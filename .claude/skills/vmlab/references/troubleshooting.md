@@ -156,6 +156,24 @@ Snapshot capture on a dev machine flushes the syncer first and refuses while the
 
 Restore has a matching refusal when the workspace is halted: `"{machine}"'s workspace is halted, and restoring would silently destroy the guest copy of every conflicting path.` Restore does have an escape flag, `--discard-guest-changes`, which throws away the guest copy of the whole workspace and re-converges it from the host after the rewind. Both refusals ride the ledger, so they apply to a stopped machine too.
 
+## A USB device node cannot be opened
+
+```
+cannot open /dev/bus/usb/{bus}/{dev} for {vid}:{pid} {device} at port {port} — vmlab runs as {user} and needs read-write access to it.
+  for now:   sudo setfacl -m u:{user}:rw /dev/bus/usb/{bus}/{dev}
+  for good:  a udev rule, e.g. SUBSYSTEM=="usb", ATTR{idVendor}=="{vid}", ATTR{idProduct}=="{pid}", TAG+="uaccess" in /etc/udev/rules.d/70-vmlab-usb.rules
+```
+
+`vmlab usb attach` hands the node to QEMU, which runs as the user, and a stock node is `root:root 0664`. The `setfacl` grant lasts until the device is replugged (the device number in the path changes) or the host reboots. The udev rule lasts: write it, `sudo udevadm control --reload && sudo udevadm trigger`, replug. Then attach again.
+
+## A VM has no USB controller to attach to
+
+```
+"{machine}" has no USB controller to attach to — set `usb = true` on {machine} and restart it
+```
+
+Host USB devices hot-plug onto an xHCI the VM gets only when it starts with `usb = true` (vm block or profile). Add it and `vmlab vm restart {machine}`. Off by default because it changes the VM's hardware: online snapshots taken before no longer restore. A container refuses with `USB passthrough is for VMs` and nothing changes that.
+
 ## A port forward was skipped
 
 ```

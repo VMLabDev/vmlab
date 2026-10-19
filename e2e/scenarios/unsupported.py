@@ -4,6 +4,7 @@ where it can be, and otherwise skipped with the reason, after the cheapest
 check that vmlab handles it gracefully.
 """
 
+import json
 import os
 import pathlib
 import shutil
@@ -224,11 +225,61 @@ def guest(h):
         h.ok("login.elevated", False, f"validate accepted `elevated` on a Linux login: {v.text.strip()!r}")
 
 
+def usb(h):
+    """Every USB passthrough path that needs no host device (§5.2.1). The
+    container sees the host's sysfs, but no device in it is one this run may
+    take from the host, so the attach itself is left to a live check."""
+    listed = h.vmlab("usb", "list")
+    as_json = h.vmlab("usb", "list", "--json")
+    rows = json.loads(as_json.out)
+    h.ok(
+        "usb.list",
+        isinstance(rows, list)
+        and (listed.out.startswith("PORT") if rows else "no USB devices" in listed.out),
+        f"{len(rows)} device(s)",
+    )
+
+    with h.lab("unsupported-usb") as lab:
+        h.vmlab("up", "usb01", "plain01", cwd=lab, timeout=600)
+        h.wait_ready(lab, "usb01", "plain01")
+
+        def root_hubs(vm: str) -> str:
+            return h.vmlab("exec", vm, "--", "sh", "-c",
+                           "cat /sys/bus/usb/devices/usb*/idProduct", cwd=lab).out
+
+        def controller():
+            # An xHCI's USB 3 root hub is 1d6b:0003; `-usb` alone has none.
+            assert "0003" in root_hubs("usb01"), "no xHCI root hub in usb01"
+            assert "0003" not in root_hubs("plain01"), "plain01 has an xHCI it was not asked for"
+            return True
+
+        h.check("usb.controller", controller)
+
+        def refusals():
+            said = {}
+            for vm, sel in [("plain01", "dead:beef"), ("web", "dead:beef"),
+                            ("usb01", "mouse"), ("usb01", "dead:beef")]:
+                r = h.vmlab("usb", "attach", vm, sel, cwd=lab, check=False)
+                assert r.code != 0, f"attach {vm} {sel} succeeded"
+                said[(vm, sel)] = r.text
+            assert "set `usb = true` on plain01 and restart it" in said[("plain01", "dead:beef")], said
+            assert "USB passthrough is for VMs" in said[("web", "dead:beef")], said
+            assert "is not a USB selector" in said[("usb01", "mouse")], said
+            assert "no USB device matches `dead:beef`" in said[("usb01", "dead:beef")], said
+            r = h.vmlab("usb", "detach", "usb01", "--all", cwd=lab)
+            assert "holds no USB devices" in r.out, r.out
+            return True
+
+        h.check("usb.refusals", refusals)
+        h.skip("usb.attach", "the e2e container has no host USB device it may take from the host; "
+               "attach and detach are verified live against a real device")
+
+
 def run(h):
     # The parts are independent: one aborting leaves its own features missing
     # (which fails the run) without costing the others theirs.
     failed = []
-    for part in (fastpath, gpu, guest):
+    for part in (fastpath, gpu, guest, usb):
         try:
             part(h)
         except ScenarioFailed as e:

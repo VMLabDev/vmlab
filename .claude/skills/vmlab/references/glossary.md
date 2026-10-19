@@ -44,6 +44,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | syncer | The workspace syncer: the loop in the lab daemon that keeps a dev machine's workspace and the host tree in step, both ways, as the machine's default login. See dev-machines.md. |
 | template | A sealed, read-only disk image in the store that VMs clone from. Built from an ISO or cloud image by a `template {}` file, or pulled from a registry. See templates.md. |
 | trunk | The PSK-authenticated TCP link two supervisors bridge a global segment over, so machines on two hosts share one L2 segment. The listen port is `trunk_port` in host config. See networking.md. |
+| USB passthrough | Handing a USB device plugged into the host to a running VM with `vmlab usb attach`, and giving it back, with no restart. The VM needs `usb = true`; the device leaves the host while attached; attachments are runtime only. See cli-machine.md. |
 | variant | A named, sealed disk state of a template version, stored as a qcow2 overlay on its base and selected with `#<name>`; no `#` selects the default variant. Not a snapshot. See templates.md. |
 | viewer | The VNC client `vmlab up` opens for a machine with `gui = true` and `vmlab console` opens on demand. Chosen from host config, else found on `PATH`. See snapshots-vision.md. |
 | VM | A `vm {}` in a lab: a QEMU guest booted from a linked clone of a template, or from a blank disk when scratch. See vm.md. |

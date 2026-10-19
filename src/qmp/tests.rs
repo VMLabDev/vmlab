@@ -394,3 +394,80 @@ async fn close_fails_pending_and_future_calls() {
         Err(QmpError::Closed)
     ));
 }
+
+/// A USB attach is one `device_add` carrying the plan's properties verbatim.
+#[tokio::test]
+async fn device_add_sends_the_properties() {
+    let mock = spawn_mock(|msg| vec![ok(msg, json!({}))]);
+    let client = QmpClient::connect(&mock.path).await.expect("connect");
+    let props = json!({"driver": "usb-host", "id": "usbhost-1-2", "bus": "usbx.0",
+                       "hostbus": 1, "hostaddr": 5, "hostport": "2"});
+    client.device_add(props.clone()).await.expect("device_add");
+    let received = mock.received.lock().unwrap();
+    let msg = received
+        .iter()
+        .find(|m| execute_name(m) == "device_add")
+        .expect("device_add sent");
+    assert_eq!(msg["arguments"], props);
+}
+
+/// `device_del` waits for the `DEVICE_DELETED` naming its device — one
+/// for another device does not end the wait, and the event may arrive
+/// before the reply.
+#[tokio::test]
+async fn device_del_waits_for_its_device_deleted() {
+    let mock = spawn_mock(|msg| match execute_name(msg) {
+        "device_del" => vec![
+            json!({"event": "DEVICE_DELETED", "data": {"device": "other", "path": "/x"},
+                   "timestamp": {"seconds": 1, "microseconds": 0}})
+            .to_string(),
+            json!({"event": "DEVICE_DELETED", "data": {"device": "usbhost-1-2", "path": "/y"},
+                   "timestamp": {"seconds": 1, "microseconds": 1}})
+            .to_string(),
+            ok(msg, json!({})),
+        ],
+        _ => vec![ok(msg, json!({}))],
+    });
+    let client = QmpClient::connect(&mock.path).await.expect("connect");
+    client
+        .device_del("usbhost-1-2", std::time::Duration::from_secs(5))
+        .await
+        .expect("device_del");
+    let received = mock.received.lock().unwrap();
+    let msg = received
+        .iter()
+        .find(|m| execute_name(m) == "device_del")
+        .expect("device_del sent");
+    assert_eq!(msg["arguments"], json!({"id": "usbhost-1-2"}));
+}
+
+/// No event for the device: the wait times out and says so.
+#[tokio::test]
+async fn device_del_without_its_event_times_out() {
+    let mock = spawn_mock(|msg| vec![ok(msg, json!({}))]);
+    let client = QmpClient::connect(&mock.path).await.expect("connect");
+    let err = client
+        .device_del("usbhost-1-2", std::time::Duration::from_millis(100))
+        .await
+        .expect_err("no event");
+    assert!(err.to_string().contains("no DEVICE_DELETED"), "{err}");
+}
+
+/// A refused `device_del` (no such device) fails at once, not at the timeout.
+#[tokio::test]
+async fn device_del_of_an_unknown_device_fails_fast() {
+    let mock = spawn_mock(|msg| match execute_name(msg) {
+        "device_del" => vec![
+            json!({"error": {"class": "DeviceNotFound", "desc": "Device 'x' not found"},
+                   "id": msg["id"]})
+            .to_string(),
+        ],
+        _ => vec![ok(msg, json!({}))],
+    });
+    let client = QmpClient::connect(&mock.path).await.expect("connect");
+    let err = client
+        .device_del("x", std::time::Duration::from_secs(30))
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, QmpError::Command { .. }), "{err:?}");
+}

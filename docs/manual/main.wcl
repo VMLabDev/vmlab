@@ -26,6 +26,7 @@ import "./pages/guide/registries.wcl"
 import "./pages/guide/networking.wcl"
 import "./pages/guide/containers.wcl"
 import "./pages/guide/shares.wcl"
+import "./pages/guide/usb.wcl"
 import "./pages/guide/snapshots.wcl"
 import "./pages/guide/scripting.wcl"
 import "./pages/guide/vision.wcl"
@@ -61,6 +62,7 @@ import "./pages/commands/vm.wcl"
 import "./pages/commands/container.wcl"
 import "./pages/commands/machine.wcl"
 import "./pages/commands/clipboard.wcl"
+import "./pages/commands/usb.wcl"
 import "./pages/commands/dns.wcl"
 import "./pages/commands/lab.wcl"
 import "./pages/commands/snapshot.wcl"
@@ -125,6 +127,7 @@ site manual {
       chapter "Networking"                           { page = guide_networking }
       chapter "Lab containers"                       { page = guide_containers }
       chapter "Shared folders"                       { page = guide_shares }
+      chapter "Host USB devices"                     { page = guide_usb }
       chapter "Snapshots"                            { page = guide_snapshots }
       chapter "Guest automation with wscript"        { page = guide_scripting }
       chapter "Screens, input and vision"            { page = guide_vision }
@@ -160,6 +163,7 @@ site manual {
       chapter "vmlab container"  { page = cmd_container }
       chapter "vmlab machine"    { page = cmd_machine }
       chapter "vmlab clipboard"  { page = cmd_clipboard }
+      chapter "vmlab usb"        { page = cmd_usb }
       chapter "vmlab dns"        { page = cmd_dns }
       chapter "vmlab lab"        { page = cmd_lab }
       chapter "vmlab snapshot"   { page = cmd_snapshot }

@@ -138,6 +138,17 @@ SRC
     host now. The same holds for a container's volumes.
   DOC
 
+  p <<DOC
+    Host USB devices passed through with [`vmlab usb`](cmd_usb) are not in a
+    snapshot either. An online snapshot of a VM holding any is refused,
+    naming them: `"{vm}" holds host USB devices (…) — an online snapshot of
+    it could only be restored with the same devices attached at the same
+    ports; detach them first`. Run `vmlab usb detach {vm} --all` and take it
+    again. An online restore detaches every device the VM holds before it
+    rewinds, since the restored guest never saw them. Offline snapshots and
+    restores are unaffected: a stopped VM holds nothing.
+  DOC
+
   h2 "Snapshots and a dev workspace"
 
   p <<DOC

@@ -1,0 +1,24 @@
+// Host USB passthrough without a host device to give (§5.2.1): one VM booted
+// with the hot-plug controller, one without, and a container that is never
+// started — the refusals are answered before anything is asked of it.
+import <vmlab.wcl>
+
+lab "e2e-unsupported-usb" {
+  vm "usb01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    usb      = true
+  }
+
+  vm "plain01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+  }
+
+  container "web" {
+    image   = "alpine:3.22"
+    profile = "container"
+  }
+}

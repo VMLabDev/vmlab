@@ -245,9 +245,41 @@ Each VM block can express:
   Validation (§5.1) runs the same pick and resolution a start runs: `host_gpu` must be a non-empty string; a `passthrough` name this host lacks, or nothing to pick, is an error; a `virgl`/`vulkan` name this host lacks is a warning, not an error; and the picked GPU's address must name a PCI device (with a render node, for `virgl`/`vulkan`), its `vulkan_icd` must exist, and its `qemu_binary` must be an executable file for the VM's arch.
 - `display`, `firmware`, `tpm`, `secure_boot` — normally supplied by the profile, overridable per VM. `secure_boot = true` is enforced: the VM's UEFI variable store starts from a template with Microsoft's keys enrolled, and a host with no such template refuses the VM rather than boot one in setup mode, where nothing is verified.
 - **UEFI firmware ships with vmlab.** The guest asset set carries Debian's edk2 builds under `firmware/<arch>/`, pinned by version and sha256: for x86_64 the 4 MiB OVMF pair and its secure-boot pair (`OVMF_CODE_4M.secboot.fd` with `OVMF_VARS_4M.ms.fd`, Microsoft's and the distro's keys enrolled); for aarch64 the AAVMF pair and its secure-boot pair. A host needs no OVMF package, and every host boots the same bytes. The lookup, for plain UEFI and secure boot alike: the host config's `firmware_dir` (laid out `<dir>/<arch>/` like the bundled set, and authoritative for an arch it has a directory for), then the bundled set in the guest asset directories' order, then the host's distro firmware. A secure-boot CODE build is only ever taken with its enrolled VARS. Each VM copies its VARS template once, at first start, and keeps that copy; one whose store was created under a firmware of another flash layout keeps booting a build of that layout. Nothing host-specific about firmware enters a template's sealed metadata — it records `firmware` and `secure_boot`, never a path.
+- `usb = true` — boot with a hot-plug xHCI controller that host USB devices can be passed through to at runtime (§5.2.1). Set on the VM or the profile; a template has no say in it. Default off.
 - `qemu_args = [...]` — **escape hatch**: raw arguments appended verbatim to the QEMU command line, last so they win
 
 Values not set on the VM inherit from the template's recorded hardware; values not set there come from the profile; the profile's defaults are the floor. Precedence: **VM block > template > profile** (no template layer for `scratch` VMs, §6.5).
+
+#### 5.2.1 USB passthrough
+
+A running VM can be handed a USB device plugged into the host, and given it back, without a restart. The device leaves the host while the VM holds it.
+
+**The controller is opt-in.** `usb = true` (VM block > profile; default false) boots the VM with a `qemu-xhci` controller carrying the fixed id `usbx`, and every passed-through device hot-plugs onto its bus, `usbx.0`. On `q35`/`pc` it sits beside the controllers `-usb` adds; on `virt`, which already has an xHCI for its tablet, that controller gains the id instead of a second being added. It is opt-in because it changes the VM's hardware: an online snapshot taken without it no longer restores, and on q35 QEMU places the `usb-tablet` on the new xHCI rather than where it was.
+
+**The host listing.** vmlab reads `/sys/bus/usb/devices`: per device its vendor and product ids, manufacturer and product strings, serial, negotiated speed, bus and device number, port path (`<bus>-<port>[.<port>...]`) and interface classes. Root hubs and hubs (class 09) are hidden. Holders are not tracked by the supervisor: its `usb.list` asks every running lab daemon what its machines hold (`machine.usb_attached`, all machines when none is named) and lists each device with the `lab/vm` holding it. A lab that does not answer within a few seconds is left out, and its devices list as free.
+
+**Selectors.** A device is named by `<vid>:<pid>`, `<vid>:<pid>@<serial>` or `port:<bus>-<port>[.<port>...]`. A selector matching nothing is refused; one matching several is refused with every candidate listed by its `port:` selector.
+
+**Attach** (`machine.usb_attach`; `vmlab usb attach`; wscript `usb_attach`) refuses, in this order:
+
+1. A container — USB passthrough is for VMs.
+2. A VM that is not running (a suspended one is refused as for every other operation that would change it), or one booted without `usb = true`: *"set `usb = true` on <vm> and restart it"*.
+3. A malformed selector, or one matching no device or several.
+4. A device another machine holds, in this lab or any other, naming the holder as `lab/vm`.
+5. A device with a HID boot keyboard or mouse interface (class 03, protocol 01 or 02) unless forced (`--force`, wscript `usb_attach_force`): the host is probably using it as input, and loses it while it is attached. A receiver carrying both is named a keyboard.
+6. A device node, `/dev/bus/usb/BBB/DDD`, the vmlab process cannot open read-write. A stock node is `root:root 0664`, so this is the usual first refusal. It names the node and two fixes, one line each: `sudo setfacl -m u:<user>:rw <node>` for now, and a udev rule (`SUBSYSTEM=="usb", ATTR{idVendor}=="…", ATTR{idProduct}=="…", TAG+="uaccess"`) for good.
+
+The attach is then QMP `device_add` of `usb-host` on `usbx.0`, pinned by `hostbus`, `hostport` **and** `hostaddr` (the device number), with the qdev id `usbhost-<port path>`. The device number changes on every replug, so a different device later plugged into the same socket never matches the pin and is never handed to the guest unasked.
+
+**Detach** (`machine.usb_detach`; `vmlab usb detach`; wscript `usb_detach`/`usb_detach_all`) resolves its selector against what the VM holds, not against the host — the device may already be gone — or takes every one with `--all`. It is QMP `device_del`, waiting for QEMU's `DEVICE_DELETED` naming the device. The tracking is dropped even when QEMU no longer knows the device, so a detach never leaves a phantom attachment.
+
+**Tracking is runtime only.** The lab daemon tracks attachments per VM in memory; nothing is persisted. A VM stop releases everything it held, with no per-device event — `vm.stopped` says it. Each attach and detach emits `usb.attached` / `usb.detached` carrying `vm`, `port`, `id` (`vid:pid`), `product` and `qdev_id`; a detach vmlab made on its own adds `reason`: `unplugged` or `restore`.
+
+**Unplugged from the host.** QEMU keeps a `usb-host` device whose host device left: it detaches from the guest's bus, waits for a match to reappear, and emits no QMP event either way. So while any device is attached the lab daemon reads sysfs every 2 seconds, and an attachment whose port is empty, or holds a device with a different device number (a replug), is removed with `device_del` and reported as `usb.detached` with `reason = "unplugged"`. The watch stops once nothing is attached.
+
+**Snapshots.** An online snapshot of a VM holding host devices is refused, naming them and saying to detach first (`vmlab usb detach <vm> --all`): a restore of one could only succeed with the same devices attached at the same ports. QEMU 11.1 itself saves one (`usb-host` migrates its state) and loads it while the device is still attached, but a load once it is detached fails — *"Unknown section or instance '…/usb-host' … Make sure that your current VM setup matches your saved VM setup, including any hotplugged devices"* — and vmlab cannot promise the device will be plugged in, at the same port, whenever the snapshot is restored, so it refuses at capture rather than produce a snapshot that may never restore. An offline snapshot is unaffected — a stopped VM holds nothing. An online restore detaches every device the VM holds first (`reason = "restore"`), since the guest it rewinds to never saw them; an offline restore stops the VM, which releases them anyway.
+
+**Surfaces.** The CLI is `vmlab usb list [--json]`, `vmlab usb attach [lab/]vm <selector> [--force] [--json]` and `vmlab usb detach [lab/]vm (<selector> | --all) [--json]`. A script has `lab.usb_devices()` and, on the machine handle, `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` (§10.1, §10.3). The wire commands are the lab daemon's `machine.usb_attach`, `machine.usb_detach` and `machine.usb_attached`, and the supervisor's `usb.list`.
 
 ### 5.3 Guest OS profiles
 
@@ -304,7 +336,7 @@ A failed variant build reports which variant failed and stops; the base and ever
 ### 6.2 Store, addressing, export
 
 - Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>][#<variant>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store; the `#<variant>` suffix selects one disk of a version that has variants (§6.6). `vmlab validate` rejects archless references.
-- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle.
+- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle. Surface 3 adds host USB passthrough (§5.2.1): `lab.usb_devices()`, and `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` on the machine handle.
 - `vmlab template list / rm` manage the store. `list` shows each version's variants beneath it, the default marked and a stale one flagged; `rm <arch>/<name>@<version>` removes the version with all its variants, and `rm …#<variant>` removes that one variant (§6.6).
 - `vmlab template export` produces a single portable archive (qcow2 + metadata, and every variant's `variants/<variant>/disk.qcow2` with the full `template.wcl`); `vmlab template import` installs one, refusing any variant whose overlay is not the one its block's `sha256` names or whose `base_sha256` is not the archive's base — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).
@@ -404,7 +436,7 @@ Both **online** and **offline** snapshots are required:
 
 Every snapshot records the VM's **power state at capture time**. Restore must do the right thing: restoring an online snapshot resumes the VM running exactly where it was; restoring an offline snapshot leaves the VM powered off. Snapshots are named, listable, and deletable per VM; a lab-wide snapshot verb captures all VMs (and containers, §18) in a lab under one name (consistency across VMs is best-effort, not coordinated — document this).
 
-Snapshots use **qcow2-internal snapshots wherever the mechanism supports the case**, keeping the on-disk footprint to the clone file itself; external snapshot files are permitted only where internal snapshots cannot deliver the behavioural contract above. Either way the mechanism must coexist with the linked-clone backing chain, and the contract — not the mechanism — is what binds. Shared folders (§7.5) stay snapshot-compatible on both transports: SMB carries no device state at all, and virtiofs shares transfer the virtiofsd session state through the snapshot's migration stream. On a host whose virtiofsd predates that transfer (§7.5), online capture and restore of a machine with virtiofs devices refuse, naming the virtiofsd release that has it; offline snapshots are unaffected.
+Snapshots use **qcow2-internal snapshots wherever the mechanism supports the case**, keeping the on-disk footprint to the clone file itself; external snapshot files are permitted only where internal snapshots cannot deliver the behavioural contract above. Either way the mechanism must coexist with the linked-clone backing chain, and the contract — not the mechanism — is what binds. Shared folders (§7.5) stay snapshot-compatible on both transports: SMB carries no device state at all, and virtiofs shares transfer the virtiofsd session state through the snapshot's migration stream. On a host whose virtiofsd predates that transfer (§7.5), online capture and restore of a machine with virtiofs devices refuse, naming the virtiofsd release that has it; offline snapshots are unaffected. Host USB devices (§5.2.1) do not travel the same way: online capture of a VM holding any is refused, naming them, and an online restore detaches them first.
 
 **The guest clock after a restore.** A restored online snapshot resumes at the time it was captured, so a guest restored a week later believes it is a week ago: TLS, Kerberos and anything that checks a certificate or a ticket break until the guest's own time sync catches up, if it has one. Each machine declares how vmlab treats its clock with `clock`, on the `vm` or `container` block alone, never resolved through template or profile (it is runtime policy plus the RTC's start, not hardware):
 
@@ -496,7 +528,7 @@ The PRD permits shipping 2 first and replacing with 1 later — including a hybr
 
 The daemon emits structured events, minimally:
 
-- **Lifecycle:** `vm.starting`, `vm.ready`, `vm.stopped` (with reason: requested / guest-initiated / crashed), `vm.crashed`, `vm.suspended` and `vm.woken` (the guest slept and woke, §7.2; `vm.woken` carries a `cause`: `prevent_sleep`, `start`, `stop`, `restore` or `guest`), `lab.up`, `lab.down`, `snapshot.created`, `snapshot.restored` (an online restore's carries the clock outcome, `clock`, §7.3), `template.built`
+- **Lifecycle:** `vm.starting`, `vm.ready`, `vm.stopped` (with reason: requested / guest-initiated / crashed), `vm.crashed`, `vm.suspended` and `vm.woken` (the guest slept and woke, §7.2; `vm.woken` carries a `cause`: `prevent_sleep`, `start`, `stop`, `restore` or `guest`), `lab.up`, `lab.down`, `snapshot.created`, `snapshot.restored` (an online restore's carries the clock outcome, `clock`, §7.3), `template.built`, `usb.attached` and `usb.detached` (§5.2.1)
 - **Errors:** QMP failures, QEMU process death, agent timeouts, network fabric errors, `lab.daemon_crashed` (emitted by the supervisor) — any unrecoverable error is an event before it is a failure.
 - **Resource watchdog:** `host.disk_low` (configurable threshold on the filesystems holding `.vmlab/` and the template store — linked clones grow), plus headroom checks before snapshot operations.
 
@@ -620,6 +652,7 @@ lab.container("web") -> Machine      # error if undefined, or if it's a VM
 lab.containers() -> [Machine]        # the containers only
 lab.this_vm() -> Machine             # the machine that declared this script
 lab.segment("corp") -> Segment
+lab.usb_devices() -> [UsbDevice]     # host USB devices and who holds each (§5.2.1)
 lab.name() -> string
 lab.log(msg)                         # into the lab log + live CLI stream
 ```
@@ -729,6 +762,17 @@ never declared), the wscript rung of §19.2's precedence ladder. Reading the
 declared logins is what lets a provision script create *exactly* the account
 declared, rather than the password existing in two places that drift.
 
+**Host USB** (§5.2.1) — VMs booted with `usb = true`
+
+```
+m.usb_attach(selector) -> UsbDevice        # <vid>:<pid>[@serial] | port:<path>
+m.usb_attach_force(selector) -> UsbDevice  # also a HID keyboard or mouse
+m.usb_detach(selector)   m.usb_detach_all()
+m.usb_attached() -> [UsbDevice]
+```
+
+`UsbDevice` carries `id` (the `port:<path>` selector naming exactly that device), `vendor_id`, `product_id`, `serial`, `port`, `product`, `manufacturer` and `attached_to` (`lab/vm`, or none). `force` is its own verb because wscript has no optional arguments, and `usb_attach(sel, true)` would not say what the `true` overrides.
+
 All blocking calls take timeouts and return wscript `Result`s; an error propagating out of a provision script fails the provision run (and therefore `vmlab up`) with the error attached to the lab log.
 
 ### 10.4 Execution model
@@ -763,6 +807,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2) |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |
 | `vmlab console <vm>` | Attach viewer |
+| `vmlab usb list / attach / detach` | Host USB devices and who holds each; hot-plug one into a running VM with `usb = true` and back (§5.2.1) |
 | `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
 | `vmlab cp <src> <vm>:<dest>` | Copy a host file/tree into a guest via the agent |
 | `vmlab app run [--via waypipe\|x11\|rdp] [--detach] <machine> -- cmd` | Show one guest program's windows on the host desktop (§20) |

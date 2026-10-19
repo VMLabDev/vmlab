@@ -156,6 +156,29 @@ login, like `exec`. A CLI act on a running machine, never a declaration and
 never a wscript call. Unrelated to the **display**, which it does not use.
 _Avoid_: remote app, seamless window, app forwarding, share (that is a folder)
 
+**USB passthrough**:
+Handing a USB device plugged into the host to a running VM, and giving it
+back, with no restart. Needs the VM to have booted with `usb = true` — an
+opt-in hot-plug xHCI controller, because adding it changes the VM's hardware.
+A CLI and wscript act on a running machine, never a declaration; a container
+refuses it. Unrelated to **shared apps** and to `-usb`'s tablet.
+_Avoid_: USB redirection (that is SPICE's client-side feature), USB sharing
+
+**Attachment**:
+One host USB device held by one running VM — the device as listed when it was
+attached, pinned to that plug-in by bus, port and device number. Runtime only:
+tracked by the lab daemon in memory, released by a detach, a VM stop, an
+online restore, or the device leaving the host. The supervisor tracks none; its
+listing asks every lab who holds what.
+_Avoid_: claim, binding, mount
+
+**Selector** (USB):
+How a person names one host USB device: `<vid>:<pid>`,
+`<vid>:<pid>@<serial>`, or `port:<bus>-<port>[.<port>...]`. Resolves to
+exactly one device or is refused — with the candidates listed when it matches
+several. A detach resolves it against the VM's attachments, not the host.
+_Avoid_: device id (that is the `vid:pid` pair alone), filter
+
 ### Templates and images
 
 **Template**:

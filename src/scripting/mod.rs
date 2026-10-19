@@ -136,6 +136,41 @@ pub struct GuestStats {
     pub disks: Vec<DiskStat>,
 }
 
+/// One host USB device (`lab.usb_devices()`, `vm.usb_attached()`, PRD
+/// §5.2.1).
+#[derive(Script, Clone)]
+#[script(name = "UsbDevice")]
+pub struct ScriptUsbDevice {
+    /// The selector naming exactly this device, `port:<bus>-<port>` — what
+    /// to hand `usb_attach` when vendor and product ids are not unique.
+    pub id: String,
+    /// Four lowercase hex digits.
+    pub vendor_id: String,
+    pub product_id: String,
+    pub serial: Option<String>,
+    /// The kernel's port path, `<bus>-<port>[.<port>...]`.
+    pub port: String,
+    pub product: Option<String>,
+    pub manufacturer: Option<String>,
+    /// `lab/vm` holding it, or `none` while it is free.
+    pub attached_to: Option<String>,
+}
+
+impl ScriptUsbDevice {
+    fn of(d: crate::usb::HostDevice, attached_to: Option<String>) -> Self {
+        ScriptUsbDevice {
+            id: d.port_selector(),
+            vendor_id: d.vendor_id,
+            product_id: d.product_id,
+            serial: d.serial,
+            port: d.port,
+            product: d.product,
+            manufacturer: d.manufacturer,
+            attached_to,
+        }
+    }
+}
+
 /// One mounted filesystem in [`GuestStats`].
 #[derive(Script, Clone)]
 pub struct DiskStat {
@@ -328,6 +363,31 @@ impl MachineHandle {
             first_boot_gated: self.first_boot_gated,
             logon,
         })
+    }
+
+    /// An attachment as the record a script sees, holder spelled `lab/vm`.
+    fn usb_record(&self, a: crate::usb::Attachment) -> ScriptUsbDevice {
+        let holder = format!("{}/{}", self.runtime.name, a.machine);
+        ScriptUsbDevice::of(a.device, Some(holder))
+    }
+
+    fn usb_attach(&self, selector: &str, force: bool) -> Result<ScriptUsbDevice, String> {
+        let runtime = self.runtime.clone();
+        let machine = self.name().to_string();
+        let selector = selector.to_string();
+        let a = self
+            .block(async move { runtime.usb_attach(&machine, &selector, force).await })
+            .map_err(estr)?;
+        Ok(self.usb_record(a))
+    }
+
+    fn usb_detach(&self, selector: Option<&str>) -> Result<(), String> {
+        let runtime = self.runtime.clone();
+        let machine = self.name().to_string();
+        let selector = selector.map(str::to_string);
+        self.block(async move { runtime.usb_detach(&machine, selector.as_deref()).await })
+            .map(|_| ())
+            .map_err(estr)
     }
 
     /// Relative local paths resolve against the running script's directory.
@@ -539,6 +599,17 @@ pub fn lab_module() -> Module {
                     return Err(format!("\"{name}\" is a vm — use lab.vm()"));
                 }
                 Ok(l.handle_for(m))
+            },
+        )
+        // Host USB devices, each with the machine holding it (§5.2.1).
+        .method(
+            "usb_devices",
+            |l: &LabHandle| -> Result<Vec<ScriptUsbDevice>, String> {
+                let listed = l.rt.block_on(l.runtime.usb_devices()).map_err(estr)?;
+                Ok(listed
+                    .into_iter()
+                    .map(|d| ScriptUsbDevice::of(d.device, d.attached_to))
+                    .collect())
             },
         )
         .method("containers", |l: &LabHandle| -> Vec<MachineHandle> {
@@ -1065,6 +1136,43 @@ pub fn lab_module() -> Module {
                 ))
             },
         )
+        // Host USB passthrough (§5.2.1). `force` is its own verb, as
+        // `restore_discarding_workspace` is: wscript has no optional
+        // arguments, and `usb_attach(sel, true)` would not say what the
+        // `true` overrides — taking the host's keyboard or mouse away.
+        .method(
+            "usb_attach",
+            |h: &MachineHandle, selector: &str| -> Result<ScriptUsbDevice, String> {
+                h.usb_attach(selector, false)
+            },
+        )
+        .method(
+            "usb_attach_force",
+            |h: &MachineHandle, selector: &str| -> Result<ScriptUsbDevice, String> {
+                h.usb_attach(selector, true)
+            },
+        )
+        .method(
+            "usb_detach",
+            |h: &MachineHandle, selector: &str| -> Result<(), String> {
+                h.usb_detach(Some(selector))
+            },
+        )
+        .method(
+            "usb_detach_all",
+            |h: &MachineHandle| -> Result<(), String> { h.usb_detach(None) },
+        )
+        .method(
+            "usb_attached",
+            |h: &MachineHandle| -> Result<Vec<ScriptUsbDevice>, String> {
+                let runtime = h.runtime.clone();
+                let machine = h.name().to_string();
+                let attached = h
+                    .block(async move { runtime.usb_attached(Some(&machine)).await })
+                    .map_err(estr)?;
+                Ok(attached.into_iter().map(|a| h.usb_record(a)).collect())
+            },
+        )
         .method("logins", |h: &MachineHandle| -> Vec<ScriptLogin> {
             script_logins(h.machine.logins(), h.machine.guest_os())
         })
@@ -1523,6 +1631,7 @@ fn main(lab: Lab) {
         ensure_wscript_surface_supported("x86_64/win11@legacy", None).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@v1", Some(1.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@v2", Some(2.into())).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@v3", Some(3.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@current", Some(WSCRIPT_SURFACE_VERSION))
             .unwrap();
     }
@@ -1530,10 +1639,10 @@ fn main(lab: Lab) {
     #[test]
     fn a_template_above_the_surface_ceiling_asks_for_a_newer_vmlab() {
         let err =
-            ensure_wscript_surface_supported("x86_64/win11@newer", Some(3.into())).unwrap_err();
+            ensure_wscript_surface_supported("x86_64/win11@newer", Some(4.into())).unwrap_err();
         assert_eq!(
             err,
-            "template `x86_64/win11@newer` records wscript surface 3, newer than this host's 2; \
+            "template `x86_64/win11@newer` records wscript surface 4, newer than this host's 3; \
              upgrade vmlab to use it"
         );
     }

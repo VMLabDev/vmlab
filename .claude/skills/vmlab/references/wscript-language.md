@@ -177,9 +177,11 @@ The documented signatures use the parameter names the host registers; the
 generated interface file spells them `a0`, `a1` and so on.
 
 Note: a template stores the wscript surface version its scripts compiled against.
-This host compiles surfaces from its supported floor up to its own (surface 2,
-which added `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and
-`as_account`). A template below the floor is refused with one message telling
+This host compiles surfaces from its supported floor up to its own (surface 3;
+surface 2 added `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`,
+`as_login` and `as_account`, and surface 3 added host USB passthrough:
+`lab.usb_devices()`, `usb_attach`, `usb_attach_force`, `usb_detach`,
+`usb_detach_all` and `usb_attached`). A template below the floor is refused with one message telling
 you to rebuild it with this vmlab version; a template recording a newer surface
 than the host's is refused by name with one telling you to upgrade vmlab. Either
 refusal comes before any embedded script compiles, rather than a cascade of
@@ -217,7 +219,7 @@ the reboot when it is already set; see examples.md.
 - Clearing DNS records the lab file declared: they have no id and cannot be
   cleared from a script.
 - Constructing record types: `Match`, `ExecResult`, `Login`, `GuestStats`,
-  `DiskStat` and `Event` are never constructed by a script; they are only read.
+  `DiskStat`, `UsbDevice` and `Event` are never constructed by a script; they are only read.
 - Distinguishing an unset environment variable from an empty one: `vmlab::env`
   returns an empty string for both.
 - An exec transport on a guest built from a template with no agent: there is

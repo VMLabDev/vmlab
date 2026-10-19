@@ -29,8 +29,11 @@ pub(crate) struct EmbeddedWscript {
 /// stamped surface. Two adds, on the machine handle, `logins()`,
 /// `as_login()`/`as_account()` (§19.2's wscript rung), `eject_cdrom()`,
 /// `boot_id()` and `wait_rebooted()`; and makes `seg.route_to()` /
-/// `seg.unroute_to()` work rather than fail.
-pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(2);
+/// `seg.unroute_to()` work rather than fail. Three adds host USB passthrough
+/// (§5.2.1): `lab.usb_devices()` and, on the machine handle, `usb_attach()`,
+/// `usb_attach_force()`, `usb_detach()`, `usb_detach_all()` and
+/// `usb_attached()`.
+pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(3);
 /// Oldest stamped surface this host promises to compile. Unstamped templates
 /// are legacy and remain accepted through compatibility aliases.
 const MIN_WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(1);

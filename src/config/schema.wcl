@@ -272,6 +272,8 @@ type Vm {
   @options(["ovmf", "seabios"]) firmware: utf8?
   @doc("Enable a TPM 2.0 device; inherited from template→profile")
   tpm: bool?
+  @doc("Boot with a hot-plug xHCI controller so `vmlab usb attach` can pass host USB devices in; inherited from the profile, default false. Adding it changes the VM's hardware, so online snapshots taken without it no longer restore")
+  usb: bool?
   @doc("Enable secure boot (OVMF only); inherited from template→profile")
   secure_boot: bool?
   @doc("Raw QEMU flags appended last — escape hatch")

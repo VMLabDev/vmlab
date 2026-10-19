@@ -23,6 +23,12 @@ is written through QMP's `snapshot-save` into the primary disk, covering every
 disk the machine has; an offline one is written with `qemu-img` to each disk in
 turn. Snapshots are named, listed and deleted per machine.
 
+Host USB devices passed through with `vmlab usb` are not in a snapshot. An
+online snapshot of a VM holding any is refused, naming them, until they are
+detached (`vmlab usb detach <vm> --all`); an online restore detaches every
+device the VM holds first, since the restored guest never saw them. Offline
+snapshots and restores are unaffected.
+
 When an online snapshot is restored, the daemon drops its agent connection
 before resuming, because the rewound guest replays serial bytes the host
 already consumed, and reconnects on next use.

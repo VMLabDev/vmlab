@@ -186,6 +186,49 @@ async fn teardown(sup: &Arc<Supervisor>, tasks: &crate::lifecycle::TaskGroup) {
 }
 
 impl Supervisor {
+    /// Every USB device on this host, each with the machine holding it
+    /// (PRD §5.2.1). The holders are asked of every running lab rather than
+    /// tracked here: a lab daemon knows what its VMs hold, survives a
+    /// supervisor restart, and takes its devices with it when it goes. A lab
+    /// that does not answer in time is left out — its devices list as free,
+    /// and an attach to one is refused by QEMU, which cannot claim it.
+    async fn usb_list(&self) -> Result<Vec<crate::usb::Listed>, CommandError> {
+        let host = crate::usb::scan(std::path::Path::new(crate::usb::SYSFS_ROOT))
+            .map_err(|e| CommandError::failed(format!("reading USB devices: {e}")))?;
+        let labs: Vec<String> = {
+            let reg = self.registry.lock().await;
+            reg.labs()
+                .iter()
+                .filter(|l| l.state == LabState::Running)
+                .map(|l| l.name.clone())
+                .collect()
+        };
+        let mut held = Vec::new();
+        for lab in labs {
+            let ask = async {
+                let client = LabClient::connect(&crate::paths::lab_socket(&lab))
+                    .await
+                    .ok()?;
+                let v = client
+                    .send(LabRequest::MachineHeldUsb { machine: None })
+                    .await
+                    .ok()?;
+                serde_json::from_value::<Vec<crate::usb::Attachment>>(v).ok()
+            };
+            let attached = tokio::time::timeout(std::time::Duration::from_secs(3), ask)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            held.extend(
+                attached
+                    .into_iter()
+                    .map(|a| (a.device.port, format!("{lab}/{}", a.machine))),
+            );
+        }
+        Ok(crate::usb::listing(host, &held))
+    }
+
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
     }
@@ -600,6 +643,7 @@ impl Handler<SupRequest> for SupervisorHandler {
                 Ok(json!(true))
             }
             SupRequest::GlobalList {} => Ok(json!(sup.globals.list().await)),
+            SupRequest::UsbList {} => Ok(json!(sup.usb_list().await?)),
             // Template operations on a lab's declarations (PRD §6). All
             // take `lab` + `root` like `lab.ensure`, so the supervisor works
             // for labs it never started.

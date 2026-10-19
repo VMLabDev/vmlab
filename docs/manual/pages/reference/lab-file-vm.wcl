@@ -80,6 +80,7 @@ SRC
       | "`accel`" | "utf8" | "inherited" | "Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`." |
       | "`firmware`" | "utf8" | "inherited" | "Firmware: `ovmf` or `seabios`. Inherited from template, then profile." |
       | "`tpm`" | "bool" | "inherited" | "Enable a TPM 2.0 device. Inherited from template, then profile." |
+      | "`usb`" | "bool" | "inherited" | "Boot with a hot-plug xHCI controller so [vmlab usb](cmd_usb) can pass host USB devices in. Inherited from the profile only — a template has no say; off when neither sets it. Changes the VM's hardware, so online snapshots taken without it no longer restore." |
       | "`secure_boot`" | "bool" | "inherited" | "Enable secure boot; OVMF only. Inherited from template, then profile." |
       | "`qemu_args`" | "list<utf8>" | "none" | "Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates." |
       | "`gpu {}`" | "child" | "none" | "GPU acceleration: passthrough, virgl or vulkan." |

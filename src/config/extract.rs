@@ -574,6 +574,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
+    let usb = r.bool("usb").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
     let qemu_args = r.string_list("qemu_args");
     let dev = extract_dev(&mut r);
@@ -646,6 +647,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         accel,
         firmware,
         tpm,
+        usb,
         secure_boot,
         qemu_args,
         gpu,
