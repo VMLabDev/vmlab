@@ -1528,7 +1528,7 @@ impl LabRuntime {
         output: &crate::scripting::OutputSink,
         shipped: impl Fn(&dyn Machine) -> Result<crate::agent_asset::AgentAsset>,
     ) {
-        use super::agent_repair::{Refresh, decide, eligible, push};
+        use super::agent_repair::{Refresh, decide, eligible, push_under};
         if !self
             .agent_updates
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1547,11 +1547,20 @@ impl LabRuntime {
                 return;
             }
         };
-        let handshake = match async {
-            m.wait_agent_up(m.ready_timeout()).await?;
-            m.wait_agent(Duration::from_secs(60)).await
+        // Only once the agent is up — never while a guest boots, which would
+        // hold every `exec` for the boot — but from that moment: the gate is
+        // taken before this refresh's own handshake and comparison, so an
+        // `exec` arriving the instant `up` returns waits for the decision
+        // instead of being handed the channel the push then restarts. A
+        // machine found current releases it a handshake later.
+        if let Err(e) = m.wait_agent_up(m.ready_timeout()).await {
+            self.agent_update_failed(&name, None, &asset.version, &e, output);
+            return;
         }
-        .await
+        let replacing = m.begin_agent_replacement().await;
+        let handshake = match m
+            .wait_agent_during_replacement(Duration::from_secs(60))
+            .await
         {
             Ok(agent) => agent.info().agent_version.clone(),
             Err(e) => {
@@ -1583,7 +1592,7 @@ impl LabRuntime {
             }
             Refresh::Update { from, to } => (from, to),
         };
-        let pushed = match push(m, &asset).await {
+        let pushed = match push_under(m, &asset, replacing).await {
             Ok(report) => report.pushed,
             Err(e) => {
                 self.agent_update_failed(&name, Some(&from), &to, &e, output);

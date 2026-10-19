@@ -1365,7 +1365,33 @@ or failed — whether `up` runs it inline or the handshake does: the refresh
 restarts the agent, so a machine reported ready first would hand whoever waited
 on it — `wait_ready`, a dependent, `status`, a second `exec` — a channel about
 to close. `vm.ready` is emitted, and forwards installed, at that true
-readiness. The hold applies only where a refresh can run — a machine opted out,
+readiness. **And nothing else reaches the agent while it is being replaced.**
+Readiness alone was not enough: `up` returns without waiting on a machine
+nothing waits on, so a `vmlab exec` issued right after it met the background
+refresh mid-flight — handed the very connection the push then shut down
+("agent channel closed during exec"), its process killed in the restart (exit
+137), or handshaken with the agent on its way out and cut off when the new one
+answered its ping as somebody else. So the push holds the machine's agent
+channel from before it hands the guest the binary until the new agent has
+answered a handshake under its own instance (the agent's Hello and Pong name
+it; a reconnect answered under the old instance, or the old stamp, is a
+restart that did not happen). Every other caller — `exec`, `shell`, `cp`, a
+script, a probe — waits for the hold to end, up to four minutes, then fails
+naming the replacement, and what it gets afterwards is the new agent. `up`'s
+refresh takes the hold the moment the agent is up, before its own handshake
+and comparison, so an `exec` that arrives as `up` returns waits for the
+decision; a machine found current releases it a handshake later. A session
+already open on the channel when the push begins is let finish first, up to
+a minute, before the restart. The same hold covers `repair-agent`. **A
+reconnect answered by the agent told to restart is a restart not yet taken
+effect, and is waited for**: on Windows the service bounce lands seconds
+after the restart command returned (the restart script sleeps before `sc
+stop`), so the push's first reconnect was routinely the old agent's — the
+refresh was reported failed, the machine went ready, and the bounce then
+landed under the first `exec` after `up`. The old agent answering is pinged
+until it stops answering or another instance answers, then handshaken again,
+up to the two-minute reconnect budget; only then is "the service did not
+restart onto it" reported. The hold applies only where a refresh can run — a machine opted out,
 a container, the legacy tier or one with no sealed agent is ready at its
 handshake as before, and one already current is held only for the comparison —
 and it is bounded: past five minutes the machine is reported ready on whatever

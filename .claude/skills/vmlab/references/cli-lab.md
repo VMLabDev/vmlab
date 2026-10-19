@@ -108,7 +108,18 @@ cannot be refreshed is not held. A failed refresh never fails `up`: it prints
 `warning: agent: could not update "<vm>" …` with the reason and the old agent stays
 in place. Containers, the legacy agent tier, and VMs whose template sealed no agent
 are skipped silently. `agent_update = false` on a `vm` (or on the `lab`, for every
-VM; the `vm` wins) keeps the template's agent.
+VM; the `vm` wins) keeps the template's agent. **Nothing else reaches the agent
+while it is being replaced**: from before the push sends the binary until the new
+agent has answered a handshake as a new instance, every other use of the VM's
+agent (`exec`, `shell`, `cp`, a script) waits, up to four minutes, then runs on the
+new agent; a command already running when the push begins gets up to a minute
+to finish before the restart. So `vmlab up && vmlab exec …` works even when the
+exec lands in the background refresh — before this it failed with `agent channel
+closed during exec` or exit 137. On Windows the service restart lands seconds
+after the push asks for it, so the push keeps waiting (within its two-minute
+budget) while the old agent still answers, and reports `the service did not
+restart onto it` only when the budget is spent — a Server 2025 refresh used to be
+reported failed with the restart still pending.
 
 ### Examples
 

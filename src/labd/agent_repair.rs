@@ -40,7 +40,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use super::guest_os::GuestOs;
-use super::machine::{AgentOrigin, Machine};
+use super::machine::{AgentOrigin, AgentReplacement, Machine};
 use crate::agent_asset::{AgentAsset, AgentOs, ensure_agent_asset};
 
 /// How long the new agent has to answer its handshake after the swap. A
@@ -51,6 +51,15 @@ const RECONNECT_WAIT: Duration = Duration::from_secs(120);
 /// Long enough for the swap to run, short enough that a wedged guest reports
 /// a timeout rather than hanging the caller.
 const SWAP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the push waits for sessions already open on the channel — an
+/// exec handed the connection in the moment before the gate closed — to end
+/// before it restarts the agent out from under them. Generous, because the
+/// wait costs nothing anyone is waiting on (a background refresh, or an
+/// inline one before any provision) and a user's command cut off is the
+/// bug; a terminal or a tail left open is cut off when the bound is
+/// reached, as it would have been at once before.
+const DRAIN_WAIT: Duration = Duration::from_secs(60);
 
 /// How a repair replaces the binary inside one guest family — computed before
 /// anything runs, so what a repair will do is a value a test can read.
@@ -234,10 +243,30 @@ pub async fn repair(m: &Arc<dyn Machine>) -> Result<RepairReport> {
 /// binary, swap, restart the service and wait for the new agent's handshake.
 /// A failure before the swap leaves the old agent installed and running.
 pub async fn push(m: &Arc<dyn Machine>, asset: &AgentAsset) -> Result<RepairReport> {
+    let replacing = m.begin_agent_replacement().await;
+    push_under(m, asset, replacing).await
+}
+
+/// [`push`] under a gate the caller already holds — `up`'s refresh takes it
+/// the moment the agent is up, before its own handshake and comparison, so
+/// an `exec` arriving the instant `up` returns cannot be handed the channel
+/// ahead of the push.
+///
+/// From the gate until the new agent has answered, nobody else gets the
+/// channel: an exec handed the connection now would ride it into the restart
+/// and die with it, and one that handshook with the agent on its way out
+/// would be talking to a process about to be killed. Both wait on the
+/// machine, and are released with the guard however the push ends.
+pub async fn push_under(
+    m: &Arc<dyn Machine>,
+    asset: &AgentAsset,
+    replacing: AgentReplacement,
+) -> Result<RepairReport> {
+    let _replacing = replacing;
     let name = m.name().to_string();
     let plan = plan(m.guest_os());
 
-    let agent = m.agent().await.with_context(|| {
+    let agent = m.agent_during_replacement().await.with_context(|| {
         format!(
             "\"{name}\" must be running with its agent answering before a new one can be \
              pushed into it over that channel"
@@ -270,6 +299,12 @@ pub async fn push(m: &Arc<dyn Machine>, asset: &AgentAsset) -> Result<RepairRepo
         );
     }
 
+    // What was opened on this connection before the gate closed finishes
+    // first: the restart kills every process the old agent is running, and
+    // an exec that reached the channel a moment before the push did was
+    // dying with it, as "agent channel closed during exec" or 137.
+    drain(&agent, DRAIN_WAIT).await;
+
     // From here the channel is expected to die: the restart takes the agent
     // that is carrying this command with it. A command that returns is what we
     // asked for, and one that does not is the restart arriving early — neither
@@ -289,37 +324,19 @@ pub async fn push(m: &Arc<dyn Machine>, asset: &AgentAsset) -> Result<RepairRepo
     // Let go of the connection so the guest's one chardev slot is free for the
     // agent that is coming back, and forget the handshake failures the gap
     // produces on the way.
+    let replaced_instance = agent.info().instance;
     agent.shutdown().await;
     m.clear_agent_failure().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    // The one message a stranded developer reads, so it says exactly what is
-    // where: the machine is running an agent that is not answering, and what
-    // it takes to put the old one back differs by guest family.
-    let agent = m.wait_agent(RECONNECT_WAIT).await.with_context(|| {
-        let recovery = match &plan.replaced {
-            Some(previous) => format!("the binary it replaced is still at {previous}"),
-            None => "the binary it replaced is gone, so a rebuild is what restores it".to_string(),
-        };
-        format!(
-            "\"{name}\"'s agent never came back after the repair; the pushed one is installed \
-             at {} and {recovery}",
-            plan.install
-        )
-    })?;
-    m.clear_agent_failure().await;
-
+    let agent = came_back(
+        m,
+        &asset.version,
+        replaced_instance.as_deref(),
+        &plan,
+        RECONNECT_WAIT,
+    )
+    .await?;
     let info = agent.info();
-    // An agent that answers is not proof the new one does: a restart that
-    // never happened leaves the old agent running from its renamed image, and
-    // it answers the reconnect as readily. The pushed binary carries its stamp
-    // in its handshake, so anything else answering is the old one.
-    if let Some(stale) = still_running_the_old_agent(&asset.version, &info.agent_version) {
-        bail!(
-            "\"{name}\": the pushed agent is installed at {} but the agent answering is still \
-             {stale} — the service did not restart onto it; `vmlab vm restart {name}` loads it",
-            plan.install
-        );
-    }
     Ok(RepairReport {
         machine: name,
         pushed: asset.version.clone(),
@@ -327,6 +344,117 @@ pub async fn push(m: &Arc<dyn Machine>, asset: &AgentAsset) -> Result<RepairRepo
         agent_version: info.agent_version,
         features: info.features,
     })
+}
+
+/// The agent that replaced the one told to restart, waited for up to `wait`.
+///
+/// A reconnect answered by the old agent — the old stamp, or the old instance
+/// — is a restart that has not happened *yet*, not one that failed. On
+/// Windows the service bounce lands seconds after the command that asked for
+/// it returned (the restart script sleeps before `sc stop`, and `sc` takes
+/// its time), so the first reconnect is routinely the old agent's. Reported
+/// as a failed refresh, that let the machine go ready, and the bounce then
+/// landed under the first `exec` after `up`, which hung on an agent that was
+/// being stopped. So the old agent answering is waited on: pinged until it
+/// stops answering or somebody else answers, then handshaken again, until
+/// the deadline — only then is a restart that never took effect reported.
+///
+/// The messages are the ones a stranded developer reads, so they say exactly
+/// what is where: the machine is running an agent that is not the pushed
+/// one, and what it takes to put the old one back differs by guest family.
+pub(super) async fn came_back(
+    m: &Arc<dyn Machine>,
+    pushed: &str,
+    replaced_instance: Option<&str>,
+    plan: &RepairPlan,
+    wait: Duration,
+) -> Result<super::vm_agent::AgentHandle> {
+    let name = m.name().to_string();
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let agent = m
+            .wait_agent_during_replacement(remaining.max(Duration::from_secs(1)))
+            .await
+            .with_context(|| {
+                let recovery = match &plan.replaced {
+                    Some(previous) => format!("the binary it replaced is still at {previous}"),
+                    None => "the binary it replaced is gone, so a rebuild is what restores it"
+                        .to_string(),
+                };
+                format!(
+                    "\"{name}\"'s agent never came back after the repair; the pushed one is \
+                     installed at {} and {recovery}",
+                    plan.install
+                )
+            })?;
+        m.clear_agent_failure().await;
+
+        let info = agent.info();
+        // An agent that answers is not proof the new one does: a restart that
+        // has not happened leaves the old agent running from its renamed
+        // image, and it answers the reconnect as readily. The pushed binary
+        // carries its stamp in its handshake, and names its process, so
+        // either of the old ones answering is the old agent.
+        let stale = still_running_the_old_agent(pushed, &info.agent_version)
+            .map(|v| format!("still {v}"))
+            .or_else(|| {
+                same_process_answered(replaced_instance, info.instance.as_deref())
+                    .then(|| "the same instance as before".to_string())
+            });
+        let Some(stale) = stale else {
+            return Ok(agent);
+        };
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "\"{name}\": the pushed agent is installed at {} but the agent answering is \
+                 {stale} — the service did not restart onto it within {}s; `vmlab vm restart \
+                 {name}` loads it",
+                plan.install,
+                wait.as_secs()
+            );
+        }
+        // The old agent, still answering: wait for it to go. A ping it
+        // does not answer, or that another instance answers, is the restart
+        // taking effect, and the next reconnect handshakes with whoever is
+        // there then.
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !agent.ping(Duration::from_secs(5)).await {
+                break;
+            }
+        }
+    }
+}
+
+/// Wait, up to `bound`, for every session open on `agent` to end. Returns how
+/// many were still open when it stopped waiting — zero is the usual answer,
+/// and anything else is about to be cut off by the restart.
+async fn drain(agent: &super::vm_agent::AgentHandle, bound: Duration) -> usize {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        let open = agent.open_sessions().await;
+        if open == 0 || tokio::time::Instant::now() >= deadline {
+            if open > 0 {
+                tracing::warn!(
+                    open,
+                    "agent replacement: sessions still open after {}s; restarting the agent \
+                     under them",
+                    bound.as_secs()
+                );
+            }
+            return open;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether the agent answering the reconnect is the very process that was
+/// told to restart: both named an instance and it is the same one. An agent
+/// that names none (one from before instances were on the wire) cannot be
+/// told apart this way and is judged by its stamp alone.
+fn same_process_answered(replaced: Option<&str>, answering: Option<&str>) -> bool {
+    matches!((replaced, answering), (Some(a), Some(b)) if a == b)
 }
 
 /// The version the agent answering a reconnect reports, when it is not the
@@ -530,6 +658,19 @@ mod tests {
             Some("0.1.0")
         );
         assert_eq!(still_running_the_old_agent("unknown", "agent=old"), None);
+    }
+
+    /// The stamp says which binary answered; the instance says which process.
+    /// A reconnect answered under the instance the restarted agent had is the
+    /// same process, whatever its stamp; an agent naming no instance is
+    /// judged by its stamp alone, which is all it offers.
+    #[test]
+    fn a_reconnect_by_the_same_instance_is_not_a_restart() {
+        assert!(same_process_answered(Some("a81e"), Some("a81e")));
+        assert!(!same_process_answered(Some("a81e"), Some("77fc")));
+        assert!(!same_process_answered(None, Some("77fc")));
+        assert!(!same_process_answered(Some("a81e"), None));
+        assert!(!same_process_answered(None, None));
     }
 
     #[test]
