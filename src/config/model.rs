@@ -355,6 +355,9 @@ pub struct Vm {
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
+    /// A hot-plug xHCI controller for host USB passthrough (§5.2.1); None =
+    /// inherit the profile's, and with neither saying, off.
+    pub usb: Option<bool>,
     pub secure_boot: Option<bool>,
     pub qemu_args: Vec<String>,
     pub gpu: Option<Gpu>,

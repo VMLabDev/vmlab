@@ -537,6 +537,35 @@ pub trait Machine: Send + Sync + 'static {
         None
     }
 
+    // ---- host USB passthrough (PRD §5.2.1) ---------------------------------
+
+    /// Whether this machine can take a host USB device now: running, and
+    /// booted with the controller one attaches to. The default is the
+    /// container's answer — a micro-VM has no USB bus to offer.
+    async fn usb_ready(&self) -> Result<()> {
+        bail!(crate::usb::container_refusal(self.name()))
+    }
+
+    /// Hot-plug the device `plan` decided on, and track it.
+    async fn usb_attach(&self, plan: &crate::usb::AttachPlan) -> Result<crate::usb::Attachment> {
+        let _ = plan;
+        bail!(crate::usb::container_refusal(self.name()))
+    }
+
+    /// Unplug the attachment with qdev id `qdev_id` and stop tracking it —
+    /// tracking goes even when QEMU no longer knows the device, so a removal
+    /// that cannot complete never leaves a phantom attachment behind.
+    async fn usb_detach(&self, qdev_id: &str) -> Result<crate::usb::Attachment> {
+        let _ = qdev_id;
+        bail!(crate::usb::container_refusal(self.name()))
+    }
+
+    /// The host devices this machine holds now. Runtime only: a stop clears
+    /// them.
+    async fn usb_attached(&self) -> Vec<crate::usb::Attachment> {
+        Vec::new()
+    }
+
     // ---- capability surfaces ----------------------------------------------
 
     /// The machine's framebuffer, if it reports one.

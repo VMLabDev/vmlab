@@ -10,6 +10,7 @@ pub mod lab;
 mod lab_move;
 pub mod machine;
 pub mod tty_attach;
+pub mod usb;
 pub mod validate;
 
 use anyhow::Result;
@@ -114,6 +115,11 @@ pub enum Command {
     Clipboard {
         #[command(subcommand)]
         cmd: ClipboardCmd,
+    },
+    /// Pass host USB devices through to running VMs: list / attach / detach
+    Usb {
+        #[command(subcommand)]
+        cmd: usb::UsbCmd,
     },
     /// Print the DNS zones this lab's segments serve
     Dns {
@@ -708,6 +714,7 @@ pub fn run() -> ExitCode {
                 json,
             } => machine::cmd_clipboard_set(&machine, text, json),
         },
+        Command::Usb { cmd } => usb::cmd_usb(cmd),
         Command::Dns { json } => lab::cmd_dns(json),
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {

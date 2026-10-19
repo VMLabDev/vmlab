@@ -29,6 +29,7 @@ pub mod playbook;
 pub mod pull_ledger;
 pub mod share_plan;
 pub mod state;
+pub mod usb;
 pub mod vm;
 pub mod vm_agent;
 pub mod workspace;
@@ -705,6 +706,33 @@ impl Handler<LabRequest> for LabdHandler {
                     .await
                     .map_err(|e| CommandError::failed(format!("{e:#}")))?;
                 Ok(serde_json::to_value(report).unwrap_or_default())
+            }
+            // ---- host USB passthrough (PRD §5.2.1) -------------------------
+            LabRequest::MachineUsbAttach {
+                machine,
+                selector,
+                force,
+            } => {
+                let a = lab.usb_attach(&machine, &selector, force).await?;
+                Ok(json!(a))
+            }
+            LabRequest::MachineUsbDetach {
+                machine,
+                selector,
+                all,
+            } => {
+                let selector = match (selector, all) {
+                    (Some(_), true) | (None, false) => {
+                        return Err(CommandError::invalid(
+                            "name one device to detach, or pass `all` — not both, not neither",
+                        ));
+                    }
+                    (selector, _) => selector,
+                };
+                Ok(json!(lab.usb_detach(&machine, selector.as_deref()).await?))
+            }
+            LabRequest::MachineHeldUsb { machine } => {
+                Ok(json!(lab.usb_attached(machine.as_deref()).await?))
             }
             // A shared app (PRD §20.3): the daemon opens the agent session
             // and brokers it as two sockets; the window protocol's host end

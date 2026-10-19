@@ -29,6 +29,11 @@ pub struct ResolvedVm {
     pub firmware: Option<FirmwareKind>,
     pub secure_boot: bool,
     pub tpm: bool,
+    /// Boot with the hot-plug xHCI controller (`id=usbx`) host USB devices
+    /// attach to (§5.2.1). VM > profile: a template does not carry it, since
+    /// what a VM may have plugged into it is a property of the lab, not of
+    /// the image.
+    pub usb: bool,
     pub disk_bus: DiskBus,
     pub nic_model: String,
     /// VGA/display device QEMU name (None = profile said nothing and the
@@ -430,6 +435,7 @@ pub fn resolve_vm(
             .or(template.and_then(|t| t.tpm))
             .or(profile.tpm)
             .unwrap_or(false),
+        usb: lab_vm.usb.or(profile.usb).unwrap_or(false),
         disk_bus: profile.disk_bus.unwrap_or(DiskBus::Virtio),
         nic_model: profile
             .nic_model
@@ -623,6 +629,28 @@ mod tests {
         .unwrap();
         let set = ProfileSet::load(dir.path()).unwrap();
         (dir, set)
+    }
+
+    /// `usb` (§5.2.1) resolves VM block > profile and is off when neither
+    /// says; a template has no say in it.
+    #[test]
+    fn usb_precedence_vm_over_profile_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lab.wcl"),
+            "import <vmlab-profile.wcl>\nprofile \"usbby\" { usb = true }\n",
+        )
+        .unwrap();
+        let profiles = ProfileSet::load(dir.path()).unwrap();
+        let usb = |src: &str| resolve_vm(&vm(src), Some(&meta()), &profiles).unwrap().usb;
+        assert!(!usb("vm \"a\" { template = \"x86_64/win\" }"));
+        assert!(usb("vm \"a\" { template = \"x86_64/win\" usb = true }"));
+        assert!(usb(
+            "vm \"a\" { template = \"x86_64/win\" profile = \"usbby\" }"
+        ));
+        assert!(!usb(
+            "vm \"a\" { template = \"x86_64/win\" profile = \"usbby\" usb = false }"
+        ));
     }
 
     /// `cpu_model` resolves VM block > template > profile like every other

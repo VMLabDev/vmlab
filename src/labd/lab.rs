@@ -91,6 +91,10 @@ pub struct LabRuntime {
     /// ready (or, inline, finishing), so a refresh runs at most once per
     /// start. Only eligible machines are ever entered.
     deferred_refresh: std::sync::Mutex<HashMap<String, OwedRefresh>>,
+    /// Host USB passthrough's lab-wide half (§5.2.1): where the host's
+    /// devices are read from, the lock serialising attaches, and the
+    /// unplug watch.
+    pub(super) usb: super::usb::UsbHost,
     /// Where a refresh finds the agent asset this host ships for a machine —
     /// [`agent_repair::shipped_asset`](super::agent_repair::shipped_asset),
     /// replaced only by tests, which must not depend on this host's installed
@@ -628,6 +632,7 @@ impl LabRuntime {
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            usb: super::usb::UsbHost::default(),
         }))
     }
 
@@ -639,6 +644,17 @@ impl LabRuntime {
     pub(super) fn with_machines(
         config: LabFile,
         machines: Vec<Arc<dyn Machine>>,
+    ) -> Result<Arc<LabRuntime>> {
+        Self::with_machines_on(config, machines, super::usb::UsbHost::default())
+    }
+
+    /// [`Self::with_machines`] reading host USB devices from `usb` — a fake
+    /// sysfs tree.
+    #[cfg(test)]
+    pub(super) fn with_machines_on(
+        config: LabFile,
+        machines: Vec<Arc<dyn Machine>>,
+        usb: super::usb::UsbHost,
     ) -> Result<Arc<LabRuntime>> {
         let name = config.lab.name.clone();
         let root = config.root.clone();
@@ -680,6 +696,7 @@ impl LabRuntime {
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            usb,
         }))
     }
 
@@ -2604,6 +2621,15 @@ impl LabRuntime {
         // Suspending is a real stop, waited for, which closes both.
         let bracket = self.workspaces.suspend(name).await;
 
+        // An online restore rewinds the guest to a moment it held none of
+        // the host USB devices it holds now (capture refuses while any are
+        // attached), so they are unplugged first rather than left on a bus
+        // the restored device state knows nothing of (§5.2.1). An offline
+        // restore stops the machine, which releases them anyway.
+        if record.online {
+            self.usb_release_for(name, "restore").await;
+        }
+
         // **Every check that can refuse has already run**, so the note goes on
         // before the rewind and stays on if the rewind fails. That ordering is
         // the bracket's whole safety argument: after this point nobody can
@@ -3007,6 +3033,9 @@ mod tests {
         /// What `boot_id` answers, in turn; the last answer repeats. Empty is
         /// a machine with no boot identity to read.
         boot_ids: std::sync::Mutex<Vec<Result<&'static str, &'static str>>>,
+        /// Host USB devices it holds, when it is a VM booted with
+        /// `usb = true`; `None` keeps the trait's refusal.
+        usb: Option<std::sync::Mutex<Vec<crate::usb::Attachment>>>,
     }
 
     impl FakeMachine {
@@ -3031,7 +3060,17 @@ mod tests {
                 online_snapshots: false,
                 clock: crate::config::model::Clock::Host,
                 boot_ids: std::sync::Mutex::new(Vec::new()),
+                usb: None,
             })
+        }
+
+        /// A running VM double with a USB controller.
+        fn usb_vm(name: &str, shared: &Shared) -> Arc<Self> {
+            let mut m =
+                Arc::into_inner(Self::new(name, MachineKind::Vm, shared)).expect("sole owner");
+            m.usb = Some(std::sync::Mutex::new(Vec::new()));
+            *m.state.get_mut() = PowerState::Running;
+            Arc::new(m)
         }
 
         /// A running double whose snapshots are online, declaring `clock`.
@@ -3251,6 +3290,47 @@ mod tests {
         }
         async fn snapshot(&self, _name: &str) -> Result<bool> {
             Ok(self.online_snapshots)
+        }
+        async fn usb_ready(&self) -> Result<()> {
+            if self.usb.is_none() {
+                bail!(crate::usb::container_refusal(&self.name));
+            }
+            if *self.state.read().await != PowerState::Running {
+                bail!("\"{}\" is not running", self.name);
+            }
+            Ok(())
+        }
+        async fn usb_attach(
+            &self,
+            plan: &crate::usb::AttachPlan,
+        ) -> Result<crate::usb::Attachment> {
+            self.usb_ready().await?;
+            let a = crate::usb::Attachment {
+                machine: self.name.clone(),
+                qdev_id: plan.device.qdev_id(),
+                device: plan.device.clone(),
+            };
+            self.usb.as_ref().unwrap().lock().unwrap().push(a.clone());
+            self.note(&format!("usb_attach:{}", a.device.port)).await;
+            Ok(a)
+        }
+        async fn usb_detach(&self, qdev_id: &str) -> Result<crate::usb::Attachment> {
+            let gone = {
+                let mut held = self.usb.as_ref().unwrap().lock().unwrap();
+                let i = held
+                    .iter()
+                    .position(|a| a.qdev_id == qdev_id)
+                    .ok_or_else(|| anyhow!("no {qdev_id}"))?;
+                held.remove(i)
+            };
+            self.note(&format!("usb_detach:{}", gone.device.port)).await;
+            Ok(gone)
+        }
+        async fn usb_attached(&self) -> Vec<crate::usb::Attachment> {
+            self.usb
+                .as_ref()
+                .map(|u| u.lock().unwrap().clone())
+                .unwrap_or_default()
         }
         fn clock(&self) -> crate::config::model::Clock {
             self.clock
@@ -4209,5 +4289,174 @@ lab "t" {
             !said.load(std::sync::atomic::Ordering::Relaxed),
             "all mounted says nothing"
         );
+    }
+
+    // ---- host USB passthrough (§5.2.1) ---------------------------------------
+
+    /// A lab of two USB-capable VM doubles `a` and `b` and a container `web`,
+    /// reading the fake sysfs of `usb::tests::fake_sysfs`, with device nodes
+    /// for both flash drives this process can open and a receiver node it
+    /// cannot.
+    fn usb_lab(dir: &std::path::Path) -> (Arc<LabRuntime>, tempfile::TempDir, Arc<FakeMachine>) {
+        use std::os::unix::fs::PermissionsExt;
+        let sh = shared(dir);
+        let sys = crate::usb::tests::fake_sysfs();
+        let dev = dir.join("dev");
+        std::fs::create_dir_all(dev.join("001")).unwrap();
+        for (n, mode) in [("006", 0o666), ("007", 0o666), ("015", 0o444)] {
+            let node = dev.join("001").join(n);
+            std::fs::write(&node, b"").unwrap();
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let a = FakeMachine::usb_vm("a", &sh);
+        let b = FakeMachine::usb_vm("b", &sh);
+        let web = FakeMachine::new("web", MachineKind::Container, &sh);
+        let config = crate::config::load_lab_source(
+            "import <vmlab.wcl>\nlab \"t\" {\n  vm \"a\" { template = \"x86_64/t\" usb = true }\n  \
+             vm \"b\" { template = \"x86_64/t\" usb = true }\n  container \"web\" { image = \"web:1\" }\n}\n",
+            "<test>",
+            dir,
+        )
+        .expect("lab source");
+        let lab = LabRuntime::with_machines_on(
+            config,
+            vec![a.clone(), b, web],
+            super::super::usb::UsbHost::fake(sys.path().to_path_buf(), dev),
+        )
+        .expect("runtime");
+        (lab, sys, a)
+    }
+
+    #[tokio::test]
+    async fn usb_attach_refusals_and_detach() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sys, _a) = usb_lab(dir.path());
+        let mut events = lab.events.subscribe();
+
+        let got = lab.usb_attach("a", "0781:5581@BB22", false).await.unwrap();
+        assert_eq!(got.device.port, "1-9");
+        assert_eq!(got.qdev_id, "usbhost-1-9");
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.event, "usb.attached");
+        assert_eq!(ev.data["vm"], "a");
+        assert_eq!(ev.data["port"], "1-9");
+
+        let err = |r: Result<crate::usb::Attachment>| format!("{:#}", r.unwrap_err());
+        // Held by another machine of this lab, named as lab/vm.
+        let e = err(lab.usb_attach("b", "port:1-9", false).await);
+        assert!(e.contains("already attached to t/a"), "{e}");
+        // Ambiguous: both drives match.
+        let e = err(lab.usb_attach("b", "0781:5581", false).await);
+        assert!(e.contains("matches 2 USB devices"), "{e}");
+        // A HID receiver wants --force, then a node this process can open.
+        let e = err(lab.usb_attach("b", "046d:c547", false).await);
+        assert!(e.contains("is a HID keyboard"), "{e}");
+        if !nix::unistd::getuid().is_root() {
+            let e = err(lab.usb_attach("b", "046d:c547", true).await);
+            assert!(e.contains("cannot open") && e.contains("001/015"), "{e}");
+            assert!(e.contains("sudo setfacl -m u:"), "{e}");
+        }
+        let e = err(lab.usb_attach("web", "port:1-10", false).await);
+        assert!(e.contains("USB passthrough is for VMs"), "{e}");
+        let e = err(lab.usb_attach("b", "mouse", false).await);
+        assert!(e.contains("is not a USB selector"), "{e}");
+
+        lab.usb_attach("b", "port:1-10", false).await.unwrap();
+        assert_eq!(lab.usb_attached(None).await.unwrap().len(), 2);
+        // The container holds nothing, and says so without refusing: the
+        // supervisor asks every machine.
+        assert!(lab.usb_attached(Some("web")).await.unwrap().is_empty());
+
+        let gone = lab.usb_detach("a", Some("port:1-9")).await.unwrap();
+        assert_eq!(gone.len(), 1);
+        let e = format!(
+            "{:#}",
+            lab.usb_detach("a", Some("port:1-9")).await.unwrap_err()
+        );
+        assert!(e.contains("attached to \"a\""), "{e}");
+        let gone = lab.usb_detach("b", None).await.unwrap();
+        assert_eq!(gone[0].device.port, "1-10");
+        assert!(lab.usb_attached(None).await.unwrap().is_empty());
+    }
+
+    /// A device unplugged from the host while a VM holds it leaves the
+    /// tracking, with a `usb.detached` that says why; the rest stay.
+    #[tokio::test]
+    async fn an_unplugged_device_is_swept_out_of_the_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, sys, a) = usb_lab(dir.path());
+        lab.usb_attach("a", "port:1-9", false).await.unwrap();
+        lab.usb_attach("b", "port:1-10", false).await.unwrap();
+        let mut events = lab.events.subscribe();
+
+        assert!(lab.usb_sweep().await, "nothing has left");
+        std::fs::remove_dir_all(sys.path().join("1-9")).unwrap();
+        assert!(lab.usb_sweep().await, "b still holds one");
+        assert!(a.usb_attached().await.is_empty());
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.event, "usb.detached");
+        assert_eq!(ev.data["reason"], "unplugged");
+        assert_eq!(ev.data["port"], "1-9");
+
+        // Replugged into the same socket: a new device number, so it is not
+        // the device b was given.
+        std::fs::write(sys.path().join("1-10").join("devnum"), "8\n").unwrap();
+        assert!(!lab.usb_sweep().await, "nothing attached any more");
+        assert!(lab.usb_attached(None).await.unwrap().is_empty());
+    }
+
+    /// The wscript surface (§5.2.1) over the same runtime calls.
+    #[tokio::test]
+    async fn usb_from_wscript() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sys, _a) = usb_lab(dir.path());
+        let said = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            Arc::new(move |s: String| said.lock().unwrap().push(s.trim_end().to_string()))
+        };
+        let script = r#"use vmlab
+
+fn main(lab: Lab) {
+    let Ok(a) = lab.machine("a") else { return }
+    match a.usb_attach("046d:c547") {
+        Ok(_) => lab.log("hid attached unforced"),
+        Err(e) => lab.log("refused: " + e),
+    }
+    let d = a.usb_attach("0781:5581@AA11").expect("attach")
+    lab.log("attached " + d.id + " " + d.vendor_id + ":" + d.product_id)
+    for dev in lab.usb_devices().expect("list") {
+        match dev.attached_to {
+            Some(h) => lab.log("held " + dev.port + " by " + h),
+            None => lab.log("free " + dev.port),
+        }
+    }
+    lab.log("a holds " + fmt("{}", a.usb_attached().expect("attached").len()))
+    a.usb_detach("port:1-10").expect("detach")
+    lab.log("a holds " + fmt("{}", a.usb_attached().expect("attached").len()))
+}
+"#;
+        crate::scripting::run_script_source(
+            lab,
+            script.into(),
+            "usb.ws",
+            dir.path().to_path_buf(),
+            None,
+            sink,
+        )
+        .await
+        .expect("script");
+        let said = said.lock().unwrap().clone();
+        let has = |line: &str| said.iter().any(|s| s == line);
+        assert!(
+            said.iter()
+                .any(|s| s.starts_with("refused: ") && s.contains("HID keyboard")),
+            "{said:?}"
+        );
+        assert!(has("attached port:1-10 0781:5581"), "{said:?}");
+        assert!(has("held 1-10 by t/a"), "{said:?}");
+        assert!(has("free 1-9"), "{said:?}");
+        assert!(has("a holds 1"), "{said:?}");
+        assert!(has("a holds 0"), "{said:?}");
     }
 }

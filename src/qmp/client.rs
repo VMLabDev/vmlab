@@ -320,6 +320,45 @@ impl QmpClient {
         self.input_send_event(events).await
     }
 
+    // --- device hot-plug ---------------------------------------------------
+
+    /// Hot-plug a device (`device_add`). `args` is the device's properties,
+    /// `driver` and `id` among them.
+    pub async fn device_add(&self, args: Value) -> Result<(), QmpError> {
+        self.execute("device_add", Some(args)).await.map(|_| ())
+    }
+
+    /// Unplug the device with qdev id `id` (`device_del`) and wait up to
+    /// `timeout` for QEMU's `DEVICE_DELETED` naming it — `device_del` only
+    /// *requests* the removal, and the id stays taken until the event.
+    ///
+    /// Subscribed before the request, so an event QEMU emits before the
+    /// reply (a USB unplug is immediate) is not missed.
+    pub async fn device_del(&self, id: &str, timeout: Duration) -> Result<(), QmpError> {
+        let mut events = self.subscribe_events();
+        self.execute("device_del", Some(json!({"id": id}))).await?;
+        let wait = async {
+            loop {
+                match events.recv().await {
+                    Ok(e)
+                        if e.event == "DEVICE_DELETED"
+                            && e.data.get("device").and_then(Value::as_str) == Some(id) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Err(QmpError::Closed),
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            QmpError::Protocol(format!(
+                "device_del {id}: no DEVICE_DELETED within {}s",
+                timeout.as_secs()
+            ))
+        })?
+    }
+
     // --- snapshots ----------------------------------------------------------
 
     /// Take an online snapshot (`snapshot-save`): disk + RAM + device

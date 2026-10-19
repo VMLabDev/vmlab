@@ -37,6 +37,7 @@ the code is the contract.
 | `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>`, `lab: Option<String>`, `members: Vec<GlobalMember>`, `mtu: Option<u16>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
 | `global.detach` | `name: String`, `lab: Option<String>` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
+| `usb.list` | — | `cli`, `daemon` | Every USB device plugged into this host (PRD §5.2.1), hubs hidden, each with the `lab/vm` holding it, if one does. |
 | `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli` | The templates a file declares, with their store and build state. |
 | `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>` | `cli` | Start building one declared template. |
 | `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running build. |
@@ -85,6 +86,9 @@ the code is the contract.
 | `machine.osinfo` | `machine: String`, `timeout: u64` | `cli` | What the guest OS says it is. |
 | `machine.tty_open` | `machine: String`, `cols: u16`, `rows: u16`, `user: Option<String>`, `password: Option<String>` | `cli` | Open an interactive terminal, re-exposed as a raw-byte unix socket the caller connects to. Every open gets its own shell. |
 | `machine.repair_agent` | `machine: String` | `cli` | Push the host's shipped vmlab-agent into a running machine and mark it **diverged** (PRD §19.4). Never fires by itself: an automatic refresh would make the template's sealed `agent_version` a lie. |
+| `machine.usb_attach` | `machine: String`, `selector: String`, `force: bool` | `cli` | Hot-plug the host USB device `selector` names into a running VM booted with `usb = true` (PRD §5.2.1): `<vid>:<pid>`, `<vid>:<pid>@<serial>` or `port:<bus>-<port>`. A HID keyboard or mouse is refused without `force`. Answers with the attachment. |
+| `machine.usb_detach` | `machine: String`, `selector: Option<String>`, `all: bool` | `cli` | Unplug a host USB device from a VM — the one `selector` names, or with `all` every one it holds. Answers with what was detached. |
+| `machine.usb_attached` | `machine: Option<String>` | `daemon` | The host USB devices one machine holds — or, with `machine` omitted, every machine in the lab. |
 | `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli` | Resize an open terminal session. |
 | `machine.app_open` | `machine: String`, `mode: String`, `argv: Vec<String>`, `cwd: Option<String>`, `cookie: Option<String>`, `user: Option<String>`, `password: Option<String>` | `cli` | Open a **shared app** session (PRD §20): start `argv` in the guest and carry its windows' protocol to the caller, which owns the host desktop end. The reply is `{"session", "control", "conns"}`, plus `"rdp": {"user", "password"}` in `rdp` mode. `control` is a unix socket relaying the session's length-prefixed app records, closed by the caller to end the session; every connection to `conns` becomes one transport connection of the session. In `waypipe` mode a guest with no `waypipe` for that identity answers `unsupported`. |
 | `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
@@ -136,6 +140,8 @@ Deliberate, with the reason recorded beside the declaration:
 - `machine.exec` — The scripted counterpart to the console's interactive terminals: one command, its output collected, an exit code to branch on. The console opens a shell and lets a human type instead.
 - `machine.osinfo` — A live guest probe with a timeout, so it does not belong on a panel that refreshes; the status projection already carries what the console shows about a machine. Its CLI help calls it fit for scripting, which is what it is.
 - `machine.repair_agent` — A deliberate, machine-changing act with a rebuild as its alternative — the console offering it as a button would invite exactly the reflex the verb exists to keep manual, and its audience is whoever is iterating on the agent itself, at a terminal.
+- `machine.usb_attach` — A script attaches through the lab runtime it is bound to, not over the socket, so the verb is the one caller that crosses it.
+- `machine.usb_detach` — The other half of `machine.usb_attach`, and one-way for the same reason.
 - `machine.app_open` — The host end of a shared app is a window-protocol client running in the user's own desktop session, which only a process started there has; the daemon is headless by design (§11).
 - `machine.tail` — An open-ended stream of an arbitrary guest path, which is what a terminal is for. The console follows a machine's console log through `machine.logs`.
 - `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.
@@ -201,6 +207,7 @@ Neither, which the build rejects:
 
 Deliberate, with the reason recorded beside the declaration:
 
+- `machine.usb_attached` — The supervisor asks every lab to fold holders into `usb.list`, which is the listing the CLI shows; a per-machine view of the same rows would be a second way to read one fact.
 - `global.attach` — Daemon-internal: a lab daemon joins a global segment because a lab declared one, so there is nothing for a person to ask for.
 - `global.detach` — The other half of `global.attach`, and daemon-internal for the same reason.
 - `global.list` — A lab daemon reads it to fold each segment's peer state into the lab status projection, which is how both other surfaces already see it.

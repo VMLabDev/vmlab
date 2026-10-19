@@ -34,6 +34,9 @@ const STOP_SETTLE: Duration = Duration::from_secs(120);
 /// `system_wakeup`. QEMU resumes the vCPUs at once; what takes the time is
 /// the event arriving, so this is generous rather than tight.
 const WAKE_SETTLE: Duration = Duration::from_secs(10);
+/// How long a USB detach waits for QEMU's `DEVICE_DELETED`. A USB unplug
+/// completes as it is asked for, so this only bounds a wedged emulator.
+const USB_DETACH_WAIT: Duration = Duration::from_secs(10);
 
 /// What to tell a user whose guest has no answering vmlab-agent. A failed
 /// handshake alone cannot say why, so the advice leans on what is known:
@@ -280,6 +283,10 @@ pub struct VmInstance {
     /// daemons start, because what they were started with is what a
     /// snapshot meets. Std lock: never held across an await.
     snapshot_refusal: std::sync::Mutex<Option<String>>,
+    /// Host USB devices this run holds (§5.2.1). Runtime only — teardown
+    /// clears it, since a stopped QEMU holds nothing. Held across the QMP
+    /// call of an attach or detach, so two never interleave on one VM.
+    usb: Mutex<Vec<crate::usb::Attachment>>,
     /// The running machine's control channel (see [`Control`]); `None` while
     /// stopped.
     control: Mutex<Option<Arc<dyn Control>>>,
@@ -363,6 +370,7 @@ impl VmInstance {
             virtiofsd: Mutex::new(Vec::new()),
             virtiofs_mounts: Mutex::new(Vec::new()),
             snapshot_refusal: std::sync::Mutex::new(None),
+            usb: Mutex::new(Vec::new()),
             control: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
@@ -1110,6 +1118,7 @@ impl VmInstance {
             }
         }
         self.virtiofs_mounts.lock().await.clear();
+        self.usb.lock().await.clear();
         *self.snapshot_refusal.lock().expect("refusal lock") = None;
         // RAII: dropping tap attachments detaches their switch ports and
         // XDP state; with QEMU gone, the kernel then destroys the taps.
@@ -1224,6 +1233,11 @@ impl VmInstance {
             PowerState::Running => {
                 if let Some(why) = self.online_snapshot_refusal().await {
                     bail!("{why}");
+                }
+                // See `usb::snapshot_refusal` for why, and PRD §5.2.1.
+                let attached = self.usb.lock().await.clone();
+                if !attached.is_empty() {
+                    bail!(crate::usb::snapshot_refusal(&self.cfg.name, &attached));
                 }
                 let qmp = self.qmp().await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
@@ -1643,6 +1657,66 @@ impl super::machine::Machine for VmInstance {
 
     async fn delete_snapshot(&self, name: &str) -> Result<()> {
         self.drop_snapshot(name).await
+    }
+
+    async fn usb_ready(&self) -> Result<()> {
+        match self.power_state().await {
+            PowerState::Running => {}
+            PowerState::Suspended => return Err(super::machine::suspended_error(&self.cfg.name)),
+            _ => bail!(
+                "\"{}\" is not running — host USB devices attach to a running VM",
+                self.cfg.name
+            ),
+        }
+        if !self.template().resolved.usb {
+            bail!(crate::usb::no_controller_refusal(&self.cfg.name));
+        }
+        Ok(())
+    }
+
+    async fn usb_attach(&self, plan: &crate::usb::AttachPlan) -> Result<crate::usb::Attachment> {
+        self.usb_ready().await?;
+        let mut attached = self.usb.lock().await;
+        let qmp = self.qmp().await?;
+        qmp.device_add(plan.args.clone()).await.with_context(|| {
+            format!("attaching {} to {}", plan.device.describe(), self.cfg.name)
+        })?;
+        let attachment = crate::usb::Attachment {
+            machine: self.cfg.name.clone(),
+            qdev_id: plan.device.qdev_id(),
+            device: plan.device.clone(),
+        };
+        attached.push(attachment.clone());
+        Ok(attachment)
+    }
+
+    async fn usb_detach(&self, qdev_id: &str) -> Result<crate::usb::Attachment> {
+        let mut attached = self.usb.lock().await;
+        let i = attached
+            .iter()
+            .position(|a| a.qdev_id == qdev_id)
+            .ok_or_else(|| anyhow!("\"{}\" holds no USB device {qdev_id}", self.cfg.name))?;
+        let gone = attached.remove(i);
+        // Removed from the tracking first: a QEMU that has already dropped
+        // the device, or exited, must not leave a phantom behind.
+        let qmp = self.qmp().await?;
+        match qmp.device_del(qdev_id, USB_DETACH_WAIT).await {
+            Ok(()) => Ok(gone),
+            Err(crate::qmp::QmpError::Command { class, .. }) if class == "DeviceNotFound" => {
+                Ok(gone)
+            }
+            Err(e) => Err(anyhow!(e)).with_context(|| {
+                format!(
+                    "detaching {} from {}",
+                    gone.device.describe(),
+                    self.cfg.name
+                )
+            }),
+        }
+    }
+
+    async fn usb_attached(&self) -> Vec<crate::usb::Attachment> {
+        self.usb.lock().await.clone()
     }
 
     fn display(self: Arc<Self>) -> Option<super::display::Display> {

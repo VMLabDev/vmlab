@@ -445,6 +445,40 @@ async fn a_vms_status_reports_its_resolved_hardware() {
     assert_eq!(detail.memory, Some(resolved.memory));
 }
 
+/// Host USB passthrough's machine-side refusals (§5.2.1): a container
+/// never; a VM only while running, and only when it booted with the
+/// controller; a stop forgets nothing it did not hold.
+#[tokio::test]
+async fn usb_attaches_only_to_a_running_vm_with_the_controller() {
+    let dirs = Dirs::new();
+    let (ctr, _hv) = container(&dirs, WORKLOAD, Script::healthy());
+    let e = format!("{:#}", ctr.usb_ready().await.unwrap_err());
+    assert_eq!(e, "\"web\" is a container — USB passthrough is for VMs");
+
+    let (plain, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let e = format!("{:#}", plain.usb_ready().await.unwrap_err());
+    assert!(e.contains("is not running"), "{e}");
+    let (cbs, _observed) = callbacks();
+    start_vm(&plain, cbs).await.expect("start");
+    let e = format!("{:#}", plain.usb_ready().await.unwrap_err());
+    assert_eq!(
+        e,
+        "\"dc01\" has no USB controller to attach to — set `usb = true` on dc01 and restart it"
+    );
+    plain.stop(true).await.expect("stop");
+
+    let (usb, _hv) = vm(
+        &dirs,
+        r#"vm "dc02" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB usb = true }"#,
+        Script::healthy(),
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&usb, cbs).await.expect("start");
+    usb.usb_ready().await.expect("running with a controller");
+    assert!(usb.usb_attached().await.is_empty());
+    usb.stop(true).await.expect("stop");
+}
+
 // ---- the VM start ladder ----------------------------------------------------
 
 /// The whole point of the seam: a VM's start ladder runs to completion with
