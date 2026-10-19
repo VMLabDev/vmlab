@@ -545,6 +545,12 @@ pub fn container_refusal(name: &str) -> String {
 }
 
 /// The refusal for an online snapshot while devices are attached.
+///
+/// Not a QEMU limit: 11.1 saves a `usb-host` device's state and loads it
+/// back while the device is still attached. Loading it once the device is
+/// gone fails ("Unknown section or instance '…/usb-host'"), and nothing
+/// guarantees the device is plugged in, at that port, on the day of the
+/// restore — so the snapshot is refused rather than taken unrestorable.
 pub fn snapshot_refusal(vm: &str, attached: &[Attachment]) -> String {
     format!(
         "\"{vm}\" holds host USB devices ({}) — an online snapshot of it could only be \
