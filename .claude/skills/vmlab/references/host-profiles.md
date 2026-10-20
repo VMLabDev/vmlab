@@ -141,7 +141,10 @@ With `qemu_binary` set, the VM also gets `-L <stock data dir>` —
 `<prefix>/share/qemu` of the `qemu-system-<arch>` on PATH, only if it exists —
 so a minimal build finds firmware and ROMs; QEMU still searches its own data
 dir after it. `qemu.log`'s `vmlab: env:` line lists every variable vmlab set,
-`qemu_env` included; `vmlab status -v` shows `qemu=<path>` after `host_gpu=`.
+`qemu_env` included; `vmlab status -v` shows `qemu=<path>` after `host_gpu=`,
+then the same variables as `env=NAME=value,...` by name (values in full), and
+`status --json` carries them as the VM's `qemu_env` object — both as recorded
+at the start, not the host config as it is now.
 No host-wide default, no CLI override; template builds (no `gpu {}`) always run
 the stock QEMU. Use: NVIDIA's EGL takes a LINEAR dma-buf only as
 `GL_TEXTURE_EXTERNAL_OES`, so stock QEMU 11.1's egl-headless shows a black

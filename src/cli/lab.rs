@@ -393,16 +393,34 @@ pub fn cmd_destroy() -> Result<()> {
 /// `vmlab status`. A lab name registered from another directory is that
 /// directory's lab, not this one's, so it is the same conflict every other
 /// lab-scoped verb answers (ADR-0011, issue #148) rather than its status.
-pub fn cmd_status(verbose: bool) -> Result<()> {
+pub fn cmd_status(verbose: bool, json: bool) -> Result<()> {
     rt()?.block_on(async {
         let (name, root) = current_lab()?;
         let Some(client) = daemon::try_own_lab_daemon(&name, &root).await? else {
+            if json {
+                return super::print_json(&not_running_status(&name));
+            }
             println!("lab \"{name}\": not running");
             return Ok(());
         };
-        print!("{}", render_status(&lab_status(&client).await?, verbose));
+        let payload = client.send(LabRequest::Status {}).await.map_err(remote)?;
+        let status = read_status(payload.clone())?;
+        if json {
+            // The daemon's projection verbatim, as `lab list --json` does —
+            // after the parse above, so a reply this binary cannot read is
+            // the same error either way rather than JSON of unknown shape.
+            return super::print_json(&payload);
+        }
+        print!("{}", render_status(&status, verbose));
         Ok(())
     })
+}
+
+/// What `status --json` prints for a lab with no daemon: the name and that
+/// nothing runs, so a script reads one shape from both answers rather than
+/// parsing a sentence.
+fn not_running_status(name: &str) -> Value {
+    serde_json::json!({ "lab": name, "running": false })
 }
 
 /// Ask a lab daemon for its status projection (ADR-0004).
@@ -412,6 +430,11 @@ pub fn cmd_status(verbose: bool) -> Result<()> {
 /// printed a status table with no rows in it.
 pub(super) async fn lab_status(client: &LabClient) -> Result<LabStatus> {
     let payload = client.send(LabRequest::Status {}).await.map_err(remote)?;
+    read_status(payload)
+}
+
+/// The daemon's status reply as the typed projection, or the error above.
+fn read_status(payload: Value) -> Result<LabStatus> {
     serde_json::from_value(payload).context("the lab daemon reported a status vmlab cannot read")
 }
 
@@ -608,6 +631,20 @@ fn machine_detail(m: &MachineStatus) -> String {
             // Only when that host GPU ran its own QEMU, not the stock one.
             if let Some(qemu) = &vm.qemu_binary {
                 field("qemu", qemu.clone());
+            }
+            // The variables vmlab set in that QEMU's environment at start,
+            // `qemu_env` included, by name — what `qemu.log`'s `vmlab: env:`
+            // line shows, so the question "did this VM get the host GPU's
+            // setting" is answered here without opening the log. Values in
+            // full: vmlab is not a security boundary, and a path is the
+            // usual answer.
+            if !vm.qemu_env.is_empty() {
+                let pairs: Vec<String> = vm
+                    .qemu_env
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                field("env", pairs.join(","));
             }
         }
         MachineDetail::Container(c) => {
@@ -2021,8 +2058,8 @@ pub fn cmd_logs(
 mod tests {
     use super::{
         DaemonFreshness, LabRequest, PowerOp, Region, backup_notice, daemon_freshness,
-        format_log_line, listed_state, pulling_machines, region_value, render_dns, render_status,
-        root_for,
+        format_log_line, listed_state, not_running_status, pulling_machines, region_value,
+        render_dns, render_status, root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
@@ -2359,6 +2396,57 @@ mod tests {
             line.ends_with(" host_gpu=Nvidia1 qemu=/opt/qemu-vmlab/bin/qemu-system-x86_64"),
             "got:\n{out}"
         );
+    }
+
+    /// A VM with a `gpu {}` shows the variables its start set in QEMU's
+    /// environment after `qemu=` — vmlab's own loader filter and the host
+    /// GPU's `qemu_env`, by name, values in full — so whether a running VM
+    /// got a host GPU's setting is read here rather than from `qemu.log`
+    /// (§5.2). A VM that set none says nothing.
+    #[test]
+    fn verbose_shows_the_environment_a_vm_was_started_with() {
+        let MachineDetail::Vm(mut detail) = vm() else {
+            unreachable!()
+        };
+        detail.host_gpu = Some("Nvidia1".into());
+        detail.qemu_binary = Some("/opt/qemu-vmlab/bin/qemu-system-x86_64".into());
+        detail.qemu_env = std::collections::BTreeMap::from([
+            (
+                "VK_LOADER_DRIVERS_SELECT".to_string(),
+                "*nvidia*".to_string(),
+            ),
+            (
+                "RENDER_SERVER_EXEC_PATH".to_string(),
+                "/opt/virgl/libexec/virgl_render_server".to_string(),
+            ),
+        ]);
+        let out = render_status(
+            &lab(vec![
+                addressed("gl01", PowerState::Running, true, MachineDetail::Vm(detail)),
+                addressed("dc01", PowerState::Running, true, vm()),
+            ]),
+            true,
+        );
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("state=")).collect();
+        assert!(
+            lines[0].ends_with(
+                " qemu=/opt/qemu-vmlab/bin/qemu-system-x86_64 \
+                 env=RENDER_SERVER_EXEC_PATH=/opt/virgl/libexec/virgl_render_server,\
+                 VK_LOADER_DRIVERS_SELECT=*nvidia*"
+            ),
+            "got:\n{out}"
+        );
+        assert!(!lines[1].contains(" env="), "got:\n{out}");
+    }
+
+    /// `status --json` on a lab with no daemon answers in JSON too, naming
+    /// the lab and that nothing runs, so a script reads one shape from both
+    /// answers.
+    #[test]
+    fn a_lab_that_is_not_running_has_a_json_answer() {
+        let v = not_running_status("ad-lab");
+        assert_eq!(v["lab"], "ad-lab");
+        assert_eq!(v["running"], false);
     }
 
     /// A machine a repair verb changed in place says so wherever its state is

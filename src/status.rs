@@ -14,6 +14,7 @@
 //!   [`MachineLabel::derive`], so no two surfaces can describe the same lab
 //!   differently.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -260,6 +261,14 @@ pub struct VmStatus {
     /// emulator (§5.2); `None` for the stock one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qemu_binary: Option<String>,
+    /// The variables vmlab set in that QEMU's own environment at the last
+    /// start (§5.2): the derived `VK_*`/`VMLAB_*` loader filter and the host
+    /// GPU's `qemu_env` laid over it — what `qemu.log`'s `vmlab: env:` line
+    /// records, by name. Recorded at start, so a host config edited since
+    /// does not change what a running VM reports. Empty with no `gpu {}` or
+    /// before a start.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub qemu_env: BTreeMap<String, String>,
 }
 
 /// What a container has and a VM does not.
@@ -641,6 +650,7 @@ pub(crate) mod fixtures {
             agent_version: Some("0.1.0".into()),
             host_gpu: None,
             qemu_binary: None,
+            qemu_env: BTreeMap::new(),
         })
     }
 
@@ -962,6 +972,40 @@ mod tests {
         assert_eq!(json["machines"][0]["agent_diverged"], true);
         let back: LabStatus = serde_json::from_value(json).unwrap();
         assert!(back.machines[0].agent_diverged);
+    }
+
+    /// A VM carries the variables its start set in QEMU's environment (§5.2)
+    /// as one object by name, so a script reads a key straight out of
+    /// `status --json`; a VM that set none carries no key at all rather than
+    /// an empty object on every row, and reads back as none.
+    #[test]
+    fn the_projection_carries_the_qemu_environment_a_vm_started_with() {
+        let MachineDetail::Vm(mut detail) = vm() else {
+            unreachable!()
+        };
+        detail.qemu_env = BTreeMap::from([
+            (
+                "VK_LOADER_DRIVERS_SELECT".to_string(),
+                "*nvidia*".to_string(),
+            ),
+            ("RENDER_SERVER_EXEC_PATH".to_string(), "/x".to_string()),
+        ]);
+        let status = lab(vec![
+            machine("gl01", PowerState::Running, true, MachineDetail::Vm(detail)),
+            machine("dc01", PowerState::Running, true, vm()),
+        ]);
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["machines"][0]["qemu_env"]["RENDER_SERVER_EXEC_PATH"],
+            "/x"
+        );
+        assert_eq!(
+            json["machines"][0]["qemu_env"]["VK_LOADER_DRIVERS_SELECT"],
+            "*nvidia*"
+        );
+        assert!(json["machines"][1].get("qemu_env").is_none());
+        let back: LabStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status);
     }
 
     /// The wire shape: kind-specific fields sit alongside the common ones under

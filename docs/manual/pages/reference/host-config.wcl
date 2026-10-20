@@ -174,7 +174,10 @@ SRC
     turns the layer off. The
     `vmlab: env:` line in `qemu.log` lists every variable vmlab set,
     `qemu_env` included, with its value. `vmlab status -v` shows
-    `qemu=<path>` after `host_gpu=` for a VM that ran a `qemu_binary`.
+    `qemu=<path>` after `host_gpu=` for a VM that ran a `qemu_binary`, then
+    that same set as `env=NAME=value,...` by name, values in full;
+    `vmlab status --json` carries it as the VM's `qemu_env` object. Both
+    show what the VM was started with, not the host config as it is now.
     Template builds never have a `gpu {}`, so they always run the stock QEMU.
   DOC
 
