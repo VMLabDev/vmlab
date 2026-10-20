@@ -188,8 +188,13 @@ fn run_with(platform: PlatformImpl) -> ! {
                     mux.handle_frame(frame, &platform);
                 }
             }
+            // A read that fails is a port connection being reset (the
+            // Windows adapter poisons one whose write stalled; the reader
+            // reopens it on its next pass). Bytes were lost on it, so every
+            // session dies with it, and the host is told on each.
             Err(e) => {
                 eprintln!("vmlab-agent: port read failed: {e}");
+                mux.reset(&format!("port connection reset ({e})"));
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }

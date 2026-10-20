@@ -286,6 +286,22 @@ over it), terminals, tail, metrics, clipboard and the workspace watch, in
 both VMs and containers.
 _Avoid_: QGA, qemu-guest-agent (removed), guest tools
 
+**Progress watchdog**:
+The rule that a `fileops` channel which goes silent fails rather than waits:
+nothing from the guest for 60 s with a request outstanding fails the call,
+naming the request and the file, and the channel with it. Measured as
+silence, so a slow transfer that is still moving never trips it; a `digest`'s
+budget grows with the file.
+_Avoid_: timeout (reads as elapsed time, which a slow transfer would exceed)
+
+**Port connection reset**:
+The agent abandoning a virtio-serial port connection whose write pended too
+long (15 s on Windows) and reopening the port. Bytes are lost in both
+directions, so the agent fails every open channel with `channel lost: port
+connection reset`, and its port writer offers a refused frame again instead
+of dropping it.
+_Avoid_: reconnect (the host never disconnected), hang
+
 **Event handler**:
 A wscript script bound with `on "event" {}` that reacts to a lifecycle event.
 Failures are logged, never fatal.

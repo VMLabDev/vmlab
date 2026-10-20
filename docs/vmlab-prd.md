@@ -1486,6 +1486,22 @@ guest-computed verification that today's transfer offers (and which the syncer
 then leans on heavily), and **`mode` moves to `open`/`setstat`**, keeping "Unix
 permission bits, ignored on Windows".
 
+**A file channel that goes silent fails, and says so.** Every request on a
+`fileops` channel runs under a **progress watchdog**: once nothing at all has
+arrived from the guest for 60 s while a request is outstanding, the call fails
+naming the request and the file, and the channel with it — a record stream has
+no resynchronisation point, so every later reply on it would be suspect. The
+budget is silence, not elapsed time: a transfer that is slow but moving renews
+it with every reply, pipelined or not, and `digest` — the one request with no
+progress inside it — gets a budget that grows with the file (60 s plus the
+length at 2 MiB/s). The agent's half of the same rule: a **port connection
+reset** (the Windows adapter abandons a port write that pends 15 s and reopens
+the port) loses bytes the host cannot account for, so the agent fails every
+open channel with an error the host receives by id, and its port writer offers
+a refused frame again rather than dropping it. Before both, a frame lost on
+such a reset left `vmlab cp` waiting forever with nothing logged on either
+side.
+
 **`watch` reports paths, not events** — and that single move dissolves the
 platform-divergence problem. The agent holds a **coalescing set of dirty paths**
 that the host drains; a drained record is the path plus its **current stat**

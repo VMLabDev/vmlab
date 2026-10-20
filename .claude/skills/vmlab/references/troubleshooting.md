@@ -79,6 +79,15 @@ Usual causes, in order of likelihood: the template was built without the agent, 
 
 If the guest is up and the agent is absent, rebuild the template so the bake installs the agent this vmlab ships, or push one into the running machine with `vmlab machine repair-agent`. A container's agent comes from the host's guest asset, so on a container the message ends with `there is nothing to rebuild or repair — an agent that is not answering here is a machine to restart, or a guest asset to reinstall (§19.4)`.
 
+## A copy failed because the file channel went silent
+
+```
+push C:/tools/driver.sys: writing at offset 65536: the guest's agent answered nothing for 60s: the write at offset 65536 is unanswered and nothing else moved on the file channel
+pull C:/big.bin: reading at offset 63569920: channel lost: port connection reset (…)
+```
+
+Every request on the agent's file session runs under a progress watchdog: the first message means nothing at all arrived from the guest for 60 seconds while the named request was outstanding. It is silence, not slowness — a slow transfer that is still moving renews the budget with every reply. The second is the guest's own report: its port connection was reset under the session (a port write that pended more than 15 seconds, which happens when the host or QEMU stopped draining the port under load), bytes were lost, and it failed every open channel rather than let one wait. Both name the file; rerun the copy. The lab daemon log carries the same words. An agent older than vmlab 0.31 dropped frames silently on that reset, which left the copy waiting forever — `vmlab machine repair-agent <machine>` replaces it.
+
 ## Autologon set on a fresh Windows clone is gone after a reboot
 
 ```
