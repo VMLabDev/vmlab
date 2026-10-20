@@ -144,6 +144,31 @@ const OUT_QUEUE: usize = 256;
 /// while both sides respect the window; the bound is a safety net.
 const INPUT_QUEUE: usize = 2 * (INITIAL_WINDOW as usize / 1024);
 
+/// How long the port writer waits before offering a refused frame again.
+const WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The one write failure the port writer must **not** retry: the platform
+/// gave up waiting for the request, but the driver still holds it and will
+/// put the bytes on the wire whenever the host drains the port. Offering
+/// the frame again would deliver it twice. A port adapter that abandons a
+/// write wraps this in the error it returns (see `windows::port`).
+#[derive(Debug)]
+pub struct WriteAbandoned;
+
+impl std::fmt::Display for WriteAbandoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("port write abandoned; the driver will still deliver it")
+    }
+}
+
+impl std::error::Error for WriteAbandoned {}
+
+/// Whether a failed write is one the driver will complete on its own.
+fn write_was_abandoned(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<WriteAbandoned>())
+}
+
 impl Mux {
     /// Start the writer thread over the port's write half and return the mux.
     pub fn new(mut port_w: impl Write + Send + 'static) -> Mux {
@@ -152,11 +177,26 @@ impl Mux {
             for frame in rx {
                 // Blocks until the host side is connected — that is the
                 // point of doing it on this dedicated thread.
-                if port_w.write_all(&frame).is_err() {
-                    // Port write errors are not recoverable from here; keep
-                    // draining so senders don't wedge (the reader loop owns
-                    // reconnect/exit policy).
-                    continue;
+                //
+                // A refused frame is offered again rather than dropped: a
+                // port connection being reset underneath us (the Windows
+                // adapter does that to a write that pends too long) refuses
+                // every write until the reader has reopened it, and each
+                // frame it refused was a reply or a credit grant some host
+                // call is waiting on. Dropping one left that call waiting
+                // forever with nothing logged on either side. The one
+                // exception is a write the driver still owns, which it will
+                // deliver itself.
+                let mut told = false;
+                while let Err(e) = port_w.write_all(&frame) {
+                    if write_was_abandoned(&e) {
+                        break;
+                    }
+                    if !told {
+                        eprintln!("vmlab-agent: port write failed ({e}); retrying until it goes");
+                        told = true;
+                    }
+                    thread::sleep(WRITE_RETRY);
                 }
                 let _ = port_w.flush();
             }
@@ -261,6 +301,36 @@ impl Mux {
             s.credit.close();
             s.input = None;
             s.kill = None;
+        }
+    }
+
+    /// The port connection was reset under every live session: fail each
+    /// one, telling the host why by id.
+    ///
+    /// A reset loses bytes in both directions — whatever the guest had not
+    /// yet read is discarded with the port handle, and the host cannot tell
+    /// which of its requests those were. So nothing that was open survives
+    /// it: every session is torn down as on a host re-handshake, and the
+    /// host hears an error on each, which is what fails the calls waiting
+    /// on them promptly instead of leaving them to a watchdog.
+    pub fn reset(&self, reason: &str) {
+        let ids: Vec<u32> = self
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        if !ids.is_empty() {
+            eprintln!(
+                "vmlab-agent: {reason}; failing {} open channel(s)",
+                ids.len()
+            );
+        }
+        for id in ids {
+            self.remove(id);
+            self.send_error(Some(id), format!("channel lost: {reason}"));
         }
     }
 
@@ -560,6 +630,7 @@ mod tests {
     use super::*;
     use crate::fake_spawner::TestPlatform;
     use crate::testutil::capture_mux;
+    use vmlab_agent_proto::FrameDecoder;
 
     #[test]
     fn hello_resets_and_echoes_token() {
@@ -699,6 +770,145 @@ mod tests {
             }
         );
         assert!(platform.clock.lock().unwrap().is_empty());
+    }
+
+    /// A port that refuses a frame for a while — the Windows adapter does,
+    /// from the moment a write stalls until the reader has reopened the
+    /// port — gets that frame again once it will take it, exactly once. A
+    /// dropped frame was a reply or a credit grant some host call waited
+    /// on forever.
+    #[test]
+    fn a_refused_frame_is_offered_again_until_the_port_takes_it() {
+        struct Refusing {
+            left: usize,
+            tx: std::sync::mpsc::Sender<Vec<u8>>,
+        }
+        impl Write for Refusing {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.left > 0 {
+                    self.left -= 1;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "port connection is being reset",
+                    ));
+                }
+                let _ = self.tx.send(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mux = Mux::new(Refusing { left: 3, tx });
+        mux.send_ctrl(&AgentMsg::Eof { id: 11 });
+        mux.send_ctrl(&AgentMsg::Eof { id: 12 });
+        let mut dec = FrameDecoder::new();
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            let bytes = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the refused frame arrives once the port takes it");
+            dec.push(&bytes);
+            while let Some(f) = dec.next_frame() {
+                got.push(serde_json::from_slice::<AgentMsg>(&f.payload).unwrap());
+            }
+        }
+        assert_eq!(
+            got,
+            vec![AgentMsg::Eof { id: 11 }, AgentMsg::Eof { id: 12 }],
+            "each frame exactly once, in order"
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "nothing is delivered twice"
+        );
+    }
+
+    /// The one refusal that is not retried: a write the driver still owns
+    /// and will deliver itself. Offering it again would put the frame on
+    /// the wire twice.
+    #[test]
+    fn an_abandoned_write_is_not_offered_again() {
+        struct Abandoning {
+            first: bool,
+            tx: std::sync::mpsc::Sender<Vec<u8>>,
+        }
+        impl Write for Abandoning {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.first) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        WriteAbandoned,
+                    ));
+                }
+                let _ = self.tx.send(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mux = Mux::new(Abandoning { first: true, tx });
+        mux.send_ctrl(&AgentMsg::Eof { id: 21 });
+        mux.send_ctrl(&AgentMsg::Eof { id: 22 });
+        let mut dec = FrameDecoder::new();
+        dec.push(
+            &rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the second frame arrives"),
+        );
+        let f = dec.next_frame().expect("one frame");
+        assert_eq!(
+            serde_json::from_slice::<AgentMsg>(&f.payload).unwrap(),
+            AgentMsg::Eof { id: 22 },
+            "the abandoned frame is the driver's to deliver, not ours again"
+        );
+    }
+
+    /// A port connection reset under live sessions loses bytes the host
+    /// cannot account for, so every session dies with it and the host is
+    /// told on each by id — which is what fails the calls waiting on them
+    /// at once rather than leaving them to a watchdog.
+    #[test]
+    fn a_port_reset_fails_every_open_channel_by_id() {
+        let (mux, mut cap) = capture_mux();
+        let killed = Arc::new(Mutex::new(Vec::new()));
+        let mut inputs = Vec::new();
+        for id in [3u32, 4] {
+            let k = killed.clone();
+            let (input, credit) = mux
+                .register(id, None, Some(Box::new(move || k.lock().unwrap().push(id))))
+                .unwrap();
+            inputs.push((input, credit));
+        }
+        mux.reset("port connection reset (port I/O stalled)");
+        let mut told = Vec::new();
+        for _ in 0..2 {
+            match cap.ctrl() {
+                AgentMsg::Error { id: Some(id), msg } => {
+                    assert_eq!(
+                        msg,
+                        "channel lost: port connection reset (port I/O stalled)"
+                    );
+                    told.push(id);
+                }
+                other => panic!("expected a channel error, got {other:?}"),
+            }
+        }
+        told.sort();
+        assert_eq!(told, vec![3, 4]);
+        let mut k = killed.lock().unwrap().clone();
+        k.sort();
+        assert_eq!(k, vec![3, 4], "each session's kill hook ran");
+        for (input, credit) in inputs {
+            assert_eq!(credit.take(10), 0, "credit closed");
+            assert!(input.recv().is_err(), "input ended");
+        }
+        // Nothing is left to fail twice.
+        mux.reset("again");
+        assert!(mux.inner.sessions.lock().unwrap().is_empty());
     }
 
     #[test]

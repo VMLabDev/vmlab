@@ -690,7 +690,10 @@ impl AgentHandle {
         mode: Option<u32>,
         logon: Option<Logon>,
     ) -> Result<(String, u64)> {
-        let ops = self.open_fileops(logon).await?;
+        let ops = self
+            .open_fileops(logon)
+            .await
+            .with_context(|| format!("push {remote}"))?;
         ops.push(local, remote, mode).await
     }
 
@@ -702,7 +705,10 @@ impl AgentHandle {
     /// pipelined stream of writes — no per-file channel setup.
     pub async fn push_tree(&self, src: &Path, guest_dest: &str) -> Result<(usize, u64)> {
         let entries = walk_tree_for_push(src, guest_dest)?;
-        let ops = self.open_fileops(None).await?;
+        let ops = self
+            .open_fileops(None)
+            .await
+            .with_context(|| format!("push {guest_dest}"))?;
         let mut made: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut bytes = 0u64;
         let files = entries.len();
@@ -738,7 +744,10 @@ impl AgentHandle {
         let file = tokio::fs::File::create(local)
             .await
             .with_context(|| format!("creating {}", local.display()))?;
-        let ops = self.open_fileops(logon).await?;
+        let ops = self
+            .open_fileops(logon)
+            .await
+            .with_context(|| format!("pull {remote}"))?;
         ops.pull(remote, &mut FileSink(file)).await
     }
 
@@ -764,7 +773,10 @@ impl AgentHandle {
             buf: Vec::new(),
             limit,
         };
-        let ops = self.open_fileops(logon).await?;
+        let ops = self
+            .open_fileops(logon)
+            .await
+            .with_context(|| format!("pull {remote}"))?;
         let (sha256, _len) = ops.pull(remote, &mut sink).await?;
         Ok((sha256, sink.buf))
     }
@@ -1113,6 +1125,14 @@ struct FileOpsInner {
     wire: Mutex<()>,
     pending: std::sync::Mutex<Pending>,
     next_id: AtomicU64,
+    /// When the guest last answered *anything* on this channel — the
+    /// watchdog's notion of progress. A reply to any request counts: a
+    /// pipelined transfer is judged by whether the channel moves, not by
+    /// whether one particular chunk has been acknowledged yet.
+    last_reply: std::sync::Mutex<tokio::time::Instant>,
+    /// How long the channel may stay silent before a call gives up, in
+    /// milliseconds — [`FILEOPS_STALL`] unless a caller set otherwise.
+    stall_ms: AtomicU64,
 }
 
 /// One reply, or the reason the channel will never produce it.
@@ -1134,6 +1154,33 @@ struct Pending {
 const TRANSFER_WINDOW: usize = 16;
 const TRANSFER_CHUNK: usize = 64 * 1024;
 
+/// How long a file channel may go with **nothing** arriving from the guest
+/// before the call waiting on it fails, naming what it asked for.
+///
+/// Without this a reply lost on the wire — a Windows agent abandons a port
+/// write that pends 15 s and reopens the port, telling nobody — left the
+/// transfer, and the `vmlab cp` behind it, waiting forever. The budget is
+/// idle time, not elapsed time: a transfer that is slow but moving renews it
+/// with every reply, so a cold disk or a loaded guest never trips it, and
+/// the figure only has to exceed the longest *single* round trip a healthy
+/// guest takes. The agent's own port reset fires at 15 s; four times that
+/// leaves room for a guest paging under load, a Defender scan holding an
+/// open, or a `mkdir` on a network drive, and still answers inside the
+/// minute an unattended run would otherwise lose to a hang.
+pub const FILEOPS_STALL: Duration = Duration::from_secs(60);
+
+/// The slowest hashing rate a guest is granted before its `digest` of a
+/// file counts as stalled: a digest is one request with no progress inside
+/// it, so its budget grows with the file. 2 MiB/s is well under any disk
+/// and CPU a guest runs on — a 20 MB driver adds ten seconds, a gigabyte
+/// about eight and a half minutes.
+const DIGEST_FLOOR_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
+
+/// The watchdog budget for a digest of `len` bytes.
+fn digest_budget(stall: Duration, len: u64) -> Duration {
+    stall + Duration::from_secs(len / DIGEST_FLOOR_BYTES_PER_SEC)
+}
+
 impl FileOps {
     fn start(session: AgentSession) -> FileOps {
         let inner = Arc::new(FileOpsInner {
@@ -1143,9 +1190,19 @@ impl FileOps {
             wire: Mutex::new(()),
             pending: std::sync::Mutex::new(Pending::default()),
             next_id: AtomicU64::new(1),
+            last_reply: std::sync::Mutex::new(tokio::time::Instant::now()),
+            stall_ms: AtomicU64::new(FILEOPS_STALL.as_millis() as u64),
         });
         let pump = tokio::spawn(fileops_pump(session, inner.clone()));
         FileOps { inner, pump }
+    }
+
+    /// How long this channel may stay silent before a call on it fails
+    /// (see [`FILEOPS_STALL`]). Tests shorten it; nothing else should.
+    pub fn set_stall_timeout(&self, stall: Duration) {
+        self.inner
+            .stall_ms
+            .store(stall.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// Push a host file, verifying against the guest's own digest of what
@@ -1236,7 +1293,7 @@ impl FileOps {
 
         let local_sha = hex::encode(hasher.finalize());
         let (sha256, len) = self
-            .digest(remote)
+            .digest_of_len(remote, offset)
             .await
             .with_context(|| format!("push {remote}"))?;
         if sha256 != local_sha {
@@ -1332,7 +1389,7 @@ impl FileOps {
         sink.finish().await?;
 
         let (sha256, len) = self
-            .digest(remote)
+            .digest_of_len(remote, got)
             .await
             .with_context(|| format!("pull {remote}"))?;
         if hex::encode(hasher.finalize()) != sha256 || len != got {
@@ -1406,14 +1463,28 @@ impl FileOps {
     }
 
     /// The guest's own SHA-256 and length of what is at `path`.
+    ///
+    /// Costs a `stat` first: a digest is one request the guest answers only
+    /// when it has read the whole file, so the watchdog that guards it has
+    /// to know how big the file is before it can tell slow from stalled.
     pub async fn digest(&self, path: &str) -> Result<(String, u64)> {
+        let attrs = self.stat(path).await?;
+        self.digest_of_len(path, attrs.size).await
+    }
+
+    /// [`digest`](Self::digest) for a caller that already knows the length,
+    /// which is what sizes the watchdog's budget (see
+    /// [`DIGEST_FLOOR_BYTES_PER_SEC`]).
+    async fn digest_of_len(&self, path: &str, len: u64) -> Result<(String, u64)> {
+        let budget = digest_budget(self.inner.stall(), len);
         match self
             .inner
-            .call(
+            .call_within(
                 Op::Digest {
                     path: path.to_string(),
                 },
                 &[],
+                budget,
             )
             .await?
         {
@@ -1639,8 +1710,41 @@ impl FileOpsInner {
     /// One request, awaited by id. The reply may arrive after replies to
     /// requests sent later — that is the point.
     async fn call(&self, op: Op, payload: &[u8]) -> Result<(Reply, Vec<u8>)> {
+        let stall = self.stall();
+        self.call_within(op, payload, stall).await
+    }
+
+    /// The channel's silence budget, as set.
+    fn stall(&self) -> Duration {
+        Duration::from_millis(self.stall_ms.load(Ordering::SeqCst))
+    }
+
+    /// When the guest last answered anything on this channel.
+    fn last_reply(&self) -> tokio::time::Instant {
+        *self.last_reply.lock_recover()
+    }
+
+    /// [`call`](Self::call) under a watchdog of `budget`: the call fails —
+    /// and takes the whole channel with it — once **nothing** has arrived
+    /// from the guest for that long, measured from whichever is later, the
+    /// request going out or the channel's last reply. A reply to any other
+    /// request renews it, so a transfer that is slow but moving is never
+    /// mistaken for one that has stopped; only a channel that has gone
+    /// silent with this request unanswered trips it.
+    ///
+    /// The whole channel fails rather than the one call because a reply
+    /// that never came means a frame was lost or the guest's session is
+    /// gone, and a record stream has no resynchronisation point: every
+    /// later reply on it would be suspect.
+    async fn call_within(
+        &self,
+        op: Op,
+        payload: &[u8],
+        budget: Duration,
+    ) -> Result<(Reply, Vec<u8>)> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let label = op_label(&op);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
         {
             let mut pending = self.pending.lock_recover();
             if let Some(failed) = &pending.failed {
@@ -1652,10 +1756,27 @@ impl FileOpsInner {
             self.pending.lock_recover().waiters.remove(&id);
             return Err(e);
         }
-        match rx.await {
-            Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(msg)) => bail!("{msg}"),
-            Err(_) => bail!("agent channel closed during a file operation"),
+        let sent = tokio::time::Instant::now();
+        loop {
+            let since = self.last_reply().max(sent);
+            let Some(remaining) = budget.checked_sub(since.elapsed()) else {
+                let msg = format!(
+                    "the guest's agent answered nothing for {budget:?}: {label} is unanswered \
+                     and nothing else moved on the file channel"
+                );
+                tracing::warn!("agent fileops channel {}: {msg}", self.id);
+                self.fail_all(msg.clone());
+                bail!("{msg}");
+            };
+            match tokio::time::timeout(remaining, &mut rx).await {
+                Ok(Ok(Ok(answer))) => return Ok(answer),
+                Ok(Ok(Err(msg))) => bail!("{msg}"),
+                Ok(Err(_)) => bail!("agent channel closed during a file operation"),
+                // Silent for the budget *since we last looked*; the channel
+                // may still have moved for someone else in the meantime,
+                // which the next pass of the loop credits.
+                Err(_) => continue,
+            }
         }
     }
 
@@ -1711,6 +1832,16 @@ impl FileOpsInner {
         while off < bytes.len() {
             let n = self.credit.take(bytes.len() - off).await;
             if n == 0 {
+                // The channel is gone. The reader closes the credit the
+                // moment the agent's error arrives, a beat before the pump
+                // records why; wait that beat out so the failure carries
+                // the agent's own reason rather than a bare "closed".
+                for _ in 0..25 {
+                    if let Some(reason) = &self.pending.lock_recover().failed {
+                        bail!("{reason}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
                 bail!("agent channel closed");
             }
             self.handle.send_data(self.id, &bytes[off..off + n]).await?;
@@ -1757,6 +1888,7 @@ async fn fileops_pump(mut session: AgentSession, inner: Arc<FileOpsInner>) {
                 loop {
                     match decoder.next_record::<Response>() {
                         Ok(Some((response, payload))) => {
+                            *inner.last_reply.lock_recover() = tokio::time::Instant::now();
                             let waiter = inner.pending.lock_recover().waiters.remove(&response.id);
                             if let Some(waiter) = waiter {
                                 let _ = waiter.send(Ok((response.reply, payload)));
@@ -1791,6 +1923,33 @@ async fn join_one(set: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
         Some(Ok(r)) => r,
         Some(Err(e)) => Err(anyhow!("{e}")),
         None => Ok(()),
+    }
+}
+
+/// What a request asked for, in the words the watchdog's error uses: the
+/// path where the request names one, the offset where it names a handle, so
+/// the failure names the file, or the context around it does.
+fn op_label(op: &Op) -> String {
+    match op {
+        Op::Open { path, .. } => format!("the open of {path}"),
+        Op::Close { .. } => "a close".into(),
+        Op::Read { offset, .. } => format!("the read at offset {offset}"),
+        Op::Write { offset, .. } => format!("the write at offset {offset}"),
+        Op::Fstat { .. } => "an fstat".into(),
+        Op::Fsetstat { .. } => "an fsetstat".into(),
+        Op::Stat { path } => format!("the stat of {path}"),
+        Op::Lstat { path } => format!("the lstat of {path}"),
+        Op::Setstat { path, .. } => format!("the setstat of {path}"),
+        Op::OpenDir { path } => format!("the opendir of {path}"),
+        Op::ReadDir { .. } => "a readdir".into(),
+        Op::Mkdir { path, .. } => format!("the mkdir of {path}"),
+        Op::Rmdir { path } => format!("the rmdir of {path}"),
+        Op::Remove { path } => format!("the removal of {path}"),
+        Op::Rename { from, to } => format!("the rename of {from} to {to}"),
+        Op::Realpath { path } => format!("the realpath of {path}"),
+        Op::Symlink { link, .. } => format!("the symlink at {link}"),
+        Op::Readlink { path } => format!("the readlink of {path}"),
+        Op::Digest { path } => format!("the digest of {path}"),
     }
 }
 
@@ -2570,6 +2729,9 @@ mod tests {
                                 // deliberately in a shuffled order so the
                                 // host cannot rely on the one it asked in.
                                 for (response, bytes) in fs.serve(&payload) {
+                                    if fs.slow {
+                                        tokio::time::sleep(SLOW_REPLY).await;
+                                    }
                                     for chunk in
                                         fileops::encode_record(&response, &bytes).chunks(4096)
                                     {
@@ -2613,7 +2775,18 @@ mod tests {
         /// `realpath("/who")` — the mock's way of showing the identity
         /// actually reached the wire (§19.2).
         who: String,
+        /// Pace every reply by [`SLOW_REPLY`]: a guest that is slow but
+        /// moving, which the watchdog must never mistake for one that
+        /// stopped.
+        slow: bool,
     }
+
+    /// The marker reply [`MockFiles::op`] hands back for a request the
+    /// stalled peer never answers; `serve` drops it on the floor.
+    const SWALLOWED: &str = "<swallowed>";
+
+    /// How long the slow mock sits on each reply.
+    const SLOW_REPLY: Duration = Duration::from_millis(40);
 
     /// The guest's filesystem, shared by every session on one connection —
     /// what one channel writes, the next can stat. Handles are deliberately
@@ -2635,6 +2808,7 @@ mod tests {
                 who: logon
                     .map(|l| format!("as:{}:{}", l.user, l.elevated))
                     .unwrap_or_else(|| "as:agent".into()),
+                slow: false,
             }
         }
 
@@ -2646,7 +2820,18 @@ mod tests {
                 .next_record::<Request>()
                 .expect("framed request")
             {
+                // A file named `slow` is served at a crawl: every reply is
+                // paced, so a transfer into it moves but never fast.
+                if let Op::Open { path, .. } = &request.op
+                    && path.contains("slow")
+                {
+                    self.slow = true;
+                }
                 let (reply, bytes) = self.op(request.op, payload);
+                // The one reply a stalled peer never sends.
+                if matches!(&reply, Reply::Error { msg, .. } if msg == SWALLOWED) {
+                    continue;
+                }
                 out.push((
                     Response {
                         id: request.id,
@@ -2697,6 +2882,19 @@ mod tests {
                             Vec::new(),
                         );
                     };
+                    // A stalled peer: the first chunk of a file named for
+                    // it is acknowledged and every later one vanishes, as a
+                    // frame dropped on a port reset does — bytes were
+                    // acknowledged, then nothing, with no error anywhere.
+                    if path.contains("stalls") && offset > 0 {
+                        return (
+                            Reply::Error {
+                                code: ErrorCode::Failure,
+                                msg: SWALLOWED.into(),
+                            },
+                            Vec::new(),
+                        );
+                    }
                     let mut store = self.fs.store.lock().unwrap();
                     let file = store.entry(path).or_default();
                     let end = offset as usize + payload.len();
@@ -3074,6 +3272,79 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
     }
 
+    /// A guest that stops answering mid-transfer — a frame dropped on a port
+    /// reset, a session gone on its side — fails the push within the
+    /// watchdog's budget, naming the file and the request it was waiting
+    /// on, instead of waiting forever. The whole channel is spent with it:
+    /// the next call on it fails at once with the same reason.
+    #[tokio::test]
+    async fn a_stalled_peer_fails_the_push_with_the_watchdog_error_not_a_hang() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        ops.set_stall_timeout(Duration::from_millis(300));
+        let work = tempfile::tempdir().unwrap();
+        let local = work.path().join("driver.sys");
+        std::fs::write(&local, vec![7u8; 4 * TRANSFER_CHUNK]).unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            ops.push(&local, "/guest/driver/stalls.sys", None),
+        )
+        .await
+        .expect("the push returned instead of hanging");
+        let err = format!("{:#}", outcome.unwrap_err());
+        assert!(err.contains("push /guest/driver/stalls.sys"), "{err}");
+        assert!(err.contains("answered nothing for 300ms"), "{err}");
+        assert!(err.contains("the write at offset"), "{err}");
+
+        let next = format!("{:#}", ops.stat("/guest/some-file").await.unwrap_err());
+        assert!(next.contains("answered nothing"), "{next}");
+    }
+
+    /// The watchdog measures silence, not elapsed time: a transfer that is
+    /// slow but moving renews it with every reply, so a push that takes
+    /// many budgets end to end still lands intact.
+    #[tokio::test]
+    async fn a_slow_but_moving_transfer_never_trips_the_watchdog() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        ops.set_stall_timeout(Duration::from_millis(150));
+        let work = tempfile::tempdir().unwrap();
+        let local = work.path().join("big.dll");
+        let payload: Vec<u8> = (0..12 * TRANSFER_CHUNK).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&local, &payload).unwrap();
+
+        let started = tokio::time::Instant::now();
+        let (sha, len) = ops.push(&local, "/guest/slow.dll", None).await.unwrap();
+        assert!(
+            started.elapsed() > Duration::from_millis(300),
+            "the mock was meant to be slow"
+        );
+        assert_eq!(len, payload.len() as u64);
+        use sha2::{Digest, Sha256};
+        assert_eq!(sha, hex::encode(Sha256::digest(&payload)));
+    }
+
+    /// A digest is one request the guest answers only once it has read the
+    /// whole file, so its budget grows with the file: a 20 MB driver gets
+    /// ten seconds more, a gigabyte over eight minutes, and an empty file
+    /// nothing beyond the channel's own budget.
+    #[test]
+    fn a_digests_budget_grows_with_the_file() {
+        let stall = Duration::from_secs(60);
+        assert_eq!(digest_budget(stall, 0), Duration::from_secs(60));
+        assert_eq!(
+            digest_budget(stall, 20 * 1024 * 1024),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            digest_budget(stall, 1024 * 1024 * 1024),
+            Duration::from_secs(60 + 512)
+        );
+    }
+
     /// The workspace syncer's guest→host transfer: the same verified pull,
     /// on the session that decided to run it rather than on one of its own.
     #[tokio::test]
@@ -3334,7 +3605,9 @@ mod tests {
             .push_file(&local, "/guest/x.bin", None)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("repair-agent"), "{err}");
+        let err = format!("{err:#}");
+        assert!(err.contains("repair-agent"), "{err}");
+        assert!(err.starts_with("push /guest/x.bin"), "{err}");
     }
 
     const MOCK_NO_DESKTOP: &str = "no one is logged on to the desktop";

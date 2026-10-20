@@ -365,11 +365,13 @@ impl Write for PortIo {
         match self.wait_io(&h, &mut ov, WRITE_STALL, 1) {
             IoWait::Done(n) => Ok(n),
             IoWait::Failed(e) => Err(e),
+            // Typed so the writer knows not to offer the frame again: the
+            // driver still holds this request and will deliver it.
             IoWait::Abandoned => {
                 self.abandon(h, ov);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "port write abandoned; connection reset",
+                    crate::mux::WriteAbandoned,
                 ))
             }
         }
