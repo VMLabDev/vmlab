@@ -45,7 +45,7 @@ pub(super) async fn lab_client_for(lab: Option<String>) -> Result<(String, LabCl
     match lab {
         Some(name) => {
             let client = daemon::try_lab_daemon(&name)
-                .await
+                .await?
                 .ok_or_else(|| anyhow!("lab \"{name}\" is not running"))?;
             Ok((name, client))
         }
@@ -67,7 +67,7 @@ async fn current_lab_client_for(lab: Option<String>) -> Result<(String, LabClien
     let (name, root) = match lab {
         None => current_lab()?,
         Some(name) => {
-            if daemon::try_lab_daemon(&name).await.is_none() {
+            if daemon::try_lab_daemon(&name).await?.is_none() {
                 bail!("lab \"{name}\" is not running");
             }
             match current_lab() {
@@ -813,9 +813,11 @@ fn cmd_lab_list(json: bool) -> Result<()> {
         for lab in &mut labs {
             let registry = lab["state"].as_str().unwrap_or("?").to_string();
             let status = match lab["name"].as_str() {
+                // A listing reads what it can: a daemon of another build
+                // is listed from the registry alone, not refused.
                 Some(name) if registry == "running" => match daemon::try_lab_daemon(name).await {
-                    Some(client) => lab_status(&client).await.ok(),
-                    None => None,
+                    Ok(Some(client)) => lab_status(&client).await.ok(),
+                    _ => None,
                 },
                 _ => None,
             };
@@ -851,7 +853,7 @@ fn cmd_lab_info(name: &str, verbose: bool) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
         let entry = labs.iter().find(|l| l["name"].as_str() == Some(name));
-        match daemon::try_lab_daemon(name).await {
+        match daemon::try_lab_daemon(name).await? {
             Some(client) => {
                 if let Some(root) = entry.and_then(|l| l["root"].as_str()) {
                     println!("directory: {root}");
@@ -882,7 +884,7 @@ fn cmd_lab_info(name: &str, verbose: bool) -> Result<()> {
 /// longer exists gives its name back.
 fn cmd_lab_stop(name: &str, force: bool) -> Result<()> {
     rt()?.block_on(async {
-        let Some(client) = daemon::try_lab_daemon(name).await else {
+        let Some(client) = daemon::try_lab_daemon(name).await? else {
             // No daemon answering, but a registration (a crashed daemon's,
             // say) still holds the name; releasing it reaps whatever that
             // daemon left running.
@@ -935,7 +937,7 @@ fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
         // is exactly what restart exists to recover from, and blocking there
         // would make the verb useless when it is needed most (the console's
         // reload button reasons the same way).
-        if let Some(client) = daemon::try_lab_daemon(name).await
+        if let Some(client) = daemon::try_lab_daemon(name).await?
             && let Ok(status) = lab_status(&client).await
             && !status.all_stopped()
         {
@@ -974,7 +976,7 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
         let root = root_for(&labs, name);
-        match daemon::try_lab_daemon(name).await {
+        match daemon::try_lab_daemon(name).await? {
             Some(client) => {
                 client.send(LabRequest::Destroy {}).await.map_err(remote)?;
             }

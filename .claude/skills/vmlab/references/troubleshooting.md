@@ -206,6 +206,23 @@ Every `vmlab` verb that needs the supervisor connects to `$XDG_RUNTIME_DIR/vmlab
 
 Related messages from the same code path are `spawning vmlabd`, when the binary itself cannot be executed, and `opening {log_path}`, when the state directory is not writable.
 
+## The daemon is another build of vmlab
+
+```
+the running vmlabd is vmlab build 0.30.0-alpha, but this vmlab is build 0.31.0+1a2b3c4 — one build cannot drive another's daemons. Run `vmlab daemon stop` (which stops every lab daemon and the machines they run; disks and snapshots stay), then this command again
+```
+
+The supervisor and lab daemons outlive the `vmlab` that started them, so a vmlab
+installed (or built) while they run meets daemons of the previous build. Every verb
+that connects asks the daemon's build (`version`) first and refuses one that differs
+from its own; the wire has no protocol version to judge compatibility by, so the
+build is the unit. A build is the crate version plus the git revision
+(`0.31.0+1a2b3c4`), so two source builds of one version are told apart. The variant
+naming `lab "{name}"'s daemon` met a lab daemon; `an older vmlab build, from before
+daemons reported their build` met exactly that. Fix: `vmlab daemon stop` (stops
+every lab daemon and its machines; disks and snapshots stay), then retry.
+`vmlab daemon status` and `vmlab lab list` still answer against old daemons.
+
 ## The lab name is already registered
 
 ```

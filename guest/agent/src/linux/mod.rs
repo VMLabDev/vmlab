@@ -1097,9 +1097,16 @@ fn root_env() -> Vec<(String, String)> {
 }
 
 /// Container environment: the spec env verbatim plus a terminal type and
-/// the injected BusyBox applets at the front of PATH (mirrors what cinit's
-/// tty did), and — for a session that is somebody — the login variables
-/// cinit's own `build_env` does not know about (§19.2).
+/// the injected BusyBox applets at the **end** of PATH (§18), and — for a
+/// session that is somebody — the login variables cinit's own `build_env`
+/// does not know about (§19.2).
+///
+/// The shim is a fallback, not a toolbox: it exists so a distroless image
+/// still has a shell and the basics for `exec` and `shell`. Ahead of the
+/// image's own directories it shadowed them — `mount` in a `debian:12`
+/// container resolved to BusyBox's, which reads no `/etc/fstab` options on a
+/// remount, instead of util-linux's — so the image's tools win and BusyBox
+/// answers only for what the image lacks.
 fn container_env(ctx: &ContainerCtx, session: Option<&Session>) -> Vec<(String, String)> {
     let mut env = ctx.env.clone();
     if !env.iter().any(|(k, _)| k == "TERM") {
@@ -1108,17 +1115,17 @@ fn container_env(ctx: &ContainerCtx, session: Option<&Session>) -> Vec<(String, 
     let busybox_bin = vmlab_agent_proto::BUSYBOX_BIN_DIR;
     if let Some((_, path)) = env.iter_mut().find(|(k, _)| k == "PATH") {
         if !path.split(':').any(|part| part == busybox_bin) {
-            *path = format!("{busybox_bin}:{path}");
+            *path = format!("{path}:{busybox_bin}");
         }
     } else {
-        env.push(("PATH".into(), format!("{busybox_bin}:{}", login::SUPATH)));
+        env.push(("PATH".into(), format!("{}:{busybox_bin}", login::SUPATH)));
     }
     // A **declared** login overrides what the container says about who it is:
     // cinit's `build_env` put the *workload* user's `HOME` there, and a
     // session attached as `dev` that reports `HOME=/app` is exactly the
     // half-login §19.2 forbids. The floor is the workload, so for it the
     // container's own values stand. `PATH` is neither's — it was assembled
-    // above, with the toolbox on the front.
+    // above, with the shim on the end.
     if let Some(session) = session {
         for (key, value) in session.env() {
             if key == "PATH" {
@@ -1697,18 +1704,30 @@ mod tests {
         }
     }
 
+    /// The BusyBox shim is the last entry on PATH, never the first: the
+    /// image's own `mount`, `ps` and the rest win, and the shim answers only
+    /// for what a distroless image lacks (§18). Before this it led, and a
+    /// `mount -o remount` in a `debian:12` container silently got BusyBox
+    /// semantics instead of util-linux's.
     #[test]
-    fn container_env_adds_term_and_busybox_path() {
+    fn container_env_adds_term_and_puts_the_busybox_shim_last_on_path() {
         let ctx = test_ctx("/rootfs", vec![("FOO".into(), "bar".into())]);
         let env = container_env(&ctx, None);
         assert!(env.contains(&("TERM".into(), "xterm-256color".into())));
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "PATH" && v.starts_with(vmlab_agent_proto::BUSYBOX_BIN_DIR))
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("a PATH");
+        assert_eq!(
+            path.split(':').next_back(),
+            Some(vmlab_agent_proto::BUSYBOX_BIN_DIR),
+            "{path}"
         );
+        assert!(path.starts_with(login::SUPATH), "{path}");
         assert!(env.contains(&("FOO".into(), "bar".into())));
 
-        // Explicit values win; PATH still gets the toolbox prepended once.
+        // Explicit values win; PATH still gets the shim appended once.
         let ctx = test_ctx(
             "/rootfs",
             vec![
@@ -1718,6 +1737,20 @@ mod tests {
         );
         let env = container_env(&ctx, None);
         assert_eq!(env.iter().filter(|(k, _)| k == "TERM").count(), 1);
+        assert!(env.contains(&(
+            "PATH".into(),
+            format!("/only:{}", vmlab_agent_proto::BUSYBOX_BIN_DIR)
+        )));
+
+        // Already there, wherever the image put it: left alone.
+        let ctx = test_ctx(
+            "/rootfs",
+            vec![(
+                "PATH".into(),
+                format!("{}:/only", vmlab_agent_proto::BUSYBOX_BIN_DIR),
+            )],
+        );
+        let env = container_env(&ctx, None);
         assert!(env.contains(&(
             "PATH".into(),
             format!("{}:/only", vmlab_agent_proto::BUSYBOX_BIN_DIR)

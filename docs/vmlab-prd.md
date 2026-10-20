@@ -78,7 +78,7 @@ vmlab is a two-tier daemon system: one **supervisor** per user, one **lab daemon
 
 - **Supervisor (`vmlabd`).** One per user, auto-started by the CLI. Owns: spawning a lab daemon on `up` and reaping it on a full `down` (no machines named, or `vmlab lab stop`) and on `destroy`, which releases the lab's name — a partial `down`, a `vm stop` or a failed `up` leave the daemon up with machines stopped (see §7.1 for how the next `up` keeps it from running a stale lab file); the registry of running labs (name → root, socket, pid, state); **global segments** (§9.2) — shared switches live here, with lab daemons attached as trunk ports; cross-host peering; serialised writes to the template store (pulls, builds, imports — so concurrent labs can't corrupt it; reads are lock-free); host-level watchdogs (`host.disk_low`); and an aggregated event stream across all labs. A lab name is unique within this host registry. `lab.ensure` and `lab.restart` refuse a name already registered at another canonical root with a `conflict` error naming that root and the steps that release the name — a full `vmlab down` there, or `vmlab lab stop <name>` from anywhere (the way out when that directory is gone) — or renaming this lab. The CLI verbs that reach a lab's daemon without `lab.ensure` — `status`, `down`, `destroy`, `console`, `dev sync` — check the registered root first and refuse with the same conflict (exit 5), so a second checkout declaring the same name can neither read nor stop nor destroy the first one's lab. If a lab daemon dies unexpectedly, the supervisor detects it, emits `lab.daemon_crashed`, and marks the lab failed — it does not silently restart it.
 - **Lab daemon.** One per running lab, owning everything lab-scoped: that lab's QEMU processes, QMP and guest-agent channels, lab-local segments and their DHCP/DNS/routing/rules, clones and snapshots, lab state, and lab events (forwarded up to the supervisor's aggregate stream). A lab daemon's failure is contained to its lab; other labs and the supervisor are unaffected.
-- **CLI.** Connects to the supervisor for discovery and host-scoped verbs (template store, `status` across labs, daemon control), then talks **directly** to the relevant lab daemon's socket for lab-scoped operations — no proxying in the hot path.
+- **CLI.** Connects to the supervisor for discovery and host-scoped verbs (template store, `status` across labs, daemon control), then talks **directly** to the relevant lab daemon's socket for lab-scoped operations — no proxying in the hot path. **It drives only daemons of its own build.** The daemons outlive the `vmlab` that started them, so a vmlab installed over a running one meets daemons of the build before; the wire carries no protocol version by which two builds could be judged compatible, so the build is the unit. On connecting, the CLI asks the supervisor and the lab daemon for their build (`version`: the crate version plus the git revision it was built from, `0.31.0+1a2b3c4`, so two developer builds of one version are told apart) and refuses one that differs from its own — naming both builds and the one fix, `vmlab daemon stop` then retry — rather than meeting the difference later as a `vmlab.wcl` digest that "changed" or anything else two builds disagree on. A daemon too old to answer `version` is refused the same way. `vmlab daemon stop` and `daemon status` are exempt, being how an old daemon is stopped and seen; `vmlab lab list` lists a lab of another build from the registry alone.
 - **wscript runtime.** Executes **inside the lab daemon** — it must react to events and co-locating it with the lab's state and event stream keeps everything in one place. The script-facing contract is unchanged: scripts get the lab/VM API (§10) and remain daemon-unaware.
 - **QEMU.** One process per VM, launched by its lab daemon with `-qmp`, the `vmlab.agent.0` virtio-serial channel, VNC display, and one stream-socket netdev per NIC into the lab daemon's switch.
 
@@ -820,7 +820,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine, to iterate on the agent without rebuilding a template, and mark it diverged; `up` runs the same push on a stale agent by default (§19.4) |
 | `vmlab template build / list / rm / export / import` | Template store |
 | `vmlab template push / pull / login` | OCI registry distribution (§6.4) |
-| `vmlab daemon start / stop / status` | Supervisor control (normally automatic); status lists lab daemons |
+| `vmlab daemon start / stop / status` | Supervisor control (normally automatic); status lists lab daemons and the supervisor's build. Every other verb refuses a supervisor or lab daemon of another build than the CLI's (§3), and `daemon stop` is the fix it names |
 
 ---
 
@@ -891,6 +891,15 @@ VM and container names share one namespace: DNS, `depends_on` waves,
 across both kinds. A container with no NICs is valid — air-gapped, still
 reachable via `exec`/`cp` over the agent channel — unless it declares
 volumes, which are network-mounted (validation error, mirroring §7.5).
+**The BusyBox shim is a fallback, last on `PATH`.** cinit copies a static
+BusyBox into every container's scratch layer at `/.vmlab/busybox`, with an
+applet directory `/.vmlab/bin`, so a distroless image with no shell still gets
+a working `vmlab exec` and `vmlab shell`. The agent appends that directory to
+the **end** of the `PATH` an exec or shell runs with (the image's own, else the
+`login.defs` superuser path), so the image's `mount`, `ps` and the rest win
+and BusyBox answers only for what the image lacks; ahead of them it shadowed
+util-linux's `mount` in a `debian:12` container, which silently remounted
+without the `/etc/fstab` options.
 
 **Architecture.** Every container runs in a **micro-VM**: a pinned Alpine
 `linux-virt` kernel + purpose-built initramfs (`vmlab-cinit` as PID 1,
@@ -1357,7 +1366,33 @@ or failed — whether `up` runs it inline or the handshake does: the refresh
 restarts the agent, so a machine reported ready first would hand whoever waited
 on it — `wait_ready`, a dependent, `status`, a second `exec` — a channel about
 to close. `vm.ready` is emitted, and forwards installed, at that true
-readiness. The hold applies only where a refresh can run — a machine opted out,
+readiness. **And nothing else reaches the agent while it is being replaced.**
+Readiness alone was not enough: `up` returns without waiting on a machine
+nothing waits on, so a `vmlab exec` issued right after it met the background
+refresh mid-flight — handed the very connection the push then shut down
+("agent channel closed during exec"), its process killed in the restart (exit
+137), or handshaken with the agent on its way out and cut off when the new one
+answered its ping as somebody else. So the push holds the machine's agent
+channel from before it hands the guest the binary until the new agent has
+answered a handshake under its own instance (the agent's Hello and Pong name
+it; a reconnect answered under the old instance, or the old stamp, is a
+restart that did not happen). Every other caller — `exec`, `shell`, `cp`, a
+script, a probe — waits for the hold to end, up to four minutes, then fails
+naming the replacement, and what it gets afterwards is the new agent. `up`'s
+refresh takes the hold the moment the agent is up, before its own handshake
+and comparison, so an `exec` that arrives as `up` returns waits for the
+decision; a machine found current releases it a handshake later. A session
+already open on the channel when the push begins is let finish first, up to
+a minute, before the restart. The same hold covers `repair-agent`. **A
+reconnect answered by the agent told to restart is a restart not yet taken
+effect, and is waited for**: on Windows the service bounce lands seconds
+after the restart command returned (the restart script sleeps before `sc
+stop`), so the push's first reconnect was routinely the old agent's — the
+refresh was reported failed, the machine went ready, and the bounce then
+landed under the first `exec` after `up`. The old agent answering is pinged
+until it stops answering or another instance answers, then handshaken again,
+up to the two-minute reconnect budget; only then is "the service did not
+restart onto it" reported. The hold applies only where a refresh can run — a machine opted out,
 a container, the legacy tier or one with no sealed agent is ready at its
 handshake as before, and one already current is held only for the comparison —
 and it is bounded: past five minutes the machine is reported ready on whatever

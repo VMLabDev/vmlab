@@ -364,6 +364,14 @@ impl AgentHandle {
         self.inner.open_waiters.lock_recover().clear();
     }
 
+    /// How many sessions are open on this connection right now — every exec,
+    /// terminal, tail, file session and watch that has not ended. What a
+    /// replacement of the agent waits on before it restarts the agent out from
+    /// under them (§19.4).
+    pub async fn open_sessions(&self) -> usize {
+        self.inner.sessions.lock().await.len()
+    }
+
     /// Whether the agent this handle handshook still answers. An agent that
     /// restarted in the guest answers pings on the very same channel, so the
     /// pong is also checked against the instance the handshake named: a

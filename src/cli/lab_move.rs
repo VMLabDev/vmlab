@@ -72,7 +72,7 @@ pub fn cmd_lab_move(name: &str, from: Option<PathBuf>) -> Result<()> {
         // registered daemon answers for its machines; with no daemon, a
         // process left holding the disks answers for itself below.
         if registered.is_some()
-            && let Some(client) = daemon::try_lab_daemon(name).await
+            && let Some(client) = daemon::try_lab_daemon(name).await?
             && let Ok(status) = lab_status(&client).await
         {
             let running: Vec<&str> = status

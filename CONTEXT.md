@@ -134,7 +134,10 @@ default, when a VM's agent stamp differs from the shipped asset's (opt out
 with `agent_update = false`). Either makes the machine a **diverged machine**.
 Meaningless for a machine whose agent came with the host rather than with what
 it boots — a container micro-VM's — which is reported rather than implied, and
-impossible on the legacy tier, which `up` skips silently.
+impossible on the legacy tier, which `up` skips silently. While it runs it
+holds the machine's **agent channel**: every other caller waits until the new
+agent has answered a handshake under its own instance, so nothing rides the
+connection the restart closes.
 _Avoid_: upgrade, hot-patch, self-update
 
 **Display**:
@@ -297,6 +300,13 @@ _Avoid_: daemon (ambiguous with the lab daemon), server, master
 **Lab daemon**:
 The per-lab daemon spawned by the supervisor on `vmlab up`. Owns the machines,
 the network fabric, snapshots and the wscript runtime.
+
+**Build**:
+Which `vmlab` binary a process is: the crate version plus the git revision it
+was built from (`0.31.0+1a2b3c4`). The CLI drives only daemons of its own
+build and refuses any other by name, `vmlab daemon stop` being the fix; the
+wire carries no protocol version, so the build is the compatibility unit.
+_Avoid_: version (alone — two builds share one)
 
 **Hypervisor**:
 The seam between deciding a machine should run and the host actually running
