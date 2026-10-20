@@ -670,6 +670,8 @@ The guest side is recognised by splitting on the first colon, so a Windows path 
 
 A push sends one file, or walks a directory and sends every file under it to the matching path below the guest destination, one request per file, keeping each file's mode. The daemon opens the host file itself, so the path is made absolute first, and verifies the digest end to end. It prints `pushed <bytes> bytes to <vm>:<path>` for a file and `pushed <n> file(s), <bytes> bytes to <vm>:<path>` for a tree.
 
+A transfer never hangs silently. Every request on the file session runs under a progress watchdog: when nothing at all has arrived from the guest for 60 seconds while a request is outstanding, the copy fails with `the guest's agent answered nothing for 60s: <request> is unanswered and nothing else moved on the file channel`, prefixed with the file it was copying. The budget is silence, not elapsed time, so a slow transfer that is still moving never trips it. A guest whose agent noticed its own port connection reset fails the copy sooner, with `channel lost: port connection reset (…)`. Either way the failure is one file; rerun the copy.
+
 A pull copies one guest file to the host path. When the host destination is an existing directory the guest file's name is kept under it. It prints `pulled <bytes> bytes to <path>`.
 
 Note — transfers run as the agent identity: `cp` still runs as SYSTEM or root even on a machine that declares a `login {}`, unlike `exec` and `shell`. A pushed file is owned by the agent identity, not by the login `exec` and `shell` run as. To write into a login's home as that login, use the `as_login` handle in a provision script (logins.md).

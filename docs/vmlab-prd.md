@@ -78,7 +78,7 @@ vmlab is a two-tier daemon system: one **supervisor** per user, one **lab daemon
 
 - **Supervisor (`vmlabd`).** One per user, auto-started by the CLI. Owns: spawning a lab daemon on `up` and reaping it on a full `down` (no machines named, or `vmlab lab stop`) and on `destroy`, which releases the lab's name — a partial `down`, a `vm stop` or a failed `up` leave the daemon up with machines stopped (see §7.1 for how the next `up` keeps it from running a stale lab file); the registry of running labs (name → root, socket, pid, state); **global segments** (§9.2) — shared switches live here, with lab daemons attached as trunk ports; cross-host peering; serialised writes to the template store (pulls, builds, imports — so concurrent labs can't corrupt it; reads are lock-free); host-level watchdogs (`host.disk_low`); and an aggregated event stream across all labs. A lab name is unique within this host registry. `lab.ensure` and `lab.restart` refuse a name already registered at another canonical root with a `conflict` error naming that root and the steps that release the name — a full `vmlab down` there, or `vmlab lab stop <name>` from anywhere (the way out when that directory is gone) — or renaming this lab. The CLI verbs that reach a lab's daemon without `lab.ensure` — `status`, `down`, `destroy`, `console`, `dev sync` — check the registered root first and refuse with the same conflict (exit 5), so a second checkout declaring the same name can neither read nor stop nor destroy the first one's lab. If a lab daemon dies unexpectedly, the supervisor detects it, emits `lab.daemon_crashed`, and marks the lab failed — it does not silently restart it.
 - **Lab daemon.** One per running lab, owning everything lab-scoped: that lab's QEMU processes, QMP and guest-agent channels, lab-local segments and their DHCP/DNS/routing/rules, clones and snapshots, lab state, and lab events (forwarded up to the supervisor's aggregate stream). A lab daemon's failure is contained to its lab; other labs and the supervisor are unaffected.
-- **CLI.** Connects to the supervisor for discovery and host-scoped verbs (template store, `status` across labs, daemon control), then talks **directly** to the relevant lab daemon's socket for lab-scoped operations — no proxying in the hot path.
+- **CLI.** Connects to the supervisor for discovery and host-scoped verbs (template store, `status` across labs, daemon control), then talks **directly** to the relevant lab daemon's socket for lab-scoped operations — no proxying in the hot path. **It drives only daemons of its own build.** The daemons outlive the `vmlab` that started them, so a vmlab installed over a running one meets daemons of the build before; the wire carries no protocol version by which two builds could be judged compatible, so the build is the unit. On connecting, the CLI asks the supervisor and the lab daemon for their build (`version`: the crate version plus the git revision it was built from, `0.31.0+1a2b3c4`, so two developer builds of one version are told apart) and refuses one that differs from its own — naming both builds and the one fix, `vmlab daemon stop` then retry — rather than meeting the difference later as a `vmlab.wcl` digest that "changed" or anything else two builds disagree on. A daemon too old to answer `version` is refused the same way. `vmlab daemon stop` and `daemon status` are exempt, being how an old daemon is stopped and seen; `vmlab lab list` lists a lab of another build from the registry alone.
 - **wscript runtime.** Executes **inside the lab daemon** — it must react to events and co-locating it with the lab's state and event stream keeps everything in one place. The script-facing contract is unchanged: scripts get the lab/VM API (§10) and remain daemon-unaware.
 - **QEMU.** One process per VM, launched by its lab daemon with `-qmp`, the `vmlab.agent.0` virtio-serial channel, VNC display, and one stream-socket netdev per NIC into the lab daemon's switch.
 
@@ -233,7 +233,7 @@ Each VM block can express:
 
   **A host GPU's own QEMU.** A GPU's driver can need a QEMU the host's package does not provide: QEMU 11.1's `egl-headless` binds a blob scanout's LINEAR dma-buf as `GL_TEXTURE_2D`, which NVIDIA's EGL accepts only as `GL_TEXTURE_EXTERNAL_OES`, so a Venus guest on an NVIDIA card renders behind a black console until QEMU is patched; AMD and Intel accept the 2D binding and keep the stock QEMU. The need follows the GPU, not the lab, so it lives on the host GPU:
   - `qemu_binary` — an absolute path. Every VM whose `gpu {}` resolves to that host GPU, in all three modes, runs it instead of `qemu-system-<arch>` from `PATH`. A file named `qemu-system-<a>` whose `<a>` is not the VM's QEMU arch is refused, naming both; a file of any other name is taken as given. A missing or non-executable path is refused, naming the host GPU and the path, by `vmlab validate` for the GPUs a lab uses and again at VM start. Such a VM also gets `-L <dir>`, where `<dir>` is the stock QEMU's data directory — `<prefix>/share/qemu` for the `qemu-system-<arch>` on `PATH`, symlinks followed — when that directory exists, so a minimal build finds the firmware and option ROMs it was not installed beside; QEMU still searches its own data directory after `-L`, so a full build loses nothing. With no stock QEMU on `PATH`, nothing is added. `vmlab status -v` shows `qemu=<path>` after `host_gpu=` for a VM that ran one.
-  - `qemu_env` — a record of strings, `{ KEY: "value" }` (WCL has no map type; the keys are identifiers). Applied to the QEMU process's own environment after the inherited Vulkan loader variables are removed and vmlab's derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and PCI-filter variables set, and an explicit host setting beats a derived one: a `qemu_env` key replaces vmlab's value for it. A key that is empty or contains `=` is refused. The `vmlab: env:` line lists every variable vmlab set, `qemu_env` included, with values.
+  - `qemu_env` — a record of strings, `{ KEY: "value" }` (WCL has no map type; the keys are identifiers). Applied to the QEMU process's own environment after the inherited Vulkan loader variables are removed and vmlab's derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and PCI-filter variables set, and an explicit host setting beats a derived one: a `qemu_env` key replaces vmlab's value for it. A key that is empty or contains `=` is refused. The `vmlab: env:` line lists every variable vmlab set, `qemu_env` included, with values. `vmlab status -v` shows the same set after `qemu=`, as `env=NAME=value,...` by name, values in full (vmlab is not a security boundary, and a path is the usual value); `vmlab status --json` carries it as the VM's `qemu_env` object. Both are what the VM was started with, recorded at that start, so a host config edited since does not change what a running VM reports; a VM that set nothing shows no `env=` and no `qemu_env`.
 
   There is no host-wide `qemu_binary` and no one-off CLI override. Template builds never carry a `gpu {}`, so they always run the stock QEMU.
 
@@ -313,17 +313,18 @@ Templates are defined in `template {}` blocks — in a dedicated WCL file or alo
   - another template (`from = "<arch>/<name>@<version>[#<variant>]"`) — layered builds: take an existing template, run more provisioning, seal as a new template. The reference resolves as a build context (§6.6): no `#` seeds from the source's default variant (its base, when it has none), `#<variant>` from that variant, `#base` from the base. Seeding flattens the selected disk's chain into the working disk. The surface check and the first-boot script the build boot runs come from the *effective* metadata of what was selected; `#base` runs no first-boot script.
   - `scratch` (§6.5) — blank disk; the build's attached installer media and provision script do everything.
 - **Hardware** — disk size, profile, and any §5.2 attributes; these are recorded into the template's metadata and become the inheritance layer for VMs.
+- **Build GPU** — a `gpu { mode = … host_gpu = … }` block, the same block a lab VM carries (§5.2), for the build VM only. §5.1 validates it as a lab VM's — `passthrough` included, on the same terms — and the build VM gets the host GPU exactly as a lab VM does: `host_gpu` by name, else the host's default, with the render node, the loader filter, the PCI-filter layer and the host config's `qemu_binary`/`qemu_env` that choice entails; a `host_gpu` the host lacks warns and falls back as a lab's does. `vmlab template build` logs the pick (`host_gpu=<name>`). It is **never recorded** in the template's metadata: a clone's GPU is the lab's choice, and the sealed image keeps the profile's plain display for clones that declare none. The case is a variant whose install needs a working paravirtual GPU to complete — a Windows GPU driver package that verifies its kernel driver started.
 - **Media** — additional ISO/floppy attachments for the build, including images built from folders (§6.3) — unattend files, driver media, agent installers.
 - **Provision scripts** — the same wscript machinery as labs (§10): the build boots the source, the script drives the installer with keystrokes/screen matching, configures, and seals. The vmlab guest agent is installed by the guest's own unattended-install hook from the auto-attached VMLAB bootstrap ISO, and the build verifies its handshake before sealing.
 
 Build flow: create working qcow2 → boot per template hardware → run build provision scripts → graceful shutdown → move qcow2 + metadata into the store under `<arch>/<name>/<version>/`. Metadata records both the baked `agent_version` and the host wscript-surface version used by embedded first-boot scripts. A failed build leaves nothing in the store.
 
-**Variants (§6.6).** A template block may declare `variant "<name>" { … }` children. Each takes `default`, `description` and `first_boot`; overrides of the base hardware (`profile`, `cpus`, `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`, `qemu_args`, and `nic`/`media` children); and `provision`/`playbook` children, run in declaration order. §5.1 checks the names (the variant grammar, `base` reserved, no duplicates) and the default rule (exactly one `default = true`, or a lone variant); the build checks them again, because it reads its file without the lab validator.
+**Variants (§6.6).** A template block may declare `variant "<name>" { … }` children. Each takes `default`, `description` and `first_boot`; overrides of the base hardware (`profile`, `cpus`, `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`, `qemu_args`, and `nic`/`media` children); a build-only `gpu {}` replacing the template's, as `nic` does; and `provision`/`playbook` children, run in declaration order. §5.1 checks the names (the variant grammar, `base` reserved, no duplicates) and the default rule (exactly one `default = true`, or a lone variant); the build checks them again, because it reads its file without the lab validator.
 
 On a definition with variants, `vmlab template build` builds and seals the base exactly as above, recording its `sha256` — but the base embeds no first-boot script: the template-level `first_boot` is each variant's inheritable default, and a variant's own `first_boot` overrides it. Then it builds the variants, the default first and the rest in declaration order (a failure stops the build, and a version holding several variants but not its default would be invalid metadata). Each variant build:
 
 1. creates a linked overlay on the sealed base;
-2. boots it with the variant's **effective** hardware — the variant block over the base's recorded metadata, so `secure_boot = false` really boots without Secure Boot. The template's installer media and extra disks stay with the base; its `qemu_args` and NICs carry over unless the variant declares its own;
+2. boots it with the variant's **effective** hardware — the variant block over the base's recorded metadata, so `secure_boot = false` really boots without Secure Boot. The template's installer media and extra disks stay with the base; its `qemu_args`, `gpu {}` and NICs carry over unless the variant declares its own;
 3. verifies the agent and runs the variant's provisions and playbooks. **The build boot runs no first-boot script** — the base was sealed without being generalized, so there is nothing for one to specialize; first boot is for the variant's clones;
 4. shuts down gracefully, as the base seal does;
 5. rewrites the overlay's backing file to `../../disk.qcow2` (`qemu-img rebase -u`);
@@ -397,7 +398,7 @@ Exactly one variant carries `default = true`; a lone variant is the default with
 
 A variant's overlay holds only its delta from the base. The backing path is relative, so moving the store or importing an export keeps it attached. A version counts as installed only when `template.wcl` exists, as before; a variant counts only when both its block in `template.wcl` and its overlay exist.
 
-**Metadata.** `template_meta` gains `variant "<name>" { … }` child blocks. Each records `created`, its overlay's `sha256`, the `base_sha256` it was built on, optionally `default`, `description`, `first_boot_script`, `wscript_surface` and `agent_version`, and any overrides of the base's hardware fields (`profile`, `cpus`, `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`). A variant's **effective metadata** is the base's `template_meta` overridden field by field by the variant's own fields. Everything downstream of a resolution — the hardware chain (§5.2, ADR-0008), first boot, the wscript-surface check (§6.2) and agent staleness (§19.4) — reads the effective metadata of whatever the reference resolved to. A variant whose `base_sha256` is not the base's `sha256` is **stale**: it is refused with a message to rebuild the variant, so a rebuilt base never has an old delta replayed on top of it. A base that records no `sha256` vouches for no variant.
+**Metadata.** `template_meta` gains `variant "<name>" { … }` child blocks. Each records `created`, its overlay's `sha256`, the `base_sha256` it was built on, optionally `default`, `description`, `first_boot_script`, `wscript_surface` and `agent_version`, and any overrides of the base's hardware fields (`profile`, `cpus`, `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`). The build's `gpu {}` is not among them — neither the template's nor a variant's is recorded (§6.1). A variant's **effective metadata** is the base's `template_meta` overridden field by field by the variant's own fields. Everything downstream of a resolution — the hardware chain (§5.2, ADR-0008), first boot, the wscript-surface check (§6.2) and agent staleness (§19.4) — reads the effective metadata of whatever the reference resolved to. A variant whose `base_sha256` is not the base's `sha256` is **stale**: it is refused with a message to rebuild the variant, so a rebuilt base never has an old delta replayed on top of it. A base that records no `sha256` vouches for no variant.
 
 **Clones.** A VM's primary disk is a linked clone backed by the absolute path of the resolved disk: the variant's overlay, giving the chain clone → variant → base, or the base for a base-only template. `clone-source` records the full reference text including `#<variant>`, so a changed variant refuses reuse exactly as a changed pin does (§7.1). `vmlab status -v` shows the variant each VM runs, including the default a bare reference picked. Removal is guarded per disk: a variant backing a clone cannot be removed, nor the version whose base or any variant backs one, unless `--force`. Removing a version removes all of its variants; removing one variant is refused for the default while others remain and for the last one, either of which would let a bare reference fall through to the unsealed base.
 
@@ -802,7 +803,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab down [vm...]` | Graceful stop; clones retained; a full `down` also reaps the lab daemon and releases the lab name |
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
 | `vmlab lab move <lab> [--from <dir>]` | Run in the lab root that should own a stopped lab (its `vmlab.wcl` declaring the same name): refuses while any of the lab's machines or processes run, or when this root already holds machine data; warns naming each machine the two lab files declare differently; releases the name; moves the working data (`.vmlab/`, or the `VMLAB_WORK_DIR` directory keyed by the root), renaming on one filesystem and otherwise copying, verifying and only then deleting the source; drops `smb/smb.conf` and rebases each `@dev` sync ledger onto the new root; lists each share, volume or workspace folder missing under the new root; and registers the lab from there. `--from` names the old root once the name is released |
-| `vmlab status [-v]` | Machine status, IPs and segments, plus `dev` (§19.1); `-v` adds raw state and per-kind detail |
+| `vmlab status [-v] [--json]` | Machine status, IPs and segments, plus `dev` (§19.1); `-v` adds raw state and per-kind detail; `--json` prints the status projection |
 | `vmlab validate` | Full §5.1 validation, no side effects |
 | `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2) |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |
@@ -819,7 +820,7 @@ The viewer is chosen automatically: an explicit `viewer` in host config wins, el
 | `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine, to iterate on the agent without rebuilding a template, and mark it diverged; `up` runs the same push on a stale agent by default (§19.4) |
 | `vmlab template build / list / rm / export / import` | Template store |
 | `vmlab template push / pull / login` | OCI registry distribution (§6.4) |
-| `vmlab daemon start / stop / status` | Supervisor control (normally automatic); status lists lab daemons |
+| `vmlab daemon start / stop / status` | Supervisor control (normally automatic); status lists lab daemons and the supervisor's build. Every other verb refuses a supervisor or lab daemon of another build than the CLI's (§3), and `daemon stop` is the fix it names |
 
 ---
 
@@ -890,6 +891,15 @@ VM and container names share one namespace: DNS, `depends_on` waves,
 across both kinds. A container with no NICs is valid — air-gapped, still
 reachable via `exec`/`cp` over the agent channel — unless it declares
 volumes, which are network-mounted (validation error, mirroring §7.5).
+**The BusyBox shim is a fallback, last on `PATH`.** cinit copies a static
+BusyBox into every container's scratch layer at `/.vmlab/busybox`, with an
+applet directory `/.vmlab/bin`, so a distroless image with no shell still gets
+a working `vmlab exec` and `vmlab shell`. The agent appends that directory to
+the **end** of the `PATH` an exec or shell runs with (the image's own, else the
+`login.defs` superuser path), so the image's `mount`, `ps` and the rest win
+and BusyBox answers only for what the image lacks; ahead of them it shadowed
+util-linux's `mount` in a `debian:12` container, which silently remounted
+without the `/etc/fstab` options.
 
 **Architecture.** Every container runs in a **micro-VM**: a pinned Alpine
 `linux-virt` kernel + purpose-built initramfs (`vmlab-cinit` as PID 1,
@@ -1356,7 +1366,33 @@ or failed — whether `up` runs it inline or the handshake does: the refresh
 restarts the agent, so a machine reported ready first would hand whoever waited
 on it — `wait_ready`, a dependent, `status`, a second `exec` — a channel about
 to close. `vm.ready` is emitted, and forwards installed, at that true
-readiness. The hold applies only where a refresh can run — a machine opted out,
+readiness. **And nothing else reaches the agent while it is being replaced.**
+Readiness alone was not enough: `up` returns without waiting on a machine
+nothing waits on, so a `vmlab exec` issued right after it met the background
+refresh mid-flight — handed the very connection the push then shut down
+("agent channel closed during exec"), its process killed in the restart (exit
+137), or handshaken with the agent on its way out and cut off when the new one
+answered its ping as somebody else. So the push holds the machine's agent
+channel from before it hands the guest the binary until the new agent has
+answered a handshake under its own instance (the agent's Hello and Pong name
+it; a reconnect answered under the old instance, or the old stamp, is a
+restart that did not happen). Every other caller — `exec`, `shell`, `cp`, a
+script, a probe — waits for the hold to end, up to four minutes, then fails
+naming the replacement, and what it gets afterwards is the new agent. `up`'s
+refresh takes the hold the moment the agent is up, before its own handshake
+and comparison, so an `exec` that arrives as `up` returns waits for the
+decision; a machine found current releases it a handshake later. A session
+already open on the channel when the push begins is let finish first, up to
+a minute, before the restart. The same hold covers `repair-agent`. **A
+reconnect answered by the agent told to restart is a restart not yet taken
+effect, and is waited for**: on Windows the service bounce lands seconds
+after the restart command returned (the restart script sleeps before `sc
+stop`), so the push's first reconnect was routinely the old agent's — the
+refresh was reported failed, the machine went ready, and the bounce then
+landed under the first `exec` after `up`. The old agent answering is pinged
+until it stops answering or another instance answers, then handshaken again,
+up to the two-minute reconnect budget; only then is "the service did not
+restart onto it" reported. The hold applies only where a refresh can run — a machine opted out,
 a container, the legacy tier or one with no sealed agent is ready at its
 handshake as before, and one already current is held only for the comparison —
 and it is bounded: past five minutes the machine is reported ready on whatever
@@ -1449,6 +1485,22 @@ silent regression: **`fileops` carries a `digest` request**, preserving the
 guest-computed verification that today's transfer offers (and which the syncer
 then leans on heavily), and **`mode` moves to `open`/`setstat`**, keeping "Unix
 permission bits, ignored on Windows".
+
+**A file channel that goes silent fails, and says so.** Every request on a
+`fileops` channel runs under a **progress watchdog**: once nothing at all has
+arrived from the guest for 60 s while a request is outstanding, the call fails
+naming the request and the file, and the channel with it — a record stream has
+no resynchronisation point, so every later reply on it would be suspect. The
+budget is silence, not elapsed time: a transfer that is slow but moving renews
+it with every reply, pipelined or not, and `digest` — the one request with no
+progress inside it — gets a budget that grows with the file (60 s plus the
+length at 2 MiB/s). The agent's half of the same rule: a **port connection
+reset** (the Windows adapter abandons a port write that pends 15 s and reopens
+the port) loses bytes the host cannot account for, so the agent fails every
+open channel with an error the host receives by id, and its port writer offers
+a refused frame again rather than dropping it. Before both, a frame lost on
+such a reset left `vmlab cp` waiting forever with nothing logged on either
+side.
 
 **`watch` reports paths, not events** — and that single move dissolves the
 platform-divergence problem. The agent holds a **coalescing set of dirty paths**

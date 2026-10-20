@@ -73,6 +73,7 @@ template "windows-11" {
   }
   variant "win3d" {
     secure_boot = false              // the variant's build boot and its clones run without SB
+    gpu { mode = "vulkan" }          // the build VM only; host_gpu = "AMD1" to pin. Never recorded
     provision "scripts/win3d-setup.ws" { }
     provision "scripts/generalize.ws" { }
   }
@@ -81,7 +82,8 @@ template "windows-11" {
 
 - A `variant` block takes `default`, `description`, `first_boot`, the hardware
   overrides (`profile cpus memory display cpu_model accel firmware tpm
-  secure_boot`), `qemu_args` (replaces the template's), `nic` (replaces the
+  secure_boot`), `qemu_args` (replaces the template's), `gpu {}` (replaces the
+  template's; build VM only), `nic` (replaces the
   template's when declared), `media`, and `provision`/`playbook` steps run in
   declaration order. Validation: legal unique names, not `base`; exactly one
   `default = true` unless there is only one variant.
@@ -311,6 +313,7 @@ template "<name>" {
   first_boot  = "scripts/first-boot.ws"
   agent       = true
   source "…"  { … }
+  gpu         { … }
   media       { … }
   provision "…" { … }
   playbook "…"  { … }
@@ -341,6 +344,7 @@ template "<name>" {
 | `first_boot` | utf8 | none | wscript run on the first instantiation of a clone, before it turns ready. |
 | `agent` | bool | `true` | Bake the vmlab-agent service into the image. |
 | `source {}` | child | required | What the build starts from. Exactly one of four forms. |
+| `gpu {}` | child | none | GPU acceleration for the build VM only (`mode`, `host_gpu`; vm.md `gpu {}`). Validated and picked as a lab VM's, `passthrough` included; the build log says `host_gpu=<name>`; a missing `host_gpu` warns and falls back. **Never recorded**: clones choose their own GPU. Use it when an install needs a working paravirtual GPU; do not override `display` for that. |
 | `media {}` | children | none | ISO or floppy images attached to the build. |
 | `provision {}` | children | none | Provision scripts that drive the build. |
 | `playbook {}` | children | none | config-weave playbooks applied to the build VM, interleaved with provisions in declaration order. Steps stream as structured build progress. |

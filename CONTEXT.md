@@ -134,7 +134,10 @@ default, when a VM's agent stamp differs from the shipped asset's (opt out
 with `agent_update = false`). Either makes the machine a **diverged machine**.
 Meaningless for a machine whose agent came with the host rather than with what
 it boots — a container micro-VM's — which is reported rather than implied, and
-impossible on the legacy tier, which `up` skips silently.
+impossible on the legacy tier, which `up` skips silently. While it runs it
+holds the machine's **agent channel**: every other caller waits until the new
+agent has answered a handshake under its own instance, so nothing rides the
+connection the restart closes.
 _Avoid_: upgrade, hot-patch, self-update
 
 **Display**:
@@ -283,6 +286,22 @@ over it), terminals, tail, metrics, clipboard and the workspace watch, in
 both VMs and containers.
 _Avoid_: QGA, qemu-guest-agent (removed), guest tools
 
+**Progress watchdog**:
+The rule that a `fileops` channel which goes silent fails rather than waits:
+nothing from the guest for 60 s with a request outstanding fails the call,
+naming the request and the file, and the channel with it. Measured as
+silence, so a slow transfer that is still moving never trips it; a `digest`'s
+budget grows with the file.
+_Avoid_: timeout (reads as elapsed time, which a slow transfer would exceed)
+
+**Port connection reset**:
+The agent abandoning a virtio-serial port connection whose write pended too
+long (15 s on Windows) and reopening the port. Bytes are lost in both
+directions, so the agent fails every open channel with `channel lost: port
+connection reset`, and its port writer offers a refused frame again instead
+of dropping it.
+_Avoid_: reconnect (the host never disconnected), hang
+
 **Event handler**:
 A wscript script bound with `on "event" {}` that reacts to a lifecycle event.
 Failures are logged, never fatal.
@@ -297,6 +316,13 @@ _Avoid_: daemon (ambiguous with the lab daemon), server, master
 **Lab daemon**:
 The per-lab daemon spawned by the supervisor on `vmlab up`. Owns the machines,
 the network fabric, snapshots and the wscript runtime.
+
+**Build**:
+Which `vmlab` binary a process is: the crate version plus the git revision it
+was built from (`0.31.0+1a2b3c4`). The CLI drives only daemons of its own
+build and refuses any other by name, `vmlab daemon stop` being the fix; the
+wire carries no protocol version, so the build is the compatibility unit.
+_Avoid_: version (alone — two builds share one)
 
 **Hypervisor**:
 The seam between deciding a machine should run and the host actually running
@@ -629,7 +655,9 @@ takes the default — never an address, because which card sits where is a
 fact about one machine and a lab file travels. Names match
 case-insensitively. A paravirtual mode falls back to the default from a name
 this host lacks; `passthrough` refuses. Picked by the lab daemon at VM start
-(`qemu::hostgpu::pick`). PRD §5.2.
+(`qemu::hostgpu::pick`). A template's or variant's `gpu {}` is the build VM's
+(`template::build::BuildSpec::gpu`), picked the same way and never sealed into
+the metadata. PRD §5.2, §6.1.
 _Avoid_: GPU address (the address is a host GPU's field), render node (the
 node is what sysfs resolves the address to)
 
@@ -646,7 +674,10 @@ loader's `VK_LOADER_DRIVERS_SELECT`, which matches a driver, not a device)
 **Lab status**:
 The typed projection of a lab's machines, segments and pulls that the lab
 daemon produces once and every surface renders unchanged. Carries the
-state-to-label derivation, so every surface speaks one vocabulary. See
+state-to-label derivation, so every surface speaks one vocabulary. A VM's
+entry records what its last start decided — the host GPU, its `qemu_binary`
+and the environment vmlab set on QEMU (`qemu_env`) — not what the host
+config says now. `vmlab status --json` prints it as it arrived. See
 ADR-0004.
 _Avoid_: state (a machine has a power state), snapshot, summary
 

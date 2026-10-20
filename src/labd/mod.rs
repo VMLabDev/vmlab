@@ -432,6 +432,7 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::Ping {} => Ok(json!("pong")),
             // The wire form of the status projection (ADR-0004); every surface
             // parses it straight back into `LabStatus`.
+            LabRequest::Version {} => Ok(json!(crate::version::BUILD)),
             LabRequest::Status {} => Ok(json!(lab.status().await)),
             LabRequest::DnsTable {} => Ok(lab.dns_table().await),
             LabRequest::Up { machines } => {

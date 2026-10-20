@@ -575,6 +575,174 @@ async fn an_agent_restarted_in_the_guest_is_handshaken_again() {
     vm.stop(true).await.expect("stop");
 }
 
+/// **An agent call made while the agent is being replaced waits, and lands
+/// on the agent that replaced it** (§19.4). The push restarts the agent and
+/// shuts its own connection down; before this, `vmlab exec` issued right
+/// after `up` — whose refresh of an un-waited machine runs on after `up`
+/// returns — was handed that very connection and died with it, as "agent
+/// channel closed during exec", or was killed in the restart (137), or
+/// handshook with the agent on its way out and was cut off when the new
+/// one answered its ping as somebody else.
+///
+/// The fake's agent restarts a second in, as a new instance with a new
+/// version. The gate is held across that: a caller waiting on it is still
+/// waiting once the restart has happened, the machine's agent is "not
+/// answering" to a probe meanwhile, the replacement's own reconnect reaches
+/// the new instance, and the waiter — released only then — gets a handle
+/// that handshook with the new instance, never the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_call_during_a_replacement_waits_for_the_agent_that_replaced_it() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                agent_restarts: Some((Duration::from_secs(1), "0.0.0-fake-2".into())),
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    let before = m.agent().await.expect("agent").info();
+    assert_eq!(before.agent_version, "0.0.0-fake");
+
+    // The push takes the gate while the old agent is still the one answering.
+    let replacing = m.begin_agent_replacement().await;
+    let waiter = tokio::spawn({
+        let m = Arc::clone(&m);
+        async move {
+            m.agent()
+                .await
+                .expect("the agent after the replacement")
+                .info()
+        }
+    });
+    // Past the scripted restart: the new instance is up, and the waiter is
+    // still held, because the replacement has not said it is done.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!waiter.is_finished(), "held until the replacement is done");
+    assert!(
+        !m.agent_answering().await,
+        "not answering anybody while it is being replaced"
+    );
+
+    // The replacement's own reconnect goes through the gate it holds, and
+    // finds the new instance.
+    let came_back = m
+        .wait_agent_during_replacement(SETTLE)
+        .await
+        .expect("the replacement reaches the new agent")
+        .info();
+    assert_ne!(
+        came_back.instance, before.instance,
+        "a new process answered"
+    );
+    assert_eq!(came_back.agent_version, "0.0.0-fake-2");
+    assert!(
+        !waiter.is_finished(),
+        "still held: the reconnect is not the release"
+    );
+
+    drop(replacing);
+    let after = tokio::time::timeout(SETTLE, waiter)
+        .await
+        .expect("released with the replacement")
+        .expect("the waiter's task");
+    assert_eq!(
+        after.instance, came_back.instance,
+        "the waiter got the new agent"
+    );
+    assert_eq!(after.agent_version, "0.0.0-fake-2");
+    assert!(m.agent_answering().await, "answering again once released");
+
+    vm.stop(true).await.expect("stop");
+}
+
+/// **A reconnect answered by the agent told to restart is a restart not yet
+/// taken effect, and is waited for** (§19.4). On Windows the service bounce
+/// lands seconds after the restart command returned, so the push's first
+/// reconnect was routinely the old agent's: the refresh was reported failed
+/// ("the agent answering is still agent=f1e4515 — the service did not
+/// restart onto it"), the machine went ready, and the bounce then landed
+/// under the first `exec` after `up`.
+///
+/// The fake's agent restarts a second in, as a new instance with a new
+/// version: the push's wait outlasts that and lands on the new instance. A
+/// guest whose agent never restarts is reported, by name, only once the
+/// wait is up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_push_waits_for_a_restart_that_has_not_taken_effect_yet() {
+    let dirs = Dirs::new();
+    let (vm1, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                agent_restarts: Some((Duration::from_secs(1), "0.0.0-fake-2".into())),
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm1, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm1.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    let before = m.agent().await.expect("agent").info();
+    let plan = super::agent_repair::plan(super::guest_os::GuestOs::Linux);
+
+    // Asked straight away, the agent answering is still the one that was
+    // told to restart — and the wait outlasts the restart.
+    let after = super::agent_repair::came_back(
+        &m,
+        "0.0.0-fake-2",
+        before.instance.as_deref(),
+        &plan,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("the restarted agent answers within the wait")
+    .info();
+    assert_ne!(after.instance, before.instance);
+    assert_eq!(after.agent_version, "0.0.0-fake-2");
+    vm1.stop(true).await.expect("stop");
+
+    // No restart ever: reported once the wait is up, naming what answered.
+    let dirs = Dirs::new();
+    let (vm2, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm2, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm2.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    let before = m.agent().await.expect("agent").info();
+    let started = tokio::time::Instant::now();
+    let err = match super::agent_repair::came_back(
+        &m,
+        "agent=new",
+        before.instance.as_deref(),
+        &plan,
+        Duration::from_secs(3),
+    )
+    .await
+    {
+        Ok(_) => panic!("the old agent is not the pushed one"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "waited the wait out"
+    );
+    assert!(err.contains("still 0.0.0-fake"), "{err}");
+    assert!(err.contains("did not restart onto it within 3s"), "{err}");
+    assert!(err.contains("vmlab vm restart dc01"), "{err}");
+    vm2.stop(true).await.expect("stop");
+}
+
 /// A software TPM that never binds its control socket must fail the start
 /// with something a user can act on — not let the emulator spawn and die on a
 /// missing chardev, and not leave the VM wedged in Starting.

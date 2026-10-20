@@ -445,6 +445,16 @@ vocabulary! {
     LabRequest => drop_shadowed_machine_aliases {
         /// Liveness check; answers `"pong"`.
         Ping = "ping" {},
+        /// This daemon's build (`vmlab::version::BUILD`): what the CLI
+        /// compares with its own before it drives the daemon, since one
+        /// build cannot drive another's.
+        #[one_way(
+            "cli",
+            "The build check is the CLI's: it is the one process that can be \
+             a different build from the daemon it connects to, and a script \
+             runs inside the daemon that would answer."
+        )]
+        Version = "version" {},
         /// The whole lab's runtime status: machines, segments, readiness.
         Status = "status" {},
         /// The DNS zones the lab's segments serve.

@@ -237,6 +237,14 @@ pub struct TemplateParts {
     pub variant: Option<String>,
 }
 
+/// Whether an agent connect waits on a replacement of the agent in progress
+/// (every caller) or is the replacement's own (§19.4).
+#[derive(Debug, Clone, Copy)]
+enum AgentGate {
+    Wait,
+    Bypass,
+}
+
 pub struct VmInstance {
     pub lab: String,
     pub cfg: model::Vm,
@@ -273,6 +281,10 @@ pub struct VmInstance {
     host_gpu: std::sync::Mutex<Option<String>>,
     /// That host GPU's `qemu_binary`, when the last start ran one (§5.2).
     qemu_binary: std::sync::Mutex<Option<PathBuf>>,
+    /// The variables the last start set in QEMU's environment (§5.2): what
+    /// `qemu.log`'s `vmlab: env:` line was written from, kept so status
+    /// answers from the start and not from a host config edited since.
+    qemu_env: std::sync::Mutex<Vec<(String, String)>>,
     qemu: Mutex<Option<Arc<dyn Process>>>,
     swtpm: Mutex<Option<Arc<dyn Process>>>,
     /// Per-share virtiofsd daemons of the current run (§7.5). Killed on
@@ -369,6 +381,7 @@ impl VmInstance {
             wake_cause: std::sync::Mutex::new(None),
             host_gpu: std::sync::Mutex::new(None),
             qemu_binary: std::sync::Mutex::new(None),
+            qemu_env: std::sync::Mutex::new(Vec::new()),
             qemu: Mutex::new(None),
             swtpm: Mutex::new(None),
             virtiofsd: Mutex::new(Vec::new()),
@@ -507,6 +520,12 @@ impl VmInstance {
     /// guests don't pay the timeout on every exec that would prefer the
     /// agent transport.
     async fn agent_handle(&self) -> Result<super::vm_agent::AgentHandle> {
+        self.agent_handle_with(AgentGate::Wait).await
+    }
+
+    /// [`agent_handle`](Self::agent_handle), with or without the wait on a
+    /// replacement of the agent in progress (§19.4).
+    async fn agent_handle_with(&self, gate: AgentGate) -> Result<super::vm_agent::AgentHandle> {
         match self.power_state().await {
             PowerState::Running => {}
             // A guest that keeps itself awake is only asleep for the moment
@@ -537,9 +556,15 @@ impl VmInstance {
             self.agent_up_flag().await,
             self.template().agent_version.as_deref(),
         );
-        self.agent
-            .connect(&self.cfg.name, &self.dirs.agent_sock(), &hint)
-            .await
+        let (name, sock) = (&self.cfg.name, self.dirs.agent_sock());
+        match gate {
+            AgentGate::Wait => self.agent.connect(name, &sock, &hint).await,
+            AgentGate::Bypass => {
+                self.agent
+                    .connect_during_replacement(name, &sock, &hint)
+                    .await
+            }
+        }
     }
 
     /// Whether the vmlab-agent answers right now, sharing (and populating)
@@ -712,6 +737,7 @@ impl VmInstance {
         }
         *self.host_gpu.lock_recover() = plan.name.clone();
         *self.qemu_binary.lock_recover() = plan.qemu_binary.clone();
+        *self.qemu_env.lock_recover() = plan.env.set.clone();
         Ok(plan)
     }
 
@@ -1631,6 +1657,14 @@ impl super::machine::Machine for VmInstance {
         self.agent_handle().await
     }
 
+    async fn begin_agent_replacement(&self) -> super::machine::AgentReplacement {
+        self.agent.begin_replacement().await
+    }
+
+    async fn agent_during_replacement(&self) -> Result<super::vm_agent::AgentHandle> {
+        self.agent_handle_with(AgentGate::Bypass).await
+    }
+
     async fn agent_answering(&self) -> bool {
         self.agent_is_answering().await
     }
@@ -1930,6 +1964,7 @@ impl super::machine::Machine for VmInstance {
                 .lock_recover()
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            qemu_env: self.qemu_env.lock_recover().iter().cloned().collect(),
         })
     }
 }

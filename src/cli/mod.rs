@@ -93,6 +93,9 @@ pub enum Command {
         /// kind-specific detail (template/hardware, image/health/last exit)
         #[arg(short, long)]
         verbose: bool,
+        /// Print the lab daemon's status projection as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Validate the lab file with no side effects
     Validate,
@@ -651,7 +654,7 @@ pub fn run() -> ExitCode {
         Command::Pull { vms } => lab::cmd_pull(vms),
         Command::Down { vms, force } => lab::cmd_down(vms, force),
         Command::Destroy => lab::cmd_destroy(),
-        Command::Status { verbose } => lab::cmd_status(verbose),
+        Command::Status { verbose, json } => lab::cmd_status(verbose, json),
         Command::Validate => validate::cmd_validate().map(|_| ()),
         Command::Vm { cmd } => match cmd {
             VmCmd::Start { vm } => lab::cmd_machine_power(&vm, lab::PowerOp::Start, false),

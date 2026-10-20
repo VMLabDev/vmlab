@@ -230,6 +230,27 @@ MSG
     `prevent_sleep` on.
   DOC
 
+  h2 "A copy failed because the file channel went silent"
+  code text { source = <<'MSG'
+push C:/tools/driver.sys: writing at offset 65536: the guest's agent answered nothing for 60s: the write at offset 65536 is unanswered and nothing else moved on the file channel
+pull C:/big.bin: reading at offset 63569920: channel lost: port connection reset (…)
+MSG
+  }
+  p <<DOC
+    Every request on the agent's file session runs under a progress
+    watchdog: the first message means nothing at all arrived from the guest
+    for 60 seconds while the named request was outstanding. It is silence,
+    not slowness — a slow transfer that is still moving renews the budget
+    with every reply. The second is the guest's own report: its port
+    connection was reset under the session (a port write that pended more
+    than 15 seconds, which happens when the host or QEMU stopped draining
+    the port under load), bytes were lost, and it failed every open channel
+    rather than let one wait. Both name the file; rerun the copy. The lab
+    daemon log carries the same words. An agent older than vmlab 0.31 dropped
+    frames silently on that reset, which left the copy waiting forever —
+    `vmlab machine repair-agent <machine>` replaces it.
+  DOC
+
   h2 "The machine's agent is out of date"
   code text { source = <<'MSG'
 the guest agent has no `watch` support — rebuild the template to update it
@@ -641,6 +662,31 @@ MSG
     binary itself cannot be executed, and `opening {log_path}`, when the
     state directory is not writable. [Files and directories](ref_paths) lists
     every location.
+  DOC
+
+  h2 "The daemon is another build of vmlab"
+  code text { source = "the running vmlabd is vmlab build 0.30.0-alpha, but this vmlab is build 0.31.0+1a2b3c4 — one build cannot drive another's daemons. Run `vmlab daemon stop` (which stops every lab daemon and the machines they run; disks and snapshots stay), then this command again" }
+  p <<DOC
+    The supervisor and the lab daemons outlive the `vmlab` command that
+    started them, so installing a new vmlab, or building one from source,
+    while they run leaves daemons of the previous build. The wire protocol
+    carries no version by which two builds could be judged compatible, so
+    every verb that connects to a daemon asks for its build first and refuses
+    one that differs from its own. The message names both builds; the same
+    message with `lab "{name}"'s daemon` names a lab daemon, and one that
+    says `an older vmlab build, from before daemons reported their build`
+    met exactly that. A build is the crate version plus the git revision it
+    was built from, so two source builds of the same version are told apart.
+  DOC
+  p <<DOC
+    `vmlab daemon stop` is the fix. It stops the supervisor and every lab
+    daemon, and with them the machines they run; clones, snapshots and lab
+    state stay on disk, and the next `vmlab up` starts daemons of the new
+    build. `vmlab daemon status` and `vmlab lab list` still answer against
+    the old daemons, so you can see what is running before stopping it.
+    Before this check, the mismatch surfaced later and less clearly, as a
+    `vmlab.wcl has changed` refusal between two builds that hashed the file
+    differently.
   DOC
 
   h2 "The lab name is already registered"

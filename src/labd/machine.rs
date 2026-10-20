@@ -481,24 +481,39 @@ pub trait Machine: Send + Sync + 'static {
     /// Hard failures (stopped, or a vintage guest with no agent channel)
     /// surface immediately.
     async fn wait_agent(&self, timeout: Duration) -> Result<AgentHandle> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            match self.agent().await {
-                Ok(agent) => return Ok(agent),
-                Err(e) => {
-                    // A permanent reason will not improve with waiting.
-                    // Anything untyped is treated as permanent too: guessing
-                    // that an unknown failure is retryable is how a caller
-                    // ends up blocked for the whole timeout on a real fault.
-                    let transient =
-                        AgentUnavailable::of(&e).is_some_and(AgentUnavailable::is_transient);
-                    if !transient || tokio::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            }
-        }
+        retry_handshake(timeout, || self.agent()).await
+    }
+
+    // ---- replacing the agent (§19.4) --------------------------------------
+
+    /// Hold this machine's agent channel for a replacement of the agent
+    /// itself (§19.4): from here until the returned guard drops, every other
+    /// caller of [`agent`](Machine::agent) waits — bounded by
+    /// [`AGENT_REPLACEMENT_WAIT`] — instead of being handed a channel the
+    /// replacement is about to restart out from under it, or a handshake
+    /// with the agent being replaced. The push holds it from before the
+    /// binary is sent until the new agent has answered a handshake under its
+    /// own instance, so what a waiter gets afterwards is the new agent.
+    ///
+    /// A second replacement asked for while one is held waits for the first.
+    /// The default holds nothing: a machine whose agent is never replaced
+    /// (a container's ships with the host) has nothing to gate.
+    async fn begin_agent_replacement(&self) -> AgentReplacement {
+        AgentReplacement::none()
+    }
+
+    /// [`agent`](Machine::agent) for the holder of an [`AgentReplacement`],
+    /// which does not wait on the gate it holds. The replacement reaches the
+    /// agent it is replacing, and then the one that replaced it, through
+    /// this and nothing else.
+    async fn agent_during_replacement(&self) -> Result<AgentHandle> {
+        self.agent().await
+    }
+
+    /// [`wait_agent`](Machine::wait_agent) over
+    /// [`agent_during_replacement`](Machine::agent_during_replacement).
+    async fn wait_agent_during_replacement(&self, timeout: Duration) -> Result<AgentHandle> {
+        retry_handshake(timeout, || self.agent_during_replacement()).await
     }
 
     /// Per-NIC IPv4 addresses reported by the agent, matched to the configured
@@ -829,6 +844,58 @@ async fn wait_until(
     }
 }
 
+/// How long a caller of [`Machine::agent`] waits for a replacement of the
+/// agent in progress ([`Machine::begin_agent_replacement`]) before giving up.
+/// A push stages the binary, swaps it, restarts the service and waits up to
+/// two minutes for the new agent's handshake; this is that, with room, so a
+/// waiter outlasts a slow guest and still fails by name on a wedged one.
+pub const AGENT_REPLACEMENT_WAIT: Duration = Duration::from_secs(240);
+
+/// The agent of one machine is being replaced (§19.4) — what
+/// [`Machine::begin_agent_replacement`] hands the push, and what every
+/// other [`Machine::agent`] call waits on until it drops. A guard rather
+/// than a flag: a push that fails, or whose task is gone, reopens the
+/// channel by dropping it, so nothing can leave the machine gated for good.
+#[must_use = "the agent channel is held only while this is alive"]
+pub struct AgentReplacement {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl AgentReplacement {
+    /// Holds nothing — the gate of a machine whose agent is never replaced.
+    pub fn none() -> Self {
+        Self { _permit: None }
+    }
+}
+
+/// `connect` retried on transient handshake failures until `timeout` — the
+/// loop behind [`Machine::wait_agent`], shared with the replacement's own
+/// reconnect so the two cannot drift.
+async fn retry_handshake<F, Fut>(timeout: Duration, mut connect: F) -> Result<AgentHandle>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<AgentHandle>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match connect().await {
+            Ok(agent) => return Ok(agent),
+            Err(e) => {
+                // A permanent reason will not improve with waiting.
+                // Anything untyped is treated as permanent too: guessing
+                // that an unknown failure is retryable is how a caller
+                // ends up blocked for the whole timeout on a real fault.
+                let transient =
+                    AgentUnavailable::of(&e).is_some_and(AgentUnavailable::is_transient);
+                if !transient || tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
 /// What an operation that needs the guest says when the guest is asleep
 /// (ACPI S3): the state by name, how to wake it, and how to stop it sleeping.
 ///
@@ -890,13 +957,30 @@ impl AgentUnavailable {
 /// The "no agent answering" advice stays with the adapter — a VM wants a
 /// template rebuild, a container wants its guest boot asset rebuilt — so
 /// [`connect`](Self::connect) takes the hint rather than owning one.
-#[derive(Default)]
 pub(super) struct AgentSlot {
     handle: tokio::sync::Mutex<Option<AgentHandle>>,
     failed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// The version the last successful handshake reported, kept apart from
     /// `handle` so a status read never waits behind a connect in progress.
     answered: std::sync::Mutex<Option<String>>,
+    /// One permit, held by a replacement of the agent (§19.4) for as long as
+    /// it runs. [`connect`](Self::connect) waits for it to be free before it
+    /// hands a channel out, so nobody lands on the agent being replaced or on
+    /// the connection the replacement is about to shut down; the replacement
+    /// itself reconnects through
+    /// [`connect_during_replacement`](Self::connect_during_replacement).
+    replacing: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for AgentSlot {
+    fn default() -> Self {
+        Self {
+            handle: tokio::sync::Mutex::new(None),
+            failed_at: tokio::sync::Mutex::new(None),
+            answered: std::sync::Mutex::new(None),
+            replacing: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
 }
 
 impl AgentSlot {
@@ -908,7 +992,64 @@ impl AgentSlot {
     /// features it reports are the running agent's. A dead one is shut down
     /// explicitly, because QEMU's chardev serves exactly one client and a
     /// half-dead connection would block every future connect.
+    ///
+    /// Waits first for any replacement of the agent in progress, so what it
+    /// hands out afterwards is the agent that replaced it.
     pub async fn connect(&self, name: &str, sock: &Path, hint: &str) -> Result<AgentHandle> {
+        self.wait_replaced(name).await?;
+        self.connect_during_replacement(name, sock, hint).await
+    }
+
+    /// Take the gate every other [`connect`](Self::connect) waits on, for a
+    /// replacement of the agent (§19.4). Waits for a replacement already in
+    /// progress rather than running beside it.
+    pub async fn begin_replacement(&self) -> AgentReplacement {
+        let permit = Arc::clone(&self.replacing)
+            .acquire_owned()
+            .await
+            .expect("the replacement semaphore is never closed");
+        AgentReplacement {
+            _permit: Some(permit),
+        }
+    }
+
+    /// Whether a replacement of the agent holds the gate right now.
+    pub fn replacing(&self) -> bool {
+        self.replacing.available_permits() == 0
+    }
+
+    /// Wait for a replacement in progress to finish, up to
+    /// [`AGENT_REPLACEMENT_WAIT`]; past that, a handshake failure naming
+    /// the replacement, which is transient (the replacement may yet end).
+    async fn wait_replaced(&self, name: &str) -> Result<()> {
+        if !self.replacing() {
+            return Ok(());
+        }
+        match tokio::time::timeout(AGENT_REPLACEMENT_WAIT, self.replacing.acquire()).await {
+            Ok(permit) => {
+                drop(permit);
+                Ok(())
+            }
+            Err(_) => Err(AgentUnavailable::Handshake {
+                machine: name.to_string(),
+                message: format!(
+                    "its agent is still being replaced after {}s; the replacement did not \
+                     come back (`vmlab vm restart {name}` loads whatever is installed)",
+                    AGENT_REPLACEMENT_WAIT.as_secs()
+                ),
+            }
+            .into()),
+        }
+    }
+
+    /// [`connect`](Self::connect) without the wait on the replacement gate:
+    /// what the holder of an [`AgentReplacement`] reconnects through.
+    pub async fn connect_during_replacement(
+        &self,
+        name: &str,
+        sock: &Path,
+        hint: &str,
+    ) -> Result<AgentHandle> {
         let mut agent = self.handle.lock().await;
         if let Some(handle) = agent.as_ref() {
             if handle.ping(Duration::from_secs(2)).await {
@@ -952,6 +1093,12 @@ impl AgentSlot {
     /// cached handle. Bypasses the failed-handshake cache — pollers need
     /// prompt discovery, not exec-path backoff — with a shorter timeout.
     pub async fn probe(&self, sock: &Path) -> bool {
+        // Not while it is being replaced: a probe that handshook with the
+        // agent on its way out would cache a handle the replacement's own
+        // reconnect then mistook for the agent that came back.
+        if self.replacing() {
+            return false;
+        }
         let mut agent = self.handle.lock().await;
         if let Some(handle) = agent.as_ref() {
             if handle.ping(Duration::from_secs(2)).await {
@@ -1012,6 +1159,53 @@ impl AgentSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caller held by a replacement that never ends is not held for ever:
+    /// past [`AGENT_REPLACEMENT_WAIT`] it fails by name, as a handshake
+    /// failure — transient, because the replacement may yet come back — that
+    /// says what it waited on and what to do about it.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_that_never_ends_fails_its_waiters_by_name() {
+        let slot = AgentSlot::default();
+        let held = slot.begin_replacement().await;
+        assert!(slot.replacing());
+        let sock = std::env::temp_dir().join("vmlab-no-such-agent.sock");
+        let err = match slot.connect("dc01", &sock, "hint").await {
+            Ok(_) => panic!("held past the wait"),
+            Err(e) => e,
+        };
+        let reason = AgentUnavailable::of(&err).expect("typed");
+        assert!(reason.is_transient(), "{reason}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dc01"), "{msg}");
+        assert!(msg.contains("still being replaced"), "{msg}");
+        assert!(msg.contains("vmlab vm restart dc01"), "{msg}");
+        drop(held);
+        assert!(!slot.replacing(), "released with the guard");
+    }
+
+    /// A second replacement asked for while one is held waits for the first
+    /// rather than running beside it — two pushes into one guest would race
+    /// each other's swap and restart.
+    #[tokio::test]
+    async fn replacements_of_one_agent_take_turns() {
+        let slot = Arc::new(AgentSlot::default());
+        let first = slot.begin_replacement().await;
+        let second = tokio::spawn({
+            let slot = Arc::clone(&slot);
+            async move { slot.begin_replacement().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!second.is_finished(), "waits for the first");
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("takes its turn")
+            .expect("task");
+        assert!(slot.replacing(), "and holds the gate in turn");
+        drop(second);
+        assert!(!slot.replacing());
+    }
 
     /// `wait_agent` retries a handshake and gives up immediately on a reason
     /// that will never improve. Before this was typed it decided by searching

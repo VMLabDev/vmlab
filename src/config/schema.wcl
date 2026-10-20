@@ -577,6 +577,8 @@ type TemplateDef {
   @children("provision") provisions: list<Provision>
   @doc("config-weave playbooks applied to the build VM, interleaved with provisions in declaration order; steps stream as structured build progress")
   @children("playbook")  playbooks: list<Playbook>
+  @doc("GPU acceleration for the build VM only (passthrough / virgl / vulkan), resolved on this host as a lab VM's is; never recorded for clones")
+  @child("gpu")          gpu: Gpu?
   @doc("NICs for the build VM (optional; the build VM may be air-gapped)")
   @children("nic")       nics: list<Nic>
   @doc("Additional disks attached during the build")
@@ -619,6 +621,8 @@ type TemplateVariant {
   secure_boot: bool?
   @doc("Raw QEMU flags for the variant's build VM, replacing the template's; default: the template's")
   qemu_args: list<utf8>?
+  @doc("GPU acceleration for the variant's build VM only, replacing the template's; never recorded for clones; default: the template's")
+  @child("gpu")          gpu: Gpu?
   @doc("ISO/floppy images attached to the variant's build")
   @children("media")     media: list<Media>
   @doc("Provision scripts the variant's build runs on the base, interleaved with its playbooks in declaration order")

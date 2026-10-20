@@ -141,6 +141,16 @@ page guide_containers {
     That is what a [dev container](guide_dev) wants, since it has no service
     to be, and the `dev-container` example in this manual declares it.
   DOC
+  p <<DOC
+    `exec` and `shell` run with the image's own `PATH`, or the superuser path
+    from `login.defs` when the image sets none, with one directory appended
+    at the end: `/.vmlab/bin`, a static BusyBox that cinit copies into every
+    container's scratch layer. It is a fallback, so a distroless image with
+    no shell still answers `vmlab shell`, and because it comes last the
+    image's own tools win: `command -v mount` in a `debian:12` container
+    gives `/usr/bin/mount`, and BusyBox answers only for what the image
+    lacks.
+  DOC
 
   h2 "Readiness and health"
 

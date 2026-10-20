@@ -3,8 +3,8 @@ page cmd_status {
   chapter_header "vmlab status" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-09-02"
-    version      = "vmlab 0.9"
+    updated      = "2026-10-20"
+    version      = "vmlab 0.31"
   }
 
   p <<DOC
@@ -20,6 +20,7 @@ page cmd_status {
     rows:
       | "Option" | "Meaning" |
       | "`-v`, `--verbose`" | "Add the raw power state, readiness, and each machine's kind-specific detail (template/hardware, image/health/last exit)." |
+      | "`--json`" | "Print the lab daemon's status projection as JSON instead of the tables. A lab with no daemon prints `{\"lab\": \"<name>\", \"running\": false}`." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -71,8 +72,23 @@ page cmd_status {
     its last handshake reported it, or the version the template sealed
     before an agent has answered or while the VM is stopped. An agent that
     restarts inside the guest is handshaken again the next time vmlab
-    reaches it, so the version follows the restart. A container adds
-    `health`, `exit` and `digest`.
+    reaches it, so the version follows the restart. A VM with a
+    [gpu block](ref_vm) adds `host_gpu=`, the host GPU its
+    last start picked, `qemu=` when that GPU ran its own `qemu_binary`, and
+    `env=NAME=value,...`: every variable vmlab set in that QEMU's
+    environment, the `VK_*` and `VMLAB_*` loader filter and the host GPU's
+    `qemu_env`, by name with values in full. That is what `qemu.log`'s
+    `vmlab: env:` line records, taken at the start, so a host config edited
+    since does not change what a running VM reports. See
+    [Host GPUs](guide_host). A container adds `health`, `exit` and `digest`.
+  DOC
+
+  p <<DOC
+    With `--json` the verb prints the daemon's status projection as it
+    arrived, the same object [vmlab lab](cmd_lab) `info` renders: each
+    machine carries its `kind`, its label, and the fields above under their
+    own names (`host_gpu`, `qemu_binary`, and `qemu_env` as an object of
+    `NAME: value`), each omitted where it has nothing to say.
   DOC
 
   h3 "Dev machines"
@@ -122,6 +138,9 @@ SRC
 
   p "Show the raw state behind each label:"
   code sh { source = "vmlab status -v" }
+
+  p "Check which render server a Venus VM's QEMU was started with:"
+  code sh { source = "vmlab status --json | jq '.machines[] | select(.name == \"gl01\") | .qemu_env'" }
 
   h2 "Exit status"
 

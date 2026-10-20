@@ -79,6 +79,15 @@ Usual causes, in order of likelihood: the template was built without the agent, 
 
 If the guest is up and the agent is absent, rebuild the template so the bake installs the agent this vmlab ships, or push one into the running machine with `vmlab machine repair-agent`. A container's agent comes from the host's guest asset, so on a container the message ends with `there is nothing to rebuild or repair — an agent that is not answering here is a machine to restart, or a guest asset to reinstall (§19.4)`.
 
+## A copy failed because the file channel went silent
+
+```
+push C:/tools/driver.sys: writing at offset 65536: the guest's agent answered nothing for 60s: the write at offset 65536 is unanswered and nothing else moved on the file channel
+pull C:/big.bin: reading at offset 63569920: channel lost: port connection reset (…)
+```
+
+Every request on the agent's file session runs under a progress watchdog: the first message means nothing at all arrived from the guest for 60 seconds while the named request was outstanding. It is silence, not slowness — a slow transfer that is still moving renews the budget with every reply. The second is the guest's own report: its port connection was reset under the session (a port write that pended more than 15 seconds, which happens when the host or QEMU stopped draining the port under load), bytes were lost, and it failed every open channel rather than let one wait. Both name the file; rerun the copy. The lab daemon log carries the same words. An agent older than vmlab 0.31 dropped frames silently on that reset, which left the copy waiting forever — `vmlab machine repair-agent <machine>` replaces it.
+
 ## Autologon set on a fresh Windows clone is gone after a reboot
 
 ```
@@ -205,6 +214,23 @@ supervisor did not come up — check ~/.local/state/vmlab/vmlabd.log
 Every `vmlab` verb that needs the supervisor connects to `$XDG_RUNTIME_DIR/vmlab/vmlabd.sock`, spawns `vmlabd` if nothing answers, and retries for about ten seconds. This message means the spawned process never answered a ping. The log it names holds `vmlabd`'s stdout and stderr. Common causes: a stale socket from a previous user session, a runtime directory owned by another user, a `vmlab-host.wcl` that fails to parse, and a fast-path probe that crashed rather than degraded. The per-lab daemon's log is `.vmlab/lab.log` inside the lab directory, and `vmlab logs` reads it.
 
 Related messages from the same code path are `spawning vmlabd`, when the binary itself cannot be executed, and `opening {log_path}`, when the state directory is not writable.
+
+## The daemon is another build of vmlab
+
+```
+the running vmlabd is vmlab build 0.30.0-alpha, but this vmlab is build 0.31.0+1a2b3c4 — one build cannot drive another's daemons. Run `vmlab daemon stop` (which stops every lab daemon and the machines they run; disks and snapshots stay), then this command again
+```
+
+The supervisor and lab daemons outlive the `vmlab` that started them, so a vmlab
+installed (or built) while they run meets daemons of the previous build. Every verb
+that connects asks the daemon's build (`version`) first and refuses one that differs
+from its own; the wire has no protocol version to judge compatibility by, so the
+build is the unit. A build is the crate version plus the git revision
+(`0.31.0+1a2b3c4`), so two source builds of one version are told apart. The variant
+naming `lab "{name}"'s daemon` met a lab daemon; `an older vmlab build, from before
+daemons reported their build` met exactly that. Fix: `vmlab daemon stop` (stops
+every lab daemon and its machines; disks and snapshots stay), then retry.
+`vmlab daemon status` and `vmlab lab list` still answer against old daemons.
 
 ## The lab name is already registered
 

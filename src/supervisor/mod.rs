@@ -602,7 +602,7 @@ impl Handler<SupRequest> for SupervisorHandler {
         }
         match req {
             SupRequest::Ping {} => Ok(json!("pong")),
-            SupRequest::Version {} => Ok(json!(env!("CARGO_PKG_VERSION"))),
+            SupRequest::Version {} => Ok(json!(crate::version::BUILD)),
             // Which network fast-path tier this daemon selected (PRD §9.1),
             // plus why the skipped kernel tiers were unavailable.
             SupRequest::FastPath {} => Ok(crate::net::fastpath::status_json()),

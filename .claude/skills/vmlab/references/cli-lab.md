@@ -108,7 +108,18 @@ cannot be refreshed is not held. A failed refresh never fails `up`: it prints
 `warning: agent: could not update "<vm>" …` with the reason and the old agent stays
 in place. Containers, the legacy agent tier, and VMs whose template sealed no agent
 are skipped silently. `agent_update = false` on a `vm` (or on the `lab`, for every
-VM; the `vm` wins) keeps the template's agent.
+VM; the `vm` wins) keeps the template's agent. **Nothing else reaches the agent
+while it is being replaced**: from before the push sends the binary until the new
+agent has answered a handshake as a new instance, every other use of the VM's
+agent (`exec`, `shell`, `cp`, a script) waits, up to four minutes, then runs on the
+new agent; a command already running when the push begins gets up to a minute
+to finish before the restart. So `vmlab up && vmlab exec …` works even when the
+exec lands in the background refresh — before this it failed with `agent channel
+closed during exec` or exit 137. On Windows the service restart lands seconds
+after the push asks for it, so the push keeps waiting (within its two-minute
+budget) while the old agent still answers, and reports `the service did not
+restart onto it` only when the budget is spent — a Server 2025 refresh used to be
+reported failed with the restart still pending.
 
 ### Examples
 
@@ -225,6 +236,7 @@ vmlab status [OPTIONS]
 | Option | Meaning |
 | --- | --- |
 | `-v`, `--verbose` | Add the raw power state, readiness, and each machine's kind-specific detail (template/hardware, image/health/last exit). |
+| `--json` | Print the lab daemon's status projection as JSON instead of the tables; a lab with no daemon prints `{"lab": "<name>", "running": false}`. |
 | `-h`, `--help` | Print help. |
 
 ### What it prints
@@ -258,8 +270,16 @@ whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or
 `up`'s agent refresh. A VM
 then adds `arch`, `cpus`, `memory` and `agent` (the running agent's handshake
 stamp, or the template's sealed one before an agent answers or while stopped; an
-agent restarted inside the guest is handshaken again, so this follows it); a
-container adds `health`, `exit` and `digest`.
+agent restarted inside the guest is handshaken again, so this follows it). A VM
+with a `gpu {}` adds `host_gpu=` (the host GPU its last start picked), `qemu=`
+when that GPU ran its own `qemu_binary`, and `env=NAME=value,...`: every variable
+vmlab set in that QEMU's environment (the `VK_*`/`VMLAB_*` loader filter and the
+host GPU's `qemu_env`), by name with values in full — what `qemu.log`'s
+`vmlab: env:` line records, taken at the start, so a host config edited since
+does not change what a running VM reports. A container adds `health`, `exit` and
+`digest`. `--json` prints the projection itself: each machine carries `kind`, its
+label and these fields by name (`host_gpu`, `qemu_binary`, `qemu_env` as an
+object), each omitted where empty.
 
 #### Dev machines
 

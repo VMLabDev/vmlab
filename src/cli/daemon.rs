@@ -32,6 +32,10 @@ pub async fn ensure_supervisor() -> Result<SupClient> {
     let sock = crate::paths::supervisor_socket();
     if let Ok(client) = SupClient::connect(&sock).await {
         if client.send(SupRequest::Ping {}).await.is_ok() {
+            same_build(
+                "the running vmlabd",
+                client.send(SupRequest::Version {}).await.ok(),
+            )?;
             return Ok(client);
         }
         // Something holds the socket and will not serve: a supervisor on its
@@ -129,7 +133,26 @@ pub async fn ensure_lab_daemon(name: &str, root: &std::path::Path) -> Result<Lab
             .as_str()
             .context("malformed lab.ensure response")?,
     );
-    Ok(LabClient::connect(&sock).await?)
+    let client = LabClient::connect(&sock).await?;
+    same_build(
+        &format!("lab \"{name}\"'s daemon"),
+        client.send(LabRequest::Version {}).await.ok(),
+    )?;
+    Ok(client)
+}
+
+/// Refuse a daemon of another build than this binary (`crate::version`):
+/// `answer` is what it said to `version`, or `None` where it could not say.
+/// The daemons outlive the `vmlab` that started them, so a vmlab installed
+/// over a running one meets daemons of the build before — which answered
+/// with a `vmlab.wcl` digest that "changed" rather than with the real
+/// difference, until this named it.
+fn same_build(what: &str, answer: Option<serde_json::Value>) -> Result<()> {
+    let theirs = answer.as_ref().and_then(|v| v.as_str());
+    match crate::version::mismatch(what, crate::version::BUILD, theirs) {
+        Some(why) => bail!(why),
+        None => Ok(()),
+    }
 }
 
 /// Refuse when `name` is registered from a root other than `root` — the same
@@ -162,15 +185,25 @@ pub async fn check_registration(name: &str, root: &Path) -> Result<()> {
 /// registered from another root (see [`check_registration`]).
 pub async fn try_own_lab_daemon(name: &str, root: &Path) -> Result<Option<LabClient>> {
     check_registration(name, root).await?;
-    Ok(try_lab_daemon(name).await)
+    try_lab_daemon(name).await
 }
 
-/// Connect to a lab daemon only if it is already running.
-pub async fn try_lab_daemon(name: &str) -> Option<LabClient> {
+/// Connect to a lab daemon only if it is already running: `None` when it is
+/// not, and a refusal when one is running but is another build than this
+/// `vmlab` (see [`same_build`]).
+pub async fn try_lab_daemon(name: &str) -> Result<Option<LabClient>> {
     let sock = crate::paths::lab_socket(name);
-    let client = LabClient::connect(&sock).await.ok()?;
-    client.send(LabRequest::Ping {}).await.ok()?;
-    Some(client)
+    let Ok(client) = LabClient::connect(&sock).await else {
+        return Ok(None);
+    };
+    if client.send(LabRequest::Ping {}).await.is_err() {
+        return Ok(None);
+    }
+    same_build(
+        &format!("lab \"{name}\"'s daemon"),
+        client.send(LabRequest::Version {}).await.ok(),
+    )?;
+    Ok(Some(client))
 }
 
 /// `vmlab fastpath` — which network fast-path tier the supervisor selected
