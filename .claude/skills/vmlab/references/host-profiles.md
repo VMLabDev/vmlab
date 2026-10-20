@@ -174,7 +174,7 @@ and sha256 (`firmware/VERSION` names the packages):
 
 | Arch | Plain UEFI | Secure boot |
 | --- | --- | --- |
-| x86_64 | `OVMF_CODE_4M.fd` + `OVMF_VARS_4M.fd` | `OVMF_CODE_4M.secboot.fd` + `OVMF_VARS_4M.ms.fd` (Microsoft + Debian keys enrolled) |
+| x86_64 | `OVMF_CODE_4M.fd` + `OVMF_VARS_4M.fd` | `OVMF_CODE_4M.secboot.fd` + `OVMF_VARS_4M.ms.fd` (Microsoft 2011 + 2023 CAs and Debian keys enrolled) |
 | aarch64 | `AAVMF_CODE.fd` + `AAVMF_VARS.fd` | `AAVMF_CODE.secboot.fd` + `AAVMF_VARS.ms.fd` (keys enrolled) |
 
 A host needs no `ovmf` / `qemu-efi-aarch64` package. Lookup order, for plain UEFI
