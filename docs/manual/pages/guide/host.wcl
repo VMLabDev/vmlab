@@ -206,8 +206,8 @@ DOC
   table {
     rows:
       | "Arch" | "Plain UEFI" | "Secure boot" |
-      | "x86_64" | "`OVMF_CODE_4M.fd` with `OVMF_VARS_4M.fd`" | "`OVMF_CODE_4M.secboot.fd` with `OVMF_VARS_4M.ms.fd`, Microsoft's and Debian's keys enrolled" |
-      | "aarch64" | "`AAVMF_CODE.fd` with `AAVMF_VARS.fd`" | "`AAVMF_CODE.secboot.fd` with `AAVMF_VARS.ms.fd`, keys enrolled" |
+      | "x86_64" | "`OVMF_CODE_4M.fd` with `OVMF_VARS_4M.fd`" | "`OVMF_CODE_4M.secboot.fd` with `OVMF_VARS_4M.ms.fd`, Microsoft's 2011 and 2023 certificates and Debian's keys enrolled" |
+      | "aarch64" | "`AAVMF_CODE.fd` with `AAVMF_VARS.fd`" | "`AAVMF_CODE.secboot.fd` with `AAVMF_VARS.ms.fd`, the same keys enrolled" |
   }
 
   p <<'DOC'

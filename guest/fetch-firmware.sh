@@ -4,7 +4,7 @@
 # OVMF package and every host boots the same bytes. src/qemu/firmware.rs looks
 # it up under <guest asset dir>/firmware/<arch>/ before the host's own.
 #
-#   x86_64   Debian `ovmf`:
+#   x86_64   Debian `ovmf-generic`:
 #              OVMF_CODE_4M.fd          + OVMF_VARS_4M.fd      plain UEFI
 #              OVMF_CODE_4M.secboot.fd  + OVMF_VARS_4M.ms.fd   secure boot,
 #                                         Microsoft + distro keys enrolled
@@ -26,10 +26,15 @@ MIRROR="${VMLAB_DEBIAN_MIRROR:-https://deb.debian.org/debian}"
 SNAPSHOT="https://snapshot.debian.org"
 
 # Pinned packages: arch|package|version|sha256 — all from the edk2 source
-# package, Debian 13 (trixie).
+# package, Debian unstable. Not trixie's 2025.02: its secure-boot VARS enrol
+# only Microsoft's 2011 certificates, and a Windows boot manager signed by the
+# "Windows UEFI CA 2023" (shipped by Windows updates from 2026-09) is refused
+# with Access Denied by any fresh store made from them. These enrol both the
+# 2011 and the 2023 Microsoft CAs. The x86_64 images moved from `ovmf` to
+# `ovmf-generic`, which `ovmf` now only depends on.
 PACKAGES=(
-  "x86_64|ovmf|2025.02-8+deb13u1|78e0d54df11fc77406cb7a0bc9a39e5bca6d1cbe06556b91d9a73491c52decdf"
-  "aarch64|qemu-efi-aarch64|2025.02-8+deb13u1|a00b2411a79c8aeafd95a7c868ac3cd1aab592f1af9fff965f02d81a625276ed"
+  "x86_64|ovmf-generic|2026.08+ds-2|05c1593998ba58700ff86c062bde306321af1f5a2943ea9ceef6c2332f3f3374"
+  "aarch64|qemu-efi-aarch64|2026.08+ds-2|30467a3593c099ea42bd6ff3c4590e4b205edf9a7b98844f4bed17cd8b05eb58"
 )
 
 # What each arch ships: destination name|path inside the package. The
