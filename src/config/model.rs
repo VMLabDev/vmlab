@@ -638,6 +638,16 @@ pub enum GpuMode {
 }
 
 impl GpuMode {
+    /// The schema spelling — what a rendered build lab writes the mode
+    /// back out as (§6.1).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GpuMode::Passthrough => "passthrough",
+            GpuMode::Virgl => "virgl",
+            GpuMode::Vulkan => "vulkan",
+        }
+    }
+
     /// Whether the guest's scanout is a host GL texture (egl-headless) rather
     /// than a 2D surface — the modes QMP `screendump` cannot capture.
     pub fn gl_display(self) -> bool {
@@ -886,6 +896,10 @@ pub struct TemplateDef {
     /// Watch the build VM in QEMU's own window (§11).
     pub gui: bool,
     pub qemu_args: Vec<String>,
+    /// GPU acceleration for the build VM (§5.2), resolved on the building
+    /// host exactly as a lab VM's. Build-only: never recorded in the sealed
+    /// metadata, because a clone's GPU is the lab's choice (§6.1).
+    pub gpu: Option<Gpu>,
     /// Wscript script (path relative to the template root) run the first time a VM
     /// is instantiated from this template, before it is reported ready (§6.1).
     pub first_boot: Option<PathBuf>,
@@ -955,6 +969,9 @@ pub struct TemplateVariantDef {
     pub secure_boot: Option<bool>,
     /// Replaces the template's `qemu_args` for this variant's build boot.
     pub qemu_args: Option<Vec<String>>,
+    /// Replaces the template's `gpu {}` for this variant's build boot.
+    /// Build-only, like the template's: never recorded for clones.
+    pub gpu: Option<Gpu>,
     pub media: Vec<Media>,
     pub provisions: Vec<Provision>,
     pub playbooks: Vec<Playbook>,

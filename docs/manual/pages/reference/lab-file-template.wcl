@@ -47,6 +47,7 @@ template "<name>" {
   first_boot  = "scripts/first-boot.ws"
   agent       = true
   source "…"  { … }
+  gpu         { … }
   media       { … }
   provision "…" { … }
   playbook "…"  { … }
@@ -79,6 +80,7 @@ SRC
       | "`first_boot`" | "utf8" | "none" | "wscript run on the first instantiation of a clone, before it turns ready." |
       | "`agent`" | "bool" | "`true`" | "Bake the vmlab-agent service into the image." |
       | "`source {}`" | "child" | "required" | "What the build starts from. Exactly one of four forms." |
+      | "`gpu {}`" | "child" | "none" | "GPU acceleration for the build VM only: passthrough, virgl or vulkan, with an optional `host_gpu`. Never recorded for clones." |
       | "`media {}`" | "children" | "none" | "ISO or floppy images attached to the build." |
       | "`provision {}`" | "children" | "none" | "Provision scripts that drive the build." |
       | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied to the build VM, interleaved with provisions in declaration order. Steps stream as structured build progress." |
@@ -87,8 +89,27 @@ SRC
       | "`variant {}`" | "children" | "none" | "Sealed variants built on the base after it seals, each its own disk state. See the variant {} section below." |
   }
   p <<DOC
-    `media`, `provision`, `playbook`, `nic` and `disk` are the same blocks a
-    `vm` carries; see [vm and its children](ref_vm).
+    `media`, `provision`, `playbook`, `nic`, `disk` and `gpu` are the same
+    blocks a `vm` carries; see [vm and its children](ref_vm).
+  DOC
+  h3 "The build VM's GPU"
+  p <<DOC
+    A `gpu {}` on a template or a variant gives the **build VM** a GPU and
+    nothing else. Validation checks it as a lab VM's, `passthrough`
+    included. At the build boot the lab daemon picks the host GPU as it does
+    for a lab VM: the `host_gpu` named, or the host's default, with its
+    render node, the Vulkan loader filter, the PCI-filter layer and the host
+    config's `qemu_binary` and `qemu_env`. A `host_gpu` this host does not
+    declare warns and falls back to the default. The build log names the
+    pick as `host_gpu=<name>`, and the build VM's `qemu.log` header shows
+    the argv and environment it produced.
+  DOC
+  p <<DOC
+    The block is never recorded in the template's metadata: a clone's GPU is
+    the lab's choice, so a clone that declares no `gpu {}` boots on the
+    profile's plain display. Use it when an install only completes on a
+    working paravirtual GPU, such as a Windows GPU driver package that
+    verifies its kernel driver started, and leave `display` alone.
   DOC
   h3 "Versions and the registry"
   p <<DOC
@@ -186,6 +207,7 @@ template "windows-11" {
   variant "win3d" {
     description = "GPU driver installed"
     secure_boot = false
+    gpu { mode = "vulkan" }          // the build VM only; host_gpu = "AMD1" to pin
     provision "scripts/win3d-setup.ws" { }
     provision "scripts/generalize.ws" { }
   }
@@ -209,6 +231,7 @@ SRC
       | "`tpm`" | "bool" | "the base's" | "Enable a TPM 2.0 device." |
       | "`secure_boot`" | "bool" | "the base's" | "Enable secure boot; OVMF only." |
       | "`qemu_args`" | "list<utf8>" | "the template's" | "Raw QEMU flags for the variant's build VM, replacing the template's." |
+      | "`gpu {}`" | "child" | "the template's" | "GPU acceleration for the variant's build VM only, replacing the template's. Never recorded for clones; see the build VM's GPU above." |
       | "`media {}`" | "children" | "none" | "ISO or floppy images attached to the variant's build. The template's own media stay with the base build." |
       | "`provision {}`" | "children" | "none" | "Provision scripts the variant's build runs, interleaved with its playbooks in declaration order." |
       | "`playbook {}`" | "children" | "none" | "config-weave playbooks applied to the variant's build VM." |
@@ -219,7 +242,8 @@ SRC
     the variant's build boot and for every clone of the variant; a field the
     variant leaves out follows the base. `secure_boot = false` on a variant
     of a Secure Boot base boots its build, and its clones, on the firmware
-    without Secure Boot.
+    without Secure Boot. `gpu {}` is the exception: it reaches the variant's
+    build boot and never its clones.
   DOC
   h3 "How a variant builds"
   p <<DOC

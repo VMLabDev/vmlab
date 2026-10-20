@@ -454,7 +454,9 @@ fn gpu_field_moved(field: &str) -> String {
 
 /// Every lab `gpu {}` field that moved to the host config (PRD §5.2), as the
 /// issue saying where it went; [`super::supersede`] puts these in place of
-/// the schema's unknown-field complaint about the same text.
+/// the schema's unknown-field complaint about the same text. A template's
+/// and a variant's build-VM `gpu {}` (§6.1) is the same block, so it earns
+/// the same words.
 pub fn moved_fields(doc: &Document) -> IssueList {
     fn walk(b: &Block, in_vm: bool, out: &mut IssueList) {
         if in_vm && b.kind() == "gpu" {
@@ -467,7 +469,11 @@ pub fn moved_fields(doc: &Document) -> IssueList {
             }
         }
         for child in b.blocks() {
-            walk(&child, b.kind() == "vm", out);
+            walk(
+                &child,
+                matches!(b.kind(), "vm" | "template" | "variant"),
+                out,
+            );
         }
     }
     let mut out = IssueList::new();
@@ -890,9 +896,11 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let mut nics = Vec::new();
     let mut extra_disks = Vec::new();
     let mut variants = Vec::new();
+    let mut gpu = None;
     for child in r.children() {
         match child.kind() {
             "source" => source = extract_source(&child, r.issues()),
+            "gpu" => gpu = extract_gpu(&child, r.issues()),
             "media" => {
                 if let Some(m) = extract_media(&child, r.issues()) {
                     media.push(m);
@@ -961,6 +969,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         nested,
         gui,
         qemu_args,
+        gpu,
         first_boot,
         agent,
         media,
@@ -980,6 +989,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
     let mut provisions = Vec::new();
     let mut playbooks = Vec::new();
     let mut nics = Vec::new();
+    let mut gpu = None;
     for child in r.children() {
         match child.kind() {
             "media" => {
@@ -998,6 +1008,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
                 }
             }
             "nic" => nics.push(extract_nic(&child, r.issues())),
+            "gpu" => gpu = extract_gpu(&child, r.issues()),
             _ => {}
         }
     }
@@ -1030,6 +1041,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
         tpm,
         secure_boot,
         qemu_args,
+        gpu,
         media,
         provisions,
         playbooks,
