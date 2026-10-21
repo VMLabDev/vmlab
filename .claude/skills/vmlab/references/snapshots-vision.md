@@ -42,6 +42,15 @@ succeeds and `vmlab snapshot restore` prints a `WARNING:` line; the
 captured time, and an RFC 3339 date-time starts the machine at that instant
 and is never set.
 
+The RTC holds UTC. Windows guests on `vmlab-agent` read it as UTC because the
+bootstrap installer sets `RealTimeIsUniversal = 1` and the agent re-ensures it
+at every start; an older template gets it from `up`'s agent update or
+`vmlab machine repair-agent`, after which the daemon sets the running clock
+once (`clock = "host"`), the flag holding from the next boot. Profiles with
+`rtc = "localtime"` (`windows-xp`, `windows-9x`) start the RTC at the host's
+local time instead (`-rtc base=localtime`; a fixed instant converted to host
+local time). vmlab sets no guest time zone.
+
 Containers snapshot with the same verbs and the same semantics. The
 per-container scratch disk holds the snapshot, the image's read-only root is
 outside it, and each snapshot records the image digest it was taken against

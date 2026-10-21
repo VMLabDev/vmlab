@@ -71,6 +71,19 @@ impl AgentTransport {
     }
 }
 
+/// What the guest reads its real-time clock as (PRD §7.3), and so what the
+/// RTC is started at. `Utc` is QEMU's default and what every Linux guest
+/// expects; Windows guests on the Rust agent are made to expect it too
+/// (`RealTimeIsUniversal`). `Localtime` is for guests that cannot be — DOS,
+/// Windows 9x, NT4 through XP/2003 — whose RTC then holds the host's local
+/// time (QEMU `-rtc base=localtime`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rtc {
+    #[default]
+    Utc,
+    Localtime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareKind {
     Ovmf,
@@ -111,6 +124,8 @@ pub struct Profile {
     /// the virtio-win driver + WinFsp on Windows) — makes it a candidate
     /// for `transport = "auto"` shares (§7.5).
     pub virtiofs: bool,
+    /// What the guest reads the RTC as (§7.3).
+    pub rtc: Rtc,
     /// Guest path an `@dev` workspace lands at when the decorator names none
     /// (§19.1). Guest-OS-shaped — `C:\src` on Windows, `/src` on Linux —
     /// which is why it is profile-sourced rather than a constant. `None`
@@ -288,6 +303,10 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .unspan()
             .unwrap_or_default(),
         virtiofs: r.bool("virtiofs").unspan().unwrap_or(false),
+        rtc: r
+            .keyword("rtc", &[("utc", Rtc::Utc), ("localtime", Rtc::Localtime)])
+            .unspan()
+            .unwrap_or_default(),
         workspace_guest: r.string("workspace_guest").unspan(),
     };
     Some(Profile {
@@ -401,6 +420,46 @@ mod tests {
         assert!(custom.machine.is_none());
         assert!(custom.firmware.is_none());
         assert_eq!(custom.agent_transport, AgentTransport::VirtioSerial);
+    }
+
+    /// Only the guests that cannot read the RTC as UTC — NT4 through XP/2003,
+    /// DOS and 9x — start it at local time (#166); every other shipped
+    /// profile, Windows on the Rust agent included, leaves it UTC.
+    #[test]
+    fn only_the_pre_vista_windows_profiles_keep_a_local_rtc() {
+        let set = ProfileSet::shipped().unwrap();
+        for name in set.names() {
+            let want = if matches!(name, "windows-xp" | "windows-9x") {
+                Rtc::Localtime
+            } else {
+                Rtc::Utc
+            };
+            assert_eq!(set.get(name).unwrap().rtc, want, "{name}");
+        }
+    }
+
+    /// `rtc` takes `utc` or `localtime`, and nothing else.
+    #[test]
+    fn rtc_reads_its_two_keywords_and_refuses_others() {
+        let ok = parse_profiles(
+            "import <vmlab-profile.wcl>\n\
+             profile \"local\" { rtc = \"localtime\" }\n\
+             profile \"utc\" { rtc = \"utc\" }\n\
+             profile \"unset\" {}\n",
+            "<test>",
+        )
+        .unwrap();
+        let of = |n: &str| ok.iter().find(|p| p.name == n).unwrap().rtc;
+        assert_eq!(of("local"), Rtc::Localtime);
+        assert_eq!(of("utc"), Rtc::Utc);
+        assert_eq!(of("unset"), Rtc::Utc);
+
+        let err = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"x\" { rtc = \"gmt\" }\n",
+            "<test>",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("utc, localtime"), "{err:#}");
     }
 
     /// `transport = "auto"` puts a share on virtiofs only where the profile

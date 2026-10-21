@@ -53,8 +53,10 @@ pub struct ResolvedVm {
     /// template's `nested` reaches its build VM, never the VMs made from it
     /// (ADR-0009), and profiles do not carry it.
     pub nested: bool,
-    /// QEMU `-rtc base=` for a machine declaring a fixed clock (§7.3);
-    /// declared on the VM alone, never inherited.
+    /// QEMU `-rtc base=` (§7.3): the clock is declared on the VM alone,
+    /// never inherited; what the guest reads the RTC as — UTC, or local time
+    /// for the profiles that cannot read it any other way — is the profile's.
+    /// `None` keeps QEMU's default, the host's UTC time.
     pub rtc_base: Option<String>,
     /// The QEMU `-cpu` model (§5.2), VM > template > profile. `None` keeps
     /// the accelerator default — the host CPU under KVM, `max` under TCG.
@@ -446,7 +448,7 @@ pub fn resolve_vm(
         input_transport: profile.input_transport,
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
-        rtc_base: lab_vm.clock.rtc_base(),
+        rtc_base: lab_vm.clock.rtc_base_for(profile.rtc),
         cpu_model: cpu_model.map(|(model, _)| model),
         accel,
         gpu: lab_vm.gpu.clone(),

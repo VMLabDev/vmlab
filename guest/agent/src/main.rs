@@ -22,6 +22,9 @@ mod mux;
 // is tested on any host, compiled only where it is used.
 #[cfg(any(windows, test))]
 mod rdp;
+// That a Windows guest reads the RTC as UTC: portable like `rdp`.
+#[cfg(any(windows, test))]
+mod rtc;
 mod spawn;
 mod tail;
 mod terminal;

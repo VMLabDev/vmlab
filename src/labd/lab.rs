@@ -248,7 +248,7 @@ fn daemon_log(machine: &str) -> crate::scripting::OutputSink {
 /// so its agent answers within seconds of the load.
 const CLOCK_AGENT_WAIT: Duration = Duration::from_secs(60);
 /// How long the agent has to answer `set_time`.
-const CLOCK_SET_WAIT: Duration = Duration::from_secs(10);
+pub(super) const CLOCK_SET_WAIT: Duration = Duration::from_secs(10);
 
 /// What an online restore did with the guest clock (§7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]

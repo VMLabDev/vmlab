@@ -364,7 +364,7 @@ fn reg_sz(key: &str, value: &str) -> Result<String, String> {
 }
 
 /// A DWORD, or `None` where the key or the value does not exist.
-fn reg_dword(key: &str, value: &str) -> Result<Option<u32>, String> {
+pub(super) fn reg_dword(key: &str, value: &str) -> Result<Option<u32>, String> {
     let k = wide(key);
     let v = wide(value);
     let mut out = 0u32;
@@ -390,7 +390,7 @@ fn reg_dword(key: &str, value: &str) -> Result<Option<u32>, String> {
 
 /// Write a DWORD, creating its key if it does not exist yet — the policy
 /// key, on a guest no policy has touched.
-fn set_reg_dword(key: &str, value: &str, data: u32) -> Result<(), String> {
+pub(super) fn set_reg_dword(key: &str, value: &str, data: u32) -> Result<(), String> {
     let k = wide(key);
     let v = wide(value);
     let mut hkey: HKEY = std::ptr::null_mut();

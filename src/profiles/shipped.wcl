@@ -79,6 +79,9 @@ profile "windows-xp" {
   cpus        = 2
   memory      = 2GiB
   agent_transport = "isa-serial"
+  // NT4 through XP/2003 read the RTC as local time and cannot be told
+  // otherwise reliably, so it is started at the host's (§7.3).
+  rtc             = "localtime"
   workspace_guest = "C:\\src"
 }
 
@@ -94,6 +97,8 @@ profile "windows-9x" {
   cpus        = 1
   memory      = 256MiB
   agent_transport = "isa-serial"
+  // DOS and Windows 9x know no UTC: the RTC is the local time (§7.3).
+  rtc             = "localtime"
   // Real-mode DOS/9x TUIs (fdisk, setup) drop QMP send-key events between menu
   // redraws; drive their keyboard over VNC instead, which lands reliably.
   input_transport = "vnc"

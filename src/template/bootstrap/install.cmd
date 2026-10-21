@@ -19,6 +19,10 @@ rem `sc create` fails when the service exists (rebuilds); reconfigure then.
 sc create vmlab-agent binPath= C:\ProgramData\vmlab\vmlab-agent.exe start= auto
 if errorlevel 1 sc config vmlab-agent binPath= C:\ProgramData\vmlab\vmlab-agent.exe start= auto
 sc failure vmlab-agent reset= 86400 actions= restart/5000/restart/5000/restart/5000
+rem QEMU's RTC holds UTC; Windows reads it as local time without this, and
+rem is then wrong by its UTC offset at every cold boot (PRD 7.3). The agent
+rem ensures the same value at each start.
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation" /v RealTimeIsUniversal /t REG_DWORD /d 1 /f
 sc start vmlab-agent
 exit /b 0
 :legacy

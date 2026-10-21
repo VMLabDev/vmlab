@@ -293,6 +293,7 @@ in the config.
 | `agent_transport` | The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias. |
 | `input_transport` | How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc` (see snapshots-vision.md). |
 | `virtiofs` | Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = "auto"` shares (see shares-media.md). |
+| `rtc` | What the guest reads the real-time clock as: `utc` (default), or `localtime` for DOS, Windows 9x and NT4 through XP/2003, which cannot read it as UTC (see snapshots-vision.md). |
 | `workspace_guest` | The guest path an `@dev` workspace lands at when the decorator names none (see dev-machines.md). |
 
 The profile also classifies the guest as Windows-family or Linux-family, which is
@@ -387,6 +388,7 @@ profile "<name>" {
   agent_transport = "virtio-serial"
   input_transport = "qmp"
   virtiofs        = false
+  rtc             = "utc"
   workspace_guest = "/src"
 }
 ```
@@ -411,10 +413,11 @@ profile "<name>" {
 | `agent_channel` | bool | unset | Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present. |
 | `input_transport` | utf8 | `qmp` | How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path. |
 | `virtiofs` | bool | `false` | The guest mounts virtiofs natively, so `transport = "auto"` shares use it instead of SMB. |
+| `rtc` | utf8 | `utc` | What the guest reads the RTC as: `utc`, or `localtime` — the RTC then starts at the host's local time (`-rtc base=localtime`; a fixed `clock` converted to host local time). Only `windows-xp` and `windows-9x` set it. |
 | `workspace_guest` | utf8 | unset | Guest path an `@dev` workspace lands at when the decorator names none. |
 
 The parser enforces the keyword sets above for `machine`, `firmware`, `disk_bus`,
-`accel` and `input_transport`, `cpus` at least 1, and a non-negative `memory`. `nic_model`,
+`accel`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative `memory`. `nic_model`,
 `display` and `cpu_model` are passed to QEMU as written; an empty `cpu_model` is
 refused. A profile that sets no `workspace_guest`
 still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` machine a
@@ -428,8 +431,8 @@ still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` mach
 | `windows-10` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
 | `windows-server` | q35 | ovmf | false | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
 | `windows-legacy` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | Vista, 7 and 2008-era guests; virtio-serial agent (virtio-win covers this era). |
-| `windows-xp` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | `agent_transport = "isa-serial"`: NT4 through XP/2003, the legacy agent on COM1. |
-| `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`, `agent_transport = "isa-serial"`. DOS, Windows 3.x to ME. |
+| `windows-xp` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | `agent_transport = "isa-serial"`, `rtc = "localtime"`: NT4 through XP/2003, the legacy agent on COM1. |
+| `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`, `agent_transport = "isa-serial"`, `rtc = "localtime"`. DOS, Windows 3.x to ME. |
 | `templeos` | pc | seabios | false | false | ide | e1000 | std | 2 | 512MiB | `agent_transport = "isa-serial"`. TempleOS: the HolyC agent on COM1; no network by design. |
 | `linux-modern` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 2 | 4GiB | `virtiofs = true`. |
 | `linux-generic` | q35 | seabios | false | false | virtio | virtio-net-pci | std | 2 | 2GiB | Older or unusual distros. |
