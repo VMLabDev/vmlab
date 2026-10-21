@@ -79,6 +79,7 @@ SRC
       | "`machine`" | "utf8" | "QEMU default" | "Machine type: `q35`, or `pc` for i440fx." |
       | "`firmware`" | "utf8" | "QEMU default" | "Firmware: `ovmf` or `seabios`." |
       | "`secure_boot`" | "bool" | "unset" | "Enable secure boot; OVMF only." |
+      | "`secure_boot_keys`" | "utf8" | "unset (`microsoft`)" | "The key store secure boot starts from: `microsoft` or `setup`. See [Host and firmware](guide_host)." |
       | "`tpm`" | "bool" | "unset" | "Attach a swtpm 2.0 device." |
       | "`usb`" | "bool" | "unset" | "Boot with the hot-plug xHCI controller host USB passthrough needs ([vmlab usb](cmd_usb)). A VM's own `usb` wins. Unset is off." |
       | "`disk_bus`" | "utf8" | "QEMU default" | "Primary disk bus: `virtio`, `ide` or `sata`." |

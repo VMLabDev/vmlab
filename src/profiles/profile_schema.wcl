@@ -13,6 +13,7 @@ type Profile {
   machine: utf8?        // "q35" | "pc" (i440fx)
   firmware: utf8?       // "ovmf" | "seabios"
   secure_boot: bool?
+  secure_boot_keys: utf8?  // "microsoft" (default) | "setup" — the key store secure boot starts from
   tpm: bool?            // swtpm 2.0 when true
   usb: bool?            // hot-plug xHCI for host USB passthrough (§5.2.1); default false
   disk_bus: utf8?       // "virtio" | "ide" | "sata"

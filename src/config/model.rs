@@ -465,6 +465,13 @@ pub struct Vm {
     /// inherit the profile's, and with neither saying, off.
     pub usb: Option<bool>,
     pub secure_boot: Option<bool>,
+    /// The key store secure boot starts from (§5.2); None = inherit
+    /// template→profile, and with no layer naming one, Microsoft's.
+    pub secure_boot_keys: Option<SecureBootKeys>,
+    /// A pre-enrolled VARS file the VM's variable store starts from instead
+    /// (§5.2), relative to the lab root as declared (the lab daemon roots
+    /// it). Exclusive with `secure_boot_keys`.
+    pub secure_boot_vars: Option<PathBuf>,
     pub qemu_args: Vec<String>,
     pub gpu: Option<Gpu>,
     pub nics: Vec<Nic>,
@@ -541,6 +548,52 @@ impl AccelMode {
 
 /// The `accel =` keyword table, shared by every block that declares one.
 pub const ACCELS: &[(&str, AccelMode)] = &[("kvm", AccelMode::Kvm), ("tcg", AccelMode::Tcg)];
+
+/// The UEFI key store a secure-boot machine's variable store starts from
+/// (§5.2). `Microsoft` is the default: the bundled VARS with Microsoft's
+/// (and Debian's) keys enrolled. `Setup` is the blank store, so the
+/// firmware starts in setup mode and the guest enrolls its own keys.
+///
+/// `Vars` is never written in a lab file — there the same thing is spelled
+/// `secure_boot_vars = "<path>"`. It is how template metadata records a
+/// template that carries its own pre-enrolled VARS file beside its disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecureBootKeys {
+    Microsoft,
+    Setup,
+    Vars,
+}
+
+impl SecureBootKeys {
+    /// The schema spelling, also the one template metadata records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecureBootKeys::Microsoft => "microsoft",
+            SecureBootKeys::Setup => "setup",
+            SecureBootKeys::Vars => "vars",
+        }
+    }
+
+    /// The inverse of [`SecureBootKeys::as_str`]; an unknown spelling is
+    /// `None`, as for [`Firmware::parse`].
+    pub fn parse(s: &str) -> Option<SecureBootKeys> {
+        [
+            SecureBootKeys::Microsoft,
+            SecureBootKeys::Setup,
+            SecureBootKeys::Vars,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == s)
+    }
+}
+
+/// The `secure_boot_keys =` keyword table — the two a lab file or profile
+/// may name. `vars` is metadata-only (see [`SecureBootKeys::Vars`]).
+pub const SECURE_BOOT_KEYS: &[(&str, SecureBootKeys)] = &[
+    ("microsoft", SecureBootKeys::Microsoft),
+    ("setup", SecureBootKeys::Setup),
+];
 
 #[derive(Debug, Clone)]
 pub struct Nic {
@@ -892,6 +945,12 @@ pub struct TemplateDef {
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
+    /// The key store the build VM's secure boot starts from, recorded for
+    /// clones (§5.2).
+    pub secure_boot_keys: Option<SecureBootKeys>,
+    /// A pre-enrolled VARS file (relative to the template root) the build
+    /// boots with, stored with the sealed template for its clones (§5.2).
+    pub secure_boot_vars: Option<PathBuf>,
     pub nested: bool,
     /// Watch the build VM in QEMU's own window (§11).
     pub gui: bool,
@@ -967,6 +1026,9 @@ pub struct TemplateVariantDef {
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
+    /// The key store for this variant's build boot and clones; a variant
+    /// carries no VARS file of its own.
+    pub secure_boot_keys: Option<SecureBootKeys>,
     /// Replaces the template's `qemu_args` for this variant's build boot.
     pub qemu_args: Option<Vec<String>>,
     /// Replaces the template's `gpu {}` for this variant's build boot.

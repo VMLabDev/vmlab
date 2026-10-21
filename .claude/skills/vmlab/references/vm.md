@@ -73,6 +73,8 @@ vm "<name>" {
 | `tpm` | bool | inherited | Enable a TPM 2.0 device. Inherited from template, then profile. |
 | `usb` | bool | inherited | Boot with a hot-plug xHCI controller (id `usbx`) so `vmlab usb attach` can pass host USB devices in. VM > profile only — a template has no say; off when neither sets it. Changes the VM's hardware: online snapshots taken without it no longer restore, and on q35 the tablet moves to the new controller. |
 | `secure_boot` | bool | inherited | Enable secure boot; OVMF only. Inherited from template, then profile. |
+| `secure_boot_keys` | utf8 | inherited, else `microsoft` | Key store secure boot starts from: `microsoft` (bundled store, Microsoft's keys) or `setup` (blank store — firmware in setup mode, the guest enrolls its own keys, the VM's `OVMF_VARS.fd` keeps them). Inherited from template, then profile. Needs `secure_boot = true`. |
+| `secure_boot_vars` | utf8 | none | Pre-enrolled UEFI VARS file (relative to lab root) copied once at first start instead of the bundled store; must be the secure-boot firmware's VARS size. Needs `secure_boot = true`; exclusive with `secure_boot_keys`; overrides a template's stored VARS. |
 | `qemu_args` | list<utf8> | none | Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates. |
 | `gpu {}` | child | none | GPU acceleration: passthrough, virgl or vulkan. |
 | `nic {}` | children | none | Network interfaces. No NICs means air-gapped. Shares need at least one. |
@@ -120,6 +122,10 @@ Known architectures are `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`,
 - `secure_boot = true` is rejected when the firmware resolves to `seabios`.
   Either value may have been inherited, so the message names the layer each came
   from.
+- `secure_boot_keys` (other than `microsoft`) or `secure_boot_vars` is rejected
+  where secure boot resolves off, naming both layers (a store inherited from
+  below the layer that turned secure boot off is fine); both on one block is
+  rejected; `secure_boot_vars` must name an existing file.
 - A VM with `share {}` blocks that are not `transport = "virtiofs"` needs at
   least one `nic {}`, because SMB is reachable only over a segment.
 - A `playbook {}` on a VM whose arch is known to be something other than

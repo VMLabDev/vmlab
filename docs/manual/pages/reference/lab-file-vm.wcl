@@ -82,6 +82,8 @@ SRC
       | "`tpm`" | "bool" | "inherited" | "Enable a TPM 2.0 device. Inherited from template, then profile." |
       | "`usb`" | "bool" | "inherited" | "Boot with a hot-plug xHCI controller so [vmlab usb](cmd_usb) can pass host USB devices in. Inherited from the profile only — a template has no say; off when neither sets it. Changes the VM's hardware, so online snapshots taken without it no longer restore." |
       | "`secure_boot`" | "bool" | "inherited" | "Enable secure boot; OVMF only. Inherited from template, then profile." |
+      | "`secure_boot_keys`" | "utf8" | "inherited, else `microsoft`" | "The key store secure boot starts from. `microsoft`: the bundled store with Microsoft's keys enrolled. `setup`: the blank store, so the firmware starts in setup mode and the guest enrolls its own keys on first boot; the VM's `OVMF_VARS.fd` keeps them. Inherited from template, then profile. Needs `secure_boot = true`. See [Host and firmware](guide_host)." |
+      | "`secure_boot_vars`" | "utf8" | "none" | "A pre-enrolled UEFI VARS file, relative to the lab root, copied once at the VM's first start in place of the bundled store, so the guest enforces your keys from its first boot. Must be the size of the secure-boot firmware's VARS template. Needs `secure_boot = true`; exclusive with `secure_boot_keys`. Overrides a template's stored VARS." |
       | "`qemu_args`" | "list<utf8>" | "none" | "Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates." |
       | "`gpu {}`" | "child" | "none" | "GPU acceleration: passthrough, virgl or vulkan." |
       | "`nic {}`" | "children" | "none" | "Network interfaces. No NICs means air-gapped. Shares need at least one." |
@@ -119,6 +121,7 @@ SRC
     li "`cdrom` and `floppy` name files that exist under the lab root."
     li "`clock` is `host`, `snapshot`, or an RFC 3339 date-time such as `2020-01-01T00:00:00Z`."
     li "`secure_boot = true` is rejected when the firmware resolves to `seabios`. Either value may have been inherited, so the message names the layer each came from."
+    li "`secure_boot_keys` (other than `microsoft`) or `secure_boot_vars` is rejected where secure boot resolves off, naming the layer each side came from. A key store inherited from below the layer that turned secure boot off is not an error. The two are rejected together on one block, and `secure_boot_vars` must name an existing file."
     li "A VM with `share {}` blocks that are not `transport = \"virtiofs\"` needs at least one `nic {}`, because SMB is reachable only over a segment."
     li "A `playbook {}` on a VM whose arch is known to be something other than `x86_64` is rejected; config-weave ships guest binaries for x86_64 only."
   }

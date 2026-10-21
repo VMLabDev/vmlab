@@ -14,8 +14,13 @@
 //!  3. the host's distro firmware at its well-known paths.
 //!
 //! Secure boot and plain UEFI walk the same order. A secure-boot build is
-//! always taken with the VARS template that has keys enrolled for it: a
-//! blank VARS leaves the firmware in setup mode, where it verifies nothing.
+//! taken with the VARS template that has keys enrolled for it: a blank VARS
+//! leaves the firmware in setup mode, where it verifies nothing. That is
+//! refused unless the machine opts in with `secure_boot_keys = "setup"`,
+//! where setup mode is the point — the guest enrolls its own keys — and the
+//! secboot CODE is paired with the blank VARS on purpose ([`Pairing::Setup`]).
+//! A `secure_boot_vars` file replaces the VARS template outright, under the
+//! setup pairing's CODE ([`with_vars_file`]).
 //!
 //! Discovery probes the host filesystem, so it happens once per machine
 //! start, where the lab daemon assembles the runtime paths — never inside
@@ -34,21 +39,87 @@ pub struct UefiFirmware {
     pub vars_template: PathBuf,
 }
 
+/// Which CODE build is paired with which VARS template (§5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pairing {
+    /// Plain UEFI: the CODE build without secure boot, and its blank VARS.
+    Plain,
+    /// Secure boot enforcing Microsoft's keys: the secboot CODE and the VARS
+    /// with those keys enrolled — what `secure_boot = true` means by default.
+    Enrolled,
+    /// Secure boot in setup mode: the secboot CODE and the blank VARS, so the
+    /// guest enrolls its own keys (`secure_boot_keys = "setup"`). Also the
+    /// CODE a `secure_boot_vars` file is booted under.
+    Setup,
+}
+
+impl Pairing {
+    /// The pairing a resolved VM boots: plain without secure boot, else by
+    /// the key store it starts from.
+    pub fn of(secure_boot: bool, store: &crate::qemu::resolve::KeyStore) -> Self {
+        match (secure_boot, store) {
+            (false, _) => Pairing::Plain,
+            (true, crate::qemu::resolve::KeyStore::Microsoft) => Pairing::Enrolled,
+            (true, _) => Pairing::Setup,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Pairing::Plain => "UEFI",
+            Pairing::Enrolled => "secure-boot",
+            Pairing::Setup => "secure-boot (setup mode)",
+        }
+    }
+}
+
 /// The file names inside a `firmware/<arch>/` directory — the bundled set's
 /// layout, and the one a `firmware_dir` override follows. `None` where vmlab
 /// has no such build: riscv64 has no secure-boot variant.
-pub fn bundled_names(arch: &str, secure_boot: bool) -> Option<(&'static str, &'static str)> {
-    Some(match (arch, secure_boot) {
+pub fn bundled_names(arch: &str, pairing: Pairing) -> Option<(&'static str, &'static str)> {
+    Some(match (arch, pairing) {
         // Debian `ovmf`: the 4 MiB builds; `.ms` carries Microsoft's keys
         // (and the distro's) enrolled, which Windows and shim boot under.
-        ("x86_64", false) => ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
-        ("x86_64", true) => ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.ms.fd"),
+        ("x86_64", Pairing::Plain) => ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
+        ("x86_64", Pairing::Enrolled) => ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.ms.fd"),
+        ("x86_64", Pairing::Setup) => ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.fd"),
         // Debian `qemu-efi-aarch64`: 64 MiB pflash images.
-        ("aarch64", false) => ("AAVMF_CODE.fd", "AAVMF_VARS.fd"),
-        ("aarch64", true) => ("AAVMF_CODE.secboot.fd", "AAVMF_VARS.ms.fd"),
+        ("aarch64", Pairing::Plain) => ("AAVMF_CODE.fd", "AAVMF_VARS.fd"),
+        ("aarch64", Pairing::Enrolled) => ("AAVMF_CODE.secboot.fd", "AAVMF_VARS.ms.fd"),
+        ("aarch64", Pairing::Setup) => ("AAVMF_CODE.secboot.fd", "AAVMF_VARS.fd"),
         // Not bundled, but an override may carry it.
-        ("riscv64", false) => ("RISCV_VIRT_CODE.fd", "RISCV_VIRT_VARS.fd"),
+        ("riscv64", Pairing::Plain) => ("RISCV_VIRT_CODE.fd", "RISCV_VIRT_VARS.fd"),
         _ => return None,
+    })
+}
+
+/// `fw` with a user-supplied VARS file in place of its VARS template — what
+/// `secure_boot_vars` boots (§5.2). A VARS store only works under a CODE
+/// build of its own flash layout, so a file whose size differs from the
+/// template it replaces is refused rather than handed to QEMU.
+pub fn with_vars_file(fw: UefiFirmware, vars: &Path) -> Result<UefiFirmware> {
+    let meta =
+        std::fs::metadata(vars).map_err(|e| anyhow!("secure_boot_vars {}: {e}", vars.display()))?;
+    if !meta.is_file() {
+        return Err(anyhow!("secure_boot_vars {} is not a file", vars.display()));
+    }
+    if let Some(want) = len_of(&fw.vars_template)
+        && meta.len() != want
+    {
+        return Err(anyhow!(
+            "secure_boot_vars {} is {} bytes, but the firmware it boots under ({}) takes a \
+             {want}-byte VARS store like {} — build it from that template (`virt-fw-vars \
+             --input {} --output … --set-pk … --add-db …`)",
+            vars.display(),
+            meta.len(),
+            fw.code.display(),
+            fw.vars_template.display(),
+            fw.vars_template.display(),
+        ));
+    }
+    Ok(UefiFirmware {
+        code: fw.code,
+        vars_template: vars.to_path_buf(),
     })
 }
 
@@ -157,6 +228,40 @@ fn host_secure_boot_pairs(arch: &str) -> &'static [(&'static str, &'static str)]
     }
 }
 
+/// The host's secure-boot CODE builds each paired with the blank VARS of its
+/// own layout — setup mode, opted into with `secure_boot_keys = "setup"`.
+/// Arch's `edk2-ovmf`, which ships no enrolled VARS, answers here.
+fn host_setup_pairs(arch: &str) -> &'static [(&'static str, &'static str)] {
+    match arch {
+        "x86_64" => &[
+            // Arch (`edk2-ovmf`).
+            (
+                "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
+                "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+            ),
+            // Fedora, RHEL (`edk2-ovmf`).
+            (
+                "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
+                "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+            ),
+            // Debian, Ubuntu (`ovmf`).
+            (
+                "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+                "/usr/share/OVMF/OVMF_VARS_4M.fd",
+            ),
+            (
+                "/usr/share/OVMF/OVMF_CODE.secboot.fd",
+                "/usr/share/OVMF/OVMF_VARS.fd",
+            ),
+        ],
+        "aarch64" => &[(
+            "/usr/share/AAVMF/AAVMF_CODE.secboot.fd",
+            "/usr/share/AAVMF/AAVMF_VARS.fd",
+        )],
+        _ => &[],
+    }
+}
+
 /// Secure-boot CODE builds shipped without an enrolled VARS beside them —
 /// Arch's `edk2-ovmf` is one. Named in the error so a host carrying one is
 /// told what is missing rather than that it has no firmware.
@@ -202,17 +307,17 @@ impl Sources {
     }
 
     /// The UEFI CODE/VARS pair for a QEMU arch (`x86_64`, `aarch64`,
-    /// `riscv64`). `secure_boot` selects a secboot build with keys enrolled
-    /// (x86_64, aarch64); riscv64 has no secure-boot variant and gets its
-    /// plain build.
-    pub fn lookup(&self, arch: &str, secure_boot: bool) -> Result<UefiFirmware> {
-        let names = bundled_names(arch, secure_boot);
+    /// `riscv64`). `pairing` selects a secboot build with keys enrolled, or
+    /// the same build in setup mode (x86_64, aarch64); riscv64 has no
+    /// secure-boot variant and gets its plain build.
+    pub fn lookup(&self, arch: &str, pairing: Pairing) -> Result<UefiFirmware> {
+        let names = bundled_names(arch, pairing);
         if let Some(dir) = self.override_arch_dir(arch) {
             let Some((code, vars)) = names else {
                 return Err(anyhow!(
                     "firmware_dir {} holds no {} build vmlab can use for {arch}",
                     dir.display(),
-                    if secure_boot { "secure-boot" } else { "UEFI" }
+                    pairing.label()
                 ));
             };
             let (code, vars) = (dir.join(code), dir.join(vars));
@@ -238,11 +343,11 @@ impl Sources {
                 },
             ));
         }
-        if let Some(fw) = self.bundled_pair(arch, secure_boot) {
+        if let Some(fw) = self.bundled_pair(arch, pairing) {
             return Ok(fw);
         }
-        self.host_lookup(arch, secure_boot).map_err(|e| {
-            let tried = self.bundled_tried(arch, secure_boot);
+        self.host_lookup(arch, pairing).map_err(|e| {
+            let tried = self.bundled_tried(arch, pairing);
             if tried.is_empty() {
                 e
             } else {
@@ -264,17 +369,17 @@ impl Sources {
     pub fn lookup_for_vars(
         &self,
         arch: &str,
-        secure_boot: bool,
+        pairing: Pairing,
         vars_len: u64,
     ) -> Result<UefiFirmware> {
-        let first = self.lookup(arch, secure_boot);
+        let first = self.lookup(arch, pairing);
         if let Ok(fw) = &first
             && len_of(&fw.vars_template) == Some(vars_len)
         {
             return first;
         }
         let matching = self
-            .every_pair(arch, secure_boot)
+            .every_pair(arch, pairing)
             .into_iter()
             .find(|fw| fw.code.is_file() && len_of(&fw.vars_template) == Some(vars_len));
         if let Some(fw) = matching {
@@ -291,8 +396,8 @@ impl Sources {
         ))
     }
 
-    fn bundled_pair(&self, arch: &str, secure_boot: bool) -> Option<UefiFirmware> {
-        let (code, vars) = bundled_names(arch, secure_boot)?;
+    fn bundled_pair(&self, arch: &str, pairing: Pairing) -> Option<UefiFirmware> {
+        let (code, vars) = bundled_names(arch, pairing)?;
         self.bundled.iter().find_map(|base| {
             let dir = base.join("firmware").join(arch);
             let (code, vars) = (dir.join(code), dir.join(vars));
@@ -303,8 +408,8 @@ impl Sources {
         })
     }
 
-    fn bundled_tried(&self, arch: &str, secure_boot: bool) -> Vec<String> {
-        let Some((code, _)) = bundled_names(arch, secure_boot) else {
+    fn bundled_tried(&self, arch: &str, pairing: Pairing) -> Vec<String> {
+        let Some((code, _)) = bundled_names(arch, pairing) else {
             return Vec::new();
         };
         self.bundled
@@ -320,13 +425,13 @@ impl Sources {
     }
 
     /// Every candidate pair of one kind, in search order, existing or not.
-    fn every_pair(&self, arch: &str, secure_boot: bool) -> Vec<UefiFirmware> {
+    fn every_pair(&self, arch: &str, pairing: Pairing) -> Vec<UefiFirmware> {
         let mut out = Vec::new();
         let pair = |dir: PathBuf, (c, v): (&str, &str)| UefiFirmware {
             code: dir.join(c),
             vars_template: dir.join(v),
         };
-        let names = bundled_names(arch, secure_boot);
+        let names = bundled_names(arch, pairing);
         if let Some(dir) = self.override_arch_dir(arch) {
             // Authoritative: nothing else is a candidate for this arch.
             out.extend(names.map(|n| pair(dir, n)));
@@ -337,10 +442,10 @@ impl Sources {
                 out.push(pair(base.join("firmware").join(arch), n));
             }
         }
-        let host: &[(&str, &str)] = if secure_boot && arch != "riscv64" {
-            host_secure_boot_pairs(arch)
-        } else {
-            host_pairs(arch).unwrap_or(&[])
+        let host: &[(&str, &str)] = match pairing {
+            Pairing::Enrolled if arch != "riscv64" => host_secure_boot_pairs(arch),
+            Pairing::Setup if arch != "riscv64" => host_setup_pairs(arch),
+            _ => host_pairs(arch).unwrap_or(&[]),
         };
         out.extend(host.iter().map(|(c, v)| UefiFirmware {
             code: self.host(c),
@@ -350,10 +455,28 @@ impl Sources {
     }
 
     /// The host's distro firmware — the last tier.
-    fn host_lookup(&self, arch: &str, secure_boot: bool) -> Result<UefiFirmware> {
+    fn host_lookup(&self, arch: &str, pairing: Pairing) -> Result<UefiFirmware> {
         let plain = host_pairs(arch)?;
-        if secure_boot && !host_secure_boot_pairs(arch).is_empty() {
+        if pairing == Pairing::Enrolled && !host_secure_boot_pairs(arch).is_empty() {
             return self.host_secure_boot(arch);
+        }
+        let setup = host_setup_pairs(arch);
+        if pairing == Pairing::Setup && !setup.is_empty() {
+            if let Some((code, vars_template)) = setup
+                .iter()
+                .map(|(c, v)| (self.host(c), self.host(v)))
+                .find(|(c, v)| c.is_file() && v.is_file())
+            {
+                return Ok(UefiFirmware {
+                    code,
+                    vars_template,
+                });
+            }
+            let codes: Vec<&str> = setup.iter().map(|(c, _)| *c).collect();
+            return Err(anyhow!(
+                "{arch} secure-boot UEFI firmware not found; tried: {}",
+                codes.join(", ")
+            ));
         }
         if let Some(fw) = plain
             .iter()
@@ -411,7 +534,8 @@ impl Sources {
             Some(code) => Err(anyhow!(
                 "{arch} secure boot needs a UEFI VARS template with keys enrolled, and this host \
                  has only {code} without one — a blank VARS boots in setup mode and enforces \
-                 nothing; tried: {}",
+                 nothing, so vmlab refuses it unless the machine asks for setup mode with \
+                 `secure_boot_keys = \"setup\"`; tried: {}",
                 enrolled.join(", ")
             )),
             None => Err(anyhow!(
@@ -496,13 +620,13 @@ mod tests {
         let f = Fake::new();
         f.host(DEBIAN_X86).bundled("x86_64", BUNDLED_X86);
         let s = f.sources(false);
-        let plain = s.lookup("x86_64", false).unwrap();
+        let plain = s.lookup("x86_64", Pairing::Plain).unwrap();
         assert_eq!(plain.code, f.path("guest/firmware/x86_64/OVMF_CODE_4M.fd"));
         assert_eq!(
             plain.vars_template,
             f.path("guest/firmware/x86_64/OVMF_VARS_4M.fd")
         );
-        let sb = s.lookup("x86_64", true).unwrap();
+        let sb = s.lookup("x86_64", Pairing::Enrolled).unwrap();
         assert_eq!(
             sb.code,
             f.path("guest/firmware/x86_64/OVMF_CODE_4M.secboot.fd")
@@ -524,16 +648,19 @@ mod tests {
             .put("override/x86_64/OVMF_CODE_4M.fd", 0)
             .put("override/x86_64/OVMF_VARS_4M.fd", 0);
         let s = f.sources(true);
-        let fw = s.lookup("x86_64", false).unwrap();
+        let fw = s.lookup("x86_64", Pairing::Plain).unwrap();
         assert_eq!(fw.code, f.path("override/x86_64/OVMF_CODE_4M.fd"));
 
         // The override's x86_64 directory has no secboot pair.
-        let msg = s.lookup("x86_64", true).unwrap_err().to_string();
+        let msg = s
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains("firmware_dir"), "{msg}");
         assert!(msg.contains("OVMF_CODE_4M.secboot.fd"), "{msg}");
 
         // No aarch64 directory in the override: the bundled set answers.
-        let fw = s.lookup("aarch64", false).unwrap();
+        let fw = s.lookup("aarch64", Pairing::Plain).unwrap();
         assert_eq!(fw.code, f.path("guest/firmware/aarch64/AAVMF_CODE.fd"));
     }
 
@@ -551,7 +678,10 @@ mod tests {
             ],
         )
         .host(DEBIAN_X86);
-        let sb = f.sources(false).lookup("x86_64", true).unwrap();
+        let sb = f
+            .sources(false)
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap();
         assert!(
             sb.code
                 .ends_with("root/usr/share/OVMF/OVMF_CODE_4M.secboot.fd")
@@ -573,13 +703,13 @@ mod tests {
             ],
         );
         let s = f.sources(false);
-        let plain = s.lookup("aarch64", false).unwrap();
+        let plain = s.lookup("aarch64", Pairing::Plain).unwrap();
         assert_eq!(plain.code, f.path("guest/firmware/aarch64/AAVMF_CODE.fd"));
         assert_eq!(
             plain.vars_template,
             f.path("guest/firmware/aarch64/AAVMF_VARS.fd")
         );
-        let sb = s.lookup("aarch64", true).unwrap();
+        let sb = s.lookup("aarch64", Pairing::Enrolled).unwrap();
         assert_eq!(
             sb.code,
             f.path("guest/firmware/aarch64/AAVMF_CODE.secboot.fd")
@@ -601,7 +731,7 @@ mod tests {
             "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
             "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
         ]);
-        let fw = f.sources(false).lookup("x86_64", false).unwrap();
+        let fw = f.sources(false).lookup("x86_64", Pairing::Plain).unwrap();
         assert!(fw.code.ends_with("edk2/x64/OVMF_CODE.4m.fd"), "{fw:?}");
         assert!(fw.vars_template.ends_with("edk2/x64/OVMF_VARS.4m.fd"));
     }
@@ -616,7 +746,10 @@ mod tests {
             "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd",
             "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd",
         ]);
-        let sb = f.sources(false).lookup("x86_64", true).unwrap();
+        let sb = f
+            .sources(false)
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap();
         assert!(sb.code.ends_with("edk2/ovmf/OVMF_CODE.secboot.fd"));
         assert!(sb.vars_template.ends_with("edk2/ovmf/OVMF_VARS.secboot.fd"));
     }
@@ -634,7 +767,7 @@ mod tests {
         ]);
         let msg = f
             .sources(false)
-            .lookup("x86_64", true)
+            .lookup("x86_64", Pairing::Enrolled)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("keys enrolled"), "{msg}");
@@ -654,7 +787,7 @@ mod tests {
         let f = Fake::new();
         let msg = f
             .sources(false)
-            .lookup("aarch64", false)
+            .lookup("aarch64", Pairing::Plain)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("aarch64 UEFI firmware not found"), "{msg}");
@@ -668,7 +801,7 @@ mod tests {
         f.host(&["/usr/share/AAVMF/AAVMF_CODE.fd"]);
         let msg = f
             .sources(false)
-            .lookup("aarch64", false)
+            .lookup("aarch64", Pairing::Plain)
             .unwrap_err()
             .to_string();
         assert!(
@@ -679,7 +812,7 @@ mod tests {
 
         let msg = f
             .sources(false)
-            .lookup("x86_64", true)
+            .lookup("x86_64", Pairing::Enrolled)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("secure-boot UEFI firmware not found"), "{msg}");
@@ -696,12 +829,12 @@ mod tests {
             .put("root/usr/share/OVMF/OVMF_CODE.fd", 8)
             .put("root/usr/share/OVMF/OVMF_VARS.fd", 128);
         let s = f.sources(false);
-        let fw = s.lookup_for_vars("x86_64", false, 540).unwrap();
+        let fw = s.lookup_for_vars("x86_64", Pairing::Plain, 540).unwrap();
         assert_eq!(fw.code, f.path("guest/firmware/x86_64/OVMF_CODE_4M.fd"));
-        let fw = s.lookup_for_vars("x86_64", false, 128).unwrap();
+        let fw = s.lookup_for_vars("x86_64", Pairing::Plain, 128).unwrap();
         assert_eq!(fw.code, f.path("root/usr/share/OVMF/OVMF_CODE.fd"));
         let msg = s
-            .lookup_for_vars("x86_64", false, 999)
+            .lookup_for_vars("x86_64", Pairing::Plain, 999)
             .unwrap_err()
             .to_string();
         assert!(
@@ -717,18 +850,147 @@ mod tests {
             "/usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd",
             "/usr/share/edk2/riscv64/RISCV_VIRT_VARS.fd",
         ]);
-        let fw = f.sources(false).lookup("riscv64", false).unwrap();
+        let fw = f.sources(false).lookup("riscv64", Pairing::Plain).unwrap();
         assert!(fw.code.ends_with("RISCV_VIRT_CODE.fd"), "{fw:?}");
         // No secure-boot variant: the plain build answers, as it always has.
-        let fw = f.sources(false).lookup("riscv64", true).unwrap();
+        let fw = f
+            .sources(false)
+            .lookup("riscv64", Pairing::Enrolled)
+            .unwrap();
         assert!(fw.code.ends_with("RISCV_VIRT_CODE.fd"), "{fw:?}");
+    }
+
+    /// Setup mode pairs the secboot CODE with the blank VARS — bundled for
+    /// both arches — and the default pairing is untouched by it.
+    #[test]
+    fn setup_mode_pairs_the_secboot_code_with_the_blank_vars() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86).bundled(
+            "aarch64",
+            &[
+                "AAVMF_CODE.fd",
+                "AAVMF_VARS.fd",
+                "AAVMF_CODE.secboot.fd",
+                "AAVMF_VARS.ms.fd",
+            ],
+        );
+        let s = f.sources(false);
+        let setup = s.lookup("x86_64", Pairing::Setup).unwrap();
+        assert_eq!(
+            setup.code,
+            f.path("guest/firmware/x86_64/OVMF_CODE_4M.secboot.fd")
+        );
+        assert_eq!(
+            setup.vars_template,
+            f.path("guest/firmware/x86_64/OVMF_VARS_4M.fd")
+        );
+        let enrolled = s.lookup("x86_64", Pairing::Enrolled).unwrap();
+        assert_eq!(enrolled.code, setup.code);
+        assert_eq!(
+            enrolled.vars_template,
+            f.path("guest/firmware/x86_64/OVMF_VARS_4M.ms.fd")
+        );
+        let setup = s.lookup("aarch64", Pairing::Setup).unwrap();
+        assert_eq!(
+            setup.code,
+            f.path("guest/firmware/aarch64/AAVMF_CODE.secboot.fd")
+        );
+        assert_eq!(
+            setup.vars_template,
+            f.path("guest/firmware/aarch64/AAVMF_VARS.fd")
+        );
+    }
+
+    /// A host with a secboot CODE and only a blank VARS — Arch's layout — is
+    /// refused for the enrolled pairing, and is exactly what setup mode asks
+    /// for.
+    #[test]
+    fn setup_mode_takes_a_host_secboot_build_without_enrolled_vars() {
+        let f = Fake::new();
+        f.host(&[
+            "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+            "/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd",
+            "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+        ]);
+        let s = f.sources(false);
+        let msg = s
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("secure_boot_keys = \"setup\""), "{msg}");
+        let fw = s.lookup("x86_64", Pairing::Setup).unwrap();
+        assert!(
+            fw.code.ends_with("edk2/x64/OVMF_CODE.secboot.4m.fd"),
+            "{fw:?}"
+        );
+        assert!(fw.vars_template.ends_with("edk2/x64/OVMF_VARS.4m.fd"));
+    }
+
+    /// An override directory is authoritative for setup mode too: it needs
+    /// the secboot CODE beside the blank VARS.
+    #[test]
+    fn override_answers_setup_mode_from_its_own_files() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86)
+            .put("override/x86_64/OVMF_CODE_4M.fd", 0)
+            .put("override/x86_64/OVMF_VARS_4M.fd", 0);
+        let s = f.sources(true);
+        let msg = s.lookup("x86_64", Pairing::Setup).unwrap_err().to_string();
+        assert!(msg.contains("OVMF_CODE_4M.secboot.fd"), "{msg}");
+        f.put("override/x86_64/OVMF_CODE_4M.secboot.fd", 0);
+        let fw = s.lookup("x86_64", Pairing::Setup).unwrap();
+        assert_eq!(fw.code, f.path("override/x86_64/OVMF_CODE_4M.secboot.fd"));
+        assert_eq!(fw.vars_template, f.path("override/x86_64/OVMF_VARS_4M.fd"));
+    }
+
+    /// The pairing a resolved VM boots: plain without secure boot, enrolled
+    /// for Microsoft's keys, setup for every other store.
+    #[test]
+    fn pairing_follows_secure_boot_and_the_key_store() {
+        use crate::qemu::resolve::KeyStore;
+        assert_eq!(Pairing::of(false, &KeyStore::Setup), Pairing::Plain);
+        assert_eq!(Pairing::of(true, &KeyStore::Microsoft), Pairing::Enrolled);
+        assert_eq!(Pairing::of(true, &KeyStore::Setup), Pairing::Setup);
+        assert_eq!(Pairing::of(true, &KeyStore::Template), Pairing::Setup);
+        assert_eq!(
+            Pairing::of(true, &KeyStore::File("k.fd".into())),
+            Pairing::Setup
+        );
+    }
+
+    /// A user VARS file replaces the template under the same CODE, when it
+    /// has the template's size; any other size, or no file, is refused.
+    #[test]
+    fn a_vars_file_must_match_the_template_it_replaces() {
+        let f = Fake::new();
+        f.put("guest/firmware/x86_64/OVMF_CODE_4M.secboot.fd", 8)
+            .put("guest/firmware/x86_64/OVMF_VARS_4M.fd", 540)
+            .put("keys/good.fd", 540)
+            .put("keys/short.fd", 128);
+        let fw = f.sources(false).lookup("x86_64", Pairing::Setup).unwrap();
+        let ok = with_vars_file(fw.clone(), &f.path("keys/good.fd")).unwrap();
+        assert_eq!(ok.code, fw.code);
+        assert_eq!(ok.vars_template, f.path("keys/good.fd"));
+        let msg = with_vars_file(fw.clone(), &f.path("keys/short.fd"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("128 bytes") && msg.contains("540-byte"),
+            "{msg}"
+        );
+        let msg = with_vars_file(fw.clone(), &f.path("keys/missing.fd"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("keys/missing.fd"), "{msg}");
+        let msg = with_vars_file(fw, &f.path("keys")).unwrap_err().to_string();
+        assert!(msg.contains("not a file"), "{msg}");
     }
 
     #[test]
     fn unknown_arch_is_an_error() {
         let err = Fake::new()
             .sources(false)
-            .lookup("s390x", false)
+            .lookup("s390x", Pairing::Plain)
             .unwrap_err();
         assert!(err.to_string().contains("no UEFI firmware lookup"), "{err}");
     }

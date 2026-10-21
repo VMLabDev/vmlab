@@ -235,6 +235,10 @@ pub struct TemplateParts {
     /// The template variant the backing disk is (§6.6); `None` for the base
     /// of a base-only template, scratch, or a pull not yet bound.
     pub variant: Option<String>,
+    /// The pre-enrolled UEFI VARS file the template carries beside its disk
+    /// (§5.2) — what [`qemu::resolve::KeyStore::Template`] starts a clone's
+    /// variable store from. `None` when the template carries none.
+    pub template_vars: Option<PathBuf>,
 }
 
 /// Whether an agent connect waits on a replacement of the agent in progress
@@ -673,13 +677,43 @@ impl VmInstance {
         let arch = qemu::qemu_arch(&t.resolved.arch);
         let firmware_dir = crate::config::host::HostConfig::load_default()?.firmware_dir;
         let sources = qemu::firmware::Sources::installed(firmware_dir);
-        let fw = match std::fs::metadata(self.dirs.ovmf_vars()) {
-            Ok(m) => sources.lookup_for_vars(arch, t.resolved.secure_boot, m.len()),
-            Err(_) => sources.lookup(arch, t.resolved.secure_boot),
+        let pairing = qemu::firmware::Pairing::of(t.resolved.secure_boot, &t.resolved.key_store);
+        let context = || format!("{}: UEFI firmware", self.cfg.name);
+        if let Ok(m) = std::fs::metadata(self.dirs.ovmf_vars()) {
+            // The VM's own store exists: it is never replaced, whatever the
+            // key store says now — it holds what the guest enrolled.
+            return Ok(Some(
+                sources
+                    .lookup_for_vars(arch, pairing, m.len())
+                    .with_context(context)?,
+            ));
+        }
+        let fw = sources.lookup(arch, pairing).with_context(context)?;
+        // A pre-enrolled store replaces the VARS template at the first start.
+        let vars_file = match (&t.resolved.key_store, t.resolved.secure_boot) {
+            (_, false) => None,
+            // The lab builder roots the vm block's path against the lab.
+            (qemu::resolve::KeyStore::File(declared), true) => Some(
+                self.cfg
+                    .secure_boot_vars
+                    .clone()
+                    .unwrap_or_else(|| declared.clone()),
+            ),
+            (qemu::resolve::KeyStore::Template, true) => {
+                Some(t.template_vars.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: its template records a pre-enrolled VARS file \
+                         (secure_boot_keys = \"vars\") that the store does not hold",
+                        self.cfg.name
+                    )
+                })?)
+            }
+            _ => None,
         };
-        Ok(Some(fw.with_context(|| {
-            format!("{}: UEFI firmware", self.cfg.name)
-        })?))
+        Ok(Some(match vars_file {
+            Some(path) => qemu::firmware::with_vars_file(fw, &path).with_context(context)?,
+            None => fw,
+        }))
     }
 
     fn build_paths(

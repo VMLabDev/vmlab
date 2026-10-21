@@ -276,6 +276,10 @@ type Vm {
   usb: bool?
   @doc("Enable secure boot (OVMF only); inherited from template→profile")
   secure_boot: bool?
+  @doc("Key store secure boot starts from: `microsoft` (default; Microsoft's keys enrolled) | `setup` (blank store, so the firmware starts in setup mode and the guest enrolls its own keys); inherited from template→profile; needs `secure_boot = true`; exclusive with `secure_boot_vars`")
+  @options(["microsoft", "setup"]) secure_boot_keys: utf8?
+  @doc("Pre-enrolled UEFI VARS file (relative to lab root) copied as the VM's variable store at its first start; needs `secure_boot = true`; exclusive with `secure_boot_keys`")
+  secure_boot_vars: utf8?
   @doc("Raw QEMU flags appended last — escape hatch")
   qemu_args: list<utf8>?
   @doc("GPU acceleration (passthrough / virgl / vulkan)")
@@ -559,6 +563,10 @@ type TemplateDef {
   tpm: bool?
   @doc("Enable secure boot (OVMF only)")
   secure_boot: bool?
+  @doc("Key store secure boot starts from: `microsoft` (default) | `setup` (blank store, firmware in setup mode); recorded for clones; needs `secure_boot = true`; exclusive with `secure_boot_vars`")
+  @options(["microsoft", "setup"]) secure_boot_keys: utf8?
+  @doc("Pre-enrolled UEFI VARS file (relative to the template root) the build boots with, stored with the template so its clones start from it; needs `secure_boot = true`; exclusive with `secure_boot_keys`")
+  secure_boot_vars: utf8?
   @doc("Enable nested virtualisation for the build VM")
   nested: bool?
   @doc("Watch the build VM via a VNC viewer")
@@ -619,6 +627,8 @@ type TemplateVariant {
   tpm: bool?
   @doc("Enable secure boot (OVMF only) for this variant; default: the base's")
   secure_boot: bool?
+  @doc("Key store for this variant's secure boot: `microsoft` | `setup`; default: the base's (a variant carries no VARS file of its own)")
+  @options(["microsoft", "setup"]) secure_boot_keys: utf8?
   @doc("Raw QEMU flags for the variant's build VM, replacing the template's; default: the template's")
   qemu_args: list<utf8>?
   @doc("GPU acceleration for the variant's build VM only, replacing the template's; never recorded for clones; default: the template's")

@@ -445,9 +445,13 @@ impl Registry {
         // to its repo (GHCR).
         let mut base_config = config_meta.clone();
         base_config.variants.clear();
-        let config_desc = self
-            .put_config(&repo, &TemplateConfig::from_meta(&base_config))
-            .await?;
+        let mut base_blob = TemplateConfig::from_meta(&base_config);
+        if let Some(vars) = crate::template::store::template_vars(template_dir, &meta) {
+            let bytes = std::fs::read(&vars)
+                .with_context(|| format!("reading the template's UEFI VARS {}", vars.display()))?;
+            base_blob = base_blob.with_vars(&bytes)?;
+        }
+        let config_desc = self.put_config(&repo, &base_blob).await?;
         let mut manifest = build_manifest(&set, config_desc);
         manifest.set_variants(&entries, meta.default_variant().map(|d| d.name.as_str()));
         if let Some(src) = source {
@@ -581,8 +585,13 @@ impl Registry {
 
     /// Resolve this reference's tag to the per-arch [`Manifest`] and its
     /// [`TemplateMeta`] (config blob) — the cheap part of a pull, with no chunk
-    /// download. Used to learn the real version behind a moving tag.
-    async fn resolve_manifest_meta(&self, arch: Option<&str>) -> Result<(Manifest, TemplateMeta)> {
+    /// download. Used to learn the real version behind a moving tag. The
+    /// third value is the pre-enrolled UEFI VARS file the config blob carries
+    /// for a `secure_boot_keys = "vars"` template (§5.2), if any.
+    async fn resolve_manifest_meta(
+        &self,
+        arch: Option<&str>,
+    ) -> Result<(Manifest, TemplateMeta, Option<Vec<u8>>)> {
         let repo = &self.reference.repository;
 
         // 1. Fetch the tag and resolve to a single manifest.
@@ -625,6 +634,7 @@ impl Registry {
             .await
             .context("downloading config blob")?;
         let config = TemplateConfig::from_json(&config_bytes)?;
+        let vars = config.vars()?;
         let meta = config.into_meta(Some(self.reference.canonical()))?;
 
         // A requested arch must match what we resolved (defence in depth
@@ -638,7 +648,7 @@ impl Registry {
                 meta.arch
             );
         }
-        Ok((manifest, meta))
+        Ok((manifest, meta, vars))
     }
 
     /// The concrete version behind this reference's tag for `arch` (resolves a
@@ -699,7 +709,13 @@ impl Registry {
 
         // Steps 1-3: resolve the tag to the per-arch manifest + metadata
         // (no chunk download yet).
-        let (manifest, meta) = self.resolve_manifest_meta(arch).await?;
+        let (manifest, meta, vars) = self.resolve_manifest_meta(arch).await?;
+        ensure!(
+            meta.secure_boot_keys != Some(crate::config::model::SecureBootKeys::Vars)
+                || vars.is_some(),
+            "{} records secure_boot_keys = \"vars\" but its config blob carries no VARS file",
+            self.reference.canonical()
+        );
         let whole = manifest
             .whole_digest()
             .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
@@ -844,6 +860,10 @@ impl Registry {
                 None => {
                     let disk = staging.join(DISK_FILE);
                     chunking::assemble(&base_paths, &disk)?;
+                    if let Some(vars) = &vars {
+                        std::fs::write(staging.join(crate::template::store::VARS_FILE), vars)
+                            .context("writing the template's UEFI VARS")?;
+                    }
                     chunking::verify_whole(&disk, &whole)?;
                     let mut meta = meta;
                     if meta.sha256.is_none() {
@@ -1741,6 +1761,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -1954,6 +1975,50 @@ mod tests {
             .resolve_version("x86_64", "alpine", Some("3.20"))
             .unwrap();
         assert_eq!(std::fs::read(&resolved.disk_path).unwrap(), disk);
+    }
+
+    /// A template carrying a pre-enrolled VARS file (§5.2) pushes it in the
+    /// base's config blob and pulls it back beside the disk, so clones of
+    /// the pulled copy start from the same enrolled keys.
+    #[tokio::test]
+    async fn a_templates_vars_file_survives_push_and_pull() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.secure_boot = Some(true);
+        m.firmware = Some("ovmf".into());
+        m.secure_boot_keys = Some(crate::config::model::SecureBootKeys::Vars);
+        make_template(&tdir, &m, &[7u8; 64 * 1024]);
+        let mut vars = vec![0xffu8; 540_672];
+        vars[100..108].copy_from_slice(b"user-PK!");
+        std::fs::write(tdir.join(crate::template::store::VARS_FILE), &vars).unwrap();
+
+        let reg = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone());
+        reg.push(
+            &tdir,
+            1024 * 1024,
+            "x86_64",
+            &work.path().join("push"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let pulled = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .pull(Some("x86_64"), &store, &store_root.join(".oci-pull"), false)
+            .await
+            .unwrap();
+        assert_eq!(pulled.secure_boot_keys, m.secure_boot_keys);
+        let r = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap();
+        let held = crate::template::store::template_vars(&r.dir, &r.meta).unwrap();
+        assert_eq!(std::fs::read(held).unwrap(), vars);
     }
 
     /// Pulling a version the store already holds uses the stored copy when it
@@ -2290,6 +2355,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -2443,6 +2509,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,

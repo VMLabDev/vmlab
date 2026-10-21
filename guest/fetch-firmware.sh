@@ -12,6 +12,10 @@
 #              AAVMF_CODE.fd            + AAVMF_VARS.fd        plain UEFI
 #              AAVMF_CODE.secboot.fd    + AAVMF_VARS.ms.fd     secure boot
 #
+# `secure_boot_keys = "setup"` pairs each secboot CODE with the blank VARS
+# above (setup mode), and `secure_boot_vars` boots a user file under it, so
+# no extra image is needed for either.
+#
 # Each .deb is pinned by exact version + sha256 and fetched from
 # deb.debian.org, falling back to snapshot.debian.org once the pool has
 # dropped the version (a stable point release supersedes it). A .deb is an ar

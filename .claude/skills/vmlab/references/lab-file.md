@@ -115,6 +115,8 @@ required child blocks. The schema declares these with decorators on each field.
   cloned VM.
 - `secure_boot = true` on a VM whose firmware resolves to SeaBIOS. Either value
   may have been inherited, so the message names the layer each came from.
+- `secure_boot_keys`/`secure_boot_vars` where secure boot resolves off (named the
+  same way), both on one block, or a `secure_boot_vars` file that is missing.
 - `nested = true` on a VM whose `cpu_model` resolves to a named model, which
   decides the CPU features itself. The model may have been inherited, so the
   message names the layer it came from.

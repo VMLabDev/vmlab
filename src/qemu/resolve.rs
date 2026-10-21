@@ -8,7 +8,9 @@
 //! because the hardware surfaces differ: a container micro-VM has no
 //! firmware, TPM, display or disk bus to choose.
 
-use crate::config::model::{AccelMode, Container, Firmware, Gpu, TemplateRef, Vm};
+use std::path::PathBuf;
+
+use crate::config::model::{AccelMode, Container, Firmware, Gpu, SecureBootKeys, TemplateRef, Vm};
 use crate::profiles::{
     AgentTransport, DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet,
 };
@@ -28,6 +30,9 @@ pub struct ResolvedVm {
     pub machine: String,
     pub firmware: Option<FirmwareKind>,
     pub secure_boot: bool,
+    /// What the VM's UEFI variable store starts from under secure boot
+    /// (§5.2). Read only when `secure_boot` is on.
+    pub key_store: KeyStore,
     pub tpm: bool,
     /// Boot with the hot-plug xHCI controller (`id=usbx`) host USB devices
     /// attach to (§5.2.1). VM > profile: a template does not carry it, since
@@ -99,6 +104,59 @@ pub struct AccelRequest {
     pub from: String,
 }
 
+/// What a secure-boot VM's per-VM UEFI variable store is first copied from
+/// (§5.2) — resolved VM > template > profile like every other hardware
+/// field, with Microsoft's enrolled keys as vmlab's default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyStore {
+    /// The bundled VARS with Microsoft's (and Debian's) keys enrolled.
+    Microsoft,
+    /// The blank VARS: the firmware starts in setup mode and the guest
+    /// enrolls its own keys, which the per-VM copy then keeps.
+    Setup,
+    /// A pre-enrolled VARS file the vm block names, as declared — relative
+    /// to the lab root (the lab daemon roots it).
+    File(PathBuf),
+    /// The pre-enrolled VARS file the template carries beside its disk.
+    Template,
+}
+
+impl KeyStore {
+    /// How template metadata records this store: a file — the vm block's or
+    /// a template's — is `vars`, stored beside the disk.
+    pub fn recorded(&self) -> SecureBootKeys {
+        match self {
+            KeyStore::Microsoft => SecureBootKeys::Microsoft,
+            KeyStore::Setup => SecureBootKeys::Setup,
+            KeyStore::File(_) | KeyStore::Template => SecureBootKeys::Vars,
+        }
+    }
+
+    /// Microsoft's keys — what secure boot meant before the store was a
+    /// choice, and still means when nothing names one.
+    pub fn is_default(&self) -> bool {
+        *self == KeyStore::Microsoft
+    }
+
+    /// How the declaration reads in a message.
+    fn describe(&self) -> String {
+        match self {
+            KeyStore::Microsoft => "secure_boot_keys = \"microsoft\"".to_string(),
+            KeyStore::Setup => "secure_boot_keys = \"setup\"".to_string(),
+            KeyStore::File(p) => format!("secure_boot_vars = \"{}\"", p.display()),
+            KeyStore::Template => "a pre-enrolled VARS file".to_string(),
+        }
+    }
+
+    pub(crate) fn of_keys(keys: SecureBootKeys) -> Self {
+        match keys {
+            SecureBootKeys::Microsoft => KeyStore::Microsoft,
+            SecureBootKeys::Setup => KeyStore::Setup,
+            SecureBootKeys::Vars => KeyStore::Template,
+        }
+    }
+}
+
 /// Which layer of the §5.2 precedence chain supplied a resolved value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
@@ -153,6 +211,16 @@ impl FirmwareChoice {
 }
 
 impl Layer {
+    /// Precedence: lower outranks higher (the vm block is 0).
+    fn rank(self) -> u8 {
+        match self {
+            Layer::Vm => 0,
+            Layer::Template => 1,
+            Layer::Profile => 2,
+            Layer::Default => 3,
+        }
+    }
+
     /// How this layer reads in an error message.
     pub fn label(self, profile_name: Option<&str>) -> String {
         match self {
@@ -294,6 +362,62 @@ pub fn resolve_firmware(
     }
 }
 
+/// The key store a VM's secure boot starts from, and the layer that named
+/// it (§5.2). A layer names one through `secure_boot_vars` (the vm block
+/// only — a pre-enrolled file the lab carries) or `secure_boot_keys`; a
+/// template recording `vars` names the file stored beside its disk. Split
+/// out of [`resolve_vm`] so validation can name the layer (§5.1).
+pub fn resolve_key_store(
+    lab_vm: &Vm,
+    template: Option<&TemplateMeta>,
+    profile: &Profile,
+) -> (KeyStore, Layer) {
+    pick(
+        lab_vm
+            .secure_boot_vars
+            .clone()
+            .map(KeyStore::File)
+            .or(lab_vm.secure_boot_keys.map(KeyStore::of_keys)),
+        template.and_then(|t| t.secure_boot_keys.map(KeyStore::of_keys)),
+        profile.secure_boot_keys.map(KeyStore::of_keys),
+    )
+    .unwrap_or((KeyStore::Microsoft, Layer::Default))
+}
+
+/// Why a key store cannot stand where it was declared: it only means
+/// anything under secure boot, and secure boot is off — or there is no UEFI
+/// to run it, which [`FirmwareChoice::conflict_message`] already reports
+/// when secure boot is on. `None` when there is nothing to report.
+///
+/// A key store inherited from below the layer that turned secure boot off
+/// is not a conflict: a vm block saying `secure_boot = false` over a template
+/// built with `setup` has decided, and the template's store is moot.
+pub fn key_store_conflict(
+    machine: &str,
+    store: &KeyStore,
+    store_layer: Layer,
+    firmware: &FirmwareChoice,
+    profile_name: Option<&str>,
+) -> Option<String> {
+    if store.is_default()
+        || firmware.secure_boot
+        || store_layer.rank() > firmware.secure_boot_layer.rank()
+    {
+        return None;
+    }
+    let secure_boot = match firmware.secure_boot_layer {
+        Layer::Default => "secure_boot is not set (vmlab's default is false)".to_string(),
+        layer => format!("secure_boot = false (from {})", layer.label(profile_name)),
+    };
+    Some(format!(
+        "vm \"{machine}\": {} (from {}) but {secure_boot} — a UEFI key store only means anything \
+         under secure boot; set `secure_boot = true` (with `firmware = \"ovmf\"`) or drop it \
+         (PRD §5.2)",
+        store.describe(),
+        store_layer.label(profile_name),
+    ))
+}
+
 fn firmware_kind(f: Firmware) -> FirmwareKind {
     match f {
         Firmware::Ovmf => FirmwareKind::Ovmf,
@@ -376,6 +500,19 @@ pub fn resolve_vm(
         anyhow::bail!(firmware_choice.conflict_message(&lab_vm.name, profile_name.as_deref()));
     }
 
+    let (key_store, key_store_layer) = resolve_key_store(lab_vm, template, profile);
+    // As for secure boot itself: validation cannot always see the template
+    // layer, so the resolver refuses too.
+    if let Some(why) = key_store_conflict(
+        &lab_vm.name,
+        &key_store,
+        key_store_layer,
+        &firmware_choice,
+        profile_name.as_deref(),
+    ) {
+        anyhow::bail!(why);
+    }
+
     let cpu_model = resolve_cpu_model(lab_vm, template, profile);
     // Validation reports this too, but like secure boot it cannot always see
     // the template layer; every layer is in hand here.
@@ -430,6 +567,7 @@ pub fn resolve_vm(
         machine,
         firmware: firmware_choice.firmware,
         secure_boot: firmware_choice.secure_boot,
+        key_store,
         tpm: lab_vm
             .tpm
             .or(template.and_then(|t| t.tpm))
@@ -588,6 +726,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -830,6 +969,95 @@ mod tests {
         );
         let r = resolve_vm(&v, None, &profiles).unwrap();
         assert_eq!(r.machine, "virt,acpi=off");
+    }
+
+    /// The key store resolves VM > template > profile like the rest of the
+    /// hardware, `secure_boot_vars` naming a file on the vm block, a
+    /// template's recorded `vars` its own stored file — and Microsoft's keys
+    /// when nothing names one.
+    #[test]
+    fn key_store_resolves_vm_over_template_over_profile() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let win11 = profiles.get("windows-11").unwrap();
+        let mut setup_profile = win11.clone();
+        setup_profile.secure_boot_keys = Some(SecureBootKeys::Setup);
+
+        let bare = vm("vm \"a\" { template = \"x86_64/t\" }");
+        assert_eq!(
+            resolve_key_store(&bare, None, win11),
+            (KeyStore::Microsoft, Layer::Default)
+        );
+        assert_eq!(
+            resolve_key_store(&bare, None, &setup_profile),
+            (KeyStore::Setup, Layer::Profile)
+        );
+
+        let mut m = meta();
+        m.secure_boot_keys = Some(SecureBootKeys::Vars);
+        assert_eq!(
+            resolve_key_store(&bare, Some(&m), &setup_profile),
+            (KeyStore::Template, Layer::Template)
+        );
+
+        let keys = vm("vm \"a\" { template = \"x86_64/t\" secure_boot_keys = \"microsoft\" }");
+        assert_eq!(
+            resolve_key_store(&keys, Some(&m), &setup_profile),
+            (KeyStore::Microsoft, Layer::Vm)
+        );
+        let file = vm("vm \"a\" { template = \"x86_64/t\" secure_boot_vars = \"keys/v.fd\" }");
+        assert_eq!(
+            resolve_key_store(&file, Some(&m), &setup_profile),
+            (KeyStore::File("keys/v.fd".into()), Layer::Vm)
+        );
+    }
+
+    /// A key store reaches the resolved VM; one declared where secure boot
+    /// is off is refused naming both layers, but one inherited from below
+    /// the layer that turned secure boot off is moot, not an error.
+    #[test]
+    fn resolve_refuses_a_key_store_without_secure_boot() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm(
+            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"windows-11\" disk = 10GiB secure_boot_keys = \"setup\" }",
+        );
+        let r = resolve_vm(&v, None, &profiles).unwrap();
+        assert!(r.secure_boot);
+        assert_eq!(r.key_store, KeyStore::Setup);
+
+        let v = vm(
+            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"linux-modern\" disk = 10GiB secure_boot_keys = \"setup\" }",
+        );
+        let err = resolve_vm(&v, None, &profiles).unwrap_err().to_string();
+        assert!(
+            err.contains("secure_boot_keys = \"setup\" (from the vm block)")
+                && err.contains("secure_boot = false (from profile \"linux-modern\")"),
+            "{err}"
+        );
+
+        let v = vm(
+            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"windows-11\" disk = 10GiB secure_boot = false secure_boot_vars = \"k.fd\" }",
+        );
+        let err = resolve_vm(&v, None, &profiles).unwrap_err().to_string();
+        assert!(
+            err.contains("secure_boot_vars = \"k.fd\" (from the vm block)")
+                && err.contains("secure_boot = false (from the vm block)"),
+            "{err}"
+        );
+
+        // The template was built with setup mode; this VM turns secure boot
+        // off, which leaves the template's store unread.
+        let mut m = meta();
+        m.secure_boot = Some(true);
+        m.firmware = Some("ovmf".into());
+        m.secure_boot_keys = Some(SecureBootKeys::Setup);
+        let v = vm("vm \"a\" { template = \"x86_64/win\" secure_boot = false }");
+        let r = resolve_vm(&v, Some(&m), &profiles).unwrap();
+        assert!(!r.secure_boot);
+        let v = vm("vm \"a\" { template = \"x86_64/win\" }");
+        assert_eq!(
+            resolve_vm(&v, Some(&m), &profiles).unwrap().key_store,
+            KeyStore::Setup
+        );
     }
 
     #[test]

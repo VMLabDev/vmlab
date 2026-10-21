@@ -723,6 +723,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,

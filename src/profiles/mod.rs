@@ -89,6 +89,9 @@ pub struct Profile {
     pub machine: Option<Machine>,
     pub firmware: Option<FirmwareKind>,
     pub secure_boot: Option<bool>,
+    /// The key store secure boot starts from (§5.2): `microsoft` or `setup`.
+    /// None = Microsoft's, unless a higher layer names one.
+    pub secure_boot_keys: Option<crate::config::model::SecureBootKeys>,
     pub tpm: Option<bool>,
     /// Boot with the hot-plug xHCI controller USB passthrough attaches to
     /// (§5.2.1). None = off.
@@ -238,6 +241,9 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             )
             .unspan(),
         secure_boot: r.bool("secure_boot").unspan(),
+        secure_boot_keys: r
+            .keyword("secure_boot_keys", crate::config::model::SECURE_BOOT_KEYS)
+            .unspan(),
         tpm: r.bool("tpm").unspan(),
         usb: r.bool("usb").unspan(),
         disk_bus: r
