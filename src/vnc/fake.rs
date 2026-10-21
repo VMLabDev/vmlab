@@ -26,6 +26,8 @@ pub(crate) struct FakeRfb {
     /// How many connections the server has accepted so far.
     pub connections: Arc<AtomicUsize>,
     accept: tokio::task::JoinHandle<()>,
+    /// Flipped by `vanish` so every open connection of this generation ends.
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 /// The reply that closes the connection instead of answering.
@@ -38,13 +40,14 @@ pub(crate) fn spawn(width: u16, height: u16, replies: Vec<Vec<u8>>) -> FakeRfb {
     let path = dir.path().join("vnc.sock");
     let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     let connections = Arc::new(AtomicUsize::new(0));
-    let accept = listen(&path, width, height, replies, &received, &connections);
+    let (accept, closed) = listen(&path, width, height, replies, &received, &connections);
     FakeRfb {
         _dir: dir,
         path,
         received,
         connections,
         accept,
+        closed,
     }
 }
 
@@ -55,32 +58,44 @@ fn listen(
     replies: Vec<Vec<u8>>,
     received: &Arc<Mutex<Vec<Vec<u8>>>>,
     connections: &Arc<AtomicUsize>,
-) -> tokio::task::JoinHandle<()> {
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let listener = UnixListener::bind(path).expect("bind fake rfb socket");
     let rec = Arc::clone(received);
     let conns = Arc::clone(connections);
-    tokio::spawn(async move {
+    let (closed, closed_rx) = tokio::sync::watch::channel(false);
+    let accept = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             conns.fetch_add(1, Ordering::SeqCst);
             let replies = replies.clone();
             let rec = Arc::clone(&rec);
-            tokio::spawn(serve(stream, width, height, replies, rec));
+            let mut closed = closed_rx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    r = serve(stream, width, height, replies, rec) => r,
+                    _ = closed.changed() => Ok(()),
+                }
+            });
         }
-    })
+    });
+    (accept, closed)
 }
 
 impl FakeRfb {
-    /// Stop listening and remove the socket, as a QEMU that exited would.
-    /// Connections already open are left to their own scripts.
+    /// Stop listening, close every open connection and remove the socket,
+    /// as a QEMU that exited would.
     pub(crate) fn vanish(&self) {
         self.accept.abort();
+        let _ = self.closed.send(true);
         let _ = std::fs::remove_file(&self.path);
     }
 
     /// Listen again on the same path, as the next QEMU would, serving a
     /// `width`x`height` screen with `replies`.
     pub(crate) fn reappear(&mut self, width: u16, height: u16, replies: Vec<Vec<u8>>) {
-        self.accept = listen(
+        let (accept, closed) = listen(
             &self.path,
             width,
             height,
@@ -88,6 +103,8 @@ impl FakeRfb {
             &self.received,
             &self.connections,
         );
+        self.accept = accept;
+        self.closed = closed;
     }
 }
 

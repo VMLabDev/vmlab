@@ -18,6 +18,7 @@ pub mod paths;
 pub mod profiles;
 pub mod proto;
 mod qemu;
+pub mod record;
 /// The lab status projection every surface renders (ADR-0004): produced by the
 /// lab daemon, consumed unchanged by the CLI table.
 pub mod status;
