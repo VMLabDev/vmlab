@@ -120,9 +120,11 @@ async fn collect_events(
 
 struct TestLab {
     events: Arc<EventLog>,
-    /// Every `machine_ready` the lab was told of, in order — and every
-    /// `before_resume`, as `resume:<name>`, so the order of the two shows.
+    /// Every `machine_ready` the lab was told of, in order.
     readied: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Every `before_resume` and `machine_ready`, interleaved as
+    /// `resume:<name>` and `ready:<name>`, so the order of the two shows.
+    hooks: Arc<std::sync::Mutex<Vec<String>>>,
     /// Make `before_resume` fail with this, as a recorder that could not
     /// attach would (§11.1, D20).
     refuse_resume: std::sync::Mutex<Option<String>>,
@@ -133,12 +135,17 @@ impl TestLab {
         Self {
             events,
             readied: Arc::default(),
+            hooks: Arc::default(),
             refuse_resume: std::sync::Mutex::new(None),
         }
     }
 
     fn readied(&self) -> Vec<String> {
         self.readied.lock().expect("readied").clone()
+    }
+
+    fn hooks(&self) -> Vec<String> {
+        self.hooks.lock().expect("hooks").clone()
     }
 }
 
@@ -168,9 +175,9 @@ impl LabServices for TestLab {
     }
 
     async fn before_resume(&self, machine: &str) -> anyhow::Result<()> {
-        self.readied
+        self.hooks
             .lock()
-            .expect("readied")
+            .expect("hooks")
             .push(format!("resume:{machine}"));
         match self.refuse_resume.lock().expect("refuse").clone() {
             Some(why) => Err(anyhow::anyhow!(why)),
@@ -183,6 +190,10 @@ impl LabServices for TestLab {
             .lock()
             .expect("readied")
             .push(machine.to_string());
+        self.hooks
+            .lock()
+            .expect("hooks")
+            .push(format!("ready:{machine}"));
     }
 
     async fn smb_mount_plan(
@@ -2017,14 +2028,14 @@ async fn before_resume_runs_in_the_paused_window_and_can_refuse_the_start() {
         .await
         .expect("start");
     m.wait_ready(SETTLE).await.expect("ready");
-    let seen = lab.readied();
+    let seen = lab.hooks();
     let resume = seen
         .iter()
         .position(|s| s == "resume:dc01")
         .expect("before_resume ran");
     let ready = seen
         .iter()
-        .position(|s| s == "dc01")
+        .position(|s| s == "ready:dc01")
         .expect("machine_ready ran");
     assert!(resume < ready, "{seen:?}");
     m.stop(true).await.expect("stop");
