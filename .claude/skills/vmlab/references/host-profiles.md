@@ -187,13 +187,23 @@ and secure boot alike:
 3. The host's distro firmware at its well-known paths (riscv64 always lands
    here — nothing is bundled for it).
 
-- A secure-boot CODE is only ever paired with its enrolled VARS; a blank store
-  boots in setup mode and enforces nothing, so vmlab refuses instead.
+- A secure-boot CODE is paired with its enrolled VARS by default; a blank store
+  boots in setup mode and enforces nothing, so vmlab refuses it — unless the VM
+  opts in with `secure_boot_keys = "setup"` (secboot CODE + blank
+  `OVMF_VARS_4M.fd`; the guest enrolls its own keys, e.g. systemd-boot
+  auto-enroll). `secure_boot_vars = "<path>"` boots a user-supplied pre-enrolled
+  VARS file (e.g. from `virt-fw-vars --set-pk … --add-db …`) under the secboot
+  CODE; it must be the size of that CODE's VARS template.
 - Each VM copies its VARS template once, at first start, to
   `.vmlab/vms/<vm>/OVMF_VARS.fd`, and keeps it. A VM whose store was created
   under a firmware of another flash layout (a host's 2 MiB OVMF) keeps booting
   a build of that layout.
-- Templates record `firmware` and `secure_boot`, never a firmware path.
+- Templates record `firmware`, `secure_boot` and `secure_boot_keys`, never a
+  firmware path. A template built with `secure_boot_vars` stores the file as
+  `OVMF_VARS.fd` beside its disk (`secure_boot_keys = "vars"`); export/import and
+  push/pull carry it, and clones start from it.
+- Changing the key store of a VM that has already started means deleting its
+  `OVMF_VARS.fd` (losing its boot entries): an existing copy is never replaced.
 - To see which firmware a running VM booted, read the `-drive if=pflash`
   arguments of its QEMU process.
 
@@ -402,6 +412,7 @@ profile "<name>" {
 | `machine` | utf8 | QEMU default | Machine type: `q35`, or `pc` for i440fx. |
 | `firmware` | utf8 | QEMU default | Firmware: `ovmf` or `seabios`. |
 | `secure_boot` | bool | unset | Enable secure boot; OVMF only. |
+| `secure_boot_keys` | utf8 | unset (`microsoft`) | Key store secure boot starts from: `microsoft` or `setup`. |
 | `tpm` | bool | unset | Attach a swtpm 2.0 device. |
 | `usb` | bool | unset | Boot with the hot-plug xHCI controller host USB passthrough needs. A VM's own `usb` wins; unset is off. |
 | `disk_bus` | utf8 | QEMU default | Primary disk bus: `virtio`, `ide` or `sata`. |

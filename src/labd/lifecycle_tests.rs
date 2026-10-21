@@ -252,6 +252,7 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
             first_boot: None,
             agent_version: Some("0.1.0".into()),
             variant: None,
+            template_vars: None,
         },
     );
     let hv = FakeHypervisor::new(script);
@@ -435,6 +436,7 @@ async fn a_vms_status_reports_its_resolved_hardware() {
         first_boot: None,
         agent_version: parts.agent_version.clone(),
         variant: None,
+        template_vars: None,
     });
 
     let m: Arc<dyn Machine> = vm.clone();
@@ -1481,6 +1483,7 @@ async fn an_agentless_clone_is_ready_once_it_is_running() {
         first_boot: parts.first_boot.clone(),
         agent_version: None,
         variant: None,
+        template_vars: None,
     });
 
     let m: Arc<dyn Machine> = vm.clone();
@@ -1516,6 +1519,7 @@ async fn a_clone_with_an_agent_still_waits_for_the_handshake() {
         first_boot: parts.first_boot.clone(),
         agent_version: parts.agent_version.clone(), // an agent IS baked in
         variant: None,
+        template_vars: None,
     });
 
     let (cbs, _observed) = callbacks();

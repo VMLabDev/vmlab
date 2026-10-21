@@ -25,6 +25,7 @@ type TemplateMeta {
   firmware: utf8?
   tpm: bool?
   secure_boot: bool?
+  secure_boot_keys: utf8?  // "microsoft" | "setup" | "vars" (vars: OVMF_VARS.fd beside the disk)
   display: utf8?
   cpu_model: utf8?    // QEMU -cpu model
   accel: utf8?        // "kvm" | "tcg"
@@ -58,6 +59,7 @@ type VariantMeta {
   firmware: utf8?
   tpm: bool?
   secure_boot: bool?
+  secure_boot_keys: utf8?  // "microsoft" | "setup" | "vars" (vars: OVMF_VARS.fd beside the disk)
   display: utf8?
   cpu_model: utf8?
   accel: utf8?

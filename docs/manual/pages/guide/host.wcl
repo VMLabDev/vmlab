@@ -226,15 +226,53 @@ DOC
   }
 
   p <<'DOC'
-A secure-boot build is only ever taken with the variable store that has keys
-enrolled for it: a blank store boots in setup mode, where nothing is verified,
-so vmlab refuses rather than boot one. Each VM copies its store from the
-template once, at its first start, into `.vmlab/vms/<vm>/OVMF_VARS.fd`, and
-keeps it, enrolled keys and boot entries included. A VM created under a
-firmware of a different flash layout, such as a host's old 2 MiB OVMF, keeps
-booting a build of that layout. Templates record `firmware` and
-`secure_boot`, never a firmware path, so nothing about the building host
-travels with them.
+By default a secure-boot build is only ever taken with the variable store
+that has keys enrolled for it: a blank store boots in setup mode, where
+nothing is verified, so vmlab refuses rather than boot one. Each VM copies its
+store from the template once, at its first start, into
+`.vmlab/vms/<vm>/OVMF_VARS.fd`, and keeps it, enrolled keys and boot entries
+included. A VM created under a firmware of a different flash layout, such as a
+host's old 2 MiB OVMF, keeps booting a build of that layout. Templates record
+`firmware`, `secure_boot` and `secure_boot_keys`, never a firmware path, so
+nothing about the building host travels with them.
+DOC
+
+  h3 "Your own secure-boot keys"
+
+  p <<'DOC'
+A guest signed with a key you generated, such as an mkosi image whose UKI is
+signed with `mkosi genkey`'s key, does not boot under Microsoft's store. Two
+settings on the VM (or the template) choose another store:
+DOC
+
+  table {
+    rows:
+      | "Setting" | "Pairs" | "Use it when" |
+      | "`secure_boot_keys = \"setup\"`" | "The secure-boot CODE with the blank VARS (`OVMF_VARS_4M.fd`, `AAVMF_VARS.fd`)" | "The guest enrolls its own keys on first boot, for example through systemd-boot's auto-enroll. The firmware starts in setup mode; the VM's `OVMF_VARS.fd` keeps the enrolled keys and every later boot enforces them." |
+      | "`secure_boot_vars = \"keys/OVMF_VARS.fd\"`" | "The secure-boot CODE with your file" | "The guest must enforce from its very first boot. Build the file from the blank VARS template, for example `virt-fw-vars --input OVMF_VARS_4M.fd --output keys/OVMF_VARS.fd --set-pk … --add-kek … --add-db …`. It must be the template's size, and is copied once like the bundled store." |
+  }
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+vm "candidate" {
+  template         = "x86_64/distro-server"
+  firmware         = "ovmf"
+  secure_boot      = true
+  secure_boot_keys = "setup"   // "microsoft" is the default
+}
+SRC
+  }
+
+  p <<'DOC'
+Setup mode is never chosen for you: without `secure_boot_keys = "setup"`, a
+host that has a secure-boot CODE but no enrolled store is still refused.
+Neither setting means anything without secure boot, so validation rejects them
+where `secure_boot` resolves off or the firmware is SeaBIOS. The store is
+copied at the VM's first start only; to change the key store of a VM that has
+already started, delete its `OVMF_VARS.fd`, losing its boot entries. A
+template built with either setting records it, and one built with
+`secure_boot_vars` stores the file beside its disk, so every clone starts from
+the same keys unless it names its own. `firmware_dir` is unchanged by all of
+this: it still replaces the whole firmware set for an architecture, host-wide.
 DOC
 
   h2 "Directories"

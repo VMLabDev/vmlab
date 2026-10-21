@@ -74,6 +74,8 @@ SRC
       | "`firmware`" | "utf8" | "from profile" | "Firmware: `ovmf` or `seabios`." |
       | "`tpm`" | "bool" | "from profile" | "Enable a TPM 2.0 device." |
       | "`secure_boot`" | "bool" | "from profile" | "Enable secure boot; OVMF only." |
+      | "`secure_boot_keys`" | "utf8" | "from profile, else `microsoft`" | "The key store the build's secure boot starts from: `microsoft` or `setup` (blank store, setup mode). Recorded in the metadata, so clones start from the same store. Needs `secure_boot = true`." |
+      | "`secure_boot_vars`" | "utf8" | "none" | "A pre-enrolled UEFI VARS file, relative to the template root, the build boots with. Stored beside the sealed disk as `OVMF_VARS.fd` and recorded as `secure_boot_keys = \"vars\"`, so every clone starts from it; carried by export, import, push and pull. Needs `secure_boot = true`; exclusive with `secure_boot_keys`." |
       | "`nested`" | "bool" | "`false`" | "Enable nested virtualisation for the build VM." |
       | "`gui`" | "bool" | "`false`" | "Watch the build VM in a VNC viewer." |
       | "`qemu_args`" | "list<utf8>" | "none" | "Raw QEMU flags for the build VM. The escape hatch." |
@@ -230,6 +232,7 @@ SRC
       | "`firmware`" | "utf8" | "the base's" | "Firmware: `ovmf` or `seabios`." |
       | "`tpm`" | "bool" | "the base's" | "Enable a TPM 2.0 device." |
       | "`secure_boot`" | "bool" | "the base's" | "Enable secure boot; OVMF only." |
+      | "`secure_boot_keys`" | "utf8" | "the base's" | "`microsoft` or `setup`. A variant carries no VARS file of its own; a base's stored file is used unless this names another store." |
       | "`qemu_args`" | "list<utf8>" | "the template's" | "Raw QEMU flags for the variant's build VM, replacing the template's." |
       | "`gpu {}`" | "child" | "the template's" | "GPU acceleration for the variant's build VM only, replacing the template's. Never recorded for clones; see the build VM's GPU above." |
       | "`media {}`" | "children" | "none" | "ISO or floppy images attached to the variant's build. The template's own media stay with the base build." |

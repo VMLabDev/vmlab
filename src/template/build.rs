@@ -19,6 +19,7 @@ use crate::config::model::{
     ArtefactSource, Firmware, TemplateDef, TemplateRef, TemplateSource, TemplateVariantDef,
 };
 use crate::labd::machine::Machine;
+use crate::qemu::resolve::KeyStore;
 use crate::scripting::OutputSink;
 
 /// Called once the build VM's VNC socket is accepting connections.
@@ -437,7 +438,7 @@ async fn build_variant(
         )
     })?;
     let build_vm = "build";
-    let hw = EffectiveHardware::for_variant(v, &base.meta);
+    let hw = EffectiveHardware::for_variant(v, &base.meta).locate_vars(Some(&base.dir));
     let spec = BuildSpec::variant(def, v, base.meta.disk);
     check_spec_hardware(def, &spec, &hw, build_vm, root, profiles)?;
 
@@ -695,6 +696,7 @@ fn variant_meta(v: &TemplateVariantDef, image: VariantImage) -> super::meta::Var
         firmware: v.firmware.map(|f| f.as_str().to_string()),
         tpm: v.tpm,
         secure_boot: v.secure_boot,
+        secure_boot_keys: v.secure_boot_keys,
         display: v.display.clone(),
         cpu_model: v.cpu_model.clone(),
         accel: v.accel,
@@ -835,7 +837,8 @@ async fn run_build(
     // the block restates (ADR-0009), so the source's metadata has to be in
     // hand before anything asks what this build boots on.
     let mut layered = resolve_layered_source(def, store)?;
-    let hw = EffectiveHardware::resolve(def, layered.as_ref().map(|r| &r.meta));
+    let hw = EffectiveHardware::resolve(def, layered.as_ref().map(|r| &r.meta))
+        .locate_vars(layered.as_ref().map(|r| r.dir.as_path()));
 
     // That hardware decides how the build VM boots, so resolve it before the
     // first expensive step: the resolver refuses combinations that cannot work
@@ -1008,6 +1011,7 @@ async fn run_build(
             first_boot: Some(first_boot),
             agent_version: parts.agent_version.clone(),
             variant: parts.variant.clone(),
+            template_vars: parts.template_vars.clone(),
         });
     }
 
@@ -1249,6 +1253,14 @@ async fn run_build(
         },
     );
 
+    // A pre-enrolled key store is sealed beside the disk, so every clone's
+    // variable store starts from it (§5.2) — the file the build booted with,
+    // not the build VM's own store, which holds the build's boot entries.
+    if let Some(KeyStore::File(path)) = &hw.key_store {
+        let from = root.join(path);
+        std::fs::copy(&from, staging.join(super::store::VARS_FILE))
+            .with_context(|| format!("copying secure_boot_vars {}", from.display()))?;
+    }
     store
         .install(&staging, &meta, false)
         .context("installing into the store")?;
@@ -1342,6 +1354,11 @@ struct EffectiveHardware {
     firmware: Option<Firmware>,
     tpm: Option<bool>,
     secure_boot: Option<bool>,
+    /// The key store the build's secure boot starts from (§5.2). A file —
+    /// the block's `secure_boot_vars`, relative to the template root, or a
+    /// source template's stored VARS once [`Self::locate_vars`] has found it
+    /// — is sealed beside the disk for the clones.
+    key_store: Option<KeyStore>,
     display: Option<String>,
     cpu_model: Option<String>,
     accel: Option<crate::config::model::AccelMode>,
@@ -1366,6 +1383,7 @@ impl EffectiveHardware {
             firmware: v.firmware,
             tpm: v.tpm,
             secure_boot: v.secure_boot,
+            key_store: v.secure_boot_keys.map(KeyStore::of_keys),
             display: v.display.clone(),
             cpu_model: v.cpu_model.clone(),
             accel: v.accel,
@@ -1382,16 +1400,39 @@ impl EffectiveHardware {
             firmware: def.firmware,
             tpm: def.tpm,
             secure_boot: def.secure_boot,
+            key_store: def
+                .secure_boot_vars
+                .clone()
+                .map(KeyStore::File)
+                .or(def.secure_boot_keys.map(KeyStore::of_keys)),
             display: def.display.clone(),
             cpu_model: def.cpu_model.clone(),
             accel: def.accel,
         }
     }
 
+    /// Point a key store inherited from the source template at the VARS
+    /// file the source carries in `dir`, its version directory.
+    fn locate_vars(mut self, dir: Option<&Path>) -> Self {
+        if let (Some(KeyStore::Template), Some(dir)) = (&self.key_store, dir) {
+            self.key_store = Some(KeyStore::File(dir.join(super::store::VARS_FILE)));
+        }
+        self
+    }
+
     /// This layer over `source`'s recorded hardware: each field this layer
     /// leaves unset is taken from the source, the firmware pair as a pair.
     fn over(self, source: Option<&TemplateMeta>) -> Self {
         let (source_firmware, source_secure_boot) = source_firmware(source);
+        // The key store goes with the firmware pair: dropped beside a
+        // firmware this build cannot read, inherited otherwise.
+        let firmware_dropped = source
+            .and_then(|m| m.firmware.as_deref())
+            .is_some_and(|f| Firmware::parse(f).is_none());
+        let source_key_store = source
+            .filter(|_| !firmware_dropped)
+            .and_then(|m| m.secure_boot_keys)
+            .map(KeyStore::of_keys);
         Self {
             profile: self
                 .profile
@@ -1401,6 +1442,7 @@ impl EffectiveHardware {
             firmware: self.firmware.or(source_firmware),
             tpm: self.tpm.or_else(|| source.and_then(|m| m.tpm)),
             secure_boot: self.secure_boot.or(source_secure_boot),
+            key_store: self.key_store.or(source_key_store),
             display: self
                 .display
                 .or_else(|| source.and_then(|m| m.display.clone())),
@@ -1651,6 +1693,7 @@ fn seal_meta(
         firmware: hw.firmware.map(|f| f.as_str().to_string()),
         tpm: hw.tpm,
         secure_boot: hw.secure_boot,
+        secure_boot_keys: hw.key_store.as_ref().map(KeyStore::recorded),
         display: hw.display.clone(),
         cpu_model: hw.cpu_model.clone(),
         accel: hw.accel,
@@ -1827,6 +1870,7 @@ fn synth_spec_lab(
         firmware,
         tpm,
         secure_boot,
+        key_store,
         display,
         cpu_model,
         accel,
@@ -1875,6 +1919,20 @@ fn synth_spec_lab(
     }
     if let Some(sb) = secure_boot {
         writeln!(s, "    secure_boot = {sb}").unwrap();
+    }
+    match key_store {
+        None => {}
+        Some(KeyStore::Microsoft) => writeln!(s, "    secure_boot_keys = \"microsoft\"").unwrap(),
+        Some(KeyStore::Setup) => writeln!(s, "    secure_boot_keys = \"setup\"").unwrap(),
+        Some(KeyStore::File(path)) => writeln!(
+            s,
+            "    secure_boot_vars = {}",
+            wcl_str(root.join(path).display())
+        )
+        .unwrap(),
+        Some(KeyStore::Template) => {
+            bail!("the source template records a pre-enrolled VARS file the build cannot locate")
+        }
     }
     if def.nested {
         writeln!(s, "    nested   = true").unwrap();
@@ -2027,6 +2085,8 @@ mod tests {
         BuildBoot, EffectiveHardware, SealedImage, build_lab_name, seal_meta, sweep_workdirs_in,
         synth_lab, wcl_str,
     };
+    use crate::config::model::SecureBootKeys;
+    use crate::qemu::resolve::KeyStore;
     use crate::template::meta::TemplateMeta;
     use crate::template::store::{DISK_FILE, TemplateStore};
     use std::path::Path;
@@ -2119,6 +2179,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -2880,6 +2941,109 @@ mod tests {
         assert!(report.contains("secure boot needs UEFI"), "{report}");
     }
 
+    fn sealed_image() -> SealedImage {
+        SealedImage {
+            disk: 64 << 30,
+            sha256: "ab".repeat(32),
+            first_boot_script: None,
+            agent_version: None,
+        }
+    }
+
+    /// A block's key store reaches the build VM and the sealed metadata:
+    /// `setup` as itself, a `secure_boot_vars` file rendered rooted and
+    /// recorded as `vars` (the file is sealed beside the disk).
+    #[test]
+    fn a_key_store_reaches_the_build_and_the_metadata() {
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" disk = 10GiB firmware = "ovmf"
+                 secure_boot = true secure_boot_keys = "setup" source "scratch" {} }"#);
+        assert!(
+            render(&d).contains("secure_boot_keys = \"setup\""),
+            "{}",
+            render(&d)
+        );
+        let sealed = seal_meta(&d, &hw(&d), "1", sealed_image());
+        assert_eq!(sealed.secure_boot_keys, Some(SecureBootKeys::Setup));
+
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" disk = 10GiB firmware = "ovmf"
+                 secure_boot = true secure_boot_vars = "keys/v.fd" source "scratch" {} }"#);
+        let wcl = render(&d);
+        assert!(
+            wcl.contains("secure_boot_vars = \"/root/keys/v.fd\""),
+            "{wcl}"
+        );
+        let sealed = seal_meta(&d, &hw(&d), "1", sealed_image());
+        assert_eq!(sealed.secure_boot_keys, Some(SecureBootKeys::Vars));
+
+        // Nothing declared: nothing rendered, nothing recorded.
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" disk = 10GiB firmware = "ovmf"
+                 secure_boot = true source "scratch" {} }"#);
+        assert!(!render(&d).contains("secure_boot_"), "{}", render(&d));
+        assert_eq!(
+            seal_meta(&d, &hw(&d), "1", sealed_image()).secure_boot_keys,
+            None
+        );
+    }
+
+    /// A layered build inherits its source's stored VARS: located in the
+    /// source's version directory, booted, and recorded again as `vars`. A
+    /// block naming its own key store wins over it.
+    #[test]
+    fn a_layered_build_inherits_the_sources_vars_file() {
+        let source = TemplateMeta {
+            secure_boot_keys: Some(SecureBootKeys::Vars),
+            ..source_meta_full()
+        };
+        let d = layered("");
+        let hw = EffectiveHardware::resolve(&d, Some(&source))
+            .locate_vars(Some(Path::new("/store/x86_64/win11/26100.1")));
+        assert_eq!(
+            hw.key_store,
+            Some(KeyStore::File(
+                "/store/x86_64/win11/26100.1/OVMF_VARS.fd".into()
+            ))
+        );
+        let wcl = synth_lab(
+            &d,
+            &hw,
+            "build-t",
+            "build",
+            Path::new("/root"),
+            install(None),
+        )
+        .unwrap();
+        assert!(
+            wcl.contains("secure_boot_vars = \"/store/x86_64/win11/26100.1/OVMF_VARS.fd\""),
+            "{wcl}"
+        );
+        assert_eq!(
+            seal_meta(&d, &hw, "1", sealed_image()).secure_boot_keys,
+            Some(SecureBootKeys::Vars)
+        );
+
+        let d = layered("  secure_boot_keys = \"microsoft\"\n");
+        let hw = EffectiveHardware::resolve(&d, Some(&source))
+            .locate_vars(Some(Path::new("/store/x86_64/win11/26100.1")));
+        assert_eq!(hw.key_store, Some(KeyStore::Microsoft));
+
+        // Unlocated, the render refuses rather than booting Microsoft's keys.
+        let hw = EffectiveHardware::resolve(&layered(""), Some(&source));
+        assert!(
+            synth_lab(
+                &d,
+                &hw,
+                "build-t",
+                "build",
+                Path::new("/root"),
+                install(None)
+            )
+            .is_err()
+        );
+    }
+
     /// The sealed template records what it inherited, so a chain of layered
     /// rebuilds keeps the profile the first one recorded instead of losing a
     /// layer each time.
@@ -3145,6 +3309,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -3581,6 +3746,7 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
                 firmware: None,
                 tpm: None,
                 secure_boot: None,
+                secure_boot_keys: None,
                 display: None,
                 cpu_model: None,
                 accel: None,

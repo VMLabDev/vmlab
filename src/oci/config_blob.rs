@@ -37,6 +37,17 @@ pub struct TemplateConfig {
     pub tpm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub secure_boot: Option<bool>,
+    /// The key store secure boot starts from (§5.2), by its metadata
+    /// spelling. Free text, like `accel`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub secure_boot_keys: Option<String>,
+    /// The template's pre-enrolled UEFI VARS file, zstd-compressed and then
+    /// base64-encoded — set on the base's config blob when
+    /// `secure_boot_keys = "vars"`. It rides in the config rather than as a
+    /// layer because every layer is a disk chunk to a client that predates
+    /// it; a VARS store is mostly erased flash and compresses to a few KiB.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub secure_boot_vars: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub display: Option<String>,
     /// QEMU `-cpu` model (§5.2).
@@ -102,6 +113,8 @@ impl TemplateConfig {
             firmware: meta.firmware.clone(),
             tpm: meta.tpm,
             secure_boot: meta.secure_boot,
+            secure_boot_keys: meta.secure_boot_keys.map(|k| k.as_str().to_string()),
+            secure_boot_vars: None,
             display: meta.display.clone(),
             cpu_model: meta.cpu_model.clone(),
             accel: meta.accel.map(|a| a.as_str().to_string()),
@@ -164,6 +177,7 @@ impl TemplateConfig {
             firmware: over(&m.firmware, &base.firmware),
             tpm: over(&m.tpm, &base.tpm),
             secure_boot: over(&m.secure_boot, &base.secure_boot),
+            secure_boot_keys: over(&m.secure_boot_keys, &base.secure_boot_keys),
             display: over(&m.display, &base.display),
             cpu_model: over(&m.cpu_model, &base.cpu_model),
             accel: over(&m.accel, &base.accel),
@@ -188,6 +202,10 @@ impl TemplateConfig {
             firmware: self.firmware,
             tpm: self.tpm,
             secure_boot: self.secure_boot,
+            secure_boot_keys: self
+                .secure_boot_keys
+                .as_deref()
+                .and_then(crate::config::model::SecureBootKeys::parse),
             display: self.display,
             cpu_model: self.cpu_model,
             accel: self
@@ -206,6 +224,28 @@ impl TemplateConfig {
             // base's config blob.
             variants: Vec::new(),
         })
+    }
+
+    /// Carry `vars` — the template's pre-enrolled VARS file — in this blob.
+    pub fn with_vars(mut self, vars: &[u8]) -> Result<Self> {
+        use base64::Engine as _;
+        let packed = zstd::encode_all(vars, 19)?;
+        self.secure_boot_vars = Some(base64::engine::general_purpose::STANDARD.encode(packed));
+        Ok(self)
+    }
+
+    /// The VARS file this blob carries, unpacked; `None` when it carries none.
+    pub fn vars(&self) -> Result<Option<Vec<u8>>> {
+        use base64::Engine as _;
+        let Some(text) = &self.secure_boot_vars else {
+            return Ok(None);
+        };
+        let packed = base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(|e| anyhow::anyhow!("malformed secure_boot_vars in the config blob: {e}"))?;
+        Ok(Some(zstd::decode_all(packed.as_slice()).map_err(|e| {
+            anyhow::anyhow!("malformed secure_boot_vars in the config blob: {e}")
+        })?))
     }
 
     /// Serialise to canonical JSON bytes.
@@ -236,6 +276,7 @@ mod tests {
             firmware: Some("uefi".into()),
             tpm: Some(true),
             secure_boot: Some(true),
+            secure_boot_keys: Some(crate::config::model::SecureBootKeys::Vars),
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
             accel: Some(crate::config::model::AccelMode::Tcg),
@@ -260,6 +301,27 @@ mod tests {
         assert_eq!(cfg, back);
         let m2 = back.into_meta(None).unwrap();
         assert_eq!(m, m2);
+    }
+
+    /// A template's pre-enrolled VARS file rides the base's config blob,
+    /// compressed, and comes back byte for byte; the key store travels as
+    /// its metadata spelling. A blob without one carries none.
+    #[test]
+    fn vars_ride_the_config_blob() {
+        let m = meta();
+        let mut vars = vec![0xffu8; 540_672];
+        vars[..16].copy_from_slice(b"enrolled-PK-KEK!");
+        let cfg = TemplateConfig::from_meta(&m).with_vars(&vars).unwrap();
+        assert_eq!(cfg.secure_boot_keys.as_deref(), Some("vars"));
+        let json = cfg.to_json().unwrap();
+        assert!(json.len() < 64 * 1024, "{} bytes", json.len());
+        let back = TemplateConfig::from_json(&json).unwrap();
+        assert_eq!(back.vars().unwrap().as_deref(), Some(vars.as_slice()));
+        assert_eq!(
+            back.into_meta(None).unwrap().secure_boot_keys,
+            Some(crate::config::model::SecureBootKeys::Vars)
+        );
+        assert_eq!(TemplateConfig::from_meta(&m).vars().unwrap(), None);
     }
 
     #[test]
@@ -314,6 +376,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -343,6 +406,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: Some(false),
+            secure_boot_keys: Some(crate::config::model::SecureBootKeys::Microsoft),
             display: None,
             cpu_model: None,
             accel: None,

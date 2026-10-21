@@ -326,6 +326,9 @@ fn rooted_vm_config(
     root: &std::path::Path,
 ) -> crate::config::model::Vm {
     let mut cfg = vm_cfg.clone();
+    if let Some(vars) = &cfg.secure_boot_vars {
+        cfg.secure_boot_vars = Some(root.join(vars));
+    }
     for d in &mut cfg.extra_disks {
         if let Some(from) = &d.from {
             d.from = Some(root.join(from));
@@ -355,8 +358,8 @@ impl LabRuntime {
         for vm_cfg in &config.lab.vms {
             // Backing disk + effective metadata: the variant the reference
             // resolves to, or the base (§6.6).
-            let (backing, meta, variant, disk_size) = match &vm_cfg.template {
-                TemplateRef::Scratch => (None, None, None, vm_cfg.disk),
+            let (backing, meta, variant, disk_size, template_vars) = match &vm_cfg.template {
+                TemplateRef::Scratch => (None, None, None, vm_cfg.disk, None),
                 TemplateRef::Store {
                     arch,
                     name: tname,
@@ -372,11 +375,14 @@ impl LabRuntime {
                             Purpose::Lab,
                         )
                         .with_context(|| format!("vm \"{}\"", vm_cfg.name))?;
+                    let template_vars =
+                        crate::template::store::template_vars(&resolved.dir, &resolved.meta);
                     (
                         Some(resolved.disk_path),
                         Some(resolved.meta),
                         resolved.variant,
                         None,
+                        template_vars,
                     )
                 }
                 TemplateRef::Registry { reference, variant } => {
@@ -403,11 +409,16 @@ impl LabRuntime {
                             let resolved = version
                                 .select(variant.as_ref(), Purpose::Lab)
                                 .with_context(|| format!("vm \"{}\"", vm_cfg.name))?;
+                            let template_vars = crate::template::store::template_vars(
+                                &resolved.dir,
+                                &resolved.meta,
+                            );
                             (
                                 Some(resolved.disk_path),
                                 Some(resolved.meta),
                                 resolved.variant,
                                 None,
+                                template_vars,
                             )
                         }
                         None => {
@@ -418,7 +429,7 @@ impl LabRuntime {
                                     arch,
                                 },
                             );
-                            (None, None, None, None)
+                            (None, None, None, None, None)
                         }
                     }
                 }
@@ -509,6 +520,7 @@ impl LabRuntime {
                     first_boot,
                     agent_version,
                     variant,
+                    template_vars,
                 },
             );
             vms.insert(vm_cfg.name.clone(), vm);
@@ -928,6 +940,7 @@ impl LabRuntime {
                 first_boot: resolved.meta.first_boot(),
                 agent_version: resolved.meta.agent_version.clone(),
                 variant: resolved.variant.clone(),
+                template_vars: crate::template::store::template_vars(&resolved.dir, &resolved.meta),
             });
         }
         Ok(())

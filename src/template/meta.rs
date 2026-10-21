@@ -12,7 +12,7 @@ use wcl_lang::{Block, Document, Environment, Registry, disk_loader};
 
 use crate::config::IssueList;
 use crate::config::block::{Reader, Unspan, finish};
-use crate::config::model::{BASE_VARIANT, VariantRef};
+use crate::config::model::{BASE_VARIANT, SecureBootKeys, VariantRef};
 
 /// Embedded schema, registered in the loader as `vmlab-meta.wcl`.
 const META_SCHEMA: &str = include_str!("meta_schema.wcl");
@@ -38,6 +38,10 @@ pub struct TemplateMeta {
     pub firmware: Option<String>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
+    /// The key store secure boot starts from (§5.2). `Vars` means the
+    /// version directory holds a pre-enrolled VARS file ([`super::store::VARS_FILE`])
+    /// that clones start from.
+    pub secure_boot_keys: Option<SecureBootKeys>,
     pub display: Option<String>,
     /// QEMU `-cpu` model the template pins for its clones (§5.2).
     pub cpu_model: Option<String>,
@@ -96,6 +100,7 @@ pub struct VariantMeta {
     pub firmware: Option<String>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
+    pub secure_boot_keys: Option<SecureBootKeys>,
     pub display: Option<String>,
     pub cpu_model: Option<String>,
     pub accel: Option<crate::config::model::AccelMode>,
@@ -285,6 +290,7 @@ impl TemplateMeta {
         over(&mut m.firmware, &v.firmware);
         over(&mut m.tpm, &v.tpm);
         over(&mut m.secure_boot, &v.secure_boot);
+        over(&mut m.secure_boot_keys, &v.secure_boot_keys);
         over(&mut m.display, &v.display);
         over(&mut m.cpu_model, &v.cpu_model);
         over(&mut m.accel, &v.accel);
@@ -335,6 +341,9 @@ impl TemplateMeta {
         }
         if let Some(s) = self.secure_boot {
             let _ = writeln!(out, "  secure_boot = {s}");
+        }
+        if let Some(k) = self.secure_boot_keys {
+            let _ = writeln!(out, "  secure_boot_keys = {}", quote(k.as_str()));
         }
         if let Some(d) = &self.display {
             let _ = writeln!(out, "  display = {}", quote(d));
@@ -452,6 +461,9 @@ fn write_variant(out: &mut String, v: &VariantMeta) {
     if let Some(s) = v.secure_boot {
         let _ = writeln!(out, "    secure_boot = {s}");
     }
+    if let Some(k) = v.secure_boot_keys {
+        let _ = writeln!(out, "    secure_boot_keys = {}", quote(k.as_str()));
+    }
     if let Some(d) = &v.display {
         let _ = writeln!(out, "    display = {}", quote(d));
     }
@@ -503,6 +515,11 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
     let firmware = r.string("firmware").unspan();
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
+    // Lenient, like `firmware`: an unknown key store reads as unset.
+    let secure_boot_keys = r
+        .string("secure_boot_keys")
+        .unspan()
+        .and_then(|s| SecureBootKeys::parse(&s));
     let display = r.string("display").unspan();
     let cpu_model = r
         .parsed("cpu_model", crate::config::model::parse_cpu_model)
@@ -536,6 +553,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         firmware,
         tpm,
         secure_boot,
+        secure_boot_keys,
         display,
         cpu_model,
         accel,
@@ -627,6 +645,10 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
     let firmware = r.string("firmware").unspan();
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
+    let secure_boot_keys = r
+        .string("secure_boot_keys")
+        .unspan()
+        .and_then(|s| SecureBootKeys::parse(&s));
     let display = r.string("display").unspan();
     let cpu_model = r
         .parsed("cpu_model", crate::config::model::parse_cpu_model)
@@ -651,6 +673,7 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
         firmware,
         tpm,
         secure_boot,
+        secure_boot_keys,
         display,
         cpu_model,
         accel,
@@ -713,6 +736,7 @@ mod tests {
             firmware: Some("uefi".into()),
             tpm: Some(true),
             secure_boot: Some(true),
+            secure_boot_keys: Some(SecureBootKeys::Setup),
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
             accel: Some(crate::config::model::AccelMode::Tcg),
@@ -742,6 +766,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -764,6 +789,42 @@ mod tests {
         assert!(text.starts_with(SCHEMA_IMPORT));
         let back = TemplateMeta::from_wcl(&text, "<test>").unwrap();
         assert_eq!(meta, back);
+    }
+
+    /// Every key store a template records round-trips through the file, a
+    /// variant's overrides the base's, and a spelling this build does not
+    /// know reads as unset rather than breaking the store entry.
+    #[test]
+    fn key_store_round_trips_and_is_lenient() {
+        for keys in [
+            SecureBootKeys::Microsoft,
+            SecureBootKeys::Setup,
+            SecureBootKeys::Vars,
+        ] {
+            let mut meta = full_meta();
+            meta.secure_boot_keys = Some(keys);
+            let mut v = variant("v");
+            v.secure_boot_keys = Some(SecureBootKeys::Setup);
+            meta.variants = vec![v.clone()];
+            let text = meta.to_wcl();
+            assert!(
+                text.contains(&format!("secure_boot_keys = \"{}\"", keys.as_str())),
+                "{text}"
+            );
+            let back = TemplateMeta::from_wcl(&text, "<test>").unwrap();
+            assert_eq!(back, meta);
+            assert_eq!(
+                back.effective(Some(&v)).secure_boot_keys,
+                Some(SecureBootKeys::Setup)
+            );
+            assert_eq!(back.effective(None).secure_boot_keys, Some(keys));
+        }
+        let text = full_meta().to_wcl().replace(
+            "secure_boot_keys = \"setup\"",
+            "secure_boot_keys = \"tpm-sealed\"",
+        );
+        let back = TemplateMeta::from_wcl(&text, "<test>").unwrap();
+        assert_eq!(back.secure_boot_keys, None);
     }
 
     #[test]
@@ -961,6 +1022,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,

@@ -338,6 +338,8 @@ template "<name>" {
 | `firmware` | utf8 | from profile | Firmware: `ovmf` or `seabios`. |
 | `tpm` | bool | from profile | Enable a TPM 2.0 device. |
 | `secure_boot` | bool | from profile | Enable secure boot; OVMF only. |
+| `secure_boot_keys` | utf8 | from profile, else `microsoft` | Key store for the build's secure boot: `microsoft` or `setup`. Recorded for clones. A variant may override it. |
+| `secure_boot_vars` | utf8 | none | Pre-enrolled UEFI VARS file (relative to the template root) the build boots with; stored beside the sealed disk as `OVMF_VARS.fd` so clones start from it. Exclusive with `secure_boot_keys`. |
 | `nested` | bool | `false` | Enable nested virtualisation for the build VM. |
 | `gui` | bool | `false` | Watch the build VM in a VNC viewer. |
 | `qemu_args` | list<utf8> | none | Raw QEMU flags for the build VM. The escape hatch. |

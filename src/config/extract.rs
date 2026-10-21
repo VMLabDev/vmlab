@@ -586,6 +586,8 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let tpm = r.bool("tpm").unspan();
     let usb = r.bool("usb").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
+    let secure_boot_keys = r.keyword("secure_boot_keys", SECURE_BOOT_KEYS).unspan();
+    let secure_boot_vars = r.path("secure_boot_vars").unspan();
     let qemu_args = r.string_list("qemu_args");
     let dev = extract_dev(&mut r);
     let mut gpu = None;
@@ -659,6 +661,8 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         tpm,
         usb,
         secure_boot,
+        secure_boot_keys,
+        secure_boot_vars,
         qemu_args,
         gpu,
         nics,
@@ -946,6 +950,8 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
+    let secure_boot_keys = r.keyword("secure_boot_keys", SECURE_BOOT_KEYS).unspan();
+    let secure_boot_vars = r.path("secure_boot_vars").unspan();
     let nested = r.bool("nested").unspan().unwrap_or(false);
     let gui = r.bool("gui").unspan().unwrap_or(false);
     let qemu_args = r.string_list("qemu_args");
@@ -970,6 +976,8 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         firmware,
         tpm,
         secure_boot,
+        secure_boot_keys,
+        secure_boot_vars,
         nested,
         gui,
         qemu_args,
@@ -1028,6 +1036,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
     let secure_boot = r.bool("secure_boot").unspan();
+    let secure_boot_keys = r.keyword("secure_boot_keys", SECURE_BOOT_KEYS).unspan();
     let qemu_args = r.opt_string_list("qemu_args");
     Some(TemplateVariantDef {
         name: name?,
@@ -1044,6 +1053,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
         firmware,
         tpm,
         secure_boot,
+        secure_boot_keys,
         qemu_args,
         gpu,
         media,

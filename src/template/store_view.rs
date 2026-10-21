@@ -113,6 +113,10 @@ pub struct TemplateSummary {
     pub firmware: Option<String>,
     pub tpm: Option<bool>,
     pub secure_boot: Option<bool>,
+    /// The key store secure boot starts from (§5.2): `microsoft`, `setup`, or
+    /// `vars` for a template carrying its own pre-enrolled VARS file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure_boot_keys: Option<String>,
     pub display: Option<String>,
     pub cpu_model: Option<String>,
     pub accel: Option<String>,
@@ -141,6 +145,7 @@ impl From<&TemplateMeta> for TemplateSummary {
             firmware: t.firmware.clone(),
             tpm: t.tpm,
             secure_boot: t.secure_boot,
+            secure_boot_keys: t.secure_boot_keys.map(|k| k.as_str().to_string()),
             display: t.display.clone(),
             cpu_model: t.cpu_model.clone(),
             accel: t.accel.map(|a| a.as_str().to_string()),

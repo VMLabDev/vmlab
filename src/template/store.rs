@@ -23,6 +23,17 @@ use crate::config::model::{BASE_VARIANT, VariantRef};
 
 /// Disk image file name inside a version directory.
 pub const DISK_FILE: &str = "disk.qcow2";
+/// The pre-enrolled UEFI VARS file a version built with `secure_boot_vars`
+/// carries beside its disk (§5.2); its clones' variable stores start from
+/// it. Present exactly when the metadata records `secure_boot_keys = "vars"`.
+pub const VARS_FILE: &str = "OVMF_VARS.fd";
+
+/// The VARS file a version directory carries, when the effective metadata
+/// says its clones start from one.
+pub fn template_vars(dir: &Path, meta: &TemplateMeta) -> Option<PathBuf> {
+    (meta.secure_boot_keys == Some(crate::config::model::SecureBootKeys::Vars))
+        .then(|| dir.join(VARS_FILE))
+}
 const LOCK_FILE: &str = ".lock";
 const STAGING_PREFIX: &str = ".staging-";
 
@@ -288,6 +299,15 @@ impl TemplateStore {
             "staging directory {} contains no {DISK_FILE}",
             staging.display()
         );
+        ensure!(
+            template_vars(staging, meta).is_none_or(|vars| vars.is_file()),
+            "template {}/{}@{} records secure_boot_keys = \"vars\" but its staging directory {} \
+             carries no {VARS_FILE}",
+            meta.arch,
+            meta.name,
+            meta.version,
+            staging.display()
+        );
         let dest = self.version_dir(&meta.arch, &meta.name, &meta.version);
         if dest.exists() {
             if !overwrite {
@@ -485,6 +505,11 @@ impl TemplateStore {
             .context("cannot archive template.wcl")?;
         tar.append_path_with_name(&resolved.disk_path, DISK_FILE)
             .context("cannot archive disk.qcow2")?;
+        let vars = resolved.dir.join(VARS_FILE);
+        if vars.is_file() {
+            tar.append_path_with_name(&vars, VARS_FILE)
+                .context("cannot archive the template's UEFI VARS")?;
+        }
         for v in &resolved.meta.variants {
             let rel = variant_disk_rel(&v.name);
             tar.append_path_with_name(resolved.dir.join(&rel), &rel)
@@ -989,6 +1014,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -1427,6 +1453,37 @@ mod tests {
     // ---- export / import --------------------------------------------------------
 
     #[test]
+    fn a_vars_template_carries_its_vars_file_through_install_and_export() {
+        let (_tmp, store) = new_store();
+        let mut m = meta("x86_64", "mkosi", "1");
+        m.secure_boot_keys = Some(crate::config::model::SecureBootKeys::Vars);
+        // Recording `vars` with no file staged is refused.
+        let err = install(&store, &m, b"disk").unwrap_err().to_string();
+        assert!(err.contains(VARS_FILE), "{err}");
+
+        fs::create_dir_all(store.root()).unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap().keep();
+        fs::write(staging.join(DISK_FILE), b"disk").unwrap();
+        fs::write(staging.join(VARS_FILE), b"enrolled").unwrap();
+        store.install(&staging, &m, false).unwrap();
+        let r = store.resolve_version("x86_64", "mkosi", None).unwrap();
+        let vars = template_vars(&r.dir, &r.meta).unwrap();
+        assert_eq!(fs::read(&vars).unwrap(), b"enrolled");
+
+        let out = tempfile::tempdir().unwrap();
+        let archive = out.path().join("mkosi.tar.zst");
+        store.export("x86_64", "mkosi", None, &archive).unwrap();
+        let (_tmp2, other) = new_store();
+        let imported = other.import(&archive, false).unwrap();
+        assert_eq!(imported.secure_boot_keys, m.secure_boot_keys);
+        let r = other.resolve_version("x86_64", "mkosi", None).unwrap();
+        assert_eq!(fs::read(r.dir.join(VARS_FILE)).unwrap(), b"enrolled");
+
+        // A template recording no file names none.
+        assert_eq!(template_vars(&r.dir, &meta("x86_64", "x", "1")), None);
+    }
+
+    #[test]
     fn export_import_round_trip() {
         let (_tmp, store) = new_store();
         let disk_bytes = b"pretend qcow2 bytes".as_slice();
@@ -1554,6 +1611,7 @@ mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,

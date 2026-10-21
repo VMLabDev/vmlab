@@ -9,8 +9,9 @@ use super::model::*;
 use super::{Issue, IssueList};
 use crate::profiles::Profile;
 use crate::qemu::resolve::{
-    Layer, default_profile, effective_profile_name, nested_cpu_model_conflict, nested_tcg_conflict,
-    resolve_accel, resolve_cpu_model, resolve_firmware, vm_arch,
+    Layer, default_profile, effective_profile_name, key_store_conflict, nested_cpu_model_conflict,
+    nested_tcg_conflict, resolve_accel, resolve_cpu_model, resolve_firmware, resolve_key_store,
+    vm_arch,
 };
 use crate::template::TemplateMeta;
 use crate::template::meta::Purpose;
@@ -306,6 +307,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 &mut issues,
             );
         }
+        check_key_store_declaration(
+            &format!("vm \"{}\"", vm.name),
+            vm.span,
+            vm.secure_boot_keys,
+            vm.secure_boot_vars.as_deref(),
+            &file.root,
+            &mut issues,
+        );
         for path in [&vm.cdrom, &vm.floppy].into_iter().flatten() {
             if !file.root.join(path).is_file() {
                 issues.push(Issue::at(
@@ -602,6 +611,36 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     t.name
                 ),
             ));
+        }
+        let what = format!("template \"{}\"", t.name);
+        check_key_store_declaration(
+            &what,
+            t.span,
+            t.secure_boot_keys,
+            t.secure_boot_vars.as_deref(),
+            &file.root,
+            &mut issues,
+        );
+        // What the block decides by itself; a secure boot the build inherits
+        // is checked by its hardware pre-flight, which resolves the render.
+        let declares_store = t.secure_boot_vars.is_some()
+            || t.secure_boot_keys
+                .is_some_and(|k| k != SecureBootKeys::Microsoft);
+        if declares_store {
+            check_template_key_store(&what, t.span, t.secure_boot, t.firmware, &mut issues);
+        }
+        for v in &t.variants {
+            if v.secure_boot_keys
+                .is_some_and(|k| k != SecureBootKeys::Microsoft)
+            {
+                check_template_key_store(
+                    &format!("template \"{}\" variant \"{}\"", t.name, v.name),
+                    v.span,
+                    v.secure_boot,
+                    v.firmware,
+                    &mut issues,
+                );
+            }
         }
         // Likewise its `accel`: nested virtualisation needs KVM (§5.2).
         if t.nested && t.accel == Some(AccelMode::Tcg) {
@@ -938,6 +977,7 @@ fn check_vm_hardware(
         issues.push(Issue::at(vm.span, format!("unknown profile \"{p}\"")));
     }
     check_secure_boot(vm, ctx, issues);
+    check_key_store(vm, ctx, issues);
     check_nested_cpu_model(vm, ctx, issues);
     check_nested_tcg(vm, ctx, issues);
 }
@@ -1035,6 +1075,102 @@ fn check_secure_boot(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueLis
     issues.push(Issue::at(
         vm.span,
         choice.conflict_message(&vm.name, profile_name.as_deref()),
+    ));
+}
+
+/// A UEFI key store (`secure_boot_keys` other than Microsoft's, or
+/// `secure_boot_vars`) only means anything under secure boot (§5.2). Either
+/// side may have been inherited, so this resolves the chain and names the
+/// layer each came from; a store inherited from below the layer that turned
+/// secure boot off is no conflict ([`key_store_conflict`]).
+fn check_key_store(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueList) {
+    let layer = TemplateLayer::of(vm, ctx);
+    let Some(arch) = vm_arch(vm) else { return };
+    let profile_name = effective_profile_name(vm, layer.meta());
+    let profile = match &profile_name {
+        Some(name) => match ctx.profile(name) {
+            Some(p) => p,
+            None => return,
+        },
+        None => default_profile(),
+    };
+    let choice = resolve_firmware(vm, layer.meta(), &profile, &arch);
+    let (store, store_layer) = resolve_key_store(vm, layer.meta(), &profile);
+    // With the template layer unknown, the template could turn secure boot
+    // on, or supply the store: only the vm block deciding both is certain.
+    let certain =
+        layer.is_known() || (store_layer == Layer::Vm && choice.secure_boot_layer == Layer::Vm);
+    if !certain {
+        return;
+    }
+    if let Some(why) = key_store_conflict(
+        &vm.name,
+        &store,
+        store_layer,
+        &choice,
+        profile_name.as_deref(),
+    ) {
+        issues.push(Issue::at(vm.span, why));
+    }
+}
+
+/// The checks a key-store declaration needs on its own block, wherever it
+/// is declared: `secure_boot_vars` replaces the store `secure_boot_keys`
+/// picks, so the two cannot both be set, and the file has to be there.
+fn check_key_store_declaration(
+    what: &str,
+    span: Span,
+    keys: Option<SecureBootKeys>,
+    vars: Option<&Path>,
+    root: &Path,
+    issues: &mut IssueList,
+) {
+    let Some(vars) = vars else { return };
+    if let Some(keys) = keys {
+        issues.push(Issue::at(
+            span,
+            format!(
+                "{what}: secure_boot_keys = \"{}\" and secure_boot_vars are both set — \
+                 secure_boot_vars is a pre-enrolled key store of its own, and setup mode a \
+                 blank one; set one or the other (PRD §5.2)",
+                keys.as_str()
+            ),
+        ));
+    }
+    if !root.join(vars).is_file() {
+        issues.push(Issue::at(
+            span,
+            format!(
+                "{what}: secure_boot_vars {} does not exist or is not a file",
+                vars.display()
+            ),
+        ));
+    }
+}
+
+/// A template or variant block declaring a key store beside its own
+/// `secure_boot = false` or `firmware = "seabios"`: the store would be read
+/// nowhere (§5.2).
+fn check_template_key_store(
+    what: &str,
+    span: Span,
+    secure_boot: Option<bool>,
+    firmware: Option<Firmware>,
+    issues: &mut IssueList,
+) {
+    let why = if secure_boot == Some(false) {
+        "secure_boot = false"
+    } else if firmware == Some(Firmware::Seabios) {
+        "firmware = \"seabios\""
+    } else {
+        return;
+    };
+    issues.push(Issue::at(
+        span,
+        format!(
+            "{what}: a UEFI key store (secure_boot_keys / secure_boot_vars) but {why} on the same \
+             block — a key store only means anything under secure boot (PRD §5.2)"
+        ),
     ));
 }
 
@@ -1639,6 +1775,7 @@ pub(crate) mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -1777,6 +1914,7 @@ pub(crate) mod tests {
             firmware: None,
             tpm: None,
             secure_boot: None,
+            secure_boot_keys: None,
             display: None,
             cpu_model: None,
             accel: None,
@@ -1911,6 +2049,158 @@ lab "l" { vm "a" { template = "x86_64/t" } }"#,
 lab "l" { vm "a" { template = "scratch" arch = "x86_64" profile = "windows-legacy"
   disk = 10GiB secure_boot = true } }"#,
             ["profile \"windows-legacy\""].as_slice(),
+        );
+    }
+
+    /// Validate `src` with `keys/v.fd` (540 bytes) present under the root.
+    fn key_store_errs(ctx: &Hardware, src: &str) -> Vec<String> {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("keys")).unwrap();
+        std::fs::write(root.path().join("keys/v.fd"), vec![0u8; 540]).unwrap();
+        let f = load_lab_source(src, "<test>", root.path()).expect("source should parse");
+        validate(&f, ctx).into_iter().map(|i| i.message).collect()
+    }
+
+    /// `secure_boot_keys` / `secure_boot_vars` only mean anything under
+    /// secure boot: declared where it is off — by the vm block, a profile or
+    /// vmlab's default — validation names both layers; under it they pass.
+    #[test]
+    fn a_key_store_without_secure_boot_is_rejected_naming_the_layers() {
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern" secure_boot_keys = "setup" } }"#,
+        );
+        assert!(
+            es.iter().any(
+                |m| m.contains("secure_boot_keys = \"setup\" (from the vm block)")
+                    && m.contains("secure_boot = false (from profile \"linux-modern\")")
+            ),
+            "{es:#?}"
+        );
+
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-11" secure_boot = false
+  secure_boot_vars = "keys/v.fd" } }"#,
+        );
+        assert!(
+            es.iter().any(
+                |m| m.contains("secure_boot_vars = \"keys/v.fd\" (from the vm block)")
+                    && m.contains("secure_boot = false (from the vm block)")
+            ),
+            "{es:#?}"
+        );
+
+        // SeaBIOS with nothing turning secure boot on: vmlab's default.
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-legacy" secure_boot_keys = "setup" } }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("UEFI key store")), "{es:#?}");
+
+        // Under secure boot, both forms validate.
+        for decl in [
+            r#"secure_boot_keys = "setup""#,
+            r#"secure_boot_vars = "keys/v.fd""#,
+        ] {
+            let es = key_store_errs(
+                &Hardware::blank(),
+                &format!(
+                    "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"x86_64/t\" \
+                     profile = \"windows-11\" {decl} }} }}"
+                ),
+            );
+            assert!(
+                !es.iter()
+                    .any(|m| m.contains("key store") || m.contains("secure_boot_vars")),
+                "{decl}: {es:#?}"
+            );
+        }
+
+        // An unknown template layer could turn secure boot on: not certain.
+        let es = key_store_errs(
+            &Hardware::missing_template(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" secure_boot_keys = "setup" } }"#,
+        );
+        assert!(!es.iter().any(|m| m.contains("UEFI key store")), "{es:#?}");
+    }
+
+    /// `secure_boot_vars` is a key store of its own: naming
+    /// `secure_boot_keys` beside it is refused, and the file has to exist.
+    #[test]
+    fn secure_boot_vars_is_exclusive_and_must_exist() {
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-11"
+  secure_boot_keys = "setup" secure_boot_vars = "keys/v.fd" } }"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m
+                    .contains("secure_boot_keys = \"setup\" and secure_boot_vars are both set")),
+            "{es:#?}"
+        );
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-11"
+  secure_boot_vars = "keys/missing.fd" } }"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("secure_boot_vars keys/missing.fd does not exist")),
+            "{es:#?}"
+        );
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "windows-11"
+  secure_boot_vars = "keys" } }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("is not a file")), "{es:#?}");
+    }
+
+    /// A template block declaring a key store beside its own
+    /// `secure_boot = false` is refused, as is the pair on one block.
+    #[test]
+    fn a_template_key_store_needs_secure_boot_on_its_block() {
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86_64" version = "1" disk = 10GiB secure_boot = false
+  secure_boot_keys = "setup" source "scratch" {} }"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("template \"t\": a UEFI key store")
+                    && m.contains("secure_boot = false")),
+            "{es:#?}"
+        );
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86_64" version = "1" disk = 10GiB secure_boot = true firmware = "ovmf"
+  secure_boot_keys = "setup" secure_boot_vars = "keys/v.fd" source "scratch" {} }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("are both set")), "{es:#?}");
+        let es = key_store_errs(
+            &Hardware::blank(),
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86_64" version = "1" disk = 10GiB secure_boot = true firmware = "ovmf"
+  secure_boot_vars = "keys/v.fd" source "scratch" {} }"#,
+        );
+        assert!(
+            !es.iter()
+                .any(|m| m.contains("key store") || m.contains("secure_boot_vars")),
+            "{es:#?}"
         );
     }
 
