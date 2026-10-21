@@ -485,3 +485,50 @@ fn an_identical_repeat_with_a_zero_hotspot_is_treated_as_stale() {
     core.cursor(secs(1.0), dot([0, 0, 0, 255], (0, 0)));
     assert!(core.draws_pointer(), "a different shape is drawn");
 }
+
+/// Alpha cursor pixels arrive premultiplied, so they are added to what is
+/// left of the pixel beneath, not blended as straight alpha. The figures are
+/// the ones measured live: ComixCursors-Blue's most opaque pixel reaches the
+/// recorder as (78,162,179) at alpha 190.
+#[test]
+fn alpha_cursor_pixels_blend_as_premultiplied() {
+    let size = Size::new(4, 4);
+    let bg = [40, 120, 60];
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 4, 4);
+    core.rect(secs(0.0), 0, 0, 4, 4, &solid(4, 4, bg));
+    core.input(secs(0.01), InputEvent::Move { x: 2, y: 2 });
+    core.cursor(secs(0.02), dot([78, 162, 179, 190], (0, 0)));
+    let frame = core.tick(secs(0.1)).pop().unwrap();
+    let got = pixel(&frame, size, 2, 2);
+    // src + dst * (1 - 190/255) = (88.2, 192.6, 194.3)
+    let premultiplied: [i32; 3] = [88, 193, 194];
+    // src * a + dst * (1 - a) would give (68, 151, 149): too dark.
+    let straight: [i32; 3] = [68, 151, 149];
+    for c in 0..3 {
+        assert!(
+            (i32::from(got[c]) - premultiplied[c]).abs() <= 1,
+            "channel {c}: got {got:?}, want {premultiplied:?}"
+        );
+        assert!((i32::from(got[c]) - straight[c]).abs() > 10);
+    }
+    assert_eq!(pixel(&frame, size, 1, 1), bg, "neighbour untouched");
+}
+
+/// A fully opaque pixel replaces the background and a fully transparent one
+/// leaves it, under either reading of alpha, which is what a RichCursor's
+/// 1-bit mask relies on.
+#[test]
+fn opaque_and_transparent_cursor_pixels_are_exact() {
+    let size = Size::new(4, 4);
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 4, 4);
+    core.rect(secs(0.0), 0, 0, 4, 4, &solid(4, 4, GREEN));
+    core.input(secs(0.01), InputEvent::Move { x: 1, y: 1 });
+    core.cursor(secs(0.02), dot([200, 10, 30, 255], (0, 0)));
+    let frame = core.tick(secs(0.1)).pop().unwrap();
+    assert_eq!(pixel(&frame, size, 1, 1), [200, 10, 30]);
+    core.cursor(secs(0.11), dot([200, 10, 30, 0], (0, 0)));
+    let frame = core.tick(secs(0.2)).pop().unwrap();
+    assert_eq!(pixel(&frame, size, 1, 1), GREEN);
+}

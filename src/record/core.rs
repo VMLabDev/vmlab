@@ -80,7 +80,10 @@ pub struct CursorShape {
     pub hotspot: (u16, u16),
     pub width: u16,
     pub height: u16,
-    /// Straight-alpha RGBA.
+    /// Premultiplied-alpha RGBA: what a Linux guest uploads to the virtio-gpu
+    /// cursor plane (DRM's default plane blend mode) and what QEMU relays,
+    /// measured live on GNOME and KDE (acceptance F2). A RichCursor's 1-bit
+    /// mask yields alpha 0 or 255, which is premultiplied and straight alike.
     pub rgba: Vec<u8>,
 }
 
@@ -519,6 +522,7 @@ impl Placement {
     }
 }
 
+/// Straight-alpha blend of `colour` over the pixel at `(x, y)`.
 fn blend(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 3], alpha: f64) {
     if x < 0 || y < 0 || x >= i64::from(size.width) || y >= i64::from(size.height) {
         return;
@@ -527,6 +531,21 @@ fn blend(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 3], alpha: f64
     for c in 0..3 {
         let base = f64::from(rgb[i + c]);
         rgb[i + c] = (base + (f64::from(colour[c]) - base) * alpha)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Premultiplied-alpha blend: `colour` already carries its alpha, so it is
+/// added to what is left of the pixel beneath (`src + dst * (1 - a)`).
+fn blend_premultiplied(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 3], alpha: f64) {
+    if x < 0 || y < 0 || x >= i64::from(size.width) || y >= i64::from(size.height) {
+        return;
+    }
+    let i = ((y as u32 * size.width + x as u32) * 3) as usize;
+    for c in 0..3 {
+        let base = f64::from(rgb[i + c]);
+        rgb[i + c] = (f64::from(colour[c]) + base * (1.0 - alpha))
             .round()
             .clamp(0.0, 255.0) as u8;
     }
@@ -549,7 +568,7 @@ fn draw_cursor(rgb: &mut [u8], size: Size, p: &Placement, cursor: &CursorShape, 
             let i = ((sy * u32::from(cursor.width) + sx) * 4) as usize;
             let a = f64::from(cursor.rgba[i + 3]) / 255.0;
             if a > 0.0 {
-                blend(
+                blend_premultiplied(
                     rgb,
                     size,
                     x0 + dx,
