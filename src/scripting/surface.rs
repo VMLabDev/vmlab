@@ -32,8 +32,10 @@ pub(crate) struct EmbeddedWscript {
 /// `seg.unroute_to()` work rather than fail. Three adds host USB passthrough
 /// (§5.2.1): `lab.usb_devices()` and, on the machine handle, `usb_attach()`,
 /// `usb_attach_force()`, `usb_detach()`, `usb_detach_all()` and
-/// `usb_attached()`.
-pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(3);
+/// `usb_attached()`. Four adds console recording (§11.1): `record()` on the
+/// machine handle and the `Recording` handle it returns, with `stop()` and
+/// `path()`.
+pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(4);
 /// Oldest stamped surface this host promises to compile. Unstamped templates
 /// are legacy and remain accepted through compatibility aliases.
 const MIN_WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(1);

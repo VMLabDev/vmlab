@@ -4863,6 +4863,80 @@ lab "t" {
         }
     }
 
+    /// `m.record` from a script: a relative path lands under the lab root, the
+    /// handle's `stop` finalises, and a recording left open is finalised when
+    /// the run ends.
+    #[tokio::test]
+    async fn a_script_records_through_the_machine_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, _sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        let said = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            Arc::new(move |s: String| said.lock().unwrap().push(s.trim_end().to_string()))
+        };
+        let script = r#"use vmlab
+
+fn main(lab: Lab) {
+    let Ok(a) = lab.machine("a") else { return }
+    let r = a.record("out/a.mp4", #{ "fps": "10", "size": "32x16" }).expect("record")
+    lab.log("path " + r.path())
+    let stopped = r.stop().expect("stop")
+    lab.log("stopped " + stopped)
+    match r.stop() {
+        Ok(_) => lab.log("stopped twice?"),
+        Err(e) => lab.log("again: " + e),
+    }
+    let Ok(b) = lab.machine("b") else { return }
+    let open = b.record("", #{ "fps": "10", "size": "32x16" }).expect("record b")
+    lab.log("b " + open.path())
+    match a.record("x.gif", #{}) {
+        Ok(_) => lab.log("gif?"),
+        Err(e) => lab.log("refused: " + e),
+    }
+}
+"#;
+        crate::scripting::run_script_source(
+            lab.clone(),
+            script.to_string(),
+            "<test>",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            sink,
+        )
+        .await
+        .expect("script");
+        let said = said.lock().unwrap().clone();
+        let expected = lab.root.join("out/a.mp4").display().to_string();
+        assert!(
+            said.iter().any(|l| *l == format!("path {expected}")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|l| *l == format!("stopped {expected}")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("again: ") && l.contains("not recording")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("refused: ") && l.contains(".gif")),
+            "{said:?}"
+        );
+        assert!(
+            lab.recordings.live_machines().await.is_empty(),
+            "the run finalised b's"
+        );
+        let b_path = said.iter().find(|l| l.starts_with("b ")).unwrap();
+        assert!(std::path::Path::new(&b_path[2..]).exists(), "{b_path}");
+    }
+
     /// `--record` on a start verb: checked and armed first, started in the
     /// machine's paused window (the recorder is attached before the CPUs
     /// run), and a second request for a machine already recording refused.

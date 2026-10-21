@@ -4,6 +4,7 @@
 //! execute on blocking threads and host methods bridge into the lab
 //! daemon's tokio runtime via `Handle::block_on`.
 
+pub mod record;
 mod runner;
 mod surface;
 pub mod terminal;
@@ -368,6 +369,45 @@ impl MachineHandle {
             first_boot_gated: self.first_boot_gated,
             logon,
             run: self.run,
+        })
+    }
+
+    /// `m.record(path, opts)` (§11.1): start recording this machine's
+    /// console. An empty `path` takes the lab's default; a relative one is
+    /// against the lab root. The recording belongs to this script's run, so
+    /// the daemon finalises it when the run ends if the script does not.
+    fn record(
+        &self,
+        path: &str,
+        opts: &std::collections::HashMap<String, String>,
+    ) -> Result<record::RecordingHandle, String> {
+        let options = record::parse_opts(opts)?;
+        let path = if path.is_empty() {
+            None
+        } else {
+            let p = std::path::Path::new(path);
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.runtime.root.join(p)
+            };
+            Some(abs.display().to_string())
+        };
+        let runtime = self.runtime.clone();
+        let machine = self.name().to_string();
+        let run = self.run;
+        let started = self
+            .block(async move {
+                runtime
+                    .record_start(&machine, path.as_deref(), &options, Some(run))
+                    .await
+            })
+            .map_err(estr)?;
+        Ok(record::RecordingHandle {
+            machine: started.machine,
+            path: started.path.display().to_string(),
+            runtime: self.runtime.clone(),
+            rt: self.rt.clone(),
         })
     }
 
@@ -982,6 +1022,13 @@ pub fn lab_module() -> Module {
             },
         )
         .method(
+            "record",
+            |h: &MachineHandle,
+             path: String,
+             opts: std::collections::HashMap<String, String>|
+             -> Result<record::RecordingHandle, String> { h.record(&path, &opts) },
+        )
+        .method(
             "wait_for_image",
             |h: &MachineHandle, image: String, timeout_secs: i64| -> Result<ScriptMatch, String> {
                 h.wait_for(&[image], 0.9, vec![], timeout_secs, 1000)
@@ -1212,6 +1259,13 @@ pub fn lab_module() -> Module {
         });
 
     // -- Terminal sessions (send/expect) ---------------------------------------
+    m.ty::<record::RecordingHandle>()
+        .method(
+            "stop",
+            |r: &record::RecordingHandle| -> Result<String, String> { r.stop() },
+        )
+        .method("path", |r: &record::RecordingHandle| -> String { r.path() });
+
     m.ty::<terminal::TerminalHandle>()
         .method(
             "send",
@@ -1535,6 +1589,28 @@ fn main(lab: Lab) {
         assert!(script_logins(&[], GuestOs::Windows).is_empty());
     }
 
+    /// The console recording surface (surface 4): `record` with and without
+    /// options, and the handle's `stop` and `path`.
+    #[test]
+    fn record_api_compiles() {
+        let src = r#"
+use vmlab
+
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let r = vm.record("demo.mp4", #{ "compress_idle": "2", "timeline": "true" }).expect("record")
+    lab.log("recording to " + r.path())
+    let plain = vm.record("", #{}).expect("default path")
+    match plain.stop() {
+        Ok(path) => lab.log("finalised " + path),
+        Err(e) => lab.log(e),
+    }
+    let done: string = r.stop().expect("stop")
+}
+"#;
+        check_script_source(src).expect("record API surface should type-check");
+    }
+
     #[test]
     fn terminal_api_compiles() {
         // The send/expect terminal handle + metrics, on VMs and containers.
@@ -1639,6 +1715,7 @@ fn main(lab: Lab) {
         ensure_wscript_surface_supported("x86_64/win11@v1", Some(1.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@v2", Some(2.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@v3", Some(3.into())).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@v4", Some(4.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@current", Some(WSCRIPT_SURFACE_VERSION))
             .unwrap();
     }
@@ -1646,10 +1723,10 @@ fn main(lab: Lab) {
     #[test]
     fn a_template_above_the_surface_ceiling_asks_for_a_newer_vmlab() {
         let err =
-            ensure_wscript_surface_supported("x86_64/win11@newer", Some(4.into())).unwrap_err();
+            ensure_wscript_surface_supported("x86_64/win11@newer", Some(5.into())).unwrap_err();
         assert_eq!(
             err,
-            "template `x86_64/win11@newer` records wscript surface 4, newer than this host's 3; \
+            "template `x86_64/win11@newer` records wscript surface 5, newer than this host's 4; \
              upgrade vmlab to use it"
         );
     }
