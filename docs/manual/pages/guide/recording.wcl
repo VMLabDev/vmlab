@@ -69,10 +69,25 @@ still shows the last shape QEMU sent, because QEMU does not report the hide.
 DOC
 
   p <<'DOC'
+Across a guest reboot the pointer disappears and comes back. QEMU never
+clears a cursor shape; it re-announces the last one, with its hotspot zeroed,
+when the display resets and again with every resolution change through the
+boot. The recorder recognises that repeat and hides the pointer instead of
+drawing the old desktop's arrow over the firmware, the kernel's text and the
+login screen; the pointer returns once the greeter or the desktop defines a
+shape of its own. The same happens when a running desktop changes resolution:
+the pointer is hidden for the moment until the compositor defines its cursor
+again. A cursor whose own hotspot is at (0,0) cannot be told from QEMU's
+repeat of it, so after a reset it stays hidden until the guest sends a
+different shape.
+DOC
+
+  p <<'DOC'
 Every click vmlab sends, and both ends of a drag, gets an amber ripple at the
 click point that grows and fades over half a second. The ripple is drawn
 whether or not a cursor shape is known, so a click on a std VGA guest is
-still visible in the video.
+still visible in the video, and it is drawn beneath the pointer, so the
+pointer keeps its colours while the ripple plays.
 DOC
 
   h2 "Idle compression"
