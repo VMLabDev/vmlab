@@ -34,4 +34,8 @@ type Profile {
   // Linux. A profile setting none of them still hosts a dev machine — a
   // missing key means the vmlab floor applies (src/dev.rs).
   workspace_guest: utf8?  // guest path an `@dev` workspace lands at
+  // Absolute guest directory a `playbook {}` block pushes config-weave and its
+  // playbook folders into when the block names no `guest_dir` (unset = the
+  // family default: /var/lib/vmlab/weave on Linux, C:\weave on Windows).
+  playbook_dir: utf8?
 }

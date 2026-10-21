@@ -503,6 +503,10 @@ type Playbook {
   play: utf8
   @doc("Ceiling on each config-weave run, e.g. `2h`; a run after a reboot gets the full value again (default 1h)")
   @range(1) @default(1h) timeout: std.Duration?
+  @doc("Absolute guest directory the config-weave binary and the playbook folders land in (default: the profile's `playbook_dir`, else `/var/lib/vmlab/weave` on Linux and `C:\\weave` on Windows)")
+  guest_dir: utf8?
+  @doc("Absolute path of a config-weave binary already in the guest; when set vmlab pushes no binary and runs this one (must end in `.exe` on Windows)")
+  guest_bin: utf8?
   @doc("Variable overrides passed to config-weave for this machine's run")
   @children("var") vars: list<PlaybookVar>
 }

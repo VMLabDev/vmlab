@@ -3,7 +3,7 @@ page guide_playbooks {
   chapter_header "Playbooks" {
     kicker       = "The guide · explanation"
     reading_time = "7 min read"
-    updated      = "2026-10-08"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -71,19 +71,57 @@ DOC
   p <<'DOC'
 Before anything boots, `vmlab up` checks that the binary each targeted
 machine will need exists on the host and fails naming it if not. A guest whose
-architecture is not x86_64 cannot run a playbook at all.
+architecture is not x86_64 cannot run a pushed binary.
+DOC
+
+  p <<'DOC'
+The pushed binary and the playbook folders land in one guest directory:
+`/var/lib/vmlab/weave` on Linux and `C:\weave` on Windows. The Linux default
+is under `/var` because `/var` stays writable on a guest whose root is
+read-only, such as an image-based or verity-rooted system, and it persists
+across reboots. `guest_dir` on the block moves it for that block, and
+`playbook_dir` on a [guest OS profile](guide_profiles) moves it for every
+machine running that profile. The block wins over the profile, and the
+profile over the default. vmlab creates the directory before pushing; if it
+cannot, the error names the directory.
+DOC
+
+  p <<'DOC'
+Some images ship config-weave themselves. For those, `guest_bin` names the
+binary already in the guest, as an absolute path. vmlab then pushes no binary
+and needs no host-side one, so the preflight above and the x86_64 limit do
+not apply to that block. Before each run it probes `<guest_bin> version`, and
+fails naming the path if the binary is missing or does not answer. The
+playbook folder is still pushed to the guest directory.
+DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+playbook "playbooks/baseline" {
+  play      = "baseline"
+  guest_dir = "/var/lib/weave"           // where the playbook folder goes
+  guest_bin = "/usr/bin/config-weave"    // run this one; push none
+}
+SRC
+  }
+
+  p <<'DOC'
+`vmlab validate` rejects a `guest_dir` or `guest_bin` that is not absolute
+for the machine's guest family: a drive-letter path on Windows, a path
+starting with `/` on Linux, and either where the family is unknown. On
+Windows a `guest_bin` must also end in `.exe`.
 DOC
 
   h2 "What a run does"
 
   p <<'DOC'
 A run, whether from `vmlab up` or from `vmlab playbook check` or `apply`,
-waits for the machine's agent, then does four things in order.
+waits for the machine's agent, then does five things in order.
 DOC
 
   list { style = :numbered
-    li "**Ensure the guest binary.** vmlab remembers the SHA-256 of the binary it last pushed to each machine and probes the guest with `config-weave version`. It pushes again when the host binary changed or the probe fails, which is what happens after a snapshot restore rolls the disk back under a warm cache. The host-side files are named `config-weave-linux-x86_64` and `config-weave-windows-x86_64.exe`; in the guest they land at `/weave/config-weave` on Linux and `C:\\weave\\config-weave.exe` on Windows, with playbook folders under `/weave/playbooks` and `C:\\weave\\playbooks` beside them."
-    li "**Push the playbook folder, every time.** The guest copy is removed and re-pushed on each run so deleted source files never linger. The lab-relative path is flattened into one guest directory name, `playbooks/baseline` becoming `playbooks__baseline`, so two playbooks in one lab cannot collide. A fast edit-then-run loop is the point of always pushing."
+    li "**Make the guest directory.** The block's `guest_dir`, else the profile's `playbook_dir`, else `/var/lib/vmlab/weave` on Linux and `C:\\weave` on Windows. It is created if missing."
+    li "**Ensure the guest binary.** vmlab remembers the SHA-256 of the binary it last pushed to each machine, and the guest path it pushed it to, and probes the guest with `config-weave version`. It pushes again when the host binary changed, the guest directory moved, or the probe fails, which is what happens after a snapshot restore rolls the disk back under a warm cache. The host-side files are named `config-weave-linux-x86_64` and `config-weave-windows-x86_64.exe`; in the guest they land at `<dir>/config-weave` on Linux and `<dir>\\config-weave.exe` on Windows. A block naming `guest_bin` skips the push and probes that binary instead."
+    li "**Push the playbook folder, every time.** The folder lands under `<dir>/playbooks`. The guest copy is removed and re-pushed on each run so deleted source files never linger. The lab-relative path is flattened into one guest directory name, `playbooks/baseline` becoming `playbooks__baseline`, so two playbooks in one lab cannot collide. A fast edit-then-run loop is the point of always pushing."
     li "**Run the verb.** The guest command is `config-weave check|apply <dir> <play> --json --events-ndjson` plus the `--var` pairs. Progress events arrive on stderr as JSON lines and are rendered into human lines on the CLI stream and the lab log; the final `--json` report on stdout is parsed and attached to the completion event."
     li "**Report the verdict.** Infrastructure failures, a push that will not land or a guest that stops answering, are errors. config-weave's own verdict comes back as its exit code: 0 for converged, 1 for a step error, 2 for a validation failure, and 3 for reboot still required."
   }

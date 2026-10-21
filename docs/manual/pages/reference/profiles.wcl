@@ -68,6 +68,7 @@ profile "<name>" {
   input_transport = "qmp"
   virtiofs        = false
   workspace_guest = "/src"
+  playbook_dir    = "/var/lib/vmlab/weave"
 }
 SRC
   }
@@ -93,6 +94,7 @@ SRC
       | "`input_transport`" | "utf8" | "`qmp`" | "How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path." |
       | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
       | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |
+      | "`playbook_dir`" | "utf8" | "unset" | "Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\\…`). Unset, `/var/lib/vmlab/weave` on Linux and `C:\\weave` on Windows." |
   }
   p <<DOC
     The parser enforces the keyword sets above for `machine`, `firmware`,

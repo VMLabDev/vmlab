@@ -294,6 +294,7 @@ in the config.
 | `input_transport` | How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc` (see snapshots-vision.md). |
 | `virtiofs` | Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = "auto"` shares (see shares-media.md). |
 | `workspace_guest` | The guest path an `@dev` workspace lands at when the decorator names none (see dev-machines.md). |
+| `playbook_dir` | The guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`, for a guest whose default location is not writable (see automation.md). |
 
 The profile also classifies the guest as Windows-family or Linux-family, which is
 what the `login {}` validation rules and the Windows preconditions of the workspace
@@ -388,6 +389,7 @@ profile "<name>" {
   input_transport = "qmp"
   virtiofs        = false
   workspace_guest = "/src"
+  playbook_dir    = "/var/lib/vmlab/weave"
 }
 ```
 
@@ -412,6 +414,7 @@ profile "<name>" {
 | `input_transport` | utf8 | `qmp` | How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path. |
 | `virtiofs` | bool | `false` | The guest mounts virtiofs natively, so `transport = "auto"` shares use it instead of SMB. |
 | `workspace_guest` | utf8 | unset | Guest path an `@dev` workspace lands at when the decorator names none. |
+| `playbook_dir` | utf8 | unset | Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\…`). Unset, `/var/lib/vmlab/weave` on Linux and `C:\weave` on Windows. |
 
 The parser enforces the keyword sets above for `machine`, `firmware`, `disk_bus`,
 `accel` and `input_transport`, `cpus` at least 1, and a non-negative `memory`. `nic_model`,

@@ -1997,6 +1997,12 @@ fn synth_spec_lab(
                     wcl_str(&p.play),
                 )
                 .unwrap();
+                if let Some(d) = &p.guest_dir {
+                    write!(s, " guest_dir = {}", wcl_str(d)).unwrap();
+                }
+                if let Some(b) = &p.guest_bin {
+                    write!(s, " guest_bin = {}", wcl_str(b)).unwrap();
+                }
                 for v in &p.vars {
                     write!(
                         s,
@@ -2241,6 +2247,25 @@ mod tests {
         assert_eq!(build.playbooks.len(), 1);
         assert_eq!(build.playbooks[0].vars[0].name, "tz");
         assert_eq!(build.playbooks[0].vars[0].value, "UTC");
+    }
+
+    /// A template playbook's `guest_dir` and `guest_bin` (#169) reach the
+    /// build VM's block — the build is where a read-only image needs them.
+    #[test]
+    fn playbook_guest_paths_carry_into_build_lab() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  playbook \"pb\" { play = \"b\" guest_dir = \"/var/opt/w\" guest_bin = \"/usr/bin/config-weave\" }\n",
+            "}\n"
+        ));
+        let wcl = render(&d);
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let pb = &lf.lab.vms[0].playbooks[0];
+        assert_eq!(pb.guest_dir.as_deref(), Some("/var/opt/w"));
+        assert_eq!(pb.guest_bin.as_deref(), Some("/usr/bin/config-weave"));
     }
 
     /// The synthetic build lab must satisfy the lab schema — `disk`/`memory`

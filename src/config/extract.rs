@@ -497,6 +497,8 @@ fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
     let path = r.label();
     let play = r.required_string("play");
     let timeout = positive_duration(&mut r, "timeout", Playbook::DEFAULT_TIMEOUT);
+    let guest_dir = r.string("guest_dir").unspan();
+    let guest_bin = r.string("guest_bin").unspan();
     let span = r.span();
     let mut vars = Vec::new();
     for child in r.children() {
@@ -511,6 +513,8 @@ fn extract_playbook(b: &Block, issues: &mut IssueList) -> Option<Playbook> {
         play: play?.value,
         timeout,
         vars,
+        guest_dir,
+        guest_bin,
         span,
     })
 }
