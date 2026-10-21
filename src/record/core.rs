@@ -84,6 +84,23 @@ pub struct CursorShape {
     pub rgba: Vec<u8>,
 }
 
+impl CursorShape {
+    /// Whether `other` is QEMU re-announcing this shape rather than the guest
+    /// defining one: the same pixels with the hotspot zeroed. QEMU 11 sends
+    /// exactly that at a virtio-gpu reset and alongside every `DesktopSize`
+    /// through a reboot (acceptance F1), long after the guest that drew the
+    /// shape is gone. A guest redefining its cursor after a mode change sends
+    /// its real hotspot, so it passes; a shape whose own hotspot is (0,0)
+    /// cannot be told apart and is treated as stale, hidden rather than
+    /// drawn wrongly, until the guest sends a different shape.
+    fn is_stale_resend_of(&self, other: &CursorShape) -> bool {
+        other.hotspot == (0, 0)
+            && other.width == self.width
+            && other.height == self.height
+            && other.rgba == self.rgba
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Ripple {
     /// Source (framebuffer) coordinates.
@@ -110,6 +127,9 @@ pub struct Core {
     dirty_area: u64,
     input_in_interval: bool,
     cursor: Option<CursorShape>,
+    /// The last shape the guest itself defined, kept while `cursor` is
+    /// hidden so a stale re-announcement of it can be recognised.
+    defined: Option<CursorShape>,
     /// Last pointer position vmlab sent, source coordinates.
     pointer: Option<(i64, i64)>,
     ripples: Vec<Ripple>,
@@ -136,6 +156,7 @@ impl Core {
             dirty_area: 0,
             input_in_interval: false,
             cursor: None,
+            defined: None,
             pointer: None,
             ripples: Vec::new(),
             intervals: 0,
@@ -240,9 +261,21 @@ impl Core {
         }
     }
 
-    /// The guest defined its cursor shape.
+    /// A cursor shape rectangle arrived. A genuinely new shape is drawn from
+    /// here on; QEMU's re-announcement of the shape already known (see
+    /// [`CursorShape::is_stale_resend_of`]) hides the pointer instead, since
+    /// QEMU only re-announces when the display that drew it was reset.
     pub fn cursor(&mut self, at: Duration, shape: CursorShape) {
         self.advance(at);
+        if self
+            .defined
+            .as_ref()
+            .is_some_and(|d| d.is_stale_resend_of(&shape))
+        {
+            self.cursor = None;
+            return;
+        }
+        self.defined = Some(shape.clone());
         self.cursor = Some(shape);
     }
 

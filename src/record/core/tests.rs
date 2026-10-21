@@ -391,3 +391,97 @@ fn clicks_without_a_point_and_drags_use_the_pointer() {
     assert_ne!(pixel(&frame, size, 50, 50), BLACK);
     assert_eq!(pixel(&frame, size, 35, 35), BLACK);
 }
+
+/// A 1x1 cursor of one premultiplied pixel, hotspot (0,0).
+fn dot(rgba: [u8; 4], hotspot: (u16, u16)) -> CursorShape {
+    CursorShape {
+        hotspot,
+        width: 1,
+        height: 1,
+        rgba: rgba.to_vec(),
+    }
+}
+
+/// QEMU re-announces the last shape with its hotspot zeroed at a virtio-gpu
+/// reset and beside every `DesktopSize` through a reboot. Such a rect hides
+/// the pointer rather than re-arming it, and it stays hidden across the
+/// mode changes that follow until the guest defines a shape of its own.
+#[test]
+fn a_stale_resend_of_the_known_shape_hides_the_pointer() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 8, 8);
+    core.rect(secs(0.0), 0, 0, 8, 8, &solid(8, 8, BLACK));
+    core.input(secs(0.01), InputEvent::Move { x: 4, y: 4 });
+    core.cursor(secs(0.02), arrow());
+    assert!(core.draws_pointer());
+
+    // The reset: same pixels, hotspot (0,0), no DesktopSize with it.
+    let mut stale = arrow();
+    stale.hotspot = (0, 0);
+    core.cursor(secs(0.5), stale.clone());
+    assert!(!core.draws_pointer(), "the reset re-send hides the pointer");
+    let frame = core.tick(secs(0.6)).pop().unwrap();
+    assert!(all(&frame, BLACK));
+
+    // Firmware text mode, then the kernel's mode: each DesktopSize carries
+    // the stale shape again.
+    core.desktop_size(secs(1.0), 4, 2);
+    core.cursor(secs(1.0), stale.clone());
+    assert!(!core.draws_pointer(), "stale with the firmware DesktopSize");
+    core.desktop_size(secs(2.0), 8, 8);
+    core.cursor(secs(2.0), stale);
+    assert!(!core.draws_pointer(), "stale with the kernel DesktopSize");
+
+    // The greeter defines its own cursor: a different shape, drawn again.
+    let mut greeter = arrow();
+    greeter.rgba[0] = 0;
+    core.cursor(secs(3.0), greeter);
+    assert!(core.draws_pointer(), "a genuinely new shape is drawn");
+}
+
+/// A running desktop that changes resolution sends a `DesktopSize` and then
+/// defines its cursor again with the real hotspot. The same pixels with a
+/// non-zero hotspot are the guest's own definition, so the pointer shows
+/// again once it arrives.
+#[test]
+fn a_legitimate_redefinition_after_a_mode_change_shows_the_pointer() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 8, 8);
+    core.rect(secs(0.0), 0, 0, 8, 8, &solid(8, 8, BLACK));
+    core.input(secs(0.01), InputEvent::Move { x: 4, y: 4 });
+    core.cursor(secs(0.02), arrow());
+
+    core.desktop_size(secs(1.0), 4, 4);
+    let mut stale = arrow();
+    stale.hotspot = (0, 0);
+    core.cursor(secs(1.0), stale);
+    assert!(!core.draws_pointer(), "QEMU's re-send with the DesktopSize");
+    core.rect(secs(1.1), 0, 0, 4, 4, &solid(4, 4, GREEN));
+    core.cursor(secs(1.2), arrow());
+    assert!(
+        core.draws_pointer(),
+        "the compositor's own redefinition carries its hotspot"
+    );
+    let frame = core.tick(secs(1.3)).pop().unwrap();
+    assert_eq!(pixel(&frame, size, 6, 6), [255, 255, 255]);
+}
+
+/// A shape whose own hotspot is (0,0) cannot be told from QEMU's re-send of
+/// it: the first definition is drawn, an identical repeat is treated as
+/// stale and hides the pointer, and a different shape shows it again.
+#[test]
+fn an_identical_repeat_with_a_zero_hotspot_is_treated_as_stale() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 8, 8);
+    core.input(secs(0.01), InputEvent::Move { x: 4, y: 4 });
+    let zero = dot([255, 255, 255, 255], (0, 0));
+    core.cursor(secs(0.02), zero.clone());
+    assert!(core.draws_pointer(), "the first definition is genuine");
+    core.cursor(secs(0.5), zero);
+    assert!(!core.draws_pointer(), "an identical repeat is hidden");
+    core.cursor(secs(1.0), dot([0, 0, 0, 255], (0, 0)));
+    assert!(core.draws_pointer(), "a different shape is drawn");
+}
