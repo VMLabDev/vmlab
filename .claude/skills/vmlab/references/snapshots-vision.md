@@ -347,10 +347,16 @@ script; the flags, defaults, refusals and lifecycle are in cli-machine.md
   It is drawn only when QEMU sends a cursor shape (virtio-vga/virtio-gpu, qxl,
   vmware); on std VGA, bochs and cirrus the guest paints its own pointer into
   the framebuffer, so nothing is drawn twice. A virtio-gpu guest hiding its
-  cursor (full-screen video) still shows the last shape.
+  cursor (full-screen video) still shows the last shape. Across a reboot or a
+  resolution change QEMU re-announces the last shape with its hotspot zeroed;
+  the recorder treats that as stale and hides the pointer until the guest
+  defines a shape with its own hotspot (a shape whose hotspot is (0,0) stays
+  hidden until a different one arrives), so no old pointer is drawn over
+  firmware, kernel or login screens. Cursor pixels are blended as the
+  premultiplied alpha the guest uploads.
 - **Ripple.** An amber ripple at every click vmlab sends, and both ends of a
   drag, growing and fading over 0.5 s, drawn whether or not a cursor shape is
-  known.
+  known, beneath the pointer.
 - **Idle compression** (`--compress-idle[=SECS]`, `compress_idle` in `opts`).
   An interval is idle when its framebuffer changes cover at most 64x64 px (a
   blinking caret or a seconds clock does not count; QEMU reports dirt in

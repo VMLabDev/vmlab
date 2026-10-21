@@ -80,8 +80,28 @@ pub struct CursorShape {
     pub hotspot: (u16, u16),
     pub width: u16,
     pub height: u16,
-    /// Straight-alpha RGBA.
+    /// Premultiplied-alpha RGBA: what a Linux guest uploads to the virtio-gpu
+    /// cursor plane (DRM's default plane blend mode) and what QEMU relays,
+    /// measured live on GNOME and KDE (acceptance F2). A RichCursor's 1-bit
+    /// mask yields alpha 0 or 255, which is premultiplied and straight alike.
     pub rgba: Vec<u8>,
+}
+
+impl CursorShape {
+    /// Whether `other` is QEMU re-announcing this shape rather than the guest
+    /// defining one: the same pixels with the hotspot zeroed. QEMU 11 sends
+    /// exactly that at a virtio-gpu reset and alongside every `DesktopSize`
+    /// through a reboot (acceptance F1), long after the guest that drew the
+    /// shape is gone. A guest redefining its cursor after a mode change sends
+    /// its real hotspot, so it passes; a shape whose own hotspot is (0,0)
+    /// cannot be told apart and is treated as stale, hidden rather than
+    /// drawn wrongly, until the guest sends a different shape.
+    fn is_stale_resend_of(&self, other: &CursorShape) -> bool {
+        other.hotspot == (0, 0)
+            && other.width == self.width
+            && other.height == self.height
+            && other.rgba == self.rgba
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +130,9 @@ pub struct Core {
     dirty_area: u64,
     input_in_interval: bool,
     cursor: Option<CursorShape>,
+    /// The last shape the guest itself defined, kept while `cursor` is
+    /// hidden so a stale re-announcement of it can be recognised.
+    defined: Option<CursorShape>,
     /// Last pointer position vmlab sent, source coordinates.
     pointer: Option<(i64, i64)>,
     ripples: Vec<Ripple>,
@@ -136,6 +159,7 @@ impl Core {
             dirty_area: 0,
             input_in_interval: false,
             cursor: None,
+            defined: None,
             pointer: None,
             ripples: Vec::new(),
             intervals: 0,
@@ -240,9 +264,21 @@ impl Core {
         }
     }
 
-    /// The guest defined its cursor shape.
+    /// A cursor shape rectangle arrived. A genuinely new shape is drawn from
+    /// here on; QEMU's re-announcement of the shape already known (see
+    /// [`CursorShape::is_stale_resend_of`]) hides the pointer instead, since
+    /// QEMU only re-announces when the display that drew it was reset.
     pub fn cursor(&mut self, at: Duration, shape: CursorShape) {
         self.advance(at);
+        if self
+            .defined
+            .as_ref()
+            .is_some_and(|d| d.is_stale_resend_of(&shape))
+        {
+            self.cursor = None;
+            return;
+        }
+        self.defined = Some(shape.clone());
         self.cursor = Some(shape);
     }
 
@@ -430,21 +466,22 @@ impl Core {
         self.scaled.as_deref().unwrap_or(&[])
     }
 
-    /// The output frame at wall time `t`: base, pointer, ripples.
+    /// The output frame at wall time `t`: base, ripples, then the pointer on
+    /// top so a ripple never tints it.
     fn compose(&mut self, t: Duration) -> Frame {
         let placement = self.placement();
         let mut rgb = self.base().to_vec();
         let size = self.settings.size;
         if let Some(p) = placement {
-            if let (Some(cursor), Some((px, py))) = (self.cursor.as_ref(), self.pointer) {
-                draw_cursor(&mut rgb, size, &p, cursor, px, py);
-            }
             for r in &self.ripples {
                 if r.start <= t && t < r.start + RIPPLE_DURATION {
                     let progress = (t - r.start).as_secs_f64() / RIPPLE_DURATION.as_secs_f64();
                     let (cx, cy) = p.map(r.x as f64, r.y as f64);
                     draw_ripple(&mut rgb, size, cx, cy, progress);
                 }
+            }
+            if let (Some(cursor), Some((px, py))) = (self.cursor.as_ref(), self.pointer) {
+                draw_cursor(&mut rgb, size, &p, cursor, px, py);
             }
         }
         Frame { rgb }
@@ -486,6 +523,7 @@ impl Placement {
     }
 }
 
+/// Straight-alpha blend of `colour` over the pixel at `(x, y)`.
 fn blend(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 3], alpha: f64) {
     if x < 0 || y < 0 || x >= i64::from(size.width) || y >= i64::from(size.height) {
         return;
@@ -494,6 +532,21 @@ fn blend(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 3], alpha: f64
     for c in 0..3 {
         let base = f64::from(rgb[i + c]);
         rgb[i + c] = (base + (f64::from(colour[c]) - base) * alpha)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Premultiplied-alpha blend: `colour` already carries its alpha, so it is
+/// added to what is left of the pixel beneath (`src + dst * (1 - a)`).
+fn blend_premultiplied(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 3], alpha: f64) {
+    if x < 0 || y < 0 || x >= i64::from(size.width) || y >= i64::from(size.height) {
+        return;
+    }
+    let i = ((y as u32 * size.width + x as u32) * 3) as usize;
+    for c in 0..3 {
+        let base = f64::from(rgb[i + c]);
+        rgb[i + c] = (f64::from(colour[c]) + base * (1.0 - alpha))
             .round()
             .clamp(0.0, 255.0) as u8;
     }
@@ -516,7 +569,7 @@ fn draw_cursor(rgb: &mut [u8], size: Size, p: &Placement, cursor: &CursorShape, 
             let i = ((sy * u32::from(cursor.width) + sx) * 4) as usize;
             let a = f64::from(cursor.rgba[i + 3]) / 255.0;
             if a > 0.0 {
-                blend(
+                blend_premultiplied(
                     rgb,
                     size,
                     x0 + dx,

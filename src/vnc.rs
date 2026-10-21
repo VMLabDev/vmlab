@@ -284,8 +284,10 @@ impl VncClient {
             ENC_ALPHA_CURSOR => {
                 // QEMU writes the sub-encoding (always RAW) and then the
                 // cursor's `uint32_t` ARGB pixels in host order — on every
-                // host vmlab runs on that is the bytes B G R A, straight
-                // alpha, not the premultiplied RGBA rfbproto describes.
+                // host vmlab runs on that is the bytes B G R A, not the RGBA
+                // rfbproto describes. The alpha is premultiplied as the guest
+                // uploaded it to its cursor plane (measured on GNOME and KDE),
+                // and the recorder blends it as such.
                 let sub = self.stream.read_i32().await?;
                 if sub != ENC_RAW {
                     bail!("VNC alpha cursor uses unsupported sub-encoding {sub}");
