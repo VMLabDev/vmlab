@@ -336,6 +336,18 @@ pub async fn push_under(
         RECONNECT_WAIT,
     )
     .await?;
+    if sets_clock_after_push(m.guest_os(), m.clock())
+        && agent.has_feature(vmlab_agent_proto::features::SET_TIME)
+    {
+        // Never fails the push, which has happened: the clock is wrong only
+        // until the guest's own time sync or its next cold boot.
+        if let Err(e) = agent
+            .set_time(std::time::SystemTime::now(), super::lab::CLOCK_SET_WAIT)
+            .await
+        {
+            tracing::warn!(machine = %name, error = %format!("{e:#}"), "guest clock not set after the agent push");
+        }
+    }
     let info = agent.info();
     Ok(RepairReport {
         machine: name,
@@ -344,6 +356,19 @@ pub async fn push_under(
         agent_version: info.agent_version,
         features: info.features,
     })
+}
+
+/// Whether a push into a machine sets its clock to the host's once the new
+/// agent answers (§7.3, #166). A Windows agent makes the guest read the RTC
+/// as UTC when it starts, but the kernel took the RTC as local time at this
+/// boot, so a guest whose template predates the flag runs off by its UTC
+/// offset until it next boots. Setting the time once corrects the running
+/// clock — and is right whenever the clock is `host`'s, so it needs no
+/// knowledge of whether the agent wrote the flag. A `snapshot` clock may be
+/// running from a restore that kept its captured time, and a fixed one is
+/// never set by vmlab; a Linux guest never had the problem.
+pub fn sets_clock_after_push(guest_os: GuestOs, clock: crate::config::model::Clock) -> bool {
+    guest_os == GuestOs::Windows && clock == crate::config::model::Clock::Host
 }
 
 /// The agent that replaced the one told to restart, waited for up to `wait`.
@@ -586,6 +611,20 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A push sets a Windows guest's clock once the new agent answers — the
+    /// boot it is running read the RTC as local time (#166) — when the clock
+    /// is the host's; a `snapshot` or fixed clock and a Linux guest are left
+    /// alone.
+    #[test]
+    fn a_push_sets_the_clock_of_a_windows_guest_following_the_host() {
+        use crate::config::model::{Clock, parse_clock};
+        assert!(sets_clock_after_push(GuestOs::Windows, Clock::Host));
+        assert!(!sets_clock_after_push(GuestOs::Windows, Clock::Snapshot));
+        let fixed = parse_clock("2020-01-01T00:00:00Z").unwrap();
+        assert!(!sets_clock_after_push(GuestOs::Windows, fixed));
+        assert!(!sets_clock_after_push(GuestOs::Linux, Clock::Host));
+    }
 
     /// The staged binary never lands on the path the service runs from: a
     /// half-written file there would break the agent a failed repair would

@@ -305,8 +305,9 @@ pub fn build_args(
     arg(&mut a, "cpu", vm.cpu_model.clone().unwrap_or(default_cpu));
     arg(&mut a, "smp", vm.cpus.to_string());
     arg(&mut a, "m", format!("{}M", vm.memory >> 20));
-    // A fixed clock starts the RTC at the declared instant (§7.3); without
-    // one QEMU's default, the host's UTC time, applies.
+    // A fixed clock starts the RTC at the declared instant, and a guest that
+    // reads the RTC as local time (the profile's `rtc`) has it start at the
+    // host's (§7.3); otherwise QEMU's default, the host's UTC time, applies.
     if let Some(base) = &vm.rtc_base {
         arg(&mut a, "rtc", format!("base={base}"));
     }
@@ -907,6 +908,42 @@ mod tests {
         let host = resolved("linux-generic", "x86_64");
         let args = build_args("l", &host, &paths(), Accel::Kvm).unwrap();
         assert!(!args.iter().any(|a| a == "-rtc"), "{args:?}");
+    }
+
+    /// A profile whose guest reads the RTC as local time (#166) starts it at
+    /// the host's: `base=localtime` for the host's clock, and a fixed instant
+    /// as the host's wall clock at it. A Windows profile on the Rust agent
+    /// keeps QEMU's UTC default — its agent tells the guest so.
+    #[test]
+    fn a_local_rtc_profile_starts_the_rtc_at_local_time() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let rtc_of = |vm: &super::super::resolve::ResolvedVm| {
+            let args = build_args("l", vm, &paths(), Accel::Kvm).unwrap();
+            args.iter()
+                .position(|a| a == "-rtc")
+                .map(|i| args[i + 1].clone())
+        };
+        for profile in ["windows-xp", "windows-9x"] {
+            let host = resolved(profile, "x86_64");
+            assert_eq!(
+                rtc_of(&host).as_deref(),
+                Some("base=localtime"),
+                "{profile}"
+            );
+            let v = super::super::resolve::testing::vm(&format!(
+                "vm \"t\" {{ template = \"scratch\" arch = \"x86_64\" profile = \"{profile}\" disk = 1GiB clock = \"2020-01-01T00:00:00Z\" }}"
+            ));
+            let fixed = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
+            let at = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap();
+            let local = at
+                .with_timezone(&chrono::Local)
+                .naive_local()
+                .format("%Y-%m-%dT%H:%M:%S");
+            assert_eq!(rtc_of(&fixed), Some(format!("base={local}")), "{profile}");
+        }
+        for profile in ["windows-11", "windows-server", "windows-legacy"] {
+            assert_eq!(rtc_of(&resolved(profile, "x86_64")), None, "{profile}");
+        }
     }
 
     /// A resolved `cpu_model` replaces the accelerator default under both

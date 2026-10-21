@@ -33,6 +33,7 @@ DOC
       | "`agent_transport`" | "The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias." |
       | "`input_transport`" | "How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc`. See [Screens, input and vision](guide_vision)." |
       | "`virtiofs`" | "Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = \"auto\"` shares. See [Shared folders](guide_shares)." |
+      | "`rtc`" | "What the guest reads the real-time clock as: `utc` (default), or `localtime` for DOS, Windows 9x and NT4 through XP/2003, which cannot read it as UTC. See [Snapshots](guide_snapshots) for the clock." |
       | "`workspace_guest`" | "The guest path an `@dev` workspace lands at when the decorator names none. See [Dev machines and the workspace syncer](guide_dev)." |
   }
 

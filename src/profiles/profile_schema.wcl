@@ -29,6 +29,11 @@ type Profile {
   agent_channel: bool?  // superseded by agent_transport: true = virtio-serial, false = none
   input_transport: utf8?  // "qmp" (default) | "vnc" — scripted input path (§10.3)
   virtiofs: bool?       // guest mounts virtiofs natively (default false) — §7.5 share transport
+  // What the guest reads the RTC as (§7.3): "utc" (default — the RTC holds
+  // UTC; Windows guests on the Rust agent are told so) | "localtime" (the
+  // RTC holds host local time, QEMU `-rtc base=localtime` — for guests that
+  // cannot treat it as UTC: DOS, Windows 9x, NT4 through XP/2003).
+  rtc: utf8?
   // Dev-machine defaults (§19.1). Guest-OS-shaped, which is why they are
   // profile-sourced: a workspace path is `C:\src` on Windows and `/src` on
   // Linux. A profile setting none of them still hosts a dev machine — a

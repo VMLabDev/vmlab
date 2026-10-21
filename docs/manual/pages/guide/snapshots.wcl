@@ -100,6 +100,27 @@ page guide_snapshots {
   }
 
   p <<DOC
+    The RTC holds UTC. Linux reads it that way, and so does every Windows
+    guest that runs `vmlab-agent`: the bootstrap installer sets
+    `RealTimeIsUniversal = 1` under
+    `HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation`, and the
+    agent sets it again whenever it starts. Without it, Windows reads the RTC
+    as local time and is wrong by its UTC offset at every cold boot. A
+    template built before vmlab set the flag gets it from `up`'s agent update
+    or `vmlab machine repair-agent`. Windows reads the flag only at boot, so
+    after either one, vmlab sets the running guest's clock to the host's time
+    once (`clock = "host"` only). The flag holds from the next boot.
+  DOC
+
+  p <<DOC
+    DOS, Windows 9x and NT4 through XP/2003 cannot read the RTC as UTC. Their
+    profiles, `windows-9x` and `windows-xp`, set `rtc = "localtime"`, so the
+    RTC starts at the host's local time instead, and a fixed date-time starts
+    it at the host's local time at that instant. Such a guest is right when
+    its time zone matches the host's.
+  DOC
+
+  p <<DOC
     A fixed date-time is for testing software that depends on the date: a
     licence that expires, a certificate that is not yet valid, a job that
     runs at the end of a month. Any offset is accepted and converted to UTC.

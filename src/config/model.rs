@@ -1070,9 +1070,35 @@ impl Clock {
 
     /// QEMU `-rtc base=` for a fixed clock: UTC, without a zone suffix.
     pub fn rtc_base(self) -> Option<String> {
-        match self {
-            Clock::Fixed(at) => Some(at.format("%Y-%m-%dT%H:%M:%S").to_string()),
-            Clock::Host | Clock::Snapshot => None,
+        self.rtc_base_in(crate::profiles::Rtc::Utc, &chrono::Utc)
+    }
+
+    /// QEMU `-rtc base=` for a guest that reads the RTC as `rtc` (§7.3), on
+    /// this host. `None` leaves QEMU's default, the host's UTC time.
+    pub fn rtc_base_for(self, rtc: crate::profiles::Rtc) -> Option<String> {
+        self.rtc_base_in(rtc, &chrono::Local)
+    }
+
+    /// [`rtc_base_for`](Self::rtc_base_for) with the host's zone supplied.
+    /// A guest reading the RTC as local time is started at the host's local
+    /// time — `localtime`, or a fixed instant as the wall clock in `host_tz`
+    /// at that instant — so it reads the instant the clock declares.
+    pub fn rtc_base_in<Tz: chrono::TimeZone>(
+        self,
+        rtc: crate::profiles::Rtc,
+        host_tz: &Tz,
+    ) -> Option<String> {
+        use crate::profiles::Rtc;
+        match (self, rtc) {
+            (Clock::Fixed(at), Rtc::Utc) => Some(at.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            (Clock::Fixed(at), Rtc::Localtime) => Some(
+                at.with_timezone(host_tz)
+                    .naive_local()
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string(),
+            ),
+            (Clock::Host | Clock::Snapshot, Rtc::Utc) => None,
+            (Clock::Host | Clock::Snapshot, Rtc::Localtime) => Some("localtime".to_string()),
         }
     }
 }
@@ -1440,5 +1466,31 @@ mod tests {
         let err = parse_clock("2020-01-01").unwrap_err();
         assert!(err.contains("RFC 3339"), "{err}");
         assert!(parse_clock("Host").is_err());
+    }
+
+    /// A guest that reads the RTC as local time (#166) gets QEMU's
+    /// `localtime` for a running clock, and a fixed instant as the host's
+    /// wall clock at that instant — so it reads the instant declared. One
+    /// reading UTC is unchanged.
+    #[test]
+    fn a_local_rtc_starts_at_the_hosts_wall_clock() {
+        use crate::profiles::Rtc;
+        let brisbane = chrono::FixedOffset::east_opt(10 * 3600).unwrap();
+        let fixed = parse_clock("2020-01-01T00:00:00Z").unwrap();
+        assert_eq!(
+            fixed.rtc_base_in(Rtc::Localtime, &brisbane).as_deref(),
+            Some("2020-01-01T10:00:00")
+        );
+        assert_eq!(
+            fixed.rtc_base_in(Rtc::Utc, &brisbane).as_deref(),
+            Some("2020-01-01T00:00:00")
+        );
+        for clock in [Clock::Host, Clock::Snapshot] {
+            assert_eq!(
+                clock.rtc_base_in(Rtc::Localtime, &brisbane).as_deref(),
+                Some("localtime")
+            );
+            assert_eq!(clock.rtc_base_in(Rtc::Utc, &brisbane), None);
+        }
     }
 }

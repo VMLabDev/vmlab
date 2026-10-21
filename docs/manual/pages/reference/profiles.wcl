@@ -67,6 +67,7 @@ profile "<name>" {
   agent_transport = "virtio-serial"
   input_transport = "qmp"
   virtiofs        = false
+  rtc             = "utc"
   workspace_guest = "/src"
 }
 SRC
@@ -92,11 +93,12 @@ SRC
       | "`agent_channel`" | "bool" | "unset" | "Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present." |
       | "`input_transport`" | "utf8" | "`qmp`" | "How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path." |
       | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
+      | "`rtc`" | "utf8" | "`utc`" | "What the guest reads the real-time clock as: `utc`, or `localtime` for a guest that cannot read it as UTC, whose RTC then starts at the host's local time (QEMU `-rtc base=localtime`; a fixed `clock` is converted to the host's local time at that instant). Only `windows-xp` and `windows-9x` set `localtime`." |
       | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |
   }
   p <<DOC
     The parser enforces the keyword sets above for `machine`, `firmware`,
-    `disk_bus`, `accel` and `input_transport`, `cpus` at least 1, and a non-negative
+    `disk_bus`, `accel`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative
     `memory`. `nic_model`, `display` and `cpu_model` are passed to QEMU as
     written; an empty `cpu_model` is refused. A
     profile that sets no `workspace_guest` still hosts a dev machine; the
@@ -123,8 +125,9 @@ SRC
       | "`windows-11`" | "q35" | "ovmf" | "true" | "true" | "virtio" | "virtio-net-pci" | "virtio-vga" | "4" | "8GiB" | "" |
       | "`windows-10`" | "q35" | "ovmf" | "false" | "false" | "virtio" | "virtio-net-pci" | "virtio-vga" | "4" | "8GiB" | "" |
       | "`windows-server`" | "q35" | "ovmf" | "false" | "true" | "virtio" | "virtio-net-pci" | "virtio-vga" | "4" | "8GiB" | "" |
-      | "`windows-legacy`" | "pc" | "seabios" | "false" | "false" | "ide" | "e1000" | "std" | "2" | "2GiB" | "XP, 7 and 2008-era guests with no virtio drivers." |
-      | "`windows-9x`" | "pc" | "seabios" | "false" | "false" | "ide" | "pcnet" | "cirrus-vga" | "1" | "256MiB" | "`input_transport = \"vnc\"`. DOS, Windows 3.x to ME and 2000-era guests." |
+      | "`windows-legacy`" | "pc" | "seabios" | "false" | "false" | "ide" | "e1000" | "std" | "2" | "2GiB" | "Vista, 7 and 2008-era guests with no virtio storage or network drivers at install time; virtio-serial agent." |
+      | "`windows-xp`" | "pc" | "seabios" | "false" | "false" | "ide" | "e1000" | "std" | "2" | "2GiB" | "`agent_transport = \"isa-serial\"`, `rtc = \"localtime\"`. NT4 through XP/2003, the legacy agent on COM1." |
+      | "`windows-9x`" | "pc" | "seabios" | "false" | "false" | "ide" | "pcnet" | "cirrus-vga" | "1" | "256MiB" | "`input_transport = \"vnc\"`, `agent_transport = \"isa-serial\"`, `rtc = \"localtime\"`. DOS, Windows 3.x to ME and 2000-era guests." |
       | "`linux-modern`" | "q35" | "ovmf" | "false" | "false" | "virtio" | "virtio-net-pci" | "virtio-vga" | "2" | "4GiB" | "`virtiofs = true`." |
       | "`linux-generic`" | "q35" | "seabios" | "false" | "false" | "virtio" | "virtio-net-pci" | "std" | "2" | "2GiB" | "Older or unusual distros." |
       | "`container`" | "" | "" | "" | "" | "" | "" | "" | "1" | "256MiB" | "Micro-VM size for an OCI container; nothing else applies to a container." |

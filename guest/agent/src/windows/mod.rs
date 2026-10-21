@@ -42,12 +42,30 @@ pub struct WindowsSpawner {
 }
 
 pub fn new_platform() -> WindowsPlatform {
+    ensure_rtc_is_utc();
     let logons = Arc::new(logon::Logons::new());
     // Idle logons are dropped on a timer, which is what unloads their
     // profile hives — nothing else would.
     logon::start_sweeper(logons.clone());
     WindowsPlatform {
         spawner: WindowsSpawner { logons },
+    }
+}
+
+/// Make the guest read the RTC as UTC (PRD §7.3), once per start. Never
+/// fatal: an agent that cannot write the flag still serves everything else,
+/// and says why the clock may be off.
+fn ensure_rtc_is_utc() {
+    use crate::rtc::{KEY, VALUE, ensure};
+    match ensure(
+        || rdp::reg_dword(KEY, VALUE),
+        |v| rdp::set_reg_dword(KEY, VALUE, v),
+    ) {
+        Ok(false) => {}
+        Ok(true) => eprintln!(
+            r"vmlab-agent: set HKLM\{KEY}\{VALUE} = 1; the RTC is read as UTC from the next boot"
+        ),
+        Err(e) => eprintln!("vmlab-agent: could not make the RTC read as UTC: {e}"),
     }
 }
 
