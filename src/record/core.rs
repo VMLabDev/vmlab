@@ -301,10 +301,17 @@ impl Core {
     }
 
     /// Process every interval that ended by `now`, close any open idle run,
-    /// and return the frames due. The last call.
+    /// and return the frames due. The last call. A recording stopped before
+    /// its first interval ended still gets one frame, so the file it leaves
+    /// is a playable video rather than a container with no stream in it.
     pub fn finish(&mut self, now: Duration) -> Vec<Frame> {
         self.advance(now);
         self.close_idle();
+        if self.video.is_zero() {
+            let frame = self.compose(now);
+            self.out.push(frame);
+            self.video += self.dt;
+        }
         std::mem::take(&mut self.out)
     }
 

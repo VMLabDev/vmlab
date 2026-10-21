@@ -291,6 +291,20 @@ fn the_timeline_maps_wall_time_through_cuts() {
     assert_eq!(json["x"], 1);
 }
 
+/// A recording stopped before its first interval ends still yields one
+/// frame, so the file is a video.
+#[test]
+fn finishing_at_once_still_yields_a_frame() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 8, 8);
+    core.rect(secs(0.01), 0, 0, 8, 8, &solid(8, 8, RED));
+    let frames = core.finish(secs(0.02));
+    assert_eq!(frames.len(), 1);
+    assert!(all(&frames[0], RED));
+    assert_eq!(core.video_duration(), secs(0.1));
+}
+
 /// Without compression nothing is ever cut and the timeline is wall time.
 #[test]
 fn without_compression_video_time_is_wall_time() {
