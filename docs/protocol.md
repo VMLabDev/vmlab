@@ -64,15 +64,15 @@ the code is the contract.
 | `version` | — | `cli` | This daemon's build (`vmlab::version::BUILD`): what the CLI compares with its own before it drives the daemon, since one build cannot drive another's. |
 | `status` | — | `cli` | The whole lab's runtime status: machines, segments, readiness. |
 | `dns.table` | — | `cli` | The DNS zones the lab's segments serve. |
-| `up` | `machines: Vec<String>` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
+| `up` | `machines: Vec<String>`, `record: Vec<RecordRequest>` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
 | `pull` | `machines: Vec<String>` | `cli` | Download every pending template and image without starting anything, over the code path `up` runs first. |
 | `pull.cancel` | `machine: String` | `cli` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
-| `run` | `script: String` | `cli` | Run an ad-hoc wscript against the lab (PRD §12), streaming output. |
+| `run` | `script: String`, `record: Vec<RecordRequest>` | `cli` | Run an ad-hoc wscript against the lab (PRD §12), streaming output. |
 | `down` | `machines: Vec<String>`, `force: bool` | `cli` | Stop the lab, or just the named machines (empty = all). |
 | `destroy` | — | `cli` | Stop the lab and delete everything it materialised. |
-| `machine.start` | `machine: String` | `cli` | Start one machine, pulling its template or image first. |
+| `machine.start` | `machine: String`, `record: Vec<RecordRequest>` | `cli` | Start one machine, pulling its template or image first. |
 | `machine.stop` | `machine: String`, `force: bool` | `cli` | Stop one machine; `force` kills instead of the graceful ladder. |
-| `machine.restart` | `machine: String`, `force: bool` | `cli` | Stop one machine, wait for it to settle, and boot it again. |
+| `machine.restart` | `machine: String`, `force: bool`, `record: Vec<RecordRequest>` | `cli` | Stop one machine, wait for it to settle, and boot it again. |
 | `machine.destroy` | `machine: String` | `cli` | Stop one machine and delete everything it materialised. |
 | `machine.capabilities` | `machine: String` | `cli` | What this machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, and whichever features its agent negotiated. |
 | `machine.ip` | `machine: String`, `nic: Option<usize>` | `cli` | The machine's guest IP, optionally for one NIC index. |
@@ -90,6 +90,9 @@ the code is the contract.
 | `machine.usb_attach` | `machine: String`, `selector: String`, `force: bool` | `cli` | Hot-plug the host USB device `selector` names into a running VM booted with `usb = true` (PRD §5.2.1): `<vid>:<pid>`, `<vid>:<pid>@<serial>` or `port:<bus>-<port>`. A HID keyboard or mouse is refused without `force`. Answers with the attachment. |
 | `machine.usb_detach` | `machine: String`, `selector: Option<String>`, `all: bool` | `cli` | Unplug a host USB device from a VM — the one `selector` names, or with `all` every one it holds. Answers with what was detached. |
 | `machine.usb_attached` | `machine: Option<String>` | `daemon` | The host USB devices one machine holds — or, with `machine` omitted, every machine in the lab. |
+| `machine.record_start` | `machine: String`, `path: Option<String>`, `options: RecordOptions` | `cli` | Record one VM's console to an MP4 or WebM file (§11.1): the path's extension picks the format, `options` the rate, size, idle compression, timeline and cap. One per machine (`conflict`); a container has no display (`unsupported`); missing ffmpeg or encoder is `failed`. Answers with the live recording's status. |
+| `machine.record_stop` | `machine: String` | `cli` | Finalise one VM's recording to a playable file. Answers with the path and the video's length. |
+| `machine.record_status` | `machine: Option<String>` | `cli` | Every live recording in the lab — or, with `machine` named, that machine's: path, start time, elapsed time and options. |
 | `machine.tty_resize` | `machine: String`, `session: u32`, `cols: u16`, `rows: u16` | `cli` | Resize an open terminal session. |
 | `machine.app_open` | `machine: String`, `mode: String`, `argv: Vec<String>`, `cwd: Option<String>`, `cookie: Option<String>`, `user: Option<String>`, `password: Option<String>` | `cli` | Open a **shared app** session (PRD §20): start `argv` in the guest and carry its windows' protocol to the caller, which owns the host desktop end. The reply is `{"session", "control", "conns"}`, plus `"rdp": {"user", "password"}` in `rdp` mode. `control` is a unix socket relaying the session's length-prefixed app records, closed by the caller to end the session; every connection to `conns` becomes one transport connection of the session. In `waypipe` mode a guest with no `waypipe` for that identity answers `unsupported`. |
 | `machine.push_file` | `machine: String`, `to: String`, `from: Option<String>`, `data: Option<String>`, `mode: Option<u32>` | `cli` | Copy a file into the guest: either `from`, a host path the daemon can see, or `data`, base64 for a caller that holds bytes. |
@@ -144,6 +147,9 @@ Deliberate, with the reason recorded beside the declaration:
 - `machine.repair_agent` — A deliberate, machine-changing act with a rebuild as its alternative — the console offering it as a button would invite exactly the reflex the verb exists to keep manual, and its audience is whoever is iterating on the agent itself, at a terminal.
 - `machine.usb_attach` — A script attaches through the lab runtime it is bound to, not over the socket, so the verb is the one caller that crosses it.
 - `machine.usb_detach` — The other half of `machine.usb_attach`, and one-way for the same reason.
+- `machine.record_start` — A script records through the lab runtime it is bound to              (`m.record`), not over the socket, so the verb is the one caller              that crosses it.
+- `machine.record_stop` — The other half of `machine.record_start`, and one-way for the same reason.
+- `machine.record_status` — `status` folds the same entries into each machine's line; this              is the recording-only view `vmlab record status` shows.
 - `machine.app_open` — The host end of a shared app is a window-protocol client running in the user's own desktop session, which only a process started there has; the daemon is headless by design (§11).
 - `machine.tail` — An open-ended stream of an arbitrary guest path, which is what a terminal is for. The console follows a machine's console log through `machine.logs`.
 - `machine.eventlog` — A stream into a terminal, for the same reason as `machine.tail`.

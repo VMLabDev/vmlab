@@ -127,6 +127,17 @@ A leftover `AutoLogonCount` is a different cause with the same symptom (Windows 
 | ``` {machine}: Windows `{edition}` has no Remote Desktop host; shared apps need Pro, Enterprise, Education or Server ``` | `EditionID` is a Home edition (`Core`, `CoreN`, `CoreSingleLanguage`, `CoreCountrySpecific`). | Build the template from a Pro, Enterprise, Education or Server image. |
 | ``` RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password ``` | RDP cannot log on as SYSTEM; the machine has no `login {}` and no `--user` was given, or `--user SYSTEM` was. | Declare a `login {}` with a `password` (logins.md), or pass `--user` and `--password`. |
 
+## A recording is refused
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| ``` recording needs ffmpeg: none found on PATH, and the host config (config.wcl) names none under `ffmpeg` ``` | The lab daemon looks for ffmpeg only when a recording starts, and found none. Exit 1 (`failed`). | Install ffmpeg, or set `ffmpeg` in the host config (host-profiles.md) to the binary. |
+| ``` recording a .mp4 needs the `libx264` encoder, which {ffmpeg} -encoders does not list; install an ffmpeg built with it, or point the host config's `ffmpeg` key at one ``` | The ffmpeg found cannot write the format: `.mp4` needs `libx264`, `.webm` needs `libvpx-vp9`. Exit 1. | Install an ffmpeg built with the encoder, or point the `ffmpeg` key at one. |
+| ``` machine `{machine}` is already recording to {path}; stop it first (`vmlab record stop {machine}`) ``` | One recording per machine. Also meets `vm restart --record` of a VM already recording (its recording follows the restart on its own). Exit 5 (`conflict`). | `vmlab record stop {machine}`, then start again; `vmlab record status` lists what is live. |
+| ``` machine `{machine}` has no display ``` | Only a VM has a framebuffer; a container cannot be recorded. Exit 6 (`unsupported`). | Nothing changes that. |
+| ``` machine `{machine}` did not start, so its recording was not started ``` | A `--record` on `up`/`vm start`/`vm restart` named a VM whose boot failed. Exit 1. | Fix the boot; a VM that was already running would have been recorded from now instead. |
+| ``` recording `{path}`: unsupported extension `.gif`; a recording is written as `.mp4` (H.264) or `.webm` (VP9) — convert it afterwards for anything else ``` | Refused by the CLI before any daemon is reached. | Record to `.mp4` and convert with ffmpeg afterwards. |
+
 ## `vmlab machine repair-agent` refused
 
 A machine whose agent is older than the host's lacks features the host expects; `vmlab machine capabilities <machine>` lists the ones it negotiated. `vmlab up` and `vmlab vm start` normally refresh it by themselves when the VM's agent stamp differs from the shipped agent's, printing `agent: updated "<vm>" (<old> → <new>)`, or `warning: agent: could not update "<vm>" …` with the reason, leaving the old agent in place and carrying on; `agent_update = false` on the `vm` or `lab` block turns that off. Rebuilding the template is the durable remedy. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:

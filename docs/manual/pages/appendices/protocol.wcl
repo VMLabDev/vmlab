@@ -3,7 +3,7 @@ page ref_protocol {
   chapter_header "Wire protocol and error codes" {
     kicker       = "Appendices · reference"
     reading_time = "8 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -98,9 +98,22 @@ SRC
       | "Guest agent" | "`machine.exec`, `machine.tty_open`, `machine.tty_resize`, `machine.push_file`, `machine.pull_file`, `machine.tail`, `machine.eventlog`, `machine.clipboard_get`, `machine.clipboard_set`" |
       | "Playbooks" | "`playbook.list`, `playbook.check`, `playbook.apply`" |
       | "Host USB" | "`machine.usb_attach`, `machine.usb_detach`, `machine.usb_attached`" |
+      | "Console recording" | "`machine.record_start`, `machine.record_stop`, `machine.record_status`" |
       | "Snapshots" | "`snapshot.take`, `snapshot.restore`, `snapshot.delete`, `snapshot.list`" |
       | "Workspace" | "`workspace.flush`, `workspace.resolve`, `workspace.diff`" |
   }
+  p <<DOC
+    `machine.record_start` takes `machine`, an optional absolute `path` and
+    an `options` object (`fps`, `size`, `compress_idle`, `timeline`,
+    `max_duration`, each optional) and answers with the live recording's
+    status; `machine.record_stop` answers with the path and the video's
+    length; `machine.record_status` lists every live recording, or one
+    machine's. `up`, `run`, `machine.start` and `machine.restart` each take
+    a `record` list of `{machine, path?, options}` for the recordings that
+    ride the boot or last the run. A script records through the lab runtime
+    it is bound to, not over the socket, so the three `record` commands are
+    called by the CLI alone. See [Console recording](guide_recording).
+  DOC
   p <<DOC
     Every lab-daemon command is called by the CLI except
     `machine.usb_attached`, which the supervisor calls on every running lab

@@ -122,6 +122,12 @@ struct TestLab {
     events: Arc<EventLog>,
     /// Every `machine_ready` the lab was told of, in order.
     readied: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Every `before_resume` and `machine_ready`, interleaved as
+    /// `resume:<name>` and `ready:<name>`, so the order of the two shows.
+    hooks: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Make `before_resume` fail with this, as a recorder that could not
+    /// attach would (§11.1, D20).
+    refuse_resume: std::sync::Mutex<Option<String>>,
 }
 
 impl TestLab {
@@ -129,11 +135,17 @@ impl TestLab {
         Self {
             events,
             readied: Arc::default(),
+            hooks: Arc::default(),
+            refuse_resume: std::sync::Mutex::new(None),
         }
     }
 
     fn readied(&self) -> Vec<String> {
         self.readied.lock().expect("readied").clone()
+    }
+
+    fn hooks(&self) -> Vec<String> {
+        self.hooks.lock().expect("hooks").clone()
     }
 }
 
@@ -162,11 +174,26 @@ impl LabServices for TestLab {
         })
     }
 
+    async fn before_resume(&self, machine: &str) -> anyhow::Result<()> {
+        self.hooks
+            .lock()
+            .expect("hooks")
+            .push(format!("resume:{machine}"));
+        match self.refuse_resume.lock().expect("refuse").clone() {
+            Some(why) => Err(anyhow::anyhow!(why)),
+            None => Ok(()),
+        }
+    }
+
     async fn machine_ready(&self, machine: &str) {
         self.readied
             .lock()
             .expect("readied")
             .push(machine.to_string());
+        self.hooks
+            .lock()
+            .expect("hooks")
+            .push(format!("ready:{machine}"));
     }
 
     async fn smb_mount_plan(
@@ -329,6 +356,7 @@ async fn start_vm(vm: &Arc<VmInstance>, cbs: Callbacks) -> anyhow::Result<()> {
             readies.fetch_add(1, Ordering::SeqCst);
         },
         std::future::ready(()),
+        std::future::ready(Ok(())),
         |_| {},
     )
     .await
@@ -1040,6 +1068,7 @@ async fn nothing_is_still_up_when_the_exit_callback_fires() {
         },
         || {},
         std::future::ready(()),
+        std::future::ready(Ok(())),
         |_| {},
     )
     .await
@@ -1979,4 +2008,52 @@ async fn a_vms_status_names_the_agent_that_answered_not_the_sealed_one() {
 
     vm.stop(true).await.expect("stop");
     assert_eq!(agent(m.status_detail().await).as_deref(), Some("0.1.0"));
+}
+
+/// The paused window (§11.1, D20): the lab's `before_resume` runs once the
+/// emulator is up — the VM is `Starting`, control answers — and before the
+/// CPUs are released, so a recorder attached there catches the first frame;
+/// readiness follows it. An error there fails the start and leaves the VM
+/// stopped.
+#[tokio::test]
+async fn before_resume_runs_in_the_paused_window_and_can_refuse_the_start() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events));
+    let m: Arc<dyn Machine> = vm.clone();
+
+    m.clone()
+        .start(lab.clone() as Arc<dyn LabServices>)
+        .await
+        .expect("start");
+    m.wait_ready(SETTLE).await.expect("ready");
+    let seen = lab.hooks();
+    let resume = seen
+        .iter()
+        .position(|s| s == "resume:dc01")
+        .expect("before_resume ran");
+    let ready = seen
+        .iter()
+        .position(|s| s == "ready:dc01")
+        .expect("machine_ready ran");
+    assert!(resume < ready, "{seen:?}");
+    m.stop(true).await.expect("stop");
+    m.wait_state(PowerState::Stopped, SETTLE)
+        .await
+        .expect("stopped");
+
+    *lab.refuse_resume.lock().unwrap() = Some("recorder could not attach".into());
+    let err = m
+        .clone()
+        .start(lab.clone() as Arc<dyn LabServices>)
+        .await
+        .expect_err("a refused resume fails the start");
+    assert!(
+        format!("{err:#}").contains("recorder could not attach"),
+        "{err:#}"
+    );
+    m.wait_state(PowerState::Stopped, SETTLE)
+        .await
+        .expect("the failed start leaves the VM stopped");
 }

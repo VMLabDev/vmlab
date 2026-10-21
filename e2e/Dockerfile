@@ -45,7 +45,7 @@ RUN apt-get update \
       libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri libgbm1 libopengl0 \
       qemu-utils \
       swtpm swtpm-tools virtiofsd \
-      samba xorriso mtools dosfstools squashfs-tools tesseract-ocr \
+      samba xorriso mtools dosfstools squashfs-tools tesseract-ocr ffmpeg \
       python3 util-linux procps iproute2 curl ca-certificates \
       xvfb x11-utils \
  && rm -rf /var/lib/apt/lists/*

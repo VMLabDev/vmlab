@@ -159,6 +159,16 @@ login, like `exec`. A CLI act on a running machine, never a declaration and
 never a wscript call. Unrelated to the **display**, which it does not use.
 _Avoid_: remote app, seamless window, app forwarding, share (that is a folder)
 
+**Console recording**:
+A video of one VM's **display**, MP4 or WebM, written by the lab daemon from
+the VM's VNC socket while it runs; started by `vmlab record start`, by
+`--record` on `script`/`up`/`vm start`/`vm restart`, or by a script's
+`Machine.record`, and finalised to a playable file by `record stop`, its
+maximum duration, or whatever ends the machine or the run. Draws the pointer
+only where vmlab itself sent it, because VNC carries no pointer position. Not
+a screenshot (one frame) and not a screen capture of the host.
+_Avoid_: screen recording, screencast, capture (that is a snapshot verb), video (alone)
+
 **USB passthrough**:
 Handing a USB device plugged into the host to a running VM, and giving it
 back, with no restart. Needs the VM to have booted with `usb = true` — an

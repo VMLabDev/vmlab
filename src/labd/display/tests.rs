@@ -77,6 +77,7 @@ struct FakeHost {
     vnc: PathBuf,
     gl: bool,
     qmp_opens: Mutex<usize>,
+    tap: Arc<crate::record::InputTap>,
 }
 
 #[async_trait::async_trait]
@@ -100,6 +101,10 @@ impl DisplayHost for FakeHost {
     fn gl_display(&self) -> bool {
         self.gl
     }
+
+    fn input_tap(&self) -> Arc<crate::record::InputTap> {
+        self.tap.clone()
+    }
 }
 
 /// A display whose QMP answers `screendump` with `answer` and whose VNC
@@ -119,6 +124,7 @@ fn display(
         vnc: rfb.path.clone(),
         gl,
         qmp_opens: Mutex::new(0),
+        tap: Arc::default(),
     });
     (Display::new(host.clone()), host, rfb, dumps)
 }
@@ -174,6 +180,7 @@ async fn grab_reports_no_surface_when_the_vnc_fallback_fails_too() {
         vnc,
         gl: false,
         qmp_opens: Mutex::new(0),
+        tap: Arc::default(),
     }));
 
     let err = format!("{:#}", d.grab().await.unwrap_err());
@@ -189,4 +196,50 @@ async fn grab_does_not_fall_back_on_other_qmp_errors() {
     let err = format!("{:#}", d.grab().await.unwrap_err());
     assert!(err.contains("device busy"), "{err}");
     assert!(rfb.received.lock().unwrap().is_empty());
+}
+
+/// Every input the display sends is published to its tap, with the
+/// coordinates it had: a click that names a point is one click, not a move
+/// and a click.
+#[tokio::test]
+async fn inputs_are_published_to_the_tap() {
+    use crate::record::InputEvent;
+    let (d, host, _rfb, _dumps) = display(false, Screendump::Writes(qmp_image()), &qmp_image());
+    let mut rx = host.tap.attach();
+    d.send_keys("ctrl-c").await.unwrap();
+    d.type_text("hi", 0).await.unwrap();
+    d.mouse_move(3, 4).await.unwrap();
+    d.mouse_click("left", Some((5, 6))).await.unwrap();
+    d.mouse_click("right", None).await.unwrap();
+    d.mouse_drag(1, 1, 2, 2).await.unwrap();
+    let mut got = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        got.push(ev.event);
+    }
+    assert_eq!(
+        got,
+        vec![
+            InputEvent::Keys {
+                chord: "ctrl-c".into()
+            },
+            InputEvent::Text { text: "hi".into() },
+            InputEvent::Move { x: 3, y: 4 },
+            InputEvent::Click {
+                button: "left".into(),
+                x: Some(5),
+                y: Some(6)
+            },
+            InputEvent::Click {
+                button: "right".into(),
+                x: None,
+                y: None
+            },
+            InputEvent::Drag {
+                x1: 1,
+                y1: 1,
+                x2: 2,
+                y2: 2
+            },
+        ]
+    );
 }

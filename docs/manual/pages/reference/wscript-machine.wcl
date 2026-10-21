@@ -3,7 +3,7 @@ page ref_ws_machine {
   chapter_header "wscript API: Machine" {
     kicker       = "Reference · reference"
     reading_time = "30 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -32,7 +32,8 @@ page ref_ws_machine {
     `wait_for_text`. Guest agent: `exec`, `exec_timeout`, `copy_to`,
     `copy_from`, `logs`, `terminal`, `stats`. Identity: `logins`, `as_login`,
     `as_account`. Host USB: `usb_attach`, `usb_attach_force`, `usb_detach`,
-    `usb_detach_all`, `usb_attached`.
+    `usb_detach_all`, `usb_attached`. Console recording (surface 4):
+    `record`.
   DOC
 
   p <<DOC
@@ -1231,6 +1232,42 @@ SRC
 fn main(lab: Lab) {
     let Ok(m) = lab.vm("u1") else { return }
     for d in m.usb_attached().expect("attached") { lab.log(d.port) }
+}
+SRC
+  }
+
+  h2 "Machine.record"
+  p "Start a console recording of this VM (wscript surface 4)."
+  code wscript { source = "fn record(self, path: string, opts: Map[string, string]) -> Result[Recording, string]" }
+  table {
+    rows:
+      | "Parameter" | "Type" | "Meaning" |
+      | "`path`" | "string" | "The output file; `.mp4` (H.264) or `.webm` (VP9) by extension. Empty for the default, `.vmlab/recordings/<machine>-<UTC timestamp>.mp4`. A relative path resolves against the lab root, not the script's directory." |
+      | "`opts`" | "Map[string, string]" | "Recording options, every value a string: `fps`, `size` (`\"1280x720\"`), `compress_idle` (seconds, or `\"true\"` for the 2 second default), `timeline` (`\"true\"` or `\"false\"`), `max_duration` (`\"90\"`, `\"90s\"`, `\"5m\"`, `\"1h30m\"`). Pass `#{}` for the defaults." |
+  }
+  p <<DOC
+    Starts the same recording [vmlab record start](cmd_record) does and
+    returns a [Recording](ref_ws_types) handle for it. The recording belongs
+    to this script's run: `Recording.stop` finalises it early and returns the
+    path, and one the script never stops is finalised by the lab daemon when
+    the run ends, whether `main` returned or raised, so a failing script still
+    leaves a playable file. It fails when the machine has no display (a
+    container, "machine `web` has no display"), when it is already recording
+    (the error names the live file), when a key in `opts` is unknown or its
+    value malformed (the error says which), when the extension, size or rate
+    is refused, or when the host has no `ffmpeg` with the encoder the format
+    needs. Emits `record.started`. See [Console recording](guide_recording).
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("win01") else { return }
+    let r = vm.record("demo.mp4", #{ "compress_idle": "2", "timeline": "true" }).expect("record")
+    let k = vm.send_keys("ctrl-alt-del")
+    let t = vm.type_text("Password1!\n")
+    match r.stop() {
+        Ok(path) => lab.log("recorded " + path),
+        Err(e) => lab.log(e),
+    }
 }
 SRC
   }

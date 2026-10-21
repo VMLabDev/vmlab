@@ -1,9 +1,10 @@
-# wscript API: Lab, Segment, Term and the shared types
+# wscript API: Lab, Segment, Term, Recording and the shared types
 
 Method-by-method reference for the two handles a script starts from — `Lab`,
 which every script receives, and `Segment`, which a lab handle gives out by name
-— plus `Term`, the six record types methods return or handlers receive, and the
-two functions on the `vmlab` module. `Machine` is in wscript-machine-api.md; the
+— plus `Term`, `Recording` (the handle `Machine.record` returns), the six record
+types methods return or handlers receive, and the two functions on the `vmlab`
+module. `Machine` is in wscript-machine-api.md; the
 language itself is in wscript-language.md.
 
 Every script begins with `use vmlab`. A provision script or an ad-hoc
@@ -753,6 +754,44 @@ fn main(lab: Lab) {
     let Ok(vm) = lab.vm("box") else { return }
     let Ok(t) = vm.terminal() else { return }
     t.close()
+}
+```
+
+## Recording
+
+The handle `Machine.record` returns (wscript-machine-api.md) for a console
+recording the script started. Opaque: two methods, no fields.
+
+### Recording.stop
+
+Finalise the recording and return the path of the file.
+
+```wscript
+fn stop(self) -> Result[string, string]
+```
+
+Closes ffmpeg's input, waits for the trailer, returns the video's absolute path;
+the file plays after it. A second `stop`, or one after the daemon already
+finalised the recording (its `max_duration` reached, the machine stopped, the
+disk low), fails with "machine `win01` is not recording". A handle dropped
+without `stop` is finalised by the daemon when the run ends, success or failure.
+
+### Recording.path
+
+```wscript
+fn path(self) -> string
+```
+
+The absolute output path the recording was started with, the default under
+`.vmlab/recordings/` included. Never fails; the same string `stop` returns.
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("win01") else { return }
+    let Ok(r) = vm.record("", #{}) else { return }
+    lab.log("recording to " + r.path())
+    vmlab::sleep_ms(5000)
+    let path = r.stop().expect("stop")
 }
 ```
 

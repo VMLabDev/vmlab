@@ -16,6 +16,8 @@
 use ipnet::Ipv4Net;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::record::{RecordOptions, RecordRequest};
 use serde_json::{Map, Value, json};
 
 use super::error::CommandError;
@@ -464,6 +466,10 @@ vocabulary! {
         /// Streams provisioning output.
         Up = "up" {
             #[serde(default, alias = "vms")] machines: Vec<String>,
+            /// Recordings to start with the machines that boot (§11.1, D20):
+            /// each VM named is started paused, its recorder attached, then
+            /// continued.
+            #[serde(default)] record: Vec<RecordRequest>,
         },
         /// Download every pending template and image without starting
         /// anything, over the code path `up` runs first.
@@ -484,6 +490,10 @@ vocabulary! {
         )]
         Run = "run" {
             script: String,
+            /// Recordings that last exactly as long as the run (§11.1, D8):
+            /// started before the script, finalised when it returns, success
+            /// or failure.
+            #[serde(default)] record: Vec<RecordRequest>,
         },
         /// Stop the lab, or just the named machines (empty = all).
         Down = "down" {
@@ -496,6 +506,8 @@ vocabulary! {
         /// Start one machine, pulling its template or image first.
         MachineStart = "machine.start" {
             #[serde(alias = "vm", alias = "container")] machine: String,
+            /// A recording to start from the first frame (§11.1, D20).
+            #[serde(default)] record: Vec<RecordRequest>,
         },
         /// Stop one machine; `force` kills instead of the graceful ladder.
         MachineStop = "machine.stop" {
@@ -506,6 +518,9 @@ vocabulary! {
         MachineRestart = "machine.restart" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default)] force: bool,
+            /// A recording to start from the first frame of the new boot
+            /// (§11.1, D20); a machine already recording is a `conflict`.
+            #[serde(default)] record: Vec<RecordRequest>,
         },
         /// Stop one machine and delete everything it materialised.
         MachineDestroy = "machine.destroy" {
@@ -700,6 +715,36 @@ vocabulary! {
         )]
         MachineHeldUsb = "machine.usb_attached" {
             #[serde(default, alias = "vm", alias = "container")] machine: Option<String>,
+        },
+        /// Record one VM's console to an MP4 or WebM file (§11.1): the
+        /// path's extension picks the format, `options` the rate, size, idle
+        /// compression, timeline and cap. One per machine (`conflict`); a
+        /// container has no display (`unsupported`); missing ffmpeg or
+        /// encoder is `failed`. Answers with the live recording's status.
+        #[one_way(
+            "cli",
+            "A script records through the lab runtime it is bound to              (`m.record`), not over the socket, so the verb is the one caller              that crosses it."
+        )]
+        MachineRecordStart = "machine.record_start" {
+            #[serde(alias = "vm")] machine: String,
+            /// Absolute output path; absent means `.vmlab/recordings/<machine>-<stamp>.mp4`.
+            #[serde(default)] path: Option<String>,
+            #[serde(default)] options: RecordOptions,
+        },
+        /// Finalise one VM's recording to a playable file. Answers with the
+        /// path and the video's length.
+        #[one_way("cli", "The other half of `machine.record_start`, and one-way for the same reason.")]
+        MachineRecordStop = "machine.record_stop" {
+            #[serde(alias = "vm")] machine: String,
+        },
+        /// Every live recording in the lab — or, with `machine` named, that
+        /// machine's: path, start time, elapsed time and options.
+        #[one_way(
+            "cli",
+            "`status` folds the same entries into each machine's line; this              is the recording-only view `vmlab record status` shows."
+        )]
+        MachineRecordStatus = "machine.record_status" {
+            #[serde(default, alias = "vm")] machine: Option<String>,
         },
         /// Resize an open terminal session.
         MachineTtyResize = "machine.tty_resize" {
@@ -1233,7 +1278,8 @@ mod tests {
             assert_eq!(
                 req,
                 LabRequest::MachineStart {
-                    machine: "dc01".into()
+                    machine: "dc01".into(),
+                    record: Vec::new(),
                 }
             );
         }
@@ -1242,7 +1288,8 @@ mod tests {
             assert_eq!(
                 req,
                 LabRequest::Up {
-                    machines: vec!["dc01".into()]
+                    machines: vec!["dc01".into()],
+                    record: Vec::new(),
                 }
             );
         }
@@ -1257,14 +1304,16 @@ mod tests {
         assert_eq!(
             req,
             LabRequest::MachineStart {
-                machine: "a".into()
+                machine: "a".into(),
+                record: Vec::new(),
             }
         );
         let req = LabRequest::from_wire("up", json!({"machines": ["a"], "vms": ["b"]})).unwrap();
         assert_eq!(
             req,
             LabRequest::Up {
-                machines: vec!["a".into()]
+                machines: vec!["a".into()],
+                record: Vec::new(),
             }
         );
     }

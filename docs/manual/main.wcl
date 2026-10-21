@@ -30,6 +30,7 @@ import "./pages/guide/usb.wcl"
 import "./pages/guide/snapshots.wcl"
 import "./pages/guide/scripting.wcl"
 import "./pages/guide/vision.wcl"
+import "./pages/guide/recording.wcl"
 import "./pages/guide/playbooks.wcl"
 import "./pages/guide/logins.wcl"
 import "./pages/guide/apps.wcl"
@@ -69,6 +70,7 @@ import "./pages/commands/snapshot.wcl"
 import "./pages/commands/playbook.wcl"
 import "./pages/commands/template.wcl"
 import "./pages/commands/console.wcl"
+import "./pages/commands/record.wcl"
 import "./pages/commands/script.wcl"
 import "./pages/commands/exec.wcl"
 import "./pages/commands/shell.wcl"
@@ -131,6 +133,7 @@ site manual {
       chapter "Snapshots"                            { page = guide_snapshots }
       chapter "Guest automation with wscript"        { page = guide_scripting }
       chapter "Screens, input and vision"            { page = guide_vision }
+      chapter "Console recording"                    { page = guide_recording }
       chapter "Playbooks"                            { page = guide_playbooks }
       chapter "Logins"                                { page = guide_logins }
       chapter "Shared apps"                          { page = guide_apps }
@@ -170,6 +173,7 @@ site manual {
       chapter "vmlab playbook"   { page = cmd_playbook }
       chapter "vmlab template"   { page = cmd_template }
       chapter "vmlab console"    { page = cmd_console }
+      chapter "vmlab record"     { page = cmd_record }
       chapter "vmlab script"     { page = cmd_script }
       chapter "vmlab exec"       { page = cmd_exec }
       chapter "vmlab shell"      { page = cmd_shell }

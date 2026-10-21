@@ -6,7 +6,7 @@ page apx_troubleshooting {
   chapter_header "Troubleshooting" {
     kicker       = "Appendices · reference"
     reading_time = "18 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -382,6 +382,46 @@ MSG
     hardware: an online snapshot taken before you added it no longer
     restores. A container refuses differently, with `USB passthrough is for
     VMs`, and has no setting that changes that.
+  DOC
+
+  h2 "A recording needs ffmpeg"
+  code text { source = <<'MSG'
+recording needs ffmpeg: none found on PATH, and the host config (config.wcl) names none under `ffmpeg`
+recording a .mp4 needs the `libx264` encoder, which {ffmpeg} -encoders does not list; install an ffmpeg built with it, or point the host config's `ffmpeg` key at one
+MSG
+  }
+  p <<DOC
+    A [console recording](guide_recording) is encoded by the host's ffmpeg,
+    which the lab daemon looks for only when a recording starts. The first
+    message means no `ffmpeg` is on the daemon's `PATH` and the
+    [host config](ref_host) names none: install ffmpeg, or set `ffmpeg` in
+    `config.wcl` to the binary. The second means the ffmpeg found cannot
+    write the format you asked for: `.mp4` needs `libx264`, `.webm` needs
+    `libvpx-vp9`. Distribution builds usually carry both; a minimal build
+    may carry neither. Install one that does, or point the `ffmpeg` key at
+    one. Either refusal exits 1 (`failed`) and nothing was recorded.
+  DOC
+
+  h2 "The machine is already recording"
+  code text { source = "machine `{machine}` is already recording to {path}; stop it first (`vmlab record stop {machine}`)" }
+  p <<DOC
+    One recording per machine. The live file is the one named; stop it with
+    `vmlab record stop {machine}` and start again, or let the one that is
+    running finish. The same refusal, exit 5 (`conflict`), meets a
+    `vmlab vm restart --record` of a VM already recording, because the
+    running recording follows the restart on its own, and a script's
+    `record` on a machine another surface is recording. `vmlab record
+    status` lists what is live.
+  DOC
+
+  h2 "A recording was asked of a machine with no display"
+  code text { source = "machine `{machine}` has no display" }
+  p <<DOC
+    Only a VM has a framebuffer to record. A container runs in a micro-VM
+    with no display, so `vmlab record start`, `--record` and a script's
+    `record` refuse it with exit 6 (`unsupported`); nothing changes that.
+    The same words meet the screen methods on a container, for the same
+    reason.
   DOC
 
   h2 "Large reads fail on a Windows virtiofs share"

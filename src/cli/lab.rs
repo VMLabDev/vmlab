@@ -190,7 +190,8 @@ pub(super) fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Runtime::new()?)
 }
 
-pub fn cmd_up(vms: Vec<String>) -> Result<()> {
+pub fn cmd_up(vms: Vec<String>, record: Vec<crate::record::RecordRequest>) -> Result<()> {
+    super::record::check_targets(&record)?;
     rt()?.block_on(async {
         // Validate before any side effect (PRD §5.1: implicitly every verb).
         let file = super::validate::validate_current()?;
@@ -204,12 +205,16 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
             .send_streaming(
                 LabRequest::Up {
                     machines: vms.clone(),
+                    record: record.clone(),
                 },
                 |chunk| print!("{chunk}"),
             )
             .await
             .map_err(remote)?;
         println!("lab \"{name}\" is up");
+        if let Some(line) = super::record::finished_line(&record) {
+            println!("{}", line.replace("recorded", "recording"));
+        }
 
         // `gui = true` VMs get a detached VNC viewer opened from this
         // interactive session (the daemon is headless and can't reach the
@@ -490,6 +495,29 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
         }
     }
 
+    // Recordings (§11.1), in their own section for the same reason as dev
+    // machines below: most of the time there are none, and the path and the
+    // elapsed time do not fit a shared row.
+    let recording: Vec<_> = status
+        .machines
+        .iter()
+        .filter_map(|m| m.recording.as_ref())
+        .collect();
+    if !recording.is_empty() {
+        let name_w = column_width("RECORDING", recording.iter().map(|r| r.machine.len()));
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  {:<name_w$} {:>8}  PATH", "RECORDING", "ELAPSED");
+        for r in recording {
+            let _ = writeln!(
+                out,
+                "  {:<name_w$} {:>7}s  {}",
+                r.machine,
+                r.elapsed_secs.round() as u64,
+                r.path.display()
+            );
+        }
+    }
+
     // Dev machines (PRD §19.1), in their own section rather than as a column
     // on every machine: most labs have none, and the two things worth naming —
     // which one is *the* dev machine, and where its workspace lands — do not
@@ -600,6 +628,10 @@ fn machine_detail(m: &MachineStatus) -> String {
     // matters (§19.4).
     if m.agent_diverged {
         detail.push_str(" diverged=yes");
+    }
+    // Likewise a recording (§11.1): only the machine in the middle of one.
+    if let Some(r) = &m.recording {
+        detail.push_str(&format!(" recording={}", r.path.display()));
     }
     let mut field = |k: &str, v: String| detail.push_str(&format!(" {k}={v}"));
     match &m.detail {
@@ -1053,18 +1085,34 @@ pub enum PowerOp {
 }
 
 impl PowerOp {
-    /// The request this operation makes against one machine.
-    fn request(self, machine: String, force: bool) -> LabRequest {
+    /// The request this operation makes against one machine. `record` is the
+    /// `--record` a start or restart carries (§11.1, D20); a stop has none.
+    fn request(
+        self,
+        machine: String,
+        force: bool,
+        record: Vec<crate::record::RecordRequest>,
+    ) -> LabRequest {
         match self {
-            PowerOp::Start => LabRequest::MachineStart { machine },
+            PowerOp::Start => LabRequest::MachineStart { machine, record },
             PowerOp::Stop => LabRequest::MachineStop { machine, force },
-            PowerOp::Restart => LabRequest::MachineRestart { machine, force },
+            PowerOp::Restart => LabRequest::MachineRestart {
+                machine,
+                force,
+                record,
+            },
         }
     }
 }
 
 /// `vmlab vm start|stop|restart` and `vmlab container start|stop|restart`.
-pub fn cmd_machine_power(machine_ref: &str, op: PowerOp, force: bool) -> Result<()> {
+pub fn cmd_machine_power(
+    machine_ref: &str,
+    op: PowerOp,
+    force: bool,
+    record: Vec<crate::record::RecordRequest>,
+) -> Result<()> {
+    super::record::check_targets(&record)?;
     rt()?.block_on(async {
         let (lab, machine) = split_vm_ref(machine_ref)?;
         // Starting a machine builds it from the daemon's configuration, so
@@ -1073,10 +1121,14 @@ pub fn cmd_machine_power(machine_ref: &str, op: PowerOp, force: bool) -> Result<
             PowerOp::Start | PowerOp::Restart => current_lab_client_for(lab).await?,
             PowerOp::Stop => lab_client_for(lab).await?,
         };
+        let started = super::record::finished_line(&record);
         client
-            .send(op.request(machine, force))
+            .send(op.request(machine, force, record))
             .await
             .map_err(remote)?;
+        if let Some(line) = started {
+            println!("{}", line.replace("recorded", "recording"));
+        }
         Ok(())
     })
 }
@@ -1786,7 +1838,8 @@ fn cp_pull(vm_part: &str, guest_src: &str, dest: &str) -> Result<()> {
     })
 }
 
-pub fn cmd_run(script: &str) -> Result<()> {
+pub fn cmd_run(script: &str, record: Vec<crate::record::RecordRequest>) -> Result<()> {
+    super::record::check_targets(&record)?;
     rt()?.block_on(async {
         let (name, root) = current_lab()?;
         if !root.join(script).is_file() {
@@ -1797,11 +1850,15 @@ pub fn cmd_run(script: &str) -> Result<()> {
             .send_streaming(
                 LabRequest::Run {
                     script: script.to_string(),
+                    record: record.clone(),
                 },
                 |chunk| print!("{chunk}"),
             )
             .await
             .map_err(remote)?;
+        if let Some(line) = super::record::finished_line(&record) {
+            println!("{line}");
+        }
         Ok(())
     })
 }
@@ -2469,6 +2526,36 @@ mod tests {
         assert!(!lines[1].contains("diverged"), "got:\n{out}");
     }
 
+    /// A recording shows as its own section and, under `-v`, on the machine's
+    /// detail line; a machine recording nothing says nothing about it.
+    #[test]
+    fn a_recording_is_named_under_its_own_machine() {
+        let mut recording = addressed("vm01", PowerState::Running, true, vm());
+        recording.recording = Some(crate::record::RecordingStatus {
+            machine: "vm01".into(),
+            path: "/r/demo.mp4".into(),
+            started_at: chrono::Utc::now(),
+            elapsed_secs: 42.0,
+            options: crate::record::RecordOptions::default(),
+        });
+        let out = render_status(
+            &lab(vec![
+                recording,
+                addressed("dc01", PowerState::Running, true, vm()),
+            ]),
+            true,
+        );
+        assert!(out.contains("RECORDING"), "got:\n{out}");
+        let section = out
+            .lines()
+            .find(|l| l.contains("42s  /r/demo.mp4"))
+            .expect("section row");
+        assert!(section.trim_start().starts_with("vm01"), "got:\n{out}");
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("state=")).collect();
+        assert!(lines[0].contains("recording=/r/demo.mp4"), "got:\n{out}");
+        assert!(!lines[1].contains("recording"), "got:\n{out}");
+    }
+
     /// A machine with no address reads as `-` rather than shifting the columns.
     #[test]
     fn a_machine_without_an_address_still_lines_up() {
@@ -2541,24 +2628,26 @@ mod tests {
     #[test]
     fn power_ops_build_their_documented_requests() {
         assert_eq!(
-            PowerOp::Start.request("dc01".into(), true),
+            PowerOp::Start.request("dc01".into(), true, Vec::new()),
             // Start has nothing to force.
             LabRequest::MachineStart {
                 machine: "dc01".into(),
+                record: Vec::new(),
             }
         );
         assert_eq!(
-            PowerOp::Stop.request("dc01".into(), true),
+            PowerOp::Stop.request("dc01".into(), true, Vec::new()),
             LabRequest::MachineStop {
                 machine: "dc01".into(),
                 force: true,
             }
         );
         assert_eq!(
-            PowerOp::Restart.request("dc01".into(), false),
+            PowerOp::Restart.request("dc01".into(), false, Vec::new()),
             LabRequest::MachineRestart {
                 machine: "dc01".into(),
                 force: false,
+                record: Vec::new(),
             }
         );
     }

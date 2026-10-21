@@ -32,6 +32,7 @@ SCENARIOS = [
     "containers",
     "snapshots",
     "scripting",
+    "record",
     "playbooks",
     "dev",
     "apps",

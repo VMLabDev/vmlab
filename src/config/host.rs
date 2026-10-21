@@ -35,6 +35,9 @@ pub struct HostConfig {
     /// The FreeRDP client for shared apps from Windows guests (PRD §20.4);
     /// `None` = `xfreerdp3`, then `xfreerdp`, on `PATH`.
     pub freerdp: Option<std::path::PathBuf>,
+    /// The ffmpeg console recordings are encoded with (PRD §11.1); `None` =
+    /// `ffmpeg` on `PATH`. Read by the lab daemon when a recording starts.
+    pub ffmpeg: Option<std::path::PathBuf>,
     pub oci_chunk_size: u64,
     /// Network fast-path tier selection (§9.1 substitutable backend).
     pub fastpath: crate::net::fastpath::FastpathMode,
@@ -108,6 +111,7 @@ impl Default for HostConfig {
             viewer: None,
             waypipe: None,
             freerdp: None,
+            ffmpeg: None,
             oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
             fastpath: crate::net::fastpath::FastpathMode::Auto,
             config_weave_bin_dir: None,
@@ -168,6 +172,7 @@ impl HostConfig {
             }
             cfg.viewer = r.string("viewer").unspan();
             cfg.waypipe = r.path("waypipe").unspan();
+            cfg.ffmpeg = r.path("ffmpeg").unspan();
             cfg.freerdp = r.path("freerdp").unspan();
             if let Some(v) = r
                 .keyword("fastpath", crate::net::fastpath::FastpathMode::NAMES)
@@ -373,6 +378,7 @@ host {
   workspace_max_file = 2GiB
   firmware_dir     = "/opt/edk2"
   waypipe          = "/opt/waypipe/bin/waypipe"
+  ffmpeg           = "/opt/ffmpeg/bin/ffmpeg"
   freerdp          = "/usr/bin/sdl-freerdp3"
 }
 "#,
@@ -391,6 +397,10 @@ host {
         assert_eq!(
             cfg.waypipe.as_deref(),
             Some(Path::new("/opt/waypipe/bin/waypipe"))
+        );
+        assert_eq!(
+            cfg.ffmpeg.as_deref(),
+            Some(Path::new("/opt/ffmpeg/bin/ffmpeg"))
         );
         assert_eq!(
             cfg.freerdp.as_deref(),

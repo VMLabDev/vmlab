@@ -3,7 +3,7 @@ page cmd_status {
   chapter_header "vmlab status" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-10-20"
+    updated      = "2026-10-21"
     version      = "vmlab 0.31"
   }
 
@@ -89,6 +89,15 @@ page cmd_status {
     machine carries its `kind`, its label, and the fields above under their
     own names (`host_gpu`, `qemu_binary`, and `qemu_env` as an object of
     `NAME: value`), each omitted where it has nothing to say.
+  DOC
+
+  p <<DOC
+    While any [console recording](guide_recording) is live the machine table
+    is followed by a `RECORDING` section, one row per recording with the
+    machine, the elapsed seconds and the file's path, and `--verbose` adds
+    `recording=<path>` to that machine's detail line. With `--json` the
+    machine carries a `recording` object: `machine`, `path`, `started_at`,
+    `elapsed_secs` and `options`.
   DOC
 
   h3 "Dev machines"

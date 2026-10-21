@@ -342,7 +342,7 @@ A failed variant build reports which variant failed and stops; the base and ever
 ### 6.2 Store, addressing, export
 
 - Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>][#<variant>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store; the `#<variant>` suffix selects one disk of a version that has variants (§6.6). `vmlab validate` rejects archless references.
-- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle. Surface 3 adds host USB passthrough (§5.2.1): `lab.usb_devices()`, and `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` on the machine handle.
+- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle. Surface 3 adds host USB passthrough (§5.2.1): `lab.usb_devices()`, and `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` on the machine handle. Surface 4 adds console recording (§11.1): `record` on the machine handle, and the `Recording` handle it returns with `stop` and `path`.
 - `vmlab template list / rm` manage the store. `list` shows each version's variants beneath it, the default marked and a stale one flagged; `rm <arch>/<name>@<version>` removes the version with all its variants, and `rm …#<variant>` removes that one variant (§6.6).
 - `vmlab template export` produces a single portable archive (qcow2 + metadata, and every variant's `variants/<variant>/disk.qcow2` with the full `template.wcl`); `vmlab template import` installs one, refusing any variant whose overlay is not the one its block's `sha256` names or whose `base_sha256` is not the archive's base — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).
@@ -750,6 +750,9 @@ m.wait_for_any([refs], opts) -> Match       #   region{x,y,w,h}, interval
 m.find_image(ref, opts) -> Match | None     # single-shot, no wait
 m.ocr(opts) -> string                       # Tesseract; optional region
 m.wait_for_text(pattern, opts) -> Match     # OCR-based wait, regex pattern
+m.record(path, opts) -> Recording           # console video (§11.1); opts: fps,
+                                            #   size, compress_idle, timeline,
+                                            #   max_duration; r.stop() -> path
 ```
 
 Reference images are paths relative to the lab (convention: `images/` beside `vmlab.wcl`). Matching is normalised template matching with a similarity threshold (default ~0.9, overridable). `Match` carries location + score, so a found image can anchor a relative mouse click.
@@ -800,27 +803,48 @@ Every VM gets a VNC display served on a unix socket (TCP optional, off by defaul
 
 The viewer is chosen automatically: an explicit `viewer` in host config wins, else the first of `remote-viewer` (virt-viewer), `gvncviewer`, `vncviewer` found on `PATH`. `remote-viewer` dials the VNC unix socket directly; the others are TCP-only, so vmlab bridges the socket to a localhost display port for them. Neither `vmlab console` nor the `gui = true` auto-open ties up the terminal: a TCP viewer's bridge runs in a detached helper (`vmlab __vncbridge`, in its own session) that exits when the viewer window closes. With no viewer at all, `vmlab console` falls back to bridging and printing the address to attach to manually (the WSL2 path, also forced with `--tcp`).
 
+### 11.1 Console recording
+
+The lab daemon records a VM's console to a video file. It holds one long-lived, shared RFB connection of its own to the VM's existing VNC socket — beside `vmlab console` and the input transport, never through them — receives incremental framebuffer updates and QEMU's cursor shape, composites the pointer and a ripple at each click vmlab sends, and pipes constant-rate frames to host `ffmpeg`.
+
+**Control.** `vmlab record start <vm> [-o path] [--fps N] [--size WxH] [--compress-idle[=secs]] [--timeline] [--max-duration D]`, `vmlab record stop <vm>` (answers with the finalised path and the video's length) and `vmlab record status [vm]` (path, start time, elapsed time and options of each live recording; `vmlab status` shows the same per machine, in `-v` and `--json` too). `--record <vm>=<path>` (repeatable, with the same option flags applied to every recording named) on `vmlab script` records for exactly the run — finalised when the script returns, success or failure — and on `vmlab up`, `vmlab vm start` and `vmlab vm restart` records from the first frame: QEMU starts paused (`-S`), the recorder attaches, then the VM is continued over QMP. From wscript, `m.record(path, opts)` returns a `Recording` whose `stop()` finalises and returns the path; a recording a script never stops is finalised by the daemon when the run ends.
+
+**Output.** The path's extension picks the format: `.mp4` (H.264, `yuv420p`) or `.webm` (VP9); anything else, `.gif` included, is refused before recording starts — convert afterwards. The CLI resolves a relative path against the caller's working directory and sends an absolute one; wscript resolves against the lab root; no path means `.vmlab/recordings/<vm>-<timestamp>.mp4`. Constant frame rate, 30 fps by default. One output size per file, 1920x1080 by default; every frame is scaled with its aspect preserved and letterboxed, so a recording that starts at a 640x480 boot screen and ends on a larger desktop is one file at one size.
+
+**Pointer and clicks.** QEMU never puts the pointer position on the wire, so the pointer is drawn at the last absolute position vmlab itself sent through the machine's display — `send_keys`, `type_text`, `mouse_move`, `mouse_click` and `mouse_drag`, from a script or the CLI, are the only input source the recorder knows; a human's input through a VNC viewer is not tracked. The pointer is drawn only once a cursor shape rectangle has arrived (virtio-vga and virtio-gpu, qxl, vmware); std VGA, bochs and cirrus guests paint their own pointer into the framebuffer and send none, so nothing is drawn twice. A `DesktopSize` change, a reconnect or a guest reboot resets the shape to unknown until a new one arrives. A ripple is drawn at every click vmlab sends and at both ends of a drag. Captions, key overlays and titles are a video editor's work; there is no audio.
+
+**Idle compression.** Off by default. `--compress-idle[=secs]` (`compress_idle` in opts; threshold 2 s by default) cuts a stretch in which no framebuffer change exceeded a small area — a blinking caret or a clock does not count — and vmlab sent no input, once it is longer than the threshold, to half a second of video. A click on a static screen is activity and is never cut.
+
+**Timeline.** `--timeline` (`timeline: true`) writes `<output>.events.json` beside the video: every input vmlab sent while recording, each stamped in output-video time (through the cuts) and in wall time, plus the cuts themselves.
+
+**ffmpeg.** Found through the host config key `ffmpeg` (a path), else `ffmpeg` on `PATH`, and checked when a recording starts — never at `up` unless `--record` is given — including that the encoder the format needs is built in (`libx264` for MP4, `libvpx-vp9` for WebM). The refusal names both discovery routes and the missing encoder. Everything else in vmlab works without ffmpeg.
+
+**Ownership and lifecycle.** The lab daemon owns every recording, so it outlives the CLI that started it. One recording per machine: a second start is `conflict`, naming the live file. A container has no display: `unsupported`. A bad extension, size, rate or path is `invalid_argument`; a missing ffmpeg or encoder, or a VNC socket that refuses, is `failed`. A guest reboot in the same QEMU needs nothing. `vm restart` and a snapshot restore replace or rewind the VM under the recording, which continues, repeating the last frame while the socket is gone and reconnecting when the new QEMU's appears, so the result is one continuous file. `vm stop`, `down`, `destroy`, `vm destroy` and the lab daemon's own exit finalise the file — ffmpeg's input closed, the trailer written, the process awaited — before anything else goes. `--max-duration` finalises at that length of video; the lab's disk watchdog finalises every live recording when it trips. Events: `record.started` and `record.stopped`.
+
+**Out of scope.** GIF output; `vmlab template build --record` (the recorder depends only on a socket path, an input feed and an options value, so the supervisor can host it later); audio; a hidden hardware cursor on a virtio-gpu guest, which never reaches VNC, so the last shape stays drawn.
+
 ---
 
 ## 12. CLI
 
 | Verb | Action |
 |---|---|
-| `vmlab up [vm...]` | Create/start lab (or subset), run provision scripts; always from the lab file as it is on disk now (§7.1) |
+| `vmlab up [vm...] [--record vm=path]` | Create/start lab (or subset), run provision scripts; always from the lab file as it is on disk now (§7.1); `--record` records a VM from its first frame (§11.1) |
 | `vmlab down [vm...]` | Graceful stop; clones retained; a full `down` also reaps the lab daemon and releases the lab name |
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
 | `vmlab lab move <lab> [--from <dir>]` | Run in the lab root that should own a stopped lab (its `vmlab.wcl` declaring the same name): refuses while any of the lab's machines or processes run, or when this root already holds machine data; warns naming each machine the two lab files declare differently; releases the name; moves the working data (`.vmlab/`, or the `VMLAB_WORK_DIR` directory keyed by the root), renaming on one filesystem and otherwise copying, verifying and only then deleting the source; drops `smb/smb.conf` and rebases each `@dev` sync ledger onto the new root; lists each share, volume or workspace folder missing under the new root; and registers the lab from there. `--from` names the old root once the name is released |
 | `vmlab status [-v] [--json]` | Machine status, IPs and segments, plus `dev` (§19.1); `-v` adds raw state and per-kind detail; `--json` prints the status projection |
 | `vmlab validate` | Full §5.1 validation, no side effects |
-| `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2) |
+| `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2); `start` and `restart` take `--record vm=path` (§11.1) |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |
 | `vmlab console <vm>` | Attach viewer |
+| `vmlab record start / stop / status` | Record a VM's console to MP4 or WebM, owned by the lab daemon; pointer and click ripples drawn, idle compression and a timeline opt-in (§11.1) |
 | `vmlab usb list / attach / detach` | Host USB devices and who holds each; hot-plug one into a running VM with `usb = true` and back (§5.2.1) |
 | `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
 | `vmlab cp <src> <vm>:<dest>` | Copy a host file/tree into a guest via the agent |
 | `vmlab app run [--via waypipe\|x11\|rdp] [--detach] <machine> -- cmd` | Show one guest program's windows on the host desktop (§20) |
 | `vmlab osinfo <vm>` | Guest OS identification as JSON |
-| `vmlab script <script.ws>` | Ad-hoc script against the current lab |
+| `vmlab script <script.ws> [--record vm=path]` | Ad-hoc script against the current lab; `--record` records a VM for exactly the run (§11.1) |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
 | `vmlab dev sync status / flush / diff / resolve` | Workspace syncer state and conflict resolution (§19.6) |
 | `vmlab machine capabilities / stats` | Per-machine probed capabilities, including agent features (§19.4) |
@@ -2219,7 +2243,7 @@ inside the container's root filesystem, where the program can reach them.
 
 ### 20.4 Configuration
 
-The host config (`config.wcl`, like `viewer` in §11) can name the host-side binaries: `waypipe` for the waypipe
+The host config (`config.wcl`, like `viewer` in §11 and `ffmpeg` in §11.1) can name the host-side binaries: `waypipe` for the waypipe
 client and `freerdp` for the RDP client. Unset, the CLI finds `waypipe` on
 `PATH`, and `xfreerdp3` then `xfreerdp` for FreeRDP. The lab file needs nothing.
 Sharing an app is a CLI act on a running machine, not a declaration.

@@ -3,9 +3,15 @@
 //!
 //! It completes the auth-less handshake, records every client message, and
 //! answers the n-th `FramebufferUpdateRequest` on each connection with the
-//! n-th scripted reply — raw server bytes, built with the helpers below.
+//! n-th scripted reply — raw server bytes, built with the helpers below. An
+//! empty reply closes the connection instead ([`CLOSE`]), the way QEMU drops
+//! a client it has given up on; a fresh connection starts the replies over.
+//! [`FakeRfb::vanish`] and [`FakeRfb::reappear`] take the socket away and
+//! bring it back on the same path, which is what a `vm restart` does to a
+//! recorder (§11).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use image::RgbImage;
@@ -17,27 +23,88 @@ pub(crate) struct FakeRfb {
     pub path: PathBuf,
     /// Every client message after `ClientInit`, whole, in arrival order.
     pub received: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// How many connections the server has accepted so far.
+    pub connections: Arc<AtomicUsize>,
+    accept: tokio::task::JoinHandle<()>,
+    /// Flipped by `vanish` so every open connection of this generation ends.
+    closed: tokio::sync::watch::Sender<bool>,
 }
+
+/// The reply that closes the connection instead of answering.
+pub(crate) const CLOSE: Vec<u8> = Vec::new();
 
 /// Serve a `width`x`height` framebuffer, answering update requests with
 /// `replies` in order.
 pub(crate) fn spawn(width: u16, height: u16, replies: Vec<Vec<u8>>) -> FakeRfb {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("vnc.sock");
-    let listener = UnixListener::bind(&path).expect("bind fake rfb socket");
     let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
-    let rec = Arc::clone(&received);
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let replies = replies.clone();
-            let rec = Arc::clone(&rec);
-            tokio::spawn(serve(stream, width, height, replies, rec));
-        }
-    });
+    let connections = Arc::new(AtomicUsize::new(0));
+    let (accept, closed) = listen(&path, width, height, replies, &received, &connections);
     FakeRfb {
         _dir: dir,
         path,
         received,
+        connections,
+        accept,
+        closed,
+    }
+}
+
+fn listen(
+    path: &std::path::Path,
+    width: u16,
+    height: u16,
+    replies: Vec<Vec<u8>>,
+    received: &Arc<Mutex<Vec<Vec<u8>>>>,
+    connections: &Arc<AtomicUsize>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let listener = UnixListener::bind(path).expect("bind fake rfb socket");
+    let rec = Arc::clone(received);
+    let conns = Arc::clone(connections);
+    let (closed, closed_rx) = tokio::sync::watch::channel(false);
+    let accept = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            conns.fetch_add(1, Ordering::SeqCst);
+            let replies = replies.clone();
+            let rec = Arc::clone(&rec);
+            let mut closed = closed_rx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    r = serve(stream, width, height, replies, rec) => r,
+                    _ = closed.changed() => Ok(()),
+                }
+            });
+        }
+    });
+    (accept, closed)
+}
+
+impl FakeRfb {
+    /// Stop listening, close every open connection and remove the socket,
+    /// as a QEMU that exited would.
+    pub(crate) fn vanish(&self) {
+        self.accept.abort();
+        let _ = self.closed.send(true);
+        let _ = std::fs::remove_file(&self.path);
+    }
+
+    /// Listen again on the same path, as the next QEMU would, serving a
+    /// `width`x`height` screen with `replies`.
+    pub(crate) fn reappear(&mut self, width: u16, height: u16, replies: Vec<Vec<u8>>) {
+        let (accept, closed) = listen(
+            &self.path,
+            width,
+            height,
+            replies,
+            &self.received,
+            &self.connections,
+        );
+        self.accept = accept;
+        self.closed = closed;
     }
 }
 
@@ -92,6 +159,9 @@ async fn serve(
         if kind == 3
             && let Some(reply) = replies.next()
         {
+            if reply.is_empty() {
+                return Ok(());
+            }
             s.write_all(&reply).await?;
         }
     }
@@ -123,6 +193,56 @@ pub(crate) fn raw_rect(img: &RgbImage, x: u16, y: u16, w: u16, h: u16) -> Vec<u8
 /// A `DesktopSize` pseudo-rectangle announcing a `w`x`h` framebuffer.
 pub(crate) fn desktop_size(w: u16, h: u16) -> Vec<u8> {
     rect_header(0, 0, w, h, -223)
+}
+
+/// An AlphaCursor pseudo-rectangle as QEMU sends it: hotspot `(hx, hy)`,
+/// `w`x`h`, a RAW sub-encoding, then one host-order ARGB `u32` per pixel —
+/// the bytes `B G R A` on a little-endian host. `argb` is one `[a, r, g, b]`
+/// per pixel.
+pub(crate) fn alpha_cursor(hx: u16, hy: u16, w: u16, h: u16, argb: &[[u8; 4]]) -> Vec<u8> {
+    assert_eq!(argb.len(), w as usize * h as usize);
+    let mut r = rect_header(hx, hy, w, h, -314);
+    r.extend_from_slice(&0i32.to_be_bytes());
+    for [a, red, g, b] in argb {
+        r.extend_from_slice(&u32::from_be_bytes([*a, *red, *g, *b]).to_le_bytes());
+    }
+    r
+}
+
+/// A RichCursor pseudo-rectangle: `w`x`h` pixels in the capture's pixel
+/// format (`B G R x`) then a 1 bpp mask, rows padded to a byte, MSB first.
+/// `rgb` is one `[r, g, b]` per pixel and `opaque` one flag per pixel.
+pub(crate) fn rich_cursor(
+    hx: u16,
+    hy: u16,
+    w: u16,
+    h: u16,
+    rgb: &[[u8; 3]],
+    opaque: &[bool],
+) -> Vec<u8> {
+    assert_eq!(rgb.len(), w as usize * h as usize);
+    assert_eq!(opaque.len(), rgb.len());
+    let mut r = rect_header(hx, hy, w, h, -239);
+    for [red, g, b] in rgb {
+        r.extend_from_slice(&[*b, *g, *red, 0]);
+    }
+    let stride = (w as usize).div_ceil(8);
+    for row in 0..h as usize {
+        let mut bytes = vec![0u8; stride];
+        for col in 0..w as usize {
+            if opaque[row * w as usize + col] {
+                bytes[col / 8] |= 0x80 >> (col % 8);
+            }
+        }
+        r.extend_from_slice(&bytes);
+    }
+    r
+}
+
+/// A pseudo-rectangle with no payload and an encoding the client never asked
+/// for (QEMU's extended key event announcement).
+pub(crate) fn unrequested_pseudo() -> Vec<u8> {
+    rect_header(0, 0, 0, 0, -258)
 }
 
 fn rect_header(x: u16, y: u16, w: u16, h: u16, encoding: i32) -> Vec<u8> {

@@ -225,7 +225,7 @@ mod tests {
         async fn handle(&self, req: LabRequest, stream: &Streamer) -> Result<Value, CommandError> {
             match req {
                 LabRequest::Ping {} => Ok(Value::String("pong".into())),
-                LabRequest::MachineStart { machine } => Err(CommandError::conflict(format!(
+                LabRequest::MachineStart { machine, .. } => Err(CommandError::conflict(format!(
                     "{machine} is already running"
                 ))),
                 LabRequest::MachineStop { machine, force } => {
@@ -237,7 +237,7 @@ mod tests {
                 LabRequest::SnapshotList { machine } => {
                     Err(CommandError::not_found(format!("no machine `{machine}`")))
                 }
-                LabRequest::Up { machines } => {
+                LabRequest::Up { machines, .. } => {
                     for machine in &machines {
                         stream.chunk(format!("starting {machine}")).await;
                     }
@@ -282,6 +282,7 @@ mod tests {
             (
                 LabRequest::MachineStart {
                     machine: "dc01".into(),
+                    record: Vec::new(),
                 },
                 ErrorCode::Conflict,
             ),
@@ -346,6 +347,7 @@ mod tests {
             .send_streaming(
                 LabRequest::Up {
                     machines: vec!["a".into(), "b".into()],
+                    record: Vec::new(),
                 },
                 |c| chunks.push(c),
             )

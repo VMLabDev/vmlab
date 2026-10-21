@@ -325,3 +325,51 @@ the rare interactive step no command line reaches. Image matching is exact and
 fast but tied to one look; OCR survives theme and resolution changes but is
 slower and approximate. Both are available in every GPU mode: with a GL
 display the capture is read over VNC, which sees the host-rendered framebuffer.
+
+## Recording
+
+A console recording is a video of one VM's display, MP4 (H.264, `yuv420p`) or
+WebM (VP9) by the output path's extension, written by the lab daemon from the
+VM's VNC socket while it runs. Started by `vmlab record start`, `--record
+<vm>=<path>` on `script`/`up`/`vm start`/`vm restart`, or `Machine.record` in a
+script; the flags, defaults, refusals and lifecycle are in cli-machine.md
+(`vmlab record`), the method in wscript-machine-api.md. What the video shows:
+
+- **Frames.** Constant rate (default 30 fps, 1 to 120). Every source frame is
+  scaled with aspect kept and letterboxed into one output size (default
+  1920x1080; both dimensions even, 16 to 7680x4320), so a 640x480 boot screen
+  and a later 1280x1024 desktop land in one frame size. A still screen repeats
+  its last picture. No audio, no captions.
+- **The pointer rule.** QEMU never sends pointer position over VNC, so the
+  pointer is drawn at the last position vmlab itself sent (`mouse_move`,
+  `mouse_click`, `mouse_drag` from a script or `vmlab vm mouse-move`/`click`/
+  `drag`); a person's input through a `vmlab console` viewer is not tracked.
+  It is drawn only when QEMU sends a cursor shape (virtio-vga/virtio-gpu, qxl,
+  vmware); on std VGA, bochs and cirrus the guest paints its own pointer into
+  the framebuffer, so nothing is drawn twice. A virtio-gpu guest hiding its
+  cursor (full-screen video) still shows the last shape.
+- **Ripple.** An amber ripple at every click vmlab sends, and both ends of a
+  drag, growing and fading over 0.5 s, drawn whether or not a cursor shape is
+  known.
+- **Idle compression** (`--compress-idle[=SECS]`, `compress_idle` in `opts`).
+  An interval is idle when its framebuffer changes cover at most 64x64 px (a
+  blinking caret or a seconds clock does not count; QEMU reports dirt in
+  16-pixel cells) and vmlab sent no input. An idle run longer than the
+  threshold (default 2 s) becomes 0.5 s of video. A click on a static screen
+  is never cut. Off unless asked for.
+- **Timeline** (`--timeline`). `<output>.events.json` beside the video:
+  `{video, fps, size, duration, events: [...], cuts: [...]}`. Each event has
+  `at` (video seconds, after cuts), `wall` (seconds since start) and `kind`:
+  `keys{chord}`, `text{text}`, `move{x,y}`, `click{button,x?,y?}` (position
+  only when the click moved first), `drag{x1,y1,x2,y2}`. Each cut is
+  `{wall_start, wall_end, kept}`. Only input vmlab sent appears.
+- **Lifecycle.** Owned by the lab daemon: survives the CLI exiting, guest
+  reboots, `vm restart` and snapshot restore (the last frame is held across
+  the gap and the recorder reconnects to the new QEMU); finalised to a
+  playable file on `record stop`, `Recording.stop`, `--max-duration`, `vm
+  stop`, `down`, `destroy`, `vm destroy`, lab daemon exit, and the
+  `host.disk_low` watchdog. One per machine (`conflict`). Events
+  `record.started` and `record.stopped` (automation.md).
+- **Limits.** No GIF (convert the MP4 with ffmpeg afterwards); no audio;
+  containers have no display (`unsupported`); a human's pointer through a VNC
+  viewer is not tracked; template builds cannot be recorded yet.

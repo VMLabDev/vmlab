@@ -29,6 +29,7 @@ use image::RgbImage;
 
 use crate::profiles::InputTransport;
 use crate::qmp::QmpClient;
+use crate::record::{InputEvent, InputTap};
 use crate::vision::{self, Match, MatchOptions};
 
 /// What a [`Display`] needs from the machine behind it.
@@ -54,6 +55,9 @@ pub trait DisplayHost: Send + Sync + 'static {
     /// under egl-headless). QMP `screendump` answers `no surface` there, so
     /// captures go over VNC, which reads the texture back.
     fn gl_display(&self) -> bool;
+    /// Where every input this display sends is published, for the machine's
+    /// console recorder (§11.1, D12): one per machine, for its lifetime.
+    fn input_tap(&self) -> Arc<InputTap>;
 }
 
 /// A machine's display, with the operations that read and drive it.
@@ -74,6 +78,17 @@ impl Display {
     /// guests like macOS where QMP `send-key` is ignored).
     fn input_vnc(&self) -> bool {
         matches!(self.host.input_transport(), InputTransport::Vnc)
+    }
+
+    /// The machine's VNC socket — what a console recorder connects to on its
+    /// own, separate connection (§11.1).
+    pub fn vnc_sock(&self) -> PathBuf {
+        self.host.vnc_sock()
+    }
+
+    /// The feed a recorder attaches to for every input this display sends.
+    pub fn input_tap(&self) -> Arc<InputTap> {
+        self.host.input_tap()
     }
 
     /// Open a fresh RFB connection. A long-lived connection that never drains
@@ -138,6 +153,9 @@ impl Display {
     /// Send a key chord (e.g. `ctrl-alt-delete`).
     pub async fn send_keys(&self, chord: &str) -> Result<()> {
         let keys = keymap::parse_chord(chord).map_err(|e| anyhow!(e))?;
+        self.host.input_tap().publish(InputEvent::Keys {
+            chord: chord.to_string(),
+        });
         if self.input_vnc() {
             let syms: Vec<u32> = keys
                 .iter()
@@ -155,6 +173,9 @@ impl Display {
 
     /// Type literal text, one character at a time, pausing `delay_ms` between.
     pub async fn type_text(&self, text: &str, delay_ms: u64) -> Result<()> {
+        self.host.input_tap().publish(InputEvent::Text {
+            text: text.to_string(),
+        });
         if self.input_vnc() {
             // Resolve all keysyms up front so the input loop owns plain data.
             let mut per_char: Vec<Vec<u32>> = Vec::with_capacity(text.len());
@@ -186,6 +207,13 @@ impl Display {
 
     /// Move the pointer to absolute screen coordinates.
     pub async fn mouse_move(&self, x: i64, y: i64) -> Result<()> {
+        self.host.input_tap().publish(InputEvent::Move { x, y });
+        self.move_pointer(x, y).await
+    }
+
+    /// The move itself, unpublished: a click that names a point moves first,
+    /// and the recorder hears about the click, not a move it did not ask for.
+    async fn move_pointer(&self, x: i64, y: i64) -> Result<()> {
         if self.input_vnc() {
             let mut c = self.vnc().await?;
             return c.mouse_move(x, y).await;
@@ -201,6 +229,11 @@ impl Display {
     /// for an explicit one-shot click); when `None`, QMP clicks at the
     /// pointer's current position and VNC errors (it needs coordinates).
     pub async fn mouse_click(&self, button: &str, at: Option<(i64, i64)>) -> Result<()> {
+        self.host.input_tap().publish(InputEvent::Click {
+            button: button.to_string(),
+            x: at.map(|p| p.0),
+            y: at.map(|p| p.1),
+        });
         if self.input_vnc() {
             let mask = vnc_button(button)?;
             let (x, y) = at.ok_or_else(|| anyhow!("VNC input needs coordinates for a click"))?;
@@ -208,7 +241,7 @@ impl Display {
             return c.click(x, y, mask).await;
         }
         if let Some((x, y)) = at {
-            self.mouse_move(x, y).await?;
+            self.move_pointer(x, y).await?;
         }
         let qmp = self.host.qmp().await?;
         qmp.mouse_button(button, true).await?;
@@ -220,6 +253,9 @@ impl Display {
     /// Press the left button at `(x1,y1)`, drag to `(x2,y2)` in a few steps,
     /// then release.
     pub async fn mouse_drag(&self, x1: i64, y1: i64, x2: i64, y2: i64) -> Result<()> {
+        self.host
+            .input_tap()
+            .publish(InputEvent::Drag { x1, y1, x2, y2 });
         if self.input_vnc() {
             let mut c = self.vnc().await?;
             c.pointer(x1, y1, 0).await?;

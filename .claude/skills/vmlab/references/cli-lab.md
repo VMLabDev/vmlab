@@ -16,12 +16,14 @@ their provision scripts and playbooks. With machine names it does the same for a
 subset of the lab.
 
 ```sh
-vmlab up [VMS]...
+vmlab up [--record <VM=PATH>]... [VMS]...
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `[VMS]...` | Machines to bring up. With none given, every VM and container in the lab. |
+| `--record <VM=PATH>` | Record that VM's console to `PATH` from the first frame of its boot; repeatable, one VM each. Checked before anything boots (one refusal arms none); the recording outlives `up`, which prints `recording <vm> to <path>` after its last line. A VM already running is recorded from now. See cli-machine.md (`vmlab record`). |
+| `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options, applied to every `--record`. |
 | `-h`, `--help` | Print help. |
 
 ### What it does
@@ -244,7 +246,7 @@ vmlab status [OPTIONS]
 With no lab daemon running the verb prints `lab "<name>": not running` and exits 0
 (as after a full `down`). When the lab's name is registered from another directory,
 `status` refuses with the same exit-5 `conflict` as `up`, naming that directory.
-Otherwise it prints up to four sections, each omitted when empty.
+Otherwise it prints up to five sections, each omitted when empty.
 
 #### Machines
 
@@ -294,6 +296,14 @@ One row per lab segment: `SEGMENT`, `SUBNET`, `GATEWAY`, `NAT/DHCP` as `on/off`
 pairs, `DROPPED` (frames the switch shed on this segment; anything other than 0
 means the fabric is losing frames under load) and `PEER` (the cross-host trunk
 target and whether it is `up` or `down`).
+
+#### Recordings
+
+While any console recording is live, a `RECORDING` section follows the machines:
+machine, elapsed seconds and path per recording. `-v` adds `recording=<path>` to
+the machine's detail line; `--json` carries a per-machine `recording` object
+`{machine, path, started_at, elapsed_secs, options}`. See cli-machine.md
+(`vmlab record`).
 
 #### Downloads
 
@@ -1008,12 +1018,14 @@ wscript-language.md). The script runs inside the lab daemon, with the same `lab`
 it is produced.
 
 ```sh
-vmlab script <SCRIPT>
+vmlab script [--record <VM=PATH>]... <SCRIPT>
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `<SCRIPT>` | Script path, relative to the lab root. |
+| `--record <VM=PATH>` | Record that VM's console to `PATH` for exactly as long as the run lasts; repeatable, one VM each. Started before the script, finalised when it returns, success or failure; the verb prints `recorded <vm> to <path>`. See cli-machine.md (`vmlab record`). |
+| `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options, applied to every `--record`. |
 | `-h`, `--help` | Print help. |
 
 The path is resolved against the lab root, the directory holding `vmlab.wcl`, not against the

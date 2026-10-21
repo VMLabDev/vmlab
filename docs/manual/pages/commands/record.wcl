@@ -1,0 +1,222 @@
+page cmd_record {
+  title = "vmlab record"
+  chapter_header "vmlab record" {
+    kicker       = "Commands · reference"
+    reading_time = "5 min read"
+    updated      = "2026-10-21"
+    version      = "vmlab 0.9"
+  }
+
+  p <<DOC
+    `vmlab record` records a VM's console to an MP4 or WebM file. The lab
+    daemon owns the recording: it carries on after this command returns,
+    survives guest reboots, `vm restart` and snapshot restores, and is
+    finalised to a playable file when you stop it or when the machine goes
+    away. See [Console recording](guide_recording) for what the file holds,
+    the pointer rule and idle compression.
+  DOC
+
+  code sh { source = "vmlab record <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`start`" | "Start recording a VM's console to an MP4 or WebM file." |
+      | "`stop`" | "Stop a VM's recording and finalise the file." |
+      | "`status`" | "List live recordings, for one VM or the whole lab." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Every subcommand takes a VM reference of the form `[lab/]vm`. A bare name
+    is resolved against the lab in the current directory, and the lab daemon
+    is started if none is running. The qualified form addresses a lab that is
+    already running from any directory. Recording needs `ffmpeg` on the host;
+    see "What it needs" below.
+  DOC
+
+  h2 "vmlab record start"
+
+  code sh { source = "vmlab record start [OPTIONS] <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]vm`." |
+      | "`-o`, `--output <PATH>`" | "Output file; the extension picks the format, `.mp4` (H.264) or `.webm` (VP9). A relative path resolves against the shell's working directory. Default: `.vmlab/recordings/<vm>-<UTC timestamp>.mp4` in the lab." |
+      | "`--fps <N>`" | "Frames per second, 1 to 120. Default 30." |
+      | "`--size <WxH>`" | "Output frame size, e.g. `1280x720`. Every frame is scaled with its aspect kept and letterboxed into it. Both dimensions even, between 16 and 7680x4320. Default `1920x1080`." |
+      | "`--compress-idle[=SECS]`" | "Cut idle stretches longer than `SECS` to half a second. With no figure, 2. The `=` is required when a figure is given." |
+      | "`--timeline`" | "Write `<output>.events.json` beside the video, listing every input vmlab sent in video time." |
+      | "`--max-duration <DURATION>`" | "Finalise the recording once the video is this long: seconds (`90`), or a figure with `s`, `m`, `h` units, chained (`90s`, `5m`, `1h30m`)." |
+      | "`--json`" | "Print the daemon's reply as JSON." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    The CLI refuses a bad extension, including `.gif`, and a malformed
+    `--max-duration` before it contacts a daemon. The daemon then checks, in
+    this order: that the machine has a display (a container has none), that
+    it is not already recording, that the size and rate are acceptable, and
+    that the host has an `ffmpeg` with the format's encoder. Only then does
+    it connect to the VM's VNC socket and start ffmpeg. On success it prints
+    one line with the options in force, defaults filled in, and emits
+    `record.started`:
+  DOC
+
+  code text { source = "recording demo/win01 to /home/me/demo/.vmlab/recordings/win01-20261021T101500.000.mp4 (30 fps, 1920x1080)" }
+
+  p <<DOC
+    An idle stretch is a run of frame intervals in which the framebuffer
+    changed by at most 64x64 pixels and vmlab sent no input; a blinking caret
+    or a clock does not break it, and a click on a static screen is never
+    cut. The recording also ends on its own when `--max-duration` of video
+    has been written, and when the `host.disk_low` watchdog fires. Either
+    way the file is finalised and `record.stopped` names the reason.
+  DOC
+
+  h2 "vmlab record stop"
+
+  code sh { source = "vmlab record stop [OPTIONS] <VM>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<VM>`" | "The VM, as `[lab/]vm`." |
+      | "`--json`" | "Print the daemon's reply as JSON." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Closes ffmpeg's input, lets it write the trailer and waits for it, then
+    prints the path and the length of the video. With `--timeline` the
+    sidecar's path follows on a second line. A recording that had already
+    ended on its own adds a line saying why. A machine that is not recording
+    is `not_found`: `machine X is not recording`.
+  DOC
+
+  code text { source = <<TXT
+stopped recording demo/win01: /home/me/demo/.vmlab/recordings/win01-20261021T101500.000.mp4 (1m35s of video)
+timeline: /home/me/demo/.vmlab/recordings/win01-20261021T101500.000.mp4.events.json
+TXT
+  }
+
+  h2 "vmlab record status"
+
+  code sh { source = "vmlab record status [OPTIONS] [VM]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`[VM]`" | "The VM, as `[lab/]vm`. Omit it for every machine in the lab." |
+      | "`--json`" | "Print the daemon's reply as a JSON array." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    One row per live recording: `MACHINE`, `ELAPSED` on the wall clock,
+    `STARTED` in UTC, `PATH` and the options in force. With nothing live it
+    prints `no recordings`. A recording that ended on its own is finalised
+    here and no longer listed. [vmlab status](cmd_status) shows the same
+    entries in its `RECORDING` section, and `vmlab status --json` carries
+    each as a `recording` object on its machine: `machine`, `path`,
+    `started_at`, `elapsed_secs`, `options`.
+  DOC
+
+  code text { source = <<TXT
+MACHINE  ELAPSED  STARTED              PATH  (OPTIONS)
+win01      1m35s  2026-10-21 10:15:00  /home/me/demo/.vmlab/recordings/win01-20261021T101500.000.mp4  (30 fps, 1920x1080, compress-idle 2s)
+TXT
+  }
+
+  h2 "--record on script, up, vm start and vm restart"
+
+  code sh { source = <<SH
+vmlab script   [--record <VM=PATH>]... [RECORD OPTIONS] <SCRIPT>
+vmlab up       [--record <VM=PATH>]... [RECORD OPTIONS] [VMS]...
+vmlab vm start [--record <VM=PATH>]... [RECORD OPTIONS] <VM>
+vmlab vm restart [--record <VM=PATH>]... [RECORD OPTIONS] <VM>
+SH
+  }
+
+  p <<DOC
+    `--record <vm>=<path>` asks the verb to record a VM alongside its own
+    work. It repeats, once per VM, and a VM named twice is refused. The
+    path is required and its extension picks the format as for `-o`; a
+    relative path resolves against the shell's working directory. `--fps`,
+    `--size`, `--compress-idle`, `--timeline` and `--max-duration` are
+    accepted as above and apply to every recording the command line names.
+  DOC
+
+  p <<DOC
+    On `up`, `vm start` and `vm restart` the recording starts with the boot:
+    QEMU starts paused, the recorder attaches, then the VM continues, so the
+    video opens on the firmware's first frame. Every `--record` is checked
+    before anything boots and one refusal arms none; the recordings then
+    outlive the verb, and it prints `recording <vm> to <path>` once it is
+    done. A `--record` for a VM that was already running, so that nothing
+    booted, records it from now. One whose VM failed to start fails the verb
+    with `machine X did not start, so its recording was not started`. A
+    `vm restart` of a VM that is already recording is a `conflict`, because
+    the existing recording follows the restart on its own.
+  DOC
+
+  p <<DOC
+    On `script` the recordings last exactly the run: they start before the
+    script, are finalised when it returns, whether it succeeded or failed,
+    and the verb prints `recorded <vm> to <path>` at the end.
+  DOC
+
+  h2 "What it needs"
+
+  p <<DOC
+    The host needs `ffmpeg` built with `libx264` for `.mp4` or `libvpx-vp9`
+    for `.webm`. vmlab runs the `ffmpeg` on `PATH`, or the one the `ffmpeg`
+    key in the [host config](ref_host) names, and reads its `-encoders`
+    list. The check runs when a recording starts and at no other time, so
+    `vmlab up` without `--record` never looks for ffmpeg. The refusals:
+  DOC
+
+  code text { source = <<TXT
+recording needs ffmpeg: none found on PATH, and the host config (config.wcl) names none under `ffmpeg`
+recording a .mp4 needs the `libx264` encoder, which /usr/bin/ffmpeg -encoders does not list; install an ffmpeg built with it, or point the host config's `ffmpeg` key at one
+TXT
+  }
+
+  h2 "Examples"
+
+  p "Record a VM until you stop it, with the default name under `.vmlab/recordings/`:"
+  code sh { source = <<SH
+vmlab record start win01
+vmlab record status
+vmlab record stop win01
+SH
+  }
+
+  p "A short, idle-compressed clip with a timeline, capped at five minutes of video:"
+  code sh { source = "vmlab record start win01 -o demo.webm --size 1280x720 --compress-idle --timeline --max-duration 5m" }
+
+  p "Record a boot from the firmware's first frame:"
+  code sh { source = "vmlab vm restart win01 --record win01=boot.mp4 --compress-idle=5" }
+
+  p "Record two machines for exactly as long as a script runs:"
+  code sh { source = "vmlab script scripts/install.ws --record dc01=dc01.mp4 --record client01=client01.mp4 --timeline" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 on success. Exit 4 (`not_found`) means the lab declares
+    no machine by that name, or, for `stop`, that the machine is not
+    recording. Exit 5 (`conflict`) means the machine is already recording;
+    the message names the live file and `vmlab record stop <vm>`. Exit 6
+    (`unsupported`) means the machine has no display, which is every
+    container. Exit 2 (`invalid_argument`) means the daemon refused the
+    path, size or rate: a size with an odd dimension or outside 16 to
+    7680x4320, a rate outside 1 to 120, or a relative path that reached it.
+    Exit 1 (`failed`) means no `ffmpeg` or no encoder, a VM named by
+    `--record` that did not start, or ffmpeg failing while the file was
+    finalised. A bad extension or a malformed `--max-duration` is refused
+    by the CLI before any request is sent, with a message and no code, and
+    a usage error the argument parser rejects exits 2.
+  DOC
+}

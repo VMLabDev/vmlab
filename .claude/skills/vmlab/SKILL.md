@@ -36,16 +36,17 @@ recalling vmlab behaviour or reading vmlab's source.
 | Segments, DHCP, DNS, NAT, routing, traffic rules, the eBPF fast path | `references/networking.md` |
 | Templates, the store, builds, `source {}`, linked clones, scratch VMs, OCI distribution, and the published templates anyone can pull (`ghcr.io/vmlabdev/vmlab-templates`, Windows included) | `references/templates.md` |
 | The wscript language: types, control flow, matching, modules, stdlib | `references/wscript-language.md` |
-| wscript `Lab`, `Segment` and `Term` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `UsbDevice`, `Event`) | `references/wscript-lab-api.md` |
-| wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots, host USB | `references/wscript-machine-api.md` |
+| wscript `Lab`, `Segment`, `Term` and `Recording` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `UsbDevice`, `Event`) | `references/wscript-lab-api.md` |
+| wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots, host USB, console recording (`record`) | `references/wscript-machine-api.md` |
 | Provisions, `on "event" {}` handlers, the event catalogue, playbooks | `references/automation.md` |
 | `@dev`, the workspace syncer, and `vmlab dev sync` | `references/dev-machines.md` |
 | `login {}`, who runs as whom, minted Windows logons, Linux sessions, `as_login` | `references/logins.md` |
-| Snapshots, screenshots, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |
+| Snapshots, screenshots, console recording, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |
 | Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
 | The host config file, WSL 2, guest OS profiles | `references/host-profiles.md` |
 | Lab-level CLI verbs: `up`, `down`, `status`, `validate`, `destroy`, `pull`, `lab`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script` | `references/cli-lab.md` |
-| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `cp`, `clipboard`, `snapshot`, `usb`, `dev` | `references/cli-machine.md` |
+| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `record`, `cp`, `clipboard`, `snapshot`, `usb`, `dev` | `references/cli-machine.md` |
+| Console recording: `vmlab record`, `--record` on `script`/`up`/`vm start`/`vm restart`, the pointer rule, idle compression, the timeline, what ends a recording | `references/cli-machine.md` (`vmlab record`), `references/snapshots-vision.md` (Recording) |
 | Shared apps: a guest program's windows on the host desktop over waypipe, X11 or RDP (`vmlab app run`) | `references/cli-machine.md` |
 | `vmlab template` and its subcommands | `references/cli-template.md` |
 | A command that failed, or a message the user is asking about | `references/troubleshooting.md` |

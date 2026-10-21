@@ -28,6 +28,8 @@ type HostConfig {
   waypipe: utf8?
   @doc("FreeRDP 3 client for shared apps from Windows guests (§20.4); default: `xfreerdp3`, then `xfreerdp`, on PATH")
   freerdp: utf8?
+  @doc("ffmpeg for console recordings (§11.1); default: `ffmpeg` on PATH")
+  ffmpeg: utf8?
   @doc("Network fast path: `auto` (probe; default), `off`, `sockmap`, or `afxdp`")
   fastpath: utf8?
   @doc("OCI layer chunk size for template push; default `512MiB`")

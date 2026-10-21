@@ -111,6 +111,8 @@ pub struct LabRuntime {
     /// a developer's source tree must not stop syncing because a terminal
     /// closed.
     pub workspaces: crate::labd::workspace::WorkspaceSyncers,
+    /// The console recordings this lab owns, one per machine (§11.1).
+    pub recordings: super::record::Recordings,
     /// This runtime as its own `Arc`. [`crate::labd::machine::LabServices`] is
     /// a `&self` interface (it has to be, to be object-safe), and the work
     /// behind two of its methods spawns tasks that outlive the call.
@@ -673,6 +675,7 @@ impl LabRuntime {
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            recordings: super::record::Recordings::default(),
             usb: super::usb::UsbHost::default(),
         }))
     }
@@ -737,6 +740,7 @@ impl LabRuntime {
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            recordings: super::record::Recordings::default(),
             usb,
         }))
     }
@@ -1340,12 +1344,22 @@ impl LabRuntime {
         self.machine(name)?.start(self.services()).await
     }
 
+    /// Stop one machine, finalising its recording first (D6: unlike the
+    /// workspace syncer, a recording ends with the machine it shows).
+    pub async fn stop_machine(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
+        let m = self.machine(name)?;
+        self.record_finalise_machine(name, "machine stopped").await;
+        m.stop(force).await
+    }
+
     /// Stop one machine and delete everything it materialised, leaving the
     /// rest of the lab running. It stays in the lab config, so a later
     /// `up <name>` re-materialises it (per-machine analogue of [`destroy`]).
     pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
         let m = self.machine(name)?;
         self.workspaces.stop(name).await;
+        self.record_finalise_machine(name, "machine destroyed")
+            .await;
         m.stop(true).await?;
         // Settle before removing disks out from under a still-running QEMU.
         wait_settled(&*m).await;
@@ -2076,9 +2090,15 @@ impl LabRuntime {
                     output(format!("provision: {} → {m}\n", p.script.display()));
                     // The script reaches its own machine with `lab.this_vm()`.
                     let owner = Some(crate::scripting::ScriptOwner::provision(m));
-                    crate::scripting::run_script_file(self.clone(), &script, owner, output.clone())
-                        .await
-                        .with_context(|| format!("provision {}", p.script.display()))?;
+                    crate::scripting::run_script_file(
+                        self.clone(),
+                        &script,
+                        owner,
+                        None,
+                        output.clone(),
+                    )
+                    .await
+                    .with_context(|| format!("provision {}", p.script.display()))?;
                 }
                 plan::StepKind::Playbook(p) => {
                     output(format!(
@@ -2154,6 +2174,7 @@ impl LabRuntime {
             &label,
             m.local_dir().to_path_buf(),
             Some(crate::scripting::ScriptOwner::first_boot(name)),
+            None,
             output.clone(),
         );
         tokio::time::timeout(Duration::from_secs(1800), run)
@@ -2192,9 +2213,11 @@ impl LabRuntime {
         }
 
         // Before the machines go: a syncer whose guest has gone would spend
-        // its retry window failing to reach one.
+        // its retry window failing to reach one, and a recording is
+        // finalised while its last frame is still the machine's (D6).
         for name in plan.machines() {
             self.workspaces.stop(name).await;
+            self.record_finalise_machine(name, "machine stopped").await;
         }
 
         for wave in &plan.waves {
@@ -2225,6 +2248,7 @@ impl LabRuntime {
     /// config (PRD §12).
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
         self.workspaces.stop_all().await;
+        self.record_finalise_all("lab destroyed").await;
         self.down(&[], true).await?;
         // Wait for the exit monitors to settle before removing disks.
         for m in self.machines() {
@@ -2476,9 +2500,12 @@ impl LabRuntime {
         // once here for the same reason as the two above: a syncer belongs to
         // the lab, not to the machine it writes into.
         let syncing = self.workspaces.reports().await;
+        // And what each machine is recording (§11.1), owned by the lab too.
+        let recording = self.record_status(None).await;
         let mut machines = Vec::new();
         for m in self.machines() {
             let mut status = m.status().await;
+            status.recording = recording.iter().find(|r| r.machine == status.name).cloned();
             // Lab-level, not machine-level: is this machine's template/image
             // download still pending? Drives the "Download" button.
             status.cached = !self.pulls.lock_recover().is_pending(&status.name);
@@ -2898,6 +2925,12 @@ impl crate::labd::machine::LabServices for LabRuntime {
         seg.attach_nic(sock, mac, isolated, tap_ok).await
     }
 
+    async fn before_resume(&self, machine: &str) -> Result<()> {
+        // A `--record` armed for this boot attaches now, while the CPUs are
+        // still paused, so the video starts at the firmware's first frame.
+        self.record_at_resume(machine).await
+    }
+
     async fn before_ready(&self, machine: &str) {
         // An agent refresh `up` or `vm start` deferred because nothing waited
         // on this machine (§19.4). Held here, not run beside readiness: the
@@ -3112,9 +3145,57 @@ mod tests {
         /// Host USB devices it holds, when it is a VM booted with
         /// `usb = true`; `None` keeps the trait's refusal.
         usb: Option<std::sync::Mutex<Vec<crate::usb::Attachment>>>,
+        /// A display whose VNC socket is a fake RFB server, for the console
+        /// recording tests (§11.1); `None` is a machine with no display.
+        display: Option<Arc<FakeDisplayHost>>,
+    }
+
+    /// What a displayed double tells its [`Display`]: a VNC socket (a fake
+    /// server's) and an input tap. QMP is never reached.
+    struct FakeDisplayHost {
+        name: String,
+        vnc: PathBuf,
+        tap: Arc<crate::record::InputTap>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::display::DisplayHost for FakeDisplayHost {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn qmp(&self) -> Result<crate::qmp::QmpClient> {
+            Err(anyhow!("fake display has no QMP"))
+        }
+        fn vnc_sock(&self) -> PathBuf {
+            self.vnc.clone()
+        }
+        fn capture_dir(&self) -> PathBuf {
+            self.vnc.parent().unwrap().to_path_buf()
+        }
+        fn input_transport(&self) -> crate::profiles::InputTransport {
+            crate::profiles::InputTransport::Vnc
+        }
+        fn gl_display(&self) -> bool {
+            false
+        }
+        fn input_tap(&self) -> Arc<crate::record::InputTap> {
+            self.tap.clone()
+        }
     }
 
     impl FakeMachine {
+        /// A VM double with a display served by the fake RFB server at `vnc`.
+        fn displayed(name: &str, shared: &Shared, vnc: &std::path::Path) -> Arc<Self> {
+            let mut m =
+                Arc::into_inner(Self::new(name, MachineKind::Vm, shared)).expect("sole owner");
+            m.display = Some(Arc::new(FakeDisplayHost {
+                name: name.to_string(),
+                vnc: vnc.to_path_buf(),
+                tap: Arc::default(),
+            }));
+            Arc::new(m)
+        }
+
         fn new(name: &str, kind: MachineKind, shared: &Shared) -> Arc<Self> {
             Arc::new(Self {
                 name: name.to_string(),
@@ -3137,6 +3218,7 @@ mod tests {
                 clock: crate::config::model::Clock::Host,
                 boot_ids: std::sync::Mutex::new(Vec::new()),
                 usb: None,
+                display: None,
             })
         }
 
@@ -3314,6 +3396,13 @@ mod tests {
             self.note("start").await;
             *self.state.write().await = PowerState::Starting;
             tokio::time::sleep(self.boot).await;
+            // The paused window a real VM offers before its CPUs run (D20).
+            if let Err(e) = lab.before_resume(&self.name).await {
+                *self.state.write().await = PowerState::Stopped;
+                return Err(e);
+            }
+            let recording = self.display.as_ref().is_some_and(|d| d.tap.attached());
+            self.note(&format!("resume:recording={recording}")).await;
             *self.state.write().await = PowerState::Running;
             let me = self.clone();
             tokio::spawn(async move {
@@ -3334,6 +3423,11 @@ mod tests {
         ) -> Result<()> {
             self.note(&format!("restore:{snap}")).await;
             Ok(())
+        }
+
+        fn display(self: Arc<Self>) -> Option<super::super::display::Display> {
+            let host = self.display.as_ref()?.clone();
+            Some(super::super::display::Display::new(host))
         }
 
         /// A VM double seals an agent, as a template built with one does; a
@@ -3533,6 +3627,7 @@ fn main(lab: Lab) {
             REBOOT_SCRIPT.into(),
             "reboot.ws",
             dir.path().to_path_buf(),
+            None,
             None,
             sink,
         )
@@ -4518,6 +4613,7 @@ fn main(lab: Lab) {
             "usb.ws",
             dir.path().to_path_buf(),
             None,
+            None,
             sink,
         )
         .await
@@ -4534,5 +4630,368 @@ fn main(lab: Lab) {
         assert!(has("free 1-9"), "{said:?}");
         assert!(has("a holds 1"), "{said:?}");
         assert!(has("a holds 0"), "{said:?}");
+    }
+
+    // ---- console recordings (§11.1) -------------------------------------
+
+    /// A lab with a displayed VM `a` (its VNC socket a fake RFB server), a
+    /// VM `b` the same way, and a container `web` with no display.
+    async fn record_lab(
+        dir: &std::path::Path,
+    ) -> Option<(Arc<LabRuntime>, Shared, crate::vnc::fake::FakeRfb)> {
+        let avail = crate::record::encoder::probe(None).await;
+        if crate::record::encoder::check(&avail, crate::record::Format::Mp4).is_err() {
+            eprintln!("skipping: no ffmpeg with libx264 on this host");
+            return None;
+        }
+        let img = crate::vnc::fake::pattern(16, 8);
+        let rfb = crate::vnc::fake::spawn(
+            16,
+            8,
+            vec![crate::vnc::fake::update(&[crate::vnc::fake::raw_rect(
+                &img, 0, 0, 16, 8,
+            )])],
+        );
+        let sh = shared(dir);
+        let a = FakeMachine::displayed("a", &sh, &rfb.path);
+        let b = FakeMachine::displayed("b", &sh, &rfb.path);
+        let web = FakeMachine::new("web", MachineKind::Container, &sh);
+        let lab = lab_of(
+            dir,
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "a" { template = "x86_64/t" }
+  vm "b" { template = "x86_64/t" }
+  container "web" { image = "web:1" }
+}"#,
+            vec![a, b, web],
+        );
+        Some((lab, sh, rfb))
+    }
+
+    fn code_of(e: &anyhow::Error) -> Option<crate::proto::ErrorCode> {
+        e.downcast_ref::<crate::proto::CommandError>()
+            .map(|c| c.code)
+    }
+
+    fn small() -> crate::record::RecordOptions {
+        crate::record::RecordOptions {
+            fps: Some(10),
+            size: Some(crate::record::Size::new(32, 16)),
+            ..Default::default()
+        }
+    }
+
+    /// Start, status and stop; the second start is a `conflict` naming the
+    /// live file, a container is `unsupported`, a bad path or figure is
+    /// `invalid_argument`, and stopping what is not recording is `not_found`.
+    #[tokio::test]
+    async fn recordings_start_report_stop_and_refuse_by_code() {
+        use crate::proto::ErrorCode;
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, _sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        let out = dir.path().join("a.mp4");
+        let started = lab
+            .record_start("a", Some(out.to_str().unwrap()), &small(), None)
+            .await
+            .expect("start");
+        assert_eq!(started.path, out);
+        assert_eq!(started.options.fps, Some(10));
+
+        let status = lab.record_status(None).await;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].machine, "a");
+        let lab_status = lab.status().await;
+        let a = lab_status.machines.iter().find(|m| m.name == "a").unwrap();
+        assert_eq!(
+            a.recording.as_ref().map(|r| r.path.clone()),
+            Some(out.clone())
+        );
+        assert!(
+            lab_status
+                .machines
+                .iter()
+                .find(|m| m.name == "b")
+                .unwrap()
+                .recording
+                .is_none()
+        );
+
+        let again = lab
+            .record_start("a", Some(out.to_str().unwrap()), &small(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&again), Some(ErrorCode::Conflict));
+        assert!(format!("{again:#}").contains("a.mp4"), "{again:#}");
+
+        let web = lab
+            .record_start("web", None, &small(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&web), Some(ErrorCode::Unsupported));
+        assert!(format!("{web:#}").contains("no display"), "{web:#}");
+
+        let gif = lab
+            .record_start("b", Some("/tmp/x.gif"), &small(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&gif), Some(ErrorCode::InvalidArgument));
+        let rel = lab
+            .record_start("b", Some("rel.mp4"), &small(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&rel), Some(ErrorCode::InvalidArgument));
+        let odd = lab
+            .record_start(
+                "b",
+                None,
+                &crate::record::RecordOptions {
+                    size: Some(crate::record::Size::new(33, 16)),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&odd), Some(ErrorCode::InvalidArgument));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stopped = lab.record_stop("a").await.expect("stop");
+        assert_eq!(stopped.path, out);
+        assert!(out.exists());
+        assert!(stopped.duration_secs > 0.0);
+        assert!(lab.record_status(None).await.is_empty());
+        let none = lab.record_stop("a").await.unwrap_err();
+        assert_eq!(code_of(&none), Some(ErrorCode::NotFound));
+
+        // The default path lands under the lab's recordings directory.
+        let defaulted = lab
+            .record_start("b", None, &small(), None)
+            .await
+            .expect("start");
+        assert!(
+            defaulted.path.starts_with(lab.lab_local.join("recordings")),
+            "{:?}",
+            defaulted.path
+        );
+        lab.record_stop("b").await.expect("stop");
+    }
+
+    /// `vm stop`, `down`, a machine's destroy and the lab's destroy finalise
+    /// what the machine was recording; nothing is left live.
+    #[tokio::test]
+    async fn stopping_a_machine_finalises_its_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, _sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        let mut events = lab.events.subscribe();
+        for (ender, wait) in [
+            ("stop", 0),
+            ("down", 1),
+            ("destroy_machine", 2),
+            ("destroy", 3),
+        ] {
+            let out = dir.path().join(format!("{ender}.mp4"));
+            lab.record_start("a", Some(out.to_str().unwrap()), &small(), None)
+                .await
+                .expect("start");
+            assert_eq!(lab.recordings.live_machines().await, vec!["a".to_string()]);
+            match wait {
+                0 => lab.stop_machine("a", false).await.expect("stop"),
+                1 => lab.down(&[], false).await.expect("down"),
+                2 => lab.destroy_machine("a").await.expect("destroy a"),
+                _ => lab.destroy().await.expect("destroy"),
+            }
+            assert!(lab.recordings.live_machines().await.is_empty(), "{ender}");
+            assert!(out.exists(), "{ender} left a file");
+        }
+        let mut seen = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            seen.push(ev.event.clone());
+        }
+        assert_eq!(seen.iter().filter(|k| *k == "record.started").count(), 4);
+        assert_eq!(seen.iter().filter(|k| *k == "record.stopped").count(), 4);
+    }
+
+    /// Recordings a script run started are finalised when the run ends,
+    /// whether the script returned or failed.
+    #[tokio::test]
+    async fn a_run_finalises_the_recordings_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, _sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        for (script, ok) in [
+            ("use vmlab\nfn main(lab: Lab) { lab.log(\"fine\") }\n", true),
+            (
+                "use vmlab\nfn main(lab: Lab) { lab.machine(\"nope\").expect(\"boom\") }\n",
+                false,
+            ),
+        ] {
+            let run = lab.recordings.new_run();
+            let out = dir.path().join(format!("run-{ok}.mp4"));
+            lab.record_start("a", Some(out.to_str().unwrap()), &small(), Some(run))
+                .await
+                .expect("start");
+            // Another run's recording is not this run's to finalise.
+            let other = dir.path().join(format!("other-{ok}.mp4"));
+            lab.record_start(
+                "b",
+                Some(other.to_str().unwrap()),
+                &small(),
+                Some(lab.recordings.new_run()),
+            )
+            .await
+            .expect("start b");
+            let result = crate::scripting::run_script_source(
+                lab.clone(),
+                script.to_string(),
+                "<test>",
+                dir.path().to_path_buf(),
+                None,
+                Some(run),
+                quiet(),
+            )
+            .await;
+            assert_eq!(result.is_ok(), ok);
+            assert_eq!(lab.recordings.live_machines().await, vec!["b".to_string()]);
+            assert!(out.exists());
+            lab.record_stop("b").await.expect("stop b");
+        }
+    }
+
+    /// `m.record` from a script: a relative path lands under the lab root, the
+    /// handle's `stop` finalises, and a recording left open is finalised when
+    /// the run ends.
+    #[tokio::test]
+    async fn a_script_records_through_the_machine_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, _sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        let said = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            Arc::new(move |s: String| said.lock().unwrap().push(s.trim_end().to_string()))
+        };
+        let script = r#"use vmlab
+
+fn main(lab: Lab) {
+    let Ok(a) = lab.machine("a") else { return }
+    let r = a.record("out/a.mp4", #{ "fps": "10", "size": "32x16" }).expect("record")
+    lab.log("path " + r.path())
+    let stopped = r.stop().expect("stop")
+    lab.log("stopped " + stopped)
+    match r.stop() {
+        Ok(_) => lab.log("stopped twice?"),
+        Err(e) => lab.log("again: " + e),
+    }
+    let Ok(b) = lab.machine("b") else { return }
+    let open = b.record("", #{ "fps": "10", "size": "32x16" }).expect("record b")
+    lab.log("b " + open.path())
+    match a.record("x.gif", #{}) {
+        Ok(_) => lab.log("gif?"),
+        Err(e) => lab.log("refused: " + e),
+    }
+}
+"#;
+        crate::scripting::run_script_source(
+            lab.clone(),
+            script.to_string(),
+            "<test>",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            sink,
+        )
+        .await
+        .expect("script");
+        let said = said.lock().unwrap().clone();
+        let expected = lab.root.join("out/a.mp4").display().to_string();
+        assert!(
+            said.iter().any(|l| *l == format!("path {expected}")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|l| *l == format!("stopped {expected}")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("again: ") && l.contains("not recording")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("refused: ") && l.contains(".gif")),
+            "{said:?}"
+        );
+        assert!(
+            lab.recordings.live_machines().await.is_empty(),
+            "the run finalised b's"
+        );
+        let b_path = said.iter().find(|l| l.starts_with("b ")).unwrap();
+        assert!(std::path::Path::new(&b_path[2..]).exists(), "{b_path}");
+    }
+
+    /// `--record` on a start verb: checked and armed first, started in the
+    /// machine's paused window (the recorder is attached before the CPUs
+    /// run), and a second request for a machine already recording refused.
+    #[tokio::test]
+    async fn an_armed_recording_starts_before_the_machine_resumes() {
+        use crate::proto::ErrorCode;
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        let out = dir.path().join("boot.mp4");
+        let req = crate::record::RecordRequest {
+            machine: "a".into(),
+            path: Some(out.to_str().unwrap().into()),
+            options: small(),
+        };
+        lab.record_arm(std::slice::from_ref(&req), None)
+            .await
+            .expect("arm");
+        assert!(lab.recordings.is_pending("a"));
+        lab.up(&["a".into()], quiet()).await.expect("up");
+        lab.record_settle(&["a".into()]).await.expect("settle");
+        let log = sh.log.lock().await.clone();
+        assert!(
+            log.iter().any(|l| l.ends_with("a:resume:recording=true")),
+            "the recorder was attached before the CPUs ran: {log:?}"
+        );
+        assert_eq!(lab.recordings.live_machines().await, vec!["a".to_string()]);
+
+        let again = lab
+            .record_arm(std::slice::from_ref(&req), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&again), Some(ErrorCode::Conflict));
+
+        // A request still armed after the verb — its machine was already
+        // running, so nothing booted to consume it — is settled by recording
+        // the machine from now.
+        lab.record_stop("a").await.expect("stop");
+        lab.record_arm(std::slice::from_ref(&req), None)
+            .await
+            .expect("arm");
+        assert!(lab.recordings.is_pending("a"));
+        lab.record_settle(&["a".into()]).await.expect("settle");
+        assert_eq!(lab.recordings.live_machines().await, vec!["a".to_string()]);
+        lab.record_stop("a").await.expect("stop");
+
+        // An arm that fails for one machine arms none.
+        let bad = crate::record::RecordRequest {
+            machine: "web".into(),
+            path: None,
+            options: small(),
+        };
+        let err = lab.record_arm(&[req.clone(), bad], None).await.unwrap_err();
+        assert_eq!(code_of(&err), Some(ErrorCode::Unsupported));
+        assert!(!lab.recordings.is_pending("a"));
     }
 }

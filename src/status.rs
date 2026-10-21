@@ -460,6 +460,11 @@ pub struct MachineStatus {
     /// state beside the machine's MACs and snapshot records, and is forgotten
     /// with the artefacts a `destroy` removes.
     pub agent_diverged: bool,
+    /// The console recording this machine is in the middle of (§11.1), if
+    /// any — path, start, elapsed, options. Lab-level, like `dev`: the lab
+    /// daemon owns recordings, so `LabRuntime::status` fills it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<crate::record::RecordingStatus>,
     #[serde(flatten)]
     pub detail: MachineDetail,
 }
@@ -681,6 +686,7 @@ pub(crate) mod fixtures {
             cached: true,
             dev: None,
             agent_diverged: false,
+            recording: None,
             detail,
         }
     }

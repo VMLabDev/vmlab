@@ -1,0 +1,240 @@
+page guide_recording {
+  title = "Console recording"
+  chapter_header "Console recording" {
+    kicker       = "The guide · explanation"
+    reading_time = "8 min read"
+    updated      = "2026-10-21"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+A console recording is a video of one VM's display, written by the lab daemon
+to an MP4 or WebM file while the VM runs. You start one by hand with
+[vmlab record](cmd_record), ask for one alongside a boot or a script run with
+`--record`, or start one from a script with `Machine.record`. The recorder
+reads the same VNC socket [vmlab console](cmd_console) and the screenshot
+methods use, so a recording needs nothing in the guest and works before the
+guest has an agent. This chapter explains what ends up in the file, how the
+pointer gets there, what idle compression and the timeline do, who owns a
+recording, and what a recording cannot do. The flags are in
+[vmlab record](cmd_record) and the method in
+[wscript API: Machine](ref_ws_machine).
+DOC
+
+  h2 "What a recording holds"
+
+  p <<'DOC'
+The recorder holds one connection to the VM's VNC socket for the life of the
+recording, receives every framebuffer update and QEMU's cursor shape, and
+writes constant-rate frames to the host's `ffmpeg`. The output path's
+extension picks the format: `.mp4` is H.264 in `yuv420p`, `.webm` is VP9.
+Nothing else is accepted, `.gif` included, and the refusal comes before any
+socket is opened. Convert the MP4 afterwards for anything else.
+DOC
+
+  p <<'DOC'
+The video runs at 30 frames per second in a 1920x1080 frame unless `--fps` or
+`--size` says otherwise. Every source frame is scaled into that one size with
+its aspect ratio kept and letterboxed, so a 640x480 firmware screen and the
+1280x1024 desktop the guest switches to later land in the same file at the
+same size, with bars where the shapes differ. A size must have even
+dimensions, because 4:2:0 video cannot hold an odd edge, and each dimension
+must lie between 16 and 7680x4320. The rate must lie between 1 and 120.
+A frame is emitted at the end of every interval whether or not anything
+arrived, so a still screen repeats its last picture rather than stalling the
+clock.
+DOC
+
+  p "There is no audio and there are no captions."
+
+  h2 "The pointer rule"
+
+  p <<'DOC'
+QEMU never sends a pointer position over VNC, so the recorder has no way to
+learn where the guest's pointer is. It draws the pointer at the last position
+vmlab itself sent: a `mouse_move`, `mouse_click` or `mouse_drag` from a script,
+or `vmlab vm mouse-move`, `click` and `drag` from the shell. A person moving
+the mouse in a viewer opened by `vmlab console` is not tracked, and the drawn
+pointer stays where vmlab last put it.
+DOC
+
+  p <<'DOC'
+The pointer is drawn only when QEMU sends a cursor shape, which it does for a
+guest on a virtio-vga, virtio-gpu, qxl or vmware display. On std VGA, bochs
+and cirrus the guest paints its own pointer into the framebuffer, QEMU sends
+no shape, and the recorder draws nothing, so a pointer never appears twice.
+The shape is the guest's own: a Windows arrow looks like a Windows arrow. A
+virtio-gpu guest that hides its cursor, as a full-screen video player does,
+still shows the last shape QEMU sent, because QEMU does not report the hide.
+DOC
+
+  p <<'DOC'
+Every click vmlab sends, and both ends of a drag, gets an amber ripple at the
+click point that grows and fades over half a second. The ripple is drawn
+whether or not a cursor shape is known, so a click on a std VGA guest is
+still visible in the video.
+DOC
+
+  h2 "Idle compression"
+
+  p <<'DOC'
+A boot or an install spends most of its time on a screen that is not
+changing. `--compress-idle` cuts those stretches out. The recorder watches
+each frame interval: an interval is idle when the framebuffer rectangles it
+received cover no more than 64x64 pixels in total and vmlab sent no input
+during it. A blinking caret or a clock with seconds does not break an idle
+run, because QEMU reports dirt in 16-pixel cells and such a change stays well
+under the area. A run of idle intervals longer than the threshold, 2 seconds
+unless `--compress-idle=SECS` names another, becomes half a second of video.
+A click on a static screen is never cut, because the interval it lands in is
+not idle.
+DOC
+
+  p <<'DOC'
+Without the flag nothing is cut and the video is as long as the recording
+was. With it the video is shorter than the wall clock, and the timeline, if
+you asked for one, records where the cuts fell so you can map a moment in the
+video back to when it happened.
+DOC
+
+  h2 "The timeline"
+
+  p <<'DOC'
+`--timeline` writes a JSON sidecar beside the video, `<output>.events.json`,
+listing every input vmlab sent during the recording. Each entry carries `at`,
+the second of the output video it falls on after any idle cuts, `wall`, the
+seconds since the recording started on the wall clock, a `kind`, and the
+fields that kind has:
+DOC
+
+  table {
+    rows:
+      | "Kind" | "Fields" | "Sent by" |
+      | "`keys`" | "`chord`" | "`send_keys`, `vmlab vm sendkeys`" |
+      | "`text`" | "`text`" | "`type_text`, `type_text_paced`" |
+      | "`move`" | "`x`, `y`" | "`mouse_move`, `vmlab vm mouse-move`" |
+      | "`click`" | "`button`, `x`, `y` (position only when the click moved first)" | "`mouse_click`, `vmlab vm click`" |
+      | "`drag`" | "`x1`, `y1`, `x2`, `y2`" | "`mouse_drag`, `vmlab vm drag`" |
+  }
+
+  p <<'DOC'
+The file as a whole carries `video`, the file name of the recording, `fps`, `size`
+and `duration`, the `events` list, and `cuts`: one `{wall_start, wall_end,
+kept}` per idle stretch that was shortened, each in wall-clock seconds with
+the length it was cut to. A recording made without idle compression has an
+empty `cuts` list and `at` equal to `wall` on every entry. Like the pointer,
+the timeline knows only what vmlab sent; a person typing into a viewer leaves
+no entry.
+DOC
+
+  code json { source = <<'SRC'
+{
+  "video": "win01-20261021T101500.000.mp4",
+  "fps": 30,
+  "size": "1920x1080",
+  "duration": 41.5,
+  "events": [
+    {"at": 3.2, "wall": 3.2, "kind": "keys", "chord": "ctrl-alt-del"},
+    {"at": 9.8, "wall": 31.1, "kind": "text", "text": "Password1!\n"},
+    {"at": 12.0, "wall": 33.3, "kind": "click", "button": "left", "x": 640, "y": 410}
+  ],
+  "cuts": [
+    {"wall_start": 4.0, "wall_end": 25.8, "kept": 0.5}
+  ]
+}
+SRC
+  }
+
+  h2 "Who owns a recording"
+
+  p <<'DOC'
+The lab daemon owns every recording, not the CLI that asked for it. A
+recording started with `vmlab record start` carries on after the command
+returns, after the terminal closes, and until something ends it: a
+`vmlab record stop`, its `--max-duration`, or the machine going away. The
+daemon finalises every recording to a playable file when the machine is
+stopped by `vmlab vm stop`, `vmlab down`, `vmlab destroy` or `vmlab vm
+destroy`, and when the daemon itself exits. The `host.disk_low` watchdog
+finalises every live recording too, so a full disk leaves you with playable
+files rather than truncated ones.
+DOC
+
+  p <<'DOC'
+A guest reboot does not end a recording: the VNC socket stays and the frames
+keep coming. Neither does `vmlab vm restart` nor a snapshot restore, both of
+which replace the QEMU process under the display. The recorder holds the
+last frame across the gap and reconnects to the new QEMU's socket, so the
+video shows the old screen, then the new boot, with no break in the file.
+DOC
+
+  p <<'DOC'
+`--record <vm>=<path>` on [vmlab up](cmd_up), `vmlab vm start` and
+`vmlab vm restart` records a boot from its first frame: QEMU starts paused,
+the recorder attaches, and only then does the VM continue, so the file opens
+on the firmware's first screen. Every `--record` is checked before anything
+boots, and one refusal arms none. A `--record` naming a VM that was already
+running, so that nothing booted, records it from now; one naming a VM that
+failed to start fails the verb with `machine X did not start, so its
+recording was not started`. On [vmlab script](cmd_script) the recordings last
+exactly the run: they start before the script and are finalised when it
+returns, whether it succeeded or failed.
+DOC
+
+  p <<'DOC'
+A script's own `m.record(path, opts)` returns a `Recording` handle whose
+`stop()` finalises the file and returns its path. A recording the script
+never stops is finalised by the daemon when the run ends, success or failure,
+so a script that fails halfway still leaves a playable file of how it got
+there. One recording per machine: a second `start` while one is live is a
+`conflict` that names the live file.
+DOC
+
+  h2 "What a recording needs from the host"
+
+  p <<'DOC'
+Recording needs `ffmpeg` on the host with the encoder for the format you
+asked for: `libx264` for `.mp4`, `libvpx-vp9` for `.webm`. vmlab looks for
+`ffmpeg` on `PATH`, or at the path the `ffmpeg` key in the
+[host config](ref_host) names, and runs `ffmpeg -encoders` to see what it
+can write. The check happens when a recording starts, and nowhere else: a
+host without ffmpeg runs labs as before, and `vmlab up` never looks for it
+unless `--record` is given. A missing binary or encoder is a `failed` refusal
+that names the host config key, `PATH` and the encoder it needed.
+DOC
+
+  p <<'DOC'
+A recording named with no path lands in the lab's own `.vmlab/recordings/`
+as `<vm>-<UTC timestamp>.mp4`, beside `screenshots/` (see
+[Files and directories](ref_paths)). A relative `-o` path on the CLI resolves
+against the shell's working directory; a relative path from a script resolves
+against the lab root.
+DOC
+
+  h2 "Watching one"
+
+  p <<'DOC'
+[vmlab status](cmd_status) prints a `RECORDING` section, with the machine,
+elapsed time and path, whenever any recording is live, and `-v` adds
+`recording=<path>` to a recording machine's detail line. `vmlab record
+status` lists the same with the options in force. Every start emits
+`record.started` and every finish `record.stopped`, with the length of the
+video and why it ended (see [Events](ref_events)), so a handler can pick up
+a finished file.
+DOC
+
+  h2 "Limits"
+
+  list {
+    li "No GIF. Convert the MP4 afterwards with ffmpeg."
+    li "No audio."
+    li "A container has no display, so it cannot be recorded: `unsupported`, with `machine X has no display`."
+    li "A person's pointer in a VNC viewer is not tracked; only input vmlab sent moves the drawn pointer or appears in the timeline."
+    li "A virtio-gpu guest that hides its cursor still shows the last cursor shape QEMU sent."
+    li "Template builds cannot be recorded yet."
+  }
+
+  callout "Record the boot, not the wait" {
+    kind = :tip
+    body = "A Windows install under `--record` with `--compress-idle` is a few minutes of video for an hour of wall clock, and the timeline says where each minute came from. Leave compression off when the length of a pause is the thing you are measuring."
+  }
+}
