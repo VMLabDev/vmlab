@@ -132,6 +132,10 @@ pub struct Profile {
     /// means the floor applies, never that the profile cannot host a dev
     /// machine ([`crate::dev`]).
     pub workspace_guest: Option<String>,
+    /// Guest directory a `playbook {}` block pushes config-weave and its
+    /// playbook folders into when the block names no `guest_dir`. `None`
+    /// means the family default ([`crate::labd::playbook::resolve_guest_dir`]).
+    pub playbook_dir: Option<String>,
 }
 
 /// The full profile set: shipped profiles plus user overrides/extensions.
@@ -308,6 +312,18 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .unspan()
             .unwrap_or_default(),
         workspace_guest: r.string("workspace_guest").unspan(),
+        playbook_dir: {
+            let dir = r.string("playbook_dir").unspan();
+            if let Some(d) = &dir
+                && !crate::config::model::is_unix_absolute(d)
+                && !crate::config::model::is_windows_absolute(d)
+            {
+                r.issue(format!(
+                    "`playbook_dir` must be an absolute guest path (`/…` or `C:\\…`), got \"{d}\""
+                ));
+            }
+            dir
+        },
     };
     Some(Profile {
         name: name?,
@@ -621,6 +637,23 @@ profile "freebsd" { machine = "q35" firmware = "seabios" }
             &source[span.offset()..span.offset() + span.len()],
             "machine = \"vax\""
         );
+    }
+
+    /// `playbook_dir` (#169) is read, and must be absolute in one of the two
+    /// guest forms — a relative path has no meaning in the guest.
+    #[test]
+    fn playbook_dir_is_read_and_must_be_absolute() {
+        let source = concat!(
+            "import <vmlab-profile.wcl>\n",
+            "profile \"ro\" { playbook_dir = \"/var/opt/weave\" }\n",
+            "profile \"win\" { playbook_dir = \"D:\\\\weave\" }\n",
+        );
+        let ps = parse_profiles(source, "p.wcl").unwrap();
+        assert_eq!(ps[0].playbook_dir.as_deref(), Some("/var/opt/weave"));
+        assert_eq!(ps[1].playbook_dir.as_deref(), Some("D:\\weave"));
+
+        let err = profile_err("profile \"x\" { playbook_dir = \"weave\" }\n");
+        assert!(err.contains("`playbook_dir` must be an absolute"), "{err}");
     }
 
     #[test]

@@ -1294,14 +1294,17 @@ impl LabRuntime {
     /// The config-weave guest binaries every playbook-targeted machine in
     /// `targets` will need must exist on the host before anything boots.
     /// Also the runtime arch gate for machines whose arch validation could
-    /// not see statically (registry templates, containers).
+    /// not see statically (registry templates, containers). A block naming
+    /// a guest-resident `guest_bin` needs no host binary, so a machine whose
+    /// every block does is not checked.
     fn preflight_playbooks(&self, targets: &[String]) -> Result<()> {
         use crate::labd::playbook;
         let lab = &self.config.lab;
         let dir = playbook::default_bin_dir(self.host_cfg.config_weave_bin_dir.as_deref());
         let mut errs: Vec<String> = Vec::new();
         for name in targets {
-            let targeted = playbook::playbooks_of(lab, name).is_some_and(|p| !p.is_empty());
+            let targeted = playbook::playbooks_of(lab, name)
+                .is_some_and(|p| p.iter().any(|pb| pb.guest_bin.is_none()));
             if !targeted {
                 continue;
             }
@@ -2234,12 +2237,18 @@ impl LabRuntime {
     /// VM naming no `profile` of its own would land on the floor instead of on
     /// its guest OS's path.
     fn dev_machines(&self) -> Vec<crate::dev::ResolvedDev> {
-        crate::dev::machines(&self.config.lab, |cfg| {
-            self.machine(cfg.name())
-                .ok()
-                .and_then(|m| m.profile())
-                .and_then(|name| self.profiles.get(&name).cloned())
-        })
+        crate::dev::machines(&self.config.lab, |cfg| self.effective_profile(cfg.name()))
+    }
+
+    /// The guest OS profile `machine` effectively runs, read off its resolved
+    /// hardware (a VM's may have come from its template). `None` when the
+    /// machine is unknown, names no profile, or names one this host lacks —
+    /// every profile-sourced default then falls through to its floor.
+    pub(crate) fn effective_profile(&self, machine: &str) -> Option<crate::profiles::Profile> {
+        self.machine(machine)
+            .ok()
+            .and_then(|m| m.profile())
+            .and_then(|name| self.profiles.get(&name).cloned())
     }
 
     /// Start the workspace syncer for every `@dev` machine in `scope` that

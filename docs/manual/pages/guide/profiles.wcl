@@ -35,6 +35,7 @@ DOC
       | "`virtiofs`" | "Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = \"auto\"` shares. See [Shared folders](guide_shares)." |
       | "`rtc`" | "What the guest reads the real-time clock as: `utc` (default), or `localtime` for DOS, Windows 9x and NT4 through XP/2003, which cannot read it as UTC. See [Snapshots](guide_snapshots) for the clock." |
       | "`workspace_guest`" | "The guest path an `@dev` workspace lands at when the decorator names none. See [Dev machines and the workspace syncer](guide_dev)." |
+      | "`playbook_dir`" | "The guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`, for a guest whose default location is not writable. See [Playbooks](guide_playbooks)." |
   }
 
   p <<'DOC'

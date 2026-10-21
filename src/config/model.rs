@@ -843,12 +843,32 @@ pub struct Playbook {
     /// `--var name=value` overrides for this machine's run, in declaration
     /// order.
     pub vars: Vec<PlaybookVar>,
+    /// Guest directory the config-weave binary and the playbook folders land
+    /// in. `None` = the profile's `playbook_dir`, else the family default
+    /// ([`crate::labd::playbook::resolve_guest_dir`]).
+    pub guest_dir: Option<String>,
+    /// A config-weave binary already in the guest: run it instead of pushing
+    /// one. `None` = push the host's binary into `guest_dir`.
+    pub guest_bin: Option<String>,
     pub span: Span,
 }
 
 impl Playbook {
     /// `timeout` when the block leaves it out.
     pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+}
+
+/// A Unix absolute guest path: rooted at `/`. Which form a guest accepts is
+/// its family's question; this and [`is_windows_absolute`] answer only
+/// whether a path is the one or the other.
+pub fn is_unix_absolute(path: &str) -> bool {
+    path.starts_with('/')
+}
+
+/// A Windows drive-letter absolute path: `C:\…` or `C:/…`.
+pub fn is_windows_absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
 }
 
 /// One variable override passed to config-weave as `--var name=value`.

@@ -295,6 +295,7 @@ in the config.
 | `virtiofs` | Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = "auto"` shares (see shares-media.md). |
 | `rtc` | What the guest reads the real-time clock as: `utc` (default), or `localtime` for DOS, Windows 9x and NT4 through XP/2003, which cannot read it as UTC (see snapshots-vision.md). |
 | `workspace_guest` | The guest path an `@dev` workspace lands at when the decorator names none (see dev-machines.md). |
+| `playbook_dir` | The guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`, for a guest whose default location is not writable (see automation.md). |
 
 The profile also classifies the guest as Windows-family or Linux-family, which is
 what the `login {}` validation rules and the Windows preconditions of the workspace
@@ -390,6 +391,7 @@ profile "<name>" {
   virtiofs        = false
   rtc             = "utc"
   workspace_guest = "/src"
+  playbook_dir    = "/var/lib/vmlab/weave"
 }
 ```
 
@@ -415,6 +417,7 @@ profile "<name>" {
 | `virtiofs` | bool | `false` | The guest mounts virtiofs natively, so `transport = "auto"` shares use it instead of SMB. |
 | `rtc` | utf8 | `utc` | What the guest reads the RTC as: `utc`, or `localtime` — the RTC then starts at the host's local time (`-rtc base=localtime`; a fixed `clock` converted to host local time). Only `windows-xp` and `windows-9x` set it. |
 | `workspace_guest` | utf8 | unset | Guest path an `@dev` workspace lands at when the decorator names none. |
+| `playbook_dir` | utf8 | unset | Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\…`). Unset, `/var/lib/vmlab/weave` on Linux and `C:\weave` on Windows. |
 
 The parser enforces the keyword sets above for `machine`, `firmware`, `disk_bus`,
 `accel`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative `memory`. `nic_model`,

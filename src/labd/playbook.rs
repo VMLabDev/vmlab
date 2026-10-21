@@ -2,10 +2,12 @@
 //! the per-machine run engine behind `playbook.check` / `playbook.apply`
 //! and the `up`-time apply steps, and the in-flight op registry.
 //!
-//! Guest layout stays consistent with config-weave's own testlab runner:
-//! the binary at `/weave/config-weave` (Linux) or `C:/weave/config-weave.exe`
-//! (Windows), playbooks under `<...>/weave/playbooks/`, forward slashes
-//! throughout.
+//! Guest layout: one guest directory per block ([`resolve_guest_dir`] —
+//! `/var/lib/vmlab/weave` on Linux and `C:/weave` on Windows unless the block
+//! or the profile names another) holding the binary (`config-weave`, or
+//! `config-weave.exe`) and the playbooks under `playbooks/`, forward slashes
+//! throughout. A block naming `guest_bin` runs that guest-resident binary
+//! instead of pushing one.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -155,18 +157,46 @@ where
     op().await
 }
 
-fn guest_base(os: GuestOs) -> &'static str {
+/// Where the playbook machinery lands in a Linux guest when neither the block
+/// nor the profile says otherwise. Under `/var` because that is writable on
+/// read-only-root systems (image-based, verity, NixOS) and persists across
+/// reboots, which the pushed-binary cache relies on.
+pub const LINUX_GUEST_DIR: &str = "/var/lib/vmlab/weave";
+/// The Windows counterpart, forward slashes like every guest path here.
+pub const WINDOWS_GUEST_DIR: &str = "C:/weave";
+
+/// The guest directory one `playbook {}` block uses: its own `guest_dir`,
+/// else the machine's profile's `playbook_dir`, else the family default.
+/// Windows backslashes become forward slashes, which the agent and
+/// config-weave accept and which keep path joins uniform.
+pub fn resolve_guest_dir(block: Option<&str>, profile: Option<&str>, os: GuestOs) -> String {
+    let dir = block.or(profile).unwrap_or(match os {
+        GuestOs::Linux => LINUX_GUEST_DIR,
+        GuestOs::Windows => WINDOWS_GUEST_DIR,
+    });
     match os {
-        GuestOs::Linux => "/weave",
-        GuestOs::Windows => "C:/weave",
+        GuestOs::Linux => dir.to_string(),
+        GuestOs::Windows => dir.replace('\\', "/"),
     }
 }
 
-fn guest_binary_path(os: GuestOs) -> String {
+/// `leaf` under the guest directory `dir`, never doubling the separator
+/// (`/` + `config-weave` is `/config-weave`).
+fn guest_join(dir: &str, leaf: &str) -> String {
+    format!("{}/{leaf}", dir.trim_end_matches('/'))
+}
+
+/// Where a pushed config-weave binary lives under the guest directory.
+fn guest_binary_path(dir: &str, os: GuestOs) -> String {
     match os {
-        GuestOs::Linux => format!("{}/config-weave", guest_base(os)),
-        GuestOs::Windows => format!("{}/config-weave.exe", guest_base(os)),
+        GuestOs::Linux => guest_join(dir, "config-weave"),
+        GuestOs::Windows => guest_join(dir, "config-weave.exe"),
     }
+}
+
+/// Where one playbook folder lives under the guest directory.
+fn guest_playbook_path(dir: &str, playbook: &Path) -> String {
+    guest_join(dir, &format!("playbooks/{}", sanitize_guest_dir(playbook)))
 }
 
 /// Flatten a lab-relative playbook path into one guest directory name
@@ -274,12 +304,20 @@ struct OpState {
     reboot_attempt: u32,
 }
 
+/// One machine's entry in the pushed-binary cache.
+struct PushedBinary {
+    guest_path: String,
+    sha256: String,
+}
+
 #[derive(Default)]
 struct OpsInner {
     /// In-flight runs keyed by machine — one per machine at a time.
     ops: HashMap<String, OpState>,
-    /// sha256 of the config-weave binary last pushed to each machine.
-    pushed: HashMap<String, String>,
+    /// The config-weave binary last pushed to each machine: where it went and
+    /// its sha256. The path is part of the answer, so a block whose guest
+    /// directory changed pushes again rather than trusting the old location.
+    pushed: HashMap<String, PushedBinary>,
     next_op: u64,
 }
 
@@ -350,16 +388,24 @@ impl PlaybookOps {
         }
     }
 
-    fn pushed_sha(&self, machine: &str) -> Option<String> {
-        self.inner.lock_recover().pushed.get(machine).cloned()
+    /// Whether the binary with `sha` was last pushed to `machine` at
+    /// `guest_path`. Either differing means a push is owed.
+    fn pushed_matches(&self, machine: &str, guest_path: &str, sha: &str) -> bool {
+        self.inner
+            .lock_recover()
+            .pushed
+            .get(machine)
+            .is_some_and(|p| p.guest_path == guest_path && p.sha256 == sha)
     }
 
-    fn set_pushed(&self, machine: &str, sha: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .pushed
-            .insert(machine.to_string(), sha.to_string());
+    fn set_pushed(&self, machine: &str, guest_path: &str, sha: &str) {
+        self.inner.lock_recover().pushed.insert(
+            machine.to_string(),
+            PushedBinary {
+                guest_path: guest_path.to_string(),
+                sha256: sha.to_string(),
+            },
+        );
     }
 
     /// The running op for `machine` (`playbook.list` decoration).
@@ -538,68 +584,35 @@ async fn run_inner(
         },
     };
 
-    // Guest binary: re-push when the host binary changed, or when a probe
-    // says the guest lost it (snapshot restores roll the disk back under a
-    // warm cache).
-    let bin_dir = default_bin_dir(lab.host_cfg.config_weave_bin_dir.as_deref());
-    let host_bin = weave_binary(&bin_dir, os, &arch)?;
-    let host_sha = crate::template::store::sha256_file(&host_bin)?;
-    let guest_bin = guest_binary_path(os);
-    let cached = lab.playbook_ops.pushed_sha(machine);
-    let mut need_push = cached.as_deref() != Some(host_sha.as_str());
-    if !need_push {
-        let probe = agent
-            .exec(
-                vec![guest_bin.clone(), "version".to_string()],
-                Vec::new(),
-                None,
-                None,
-                Duration::from_secs(30),
-                None,
-            )
-            .await;
-        need_push = !matches!(probe, Ok(ref o) if o.exit_code == 0);
-    }
-    if need_push {
-        log_line(&format!("pushing config-weave to {machine}"));
-        retry_push("config-weave binary push", &log_line, || {
-            let agent = agent.clone();
-            let host_bin = host_bin.clone();
-            let guest_bin = guest_bin.clone();
-            async move {
-                agent.push_file(&host_bin, &guest_bin, Some(0o755)).await?;
-                let smoke = agent
-                    .exec(
-                        vec![guest_bin, "version".to_string()],
-                        Vec::new(),
-                        None,
-                        None,
-                        Duration::from_secs(30),
-                        None,
-                    )
-                    .await?;
-                if smoke.exit_code != 0 {
-                    bail!(
-                        "version probe exited {}: {}",
-                        smoke.exit_code,
-                        String::from_utf8_lossy(&smoke.stderr)
-                    );
-                }
-                Ok(())
-            }
-        })
+    // The guest directory: the block's, else the profile's, else the
+    // family's. Made up front so a read-only location fails here, naming
+    // the directory and the knob that moves it, rather than mid-push.
+    let profile_dir = lab.effective_profile(machine).and_then(|p| p.playbook_dir);
+    let base_dir = resolve_guest_dir(pb.guest_dir.as_deref(), profile_dir.as_deref(), os);
+    agent
+        .open_fileops(None)
+        .await?
+        .mkdir_p(&base_dir)
         .await
-        .with_context(|| format!("pushing config-weave into {machine}"))?;
-        lab.playbook_ops.set_pushed(machine, &host_sha);
-    }
+        .with_context(|| {
+            format!(
+                "creating the playbook directory {base_dir} in {machine} — set `guest_dir` on \
+                 the playbook block (or `playbook_dir` on the profile) to a writable path"
+            )
+        })?;
+
+    let guest_bin = match &pb.guest_bin {
+        // A guest-resident binary: nothing to push, but it has to answer.
+        Some(bin) => {
+            probe_guest_resident(&agent, machine, bin).await?;
+            bin.clone()
+        }
+        None => push_binary(lab, machine, &agent, os, &arch, &base_dir, &log_line).await?,
+    };
 
     // Playbook folder: pre-clean then push fresh every run, so deleted
     // source files never linger in the guest.
-    let guest_dir = format!(
-        "{}/playbooks/{}",
-        guest_base(os),
-        sanitize_guest_dir(&pb.path)
-    );
+    let guest_dir = guest_playbook_path(&base_dir, &pb.path);
     let rm: Vec<String> = match os {
         GuestOs::Linux => vec!["rm".into(), "-rf".into(), guest_dir.clone()],
         GuestOs::Windows => vec![
@@ -753,6 +766,78 @@ async fn run_inner(
             report,
         });
     }
+}
+
+/// `<bin> version` in the guest — the probe every config-weave binary has to
+/// pass before vmlab runs a play with it. `Err` when the binary cannot be
+/// started or does not exit 0.
+async fn probe_version(agent: &AgentHandle, bin: &str) -> Result<()> {
+    let out = agent
+        .exec(
+            vec![bin.to_string(), "version".to_string()],
+            Vec::new(),
+            None,
+            None,
+            Duration::from_secs(30),
+            None,
+        )
+        .await?;
+    if out.exit_code != 0 {
+        bail!(
+            "version probe exited {}: {}",
+            out.exit_code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// A `guest_bin` the block names: vmlab pushes nothing, so the only thing to
+/// establish is that the binary is there and answers.
+async fn probe_guest_resident(agent: &AgentHandle, machine: &str, bin: &str) -> Result<()> {
+    probe_version(agent, bin).await.map_err(|e| {
+        anyhow!("guest_bin {bin} on {machine} is missing or did not answer `version`: {e:#}")
+    })
+}
+
+/// Ensure the host's config-weave binary is at its place under `base_dir`,
+/// returning that guest path. Re-pushes when the cache has no entry for this
+/// (path, sha256) — the host binary changed, or the guest directory moved —
+/// or when a probe says the guest lost it (a snapshot restore rolls the disk
+/// back under a warm cache).
+async fn push_binary(
+    lab: &LabRuntime,
+    machine: &str,
+    agent: &AgentHandle,
+    os: GuestOs,
+    arch: &str,
+    base_dir: &str,
+    log_line: &impl Fn(&str),
+) -> Result<String> {
+    let bin_dir = default_bin_dir(lab.host_cfg.config_weave_bin_dir.as_deref());
+    let host_bin = weave_binary(&bin_dir, os, arch)?;
+    let host_sha = crate::template::store::sha256_file(&host_bin)?;
+    let guest_bin = guest_binary_path(base_dir, os);
+    let need_push = !lab
+        .playbook_ops
+        .pushed_matches(machine, &guest_bin, &host_sha)
+        || probe_version(agent, &guest_bin).await.is_err();
+    if need_push {
+        log_line(&format!("pushing config-weave to {machine}:{guest_bin}"));
+        retry_push("config-weave binary push", log_line, || {
+            let agent = agent.clone();
+            let host_bin = host_bin.clone();
+            let guest_bin = guest_bin.clone();
+            async move {
+                agent.push_file(&host_bin, &guest_bin, Some(0o755)).await?;
+                probe_version(&agent, &guest_bin).await
+            }
+        })
+        .await
+        .with_context(|| format!("pushing config-weave into {machine} at {guest_bin}"))?;
+        lab.playbook_ops.set_pushed(machine, &guest_bin, &host_sha);
+    }
+    Ok(guest_bin)
 }
 
 /// The guest command line for one run. Each declared variable becomes a
@@ -1045,6 +1130,78 @@ mod tests {
         assert!(err.to_string().contains("still locked"), "{err}");
     }
 
+    /// #169: the block's `guest_dir` beats the profile's `playbook_dir`,
+    /// which beats the family default — `/var/lib/vmlab/weave`, writable on
+    /// a read-only root, and `C:/weave`.
+    #[test]
+    fn guest_dir_precedence() {
+        use GuestOs::{Linux, Windows};
+        assert_eq!(resolve_guest_dir(None, None, Linux), "/var/lib/vmlab/weave");
+        assert_eq!(resolve_guest_dir(None, None, Windows), "C:/weave");
+        assert_eq!(
+            resolve_guest_dir(None, Some("/var/opt/weave"), Linux),
+            "/var/opt/weave"
+        );
+        assert_eq!(
+            resolve_guest_dir(Some("/tmp/w"), Some("/var/opt/weave"), Linux),
+            "/tmp/w"
+        );
+        // Windows backslashes are normalised; Linux paths are left alone.
+        assert_eq!(
+            resolve_guest_dir(None, Some("D:\\tools\\weave"), Windows),
+            "D:/tools/weave"
+        );
+        assert_eq!(
+            resolve_guest_dir(Some("E:\\w"), Some("D:\\x"), Windows),
+            "E:/w"
+        );
+    }
+
+    #[test]
+    fn guest_paths_join_under_the_dir() {
+        let pb = Path::new("playbooks/baseline");
+        assert_eq!(
+            guest_binary_path(LINUX_GUEST_DIR, GuestOs::Linux),
+            "/var/lib/vmlab/weave/config-weave"
+        );
+        assert_eq!(
+            guest_playbook_path(LINUX_GUEST_DIR, pb),
+            "/var/lib/vmlab/weave/playbooks/playbooks__baseline"
+        );
+        assert_eq!(
+            guest_binary_path(WINDOWS_GUEST_DIR, GuestOs::Windows),
+            "C:/weave/config-weave.exe"
+        );
+        assert_eq!(
+            guest_playbook_path("C:/weave/", pb),
+            "C:/weave/playbooks/playbooks__baseline"
+        );
+        // A root or trailing-slash dir never doubles the separator.
+        assert_eq!(guest_binary_path("/", GuestOs::Linux), "/config-weave");
+        assert_eq!(
+            guest_binary_path("/opt/w/", GuestOs::Linux),
+            "/opt/w/config-weave"
+        );
+    }
+
+    /// The push cache is keyed on where the binary went as well as what it
+    /// was: a moved `guest_dir` must push again, not trust the old place.
+    #[test]
+    fn push_cache_follows_the_guest_path() {
+        let ops = PlaybookOps::default();
+        let old = "/weave/config-weave";
+        let new = "/var/lib/vmlab/weave/config-weave";
+        assert!(!ops.pushed_matches("m", old, "sha1"), "empty cache");
+        ops.set_pushed("m", old, "sha1");
+        assert!(ops.pushed_matches("m", old, "sha1"));
+        assert!(!ops.pushed_matches("m", new, "sha1"), "moved dir");
+        assert!(!ops.pushed_matches("m", old, "sha2"), "new binary");
+        assert!(!ops.pushed_matches("other", old, "sha1"), "other machine");
+        ops.set_pushed("m", new, "sha1");
+        assert!(ops.pushed_matches("m", new, "sha1"));
+        assert!(!ops.pushed_matches("m", old, "sha1"));
+    }
+
     #[test]
     fn sanitize_flattens_paths() {
         assert_eq!(
@@ -1174,17 +1331,17 @@ lab "l" {
 }"#);
         let pb = resolve_playbook(&lab, "srv01", None, None).unwrap();
         let argv = run_argv(
-            "/weave/config-weave",
-            "/weave/playbooks/pb__ad",
+            "/var/lib/vmlab/weave/config-weave",
+            "/var/lib/vmlab/weave/playbooks/pb__ad",
             pb,
             PlaybookMode::Apply,
         );
         assert_eq!(
             argv,
             vec![
-                "/weave/config-weave",
+                "/var/lib/vmlab/weave/config-weave",
                 "apply",
-                "/weave/playbooks/pb__ad",
+                "/var/lib/vmlab/weave/playbooks/pb__ad",
                 "member-server",
                 "--json",
                 "--events-ndjson",
@@ -1196,6 +1353,25 @@ lab "l" {
                 "retries=3",
             ]
         );
+    }
+
+    /// The block's `guest_dir` and `guest_bin` reach the model; leaving them
+    /// out leaves the profile and the push in charge.
+    #[test]
+    fn block_carries_guest_dir_and_guest_bin() {
+        let lab = lab(r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    playbook "pb/x" { play = "base" guest_dir = "/var/opt/w" guest_bin = "/usr/bin/config-weave" }
+  }
+  vm "b" { template = "x86_64/t" playbook "pb/x" { play = "base" } }
+}"#);
+        let pb = resolve_playbook(&lab, "a", None, None).unwrap();
+        assert_eq!(pb.guest_dir.as_deref(), Some("/var/opt/w"));
+        assert_eq!(pb.guest_bin.as_deref(), Some("/usr/bin/config-weave"));
+        let pb = resolve_playbook(&lab, "b", None, None).unwrap();
+        assert!(pb.guest_dir.is_none() && pb.guest_bin.is_none());
     }
 
     #[test]

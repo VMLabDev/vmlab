@@ -447,10 +447,15 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             TemplateRef::Store { arch, .. } => Some(arch.as_str()),
             _ => vm.arch.as_deref(),
         };
+        let family =
+            login_family(effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref());
         for p in &vm.playbooks {
-            check_playbook(p, &file.root, &mut issues);
+            check_playbook(p, &file.root, family, &mut issues);
+            // A guest-resident binary is the guest's own business; only a
+            // pushed one has to be config-weave's x86_64 build.
             if let Some(arch) = arch
                 && arch != "x86_64"
+                && p.guest_bin.is_none()
             {
                 issues.push(Issue::at(
                     p.span,
@@ -467,8 +472,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for p in &c.provisions {
             scripts.push((&p.script, p.span));
         }
+        // A container always runs vmlab's own Linux guest (§18).
         for p in &c.playbooks {
-            check_playbook(p, &file.root, &mut issues);
+            check_playbook(p, &file.root, LoginFamily::Linux, &mut issues);
         }
     }
 
@@ -687,10 +693,22 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         }
         // Build playbooks run on the synthetic "build" VM, and config-weave
         // is x86_64-only (§10.4).
-        let variant_playbooks = t.variants.iter().flat_map(|v| &v.playbooks);
-        for p in t.playbooks.iter().chain(variant_playbooks) {
-            check_playbook(p, &file.root, &mut issues);
-            if t.arch != "x86_64" {
+        let base_family = login_family(t.profile.as_deref());
+        let variant_playbooks = t.variants.iter().flat_map(|v| {
+            let family = match &v.profile {
+                Some(p) => login_family(Some(p)),
+                None => base_family,
+            };
+            v.playbooks.iter().map(move |p| (p, family))
+        });
+        for (p, family) in t
+            .playbooks
+            .iter()
+            .map(|p| (p, base_family))
+            .chain(variant_playbooks)
+        {
+            check_playbook(p, &file.root, family, &mut issues);
+            if t.arch != "x86_64" && p.guest_bin.is_none() {
                 issues.push(Issue::at(
                     p.span,
                     format!(
@@ -1069,7 +1087,8 @@ impl TemplateLayer {
     }
 }
 
-/// The guest OS family a machine's `login {}` blocks are judged against.
+/// The guest OS family a machine's `login {}` blocks — and its playbooks'
+/// guest paths — are judged against.
 ///
 /// Three-valued where its siblings are two-valued, and deliberately so. Both
 /// of §19.2's family rules are statements about a *known* family — "the agent
@@ -1172,13 +1191,36 @@ fn check_logins(
 }
 
 /// Structural checks shared by every `playbook {}` block, wherever it is
-/// declared: the play is named, the folder is a real playbook, and the
-/// variables can survive the trip to config-weave's `--var KEY=VALUE`.
-fn check_playbook(p: &Playbook, root: &Path, issues: &mut IssueList) {
+/// declared: the play is named, the folder is a real playbook, the
+/// variables can survive the trip to config-weave's `--var KEY=VALUE`, and
+/// the guest paths are absolute for the machine's `family`.
+fn check_playbook(p: &Playbook, root: &Path, family: LoginFamily, issues: &mut IssueList) {
     if p.play.is_empty() {
         issues.push(Issue::at(
             p.span,
             format!("playbook {} has an empty play name", p.path.display()),
+        ));
+    }
+    for (key, value) in [("guest_dir", &p.guest_dir), ("guest_bin", &p.guest_bin)] {
+        if let Some(path) = value
+            && let Some(why) = guest_path_problem(path, family)
+        {
+            issues.push(Issue::at(
+                p.span,
+                format!("playbook {}: `{key}` {why}", p.path.display()),
+            ));
+        }
+    }
+    if family == LoginFamily::Windows
+        && let Some(bin) = &p.guest_bin
+        && !bin.to_ascii_lowercase().ends_with(".exe")
+    {
+        issues.push(Issue::at(
+            p.span,
+            format!(
+                "playbook {}: `guest_bin` \"{bin}\" must end in `.exe` on a Windows guest",
+                p.path.display()
+            ),
         ));
     }
     let dir = root.join(&p.path);
@@ -1219,6 +1261,26 @@ fn check_playbook(p: &Playbook, root: &Path, issues: &mut IssueList) {
             ));
         }
     }
+}
+
+/// Why `path` is not an absolute guest path for `family`, or `None` when it
+/// is. A known family takes only its own form; an unknown one either, since
+/// rejecting on a guess is what the three-valued family exists to avoid.
+fn guest_path_problem(path: &str, family: LoginFamily) -> Option<String> {
+    use crate::config::model::{is_unix_absolute, is_windows_absolute};
+    let ok = match family {
+        LoginFamily::Linux => is_unix_absolute(path),
+        LoginFamily::Windows => is_windows_absolute(path),
+        LoginFamily::Unknown => is_unix_absolute(path) || is_windows_absolute(path),
+    };
+    (!ok).then(|| {
+        let form = match family {
+            LoginFamily::Linux => "an absolute path (`/…`)",
+            LoginFamily::Windows => "an absolute drive-letter path (`C:\\…`)",
+            LoginFamily::Unknown => "an absolute guest path (`/…` or `C:\\…`)",
+        };
+        format!("must be {form}, got \"{path}\"")
+    })
 }
 
 /// Mirrors config-weave's own `is_identifier` gate on `--var` keys.
@@ -3322,6 +3384,84 @@ template "t" {
                 .any(|m| m.contains("\"1bad\" is not a valid identifier")),
             "expected identifier error, got: {es:#?}"
         );
+    }
+
+    /// #169: `guest_dir`/`guest_bin` must be absolute in the machine's family's
+    /// form, and a Windows `guest_bin` must be an `.exe`. A machine whose family
+    /// is unknown takes either form; a container is always Linux.
+    #[test]
+    fn playbook_guest_paths_are_absolute_for_the_family() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "lin" {
+    template = "x86_64/t"
+    profile  = "linux-modern"
+    playbook "playbooks/base" { play = "base" guest_dir = "var/weave" }
+  }
+  vm "win" {
+    template = "x86_64/t"
+    profile  = "windows-11"
+    playbook "playbooks/base" {
+      play      = "base"
+      guest_dir = "/var/weave"
+      guest_bin = "C:\\weave\\config-weave"
+    }
+  }
+  vm "ok-win" {
+    template = "x86_64/t"
+    profile  = "windows-11"
+    playbook "playbooks/base" {
+      play      = "base"
+      guest_dir = "D:\\weave"
+      guest_bin = "C:/tools/Config-Weave.EXE"
+    }
+  }
+  vm "unknown" {
+    template = "x86_64/t"
+    playbook "playbooks/base" { play = "base" guest_dir = "E:/w" }
+    playbook "playbooks/base" { play = "base" guest_bin = "/usr/bin/config-weave" }
+  }
+  container "c" {
+    image = "redis"
+    playbook "playbooks/base" { play = "base" guest_dir = "C:\\weave" }
+  }
+}"#,
+        );
+        let has = |needle: &str| es.iter().any(|m| m.contains(needle));
+        assert!(
+            has("`guest_dir` must be an absolute path (`/…`), got \"var/weave\""),
+            "{es:#?}"
+        );
+        assert!(
+            has("`guest_dir` must be an absolute drive-letter path (`C:\\…`), got \"/var/weave\""),
+            "{es:#?}"
+        );
+        assert!(
+            has("`guest_bin` \"C:\\weave\\config-weave\" must end in `.exe`"),
+            "{es:#?}"
+        );
+        assert!(
+            has("`guest_dir` must be an absolute path (`/…`), got \"C:\\weave\""),
+            "container is Linux: {es:#?}"
+        );
+        assert_eq!(es.len(), 4, "ok-win and unknown are clean: {es:#?}");
+    }
+
+    /// A guest-resident binary is not config-weave's x86_64 build, so the
+    /// arch gate that guards the push does not apply to it.
+    #[test]
+    fn guest_bin_lifts_the_x86_64_gate() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "arm" {
+    template = "aarch64/t"
+    playbook "playbooks/base" { play = "base" guest_bin = "/usr/bin/config-weave" }
+  }
+}"#,
+        );
+        assert!(es.is_empty(), "{es:#?}");
     }
 
     #[test]

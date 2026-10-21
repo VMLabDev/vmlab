@@ -69,6 +69,7 @@ profile "<name>" {
   virtiofs        = false
   rtc             = "utc"
   workspace_guest = "/src"
+  playbook_dir    = "/var/lib/vmlab/weave"
 }
 SRC
   }
@@ -95,6 +96,7 @@ SRC
       | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
       | "`rtc`" | "utf8" | "`utc`" | "What the guest reads the real-time clock as: `utc`, or `localtime` for a guest that cannot read it as UTC, whose RTC then starts at the host's local time (QEMU `-rtc base=localtime`; a fixed `clock` is converted to the host's local time at that instant). Only `windows-xp` and `windows-9x` set `localtime`." |
       | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |
+      | "`playbook_dir`" | "utf8" | "unset" | "Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\\…`). Unset, `/var/lib/vmlab/weave` on Linux and `C:\\weave` on Windows." |
   }
   p <<DOC
     The parser enforces the keyword sets above for `machine`, `firmware`,

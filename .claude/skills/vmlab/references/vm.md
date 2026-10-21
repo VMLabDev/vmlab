@@ -123,7 +123,8 @@ Known architectures are `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`,
 - A VM with `share {}` blocks that are not `transport = "virtiofs"` needs at
   least one `nic {}`, because SMB is reachable only over a segment.
 - A `playbook {}` on a VM whose arch is known to be something other than
-  `x86_64` is rejected; config-weave ships guest binaries for x86_64 only.
+  `x86_64` is rejected unless it names a `guest_bin`; config-weave ships guest
+  binaries for x86_64 only.
 
 ```wcl
 # examples/mixed-lab/vmlab.wcl
@@ -437,13 +438,18 @@ playbook "playbooks/baseline" {
 | `path` | utf8 (label) | required | Playbook folder containing `playbook.wcl`, relative to the lab root; the inline label. |
 | `play` | utf8 | required | Play name inside the playbook to run. |
 | `timeout` | duration | `1h` | Ceiling on each config-weave run, such as `2h` or `90min`. A run after a reboot gets the full value again. |
+| `guest_dir` | utf8 | profile's `playbook_dir`, else `/var/lib/vmlab/weave` (Linux) or `C:\weave` (Windows) | Absolute guest directory the config-weave binary and the playbook folders land in. Created if missing. |
+| `guest_bin` | utf8 | unset | Absolute path of a config-weave binary already in the guest. When set, vmlab pushes no binary and probes this one with `version` before each run; the playbook folder is still pushed to `guest_dir`. |
 | `var {}` | children | none | Variable overrides passed to config-weave for this machine's run. |
 
 Validation requires a non-empty `play`, a `path` that is a directory holding a
 `playbook.wcl`, a `timeout` greater than zero, and no variable set twice on one
-block. config-weave ships guest
+block. `guest_dir` and `guest_bin` must be absolute for the machine's guest
+family: a drive-letter path on Windows, a path starting with `/` on Linux
+(every container), and either where the family is unknown. On Windows
+`guest_bin` must also end in `.exe`. config-weave ships guest
 binaries for x86_64 only, so a playbook on a VM with another known arch is
-rejected.
+rejected unless it names a `guest_bin`.
 
 ## var {}
 
