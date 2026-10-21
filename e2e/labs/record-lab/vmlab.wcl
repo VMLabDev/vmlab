@@ -1,0 +1,29 @@
+// Console recording (§11.1): one Alpine VM whose console is recorded, and
+// one idle container to show that a machine with no display refuses.
+import <vmlab.wcl>
+
+lab "e2e-record" {
+  segment "lan" {
+    subnet = "10.87.0.0/24"
+  }
+
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic {
+      segment = "lan"
+      ip      = "10.87.0.10"
+    }
+  }
+
+  container "web" {
+    image   = "alpine:3.22"
+    profile = "container"
+    mode    = :idle
+    nic {
+      segment = "lan"
+      ip      = "10.87.0.20"
+    }
+  }
+}
