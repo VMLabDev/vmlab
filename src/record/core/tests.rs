@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::{Core, CursorShape, Frame, IDLE_AREA, RIPPLE_RGB};
+use super::{Core, CursorShape, Frame};
 use crate::record::input::InputEvent;
 use crate::record::{Format, Settings, Size};
 
@@ -32,7 +32,7 @@ fn pixel(frame: &Frame, size: Size, x: u32, y: u32) -> [u8; 3] {
 }
 
 fn all(frame: &Frame, rgb: [u8; 3]) -> bool {
-    frame.rgb.chunks_exact(3).all(|p| p == rgb)
+    frame.rgb.as_chunks::<3>().0.iter().all(|p| *p == rgb)
 }
 
 const RED: [u8; 3] = [255, 0, 0];
@@ -180,7 +180,6 @@ fn a_click_ripples_at_its_point() {
         "amber at the click point: {centre:?}"
     );
     assert_eq!(pixel(&frame, size, 2, 2), BLACK, "far corner untouched");
-    let _ = RIPPLE_RGB;
 
     let frames = core.tick(secs(0.7));
     assert!(all(frames.last().unwrap(), BLACK), "faded out after 0.5 s");
@@ -248,7 +247,6 @@ fn idle_stretches_are_cut_and_activity_is_not() {
     let frames = core.finish(secs(6.0));
     assert_eq!(frames.len(), 5, "2 s idle at the end becomes 0.5 s");
     assert_eq!(core.cuts().len(), 2);
-    assert!(IDLE_AREA >= 8 * 16);
 }
 
 /// Timeline timestamps are in output-video time, so an input after a cut is

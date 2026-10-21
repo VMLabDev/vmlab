@@ -293,7 +293,9 @@ impl VncClient {
                 let mut px = vec![0u8; w as usize * h as usize * 4];
                 self.stream.read_exact(&mut px).await?;
                 let rgba = px
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|p| [p[2], p[1], p[0], p[3]])
                     .collect();
                 Ok(Some(StreamEvent::Cursor {
