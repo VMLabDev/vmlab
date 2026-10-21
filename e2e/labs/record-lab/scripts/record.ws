@@ -6,7 +6,7 @@ fn main(lab: Lab) {
     let vm = lab.vm("vm01").expect("vm01")
     let r = vm.record("recordings/from-script.webm", #{ "fps": "15", "size": "960x540" }).expect("record")
     lab.log("e2e-recording " + r.path())
-    vm.send_keys("ret").expect("keys")
+    vm.send_keys("enter").expect("keys")
     let path = r.stop().expect("stop")
     lab.log("e2e-stopped " + path)
     let open = vm.record("recordings/left-open.mp4", #{}).expect("record again")
