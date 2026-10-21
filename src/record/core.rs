@@ -36,9 +36,9 @@ pub const IDLE_AREA: u64 = 64 * 64;
 /// How long a click ripple stays on screen.
 pub const RIPPLE_DURATION: Duration = Duration::from_millis(500);
 /// Ripple geometry, in output pixels: it starts as a disc of this radius...
-const RIPPLE_RADIUS_START: f64 = 6.0;
+const RIPPLE_RADIUS_START: f64 = 10.0;
 /// ...and grows to this radius as it fades.
-const RIPPLE_RADIUS_END: f64 = 36.0;
+const RIPPLE_RADIUS_END: f64 = 44.0;
 /// Ripple colour (an amber that reads on light and dark desktops alike).
 pub const RIPPLE_RGB: [u8; 3] = [255, 170, 0];
 
@@ -534,14 +534,14 @@ fn draw_ripple(rgb: &mut [u8], size: Size, cx: f64, cy: f64, progress: f64) {
             if d > radius {
                 continue;
             }
-            let rim = if radius - d < 2.5 { 1.0 } else { 0.65 };
+            let rim = if radius - d < 3.0 { 1.0 } else { 0.8 };
             blend(
                 rgb,
                 size,
                 cx.round() as i64 + dx,
                 cy.round() as i64 + dy,
                 RIPPLE_RGB,
-                (0.85 * fade * rim).clamp(0.0, 1.0),
+                (0.95 * fade * rim).clamp(0.0, 1.0),
             );
         }
     }
