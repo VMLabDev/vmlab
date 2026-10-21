@@ -1112,6 +1112,8 @@ pub const EVENT_NAMES: &[&str] = &[
     "playbook.applied",
     "playbook.failed",
     "host.disk_low",
+    "record.started",
+    "record.stopped",
 ];
 
 /// Architectures with a `qemu-system-<arch>` emulator vmlab will drive.

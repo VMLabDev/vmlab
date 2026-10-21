@@ -315,6 +315,9 @@ pub struct VmInstance {
     /// [`super::hypervisor`]). Real QEMU in production; a fake in tests, which
     /// is what makes the start ladder and the exit monitor testable.
     hv: Arc<dyn Hypervisor>,
+    /// Where the display publishes every input it sends, for a console
+    /// recorder (§11.1). Lives as long as the machine, across restarts.
+    input_tap: Arc<crate::record::InputTap>,
 }
 
 /// What a VM's primary disk is made from, as the lab file declares it: the
@@ -395,6 +398,7 @@ impl VmInstance {
             control: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
+            input_tap: Arc::default(),
         })
     }
 
@@ -895,6 +899,7 @@ impl VmInstance {
         on_exit: impl Fn(StopReason, String) + Send + Sync + 'static,
         on_ready: impl Fn() + Send + Sync + 'static,
         before_ready: impl std::future::Future<Output = ()> + Send + 'static,
+        before_resume: impl std::future::Future<Output = Result<()>> + Send + 'static,
         on_sleep: impl Fn(SleepChange) + Send + Sync + 'static,
     ) -> Result<()> {
         {
@@ -991,6 +996,10 @@ impl VmInstance {
                 .await?;
             *self.qemu.lock().await = Some(proc.clone());
 
+            // The paused window (D20): QEMU is up, its VNC socket answers,
+            // and no guest instruction has run. Whatever must catch the
+            // first frame attaches here, then the CPUs go.
+            before_resume.await?;
             control.resume().await?;
             *self.control.lock().await = Some(control.clone());
 
@@ -1335,8 +1344,14 @@ impl VmInstance {
         if was_online {
             // Ensure a running QEMU to load into.
             if self.power_state().await == PowerState::Stopped {
-                self.boot(on_exit, on_ready, std::future::ready(()), on_sleep)
-                    .await?;
+                self.boot(
+                    on_exit,
+                    on_ready,
+                    std::future::ready(()),
+                    std::future::ready(Ok(())),
+                    on_sleep,
+                )
+                .await?;
             }
             // QEMU loads a snapshot into a running machine; one that is
             // asleep is woken first, and the snapshot decides what it runs.
@@ -1421,6 +1436,10 @@ impl super::display::DisplayHost for VmInstance {
             .gpu
             .as_ref()
             .is_some_and(|g| g.mode.gl_display())
+    }
+
+    fn input_tap(&self) -> Arc<crate::record::InputTap> {
+        self.input_tap.clone()
     }
 }
 
@@ -1594,6 +1613,8 @@ impl super::machine::Machine for VmInstance {
         let ready_lab = Arc::clone(&lab);
         let gate_lab = Arc::clone(&lab);
         let gate_name = self.cfg.name.clone();
+        let resume_lab = Arc::clone(&lab);
+        let resume_name = self.cfg.name.clone();
         self.boot(
             move |reason, status| {
                 let payload =
@@ -1615,6 +1636,7 @@ impl super::machine::Machine for VmInstance {
                 tokio::spawn(async move { lab.machine_ready(&n).await });
             },
             async move { gate_lab.before_ready(&gate_name).await },
+            async move { resume_lab.before_resume(&resume_name).await },
             sleep_events(lab.events().clone(), self.cfg.name.clone()),
         )
         .await

@@ -155,6 +155,14 @@ pub trait LabServices: Send + Sync + 'static {
     /// default owes nothing.
     async fn before_ready(&self, _machine: &str) {}
 
+    /// The emulator is up with its CPUs still paused and nothing yet drawn
+    /// (D20): the one moment a console recorder can attach and be sure of
+    /// the first frame. An error here fails the start. The default owes
+    /// nothing.
+    async fn before_resume(&self, _machine: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// This machine reached readiness — (re-)install anything keyed on its
     /// network lease, which moves across restarts.
     async fn machine_ready(&self, machine: &str);
@@ -751,6 +759,8 @@ impl dyn Machine {
             // Lab-level too: divergence is recorded in the lab's persisted
             // state, which the machine does not hold (§19.4).
             agent_diverged: false,
+            // And the recording: the lab daemon owns it (§11.1).
+            recording: None,
             detail,
         }
     }

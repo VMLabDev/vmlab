@@ -243,6 +243,55 @@ impl Settings {
     }
 }
 
+/// One recording a request asks a lab daemon to start alongside what it is
+/// doing: `--record <vm>=<path>` on `script`, `up`, `vm start` and
+/// `vm restart` (D8, D20). The one shape every such request carries.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RecordRequest {
+    /// The machine to record.
+    pub machine: String,
+    /// Absolute output path; absent means the lab's default
+    /// (`.vmlab/recordings/<machine>-<stamp>.mp4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub options: RecordOptions,
+}
+
+/// A live recording as status reports it (ADR-0004) and as
+/// `machine.record_start` / `machine.record_status` answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordingStatus {
+    pub machine: String,
+    pub path: std::path::PathBuf,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Wall-clock seconds since it started.
+    pub elapsed_secs: f64,
+    /// The options in force, defaults filled in.
+    pub options: RecordOptions,
+}
+
+// The status projection is `Eq` (ADR-0004) and these ride in it. Their only
+// non-`Eq` members are finite seconds (an elapsed time, a threshold, a cap)
+// that never hold a NaN, so equality is reflexive in practice.
+impl Eq for RecordingStatus {}
+impl Eq for RecordOptions {}
+
+/// What `machine.record_stop` answers: the finalised file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordStopped {
+    pub machine: String,
+    pub path: std::path::PathBuf,
+    /// Length of the video written, in seconds.
+    pub duration_secs: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<std::path::PathBuf>,
+    /// Why it had already ended, when it was not this stop: the maximum
+    /// duration, or an encoder failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<String>,
+}
+
 /// The sidecar a `timeline` recording writes beside its video.
 pub fn timeline_path(output: &Path) -> std::path::PathBuf {
     let mut name = output

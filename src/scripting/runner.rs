@@ -12,6 +12,7 @@ use wscript::Vm;
 
 use super::{EventData, LabHandle, SegmentHandle};
 use crate::labd::lab::LabRuntime;
+use crate::labd::record::RunId;
 
 /// Where script log output goes (lab log + live CLI stream, PRD §10.1).
 pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -76,12 +77,22 @@ pub async fn run_script_file(
     runtime: Arc<LabRuntime>,
     script: &Path,
     owner: Option<ScriptOwner>,
+    run: Option<RunId>,
     output: OutputSink,
 ) -> Result<()> {
     let source =
         std::fs::read_to_string(script).with_context(|| format!("reading {}", script.display()))?;
     let name = script.display().to_string();
-    run_script_source(runtime, source, &name, script_dir(script), owner, output).await
+    run_script_source(
+        runtime,
+        source,
+        &name,
+        script_dir(script),
+        owner,
+        run,
+        output,
+    )
+    .await
 }
 
 /// Run a `main(lab)` script from in-memory source (a template's embedded
@@ -94,12 +105,19 @@ pub async fn run_script_source(
     name: &str,
     ref_base: std::path::PathBuf,
     owner: Option<ScriptOwner>,
+    run: Option<RunId>,
     output: OutputSink,
 ) -> Result<()> {
     let name = name.to_string();
     let ref_base = Arc::new(ref_base);
     let rt = tokio::runtime::Handle::current();
     let out_err = output.clone();
+    // The run every recording this script starts belongs to (D7): a caller
+    // that already holds one (`vmlab script --record`) passes it, so the
+    // recordings it started before the script are finalised with the
+    // script's own.
+    let run = run.unwrap_or_else(|| runtime.recordings.new_run());
+    let finalise_on = runtime.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
         let ctx = super::context();
         let unit = ctx
@@ -112,12 +130,17 @@ pub async fn run_script_source(
             output,
             ref_base,
             owner,
+            run,
         };
         vm.call_unit::<_, ()>(&unit, "main", (lab,))
             .map_err(|e| anyhow!("{name}: {}", run_error(e)))
     })
     .await
-    .map_err(|e| anyhow!("script thread panicked: {e}"))?;
+    .map_err(|e| anyhow!("script thread panicked: {e}"));
+    // Whatever the script recorded and did not stop is finalised here, on
+    // success and on failure alike (D7).
+    finalise_on.record_finalise_run(run).await;
+    let result = result?;
     if let Err(e) = &result {
         out_err(format!("script failed: {e:#}\n"));
     }
@@ -139,6 +162,8 @@ pub async fn run_event_handler(
     let name = script.display().to_string();
     let ref_base = Arc::new(script_dir(script));
     let rt = tokio::runtime::Handle::current();
+    let run = runtime.recordings.new_run();
+    let finalise_on = runtime.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
         let ctx = super::context();
         let unit = ctx
@@ -151,11 +176,13 @@ pub async fn run_event_handler(
             output,
             ref_base,
             owner: None,
+            run,
         };
         vm.call_unit::<_, ()>(&unit, "handle", (event, lab))
             .map_err(|e| anyhow!("{name}: {}", run_error(e)))
     })
     .await;
+    finalise_on.record_finalise_run(run).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!("event handler failed: {e:#}"),

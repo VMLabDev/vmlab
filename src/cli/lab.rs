@@ -204,6 +204,7 @@ pub fn cmd_up(vms: Vec<String>) -> Result<()> {
             .send_streaming(
                 LabRequest::Up {
                     machines: vms.clone(),
+                    record: Vec::new(),
                 },
                 |chunk| print!("{chunk}"),
             )
@@ -1056,9 +1057,16 @@ impl PowerOp {
     /// The request this operation makes against one machine.
     fn request(self, machine: String, force: bool) -> LabRequest {
         match self {
-            PowerOp::Start => LabRequest::MachineStart { machine },
+            PowerOp::Start => LabRequest::MachineStart {
+                machine,
+                record: Vec::new(),
+            },
             PowerOp::Stop => LabRequest::MachineStop { machine, force },
-            PowerOp::Restart => LabRequest::MachineRestart { machine, force },
+            PowerOp::Restart => LabRequest::MachineRestart {
+                machine,
+                force,
+                record: Vec::new(),
+            },
         }
     }
 }
@@ -1797,6 +1805,7 @@ pub fn cmd_run(script: &str) -> Result<()> {
             .send_streaming(
                 LabRequest::Run {
                     script: script.to_string(),
+                    record: Vec::new(),
                 },
                 |chunk| print!("{chunk}"),
             )
@@ -2545,6 +2554,7 @@ mod tests {
             // Start has nothing to force.
             LabRequest::MachineStart {
                 machine: "dc01".into(),
+                record: Vec::new(),
             }
         );
         assert_eq!(
@@ -2559,6 +2569,7 @@ mod tests {
             LabRequest::MachineRestart {
                 machine: "dc01".into(),
                 force: false,
+                record: Vec::new(),
             }
         );
     }

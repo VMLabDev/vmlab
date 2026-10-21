@@ -27,6 +27,7 @@ pub mod one_shot;
 pub mod plan;
 pub mod playbook;
 pub mod pull_ledger;
+pub mod record;
 pub mod share_plan;
 pub mod state;
 pub mod usb;
@@ -138,6 +139,7 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     // (PRD §8.1); matters even more on WSL2's growing VHDX (§13).
     let wd_events = runtime.events.clone();
     let wd_path = runtime.lab_local.clone();
+    let wd_lab = runtime.clone();
     let watchdog = crate::config::host::spawn_disk_watchdog(
         wd_path.clone(),
         host_cfg.disk_low_percent,
@@ -148,6 +150,12 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
                 "host.disk_low",
                 json!({"path": wd_path, "free_percent": free}),
             );
+            // A recording grows the very filesystem that just ran low: every
+            // live one is finalised to a playable file (D14).
+            let lab = wd_lab.clone();
+            tokio::spawn(async move {
+                lab.record_finalise_all("disk space low").await;
+            });
         },
     );
     tasks.adopt("disk-watchdog", watchdog);
@@ -289,6 +297,29 @@ where
     let result = op(output).await;
     drained.await;
     result
+}
+
+/// The start a `machine.start` performs once its pull and preflight are done.
+///
+/// `vm start` refreshes a stale agent as `up` does (§19.4), in the background
+/// at its handshake — holding its readiness until the refresh is done — so the
+/// verb still returns as soon as the machine has started. Not under a pending
+/// first-boot, which only `up` runs and which the refresh must follow — the
+/// next `up` does it. Starting a sleeping machine wakes it, and nothing else:
+/// it never stopped, so no handshake is coming to defer a refresh to, and a
+/// refresh is not what was asked for.
+async fn start_machine_request(lab: &Arc<LabRuntime>, machine: &str) -> Result<(), CommandError> {
+    let m = machine_of(lab, machine)?;
+    if m.state().await == vm::PowerState::Suspended {
+        lab.start_machine(machine).await?;
+        return Ok(());
+    }
+    if m.pending_first_boot().is_none() {
+        lab.start_with_deferred_refresh(&m).await?;
+    } else {
+        lab.start_machine(machine).await?;
+    }
+    Ok(())
 }
 
 /// The addressed machine.
@@ -435,8 +466,16 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::Version {} => Ok(json!(crate::version::BUILD)),
             LabRequest::Status {} => Ok(json!(lab.status().await)),
             LabRequest::DnsTable {} => Ok(lab.dns_table().await),
-            LabRequest::Up { machines } => {
-                streamed(lab, stream, |output| lab.up(&machines, output)).await?;
+            LabRequest::Up { machines, record } => {
+                // Recordings ride the boot (D20): checked and armed first, so
+                // a refusal costs nothing, started in each VM's paused
+                // window, and anything left over settled after.
+                lab.record_arm(&record, None).await?;
+                let targets: Vec<String> = record.iter().map(|r| r.machine.clone()).collect();
+                let up = streamed(lab, stream, |output| lab.up(&machines, output)).await;
+                let settled = lab.record_settle(&targets).await;
+                up?;
+                settled?;
                 Ok(json!(true))
             }
             // Download any pending templates/images without starting anything
@@ -453,12 +492,22 @@ impl Handler<LabRequest> for LabdHandler {
             // is waiting on it fails with "download cancelled".
             LabRequest::PullCancel { machine } => Ok(json!(lab.cancel_pull(&machine))),
             // Ad-hoc script against the lab (PRD §12: vmlab script).
-            LabRequest::Run { script } => {
+            LabRequest::Run { script, record } => {
                 let path = lab.root.join(script);
-                streamed(lab, stream, |output| {
-                    crate::scripting::run_script_file(lab.clone(), &path, None, output)
+                // `--record` lasts exactly the run (D8): the recordings are
+                // the run's own, so the finalise that ends every recording a
+                // run started — success or failure — ends these too.
+                let run = lab.recordings.new_run();
+                for r in &record {
+                    lab.record_start(&r.machine, r.path.as_deref(), &r.options, Some(run))
+                        .await?;
+                }
+                let result = streamed(lab, stream, |output| {
+                    crate::scripting::run_script_file(lab.clone(), &path, None, Some(run), output)
                 })
-                .await?;
+                .await;
+                lab.record_finalise_run(run).await;
+                result?;
                 Ok(json!(true))
             }
             LabRequest::Down { machines, force } => {
@@ -493,7 +542,7 @@ impl Handler<LabRequest> for LabdHandler {
             // genuinely cannot serve a command it says so through its
             // capabilities (no display, no console log) rather than through
             // its kind — see `labd::machine`.
-            LabRequest::MachineStart { machine } => {
+            LabRequest::MachineStart { machine, record } => {
                 // Pull with CLI-visible progress before the preflight (the
                 // pulled meta can change the resolved firmware/TPM needs);
                 // the internal pull in start is then a no-op.
@@ -503,34 +552,47 @@ impl Handler<LabRequest> for LabdHandler {
                 })
                 .await?;
                 lab.preflight_binaries(std::slice::from_ref(&machine))?;
-                // `vm start` refreshes a stale agent as `up` does (§19.4),
-                // in the background at its handshake — holding its readiness
-                // until the refresh is done — so the verb still returns as
-                // soon as the machine has started. Not under
-                // a pending first-boot, which only `up` runs and which the
-                // refresh must follow — the next `up` does it.
-                let m = machine_of(lab, &machine)?;
-                // Starting a sleeping machine wakes it, and nothing else: it
-                // never stopped, so no handshake is coming to defer a
-                // refresh to, and a refresh is not what was asked for.
-                if m.state().await == vm::PowerState::Suspended {
-                    lab.start_machine(&machine).await?;
-                    return Ok(json!(true));
-                }
-                if m.pending_first_boot().is_none() {
-                    lab.start_with_deferred_refresh(&m).await?;
-                } else {
-                    lab.start_machine(&machine).await?;
-                }
+                lab.record_arm(&record, None).await?;
+                let targets: Vec<String> = record.iter().map(|r| r.machine.clone()).collect();
+                let started = start_machine_request(lab, &machine).await;
+                let settled = lab.record_settle(&targets).await;
+                started?;
+                settled?;
                 Ok(json!(true))
             }
             LabRequest::MachineStop { machine, force } => {
-                machine_of(lab, &machine)?.stop(force).await?;
+                lab.stop_machine(&machine, force).await?;
                 Ok(json!(true))
             }
-            LabRequest::MachineRestart { machine, force } => {
-                lab.restart_machine(&machine, force).await?;
+            LabRequest::MachineRestart {
+                machine,
+                force,
+                record,
+            } => {
+                lab.record_arm(&record, None).await?;
+                let targets: Vec<String> = record.iter().map(|r| r.machine.clone()).collect();
+                let restarted = lab.restart_machine(&machine, force).await;
+                let settled = lab.record_settle(&targets).await;
+                restarted?;
+                settled?;
                 Ok(json!(true))
+            }
+            LabRequest::MachineRecordStart {
+                machine,
+                path,
+                options,
+            } => {
+                let status = lab
+                    .record_start(&machine, path.as_deref(), &options, None)
+                    .await?;
+                Ok(json!(status))
+            }
+            LabRequest::MachineRecordStop { machine } => {
+                let stopped = lab.record_stop(&machine).await?;
+                Ok(json!(stopped))
+            }
+            LabRequest::MachineRecordStatus { machine } => {
+                Ok(json!(lab.record_status(machine.as_deref()).await))
             }
             LabRequest::MachineDestroy { machine } => {
                 lab.destroy_machine(&machine).await?;

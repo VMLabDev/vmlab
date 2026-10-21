@@ -55,6 +55,9 @@ pub struct LabHandle {
     /// first-boot provision runs against. `None` for handlers and
     /// `vmlab script`.
     pub(crate) owner: Option<runner::ScriptOwner>,
+    /// This run, which every recording a script starts belongs to (§11.1,
+    /// D7): the daemon finalises what is still live when the run ends.
+    pub(crate) run: crate::labd::record::RunId,
 }
 
 impl LabHandle {
@@ -106,6 +109,8 @@ pub struct MachineHandle {
     /// makes `dev.exec(…)` and `dev.copy_to(…)` land under one identity
     /// without either call repeating it.
     pub(crate) logon: Option<Logon>,
+    /// The script run this handle belongs to (see [`LabHandle::run`]).
+    pub(crate) run: crate::labd::record::RunId,
 }
 
 /// A segment handle (PRD §10.2).
@@ -362,6 +367,7 @@ impl MachineHandle {
             ref_base: self.ref_base.clone(),
             first_boot_gated: self.first_boot_gated,
             logon,
+            run: self.run,
         })
     }
 
@@ -508,6 +514,7 @@ impl LabHandle {
             // The agent identity, which is what everything vmlab does on its
             // own behalf keeps (§19.2). A script asks for another by name.
             logon: None,
+            run: self.run,
         }
     }
 }
