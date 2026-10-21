@@ -466,21 +466,22 @@ impl Core {
         self.scaled.as_deref().unwrap_or(&[])
     }
 
-    /// The output frame at wall time `t`: base, pointer, ripples.
+    /// The output frame at wall time `t`: base, ripples, then the pointer on
+    /// top so a ripple never tints it.
     fn compose(&mut self, t: Duration) -> Frame {
         let placement = self.placement();
         let mut rgb = self.base().to_vec();
         let size = self.settings.size;
         if let Some(p) = placement {
-            if let (Some(cursor), Some((px, py))) = (self.cursor.as_ref(), self.pointer) {
-                draw_cursor(&mut rgb, size, &p, cursor, px, py);
-            }
             for r in &self.ripples {
                 if r.start <= t && t < r.start + RIPPLE_DURATION {
                     let progress = (t - r.start).as_secs_f64() / RIPPLE_DURATION.as_secs_f64();
                     let (cx, cy) = p.map(r.x as f64, r.y as f64);
                     draw_ripple(&mut rgb, size, cx, cy, progress);
                 }
+            }
+            if let (Some(cursor), Some((px, py))) = (self.cursor.as_ref(), self.pointer) {
+                draw_cursor(&mut rgb, size, &p, cursor, px, py);
             }
         }
         Frame { rgb }

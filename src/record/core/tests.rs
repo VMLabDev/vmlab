@@ -532,3 +532,34 @@ fn opaque_and_transparent_cursor_pixels_are_exact() {
     let frame = core.tick(secs(0.2)).pop().unwrap();
     assert_eq!(pixel(&frame, size, 1, 1), GREEN);
 }
+
+/// The pointer is drawn above the ripple: a click under an opaque cursor
+/// leaves the cursor's own pixels untinted while the ripple shows around it.
+#[test]
+fn the_pointer_sits_above_the_ripple() {
+    let size = Size::new(64, 64);
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 64, 64);
+    core.rect(secs(0.0), 0, 0, 64, 64, &solid(64, 64, BLACK));
+    core.cursor(secs(0.01), arrow());
+    core.input(
+        secs(0.05),
+        InputEvent::Click {
+            button: "left".into(),
+            x: Some(32),
+            y: Some(32),
+        },
+    );
+    let frame = core.tick(secs(0.1)).pop().unwrap();
+    assert_eq!(
+        pixel(&frame, size, 31, 31),
+        [255, 255, 255],
+        "the cursor's opaque pixel is not tinted by the ripple"
+    );
+    assert_eq!(pixel(&frame, size, 32, 31), [255, 255, 255]);
+    let beside = pixel(&frame, size, 36, 32);
+    assert!(
+        beside[0] > 90 && beside[2] == 0,
+        "the ripple is there around it: {beside:?}"
+    );
+}
