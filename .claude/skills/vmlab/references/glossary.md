@@ -6,6 +6,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | --- | --- |
 | agent | `vmlab-agent`, the process vmlab runs inside every guest, listening on the `vmlab.agent.0` virtio-serial port. It carries exec, terminals, file transfer, the workspace watch, metrics and the clipboard. It is baked into a template at build time and shipped with the host for containers. See architecture.md. |
 | base | The one disk of a template version its variants are built on. Unsealed on a template with variants, so `#base` is refused for a lab VM. See templates.md. |
+| console recording | A video of one VM's display, MP4 or WebM, written by the lab daemon from the VM's VNC socket while it runs. Started by `vmlab record start`, `--record` on `script`/`up`/`vm start`/`vm restart`, or a script's `record`; finalised by `record stop`, its maximum duration, or the machine going away. Not a screenshot, which is one frame. See cli-machine.md (`vmlab record`) and snapshots-vision.md. |
 | dev machine | A machine with a synced workspace: one carrying the `@dev` decorator, onto which vmlab syncs a host directory both ways. A lab may mark one of them `default = true`. See dev-machines.md. |
 | event | A named occurrence in a lab, such as `vm.crashed` or `host.disk_low`, carried on the lab's event stream and written to the event log. See automation.md. |
 | fabric | The userspace network vmlab runs every segment on: frame codecs, an L2 switch, DHCP, DNS, a gateway and a NAT engine, all in the lab daemon's process. No tap, bridge or macvlan. See networking.md. |

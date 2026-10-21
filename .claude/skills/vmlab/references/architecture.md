@@ -217,6 +217,7 @@ should be in the lab's `.gitignore`.
 | `smb/` | The bundled smbd's configuration and state. See shares-media.md. |
 | `workspace/<machine>.json` | The workspace syncer's ledger for one dev machine. See dev-machines.md. |
 | `screenshots/` | Where `Machine.screenshot` writes when given no path. |
+| `recordings/` | Where a console recording lands when given no path, as `<vm>-<UTC timestamp>.mp4`. See cli-machine.md (`vmlab record`). |
 
 `VMLAB_WORK_DIR` relocates the whole directory: with it set, the lab's working
 data lives at `$VMLAB_WORK_DIR/<lab-dir-name>-<hash>/`, where the hash is
@@ -317,11 +318,19 @@ workspaces. Every lab-daemon command is called by the CLI.
 | Display and input | `machine.screenshot`, `machine.sendkeys`, `machine.mouse_move`, `machine.mouse_click`, `machine.mouse_drag`, `machine.ocr`, `machine.find_image` |
 | Guest agent | `machine.exec`, `machine.tty_open`, `machine.tty_resize`, `machine.push_file`, `machine.pull_file`, `machine.tail`, `machine.eventlog`, `machine.clipboard_get`, `machine.clipboard_set` |
 | Playbooks | `playbook.list`, `playbook.check`, `playbook.apply` |
+| Console recording | `machine.record_start`, `machine.record_stop`, `machine.record_status` |
 | Snapshots | `snapshot.take`, `snapshot.restore`, `snapshot.delete`, `snapshot.list` |
 | Workspace | `workspace.flush`, `workspace.resolve`, `workspace.diff` |
 
 `machine.tty_open` answers with the path of a second unix socket the caller
-connects to and pipes a raw terminal over.
+connects to and pipes a raw terminal over. `machine.record_start` takes
+`machine`, an optional absolute `path` and an `options` object (`fps`, `size`,
+`compress_idle`, `timeline`, `max_duration`, each optional) and answers with the
+live recording's status; `machine.record_stop` answers with the path and the
+video's length; `machine.record_status` lists live recordings, or one machine's.
+`up`, `run`, `machine.start` and `machine.restart` each take a `record` list of
+`{machine, path?, options}`. A script records through the lab runtime it is
+bound to, not over the socket, so the three `record` commands are CLI-only.
 
 ### Events on the wire
 

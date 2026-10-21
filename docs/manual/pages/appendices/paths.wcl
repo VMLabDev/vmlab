@@ -3,7 +3,7 @@ page ref_paths {
   chapter_header "Files and directories" {
     kicker       = "Appendices · reference"
     reading_time = "9 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -108,6 +108,7 @@ page ref_paths {
       | "`smb/`" | "The bundled smbd's configuration, passdb, log and persistent state; its sockets live under the runtime root's `smb/<hash>/`. See [Shared folders](guide_shares)." |
       | "`workspace/<machine>.json`" | "The workspace syncer's ledger for one dev machine. See [Dev machines and the workspace syncer](guide_dev)." |
       | "`screenshots/`" | "Where `Machine.screenshot` writes when given no path." |
+      | "`recordings/`" | "Where a [console recording](guide_recording) lands when given no path, as `<vm>-<UTC timestamp>.mp4`." |
   }
   p <<DOC
     `VMLAB_WORK_DIR` relocates the whole directory: with it set, the lab's

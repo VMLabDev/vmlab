@@ -1,6 +1,6 @@
 # vmlab CLI: machine-level verbs
 
-Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `cp`, `clipboard`, `usb`, `snapshot`, `dev`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
+Per-machine commands: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `record`, `cp`, `clipboard`, `usb`, `snapshot`, `dev`. Lab-level verbs (`up`, `down`, `destroy`, `status`, `validate`, `lab`) are in cli-lab.md.
 
 Machine references take the form `[lab/]name`. A bare name resolves against the lab in the current directory and starts the lab daemon if none is running. The qualified form addresses a lab already running, from any directory, and never starts one; it fails with `lab "<name>" is not running` otherwise. A malformed reference such as `lab/` is refused before anything is contacted. Exceptions are noted per verb (`console` and `dev sync` never start a daemon).
 
@@ -33,12 +33,14 @@ The power subcommands and `ip` accept a container name too and behave the same; 
 ### vmlab vm start
 
 ```sh
-vmlab vm start <VM>
+vmlab vm start [--record <VM=PATH>]... <VM>
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `<VM>` | The VM, as `[lab/]name`. |
+| `--record <VM=PATH>` | Record the VM's console to `PATH` from the first frame of the boot; the recording outlives the verb (`vmlab record` below). |
+| `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options (`vmlab record` below). |
 | `-h`, `--help` | Print help. |
 
 Starts one VM without running the lab's `up` plan: no dependency waves, no provision scripts, no playbooks. Any deferred download the VM needs runs first with progress on the terminal, then the host binaries are checked, then the VM boots. A VM whose clone does not exist yet gets one created from its template, and its first-boot script runs before it reports ready, exactly as under `vmlab up`. A VM that is already running is left alone. Nothing is printed on success.
@@ -74,15 +76,19 @@ Stops one VM through the graceful ladder: a shutdown through the guest agent, th
 ### vmlab vm restart
 
 ```sh
-vmlab vm restart <VM>
+vmlab vm restart [--record <VM=PATH>]... <VM>
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `<VM>` | The VM, as `[lab/]name`. |
+| `--record <VM=PATH>` | Record the VM's console to `PATH` from the first frame of the new boot. A VM already recording is a `conflict`; its recording follows the restart on its own. |
+| `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options (`vmlab record` below). |
 | `-h`, `--help` | Print help. |
 
 Stops the VM through the graceful ladder, waits up to 60 seconds for it to settle as stopped, and boots it again. The clone is kept, so the guest comes back with its disk state and no first-boot script. Port forwards that target the VM are re-installed by the daemon when it gets a new lease. A VM that does not settle in time fails with `<name> did not stop for restart`.
+
+With `--record`, `start` and `restart` boot the VM paused, attach the recorder, then let it continue, so the video opens on the firmware's first frame; the verb prints `recording <vm> to <path>` once the VM is up. A `--record` for a VM that was already running records it from now; one whose VM failed to start fails the verb with `machine X did not start, so its recording was not started`.
 
 ### vmlab vm destroy
 
@@ -784,6 +790,48 @@ Matches the selector against what the VM holds (not the host), or takes everythi
 ### Exit status
 
 0 on success. Exit 4 (`not_found`) for an unknown machine. Every refusal exits 1 (`failed`). A usage error (`detach` with neither a selector nor `--all`) exits 2.
+
+## vmlab record
+
+Records a VM's console to an MP4 or WebM file (PRD §11.1). The lab daemon owns the recording: it carries on after the command returns, survives guest reboots, `vm restart` and snapshot restores (the last frame is held across the gap and the recorder reconnects to the new QEMU), and is finalised to a playable file on `record stop`, `--max-duration`, `vm stop`, `down`, `destroy`, `vm destroy`, lab daemon exit and the `host.disk_low` watchdog. The recorder reads the VM's VNC socket, so it needs nothing in the guest and works before an agent exists. One recording per machine. Containers have no display and cannot be recorded. No audio, no captions, no GIF (convert the MP4 afterwards). Template builds cannot be recorded yet. The rules for what the video shows (pointer, ripple, idle compression, timeline) are in snapshots-vision.md under "Recording".
+
+```sh
+vmlab record start [-o PATH] [--fps N] [--size WxH] [--compress-idle[=SECS]] [--timeline] [--max-duration D] [--json] <VM>
+vmlab record stop [--json] <VM>
+vmlab record status [--json] [VM]
+```
+
+`<VM>` is `[lab/]vm`. The CLI refuses a bad extension (anything but `.mp4`/`.webm`, `.gif` included) and a malformed `--max-duration` before contacting a daemon; a relative `-o` resolves against the shell's cwd and is sent absolute.
+
+### vmlab record start
+
+| Option | Meaning |
+| --- | --- |
+| `-o`, `--output <PATH>` | Output file; `.mp4` is H.264 (`yuv420p`), `.webm` is VP9. Default `.vmlab/recordings/<vm>-<UTC timestamp>.mp4` in the lab. |
+| `--fps <N>` | Frames per second, 1 to 120. Default 30. |
+| `--size <WxH>` | Output frame size; every frame is scaled with aspect kept and letterboxed into it. Both dimensions even, 16 to 7680x4320. Default `1920x1080`. |
+| `--compress-idle[=SECS]` | Cut idle stretches longer than `SECS` (default 2) to 0.5 s of video. `=` required when a figure is given. |
+| `--timeline` | Write `<output>.events.json` beside the video. |
+| `--max-duration <D>` | Finalise after this much video: `90`, `90s`, `5m`, `1h30m`. |
+| `--json` | Print the daemon's reply as JSON. |
+
+The daemon checks, in order: the machine has a display (`unsupported`, `machine X has no display`); it is not already recording (`conflict`, naming the live file and `vmlab record stop X`); path absolute, size and rate acceptable (`invalid_argument`); an `ffmpeg` with the format's encoder exists (`failed`: `recording needs ffmpeg: none found on PATH, and the host config (config.wcl) names none under `ffmpeg``, or ``recording a .mp4 needs the `libx264` encoder, which <ffmpeg> -encoders does not list; install an ffmpeg built with it, or point the host config's `ffmpeg` key at one``; `.webm` needs `libvpx-vp9`). ffmpeg is the host config `ffmpeg` key (host-profiles.md) else `ffmpeg` on `PATH`, looked for only when a recording starts, never at `up` without `--record`. On success: `recording <lab>/<vm> to <path> (30 fps, 1920x1080[, compress-idle 2s][, timeline][, max 5m00s])` and a `record.started` event.
+
+### vmlab record stop
+
+Closes ffmpeg's input, waits for the trailer, prints `stopped recording <lab>/<vm>: <path> (1m35s of video)`, then `timeline: <path>.events.json` when one was written, and `it had already ended: <why>` when the recording finished on its own first. A machine not recording is `not_found` (`machine X is not recording`). Emits `record.stopped`.
+
+### vmlab record status
+
+One row per live recording: `MACHINE`, `ELAPSED` (wall clock), `STARTED` (UTC), `PATH`, `(OPTIONS)`; `no recordings` when none. A recording that ended on its own is finalised here and dropped from the list. `vmlab status` shows the same entries in a `RECORDING` section (machine, elapsed, path) whenever any is live, `-v` adds `recording=<path>` to the machine's detail line, and `--json` carries a per-machine `recording` object `{machine, path, started_at, elapsed_secs, options}`.
+
+### --record on script, up, vm start, vm restart
+
+`--record <vm>=<path>` (repeatable, one VM each; a VM named twice is refused) plus the same option flags, which apply to every recording named. On `up`, `vm start`, `vm restart`: every `--record` is checked before anything boots and one refusal arms none; QEMU starts paused, the recorder attaches, the VM continues, so the video starts at the firmware's first frame; the recordings outlive the verb, which prints `recording <vm> to <path>`; a `--record` for a VM already running records it from now. On `script`: recordings last exactly the run, started before the script and finalised when it returns, success or failure; the verb prints `recorded <vm> to <path>`.
+
+### Exit status
+
+0 on success. 4 (`not_found`): unknown machine, or `stop` on a machine not recording. 5 (`conflict`): already recording. 6 (`unsupported`): no display (every container). 2 (`invalid_argument`): the daemon refused the path, size or rate. 1 (`failed`): no ffmpeg or encoder, a `--record` VM that did not start, or ffmpeg failing at finalise. A bad extension or `--max-duration` is refused by the CLI with no code.
 
 ## vmlab snapshot
 

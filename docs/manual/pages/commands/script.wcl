@@ -3,7 +3,7 @@ page cmd_script {
   chapter_header "vmlab script" {
     kicker       = "Commands · reference"
     reading_time = "3 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -14,12 +14,14 @@ page cmd_script {
     and its output streams back to the terminal as it is produced.
   DOC
 
-  code sh { source = "vmlab script <SCRIPT>" }
+  code sh { source = "vmlab script [--record <VM=PATH>]... <SCRIPT>" }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`<SCRIPT>`" | "Script path, relative to the lab root." |
+      | "`--record <VM=PATH>`" | "Record that VM's console to `PATH` for exactly as long as the run lasts; repeatable, one VM each. The extension picks the format, `.mp4` or `.webm`." |
+      | "`--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration`" | "Recording options, applied to every `--record`. See [vmlab record](cmd_record)." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -39,6 +41,15 @@ page cmd_script {
     The console runs declared playbooks and never a scratch script, so
     `script` is reachable only from the CLI: the file comes from the caller's
     disk and its output belongs to the terminal that ran it.
+  DOC
+
+  p <<DOC
+    With `--record`, each named VM's recording starts before the script and
+    is finalised when the run returns, whether it succeeded or failed, and
+    the verb prints `recorded <vm> to <path>` at the end. The recordings are
+    checked first, so a VM with no display or a host with no `ffmpeg` fails
+    the command before the script runs. See
+    [Console recording](guide_recording).
   DOC
 
   code sh { source = <<'SRC'

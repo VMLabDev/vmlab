@@ -24,6 +24,8 @@ Method groups:
 - Identity: `logins`, `as_login`, `as_account`.
 - Host USB (surface 3): `usb_attach`, `usb_attach_force`, `usb_detach`,
   `usb_detach_all`, `usb_attached`.
+- Console recording (surface 4): `record`, returning a `Recording` handle
+  (wscript-lab-api.md).
 
 Two conventions apply throughout. Relative host paths, for reference images,
 screenshots and file transfers, resolve against the directory the running
@@ -1284,4 +1286,42 @@ container, or a stopped machine, holds none: attachments are runtime only.
 
 ```wscript
 fn usb_attached(self) -> Result[List[UsbDevice], string]
+```
+
+## Machine.record
+
+Start a console recording of this VM (wscript surface 4).
+
+```wscript
+fn record(self, path: string, opts: Map[string, string]) -> Result[Recording, string]
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `path` | string | Output file, `.mp4` (H.264) or `.webm` (VP9) by extension. Empty for the default `.vmlab/recordings/<machine>-<UTC timestamp>.mp4`. A relative path resolves against the lab root, not the script's directory. |
+| `opts` | Map[string, string] | Every value a string (wscript maps are homogeneous): `fps`, `size` (`"1280x720"`), `compress_idle` (seconds, or `"true"` for the 2 s default), `timeline` (`"true"`/`"false"`), `max_duration` (`"90"`, `"90s"`, `"5m"`, `"1h30m"`). `#{}` for the defaults. |
+
+The same recording `vmlab record start` makes (cli-machine.md), returned as a
+`Recording` handle. The recording belongs to this script's run: `Recording.stop`
+finalises it early and returns the path, and one the script never stops is
+finalised by the lab daemon when the run ends, whether `main` returned or
+raised; that is the scoped guarantee, provided by the daemon rather than the
+language. It fails when the machine has no display ("machine `web` has no
+display", every container), when it is already recording (naming the live
+file), when an `opts` key is unknown or a value malformed ("record opts: …"),
+when the extension, size or rate is refused, or when the host has no `ffmpeg`
+with the format's encoder. Emits `record.started`. The pointer, ripple, idle
+compression and timeline rules are in snapshots-vision.md under "Recording".
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("win01") else { return }
+    let r = vm.record("demo.mp4", #{ "compress_idle": "2", "timeline": "true" }).expect("record")
+    let k = vm.send_keys("ctrl-alt-del")
+    let t = vm.type_text("Password1!\n")
+    match r.stop() {
+        Ok(path) => lab.log("recorded " + path),
+        Err(e) => lab.log(e),
+    }
+}
 ```

@@ -6,7 +6,7 @@ page apx_glossary {
   chapter_header "Glossary" {
     kicker       = "Appendices · reference"
     reading_time = "8 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -21,6 +21,7 @@ page apx_glossary {
       | "Term" | "Meaning" |
       | "agent" | "`vmlab-agent`, the process vmlab runs inside every guest, listening on the `vmlab.agent.0` virtio-serial port. It carries exec, terminals, file transfer, the workspace watch, metrics and the clipboard. It is baked into a template at build time and shipped with the host for containers. See [How vmlab runs a lab](guide_architecture)." |
       | "base" | "The one disk of a template version its variants are built on. Unsealed on a template with variants, so a lab machine cannot clone it: `#base` is refused outside a build. See [Templates](guide_templates)." |
+      | "console recording" | "A video of one VM's display, MP4 or WebM, written by the lab daemon from the VM's VNC socket while it runs. Started by `vmlab record start`, `--record` on `script`, `up`, `vm start` and `vm restart`, or a script's `record`; finalised by `record stop`, its maximum duration, or the machine going away. Not a screenshot: a screenshot is one frame, taken by `Machine.screenshot`. See [Console recording](guide_recording)." |
       | "dev machine" | "A machine carrying the `@dev` decorator: a machine with a synced workspace, which vmlab keeps in step with a host directory. A lab may mark one of them `default = true`. See [Dev machines and the workspace syncer](guide_dev)." |
       | "event" | "A named occurrence in a lab, such as `vm.crashed` or `host.disk_low`, carried on the lab's event stream and written to the event log. See [Events and handlers](guide_events) and the [Events](ref_events) reference." |
       | "fabric" | "The userspace network vmlab runs every segment on: frame codecs, an L2 switch, DHCP, DNS, a gateway and a NAT engine, all in the lab daemon's process. No tap, bridge or macvlan. See [Networking](guide_networking)." |

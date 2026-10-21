@@ -3,7 +3,7 @@ page cmd_up {
   chapter_header "vmlab up" {
     kicker       = "Commands · reference"
     reading_time = "5 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -16,12 +16,14 @@ page cmd_up {
     same for a subset of the lab.
   DOC
 
-  code sh { source = "vmlab up [VMS]..." }
+  code sh { source = "vmlab up [--record <VM=PATH>]... [VMS]..." }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`[VMS]...`" | "Machines to bring up. With none given, every VM and container in the lab." |
+      | "`--record <VM=PATH>`" | "Record that VM's console to `PATH` from the first frame of its boot; repeatable, one VM each. The recording outlives the verb. See [vmlab record](cmd_record)." |
+      | "`--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration`" | "Recording options, applied to every `--record`." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -229,6 +231,20 @@ TXT
     Set `agent_update = false` on a `vm` block to keep the agent its template
     sealed. Set it on the `lab` block to do the same for every VM; a VM's own
     setting wins. See [vm and its children](ref_vm).
+  DOC
+
+  h2 "Recording a boot"
+
+  p <<DOC
+    `--record <vm>=<path>` records a VM's console from the first frame of
+    its boot: QEMU starts paused, the recorder attaches, and only then does
+    the VM continue. Every `--record` is checked before anything boots, and
+    one refusal (a container, a bad size, no `ffmpeg`) arms none. The
+    recording belongs to the lab daemon and continues after `up` returns,
+    which prints `recording <vm> to <path>` after its last line; stop it
+    with `vmlab record stop`, or let `vm stop`, `down` or `destroy`
+    finalise it. A `--record` naming a VM that was already running records
+    it from now. See [Console recording](guide_recording).
   DOC
 
   callout "A failed first-boot leaves the machine running" {

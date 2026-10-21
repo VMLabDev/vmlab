@@ -3,15 +3,16 @@ page ref_ws_types {
   chapter_header "wscript API: Term, types and the vmlab module" {
     kicker       = "Reference · reference"
     reading_time = "10 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
   p <<DOC
     This chapter covers the rest of the wscript surface: `Term`, the
-    send/expect handle [Machine.terminal](ref_ws_machine) returns; the six
-    record types methods return or handlers receive; and the two functions
-    on the `vmlab` module itself. The [scripting guide](guide_scripting)
+    send/expect handle [Machine.terminal](ref_ws_machine) returns;
+    `Recording`, the handle [Machine.record](ref_ws_machine) returns; the
+    six record types methods return or handlers receive; and the two
+    functions on the `vmlab` module itself. The [scripting guide](guide_scripting)
     explains where scripts run. The handles are in
     [wscript API: Lab and Segment](ref_ws_lab) and
     [wscript API: Machine](ref_ws_machine).
@@ -166,6 +167,46 @@ fn main(lab: Lab) {
     let Ok(vm) = lab.vm("box") else { return }
     let Ok(t) = vm.terminal() else { return }
     t.close()
+}
+SRC
+  }
+
+  h2 "Recording.stop"
+  p "Finalise the recording and return the path of the file."
+  code wscript { source = "fn stop(self) -> Result[string, string]" }
+  p <<DOC
+    Closes ffmpeg's input, lets it write the trailer and waits for it, as
+    [vmlab record stop](cmd_record) does, then returns the video's path.
+    After it the file plays. A second `stop`, or a `stop` after the daemon
+    has already finalised the recording (its `max_duration` was reached, the
+    machine was stopped, the disk ran low), fails with
+    "machine `win01` is not recording". A handle the script drops without
+    stopping is finalised by the daemon when the run ends.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("win01") else { return }
+    let Ok(r) = vm.record("", #{}) else { return }
+    vmlab::sleep_ms(5000)
+    let path = r.stop().expect("stop")
+    lab.log("finalised " + path)
+}
+SRC
+  }
+
+  h2 "Recording.path"
+  p "Where the video is being written."
+  code wscript { source = "fn path(self) -> string" }
+  p <<DOC
+    The absolute output path the recording was started with, the default
+    under `.vmlab/recordings/` included. It never fails, and it is the same
+    string `stop` returns.
+  DOC
+  code wscript { source = <<'SRC'
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("win01") else { return }
+    let Ok(r) = vm.record("demo.mp4", #{}) else { return }
+    lab.log("recording to " + r.path())
 }
 SRC
   }

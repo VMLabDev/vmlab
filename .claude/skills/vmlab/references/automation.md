@@ -99,6 +99,7 @@ rejects an `on {}` that names anything else:
 | `snapshot.created`, `snapshot.restored` | A snapshot taken or restored on a machine. See snapshots-vision.md. |
 | `template.built` | A template build sealed. See templates.md. |
 | `usb.attached`, `usb.detached` | A host USB device hot-plugged into a VM, or taken out of it. See cli-machine.md (`vmlab usb`). |
+| `record.started`, `record.stopped` | A console recording of a VM began, or was finalised to a file. See cli-machine.md (`vmlab record`). |
 | `playbook.applied`, `playbook.failed` | A play converged, or a run ended non-zero or failed to run. |
 | `host.disk_low` | The free-space watchdog crossed its threshold. |
 
@@ -266,6 +267,13 @@ Deleting a snapshot emits nothing.
 | `usb.detached` | `vm`, `port`, `id`, `product`, `qdev_id`, `reason` | A host USB device left a VM. `reason` is absent for a requested detach, `unplugged` when it left the host, `restore` when an online restore removed it first. |
 
 A VM stop releases its devices with no `usb.detached` per device; `vm.stopped` says it.
+
+### Console recordings
+
+| Event | Payload fields | When |
+| --- | --- | --- |
+| `record.started` | `vm`, `path`, `options` | A console recording of the VM began (`vmlab record start`, `--record`, or a script's `record`). `options` is the set in force with defaults filled in: `fps`, `size`, and `compress_idle`, `timeline`, `max_duration` where asked for. |
+| `record.stopped` | `vm`, `path`, `duration_secs`, `reason`; or `vm`, `path`, `error` | The recording was finalised, `duration_secs` of video long. `reason` is `stopped` (a `record stop` or a handle's `stop`), `script run ended`, `machine stopped`, `machine destroyed`, `lab destroyed`, `disk space low`, or what ended it on its own (its maximum duration, an encoder failure). When ffmpeg failed while finalising, `error` carries why instead. |
 
 ### Downloads
 

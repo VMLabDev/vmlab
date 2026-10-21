@@ -3,7 +3,7 @@ page cmd_vm {
   chapter_header "vmlab vm" {
     kicker       = "Commands · reference"
     reading_time = "10 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -53,12 +53,14 @@ page cmd_vm {
 
   h2 "vmlab vm start"
 
-  code sh { source = "vmlab vm start <VM>" }
+  code sh { source = "vmlab vm start [--record <VM=PATH>]... <VM>" }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`--record <VM=PATH>`" | "Record the VM's console to `PATH` from the first frame of the boot. The recording outlives the verb. See [vmlab record](cmd_record)." |
+      | "`--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration`" | "Recording options. See [vmlab record](cmd_record)." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -130,12 +132,14 @@ page cmd_vm {
 
   h2 "vmlab vm restart"
 
-  code sh { source = "vmlab vm restart <VM>" }
+  code sh { source = "vmlab vm restart [--record <VM=PATH>]... <VM>" }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`--record <VM=PATH>`" | "Record the VM's console to `PATH` from the first frame of the new boot. A VM already recording is a `conflict`; its recording follows the restart on its own. See [vmlab record](cmd_record)." |
+      | "`--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration`" | "Recording options. See [vmlab record](cmd_record)." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -153,6 +157,15 @@ page cmd_vm {
     is a machine a new daemon cannot take over, so restarting it after an
     edit to `vmlab.wcl` refuses; run `vmlab down` and then `vmlab up` (or
     `vm start`) to boot it with the edit.
+  DOC
+
+  p <<DOC
+    With `--record`, `start` and `restart` boot the VM paused, attach the
+    recorder, then let it continue, so the video opens on the firmware's
+    first frame; the verb prints `recording <vm> to <path>` once the VM is
+    up and the recording carries on in the lab daemon. A `--record` for a
+    VM that was already running records it from now. See
+    [Console recording](guide_recording).
   DOC
 
   h2 "vmlab vm destroy"

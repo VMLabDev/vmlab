@@ -3,7 +3,7 @@ page ref_events {
   chapter_header "Events" {
     kicker       = "Appendices · reference"
     reading_time = "12 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-21"
     version      = "vmlab 0.9"
   }
 
@@ -91,6 +91,14 @@ SRC
       | "`usb.detached`" | "`vm`, `port`, `id`, `product`, `qdev_id`, `reason`" | "A host USB device left a VM. `reason` is absent for a detach someone asked for, `unplugged` when the device left the host, and `restore` when an online restore removed it first." |
   }
   p "A VM stop releases every device it holds without a `usb.detached` for each; `vm.stopped` says it."
+
+  h2 "Console recordings"
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`record.started`" | "`vm`, `path`, `options`" | "A console recording of the VM began ([vmlab record](cmd_record), `--record`, or a script's `record`). `options` is the set in force with defaults filled in: `fps`, `size`, and `compress_idle`, `timeline`, `max_duration` where asked for." |
+      | "`record.stopped`" | "`vm`, `path`, `duration_secs`, `reason`; or `vm`, `path`, `error`" | "The recording was finalised to a playable file `duration_secs` of video long. `reason` is `stopped` for a `record stop` or a handle's `stop`, `script run ended`, `machine stopped`, `machine destroyed`, `lab destroyed`, `disk space low`, or what ended it on its own: its maximum duration or an encoder failure. When ffmpeg failed while finalising, `error` carries why instead and the file may not play." |
+  }
 
   h2 "Downloads"
   p <<DOC

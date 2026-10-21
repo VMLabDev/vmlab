@@ -167,6 +167,18 @@ Module map under `src/`:
   per-target binaries (musl + windows-gnu).
 - `media/` — folder → ISO/floppy with content-addressed cache.
 - `vision/` — screenshot, template matching, OCR.
+- `record/` — console recording (§11.1): the pure core (`core.rs`: framebuffer
+  rectangles, cursor shapes and the inputs vmlab sent in; letterboxed frames
+  on a constant clock, the pointer at the last position vmlab sent, click
+  ripples, idle cuts and the timeline out), the encoder plan (`encoder.rs`:
+  ffmpeg discovery against the host config `ffmpeg` key and the argv for
+  `.mp4`/`.webm` as values), and the executor (`executor.rs`: the RFB read
+  loop over the VM's VNC socket that reconnects across a `vm restart` or a
+  restore, the ffmpeg child and the clock); `labd/record.rs` the lab daemon's
+  registry and verbs (one recording per machine, armed in the paused window
+  of a boot, finalised by whoever ends the machine or the run); `cli/record.rs`
+  the `vmlab record` verb and the `--record` flags on `script`, `up`,
+  `vm start` and `vm restart`.
 - `usb/` — host USB passthrough (§5.2.1), pure over its inputs: the sysfs
   scan (root injectable), selectors and their resolution, and `plan_attach`,
   every attach refusal plus the `device_add` arguments as a value (ADR-0003).
