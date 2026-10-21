@@ -9,6 +9,7 @@ pub mod dev;
 pub mod lab;
 mod lab_move;
 pub mod machine;
+pub mod record;
 pub mod tty_attach;
 pub mod usb;
 pub mod validate;
@@ -71,6 +72,8 @@ pub enum Command {
     Up {
         /// VMs to bring up (default: all)
         vms: Vec<String>,
+        #[command(flatten)]
+        record: record::RecordFlags,
     },
     /// Graceful stop; clones retained
     Down {
@@ -124,6 +127,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: usb::UsbCmd,
     },
+    /// Record a VM's console to video: start / stop / status
+    Record {
+        #[command(subcommand)]
+        cmd: record::RecordCmd,
+    },
     /// Print the DNS zones this lab's segments serve
     Dns {
         /// Emit the raw JSON instead of a table
@@ -161,6 +169,8 @@ pub enum Command {
     Script {
         /// Script path, relative to the lab root
         script: String,
+        #[command(flatten)]
+        record: record::RecordFlags,
     },
     /// Internal: write the wscript interface file (LSP support for lab scripts)
     #[command(hide = true)]
@@ -363,7 +373,11 @@ pub enum AppCmd {
 #[derive(Subcommand)]
 pub enum VmCmd {
     /// Start one VM
-    Start { vm: String },
+    Start {
+        vm: String,
+        #[command(flatten)]
+        record: record::RecordFlags,
+    },
     /// Print a VM's IP address (defaults to the first NIC with a lease)
     Ip {
         vm: String,
@@ -378,7 +392,11 @@ pub enum VmCmd {
         force: bool,
     },
     /// Restart one VM
-    Restart { vm: String },
+    Restart {
+        vm: String,
+        #[command(flatten)]
+        record: record::RecordFlags,
+    },
     /// Destroy one VM: stop it and delete its clone (config retained)
     Destroy { vm: String },
     /// Capture a running VM's screen to a PNG file
@@ -650,17 +668,23 @@ pub fn run() -> ExitCode {
         broken_pipe::install();
     }
     let result = match cli.command {
-        Command::Up { vms } => lab::cmd_up(vms),
+        Command::Up { vms, record } => record.requests().and_then(|r| lab::cmd_up(vms, r)),
         Command::Pull { vms } => lab::cmd_pull(vms),
         Command::Down { vms, force } => lab::cmd_down(vms, force),
         Command::Destroy => lab::cmd_destroy(),
         Command::Status { verbose, json } => lab::cmd_status(verbose, json),
         Command::Validate => validate::cmd_validate().map(|_| ()),
         Command::Vm { cmd } => match cmd {
-            VmCmd::Start { vm } => lab::cmd_machine_power(&vm, lab::PowerOp::Start, false),
+            VmCmd::Start { vm, record } => record
+                .requests()
+                .and_then(|r| lab::cmd_machine_power(&vm, lab::PowerOp::Start, false, r)),
             VmCmd::Ip { vm, nic } => lab::cmd_machine_ip(&vm, nic),
-            VmCmd::Stop { vm, force } => lab::cmd_machine_power(&vm, lab::PowerOp::Stop, force),
-            VmCmd::Restart { vm } => lab::cmd_machine_power(&vm, lab::PowerOp::Restart, false),
+            VmCmd::Stop { vm, force } => {
+                lab::cmd_machine_power(&vm, lab::PowerOp::Stop, force, Vec::new())
+            }
+            VmCmd::Restart { vm, record } => record
+                .requests()
+                .and_then(|r| lab::cmd_machine_power(&vm, lab::PowerOp::Restart, false, r)),
             VmCmd::Destroy { vm } => lab::cmd_machine_destroy(&vm, "vm"),
             VmCmd::Screenshot { vm, path } => lab::cmd_vm_screenshot(&vm, &path),
             VmCmd::Sendkeys { vm, chord } => lab::cmd_vm_sendkeys(&vm, &chord),
@@ -677,13 +701,13 @@ pub fn run() -> ExitCode {
         },
         Command::Container { cmd } => match cmd {
             ContainerCmd::Start { container } => {
-                lab::cmd_machine_power(&container, lab::PowerOp::Start, false)
+                lab::cmd_machine_power(&container, lab::PowerOp::Start, false, Vec::new())
             }
             ContainerCmd::Stop { container, force } => {
-                lab::cmd_machine_power(&container, lab::PowerOp::Stop, force)
+                lab::cmd_machine_power(&container, lab::PowerOp::Stop, force, Vec::new())
             }
             ContainerCmd::Restart { container } => {
-                lab::cmd_machine_power(&container, lab::PowerOp::Restart, false)
+                lab::cmd_machine_power(&container, lab::PowerOp::Restart, false, Vec::new())
             }
             ContainerCmd::Destroy { container } => {
                 lab::cmd_machine_destroy(&container, "container")
@@ -718,6 +742,7 @@ pub fn run() -> ExitCode {
             } => machine::cmd_clipboard_set(&machine, text, json),
         },
         Command::Usb { cmd } => usb::cmd_usb(cmd),
+        Command::Record { cmd } => record::cmd_record(cmd),
         Command::Dns { json } => lab::cmd_dns(json),
         Command::Lab { cmd } => lab::cmd_lab(cmd),
         Command::Snapshot { cmd } => match cmd {
@@ -746,7 +771,9 @@ pub fn run() -> ExitCode {
         Command::Template { cmd } => crate::template::cli::cmd_template(cmd),
         Command::Console { vm, tcp } => console::cmd_console(&vm, tcp),
         Command::Vncbridge { lab, vm } => console::run_bridge(lab, vm),
-        Command::Script { script } => lab::cmd_run(&script),
+        Command::Script { script, record } => {
+            record.requests().and_then(|r| lab::cmd_run(&script, r))
+        }
         Command::Wscripti { out } => crate::scripting::write_interface(&out)
             .map_err(anyhow::Error::from)
             .map(|()| println!("wrote {}", out.display())),
