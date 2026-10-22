@@ -75,6 +75,11 @@ pub struct Run {
     /// what a service restart, or a guest reboot QEMU outlives, looks like
     /// from the host.
     pub agent_restarts: Option<(Duration, String)>,
+    /// How long the restarting agent is gone before the new one answers:
+    /// the gap a Windows service bounce leaves, in which the old process has
+    /// dropped its connection and every handshake fails. Without it the
+    /// restart is instantaneous.
+    pub agent_restart_gap: Option<Duration>,
 }
 
 impl Run {
@@ -262,11 +267,17 @@ impl Hypervisor for FakeHypervisor {
 
         if let Some((after, version)) = run.agent_restarts.clone() {
             let machine = machine.clone();
+            let gap = run.agent_restart_gap;
             tokio::spawn(async move {
                 tokio::time::sleep(after).await;
+                if let Some(gap) = gap {
+                    machine.agent.lock().expect("fake agent lock").down = true;
+                    tokio::time::sleep(gap).await;
+                }
                 let mut agent = machine.agent.lock().expect("fake agent lock");
                 agent.instance += 1;
                 agent.version = version;
+                agent.down = false;
             });
         }
 
@@ -334,6 +345,8 @@ pub(crate) struct FakeProc {
 struct FakeAgent {
     instance: u32,
     version: String,
+    /// Between an old process exiting and its replacement answering.
+    down: bool,
 }
 
 impl FakeProc {
@@ -346,8 +359,14 @@ impl FakeProc {
             agent: std::sync::Mutex::new(FakeAgent {
                 instance: 1,
                 version: "0.0.0-fake".into(),
+                down: false,
             }),
         }
+    }
+
+    /// Whether the agent is mid-restart, with nothing answering.
+    fn agent_down(&self) -> bool {
+        self.agent.lock().expect("fake agent lock").down
     }
 
     /// The instance the guest's agent names itself by, and its version.
@@ -603,6 +622,11 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
             let Ok(msg) = serde_json::from_slice::<HostMsg>(&payload) else {
                 continue;
             };
+            // Mid-restart the old process is gone: its connection drops, and
+            // nothing answers a new one until the replacement is up.
+            if machine.agent_down() {
+                return;
+            }
             let (instance, agent_version) = machine.agent_now();
             let reply = match msg {
                 HostMsg::Hello { token, .. } => AgentMsg::Hello {

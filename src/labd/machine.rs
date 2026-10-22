@@ -960,6 +960,18 @@ impl AgentUnavailable {
     }
 }
 
+/// Whether a connect honours the failed-handshake backoff
+/// ([`AgentSlot::dial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backoff {
+    /// Answer from a failure in the last 30 s without dialling: spares a
+    /// guest with no agent the handshake timeout on every call.
+    Honour,
+    /// Always dial: a replacement expects its own restart to fail a
+    /// handshake, and must see the new agent the moment it answers.
+    Skip,
+}
+
 /// The cached-connection half of a machine's agent channel, shared by both
 /// adapters: one live handle, plus when the last handshake failed so
 /// agent-less guests don't pay the timeout on every call.
@@ -1007,7 +1019,7 @@ impl AgentSlot {
     /// hands out afterwards is the agent that replaced it.
     pub async fn connect(&self, name: &str, sock: &Path, hint: &str) -> Result<AgentHandle> {
         self.wait_replaced(name).await?;
-        self.connect_during_replacement(name, sock, hint).await
+        self.dial(name, sock, hint, Backoff::Honour).await
     }
 
     /// Take the gate every other [`connect`](Self::connect) waits on, for a
@@ -1054,11 +1066,29 @@ impl AgentSlot {
 
     /// [`connect`](Self::connect) without the wait on the replacement gate:
     /// what the holder of an [`AgentReplacement`] reconnects through.
+    ///
+    /// It also skips the failed-handshake backoff. A replacement restarts the
+    /// agent on purpose, so a handshake that lands in the restart's gap is
+    /// expected to fail, and the next one must actually dial: answering it
+    /// from the backoff would hold the push on a failure that stopped being
+    /// true the moment the new agent came up, until its wait ran out.
     pub async fn connect_during_replacement(
         &self,
         name: &str,
         sock: &Path,
         hint: &str,
+    ) -> Result<AgentHandle> {
+        self.dial(name, sock, hint, Backoff::Skip).await
+    }
+
+    /// Reuse the cached handle if it still answers, else handshake afresh —
+    /// unless `backoff` honours a handshake that failed in the last 30 s.
+    async fn dial(
+        &self,
+        name: &str,
+        sock: &Path,
+        hint: &str,
+        backoff: Backoff,
     ) -> Result<AgentHandle> {
         let mut agent = self.handle.lock().await;
         if let Some(handle) = agent.as_ref() {
@@ -1069,7 +1099,7 @@ impl AgentSlot {
                 dead.shutdown().await;
             }
         }
-        {
+        if backoff == Backoff::Honour {
             let failed = self.failed_at.lock().await;
             if let Some(at) = *failed
                 && at.elapsed() < Duration::from_secs(30)
@@ -1169,6 +1199,50 @@ impl AgentSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The failed-handshake backoff spares ordinary callers, never a
+    /// replacement.** After a failed handshake, a plain connect inside the
+    /// backoff answers with the hint alone and does not dial; a reconnect
+    /// during a replacement dials anyway, which its error shows by naming
+    /// the socket it tried.
+    #[tokio::test]
+    async fn a_replacement_reconnect_dials_through_the_handshake_backoff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("absent.sock");
+        let slot = AgentSlot::default();
+        let hint = "no agent here";
+
+        let first = slot
+            .connect("m1", &sock, hint)
+            .await
+            .err()
+            .expect("nothing listens");
+        assert!(
+            format!("{first:#}").contains("connecting agent socket"),
+            "{first:#}"
+        );
+
+        let backed_off = slot
+            .connect("m1", &sock, hint)
+            .await
+            .err()
+            .expect("backed off");
+        assert_eq!(
+            format!("{backed_off:#}"),
+            format!("m1: {hint}"),
+            "answered from the backoff"
+        );
+
+        let dialled = slot
+            .connect_during_replacement("m1", &sock, hint)
+            .await
+            .err()
+            .expect("still nothing listens");
+        assert!(
+            format!("{dialled:#}").contains("connecting agent socket"),
+            "a replacement dials past the backoff: {dialled:#}"
+        );
+    }
 
     /// A caller held by a replacement that never ends is not held for ever:
     /// past [`AGENT_REPLACEMENT_WAIT`] it fails by name, as a handshake
