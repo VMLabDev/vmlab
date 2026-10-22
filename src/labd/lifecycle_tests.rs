@@ -693,6 +693,55 @@ async fn an_agent_call_during_a_replacement_waits_for_the_agent_that_replaced_it
     vm.stop(true).await.expect("stop");
 }
 
+/// **A reconnect that lands in the restart's gap is retried, not believed**
+/// (§19.4). A Windows service bounce leaves seconds in which nothing
+/// answers; a handshake attempted then fails. That failure must not stand
+/// for the rest of the wait: the failed-handshake backoff that spares an
+/// agent-less guest repeated timeouts would otherwise answer every retry
+/// from its cache, and the push would report an agent that came back as
+/// one that never did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_inside_the_restart_gap_does_not_end_the_wait() {
+    let dirs = Dirs::new();
+    let (vm1, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                agent_restarts: Some((Duration::from_secs(4), "0.0.0-fake-2".into())),
+                agent_restart_gap: Some(Duration::from_secs(8)),
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm1, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm1.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    let before = m.agent().await.expect("agent").info();
+    let plan = super::agent_repair::plan(super::guest_os::GuestOs::Linux);
+
+    // Held as a real push holds it: the status poller's probe stands down
+    // while it is taken, so nothing else clears a failed handshake for the
+    // push.
+    let replacing = m.begin_agent_replacement().await;
+    let after = super::agent_repair::came_back(
+        &m,
+        "0.0.0-fake-2",
+        before.instance.as_deref(),
+        &plan,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("the agent that came back after the gap answers within the wait")
+    .info();
+    assert_ne!(after.instance, before.instance);
+    assert_eq!(after.agent_version, "0.0.0-fake-2");
+    drop(replacing);
+    vm1.stop(true).await.expect("stop");
+}
+
 /// **A reconnect answered by the agent told to restart is a restart not yet
 /// taken effect, and is waited for** (§19.4). On Windows the service bounce
 /// lands seconds after the restart command returned, so the push's first
