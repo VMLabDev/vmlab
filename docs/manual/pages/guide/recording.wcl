@@ -245,7 +245,7 @@ DOC
     li "A container has no display, so it cannot be recorded: `unsupported`, with `machine X has no display`."
     li "A person's pointer in a VNC viewer is not tracked; only input vmlab sent moves the drawn pointer or appears in the timeline."
     li "A virtio-gpu guest that hides its cursor still shows the last cursor shape QEMU sent."
-    li "Template builds cannot be recorded yet."
+    li "Template build VMs cannot be recorded."
   }
 
   callout "Record the boot, not the wait" {

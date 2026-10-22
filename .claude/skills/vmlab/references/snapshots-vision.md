@@ -378,4 +378,4 @@ script; the flags, defaults, refusals and lifecycle are in cli-machine.md
   `record.started` and `record.stopped` (automation.md).
 - **Limits.** No GIF (convert the MP4 with ffmpeg afterwards); no audio;
   containers have no display (`unsupported`); a human's pointer through a VNC
-  viewer is not tracked; template builds cannot be recorded yet.
+  viewer is not tracked; template build VMs cannot be recorded.

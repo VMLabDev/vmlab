@@ -821,7 +821,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 
 **Ownership and lifecycle.** The lab daemon owns every recording, so it outlives the CLI that started it. One recording per machine: a second start is `conflict`, naming the live file. A container has no display: `unsupported`. A bad extension, size, rate or path is `invalid_argument`; a missing ffmpeg or encoder, or a VNC socket that refuses, is `failed`. A guest reboot in the same QEMU needs nothing. `vm restart` and a snapshot restore replace or rewind the VM under the recording, which continues, repeating the last frame while the socket is gone and reconnecting when the new QEMU's appears, so the result is one continuous file. `vm stop`, `down`, `destroy`, `vm destroy` and the lab daemon's own exit finalise the file — ffmpeg's input closed, the trailer written, the process awaited — before anything else goes. `--max-duration` finalises at that length of video; the lab's disk watchdog finalises every live recording when it trips. Events: `record.started` and `record.stopped`.
 
-**Out of scope.** GIF output; `vmlab template build --record` (the recorder depends only on a socket path, an input feed and an options value, so the supervisor can host it later); audio; a hidden hardware cursor on a virtio-gpu guest, which never reaches VNC, so the last shape stays drawn.
+**Out of scope.** GIF output; recording a template build VM (`vmlab template build` has no `--record`); audio; a hidden hardware cursor on a virtio-gpu guest, which never reaches VNC, so the last shape stays drawn.
 
 ---
 
