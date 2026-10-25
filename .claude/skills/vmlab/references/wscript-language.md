@@ -96,8 +96,11 @@ message naming the machine and the reason. Three ways to consume one:
   the function. `let Some(x) = opt else { … }` does the same for an `Option`.
 
 `r.expect("message")` and `r.unwrap()` take the value or raise a fault that ends
-the script. The examples use `expect` in `main` to turn a failed setup into a
-failed provision with a readable message.
+the script. On an `Err`, `expect` reports `message: <err>`, so the error that
+caused the failure appears after your message; on a `None` it reports the
+message alone. The examples use `expect` in `main` to turn a failed setup into a
+failed provision that names both the step and its cause, for example
+`script failed: …/setup.ws: setup failed: exited 3: <stderr> (at main)`.
 
 A value you do not use must still be bound, so a fire-and-forget call reads
 `let k = m.send_keys("enter")`.
