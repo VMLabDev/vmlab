@@ -84,7 +84,11 @@ page cmd_status {
     restarts inside the guest is handshaken again the next time vmlab
     reaches it, so the version follows the restart. A VM with a
     [gpu block](ref_vm) adds `host_gpu=`, the host GPU its
-    last start picked, `qemu=` when that GPU ran its own `qemu_binary`, and
+    last start picked; under virgl or vulkan `keepawake=`, whether the
+    supervisor holds that GPU out of runtime suspend (`on`; `off` when the
+    GPU's `keepawake` does not want it; `lost` once the helper has exited;
+    `failed` when it could not start); `qemu=` when that GPU ran its own
+    `qemu_binary`; and
     `env=NAME=value,...`: every variable vmlab set in that QEMU's
     environment, the `VK_*` and `VMLAB_*` loader filter and the host GPU's
     `qemu_env`, by name with values in full. That is what `qemu.log`'s
@@ -97,7 +101,7 @@ page cmd_status {
     With `--json` the verb prints the daemon's status projection as it
     arrived, the same object [vmlab lab](cmd_lab) `info` renders: each
     machine carries its `kind`, its label, and the fields above under their
-    own names (`host_gpu`, `qemu_binary`, and `qemu_env` as an object of
+    own names (`host_gpu`, `keepawake`, `qemu_binary`, and `qemu_env` as an object of
     `NAME: value`), each omitted where it has nothing to say.
   DOC
 

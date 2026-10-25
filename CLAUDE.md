@@ -118,7 +118,10 @@ Module map under `src/`:
   argv for lab containers (§18); `hostgpu.rs` picks a VM's host GPU and its
   emulator environment, and `vk_layer.rs` embeds the Vulkan PCI filter
   (`vk_pci_filter.c`, compiled by `build.rs`) that leaves a Venus guest only
-  that GPU (§5.2).
+  that GPU (§5.2); `keepawake.rs` embeds `vmlab-gpu-keepawake`
+  (`gpu_keepawake.c`, also compiled by `build.rs`), the helper the
+  supervisor's `supervisor/keepawake.rs` runs to hold a host GPU out of
+  runtime suspend between labs (ADR-0018).
 - `qmp/` — the QMP client.
 - `appshare/` — shared apps (§20): the CLI-side host end, because only the
   user's desktop session reaches the compositor. `select_mode` picks the

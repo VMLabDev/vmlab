@@ -4,6 +4,7 @@
 //! detaches it into its own process group).
 
 pub mod global;
+pub mod keepawake;
 pub mod registry;
 pub mod store;
 pub mod templates;
@@ -36,6 +37,8 @@ pub struct Supervisor {
     /// process, carrying its environment, and be adopted by the next
     /// supervisor as if it were current.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// The helpers holding host GPUs out of runtime suspend (ADR-0018).
+    keepers: keepawake::Keepers,
 }
 
 /// How long a release waits for a lab daemon's teardown before killing it
@@ -46,7 +49,7 @@ const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120
 /// Whether `pid` is a live process, as opposed to gone or a zombie nobody has
 /// reaped yet — an exited daemon this supervisor did not spawn can linger as
 /// one where PID 1 does not reap.
-fn process_running(pid: u32) -> bool {
+pub(crate) fn process_running(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| {
@@ -102,6 +105,7 @@ async fn run_async() -> Result<()> {
         ensure_locks: Mutex::new(std::collections::HashMap::new()),
         template_ops: templates::TemplateOps::default(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        keepers: keepawake::Keepers::default(),
     });
 
     // Long-lived background tasks register here so the `shutdown` command
@@ -172,8 +176,8 @@ async fn run_async() -> Result<()> {
     Ok(())
 }
 
-/// Release every lab daemon (each stops its own machines) and join the
-/// supervisor's background tasks.
+/// Release every lab daemon (each stops its own machines), then the GPUs
+/// held awake for them, and join the supervisor's background tasks.
 async fn teardown(sup: &Arc<Supervisor>, tasks: &crate::lifecycle::TaskGroup) {
     let names: Vec<String> = {
         let reg = sup.registry.lock().await;
@@ -182,6 +186,7 @@ async fn teardown(sup: &Arc<Supervisor>, tasks: &crate::lifecycle::TaskGroup) {
     for name in names {
         let _ = sup.release_lab(&name).await;
     }
+    sup.keepers.stop_all().await;
     tasks.shutdown(std::time::Duration::from_secs(5)).await;
 }
 
@@ -644,6 +649,10 @@ impl Handler<SupRequest> for SupervisorHandler {
             }
             SupRequest::GlobalList {} => Ok(json!(sup.globals.list().await)),
             SupRequest::UsbList {} => Ok(json!(sup.usb_list().await?)),
+            SupRequest::GpuKeepAwake { gpu, address } => {
+                let pid = sup.keepers.ensure(&gpu, &address).await?;
+                Ok(json!({"pid": pid}))
+            }
             // Template operations on a lab's declarations (PRD §6). All
             // take `lab` + `root` like `lab.ensure`, so the supervisor works
             // for labs it never started.

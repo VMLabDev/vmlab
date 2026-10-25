@@ -283,6 +283,9 @@ pub struct VmInstance {
     wake_cause: std::sync::Mutex<Option<WakeCause>>,
     /// The declared host GPU the last start picked (§5.2), for status.
     host_gpu: std::sync::Mutex<Option<String>>,
+    /// Whether the supervisor holds that GPU awake (ADR-0018), as the last
+    /// start left it; `None` with no render GPU.
+    keepawake: std::sync::Mutex<Option<KeepAwake>>,
     /// That host GPU's `qemu_binary`, when the last start ran one (§5.2).
     qemu_binary: std::sync::Mutex<Option<PathBuf>>,
     /// The variables the last start set in QEMU's environment (§5.2): what
@@ -387,6 +390,7 @@ impl VmInstance {
             stop_requested: RwLock::new(false),
             wake_cause: std::sync::Mutex::new(None),
             host_gpu: std::sync::Mutex::new(None),
+            keepawake: std::sync::Mutex::new(None),
             qemu_binary: std::sync::Mutex::new(None),
             qemu_env: std::sync::Mutex::new(Vec::new()),
             qemu: Mutex::new(None),
@@ -779,6 +783,46 @@ impl VmInstance {
         Ok(plan)
     }
 
+    /// Ask the supervisor to hold the render GPU awake when the plan wants
+    /// it (ADR-0018), before the emulator opens it. A keeper that cannot
+    /// start is a warning, not a refusal: it narrows a window, and the VM
+    /// renders without it.
+    async fn hold_gpu_awake(&self, plan: &qemu::hostgpu::RenderPlan) -> Option<KeepAwake> {
+        let gpu = plan.gpu.as_ref()?;
+        if !plan.keepawake {
+            return Some(KeepAwake::Off);
+        }
+        let name = plan.name.clone().unwrap_or_else(|| gpu.address.clone());
+        let ask = async {
+            let client =
+                crate::proto::client::SupClient::connect(&crate::paths::supervisor_socket())
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+            client
+                .send(crate::proto::SupRequest::GpuKeepAwake {
+                    gpu: name.clone(),
+                    address: gpu.address.clone(),
+                })
+                .await
+                .map_err(|e| format!("{e:#}"))
+        };
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(20), ask)
+            .await
+            .unwrap_or_else(|_| Err("the supervisor did not answer".into()));
+        match answer.map(|v| v["pid"].as_u64()) {
+            Ok(Some(pid)) => Some(KeepAwake::Held(pid as u32)),
+            Ok(None) => Some(KeepAwake::Failed),
+            Err(e) => {
+                tracing::warn!(
+                    "{}: host GPU {name} is not held awake, so it can runtime-suspend between \
+                     labs: {e}",
+                    self.cfg.name
+                );
+                Some(KeepAwake::Failed)
+            }
+        }
+    }
+
     /// Spawn one virtiofsd per virtiofs share (listening before QEMU
     /// starts) and return the (tag, socket) device list; also records the
     /// ready-time mount plan and whether the run can be snapshotted online.
@@ -965,6 +1009,8 @@ impl VmInstance {
 
             let (nic_specs, nic_fds) = self.nic_specs().await?;
             let render = self.render_plan(&t)?;
+            let keep = self.hold_gpu_awake(&render).await;
+            *self.keepawake.lock_recover() = keep;
             if let Some(dir) = &render.vk_layer {
                 qemu::vk_layer::install(dir).with_context(|| {
                     format!("{}: installing the Vulkan PCI-filter layer", self.cfg.name)
@@ -2015,6 +2061,7 @@ impl super::machine::Machine for VmInstance {
                 .answered_version()
                 .or_else(|| self.template().agent_version.clone()),
             host_gpu: self.host_gpu.lock_recover().clone(),
+            keepawake: self.keepawake.lock_recover().map(|k| k.label().to_string()),
             qemu_binary: self
                 .qemu_binary
                 .lock_recover()
@@ -2110,6 +2157,30 @@ async fn run_tool(bin: &str, args: &[String]) -> Result<()> {
         bail!("{bin} failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
+}
+
+/// Whether the supervisor holds a VM's render GPU awake (ADR-0018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepAwake {
+    /// The GPU's `keepawake` does not want it.
+    Off,
+    /// The helper the supervisor answered with.
+    Held(u32),
+    /// The supervisor could not start one.
+    Failed,
+}
+
+impl KeepAwake {
+    /// What `status -v` says: `on` while the helper runs, `lost` once it
+    /// has gone, `off`, or `failed`.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Held(pid) if crate::supervisor::process_running(pid) => "on",
+            Self::Held(_) => "lost",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[cfg(test)]

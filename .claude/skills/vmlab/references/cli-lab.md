@@ -288,14 +288,16 @@ whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or
 then adds `arch`, `cpus`, `memory` and `agent` (the running agent's handshake
 stamp, or the template's sealed one before an agent answers or while stopped; an
 agent restarted inside the guest is handshaken again, so this follows it). A VM
-with a `gpu {}` adds `host_gpu=` (the host GPU its last start picked), `qemu=`
+with a `gpu {}` adds `host_gpu=` (the host GPU its last start picked), under
+virgl/vulkan `keepawake=` (`on` while the supervisor's helper holds that GPU out
+of runtime suspend, `off`, `lost` once it exited, `failed`; host-profiles.md), `qemu=`
 when that GPU ran its own `qemu_binary`, and `env=NAME=value,...`: every variable
 vmlab set in that QEMU's environment (the `VK_*`/`VMLAB_*` loader filter and the
 host GPU's `qemu_env`), by name with values in full — what `qemu.log`'s
 `vmlab: env:` line records, taken at the start, so a host config edited since
 does not change what a running VM reports. A container adds `health`, `exit` and
 `digest`. `--json` prints the projection itself: each machine carries `kind`, its
-label and these fields by name (`host_gpu`, `qemu_binary`, `qemu_env` as an
+label and these fields by name (`host_gpu`, `keepawake`, `qemu_binary`, `qemu_env` as an
 object), each omitted where empty.
 
 #### Dev machines

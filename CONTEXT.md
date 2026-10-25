@@ -689,6 +689,17 @@ directory at VM start. PRD §5.2.
 _Avoid_: device select (Mesa's layer, which breaks Venus), driver filter (the
 loader's `VK_LOADER_DRIVERS_SELECT`, which matches a driver, not a device)
 
+**Keep-awake helper**:
+`vmlab-gpu-keepawake`, one per held host GPU, run by the supervisor from the
+first `virgl`/`vulkan` VM start on that GPU until the supervisor stops. It
+keeps a GLES context on the GPU busy with a tiny clear every 100 ms, so the
+driver never runtime-suspends the GPU between one lab's `down` and the next
+`up`. A host GPU's `keepawake` decides whether it runs (`auto`: an NVIDIA GPU
+that can runtime-suspend). Built into the binary (`qemu::keepawake`), run by
+`supervisor::keepawake`. PRD §5.2, ADR-0018.
+_Avoid_: keeper process, power daemon (it changes no power setting; it is a
+client)
+
 **Lab status**:
 The typed projection of a lab's machines, segments and pulls that the lab
 daemon produces once and every surface renders unchanged. Carries the

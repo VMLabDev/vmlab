@@ -13,8 +13,16 @@
 //! default, and a lab's `gpu {}` names one with `host_gpu` or takes the
 //! default ([`pick`]). The picked GPU's PCI address is resolved through
 //! sysfs: the device's `drm/` directory holds its render node, its `driver`
-//! link the kernel driver. The sysfs root is a value so the resolution is
-//! testable on any host.
+//! link the kernel driver, its `power/` directory the runtime power state.
+//! The sysfs root is a value so the resolution is testable on any host.
+//!
+//! Runtime power management is read here too, because it decides two
+//! things before a VM starts: a GPU whose runtime state is `error` is
+//! refused, since the driver has lost it and QEMU would abort on it some
+//! seconds after the VM was reported up; and an NVIDIA GPU that can
+//! runtime-suspend earns a warning and, under its `keepawake`, the
+//! supervisor's helper that holds it awake ([`keepawake_wanted`],
+//! ADR-0018).
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +30,7 @@ use anyhow::{Context, Result, bail};
 
 use super::process::ChildEnv;
 use super::vk_layer;
-use crate::config::host::{HostConfig, HostGpu};
+use crate::config::host::{HostConfig, HostGpu, KeepAwake};
 use crate::config::model::{Gpu, GpuMode};
 
 /// One host GPU with a render node.
@@ -36,21 +44,87 @@ pub struct RenderGpu {
     pub driver: Option<String>,
 }
 
+/// A host GPU's runtime power management, as sysfs and its driver report
+/// it. Every field is `None` where the file is missing or unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Power {
+    /// `power/runtime_status`: `active`, `suspended`, `resuming`,
+    /// `suspending`, `error` or `unsupported`.
+    pub runtime_status: Option<String>,
+    /// `power/control`: `auto` lets the device runtime-suspend, `on` keeps
+    /// it powered.
+    pub control: Option<String>,
+    /// Whether the NVIDIA driver runs runtime D3 on the GPU, from the
+    /// `Runtime D3 status:` line of `/proc/driver/nvidia/gpus/<addr>/power`.
+    /// `None` for another driver.
+    pub runtime_d3: Option<bool>,
+}
+
+impl Power {
+    /// Whether the driver has lost the device: a resume failed and the
+    /// kernel stopped trying (`runtime_status` `error`).
+    pub fn failed(&self) -> bool {
+        self.runtime_status.as_deref() == Some("error")
+    }
+
+    /// Whether the device can runtime-suspend while nothing uses it:
+    /// `power/control` is `auto` and the driver does not say runtime D3 is
+    /// off. The NVIDIA driver leaves `control` at `auto` on a desktop card
+    /// whose runtime D3 it has disabled, so `control` alone overstates it.
+    pub fn can_suspend(&self) -> bool {
+        self.control.as_deref() == Some("auto") && self.runtime_d3 != Some(false)
+    }
+}
+
 /// The sysfs tree host GPUs are read from: `/sys` on a real host, a fake tree
-/// in tests.
+/// in tests. `proc` is where the NVIDIA driver's own `driver/nvidia/` files
+/// are read from: `/proc` on a real host, `<root>/proc` in a fake tree.
 #[derive(Debug, Clone)]
 pub struct Sysfs {
     root: PathBuf,
+    proc: PathBuf,
 }
 
 impl Sysfs {
+    /// A fake tree at `root`, its `proc` under it.
+    #[cfg(test)]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        Self {
+            proc: root.join("proc"),
+            root,
+        }
     }
 
-    /// The host's own `/sys`.
+    /// The host's own `/sys` and `/proc`.
     pub fn host() -> Self {
-        Self::new("/sys")
+        Self {
+            root: "/sys".into(),
+            proc: "/proc".into(),
+        }
+    }
+
+    /// The device's runtime power management.
+    pub fn power(&self, address: &str) -> Power {
+        let dev = self.devices().join(address);
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let runtime_d3 = read(
+            self.proc
+                .join("driver/nvidia/gpus")
+                .join(address)
+                .join("power"),
+        )
+        .and_then(|text| nvidia_runtime_d3(&text));
+        Power {
+            runtime_status: read(dev.join("power/runtime_status")),
+            control: read(dev.join("power/control")),
+            runtime_d3,
+        }
     }
 
     fn devices(&self) -> PathBuf {
@@ -71,10 +145,18 @@ impl Sysfs {
     }
 
     /// Resolve a PCI address to its render node and driver. An address with
-    /// no device, or a device with no render node, is an error naming it.
+    /// no device, a device with no render node, or one in a failed power
+    /// state is an error naming it.
     pub fn resolve(&self, address: &str) -> Result<RenderGpu> {
         self.device(address)?;
         let dev = self.devices().join(address);
+        if self.power(address).failed() {
+            bail!(
+                "gpu address {address}: the device is in a failed power state \
+                 (power/runtime_status=error) — its driver lost it on a resume, \
+                 and it needs a reboot before a VM can render on it"
+            );
+        }
         match render_node(&dev) {
             Some(node) => Ok(RenderGpu {
                 address: address.to_string(),
@@ -123,6 +205,34 @@ fn render_node(dev: &Path) -> Option<PathBuf> {
         .into_iter()
         .next()
         .map(|n| Path::new("/dev/dri").join(n))
+}
+
+/// The NVIDIA driver's runtime D3 setting from its per-GPU `power` file:
+/// `Runtime D3 status:  Enabled (fine-grained)` or `Disabled by default`.
+fn nvidia_runtime_d3(text: &str) -> Option<bool> {
+    let value = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Runtime D3 status:"))?
+        .trim();
+    if value.starts_with("Enabled") {
+        Some(true)
+    } else if value.starts_with("Disabled") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether the supervisor should hold a GPU awake (ADR-0018): always under
+/// `on`, never under `off`, and under `auto` only for an NVIDIA GPU that
+/// can runtime-suspend — the driver whose runtime-D3 resume has lost GPUs
+/// until reboot (Xid 119, a GSP that does not come back).
+pub fn keepawake_wanted(mode: KeepAwake, gpu: &RenderGpu, power: &Power) -> bool {
+    match mode {
+        KeepAwake::On => true,
+        KeepAwake::Off => false,
+        KeepAwake::Auto => gpu.driver.as_deref() == Some("nvidia") && power.can_suspend(),
+    }
 }
 
 /// The basename of the device's `driver` link.
@@ -294,6 +404,9 @@ pub struct RenderPlan {
     pub vk_layer: Option<PathBuf>,
     /// A missing `host_gpu` the plan fell back from ([`Picked::warning`]).
     pub warning: Option<String>,
+    /// Whether the supervisor should hold [`Self::gpu`] awake before the
+    /// emulator spawns ([`keepawake_wanted`]).
+    pub keepawake: bool,
     pub env: ChildEnv,
 }
 
@@ -435,6 +548,9 @@ pub fn render_plan(
         if vulkan && plan.gpu.is_some() {
             plan.vk_layer = Some(vk_layer::dir(data));
         }
+        if let (Some(d), Some(g)) = (decl, &plan.gpu) {
+            plan.keepawake = keepawake_wanted(d.keepawake, g, &sysfs.power(&g.address));
+        }
         plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd, plan.vk_layer.as_deref());
     }
     if let Some(decl) = decl {
@@ -457,9 +573,11 @@ pub fn render_gpu_unpicked<'a>(gpus: impl IntoIterator<Item = &'a Gpu>, host: &H
 
 /// Every warning these machines' `gpu {}` blocks earn on this host, once
 /// each: a `host_gpu` this host lacks that a paravirtual mode falls back
-/// from, and — when some paravirtual GPU resolves to no declared GPU at all
-/// on a host with several render nodes — [`unpicked_warning`]. Refusals are
-/// validation's and the start's, not this.
+/// from, an NVIDIA GPU a paravirtual mode renders on that can
+/// runtime-suspend ([`runtime_pm_warning`]), and — when some paravirtual GPU
+/// resolves to no declared GPU at all on a host with several render nodes —
+/// [`unpicked_warning`]. Refusals are validation's and the start's, not
+/// this.
 pub fn warnings<'a>(
     gpus: impl IntoIterator<Item = (&'a str, &'a Gpu)>,
     host: &HostConfig,
@@ -471,11 +589,21 @@ pub fn warnings<'a>(
         if gpu.mode == GpuMode::Passthrough {
             continue;
         }
-        if let Some(w) = pick(gpu, host).ok().and_then(|p| p.warning()) {
+        let Ok(picked) = pick(gpu, host) else {
+            continue;
+        };
+        if let Some(w) = picked.warning() {
             let w = format!("vm \"{vm}\": {w}");
             if !out.contains(&w) {
                 out.push(w);
             }
+        }
+        if let Some(decl) = picked.gpu
+            && let Ok(render) = sysfs.resolve(&decl.address)
+            && let Some(w) = runtime_pm_warning(decl, &render, &sysfs.power(&decl.address))
+            && !out.contains(&w)
+        {
+            out.push(w);
         }
     }
     if render_gpu_unpicked(gpus.iter().map(|(_, g)| *g), host)
@@ -484,6 +612,35 @@ pub fn warnings<'a>(
         out.push(w);
     }
     out
+}
+
+/// The warning a `virgl`/`vulkan` GPU earns when it is NVIDIA and can
+/// runtime-suspend: between one lab's last emulator exiting and the next
+/// one opening the render node, the driver powers the GPU down, and a
+/// resume that fails has lost the GPU until reboot. Only NVIDIA, because
+/// that resume (the GSP firmware booting again) is the failure seen; the
+/// kernel default `power/control=auto` on every other driver would make it
+/// noise. It names the host-side fix either way, and says whether vmlab's
+/// keeper covers the gap meanwhile.
+pub fn runtime_pm_warning(decl: &HostGpu, gpu: &RenderGpu, power: &Power) -> Option<String> {
+    if gpu.driver.as_deref() != Some("nvidia") || !power.can_suspend() {
+        return None;
+    }
+    let held = if keepawake_wanted(decl.keepawake, gpu, power) {
+        "vmlab holds it awake while vmlabd runs (`keepawake`); to keep it awake across \
+         supervisor restarts too"
+    } else {
+        "its `keepawake` is off, so nothing holds it; to keep it awake"
+    };
+    Some(format!(
+        "host GPU `{}` ({}) can runtime-suspend (power/control=auto): a lab restart lets the \
+         NVIDIA driver power it down, and a failed resume (Xid 119) has lost the GPU until \
+         reboot. {held}, set `power/control` to `on` as root (a udev rule, for every boot: \
+         ACTION==\"add|bind\", SUBSYSTEM==\"pci\", ATTR{{vendor}}==\"0x10de\", \
+         ATTR{{class}}==\"0x030000\", ATTR{{power/control}}=\"on\") or turn runtime D3 off \
+         (`options nvidia NVreg_DynamicPowerManagement=0x00` in /etc/modprobe.d/)",
+        decl.name, decl.address
+    ))
 }
 
 /// The warning a lab with a `virgl`/`vulkan` GPU gets when no host GPU
@@ -542,6 +699,31 @@ pub(crate) mod testing {
         std::os::unix::fs::symlink(
             format!("../../../bus/pci/drivers/{driver}"),
             dev.join("driver"),
+        )
+        .unwrap();
+    }
+
+    /// Give a fake device a `power/` directory: its `runtime_status` and
+    /// `control`.
+    pub fn fake_power(root: &Path, address: &str, runtime_status: &str, control: &str) {
+        let power = root.join("bus/pci/devices").join(address).join("power");
+        std::fs::create_dir_all(&power).unwrap();
+        std::fs::write(power.join("runtime_status"), format!("{runtime_status}\n")).unwrap();
+        std::fs::write(power.join("control"), format!("{control}\n")).unwrap();
+    }
+
+    /// Give a fake NVIDIA device the driver's own `power` file under
+    /// `<root>/proc`, with this `Runtime D3 status:` value.
+    pub fn fake_nvidia_runtime_d3(root: &Path, address: &str, status: &str) {
+        let dir = root.join("proc/driver/nvidia/gpus").join(address);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("power"),
+            format!(
+                "Runtime D3 status:          {status}\n\
+                 Tegra iGPU Rail-Gating:     Disabled\n\
+                 Video Memory:               Active\n"
+            ),
         )
         .unwrap();
     }
@@ -696,6 +878,7 @@ mod tests {
             default,
             qemu_binary: None,
             qemu_env: Vec::new(),
+            keepawake: KeepAwake::Auto,
         }
     }
 
@@ -1279,5 +1462,193 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A host GPU the driver has lost on a resume (`runtime_status` is
+    /// `error`) is refused by the start and by validation, naming the GPU
+    /// and its address, rather than handed to an emulator that would abort
+    /// on it after the VM was reported up.
+    #[test]
+    fn a_host_gpu_in_a_failed_power_state_is_refused_by_name() {
+        let sys = fake_host();
+        super::testing::fake_power(sys.path(), "0000:01:00.0", "error", "auto");
+        let sysfs = Sysfs::new(sys.path());
+        for mode in [GpuMode::Vulkan, GpuMode::Virgl] {
+            let e = format!(
+                "{:#}",
+                render_plan(Some(&gpu(mode, None)), &host(), &sysfs).unwrap_err()
+            );
+            assert!(
+                e.starts_with("host GPU `Nvidia1`: gpu address 0000:01:00.0: ")
+                    && e.contains("failed power state (power/runtime_status=error)")
+                    && e.contains("needs a reboot"),
+                "{e}"
+            );
+        }
+        // The other card, and a GPU whose state reads anything else, render.
+        render_plan(
+            Some(&gpu(GpuMode::Vulkan, Some("Nvidia2"))),
+            &host(),
+            &sysfs,
+        )
+        .unwrap();
+        for status in ["active", "suspended", "resuming", "unsupported"] {
+            super::testing::fake_power(sys.path(), "0000:01:00.0", status, "auto");
+            render_plan(Some(&gpu(GpuMode::Vulkan, None)), &host(), &sysfs).unwrap();
+        }
+    }
+
+    /// Power is read from `power/` and, for NVIDIA, the driver's own file;
+    /// a device can suspend under `control=auto` unless the driver says
+    /// runtime D3 is disabled, and never under `control=on`.
+    #[test]
+    fn power_reads_sysfs_and_the_nvidia_runtime_d3_line() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        assert_eq!(sysfs.power("0000:01:00.0"), Power::default());
+        super::testing::fake_power(sys.path(), "0000:01:00.0", "suspended", "auto");
+        let p = sysfs.power("0000:01:00.0");
+        assert_eq!(p.runtime_status.as_deref(), Some("suspended"));
+        assert_eq!(p.control.as_deref(), Some("auto"));
+        assert_eq!(p.runtime_d3, None);
+        assert!(p.can_suspend() && !p.failed());
+        for (line, d3, can) in [
+            ("Enabled (fine-grained)", Some(true), true),
+            ("Disabled by default", Some(false), false),
+            ("Not supported", None, true),
+        ] {
+            super::testing::fake_nvidia_runtime_d3(sys.path(), "0000:01:00.0", line);
+            let p = sysfs.power("0000:01:00.0");
+            assert_eq!(p.runtime_d3, d3, "{line}");
+            assert_eq!(p.can_suspend(), can, "{line}");
+        }
+        super::testing::fake_power(sys.path(), "0000:05:00.0", "active", "on");
+        assert!(!sysfs.power("0000:05:00.0").can_suspend());
+    }
+
+    /// `on` and `off` are what they say on any driver; `auto` holds only an
+    /// NVIDIA GPU that can runtime-suspend.
+    #[test]
+    fn keepawake_auto_is_an_nvidia_gpu_that_can_suspend() {
+        let render = |driver: &str| RenderGpu {
+            address: "0000:01:00.0".into(),
+            render_node: "/dev/dri/renderD128".into(),
+            driver: Some(driver.into()),
+        };
+        let power = |control: &str, d3: Option<bool>| Power {
+            runtime_status: Some("active".into()),
+            control: Some(control.into()),
+            runtime_d3: d3,
+        };
+        let nv = render("nvidia");
+        let amd = render("amdgpu");
+        assert!(keepawake_wanted(KeepAwake::Auto, &nv, &power("auto", None)));
+        assert!(keepawake_wanted(
+            KeepAwake::Auto,
+            &nv,
+            &power("auto", Some(true))
+        ));
+        assert!(!keepawake_wanted(
+            KeepAwake::Auto,
+            &nv,
+            &power("auto", Some(false))
+        ));
+        assert!(!keepawake_wanted(KeepAwake::Auto, &nv, &power("on", None)));
+        assert!(!keepawake_wanted(
+            KeepAwake::Auto,
+            &amd,
+            &power("auto", None)
+        ));
+        assert!(keepawake_wanted(KeepAwake::On, &amd, &power("on", None)));
+        assert!(!keepawake_wanted(
+            KeepAwake::Off,
+            &nv,
+            &power("auto", Some(true))
+        ));
+    }
+
+    /// The plan carries the keep-awake decision for the GPU it renders on,
+    /// and passthrough never wants one.
+    #[test]
+    fn the_render_plan_says_whether_to_keep_its_gpu_awake() {
+        let sys = fake_host();
+        super::testing::fake_power(sys.path(), "0000:01:00.0", "active", "auto");
+        super::testing::fake_power(sys.path(), "0000:05:00.0", "active", "auto");
+        super::testing::fake_nvidia_runtime_d3(sys.path(), "0000:05:00.0", "Disabled by default");
+        super::testing::fake_power(sys.path(), "0000:72:00.0", "active", "auto");
+        let sysfs = Sysfs::new(sys.path());
+        let wants = |mode, name: &str, h: &HostConfig| {
+            render_plan(Some(&gpu(mode, Some(name))), h, &sysfs)
+                .unwrap()
+                .keepawake
+        };
+        let h = host();
+        assert!(wants(GpuMode::Vulkan, "Nvidia1", &h));
+        assert!(wants(GpuMode::Virgl, "Nvidia1", &h));
+        assert!(!wants(GpuMode::Vulkan, "Nvidia2", &h));
+        assert!(!wants(GpuMode::Vulkan, "AMD1", &h));
+        let mut h = host();
+        h.gpus[0].keepawake = KeepAwake::On;
+        h.gpus[1].keepawake = KeepAwake::Off;
+        assert!(wants(GpuMode::Vulkan, "AMD1", &h));
+        assert!(!wants(GpuMode::Vulkan, "Nvidia1", &h));
+        h.gpus.push(HostGpu {
+            keepawake: KeepAwake::On,
+            ..decl("Vfio1", "0000:03:00.0", false)
+        });
+        assert!(!wants(GpuMode::Passthrough, "Vfio1", &h));
+    }
+
+    /// An NVIDIA GPU a paravirtual guest renders on that can runtime-suspend
+    /// earns one warning naming the GPU, its address and both host-side
+    /// fixes; it says whether the keeper covers the gap. A GPU whose runtime
+    /// D3 is disabled, one at `control=on`, another driver, and passthrough
+    /// earn none.
+    #[test]
+    fn a_suspendable_nvidia_gpu_earns_one_runtime_pm_warning() {
+        let sys = fake_host();
+        super::testing::fake_power(sys.path(), "0000:01:00.0", "suspended", "auto");
+        super::testing::fake_power(sys.path(), "0000:05:00.0", "active", "auto");
+        super::testing::fake_nvidia_runtime_d3(sys.path(), "0000:05:00.0", "Disabled by default");
+        super::testing::fake_power(sys.path(), "0000:72:00.0", "active", "auto");
+        let sysfs = Sysfs::new(sys.path());
+        let vulkan = gpu(GpuMode::Vulkan, Some("Nvidia1"));
+        let virgl = gpu(GpuMode::Virgl, None);
+        let w = warnings([("a", &vulkan), ("b", &virgl)], &host(), &sysfs);
+        assert_eq!(w.len(), 1, "{w:?}");
+        let w = &w[0];
+        assert!(
+            w.starts_with(
+                "host GPU `Nvidia1` (0000:01:00.0) can runtime-suspend (power/control=auto)"
+            ),
+            "{w}"
+        );
+        assert!(w.contains("vmlab holds it awake while vmlabd runs"), "{w}");
+        assert!(w.contains("ATTR{power/control}=\"on\""), "{w}");
+        assert!(
+            w.contains("options nvidia NVreg_DynamicPowerManagement=0x00"),
+            "{w}"
+        );
+
+        let mut off = host();
+        off.gpus[1].keepawake = KeepAwake::Off;
+        let w = warnings([("a", &vulkan)], &off, &sysfs);
+        assert!(
+            w[0].contains("its `keepawake` is off, so nothing holds it"),
+            "{w:?}"
+        );
+
+        let quiet = [
+            gpu(GpuMode::Vulkan, Some("Nvidia2")),
+            gpu(GpuMode::Vulkan, Some("AMD1")),
+        ];
+        assert!(warnings(quiet.iter().map(|g| ("a", g)), &host(), &sysfs).is_empty());
+        super::testing::fake_power(sys.path(), "0000:01:00.0", "active", "on");
+        assert!(warnings([("a", &vulkan)], &host(), &sysfs).is_empty());
+        let mut pt = host();
+        pt.gpus[1].address = "0000:03:00.0".into();
+        super::testing::fake_power(sys.path(), "0000:03:00.0", "suspended", "auto");
+        let pass = gpu(GpuMode::Passthrough, Some("Nvidia1"));
+        assert!(warnings([("a", &pass)], &pt, &sysfs).is_empty());
     }
 }

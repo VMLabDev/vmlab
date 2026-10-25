@@ -691,6 +691,11 @@ fn machine_detail(m: &MachineStatus) -> String {
             if let Some(gpu) = &vm.host_gpu {
                 field("host_gpu", gpu.clone());
             }
+            // Only with a render GPU: whether the supervisor holds it out of
+            // runtime suspend (ADR-0018).
+            if let Some(keep) = &vm.keepawake {
+                field("keepawake", keep.clone());
+            }
             // Only when that host GPU ran its own QEMU, not the stock one.
             if let Some(qemu) = &vm.qemu_binary {
                 field("qemu", qemu.clone());
@@ -2490,6 +2495,30 @@ mod tests {
         assert!(lines[0].ends_with(" host_gpu=AMD1"), "got:\n{out}");
         assert!(!lines[1].contains("host_gpu"), "got:\n{out}");
         assert!(!out.contains(" qemu="), "got:\n{out}");
+    }
+
+    /// A VM on a render GPU says whether the supervisor holds it awake,
+    /// right after the GPU's name (ADR-0018).
+    #[test]
+    fn verbose_says_whether_the_host_gpu_is_held_awake() {
+        let MachineDetail::Vm(mut detail) = vm() else {
+            unreachable!()
+        };
+        detail.host_gpu = Some("Nvidia1".into());
+        detail.keepawake = Some("on".into());
+        let out = render_status(
+            &lab(vec![
+                addressed("gl01", PowerState::Running, true, MachineDetail::Vm(detail)),
+                addressed("dc01", PowerState::Running, true, vm()),
+            ]),
+            true,
+        );
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("state=")).collect();
+        assert!(
+            lines[0].ends_with(" host_gpu=Nvidia1 keepawake=on"),
+            "got:\n{out}"
+        );
+        assert!(!lines[1].contains("keepawake"), "got:\n{out}");
     }
 
     /// A VM whose host GPU ran its own QEMU names it beside the GPU (§5.2).

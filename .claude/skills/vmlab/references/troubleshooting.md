@@ -210,6 +210,16 @@ Every forward in the lab is planned before `up` installs any. When two claim the
 
 A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort and reports in the lab log. Change the `host_port` or free the port. Two instances of one lab file declare the same fixed `host_port`, so the second instance's forward fails this way while the first holds the port. Omit `host_port` (or a `port {}`'s `host`) and each instance binds a free port of its own, which `vmlab status` shows marked `(auto)`.
 
+## A host GPU is in a failed power state
+
+```
+host GPU `Nvidia1`: gpu address 0000:01:00.0: the device is in a failed power state (power/runtime_status=error) — its driver lost it on a resume, and it needs a reboot before a VM can render on it
+```
+
+The driver powered the idle GPU down (runtime PM, `power/control=auto`) and could not resume it; on NVIDIA the kernel log has `Xid 119` (GSP timeout), often `Xid 79`, and `nvidia-smi` finds no device. Only a host reboot recovers it. Prevent it with the host-side fixes in host-profiles.md (`gpu "<name>" {}`, runtime power management): a udev rule setting `power/control=on`, or `options nvidia NVreg_DynamicPowerManagement=0x00`. Meanwhile `keepawake` (default `auto` on NVIDIA) holds the GPU across `down`/`up` while the supervisor runs; `vmlab status -v` shows `keepawake=on`.
+
+`host GPU `X` (addr) can runtime-suspend (power/control=auto): …` is the warning form of the same risk, printed by `up`. When `status -v` shows `keepawake=failed`, the helper could not open the GPU through EGL; the reason is in `~/.local/state/vmlab/labd-<lab>.log`.
+
 ## Nested virtualisation is off on WSL 2
 
 vmlab prints nothing specific to WSL 2. When nested virtualisation is disabled in `.wslconfig`, `/dev/kvm` does not open and every machine gets the TCG warning at the top of this file. Enable it under `[wsl2]` in `%USERPROFILE%\.wslconfig`, run `wsl --shutdown` from Windows, and start again. See host-profiles.md for the full setup.
