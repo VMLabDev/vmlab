@@ -173,24 +173,27 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
 
     // -- duplicate forward host ports across the lab ----------------------
     // Container `port` blocks compile into the same forward machinery, so
-    // they share the uniqueness space with segment forwards.
+    // they share the uniqueness space with segment forwards. Only declared
+    // ports can collide: an omitted one is picked free at install time.
     let mut fwd_ports: HashMap<u16, Span> = HashMap::new();
     for seg in &lab.segments {
         for fwd in &seg.forwards {
-            if fwd_ports.insert(fwd.host_port, fwd.span).is_some() {
+            let Some(port) = fwd.host_port else { continue };
+            if fwd_ports.insert(port, fwd.span).is_some() {
                 issues.push(Issue::at(
                     fwd.span,
-                    format!("duplicate forward host_port {}", fwd.host_port),
+                    format!("duplicate forward host_port {port}"),
                 ));
             }
         }
     }
     for c in &lab.containers {
         for p in &c.ports {
-            if fwd_ports.insert(p.host_port, p.span).is_some() {
+            let Some(port) = p.host_port else { continue };
+            if fwd_ports.insert(port, p.span).is_some() {
                 issues.push(Issue::at(
                     p.span,
-                    format!("duplicate forward host port {}", p.host_port),
+                    format!("duplicate forward host port {port}"),
                 ));
             }
         }
@@ -3289,6 +3292,47 @@ lab "l" {
   segment "s" { forward { host_port = 18080 to = "c:80" } }
   vm "v" { template = "x86_64/t" nic { segment = "s" } }
   container "c" { image = "nginx" nic { segment = "s" } port { host = 18080 container = 80 } }
+}"#,
+            "duplicate forward host port",
+        );
+    }
+
+    /// Omitted host ports are picked at install time, so any number of them
+    /// sit beside each other and beside a declared one.
+    #[test]
+    fn auto_host_ports_never_duplicate() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" {
+    forward { to = "c:80" }
+    forward { to = "c:81" }
+    forward { host_port = 18080 to = "c:82" }
+  }
+  container "c" { image = "nginx" nic { segment = "s" }
+    port { container = 80 }
+    port { container = 81 }
+  }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    /// A declared port still collides with another declared one when auto
+    /// ports sit between them.
+    #[test]
+    fn fixed_host_ports_still_duplicate_among_auto_ones() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" {
+    forward { host_port = 18080 to = "c:80" }
+    forward { to = "c:81" }
+  }
+  container "c" { image = "nginx" nic { segment = "s" }
+    port { container = 80 }
+    port { host = 18080 container = 82 }
+  }
 }"#,
             "duplicate forward host port",
         );

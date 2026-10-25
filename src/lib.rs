@@ -7,6 +7,7 @@ pub mod config;
 pub mod dev;
 pub mod guest_asset;
 mod hashing;
+mod instance;
 pub mod lab_init;
 mod labd;
 mod lifecycle;

@@ -48,12 +48,80 @@ and the supervisor itself, are unaffected.
 ### A lab name is a host-wide identity
 
 The supervisor's registry, the lab's runtime directory, its control socket and
-its process markers are all keyed by the lab's declared name, not by the
-directory it lives in. Two directories that declare the same lab name cannot
-run at once on one host. On `up` of the second, the supervisor answers with a
-`conflict` error naming the other root and the two remedies: stop that lab, or
-rename this one. This rule is what makes a `[lab/]name` machine reference
-unambiguous from any directory.
+its process markers are all keyed by the name the lab runs under, not by the
+directory it lives in. Two directories that run a lab under the same name
+cannot run at once on one host. On `up` of the second, the supervisor answers
+with a `conflict` error naming the other root and the two remedies: stop that
+lab, or rename this one. This rule is what makes a `[lab/]name` machine
+reference unambiguous from any directory.
+
+### Lab instances
+
+The name a lab runs under is usually the one its `lab` block declares. A
+directory can instead run its lab as an **instance**, under the effective name
+`<declared>-<instance>`. The CLI picks the instance; the first that applies
+wins:
+
+1. the `--instance <ID>` flag, which every `vmlab` command takes;
+   `--instance ""` means no instance;
+2. the `VMLAB_INSTANCE` environment variable; set but empty means no instance;
+3. the name of the linked git worktree the lab directory is in (its `.git` is a
+   file `gitdir: <repo>/.git/worktrees/<name>`), read without the `git`
+   binary. The main worktree, a submodule and a directory outside git have no
+   instance.
+
+The instance is lowercased and every run of characters other than letters and
+digits becomes one `-`, trimmed at both ends: `--instance Feature/Login_Page`
+gives `demo-feature-login-page`. An instance with no letters or digits is an
+error. When the effective name would pass 63 characters the instance is cut
+short and six hex characters of its hash appended; a declared name too long to
+leave room for that is an error.
+
+Everything keyed by a lab's name follows the effective name: the registry entry
+and `vmlab lab list`, the runtime, state and log directories, sockets, process
+markers, generated MAC addresses, guest DNS names (`<vm>.<lab>`) and events. A
+`[lab/]machine` reference takes the effective name
+(`vmlab exec demo-feat-x/box -- uname -a`). `vmlab validate` checks the
+declared name and prints the effective one in its `ok: lab` line. The lab
+daemon accepts only the declared name or `<declared>-<something>`.
+
+An instance renames the lab, not what its file says. These still collide
+between two instances of one lab file: a fixed `host_port` in a segment
+`forward {}` or a container `port {}` (the second instance's bind fails; omit
+the host port and each instance gets its own, see networking.md), an
+explicit `nic { mac }` on a global segment, a GPU `passthrough` device, and
+template builds the lab file declares. A global segment is shared by design and
+both instances join it. Lab-local segments, subnets included, do not collide:
+each lab's network runs in its own process.
+
+A lab started from a linked worktree before instances existed keeps running
+under its declared name; after the upgrade, commands in that worktree resolve
+to `<declared>-<worktree>` and see it as not running. Stop it with
+`vmlab lab stop <declared>`, or pass `--instance ""` to reach it.
+
+#### Two worktrees of one lab
+
+A repository whose `vmlab.wcl` declares `lab "demo"` runs from its main
+worktree and a linked worktree `feat-x` at once, with no change to the file:
+
+```sh
+cd ~/src/app && vmlab up                 # lab "demo"
+git worktree add ../feat-x
+cd ../feat-x && vmlab up                 # lab "demo-feat-x"
+vmlab lab list
+```
+
+```
+NAME         STATE      DIRECTORY
+demo         running    /home/wil/src/app
+demo-feat-x  running    /home/wil/src/feat-x
+```
+
+Each worktree's `.vmlab/` holds its own clones, so the second `up` builds its
+machines from the templates. From `feat-x`, `status`, `exec box` and `down` act
+on `demo-feat-x`; `vmlab exec demo/box` and `vmlab exec demo-feat-x/box` pick
+one from anywhere. A clone outside git needs an instance named by hand, such as
+`export VMLAB_INSTANCE=second`.
 
 ## What a machine is
 
@@ -123,7 +191,7 @@ corresponding environment variable.
 | `~/.local/share/vmlab/oci/` | The digest-addressed cache of pulled container images. |
 | `~/.local/state/vmlab/` | Daemon state, per-lab and per-machine logs as JSON lines, event history. |
 | `~/.config/vmlab/` | The host configuration file and user profile overrides (see host-profiles.md). |
-| `$XDG_RUNTIME_DIR/vmlab/` | `vmlabd.sock`, and `labs/<lab>/` holding each lab daemon's `control.sock` and its per-machine QMP, agent, NIC and VNC sockets. |
+| `$XDG_RUNTIME_DIR/vmlab/` | `vmlabd.sock`, and `labs/<lab>/` holding each lab daemon's `control.sock` and its per-machine QMP, agent, NIC and VNC sockets. A lab or machine name too long for a socket path to fit is replaced in the path by a short hash. |
 
 The runtime directory is created private to the user, because a client that can
 reach a control socket can run scripts in the lab and read and write guest
@@ -201,6 +269,11 @@ daemon call for logs.
 | `labs/<lab>/containers/<name>/` | `qmp.sock`, `ctl.sock`, `agent.sock`, `nic<i>.sock`, `vfs<i>.sock` and `term-<id>.sock`. |
 | `global/<segment>.sock` | The trunk socket a lab daemon bridges to for a global segment. See networking.md. |
 
+`<lab>` here and in the state paths is the name the lab runs under,
+`<declared>-<instance>` for an instance. In the runtime paths, a lab or machine
+name long enough that a socket below it would not fit in a unix socket path is
+replaced by `_` and twelve hex characters of its hash.
+
 ## The lab directory
 
 A lab is any directory holding a `vmlab.wcl`. Every lab-scoped verb finds it by
@@ -236,6 +309,7 @@ keeps disk clones off a slow filesystem such as a bind mount.
 | `VMLAB_CONFIG_WEAVE_DIR` | Where the playbook engine's guest binaries are, instead of `~/.local/share/config-weave/bin`. |
 | `VMLAB_VIRTIOFSD` | The `virtiofsd` binary to use, before searching `PATH` and the distribution helper directories (`/usr/lib`, `/usr/libexec`, `/usr/lib/qemu`). |
 | `VMLAB_FASTPATH` | Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See host-profiles.md. |
+| `VMLAB_INSTANCE` | The instance this directory's lab runs as, named `<declared>-<instance>`, when `--instance` is not given. Set but empty means none, which also overrides a linked git worktree's name. See "Lab instances" above. |
 | `VMLAB_DEV_MACHINE` | Which dev machine `vmlab dev` verbs mean, second on the selection ladder after an explicit argument. See dev-machines.md. |
 | `DOCKER_CONFIG` | The directory holding `config.json` with registry credentials. |
 | `PATH` | Searched for the emulator, `qemu-img`, `swtpm` and `virtiofsd`. |

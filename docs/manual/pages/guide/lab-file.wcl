@@ -26,8 +26,9 @@ page guide_lab_file {
     attribute before vmlab reads anything. A file without it is not a lab
     file. After the import comes one `lab "<name>" { ... }` block. The name is
     a DNS label, because it appears in every machine's DNS name, and it is
-    the lab's identity on the host, as [How vmlab runs a lab](guide_architecture)
-    explains.
+    the lab's identity on the host, or `<name>-<instance>` is when the
+    directory runs the lab as an instance, as
+    [How vmlab runs a lab](guide_architecture) explains.
   DOC
 
   code wcl {

@@ -410,7 +410,7 @@ lab "l" {
         assert!(matches!(&web.volumes[1].source, VolumeSource::Host(_)));
         assert!(web.volumes[1].read_only);
         assert_eq!(web.ports.len(), 1);
-        assert_eq!(web.ports[0].host_port, 18080);
+        assert_eq!(web.ports[0].host_port, Some(18080));
         assert_eq!(web.ports[0].container_port, 80);
         assert_eq!(web.ports[0].proto, Proto::Both);
         let hc = web.healthcheck.as_ref().unwrap();
@@ -425,6 +425,33 @@ lab "l" {
         assert!(db.entrypoint.is_none());
         assert!(db.command.is_none());
         assert!(db.healthcheck.is_none());
+    }
+
+    /// An omitted host port is automatic: the model carries `None`, and a
+    /// declared one beside it still reads as given.
+    #[test]
+    fn omitted_host_ports_extract_as_auto() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { nat = true
+    forward { to = "web:80" }
+    forward { host_port = 8080 to = "web:81" }
+  }
+  container "web" { image = "nginx" nic { segment = "s" }
+    port { container = 80 }
+    port { host = 9090 container = 81 }
+  }
+}
+"#;
+        let lf = load_lab_source(src, "<test>", Path::new("/tmp")).unwrap();
+        let fwds = &lf.lab.segments[0].forwards;
+        assert_eq!(fwds[0].host_port, None);
+        assert_eq!(fwds[0].guest_port, 80);
+        assert_eq!(fwds[1].host_port, Some(8080));
+        let ports = &lf.lab.containers[0].ports;
+        assert_eq!(ports[0].host_port, None);
+        assert_eq!(ports[0].container_port, 80);
+        assert_eq!(ports[1].host_port, Some(9090));
     }
 
     /// §19.2: identity is machine-level, so `login {}` reads the same on a VM

@@ -3,7 +3,7 @@ page ref_paths {
   chapter_header "Files and directories" {
     kicker       = "Appendices · reference"
     reading_time = "9 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-25"
     version      = "vmlab 0.9"
   }
 
@@ -90,6 +90,13 @@ page ref_paths {
       | "`smb/<hash>/`" | "One lab's bundled smbd: its private, lock and pid directories, where it binds `msg.sock/<pid>` and `ncalrpc/`. Named by a hash of the lab's path so a socket path stays short however deep the lab sits, and removed when the smbd stops." |
       | "`global/<segment>.sock`" | "The trunk socket a lab daemon bridges to for a global segment. See [Networking](guide_networking)." |
   }
+  p <<DOC
+    `<lab>` here and in the state paths above is the name the lab runs
+    under, `<declared>-<instance>` for an [instance](guide_architecture).
+    In the runtime paths, a lab or machine name long enough that a socket
+    below it would not fit in a unix socket path is replaced by `_` and
+    twelve hex characters of its hash.
+  DOC
 
   h2 "The lab directory"
   p <<DOC
@@ -132,6 +139,7 @@ page ref_paths {
       | "`VMLAB_CONFIG_WEAVE_DIR`" | "Where the playbook engine's guest binaries are, instead of `~/.local/share/config-weave/bin`." |
       | "`VMLAB_VIRTIOFSD`" | "The `virtiofsd` binary to use, before searching `PATH`." |
       | "`VMLAB_FASTPATH`" | "Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See [Host configuration and WSL 2](guide_host)." |
+      | "`VMLAB_INSTANCE`" | "The instance this directory's lab runs as, named `<declared>-<instance>`, when `--instance` is not given. Set but empty means none, which also overrides a linked git worktree's name. See [How vmlab runs a lab](guide_architecture)." |
       | "`VMLAB_DEV_MACHINE`" | "Which dev machine `vmlab dev` verbs mean, second on the selection ladder after an explicit argument. See [vmlab dev](cmd_dev)." |
       | "`DOCKER_CONFIG`" | "The directory holding `config.json` with registry credentials." |
       | "`PATH`" | "Searched for the emulator, `qemu-img`, `swtpm` and `virtiofsd`." |

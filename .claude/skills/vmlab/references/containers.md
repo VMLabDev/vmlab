@@ -396,16 +396,20 @@ becomes ready.
 
 ```wcl
 port { host = 18081 container = 80 proto = "tcp" }
+port { container = 443 }   # automatic host port
 ```
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `host` | i64 | required | Host port to listen on, 1 to 65535. Unique across the lab. |
+| `host` | i64 | automatic | Host port to listen on, 1 to 65535. Unique across the lab. Omitted: vmlab picks a free port when it installs the forward. |
 | `container` | i64 | required | Container port to forward to, 1 to 65535. |
 | `proto` | utf8 | `tcp` | Protocol: `tcp`, `udp` or `both`. |
 
-The host port must be unused by every other `port {}` and every segment
-`forward {}` in the lab, and the container needs a NIC.
+A declared host port must be unused by every other `port {}` and every segment
+`forward {}` in the lab, and the container needs a NIC. An omitted `host` is
+automatic, exactly as an omitted `forward { host_port }` (see networking.md,
+"Automatic host ports"): `vmlab status` shows the port vmlab picked, marked
+`(auto)`, and it survives `vmlab container restart` while the lab daemon runs.
 
 ## healthcheck {}
 

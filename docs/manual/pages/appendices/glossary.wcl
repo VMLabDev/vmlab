@@ -6,7 +6,7 @@ page apx_glossary {
   chapter_header "Glossary" {
     kicker       = "Appendices · reference"
     reading_time = "8 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-25"
     version      = "vmlab 0.9"
   }
 
@@ -26,12 +26,13 @@ page apx_glossary {
       | "event" | "A named occurrence in a lab, such as `vm.crashed` or `host.disk_low`, carried on the lab's event stream and written to the event log. See [Events and handlers](guide_events) and the [Events](ref_events) reference." |
       | "fabric" | "The userspace network vmlab runs every segment on: frame codecs, an L2 switch, DHCP, DNS, a gateway and a NAT engine, all in the lab daemon's process. No tap, bridge or macvlan. See [Networking](guide_networking)." |
       | "fast path" | "An optional kernel-assisted tier of the fabric (`afxdp` or `sockmap`) probed at daemon start and used when it works. `vmlab fastpath` says which tier is active. See [Networking](guide_networking)." |
-      | "forward" | "A `forward {}` on a segment, or a `port {}` on a container, that maps a host TCP port onto a guest port. Planned as a whole before any is installed. See [Networking](guide_networking)." |
+      | "forward" | "A `forward {}` on a segment, or a `port {}` on a container, that maps a host TCP port onto a guest port. Planned as a whole before any is installed. Its host port is declared, or automatic when omitted: vmlab picks a free one and [vmlab status](cmd_status) shows it. See [Networking](guide_networking)." |
       | "global segment" | "A segment with `global = true`, owned by the supervisor rather than one lab, so machines from several labs share it; it can also peer with another host over a trunk. See [Networking](guide_networking)." |
       | "halt" | "The state a workspace enters when a sync pass finds a path changed on both sides. The whole workspace stops, both directions, on that one machine; nothing is written or deleted. Resolved from the host with the `vmlab dev sync` verbs. See [Dev machines and the workspace syncer](guide_dev)." |
       | "handler" | "An `on \"<event>\" { run = … }` block in the lab file that runs a wscript when the named event fires. See [Events and handlers](guide_events)." |
       | "host config" | "`vmlab-host.wcl`, the per-user file that sets host-wide values: the store location, the viewer command, the fast path mode, the trunk port and PSK. See [Host configuration and WSL 2](guide_host) and the [Host configuration file](ref_host) reference." |
-      | "lab" | "One `lab \"<name>\" {}` in a `vmlab.wcl`: a set of machines and segments brought up and torn down together. Its name is its host-global identity. See [The lab file](guide_lab_file)." |
+      | "instance" | "A lab file run under the effective name `<declared>-<instance>` instead of its declared name, so one lab file can run from two directories at once. Chosen by `--instance`, then `VMLAB_INSTANCE`, then the name of the linked git worktree the lab is in; an empty value means none. Every name-keyed resource follows the effective name. See [How vmlab runs a lab](guide_architecture)." |
+      | "lab" | "One `lab \"<name>\" {}` in a `vmlab.wcl`: a set of machines and segments brought up and torn down together. The name it runs under, the declared one or an instance's, is its host-global identity. See [The lab file](guide_lab_file)." |
       | "lab container" | "A `container {}` in a lab: an OCI image pulled like a docker image and run inside a micro-VM, so it is a lab machine in every respect. See [Lab containers](guide_containers)." |
       | "lab daemon" | "The per-lab process the supervisor spawns on `up`: lifecycle, snapshots, the fabric for the lab's segments, events, shares and the syncer. Logs to `.vmlab/lab.log`. See [How vmlab runs a lab](guide_architecture)." |
       | "ledger" | "The host-side record of what the two sides of a workspace last agreed on, per path. Guest changes are drained into it; the note that a re-seed is owed and the halt a restore refuses on both ride it. See [Dev machines and the workspace syncer](guide_dev)." |

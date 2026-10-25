@@ -117,8 +117,7 @@ async fn guest_family(lab: Option<&str>, machine: &str) -> Result<GuestFamily> {
                 .ok_or_else(|| anyhow!("lab \"{name}\" is not running"))?,
         },
     };
-    let file =
-        crate::config::load_lab_root(&root).map_err(|e| anyhow!("{:?}", miette::Report::new(e)))?;
+    let file = crate::instance::load(&root)?;
     let cfg = file
         .lab
         .machine(machine)

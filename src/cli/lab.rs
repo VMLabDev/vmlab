@@ -26,7 +26,7 @@ pub(super) fn load_lab_here() -> Result<(crate::config::LabFile, std::path::Path
 }
 
 fn load_lab_at(root: &std::path::Path) -> Result<crate::config::LabFile> {
-    crate::config::load_lab_root(root).map_err(|e| anyhow!("{:?}", miette::Report::new(e)))
+    crate::instance::load(root)
 }
 
 /// Resolve a `[lab/]vm` reference (PRD §9.3): with a slash the lab is
@@ -220,8 +220,7 @@ pub fn cmd_up(vms: Vec<String>, record: Vec<crate::record::RecordRequest>) -> Re
         // interactive session (the daemon is headless and can't reach the
         // user's display). Closing the viewer only disconnects; the VM
         // keeps running (§11). Done CLI-side so VMs always boot headless.
-        let file = crate::config::load_lab_root(&root)
-            .map_err(|e| anyhow!("{:?}", miette::Report::new(e)))?;
+        let file = load_lab_at(&root)?;
         let lab_gui = file.lab.gui.unwrap_or(false);
         for vm in &file.lab.vms {
             if !vm.gui.unwrap_or(lab_gui) {
@@ -586,6 +585,38 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
                 s.gateway,
                 format!("{}/{}", on_off(s.nat), on_off(s.dhcp)),
                 s.frames.dropped,
+            );
+        }
+    }
+
+    // Port forwards as bound. An automatic one's port is only knowable
+    // here (§9.8): the lab file left it out, and it is what a second lab
+    // instance of the same file is told to use instead of a fixed port.
+    if !status.forwards.is_empty() {
+        let host = |f: &crate::status::ForwardStatus| {
+            if f.auto {
+                format!("{} (auto)", f.host_port)
+            } else {
+                f.host_port.to_string()
+            }
+        };
+        let name_w = column_width("FORWARD", status.forwards.iter().map(|f| f.machine.len()));
+        let host_w = column_width("HOST", status.forwards.iter().map(|f| host(f).len()));
+        let guest_w = column_width("GUEST", status.forwards.iter().map(|f| f.guest.len()));
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  {:<name_w$} {:<host_w$} {:<guest_w$} PROTO",
+            "FORWARD", "HOST", "GUEST"
+        );
+        for f in &status.forwards {
+            let _ = writeln!(
+                out,
+                "  {:<name_w$} {:<host_w$} {:<guest_w$} {}",
+                f.machine,
+                host(f),
+                f.guest,
+                f.proto,
             );
         }
     }
@@ -2038,8 +2069,7 @@ pub fn cmd_logs(
                 // if that lab declares it, otherwise a lab name.
                 match current_lab() {
                     Ok((lab_name, root)) => {
-                        let file = crate::config::load_lab_root(&root)
-                            .map_err(|e| anyhow!("{:?}", miette::Report::new(e)))?;
+                        let file = load_lab_at(&root)?;
                         if file.lab.vms.iter().any(|v| v.name == maybe_vm)
                             || file.lab.containers.iter().any(|c| c.name == maybe_vm)
                         {
@@ -2302,6 +2332,37 @@ mod tests {
         assert!(out.contains("10.0.0.5"), "got:\n{out}");
         // The raw power state is not in the default table.
         assert!(!out.contains("state="), "got:\n{out}");
+    }
+
+    /// Installed forwards get their own table, an automatic port marked as
+    /// vmlab's pick; a lab with none prints no table at all.
+    #[test]
+    fn the_status_table_lists_forwards_and_marks_auto_ports() {
+        use crate::status::ForwardStatus;
+        let fwd = |machine: &str, host_port, auto| ForwardStatus {
+            machine: machine.into(),
+            segment: "lan".into(),
+            host_port,
+            guest: "10.0.0.5:80".into(),
+            proto: "tcp".into(),
+            auto,
+        };
+        let mut status = lab(vec![addressed("web", PowerState::Running, true, vm())]);
+        assert!(!render_status(&status, false).contains("FORWARD"));
+        status.forwards = vec![fwd("web", 8080, false), fwd("web", 41234, true)];
+        let out = render_status(&status, false);
+        assert!(
+            out.contains("FORWARD HOST         GUEST       PROTO"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("web     8080         10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("web     41234 (auto) 10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
     }
 
     /// `vmlab status` names which machine is the dev machine, off the same

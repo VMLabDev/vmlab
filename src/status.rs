@@ -544,6 +544,25 @@ pub struct SegmentStatus {
     pub frames: SegmentFrames,
 }
 
+// ---- port forwards -----------------------------------------------------------
+
+/// One host→guest port forward the lab daemon has installed (PRD §9.8,
+/// §18): a segment `forward {}` or a container `port {}`, as bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardStatus {
+    pub machine: String,
+    /// The segment whose NAT engine carries it.
+    pub segment: String,
+    /// The host port actually listening — the kernel's pick for an `auto` one.
+    pub host_port: u16,
+    /// The guest end, `ip:port` (the machine's lease when it was installed).
+    pub guest: String,
+    /// `tcp` | `udp` | `both` as declared (`both` listens on TCP).
+    pub proto: String,
+    /// vmlab picked `host_port`: the declaration left it out.
+    pub auto: bool,
+}
+
 // ---- downloads --------------------------------------------------------------
 
 /// Which artefact a download is fetching.
@@ -624,6 +643,10 @@ pub struct LabStatus {
     /// the field, which never matches a digest and so reads as stale.
     #[serde(default)]
     pub config_digest: String,
+    /// Every installed port forward, ordered by machine then declaration.
+    /// Absent from a daemon that predates the field.
+    #[serde(default)]
+    pub forwards: Vec<ForwardStatus>,
 }
 
 impl LabStatus {
@@ -754,6 +777,7 @@ pub(crate) mod fixtures {
             provisioned: true,
             pulls: Vec::new(),
             config_digest: String::new(),
+            forwards: Vec::new(),
         }
     }
 }

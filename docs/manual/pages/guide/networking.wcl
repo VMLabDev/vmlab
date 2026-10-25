@@ -147,6 +147,18 @@ page guide_networking {
     at runtime with `Segment.forward`.
   DOC
 
+  p <<DOC
+    A forward that leaves its host port out (`forward { to = "web:80" }`, or
+    `port { container = 80 }`) gets an automatic one: the daemon binds a free
+    port when it installs the forward, claims nothing in the plan, and
+    reports the port in [vmlab status](cmd_status), marked `(auto)`. A
+    machine restart asks for the same port again, so it holds while the lab
+    daemon runs; a full `down` and `up` may hand out another. Two
+    [instances](guide_architecture) of one lab file need automatic ports,
+    since a fixed one can be bound only once. See
+    [Automatic host ports](ref_lab).
+  DOC
+
   h2 "Guest routes and inter-segment routing"
 
   p <<DOC

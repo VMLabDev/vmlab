@@ -231,7 +231,9 @@ pub enum Proto {
 
 #[derive(Debug, Clone)]
 pub struct Forward {
-    pub host_port: u16,
+    /// `None` = automatic: vmlab binds a free port when it installs the
+    /// forward and reports it in `vmlab status`.
+    pub host_port: Option<u16>,
     pub vm: String,
     pub guest_port: u16,
     pub proto: Proto,
@@ -800,7 +802,8 @@ pub struct Volume {
 /// Host→container port forward — sugar for the segment forward machinery.
 #[derive(Debug, Clone)]
 pub struct PortMap {
-    pub host_port: u16,
+    /// `None` = automatic, as for [`Forward::host_port`].
+    pub host_port: Option<u16>,
     pub container_port: u16,
     pub proto: Proto,
     pub span: Span,

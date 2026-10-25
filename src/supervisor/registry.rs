@@ -41,13 +41,16 @@ impl LabEntry {
     /// there, or `vmlab lab stop` by name from anywhere — which is also the
     /// way out when that directory no longer exists — both stop the lab and
     /// have the supervisor reap its daemon while keeping its clones.
+    /// Or this directory takes a name of its own as a lab instance
+    /// (crate::instance).
     pub fn claims(&self, name: &str, requested_root: &Path) -> Result<(), CommandError> {
         if self.root == requested_root {
             return Ok(());
         }
         Err(CommandError::conflict(format!(
             "lab `{name}` is already registered from {root} — run `vmlab down` there \
-             (or `vmlab lab stop {name}` from anywhere) to release it, or rename this lab",
+             (or `vmlab lab stop {name}` from anywhere) to release it, or run this \
+             directory as its own instance with `--instance <id>`",
             root = self.root.display()
         )))
     }
@@ -164,7 +167,7 @@ mod tests {
             assert!(error.message.contains("/labs/first"));
             assert!(error.message.contains("run `vmlab down` there"));
             assert!(error.message.contains("vmlab lab stop mylab"));
-            assert!(error.message.contains("rename this lab"));
+            assert!(error.message.contains("--instance <id>"));
         }
     }
 

@@ -344,7 +344,7 @@ impl SegmentHandle {
                 guest_port,
                 crate::config::model::Proto::Tcp,
             )
-            .map(|id| id as i64)
+            .map(|(id, _)| id as i64)
         })
     }
 

@@ -42,7 +42,10 @@ page cmd_validate {
     On success the verb prints one line, `ok: lab "<name>" — N vm(s), N
     container(s), N segment(s)`. On failure it prints every issue as a
     report with the offending text underlined in the source, and prints
-    nothing else.
+    nothing else. Validation checks the name the file declares; `<name>`
+    is the name the lab runs under, `<declared>-<instance>` when the
+    directory runs it as an [instance](guide_architecture), as in a linked
+    git worktree.
   DOC
 
   p <<DOC

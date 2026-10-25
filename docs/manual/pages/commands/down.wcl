@@ -3,7 +3,7 @@ page cmd_down {
   chapter_header "vmlab down" {
     kicker       = "Commands · reference"
     reading_time = "3 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-25"
     version      = "vmlab 0.9"
   }
 
@@ -65,9 +65,11 @@ page cmd_down {
     does not hold its port against the next `up`, and then has the supervisor
     reap the lab daemon. That releases the lab's name: `vmlab lab list` no
     longer shows the lab, `vmlab status` says `not running`, and another
-    directory declaring the same `lab` name, such as a second git worktree,
-    can bring it up (see
-    [The lab name is already registered](apx_troubleshooting)). The clones,
+    directory whose lab runs under the same name, such as a second clone of
+    the repository, can bring it up (see
+    [The lab name is already registered](apx_troubleshooting)). A linked git
+    worktree runs its lab as an [instance](guide_architecture) under a name
+    of its own and does not need this release. The clones,
     snapshots and `.vmlab/` stay. The next [vmlab up](cmd_up) starts a fresh
     daemon, so it reads `vmlab.wcl` as it is then, edits included.
   DOC

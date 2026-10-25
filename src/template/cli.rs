@@ -366,7 +366,7 @@ fn lab_here() -> String {
 /// watching that lab will see it. A file that declares no lab — a bare
 /// template file — belongs to the store, spelled as the empty lab.
 fn lab_of(root: &Path) -> String {
-    crate::config::load_lab_root(root)
+    crate::instance::load(root)
         .map(|f| f.lab.name)
         .unwrap_or_default()
 }

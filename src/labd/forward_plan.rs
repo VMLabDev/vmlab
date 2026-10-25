@@ -50,6 +50,21 @@ impl ForwardSource {
 pub enum HostBinding {
     /// A declared port on every interface.
     Port(u16),
+    /// No port declared: vmlab binds a free one on every interface when it
+    /// installs the forward, preferring the one it held last time
+    /// ([`sticky_bind`]).
+    Auto,
+}
+
+impl HostBinding {
+    fn from_declared(port: Option<u16>) -> Self {
+        port.map_or(HostBinding::Auto, HostBinding::Port)
+    }
+
+    /// Whether vmlab picks the port.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, HostBinding::Auto)
+    }
 }
 
 /// One forward to install.
@@ -148,7 +163,10 @@ pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
             }
             if inputs.lab.machine(&fwd.vm).is_none() {
                 plan.skipped.push(Skip {
-                    what: format!("forward {} → \"{}\"", fwd.host_port, fwd.vm),
+                    what: match fwd.host_port {
+                        Some(p) => format!("forward {p} → \"{}\"", fwd.vm),
+                        None => format!("forward (auto) → \"{}\"", fwd.vm),
+                    },
                     why: "no such vm or container in the lab".into(),
                 });
                 continue;
@@ -159,7 +177,7 @@ pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
                 Draft {
                     machine: fwd.vm.clone(),
                     segment: seg.name.clone(),
-                    host: HostBinding::Port(fwd.host_port),
+                    host: HostBinding::from_declared(fwd.host_port),
                     guest_port: fwd.guest_port,
                     proto: fwd.proto,
                     source: ForwardSource::Declared,
@@ -184,7 +202,7 @@ pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
                 Draft {
                     machine: c.name.clone(),
                     segment,
-                    host: HostBinding::Port(port.host_port),
+                    host: HostBinding::from_declared(port.host_port),
                     guest_port: port.container_port,
                     proto: port.proto,
                     source,
@@ -247,8 +265,11 @@ fn push(plan: &mut ForwardPlan, inputs: &ForwardInputs, draft: Draft) {
 fn resolve_conflicts(plan: &mut ForwardPlan) {
     let mut claims: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
     for (i, r) in plan.rules.iter().enumerate() {
-        let HostBinding::Port(p) = r.host;
-        claims.entry(p).or_default().push(i);
+        // An automatic port is picked free at install time; it claims
+        // nothing a plan could contest.
+        if let HostBinding::Port(p) = r.host {
+            claims.entry(p).or_default().push(i);
+        }
     }
     let mut dropped: Vec<usize> = Vec::new();
     for (host_port, claimants) in claims {
@@ -278,6 +299,89 @@ fn resolve_conflicts(plan: &mut ForwardPlan) {
         i += 1;
         keep
     });
+}
+
+/// What a forward installed earlier is recognised by when its machine's
+/// forwards are installed again (a restart takes a new lease, so the rule's
+/// guest address is not part of it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardKey {
+    pub machine: String,
+    pub segment: String,
+    pub source: ForwardSource,
+    pub guest_port: u16,
+    pub proto: Proto,
+}
+
+impl ForwardRule {
+    pub fn key(&self) -> ForwardKey {
+        ForwardKey {
+            machine: self.machine.clone(),
+            segment: self.segment.clone(),
+            source: self.source.clone(),
+            guest_port: self.guest_port,
+            proto: self.proto,
+        }
+    }
+}
+
+/// The ports to try binding for one rule, in order. A declared port is the
+/// only candidate — it is exactly what the lab file asked for. An automatic
+/// rule tries the port it held the last time it was installed (`previous`),
+/// so a machine restart keeps the address a user already has, then falls
+/// back to port 0: whatever the kernel hands out.
+pub fn sticky_bind(host: HostBinding, previous: Option<u16>) -> Vec<u16> {
+    match host {
+        HostBinding::Port(p) => vec![p],
+        HostBinding::Auto => match previous {
+            Some(p) if p != 0 => vec![p, 0],
+            _ => vec![0],
+        },
+    }
+}
+
+/// A forward the lab daemon installed, as it tracks it per machine: enough
+/// to tear it down, to report it in `vmlab status`, and to recognise its
+/// rule the next time the machine's forwards are installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledForward {
+    pub key: ForwardKey,
+    /// The segment services' forward id.
+    pub id: u64,
+    /// The host port actually bound.
+    pub host_port: u16,
+    /// Whether vmlab picked `host_port` (the declaration omitted it).
+    pub auto: bool,
+    pub guest_ip: Ipv4Addr,
+}
+
+/// The ports to try for each of `rules`, in order, given what the same
+/// machine had installed before (ADR-0003: decided before any bind).
+///
+/// An automatic rule whose key matches an automatic forward installed last
+/// time asks for that port first ([`sticky_bind`]). Each previous forward
+/// is matched at most once, in order, so two identical automatic rules keep
+/// a port each rather than both asking for the first one's.
+pub fn bind_candidates(previous: &[InstalledForward], rules: &[&ForwardRule]) -> Vec<Vec<u16>> {
+    let mut used = vec![false; previous.len()];
+    rules
+        .iter()
+        .map(|rule| {
+            let mut held = None;
+            if rule.host.is_auto() {
+                let key = rule.key();
+                if let Some(i) = previous
+                    .iter()
+                    .enumerate()
+                    .position(|(i, p)| !used[i] && p.auto && p.key == key)
+                {
+                    used[i] = true;
+                    held = Some(previous[i].host_port);
+                }
+            }
+            sticky_bind(rule.host, held)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -474,6 +578,178 @@ lab "l" {
         assert!(
             p.rules.iter().all(|r| r.prime_mac.is_some()),
             "no rule is left unprimed: {p:#?}"
+        );
+    }
+
+    /// A lab whose forwards leave their host ports out.
+    fn auto_lab() -> Lab {
+        lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { to = "web:80" }
+    forward { to = "web:443" }
+  }
+  vm "web" { template = "x86_64/t" nic { segment = "lan" } }
+  container "cache" { image = "redis" nic { segment = "lan" }
+    port { container = 6379 }
+  }
+}"#,
+        )
+    }
+
+    /// An omitted host port plans as `Auto`, from either source.
+    #[test]
+    fn an_omitted_host_port_plans_as_auto() {
+        let lab = auto_lab();
+        let obs = leased(&[("web", 10), ("cache", 11)]);
+        let p = plan(&inputs(&lab, &obs), &[]);
+        assert_eq!(p.rules.len(), 3, "{p:#?}");
+        assert!(
+            p.rules.iter().all(|r| r.host == HostBinding::Auto),
+            "{p:#?}"
+        );
+    }
+
+    /// Automatic ports claim nothing, so any number of them never conflict.
+    #[test]
+    fn auto_rules_never_conflict() {
+        let lab = auto_lab();
+        let obs = leased(&[("web", 10), ("cache", 11)]);
+        let p = plan(&inputs(&lab, &obs), &[]);
+        assert!(p.conflicts.is_empty(), "{p:#?}");
+        assert!(p.skipped.is_empty(), "{p:#?}");
+    }
+
+    /// Fixed ports beside automatic ones still contest, and only they do.
+    #[test]
+    fn fixed_ports_still_conflict_among_auto_ones() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { host_port = 8080 to = "a:80" }
+    forward { to = "a:81" }
+  }
+  vm "a" { template = "x86_64/t" nic { segment = "lan" } }
+  container "b" { image = "nginx" nic { segment = "lan" }
+    port { container = 82 }
+    port { host = 8080 container = 80 }
+  }
+}"#,
+        );
+        let obs = leased(&[("a", 10), ("b", 11)]);
+        let p = plan(&inputs(&lab, &obs), &[]);
+        assert_eq!(p.conflicts.len(), 1, "{p:#?}");
+        assert_eq!(p.conflicts[0].host_port, 8080);
+        assert_eq!(p.rules.len(), 3, "both auto rules and the winner: {p:#?}");
+        assert_eq!(
+            p.rules.iter().filter(|r| r.host.is_auto()).count(),
+            2,
+            "{p:#?}"
+        );
+    }
+
+    /// A declared port is tried alone, with or without a history.
+    #[test]
+    fn sticky_bind_leaves_a_declared_port_alone() {
+        assert_eq!(sticky_bind(HostBinding::Port(8080), None), vec![8080]);
+        assert_eq!(
+            sticky_bind(HostBinding::Port(8080), Some(40000)),
+            vec![8080]
+        );
+    }
+
+    /// An automatic port tries what it held last time, then any free port.
+    #[test]
+    fn sticky_bind_prefers_the_previous_auto_port() {
+        assert_eq!(sticky_bind(HostBinding::Auto, None), vec![0]);
+        assert_eq!(sticky_bind(HostBinding::Auto, Some(40000)), vec![40000, 0]);
+        assert_eq!(sticky_bind(HostBinding::Auto, Some(0)), vec![0]);
+    }
+
+    /// The key a re-install recognises a rule by survives a new lease.
+    #[test]
+    fn a_rule_key_ignores_the_lease() {
+        let lab = auto_lab();
+        let first = plan(&inputs(&lab, &leased(&[("web", 10)])), &["web".into()]);
+        let again = plan(&inputs(&lab, &leased(&[("web", 20)])), &["web".into()]);
+        let k1: Vec<ForwardKey> = first.rules.iter().map(ForwardRule::key).collect();
+        let k2: Vec<ForwardKey> = again.rules.iter().map(ForwardRule::key).collect();
+        assert_eq!(k1, k2);
+        assert_ne!(k1[0], k1[1], "two guest ports, two keys");
+    }
+
+    fn installed(rule: &ForwardRule, host_port: u16) -> InstalledForward {
+        InstalledForward {
+            key: rule.key(),
+            id: 1,
+            host_port,
+            auto: rule.host.is_auto(),
+            guest_ip: rule.guest_ip,
+        }
+    }
+
+    /// A restart re-plans with a new lease; each automatic rule asks for the
+    /// port it held before, then any.
+    #[test]
+    fn a_reinstall_asks_for_each_auto_rule_s_previous_port() {
+        let lab = auto_lab();
+        let before = plan(&inputs(&lab, &leased(&[("web", 10)])), &["web".into()]);
+        let previous = vec![
+            installed(&before.rules[0], 40001),
+            installed(&before.rules[1], 40002),
+        ];
+        let after = plan(&inputs(&lab, &leased(&[("web", 20)])), &["web".into()]);
+        let rules: Vec<&ForwardRule> = after.rules.iter().collect();
+        assert_eq!(
+            bind_candidates(&previous, &rules),
+            vec![vec![40001, 0], vec![40002, 0]]
+        );
+    }
+
+    /// The first install has no history, and a fixed rule never borrows one.
+    #[test]
+    fn a_first_install_binds_any_port_and_fixed_rules_their_own() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { host_port = 8080 to = "a:80" }
+    forward { to = "a:81" }
+  }
+  vm "a" { template = "x86_64/t" nic { segment = "lan" } }
+}"#,
+        );
+        let p = plan(&inputs(&lab, &leased(&[("a", 10)])), &[]);
+        let rules: Vec<&ForwardRule> = p.rules.iter().collect();
+        assert_eq!(bind_candidates(&[], &rules), vec![vec![8080], vec![0]]);
+        let previous = vec![installed(&p.rules[0], 8080), installed(&p.rules[1], 40000)];
+        assert_eq!(
+            bind_candidates(&previous, &rules),
+            vec![vec![8080], vec![40000, 0]]
+        );
+    }
+
+    /// Two identical automatic rules keep a port each.
+    #[test]
+    fn identical_auto_rules_each_keep_their_own_port() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { to = "a:80" }
+    forward { to = "a:80" }
+  }
+  vm "a" { template = "x86_64/t" nic { segment = "lan" } }
+}"#,
+        );
+        let p = plan(&inputs(&lab, &leased(&[("a", 10)])), &[]);
+        let rules: Vec<&ForwardRule> = p.rules.iter().collect();
+        let previous = vec![installed(&p.rules[0], 40001), installed(&p.rules[1], 40002)];
+        assert_eq!(
+            bind_candidates(&previous, &rules),
+            vec![vec![40001, 0], vec![40002, 0]]
         );
     }
 }
