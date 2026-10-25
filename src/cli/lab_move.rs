@@ -1,14 +1,16 @@
 //! `vmlab lab move <lab> [--from <root>]` — hand a stopped lab's working
 //! data, clones and all, from one lab root to another declaring the same
-//! name (issue #143).
+//! lab (issue #143).
 //!
-//! A lab name is host-global (ADR-0011), so several worktrees of one
-//! repository share one lab, and a provisioned guest is expensive to build
-//! again. The verb runs from the target root: it refuses while anything of the
-//! lab runs or when the target already has machines of its own, releases the
-//! name, moves the working data (`.vmlab/`, or the `VMLAB_WORK_DIR` directory
-//! keyed by the root's hash), carries the paths stored in it over to the new
-//! root, and registers the lab from there.
+//! A provisioned guest is expensive to build again, so a lab's clones can
+//! follow it to another checkout. The verb runs from the target root: it
+//! refuses while anything of the lab runs or when the target already has
+//! machines of its own, releases the name, moves the working data (`.vmlab/`,
+//! or the `VMLAB_WORK_DIR` directory keyed by the root's hash), carries the
+//! paths stored in it over to the new root, and registers the lab from there
+//! under the target's own name. The two roots must declare the same lab; the
+//! names they run under may differ, as `demo` in a main worktree and
+//! `demo-feat-x` in a linked one do (crate::instance).
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -31,13 +33,20 @@ const MACHINE_DATA: [&str; 3] = ["vms", "containers", "volumes"];
 pub fn cmd_lab_move(name: &str, from: Option<PathBuf>) -> Result<()> {
     rt()?.block_on(async {
         let target = crate::paths::find_lab_root(&std::env::current_dir()?)?;
+        // The lab may move between instances of one lab file (two git
+        // worktrees): `demo` in the main worktree to `demo-feat-x` in a
+        // linked one. What has to match is the declared name; the lab is
+        // registered under the target's own name once it arrives.
+        let target_declared = load_declared(&target)?;
+        let declared = target_declared.lab.name.clone();
         let target_file = load(&target)?;
-        if target_file.lab.name != name {
+        let target_name = target_file.lab.name.clone();
+        if !crate::instance::belongs_to(name, &declared) {
             return Err(CommandError::invalid(format!(
-                "{} declares lab \"{}\", not \"{name}\" — run `vmlab lab move` from a \
-                 checkout whose lab file declares \"{name}\"",
+                "{} declares lab \"{declared}\", and \"{name}\" is neither that lab nor an \
+                 instance of it — run `vmlab lab move` from a checkout whose lab file \
+                 declares the lab you are moving",
                 target.join(crate::paths::LAB_FILE).display(),
-                target_file.lab.name,
             ))
             .into());
         }
@@ -92,18 +101,18 @@ pub fn cmd_lab_move(name: &str, from: Option<PathBuf>) -> Result<()> {
             }
         }
 
-        match load(&source) {
+        match load_declared(&source) {
             Ok(source_file) => {
-                if source_file.lab.name != name {
+                if source_file.lab.name != declared {
                     return Err(CommandError::invalid(format!(
-                        "{} declares lab \"{}\", not \"{name}\" — its working data is not \
-                         this lab's",
+                        "{} declares lab \"{}\", not \"{declared}\" — its working data is \
+                         not this lab's",
                         source.join(crate::paths::LAB_FILE).display(),
                         source_file.lab.name
                     ))
                     .into());
                 }
-                for line in differences(&source_file, &target_file) {
+                for line in differences(&source_file, &target_declared) {
                     println!("warning: {line}");
                 }
             }
@@ -161,18 +170,32 @@ pub fn cmd_lab_move(name: &str, from: Option<PathBuf>) -> Result<()> {
             }
         }
 
-        daemon::ensure_lab_daemon(name, &target)
+        daemon::ensure_lab_daemon(&target_name, &target)
             .await
             .map_err(|e| anyhow!("the lab moved, but registering it failed: {e:#}"))?;
-        println!(
-            "lab \"{name}\" now lives in {} — run `vmlab validate`, then `vmlab up`",
-            target.display()
-        );
+        if target_name == name {
+            println!(
+                "lab \"{name}\" now lives in {} — run `vmlab validate`, then `vmlab up`",
+                target.display()
+            );
+        } else {
+            println!(
+                "lab \"{name}\" now lives in {} as \"{target_name}\" — run `vmlab validate`, \
+                 then `vmlab up`",
+                target.display()
+            );
+        }
         Ok(())
     })
 }
 
+/// The lab file under the name this directory runs it as (crate::instance).
 fn load(root: &Path) -> Result<LabFile> {
+    crate::instance::load(root)
+}
+
+/// The lab file under the name it declares.
+fn load_declared(root: &Path) -> Result<LabFile> {
     crate::config::load_lab_root(root).map_err(|e| anyhow!("{:?}", miette::Report::new(e)))
 }
 

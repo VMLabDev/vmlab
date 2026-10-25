@@ -84,10 +84,85 @@ pub fn supervisor_socket() -> PathBuf {
     runtime_dir().join("vmlabd.sock")
 }
 
-/// Runtime directory for one lab daemon: control socket plus per-VM
-/// QMP/agent/NIC/VNC sockets.
+/// The longest path a unix socket can bind: `sun_path` is 108 bytes and
+/// holds the terminating NUL.
+const SUN_PATH_MAX: usize = 107;
+
+/// Longest socket file name bound in a machine's runtime directory:
+/// `app-<u32>-conns.sock` (the shared-app connection socket, §20.3).
+const MACHINE_SOCKET_NAME_MAX: usize = "app-4294967295-conns.sock".len();
+
+/// What a machine runtime directory adds below its lab's runtime directory at
+/// worst: `/containers/` (the longer kind directory), a hashed machine
+/// component (see [`fitted`]) and the longest socket name.
+const MACHINE_DIR_RESERVE: usize =
+    "/containers/".len() + HASHED_COMPONENT_LEN + 1 + MACHINE_SOCKET_NAME_MAX;
+
+/// `_` plus 12 hex characters.
+const HASHED_COMPONENT_LEN: usize = 13;
+
+/// `parent/name` when `reserve` more bytes below it still fit in a socket
+/// path, else `parent/_<12 hex of name>`.
+///
+/// Lab and machine names are DNS labels of up to 63 characters each, so the
+/// plain path does not always fit in `sun_path`: QEMU then fails to bind its
+/// QMP or VNC socket. A DNS label cannot start with `_`, so a hashed component
+/// never collides with a real name. With both components hashed every socket
+/// fits as long as the runtime base ([`runtime_dir`]) is at most 37 bytes;
+/// `/run/user/<uid>/vmlab` is at most 26.
+fn fitted(parent: &Path, name: &str, reserve: usize) -> PathBuf {
+    let plain = parent.join(name);
+    if plain.as_os_str().len() + reserve <= SUN_PATH_MAX {
+        return plain;
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    parent.join(format!("_{}", hex::encode(&digest[..6])))
+}
+
+/// Runtime directory for one lab daemon: control socket plus the machine
+/// runtime directories ([`machine_runtime_dir`]).
 pub fn lab_runtime_dir(lab: &str) -> PathBuf {
-    runtime_dir().join("labs").join(lab)
+    lab_runtime_dir_in(&runtime_dir(), lab)
+}
+
+/// [`lab_runtime_dir`] against an explicit runtime base, for tests.
+pub fn lab_runtime_dir_in(runtime: &Path, lab: &str) -> PathBuf {
+    fitted(&runtime.join("labs"), lab, MACHINE_DIR_RESERVE)
+}
+
+/// Which kind of machine a runtime directory belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineKind {
+    Vm,
+    Container,
+}
+
+impl MachineKind {
+    fn dir(self) -> &'static str {
+        match self {
+            MachineKind::Vm => "vms",
+            MachineKind::Container => "containers",
+        }
+    }
+}
+
+/// Runtime directory for one machine's sockets (QMP, agent, VNC, NICs,
+/// virtiofsd, terminals, shared apps):
+/// `<lab runtime>/{vms,containers}/<machine>`, with the machine component
+/// hashed when its longest socket would not fit in `sun_path`.
+pub fn machine_runtime_dir(lab: &str, kind: MachineKind, machine: &str) -> PathBuf {
+    machine_runtime_dir_in(&runtime_dir(), lab, kind, machine)
+}
+
+/// [`machine_runtime_dir`] against an explicit runtime base, for tests.
+pub fn machine_runtime_dir_in(
+    runtime: &Path,
+    lab: &str,
+    kind: MachineKind,
+    machine: &str,
+) -> PathBuf {
+    let parent = lab_runtime_dir_in(runtime, lab).join(kind.dir());
+    fitted(&parent, machine, 1 + MACHINE_SOCKET_NAME_MAX)
 }
 
 /// Lab daemon control socket.
@@ -264,6 +339,61 @@ pub fn vmlab_exe() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The longest socket any machine binds, for the given names and base.
+    fn longest_machine_socket(base: &Path, lab: &str, kind: MachineKind, m: &str) -> PathBuf {
+        machine_runtime_dir_in(base, lab, kind, m).join("app-4294967295-conns.sock")
+    }
+
+    #[test]
+    fn machine_sockets_fit_sun_path_for_the_longest_names() {
+        let label = "a".repeat(63);
+        for base in [
+            Path::new("/run/user/1000/vmlab"),
+            Path::new("/run/user/4294967294/vmlab"),
+            Path::new("/tmp/thirty-seven-bytes-of-base/vmlab"),
+        ] {
+            for kind in [MachineKind::Vm, MachineKind::Container] {
+                let sock = longest_machine_socket(base, &label, kind, &label);
+                assert!(
+                    sock.as_os_str().len() <= SUN_PATH_MAX,
+                    "{} is {} bytes",
+                    sock.display(),
+                    sock.as_os_str().len()
+                );
+            }
+            let control = lab_runtime_dir_in(base, &label).join("control.sock");
+            assert!(control.as_os_str().len() <= SUN_PATH_MAX);
+        }
+    }
+
+    #[test]
+    fn short_names_keep_readable_runtime_paths() {
+        let base = Path::new("/run/user/1000/vmlab");
+        assert_eq!(
+            machine_runtime_dir_in(base, "demo", MachineKind::Vm, "web01"),
+            Path::new("/run/user/1000/vmlab/labs/demo/vms/web01")
+        );
+        assert_eq!(
+            machine_runtime_dir_in(base, "demo", MachineKind::Container, "cache"),
+            Path::new("/run/user/1000/vmlab/labs/demo/containers/cache")
+        );
+    }
+
+    #[test]
+    fn hashed_components_are_stable_distinct_and_never_dns_labels() {
+        let base = Path::new("/run/user/1000/vmlab");
+        let a = "a".repeat(63);
+        let b = "b".repeat(63);
+        let ra = lab_runtime_dir_in(base, &a);
+        assert_eq!(ra, lab_runtime_dir_in(base, &a));
+        assert_ne!(ra, lab_runtime_dir_in(base, &b));
+        let last = ra.file_name().unwrap().to_str().unwrap();
+        assert!(
+            last.starts_with('_') && last.len() == HASHED_COMPONENT_LEN,
+            "{last}"
+        );
+    }
 
     #[test]
     fn smb_runtime_dir_is_bounded_whatever_the_lab_path() {

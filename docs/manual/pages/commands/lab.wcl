@@ -3,7 +3,7 @@ page cmd_lab {
   chapter_header "vmlab lab" {
     kicker       = "Commands · reference"
     reading_time = "6 min read"
-    updated      = "2026-10-06"
+    updated      = "2026-10-25"
     version      = "vmlab 0.9"
   }
 
@@ -13,6 +13,13 @@ page cmd_lab {
     it started, and these verbs read it and act on the daemons behind it. See
     [How vmlab runs a lab](guide_architecture) for the supervisor and the
     per-lab daemons.
+  DOC
+
+  p <<DOC
+    A `<LAB>` argument is the name the lab runs under. For a lab running as
+    an [instance](guide_architecture), such as one started from a linked git
+    worktree, that is the effective name `<declared>-<instance>` that
+    `vmlab lab list` shows, not the name its file declares.
   DOC
 
   code sh { source = "vmlab lab <COMMAND>" }
@@ -48,6 +55,8 @@ page cmd_lab {
 
   p <<DOC
     Prints one row per registered lab with `NAME`, `STATE` and `DIRECTORY`.
+    Two instances of one lab file are two rows, each with its own name and
+    directory.
     The state is `running`, `stopped`, `stopping` or `failed`. `stopped`
     means the daemon is up with no machine running, as after `vmlab vm stop`
     of every machine or an `up` that failed; a full `vmlab down` or
@@ -180,23 +189,31 @@ page cmd_lab {
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`<LAB>`" | "The lab's name. The `vmlab.wcl` in this directory must declare it." |
+      | "`<LAB>`" | "The name the lab runs under now, as `vmlab lab list` shows it. The `vmlab.wcl` in this directory must declare the same lab: `<LAB>` is its declared name or an instance of it." |
       | "`--from <DIR>`" | "The lab root to move from. Defaults to the directory the lab is registered from; required once the name is released, for example after a full `vmlab down` there." |
       | "`-h`, `--help`" | "Print help." |
   }
 
   p <<DOC
     Hands a stopped lab, with its provisioned machines, to another
-    directory that declares the same lab name, typically another git
-    worktree of the same repository. A lab name is unique per host, so the
-    worktrees share one lab, and this moves it to the one you work in now
-    without building its machines again. Run it in the directory that should
-    own the lab.
+    directory whose lab file declares the same lab, typically another git
+    worktree of the same repository. It moves the lab to the directory you
+    work in now without building its machines again. Run it in the
+    directory that should own the lab.
+  DOC
+
+  p <<DOC
+    The two directories may run the lab under different names: the main
+    worktree's `demo` moves into a linked worktree `feat-x` and arrives as
+    `demo-feat-x`, the name that directory runs it under (see
+    [instances](guide_architecture)). What must match is the lab the two
+    files declare. The working data moves as it is, so the machines keep
+    their disks, volumes and recorded MAC addresses under the new name.
   DOC
 
   p <<DOC
     It refuses, and changes nothing, when this directory's lab file declares
-    another name, when a machine of the lab is running (`vmlab down` there
+    another lab, when a machine of the lab is running (`vmlab down` there
     first), or when this directory's working data already holds machine
     data: a clone, a container's disk or a named volume (`vmlab destroy`
     here first). Working data without any, such as SMB state left by an
@@ -225,15 +242,17 @@ page cmd_lab {
     Folders the lab points machines at do not move: shares, container bind
     mounts and `@dev` workspaces belong to the checkout. The verb lists each
     one that does not exist under this directory, such as a media folder git
-    ignores. Last, it registers the lab from this directory and prints
-    `lab "<name>" now lives in <dir> — run `vmlab validate`, then
-    `vmlab up``.
+    ignores. Last, it registers the lab from this directory under this
+    directory's name and prints `lab "<name>" now lives in <dir> — run
+    `vmlab validate`, then `vmlab up``, with `as "<new name>"` after the
+    directory when the name changed.
   DOC
 
   p <<DOC
-    There is no `--copy`. Both directories declare one lab name, and a name
-    is registered from one directory at a time, so a copy could not run
-    beside the original without renaming one of the labs.
+    There is no `--copy`. A name is registered from one directory at a time,
+    so a copy could not run beside the original under the same name. To run
+    the lab twice, run the second directory as an instance and let it build
+    its own machines.
   DOC
 
   h2 "Examples"
@@ -254,13 +273,16 @@ SRC
   p "Free the host of a lab you started from another directory:"
   code sh { source = "vmlab lab destroy peer-b" }
 
-  p "Take over the lab another worktree built, from the worktree you work in now:"
+  p "Take over the lab the main worktree built, from a linked worktree you work in now:"
   code sh { source = <<'SRC'
 cd ~/src/app-feature
 vmlab lab move app-lab --from ~/src/app-main
 vmlab up
 SRC
   }
+
+  p "Stop the instance a linked worktree `feat-x` runs, from any directory:"
+  code sh { source = "vmlab lab stop demo-feat-x" }
 
   h2 "Exit status"
 
@@ -274,7 +296,7 @@ SRC
     directory. `move` exits 5 when a machine or process of the lab is
     running, when this directory already holds machine data, or when the
     lab is registered from a directory other than `--from`; it exits 2 when
-    a lab file declares another name, and 1 when the lab is not registered
+    a lab file runs under another name, and 1 when the lab is not registered
     and no `--from` is given. A usage error exits 2.
   DOC
 }

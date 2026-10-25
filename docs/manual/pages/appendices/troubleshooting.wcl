@@ -6,7 +6,7 @@ page apx_troubleshooting {
   chapter_header "Troubleshooting" {
     kicker       = "Appendices · reference"
     reading_time = "18 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-25"
     version      = "vmlab 0.9"
   }
 
@@ -472,7 +472,12 @@ MSG
     rest of the lab still comes up, and `vmlab logs` carries a
     `forward.skipped` event in the same `{what}: {why}` shape, for example
     `"vm1": forward: cannot listen on host 0.0.0.0:14330: Address already in use (os error 98)`.
-    Change the `host_port` or free the port.
+    Change the `host_port` or free the port. Two
+    [instances](guide_architecture) of one lab file declare the same fixed
+    `host_port`, so the second instance's forward fails this way while the
+    first holds the port. Omit `host_port`, or a `port {}`'s `host`, and each
+    instance binds a free port of its own, which
+    [vmlab status](cmd_status) shows marked `(auto)`.
   DOC
   p <<DOC
     A forward that did install leaves a `forward.installed` event naming its
@@ -730,14 +735,17 @@ MSG
   DOC
 
   h2 "The lab name is already registered"
-  code text { source = "lab `{name}` is already registered from {root} — run `vmlab down` there (or `vmlab lab stop {name}` from anywhere) to release it, or rename this lab" }
+  code text { source = "lab `{name}` is already registered from {root} — run `vmlab down` there (or `vmlab lab stop {name}` from anywhere) to release it, or run this directory as its own instance with `--instance <id>`" }
   p <<DOC
-    A [lab](guide_lab_file)'s declared name is its host-global runtime
+    The name a [lab](guide_lab_file) runs under is its host-global runtime
     identity, not its directory (ADR-0011). The supervisor compares the
     requested lab root with the registered one before it hands out a socket
     or starts a daemon, and a different root is a `conflict` in every
-    registry state, so the command exits 5. This is what two clones or
-    worktrees of the same repository hit when both declare `lab "demo"`.
+    registry state, so the command exits 5. This is what two clones of the
+    same repository hit when both declare `lab "demo"` and neither runs as
+    an [instance](guide_architecture). Two linked git worktrees do not hit
+    it, because each runs under `<declared>-<worktree>`, unless one of them
+    passes `--instance ""` while the other runs the declared name.
   DOC
   p <<DOC
     `status`, `down`, `destroy`, `console` and `dev sync` refuse the same
@@ -749,8 +757,16 @@ MSG
     directory the message names, or with `vmlab lab stop <name>` from any
     directory, which is also the way out when that directory no longer
     exists. Both stop the lab's machines, keep its clones and have the
-    supervisor reap its daemon. Or change the `lab` name in one of the two
-    files.
+    supervisor reap its daemon. Or run this directory's lab as an instance,
+    with `--instance <ID>` or `VMLAB_INSTANCE`, so it registers under a name
+    of its own. Or change the `lab` name in one of the two files.
+  DOC
+  p <<DOC
+    After upgrading to a vmlab with instances, a lab already running from a
+    linked worktree under its declared name keeps that name, while commands
+    in the worktree now resolve to `<declared>-<worktree>` and report it as
+    not running. Release the old one with `vmlab lab stop <declared>`, or
+    pass `--instance ""` to address it as before.
   DOC
   p <<DOC
     To carry the provisioned machines across instead of building them
@@ -758,7 +774,9 @@ MSG
     lab. It refuses while a machine runs, releases the name itself, moves
     the working data and registers the lab from there (see
     [vmlab lab move](cmd_lab)). Pass `--from <dir>` when the name has
-    already been released.
+    already been released. The lab arrives under the name the new directory
+    runs it as, so the main worktree's `demo` moved into a linked worktree
+    `feat-x` becomes `demo-feat-x`.
   DOC
 
   h2 "The eBPF fast path is unavailable"

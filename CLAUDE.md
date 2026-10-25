@@ -101,6 +101,11 @@ Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
   `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005).
+- `instance.rs` — lab instances (ADR-0011's amendment, PRD §3.2): the
+  effective name `<declared>-<instance>` a directory runs its lab under, from
+  `--instance`, `VMLAB_INSTANCE` or the linked git worktree, slugged to a DNS
+  label; the CLI applies it on load, and the lab daemon `adopt`s the name it
+  is started with.
 - `dev/` — dev machines (§19.1): who carries `@dev`, which one is the lab's
   default, and the `@dev` > profile > floor resolution of its arguments —
   deliberately separate from the hardware resolver ADR-0008 owns. `select.rs`

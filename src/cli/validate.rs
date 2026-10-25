@@ -189,9 +189,12 @@ pub fn gpu_warnings(
 pub fn validate_current() -> Result<crate::config::LabFile> {
     let cwd = std::env::current_dir()?;
     let root = crate::paths::find_lab_root(&cwd)?;
-    let file = config::load_lab_root(&root).map_err(miette_to_anyhow)?;
+    let mut file = config::load_lab_root(&root).map_err(miette_to_anyhow)?;
+    // Validation checks the name the file declares; the instance this
+    // directory runs as (crate::instance) is applied after it.
     let issues = config::validate(&file, &HostContext::new()?);
     if issues.is_empty() {
+        crate::instance::apply(&mut file, &root)?;
         return Ok(file);
     }
     let path = root.join(crate::paths::LAB_FILE);

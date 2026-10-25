@@ -3,14 +3,15 @@ page cmd_status {
   chapter_header "vmlab status" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-25"
     version      = "vmlab 0.31"
   }
 
   p <<DOC
     `vmlab status` reports what every machine in the current
     [lab](guide_lab_file) is doing, its IP address, the state of each
-    [segment](guide_networking), and any download in flight. It reads the lab
+    [segment](guide_networking), every installed port forward, and any
+    download in flight. It reads the lab
     daemon's status projection and never starts anything.
   DOC
 
@@ -33,8 +34,17 @@ page cmd_status {
     another directory, the lab running under it is that directory's, not
     this one's, and `status` refuses with the same `conflict` as `up`,
     naming the other directory (see
-    [The lab name is already registered](apx_troubleshooting)). Otherwise it prints up to four sections, each omitted when
+    [The lab name is already registered](apx_troubleshooting)). Otherwise it prints up to five sections, each omitted when
     empty.
+  DOC
+
+  p <<DOC
+    `<name>` is the name this directory's lab runs under: the declared name,
+    or `<declared>-<instance>` when it runs as an
+    [instance](guide_architecture), as it does by default in a linked git
+    worktree. The same lab file running from another worktree is a different
+    lab, so `status` here neither shows it nor refuses because of it. Use
+    [vmlab lab list](cmd_lab) to see every instance on the host.
   DOC
 
   h3 "Machines"
@@ -120,6 +130,22 @@ page cmd_status {
     (the cross-host trunk target and whether it is `up` or `down`).
   DOC
 
+  h3 "Forwards"
+
+  p <<DOC
+    One row per installed port forward, segment `forward {}` and container
+    `port {}` alike: `FORWARD` (the machine), `HOST` (the host port actually
+    listening), `GUEST` (`ip:port`, the lease it was installed against) and
+    `PROTO`. A port vmlab picked because the declaration left it out is marked
+    `(auto)`, as in `41234 (auto)`; this table is where an automatic port is
+    read from. With `--json` the lab carries the same as its `forwards` list,
+    one object per forward with `machine`, `segment`, `host_port`, `guest`,
+    `proto` and `auto`. An automatic port stays the same across machine
+    restarts while the lab daemon runs, and may change after a full
+    [vmlab down](cmd_down) and `up`. See
+    [Automatic host ports](ref_lab).
+  DOC
+
   h3 "Downloads"
 
   p <<DOC
@@ -142,11 +168,18 @@ lab "ad-lab"
 
   SEGMENT SUBNET         GATEWAY    NAT/DHCP DROPPED    PEER
   corp    10.10.0.0/24   10.10.0.1  on/on    0          -
+
+  FORWARD HOST         GUEST           PROTO
+  dc01    13389        10.10.0.10:3389 tcp
+  dc01    41234 (auto) 10.10.0.10:80   tcp
 SRC
   }
 
   p "Show the raw state behind each label:"
   code sh { source = "vmlab status -v" }
+
+  p "Read an automatic port from a script:"
+  code sh { source = "vmlab status --json | jq '.forwards[] | select(.machine == \"dc01\" and .auto) | .host_port'" }
 
   p "Check which render server a Venus VM's QEMU was started with:"
   code sh { source = "vmlab status --json | jq '.machines[] | select(.name == \"gl01\") | .qemu_env'" }

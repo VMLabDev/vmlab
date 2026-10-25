@@ -158,10 +158,8 @@ pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<()> {
 /// is launched directly; a TCP-only viewer runs in a detached bridge so it
 /// survives `up` exiting. Prints how to attach when no viewer is found.
 pub fn open_for(lab: &str, vm: &str) -> Result<()> {
-    let sock = crate::paths::lab_runtime_dir(lab)
-        .join("vms")
-        .join(vm)
-        .join("vnc.sock");
+    let sock =
+        crate::paths::machine_runtime_dir(lab, crate::paths::MachineKind::Vm, vm).join("vnc.sock");
     if !sock.exists() {
         return Ok(());
     }

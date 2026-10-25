@@ -280,7 +280,7 @@ fn extract_sinkhole(b: &Block, issues: &mut IssueList) -> Option<SinkholeRule> {
 fn extract_forward(b: &Block, issues: &mut IssueList) -> Option<Forward> {
     let mut r = Reader::new(b, issues);
     let span = r.span();
-    let host_port = r.required("host_port", |r, n| r.port(n))?.value;
+    let host_port = r.port("host_port").unspan();
     let to = r.required_string("to")?;
     let Some((vm, port_s)) = to.value.split_once(':') else {
         r.issue_at(
@@ -855,7 +855,7 @@ fn extract_volume(b: &Block, issues: &mut IssueList) -> Option<Volume> {
 fn extract_port(b: &Block, issues: &mut IssueList) -> Option<PortMap> {
     let mut r = Reader::new(b, issues);
     let span = r.span();
-    let host_port = r.required("host", |r, n| r.port(n))?.value;
+    let host_port = r.port("host").unspan();
     let container_port = r.required("container", |r, n| r.port(n))?.value;
     let proto = r.keyword("proto", PROTOS).unspan().unwrap_or(Proto::Tcp);
     Some(PortMap {
@@ -1175,8 +1175,8 @@ mod tests {
                 "missing required field `dest`",
             ),
             (
-                "container \"c\" { image = \"nginx\" port { container = 80 } }",
-                "missing required field `host`",
+                "container \"c\" { image = \"nginx\" port { host = 8080 } }",
+                "missing required field `container`",
             ),
         ];
         for (body, expected) in cases {

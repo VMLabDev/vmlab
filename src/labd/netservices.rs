@@ -245,14 +245,16 @@ impl SegmentServices {
 
     /// Spawn a host→guest port forward (PRD §9.8). Requires NAT on the
     /// segment (the engine originates the guest-side TCP/UDP). Returns a
-    /// forward id usable with [`SegmentServices::remove_forward`].
+    /// forward id usable with [`SegmentServices::remove_forward`], and the
+    /// host port actually bound (the kernel's pick when `host_addr` asks for
+    /// port 0).
     pub fn add_forward(
         &self,
         host_addr: std::net::SocketAddr,
         guest_ip: std::net::Ipv4Addr,
         guest_port: u16,
         proto: crate::config::model::Proto,
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, u16), String> {
         let engine = self
             .nat
             .as_ref()
@@ -260,7 +262,7 @@ impl SegmentServices {
             .clone();
         use crate::config::model::Proto;
         use crate::net::nat::PortForwarder;
-        let handle = match proto {
+        let (handle, bound) = match proto {
             Proto::Udp => PortForwarder::spawn_udp_forward(host_addr, engine, guest_ip, guest_port),
             // "both" forwards TCP (the common case); a second call can add UDP.
             _ => PortForwarder::spawn_tcp_forward(host_addr, engine, guest_ip, guest_port),
@@ -270,7 +272,7 @@ impl SegmentServices {
             .next_forward_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.forwards.lock_recover().push((id, handle));
-        Ok(id)
+        Ok((id, bound.port()))
     }
 
     /// Tear down a forward spawned by [`Self::add_forward`]. Declared
@@ -442,13 +444,14 @@ mod tests {
         let (services, _gw, _guest) = segment(true);
         for _ in 0..50 {
             let addr = free_port();
-            let first = services
+            let (first, _) = services
                 .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
                 .unwrap();
             assert!(services.remove_forward(first).await);
-            let second = services
+            let (second, bound) = services
                 .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
                 .expect("the removed forward's port is free again");
+            assert_eq!(bound, addr.port());
             tokio::net::TcpStream::connect(addr)
                 .await
                 .expect("the re-installed forward is listening");
@@ -467,5 +470,21 @@ mod tests {
             .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
             .expect_err("the port is taken");
         assert!(err.contains(&addr.port().to_string()), "{err}");
+    }
+
+    /// Port 0 asks the kernel for a free port, and the forward reports the
+    /// one it got, listening there.
+    #[tokio::test]
+    async fn a_forward_on_port_zero_reports_its_bound_port() {
+        let (services, _gw, _guest) = segment(true);
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (id, bound) = services
+            .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
+            .unwrap();
+        assert_ne!(bound, 0);
+        tokio::net::TcpStream::connect(("127.0.0.1", bound))
+            .await
+            .expect("the forward listens on the port it reported");
+        services.remove_forward(id).await;
     }
 }

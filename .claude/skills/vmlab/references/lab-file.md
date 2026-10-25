@@ -31,7 +31,8 @@ or with two, is rejected. It may also declare `template {}` blocks beside the
 lab (see templates.md).
 
 The lab name is a DNS label, because it appears in every machine's DNS name, and
-it is the lab's identity on the host (see architecture.md).
+it is the lab's identity on the host, or `<name>-<instance>` is when the directory
+runs the lab as an instance (see architecture.md, "Lab instances").
 
 ```wcl
 # vmlab.wcl
@@ -205,7 +206,8 @@ container "dev01" {
 ## lab {}
 
 The one lab a file declares. The inline label is the lab's name, which becomes
-part of every guest hostname and is unique on the host.
+part of every guest hostname and is unique on the host. A directory that runs the
+lab as an instance runs it as `<name>-<instance>` instead.
 
 ```wcl
 lab "<name>" {

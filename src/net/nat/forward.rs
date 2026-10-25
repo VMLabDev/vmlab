@@ -40,17 +40,18 @@ impl PortForwarder {
     ///
     /// The bind happens here, before the task is spawned, so a port that is
     /// already taken is the caller's error to report rather than a warning
-    /// inside a task nobody awaits.
+    /// inside a task nobody awaits. Returns the address actually bound,
+    /// which differs from `listen` when it asks for port 0.
     pub fn spawn_tcp_forward(
         listen: SocketAddr,
         engine: Arc<NatEngine>,
         guest_ip: Ipv4Addr,
         guest_port: u16,
-    ) -> std::io::Result<JoinHandle<()>> {
+    ) -> std::io::Result<(JoinHandle<()>, SocketAddr)> {
         let listener = TcpListener::from_std(bind_tcp(listen)?)?;
-        Ok(tokio::spawn(Self::serve_tcp(
-            listener, engine, guest_ip, guest_port,
-        )))
+        let bound = listener.local_addr()?;
+        let handle = tokio::spawn(Self::serve_tcp(listener, engine, guest_ip, guest_port));
+        Ok((handle, bound))
     }
 
     /// As [`Self::spawn_tcp_forward`] but on an already-bound listener
@@ -93,13 +94,13 @@ impl PortForwarder {
         engine: Arc<NatEngine>,
         guest_ip: Ipv4Addr,
         guest_port: u16,
-    ) -> std::io::Result<JoinHandle<()>> {
+    ) -> std::io::Result<(JoinHandle<()>, SocketAddr)> {
         let sock = std::net::UdpSocket::bind(listen)?;
         sock.set_nonblocking(true)?;
         let sock = UdpSocket::from_std(sock)?;
-        Ok(tokio::spawn(Self::serve_udp(
-            sock, engine, guest_ip, guest_port,
-        )))
+        let bound = sock.local_addr()?;
+        let handle = tokio::spawn(Self::serve_udp(sock, engine, guest_ip, guest_port));
+        Ok((handle, bound))
     }
 
     /// As [`Self::spawn_udp_forward`] but on an already-bound socket.

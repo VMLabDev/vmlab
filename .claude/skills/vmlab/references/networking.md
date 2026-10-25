@@ -421,18 +421,36 @@ into the segment, which is the path for RDP, SSH and web UIs from the host.
 
 ```wcl
 forward { host_port = 13389 to = "dc01:3389" proto = "tcp" }
+forward { to = "dc01:80" }   # automatic host port
 ```
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `host_port` | i64 | required | Host port to listen on, 1 to 65535. Unique across the lab. |
+| `host_port` | i64 | automatic | Host port to listen on, 1 to 65535. Unique across the lab. Omitted: vmlab picks a free port when it installs the forward. |
 | `to` | utf8 | required | Target as `vm:port`. The machine must be declared in this lab. |
 | `proto` | utf8 | `tcp` | Protocol: `tcp`, `udp` or `both`. |
 
 Validation requires `to` to have the form `name:port` with a numeric port, the
-name to be a VM or container in this lab, and `host_port` to be unused by every
-other `forward` and every container `port {}` in the lab, since both compile
-into the same forward machinery.
+name to be a VM or container in this lab, and a declared `host_port` to be
+unused by every other `forward` and every container `port {}` in the lab, since
+both compile into the same forward machinery. Omitted host ports are never
+duplicates.
+
+### Automatic host ports
+
+WCL has no int-or-string type, so there is no `host_port = "auto"`: leave the
+field out. The lab daemon binds a free port when it installs the forward (when
+the target machine is ready and has a lease) and records the port it got.
+`vmlab status` shows it in the `FORWARD HOST GUEST PROTO` table, marked `(auto)`;
+`vmlab status --json` carries it in the lab's `forwards` list (`host_port`, with
+`auto: true`); the `forward.installed` event names it too.
+
+The port is stable while that lab daemon runs: a machine restart re-installs its
+forwards against the new lease and an automatic forward asks for the port it held
+before, taking a fresh one only if something else has bound that port meanwhile.
+It may change after a full `vmlab down` and `up` (a full down ends the lab daemon) or any other daemon restart. Use automatic ports when two lab
+instances of one file run side by side (two git worktrees, `--instance`): a fixed
+`host_port` makes the second instance's forward fail to bind.
 
 A forward rides the segment's NAT engine, so the segment needs `nat = true`.
 Validation does not check this: on a segment without NAT the forward is not

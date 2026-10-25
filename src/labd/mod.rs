@@ -87,14 +87,11 @@ pub fn run(lab: String, root: PathBuf) -> Result<()> {
 }
 
 async fn run_async(lab: String, root: PathBuf) -> Result<()> {
-    let config = crate::config::load_lab_root(&root)
+    let mut config = crate::config::load_lab_root(&root)
         .map_err(|e| anyhow::anyhow!("cannot load lab config: {e}"))?;
-    anyhow::ensure!(
-        config.lab.name == lab,
-        "lab file at {} defines \"{}\", not \"{lab}\"",
-        root.display(),
-        config.lab.name
-    );
+    // The CLI chose the name, an instance of the declared one when this
+    // directory runs as one (see crate::instance); everything below keys on it.
+    crate::instance::adopt(&mut config, &lab, &root)?;
 
     // The broadcast channel is shared between the protocol server (which
     // fans events out to subscribers) and the event log.

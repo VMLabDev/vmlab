@@ -62,6 +62,12 @@ pub enum LogFormat {
 #[derive(Parser)]
 #[command(name = "vmlab", version, about = "Single-host VM lab orchestrator")]
 pub struct Cli {
+    /// Run this directory's lab as instance ID, named `<lab>-<ID>`, so two
+    /// directories with the same lab file (two git worktrees) can run at
+    /// once. Default: `$VMLAB_INSTANCE`, else the linked git worktree's
+    /// name; an empty ID runs the lab under its declared name.
+    #[arg(long, global = true, value_name = "ID")]
+    instance: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -655,6 +661,9 @@ pub struct As {
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(instance) = cli.instance.clone() {
+        crate::instance::set_flag(instance);
+    }
     // The daemons the binary hosts keep std's panic: a daemon whose stdout
     // has gone must not die of it.
     let person_facing = !matches!(

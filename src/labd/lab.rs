@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
-use super::forward_plan::{self, ForwardPlan, ForwardRule, HostBinding};
+use super::forward_plan::{self, ForwardPlan, ForwardRule, InstalledForward};
 use super::machine::Machine;
 use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
@@ -50,10 +50,12 @@ pub struct LabRuntime {
     /// SMB server for the lab's shares (PRD §7.5); `None` until `up` starts
     /// it (only when some VM declares shares).
     pub smb: Mutex<Option<crate::smb::LabSmb>>,
-    /// Forward ids installed for each machine — segment `forward {}` blocks
+    /// Forwards installed for each machine — segment `forward {}` blocks
     /// and container `port {}` blocks alike — removed and re-installed when
     /// a restart brings a new lease, so a forward never points at a stale IP.
-    machine_forwards: Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
+    /// Each records the port it bound, so an automatic one asks for the same
+    /// port again on re-install, and `vmlab status` can say where it is.
+    machine_forwards: Mutex<std::collections::HashMap<String, Vec<InstalledForward>>>,
     /// Kept for post-pull re-resolution (deferred templates fold their meta
     /// into the hardware resolution only once pulled).
     profiles: ProfileSet,
@@ -1709,13 +1711,22 @@ impl LabRuntime {
         observed
     }
 
-    /// Install one planned forward, returning its id.
+    /// Install one planned forward, returning its id and the host port it
+    /// bound.
     ///
     /// The single executor behind every forward the lab installs, whether it
     /// came from a segment `forward {}` or a container `port {}`. Priming the
     /// NAT engine with the lease MAC happens for both: a machine that never
     /// originates egress is otherwise unreachable.
-    async fn install_forward(&self, net: &LabNetwork, rule: &ForwardRule) -> Result<u64, String> {
+    ///
+    /// `ports` are tried in order ([`forward_plan::bind_candidates`]): a
+    /// fixed rule's one port, or an automatic rule's previous port then 0.
+    async fn install_forward(
+        &self,
+        net: &LabNetwork,
+        rule: &ForwardRule,
+        ports: &[u16],
+    ) -> Result<(u64, u16), String> {
         let services = net
             .segments
             .get(&rule.segment)
@@ -1729,9 +1740,18 @@ impl LabRuntime {
         if let Some(mac) = rule.prime_mac {
             services.learn_mac(rule.guest_ip, mac);
         }
-        let HostBinding::Port(port) = rule.host;
-        let host_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
-        services.add_forward(host_addr, rule.guest_ip, rule.guest_port, rule.proto)
+        let mut last = String::from("no host port to bind");
+        for &port in ports {
+            let host_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+            match services.add_forward(host_addr, rule.guest_ip, rule.guest_port, rule.proto) {
+                Ok(installed) => return Ok(installed),
+                Err(e) => {
+                    tracing::debug!("{}: {e}; trying the next candidate", rule.machine);
+                    last = e;
+                }
+            }
+        }
+        Err(last)
     }
 
     /// Announce everything a plan left out, and every host port it found
@@ -2000,24 +2020,38 @@ impl LabRuntime {
         let net = self.network.lock().await;
         let mut tracked = self.machine_forwards.lock().await;
         for (machine, rules) in installable {
-            // Drop this machine's forwards from a previous run/lease.
-            for (seg, id) in tracked.remove(machine).unwrap_or_default() {
-                if let Some(s) = net.segments.get(&seg).and_then(|s| s.services.as_ref()) {
-                    s.remove_forward(id).await;
+            // Drop this machine's forwards from a previous run/lease. Their
+            // listeners are closed by the time `remove_forward` returns, so
+            // an automatic rule can ask for its old port straight back.
+            let previous = tracked.remove(machine).unwrap_or_default();
+            for old in &previous {
+                if let Some(s) = net
+                    .segments
+                    .get(&old.key.segment)
+                    .and_then(|s| s.services.as_ref())
+                {
+                    s.remove_forward(old.id).await;
                 }
             }
+            let candidates = forward_plan::bind_candidates(&previous, &rules);
             let mut installed = Vec::new();
-            for rule in rules {
+            for (rule, ports) in rules.into_iter().zip(candidates) {
                 let what = format!("\"{machine}\": {}", rule.source.describe());
-                let HostBinding::Port(host_port) = rule.host;
-                match self.install_forward(&net, rule).await {
-                    Ok(id) => {
-                        installed.push((rule.segment.clone(), id));
+                match self.install_forward(&net, rule, &ports).await {
+                    Ok((id, host_port)) => {
+                        installed.push(InstalledForward {
+                            key: rule.key(),
+                            id,
+                            host_port,
+                            auto: rule.host.is_auto(),
+                            guest_ip: rule.guest_ip,
+                        });
                         self.events.emit(
                             "forward.installed",
                             json!({
                                 "what": what,
                                 "host_port": host_port,
+                                "auto": rule.host.is_auto(),
                                 "guest": format!("{}:{}", rule.guest_ip, rule.guest_port),
                             }),
                         );
@@ -2566,6 +2600,7 @@ impl LabRuntime {
                 },
             });
         }
+        let forwards = self.forward_statuses().await;
         // In-flight downloads, so a page load mid-pull still shows progress
         // (the events only reach clients that were already connected).
         LabStatus {
@@ -2575,7 +2610,33 @@ impl LabRuntime {
             provisioned: self.provisioned(),
             pulls: self.pulls.lock_recover().snapshot(),
             config_digest: crate::config::digest(&self.config),
+            forwards,
         }
+    }
+
+    /// The installed forwards as `status` reports them: by machine, then in
+    /// the order they were installed.
+    async fn forward_statuses(&self) -> Vec<crate::status::ForwardStatus> {
+        let tracked = self.machine_forwards.lock().await;
+        let mut machines: Vec<&String> = tracked.keys().collect();
+        machines.sort();
+        machines
+            .into_iter()
+            .flat_map(|m| &tracked[m])
+            .map(|f| crate::status::ForwardStatus {
+                machine: f.key.machine.clone(),
+                segment: f.key.segment.clone(),
+                host_port: f.host_port,
+                guest: format!("{}:{}", f.guest_ip, f.key.guest_port),
+                proto: match f.key.proto {
+                    crate::config::model::Proto::Tcp => "tcp",
+                    crate::config::model::Proto::Udp => "udp",
+                    crate::config::model::Proto::Both => "both",
+                }
+                .to_string(),
+                auto: f.auto,
+            })
+            .collect()
     }
 
     /// Whether this lab has materialised anything a destroy would remove:

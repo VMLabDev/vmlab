@@ -1,6 +1,6 @@
 # ADR-0011: A lab name is its host-global runtime identity
 
-- **Status**: Accepted
+- **Status**: Accepted, amended 2026-10-25
 - **Date**: 2026-08-04
 - **Related**: [ADR-0003](0003-decisions-are-values-computed-before-execution.md),
   [ADR-0007](0007-the-wire-protocol-carries-a-typed-vocabulary.md)
@@ -46,3 +46,37 @@ rejected.
 
 - Any future host-global surface that treats a lab name as a display label
   rather than the identity established here.
+
+## Amendment (2026-10-25): lab instances
+
+The decision stands: the name a lab runs under is its host-global runtime
+identity, and the supervisor still refuses a second root for a registered
+name. What changed is where that name can come from. A directory may run its
+lab as an **instance**, under the effective name `<declared>-<instance>`
+(`src/instance.rs`). The CLI picks the instance from `--instance <ID>`, then
+`VMLAB_INSTANCE`, then the name of the linked git worktree the lab directory
+is in; an empty flag or variable means none, and a main worktree, a submodule
+or no git has none. Every name-keyed resource follows the effective name:
+registry entry, runtime and state directories, sockets, process markers,
+generated MACs, guest DNS names and `[lab/]vm` references. The lab daemon
+accepts only the declared name or `<declared>-<something>`.
+
+So the **Given up** point no longer holds for worktrees: two linked worktrees
+of one repository resolve to distinct effective names and run at once with no
+change to either lab file. Two clones outside git worktrees still need an
+instance named by hand. Two directories that resolve to the same effective
+name still conflict exactly as above, for example `--instance ""` in a linked
+worktree while the main worktree runs the declared name.
+
+The instance renames the lab, not its file content. These still collide
+between two instances of one lab file, because they are written in the file:
+
+- a fixed `host_port` in a segment `forward {}` or a container `port {}`: the
+  second instance's bind fails;
+- an explicit `nic { mac }` on a global segment;
+- a GPU `passthrough` device;
+- template builds declared in the lab file.
+
+Global segments (`global = true`) are shared by design, and both instances
+join the same one. Lab-local segment subnets do not collide, because each
+lab's network runs in its own userspace process.

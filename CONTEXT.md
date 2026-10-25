@@ -14,15 +14,23 @@ when the two disagree, this file wins.
 
 **Lab**:
 A set of machines plus the virtual networks connecting them, declared in a
-`lab {}` block in `vmlab.wcl`. Its declared name identifies it uniquely among
-the labs registered on one host.
+`lab {}` block in `vmlab.wcl`. The name it runs under, its declared name or a
+lab instance's effective name, identifies it uniquely among the labs
+registered on one host.
 _Avoid_: environment, project, stack
+
+**Lab instance**:
+A lab file run under the effective name `<declared>-<instance>` rather than its
+declared name, so one lab file can run from two directories at once. The
+instance comes from `--instance`, `VMLAB_INSTANCE` or the linked git worktree
+the lab is in (ADR-0011's amendment).
+_Avoid_: copy, clone (a clone is a VM's disk)
 
 **Machine**:
 Anything a lab boots, attaches to a segment, and drives through the agent — a
 VM or a container. The unit that `depends_on`, `up` waves and `machine.*`
 operations address.
-_Avoid_: node, instance, workload
+_Avoid_: node, instance (a lab instance is a lab), workload
 
 **VM**:
 A machine booted from a template's linked clone, with its own firmware, disks

@@ -170,8 +170,8 @@ type DnsRecord {
 // Host→guest port forward.
 @block("forward")
 type Forward {
-  @doc("Host port to listen on (1–65535); unique across the lab (required)")
-  @range(1, 65535) host_port: i64
+  @doc("Host port to listen on (1–65535), unique across the lab; omitted = vmlab picks a free port when the forward is installed, shown by `vmlab status`")
+  @range(1, 65535) host_port: i64?
   @doc("Target as `vm:port`; the VM must be declared (required)")
   to: utf8
   @doc("Protocol: `tcp` (default) | `udp` | `both`")
@@ -414,8 +414,8 @@ type Volume {
 // Host→container port forward (compiles into the segment forward machinery).
 @block("port")
 type PortMap {
-  @doc("Host port to listen on (1–65535); unique across the lab (required)")
-  @range(1, 65535) host: i64
+  @doc("Host port to listen on (1–65535), unique across the lab; omitted = vmlab picks a free port when the forward is installed, shown by `vmlab status`")
+  @range(1, 65535) host: i64?
   @doc("Container port to forward to (1–65535) (required)")
   @range(1, 65535) container: i64
   @doc("Protocol: `tcp` (default) | `udp` | `both`")

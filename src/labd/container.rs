@@ -66,9 +66,7 @@ impl ContainerDirs {
             local: crate::paths::lab_local_dir(lab_root)
                 .join("containers")
                 .join(name),
-            run: crate::paths::lab_runtime_dir(lab)
-                .join("containers")
-                .join(name),
+            run: crate::paths::machine_runtime_dir(lab, crate::paths::MachineKind::Container, name),
             logs: crate::paths::state_dir()
                 .join("labs")
                 .join(lab)

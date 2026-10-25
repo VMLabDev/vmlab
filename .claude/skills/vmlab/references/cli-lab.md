@@ -7,6 +7,14 @@ Per-machine verbs are in cli-machine.md; template verbs in cli-template.md.
 Exit codes shared across verbs: 0 success, 1 `failed`, 2 usage error,
 3 reboot still required, 4 `not_found`, 5 `conflict`, 6 `unsupported`.
 
+Every `vmlab` command takes the global `--instance <ID>`: run this directory's
+lab as the instance `<declared>-<ID>`, so one lab file can run from two
+directories at once. Without it, `VMLAB_INSTANCE` applies, then the name of the
+linked git worktree the lab is in; `--instance ""` (or an empty
+`VMLAB_INSTANCE`) runs the lab under its declared name. Every verb here that
+finds its lab from the current directory uses that effective name. See
+architecture.md ("Lab instances").
+
 ## vmlab up
 
 Brings the lab in the current directory to life: validates the lab file, starts
@@ -198,7 +206,9 @@ can lose unflushed writes.
 A full `down` (no machine names) also stops the bundled SMB server, so it does not
 hold its port against the next `up`, then has the supervisor reap the lab daemon.
 That releases the lab's name: `lab list` drops it, `status` says `not running`, and
-another directory declaring the same `lab` name (a second worktree) can `up` it.
+another directory whose lab runs under the same name (a second clone) can `up` it.
+A linked git worktree runs its lab as an instance under a name of its own and does
+not need this release.
 Clones, snapshots and `.vmlab/` stay; the next `up` starts a fresh daemon that reads
 `vmlab.wcl` as it is then. A partial `down` keeps the daemon and shares for the
 machines still running. `vmlab lab stop` is a full `down` by name from anywhere;
@@ -228,7 +238,7 @@ A machine that fails to stop, or a lab directory that cannot be found, exits 1
 ## vmlab status
 
 Reports what every machine in the current lab is doing, its IP address, the state
-of each segment, and any download in flight. It reads the lab daemon's status
+of each segment, every installed port forward, and any download in flight. It reads the lab daemon's status
 projection and never starts anything.
 
 ```sh
@@ -246,7 +256,12 @@ vmlab status [OPTIONS]
 With no lab daemon running the verb prints `lab "<name>": not running` and exits 0
 (as after a full `down`). When the lab's name is registered from another directory,
 `status` refuses with the same exit-5 `conflict` as `up`, naming that directory.
-Otherwise it prints up to five sections, each omitted when empty.
+Otherwise it prints up to six sections, each omitted when empty.
+
+`<name>` is the name this directory's lab runs under: the declared name, or
+`<declared>-<instance>` in a linked git worktree or under `--instance`. The same lab
+file running from another worktree is a different lab; `vmlab lab list` shows them
+all.
 
 #### Machines
 
@@ -297,6 +312,18 @@ pairs, `DROPPED` (frames the switch shed on this segment; anything other than 0
 means the fabric is losing frames under load) and `PEER` (the cross-host trunk
 target and whether it is `up` or `down`).
 
+#### Forwards
+
+One row per installed port forward (segment `forward {}` and container `port {}`
+alike): `FORWARD` (the machine), `HOST` (the host port actually listening),
+`GUEST` (`ip:port`, the lease it was installed against) and `PROTO`. A port
+vmlab picked because the declaration omitted it is marked `(auto)`, as in
+`41234 (auto)`; this table is where an automatic port is read from. `--json`
+carries the same as the lab's `forwards` list, one object per forward with
+`machine`, `segment`, `host_port`, `guest`, `proto` and `auto`. An automatic port
+stays the same across machine restarts while the lab daemon runs; it may change
+after a full `down` and `up`, which restarts the daemon (see networking.md, `forward {}`).
+
 #### Recordings
 
 While any console recording is live, a `RECORDING` section follows the machines:
@@ -327,6 +354,10 @@ lab "ad-lab"
 
   SEGMENT SUBNET         GATEWAY    NAT/DHCP DROPPED    PEER
   corp    10.10.0.0/24   10.10.0.1  on/on    0          -
+
+  FORWARD HOST         GUEST           PROTO
+  dc01    13389        10.10.0.10:3389 tcp
+  dc01    41234 (auto) 10.10.0.10:80   tcp
 ```
 
 Show the raw state behind each label:
@@ -371,7 +402,8 @@ error; it is a deferred download.
 On success the verb prints one line,
 `ok: lab "<name>" — N vm(s), N container(s), N segment(s)`. On failure it prints
 every issue as a report with the offending text underlined in the source, and prints
-nothing else.
+nothing else. Validation checks the declared name; `<name>` is the name the lab runs
+under, `<declared>-<instance>` for an instance (as in a linked git worktree).
 
 Nothing here writes a file or probes a running machine. Whether an agent serves a
 feature depends on a live handshake, so `validate` never checks it.
@@ -507,7 +539,9 @@ A usage error exits 2.
 
 Manages running labs host-wide, by name rather than by the current directory. The
 supervisor keeps a registry of every lab daemon it started, and these verbs read it and
-act on the daemons behind it (see architecture.md).
+act on the daemons behind it (see architecture.md). A `<LAB>` argument is the name
+the lab runs under, the effective `<declared>-<instance>` for an instance, as
+`vmlab lab list` shows it.
 
 ```sh
 vmlab lab <COMMAND>
@@ -542,7 +576,8 @@ Prints one row per registered lab with `NAME`, `STATE` and `DIRECTORY`. The stat
 machine running, as after `vm stop` of every machine or a failed `up` (a full `down`
 or `lab stop` unlists the lab). `failed` means the daemon exited without
 being asked to. With no supervisor or an empty registry it prints `no running labs`. Under
-`--json` each entry carries `name`, `root`, `pid` and `state`.
+`--json` each entry carries `name`, `root`, `pid` and `state`. Two instances of one
+lab file are two rows, each with its own name and directory.
 
 ### vmlab lab info
 
@@ -656,6 +691,12 @@ Free the host of a lab started from another directory:
 
 ```sh
 vmlab lab destroy peer-b
+```
+
+Stop the instance a linked worktree `feat-x` runs, from any directory:
+
+```sh
+vmlab lab stop demo-feat-x
 ```
 
 ### Exit status

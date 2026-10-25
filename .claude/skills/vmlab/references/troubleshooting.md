@@ -208,7 +208,7 @@ Every forward in the lab is planned before `up` installs any. When two claim the
 | `needs a nic to reach it over` | The target machine has no `nic {}`, so no segment reaches it. |
 | `no lease — is it running and ready?` | The target has a NIC but no DHCP lease yet. The forward installs once the machine is up; `vmlab status` shows the lease. |
 
-A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort and reports in the lab log. Change the `host_port` or free the port.
+A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort and reports in the lab log. Change the `host_port` or free the port. Two instances of one lab file declare the same fixed `host_port`, so the second instance's forward fails this way while the first holds the port. Omit `host_port` (or a `port {}`'s `host`) and each instance binds a free port of its own, which `vmlab status` shows marked `(auto)`.
 
 ## Nested virtualisation is off on WSL 2
 
@@ -246,14 +246,16 @@ every lab daemon and its machines; disks and snapshots stay), then retry.
 ## The lab name is already registered
 
 ```
-lab `{name}` is already registered from {root} — run `vmlab down` there (or `vmlab lab stop {name}` from anywhere) to release it, or rename this lab
+lab `{name}` is already registered from {root} — run `vmlab down` there (or `vmlab lab stop {name}` from anywhere) to release it, or run this directory as its own instance with `--instance <id>`
 ```
 
-A lab's declared name is its host-global runtime identity, not its directory (ADR-0011). The supervisor compares the requested lab root with the registered one before it hands out a socket or starts a daemon, and a different root is a `conflict` in every registry state, so the command exits 5. This is what two clones or worktrees of the same repository hit when both declare `lab "demo"`.
+The name a lab runs under is its host-global runtime identity, not its directory (ADR-0011). The supervisor compares the requested lab root with the registered one before it hands out a socket or starts a daemon, and a different root is a `conflict` in every registry state, so the command exits 5. This is what two clones of the same repository hit when both declare `lab "demo"` and neither runs as an instance. Two linked git worktrees do not hit it, because each runs under `<declared>-<worktree>`, unless one passes `--instance ""` while the other runs the declared name.
 
 `status`, `down`, `destroy`, `console` and `dev sync` refuse the same way, so the second directory can neither read nor stop the first one's lab.
 
-Release the name with a full `vmlab down` (or `vmlab destroy`) in the directory the message names, or with `vmlab lab stop <name>` from any directory — also the way out when that directory no longer exists. Both stop the machines, keep the clones and reap the daemon. Or change the `lab` name in one of the two files. To carry the provisioned disks across, move `.vmlab/` after the release and before `vmlab up` in the new directory.
+Release the name with a full `vmlab down` (or `vmlab destroy`) in the directory the message names, or with `vmlab lab stop <name>` from any directory — also the way out when that directory no longer exists. Both stop the machines, keep the clones and reap the daemon. Or run this directory's lab as an instance, with `--instance <ID>` or `VMLAB_INSTANCE`, so it registers under a name of its own. Or change the `lab` name in one of the two files. To carry the provisioned machines across, run `vmlab lab move <name>` in the directory that should own the lab; the lab arrives under the name that directory runs it as, so the main worktree's `demo` moved into linked worktree `feat-x` becomes `demo-feat-x`.
+
+After upgrading to a vmlab with instances, a lab already running from a linked worktree under its declared name keeps that name, while commands in the worktree resolve to `<declared>-<worktree>` and report it as not running. Release it with `vmlab lab stop <declared>`, or pass `--instance ""` to address it as before.
 
 ## The eBPF fast path is unavailable
 
