@@ -54,6 +54,12 @@ page cmd_console {
     the Windows side and connects to the forwarded port.
   DOC
 
+  p <<DOC
+    The viewer shows the frame the guest puts on its scanout. On a Windows
+    `vulkan` guest that frame can hold bands of stale pixels, which RDP into
+    the guest does not show; see [Troubleshooting](apx_troubleshooting).
+  DOC
+
   code sh { source = <<'SRC'
 vmlab console winsrv
 vmlab console --tcp mixed-lab/winsrv

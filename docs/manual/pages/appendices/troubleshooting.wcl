@@ -574,6 +574,28 @@ MSG
     `qemu_binary` at it, as [Host GPUs](guide_host) shows.
   DOC
 
+  h2 "A Venus guest's console shows bands of stale pixels"
+  p <<DOC
+    The VNC console and `vmlab vm screenshot` of a Windows `vulkan` guest
+    can show horizontal bands of stale pixels across a GPU-drawn window
+    that was changing. The bands hold rows of that window from an earlier
+    frame. They stay until the guest presents again. A busy or slow host
+    GPU shows them more often.
+  DOC
+  p <<DOC
+    The bands are in the frame the guest's display driver puts on the
+    scanout. QEMU shows that frame as it is, so every VNC client sees them.
+    The frame does not change after the guest flushes it, and an AMD host
+    GPU on stock QEMU shows the same bands. RDP and an in-guest screen
+    capture build their own frame, and they show a clean desktop. The fix
+    belongs in the guest's graphics stack, not in vmlab or QEMU
+    (VMLabDev/vmlab#170). Until then, use RDP to look at a desktop that
+    must be exact: add a [port forward](guide_networking) to the guest's
+    port 3389, for example
+    `forward { host_port = 13389 to = "win11:3389" }`, and connect an RDP
+    client to `127.0.0.1:13389`.
+  DOC
+
   h2 "A Venus guest sees two GPUs"
   p <<DOC
     A `vulkan` guest on a declared host GPU should list one Venus device,

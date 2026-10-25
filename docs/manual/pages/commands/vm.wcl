@@ -213,6 +213,12 @@ page cmd_vm {
     is printed on success. The VM must be running.
   DOC
 
+  p <<DOC
+    The capture is the frame the guest last put on its scanout. On a Windows
+    `vulkan` guest that frame can hold bands of stale pixels; see
+    [Troubleshooting](apx_troubleshooting).
+  DOC
+
   h2 "vmlab vm sendkeys"
 
   code sh { source = "vmlab vm sendkeys <VM> <CHORD>" }

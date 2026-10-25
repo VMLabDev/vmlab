@@ -153,6 +153,15 @@ the stock QEMU. Use: NVIDIA's EGL takes a LINEAR dma-buf only as
 console for a Venus guest; the patched QEMU
 (`VMLabDev/qemu`, branch `vmlab/egl-headless-external-dmabuf`) fixes it.
 
+Stale bands: a Windows Venus guest's VNC console and `vmlab vm screenshot` can
+show horizontal bands of an earlier frame across a GPU-drawn window that was
+changing, until the guest presents again (more often on a busy or slow host
+GPU). The bands are in the frame the guest's display driver flips to the
+scanout, not a QEMU readback race: the scanout does not change after the flush,
+and AMD on stock QEMU shows them too. RDP and an in-guest capture compose their
+own frame and are clean. Not fixed (VMLabDev/vmlab#170); for an exact view, RDP
+through a segment `forward { host_port = 13389 to = "<vm>:3389" }`.
+
 Identical cards: two RTX 5090s both match the `*nvidia*` driver filter, the
 loader cannot filter by PCI address, and Mesa's device-select layer breaks
 Venus. So every `vulkan` VM on a picked GPU gets vmlab's own implicit layer,
