@@ -154,7 +154,7 @@ impl VmDirs {
     pub fn new(lab: &str, vm: &str, lab_local: &Path) -> Self {
         Self {
             local: lab_local.join("vms").join(vm),
-            run: crate::paths::lab_runtime_dir(lab).join("vms").join(vm),
+            run: crate::paths::machine_runtime_dir(lab, crate::paths::MachineKind::Vm, vm),
             logs: crate::paths::state_dir()
                 .join("labs")
                 .join(lab)

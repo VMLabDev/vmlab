@@ -34,9 +34,7 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
             .await?
             .ok_or_else(|| anyhow!("lab \"{lab}\" is not running — `vmlab up` first"))?;
 
-        let sock = crate::paths::lab_runtime_dir(&lab)
-            .join("vms")
-            .join(&vm)
+        let sock = crate::paths::machine_runtime_dir(&lab, crate::paths::MachineKind::Vm, &vm)
             .join("vnc.sock");
         if !sock.exists() {
             bail!("VNC socket for {lab}/{vm} not found ({})", sock.display());
@@ -79,9 +77,7 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
 pub fn run_bridge(lab: String, vm: String) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let sock = crate::paths::lab_runtime_dir(&lab)
-            .join("vms")
-            .join(&vm)
+        let sock = crate::paths::machine_runtime_dir(&lab, crate::paths::MachineKind::Vm, &vm)
             .join("vnc.sock");
         if !sock.exists() {
             bail!("VNC socket for {lab}/{vm} not found ({})", sock.display());
