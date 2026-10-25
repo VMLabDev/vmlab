@@ -574,6 +574,34 @@ MSG
     `qemu_binary` at it, as [Host GPUs](guide_host) shows.
   DOC
 
+  h2 "A host GPU is in a failed power state"
+  code text { source = "host GPU `Nvidia1`: gpu address 0000:01:00.0: the device is in a failed power state (power/runtime_status=error) — its driver lost it on a resume, and it needs a reboot before a VM can render on it" }
+  p <<DOC
+    The GPU's driver powered it down while nothing used it, and could not
+    bring it back. On NVIDIA the kernel log shows `Xid 119` (the GSP did not
+    answer) and often `Xid 79` (the GPU fell off the bus), and `nvidia-smi`
+    finds no device. Nothing short of a host reboot recovers it. To keep it
+    from happening again, keep the GPU powered as
+    [Runtime power management](ref_host) shows: a udev rule setting
+    `power/control` to `on`, or `options nvidia NVreg_DynamicPowerManagement=0x00`.
+    vmlab's own `keepawake` helper holds the GPU between `vmlab down` and
+    `vmlab up` while the supervisor runs; check it with `vmlab status -v`
+    (`keepawake=on`).
+  DOC
+
+  h2 "A host GPU can runtime-suspend"
+  code text { source = "host GPU `Nvidia1` (0000:01:00.0) can runtime-suspend (power/control=auto): a lab restart lets the NVIDIA driver power it down, and a failed resume (Xid 119) has lost the GPU until reboot. ..." }
+  p <<DOC
+    A warning, not an error. The NVIDIA GPU a virgl or vulkan VM renders on
+    has runtime power management on. When the warning says vmlab holds it
+    awake, the supervisor's `keepawake` helper covers restarting a lab. The
+    warning names the host-side fixes that also cover a supervisor restart
+    and a reboot. They are in [Runtime power management](ref_host). When
+    `vmlab status -v` shows `keepawake=failed`, the helper could not open
+    the GPU through EGL; the reason is in the lab daemon's log,
+    `~/.local/state/vmlab/labd-<lab>.log`.
+  DOC
+
   h2 "A Venus guest sees two GPUs"
   p <<DOC
     A `vulkan` guest on a declared host GPU should list one Venus device,

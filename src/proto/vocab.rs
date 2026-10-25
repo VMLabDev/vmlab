@@ -1043,6 +1043,23 @@ vocabulary! {
         /// hidden, each with the `lab/vm` holding it, if one does.
         UsbList = "usb.list" {},
 
+        /// Hold a host GPU out of runtime suspend until the supervisor stops
+        /// (ADR-0018), starting its keep-awake helper unless one runs;
+        /// answers with the helper's `pid`. `failed` when the helper cannot
+        /// open the GPU.
+        #[one_way(
+            "daemon",
+            "Daemon-internal: a lab daemon asks before a `virgl`/`vulkan` VM \
+             starts on a GPU whose `keepawake` wants it, so there is nothing \
+             for a person to ask for; `vmlab status -v` shows the answer."
+        )]
+        GpuKeepAwake = "gpu.keepawake" {
+            /// The host GPU's declared name, for messages.
+            gpu: String,
+            /// Its PCI address, `0000:01:00.0`.
+            address: String,
+        },
+
         /// The templates a file declares, with their store and build state.
         TemplateList = "template.list" {
             lab: String,

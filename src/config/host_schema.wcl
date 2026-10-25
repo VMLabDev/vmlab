@@ -58,6 +58,8 @@ type HostGpu {
   qemu_binary: utf8?
   @doc("Variables set in the QEMU process's environment, `{ KEY: \"value\" }`; they win over the Vulkan loader variables vmlab derives")
   @schemaless qemu_env: QemuEnv?
+  @doc("Hold the GPU out of runtime suspend from the first virgl/vulkan VM on it until the supervisor stops: `auto` (default; an NVIDIA GPU that can runtime-suspend), `on`, or `off`")
+  keepawake: utf8?
 }
 
 // `qemu_env`'s shape: a record of strings, keyed by variable name. WCL has

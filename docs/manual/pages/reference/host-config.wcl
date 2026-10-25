@@ -144,6 +144,7 @@ SRC
       | "`default`" | "bool" | "`false`" | "The GPU a lab gets when it names none, or names one this host lacks under virgl or vulkan. A lone `gpu` block is the default without it." |
       | "`qemu_binary`" | "utf8" | "none" | "Absolute path to the QEMU every VM on this GPU runs, in every mode including passthrough, instead of `qemu-system-<arch>` from `PATH`. vmlab also passes it `-L <dir>` (see below)." |
       | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives." |
+      | "`keepawake`" | "utf8" | "`auto`" | "Whether the supervisor holds this GPU out of runtime suspend from the first virgl or vulkan VM started on it until the supervisor stops. `auto`: only an NVIDIA GPU that can runtime-suspend. `on`: always, on any driver with EGL. `off`: never. See below." |
   }
   p "The parser enforces these rules:"
   list {
@@ -152,6 +153,7 @@ SRC
     li "At most one block carries `default = true`."
     li "`qemu_binary` is an absolute path."
     li "Every `qemu_env` value is a string. Each key is a WCL identifier, so it is never empty and never contains `=`."
+    li "`keepawake` is `auto`, `on` or `off`."
   }
   p <<DOC
     The rest is checked when a lab uses the GPU, by `vmlab validate` and at
@@ -188,6 +190,42 @@ SRC
     `vmlab status --json` carries it as the VM's `qemu_env` object. Both
     show what the VM was started with, not the host config as it is now.
     Template builds never have a `gpu {}`, so they always run the stock QEMU.
+  DOC
+  h3 "Runtime power management"
+  p <<DOC
+    A GPU with runtime power management on (`power/control` is `auto`) is
+    powered down by its driver once nothing has used it for a few seconds.
+    Between one lab's `vmlab down` and the next `vmlab up` nothing uses it.
+    On an NVIDIA GPU the resume after that boots the GSP firmware again,
+    and a resume that fails (`Xid 119`) loses the GPU until the host
+    reboots. vmlab handles this three ways:
+  DOC
+  list {
+    li "A GPU whose `power/runtime_status` is `error` is refused by `vmlab validate` and at VM start, naming the GPU and its address. Its driver has already lost it, and QEMU would abort on it some seconds after the VM was reported up. Reboot the host."
+    li "`vmlab up` warns once about an NVIDIA GPU a virgl or vulkan VM renders on that can runtime-suspend: `power/control` is `auto` and the driver does not report runtime D3 disabled in `/proc/driver/nvidia/gpus/<address>/power`. NVIDIA leaves `power/control` at `auto` on desktop cards whose runtime D3 it has turned off, so those get no warning."
+    li "Under `keepawake` (default `auto`, the same NVIDIA condition) the supervisor starts a small helper, `vmlab-gpu-keepawake`, before the first such VM on the GPU starts. The helper opens an OpenGL ES context on the GPU through EGL and clears a 16x16 renderbuffer every 100 ms. A context alone does not stop the NVIDIA driver from suspending the GPU, but small regular work does. The helper needs no root and about 6 MiB of video memory, and runs until `vmlab daemon stop`. It exits by itself if the supervisor dies. `vmlab status -v` shows `keepawake=` after `host_gpu=`."
+  }
+  p <<DOC
+    The helper covers `down` then `up` while the supervisor runs. It does
+    not cover a supervisor restart, and the GPU is held only after a VM has
+    started on it. To keep an NVIDIA GPU powered at all times, fix it on the
+    host as root, with one of these:
+  DOC
+  code text { source = <<'SRC'
+# /etc/udev/rules.d/99-nvidia-no-runtime-pm.rules: keep every NVIDIA GPU powered, every boot
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", ATTR{power/control}="on"
+
+# or turn runtime D3 off in the driver (/etc/modprobe.d/nvidia-no-rtd3.conf, then reboot;
+# regenerate the initramfs if it loads nvidia)
+options nvidia NVreg_DynamicPowerManagement=0x00
+
+# or, until the next reboot, for one GPU
+echo on | sudo tee /sys/bus/pci/devices/0000:01:00.0/power/control
+SRC
+  }
+  p <<DOC
+    All three keep the GPU powered while idle, which costs battery on a
+    laptop. The helper holds it only while the supervisor runs.
   DOC
 
   callout "A neutral fast path" { kind = :info body = <<DOC

@@ -5,6 +5,7 @@ pub mod cmdline;
 pub mod container;
 pub mod firmware;
 pub mod hostgpu;
+pub mod keepawake;
 pub mod process;
 pub mod resolve;
 pub mod virtiofsd;

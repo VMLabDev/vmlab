@@ -38,6 +38,7 @@ the code is the contract.
 | `global.detach` | `name: String`, `lab: Option<String>` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
 | `usb.list` | — | `cli`, `daemon` | Every USB device plugged into this host (PRD §5.2.1), hubs hidden, each with the `lab/vm` holding it, if one does. |
+| `gpu.keepawake` | `gpu: String`, `address: String` | `daemon` | Hold a host GPU out of runtime suspend until the supervisor stops (ADR-0018), starting its keep-awake helper unless one runs; answers with the helper's `pid`. `failed` when the helper cannot open the GPU. |
 | `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli` | The templates a file declares, with their store and build state. |
 | `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>`, `variants: Option<Vec<String>>` | `cli` | Start building one declared template. |
 | `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running build. |
@@ -219,4 +220,5 @@ Deliberate, with the reason recorded beside the declaration:
 - `global.attach` — Daemon-internal: a lab daemon joins a global segment because a lab declared one, so there is nothing for a person to ask for.
 - `global.detach` — The other half of `global.attach`, and daemon-internal for the same reason.
 - `global.list` — A lab daemon reads it to fold each segment's peer state into the lab status projection, which is how both other surfaces already see it.
+- `gpu.keepawake` — Daemon-internal: a lab daemon asks before a `virgl`/`vulkan` VM starts on a GPU whose `keepawake` wants it, so there is nothing for a person to ask for; `vmlab status -v` shows the answer.
 

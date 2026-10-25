@@ -130,6 +130,7 @@ gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/
 | `default` | bool | `false` | The GPU a lab gets when it names none. At most one; a lone block is the default without it. |
 | `qemu_binary` | utf8 | none | Absolute path to the QEMU every VM on this GPU runs (all modes, passthrough too) instead of `qemu-system-<arch>` on PATH. |
 | `qemu_env` | record of utf8 | none | `{ KEY: "value" }` set in that QEMU's environment, applied last: beats the derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and the PCI-filter variables (`VMLAB_VK_PCI_FILTER_DISABLE: "1"` turns the layer off). |
+| `keepawake` | utf8 | `auto` | Supervisor holds the GPU out of runtime suspend from the first virgl/vulkan VM on it until `vmlab daemon stop`. `auto`: an NVIDIA GPU that can runtime-suspend; `on`: always (any EGL driver); `off`: never. |
 
 Parsing rejects a missing `address`, two labels differing only in case, and a
 second `default = true`. The rest is checked when a lab uses the GPU (validate
@@ -167,6 +168,37 @@ on, identical cards or not. `qemu.log` shows `VK_ADD_IMPLICIT_LAYER_PATH` and
 line after the guest used Vulkan means the host loader is too old to honour
 `VK_ADD_IMPLICIT_LAYER_PATH`; `qemu_env = { VMLAB_VK_PCI_FILTER_DISABLE: "1" }`
 turns the layer off.
+
+Runtime power management (ADR-0018). With `power/control=auto` the driver
+powers an idle GPU down, and between `vmlab down` and the next `up` nothing uses
+it; on NVIDIA the resume reboots the GSP, and a failed one (Xid 119, often then
+Xid 79) loses the GPU until the host reboots — QEMU then aborts in
+`libnvidia-eglcore` some 40 s after the VM was reported up. vmlab:
+- refuses a GPU whose `power/runtime_status` is `error` (validate and VM start:
+  ``host GPU `Nvidia1`: gpu address 0000:01:00.0: the device is in a failed
+  power state (power/runtime_status=error) …``) — reboot the host;
+- warns once on `up` for an NVIDIA virgl/vulkan GPU that can runtime-suspend:
+  `power/control=auto` and `/proc/driver/nvidia/gpus/<addr>/power` not saying
+  `Runtime D3 status: Disabled` (desktop cards report it disabled while
+  `control` stays `auto`, so they get no warning). NVIDIA only: that resume is
+  the failure seen, and `auto` is the kernel default elsewhere;
+- under `keepawake` (same condition by default) asks the supervisor, before the
+  emulator spawns, to run `vmlab-gpu-keepawake` on the GPU (C, embedded in the
+  binary, written to `~/.local/share/vmlab/gpu-keepawake/<digest>/`): an EGL
+  device-platform GLES context plus a 16x16 clear every 100 ms (a context alone
+  does not hold an NVIDIA GPU awake). No root, ~6 MiB VRAM; one per GPU,
+  reused across labs; exits with the supervisor, even a killed one.
+  `vmlab status -v` shows `keepawake=on|off|lost|failed` after `host_gpu=`.
+  A failed helper is a warning in `labd-<lab>.log`, never a refused start.
+
+The helper does not cover a supervisor restart. The host-side fixes (root) keep
+the GPU powered always: a udev rule
+`ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", ATTR{power/control}="on"`
+in `/etc/udev/rules.d/99-nvidia-no-runtime-pm.rules`, or
+`options nvidia NVreg_DynamicPowerManagement=0x00` in `/etc/modprobe.d/`
+(reboot; regenerate the initramfs if it loads nvidia), or for one boot
+`echo on | sudo tee /sys/bus/pci/devices/<addr>/power/control`. All cost idle
+battery on a laptop.
 
 ### UEFI firmware
 

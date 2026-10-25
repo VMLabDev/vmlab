@@ -80,6 +80,30 @@ pub struct HostGpu {
     /// Variables set in the QEMU process's own environment, in key order,
     /// after vmlab's derived Vulkan loader variables — so these win.
     pub qemu_env: Vec<(String, String)>,
+    /// Whether the supervisor holds this GPU out of runtime suspend while
+    /// VMs render on it (ADR-0018).
+    pub keepawake: KeepAwake,
+}
+
+/// A host GPU's `keepawake` (PRD §5.2, ADR-0018): whether the supervisor
+/// runs a helper that keeps the GPU out of runtime suspend from the first
+/// `virgl`/`vulkan` VM started on it until the supervisor stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepAwake {
+    /// Only an NVIDIA GPU that can runtime-suspend: `power/control` is
+    /// `auto` and the driver does not report runtime D3 disabled.
+    #[default]
+    Auto,
+    /// Always, on any driver with EGL.
+    On,
+    /// Never.
+    Off,
+}
+
+impl KeepAwake {
+    /// The spelling of each value, once, for the extractor.
+    pub const NAMES: &'static [(&'static str, Self)] =
+        &[("auto", Self::Auto), ("on", Self::On), ("off", Self::Off)];
 }
 
 /// Why `key` cannot name an environment variable: empty, or carrying the
@@ -226,6 +250,10 @@ impl HostConfig {
                 default: r.bool("default").unspan().unwrap_or(false),
                 qemu_binary: qemu_binary.unspan(),
                 qemu_env,
+                keepawake: r
+                    .keyword("keepawake", KeepAwake::NAMES)
+                    .unspan()
+                    .unwrap_or_default(),
             };
             if let Some(prev) = cfg
                 .gpus
@@ -467,6 +495,28 @@ gpu "Nvidia1" {
         );
         let amd = cfg.gpu("AMD1").unwrap();
         assert!(amd.qemu_binary.is_none() && amd.qemu_env.is_empty());
+    }
+
+    /// `keepawake` reads `auto`, `on` or `off`, defaults to `auto`, and
+    /// refuses anything else by name.
+    #[test]
+    fn parses_a_host_gpus_keepawake() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0"  keepawake = "on" }
+gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
+gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let modes: Vec<KeepAwake> = cfg.gpus.iter().map(|g| g.keepawake).collect();
+        assert_eq!(modes, [KeepAwake::On, KeepAwake::Auto, KeepAwake::Off]);
+        let err = host_err("gpu \"Nvidia1\" { address = \"0000:01:00.0\"  keepawake = \"yes\" }\n");
+        assert!(
+            err.contains("`keepawake` must be one of auto, on, off, got `yes`"),
+            "{err}"
+        );
     }
 
     /// A relative `qemu_binary` would resolve against whatever directory
