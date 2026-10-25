@@ -42,7 +42,7 @@ page gs_first_provision {
   list {
     li "`use vmlab` imports the host module, which provides `vmlab::sleep_ms` and the other helpers in [wscript API: Term, types and the vmlab module](ref_ws_types)."
     li "`fn main(lab: Lab)` is the entry point. vmlab calls it with the [Lab handle](ref_ws_lab), from which the script reaches every machine and segment by name."
-    li "Methods that can fail return `Result`. The `?` operator propagates an error string out of `setup`, and `expect` in `main` turns it into a failed provision, which fails `vmlab up` with that message."
+    li "Methods that can fail return `Result`. The `?` operator propagates an error string out of `setup`, and `expect` in `main` turns it into a failed provision, which fails `vmlab up` with the message followed by the error, as `first-vm setup failed: <err>`."
     li "`wait_ready(600)` blocks until the guest agent answers or 600 seconds pass. A provision runs after its machine is ready, so the call is instant during `up`, but it makes the script correct under `vmlab script` too, where nothing has waited for you."
   }
 

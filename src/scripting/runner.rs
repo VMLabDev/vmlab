@@ -220,7 +220,9 @@ pub(crate) fn render_diag(d: &wscript::Diagnostic) -> String {
 fn run_error(e: wscript::Error) -> String {
     match e {
         wscript::Error::Runtime(r) => {
-            let mut s = r.message.clone();
+            // A fault can end in a payload's own newline (an `expect` on an
+            // `Err` carrying a command's stderr); the trace stays on its line.
+            let mut s = r.message.trim_end().to_string();
             if !r.trace.is_empty() {
                 let chain = r
                     .trace
@@ -362,5 +364,62 @@ impl SegmentHandle {
             let rs = s.rules.lock().map_err(|_| "ruleset poisoned".to_string())?;
             serde_json::to_string(&rs.list()).map_err(|e| e.to_string())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `main()` of `src` under vmlab's script context and return the
+    /// failure as `vmlab up` prints it after `script failed: <name>: `.
+    fn fault_of(src: &str) -> String {
+        let ctx = super::super::context();
+        let unit = ctx
+            .compile(src)
+            .unwrap_or_else(|e| panic!("{}", compile_error(e)));
+        let mut vm = Vm::new(&ctx);
+        let err = vm
+            .call_unit::<_, ()>(&unit, "main", ())
+            .expect_err("script should fault");
+        run_error(err)
+    }
+
+    /// A provision that stops on `expect` names its own step and the `Err`
+    /// that caused it (#170), not the step alone.
+    #[test]
+    fn result_expect_reports_the_err_payload() {
+        let msg = fault_of(
+            r#"
+fn setup() -> Result[int, string] {
+    Err("powershell: access denied\n")
+}
+
+fn main() {
+    let n = setup().expect("install-apps failed")
+}
+"#,
+        );
+        assert_eq!(
+            msg,
+            "install-apps failed: powershell: access denied (at main)"
+        );
+    }
+
+    /// `None` has no payload, so `expect` on it reports the message alone.
+    #[test]
+    fn option_expect_reports_the_message() {
+        let msg = fault_of(
+            r#"
+fn find() -> Option[string] {
+    None
+}
+
+fn main() {
+    let c = find().expect("no config found")
+}
+"#,
+        );
+        assert_eq!(msg, "no config found (at main)");
     }
 }

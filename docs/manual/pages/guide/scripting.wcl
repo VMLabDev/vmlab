@@ -64,8 +64,10 @@ DOC
 
   p <<'DOC'
 `r.expect("message")` and `r.unwrap()` take the value or raise a fault that
-ends the script. The examples use `expect` in `main` to turn a failed setup
-into a failed provision with a readable message. A value you do not use must
+ends the script. On an `Err`, `expect` reports `message: <err>`, so the error
+that caused the failure appears after your message; on a `None` it reports the
+message alone. The examples use `expect` in `main` to turn a failed setup into
+a failed provision that names both the step and its cause. A value you do not use must
 still be bound, so a fire-and-forget call reads `let k = m.send_keys("enter")`.
 DOC
 

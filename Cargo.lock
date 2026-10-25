@@ -2874,7 +2874,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "wscript"
 version = "0.2.0"
-source = "git+https://github.com/Configweave/wscript.git?rev=ddb6d9fedc77e68736a1281eaf8a122250f40aa3#ddb6d9fedc77e68736a1281eaf8a122250f40aa3"
+source = "git+https://github.com/Configweave/wscript.git?rev=faf09e6e4c7e8ed28611993aa8dc71633a67c028#faf09e6e4c7e8ed28611993aa8dc71633a67c028"
 dependencies = [
  "wscript-compiler",
  "wscript-core",
@@ -2897,7 +2897,7 @@ version = "0.2.0"
 [[package]]
 name = "wscript-macros"
 version = "0.2.0"
-source = "git+https://github.com/Configweave/wscript.git?rev=ddb6d9fedc77e68736a1281eaf8a122250f40aa3#ddb6d9fedc77e68736a1281eaf8a122250f40aa3"
+source = "git+https://github.com/Configweave/wscript.git?rev=faf09e6e4c7e8ed28611993aa8dc71633a67c028#faf09e6e4c7e8ed28611993aa8dc71633a67c028"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2907,7 +2907,7 @@ dependencies = [
 [[package]]
 name = "wscript-std"
 version = "0.2.0"
-source = "git+https://github.com/Configweave/wscript.git?rev=ddb6d9fedc77e68736a1281eaf8a122250f40aa3#ddb6d9fedc77e68736a1281eaf8a122250f40aa3"
+source = "git+https://github.com/Configweave/wscript.git?rev=faf09e6e4c7e8ed28611993aa8dc71633a67c028#faf09e6e4c7e8ed28611993aa8dc71633a67c028"
 dependencies = [
  "quick-xml",
  "regex",
@@ -2920,7 +2920,7 @@ dependencies = [
 [[package]]
 name = "wscript-vm"
 version = "0.2.0"
-source = "git+https://github.com/Configweave/wscript.git?rev=ddb6d9fedc77e68736a1281eaf8a122250f40aa3#ddb6d9fedc77e68736a1281eaf8a122250f40aa3"
+source = "git+https://github.com/Configweave/wscript.git?rev=faf09e6e4c7e8ed28611993aa8dc71633a67c028#faf09e6e4c7e8ed28611993aa8dc71633a67c028"
 dependencies = [
  "wscript-core",
 ]
