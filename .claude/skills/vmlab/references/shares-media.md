@@ -97,6 +97,13 @@ even on a shared segment. Authenticated NTLMv2 with SMB signing is the baseline,
 because current Windows hardening rejects unauthenticated shares. The credentials
 are plumbed by vmlab and are not user-visible.
 
+A Windows guest can run a program straight off an SMB share, read-only or not,
+whatever the file's unix mode. Samba builds the access list it reports from the
+mode bits, so a host file without an execute bit would otherwise refuse
+`Start-Process` with "Access is denied" even though reading and copying it work.
+Every share is served with `acl allow execute always`, which grants execute and
+nothing else: a read-only share still refuses every write.
+
 ### Mounting in the guest
 
 Once a VM is ready, the lab daemon runs the share plan's **mount steps** through

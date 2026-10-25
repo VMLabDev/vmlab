@@ -258,6 +258,13 @@ impl SmbConfig {
             out.push_str("    guest ok = no\n");
             // Access the host tree as the daemon's own unix user.
             out.push_str(&format!("    force user = {unix_user}\n"));
+            // Samba maps a file's unix mode into the NT ACL it reports, so a
+            // file without an `x` bit (any `.exe` downloaded or copied on the
+            // host) carries no FILE_EXECUTE, and the guest's CreateProcess
+            // fails with "Access is denied" while reads and copies work.
+            // Granting execute on open changes nothing a guest can write; it
+            // could copy the file off the share and run it anyway.
+            out.push_str("    acl allow execute always = yes\n");
             out.push('\n');
         }
 
@@ -362,6 +369,26 @@ mod tests {
         // scoping
         assert!(conf.contains("valid users = labuser"));
         assert!(conf.contains("guest ok = no"));
+    }
+
+    /// A host file is executable to the guest whatever its unix mode, on a
+    /// read-only share as on a writable one, and the read-only share stays
+    /// read-only.
+    #[test]
+    fn conf_allows_execute_on_every_share() {
+        let conf = cfg(false).render_conf();
+        for name in ["[src]", "[data]"] {
+            let section = conf
+                .split_once(name)
+                .map(|(_, rest)| rest.split("\n[").next().unwrap_or(rest))
+                .unwrap_or_else(|| panic!("no {name} section in:\n{conf}"));
+            assert!(
+                section.contains("acl allow execute always = yes"),
+                "{name} lacks execute:\n{section}"
+            );
+        }
+        let data = conf.split_once("[data]").unwrap().1;
+        assert!(data.contains("read only = yes"), "{data}");
     }
 
     #[test]
