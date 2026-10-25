@@ -506,6 +506,8 @@ Share contents are outside snapshot scope on both transports (§7.3).
 
 **Access model.** vmlab generates per-lab SMB credentials automatically; a share is mappable only with its owning VM's credential, scoping shares to their declaring VM even on a shared segment. Authenticated NTLMv2 + SMB signing is the baseline — required anyway because current Windows hardening (guest-auth blocking, signing requirements on recent Windows 11) rejects unauthenticated shares. None of this is user-visible: credentials are plumbed by vmlab.
 
+**Execute.** A guest may execute any file it can read on an SMB share, read-only shares included, whatever the host file's unix mode: Samba derives the NT ACL it reports from the mode bits, so without `acl allow execute always` a host file lacking an execute bit refuses a Windows guest's `CreateProcess` ("Access is denied") while reads and copies succeed. Execute grants nothing a read cannot already reach, and a read-only share stays read-only.
+
 **Correction required by §19.2.** The agent's mounts run as the agent identity
 and land in the global DOS-device namespace, so every session *sees* the drive
 letters and folder symlinks while each logon authenticates separately; today's
