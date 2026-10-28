@@ -1,6 +1,6 @@
 # ADR-0019: A worktree lab is a linked clone of a frozen main lab
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-10-28
 - **Supersedes**: nothing
 - **Amends**: [ADR-0011](0011-a-lab-name-is-its-host-global-runtime-identity.md)
