@@ -5,6 +5,8 @@ pub mod appshare;
 pub mod cli;
 pub mod config;
 pub mod dev;
+#[allow(dead_code)] // Consumers land with #174-#177; drop once every item has a caller.
+mod freeze;
 pub mod guest_asset;
 mod hashing;
 mod instance;
