@@ -115,6 +115,9 @@ pub struct LabRuntime {
     pub workspaces: crate::labd::workspace::WorkspaceSyncers,
     /// The console recordings this lab owns, one per machine (§11.1).
     pub recordings: super::record::Recordings,
+    /// Worktree isolation (§21.4), decided once when the daemon starts:
+    /// `Some` for the frozen main lab and every worktree lab built on it.
+    pub isolation: Option<super::isolation::IsolationPlan>,
     /// This runtime as its own `Arc`. [`crate::labd::machine::LabServices`] is
     /// a `&self` interface (it has to be, to be object-safe), and the work
     /// behind two of its methods spawns tasks that outlive the call.
@@ -355,6 +358,12 @@ impl LabRuntime {
         let mut state = LabState::load(&lab_local)?;
         let store = TemplateStore::new(crate::paths::template_store_dir());
         let mut network = LabNetwork::build(&config.lab)?;
+        // Before any gateway is wired: isolation changes what each NAT
+        // engine admits and which global segments the lab joins (§21.4).
+        let isolation = super::isolation::decide(&root, &config.lab)?;
+        if let Some(plan) = &isolation {
+            network.isolate(plan);
+        }
         let mut pending: BTreeMap<String, PullJob> = BTreeMap::new();
         let home = std::env::var_os("HOME").map(PathBuf::from);
 
@@ -679,6 +688,7 @@ impl LabRuntime {
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
             recordings: super::record::Recordings::default(),
             usb: super::usb::UsbHost::default(),
+            isolation,
         }))
     }
 
@@ -706,7 +716,11 @@ impl LabRuntime {
         let root = config.root.clone();
         let lab_local = crate::paths::lab_local_dir(&root);
         std::fs::create_dir_all(&lab_local)?;
-        let network = LabNetwork::build(&config.lab)?;
+        let mut network = LabNetwork::build(&config.lab)?;
+        let isolation = super::isolation::decide(&root, &config.lab)?;
+        if let Some(plan) = &isolation {
+            network.isolate(plan);
+        }
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
         let events = Arc::new(super::events::EventLog::new(&name, tx)?);
         let machines: BTreeMap<String, Arc<dyn Machine>> = machines
@@ -744,6 +758,7 @@ impl LabRuntime {
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
             recordings: super::record::Recordings::default(),
             usb,
+            isolation,
         }))
     }
 
@@ -1741,8 +1756,9 @@ impl LabRuntime {
             services.learn_mac(rule.guest_ip, mac);
         }
         let mut last = String::from("no host port to bind");
+        let bind = super::isolation::forward_bind(self.isolation.as_ref());
         for &port in ports {
-            let host_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+            let host_addr = std::net::SocketAddr::from((bind, port));
             match services.add_forward(host_addr, rule.guest_ip, rule.guest_port, rule.proto) {
                 Ok(installed) => return Ok(installed),
                 Err(e) => {
@@ -1791,6 +1807,17 @@ impl LabRuntime {
         // configuration steps are in scope (see `labd::plan`).
         let plan =
             plan::plan(&self.config.lab, subset, plan::Direction::Up).map_err(|e| anyhow!(e))?;
+        // Worktree isolation (§21.4) refuses a worktree lab that peers a
+        // global segment with another host, before anything boots.
+        if let Some(isolation) = &self.isolation {
+            if let Some(why) = isolation.refusal() {
+                bail!("{why}");
+            }
+            output(format!("{}\n", isolation.describe()));
+            for warning in &isolation.warnings {
+                output(format!("warning: {warning}\n"));
+            }
+        }
         for skip in &plan.skipped {
             output(format!("{}: {}\n", skip.what, skip.why));
         }
@@ -2574,7 +2601,7 @@ impl LabRuntime {
             let peer_connected = if seg.global {
                 trunk_states
                     .as_ref()
-                    .map(|m| m.get(&seg.name).copied().unwrap_or(false))
+                    .map(|m| m.get(&seg.global_name).copied().unwrap_or(false))
             } else {
                 None
             };
@@ -2611,6 +2638,7 @@ impl LabRuntime {
             pulls: self.pulls.lock_recover().snapshot(),
             config_digest: crate::config::digest(&self.config),
             forwards,
+            isolation: self.isolation.as_ref().map(|p| p.status()),
         }
     }
 
@@ -3602,6 +3630,80 @@ mod tests {
 
     fn quiet() -> crate::scripting::OutputSink {
         Arc::new(|_| {})
+    }
+
+    /// A main checkout at `<tmp>/main` frozen at generation 1, and a linked
+    /// worktree `feat-x` beside it, laid out as `git worktree add` leaves
+    /// them. Returns the two lab roots.
+    fn frozen_family(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let main = tmp.join("main");
+        let wt_git = main.join(".git/worktrees/feat-x");
+        let wt = tmp.join("feat-x");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        crate::freeze::WorktreeConfig {
+            generation: 1,
+            snapshot: "base".into(),
+        }
+        .save(&crate::paths::lab_local_dir(&main))
+        .unwrap();
+        (main, wt)
+    }
+
+    /// A worktree lab peering a global segment with another host is refused
+    /// at `up`, naming §21.4 (ADR-0019 amending ADR-0011); the frozen main
+    /// lab declaring the same peer is not.
+    #[tokio::test]
+    async fn a_worktree_lab_with_a_global_peer_is_refused_at_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, wt) = frozen_family(tmp.path());
+        let src = r#"import <vmlab.wcl>
+lab "t" {
+  segment "corp" { global = true connect { host = "otherhost:13947" } }
+}"#;
+        let lab = lab_of(&wt, src, Vec::new());
+        let err = lab.up(&[], quiet()).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("§21.4"), "{err:#}");
+        assert!(format!("{err:#}").contains("\"corp\""), "{err:#}");
+
+        let lab = lab_of(&main, src, Vec::new());
+        assert_eq!(lab.isolation.as_ref().unwrap().refusal(), None);
+    }
+
+    /// The status projection carries the decision: present in both labs of
+    /// a frozen family, the worktree's global segment renamed, absent from a
+    /// lab that is not frozen.
+    #[tokio::test]
+    async fn status_reports_worktree_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, wt) = frozen_family(tmp.path());
+        let src = r#"import <vmlab.wcl>
+lab "t" {
+  segment "corp" { global = true }
+}"#;
+        let main_status = lab_of(&main, src, Vec::new()).status().await;
+        let iso = main_status.isolation.expect("main lab isolated");
+        assert_eq!((iso.role.as_str(), iso.worktree), ("main", None));
+        assert_eq!(iso.forward_bind, "127.0.0.1");
+
+        let wt_lab = lab_of(&wt, src, Vec::new());
+        assert_eq!(
+            wt_lab.network.lock().await.segments["corp"].global_name,
+            "corp@feat-x"
+        );
+        let iso = wt_lab.status().await.isolation.expect("worktree isolated");
+        assert_eq!(iso.worktree.as_deref(), Some("feat-x"));
+
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            lab_of(plain.path(), src, Vec::new())
+                .status()
+                .await
+                .isolation,
+            None
+        );
     }
 
     #[tokio::test]

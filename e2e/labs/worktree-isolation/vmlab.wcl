@@ -1,0 +1,30 @@
+// The worktree scenario's lab (PRD §21). Committed to a scratch git
+// repository, frozen at an offline snapshot in the main checkout, and run
+// again from a linked worktree whose machine is a clone of the main lab's.
+// The forward has no host port: both labs of the family install it, each on
+// a port of its own.
+import <vmlab.wcl>
+
+lab "e2e-worktree" {
+  segment "lan" {
+    subnet = "10.83.0.0/24"
+    nat    = true
+    forward { to = "web:8080" }
+  }
+
+  // Joined as "shared" by the main lab and "shared@<worktree>" by the
+  // worktree lab: two supervisor segments, each with its own DNS.
+  segment "shared" {
+    subnet = "10.83.9.0/24"
+    global = true
+  }
+
+  vm "web" {
+    template = "x86_64/e2e-alpine"
+    arch     = "x86_64"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" }
+    nic { segment = "shared" }
+  }
+}

@@ -46,7 +46,7 @@ RUN apt-get update \
       qemu-utils \
       swtpm swtpm-tools virtiofsd \
       samba xorriso mtools dosfstools squashfs-tools tesseract-ocr ffmpeg \
-      python3 util-linux procps iproute2 curl ca-certificates \
+      python3 util-linux procps iproute2 curl ca-certificates git \
       xvfb x11-utils \
  && rm -rf /var/lib/apt/lists/*
 # Ubuntu 24.04's virtiofsd 1.10.0, which predates --migration-mode and

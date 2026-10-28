@@ -31,6 +31,7 @@ SCENARIOS = [
     "network",
     "containers",
     "snapshots",
+    "worktree",
     "scripting",
     "record",
     "playbooks",

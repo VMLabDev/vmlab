@@ -461,6 +461,28 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "lab \"{}\"", status.lab);
+    // Worktree isolation (§21.4) changes what a guest can reach and where a
+    // forward listens, so it is said before anything else: a developer
+    // wondering why `curl <host-ip>` fails in a worktree guest looks here.
+    if let Some(iso) = &status.isolation {
+        let whose = match &iso.worktree {
+            Some(name) => format!("worktree \"{name}\""),
+            None => "frozen main lab".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "worktree isolation: {whose}, generation {} at \"{}\"; NAT refuses host addresses, \
+             forwards bind {}",
+            iso.generation, iso.snapshot, iso.forward_bind
+        );
+        for g in iso.globals.iter().filter(|g| g.joined != g.segment) {
+            let _ = writeln!(
+                out,
+                "  global segment \"{}\" joins as \"{}\"",
+                g.segment, g.joined
+            );
+        }
+    }
 
     if !status.machines.is_empty() {
         let name_w = column_width("NAME", status.machines.iter().map(|m| m.name.len()));
@@ -2366,6 +2388,38 @@ mod tests {
         );
         assert!(
             out.contains("web     41234 (auto) 10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
+    }
+
+    /// A lab under worktree isolation says so under its name, with the
+    /// global segments it joins under another name; any other lab does not.
+    #[test]
+    fn the_status_table_says_worktree_isolation() {
+        use crate::status::{IsolatedGlobal, IsolationStatus};
+        let mut status = lab(vec![addressed("web", PowerState::Running, true, vm())]);
+        assert!(!render_status(&status, false).contains("isolation"));
+        status.isolation = Some(IsolationStatus {
+            role: "worktree".into(),
+            worktree: Some("feat-x".into()),
+            generation: 1,
+            snapshot: "base".into(),
+            forward_bind: "127.0.0.1".into(),
+            globals: vec![IsolatedGlobal {
+                segment: "corp".into(),
+                joined: "corp@feat-x".into(),
+            }],
+        });
+        let out = render_status(&status, false);
+        assert!(
+            out.contains(
+                "worktree isolation: worktree \"feat-x\", generation 1 at \"base\"; NAT refuses \
+                 host addresses, forwards bind 127.0.0.1"
+            ),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("global segment \"corp\" joins as \"corp@feat-x\""),
             "got:\n{out}"
         );
     }
