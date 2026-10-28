@@ -36,6 +36,11 @@ pub const FREEZE_DIR: &str = "freeze";
 /// A machine's state record, copied into its generation directory.
 pub const MACHINE_STATE_FILE: &str = "state.json";
 
+/// Beside a worktree machine's disks (`.vmlab/vms/<machine>/` or the
+/// container's directory): the generation it was cloned from, as a decimal.
+/// The template reference stays in `clone-source`, unchanged.
+pub const FREEZE_SOURCE_FILE: &str = "freeze-generation";
+
 /// The named volumes, copied into a generation directory.
 pub const VOLUMES_DIR: &str = "volumes";
 

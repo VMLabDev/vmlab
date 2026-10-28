@@ -2695,6 +2695,8 @@ impl LabRuntime {
                     online,
                     taken_at: chrono::Utc::now(),
                     image_digest: m.snapshot_pin(),
+                    freeze_point: None,
+                    frozen_in: None,
                 },
             );
             state.save(&self.lab_local)?;
