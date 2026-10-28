@@ -20,6 +20,12 @@
 //! .vmlab/freeze/<n>/volumes/<name>/          the lab's named volumes
 //! ```
 
+pub mod inspect;
+pub mod plan;
+#[cfg(test)]
+mod qemu_tests;
+pub mod steps;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
