@@ -378,6 +378,7 @@ pub fn cmd_destroy() -> Result<()> {
                 client.send(LabRequest::Destroy {}).await.map_err(remote)?;
             }
             None if lab_local.exists() => {
+                refuse_destroy_under_freeze(&root).await?;
                 std::fs::remove_dir_all(&lab_local)
                     .with_context(|| format!("removing {}", lab_local.display()))?;
             }
@@ -392,6 +393,25 @@ pub fn cmd_destroy() -> Result<()> {
         println!("lab \"{name}\" destroyed");
         Ok(())
     })
+}
+
+/// The lab daemon's destroy guard (§21.5), for a lab with no daemon running:
+/// a main checkout's lab whose freeze a worktree lab backs onto stays.
+async fn refuse_destroy_under_freeze(root: &std::path::Path) -> Result<()> {
+    if crate::freeze::main_lab_root(root).is_some() {
+        return Ok(());
+    }
+    let deps = crate::freeze::inspect::dependants(root).await;
+    if deps.is_empty() {
+        return Ok(());
+    }
+    Err(
+        crate::proto::CommandError::conflict(crate::freeze::inspect::dependants_refusal(
+            "cannot destroy the main lab",
+            &deps,
+        ))
+        .into(),
+    )
 }
 
 /// `vmlab status`. A lab name registered from another directory is that
@@ -1090,6 +1110,7 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
                 Some(root) => {
                     let lab_local = crate::paths::lab_local_dir(root);
                     if lab_local.exists() {
+                        refuse_destroy_under_freeze(root).await?;
                         std::fs::remove_dir_all(&lab_local)
                             .with_context(|| format!("removing {}", lab_local.display()))?;
                     }
@@ -1995,21 +2016,37 @@ pub fn cmd_snapshots(vm_ref: &str) -> Result<()> {
             println!("no snapshots for {vm}");
             return Ok(());
         }
-        println!("{:<24} {:<8} TAKEN", "NAME", "KIND");
-        for s in list {
-            println!(
-                "{:<24} {:<8} {}",
-                s["name"].as_str().unwrap_or("?"),
-                if s["online"].as_bool().unwrap_or(false) {
-                    "online"
-                } else {
-                    "offline"
-                },
-                s["taken_at"].as_str().unwrap_or("?"),
-            );
-        }
+        print!("{}", render_snapshots(&list));
         Ok(())
     })
+}
+
+/// The `snapshot list` table. A freeze point and a locked snapshot (§21.3)
+/// say so, since a restore treats each differently from an ordinary one.
+fn render_snapshots(list: &[Value]) -> String {
+    let mut out = format!("{:<24} {:<8} {:<22} TAKEN\n", "NAME", "KIND", "FREEZE");
+    for s in list {
+        let freeze = match (s["frozen_in"].as_u64(), s["freeze_point"].as_u64()) {
+            (Some(g), _) => format!("locked (gen {g})"),
+            (None, Some(g)) => format!("freeze point (gen {g})"),
+            (None, None) => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<24} {:<8} {:<22} {}\n",
+            s["name"].as_str().unwrap_or("?"),
+            if s["online"].as_bool().unwrap_or(false) {
+                "online"
+            } else {
+                "offline"
+            },
+            freeze,
+            s["taken_at"].as_str().unwrap_or("?"),
+        ));
+    }
+    if list.iter().any(|s| s["locked"].as_bool().unwrap_or(false)) {
+        out.push_str("locked snapshots live in frozen files; `vmlab worktree thaw` unlocks them\n");
+    }
+    out
 }
 
 pub fn cmd_snapshot_delete(vm_ref: &str, name: String) -> Result<()> {
@@ -2151,13 +2188,38 @@ mod tests {
     use super::{
         DaemonFreshness, LabRequest, PowerOp, Region, backup_notice, daemon_freshness,
         format_log_line, listed_state, not_running_status, pulling_machines, region_value,
-        render_dns, render_status, root_for,
+        render_dns, render_snapshots, render_status, root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
     use crate::status::{MachineDetail, MachineStatus, PowerState, PullKind, PullStatus};
     use crate::status::{SegmentFrames, SegmentStatus};
     use serde_json::json;
+
+    /// §21.3: a freeze point and a locked snapshot say so, and a list
+    /// holding a locked one says what unlocks it.
+    #[test]
+    fn snapshot_list_marks_locks_and_freeze_points() {
+        let list = vec![
+            json!({"name": "early", "online": true, "taken_at": "t1", "locked": true,
+                   "frozen_in": 1, "freeze_point": null}),
+            json!({"name": "base", "online": false, "taken_at": "t2", "locked": false,
+                   "frozen_in": null, "freeze_point": 1}),
+            json!({"name": "after", "online": false, "taken_at": "t3", "locked": false}),
+        ];
+        let out = render_snapshots(&list);
+        assert!(
+            out.contains("early                    online   locked (gen 1)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("base                     offline  freeze point (gen 1)"),
+            "{out}"
+        );
+        assert!(out.contains("after                    offline  -"), "{out}");
+        assert!(out.contains("vmlab worktree thaw"), "{out}");
+        assert!(!render_snapshots(&list[2..]).contains("thaw"));
+    }
 
     /// A machine at an address, since every column but `IP` is exercised by the
     /// shared fixture as it stands.

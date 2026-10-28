@@ -2281,6 +2281,10 @@ impl LabRuntime {
     /// Stop everything and delete clones, lab-local state, and dynamic net
     /// config (PRD §12).
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
+        // Worktree overlays name the frozen files by absolute path (§21.5).
+        // With none depending, the freeze goes with the rest of `.vmlab/`.
+        self.refuse_while_depended_on("cannot destroy the main lab")
+            .await?;
         self.workspaces.stop_all().await;
         self.record_finalise_all("lab destroyed").await;
         self.down(&[], true).await?;
@@ -2683,6 +2687,9 @@ impl LabRuntime {
     /// other machine passes straight through.
     pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
         let m = self.machine(vm_name)?;
+        if let Some(why) = super::worktree::take_refusal(&*self.state.lock().await, vm_name, snap) {
+            return Err(crate::proto::CommandError::conflict(why).into());
+        }
         self.workspaces
             .before_capture(vm_name, self.workspace_of(vm_name).as_ref())
             .await?;
@@ -2752,6 +2759,17 @@ impl LabRuntime {
             state.machine_mut(name).snapshots.get(snap).cloned()
         }
         .ok_or_else(|| anyhow!("\"{name}\" has no snapshot \"{snap}\""))?;
+        if let Some(g) = record.frozen_in {
+            return Err(
+                crate::proto::CommandError::conflict(super::worktree::locked_refusal(
+                    name,
+                    snap,
+                    g,
+                    "restoring",
+                ))
+                .into(),
+            );
+        }
 
         let m = self.machine(name)?;
         let workspace = self.workspace_of(name);
@@ -2814,11 +2832,16 @@ impl LabRuntime {
         // a syncer coming back to a rolled-back tree it was never told about
         // is exactly the propagation this bracket exists to prevent.
         let restored = match noted {
-            Ok(()) => {
-                Arc::clone(&m)
-                    .restore(self.services(), snap, record.online)
-                    .await
-            }
+            // A freeze point is no internal snapshot of the machine's own
+            // disks but the state of the frozen files under them (§21.3).
+            Ok(()) => match record.freeze_point {
+                Some(generation) => self.restore_freeze_point(&m, snap, generation).await,
+                None => {
+                    Arc::clone(&m)
+                        .restore(self.services(), snap, record.online)
+                        .await
+                }
+            },
             Err(e) => Err(e),
         };
         // Put back on **both** paths. A workspace whose syncer quietly never
@@ -2890,8 +2913,38 @@ impl LabRuntime {
         }
     }
 
+    /// Delete one machine's snapshot. A locked one refuses (§21.3), and a
+    /// freeze point is a record alone: its state is the frozen files', which
+    /// nothing deletes but a thaw, and the overlay's empty mark of it (when a
+    /// restore left one) goes with it.
     pub async fn delete_snapshot(&self, vm_name: &str, snap: &str) -> Result<()> {
         let mut state = self.state.lock().await;
+        let record = state
+            .machines
+            .get(vm_name)
+            .and_then(|m| m.snapshots.get(snap));
+        if let Some(g) = record.and_then(|r| r.frozen_in) {
+            return Err(
+                crate::proto::CommandError::conflict(super::worktree::locked_refusal(
+                    vm_name, snap, g, "deleting",
+                ))
+                .into(),
+            );
+        }
+        if record.is_some_and(|r| r.freeze_point.is_some()) {
+            let m = self.machine(vm_name)?;
+            for disk in m.disk_paths() {
+                let marked = crate::freeze::inspect::disk_facts(&disk)
+                    .await?
+                    .is_some_and(|f| f.snapshots.iter().any(|s| s.name == snap));
+                if marked {
+                    crate::template::qimg::snapshot_delete(&disk, snap).await?;
+                }
+            }
+            state.machine_mut(vm_name).snapshots.remove(snap);
+            state.save(&self.lab_local)?;
+            return Ok(());
+        }
         self.machine(vm_name)?.delete_snapshot(snap).await?;
         state.machine_mut(vm_name).snapshots.remove(snap);
         state.save(&self.lab_local)?;
@@ -2908,7 +2961,16 @@ impl LabRuntime {
         Ok(json!(
             snaps
                 .into_iter()
-                .map(|(name, r)| json!({"name": name, "online": r.online, "taken_at": r.taken_at}))
+                .map(|(name, r)| json!({
+                    "name": name,
+                    "online": r.online,
+                    "taken_at": r.taken_at,
+                    // §21.3: stored in a frozen file, so restore and delete
+                    // refuse until `vmlab worktree thaw`.
+                    "locked": r.frozen_in.is_some(),
+                    "frozen_in": r.frozen_in,
+                    "freeze_point": r.freeze_point,
+                }))
                 .collect::<Vec<_>>()
         ))
     }
@@ -3397,6 +3459,9 @@ mod tests {
         }
         fn run_dir(&self) -> &std::path::Path {
             &self.dir
+        }
+        fn disk_paths(&self) -> Vec<PathBuf> {
+            vec![self.dir.join("disk0.qcow2")]
         }
         fn required_binaries(&self) -> Vec<String> {
             // Something every host running the test suite has, so preflight is

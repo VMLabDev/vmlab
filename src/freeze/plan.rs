@@ -676,8 +676,10 @@ pub fn plan_thaw(input: &ThawInput) -> Result<ThawPlan> {
             let names = thaw_disk(&mut out.plan, &mut active, input, m, d, &stranded)?;
             survivors.get_or_insert(names);
         }
-        out.survivors
-            .insert(m.name.clone(), survivors.unwrap_or_default());
+        // A machine with no disk (never built) keeps its records as they are.
+        if let Some(survivors) = survivors {
+            out.survivors.insert(m.name.clone(), survivors);
+        }
         if !stranded.is_empty() {
             out.dropped
                 .insert(m.name.clone(), stranded.into_iter().collect());
