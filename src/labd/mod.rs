@@ -11,6 +11,7 @@ pub mod container_ctl;
 pub mod display;
 pub mod events;
 pub mod forward_plan;
+pub mod freeze_clone;
 pub mod guest_os;
 pub mod hypervisor;
 pub mod identity;

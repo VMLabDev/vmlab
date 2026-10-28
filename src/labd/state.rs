@@ -13,7 +13,7 @@ use crate::config::model::MacAddr;
 
 /// One machine's persisted state. VMs and containers record the same things;
 /// the image fields simply stay `None` on a VM.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MachineState {
     /// MAC per NIC index — generated deterministically, persisted so DHCP
     /// reservations stay stable (PRD §9.4).
@@ -66,7 +66,7 @@ pub struct TimedOutRun {
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     /// Captured while running (disk+RAM+device) vs powered off (disk only).
     pub online: bool,
