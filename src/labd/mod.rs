@@ -11,9 +11,11 @@ pub mod container_ctl;
 pub mod display;
 pub mod events;
 pub mod forward_plan;
+pub mod freeze_clone;
 pub mod guest_os;
 pub mod hypervisor;
 pub mod identity;
+pub mod isolation;
 pub mod lab;
 #[cfg(test)]
 mod legacy_agent_tests;
@@ -34,6 +36,7 @@ pub mod usb;
 pub mod vm;
 pub mod vm_agent;
 pub mod workspace;
+pub mod worktree;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,10 +109,27 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     let profiles = crate::profiles::ProfileSet::load_default()?;
     let runtime = LabRuntime::build(config, event_log, &profiles).await?;
 
+    // Worktree isolation (PRD §21.4) was decided as the runtime was built;
+    // say so once, where the lab's history keeps it.
+    if let Some(isolation) = &runtime.isolation {
+        tracing::info!("{}", isolation.describe());
+        for warning in &isolation.warnings {
+            tracing::warn!("{warning}");
+        }
+        runtime.events.emit(
+            "lab.isolation",
+            serde_json::to_value(isolation.status()).unwrap_or_default(),
+        );
+    }
+
     // Bridge any global segments to the supervisor (PRD §9.2). Best-effort:
     // a failure here is logged but doesn't abort the daemon (lab-local
-    // segments still work).
-    if let Err(e) = runtime
+    // segments still work). A worktree lab declaring a peer joins none: its
+    // `up` refuses (§21.4), and nothing it starts may reach another host.
+    let refusal = runtime.isolation.as_ref().and_then(|i| i.refusal());
+    if let Some(why) = refusal {
+        tracing::warn!("not attaching global segments: {why}");
+    } else if let Err(e) = runtime
         .network
         .lock()
         .await
@@ -1143,6 +1163,10 @@ impl Handler<LabRequest> for LabdHandler {
                 Ok(json!(true))
             }
             LabRequest::SnapshotList { machine } => Ok(lab.snapshots(&machine).await?),
+            LabRequest::WorktreeFreeze { snapshot } => Ok(lab.worktree_freeze(&snapshot).await?),
+            LabRequest::WorktreeThaw {
+                drop_online_snapshots,
+            } => Ok(lab.worktree_thaw(drop_online_snapshots).await?),
 
             // The three `dev sync` verbs that need the daemon (§19.6).
             // `status` is not among them: a syncer's report is part of the

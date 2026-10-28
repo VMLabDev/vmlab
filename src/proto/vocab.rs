@@ -890,6 +890,31 @@ vocabulary! {
         SnapshotList = "snapshot.list" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
+        /// Freeze the stopped lab at the offline snapshot `snapshot` on every
+        /// machine, as the next generation worktree labs clone from (PRD
+        /// §21.1).
+        #[one_way(
+            "cli",
+            "Freezing is done once, by hand, in the main checkout: the \
+             machines' disks become read-only files every worktree of the \
+             repository depends on. A lab script has no reason to take a \
+             decision with that reach, and nothing to gain from it."
+        )]
+        WorktreeFreeze = "worktree.freeze" {
+            snapshot: String,
+        },
+        /// Fold the freeze back into the stopped main lab's disks and unlock
+        /// its earlier snapshots (PRD §21.3). Refused while any worktree lab
+        /// backs onto it. `drop_online_snapshots` gives up the online
+        /// snapshots taken since a freeze, whose machine state no commit can
+        /// carry, rather than refusing.
+        #[one_way(
+            "cli",
+            "The counterpart of `worktree.freeze`, for the same reason."
+        )]
+        WorktreeThaw = "worktree.thaw" {
+            #[serde(default)] drop_online_snapshots: bool,
+        },
 
         /// Run a workspace sync pass now and answer with what it decided
         /// (PRD §19.6). What `vmlab dev sync flush` and `status --wait` are.

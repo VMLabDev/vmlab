@@ -1,0 +1,197 @@
+page cmd_worktree {
+  title = "vmlab worktree"
+  chapter_header "vmlab worktree" {
+    kicker       = "Commands · reference"
+    reading_time = "6 min read"
+    updated      = "2026-10-28"
+    version      = "vmlab 0.31"
+  }
+
+  p <<DOC
+    `vmlab worktree` freezes the main checkout's lab for
+    [worktree labs](guide_worktrees) to clone their machines from, thaws it,
+    and reports where the family stands. `freeze` and `thaw` run in the main
+    checkout and go to its lab daemon, as the snapshot verbs do. `status`
+    reads the files alone, so it answers in the main checkout or any linked
+    worktree with no daemon running.
+  DOC
+
+  code sh { source = "vmlab worktree <COMMAND>" }
+
+  table {
+    rows:
+      | "Subcommand" | "Meaning" |
+      | "`freeze`" | "Freeze the stopped main lab at an offline snapshot every machine has, for linked git worktrees to clone their machines from." |
+      | "`thaw`" | "Fold the freeze back into the stopped main lab's disks and unlock its earlier snapshots." |
+      | "`status`" | "Each generation of the main lab's freeze, its snapshot, and the worktrees whose disks back onto it." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    A lab daemon decides [worktree isolation](guide_worktrees) when it
+    starts, and `freeze` and `thaw` run in a daemon that started before
+    them. The next `up`, `pull`, `vm start` or `vm restart` in the main
+    checkout replaces that daemon first, as it does after an edit to
+    `vmlab.wcl` (see [vmlab up](cmd_up)).
+  DOC
+
+  h2 "vmlab worktree freeze"
+
+  code sh { source = "vmlab worktree freeze [OPTIONS] <SNAPSHOT>" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`<SNAPSHOT>`" | "The offline snapshot to freeze at." |
+      | "`--json`" | "Emit the raw JSON reply instead of a report." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Freezes every machine of the lab at `SNAPSHOT` as the next
+    **generation**, `1` for the first freeze. Each disk is rewound to the
+    snapshot, moved into `.vmlab/freeze/<n>/<machine>/` and made read-only,
+    and the machine's disk becomes an overlay on it that holds the state the
+    lab had, so the main lab carries on unchanged. The machine's
+    `OVMF_VARS.fd`, `tpm-state/`, `clone-source`, `firstboot.done` and state record, and the
+    lab's named volumes, are copied into the generation. `.vmlab/worktree.json`
+    is written last, naming the generation and the snapshot; its presence is
+    what makes the lab frozen. A failure at any step undoes every step
+    before it, and the error says so.
+  DOC
+
+  p <<DOC
+    The overlay is written by copying the disk (`cp --reflink=auto`, free on
+    a filesystem with reflinks) and rebasing an empty overlay onto the
+    frozen file with a safe `qemu-img rebase`, which writes only the
+    clusters that differ from the snapshot. Without reflinks each copy is a
+    full one, and every disk's copy stays until the whole freeze has
+    committed.
+  DOC
+
+  p <<DOC
+    `SNAPSHOT` becomes the **freeze point**, and every other snapshot of the
+    lab is **locked** in this generation: see [vmlab snapshot](cmd_snapshot).
+    Freezing again freezes the main lab's current overlays as generation
+    `n+1`, backed by generation `n`, and the previous freeze point is locked
+    with the rest. On success it prints:
+  DOC
+
+  code text { source = <<'SRC'
+froze generation 1 at "provisioned": dc01, web
+snapshots taken before it are locked until `vmlab worktree thaw`; linked worktrees now clone these machines on `vmlab up`
+SRC
+  }
+
+  p "Then a `WARNING:` line for each leftover file it could not clean up. It refuses, and changes nothing, when:"
+
+  list {
+    li "the lab is in a linked git worktree; only the main checkout's lab freezes,"
+    li "the lab declares no machines,"
+    li "a machine is running (`vmlab down` first),"
+    li "a machine has no snapshot `SNAPSHOT`, or has never been built,"
+    li "the snapshot was taken online,"
+    li "the snapshot is itself locked in an earlier generation (take a new offline snapshot),"
+    li "a disk lacks the internal snapshot the lab's record says it holds,"
+    li "a disk still holds the temporary snapshot an interrupted freeze or thaw left behind,"
+    li "a disk names its backing file by a relative path, which the move would break."
+  }
+
+  h2 "vmlab worktree thaw"
+
+  code sh { source = "vmlab worktree thaw [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`--drop-online-snapshots`" | "Give up the online snapshots taken since a freeze, whose machine state cannot be carried into the thawed disks, rather than refuse." |
+      | "`--json`" | "Emit the raw JSON reply instead of a report." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Collapses each disk's chain back into its oldest frozen file, which
+    becomes the machine's disk again. Every layer above it is committed down
+    with `qemu-img commit`, and the snapshots each layer holds are carried
+    across one by one, so offline snapshots taken after a freeze survive.
+    The main lab keeps its current state. `.vmlab/freeze/` and
+    `worktree.json` are removed and every snapshot is unlocked. On success it
+    prints:
+  DOC
+
+  code text { source = <<'SRC'
+thawed: the freeze is gone and every snapshot is unlocked
+SRC
+  }
+
+  p <<DOC
+    With `--drop-online-snapshots` it adds `dropped snapshot "<name>" of
+    <machine>` for each snapshot it gave up, then any `WARNING:` lines. It
+    refuses when:
+  DOC
+
+  list {
+    li "the lab is in a linked git worktree; only the main checkout's lab thaws,"
+    li "the lab is not frozen,"
+    li "any worktree lab's disk backs onto any generation. The refusal names each worktree and its generations; run `vmlab destroy` in each to release it,"
+    li "a machine is running (`vmlab down` first),"
+    li "a machine holds online snapshots stored above its oldest generation, unless `--drop-online-snapshots` is given. The refusal names them,"
+    li "a disk's chain is not the shape a freeze leaves: a temporary snapshot left by an interrupted freeze, a snapshot name stored twice in one chain, or a generation that does not hold its own freeze point."
+  }
+
+  h2 "vmlab worktree status"
+
+  code sh { source = "vmlab worktree status [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`--json`" | "Emit the raw JSON instead of a table." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    Prints the main checkout, then `this worktree:` when run in a linked
+    worktree, then one row per generation: `GENERATION` (the newest marked
+    `(newest)`), `SNAPSHOT`, `MACHINES` and `WORKTREES`, the linked worktree
+    labs whose disks back onto it, or `-`. It reads every worktree disk's
+    backing chain directly, so it counts worktree labs whose daemons are not
+    running. An unfrozen lab prints `not frozen` with the command that
+    freezes it. Generations on disk with no `worktree.json` add a warning
+    that worktree labs do not clone from them.
+  DOC
+
+  h2 "Examples"
+
+  p "Freeze a provisioned lab and bring it back up under isolation:"
+  code sh { source = <<'SRC'
+vmlab down
+vmlab snapshot create provisioned
+vmlab worktree freeze provisioned
+vmlab up
+SRC
+  }
+
+  p "See which worktrees still hold the freeze:"
+  code sh { source = "vmlab worktree status" }
+
+  code text { source = <<'SRC'
+main checkout: /home/wil/src/app
+GENERATION  SNAPSHOT     MACHINES   WORKTREES
+1           provisioned  dc01, web  /home/wil/src/feat-x
+2 (newest)  upgraded     dc01, web  -
+SRC
+  }
+
+  p "Thaw, giving up the online snapshots taken since the freeze:"
+  code sh { source = "vmlab worktree thaw --drop-online-snapshots" }
+
+  h2 "Exit status"
+
+  p <<DOC
+    Exit status is 0 on success, and 0 for `status` on an unfrozen lab.
+    Every refusal listed above exits 5 (`conflict`). A step that failed and
+    was rolled back, an invalid snapshot name, or a daemon that cannot be
+    reached exits 1 (`failed`). A usage error exits 2.
+  DOC
+}

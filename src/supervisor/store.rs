@@ -25,6 +25,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::Supervisor;
+use super::backing;
 use super::templates::op_sink;
 use crate::config::model::{TemplateRef, VariantRef, parse_template_ref};
 use crate::proto::{CommandError, Event};
@@ -255,10 +256,14 @@ pub(super) fn backed_clones_reason(
         .iter()
         .map(|d| d.canonicalize().unwrap_or_else(|_| d.clone()))
         .collect();
+    // A machine reaches a doomed disk through several of its own disks, or
+    // a base through its variant: name it once.
+    let mut named = HashSet::new();
     let users: Vec<&str> = clones
         .iter()
         .filter(|(backing, _)| doomed.contains(backing))
         .map(|(_, who)| who.as_str())
+        .filter(|who| named.insert(*who))
         .collect();
     match users.as_slice() {
         [] => None,
@@ -393,29 +398,38 @@ fn family_matches(filter: Option<&str>, arch: &str, name: &str) -> bool {
     }
 }
 
-/// Every linked clone in a registered lab, as (canonical backing disk,
-/// `lab/vm`). The backing disk is a version's base or one of its variant
-/// overlays (§6.6). Best-effort: unreadable labs/clones are skipped, so a
-/// scan hiccup never blocks a prune.
+/// Every image a clone leans on, as (canonical image, who): for each qcow2
+/// in the working data of every registered lab and of the rest of its
+/// worktree family (§21.5), every image anywhere in its backing chain —
+/// frozen generations, a template variant and its base alike. The who is
+/// `lab/vm`, a frozen file carrying its generation (see [`backing::owner`]).
+/// Best-effort: unreadable labs and images end a chain early rather than
+/// failing, so a scan hiccup never blocks a prune.
 pub(super) async fn clones_by_backing() -> Vec<(PathBuf, String)> {
-    let mut out = Vec::new();
     let reg = super::registry::Registry::load();
-    for lab in reg.labs() {
-        let vms = crate::paths::lab_local_dir(&lab.root).join("vms");
-        let Ok(entries) = std::fs::read_dir(&vms) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let disk = e.path().join("disk0.qcow2");
-            if !disk.is_file() {
-                continue;
-            }
-            if let Ok(info) = crate::template::qimg::image_info(&disk).await
-                && let Some(backing) = info.backing_file
-                && let Ok(canon) = backing.canonicalize()
-            {
-                let vm = e.file_name().to_string_lossy().into_owned();
-                out.push((canon, format!("{}/{vm}", lab.name)));
+    let registered: Vec<(String, PathBuf)> = reg
+        .labs()
+        .iter()
+        .map(|l| (l.name.clone(), l.root.clone()))
+        .collect();
+    let roots = backing::scan_roots(
+        &registered,
+        crate::freeze::main_lab_root,
+        crate::freeze::worktree_lab_roots,
+    );
+    let read = |image: PathBuf| async move {
+        crate::template::qimg::image_info(&image)
+            .await
+            .ok()
+            .and_then(|info| info.backing_file)
+    };
+    let mut headers = backing::Headers::new();
+    let mut out = Vec::new();
+    for scan in roots {
+        for disk in backing::lab_disks(&crate::paths::lab_local_dir(&scan.root)) {
+            let who = backing::owner(&scan.label, &disk);
+            for image in backing::backing_chain(&disk.path, &mut headers, &read).await {
+                out.push((image, who.clone()));
             }
         }
     }

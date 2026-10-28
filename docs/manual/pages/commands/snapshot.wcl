@@ -3,7 +3,7 @@ page cmd_snapshot {
   chapter_header "vmlab snapshot" {
     kicker       = "Commands · reference"
     reading_time = "7 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -77,6 +77,13 @@ page cmd_snapshot {
     [vmlab dev](cmd_dev). Every other machine passes straight through.
   DOC
 
+  p <<DOC
+    In a [worktree lab](guide_worktrees) family, the capture refuses two
+    names and asks for another. A locked snapshot's name is refused because
+    its record says where that snapshot really lives. The freeze point's
+    name is refused because every lab of the family restores it.
+  DOC
+
   h2 "vmlab snapshot restore"
 
   code sh { source = "vmlab snapshot restore [OPTIONS] <NAME>" }
@@ -144,6 +151,21 @@ page cmd_snapshot {
     copy host-side before you decide.
   DOC
 
+  h3 "Restoring under a freeze"
+
+  p <<DOC
+    Once the main checkout's lab is frozen for
+    [worktree labs](guide_worktrees), two kinds of snapshot restore
+    differently, in the main lab and in every worktree lab built on it:
+  DOC
+
+  list {
+    li "The **freeze point**, the snapshot `vmlab worktree freeze` was given, is the state of the frozen files under the machine's disks. Restoring it stops a running machine, then replaces each disk with an empty overlay on its frozen file and writes no frozen file. Offline snapshots taken since the freeze are carried into the new overlay and survive; with none, the restore is instant, and each one carried adds time in proportion to what it holds. An online one cannot be carried, so the restore refuses, naming it, until it is deleted. A disk that is not an overlay on the frozen file, such as one built from its template, refuses too."
+    li "A **locked** snapshot, one the main lab took before the freeze, lives inside a frozen file that worktree labs read. Restoring it would write that file, so the restore refuses, naming `vmlab worktree thaw`."
+  }
+
+  p "Snapshots taken after the freeze restore as any other."
+
   h2 "vmlab snapshot list"
 
   code sh { source = "vmlab snapshot list <VM>" }
@@ -157,9 +179,13 @@ page cmd_snapshot {
 
   p <<DOC
     Prints one row per snapshot of the machine: `NAME`, `KIND` (`online` or
-    `offline`) and `TAKEN`, the capture time in UTC. A machine with none,
-    including a name the lab does not declare, prints `no snapshots for
-    <name>`.
+    `offline`), `FREEZE` and `TAKEN`, the capture time in UTC. `FREEZE` is
+    `-` for an ordinary snapshot, `freeze point (gen <n>)` for the snapshot
+    generation `n` of a [worktree lab](guide_worktrees) freeze was taken at,
+    and `locked (gen <n>)` for one taken before generation `n` was frozen.
+    When any is locked, a last line says `vmlab worktree thaw` unlocks them.
+    A machine with none, including a name the lab does not declare, prints
+    `no snapshots for <name>`.
   DOC
 
   h2 "vmlab snapshot delete"
@@ -176,7 +202,10 @@ page cmd_snapshot {
 
   p <<DOC
     Removes the snapshot from the machine's disk and from the lab's record.
-    Prints `snapshot "<name>" deleted`.
+    Prints `snapshot "<name>" deleted`. A locked snapshot is refused, naming
+    `vmlab worktree thaw`. Deleting the freeze point removes it from this
+    lab only: the frozen files and the other labs of the family keep it, and
+    this lab can no longer reset to it.
   DOC
 
   h2 "Examples"
@@ -189,13 +218,16 @@ SRC
   }
 
   code sh { source = <<'SRC'
-NAME                     KIND     TAKEN
-pre-upgrade              online   2026-09-02T09:14:31Z
+NAME                     KIND     FREEZE                 TAKEN
+pre-upgrade              online   -                      2026-09-02T09:14:31Z
 SRC
   }
 
   p "Roll the whole lab back to a known state:"
   code sh { source = "vmlab snapshot restore clean" }
+
+  p "Reset a worktree lab to the state the main lab was frozen in:"
+  code sh { source = "vmlab snapshot restore provisioned" }
 
   p "Restore a dev machine whose workspace is halted, giving up the guest's copies:"
   code sh { source = "vmlab snapshot restore --vm dev01 --discard-guest-changes before-refactor" }
@@ -204,11 +236,14 @@ SRC
 
   p <<DOC
     Exit status is 0 on success, and 0 for `list` on a machine with no
-    snapshots. Every refusal and failure exits 1 (`failed`): an unknown
+    snapshots. Every refusal and failure not listed under exit 5 exits 1 (`failed`): an unknown
     machine, a missing snapshot, a capture refused because the workspace is
     not in step, a restore refused on a halted workspace or a changed image
     pin, and a snapshot the machine cannot take or restore. Exit 5
     (`conflict`) means the supervisor tracks a lab with this name from
-    another directory. A usage error exits 2.
+    another directory, or a freeze refused the verb: a locked snapshot
+    restored, deleted or taken again, the freeze point taken again, or a
+    freeze-point restore blocked by an online snapshot or a disk that is
+    not an overlay on the frozen file. A usage error exits 2.
   DOC
 }

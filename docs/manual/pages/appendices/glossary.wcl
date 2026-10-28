@@ -6,7 +6,7 @@ page apx_glossary {
   chapter_header "Glossary" {
     kicker       = "Appendices · reference"
     reading_time = "8 min read"
-    updated      = "2026-10-25"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -27,6 +27,9 @@ page apx_glossary {
       | "fabric" | "The userspace network vmlab runs every segment on: frame codecs, an L2 switch, DHCP, DNS, a gateway and a NAT engine, all in the lab daemon's process. No tap, bridge or macvlan. See [Networking](guide_networking)." |
       | "fast path" | "An optional kernel-assisted tier of the fabric (`afxdp` or `sockmap`) probed at daemon start and used when it works. `vmlab fastpath` says which tier is active. See [Networking](guide_networking)." |
       | "forward" | "A `forward {}` on a segment, or a `port {}` on a container, that maps a host TCP port onto a guest port. Planned as a whole before any is installed. Its host port is declared, or automatic when omitted: vmlab picks a free one and [vmlab status](cmd_status) shows it. See [Networking](guide_networking)." |
+      | "freeze" | "The main checkout's lab disks made read-only at a named offline snapshot by `vmlab worktree freeze`, so worktree labs can clone from them, with the firmware variables, TPM state, volumes and state records copied beside them. Kept as numbered generations under `.vmlab/freeze/<n>/`; undone by `vmlab worktree thaw`. Not a template: it is working data on one host and is never committed. See [Worktree labs](guide_worktrees)." |
+      | "freeze point" | "The snapshot a generation was frozen at. Every lab of the family holds it, and restoring it empties the lab's overlays onto the frozen files. See [Worktree labs](guide_worktrees)." |
+      | "generation" | "One freeze of the main lab, numbered from 1 under `.vmlab/freeze/<n>/`. Freezing again adds generation `n+1`, backed by `n`; a worktree lab keeps the generation it was cloned from. See [Worktree labs](guide_worktrees)." |
       | "global segment" | "A segment with `global = true`, owned by the supervisor rather than one lab, so machines from several labs share it; it can also peer with another host over a trunk. See [Networking](guide_networking)." |
       | "halt" | "The state a workspace enters when a sync pass finds a path changed on both sides. The whole workspace stops, both directions, on that one machine; nothing is written or deleted. Resolved from the host with the `vmlab dev sync` verbs. See [Dev machines and the workspace syncer](guide_dev)." |
       | "handler" | "An `on \"<event>\" { run = … }` block in the lab file that runs a wscript when the named event fires. See [Events and handlers](guide_events)." |
@@ -37,6 +40,7 @@ page apx_glossary {
       | "lab daemon" | "The per-lab process the supervisor spawns on `up`: lifecycle, snapshots, the fabric for the lab's segments, events, shares and the syncer. Logs to `.vmlab/lab.log`. See [How vmlab runs a lab](guide_architecture)." |
       | "ledger" | "The host-side record of what the two sides of a workspace last agreed on, per path. Guest changes are drained into it; the note that a re-seed is owed and the halt a restore refuses on both ride it. See [Dev machines and the workspace syncer](guide_dev)." |
       | "linked clone" | "A VM's disk: a qcow2 whose backing file is the template image in the store. Created on `up` under `.vmlab/`, kept by `down`, deleted by `destroy`. See [Templates and the store](guide_templates)." |
+      | "locked snapshot" | "A snapshot the main lab took before a freeze. It lives inside a frozen file, so restoring, deleting or taking it again is refused until `vmlab worktree thaw`. See [Snapshots](guide_snapshots)." |
       | "login" | "A `login {}` block on a machine: a declared guest account a person lands as. `vmlab exec --user`, `vmlab shell --user` and a script's `as_login` select one by label. See [Logins](guide_logins)." |
       | "logon" | "The Windows session vmlab mints for a login: a token from `LogonUser` and a loaded profile, cached per (account, secret, machine). The Linux equivalent is a real session through `su -l` or `setuid`. See [Logins](guide_logins)." |
       | "machine" | "A VM or a lab container. Every verb that takes a machine name accepts either kind. See [How vmlab runs a lab](guide_architecture)." |
@@ -67,6 +71,8 @@ page apx_glossary {
       | "VM" | "A `vm {}` in a lab: a QEMU guest booted from a linked clone of a template, or from a blank disk when scratch. See [Lab file: vm and its children](ref_vm)." |
       | "watchdog" | "A supervisor check that fires an event on a host condition, such as `host.disk_low` when the filesystem under the store or a lab's clones passes the configured threshold. See [Events and handlers](guide_events)." |
       | "workspace" | "The host directory `@dev(workspace = …)` names, mirrored into a dev machine as a guest-local copy of that canonical host tree. The host copy is what survives `destroy`. See [Dev machines and the workspace syncer](guide_dev)." |
+      | "worktree isolation" | "The rules a freeze turns on for the main lab and every worktree lab built on it: NAT refuses every new flow to the host, port forwards bind `127.0.0.1`, and a worktree lab's global segments join `<segment>@<worktree>`. Shown by `vmlab status`. See [Worktree labs](guide_worktrees)." |
+      | "worktree lab" | "A lab instance in a linked git worktree whose machines are linked clones of the main checkout's freeze rather than of their templates. It starts as if the freeze point had just been restored, under worktree isolation. An instance in an ordinary directory is not one. See [Worktree labs](guide_worktrees)." |
       | "wscript" | "The scripting language vmlab's provisions, handlers and `vmlab script` run. vmlab registers its lab, segment and machine API as a wscript host module. See [Guest automation with wscript](guide_scripting)." |
       | "wscripti" | "The `.wscripti` interface file describing that host module, which an editor's wscript language server reads for completion and diagnostics. See [wscript API: Lab and Segment](ref_ws_lab)." |
   }

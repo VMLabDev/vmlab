@@ -39,12 +39,17 @@
 //! and [`NatEngine::udp_bind_guest_flow`] do the same for UDP datagrams.
 //! [`PortForwarder`] ties host listeners to those primitives.
 //!
+//! Under worktree isolation (PRD §21.4) a [`HostGuard`] refuses every new
+//! flow to the host's own addresses: a SYN is answered with RST, a UDP
+//! datagram or an ICMP echo is dropped ([`guard`]).
+//!
 //! Frames toward a guest need the guest's MAC: it is learned from every
 //! frame the engine sees, and the gateway can prime the table via
 //! [`NatEngine::learn_mac`] (it sees ARP/DHCP). Unknown guests fall back to
 //! the L2 broadcast address, which the switch floods.
 
 mod forward;
+pub mod guard;
 mod icmp;
 mod udp;
 mod vtcp;
@@ -53,6 +58,7 @@ mod vtcp;
 mod tests;
 
 pub use forward::PortForwarder;
+pub use guard::HostGuard;
 pub use icmp::{Pinger, SubprocessPinger};
 pub use vtcp::{FlowKey, GuestStream};
 
@@ -116,6 +122,9 @@ pub struct NatEngine {
     macs: StdMutex<HashMap<Ipv4Addr, MacAddr>>,
     icmp: icmp::IcmpState,
     pinger: Arc<dyn Pinger>,
+    /// Worktree isolation's refusal of host addresses (§21.4); unset outside
+    /// a frozen family.
+    guard: std::sync::OnceLock<Arc<HostGuard>>,
     ip_id: AtomicU16,
     eph_counter: AtomicU32,
 }
@@ -141,6 +150,7 @@ impl NatEngine {
             macs: StdMutex::new(HashMap::new()),
             icmp: icmp::IcmpState::new(),
             pinger,
+            guard: std::sync::OnceLock::new(),
             ip_id: AtomicU16::new(1),
             eph_counter: AtomicU32::new(0),
         })
@@ -148,6 +158,18 @@ impl NatEngine {
 
     pub fn config(&self) -> &NatConfig {
         &self.cfg
+    }
+
+    /// Put the engine under worktree isolation (§21.4): from now on every
+    /// new flow `guard` refuses is reset or dropped. Set once; a second call
+    /// is ignored.
+    pub fn set_guard(&self, guard: Arc<HostGuard>) {
+        let _ = self.guard.set(guard);
+    }
+
+    /// Whether worktree isolation refuses a new flow to `dst`.
+    fn refused(&self, dst: Ipv4Addr, kind: guard::FlowKind) -> bool {
+        self.guard.get().is_some_and(|g| g.refuses(dst, kind))
     }
 
     /// Prime the IP → MAC table (the gateway sees ARP/DHCP and knows best).
@@ -199,13 +221,15 @@ impl NatEngine {
             let _ = tx.send(seg).await;
             return;
         }
-        if seg.is_syn() && !seg.is_ack() {
+        let opens = seg.is_syn() && !seg.is_ack();
+        if opens && !self.refused(key.dst_ip, guard::FlowKind::Tcp { port: key.dst_port }) {
             debug!(?key, "nat: passive vtcp open");
             let (tx, rx) = mpsc::channel(64);
             self.tcp_flows.lock_recover().insert(key, tx);
             vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx);
         } else if !seg.is_rst() {
-            // Anything unexpected for an unknown flow: reset it.
+            // Anything unexpected for an unknown flow, or a SYN worktree
+            // isolation refuses: reset it.
             if let Some(rst) = vtcp::rst_for(ip, &tcp, self.next_ip_id()) {
                 self.send_frame(src_mac, &rst).await;
             }
@@ -225,6 +249,14 @@ impl NatEngine {
             }
             return;
         }
+        if self.refused(
+            ip.dst(),
+            guard::FlowKind::Udp {
+                port: udp_seg.dst_port(),
+            },
+        ) {
+            return;
+        }
         let key = FlowKey {
             guest_ip: ip.src(),
             guest_port: udp_seg.src_port(),
@@ -241,6 +273,9 @@ impl NatEngine {
         if icmp_msg.icmp_type() != ICMP_ECHO_REQUEST || ip.dst() == self.cfg.gw_ip {
             // Echo to the gateway itself is answered by the gateway, not
             // here; everything but echo requests is dropped.
+            return;
+        }
+        if self.refused(ip.dst(), guard::FlowKind::Icmp) {
             return;
         }
         let pkt = raw[..usize::from(ip.total_len())].to_vec();

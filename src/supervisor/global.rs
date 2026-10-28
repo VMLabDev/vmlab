@@ -573,7 +573,7 @@ impl GlobalSegments {
 
         let mut dhcp = DhcpConfig::new(subnet, gw_ip, gw_mac);
         dhcp.dns_server = Some(gw_ip);
-        dhcp.domain = Some(format!("{name}.{}", self.dns_suffix));
+        dhcp.domain = Some(format!("{}.{}", domain_label(name), self.dns_suffix));
         let zone = DnsZone::new(&self.dns_suffix);
 
         let gateway = Gateway::spawn(
@@ -851,6 +851,19 @@ fn spawn_tcp_peer_dialer(
             tokio::time::sleep(REDIAL_DELAY + dial_jitter()).await;
         }
     })
+}
+
+/// A global segment's name as a DNS domain label. A worktree lab's global
+/// segment is named `<segment>@<worktree>` (PRD §21.4), and a worktree is
+/// named by its directory: `@`, and anything else a segment name never
+/// holds, becomes `-`. A plain segment name passes through unchanged.
+fn domain_label(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '-',
+        })
+        .collect()
 }
 
 async fn dial_peer(addr: SocketAddr, segment: &str, psk: &str) -> Result<tokio::net::TcpStream> {
@@ -1272,6 +1285,14 @@ mod tests {
 
     /// A lease wins over a declared address, and a machine with neither is
     /// not named at all.
+    /// A worktree lab's segment name still makes a domain (§21.4).
+    #[test]
+    fn a_worktree_segment_name_makes_a_domain_label() {
+        assert_eq!(domain_label("corp"), "corp");
+        assert_eq!(domain_label("corp@feat-x"), "corp-feat-x");
+        assert_eq!(domain_label("corp@my tree"), "corp-my-tree");
+    }
+
     #[test]
     fn a_lease_names_a_machine() {
         let mut dir = Directory::default();

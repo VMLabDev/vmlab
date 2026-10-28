@@ -3,6 +3,7 @@
 //! aggregation. Auto-started by the CLI; runs in the foreground (the CLI
 //! detaches it into its own process group).
 
+pub mod backing;
 pub mod global;
 pub mod keepawake;
 pub mod registry;

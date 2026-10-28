@@ -43,6 +43,9 @@ pub struct SegmentNet {
     /// Supervisor-owned shared segment (PRD §9.2): no local gateway; bridged
     /// to the supervisor's global switch via a trunk.
     pub global: bool,
+    /// The name the supervisor knows a global segment by: its own name, or
+    /// `<name>@<worktree>` in a worktree lab (§21.4, [`LabNetwork::isolate`]).
+    pub global_name: String,
     /// Cross-host peer (`connect { host }`), forwarded to the supervisor.
     pub peer: Option<String>,
     /// This lab's NICs on a global segment, for the supervisor's DNS; filled
@@ -143,6 +146,9 @@ pub struct LabNetwork {
     /// Daemon inter-segment routing (§9.6): every lab-local segment's
     /// gateway, and the pairs connected by `routes_to` or a script.
     pub router: Arc<Router>,
+    /// Worktree isolation (§21.4): every segment's NAT engine refuses host
+    /// addresses. Set by [`Self::isolate`] before the gateways are wired.
+    pub isolated: bool,
 }
 
 impl LabNetwork {
@@ -185,6 +191,7 @@ impl LabNetwork {
                     nat: seg.nat,
                     dhcp: seg.dhcp,
                     global: seg.global,
+                    global_name: seg.name.clone(),
                     peer: seg.connect.as_ref().map(|c| c.host.clone()),
                     global_members: Vec::new(),
                     global_warnings: Vec::new(),
@@ -218,6 +225,7 @@ impl LabNetwork {
                     nat: true,
                     dhcp: true,
                     global: false,
+                    global_name: NAT_SEGMENT.to_string(),
                     peer: None,
                     global_members: Vec::new(),
                     global_warnings: Vec::new(),
@@ -232,7 +240,18 @@ impl LabNetwork {
         Ok(LabNetwork {
             segments,
             router: Router::new(),
+            isolated: false,
         })
+    }
+
+    /// Put the network under worktree isolation (§21.4): NAT engines wired
+    /// after this refuse host addresses, and each global segment takes the
+    /// name `plan` joins it under.
+    pub fn isolate(&mut self, plan: &super::isolation::IsolationPlan) {
+        self.isolated = true;
+        for seg in self.segments.values_mut().filter(|s| s.global) {
+            seg.global_name = plan.global_name(&seg.name);
+        }
     }
 
     pub fn segment_mut(&mut self, name: &str) -> Option<&mut SegmentNet> {
@@ -254,7 +273,7 @@ impl LabNetwork {
                 .context("connecting to supervisor for global segment")?;
             let resp = client
                 .send(crate::proto::SupRequest::GlobalAttach {
-                    name: seg.name.clone(),
+                    name: seg.global_name.clone(),
                     subnet: seg.config.as_ref().and_then(|c| c.subnet),
                     peer: seg.peer.clone(),
                     lab: Some(lab.to_string()),
@@ -284,7 +303,11 @@ impl LabNetwork {
                 .switch
                 .add_stream_port(stream, crate::net::switch::PortClass::Service)
                 .await;
-            tracing::info!("bridged global segment \"{}\" to supervisor", seg.name);
+            tracing::info!(
+                "bridged global segment \"{}\" to supervisor as \"{}\"",
+                seg.name,
+                seg.global_name
+            );
         }
         Ok(())
     }
@@ -303,7 +326,7 @@ impl LabNetwork {
             .segments
             .values()
             .filter(|s| s.global)
-            .map(|s| s.name.clone())
+            .map(|s| s.global_name.clone())
             .collect();
         if names.is_empty() {
             return;
@@ -451,6 +474,7 @@ impl LabNetwork {
                 &seg.switch,
                 &handle,
                 seg.nat,
+                self.isolated,
                 mtu,
                 (&router, &seg.name),
             );

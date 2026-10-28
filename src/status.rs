@@ -568,6 +568,33 @@ pub struct ForwardStatus {
     pub auto: bool,
 }
 
+/// Worktree isolation as the lab daemon decided it at start (PRD §21.4,
+/// ADR-0019): the lab is the frozen main lab or a worktree lab built on it,
+/// so NAT refuses host addresses, forwards bind `forward_bind`, and its
+/// global segments join the names in `globals`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolationStatus {
+    /// `main` | `worktree`.
+    pub role: String,
+    /// The linked worktree's name; `None` for the main lab.
+    pub worktree: Option<String>,
+    /// The family's newest generation and the snapshot it was frozen at.
+    pub generation: u32,
+    pub snapshot: String,
+    /// The address every port forward binds: `127.0.0.1`.
+    pub forward_bind: String,
+    /// Each global segment and the name it joins in the supervisor.
+    pub globals: Vec<IsolatedGlobal>,
+}
+
+/// One global segment under worktree isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IsolatedGlobal {
+    pub segment: String,
+    /// `<segment>@<worktree>` in a worktree lab, `<segment>` in the main lab.
+    pub joined: String,
+}
+
 // ---- downloads --------------------------------------------------------------
 
 /// Which artefact a download is fetching.
@@ -652,6 +679,16 @@ pub struct LabStatus {
     /// Absent from a daemon that predates the field.
     #[serde(default)]
     pub forwards: Vec<ForwardStatus>,
+    /// Worktree isolation (PRD §21.4), when the lab is in a frozen family.
+    /// `None` outside one, and from a daemon that predates the field.
+    #[serde(default)]
+    pub isolation: Option<IsolationStatus>,
+    /// The daemon planned which machines clone from the main checkout's
+    /// freeze (§21.2) against a freeze that has since moved — frozen,
+    /// refrozen or thawed — or before a machine lost its disk. A boot verb
+    /// replaces it, as it does a daemon whose `config_digest` is stale.
+    #[serde(default)]
+    pub freeze_stale: bool,
 }
 
 impl LabStatus {
@@ -784,6 +821,8 @@ pub(crate) mod fixtures {
             pulls: Vec::new(),
             config_digest: String::new(),
             forwards: Vec::new(),
+            isolation: None,
+            freeze_stale: false,
         }
     }
 }

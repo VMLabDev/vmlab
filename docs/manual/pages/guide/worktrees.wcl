@@ -1,0 +1,266 @@
+page guide_worktrees {
+  title = "Worktree labs"
+  chapter_header "Worktree labs" {
+    kicker       = "The guide · how-to"
+    reading_time = "9 min read"
+    updated      = "2026-10-28"
+    version      = "vmlab 0.31"
+  }
+
+  p <<DOC
+    Provisioning a lab can take hours: a domain promoted, a database seeded,
+    an IDE installed. A linked git worktree normally runs its own
+    [instance](guide_architecture) of the lab and builds every machine from
+    its template again. A **worktree lab** skips that. You freeze the main
+    checkout's lab once at an offline snapshot. Every linked worktree's
+    `vmlab up` then builds each machine as a linked clone of the frozen
+    disk, starting as if that snapshot had just been restored. The main lab
+    keeps running while worktree labs come and go, and no lab in the family
+    can reach another. The verbs are in [vmlab worktree](cmd_worktree).
+  DOC
+
+  p <<DOC
+    Nothing in `vmlab.wcl` declares a freeze. It is working data in the main
+    checkout's `.vmlab/`, so no branch can commit or carry one.
+  DOC
+
+  h2 "What this covers"
+
+  list {
+    li "freezing the main checkout's lab at an offline snapshot,"
+    li "checking that the family runs isolated,"
+    li "bringing up a worktree lab that clones its machines from the freeze,"
+    li "resetting any lab of the family to the freeze point,"
+    li "freezing again after the main lab moves on,"
+    li "thawing the freeze back into the main lab."
+  }
+
+  p <<DOC
+    You need a lab that already runs in the main checkout of a git
+    repository, and a linked worktree made with `git worktree add`.
+  DOC
+
+  h2 "Freeze the main lab"
+
+  p <<DOC
+    Run the freeze in the main checkout, with the lab stopped and an
+    **offline** snapshot of the same name on every machine. An online
+    snapshot is refused: its memory holds the main lab's DHCP leases and
+    agent sessions, and a clone booting its disk alone would see a power cut.
+  DOC
+
+  code sh { source = <<'SRC'
+cd ~/src/app
+vmlab down
+vmlab snapshot create provisioned
+vmlab worktree freeze provisioned
+SRC
+  }
+
+  code text { source = <<'SRC'
+froze generation 1 at "provisioned": dc01, web, db
+snapshots taken before it are locked until `vmlab worktree thaw`; linked worktrees now clone these machines on `vmlab up`
+SRC
+  }
+
+  p <<DOC
+    Each disk becomes read-only under `.vmlab/freeze/1/`, and the main lab
+    carries on in an overlay over it, in exactly the state it had. A failure
+    on any disk puts every machine back as it was.
+    [vmlab worktree freeze](cmd_worktree) lists what is copied and every
+    refusal.
+  DOC
+
+  p <<DOC
+    On a filesystem with reflinks, such as Btrfs or XFS, the freeze copies
+    nothing. On any other, it copies every disk in full and keeps the copies
+    until the whole freeze has committed, and copies the named volumes for
+    good, so the lab needs that much free space while it runs.
+  DOC
+
+  p <<DOC
+    The snapshot you froze at is now the **freeze point** of every lab in
+    the family. Every snapshot the main lab took before the freeze is
+    **locked**: it lives inside a frozen file, so restoring, deleting or
+    taking it again is refused until you thaw. See
+    [Snapshots under a freeze](guide_snapshots).
+  DOC
+
+  h2 "Check worktree isolation"
+
+  p <<DOC
+    Cloned guests share hostnames, MAC addresses, machine-ids and Windows
+    SIDs, so two labs of a family must never share a wire or a route. While
+    the main checkout is frozen, the main lab and every worktree lab built on
+    it run with worktree isolation:
+  DOC
+
+  list {
+    li "NAT refuses every new flow to the host itself: loopback, `0.0.0.0/8`, and every address and broadcast address on a host interface. The lab's own smbd stays reachable, so [shared folders](guide_shares) keep working."
+    li "Port forwards bind `127.0.0.1` instead of every interface."
+    li "A worktree lab's global segments join `<segment>@<worktree>`, named after the git worktree, so they are shared with no other lab of the family. A global segment with a `connect {}` peer refuses `up` in a worktree lab."
+  }
+
+  p <<DOC
+    Without the first rule, a worktree guest could reach the main lab's port
+    forwards through the host's LAN address and land on its own clone. A
+    guest can still reach the internet. [Networking](guide_networking) gives
+    the rules in full.
+  DOC
+
+  p <<DOC
+    A lab daemon decides isolation when it starts. The freeze ran in the main
+    lab's daemon, so the next `vmlab up` there replaces that daemon first and
+    says so. Then `vmlab status` shows the decision on the line after the
+    lab's name:
+  DOC
+
+  code sh { source = "vmlab up && vmlab status" }
+
+  code text { source = <<'SRC'
+lab "app": the main checkout's freeze or a machine's disk changed — restarting the lab daemon to plan its clones again
+...
+lab "app"
+worktree isolation: frozen main lab, generation 1 at "provisioned"; NAT refuses host addresses, forwards bind 127.0.0.1
+SRC
+  }
+
+  h2 "Bring up a worktree lab"
+
+  p "In a linked worktree, `vmlab up` reads the main checkout's freeze. Nothing in the worktree needs to change:"
+
+  code sh { source = <<'SRC'
+git worktree add ../feat-x
+cd ../feat-x
+vmlab up
+vmlab status
+SRC
+  }
+
+  code text { source = <<'SRC'
+lab "app-feat-x"
+worktree isolation: worktree "feat-x", generation 1 at "provisioned"; NAT refuses host addresses, forwards bind 127.0.0.1
+SRC
+  }
+
+  p <<DOC
+    Each machine with no disk yet is cloned from the newest generation when
+    the freeze holds it under the same `template` or `image` reference. It
+    keeps the frozen machine's MAC addresses, firmware variables and TPM
+    state, and boots as the main lab would right after restoring the freeze
+    point, so its first-boot provision does not run again. Every other
+    machine builds from its template as usual: a machine new in this branch,
+    or one whose reference changed.
+  DOC
+
+  p <<DOC
+    A machine that already has a disk keeps it, including one built before
+    the freeze. To rebuild it from the freeze, run `vmlab vm destroy <name>`
+    and `vmlab up` again. A [dev machine](guide_dev) cloned from the freeze
+    re-seeds its workspace from this worktree's tree before its watch opens.
+  DOC
+
+  p <<DOC
+    When the freeze's files are missing, `up` refuses and names
+    `vmlab worktree freeze` as the fix. It never falls back to the
+    templates, which would silently skip the provisioning the freeze
+    carries.
+  DOC
+
+  h2 "Reset a lab to the freeze point"
+
+  p "The freeze point resets any lab of the family, the main lab included, to the state it was frozen in:"
+
+  code sh { source = "vmlab snapshot restore provisioned" }
+
+  p <<DOC
+    The restore stops a running machine and empties its overlays onto the
+    frozen files. With no snapshot taken since the freeze, that is instant.
+    Offline snapshots taken since then survive; each is carried into the new
+    overlay, which takes time in proportion to what it holds. An online one
+    cannot be carried, so the restore refuses, naming it: delete it with
+    `vmlab snapshot delete` first. The freeze point's name cannot be taken
+    again by `vmlab snapshot create`.
+  DOC
+
+  h2 "Freeze again"
+
+  p "When the main lab has moved on and the worktrees should start from its new state, freeze again:"
+
+  code sh { source = <<'SRC'
+vmlab down
+vmlab snapshot create upgraded
+vmlab worktree freeze upgraded
+SRC
+  }
+
+  p <<DOC
+    This freezes the main lab's current overlays as generation 2, backed by
+    generation 1, and locks the old freeze point with the other earlier
+    snapshots. Worktree labs already built keep generation 1; only machines
+    built from now on start from generation 2. A worktree lab's daemon
+    that planned its clones before the refreeze is replaced by its next
+    `up`, as after an edit to `vmlab.wcl`. To see which worktree uses which
+    generation:
+  DOC
+
+  code sh { source = "vmlab worktree status" }
+
+  code text { source = <<'SRC'
+main checkout: /home/wil/src/app
+GENERATION  SNAPSHOT     MACHINES       WORKTREES
+1           provisioned  dc01, web, db  /home/wil/src/feat-x
+2 (newest)  upgraded     dc01, web, db  -
+SRC
+  }
+
+  h2 "Thaw"
+
+  p "Thawing folds the freeze back into the main lab's disks and unlocks its earlier snapshots. Destroy every worktree lab first, then thaw in the main checkout with the lab stopped:"
+
+  code sh { source = <<'SRC'
+cd ../feat-x && vmlab destroy
+cd ../app && vmlab down && vmlab worktree thaw
+SRC
+  }
+
+  p <<DOC
+    The main lab keeps its current state, and offline snapshots taken after
+    a freeze survive. The thaw refuses while any worktree disk backs onto the
+    freeze, naming each worktree. It also refuses on online snapshots taken
+    since a freeze, whose machine state no commit can carry; delete them, or
+    pass `--drop-online-snapshots` to give them up. Isolation ends at the
+    main lab's next `up`, which replaces its daemon as after the freeze.
+  DOC
+
+  h2 "Guards on a freeze"
+
+  list {
+    li "`vmlab destroy` in the main checkout refuses while any worktree lab uses the freeze, naming each one. With none using it, `destroy` deletes the freeze with the rest of `.vmlab/`."
+    li "`vmlab lab move` refuses to move a frozen main lab, because every overlay of the family names the frozen files by absolute path. When worktrees depend on the freeze, the refusal names them; otherwise it asks you to thaw first."
+    li "The template store counts a template as in use while any frozen file backs onto it, so `vmlab template rm` needs `--force`."
+    li "Nothing in vmlab opens a frozen file read-write."
+  }
+
+  callout "A freeze is not portable" {
+    kind = :error
+    body = "Worktree overlays name the frozen files by absolute path. Moving or renaming the main checkout's directory, or its `VMLAB_WORK_DIR`, breaks every worktree lab built on it. Destroy the worktree labs and thaw first."
+  }
+
+  p <<DOC
+    A freeze needs the main lab stopped; there is no live freeze. A lab run
+    with `--instance` or `VMLAB_INSTANCE` in an ordinary directory is not a
+    worktree lab and keeps the ordinary instance rules. To share a
+    provisioned machine across hosts, build a [template](guide_templates)
+    from it instead.
+  DOC
+
+  h2 "See also"
+
+  list {
+    li "[vmlab worktree](cmd_worktree): the freeze, thaw and status verbs, what they copy, their output and refusals."
+    li "[vmlab snapshot](cmd_snapshot): how the freeze point and locked snapshots restore."
+    li "[Networking](guide_networking): worktree isolation beside the NAT, forwards and global segments it changes."
+    li "[How vmlab runs a lab](guide_architecture): lab instances, which every worktree lab is first."
+  }
+}

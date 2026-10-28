@@ -45,6 +45,23 @@ pub struct ImageInfo {
     /// Backing image, present for linked clones.
     #[serde(rename = "backing-filename", default)]
     pub backing_file: Option<PathBuf>,
+    /// The backing image as qemu-img resolved it: absolute even when the
+    /// image records a relative path.
+    #[serde(rename = "full-backing-filename", default)]
+    pub full_backing_file: Option<PathBuf>,
+    /// The qcow2-internal snapshots the image holds (PRD §7.3).
+    #[serde(default)]
+    pub snapshots: Vec<InternalSnapshot>,
+}
+
+/// One qcow2-internal snapshot, as `qemu-img info` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InternalSnapshot {
+    pub name: String,
+    /// Bytes of saved machine state: non-zero for an online snapshot's
+    /// primary disk, which no offline operation can carry elsewhere.
+    #[serde(rename = "vm-state-size", default)]
+    pub vm_state_size: u64,
 }
 
 async fn run(args: &[&str]) -> Result<Vec<u8>> {
@@ -102,6 +119,16 @@ pub async fn rebase_unsafe(path: &Path, backing: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move `path` onto `backing` (by absolute path) keeping its content:
+/// `qemu-img rebase` in safe mode, which reads the old and the new backing
+/// chains — both opened read-only — and writes into `path` only the clusters
+/// where they differ (PRD §21.1).
+pub async fn rebase_safe(path: &Path, backing: &Path) -> Result<()> {
+    let (path, backing) = (path_str(path), path_str(backing));
+    run(&["rebase", "-q", "-b", &backing, "-F", "qcow2", &path]).await?;
+    Ok(())
+}
+
 /// Inspect an image via `qemu-img info --output=json`.
 ///
 /// `-U` (force-share): the image may be a running machine's disk, which QEMU
@@ -153,6 +180,29 @@ pub async fn snapshot_apply(path: &Path, name: &str) -> Result<()> {
 pub async fn snapshot_delete(path: &Path, name: &str) -> Result<()> {
     let path = path_str(path);
     run(&["snapshot", "-d", name, &path]).await?;
+    Ok(())
+}
+
+/// Write `dest` as an overlay on `backing` holding `src`'s state at its
+/// internal snapshot `snapshot`: `qemu-img convert -l snapshot.name=… -B …`.
+/// Only what `src`'s own layer allocated at that snapshot is written; what
+/// it reads through from its backing is left to `backing`, which must
+/// therefore hold the same content `src`'s backing did (PRD §21.1).
+pub async fn export_overlay(src: &Path, snapshot: &str, backing: &Path, dest: &Path) -> Result<()> {
+    let opt = format!("snapshot.name={snapshot}");
+    let (src, backing, dest) = (path_str(src), path_str(backing), path_str(dest));
+    run(&[
+        "convert", "-O", "qcow2", "-l", &opt, "-B", &backing, "-F", "qcow2", &src, &dest,
+    ])
+    .await?;
+    Ok(())
+}
+
+/// Write `top`'s active layer into its backing file, leaving `top` as it was
+/// (`qemu-img commit -d`): the caller discards or re-applies it.
+pub async fn commit(top: &Path) -> Result<()> {
+    let top = path_str(top);
+    run(&["commit", "-q", "-d", &top]).await?;
     Ok(())
 }
 

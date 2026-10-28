@@ -3,7 +3,7 @@ page cmd_up {
   chapter_header "vmlab up" {
     kicker       = "Commands · reference"
     reading_time = "5 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -102,6 +102,15 @@ TXT
     same disks and skips the first-boot script.
   DOC
 
+  p <<DOC
+    In a linked git worktree whose main checkout is frozen, `up` builds each
+    machine that has no disk yet as a clone of the freeze rather than of its
+    template, when the freeze holds it under the same `template` or `image`
+    reference. It boots as if the freeze point had just been restored, and
+    every lab of the family runs under worktree isolation. See
+    [Worktree labs](guide_worktrees).
+  DOC
+
   h2 "Editing the lab file between runs"
 
   p <<DOC
@@ -154,6 +163,17 @@ TXT
     and the next `up` pulls the new image (see
     [Containers](guide_containers)).
   DOC
+
+  p <<DOC
+    A lab daemon also decides, when it starts, whether the lab runs under
+    [worktree isolation](guide_worktrees) and, in a worktree lab, which
+    machines clone from the main checkout's freeze. When the main checkout
+    has been frozen, frozen again or thawed since, or a machine has lost its
+    disk, `up`, `pull`, `vm start` and `vm restart` replace the daemon the
+    same way, in the main lab and in a worktree lab, with the same refusals
+    while a machine is running, and print:
+  DOC
+  code text { source = "lab \"app-feat-x\": the main checkout's freeze or a machine's disk changed — restarting the lab daemon to plan its clones again" }
 
   h2 "Agent refresh"
 

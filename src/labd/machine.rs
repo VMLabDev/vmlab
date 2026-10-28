@@ -245,6 +245,10 @@ pub trait Machine: Send + Sync + 'static {
     fn local_dir(&self) -> &Path;
     /// `$XDG_RUNTIME_DIR/...` — this run's sockets.
     fn run_dir(&self) -> &Path;
+    /// Every qcow2 the machine writes, in the order its snapshots address
+    /// them: a VM's `disk0.qcow2` then each `disk-<name>.qcow2`, a
+    /// container's `scratch.qcow2`. What a freeze freezes (§21.1).
+    fn disk_paths(&self) -> Vec<PathBuf>;
 
     /// External binaries that must be on PATH before this machine can boot,
     /// so a missing package surfaces as one clear error rather than a spawn

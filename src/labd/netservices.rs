@@ -19,7 +19,7 @@ use bytes::Bytes;
 use crate::config::model::MacAddr;
 use crate::net::frame::{ETHERTYPE_IPV4, EthView, IPPROTO_TCP, Ipv4View, TcpView, eth_build};
 use crate::net::gateway::GatewayHandle;
-use crate::net::nat::{NatConfig, NatEngine};
+use crate::net::nat::{HostGuard, NatConfig, NatEngine};
 use crate::net::router::Router;
 use crate::net::rules::{RuleSet, Verdict};
 use crate::net::switch::{HookAction, PortClass, Switch};
@@ -31,9 +31,10 @@ pub struct SegmentServices {
     /// The engine giving this segment egress — `None` without `nat`, even
     /// though a segment without egress still runs one for its host services.
     pub nat: Option<Arc<NatEngine>>,
-    /// Host loopback TCP ports a guest on a segment without egress may still
-    /// reach — through a `redirect` rewriting a gateway address onto one.
-    /// Unused on a segment with egress, which reaches every port anyway.
+    /// Host loopback TCP ports a guest may reach through a `redirect`
+    /// rewriting a gateway address onto one, on a segment without egress or
+    /// under worktree isolation (§21.4). Unused on a segment with egress
+    /// outside isolation, which reaches every port anyway.
     host_services: Arc<Mutex<Vec<u16>>>,
     /// Active runtime port forwards: rule id → task handle.
     pub forwards: Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>>,
@@ -44,10 +45,13 @@ impl SegmentServices {
     /// Install NAT (when the segment has egress) and the L3 rule hook on the
     /// switch. `gateway` is this segment's gateway handle; `router` routes
     /// what it can of the gateway's off-segment frames, as `segment`'s.
+    /// `isolated` puts the engine under worktree isolation (§21.4): it
+    /// refuses every host address but the services this segment exposes.
     pub fn install(
         switch: &Arc<Switch>,
         gateway: &GatewayHandle,
         nat_enabled: bool,
+        isolated: bool,
         mtu: u16,
         router: (&Arc<Router>, &str),
     ) -> Arc<SegmentServices> {
@@ -98,6 +102,9 @@ impl SegmentServices {
         let host_services = Arc::new(Mutex::new(Vec::new()));
         let admit = (!nat_enabled).then(|| host_services.clone());
         let engine = spawn_nat(switch, gateway, gw_mac, mtu, rules.clone(), admit, router);
+        if isolated {
+            engine.set_guard(Arc::new(HostGuard::new(host_services.clone())));
+        }
         let nat = nat_enabled.then_some(engine);
 
         Arc::new(SegmentServices {
@@ -223,8 +230,9 @@ pub fn preinstall_rules(
 
 impl SegmentServices {
     /// Let guests reach host loopback TCP `port` even when the segment has
-    /// no egress. The caller installs the `redirect` that rewrites a gateway
-    /// address onto it; this only stops the missing egress dropping it.
+    /// no egress, or runs under worktree isolation. The caller installs the
+    /// `redirect` that rewrites a gateway address onto it; this only stops
+    /// the missing egress, or isolation's host guard, dropping it.
     pub fn expose_host_service(&self, port: u16) {
         let mut ports = self.host_services.lock_recover();
         if !ports.contains(&port) {
@@ -321,6 +329,18 @@ mod tests {
         GatewayHandle,
         crate::net::switch::ChannelPort,
     ) {
+        segment_isolated(nat, false)
+    }
+
+    /// [`segment`], under worktree isolation when `isolated`.
+    fn segment_isolated(
+        nat: bool,
+        isolated: bool,
+    ) -> (
+        Arc<SegmentServices>,
+        GatewayHandle,
+        crate::net::switch::ChannelPort,
+    ) {
         let sw = Switch::new("seg".into());
         let gw_mac = gateway_mac("lab", "seg");
         let gw = Gateway::spawn(
@@ -335,7 +355,8 @@ mod tests {
                 upstream_dns: None,
             },
         );
-        let services = SegmentServices::install(&sw, &gw, nat, 1500, (&Router::new(), "seg"));
+        let services =
+            SegmentServices::install(&sw, &gw, nat, isolated, 1500, (&Router::new(), "seg"));
         let guest = sw.add_channel_port(PortClass::Guest { isolated: false });
         (services, gw, guest)
     }
@@ -424,6 +445,58 @@ mod tests {
 
         guest.tx.send(syn(GW_IP, 445)).await.unwrap();
         assert!(!accepted(&other).await, "an unexposed port was reached");
+    }
+
+    /// Under worktree isolation a segment with egress still reaches the
+    /// lab's `smbd` behind gateway:445 (§21.4: a gateway service, not a NAT
+    /// connection the guest chose)...
+    #[tokio::test]
+    async fn an_isolated_segment_reaches_its_smbd_through_the_gateway() {
+        let smbd = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = smbd.local_addr().unwrap().port();
+        let (services, _gw, guest) = segment_isolated(true, true);
+        redirect_445(&services, port);
+        services.expose_host_service(port);
+
+        guest.tx.send(syn(GW_IP, 445)).await.unwrap();
+        assert!(accepted(&smbd).await, "gateway:445 never reached smbd");
+    }
+
+    /// ...and nothing else on the host: a listener on loopback, which the
+    /// same segment reaches without isolation, is answered with RST.
+    #[tokio::test]
+    async fn an_isolated_segment_reaches_no_host_port() {
+        let other = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = other.local_addr().unwrap().port();
+
+        let (_services, _gw, guest) = segment_isolated(true, false);
+        guest.tx.send(syn(Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        assert!(
+            accepted(&other).await,
+            "egress reaches the host without isolation"
+        );
+
+        let (_services, _gw, mut guest) = segment_isolated(true, true);
+        guest.tx.send(syn(Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        assert!(!accepted(&other).await, "isolation let a host port through");
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = guest.rx.recv().await.expect("guest port open");
+                let tcp = EthView::parse(&frame)
+                    .and_then(|eth| Ipv4View::parse(eth.payload()).map(|ip| ip.payload().to_vec()))
+                    .and_then(|p| TcpView::parse(&p).map(|t| t.flags()));
+                if let Some(flags) = tcp {
+                    return flags;
+                }
+            }
+        })
+        .await
+        .expect("the refused SYN got no reply");
+        assert_ne!(reply & crate::net::frame::TCP_RST, 0, "flags {reply:#x}");
     }
 
     /// A free loopback port, released for the test to claim.

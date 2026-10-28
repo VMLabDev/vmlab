@@ -13,6 +13,7 @@ pub mod record;
 pub mod tty_attach;
 pub mod usb;
 pub mod validate;
+pub mod worktree;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -153,6 +154,12 @@ pub enum Command {
     Snapshot {
         #[command(subcommand)]
         cmd: SnapshotCmd,
+    },
+    /// Worktree labs: freeze the main lab for linked git worktrees to clone,
+    /// thaw it, and list who depends on it (PRD §21)
+    Worktree {
+        #[command(subcommand)]
+        cmd: worktree::WorktreeCmd,
     },
     /// Run config-weave playbooks against lab machines
     Playbook {
@@ -601,6 +608,10 @@ pub enum SnapshotCmd {
         discard_guest_changes: bool,
     },
     /// List a VM's/container's snapshots
+    ///
+    /// In a frozen main lab, snapshots taken before the freeze are listed as
+    /// locked: they live in a frozen file, and restore and delete refuse
+    /// them until `vmlab worktree thaw` (§21.3).
     List { vm: String },
     /// Delete a VM/container snapshot
     Delete { vm: String, name: String },
@@ -764,6 +775,7 @@ pub fn run() -> ExitCode {
             SnapshotCmd::List { vm } => lab::cmd_snapshots(&vm),
             SnapshotCmd::Delete { vm, name } => lab::cmd_snapshot_delete(&vm, name),
         },
+        Command::Worktree { cmd } => worktree::cmd_worktree(cmd),
         Command::Playbook { cmd } => match cmd {
             PlaybookCmd::List => lab::cmd_playbook_list(),
             PlaybookCmd::Check {

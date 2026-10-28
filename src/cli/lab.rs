@@ -107,9 +107,27 @@ enum DaemonFreshness {
 /// machine the old one is running or carry on a download the old one is
 /// doing, so either of those refuses rather than being quietly lost.
 fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFreshness {
-    if status.config_digest == digest {
+    let edited = status.config_digest != digest;
+    if !edited && !status.freeze_stale {
         return DaemonFreshness::Current;
     }
+    // A worktree lab's daemon planned which machines clone from the main
+    // checkout's freeze when it started (§21.2); the freeze moving since is
+    // as much a change to what `up` would build as an edit is.
+    let (changed, load, apply) = if edited {
+        (
+            "vmlab.wcl has changed since the lab daemon loaded it",
+            "the new file",
+            "the edit (or undo the edit)",
+        )
+    } else {
+        (
+            "the main checkout's freeze (or a machine's disk) has changed since the lab \
+             daemon planned which machines clone from it",
+            "the change",
+            "it",
+        )
+    };
     let running: Vec<&str> = status
         .machines
         .iter()
@@ -118,10 +136,9 @@ fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFresh
         .collect();
     if !running.is_empty() {
         return DaemonFreshness::Refuse(format!(
-            "lab \"{name}\": vmlab.wcl has changed since the lab daemon loaded it, \
-             and {running} — the daemon cannot load the new file without \
-             stopping {them}. Run `vmlab down`, then this command again, to apply \
-             the edit (or undo the edit)",
+            "lab \"{name}\": {changed}, and {running} — the daemon cannot load \
+             {load} without stopping {them}. Run `vmlab down`, then this command \
+             again, to apply {apply}",
             running = match running.as_slice() {
                 [one] => format!("{one} is still running"),
                 many => format!("{} are still running", many.join(", ")),
@@ -134,10 +151,10 @@ fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFresh
     pulling.dedup();
     if !pulling.is_empty() {
         return DaemonFreshness::Refuse(format!(
-            "lab \"{name}\": vmlab.wcl has changed since the lab daemon loaded it, \
-             but it is still downloading {} — loading the new file would abandon \
-             the download. Wait for it to finish (or interrupt the `vmlab pull` \
-             that started it), then run this command again",
+            "lab \"{name}\": {changed}, but it is still downloading {} — \
+             loading {load} would abandon the download. Wait for it to finish \
+             (or interrupt the `vmlab pull` that started it), then run this \
+             command again",
             pulling.join(", ")
         ));
     }
@@ -161,11 +178,21 @@ async fn ensure_current_daemon(name: &str, root: &std::path::Path) -> Result<Lab
     // so), and the digest covers it, so load from the same path.
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let digest = crate::config::digest(&load_lab_at(&root)?);
-    match daemon_freshness(name, &lab_status(&client).await?, &digest) {
+    let status = lab_status(&client).await?;
+    match daemon_freshness(name, &status, &digest) {
         DaemonFreshness::Current => Ok(client),
         DaemonFreshness::Refuse(why) => bail!(why),
         DaemonFreshness::Restart => {
-            println!("lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it");
+            if status.config_digest != digest {
+                println!(
+                    "lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it"
+                );
+            } else {
+                println!(
+                    "lab \"{name}\": the main checkout's freeze or a machine's disk changed \
+                     — restarting the lab daemon to plan its clones again"
+                );
+            }
             let reply = daemon::ensure_supervisor()
                 .await?
                 .send(SupRequest::LabRestart {
@@ -378,6 +405,7 @@ pub fn cmd_destroy() -> Result<()> {
                 client.send(LabRequest::Destroy {}).await.map_err(remote)?;
             }
             None if lab_local.exists() => {
+                refuse_destroy_under_freeze(&root).await?;
                 std::fs::remove_dir_all(&lab_local)
                     .with_context(|| format!("removing {}", lab_local.display()))?;
             }
@@ -392,6 +420,25 @@ pub fn cmd_destroy() -> Result<()> {
         println!("lab \"{name}\" destroyed");
         Ok(())
     })
+}
+
+/// The lab daemon's destroy guard (§21.5), for a lab with no daemon running:
+/// a main checkout's lab whose freeze a worktree lab backs onto stays.
+async fn refuse_destroy_under_freeze(root: &std::path::Path) -> Result<()> {
+    if crate::freeze::main_lab_root(root).is_some() {
+        return Ok(());
+    }
+    let deps = crate::freeze::inspect::dependants(root).await;
+    if deps.is_empty() {
+        return Ok(());
+    }
+    Err(
+        crate::proto::CommandError::conflict(crate::freeze::inspect::dependants_refusal(
+            "cannot destroy the main lab",
+            &deps,
+        ))
+        .into(),
+    )
 }
 
 /// `vmlab status`. A lab name registered from another directory is that
@@ -461,6 +508,28 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "lab \"{}\"", status.lab);
+    // Worktree isolation (§21.4) changes what a guest can reach and where a
+    // forward listens, so it is said before anything else: a developer
+    // wondering why `curl <host-ip>` fails in a worktree guest looks here.
+    if let Some(iso) = &status.isolation {
+        let whose = match &iso.worktree {
+            Some(name) => format!("worktree \"{name}\""),
+            None => "frozen main lab".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "worktree isolation: {whose}, generation {} at \"{}\"; NAT refuses host addresses, \
+             forwards bind {}",
+            iso.generation, iso.snapshot, iso.forward_bind
+        );
+        for g in iso.globals.iter().filter(|g| g.joined != g.segment) {
+            let _ = writeln!(
+                out,
+                "  global segment \"{}\" joins as \"{}\"",
+                g.segment, g.joined
+            );
+        }
+    }
 
     if !status.machines.is_empty() {
         let name_w = column_width("NAME", status.machines.iter().map(|m| m.name.len()));
@@ -1090,6 +1159,7 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
                 Some(root) => {
                     let lab_local = crate::paths::lab_local_dir(root);
                     if lab_local.exists() {
+                        refuse_destroy_under_freeze(root).await?;
                         std::fs::remove_dir_all(&lab_local)
                             .with_context(|| format!("removing {}", lab_local.display()))?;
                     }
@@ -1995,21 +2065,37 @@ pub fn cmd_snapshots(vm_ref: &str) -> Result<()> {
             println!("no snapshots for {vm}");
             return Ok(());
         }
-        println!("{:<24} {:<8} TAKEN", "NAME", "KIND");
-        for s in list {
-            println!(
-                "{:<24} {:<8} {}",
-                s["name"].as_str().unwrap_or("?"),
-                if s["online"].as_bool().unwrap_or(false) {
-                    "online"
-                } else {
-                    "offline"
-                },
-                s["taken_at"].as_str().unwrap_or("?"),
-            );
-        }
+        print!("{}", render_snapshots(&list));
         Ok(())
     })
+}
+
+/// The `snapshot list` table. A freeze point and a locked snapshot (§21.3)
+/// say so, since a restore treats each differently from an ordinary one.
+fn render_snapshots(list: &[Value]) -> String {
+    let mut out = format!("{:<24} {:<8} {:<22} TAKEN\n", "NAME", "KIND", "FREEZE");
+    for s in list {
+        let freeze = match (s["frozen_in"].as_u64(), s["freeze_point"].as_u64()) {
+            (Some(g), _) => format!("locked (gen {g})"),
+            (None, Some(g)) => format!("freeze point (gen {g})"),
+            (None, None) => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<24} {:<8} {:<22} {}\n",
+            s["name"].as_str().unwrap_or("?"),
+            if s["online"].as_bool().unwrap_or(false) {
+                "online"
+            } else {
+                "offline"
+            },
+            freeze,
+            s["taken_at"].as_str().unwrap_or("?"),
+        ));
+    }
+    if list.iter().any(|s| s["locked"].as_bool().unwrap_or(false)) {
+        out.push_str("locked snapshots live in frozen files; `vmlab worktree thaw` unlocks them\n");
+    }
+    out
 }
 
 pub fn cmd_snapshot_delete(vm_ref: &str, name: String) -> Result<()> {
@@ -2151,13 +2237,38 @@ mod tests {
     use super::{
         DaemonFreshness, LabRequest, PowerOp, Region, backup_notice, daemon_freshness,
         format_log_line, listed_state, not_running_status, pulling_machines, region_value,
-        render_dns, render_status, root_for,
+        render_dns, render_snapshots, render_status, root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
     use crate::status::{MachineDetail, MachineStatus, PowerState, PullKind, PullStatus};
     use crate::status::{SegmentFrames, SegmentStatus};
     use serde_json::json;
+
+    /// §21.3: a freeze point and a locked snapshot say so, and a list
+    /// holding a locked one says what unlocks it.
+    #[test]
+    fn snapshot_list_marks_locks_and_freeze_points() {
+        let list = vec![
+            json!({"name": "early", "online": true, "taken_at": "t1", "locked": true,
+                   "frozen_in": 1, "freeze_point": null}),
+            json!({"name": "base", "online": false, "taken_at": "t2", "locked": false,
+                   "frozen_in": null, "freeze_point": 1}),
+            json!({"name": "after", "online": false, "taken_at": "t3", "locked": false}),
+        ];
+        let out = render_snapshots(&list);
+        assert!(
+            out.contains("early                    online   locked (gen 1)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("base                     offline  freeze point (gen 1)"),
+            "{out}"
+        );
+        assert!(out.contains("after                    offline  -"), "{out}");
+        assert!(out.contains("vmlab worktree thaw"), "{out}");
+        assert!(!render_snapshots(&list[2..]).contains("thaw"));
+    }
 
     /// A machine at an address, since every column but `IP` is exercised by the
     /// shared fixture as it stands.
@@ -2214,6 +2325,30 @@ mod tests {
             daemon_freshness("demo", &running, "loaded"),
             DaemonFreshness::Current
         );
+    }
+
+    /// A worktree lab's daemon that planned its clones against a freeze that
+    /// has since moved is replaced like one running an edited file, and
+    /// refuses the same way over a running machine, saying what moved.
+    #[test]
+    fn a_daemon_planned_against_a_moved_freeze_is_replaced() {
+        let m = |state| crate::status::fixtures::machine("web", state, false, vm());
+        let mut status = lab(vec![m(PowerState::Stopped)]);
+        status.config_digest = "loaded".into();
+        status.freeze_stale = true;
+        assert_eq!(
+            daemon_freshness("demo", &status, "loaded"),
+            DaemonFreshness::Restart
+        );
+        let mut running = lab(vec![m(PowerState::Running)]);
+        running.config_digest = "loaded".into();
+        running.freeze_stale = true;
+        let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &running, "loaded") else {
+            panic!("did not refuse");
+        };
+        assert!(why.contains("freeze"), "{why}");
+        assert!(!why.contains("vmlab.wcl"), "{why}");
+        assert!(why.contains("vmlab down"), "{why}");
     }
 
     /// A daemon from before the digest existed reports none, and is taken to
@@ -2366,6 +2501,38 @@ mod tests {
         );
         assert!(
             out.contains("web     41234 (auto) 10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
+    }
+
+    /// A lab under worktree isolation says so under its name, with the
+    /// global segments it joins under another name; any other lab does not.
+    #[test]
+    fn the_status_table_says_worktree_isolation() {
+        use crate::status::{IsolatedGlobal, IsolationStatus};
+        let mut status = lab(vec![addressed("web", PowerState::Running, true, vm())]);
+        assert!(!render_status(&status, false).contains("isolation"));
+        status.isolation = Some(IsolationStatus {
+            role: "worktree".into(),
+            worktree: Some("feat-x".into()),
+            generation: 1,
+            snapshot: "base".into(),
+            forward_bind: "127.0.0.1".into(),
+            globals: vec![IsolatedGlobal {
+                segment: "corp".into(),
+                joined: "corp@feat-x".into(),
+            }],
+        });
+        let out = render_status(&status, false);
+        assert!(
+            out.contains(
+                "worktree isolation: worktree \"feat-x\", generation 1 at \"base\"; NAT refuses \
+                 host addresses, forwards bind 127.0.0.1"
+            ),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("global segment \"corp\" joins as \"corp@feat-x\""),
             "got:\n{out}"
         );
     }

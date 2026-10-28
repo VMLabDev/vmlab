@@ -13,7 +13,7 @@ use crate::config::model::MacAddr;
 
 /// One machine's persisted state. VMs and containers record the same things;
 /// the image fields simply stay `None` on a VM.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MachineState {
     /// MAC per NIC index — generated deterministically, persisted so DHCP
     /// reservations stay stable (PRD §9.4).
@@ -66,7 +66,7 @@ pub struct TimedOutRun {
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     /// Captured while running (disk+RAM+device) vs powered off (disk only).
     pub online: bool,
@@ -76,6 +76,16 @@ pub struct SnapshotRecord {
     /// read-only rootfs, so restore refuses a changed pin. `None` for VMs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_digest: Option<String>,
+    /// The freeze point of generation `n` (PRD §21.3): restoring it replaces
+    /// the machine's overlays with empty ones on their own backing files,
+    /// rather than applying an internal snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze_point: Option<u32>,
+    /// Taken before generation `n` was frozen, so stored inside a frozen
+    /// file: listed as locked, and restore and delete refuse until `thaw`
+    /// (PRD §21.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_in: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -192,6 +202,8 @@ mod tests {
                 online: true,
                 taken_at: chrono::Utc::now(),
                 image_digest: None,
+                freeze_point: None,
+                frozen_in: None,
             },
         );
         s.machine_mut("web").snapshots.insert(
@@ -200,6 +212,8 @@ mod tests {
                 online: false,
                 taken_at: chrono::Utc::now(),
                 image_digest: Some("sha256:abc".into()),
+                freeze_point: None,
+                frozen_in: None,
             },
         );
         s.save(tmp.path()).unwrap();

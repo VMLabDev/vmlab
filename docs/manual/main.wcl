@@ -28,6 +28,7 @@ import "./pages/guide/containers.wcl"
 import "./pages/guide/shares.wcl"
 import "./pages/guide/usb.wcl"
 import "./pages/guide/snapshots.wcl"
+import "./pages/guide/worktrees.wcl"
 import "./pages/guide/scripting.wcl"
 import "./pages/guide/vision.wcl"
 import "./pages/guide/recording.wcl"
@@ -67,6 +68,7 @@ import "./pages/commands/usb.wcl"
 import "./pages/commands/dns.wcl"
 import "./pages/commands/lab.wcl"
 import "./pages/commands/snapshot.wcl"
+import "./pages/commands/worktree.wcl"
 import "./pages/commands/playbook.wcl"
 import "./pages/commands/template.wcl"
 import "./pages/commands/console.wcl"
@@ -131,6 +133,7 @@ site manual {
       chapter "Shared folders"                       { page = guide_shares }
       chapter "Host USB devices"                     { page = guide_usb }
       chapter "Snapshots"                            { page = guide_snapshots }
+      chapter "Worktree labs"                        { page = guide_worktrees }
       chapter "Guest automation with wscript"        { page = guide_scripting }
       chapter "Screens, input and vision"            { page = guide_vision }
       chapter "Console recording"                    { page = guide_recording }
@@ -170,6 +173,7 @@ site manual {
       chapter "vmlab dns"        { page = cmd_dns }
       chapter "vmlab lab"        { page = cmd_lab }
       chapter "vmlab snapshot"   { page = cmd_snapshot }
+      chapter "vmlab worktree"   { page = cmd_worktree }
       chapter "vmlab playbook"   { page = cmd_playbook }
       chapter "vmlab template"   { page = cmd_template }
       chapter "vmlab console"    { page = cmd_console }

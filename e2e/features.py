@@ -161,6 +161,11 @@ FEATURES: dict[str, str] = {
     "snapshot.clock.kept": "`clock = \"snapshot\"` keeps the time a restored guest was captured at",
     "snapshot.clock.fixed": "a fixed `clock` starts the guest at the declared date",
     "snapshot.virtiofs.old-virtiofsd": "online snapshots refused, offline ones taken, on a virtiofsd too old to migrate",
+    # -- worktree labs (§21) -----------------------------------------------
+    "worktree.isolation.status": "`vmlab status` (and `--json`) in a frozen family says the main and the worktree lab run under worktree isolation",
+    "worktree.isolation.forward": "under worktree isolation a forward binds 127.0.0.1: reachable on loopback, not on the host's address",
+    "worktree.isolation.nat": "a worktree guest is refused (RST) the main lab's forward and any other host address through NAT",
+    "worktree.isolation.global": "a worktree lab joins its global segment as `<segment>@<worktree>`, with its own DNS, the main lab keeping the plain name",
     # -- scripting and events ----------------------------------------------
     "script.run": "`vmlab script` runs a wscript against the lab",
     "script.provision": "`provision` scripts run on `up`",
@@ -191,6 +196,9 @@ FEATURES: dict[str, str] = {
     "app.exit-code": "`vmlab app run` exits with the guest program's code",
     "app.waypipe": "`vmlab app run` over waypipe on a Wayland host",
     "app.rdp": "`vmlab app run` over RDP RemoteApp from a Windows guest",
+    # -- worktree labs -----------------------------------------------------
+    "worktree.clone": "`up` in a linked worktree clones each machine from the main checkout's freeze",
+    "worktree.clone.macs": "a worktree machine keeps the frozen MACs, and the main and worktree labs run at once",
     # -- architectures -----------------------------------------------------
     "arch.emulated": "a non-x86 guest under TCG emulation",
 }

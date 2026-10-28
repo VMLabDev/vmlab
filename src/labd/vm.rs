@@ -1559,6 +1559,10 @@ impl super::machine::Machine for VmInstance {
         &self.dirs.local
     }
 
+    fn disk_paths(&self) -> Vec<PathBuf> {
+        self.all_disk_paths()
+    }
+
     fn run_dir(&self) -> &Path {
         &self.dirs.run
     }

@@ -3,7 +3,7 @@ page guide_snapshots {
   chapter_header "Snapshots" {
     kicker       = "The guide · explanation"
     reading_time = "9 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -250,6 +250,23 @@ SRC
     kind = :warning
     body = "A dev machine's source lives on the host, which is what survives `destroy` and what a restore re-converges the guest from. A snapshot holds the guest copy of the workspace as it was, and a restore replaces it with the host's current tree. Every surface that takes or restores a snapshot repeats this sentence, because a developer who believes a snapshot holds their edits has believed something this design deliberately does not offer."
   }
+
+  h2 "Snapshots under a freeze"
+
+  p <<DOC
+    Freezing the main lab for [worktree labs](guide_worktrees) changes what
+    two kinds of snapshot are. The snapshot you freeze at becomes the
+    **freeze point**: the state of the frozen files every lab of the family
+    stands on, which any of those labs restores instantly by emptying its
+    overlays. Every snapshot the main lab took before the freeze is stored
+    inside a frozen file, so it is **locked**: restoring, deleting or taking
+    it again would write a file other labs read, and each is refused until
+    `vmlab worktree thaw`. `vmlab snapshot list` marks both in its `FREEZE`
+    column. Snapshots taken after the freeze live in each lab's own
+    overlays and behave as this chapter describes, except that an online
+    one blocks a freeze-point restore and a thaw until it is deleted.
+    [vmlab snapshot](cmd_snapshot) gives the refusals.
+  DOC
 
   h2 "Headroom"
 
