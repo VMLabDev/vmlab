@@ -25,10 +25,9 @@ use crate::labd::state::LabState;
 use crate::proto::CommandError;
 use crate::template::qimg::InternalSnapshot;
 
-/// The internal snapshot a freeze holds the main lab's current state in
-/// while it rewinds the file to `<snapshot>`, and a thaw or a freeze-point
-/// restore holds a disk's current state in while it rearranges the chain.
-/// Never left behind by a finished verb.
+/// The internal snapshot a thaw or a freeze-point restore holds a disk's
+/// current state in while it rearranges the chain. Never left behind by a
+/// finished verb; a freeze refuses a disk that still has one.
 pub const HOLD_SNAPSHOT: &str = "vmlab-freeze-hold";
 
 /// What `qemu-img info` says about one disk.
@@ -334,30 +333,41 @@ pub fn plan_freeze(input: &FreezeInput, carried: &BTreeMap<String, Vec<String>>)
     Ok(plan)
 }
 
-/// §21.1's five steps on one disk, each with what undoes it.
+/// One disk's freeze, each step with what undoes it.
+///
+/// §21.1's sequence with step 4 done by a safe rebase rather than `convert
+/// -B`, which would write every cluster the disk's own layer ever allocated:
+/// a whole provisioning's worth on a first freeze. A copy of the disk taken
+/// before anything moves keeps the current state readable, the main lab's
+/// new disk starts as an empty overlay on that copy, and `qemu-img rebase`
+/// (safe) moves it onto the frozen file, writing only the clusters where the
+/// current state and the freeze point differ. No hold snapshot is needed.
+///
+/// The copy is also the rollback: renamed back over the disk it is the disk,
+/// byte for byte. So it stays until the freeze is committed and is removed by
+/// the plan's cleanup, never by a step.
 fn freeze_disk(plan: &mut Plan, disk: &Path, frozen: &Path, snap: &str) {
     let (disk, frozen) = (disk.to_path_buf(), frozen.to_path_buf());
-    let hold = HOLD_SNAPSHOT.to_string();
-    // 1. Hold the current state.
+    let work = beside(&disk, ".freeze-work");
+    // 1. The current state, kept readable: `cp --reflink=auto`, so free where
+    //    the filesystem shares extents.
     plan.push(
-        Step::SnapshotCreate {
-            disk: disk.clone(),
-            name: hold.clone(),
+        Step::Copy {
+            from: disk.clone(),
+            to: work.clone(),
         },
-        vec![Step::SnapshotDelete {
-            disk: disk.clone(),
-            name: hold.clone(),
-        }],
+        vec![Step::Remove { path: work.clone() }],
     );
-    // 2. Rewind the file to the freeze point.
+    // 2. Rewind the file to the freeze point. Undone by the copy, which is
+    //    the file as it was.
     plan.push(
         Step::SnapshotApply {
             disk: disk.clone(),
             name: snap.to_string(),
         },
-        vec![Step::SnapshotApply {
-            disk: disk.clone(),
-            name: hold.clone(),
+        vec![Step::Rename {
+            from: work.clone(),
+            to: disk.clone(),
         }],
     );
     // 3. Into the generation.
@@ -371,39 +381,33 @@ fn freeze_disk(plan: &mut Plan, disk: &Path, frozen: &Path, snap: &str) {
             to: disk.clone(),
         }],
     );
-    // 4. The main lab's new disk: the held state, over the frozen file.
-    plan.push(
-        Step::Export {
-            src: frozen.clone(),
-            snapshot: hold.clone(),
-            backing: frozen.clone(),
-            dest: disk.clone(),
-        },
-        vec![Step::Remove { path: disk.clone() }],
-    );
-    // 5. Drop the hold. Undone by committing the overlay back down, which
-    //    puts the current state into the frozen file's active layer, and
-    //    holding it again — what step 4's undo then expects to find.
-    plan.push(
-        Step::SnapshotDelete {
-            disk: frozen.clone(),
-            name: hold.clone(),
-        },
-        vec![
-            Step::Commit { top: disk.clone() },
-            Step::SnapshotCreate {
-                disk: frozen.clone(),
-                name: hold,
-            },
-        ],
-    );
-    // 6. Nothing opens it read-write again.
+    // 4. Read-only before anything is layered on it, so the rebase below
+    //    cannot open it read-write either.
     plan.push(
         Step::ReadOnly {
             path: frozen.clone(),
         },
-        vec![Step::Writable { path: frozen }],
+        vec![Step::Writable {
+            path: frozen.clone(),
+        }],
     );
+    // 5. The main lab's new disk: empty, over the current state.
+    plan.push(
+        Step::Overlay {
+            backing: work.clone(),
+            dest: disk.clone(),
+        },
+        vec![Step::Remove { path: disk.clone() }],
+    );
+    // 6. Onto the frozen file, writing only what differs from it.
+    plan.push(
+        Step::RebaseSafe {
+            disk: disk.clone(),
+            backing: frozen,
+        },
+        vec![],
+    );
+    plan.cleanup.push(Step::Remove { path: work });
 }
 
 /// Mark the main lab's records for generation `generation` frozen at
@@ -925,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn freeze_runs_the_five_steps_per_disk_in_order() {
+    fn freeze_rebases_each_disk_onto_its_frozen_file() {
         let carried = BTreeMap::from([("dc".to_string(), vec!["OVMF_VARS.fd".to_string()])]);
         let plan = plan_freeze(
             &input(vec![machine("dc", true, Some(record(false)))]),
@@ -933,8 +937,8 @@ mod tests {
         )
         .unwrap();
         let disk = PathBuf::from("/l/.vmlab/vms/dc/disk0.qcow2");
+        let work = PathBuf::from("/l/.vmlab/vms/dc/disk0.qcow2.freeze-work");
         let frozen = PathBuf::from("/l/.vmlab/freeze/1/dc/disk0.qcow2");
-        let hold = HOLD_SNAPSHOT.to_string();
         assert_eq!(
             plan.forward(),
             vec![
@@ -944,9 +948,9 @@ mod tests {
                 &Step::CreateDir {
                     path: "/l/.vmlab/freeze/1/dc".into()
                 },
-                &Step::SnapshotCreate {
-                    disk: disk.clone(),
-                    name: hold.clone()
+                &Step::Copy {
+                    from: disk.clone(),
+                    to: work.clone()
                 },
                 &Step::SnapshotApply {
                     disk: disk.clone(),
@@ -956,18 +960,16 @@ mod tests {
                     from: disk.clone(),
                     to: frozen.clone()
                 },
-                &Step::Export {
-                    src: frozen.clone(),
-                    snapshot: hold.clone(),
-                    backing: frozen.clone(),
-                    dest: disk.clone()
-                },
-                &Step::SnapshotDelete {
-                    disk: frozen.clone(),
-                    name: hold.clone()
-                },
                 &Step::ReadOnly {
                     path: frozen.clone()
+                },
+                &Step::Overlay {
+                    backing: work.clone(),
+                    dest: disk.clone()
+                },
+                &Step::RebaseSafe {
+                    disk: disk.clone(),
+                    backing: frozen.clone()
                 },
                 &Step::Copy {
                     from: "/l/.vmlab/vms/dc/OVMF_VARS.fd".into(),
@@ -979,19 +981,18 @@ mod tests {
                 },
             ]
         );
-        // The hold's deletion is undone by committing the overlay back and
-        // holding again, after the chmod is undone.
+        // The rewind is undone by the copy, which is the disk as it was; the
+        // copy goes only once the freeze is committed.
         assert_eq!(
-            plan.steps[6].undo,
-            vec![
-                Step::Commit { top: disk.clone() },
-                Step::SnapshotCreate {
-                    disk: frozen.clone(),
-                    name: hold
-                }
-            ]
+            plan.steps[3].undo,
+            vec![Step::Rename {
+                from: work.clone(),
+                to: disk
+            }]
         );
-        assert_eq!(plan.steps[7].undo, vec![Step::Writable { path: frozen }]);
+        assert_eq!(plan.cleanup, vec![Step::Remove { path: work }]);
+        // The frozen file is read-only before anything layers onto it.
+        assert_eq!(plan.steps[5].undo, vec![Step::Writable { path: frozen }]);
     }
 
     #[test]

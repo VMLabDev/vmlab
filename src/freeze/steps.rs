@@ -55,6 +55,13 @@ pub enum Step {
         disk: PathBuf,
         backing: PathBuf,
     },
+    /// `qemu-img rebase` (safe): move `disk` onto `backing`, writing into it
+    /// only the clusters where its old and new backing chains differ. Both
+    /// backing chains are opened read-only.
+    RebaseSafe {
+        disk: PathBuf,
+        backing: PathBuf,
+    },
     Rename {
         from: PathBuf,
         to: PathBuf,
@@ -112,6 +119,9 @@ impl fmt::Display for Step {
             Step::Overlay { backing, dest } => write!(f, "create -b {} {}", d(backing), d(dest)),
             Step::Commit { top } => write!(f, "commit -d {}", d(top)),
             Step::Rebase { disk, backing } => write!(f, "rebase -u -b {} {}", d(backing), d(disk)),
+            Step::RebaseSafe { disk, backing } => {
+                write!(f, "rebase -b {} {}", d(backing), d(disk))
+            }
             Step::Rename { from, to } => write!(f, "mv {} {}", d(from), d(to)),
             Step::ReadOnly { path } => write!(f, "chmod 0444 {}", d(path)),
             Step::Writable { path } => write!(f, "chmod 0644 {}", d(path)),
@@ -168,6 +178,7 @@ pub async fn run_step(step: &Step) -> Result<()> {
         Step::Rebase { disk, backing } => {
             qimg::rebase_unsafe(disk, &backing.to_string_lossy()).await?
         }
+        Step::RebaseSafe { disk, backing } => qimg::rebase_safe(disk, backing).await?,
         Step::Rename { from, to } => std::fs::rename(from, to)
             .with_context(|| format!("moving {} to {}", from.display(), to.display()))?,
         Step::ReadOnly { path } => set_mode(path, 0o444)?,

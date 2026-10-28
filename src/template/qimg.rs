@@ -119,6 +119,16 @@ pub async fn rebase_unsafe(path: &Path, backing: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move `path` onto `backing` (by absolute path) keeping its content:
+/// `qemu-img rebase` in safe mode, which reads the old and the new backing
+/// chains — both opened read-only — and writes into `path` only the clusters
+/// where they differ (PRD §21.1).
+pub async fn rebase_safe(path: &Path, backing: &Path) -> Result<()> {
+    let (path, backing) = (path_str(path), path_str(backing));
+    run(&["rebase", "-q", "-b", &backing, "-F", "qcow2", &path]).await?;
+    Ok(())
+}
+
 /// Inspect an image via `qemu-img info --output=json`.
 ///
 /// `-U` (force-share): the image may be a running machine's disk, which QEMU

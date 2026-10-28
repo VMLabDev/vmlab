@@ -72,6 +72,25 @@ fn check_clean(path: &Path) {
     );
 }
 
+/// Bytes of guest data `path`'s own layer holds, from `qemu-img map`: what a
+/// freeze actually wrote into the main lab's overlay.
+fn own_data(path: &Path) -> u64 {
+    let out = std::process::Command::new("qemu-img")
+        .args(["map", "-U", "--output=json"])
+        .arg(path)
+        .output()
+        .unwrap();
+    let map: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    map.iter()
+        .filter(|e| e["depth"] == 0 && e["data"] == true)
+        .map(|e| e["length"].as_u64().unwrap())
+        .sum()
+}
+
+fn bytes(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap()
+}
+
 fn record(online: bool) -> SnapshotRecord {
     SnapshotRecord {
         online,
@@ -110,6 +129,10 @@ async fn lab(names: &[&str]) -> Lab {
         let disk = dir.join("disk0.qcow2");
         qimg::create_linked_clone(&tpl, &disk).await.unwrap();
         write(&disk, 1, 0x11);
+        // More provisioning, which a freeze must not copy into the overlay.
+        for slot in 9..13 {
+            write(&disk, slot, 0x19);
+        }
         qimg::snapshot_create(&disk, "base").await.unwrap();
         write(&disk, 2, 0x12);
     }
@@ -262,6 +285,10 @@ async fn freeze_point_restore_refreeze_and_thaw_keep_every_state() {
     );
     assert!(reads(&g2, 5, 0x15) && reads(&g2, 6, 0));
     assert!(reads(&disk, 3, 0x13) && reads(&disk, 5, 0x15) && reads(&disk, 6, 0x16));
+    // A refreeze writes only what changed since `two` (slot 6).
+    assert_eq!(own_data(&disk), MIB);
+    check_clean(&disk);
+    check_clean(&g2);
     write(&disk, 7, 0x17);
     qimg::snapshot_create(&disk, "late").await.unwrap();
     write(&disk, 8, 0x18);
@@ -321,6 +348,7 @@ async fn a_failure_mid_freeze_puts_every_disk_back() {
     let lab = lab(&["a", "b"]).await;
     let before = |name: &str| snapshot_names(&lab.disk(name));
     let (a0, b0) = (before("a"), before("b"));
+    let a_bytes = bytes(&lab.disk("a"));
     // `b` loses its snapshot after the facts were read: its apply fails,
     // after `a` was completely frozen.
     let mut machines = Vec::new();
@@ -336,6 +364,7 @@ async fn a_failure_mid_freeze_puts_every_disk_back() {
         });
     }
     qimg::snapshot_delete(&lab.disk("b"), "base").await.unwrap();
+    let b_bytes = bytes(&lab.disk("b"));
     let input = FreezeInput {
         lab_local: lab.lab_local.clone(),
         in_linked_worktree: false,
@@ -362,6 +391,8 @@ async fn a_failure_mid_freeze_puts_every_disk_back() {
         assert!(!std::fs::metadata(&disk).unwrap().permissions().readonly());
         check_clean(&disk);
     }
+    assert_eq!(bytes(&lab.disk("a")), a_bytes, "a is byte-identical");
+    assert_eq!(bytes(&lab.disk("b")), b_bytes, "b is byte-identical");
     assert_eq!(before("a"), a0);
     assert_eq!(
         before("b"),
@@ -377,9 +408,10 @@ async fn a_rollback_after_every_step_ran_unfreezes_too() {
         return;
     }
     // What the lab daemon does when saving the records fails after the plan
-    // succeeded: the deletion of the hold is undone by a commit.
+    // succeeded: the work copy, kept until commit, is the disk again.
     let lab = lab(&["a"]).await;
     let disk = lab.disk("a");
+    let original = bytes(&disk);
     let input = FreezeInput {
         lab_local: lab.lab_local.clone(),
         in_linked_worktree: false,
@@ -400,6 +432,8 @@ async fn a_rollback_after_every_step_ran_unfreezes_too() {
         .unwrap();
     assert!(applied.rollback().await.is_empty());
     assert!(!super::freeze_root(&lab.lab_local).exists());
+    assert_eq!(bytes(&disk), original, "byte-identical");
+    assert!(!disk.with_file_name("disk0.qcow2.freeze-work").exists());
     assert!(reads(&disk, 1, 0x11) && reads(&disk, 2, 0x12));
     assert_eq!(snapshot_names(&disk), ["base"]);
     check_clean(&disk);
