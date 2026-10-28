@@ -3,13 +3,13 @@
 Manual: `docs/manual`
 Standard: `~/.claude/skills/technical-book/reference/standard.md`
 Config: `.agent/config.yaml`
-Coverage: 138 of 138 documented (100%), threshold 100%
-Build: `wcl wdoc build docs/manual/main.wcl` exit 0 (66 pages)
-Run: 2026-09-02
+Coverage: 155 of 155 documented (100%), threshold 100%
+Build: `wcl wdoc build docs/manual/main.wcl` exit 0 (71 pages)
+Run: 2026-10-28 (script half over the whole manual; judgement half over the worktree-labs change only — rows below from 2026-09-02 are carried unchanged)
 
 ## Findings
 
-The script half reported no findings: every part, chapter, section, callout, diagram and listing rule passed, and coverage is complete.
+2026-10-28: before the worktree-labs update the script reported `site/missing-symbol/vmlab worktree` and `site/coverage` (99%); both are resolved by `cmd_worktree`. The judgement pass over the changed chapters (Worktree labs, vmlab worktree, vmlab snapshot, vmlab status, vmlab destroy, vmlab lab, vmlab up, Snapshots, Networking, Events, Paths, Glossary, How vmlab runs a lab) raised 24 findings, all applied in the same change, so none is carried. Earlier: the script half reported no findings: every part, chapter, section, callout, diagram and listing rule passed, and coverage is complete.
 
 | Finding | Severity | Status | Detail |
 |---------|----------|--------|--------|

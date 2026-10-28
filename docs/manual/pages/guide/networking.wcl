@@ -3,7 +3,7 @@ page guide_networking {
   chapter_header "Networking" {
     kicker       = "The guide · explanation"
     reading_time = "14 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -124,6 +124,20 @@ page guide_networking {
     server.
   DOC
 
+  p <<DOC
+    Under [worktree isolation](guide_worktrees) that path is closed. The NAT
+    refuses every new flow to the host: `127.0.0.0/8`, `0.0.0.0/8`, and
+    every address and broadcast address on a host interface, re-read at most
+    once a second so a VPN or a renewed lease is covered from the next flow.
+    A refused TCP connect gets a reset; UDP and ICMP are dropped silently.
+    The only exception is TCP to `127.0.0.1` on the lab's own smbd port,
+    which the gateway's port-445 redirect uses for
+    [shared folders](guide_shares). The gateway's own DNS and DHCP never
+    pass through NAT and keep working, and so does the internet. A
+    `redirect {}` onto a host address is refused like any other flow; the
+    lab daemon logs a warning at start for one onto `127.x` or `0.0.0.0`.
+  DOC
+
   h2 "Port forwards"
 
   p <<DOC
@@ -157,6 +171,13 @@ page guide_networking {
     [instances](guide_architecture) of one lab file need automatic ports,
     since a fixed one can be bound only once. See
     [Automatic host ports](ref_lab).
+  DOC
+
+  p <<DOC
+    A forward listens on every host interface, except under
+    [worktree isolation](guide_worktrees), where every segment `forward {}`
+    and container `port {}` binds `127.0.0.1` instead. A forward is then
+    reachable from the host itself and nowhere else.
   DOC
 
   h2 "Guest routes and inter-segment routing"
@@ -277,6 +298,16 @@ SRC
     their host configuration and listening on `trunk_port`. VMs stay local;
     only the wire spans hosts. `connect` on a segment that is not global is a
     validation error.
+  DOC
+
+  p <<DOC
+    In a [worktree lab](guide_worktrees), whose machines are clones of the
+    main lab's, a global segment is not shared with the main lab or another
+    worktree. It joins as `<segment>@<worktree>`, named after the linked git
+    worktree, so two lab files in the same worktree still meet on it.
+    `vmlab status` shows the name it joined under. A global segment with a
+    `connect {}` peer refuses `up` in a worktree lab. The frozen main lab
+    keeps the plain names.
   DOC
 
   callout "Declare `connect` on one side" {

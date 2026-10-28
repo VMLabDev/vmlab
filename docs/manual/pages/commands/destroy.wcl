@@ -3,7 +3,7 @@ page cmd_destroy {
   chapter_header "vmlab destroy" {
     kicker       = "Commands · reference"
     reading_time = "3 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -57,6 +57,24 @@ page cmd_destroy {
     name from any directory use [vmlab lab destroy](cmd_lab).
   DOC
 
+  h2 "Worktree labs"
+
+  p <<DOC
+    In the main checkout of a [worktree lab](guide_worktrees) family,
+    `destroy` refuses while any linked worktree's disk backs onto the
+    freeze, with or without a daemon running, and changes nothing. The
+    refusal names each worktree and the generations it uses, and says to
+    run `vmlab destroy` in each to release it. With no worktree using the
+    freeze, `destroy` deletes `.vmlab/freeze/` and `worktree.json` with the
+    rest of `.vmlab/`, so the frozen state is gone for good.
+  DOC
+
+  p <<DOC
+    In a worktree lab, `destroy` deletes only the worktree's own overlays and
+    copies and never touches the frozen files. It is how a worktree releases
+    the freeze, and the next `up` there clones from the newest generation.
+  DOC
+
   h2 "Examples"
 
   p "Tear a lab down and rebuild it from scratch:"
@@ -72,6 +90,7 @@ SRC
     Exit status is 0 when the lab's state was removed, whether or not a
     daemon was running. A lab directory that cannot be found, a machine that
     cannot be stopped, or a `.vmlab/` directory that cannot be removed exits
-    1 (`failed`). A usage error exits 2.
+    1 (`failed`). A main lab whose freeze a worktree lab still uses exits 5
+    (`conflict`). A usage error exits 2.
   DOC
 }

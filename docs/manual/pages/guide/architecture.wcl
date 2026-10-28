@@ -3,7 +3,7 @@ page guide_architecture {
   chapter_header "How vmlab runs a lab" {
     kicker       = "The guide · explanation"
     reading_time = "9 min read"
-    updated      = "2026-10-25"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -148,7 +148,9 @@ SRC
   p <<DOC
     Each worktree's `.vmlab/` holds its own clones, so the second `up`
     builds its machines from the templates rather than sharing the first
-    one's. From `feat-x`, `vmlab status`, `vmlab exec box` and `vmlab down`
+    one's. When the main checkout's lab is frozen, the worktree's machines
+    are linked clones of its provisioned disks instead, and the two labs run
+    isolated from each other (see [Worktree labs](guide_worktrees)). From `feat-x`, `vmlab status`, `vmlab exec box` and `vmlab down`
     act on `demo-feat-x`. From anywhere, `vmlab exec demo/box` and
     `vmlab exec demo-feat-x/box` pick one explicitly. To run a clone outside
     git as a second instance, give it a name by hand, for example

@@ -3,7 +3,7 @@ page cmd_status {
   chapter_header "vmlab status" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-10-25"
+    updated      = "2026-10-28"
     version      = "vmlab 0.31"
   }
 
@@ -45,6 +45,38 @@ page cmd_status {
     worktree. The same lab file running from another worktree is a different
     lab, so `status` here neither shows it nor refuses because of it. Use
     [vmlab lab list](cmd_lab) to see every instance on the host.
+  DOC
+
+  h3 "Worktree isolation"
+
+  p <<DOC
+    A lab running under [worktree isolation](guide_worktrees), the frozen
+    main lab or a worktree lab built on its freeze, says so on the line
+    after its name, before any table:
+  DOC
+
+  code text { source = <<'SRC'
+worktree isolation: worktree "feat-x", generation 1 at "provisioned"; NAT refuses host addresses, forwards bind 127.0.0.1
+  global segment "corp" joins as "corp@feat-x"
+SRC
+  }
+
+  p <<DOC
+    The main lab reads `frozen main lab` in place of the worktree. One
+    indented line follows for each global segment the lab joins under
+    another name. The line is what the lab daemon decided when it started,
+    so after a freeze or a thaw it shows the old decision until the next
+    boot verb replaces the daemon (see [vmlab up](cmd_up)).
+  DOC
+
+  p <<DOC
+    With `--json` the lab carries an `isolation` object: `role` (`main` or
+    `worktree`), `worktree`, `generation`, `snapshot`, `forward_bind` and
+    `globals`, a list of `segment` and `joined` pairs; it is absent when the
+    lab is not isolated. The projection also carries `freeze_stale`, true
+    when the daemon would decide differently if started now: the main
+    checkout has been frozen, frozen again or thawed since, or a machine
+    has lost its disk.
   DOC
 
   h3 "Machines"

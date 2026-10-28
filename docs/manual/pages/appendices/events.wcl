@@ -3,7 +3,7 @@ page ref_events {
   chapter_header "Events" {
     kicker       = "Appendices · reference"
     reading_time = "12 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -82,6 +82,16 @@ SRC
       | "`snapshot.restored`" | "`vm`, `name`, `online`, `clock`" | "A snapshot was restored, after the pin check and the syncer bracket. `clock` is present for an online restore only: `set` (set to the host's time), `kept` (the machine's `clock` is `snapshot`), `fixed` (a fixed date-time) or `not_set` (it should have been set and could not, and the reason is in the daemon log and the CLI warning)." |
   }
   p "Deleting a snapshot emits nothing."
+
+  h2 "Worktree labs"
+  table {
+    rows:
+      | "Event" | "Payload fields" | "When" |
+      | "`worktree.frozen`" | "`generation`, `snapshot`, `machines`" | "`vmlab worktree freeze` froze the main lab's machines as that generation, at that snapshot. See [Worktree labs](guide_worktrees)." |
+      | "`worktree.thawed`" | "`dropped`: a list of `machine`, `name`" | "`vmlab worktree thaw` folded the freeze back into the main lab. `dropped` names each online snapshot `--drop-online-snapshots` gave up." |
+      | "`machine.cloned_from_freeze`" | "`machine`, `generation`, `snapshot`, `main`" | "A worktree lab built the machine as a clone of that generation of the main checkout `main`, before its first start." |
+      | "`lab.isolation`" | "`role`, `worktree`, `generation`, `snapshot`, `forward_bind`, `globals`" | "The lab daemon started under worktree isolation. `role` is `main` or `worktree`, `worktree` the linked worktree's name or null, `forward_bind` the address every forward binds, and `globals` each global segment with the name it `joined`. Emitted once per daemon start, before any machine starts." |
+  }
 
   h2 "Host USB devices"
   table {

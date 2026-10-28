@@ -3,7 +3,7 @@ page cmd_lab {
   chapter_header "vmlab lab" {
     kicker       = "Commands · reference"
     reading_time = "6 min read"
-    updated      = "2026-10-25"
+    updated      = "2026-10-28"
     version      = "vmlab 0.9"
   }
 
@@ -179,7 +179,8 @@ page cmd_lab {
     its daemon is reaped. With no reachable daemon but a registry entry, it
     removes the lab's `.vmlab/` directory itself. A name the registry does
     not know fails with `lab "<name>" is not running`. Prints `lab "<name>"
-    destroyed`.
+    destroyed`. Like `vmlab destroy`, it refuses a main checkout's lab whose
+    [worktree lab](guide_worktrees) freeze a linked worktree still uses.
   DOC
 
   h2 "vmlab lab move"
@@ -221,6 +222,15 @@ page cmd_lab {
     differently, or one declares a machine the other does not, it warns
     naming each one and continues: the next `up` runs this directory's file,
     and refuses a clone whose template changed (see [vmlab up](cmd_up)).
+  DOC
+
+  p <<DOC
+    A frozen lab does not move. Its own disks and every
+    [worktree lab](guide_worktrees)'s overlays name the frozen files under
+    `.vmlab/freeze/` by absolute path, so moving the working data would
+    break every disk of the family. While worktree labs back onto the
+    freeze the refusal names them; with none, it asks for
+    `vmlab worktree thaw` first.
   DOC
 
   p <<DOC
@@ -289,12 +299,14 @@ SRC
   p <<DOC
     Exit status is 0 on success, including `list` with nothing running,
     `stop` on a lab that is not running, and `info` on a registered lab
-    whose daemon does not answer. An unknown lab name, a lab with machines
+    whose daemon does not answer. `destroy` exits 5 (`conflict`) when
+    worktree labs use the lab's freeze. An unknown lab name, a lab with machines
     still running at `restart`, a daemon that fails the request, or a
     supervisor that does not come up exits 1 (`failed`). `restart` exits 5
     (`conflict`) when the supervisor already tracks this name from another
     directory. `move` exits 5 when a machine or process of the lab is
-    running, when this directory already holds machine data, or when the
+    running, when this directory already holds machine data, when the lab is frozen,
+    or when the
     lab is registered from a directory other than `--from`; it exits 2 when
     a lab file runs under another name, and 1 when the lab is not registered
     and no `--from` is given. A usage error exits 2.
