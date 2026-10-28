@@ -1178,3 +1178,120 @@ async fn udp_flow_table_reuses_entries_and_expires_idle_ones() {
         "idle flows drained"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Worktree isolation (§21.4)
+// ---------------------------------------------------------------------------
+
+/// An engine under worktree isolation, with `host` as the host's interface
+/// addresses and `exposed` as the lab's own host services.
+fn guarded(
+    pinger: Arc<dyn Pinger>,
+    host: Vec<Ipv4Addr>,
+    exposed: Vec<u16>,
+) -> (Arc<NatEngine>, mpsc::Receiver<Bytes>) {
+    let (engine, rx) = engine_with_pinger(pinger);
+    let host: std::collections::HashSet<Ipv4Addr> = host.into_iter().collect();
+    engine.set_guard(Arc::new(super::HostGuard::with_source(
+        Arc::new(std::sync::Mutex::new(exposed)),
+        Box::new(move || host.clone()),
+    )));
+    (engine, rx)
+}
+
+fn stub_pinger() -> Arc<StubPinger> {
+    Arc::new(StubPinger {
+        reachable: true,
+        calls: AtomicUsize::new(0),
+    })
+}
+
+/// A SYN to a listening loopback port is answered with RST, and the
+/// listener never sees a connection.
+#[tokio::test]
+async fn isolation_resets_tcp_to_the_host() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dst = (Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port());
+    let (engine, mut rx) = guarded(stub_pinger(), Vec::new(), Vec::new());
+
+    guest_tcp(&engine, 40100, dst, 777, 0, TCP_SYN, b"", &[]).await;
+    let t = recv_tcp(&mut rx).await;
+    assert_ne!(t.flags & TCP_RST, 0, "refused SYN is reset");
+    assert_eq!(t.ack, 778, "the reset acks the SYN");
+    assert_eq!(t.src, dst);
+    assert!(
+        timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "the host listener was reached"
+    );
+}
+
+/// The same refusal for a host interface address, not just loopback: the
+/// path a worktree guest would take to the main lab's forward.
+#[tokio::test]
+async fn isolation_resets_tcp_to_a_host_interface_address() {
+    let lan = Ipv4Addr::new(192, 0, 2, 44);
+    let (engine, mut rx) = guarded(stub_pinger(), vec![lan], Vec::new());
+    guest_tcp(&engine, 40101, (lan, 8080), 1, 0, TCP_SYN, b"", &[]).await;
+    let t = recv_tcp(&mut rx).await;
+    assert_ne!(t.flags & TCP_RST, 0);
+    assert!(
+        engine.tcp_flows.lock().unwrap().is_empty(),
+        "no flow opened"
+    );
+}
+
+/// The lab's own `smbd` port on 127.0.0.1 stays reachable.
+#[tokio::test]
+async fn isolation_admits_an_exposed_host_service() {
+    let addr = tcp_echo_server().await;
+    let dst = (Ipv4Addr::LOCALHOST, addr.port());
+    let (engine, mut rx) = guarded(stub_pinger(), Vec::new(), vec![addr.port()]);
+    guest_tcp(&engine, 40102, dst, 1000, 0, TCP_SYN, b"", &[]).await;
+    let t = recv_tcp(&mut rx).await;
+    assert_eq!(t.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK, "{t:?}");
+}
+
+/// A datagram to the host is dropped: no flow, no reply.
+#[tokio::test]
+async fn isolation_drops_udp_to_the_host() {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = (Ipv4Addr::LOCALHOST, sock.local_addr().unwrap().port());
+    let (engine, mut rx) = guarded(stub_pinger(), Vec::new(), Vec::new());
+    guest_udp(&engine, 50100, dst, b"hello").await;
+    let mut buf = [0u8; 16];
+    assert!(
+        timeout(Duration::from_millis(300), sock.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "the datagram reached the host"
+    );
+    assert!(engine.udp_flows.lock().unwrap().is_empty());
+    assert!(
+        timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
+}
+
+/// An echo to the host is dropped without a probe; one elsewhere is not.
+#[tokio::test]
+async fn isolation_drops_icmp_to_the_host() {
+    let lan = Ipv4Addr::new(192, 0, 2, 45);
+    let pinger = stub_pinger();
+    let (engine, mut rx) = guarded(pinger.clone(), vec![lan], Vec::new());
+    guest_icmp_echo(&engine, lan, 1, b"x").await;
+    guest_icmp_echo(&engine, Ipv4Addr::LOCALHOST, 2, b"x").await;
+    assert!(
+        timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "no frame emitted"
+    );
+    assert_eq!(pinger.calls.load(Ordering::SeqCst), 0, "no probe ran");
+
+    guest_icmp_echo(&engine, Ipv4Addr::new(192, 0, 2, 46), 3, b"x").await;
+    recv_frame(&mut rx).await;
+    assert_eq!(pinger.calls.load(Ordering::SeqCst), 1);
+}

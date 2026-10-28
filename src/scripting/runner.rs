@@ -338,7 +338,9 @@ impl SegmentHandle {
         let guest_ip: std::net::Ipv4Addr = guest_ip
             .parse()
             .map_err(|_| format!("vm {vm} has no IPv4 lease yet"))?;
-        let host_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, host_port));
+        // Under worktree isolation a forward binds loopback only (§21.4).
+        let bind = crate::labd::isolation::forward_bind(self.runtime.isolation.as_ref());
+        let host_addr = std::net::SocketAddr::from((bind, host_port));
         self.with_services(|s| {
             s.add_forward(
                 host_addr,
