@@ -1552,15 +1552,23 @@ impl LabRuntime {
         Ok(())
     }
 
-    /// Whether this daemon would build some machine differently if it were
-    /// built now (§21.2): the main checkout was frozen, refrozen or thawed
-    /// since, or a machine has lost its disk. A boot verb replaces such a
-    /// daemon first, as it does one running an edited lab file.
+    /// Whether this daemon would build some machine differently, or decide
+    /// worktree isolation differently, if it were built now (§21.2, §21.4):
+    /// the main checkout was frozen, refrozen or thawed since, or a machine
+    /// has lost its disk. A boot verb replaces such a daemon first, as it
+    /// does one running an edited lab file. Isolation is decided once, when
+    /// the network is assembled, and a freeze or thaw runs inside the main
+    /// lab's own daemon, so without this the main lab would keep running
+    /// unisolated after its freeze.
     fn freeze_stale(&self, planned: Option<&freeze_clone::FreezePlan>) -> bool {
         let now = freeze_clone::observe(&self.root, &self.lab_local, &self.freeze_declared)
             .ok()
             .and_then(|o| freeze_clone::plan(&self.freeze_declared, &o));
-        freeze_clone::stale(planned, now.as_ref())
+        // An unreadable `worktree.json` counts as stale: the rebuild then
+        // fails loudly rather than this daemon running on its old decision.
+        let isolation_moved = super::isolation::decide(&self.root, &self.config.lab)
+            .map_or(true, |now| now != self.isolation);
+        freeze_clone::stale(planned, now.as_ref()) || isolation_moved
     }
 
     /// Stop one machine, finalising its recording first (D6: unlike the
@@ -3997,6 +4005,36 @@ lab "t" {
                 .isolation,
             None
         );
+    }
+
+    /// A freeze or thaw runs inside the main lab's own daemon, which decided
+    /// isolation when it started. Its status says it is stale, so the next
+    /// boot verb replaces it and the main lab comes up isolated (§21.4).
+    #[tokio::test]
+    async fn a_freeze_or_thaw_after_start_makes_the_daemon_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, _wt) = frozen_family(tmp.path());
+        let src = r#"import <vmlab.wcl>
+lab "t" {
+  segment "corp" { global = true }
+}"#;
+        let main_local = crate::paths::lab_local_dir(&main);
+        let record = crate::freeze::WorktreeConfig::load(&main_local)
+            .unwrap()
+            .expect("frozen");
+
+        crate::freeze::WorktreeConfig::remove(&main_local).unwrap();
+        let lab = lab_of(&main, src, Vec::new());
+        assert_eq!(lab.status().await.isolation, None);
+        assert!(!lab.status().await.freeze_stale);
+
+        record.save(&main_local).unwrap();
+        assert!(lab.status().await.freeze_stale, "frozen since start");
+
+        let lab = lab_of(&main, src, Vec::new());
+        assert!(!lab.status().await.freeze_stale);
+        crate::freeze::WorktreeConfig::remove(&main_local).unwrap();
+        assert!(lab.status().await.freeze_stale, "thawed since start");
     }
 
     #[tokio::test]
