@@ -196,6 +196,9 @@ FEATURES: dict[str, str] = {
     "app.exit-code": "`vmlab app run` exits with the guest program's code",
     "app.waypipe": "`vmlab app run` over waypipe on a Wayland host",
     "app.rdp": "`vmlab app run` over RDP RemoteApp from a Windows guest",
+    # -- worktree labs -----------------------------------------------------
+    "worktree.clone": "`up` in a linked worktree clones each machine from the main checkout's freeze",
+    "worktree.clone.macs": "a worktree machine keeps the frozen MACs, and the main and worktree labs run at once",
     # -- architectures -----------------------------------------------------
     "arch.emulated": "a non-x86 guest under TCG emulation",
 }

@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, InstalledForward};
+use super::freeze_clone;
 use super::machine::Machine;
 use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
@@ -118,6 +119,16 @@ pub struct LabRuntime {
     /// Worktree isolation (§21.4), decided once when the daemon starts:
     /// `Some` for the frozen main lab and every worktree lab built on it.
     pub isolation: Option<super::isolation::IsolationPlan>,
+    /// Every machine as the freeze planner compares it against the main
+    /// checkout's freeze (§21.2), kept so `status` can plan again and say
+    /// whether this daemon's plan still holds.
+    freeze_declared: Vec<freeze_clone::Declared>,
+    /// Which machines this daemon builds from the main checkout's freeze, as
+    /// planned when it was built (§21.2): their MACs and image pins are the
+    /// frozen ones already. A clone, once made, is marked built. Held across
+    /// a clone, so two starts never clone at once. `None` outside a worktree
+    /// lab of a frozen family.
+    freeze: Mutex<Option<freeze_clone::FreezePlan>>,
     /// This runtime as its own `Arc`. [`crate::labd::machine::LabServices`] is
     /// a `&self` interface (it has to be, to be object-safe), and the work
     /// behind two of its methods spawns tasks that outlive the call.
@@ -344,6 +355,50 @@ fn rooted_vm_config(
     cfg
 }
 
+/// Every machine of the lab file as the freeze planner compares it against
+/// the main checkout's freeze (§21.2): what its disk is made from, where it
+/// keeps its disks, and which disks and named volumes it uses.
+fn freeze_declared(
+    config: &LabFile,
+    lab: &str,
+    lab_local: &std::path::Path,
+) -> Vec<freeze_clone::Declared> {
+    let vms = config.lab.vms.iter().map(|vm| freeze_clone::Declared {
+        name: vm.name.clone(),
+        kind: freeze_clone::Kind::Vm,
+        source: crate::labd::vm::clone_source(vm),
+        local: VmDirs::new(lab, &vm.name, lab_local).local,
+        disks: std::iter::once("disk0.qcow2".to_string())
+            .chain(
+                vm.extra_disks
+                    .iter()
+                    .map(|d| format!("disk-{}.qcow2", d.name)),
+            )
+            .collect(),
+        volumes: Vec::new(),
+    });
+    let containers = config
+        .lab
+        .containers
+        .iter()
+        .map(|c| freeze_clone::Declared {
+            name: c.name.clone(),
+            kind: freeze_clone::Kind::Container,
+            source: c.image.reference.clone(),
+            local: ContainerDirs::new(&config.root, lab, &c.name).local,
+            disks: vec!["scratch.qcow2".to_string()],
+            volumes: c
+                .volumes
+                .iter()
+                .filter_map(|v| match &v.source {
+                    crate::config::model::VolumeSource::Named(n) => Some(n.clone()),
+                    crate::config::model::VolumeSource::Host(_) => None,
+                })
+                .collect(),
+        });
+    vms.chain(containers).collect()
+}
+
 impl LabRuntime {
     pub async fn build(
         config: LabFile,
@@ -356,6 +411,13 @@ impl LabRuntime {
         std::fs::create_dir_all(&lab_local)?;
 
         let mut state = LabState::load(&lab_local)?;
+        // Before any machine is built: a machine cloned from the main
+        // checkout's freeze carries the frozen MACs and image pin (§21.2).
+        let freeze_declared = freeze_declared(&config, &name, &lab_local);
+        let freeze = freeze_clone::plan(
+            &freeze_declared,
+            &freeze_clone::observe(&root, &lab_local, &freeze_declared)?,
+        );
         let store = TemplateStore::new(crate::paths::template_store_dir());
         let mut network = LabNetwork::build(&config.lab)?;
         // Before any gateway is wired: isolation changes what each NAT
@@ -450,17 +512,26 @@ impl LabRuntime {
 
             let resolved = crate::qemu::resolve_vm(vm_cfg, meta.as_ref(), profiles)?;
 
-            // Stable MACs: explicit > persisted > generated (PRD §9.4).
-            let vm_state = state.machine_mut(&vm_cfg.name);
+            // Stable MACs: explicit > persisted > generated (PRD §9.4). A
+            // machine about to be cloned from the freeze has no disk, so
+            // nothing persisted here has reached a guest: the frozen
+            // machine's MACs take that place, and are persisted with the
+            // rest of its record when the clone is made (§21.2).
+            let frozen = freeze.as_ref().and_then(|f| f.record(&vm_cfg.name));
             let mut macs = Vec::new();
             for (i, nic) in vm_cfg.nics.iter().enumerate() {
                 let mac = nic
                     .mac
-                    .or_else(|| vm_state.macs.get(i).copied())
+                    .or_else(|| match frozen {
+                        Some(record) => record.macs.get(i).copied(),
+                        None => state.machine_mut(&vm_cfg.name).macs.get(i).copied(),
+                    })
                     .unwrap_or_else(|| generate_mac(&name, &vm_cfg.name, i));
                 macs.push(mac);
             }
-            vm_state.macs = macs.clone();
+            if frozen.is_none() {
+                state.machine_mut(&vm_cfg.name).macs = macs.clone();
+            }
 
             let dirs = VmDirs::new(&name, &vm_cfg.name, &lab_local);
             let mut cdroms = Vec::new();
@@ -550,7 +621,14 @@ impl LabRuntime {
             let arch = std::env::consts::ARCH;
             let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
             for c_cfg in &config.lab.containers {
-                let c_state = state.machine_mut(&c_cfg.name);
+                // A container about to be cloned from the freeze binds the
+                // frozen image pin and MACs, written to the lab's state only
+                // when the clone is made (§21.2).
+                let mut frozen = freeze.as_ref().and_then(|f| f.record(&c_cfg.name)).cloned();
+                let c_state = match &mut frozen {
+                    Some(record) => record,
+                    None => state.machine_mut(&c_cfg.name),
+                };
                 if c_state.image_ref.as_deref() != Some(c_cfg.image.reference.as_str()) {
                     // The `image =` line changed — drop the stale pin.
                     c_state.image_digest = None;
@@ -643,12 +721,23 @@ impl LabRuntime {
         // map spans VMs and containers (one name namespace), so container
         // static IPs and lease-DNS registrations work identically.
         let host_cfg = crate::config::host::HostConfig::load_default()?;
-        let macs_by_vm: std::collections::HashMap<String, Vec<crate::config::model::MacAddr>> =
+        let mut macs_by_vm: std::collections::HashMap<String, Vec<crate::config::model::MacAddr>> =
             state
                 .machines
                 .iter()
                 .map(|(n, m)| (n.clone(), m.macs.clone()))
                 .collect();
+        // A machine still to be cloned from the freeze reserves the MACs it
+        // was built with, not whatever its record here says.
+        for (n, m) in vms
+            .iter()
+            .map(|(n, v)| (n, v.macs.clone()))
+            .chain(containers.iter().map(|(n, c)| (n, c.macs.clone())))
+        {
+            if freeze.as_ref().and_then(|f| f.record(n)).is_some() {
+                macs_by_vm.insert(n.clone(), m);
+            }
+        }
         network.wire_gateways(&config.lab, &macs_by_vm, &host_cfg);
 
         let machines: BTreeMap<String, Arc<dyn Machine>> = vms
@@ -689,6 +778,8 @@ impl LabRuntime {
             recordings: super::record::Recordings::default(),
             usb: super::usb::UsbHost::default(),
             isolation,
+            freeze_declared,
+            freeze: Mutex::new(freeze),
         }))
     }
 
@@ -759,6 +850,8 @@ impl LabRuntime {
             recordings: super::record::Recordings::default(),
             usb,
             isolation,
+            freeze_declared: Vec::new(),
+            freeze: Mutex::new(None),
         }))
     }
 
@@ -1358,7 +1451,116 @@ impl LabRuntime {
 
     /// Boot one machine, whichever kind it is.
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.clone_from_freeze(name).await?;
         self.machine(name)?.start(self.services()).await
+    }
+
+    /// Build `name` from the main checkout's freeze when this daemon planned
+    /// it so and it has no disk yet (§21.2), and copy in the frozen named
+    /// volumes it mounts that this lab has not got. Refuses when the freeze
+    /// it would come from cannot be read; never falls back to the template.
+    /// A no-op for every other machine, and for this one once it is built.
+    ///
+    /// Before the machine's first boot, so that boot finds a disk to keep,
+    /// and the copies a fresh VM would otherwise make from its firmware's
+    /// templates already in place.
+    async fn clone_from_freeze(self: &Arc<Self>, name: &str) -> Result<()> {
+        let mut guard = self.freeze.lock().await;
+        let Some(plan) = guard.as_mut() else {
+            return Ok(());
+        };
+        match plan.machines.get(name) {
+            Some(freeze_clone::Source::Refused(why)) => {
+                bail!("\"{name}\" cannot be built: {why}")
+            }
+            Some(freeze_clone::Source::Freeze(clone)) => {
+                let clone = clone.as_ref().clone();
+                self.make_clone(name, &clone, plan).await?;
+                plan.machines
+                    .insert(name.to_string(), freeze_clone::Source::Built);
+            }
+            _ => {}
+        }
+        let (copy, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut plan.volumes)
+            .into_iter()
+            .partition(|v| v.used_by.iter().any(|m| m == name));
+        plan.volumes = keep;
+        for v in copy {
+            if !v.copy.to.exists() {
+                v.run()
+                    .await
+                    .with_context(|| format!("copying volume \"{}\" from the freeze", v.name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute one machine's part of the freeze plan. Its record is merged
+    /// into the lab's state before its primary disk exists, because the
+    /// primary disk is what marks it built: interrupted anywhere, the next
+    /// `up` plans the same clone again and finishes it.
+    async fn make_clone(
+        &self,
+        name: &str,
+        clone: &freeze_clone::MachineClone,
+        plan: &freeze_clone::FreezePlan,
+    ) -> Result<()> {
+        let m = self.machine(name)?;
+        clone.stage().await.with_context(|| {
+            format!(
+                "\"{name}\": cloning from freeze generation {} of {}",
+                plan.generation,
+                plan.main_root.display()
+            )
+        })?;
+        // An `@dev` machine's guest tree is the main checkout's, as of the
+        // freeze: the re-seed carries this worktree's tree in before its
+        // watch opens (§19.6), exactly as after a restore.
+        if let Some(workspace) = self.workspace_of(name) {
+            crate::labd::workspace::ledger::Ledger::mark_rewound(
+                &workspace.ledger_path,
+                &workspace.host_root,
+                &workspace.guest_root,
+            )
+            .with_context(|| format!("\"{name}\": noting the re-seed its workspace owes"))?;
+        }
+        {
+            let mut state = self.state.lock().await;
+            let mut record = clone.record.clone();
+            // The MACs this machine was built with: the frozen ones, unless
+            // the lab file pins a NIC's MAC itself.
+            record.macs = m.macs().to_vec();
+            state.machines.insert(name.to_string(), record);
+            state.save(&self.lab_local)?;
+        }
+        clone.finish().await.with_context(|| {
+            format!(
+                "\"{name}\": cloning from freeze generation {} of {}",
+                plan.generation,
+                plan.main_root.display()
+            )
+        })?;
+        self.events.emit(
+            "machine.cloned_from_freeze",
+            json!({
+                "machine": name,
+                "generation": plan.generation,
+                "snapshot": plan.snapshot,
+                "main": plan.main_root.display().to_string(),
+            }),
+        );
+        Ok(())
+    }
+
+    /// Whether this daemon would build some machine differently if it were
+    /// built now (§21.2): the main checkout was frozen, refrozen or thawed
+    /// since, or a machine has lost its disk. A boot verb replaces such a
+    /// daemon first, as it does one running an edited lab file.
+    fn freeze_stale(&self, planned: Option<&freeze_clone::FreezePlan>) -> bool {
+        let now = freeze_clone::observe(&self.root, &self.lab_local, &self.freeze_declared)
+            .ok()
+            .and_then(|o| freeze_clone::plan(&self.freeze_declared, &o));
+        freeze_clone::stale(planned, now.as_ref())
     }
 
     /// Stop one machine, finalising its recording first (D6: unlike the
@@ -1850,6 +2052,30 @@ impl LabRuntime {
         // whole of what `up` did.
         for name in &targets {
             self.machine(name)?.check_disks()?;
+        }
+        // Likewise a machine the main checkout's freeze cannot build (§21.2).
+        if let Some(plan) = self.freeze.lock().await.as_ref() {
+            for name in &targets {
+                if let Some(freeze_clone::Source::Refused(why)) = plan.machines.get(name) {
+                    bail!("\"{name}\" cannot be built: {why}");
+                }
+            }
+            for (name, _) in plan
+                .clones()
+                .filter(|(n, _)| targets.iter().any(|t| t == n))
+            {
+                output(format!(
+                    "{name}: cloning from freeze generation {} (snapshot \"{}\") of {}\n",
+                    plan.generation,
+                    plan.snapshot,
+                    plan.main_root.display()
+                ));
+            }
+        }
+        // Before anything downloads or boots, so the waves below see each
+        // clone's first-boot marker and the pull its image pin.
+        for name in &targets {
+            self.clone_from_freeze(name).await?;
         }
 
         // Deferred template/image downloads happen here — before the binary
@@ -2628,6 +2854,7 @@ impl LabRuntime {
             });
         }
         let forwards = self.forward_statuses().await;
+        let freeze_stale = self.freeze_stale(self.freeze.lock().await.as_ref());
         // In-flight downloads, so a page load mid-pull still shows progress
         // (the events only reach clients that were already connected).
         LabStatus {
@@ -2639,6 +2866,7 @@ impl LabRuntime {
             config_digest: crate::config::digest(&self.config),
             forwards,
             isolation: self.isolation.as_ref().map(|p| p.status()),
+            freeze_stale,
         }
     }
 
@@ -5158,5 +5386,140 @@ fn main(lab: Lab) {
         let err = lab.record_arm(&[req.clone(), bad], None).await.unwrap_err();
         assert_eq!(code_of(&err), Some(ErrorCode::Unsupported));
         assert!(!lab.recordings.is_pending("a"));
+    }
+
+    /// A worktree lab of a frozen main checkout (§21.2), built for real: the
+    /// machine in the freeze is built with the frozen MACs, its record is
+    /// written only when the clone is made, and the clone keeps the freeze
+    /// point as its one snapshot; a machine new in the branch keeps the MACs
+    /// its effective name generates.
+    #[tokio::test]
+    async fn a_worktree_lab_clones_from_the_freeze_with_the_frozen_macs() {
+        let have = std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("qemu-img").is_file())
+        });
+        if !have {
+            eprintln!("skipping: qemu-img not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().canonicalize().unwrap();
+        let (main, wt) = (tmp.join("main"), tmp.join("wt"));
+        let wt_git = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let src = r#"import <vmlab.wcl>
+            lab "l" {
+                segment "lan" { subnet = "10.71.0.0/24" }
+                vm "dc01" {
+                    template = "scratch"
+                    arch = "x86_64"
+                    disk = 1MiB
+                    nic { segment = "lan" }
+                }
+                vm "web" {
+                    template = "scratch"
+                    arch = "x86_64"
+                    disk = 1MiB
+                    nic { segment = "lan" }
+                }
+            }"#;
+        std::fs::write(wt.join("vmlab.wcl"), src).unwrap();
+
+        let main_local = crate::paths::lab_local_dir(&main);
+        let frozen = crate::freeze::machine_dir(&main_local, 1, "dc01");
+        std::fs::create_dir_all(&frozen).unwrap();
+        crate::template::qimg::create_blank(&frozen.join("disk0.qcow2"), 1 << 20)
+            .await
+            .unwrap();
+        std::fs::write(frozen.join("clone-source"), "scratch\n").unwrap();
+        let mac = crate::config::model::MacAddr([0x52, 0x54, 0, 0xfe, 0xed, 0x01]);
+        let mut record = crate::labd::state::MachineState {
+            macs: vec![mac],
+            ..Default::default()
+        };
+        for (name, freeze_point) in [("base", Some(1)), ("early", None)] {
+            record.snapshots.insert(
+                name.into(),
+                SnapshotRecord {
+                    online: false,
+                    taken_at: chrono::Utc::now(),
+                    image_digest: None,
+                    freeze_point,
+                    frozen_in: freeze_point.xor(Some(1)),
+                },
+            );
+        }
+        std::fs::write(
+            frozen.join("state.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        crate::freeze::WorktreeConfig {
+            generation: 1,
+            snapshot: "base".into(),
+        }
+        .save(&main_local)
+        .unwrap();
+
+        let config = crate::config::load_lab_source(src, "<test>", &wt).expect("lab source");
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let events = Arc::new(super::super::events::EventLog::new("l-wt", tx).unwrap());
+        let lab = LabRuntime::build(config, events, &ProfileSet::shipped().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(lab.vm("dc01").unwrap().macs, vec![mac]);
+        assert_eq!(
+            lab.vm("web").unwrap().macs,
+            vec![generate_mac("l", "web", 0)]
+        );
+        assert!(
+            !lab.state.lock().await.machines.contains_key("dc01"),
+            "nothing is written for the clone before it is made"
+        );
+        assert!(!lab.status().await.freeze_stale);
+
+        lab.clone_from_freeze("dc01").await.unwrap();
+        lab.clone_from_freeze("web").await.unwrap();
+        let local = &lab.vm("dc01").unwrap().dirs.local;
+        let info = crate::template::qimg::image_info(&local.join("disk0.qcow2"))
+            .await
+            .unwrap();
+        assert_eq!(info.backing_file, Some(frozen.join("disk0.qcow2")));
+        assert_eq!(
+            std::fs::read_to_string(local.join("freeze-generation")).unwrap(),
+            "1\n"
+        );
+        assert!(!lab.vm("web").unwrap().dirs.primary_disk().exists());
+        let state = LabState::load(&lab.lab_local).unwrap();
+        assert_eq!(state.machines["dc01"].macs, vec![mac]);
+        assert_eq!(
+            state.machines["dc01"].snapshots.keys().collect::<Vec<_>>(),
+            ["base"]
+        );
+        // The disk the boot keeps is the clone, and the daemon's plan holds.
+        lab.vm("dc01").unwrap().ensure_disks().await.unwrap();
+        assert_eq!(
+            crate::template::qimg::image_info(&local.join("disk0.qcow2"))
+                .await
+                .unwrap()
+                .backing_file,
+            Some(frozen.join("disk0.qcow2"))
+        );
+        assert!(!lab.status().await.freeze_stale);
+
+        // A missing generation refuses the machine still to be built.
+        std::fs::remove_dir_all(crate::freeze::freeze_root(&main_local)).unwrap();
+        let config = crate::config::load_lab_source(src, "<test>", &wt).expect("lab source");
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let events = Arc::new(super::super::events::EventLog::new("l-wt", tx).unwrap());
+        let lab = LabRuntime::build(config, events, &ProfileSet::shipped().unwrap())
+            .await
+            .unwrap();
+        let err = lab.clone_from_freeze("web").await.unwrap_err().to_string();
+        assert!(err.contains("vmlab worktree freeze"), "{err}");
+        lab.clone_from_freeze("dc01").await.unwrap();
     }
 }

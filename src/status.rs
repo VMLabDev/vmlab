@@ -683,6 +683,12 @@ pub struct LabStatus {
     /// `None` outside one, and from a daemon that predates the field.
     #[serde(default)]
     pub isolation: Option<IsolationStatus>,
+    /// The daemon planned which machines clone from the main checkout's
+    /// freeze (§21.2) against a freeze that has since moved — frozen,
+    /// refrozen or thawed — or before a machine lost its disk. A boot verb
+    /// replaces it, as it does a daemon whose `config_digest` is stale.
+    #[serde(default)]
+    pub freeze_stale: bool,
 }
 
 impl LabStatus {
@@ -816,6 +822,7 @@ pub(crate) mod fixtures {
             config_digest: String::new(),
             forwards: Vec::new(),
             isolation: None,
+            freeze_stale: false,
         }
     }
 }

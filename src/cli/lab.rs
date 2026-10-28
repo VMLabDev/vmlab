@@ -107,9 +107,27 @@ enum DaemonFreshness {
 /// machine the old one is running or carry on a download the old one is
 /// doing, so either of those refuses rather than being quietly lost.
 fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFreshness {
-    if status.config_digest == digest {
+    let edited = status.config_digest != digest;
+    if !edited && !status.freeze_stale {
         return DaemonFreshness::Current;
     }
+    // A worktree lab's daemon planned which machines clone from the main
+    // checkout's freeze when it started (§21.2); the freeze moving since is
+    // as much a change to what `up` would build as an edit is.
+    let (changed, load, apply) = if edited {
+        (
+            "vmlab.wcl has changed since the lab daemon loaded it",
+            "the new file",
+            "the edit (or undo the edit)",
+        )
+    } else {
+        (
+            "the main checkout's freeze (or a machine's disk) has changed since the lab \
+             daemon planned which machines clone from it",
+            "the change",
+            "it",
+        )
+    };
     let running: Vec<&str> = status
         .machines
         .iter()
@@ -118,10 +136,9 @@ fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFresh
         .collect();
     if !running.is_empty() {
         return DaemonFreshness::Refuse(format!(
-            "lab \"{name}\": vmlab.wcl has changed since the lab daemon loaded it, \
-             and {running} — the daemon cannot load the new file without \
-             stopping {them}. Run `vmlab down`, then this command again, to apply \
-             the edit (or undo the edit)",
+            "lab \"{name}\": {changed}, and {running} — the daemon cannot load \
+             {load} without stopping {them}. Run `vmlab down`, then this command \
+             again, to apply {apply}",
             running = match running.as_slice() {
                 [one] => format!("{one} is still running"),
                 many => format!("{} are still running", many.join(", ")),
@@ -134,10 +151,10 @@ fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFresh
     pulling.dedup();
     if !pulling.is_empty() {
         return DaemonFreshness::Refuse(format!(
-            "lab \"{name}\": vmlab.wcl has changed since the lab daemon loaded it, \
-             but it is still downloading {} — loading the new file would abandon \
-             the download. Wait for it to finish (or interrupt the `vmlab pull` \
-             that started it), then run this command again",
+            "lab \"{name}\": {changed}, but it is still downloading {} — \
+             loading {load} would abandon the download. Wait for it to finish \
+             (or interrupt the `vmlab pull` that started it), then run this \
+             command again",
             pulling.join(", ")
         ));
     }
@@ -161,11 +178,21 @@ async fn ensure_current_daemon(name: &str, root: &std::path::Path) -> Result<Lab
     // so), and the digest covers it, so load from the same path.
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let digest = crate::config::digest(&load_lab_at(&root)?);
-    match daemon_freshness(name, &lab_status(&client).await?, &digest) {
+    let status = lab_status(&client).await?;
+    match daemon_freshness(name, &status, &digest) {
         DaemonFreshness::Current => Ok(client),
         DaemonFreshness::Refuse(why) => bail!(why),
         DaemonFreshness::Restart => {
-            println!("lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it");
+            if status.config_digest != digest {
+                println!(
+                    "lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it"
+                );
+            } else {
+                println!(
+                    "lab \"{name}\": the main checkout's freeze or a machine's disk changed \
+                     — restarting the lab daemon to plan its clones again"
+                );
+            }
             let reply = daemon::ensure_supervisor()
                 .await?
                 .send(SupRequest::LabRestart {
@@ -2236,6 +2263,30 @@ mod tests {
             daemon_freshness("demo", &running, "loaded"),
             DaemonFreshness::Current
         );
+    }
+
+    /// A worktree lab's daemon that planned its clones against a freeze that
+    /// has since moved is replaced like one running an edited file, and
+    /// refuses the same way over a running machine, saying what moved.
+    #[test]
+    fn a_daemon_planned_against_a_moved_freeze_is_replaced() {
+        let m = |state| crate::status::fixtures::machine("web", state, false, vm());
+        let mut status = lab(vec![m(PowerState::Stopped)]);
+        status.config_digest = "loaded".into();
+        status.freeze_stale = true;
+        assert_eq!(
+            daemon_freshness("demo", &status, "loaded"),
+            DaemonFreshness::Restart
+        );
+        let mut running = lab(vec![m(PowerState::Running)]);
+        running.config_digest = "loaded".into();
+        running.freeze_stale = true;
+        let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &running, "loaded") else {
+            panic!("did not refuse");
+        };
+        assert!(why.contains("freeze"), "{why}");
+        assert!(!why.contains("vmlab.wcl"), "{why}");
+        assert!(why.contains("vmlab down"), "{why}");
     }
 
     /// A daemon from before the digest existed reports none, and is taken to

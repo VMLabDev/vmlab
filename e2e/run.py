@@ -36,6 +36,7 @@ SCENARIOS = [
     "record",
     "playbooks",
     "dev",
+    "worktree_clone",
     "apps",
     "peers",
     "admin",
