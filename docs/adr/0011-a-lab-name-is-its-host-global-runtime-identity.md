@@ -85,7 +85,7 @@ lab's network runs in its own userspace process.
 
 [ADR-0019](0019-a-worktree-lab-is-a-linked-clone-of-a-frozen-main-lab.md)
 changes the global-segment rule for one case. When a lab instance is built on
-a freeze of the main lab, its global segments join `<segment>@<instance>`
+a freeze of the main lab, its global segments join `<segment>@<worktree>`
 instead of `<segment>`, so it never shares a wire with the main lab or with
 another worktree. Its `connect {}` peers are refused. Every other instance
 keeps the rule above.

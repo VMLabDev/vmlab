@@ -2348,7 +2348,8 @@ Building a machine from the freeze:
   **MACs** unchanged, its first-boot marker, a container's image pin, and the
   record of `<snapshot>`;
 - copies the lab's named volumes on first build, with `cp --reflink=auto`;
-- records the generation beside the template reference in `clone-source`;
+- writes the generation to `freeze-generation` beside the disks, leaving
+  `clone-source` as the template reference so §7.1's check still applies;
 - writes an `@dev` machine's workspace ledger with `reseed_owed = true`, so the
   §19.6 re-seed carries the worktree's own tree into the guest before its watch
   opens.
@@ -2384,13 +2385,17 @@ When `worktree.json` exists, the main lab and every worktree lab built on it run
 with **worktree isolation**. Cloned guests share hostnames, MACs, machine-ids
 and Windows SIDs, so labs in the family must never share a wire or a route:
 
-- **NAT** (§9.7) refuses every connection to a host address: loopback and every
-  address on a host interface. The lab's own gateway services (DNS, the
-  gateway:445 redirect to its `smbd`) answer on the segment and are not NAT
-  connections, so they keep working.
+- **NAT** (§9.7) refuses every new flow to a host address: `127.0.0.0/8`,
+  `0.0.0.0/8`, and every address and broadcast address on a host interface,
+  re-read at most once a second so a new interface is covered. A refused TCP
+  connect gets a RST; UDP and ICMP are dropped. The one exception is TCP to
+  `127.0.0.1` on a port the segment exposes as a host service, which today is
+  only the lab's own `smbd` behind the gateway:445 redirect. The gateway's DNS
+  and DHCP never reach NAT. A `redirect {}` onto a host address is refused like
+  any other flow, and `up` warns about one.
 - **Port forwards** (§9.8, §18 `port {}`) bind `127.0.0.1` instead of `0.0.0.0`.
 - **Global segments** (§9.2): a worktree lab's `global = true` segment joins
-  `<segment>@<instance>` instead of `<segment>`. Two lab files of one worktree
+  `<segment>@<worktree>` instead of `<segment>`. Two lab files of one worktree
   still share it, but no worktree shares it with the main lab or with another
   worktree. A `connect {}` peer is refused in a worktree lab.
 

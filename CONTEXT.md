@@ -42,7 +42,7 @@ _Avoid_: forked lab, child lab
 **Worktree isolation**:
 The rules a freeze turns on for the main lab and every worktree lab built on
 it: NAT refuses host addresses, port forwards bind loopback, and a worktree
-lab's global segments are renamed `<segment>@<instance>` (§21.4).
+lab's global segments are renamed `<segment>@<worktree>` (§21.4).
 
 **Machine**:
 Anything a lab boots, attaches to a segment, and drives through the agent — a

@@ -92,7 +92,7 @@ main checkout. `vmlab worktree thaw` undoes it.
 - **A freeze turns on worktree isolation** for the main lab and every worktree
   lab built on it. NAT refuses connections to the host's own addresses. Port
   forwards bind `127.0.0.1`, not `0.0.0.0`. A worktree lab's global segments
-  join `<segment>@<instance>` rather than `<segment>`, and `connect {}` is
+  join `<segment>@<worktree>` rather than `<segment>`, and `connect {}` is
   refused. That last rule amends ADR-0011, which says both instances join the
   same global segment.
 
