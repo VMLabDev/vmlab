@@ -95,7 +95,18 @@ carried on the agent channel. **USB passthrough is built** (§5.2.1):
 list/attach/detach` (wscript surface 3) hand it host USB devices at runtime —
 runtime-only attachments in the lab daemon, holders gathered by the
 supervisor's `usb.list` from every lab, unplugs swept from sysfs, online
-snapshots refused while any are attached.
+snapshots refused while any are attached. **Worktree labs are built** (§21,
+ADR-0019, #174–#178): `vmlab worktree freeze <snapshot>` in the main checkout
+makes each disk read-only at an offline snapshot under `.vmlab/freeze/<n>/`
+and puts the main lab back on its current state as an overlay written by copy
+plus safe `qemu-img rebase` (only the post-snapshot delta); `.vmlab/worktree.json`
+names the newest generation. A linked worktree's `up` clones each matching
+machine from it, carrying MACs, firmware variables, TPM state, volumes and the
+freeze-point record, and owing an `@dev` re-seed. Snapshots taken before the
+freeze are **locked** until `thaw`; restoring the freeze point resets a lab
+and keeps later offline snapshots. A frozen family runs under **worktree
+isolation**: NAT refuses host addresses, forwards bind loopback, and a
+worktree's global segments join `<segment>@<worktree>`.
 
 Module map under `src/`:
 
@@ -106,6 +117,12 @@ Module map under `src/`:
   `--instance`, `VMLAB_INSTANCE` or the linked git worktree, slugged to a DNS
   label; the CLI applies it on load, and the lab daemon `adopt`s the name it
   is started with.
+- `freeze/` — worktree labs (§21, ADR-0019): the freeze layout, the
+  `worktree.json` record and how a lab root finds its main checkout or its
+  linked worktrees without the git binary (`mod.rs`); freeze, thaw and
+  freeze-point restore planned as step lists with undos (`plan.rs`) run by one
+  rolling-back executor (`steps.rs`); the facts and dependants they need, and
+  `worktree status` (`inspect.rs`).
 - `dev/` — dev machines (§19.1): who carries `@dev`, which one is the lab's
   default, and the `@dev` > profile > floor resolution of its arguments —
   deliberately separate from the hardware resolver ADR-0008 owns. `select.rs`
@@ -191,7 +208,8 @@ Module map under `src/`:
   scan (root injectable), selectors and their resolution, and `plan_attach`,
   every attach refusal plus the `device_add` arguments as a value (ADR-0003).
 - `net/` — userspace fabric: frame codecs, L2 switch, DHCP, DNS, gateway,
-  NAT engine, L3 rules.
+  NAT engine, L3 rules; `nat/guard.rs` is worktree isolation's host-address
+  filter (§21.4).
 - `proto/` — JSON-lines daemon wire protocol (client + server). `vocab.rs`
   holds the typed request vocabulary every surface constructs through
   (ADR-0007) and `error.rs` the error codes replies carry; `report.rs`
@@ -200,9 +218,15 @@ Module map under `src/`:
   `templates.rs` runs lab-scoped builds/pushes as background operations
   (`vmlab template build` rides it) and `store.rs`
   the store- and registry-scoped operations behind every `vmlab template` verb
-  (ADR-0010).
+  (ADR-0010); `backing.rs` walks every lab disk's whole backing chain, frozen
+  generations and unregistered worktrees included, for the store's in-use
+  check (§21.5).
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
+  `worktree.rs` runs freeze, thaw and freeze-point restore under the state
+  lock (§21.1, §21.3), `freeze_clone.rs` plans and makes a worktree machine's
+  clone from the freeze (§21.2), and `isolation.rs` decides worktree isolation
+  once at daemon start (§21.4);
   `container.rs`/`container_ctl.rs` run OCI containers as micro-VMs (§18);
   `app_share.rs` is `machine.app_open` (§20.3), the broker that opens a
   shared app's agent session and hands the CLI its control and connection
@@ -249,7 +273,9 @@ Module map under `src/`:
   `sync` verbs a halt is resolved through (§19.6), which live here because
   ADR-0013 leaves no guest→host control path to offer them from. `usb.rs` is
   `vmlab usb` (§5.2.1): `list` from the supervisor (or sysfs alone when none
-  runs), `attach`/`detach` to the VM's lab daemon.
+  runs), `attach`/`detach` to the VM's lab daemon. `worktree.rs` is `vmlab
+  worktree freeze/thaw/status` (§21); `status` reads files only and needs no
+  daemon.
 
 The user manual is a wdoc book at `docs/manual/` (`just manual-build`,
 `just manual-serve`; audited with `/technical-book audit`, whose surface
