@@ -134,8 +134,9 @@ page guide_networking {
     which the gateway's port-445 redirect uses for
     [shared folders](guide_shares). The gateway's own DNS and DHCP never
     pass through NAT and keep working, and so does the internet. A
-    `redirect {}` onto a host address is refused like any other flow; the
-    lab daemon logs a warning at start for one onto `127.x` or `0.0.0.0`.
+    `redirect {}` onto a host address is refused like any other flow. For
+    one onto `127.x` or `0.0.0.0`, `vmlab up` prints a warning and the lab
+    daemon logs it at start.
   DOC
 
   h2 "Port forwards"

@@ -201,7 +201,8 @@ async fn refuse_frozen(source: &Path, source_data: &Path) -> Result<()> {
     let deps = crate::freeze::inspect::dependants(source).await;
     let why = if deps.is_empty() {
         format!(
-            "{} is frozen, and its own disks name the frozen files under it by absolute path              — `vmlab worktree thaw` there first",
+            "{} is frozen, and its own disks name the frozen files under it by absolute \
+             path — `vmlab worktree thaw` there first",
             source.display()
         )
     } else {
