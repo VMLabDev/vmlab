@@ -1,0 +1,23 @@
+// Worktree labs (§21.2): one VM and one idle container with a named volume.
+// The scenario commits this lab to a scratch git repository, provisions it in
+// the main checkout, freezes it, and brings it up again in a linked worktree.
+import <vmlab.wcl>
+
+lab "e2e-worktree" {
+  segment "lan" { subnet = "10.87.0.0/24" }
+
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    nic { segment = "lan" }
+  }
+
+  container "c01" {
+    image   = "alpine:3.22"
+    profile = "container"
+    mode    = :idle
+    nic { segment = "lan" }
+    volume { name = "e2e-wt-data" target = "/data" }
+  }
+}
