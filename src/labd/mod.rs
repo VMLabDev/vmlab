@@ -36,6 +36,7 @@ pub mod usb;
 pub mod vm;
 pub mod vm_agent;
 pub mod workspace;
+pub mod worktree;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1162,6 +1163,10 @@ impl Handler<LabRequest> for LabdHandler {
                 Ok(json!(true))
             }
             LabRequest::SnapshotList { machine } => Ok(lab.snapshots(&machine).await?),
+            LabRequest::WorktreeFreeze { snapshot } => Ok(lab.worktree_freeze(&snapshot).await?),
+            LabRequest::WorktreeThaw {
+                drop_online_snapshots,
+            } => Ok(lab.worktree_thaw(drop_online_snapshots).await?),
 
             // The three `dev sync` verbs that need the daemon (§19.6).
             // `status` is not among them: a syncer's report is part of the

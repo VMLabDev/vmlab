@@ -64,6 +64,7 @@ pub fn cmd_lab_move(name: &str, from: Option<PathBuf>) -> Result<()> {
                 source_data.display()
             );
         }
+        refuse_frozen(&source, &source_data).await?;
         // Read before anything changes, so a target holding machines of its
         // own refuses with the source still registered and untouched.
         let held = machine_data(&target_data)?;
@@ -187,6 +188,26 @@ pub fn cmd_lab_move(name: &str, from: Option<PathBuf>) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// A frozen lab does not move (§21.5): worktree overlays name its frozen
+/// files by absolute path, and so do its own overlays, so moving the working
+/// data breaks every disk of the family. With worktrees depending, they are
+/// named; with none, a thaw first is all it takes.
+async fn refuse_frozen(source: &Path, source_data: &Path) -> Result<()> {
+    if !crate::freeze::freeze_root(source_data).exists() {
+        return Ok(());
+    }
+    let deps = crate::freeze::inspect::dependants(source).await;
+    let why = if deps.is_empty() {
+        format!(
+            "{} is frozen, and its own disks name the frozen files under it by absolute path              — `vmlab worktree thaw` there first",
+            source.display()
+        )
+    } else {
+        crate::freeze::inspect::dependants_refusal("cannot move the main checkout's lab", &deps)
+    };
+    Err(CommandError::conflict(why).into())
 }
 
 /// The lab file under the name this directory runs it as (crate::instance).
@@ -509,6 +530,18 @@ lab "moving" {
 
     /// Two checkouts of one lab file differ only in their roots, which is
     /// not a difference worth a warning.
+    /// §21.5: a frozen lab stays where its overlays say it is; one never
+    /// frozen moves.
+    #[tokio::test]
+    async fn a_frozen_lab_refuses_to_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join(".vmlab");
+        refuse_frozen(tmp.path(), &data).await.unwrap();
+        std::fs::create_dir_all(crate::freeze::generation_dir(&data, 1)).unwrap();
+        let why = format!("{:#}", refuse_frozen(tmp.path(), &data).await.unwrap_err());
+        assert!(why.contains("worktree thaw"), "{why}");
+    }
+
     #[test]
     fn the_same_lab_file_in_two_roots_does_not_differ() {
         let a = lab_at(Path::new("/a"), LAB);

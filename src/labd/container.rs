@@ -1218,6 +1218,10 @@ impl super::machine::Machine for ContainerInstance {
         &self.dirs.run
     }
 
+    fn disk_paths(&self) -> Vec<PathBuf> {
+        vec![self.dirs.scratch_disk()]
+    }
+
     /// A micro-VM needs the host-arch emulator; `qemu-img` creates its
     /// scratch overlay.
     fn required_binaries(&self) -> Vec<String> {
