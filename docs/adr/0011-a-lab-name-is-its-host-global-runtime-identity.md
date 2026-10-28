@@ -1,6 +1,6 @@
 # ADR-0011: A lab name is its host-global runtime identity
 
-- **Status**: Accepted, amended 2026-10-25
+- **Status**: Accepted, amended 2026-10-25 and 2026-10-28
 - **Date**: 2026-08-04
 - **Related**: [ADR-0003](0003-decisions-are-values-computed-before-execution.md),
   [ADR-0007](0007-the-wire-protocol-carries-a-typed-vocabulary.md)
@@ -80,3 +80,12 @@ between two instances of one lab file, because they are written in the file:
 Global segments (`global = true`) are shared by design, and both instances
 join the same one. Lab-local segment subnets do not collide, because each
 lab's network runs in its own userspace process.
+
+## Amendment (2026-10-28): worktree labs built on a freeze
+
+[ADR-0019](0019-a-worktree-lab-is-a-linked-clone-of-a-frozen-main-lab.md)
+changes the global-segment rule for one case. When a lab instance is built on
+a freeze of the main lab, its global segments join `<segment>@<instance>`
+instead of `<segment>`, so it never shares a wire with the main lab or with
+another worktree. Its `connect {}` peers are refused. Every other instance
+keeps the rule above.

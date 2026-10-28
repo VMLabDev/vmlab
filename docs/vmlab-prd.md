@@ -99,14 +99,14 @@ All control sockets are unix domain sockets under `$XDG_RUNTIME_DIR/vmlab/`: `vm
 
 The instance is slugged: lowercased, every run of characters outside `[a-z0-9]` one `-`, leading and trailing `-` trimmed; one with no letter or digit is an error. A result over 63 characters cuts the slug and appends 6 hex characters of its hash (`<declared>-<cut>-<hash6>`); a declared name that leaves no room is an error. `vmlab validate` validates the declared name, then applies the instance, and reports the effective name. The lab daemon is started with the effective name and accepts only the declared name or `<declared>-<something>`. The conflict rule of §3 applies to the effective name unchanged: two roots resolving to one name conflict.
 
-An instance renames the lab, not its file: a fixed `host_port` (§9.8, §18) — an omitted one is picked free per instance, so two instances of one file declare their forwards without one — an explicit `nic { mac }` on a global segment, GPU `passthrough` and template builds declared in the lab file still collide between two instances of one file. Global segments are shared by design; lab-local segments, subnets included, do not collide.
+An instance renames the lab, not its file: a fixed `host_port` (§9.8, §18) — an omitted one is picked free per instance, so two instances of one file declare their forwards without one — an explicit `nic { mac }` on a global segment, GPU `passthrough` and template builds declared in the lab file still collide between two instances of one file. Global segments are shared by design, except for a worktree lab built on a freeze (§21.4); lab-local segments, subnets included, do not collide.
 
 ## 4. File and directory layout
 
 | Path | Contents |
 |---|---|
 | `<repo>/vmlab.wcl` | The lab definition. Located by walking up from cwd, like git. |
-| `<repo>/.vmlab/` | Lab-local working data: linked-clone qcow2s, snapshot data, built floppy/ISO images, screenshots, downloaded artefacts cache. Safe to delete when the lab is down. Should be gitignored. |
+| `<repo>/.vmlab/` | Lab-local working data: linked-clone qcow2s, snapshot data, built floppy/ISO images, screenshots, downloaded artefacts cache, and in a main checkout any freeze (`freeze/`, `worktree.json`, §21). Safe to delete when the lab is down, unless a worktree lab backs onto its freeze. Should be gitignored. |
 | `~/.local/share/vmlab/templates/<arch>/<name>/<version>/` | Template store: sealed qcow2 + `template.wcl` metadata. |
 | `~/.local/state/vmlab/` | Daemon state, per-lab and per-VM logs (JSON lines), event history. |
 | `$XDG_RUNTIME_DIR/vmlab/` | `vmlabd.sock` (supervisor) and `labs/<lab>/` directories holding each lab daemon's control socket and per-VM QMP/agent/NIC/VNC sockets. |
@@ -859,6 +859,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 | `vmlab validate` | Full §5.1 validation, no side effects; reports the effective lab name (§3.2) |
 | `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2); `start` and `restart` take `--record vm=path` (§11.1) |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |
+| `vmlab worktree freeze <snapshot> / thaw / status` | Freeze the main checkout's lab at an offline snapshot so worktree labs clone from it, undo that, or list generations and the worktrees using them (§21) |
 | `vmlab console <vm>` | Attach viewer |
 | `vmlab record start / stop / status` | Record a VM's console to MP4 or WebM, owned by the lab daemon; pointer and click ripples drawn, idle compression and a timeline opt-in (§11.1) |
 | `vmlab usb list / attach / detach` | Host USB devices and who holds each; hot-plug one into a running VM with `usb = true` and back (§5.2.1) |
@@ -2281,3 +2282,142 @@ Sharing an app is a CLI act on a running machine, not a declaration.
   of these, and vmlab does not turn them on.
 - **Host launcher entries** (`.desktop` files) for guest apps.
 - **macOS guests and hosts.**
+
+## 21. Worktree labs
+
+A **worktree lab** is a lab instance (§3.2) in a linked git worktree whose
+machines start from a **freeze** of the main checkout's lab, not from their
+templates. Provisioning a lab can take hours. A worktree lab skips it: each
+machine is a linked clone of the main lab's disk at a named snapshot, and it
+carries on as if it had just been restored from that snapshot. The main lab
+keeps running while worktree labs come and go, and no lab in the family can
+reach another (§21.4). ADR-0019 records the decision.
+
+Nothing in `vmlab.wcl` declares a freeze. It is working data, kept in the main
+checkout's `.vmlab/`, so a branch can never commit or carry one.
+
+### 21.1 Freezing the main lab
+
+`vmlab worktree freeze <snapshot>` runs in the main checkout. It needs the lab
+stopped and an **offline** snapshot named `<snapshot>` on every machine. An
+online snapshot's memory holds the main lab's leases and agent sessions, and a
+cold boot from its disk alone is a power cut, so freeze refuses one. For each
+disk of each machine (a VM's `disk0.qcow2` and `disk-<name>.qcow2`, a
+container's `scratch.qcow2`), the freeze:
+
+1. takes a temporary internal snapshot of the disk's current state;
+2. applies `<snapshot>` (`qemu-img snapshot -a`);
+3. moves the file to `.vmlab/freeze/<n>/<machine>/` and makes it read-only;
+4. writes the main lab's new disk as an overlay holding the current state:
+   `qemu-img convert -l snapshot.name=<temporary> -B <frozen file> -F qcow2`;
+5. deletes the temporary snapshot.
+
+The main lab therefore keeps the exact state it had, and the frozen file's
+current state is `<snapshot>`. The freeze also copies each machine's
+`OVMF_VARS.fd` and `tpm-state`, the lab's named volumes, and each machine's
+record from `.vmlab/state.json` into `.vmlab/freeze/<n>/`. It then writes
+`.vmlab/worktree.json`, naming generation `<n>` and `<snapshot>`. A freeze is
+all or nothing: a failure on any disk leaves every machine as it was.
+
+**Freezing again** freezes the main lab's current overlays the same way, as
+generation `n+1` backed by generation `n`, and points `worktree.json` at it.
+Worktree labs already built keep the generation they were cloned from. A
+generation stays on disk while any disk backs onto it.
+
+`vmlab worktree status`, in the main checkout or a worktree, lists each
+generation, its snapshot, and the worktrees whose disks back onto it.
+
+### 21.2 Worktree labs
+
+In a linked worktree, `up` reads the main checkout's `.vmlab/worktree.json`.
+The main checkout is found through the worktree's `.git` file and the common
+git directory, without the git binary, and its `.vmlab/` through the same rule
+as any lab's working data (§4). With no `worktree.json` the worktree lab
+behaves exactly as without this section. With one, `up` builds each machine
+that has no disk yet from the newest generation when the machine is in the
+freeze and its template or image reference matches the one it was frozen
+under. Every other machine (new in this branch, or with a changed reference) is
+built from its template as usual. A machine already built, before or after the
+freeze, keeps its disk until `vmlab destroy` or `vmlab vm destroy`.
+
+Building a machine from the freeze:
+
+- creates an overlay in the worktree's own `.vmlab/vms/<machine>/` for each
+  frozen disk, backed by the frozen file by absolute path;
+- copies the machine's `OVMF_VARS.fd`, `tpm-state`, and state record: its
+  **MACs** unchanged, its first-boot marker, a container's image pin, and the
+  record of `<snapshot>`;
+- copies the lab's named volumes on first build, with `cp --reflink=auto`;
+- records the generation beside the template reference in `clone-source`;
+- writes an `@dev` machine's workspace ledger with `reseed_owed = true`, so the
+  §19.6 re-seed carries the worktree's own tree into the guest before its watch
+  opens.
+
+`up` then treats the machine exactly as the main lab's `up` would treat it right
+after restoring `<snapshot>`. When `worktree.json` names a generation whose
+files are missing, `up` refuses, naming the main checkout, the generation, and
+`vmlab worktree freeze` as the fix. It never falls back to the template.
+
+### 21.3 Snapshots and thaw
+
+A freeze turns `<snapshot>` into a **freeze point** in every lab of the family.
+`vmlab snapshot restore <snapshot>` in the main lab or a worktree lab replaces
+that lab's overlays with empty ones, which is instant and touches no frozen file.
+Snapshots taken after the freeze are stored in each lab's overlays and work as
+§7.3 says.
+
+The main lab's snapshots taken **before** the freeze are stored in the frozen
+files. Restoring or deleting one would write to a file every worktree reads, so
+`snapshot list` shows them as locked, and restore and delete refuse, naming
+`vmlab worktree thaw`.
+
+`vmlab worktree thaw` runs in the main checkout with the lab stopped. It refuses
+while any worktree disk backs onto any generation, naming each worktree and
+`vmlab destroy` as the way to release one. Otherwise it commits the main lab's
+overlays down the chain (`qemu-img commit`), moves the files back, deletes
+`.vmlab/freeze/` and `worktree.json`, and unlocks the earlier snapshots. The main
+lab keeps its current state.
+
+### 21.4 Worktree isolation
+
+When `worktree.json` exists, the main lab and every worktree lab built on it run
+with **worktree isolation**. Cloned guests share hostnames, MACs, machine-ids
+and Windows SIDs, so labs in the family must never share a wire or a route:
+
+- **NAT** (§9.7) refuses every connection to a host address: loopback and every
+  address on a host interface. The lab's own gateway services (DNS, the
+  gateway:445 redirect to its `smbd`) answer on the segment and are not NAT
+  connections, so they keep working.
+- **Port forwards** (§9.8, §18 `port {}`) bind `127.0.0.1` instead of `0.0.0.0`.
+- **Global segments** (§9.2): a worktree lab's `global = true` segment joins
+  `<segment>@<instance>` instead of `<segment>`. Two lab files of one worktree
+  still share it, but no worktree shares it with the main lab or with another
+  worktree. A `connect {}` peer is refused in a worktree lab.
+
+A guest in a worktree lab can still reach the internet, and two labs could meet
+through an outside service both use. vmlab does not police that.
+
+### 21.5 Guards
+
+While any worktree disk backs onto a generation:
+
+- `vmlab destroy` in the main checkout refuses, naming the worktrees;
+- `vmlab lab move` of the main checkout's lab refuses, because worktree overlays
+  name the frozen files by absolute path;
+- the template store's in-use check (§7.1, ADR-0010) walks every disk's whole
+  backing chain, frozen files included, so a template under a freeze cannot be
+  removed without `--force`;
+- nothing in vmlab writes a frozen file: no snapshot operation, repair or
+  `qemu-img amend` opens one read-write.
+
+With no worktree using it, `vmlab destroy` in the main checkout deletes the
+freeze and `worktree.json` along with the rest of `.vmlab/`.
+
+### 21.6 Non-goals
+
+- **Live freezing.** The main lab is stopped for the length of a freeze. Every
+  later step runs with it up.
+- **Clones outside git worktrees.** A lab instance named by `--instance` or
+  `VMLAB_INSTANCE` in an ordinary directory is not a worktree lab.
+- **Isolation without a freeze.** Instances that are not worktree labs keep
+  §3.2's rules, shared global segments included.

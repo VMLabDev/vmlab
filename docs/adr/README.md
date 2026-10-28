@@ -18,7 +18,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0008](0008-hardware-resolution-happens-once.md) | Hardware resolution happens once, for both machine kinds | Accepted |
 | [0009](0009-build-hardware-resolves-block-over-source-template.md) | Build hardware resolves block over source template, and the profile stays live | Accepted |
 | [0010](0010-the-supervisor-owns-the-template-store.md) | The supervisor owns the template store, and every surface asks it | Accepted |
-| [0011](0011-a-lab-name-is-its-host-global-runtime-identity.md) | A lab name is its host-global runtime identity | Accepted, amended 2026-10-25 |
+| [0011](0011-a-lab-name-is-its-host-global-runtime-identity.md) | A lab name is its host-global runtime identity | Accepted, amended 2026-10-25 and 2026-10-28 |
 | [0012](0012-vmlab-terminates-ssh-on-the-host.md) | vmlab terminates SSH on the host | Superseded |
 | [0013](0013-the-host-opens-channels-the-guest-answers.md) | The host opens channels, the guest answers | Accepted |
 | [0014](0014-the-workspace-is-a-guest-local-copy-of-a-canonical-host-tree.md) | The workspace is a guest-local copy of a canonical host tree | Accepted |
@@ -26,6 +26,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0016](0016-a-shared-app-rides-the-guest-familys-own-window-protocol.md) | A shared app rides the guest family's own window protocol | Accepted |
 | [0017](0017-a-template-version-is-a-base-plus-sealed-variants.md) | A template version is a base plus sealed variants, stored as overlays | Accepted |
 | [0018](0018-the-supervisor-holds-a-host-gpu-awake.md) | The supervisor holds a host GPU awake between labs | Accepted |
+| [0019](0019-a-worktree-lab-is-a-linked-clone-of-a-frozen-main-lab.md) | A worktree lab is a linked clone of a frozen main lab | Proposed |
 
 ## Format
 

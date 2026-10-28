@@ -26,6 +26,24 @@ instance comes from `--instance`, `VMLAB_INSTANCE` or the linked git worktree
 the lab is in (ADR-0011's amendment).
 _Avoid_: copy, clone (a clone is a VM's disk)
 
+**Freeze**:
+The main checkout's lab disks made read-only at a named offline snapshot, so
+worktree labs can clone from them, plus the firmware variables, TPM state,
+volumes and state records copied beside them. Kept as numbered generations
+under `.vmlab/freeze/<n>/`. `vmlab worktree thaw` undoes it (§21, ADR-0019).
+_Avoid_: seed (that is the workspace syncer's), base (a template's unsealed disk)
+
+**Worktree lab**:
+A lab instance in a linked git worktree whose machines are linked clones of the
+main checkout's freeze rather than of their templates. It starts as if restored
+from the freeze snapshot, under worktree isolation.
+_Avoid_: forked lab, child lab
+
+**Worktree isolation**:
+The rules a freeze turns on for the main lab and every worktree lab built on
+it: NAT refuses host addresses, port forwards bind loopback, and a worktree
+lab's global segments are renamed `<segment>@<instance>` (§21.4).
+
 **Machine**:
 Anything a lab boots, attaches to a segment, and drives through the agent — a
 VM or a container. The unit that `depends_on`, `up` waves and `machine.*`
