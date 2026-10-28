@@ -194,7 +194,8 @@ pub fn main_lab_root(root: &Path) -> Option<PathBuf> {
     }
     let main_top = common_dir.parent()?;
     let rel = root.strip_prefix(&top).ok()?;
-    Some(main_top.join(rel))
+    // Collected, so a lab at the top of the checkout has no trailing `/`.
+    Some(main_top.join(rel).components().collect())
 }
 
 /// The lab roots in every linked worktree of the repository whose main
@@ -215,7 +216,9 @@ pub fn worktree_lab_roots(main_root: &Path) -> Vec<PathBuf> {
             // `<common>/worktrees/<name>/gitdir` names `<worktree>/.git`.
             let text = std::fs::read_to_string(e.path().join("gitdir")).ok()?;
             let wt_top = PathBuf::from(text.trim()).parent()?.to_path_buf();
-            wt_top.is_dir().then(|| wt_top.join(rel))
+            wt_top
+                .is_dir()
+                .then(|| wt_top.join(rel).components().collect())
         })
         .collect();
     out.sort();
