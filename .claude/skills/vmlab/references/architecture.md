@@ -118,7 +118,9 @@ demo-feat-x  running    /home/wil/src/feat-x
 ```
 
 Each worktree's `.vmlab/` holds its own clones, so the second `up` builds its
-machines from the templates. From `feat-x`, `status`, `exec box` and `down` act
+machines from the templates. When the main checkout's lab is frozen, the
+worktree's machines are linked clones of its provisioned disks instead, and the two
+labs run isolated from each other (worktrees.md). From `feat-x`, `status`, `exec box` and `down` act
 on `demo-feat-x`; `vmlab exec demo/box` and `vmlab exec demo-feat-x/box` pick
 one from anywhere. A clone outside git needs an instance named by hand, such as
 `export VMLAB_INSTANCE=second`.
@@ -177,7 +179,8 @@ and reports the lab up once every step has finished. Provision output streams
 live to the terminal, prefixed with the machine's name, and into the lab log.
 
 `down` walks the stop ladder on every machine — agent shutdown, then ACPI, then
-a kill after a timeout — and asks the supervisor to release the daemon.
+an emulator quit that flushes the disks, then a kill after a timeout — and asks
+the supervisor to release the daemon.
 `destroy` does the same and then removes everything in `.vmlab/`.
 
 ## Where things live
@@ -230,7 +233,7 @@ deployments.
 | `templates/.lock` | The advisory lock every store mutation holds. |
 | `templates/.oci-pull/` | Staging for a registry pull in progress. |
 | `oci/` | The digest-addressed container-image cache: `blobs/sha256/`, `images/sha256/<manifest>/` with `manifest.json`, `config.json` and `rootfs.sqfs`, and `refs/<host>/<repo>/<tag>` recording the last digest a tag resolved to. See containers.md. |
-| `guest/<arch>/` | The container micro-VM kernel and initramfs, and `guest/agent/<os>-<arch>/` the guest agent binaries, when installed here rather than under `/usr/share/vmlab/guest`. |
+| `guest/<arch>/` | The container micro-VM kernel and initramfs, `guest/agent/<os>-<arch>/` the guest agent binaries, and `guest/firmware/<arch>/` the UEFI firmware vmlab boots its VMs with, when installed here rather than under `/usr/share/vmlab/guest`. |
 | `cache/artefacts/` | Content-addressed downloads a template build's `source {}` fetched. |
 | `cache/builds/` | Working directories of template builds. |
 | `cache/oci-push/` | Working directory of a registry push. |
@@ -269,6 +272,7 @@ daemon call for logs.
 | `labs/<lab>/control.sock` | One lab daemon's control socket. |
 | `labs/<lab>/vms/<vm>/` | `qmp.sock`, `agent.sock`, `vnc.sock`, `tpm.sock`, one `nic<i>.sock` per NIC, one `vfs<i>.sock` per virtiofs share, and a `term-<id>.sock` per open terminal. |
 | `labs/<lab>/containers/<name>/` | `qmp.sock`, `ctl.sock`, `agent.sock`, `nic<i>.sock`, `vfs<i>.sock` and `term-<id>.sock`. |
+| `smb/<hash>/` | One lab's bundled smbd: its private, lock and pid directories, where it binds `msg.sock/<pid>` and `ncalrpc/`. Named by a hash of the lab's path so a socket path stays short however deep the lab sits, and removed when the smbd stops. |
 | `global/<segment>.sock` | The trunk socket a lab daemon bridges to for a global segment. See networking.md. |
 
 `<lab>` here and in the state paths is the name the lab runs under,
@@ -289,8 +293,12 @@ should be in the lab's `.gitignore`.
 | `containers/<name>/` | `scratch.qcow2`, the writable overlay, and `container.json`. |
 | `media/` | ISO and floppy images built from `media {}` folders, content-addressed. See vm.md. |
 | `volumes/` | Named container volumes. |
-| `smb/` | The bundled smbd's configuration and state. See shares-media.md. |
+| `smb/` | The bundled smbd's configuration, passdb, log and persistent state; its sockets live under the runtime root's `smb/<hash>/`. See shares-media.md. |
 | `workspace/<machine>.json` | The workspace syncer's ledger for one dev machine. See dev-machines.md. |
+| `worktree.json` | In a main checkout frozen for worktree labs: the newest generation and the snapshot it was frozen at. Its presence turns on worktree isolation for the family. See worktrees.md. |
+| `worktree-ports.json` | In a frozen main checkout: each worktree lab's port slot, keyed by the git worktree's name, and every fixed port each lab of the family has bound, the main lab's declared ones included. Locked exclusively for every change, released per worktree by `vmlab destroy` there, deleted by a thaw. |
+| `freeze/<n>/<machine>/` | Generation `n` of the freeze: the machine's frozen disks, read-only, with copies of its `OVMF_VARS.fd`, `tpm-state/`, `firstboot.done`, `clone-source` and `state.json` record. `freeze/<n>/volumes/` holds the named volumes. |
+| `vms/<vm>/freeze-generation` | In a worktree lab: the generation the machine was cloned from. Beside a container's disk too. |
 | `screenshots/` | Where `Machine.screenshot` writes when given no path. |
 | `recordings/` | Where a console recording lands when given no path, as `<vm>-<UTC timestamp>.mp4`. See cli-machine.md (`vmlab record`). |
 
@@ -307,7 +315,7 @@ keeps disk clones off a slow filesystem such as a bind mount.
 | `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Move the four roots above. |
 | `HOME` | The base of every default root. |
 | `VMLAB_WORK_DIR` | Relocates every lab's `.vmlab/` under one base, as described above. |
-| `VMLAB_GUEST_ASSET_DIR` | Searched first for the micro-VM kernel and initramfs (`<arch>/`) and the agent binaries (`agent/<os>-<arch>/`), before `/usr/share/vmlab/guest` and the data root's `guest/`. |
+| `VMLAB_GUEST_ASSET_DIR` | Searched first for the micro-VM kernel and initramfs (`<arch>/`), the agent binaries (`agent/<os>-<arch>/`) and the bundled UEFI firmware (`firmware/<arch>/`), before `/usr/share/vmlab/guest` and the data root's `guest/`. |
 | `VMLAB_CONFIG_WEAVE_DIR` | Where the playbook engine's guest binaries are, instead of `~/.local/share/config-weave/bin`. |
 | `VMLAB_VIRTIOFSD` | The `virtiofsd` binary to use, before searching `PATH` and the distribution helper directories (`/usr/lib`, `/usr/libexec`, `/usr/lib/qemu`). |
 | `VMLAB_FASTPATH` | Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See host-profiles.md. |
@@ -378,6 +386,7 @@ catalogue and global segments.
 | Liveness | `ping`, `version`, `fastpath`, `status`, `shutdown` | CLI, and daemons for `ping` and `shutdown` |
 | Lab daemons | `lab.ensure`, `lab.release`, `lab.restart` | CLI |
 | Global segments | `global.attach`, `global.detach`, `global.list` | Lab daemons only |
+| Host USB | `usb.list` | CLI, and lab daemons for a script's `lab.usb_devices()` |
 | Template builds | `template.list`, `template.build`, `template.stop_build` | CLI |
 | The store | `store.list`, `store.remove`, `store.prune`, `store.export`, `store.import`, `store.pull`, `store.push`, `store.stop_push` | CLI |
 | Registries | `registry.search`, `registry.login`, `registry.namespaces`, `registry.namespace_add`, `registry.namespace_remove` | CLI |
@@ -385,7 +394,9 @@ catalogue and global segments.
 ### A lab daemon's socket
 
 A lab daemon owns one lab: its machines, network, snapshots, playbooks and
-workspaces. Every lab-daemon command is called by the CLI.
+workspaces. Every lab-daemon command is called by the CLI except
+`machine.usb_attached`, which the supervisor calls on every running lab to build
+`usb.list`.
 
 | Group | Commands |
 | --- | --- |
@@ -394,12 +405,14 @@ workspaces. Every lab-daemon command is called by the CLI.
 | Display and input | `machine.screenshot`, `machine.sendkeys`, `machine.mouse_move`, `machine.mouse_click`, `machine.mouse_drag`, `machine.ocr`, `machine.find_image` |
 | Guest agent | `machine.exec`, `machine.tty_open`, `machine.tty_resize`, `machine.push_file`, `machine.pull_file`, `machine.tail`, `machine.eventlog`, `machine.clipboard_get`, `machine.clipboard_set` |
 | Playbooks | `playbook.list`, `playbook.check`, `playbook.apply` |
+| Host USB | `machine.usb_attach`, `machine.usb_detach`, `machine.usb_attached` |
 | Console recording | `machine.record_start`, `machine.record_stop`, `machine.record_status` |
 | Snapshots | `snapshot.take`, `snapshot.restore`, `snapshot.delete`, `snapshot.list` |
 | Workspace | `workspace.flush`, `workspace.resolve`, `workspace.diff` |
 
 `machine.tty_open` answers with the path of a second unix socket the caller
-connects to and pipes a raw terminal over. `machine.record_start` takes
+connects to and pipes a raw terminal over, which is what `vmlab shell` does.
+`machine.record_start` takes
 `machine`, an optional absolute `path` and an `options` object (`fps`, `size`,
 `compress_idle`, `timeline`, `max_duration`, each optional) and answers with the
 live recording's status; `machine.record_stop` answers with the path and the

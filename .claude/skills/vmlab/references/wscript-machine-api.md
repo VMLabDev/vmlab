@@ -82,7 +82,9 @@ Start the machine if it is stopped.
 fn start(self) -> Result[unit, string]
 ```
 
-A machine that is not stopped returns `Ok` without doing anything. A pending
+A `suspended` VM, one whose guest put itself to sleep, is woken with QMP
+`system_wakeup` instead of started again. Any other machine that is not stopped
+returns `Ok` without doing anything. A pending
 template or image download is completed first. The call returns once the
 emulator is running; it does not wait for readiness, so follow it with
 `Machine.wait_ready`. The error carries the reason the download or the boot
@@ -219,8 +221,9 @@ The machine's power state.
 fn state(self) -> string
 ```
 
-Returns `stopped`, `starting`, `running` or `stopping`. It never fails. Running
-says nothing about readiness; see `Machine.is_ready`.
+Returns `stopped`, `starting`, `running`, `stopping` or `suspended` (a VM whose
+guest went to sleep; `start()` wakes it). It never fails. Running says nothing
+about readiness; see `Machine.is_ready`.
 
 ```wscript
 fn main(lab: Lab) {
@@ -1269,7 +1272,8 @@ fn usb_detach(self, selector: string) -> Result[unit, string]
 
 The selector is matched against the VM's attachments, not the host, so a
 device already unplugged can still be named. Returns once QEMU reports the
-device deleted. Emits `usb.detached`.
+device deleted. The error names a selector matching none of the VM's
+attachments, or several. Emits `usb.detached`.
 
 ## Machine.usb_detach_all
 

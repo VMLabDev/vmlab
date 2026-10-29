@@ -111,6 +111,7 @@ rejects an `on {}` that names anything else:
 | Event | When |
 | --- | --- |
 | `vm.starting`, `vm.ready`, `vm.stopped`, `vm.crashed` | A VM's lifecycle. `vm.stopped` follows every exit; `vm.crashed` precedes it when QEMU died rather than being asked to stop. |
+| `vm.suspended`, `vm.woken` | A VM's guest put itself to sleep (ACPI S3), or runs again. |
 | `container.starting`, `container.ready`, `container.stopped`, `container.crashed`, `container.unhealthy` | A container's lifecycle, plus its healthcheck turning unhealthy. See containers.md. |
 | `lab.up`, `lab.down` | The end of an `up` and of a `down`, with the machines involved. |
 | `lab.daemon_crashed` | Emitted by the supervisor when a lab daemon dies unexpectedly; the lab is marked failed and not restarted. |
@@ -257,6 +258,8 @@ status and `exit_code` the container's.
 | `vm.ready` | `vm` | The agent handshake completed, or an online snapshot finished loading, or the first-boot provision completed and was sealed. For a container in that last case the key is `container`. |
 | `vm.crashed` | `vm`, `reason`, `status` | The emulator exited without being asked. Always followed by `vm.stopped`. |
 | `vm.stopped` | `vm`, `reason`, `status` | The emulator exited for any reason. |
+| `vm.suspended` | `vm`, `prevent_sleep` | The guest suspended itself to RAM (ACPI S3); the VM now reports `suspended`. `prevent_sleep = true` means a wake is already on its way. |
+| `vm.woken` | `vm`, `cause`, `message` | A suspended guest runs again. `cause` is `prevent_sleep` (the daemon woke it the moment it slept), `start` (`vmlab vm start`), `stop` (a graceful stop woke it first), `restore` (an online snapshot restore), or `guest` (its own wake source, or a reset). |
 | `vm.destroyed` | `vm` | `vmlab vm destroy` removed the VM's clones, run directory and workspace ledger. |
 | `container.starting` | `container` | The container's start began, after the image pull. |
 | `container.ready` | `container` | The micro-VM reported ready; port forwards are installed next. |
@@ -273,9 +276,20 @@ status and `exit_code` the container's.
 | Event | Payload fields | When |
 | --- | --- | --- |
 | `snapshot.created` | `vm`, `name`, `online` | A snapshot was taken, of a VM or a container alike, after the workspace pre-flight flush. |
-| `snapshot.restored` | `vm`, `name`, `online` | A snapshot was restored, after the pin check and the syncer bracket. |
+| `snapshot.restored` | `vm`, `name`, `online`, `clock` | A snapshot was restored, after the pin check and the syncer bracket. `clock` is present for an online restore only: `set` (set to the host's time), `kept` (the machine's `clock` is `snapshot`), `fixed` (a fixed date-time) or `not_set` (it should have been set and could not; the reason is in the daemon log and the CLI warning). |
 
 Deleting a snapshot emits nothing.
+
+### Worktree labs
+
+See worktrees.md.
+
+| Event | Payload fields | When |
+| --- | --- | --- |
+| `worktree.frozen` | `generation`, `snapshot`, `machines` | `vmlab worktree freeze` froze the main lab's machines as that generation, at that snapshot. |
+| `worktree.thawed` | `dropped`: a list of `machine`, `name` | `vmlab worktree thaw` folded the freeze back into the main lab. `dropped` names each online snapshot `--drop-online-snapshots` gave up. |
+| `machine.cloned_from_freeze` | `machine`, `generation`, `snapshot`, `main` | A worktree lab built the machine as a clone of that generation of the main checkout `main`, before its first start. |
+| `lab.isolation` | `role`, `worktree`, `generation`, `snapshot`, `forward_bind`, `globals` | The lab daemon started under worktree isolation. `role` is `main` or `worktree`, `worktree` the linked worktree's name or null, `forward_bind` the address every forward binds, and `globals` each global segment with the name it `joined`. Emitted once per daemon start, before any machine starts. |
 
 ### Host USB devices
 
@@ -513,7 +527,8 @@ first; once the tree has drained the record clears and the run goes ahead.
 `vmlab playbook list` shows the record. In a container an orphan of an orphan
 goes to the container's init and is not counted, and on Windows work handed to
 the Windows Installer service is counted only through the `msiexec` waiting on
-it.
+it. A guest whose agent predates process trees runs as before, with no record
+and no refusal.
 
 Only one run per machine is in flight at a time; a second `apply` against a
 machine already converging is refused rather than queued. The run emits

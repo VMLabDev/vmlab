@@ -260,7 +260,8 @@ fn usb_devices(self) -> Result[List[UsbDevice], string]
 ```
 
 `attached_to` names the holder as `lab/vm` across every running lab, or is
-`None` for a free device.
+`None` for a free device. The error carries a failure to read the host's device
+list.
 
 ```wscript
 fn main(lab: Lab) {

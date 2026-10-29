@@ -163,8 +163,8 @@ root) or a named volume (`name = "db"`), kept under the lab's `.vmlab/` and
 shared by name between containers. Named volumes survive `down` and
 per-container destroy; only lab `destroy` removes them. Volumes attach as
 vhost-user-fs devices, one `virtiofsd` per volume, mounted natively by cinit
-before the network is up. A host with no `virtiofsd` binary falls back to SMB
-shares served by the lab daemon at the segment gateway, mounted over CIFS once
+before the network is up. A host with no `virtiofsd` binary, or a read-only
+volume on a `virtiofsd` without `--readonly`, falls back to SMB shares served by the lab daemon at the segment gateway, mounted over CIFS once
 the network is up, exactly as shares-media.md describes for VMs. Ownership on
 volume files is mount-level, not per-file container uid and gid.
 
