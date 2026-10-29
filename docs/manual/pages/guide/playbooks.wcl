@@ -3,7 +3,7 @@ page guide_playbooks {
   chapter_header "Playbooks" {
     kicker       = "The guide · explanation"
     reading_time = "7 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -199,11 +199,12 @@ DOC
 
   p <<'DOC'
 Provisions and playbooks are one ordered list per machine. They run in the
-order their blocks appear inside that machine, once it is ready, and a
-machine that depends on another waits until that machine's whole list has
-completed. So in the example above `scripts/setup.ws` runs, then the
-`baseline` play, and only then does anything with `depends_on = ["buildbox"]`
-start. A template's playbooks interleave with its provisions the same way
+order their blocks appear inside that machine, once it is ready. So in the
+example above `scripts/setup.ws` runs, then the `baseline` play. Other
+machines run their own lists at the same time. A machine with
+`depends_on = ["buildbox"]` starts as soon as `buildbox` is ready, without
+waiting for that list; one with `depends_on_provision = ["buildbox"]` holds
+its own first step until `buildbox`'s list has completed. A template's playbooks interleave with its provisions the same way
 during a build, with steps streamed as build progress.
 DOC
 

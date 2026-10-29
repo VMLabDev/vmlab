@@ -3,7 +3,7 @@ page ref_container {
   chapter_header "Lab file: container and its children" {
     kicker       = "Reference · reference"
     reading_time = "10 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -21,7 +21,8 @@ page ref_container {
   p <<DOC
     An OCI container run inside a micro-VM. It attaches to segments exactly
     like a VM, registers in DNS as `<name>.<lab>.<suffix>`, and joins the
-    same `depends_on` waves. A container with no NICs is air-gapped but
+    same `depends_on` start order and `depends_on_provision` provisioning
+    order as a VM. A container with no NICs is air-gapped but
     still reachable with `exec` and `cp` over the agent channel.
   DOC
   code wcl { source = <<'SRC'
@@ -36,6 +37,7 @@ container "<name>" {
   cpus       = 1
   memory     = 256MiB
   depends_on = ["db"]
+  depends_on_provision = ["db"]
   clock      = "host"
   nic         { … }
   env         { … }
@@ -61,7 +63,8 @@ SRC
       | "`profile`" | "utf8" | "none" | "Guest profile supplying micro-VM hardware defaults, for example `container`." |
       | "`cpus`" | "i64" | "from profile" | "vCPU count for the micro-VM, greater than 0. One of this field or the profile must supply it." |
       | "`memory`" | "ByteSize" | "from profile" | "RAM for the micro-VM, for example `512MiB`. One of this field or the profile must supply it." |
-      | "`depends_on`" | "list<utf8>" | "none" | "VM or container names to wait for before this one. No cycles." |
+      | "`depends_on`" | "list<utf8>" | "none" | "Start order: VM or container names that must be ready before this container starts. Their provisioning is not waited for. `down` stops in reverse. No self-reference, no cycles." |
+      | "`depends_on_provision`" | "list<utf8>" | "none" | "Provisioning order: VM or container names whose provision and playbook steps must all finish before this container's first step runs. Does not delay its start. No self-reference, no cycles." |
       | "`clock`" | "utf8" | "`host`" | "Guest clock policy, as on a VM. `host`: after an online snapshot restore the lab daemon sets the micro-VM's clock to the host's current time through the agent. `snapshot`: a restored container keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z`: the RTC starts at that instant on every boot and vmlab never sets it. Declared here only. See [vm and its children](ref_vm)." |
       | "`nic {}`" | "children" | "none" | "Network interfaces. None means air-gapped; exec and copy still work via the agent." |
       | "`env {}`" | "children" | "none" | "Environment variables passed to the container process." |
@@ -87,7 +90,7 @@ SRC
     li "An `:idle` container cannot declare `entrypoint`, `command` or a `healthcheck`."
     li "A container with `port {}` blocks needs at least one NIC; forwards need a segment to reach it over."
     li "A container with `volume {}` blocks needs at least one NIC; volumes mount over the network from the segment gateway."
-    li "Every name in `depends_on` exists, with no cycle across VMs and containers."
+    li "Every name in `depends_on` and `depends_on_provision` exists and is not the container itself, and neither key forms a cycle across VMs and containers. A loop that crosses from one key to the other is allowed."
     li "`clock` is `host`, `snapshot`, or an RFC 3339 date-time such as `2020-01-01T00:00:00Z`."
     li "`login {}` blocks are judged against the Linux family regardless of the profile named: `elevated` is rejected and `password` is optional."
   }
@@ -181,7 +184,7 @@ SRC
   p <<DOC
     A probe run inside the container. Readiness is two-stage: the process
     starts, then the first probe passes. Only then does the container count as
-    ready for `depends_on` waves. Consecutive failures past `retries` fire
+    ready, and machines that name it in `depends_on` may start. Consecutive failures past `retries` fire
     `container.unhealthy`.
   DOC
   code wcl { source = <<'SRC'

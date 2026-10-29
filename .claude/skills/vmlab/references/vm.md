@@ -28,6 +28,7 @@ vm "<name>" {
   cdrom       = "./isos/boot.iso"
   floppy      = "./boot.img"
   depends_on  = ["dc01"]
+  depends_on_provision = ["dc01"]
   nested      = false
   gui         = false
   agent_update = true
@@ -61,7 +62,8 @@ vm "<name>" {
 | `disk` | ByteSize | none | Primary disk size, for example `64GiB`. Scratch VMs only; rejected on cloned VMs. |
 | `cdrom` | utf8 | none | Path to an ISO to attach as a CD-ROM, relative to the lab root. |
 | `floppy` | utf8 | none | Path to a floppy image to attach, relative to the lab root. |
-| `depends_on` | list<utf8> | none | VM or container names to wait for before this one starts. No cycles. |
+| `depends_on` | list<utf8> | none | Start order: VM or container names that must be ready before this one starts. Ready means a VM's agent answers or a container passes its healthcheck; their provisioning is not waited for. `down` stops in reverse. No self-reference, no cycles. |
+| `depends_on_provision` | list<utf8> | none | Provisioning order: VM or container names whose provision and playbook steps must all finish before this machine's first step runs. Does not delay this machine's start. No self-reference, no cycles. |
 | `nested` | bool | `false` | Expose hardware virtualisation (VMX/SVM) to the guest. Without it, an x86 guest under KVM has both masked. `up` warns when the host's KVM module has nested virtualisation off. No effect under TCG or on other architectures. |
 | `gui` | bool | lab `gui` | Open a VNC viewer on `up`. The VM always runs headless. |
 | `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
@@ -113,8 +115,12 @@ Known architectures are `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`,
 - `cpus` is at least 1. `memory` and `disk` are non-negative sizes.
 - `disk` on a store or registry template is an error; clones inherit the
   template's disk. Use `disk "name" {}` blocks for extra disks.
-- Every name in `depends_on` exists in the lab, and the dependency graph across
-  VMs and containers has no cycle.
+- Every name in `depends_on` and `depends_on_provision` exists in the lab and is
+  not the machine itself.
+- Neither key forms a cycle across VMs and containers; the error names the whole
+  path. The two keys are separate graphs, so a loop that crosses from one to the
+  other is allowed: starting a machine never waits for provisioning, so it cannot
+  deadlock.
 - `profile`, if set, names a known profile.
 - `cdrom` and `floppy` name files that exist under the lab root.
 - `clock` is `host`, `snapshot`, or an RFC 3339 date-time such as
@@ -423,8 +429,9 @@ provision "scripts/setup.ws" { }
 | `script` | utf8 (label) | required | Path to the `.ws` file, relative to the lab root; the inline label. Must exist and compile. |
 
 Validation checks the file exists and compiles it, reporting compile errors
-against the block. Across machines, steps follow the order the machine blocks
-appear, with `depends_on` gating when each becomes eligible.
+against the block. Different machines provision in parallel; only
+`depends_on_provision` holds one machine's first step until another machine's
+steps have all finished.
 
 ## playbook {}
 

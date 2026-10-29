@@ -168,11 +168,13 @@ The CLI locates `vmlab.wcl`, validates it (see lab-file.md), and asks the
 supervisor to ensure a lab daemon for that name. The supervisor pre-pulls any
 registry templates or container images the lab needs, then spawns the daemon.
 The daemon computes its plan as a value before it starts anything: the waves of
-machines `depends_on` implies, the share plan (see shares-media.md), and the
+machines `depends_on` implies, the provisioning order `depends_on_provision`
+implies, the share plan (see shares-media.md), and the
 forward plan (see networking.md). It assembles the network fabric, creates the
 clones, launches one QEMU per machine, waits for each agent, mounts shares,
-runs each machine's provision steps in declaration order, and reports the lab
-up. Provision output streams live to the terminal and into the lab log.
+runs each machine's provision steps in declaration order, machines in parallel,
+and reports the lab up once every step has finished. Provision output streams
+live to the terminal, prefixed with the machine's name, and into the lab log.
 
 `down` walks the stop ladder on every machine — agent shutdown, then ACPI, then
 a kill after a timeout — and asks the supervisor to release the daemon.

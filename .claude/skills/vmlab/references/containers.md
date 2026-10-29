@@ -6,7 +6,8 @@ compose-style configuration: environment variables, volumes, port forwards, a
 healthcheck, and `nic` blocks identical to a VM's. Every container runs as a
 machine in a micro-VM, so it has the same segments, DNS, snapshots and agent
 channel as a VM. It registers in DNS as `<name>.<lab>.<suffix>` and joins the
-same `depends_on` waves.
+same `depends_on` start order and `depends_on_provision` provisioning order as
+a VM.
 
 ```wcl
 # examples/mixed-lab/vmlab.wcl
@@ -201,7 +202,7 @@ stage waits for the agent instead.
 
 Readiness is deliberately not gated on the agent in workload mode. The
 entrypoint runs regardless, as it would under Docker, and an agent hiccup must
-not wedge a `depends_on` wave. The agent is polled separately and gates only
+not wedge a `depends_on` wave (`depends_on` waits for readiness only). The agent is polled separately and gates only
 `exec` and `cp`. The events `container.starting`, `ready`, `stopped`, `crashed`
 and `unhealthy` are bindable with `on`, exactly like their VM counterparts, and
 readiness gates the dependents of a container the same way a VM's does.
@@ -247,6 +248,7 @@ container "<name>" {
   cpus       = 1
   memory     = 256MiB
   depends_on = ["db"]
+  depends_on_provision = ["db"]
   nic         { … }
   env         { … }
   volume      { … }
@@ -271,7 +273,8 @@ container "<name>" {
 | `profile` | utf8 | none | Guest profile supplying micro-VM hardware defaults, for example `container`. |
 | `cpus` | i64 | from profile | vCPU count for the micro-VM, greater than 0. One of this field or the profile must supply it. |
 | `memory` | ByteSize | from profile | RAM for the micro-VM, for example `512MiB`. One of this field or the profile must supply it. |
-| `depends_on` | list<utf8> | none | VM or container names to wait for before this one. No cycles. |
+| `depends_on` | list<utf8> | none | Start order: VM or container names that must be ready before this one starts. Ready means a VM's agent answers or a container passes its healthcheck; their provisioning is not waited for. `down` stops in reverse. No self-reference, no cycles. |
+| `depends_on_provision` | list<utf8> | none | Provisioning order: VM or container names whose provision and playbook steps must all finish before this machine's first step runs. Does not delay this machine's start. No self-reference, no cycles. |
 | `nic {}` | children | none | Network interfaces. None means air-gapped; exec and copy still work via the agent. |
 | `env {}` | children | none | Environment variables passed to the container process. |
 | `volume {}` | children | none | Host binds and named volumes mounted into the container. |
@@ -295,7 +298,9 @@ Validation enforces these rules:
   segment to reach it over.
 - A container with `volume {}` blocks needs at least one NIC; volumes mount over
   the network from the segment gateway.
-- Every name in `depends_on` exists, with no cycle across VMs and containers.
+- Every name in `depends_on` and `depends_on_provision` exists and is not the
+  container itself, and neither key forms a cycle across VMs and containers. A
+  loop that crosses from one key to the other is allowed.
 - `login {}` blocks are judged against the Linux family regardless of the
   profile named: `elevated` is rejected and `password` is optional.
 
@@ -414,8 +419,8 @@ automatic, exactly as an omitted `forward { host_port }` (see networking.md,
 ## healthcheck {}
 
 A probe run inside the container. Readiness is two-stage: the process starts,
-then the first probe passes. Only then does the container count as ready for
-`depends_on` waves. Consecutive failures past `retries` fire
+then the first probe passes. Only then does the container count as ready, and
+machines that name it in `depends_on` may start. Consecutive failures past `retries` fire
 `container.unhealthy`.
 
 ```wcl

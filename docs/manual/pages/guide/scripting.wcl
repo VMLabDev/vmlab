@@ -3,7 +3,7 @@ page guide_scripting {
   chapter_header "Guest automation with wscript" {
     kicker       = "The guide · explanation"
     reading_time = "12 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -159,10 +159,37 @@ A **provision script** is declared with a `provision "path.ws" { }` block
 inside the `vm {}` or `container {}` it configures. Its entry point is
 `fn main(lab: Lab)`. It runs once during `vmlab up`, after that machine is
 ready, at its position among the machine's steps, interleaved with the
-machine's [playbooks](guide_playbooks) in declaration order. Across machines,
-steps follow the order the machine blocks appear, with `depends_on` gating
-when each becomes eligible. A script orchestrating several machines is the
-normal case: it reaches the others through the lab handle.
+machine's [playbooks](guide_playbooks) in declaration order. Different
+machines provision in parallel, so a script cannot assume another machine's
+steps have run. A script orchestrating several machines is the normal case:
+it reaches the others through the lab handle, and its machine declares the
+order it needs with `depends_on_provision`. A member that joins a domain
+names the domain controller there, so the join runs only after the
+controller has been stood up:
+DOC
+
+  code wcl { source = <<'SRC'
+vm "dc01" {
+  template = "x86_64/windows-server-2025"
+  provision "scripts/promote-dc.ws" { }
+}
+
+vm "ws01" {
+  template             = "x86_64/windows-11"
+  depends_on           = ["dc01"]   // boot once dc01 answers
+  depends_on_provision = ["dc01"]   // join once dc01 is a controller
+  provision "scripts/join-domain.ws" { }
+}
+SRC
+  }
+
+  p <<'DOC'
+**Upgrading a lab.** `depends_on` used to hold a dependent back until its
+dependency's provisions had finished too. It is now start order only, so a lab
+whose dependents relied on a dependency's provisions having run adds
+`depends_on_provision` naming the same machines. Without it the dependent's
+steps run in parallel with the dependency's, and a join can reach a
+controller that does not exist yet.
 DOC
 
   p <<'DOC'

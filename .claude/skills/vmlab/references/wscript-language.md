@@ -131,10 +131,10 @@ A **provision script** is declared with a `provision "path.ws" { }` block inside
 the `vm {}` or `container {}` it configures. Its entry point is
 `fn main(lab: Lab)`. It runs once during `vmlab up`, after that machine is ready,
 at its position among the machine's steps, interleaved with the machine's
-playbooks (automation.md) in declaration order. Across machines, steps follow the
-order the machine blocks appear, with `depends_on` gating when each becomes
-eligible. A script orchestrating several machines is the normal case: it reaches
-the others through the lab handle.
+playbooks (automation.md) in declaration order. Different machines provision in
+parallel. A script orchestrating several machines is the normal case: it reaches
+the others through the lab handle, and its machine names the machines whose steps
+must finish first in `depends_on_provision`.
 
 `lab.this_vm()` returns the machine whose `provision {}` block declared the
 running script, or the build VM when a template's first-boot script runs. It is

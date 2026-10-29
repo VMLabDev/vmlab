@@ -3,7 +3,7 @@ page guide_architecture {
   chapter_header "How vmlab runs a lab" {
     kicker       = "The guide · explanation"
     reading_time = "9 min read"
-    updated      = "2026-10-28"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -266,12 +266,14 @@ SRC
     describes, and asks the supervisor to ensure a lab daemon for that name.
     The supervisor pre-pulls any registry templates or container images the
     lab needs, then spawns the daemon. The daemon computes its plan as a value
-    before it starts anything: the waves of machines `depends_on` implies,
+    before it starts anything: the waves of machines `depends_on` implies, the
+    provisioning order `depends_on_provision` implies,
     the [share plan](guide_shares), and the [forward plan](guide_networking).
     It assembles the network fabric, creates the clones, launches one QEMU per
     machine, waits for each agent, mounts shares, runs each machine's
-    provision steps in declaration order, and reports the lab up. Provision
-    output streams live to your terminal and into the lab log.
+    provision steps in declaration order, machines in parallel, and reports
+    the lab up once every step has finished. Provision output streams live to
+    your terminal, prefixed with the machine's name, and into the lab log.
   DOC
 
   p <<DOC
