@@ -113,8 +113,8 @@ TXT
 
   p <<DOC
     In a frozen family each lab's fixed host ports are shifted by its port
-    slot, and `up` prints one line for each forward bound somewhere other
-    than its declared port:
+    slot, and `up` prints one line for each forward it installs somewhere
+    other than its declared port:
   DOC
 
   code text { source = <<'SRC'
@@ -122,7 +122,13 @@ TXT
 SRC
   }
 
-  p "[vmlab port](cmd_port) prints the bound port for a script."
+  p <<DOC
+    A forward installed after `up` returns, once its machine takes a lease,
+    is not printed. The lab daemon writes the same line to its log, and the
+    `forward.installed` event carries the declared port as `declared_port`.
+    [vmlab status](cmd_status) marks every shifted forward, however it was
+    installed, and [vmlab port](cmd_port) prints the bound port for a script.
+  DOC
 
   h2 "Editing the lab file between runs"
 

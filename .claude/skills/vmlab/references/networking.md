@@ -466,8 +466,11 @@ Automatic ports are not shifted; runtime `seg.forward(host_port, …)` is.
 Slots and bound ports live in the main checkout's `.vmlab/worktree-ports.json`
 (locked for every change; a freeze writes the main lab's declared fixed ports
 as slot 0; a thaw deletes it). `up` prints `"web": container port declared on
-host port 18080 is bound on 18081 (worktree port slot, PRD §21.7)`; `vmlab
-status` shows `18081 (18080)` and `--json` carries `declared_port`. Scripts
+host port 18080 is bound on 18081 (worktree port slot, PRD §21.7)` only for
+forwards it installs itself; one installed after `up` returns (once its machine
+takes a lease, which is common) goes to the lab daemon's log and the
+`forward.installed` event (`declared_port`). `vmlab status` always shows
+`18081 (18080)` and `--json` carries `declared_port`. Scripts
 read the port with `vmlab port <machine> <guest-port>` (cli-machine.md).
 
 A forward rides the segment's NAT engine, so the segment needs `nat = true`.

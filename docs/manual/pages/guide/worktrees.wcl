@@ -188,7 +188,8 @@ SRC
 
   p <<DOC
     With the main lab declaring `port { host = 18080 container = 80 }`, the
-    first worktree lab's `up` prints the port it bound instead:
+    first worktree lab's `up` prints the port it bound instead, when it
+    installs that forward itself:
   DOC
 
   code text { source = <<'SRC'
@@ -197,8 +198,12 @@ SRC
   }
 
   p <<DOC
-    [vmlab status](cmd_status) shows the forward as `18081 (18080)`, and
-    `status --json` carries the declared port as `declared_port`. A script
+    A forward is often installed after `up` returns, once its machine takes
+    a lease. `up` does not print that one: the lab daemon writes the line to
+    its log ([vmlab logs](cmd_logs)), and the `forward.installed` event carries
+    `declared_port`. [vmlab status](cmd_status) always shows a shifted
+    forward as `18081 (18080)`, and `status --json` carries the declared
+    port as `declared_port`. A script
     should not compute the port from the slot. It asks for it instead:
   DOC
 
