@@ -1,8 +1,9 @@
 // The worktree scenario's lab (PRD §21). Committed to a scratch git
 // repository, frozen at an offline snapshot in the main checkout, and run
 // again from a linked worktree whose machine is a clone of the main lab's.
-// The forward has no host port: both labs of the family install it, each on
-// a port of its own.
+// The first forward has no host port: both labs of the family install it,
+// each on a port of its own. The second declares one, which the worktree
+// lab's port slot shifts (§21.7).
 import <vmlab.wcl>
 
 lab "e2e-worktree" {
@@ -10,6 +11,7 @@ lab "e2e-worktree" {
     subnet = "10.83.0.0/24"
     nat    = true
     forward { to = "web:8080" }
+    forward { host_port = 9080 to = "web:8080" }
   }
 
   // Joined as "shared" by the main lab and "shared@<worktree>" by the

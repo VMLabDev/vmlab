@@ -3,8 +3,8 @@ page ref_paths {
   chapter_header "Files and directories" {
     kicker       = "Appendices · reference"
     reading_time = "9 min read"
-    updated      = "2026-10-28"
-    version      = "vmlab 0.9"
+    updated      = "2026-10-29"
+    version      = "vmlab 0.35"
   }
 
   p <<DOC
@@ -115,6 +115,7 @@ page ref_paths {
       | "`smb/`" | "The bundled smbd's configuration, passdb, log and persistent state; its sockets live under the runtime root's `smb/<hash>/`. See [Shared folders](guide_shares)." |
       | "`workspace/<machine>.json`" | "The workspace syncer's ledger for one dev machine. See [Dev machines and the workspace syncer](guide_dev)." |
       | "`worktree.json`" | "In a main checkout frozen for [worktree labs](guide_worktrees): the newest generation and the snapshot it was frozen at. Its presence turns on worktree isolation for the family." |
+      | "`worktree-ports.json`" | "In a frozen main checkout: each worktree lab's port slot, keyed by the git worktree's name, and every fixed port each lab of the family has bound, the main lab's declared ones included. Locked exclusively for every change, released per worktree by `vmlab destroy` there, and deleted by a thaw. See [Worktree labs](guide_worktrees)." |
       | "`freeze/<n>/<machine>/`" | "Generation `n` of the freeze: the machine's frozen disks, read-only, with copies of its `OVMF_VARS.fd`, `tpm-state/`, `firstboot.done`, `clone-source` and `state.json` record. `freeze/<n>/volumes/` holds the named volumes. See [Worktree labs](guide_worktrees)." |
       | "`vms/<vm>/freeze-generation`" | "In a worktree lab: the generation the machine was cloned from. Beside a container's disk too. See [Worktree labs](guide_worktrees)." |
       | "`screenshots/`" | "Where `Machine.screenshot` writes when given no path." |

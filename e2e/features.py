@@ -125,6 +125,7 @@ FEATURES: dict[str, str] = {
     "net.isolated": "`nic { isolated = true }`",
     "net.forward": "segment `forward` to a machine port",
     "net.forward.provisioned": "segment `forward` to a machine `up` provisions, installed and logged as `forward.installed`",
+    "port.verb": "`vmlab port` prints a forward's bound host port (and `--json` its status entry) as `status --json` reports it, and fails naming the installed forwards",
     "net.routes": "daemon routing between `routes_to` segments (source kept, rules applied, the rest isolated) and `route` blocks",
     "net.l3.block": "`block` rules",
     "net.l3.redirect": "`redirect` rules",
@@ -166,6 +167,8 @@ FEATURES: dict[str, str] = {
     "worktree.isolation.forward": "under worktree isolation a forward binds 127.0.0.1: reachable on loopback, not on the host's address",
     "worktree.isolation.nat": "a worktree guest is refused (RST) the main lab's forward and any other host address through NAT",
     "worktree.isolation.global": "a worktree lab joins its global segment as `<segment>@<worktree>`, with its own DNS, the main lab keeping the plain name",
+    "worktree.ports.shift": "a fixed `host_port` binds exactly in the main lab and one up in the first worktree lab, both answering on 127.0.0.1; `up` says so and `status` shows the declared port",
+    "worktree.ports.stable": "a worktree lab keeps its shifted port across `down` and `up`",
     # -- scripting and events ----------------------------------------------
     "script.run": "`vmlab script` runs a wscript against the lab",
     "script.provision": "`provision` scripts run on `up`",

@@ -3,8 +3,8 @@ page guide_networking {
   chapter_header "Networking" {
     kicker       = "The guide · explanation"
     reading_time = "14 min read"
-    updated      = "2026-10-28"
-    version      = "vmlab 0.9"
+    updated      = "2026-10-29"
+    version      = "vmlab 0.35"
   }
 
   p <<DOC
@@ -179,6 +179,20 @@ page guide_networking {
     [worktree isolation](guide_worktrees), where every segment `forward {}`
     and container `port {}` binds `127.0.0.1` instead. A forward is then
     reachable from the host itself and nowhere else.
+  DOC
+
+  p <<DOC
+    The labs of a frozen family would collide on a fixed host port, so each
+    holds a port slot and binds a fixed port `P` at `P + slot`, or the next
+    free port above it. The main lab keeps exactly `P`; automatic ports are
+    not shifted. [vmlab status](cmd_status) shows a shifted forward as
+    `18081 (18080)`. See [Worktree labs](guide_worktrees).
+  DOC
+
+  p <<DOC
+    [vmlab port](cmd_port) prints the host port for one machine and guest
+    port, whether it was declared, automatic or shifted. A script should
+    read the port from it, not from the lab file.
   DOC
 
   h2 "Guest routes and inter-segment routing"

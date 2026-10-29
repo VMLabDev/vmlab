@@ -338,18 +338,55 @@ impl SegmentHandle {
         let guest_ip: std::net::Ipv4Addr = guest_ip
             .parse()
             .map_err(|_| format!("vm {vm} has no IPv4 lease yet"))?;
-        // Under worktree isolation a forward binds loopback only (§21.4).
+        use crate::config::model::Proto;
+        use crate::freeze::ports;
+        // Under worktree isolation a forward binds loopback only (§21.4),
+        // and a fixed port is shifted by the lab's port slot as a declared
+        // one is (§21.7): chosen, bound and recorded under the family
+        // record's lock.
         let bind = crate::labd::isolation::forward_bind(self.runtime.isolation.as_ref());
-        let host_addr = std::net::SocketAddr::from((bind, host_port));
-        self.with_services(|s| {
-            s.add_forward(
-                host_addr,
-                guest_ip,
-                guest_port,
-                crate::config::model::Proto::Tcp,
-            )
-            .map(|(id, _)| id as i64)
-        })
+        let family = match &self.runtime.isolation {
+            Some(isolation) if host_port != 0 => {
+                let mut locked =
+                    ports::lock(&isolation.family_local).map_err(|e| format!("{e:#}"))?;
+                let mut record = locked.load().map_err(|e| format!("{e:#}"))?;
+                let key = ports::PortKey {
+                    worktree: isolation.port_owner().map(str::to_string),
+                    machine: vm.to_string(),
+                    source: "script".into(),
+                    guest_port,
+                    proto: Proto::Tcp,
+                    declared: host_port,
+                };
+                let slot = record.slot(key.worktree.as_deref());
+                let port = record.choose(&key, slot, |p| ports::host_free(bind, p, Proto::Tcp))?;
+                record.record(key, port);
+                Some((locked, record, port))
+            }
+            _ => None,
+        };
+        let port = family.as_ref().map_or(host_port, |(_, _, port)| *port);
+        let host_addr = std::net::SocketAddr::from((bind, port));
+        let id = self.with_services(|s| {
+            s.add_forward(host_addr, guest_ip, guest_port, Proto::Tcp)
+                .map(|(id, _)| id as i64)
+        })?;
+        if let Some((locked, record, _)) = family {
+            locked.save(&record).map_err(|e| format!("{e:#}"))?;
+            if port != host_port {
+                self.runtime.events.emit(
+                    "forward.installed",
+                    serde_json::json!({
+                        "what": format!("\"{vm}\": script forward"),
+                        "host_port": port,
+                        "auto": false,
+                        "declared_port": host_port,
+                        "guest": format!("{guest_ip}:{guest_port}"),
+                    }),
+                );
+            }
+        }
+        Ok(id)
     }
 
     /// Connect (`enable`) or disconnect this segment and `other` for daemon

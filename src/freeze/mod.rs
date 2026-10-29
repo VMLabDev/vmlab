@@ -11,6 +11,7 @@
 //!
 //! ```text
 //! .vmlab/worktree.json                       newest generation + snapshot
+//! .vmlab/worktree-ports.json                 port slots and bound ports (§21.7)
 //! .vmlab/freeze/<n>/<machine>/disk0.qcow2    frozen disks, read-only
 //! .vmlab/freeze/<n>/<machine>/disk-<x>.qcow2
 //! .vmlab/freeze/<n>/<machine>/scratch.qcow2  a container's writable layer
@@ -22,6 +23,7 @@
 
 pub mod inspect;
 pub mod plan;
+pub mod ports;
 #[cfg(test)]
 mod qemu_tests;
 pub mod steps;

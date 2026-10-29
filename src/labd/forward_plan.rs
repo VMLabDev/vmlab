@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 use crate::config::model::{Lab, MacAddr, Proto};
+use crate::freeze::ports::{FamilyPorts, PortKey};
 use crate::labd::network::nic_segment_name;
 use crate::labd::plan::Skip;
 
@@ -41,6 +42,14 @@ impl ForwardSource {
         match self {
             ForwardSource::Declared => "forward".to_string(),
             ForwardSource::ContainerPort => "container port".to_string(),
+        }
+    }
+
+    /// How a frozen family's port record names the source (PRD §21.7).
+    pub fn record_name(&self) -> &'static str {
+        match self {
+            ForwardSource::Declared => "forward",
+            ForwardSource::ContainerPort => "port",
         }
     }
 }
@@ -215,6 +224,47 @@ pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
     plan
 }
 
+/// Every fixed host port the lab file declares, as the main lab's keys in a
+/// frozen family's port record: what a freeze writes into slot 0 (§21.7) so
+/// no worktree lab takes one while the main lab is down. Forwards to a
+/// machine the lab does not have are left out, as [`plan`] leaves them.
+pub fn declared_fixed(lab: &Lab) -> Vec<PortKey> {
+    let key = |machine: &str, source: ForwardSource, guest_port, proto, declared| PortKey {
+        worktree: None,
+        machine: machine.to_string(),
+        source: source.record_name().to_string(),
+        guest_port,
+        proto,
+        declared,
+    };
+    let forwards = lab
+        .segments
+        .iter()
+        .flat_map(|s| &s.forwards)
+        .filter_map(|f| {
+            lab.machine(&f.vm)?;
+            Some(key(
+                &f.vm,
+                ForwardSource::Declared,
+                f.guest_port,
+                f.proto,
+                f.host_port?,
+            ))
+        });
+    let ports = lab.containers.iter().flat_map(|c| {
+        c.ports.iter().filter_map(|p| {
+            Some(key(
+                &c.name,
+                ForwardSource::ContainerPort,
+                p.container_port,
+                p.proto,
+                p.host_port?,
+            ))
+        })
+    });
+    forwards.chain(ports).collect()
+}
+
 /// The machine's first NIC's segment, recording a skip when it has none.
 fn segment_or_skip(
     plan: &mut ForwardPlan,
@@ -314,6 +364,28 @@ pub struct ForwardKey {
 }
 
 impl ForwardRule {
+    /// The declaration's fixed host port, `None` for an automatic one.
+    pub fn declared_port(&self) -> Option<u16> {
+        match self.host {
+            HostBinding::Port(p) => Some(p),
+            HostBinding::Auto => None,
+        }
+    }
+
+    /// The key a frozen family's port record holds this rule under, for the
+    /// lab `worktree` (`None` = the main lab). `None` for an automatic rule,
+    /// which a family leaves alone (§21.7).
+    pub fn port_key(&self, worktree: Option<&str>) -> Option<PortKey> {
+        Some(PortKey {
+            worktree: worktree.map(str::to_string),
+            machine: self.machine.clone(),
+            source: self.source.record_name().to_string(),
+            guest_port: self.guest_port,
+            proto: self.proto,
+            declared: self.declared_port()?,
+        })
+    }
+
     pub fn key(&self) -> ForwardKey {
         ForwardKey {
             machine: self.machine.clone(),
@@ -352,7 +424,29 @@ pub struct InstalledForward {
     pub host_port: u16,
     /// Whether vmlab picked `host_port` (the declaration omitted it).
     pub auto: bool,
+    /// The declared fixed port, which a frozen family's port slot may have
+    /// shifted `host_port` off (§21.7). `None` for an automatic one.
+    pub declared: Option<u16>,
     pub guest_ip: Ipv4Addr,
+}
+
+impl InstalledForward {
+    /// The declared port when the lab bound another one, for `status`.
+    pub fn shifted_from(&self) -> Option<u16> {
+        self.declared.filter(|d| *d != self.host_port)
+    }
+}
+
+/// A frozen family's port record as one lab installs its fixed forwards
+/// against it (§21.7): the record, under its lock, the lab's place in it,
+/// and the host check [`FamilyPorts::choose`] is given.
+pub struct FamilyBind<'a> {
+    pub ports: &'a mut FamilyPorts,
+    /// The linked worktree's name, `None` for the main lab.
+    pub worktree: Option<String>,
+    pub slot: u16,
+    /// Whether the host has a port free on the address forwards bind.
+    pub is_free: &'a mut dyn FnMut(u16, Proto) -> bool,
 }
 
 /// The ports to try for each of `rules`, in order, given what the same
@@ -362,11 +456,29 @@ pub struct InstalledForward {
 /// time asks for that port first ([`sticky_bind`]). Each previous forward
 /// is matched at most once, in order, so two identical automatic rules keep
 /// a port each rather than both asking for the first one's.
-pub fn bind_candidates(previous: &[InstalledForward], rules: &[&ForwardRule]) -> Vec<Vec<u16>> {
+///
+/// In a frozen family (`family`), a fixed rule's one candidate is the port
+/// its slot gives it ([`FamilyPorts::choose`]), recorded in the family's
+/// record as it is chosen so the next rule sees it taken. A rule the family
+/// has no port for is an `Err` naming its declared port.
+pub fn bind_candidates(
+    previous: &[InstalledForward],
+    rules: &[&ForwardRule],
+    mut family: Option<&mut FamilyBind>,
+) -> Vec<Result<Vec<u16>, String>> {
     let mut used = vec![false; previous.len()];
+    let worktree = family.as_ref().and_then(|f| f.worktree.clone());
     rules
         .iter()
         .map(|rule| {
+            if let (Some(f), Some(key)) =
+                (family.as_deref_mut(), rule.port_key(worktree.as_deref()))
+            {
+                let is_free = &mut *f.is_free;
+                let port = f.ports.choose(&key, f.slot, |p| is_free(p, rule.proto))?;
+                f.ports.record(key, port);
+                return Ok(vec![port]);
+            }
             let mut held = None;
             if rule.host.is_auto() {
                 let key = rule.key();
@@ -379,7 +491,7 @@ pub fn bind_candidates(previous: &[InstalledForward], rules: &[&ForwardRule]) ->
                     held = Some(previous[i].host_port);
                 }
             }
-            sticky_bind(rule.host, held)
+            Ok(sticky_bind(rule.host, held))
         })
         .collect()
 }
@@ -686,8 +798,17 @@ lab "l" {
             id: 1,
             host_port,
             auto: rule.host.is_auto(),
+            declared: rule.declared_port(),
             guest_ip: rule.guest_ip,
         }
+    }
+
+    /// Every candidate list, unwrapped: outside a family none can fail.
+    fn candidates(previous: &[InstalledForward], rules: &[&ForwardRule]) -> Vec<Vec<u16>> {
+        bind_candidates(previous, rules, None)
+            .into_iter()
+            .map(Result::unwrap)
+            .collect()
     }
 
     /// A restart re-plans with a new lease; each automatic rule asks for the
@@ -703,7 +824,7 @@ lab "l" {
         let after = plan(&inputs(&lab, &leased(&[("web", 20)])), &["web".into()]);
         let rules: Vec<&ForwardRule> = after.rules.iter().collect();
         assert_eq!(
-            bind_candidates(&previous, &rules),
+            candidates(&previous, &rules),
             vec![vec![40001, 0], vec![40002, 0]]
         );
     }
@@ -723,10 +844,10 @@ lab "l" {
         );
         let p = plan(&inputs(&lab, &leased(&[("a", 10)])), &[]);
         let rules: Vec<&ForwardRule> = p.rules.iter().collect();
-        assert_eq!(bind_candidates(&[], &rules), vec![vec![8080], vec![0]]);
+        assert_eq!(candidates(&[], &rules), vec![vec![8080], vec![0]]);
         let previous = vec![installed(&p.rules[0], 8080), installed(&p.rules[1], 40000)];
         assert_eq!(
-            bind_candidates(&previous, &rules),
+            candidates(&previous, &rules),
             vec![vec![8080], vec![40000, 0]]
         );
     }
@@ -748,8 +869,119 @@ lab "l" {
         let rules: Vec<&ForwardRule> = p.rules.iter().collect();
         let previous = vec![installed(&p.rules[0], 40001), installed(&p.rules[1], 40002)];
         assert_eq!(
-            bind_candidates(&previous, &rules),
+            candidates(&previous, &rules),
             vec![vec![40001, 0], vec![40002, 0]]
         );
+    }
+
+    /// A frozen family: a lab with one fixed forward of each source and one
+    /// automatic one.
+    fn family_lab() -> Lab {
+        lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { host_port = 8080 to = "a:80" }
+    forward { to = "a:81" }
+  }
+  vm "a" { template = "x86_64/t" nic { segment = "lan" } }
+  container "b" { image = "nginx" nic { segment = "lan" }
+    port { host = 8081 container = 80 }
+  }
+}"#,
+        )
+    }
+
+    /// A worktree lab in slot 1 shifts each fixed rule, sees its own first
+    /// choice taken when choosing the next, records both, and leaves the
+    /// automatic rule as it was (§21.7).
+    #[test]
+    fn a_worktree_s_fixed_rules_shift_by_its_slot() {
+        let lab = family_lab();
+        let p = plan(&inputs(&lab, &leased(&[("a", 10), ("b", 11)])), &[]);
+        let rules: Vec<&ForwardRule> = p.rules.iter().collect();
+        let mut ports = FamilyPorts::default();
+        let mut free = |_: u16, _: Proto| true;
+        let mut fam = FamilyBind {
+            ports: &mut ports,
+            worktree: Some("feat-x".into()),
+            slot: 1,
+            is_free: &mut free,
+        };
+        let c = bind_candidates(&[], &rules, Some(&mut fam));
+        assert_eq!(c, vec![Ok(vec![8081]), Ok(vec![0]), Ok(vec![8082])]);
+        let key = rules[2].port_key(Some("feat-x")).unwrap();
+        assert_eq!(key.source, "port");
+        assert_eq!(ports.previous(&key), Some(8082));
+        assert_eq!(ports.ports.len(), 2, "automatic ports are not recorded");
+    }
+
+    /// The main lab binds what it declares, whatever the host says.
+    #[test]
+    fn the_main_lab_s_fixed_rules_are_unshifted() {
+        let lab = family_lab();
+        let p = plan(&inputs(&lab, &leased(&[("a", 10), ("b", 11)])), &[]);
+        let rules: Vec<&ForwardRule> = p.rules.iter().collect();
+        let mut ports = FamilyPorts::default();
+        let mut held = |_: u16, _: Proto| false;
+        let mut fam = FamilyBind {
+            ports: &mut ports,
+            worktree: None,
+            slot: 0,
+            is_free: &mut held,
+        };
+        let c = bind_candidates(&[], &rules, Some(&mut fam));
+        assert_eq!(c, vec![Ok(vec![8080]), Ok(vec![0]), Ok(vec![8081])]);
+    }
+
+    /// A shift with nowhere to go fails that rule alone.
+    #[test]
+    fn a_rule_the_family_cannot_place_fails_alone() {
+        let lab = family_lab();
+        let p = plan(&inputs(&lab, &leased(&[("a", 10), ("b", 11)])), &[]);
+        let rules: Vec<&ForwardRule> = p.rules.iter().collect();
+        let mut ports = FamilyPorts::default();
+        let mut free = |_: u16, _: Proto| true;
+        let mut fam = FamilyBind {
+            ports: &mut ports,
+            worktree: Some("feat-x".into()),
+            slot: 65000,
+            is_free: &mut free,
+        };
+        let c = bind_candidates(&[], &rules, Some(&mut fam));
+        assert!(c[0].as_ref().unwrap_err().contains("8080"), "{c:?}");
+        assert_eq!(c[1], Ok(vec![0]));
+    }
+
+    /// A freeze records every fixed port the file declares, from both
+    /// sources, as the main lab's.
+    #[test]
+    fn declared_fixed_lists_every_fixed_port() {
+        let keys = declared_fixed(&family_lab());
+        let got: Vec<(&str, &str, u16, u16)> = keys
+            .iter()
+            .map(|k| {
+                (
+                    k.machine.as_str(),
+                    k.source.as_str(),
+                    k.guest_port,
+                    k.declared,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![("a", "forward", 80, 8080), ("b", "port", 80, 8081)]
+        );
+        assert!(keys.iter().all(|k| k.worktree.is_none()));
+    }
+
+    #[test]
+    fn a_shifted_forward_names_its_declared_port() {
+        let lab = family_lab();
+        let p = plan(&inputs(&lab, &leased(&[("a", 10)])), &[]);
+        assert_eq!(installed(&p.rules[0], 8081).shifted_from(), Some(8080));
+        assert_eq!(installed(&p.rules[0], 8080).shifted_from(), None);
+        assert_eq!(installed(&p.rules[1], 40000).shifted_from(), None);
     }
 }

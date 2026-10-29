@@ -45,7 +45,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
 | The host config file, WSL 2, guest OS profiles | `references/host-profiles.md` |
 | Lab-level CLI verbs: `up`, `down`, `status`, `validate`, `destroy`, `pull`, `lab`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script` | `references/cli-lab.md` |
-| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `record`, `cp`, `clipboard`, `snapshot`, `usb`, `dev` | `references/cli-machine.md` |
+| Per-machine CLI verbs: `vm`, `machine`, `container`, `exec`, `shell`, `app`, `console`, `record`, `cp`, `clipboard`, `snapshot`, `usb`, `port`, `dev` | `references/cli-machine.md` |
 | Console recording: `vmlab record`, `--record` on `script`/`up`/`vm start`/`vm restart`, the pointer rule, idle compression, the timeline, what ends a recording | `references/cli-machine.md` (`vmlab record`), `references/snapshots-vision.md` (Recording) |
 | Shared apps: a guest program's windows on the host desktop over waypipe, X11 or RDP (`vmlab app run`) | `references/cli-machine.md` |
 | `vmlab template` and its subcommands | `references/cli-template.md` |

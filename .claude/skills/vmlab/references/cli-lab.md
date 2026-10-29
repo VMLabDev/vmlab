@@ -320,9 +320,12 @@ One row per installed port forward (segment `forward {}` and container `port {}`
 alike): `FORWARD` (the machine), `HOST` (the host port actually listening),
 `GUEST` (`ip:port`, the lease it was installed against) and `PROTO`. A port
 vmlab picked because the declaration omitted it is marked `(auto)`, as in
-`41234 (auto)`; this table is where an automatic port is read from. `--json`
-carries the same as the lab's `forwards` list, one object per forward with
-`machine`, `segment`, `host_port`, `guest`, `proto` and `auto`. An automatic port
+`41234 (auto)`; this table is where an automatic port is read from. A fixed
+port a worktree lab's port slot shifted (PRD §21.7) is followed by the declared
+one, as in `18081 (18080)`. `--json` carries the same as the lab's `forwards`
+list, one object per forward with `machine`, `segment`, `host_port`, `guest`,
+`guest_port`, `proto` and `auto`, plus `declared_port` on a shifted forward
+only. A script reads one forward's port with `vmlab port` (cli-machine.md). An automatic port
 stays the same across machine restarts while the lab daemon runs; it may change
 after a full `down` and `up`, which restarts the daemon (see networking.md, `forward {}`).
 

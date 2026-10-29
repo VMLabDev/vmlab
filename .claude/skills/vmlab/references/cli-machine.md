@@ -791,6 +791,27 @@ Matches the selector against what the VM holds (not the host), or takes everythi
 
 0 on success. Exit 4 (`not_found`) for an unknown machine. Every refusal exits 1 (`failed`). A usage error (`detach` with neither a selector nor `--all`) exits 2.
 
+## vmlab port
+
+Prints the host port a running machine's forward to a guest port is bound on, and nothing else, for scripts (PRD §21.7). Works for any lab, frozen or not; read-only, it never starts a lab daemon.
+
+```sh
+vmlab port [--json] <[lab/]machine> <guest-port>[/tcp|/udp]
+```
+
+The lab comes from the working directory (with `--instance`/`VMLAB_INSTANCE`) or a `lab/machine` reference. It reads the lab's status and matches the machine's installed forwards (segment `forward {}`, container `port {}`, runtime `seg.forward`) on guest port, and on protocol when a suffix is given (case-insensitive; `both` matches either). Matches sharing one host port are one answer. Plain output is the port and a newline; `--json` prints the forward's entry from `status --json` (`machine`, `segment`, `host_port`, `guest`, `guest_port`, `proto`, `auto`, and `declared_port` when shifted). Typical use: `curl "http://127.0.0.1:$(vmlab port web 80)/"`.
+
+### Exit status
+
+| Case | Exit | Message |
+| --- | --- | --- |
+| Malformed port or protocol | 2 (`invalid_argument`) | `` `80/sctp`: the protocol is `tcp` or `udp`, not `sctp` `` |
+| tcp and udp forwards on different host ports, no suffix | 2 | `"web" has more than one forward to guest port 80: 80/tcp on host port 18580, 80/udp on host port 58525; name one as 80/tcp or 80/udp` |
+| No matching forward | 4 (`not_found`) | `"web" in lab "portcheck" has no forward to guest port 81; its forwards: …` (or `it has no forwards installed`) |
+| Unknown machine | 4 | `no vm or container "nope" in lab "portcheck"` |
+| Machine stopped (even if its forwards are still listed) | 5 (`conflict`) | `"web" in lab "portcheck" is not running` |
+| Lab daemon not running | 5 | `lab "portcheck" is not running` |
+
 ## vmlab record
 
 Records a VM's console to an MP4 or WebM file (PRD §11.1). The lab daemon owns the recording: it carries on after the command returns, survives guest reboots, `vm restart` and snapshot restores (the last frame is held across the gap and the recorder reconnects to the new QEMU), and is finalised to a playable file on `record stop`, `--max-duration`, `vm stop`, `down`, `destroy`, `vm destroy`, lab daemon exit and the `host.disk_low` watchdog. The recorder reads the VM's VNC socket, so it needs nothing in the guest and works before an agent exists. One recording per machine. Containers have no display and cannot be recorded. No audio, no captions, no GIF (convert the MP4 afterwards). Template build VMs cannot be recorded. The rules for what the video shows (pointer, ripple, idle compression, timeline) are in snapshots-vision.md under "Recording".

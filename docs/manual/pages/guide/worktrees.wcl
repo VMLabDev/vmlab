@@ -2,9 +2,9 @@ page guide_worktrees {
   title = "Worktree labs"
   chapter_header "Worktree labs" {
     kicker       = "The guide · how-to"
-    reading_time = "9 min read"
-    updated      = "2026-10-28"
-    version      = "vmlab 0.31"
+    reading_time = "11 min read"
+    updated      = "2026-10-29"
+    version      = "vmlab 0.35"
   }
 
   p <<DOC
@@ -30,6 +30,7 @@ page guide_worktrees {
     li "freezing the main checkout's lab at an offline snapshot,"
     li "checking that the family runs isolated,"
     li "bringing up a worktree lab that clones its machines from the freeze,"
+    li "reaching each lab's fixed ports, which a port slot shifts,"
     li "resetting any lab of the family to the freeze point,"
     li "freezing again after the main lab moves on,"
     li "thawing the freeze back into the main lab."
@@ -97,7 +98,7 @@ SRC
 
   list {
     li "NAT refuses every new flow to the host itself: loopback, `0.0.0.0/8`, and every address and broadcast address on a host interface. The lab's own smbd stays reachable, so [shared folders](guide_shares) keep working."
-    li "Port forwards bind `127.0.0.1` instead of every interface."
+    li "Port forwards bind `127.0.0.1` instead of every interface, and a fixed port is shifted by the lab's port slot, as Ports below describes."
     li "A worktree lab's global segments join `<segment>@<worktree>`, named after the git worktree, so they are shared with no other lab of the family. A global segment with a `connect {}` peer refuses `up` in a worktree lab."
   }
 
@@ -165,6 +166,61 @@ SRC
     `vmlab worktree freeze` as the fix. It never falls back to the
     templates, which would silently skip the provisioning the freeze
     carries.
+  DOC
+
+  h2 "Ports"
+
+  p <<DOC
+    Every lab of a frozen family binds its forwards on `127.0.0.1`, so two
+    labs that declare one fixed `host_port` would collide. Each lab of the
+    family holds a **port slot** instead, and a fixed port is shifted by it.
+    Automatic ports, where the declaration leaves the host port out, are not
+    shifted.
+  DOC
+
+  list {
+    li "The main lab is slot 0 and always binds exactly the port it declares. When a process outside the family holds that port, the forward fails, as it does outside a freeze."
+    li "A worktree lab takes the lowest free slot from 1 the first time it installs a forward with a fixed port, and keeps it until `vmlab destroy` in that worktree releases it."
+    li "A fixed port `P` binds `P + slot`. When another lab of the family has that port recorded, or another process holds it, the lab takes the next port above it that is neither. A shift past 65535 fails that forward alone, naming the declared port."
+    li "The port a lab gets is recorded and asked for first on every later install, so it stays the same across `down`, `up` and machine restarts."
+    li "Runtime forwards added with `Segment.forward` and a fixed host port follow the same rule."
+  }
+
+  p <<DOC
+    With the main lab declaring `port { host = 18080 container = 80 }`, the
+    first worktree lab's `up` prints the port it bound instead, when it
+    installs that forward itself:
+  DOC
+
+  code text { source = <<'SRC'
+"web": container port declared on host port 18080 is bound on 18081 (worktree port slot, PRD §21.7)
+SRC
+  }
+
+  p <<DOC
+    A forward is often installed after `up` returns, once its machine takes
+    a lease. `up` does not print that one: the lab daemon writes the line to
+    its log ([vmlab logs](cmd_logs)), and the `forward.installed` event carries
+    `declared_port`. [vmlab status](cmd_status) always shows a shifted
+    forward as `18081 (18080)`, and `status --json` carries the declared
+    port as `declared_port`. A script
+    should not compute the port from the slot. It asks for it instead:
+  DOC
+
+  code sh { source = "curl -s \"http://127.0.0.1:$(vmlab port web 80)/\"" }
+
+  p <<DOC
+    [vmlab port](cmd_port) prints the host port a running machine's forward
+    is bound on, in a worktree lab, the main lab or any other lab.
+  DOC
+
+  p <<DOC
+    Slots and every fixed port each lab of the family has bound are recorded
+    in the main checkout's `.vmlab/worktree-ports.json`, keyed by the git
+    worktree's name. The freeze records the main lab's declared fixed ports
+    in slot 0, so a worktree never takes one of them while the main lab is
+    down. Every change to the file holds an exclusive lock on it, so two
+    labs coming up at once cannot pick one port. A thaw deletes it.
   DOC
 
   h2 "Reset a lab to the freeze point"
@@ -259,6 +315,7 @@ SRC
 
   list {
     li "[vmlab worktree](cmd_worktree): the freeze, thaw and status verbs, what they copy, their output and refusals."
+    li "[vmlab port](cmd_port): the host port a forward is bound on, shifted or not."
     li "[vmlab snapshot](cmd_snapshot): how the freeze point and locked snapshots restore."
     li "[Networking](guide_networking): worktree isolation beside the NAT, forwards and global segments it changes."
     li "[How vmlab runs a lab](guide_architecture): lab instances, which every worktree lab is first."

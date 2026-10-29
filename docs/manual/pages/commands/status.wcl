@@ -3,8 +3,8 @@ page cmd_status {
   chapter_header "vmlab status" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-10-28"
-    version      = "vmlab 0.31"
+    updated      = "2026-10-29"
+    version      = "vmlab 0.35"
   }
 
   p <<DOC
@@ -174,11 +174,15 @@ SRC
     listening), `GUEST` (`ip:port`, the lease it was installed against) and
     `PROTO`. A port vmlab picked because the declaration left it out is marked
     `(auto)`, as in `41234 (auto)`; this table is where an automatic port is
-    read from. With `--json` the lab carries the same as its `forwards` list,
-    one object per forward with `machine`, `segment`, `host_port`, `guest`,
-    `proto` and `auto`. An automatic port stays the same across machine
-    restarts while the lab daemon runs, and may change after a full
-    [vmlab down](cmd_down) and `up`. See
+    read from. A fixed port bound somewhere other than where it was declared,
+    because a [worktree lab's port slot](guide_worktrees) shifted it, is
+    followed by the declared port, as in `18081 (18080)`. With `--json` the
+    lab carries the same as its `forwards` list, one object per forward with
+    `machine`, `segment`, `host_port`, `guest`, `guest_port`, `proto` and
+    `auto`, plus `declared_port` on a shifted forward only. To read one
+    forward's port from a script, use [vmlab port](cmd_port). An automatic
+    port stays the same across machine restarts while the lab daemon runs,
+    and may change after a full [vmlab down](cmd_down) and `up`. See
     [Automatic host ports](ref_lab).
   DOC
 
@@ -216,6 +220,9 @@ SRC
 
   p "Read an automatic port from a script:"
   code sh { source = "vmlab status --json | jq '.forwards[] | select(.machine == \"dc01\" and .auto) | .host_port'" }
+
+  p "The same for one guest port, without `jq`:"
+  code sh { source = "vmlab port dc01 80" }
 
   p "Check which render server a Venus VM's QEMU was started with:"
   code sh { source = "vmlab status --json | jq '.machines[] | select(.name == \"gl01\") | .qemu_env'" }
