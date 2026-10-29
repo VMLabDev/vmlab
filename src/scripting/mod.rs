@@ -2,8 +2,10 @@
 //! lab/VM/segment handles to provision scripts, event handlers, and ad-hoc
 //! runs. Scripts are daemon-unaware; the wscript VM is synchronous, so scripts
 //! execute on blocking threads and host methods bridge into the lab
-//! daemon's tokio runtime via `Handle::block_on`.
+//! daemon's tokio runtime via `Handle::block_on` (through [`cancel`], so a
+//! provision `up` abandons stops at its next host call).
 
+mod cancel;
 pub mod record;
 mod runner;
 mod surface;
@@ -24,6 +26,7 @@ use crate::labd::vm::PowerState;
 use crate::labd::vm_agent::Logon;
 use crate::vision;
 
+pub use cancel::ScriptCancelled;
 pub use runner::{OutputSink, ScriptOwner, run_event_handler, run_script_file, run_script_source};
 pub(crate) use surface::{
     EmbeddedWscript, WSCRIPT_SURFACE_VERSION, WscriptSurfaceVersion,
@@ -312,7 +315,7 @@ impl MachineHandle {
     where
         F: std::future::Future<Output = T>,
     {
-        self.rt.block_on(fut)
+        cancel::block_on(&self.rt, fut)
     }
 
     fn name(&self) -> &str {
@@ -536,7 +539,7 @@ impl MachineHandle {
                     self.name()
                 ));
             }
-            std::thread::sleep(Duration::from_millis(interval_ms.max(50) as u64));
+            cancel::sleep(Duration::from_millis(interval_ms.max(50) as u64));
         }
     }
 }
@@ -570,7 +573,7 @@ pub fn lab_module() -> Module {
     m.doc("vmlab lab/VM/segment API (PRD §10)");
 
     m.fn_("sleep_ms", |ms: i64| {
-        std::thread::sleep(Duration::from_millis(ms.max(0) as u64));
+        cancel::sleep(Duration::from_millis(ms.max(0) as u64));
     });
 
     // Host environment variable, or "" when unset. Lets build/provision
@@ -652,7 +655,7 @@ pub fn lab_module() -> Module {
         .method(
             "usb_devices",
             |l: &LabHandle| -> Result<Vec<ScriptUsbDevice>, String> {
-                let listed = l.rt.block_on(l.runtime.usb_devices()).map_err(estr)?;
+                let listed = cancel::block_on(&l.rt, l.runtime.usb_devices()).map_err(estr)?;
                 Ok(listed
                     .into_iter()
                     .map(|d| ScriptUsbDevice::of(d.device, d.attached_to))
@@ -669,9 +672,9 @@ pub fn lab_module() -> Module {
         .method(
             "segment",
             |l: &LabHandle, name: &str| -> Result<SegmentHandle, String> {
-                let exists = l
-                    .rt
-                    .block_on(async { l.runtime.network.lock().await.segments.contains_key(name) });
+                let exists = cancel::block_on(&l.rt, async {
+                    l.runtime.network.lock().await.segments.contains_key(name)
+                });
                 if !exists {
                     return Err(format!(
                         "no segment \"{name}\" in lab \"{}\"",
@@ -1102,7 +1105,7 @@ pub fn lab_module() -> Module {
                             h.name()
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(1000));
+                    cancel::sleep(Duration::from_millis(1000));
                 }
             },
         )

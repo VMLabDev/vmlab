@@ -62,8 +62,7 @@ impl TerminalHandle {
         let Some(session) = st.session.as_ref() else {
             return Err(format!("{}: terminal session is closed", self.machine));
         };
-        self.rt
-            .block_on(session.send(text.as_bytes()))
+        super::cancel::block_on(&self.rt, session.send(text.as_bytes()))
             .map_err(|e| format!("{e:#}"))
     }
 
@@ -121,12 +120,14 @@ impl TerminalHandle {
         let Some(session) = st.session.as_ref() else {
             return Err(format!("{}: terminal session is closed", self.machine));
         };
-        self.rt
-            .block_on(session.resize(
+        super::cancel::block_on(
+            &self.rt,
+            session.resize(
                 cols.clamp(2, u16::MAX as i64) as u16,
                 rows.clamp(2, u16::MAX as i64) as u16,
-            ))
-            .map_err(|e| format!("{e:#}"))
+            ),
+        )
+        .map_err(|e| format!("{e:#}"))
     }
 
     /// End the session (kills the shell). Also implied when the handle is
@@ -148,9 +149,9 @@ impl TerminalHandle {
         let mut remaining = wait;
         loop {
             let started = std::time::Instant::now();
-            let ev = self
-                .rt
-                .block_on(async { tokio::time::timeout(remaining, session.recv()).await });
+            let ev = super::cancel::block_on(&self.rt, async {
+                tokio::time::timeout(remaining, session.recv()).await
+            });
             match ev {
                 Err(_) => return, // quiet: nothing new within the window
                 Ok(None) => {

@@ -28,6 +28,7 @@ pub mod network;
 pub mod one_shot;
 pub mod plan;
 pub mod playbook;
+pub mod provisioning;
 pub mod pull_ledger;
 pub mod record;
 pub mod share_plan;

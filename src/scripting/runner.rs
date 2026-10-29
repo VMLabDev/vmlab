@@ -27,14 +27,25 @@ pub struct ScriptOwner {
     /// before the VM is allowed to reach full readiness — so `is_ready` /
     /// `wait_ready` on it mean agent-level readiness instead.
     pub first_boot: bool,
+    /// Cancels the run at its next host call — `up` hands each provision one,
+    /// so the first failed step stops the others (§7.2). See
+    /// [`super::cancel`].
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ScriptOwner {
+    /// The same owner, its run cancelled when `token` is.
+    pub fn cancelled_by(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
     /// A machine-scoped `provision {}` block: the VM is fully up already.
     pub fn provision(vm: impl Into<String>) -> Self {
         Self {
             vm: vm.into(),
             first_boot: false,
+            cancel: None,
         }
     }
 
@@ -43,6 +54,7 @@ impl ScriptOwner {
         Self {
             vm: vm.into(),
             first_boot: true,
+            cancel: None,
         }
     }
 }
@@ -52,7 +64,7 @@ impl SegmentHandle {
         &self,
         f: impl FnOnce(&mut crate::net::dns::DnsZone) -> T,
     ) -> Result<T, String> {
-        self.rt.block_on(async {
+        super::cancel::block_on(&self.rt, async {
             let net = self.runtime.network.lock().await;
             let seg = net
                 .segments
@@ -118,7 +130,9 @@ pub async fn run_script_source(
     // script's own.
     let run = run.unwrap_or_else(|| runtime.recordings.new_run());
     let finalise_on = runtime.clone();
+    let token = owner.as_ref().and_then(|o| o.cancel.clone());
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let _entered = super::cancel::enter(token);
         let ctx = super::context();
         let unit = ctx
             .compile(&source)
@@ -136,10 +150,18 @@ pub async fn run_script_source(
             .map_err(|e| anyhow!("{name}: {}", run_error(e)))
     })
     .await
-    .map_err(|e| anyhow!("script thread panicked: {e}"));
+    .map_err(|e| match e.try_into_panic() {
+        Ok(payload) if payload.is::<super::cancel::Cancelled>() => {
+            anyhow::Error::new(super::cancel::ScriptCancelled)
+        }
+        Ok(_) => anyhow!("script thread panicked"),
+        Err(e) => anyhow!("script thread panicked: {e}"),
+    });
     // Whatever the script recorded and did not stop is finalised here, on
     // success and on failure alike (D7).
     finalise_on.record_finalise_run(run).await;
+    // A cancelled run says nothing here: the step that failed first says
+    // why, and this one only stopped.
     let result = result?;
     if let Err(e) = &result {
         out_err(format!("script failed: {e:#}\n"));
@@ -245,7 +267,7 @@ impl SegmentHandle {
         &self,
         f: impl FnOnce(&Arc<crate::labd::netservices::SegmentServices>) -> Result<T, String>,
     ) -> Result<T, String> {
-        self.rt.block_on(async {
+        super::cancel::block_on(&self.rt, async {
             let net = self.runtime.network.lock().await;
             let seg = net
                 .segments
@@ -327,7 +349,7 @@ impl SegmentHandle {
         let guest_port =
             u16::try_from(guest_port).map_err(|_| "guest_port out of range".to_string())?;
         // Resolve the target VM's leased IP on this segment.
-        let guest_ip = self.rt.block_on(async {
+        let guest_ip = super::cancel::block_on(&self.rt, async {
             self.runtime
                 .machine(vm)
                 .map_err(|e| format!("{e:#}"))?
@@ -392,7 +414,7 @@ impl SegmentHandle {
     /// Connect (`enable`) or disconnect this segment and `other` for daemon
     /// inter-segment routing (§9.6): both ways, lab-local segments only.
     pub(crate) fn route_to(&self, other: &str, enable: bool) -> Result<(), String> {
-        self.rt.block_on(async {
+        super::cancel::block_on(&self.rt, async {
             let net = self.runtime.network.lock().await;
             net.set_route(&self.segment, other, enable)
         })
