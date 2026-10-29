@@ -24,7 +24,9 @@ lab "ad-lab" {
     memory   = 8GiB
     nic { segment = "corp" ip = "10.50.0.10" }
 
-    // Runs once dc01 is ready; anything depending on dc01 waits for it.
+    // Runs once dc01 is ready. `depends_on` does not wait for it; a machine
+    // whose own provisions needed the DC promoted would name dc01 in
+    // `depends_on_provision`.
     provision "scripts/setup.ws" { }
   }
 

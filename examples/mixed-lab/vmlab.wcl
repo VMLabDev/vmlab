@@ -41,7 +41,8 @@ lab "mixed-lab" {
       guest = "S:"
     }  # auto-mounted when ready
 
-    # Runs once winsrv is ready; nix01 depends on it, so it waits.
+    # Runs once winsrv is ready. nix01 starts as soon as winsrv is ready
+    # (`depends_on` is start order), so this script can wait for nix01 too.
     provision "scripts/setup.ws" { }
   }
   # ANCHOR_END: vm-winsrv

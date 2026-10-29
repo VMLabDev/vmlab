@@ -98,11 +98,15 @@ boundary and snapshots like a VM does.
 ## Setting guests up
 
 Setup steps are declared **inside** the machine they configure and applied in
-declaration order on `vmlab up`:
+declaration order on `vmlab up`. Different machines provision in parallel;
+`depends_on` orders only when they start, and `depends_on_provision` holds a
+machine's steps until the machines it names have finished theirs — here, until
+the domain controller exists to join:
 
 ```wcl
 vm "srv01" {
-  template = "x86_64/windows-server-2025"
+  template             = "x86_64/windows-server-2025"
+  depends_on_provision = ["dc01"]   # join only once dc01 is promoted
   nic { segment = "corp" }
 
   playbook "playbooks/domain" {                # declarative (config-weave)
