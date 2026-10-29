@@ -2219,7 +2219,9 @@ impl LabRuntime {
         self.run_up_steps(&steps, &mut next_step, &done, &mounts, &output)
             .await?;
 
-        self.install_forwards(&targets).await;
+        for line in self.install_forwards(&targets).await {
+            output(format!("{line}\n"));
+        }
 
         // After provisioning, and only now: the syncer writes as the
         // machine's default login, which the provisioning is what creates
@@ -2256,7 +2258,10 @@ impl LabRuntime {
     /// removed before re-installing, so a forward never points at a stale IP.
     /// Best-effort — a forward that cannot be installed is announced on the
     /// event feed and the rest of the lab still works.
-    async fn install_forwards(self: &Arc<Self>, scope: &[String]) {
+    ///
+    /// Returns a line for each forward a frozen family's port slot bound off
+    /// its declared port (§21.7), for `up` to print.
+    async fn install_forwards(self: &Arc<Self>, scope: &[String]) -> Vec<String> {
         let observed = self.forward_observations(scope).await;
         let plan = forward_plan::plan(
             &forward_plan::ForwardInputs {
@@ -2275,11 +2280,12 @@ impl LabRuntime {
                 .push(rule);
         }
         if installable.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let net = self.network.lock().await;
         let mut tracked = self.machine_forwards.lock().await;
+        let mut shifted = Vec::new();
         for (machine, rules) in installable {
             // Drop this machine's forwards from a previous run/lease. Their
             // listeners are closed by the time `remove_forward` returns, so
@@ -2294,28 +2300,68 @@ impl LabRuntime {
                     s.remove_forward(old.id).await;
                 }
             }
-            let candidates = forward_plan::bind_candidates(&previous, &rules);
+            // In a frozen family a fixed port is shifted by the lab's port
+            // slot (§21.7), chosen and recorded under the family record's
+            // lock, which is held until this machine's binds are done.
+            let mut family = match self.family_ports(&rules) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("\"{machine}\": {e:#}");
+                    self.events.emit(
+                        "forward.skipped",
+                        json!({"what": format!("\"{machine}\": forwards"), "reason": format!("{e:#}")}),
+                    );
+                    continue;
+                }
+            };
+            let bind = super::isolation::forward_bind(self.isolation.as_ref());
+            let mut is_free = |port, proto| crate::freeze::ports::host_free(bind, port, proto);
+            let candidates = {
+                let mut fam =
+                    family
+                        .as_mut()
+                        .map(|(_, ports, worktree, slot)| forward_plan::FamilyBind {
+                            ports,
+                            worktree: worktree.clone(),
+                            slot: *slot,
+                            is_free: &mut is_free,
+                        });
+                forward_plan::bind_candidates(&previous, &rules, fam.as_mut())
+            };
             let mut installed = Vec::new();
             for (rule, ports) in rules.into_iter().zip(candidates) {
                 let what = format!("\"{machine}\": {}", rule.source.describe());
-                match self.install_forward(&net, rule, &ports).await {
+                let bound = match ports {
+                    Ok(ports) => self.install_forward(&net, rule, &ports).await,
+                    Err(e) => Err(e),
+                };
+                match bound {
                     Ok((id, host_port)) => {
-                        installed.push(InstalledForward {
+                        let forward = InstalledForward {
                             key: rule.key(),
                             id,
                             host_port,
                             auto: rule.host.is_auto(),
+                            declared: rule.declared_port(),
                             guest_ip: rule.guest_ip,
-                        });
+                        };
+                        if let Some(declared) = forward.shifted_from() {
+                            shifted.push(format!(
+                                "{what} declared on host port {declared} is bound on {host_port} \
+                                 (worktree port slot, PRD §21.7)"
+                            ));
+                        }
                         self.events.emit(
                             "forward.installed",
                             json!({
                                 "what": what,
                                 "host_port": host_port,
                                 "auto": rule.host.is_auto(),
+                                "declared_port": forward.shifted_from(),
                                 "guest": format!("{}:{}", rule.guest_ip, rule.guest_port),
                             }),
                         );
+                        installed.push(forward);
                     }
                     Err(e) => {
                         tracing::warn!("{what}: {e}");
@@ -2324,8 +2370,43 @@ impl LabRuntime {
                     }
                 }
             }
+            if let Some((locked, ports, _, _)) = family
+                && let Err(e) = locked.save(&ports)
+            {
+                tracing::warn!("\"{machine}\": recording its ports: {e:#}");
+            }
             tracked.insert(machine.to_string(), installed);
         }
+        shifted
+    }
+
+    /// The frozen family's port record, locked and loaded, with this lab's
+    /// name in it and its slot (allocated now if it has none), when the lab
+    /// is in a family and `rules` hold a fixed port (§21.7). `None` outside
+    /// a family, or when every rule is automatic.
+    #[allow(clippy::type_complexity)]
+    fn family_ports(
+        &self,
+        rules: &[&ForwardRule],
+    ) -> Result<
+        Option<(
+            crate::freeze::ports::Locked,
+            crate::freeze::ports::FamilyPorts,
+            Option<String>,
+            u16,
+        )>,
+    > {
+        let Some(isolation) = &self.isolation else {
+            return Ok(None);
+        };
+        if rules.iter().all(|r| r.host.is_auto()) {
+            return Ok(None);
+        }
+        let mut locked = crate::freeze::ports::lock(&isolation.family_local)?;
+        let mut ports = locked.load()?;
+        let worktree = isolation.port_owner().map(str::to_string);
+        let slot = ports.slot(worktree.as_deref());
+        Ok(Some((locked, ports, worktree, slot)))
     }
 
     /// Run configuration steps (provision scripts and playbook applies —
@@ -2556,6 +2637,8 @@ impl LabRuntime {
         // Removes clones, container overlays, AND named volumes — destroy is
         // the lab-scoped volume lifecycle boundary (PRD §12).
         remove_tree(&self.lab_local).await?;
+        // A worktree lab gives its port slot back to the family (§21.7).
+        crate::freeze::ports::release_worktree(&self.root)?;
         // Each machine's run dir, asked for rather than guessed at: the lab's
         // runtime dir also holds the daemon's own control socket, so it is not
         // ours to remove wholesale.
@@ -2904,7 +2987,7 @@ impl LabRuntime {
                 .to_string(),
                 auto: f.auto,
                 guest_port: f.key.guest_port,
-                declared_port: None,
+                declared_port: f.shifted_from(),
             })
             .collect()
     }

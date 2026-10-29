@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -54,6 +54,9 @@ pub struct IsolationPlan {
     /// Declared rules isolation will defeat, said once at lab start: a
     /// `redirect {}` onto a host address is a NAT flow like any other.
     pub warnings: Vec<String>,
+    /// The main checkout's working data, which holds the family's port
+    /// record (`worktree-ports.json`, §21.7).
+    pub family_local: PathBuf,
 }
 
 /// The plan for `lab` at `root`, or `None` when no freeze applies to it.
@@ -62,13 +65,23 @@ pub fn decide(root: &Path, lab: &Lab) -> Result<Option<IsolationPlan>> {
         return Ok(None);
     };
     let worktree = crate::instance::worktree_name(root);
-    Ok(Some(plan(lab, &family, worktree.as_deref())))
+    let family_local = match &family {
+        Family::Worktree { main_lab_local, .. } => main_lab_local.clone(),
+        Family::FrozenMain { .. } => crate::paths::lab_local_dir(root),
+    };
+    Ok(Some(plan(lab, &family, worktree.as_deref(), family_local)))
 }
 
 /// The plan for `lab` in `family`. `worktree` is the linked worktree's name
 /// ([`crate::instance::worktree_name`]); a worktree lab without one, which
 /// [`Family::of`] does not produce, falls back to the lab's own name.
-pub fn plan(lab: &Lab, family: &Family, worktree: Option<&str>) -> IsolationPlan {
+/// `family_local` is the main checkout's working data.
+pub fn plan(
+    lab: &Lab,
+    family: &Family,
+    worktree: Option<&str>,
+    family_local: PathBuf,
+) -> IsolationPlan {
     let config = family.config();
     let role = match family {
         Family::FrozenMain { .. } => Role::Main,
@@ -107,6 +120,7 @@ pub fn plan(lab: &Lab, family: &Family, worktree: Option<&str>) -> IsolationPlan
         globals,
         refused_peers,
         warnings,
+        family_local,
     }
 }
 
@@ -127,6 +141,15 @@ pub fn forward_bind(plan: Option<&IsolationPlan>) -> Ipv4Addr {
 }
 
 impl IsolationPlan {
+    /// The lab's name in the family's port record: its worktree's, `None`
+    /// for the main lab (slot 0).
+    pub fn port_owner(&self) -> Option<&str> {
+        match &self.role {
+            Role::Main => None,
+            Role::Worktree { name } => Some(name),
+        }
+    }
+
     /// The name the supervisor knows the global segment `segment` by.
     pub fn global_name(&self, segment: &str) -> String {
         self.globals
@@ -242,7 +265,7 @@ lab "l" {
 
     #[test]
     fn the_main_lab_keeps_its_global_names_and_binds_loopback() {
-        let p = plan(&globals_lab(), &main(), None);
+        let p = plan(&globals_lab(), &main(), None, "/src/main/.vmlab".into());
         assert_eq!(p.role, Role::Main);
         assert_eq!(forward_bind(Some(&p)), Ipv4Addr::LOCALHOST);
         assert_eq!(p.global_name("shared"), "shared");
@@ -256,7 +279,12 @@ lab "l" {
     /// two lab files of the worktree meet there and nobody else does.
     #[test]
     fn a_worktree_lab_joins_its_globals_by_worktree() {
-        let p = plan(&globals_lab(), &worktree(), Some("feat-x"));
+        let p = plan(
+            &globals_lab(),
+            &worktree(),
+            Some("feat-x"),
+            "/src/main/.vmlab".into(),
+        );
         assert_eq!(
             p.role,
             Role::Worktree {
@@ -267,6 +295,7 @@ lab "l" {
         assert_eq!(p.global_name("corp"), "corp@feat-x");
         assert_eq!(forward_bind(Some(&p)), Ipv4Addr::LOCALHOST);
         assert_eq!(p.refusal(), None);
+        assert_eq!(p.port_owner(), Some("feat-x"));
     }
 
     #[test]
@@ -278,13 +307,16 @@ lab "l" {
   segment "corp" { global = true }
 }"#,
         );
-        let p = plan(&lab, &worktree(), Some("feat-x"));
+        let p = plan(&lab, &worktree(), Some("feat-x"), "/src/main/.vmlab".into());
         assert_eq!(p.refused_peers, vec!["shared".to_string()]);
         let why = p.refusal().expect("refused");
         assert!(why.contains("\"shared\""), "{why}");
         assert!(why.contains("§21.4"), "{why}");
         // The frozen main lab keeps its peer.
-        assert_eq!(plan(&lab, &main(), None).refusal(), None);
+        assert_eq!(
+            plan(&lab, &main(), None, "/src/main/.vmlab".into()).refusal(),
+            None
+        );
     }
 
     #[test]
@@ -298,14 +330,20 @@ lab "l" {
   }
 }"#,
         );
-        let p = plan(&lab, &main(), None);
+        let p = plan(&lab, &main(), None, "/src/main/.vmlab".into());
         assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
         assert!(p.warnings[0].contains("127.0.0.1"), "{:?}", p.warnings);
     }
 
     #[test]
     fn the_status_projection_names_the_worktree_and_its_globals() {
-        let s = plan(&globals_lab(), &worktree(), Some("feat-x")).status();
+        let s = plan(
+            &globals_lab(),
+            &worktree(),
+            Some("feat-x"),
+            "/src/main/.vmlab".into(),
+        )
+        .status();
         assert_eq!(s.role, "worktree");
         assert_eq!(s.worktree.as_deref(), Some("feat-x"));
         assert_eq!(s.forward_bind, "127.0.0.1");
@@ -327,5 +365,7 @@ lab "l" {
             .unwrap();
         let p = decide(tmp.path(), &lab).unwrap().expect("frozen main");
         assert_eq!(p.role, Role::Main);
+        assert_eq!(p.port_owner(), None, "slot 0");
+        assert_eq!(p.family_local, crate::paths::lab_local_dir(tmp.path()));
     }
 }

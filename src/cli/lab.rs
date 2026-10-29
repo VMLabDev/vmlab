@@ -408,8 +408,11 @@ pub fn cmd_destroy() -> Result<()> {
                 refuse_destroy_under_freeze(&root).await?;
                 std::fs::remove_dir_all(&lab_local)
                     .with_context(|| format!("removing {}", lab_local.display()))?;
+                crate::freeze::ports::release_worktree(&root)?;
             }
-            None => {}
+            // Nothing materialised, but a worktree lab may still hold a port
+            // slot (§21.7).
+            None => crate::freeze::ports::release_worktree(&root)?,
         }
         // Reap the lab daemon.
         if let Ok(sup) = daemon::ensure_supervisor().await {
@@ -662,12 +665,13 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
     // here (§9.8): the lab file left it out, and it is what a second lab
     // instance of the same file is told to use instead of a fixed port.
     if !status.forwards.is_empty() {
-        let host = |f: &crate::status::ForwardStatus| {
-            if f.auto {
-                format!("{} (auto)", f.host_port)
-            } else {
-                f.host_port.to_string()
-            }
+        // A frozen family's port slot may have bound a fixed port off its
+        // declared one (§21.7): the declared port follows in brackets, where
+        // an automatic one says `(auto)`.
+        let host = |f: &crate::status::ForwardStatus| match (f.auto, f.declared_port) {
+            (true, _) => format!("{} (auto)", f.host_port),
+            (false, Some(declared)) => format!("{} ({declared})", f.host_port),
+            (false, None) => f.host_port.to_string(),
         };
         let name_w = column_width("FORWARD", status.forwards.iter().map(|f| f.machine.len()));
         let host_w = column_width("HOST", status.forwards.iter().map(|f| host(f).len()));
@@ -1163,6 +1167,8 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
                         std::fs::remove_dir_all(&lab_local)
                             .with_context(|| format!("removing {}", lab_local.display()))?;
                     }
+                    // A worktree lab's port slot goes back to the family (§21.7).
+                    crate::freeze::ports::release_worktree(root)?;
                 }
                 None => bail!("lab \"{name}\" is not running"),
             },
@@ -2503,6 +2509,29 @@ mod tests {
         );
         assert!(
             out.contains("web     41234 (auto) 10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
+    }
+
+    /// A forward a worktree's port slot shifted shows its declared port in
+    /// brackets, where an automatic one says `(auto)` (§21.7).
+    #[test]
+    fn the_status_table_marks_a_shifted_port_with_the_declared_one() {
+        use crate::status::ForwardStatus;
+        let mut status = lab(vec![addressed("web", PowerState::Running, true, vm())]);
+        status.forwards = vec![ForwardStatus {
+            machine: "web".into(),
+            segment: "lan".into(),
+            host_port: 8081,
+            guest: "10.0.0.5:80".into(),
+            proto: "tcp".into(),
+            auto: false,
+            guest_port: 80,
+            declared_port: Some(8080),
+        }];
+        let out = render_status(&status, false);
+        assert!(
+            out.contains("web     8081 (8080) 10.0.0.5:80 tcp"),
             "got:\n{out}"
         );
     }

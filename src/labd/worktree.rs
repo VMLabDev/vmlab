@@ -16,12 +16,14 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use super::forward_plan;
 use super::lab::LabRuntime;
 use super::machine::Machine;
 use super::state::LabState;
 use super::vm::PowerState;
 use crate::freeze::inspect::{self, disk_facts};
 use crate::freeze::plan::{self, CARRIED, FreezeInput, FreezeMachine, ThawDisk, ThawInput};
+use crate::freeze::ports;
 use crate::freeze::steps::{execute, rolled_back};
 use crate::freeze::{self as fz, WorktreeConfig};
 use crate::proto::CommandError;
@@ -112,16 +114,31 @@ impl LabRuntime {
 
         // The records, then `worktree.json` last: its presence is what makes
         // the family frozen, so it appears only once everything under it is.
+        // The main lab's declared fixed ports go into the family's port
+        // record as slot 0's before it (§21.7), so a worktree lab never
+        // takes one while the main lab is down; a failure puts back the
+        // main lab's records as they were and leaves the worktrees' alone.
         let config = WorktreeConfig {
             generation,
             snapshot: snapshot.to_string(),
         };
+        let declared = ports::main_declared(forward_plan::declared_fixed(&self.config.lab));
+        let mut main_ports = None;
         let committed = marked
             .save(&self.lab_local)
+            .and_then(|()| {
+                ports::update(&self.lab_local, |f| {
+                    main_ports = Some(f.main_records());
+                    f.replace_main(declared);
+                })
+            })
             .and_then(|()| config.save(&self.lab_local));
         if let Err(e) = committed {
             let failed = applied.rollback().await;
             let _ = state.save(&self.lab_local);
+            if let Some(records) = main_ports {
+                let _ = ports::restore_main(&self.lab_local, records);
+            }
             let _ = match &previous {
                 Some(p) => p.save(&self.lab_local),
                 None => WorktreeConfig::remove(&self.lab_local),
@@ -216,6 +233,10 @@ impl LabRuntime {
         *state = thawed;
         let mut warnings = Vec::new();
         if let Err(e) = WorktreeConfig::remove(&self.lab_local) {
+            warnings.push(format!("{e:#}"));
+        }
+        // Outside a family nothing shifts a port (§21.7).
+        if let Err(e) = ports::remove(&self.lab_local) {
             warnings.push(format!("{e:#}"));
         }
         warnings.extend(applied.finish().await);

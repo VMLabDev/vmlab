@@ -13,7 +13,39 @@ from scenarios.network import curl, gsh, host_ip, resolve, start_host_http
 
 LAB = "worktree-isolation"
 MAIN_MARKER = "e2e-main-lab-marker"
+WT_MARKER = "e2e-worktree-lab-marker"
 HOST_PORT = 9003
+# The lab file's fixed forward: the main lab binds it, the worktree lab (port
+# slot 1) the one above it (§21.7).
+FIXED_PORT = 9080
+
+
+def serve(h, lab, marker: str):
+    """A web server in the lab's `web` guest on :8080, serving `marker` at /m."""
+    gsh(
+        h,
+        lab,
+        "web",
+        f"mkdir -p /tmp/www && echo {marker} > /tmp/www/m && "
+        "setsid nohup python3 -m http.server 8080 --directory /tmp/www >/dev/null 2>&1 </dev/null &",
+    )
+
+
+def fixed_forward(st: dict) -> dict:
+    """The status entry of the lab's fixed forward, or {}."""
+    return next((f for f in st.get("forwards", []) if not f.get("auto")), {})
+
+
+def answers(h, port: int, marker: str) -> bool:
+    try:
+        h.wait_until(
+            lambda: marker in curl(h, f"http://127.0.0.1:{port}/m"),
+            timeout=60,
+            what=f"{marker} on 127.0.0.1:{port}",
+        )
+        return True
+    except ScenarioFailed:
+        return False
 
 
 def status(h, lab) -> dict:
@@ -59,17 +91,11 @@ def scenario(h, main, wt):
     h.vmlab("worktree", "freeze", "base", cwd=main, timeout=600)
     h.vmlab("up", cwd=main, timeout=600)
     h.wait_ready(main, "web")
-    gsh(
-        h,
-        main,
-        "web",
-        f"mkdir -p /tmp/www && echo {MAIN_MARKER} > /tmp/www/m && "
-        "setsid nohup python3 -m http.server 8080 --directory /tmp/www >/dev/null 2>&1 </dev/null &",
-    )
+    serve(h, main, MAIN_MARKER)
 
     # The worktree lab, cloned from the freeze.
     git(h, main, "worktree", "add", "-q", "-b", "wt", str(wt))
-    h.vmlab("up", cwd=wt, timeout=600)
+    wt_up = h.vmlab("up", cwd=wt, timeout=600).text
     h.wait_ready(wt, "web")
 
     main_st, wt_st = status(h, main), status(h, wt)
@@ -86,7 +112,7 @@ def scenario(h, main, wt):
 
     # -- forwards bind loopback ------------------------------------------
     host = host_ip()
-    forwards = [f for f in main_st.get("forwards", []) if f.get("machine") == "web"]
+    forwards = [f for f in main_st.get("forwards", []) if f.get("machine") == "web" and f.get("auto")]
     port = forwards[0]["host_port"] if forwards else 0
     try:
         h.wait_until(
@@ -144,6 +170,40 @@ def scenario(h, main, wt):
         and other is None,
         f"worktree joins {joined}, main joins {main_joined}; on the worktree's segment "
         f"its own web -> {own}, the main lab's web -> {other}",
+    )
+
+    # -- a fixed port is shifted by the worktree's port slot (§21.7) ---------
+    serve(h, wt, WT_MARKER)
+    main_fixed, wt_fixed = fixed_forward(status(h, main)), fixed_forward(status(h, wt))
+    wt_text = h.vmlab("status", cwd=wt, check=False).out
+    shifted = FIXED_PORT + 1
+    main_answers = answers(h, FIXED_PORT, MAIN_MARKER)
+    wt_answers = answers(h, shifted, WT_MARKER)
+    h.ok(
+        "worktree.ports.shift",
+        main_fixed.get("host_port") == FIXED_PORT
+        and "declared_port" not in main_fixed
+        and wt_fixed.get("host_port") == shifted
+        and wt_fixed.get("declared_port") == FIXED_PORT
+        and f"{shifted} ({FIXED_PORT})" in wt_text
+        and f"host port {FIXED_PORT} is bound on {shifted}" in wt_up
+        and main_answers
+        and wt_answers,
+        f"main forward {main_fixed}; worktree forward {wt_fixed}; 127.0.0.1:{FIXED_PORT} "
+        f"answered main={main_answers}, 127.0.0.1:{shifted} answered worktree={wt_answers}; "
+        f"up said: {[l for l in wt_up.splitlines() if 'PRD §21.7' in l]}",
+    )
+
+    h.vmlab("down", cwd=wt, timeout=300)
+    again_up = h.vmlab("up", cwd=wt, timeout=600).text
+    h.wait_ready(wt, "web")
+    again = fixed_forward(status(h, wt))
+    h.ok(
+        "worktree.ports.stable",
+        again.get("host_port") == shifted
+        and again.get("declared_port") == FIXED_PORT
+        and f"is bound on {shifted}" in again_up,
+        f"after down/up the worktree forward is {again}",
     )
 
     h.vmlab("destroy", cwd=wt, timeout=300)
