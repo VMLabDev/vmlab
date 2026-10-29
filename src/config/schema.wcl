@@ -250,8 +250,10 @@ type Vm {
   cdrom: utf8?
   @doc("Path to a floppy image to attach (relative to lab root)")
   floppy: utf8?
-  @doc("VM names to wait for before this one (no cycles)")
+  @doc("VM/container names this one starts after, once each is ready — start order only, never their provisioning (no cycles)")
   depends_on: list<utf8>?
+  @doc("VM/container names whose provision and playbook steps all finish before this one's first step; does not delay its start (no cycles)")
+  depends_on_provision: list<utf8>?
   @doc("Expose hardware virtualisation (VMX/SVM) to the guest; masked without it")
   nested: bool?
   @doc("Open a VNC viewer on `up`; the VM always runs headless")
@@ -368,8 +370,10 @@ type Container {
   @range(1) cpus: i64?
   @doc("RAM for the micro-VM, e.g. `512MiB`; inherited from `profile` if omitted — one of the two must supply it")
   memory: std.ByteSize?
-  @doc("VM/container names to wait for before this one (no cycles)")
+  @doc("VM/container names this one starts after, once each is ready — start order only, never their provisioning (no cycles)")
   depends_on: list<utf8>?
+  @doc("VM/container names whose provision and playbook steps all finish before this one's first step; does not delay its start (no cycles)")
+  depends_on_provision: list<utf8>?
   @doc("Network interfaces; none = air-gapped (exec/copy still work via the agent)")
   @children("nic")      nics: list<Nic>
   @doc("Environment variables passed to the container process")

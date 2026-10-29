@@ -80,6 +80,15 @@ impl<'a> MachineCfg<'a> {
         }
     }
 
+    /// The machines whose configuration steps must all finish before this
+    /// one's first step (§7.2).
+    pub fn depends_on_provision(&self) -> &'a [String] {
+        match self {
+            MachineCfg::Vm(v) => &v.depends_on_provision,
+            MachineCfg::Container(c) => &c.depends_on_provision,
+        }
+    }
+
     pub fn provisions(&self) -> &'a [Provision] {
         match self {
             MachineCfg::Vm(v) => &v.provisions,
@@ -439,7 +448,11 @@ pub struct Vm {
     pub disk: Option<u64>,
     pub cdrom: Option<PathBuf>,
     pub floppy: Option<PathBuf>,
+    /// Start order: machines that must be ready before this one starts (§7.2).
     pub depends_on: Vec<String>,
+    /// Provisioning order: machines whose steps finish before this one's
+    /// first step (§7.2).
+    pub depends_on_provision: Vec<String>,
     pub nested: bool,
     /// Open a VNC viewer on `up` (§11); None = inherit the lab default.
     pub gui: Option<bool>,
@@ -749,8 +762,11 @@ pub struct Container {
     pub cpus: Option<u32>,
     /// Micro-VM RAM in bytes; falls back to the profile.
     pub memory: Option<u64>,
-    /// VM or container names — the namespaces are unified.
+    /// VM or container names — the namespaces are unified. Start order
+    /// (§7.2).
     pub depends_on: Vec<String>,
+    /// Provisioning order (§7.2), over the same unified namespace.
+    pub depends_on_provision: Vec<String>,
     pub nics: Vec<Nic>,
     pub env: Vec<EnvVar>,
     pub volumes: Vec<Volume>,

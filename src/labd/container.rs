@@ -1515,6 +1515,7 @@ mod tests {
             cpus: None,
             memory: None,
             depends_on: vec![],
+            depends_on_provision: vec![],
             nics: vec![],
             env: vec![],
             volumes: vec![],
