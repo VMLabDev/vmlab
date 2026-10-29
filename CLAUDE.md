@@ -223,6 +223,10 @@ Module map under `src/`:
   check (§21.5).
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
+  `provisioning.rs` is §7.2's per-machine provisioning: each machine's steps
+  run in parallel once it is ready, gated by `depends_on_provision`, with
+  machine-prefixed output and the first failure cancelling the rest (wscript
+  provisions stop at their next host call through `scripting/cancel.rs`);
   `worktree.rs` runs freeze, thaw and freeze-point restore under the state
   lock (§21.1, §21.3), `freeze_clone.rs` plans and makes a worktree machine's
   clone from the freeze (§21.2), and `isolation.rs` decides worktree isolation

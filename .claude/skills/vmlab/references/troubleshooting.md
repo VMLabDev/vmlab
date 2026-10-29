@@ -73,7 +73,7 @@ no vmlab-agent answered on the agent channel
 agent did not open the channel in time
 ```
 
-A machine is *ready* when its agent answers on the `vmlab.agent.0` virtio-serial port. VMs get ten minutes, containers five. `vmlab up` waits for readiness only when a later wave depends on the machine, or a provision or share must run on it, so the first symptom is often `first-boot {name}: agent did not come up` from a provision rather than the timeout itself.
+A machine is *ready* when its agent answers on the `vmlab.agent.0` virtio-serial port. VMs get ten minutes, containers five. `vmlab up` waits for readiness only when a later wave depends on the machine, another machine names it in `depends_on_provision`, or a provision or share must run on it, so the first symptom is often `first-boot {name}: agent did not come up` from a provision rather than the timeout itself.
 
 Usual causes, in order of likelihood: the template was built without the agent, or with an agent from an older vmlab; the guest is still installing (a template build that has not finished); the guest is running under TCG and has not reached userspace yet; or the guest booted but its agent service failed. Open the display with `vmlab console <machine>` and look. `vmlab machine capabilities <machine>` prints `agent -` when the agent has not answered at all, and a feature list when it has.
 
