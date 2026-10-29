@@ -9,6 +9,7 @@ pub mod dev;
 pub mod lab;
 mod lab_move;
 pub mod machine;
+pub mod port;
 pub mod record;
 pub mod tty_attach;
 pub mod usb;
@@ -256,6 +257,23 @@ pub enum Command {
     },
     /// Print guest OS information, as reported by the guest agent, as JSON
     Osinfo { vm: String },
+    /// Print the host port a running machine's forward to a guest port is
+    /// bound on, and nothing else
+    ///
+    /// The bound port is what scripts need under a frozen family, where a
+    /// worktree lab's fixed ports are shifted, and for an automatic port
+    /// (PRD §21.7). `both` forwards match either protocol.
+    Port {
+        /// The machine, as `[lab/]machine`
+        machine: String,
+        /// `<guest-port>[/tcp|/udp]`; the suffix picks between a tcp and a
+        /// udp forward bound on different host ports
+        #[arg(value_name = "GUEST-PORT")]
+        guest_port: String,
+        /// Print the forward's status entry as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Tail or dump JSON-line logs for the lab or one VM
     Logs {
         /// [lab/][vm] (default: the cwd's lab)
@@ -827,6 +845,11 @@ pub fn run() -> ExitCode {
         Command::Tail { vm, path } => lab::cmd_tail(&vm, &path),
         Command::Eventlog { vm, filter } => lab::cmd_eventlog(&vm, filter.as_deref()),
         Command::Osinfo { vm } => lab::cmd_osinfo(&vm),
+        Command::Port {
+            machine,
+            guest_port,
+            json,
+        } => port::cmd_port(&machine, &guest_port, json),
         Command::Logs {
             target,
             follow,
