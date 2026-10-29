@@ -255,17 +255,19 @@ def reload_after_down(h, lab: pathlib.Path) -> None:
     applied = up.code == 0 and serial == "E2E-QEMU-ARGS-2" and "type=1,serial=E2E-QEMU-ARGS-2" in argv
 
     # Edited again while vm01 runs: a fresh daemon cannot adopt it, so `up`
-    # refuses by name and vm01 keeps what it booted with.
+    # refuses by name and vm01 keeps what it booted with. The `up vm01` above
+    # pulled vm03 in through vm01's depends_on_provision, so both are named.
     edit_lab(lab, "serial=E2E-QEMU-ARGS-2\"", "serial=E2E-QEMU-ARGS-3\"")
     busy = h.vmlab("up", "vm01", cwd=lab, timeout=120, check=False)
     refused = (
-        busy.code != 0 and "vm01 is still running" in busy.text and "vmlab down" in busy.text
+        busy.code != 0 and "vm01, vm03 are still running" in busy.text and "vmlab down" in busy.text
         and "type=1,serial=E2E-QEMU-ARGS-2" in qemu_argv("vm01")
     )
 
     # `vm stop` leaves the daemon up with nothing running, still holding the
     # file it loaded: `vm start` replaces it and boots the edit.
     h.vmlab("vm", "stop", "vm01", cwd=lab, check=False, timeout=180)
+    h.vmlab("vm", "stop", "vm03", cwd=lab, check=False, timeout=180)
     sv = h.vmlab("vm", "start", "vm01", cwd=lab, timeout=600, check=False)
     if sv.code == 0:
         h.wait_ready(lab, "vm01")
