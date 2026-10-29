@@ -47,7 +47,8 @@ have. Never call a variant a "snapshot" — that is a VM snapshot.
   holds a `variant "<name>" { … }` block per variant: `created`, `sha256`,
   `base_sha256`, optional `default`, `description`, `first_boot_script`,
   `wscript_surface`, `agent_version`, and hardware overrides (`profile`, `cpus`,
-  `memory`, `firmware`, `tpm`, `secure_boot`, `display`, `cpu_model`, `accel`).
+  `memory`, `firmware`, `tpm`, `secure_boot`, `secure_boot_keys`, `display`,
+  `cpu_model`, `accel`).
   A variant counts only when both its block and its overlay exist.
 - **Effective metadata**: the base's fields with the variant's in their place.
   Hardware resolution, first boot, the surface check and agent staleness all
@@ -82,11 +83,15 @@ template "windows-11" {
 
 - A `variant` block takes `default`, `description`, `first_boot`, the hardware
   overrides (`profile cpus memory display cpu_model accel firmware tpm
-  secure_boot`), `qemu_args` (replaces the template's), `gpu {}` (replaces the
-  template's; build VM only), `nic` (replaces the
+  secure_boot secure_boot_keys`), `qemu_args` (replaces the template's),
+  `gpu {}` (replaces the template's; build VM only), `nic` (replaces the
   template's when declared), `media`, and `provision`/`playbook` steps run in
   declaration order. Validation: legal unique names, not `base`; exactly one
   `default = true` unless there is only one variant.
+- A variant's `secure_boot_keys` is `microsoft` or `setup`. A variant carries no
+  VARS file of its own: the base's stored `OVMF_VARS.fd` (from
+  `secure_boot_vars`) is used unless the variant's `secure_boot_keys` names
+  another store.
 - `vmlab template build` seals the base, then builds each variant (default
   first, rest in file order): a linked overlay on the sealed base, booted on the
   variant's **effective** hardware (variant over the base's recorded metadata),
@@ -109,8 +114,9 @@ template "windows-11" {
   rebuilds just those variants onto the installed version. Refused while a
   clone is backed by a variant it would replace.
 - A layered `source "template" { from = … }` resolves as a build context: no `#`
-  seeds from the default variant, `#<v>` from that one, `#base` from the base
-  (and runs no first-boot script). Seeding flattens the chain.
+  seeds from the default variant, `#<v>` from that one, `#base` from the base.
+  The build boot runs the first-boot script of what was selected, and none for
+  `#base`. Seeding flattens the chain.
 
 ## The store
 
@@ -131,7 +137,8 @@ Verbs (flags in cli-template.md):
 
 - `vmlab template list` — show what is installed.
 - `vmlab template rm` — remove one version; refuses without `--force` when that
-  disk still backs a linked clone in some lab.
+  disk still backs a linked clone in some lab, or a worktree lab freeze's frozen
+  file backs onto it (worktrees.md).
 - `vmlab template clean` — prune superseded builds per family, keeping the
   newest by default; a dry run until you pass `--yes`.
 - `vmlab template build` — build a `template {}` block.
@@ -201,6 +208,10 @@ guest installs the agent itself, so no host channel is needed before the agent
 exists, and the build verifies the handshake before sealing. Clones never see
 this ISO. Set `agent = false` on the block to skip baking the agent, at the cost
 of a template that never reports ready.
+
+The build VM always runs with `prevent_sleep` on (vm.md). A build is unattended,
+and a guest that idles into ACPI S3 mid-install, as a Windows client edition does,
+would stall it exactly like a hang; the lab daemon wakes it the moment it sleeps.
 
 For an x86 guest the ISO also carries the legacy agent (host-profiles.md,
 `agent_transport = "isa-serial"`) under `legacy/nt`, `legacy/9x` and `legacy/dos`,
@@ -339,7 +350,7 @@ template "<name>" {
 | `tpm` | bool | from profile | Enable a TPM 2.0 device. |
 | `secure_boot` | bool | from profile | Enable secure boot; OVMF only. |
 | `secure_boot_keys` | utf8 | from profile, else `microsoft` | Key store for the build's secure boot: `microsoft` or `setup`. Recorded for clones. A variant may override it. |
-| `secure_boot_vars` | utf8 | none | Pre-enrolled UEFI VARS file (relative to the template root) the build boots with; stored beside the sealed disk as `OVMF_VARS.fd` so clones start from it. Exclusive with `secure_boot_keys`. |
+| `secure_boot_vars` | utf8 | none | Pre-enrolled UEFI VARS file (relative to the template root) the build boots with; stored beside the sealed disk as `OVMF_VARS.fd` and recorded as `secure_boot_keys = "vars"`, so clones start from it; carried by export, import, push and pull. Needs `secure_boot = true`; exclusive with `secure_boot_keys`. |
 | `nested` | bool | `false` | Enable nested virtualisation for the build VM. |
 | `gui` | bool | `false` | Watch the build VM in a VNC viewer. |
 | `qemu_args` | list<utf8> | none | Raw QEMU flags for the build VM. The escape hatch. |
@@ -423,6 +434,10 @@ The four kinds:
   the base: the build starts from that template's disk and its recorded
   hardware, runs more provisioning, and seals a new template. `from` must be a
   local store reference; a registry reference or `scratch` is rejected here.
+  On a source with variants, the build boot runs the first-boot script of what
+  `from` selected — the default variant's for no `#`, that variant's for
+  `#<variant>`, none for `#base` — and the selected disk and everything beneath
+  it are flattened into the working disk.
 - **`scratch`** — a blank disk of the template's declared `disk` size. The
   attached installer media and provision script do everything.
 

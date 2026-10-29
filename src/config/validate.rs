@@ -228,17 +228,17 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             &mut issues,
         );
 
-        for dep in &vm.depends_on {
-            if !machine_exists(lab, dep) {
-                issues.push(Issue::at(
-                    vm.span,
-                    format!(
-                        "vm \"{}\" depends_on undefined vm/container \"{dep}\"",
-                        vm.name
-                    ),
-                ));
-            }
-        }
+        check_machine_refs(
+            lab,
+            &format!("vm \"{}\"", vm.name),
+            &vm.name,
+            vm.span,
+            [
+                ("depends_on", &vm.depends_on),
+                ("depends_on_provision", &vm.depends_on_provision),
+            ],
+            &mut issues,
+        );
 
         // virtiofs is a vhost-user device, so it needs no guest networking. Every
         // other transport lands on SMB, which is reachable only over a segment
@@ -382,17 +382,17 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             &mut issues,
         );
 
-        for dep in &c.depends_on {
-            if !machine_exists(lab, dep) {
-                issues.push(Issue::at(
-                    c.span,
-                    format!(
-                        "container \"{}\" depends_on undefined vm/container \"{dep}\"",
-                        c.name
-                    ),
-                ));
-            }
-        }
+        check_machine_refs(
+            lab,
+            &format!("container \"{}\"", c.name),
+            &c.name,
+            c.span,
+            [
+                ("depends_on", &c.depends_on),
+                ("depends_on_provision", &c.depends_on_provision),
+            ],
+            &mut issues,
+        );
 
         if !c.ports.is_empty() && c.nics.is_empty() {
             issues.push(Issue::at(
@@ -440,7 +440,15 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         }
     }
 
-    check_dependency_cycles(lab, &mut issues);
+    // The two keys are separate graphs (§7.2): a loop that crosses them
+    // cannot deadlock, since starting a machine never waits for provisioning.
+    check_dependency_cycles(lab, "depends_on", |m| m.depends_on(), &mut issues);
+    check_dependency_cycles(
+        lab,
+        "depends_on_provision",
+        |m| m.depends_on_provision(),
+        &mut issues,
+    );
     check_dev_defaults(lab, &mut issues);
 
     // -- per-machine configuration steps ------------------------------------
@@ -1437,6 +1445,30 @@ fn machine_exists(lab: &Lab, name: &str) -> bool {
     lab.vms.iter().any(|v| v.name == name) || lab.containers.iter().any(|c| c.name == name)
 }
 
+/// Every entry of a machine's ordering keys (§7.2) names another declared
+/// machine. `who` is the block as the issue names it (`vm "a"`).
+fn check_machine_refs(
+    lab: &Lab,
+    who: &str,
+    name: &str,
+    span: Span,
+    keys: [(&str, &[String]); 2],
+    issues: &mut IssueList,
+) {
+    for (key, deps) in keys {
+        for dep in deps {
+            if dep == name {
+                issues.push(Issue::at(span, format!("{who} names itself in {key}")));
+            } else if !machine_exists(lab, dep) {
+                issues.push(Issue::at(
+                    span,
+                    format!("{who} {key} names undefined vm/container \"{dep}\""),
+                ));
+            }
+        }
+    }
+}
+
 fn check_nics(
     lab: &Lab,
     nics: &[Nic],
@@ -1596,7 +1628,15 @@ pub fn gateway_ip(net: ipnet::Ipv4Net) -> Ipv4Addr {
     Ipv4Addr::from(base + 1)
 }
 
-fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
+/// One ordering key's graph (§7.2) is acyclic. `key` names it in the issue;
+/// `edges` reads it off a machine. A machine naming itself is reported by
+/// [`check_machine_refs`] and skipped here, so it is not said twice.
+fn check_dependency_cycles(
+    lab: &Lab,
+    key: &str,
+    edges: impl for<'m> Fn(&MachineCfg<'m>) -> &'m [String],
+    issues: &mut IssueList,
+) {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         Visiting,
@@ -1623,7 +1663,7 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
         state.insert(name, State::Visiting);
         stack.push(name);
         if let Some(names) = deps.get(name) {
-            for dep in names.iter() {
+            for dep in names.iter().filter(|d| d.as_str() != name) {
                 if let Some(cycle) = visit(dep, deps, state, stack) {
                     return Some(cycle);
                 }
@@ -1637,11 +1677,11 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
     let mut deps: HashMap<&str, &[String]> = HashMap::new();
     let mut roots: Vec<(&str, Span)> = Vec::new();
     for vm in &lab.vms {
-        deps.insert(&vm.name, &vm.depends_on);
+        deps.insert(&vm.name, edges(&MachineCfg::Vm(vm)));
         roots.push((&vm.name, vm.span));
     }
     for c in &lab.containers {
-        deps.insert(&c.name, &c.depends_on);
+        deps.insert(&c.name, edges(&MachineCfg::Container(c)));
         roots.push((&c.name, c.span));
     }
 
@@ -1651,7 +1691,7 @@ fn check_dependency_cycles(lab: &Lab, issues: &mut IssueList) {
         if let Some(cycle) = visit(name, &deps, &mut state, &mut stack) {
             issues.push(Issue::at(
                 span,
-                format!("dependency cycle: {}", cycle.join(" -> ")),
+                format!("dependency cycle in {key}: {}", cycle.join(" -> ")),
             ));
             return; // one cycle report is enough to act on
         }
@@ -2750,6 +2790,90 @@ lab "l" {
   vm "b" { template = "x86_64/t" depends_on = ["a"] }
 }"#,
             "dependency cycle",
+        );
+    }
+
+    #[test]
+    fn depends_on_provision_cycle_reports_the_whole_path() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" depends_on_provision = ["b"] }
+  vm "b" { template = "x86_64/t" depends_on_provision = ["c"] }
+  container "c" { image = "nginx" depends_on_provision = ["a"] }
+}"#,
+            "dependency cycle in depends_on_provision: a -> b -> c -> a",
+        );
+    }
+
+    #[test]
+    fn depends_on_cycle_names_its_key() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" depends_on = ["b"] }
+  vm "b" { template = "x86_64/t" depends_on = ["a"] }
+}"#,
+            "dependency cycle in depends_on: a -> b -> a",
+        );
+    }
+
+    /// The two keys are separate graphs: `a` starts after `b`, and `b`
+    /// provisions after `a`. Starting never waits for provisioning, so the
+    /// loop cannot deadlock (§5.1).
+    #[test]
+    fn a_loop_across_the_two_keys_is_allowed() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" depends_on = ["b"] }
+  vm "b" { template = "x86_64/t" depends_on_provision = ["a"] }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    #[test]
+    fn ordering_keys_name_declared_machines() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" depends_on = ["ghost"] }
+  container "c" { image = "nginx" depends_on_provision = ["phantom"] }
+}"#,
+        );
+        for needle in [
+            "vm \"a\" depends_on names undefined vm/container \"ghost\"",
+            "container \"c\" depends_on_provision names undefined vm/container \"phantom\"",
+        ] {
+            assert!(
+                es.iter().any(|m| m.contains(needle)),
+                "missing {needle} in {es:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_cannot_name_itself_in_either_key() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" depends_on = ["a"] }
+  container "c" { image = "nginx" depends_on_provision = ["c"] }
+}"#,
+        );
+        for needle in [
+            "vm \"a\" names itself in depends_on",
+            "container \"c\" names itself in depends_on_provision",
+        ] {
+            assert!(
+                es.iter().any(|m| m.contains(needle)),
+                "missing {needle} in {es:#?}"
+            );
+        }
+        assert!(
+            !es.iter().any(|m| m.contains("cycle")),
+            "a self-reference is said once, not again as a cycle: {es:#?}"
         );
     }
 

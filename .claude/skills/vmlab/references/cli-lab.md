@@ -1,7 +1,8 @@
 # vmlab CLI: lab-level verbs
 
 Lab-scoped commands: `up`, `down`, `status`, `validate`, `destroy`, `pull`,
-`lab`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script`.
+`lab`, `worktree`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`,
+`script`.
 Per-machine verbs are in cli-machine.md; template verbs in cli-template.md.
 
 Exit codes shared across verbs: 0 success, 1 `failed`, 2 usage error,
@@ -47,10 +48,11 @@ after `vmlab up` returns (see architecture.md).
 
 Inside the daemon, `up` works through a plan computed before anything is touched:
 
-1. Machines the subset drags in through `depends_on` are added, and the machines
-   are grouped into waves. A machine's dependencies must be ready, and the
-   provisions scoped to them complete, before the machine's wave starts. Anything
-   the plan skips is printed with its reason.
+1. Machines the subset names through `depends_on` or `depends_on_provision` are
+   added, and `up` prints each one it pulls in. The machines are grouped into
+   waves by `depends_on`: a machine's wave starts once every machine it names is
+   ready — readiness only, never their provisioning. Anything the plan skips is
+   printed with its reason.
 2. Deferred downloads run first, with progress streamed to the terminal. This is
    the same code path `vmlab pull` runs on its own.
 3. The host's QEMU, firmware and helper binaries are checked for every target
@@ -64,10 +66,25 @@ Inside the daemon, `up` works through a plan computed before anything is touched
    For a VM `up` waits on anyway (first-boot, a provision or playbook, or a
    dependent), `up` refreshes the agent if it is out of date once it answers,
    after first-boot and before any provision (see "Agent refresh" below).
-6. Between waves the daemon runs every provision script and playbook whose machine
-   has started, in declaration order, waiting for each machine's readiness first.
+6. Each machine runs its own provision scripts and playbooks in declaration order
+   once it is ready and its share mounts have finished. Machines provision in
+   parallel with each other and with later waves still booting. A machine that
+   declares `depends_on_provision` holds its first step until every machine it
+   names has finished all of its steps. Step output is prefixed with the
+   machine's name. The first failed step fails `up` and cancels the steps still
+   running; `up` returns once every step has finished. Shared folders are
+   mounted once each VM is ready, after its first-boot script, and a mount step
+   may retry for five minutes; a VM's provisions and playbooks wait for its mounts
+   to finish, and `up` prints its mount report before the first of them runs.
 7. Port forwards are installed, and the workspace syncer starts for every dev
    machine that declares a workspace (see dev-machines.md).
+8. `up` waits for the share mounts of every VM no provision or playbook waited on,
+   ending as soon as every mount task has finished and at most 30 seconds after
+   the rest of `up` is done, so a VM with shares that nothing else waits on holds
+   `up` until its guest answers and its shares are mounted, or for those 30
+   seconds. Each share that will not mount, or is still failing when the wait runs
+   out, gets a `WARNING:` line naming the VM, the share and the reason
+   (shares-media.md).
 
 Output from provision scripts streams to the terminal as it happens. On success
 the last line is `lab "<name>" is up`. A VM declared with `gui = true` (or a lab
@@ -86,14 +103,46 @@ compares a digest of what the file declares (comments do not count) with the one
 the daemon loaded. Changed, with no machine running and no download in flight:
 `up` replaces the daemon and prints `lab "<name>": vmlab.wcl changed — restarting
 the lab daemon to load it`. Clones, snapshots, `.vmlab/state.json` and workspace
-ledgers persist. Changed while a machine runs (or starts, stops, is suspended) or
-a download is in flight: `up` refuses, naming them; run `vmlab down` first.
+ledgers persist. Changed while a machine runs (or starts, stops, is suspended): `up`
+refuses, names those machines, and changes nothing:
+
+```
+lab "ad-lab": vmlab.wcl has changed since the lab daemon loaded it, and dc01 is still running — the daemon cannot load the new file without stopping it. Run `vmlab down`, then this command again, to apply the edit (or undo the edit)
+```
+
+A download still in flight refuses the same way and names the artefact; wait for it
+to finish, or interrupt the `vmlab pull` that started it.
 `pull`, `vm start`/`restart` and `container start`/`restart` follow the same
 rule. A VM whose clone was made from a different `template` than the file now
 names (recorded in `.vmlab/vms/<vm>/clone-source`, compared as written, so an
-unpinned reference survives newer builds) is refused before anything downloads
-or boots: `vmlab vm destroy <vm>` (or `vmlab destroy`) recreates it, or put the
-template line back. A container's edited `image` line just drops its pin.
+unpinned reference survives newer builds, while pinning a different `@<version>`
+counts as a different template) is refused before anything downloads or boots,
+keeping the clone:
+
+```
+vm "web": its disk is a clone of "x86_64/alpine-3.23", but vmlab.wcl now declares "x86_64/debian-13" — a clone cannot move to another template. Run `vmlab vm destroy web` (or `vmlab destroy`) to discard the disk and recreate it from "x86_64/debian-13", or put the template line back
+```
+
+`vmlab vm destroy <vm>` (or `vmlab destroy`) recreates it, or put the template line
+back. A container's edited `image` line just drops its pin.
+
+A lab daemon also decides, when it starts, whether the lab runs under worktree
+isolation and, in a worktree lab, which machines clone from the main checkout's
+freeze (worktrees.md). When the main checkout has been frozen, frozen again or
+thawed since, or a machine has lost its disk, `up`, `pull`, `vm start` and
+`vm restart` replace the daemon the same way, in the main lab and in a worktree
+lab, with the same refusals while a machine is running, and print `lab "<name>":
+the main checkout's freeze or a machine's disk changed — restarting the lab daemon
+to plan its clones again`.
+
+In a linked git worktree whose main checkout is frozen, `up` builds each machine
+that has no disk yet as a clone of the freeze rather than of its template, when the
+freeze holds it under the same `template` or `image` reference. It boots as if the
+freeze point had just been restored, and every lab of the family runs under worktree
+isolation. In a frozen family `up` prints one line for each forward it installs
+on a port other than its declared one, `"web": container port declared on host
+port 18080 is bound on 18081 (worktree port slot, PRD §21.7)` (networking.md,
+"Ports in a frozen family").
 
 Note: a first-boot provision that errors, or that takes longer than 30 minutes,
 fails `up` but does not stop the machine, so a console or shell can be opened to
@@ -113,7 +162,8 @@ the background when its agent first answers, its line going to the lab daemon's 
 the event and `diverged=yes` still report it. Either way the VM is **not ready
 until the refresh has finished** (succeeded or failed): `status` shows it `booting`, and
 `wait_ready`, dependents, `vm.ready` and port forwards wait for it — capped at five
-minutes. A VM whose agent is current is held only for the comparison; one that
+minutes, after which the VM is reported ready and the refresh finishes in the
+background. A guest that never answers is never waited for. A VM whose agent is current is held only for the comparison; one that
 cannot be refreshed is not held. A failed refresh never fails `up`: it prints
 `warning: agent: could not update "<vm>" …` with the reason and the old agent stays
 in place. Containers, the legacy agent tier, and VMs whose template sealed no agent
@@ -157,7 +207,10 @@ vmlab status
 
 0 when every target machine started and every provision step completed. A lab
 file that fails validation, a lab directory that cannot be found, a supervisor
-that does not come up, or a boot or provision failure all exit 1 (`failed`).
+that does not come up, a boot or provision failure, an edit that cannot be applied
+while machines are running, or a VM whose template changed under its clone all exit
+1 (`failed`). A share that will not mount is a warning, not a failure: the machines
+are up, so `up` still exits 0.
 Exit 5 (`conflict`) means the supervisor already tracks a lab with this name from
 a different directory; stop that lab or rename this one. A usage error the
 argument parser rejects exits 2.
@@ -256,7 +309,26 @@ vmlab status [OPTIONS]
 With no lab daemon running the verb prints `lab "<name>": not running` and exits 0
 (as after a full `down`). When the lab's name is registered from another directory,
 `status` refuses with the same exit-5 `conflict` as `up`, naming that directory.
-Otherwise it prints up to six sections, each omitted when empty.
+Otherwise it prints up to five sections, each omitted when empty (the `RECORDING`
+rows follow the machine table).
+
+A lab running under worktree isolation (the frozen main lab, or a worktree lab built
+on its freeze; worktrees.md) says so on the line after its name, before any table:
+
+```
+worktree isolation: worktree "feat-x", generation 1 at "provisioned"; NAT refuses host addresses, forwards bind 127.0.0.1
+  global segment "corp" joins as "corp@feat-x"
+```
+
+The main lab reads `frozen main lab` in place of the worktree. One indented line
+follows for each global segment the lab joins under another name. The line is what
+the lab daemon decided when it started, so after a freeze or a thaw it shows the old
+decision until the next boot verb replaces the daemon. With `--json` the lab carries
+an `isolation` object: `role` (`main` or `worktree`), `worktree`, `generation`,
+`snapshot`, `forward_bind` and `globals`, a list of `segment` and `joined` pairs;
+absent when the lab is not isolated. The projection also carries `freeze_stale`,
+true when the daemon would decide differently if started now: the main checkout has
+been frozen, frozen again or thawed since, or a machine has lost its disk.
 
 `<name>` is the name this directory's lab runs under: the declared name, or
 `<declared>-<instance>` in a linked git worktree or under `--instance`. The same lab
@@ -277,6 +349,7 @@ way:
 | `running` | Running and ready. |
 | `unhealthy` | A container is ready but its declared healthcheck is failing. |
 | `stopping` | The stop ladder is in progress. |
+| `suspended` | A VM's guest put itself to sleep (ACPI S3). QEMU is alive and holds its memory, but nothing in the guest answers, so agent commands are refused with `conflict`. `vmlab vm start` wakes it; `prevent_sleep = true` on the VM keeps it from staying asleep. |
 | `stopped` | Powered off. |
 | `exited (N)` | A container's entrypoint exited with a non-zero code. |
 
@@ -290,7 +363,8 @@ stamp, or the template's sealed one before an agent answers or while stopped; an
 agent restarted inside the guest is handshaken again, so this follows it). A VM
 with a `gpu {}` adds `host_gpu=` (the host GPU its last start picked), under
 virgl/vulkan `keepawake=` (`on` while the supervisor's helper holds that GPU out
-of runtime suspend, `off`, `lost` once it exited, `failed`; host-profiles.md), `qemu=`
+of runtime suspend, `off` when the GPU's `keepawake` does not want it, `lost` once
+the helper has exited, `failed` when it could not start; host-profiles.md), `qemu=`
 when that GPU ran its own `qemu_binary`, and `env=NAME=value,...`: every variable
 vmlab set in that QEMU's environment (the `VK_*`/`VMLAB_*` loader filter and the
 host GPU's `qemu_env`), by name with values in full — what `qemu.log`'s
@@ -468,6 +542,17 @@ Templates in the store are never written to by a lab and are not removed here; u
 `vmlab template` for that (see cli-template.md). To destroy a lab by name from any
 directory use `vmlab lab destroy`.
 
+In the main checkout of a worktree lab family, `destroy` refuses while any linked
+worktree's disk backs onto the freeze, with or without a daemon running, and changes
+nothing; the refusal names each worktree and the generations it uses, and says to run
+`vmlab destroy` in each. With no worktree using the freeze, `destroy` deletes
+`.vmlab/freeze/` and `worktree.json` with the rest of `.vmlab/`, so the frozen state is
+gone for good. In a worktree lab, `destroy` deletes only the worktree's own overlays
+and copies, never a frozen file; it is how a worktree releases the freeze, and the next
+`up` there clones from the newest generation. It also releases the worktree's port
+slot and the ports recorded for it in the main checkout's `worktree-ports.json`, with
+or without a daemon running (worktrees.md).
+
 ### Examples
 
 Tear a lab down and rebuild it from scratch:
@@ -481,7 +566,8 @@ vmlab up
 
 0 when the lab's state was removed, whether or not a daemon was running. A lab
 directory that cannot be found, a machine that cannot be stopped, or a `.vmlab/`
-directory that cannot be removed exits 1 (`failed`). A usage error exits 2.
+directory that cannot be removed exits 1 (`failed`). A main lab whose freeze a
+worktree lab still uses exits 5 (`conflict`). A usage error exits 2.
 
 ## vmlab pull
 
@@ -559,6 +645,7 @@ vmlab lab <COMMAND>
 | `stop` | Gracefully stop a running lab and release its name; clones retained. |
 | `restart` | Restart a lab's daemon so it re-reads `vmlab.wcl`. |
 | `destroy` | Stop a lab and delete its clones and local state. |
+| `move` | Move a stopped lab's working data to the lab in this directory. |
 | `-h`, `--help` | Print help. |
 
 The read-only subcommands never start the supervisor: with none running the registry is
@@ -650,7 +737,10 @@ exists to recover.
 
 Run inside the lab's own directory, the current directory is the root the supervisor is
 asked to restart from; run elsewhere, the registry's entry is used. The supervisor
-refuses a name already registered from a different directory. On success the verb pings
+refuses a name already registered from a different directory. Run it from the lab's
+directory when the lab is not registered (after a full `down` or `lab stop`); by name
+elsewhere it needs the registration. A full `down` already reaps the daemon, so
+`lab restart` is never needed after one. On success the verb pings
 the new daemon and prints `lab "<name>" daemon restarted at <socket>`; under `--json` it
 prints the supervisor's reply, which carries the new `socket` path.
 
@@ -670,6 +760,59 @@ delete the clones, volumes and lab-local state, and releases the lab at the supe
 so its daemon is reaped. With no reachable daemon but a registry entry, it removes the
 lab's `.vmlab/` directory itself. A name the registry does
 not know fails with `lab "<name>" is not running`. Prints `lab "<name>" destroyed`.
+Like `vmlab destroy`, it refuses a main checkout's lab whose freeze a linked
+worktree still uses (worktrees.md).
+
+### vmlab lab move
+
+```sh
+vmlab lab move [OPTIONS] <LAB>
+```
+
+| Option | Meaning |
+| --- | --- |
+| `<LAB>` | The name the lab runs under now, as `vmlab lab list` shows it. The `vmlab.wcl` in this directory must declare the same lab: `<LAB>` is its declared name or an instance of it. |
+| `--from <DIR>` | The lab root to move from. Defaults to the directory the lab is registered from; required once the name is released, for example after a full `vmlab down` there. |
+| `-h`, `--help` | Print help. |
+
+Hands a stopped lab, with its provisioned machines, to another directory whose lab
+file declares the same lab, typically another git worktree of the same repository,
+without building its machines again. Run it in the directory that should own the
+lab. The two directories may run the lab under different names: the main
+worktree's `demo` moved into linked worktree `feat-x` arrives as `demo-feat-x`,
+the name that directory runs it under. What must match is the lab the two files
+declare. The machines keep their disks, volumes and recorded MAC addresses under
+the new name.
+
+It refuses, and changes nothing, when this directory's lab file declares another
+lab, when a machine of the lab is running (`vmlab down` there first), or when this
+directory's working data already holds machine data: a clone, a container's disk
+or a named volume (`vmlab destroy` here first). Working data without any, such as
+SMB state left by an earlier `up`, is replaced. When the two lab files declare a
+machine differently, or one declares a machine the other does not, it warns naming
+each one and continues: the next `up` runs this directory's file and refuses a
+clone whose template changed. A frozen lab does not move, because its own disks
+and every worktree lab's overlays name the frozen files by absolute path: with
+worktree labs on the freeze the refusal names them, otherwise it asks for
+`vmlab worktree thaw` first (worktrees.md).
+
+It then releases the name as `vmlab lab stop` does, refusing if any process still
+holds the old working data, and moves `.vmlab/` (or the `VMLAB_WORK_DIR` directory
+keyed by the old root) to the one keyed by this root. On one filesystem that is a
+rename. Across filesystems it copies the tree beside the destination, checks every
+file's content against the source, renames the copy into place and only then
+deletes the source, so a failed copy leaves the source whole. Clones, snapshots,
+firmware variables, TPM state and named volumes move with it. It removes
+`smb/smb.conf`, which the next `up` writes for the new root, and rebases each
+`@dev` machine's sync ledger onto the new root, so the syncer reads what this
+checkout holds differently as host-side changes rather than conflicts.
+
+Folders the lab points machines at do not move: shares, container bind mounts and
+`@dev` workspaces belong to the checkout. The verb lists each one that does not
+exist under this directory, such as a media folder git ignores. Last, it registers
+the lab from this directory under this directory's name and prints
+``lab "<name>" now lives in <dir> — run `vmlab validate`, then `vmlab up` ``, with
+`as "<new name>"` after the directory when the name changed.
 
 ### Examples
 
@@ -698,6 +841,14 @@ Free the host of a lab started from another directory:
 vmlab lab destroy peer-b
 ```
 
+Take over the lab the main worktree built, from a linked worktree you work in now:
+
+```sh
+cd ~/src/app-feature
+vmlab lab move app-lab --from ~/src/app-main
+vmlab up
+```
+
 Stop the instance a linked worktree `feat-x` runs, from any directory:
 
 ```sh
@@ -707,11 +858,152 @@ vmlab lab stop demo-feat-x
 ### Exit status
 
 0 on success, including `list` with nothing running, `stop` on a lab that is not
-running, and `info` on a registered lab whose daemon does not answer. An unknown lab
+running, and `info` on a registered lab whose daemon does not answer. `destroy` exits
+5 (`conflict`) when worktree labs use the lab's freeze. An unknown lab
 name, a lab with machines still running at `restart`, a daemon that fails the request,
 or a supervisor that does not come up exits 1 (`failed`). `restart` exits 5 (`conflict`)
-when the supervisor already tracks this name from another directory. A usage error
-exits 2.
+when the supervisor already tracks this name from another directory. `move` exits 5
+when a machine or process of the lab is running, when this directory already holds
+machine data, when the lab is frozen, or when the lab is registered from a directory
+other than `--from`; it exits 2 when a lab file runs under another name, and 1 when
+the lab is not registered and no `--from` is given. A usage error exits 2.
+
+## vmlab worktree
+
+Freezes the main checkout's lab for worktree labs to clone their machines from,
+thaws it, and reports where the family stands (worktrees.md). `freeze` and `thaw`
+run in the main checkout and go to its lab daemon, as the snapshot verbs do.
+`status` reads the files alone, so it answers in the main checkout or any linked
+worktree with no daemon running.
+
+```sh
+vmlab worktree <COMMAND>
+```
+
+| Subcommand | Meaning |
+| --- | --- |
+| `freeze` | Freeze the stopped main lab at an offline snapshot every machine has, for linked git worktrees to clone their machines from. |
+| `thaw` | Fold the freeze back into the stopped main lab's disks and unlock its earlier snapshots. |
+| `status` | Each generation of the main lab's freeze, its snapshot, and the worktrees whose disks back onto it. |
+| `-h`, `--help` | Print help. |
+
+A lab daemon decides worktree isolation when it starts, and `freeze` and `thaw` run
+in a daemon that started before them. The next `up`, `pull`, `vm start` or
+`vm restart` in the main checkout replaces that daemon first, as after an edit to
+`vmlab.wcl`.
+
+### vmlab worktree freeze
+
+```sh
+vmlab worktree freeze [OPTIONS] <SNAPSHOT>
+```
+
+| Option | Meaning |
+| --- | --- |
+| `<SNAPSHOT>` | The offline snapshot to freeze at. |
+| `--json` | Emit the raw JSON reply instead of a report. |
+| `-h`, `--help` | Print help. |
+
+Freezes every machine of the lab at `SNAPSHOT` as the next **generation**, `1` for
+the first freeze. Each disk is rewound to the snapshot, moved into
+`.vmlab/freeze/<n>/<machine>/` and made read-only, and the machine's disk becomes an
+overlay on it holding the state the lab had, so the main lab carries on unchanged.
+The overlay is written by copying the disk (`cp --reflink=auto`, free on a
+filesystem with reflinks) and rebasing an empty overlay onto the frozen file with a
+safe `qemu-img rebase`, which writes only the clusters that differ from the
+snapshot; without reflinks each copy is a full one, and every disk's copy stays
+until the whole freeze has committed. The machine's `OVMF_VARS.fd`, `tpm-state/`,
+`clone-source`, `firstboot.done` and state record, and the lab's named volumes, are
+copied into the generation. `.vmlab/worktree.json` is written last; its presence is
+what makes the lab frozen. A failure at any step undoes every step before it, and
+the error says so.
+
+`SNAPSHOT` becomes the **freeze point**, and every other snapshot of the lab is
+**locked** in this generation (cli-machine.md, `vmlab snapshot`). Freezing again
+freezes the main lab's current overlays as generation `n+1`, backed by generation
+`n`, and locks the previous freeze point with the rest. On success it prints:
+
+```
+froze generation 1 at "provisioned": dc01, web
+snapshots taken before it are locked until `vmlab worktree thaw`; linked worktrees now clone these machines on `vmlab up`
+```
+
+then a `WARNING:` line for each leftover file it could not clean up. It refuses, and
+changes nothing, when:
+
+- the lab is in a linked git worktree; only the main checkout's lab freezes,
+- the lab declares no machines,
+- a machine is running (`vmlab down` first),
+- a machine has no snapshot `SNAPSHOT`, or has never been built,
+- the snapshot was taken online,
+- the snapshot is itself locked in an earlier generation (take a new offline snapshot),
+- a disk lacks the internal snapshot the lab's record says it holds,
+- a disk still holds the temporary snapshot an interrupted freeze or thaw left behind,
+- a disk names its backing file by a relative path, which the move would break.
+
+### vmlab worktree thaw
+
+```sh
+vmlab worktree thaw [OPTIONS]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--drop-online-snapshots` | Give up the online snapshots taken since a freeze, whose machine state cannot be carried into the thawed disks, rather than refuse. |
+| `--json` | Emit the raw JSON reply instead of a report. |
+| `-h`, `--help` | Print help. |
+
+Collapses each disk's chain back into its oldest frozen file, which becomes the
+machine's disk again. Every layer above it is committed down with `qemu-img commit`,
+and the snapshots each layer holds are carried across one by one, so offline
+snapshots taken after a freeze survive. The main lab keeps its current state.
+`.vmlab/freeze/` and `worktree.json` are removed and every snapshot is unlocked. On
+success it prints `thawed: the freeze is gone and every snapshot is unlocked`; with
+`--drop-online-snapshots` it adds `dropped snapshot "<name>" of <machine>` for each
+snapshot given up, then any `WARNING:` lines. It refuses when:
+
+- the lab is in a linked git worktree; only the main checkout's lab thaws,
+- the lab is not frozen,
+- any worktree lab's disk backs onto any generation; the refusal names each
+  worktree and its generations, and `vmlab destroy` in each releases it,
+- a machine is running (`vmlab down` first),
+- a machine holds online snapshots stored above its oldest generation, unless
+  `--drop-online-snapshots` is given; the refusal names them,
+- a disk's chain is not the shape a freeze leaves: a temporary snapshot left by an
+  interrupted freeze, a snapshot name stored twice in one chain, or a generation
+  that does not hold its own freeze point.
+
+### vmlab worktree status
+
+```sh
+vmlab worktree status [OPTIONS]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--json` | Emit the raw JSON instead of a table. |
+| `-h`, `--help` | Print help. |
+
+Prints the main checkout, then `this worktree:` when run in a linked worktree, then
+one row per generation: `GENERATION` (the newest marked `(newest)`), `SNAPSHOT`,
+`MACHINES` and `WORKTREES`, the linked worktree labs whose disks back onto it, or
+`-`. It reads every worktree disk's backing chain directly, so it counts worktree
+labs whose daemons are not running. An unfrozen lab prints `not frozen` with the
+command that freezes it. Generations on disk with no `worktree.json` add a warning
+that worktree labs do not clone from them.
+
+```
+main checkout: /home/wil/src/app
+GENERATION  SNAPSHOT     MACHINES   WORKTREES
+1           provisioned  dc01, web  /home/wil/src/feat-x
+2 (newest)  upgraded     dc01, web  -
+```
+
+### Exit status
+
+0 on success, and 0 for `status` on an unfrozen lab. Every refusal listed above
+exits 5 (`conflict`). A step that failed and was rolled back, an invalid snapshot
+name, or a daemon that cannot be reached exits 1 (`failed`). A usage error exits 2.
 
 ## vmlab logs
 

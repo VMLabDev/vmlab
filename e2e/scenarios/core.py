@@ -12,6 +12,7 @@ from harness import E2E, ScenarioFailed
 LAB = "e2e-core"
 OWNED = [
     "lab.validate", "lab.validate.reject", "lab.up", "lab.up.partial", "lab.depends_on",
+    "lab.depends_on_provision", "lab.provision.parallel",
     "lab.status", "lab.down", "lab.up.reload", "lab.up.template-changed", "lab.destroy",
     "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory",
     "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
@@ -254,17 +255,19 @@ def reload_after_down(h, lab: pathlib.Path) -> None:
     applied = up.code == 0 and serial == "E2E-QEMU-ARGS-2" and "type=1,serial=E2E-QEMU-ARGS-2" in argv
 
     # Edited again while vm01 runs: a fresh daemon cannot adopt it, so `up`
-    # refuses by name and vm01 keeps what it booted with.
+    # refuses by name and vm01 keeps what it booted with. The `up vm01` above
+    # pulled vm03 in through vm01's depends_on_provision, so both are named.
     edit_lab(lab, "serial=E2E-QEMU-ARGS-2\"", "serial=E2E-QEMU-ARGS-3\"")
     busy = h.vmlab("up", "vm01", cwd=lab, timeout=120, check=False)
     refused = (
-        busy.code != 0 and "vm01 is still running" in busy.text and "vmlab down" in busy.text
+        busy.code != 0 and "vm01, vm03 are still running" in busy.text and "vmlab down" in busy.text
         and "type=1,serial=E2E-QEMU-ARGS-2" in qemu_argv("vm01")
     )
 
     # `vm stop` leaves the daemon up with nothing running, still holding the
     # file it loaded: `vm start` replaces it and boots the edit.
     h.vmlab("vm", "stop", "vm01", cwd=lab, check=False, timeout=180)
+    h.vmlab("vm", "stop", "vm03", cwd=lab, check=False, timeout=180)
     sv = h.vmlab("vm", "start", "vm01", cwd=lab, timeout=600, check=False)
     if sv.code == 0:
         h.wait_ready(lab, "vm01")
@@ -320,28 +323,34 @@ def _run(h):
         if v.code != 0:
             raise ScenarioFailed(f"the core lab does not validate: {v.text.strip()[-400:]}")
 
-        # `up vm02` drags vm01 in through depends_on and starts nothing else.
+        # `up vm02` drags vm01 in through depends_on, and vm03 through vm01's
+        # depends_on_provision, saying which key did it; blank stays down.
         t0 = datetime.now(timezone.utc).replace(tzinfo=None)
         part = h.vmlab("up", "vm02", cwd=lab, timeout=600, check=False)
         if part.code != 0:
             raise ScenarioFailed(f"`vmlab up vm02` failed: {part.text.strip()[-400:]}")
-        h.wait_ready(lab, "vm01", "vm02")
-        others = {m: state_of(h, lab, m) for m in ("vm03", "blank")}
+        h.wait_ready(lab, "vm01", "vm02", "vm03")
+        states = {m: state_of(h, lab, m) for m in ("vm01", "vm02", "vm03", "blank")}
         h.ok(
             "lab.up.partial",
-            all(s == "stopped" for s in others.values()) and state_of(h, lab, "vm02") == "running",
-            f"vm01+vm02 running, others {others}",
+            states == {"vm01": "running", "vm02": "running", "vm03": "running", "blank": "stopped"}
+            and 'vm03: pulled in — "vm01" names it in depends_on_provision' in part.text,
+            f"states {states}; "
+            + next((l.strip() for l in part.text.splitlines() if l.startswith("vm03: pulled in")), "vm03 not announced"),
         )
         evs = events_since(h, lab, t0)
         ready1, start2 = first(evs, "vm.ready", "vm01"), first(evs, "vm.starting", "vm02")
         h.ok(
             "lab.depends_on",
-            "vm01: pulled in" in part.text and ready1 is not None and start2 is not None and start2 >= ready1,
+            'vm01: pulled in — "vm02" names it in depends_on' in part.text
+            and ready1 is not None and start2 is not None and start2 >= ready1,
             f"vm01 ready {ready1:%H:%M:%S.%f}, vm02 starting {start2:%H:%M:%S.%f}"
             if ready1 and start2 else f"events missing: {[e.get('event') for e in evs]}",
         )
 
-        # The rest of the lab.
+        # The rest of the lab. Every machine but blank is running already, so
+        # all three are ready at once: vm02's and vm03's provisions overlap,
+        # and vm01's holds until vm03's has finished (§7.2).
         full = h.vmlab("up", cwd=lab, timeout=600, check=False)
         h.wait_ready(lab, "vm03")
         states = {m: state_of(h, lab, m) for m in ("vm01", "vm02", "vm03", "blank")}
@@ -349,6 +358,24 @@ def _run(h):
             "lab.up",
             full.code == 0 and f'lab "{LAB}" is up' in full.out and set(states.values()) == {"running"},
             f"states {states}",
+        )
+        at = {
+            f"{m} {edge}": full.text.find(f"{m}: e2e-prov {m} {edge}")
+            for m in ("vm01", "vm02", "vm03") for edge in ("begin", "end")
+        }
+        seen = all(i >= 0 for i in at.values())
+        h.ok(
+            "lab.depends_on_provision",
+            seen and "vm01: waiting for the provisioning of vm03 (depends_on_provision)" in full.text
+            and at["vm03 end"] < at["vm01 begin"],
+            f"vm03 ended at {at['vm03 end']}, vm01 began at {at['vm01 begin']} (offsets in up's output)"
+            if seen else f"provision lines missing: {at}",
+        )
+        h.ok(
+            "lab.provision.parallel",
+            seen and at["vm02 begin"] < at["vm03 end"] and at["vm03 begin"] < at["vm02 end"],
+            f"vm02 {at['vm02 begin']}..{at['vm02 end']}, vm03 {at['vm03 begin']}..{at['vm03 end']}"
+            if seen else f"provision lines missing: {at}",
         )
 
         st = h.vmlab("status", cwd=lab).out

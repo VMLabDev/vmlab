@@ -78,10 +78,16 @@ cross-reference by name.
 Configuration steps are the clearest case of the nesting rule. A `provision` or
 `playbook` block is declared inside the machine it configures. That machine is
 the target, so there is no `target =` field. A machine's steps run in the order
-its blocks appear, once the machine is ready. Across machines they follow the
-order the machine blocks appear, with `depends_on` gating when each becomes
-eligible. A dependent waits for its dependency to be ready *and* for that
-dependency's steps to finish.
+its blocks appear, once the machine is ready. Different machines provision in
+parallel. Two independent keys order machines against each other: `depends_on`
+is start order (a machine boots once the machines it names are ready, without
+waiting for their steps); `depends_on_provision` is provisioning order (a
+machine's first step waits until the machines it names have finished all of
+theirs, while its boot does not wait at all).
+
+Upgrading: `depends_on` used to also wait for the dependency's provisions. A lab
+whose dependents relied on that adds `depends_on_provision` naming the same
+machines.
 
 ## Connectivity is always explicit
 
@@ -109,7 +115,9 @@ required child blocks. The schema declares these with decorators on each field.
   the store and not a registry reference.
 - A `nic` naming a segment the lab does not declare, a static `ip` outside its
   segment's subnet, or a duplicate static IP or MAC.
-- A cycle in `depends_on`, or a dependency naming a machine that does not exist.
+- A `depends_on` or `depends_on_provision` entry naming a machine that does not
+  exist, or the machine itself, and a cycle within either key, reported as the
+  whole path. A loop crossing from one key to the other is allowed.
 - A `provision`, `playbook` or `on` handler whose file is missing, and any
   wscript that does not compile.
 - A `scratch` VM missing `arch`, `profile` or `disk`, and a `disk` size on a

@@ -8,7 +8,9 @@ lab "e2e-core" {
   segment "lan" { subnet = "10.80.0.0/24" }
 
   // Hardware as declared: two vCPUs, a TPM, explicit OVMF, nested, extra
-  // disks, a CD-ROM, a folder-built ISO and a raw QEMU passthrough.
+  // disks, a CD-ROM, a folder-built ISO and a raw QEMU passthrough. Its
+  // provision waits for vm03's to finish (§7.2), which also pulls vm03 into
+  // an `up` of vm01 or of anything that needs vm01.
   vm "vm01" {
     template  = "x86_64/e2e-alpine"
     cpus      = 2
@@ -22,9 +24,11 @@ lab "e2e-core" {
     disk "data" { size = 1GiB }
     disk "payload" { from = "./payload/" }
     media { kind = "iso" from = "./media-iso/" label = "E2EMEDIA" }
+    depends_on_provision = ["vm03"]
+    provision "scripts/prov.ws" { }
   }
 
-  // Started only once vm01 is ready. Secure boot has a lab of its own
+  // Started only once vm01 is ready — not once vm01 has provisioned. Secure boot has a lab of its own
   // (`core-secureboot`): enforced, it refuses this unsigned image. No
   // `nested`, so its guest sees no VMX/SVM where vm01's does.
   vm "vm02" {
@@ -34,13 +38,16 @@ lab "e2e-core" {
     floppy     = "./fd.img"
     depends_on = ["vm01"]
     nic { segment = "lan" }
+    provision "scripts/prov.ws" { }
   }
 
+  // Nothing orders its provision against vm02's: the two run in parallel.
   vm "vm03" {
     template = "x86_64/e2e-alpine"
     cpus     = 1
     memory   = 512MiB
     media { kind = "floppy" from = "./media-floppy/" label = "E2EFLOP" }
+    provision "scripts/prov.ws" { }
   }
 
   // No template layer: a blank disk under SeaBIOS, nothing to boot.

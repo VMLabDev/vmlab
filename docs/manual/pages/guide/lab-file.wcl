@@ -3,7 +3,7 @@ page guide_lab_file {
   chapter_header "The lab file" {
     kicker       = "The guide · explanation"
     reading_time = "10 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -67,10 +67,13 @@ page guide_lab_file {
     `provision` or `playbook` block is declared inside the machine it
     configures. That machine is the target, so there is no `target =` field
     to get wrong. A machine's steps run in the order its blocks appear, once
-    the machine is ready. Across machines they follow the order the machine
-    blocks appear, with `depends_on` gating when each becomes eligible. A
-    dependent waits for its dependency to be ready *and* for that
-    dependency's steps to finish.
+    the machine is ready. Different machines provision in parallel. Two keys
+    order machines against each other, and they are independent:
+    `depends_on` is start order, so a machine boots once the machines it
+    names are ready, without waiting for their steps; `depends_on_provision`
+    is provisioning order, so a machine's first step waits until the
+    machines it names have finished all of theirs, while its boot does not
+    wait at all.
   DOC
 
   h2 "Connectivity is always explicit"
@@ -105,7 +108,7 @@ page guide_lab_file {
   list {
     li "A template reference that is archless or malformed, or names a template not in the store and not a registry reference."
     li "A `nic` naming a segment the lab does not declare, a static `ip` outside its segment's subnet, or a duplicate static IP or MAC."
-    li "A cycle in `depends_on`, or a dependency naming a machine that does not exist."
+    li "A `depends_on` or `depends_on_provision` entry naming a machine that does not exist, or the machine itself, and a cycle within either key, reported as the whole path. A loop that crosses from one key to the other is allowed, because starting a machine never waits for provisioning."
     li "A `provision`, `playbook` or `on` handler whose file is missing, and any wscript that does not compile."
     li "A `scratch` VM missing `arch`, `profile` or `disk`, and a `disk` size on a cloned VM."
     li "`secure_boot = true` on a VM whose firmware resolves to SeaBIOS. Either value may have been inherited, so the message names the layer each came from."

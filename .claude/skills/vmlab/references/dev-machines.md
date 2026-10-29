@@ -44,13 +44,15 @@ Unset arguments resolve **`@dev` argument, then profile, then floor**. The defau
 is profile-sourced because it is guest-OS-shaped: the shipped Windows profiles say
 `C:\src` and the Linux ones `/src`. A profile with no dev keys still hosts a dev
 machine; a missing key means the floor applies, never that the profile cannot be a
-dev target. This resolver is deliberately separate from the hardware resolver.
+dev target. The guest path does not have to exist: when the default login cannot
+create it, as with `/src` under a root-owned `/` on Linux, vmlab creates it as the
+agent identity and gives it to that login before the first sync. This resolver is
+deliberately separate from the hardware resolver.
 "First in file order wins" was rejected for the default because declaration order
 already means something in vmlab and a block reorder would silently move it.
 
-Three things were kept off the decorator on purpose:
+Two things were kept off the decorator on purpose:
 
-- Editor hints: vmlab learns no editor.
 - Ports: a dev machine's ports are ordinary `port {}` and `forward {}` declarations.
 - Toolchain and package lists: that is `provision {}` and `playbook {}`. A
   distributable template is vmlab's answer to devcontainer features, installed once
@@ -61,8 +63,11 @@ Three things were kept off the decorator on purpose:
 The guest needs two things: the agent and the toolchain. The workspace path is
 created by the syncer. The syncer rides two agent features, which the agent
 advertises in its handshake: `watch` serves the guest-side change feed and
-`fileops` every transfer. The syncer checks `watch && fileops` for itself, and
-`vmlab machine capabilities` lists the features an agent negotiated.
+`fileops` every transfer. The syncer checks `watch && fileops` for itself when it
+starts, and a machine whose agent lacks either runs with no syncer and says so. A
+template built with `agent = false` reports the features missing through the same
+path as one whose agent is merely old. `vmlab machine capabilities` lists the
+features an agent negotiated.
 
 An agent that predates these features is normally refreshed by `vmlab up` itself:
 when a VM's agent stamp differs from the agent this vmlab ships, `up` pushes the
@@ -71,9 +76,9 @@ machine **diverged**, because the template's sealed `agent_version` no longer
 describes it. `vmlab machine repair-agent` is the same push on demand, for a machine
 already running. Rebuilding the template is the route that keeps the machine
 matching its template, and `agent_update = false` keeps `up` away from the agent.
-The push needs an agent that serves `fileops`. It is meaningless on a container,
-whose agent lives in the initramfs vmlab ships and tracks the installed vmlab; the
-verb says so.
+The push needs an agent that serves `fileops`; an older one can only be rebuilt.
+It is meaningless on a container, whose agent lives in the initramfs vmlab ships
+and tracks the installed vmlab; the verb says so.
 
 Two further preconditions of a dev-capable image: the guest must be
 symlink-capable, on Windows through `SeCreateSymbolicLinkPrivilege` or Developer

@@ -13,6 +13,16 @@
 //! stopped everything in parallel, so `vmlab down dc01` left domain members
 //! running against a dead controller, and a full `down` could kill a domain
 //! controller while its members were still shutting down.
+//!
+//! Starting and provisioning are separate orders (§7.2). `depends_on` is start
+//! order alone and builds the waves; `depends_on_provision` orders one
+//! machine's configuration steps after another's and nothing else. The
+//! provisioning half of the plan is one [`Provisioning`] per machine — its own
+//! steps in file order and the machines whose steps must finish first — so
+//! machines nothing orders provision in parallel. It replaces one file-ordered
+//! queue that stalled at the first step whose machine had not started, which
+//! ran a dependency's provisions *after* a dependent declared above it had
+//! started.
 
 use std::collections::{HashMap, HashSet};
 
@@ -59,15 +69,28 @@ pub struct Skip {
     pub why: String,
 }
 
+/// One machine's share of `up`'s configuration (§7.2): its own steps, in the
+/// order its blocks were written, run once it has started, and only after
+/// every machine in `after` has finished all of its own.
+#[derive(Debug, Clone)]
+pub struct Provisioning {
+    pub machine: String,
+    pub steps: Vec<Step>,
+    /// The machine's `depends_on_provision`. Every name is in the plan: a
+    /// subset `up` pulls them in.
+    pub after: Vec<String>,
+}
+
 /// The ordered work a lifecycle operation will perform.
 #[derive(Debug, Clone)]
 pub struct LabPlan {
-    /// Machines grouped into waves. Every machine in a wave may run
-    /// concurrently; wave *n* only begins once wave *n-1* has finished.
+    /// Machines grouped into waves by `depends_on` alone. Every machine in a
+    /// wave may run concurrently; wave *n* only begins once wave *n-1* has
+    /// finished starting. Provisioning never holds a wave back.
     pub waves: Vec<Vec<String>>,
-    /// Configuration steps to interleave, in declaration order. Empty for
-    /// [`Direction::Down`].
-    pub steps: Vec<Step>,
+    /// One entry per machine the plan starts, in wave order, steps or none.
+    /// Empty for [`Direction::Down`].
+    pub provisioning: Vec<Provisioning>,
     pub skipped: Vec<Skip>,
 }
 
@@ -76,13 +99,45 @@ impl LabPlan {
     pub fn machines(&self) -> impl Iterator<Item = &String> {
         self.waves.iter().flatten()
     }
+
+    /// `machine`'s provisioning, if the plan starts it.
+    pub fn provisioning_of(&self, machine: &str) -> Option<&Provisioning> {
+        self.provisioning.iter().find(|p| p.machine == machine)
+    }
+
+    /// Whether some machine's steps wait for `machine`'s to finish — which
+    /// makes `up` wait for `machine` to reach the point its steps run even
+    /// when it has none.
+    pub fn provision_awaited(&self, machine: &str) -> bool {
+        self.provisioning
+            .iter()
+            .any(|p| p.after.iter().any(|a| a == machine))
+    }
 }
 
-/// A machine's `depends_on`, whichever kind it is.
-fn deps_of(lab: &Lab, name: &str) -> Vec<String> {
-    lab.machine(name)
-        .map(|m| m.depends_on().to_vec())
-        .unwrap_or_default()
+/// The two ordering keys (§7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    DependsOn,
+    DependsOnProvision,
+}
+
+impl Key {
+    fn name(self) -> &'static str {
+        match self {
+            Key::DependsOn => "depends_on",
+            Key::DependsOnProvision => "depends_on_provision",
+        }
+    }
+
+    fn of(self, lab: &Lab, name: &str) -> Vec<String> {
+        lab.machine(name)
+            .map(|m| match self {
+                Key::DependsOn => m.depends_on().to_vec(),
+                Key::DependsOnProvision => m.depends_on_provision().to_vec(),
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Work out what `direction` over `subset` will do.
@@ -106,9 +161,13 @@ pub fn plan(lab: &Lab, subset: &[String], direction: Direction) -> Result<LabPla
     }
 
     // Who points at whom. `dependents` is the reverse edge set, which is what
-    // makes `down` the mirror of `up` rather than a special case.
-    let dependencies: HashMap<String, Vec<String>> =
-        known.iter().map(|n| (n.clone(), deps_of(lab, n))).collect();
+    // makes `down` the mirror of `up` rather than a special case. Both are
+    // `depends_on` alone: it is the only key that orders starting and
+    // stopping.
+    let dependencies: HashMap<String, Vec<String>> = known
+        .iter()
+        .map(|n| (n.clone(), Key::DependsOn.of(lab, n)))
+        .collect();
     let mut dependents: HashMap<String, Vec<String>> =
         known.iter().map(|n| (n.clone(), Vec::new())).collect();
     for (name, deps) in &dependencies {
@@ -130,24 +189,38 @@ pub fn plan(lab: &Lab, subset: &[String], direction: Direction) -> Result<LabPla
     let targets: Vec<String> = if subset.is_empty() {
         known.clone()
     } else {
-        let mut wanted: HashSet<String> = HashSet::new();
-        let mut stack: Vec<String> = subset.to_vec();
-        while let Some(n) = stack.pop() {
-            if wanted.insert(n.clone())
-                && let Some(next) = edges.get(&n)
-            {
-                stack.extend(next.iter().cloned());
-            }
-        }
-        for name in &wanted {
-            if !subset.contains(name) {
-                skipped.push(Skip {
-                    what: name.clone(),
-                    why: match direction {
-                        Direction::Up => "pulled in — something asked for depends on it".into(),
-                        Direction::Down => "pulled in — it depends on something asked for".into(),
-                    },
-                });
+        // A subset `up` follows both keys — a machine that must provision
+        // first is as necessary as one that must start first — and says
+        // which key, and whose, pulled each machine in. `down` follows
+        // `depends_on`'s reverse edges alone.
+        let keys: &[Key] = match direction {
+            Direction::Up => &[Key::DependsOn, Key::DependsOnProvision],
+            Direction::Down => &[Key::DependsOn],
+        };
+        let mut wanted: HashSet<String> = subset.iter().cloned().collect();
+        let mut queue: std::collections::VecDeque<String> = subset.iter().cloned().collect();
+        while let Some(n) = queue.pop_front() {
+            for key in keys {
+                let next = match (direction, key) {
+                    (Direction::Down, _) => edges.get(&n).cloned().unwrap_or_default(),
+                    (Direction::Up, key) => key.of(lab, &n),
+                };
+                for m in next {
+                    if wanted.insert(m.clone()) {
+                        skipped.push(Skip {
+                            what: m.clone(),
+                            why: match direction {
+                                Direction::Up => {
+                                    format!("pulled in — \"{n}\" names it in {}", key.name())
+                                }
+                                Direction::Down => {
+                                    format!("pulled in — it names \"{n}\" in {}", key.name())
+                                }
+                            },
+                        });
+                        queue.push_back(m);
+                    }
+                }
             }
         }
         known
@@ -186,13 +259,16 @@ pub fn plan(lab: &Lab, subset: &[String], direction: Direction) -> Result<LabPla
     }
 
     // Configuration steps belong to their machine, so a partial `up` only runs
-    // the steps of machines it started — anything else would stall the queue
-    // on a machine that is never coming up.
-    let mut steps = Vec::new();
+    // the steps of machines it starts, and announces the rest.
+    let mut provisioning = Vec::new();
     if direction == Direction::Up {
+        let mut by_machine: HashMap<String, Vec<Step>> = HashMap::new();
         for step in declared_steps(lab) {
             if targets.contains(&step.machine) {
-                steps.push(step);
+                by_machine
+                    .entry(step.machine.clone())
+                    .or_default()
+                    .push(step);
             } else {
                 skipped.push(Skip {
                     what: step.describe(),
@@ -200,13 +276,46 @@ pub fn plan(lab: &Lab, subset: &[String], direction: Direction) -> Result<LabPla
                 });
             }
         }
+        for machine in waves.iter().flatten() {
+            provisioning.push(Provisioning {
+                machine: machine.clone(),
+                steps: by_machine.remove(machine).unwrap_or_default(),
+                after: Key::DependsOnProvision.of(lab, machine),
+            });
+        }
+        provisioning_deadlock(&provisioning)?;
     }
 
     Ok(LabPlan {
         waves,
-        steps,
+        provisioning,
         skipped,
     })
+}
+
+/// Refuse a `depends_on_provision` cycle before anything starts. Validation
+/// already rejects one (§5.1); this keeps the plan from ever handing the
+/// runtime a schedule that would wait forever.
+fn provisioning_deadlock(provisioning: &[Provisioning]) -> Result<(), String> {
+    let mut done: HashSet<&str> = HashSet::new();
+    let mut remaining: Vec<&Provisioning> = provisioning.iter().collect();
+    while !remaining.is_empty() {
+        let ready: Vec<&str> = remaining
+            .iter()
+            .filter(|p| p.after.iter().all(|a| done.contains(a.as_str())))
+            .map(|p| p.machine.as_str())
+            .collect();
+        if ready.is_empty() {
+            let names: Vec<&str> = remaining.iter().map(|p| p.machine.as_str()).collect();
+            return Err(format!(
+                "depends_on_provision deadlock among: {}",
+                names.join(", ")
+            ));
+        }
+        remaining.retain(|p| !ready.contains(&p.machine.as_str()));
+        done.extend(ready);
+    }
+    Ok(())
 }
 
 /// Every machine's configuration steps in file declaration order — within a
@@ -262,6 +371,11 @@ lab "l" {
         )
     }
 
+    /// Every configuration step in scope, machine by machine.
+    fn steps(p: &LabPlan) -> impl Iterator<Item = &Step> {
+        p.provisioning.iter().flat_map(|m| m.steps.iter())
+    }
+
     fn wave_names(p: &LabPlan) -> Vec<Vec<&str>> {
         p.waves
             .iter()
@@ -299,7 +413,13 @@ lab "l" {
             vec![vec!["dc01"], vec!["srv01"], vec!["app01"]],
             "cache is unrelated and stays out"
         );
-        assert!(p.skipped.iter().any(|s| s.what == "dc01"));
+        assert!(
+            p.skipped.iter().any(
+                |s| s.what == "dc01" && s.why == "pulled in — \"srv01\" names it in depends_on"
+            ),
+            "{:?}",
+            p.skipped
+        );
     }
 
     /// `vmlab down dc01` used to stop only dc01, leaving srv01 and app01
@@ -335,8 +455,8 @@ lab "l" {
         assert!(err.contains("nope"), "{err}");
     }
 
-    /// Within a machine, steps run in the order its blocks were written;
-    /// across machines, in the order the machine blocks appear.
+    /// Within a machine, steps run in the order its blocks were written; each
+    /// machine carries its own, so no machine's steps queue behind another's.
     #[test]
     fn steps_follow_declaration_order() {
         let lab = lab_of(
@@ -355,9 +475,7 @@ lab "l" {
 }"#,
         );
         let p = plan(&lab, &[], Direction::Up).unwrap();
-        let labels: Vec<String> = p
-            .steps
-            .iter()
+        let labels: Vec<String> = steps(&p)
             .map(|s| format!("{} → {}", s.describe(), s.machine))
             .collect();
         assert_eq!(
@@ -368,6 +486,11 @@ lab "l" {
                 "provision scripts/two.ws → a",
                 "provision scripts/three.ws → b",
             ]
+        );
+        assert!(
+            p.provisioning.iter().all(|m| m.after.is_empty()),
+            "nothing orders a's steps against b's: {:?}",
+            p.provisioning
         );
     }
 
@@ -383,7 +506,7 @@ lab "l" {
 }"#,
         );
         let p = plan(&lab, &["a".into()], Direction::Up).unwrap();
-        assert_eq!(p.steps.len(), 1, "only a's step runs");
+        assert_eq!(steps(&p).count(), 1, "only a's step runs");
         assert!(
             p.skipped
                 .iter()
@@ -403,6 +526,118 @@ lab "l" {
   vm "a" { template = "x86_64/t" provision "scripts/a.ws" { } }
 }"#,
         );
-        assert!(plan(&lab, &[], Direction::Down).unwrap().steps.is_empty());
+        let p = plan(&lab, &[], Direction::Down).unwrap();
+        assert!(p.provisioning.is_empty());
+    }
+
+    /// `depends_on` is start order alone (§7.2): a machine that only
+    /// provisions after another boots with it, in the same wave.
+    #[test]
+    fn waves_come_from_depends_on_alone() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "dc"     { template = "x86_64/t" provision "scripts/dc.ws" { } }
+  vm "member" { template = "x86_64/t" depends_on_provision = ["dc"] provision "scripts/join.ws" { } }
+  vm "app"    { template = "x86_64/t" depends_on = ["dc"] }
+}"#,
+        );
+        let p = plan(&lab, &[], Direction::Up).unwrap();
+        assert_eq!(wave_names(&p), vec![vec!["dc", "member"], vec!["app"]]);
+        assert_eq!(p.provisioning_of("member").unwrap().after, vec!["dc"]);
+        assert!(
+            p.provisioning_of("app").unwrap().after.is_empty(),
+            "depends_on orders starting, never provisioning"
+        );
+        assert!(p.provision_awaited("dc"));
+        assert!(!p.provision_awaited("member") && !p.provision_awaited("app"));
+    }
+
+    /// The F12 defect: a dependent declared above its dependency. The old
+    /// file-ordered queue ran `dc`'s provision after `member` had started;
+    /// the plan now carries the order `depends_on_provision` asked for on the
+    /// machine itself, whatever order the blocks were written in.
+    #[test]
+    fn a_provision_gate_does_not_depend_on_declaration_order() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "member" {
+    template = "x86_64/t"
+    depends_on = ["dc"]
+    depends_on_provision = ["dc"]
+    provision "scripts/join.ws" { }
+  }
+  vm "dc" { template = "x86_64/t" provision "scripts/dc.ws" { } }
+}"#,
+        );
+        let p = plan(&lab, &[], Direction::Up).unwrap();
+        assert_eq!(wave_names(&p), vec![vec!["dc"], vec!["member"]]);
+        let member = p.provisioning_of("member").unwrap();
+        assert_eq!(member.after, vec!["dc"]);
+        assert_eq!(member.steps.len(), 1);
+        assert_eq!(p.provisioning_of("dc").unwrap().steps.len(), 1);
+    }
+
+    /// A subset follows both keys and says which key, and whose, pulled each
+    /// machine in.
+    #[test]
+    fn up_subset_pulls_in_through_both_keys() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "dc"     { template = "x86_64/t" }
+  vm "db"     { template = "x86_64/t" depends_on = ["dc"] }
+  vm "member" { template = "x86_64/t" depends_on_provision = ["db"] }
+  vm "other"  { template = "x86_64/t" }
+}"#,
+        );
+        let p = plan(&lab, &["member".into()], Direction::Up).unwrap();
+        assert_eq!(wave_names(&p), vec![vec!["dc", "member"], vec!["db"]]);
+        let why = |what: &str| {
+            p.skipped
+                .iter()
+                .find(|s| s.what == what)
+                .map(|s| s.why.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            why("db"),
+            "pulled in — \"member\" names it in depends_on_provision"
+        );
+        assert_eq!(why("dc"), "pulled in — \"db\" names it in depends_on");
+        assert!(why("other").is_empty(), "other is unrelated and stays out");
+    }
+
+    /// `down` follows `depends_on` alone: provisioning order has nothing to
+    /// say about stopping.
+    #[test]
+    fn down_ignores_depends_on_provision() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "dc"     { template = "x86_64/t" }
+  vm "member" { template = "x86_64/t" depends_on_provision = ["dc"] }
+}"#,
+        );
+        let p = plan(&lab, &["dc".into()], Direction::Down).unwrap();
+        assert_eq!(wave_names(&p), vec![vec!["dc"]]);
+        let p = plan(&lab, &[], Direction::Down).unwrap();
+        assert_eq!(wave_names(&p), vec![vec!["dc", "member"]]);
+    }
+
+    /// A cycle validation would have refused is still refused by the plan,
+    /// not discovered as a hang.
+    #[test]
+    fn a_provision_cycle_is_refused() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "x86_64/t" depends_on_provision = ["b"] }
+  vm "b" { template = "x86_64/t" depends_on_provision = ["a"] }
+}"#,
+        );
+        let err = plan(&lab, &[], Direction::Up).unwrap_err();
+        assert!(err.contains("depends_on_provision deadlock"), "{err}");
     }
 }

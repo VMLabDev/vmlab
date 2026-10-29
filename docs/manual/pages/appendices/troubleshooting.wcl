@@ -137,7 +137,8 @@ MSG
     A machine is *ready* when its [agent](guide_architecture) answers on the
     `vmlab.agent.0` virtio-serial port. VMs get ten minutes, containers five.
     `vmlab up` waits for readiness only when a later wave depends on the
-    machine, or a provision or share must run on it, so the first symptom is
+    machine, another machine names it in `depends_on_provision`, or a
+    provision or share must run on it, so the first symptom is
     often `first-boot {name}: agent did not come up` from a provision rather
     than the timeout itself.
   DOC

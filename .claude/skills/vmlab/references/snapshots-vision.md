@@ -35,12 +35,16 @@ already consumed, and reconnects on next use.
 
 A restored guest resumes with the clock it was captured with. After an online
 restore the daemon waits up to 60 s for the agent and sets the guest clock to
-the host's time (agent feature `set_time`). If it cannot, the restore still
-succeeds and `vmlab snapshot restore` prints a `WARNING:` line; the
+the host's time (agent feature `set_time`). If it cannot (no agent answered, the
+agent predates `set_time`, or the guest refused), the restore still succeeds and
+`vmlab snapshot restore` prints a `WARNING:` line naming the machine and the
+reason; the
 `snapshot.restored` event's `clock` field says `set`, `kept`, `fixed` or
 `not_set`. A machine's `clock` attribute opts out: `snapshot` keeps the
 captured time, and an RFC 3339 date-time starts the machine at that instant
-and is never set.
+and is never set. An agent baked into a template before `set_time` existed is
+replaced by `vmlab machine repair-agent` or by `up`'s automatic agent update.
+The legacy agent sets the clock too; the TempleOS agent does not.
 
 The RTC holds UTC. Windows guests on `vmlab-agent` read it as UTC because the
 bootstrap installer sets `RealTimeIsUniversal = 1` and the agent re-ensures it
@@ -49,7 +53,8 @@ at every start; an older template gets it from `up`'s agent update or
 once (`clock = "host"`), the flag holding from the next boot. Profiles with
 `rtc = "localtime"` (`windows-xp`, `windows-9x`) start the RTC at the host's
 local time instead (`-rtc base=localtime`; a fixed instant converted to host
-local time). vmlab sets no guest time zone.
+local time). Such a guest is right when its time zone matches the host's. vmlab
+sets no guest time zone.
 
 Containers snapshot with the same verbs and the same semantics. The
 per-container scratch disk holds the snapshot, the image's read-only root is
@@ -149,6 +154,19 @@ the host, which is what survives `destroy` and what a restore re-converges the
 guest from. A snapshot holds the guest copy of the workspace as it was, and a
 restore replaces it with the host's current tree. Every surface that takes or
 restores a snapshot repeats this sentence.
+
+### Snapshots under a freeze
+
+Freezing the main lab for worktree labs (worktrees.md) changes what two kinds of
+snapshot are. The snapshot frozen at becomes the **freeze point**: the state of the
+frozen files every lab of the family stands on, which any of those labs restores
+instantly by emptying its overlays. Every snapshot the main lab took before the
+freeze is stored inside a frozen file, so it is **locked**: restoring, deleting or
+taking it again would write a file other labs read, and each is refused until
+`vmlab worktree thaw`. `vmlab snapshot list` marks both in its `FREEZE` column.
+Snapshots taken after the freeze live in each lab's own overlays and behave as
+above, except that an online one blocks a freeze-point restore and a thaw until it
+is deleted. cli-machine.md (`vmlab snapshot`) gives the refusals.
 
 ### Headroom
 
@@ -368,7 +386,8 @@ script; the flags, defaults, refusals and lifecycle are in cli-machine.md
   `at` (video seconds, after cuts), `wall` (seconds since start) and `kind`:
   `keys{chord}`, `text{text}`, `move{x,y}`, `click{button,x?,y?}` (position
   only when the click moved first), `drag{x1,y1,x2,y2}`. Each cut is
-  `{wall_start, wall_end, kept}`. Only input vmlab sent appears.
+  `{wall_start, wall_end, kept}`. Without idle compression `cuts` is empty and
+  `at` equals `wall` on every entry. Only input vmlab sent appears.
 - **Lifecycle.** Owned by the lab daemon: survives the CLI exiting, guest
   reboots, `vm restart` and snapshot restore (the last frame is held across
   the gap and the recorder reconnects to the new QEMU); finalised to a

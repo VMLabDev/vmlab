@@ -74,7 +74,7 @@ A template with `variant {}` blocks builds its base, then each variant on it —
 the default first, the rest in file order — logging `building variant
 <ref>#<name> (n/m)` as each starts. A failed variant stops the build; the base
 and the variants before it stay installed, and the error names the
-`--variant` command that retries it. `--variant` is refused when the base is
+`--variant` command that retries it. A rebuilt variant replaces the old one's disk and metadata together. `--variant` is refused when the base is
 not installed, when a named variant is not declared, when the result would hold
 several variants but not the default, and while a clone is backed by a variant
 it would replace.
@@ -105,7 +105,7 @@ vmlab template stop [OPTIONS] <NAME>
 | Option | Meaning |
 | --- | --- |
 | `<NAME>` | Template name, as the file declares it. |
-| `--arch <ARCH>` | Architecture, when the name is declared for more than one. Default: `x86_64`. |
+| `--arch <ARCH>` | Architecture, when the name is declared for more than one. Without it, the arch the lab file here declares the template for. |
 | `-h`, `--help` | Print help. |
 
 `stop` cancels the operation running for the template in the lab the shell is
@@ -209,8 +209,10 @@ vmlab template rm [OPTIONS] <REFERENCE>
 `rm` removes one exact store version, with all its variants, and prints
 `removed <arch>/<name>@<version>`. A version whose base or any variant backs a
 machine's clone is refused unless `--force` is given, naming the machines,
-because the clone reads its image from the store. Removing such a version with
-`--force` breaks every machine cloned from it.
+because the clone reads its image from the store. The in-use check walks every lab
+disk's whole backing chain, so a frozen file of a worktree lab freeze, and an
+unregistered worktree's clone of one, count too (worktrees.md). Removing such a
+version with `--force` breaks every machine cloned from it.
 
 With `#<variant>` it removes that variant's overlay and metadata block alone.
 That is refused while a clone is backed by the variant (unless `--force`), and
@@ -222,7 +224,8 @@ vmlab template rm x86_64/win2022@1.1.0
 ```
 
 Exit status is 0 on success and `failed` (1) when the reference does not
-resolve or the version backs a clone.
+resolve, the version or variant backs a clone, or the variant cannot be removed on
+its own (remove the version instead).
 
 ## vmlab template clean
 

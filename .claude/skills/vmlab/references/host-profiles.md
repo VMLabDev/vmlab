@@ -132,8 +132,11 @@ gpu "Nvidia2" { address = "0000:05:00.0"  vulkan_icd = "/usr/share/vulkan/icd.d/
 | `qemu_env` | record of utf8 | none | `{ KEY: "value" }` set in that QEMU's environment, applied last: beats the derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and the PCI-filter variables (`VMLAB_VK_PCI_FILTER_DISABLE: "1"` turns the layer off). |
 | `keepawake` | utf8 | `auto` | Supervisor holds the GPU out of runtime suspend from the first virgl/vulkan VM on it until `vmlab daemon stop`. `auto`: an NVIDIA GPU that can runtime-suspend; `on`: always (any EGL driver); `off`: never. |
 
-Parsing rejects a missing `address`, two labels differing only in case, and a
-second `default = true`. The rest is checked when a lab uses the GPU (validate
+Parsing rejects a block with no label or no `address`, two labels differing
+only in case, a second `default = true`, a `qemu_binary` that is not an absolute
+path, a `qemu_env` value that is not a string (each key is a WCL identifier, so
+never empty and never containing `=`), and a `keepawake` other than `auto`, `on`
+or `off`. The rest is checked when a lab uses the GPU (validate
 and VM start), naming it: the address must be a PCI device, with a render node
 for virgl/vulkan, `vulkan_icd` must exist, and `qemu_binary` must be an
 executable file — one named `qemu-system-<a>` for the VM's QEMU arch (another
@@ -489,7 +492,7 @@ still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` mach
 | `windows-server` | q35 | ovmf | false | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
 | `windows-legacy` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | Vista, 7 and 2008-era guests; virtio-serial agent (virtio-win covers this era). |
 | `windows-xp` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | `agent_transport = "isa-serial"`, `rtc = "localtime"`: NT4 through XP/2003, the legacy agent on COM1. |
-| `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`, `agent_transport = "isa-serial"`, `rtc = "localtime"`. DOS, Windows 3.x to ME. |
+| `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`, `agent_transport = "isa-serial"`, `rtc = "localtime"`. DOS, Windows 3.x to ME and 2000-era guests. |
 | `templeos` | pc | seabios | false | false | ide | e1000 | std | 2 | 512MiB | `agent_transport = "isa-serial"`. TempleOS: the HolyC agent on COM1; no network by design. |
 | `linux-modern` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 2 | 4GiB | `virtiofs = true`. |
 | `linux-generic` | q35 | seabios | false | false | virtio | virtio-net-pci | std | 2 | 2GiB | Older or unusual distros. |
@@ -502,6 +505,14 @@ sets `workspace_guest = "/src"`, and `custom` leaves it at the floor.
 
 `linux-modern` requests a VGA-compatible virtio GPU on x86 and downgrades to
 `virtio-gpu-pci` automatically on the non-x86 `virt` machine, which has no legacy VGA.
+
+`windows-xp` and `windows-9x` name `agent_transport = "isa-serial"`: their guests
+have no virtio drivers, so the agent channel is a 16550 on COM1 and the guest runs
+the legacy agent, a small C program that speaks the same protocol and serves `exec`
+and `set_time` only. `vmlab exec`, readiness, the stop ladder and setting the clock
+after a snapshot restore work on such a guest; a terminal and `vmlab cp` refuse by
+name, and so does `vmlab app run`. On DOS the agent is the foreground program, and
+a command's output arrives after it exits. Installing it is in templates.md.
 
 The `container` profile carries only a size because a container micro-VM boots
 vmlab's own guest asset directly and has no firmware, disk bus, display or NIC model

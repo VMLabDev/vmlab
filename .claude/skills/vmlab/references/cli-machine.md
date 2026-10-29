@@ -43,7 +43,7 @@ vmlab vm start [--record <VM=PATH>]... <VM>
 | `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options (`vmlab record` below). |
 | `-h`, `--help` | Print help. |
 
-Starts one VM without running the lab's `up` plan: no dependency waves, no provision scripts, no playbooks. Any deferred download the VM needs runs first with progress on the terminal, then the host binaries are checked, then the VM boots. A VM whose clone does not exist yet gets one created from its template, and its first-boot script runs before it reports ready, exactly as under `vmlab up`. A VM that is already running is left alone. Nothing is printed on success.
+Starts one VM without running the lab's `up` plan: no dependency waves, no provision scripts, no playbooks. Any deferred download the VM needs runs first with progress on the terminal, then the host binaries are checked, then the VM boots. A VM whose clone does not exist yet gets one created from its template, and its first-boot script runs before it reports ready, exactly as under `vmlab up`. A VM that is already running is left alone. A `suspended` VM, one whose guest put itself to sleep (ACPI S3), is woken with QMP `system_wakeup` instead: no second QEMU, no agent refresh, and the verb returns once the guest runs again, emitting `vm.woken` with `cause = start`. Nothing is printed on success.
 
 ### vmlab vm ip
 
@@ -584,7 +584,7 @@ vmlab app run [OPTIONS] <MACHINE> [-- <CMD>...]
 | `--password <PASSWORD>` | Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`. |
 | `-h`, `--help` | Print help. |
 
-The guest family comes from the machine's effective profile: a name starting with `windows` is Windows, everything else (containers included) is Linux. The host session comes from the command's own environment: `WAYLAND_DISPLAY` set is Wayland, else `DISPLAY` set is X11, else it refuses with `no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set`. Run it from a terminal inside the desktop session.
+The guest family comes from the machine's effective profile: a name starting with `windows` is Windows, everything else (containers included) is Linux. The host session comes from the command's own environment: `WAYLAND_DISPLAY` set is Wayland, else `DISPLAY` set is X11, else it refuses with `no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set`. Run it from a terminal inside the desktop session. The daemon opens the agent session and hands the CLI two private unix sockets, and the CLI runs the host end against them: `waypipe client`, a proxy to the X server, or FreeRDP. The host end lives in the CLI because only a process inside the desktop session reaches the compositor or the X server, and the lab daemon stays headless. A container's sockets live inside its root filesystem, where the program can reach them.
 
 | Guest | Host session | Protocol | Guest needs | Host needs |
 | --- | --- | --- | --- | --- |
@@ -593,15 +593,15 @@ The guest family comes from the machine's effective profile: a name starting wit
 | Linux | X11 | X11 | nothing | the X server |
 | Windows | Wayland or X11 | RDP RemoteApp | Pro, Enterprise, Education or Server edition | FreeRDP 3: `xfreerdp3`, then `xfreerdp`, on `PATH` |
 
-The host config keys `waypipe` and `freerdp` name the host binaries instead (host-profiles.md); the CLI reads them itself, so no restart is needed. waypipe → X11 is the only automatic fallback; it prints the reason on stderr followed by `; falling back to X11 through Xwayland`. `--via` never falls back, and a protocol the guest family cannot serve is refused by name. Prefer waypipe on Wayland: X11 has no compression, and a program without an X11 backend does not run under it.
+The host config keys `waypipe` and `freerdp` name the host binaries instead (host-profiles.md); the CLI reads them itself, so no restart is needed. waypipe → X11 is the only automatic fallback; it prints the reason on stderr followed by `; falling back to X11 through Xwayland`. `--via` never falls back, and a protocol the guest family cannot serve is refused by name. Prefer waypipe on Wayland: X11 has no compression, and a program without an X11 backend does not run under it. Both waypipe ends run with `--compress lz4`, because a client and server that disagree on compression refuse each other, so a guest waypipe built without lz4 cannot serve a session.
 
-Identity follows logins.md exactly as for `exec`. RDP cannot log on as the agent identity, so a Windows machine needs a `login {}` with a password or `--user`/`--password`. On Windows the agent turns Remote Desktop on, allows unlisted RemoteApp programs, adds the account to Remote Desktop Users unless it is an administrator, and starts TermService, changing each only where it differs and leaving it changed. FreeRDP gets the credentials on stdin and `--cwd` as the `/app` working directory; an argument FreeRDP's `/app` parser would alter, such as one with an apostrophe, is refused.
+Identity follows logins.md exactly as for `exec`. The waypipe check runs as the same identity, because the `PATH` that matters is that login's. RDP cannot log on as the agent identity, so a Windows machine needs a `login {}` with a password or `--user`/`--password`. At the start of each RDP session the agent prepares Windows: it turns Remote Desktop on, allows unlisted RemoteApp programs (the `fAllowUnlistedRemotePrograms` policy and `TSAppAllowList`'s `fDisabledAllowList`), adds the account to Remote Desktop Users unless it is an administrator, and starts TermService, changing each only where it differs and leaving it changed. RDP traffic reaches the guest's own `127.0.0.1:3389` from the agent, so no firewall rule is touched. FreeRDP gets the credentials on stdin and `--cwd` as the `/app` working directory; an argument FreeRDP's `/app` parser would alter, such as one with an apostrophe, is refused.
 
-On a client edition of Windows, and on Server while "Restrict each user to a single session" is on (its default), the RDP logon disconnects the same account's console session, so `vmlab console` shows the lock screen. A second `app run` against the same machine and account takes the session over: both apps' windows move to the newest FreeRDP and the first command returns. The first shared app on a machine waits about 40 seconds for TermService's listener, printing `[<machine>] waiting for Remote Desktop to listen on 127.0.0.1:3389`.
+On a client edition of Windows, and on Server while "Restrict each user to a single session" is on (its default), the RDP logon disconnects the same account's console session, so `vmlab console` shows the lock screen. A second `app run` against the same machine and account takes the session over: both apps' windows move to the newest FreeRDP and the first command returns. On a Server with that policy turned off, each `app run` gets its own session. The first shared app on a machine waits about 40 seconds for TermService's listener, printing `[<machine>] waiting for Remote Desktop to listen on 127.0.0.1:3389`.
 
 For X11 the CLI mints a cookie that the agent writes into a private Xauthority (display `:10` up); the CLI checks it on every connection and swaps in the host display's real cookie. A connected X11 program has the reach of `ssh -X` into the host X server, including reading other X clients' input.
 
-The command stays in the foreground: a waypipe or X11 session ends when the program exits, an RDP session when FreeRDP exits. Ctrl-C closes a waypipe or X11 session and kills the guest program; on RDP it disconnects the Windows session, the program keeps running, and its windows return with the account's next shared app on that machine. `--detach` makes the same protocol choice, re-runs itself as a background helper, prints ``sharing `<cmd>` from <machine> in the background (it ends when the program does)`` and returns; the helper has no terminal, so a daemon refusal is lost. Re-run without `--detach` to see one.
+The command stays in the foreground: a waypipe or X11 session ends when the program exits, an RDP session when FreeRDP exits. Ctrl-C closes a waypipe or X11 session and kills the guest program; on RDP it disconnects the Windows session, the program keeps running, and its windows return with the account's next shared app on that machine; close the program's own windows to end it. `--detach` makes the same protocol choice, re-runs itself as a background helper, prints ``sharing `<cmd>` from <machine> in the background (it ends when the program does)`` and returns; the helper has no terminal, so a daemon refusal is lost. Re-run without `--detach` to see one.
 
 ```sh
 vmlab app run nix01 -- foot
@@ -630,6 +630,8 @@ Refusals (troubleshooting.md has causes and fixes):
 | ``` FreeRDP's `/app` option cannot carry `{value}` intact: its comma, quote and backslash rules would change it ``` | A Windows argument FreeRDP would alter. |
 
 Exit status is the guest program's code (waypipe, X11) or FreeRDP's (RDP); Ctrl-C exits 130 and SIGTERM 143. Exit 2 (`invalid_argument`) is an RDP session with no account. Exit 6 (`unsupported`) is a guest with no waypipe or an agent that predates shared apps. Exit 1 (`failed`) covers the CLI's own refusals, a machine that is not running, a login that cannot be minted, Windows Home, and a host client that exits mid-session.
+
+What shared apps do not do: vmlab turns on no audio, USB or printer redirection, although the protocols can carry some of them; it writes no host launcher entries (`.desktop` files) for guest programs; macOS guests and hosts are not supported.
 
 ## vmlab console
 
@@ -706,7 +708,7 @@ vmlab clipboard <COMMAND>
 
 The machine must be running with an agent that advertises the `clipboard` feature; see `vmlab machine capabilities`. The agent advertises it only where it can reach a display server, so on a headless guest both subcommands refuse with `the guest agent has no clipboard` and exit 6 (`unsupported`).
 
-A Windows agent always advertises `clipboard`, but the Windows clipboard belongs to an interactive session. On a guest at the lock screen with nobody logged on, both subcommands refuse at once with `<machine>: no one is logged on to the desktop; the Windows clipboard belongs to an interactive session (it works once a user logs on)` and exit 1 (`failed`). Log on at the console (`vmlab console`) and retry. Clipboard access does not need anyone at the desktop on Linux, where it depends only on the agent reaching a display server.
+A Windows agent always advertises `clipboard`, but the Windows clipboard belongs to an interactive session. A locked session still counts as logged on, so the clipboard keeps working after the screen locks. On a guest at the lock screen with nobody logged on, both subcommands refuse at once with `<machine>: no one is logged on to the desktop; the Windows clipboard belongs to an interactive session (it works once a user logs on)` and exit 1 (`failed`). Log on at the console (`vmlab console`) and retry. Clipboard access does not need anyone at the desktop on Linux, where it depends only on the agent reaching a display server.
 
 ### vmlab clipboard get
 
@@ -735,7 +737,7 @@ vmlab clipboard set [OPTIONS] <MACHINE> [TEXT]
 | `--json` | Emit the raw JSON reply instead of a confirmation. |
 | `-h`, `--help` | Print help. |
 
-With a `TEXT` argument that text becomes the guest's clipboard. Without one, stdin is read to end of file and passed through verbatim, trailing newline included, so `vmlab clipboard get a | vmlab clipboard set b` round-trips exactly. Use `echo -n` when you do not want the newline `echo` adds. On success the verb prints `copied N bytes to "<machine>" clipboard`; with `--json` it prints the daemon's reply, which is `true`. The confirmation is printed only after the agent reports that the text is on the guest clipboard. An agent that predates the `clipboard_reply` feature sends no such report, so against one the confirmation means only that the request was sent.
+With a `TEXT` argument that text becomes the guest's clipboard. Without one, stdin is read to end of file and passed through verbatim, trailing newline included, so `vmlab clipboard get a | vmlab clipboard set b` round-trips exactly. Use `echo -n` when you do not want the newline `echo` adds. On success the verb prints `copied N bytes to "<machine>" clipboard`; with `--json` it prints the daemon's reply, which is `true`. The confirmation is printed only after the agent reports that the text is on the guest clipboard. An agent that predates the `clipboard_reply` feature sends no such report, so against one the confirmation means only that the request was sent. The agent is given 10 seconds to report.
 
 ### Examples
 
@@ -779,9 +781,9 @@ One row per host device, hubs hidden, in port order: `PORT`, `ID`, `SERIAL`, `SP
 
 ### vmlab usb attach
 
-The VM must be running and have started with `usb = true` (vm.md). Refused, in order, when: the machine is a container (`"web" is a container — USB passthrough is for VMs`); the VM is not running, or has no controller (`"plain" has no USB controller to attach to — set `usb = true` on plain and restart it`); the selector is malformed, unknown or ambiguous; another VM in any lab holds the device (named `lab/vm`); the device has a HID boot keyboard or mouse interface and `--force` was not given; the vmlab process cannot open `/dev/bus/usb/BBB/DDD` read-write (the message gives `sudo setfacl -m u:<user>:rw <node>` and a udev rule — troubleshooting.md). On success: `attached 046d:c547 Logitech USB Receiver at port 1-2.1.4.1.4 to usbtest/u1`, and a `usb.attached` event.
+The VM must be running and have started with `usb = true` (vm.md). Refused, in order, when: the machine is a container (`"web" is a container — USB passthrough is for VMs`); the VM is not running, or has no controller (`"plain" has no USB controller to attach to — set `usb = true` on plain and restart it`); the selector is malformed, unknown or ambiguous; another VM in any lab holds the device (named `lab/vm`); the device has a HID boot keyboard or mouse interface and `--force` was not given (a wireless receiver often carries both interfaces and is named a keyboard; never force the host's only keyboard, since nothing is left to type the detach with); the vmlab process cannot open `/dev/bus/usb/BBB/DDD` read-write (the message gives `sudo setfacl -m u:<user>:rw <node>` and a udev rule — troubleshooting.md). On success: `attached 046d:c547 Logitech USB Receiver at port 1-2.1.4.1.4 to usbtest/u1`, and a `usb.attached` event.
 
-The attach is QMP `device_add usb-host` on `usbx.0`, pinned by `hostbus`, `hostport` and `hostaddr` (device number), qdev id `usbhost-<port>`. Unplugging the device from the host drops it from the VM within ~2 s (`usb.detached`, `reason = "unplugged"`); replugging returns it to the host, never to the VM.
+The attach is QMP `device_add usb-host` on the VM's xHCI — `usbx.0` on q35/pc; on `virt` (aarch64, riscv64), which already has an xHCI, nothing is added and the existing controller is the one devices attach to — pinned by `hostbus`, `hostport` and `hostaddr` (device number), qdev id `usbhost-<port>`. Unplugging the device from the host drops it from the VM within ~2 s (`usb.detached`, `reason = "unplugged"`); replugging returns it to the host, never to the VM. An attachment is pinned to one plug-in of the device: a different device plugged into the same socket is never handed to the guest.
 
 ### vmlab usb detach
 
@@ -799,13 +801,13 @@ Prints the host port a running machine's forward to a guest port is bound on, an
 vmlab port [--json] <[lab/]machine> <guest-port>[/tcp|/udp]
 ```
 
-The lab comes from the working directory (with `--instance`/`VMLAB_INSTANCE`) or a `lab/machine` reference. It reads the lab's status and matches the machine's installed forwards (segment `forward {}`, container `port {}`, runtime `seg.forward`) on guest port, and on protocol when a suffix is given (case-insensitive; `both` matches either). Matches sharing one host port are one answer. Plain output is the port and a newline; `--json` prints the forward's entry from `status --json` (`machine`, `segment`, `host_port`, `guest`, `guest_port`, `proto`, `auto`, and `declared_port` when shifted). Typical use: `curl "http://127.0.0.1:$(vmlab port web 80)/"`.
+The lab comes from the working directory (with `--instance`/`VMLAB_INSTANCE`) or a `lab/machine` reference. It reads the lab's status and matches the machine's installed forwards (segment `forward {}`, container `port {}`, runtime `seg.forward`) on guest port (1 to 65535), and on protocol when a suffix is given (case-insensitive; `both` matches either). Several matches bound on one host port are one answer: the first, in the order `vmlab status` lists them. When matches sit on different host ports and a `/tcp` or `/udp` suffix would not settle it, the error lists every candidate. A directory with no lab file, given no `lab/machine` reference, fails as other verbs do, with exit 1. Plain output is the port and a newline; `--json` prints the forward's entry from `status --json` (`machine`, `segment`, `host_port`, `guest`, `guest_port`, `proto`, `auto`, and `declared_port` when shifted). Typical use: `curl "http://127.0.0.1:$(vmlab port web 80)/"`.
 
 ### Exit status
 
 | Case | Exit | Message |
 | --- | --- | --- |
-| Malformed port or protocol | 2 (`invalid_argument`) | `` `80/sctp`: the protocol is `tcp` or `udp`, not `sctp` `` |
+| Malformed port or protocol | 2 (`invalid_argument`) | `` `80/sctp`: the protocol is `tcp` or `udp`, not `sctp` ``; a bad port says a guest port runs from 1 to 65535 |
 | tcp and udp forwards on different host ports, no suffix | 2 | `"web" has more than one forward to guest port 80: 80/tcp on host port 18580, 80/udp on host port 58525; name one as 80/tcp or 80/udp` |
 | No matching forward | 4 (`not_found`) | `"web" in lab "portcheck" has no forward to guest port 81; its forwards: …` (or `it has no forwards installed`) |
 | Unknown machine | 4 | `no vm or container "nope" in lab "portcheck"` |
@@ -848,7 +850,7 @@ One row per live recording: `MACHINE`, `ELAPSED` (wall clock), `STARTED` (UTC), 
 
 ### --record on script, up, vm start, vm restart
 
-`--record <vm>=<path>` (repeatable, one VM each; a VM named twice is refused) plus the same option flags, which apply to every recording named. On `up`, `vm start`, `vm restart`: every `--record` is checked before anything boots and one refusal arms none; QEMU starts paused, the recorder attaches, the VM continues, so the video starts at the firmware's first frame; the recordings outlive the verb, which prints `recording <vm> to <path>`; a `--record` for a VM already running records it from now. On `script`: recordings last exactly the run, started before the script and finalised when it returns, success or failure; the verb prints `recorded <vm> to <path>`.
+`--record <vm>=<path>` (repeatable, one VM each; a VM named twice is refused) plus the same option flags, which apply to every recording named. The path is required, its extension picks the format as for `-o` (`.mp4` or `.webm`), and a relative path resolves against the shell's working directory. On `up`, `vm start`, `vm restart`: every `--record` is checked before anything boots and one refusal arms none; QEMU starts paused, the recorder attaches, the VM continues, so the video starts at the firmware's first frame; the recordings outlive the verb, which prints `recording <vm> to <path>`; a `--record` for a VM already running records it from now. On `script`: the recordings are checked before the script runs, so a VM with no display or a host with no `ffmpeg` fails the command before the script runs; recordings last exactly the run, started before the script and finalised when it returns, success or failure; the verb prints `recorded <vm> to <path>`.
 
 ### Exit status
 
@@ -890,6 +892,8 @@ Takes a snapshot named `NAME` of one machine, or, with no `--vm`, of every VM an
 
 For a dev machine with a workspace, capture is bracketed by the workspace syncer (dev-machines.md). A sync pass is flushed first, so the snapshot is coherent with the canonical copy. If the guest holds work the host has never seen, because the syncer is halted, has not completed a pass, or could not finish the flush, the capture **refuses**, naming the machine and the outstanding paths. There is no escape flag: a snapshot of a tree that exists nowhere else is not a thing to take against a warning. `vmlab dev sync flush` waits for a pending pass; a halt has to be resolved first with `vmlab dev sync resolve`. Every other machine passes straight through.
 
+In a worktree lab family (worktrees.md), the capture refuses two names and asks for another: a locked snapshot's name, because its record says where that snapshot really lives, and the freeze point's name, because every lab of the family restores it.
+
 ### vmlab snapshot restore
 
 ```sh
@@ -909,6 +913,17 @@ For a dev machine with a workspace, restore is bracketed too. A restore rewinds 
 
 A workspace that is **halted** at restore time is refused by default, because restoring would silently destroy the guest copy of every conflicting path. The refusal names the affected paths and this verb's one escape flag, `--discard-guest-changes`, which restores anyway and throws those guest copies away. `vmlab dev sync diff` shows the guest copy host-side before you decide.
 
+After an online restore, each machine whose `clock` is `host` (the default) has its clock set to the host's time through the agent, and the restore waits up to 60 s for the agent. When that fails the machine is still restored, and stderr gets `WARNING: "<machine>": the guest clock was not set to the host's time, so it resumes at the time the snapshot was taken: <reason>`. The reason is one of: no agent answered; the agent predates the `set_time` feature (`vmlab machine repair-agent` replaces it); the guest refused. An offline restore does not set the clock.
+
+#### Restoring under a freeze
+
+Once the main checkout's lab is frozen for worktree labs (worktrees.md), two kinds of snapshot restore differently, in the main lab and in every worktree lab built on it:
+
+- The **freeze point**, the snapshot `vmlab worktree freeze` was given, is the state of the frozen files under the machine's disks. Restoring it stops a running machine, then replaces each disk with an empty overlay on its frozen file and writes no frozen file. Offline snapshots taken since the freeze are carried into the new overlay and survive; with none the restore is instant, and each one carried adds time in proportion to what it holds. An online one cannot be carried, so the restore refuses, naming it, until it is deleted. A disk that is not an overlay on the frozen file, such as one built from its template, refuses too.
+- A **locked** snapshot, one the main lab took before the freeze, lives inside a frozen file that worktree labs read. Restoring it would write that file, so the restore refuses, naming `vmlab worktree thaw`.
+
+Snapshots taken after the freeze restore as any other.
+
 ### vmlab snapshot list
 
 ```sh
@@ -920,7 +935,7 @@ vmlab snapshot list <VM>
 | `<VM>` | The machine, as `[lab/]name`. |
 | `-h`, `--help` | Print help. |
 
-Prints one row per snapshot of the machine: `NAME`, `KIND` (`online` or `offline`) and `TAKEN`, the capture time in UTC. A machine with none, including a name the lab does not declare, prints `no snapshots for <name>`.
+Prints one row per snapshot of the machine: `NAME`, `KIND` (`online` or `offline`), `FREEZE` and `TAKEN`, the capture time in UTC. `FREEZE` is `-` for an ordinary snapshot, `freeze point (gen <n>)` for the snapshot generation `n` of a worktree lab freeze was taken at, and `locked (gen <n>)` for one taken before generation `n` was frozen; when any is locked, a last line says `vmlab worktree thaw` unlocks them. A machine with none, including a name the lab does not declare, prints `no snapshots for <name>`.
 
 ### vmlab snapshot delete
 
@@ -934,7 +949,7 @@ vmlab snapshot delete <VM> <NAME>
 | `<NAME>` | Snapshot name. |
 | `-h`, `--help` | Print help. |
 
-Removes the snapshot from the machine's disk and from the lab's record. Prints `snapshot "<name>" deleted`.
+Removes the snapshot from the machine's disk and from the lab's record. Prints `snapshot "<name>" deleted`. A locked snapshot is refused, naming `vmlab worktree thaw`. Deleting the freeze point removes it from this lab only: the frozen files and the other labs of the family keep it, and this lab can no longer reset to it.
 
 ### Examples
 
@@ -946,14 +961,20 @@ vmlab snapshot list dc01
 ```
 
 ```sh
-NAME                     KIND     TAKEN
-pre-upgrade              online   2026-09-02T09:14:31Z
+NAME                     KIND     FREEZE                 TAKEN
+pre-upgrade              online   -                      2026-09-02T09:14:31Z
 ```
 
 Roll the whole lab back to a known state:
 
 ```sh
 vmlab snapshot restore clean
+```
+
+Reset a worktree lab to the state the main lab was frozen in:
+
+```sh
+vmlab snapshot restore provisioned
 ```
 
 Restore a dev machine whose workspace is halted, giving up the guest's copies:
@@ -964,7 +985,7 @@ vmlab snapshot restore --vm dev01 --discard-guest-changes before-refactor
 
 ### Exit status
 
-0 on success, and 0 for `list` on a machine with no snapshots. Every refusal and failure exits 1 (`failed`): an unknown machine, a missing snapshot, a capture refused because the workspace is not in step, a restore refused on a halted workspace or a changed image pin, and a snapshot the machine cannot take or restore. Exit 5 (`conflict`) means the supervisor tracks a lab with this name from another directory. A usage error exits 2.
+0 on success, and 0 for `list` on a machine with no snapshots. Every refusal and failure not listed under exit 5 exits 1 (`failed`): an unknown machine, a missing snapshot, a capture refused because the workspace is not in step, a restore refused on a halted workspace or a changed image pin, and a snapshot the machine cannot take or restore. Exit 5 (`conflict`) means the supervisor tracks a lab with this name from another directory, or a freeze refused the verb: a locked snapshot restored, deleted or taken again, the freeze point taken again, or a freeze-point restore blocked by an online snapshot or a disk that is not an overlay on the frozen file. A usage error exits 2.
 
 ## vmlab dev
 

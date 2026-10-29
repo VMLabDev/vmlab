@@ -574,6 +574,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let cdrom = r.path("cdrom").unspan();
     let floppy = r.path("floppy").unspan();
     let depends_on = r.string_list("depends_on");
+    let depends_on_provision = r.string_list("depends_on_provision");
     let nested = r.bool("nested").unspan().unwrap_or(false);
     let gui = r.bool("gui").unspan();
     let agent_update = r.bool("agent_update").unspan();
@@ -649,6 +650,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         cdrom,
         floppy,
         depends_on,
+        depends_on_provision,
         nested,
         gui,
         agent_update,
@@ -714,6 +716,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let cpus = r.int_at_least("cpus", 1).unspan();
     let memory = r.size("memory").unspan();
     let depends_on = r.string_list("depends_on");
+    let depends_on_provision = r.string_list("depends_on_provision");
     let dev = extract_dev(&mut r);
     let mut nics = Vec::new();
     let mut env = Vec::new();
@@ -776,6 +779,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         cpus,
         memory,
         depends_on,
+        depends_on_provision,
         nics,
         env,
         volumes,

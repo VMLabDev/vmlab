@@ -1,7 +1,7 @@
 //! Lab runtime: owns the VM instances, network fabric, persisted state, and
 //! the lifecycle verbs (PRD §7). Lives inside the lab daemon.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -291,6 +291,52 @@ impl ClockAfterRestore {
             Self::NotSet(_) => "not_set",
         }
     }
+}
+
+/// What `up`'s join loop heard back: a machine finished starting, or a
+/// machine's provisioning finished (§7.2).
+enum Joined {
+    Started(Result<String>),
+    Provisioned(Result<()>),
+}
+
+/// A joined task's own result, a panic or abort folded into the error.
+fn flatten_join<T>(joined: std::result::Result<Result<T>, tokio::task::JoinError>) -> Result<T> {
+    joined.unwrap_or_else(|e| Err(anyhow!("join: {e}")))
+}
+
+/// `fut`, abandoned with [`super::provisioning::ProvisionCancelled`] the
+/// moment `cancel` fires.
+async fn until_cancelled<F: std::future::Future>(
+    cancel: &tokio_util::sync::CancellationToken,
+    fut: F,
+) -> Result<F::Output> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow::Error::new(super::provisioning::ProvisionCancelled)),
+        out = fut => Ok(out),
+    }
+}
+
+/// Fail `up` with `first` (§7.2): abort the machines still starting, cancel
+/// every step still running and wait for each to stop, then report the first
+/// real failure — never a cancellation it caused.
+async fn abandon_up<T: 'static>(
+    first: anyhow::Error,
+    mut starting: tokio::task::JoinSet<Result<T>>,
+    mut provisioning: tokio::task::JoinSet<Result<()>>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> anyhow::Error {
+    cancel.cancel();
+    starting.abort_all();
+    while starting.join_next().await.is_some() {}
+    let mut held = first;
+    while let Some(joined) = provisioning.join_next().await {
+        if let Err(e) = flatten_join(joined) {
+            held = super::provisioning::first_failure(held, e);
+        }
+    }
+    held
 }
 
 /// One machine's share-mount task as `up` started it.
@@ -2003,10 +2049,11 @@ impl LabRuntime {
         }
     }
 
-    /// `vmlab up [vm...]` (PRD §7.2, §10.4): start in depends_on waves and
-    /// run provision scripts in declaration order. A dependency is
-    /// satisfied when its VM is ready and the provisions scoped to it have
-    /// completed.
+    /// `vmlab up [vm...]` (PRD §7.2, §10.4): start in `depends_on` waves —
+    /// a dependency is satisfied once it is ready, never waiting for its
+    /// provisioning — and provision every machine in parallel once it has
+    /// started, each running its own steps in declaration order after the
+    /// machines its `depends_on_provision` names have finished theirs.
     pub async fn up(
         self: &Arc<Self>,
         subset: &[String],
@@ -2098,12 +2145,25 @@ impl LabRuntime {
         // during provisioning (PRD §7.5).
         self.ensure_smb(&output).await;
 
-        let steps = plan.steps.clone();
-        let mut next_step = 0usize;
-        let mut done: HashSet<String> = HashSet::new();
         // Every machine's mount task and what it has done so far, reported
         // before the lab is called up (§7.5).
         let mounts: Arc<std::sync::Mutex<Vec<ShareMounts>>> = Arc::default();
+        // Provisioning (§7.2) runs beside the waves, not between them: each
+        // machine's steps are a task of their own, spawned the moment it has
+        // started, gated only on the machines its `depends_on_provision`
+        // names. `finished` is each machine's signal that all of its steps
+        // are done; `cancel` stops every step still running once one fails.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // A caller that drops `up` mid-flight (a cancelled template build)
+        // drops the provisioning set with it; the guard stops the scripts
+        // that set cannot abort.
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let finished: HashMap<String, tokio::sync::watch::Sender<bool>> = plan
+            .provisioning
+            .iter()
+            .map(|p| (p.machine.clone(), tokio::sync::watch::channel(false).0))
+            .collect();
+        let mut provisioning: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
         for wave in &plan.waves {
             let wave = wave.clone();
 
@@ -2120,13 +2180,18 @@ impl LabRuntime {
                 let mounts = Arc::clone(&mounts);
                 // Whether `up` waits on this machine's agent anyway: a
                 // first-boot runs on it, a provision or playbook is scoped to
-                // it, or a later wave depends on it. Only those get the agent
+                // it, another machine's steps wait for its provisioning, or a
+                // later wave depends on it. Only those get the agent
                 // refresh inline (§19.4); `up` must not start waiting on a
                 // machine nothing waits for — one whose guest can never answer
                 // would hold it for the whole ready timeout.
                 let first_boot = me.machine(&n)?.pending_first_boot().is_some();
-                let waited =
-                    first_boot || steps.iter().any(|s| s.machine == n) || me.has_dependents(&n);
+                let waited = first_boot
+                    || plan
+                        .provisioning_of(&n)
+                        .is_some_and(|p| !p.steps.is_empty())
+                    || plan.provision_awaited(&n)
+                    || me.has_dependents(&n);
                 wave_tasks.spawn(async move {
                     let m = me.machine(&n)?;
                     // A first-boot machine's readiness is `run_first_boot`'s
@@ -2192,32 +2257,52 @@ impl LabRuntime {
                     Ok::<_, anyhow::Error>(n)
                 });
             }
-            while let Some(joined) = wave_tasks.join_next().await {
-                let started = match joined {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => {
-                        wave_tasks.abort_all();
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        wave_tasks.abort_all();
-                        return Err(anyhow!("join: {e}"));
+            // The wave is done when every machine in it has started. Meanwhile
+            // the provisioning already under way may fail, which fails `up`
+            // there and then rather than after the boots.
+            loop {
+                let next = tokio::select! {
+                    joined = wave_tasks.join_next() => match joined {
+                        None => break,
+                        Some(joined) => Joined::Started(flatten_join(joined)),
+                    },
+                    Some(joined) = provisioning.join_next(), if !provisioning.is_empty() => {
+                        Joined::Provisioned(flatten_join(joined))
                     }
                 };
-                done.insert(started);
+                match next {
+                    Joined::Started(Ok(started)) => {
+                        if let Some(work) = plan.provisioning_of(&started) {
+                            self.spawn_provisioning(
+                                &mut provisioning,
+                                work,
+                                plan.provision_awaited(&started),
+                                &finished,
+                                &mounts,
+                                &output,
+                                &cancel,
+                            );
+                        }
+                    }
+                    Joined::Started(Err(e)) | Joined::Provisioned(Err(e)) => {
+                        return Err(abandon_up(e, wave_tasks, provisioning, &cancel).await);
+                    }
+                    Joined::Provisioned(Ok(())) => {}
+                }
             }
-
-            // Between waves: run (in declaration order) every unrun
-            // provision/playbook whose machine has already started, so a VM
-            // depending on "dc01" starts only after dc01's configuration
-            // steps completed (§7.2).
-            self.run_up_steps(&steps, &mut next_step, &done, &mounts, &output)
-                .await?;
         }
-
-        // Final pass: the last wave's steps.
-        self.run_up_steps(&steps, &mut next_step, &done, &mounts, &output)
-            .await?;
+        // `up` returns once every step has finished (§7.2).
+        while let Some(joined) = provisioning.join_next().await {
+            if let Err(e) = flatten_join(joined) {
+                return Err(abandon_up(
+                    e,
+                    tokio::task::JoinSet::<Result<String>>::new(),
+                    provisioning,
+                    &cancel,
+                )
+                .await);
+            }
+        }
 
         for line in self.install_forwards(&targets).await {
             output(format!("{line}\n"));
@@ -2409,103 +2494,180 @@ impl LabRuntime {
         Ok(Some((locked, ports, worktree, slot)))
     }
 
-    /// Run configuration steps (provision scripts and playbook applies —
-    /// one declaration-ordered queue, see [`plan`]) in strict
-    /// order starting at `*next`. A step runs once the machine that declares
-    /// it has started, waiting for its readiness first; the queue stops at
-    /// the first step whose machine isn't up yet.
-    async fn run_up_steps(
+    /// Spawn `work`'s provisioning into `set`, its machine having started.
+    /// A machine with no steps that nobody's provisioning waits for needs no
+    /// task: it is finished as it starts.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_provisioning(
         self: &Arc<Self>,
-        steps: &[plan::Step],
-        next: &mut usize,
-        started: &HashSet<String>,
+        set: &mut tokio::task::JoinSet<Result<()>>,
+        work: &plan::Provisioning,
+        awaited: bool,
+        finished: &HashMap<String, tokio::sync::watch::Sender<bool>>,
+        mounts: &Arc<std::sync::Mutex<Vec<ShareMounts>>>,
+        output: &crate::scripting::OutputSink,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) {
+        let Some(done) = finished.get(&work.machine).cloned() else {
+            return;
+        };
+        if work.steps.is_empty() && !awaited {
+            done.send_replace(true);
+            return;
+        }
+        let after: Vec<(String, tokio::sync::watch::Receiver<bool>)> = work
+            .after
+            .iter()
+            .filter_map(|a| finished.get(a).map(|tx| (a.clone(), tx.subscribe())))
+            .collect();
+        let me = Arc::clone(self);
+        let work = work.clone();
+        let mounts = Arc::clone(mounts);
+        let output = output.clone();
+        let cancel = cancel.clone();
+        set.spawn(async move {
+            let name = work.machine.clone();
+            let result = me
+                .provision_machine(&work, after, &mounts, &output, &cancel)
+                .await;
+            match &result {
+                Ok(()) => {
+                    done.send_replace(true);
+                }
+                Err(e) if super::provisioning::is_cancelled(e) => {
+                    output(format!(
+                        "{name}: provisioning cancelled — another machine's step failed\n"
+                    ));
+                }
+                Err(_) => {}
+            }
+            result
+        });
+    }
+
+    /// One machine's configuration (§7.2): once it is ready, and once every
+    /// machine in `after` has finished its own, its provision and playbook
+    /// steps in declaration order, each line of their output led by its name.
+    async fn provision_machine(
+        self: &Arc<Self>,
+        work: &plan::Provisioning,
+        after: Vec<(String, tokio::sync::watch::Receiver<bool>)>,
         mounts: &std::sync::Mutex<Vec<ShareMounts>>,
         output: &crate::scripting::OutputSink,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
-        while *next < steps.len() {
-            let step = &steps[*next];
-            let m = &step.machine;
-            if !started.contains(m) {
-                return Ok(());
+        let m = &work.machine;
+        // A step may read the machine's shares, so it starts once they
+        // have mounted or given up, and says which (§7.5).
+        let report = mounts
+            .lock_recover()
+            .iter()
+            .find(|s| s.machine == *m)
+            .map(|s| Arc::clone(&s.report));
+        if let Some(report) = report.filter(|_| !work.steps.is_empty()) {
+            if !report.is_settled() {
+                output(format!(
+                    "\"{m}\": waiting for its shares to mount before its provisions and \
+                     playbooks\n"
+                ));
             }
-            // A step may read the machine's shares, so it starts once they
-            // have mounted or given up, and says which (§7.5).
-            let report = mounts
-                .lock_recover()
-                .iter()
-                .find(|s| s.machine == *m)
-                .map(|s| Arc::clone(&s.report));
-            if let Some(report) = report {
-                if !report.is_settled() {
-                    output(format!(
-                        "\"{m}\": waiting for its shares to mount before its provisions and \
-                         playbooks\n"
-                    ));
-                }
-                report.settled().await;
-                if report.take_report() {
-                    for line in report.lines(m, true) {
-                        output(line);
-                    }
+            until_cancelled(cancel, report.settled()).await?;
+            if report.take_report() {
+                for line in report.lines(m, true) {
+                    output(line);
                 }
             }
-            let machine = self.machine(m)?;
-            // The machine's own budget, never a literal: a VM may still be
-            // running a first-boot provision, a container's entrypoint starts
-            // fast and its healthcheck governs the rest. A build waives the
-            // wait entirely — see `provisions_wait_ready`.
-            if self
-                .provisions_wait_ready
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                machine.wait_ready(machine.ready_timeout()).await?;
+        }
+        let machine = self.machine(m)?;
+        // The machine's own budget, never a literal: a VM may still be
+        // running a first-boot provision, a container's entrypoint starts
+        // fast and its healthcheck governs the rest. A build waives the
+        // wait entirely — see `provisions_wait_ready`.
+        if self
+            .provisions_wait_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            until_cancelled(cancel, machine.wait_ready(machine.ready_timeout())).await??;
+        }
+        let pending: Vec<&str> = after
+            .iter()
+            .filter(|(_, rx)| !*rx.borrow())
+            .map(|(a, _)| a.as_str())
+            .collect();
+        if !pending.is_empty() {
+            output(format!(
+                "{m}: waiting for the provisioning of {} (depends_on_provision)\n",
+                pending.join(", ")
+            ));
+        }
+        for (_, mut rx) in after {
+            // A sender dropped unfinished is a machine whose provisioning
+            // failed; `up` is failing for it already.
+            until_cancelled(cancel, rx.wait_for(|done| *done))
+                .await?
+                .map_err(|_| anyhow::Error::new(super::provisioning::ProvisionCancelled))?;
+        }
+        let lines = super::provisioning::LinePrefix::new(m, output.clone());
+        let out = lines.sink();
+        for step in &work.steps {
+            let ran = self.run_step(step, &out, cancel).await;
+            lines.flush();
+            ran?;
+        }
+        Ok(())
+    }
+
+    /// One provision or playbook step on its own machine. A provision script
+    /// is cancelled from inside, at its next host call, and awaited until it
+    /// stops; a playbook apply is abandoned where it stands.
+    async fn run_step(
+        self: &Arc<Self>,
+        step: &plan::Step,
+        output: &crate::scripting::OutputSink,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let m = &step.machine;
+        output(format!("{}\n", step.describe()));
+        match &step.kind {
+            plan::StepKind::Provision(p) => {
+                let script = self.root.join(&p.script);
+                // The script reaches its own machine with `lab.this_vm()`.
+                let owner =
+                    crate::scripting::ScriptOwner::provision(m).cancelled_by(cancel.clone());
+                crate::scripting::run_script_file(
+                    self.clone(),
+                    &script,
+                    Some(owner),
+                    None,
+                    output.clone(),
+                )
+                .await
+                .with_context(|| format!("{m}: provision {}", p.script.display()))
             }
-            match &step.kind {
-                plan::StepKind::Provision(p) => {
-                    let script = self.root.join(&p.script);
-                    output(format!("provision: {} → {m}\n", p.script.display()));
-                    // The script reaches its own machine with `lab.this_vm()`.
-                    let owner = Some(crate::scripting::ScriptOwner::provision(m));
-                    crate::scripting::run_script_file(
-                        self.clone(),
-                        &script,
-                        owner,
-                        None,
-                        output.clone(),
-                    )
-                    .await
-                    .with_context(|| format!("provision {}", p.script.display()))?;
-                }
-                plan::StepKind::Playbook(p) => {
-                    output(format!(
-                        "playbook: {} play {} → {m}\n",
-                        p.path.display(),
-                        p.play
-                    ));
-                    let outcome = crate::labd::playbook::run_playbook(
+            plan::StepKind::Playbook(p) => {
+                let outcome = until_cancelled(
+                    cancel,
+                    crate::labd::playbook::run_playbook(
                         self,
                         m,
                         p,
                         crate::labd::playbook::PlaybookMode::Apply,
                         output,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("playbook {} play {} on {m}", p.path.display(), p.play)
-                    })?;
-                    if outcome.exit_code != 0 {
-                        bail!(
-                            "playbook {} play {} on {m}: config-weave exited {}",
-                            p.path.display(),
-                            p.play,
-                            outcome.exit_code
-                        );
-                    }
+                    ),
+                )
+                .await?
+                .with_context(|| format!("playbook {} play {} on {m}", p.path.display(), p.play))?;
+                if outcome.exit_code != 0 {
+                    bail!(
+                        "playbook {} play {} on {m}: config-weave exited {}",
+                        p.path.display(),
+                        p.play,
+                        outcome.exit_code
+                    );
                 }
+                Ok(())
             }
-            *next += 1;
         }
-        Ok(())
     }
 
     /// Run the machine's first-boot provision the first time it is
@@ -4688,6 +4850,193 @@ lab "t" { container "leaf" { image = "x:1" } }"#,
         );
     }
 
+    /// A provision script that says `<tag>-begin`, holds for `hold_ms`, then
+    /// says `<tag>-end`.
+    fn timed_script(dir: &std::path::Path, tag: &str, hold_ms: u64) {
+        std::fs::write(
+            dir.join(format!("{tag}.ws")),
+            format!(
+                "use vmlab\n\nfn main(lab: Lab) {{\n    lab.log(\"{tag}-begin\")\n    \
+                 vmlab::sleep_ms({hold_ms})\n    lab.log(\"{tag}-end\")\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Where `needle` first appears in what `up` said, by the shared clock.
+    fn said_at(said: &Said, needle: &str) -> usize {
+        let said = said.lock().unwrap();
+        said.iter()
+            .find(|(_, s)| s.contains(needle))
+            .map(|(n, _)| *n)
+            .unwrap_or_else(|| panic!("{needle} missing from {said:?}"))
+    }
+
+    /// Machines nothing orders provision in parallel (§7.2), and every line
+    /// of their output is led by the machine's name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_machines_provision_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        timed_script(dir.path(), "a", 400);
+        timed_script(dir.path(), "b", 400);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "a" { image = "x:1" provision "a.ws" { } }
+  container "b" { image = "x:1" provision "b.ws" { } }
+}"#,
+            vec![
+                FakeMachine::new("a", MachineKind::Container, &sh),
+                FakeMachine::new("b", MachineKind::Container, &sh),
+            ],
+        );
+        let (sink, said) = numbered(&sh);
+        lab.up(&[], sink).await.expect("up");
+        assert!(
+            said_at(&said, "a: a-begin") < said_at(&said, "b: b-end")
+                && said_at(&said, "b: b-begin") < said_at(&said, "a: a-end"),
+            "the two provisions did not overlap: {:?}",
+            said.lock().unwrap()
+        );
+        assert!(said_at(&said, "a: provision a.ws") < said_at(&said, "a: a-begin"));
+    }
+
+    /// The F12 defect, regressed: a dependent declared *above* its
+    /// dependency. The one file-ordered queue stalled at the dependent's step
+    /// (its machine not started yet), so the dependency's provision ran only
+    /// after the dependent had started — and then after the dependent's own.
+    /// `depends_on_provision` now orders them whatever the file order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dependency_declared_below_provisions_first_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        timed_script(dir.path(), "join", 50);
+        timed_script(dir.path(), "dc", 300);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "member" {
+    image = "x:1"
+    depends_on = ["dc"]
+    depends_on_provision = ["dc"]
+    provision "join.ws" { }
+  }
+  container "dc" { image = "x:1" provision "dc.ws" { } }
+}"#,
+            vec![
+                FakeMachine::new("member", MachineKind::Container, &sh),
+                FakeMachine::new("dc", MachineKind::Container, &sh),
+            ],
+        );
+        let (sink, said) = numbered(&sh);
+        lab.up(&[], sink).await.expect("up");
+        assert!(
+            said_at(&said, "dc: dc-end") < said_at(&said, "member: join-begin"),
+            "member's step ran before dc's had finished: {:?}",
+            said.lock().unwrap()
+        );
+        assert!(
+            said_at(&said, "member: waiting for the provisioning of dc")
+                < said_at(&said, "dc: dc-end"),
+            "the wait was not announced: {:?}",
+            said.lock().unwrap()
+        );
+    }
+
+    /// `depends_on` is start order only (§7.2): the dependent starts once its
+    /// dependency is ready, while the dependency is still provisioning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn depends_on_does_not_wait_for_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        timed_script(dir.path(), "dc", 500);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "dc" { image = "x:1" provision "dc.ws" { } }
+  container "app" { image = "x:1" depends_on = ["dc"] }
+}"#,
+            vec![
+                FakeMachine::new("dc", MachineKind::Container, &sh),
+                FakeMachine::new("app", MachineKind::Container, &sh),
+            ],
+        );
+        let (sink, said) = numbered(&sh);
+        lab.up(&[], sink).await.expect("up");
+        let started = sh
+            .log
+            .lock()
+            .await
+            .iter()
+            .find(|l| l.ends_with(":app:start"))
+            .and_then(|l| l.split(':').next()?.parse::<usize>().ok())
+            .expect("app never started");
+        assert!(
+            started < said_at(&said, "dc: dc-end"),
+            "app waited for dc's provisioning: {:?}",
+            said.lock().unwrap()
+        );
+    }
+
+    /// The first failed step fails `up` with its own error, cancels the steps
+    /// still running — a script stops at its next host call — and never
+    /// starts the ones waiting on the failed machine; `up` returns once all
+    /// of them have stopped (§7.2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_failed_step_cancels_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        std::fs::write(
+            dir.path().join("bad.ws"),
+            "use vmlab\n\nfn main(lab: Lab) {\n    vmlab::sleep_ms(200)\n    \
+             let _m = lab.machine(\"nope\").expect(\"bad-step-failed\")\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("slow.ws"),
+            "use vmlab\n\nfn main(lab: Lab) {\n    lab.log(\"slow-begin\")\n    \
+             vmlab::sleep_ms(60000)\n    lab.log(\"slow-end\")\n}\n",
+        )
+        .unwrap();
+        timed_script(dir.path(), "after", 0);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  container "bad" { image = "x:1" provision "bad.ws" { } }
+  container "slow" { image = "x:1" provision "slow.ws" { } }
+  container "after" { image = "x:1" depends_on_provision = ["bad"] provision "after.ws" { } }
+}"#,
+            vec![
+                FakeMachine::new("bad", MachineKind::Container, &sh),
+                FakeMachine::new("slow", MachineKind::Container, &sh),
+                FakeMachine::new("after", MachineKind::Container, &sh),
+            ],
+        );
+        let (sink, said) = numbered(&sh);
+        let began = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(20), lab.up(&[], sink))
+            .await
+            .expect("up returned once the steps stopped")
+            .expect_err("a failed step fails up");
+        assert!(began.elapsed() < Duration::from_secs(20));
+        let err = format!("{err:#}");
+        assert!(err.contains("bad: provision bad.ws"), "{err}");
+        assert!(err.contains("bad-step-failed"), "{err}");
+        let said = said.lock().unwrap();
+        let has = |needle: &str| said.iter().any(|(_, s)| s.contains(needle));
+        assert!(has("slow: slow-begin") && !has("slow-end"), "{said:?}");
+        assert!(has("slow: provisioning cancelled"), "{said:?}");
+        assert!(
+            !has("after-begin"),
+            "a step waiting on the failure ran: {said:?}"
+        );
+    }
+
     /// `down` runs the waves leaves-first: a dependency outlives the machines
     /// that need it to shut down cleanly.
     #[tokio::test]
@@ -4911,7 +5260,7 @@ lab "t" {
         let said = said.lock().unwrap();
         let provision = said
             .iter()
-            .find(|(_, s)| s.starts_with("provision: p.ws"))
+            .find(|(_, s)| s.starts_with("win: provision p.ws"))
             .map(|(n, _)| *n)
             .expect("the provision never ran");
         assert!(

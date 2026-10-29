@@ -31,6 +31,8 @@ FEATURES: dict[str, str] = {
     "lab.up": "`vmlab up` brings the lab up",
     "lab.up.partial": "`vmlab up <machine>` brings up one machine",
     "lab.depends_on": "`depends_on` orders machine start",
+    "lab.depends_on_provision": "`depends_on_provision` holds a machine's provisions until another's have finished",
+    "lab.provision.parallel": "machines nothing orders provision in parallel, each line led by the machine's name",
     "lab.status": "`vmlab status` and `status -v`",
     "lab.down": "`vmlab down`",
     "lab.up.reload": "`vmlab up` after `down` runs the edited lab file; an edit over a running machine refuses",

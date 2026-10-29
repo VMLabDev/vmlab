@@ -35,6 +35,21 @@ or set `VMLAB_VERSION`. To install somewhere other than `~/.local/bin`, pass
 `--bin-dir <dir>` or set `VMLAB_INSTALL_DIR`. If the target directory is not on
 your `PATH`, the installer prints the `export` line to add.
 
+The network fabric needs no privilege. Its optional eBPF fast path needs
+`CAP_BPF` and `CAP_NET_ADMIN`. Installed as an ordinary user from a terminal,
+the installer asks whether to grant the binary those two capabilities, and on
+yes runs `sudo setcap cap_bpf,cap_net_admin+ep` on it; any program running as
+the user can then use them through vmlab. `--fastpath` grants them without
+asking, `--no-fastpath` never offers, and `VMLAB_FASTPATH_CAPS=yes|no|ask` sets
+the same choice. With no terminal to ask on, the installer prints the `setcap`
+command instead. It offers nothing when run as root, whose daemons hold every
+capability already, or on WSL 2, which cannot run the fast path, and it says so
+when the binary sits on a `nosuid` mount, where the kernel ignores file
+capabilities. Replacing the binary drops its capabilities, so every install
+asks again, defaulting to yes when the binary it replaced had them. Daemons
+already running keep the privileges they started with: run `vmlab daemon stop`
+before `vmlab fastpath`.
+
 ### Build from source instead
 
 The prebuilt binary exists for Linux x86_64 only. On any other Linux
@@ -48,6 +63,26 @@ cargo install --git https://github.com/VMLabDev/vmlab --locked
 
 From a checkout, `just build` runs `cargo build` and `just install` runs
 `cargo install --path . --locked`, which places the binary in `~/.cargo/bin`.
+A source build installs no guest assets; Guest assets below says how to build
+them.
+
+To build everything a release ships with no host toolchain beyond Docker, use
+the build container. The image holds every toolchain on Ubuntu 24.04, the
+distribution CI builds on. The checkout is mounted into it and the build runs as
+the user, so nothing in the checkout ends up owned by root.
+
+```sh
+just buildbox::dist
+ls target/dist/
+```
+
+`target/dist/` then holds the release binary `vmlab-<version>-linux-x86_64`, the
+guest bundle `vmlab-guest-<version>.tar.gz` with its `.sha256`, and the BPF
+objects rebuilt under `bpf/`. The first run builds the image and every target
+from cold; later runs are incremental, because cargo's caches and target
+directories persist in Docker volumes. `just buildbox::shell` opens a shell in
+the same container, where `just ci::check` runs. `build/README.md` describes the
+setup.
 
 Confirm the binary runs:
 
@@ -97,10 +132,14 @@ a squashfs. A VNC viewer is required for `vmlab console` and `gui = true`;
 unix socket directly, and `gvncviewer` or `vncviewer` work over a local TCP
 bridge. Shared folders use `virtiofsd` when the host and guest both support it
 and fall back to the bundled `smbd` otherwise, so installing both covers every
-guest.
+guest. Install `virtiofsd` 1.13.0 or later for every feature: online snapshots
+of a VM with a virtiofs share need 1.11.0, and read-only virtiofs shares need
+1.13.0. Ubuntu 24.04 ships 1.10.0, and the install script says so when it finds
+one that old.
 
 vmlab checks for a missing tool when it first needs it, not at install time.
-`vmlab validate` does not probe the host. A missing emulator is reported by
+`vmlab validate` probes the host only for `virtiofsd`, when a share demands
+virtiofs and the installed one cannot serve it. A missing emulator is reported by
 `vmlab up`, a missing `sqfstar` by the first container start, and a missing
 viewer by `vmlab console`.
 
@@ -136,8 +175,11 @@ TempleOS) — and `install.sh` downloads it from the same release as the binary,
 verifies it against its `.sha256`, and swaps it into
 `~/.local/share/vmlab/guest/` whole, so nothing from an older version
 survives. `--no-guest` skips it; `--guest-dir <dir>` (or `VMLAB_GUEST_DIR`)
-puts it elsewhere, which then needs `VMLAB_GUEST_ASSET_DIR` pointing at it. A
-failed download or checksum mismatch keeps the binary and warns.
+puts it elsewhere; vmlab does not search an arbitrary directory, so the
+installer then prints the `VMLAB_GUEST_ASSET_DIR` setting that points vmlab at
+it. A failed download, a checksum mismatch, or a release published before the
+bundle existed costs only the guest assets: the installer keeps the binary,
+warns, and names the source build below as the fallback.
 
 Build them from source when working on vmlab, running a source-built binary,
 or after `--no-guest`: one recipe runs the three build scripts and copies the
@@ -159,10 +201,27 @@ runs without root and needs `curl`, `tar`, `gzip`, `cpio`, `sha256sum`,
 `cargo`, `rustup` and `git` on the host, plus the
 `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` Rust targets
 installed with `rustup target add`. `guest/build-agent.sh` cross-compiles the
-agent for Linux x86_64, aarch64 and riscv64 and for Windows x86_64. The Windows
-target needs `x86_64-w64-mingw32-gcc` from mingw-w64 and is skipped with a
-warning when it is absent. The riscv64 target is best-effort and skipped the
-same way.
+agent for Linux x86_64, aarch64 and riscv64 and for Windows x86_64 and x86. The
+Windows targets need `x86_64-w64-mingw32-gcc` and `i686-w64-mingw32-gcc` from
+mingw-w64 and are skipped with a warning when absent. The riscv64 target is
+best-effort and skipped the same way. `guest/build-agent-legacy.sh` builds the
+legacy agents: the Windows NT build with mingw-w64, the Windows 9x and DOS builds
+with OpenWatcom v2 (found through `$WATCOM`, else `~/.local/opt/open-watcom-v2`),
+and the old-Linux build with the host `cc` at `-m32 -static`, which needs
+`gcc-multilib` on an x86_64 host.
+
+The Windows agents target `*-win7-windows-gnu` rather than `*-pc-windows-gnu`,
+because the standard library's usual RNG entry point (`ProcessPrng`) arrived in
+Windows 10 1809 and an import the loader cannot resolve stops the process
+starting at all. Those targets are tier 3, so the build needs a nightly
+toolchain with `rust-src`; it reuses the channel `ebpf/rust-toolchain.toml`
+pins. They also link against an msvcrt C runtime built by
+`guest/build-mingw-msvcrt.sh`, a one-time five-minute build into
+`~/.local/share/vmlab/toolchains/mingw-msvcrt`. Distribution mingw-w64 packages
+are UCRT-only, and a binary that imports the UCRT will not load on Vista, 7, 8,
+8.1, Server 2008, 2008 R2, 2012 or 2012 R2; `msvcrt.dll` has been present since
+NT4. Without the prefix the agents still build, and the script says what that
+cost.
 
 Assets are not needed for every workflow:
 
@@ -175,7 +234,7 @@ Assets are not needed for every workflow:
   architecture, unless the template sets `agent = false`. Without it the build
   fails before booting anything, with the same kind of message.
 
-Success: `ls ~/.local/share/vmlab/guest/` lists `x86_64` and `agent`.
+Success: `ls ~/.local/share/vmlab/guest/` lists `aarch64`, `agent` and `x86_64`.
 `cat ~/.local/share/vmlab/guest/x86_64/VERSION` prints a version stamp.
 
 ### On WSL 2
@@ -916,7 +975,8 @@ Four things in this file are the shape of every provision script.
   by name.
 - Methods that can fail return `Result`. The `?` operator propagates an error
   string out of `setup`, and `expect` in `main` turns it into a failed
-  provision, which fails `vmlab up` with that message.
+  provision, which fails `vmlab up` with the message followed by the error, as
+  `alpine-registry setup failed: <err>`.
 - `wait_ready(600)` blocks until the guest agent answers or 600 seconds pass. A
   provision runs after its machine is ready, so the call is instant during `up`,
   but it makes the script correct under `vmlab script` too, where nothing has

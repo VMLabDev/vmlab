@@ -28,9 +28,11 @@ vm "<name>" {
   cdrom       = "./isos/boot.iso"
   floppy      = "./boot.img"
   depends_on  = ["dc01"]
+  depends_on_provision = ["dc01"]
   nested      = false
   gui         = false
   agent_update = true
+  prevent_sleep = false
   clock       = "host"         // or "snapshot", or "2020-01-01T00:00:00Z"
   display     = "virtio-vga"
   cpu_model   = "pentium3"
@@ -61,17 +63,19 @@ vm "<name>" {
 | `disk` | ByteSize | none | Primary disk size, for example `64GiB`. Scratch VMs only; rejected on cloned VMs. |
 | `cdrom` | utf8 | none | Path to an ISO to attach as a CD-ROM, relative to the lab root. |
 | `floppy` | utf8 | none | Path to a floppy image to attach, relative to the lab root. |
-| `depends_on` | list<utf8> | none | VM or container names to wait for before this one starts. No cycles. |
+| `depends_on` | list<utf8> | none | Start order: VM or container names that must be ready before this one starts. Ready means a VM's agent answers or a container passes its healthcheck; their provisioning is not waited for. `down` stops in reverse. No self-reference, no cycles. |
+| `depends_on_provision` | list<utf8> | none | Provisioning order: VM or container names whose provision and playbook steps must all finish before this machine's first step runs. Does not delay this machine's start. No self-reference, no cycles. |
 | `nested` | bool | `false` | Expose hardware virtualisation (VMX/SVM) to the guest. Without it, an x86 guest under KVM has both masked. `up` warns when the host's KVM module has nested virtualisation off. No effect under TCG or on other architectures. |
 | `gui` | bool | lab `gui` | Open a VNC viewer on `up`. The VM always runs headless. |
 | `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
-| `clock` | utf8 | `host` | Guest clock policy. `host`: the RTC runs from the host's time, and after an online snapshot restore the lab daemon sets the guest's clock to the host's current time through the agent (a failure warns and the restore still succeeds). `snapshot`: a restored guest keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z` (any offset, converted to UTC): the RTC starts at that instant on every boot and runs forward, and vmlab never sets it, after a restore included. The guest's own NTP or w32time can still move it. Declared on the machine block only, never inherited. Also accepted on a `container {}`. |
+| `prevent_sleep` | bool | `false` | Keep the guest awake: the moment it suspends to RAM (ACPI S3), the lab daemon wakes it with QMP `system_wakeup` and records `vm.woken` with `cause = prevent_sleep`. Declared on the `vm` block only, never inherited: it is the daemon's policy, not hardware. The template build VM always has it on. Not accepted on a `container {}`. Without it a sleeping guest shows `suspended` in `vmlab status` until `vmlab vm start` wakes it. |
+| `clock` | utf8 | `host` | Guest clock policy. `host`: the RTC runs from the host's time, and after an online snapshot restore the lab daemon sets the guest's clock to the host's current time through the agent (a failure warns and the restore still succeeds). `snapshot`: a restored guest keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z` (any offset, converted to UTC): the RTC starts at that instant on every boot and runs forward, and vmlab never sets it, after a restore included. The guest's own NTP or w32time can still move it; turn that sync off in the guest, or keep the machine off a segment with a route to a time server, when the date must hold. Declared on the machine block only, never inherited. Also accepted on a `container {}`. |
 | `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
 | `cpu_model` | utf8 | inherited | QEMU `-cpu` model, for example `pentium3`, `pentium2`, `qemu32` or `Westmere`, replacing the default (`host` under KVM, `max` under TCG) under either accelerator. For guests the host CPU breaks, such as Windows 9x Setup. Inherited from template, then profile. Any non-empty name is accepted; QEMU refuses an unknown one at start. Cannot be combined with `nested = true`. |
 | `accel` | utf8 | inherited | Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`. |
 | `firmware` | utf8 | inherited | Firmware: `ovmf` or `seabios`. Inherited from template, then profile. |
 | `tpm` | bool | inherited | Enable a TPM 2.0 device. Inherited from template, then profile. |
-| `usb` | bool | inherited | Boot with a hot-plug xHCI controller (id `usbx`) so `vmlab usb attach` can pass host USB devices in. VM > profile only — a template has no say; off when neither sets it. Changes the VM's hardware: online snapshots taken without it no longer restore, and on q35 the tablet moves to the new controller. |
+| `usb` | bool | inherited | Boot with a hot-plug xHCI controller (id `usbx`) so `vmlab usb attach` can pass host USB devices in. VM > profile only — a template has no say; off when neither sets it. Changes the VM's hardware: online snapshots taken without it no longer restore, and on q35 the tablet moves to the new controller. On `virt` (aarch64, riscv64), which already has an xHCI, nothing is added: the existing controller is the one devices attach to. |
 | `secure_boot` | bool | inherited | Enable secure boot; OVMF only. Inherited from template, then profile. |
 | `secure_boot_keys` | utf8 | inherited, else `microsoft` | Key store secure boot starts from: `microsoft` (bundled store, Microsoft's keys) or `setup` (blank store — firmware in setup mode, the guest enrolls its own keys, the VM's `OVMF_VARS.fd` keeps them). Inherited from template, then profile. Needs `secure_boot = true`. |
 | `secure_boot_vars` | utf8 | none | Pre-enrolled UEFI VARS file (relative to lab root) copied once at first start instead of the bundled store; must be the secure-boot firmware's VARS size. Needs `secure_boot = true`; exclusive with `secure_boot_keys`; overrides a template's stored VARS. |
@@ -113,8 +117,12 @@ Known architectures are `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`,
 - `cpus` is at least 1. `memory` and `disk` are non-negative sizes.
 - `disk` on a store or registry template is an error; clones inherit the
   template's disk. Use `disk "name" {}` blocks for extra disks.
-- Every name in `depends_on` exists in the lab, and the dependency graph across
-  VMs and containers has no cycle.
+- Every name in `depends_on` and `depends_on_provision` exists in the lab and is
+  not the machine itself.
+- Neither key forms a cycle across VMs and containers; the error names the whole
+  path. The two keys are separate graphs, so a loop that crosses from one to the
+  other is allowed: starting a machine never waits for provisioning, so it cannot
+  deadlock.
 - `profile`, if set, names a known profile.
 - `cdrom` and `floppy` name files that exist under the lab root.
 - `clock` is `host`, `snapshot`, or an RFC 3339 date-time such as
@@ -423,8 +431,9 @@ provision "scripts/setup.ws" { }
 | `script` | utf8 (label) | required | Path to the `.ws` file, relative to the lab root; the inline label. Must exist and compile. |
 
 Validation checks the file exists and compiles it, reporting compile errors
-against the block. Across machines, steps follow the order the machine blocks
-appear, with `depends_on` gating when each becomes eligible.
+against the block. Different machines provision in parallel; only
+`depends_on_provision` holds one machine's first step until another machine's
+steps have all finished.
 
 ## playbook {}
 

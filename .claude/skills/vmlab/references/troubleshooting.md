@@ -73,11 +73,21 @@ no vmlab-agent answered on the agent channel
 agent did not open the channel in time
 ```
 
-A machine is *ready* when its agent answers on the `vmlab.agent.0` virtio-serial port. VMs get ten minutes, containers five. `vmlab up` waits for readiness only when a later wave depends on the machine, or a provision or share must run on it, so the first symptom is often `first-boot {name}: agent did not come up` from a provision rather than the timeout itself.
+A machine is *ready* when its agent answers on the `vmlab.agent.0` virtio-serial port. VMs get ten minutes, containers five. `vmlab up` waits for readiness only when a later wave depends on the machine, another machine names it in `depends_on_provision`, or a provision or share must run on it, so the first symptom is often `first-boot {name}: agent did not come up` from a provision rather than the timeout itself.
 
 Usual causes, in order of likelihood: the template was built without the agent, or with an agent from an older vmlab; the guest is still installing (a template build that has not finished); the guest is running under TCG and has not reached userspace yet; or the guest booted but its agent service failed. Open the display with `vmlab console <machine>` and look. `vmlab machine capabilities <machine>` prints `agent -` when the agent has not answered at all, and a feature list when it has.
 
 If the guest is up and the agent is absent, rebuild the template so the bake installs the agent this vmlab ships, or push one into the running machine with `vmlab machine repair-agent`. A container's agent comes from the host's guest asset, so on a container the message ends with `there is nothing to rebuild or repair — an agent that is not answering here is a machine to restart, or a guest asset to reinstall (§19.4)`.
+
+## The machine is suspended
+
+```
+{machine} is suspended: the guest went to sleep (ACPI S3) and nothing in it answers until it is woken
+```
+
+QEMU's q35 machine advertises ACPI S3, and a guest that takes it, as a Windows client edition does after an idle timeout, leaves QEMU running with its vCPUs stopped. `vmlab status` shows the VM `suspended`, the event log has `vm.suspended`, and `exec`, `shell`, `cp` and every other agent command fail at once with this message and exit code 5 (`conflict`) rather than waiting out a handshake.
+
+`vmlab vm start <machine>` wakes it where it left off. To stop it sleeping at all, set `prevent_sleep = true` on the `vm` block (vm.md), or turn the guest's own sleep timer off. Template builds already run with `prevent_sleep` on.
 
 ## A copy failed because the file channel went silent
 
@@ -138,9 +148,13 @@ A leftover `AutoLogonCount` is a different cause with the same symptom (Windows 
 | ``` machine `{machine}` did not start, so its recording was not started ``` | A `--record` on `up`/`vm start`/`vm restart` named a VM whose boot failed. Exit 1. | Fix the boot; a VM that was already running would have been recorded from now instead. |
 | ``` recording `{path}`: unsupported extension `.gif`; a recording is written as `.mp4` (H.264) or `.webm` (VP9) — convert it afterwards for anything else ``` | Refused by the CLI before any daemon is reached. | Record to `.mp4` and convert with ffmpeg afterwards. |
 
-## `vmlab machine repair-agent` refused
+## The machine's agent is out of date
 
-A machine whose agent is older than the host's lacks features the host expects; `vmlab machine capabilities <machine>` lists the ones it negotiated. `vmlab up` and `vmlab vm start` normally refresh it by themselves when the VM's agent stamp differs from the shipped agent's, printing `agent: updated "<vm>" (<old> → <new>)`, or `warning: agent: could not update "<vm>" …` with the reason, leaving the old agent in place and carrying on; `agent_update = false` on the `vm` or `lab` block turns that off. Rebuilding the template is the durable remedy. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:
+```
+the guest agent has no `watch` support — rebuild the template to update it
+```
+
+A machine whose agent is older than the host's lacks features the host expects, such as the `fileops` and `watch` the workspace syncer needs; `vmlab machine capabilities <machine>` lists the ones it negotiated. `vmlab validate` says nothing about it, deliberately, because it needs a running agent to know. `vmlab up` and `vmlab vm start` normally refresh it by themselves when the VM's agent stamp differs from the shipped agent's, printing `agent: updated "<vm>" (<old> → <new>)`, or `warning: agent: could not update "<vm>" …` with the reason, leaving the old agent in place and carrying on; `agent_update = false` on the `vm` or `lab` block turns that off. Rebuilding the template is the durable remedy. `vmlab machine repair-agent <machine>` pushes the host's shipped agent into the running machine over its own channel and marks the machine *diverged* in `vmlab status`, so you remember the clone no longer matches its template. It refuses on three conditions:
 
 | Refusal | Meaning |
 | --- | --- |
@@ -194,6 +208,16 @@ cannot open /dev/bus/usb/{bus}/{dev} for {vid}:{pid} {device} at port {port} —
 
 Host USB devices hot-plug onto an xHCI the VM gets only when it starts with `usb = true` (vm block or profile). Add it and `vmlab vm restart {machine}`. Off by default because it changes the VM's hardware: online snapshots taken before no longer restore. A container refuses with `USB passthrough is for VMs` and nothing changes that.
 
+## Large reads fail on a Windows virtiofs share
+
+```
+WARNING: vm "{machine}": share "{share}" rides virtiofs into a Windows guest; virtio-win 0.1.302's VioFS driver fails large reads there at random ("Error performing inpage operation") and can leave a copy that reported success unreadable; use transport = "smb" (or "auto", which picks SMB on Windows) unless the template carries a VioFS without the fault, such as 0.1.285
+```
+
+`vmlab up` prints this for every share that rides virtiofs into a Windows guest. Listings and small files work, but reading a file of a few hundred megabytes or more fails in the guest with `Error performing inpage operation`, and some copy tools, `robocopy /J` among them, report success while leaving a copy that cannot be read. The fault is in virtio-win 0.1.302's VioFS driver, and no `virtiofsd` setting avoids it.
+
+Set `transport = "smb"` on the share, or remove `transport` so that `auto` picks SMB; an SMB share needs the VM to have a `nic {}`. A template built with VioFS 0.1.285 reads large files correctly over virtiofs; the warning still appears for it, because vmlab cannot see the guest's driver version.
+
 ## A port forward was skipped
 
 ```
@@ -208,7 +232,59 @@ Every forward in the lab is planned before `up` installs any. When two claim the
 | `needs a nic to reach it over` | The target machine has no `nic {}`, so no segment reaches it. |
 | `no lease — is it running and ready?` | The target has a NIC but no DHCP lease yet. The forward installs once the machine is up; `vmlab status` shows the lease. |
 
-A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort and reports in the lab log. Change the `host_port` or free the port. Two instances of one lab file declare the same fixed `host_port`, so the second instance's forward fails this way while the first holds the port. Omit `host_port` (or a `port {}`'s `host`) and each instance binds a free port of its own, which `vmlab status` shows marked `(auto)`.
+A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort: the rest of the lab still comes up, and `vmlab logs` carries a `forward.skipped` event in the same `{what}: {why}` shape, for example `"vm1": forward: cannot listen on host 0.0.0.0:14330: Address already in use (os error 98)`. Change the `host_port` or free the port. Two instances of one lab file declare the same fixed `host_port`, so the second instance's forward fails this way while the first holds the port. Omit `host_port` (or a `port {}`'s `host`) and each instance binds a free port of its own, which `vmlab status` shows marked `(auto)`.
+
+A forward that did install leaves a `forward.installed` event naming its host port and guest address. A forward with neither event was never planned: check that `vmlab validate` lists the segment and that the machine it names has started.
+
+## A lab gpu {} still names an address
+
+```
+gpu `address` moved to the host config: declare `gpu "<name>" { address = "0000:01:00.0" }` in ~/.config/vmlab/config.wcl and name it here with `host_gpu = "<name>"` (or mark it `default = true`) (PRD §5.2)
+```
+
+vmlab 0.24 let a lab's `gpu {}` carry `address` and `vulkan_icd`, and the host config a default `gpu_address`. All three moved into named host GPUs; a lab or host config still carrying one fails every verb with a message of this shape.
+
+Move the address, and any `vulkan_icd`, into a `gpu "<name>" {}` block beside `host {}` in `~/.config/vmlab/config.wcl` (host-profiles.md). Delete the fields from the lab, then write `host_gpu = "<name>"` in its `gpu {}` or leave it out and let the host's default apply. A lone `gpu` block is the default without `default = true`.
+
+## A host GPU is not declared on this host
+
+```
+{machine}: host GPU `{name}` is not declared on this host; using the default `{default}`
+```
+
+A warning from `vmlab validate`, `vmlab up` and the lab daemon's log: the lab's `host_gpu` names a GPU this host config does not declare, and the mode is `virgl` or `vulkan`, so it falls back to the host's default. With no default either, the message says so and QEMU picks the render node. Declare a `gpu` block of that name on this host, or mark the GPU you want `default = true`; names match case-insensitively.
+
+Under `passthrough` the mismatch is an error naming the GPUs this host does declare. `passthrough` with no `host_gpu` and no default fails too, and so does a host with several GPUs and no default:
+
+```
+passthrough needs a host GPU: declare `gpu "<name>" { address = ... }` in ~/.config/vmlab/config.wcl
+```
+
+## No host GPU was picked on a host with several render nodes
+
+```
+this host has {n} render nodes and no host GPU was picked for a virgl/vulkan gpu {}: {nodes} — declare `gpu "<name>" { address = ... }` in ~/.config/vmlab/config.wcl (a lone one is the default, else mark one `default = true`) (PRD §5.2)
+```
+
+A warning from `vmlab up` and `vmlab validate`. QEMU renders on whichever node it finds first, and Venus sees every Vulkan driver on the host, so the console can come up black. Each node is listed with its PCI address and kernel driver: declare the one you want as a host GPU.
+
+## A host GPU's qemu_binary is refused
+
+```
+vm "{machine}": host GPU `{name}`: qemu_binary {path} does not exist
+vm "{machine}": host GPU `{name}`: qemu_binary {path} is not an executable file
+vm "{machine}": host GPU `{name}`: qemu_binary {path} emulates {theirs}, but this VM is {ours} (it would need qemu-system-{ours})
+```
+
+`vmlab validate` and VM start check the `qemu_binary` of the host GPU a VM resolves to, in every GPU mode. For the first two, fix the path or set the executable bit. The third means the file is named `qemu-system-<arch>` for another arch: give the GPU the build for the arch your VMs run. A file with any other name is not checked for arch.
+
+## A Venus guest on NVIDIA has a black console
+
+A `vulkan` guest on an NVIDIA host GPU renders correctly, but its VNC console and `vmlab vm screenshot` go black once the guest presents. Stock QEMU 11.1's `egl-headless` binds the scanout in a way NVIDIA's EGL refuses. Point the NVIDIA host GPU's `qemu_binary` at the patched QEMU; host-profiles.md (`gpu "<name>" {}`) has the cause and the branch.
+
+## A Venus guest's console shows bands of stale pixels
+
+The VNC console and `vmlab vm screenshot` of a Windows `vulkan` guest show horizontal bands of an earlier frame across a GPU-drawn window that was changing. The bands are in the frame the guest's display driver produces, so every VNC client sees them, and nothing in vmlab or QEMU fixes it (host-profiles.md, `gpu "<name>" {}`). For a desktop that must be exact, use RDP: forward the guest's port 3389, for example `forward { host_port = 13389 to = "win11:3389" }`, and connect an RDP client to `127.0.0.1:13389`.
 
 ## A host GPU is in a failed power state
 
@@ -219,6 +295,14 @@ host GPU `Nvidia1`: gpu address 0000:01:00.0: the device is in a failed power st
 The driver powered the idle GPU down (runtime PM, `power/control=auto`) and could not resume it; on NVIDIA the kernel log has `Xid 119` (GSP timeout), often `Xid 79`, and `nvidia-smi` finds no device. Only a host reboot recovers it. Prevent it with the host-side fixes in host-profiles.md (`gpu "<name>" {}`, runtime power management): a udev rule setting `power/control=on`, or `options nvidia NVreg_DynamicPowerManagement=0x00`. Meanwhile `keepawake` (default `auto` on NVIDIA) holds the GPU across `down`/`up` while the supervisor runs; `vmlab status -v` shows `keepawake=on`.
 
 `host GPU `X` (addr) can runtime-suspend (power/control=auto): …` is the warning form of the same risk, printed by `up`. When `status -v` shows `keepawake=failed`, the helper could not open the GPU through EGL; the reason is in `~/.local/state/vmlab/labd-<lab>.log`.
+
+## A Venus guest sees two GPUs
+
+A `vulkan` guest on a declared host GPU should list one Venus device, plus its own `llvmpipe`; vmlab's `VK_LAYER_VMLAB_pci_filter` hides every other device (host-profiles.md, `gpu "<name>" {}`). When the guest still lists two, look in the VM's `qemu.log`:
+
+- The `vmlab: env:` line sets `VMLAB_VK_PCI_FILTER_DISABLE=1`: the host GPU's `qemu_env` turned the filter off. Remove that key.
+- The `vmlab: env:` line has `VK_ADD_IMPLICIT_LAYER_PATH`, but no `vmlab-pci-filter:` line follows it after the guest has used Vulkan: the host's Vulkan loader is too old. Update `vulkan-icd-loader` or `libvulkan1`.
+- A `vmlab-pci-filter: <address>: no Vulkan device at this address` line means the driver at that address reports no `VK_EXT_pci_bus_info`, and the guest sees no device at all. Check `vulkaninfo` on the host for that card.
 
 ## Nested virtualisation is off on WSL 2
 

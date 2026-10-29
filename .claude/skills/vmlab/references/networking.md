@@ -93,6 +93,14 @@ off-segment reaches the host's own address space. That is how a guest reaches a
 host-side service such as a package mirror or a licence server, with no
 listener inside the guest and no route of the guest's own.
 
+Under worktree isolation (worktrees.md) that path is closed. The NAT refuses every
+new flow to the host: `127.0.0.0/8`, `0.0.0.0/8`, and every address and broadcast
+address on a host interface, re-read at most once a second so a VPN or a renewed
+lease is covered from the next flow. A refused TCP connect gets a reset; UDP and
+ICMP are dropped silently. The only exception is TCP to `127.0.0.1` on the lab's
+own smbd port, which the gateway's port-445 redirect uses for shared folders. The
+internet stays reachable.
+
 ## Port forwards
 
 A `forward` block on a segment, or a `port` block on a container
@@ -110,6 +118,10 @@ settled in the plan: the first claimant keeps the port and the rest are
 dropped, naming the winner, rather than all being installed and the losers
 failing at bind time. Scripts can add forwards at runtime with
 `Segment.forward`.
+
+A forward listens on every host interface, except under worktree isolation
+(worktrees.md), where every segment `forward {}` and container `port {}` binds
+`127.0.0.1` instead and is reachable from the host itself and nowhere else.
 
 ## Guest routes and inter-segment routing
 
@@ -216,6 +228,13 @@ authenticating by the pre-shared key both set in `psk` in their host
 configuration and listening on `trunk_port`. VMs stay local; only the wire
 spans hosts. `connect` on a segment that is not global is a validation error.
 
+In a worktree lab (worktrees.md) every global segment joins as
+`<segment>@<worktree>`, named after the git worktree, so it is shared with no other
+lab of the family, while two lab files in the same worktree still meet on it.
+`vmlab status` shows the name it joined under. A global segment with a
+`connect {}` peer refuses `up` in a worktree lab. The frozen main lab keeps the
+plain names.
+
 Tip — declare `connect` on one side: the supervisor keeps at most one trunk per
 remote host per segment, so both sides declaring `connect` to each other is
 safe on a plain network: the dialer stands down while an inbound trunk from
@@ -240,7 +259,8 @@ seam.
 Both kernel tiers need `CAP_BPF` and `CAP_NET_ADMIN`, and each daemon proves a
 tier works on its host, loading the programs and pushing frames through
 throwaway taps or sockets, before using it. An unprivileged or WSL 2 daemon
-degrades to userspace silently. The gateway MAC and the service and trunk ports
+degrades to userspace silently. The installer offers to grant the binary both
+capabilities with `setcap`. The gateway MAC and the service and trunk ports
 never enter the kernel forwarding tables, so DHCP, DNS, NAT, rules and forwards
 behave identically on every tier. Force a tier with `fastpath` in the host
 configuration or the `VMLAB_FASTPATH` environment variable.

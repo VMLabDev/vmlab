@@ -34,6 +34,16 @@ guest OS profile declares whether its guests mount virtiofs with the `virtiofs`
 capability flag; the shipped `linux-modern` profile sets it (see
 host-profiles.md).
 
+Keep large files off virtiofs on a Windows guest. virtio-win 0.1.302's VioFS
+driver fails large reads at random with `Error performing inpage operation`, and
+`robocopy /J` can report success for a copy that cannot be read back; no
+`virtiofsd` setting avoids it, and VioFS 0.1.285 does not have the fault. vmlab
+cannot tell which driver a template carries, so the shipped Windows profiles leave
+the `virtiofs` flag off and their `auto` shares ride SMB. A share that rides
+virtiofs into a Windows guest anyway, through an explicit `transport = "virtiofs"`
+or a profile that turns the flag on, is still served, and `vmlab up` prints a
+warning naming it (troubleshooting.md).
+
 virtiofs is compatible with online snapshots. vmlab runs `virtiofsd` with
 migration mode enabled, so its session state, open handles included, rides the
 snapshot's migration stream via QEMU's device-state transfer. The cost is that a
@@ -51,7 +61,9 @@ features depend on the release:
   read-only share rides SMB, and a `virtiofs` one fails `vmlab validate`.
 
 A binary without the basic flags (QEMU's retired C `virtiofsd`) fails
-`vmlab validate` for every `virtiofs` share.
+`vmlab validate` for every `virtiofs` share. The install script reports an old
+`virtiofsd` too. Set `VMLAB_VIRTIOFSD` to use a newer build than the
+distribution's.
 
 **SMB** is the universal fallback. The lab daemon serves each share at the
 segment gateway as `\\<gateway>\<share>`, so a Windows guest needs nothing extra
@@ -67,18 +79,22 @@ Each share carries `transport = "auto" | "virtiofs" | "smb"`, defaulting to
 `auto`. The choice is made once, before the lab starts, as the **share plan**:
 which shares ride virtiofs, which fall back to SMB, which segments need a gateway
 rule to reach the SMB server, and which host port it takes. Two host facts feed
-it — whether a `virtiofsd` binary exists and whether a localhost port is free —
-and one guest fact, the profile's capability flag.
+it — what the host's `virtiofsd` can serve and whether a localhost port is
+free — and one guest fact, the profile's capability flag.
 
 - `auto` takes virtiofs only when the host can serve it *and* the guest can mount
-  it. SMB is the fallback, never the preference.
+  it. SMB is the fallback, never the preference. A read-only share counts as
+  servable only on a `virtiofsd` with `--readonly`.
 - `virtiofs` always rides virtiofs. A host with no `virtiofsd` errors when the
-  machine starts rather than degrading silently.
+  machine starts rather than degrading silently, and a `virtiofsd` that cannot
+  serve the share fails `vmlab validate`.
 - `smb` always rides the bundled SMB server.
 
 Container volumes join the same plan. They have no per-guest question, since the
 micro-VM's own guest always mounts virtiofs, so they ride virtiofs whenever the
-host has a `virtiofsd` and SMB otherwise.
+host has a `virtiofsd` and SMB otherwise. Its volumes all take one transport,
+so one read-only volume on a `virtiofsd` without `--readonly` moves every volume
+of that container to SMB.
 
 ### The bundled smbd
 
@@ -106,15 +122,22 @@ nothing else: a read-only share still refuses every write.
 
 ### Mounting in the guest
 
-Once a VM is ready, the lab daemon runs the share plan's **mount steps** through
+Once a VM is ready, after its first-boot script if it carries one, the lab
+daemon runs the share plan's **mount steps** through
 the agent. The steps are a value computed per guest OS before anything runs, so
 what a Windows guest will be told to do can be read without booting one. Each
 step is retried for five minutes; a step still failing then emits
 `share.unmountable` naming the share and the last error, and that share's
 remaining steps are skipped.
 
-`vmlab up` waits for the mount steps, at most 30 seconds after everything else
-is done, and prints `WARNING: "<vm>": share "<share>" will not mount: <reason>`
+A machine's provisions and playbooks start only once its mount steps have
+finished, every share mounted or given up, so a step can read a share. `up`
+prints `"<vm>": waiting for its shares to mount before its provisions and
+playbooks` while it holds them, and prints that machine's mount report before
+the first step runs.
+
+For a machine no step waited on, `vmlab up` waits for the mount steps, at most
+30 seconds after everything else is done, and prints `WARNING: "<vm>": share "<share>" will not mount: <reason>`
 for each share that gave up, or `... not mounted yet, still retrying (attempt
 N of 30): <last error>` for one still failing at the bound (it keeps retrying).
 A guest not yet ready is said to be still mounting, without a warning, and so
@@ -129,12 +152,18 @@ Exit status stays 0.
 - **Windows:** the credential is stored once per lab with `cmdkey`. A drive-letter
   target such as `S:` is mapped with `net use`. A folder-path target becomes a
   directory symbolic link to the UNC path with `mklink /D`, because a junction
-  cannot target a UNC path.
+  cannot target a UNC path. Each `up` keeps a link that already points at the
+  current gateway and replaces one that points at the same share through an old
+  gateway (the machine moved to a segment with another subnet). If the folder
+  path holds anything else, such as a real folder, vmlab leaves it untouched and
+  reports the share as `share.unmountable`.
 
 The agent's mounts run as the agent identity, SYSTEM on Windows, and a drive
-letter is visible in every session while each logon authenticates separately. So
-the agent also writes the lab's share credential into every logon it mints,
-before spawning anything. Without that, a `vmlab shell` or `vmlab exec` session
+letter or folder link is visible in every session while each logon
+authenticates separately. An interactive logon picks the credential up from a
+logon hook. A logon the agent mints is not interactive and cannot store a
+`cmdkey` credential, so the agent opens an SMB session to the gateway in every
+logon it mints instead, before spawning anything. Without that, a `vmlab shell` or `vmlab exec` session
 under a declared login (logins.md) would see the mapped drive and be unable to
 open it.
 
