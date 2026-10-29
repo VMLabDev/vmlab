@@ -39,6 +39,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | wscript `Lab`, `Segment`, `Term` and `Recording` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `UsbDevice`, `Event`) | `references/wscript-lab-api.md` |
 | wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots, host USB, console recording (`record`) | `references/wscript-machine-api.md` |
 | Provisions, `on "event" {}` handlers, the event catalogue, playbooks | `references/automation.md` |
+| Ordering machines: `depends_on` (start order) and `depends_on_provision` (provisioning order), parallel provisioning | `references/lab-file.md`, `references/automation.md` |
 | `@dev`, the workspace syncer, and `vmlab dev sync` | `references/dev-machines.md` |
 | `login {}`, who runs as whom, minted Windows logons, Linux sessions, `as_login` | `references/logins.md` |
 | Snapshots, screenshots, console recording, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |

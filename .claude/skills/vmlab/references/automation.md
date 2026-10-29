@@ -19,10 +19,28 @@ A provision script is declared with a `provision "path.ws" { }` block inside
 the `vm {}` or `container {}` it configures. Entry point `fn main(lab: Lab)`.
 It runs once during `vmlab up`, after that machine is ready, at its position
 among the machine's steps, interleaved with the machine's playbooks in
-declaration order. Across machines, steps follow the order the machine blocks
-appear, with `depends_on` gating when each becomes eligible. A script
-orchestrating several machines is the normal case: it reaches the others
-through the lab handle.
+declaration order. Different machines provision in parallel, so a script cannot
+assume another machine's steps have run. A script orchestrating several machines
+is the normal case: it reaches the others through the lab handle, and its
+machine declares the order it needs with `depends_on_provision`:
+
+```wcl
+vm "dc01" {
+  template = "x86_64/windows-server-2025"
+  provision "scripts/promote-dc.ws" { }
+}
+
+vm "ws01" {
+  template             = "x86_64/windows-11"
+  depends_on           = ["dc01"]   // boot once dc01 answers
+  depends_on_provision = ["dc01"]   // join once dc01 is a controller
+  provision "scripts/join-domain.ws" { }
+}
+```
+
+Upgrading: `depends_on` used to hold a dependent until its dependency's
+provisions had finished. It is now start order only; a lab that relied on the
+old behaviour adds `depends_on_provision` naming the same machines.
 
 `lab.this_vm()` returns the machine whose `provision {}` block declared the
 running script, or the build VM when a template's first-boot script runs. It is
@@ -522,10 +540,12 @@ rather than looping.
 ### Ordering with provisions
 
 Provisions and playbooks are one ordered list per machine. They run in the order
-their blocks appear inside that machine, once it is ready, and a machine that
-depends on another waits until that machine's whole list has completed. So in
-the example above `scripts/setup.ws` runs, then the `baseline` play, and only
-then does anything with `depends_on = ["buildbox"]` start. A template's
+their blocks appear inside that machine, once it is ready. So in the example
+above `scripts/setup.ws` runs, then the `baseline` play. Other machines run their
+own lists at the same time. A machine with `depends_on = ["buildbox"]` starts as
+soon as `buildbox` is ready, without waiting for that list; one with
+`depends_on_provision = ["buildbox"]` holds its own first step until `buildbox`'s
+list has completed. A template's
 playbooks interleave with its provisions the same way during a build, with steps
 streamed as build progress.
 

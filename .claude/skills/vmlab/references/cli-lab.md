@@ -47,10 +47,11 @@ after `vmlab up` returns (see architecture.md).
 
 Inside the daemon, `up` works through a plan computed before anything is touched:
 
-1. Machines the subset drags in through `depends_on` are added, and the machines
-   are grouped into waves. A machine's dependencies must be ready, and the
-   provisions scoped to them complete, before the machine's wave starts. Anything
-   the plan skips is printed with its reason.
+1. Machines the subset names through `depends_on` or `depends_on_provision` are
+   added, and `up` prints each one it pulls in. The machines are grouped into
+   waves by `depends_on`: a machine's wave starts once every machine it names is
+   ready — readiness only, never their provisioning. Anything the plan skips is
+   printed with its reason.
 2. Deferred downloads run first, with progress streamed to the terminal. This is
    the same code path `vmlab pull` runs on its own.
 3. The host's QEMU, firmware and helper binaries are checked for every target
@@ -64,8 +65,13 @@ Inside the daemon, `up` works through a plan computed before anything is touched
    For a VM `up` waits on anyway (first-boot, a provision or playbook, or a
    dependent), `up` refreshes the agent if it is out of date once it answers,
    after first-boot and before any provision (see "Agent refresh" below).
-6. Between waves the daemon runs every provision script and playbook whose machine
-   has started, in declaration order, waiting for each machine's readiness first.
+6. Each machine runs its own provision scripts and playbooks in declaration order
+   once it is ready and its share mounts have finished. Machines provision in
+   parallel with each other and with later waves still booting. A machine that
+   declares `depends_on_provision` holds its first step until every machine it
+   names has finished all of its steps. Step output is prefixed with the
+   machine's name. The first failed step fails `up` and cancels the steps still
+   running; `up` returns once every step has finished.
 7. Port forwards are installed, and the workspace syncer starts for every dev
    machine that declares a workspace (see dev-machines.md).
 

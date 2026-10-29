@@ -3,7 +3,7 @@ page cmd_up {
   chapter_header "vmlab up" {
     kicker       = "Commands · reference"
     reading_time = "5 min read"
-    updated      = "2026-10-29"
+    updated      = "2026-10-30"
     version      = "vmlab 0.35"
   }
 
@@ -47,19 +47,23 @@ page cmd_up {
 
   list {
     style = :numbered
-    li "Machines the subset drags in through `depends_on` are added, and the machines are grouped into waves. A machine's dependencies must be ready, and the provisions scoped to them complete, before the machine's wave starts. Anything the plan skips is printed with its reason."
+    li "Machines the subset names through `depends_on` or `depends_on_provision` are added, and `up` prints each one it pulls in. The machines are grouped into waves by `depends_on`: a machine's wave starts once every machine it names is ready. Readiness is all it waits for, never their provisioning. Anything the plan skips is printed with its reason."
     li "Deferred downloads run first, with progress streamed to the terminal. This is the same code path [vmlab pull](cmd_pull) runs on its own."
     li "The host's QEMU, firmware and helper binaries are checked for every target machine."
     li "The bundled SMB server starts when the lab declares [shared folders](guide_shares), so shares are reachable during provisioning."
     li "Each wave boots in parallel. A machine carrying a first-boot script runs it before it counts as ready. If one machine in a wave fails, the rest of the wave is aborted and the verb fails; the machine that failed is left running for inspection."
     li "For a VM that `up` waits on anyway, because it has a first-boot script, a provision or playbook, or a dependent, `up` refreshes the agent if it is out of date once it answers: after the first-boot script and before any provision (see below)."
-    li "Between waves the daemon runs every provision script and playbook whose machine has started, in declaration order, waiting for each machine's readiness and for its [share mounts](guide_shares) to finish first."
+    li "Each machine runs its own provision scripts and playbooks in declaration order once it is ready and its [share mounts](guide_shares) have finished. Machines provision in parallel with each other and with later waves still booting. A machine that declares `depends_on_provision` holds its first step until every machine it names has finished all of its steps."
     li "Port forwards are installed, and the workspace syncer starts for every dev machine that declares a workspace (see [Dev machines and the workspace syncer](guide_dev))."
     li "The verb waits, for at most 30 seconds, for the [share mounts](guide_shares) of every VM no provision or playbook waited on to finish, and prints a `WARNING:` line for each share that will not mount or is still failing when the wait runs out."
   }
 
   p <<DOC
-    Output from provision scripts streams to the terminal as it happens. On
+    Output from provision scripts and playbooks streams to the terminal as it
+    happens, each line prefixed with the name of the machine whose step wrote
+    it, because several machines' steps run at once. The first step that
+    fails fails `up` and cancels the steps still running on other machines;
+    `up` returns only once every step has finished or been cancelled. On
     success the last line is `lab "<name>" is up`. A VM declared with
     `gui = true` (or a lab that sets it) gets a detached VNC viewer opened from
     this terminal, since the daemon is headless; closing the viewer only
