@@ -95,7 +95,7 @@ def scenario(h, main, wt):
 
     # The worktree lab, cloned from the freeze.
     git(h, main, "worktree", "add", "-q", "-b", "wt", str(wt))
-    wt_up = h.vmlab("up", cwd=wt, timeout=600).text
+    h.vmlab("up", cwd=wt, timeout=600)
     h.wait_ready(wt, "web")
 
     main_st, wt_st = status(h, main), status(h, wt)
@@ -186,23 +186,20 @@ def scenario(h, main, wt):
         and wt_fixed.get("host_port") == shifted
         and wt_fixed.get("declared_port") == FIXED_PORT
         and f"{shifted} ({FIXED_PORT})" in wt_text
-        and f"host port {FIXED_PORT} is bound on {shifted}" in wt_up
         and main_answers
         and wt_answers,
         f"main forward {main_fixed}; worktree forward {wt_fixed}; 127.0.0.1:{FIXED_PORT} "
         f"answered main={main_answers}, 127.0.0.1:{shifted} answered worktree={wt_answers}; "
-        f"up said: {[l for l in wt_up.splitlines() if 'PRD §21.7' in l]}",
     )
 
     h.vmlab("down", cwd=wt, timeout=300)
-    again_up = h.vmlab("up", cwd=wt, timeout=600).text
+    h.vmlab("up", cwd=wt, timeout=600)
     h.wait_ready(wt, "web")
     again = fixed_forward(status(h, wt))
     h.ok(
         "worktree.ports.stable",
         again.get("host_port") == shifted
-        and again.get("declared_port") == FIXED_PORT
-        and f"is bound on {shifted}" in again_up,
+        and again.get("declared_port") == FIXED_PORT,
         f"after down/up the worktree forward is {again}",
     )
 

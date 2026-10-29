@@ -2450,8 +2450,10 @@ ports (§9.8) are unchanged.
   The main lab always binds exactly `P`, and fails as today when something
   outside the family holds it. A shift past 65535 fails that forward, naming
   the declared port.
-- **Reporting.** `up` prints one line for each shifted forward, naming the
-  declared and the bound port. `vmlab status` marks a shifted forward with the
+- **Reporting.** `up` prints one line for each shifted forward it installs,
+  naming the declared and the bound port. A forward installed after `up`
+  returns, once its machine takes a lease, is announced in the lab daemon's log
+  and by the `forward.installed` event, which carries `declared_port`. `vmlab status` marks a shifted forward with the
   declared port, and `status --json` carries it as `declared_port` on the
   forward.
 - **`vmlab port <machine> <guest-port>[/tcp|/udp]`** prints the host port a

@@ -3430,7 +3430,12 @@ impl crate::labd::machine::LabServices for LabRuntime {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
-        self.arc().install_forwards(&scope).await;
+        // `up` may have returned before this machine took its lease, so a
+        // shifted port is announced here too; `status` and the
+        // `forward.installed` event carry it either way (§21.7).
+        for line in self.arc().install_forwards(&scope).await {
+            tracing::info!("{line}");
+        }
     }
 
     async fn smb_mount_plan(
