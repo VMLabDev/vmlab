@@ -860,6 +860,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 | `vmlab vm start / stop / restart <vm>` | Per-VM power control; `start` wakes a `suspended` VM (§7.2); `start` and `restart` take `--record vm=path` (§11.1) |
 | `vmlab snapshot create / restore / list / delete` | Per-VM or lab-wide (§7.3) |
 | `vmlab worktree freeze <snapshot> / thaw / status` | Freeze the main checkout's lab at an offline snapshot so worktree labs clone from it, undo that, or list generations and the worktrees using them (§21) |
+| `vmlab port <machine> <guest-port>[/tcp\|/udp] [--json]` | The host port a running machine's forward to that guest port is bound on, for scripts (§21.7) |
 | `vmlab console <vm>` | Attach viewer |
 | `vmlab record start / stop / status` | Record a VM's console to MP4 or WebM, owned by the lab daemon; pointer and click ripples drawn, idle compression and a timeline opt-in (§11.1) |
 | `vmlab usb list / attach / detach` | Host USB devices and who holds each; hot-plug one into a running VM with `usb = true` and back (§5.2.1) |
@@ -2426,3 +2427,41 @@ freeze and `worktree.json` along with the rest of `.vmlab/`.
   `VMLAB_INSTANCE` in an ordinary directory is not a worktree lab.
 - **Isolation without a freeze.** Instances that are not worktree labs keep
   §3.2's rules, shared global segments included.
+
+### 21.7 Ports in a frozen family
+
+Every lab of a frozen family binds its forwards on `127.0.0.1` (§21.4), so two
+labs declaring one fixed `host_port` would collide. Instead each lab of the
+family holds a **port slot**, and a fixed port is shifted by it. Automatic
+ports (§9.8) are unchanged.
+
+- **Slots.** The main lab is slot 0. A worktree lab takes the lowest free slot
+  from 1 up the first time it installs a forward, and keeps it until
+  `vmlab destroy` in that worktree. Slots are recorded in the main checkout's
+  `.vmlab/worktree-ports.json`, keyed by the git worktree's name, beside every
+  fixed port each lab of the family has bound. A freeze records the main lab's
+  declared fixed ports in slot 0, so a worktree never takes one while the main
+  lab is down. A thaw deletes the file. Every change to it holds an exclusive
+  lock on it.
+- **The shift.** A fixed port `P` binds `P + slot`. When that port is recorded
+  for another lab of the family, or another process holds it, the lab takes
+  the next free port above it that is neither. The port a lab gets is recorded
+  and asked for first on every later install, so it is stable across restarts.
+  The main lab always binds exactly `P`, and fails as today when something
+  outside the family holds it. A shift past 65535 fails that forward, naming
+  the declared port.
+- **Reporting.** `up` prints one line for each shifted forward, naming the
+  declared and the bound port. `vmlab status` marks a shifted forward with the
+  declared port, and `status --json` carries it as `declared_port` on the
+  forward.
+- **`vmlab port <machine> <guest-port>[/tcp|/udp]`** prints the host port a
+  running machine's forward to that guest port is bound on, and nothing else,
+  for scripts. It takes the lab from the working directory, `--instance`, or a
+  `lab/machine` reference, as other machine verbs do. `--json` prints the
+  forward's status entry. It fails when no installed forward matches, and asks
+  for `/tcp` or `/udp` when both do. It reads `status`, so it works for any lab,
+  frozen or not.
+- Runtime forwards (wscript `seg.forward(host_port, …)`) follow the same rule.
+
+Outside a frozen family nothing here applies, and two instances of one lab file
+declaring one fixed port still collide (§3.2).

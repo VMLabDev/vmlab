@@ -2486,6 +2486,8 @@ mod tests {
             guest: "10.0.0.5:80".into(),
             proto: "tcp".into(),
             auto,
+            guest_port: 80,
+            declared_port: None,
         };
         let mut status = lab(vec![addressed("web", PowerState::Running, true, vm())]);
         assert!(!render_status(&status, false).contains("FORWARD"));

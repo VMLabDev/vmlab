@@ -2903,6 +2903,8 @@ impl LabRuntime {
                 }
                 .to_string(),
                 auto: f.auto,
+                guest_port: f.key.guest_port,
+                declared_port: None,
             })
             .collect()
     }

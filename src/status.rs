@@ -566,6 +566,15 @@ pub struct ForwardStatus {
     pub proto: String,
     /// vmlab picked `host_port`: the declaration left it out.
     pub auto: bool,
+    /// The guest port, as declared. Absent from a daemon that predates the
+    /// field; `guest` carries it too.
+    #[serde(default)]
+    pub guest_port: u16,
+    /// The declared `host_port`, when the lab bound another one: a worktree
+    /// lab's port slot shifted it, or it was taken (PRD §21.7). `None` when
+    /// `host_port` is what the file declared, or the port is automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_port: Option<u16>,
 }
 
 /// Worktree isolation as the lab daemon decided it at start (PRD §21.4,
