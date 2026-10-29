@@ -3,8 +3,8 @@ page cmd_destroy {
   chapter_header "vmlab destroy" {
     kicker       = "Commands · reference"
     reading_time = "3 min read"
-    updated      = "2026-10-28"
-    version      = "vmlab 0.9"
+    updated      = "2026-10-29"
+    version      = "vmlab 0.35"
   }
 
   p <<DOC
@@ -73,6 +73,9 @@ page cmd_destroy {
     In a worktree lab, `destroy` deletes only the worktree's own overlays and
     copies and never touches the frozen files. It is how a worktree releases
     the freeze, and the next `up` there clones from the newest generation.
+    It also releases the worktree's port slot and the ports recorded for it
+    in the main checkout's `worktree-ports.json`, with or without a daemon
+    running, so the next worktree lab can take them.
   DOC
 
   h2 "Examples"

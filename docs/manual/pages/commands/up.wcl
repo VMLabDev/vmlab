@@ -3,8 +3,8 @@ page cmd_up {
   chapter_header "vmlab up" {
     kicker       = "Commands · reference"
     reading_time = "5 min read"
-    updated      = "2026-10-28"
-    version      = "vmlab 0.9"
+    updated      = "2026-10-29"
+    version      = "vmlab 0.35"
   }
 
   p <<DOC
@@ -110,6 +110,19 @@ TXT
     every lab of the family runs under worktree isolation. See
     [Worktree labs](guide_worktrees).
   DOC
+
+  p <<DOC
+    In a frozen family each lab's fixed host ports are shifted by its port
+    slot, and `up` prints one line for each forward bound somewhere other
+    than its declared port:
+  DOC
+
+  code text { source = <<'SRC'
+"web": container port declared on host port 18080 is bound on 18081 (worktree port slot, PRD §21.7)
+SRC
+  }
+
+  p "[vmlab port](cmd_port) prints the bound port for a script."
 
   h2 "Editing the lab file between runs"
 

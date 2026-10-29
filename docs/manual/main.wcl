@@ -66,6 +66,7 @@ import "./pages/commands/machine.wcl"
 import "./pages/commands/clipboard.wcl"
 import "./pages/commands/usb.wcl"
 import "./pages/commands/dns.wcl"
+import "./pages/commands/port.wcl"
 import "./pages/commands/lab.wcl"
 import "./pages/commands/snapshot.wcl"
 import "./pages/commands/worktree.wcl"
@@ -171,6 +172,7 @@ site manual {
       chapter "vmlab clipboard"  { page = cmd_clipboard }
       chapter "vmlab usb"        { page = cmd_usb }
       chapter "vmlab dns"        { page = cmd_dns }
+      chapter "vmlab port"       { page = cmd_port }
       chapter "vmlab lab"        { page = cmd_lab }
       chapter "vmlab snapshot"   { page = cmd_snapshot }
       chapter "vmlab worktree"   { page = cmd_worktree }
