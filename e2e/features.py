@@ -125,6 +125,7 @@ FEATURES: dict[str, str] = {
     "net.isolated": "`nic { isolated = true }`",
     "net.forward": "segment `forward` to a machine port",
     "net.forward.provisioned": "segment `forward` to a machine `up` provisions, installed and logged as `forward.installed`",
+    "port.verb": "`vmlab port` prints a forward's bound host port (and `--json` its status entry) as `status --json` reports it, and fails naming the installed forwards",
     "net.routes": "daemon routing between `routes_to` segments (source kept, rules applied, the rest isolated) and `route` blocks",
     "net.l3.block": "`block` rules",
     "net.l3.redirect": "`redirect` rules",

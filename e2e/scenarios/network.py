@@ -160,6 +160,7 @@ def main_lab(h, host: str):
         egress_and_rules(h, lab, host)
         isolation(h, lab, ip)
         forward(h, lab)
+        port_verb(h, lab)
         routes(h, lab, ip)
 
 
@@ -331,6 +332,35 @@ def forward_provisioned(h, lab):
         f"host :{PROVISIONED_FORWARD_PORT} answered from router:8080 ({len(installed)} forward.installed)"
         if passed
         else f"answer {answer.strip()[:80]!r}; forward events: {lines[-4:]}",
+    )
+
+
+def port_verb(h, lab):
+    """`vmlab port` answers from the status projection (PRD §21.7): the host
+    port each machine's forward to guest 8080 is bound on, by machine, and
+    `--json` the very entry `status --json` carries. A guest port with no
+    forward fails not-found (exit 4), naming the ones that are installed."""
+    status = json.loads(h.vmlab("status", "--json", cwd=lab).out)
+    want = {
+        m: next((f for f in status.get("forwards", []) if f["machine"] == m and f["guest_port"] == 8080), None)
+        for m in ("vm01", "router")
+    }
+    if None in want.values():
+        h.ok("port.verb", False, f"status --json lacks a forward to :8080: {status.get('forwards')}")
+        return
+    plain = {m: h.vmlab("port", m, "8080", cwd=lab, check=False) for m in want}
+    as_json = h.vmlab("port", "vm01", "8080/tcp", "--json", cwd=lab, check=False)
+    missing = h.vmlab("port", "vm01", "9", cwd=lab, check=False)
+    plain_ok = all(r.code == 0 and r.out == f"{want[m]['host_port']}\n" for m, r in plain.items())
+    json_ok = as_json.code == 0 and json.loads(as_json.out or "null") == want["vm01"]
+    missing_ok = missing.code == 4 and f"host port {want['vm01']['host_port']}" in missing.text
+    h.ok(
+        "port.verb",
+        plain_ok and json_ok and missing_ok,
+        f"vm01 -> {plain['vm01'].out.strip()}, router -> {plain['router'].out.strip()}, --json matches status"
+        if plain_ok and json_ok and missing_ok
+        else f"plain {[(r.code, r.text.strip()[-120:]) for r in plain.values()]}; "
+        f"json {as_json.code} {as_json.text.strip()[-200:]}; missing {missing.code} {missing.text.strip()[-200:]}",
     )
 
 
