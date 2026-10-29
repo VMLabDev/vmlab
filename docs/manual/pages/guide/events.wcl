@@ -33,6 +33,7 @@ DOC
     rows:
       | "Event" | "When" |
       | "`vm.starting`, `vm.ready`, `vm.stopped`, `vm.crashed`" | "A VM's lifecycle. `vm.stopped` follows every exit; `vm.crashed` precedes it when QEMU died rather than being asked to stop." |
+      | "`vm.suspended`, `vm.woken`" | "A guest suspended itself to RAM, and a suspended guest running again, with the `cause` of the wake. See [vmlab vm](cmd_vm)." |
       | "`container.starting`, `container.ready`, `container.stopped`, `container.crashed`, `container.unhealthy`" | "A container's lifecycle, plus its healthcheck turning unhealthy. See [Lab containers](guide_containers)." |
       | "`lab.up`, `lab.down`" | "The end of an `up` and of a `down`, with the machines involved." |
       | "`lab.daemon_crashed`" | "Emitted by the supervisor when a lab daemon dies unexpectedly; the lab is marked failed and not restarted." |
@@ -40,6 +41,7 @@ DOC
       | "`template.built`" | "A template build sealed. See [Templates and the store](guide_templates)." |
       | "`playbook.applied`, `playbook.failed`" | "A play converged, or a run ended non-zero or failed to run. See [Playbooks](guide_playbooks)." |
       | "`host.disk_low`" | "The free-space watchdog crossed its threshold." |
+      | "`record.started`, `record.stopped`" | "A console recording of a VM began, or was finalised to a playable file. See [vmlab record](cmd_record)." |
   }
 
   p <<'DOC'
