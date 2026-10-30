@@ -53,6 +53,9 @@ pub struct TemplateConfig {
     /// QEMU `-cpu` model (§5.2).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments (§5.2).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hyperv: Option<bool>,
     /// QEMU accelerator (§5.2), by its schema spelling. Free text so a
     /// spelling a newer build wrote reads as unset rather than failing.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -117,6 +120,7 @@ impl TemplateConfig {
             secure_boot_vars: None,
             display: meta.display.clone(),
             cpu_model: meta.cpu_model.clone(),
+            hyperv: meta.hyperv,
             accel: meta.accel.map(|a| a.as_str().to_string()),
             created: meta.created.to_rfc3339(),
             origin: meta.origin.clone(),
@@ -180,6 +184,7 @@ impl TemplateConfig {
             secure_boot_keys: over(&m.secure_boot_keys, &base.secure_boot_keys),
             display: over(&m.display, &base.display),
             cpu_model: over(&m.cpu_model, &base.cpu_model),
+            hyperv: over(&m.hyperv, &base.hyperv),
             accel: over(&m.accel, &base.accel),
         })
     }
@@ -208,6 +213,7 @@ impl TemplateConfig {
                 .and_then(crate::config::model::SecureBootKeys::parse),
             display: self.display,
             cpu_model: self.cpu_model,
+            hyperv: self.hyperv,
             accel: self
                 .accel
                 .as_deref()
@@ -279,6 +285,7 @@ mod tests {
             secure_boot_keys: Some(crate::config::model::SecureBootKeys::Vars),
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
+            hyperv: Some(true),
             accel: Some(crate::config::model::AccelMode::Tcg),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
@@ -379,6 +386,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
         };
         assert!(!TemplateConfig::from_variant(&m, &v).variants_expected);
@@ -409,6 +417,7 @@ mod tests {
             secure_boot_keys: Some(crate::config::model::SecureBootKeys::Microsoft),
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
         };
         let config = TemplateConfig::from_variant(&base, &v);

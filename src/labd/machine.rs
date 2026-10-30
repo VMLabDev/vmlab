@@ -349,6 +349,13 @@ pub trait Machine: Send + Sync + 'static {
         DEFAULT_READY_TIMEOUT
     }
 
+    /// What `up` says about this machine before it boots: something it was
+    /// declared with that this launch will not give it, said rather than
+    /// refused (§5.2). Nothing, unless the kind has a reason.
+    fn launch_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Wait until the machine is fully usable: agent up and any first-boot
     /// work complete (PRD §10.3).
     ///

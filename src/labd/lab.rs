@@ -2139,6 +2139,16 @@ impl LabRuntime {
         // CLI sink and the event feed.
         self.ensure_pulled(&targets, Some(&output)).await?;
 
+        // Hardware a machine was declared with that this launch drops — a
+        // vm block's `hyperv = true` under TCG or a named `cpu_model` — is
+        // said, not refused (§5.2). After the pull, which binds the template
+        // layer a model may come from.
+        for name in &targets {
+            for warning in self.machine(name)?.launch_warnings() {
+                output(format!("warning: {warning}\n"));
+            }
+        }
+
         self.preflight_binaries(&targets)?;
 
         // Start the SMB server before guests boot so shares are reachable
