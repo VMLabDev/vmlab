@@ -268,7 +268,7 @@ status and `exit_code` the container's.
 | `container.unhealthy` | `container` | The container's healthcheck reported not healthy. |
 | `container.destroyed` | `container` | `vmlab container destroy` removed everything the container materialised. |
 | `machine.agent_repaired` | `vm`, `machine`, `agent_version` | `vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template. |
-| `machine.agent_updated` | `vm`, `machine`, `from`, `to`, `ok`, `error` | `vmlab up` or `vmlab vm start` found the VM's agent stamp differing from the shipped agent and pushed it. With `ok = true` the machine is now diverged; with `ok = false`, `error` says why the push failed and the old agent is still in place. `from` is null when the agent never answered. |
+| `machine.agent_updated` | `vm`, `machine`, `from`, `to`, `ok`, `error` | `vmlab up` or `vmlab vm start` found the VM's agent stamp differing from the shipped agent and pushed it. With `ok = true` the machine is now diverged; with `ok = false`, `error` says why the push failed and the old agent is still in place. `from` is null when the agent never answered. `stopped = true` (with `ok = false`) means the machine was stopped while the refresh still waited for its agent: nothing was pushed, and no warning was printed. |
 | `share.unmountable` | `vm`, `share`, `reason` | The mount plan holds a share this guest cannot mount, or a mount step still failed when its retries ran out (`share` is set then). See shares-media.md. |
 
 ### Snapshots

@@ -371,6 +371,7 @@ in the config.
 | `cpus`, `memory` | The hardware floor a VM or container inherits when neither its block nor its template says. |
 | `agent_transport` | The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias. |
 | `input_transport` | How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc` (see snapshots-vision.md). |
+| `acpi_shutdown` | Whether the guest shuts down on an ACPI power-button press (default `true`). The stop ladder plans from it: off, a stop goes through the agent alone and waits for a booting guest's agent. Only `macos` turns it off. |
 | `virtiofs` | Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = "auto"` shares (see shares-media.md). |
 | `rtc` | What the guest reads the real-time clock as: `utc` (default), or `localtime` for DOS, Windows 9x and NT4 through XP/2003, which cannot read it as UTC (see snapshots-vision.md). |
 | `workspace_guest` | The guest path an `@dev` workspace lands at when the decorator names none (see dev-machines.md). |
@@ -472,6 +473,7 @@ profile "<name>" {
   memory          = 4GiB
   agent_transport = "virtio-serial"
   input_transport = "qmp"
+  acpi_shutdown   = true
   virtiofs        = false
   rtc             = "utc"
   workspace_guest = "/src"
@@ -503,6 +505,7 @@ profile "<name>" {
 | `agent_transport` | utf8 | `virtio-serial` | The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake). |
 | `agent_channel` | bool | unset | Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present. |
 | `input_transport` | utf8 | `qmp` | How scripted input reaches the guest: `qmp` send-key, or `vnc` through the VM's VNC socket. A guest that reads no PS/2 keyboard needs `input = "usb"`, not `vnc`. |
+| `acpi_shutdown` | bool | `true` | The guest shuts down on an ACPI power-button press. `false` makes a graceful stop rely on the agent: it waits for a booting guest's agent as long as readiness would (10 min), skips the ACPI rung, and gives the guest 2 min to power off. Set to `false` by `macos`. |
 | `virtiofs` | bool | `false` | The guest mounts virtiofs natively, so `transport = "auto"` shares use it instead of SMB. |
 | `rtc` | utf8 | `utc` | What the guest reads the RTC as: `utc`, or `localtime` — the RTC then starts at the host's local time (`-rtc base=localtime`; a fixed `clock` converted to host local time). Only `windows-xp` and `windows-9x` set it. |
 | `workspace_guest` | utf8 | unset | Guest path an `@dev` workspace lands at when the decorator names none. |
@@ -528,7 +531,7 @@ still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` mach
 | `templeos` | pc | seabios | false | false | ide | e1000 | std | 2 | 512MiB | `agent_transport = "isa-serial"`. TempleOS: the HolyC agent on COM1; no network by design. |
 | `linux-modern` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 2 | 4GiB | `virtiofs = true`. |
 | `linux-generic` | q35 | seabios | false | false | virtio | virtio-net-pci | std | 2 | 2GiB | Older or unusual distros. |
-| `macos` | q35 | ovmf | false | false | sata | virtio-net-pci | vmware | 4 | 8GiB | `cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"`, `hyperv = false`, `apple_smc = true`, `input = "usb"`, `tsc = "host"`. Intel macOS through OpenCore, which the template carries. |
+| `macos` | q35 | ovmf | false | false | sata | virtio-net-pci | vmware | 4 | 8GiB | `cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"`, `hyperv = false`, `apple_smc = true`, `input = "usb"`, `tsc = "host"`, `acpi_shutdown = false`. Intel macOS through OpenCore, which the template carries. |
 | `container` | | | | | | | | 1 | 256MiB | Micro-VM size for an OCI container; nothing else applies to a container. |
 | `custom` | | | | | | | | | | Nothing assumed; supply everything on the VM or template and in `qemu_args`. |
 
@@ -567,6 +570,9 @@ guest is its own family across vmlab:
 - **Input**: QMP `send-key` reaches the unbound USB keyboard `input = "usb"` adds;
   `input_transport` stays `qmp`.
 - **`boot_id`**: `/usr/sbin/sysctl -n kern.bootsessionuuid`.
+- **Stop**: through the agent only (`acpi_shutdown = false`; macOS ignores the
+  power button). A `down` while the guest boots waits for its agent instead of
+  ending in a QMP `quit`, which the guest would see as a power cut.
 - **Shares**: SMB only, `mkdir -p` then `/sbin/mount_smbfs -N [-o rdonly]
   //<user>:<pass>@<gateway>/<share> <path>`, credentials percent-encoded. A
   `transport = "virtiofs"` share is reported unmountable; `auto` picks SMB.
@@ -749,6 +755,9 @@ profile "macos" {
   tsc         = "host"
   cpus        = 4
   memory      = 8GiB
+  // macOS does not shut down on an ACPI power-button press, so a graceful
+  // stop goes through the agent and waits for a booting guest's agent.
+  acpi_shutdown = false
   // `/` is the sealed system volume; `/Users/Shared` is on the Data volume
   // and any login can create a directory in it.
   workspace_guest = "/Users/Shared/src"

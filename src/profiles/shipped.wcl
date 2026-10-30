@@ -190,6 +190,9 @@ profile "macos" {
   tsc         = "host"
   cpus        = 4
   memory      = 8GiB
+  // macOS does not shut down on an ACPI power-button press, so a graceful
+  // stop goes through the agent and waits for a booting guest's agent.
+  acpi_shutdown = false
   // `/` is the sealed system volume; `/Users/Shared` is on the Data volume
   // and any login can create a directory in it.
   workspace_guest = "/Users/Shared/src"

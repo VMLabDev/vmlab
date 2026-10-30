@@ -88,6 +88,9 @@ pub struct Run {
     /// dropped its connection and every handshake fails. Without it the
     /// restart is instantaneous.
     pub agent_restart_gap: Option<Duration>,
+    /// The guest's agent first answers this long after the machine comes
+    /// up — a guest still booting. Without it the agent answers at once.
+    pub agent_answers_after: Option<Duration>,
 }
 
 impl Run {
@@ -304,6 +307,15 @@ impl Hypervisor for FakeHypervisor {
         }
         let machine = Arc::new(FakeProc::new(spec.label.clone()));
         serve_guest(&spec.channels, &machine, &run, self.script.agent)?;
+
+        if let Some(after) = run.agent_answers_after {
+            machine.agent.lock().expect("fake agent lock").down = true;
+            let machine = machine.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                machine.agent.lock().expect("fake agent lock").down = false;
+            });
+        }
 
         if let Some((after, version)) = run.agent_restarts.clone() {
             let machine = machine.clone();

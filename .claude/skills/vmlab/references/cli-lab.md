@@ -280,10 +280,17 @@ gone (see dev-machines.md).
 
 Each VM stops through the graceful ladder (see architecture.md):
 
-1. A shutdown request to the guest agent, waiting up to 30 seconds for QEMU to exit.
+1. A shutdown request to the guest agent, waiting up to 30 seconds for QEMU to exit. A VM still booting, whose template sealed an agent that has not answered yet, waits up to a minute for the agent first.
 2. An ACPI power-down through the QEMU control channel, waiting another 30 seconds.
 3. A QMP `quit`, which ends QEMU after it flushes the disk caches, waiting another 30 seconds. This is where a guest that halts at "It's now safe to turn off your computer" (Windows 9x, DOS) stops.
 4. A hard kill.
+
+A guest whose profile has `acpi_shutdown = false` (`macos`) ignores the power
+button, so its ladder has no ACPI rung: its agent rung waits for a booting guest's
+agent as long as readiness would (10 minutes) and gives the guest two minutes to
+power off. `up` returns before a clone's agent answers, so `down` straight after
+`up` still shuts it down cleanly. A VM with no sealed agent (`scratch`) goes to ACPI
+at once.
 
 A container asks its init to signal the entrypoint and power off after the image's
 stop grace, then falls through to the agent and to a kill. `--force` skips the
