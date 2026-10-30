@@ -3,7 +3,7 @@ page cmd_template {
   chapter_header "vmlab template" {
     kicker       = "Commands · reference"
     reading_time = "14 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -26,6 +26,7 @@ page cmd_template {
       | "Subcommand" | "Meaning" |
       | "`build`" | "Build templates defined in a lab or template file." |
       | "`stop`" | "Stop a build or push running for a template, whoever started it." |
+      | "`status`" | "List running builds and pushes, with the machine reference that reaches a build's VM." |
       | "`list`" | "List templates in the store." |
       | "`search`" | "Search a registry for published templates." |
       | "`rm`" | "Remove one template version." |
@@ -132,6 +133,31 @@ vmlab template build windows-11@26100.1742.6 --variant standard,win3d
 SRC
   }
 
+  p <<DOC
+    While the build VM runs, its lab answers the screen and input verbs.
+    The build VM is the machine `build` in a lab named
+    `build-<arch>-<name>`. Once its display is up, the log prints that
+    reference and the verbs that reach it:
+  DOC
+
+  code text { source = <<'SRC'
+build VM is `build-x86_64-alpine/build`: `vmlab vm screenshot build-x86_64-alpine/build <file.png>`, `vmlab console build-x86_64-alpine/build`, `vmlab vm sendkeys build-x86_64-alpine/build <chord>`
+SRC
+  }
+
+  p <<DOC
+    Use the reference with [`vmlab vm`](cmd_vm) `screenshot`, `ocr`,
+    `find-image`, `sendkeys`, `mouse-move`, `click` and `drag`, with
+    [`vmlab console`](cmd_console), and with `vmlab machine capabilities`.
+    This is how you watch a screen-driven install, or press the key a stuck
+    installer waits for. Any other verb on that lab fails with
+    `unsupported` (6), because the build owns its VM's power, disks and
+    agent. Stop a build with `vmlab template stop`, not `vmlab vm stop`.
+    When a lab with the same name already runs under its own daemon, that
+    lab keeps its socket, and the build logs that its VM cannot be
+    inspected by name.
+  DOC
+
   p "Exit status is 0 on success, `conflict` (5), `not_found` (4), `invalid_argument` (2), or 1."
 
   h2 "vmlab template stop"
@@ -161,6 +187,44 @@ SRC
   p <<DOC
     Exit status is 0 on success. `not_found` (4) means nothing is running for
     that template in this lab. Any other failure is `failed` (1).
+  DOC
+
+  h2 "vmlab template status"
+
+  code sh { source = "vmlab template status [OPTIONS]" }
+
+  table {
+    rows:
+      | "Option" | "Meaning" |
+      | "`--json`" | "Emit a JSON array instead of a table." |
+      | "`-h`, `--help`" | "Print help." |
+  }
+
+  p <<DOC
+    `status` lists every build and push the supervisor is running, from
+    every lab, oldest first. The table has columns `TEMPLATE`, `OP`, `LAB`,
+    `STARTED` and `MACHINE`. `TEMPLATE` is `<arch>/<name>`, followed by
+    `#<variant>` when a build has reached that variant. `LAB` is the lab
+    the operation is filed under, or `-` when it was started outside a lab.
+    `MACHINE` is the build VM's `<lab>/<vm>` reference while the VM is
+    reachable. It shows `-` before the VM's display is up, while the build
+    seals, and for a push. With nothing running, the command prints
+    `no template build or push is running`.
+  DOC
+
+  code text { source = <<'SRC'
+$ vmlab template status
+TEMPLATE      OP    LAB STARTED              MACHINE
+x86_64/alpine build -   2026-10-31 00:03:05  build-x86_64-alpine/build
+$ vmlab vm screenshot build-x86_64-alpine/build installer.png
+SRC
+  }
+
+  p <<DOC
+    Under `--json` each entry has `lab`, `arch`, `template`, `kind`
+    (`build` or `push`), `started` (RFC 3339), `variant` and `machine`;
+    the last two are `null` when absent. Exit status is 0, or 1 when the
+    supervisor cannot be reached.
   DOC
 
   h2 "vmlab template list"

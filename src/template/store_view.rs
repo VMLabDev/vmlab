@@ -263,3 +263,22 @@ pub struct PushStarted {
     /// The alias moved on success: `latest`, or `latest-prerelease`.
     pub moving_tag: String,
 }
+
+/// One running template operation, as `template.status` answers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningOp {
+    /// The lab the operation was filed under — the directory it was started
+    /// from, empty outside a lab.
+    pub lab: String,
+    pub arch: String,
+    pub template: String,
+    /// `build` or `push`.
+    pub kind: String,
+    /// RFC 3339.
+    pub started: String,
+    /// The variant a build is on, once it is past the base (§6.6).
+    pub variant: Option<String>,
+    /// The build VM's `<lab>/<vm>` reference while `vmlab vm screenshot`,
+    /// `vmlab console` and `vmlab vm sendkeys` can reach it (§6.1).
+    pub machine: Option<String>,
+}

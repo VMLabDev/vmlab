@@ -3,7 +3,7 @@ page guide_templates {
   chapter_header "Templates and the store" {
     kicker       = "The guide · explanation"
     reading_time = "10 min read"
-    updated      = "2026-10-30"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -182,6 +182,29 @@ page guide_templates {
     the disk and its metadata into the store under the new version. Build
     output streams to your terminal as it happens.
   DOC
+
+  h3 "Watching a running build"
+
+  p <<DOC
+    The synthetic lab is named `build-<arch>-<name>`, and its VM is
+    `build`. While the build runs, `build-<arch>-<name>/build` works as a
+    machine reference for the screen and input verbs: `vmlab vm screenshot`,
+    `ocr`, `find-image`, `sendkeys`, `mouse-move`, `click` and `drag`, and
+    `vmlab console`. Use it to watch a screen-driven install, to capture the
+    images a provision matches against, or to press the key a stuck
+    installer waits for. The build log prints the reference once the VM's
+    display is up, and [`vmlab template status`](cmd_template) lists it for
+    every running build. The lab refuses every other verb, because the
+    build owns its VM. Stop a build with `vmlab template stop`.
+  DOC
+
+  code sh { source = <<'SRC'
+vmlab template status
+vmlab vm screenshot build-x86_64-alpine/build installer.png
+vmlab console build-x86_64-alpine/build
+vmlab vm sendkeys build-x86_64-alpine/build enter
+SRC
+  }
 
   h3 "The agent bootstrap ISO"
 
