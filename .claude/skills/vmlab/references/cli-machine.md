@@ -189,9 +189,11 @@ vmlab vm ocr [OPTIONS] <VM>
 | --- | --- |
 | `<VM>` | The VM, as `[lab/]name`. |
 | `--region <X> <Y> <W> <H>` | Restrict to a region: x y w h. |
+| `--scale <SCALE>` | Upscale the frame this many times before reading it, 1 to 4. Default 3; 1 reads it at its own size. |
+| `--layout <LAYOUT>` | Page segmentation: `block` (consoles, dialogs), `sparse` (desktops, lock screens), `line` (one line), `auto` (tesseract's page analysis). Default `block`. |
 | `-h`, `--help` | Print help. |
 
-Runs OCR over the current screen, or over the rectangle `--region` names, and prints the recognised text followed by a newline. The four region values are separate arguments; negative values are clamped to 0. The recogniser and its limits are in snapshots-vision.md.
+Runs OCR over the current screen, or over the rectangle `--region` names, and prints the recognised text followed by a newline. The four region values are separate arguments; negative values are clamped to 0. A scale outside 1 to 4 or an unknown layout is refused before any daemon is contacted. The recogniser, its options and its limits are in snapshots-vision.md.
 
 ### vmlab vm find-image
 
@@ -224,6 +226,7 @@ Log in on a Windows console from the shell:
 vmlab vm sendkeys client01 ctrl-alt-delete
 vmlab vm screenshot client01 /tmp/login.png
 vmlab vm ocr client01 --region 0 400 1024 200
+vmlab vm ocr client01 --layout sparse
 ```
 
 Wait for a button to appear, then click it:
