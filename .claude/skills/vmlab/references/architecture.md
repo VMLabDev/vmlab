@@ -389,7 +389,7 @@ catalogue and global segments.
 | Lab daemons | `lab.ensure`, `lab.release`, `lab.restart` | CLI |
 | Global segments | `global.attach`, `global.detach`, `global.list` | Lab daemons only |
 | Host USB | `usb.list` | CLI, and lab daemons for a script's `lab.usb_devices()` |
-| Template builds | `template.list`, `template.build`, `template.stop_build` | CLI |
+| Template builds | `template.list`, `template.build`, `template.stop_build`, `template.status` | CLI |
 | The store | `store.list`, `store.remove`, `store.prune`, `store.export`, `store.import`, `store.pull`, `store.push`, `store.stop_push` | CLI |
 | Registries | `registry.search`, `registry.login`, `registry.namespaces`, `registry.namespace_add`, `registry.namespace_remove` | CLI |
 

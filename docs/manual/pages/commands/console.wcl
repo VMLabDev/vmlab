@@ -3,7 +3,7 @@ page cmd_console {
   chapter_header "vmlab console" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -32,6 +32,12 @@ page cmd_console {
     It then checks the VM's `vnc.sock` exists and refuses when it does not,
     which is what a VM that has not been started looks like. Containers have
     no display, so this verb is for VMs only.
+  DOC
+
+  p <<DOC
+    A running template build's VM is reachable the same way, as
+    `build-<arch>-<name>/build`; `vmlab template status` prints the
+    reference (see [vmlab template](cmd_template)).
   DOC
 
   p <<DOC

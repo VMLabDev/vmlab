@@ -1125,6 +1125,16 @@ vocabulary! {
             arch: String,
             template: String,
         },
+        /// Every running template operation, from whichever lab it was
+        /// filed under, with the build VM's `<lab>/<vm>` reference while the
+        /// machine verbs can reach it (§6.1).
+        #[one_way(
+            "cli",
+            "It answers the person at the terminal which build is running and \
+             which machine reference reaches its VM; a script runs inside a \
+             lab and has no build of its own to look for."
+        )]
+        TemplateStatus = "template.status" {},
         /// Every template in the store, with its size and, on request,
         /// whether that exact version is published.
         #[one_way(

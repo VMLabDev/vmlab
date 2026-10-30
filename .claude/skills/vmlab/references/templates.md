@@ -143,6 +143,8 @@ Verbs (flags in cli-template.md):
   newest by default; a dry run until you pass `--yes`.
 - `vmlab template build` — build a `template {}` block.
 - `vmlab template stop` — stop an in-flight build or push.
+- `vmlab template status` — running builds and pushes, from every lab, with
+  the machine reference that reaches a build's VM.
 - `vmlab template export` / `import` — portable `.tar.zst` archive, offline path.
 - `vmlab template push` / `pull` / `search` / `login` / `registry` — registries.
 
@@ -267,6 +269,33 @@ and again `24.04.4.1`. The counter continues from the highest tag already
 published when the block names a `registry`, and from the local store otherwise.
 Change the prefix and the counter restarts at zero. Pass `--version` to pin a
 version instead; a version already in the store is refused.
+
+### Watching a running build
+
+The build VM is the machine `build` in a synthetic lab named
+`build-<arch>-<name>`. While the build runs, `build-<arch>-<name>/build` is a
+machine reference for the screen and input verbs: `vmlab vm screenshot`, `ocr`,
+`find-image`, `sendkeys`, `mouse-move`, `click`, `drag`, and `vmlab console`.
+Use it to watch a screen-driven install, crop reference images for a
+provision's `find_image`, or press the key a stuck installer waits for. No
+hand-written RFB client against `vnc.sock` is needed.
+
+- The build log prints the reference once the VM's display is up:
+  `build VM is \`build-x86_64-alpine/build\`: …`.
+- `vmlab template status` lists it in the `MACHINE` column; `-` means not
+  reachable yet (or sealing, or a push).
+- Every other verb on that lab (power, snapshots, exec, cp, playbooks) fails
+  with `unsupported` (6): the build owns its VM. Stop a build with
+  `vmlab template stop`, never `vmlab vm stop`.
+- If a lab with that exact name already runs under its own daemon, it keeps its
+  socket and the build logs that its VM cannot be inspected by name.
+
+```sh
+vmlab template status
+vmlab vm screenshot build-x86_64-alpine/build installer.png
+vmlab console build-x86_64-alpine/build
+vmlab vm sendkeys build-x86_64-alpine/build enter
+```
 
 ## Media built from folders
 
