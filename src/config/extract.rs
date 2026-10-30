@@ -588,6 +588,9 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
     let hyperv = r.bool("hyperv").unspan();
+    let apple_smc = r.bool("apple_smc").unspan();
+    let input = r.keyword("input", INPUTS).unspan();
+    let tsc = r.keyword("tsc", TSCS).unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -665,6 +668,9 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         display,
         cpu_model,
         hyperv,
+        apple_smc,
+        input,
+        tsc,
         accel,
         firmware,
         tpm,
@@ -969,6 +975,9 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
     let hyperv = r.bool("hyperv").unspan();
+    let apple_smc = r.bool("apple_smc").unspan();
+    let input = r.keyword("input", INPUTS).unspan();
+    let tsc = r.keyword("tsc", TSCS).unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -996,6 +1005,9 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         display,
         cpu_model,
         hyperv,
+        apple_smc,
+        input,
+        tsc,
         accel,
         firmware,
         tpm,
@@ -1057,6 +1069,9 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
     let hyperv = r.bool("hyperv").unspan();
+    let apple_smc = r.bool("apple_smc").unspan();
+    let input = r.keyword("input", INPUTS).unspan();
+    let tsc = r.keyword("tsc", TSCS).unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -1075,6 +1090,9 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
         display,
         cpu_model,
         hyperv,
+        apple_smc,
+        input,
+        tsc,
         accel,
         firmware,
         tpm,

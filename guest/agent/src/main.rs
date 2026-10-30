@@ -6,11 +6,15 @@
 //! See `guest/agent-proto` for the wire contract and `src/mux.rs` for the
 //! dispatch core.
 //!
-//! Runs as a service (systemd on Linux, SCM on Windows — installed by the
-//! template build) or in the foreground for debugging.
+//! Runs as a service (systemd on Linux, launchd on macOS, SCM on Windows —
+//! installed by the template build) or in the foreground for debugging.
 
 mod app;
 mod clipboard;
+// What a macOS guest's own answers mean: portable like `rdp`, so the build
+// host's tests reach it.
+#[cfg(any(target_os = "macos", test))]
+mod darwin;
 mod exec;
 mod fileops;
 // The logon cache is portable policy, and both adapters resolve through it:
@@ -28,6 +32,9 @@ mod rtc;
 mod spawn;
 mod tail;
 mod terminal;
+// The recursive tree watch has a backend on Linux (inotify) and Windows
+// (ReadDirectoryChangesW) only; elsewhere the mux refuses the open.
+#[cfg(any(target_os = "linux", windows))]
 mod watch;
 
 #[cfg(test)]
@@ -41,10 +48,12 @@ mod sessions_test;
 #[cfg(test)]
 mod testutil;
 
+// Linux and macOS share one Unix half; what differs between them lives in
+// its `linux` and `macos` submodules.
 #[cfg(unix)]
-mod linux;
+mod unix;
 #[cfg(unix)]
-use linux as platform_impl;
+use unix as platform_impl;
 
 #[cfg(windows)]
 mod windows;
@@ -65,20 +74,21 @@ use crate::mux::{Mux, Platform};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Container-mode entries first: they consume the rest of the argv.
-    #[cfg(unix)]
+    // Container micro-VMs and process trees are Linux's alone.
+    #[cfg(target_os = "linux")]
     match args.first().map(String::as_str) {
-        // Exec trampoline for container sessions (see linux::nsexec_main).
-        Some("--nsexec") => linux::nsexec_main(&args[1..]),
+        // Exec trampoline for container sessions (see unix::container).
+        Some("--nsexec") => unix::container::nsexec_main(&args[1..]),
         // The subreaper an exec in a process tree runs under
-        // (see linux::shepherd).
-        Some("--shepherd") => linux::shepherd::main(&args[1..]),
+        // (see unix::shepherd).
+        Some("--shepherd") => unix::shepherd::main(&args[1..]),
         // cinit spawns the agent with the container config it wrote.
         Some("--container") => {
             let Some(config) = args.get(1) else {
                 eprintln!("vmlab-agent: --container needs a config path");
                 std::process::exit(2);
             };
-            run_with(linux::new_platform_container(config));
+            run_with(unix::container::new_platform(config));
         }
         _ => {}
     }
@@ -89,20 +99,20 @@ fn main() {
     #[allow(clippy::while_let_on_iterator)]
     while let Some(a) = args_iter.next() {
         match a.as_str() {
-            // Linux: serve on a serial device instead of the virtio port —
+            // Unix: serve on a serial device instead of the virtio port —
             // a guest too old for virtio-serial on an `isa-serial` profile
-            // (PRD §7.4). Without it the port is auto-detected by hardware.
+            // (PRD §7.4). Without it the port is found by name.
             #[cfg(unix)]
             "--port" => {
                 let Some(path) = args_iter.next() else {
                     eprintln!("vmlab-agent: --port needs a device path");
                     std::process::exit(2);
                 };
-                linux::set_port_override(std::path::PathBuf::from(path));
+                unix::set_port_override(std::path::PathBuf::from(path));
             }
             "--daemonize" => {
                 #[cfg(unix)]
-                linux::daemonize();
+                unix::daemonize();
             }
             // Windows: skip the SCM dispatcher and run in this console.
             "--console" => console = true,
@@ -163,7 +173,7 @@ fn run() -> ! {
 }
 
 #[cfg(unix)]
-type PlatformImpl = linux::LinuxPlatform;
+type PlatformImpl = unix::UnixPlatform;
 #[cfg(windows)]
 type PlatformImpl = windows::WindowsPlatform;
 

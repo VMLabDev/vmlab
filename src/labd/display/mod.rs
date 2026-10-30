@@ -53,7 +53,7 @@ pub trait DisplayHost: Send + Sync + 'static {
     /// Where a screendump may be written and immediately deleted.
     fn capture_dir(&self) -> PathBuf;
     /// Whether input goes over QMP or VNC — a resolved hardware fact, not a
-    /// preference (USB-HID-only guests such as macOS ignore QMP `send-key`).
+    /// preference (the profile's `input_transport`).
     fn input_transport(&self) -> InputTransport;
     /// Whether the scanout is a host GL texture (`gpu.mode` virgl or vulkan
     /// under egl-headless). QMP `screendump` answers `no surface` there, so
@@ -78,8 +78,8 @@ impl Display {
         Self { host }
     }
 
-    /// True when input should go over VNC instead of QMP (for USB-HID-only
-    /// guests like macOS where QMP `send-key` is ignored).
+    /// True when input should go over VNC instead of QMP (the profile's
+    /// `input_transport`).
     fn input_vnc(&self) -> bool {
         matches!(self.host.input_transport(), InputTransport::Vnc)
     }

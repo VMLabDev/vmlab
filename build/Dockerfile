@@ -22,6 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/opt/rust/cargo \
     WATCOM=/opt/open-watcom-v2 \
+    ZIG_DIR=/opt/zig \
     VMLAB_MSVCRT_PREFIX=/opt/mingw-msvcrt \
     PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -46,9 +47,15 @@ COPY rust-toolchain.toml ./
 COPY ebpf/rust-toolchain.toml ebpf/
 RUN ./scripts/guest-toolchains.sh rust
 
+# The macOS agent's zig linker, cargo-zigbuild and rcodesign, pinned in the
+# script; cargo-zigbuild lands in /opt/rust/cargo/bin, the other two here.
+RUN VMLAB_BIN_DIR=/usr/local/bin ./scripts/guest-toolchains.sh zig \
+ && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
+
 # The merge bar's extras over the bundle's toolchains: ci.yml's check job adds
 # rustfmt + clippy, its guest-crates job the windows-gnu target the agent's
-# Windows code is linted against (`ci::guest-windows-check`).
+# Windows code is linted against (`ci::guest-windows-check`). The darwin
+# target `ci::guest-macos-check` lints against comes with the rust stage.
 RUN rustup component add --toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" rustfmt clippy \
  && rustup target add --toolchain "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" x86_64-pc-windows-gnu
 

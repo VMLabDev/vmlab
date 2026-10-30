@@ -3,7 +3,7 @@ page guide_dev {
   chapter_header "Dev machines and the workspace syncer" {
     kicker       = "The guide · explanation"
     reading_time = "17 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -58,7 +58,8 @@ SRC
   p <<'DOC'
 Unset arguments resolve **`@dev` argument, then profile, then floor**. The
 default is profile-sourced because it is guest-OS-shaped: the shipped Windows
-profiles say `C:\src` and the Linux ones `/src`. A profile with no dev keys
+profiles say `C:\src`, the Linux ones `/src`, and `macos` `/Users/Shared/src`,
+because a macOS guest's `/` is the sealed system volume. A profile with no dev keys
 still hosts a dev machine; a missing key means the floor applies, never that
 the profile cannot be a dev target. The guest path does not have to exist:
 when the default login cannot create it, as with `/src` under a root-owned

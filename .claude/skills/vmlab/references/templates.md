@@ -9,7 +9,7 @@ and version, clone it into any number of labs.
 A store entry is two files: `disk.qcow2`, the sealed image, and `template.wcl`,
 its metadata. The metadata records the hardware the template was built with
 (profile, CPUs, memory, disk size, firmware, TPM, secure boot, display, CPU
-model, accelerator), where
+model, Hyper-V enlightenments, Apple SMC, input devices, TSC, accelerator), where
 it came from, the version of `vmlab-agent` baked into it, the wscript surface
 version its embedded scripts were written against, an optional first-boot
 script, and the OCI repository it publishes to. The hardware fields form the
@@ -48,7 +48,7 @@ have. Never call a variant a "snapshot" — that is a VM snapshot.
   `base_sha256`, optional `default`, `description`, `first_boot_script`,
   `wscript_surface`, `agent_version`, and hardware overrides (`profile`, `cpus`,
   `memory`, `firmware`, `tpm`, `secure_boot`, `secure_boot_keys`, `display`,
-  `cpu_model`, `hyperv`, `accel`).
+  `cpu_model`, `hyperv`, `apple_smc`, `input`, `tsc`, `accel`).
   A variant counts only when both its block and its overlay exist.
 - **Effective metadata**: the base's fields with the variant's in their place.
   Hardware resolution, first boot, the surface check and agent staleness all
@@ -82,8 +82,8 @@ template "windows-11" {
 ```
 
 - A `variant` block takes `default`, `description`, `first_boot`, the hardware
-  overrides (`profile cpus memory display cpu_model hyperv accel firmware tpm
-  secure_boot secure_boot_keys`), `qemu_args` (replaces the template's),
+  overrides (`profile cpus memory display cpu_model hyperv apple_smc input tsc
+  accel firmware tpm secure_boot secure_boot_keys`), `qemu_args` (replaces the template's),
   `gpu {}` (replaces the template's; build VM only), `nic` (replaces the
   template's when declared), `media`, and `provision`/`playbook` steps run in
   declaration order. Validation: legal unique names, not `base`; exactly one
@@ -223,6 +223,34 @@ no unattended hook, so its provision types the install line over the screen, for
 example `D:\INSTALL.BAT` from the CD, or `A:\INSTALL.BAT` from a floppy `media`
 block. The scripts probe drives A, D, E and F for their source.
 
+For an x86_64 guest the ISO also carries the **macOS agent** under `macos/`, with
+`install.sh` and `firstboot.sh`. A fresh macOS runs no unattended hook, so the
+build boots Recovery, opens its Terminal and types the install line; Recovery
+mounts the ISO at `/Volumes/VMLAB`:
+
+```sh
+/Volumes/VMLAB/macos/install.sh [--user NAME --password PW [--full-name TEXT]] [DATA-VOLUME]
+```
+
+It writes onto the new system's Data volume (default
+`/Volumes/Macintosh HD - Data`): `/Library/vmlab/vmlab-agent`, the LaunchDaemon
+`dev.vmlab.agent` (root, `RunAtLoad`, `KeepAlive`, `/etc/paths`' `PATH`, log
+`/var/log/vmlab-agent.log`), and `.AppleSetupDone`, removing a stale
+`.AppleSetupTermsOfService` that would bring the Terms page back. With `--user`
+the first boot creates that administrator with `sysadminctl`, marks its per-user
+setup screens seen, and deletes itself and the root-only file holding the
+password (log `/var/log/vmlab-firstboot.log`). Without `--user` no account is
+made. The account is an argument, never a file on the ISO, so the ISO stays the
+same for every template and no password enters the media cache.
+
+The macOS agent handshakes as `os = "macos"` and serves `terminal`, `exec`,
+`fileops`, `tail`, `metrics`, `set_time` and `clipboard`. It does not advertise
+`watch`, `tree` or any shared-app mode, so the workspace syncer, process trees
+and `vmlab app` refuse by name. Its clipboard is the console user's pasteboard and
+refuses while nobody is logged in. A repair restarts it with `launchctl kickstart -k
+system/dev.vmlab.agent`; `launchctl bootout` from inside the agent kills the
+command doing it, because a job's processes die with the job.
+
 TempleOS is the exception that proves the rule: it reads no ISO 9660 and has no
 network, so nothing can be carried in. Its agent is HolyC, and a provision types
 it at the shell with `vmlab::templeos_agent_script()` (wscript-lab-api.md), which
@@ -315,6 +343,9 @@ template "<name>" {
   display     = "virtio-vga"
   cpu_model   = "pentium3"
   hyperv      = true
+  apple_smc   = false
+  input       = "ps2"
+  tsc         = "host"
   accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
@@ -347,6 +378,9 @@ template "<name>" {
 | `display` | utf8 | from profile | QEMU display device string for the build VM. |
 | `cpu_model` | utf8 | from profile | QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`. |
 | `hyperv` | bool | from profile | Hyper-V enlightenments for the build VM under KVM; the build VM resolves it like any VM, so a template on a shipped Windows profile builds with them. Recorded in the metadata and inherited by clones. Not applied under TCG or with a `cpu_model`. |
+| `apple_smc` | bool | from profile | The Apple SMC and an SMBIOS type 2 table for the build VM, which a macOS installer needs. Recorded in the metadata and inherited by clones. x86 only. |
+| `input` | utf8 | from profile | Keyboard and pointer for the build VM: `ps2` or `usb` (USB keyboard and tablet on their own xHCI). Recorded in the metadata and inherited by clones. |
+| `tsc` | utf8 | from profile | `host`: an invariant TSC pinned at the host's frequency for the build VM, KVM only. Recorded in the metadata and inherited by clones; each clone pins its own frequency at its first start. x86 only. |
 | `accel` | utf8 | from profile | Accelerator for the build VM: `kvm` or `tcg`. Inherited by clones. `tcg` cannot be combined with `nested = true`. |
 | `firmware` | utf8 | from profile | Firmware: `ovmf` or `seabios`. |
 | `tpm` | bool | from profile | Enable a TPM 2.0 device. |

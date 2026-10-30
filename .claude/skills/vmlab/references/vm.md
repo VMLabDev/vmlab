@@ -37,6 +37,9 @@ vm "<name>" {
   display     = "virtio-vga"
   cpu_model   = "pentium3"
   hyperv      = true
+  apple_smc   = false
+  input       = "ps2"          // or "usb"
+  tsc         = "host"
   accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
@@ -71,9 +74,12 @@ vm "<name>" {
 | `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
 | `prevent_sleep` | bool | `false` | Keep the guest awake: the moment it suspends to RAM (ACPI S3), the lab daemon wakes it with QMP `system_wakeup` and records `vm.woken` with `cause = prevent_sleep`. Declared on the `vm` block only, never inherited: it is the daemon's policy, not hardware. The template build VM always has it on. Not accepted on a `container {}`. Without it a sleeping guest shows `suspended` in `vmlab status` until `vmlab vm start` wakes it. |
 | `clock` | utf8 | `host` | Guest clock policy. `host`: the RTC runs from the host's time, the lab daemon checks the guest clock at every agent handshake and sets it when more than 2 s off (`machine.clock_drift`), and after an online snapshot restore it sets the guest's clock to the host's current time through the agent (a failure warns and the restore still succeeds). `snapshot`: a restored guest keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z` (any offset, converted to UTC): the RTC starts at that instant on every boot and runs forward, and vmlab never sets it, after a restore included. The guest's own NTP or w32time can still move it; turn that sync off in the guest, or keep the machine off a segment with a route to a time server, when the date must hold. Declared on the machine block only, never inherited. Also accepted on a `container {}`. |
-| `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
+| `display` | utf8 | inherited | Display device: `virtio-vga`, `virtio-gpu`, `qxl`, `std`, `vmware` (VMware SVGA II, `vmware-svga`, what macOS drives), or a QEMU device name passed as written. Inherited from template, then profile. |
 | `cpu_model` | utf8 | inherited | QEMU `-cpu` model, for example `pentium3`, `pentium2`, `qemu32` or `Westmere`, replacing the default (`host` under KVM, `max` under TCG) under either accelerator. For guests the host CPU breaks, such as Windows 9x Setup. Inherited from template, then profile. Any non-empty name is accepted; QEMU refuses an unknown one at start. Cannot be combined with `nested = true`. |
 | `hyperv` | bool | inherited | Hyper-V enlightenments for a Windows guest: under KVM on x86 the `-cpu host` string gains `hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,hv-ipi`, so Windows reads its clock from the reference TSC page instead of an emulated timer (about 20 ns a read against 5.6 µs native, 51 µs nested under WSL 2). Inherited from template, then profile; the shipped `windows-11`, `windows-10`, `windows-server` and `windows-legacy` profiles set it, so `false` here opts out. Not applied under TCG, with a `cpu_model`, or on a non-x86 guest; `up` warns when this block set `true` and it was not applied. Where the host's KVM has APICv/AVIC on (`kvm_intel` `enable_apicv`, `kvm_amd` `avic`), `hv-avic` is added too, with `-global kvm-pit.lost_tick_policy=discard`, so an EOI is not an exit; without them neither is. `+invtsc` is never added: it blocks migration, so online snapshots. |
+| `apple_smc` | bool | inherited | The Apple SMC macOS refuses to boot without: `-device isa-applesmc,osk=…` (Apple's fixed OSK) and `-smbios type=2`. Inherited from template, then profile; only the shipped `macos` profile sets it. Off when no layer says. x86 only: another arch resolving it is refused, naming the layer. |
+| `input` | utf8 | inherited, else `ps2` | Keyboard and pointer. `ps2`: PS/2 keyboard plus `usb-tablet` on `-usb`. `usb`: `usb-kbd` and `usb-tablet` on their own `qemu-xhci,id=xhci`, no `-usb` (on `virt`, the keyboard joins the existing xHCI), for guests that read no PS/2 keyboard (macOS, OpenCore). Neither is bound to the display, so QMP `send-key` lands on the USB keyboard and `input_transport = "qmp"` works. Inherited from template, then profile; `macos` sets `usb`. |
+| `tsc` | utf8 | inherited | `host`: `-cpu` gains `,+invtsc,tsc-frequency=<Hz>`, an invariant TSC pinned at the host's frequency, which macOS needs. Read from KVM (a paused, device-less emulator over QMP) at the VM's first KVM start and pinned in `.vmlab/vms/<vm>/tsc-hz`; later starts reuse it, because the host recalibrates its TSC each boot and QEMU refuses an online snapshot taken at another frequency, while KVM runs a pin within tolerance without scaling. KVM only: under TCG `up` warns (inherited or not) and QEMU's default TSC is used. x86 only. Inherited from template, then profile; `macos` sets it. |
 | `accel` | utf8 | inherited | Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`. |
 | `firmware` | utf8 | inherited | Firmware: `ovmf` or `seabios`. Inherited from template, then profile. |
 | `tpm` | bool | inherited | Enable a TPM 2.0 device. Inherited from template, then profile. |
@@ -141,6 +147,8 @@ Known architectures are `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`,
 - A `playbook {}` on a VM whose arch is known to be something other than
   `x86_64` is rejected unless it names a `guest_bin`; config-weave ships guest
   binaries for x86_64 only.
+- A `playbook {}` on a macOS guest (profile `macos…`) is rejected unless it
+  names a `guest_bin`; config-weave ships no macOS binary.
 
 ```wcl
 # examples/mixed-lab/vmlab.wcl
@@ -179,7 +187,7 @@ vm "dev01" { … }
 | --- | --- | --- | --- |
 | `default` | bool | `false` | Make this the lab's default dev machine. At most one per lab. The only `@dev` machine in a lab is the default implicitly. |
 | `workspace` | utf8 | none | Host directory whose contents sync into the workspace, relative to the lab root. Without it the machine is still `@dev` but has no workspace. |
-| `workspace_guest` | utf8 | profile, else `/src` | Guest path the workspace lands at. Inherited from the profile (`C:\src` on Windows profiles, `/src` on Linux ones) if omitted. |
+| `workspace_guest` | utf8 | profile, else `/src` | Guest path the workspace lands at. Inherited from the profile (`C:\src` on Windows profiles, `/src` on Linux ones, `/Users/Shared/src` on `macos`) if omitted. |
 
 Unset arguments resolve in the order `@dev` argument, then the machine's
 effective profile, then the vmlab floor of `/src`. A profile that sets no
@@ -234,19 +242,19 @@ login "<label>" {
 | `label` | utf8 (label) | required | Identity label, what `--user` and `as_login` select it by, for example `dev`. Unique per machine; the inline block label. |
 | `user` | utf8 | required | Guest account to log on as, for example `PROBE\dev`. |
 | `password` | utf8 | none | The account's password, written plainly. Required on a Windows-family profile. |
-| `elevated` | bool | `true` | Run the session elevated. Windows only; declaring it on a Linux-family profile is an error. |
+| `elevated` | bool | `true` | Run the session elevated. Windows only; declaring it on a Linux-family or macOS-family profile is an error. |
 | `default` | bool | implied | Make this the machine's default identity. Implied when the machine declares exactly one login. |
 
 The family the rules are judged against is the machine's resolved profile: a
-name starting with `windows` is Windows, one starting with `linux` is Linux, and
-anything else, including `custom` and a registry template not yet pulled, is
+name starting with `windows` is Windows, one starting with `linux` is Linux, one
+starting with `macos` is macOS, and anything else, including `custom` and a registry template not yet pulled, is
 unknown and gets neither family rule. A container is always Linux. Validation
 enforces:
 
 - On a Windows family, every login has a `password`; the agent runs as
   LocalSystem and there is no credential-free logon.
-- On a Linux family, no login declares `elevated`; root is root, and the field
-  would be read nowhere.
+- On a Linux or macOS family, no login declares `elevated`; root is root, and the
+  field would be read nowhere. A login there needs no `password`: the agent is root.
 - No two logins on one machine share a label.
 - At most one login on a machine sets `default = true`; the message names both.
 
@@ -455,7 +463,7 @@ playbook "playbooks/baseline" {
 | `path` | utf8 (label) | required | Playbook folder containing `playbook.wcl`, relative to the lab root; the inline label. |
 | `play` | utf8 | required | Play name inside the playbook to run. |
 | `timeout` | duration | `1h` | Ceiling on each config-weave run, such as `2h` or `90min`. A run after a reboot gets the full value again. |
-| `guest_dir` | utf8 | profile's `playbook_dir`, else `/var/lib/vmlab/weave` (Linux) or `C:\weave` (Windows) | Absolute guest directory the config-weave binary and the playbook folders land in. Created if missing. |
+| `guest_dir` | utf8 | profile's `playbook_dir`, else `/var/lib/vmlab/weave` (Linux, macOS) or `C:\weave` (Windows) | Absolute guest directory the config-weave binary and the playbook folders land in. Created if missing. |
 | `guest_bin` | utf8 | unset | Absolute path of a config-weave binary already in the guest. When set, vmlab pushes no binary and probes this one with `version` before each run; the playbook folder is still pushed to `guest_dir`. |
 | `var {}` | children | none | Variable overrides passed to config-weave for this machine's run. |
 
@@ -463,7 +471,7 @@ Validation requires a non-empty `play`, a `path` that is a directory holding a
 `playbook.wcl`, a `timeout` greater than zero, and no variable set twice on one
 block. `guest_dir` and `guest_bin` must be absolute for the machine's guest
 family: a drive-letter path on Windows, a path starting with `/` on Linux
-(every container), and either where the family is unknown. On Windows
+(every container) and macOS, and either where the family is unknown. On Windows
 `guest_bin` must also end in `.exe`. config-weave ships guest
 binaries for x86_64 only, so a playbook on a VM with another known arch is
 rejected unless it names a `guest_bin`.

@@ -121,6 +121,12 @@ pub struct TemplateSummary {
     pub cpu_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperv: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apple_smc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsc: Option<String>,
     pub accel: Option<String>,
     /// RFC 3339.
     pub created: String,
@@ -151,6 +157,9 @@ impl From<&TemplateMeta> for TemplateSummary {
             display: t.display.clone(),
             cpu_model: t.cpu_model.clone(),
             hyperv: t.hyperv,
+            apple_smc: t.apple_smc,
+            input: t.input.map(|i| i.as_str().to_string()),
+            tsc: t.tsc.map(|t| t.as_str().to_string()),
             accel: t.accel.map(|a| a.as_str().to_string()),
             created: t.created.to_rfc3339(),
             origin: t.origin.clone(),

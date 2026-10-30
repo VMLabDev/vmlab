@@ -19,6 +19,12 @@
 #   linux-x86       i686-unknown-linux-musl     (static; optional — a 32-bit
 #                   guest too old for virtio-serial serves on COM1 instead,
 #                   PRD §7.4; skipped with a warning when not installed)
+#   macos-x86_64    x86_64-apple-darwin         (Intel macOS 11+; linked by
+#                   cargo-zigbuild against zig's libSystem stubs, no Apple
+#                   SDK, then ad-hoc signed with rcodesign; skipped with a
+#                   warning when cargo-zigbuild or zig is absent, and left
+#                   unsigned with a warning when rcodesign is — an Intel Mac
+#                   runs an unsigned binary, an Apple-silicon one would not)
 #
 # Usage: guest/build-agent.sh [target-key...]   (default: all of the above)
 #
@@ -81,7 +87,8 @@ target_spec() {
     windows-x86_64) echo "x86_64-win7-windows-gnu|vmlab-agent.exe|0" ;;
     windows-x86) echo "i686-win7-windows-gnu|vmlab-agent.exe|0" ;;
     linux-x86) echo "i686-unknown-linux-musl|vmlab-agent|0" ;;
-    *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86)" ;;
+    macos-x86_64) echo "x86_64-apple-darwin|vmlab-agent|0" ;;
+    *) die "unknown target key '$1' (known: linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86 macos-x86_64)" ;;
   esac
 }
 
@@ -142,6 +149,17 @@ build_one() {
     skip "$key: $mingw_cc not found (install mingw-w64)"
     return 0
   fi
+  # Apple targets link through zig: no Xcode, no SDK. rustc warns that it
+  # found no MacOSX.sdk to ask for symbols; zig's own libSystem stubs are
+  # what the link resolves against, and the binary needs no framework.
+  local -a build=(build)
+  if [[ "$target" == *-apple-darwin ]]; then
+    if ! command -v cargo-zigbuild >/dev/null 2>&1 || ! command -v zig >/dev/null 2>&1; then
+      skip "$key: cargo-zigbuild and zig are needed (scripts/guest-toolchains.sh zig)"
+      return 0
+    fi
+    build=(zigbuild)
+  fi
 
   local -a env_args=()
   case "$key" in
@@ -162,6 +180,15 @@ build_one() {
     windows-x86)
       env_args+=("CARGO_TARGET_I686_WIN7_WINDOWS_GNU_RUSTFLAGS=-Ctarget-feature=+crt-static $(msvcrt_link_args i686-w64-mingw32)")
       ;;
+    macos-x86_64)
+      # The oldest macOS the binary loads on — the floor its LC_BUILD_VERSION
+      # carries — and header room for the signature rcodesign adds after
+      # the link (zig's linker leaves none, and cannot sign x86_64 itself).
+      env_args+=(
+        "MACOSX_DEPLOYMENT_TARGET=11.0"
+        "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=-Wl,-headerpad_max_install_names"
+      )
+      ;;
   esac
 
   # One stamp for both halves: compiled into the binary's handshake and
@@ -172,15 +199,32 @@ build_one() {
   env_args+=("VMLAB_AGENT_STAMP=$stamp")
 
   log "building vmlab-agent for $key ($target)"
-  env "${env_args[@]}" cargo $toolchain build --release --target "$target" "${build_std[@]}" \
+  env "${env_args[@]}" cargo $toolchain "${build[@]}" --release --target "$target" "${build_std[@]}" \
     --manifest-path "$SCRIPT_DIR/agent/Cargo.toml" \
-    || die "cargo build for $target failed"
+    || die "cargo ${build[*]} for $target failed"
 
   local out="$DIST_DIR/$key"
   mkdir -p "$out"
   install -m 0755 "$SCRIPT_DIR/agent/target/$target/release/$binary" "$out/$binary"
+  if [[ "$target" == *-apple-darwin ]]; then
+    sign_apple "$key" "$out/$binary"
+  fi
   echo "$stamp" >"$out/VERSION"
   log "$key: $(du -h "$out/$binary" | cut -f1) → $out/$binary"
+}
+
+# Ad-hoc sign a Mach-O in place: a stable code identity (what TCC and
+# `codesign -dv` key on) with no Apple certificate behind it.
+sign_apple() {
+  local key="$1" bin="$2"
+  if ! command -v rcodesign >/dev/null 2>&1; then
+    [[ "$STRICT" == "1" ]] && die "$key: rcodesign not found — VMLAB_REQUIRE_ALL_TARGETS=1 ships no unsigned macOS agent (scripts/guest-toolchains.sh zig)"
+    log "$key: rcodesign not found — leaving the binary unsigned (Intel macOS runs it)"
+    return 0
+  fi
+  local out
+  out="$(rcodesign sign --binary-identifier dev.vmlab.agent "$bin" 2>&1)" \
+    || die "$key: rcodesign could not sign $bin: $out"
 }
 
 main() {
@@ -188,7 +232,7 @@ main() {
   command -v rustup >/dev/null 2>&1 || die "missing host tool: rustup"
   mkdir -p "$DIST_DIR"
   local -a keys=("$@")
-  [[ ${#keys[@]} -gt 0 ]] || keys=(linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86)
+  [[ ${#keys[@]} -gt 0 ]] || keys=(linux-x86_64 linux-aarch64 linux-riscv64 windows-x86_64 windows-x86 linux-x86 macos-x86_64)
   local key
   for key in "${keys[@]}"; do
     build_one "$key"

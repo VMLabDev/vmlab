@@ -38,8 +38,9 @@ pub enum DiskBus {
 }
 
 /// How scripted input (`vm.send_keys`/`mouse_*`) reaches the guest. QMP
-/// `send-key` only drives the PS/2 keyboard, which USB-HID-only guests
-/// (macOS/OpenCore) ignore; `Vnc` routes input over the VM's VNC socket
+/// `send-key` reaches whichever keyboard QEMU routes unbound input to — the
+/// PS/2 one, or a USB keyboard where `input = "usb"` adds one, which is how
+/// macOS and OpenCore are driven. `Vnc` routes input over the VM's VNC socket
 /// instead — the path a real viewer uses (PRD §10.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputTransport {
@@ -117,6 +118,13 @@ pub struct Profile {
     pub cpu_model: Option<String>,
     /// Hyper-V enlightenments (§5.2) under KVM. None = off.
     pub hyperv: Option<bool>,
+    /// The Apple SMC device (§5.2). None = off.
+    pub apple_smc: Option<bool>,
+    /// Keyboard and pointer devices (§5.2). None = PS/2 keyboard, USB
+    /// tablet.
+    pub input: Option<crate::config::model::InputDevices>,
+    /// The guest's TSC (§5.2). None = QEMU's default.
+    pub tsc: Option<crate::config::model::TscMode>,
     /// QEMU accelerator (§5.2). None = KVM when usable, else TCG.
     pub accel: Option<crate::config::model::AccelMode>,
     pub cpus: Option<u32>,
@@ -283,6 +291,9 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .parsed("cpu_model", crate::config::model::parse_cpu_model)
             .unspan(),
         hyperv: r.bool("hyperv").unspan(),
+        apple_smc: r.bool("apple_smc").unspan(),
+        input: r.keyword("input", crate::config::model::INPUTS).unspan(),
+        tsc: r.keyword("tsc", crate::config::model::TSCS).unspan(),
         accel: r.keyword("accel", crate::config::model::ACCELS).unspan(),
         cpus: r.int_at_least("cpus", 1).unspan(),
         memory: r.size("memory").unspan(),
@@ -365,8 +376,10 @@ mod tests {
             "{err:#}"
         );
 
+        // Only `macos` pins one: macOS boots on a supported Intel model, not
+        // on the host CPU.
         let shipped = ProfileSet::shipped().unwrap();
-        for name in shipped.names() {
+        for name in shipped.names().filter(|n| *n != "macos") {
             assert_eq!(shipped.get(name).unwrap().cpu_model, None, "{name}");
         }
     }
@@ -397,8 +410,8 @@ mod tests {
     }
 
     /// The shipped Windows profiles from Vista on turn the Hyper-V
-    /// enlightenments on (§5.2); `windows-xp`, `windows-9x` and every
-    /// non-Windows profile leave them unset.
+    /// enlightenments on (§5.2); `macos` turns them off by name, and
+    /// `windows-xp`, `windows-9x` and every other profile leave them unset.
     #[test]
     fn hyperv_is_on_for_the_enlightened_windows_profiles_only() {
         let ok = parse_profiles(
@@ -416,7 +429,10 @@ mod tests {
             "windows-legacy",
         ];
         for name in shipped.names() {
-            let want = on.contains(&name).then_some(true);
+            let want = match name {
+                "macos" => Some(false),
+                name => on.contains(&name).then_some(true),
+            };
             assert_eq!(shipped.get(name).unwrap().hyperv, want, "{name}");
         }
     }
@@ -434,6 +450,7 @@ mod tests {
             "windows-9x",
             "linux-modern",
             "linux-generic",
+            "macos",
             "custom",
         ] {
             assert!(
@@ -470,6 +487,60 @@ mod tests {
         assert!(custom.machine.is_none());
         assert!(custom.firmware.is_none());
         assert_eq!(custom.agent_transport, AgentTransport::VirtioSerial);
+    }
+
+    /// `macos` carries everything Phase 0's working command line needed that
+    /// no other profile does (§5.2), and none of the Windows extras.
+    #[test]
+    fn the_macos_profile_carries_what_macos_boots_on() {
+        use crate::config::model::{InputDevices, TscMode};
+        let set = ProfileSet::shipped().unwrap();
+        let mac = set.get("macos").unwrap();
+        assert_eq!(mac.machine, Some(Machine::Q35));
+        assert_eq!(mac.firmware, Some(FirmwareKind::Ovmf));
+        assert_eq!(mac.secure_boot, Some(false));
+        assert_eq!(mac.tpm, Some(false));
+        assert_eq!(mac.disk_bus, Some(DiskBus::Sata));
+        assert_eq!(mac.nic_model.as_deref(), Some("virtio-net-pci"));
+        assert_eq!(mac.display.as_deref(), Some("vmware"));
+        assert_eq!(
+            mac.cpu_model.as_deref(),
+            Some("Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on")
+        );
+        assert_eq!(mac.hyperv, Some(false));
+        assert_eq!(mac.apple_smc, Some(true));
+        assert_eq!(mac.input, Some(InputDevices::Usb));
+        assert_eq!(mac.tsc, Some(TscMode::Host));
+        assert_eq!(mac.agent_transport, AgentTransport::VirtioSerial);
+        assert!(!mac.virtiofs);
+        assert_eq!(mac.workspace_guest.as_deref(), Some("/Users/Shared/src"));
+        // No other shipped profile asks for any of the three.
+        for name in set.names().filter(|n| *n != "macos") {
+            let p = set.get(name).unwrap();
+            assert_eq!((p.apple_smc, p.input, p.tsc), (None, None, None), "{name}");
+        }
+    }
+
+    /// `input` and `tsc` read their keywords and refuse others.
+    #[test]
+    fn input_and_tsc_read_their_keywords_and_refuse_others() {
+        use crate::config::model::{InputDevices, TscMode};
+        let ok = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"p\" { input = \"ps2\" tsc = \"host\" }\n",
+            "<test>",
+        )
+        .unwrap();
+        assert_eq!(ok[0].input, Some(InputDevices::Ps2));
+        assert_eq!(ok[0].tsc, Some(TscMode::Host));
+        for bad in ["input = \"serial\"", "tsc = \"auto\""] {
+            let err = parse_profiles(
+                &format!("import <vmlab-profile.wcl>\nprofile \"p\" {{ {bad} }}\n"),
+                "<test>",
+            )
+            .unwrap_err();
+            let key = bad.split(' ').next().unwrap();
+            assert!(format!("{err:#}").contains(key), "{err:#}");
+        }
     }
 
     /// Only the guests that cannot read the RTC as UTC — NT4 through XP/2003,

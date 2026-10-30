@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 
 const VERSION_FILE: &str = "VERSION";
 
-/// Guest OS flavour of the agent binary. The first two are the Rust
+/// Guest OS flavour of the agent binary. The first three are the Rust
 /// `vmlab-agent`; the rest are `vmlab-agent-legacy` (guest/agent-legacy,
 /// `guest/build-agent-legacy.sh`), the C agent for guests with no
 /// virtio-serial (PRD §7.4).
@@ -26,6 +26,8 @@ const VERSION_FILE: &str = "VERSION";
 pub enum AgentOs {
     Linux,
     Windows,
+    /// Intel macOS: the Rust agent built for `x86_64-apple-darwin`.
+    Macos,
     /// NT4 through XP/2003.
     WindowsNt,
     /// Windows 95/98/ME.
@@ -41,6 +43,7 @@ impl AgentOs {
         match self {
             AgentOs::Linux => "linux",
             AgentOs::Windows => "windows",
+            AgentOs::Macos => "macos",
             AgentOs::WindowsNt => "windows-nt",
             AgentOs::Windows9x => "windows-9x",
             AgentOs::Dos => "dos",
@@ -50,7 +53,7 @@ impl AgentOs {
 
     pub fn binary(self) -> &'static str {
         match self {
-            AgentOs::Linux => "vmlab-agent",
+            AgentOs::Linux | AgentOs::Macos => "vmlab-agent",
             AgentOs::Windows => "vmlab-agent.exe",
             AgentOs::WindowsNt | AgentOs::Windows9x => "vmlab-agent-legacy.exe",
             AgentOs::Dos => "VMLABAGT.EXE",
@@ -72,7 +75,9 @@ impl AgentOs {
     /// x64 XP runs it under WOW64), so its keys are fixed.
     fn dist_key(self, arch: &str) -> String {
         match self {
-            AgentOs::Linux | AgentOs::Windows => format!("{}-{arch}", self.key()),
+            AgentOs::Linux | AgentOs::Windows | AgentOs::Macos => {
+                format!("{}-{arch}", self.key())
+            }
             AgentOs::WindowsNt => "windows-nt-x86".into(),
             AgentOs::Windows9x => "windows-9x-x86".into(),
             AgentOs::Dos => "dos-i386".into(),
@@ -248,6 +253,26 @@ mod tests {
         let win = find_in(&dirs, AgentOs::Windows, "x86_64").unwrap();
         assert!(win.path.ends_with("agent/windows-x86_64/vmlab-agent.exe"));
         assert_eq!(win.version, "unknown");
+    }
+
+    /// The macOS agent is the Rust one, keyed by arch like Linux's, and its
+    /// binary is named like Linux's too.
+    #[test]
+    fn finds_the_macos_flavour_beside_the_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_asset(tmp.path(), "macos-x86_64", "vmlab-agent", Some("agent=m"));
+        let dirs = vec![tmp.path().to_path_buf()];
+        let mac = find_in(&dirs, AgentOs::Macos, "x86_64").unwrap();
+        assert!(mac.path.ends_with("agent/macos-x86_64/vmlab-agent"));
+        assert_eq!(mac.version, "agent=m");
+        assert!(!AgentOs::Macos.is_legacy());
+        let err = find_in(&dirs, AgentOs::Linux, "x86_64").unwrap_err();
+        assert!(format!("{err}").contains("build-agent.sh linux-x86_64"));
+        let err = find_in(&[], AgentOs::Macos, "x86_64").unwrap_err();
+        assert!(
+            format!("{err}").contains("build-agent.sh macos-x86_64"),
+            "{err}"
+        );
     }
 
     /// The legacy flavours have fixed 32-bit keys whatever the guest arch.

@@ -486,8 +486,9 @@ playbook "playbooks/baseline" {
 
 `vmlab validate` rejects a `guest_dir` or `guest_bin` that is not absolute for
 the machine's guest family: a drive-letter path on Windows, a path starting with
-`/` on Linux, and either where the family is unknown. On Windows a `guest_bin`
-must also end in `.exe`.
+`/` on Linux and macOS, and either where the family is unknown. On Windows a
+`guest_bin` must also end in `.exe`. On macOS a playbook must name a `guest_bin`:
+config-weave ships no macOS binary for vmlab to push.
 
 ### What a run does
 

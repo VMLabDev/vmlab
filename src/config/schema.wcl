@@ -272,6 +272,12 @@ type Vm {
   cpu_model: utf8?
   @doc("Hyper-V enlightenments (`hv-*` CPU flags) for a Windows guest under KVM; inherited from template→profile (the shipped Windows profiles set it); not applied under TCG or with a `cpu_model`; `false` opts out")
   hyperv: bool?
+  @doc("Apple SMC device (`isa-applesmc` with its OSK key, plus an SMBIOS type 2 table) a macOS guest refuses to boot without; inherited from template→profile (the `macos` profile sets it); default false")
+  apple_smc: bool?
+  @doc("Keyboard and pointer: `ps2` (default; PS/2 keyboard, USB tablet) | `usb` (USB keyboard and tablet on an xHCI controller, for guests that read no PS/2 keyboard, such as macOS); inherited from template→profile")
+  @options(["ps2", "usb"]) input: utf8?
+  @doc("TSC: `host` gives the guest an invariant TSC pinned at the host's frequency (`+invtsc,tsc-frequency=`), read from KVM at the VM's first start and kept, which online snapshots allow where a bare `+invtsc` blocks them; KVM only; inherited from template→profile (the `macos` profile sets it); unset = QEMU's default")
+  @options(["host"]) tsc: utf8?
   @doc("Accelerator: `kvm` (required, no fallback) | `tcg` (always emulate, even where KVM works); unset = KVM when usable, else TCG; inherited from template→profile; `tcg` conflicts with `nested`")
   @options(["kvm", "tcg"]) accel: utf8?
   @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")
@@ -573,6 +579,12 @@ type TemplateDef {
   cpu_model: utf8?
   @doc("Hyper-V enlightenments for the build VM under KVM; inherited by clones; not applied under TCG or with a `cpu_model`")
   hyperv: bool?
+  @doc("Apple SMC device for the build VM; inherited by clones")
+  apple_smc: bool?
+  @doc("Keyboard and pointer for the build VM: `ps2` | `usb`; inherited by clones")
+  @options(["ps2", "usb"]) input: utf8?
+  @doc("TSC for the build VM: `host` (invariant, pinned at the host's frequency; KVM only); inherited by clones")
+  @options(["host"]) tsc: utf8?
   @doc("Accelerator for the build VM: `kvm` | `tcg`; inherited by clones; `tcg` conflicts with `nested`")
   @options(["kvm", "tcg"]) accel: utf8?
   @doc("Firmware: `ovmf` | `seabios`")
@@ -639,6 +651,12 @@ type TemplateVariant {
   cpu_model: utf8?
   @doc("Hyper-V enlightenments for this variant; default: the base's")
   hyperv: bool?
+  @doc("Apple SMC device for this variant; default: the base's")
+  apple_smc: bool?
+  @doc("Keyboard and pointer for this variant: `ps2` | `usb`; default: the base's")
+  @options(["ps2", "usb"]) input: utf8?
+  @doc("TSC for this variant: `host`; default: the base's")
+  @options(["host"]) tsc: utf8?
   @doc("Accelerator for this variant: `kvm` | `tcg`; default: the base's")
   @options(["kvm", "tcg"]) accel: utf8?
   @doc("Firmware for this variant: `ovmf` | `seabios`; default: the base's")
