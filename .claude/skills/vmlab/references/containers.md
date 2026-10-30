@@ -402,11 +402,13 @@ becomes ready.
 ```wcl
 port { host = 18081 container = 80 proto = "tcp" }
 port { container = 443 }   # automatic host port
+port { bind = "127.0.0.1" host = 18490 container = 80 }   # loopback only
 ```
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `host` | i64 | automatic | Host port to listen on, 1 to 65535. Unique across the lab. Omitted: vmlab picks a free port when it installs the forward. |
+| `host` | i64 | automatic | Host port to listen on, 1 to 65535. Unique across the lab on the addresses it binds. Omitted: vmlab picks a free port when it installs the forward. |
+| `bind` | utf8 | `0.0.0.0` | Host IPv4 address to listen on, one the host owns. Omitted: every interface. Same rules as a segment forward's (networking.md, "Bind address"). |
 | `container` | i64 | required | Container port to forward to, 1 to 65535. |
 | `proto` | utf8 | `tcp` | Protocol: `tcp`, `udp` or `both`. |
 

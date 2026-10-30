@@ -279,12 +279,14 @@ SRC
   code wcl { source = <<'SRC'
 forward { host_port = 13389 to = "dc01:3389" proto = "tcp" }
 forward { to = "dc01:80" }   # automatic host port
+forward { bind = "127.0.0.1" host_port = 8443 to = "web:443" }   # loopback only
 SRC
   }
   table {
     rows:
       | "Field" | "Type" | "Default" | "Meaning" |
-      | "`host_port`" | "i64" | "automatic" | "Host port to listen on, 1 to 65535. Unique across the lab. Omitted: vmlab picks a free port when it installs the forward." |
+      | "`host_port`" | "i64" | "automatic" | "Host port to listen on, 1 to 65535. Unique across the lab on the addresses it binds. Omitted: vmlab picks a free port when it installs the forward." |
+      | "`bind`" | "utf8" | "`0.0.0.0`" | "Host IPv4 address to listen on, one the host owns. Omitted: every interface." |
       | "`to`" | "utf8" | "required" | "Target as `vm:port`. The machine must be declared in this lab." |
       | "`proto`" | "utf8" | "`tcp`" | "Protocol: `tcp`, `udp` or `both`." |
   }
@@ -294,6 +296,25 @@ SRC
     to be unused by every other `forward` and every container `port {}` in
     the lab, since both compile into the same forward machinery. Omitted host
     ports are never duplicates.
+  DOC
+  h3 "Bind address"
+  p <<DOC
+    A forward listens on every host interface (`0.0.0.0`) unless it declares
+    `bind`. Set `bind = "127.0.0.1"` for a forward to a service that trusts
+    its caller, such as an admin console with no login, to keep it off the
+    LAN. Windows on WSL 2 still reaches a loopback forward through WSL's
+    localhost forwarding.
+  DOC
+  list {
+    li "`bind` must be an IPv4 address literal. Validation refuses a hostname, an IPv6 address or an address with a port: `forward {}: bind \"localhost\" is not an IPv4 address literal (e.g. \"127.0.0.1\")`."
+    li "The host must own the address. Validation cannot check that; installing the forward fails instead, and the `forward.skipped` event says `the host has no address <addr>`."
+    li "Two forwards on one host port conflict when they bind the same address or when either binds every interface. On two different explicit addresses, such as `127.0.0.1` and `192.168.1.5`, they do not."
+    li "Under [worktree isolation](guide_worktrees) every forward binds `127.0.0.1` whatever it declares, and `up` prints a warning for each `bind` that isolation overrides."
+  }
+  p <<DOC
+    [vmlab status](cmd_status) shows a forward on one address as
+    `127.0.0.1:8443` in the `HOST` column, and `vmlab status --json` carries
+    the address in the entry's `bind` field.
   DOC
   h3 "Automatic host ports"
   p <<DOC
