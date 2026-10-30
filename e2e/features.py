@@ -220,9 +220,11 @@ FEATURES: dict[str, str] = {
 # takes part in (the template store, validation, the supervisor); it runs on
 # both. Phase 2's sub-phases (2a platform and SeaBIOS, 2b frames, 2c OVMF, SMM,
 # TPM and Windows, 2d GPU, 2e virtio-fs and audio, 2f USB and vfio) land in
-# order, and the suite's one VM template boots OVMF, so no VM feature here is
-# applicable before 2c. A feature that touches a VM and a container is tagged
-# by the VM.
+# order. On vmlab-hv from 2a the suite builds its VM template from Alpine's
+# BIOS image on SeaBIOS (`scenarios/template.py`); a feature is tagged 2a or 2b
+# only where its scenario's labs declare nothing a later phase brings, so
+# `core` (OVMF, a TPM, floppies, `qemu_args`) and `sleep` (S3) wait for 2c. A
+# feature that touches a VM and a container is tagged by the VM.
 
 HOST = "host"
 
@@ -230,7 +232,7 @@ HOST = "host"
 PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
 
 # The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
-VMLAB_DELIVERED = "1"
+VMLAB_DELIVERED = "2b"
 
 _GROUPS: dict[str, list[str]] = {
     HOST: [
@@ -249,39 +251,41 @@ _GROUPS: dict[str, list[str]] = {
         "dev.sync.conflict", "dev.select", "dev.snapshot-bracket",
         "app.x11", "app.interrupt", "app.exit-code", "app.waypipe",
     ],
-    # Modern x86_64 VMs, on the e2e template's OVMF.
-    "2c": [
-        "template.build.qcow2", "template.build.layered", "template.registry.lab-ref",
-        "template.variant.build", "template.variant.select", "template.variant.rebuild",
-        "lab.up", "lab.up.partial", "lab.depends_on", "lab.depends_on_provision", "lab.provision.parallel",
-        "lab.status", "lab.down", "lab.up.reload", "lab.reload.stopped", "lab.reload.network",
-        "lab.up.template-changed", "lab.destroy", "lab.list", "lab.info", "lab.stop", "lab.down.release",
-        "lab.move", "lab.status.conflict", "lab.restart", "lab.destroy.named",
-        "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.sleep", "vm.prevent_sleep",
-        "vm.hw.cpus-memory", "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.tpm",
-        "vm.hw.firmware", "vm.hw.secure_boot", "vm.hw.nested", "vm.scratch", "vm.media.iso",
+    # Modern x86_64 VMs on SeaBIOS: the q35 platform (2a), then the native
+    # frame protocol behind vision, the console and the recorder (2b).
+    "2a": [
         "agent.exec", "agent.exec.timeout", "agent.shell", "agent.cp.push", "agent.cp.pull", "agent.tail",
         "agent.osinfo", "agent.stats", "agent.capabilities", "agent.clipboard", "agent.rehandshake",
-        "agent.update", "agent.repair", "agent.eventlog",
-        "login.default", "login.user", "login.password", "login.elevated",
+        "agent.update", "agent.repair", "login.default", "login.user", "login.password", "net.dhcp",
+        "net.static-ip", "net.dns.records", "net.dns.sinkhole", "net.dns.verb", "net.nat", "net.nat.bulk",
+        "net.isolated", "net.forward", "net.forward.bind", "net.forward.provisioned", "port.verb",
+        "net.routes", "net.l3.block", "net.l3.redirect", "net.mtu", "net.global", "snapshot.vm.online",
+        "snapshot.vm.offline", "snapshot.lab", "snapshot.list-delete", "snapshot.clock.set",
+    ],
+    "2b": [
         "vision.screenshot", "vision.ocr", "vision.find-image", "vision.sendkeys", "vision.mouse",
-        "console.tcp", "console.viewer",
-        "record.status", "record.up-from-boot", "record.probe", "record.timeline", "record.ocr",
-        "record.ripple", "record.compress-idle", "record.webm", "record.refusals", "record.restart",
-        "record.script", "record.wscript",
-        "net.dhcp", "net.static-ip", "net.dns.records", "net.dns.sinkhole", "net.dns.verb", "net.nat",
-        "net.nat.bulk", "net.isolated", "net.forward", "net.forward.bind", "net.forward.provisioned",
-        "port.verb", "net.routes", "net.l3.block", "net.l3.redirect", "net.mtu", "net.global", "net.peer",
-        "net.fastpath.kernel", "share.smb",
-        "snapshot.vm.online", "snapshot.vm.offline", "snapshot.lab", "snapshot.list-delete",
-        "snapshot.clock.set",
-        "worktree.isolation.status", "worktree.isolation.forward", "worktree.isolation.nat",
-        "worktree.isolation.global", "worktree.ports.shift", "worktree.ports.stable",
-        "worktree.clone", "worktree.clone.macs",
+        "console.tcp", "record.status", "record.up-from-boot", "record.probe", "record.timeline",
+        "record.ocr", "record.ripple", "record.compress-idle", "record.webm", "record.refusals",
+        "record.restart", "record.script", "record.wscript",
+    ],
+    # Modern x86_64 VMs that need OVMF, a TPM, Windows, S3, or a lab that
+    # declares one of them.
+    "2c": [
+        "template.build.qcow2", "template.build.layered", "template.registry.lab-ref",
+        "template.variant.build", "template.variant.select", "template.variant.rebuild", "lab.up",
+        "lab.up.partial", "lab.depends_on", "lab.depends_on_provision", "lab.provision.parallel",
+        "lab.status", "lab.down", "lab.up.reload", "lab.reload.stopped", "lab.reload.network",
+        "lab.up.template-changed", "lab.destroy", "lab.list", "lab.info", "lab.stop", "lab.down.release",
+        "lab.move", "lab.status.conflict", "lab.restart", "lab.destroy.named", "vm.start", "vm.stop",
+        "vm.restart", "vm.destroy", "vm.ip", "vm.sleep", "vm.prevent_sleep", "vm.hw.cpus-memory",
+        "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
+        "vm.hw.nested", "vm.scratch", "vm.media.iso", "agent.eventlog", "login.elevated", "console.viewer",
+        "net.peer", "net.fastpath.kernel", "share.smb", "worktree.isolation.status",
+        "worktree.isolation.forward", "worktree.isolation.nat", "worktree.isolation.global",
+        "worktree.ports.shift", "worktree.ports.stable", "worktree.clone", "worktree.clone.macs",
         "script.run", "script.provision", "script.as_login", "script.segment-api", "script.vision-api",
         "script.terminal", "script.snapshot-api", "events.handlers", "logs.streams", "logs.follow",
-        "playbook.up", "playbook.list", "playbook.check-apply", "playbook.timeout",
-        "app.rdp",
+        "playbook.up", "playbook.list", "playbook.check-apply", "playbook.timeout", "app.rdp",
     ],
     "2d": ["vm.hw.gpu"],
     "2e": ["share.virtiofs", "share.readonly", "share.unmountable"],

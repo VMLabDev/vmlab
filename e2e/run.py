@@ -74,10 +74,11 @@ def scenario_features(name: str) -> set[str]:
     return {fid for fid in FEATURES if f'"{fid}"' in text}
 
 
-def write_host_config(h: Harness) -> None:
-    """The host config the run's supervisor reads: only what selects the
-    hypervisor, and nothing at all on QEMU, which is the default."""
-    lines = h.host_config()
+def write_host_config(h: Harness, vms: bool = False) -> None:
+    """The host config the run's supervisor and lab daemons read: only what
+    selects the hypervisor, and nothing at all on QEMU, which is the default.
+    Rewritten per scenario, since whether VMs follow is the scenario's."""
+    lines = h.host_config(vms)
     if not lines:
         return
     path = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "vmlab" / "config.wcl"
@@ -126,6 +127,7 @@ def main() -> int:
                 continue
             mod = importlib.import_module(f"scenarios.{name}")
             h.scenario = name
+            write_host_config(h, vms=h.vms_follow(scenario_features(name)))
             started = time.monotonic()
             print(f"== {name}", flush=True)
             try:

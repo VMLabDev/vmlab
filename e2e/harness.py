@@ -21,7 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from features import FEATURES, PHASE_ORDER, VMLAB_DELIVERED, out_of_scope
+from features import FEATURES, PHASE_ORDER, PHASES, VMLAB_DELIVERED, out_of_scope
 
 E2E = pathlib.Path(__file__).resolve().parent
 WORK = pathlib.Path(os.environ.get("E2E_WORK", "/work"))
@@ -178,15 +178,29 @@ class Harness:
         """Why `feature` does not apply to this run's hypervisor, or None."""
         return out_of_scope(feature, self.hypervisor, self.delivered)
 
-    def host_config(self) -> str:
-        """The `host {}` lines that put this run's machines on its hypervisor.
-        VMs follow once the delivered phase reaches the first one the suite's
-        OVMF template boots on; until then a lab mixing kinds still validates,
-        its VMs on QEMU, and their features are skipped by phase."""
+    def seabios_template(self) -> bool:
+        """Whether the suite's VM template is built for SeaBIOS: on vmlab-hv
+        from phase 2a, which boots SeaBIOS and not yet OVMF. QEMU boots
+        either, so the scenarios whose VMs stay there do not mind."""
+        return self.hypervisor != "qemu" and PHASE_ORDER.index(self.delivered) >= PHASE_ORDER.index("2a")
+
+    def vms_follow(self, features) -> bool:
+        """Whether a scenario's VMs run on vmlab-hv: it covers a VM feature of
+        a delivered phase (2a onwards). A scenario whose VM features are all
+        later keeps its VMs on QEMU, where a lab declaring OVMF or a TPM still
+        validates, and its features are skipped by phase."""
+        if self.hypervisor == "qemu":
+            return False
+        lo, hi = PHASE_ORDER.index("2a"), PHASE_ORDER.index(self.delivered)
+        return any(f in PHASES and lo <= PHASE_ORDER.index(PHASES[f]) <= hi for f in features)
+
+    def host_config(self, vms: bool = False) -> str:
+        """The `host {}` lines that put this run's machines on its hypervisor:
+        containers always, VMs where `vms` says (`vms_follow`)."""
         if self.hypervisor == "qemu":
             return ""
         kinds = ["container"]
-        if PHASE_ORDER.index(self.delivered) >= PHASE_ORDER.index("2c"):
+        if vms:
             kinds.append("vm")
         pins = " ".join(f'{k} = "{self.hypervisor}"' for k in kinds)
         return f"  hypervisor {{ {pins} }}\n"
