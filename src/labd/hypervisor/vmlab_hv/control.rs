@@ -224,6 +224,12 @@ impl Control for HvControl {
         Some(self.asleep.subscribe())
     }
 
+    /// vmlab-hv has no command of its own for it: `resume` on a machine in
+    /// S3 wakes the guest, and it reports `wakeup`.
+    async fn wakeup(&self) -> Result<()> {
+        self.call(Command::Resume).await.map(drop)
+    }
+
     fn snapshots(&self) -> Option<Arc<dyn Snapshots>> {
         self.capabilities
             .contains(&Capability::Snapshots)
@@ -588,5 +594,17 @@ mod tests {
         let mut control = HvControl::connect(&without.socket).await.unwrap();
         control.set_display(display.path.clone());
         assert!(control.frames().is_none() && control.input().is_none());
+    }
+
+    /// A wake is vmlab-hv's `resume`, which takes a guest out of S3.
+    #[tokio::test]
+    async fn wakeup_is_a_resume() {
+        let hv = fake_hv(vec![], ok);
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        control.wakeup().await.unwrap();
+        assert_eq!(
+            hv.seen.try_iter().collect::<Vec<_>>(),
+            vec![Command::Resume]
+        );
     }
 }
