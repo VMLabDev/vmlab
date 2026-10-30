@@ -191,7 +191,7 @@ it pushes the shipped agent the way `vmlab machine repair-agent` does, marks the
 prints `agent: updated "<vm>" (<old> → <new>)`. It runs after the first-boot script
 (the template's, written for the agent it sealed) and before every provision.
 `up` never starts waiting on a VM just to refresh it: a VM with no first-boot, no
-provision or playbook and no dependent (and every `vmlab vm start`) is refreshed in
+provision or playbook and no dependent (and every `vmlab vm start` owing no first boot) is refreshed in
 the background when its agent first answers, its line going to the lab daemon's log;
 the event and `diverged=yes` still report it. Either way the VM is **not ready
 until the refresh has finished** (succeeded or failed): `status` shows it `booting`, and

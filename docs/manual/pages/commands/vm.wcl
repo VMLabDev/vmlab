@@ -78,12 +78,22 @@ page cmd_vm {
     no provision scripts, no playbooks. Any deferred download the VM needs
     runs first with progress on the terminal, then the host binaries are
     checked, then the VM boots. A VM whose clone does not exist yet gets one
-    created from its template, and its first-boot script runs before it
-    reports ready, exactly as under [vmlab up](cmd_up). A VM that is already
+    created from its template. A VM that is already
     running is left alone. A `suspended` VM, one whose guest put itself to
     sleep, is woken with QMP `system_wakeup` instead: no second QEMU, no
     agent refresh, and the verb returns once the guest runs again, emitting
-    `vm.woken` with `cause = start`. Nothing is printed on success.
+    `vm.woken` with `cause = start`. Otherwise the verb returns once the VM
+    has booted, without waiting for its agent, and prints nothing on success.
+  DOC
+
+  p <<DOC
+    A clone that has not finished its template's first-boot script runs it
+    here, exactly as under [vmlab up](cmd_up): the script, then any agent
+    refresh, then readiness. That is a new clone, or one whose
+    `.vmlab/vms/<vm>/firstboot.done` is missing because an earlier first boot
+    failed or the file was deleted. The verb prints the script's output and
+    returns once the VM is ready, or fails with the script's error and leaves
+    the VM running for inspection. `vm restart` does the same.
   DOC
 
   p <<DOC
@@ -161,7 +171,8 @@ page cmd_vm {
   p <<DOC
     Stops the VM through the graceful ladder, waits up to 60 seconds for it
     to settle as stopped, and boots it again. The clone is kept, so the guest
-    comes back with its disk state and no first-boot script. Port forwards
+    comes back with its disk state, and runs its first-boot script only if
+    the clone has not finished one (see `vm start`). Port forwards
     that target the VM are re-installed by the daemon when it gets a new
     lease. A VM that does not settle in time fails with `<name> did not stop
     for restart`.

@@ -89,8 +89,10 @@ A `suspended` VM, one whose guest put itself to sleep, is woken with QMP
 returns `Ok` without doing anything. A pending
 template or image download is completed first. The call returns once the
 emulator is running; it does not wait for readiness, so follow it with
-`Machine.wait_ready`. The error carries the reason the download or the boot
-failed.
+`Machine.wait_ready`. The exception is a clone still owing its template's
+first-boot script: the call runs it, as `vmlab up` would, and returns once the
+machine is ready. The error carries the reason the download, the boot or the
+first boot failed.
 
 ```wscript
 fn main(lab: Lab) {
@@ -152,7 +154,8 @@ fn restart(self) -> Result[unit, string]
 ```
 
 Runs `Machine.stop`, waits up to sixty seconds for the power state to reach
-stopped, then runs `Machine.start`. It fails with "<name> did not stop for
+stopped, then runs `Machine.start`, first boot included. A first-boot script
+restarting its own machine does not run itself again. It fails with "<name> did not stop for
 restart" when the machine does not settle in time, and otherwise with the stop
 or start error. This restarts the emulator; a reboot the guest performs itself
 is watched with `Machine.wait_rebooted` instead.
