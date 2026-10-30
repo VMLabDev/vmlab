@@ -79,6 +79,27 @@ SRC
     has lost its disk.
   DOC
 
+  h3 "Pending machines"
+
+  p <<DOC
+    A machine still on an older declaration than the lab file's, because a
+    reload could not rebuild it (see
+    [Editing the lab file between runs](cmd_up)), is named under the machine
+    table, one line each, with the reason and what picks the change up:
+  DOC
+
+  code text { source = "  dc01: pending — still running the declaration it was started with; restart it (`vmlab vm restart dc01`, or a stop and a start) to pick up the change" }
+
+  p <<DOC
+    The reasons are: `running` (changed while it ran), `stopped` (changed
+    while it ran, stopped since; its next boot rebuilds it), `downloading`
+    (a download for it was in flight) and `removed` (gone from the file
+    while it ran; dropped once it stops). With `--json` they are the
+    `pending` list, `machine` and `reason` pairs, and `config_digest` is the
+    digest of the file the daemon last loaded or reloaded. Every machine not
+    in `pending` runs that file.
+  DOC
+
   h3 "Machines"
 
   p <<DOC

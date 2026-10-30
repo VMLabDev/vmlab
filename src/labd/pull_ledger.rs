@@ -155,6 +155,28 @@ impl<H> PullLedger<H> {
         self.pending.contains_key(machine)
     }
 
+    /// Is a download for this machine running right now?
+    pub fn is_active(&self, machine: &str) -> bool {
+        self.active
+            .iter()
+            .any(|a| a.machines.iter().any(|m| m == machine))
+    }
+
+    /// Replace what `machine` waits on with what its rebuild found it
+    /// waiting on — `None` once its artefact is cached, or once it has left
+    /// the lab (PRD §7.1). Never called for a machine whose download is
+    /// running: a reload leaves such a machine pending instead.
+    pub fn set_pending(&mut self, machine: &str, job: Option<PullJob>) {
+        match job {
+            Some(job) => {
+                self.pending.insert(machine.to_string(), job);
+            }
+            None => {
+                self.pending.remove(machine);
+            }
+        }
+    }
+
     /// The downloads `targets` needs, one entry per distinct artefact.
     /// An empty `targets` means the whole lab.
     ///
@@ -352,6 +374,24 @@ mod tests {
 
     fn names(events: &[PullEvent]) -> Vec<&str> {
         events.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// A rebuilt machine's job replaces what it waited on, or clears it; a
+    /// running download is what a reload asks about before rebuilding.
+    #[test]
+    fn a_rebuild_replaces_or_clears_a_machines_job() {
+        let mut led = ledger(&[("web", template("reg/t:1")), ("db", image("db:1"))]);
+        led.set_pending("web", Some(template("reg/t:2")));
+        assert_eq!(led.batches(&["web".into()])[0].job, template("reg/t:2"));
+        led.set_pending("db", None);
+        assert!(!led.is_pending("db"));
+
+        assert!(!led.is_active("web"));
+        let batch = led.batches(&[]).remove(0);
+        led.begin(&batch, 1);
+        assert!(led.is_active("web"));
+        led.finish(&batch, PullOutcome::Done);
+        assert!(!led.is_active("web"));
     }
 
     /// The whole lifecycle as a value: pending → active → progress → done,

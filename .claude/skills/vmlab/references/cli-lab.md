@@ -97,21 +97,54 @@ so a second `up` after a `down` boots the same disks and skips the first-boot
 script.
 
 `up` always runs the lab file as it is on disk now. The lab daemon reads
-`vmlab.wcl` once. A full `down` reaps it, but it outlives a partial `down`, a
-`vm stop` of every machine and a failed `up`, so before starting anything `up`
-compares a digest of what the file declares (comments do not count) with the one
-the daemon loaded. Changed, with no machine running and no download in flight:
-`up` replaces the daemon and prints `lab "<name>": vmlab.wcl changed — restarting
-the lab daemon to load it`. Clones, snapshots, `.vmlab/state.json` and workspace
-ledgers persist. Changed while a machine runs (or starts, stops, is suspended): `up`
-refuses, names those machines, and changes nothing:
+`vmlab.wcl` when it starts and when a verb asks it to reload. A full `down` reaps
+it, but it outlives a partial `down`, a `vm stop` of every machine and a failed
+`up`, so before starting anything `up` compares a digest of what the file declares
+(comments do not count) with the one the daemon loaded. Changed, with no machine
+running and no download in flight: `up` replaces the daemon and prints
+`lab "<name>": vmlab.wcl changed — restarting the lab daemon to load it`. Clones,
+snapshots, `.vmlab/state.json` and workspace ledgers persist.
+
+Changed while a machine runs (or starts, stops, is suspended) or a download is in
+flight: `up` asks the daemon to **reload** the file (`lab.reload`, PRD §7.1) and
+prints one line per machine it touched, then carries on:
+
+| Change | Reload |
+| --- | --- |
+| stopped machine's block changed | rebuilt from the new block (disks, MACs, state kept) |
+| running machine's block changed | **pending**: keeps its old declaration until its next boot; `vm restart <m>` rebuilds it between stop and start |
+| machine added | built, joins the lab |
+| machine removed | dropped if stopped, pending until it stops if running; disks stay until `destroy` |
+| segment `forward {}` / container `port {}` | reinstalled live for running machines (a ports-only change leaves a container running, not pending) |
+| `on {}` handlers | swapped live |
+| download in flight for a changed machine | pending; rebuilt at its next boot |
 
 ```
-lab "ad-lab": vmlab.wcl has changed since the lab daemon loaded it, and dc01 is still running — the daemon cannot load the new file without stopping it. Run `vmlab down`, then this command again, to apply the edit (or undo the edit)
+lab "ad-lab": vmlab.wcl changed — reloading it into the running lab
+srv01: rebuilt from the new declaration
+dc01: pending — still running the declaration it was started with; restart it (`vmlab vm restart dc01`, or a stop and a start) to pick up the change
 ```
 
-A download still in flight refuses the same way and names the artefact; wait for it
-to finish, or interrupt the `vmlab pull` that started it.
+A pending machine stopped by any route (guest shutdown, crash) is rebuilt by its
+next boot. `vmlab status` lists pending machines under the table (`--json`:
+`pending`, `{machine, reason}` with reason `running|stopped|downloading|removed`).
+A full `down` still stops a removed-but-running machine.
+
+**Network changes refuse the whole reload** and apply nothing: a segment added,
+removed or changed (subnet, nat, dhcp, dns, mtu, route, routes_to, global,
+connect, record, block, redirect, sinkhole), the lab's DNS records or sinkholes,
+a NIC's segment, static IP, MAC or `gateway` flag (even on a stopped machine), and
+an added machine whose NIC has a static IP, is a gateway, joins a global segment
+or names a segment the daemon never assembled (e.g. the first `nat = true`):
+
+```
+vmlab.wcl changes the lab's network, which cannot change while the lab runs: segment "lan" changed (mtu). Nothing was reloaded. Run `vmlab down`, then this command again, to apply the edit (or undo it)
+```
+
+SMB shares: the lab's smbd serves a fixed export set. If a reload changes it while
+a machine runs, smbd keeps the old set and the reload says so; with nothing running
+it is stopped and restarts on the new set at the next boot. virtiofs shares follow
+their machine.
 `pull`, `vm start`/`restart` and `container start`/`restart` follow the same
 rule. A VM whose clone was made from a different `template` than the file now
 names (recorded in `.vmlab/vms/<vm>/clone-source`, compared as written, so an
@@ -131,7 +164,8 @@ isolation and, in a worktree lab, which machines clone from the main checkout's
 freeze (worktrees.md). When the main checkout has been frozen, frozen again or
 thawed since, or a machine has lost its disk, `up`, `pull`, `vm start` and
 `vm restart` replace the daemon the same way, in the main lab and in a worktree
-lab, with the same refusals while a machine is running, and print `lab "<name>":
+lab. This is **not** reloadable (it decides the network): while a machine runs or
+a download is in flight the verb refuses, naming them and `vmlab down`. It prints `lab "<name>":
 the main checkout's freeze or a machine's disk changed — restarting the lab daemon
 to plan its clones again`.
 

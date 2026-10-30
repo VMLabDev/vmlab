@@ -32,7 +32,8 @@ page cmd_worktree {
     starts, and `freeze` and `thaw` run in a daemon that started before
     them. The next `up`, `pull`, `vm start` or `vm restart` in the main
     checkout replaces that daemon first, as it does after an edit to
-    `vmlab.wcl` (see [vmlab up](cmd_up)).
+    `vmlab.wcl` (see [vmlab up](cmd_up)). Unlike an edit, this cannot be
+    reloaded: it refuses while a machine runs.
   DOC
 
   h2 "vmlab worktree freeze"

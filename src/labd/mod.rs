@@ -22,6 +22,7 @@ mod legacy_agent_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 pub mod machine;
+mod machine_build;
 pub mod mount_report;
 pub mod netservices;
 pub mod network;
@@ -31,6 +32,7 @@ pub mod playbook;
 pub mod provisioning;
 pub mod pull_ledger;
 pub mod record;
+pub mod reload_plan;
 pub mod share_plan;
 pub mod state;
 pub mod usb;
@@ -66,7 +68,7 @@ fn matching_handler_runs(
         .or_else(|| event.data["container"].as_str())
         .unwrap_or_default();
     runtime
-        .config
+        .config()
         .lab
         .handlers
         .iter()
@@ -134,7 +136,7 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
         .network
         .lock()
         .await
-        .attach_globals(&runtime.config.lab.name)
+        .attach_globals(&runtime.config().lab.name)
         .await
     {
         tracing::warn!("attaching global segments: {e:#}");
@@ -179,39 +181,37 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     tasks.adopt("disk-watchdog", watchdog);
 
     // Event → wscript handler bindings (PRD §8.2). Failures are logged, never
-    // fatal.
+    // fatal. Running even for a lab that declares none, since a reload can
+    // add them (§7.1): each event is matched against the handlers declared
+    // now.
     {
-        if !runtime.config.lab.handlers.is_empty() {
-            let mut rx = events_tx.subscribe();
-            let runtime = runtime.clone();
-            let group = tasks.clone();
-            let cancel = tasks.cancel_token();
-            tasks.spawn("handler-dispatch", async move {
-                loop {
-                    let ev = tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        ev = rx.recv() => match ev {
-                            Ok(ev) => ev,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
-                    };
-                    for (script, event) in matching_handler_runs(&runtime, &ev) {
-                        let runtime = runtime.clone();
-                        let output: crate::scripting::OutputSink = Arc::new(
-                            |line| tracing::info!(target: "handler", "{}", line.trim_end()),
-                        );
-                        // Registered so shutdown waits (bounded) for
-                        // in-flight handler scripts instead of killing them
-                        // mid-run at process exit.
-                        group.spawn("handler-run", async move {
-                            crate::scripting::run_event_handler(runtime, &script, event, output)
-                                .await;
-                        });
-                    }
+        let mut rx = events_tx.subscribe();
+        let runtime = runtime.clone();
+        let group = tasks.clone();
+        let cancel = tasks.cancel_token();
+        tasks.spawn("handler-dispatch", async move {
+            loop {
+                let ev = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    ev = rx.recv() => match ev {
+                        Ok(ev) => ev,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                };
+                for (script, event) in matching_handler_runs(&runtime, &ev) {
+                    let runtime = runtime.clone();
+                    let output: crate::scripting::OutputSink =
+                        Arc::new(|line| tracing::info!(target: "handler", "{}", line.trim_end()));
+                    // Registered so shutdown waits (bounded) for
+                    // in-flight handler scripts instead of killing them
+                    // mid-run at process exit.
+                    group.spawn("handler-run", async move {
+                        crate::scripting::run_event_handler(runtime, &script, event, output).await;
+                    });
                 }
-            });
-        }
+            }
+        });
     }
 
     tracing::info!("lab daemon for {lab} listening on {}", sock.display());
@@ -238,7 +238,7 @@ async fn teardown(lab: &Arc<LabRuntime>, tasks: &crate::lifecycle::TaskGroup) {
     lab.network
         .lock()
         .await
-        .detach_globals(&lab.config.lab.name)
+        .detach_globals(&lab.config().lab.name)
         .await;
     tasks.shutdown(std::time::Duration::from_secs(5)).await;
 }
@@ -333,7 +333,7 @@ async fn start_machine_request(lab: &Arc<LabRuntime>, machine: &str) -> Result<(
         return Ok(());
     }
     if m.pending_first_boot().is_none() {
-        lab.start_with_deferred_refresh(&m).await?;
+        lab.start_with_deferred_refresh(machine).await?;
     } else {
         lab.start_machine(machine).await?;
     }
@@ -450,7 +450,7 @@ async fn run_playbook(
     mode: playbook::PlaybookMode,
 ) -> Result<Value, CommandError> {
     let pb = playbook::resolve_playbook(
-        &lab.config.lab,
+        &lab.config().lab,
         &machine,
         playbook.as_deref(),
         play.as_deref(),
@@ -506,6 +506,8 @@ impl Handler<LabRequest> for LabdHandler {
                 .await?;
                 Ok(json!(true))
             }
+            // An edited lab file, applied machine by machine (§7.1).
+            LabRequest::Reload {} => Ok(json!(lab.reload().await?)),
             // Abort one machine's running download (Templates page); whatever
             // is waiting on it fails with "download cancelled".
             LabRequest::PullCancel { machine } => Ok(json!(lab.cancel_pull(&machine))),
@@ -561,6 +563,9 @@ impl Handler<LabRequest> for LabdHandler {
             // capabilities (no display, no console log) rather than through
             // its kind — see `labd::machine`.
             LabRequest::MachineStart { machine, record } => {
+                // A machine a reload left pending boots on the file as it is
+                // now (§7.1), so everything below asks the rebuilt one.
+                lab.settle_pending(&machine).await?;
                 // Pull with CLI-visible progress before the preflight (the
                 // pulled meta can change the resolved firmware/TPM needs);
                 // the internal pull in start is then a no-op.
@@ -1058,7 +1063,7 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::PlaybookList {} => {
                 // One row per (machine, playbook block) — the blocks live
                 // inside the machine they configure.
-                let cfg = &lab.config.lab;
+                let cfg = &lab.config().lab;
                 let machines: Vec<_> = cfg
                     .vms
                     .iter()
@@ -1146,12 +1151,8 @@ impl Handler<LabRequest> for LabdHandler {
                 match machine {
                     Some(machine) => warnings = lab.restore(&machine, &name, discard).await?,
                     None => {
-                        let names: Vec<String> = lab
-                            .vms
-                            .keys()
-                            .chain(lab.containers.keys())
-                            .cloned()
-                            .collect();
+                        let names: Vec<String> =
+                            lab.machines().map(|m| m.name().to_string()).collect();
                         for vm in names {
                             warnings.extend(lab.restore(&vm, &name, discard).await?);
                         }

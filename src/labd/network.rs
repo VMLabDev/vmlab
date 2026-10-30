@@ -149,9 +149,22 @@ pub struct LabNetwork {
     /// Worktree isolation (§21.4): every segment's NAT engine refuses host
     /// addresses. Set by [`Self::isolate`] before the gateways are wired.
     pub isolated: bool,
+    /// Which machine each NIC's hardware address belongs to, for the lease →
+    /// DNS registration every gateway keeps current (§9.5). Shared with those
+    /// tasks, so a machine a reload adds (PRD §7.1) is named by its lease too.
+    lease_names: Arc<std::sync::RwLock<HashMap<MacAddr, String>>>,
 }
 
 impl LabNetwork {
+    /// Each assembled segment's effective MTU, by name — what a machine's
+    /// NICs on it inherit.
+    pub fn mtus(&self) -> HashMap<String, u16> {
+        self.segments
+            .iter()
+            .map(|(name, seg)| (name.clone(), seg.effective_mtu()))
+            .collect()
+    }
+
     /// Build switches and allocate subnets for every declared segment, plus
     /// the built-in NAT segment when any NIC uses `nat = true`.
     pub fn build(lab: &Lab) -> Result<LabNetwork> {
@@ -241,7 +254,19 @@ impl LabNetwork {
             segments,
             router: Router::new(),
             isolated: false,
+            lease_names: Arc::default(),
         })
+    }
+
+    /// Name `machine`'s NICs by `macs` in every segment's lease → DNS
+    /// registration — a machine joining the lab after the gateways were
+    /// wired (PRD §7.1).
+    pub fn name_leases(&self, machine: &str, macs: &[MacAddr]) {
+        if let Ok(mut names) = self.lease_names.write() {
+            for mac in macs {
+                names.insert(*mac, machine.to_string());
+            }
+        }
     }
 
     /// Put the network under worktree isolation (§21.4): NAT engines wired
@@ -357,6 +382,13 @@ impl LabNetwork {
     ) {
         let upstream = host.upstream_resolver();
         let router = self.router.clone();
+        if let Ok(mut names) = self.lease_names.write() {
+            for (vm, macs) in macs_by_vm {
+                for mac in macs {
+                    names.insert(*mac, vm.clone());
+                }
+            }
+        }
 
         for seg in self.segments.values_mut() {
             if seg.global {
@@ -465,7 +497,7 @@ impl LabNetwork {
 
             // Lease → DNS registration sync (§9.5 auto-registration).
             if dns_enabled {
-                spawn_lease_dns_sync(&handle, &lab.name, macs_by_vm);
+                spawn_lease_dns_sync(&handle, &lab.name, self.lease_names.clone());
             }
 
             // NAT + L3 rule services on the same switch (§9.6–§9.9). Declared
@@ -574,16 +606,12 @@ fn global_members(
 fn spawn_lease_dns_sync(
     gateway: &crate::net::gateway::GatewayHandle,
     lab_name: &str,
-    macs_by_vm: &HashMap<String, Vec<MacAddr>>,
+    mac_to_vm: Arc<std::sync::RwLock<HashMap<MacAddr, String>>>,
 ) {
     let Some(zone) = gateway.dns_zone() else {
         return;
     };
     let leases_handle = gateway.leases_probe();
-    let mac_to_vm: HashMap<MacAddr, String> = macs_by_vm
-        .iter()
-        .flat_map(|(vm, macs)| macs.iter().map(move |m| (*m, vm.clone())))
-        .collect();
     let lab = lab_name.to_string();
     tokio::spawn(async move {
         let mut known: HashMap<MacAddr, Ipv4Addr> = HashMap::new();
@@ -594,11 +622,12 @@ fn spawn_lease_dns_sync(
                 if known.get(&mac) == Some(&ip) {
                     continue;
                 }
-                if let Some(vm) = mac_to_vm.get(&mac)
+                let vm = mac_to_vm.read().ok().and_then(|n| n.get(&mac).cloned());
+                if let Some(vm) = vm
                     && let Ok(mut z) = zone.lock()
                 {
                     z.register(&format!("{vm}.{lab}"), ip);
-                    z.register(vm, ip);
+                    z.register(&vm, ip);
                     known.insert(mac, ip);
                 }
             }

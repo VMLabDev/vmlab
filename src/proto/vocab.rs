@@ -476,6 +476,17 @@ vocabulary! {
         Pull = "pull" {
             #[serde(default, alias = "vms")] machines: Vec<String>,
         },
+        /// Read the lab file afresh and apply it machine by machine (PRD
+        /// §7.1): rebuild what is stopped, leave what runs pending, add and
+        /// drop, reinstall forwards and swap handlers. A network change
+        /// refuses the whole reload. Answers with what each machine did.
+        #[one_way(
+            "cli",
+            "A boot verb asks for a reload when it finds the daemon running an \
+             edited-away file it cannot replace; a script runs inside the \
+             daemon whose file it would be reloading."
+        )]
+        Reload = "lab.reload" {},
         /// Abort one machine's running download; whatever waits on it fails
         /// with "download cancelled".
         PullCancel = "pull.cancel" {

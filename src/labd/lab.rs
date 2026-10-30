@@ -10,11 +10,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use super::container::{ContainerDirs, ContainerInstance, resolve_volume_hosts};
+use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, InstalledForward};
 use super::freeze_clone;
 use super::machine::Machine;
+use super::machine_build::{self, BuildContext, Built, MachineSet};
 use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
 use super::network::nic_segment_name;
@@ -23,28 +24,40 @@ use super::pull_ledger::{
     Cancellation, PullBatch, PullEvent, PullJob, PullLedger, PullOutcome, PullProgress,
 };
 use super::share_plan;
-use super::state::{LabState, SnapshotRecord, generate_mac};
+use super::state::{LabState, SnapshotRecord};
 use super::vm::{PowerState, VmDirs, VmInstance};
 use crate::config::LabFile;
-use crate::config::model::TemplateRef;
 use crate::profiles::ProfileSet;
 use crate::status::{LabStatus, SegmentFrames, SegmentStatus};
 use crate::sync::LockRecover;
 use crate::template::TemplateStore;
 use crate::template::store::Purpose;
 
+mod reload;
+
 pub struct LabRuntime {
     pub name: String,
     pub root: PathBuf,
     pub lab_local: PathBuf,
-    pub config: LabFile,
-    pub vms: BTreeMap<String, Arc<VmInstance>>,
-    pub containers: BTreeMap<String, Arc<ContainerInstance>>,
-    /// Every machine in the lab under one name namespace, in the order
-    /// `machines()` reports them. The same `Arc`s as `vms`/`containers`; those
-    /// two stay for the handful of places that legitimately want a concrete
-    /// type (binding a deferred pull's template or image).
-    machines: BTreeMap<String, Arc<dyn Machine>>,
+    /// The lab file as this daemon last loaded it: at start, then at each
+    /// reload (PRD §7.1). Read through [`Self::config`], a snapshot a caller
+    /// keeps for as long as it needs one consistent declaration.
+    config: std::sync::RwLock<Arc<LabFile>>,
+    /// Every machine in the lab, and the declaration each was built from. A
+    /// reload rebuilds, adds and drops entries; std lock — read for a
+    /// lookup, never held across an await.
+    machines: std::sync::RwLock<MachineSet>,
+    /// What a reload builds a machine as, in a runtime whose machines are
+    /// test doubles.
+    #[cfg(test)]
+    doubles: std::sync::Mutex<Option<reload::MachineDoubles>>,
+    /// Held for writing while a reload rebuilds machines, and for reading by
+    /// every start across looking its machine up and starting it (PRD §7.1):
+    /// a start never boots an instance a reload has just replaced.
+    rebuild_gate: tokio::sync::RwLock<()>,
+    /// What the running SMB server exports, as [`reload::smb_exports`]
+    /// renders it, so a reload can tell whether the file changed them.
+    smb_served: std::sync::Mutex<String>,
     pub network: Mutex<LabNetwork>,
     pub state: Mutex<LabState>,
     pub events: Arc<EventLog>,
@@ -381,26 +394,6 @@ impl std::fmt::Display for PullCancelled {
 
 impl std::error::Error for PullCancelled {}
 
-/// A VM's declaration as its machine runs it: the lab file's folder paths
-/// resolved against the lab root. The daemon's working directory is not the
-/// lab's, so a relative `disk { from }` left alone names a folder nobody
-/// meant — validation and template builds already read it from the root.
-fn rooted_vm_config(
-    vm_cfg: &crate::config::model::Vm,
-    root: &std::path::Path,
-) -> crate::config::model::Vm {
-    let mut cfg = vm_cfg.clone();
-    if let Some(vars) = &cfg.secure_boot_vars {
-        cfg.secure_boot_vars = Some(root.join(vars));
-    }
-    for d in &mut cfg.extra_disks {
-        if let Some(from) = &d.from {
-            d.from = Some(root.join(from));
-        }
-    }
-    cfg
-}
-
 /// Every machine of the lab file as the freeze planner compares it against
 /// the main checkout's freeze (§21.2): what its disk is made from, where it
 /// keeps its disks, and which disks and named volumes it uses.
@@ -475,274 +468,33 @@ impl LabRuntime {
         let mut pending: BTreeMap<String, PullJob> = BTreeMap::new();
         let home = std::env::var_os("HOME").map(PathBuf::from);
 
-        let mut vms = BTreeMap::new();
-        for vm_cfg in &config.lab.vms {
-            // Backing disk + effective metadata: the variant the reference
-            // resolves to, or the base (§6.6).
-            let (backing, meta, variant, disk_size, template_vars) = match &vm_cfg.template {
-                TemplateRef::Scratch => (None, None, None, vm_cfg.disk, None),
-                TemplateRef::Store {
-                    arch,
-                    name: tname,
-                    version,
-                    variant,
-                } => {
-                    let resolved = store
-                        .resolve(
-                            arch,
-                            tname,
-                            version.as_deref(),
-                            variant.as_ref(),
-                            Purpose::Lab,
-                        )
-                        .with_context(|| format!("vm \"{}\"", vm_cfg.name))?;
-                    let template_vars =
-                        crate::template::store::template_vars(&resolved.dir, &resolved.meta);
-                    (
-                        Some(resolved.disk_path),
-                        Some(resolved.meta),
-                        resolved.variant,
-                        None,
-                        template_vars,
-                    )
-                }
-                TemplateRef::Registry { reference, variant } => {
-                    // A registry reference is pulled on first `up` if absent
-                    // from the store, never re-pulled implicitly (PRD §6.4).
-                    // Build NEVER downloads: an uncached template becomes a
-                    // pending pull (placeholder hardware resolution below) so
-                    // the daemon starts instantly; `ensure_pulled` binds the
-                    // real parts at up/start/`pull` time, with progress.
-                    let arch = vm_cfg.arch.clone().ok_or_else(|| {
-                        anyhow!(
-                            "vm \"{}\": registry template needs an explicit arch",
-                            vm_cfg.name
-                        )
-                    })?;
-                    // A version in the store without the variant this
-                    // machine names is still a pull: of that variant.
-                    let cached = crate::oci::cached_registry_template(reference, &arch, &store)?
-                        .filter(|v| {
-                            crate::oci::client::VariantWant::of(variant.as_ref()).held_by(&v.meta)
-                        });
-                    match cached {
-                        Some(version) => {
-                            let resolved = version
-                                .select(variant.as_ref(), Purpose::Lab)
-                                .with_context(|| format!("vm \"{}\"", vm_cfg.name))?;
-                            let template_vars = crate::template::store::template_vars(
-                                &resolved.dir,
-                                &resolved.meta,
-                            );
-                            (
-                                Some(resolved.disk_path),
-                                Some(resolved.meta),
-                                resolved.variant,
-                                None,
-                                template_vars,
-                            )
-                        }
-                        None => {
-                            pending.insert(
-                                vm_cfg.name.clone(),
-                                PullJob::Template {
-                                    reference: reference.clone(),
-                                    arch,
-                                },
-                            );
-                            (None, None, None, None, None)
-                        }
-                    }
-                }
+        let config = Arc::new(config);
+        let mtus = network.mtus();
+        let mut set = MachineSet::default();
+        {
+            let cx = BuildContext {
+                lab: &name,
+                root: &root,
+                lab_local: &lab_local,
+                profiles,
+                store: &store,
+                home: home.as_deref(),
+                mtus: &mtus,
+                freeze: freeze.as_ref(),
             };
-
-            let resolved = crate::qemu::resolve_vm(vm_cfg, meta.as_ref(), profiles)?;
-
-            // Stable MACs: explicit > persisted > generated (PRD §9.4). A
-            // machine about to be cloned from the freeze has no disk, so
-            // nothing persisted here has reached a guest: the frozen
-            // machine's MACs take that place, and are persisted with the
-            // rest of its record when the clone is made (§21.2).
-            let frozen = freeze.as_ref().and_then(|f| f.record(&vm_cfg.name));
-            let mut macs = Vec::new();
-            for (i, nic) in vm_cfg.nics.iter().enumerate() {
-                let mac = nic
-                    .mac
-                    .or_else(|| match frozen {
-                        Some(record) => record.macs.get(i).copied(),
-                        None => state.machine_mut(&vm_cfg.name).macs.get(i).copied(),
-                    })
-                    .unwrap_or_else(|| generate_mac(&name, &vm_cfg.name, i));
-                macs.push(mac);
-            }
-            if frozen.is_none() {
-                state.machine_mut(&vm_cfg.name).macs = macs.clone();
-            }
-
-            let dirs = VmDirs::new(&name, &vm_cfg.name, &lab_local);
-            let mut cdroms = Vec::new();
-            if let Some(c) = &vm_cfg.cdrom {
-                cdroms.push(root.join(c));
-            }
-            let mut floppy = vm_cfg.floppy.as_ref().map(|f| root.join(f));
-
-            // media {} blocks: ISO/floppy images built from folders,
-            // content-addressed in .vmlab/media (PRD §6.3).
-            let media_dir = lab_local.join("media");
-            for m in &vm_cfg.media {
-                let src = root.join(&m.from);
-                // xorriso/mtools under a blocking task: building an ISO from a
-                // folder takes seconds, and this runs on the daemon's runtime.
-                let (kind, label, dir) = (m.kind, m.label.clone(), media_dir.clone());
-                let built = tokio::task::spawn_blocking(move || {
-                    crate::media::MediaCache::new(dir).ensure(kind, &src, label.as_deref())
-                })
-                .await
-                .map_err(|e| anyhow!("media build task: {e}"))?
-                .with_context(|| format!("building media for vm \"{}\"", vm_cfg.name))?;
-                match m.kind {
-                    crate::config::model::MediaKind::Iso => cdroms.push(built),
-                    crate::config::model::MediaKind::Floppy => {
-                        if floppy.is_some() {
-                            bail!(
-                                "vm \"{}\": both a floppy attachment and floppy media declared — \
-                                 a VM has one floppy drive",
-                                vm_cfg.name
-                            );
-                        }
-                        floppy = Some(built);
-                    }
+            for vm_cfg in &config.lab.vms {
+                let (vm, pull) = machine_build::build_vm(&cx, vm_cfg, &mut state).await?;
+                if let Some(job) = pull {
+                    pending.insert(vm_cfg.name.clone(), job);
                 }
+                set.insert(Built::Vm(vm), config.clone());
             }
-
-            let first_boot = meta.as_ref().and_then(|m| m.first_boot());
-            let agent_version = meta.as_ref().and_then(|m| m.agent_version.clone());
-            // Each NIC inherits its segment's effective MTU (jumbo on NAT/global
-            // by default); drives `host_mtu=` on virtio NICs in the cmdline.
-            let nic_mtus: Vec<u16> = vm_cfg
-                .nics
-                .iter()
-                .map(|nic| {
-                    network
-                        .segments
-                        .get(nic_segment_name(nic))
-                        .map_or(crate::labd::network::STANDARD_MTU, |s| s.effective_mtu())
-                })
-                .collect();
-            let share_hosts = vm_cfg
-                .shares
-                .iter()
-                .map(|s| share_plan::resolve_share_host(&root, home.as_deref(), &s.host))
-                .collect();
-            let vm = VmInstance::new(
-                &name,
-                rooted_vm_config(vm_cfg, &root),
-                dirs,
-                macs,
-                nic_mtus,
-                cdroms,
-                floppy,
-                share_hosts,
-                crate::labd::vm::TemplateParts {
-                    resolved,
-                    backing,
-                    disk_size,
-                    first_boot,
-                    agent_version,
-                    variant,
-                    template_vars,
-                },
-            );
-            vms.insert(vm_cfg.name.clone(), vm);
-        }
-
-        // Containers: bind each image offline when it is already cached (the
-        // digest pin makes previously-pulled images hit); an uncached image
-        // becomes a pending pull, mirroring registry templates — build never
-        // downloads, `ensure_pulled` does (with progress) and pins the digest
-        // so `up` never re-pulls implicitly (PRD §6.4 semantics).
-        let mut containers = BTreeMap::new();
-        if !config.lab.containers.is_empty() {
-            // Micro-VM containers run the host architecture (v1).
-            let arch = std::env::consts::ARCH;
-            let cache = crate::oci::image::ImageCache::new(crate::paths::oci_cache_dir());
             for c_cfg in &config.lab.containers {
-                // A container about to be cloned from the freeze binds the
-                // frozen image pin and MACs, written to the lab's state only
-                // when the clone is made (§21.2).
-                let mut frozen = freeze.as_ref().and_then(|f| f.record(&c_cfg.name)).cloned();
-                let c_state = match &mut frozen {
-                    Some(record) => record,
-                    None => state.machine_mut(&c_cfg.name),
-                };
-                if c_state.image_ref.as_deref() != Some(c_cfg.image.reference.as_str()) {
-                    // The `image =` line changed — drop the stale pin.
-                    c_state.image_digest = None;
+                let (container, pull) = machine_build::build_container(&cx, c_cfg, &mut state)?;
+                if let Some(job) = pull {
+                    pending.insert(c_cfg.name.clone(), job);
                 }
-                let reference = match &c_state.image_digest {
-                    // `name:tag@digest` is valid and the digest wins; a
-                    // reference already carrying a digest equals its pin.
-                    Some(d) if !c_cfg.image.reference.contains('@') => {
-                        format!("{}@{}", c_cfg.image.reference, d)
-                    }
-                    _ => c_cfg.image.reference.clone(),
-                };
-                let image = crate::oci::image::cached_container_image(&reference, &cache)
-                    .with_context(|| {
-                        format!("container \"{}\": image {}", c_cfg.name, c_cfg.image)
-                    })?;
-                if let Some(image) = &image {
-                    c_state.image_digest = Some(image.manifest_digest.clone());
-                    c_state.image_ref = Some(c_cfg.image.reference.clone());
-                } else {
-                    pending.insert(
-                        c_cfg.name.clone(),
-                        PullJob::Image {
-                            reference,
-                            arch: arch.to_string(),
-                        },
-                    );
-                }
-
-                // Stable MACs: explicit > persisted > generated — the unified
-                // name namespace keeps the hash inputs collision-free.
-                let mut macs = Vec::new();
-                for (i, nic) in c_cfg.nics.iter().enumerate() {
-                    let mac = nic
-                        .mac
-                        .or_else(|| c_state.macs.get(i).copied())
-                        .unwrap_or_else(|| generate_mac(&name, &c_cfg.name, i));
-                    macs.push(mac);
-                }
-                c_state.macs = macs.clone();
-
-                let nic_mtus: Vec<u16> = c_cfg
-                    .nics
-                    .iter()
-                    .map(|nic| {
-                        network
-                            .segments
-                            .get(nic_segment_name(nic))
-                            .map_or(crate::labd::network::STANDARD_MTU, |s| s.effective_mtu())
-                    })
-                    .collect();
-                let dirs = ContainerDirs::new(&root, &name, &c_cfg.name);
-                let volumes = resolve_volume_hosts(c_cfg, &root);
-                // Same resolver as the VMs above: declaration > profile
-                // (a container has no template layer). §5.1 validation has
-                // already rejected a container no layer sizes.
-                let resolved = crate::qemu::resolve_container(c_cfg, arch, profiles)?;
-                let container = ContainerInstance::new(
-                    &name,
-                    c_cfg.clone(),
-                    resolved,
-                    dirs,
-                    macs,
-                    nic_mtus,
-                    image,
-                    volumes,
-                );
-                containers.insert(c_cfg.name.clone(), container);
+                set.insert(Built::Container(container), config.clone());
             }
         }
         state.save(&lab_local)?;
@@ -775,36 +527,24 @@ impl LabRuntime {
                 .collect();
         // A machine still to be cloned from the freeze reserves the MACs it
         // was built with, not whatever its record here says.
-        for (n, m) in vms
-            .iter()
-            .map(|(n, v)| (n, v.macs.clone()))
-            .chain(containers.iter().map(|(n, c)| (n, c.macs.clone())))
-        {
-            if freeze.as_ref().and_then(|f| f.record(n)).is_some() {
-                macs_by_vm.insert(n.clone(), m);
+        for m in set.all() {
+            if freeze.as_ref().and_then(|f| f.record(m.name())).is_some() {
+                macs_by_vm.insert(m.name().to_string(), m.macs().to_vec());
             }
         }
         network.wire_gateways(&config.lab, &macs_by_vm, &host_cfg);
-
-        let machines: BTreeMap<String, Arc<dyn Machine>> = vms
-            .iter()
-            .map(|(n, v)| (n.clone(), v.clone() as Arc<dyn Machine>))
-            .chain(
-                containers
-                    .iter()
-                    .map(|(n, c)| (n.clone(), c.clone() as Arc<dyn Machine>)),
-            )
-            .collect();
 
         Ok(Arc::new_cyclic(|me| LabRuntime {
             me: me.clone(),
             name,
             root,
             lab_local,
-            config,
-            vms,
-            containers,
-            machines,
+            config: std::sync::RwLock::new(config),
+            machines: std::sync::RwLock::new(set),
+            #[cfg(test)]
+            doubles: std::sync::Mutex::new(None),
+            rebuild_gate: tokio::sync::RwLock::new(()),
+            smb_served: std::sync::Mutex::new(String::new()),
             network: Mutex::new(network),
             state: Mutex::new(state),
             events,
@@ -860,20 +600,22 @@ impl LabRuntime {
         }
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
         let events = Arc::new(super::events::EventLog::new(&name, tx)?);
-        let machines: BTreeMap<String, Arc<dyn Machine>> = machines
-            .into_iter()
-            .map(|m| (m.name().to_string(), m))
-            .collect();
         let profiles = ProfileSet::shipped()?;
+        let config = Arc::new(config);
+        let mut set = MachineSet::default();
+        for m in machines {
+            set.insert(Built::Double(m), config.clone());
+        }
         Ok(Arc::new_cyclic(|me| LabRuntime {
             me: me.clone(),
             name,
             root,
             lab_local: lab_local.clone(),
-            config,
-            vms: BTreeMap::new(),
-            containers: BTreeMap::new(),
-            machines,
+            config: std::sync::RwLock::new(config),
+            machines: std::sync::RwLock::new(set),
+            doubles: std::sync::Mutex::new(None),
+            rebuild_gate: tokio::sync::RwLock::new(()),
+            smb_served: std::sync::Mutex::new(String::new()),
             network: Mutex::new(network),
             state: Mutex::new(LabState::load(&lab_local).unwrap_or_default()),
             events,
@@ -1018,7 +760,7 @@ impl LabRuntime {
         // its machines name between them (§6.6).
         let mut want = crate::oci::client::VariantWant::default();
         for vm_name in &batch.machines {
-            if let Some(vm_cfg) = self.config.lab.vms.iter().find(|v| &v.name == vm_name) {
+            if let Some(vm_cfg) = self.config().lab.vms.iter().find(|v| &v.name == vm_name) {
                 want.add(vm_cfg.template.variant());
             }
         }
@@ -1078,13 +820,20 @@ impl LabRuntime {
         version: &crate::template::store::TemplateVersion,
     ) -> Result<()> {
         for vm_name in &batch.machines {
-            let vm_cfg = self
-                .config
-                .lab
-                .vms
-                .iter()
-                .find(|v| &v.name == vm_name)
-                .ok_or_else(|| anyhow!("no vm \"{vm_name}\" in the lab config"))?;
+            // Against the declaration the waiting instance was built from,
+            // which a reload may have left behind the lab's (§7.1); a machine
+            // a reload dropped has nothing waiting.
+            let Some(from) = self
+                .machines
+                .read()
+                .expect("machine set lock")
+                .built_from(vm_name)
+            else {
+                continue;
+            };
+            let Some(vm_cfg) = from.lab.vms.iter().find(|v| &v.name == vm_name) else {
+                continue;
+            };
             let resolved = version
                 .select(vm_cfg.template.variant(), Purpose::Lab)
                 .with_context(|| format!("vm \"{vm_name}\""))?;
@@ -1171,8 +920,11 @@ impl LabRuntime {
     ) -> Result<()> {
         for name in &batch.machines {
             // kind-aware: as in `bind_template` — binding a downloaded image
-            // needs the concrete type that holds one.
-            let container = self.container(name)?;
+            // needs the concrete type that holds one; one a reload dropped
+            // has nothing waiting.
+            let Ok(container) = self.container(name) else {
+                continue;
+            };
             {
                 let mut state = self.state.lock().await;
                 let c_state = state.machine_mut(name);
@@ -1301,6 +1053,7 @@ impl LabRuntime {
 
         // Hand each machine whose guest mounts for itself its coordinates.
         // A machine driven from the host instead ignores this.
+        *self.smb_served.lock_recover() = reload::smb_exports(&smb);
         for (name, gateway) in smb.volume_gateways {
             let Some(creds) = labsmb.credentials(&name) else {
                 continue;
@@ -1338,13 +1091,12 @@ impl LabRuntime {
         };
         // The resolved profile (which folds in template metadata) says whether
         // the guest mounts virtiofs natively.
-        let guest_virtiofs: BTreeMap<String, bool> = self
-            .vms
+        let vms = self.machines.read().expect("machine set lock").vms();
+        let guest_virtiofs: BTreeMap<String, bool> = vms
             .iter()
             .map(|(name, vm)| (name.clone(), vm.template().resolved.virtiofs))
             .collect();
-        let windows_guests: BTreeSet<String> = self
-            .vms
+        let windows_guests: BTreeSet<String> = vms
             .iter()
             .filter(|(_, vm)| {
                 crate::smb::guest_os_hint(vm.template().resolved.profile.as_deref())
@@ -1355,7 +1107,7 @@ impl LabRuntime {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         share_plan::plan(
             &share_plan::ShareInputs {
-                lab: &self.config.lab,
+                lab: &self.config().lab,
                 root: &self.root,
                 home: home.as_deref(),
                 host_virtiofsd: share_plan::HostVirtiofsd::of(self.host_virtiofsd().as_ref()),
@@ -1381,9 +1133,10 @@ impl LabRuntime {
     // Nothing here decides *behaviour* by kind. If a caller wants one of these
     // to pick a code path, the difference belongs on `Machine` instead.
 
-    pub fn vm(&self, name: &str) -> Result<&Arc<VmInstance>> {
-        self.vms.get(name).ok_or_else(|| {
-            if self.containers.contains_key(name) {
+    pub fn vm(&self, name: &str) -> Result<Arc<VmInstance>> {
+        let set = self.machines.read().expect("machine set lock");
+        set.vm(name).ok_or_else(|| {
+            if set.container(name).is_some() {
                 anyhow!("\"{name}\" is a container — use `vmlab container ...`")
             } else {
                 anyhow!("no vm \"{name}\" in lab \"{}\"", self.name)
@@ -1391,9 +1144,10 @@ impl LabRuntime {
         })
     }
 
-    pub fn container(&self, name: &str) -> Result<&Arc<ContainerInstance>> {
-        self.containers.get(name).ok_or_else(|| {
-            if self.vms.contains_key(name) {
+    pub fn container(&self, name: &str) -> Result<Arc<ContainerInstance>> {
+        let set = self.machines.read().expect("machine set lock");
+        set.container(name).ok_or_else(|| {
+            if set.vm(name).is_some() {
                 anyhow!("\"{name}\" is a vm — use `vmlab vm ...`")
             } else {
                 anyhow!("no container \"{name}\" in lab \"{}\"", self.name)
@@ -1403,19 +1157,31 @@ impl LabRuntime {
 
     // ---- END kind-aware accessors -------------------------------------------
 
+    /// The lab file as this daemon last loaded it (PRD §7.1). A snapshot: a
+    /// reload swaps in a new one without disturbing whoever holds this.
+    pub fn config(&self) -> Arc<LabFile> {
+        self.config.read().expect("config lock").clone()
+    }
+
     /// One machine by name — the only accessor orchestration needs. Machine
     /// names are unique across both kinds, so there is one namespace to look
     /// in.
     pub fn machine(&self, name: &str) -> Result<Arc<dyn Machine>> {
         self.machines
+            .read()
+            .expect("machine set lock")
             .get(name)
-            .cloned()
             .ok_or_else(|| anyhow!("no vm or container \"{name}\" in lab \"{}\"", self.name))
     }
 
-    /// Every machine in the lab, in name order.
-    pub fn machines(&self) -> impl Iterator<Item = Arc<dyn Machine>> + '_ {
-        self.machines.values().cloned()
+    /// Every machine in the lab, in name order, as the set held them when
+    /// asked.
+    pub fn machines(&self) -> impl Iterator<Item = Arc<dyn Machine>> + use<> {
+        self.machines
+            .read()
+            .expect("machine set lock")
+            .all()
+            .into_iter()
     }
 
     /// This runtime as the narrow interface a machine boots against.
@@ -1431,7 +1197,7 @@ impl LabRuntime {
 
     /// Something in the lab waits on this machine's readiness.
     fn has_dependents(&self, name: &str) -> bool {
-        self.config
+        self.config()
             .lab
             .machines()
             .any(|m| m.depends_on().iter().any(|d| d == name))
@@ -1472,7 +1238,7 @@ impl LabRuntime {
     /// every block does is not checked.
     fn preflight_playbooks(&self, targets: &[String]) -> Result<()> {
         use crate::labd::playbook;
-        let lab = &self.config.lab;
+        let lab = &self.config().lab;
         let dir = playbook::default_bin_dir(self.host_cfg.config_weave_bin_dir.as_deref());
         let mut errs: Vec<String> = Vec::new();
         for name in targets {
@@ -1497,7 +1263,12 @@ impl LabRuntime {
 
     /// Boot one machine, whichever kind it is.
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.settle_pending(name).await?;
         self.clone_from_freeze(name).await?;
+        // A download is the one long wait a start can make: outside the
+        // gate, so a reload is not held up behind it (§7.1).
+        self.ensure_pulled(&[name.to_string()], None).await?;
+        let _gate = self.rebuild_gate.read().await;
         self.machine(name)?.start(self.services()).await
     }
 
@@ -1612,7 +1383,7 @@ impl LabRuntime {
             .and_then(|o| freeze_clone::plan(&self.freeze_declared, &o));
         // An unreadable `worktree.json` counts as stale: the rebuild then
         // fails loudly rather than this daemon running on its old decision.
-        let isolation_moved = super::isolation::decide(&self.root, &self.config.lab)
+        let isolation_moved = super::isolation::decide(&self.root, &self.config().lab)
             .map_or(true, |now| now != self.isolation);
         freeze_clone::stale(planned, now.as_ref()) || isolation_moved
     }
@@ -1725,14 +1496,16 @@ impl LabRuntime {
     /// that is not eligible is never entered, so its readiness waits on
     /// nothing; one that is eligible but already current is held only for the
     /// one handshake it takes to find out.
-    pub async fn start_with_deferred_refresh(self: &Arc<Self>, m: &Arc<dyn Machine>) -> Result<()> {
-        let name = m.name().to_string();
-        if self.refresh_could_be_owed(m.as_ref()) {
+    pub async fn start_with_deferred_refresh(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.settle_pending(name).await?;
+        let name = name.to_string();
+        if self.refresh_could_be_owed(self.machine(&name)?.as_ref()) {
             self.deferred_refresh
                 .lock_recover()
                 .insert(name.clone(), OwedRefresh::AtHandshake);
         }
         self.start_machine(&name).await?;
+        let m = &self.machine(&name)?;
         // Already running and ready, so no handshake is coming: a machine
         // other callers are already using is refreshed beside them, in the
         // background, as `vm start` on a running machine always was.
@@ -1751,7 +1524,8 @@ impl LabRuntime {
     fn refresh_could_be_owed(&self, m: &dyn Machine) -> bool {
         self.agent_updates
             .load(std::sync::atomic::Ordering::Relaxed)
-            && super::agent_repair::eligible(m, self.config.lab.agent_update_for(m.name())).is_ok()
+            && super::agent_repair::eligible(m, self.config().lab.agent_update_for(m.name()))
+                .is_ok()
     }
 
     /// Hold `m`'s readiness for the agent refresh the caller is about to run
@@ -1839,7 +1613,7 @@ impl LabRuntime {
             return;
         }
         let name = m.name().to_string();
-        if let Err(why) = eligible(m.as_ref(), self.config.lab.agent_update_for(&name)) {
+        if let Err(why) = eligible(m.as_ref(), self.config().lab.agent_update_for(&name)) {
             tracing::debug!(machine = %name, ?why, "agent refresh: not eligible");
             return;
         }
@@ -2063,7 +1837,7 @@ impl LabRuntime {
         // machines a subset drags in, which wave each lands in, and which
         // configuration steps are in scope (see `labd::plan`).
         let plan =
-            plan::plan(&self.config.lab, subset, plan::Direction::Up).map_err(|e| anyhow!(e))?;
+            plan::plan(&self.config().lab, subset, plan::Direction::Up).map_err(|e| anyhow!(e))?;
         // Worktree isolation (§21.4) refuses a worktree lab that peers a
         // global segment with another host, before anything boots.
         if let Some(isolation) = &self.isolation {
@@ -2087,8 +1861,8 @@ impl LabRuntime {
 
         // `nested = true` asks for VMX/SVM the host may not have to give
         // (§5.2): the machine still boots, so this is said, not refused.
-        let nested: Vec<&str> = self
-            .config
+        let config = self.config();
+        let nested: Vec<&str> = config
             .lab
             .vms
             .iter()
@@ -2101,6 +1875,12 @@ impl LabRuntime {
             output(format!("warning: {}: {problem}\n", nested.join(", ")));
         }
 
+        // A machine an earlier reload left pending, stopped since, boots on
+        // the declaration as it is now (§7.1): rebuilt before anything below
+        // asks it what it needs.
+        for name in &targets {
+            self.settle_pending(name).await?;
+        }
         // A VM whose clone was made from a template the lab file no longer
         // declares cannot boot it either way — refuse before downloading the
         // new template or starting anything else, so the refusal is the
@@ -2215,8 +1995,11 @@ impl LabRuntime {
                         }
                         me.start_machine(&n).await?;
                     } else {
-                        me.start_with_deferred_refresh(&m).await?;
+                        me.start_with_deferred_refresh(&n).await?;
                     }
+                    // The instance that booted: a reload may have rebuilt the
+                    // one looked up above while it was still stopped (§7.1).
+                    let m = me.machine(&n)?;
                     // Before this machine can be considered ready (§6.1). A
                     // no-op for machines carrying no first-boot script, so
                     // leaf timing is unchanged. It refreshes the agent itself,
@@ -2336,7 +2119,7 @@ impl LabRuntime {
     fn has_forwards(&self, machine: &str) -> bool {
         let plan = forward_plan::plan(
             &forward_plan::ForwardInputs {
-                lab: &self.config.lab,
+                lab: &self.config().lab,
                 observed: &forward_plan::Observed::default(),
                 isolated: self.isolation.is_some(),
             },
@@ -2361,7 +2144,7 @@ impl LabRuntime {
         let observed = self.forward_observations(scope).await;
         let plan = forward_plan::plan(
             &forward_plan::ForwardInputs {
-                lab: &self.config.lab,
+                lab: &self.config().lab,
                 observed: &observed,
                 isolated: self.isolation.is_some(),
             },
@@ -2376,12 +2159,26 @@ impl LabRuntime {
                 .or_default()
                 .push(rule);
         }
-        if installable.is_empty() {
-            return Vec::new();
-        }
-
         let net = self.network.lock().await;
         let mut tracked = self.machine_forwards.lock().await;
+        // A machine in scope the lab file declares no forward to any more —
+        // a reload took its last one away (§7.1) — has what it had removed.
+        let bare: Vec<String> = tracked
+            .keys()
+            .filter(|m| scope.contains(m) && !self.has_forwards(m))
+            .cloned()
+            .collect();
+        for machine in bare {
+            for old in tracked.remove(&machine).unwrap_or_default() {
+                if let Some(s) = net
+                    .segments
+                    .get(&old.key.segment)
+                    .and_then(|s| s.services.as_ref())
+                {
+                    s.remove_forward(old.id).await;
+                }
+            }
+        }
         let mut shifted = Vec::new();
         for (machine, rules) in installable {
             // Drop this machine's forwards from a previous run/lease. Their
@@ -2757,10 +2554,39 @@ impl LabRuntime {
     /// everything that depends on dc01 as well — before this it stopped dc01
     /// alone and left them running against a dead dependency.
     pub async fn down(self: &Arc<Self>, subset: &[String], force: bool) -> Result<()> {
-        let plan =
-            plan::plan(&self.config.lab, subset, plan::Direction::Down).map_err(|e| anyhow!(e))?;
+        // A machine the lab file has dropped while it ran is still this
+        // daemon's to stop (§7.1), though no plan over the file names it: a
+        // full `down` stops it first, and naming it stops it alone.
+        let config = self.config();
+        let (declared, dropped): (Vec<String>, Vec<String>) = if subset.is_empty() {
+            let dropped = self
+                .machines()
+                .map(|m| m.name().to_string())
+                .filter(|n| config.lab.machine(n).is_none())
+                .collect();
+            (Vec::new(), dropped)
+        } else {
+            subset
+                .iter()
+                .cloned()
+                .partition(|n| config.lab.machine(n).is_some() || self.machine(n).is_err())
+        };
+        let plan = if subset.is_empty() || !declared.is_empty() {
+            plan::plan(&config.lab, &declared, plan::Direction::Down).map_err(|e| anyhow!(e))?
+        } else {
+            plan::LabPlan {
+                waves: Vec::new(),
+                provisioning: Vec::new(),
+                skipped: Vec::new(),
+            }
+        };
         for skip in &plan.skipped {
             tracing::info!("{}: {}", skip.what, skip.why);
+        }
+        for name in &dropped {
+            self.workspaces.stop(name).await;
+            self.record_finalise_machine(name, "machine stopped").await;
+            self.machine(name)?.stop(force).await?;
         }
 
         // Before the machines go: a syncer whose guest has gone would spend
@@ -2831,7 +2657,7 @@ impl LabRuntime {
     /// VM naming no `profile` of its own would land on the floor instead of on
     /// its guest OS's path.
     fn dev_machines(&self) -> Vec<crate::dev::ResolvedDev> {
-        crate::dev::machines(&self.config.lab, |cfg| self.effective_profile(cfg.name()))
+        crate::dev::machines(&self.config().lab, |cfg| self.effective_profile(cfg.name()))
     }
 
     /// The guest OS profile `machine` effectively runs, read off its resolved
@@ -3125,6 +2951,7 @@ impl LabRuntime {
         }
         let forwards = self.forward_statuses().await;
         let freeze_stale = self.freeze_stale(self.freeze.lock().await.as_ref());
+        let pending = self.pending().await;
         // In-flight downloads, so a page load mid-pull still shows progress
         // (the events only reach clients that were already connected).
         LabStatus {
@@ -3133,7 +2960,8 @@ impl LabRuntime {
             segments,
             provisioned: self.provisioned(),
             pulls: self.pulls.lock_recover().snapshot(),
-            config_digest: crate::config::digest(&self.config),
+            config_digest: crate::config::digest(&self.config()),
+            pending,
             forwards,
             isolation: self.isolation.as_ref().map(|p| p.status()),
             freeze_stale,
@@ -5144,7 +4972,7 @@ lab "t" {
         )
         .expect("parse")
         .lab;
-        let cfg = rooted_vm_config(&lab.vms[0], root);
+        let cfg = crate::labd::machine_build::rooted_vm_config(&lab.vms[0], root);
         let from: Vec<_> = cfg.extra_disks.iter().map(|d| d.from.clone()).collect();
         assert_eq!(
             from,
@@ -6031,7 +5859,7 @@ fn main(lab: Lab) {
         assert_eq!(lab.vm("dc01").unwrap().macs, vec![mac]);
         assert_eq!(
             lab.vm("web").unwrap().macs,
-            vec![generate_mac("l", "web", 0)]
+            vec![crate::labd::state::generate_mac("l", "web", 0)]
         );
         assert!(
             !lab.state.lock().await.machines.contains_key("dc01"),
@@ -6079,5 +5907,195 @@ fn main(lab: Lab) {
         let err = lab.clone_from_freeze("web").await.unwrap_err().to_string();
         assert!(err.contains("vmlab worktree freeze"), "{err}");
         lab.clone_from_freeze("dc01").await.unwrap();
+    }
+
+    // ---- reload (PRD §7.1) ----------------------------------------------------
+
+    const RELOAD_BASE: &str = r#"import <vmlab.wcl>
+lab "t" {
+  segment "corp" { }
+  container "web" { image = "web:1" nic { segment = "corp" } }
+  container "db" { image = "db:1" nic { segment = "corp" } }
+}"#;
+
+    /// A lab of two container doubles, `web` and `db`, whose reloads build
+    /// fresh doubles — so a machine's instance changing is a rebuild.
+    fn reload_lab(dir: &std::path::Path) -> (Arc<LabRuntime>, Shared) {
+        let sh = shared(dir);
+        let lab = lab_of(
+            dir,
+            RELOAD_BASE,
+            vec![
+                FakeMachine::new("web", MachineKind::Container, &sh),
+                FakeMachine::new("db", MachineKind::Container, &sh),
+            ],
+        );
+        let doubles = sh.clone();
+        *lab.doubles.lock().unwrap() = Some(Arc::new(move |cfg| {
+            FakeMachine::new(cfg.name(), MachineKind::Container, &doubles) as Arc<dyn Machine>
+        }));
+        (lab, sh)
+    }
+
+    fn edited(dir: &std::path::Path, src: &str) -> LabFile {
+        crate::config::load_lab_source(src, "<test>", dir).expect("lab source")
+    }
+
+    fn same(a: &Arc<dyn Machine>, b: &Arc<dyn Machine>) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+    }
+
+    /// A stopped machine whose block changed is rebuilt from the new one; a
+    /// running one keeps its instance and is pending, named by `status`,
+    /// until its next boot rebuilds it — the stop and start of a restart.
+    #[tokio::test]
+    async fn a_reload_rebuilds_what_is_stopped_and_leaves_what_runs_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sh) = reload_lab(dir.path());
+        lab.start_machine("web").await.unwrap();
+        let (web, db) = (lab.machine("web").unwrap(), lab.machine("db").unwrap());
+
+        let new = RELOAD_BASE
+            .replace("\"web:1\"", "\"web:2\"")
+            .replace("\"db:1\"", "\"db:2\"");
+        let report = lab.reload_with(edited(dir.path(), &new)).await.unwrap();
+        assert_eq!(
+            report.machines,
+            [
+                crate::status::MachineReload::Rebuilt {
+                    machine: "db".into()
+                },
+                crate::status::MachineReload::Pending(crate::status::PendingMachine {
+                    machine: "web".into(),
+                    reason: crate::status::PendingReason::Running,
+                }),
+            ]
+        );
+        assert!(same(&lab.machine("web").unwrap(), &web), "web was replaced");
+        assert!(
+            !same(&lab.machine("db").unwrap(), &db),
+            "db was not rebuilt"
+        );
+
+        let status = lab.status().await;
+        assert_eq!(
+            status.config_digest,
+            crate::config::digest(&edited(dir.path(), &new))
+        );
+        assert_eq!(
+            status.pending,
+            [crate::status::PendingMachine {
+                machine: "web".into(),
+                reason: crate::status::PendingReason::Running,
+            }]
+        );
+
+        lab.restart_machine("web", false).await.unwrap();
+        let rebuilt = lab.machine("web").unwrap();
+        assert!(!same(&rebuilt, &web), "web was not rebuilt by its restart");
+        assert_eq!(rebuilt.state().await, PowerState::Running);
+        assert_eq!(web.state().await, PowerState::Stopped);
+        assert!(lab.status().await.pending.is_empty());
+    }
+
+    /// A pending machine that stops by any route — here a guest shutdown,
+    /// which no lab verb sees — is named as such, and rebuilt by the next
+    /// `up` before it boots.
+    #[tokio::test]
+    async fn a_pending_machine_that_stopped_is_rebuilt_by_its_next_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sh) = reload_lab(dir.path());
+        lab.start_machine("web").await.unwrap();
+        let web = lab.machine("web").unwrap();
+        let new = RELOAD_BASE.replace("\"web:1\"", "\"web:2\"");
+        lab.reload_with(edited(dir.path(), &new)).await.unwrap();
+
+        web.stop(false).await.unwrap();
+        assert_eq!(
+            lab.status().await.pending[0].reason,
+            crate::status::PendingReason::Stopped
+        );
+        lab.up(&["web".to_string()], quiet()).await.unwrap();
+        let now = lab.machine("web").unwrap();
+        assert!(!same(&now, &web), "booted the old instance");
+        assert_eq!(now.state().await, PowerState::Running);
+        assert!(lab.status().await.pending.is_empty());
+    }
+
+    /// Added machines join; a removed one is dropped while stopped, pending
+    /// while running, and still stopped by a full `down`.
+    #[tokio::test]
+    async fn a_reload_adds_and_drops_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sh) = reload_lab(dir.path());
+        let new = r#"import <vmlab.wcl>
+lab "t" {
+  segment "corp" { }
+  container "cache" { image = "cache:1" nic { segment = "corp" } }
+}"#;
+        lab.start_machine("web").await.unwrap();
+        let web = lab.machine("web").unwrap();
+        let report = lab.reload_with(edited(dir.path(), new)).await.unwrap();
+        let lines: Vec<String> = report.machines.iter().map(|m| m.line()).collect();
+        assert!(lines[0].starts_with("cache: added"), "{lines:?}");
+        assert!(lines[1].starts_with("db: dropped"), "{lines:?}");
+        assert!(lines[2].starts_with("web: pending"), "{lines:?}");
+        assert!(lab.machine("cache").is_ok());
+        assert!(lab.machine("db").is_err());
+        assert_eq!(
+            lab.status().await.pending[0].reason,
+            crate::status::PendingReason::Removed
+        );
+
+        lab.down(&[], false).await.unwrap();
+        assert_eq!(web.state().await, PowerState::Stopped);
+        assert!(lab.status().await.pending.is_empty());
+        assert!(lab.machine("web").is_err(), "web outlived its stop");
+    }
+
+    /// A network change applies nothing: the declaration, the instances and
+    /// the status are the ones from before, and the refusal names the change
+    /// and `vmlab down`.
+    #[tokio::test]
+    async fn a_network_change_is_refused_and_applies_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sh) = reload_lab(dir.path());
+        lab.start_machine("web").await.unwrap();
+        let db = lab.machine("db").unwrap();
+        let before = lab.status().await.config_digest;
+        let new = RELOAD_BASE
+            .replace("segment \"corp\" { }", "segment \"corp\" { mtu = 9000 }")
+            .replace("\"db:1\"", "\"db:2\"");
+        let err = lab
+            .reload_with(edited(dir.path(), &new))
+            .await
+            .expect_err("refused");
+        assert_eq!(err.code, crate::proto::ErrorCode::Conflict);
+        assert!(
+            err.message.contains("segment \"corp\" changed (mtu)"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("vmlab down"), "{}", err.message);
+        assert!(same(&lab.machine("db").unwrap(), &db), "db was rebuilt");
+        assert_eq!(lab.status().await.config_digest, before);
+    }
+
+    /// Handlers added by a reload are the ones the next event runs.
+    #[tokio::test]
+    async fn a_reload_swaps_the_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sh) = reload_lab(dir.path());
+        let new = RELOAD_BASE.replace(
+            "  segment \"corp\" { }",
+            "  segment \"corp\" { }\n  on \"container.started\" { run = \"hook.ws\" }",
+        );
+        let report = lab.reload_with(edited(dir.path(), &new)).await.unwrap();
+        assert!(report.handlers);
+        assert!(report.machines.is_empty());
+        let event = crate::proto::Event::new("container.started", "t", json!({"container": "web"}));
+        let runs = super::super::matching_handler_runs(&lab, &event);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].0.ends_with("hook.ws"));
     }
 }

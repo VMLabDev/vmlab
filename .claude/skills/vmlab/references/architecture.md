@@ -19,9 +19,11 @@ vmlab is a two-tier daemon system with a thin client in front of it. The
   it has exited.
 - **The lab daemon.** One per running lab, spawned by the supervisor on
   `vmlab up` and reaped on a full `down` (or `lab stop`) and on `destroy`, which
-  releases the lab's name; a daemon that outlives a partial stop is replaced by
-  the next `up` if the lab file changed meanwhile, so machines always boot from
-  the file on disk. It owns everything lab-scoped:
+  releases the lab's name; when the lab file changed meanwhile, the next boot
+  verb replaces a daemon that outlived a partial stop, or, while a machine runs,
+  reloads the file into it machine by machine (`lab.reload`: stopped machines
+  rebuilt, running ones pending until their next boot, network changes refused),
+  so machines always boot from the file on disk. It owns everything lab-scoped:
   the QEMU processes, their QMP and agent channels, the lab's segments with
   their DHCP, DNS, NAT and rules, clones, snapshots, lab state, the wscript
   runtime, and the workspace syncer of any dev machine (see dev-machines.md).

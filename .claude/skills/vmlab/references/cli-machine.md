@@ -45,6 +45,8 @@ vmlab vm start [--record <VM=PATH>]... <VM>
 
 Starts one VM without running the lab's `up` plan: no dependency waves, no provision scripts, no playbooks. Any deferred download the VM needs runs first with progress on the terminal, then the host binaries are checked, then the VM boots. A VM whose clone does not exist yet gets one created from its template, and its first-boot script runs before it reports ready, exactly as under `vmlab up`. A VM that is already running is left alone. A `suspended` VM, one whose guest put itself to sleep (ACPI S3), is woken with QMP `system_wakeup` instead: no second QEMU, no agent refresh, and the verb returns once the guest runs again, emitting `vm.woken` with `cause = start`. Nothing is printed on success.
 
+Like `up`, it first brings the daemon onto the lab file on disk (cli-lab.md, "`up` always runs the lab file"): replaced when nothing runs, else reloaded machine by machine. A running VM a reload left pending says so (`<vm>: pending — …`) and keeps its old declaration; a stopped pending one is rebuilt before it boots.
+
 ### vmlab vm ip
 
 ```sh
@@ -86,7 +88,7 @@ vmlab vm restart [--record <VM=PATH>]... <VM>
 | `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options (`vmlab record` below). |
 | `-h`, `--help` | Print help. |
 
-Stops the VM through the graceful ladder, waits up to 60 seconds for it to settle as stopped, and boots it again. The clone is kept, so the guest comes back with its disk state and no first-boot script. Port forwards that target the VM are re-installed by the daemon when it gets a new lease. A VM that does not settle in time fails with `<name> did not stop for restart`.
+Stops the VM through the graceful ladder, waits up to 60 seconds for it to settle as stopped, and boots it again. The clone is kept, so the guest comes back with its disk state and no first-boot script. Port forwards that target the VM are re-installed by the daemon when it gets a new lease. A VM that does not settle in time fails with `<name> did not stop for restart`. A VM a reload left **pending** (cli-lab.md) is rebuilt from the current lab file between the stop and the start, and the verb prints `<vm>: rebuilt from the new declaration`; this is how a running machine picks up an edit. `container restart` is the same.
 
 With `--record`, `start` and `restart` boot the VM paused, attach the recorder, then let it continue, so the video opens on the firmware's first frame; the verb prints `recording <vm> to <path>` once the VM is up. A `--record` for a VM that was already running records it from now; one whose VM failed to start fails the verb with `machine X did not start, so its recording was not started`.
 

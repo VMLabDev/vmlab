@@ -703,6 +703,108 @@ pub struct LabStatus {
     /// replaces it, as it does a daemon whose `config_digest` is stale.
     #[serde(default)]
     pub freeze_stale: bool,
+    /// Machines not on the declaration `config_digest` names (PRD §7.1): a
+    /// reload found each changed or removed while it could not be rebuilt,
+    /// and says why. Every other machine runs the file as loaded. Empty from
+    /// a daemon that predates the field.
+    #[serde(default)]
+    pub pending: Vec<PendingMachine>,
+}
+
+/// One machine a reload could not rebuild yet (PRD §7.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingMachine {
+    pub machine: String,
+    pub reason: PendingReason,
+}
+
+/// Why a machine is still on an older declaration than its lab's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingReason {
+    /// Its block changed while it ran; it keeps running on the declaration
+    /// it was started with until it next boots.
+    Running,
+    /// Its block changed while it ran, and it has stopped since: its next
+    /// boot rebuilds it first.
+    Stopped,
+    /// A download for it was in flight; its next boot rebuilds it first.
+    Downloading,
+    /// It left the lab file while it ran; it is dropped once it stops.
+    Removed,
+}
+
+impl PendingMachine {
+    /// The line every surface says it in.
+    pub fn line(&self) -> String {
+        let m = &self.machine;
+        match self.reason {
+            PendingReason::Running => format!(
+                "{m}: pending — still running the declaration it was started with; \
+                 restart it (`vmlab vm restart {m}`, or a stop and a start) to pick up the change"
+            ),
+            PendingReason::Stopped => {
+                format!("{m}: pending — its next boot rebuilds it from the new declaration")
+            }
+            PendingReason::Downloading => format!(
+                "{m}: pending — a download for it is in flight; its next boot rebuilds it \
+                 from the new declaration"
+            ),
+            PendingReason::Removed => format!(
+                "{m}: pending — removed from vmlab.wcl while running; dropped once it stops"
+            ),
+        }
+    }
+}
+
+/// What one machine's reload did (PRD §7.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "change")]
+pub enum MachineReload {
+    /// Rebuilt in place from the new declaration; disks, state and MACs kept.
+    Rebuilt { machine: String },
+    /// Declared afresh and built.
+    Added { machine: String },
+    /// Removed from the file while stopped; its disks stay.
+    Dropped { machine: String },
+    /// Not rebuilt yet, and why.
+    Pending(PendingMachine),
+}
+
+impl MachineReload {
+    pub fn machine(&self) -> &str {
+        match self {
+            Self::Rebuilt { machine } | Self::Added { machine } | Self::Dropped { machine } => {
+                machine
+            }
+            Self::Pending(p) => &p.machine,
+        }
+    }
+
+    /// The line the boot verbs print for it.
+    pub fn line(&self) -> String {
+        match self {
+            Self::Rebuilt { machine } => format!("{machine}: rebuilt from the new declaration"),
+            Self::Added { machine } => format!("{machine}: added to the lab"),
+            Self::Dropped { machine } => {
+                format!("{machine}: dropped from the lab (its disks stay until `vmlab destroy`)")
+            }
+            Self::Pending(p) => p.line(),
+        }
+    }
+}
+
+/// The reply to `lab.reload` (PRD §7.1): one entry per machine rebuilt,
+/// added, dropped or left pending, in name order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadReport {
+    pub machines: Vec<MachineReload>,
+    /// The `on {}` handlers changed and were swapped.
+    #[serde(default)]
+    pub handlers: bool,
+    /// What reinstalling the forwards of the running machines said.
+    #[serde(default)]
+    pub forwards: Vec<String>,
 }
 
 impl LabStatus {
@@ -837,6 +939,7 @@ pub(crate) mod fixtures {
             forwards: Vec::new(),
             isolation: None,
             freeze_stale: false,
+            pending: Vec::new(),
         }
     }
 }

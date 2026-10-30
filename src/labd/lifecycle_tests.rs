@@ -1952,7 +1952,9 @@ async fn a_machine_owed_a_refresh_is_not_ready_until_the_refresh_has_run() {
     let mut events = lab.events.subscribe();
     let m: Arc<dyn Machine> = vm.clone();
 
-    lab.start_with_deferred_refresh(&m).await.expect("start");
+    lab.start_with_deferred_refresh(m.name())
+        .await
+        .expect("start");
     m.wait_agent_up(SETTLE).await.expect("the agent answered");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
@@ -1999,7 +2001,9 @@ async fn a_machine_owed_no_refresh_is_ready_at_its_handshake() {
     );
     let mut events = lab.events.subscribe();
     let m: Arc<dyn Machine> = vm1.clone();
-    lab.start_with_deferred_refresh(&m).await.expect("start");
+    lab.start_with_deferred_refresh(m.name())
+        .await
+        .expect("start");
     m.wait_ready(SETTLE).await.expect("ready");
     collect_events(&mut events, &["vm.ready"], 1).await;
     vm1.stop(true).await.expect("stop");
@@ -2017,7 +2021,9 @@ async fn a_machine_owed_no_refresh_is_ready_at_its_handshake() {
         })
     });
     let m: Arc<dyn Machine> = vm2.clone();
-    lab.start_with_deferred_refresh(&m).await.expect("start");
+    lab.start_with_deferred_refresh(m.name())
+        .await
+        .expect("start");
     m.wait_ready(SETTLE).await.expect("ready");
     assert!(
         !asked.load(Ordering::SeqCst),

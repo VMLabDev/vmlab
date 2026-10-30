@@ -67,6 +67,7 @@ the code is the contract.
 | `dns.table` | — | `cli` | The DNS zones the lab's segments serve. |
 | `up` | `machines: Vec<String>`, `record: Vec<RecordRequest>` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
 | `pull` | `machines: Vec<String>` | `cli` | Download every pending template and image without starting anything, over the code path `up` runs first. |
+| `lab.reload` | — | `cli` | Read the lab file afresh and apply it machine by machine (PRD §7.1): rebuild what is stopped, leave what runs pending, add and drop, reinstall forwards and swap handlers. A network change refuses the whole reload. Answers with what each machine did. |
 | `pull.cancel` | `machine: String` | `cli` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
 | `run` | `script: String`, `record: Vec<RecordRequest>` | `cli` | Run an ad-hoc wscript against the lab (PRD §12), streaming output. |
 | `down` | `machines: Vec<String>`, `force: bool` | `cli` | Stop the lab, or just the named machines (empty = all). |
@@ -138,6 +139,7 @@ Every command has a caller.
 Deliberate, with the reason recorded beside the declaration:
 
 - `version` — The build check is the CLI's: it is the one process that can be a different build from the daemon it connects to, and a script runs inside the daemon that would answer.
+- `lab.reload` — A boot verb asks for a reload when it finds the daemon running an edited-away file it cannot replace; a script runs inside the daemon whose file it would be reloading.
 - `run` — A scratch script is a shell verb: it comes from a file the caller already has and streams its output back to the terminal that ran it. What the console runs is declared playbooks.
 - `machine.ip` — A scripting shortcut over data the console already holds: the lab status projection carries every machine's address, so the console reads it there rather than asking a second time.
 - `machine.mouse_move` — The console drives a machine through a live VNC canvas, where a human moves the pointer themselves. Scripted pointer input is for callers that have no canvas.
