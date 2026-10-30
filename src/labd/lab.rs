@@ -3637,7 +3637,8 @@ mod tests {
     }
 
     /// What a displayed double tells its [`Display`]: a VNC socket (a fake
-    /// server's) and an input tap. QMP is never reached.
+    /// server's) and an input tap. Its input and frames capabilities are
+    /// never reached.
     struct FakeDisplayHost {
         name: String,
         vnc: PathBuf,
@@ -3649,8 +3650,11 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        async fn qmp(&self) -> Result<crate::qmp::QmpClient> {
-            Err(anyhow!("fake display has no QMP"))
+        async fn input(&self) -> Result<Arc<dyn super::super::hypervisor::Input>> {
+            Err(anyhow!("fake display has no input capability"))
+        }
+        async fn frames(&self) -> Result<Arc<dyn super::super::hypervisor::Frames>> {
+            Err(anyhow!("fake display has no frames capability"))
         }
         fn vnc_sock(&self) -> PathBuf {
             self.vnc.clone()
