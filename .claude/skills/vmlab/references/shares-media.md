@@ -149,6 +149,11 @@ Exit status stays 0.
   `mount -t virtiofs <tag> <guest_path>`.
 - **Linux, SMB:** `mkdir -p <guest_path>`, then
   `mount -t cifs //<gateway>/<share> <guest_path>` with the generated credential.
+- **macOS, SMB:** `mkdir -p <guest_path>`, then
+  `/sbin/mount_smbfs -N [-o rdonly] //<user>:<password>@<gateway>/<share> <guest_path>`,
+  the generated credential percent-encoded in the URL. macOS has no virtiofs
+  client: a `transport = "virtiofs"` share on it is reported unmountable, naming
+  SMB, and `auto` always picks SMB.
 - **Windows:** the credential is stored once per lab with `cmdkey`. A drive-letter
   target such as `S:` is mapped with `net use`. A folder-path target becomes a
   directory symbolic link to the UNC path with `mklink /D`, because a junction

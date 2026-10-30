@@ -586,7 +586,7 @@ vmlab app run [OPTIONS] <MACHINE> [-- <CMD>...]
 | `--password <PASSWORD>` | Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`. |
 | `-h`, `--help` | Print help. |
 
-The guest family comes from the machine's effective profile: a name starting with `windows` is Windows, everything else (containers included) is Linux. The host session comes from the command's own environment: `WAYLAND_DISPLAY` set is Wayland, else `DISPLAY` set is X11, else it refuses with `no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set`. Run it from a terminal inside the desktop session. The daemon opens the agent session and hands the CLI two private unix sockets, and the CLI runs the host end against them: `waypipe client`, a proxy to the X server, or FreeRDP. The host end lives in the CLI because only a process inside the desktop session reaches the compositor or the X server, and the lab daemon stays headless. A container's sockets live inside its root filesystem, where the program can reach them.
+The guest family comes from the machine's effective profile: a name starting with `windows` is Windows, `macos` is macOS, everything else (containers included) is Linux. A macOS guest is refused before anything else: ``` `{machine}` is a macOS guest: shared apps are not supported on macOS guests — vmlab carries waypipe and X11 from Linux guests and RDP RemoteApp from Windows ones, and macOS serves none of them; use `vmlab console` for its desktop ```. The host session comes from the command's own environment: `WAYLAND_DISPLAY` set is Wayland, else `DISPLAY` set is X11, else it refuses with `no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set`. Run it from a terminal inside the desktop session. The daemon opens the agent session and hands the CLI two private unix sockets, and the CLI runs the host end against them: `waypipe client`, a proxy to the X server, or FreeRDP. The host end lives in the CLI because only a process inside the desktop session reaches the compositor or the X server, and the lab daemon stays headless. A container's sockets live inside its root filesystem, where the program can reach them.
 
 | Guest | Host session | Protocol | Guest needs | Host needs |
 | --- | --- | --- | --- | --- |
@@ -633,7 +633,7 @@ Refusals (troubleshooting.md has causes and fixes):
 
 Exit status is the guest program's code (waypipe, X11) or FreeRDP's (RDP); Ctrl-C exits 130 and SIGTERM 143. Exit 2 (`invalid_argument`) is an RDP session with no account. Exit 6 (`unsupported`) is a guest with no waypipe or an agent that predates shared apps. Exit 1 (`failed`) covers the CLI's own refusals, a machine that is not running, a login that cannot be minted, Windows Home, and a host client that exits mid-session.
 
-What shared apps do not do: vmlab turns on no audio, USB or printer redirection, although the protocols can carry some of them; it writes no host launcher entries (`.desktop` files) for guest programs; macOS guests and hosts are not supported.
+What shared apps do not do: vmlab turns on no audio, USB or printer redirection, although the protocols can carry some of them; it writes no host launcher entries (`.desktop` files) for guest programs; macOS guests are refused by name, and macOS hosts are not supported.
 
 ## vmlab console
 

@@ -341,6 +341,30 @@ warning: vm "{machine}": hyperv = true is not applied — {reason}; it boots wit
 
 `vmlab up` prints this when the vm block itself sets `hyperv = true` and the launch cannot apply it; the machine boots without `hv-*` flags. The reason is one of: it runs under TCG, a `cpu_model` names the CPU, or the guest is not x86. Drop the `accel = "tcg"` or the `cpu_model`, or drop `hyperv = true` to silence it. An inherited `hyperv` is never reported.
 
+## A macOS guest hangs or panics early in boot
+
+```
+warning: vm "{machine}": a macOS guest needs KVM to ignore the MSRs it does not emulate, and this host's kvm has ignore_msrs off (/sys/module/kvm/parameters/ignore_msrs = {value}), so the guest faults during boot — set it with `echo "options kvm ignore_msrs=1 report_ignored_msrs=0" | sudo tee /etc/modprobe.d/kvm-msrs.conf` and, until the next boot, `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` (PRD §5.2)
+```
+
+The guest stops at the Apple logo, boot-loops, or kernel-panics in its first seconds. XNU reads Intel MSRs KVM does not emulate, and with `ignore_msrs` off KVM answers each with a #GP (every boot on an AMD host). `vmlab up` prints this for a VM started under KVM whose profile name starts with `macos` or whose `apple_smc` resolves on, and starts it anyway. Run both commands from the warning, then `vmlab vm restart <vm>`; `cat /sys/module/kvm/parameters/ignore_msrs` prints `Y` once it is on.
+
+## A pinned TSC was not applied
+
+```
+warning: vm "{machine}": tsc = "host" is not applied — it runs under TCG, and the frequency is read from KVM; it boots with QEMU's default TSC, which a macOS guest does not boot with (PRD §5.2)
+```
+
+`vmlab up` prints this for any VM whose `tsc` resolves to `host` and runs under TCG, inherited (usually from `macos`) or not. The frequency comes from KVM, so there is nothing to pin, and macOS does not boot without it. Find why it is on TCG: KVM unusable (the TCG warning at the top of this file), a foreign arch, or `accel = "tcg"` on some layer. At the first KVM start the frequency is read and pinned in `.vmlab/vms/<vm>/tsc-hz`.
+
+## apple_smc or tsc on a VM that is not x86
+
+```
+vm "{machine}": apple_smc = true (from {layer}) is x86 only, and this VM is {arch} (PRD §5.2)
+```
+
+The VM is refused. The same message names `tsc = "host"` when that is the field; `{layer}` is the vm block, the template, or a profile such as `macos`. Remove the field, or use a profile or template for the VM's architecture.
+
 ## The supervisor did not come up
 
 ```

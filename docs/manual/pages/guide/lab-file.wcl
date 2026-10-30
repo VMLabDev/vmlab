@@ -118,7 +118,7 @@ page guide_lab_file {
     li "A `share` that is not explicitly virtiofs, a container `volume`, or a container `port` on a machine with no NIC, because SMB shares, volumes and forwards need a segment to reach the gateway on."
     li "A container that neither declares `cpus` and `memory` nor names a profile supplying them."
     li "A playbook `var` whose name is not a WCL identifier, or is set twice on one block."
-    li "The dev-machine rules: more than one `@dev(default = true)`, a Windows `login` without a `password`, `elevated` on a Linux-family profile, and more than one `login` with `default = true` on a machine."
+    li "The dev-machine rules: more than one `@dev(default = true)`, a Windows `login` without a `password`, `elevated` on a Linux-family or macOS-family profile, and more than one `login` with `default = true` on a machine."
   }
 
   callout "What validation deliberately does not check" {

@@ -190,12 +190,13 @@ a container — every method here fails at call time with
 
 Scripted keyboard and mouse input goes through one of two transports, chosen by
 the machine's profile (host-profiles.md). The default,
-`input_transport = "qmp"`, sends QMP `send-key` events, which drive the PS/2
-keyboard. The alternative, `"vnc"`, connects to the VM's own VNC socket and
+`input_transport = "qmp"`, sends QMP `send-key` events, which reach the
+keyboard the guest reads: the PS/2 one, or the USB one `input = "usb"` adds
+(vm.md), which is not bound to the display and so takes console-less input. The alternative, `"vnc"`, connects to the VM's own VNC socket and
 sends keysyms and pointer events the way a real viewer does. The shipped
 `windows-9x` profile uses VNC because real-mode DOS and Windows 9x setup
-screens drop QMP key events between menu redraws; a USB-HID-only guest that
-ignores the PS/2 keyboard also needs it. The script API is the same either way.
+screens drop QMP key events between menu redraws. A guest that reads no PS/2
+keyboard, such as macOS, needs `input = "usb"` rather than VNC. The script API is the same either way.
 Input over the screen is how a DOS or 9x guest gets its legacy agent installed in
 the first place; once it answers, `exec` is available on that guest too (see
 host-profiles.md, `agent_transport`).

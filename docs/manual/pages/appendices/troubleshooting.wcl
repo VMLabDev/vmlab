@@ -804,6 +804,54 @@ MSG
     inherits from a profile or a template is not reported.
   DOC
 
+  h2 "A macOS guest hangs or panics early in boot"
+  code text { source = "warning: vm \"{machine}\": a macOS guest needs KVM to ignore the MSRs it does not emulate, and this host's kvm has ignore_msrs off (/sys/module/kvm/parameters/ignore_msrs = {value}), so the guest faults during boot — set it with `echo \"options kvm ignore_msrs=1 report_ignored_msrs=0\" | sudo tee /etc/modprobe.d/kvm-msrs.conf` and, until the next boot, `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` (PRD §5.2)" }
+  p <<DOC
+    The symptom is a macOS guest that stops at the Apple logo, reboots in a
+    loop, or shows a kernel panic within the first seconds of boot. XNU reads
+    Intel model-specific registers that KVM does not emulate, and unless the
+    `kvm` module's `ignore_msrs` parameter is on, KVM answers each read with a
+    general-protection fault. On an AMD host that happens on every boot.
+    `vmlab up` prints the warning above for any VM it starts under KVM whose
+    profile name starts with `macos` or whose `apple_smc` resolves on, but it
+    still starts the VM.
+  DOC
+  p <<DOC
+    Run both commands from the warning: the first makes the setting permanent
+    from the next module load, and the second turns it on now. Then restart
+    the VM with `vmlab vm restart`. `cat /sys/module/kvm/parameters/ignore_msrs`
+    prints `Y` once it is on. `report_ignored_msrs=0` keeps the kernel log
+    free of a line for every ignored read. See
+    [Host configuration and WSL 2](guide_host).
+  DOC
+
+  h2 "A pinned TSC was not applied"
+  code text { source = "warning: vm \"{machine}\": tsc = \"host\" is not applied — it runs under TCG, and the frequency is read from KVM; it boots with QEMU's default TSC, which a macOS guest does not boot with (PRD §5.2)" }
+  p <<DOC
+    `vmlab up` prints this for a VM whose `tsc` resolves to `host` and that
+    runs under TCG. The warning appears whether the VM block set `tsc` or
+    inherited it, which for a macOS guest is usually from the `macos`
+    profile. vmlab reads the host's TSC frequency from KVM, so under TCG
+    there is nothing to pin: the VM boots with QEMU's default TSC and no
+    `+invtsc`, and macOS does not boot that way. The VM runs under TCG
+    because KVM is unusable (see
+    [KVM is unavailable and the guest runs under TCG](apx_troubleshooting)),
+    because the guest architecture is not the host's, or because a layer
+    sets `accel = "tcg"`. Fix the cause and start the VM again; the
+    frequency is read and pinned at its first KVM start.
+  DOC
+
+  h2 "apple_smc or tsc on a VM that is not x86"
+  code text { source = "vm \"{machine}\": apple_smc = true (from {layer}) is x86 only, and this VM is {arch} (PRD §5.2)" }
+  p <<DOC
+    The Apple SMC is an ISA device and `tsc-frequency` an x86 CPU property,
+    so a VM of another architecture cannot carry either, and the VM is
+    refused. The same message names `tsc = "host"` when that is the field.
+    The layer in braces says where the value came from: the vm block, the
+    template, or a profile such as `macos`. Remove the field, or pick a
+    profile or template meant for the VM's architecture.
+  DOC
+
   h2 "The supervisor did not come up"
   code text { source = "supervisor did not come up — check ~/.local/state/vmlab/vmlabd.log" }
   p <<DOC
