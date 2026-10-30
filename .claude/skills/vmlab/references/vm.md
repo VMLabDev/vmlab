@@ -493,7 +493,7 @@ var "join_password" { value = "Pa55w0rd!" secret = true }
 | --- | --- | --- | --- |
 | `name` | utf8 (label) | required | Variable name; must be a WCL identifier. The inline block label. |
 | `value` | utf8 | required | Value, passed through verbatim. config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise. |
-| `secret` | bool | `false` | Treat the value as a secret: vmlab prints `***` in its place in run output, the lab log, `playbook.op.*` events, errors and `vmlab playbook list`. |
+| `secret` | bool | `false` | Treat the value as a secret: it reaches config-weave in a separate `--secret-var-file`, which config-weave 0.12.2 and later scrub from their own output, and vmlab prints `***` in its place in run output, the lab log, `playbook.op.*` events, errors and `vmlab playbook list`. |
 
 Validation requires the name to be letters, digits and underscores, not starting
 with a digit, because config-weave binds each override as a `let` inside the

@@ -4,10 +4,13 @@
 //! The variables never ride the guest command line, where the guest's process
 //! list shows them and every error that quotes the command repeats them: they
 //! travel in a `--var-file` ([`var_file_source`]) written into a private guest
-//! directory for the run and removed after it. A `secret = true` value is
-//! then kept out of everything the run emits by one [`Redactor`], which the
-//! run engine puts between the run and every line, event, report and error
-//! that leaves it.
+//! directory for the run and removed after it. A `secret = true` value
+//! travels in a second file, handed over with `--secret-var-file`, so that
+//! config-weave scrubs it from everything it writes itself — its `--log-file`
+//! included — wherever the binary takes that flag ([`SecretVarFile`]). vmlab
+//! keeps it out of everything the run emits regardless, by one [`Redactor`]
+//! which the run engine puts between the run and every line, event, report
+//! and error that leaves it.
 
 use serde_json::Value;
 
@@ -30,14 +33,106 @@ pub fn listed(vars: &[PlaybookVar]) -> Value {
         .collect()
 }
 
-/// The `--var-file` for `vars`: one top-level `name = value` field each, in
-/// declaration order.
+/// The first config-weave release that takes `--secret-var-file`
+/// (config-weave#13), as (major, minor, patch). config-weave ships every
+/// release as a pre-release (`0.12.2-alpha`), so the pre-release tag is not
+/// compared.
+pub const SECRET_VAR_FILE_SINCE: (u64, u64, u64) = (0, 12, 2);
+
+/// Whether the config-weave binary a run uses takes `--secret-var-file`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretVarFile {
+    /// Secret variables go in their own file, which config-weave scrubs
+    /// from all of its output.
+    Supported,
+    /// An older binary: every variable shares the one `--var-file`, and
+    /// only vmlab's [`Redactor`] stands between a secret and the output.
+    /// `found` is what the binary said its version was, when it said.
+    Unsupported { found: Option<String> },
+}
+
+/// The answer from `<bin> version`, the probe every run already makes
+/// before it uses a binary. `None` when the output names no version vmlab
+/// can read — a custom build — and only `--help` can tell
+/// ([`secret_var_file_by_help`]).
+pub fn secret_var_file_by_version(version_out: &str) -> Option<SecretVarFile> {
+    let found = version_out
+        .split_whitespace()
+        .skip_while(|w| *w != "config-weave")
+        .nth(1)?;
+    let core = found.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let version = (parts.next()??, parts.next()??, parts.next()??);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(if version >= SECRET_VAR_FILE_SINCE {
+        SecretVarFile::Supported
+    } else {
+        SecretVarFile::Unsupported {
+            found: Some(found.to_string()),
+        }
+    })
+}
+
+/// The answer from `<bin> --help` (`None` when it could not be run): the
+/// flag is there or it is not.
+pub fn secret_var_file_by_help(help_out: Option<&str>) -> SecretVarFile {
+    if help_out.is_some_and(|h| h.contains("--secret-var-file")) {
+        SecretVarFile::Supported
+    } else {
+        SecretVarFile::Unsupported { found: None }
+    }
+}
+
+/// The one line a run prints when it has secret variables and a binary too
+/// old to take them apart, naming the release that would. `None` otherwise.
+pub fn secret_var_file_notice(vars: &[PlaybookVar], support: &SecretVarFile) -> Option<String> {
+    let SecretVarFile::Unsupported { found } = support else {
+        return None;
+    };
+    if !vars.iter().any(|v| v.secret) {
+        return None;
+    }
+    let (major, minor, patch) = SECRET_VAR_FILE_SINCE;
+    let found = match found {
+        Some(v) => format!("config-weave {v}"),
+        None => "this config-weave".to_string(),
+    };
+    Some(format!(
+        "{found} has no --secret-var-file, so its own logs (--log-file) do not scrub secret \
+         variables; config-weave {major}.{minor}.{patch} or later does (vmlab still redacts \
+         everything the run sends it)"
+    ))
+}
+
+/// A run's variables, split between the two files config-weave is handed:
+/// the secret ones get their own where the binary takes it, and share the
+/// ordinary one where it does not. Declaration order is kept in each.
+#[derive(Debug, Default)]
+pub struct VarFiles<'a> {
+    /// Into `--var-file`.
+    pub plain: Vec<&'a PlaybookVar>,
+    /// Into `--secret-var-file`.
+    pub secret: Vec<&'a PlaybookVar>,
+}
+
+pub fn split_vars<'a>(vars: &'a [PlaybookVar], support: &SecretVarFile) -> VarFiles<'a> {
+    let (secret, plain) = vars
+        .iter()
+        .partition(|v| v.secret && *support == SecretVarFile::Supported);
+    VarFiles { plain, secret }
+}
+
+/// A var file for `vars`: one top-level `name = value` field each, in
+/// declaration order. The same source serves `--var-file` and
+/// `--secret-var-file`, which config-weave loads alike.
 ///
 /// config-weave reads a `--var` value as a WCL expression where it can and
 /// as a string otherwise, but a var file only as an expression — so a value
 /// that does not evaluate on its own goes in as a quoted string, which is
 /// what `--var` would have made of it.
-pub fn var_file_source(vars: &[PlaybookVar]) -> String {
+pub fn var_file_source<'a>(vars: impl IntoIterator<Item = &'a PlaybookVar>) -> String {
     let mut out = String::from("// Written by vmlab for one config-weave run, then removed.\n");
     for var in vars {
         out.push_str(&var.name);
@@ -325,6 +420,110 @@ mod tests {
                 {"name": "tz", "value": "UTC", "secret": false},
                 {"name": "pw", "value": "***", "secret": true},
             ])
+        );
+    }
+
+    /// Read from the `version` probe every run already makes: 0.12.2 and
+    /// later — pre-release tag or not — take the flag, older ones do not,
+    /// and output that names no version leaves it to `--help`.
+    #[test]
+    fn support_is_read_from_the_version() {
+        use SecretVarFile::*;
+        let v = secret_var_file_by_version;
+        assert_eq!(v("config-weave 0.12.2-alpha\n"), Some(Supported));
+        assert_eq!(v("config-weave 0.12.2"), Some(Supported));
+        assert_eq!(v("config-weave 0.13.0-alpha"), Some(Supported));
+        assert_eq!(v("config-weave 1.0.0+build.7"), Some(Supported));
+        assert_eq!(
+            v("config-weave 0.11.0-alpha\n"),
+            Some(Unsupported {
+                found: Some("0.11.0-alpha".into())
+            })
+        );
+        assert_eq!(
+            v("config-weave 0.12.1"),
+            Some(Unsupported {
+                found: Some("0.12.1".into())
+            })
+        );
+        assert_eq!(v("my-weave build abc123"), None);
+        assert_eq!(v("config-weave dev"), None);
+        assert_eq!(v("config-weave 0.12"), None);
+        assert_eq!(v("config-weave 0.12.2.1"), None);
+        assert_eq!(v(""), None);
+    }
+
+    #[test]
+    fn support_is_read_from_the_help_when_the_version_says_nothing() {
+        let help = "      --var-file <PATH>  Merge\n      --secret-var-file <PATH>  Like";
+        assert_eq!(
+            secret_var_file_by_help(Some(help)),
+            SecretVarFile::Supported
+        );
+        assert_eq!(
+            secret_var_file_by_help(Some("      --var-file <PATH>  Merge")),
+            SecretVarFile::Unsupported { found: None }
+        );
+        assert_eq!(
+            secret_var_file_by_help(None),
+            SecretVarFile::Unsupported { found: None }
+        );
+    }
+
+    /// Secret variables get the second file only from a binary that takes
+    /// it; no name lands in both, which config-weave refuses.
+    #[test]
+    fn secrets_split_into_their_own_file_where_supported() {
+        let vars = vec![
+            var("tz", "UTC", false),
+            var("pw", "s3cr3t", true),
+            var("domain", "corp", false),
+            var("token", "tok", true),
+        ];
+        let names = |v: &[&PlaybookVar]| v.iter().map(|v| v.name.clone()).collect::<Vec<_>>();
+        let split = split_vars(&vars, &SecretVarFile::Supported);
+        assert_eq!(names(&split.plain), ["tz", "domain"]);
+        assert_eq!(names(&split.secret), ["pw", "token"]);
+        let old = SecretVarFile::Unsupported { found: None };
+        let split = split_vars(&vars, &old);
+        assert_eq!(names(&split.plain), ["tz", "pw", "domain", "token"]);
+        assert!(split.secret.is_empty());
+        let source = var_file_source(split_vars(&vars, &SecretVarFile::Supported).secret);
+        assert_eq!(
+            read_back(&source)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            ["pw", "token"]
+        );
+    }
+
+    /// One line, only for an old binary with secrets to hand it, naming
+    /// what it found and the release that would scrub them.
+    #[test]
+    fn the_fallback_notice_names_the_version_needed() {
+        let secret = [var("pw", "s3cr3t", true)];
+        let plain = [var("tz", "UTC", false)];
+        let old = SecretVarFile::Unsupported {
+            found: Some("0.11.0-alpha".into()),
+        };
+        let note = secret_var_file_notice(&secret, &old).unwrap();
+        assert!(
+            note.starts_with("config-weave 0.11.0-alpha has no --secret-var-file"),
+            "{note}"
+        );
+        assert!(note.contains("config-weave 0.12.2 or later"), "{note}");
+        assert!(!note.contains('\n'));
+        let unknown = SecretVarFile::Unsupported { found: None };
+        assert!(
+            secret_var_file_notice(&secret, &unknown)
+                .unwrap()
+                .starts_with("this config-weave has no")
+        );
+        assert_eq!(secret_var_file_notice(&plain, &old), None);
+        assert_eq!(
+            secret_var_file_notice(&secret, &SecretVarFile::Supported),
+            None
         );
     }
 
