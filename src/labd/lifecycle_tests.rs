@@ -1391,6 +1391,97 @@ async fn a_guest_that_ignores_acpi_ends_at_a_clean_quit() {
     assert_eq!(exit.status, "exit status: 0", "quit, not killed");
 }
 
+/// A booting guest whose agent has not answered yet is not power-cut: the
+/// stop waits for the agent its template sealed and asks it, rather than
+/// skipping to ACPI and the quit — which is what `vmlab down` right after
+/// `vmlab up` used to do. The guest here ignores ACPI and the emulator
+/// ignores `quit`, so only the agent rung ends it cleanly.
+#[tokio::test]
+async fn a_booting_guest_is_stopped_through_its_agent_once_it_answers() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                agent_answers_after: Some(Duration::from_secs(2)),
+                ignores_powerdown: true,
+                ignores_quit: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    assert!(!vm.is_agent_up().await, "still booting");
+
+    vm.stop(false).await.expect("graceful stop");
+
+    let exit = observed.exit().await;
+    assert_eq!(exit.reason, StopReason::Requested);
+    assert_eq!(exit.status, "exit status: 0", "the agent shut it down");
+}
+
+/// The wait is bounded where ACPI would work: an agent that takes longer
+/// than [`BOOTING_AGENT_WAIT`] is given up on, and the ladder goes on down.
+///
+/// [`BOOTING_AGENT_WAIT`]: super::stop_plan::BOOTING_AGENT_WAIT
+#[tokio::test(start_paused = true)]
+async fn a_booting_guest_waits_only_so_long_for_its_agent() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                agent_answers_after: Some(Duration::from_secs(300)),
+                ignores_powerdown: true,
+                ignores_quit: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+
+    vm.stop(false).await.expect("graceful stop");
+
+    let exit = observed.exit().await;
+    assert_eq!(exit.status, "signal: 9", "gave up on the agent and killed");
+}
+
+/// A guest that ignores ACPI (`acpi_shutdown = false`, macOS) is stopped
+/// through its agent too, booting or not; how much longer it is waited for
+/// than a guest the power button would stop is the plan's
+/// (`stop_plan::tests`).
+#[tokio::test]
+async fn a_booting_guest_that_ignores_acpi_is_stopped_through_its_agent() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        r#"vm "mac" { template = "scratch" arch = "x86_64" profile = "macos" disk = 10GiB }"#,
+        Script {
+            runs: vec![Run {
+                agent_answers_after: Some(Duration::from_secs(2)),
+                ignores_powerdown: true,
+                ignores_quit: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    assert!(!vm.template().resolved.acpi_shutdown);
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+
+    vm.stop(false).await.expect("graceful stop");
+
+    let exit = observed.exit().await;
+    assert_eq!(exit.status, "exit status: 0", "the agent shut it down");
+}
+
 /// A forced stop skips the graceful rungs outright. That is the whole of the
 /// flag's contract: a caller who says `force` is saying "I am not waiting for
 /// this guest", and a machine wedged mid-boot has no agent and no ACPI to
@@ -2073,6 +2164,77 @@ async fn a_stale_agent_is_refreshed_and_a_failed_refresh_only_warns() {
     );
 
     vm.stop(true).await.expect("stop");
+}
+
+/// **A refresh cut short by a stop is said quietly and accurately.** The
+/// refresh waits for the agent; the machine is stopped before it answers.
+/// Nothing was pushed and nothing went wrong, so `up`'s output carries no
+/// `warning:`, and `machine.agent_updated` says the machine stopped rather
+/// than reporting the wait's own error as a failure.
+#[tokio::test]
+async fn a_refresh_cut_short_by_a_stop_is_a_quiet_event() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                agent_answers_after: Some(Duration::from_secs(3600)),
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let config = crate::config::load_lab_source(
+        &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
+        "<test>",
+        &dirs.root,
+    )
+    .expect("lab source");
+    let lab = super::lab::LabRuntime::with_machines(config, vec![vm.clone()]).expect("runtime");
+    lab.agent_updates.store(true, Ordering::Relaxed);
+    let mut events = lab.events.subscribe();
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+
+    let binary = dirs.root.join("vmlab-agent");
+    std::fs::write(&binary, b"a newer agent").expect("asset");
+    let said = Arc::new(std::sync::Mutex::new(String::new()));
+    let sink: crate::scripting::OutputSink = {
+        let said = said.clone();
+        Arc::new(move |s: String| said.lock().expect("said").push_str(&s))
+    };
+    let refresh = {
+        let (lab, m) = (lab.clone(), m.clone());
+        tokio::spawn(async move {
+            lab.refresh_agent_with(&m, &sink, move |_: &dyn Machine| {
+                Ok(crate::agent_asset::AgentAsset {
+                    path: binary.clone(),
+                    version: "agent=new".into(),
+                })
+            })
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    vm.stop(true).await.expect("stop");
+    refresh.await.expect("refresh task");
+
+    assert_eq!(*said.lock().unwrap(), "", "no warning for a stop");
+    let event = collect_events(&mut events, &["machine.agent_updated"], 1)
+        .await
+        .remove(0);
+    assert_eq!(event.data["ok"], false, "{}", event.data);
+    assert_eq!(event.data["stopped"], true, "{}", event.data);
+    assert!(event.data["from"].is_null(), "{}", event.data);
+    assert!(
+        event.data["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("stopped before its agent answered")),
+        "{}",
+        event.data
+    );
 }
 
 // ---- readiness and the deferred agent refresh (§19.4) -------------------------

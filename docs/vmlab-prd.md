@@ -327,11 +327,11 @@ Profiles bundle known-good hardware defaults. Starter set (final list and exact 
 
 Profiles are data, not code: shipped as WCL, user-overridable and user-extensible from a profiles directory in XDG config.
 
-Besides hardware, a profile may carry guest-OS-shaped defaults a lab would otherwise repeat: `workspace_guest` (§19.1) and `playbook_dir`, the guest directory a `playbook {}` block pushes into when it names no `guest_dir` (§5.1) — so a profile for a read-only-root image fixes it for every lab. It must be an absolute guest path.
+Besides hardware, a profile says how its guest behaves when stopped: `acpi_shutdown` (default `true`) is whether it shuts down on an ACPI power-button press, which the graceful stop ladder plans from (§7.2). Besides that, a profile may carry guest-OS-shaped defaults a lab would otherwise repeat: `workspace_guest` (§19.1) and `playbook_dir`, the guest directory a `playbook {}` block pushes into when it names no `guest_dir` (§5.1) — so a profile for a read-only-root image fixes it for every lab. It must be an absolute guest path.
 
 #### macOS guests
 
-The `macos` profile boots Intel macOS (Tahoe and earlier) through OpenCore. **OpenCore is not vmlab's**: the template carries it in its disk's EFI system partition, and OVMF boots it like any UEFI application. The profile is the command line that boots it: `machine = "q35"`, `firmware = "ovmf"`, `secure_boot = false`, `tpm = false`, `disk_bus = "sata"` (macOS's own AHCI driver — OpenCore does not boot from AppleVirtIO's block personality), `nic_model = "virtio-net-pci"` (native from Big Sur on; it and the agent's virtio-serial port sit on `pcie.0`, where QEMU keeps them transitional, the only mode AppleVirtIO drives), `display = "vmware"` (there is no Apple virtio GPU driver on x86; the screen is OpenCore's GOP mode, 1280×800), `cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"` (a model macOS supports, the TSX flags it lacks off, and the VMware CPUID leaf XNU reads its TSC and bus frequencies from), `hyperv = false`, `apple_smc = true`, `input = "usb"`, `tsc = "host"` (§5.2), `cpus = 4`, `memory = 8GiB`, `workspace_guest = "/Users/Shared/src"`. It leaves the `virtiofs` capability off.
+The `macos` profile boots Intel macOS (Tahoe and earlier) through OpenCore. **OpenCore is not vmlab's**: the template carries it in its disk's EFI system partition, and OVMF boots it like any UEFI application. The profile is the command line that boots it: `machine = "q35"`, `firmware = "ovmf"`, `secure_boot = false`, `tpm = false`, `disk_bus = "sata"` (macOS's own AHCI driver — OpenCore does not boot from AppleVirtIO's block personality), `nic_model = "virtio-net-pci"` (native from Big Sur on; it and the agent's virtio-serial port sit on `pcie.0`, where QEMU keeps them transitional, the only mode AppleVirtIO drives), `display = "vmware"` (there is no Apple virtio GPU driver on x86; the screen is OpenCore's GOP mode, 1280×800), `cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"` (a model macOS supports, the TSX flags it lacks off, and the VMware CPUID leaf XNU reads its TSC and bus frequencies from), `hyperv = false`, `apple_smc = true`, `input = "usb"`, `tsc = "host"` (§5.2), `cpus = 4`, `memory = 8GiB`, `workspace_guest = "/Users/Shared/src"`, and `acpi_shutdown = false`: macOS does not act on the ACPI power button, so its graceful stop is the agent's (§7.2). It leaves the `virtiofs` capability off.
 
 **The family.** A profile whose name starts with `macos` makes the machine a macOS guest, the way `windows…` makes a Windows one; vmlab's own surfaces then behave as follows.
 
@@ -475,7 +475,7 @@ A variant's overlay holds only its delta from the base. The backing path is rela
 
 ### 7.2 Power operations
 
-`start`, graceful `stop` (guest-agent shutdown, falling back to ACPI, falling back to a QMP `quit` that flushes the disk caches, falling back to hard kill after a timeout), `force stop`, `restart`. Two keys on a `vm` or `container` block order `up`, each a list of VM or container names:
+`start`, graceful `stop` (guest-agent shutdown, falling back to ACPI, falling back to a QMP `quit` that flushes the disk caches, falling back to hard kill after a timeout), `force stop`, `restart`. **A guest still booting is stopped through its agent too**: `up` returns before a clone's agent answers, and a stop that skipped the agent rung then would end, for a guest that ignores the power button, in the quit — a power cut. So where the template sealed an agent and it has not answered yet, the stop waits for it before asking: up to a minute, then ACPI, on a guest whose profile has `acpi_shutdown` on; as long as readiness itself would wait (§7.4), with no ACPI rung and two minutes for the guest to power off, on one whose profile has it off (macOS, §5.3). A machine with no sealed agent goes to ACPI at once, as before. The rungs and their waits are a value computed before the ladder starts (ADR-0003). Two keys on a `vm` or `container` block order `up`, each a list of VM or container names:
 
 - **`depends_on`** is start order. A machine starts once every machine it names is **ready** (a VM's agent answers, §7.4; a container passes its healthcheck, §18). It does not wait for their provisioning. Machines whose dependencies are satisfied start in parallel. `down` stops in the reverse of this order.
 - **`depends_on_provision`** is provisioning order. A machine's first provision or playbook step waits until every machine it names has finished all of its own steps. It does not delay the machine's start: the two can boot together. A named machine with no steps counts as finished once it has started and is ready, so a dependent never provisions against a machine that has not come up.
@@ -1517,7 +1517,9 @@ callers, there being no readiness left to hold. A
 refresh **never fails `up`**: a
 failure is a `warning:` naming the machine and the reason, the event carries
 the error, and the binary was staged beside the running one, so the old agent
-is left in place. It is skipped silently where it cannot apply — a container
+is left in place. A machine stopped while its refresh still waited for the
+agent is not a failure: nothing was pushed, so there is no `warning:`, and the
+event says so — `ok = false` with `stopped = true`. It is skipped silently where it cannot apply — a container
 (below), the legacy tier (§7.4), a machine whose artefact sealed no agent, or
 no shipped asset for the guest's OS and arch — and is off inside a template
 build, which seals the agent it staged. This trades *same template → same
