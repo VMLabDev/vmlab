@@ -267,8 +267,10 @@ TXT
     first-boot script, no provision or playbook and nothing depending on it is
     refreshed in the background when its agent first answers, after `up` has
     returned. Its line goes to the lab daemon's log instead of your terminal;
-    the event and `diverged=yes` report it as usual. `vmlab vm start` always
-    refreshes this way. A guest that never answers is never waited for.
+    the event and `diverged=yes` report it as usual. `vmlab vm start`
+    refreshes this way too, except for a clone still owing its first-boot
+    script, which it runs and then refreshes inline, as `up` does. A guest
+    that never answers is never waited for.
   DOC
   p <<DOC
     A VM being refreshed, inline by `up` or in the background, is not
@@ -308,7 +310,9 @@ TXT
     A refresh never fails `up`. If it fails, `up` prints a `warning:` line
     that names the VM and the reason, emits `machine.agent_updated` with the
     error, and continues. The new binary is staged beside the installed one,
-    so a push that fails leaves the old agent running. Containers are never
+    so a push that fails leaves the old agent running. A VM stopped while its
+    refresh still waits for the agent is not a failure: nothing was pushed, no
+    warning is printed, and the event carries `stopped = true`. Containers are never
     refreshed, because their agent ships with this vmlab. Guests on the legacy
     agent tier are never refreshed either, because nothing can replace that
     agent over its own channel. A VM whose template sealed no agent is

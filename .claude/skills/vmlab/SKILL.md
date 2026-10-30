@@ -42,7 +42,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | Containers as lab machines, the micro-VM model, the `container {}` block | `references/containers.md` |
 | Segments, DHCP, DNS, NAT, routing, traffic rules, the eBPF fast path | `references/networking.md` |
 | Port forwards and their host ports: automatic ports, port slots, `vmlab port` | `references/networking.md`, `references/cli-machine.md` |
-| Templates, the store, builds, `source {}`, linked clones, scratch VMs, OCI distribution, and the published templates anyone can pull (`ghcr.io/vmlabdev/vmlab-templates`, Windows included) | `references/templates.md` |
+| Templates, the store, builds, watching or unsticking a running build (`build-<arch>-<name>/build`, `template status`), `source {}`, linked clones, scratch VMs, OCI distribution, and the published templates anyone can pull (`ghcr.io/vmlabdev/vmlab-templates`, Windows included) | `references/templates.md` |
 | The wscript language: types, control flow, matching, modules, stdlib | `references/wscript-language.md` |
 | wscript `Lab`, `Segment`, `Term` and `Recording` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `UsbDevice`, `Event`) | `references/wscript-lab-api.md` |
 | wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots, host USB, console recording (`record`) | `references/wscript-machine-api.md` |
@@ -56,6 +56,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | Snapshots, screenshots, console recording, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |
 | Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
 | The host config file, WSL 2, guest OS profiles, `vmlab osinfo` | `references/host-profiles.md` |
+| Which hypervisor runs a machine: `hypervisor = "qemu" \| "vmlab"`, the host's `hypervisor {}` defaults, vmlab-hv and what it refuses | `references/host-profiles.md`, `references/containers.md`, `references/snapshots-vision.md` |
 | Old and odd guests: the legacy agent tier (DOS, Windows 9x, NT4–XP), TempleOS, `cpu_model`, `accel` | `references/host-profiles.md`, `references/templates.md` |
 | Host USB passthrough: `usb = true`, `vmlab usb`, selectors | `references/cli-machine.md`, `references/vm.md` |
 | Lab-level CLI verbs: `up`, `down`, `status`, `validate`, `destroy`, `pull`, `lab`, `worktree`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script` | `references/cli-lab.md` |

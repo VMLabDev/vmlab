@@ -108,6 +108,12 @@ pub struct LabRuntime {
     /// ready (or, inline, finishing), so a refresh runs at most once per
     /// start. Only eligible machines are ever entered.
     deferred_refresh: std::sync::Mutex<HashMap<String, OwedRefresh>>,
+    /// Machines whose template first boot (§6.1) is running now. `up`, `vm
+    /// start`, `vm restart` and wscript's `start()`/`restart()` each run a
+    /// pending one, so this is what keeps it to one run at a time: a second
+    /// starter, or a first-boot script restarting its own guest, finds it
+    /// claimed and leaves it to the run that holds it.
+    first_boots: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Host USB passthrough's lab-wide half (§5.2.1): where the host's
     /// devices are read from, the lock serialising attaches, and the
     /// unplug watch.
@@ -559,6 +565,7 @@ impl LabRuntime {
             provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
             agent_updates: std::sync::atomic::AtomicBool::new(true),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
+            first_boots: std::sync::Mutex::default(),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -633,6 +640,7 @@ impl LabRuntime {
             // it on and supply their own asset.
             agent_updates: std::sync::atomic::AtomicBool::new(false),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
+            first_boots: std::sync::Mutex::default(),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -1633,7 +1641,8 @@ impl LabRuntime {
         // instead of being handed the channel the push then restarts. A
         // machine found current releases it a handshake later.
         if let Err(e) = m.wait_agent_up(m.ready_timeout()).await {
-            self.agent_update_failed(&name, None, &asset.version, &e, output);
+            self.agent_update_unreached(m.as_ref(), &asset.version, &e, output)
+                .await;
             return;
         }
         let replacing = m.begin_agent_replacement().await;
@@ -1643,7 +1652,8 @@ impl LabRuntime {
         {
             Ok(agent) => agent.info().agent_version.clone(),
             Err(e) => {
-                self.agent_update_failed(&name, None, &asset.version, &e, output);
+                self.agent_update_unreached(m.as_ref(), &asset.version, &e, output)
+                    .await;
                 return;
             }
         };
@@ -1691,6 +1701,33 @@ impl LabRuntime {
         output(format!("agent: updated \"{name}\" ({from} → {pushed})\n"));
     }
 
+    /// A refresh that gave up waiting for the agent, before anything was
+    /// pushed: a failure where the machine is still up, but a quiet,
+    /// accurate event where it was stopped under the refresh — `ok = false`
+    /// with `stopped = true`, nothing on the caller's output, and a line in
+    /// the daemon log.
+    async fn agent_update_unreached(
+        &self,
+        m: &dyn Machine,
+        to: &str,
+        e: &anyhow::Error,
+        output: &crate::scripting::OutputSink,
+    ) {
+        use super::agent_repair::{Unreached, unreached};
+        let name = m.name();
+        match unreached(m.state().await) {
+            Unreached::Failed => self.agent_update_failed(name, None, to, e, output),
+            Unreached::Stopped => {
+                tracing::info!(machine = %name, "agent refresh: the machine stopped before its agent answered; nothing was pushed");
+                self.events.emit(
+                    "machine.agent_updated",
+                    json!({"vm": name, "machine": name, "from": null, "to": to, "ok": false, "stopped": true,
+                           "error": format!("{name} stopped before its agent answered; nothing was pushed")}),
+                );
+            }
+        }
+    }
+
     /// The failed refresh: said, evented, and survived.
     fn agent_update_failed(
         &self,
@@ -1714,14 +1751,37 @@ impl LabRuntime {
         );
     }
 
-    /// Stop a machine, wait for the exit monitor to settle, and boot it again.
-    pub async fn restart_machine(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
+    /// Stop a machine, wait for the exit monitor to settle, and boot it again,
+    /// running its template's first boot when one is still owed (§6.1).
+    pub async fn restart_machine(
+        self: &Arc<Self>,
+        name: &str,
+        force: bool,
+        output: &crate::scripting::OutputSink,
+    ) -> Result<()> {
         let m = self.machine(name)?;
         m.stop(force).await?;
         m.wait_state(PowerState::Stopped, Duration::from_secs(60))
             .await
             .map_err(|_| anyhow!("{name} did not stop for restart"))?;
-        self.start_machine(name).await
+        self.start_machine(name).await?;
+        self.run_owed_first_boot(name, output).await
+    }
+
+    /// Run `name`'s template first boot if it still owes one — the clone's
+    /// `firstboot.done` marker is missing — the way `up` does: the script,
+    /// then the agent refresh, then readiness (§6.1). For the starts outside
+    /// `up`: `vm start`, `vm restart` and wscript's `start()`/`restart()`.
+    /// Without it such a machine never reports ready, since only a finished
+    /// first boot can make it so. A no-op for every other machine.
+    pub async fn run_owed_first_boot(
+        self: &Arc<Self>,
+        name: &str,
+        output: &crate::scripting::OutputSink,
+    ) -> Result<()> {
+        // The instance that booted: a reload may have rebuilt it (§7.1).
+        let m = self.machine(name)?;
+        self.run_first_boot(&m, output).await
     }
 
     /// What the running network knows about `scope`'s machines — the only
@@ -2493,16 +2553,26 @@ impl LabRuntime {
     /// For a pending first-boot it waits for the guest agent, runs the embedded
     /// script scoped to this machine (reached via `lab.this_vm()`), then marks
     /// the machine ready and emits the ready event. Any error or the overall
-    /// timeout fails `up` and leaves the machine running for inspection.
+    /// timeout fails the caller — `up`, `vm start`, `vm restart` — and leaves
+    /// the machine running for inspection; the marker is not written, so the
+    /// next start runs it again.
+    ///
+    /// A first boot already running for this machine is that run's to finish
+    /// (see [`first_boots`](Self::first_boots)): this returns at once.
     async fn run_first_boot(
         self: &Arc<Self>,
         m: &Arc<dyn Machine>,
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
+        let name = m.name();
+        // Claimed before it is asked for, so a run that has just finished
+        // is seen to have.
+        let Some(_claim) = FirstBootClaim::take(self, name) else {
+            return Ok(());
+        };
         let Some(first_boot) = m.pending_first_boot() else {
             return Ok(());
         };
-        let name = m.name();
 
         crate::scripting::ensure_wscript_surface_supported(
             &first_boot.template,
@@ -3343,6 +3413,33 @@ impl LabRuntime {
 /// How long teardown waits for a machine's exit monitor to settle before
 /// removing what the machine was using.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A machine's place in [`LabRuntime::first_boots`], held for as long as its
+/// first boot runs and given back on drop, however that run ends.
+struct FirstBootClaim<'a> {
+    lab: &'a LabRuntime,
+    machine: String,
+}
+
+impl<'a> FirstBootClaim<'a> {
+    /// The claim on `machine`'s first boot, or `None` when a run already
+    /// holds it.
+    fn take(lab: &'a LabRuntime, machine: &str) -> Option<Self> {
+        lab.first_boots
+            .lock_recover()
+            .insert(machine.to_string())
+            .then(|| Self {
+                lab,
+                machine: machine.to_string(),
+            })
+    }
+}
+
+impl Drop for FirstBootClaim<'_> {
+    fn drop(&mut self) {
+        self.lab.first_boots.lock_recover().remove(&self.machine);
+    }
+}
 
 /// Who runs the agent refresh a machine's readiness waits on (§19.4).
 enum OwedRefresh {
@@ -5032,6 +5129,129 @@ lab "t" {
         (sink, said)
     }
 
+    /// A lab of one VM, "win", whose clone still owes the first boot
+    /// `script` (its `firstboot.done` marker missing).
+    fn owing_first_boot(dir: &std::path::Path, sh: &Shared, script: &str) -> Arc<LabRuntime> {
+        lab_of(
+            dir,
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "win" { template = "x86_64/t" }
+}"#,
+            vec![FakeMachine::sharing(
+                "win",
+                sh,
+                Duration::from_millis(0),
+                Duration::from_secs(10),
+                Some(script),
+            )],
+        )
+    }
+
+    /// How many times `said` reports a first boot starting.
+    fn first_boots_run(said: &Said) -> usize {
+        said.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.starts_with("first-boot: provisioning win"))
+            .count()
+    }
+
+    const FIRST_BOOT: &str = "use vmlab\n\nfn main(lab: Lab) {\n    vmlab::sleep_ms(300)\n}\n";
+
+    /// A start outside `up` runs a first boot the clone still owes, as `up`
+    /// would, and the machine ends ready; once run, it is not run again (V6).
+    #[tokio::test]
+    async fn a_start_outside_up_runs_an_owed_first_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = owing_first_boot(dir.path(), &sh, FIRST_BOOT);
+        let (sink, said) = numbered(&sh);
+        lab.start_machine("win").await.unwrap();
+        let m = lab.machine("win").unwrap();
+        assert!(!m.is_ready().await, "ready before its first boot ran");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            lab.run_owed_first_boot("win", &sink),
+        )
+        .await
+        .expect("first boot finishes")
+        .unwrap();
+        assert!(m.pending_first_boot().is_none());
+        assert!(m.is_ready().await, "not ready after its first boot");
+        assert_eq!(first_boots_run(&said), 1);
+
+        lab.restart_machine("win", false, &sink).await.unwrap();
+        assert_eq!(first_boots_run(&said), 1, "the first boot ran twice");
+    }
+
+    /// `vm restart` of a machine still owing its first boot runs it (V6).
+    #[tokio::test]
+    async fn a_restart_runs_an_owed_first_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = owing_first_boot(dir.path(), &sh, FIRST_BOOT);
+        let (sink, said) = numbered(&sh);
+        lab.start_machine("win").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            lab.restart_machine("win", false, &sink),
+        )
+        .await
+        .expect("restart finishes")
+        .unwrap();
+        let m = lab.machine("win").unwrap();
+        assert!(m.pending_first_boot().is_none());
+        assert!(m.is_ready().await);
+        assert_eq!(first_boots_run(&said), 1);
+    }
+
+    /// Two starters at once run one first boot between them: the second
+    /// finds it claimed and leaves it to the first (V6).
+    #[tokio::test]
+    async fn concurrent_starters_run_one_first_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = owing_first_boot(dir.path(), &sh, FIRST_BOOT);
+        let (sink, said) = numbered(&sh);
+        lab.start_machine("win").await.unwrap();
+        let (a, b) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                lab.run_owed_first_boot("win", &sink),
+                lab.run_owed_first_boot("win", &sink)
+            )
+        })
+        .await
+        .expect("both return");
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(first_boots_run(&said), 1);
+        assert!(lab.machine("win").unwrap().pending_first_boot().is_none());
+        assert!(lab.first_boots.lock_recover().is_empty(), "claim kept");
+    }
+
+    /// A first-boot script that restarts its own guest — a rename, a domain
+    /// join — does not start its own first boot again from inside itself (V6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_boot_restarting_its_guest_does_not_run_itself_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = owing_first_boot(
+            dir.path(),
+            &sh,
+            "use vmlab\n\nfn main(lab: Lab) {\n    let vm = lab.this_vm().expect(\"no target vm\")\n    vm.restart().expect(\"restart\")\n}\n",
+        );
+        let (sink, said) = numbered(&sh);
+        tokio::time::timeout(Duration::from_secs(30), lab.up(&[], sink))
+            .await
+            .expect("up finishes")
+            .expect("up");
+        assert_eq!(first_boots_run(&said), 1);
+        let m = lab.machine("win").unwrap();
+        assert!(m.pending_first_boot().is_none());
+        assert!(m.is_ready().await);
+    }
+
     /// A first-boot script outlasting the mount task's wait for readiness no
     /// longer costs the machine its shares (#153): the mounts start once the
     /// script is done, so a slow first boot mounts them like any other.
@@ -6056,7 +6276,7 @@ lab "t" {
             }]
         );
 
-        lab.restart_machine("web", false).await.unwrap();
+        lab.restart_machine("web", false, &quiet()).await.unwrap();
         let rebuilt = lab.machine("web").unwrap();
         assert!(!same(&rebuilt, &web), "web was not rebuilt by its restart");
         assert_eq!(rebuilt.state().await, PowerState::Running);

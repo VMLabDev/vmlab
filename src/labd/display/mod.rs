@@ -292,9 +292,13 @@ impl Display {
     }
 
     /// OCR the screen, optionally restricted to a `(x, y, w, h)` region.
-    pub async fn ocr(&self, region: Option<(u32, u32, u32, u32)>) -> Result<String> {
+    pub async fn ocr(
+        &self,
+        region: Option<(u32, u32, u32, u32)>,
+        opts: &vision::OcrOptions,
+    ) -> Result<String> {
         let img = self.grab().await?;
-        vision::ocr(&img, region).await
+        vision::ocr(&img, region, opts).await
     }
 
     /// Search the screen for the first matching template image.

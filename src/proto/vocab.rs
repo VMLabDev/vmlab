@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::record::{RecordOptions, RecordRequest};
+use crate::vision::OcrOptions;
 use serde_json::{Map, Value, json};
 
 use super::error::CommandError;
@@ -604,6 +605,8 @@ vocabulary! {
             y2: i64,
         },
         /// Read text off the machine's display, whole screen or one region.
+        /// `options` sets the upscale (`scale`, 1–4, default 3) and the page
+        /// segmentation (`layout`: block, sparse, line or auto; default block).
         #[one_way(
             "cli",
             "Reading text off the framebuffer is a script's substitute for \
@@ -613,6 +616,7 @@ vocabulary! {
         MachineOcr = "machine.ocr" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default)] region: Option<Region>,
+            #[serde(default)] options: OcrOptions,
         },
         /// Find a template image on the machine's display; null when no match
         /// scores above `threshold`.
@@ -1125,6 +1129,16 @@ vocabulary! {
             arch: String,
             template: String,
         },
+        /// Every running template operation, from whichever lab it was
+        /// filed under, with the build VM's `<lab>/<vm>` reference while the
+        /// machine verbs can reach it (§6.1).
+        #[one_way(
+            "cli",
+            "It answers the person at the terminal which build is running and \
+             which machine reference reaches its VM; a script runs inside a \
+             lab and has no build of its own to look for."
+        )]
+        TemplateStatus = "template.status" {},
         /// Every template in the store, with its size and, on request,
         /// whether that exact version is published.
         #[one_way(
@@ -1409,6 +1423,34 @@ mod tests {
         assert!(
             LabRequest::from_wire("machine.ocr", json!({"machine": "d", "region": "nope"}))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn ocr_options_are_optional_and_typed_on_the_wire() {
+        let req = LabRequest::from_wire("machine.ocr", json!({"machine": "dc01"})).unwrap();
+        let LabRequest::MachineOcr { options, .. } = req else {
+            panic!("wrong variant");
+        };
+        assert_eq!(options, OcrOptions::default());
+
+        let req = LabRequest::from_wire(
+            "machine.ocr",
+            json!({"machine": "dc01", "options": {"scale": 2, "layout": "sparse"}}),
+        )
+        .unwrap();
+        let LabRequest::MachineOcr { options, .. } = req else {
+            panic!("wrong variant");
+        };
+        assert_eq!(options.scale, Some(2));
+        assert_eq!(options.layout, Some(crate::vision::Layout::Sparse));
+
+        assert!(
+            LabRequest::from_wire(
+                "machine.ocr",
+                json!({"machine": "d", "options": {"layout": "column"}})
+            )
+            .is_err()
         );
     }
 

@@ -43,7 +43,9 @@ vmlab vm start [--record <VM=PATH>]... <VM>
 | `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options (`vmlab record` below). |
 | `-h`, `--help` | Print help. |
 
-Starts one VM without running the lab's `up` plan: no dependency waves, no provision scripts, no playbooks. Any deferred download the VM needs runs first with progress on the terminal, then the host binaries are checked, then the VM boots. A VM whose clone does not exist yet gets one created from its template, and its first-boot script runs before it reports ready, exactly as under `vmlab up`. A VM that is already running is left alone. A `suspended` VM, one whose guest put itself to sleep (ACPI S3), is woken with QMP `system_wakeup` instead: no second QEMU, no agent refresh, and the verb returns once the guest runs again, emitting `vm.woken` with `cause = start`. Nothing is printed on success.
+Starts one VM without running the lab's `up` plan: no dependency waves, no provision scripts, no playbooks. Any deferred download the VM needs runs first with progress on the terminal, then the host binaries are checked, then the VM boots. A VM whose clone does not exist yet gets one created from its template. A VM that is already running is left alone. A `suspended` VM, one whose guest put itself to sleep (ACPI S3), is woken with QMP `system_wakeup` instead: no second QEMU, no agent refresh, and the verb returns once the guest runs again, emitting `vm.woken` with `cause = start`. Otherwise the verb returns once the VM has booted, without waiting for its agent, and prints nothing on success.
+
+A clone that has not finished its template's first-boot script runs it here, exactly as under `vmlab up`: the script, then any agent refresh, then readiness. That is a new clone, or one whose `.vmlab/vms/<vm>/firstboot.done` is missing (an earlier first boot failed, or the file was deleted). The verb prints the script's output and returns once the VM is ready, or fails with the script's error and leaves the VM running. `vm restart` and wscript's `start()`/`restart()` do the same. One first boot runs at a time per machine: a second starter, or a first-boot script restarting its own guest, leaves it to the run under way.
 
 Like `up`, it first brings the daemon onto the lab file on disk (cli-lab.md, "`up` always runs the lab file"): replaced when nothing runs, else reloaded machine by machine. A running VM a reload left pending says so (`<vm>: pending — …`) and keeps its old declaration; a stopped pending one is rebuilt before it boots.
 
@@ -88,7 +90,7 @@ vmlab vm restart [--record <VM=PATH>]... <VM>
 | `--fps`, `--size`, `--compress-idle[=SECS]`, `--timeline`, `--max-duration` | Recording options (`vmlab record` below). |
 | `-h`, `--help` | Print help. |
 
-Stops the VM through the graceful ladder, waits up to 60 seconds for it to settle as stopped, and boots it again. The clone is kept, so the guest comes back with its disk state and no first-boot script. Port forwards that target the VM are re-installed by the daemon when it gets a new lease. A VM that does not settle in time fails with `<name> did not stop for restart`. A VM a reload left **pending** (cli-lab.md) is rebuilt from the current lab file between the stop and the start, and the verb prints `<vm>: rebuilt from the new declaration`; this is how a running machine picks up an edit. `container restart` is the same.
+Stops the VM through the graceful ladder, waits up to 60 seconds for it to settle as stopped, and boots it again. The clone is kept, so the guest comes back with its disk state, and runs its first-boot script only if the clone has not finished one (`vm start` above). Port forwards that target the VM are re-installed by the daemon when it gets a new lease. A VM that does not settle in time fails with `<name> did not stop for restart`. A VM a reload left **pending** (cli-lab.md) is rebuilt from the current lab file between the stop and the start, and the verb prints `<vm>: rebuilt from the new declaration`; this is how a running machine picks up an edit. `container restart` is the same.
 
 With `--record`, `start` and `restart` boot the VM paused, attach the recorder, then let it continue, so the video opens on the firmware's first frame; the verb prints `recording <vm> to <path>` once the VM is up. A `--record` for a VM that was already running records it from now; one whose VM failed to start fails the verb with `machine X did not start, so its recording was not started`.
 
@@ -189,9 +191,11 @@ vmlab vm ocr [OPTIONS] <VM>
 | --- | --- |
 | `<VM>` | The VM, as `[lab/]name`. |
 | `--region <X> <Y> <W> <H>` | Restrict to a region: x y w h. |
+| `--scale <SCALE>` | Upscale the frame this many times before reading it, 1 to 4. Default 3; 1 reads it at its own size. |
+| `--layout <LAYOUT>` | Page segmentation: `block` (consoles, dialogs), `sparse` (desktops, lock screens), `line` (one line), `auto` (tesseract's page analysis). Default `block`. |
 | `-h`, `--help` | Print help. |
 
-Runs OCR over the current screen, or over the rectangle `--region` names, and prints the recognised text followed by a newline. The four region values are separate arguments; negative values are clamped to 0. The recogniser and its limits are in snapshots-vision.md.
+Runs OCR over the current screen, or over the rectangle `--region` names, and prints the recognised text followed by a newline. The four region values are separate arguments; negative values are clamped to 0. A scale outside 1 to 4 or an unknown layout is refused before any daemon is contacted. The recogniser, its options and its limits are in snapshots-vision.md.
 
 ### vmlab vm find-image
 
@@ -224,6 +228,7 @@ Log in on a Windows console from the shell:
 vmlab vm sendkeys client01 ctrl-alt-delete
 vmlab vm screenshot client01 /tmp/login.png
 vmlab vm ocr client01 --region 0 400 1024 200
+vmlab vm ocr client01 --layout sparse
 ```
 
 Wait for a button to appear, then click it:

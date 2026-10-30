@@ -34,6 +34,7 @@ DOC
       | "`cpus`, `memory`" | "The hardware floor a VM or container inherits when neither its block nor its template says." |
       | "`agent_transport`" | "The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias." |
       | "`input_transport`" | "How `send_keys` and the mouse reach the guest: `qmp` (default) or `vnc`. See [Screens, input and vision](guide_vision)." |
+      | "`acpi_shutdown`" | "Whether the guest shuts down on an ACPI power-button press (default `true`). The graceful stop ladder plans from it: with it off, a stop goes through the agent alone and waits for a booting guest's agent. Only `macos` turns it off. See [vmlab down](cmd_down)." |
       | "`virtiofs`" | "Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = \"auto\"` shares. See [Shared folders](guide_shares)." |
       | "`rtc`" | "What the guest reads the real-time clock as: `utc` (default), or `localtime` for DOS, Windows 9x and NT4 through XP/2003, which cannot read it as UTC. See [Snapshots](guide_snapshots) for the clock." |
       | "`workspace_guest`" | "The guest path an `@dev` workspace lands at when the decorator names none. See [Dev machines and the workspace syncer](guide_dev)." |
@@ -130,6 +131,7 @@ DOC
     li "**The agent** is `vmlab-agent` built for macOS, on the same virtio-serial channel as on Linux, running as root under launchd."
     li "**Scripted input** goes over QMP as usual. The USB keyboard `input = \"usb\"` adds is not bound to the display, so `send_keys` reaches it."
     li "**`boot_id`** reads `kern.bootsessionuuid` with `sysctl`."
+    li "**Stopping** goes through the agent, because macOS ignores the ACPI power button (`acpi_shutdown = false`). A `down` while the guest is still booting waits for its agent rather than ending in an emulator quit, which the guest would see as a power cut."
     li "**Shares** mount over SMB with `mount_smbfs`. macOS has no virtiofs client, so a share declared `transport = \"virtiofs\"` is reported unmountable and `auto` picks SMB. See [Shared folders](guide_shares)."
     li "**Logins** follow the Linux rules: the agent is root, so a `login {}` needs no `password`, and `elevated` is a validation error."
     li "**Playbooks** must name a `guest_bin`, because config-weave ships no macOS binary for vmlab to push."

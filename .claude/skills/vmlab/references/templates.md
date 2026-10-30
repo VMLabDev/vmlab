@@ -143,6 +143,8 @@ Verbs (flags in cli-template.md):
   newest by default; a dry run until you pass `--yes`.
 - `vmlab template build` — build a `template {}` block.
 - `vmlab template stop` — stop an in-flight build or push.
+- `vmlab template status` — running builds and pushes, from every lab, with
+  the machine reference that reaches a build's VM.
 - `vmlab template export` / `import` — portable `.tar.zst` archive, offline path.
 - `vmlab template push` / `pull` / `search` / `login` / `registry` — registries.
 
@@ -205,8 +207,8 @@ agent binaries and an install script per OS. The template's own
 unattended-install hook — a cloud-init `runcmd`, a subiquity late command, an
 autounattend first-logon command — mounts that ISO and runs the script. The
 guest installs the agent itself, so no host channel is needed before the agent
-exists, and the build verifies the handshake before sealing. Clones never see
-this ISO. Set `agent = false` on the block to skip baking the agent, at the cost
+exists, and the build verifies the handshake before sealing (how long it waits:
+"The first-boot script and the agent" below). Clones never see this ISO. Set `agent = false` on the block to skip baking the agent, at the cost
 of a template that never reports ready.
 
 The build VM always runs with `prevent_sleep` on (vm.md). A build is unattended,
@@ -267,6 +269,33 @@ and again `24.04.4.1`. The counter continues from the highest tag already
 published when the block names a `registry`, and from the local store otherwise.
 Change the prefix and the counter restarts at zero. Pass `--version` to pin a
 version instead; a version already in the store is refused.
+
+### Watching a running build
+
+The build VM is the machine `build` in a synthetic lab named
+`build-<arch>-<name>`. While the build runs, `build-<arch>-<name>/build` is a
+machine reference for the screen and input verbs: `vmlab vm screenshot`, `ocr`,
+`find-image`, `sendkeys`, `mouse-move`, `click`, `drag`, and `vmlab console`.
+Use it to watch a screen-driven install, crop reference images for a
+provision's `find_image`, or press the key a stuck installer waits for. No
+hand-written RFB client against `vnc.sock` is needed.
+
+- The build log prints the reference once the VM's display is up:
+  `build VM is \`build-x86_64-alpine/build\`: …`.
+- `vmlab template status` lists it in the `MACHINE` column; `-` means not
+  reachable yet (or sealing, or a push).
+- Every other verb on that lab (power, snapshots, exec, cp, playbooks) fails
+  with `unsupported` (6): the build owns its VM. Stop a build with
+  `vmlab template stop`, never `vmlab vm stop`.
+- If a lab with that exact name already runs under its own daemon, it keeps its
+  socket and the build logs that its VM cannot be inspected by name.
+
+```sh
+vmlab template status
+vmlab vm screenshot build-x86_64-alpine/build installer.png
+vmlab console build-x86_64-alpine/build
+vmlab vm sendkeys build-x86_64-alpine/build enter
+```
 
 ## Media built from folders
 
@@ -419,10 +448,24 @@ repository `vmlab template push` publishes to.
 
 `first_boot` is read at build time and baked into the template's metadata, so a
 clone runs it on its first start without the lab needing the file. It runs
-before the VM turns ready. With `agent = true` the build waits for the
-guest-installed agent's handshake before sealing and records the agent version in
-the metadata. With `agent = false`, or on a profile with no agent channel, the
-check is skipped and the build log says so.
+before the VM turns ready, under whichever verb starts the clone first: `up`,
+`vm start`, `vm restart`, or a script's `start()`/`restart()`. A finished run
+writes `.vmlab/vms/<vm>/firstboot.done`; until then every start runs it. With
+`agent = true` the build waits for the guest-installed agent's handshake before
+sealing and records the agent version in the metadata. With `agent = false`, or
+on a profile with no agent channel, the check is skipped and the build log says
+so.
+
+How long the build waits for the agent depends on the source:
+
+- `qcow2` or `template`: verified before the first provision, ten minutes from
+  boot.
+- `iso` or `scratch`: the provisions are the installer, so the build listens for
+  as long as they run, with **no deadline**. The deadline starts when they
+  return. A VM still running has two minutes more to answer. A VM they powered
+  off, or one silent for those two minutes, is shut down and booted once more
+  from its disk alone (no media, no provisions), and its agent has fifteen
+  minutes. An install may run for hours and end with the VM off or running.
 
 ### Validation
 

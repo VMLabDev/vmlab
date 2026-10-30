@@ -51,6 +51,10 @@ pub struct ResolvedVm {
     pub agent_transport: AgentTransport,
     /// How scripted input reaches the guest (QMP vs VNC).
     pub input_transport: InputTransport,
+    /// The guest shuts down on an ACPI power-button press (§7.2) — the
+    /// profile's, true when it says nothing. What the stop ladder plans
+    /// from ([`crate::labd::stop_plan`]).
+    pub acpi_shutdown: bool,
     /// The guest mounts virtiofs natively (profile capability) — with a
     /// host virtiofsd, `transport = "auto"` shares attach as vhost-user-fs
     /// devices instead of SMB (§7.5).
@@ -628,6 +632,7 @@ pub fn resolve_vm(
         display_device,
         agent_transport: profile.agent_transport,
         input_transport: profile.input_transport,
+        acpi_shutdown: profile.acpi_shutdown.unwrap_or(true),
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
         rtc_base: lab_vm.clock.rtc_base_for(profile.rtc),

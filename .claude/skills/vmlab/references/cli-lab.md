@@ -191,7 +191,7 @@ it pushes the shipped agent the way `vmlab machine repair-agent` does, marks the
 prints `agent: updated "<vm>" (<old> → <new>)`. It runs after the first-boot script
 (the template's, written for the agent it sealed) and before every provision.
 `up` never starts waiting on a VM just to refresh it: a VM with no first-boot, no
-provision or playbook and no dependent (and every `vmlab vm start`) is refreshed in
+provision or playbook and no dependent (and every `vmlab vm start` owing no first boot) is refreshed in
 the background when its agent first answers, its line going to the lab daemon's log;
 the event and `diverged=yes` still report it. Either way the VM is **not ready
 until the refresh has finished** (succeeded or failed): `status` shows it `booting`, and
@@ -280,10 +280,17 @@ gone (see dev-machines.md).
 
 Each VM stops through the graceful ladder (see architecture.md):
 
-1. A shutdown request to the guest agent, waiting up to 30 seconds for QEMU to exit.
+1. A shutdown request to the guest agent, waiting up to 30 seconds for QEMU to exit. A VM still booting, whose template sealed an agent that has not answered yet, waits up to a minute for the agent first.
 2. An ACPI power-down through the QEMU control channel, waiting another 30 seconds.
 3. A QMP `quit`, which ends QEMU after it flushes the disk caches, waiting another 30 seconds. This is where a guest that halts at "It's now safe to turn off your computer" (Windows 9x, DOS) stops.
 4. A hard kill.
+
+A guest whose profile has `acpi_shutdown = false` (`macos`) ignores the power
+button, so its ladder has no ACPI rung: its agent rung waits for a booting guest's
+agent as long as readiness would (10 minutes) and gives the guest two minutes to
+power off. `up` returns before a clone's agent answers, so `down` straight after
+`up` still shuts it down cleanly. A VM with no sealed agent (`scratch`) goes to ACPI
+at once.
 
 A container asks its init to signal the entrypoint and power off after the image's
 stop grace, then falls through to the agent and to a kill. `--force` skips the
@@ -334,7 +341,7 @@ vmlab status [OPTIONS]
 
 | Option | Meaning |
 | --- | --- |
-| `-v`, `--verbose` | Add the raw power state, readiness, and each machine's kind-specific detail (template/hardware, image/health/last exit). |
+| `-v`, `--verbose` | Add the raw power state, readiness, the hypervisor, and each machine's kind-specific detail (template/hardware, image/health/last exit). |
 | `--json` | Print the lab daemon's status projection as JSON instead of the tables; a lab with no daemon prints `{"lab": "<name>", "running": false}`. |
 | `-h`, `--help` | Print help. |
 
@@ -391,7 +398,8 @@ way:
 the guest is ready. With `--verbose` a second line under each machine carries
 `state=`, `ready=` and `cached=`, plus `diverged=yes` on a machine
 whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or by
-`up`'s agent refresh. A VM
+`up`'s agent refresh. Every machine then adds `hypervisor=` (`qemu` or `vmlab`:
+its own `hypervisor`, else the host default for its kind; PRD §22). A VM
 then adds `arch`, `cpus`, `memory` and `agent` (the running agent's handshake
 stamp, or the template's sealed one before an agent answers or while stopped; an
 agent restarted inside the guest is handshaken again, so this follows it). A VM

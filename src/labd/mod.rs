@@ -7,6 +7,7 @@ pub mod agent_repair;
 pub mod app_share;
 pub mod boot_clock;
 pub mod boot_id;
+pub mod build_lab;
 pub mod container;
 pub mod container_ctl;
 pub mod display;
@@ -38,6 +39,7 @@ pub mod record;
 pub mod reload_plan;
 pub mod share_plan;
 pub mod state;
+pub mod stop_plan;
 pub mod usb;
 pub mod vm;
 pub mod vm_agent;
@@ -324,12 +326,17 @@ where
 ///
 /// `vm start` refreshes a stale agent as `up` does (§19.4), in the background
 /// at its handshake — holding its readiness until the refresh is done — so the
-/// verb still returns as soon as the machine has started. Not under a pending
-/// first-boot, which only `up` runs and which the refresh must follow — the
-/// next `up` does it. Starting a sleeping machine wakes it, and nothing else:
-/// it never stopped, so no handshake is coming to defer a refresh to, and a
-/// refresh is not what was asked for.
-async fn start_machine_request(lab: &Arc<LabRuntime>, machine: &str) -> Result<(), CommandError> {
+/// verb still returns as soon as the machine has started. A machine that
+/// still owes its template's first boot (§6.1) runs it here as `up` would,
+/// streaming its output, and the refresh follows the script inline; the verb
+/// returns once the machine is ready. Starting a sleeping machine wakes it,
+/// and nothing else: it never stopped, so no handshake is coming to defer a
+/// refresh to, and a refresh is not what was asked for.
+async fn start_machine_request(
+    lab: &Arc<LabRuntime>,
+    machine: &str,
+    output: &crate::scripting::OutputSink,
+) -> Result<(), CommandError> {
     let m = machine_of(lab, machine)?;
     if m.state().await == vm::PowerState::Suspended {
         lab.start_machine(machine).await?;
@@ -339,6 +346,7 @@ async fn start_machine_request(lab: &Arc<LabRuntime>, machine: &str) -> Result<(
         lab.start_with_deferred_refresh(machine).await?;
     } else {
         lab.start_machine(machine).await?;
+        lab.run_owed_first_boot(machine, output).await?;
     }
     Ok(())
 }
@@ -580,7 +588,10 @@ impl Handler<LabRequest> for LabdHandler {
                 lab.preflight_binaries(std::slice::from_ref(&machine))?;
                 lab.record_arm(&record, None).await?;
                 let targets: Vec<String> = record.iter().map(|r| r.machine.clone()).collect();
-                let started = start_machine_request(lab, &machine).await;
+                let started = streamed(lab, stream, |output| async move {
+                    start_machine_request(lab, &machine, &output).await
+                })
+                .await;
                 let settled = lab.record_settle(&targets).await;
                 started?;
                 settled?;
@@ -597,7 +608,10 @@ impl Handler<LabRequest> for LabdHandler {
             } => {
                 lab.record_arm(&record, None).await?;
                 let targets: Vec<String> = record.iter().map(|r| r.machine.clone()).collect();
-                let restarted = lab.restart_machine(&machine, force).await;
+                let restarted = streamed(lab, stream, |output| async move {
+                    lab.restart_machine(&machine, force, &output).await
+                })
+                .await;
                 let settled = lab.record_settle(&targets).await;
                 restarted?;
                 settled?;
@@ -675,9 +689,13 @@ impl Handler<LabRequest> for LabdHandler {
                     .await?;
                 Ok(json!(true))
             }
-            LabRequest::MachineOcr { machine, region } => {
+            LabRequest::MachineOcr {
+                machine,
+                region,
+                options,
+            } => {
                 let text = display_of(lab, &machine)?
-                    .ocr(region.map(Region::as_tuple))
+                    .ocr(region.map(Region::as_tuple), &options)
                     .await?;
                 Ok(json!(text))
             }
