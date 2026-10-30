@@ -70,10 +70,10 @@ vm "<name>" {
 | `gui` | bool | lab `gui` | Open a VNC viewer on `up`. The VM always runs headless. |
 | `agent_update` | bool | lab `agent_update`, else `true` | Refresh the guest agent on `up` and `vm start` when its version stamp differs from the agent this vmlab ships, and mark the VM diverged. `false` leaves the agent the template sealed. Ignored on the legacy agent tier. |
 | `prevent_sleep` | bool | `false` | Keep the guest awake: the moment it suspends to RAM (ACPI S3), the lab daemon wakes it with QMP `system_wakeup` and records `vm.woken` with `cause = prevent_sleep`. Declared on the `vm` block only, never inherited: it is the daemon's policy, not hardware. The template build VM always has it on. Not accepted on a `container {}`. Without it a sleeping guest shows `suspended` in `vmlab status` until `vmlab vm start` wakes it. |
-| `clock` | utf8 | `host` | Guest clock policy. `host`: the RTC runs from the host's time, and after an online snapshot restore the lab daemon sets the guest's clock to the host's current time through the agent (a failure warns and the restore still succeeds). `snapshot`: a restored guest keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z` (any offset, converted to UTC): the RTC starts at that instant on every boot and runs forward, and vmlab never sets it, after a restore included. The guest's own NTP or w32time can still move it; turn that sync off in the guest, or keep the machine off a segment with a route to a time server, when the date must hold. Declared on the machine block only, never inherited. Also accepted on a `container {}`. |
+| `clock` | utf8 | `host` | Guest clock policy. `host`: the RTC runs from the host's time, the lab daemon checks the guest clock at every agent handshake and sets it when more than 2 s off (`machine.clock_drift`), and after an online snapshot restore it sets the guest's clock to the host's current time through the agent (a failure warns and the restore still succeeds). `snapshot`: a restored guest keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z` (any offset, converted to UTC): the RTC starts at that instant on every boot and runs forward, and vmlab never sets it, after a restore included. The guest's own NTP or w32time can still move it; turn that sync off in the guest, or keep the machine off a segment with a route to a time server, when the date must hold. Declared on the machine block only, never inherited. Also accepted on a `container {}`. |
 | `display` | utf8 | inherited | QEMU display device string. Inherited from template, then profile. |
 | `cpu_model` | utf8 | inherited | QEMU `-cpu` model, for example `pentium3`, `pentium2`, `qemu32` or `Westmere`, replacing the default (`host` under KVM, `max` under TCG) under either accelerator. For guests the host CPU breaks, such as Windows 9x Setup. Inherited from template, then profile. Any non-empty name is accepted; QEMU refuses an unknown one at start. Cannot be combined with `nested = true`. |
-| `hyperv` | bool | inherited | Hyper-V enlightenments for a Windows guest: under KVM on x86 the `-cpu host` string gains `hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,hv-ipi`, so Windows reads its clock from the reference TSC page instead of an emulated timer (about 20 ns a read against 5.6 µs native, 51 µs nested under WSL 2). Inherited from template, then profile; the shipped `windows-11`, `windows-10`, `windows-server` and `windows-legacy` profiles set it, so `false` here opts out. Not applied under TCG, with a `cpu_model`, or on a non-x86 guest; `up` warns when this block set `true` and it was not applied. `+invtsc` is never added: it blocks migration, so online snapshots. |
+| `hyperv` | bool | inherited | Hyper-V enlightenments for a Windows guest: under KVM on x86 the `-cpu host` string gains `hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,hv-ipi`, so Windows reads its clock from the reference TSC page instead of an emulated timer (about 20 ns a read against 5.6 µs native, 51 µs nested under WSL 2). Inherited from template, then profile; the shipped `windows-11`, `windows-10`, `windows-server` and `windows-legacy` profiles set it, so `false` here opts out. Not applied under TCG, with a `cpu_model`, or on a non-x86 guest; `up` warns when this block set `true` and it was not applied. Where the host's KVM has APICv/AVIC on (`kvm_intel` `enable_apicv`, `kvm_amd` `avic`), `hv-avic` is added too, with `-global kvm-pit.lost_tick_policy=discard`, so an EOI is not an exit; without them neither is. `+invtsc` is never added: it blocks migration, so online snapshots. |
 | `accel` | utf8 | inherited | Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`. |
 | `firmware` | utf8 | inherited | Firmware: `ovmf` or `seabios`. Inherited from template, then profile. |
 | `tpm` | bool | inherited | Enable a TPM 2.0 device. Inherited from template, then profile. |
@@ -470,17 +470,20 @@ rejected unless it names a `guest_bin`.
 
 ## var {}
 
-One variable override for the enclosing `playbook {}`, passed to config-weave as
-`--var name=value` for this machine's run only.
+One variable override for the enclosing `playbook {}`, for this machine's run
+only. It reaches config-weave in a `--var-file` written to a private guest
+directory for the run, never on the guest command line.
 
 ```wcl
 var "tz" { value = "UTC" }
+var "join_password" { value = "Pa55w0rd!" secret = true }
 ```
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `name` | utf8 (label) | required | Variable name; must be a WCL identifier. The inline block label. |
 | `value` | utf8 | required | Value, passed through verbatim. config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise. |
+| `secret` | bool | `false` | Treat the value as a secret: vmlab prints `***` in its place in run output, the lab log, `playbook.op.*` events, errors and `vmlab playbook list`. |
 
 Validation requires the name to be letters, digits and underscores, not starting
 with a digit, because config-weave binds each override as a `let` inside the

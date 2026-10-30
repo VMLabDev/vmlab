@@ -70,7 +70,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # the workspace syncer's host-side watcher (§19.6), which registers per
 # directory rather than recursively so a guest-owned tree costs no watch
 # descriptors.
-nix = { version = "0.31", features = ["process", "signal", "user", "fs", "net", "inotify", "poll"] }
+nix = { version = "0.31", features = ["process", "signal", "user", "fs", "net", "inotify", "poll", "feature"] }
 image = { version = "0.25", default-features = false, features = ["png", "pnm", "bmp"] }
 # 0.13 renamed the `rustls-tls` feature to `rustls` and moved
 # `RequestBuilder::query` behind its own `query` feature.

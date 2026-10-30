@@ -61,6 +61,11 @@ pub struct VmPaths {
     /// QEMU's, handed to a host GPU's `qemu_binary` so a minimal build finds
     /// its firmware and ROMs (`hostgpu::RenderPlan::data_dir`).
     pub qemu_data_dir: Option<PathBuf>,
+    /// The host's KVM virtualises the APIC — Intel APICv or AMD AVIC
+    /// ([`host_apic_virtualization`]). A host fact the lab daemon reads once,
+    /// like the firmware, so the builder stays pure: it decides whether a
+    /// `hyperv` guest gets [`HYPERV_APICV_FLAG`] (§5.2).
+    pub apic_virtualization: bool,
 }
 
 /// The qdev id of a VM's install CD-ROM device (see
@@ -220,6 +225,40 @@ pub const HYPERV_FLAGS: &str = "hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpind
                                 hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,\
                                 hv-ipi";
 
+/// Added to [`HYPERV_FLAGS`] where the host's KVM virtualises the APIC
+/// (§5.2). Hyper-V's SynIC has Windows acknowledge its timer interrupts by
+/// AutoEOI, which KVM cannot do in hardware, so it turns APICv/AVIC off for
+/// the whole VM; `hv-avic` tells Windows not to use AutoEOI and leaves them
+/// on, so an end-of-interrupt stops being an exit. A Windows 11 24H2 or
+/// Server 2025 guest takes 512 clock interrupts a second on every vCPU even
+/// idle, so that is about one exit in three gone. Without APICv/AVIC the
+/// guest would pay for an EOI AutoEOI used to save, so it is added only
+/// where they are on.
+pub const HYPERV_APICV_FLAG: &str = "hv-avic";
+
+/// What AVIC also needs on an AMD host, set wherever [`HYPERV_APICV_FLAG`]
+/// is: KVM inhibits AVIC while its in-kernel PIT re-injects missed ticks,
+/// QEMU's default. A guest with the enlightenments keeps time from the
+/// reference TSC page and has no use for PIT ticks it missed.
+pub const HYPERV_APICV_PIT: &str = "kvm-pit.lost_tick_policy=discard";
+
+/// Whether the host's KVM virtualises the APIC: `kvm_intel`'s
+/// `enable_apicv` or `kvm_amd`'s `avic`. Read where the runtime paths are
+/// assembled and handed to the builder as
+/// [`VmPaths::apic_virtualization`].
+pub fn host_apic_virtualization() -> bool {
+    host_apic_virtualization_in(Path::new("/sys/module"))
+}
+
+fn host_apic_virtualization_in(sys_module: &Path) -> bool {
+    [("kvm_intel", "enable_apicv"), ("kvm_amd", "avic")]
+        .iter()
+        .any(|(module, param)| {
+            std::fs::read_to_string(sys_module.join(module).join("parameters").join(param))
+                .is_ok_and(|v| matches!(v.trim(), "Y" | "y" | "1"))
+        })
+}
+
 /// Why a VM that resolved `hyperv = true` boots without the enlightenments
 /// under `accel` — `None` when it gets them, or never asked. They are KVM's
 /// (TCG does not implement them), x86's, and an addition to the host CPU, so
@@ -262,19 +301,26 @@ pub fn hyperv_not_applied(declared: Option<bool>, vm: &ResolvedVm, accel: Accel)
 /// happens to allow (§5.2). Masking the other vendor's flag too is harmless,
 /// and spares the builder asking which vendor the host is. Other arches pass
 /// the host CPU through unchanged. A resolved `hyperv` adds
-/// [`HYPERV_FLAGS`] on x86, with `nested` or without.
-fn kvm_cpu_model(vm: &ResolvedVm) -> String {
+/// [`HYPERV_FLAGS`] on x86, with `nested` or without, and
+/// [`HYPERV_APICV_FLAG`] where the host virtualises the APIC.
+fn kvm_cpu_model(vm: &ResolvedVm, apic_virtualization: bool) -> String {
     let x86 = qemu_arch(&vm.arch) == "x86_64";
     let host = if vm.nested || !x86 {
         "host"
     } else {
         "host,vmx=off,svm=off"
     };
-    if vm.hyperv && hyperv_skipped(vm, Accel::Kvm).is_none() {
-        format!("{host},{HYPERV_FLAGS}")
-    } else {
-        host.to_string()
+    match hyperv_apicv(vm, Accel::Kvm, apic_virtualization) {
+        Some(true) => format!("{host},{HYPERV_FLAGS},{HYPERV_APICV_FLAG}"),
+        Some(false) => format!("{host},{HYPERV_FLAGS}"),
+        None => host.to_string(),
     }
+}
+
+/// Whether the enlightenments apply under `accel`, and if so whether
+/// [`HYPERV_APICV_FLAG`] rides with them: `None` without them.
+fn hyperv_apicv(vm: &ResolvedVm, accel: Accel, apic_virtualization: bool) -> Option<bool> {
+    (vm.hyperv && hyperv_skipped(vm, accel).is_none()).then_some(apic_virtualization)
 }
 
 pub fn emulator_binary(arch: &str) -> String {
@@ -350,7 +396,7 @@ pub fn build_args(
     // accelerator: it is the CPU the guest was declared to see. QEMU owns the
     // catalogue, so an unknown name is refused by QEMU at start.
     let (accel_name, default_cpu) = match accel {
-        Accel::Kvm => ("kvm", kvm_cpu_model(vm)),
+        Accel::Kvm => ("kvm", kvm_cpu_model(vm, paths.apic_virtualization)),
         Accel::Tcg => ("tcg", "max".to_string()),
     };
     arg(&mut a, "accel", accel_name.into());
@@ -362,6 +408,10 @@ pub fn build_args(
     // host's (§7.3); otherwise QEMU's default, the host's UTC time, applies.
     if let Some(base) = &vm.rtc_base {
         arg(&mut a, "rtc", format!("base={base}"));
+    }
+    // AVIC stays on only without PIT tick re-injection (§5.2).
+    if hyperv_apicv(vm, accel, paths.apic_virtualization) == Some(true) {
+        arg(&mut a, "global", HYPERV_APICV_PIT.into());
     }
 
     // Always headless, with a VNC display on a unix socket (§11). A
@@ -1241,6 +1291,103 @@ mod tests {
         assert!(msg.contains("kvm_intel") && msg.contains("VMX"), "{msg}");
         std::fs::write(params.join("nested"), "Y\n").unwrap();
         assert_eq!(host_nested_problem_in(sys.path()), None);
+    }
+
+    /// With the host's APIC virtualised, an enlightened guest gains `hv-avic`
+    /// and the PIT stops re-injecting, together and only together (§5.2);
+    /// the host fact changes nothing for a guest the enlightenments skip.
+    #[test]
+    fn apic_virtualization_adds_hv_avic_and_drops_pit_reinjection_for_hyperv_only() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let resolve = |profile: &str, arch: &str, extra: &str| {
+            let v = super::super::resolve::testing::vm(&format!(
+                "vm \"t\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"{profile}\" \
+                 disk = 1GiB {extra} }}"
+            ));
+            super::super::resolve::resolve_vm(&v, None, &profiles).unwrap()
+        };
+        let argv = |vm: &super::super::resolve::ResolvedVm, accel: Accel, apicv: bool| {
+            let p = VmPaths {
+                apic_virtualization: apicv,
+                ..paths()
+            };
+            build_args("l", vm, &p, accel).unwrap()
+        };
+        let cpu = |args: &[String]| {
+            let i = args.iter().position(|a| a == "-cpu").unwrap();
+            args[i + 1].clone()
+        };
+        let pit = |args: &[String]| {
+            args.windows(2)
+                .filter(|w| w[0] == "-global" && w[1] == HYPERV_APICV_PIT)
+                .count()
+        };
+        assert_eq!(HYPERV_APICV_FLAG, "hv-avic");
+        assert_eq!(HYPERV_APICV_PIT, "kvm-pit.lost_tick_policy=discard");
+
+        for profile in ["windows-11", "windows-server", "windows-legacy"] {
+            let vm = resolve(profile, "x86_64", "");
+            let on = argv(&vm, Accel::Kvm, true);
+            assert_eq!(
+                cpu(&on),
+                format!("host,vmx=off,svm=off,{HYPERV_FLAGS},hv-avic"),
+                "{profile}"
+            );
+            assert_eq!(pit(&on), 1, "{profile}");
+            // Without APICv/AVIC: the flags alone, the PIT left as it was.
+            let off = argv(&vm, Accel::Kvm, false);
+            assert_eq!(
+                cpu(&off),
+                format!("host,vmx=off,svm=off,{HYPERV_FLAGS}"),
+                "{profile}"
+            );
+            assert_eq!(pit(&off), 0, "{profile}");
+            // Under TCG the enlightenments are skipped, and so is this.
+            let tcg = argv(&vm, Accel::Tcg, true);
+            assert_eq!(cpu(&tcg), "max");
+            assert_eq!(pit(&tcg), 0);
+        }
+        // `nested` keeps it; a named model, `hyperv = false`, a profile
+        // without the enlightenments and a non-x86 guest get neither.
+        let nested = argv(
+            &resolve("windows-11", "x86_64", "nested = true"),
+            Accel::Kvm,
+            true,
+        );
+        assert_eq!(cpu(&nested), format!("host,{HYPERV_FLAGS},hv-avic"));
+        assert_eq!(pit(&nested), 1);
+        for (profile, arch, extra) in [
+            ("windows-11", "x86_64", "cpu_model = \"Skylake-Client\""),
+            ("windows-server", "x86_64", "hyperv = false"),
+            ("windows-xp", "x86_64", ""),
+            ("linux-modern", "x86_64", ""),
+            ("linux-modern", "aarch64", "hyperv = true"),
+        ] {
+            let args = argv(&resolve(profile, arch, extra), Accel::Kvm, true);
+            assert!(!cpu(&args).contains("hv-avic"), "{profile} {extra}");
+            assert_eq!(pit(&args), 0, "{profile} {extra}");
+        }
+    }
+
+    #[test]
+    fn host_apic_virtualization_reads_either_vendors_parameter() {
+        let sys = tempfile::tempdir().unwrap();
+        assert!(!host_apic_virtualization_in(sys.path()), "no module");
+
+        let amd = sys.path().join("kvm_amd/parameters");
+        std::fs::create_dir_all(&amd).unwrap();
+        std::fs::write(amd.join("avic"), "N\n").unwrap();
+        assert!(!host_apic_virtualization_in(sys.path()));
+        std::fs::write(amd.join("avic"), "Y\n").unwrap();
+        assert!(host_apic_virtualization_in(sys.path()));
+
+        let sys = tempfile::tempdir().unwrap();
+        let intel = sys.path().join("kvm_intel/parameters");
+        std::fs::create_dir_all(&intel).unwrap();
+        std::fs::write(intel.join("enable_apicv"), "N\n").unwrap();
+        assert!(!host_apic_virtualization_in(sys.path()));
+        std::fs::write(intel.join("enable_apicv"), "Y\n").unwrap();
+        assert!(host_apic_virtualization_in(sys.path()));
     }
 
     #[test]

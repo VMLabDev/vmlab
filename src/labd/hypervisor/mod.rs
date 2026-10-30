@@ -62,6 +62,12 @@ pub trait Process: Send + Sync + 'static {
 
     /// End it now — the last rung of every stop ladder.
     async fn kill(&self);
+
+    /// The host process id while it runs, for reading its CPU use. `None`
+    /// once it has exited, or when nothing on the host backs it.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// A running machine's control channel: what the lifecycle asks a machine to

@@ -3,7 +3,7 @@ page ref_events {
   chapter_header "Events" {
     kicker       = "Appendices · reference"
     reading_time = "12 min read"
-    updated      = "2026-10-29"
+    updated      = "2026-10-30"
     version      = "vmlab 0.35"
   }
 
@@ -71,6 +71,8 @@ SRC
       | "`container.destroyed`" | "`container`" | "`vmlab container destroy` removed everything the container materialised." |
       | "`machine.agent_repaired`" | "`vm`, `machine`, `agent_version`" | "`vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template." |
       | "`machine.agent_updated`" | "`vm`, `machine`, `from`, `to`, `ok`, `error`" | "`vmlab up` or `vmlab vm start` found the VM's agent stamp differing from the shipped agent and pushed it. With `ok = true` the machine is now diverged; with `ok = false`, `error` says why the push failed and the old agent is still in place. `from` is null when the agent never answered." |
+      | "`machine.clock_drift`" | "`vm`, `machine`, `drift_ms`, `guest`, `host`, `corrected`, `error`" | "A fresh agent handshake found the guest clock more than 2 s from the host's, on a machine whose `clock` is `host`, and set it. `drift_ms` is guest minus host (positive when the guest is ahead); `guest` and `host` are the two times, RFC 3339. With `corrected = false`, `error` says why the guest refused. See [Snapshots](guide_snapshots)." |
+      | "`machine.clock_unchecked`" | "`vm`, `machine`, `reason`" | "The machine's `clock` is `host` but its agent cannot report the guest clock (no `get_time` feature), so a clock wrong after a reboot is not corrected. Emitted once per start." |
       | "`share.unmountable`" | "`vm`, `share`, `reason`" | "The mount plan holds a share this guest cannot mount, or a mount step still failed when its retries ran out (`share` is set then). See [Shared folders](guide_shares)." |
 
   }
@@ -149,7 +151,7 @@ SRC
     rows:
       | "Event" | "Payload fields" | "When" |
       | "`playbook.op.start`" | "base, `mode`: `apply` or `check`" | "A run was admitted." |
-      | "`playbook.op.log`" | "base, `line`" | "One human-readable line from the run." |
+      | "`playbook.op.log`" | "base, `line`" | "One human-readable line from the run. Every `playbook.op.*` payload carries `***` in place of a `secret = true` variable's value." |
       | "`playbook.op.phase`" | "base, `phase`: `running` or `rebooting`, `attempt`, `max`" | "The run changed phase, so a reboot shows as one rather than a stall." |
       | "`playbook.op.step`" | "base, `cw`: the engine's structured event" | "One structured line from the guest engine." |
       | "`playbook.op.done`" | "base, `exit_code`, `reboots`, `report`" | "The run finished without an infrastructure error, whatever its exit code." |

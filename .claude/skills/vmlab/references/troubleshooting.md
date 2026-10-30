@@ -327,11 +327,23 @@ vmlab prints nothing specific to WSL 2. When nested virtualisation is disabled i
 
 Some WSL 2 sessions have no `$XDG_RUNTIME_DIR`. vmlab does not fail on that: it falls back to `/tmp/vmlab-<uid>` for the supervisor socket and other runtime files, creates it with mode 0700, tightens an existing directory, and refuses one owned by another user. If the sockets are under `/tmp` rather than `/run/user/<uid>`, that is why. Networking on WSL 2 needs no tap, bridge or macvlan, so the fast path degrades to userspace silently there; a Windows-side VNC viewer is reached with `vmlab console --tcp`, which bridges the display to a localhost port.
 
+## A Windows guest's clock is hours off after a reboot
+
+A Windows guest whose agent set `RealTimeIsUniversal` during the current boot writes local time into the RTC whenever its clock is set, and a reboot inside the guest (QEMU keeps the RTC) then reads that local time as UTC: the clock is off by the guest's UTC offset, and Kerberos (5 min tolerance) and certificate dates break. With `clock = "host"` (the default) vmlab corrects it at the next agent handshake, before the connection is used, and emits `machine.clock_drift` (`drift_ms`, `corrected = true`); check `vmlab logs`. If the clock stays wrong: `machine.clock_unchecked` means the agent has no `get_time` — run `vmlab machine repair-agent <machine>`; `machine.clock_drift` with `corrected = false` carries the guest's refusal in `error`; a `snapshot` or date-time `clock` is never corrected, by design. Setting `RealTimeIsUniversal = 1` in the template before it is sealed removes the window entirely.
+
 ## A Windows guest is slow under nested KVM or WSL 2
 
 vmlab prints nothing for this. A Windows guest boots under KVM but anything that reads the clock often (.NET services, build tools, games) runs much slower than it should. Without the Hyper-V enlightenments Windows reads time from an emulated timer and each read exits the guest: about 5.6 µs native and 51 µs nested under WSL 2, against about 20 ns with them.
 
 They are on by default for every Windows profile from Vista on (`windows-11`, `windows-10`, `windows-server`, `windows-legacy`), so find what turned them off: `hyperv = false` on the VM or its template, a `cpu_model` (it replaces the host CPU and the flags with it), a user profile without `hyperv = true`, or the TCG fallback above. `ps -o args= -C qemu-system-x86_64` shows each machine's `-cpu`; an enlightened one carries `hv-time`. Never add `+invtsc` through `qemu_args`: QEMU then refuses to migrate the guest, and every online snapshot is a migration.
+
+## An idle Windows guest costs host CPU
+
+vmlab prints nothing for this. The qemu process of an idle Windows guest uses several percent of a host core (23-29% nested under WSL 2) while the guest shows itself idle. Windows 11 24H2/25H2 and Server 2025 take 512 clock interrupts a second on every vCPU at idle (Server 2022: 64), and each is a guest exit. Measured on native AMD KVM, 4 vCPUs at idle: Server 2025 about 4% of a core and 6,900 exits/s, Server 2022 about 1% and 700, Debian 13 under 1% and 160. No QEMU flag or device changes the tick: `hyperv`, `hv-stimer-direct`, HPET, the USB controller, the RTC's `driftfix`, `+invtsc`, the guest power plan and `bcdedit` tick settings were all tried, and stopping the vmlab agent changes nothing.
+
+vmlab removes the exits it can: where the host's KVM virtualises the APIC it adds `hv-avic` and stops PIT tick re-injection, about 6,900 → 4,900 exits/s for that guest. Check the host: `cat /sys/module/kvm_amd/parameters/avic` (AMD) or `cat /sys/module/kvm_intel/parameters/enable_apicv` (Intel); turn it on with `options kvm_amd avic=1` (or `options kvm_intel enable_apicv=1`) in `/etc/modprobe.d/` and a module reload with no VM running. Under WSL 2 it may not exist, and then vmlab cannot reduce the cost. `halt_poll_ns` is not the lever: the ~2 ms between ticks outlasts KVM's polling window, so adaptive polling switches itself off. What helps is the guest: fewer vCPUs (the cost is per vCPU), Server 2022 where 2025 is not needed, and stopping machines not in use.
+
+An online snapshot taken before vmlab added `hv-avic` still restores; that guest keeps its old exit rate until its next boot.
 
 ## Hyper-V enlightenments were not applied
 

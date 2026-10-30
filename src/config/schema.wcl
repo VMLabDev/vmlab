@@ -525,14 +525,16 @@ type Playbook {
   @children("var") vars: list<PlaybookVar>
 }
 
-// One `--var name=value` override for the play, scoped to the machine whose
-// `playbook` block declares it.
+// One variable override for the play, scoped to the machine whose `playbook`
+// block declares it; it reaches config-weave in a private `--var-file`.
 @block("var")
 type PlaybookVar {
   @doc("Variable name; must be a WCL identifier; the inline block label")
   @inline(0) name: utf8
   @doc("Value, passed through verbatim — config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise (required)")
   value: utf8
+  @doc("Treat the value as a secret: vmlab replaces it with `***` in every line, event, error and listing it emits for the run (default false)")
+  @default(false) secret: bool?
 }
 
 // Event handler binding.

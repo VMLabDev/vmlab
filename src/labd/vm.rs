@@ -756,6 +756,7 @@ impl VmInstance {
             gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
             gpu_passthrough: render.passthrough.clone(),
             qemu_data_dir: render.data_dir(&t.resolved.arch, std::env::var_os("PATH").as_deref()),
+            apic_virtualization: qemu::host_apic_virtualization(),
         })
     }
 
@@ -1652,6 +1653,11 @@ impl super::machine::Machine for VmInstance {
         lab.ensure_pulled(&self.cfg.name).await?;
         let events = lab.events().clone();
         events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
+        self.agent.set_handshake_hook(super::boot_clock::lab_hook(
+            &self.cfg.name,
+            self.cfg.clock,
+            events.clone(),
+        ));
 
         std::fs::create_dir_all(&self.dirs.run)?;
         let attachments = super::machine::attach_all_nics(&*self, &*lab).await?;
@@ -1774,6 +1780,10 @@ impl super::machine::Machine for VmInstance {
 
     async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
         self.agent_handle().await
+    }
+
+    async fn emulator_pid(&self) -> Option<u32> {
+        self.qemu.lock().await.as_ref().and_then(|p| p.pid())
     }
 
     async fn begin_agent_replacement(&self) -> super::machine::AgentReplacement {

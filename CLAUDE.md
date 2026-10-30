@@ -235,6 +235,8 @@ Module map under `src/`:
   `app_share.rs` is `machine.app_open` (§20.3), the broker that opens a
   shared app's agent session and hands the CLI its control and connection
   sockets;
+  `boot_clock.rs` is the guest-clock check every fresh agent handshake runs
+  under `clock = "host"` (§7.3, #186): `get_time`, and `set_time` past 2 s;
   `boot_id.rs` is the per-family boot identity read over the agent's `exec`
   and the loop `wait_rebooted` waits on it with (§10.3);
   `usb.rs` is USB passthrough's lab-wide half (§5.2.1) — selector resolution

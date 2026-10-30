@@ -195,6 +195,28 @@ pub fn declaration_digest(value: &impl std::fmt::Debug) -> String {
     hex::encode(Sha256::digest(blanked.as_bytes()))
 }
 
+/// Quote a value for a WCL string literal. Every value vmlab writes into a
+/// generated WCL file — a template build's lab, a playbook's variables file —
+/// passes through here, so a `"` or `\` in one cannot produce a file that
+/// fails to parse, a confusing error a long way from its cause.
+pub fn wcl_str(value: impl std::fmt::Display) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for c in raw.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Parse a dedicated template file (templates only, no lab required).
 pub fn load_template_source(
     source: &str,

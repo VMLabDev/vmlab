@@ -1266,6 +1266,11 @@ impl super::machine::Machine for ContainerInstance {
             "container.starting",
             serde_json::json!({"container": self.cfg.name}),
         );
+        self.agent.set_handshake_hook(super::boot_clock::lab_hook(
+            &self.cfg.name,
+            self.cfg.clock,
+            events.clone(),
+        ));
 
         std::fs::create_dir_all(&self.dirs.run)?;
         // The micro-VM connects to the sockets itself, so the attachments are
@@ -1347,6 +1352,10 @@ impl super::machine::Machine for ContainerInstance {
 
     async fn agent(&self) -> Result<super::vm_agent::AgentHandle> {
         self.agent_handle().await
+    }
+
+    async fn emulator_pid(&self) -> Option<u32> {
+        self.qemu.lock().await.as_ref().and_then(|p| p.pid())
     }
 
     async fn agent_answering(&self) -> bool {

@@ -542,9 +542,11 @@ fn extract_playbook_var(b: &Block, issues: &mut IssueList) -> Option<PlaybookVar
     let mut r = Reader::new(b, issues);
     let name = r.label();
     let value = r.required_string("value");
+    let secret = r.bool("secret").unspan().unwrap_or(false);
     Some(PlaybookVar {
         name: name?,
         value: value?.value,
+        secret,
         span: r.span(),
     })
 }

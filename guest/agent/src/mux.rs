@@ -135,6 +135,15 @@ fn new_instance() -> String {
     format!("{n:016x}")
 }
 
+/// The guest's system clock as `get_time` reports it: milliseconds since the
+/// Unix epoch, UTC, negative for a clock set before 1970.
+fn unix_ms_now() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
 /// How many encoded frames may queue for the port writer before senders
 /// block. Sized to absorb bursts, not to buffer a detached host forever.
 const OUT_QUEUE: usize = 256;
@@ -528,6 +537,9 @@ impl Mux {
                 Ok(()) => self.send_ctrl(&AgentMsg::TimeSet),
                 Err(msg) => self.send_ctrl(&AgentMsg::TimeSetFailed { msg }),
             },
+            HostMsg::GetTime => self.send_ctrl(&AgentMsg::Time {
+                unix_ms: unix_ms_now(),
+            }),
             HostMsg::OpenApp {
                 id,
                 mode,
@@ -750,6 +762,21 @@ mod tests {
         );
         assert_eq!(cap.ctrl(), AgentMsg::TimeSet);
         assert_eq!(*platform.clock.lock().unwrap(), vec![1_760_000_000_123]);
+    }
+
+    /// `get_time` answers the clock this agent reads, which is the guest's.
+    #[test]
+    fn get_time_is_answered_with_the_guest_clock() {
+        let (mux, mut cap) = capture_mux();
+        let before = unix_ms_now();
+        mux.handle_msg(HostMsg::GetTime, &TestPlatform::new());
+        let after = unix_ms_now();
+        match cap.ctrl() {
+            AgentMsg::Time { unix_ms } => {
+                assert!((before..=after).contains(&unix_ms), "{unix_ms}")
+            }
+            other => panic!("expected time, got {other:?}"),
+        }
     }
 
     #[test]

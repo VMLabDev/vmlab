@@ -276,6 +276,8 @@ status and `exit_code` the container's.
 | Event | Payload fields | When |
 | --- | --- | --- |
 | `snapshot.created` | `vm`, `name`, `online` | A snapshot was taken, of a VM or a container alike, after the workspace pre-flight flush. |
+| `machine.clock_drift` | `vm`, `machine`, `drift_ms`, `guest`, `host`, `corrected`, `error` | A fresh agent handshake found a `clock = "host"` guest more than 2 s from the host and set it. `drift_ms` is guest minus host; `corrected = false` carries the guest's refusal in `error`. |
+| `machine.clock_unchecked` | `vm`, `machine`, `reason` | A `clock = "host"` machine's agent has no `get_time`, so its clock is not checked. Once per start. |
 | `snapshot.restored` | `vm`, `name`, `online`, `clock` | A snapshot was restored, after the pin check and the syncer bracket. `clock` is present for an online restore only: `set` (set to the host's time), `kept` (the machine's `clock` is `snapshot`), `fixed` (a fixed date-time) or `not_set` (it should have been set and could not; the reason is in the daemon log and the CLI warning). |
 
 Deleting a snapshot emits nothing.
@@ -342,7 +344,7 @@ Every `playbook.op.*` event carries `machine`, `playbook` (the path), `play` and
 | Event | Payload fields | When |
 | --- | --- | --- |
 | `playbook.op.start` | base, `mode`: `apply` or `check` | A run was admitted. |
-| `playbook.op.log` | base, `line` | One human-readable line from the run. |
+| `playbook.op.log` | base, `line` | One human-readable line from the run. Every `playbook.op.*` payload carries `***` in place of a `secret = true` value. |
 | `playbook.op.phase` | base, `phase`: `running` or `rebooting`, `attempt`, `max` | The run changed phase, so a reboot shows as one rather than a stall. |
 | `playbook.op.step` | base, `cw`: the engine's structured event | One structured line from the guest engine. |
 | `playbook.op.done` | base, `exit_code`, `reboots`, `report` | The run finished without an infrastructure error, whatever its exit code. |
@@ -425,13 +427,23 @@ vm "buildbox" {
 }
 ```
 
-Each `var` becomes a `--var name=value` argument on the guest command line, in
-declaration order. The value is passed through verbatim with no shell in
-between, so config-weave applies its usual rule: it reads the value as a WCL
-expression where it can, so `3` is an integer and `true` a boolean, and as a
-string otherwise. That is how one play takes different settings on different
-machines. `vmlab validate` rejects a variable name that is not a WCL identifier
-and a name set twice on one block.
+Each `var` becomes one `name = value` line in a variables file vmlab writes for
+the run and passes as `--var-file`, in declaration order. config-weave reads
+the value as it reads a `--var` flag: as a WCL expression where it can, so `3`
+is an integer and `true` a boolean, and as a string otherwise. That is how one
+play takes different settings on different machines. `vmlab validate` rejects a
+variable name that is not a WCL identifier and a name set twice on one block.
+
+**Secret variables.** Mark a password or token `secret = true`. vmlab then
+prints `***` in place of the value in everything it emits for the run — the CLI
+stream, the lab log, `playbook.op.*` events, the run report, errors and `vmlab
+playbook list` — catching it as written and as config-weave prints it once
+evaluated. The run's `variables:` line names variables only, never values. No
+variable is ever on the guest command line: the variables file is written for
+each run into `<dir>/vars` (`0700`, the file `0600`; SYSTEM and Administrators
+only on Windows) and removed when the run ends, timed out or not. config-weave
+does not know which variables are secret, so its own `--log-file` and anything
+a step writes in the guest can still hold the value.
 
 ### Where the binary comes from
 
@@ -501,8 +513,8 @@ for the machine's agent, then does five things in order.
    becoming `playbooks__baseline`, so two playbooks in one lab cannot collide. A
    fast edit-then-run loop is the point of always pushing.
 4. **Run the verb.** The guest command is
-   `config-weave check|apply <dir> <play> --json --events-ndjson` plus the
-   `--var` pairs. Progress events arrive on stderr as JSON lines and are
+   `config-weave check|apply <dir> <play> --json --events-ndjson` plus
+   `--var-file <dir>/vars/vars.wcl` when the block has variables. Progress events arrive on stderr as JSON lines and are
    rendered into human lines on the CLI stream and the lab log; the final
    `--json` report on stdout is parsed and attached to the completion event.
 5. **Report the verdict.** Infrastructure failures, a push that will not land or
