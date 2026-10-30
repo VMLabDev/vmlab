@@ -110,6 +110,8 @@ pub(crate) fn container(
                 socket: socket.clone(),
             })
             .collect(),
+        // A container micro-VM has no sound card.
+        audio: None,
         rtc_base,
     })
 }

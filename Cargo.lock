@@ -2563,7 +2563,7 @@ dependencies = [
 [[package]]
 name = "vmlab-hv-proto"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=b2264caa235516b17af3c9b56de95bf033d40377#b2264caa235516b17af3c9b56de95bf033d40377"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=f7a018c8c7e0aa16a7be44ab0796f6ff16d49e15#f7a018c8c7e0aa16a7be44ab0796f6ff16d49e15"
 dependencies = [
  "serde",
  "serde_json",
