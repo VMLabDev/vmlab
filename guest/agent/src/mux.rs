@@ -21,7 +21,7 @@ use vmlab_agent_proto::{
 };
 
 use crate::app::{AppSpec, Apps};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use crate::spawn::Identity;
 use crate::spawn::{ProcessSpec, Spawner, TerminalSpec};
 
@@ -486,9 +486,17 @@ impl Mux {
                 id,
                 platform.resolve_path(path),
             ),
+            #[cfg(any(target_os = "linux", windows))]
             HostMsg::OpenWatch { id, path, prune } => {
                 crate::watch::open(self, id, platform.resolve_path(path), prune)
             }
+            // No recursive watch backend here, and `features::WATCH` is not
+            // advertised: a host that opens one anyway is told why.
+            #[cfg(not(any(target_os = "linux", windows)))]
+            HostMsg::OpenWatch { id, .. } => self.send_error(
+                Some(id),
+                "the workspace watch needs a Linux or Windows guest",
+            ),
             HostMsg::OpenEventLog { id, filter } => platform.open_eventlog(self, id, filter),
             HostMsg::SetClipboard { text } => platform.set_clipboard(self, text),
             HostMsg::GetClipboard => platform.get_clipboard(self),
@@ -596,7 +604,7 @@ pub trait Platform: Sync {
     /// Make a waypipe or X11 session's private directory, named `name`,
     /// owned by `identity` with mode 0700, and say where it and the X socket
     /// directory are — for the agent and for the program.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn app_home(&self, _identity: &Identity, _name: &str) -> Result<crate::app::AppHome, String> {
         Err("shared apps over waypipe and X11 need a Linux guest".into())
     }

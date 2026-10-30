@@ -1,4 +1,4 @@
-//! A Linux session is a real login, not a `setuid` (PRD §19.2).
+//! A Unix session is a real login, not a `setuid` (PRD §19.2).
 //!
 //! The cheap implementation gives the right uid and nothing else — no
 //! `XDG_RUNTIME_DIR`, no PAM, no keyring — which surfaces as rootless podman
@@ -26,28 +26,26 @@
 //! have done. Both are named in the agent's log and in the terminal's banner,
 //! because "rootless podman does not work here" is answerable only if a
 //! developer can see which of the two they got.
+//!
+//! **macOS takes the same route.** Its `su` reads `/etc/pam.d/su`, whose
+//! session stack is `pam_launchd`: the process lands in the account's own
+//! per-user launchd domain, the closest thing to a login macOS offers outside
+//! the GUI. Its accounts live in the directory service rather than in
+//! `/etc/passwd` (which holds only a handful of system ones), so they are
+//! resolved through `getpwnam_r` and `getgrouplist` ([`AccountDb`]); and it
+//! has no `/run/user`, so a macOS session gets no `XDG_RUNTIME_DIR` — it has
+//! `$TMPDIR`, which launchd hands every per-user process instead.
 
 use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use vmlab_agent_proto::Logon;
 
+use super::os::{self, ThreadIds};
 use crate::logon::{Held, LogonCache, LogonKey};
 use crate::spawn::{Adopted, Adopter, Identity};
-
-/// The `PATH` a login gets, from `login.defs`' own two answers: `ENV_SUPATH`
-/// for uid 0 and `ENV_PATH` for everyone else. Taken from there rather than
-/// invented because a login shell that cannot find `ip` — or that *can* find
-/// it when a real login could not — is a difference a developer will hit and
-/// not be able to explain.
-///
-/// `SUPATH` doubles as what the agent's own root sessions get, so root's
-/// `PATH` is one string rather than two that have to be kept equal.
-pub const SUPATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const USER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// A resolved guest account — everything a login needs from the guest's own
 /// account database, and nothing vmlab invents.
@@ -131,9 +129,14 @@ impl Session {
             ("SHELL".to_string(), a.shell.clone()),
             (
                 "PATH".to_string(),
-                if a.uid == 0 { SUPATH } else { USER_PATH }.to_string(),
+                if a.uid == 0 {
+                    os::SUPATH
+                } else {
+                    os::USER_PATH
+                }
+                .to_string(),
             ),
-            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LANG".to_string(), super::LANG.to_string()),
         ];
         if let Some(dir) = &self.runtime_dir {
             env.push(("XDG_RUNTIME_DIR".to_string(), dir.clone()));
@@ -184,15 +187,66 @@ impl Credentials {
 
 // ---- resolving the account ------------------------------------------------
 
-/// One `/etc/passwd` row.
-struct PasswdEntry {
-    name: String,
-    uid: u32,
-    gid: u32,
-    home: String,
-    shell: String,
+/// One account as the guest's account database holds it.
+pub struct PasswdEntry {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
+    pub shell: String,
 }
 
+/// Where a guest keeps its accounts: `/etc/passwd` and `/etc/group` on Linux
+/// (inside a container's rootfs, too), the directory service on macOS. The
+/// policy that reads one — [`resolve_account`] — is the same for both.
+pub trait AccountDb {
+    fn by_name(&self, name: &str) -> Option<PasswdEntry>;
+    fn by_uid(&self, uid: u32) -> Option<PasswdEntry>;
+    /// The gids `initgroups` would add for `entry` beyond its primary.
+    fn groups_of(&self, entry: &PasswdEntry) -> Vec<u32>;
+    fn group_by_name(&self, name: &str) -> Option<u32>;
+    /// Where an account that is not there was looked for, as an error says.
+    fn accounts_where(&self) -> &'static str;
+    fn groups_where(&self) -> &'static str;
+}
+
+/// The two files, as read.
+#[cfg(target_os = "linux")]
+pub struct Files<'a> {
+    pub passwd: &'a str,
+    pub group: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl AccountDb for Files<'_> {
+    fn by_name(&self, name: &str) -> Option<PasswdEntry> {
+        parse_passwd(self.passwd)
+            .into_iter()
+            .find(|e| e.name == name)
+    }
+
+    fn by_uid(&self, uid: u32) -> Option<PasswdEntry> {
+        parse_passwd(self.passwd).into_iter().find(|e| e.uid == uid)
+    }
+
+    fn groups_of(&self, entry: &PasswdEntry) -> Vec<u32> {
+        supplementary_groups(self.group, &entry.name)
+    }
+
+    fn group_by_name(&self, name: &str) -> Option<u32> {
+        find_group(self.group, name)
+    }
+
+    fn accounts_where(&self) -> &'static str {
+        "this guest's /etc/passwd"
+    }
+
+    fn groups_where(&self) -> &'static str {
+        "this guest's /etc/group"
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn parse_passwd(content: &str) -> Vec<PasswdEntry> {
     content
         .lines()
@@ -214,6 +268,7 @@ fn parse_passwd(content: &str) -> Vec<PasswdEntry> {
 }
 
 /// Every gid in `group` whose member list names `user`.
+#[cfg(target_os = "linux")]
 fn supplementary_groups(content: &str, user: &str) -> Vec<u32> {
     content
         .lines()
@@ -232,6 +287,7 @@ fn supplementary_groups(content: &str, user: &str) -> Vec<u32> {
 }
 
 /// Look up a group by name → gid.
+#[cfg(target_os = "linux")]
 fn find_group(content: &str, name: &str) -> Option<u32> {
     content.lines().find_map(|line| {
         // name:passwd:gid:members
@@ -249,7 +305,13 @@ fn find_group(content: &str, name: &str) -> Option<u32> {
 /// both ordinary. A bare uid is accepted the way the OCI runtimes accept one,
 /// because a container's `USER` is often numeric and absent from passwd; a
 /// *name* that is absent is an error, since there is nothing left to guess.
+#[cfg(target_os = "linux")]
 pub fn resolve_account(selector: &str, passwd: &str, group: &str) -> Result<Account, String> {
+    resolve_in(selector, &Files { passwd, group })
+}
+
+/// [`resolve_account`] against any account database.
+pub fn resolve_in(selector: &str, db: &dyn AccountDb) -> Result<Account, String> {
     let (user, wanted_group) = match selector.split_once(':') {
         Some((_, "")) => return Err(format!("bad account `{selector}`: empty group")),
         Some((user, g)) => (user, Some(g)),
@@ -258,12 +320,11 @@ pub fn resolve_account(selector: &str, passwd: &str, group: &str) -> Result<Acco
     if user.is_empty() {
         return Err("empty account name".to_string());
     }
-    let entries = parse_passwd(passwd);
     let entry = match user.parse::<u32>() {
-        Ok(uid) => entries.iter().find(|e| e.uid == uid),
-        Err(_) => Some(entries.iter().find(|e| e.name == user).ok_or_else(|| {
+        Ok(uid) => db.by_uid(uid),
+        Err(_) => Some(db.by_name(user).ok_or_else(|| {
             // §19.2: loud, and naming the account. The host adds the machine.
-            format!("no account `{user}` in this guest's /etc/passwd")
+            format!("no account `{user}` in {}", db.accounts_where())
         })?),
     };
     // A numeric id absent from passwd: gid 0, no home of its own, and the
@@ -283,22 +344,22 @@ pub fn resolve_account(selector: &str, passwd: &str, group: &str) -> Result<Acco
         }
         Some(entry) => {
             let mut groups = vec![entry.gid];
-            for gid in supplementary_groups(group, &entry.name) {
+            for gid in db.groups_of(&entry) {
                 if !groups.contains(&gid) {
                     groups.push(gid);
                 }
             }
             Account {
-                name: entry.name.clone(),
+                name: entry.name,
                 uid: entry.uid,
                 gid: entry.gid,
                 groups,
                 home: if entry.home.is_empty() {
                     "/".to_string()
                 } else {
-                    entry.home.clone()
+                    entry.home
                 },
-                shell: entry.shell.clone(),
+                shell: entry.shell,
             }
         }
     };
@@ -307,8 +368,9 @@ pub fn resolve_account(selector: &str, passwd: &str, group: &str) -> Result<Acco
     if let Some(wanted) = wanted_group {
         let gid = match wanted.parse::<u32>() {
             Ok(gid) => gid,
-            Err(_) => find_group(group, wanted)
-                .ok_or_else(|| format!("no group `{wanted}` in this guest's /etc/group"))?,
+            Err(_) => db
+                .group_by_name(wanted)
+                .ok_or_else(|| format!("no group `{wanted}` in {}", db.groups_where()))?,
         };
         account.groups.retain(|g| *g != account.gid);
         account.gid = gid;
@@ -326,7 +388,7 @@ pub fn usable_shell(root: &Path, shell: &str) -> String {
     if exists(shell) {
         return shell.to_string();
     }
-    for candidate in ["/bin/bash", "/usr/bin/bash", "/bin/sh"] {
+    for candidate in os::SHELLS {
         if exists(candidate) {
             return candidate.to_string();
         }
@@ -353,29 +415,6 @@ pub fn choose_mechanism(root: &Path) -> Mechanism {
         }
     }
     Mechanism::Setuid
-}
-
-/// Create the session's `XDG_RUNTIME_DIR` and hand back its guest-side path.
-///
-/// Rootless container tooling — the case §19.2 names — puts its state here
-/// and fails in ways that read as a broken installation when it is absent.
-/// logind owns this directory on a guest that has one and will mount its own
-/// tmpfs over ours; doing it anyway is what covers the guests that have PAM
-/// but no logind, and the `setuid` route, which has neither.
-fn ensure_runtime_dir(root: &Path, account: &Account) -> Option<String> {
-    let inside = format!("/run/user/{}", account.uid);
-    let path = root.join(inside.trim_start_matches('/'));
-    std::fs::create_dir_all(&path).ok()?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-    let dir = std::fs::File::open(&path).ok()?;
-    // Root-owned it would be useless to the session it exists for.
-    nix::unistd::fchown(
-        dir.as_fd(),
-        Some(nix::unistd::Uid::from_raw(account.uid)),
-        Some(nix::unistd::Gid::from_raw(account.gid)),
-    )
-    .ok()?;
-    Some(inside)
 }
 
 // ---- the shell script the PAM route runs ----------------------------------
@@ -455,6 +494,7 @@ impl Logins {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn for_container(rootfs: &str) -> Logins {
         Logins {
             cache: LogonCache::new(),
@@ -497,6 +537,7 @@ impl Logins {
     /// same passwd to start the workload, so a failure here means the rootfs
     /// changed underneath us — and landing as root is a better answer than
     /// refusing every attach to a running container.
+    #[cfg(target_os = "linux")]
     pub fn floor(&self, selector: &str) -> Option<Session> {
         match self.log_in(selector, false) {
             Ok(session) => {
@@ -519,21 +560,33 @@ impl Logins {
     /// image often has none, and a numeric selector resolves against it
     /// perfectly well, which is the case cinit already tolerates.
     fn log_in(&self, selector: &str, declared: bool) -> Result<Session, String> {
-        let read = |file: &str| std::fs::read_to_string(self.root.join(file)).unwrap_or_default();
-        let mut account = resolve_account(selector, &read("etc/passwd"), &read("etc/group"))?;
+        let mut account = self.lookup(selector)?;
         account.shell = usable_shell(&self.root, &account.shell);
         let mechanism = if self.pam {
             choose_mechanism(&self.root)
         } else {
             Mechanism::Setuid
         };
-        let runtime_dir = ensure_runtime_dir(&self.root, &account);
+        let runtime_dir = os::runtime_dir(&self.root, &account);
         Ok(Session {
             account,
             mechanism,
             declared,
             runtime_dir,
         })
+    }
+
+    /// The account `selector` names, from the files under this guest's root.
+    #[cfg(target_os = "linux")]
+    fn lookup(&self, selector: &str) -> Result<Account, String> {
+        let read = |file: &str| std::fs::read_to_string(self.root.join(file)).unwrap_or_default();
+        resolve_account(selector, &read("etc/passwd"), &read("etc/group"))
+    }
+
+    /// The account `selector` names, from the directory service.
+    #[cfg(target_os = "macos")]
+    fn lookup(&self, selector: &str) -> Result<Account, String> {
+        resolve_in(selector, &os::DirectoryService)
     }
 
     /// Drop resolutions nothing holds and nothing has taken lately.
@@ -596,18 +649,14 @@ pub fn own_the_terminal(slave: impl AsFd, account: &Account) {
 
 /// The thread is reading as a session; dropping this puts it back.
 ///
-/// `setfsuid`/`setfsgid` are Linux's per-thread filesystem identity and the
-/// exact analogue of the impersonation the Windows adapter does — a `tail`
-/// that ran as root would succeed on files the session itself could not open,
-/// which is the same class of "indistinguishable from a login" this module is
-/// about. Supplementary groups stay root's: they are not per-thread, so a
-/// file reachable only through one is the one read this cannot mirror.
-///
-/// Raw syscalls because musl does not expose `setfsuid`/`setfsgid` at all,
-/// and the agent is built against it.
+/// The per-thread identity ([`ThreadIds`]) is the exact analogue of the
+/// impersonation the Windows adapter does — a `tail` that ran as root would
+/// succeed on files the session itself could not open, which is the same
+/// class of "indistinguishable from a login" this module is about.
 struct AsSession {
-    previous_uid: u32,
-    previous_gid: u32,
+    /// Declared before `_held`: the thread takes its own identity back
+    /// before the resolution can be dropped.
+    _ids: ThreadIds,
     /// Keeps the resolution alive for as long as the thread is wearing it.
     /// Absent for the container floor, which the cache never held.
     _held: Option<Arc<Held<Session>>>,
@@ -615,35 +664,14 @@ struct AsSession {
 
 impl Adopted for AsSession {}
 
-impl Drop for AsSession {
-    fn drop(&mut self) {
-        set_fs_ids(self.previous_uid, self.previous_gid);
-    }
-}
-
-/// Set this thread's filesystem uid/gid, returning the previous pair. Neither
-/// call reports failure — both answer with the *previous* value — so the
-/// caller reads back to find out whether it took.
-fn set_fs_ids(uid: u32, gid: u32) -> (u32, u32) {
-    // SAFETY: two argument-free-by-value Linux syscalls that only ever affect
-    // the calling thread.
-    unsafe {
-        let previous_gid = libc::syscall(libc::SYS_setfsgid, gid) as u32;
-        let previous_uid = libc::syscall(libc::SYS_setfsuid, uid) as u32;
-        (previous_uid, previous_gid)
-    }
-}
-
 /// Lend a session's identity to whichever thread calls the adopter.
 ///
 /// The account is passed rather than read off `held` because the container
 /// floor is a session the cache never minted and so has nothing to hold.
 pub fn adopter_as(account: Account, held: Option<Arc<Held<Session>>>) -> Adopter {
     Box::new(move || {
-        let (previous_uid, previous_gid) = set_fs_ids(account.uid, account.gid);
         Ok(Box::new(AsSession {
-            previous_uid,
-            previous_gid,
+            _ids: ThreadIds::assume(account.uid, account.gid)?,
             _held: held.clone(),
         }) as Box<dyn Adopted>)
     })
@@ -663,6 +691,7 @@ pub fn credentials_for(session: &Session) -> Option<Credentials> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\n\
                           dev:x:1000:1000:Dev User:/home/dev:/bin/bash\n\
@@ -690,6 +719,50 @@ mod tests {
             "the primary gid first, then every group naming the account"
         );
         assert_eq!(dev.login_shell(), vec!["/bin/bash", "-l"]);
+    }
+
+    /// A database that is not two files — macOS's directory service — is
+    /// read by the same policy, and a missing account or group is named by
+    /// where *that* database was asked.
+    #[test]
+    fn any_account_database_is_read_by_the_same_policy() {
+        struct Directory;
+        impl AccountDb for Directory {
+            fn by_name(&self, name: &str) -> Option<PasswdEntry> {
+                (name == "admin1").then(|| PasswdEntry {
+                    name: "admin1".into(),
+                    uid: 501,
+                    gid: 20,
+                    home: "/Users/admin1".into(),
+                    shell: "/bin/zsh".into(),
+                })
+            }
+            fn by_uid(&self, uid: u32) -> Option<PasswdEntry> {
+                (uid == 501).then(|| self.by_name("admin1")).flatten()
+            }
+            fn groups_of(&self, _entry: &PasswdEntry) -> Vec<u32> {
+                vec![20, 80, 12]
+            }
+            fn group_by_name(&self, name: &str) -> Option<u32> {
+                (name == "admin").then_some(80)
+            }
+            fn accounts_where(&self) -> &'static str {
+                "the directory"
+            }
+            fn groups_where(&self) -> &'static str {
+                "the directory's groups"
+            }
+        }
+        let a = resolve_in("admin1", &Directory).unwrap();
+        assert_eq!((a.uid, a.gid), (501, 20));
+        assert_eq!(a.groups, vec![20, 80, 12], "the primary gid once, first");
+        assert_eq!(a.home, "/Users/admin1");
+        assert_eq!(resolve_in("501", &Directory).unwrap().name, "admin1");
+        assert_eq!(resolve_in("admin1:admin", &Directory).unwrap().gid, 80);
+        let err = resolve_in("nobody-here", &Directory).unwrap_err();
+        assert_eq!(err, "no account `nobody-here` in the directory");
+        let err = resolve_in("admin1:wheel", &Directory).unwrap_err();
+        assert_eq!(err, "no group `wheel` in the directory's groups");
     }
 
     /// A container's `USER` is often a bare uid that passwd never mentions —
@@ -817,7 +890,7 @@ mod tests {
         assert_eq!(value("XDG_RUNTIME_DIR"), Some("/run/user/1000"));
         assert_eq!(
             value("PATH"),
-            Some(USER_PATH),
+            Some(os::USER_PATH),
             "a non-root login gets login.defs' ENV_PATH, not root's"
         );
     }
@@ -827,7 +900,7 @@ mod tests {
         let mut s = session(Mechanism::Setuid);
         s.account = resolve_account("root", PASSWD, GROUP).unwrap();
         let env = s.env();
-        assert!(env.contains(&("PATH".into(), SUPATH.into())));
+        assert!(env.contains(&("PATH".into(), os::SUPATH.into())));
     }
 
     /// The PAM route drops privileges inside `su`; doing it first would leave
@@ -908,7 +981,7 @@ mod tests {
             home: "/home/dev".into(),
             shell: "/bin/sh".into(),
         };
-        let inside = ensure_runtime_dir(dir.path(), &account).unwrap();
+        let inside = os::runtime_dir(dir.path(), &account).unwrap();
         assert_eq!(inside, format!("/run/user/{}", account.uid));
         let made = dir.path().join(inside.trim_start_matches('/'));
         assert!(made.is_dir());

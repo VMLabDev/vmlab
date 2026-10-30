@@ -1,22 +1,52 @@
-//! Linux platform half: virtio-port discovery, the PTY terminal (a
-//! namespace-free descendant of `guest/cinit/src/tty.rs`), metrics sampling
-//! from /proc, and a best-effort clipboard when a display session is
-//! actually reachable (in practice: never on the headless server templates,
-//! and the feature is then simply not advertised).
+//! The Unix platform half, Linux's and macOS's alike: the agent port, the
+//! PTY terminal (a namespace-free descendant of `guest/cinit/src/tty.rs`),
+//! piped exec, the logins behind both, network and OS facts, the clock and
+//! the power state.
+//!
+//! What the two kernels answer differently lives in one submodule each,
+//! re-exported as `os`: where the agent port is, how metrics are sampled,
+//! how the guest is brought down, which clipboard is reachable, and which
+//! features exist at all. [`linux`] reads `/proc` and `/sys` and adds what
+//! only Linux serves — the workspace watch, process trees, shared apps and
+//! container micro-VMs ([`container`]); [`macos`] asks the Mach host and
+//! `sysctl`, and serves none of those four (PRD §7.4).
 //!
 //! Who a session runs as lives next door in [`login`]: PRD §19.2's declared
 //! logins, and the container floor — the user cinit resolved, which every
 //! session inherits when no `login {}` is declared.
 
 pub mod login;
+
+#[cfg(target_os = "linux")]
+pub mod container;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
 pub mod shepherd;
+#[cfg(target_os = "linux")]
+use linux as os;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as os;
+
+pub use os::{cpu_sample, disk_sample, mem_sample};
+
+/// Cumulative (busy, total) CPU time, in whatever unit this kernel counts
+/// it in: two samples apart give the utilisation between them.
+pub type CpuSample = (u64, u64);
+
+/// The locale every session gets: every glibc and musl guest has it, and
+/// macOS's own `/etc/zprofile` sets it for a login that has none.
+const LANG: &str = "C.UTF-8";
 
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -25,12 +55,12 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, chdir, chroot, execve, fork, setsid};
-use std::os::unix::fs::PermissionsExt;
+use nix::unistd::{ForkResult, Pid, chdir, execve, fork, setsid};
 use std::os::unix::process::CommandExt;
 
-use vmlab_agent_proto::{DiskUsage, NetInterface, OsInfo, PORT_NAME, ShutdownMode, features};
+use vmlab_agent_proto::{NetInterface, OsInfo, PORT_NAME, ShutdownMode, features};
 
+#[cfg(target_os = "linux")]
 use crate::app::AppHome;
 use crate::logon::Held;
 use crate::mux::Mux;
@@ -39,6 +69,8 @@ use crate::spawn::{
     hold_until_it_exits, piped_command,
 };
 
+#[cfg(target_os = "linux")]
+use container::ContainerCtx;
 use login::{Account, Credentials, Logins, Mechanism, Session};
 
 const BANNER: &str = concat!(
@@ -70,31 +102,31 @@ fn whose_shell(session: Option<&Session>) -> String {
 
 /// The banner a terminal opens with, on a VM and inside a container.
 fn terminal_motd(route: &Route) -> String {
+    let mut motd = String::from(BANNER);
     let session = match route {
-        Route::Container(_, session) => *session,
+        #[cfg(target_os = "linux")]
+        Route::Container(_, session) => {
+            motd.push_str("vmlab container terminal\n");
+            motd.push_str(&format!(
+                "  {} inside the container namespaces.\n",
+                whose_shell(*session)
+            ));
+            motd.push_str(
+                "  The image filesystem, environment, volumes, and processes are available here.\n",
+            );
+            motd.push_str(
+                "  Run 'busybox --list' to see tools; 'exit' ends this session; Ctrl-] detaches.\n\n",
+            );
+            return motd;
+        }
         Route::Agent => None,
         Route::Pam(s, _) | Route::Setuid(s) => Some(*s),
     };
-    let mut motd = String::from(BANNER);
-    if matches!(route, Route::Container(..)) {
-        motd.push_str("vmlab container terminal\n");
-        motd.push_str(&format!(
-            "  {} inside the container namespaces.\n",
-            whose_shell(session)
-        ));
-        motd.push_str(
-            "  The image filesystem, environment, volumes, and processes are available here.\n",
-        );
-        motd.push_str(
-            "  Run 'busybox --list' to see tools; 'exit' ends this session; Ctrl-] detaches.\n\n",
-        );
-    } else {
-        motd.push_str(&format!(
-            "vmlab terminal - {} over virtio-serial (works with no network).\n",
-            whose_shell(session)
-        ));
-        motd.push_str("  'exit' ends this session; Ctrl-] detaches the CLI client.\n\n");
-    }
+    motd.push_str(&format!(
+        "vmlab terminal - {} over virtio-serial (works with no network).\n",
+        whose_shell(session)
+    ));
+    motd.push_str("  'exit' ends this session; Ctrl-] detaches the CLI client.\n\n");
     motd
 }
 
@@ -111,22 +143,6 @@ fn winsize(cols: u16, rows: u16) -> Winsize {
     }
 }
 
-/// Resolve a virtio-serial port by its name property. Without udev there are
-/// no /dev/virtio-ports/<name> symlinks, so scan /sys and fall back to the
-/// symlink path for distros that do run udev.
-fn find_virtio_port(name: &str) -> Option<PathBuf> {
-    if let Ok(entries) = fs::read_dir("/sys/class/virtio-ports") {
-        for entry in entries.flatten() {
-            let port_name = fs::read_to_string(entry.path().join("name")).unwrap_or_default();
-            if port_name.trim() == name {
-                return Some(PathBuf::from("/dev").join(entry.file_name()));
-            }
-        }
-    }
-    let byname = PathBuf::from("/dev/virtio-ports").join(name);
-    byname.exists().then_some(byname)
-}
-
 static PORT_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// `--port <device>`: serve on this serial device instead of the virtio port.
@@ -134,30 +150,28 @@ pub fn set_port_override(path: PathBuf) {
     let _ = PORT_OVERRIDE.set(path);
 }
 
-/// Whether this VM has a virtio-serial controller at all (PCI vendor 1af4,
-/// device 1003 legacy or 1043 modern). Hardware, not timing: the profile
-/// decided it before boot, so its absence is a fact, not a race — and the
-/// signal that the agent channel is the 16550 on COM1 instead (PRD §7.4).
-fn has_virtio_serial_controller() -> bool {
-    let Ok(entries) = fs::read_dir("/sys/bus/pci/devices") else {
-        return false;
-    };
-    entries.flatten().any(|e| {
-        let vendor = fs::read_to_string(e.path().join("vendor")).unwrap_or_default();
-        let device = fs::read_to_string(e.path().join("device")).unwrap_or_default();
-        vendor.trim() == "0x1af4" && matches!(device.trim(), "0x1003" | "0x1043")
-    })
+/// The device the agent channel rides, as the platform found it.
+struct Port {
+    path: PathBuf,
+    /// Whether it is a terminal device whose line discipline has to come off
+    /// before a frame survives it: a UART, and every port on macOS, where
+    /// the virtio console is a tty too. A Linux virtio port is a plain
+    /// character device and has no termios to set.
+    tty: bool,
+    /// Said once the port is found, when where it was found is news.
+    note: Option<String>,
 }
 
-/// The serial device the agent channel rides when there is no virtio-serial:
-/// an explicit `--port`, else COM1 when the machine has no virtio-serial
-/// controller but does have a UART.
-fn serial_port() -> Option<PathBuf> {
-    if let Some(p) = PORT_OVERRIDE.get() {
-        return Some(p.clone());
+/// An explicit `--port`, else wherever this kernel puts the agent port.
+fn find_port() -> Option<Port> {
+    match PORT_OVERRIDE.get() {
+        Some(path) => Some(Port {
+            path: path.clone(),
+            tty: true,
+            note: Some(format!("serving on {}", path.display())),
+        }),
+        None => os::find_port(),
     }
-    let com1 = PathBuf::from("/dev/ttyS0");
-    (!has_virtio_serial_controller() && com1.exists()).then_some(com1)
 }
 
 /// Put a serial device in raw mode at 115200 8N1, no flow control — the
@@ -185,28 +199,18 @@ pub fn open_port() -> (
     impl std::io::Write + Send + 'static,
 ) {
     loop {
-        let path = match serial_port() {
-            Some(serial) => {
-                eprintln!(
-                    "vmlab-agent: no virtio-serial; serving on {}",
-                    serial.display()
-                );
-                serial
-            }
-            None => match find_virtio_port(PORT_NAME) {
-                Some(p) => p,
-                None => {
-                    eprintln!("vmlab-agent: waiting for port {PORT_NAME}");
-                    thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
-            },
+        let Some(Port { path, tty, note }) = find_port() else {
+            eprintln!("vmlab-agent: waiting for port {PORT_NAME}");
+            thread::sleep(Duration::from_secs(2));
+            continue;
         };
-        let is_serial = serial_port().is_some();
+        if let Some(note) = note {
+            eprintln!("vmlab-agent: {note}");
+        }
         match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(port) => match port.try_clone() {
                 Ok(w) => {
-                    if is_serial && let Err(e) = configure_serial(&port) {
+                    if tty && let Err(e) = configure_serial(&port) {
                         eprintln!("vmlab-agent: cannot configure {}: {e}", path.display());
                         thread::sleep(Duration::from_secs(2));
                         continue;
@@ -230,101 +234,50 @@ pub fn open_port() -> (
     }
 }
 
-pub struct LinuxPlatform {
-    clipboard: Option<ClipboardTool>,
+pub struct UnixPlatform {
+    clipboard: Option<os::Clipboard>,
     /// Container micro-VM mode (spawned by cinit): sessions run inside the
     /// container instead of the init namespace.
+    #[cfg(target_os = "linux")]
     container: Option<Arc<ContainerCtx>>,
-    spawner: LinuxSpawner,
-    app_paths: AppPaths,
+    spawner: UnixSpawner,
+    #[cfg(target_os = "linux")]
+    app_paths: linux::AppPaths,
 }
 
-/// Where shared-app sessions (PRD §20) put their guest end, as the program
-/// sees it — inside a container these resolve under its root filesystem.
-struct AppPaths {
-    /// The parent of every session's private directory.
-    run: String,
-    /// The X socket directory every X client looks in.
-    x11_unix: String,
-}
-
-impl Default for AppPaths {
-    fn default() -> AppPaths {
-        AppPaths {
-            run: "/run/vmlab-app".to_string(),
-            x11_unix: "/tmp/.X11-unix".to_string(),
-        }
-    }
-}
-
-/// The Linux half of the process/handle seam: PTY terminals, piped exec, and
+/// The Unix half of the process/handle seam: PTY terminals, piped exec, and
 /// the file writes behind `push` — in the init namespace, or inside the
 /// container when cinit started us in container mode. Each as the agent, or
 /// as a declared login the channel carried (PRD §19.2).
-pub struct LinuxSpawner {
+pub struct UnixSpawner {
+    #[cfg(target_os = "linux")]
     container: Option<Arc<ContainerCtx>>,
     logins: Arc<Logins>,
 }
 
-/// Everything a container session spawn needs, prepared once at startup.
-struct ContainerCtx {
-    rootfs: String,
-    /// Namespace fds of the workload holder — entering keeps working even
-    /// after that process dies. `None` in idle mode (no namespaces; the
-    /// prepared rootfs is the whole container).
-    setns: Option<NsHandles>,
-    setns_pid: Option<u32>,
-    env: Vec<(String, String)>,
-    workdir: String,
-    /// §19.2's container floor: the user cinit resolved, which every session
-    /// with no declared `login {}` lands as.
-    floor: Option<Session>,
-}
-
-/// Open namespace handles (same shape as cinit's `Namespaces`).
-struct NsHandles {
-    pid: File,
-    mount: File,
-}
-
-impl NsHandles {
-    fn open(pid: u32) -> std::io::Result<NsHandles> {
-        Ok(NsHandles {
-            pid: File::open(format!("/proc/{pid}/ns/pid"))?,
-            mount: File::open(format!("/proc/{pid}/ns/mnt"))?,
-        })
-    }
-
-    /// Enter the mount namespace immediately. Entering a PID namespace only
-    /// affects subsequently-created children, so callers must fork once
-    /// more (async-signal-safe: raw setns syscalls on open fds).
-    fn enter(&self) -> nix::Result<()> {
-        use std::os::fd::AsFd;
-        nix::sched::setns(self.mount.as_fd(), nix::sched::CloneFlags::CLONE_NEWNS)?;
-        nix::sched::setns(self.pid.as_fd(), nix::sched::CloneFlags::CLONE_NEWPID)
-    }
-}
-
-pub fn new_platform() -> LinuxPlatform {
+pub fn new_platform() -> UnixPlatform {
     let logins = Arc::new(Logins::for_vm());
     login::start_sweeper(logins.clone());
-    LinuxPlatform {
-        clipboard: ClipboardTool::probe(),
+    UnixPlatform {
+        clipboard: os::Clipboard::probe(),
+        #[cfg(target_os = "linux")]
         container: None,
-        spawner: LinuxSpawner {
+        spawner: UnixSpawner {
+            #[cfg(target_os = "linux")]
             container: None,
             logins,
         },
-        app_paths: AppPaths::default(),
+        #[cfg(target_os = "linux")]
+        app_paths: linux::AppPaths::default(),
     }
 }
 
-impl LinuxPlatform {
+#[cfg(all(test, target_os = "linux"))]
+impl UnixPlatform {
     /// Put shared-app sessions somewhere a test can write and look, rather
     /// than `/run` and the build host's own `/tmp/.X11-unix`.
-    #[cfg(test)]
-    pub fn with_app_paths(mut self, run: &str, x11_unix: &str) -> LinuxPlatform {
-        self.app_paths = AppPaths {
+    pub fn with_app_paths(mut self, run: &str, x11_unix: &str) -> UnixPlatform {
+        self.app_paths = linux::AppPaths {
             run: run.to_string(),
             x11_unix: x11_unix.to_string(),
         };
@@ -332,62 +285,31 @@ impl LinuxPlatform {
     }
 }
 
-/// Container-mode platform from cinit's config file.
-pub fn new_platform_container(config_path: &str) -> LinuxPlatform {
-    let cfg: vmlab_agent_proto::ContainerConfig = std::fs::read_to_string(config_path)
-        .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-        .unwrap_or_else(|e| {
-            eprintln!("vmlab-agent: FATAL: bad container config {config_path}: {e}");
-            std::process::exit(1);
-        });
-    let setns = cfg.setns_pid.map(|pid| {
-        NsHandles::open(pid).unwrap_or_else(|e| {
-            eprintln!("vmlab-agent: FATAL: cannot open namespaces of pid {pid}: {e}");
-            std::process::exit(1);
-        })
-    });
-    let logins = Arc::new(Logins::for_container(&cfg.rootfs));
-    login::start_sweeper(logins.clone());
-    let container = Arc::new(ContainerCtx {
-        floor: cfg.user.as_deref().and_then(|user| logins.floor(user)),
-        rootfs: cfg.rootfs,
-        setns,
-        setns_pid: cfg.setns_pid,
-        env: cfg.env,
-        workdir: cfg.workdir.unwrap_or_else(|| "/".to_string()),
-    });
-    LinuxPlatform {
-        clipboard: None,
-        container: Some(container.clone()),
-        spawner: LinuxSpawner {
-            container: Some(container),
-            logins,
-        },
-        app_paths: AppPaths::default(),
-    }
-}
+/// What every Unix agent serves, whichever kernel it runs on.
+const COMMON_FEATURES: &[&str] = &[
+    features::TERMINAL,
+    features::EXEC,
+    features::FILEOPS,
+    features::TAIL,
+    features::METRICS,
+    features::SET_TIME,
+];
 
-impl crate::mux::Platform for LinuxPlatform {
+/// The answer a guest without a reachable clipboard gives — it never
+/// advertises the feature, so only a host that asked anyway hears it.
+const NO_DISPLAY: &str = "no display session is reachable from the agent";
+
+impl crate::mux::Platform for UnixPlatform {
     fn os(&self) -> &'static str {
-        "linux"
+        os::NAME
     }
 
     fn features(&self) -> Vec<String> {
-        let mut f = vec![
-            features::TERMINAL.to_string(),
-            features::EXEC.to_string(),
-            features::FILEOPS.to_string(),
-            features::TAIL.to_string(),
-            features::METRICS.to_string(),
-            features::WATCH.to_string(),
-            features::TREE.to_string(),
-            features::SET_TIME.to_string(),
-            // Whether `waypipe` is installed is the login's business, and
-            // the host learns it from the open failing; X11 needs nothing.
-            features::APP_WAYPIPE.to_string(),
-            features::APP_X11.to_string(),
-        ];
+        let mut f: Vec<String> = COMMON_FEATURES
+            .iter()
+            .chain(os::FEATURES)
+            .map(|f| f.to_string())
+            .collect();
         if self.clipboard.is_some() {
             f.push(features::CLIPBOARD.to_string());
             f.push(features::CLIPBOARD_REPLY.to_string());
@@ -400,13 +322,14 @@ impl crate::mux::Platform for LinuxPlatform {
     }
 
     fn path_resolver(&self) -> crate::mux::PathResolver {
-        match &self.container {
-            None => Arc::new(|path| path),
-            Some(ctx) => {
-                let rootfs = ctx.rootfs.clone();
-                Arc::new(move |path: String| format!("{rootfs}/{}", path.trim_start_matches('/')))
-            }
+        #[cfg(target_os = "linux")]
+        if let Some(ctx) = &self.container {
+            let rootfs = ctx.rootfs.clone();
+            return Arc::new(move |path: String| {
+                format!("{rootfs}/{}", path.trim_start_matches('/'))
+            });
         }
+        Arc::new(|path| path)
     }
 
     fn open_eventlog(&self, mux: &Mux, id: u32, _filter: Option<String>) {
@@ -415,9 +338,7 @@ impl crate::mux::Platform for LinuxPlatform {
 
     fn set_clipboard(&self, mux: &Mux, text: String) {
         let outcome = match &self.clipboard {
-            Some(tool) => tool
-                .set(&text)
-                .map_err(|e| format!("the clipboard tool failed: {e}")),
+            Some(clipboard) => clipboard.set(&text),
             None => Err(NO_DISPLAY.to_string()),
         };
         crate::clipboard::answer_set(mux, outcome);
@@ -425,9 +346,7 @@ impl crate::mux::Platform for LinuxPlatform {
 
     fn get_clipboard(&self, mux: &Mux) {
         let outcome = match &self.clipboard {
-            Some(tool) => tool
-                .get()
-                .map_err(|e| format!("the clipboard tool failed: {e}")),
+            Some(clipboard) => clipboard.get(),
             None => Err(NO_DISPLAY.to_string()),
         };
         crate::clipboard::answer_get(mux, outcome);
@@ -438,9 +357,10 @@ impl crate::mux::Platform for LinuxPlatform {
     }
 
     fn os_info(&self) -> Result<OsInfo, String> {
-        Ok(os_info())
+        Ok(os::os_info())
     }
 
+    #[cfg(target_os = "linux")]
     fn tree_status(&self, tree: &str) -> Result<u32, String> {
         shepherd::status(tree)
     }
@@ -450,16 +370,17 @@ impl crate::mux::Platform for LinuxPlatform {
         thread::spawn(move || {
             // Let the ShuttingDown ack drain to the host first.
             thread::sleep(Duration::from_millis(200));
-            if let Err(e) = run_shutdown(mode) {
+            if let Err(e) = os::shutdown(mode) {
                 mux.send_error(None, format!("shutdown: {e}"));
             }
         });
     }
 
     fn set_time(&self, unix_ms: i64) -> Result<(), String> {
-        set_realtime_clock(unix_ms)
+        os::set_clock(unix_ms)
     }
 
+    #[cfg(target_os = "linux")]
     fn app_home(&self, identity: &Identity, name: &str) -> Result<AppHome, String> {
         let held = self
             .spawner
@@ -470,7 +391,7 @@ impl crate::mux::Platform for LinuxPlatform {
         let resolve = self.path_resolver();
         let seen = format!("{}/{name}", self.app_paths.run);
         let dir = PathBuf::from(resolve(seen.clone()));
-        make_app_dir(
+        linux::make_app_dir(
             &PathBuf::from(resolve(self.app_paths.run.clone())),
             &dir,
             owner,
@@ -486,47 +407,12 @@ impl crate::mux::Platform for LinuxPlatform {
     }
 }
 
-/// A session's private directory: under a parent anyone may pass through but
-/// nobody else may list, replacing whatever an earlier agent left at the
-/// name, mode 0700 and the session's own.
-fn make_app_dir(parent: &Path, dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    if !parent.is_dir() {
-        fs::create_dir_all(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o711))?;
-    }
-    if dir.exists() {
-        fs::remove_dir_all(dir)?;
-    }
-    fs::create_dir(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(dir, Some(uid), Some(gid))?;
-    }
-    Ok(())
-}
-
-/// Set CLOCK_REALTIME. The system clock only — the hardware clock is left
-/// to the guest's own sync, and nothing is shelled out to.
-fn set_realtime_clock(unix_ms: i64) -> Result<(), String> {
-    let ts = libc::timespec {
-        tv_sec: unix_ms.div_euclid(1000) as libc::time_t,
-        tv_nsec: (unix_ms.rem_euclid(1000) * 1_000_000) as libc::c_long,
-    };
-    // SAFETY: a plain syscall reading one initialised timespec.
-    match unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } {
-        0 => Ok(()),
-        _ => Err(format!(
-            "clock_settime(CLOCK_REALTIME): {}",
-            std::io::Error::last_os_error()
-        )),
-    }
-}
-
 /// How a channel's work gets to be who it is — decided once, then read by
 /// both the terminal and the exec shapes so they cannot drift apart.
 enum Route<'a> {
     /// Inside a container micro-VM, as whoever the session is: the declared
     /// login, else §19.2's container floor, else root.
+    #[cfg(target_os = "linux")]
     Container(&'a ContainerCtx, Option<&'a Session>),
     /// The agent's own identity on a VM — §19.2's floor, no login at all.
     Agent,
@@ -538,7 +424,7 @@ enum Route<'a> {
     Setuid(&'a Session),
 }
 
-impl LinuxSpawner {
+impl UnixSpawner {
     /// The route a channel's work takes: the declared login where the open
     /// carried one, else the container floor, else the agent's own identity
     /// (PRD §19.2).
@@ -549,20 +435,19 @@ impl LinuxSpawner {
     /// The route for a login already resolved — `None` meaning "whatever this
     /// machine's floor is", which is the container's user or nothing at all.
     fn route_for<'a>(&'a self, declared: Option<&'a Session>) -> Route<'a> {
-        let session = declared.or_else(|| self.container.as_ref().and_then(|c| c.floor.as_ref()));
-        match (&self.container, session) {
-            (Some(ctx), session) => Route::Container(ctx, session),
-            (None, None) => Route::Agent,
-            (
-                None,
-                Some(
-                    s @ Session {
-                        mechanism: Mechanism::Pam { su },
-                        ..
-                    },
-                ),
+        #[cfg(target_os = "linux")]
+        if let Some(ctx) = &self.container {
+            return Route::Container(ctx, declared.or(ctx.floor.as_ref()));
+        }
+        match declared {
+            None => Route::Agent,
+            Some(
+                s @ Session {
+                    mechanism: Mechanism::Pam { su },
+                    ..
+                },
             ) => Route::Pam(s, su),
-            (None, Some(s)) => Route::Setuid(s),
+            Some(s) => Route::Setuid(s),
         }
     }
 
@@ -579,15 +464,17 @@ impl LinuxSpawner {
             // that setns's, forks into the PID namespace, chroots, drops to
             // the session's ids, and execs) so the process genuinely lives
             // inside the container while std::process handles the pipes.
+            #[cfg(target_os = "linux")]
             Route::Container(ctx, session) => {
-                let mut env = container_env(ctx, *session);
+                let mut env = container::container_env(ctx, *session);
                 env.extend(spec.env);
                 ExecPlan {
                     spec: ProcessSpec {
-                        argv: nsexec_argv(
+                        argv: container::nsexec_argv(
                             ctx,
                             spec.argv,
-                            spec.cwd.or_else(|| container_home(ctx, *session)),
+                            spec.cwd
+                                .or_else(|| container::container_home(ctx, *session)),
                             session.and_then(login::credentials_for).as_ref(),
                         ),
                         env,
@@ -656,14 +543,16 @@ impl LinuxSpawner {
         let plan = match route {
             // The injected BusyBox (so a distroless image still gets a
             // toolbox) as whoever the session is.
+            #[cfg(target_os = "linux")]
             Route::Container(ctx, session) => {
-                let mut env = container_env(ctx, *session);
+                let mut env = container::container_env(ctx, *session);
                 env.extend(overrides);
                 ShellPlan {
-                    argv: command.or_else(|| container_shell(&ctx.rootfs)),
+                    argv: command.or_else(|| container::container_shell(&ctx.rootfs)),
                     env,
                     credentials: session.and_then(login::credentials_for),
-                    cwd: container_home(ctx, *session).unwrap_or_else(|| ctx.workdir.clone()),
+                    cwd: container::container_home(ctx, *session)
+                        .unwrap_or_else(|| ctx.workdir.clone()),
                     motd,
                 }
             }
@@ -674,7 +563,7 @@ impl LinuxSpawner {
                     argv: command.or_else(default_shell),
                     env,
                     credentials: None,
-                    cwd: "/root".to_string(),
+                    cwd: os::ROOT_HOME.to_string(),
                     motd,
                 }
             }
@@ -697,7 +586,7 @@ impl LinuxSpawner {
                     )),
                     env: vec![
                         ("TERM".to_string(), "xterm-256color".to_string()),
-                        ("PATH".to_string(), login::SUPATH.to_string()),
+                        ("PATH".to_string(), os::SUPATH.to_string()),
                     ],
                     credentials: None,
                     cwd: s.account.home.clone(),
@@ -734,24 +623,11 @@ impl LinuxSpawner {
 /// VM, where the agent is already itself.
 fn owner<'a>(route: &'a Route) -> Option<&'a Account> {
     match route {
+        #[cfg(target_os = "linux")]
         Route::Container(_, session) => session.map(|s| &s.account),
         Route::Agent => None,
         Route::Pam(s, _) | Route::Setuid(s) => Some(&s.account),
     }
-}
-
-/// Where a container session starts, when that is somewhere other than the
-/// container's own working directory.
-///
-/// A **declared** login lands in its own `$HOME`, the way §19.2 asks every
-/// session to: `login "dev"` on a container is a person saying "attach me as
-/// `dev`", and `/app` is where the *workload* runs. The floor is the workload,
-/// so it keeps the workload's directory.
-fn container_home(ctx: &ContainerCtx, session: Option<&Session>) -> Option<String> {
-    let session = session?;
-    (session.declared && session.account.home != "/")
-        .then(|| session.account.home.clone())
-        .filter(|home| Path::new(&format!("{}{home}", ctx.rootfs)).is_dir())
 }
 
 /// The piped spawn, resolved: what to run, as whom, and where.
@@ -801,7 +677,7 @@ fn spawn_piped_with(plan: ExecPlan, extra: impl FnOnce(&mut Command)) -> std::io
 }
 
 /// The shell spawn, resolved: what to run, as whom, and where. `argv` is
-/// `Option` only while it is being resolved; [`LinuxSpawner::shell_plan`] is
+/// `Option` only while it is being resolved; [`UnixSpawner::shell_plan`] is
 /// the only constructor and never hands one back empty.
 struct ShellPlan {
     argv: Option<Vec<String>>,
@@ -814,13 +690,13 @@ struct ShellPlan {
     motd: String,
 }
 
-impl Spawner for LinuxSpawner {
+impl Spawner for UnixSpawner {
     fn terminal(&self, identity: &Identity, spec: TerminalSpec) -> std::io::Result<Spawned> {
         let held = self.logins.resolve(identity)?;
         let route = self.route(&held);
         let plan = self.shell_plan(&route, spec.command, spec.env)?;
         let size = winsize(spec.cols, spec.rows);
-        let (master, pid) = spawn_shell(&plan, &size, self.container.as_deref(), owner(&route))?;
+        let (master, pid) = spawn_shell(&plan, &size, self.jail()?, owner(&route))?;
         // The master is shared: one dup drives keystrokes in, another the VT
         // stream out, and the resize hook needs the fd itself.
         let master = Arc::new(master);
@@ -858,7 +734,17 @@ impl Spawner for LinuxSpawner {
         // The shepherd wraps the whole plan, `su` and the container
         // trampoline included, so whatever they start is in the tree too.
         let spawned = match plan.spec.tree.take() {
+            #[cfg(target_os = "linux")]
             Some(tree) => shepherd::spawn(plan, &tree)?,
+            // Only Linux advertises `features::TREE`: an orphan elsewhere is
+            // reparented to an init this agent cannot count it under.
+            #[cfg(not(target_os = "linux"))]
+            Some(tree) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("process tree {tree}: process trees need a Linux or Windows guest"),
+                ));
+            }
             None => spawn_piped(plan)?,
         };
         Ok(hold_until_it_exits(spawned, held))
@@ -872,51 +758,6 @@ impl Spawner for LinuxSpawner {
             None => Ok(adopt_as_agent()),
         }
     }
-}
-
-/// The trampoline command line `nsexec_main` parses back out: the holder
-/// pid (0 in idle mode), the rootfs, the working directory, the session's
-/// ids (`-` for none), then the caller's argv after a `--` separator.
-fn nsexec_argv(
-    ctx: &ContainerCtx,
-    argv: Vec<String>,
-    cwd: Option<String>,
-    credentials: Option<&Credentials>,
-) -> Vec<String> {
-    let mut wrapped = vec![
-        "/proc/self/exe".to_string(),
-        "--nsexec".to_string(),
-        ctx.setns_pid.unwrap_or(0).to_string(),
-        ctx.rootfs.clone(),
-        cwd.unwrap_or_else(|| ctx.workdir.clone()),
-        credentials.map_or_else(|| "-".to_string(), format_credentials),
-        "--".to_string(),
-    ];
-    wrapped.extend(argv);
-    wrapped
-}
-
-/// `uid:gid:g1,g2,…` — the trampoline's own contract with itself, so the
-/// re-exec that crosses the namespaces knows who to become on the far side.
-fn format_credentials(c: &Credentials) -> String {
-    let groups: Vec<String> = c.groups.iter().map(u32::to_string).collect();
-    format!("{}:{}:{}", c.uid, c.gid, groups.join(","))
-}
-
-fn parse_credentials(field: &str) -> Option<Credentials> {
-    if field == "-" {
-        return None;
-    }
-    let mut parts = field.split(':');
-    let uid = parts.next()?.parse().ok()?;
-    let gid = parts.next()?.parse().ok()?;
-    let groups = parts
-        .next()
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|g| g.parse().ok())
-        .collect();
-    Some(Credentials { uid, gid, groups })
 }
 
 /// Guest NICs via getifaddrs: link-layer, IPv4 and IPv6 entries for one
@@ -964,31 +805,6 @@ fn net_info() -> Result<Vec<NetInterface>, String> {
     Ok(out)
 }
 
-/// Structured OS info from /etc/os-release + uname. Infallible: an initramfs
-/// without os-release (container micro-VMs) still answers with the kernel's
-/// view.
-fn os_info() -> OsInfo {
-    let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
-    let field = |key: &str| {
-        os_release
-            .lines()
-            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
-            .map(|v| v.trim().trim_matches('"').to_string())
-            .filter(|v| !v.is_empty())
-    };
-    let uts = uname();
-    OsInfo {
-        id: field("ID").unwrap_or_else(|| "linux".into()),
-        name: field("PRETTY_NAME")
-            .or_else(|| field("NAME"))
-            .unwrap_or_else(|| "Linux".into()),
-        version: field("VERSION_ID").unwrap_or_default(),
-        kernel: uts.0,
-        arch: uts.1,
-        hostname: uts.2,
-    }
-}
-
 /// (kernel release, machine arch, hostname) via uname(2).
 fn uname() -> (String, String, String) {
     // SAFETY: plain uname(2) into a zeroed struct.
@@ -1005,154 +821,78 @@ fn uname() -> (String, String, String) {
     (s(&uts.release), s(&uts.machine), s(&uts.nodename))
 }
 
-/// Bring the guest down: ask the init system so services stop cleanly, and
-/// fall back to the raw reboot(2) syscall — which is the *only* path in a
-/// container micro-VM's initramfs (no init system; the agent is cinit's
-/// child and runs with CAP_SYS_BOOT).
-fn run_shutdown(mode: ShutdownMode) -> Result<(), String> {
-    let argv: &[&str] = if Path::new("/run/systemd/system").exists() {
-        match mode {
-            ShutdownMode::Powerdown => &["systemctl", "poweroff"],
-            ShutdownMode::Reboot => &["systemctl", "reboot"],
-            ShutdownMode::Halt => &["systemctl", "halt"],
-        }
-    } else if Path::new("/sbin/openrc-shutdown").exists() {
-        match mode {
-            ShutdownMode::Powerdown => &["/sbin/openrc-shutdown", "-p", "now"],
-            ShutdownMode::Reboot => &["/sbin/openrc-shutdown", "-r", "now"],
-            ShutdownMode::Halt => &["/sbin/openrc-shutdown", "-H", "now"],
-        }
-    } else {
-        &[]
-    };
-    if !argv.is_empty()
-        && let Ok(status) = Command::new(argv[0]).args(&argv[1..]).status()
-        && status.success()
-    {
-        return Ok(());
-    }
-    // SAFETY: sync then reboot(2); nothing to clean up — the guest is going
-    // down.
-    unsafe { libc::sync() };
-    let cmd = match mode {
-        ShutdownMode::Powerdown => libc::LINUX_REBOOT_CMD_POWER_OFF,
-        ShutdownMode::Reboot => libc::LINUX_REBOOT_CMD_RESTART,
-        ShutdownMode::Halt => libc::LINUX_REBOOT_CMD_HALT,
-    };
-    // SAFETY: see above.
-    if unsafe { libc::reboot(cmd) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    }
-}
-
-/// The default interactive shell: a bash login shell when the guest has
-/// bash, else POSIX sh.
+/// The default interactive shell: the first of this kernel's usual shells
+/// the guest has, as a login shell.
 fn default_shell() -> Option<Vec<String>> {
-    for sh in ["/bin/bash", "/usr/bin/bash"] {
-        if Path::new(sh).exists() {
-            return Some(vec![sh.to_string(), "-l".to_string()]);
-        }
-    }
-    Path::new("/bin/sh")
-        .exists()
-        .then(|| vec!["/bin/sh".to_string(), "-l".to_string()])
-}
-
-/// Container shell (paths as the post-chroot child sees them): prefer the
-/// static BusyBox cinit injects so troubleshooting commands are consistent
-/// across images, then the image's own /bin/sh (see cinit's mounts).
-fn container_shell(rootfs: &str) -> Option<Vec<String>> {
-    let executable = |inside: &str| {
-        let full = format!("{rootfs}{inside}");
-        Path::new(&full)
-            .metadata()
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    };
-    if executable(vmlab_agent_proto::BUSYBOX_FALLBACK) {
-        return Some(vec![
-            vmlab_agent_proto::BUSYBOX_FALLBACK.to_string(),
-            "sh".to_string(),
-        ]);
-    }
-    executable("/bin/sh").then(|| vec!["/bin/sh".to_string()])
+    os::SHELLS
+        .iter()
+        .find(|sh| Path::new(sh).exists())
+        .map(|sh| vec![sh.to_string(), "-l".to_string()])
 }
 
 /// The agent identity's own shell environment: root, on a VM.
 fn root_env() -> Vec<(String, String)> {
     [
         ("TERM", "xterm-256color"),
-        ("HOME", "/root"),
+        ("HOME", os::ROOT_HOME),
         ("USER", "root"),
         ("LOGNAME", "root"),
         ("SHELL", "/bin/sh"),
-        ("PATH", login::SUPATH),
-        ("LANG", "C.UTF-8"),
+        ("PATH", os::SUPATH),
+        ("LANG", LANG),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect()
 }
 
-/// Container environment: the spec env verbatim plus a terminal type and
-/// the injected BusyBox applets at the **end** of PATH (§18), and — for a
-/// session that is somebody — the login variables cinit's own `build_env`
-/// does not know about (§19.2).
-///
-/// The shim is a fallback, not a toolbox: it exists so a distroless image
-/// still has a shell and the basics for `exec` and `shell`. Ahead of the
-/// image's own directories it shadowed them — `mount` in a `debian:12`
-/// container resolved to BusyBox's, which reads no `/etc/fstab` options on a
-/// remount, instead of util-linux's — so the image's tools win and BusyBox
-/// answers only for what the image lacks.
-fn container_env(ctx: &ContainerCtx, session: Option<&Session>) -> Vec<(String, String)> {
-    let mut env = ctx.env.clone();
-    if !env.iter().any(|(k, _)| k == "TERM") {
-        env.push(("TERM".into(), "xterm-256color".into()));
+/// Where a terminal's child is confined before its shell starts: a container
+/// micro-VM's namespaces and root filesystem (see [`container::Jail`]).
+#[cfg(target_os = "linux")]
+use container::Jail;
+
+/// No other Unix runs container micro-VMs, so no other Unix has a jail to
+/// put a shell in: uninhabited, so a terminal there can never be handed one.
+#[cfg(not(target_os = "linux"))]
+enum Jail {}
+
+#[cfg(not(target_os = "linux"))]
+impl Jail {
+    unsafe fn enter(&self, _close: [libc::c_int; 2]) -> bool {
+        match *self {}
     }
-    let busybox_bin = vmlab_agent_proto::BUSYBOX_BIN_DIR;
-    if let Some((_, path)) = env.iter_mut().find(|(k, _)| k == "PATH") {
-        if !path.split(':').any(|part| part == busybox_bin) {
-            *path = format!("{path}:{busybox_bin}");
-        }
-    } else {
-        env.push(("PATH".into(), format!("{}:{busybox_bin}", login::SUPATH)));
+
+    unsafe fn chroot(&self) -> bool {
+        match *self {}
     }
-    // A **declared** login overrides what the container says about who it is:
-    // cinit's `build_env` put the *workload* user's `HOME` there, and a
-    // session attached as `dev` that reports `HOME=/app` is exactly the
-    // half-login §19.2 forbids. The floor is the workload, so for it the
-    // container's own values stand. `PATH` is neither's — it was assembled
-    // above, with the shim on the end.
-    if let Some(session) = session {
-        for (key, value) in session.env() {
-            if key == "PATH" {
-                continue;
-            }
-            match env.iter_mut().find(|(k, _)| *k == key) {
-                Some(existing) if session.declared => existing.1 = value,
-                Some(_) => {}
-                None => env.push((key, value)),
-            }
-        }
+}
+
+impl UnixSpawner {
+    /// The jail a terminal's child enters, if this agent serves a container.
+    #[cfg(target_os = "linux")]
+    fn jail(&self) -> std::io::Result<Option<Jail<'_>>> {
+        self.container
+            .as_deref()
+            .map(ContainerCtx::jail)
+            .transpose()
     }
-    env
+
+    #[cfg(not(target_os = "linux"))]
+    fn jail(&self) -> std::io::Result<Option<Jail>> {
+        Ok(None)
+    }
 }
 
 /// Allocate a PTY sized `size` and fork the shell: the child becomes a
 /// session leader on the slave, drops to the session's ids and execs. In
-/// container mode the child first joins the container's namespaces (an extra
-/// fork applies the PID namespace, with the intermediate mirroring the
-/// shell's exit status) and chroots into its rootfs. Returns the master
-/// (close-on-exec) and the child pid. Post-fork the child only performs
-/// async-signal-safe operations before execve (allocation-free, like cinit's
-/// spawn).
+/// container mode the child first enters the container's [`Jail`]. Returns
+/// the master (close-on-exec) and the child pid. Post-fork the child only
+/// performs async-signal-safe operations before execve (allocation-free,
+/// like cinit's spawn).
 fn spawn_shell(
     plan: &ShellPlan,
     size: &Winsize,
-    container: Option<&ContainerCtx>,
+    jail: Option<Jail>,
     owner: Option<&Account>,
 ) -> std::io::Result<(OwnedFd, Pid)> {
     let shell = match plan.argv.as_deref() {
@@ -1185,10 +925,6 @@ fn spawn_shell(
         .map(|(k, v)| CString::new(format!("{k}={v}")))
         .collect::<Result<_, _>>()
         .map_err(|_| bad("NUL in shell environment"))?;
-    let c_root_dir = container
-        .map(|c| CString::new(c.rootfs.as_str()))
-        .transpose()
-        .map_err(|_| bad("NUL in rootfs path"))?;
     let c_workdir = CString::new(plan.cwd.as_str()).map_err(|_| bad("NUL in workdir"))?;
     let c_root = CString::new("/").unwrap();
     let credentials = plan.credentials.clone();
@@ -1205,24 +941,11 @@ fn spawn_shell(
         }
         ForkResult::Child => {
             let die = |_what: &str| -> ! { unsafe { libc::_exit(127) } };
-            if let Some(ns) = container.and_then(|c| c.setns.as_ref()) {
-                if ns.enter().is_err() {
-                    die("setns");
-                }
-                // PID setns applies to children, so this outer child
-                // supervises the actual shell and mirrors its status.
-                match unsafe { fork() } {
-                    Ok(ForkResult::Parent { child }) => {
-                        // SAFETY: closing our copies of the PTY fds.
-                        unsafe {
-                            libc::close(slave_raw);
-                            libc::close(master_raw);
-                        }
-                        mirror_child_exit(child);
-                    }
-                    Ok(ForkResult::Child) => {}
-                    Err(_) => die("fork after setns"),
-                }
+            // SAFETY: post-fork, as `enter` requires.
+            if let Some(jail) = &jail
+                && !unsafe { jail.enter([slave_raw, master_raw]) }
+            {
+                die("setns");
             }
             if setsid().is_err() {
                 die("setsid");
@@ -1241,8 +964,9 @@ fn spawn_shell(
                 }
             }
             let _ = write_all_raw(libc::STDOUT_FILENO, motd.as_bytes());
-            if let Some(root) = &c_root_dir
-                && chroot(root.as_c_str()).is_err()
+            // SAFETY: post-fork, as `chroot` requires.
+            if let Some(jail) = &jail
+                && !unsafe { jail.chroot() }
             {
                 die("chroot");
             }
@@ -1264,99 +988,6 @@ fn spawn_shell(
     }
 }
 
-/// Wait for a namespace child and exit with an equivalent status. Runs only
-/// in the small supervisor created after `setns` (same as cinit's).
-fn mirror_child_exit(child: Pid) -> ! {
-    let mut status = 0;
-    loop {
-        // SAFETY: plain waitpid loop; _exit only.
-        let rc = unsafe { libc::waitpid(child.as_raw(), &mut status, 0) };
-        if rc >= 0 {
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
-            } else {
-                continue;
-            };
-            // SAFETY: terminating the supervisor.
-            unsafe { libc::_exit(code) }
-        }
-        if nix::errno::Errno::last() != nix::errno::Errno::EINTR {
-            // SAFETY: terminating the supervisor.
-            unsafe { libc::_exit(127) }
-        }
-    }
-}
-
-/// `vmlab-agent --nsexec <pid|0> <rootfs> <workdir> <ids|-> -- argv…` — the
-/// exec trampoline for container mode: join the container's namespaces, fork
-/// so the PID namespace applies, chroot, chdir, drop to the session's ids,
-/// exec. Environment (already the merged container env) passes through
-/// untouched; stdio are the pipes std::process wired up in the parent agent.
-pub fn nsexec_main(args: &[String]) -> ! {
-    let usage = || -> ! {
-        eprintln!("vmlab-agent: bad --nsexec invocation");
-        std::process::exit(127);
-    };
-    let (Some(pid), Some(rootfs), Some(workdir), Some(ids)) =
-        (args.first(), args.get(1), args.get(2), args.get(3))
-    else {
-        usage();
-    };
-    if args.get(4).map(String::as_str) != Some("--") || args.len() < 6 {
-        usage();
-    }
-    let argv = &args[5..];
-    let credentials = parse_credentials(ids);
-
-    let pid: u32 = pid.parse().unwrap_or(0);
-    if pid != 0 {
-        let Ok(ns) = NsHandles::open(pid) else {
-            eprintln!("vmlab-agent: nsexec: cannot open namespaces of pid {pid}");
-            std::process::exit(127);
-        };
-        if ns.enter().is_err() {
-            eprintln!("vmlab-agent: nsexec: setns failed");
-            std::process::exit(127);
-        }
-        // The PID namespace applies to children: fork and mirror.
-        // SAFETY: single-threaded trampoline process.
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child }) => mirror_child_exit(child),
-            Ok(ForkResult::Child) => {}
-            Err(_) => std::process::exit(127),
-        }
-    }
-    if chroot(rootfs.as_str()).is_err() {
-        eprintln!("vmlab-agent: nsexec: chroot {rootfs} failed");
-        std::process::exit(127);
-    }
-    if chdir(workdir.as_str()).is_err() {
-        let _ = chdir("/");
-    }
-    let c_argv: Vec<CString> = argv
-        .iter()
-        .filter_map(|a| CString::new(a.as_str()).ok())
-        .collect();
-    if c_argv.len() != argv.len() {
-        std::process::exit(127);
-    }
-    // Last, as in the terminal child: everything above needs root, and the
-    // PATH search below should see what the session itself can reach.
-    if let Some(credentials) = &credentials {
-        // SAFETY: single-threaded trampoline about to exec.
-        if !unsafe { credentials.apply() } {
-            eprintln!("vmlab-agent: nsexec: cannot become uid {}", credentials.uid);
-            std::process::exit(127);
-        }
-    }
-    // execvp: resolves argv[0] via the inherited PATH inside the chroot.
-    let _ = nix::unistd::execvp(&c_argv[0], &c_argv);
-    eprintln!("vmlab-agent: nsexec: exec {} failed", argv[0]);
-    std::process::exit(127);
-}
-
 fn write_all_raw(fd: libc::c_int, mut buf: &[u8]) -> bool {
     while !buf.is_empty() {
         // SAFETY: plain write(2) on a valid fd with an in-bounds buffer.
@@ -1376,26 +1007,7 @@ pub fn kill_process(pid: u32) {
     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
 }
 
-// ---- metrics sampling ------------------------------------------------------
-
-/// Cumulative (busy, total) jiffies from /proc/stat's aggregate cpu line.
-pub type CpuSample = (u64, u64);
-
-pub fn cpu_sample() -> CpuSample {
-    let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
-    let Some(line) = stat.lines().find(|l| l.starts_with("cpu ")) else {
-        return (0, 0);
-    };
-    let fields: Vec<u64> = line
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|f| f.parse().ok())
-        .collect();
-    let total: u64 = fields.iter().sum();
-    let idle = fields.get(3).copied().unwrap_or(0) + fields.get(4).copied().unwrap_or(0);
-    (total.saturating_sub(idle), total)
-}
-
+/// Utilisation between two cumulative (busy, total) samples, in percent.
 pub fn cpu_pct(prev: &CpuSample, cur: &CpuSample) -> f32 {
     let busy = cur.0.saturating_sub(prev.0) as f32;
     let total = cur.1.saturating_sub(prev.1) as f32;
@@ -1406,137 +1018,9 @@ pub fn cpu_pct(prev: &CpuSample, cur: &CpuSample) -> f32 {
     }
 }
 
-/// (used, total) bytes; "used" excludes reclaimable cache (MemAvailable).
-pub fn mem_sample() -> (u64, u64) {
-    let mut total = 0u64;
-    let mut avail = 0u64;
-    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    for line in meminfo.lines() {
-        let kb = |l: &str| {
-            l.split_whitespace()
-                .nth(1)
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0)
-                * 1024
-        };
-        if line.starts_with("MemTotal:") {
-            total = kb(line);
-        } else if line.starts_with("MemAvailable:") {
-            avail = kb(line);
-        }
-    }
-    (total.saturating_sub(avail), total)
-}
-
-pub fn disk_sample() -> Vec<DiskUsage> {
-    let mut out = Vec::new();
-    let mut seen_devices = Vec::new();
-    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
-    for line in mounts.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(device), Some(mount)) = (it.next(), it.next()) else {
-            continue;
-        };
-        // Real block-backed filesystems only; one entry per device (bind
-        // mounts and btrfs subvolumes repeat the device).
-        if !device.starts_with("/dev/") || seen_devices.contains(&device.to_string()) {
-            continue;
-        }
-        let Ok(vfs) = nix::sys::statvfs::statvfs(mount) else {
-            continue;
-        };
-        // c_ulong is 32 bits on the i686 build, so widen explicitly; on the
-        // 64-bit builds the conversion is the identity clippy would remove.
-        #[allow(clippy::useless_conversion)]
-        let frsize: u64 = vfs.fragment_size().into();
-        #[allow(clippy::useless_conversion)]
-        let total = u64::from(vfs.blocks()) * frsize;
-        if total == 0 {
-            continue;
-        }
-        seen_devices.push(device.to_string());
-        out.push(DiskUsage {
-            mount: mount.to_string(),
-            used: total - vfs.blocks_available() * frsize,
-            total,
-        });
-    }
-    out
-}
-
-// ---- clipboard (best-effort; headless guests never advertise it) ----------
-
-/// The answer a guest without a reachable display gives — it never advertises
-/// the feature, so only a host that asked anyway hears it.
-const NO_DISPLAY: &str = "no display session is reachable from the agent";
-
-struct ClipboardTool {
-    get: Vec<String>,
-    set: Vec<String>,
-}
-
-impl ClipboardTool {
-    /// A clipboard exists only when the agent's own environment can reach a
-    /// display server (never true for the root service on server templates)
-    /// and a helper tool is installed.
-    fn probe() -> Option<ClipboardTool> {
-        let has = |bin: &str| {
-            std::env::var_os("PATH")
-                .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(bin).exists()))
-        };
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() && has("wl-copy") && has("wl-paste") {
-            return Some(ClipboardTool {
-                get: vec!["wl-paste".into(), "--no-newline".into()],
-                set: vec!["wl-copy".into()],
-            });
-        }
-        if std::env::var_os("DISPLAY").is_some() && has("xclip") {
-            return Some(ClipboardTool {
-                get: vec![
-                    "xclip".into(),
-                    "-selection".into(),
-                    "clipboard".into(),
-                    "-o".into(),
-                ],
-                set: vec!["xclip".into(), "-selection".into(), "clipboard".into()],
-            });
-        }
-        None
-    }
-
-    fn get(&self) -> std::io::Result<String> {
-        let out = Command::new(&self.get[0])
-            .args(&self.get[1..])
-            .stderr(Stdio::null())
-            .output()?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    fn set(&self, text: &str) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut child = Command::new(&self.set[0])
-            .args(&self.set[1..])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        drop(child.stdin.take());
-        let status = child.wait()?;
-        if !status.success() {
-            return Err(std::io::Error::other(format!(
-                "{} exited {status}",
-                self.set[0]
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// Detach from the launching terminal/agent: double-fork + setsid + stdio to
 /// /dev/null. Used for manual hand-launches during development; the
-/// systemd service runs in the foreground.
+/// systemd service and the launchd daemon run in the foreground.
 pub fn daemonize() {
     // SAFETY: standard double-fork; parents _exit immediately.
     unsafe {
@@ -1565,9 +1049,15 @@ pub fn daemonize() {
     }
 }
 
-#[cfg(test)]
+// The tests run on the build host, which is Linux, and cover the container
+// routes beside the VM ones.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use super::container::{container_env, container_shell, nsexec_argv, parse_credentials};
+    use super::linux::{AppPaths, os_info};
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn cpu_pct_computes_delta_utilisation() {
@@ -1724,7 +1214,7 @@ mod tests {
             Some(vmlab_agent_proto::BUSYBOX_BIN_DIR),
             "{path}"
         );
-        assert!(path.starts_with(login::SUPATH), "{path}");
+        assert!(path.starts_with(os::SUPATH), "{path}");
         assert!(env.contains(&("FOO".into(), "bar".into())));
 
         // Explicit values win; PATH still gets the shim appended once.
@@ -1777,13 +1267,13 @@ mod tests {
 
     /// A platform in container mode, sharing one context with its spawner
     /// the way `new_platform_container` does.
-    fn container_platform(ctx: ContainerCtx) -> LinuxPlatform {
+    fn container_platform(ctx: ContainerCtx) -> UnixPlatform {
         let ctx = Arc::new(ctx);
         let logins = Arc::new(Logins::for_container(&ctx.rootfs));
-        LinuxPlatform {
+        UnixPlatform {
             clipboard: None,
             container: Some(ctx.clone()),
-            spawner: LinuxSpawner {
+            spawner: UnixSpawner {
                 container: Some(ctx),
                 logins,
             },
@@ -1791,17 +1281,17 @@ mod tests {
         }
     }
 
-    fn container_spawner(ctx: ContainerCtx) -> LinuxSpawner {
+    fn container_spawner(ctx: ContainerCtx) -> UnixSpawner {
         let ctx = Arc::new(ctx);
         let logins = Arc::new(Logins::for_container(&ctx.rootfs));
-        LinuxSpawner {
+        UnixSpawner {
             container: Some(ctx),
             logins,
         }
     }
 
-    fn vm_spawner() -> LinuxSpawner {
-        LinuxSpawner {
+    fn vm_spawner() -> UnixSpawner {
+        UnixSpawner {
             container: None,
             logins: Arc::new(Logins::for_vm()),
         }
