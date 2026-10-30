@@ -56,6 +56,17 @@ pub struct TemplateConfig {
     /// Hyper-V enlightenments (§5.2).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hyperv: Option<bool>,
+    /// The Apple SMC device (§5.2).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub apple_smc: Option<bool>,
+    /// Keyboard and pointer devices (§5.2), by their schema spelling. Free
+    /// text, like `accel`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub input: Option<String>,
+    /// The guest's TSC (§5.2), by its schema spelling. Free text, like
+    /// `accel`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tsc: Option<String>,
     /// QEMU accelerator (§5.2), by its schema spelling. Free text so a
     /// spelling a newer build wrote reads as unset rather than failing.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -121,6 +132,9 @@ impl TemplateConfig {
             display: meta.display.clone(),
             cpu_model: meta.cpu_model.clone(),
             hyperv: meta.hyperv,
+            apple_smc: meta.apple_smc,
+            input: meta.input.map(|i| i.as_str().to_string()),
+            tsc: meta.tsc.map(|t| t.as_str().to_string()),
             accel: meta.accel.map(|a| a.as_str().to_string()),
             created: meta.created.to_rfc3339(),
             origin: meta.origin.clone(),
@@ -185,6 +199,9 @@ impl TemplateConfig {
             display: over(&m.display, &base.display),
             cpu_model: over(&m.cpu_model, &base.cpu_model),
             hyperv: over(&m.hyperv, &base.hyperv),
+            apple_smc: over(&m.apple_smc, &base.apple_smc),
+            input: over(&m.input, &base.input),
+            tsc: over(&m.tsc, &base.tsc),
             accel: over(&m.accel, &base.accel),
         })
     }
@@ -214,6 +231,15 @@ impl TemplateConfig {
             display: self.display,
             cpu_model: self.cpu_model,
             hyperv: self.hyperv,
+            apple_smc: self.apple_smc,
+            input: self
+                .input
+                .as_deref()
+                .and_then(crate::config::model::InputDevices::parse),
+            tsc: self
+                .tsc
+                .as_deref()
+                .and_then(crate::config::model::TscMode::parse),
             accel: self
                 .accel
                 .as_deref()
@@ -286,6 +312,9 @@ mod tests {
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
             hyperv: Some(true),
+            apple_smc: Some(true),
+            input: Some(crate::config::model::InputDevices::Usb),
+            tsc: Some(crate::config::model::TscMode::Host),
             accel: Some(crate::config::model::AccelMode::Tcg),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
@@ -387,6 +416,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
         };
         assert!(!TemplateConfig::from_variant(&m, &v).variants_expected);
@@ -418,6 +450,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
         };
         let config = TemplateConfig::from_variant(&base, &v);

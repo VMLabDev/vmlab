@@ -38,6 +38,9 @@ template "<name>" {
   display     = "virtio-vga"
   cpu_model   = "pentium3"
   hyperv      = true
+  apple_smc   = false
+  input       = "ps2"
+  tsc         = "host"
   accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
@@ -72,6 +75,9 @@ SRC
       | "`display`" | "utf8" | "from profile" | "QEMU display device string for the build VM." |
       | "`cpu_model`" | "utf8" | "from profile" | "QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`." |
       | "`hyperv`" | "bool" | "from profile" | "Hyper-V enlightenments for the build VM under KVM; the build VM resolves it like any VM, so a template on a shipped Windows profile builds with them. Recorded in the metadata and inherited by clones. Not applied under TCG or with a `cpu_model`." |
+      | "`apple_smc`" | "bool" | "from profile" | "The Apple SMC and an SMBIOS type 2 table for the build VM, which a macOS installer needs. Recorded in the metadata and inherited by clones. x86 only." |
+      | "`input`" | "utf8" | "from profile" | "Keyboard and pointer for the build VM: `ps2` or `usb` (a USB keyboard and tablet on their own xHCI, for a guest that reads no PS/2 keyboard). Recorded in the metadata and inherited by clones." |
+      | "`tsc`" | "utf8" | "from profile" | "`host`: an invariant TSC pinned at the host's frequency for the build VM, under KVM only. Recorded in the metadata and inherited by clones; each clone pins its own frequency at its first start. x86 only." |
       | "`accel`" | "utf8" | "from profile" | "Accelerator for the build VM: `kvm` or `tcg`. Inherited by clones. `tcg` cannot be combined with `nested = true`." |
       | "`firmware`" | "utf8" | "from profile" | "Firmware: `ovmf` or `seabios`." |
       | "`tpm`" | "bool" | "from profile" | "Enable a TPM 2.0 device." |
@@ -231,6 +237,9 @@ SRC
       | "`display`" | "utf8" | "the base's" | "QEMU display device string." |
       | "`cpu_model`" | "utf8" | "the base's" | "QEMU `-cpu` model." |
       | "`hyperv`" | "bool" | "the base's" | "Hyper-V enlightenments under KVM." |
+      | "`apple_smc`" | "bool" | "the base's" | "The Apple SMC device." |
+      | "`input`" | "utf8" | "the base's" | "Keyboard and pointer: `ps2` or `usb`." |
+      | "`tsc`" | "utf8" | "the base's" | "`host`: an invariant TSC pinned at the host's frequency." |
       | "`accel`" | "utf8" | "the base's" | "Accelerator: `kvm` or `tcg`." |
       | "`firmware`" | "utf8" | "the base's" | "Firmware: `ovmf` or `seabios`." |
       | "`tpm`" | "bool" | "the base's" | "Enable a TPM 2.0 device." |

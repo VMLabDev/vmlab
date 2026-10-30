@@ -142,7 +142,7 @@ required child blocks. The schema declares these with decorators on each field.
 - A playbook `var` whose name is not a WCL identifier, or is set twice on one
   block.
 - The dev-machine rules: more than one `@dev(default = true)`, a Windows `login`
-  without a `password`, `elevated` on a Linux-family profile, and more than one
+  without a `password`, `elevated` on a Linux- or macOS-family profile, and more than one
   `login` with `default = true` on a machine.
 
 Validation deliberately does not check which features a machine's agent serves.

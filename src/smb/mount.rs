@@ -49,6 +49,53 @@ pub fn linux_mount_cmd(
     ("mount".to_string(), args)
 }
 
+/// Build a macOS `mount_smbfs` invocation for a share.
+///
+/// Returns `("/sbin/mount_smbfs", [args...])`:
+/// `mount_smbfs -N [-o rdonly] //<user>:<pass>@<gw>/<share> <guest_path>`
+///
+/// The credentials ride in the URL, percent-encoded, because `mount_smbfs`
+/// takes them nowhere else short of a keychain; `-N` stops it prompting when
+/// they are refused. No dialect is named: the macOS client negotiates SMB 2/3
+/// on its own, and the lab's `smbd` serves those whether or not a share also
+/// allows SMB1 for an older guest.
+pub fn macos_mount_cmd(
+    gateway: Ipv4Addr,
+    share: &str,
+    guest_path: &str,
+    user: &str,
+    pass: &str,
+    readonly: bool,
+) -> (String, Vec<String>) {
+    let mut args = vec!["-N".to_string()];
+    if readonly {
+        args.push("-o".to_string());
+        args.push("rdonly".to_string());
+    }
+    args.push(format!(
+        "//{}:{}@{gateway}/{}",
+        url_component(user),
+        url_component(pass),
+        url_component(share)
+    ));
+    args.push(guest_path.to_string());
+    ("/sbin/mount_smbfs".to_string(), args)
+}
+
+/// `s` percent-encoded for one component of an `smb://` URL: everything but
+/// the RFC 3986 unreserved characters.
+fn url_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Whether a Windows `guest` target is a bare drive letter (`X:` or `X:\`)
 /// rather than a folder path. Matches `^[A-Za-z]:\\?$`.
 pub fn is_drive_letter(target: &str) -> bool {
@@ -470,6 +517,24 @@ mod tests {
         assert_eq!(
             s,
             "net use Z: \\\\10.0.0.1\\share /user:u p /persistent:yes"
+        );
+    }
+
+    /// `mount_smbfs` with the credentials in the URL, encoded, and `rdonly`
+    /// only for a read-only share.
+    #[test]
+    fn macos_mount_cmd_shape() {
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        let (cmd, args) = macos_mount_cmd(gw, "src", "/Volumes/src", "vm-a", "p@ss/w:rd", false);
+        assert_eq!(cmd, "/sbin/mount_smbfs");
+        assert_eq!(
+            args,
+            ["-N", "//vm-a:p%40ss%2Fw%3Ard@10.0.0.1/src", "/Volumes/src"]
+        );
+        let (_, args) = macos_mount_cmd(gw, "src", "/Volumes/src", "u", "p", true);
+        assert_eq!(
+            args,
+            ["-N", "-o", "rdonly", "//u:p@10.0.0.1/src", "/Volumes/src"]
         );
     }
 }

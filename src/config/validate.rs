@@ -1264,6 +1264,9 @@ impl TemplateLayer {
 enum LoginFamily {
     Windows,
     Linux,
+    /// A root agent like Linux's, so the same identity rules; its own family
+    /// because config-weave ships no binary for it.
+    Macos,
     /// No profile resolved, or one that names no family.
     Unknown,
 }
@@ -1272,6 +1275,7 @@ fn login_family(profile: Option<&str>) -> LoginFamily {
     match profile {
         Some(p) if p.starts_with("windows") => LoginFamily::Windows,
         Some(p) if p.starts_with("linux") => LoginFamily::Linux,
+        Some(p) if p.starts_with("macos") => LoginFamily::Macos,
         _ => LoginFamily::Unknown,
     }
 }
@@ -1306,9 +1310,9 @@ fn check_logins(
             ));
         }
         // Elevation is a Windows concept: it selects the linked token. On
-        // Linux root is root, and a non-root user is not elevatable without
-        // sudo — so the field could only be read nowhere.
-        if family == LoginFamily::Linux && login.elevated.is_some() {
+        // Linux and macOS root is root, and a non-root user is not
+        // elevatable without sudo — so the field could only be read nowhere.
+        if matches!(family, LoginFamily::Linux | LoginFamily::Macos) && login.elevated.is_some() {
             issues.push(Issue::at(
                 login.span,
                 format!(
@@ -1368,6 +1372,18 @@ fn check_playbook(p: &Playbook, root: &Path, family: LoginFamily, issues: &mut I
             ));
         }
     }
+    // config-weave cross-builds Linux and Windows guests only, so a macOS
+    // guest has nothing vmlab could push.
+    if family == LoginFamily::Macos && p.guest_bin.is_none() {
+        issues.push(Issue::at(
+            p.span,
+            format!(
+                "playbook {}: config-weave ships no macOS binary — install one in the guest and \
+                 name it with `guest_bin`",
+                p.path.display()
+            ),
+        ));
+    }
     if family == LoginFamily::Windows
         && let Some(bin) = &p.guest_bin
         && !bin.to_ascii_lowercase().ends_with(".exe")
@@ -1426,13 +1442,13 @@ fn check_playbook(p: &Playbook, root: &Path, family: LoginFamily, issues: &mut I
 fn guest_path_problem(path: &str, family: LoginFamily) -> Option<String> {
     use crate::config::model::{is_unix_absolute, is_windows_absolute};
     let ok = match family {
-        LoginFamily::Linux => is_unix_absolute(path),
+        LoginFamily::Linux | LoginFamily::Macos => is_unix_absolute(path),
         LoginFamily::Windows => is_windows_absolute(path),
         LoginFamily::Unknown => is_unix_absolute(path) || is_windows_absolute(path),
     };
     (!ok).then(|| {
         let form = match family {
-            LoginFamily::Linux => "an absolute path (`/…`)",
+            LoginFamily::Linux | LoginFamily::Macos => "an absolute path (`/…`)",
             LoginFamily::Windows => "an absolute drive-letter path (`C:\\…`)",
             LoginFamily::Unknown => "an absolute guest path (`/…` or `C:\\…`)",
         };
@@ -1832,6 +1848,9 @@ pub(crate) mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
             created: chrono::Utc::now(),
             origin: None,
@@ -1972,6 +1991,9 @@ pub(crate) mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
         };
         let mut legacy = variant("legacy", false);
@@ -3995,6 +4017,45 @@ lab "l" {
 }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
+    }
+
+    /// config-weave ships no macOS binary, so a macOS playbook names the one
+    /// the guest holds — and a macOS login, like a Linux one, takes no
+    /// `elevated` and needs no password.
+    #[test]
+    fn a_macos_guest_runs_a_resident_config_weave_and_unix_logins() {
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "mac" {
+    template = "x86_64/t"
+    profile = "macos"
+    playbook "playbooks/base" { play = "base" }
+  }
+}"#,
+        );
+        assert!(
+            es.len() == 1 && es[0].contains("config-weave ships no macOS binary"),
+            "{es:#?}"
+        );
+        let (es, _root) = errs_with_playbook_dir(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "mac" {
+    template = "x86_64/t"
+    profile = "macos"
+    playbook "playbooks/base" { play = "base" guest_bin = "/usr/local/bin/config-weave" }
+    login "dev" { user = "dev" }
+  }
+}"#,
+        );
+        assert!(es.is_empty(), "{es:#?}");
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" { vm "a" { template = "x86_64/t" profile = "macos"
+  login "dev" { user = "dev" elevated = true } } }"#,
+            "declares `elevated`, which is Windows-only",
+        );
     }
 
     #[test]

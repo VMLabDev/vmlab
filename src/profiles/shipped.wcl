@@ -160,6 +160,41 @@ profile "linux-generic" {
   workspace_guest = "/src"
 }
 
+profile "macos" {
+  description = "Intel macOS (Tahoe and earlier) booted through OpenCore: q35, OVMF, AHCI disks, VMware SVGA, USB keyboard and tablet, Apple SMC, invariant TSC"
+  machine     = "q35"
+  // OpenCore is a UEFI application, and macOS has no use for secure boot or
+  // a TPM under it.
+  firmware    = "ovmf"
+  secure_boot = false
+  tpm         = false
+  // macOS's own AHCI driver; AppleVirtIO's block personality is not what
+  // OpenCore boots from.
+  disk_bus    = "sata"
+  // virtio-net is native from Big Sur on. Both it and the agent's
+  // virtio-serial port land on pcie.0, where QEMU keeps them transitional,
+  // the only mode AppleVirtIO drives.
+  nic_model   = "virtio-net-pci"
+  // There is no Apple virtio GPU driver on x86.
+  display     = "vmware"
+  // An Intel model macOS supports, with the TSX flags it lacks off, the
+  // VMware CPUID leaf XNU reads its TSC and bus frequencies from, and no
+  // KVM paravirtual extras, which stop macOS 13 on booting on AMD hosts.
+  cpu_model   = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"
+  hyperv      = false
+  apple_smc   = true
+  // OpenCore and macOS read no PS/2 keyboard.
+  input       = "usb"
+  // QEMU fills the VMware leaf only for a known, stable TSC; pinning it at
+  // the host's frequency keeps online snapshots working.
+  tsc         = "host"
+  cpus        = 4
+  memory      = 8GiB
+  // `/` is the sealed system volume; `/Users/Shared` is on the Data volume
+  // and any login can create a directory in it.
+  workspace_guest = "/Users/Shared/src"
+}
+
 profile "container" {
   description = "Micro-VM defaults for an OCI container (PRD §18): the smallest shape that boots the guest asset and a typical service image"
   // A container micro-VM boots the guest asset directly — no firmware, disk

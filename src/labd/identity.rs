@@ -95,7 +95,8 @@ fn is_floor(selector: &str, guest_os: GuestOs) -> bool {
 pub fn floor(guest_os: GuestOs) -> &'static str {
     match guest_os {
         GuestOs::Windows => WINDOWS_FLOOR,
-        GuestOs::Linux => LINUX_FLOOR,
+        // The macOS agent is a root LaunchDaemon (§7.4).
+        GuestOs::Linux | GuestOs::Macos => LINUX_FLOOR,
     }
 }
 
@@ -104,8 +105,9 @@ fn as_logon(machine: &str, login: &Login, guest_os: GuestOs) -> Result<Logon> {
         (Some(secret), _) => secret,
         // The agent is root and root needs no credential to become an
         // account, which is the same fact that makes §19.2's container floor
-        // free. So a Linux `login {}` may declare the account alone.
-        (None, GuestOs::Linux) => String::new(),
+        // free. So a Linux `login {}` may declare the account alone — and a
+        // macOS one, whose agent is a root LaunchDaemon.
+        (None, GuestOs::Linux | GuestOs::Macos) => String::new(),
         // §5.1 rejects this at validation on a Windows-family profile: the
         // agent is SYSTEM and every credential-free route is an S4U logon,
         // which carries no network credentials. Reaching it anyway is a
@@ -134,7 +136,7 @@ fn as_logon(machine: &str, login: &Login, guest_os: GuestOs) -> Result<Logon> {
 fn elevated(declared: Option<bool>, guest_os: GuestOs) -> bool {
     match guest_os {
         GuestOs::Windows => declared.unwrap_or(true),
-        GuestOs::Linux => false,
+        GuestOs::Linux | GuestOs::Macos => false,
     }
 }
 

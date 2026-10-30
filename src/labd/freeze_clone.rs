@@ -216,8 +216,8 @@ pub struct MachineClone {
     /// presence is what marks the machine built, so it appears only once
     /// everything else is in place.
     pub overlays: Vec<Overlay>,
-    /// `OVMF_VARS.fd`, `tpm-state/`, `clone-source`, `firstboot.done`, when
-    /// the frozen machine has them.
+    /// `OVMF_VARS.fd`, `tpm-state/`, `clone-source`, `firstboot.done` and
+    /// `tsc-hz`, when the frozen machine has them.
     pub copies: Vec<FileCopy>,
     /// `freeze-generation` beside the disks.
     pub generation_file: PathBuf,
@@ -406,6 +406,7 @@ fn machine_source(
             "tpm-state",
             "clone-source",
             "firstboot.done",
+            "tsc-hz",
         ],
         Kind::Container => &[],
     };
@@ -684,6 +685,7 @@ mod tests {
                     "tpm-state",
                     "clone-source",
                     "firstboot.done",
+                    "tsc-hz",
                 ],
                 Some("x86_64/win2022"),
                 record(1),
@@ -717,7 +719,8 @@ mod tests {
                 "OVMF_VARS.fd",
                 "tpm-state",
                 "clone-source",
-                "firstboot.done"
+                "firstboot.done",
+                "tsc-hz"
             ]
         );
         assert!(c.copies.iter().all(|c| c.from.starts_with(gen1("dc01"))));

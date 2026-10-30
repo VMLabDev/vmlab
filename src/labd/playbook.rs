@@ -55,15 +55,20 @@ pub fn default_bin_dir(cfg: Option<&Path>) -> PathBuf {
 }
 
 /// The host-side config-weave binary for one guest (OS, arch). config-weave
-/// cross-builds exactly two targets, both x86_64.
+/// cross-builds exactly two targets, both x86_64 — neither of them macOS, so
+/// a macOS playbook runs a binary the guest already holds (`guest_bin`).
 pub fn weave_binary(dir: &Path, os: GuestOs, arch: &str) -> Result<PathBuf> {
-    if arch != "x86_64" {
-        bail!("config-weave ships guest binaries only for x86_64 (guest is {arch})");
-    }
     let name = match os {
         GuestOs::Linux => "config-weave-linux-x86_64",
         GuestOs::Windows => "config-weave-windows-x86_64.exe",
+        GuestOs::Macos => bail!(
+            "config-weave ships no macOS binary to push — install one in the guest and name it \
+             with `guest_bin` on the playbook block"
+        ),
     };
+    if arch != "x86_64" {
+        bail!("config-weave ships guest binaries only for x86_64 (guest is {arch})");
+    }
     let path = dir.join(name);
     if !path.is_file() {
         bail!(
@@ -172,11 +177,12 @@ pub const WINDOWS_GUEST_DIR: &str = "C:/weave";
 /// config-weave accept and which keep path joins uniform.
 pub fn resolve_guest_dir(block: Option<&str>, profile: Option<&str>, os: GuestOs) -> String {
     let dir = block.or(profile).unwrap_or(match os {
-        GuestOs::Linux => LINUX_GUEST_DIR,
+        // `/var` is `/private/var` on macOS, writable by the root agent.
+        GuestOs::Linux | GuestOs::Macos => LINUX_GUEST_DIR,
         GuestOs::Windows => WINDOWS_GUEST_DIR,
     });
     match os {
-        GuestOs::Linux => dir.to_string(),
+        GuestOs::Linux | GuestOs::Macos => dir.to_string(),
         GuestOs::Windows => dir.replace('\\', "/"),
     }
 }
@@ -190,7 +196,7 @@ fn guest_join(dir: &str, leaf: &str) -> String {
 /// Where a pushed config-weave binary lives under the guest directory.
 fn guest_binary_path(dir: &str, os: GuestOs) -> String {
     match os {
-        GuestOs::Linux => guest_join(dir, "config-weave"),
+        GuestOs::Linux | GuestOs::Macos => guest_join(dir, "config-weave"),
         GuestOs::Windows => guest_join(dir, "config-weave.exe"),
     }
 }
@@ -604,10 +610,9 @@ async fn run_inner(
     // is authoritative once connected.
     let os = match agent.info().os.as_str() {
         "windows" => GuestOs::Windows,
-        _ => match m.guest_os() {
-            GuestOs::Windows => GuestOs::Linux, // agent says non-windows: believe it
-            other => other,
-        },
+        "macos" => GuestOs::Macos,
+        // The agent names neither: believe it over a profile that does.
+        _ => GuestOs::Linux,
     };
 
     // The guest directory: the block's, else the profile's, else the
@@ -640,7 +645,7 @@ async fn run_inner(
     // source files never linger in the guest.
     let guest_dir = guest_playbook_path(&base_dir, &pb.path);
     let rm: Vec<String> = match os {
-        GuestOs::Linux => vec!["rm".into(), "-rf".into(), guest_dir.clone()],
+        GuestOs::Linux | GuestOs::Macos => vec!["rm".into(), "-rf".into(), guest_dir.clone()],
         GuestOs::Windows => vec![
             "cmd".into(),
             "/c".into(),
