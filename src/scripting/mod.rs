@@ -116,6 +116,9 @@ pub struct MachineHandle {
     pub(crate) logon: Option<Logon>,
     /// The script run this handle belongs to (see [`LabHandle::run`]).
     pub(crate) run: crate::labd::record::RunId,
+    /// The script's output, where a first boot `start()` or `restart()`
+    /// runs reports (§6.1).
+    pub(crate) output: OutputSink,
 }
 
 /// A segment handle (PRD §10.2).
@@ -373,6 +376,7 @@ impl MachineHandle {
             first_boot_gated: self.first_boot_gated,
             logon,
             run: self.run,
+            output: self.output.clone(),
         })
     }
 
@@ -603,6 +607,7 @@ impl LabHandle {
             // own behalf keeps (§19.2). A script asks for another by name.
             logon: None,
             run: self.run,
+            output: self.output.clone(),
         }
     }
 }
@@ -818,8 +823,12 @@ pub fn lab_module() -> Module {
         .method("start", |h: &MachineHandle| -> Result<(), String> {
             let runtime = h.runtime.clone();
             let name = h.name().to_string();
-            h.block(async move { runtime.start_machine(&name).await })
-                .map_err(estr)
+            let output = h.output.clone();
+            h.block(async move {
+                runtime.start_machine(&name).await?;
+                runtime.run_owed_first_boot(&name, &output).await
+            })
+            .map_err(estr)
         })
         .method("stop", |h: &MachineHandle| -> Result<(), String> {
             h.block(h.machine.stop(false)).map_err(estr)
@@ -830,7 +839,8 @@ pub fn lab_module() -> Module {
         .method("restart", |h: &MachineHandle| -> Result<(), String> {
             let runtime = h.runtime.clone();
             let name = h.name().to_string();
-            h.block(async move { runtime.restart_machine(&name, false).await })
+            let output = h.output.clone();
+            h.block(async move { runtime.restart_machine(&name, false, &output).await })
                 .map_err(estr)
         })
         // Clean QMP `quit`: exits QEMU *gracefully*, flushing block-device
