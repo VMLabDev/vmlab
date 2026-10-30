@@ -1,0 +1,23 @@
+// The firmware scenario's lab: OVMF with a TPM beside SeaBIOS, each proved
+// from inside the guest and from the launch whichever hypervisor ran it.
+import <vmlab.wcl>
+
+lab "e2e-firmware" {
+  vm "uefi" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    firmware = "ovmf"
+    tpm      = true
+  }
+
+  // No template layer: a blank disk under SeaBIOS, nothing to boot.
+  vm "bios" {
+    template = "scratch"
+    arch     = "x86_64"
+    profile  = "linux-generic"
+    disk     = 1GiB
+    cpus     = 1
+    memory   = 256MiB
+  }
+}

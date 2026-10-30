@@ -24,10 +24,6 @@ lab "e2e-scripting" {
       ip      = "10.86.0.10"
     }
 
-    // QEMU is silent on a healthy boot; a trace line per QMP command gives
-    // the qemu stream something to show.
-    qemu_args = ["-trace", "monitor_qmp_cmd_in_band"]
-
     // `setup.ws` creates the account; a lone login is the default.
     login "dev" { user = "dev" }
 
