@@ -42,7 +42,8 @@ container "buildbox" {
 
 Unset arguments resolve **`@dev` argument, then profile, then floor**. The default
 is profile-sourced because it is guest-OS-shaped: the shipped Windows profiles say
-`C:\src` and the Linux ones `/src`. A profile with no dev keys still hosts a dev
+`C:\src`, the Linux ones `/src`, and `macos` `/Users/Shared/src` (its `/` is the
+sealed system volume). A profile with no dev keys still hosts a dev
 machine; a missing key means the floor applies, never that the profile cannot be a
 dev target. The guest path does not have to exist: when the default login cannot
 create it, as with `/src` under a root-owned `/` on Linux, vmlab creates it as the
@@ -403,7 +404,7 @@ lab "first-dev" {
 
 - `@dev(...)` is a decorator on the machine. `workspace = "./workspace"` names the
   host directory to sync, relative to the lab root. The guest path defaults from the
-  profile, `/src` on Linux and `C:\src` on Windows; set `workspace_guest` to change
+  profile, `/src` on Linux, `C:\src` on Windows and `/Users/Shared/src` on macOS; set `workspace_guest` to change
   it. `default = true` makes this the lab's default dev machine, which matters once
   a lab has more than one.
 - `mode = :idle` keeps the micro-VM up without running the image's entrypoint. A dev

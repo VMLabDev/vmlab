@@ -1018,6 +1018,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
@@ -1616,6 +1619,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
         }
     }

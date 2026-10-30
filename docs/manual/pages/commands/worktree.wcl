@@ -54,7 +54,7 @@ page cmd_worktree {
     snapshot, moved into `.vmlab/freeze/<n>/<machine>/` and made read-only,
     and the machine's disk becomes an overlay on it that holds the state the
     lab had, so the main lab carries on unchanged. The machine's
-    `OVMF_VARS.fd`, `tpm-state/`, `clone-source`, `firstboot.done` and state record, and the
+    `OVMF_VARS.fd`, `tpm-state/`, `tsc-hz`, `clone-source`, `firstboot.done` and state record, and the
     lab's named volumes, are copied into the generation. `.vmlab/worktree.json`
     is written last, naming the generation and the snapshot; its presence is
     what makes the lab frozen. A failure at any step undoes every step

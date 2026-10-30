@@ -104,6 +104,7 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
                 let sub = match os {
                     AgentOs::Linux => dir.join("linux").join(arch),
                     AgentOs::Windows => dir.join("windows").join(arch),
+                    AgentOs::Macos => dir.join("macos"),
                     AgentOs::WindowsNt => dir.join("legacy").join("nt"),
                     AgentOs::Windows9x => dir.join("legacy").join("9x"),
                     AgentOs::Dos => dir.join("legacy").join("dos"),

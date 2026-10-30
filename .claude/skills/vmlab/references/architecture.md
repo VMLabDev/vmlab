@@ -291,7 +291,7 @@ should be in the lab's `.gitignore`.
 | Path under `.vmlab/` | Holds |
 | --- | --- |
 | `state.json` | Persisted lab state: snapshot records, pinned artefacts, agent repairs. |
-| `vms/<vm>/` | `disk0.qcow2`, the linked clone; `OVMF_VARS.fd`; `tpm-state/`; `firstboot.done` once the first-boot provision has run. |
+| `vms/<vm>/` | `disk0.qcow2`, the linked clone; `OVMF_VARS.fd`; `tpm-state/`; `tsc-hz`, the TSC frequency a `tsc = "host"` VM was pinned at its first start; `firstboot.done` once the first-boot provision has run. |
 | `containers/<name>/` | `scratch.qcow2`, the writable overlay, and `container.json`. |
 | `media/` | ISO and floppy images built from `media {}` folders, content-addressed. See vm.md. |
 | `volumes/` | Named container volumes. |
@@ -299,7 +299,7 @@ should be in the lab's `.gitignore`.
 | `workspace/<machine>.json` | The workspace syncer's ledger for one dev machine. See dev-machines.md. |
 | `worktree.json` | In a main checkout frozen for worktree labs: the newest generation and the snapshot it was frozen at. Its presence turns on worktree isolation for the family. See worktrees.md. |
 | `worktree-ports.json` | In a frozen main checkout: each worktree lab's port slot, keyed by the git worktree's name, and every fixed port each lab of the family has bound, the main lab's declared ones included. Locked exclusively for every change, released per worktree by `vmlab destroy` there, deleted by a thaw. |
-| `freeze/<n>/<machine>/` | Generation `n` of the freeze: the machine's frozen disks, read-only, with copies of its `OVMF_VARS.fd`, `tpm-state/`, `firstboot.done`, `clone-source` and `state.json` record. `freeze/<n>/volumes/` holds the named volumes. |
+| `freeze/<n>/<machine>/` | Generation `n` of the freeze: the machine's frozen disks, read-only, with copies of its `OVMF_VARS.fd`, `tpm-state/`, `tsc-hz`, `firstboot.done`, `clone-source` and `state.json` record. `freeze/<n>/volumes/` holds the named volumes. |
 | `vms/<vm>/freeze-generation` | In a worktree lab: the generation the machine was cloned from. Beside a container's disk too. |
 | `screenshots/` | Where `Machine.screenshot` writes when given no path. |
 | `recordings/` | Where a console recording lands when given no path, as `<vm>-<UTC timestamp>.mp4`. See cli-machine.md (`vmlab record`). |

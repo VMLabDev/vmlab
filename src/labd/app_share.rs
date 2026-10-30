@@ -105,6 +105,7 @@ fn family_name(os: GuestOs) -> &'static str {
     match os {
         GuestOs::Linux => "Linux",
         GuestOs::Windows => "Windows",
+        GuestOs::Macos => "macOS",
     }
 }
 
@@ -126,6 +127,12 @@ pub async fn open(
             req.mode
         ))
     })?;
+    if target.guest_os == GuestOs::Macos {
+        return Err(CommandError::unsupported(format!(
+            "`{machine}` is a macOS guest: {}",
+            crate::appshare::MACOS_UNSHARED
+        )));
+    }
     if via.family() != target.guest_os {
         return Err(CommandError::unsupported(format!(
             "`{}` shares apps from {} guests; `{machine}` is a {} guest",

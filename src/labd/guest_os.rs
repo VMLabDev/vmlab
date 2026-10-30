@@ -14,11 +14,14 @@
 pub enum GuestOs {
     Linux,
     Windows,
+    /// Intel macOS (§5.3's `macos` profile).
+    Macos,
 }
 
 /// Guest OS family from the resolved profile name, for selecting the
 /// config-weave binary — where XP-versus-modern Windows is irrelevant, so
-/// `windows-legacy` answers `Windows` here. Deliberately not the same
+/// `windows-legacy` answers `Windows` here. A profile named `macos…` is
+/// macOS. Deliberately not the same
 /// question as [`crate::smb::guest_os_hint`], which selects a share mount
 /// command and for which the distinction matters a great deal. Containers are
 /// always Linux; VM answers are confirmed against the agent handshake
@@ -26,6 +29,7 @@ pub enum GuestOs {
 pub fn guest_os_of(profile: Option<&str>) -> GuestOs {
     match profile {
         Some(p) if p.starts_with("windows") => GuestOs::Windows,
+        Some(p) if p.starts_with("macos") => GuestOs::Macos,
         _ => GuestOs::Linux,
     }
 }
@@ -39,6 +43,7 @@ mod tests {
         assert_eq!(guest_os_of(Some("windows-server")), GuestOs::Windows);
         assert_eq!(guest_os_of(Some("windows-legacy")), GuestOs::Windows);
         assert_eq!(guest_os_of(Some("linux-modern")), GuestOs::Linux);
+        assert_eq!(guest_os_of(Some("macos")), GuestOs::Macos);
         assert_eq!(guest_os_of(None), GuestOs::Linux);
     }
 }

@@ -2,7 +2,7 @@ page guide_profiles {
   title = "Guest OS profiles"
   chapter_header "Guest OS profiles" {
     kicker       = "The guide · explanation"
-    reading_time = "6 min read"
+    reading_time = "8 min read"
     updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
@@ -26,9 +26,10 @@ DOC
       | "Field" | "Decides" |
       | "`machine`" | "The QEMU machine type: `q35` or `pc` (i440fx)." |
       | "`firmware`, `secure_boot`, `tpm`" | "OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device." |
-      | "`disk_bus`, `nic_model`, `display`" | "The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`." |
+      | "`disk_bus`, `nic_model`, `display`" | "The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std`, `cirrus-vga` or `vmware` (VMware SVGA II)." |
       | "`cpu_model`" | "The QEMU `-cpu` model the guest sees instead of the host CPU (KVM) or `max` (TCG), for guests a modern CPUID breaks. No shipped profile sets one; a template pins it for its clones." |
       | "`hyperv`" | "The Hyper-V enlightenments under KVM, which put a Windows guest's clock on the reference TSC page instead of an emulated timer. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; `windows-xp` and `windows-9x` leave it off." |
+      | "`apple_smc`, `input`, `tsc`" | "What macOS needs and no other guest does: the Apple SMC device and an SMBIOS type 2 table; a USB keyboard beside the USB tablet (`input = \"usb\"`), because macOS reads no PS/2 keyboard; and an invariant TSC pinned at the host's frequency (`tsc = \"host\"`). Only `macos` sets them." |
       | "`accel`" | "The accelerator: `kvm` (required, no fallback) or `tcg` (always emulated, even where KVM works, for guests KVM cannot run reliably). Unset, KVM when usable, else TCG. No shipped profile sets one." |
       | "`cpus`, `memory`" | "The hardware floor a VM or container inherits when neither its block nor its template says." |
       | "`agent_transport`" | "The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias." |
@@ -40,9 +41,10 @@ DOC
   }
 
   p <<'DOC'
-The profile also classifies the guest as Windows-family or Linux-family, which
-is what the `login {}` validation rules and the Windows preconditions of the
-workspace syncer key on. A profile does not install the agent; that happens
+The profile's name also classifies the guest: `windows…` is Windows-family,
+`linux…` Linux-family and `macos…` macOS-family. That is what the `login {}`
+validation rules, the Windows preconditions of the workspace syncer, how a
+share mounts and how a playbook finds config-weave key on. A profile does not install the agent; that happens
 once, at template build, when the build stages the agent binaries on the
 bootstrap ISO and the template's unattended-install hook runs the install
 script. See [Templates and the store](guide_templates).
@@ -62,6 +64,7 @@ DOC
       | "`templeos`" | "pc" | "SeaBIOS" | "no" | "IDE disk, std VGA, no network by design, agent on COM1" | "" |
       | "`linux-modern`" | "q35" | "OVMF" | "no" | "virtio everything, native virtiofs" | "`/src`" |
       | "`linux-generic`" | "q35" | "SeaBIOS" | "no" | "virtio disk and NIC, std VGA, conservative elsewhere" | "`/src`" |
+      | "`macos`" | "q35" | "OVMF, no secure boot" | "no" | "Intel macOS through OpenCore: SATA (AHCI) disk, virtio-net, VMware SVGA, USB keyboard and tablet, Apple SMC, pinned invariant TSC, 4 CPUs and 8 GiB" | "`/Users/Shared/src`" |
       | "`container`" | "" | "" | "" | "size only: 1 CPU and 256 MiB, the micro-VM floor" | "`/src`" |
       | "`custom`" | "" | "" | "" | "nothing assumed; supply everything on the VM or template and through `qemu_args`" | "floor" |
   }
@@ -101,6 +104,39 @@ start at every boot. The output is what the command printed, with the DolDoc
 markup reduced to the text the screen shows; a compile error or an uncaught
 exception exits 1 with the compiler's or the OS's report as the output.
 DOC
+
+  h2 "macOS guests"
+
+  p <<'DOC'
+The `macos` profile boots Intel macOS, Tahoe and earlier, through OpenCore.
+OpenCore does not come with vmlab: the template carries it in the EFI system
+partition of its disk, and OVMF boots it like any other UEFI application, so
+secure boot and the TPM are off. The rest of the profile is the hardware macOS
+has drivers for. Its own AHCI driver reads the SATA disk; virtio-net is native
+from Big Sur on; VMware SVGA II is the display, because Apple ships no virtio
+GPU driver for x86, and the screen is OpenCore's 1280×800. The CPU is
+`Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on`,
+an Intel model macOS supports, with the TSX flags it lacks turned off and the
+VMware CPUID leaf it reads its clock frequencies from. `hyperv` is off by
+name. The host needs KVM's `ignore_msrs` on; see
+[Host configuration and WSL 2](guide_host).
+DOC
+
+  p <<'DOC'
+vmlab's surfaces treat a macOS guest as their own family:
+DOC
+
+  list {
+    li "**The agent** is `vmlab-agent` built for macOS, on the same virtio-serial channel as on Linux, running as root under launchd."
+    li "**Scripted input** goes over QMP as usual. The USB keyboard `input = \"usb\"` adds is not bound to the display, so `send_keys` reaches it."
+    li "**`boot_id`** reads `kern.bootsessionuuid` with `sysctl`."
+    li "**Shares** mount over SMB with `mount_smbfs`. macOS has no virtiofs client, so a share declared `transport = \"virtiofs\"` is reported unmountable and `auto` picks SMB. See [Shared folders](guide_shares)."
+    li "**Logins** follow the Linux rules: the agent is root, so a `login {}` needs no `password`, and `elevated` is a validation error."
+    li "**Playbooks** must name a `guest_bin`, because config-weave ships no macOS binary for vmlab to push."
+    li "**A dev workspace** lands at `/Users/Shared/src`: `/` is the sealed system volume, and `/Users/Shared` is on the writable Data volume."
+    li "**`vmlab app run`** refuses a macOS guest by name: it serves none of the protocols vmlab carries. Use `vmlab console` for its desktop."
+    li "**`vmlab machine repair-agent`** replaces `/Library/vmlab/vmlab-agent` and restarts it with `launchctl kickstart -k system/dev.vmlab.agent`."
+  }
 
   h2 "Overriding with user profiles"
 

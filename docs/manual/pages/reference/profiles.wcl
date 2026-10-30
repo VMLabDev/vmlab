@@ -62,6 +62,9 @@ profile "<name>" {
   display         = "virtio-vga"
   cpu_model       = "pentium3"
   hyperv          = true
+  apple_smc       = false
+  input           = "ps2"
+  tsc             = "host"
   accel           = "tcg"
   cpus            = 2
   memory          = 4GiB
@@ -87,23 +90,26 @@ SRC
       | "`usb`" | "bool" | "unset" | "Boot with the hot-plug xHCI controller host USB passthrough needs ([vmlab usb](cmd_usb)). A VM's own `usb` wins. Unset is off." |
       | "`disk_bus`" | "utf8" | "QEMU default" | "Primary disk bus: `virtio`, `ide` or `sata`." |
       | "`nic_model`" | "utf8" | "QEMU default" | "NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`." |
-      | "`display`" | "utf8" | "QEMU default" | "Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`." |
-      | "`cpu_model`" | "utf8" | "unset" | "QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. No shipped profile sets one." |
+      | "`display`" | "utf8" | "QEMU default" | "Display device, for example `virtio-vga`, `qxl`, `std`, `cirrus-vga`, or `vmware` for VMware SVGA II (`vmware-svga`)." |
+      | "`cpu_model`" | "utf8" | "unset" | "QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. Only `macos` sets one." |
       | "`hyperv`" | "bool" | "unset" | "Hyper-V enlightenments (`hv-*` CPU flags) under KVM on x86, unless a `cpu_model` names the CPU. Unset is off. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; a VM or template `hyperv` wins. See [Lab file: vm and its children](ref_vm)." |
+      | "`apple_smc`" | "bool" | "unset" | "The Apple SMC device (`isa-applesmc` with Apple's OSK) and an SMBIOS type 2 table, which macOS refuses to boot without. Unset is off. x86 only. Set by `macos`." |
+      | "`input`" | "utf8" | "unset (`ps2`)" | "Keyboard and pointer: `ps2` (PS/2 keyboard, USB tablet) or `usb` (USB keyboard and tablet on an xHCI of their own, unbound so QMP `send-key` reaches the keyboard). Set to `usb` by `macos`." |
+      | "`tsc`" | "utf8" | "unset" | "`host`: an invariant TSC pinned at the host's frequency under KVM, read at a VM's first KVM start and kept. Unset is QEMU's default. x86 only. Set by `macos`." |
       | "`accel`" | "utf8" | "unset" | "Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. No shipped profile sets one." |
       | "`cpus`" | "i64" | "unset" | "Default vCPU count, at least 1." |
       | "`memory`" | "ByteSize" | "unset" | "Default RAM, for example `4GiB`." |
       | "`agent_transport`" | "utf8" | "`virtio-serial`" | "The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake)." |
       | "`agent_channel`" | "bool" | "unset" | "Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present." |
-      | "`input_transport`" | "utf8" | "`qmp`" | "How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path." |
+      | "`input_transport`" | "utf8" | "`qmp`" | "How scripted input reaches the guest: `qmp` send-key, or `vnc` through the VM's VNC socket. A guest that reads no PS/2 keyboard needs `input = \"usb\"`, not `vnc`." |
       | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
       | "`rtc`" | "utf8" | "`utc`" | "What the guest reads the real-time clock as: `utc`, or `localtime` for a guest that cannot read it as UTC, whose RTC then starts at the host's local time (QEMU `-rtc base=localtime`; a fixed `clock` is converted to the host's local time at that instant). Only `windows-xp` and `windows-9x` set `localtime`." |
       | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |
-      | "`playbook_dir`" | "utf8" | "unset" | "Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\\…`). Unset, `/var/lib/vmlab/weave` on Linux and `C:\\weave` on Windows." |
+      | "`playbook_dir`" | "utf8" | "unset" | "Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\\…`). Unset, `/var/lib/vmlab/weave` on Linux and macOS and `C:\\weave` on Windows." |
   }
   p <<DOC
     The parser enforces the keyword sets above for `machine`, `firmware`,
-    `disk_bus`, `accel`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative
+    `disk_bus`, `accel`, `input`, `tsc`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative
     `memory`. `nic_model`, `display` and `cpu_model` are passed to QEMU as
     written; an empty `cpu_model` is refused. A
     profile that sets no `workspace_guest` still hosts a dev machine; the
@@ -115,7 +121,8 @@ SRC
     its template recorded, else the default. Validation reports an unknown
     profile name on the block that names it. A `login {}` block's family
     rules read the resolved profile's name: `windows*` is Windows, `linux*`
-    is Linux, and any other name is unknown and gets neither rule.
+    is Linux, `macos*` is macOS and follows the Linux rules, and any other
+    name is unknown and gets none of them.
   DOC
 
   h2 "Shipped profiles"
@@ -124,7 +131,7 @@ SRC
     the field is unset. `windows-11`, `windows-10`, `windows-server` and
     `windows-legacy` also set `hyperv = true`; `windows-xp` and `windows-9x`
     predate the enlightenments and leave it unset. Every Windows profile lands an `@dev` workspace at
-    `C:\\src` and every Linux one at `/src`.
+    `C:\\src`, every Linux one at `/src`, and `macos` at `/Users/Shared/src`.
   DOC
   table {
     rows:
@@ -137,6 +144,7 @@ SRC
       | "`windows-9x`" | "pc" | "seabios" | "false" | "false" | "ide" | "pcnet" | "cirrus-vga" | "1" | "256MiB" | "`input_transport = \"vnc\"`, `agent_transport = \"isa-serial\"`, `rtc = \"localtime\"`. DOS, Windows 3.x to ME and 2000-era guests." |
       | "`linux-modern`" | "q35" | "ovmf" | "false" | "false" | "virtio" | "virtio-net-pci" | "virtio-vga" | "2" | "4GiB" | "`virtiofs = true`." |
       | "`linux-generic`" | "q35" | "seabios" | "false" | "false" | "virtio" | "virtio-net-pci" | "std" | "2" | "2GiB" | "Older or unusual distros." |
+      | "`macos`" | "q35" | "ovmf" | "false" | "false" | "sata" | "virtio-net-pci" | "vmware" | "4" | "8GiB" | "`cpu_model = \"Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on\"`, `hyperv = false`, `apple_smc = true`, `input = \"usb\"`, `tsc = \"host\"`. Intel macOS through OpenCore, which the template carries." |
       | "`container`" | "" | "" | "" | "" | "" | "" | "" | "1" | "256MiB" | "Micro-VM size for an OCI container; nothing else applies to a container." |
       | "`custom`" | "" | "" | "" | "" | "" | "" | "" | "" | "" | "Nothing assumed; supply everything on the VM or template and in `qemu_args`." |
   }

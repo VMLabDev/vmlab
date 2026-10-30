@@ -212,6 +212,13 @@ impl VmDirs {
     pub fn tpm_state(&self) -> PathBuf {
         self.local.join("tpm-state")
     }
+    /// The TSC frequency a `tsc = "host"` VM was pinned at, at its first KVM
+    /// start (§5.2) — kept beside its disk, because an online snapshot only
+    /// loads into a VM started at the frequency it was taken at
+    /// ([`qemu::tsc`]).
+    pub fn tsc_pin(&self) -> PathBuf {
+        self.local.join("tsc-hz")
+    }
 }
 
 /// The template-derived half of a VM: hardware resolution, backing disk, and
@@ -731,6 +738,7 @@ impl VmInstance {
         nics: Vec<qemu::NicSpec>,
         virtiofs_shares: Vec<(String, PathBuf)>,
         render: &qemu::hostgpu::RenderPlan,
+        tsc_hz: Option<u64>,
     ) -> Result<VmPaths> {
         Ok(VmPaths {
             qmp_sock: self.dirs.qmp_sock(),
@@ -755,9 +763,36 @@ impl VmInstance {
             virtiofs_shares,
             gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
             gpu_passthrough: render.passthrough.clone(),
+            tsc_hz,
             qemu_data_dir: render.data_dir(&t.resolved.arch, std::env::var_os("PATH").as_deref()),
             apic_virtualization: qemu::host_apic_virtualization(),
         })
+    }
+
+    /// The TSC frequency a `tsc = "host"` VM runs at under KVM (§5.2): the
+    /// one pinned at its first start, else the host's, read through
+    /// `emulator` and pinned now. A host probe, so it happens here rather
+    /// than in the argv builder (ADR-0008). `None` when the VM asks for no
+    /// pinned TSC, or runs where none applies.
+    async fn pinned_tsc_hz(
+        &self,
+        t: &TemplateParts,
+        accel: qemu::Accel,
+        emulator: &str,
+    ) -> Result<Option<u64>> {
+        if t.resolved.tsc.is_none() || accel != qemu::Accel::Kvm {
+            return Ok(None);
+        }
+        let pin = self.dirs.tsc_pin();
+        if let Some(hz) = qemu::tsc::read_pin(&pin)? {
+            return Ok(Some(hz));
+        }
+        let hz = qemu::tsc::probe_host_hz(emulator)
+            .await
+            .with_context(|| format!("{}: tsc = \"host\"", self.cfg.name))?;
+        std::fs::create_dir_all(&self.dirs.local)?;
+        qemu::tsc::write_pin(&pin, hz)?;
+        Ok(Some(hz))
     }
 
     /// The host GPU a `gpu {}` gets and the emulator environment that
@@ -1017,10 +1052,20 @@ impl VmInstance {
                     format!("{}: installing the Vulkan PCI-filter layer", self.cfg.name)
                 })?;
             }
+            let tsc_hz = self
+                .pinned_tsc_hz(&t, accel, &render.emulator(&t.resolved.arch))
+                .await?;
             let args = qemu::build_args(
                 &self.lab,
                 &t.resolved,
-                &self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices, &render)?,
+                &self.build_paths(
+                    &t,
+                    firmware.as_ref(),
+                    nic_specs,
+                    vfs_devices,
+                    &render,
+                    tsc_hz,
+                )?,
                 accel,
             )?;
             // The machine answers control shortly after spawn (-S leaves CPUs
@@ -1750,14 +1795,31 @@ impl super::machine::Machine for VmInstance {
     /// A `hyperv = true` the vm block set that this host's launch drops —
     /// TCG, a named `cpu_model` (§5.2). The accelerator is decided the way
     /// [`Self::start`] decides it; one `start` would refuse is its to report.
+    ///
+    /// And for a macOS guest (§5.2), what the host lacks for it: KVM's
+    /// `ignore_msrs`, without which the guest faults on the Intel MSRs it
+    /// reads, and a pinned TSC, which TCG cannot give it.
     fn launch_warnings(&self) -> Vec<String> {
         let t = self.template();
         let kvm = qemu::kvm_usable(&t.resolved.arch);
-        qemu::plan_accel(&t.resolved, kvm)
-            .ok()
-            .and_then(|plan| qemu::hyperv_not_applied(self.cfg.hyperv, &t.resolved, plan.accel()))
-            .into_iter()
-            .collect()
+        let Ok(plan) = qemu::plan_accel(&t.resolved, kvm) else {
+            return Vec::new();
+        };
+        let mut warnings: Vec<String> = [
+            qemu::hyperv_not_applied(self.cfg.hyperv, &t.resolved, plan.accel()),
+            qemu::tsc_not_applied(&t.resolved, plan.accel()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let macos = t.resolved.apple_smc || self.guest_os() == super::guest_os::GuestOs::Macos;
+        if macos
+            && plan.accel() == qemu::Accel::Kvm
+            && let Some(problem) = qemu::host_msrs_problem()
+        {
+            warnings.push(format!("vm \"{}\": {problem}", self.cfg.name));
+        }
+        warnings
     }
 
     fn pending_first_boot(&self) -> Option<super::machine::FirstBootProvision> {

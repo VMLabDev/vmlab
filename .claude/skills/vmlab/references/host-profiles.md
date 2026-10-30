@@ -326,6 +326,23 @@ only when its VM sets `nested = true`, and only when the host's own `kvm_intel` 
 `kvm_amd` module has nested virtualisation on. `vmlab up` warns with the fix when it
 is off.
 
+### macOS guests under KVM
+
+A macOS guest needs the `kvm` module's `ignore_msrs` on: XNU reads Intel MSRs KVM
+does not emulate, KVM answers each with a #GP, and the guest panics or hangs early
+in boot (every boot on an AMD host). `vmlab up` warns, without refusing, for every VM
+it starts under KVM whose profile name starts with `macos` or whose `apple_smc`
+resolves on, when `/sys/module/kvm/parameters/ignore_msrs` is not `Y`. The fix:
+
+```sh
+echo "options kvm ignore_msrs=1 report_ignored_msrs=0" | sudo tee /etc/modprobe.d/kvm-msrs.conf
+echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs   # until the next boot
+```
+
+`tsc = "host"` (vm.md) needs KVM too: the frequency is read from KVM at the VM's
+first KVM start and pinned in `.vmlab/vms/<vm>/tsc-hz`; under TCG `up` warns and the
+VM boots without it, which macOS does not survive.
+
 If every VM is slow and `vmlab logs` shows the TCG fallback warning for x86_64
 guests, the host lacks KVM: on WSL 2 enable nested virtualisation in `.wslconfig`,
 on a bare host check that your user can open `/dev/kvm` (see troubleshooting.md).
@@ -342,9 +359,10 @@ in the config.
 | --- | --- |
 | `machine` | The QEMU machine type: `q35` or `pc` (i440fx). |
 | `firmware`, `secure_boot`, `tpm` | OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device. |
-| `disk_bus`, `nic_model`, `display` | The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`. |
-| `cpu_model` | The QEMU `-cpu` model the guest sees instead of the host CPU (KVM) or `max` (TCG), for guests a modern CPUID breaks. No shipped profile sets one; a template pins it for its clones. |
+| `disk_bus`, `nic_model`, `display` | The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std`, `cirrus-vga` or `vmware` (VMware SVGA II). |
+| `cpu_model` | The QEMU `-cpu` model the guest sees instead of the host CPU (KVM) or `max` (TCG), for guests a modern CPUID breaks. Only `macos` sets one; a template pins it for its clones. |
 | `hyperv` | The Hyper-V enlightenments under KVM, which put a Windows guest's clock on the reference TSC page instead of an emulated timer. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; `windows-xp` and `windows-9x` leave it off. |
+| `apple_smc`, `input`, `tsc` | What macOS needs and no other guest does: the Apple SMC and an SMBIOS type 2 table; a USB keyboard beside the USB tablet (`input = "usb"`), because macOS reads no PS/2 keyboard; an invariant TSC pinned at the host's frequency (`tsc = "host"`). Only `macos` sets them. |
 | `accel` | The accelerator: `kvm` (required, no fallback) or `tcg` (always emulated, even where KVM works, for guests KVM cannot run reliably). Unset, KVM when usable, else TCG. No shipped profile sets one. |
 | `cpus`, `memory` | The hardware floor a VM or container inherits when neither its block nor its template says. |
 | `agent_transport` | The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias. |
@@ -354,11 +372,11 @@ in the config.
 | `workspace_guest` | The guest path an `@dev` workspace lands at when the decorator names none (see dev-machines.md). |
 | `playbook_dir` | The guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`, for a guest whose default location is not writable (see automation.md). |
 
-The profile also classifies the guest as Windows-family or Linux-family, which is
-what the `login {}` validation rules and the Windows preconditions of the workspace
-syncer key on. A `login {}` block's family rules read the resolved profile's name:
-`windows*` is Windows, `linux*` is Linux, and any other name is unknown and gets
-neither rule.
+The profile's name also classifies the guest: `windows*` is Windows, `linux*` is
+Linux, `macos*` is macOS. The `login {}` validation rules, the Windows preconditions
+of the workspace syncer, share mounting, playbooks, `boot_id`, `app run` and
+`repair-agent` key on it. macOS follows the Linux login rules; any other name is
+unknown and gets none of them.
 
 A profile does not install the agent; that happens once, at template build, when the
 build stages the agent binaries on the bootstrap ISO and the template's
@@ -442,6 +460,9 @@ profile "<name>" {
   display         = "virtio-vga"
   cpu_model       = "pentium3"
   hyperv          = true
+  apple_smc       = false
+  input           = "ps2"
+  tsc             = "host"
   accel           = "tcg"
   cpus            = 2
   memory          = 4GiB
@@ -466,22 +487,25 @@ profile "<name>" {
 | `usb` | bool | unset | Boot with the hot-plug xHCI controller host USB passthrough needs. A VM's own `usb` wins; unset is off. |
 | `disk_bus` | utf8 | QEMU default | Primary disk bus: `virtio`, `ide` or `sata`. |
 | `nic_model` | utf8 | QEMU default | NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`. |
-| `display` | utf8 | QEMU default | Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`. |
-| `cpu_model` | utf8 | unset | QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. No shipped profile sets one. |
+| `display` | utf8 | QEMU default | Display device, for example `virtio-vga`, `qxl`, `std`, `cirrus-vga`, or `vmware` for VMware SVGA II (`vmware-svga`). |
+| `cpu_model` | utf8 | unset | QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. Only `macos` sets one. |
 | `hyperv` | bool | unset | Hyper-V enlightenments (`hv-*` CPU flags) under KVM on x86, unless a `cpu_model` names the CPU. Unset is off. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; a VM or template `hyperv` wins (vm.md). |
+| `apple_smc` | bool | unset | The Apple SMC (`isa-applesmc` with Apple's OSK) and an SMBIOS type 2 table, which macOS refuses to boot without. Unset is off. x86 only. Set by `macos`. |
+| `input` | utf8 | unset (`ps2`) | Keyboard and pointer: `ps2` (PS/2 keyboard, USB tablet) or `usb` (USB keyboard and tablet on an xHCI of their own, unbound so QMP `send-key` reaches the keyboard). `usb` on `macos`. |
+| `tsc` | utf8 | unset | `host`: an invariant TSC pinned at the host's frequency under KVM, read at a VM's first KVM start and kept. Unset is QEMU's default. x86 only. Set by `macos`. |
 | `accel` | utf8 | unset | Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. No shipped profile sets one. |
 | `cpus` | i64 | unset | Default vCPU count, at least 1. |
 | `memory` | ByteSize | unset | Default RAM, for example `4GiB`. |
 | `agent_transport` | utf8 | `virtio-serial` | The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake). |
 | `agent_channel` | bool | unset | Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present. |
-| `input_transport` | utf8 | `qmp` | How scripted input reaches the guest: `qmp` send-key, or `vnc` for guests that ignore the PS/2 path. |
+| `input_transport` | utf8 | `qmp` | How scripted input reaches the guest: `qmp` send-key, or `vnc` through the VM's VNC socket. A guest that reads no PS/2 keyboard needs `input = "usb"`, not `vnc`. |
 | `virtiofs` | bool | `false` | The guest mounts virtiofs natively, so `transport = "auto"` shares use it instead of SMB. |
 | `rtc` | utf8 | `utc` | What the guest reads the RTC as: `utc`, or `localtime` — the RTC then starts at the host's local time (`-rtc base=localtime`; a fixed `clock` converted to host local time). Only `windows-xp` and `windows-9x` set it. |
 | `workspace_guest` | utf8 | unset | Guest path an `@dev` workspace lands at when the decorator names none. |
-| `playbook_dir` | utf8 | unset | Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\…`). Unset, `/var/lib/vmlab/weave` on Linux and `C:\weave` on Windows. |
+| `playbook_dir` | utf8 | unset | Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\…`). Unset, `/var/lib/vmlab/weave` on Linux and macOS and `C:\weave` on Windows. |
 
 The parser enforces the keyword sets above for `machine`, `firmware`, `disk_bus`,
-`accel`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative `memory`. `nic_model`,
+`accel`, `input`, `tsc`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative `memory`. `nic_model`,
 `display` and `cpu_model` are passed to QEMU as written; an empty `cpu_model` is
 refused. A profile that sets no `workspace_guest`
 still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` machine a
@@ -500,11 +524,13 @@ still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` mach
 | `templeos` | pc | seabios | false | false | ide | e1000 | std | 2 | 512MiB | `agent_transport = "isa-serial"`. TempleOS: the HolyC agent on COM1; no network by design. |
 | `linux-modern` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 2 | 4GiB | `virtiofs = true`. |
 | `linux-generic` | q35 | seabios | false | false | virtio | virtio-net-pci | std | 2 | 2GiB | Older or unusual distros. |
+| `macos` | q35 | ovmf | false | false | sata | virtio-net-pci | vmware | 4 | 8GiB | `cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"`, `hyperv = false`, `apple_smc = true`, `input = "usb"`, `tsc = "host"`. Intel macOS through OpenCore, which the template carries. |
 | `container` | | | | | | | | 1 | 256MiB | Micro-VM size for an OCI container; nothing else applies to a container. |
 | `custom` | | | | | | | | | | Nothing assumed; supply everything on the VM or template and in `qemu_args`. |
 
 A blank cell means the field is unset. Every Windows profile lands an `@dev`
-workspace at `C:\src` and every Linux one at `/src`; the `container` profile also
+workspace at `C:\src`, every Linux one at `/src` and `macos` at `/Users/Shared/src`
+(`/` is macOS's sealed system volume); the `container` profile also
 sets `workspace_guest = "/src"`, and `custom` leaves it at the floor.
 
 `linux-modern` requests a VGA-compatible virtio GPU on x86 and downgrades to
@@ -524,6 +550,30 @@ to choose. Its floor is an order of magnitude below a VM's on purpose: the micro
 runs one process, not an operating system. Raise it per container with `cpus` and
 `memory`, or drop your own `container` profile into the user directory to change the
 default for every lab.
+
+`macos` boots Intel macOS (Tahoe and earlier) through OpenCore. OpenCore is not
+vmlab's: the template carries it in its disk's EFI system partition, and OVMF boots
+it, so secure boot and the TPM are off. AHCI disk, virtio-net (native from Big Sur),
+VMware SVGA (no Apple virtio GPU driver on x86; the screen is OpenCore's 1280x800), a
+Skylake model with the VMware CPUID leaf, `hyperv` off by name, no virtiofs. A macOS
+guest is its own family across vmlab:
+
+- **Agent**: `vmlab-agent` for macOS on virtio-serial `vmlab.agent.0` (in the guest
+  `/dev/cu.vmlab.agent.0`), root under launchd.
+- **Input**: QMP `send-key` reaches the unbound USB keyboard `input = "usb"` adds;
+  `input_transport` stays `qmp`.
+- **`boot_id`**: `/usr/sbin/sysctl -n kern.bootsessionuuid`.
+- **Shares**: SMB only, `mkdir -p` then `/sbin/mount_smbfs -N [-o rdonly]
+  //<user>:<pass>@<gateway>/<share> <path>`, credentials percent-encoded. A
+  `transport = "virtiofs"` share is reported unmountable; `auto` picks SMB.
+- **Logins**: the Linux rules — no `password` needed, `elevated` is an error.
+- **Playbooks**: `guest_bin` is required (config-weave ships no macOS binary);
+  `guest_dir` defaults to `/var/lib/vmlab/weave`.
+- **`@dev`**: workspace at `/Users/Shared/src`.
+- **`vmlab app run`**: refused by name; use `vmlab console`.
+- **`vmlab machine repair-agent`**: swaps `/Library/vmlab/vmlab-agent` and runs
+  `launchctl kickstart -k system/dev.vmlab.agent`.
+- **Host**: `ignore_msrs` on (see "macOS guests under KVM" above).
 
 `custom` sets nothing at all, so QEMU's defaults apply to whatever the VM and
 template leave unset.
@@ -663,6 +713,41 @@ profile "linux-generic" {
   cpus        = 2
   memory      = 2GiB
   workspace_guest = "/src"
+}
+
+profile "macos" {
+  description = "Intel macOS (Tahoe and earlier) booted through OpenCore: q35, OVMF, AHCI disks, VMware SVGA, USB keyboard and tablet, Apple SMC, invariant TSC"
+  machine     = "q35"
+  // OpenCore is a UEFI application, and macOS has no use for secure boot or
+  // a TPM under it.
+  firmware    = "ovmf"
+  secure_boot = false
+  tpm         = false
+  // macOS's own AHCI driver; AppleVirtIO's block personality is not what
+  // OpenCore boots from.
+  disk_bus    = "sata"
+  // virtio-net is native from Big Sur on. Both it and the agent's
+  // virtio-serial port land on pcie.0, where QEMU keeps them transitional,
+  // the only mode AppleVirtIO drives.
+  nic_model   = "virtio-net-pci"
+  // There is no Apple virtio GPU driver on x86.
+  display     = "vmware"
+  // An Intel model macOS supports, with the TSX flags it lacks off, the
+  // VMware CPUID leaf XNU reads its TSC and bus frequencies from, and no
+  // KVM paravirtual extras, which stop macOS 13 on booting on AMD hosts.
+  cpu_model   = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"
+  hyperv      = false
+  apple_smc   = true
+  // OpenCore and macOS read no PS/2 keyboard.
+  input       = "usb"
+  // QEMU fills the VMware leaf only for a known, stable TSC; pinning it at
+  // the host's frequency keeps online snapshots working.
+  tsc         = "host"
+  cpus        = 4
+  memory      = 8GiB
+  // `/` is the sealed system volume; `/Users/Shared` is on the Data volume
+  // and any login can create a directory in it.
+  workspace_guest = "/Users/Shared/src"
 }
 
 profile "container" {

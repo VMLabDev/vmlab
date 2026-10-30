@@ -177,12 +177,14 @@ pub struct FreezeInput {
 }
 
 /// What a freeze copies beside a machine's frozen disks, when present: the
-/// UEFI variables, the TPM, the template reference and the first-boot mark.
-pub const CARRIED: [&str; 4] = [
+/// UEFI variables, the TPM, the template reference, the first-boot mark and
+/// a `tsc = "host"` VM's pinned TSC frequency (§5.2).
+pub const CARRIED: [&str; 5] = [
     "OVMF_VARS.fd",
     "tpm-state",
     "clone-source",
     "firstboot.done",
+    "tsc-hz",
 ];
 
 /// Plan `vmlab worktree freeze <snapshot>` (§21.1), or refuse it.

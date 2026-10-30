@@ -337,7 +337,8 @@ too. A Linux guest, a container's micro-VM included, reads
 `/proc/sys/kernel/random/boot_id`. A Windows guest reads the kernel's boot
 counter, `BootId` under the prefetcher's registry key, which a clock change
 does not move; where that value is missing (NT4 through XP/2003) it falls back
-to the last boot time from WMI, normalised to UTC. Windows 9x/ME, DOS and
+to the last boot time from WMI, normalised to UTC. A macOS guest reads
+`kern.bootsessionuuid` with `sysctl`. Windows 9x/ME, DOS and
 TempleOS have no boot identity to read, and fail with "<family> has no boot
 identity vmlab can read". It also fails when the agent does not answer.
 

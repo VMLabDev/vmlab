@@ -108,7 +108,7 @@ page ref_paths {
     rows:
       | "Path under `.vmlab/`" | "Holds" |
       | "`state.json`" | "Persisted lab state: snapshot records, pinned artefacts, agent repairs." |
-      | "`vms/<vm>/`" | "`disk0.qcow2`, the linked clone; `OVMF_VARS.fd`; `tpm-state/`; `firstboot.done` once the first-boot provision has run." |
+      | "`vms/<vm>/`" | "`disk0.qcow2`, the linked clone; `OVMF_VARS.fd`; `tpm-state/`; `tsc-hz`, the TSC frequency a `tsc = \"host\"` VM was pinned at its first start; `firstboot.done` once the first-boot provision has run." |
       | "`containers/<name>/`" | "`scratch.qcow2`, the writable overlay, and `container.json`." |
       | "`media/`" | "ISO and floppy images built from `media {}` folders, content-addressed. See [Lab file: vm and its children](ref_vm)." |
       | "`volumes/`" | "Named container volumes." |
@@ -116,7 +116,7 @@ page ref_paths {
       | "`workspace/<machine>.json`" | "The workspace syncer's ledger for one dev machine. See [Dev machines and the workspace syncer](guide_dev)." |
       | "`worktree.json`" | "In a main checkout frozen for [worktree labs](guide_worktrees): the newest generation and the snapshot it was frozen at. Its presence turns on worktree isolation for the family." |
       | "`worktree-ports.json`" | "In a frozen main checkout: each worktree lab's port slot, keyed by the git worktree's name, and every fixed port each lab of the family has bound, the main lab's declared ones included. Locked exclusively for every change, released per worktree by `vmlab destroy` there, and deleted by a thaw. See [Worktree labs](guide_worktrees)." |
-      | "`freeze/<n>/<machine>/`" | "Generation `n` of the freeze: the machine's frozen disks, read-only, with copies of its `OVMF_VARS.fd`, `tpm-state/`, `firstboot.done`, `clone-source` and `state.json` record. `freeze/<n>/volumes/` holds the named volumes. See [Worktree labs](guide_worktrees)." |
+      | "`freeze/<n>/<machine>/`" | "Generation `n` of the freeze: the machine's frozen disks, read-only, with copies of its `OVMF_VARS.fd`, `tpm-state/`, `tsc-hz`, `firstboot.done`, `clone-source` and `state.json` record. `freeze/<n>/volumes/` holds the named volumes. See [Worktree labs](guide_worktrees)." |
       | "`vms/<vm>/freeze-generation`" | "In a worktree lab: the generation the machine was cloned from. Beside a container's disk too. See [Worktree labs](guide_worktrees)." |
       | "`screenshots/`" | "Where `Machine.screenshot` writes when given no path." |
       | "`recordings/`" | "Where a [console recording](guide_recording) lands when given no path, as `<vm>-<UTC timestamp>.mp4`." |
