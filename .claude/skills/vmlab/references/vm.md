@@ -45,6 +45,7 @@ vm "<name>" {
   tpm         = false
   secure_boot = false
   qemu_args   = []
+  hypervisor  = "qemu"
   gpu       { … }
   nic       { … }
   disk "…"  { … }
@@ -87,7 +88,8 @@ vm "<name>" {
 | `secure_boot` | bool | inherited | Enable secure boot; OVMF only. Inherited from template, then profile. |
 | `secure_boot_keys` | utf8 | inherited, else `microsoft` | Key store secure boot starts from: `microsoft` (bundled store, Microsoft's keys) or `setup` (blank store — firmware in setup mode, the guest enrolls its own keys, the VM's `OVMF_VARS.fd` keeps them). Inherited from template, then profile. Needs `secure_boot = true`. |
 | `secure_boot_vars` | utf8 | none | Pre-enrolled UEFI VARS file (relative to lab root) copied once at first start instead of the bundled store; must be the secure-boot firmware's VARS size. Needs `secure_boot = true`; exclusive with `secure_boot_keys`; overrides a template's stored VARS. |
-| `qemu_args` | list<utf8> | none | Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates. |
+| `qemu_args` | list<utf8> | none | Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates. Refused on any other hypervisor. |
+| `hypervisor` | utf8 | host default, else `qemu` | `qemu`, or `vmlab` (vmlab-hv). vmlab-hv runs container micro-VMs only so far, so `vmlab` is a validation error on a VM (PRD §22). Declared on the VM only, never inherited. |
 | `gpu {}` | child | none | GPU acceleration: passthrough, virgl or vulkan. |
 | `nic {}` | children | none | Network interfaces. No NICs means air-gapped. Shares need at least one. |
 | `disk {}` | children | none | Additional disks beyond the primary disk. |

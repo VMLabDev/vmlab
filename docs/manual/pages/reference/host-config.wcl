@@ -63,6 +63,11 @@ host {
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
+  vmlab_hv             = "/opt/vmlab-hv/bin/vmlab-hv"
+  hypervisor {
+    container = "qemu"
+    vm        = "qemu"
+  }
 }
 SRC
   }
@@ -84,6 +89,8 @@ SRC
       | "`config_weave_bin_dir`" | "utf8" | "`~/.local/share/config-weave/bin`" | "Directory holding the config-weave guest binaries playbooks push." |
       | "`workspace_max_file`" | "ByteSize" | "`256MiB`" | "Workspace syncer per-file size guard. A larger file is refused by name." |
       | "`firmware_dir`" | "utf8" | "none" | "UEFI firmware override, laid out `<dir>/<arch>/` with the bundled set's file names. Searched before vmlab's bundled firmware and the host's." |
+      | "`vmlab_hv`" | "utf8" | "`vmlab-hv` on PATH" | "The vmlab-hv binary that machines on `hypervisor = \"vmlab\"` run. `up` checks that it exists before it starts anything." |
+      | "`hypervisor {}`" | "child" | "`qemu` for both" | "The hypervisor a machine runs on when it does not name one, by machine kind: `container` and `vm`, each `qemu` or `vmlab`. Keyed by kind because vmlab-hv takes machines over one phase at a time. A machine's own `hypervisor` wins." |
   }
   p "The parser enforces these rules, and reports every violation in one pass:"
   list {
@@ -92,6 +99,7 @@ SRC
     li "`trunk_port` is between 1 and 65535."
     li "`fastpath` is one of `auto`, `off`, `sockmap`, `afxdp`. The `VMLAB_FASTPATH` environment variable selects the same values."
     li "`oci_chunk_size` and `workspace_max_file` are non-negative sizes."
+    li "`hypervisor { container, vm }` are each `qemu` or `vmlab`."
     li "A field the schema does not name is rejected with its position."
     li "`gpu_address`, removed after v0.24, is rejected with a message naming the `gpu` block that replaced it."
   }

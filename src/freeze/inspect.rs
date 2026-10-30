@@ -296,6 +296,7 @@ mod tests {
                 image_digest: None,
                 freeze_point: Some(1),
                 frozen_in: None,
+                hypervisor: Default::default(),
             },
         );
         let dir = super::super::machine_dir(tmp.path(), 1, "dc");

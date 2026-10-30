@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use wcl_lang::{Block, Document};
 
 use super::block::{Reader, Spanned, Unspan};
+use super::hypervisor::HypervisorKind;
 use super::model::*;
 use super::{Issue, IssueList};
 
@@ -599,6 +600,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let secure_boot_keys = r.keyword("secure_boot_keys", SECURE_BOOT_KEYS).unspan();
     let secure_boot_vars = r.path("secure_boot_vars").unspan();
     let qemu_args = r.string_list("qemu_args");
+    let hypervisor = r.keyword("hypervisor", HypervisorKind::NAMES).unspan();
     let dev = extract_dev(&mut r);
     let mut gpu = None;
     let mut nics = Vec::new();
@@ -679,6 +681,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         secure_boot_keys,
         secure_boot_vars,
         qemu_args,
+        hypervisor,
         gpu,
         nics,
         extra_disks,
@@ -728,6 +731,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let profile = r.string("profile").unspan();
     let cpus = r.int_at_least("cpus", 1).unspan();
     let memory = r.size("memory").unspan();
+    let hypervisor = r.keyword("hypervisor", HypervisorKind::NAMES).unspan();
     let depends_on = r.string_list("depends_on");
     let depends_on_provision = r.string_list("depends_on_provision");
     let dev = extract_dev(&mut r);
@@ -791,6 +795,7 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
         profile,
         cpus,
         memory,
+        hypervisor,
         depends_on,
         depends_on_provision,
         nics,

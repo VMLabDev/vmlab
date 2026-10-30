@@ -1092,7 +1092,7 @@ impl VmInstance {
                     machine,
                     env: render.env,
                     log: self.dirs.logs.join("qemu.log"),
-                    qmp_sock: self.dirs.qmp_sock(),
+                    control_sock: self.dirs.qmp_sock(),
                     fds: nic_fds,
                     channels: super::hypervisor::GuestChannels {
                         agent: self.dirs.agent_sock(),

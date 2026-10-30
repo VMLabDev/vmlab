@@ -22,6 +22,7 @@ use super::share_plan;
 use super::state::{LabState, generate_mac};
 use super::vm::{VmDirs, VmInstance};
 use crate::config::LabFile;
+use crate::config::hypervisor::HypervisorKind;
 use crate::config::model::{Container, MachineCfg, Nic, TemplateRef, Vm};
 use crate::profiles::ProfileSet;
 use crate::template::TemplateStore;
@@ -41,6 +42,9 @@ pub(super) struct BuildContext<'a> {
     /// The main checkout's freeze, in a worktree lab of a frozen family: a
     /// machine about to be cloned from it binds the frozen MACs and pins.
     pub freeze: Option<&'a FreezePlan>,
+    /// The host config: the default hypervisor per machine kind and the
+    /// vmlab-hv binary (§22).
+    pub host: &'a crate::config::host::HostConfig,
 }
 
 impl BuildContext<'_> {
@@ -80,6 +84,9 @@ pub(super) async fn build_vm(
     vm_cfg: &Vm,
     state: &mut LabState,
 ) -> Result<(Arc<VmInstance>, Option<PullJob>)> {
+    // Every VM runs on QEMU until vmlab-hv's phase 2; this refuses one that
+    // names vmlab-hv, or that the host config's default would put there.
+    hypervisor_for(cx, MachineCfg::Vm(vm_cfg))?;
     let mut pending = None;
     // Backing disk + effective metadata: the variant the reference
     // resolves to, or the base (§6.6).
@@ -310,6 +317,7 @@ pub(super) fn build_container(
     // template layer). §5.1 validation has already rejected a container no
     // layer sizes.
     let resolved = crate::qemu::resolve_container(c_cfg, arch, cx.profiles)?;
+    let hypervisor = hypervisor_for(cx, MachineCfg::Container(c_cfg))?;
     let container = ContainerInstance::new(
         cx.lab,
         c_cfg.clone(),
@@ -319,8 +327,29 @@ pub(super) fn build_container(
         nic_mtus,
         image,
         volumes,
+        hypervisor,
+        super::hypervisor::for_machine(hypervisor, cx.host),
     );
     Ok((container, pending))
+}
+
+/// The hypervisor `machine` runs on (§22), refusing — in validation's words,
+/// from the one list — a machine vmlab-hv cannot run yet. Validation said so
+/// first; this is the daemon not taking its word for it, since a host config
+/// edited since can move a machine onto vmlab-hv without touching the lab
+/// file.
+fn hypervisor_for(cx: &BuildContext<'_>, machine: MachineCfg<'_>) -> Result<HypervisorKind> {
+    let kind = cx.host.hypervisor.effective(machine);
+    if kind == HypervisorKind::Vmlab {
+        let why = crate::config::hypervisor::vmlab_refusals(
+            machine,
+            &crate::config::hypervisor::HostFacts::probe(),
+        );
+        if !why.is_empty() {
+            bail!("{}", why.join("\n"));
+        }
+    }
+    Ok(kind)
 }
 
 /// Build one machine of either kind from its declaration.

@@ -58,6 +58,21 @@ pub struct ContainerVmPaths {
     pub volumes: Vec<(String, PathBuf)>,
 }
 
+/// The guest asset's kernel command line — the same for every hypervisor
+/// that boots it, because cinit reads its root and scratch devices from it
+/// (`guest/cinit/src/cmdline.rs`): the first virtio-blk device is the
+/// squashfs rootfs (vda), the second the scratch qcow2 (vdb).
+pub fn kernel_cmdline(arch: &str) -> String {
+    let console = match arch {
+        "aarch64" => "ttyAMA0", // PL011 on the virt machine
+        _ => "ttyS0",           // 16550A on q35 and riscv virt
+    };
+    format!(
+        "console={console} quiet loglevel=3 panic=-1 reboot=t \
+         vmlab.root=/dev/vda vmlab.scratch=/dev/vdb"
+    )
+}
+
 /// Build the full argv (excluding argv[0], [`super::emulator_binary`]),
 /// picking the accelerator via [`pick_accel`].
 pub fn build_container_args(
@@ -133,20 +148,9 @@ pub(crate) fn build_container_args_with_accel(
     // `vmlab.root=`/`vmlab.scratch=` are fixed by the blockdev order below:
     // the first virtio-blk device is the squashfs rootfs (vda), the second
     // the scratch qcow2 (vdb) — see guest/cinit/src/cmdline.rs.
-    let console = match arch {
-        "aarch64" => "ttyAMA0", // PL011 on the virt machine
-        _ => "ttyS0",           // 16550A on q35 and riscv virt
-    };
     arg(&mut a, "kernel", paths.kernel.display().to_string());
     arg(&mut a, "initrd", paths.initrd.display().to_string());
-    arg(
-        &mut a,
-        "append",
-        format!(
-            "console={console} quiet loglevel=3 panic=-1 reboot=t \
-             vmlab.root=/dev/vda vmlab.scratch=/dev/vdb"
-        ),
-    );
+    arg(&mut a, "append", kernel_cmdline(arch));
 
     // Serial console → file: kernel messages plus the container's
     // stdout/stderr (cinit leaves them on the console).

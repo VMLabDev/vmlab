@@ -247,6 +247,7 @@ container "<name>" {
   profile    = "container"
   cpus       = 1
   memory     = 256MiB
+  hypervisor = "qemu"
   depends_on = ["db"]
   depends_on_provision = ["db"]
   nic         { … }
@@ -273,6 +274,7 @@ container "<name>" {
 | `profile` | utf8 | none | Guest profile supplying micro-VM hardware defaults, for example `container`. |
 | `cpus` | i64 | from profile | vCPU count for the micro-VM, greater than 0. One of this field or the profile must supply it. |
 | `memory` | ByteSize | from profile | RAM for the micro-VM, for example `512MiB`. One of this field or the profile must supply it. |
+| `hypervisor` | utf8 | host default, else `qemu` | The program that runs the micro-VM: `qemu`, or `vmlab` for vmlab-hv, vmlab's own hypervisor (x86_64 under KVM, no TCG fallback). Unset takes the host config's `hypervisor { container }`. Online snapshots restore only under the hypervisor that took them (PRD §22). |
 | `depends_on` | list<utf8> | none | Start order: VM or container names that must be ready before this one starts. Ready means a VM's agent answers or a container passes its healthcheck; their provisioning is not waited for. `down` stops in reverse. No self-reference, no cycles. |
 | `depends_on_provision` | list<utf8> | none | Provisioning order: VM or container names whose provision and playbook steps must all finish before this machine's first step runs. Does not delay this machine's start. No self-reference, no cycles. |
 | `nic {}` | children | none | Network interfaces. None means air-gapped; exec and copy still work via the agent. |
@@ -294,6 +296,8 @@ Validation enforces these rules:
   guess.
 - An `:idle` container cannot declare `entrypoint`, `command` or a
   `healthcheck`.
+- A container on `hypervisor = "vmlab"` (declared or from the host default) is
+  refused on a host that is not x86_64 or has no usable `/dev/kvm`.
 - A container with `port {}` blocks needs at least one NIC; forwards need a
   segment to reach it over.
 - A container with `volume {}` blocks needs at least one NIC; volumes mount over

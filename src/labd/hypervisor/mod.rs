@@ -16,9 +16,11 @@
 //! `Proc` and `QmpClient`. That is what lets an adapter be entirely
 //! in-memory (ADR-0001).
 //!
-//! Two adapters, both live: [`Qemu`] runs the real thing in production, and
-//! [`fake::FakeHypervisor`] runs a scripted machine with no subprocess at
-//! all, which is what every lifecycle test drives.
+//! Three adapters: [`Qemu`] runs the real thing in production, [`VmlabHv`]
+//! runs vmlab's own hypervisor for a machine that names it (PRD §22,
+//! ADR-0021), and [`fake::FakeHypervisor`] runs a scripted machine with no
+//! subprocess at all, which is what every lifecycle test drives. Which of the
+//! first two a machine gets is [`for_machine`]'s answer.
 //!
 //! What a running machine can do beyond the lifecycle — online snapshots,
 //! scripted input, framebuffer capture, device hot-plug — is a set of
@@ -46,8 +48,10 @@ use crate::qemu::{Accel, ResolvedContainer, ResolvedVm, VmPaths};
 
 mod qemu;
 pub use qemu::Qemu;
+pub(crate) mod vmlab_hv;
 #[cfg(test)]
 pub(crate) use qemu::QmpCapabilities;
+pub use vmlab_hv::VmlabHv;
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -265,8 +269,9 @@ pub struct LaunchSpec {
     pub env: ChildEnv,
     /// Where the emulator's stdout/stderr goes.
     pub log: PathBuf,
-    /// The QMP socket the emulator will bind, connected once it is up.
-    pub qmp_sock: PathBuf,
+    /// The control socket the hypervisor will bind, connected once it is up
+    /// — QMP for QEMU, the vmlab-hv control protocol for vmlab-hv.
+    pub control_sock: PathBuf,
     /// Pre-opened descriptors installed at fixed numbers in the child (tap
     /// NIC fds).
     pub fds: Vec<ChildFd>,
@@ -325,11 +330,29 @@ pub trait Hypervisor: Send + Sync + 'static {
     /// cannot be composed fails here, before anything is spawned.
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running>;
 
+    /// The program [`start_emulator`](Hypervisor::start_emulator) runs for a
+    /// machine of `arch` — what `up` checks is installed before it starts
+    /// anything.
+    fn emulator_binary(&self, arch: &str) -> String;
+
     /// The kernel + initramfs this host boots a container micro-VM from
     /// (`guest/build-asset.sh` output). A host probe like the rest of this
     /// trait: where the asset lives is a property of the machine doing the
     /// running, not of the container being run.
     fn guest_asset(&self, arch: &str) -> Result<GuestAsset>;
+}
+
+/// The adapter for a machine on `kind` (PRD §22): QEMU, or vmlab-hv at the
+/// host config's `vmlab_hv` path (else on `PATH`).
+pub fn for_machine(
+    kind: crate::config::hypervisor::HypervisorKind,
+    host: &crate::config::host::HostConfig,
+) -> Arc<dyn Hypervisor> {
+    use crate::config::hypervisor::HypervisorKind;
+    match kind {
+        HypervisorKind::Qemu => Arc::new(Qemu),
+        HypervisorKind::Vmlab => Arc::new(VmlabHv::new(host.vmlab_hv.clone())),
+    }
 }
 
 /// What one QMP event says about whether the guest is asleep: `Some(true)`
