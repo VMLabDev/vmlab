@@ -174,12 +174,22 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     // -- duplicate forward host ports across the lab ----------------------
     // Container `port` blocks compile into the same forward machinery, so
     // they share the uniqueness space with segment forwards. Only declared
-    // ports can collide: an omitted one is picked free at install time.
-    let mut fwd_ports: HashMap<u16, Span> = HashMap::new();
+    // ports can collide: an omitted one is picked free at install time. Two
+    // forwards on one port collide unless each binds its own explicit
+    // address (§9.8).
+    let mut fwd_ports: Vec<(u16, Ipv4Addr)> = Vec::new();
+    let mut claim = |port: u16, bind: Option<Ipv4Addr>| {
+        let bind = bind.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let taken = fwd_ports
+            .iter()
+            .any(|(p, b)| *p == port && forward_binds_overlap(*b, bind));
+        fwd_ports.push((port, bind));
+        taken
+    };
     for seg in &lab.segments {
         for fwd in &seg.forwards {
             let Some(port) = fwd.host_port else { continue };
-            if fwd_ports.insert(port, fwd.span).is_some() {
+            if claim(port, fwd.bind) {
                 issues.push(Issue::at(
                     fwd.span,
                     format!("duplicate forward host_port {port}"),
@@ -190,7 +200,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     for c in &lab.containers {
         for p in &c.ports {
             let Some(port) = p.host_port else { continue };
-            if fwd_ports.insert(port, p.span).is_some() {
+            if claim(port, p.bind) {
                 issues.push(Issue::at(
                     p.span,
                     format!("duplicate forward host port {port}"),
@@ -3459,6 +3469,69 @@ lab "l" {
   }
 }"#,
             "duplicate forward host port",
+        );
+    }
+
+    /// Two explicit addresses share a port; an address and every interface
+    /// do not, nor does one address twice (§9.8).
+    #[test]
+    fn distinct_bind_addresses_share_a_host_port() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" {
+    forward { bind = "127.0.0.1" host_port = 18080 to = "c:80" }
+  }
+  container "c" { image = "nginx" nic { segment = "s" }
+    port { bind = "127.0.0.2" host = 18080 container = 80 }
+  }
+}"#,
+        );
+        assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" {
+    forward { bind = "127.0.0.1" host_port = 18080 to = "c:80" }
+    forward { host_port = 18080 to = "c:81" }
+  }
+  container "c" { image = "nginx" nic { segment = "s" } }
+}"#,
+            "duplicate forward host_port 18080",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { forward { bind = "127.0.0.1" host_port = 18080 to = "c:80" } }
+  container "c" { image = "nginx" nic { segment = "s" }
+    port { bind = "127.0.0.1" host = 18080 container = 80 }
+  }
+}"#,
+            "duplicate forward host port 18080",
+        );
+    }
+
+    /// `bind` is an IPv4 literal: a hostname or an IPv6 address is refused,
+    /// naming the block and the value.
+    #[test]
+    fn a_bind_that_is_not_an_ipv4_literal_is_refused() {
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { forward { bind = "localhost" host_port = 18080 to = "c:80" } }
+  container "c" { image = "nginx" nic { segment = "s" } }
+}"#,
+            "forward {}: bind \"localhost\" is not an IPv4 address literal",
+        );
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" {}
+  container "c" { image = "nginx" nic { segment = "s" }
+    port { bind = "::1" host = 18080 container = 80 }
+  }
+}"#,
+            "port {}: bind \"::1\" is not an IPv4 address literal",
         );
     }
 

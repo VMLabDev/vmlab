@@ -172,6 +172,8 @@ type DnsRecord {
 type Forward {
   @doc("Host port to listen on (1–65535), unique across the lab; omitted = vmlab picks a free port when the forward is installed, shown by `vmlab status`")
   @range(1, 65535) host_port: i64?
+  @doc("Host IPv4 address to listen on, one the host owns; omitted = `0.0.0.0` (every interface). `127.0.0.1` keeps the forward off the LAN. Worktree isolation binds `127.0.0.1` whatever is declared")
+  bind: utf8?
   @doc("Target as `vm:port`; the VM must be declared (required)")
   to: utf8
   @doc("Protocol: `tcp` (default) | `udp` | `both`")
@@ -420,6 +422,8 @@ type Volume {
 type PortMap {
   @doc("Host port to listen on (1–65535), unique across the lab; omitted = vmlab picks a free port when the forward is installed, shown by `vmlab status`")
   @range(1, 65535) host: i64?
+  @doc("Host IPv4 address to listen on, one the host owns; omitted = `0.0.0.0` (every interface). `127.0.0.1` keeps the forward off the LAN. Worktree isolation binds `127.0.0.1` whatever is declared")
+  bind: utf8?
   @doc("Container port to forward to (1–65535) (required)")
   @range(1, 65535) container: i64
   @doc("Protocol: `tcp` (default) | `udp` | `both`")

@@ -243,10 +243,19 @@ pub struct Forward {
     /// `None` = automatic: vmlab binds a free port when it installs the
     /// forward and reports it in `vmlab status`.
     pub host_port: Option<u16>,
+    /// The host address to listen on; `None` = every interface (`0.0.0.0`).
+    pub bind: Option<Ipv4Addr>,
     pub vm: String,
     pub guest_port: u16,
     pub proto: Proto,
     pub span: Span,
+}
+
+/// Whether two forwards listening on one host port collide (PRD §9.8): on the
+/// same address, or where either listens on every interface (`0.0.0.0`).
+/// Two different explicit addresses share a port without contest.
+pub fn forward_binds_overlap(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+    a == b || a.is_unspecified() || b.is_unspecified()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -820,6 +829,8 @@ pub struct Volume {
 pub struct PortMap {
     /// `None` = automatic, as for [`Forward::host_port`].
     pub host_port: Option<u16>,
+    /// As [`Forward::bind`].
+    pub bind: Option<Ipv4Addr>,
     pub container_port: u16,
     pub proto: Proto,
     pub span: Span,
