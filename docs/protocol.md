@@ -101,7 +101,7 @@ the code is the contract.
 | `machine.pull_file` | `machine: String`, `from: String`, `to: Option<String>` | `cli` | Copy a file out of the guest: to `to`, a host path the daemon can write, or — with `to` omitted — back inline as base64, for a caller that wants the bytes rather than a file on the daemon's host. |
 | `machine.tail` | `machine: String`, `path: String` | `cli` | Follow a guest file (`tail -F` semantics), streamed as chunks until the caller hangs up or the machine stops. |
 | `machine.eventlog` | `machine: String`, `filter: Option<String>` | `cli` | Follow the Windows event log, streamed as chunks. |
-| `machine.stats` | `machine: String` | `cli` | Latest guest metrics; subscribes the sampler on first use. |
+| `machine.stats` | `machine: String` | `cli` | Latest guest metrics, and the emulator's host CPU use over one second; subscribes the sampler on first use. |
 | `machine.clipboard_get` | `machine: String` | `cli` | Read the guest clipboard. |
 | `machine.clipboard_set` | `machine: String`, `text: String` | `cli` | Write the guest clipboard. |
 | `machine.logs` | `machine: String`, `lines: usize`, `follow: bool` | `cli` | The machine's console log: the last `lines`, then, with `follow`, streamed growth until the machine stops. |

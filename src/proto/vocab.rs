@@ -834,7 +834,8 @@ vocabulary! {
             #[serde(alias = "vm", alias = "container")] machine: String,
             #[serde(default)] filter: Option<String>,
         },
-        /// Latest guest metrics; subscribes the sampler on first use.
+        /// Latest guest metrics, and the emulator's host CPU use over one
+        /// second; subscribes the sampler on first use.
         MachineStats = "machine.stats" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },

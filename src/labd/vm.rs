@@ -1776,6 +1776,10 @@ impl super::machine::Machine for VmInstance {
         self.agent_handle().await
     }
 
+    async fn emulator_pid(&self) -> Option<u32> {
+        self.qemu.lock().await.as_ref().and_then(|p| p.pid())
+    }
+
     async fn begin_agent_replacement(&self) -> super::machine::AgentReplacement {
         self.agent.begin_replacement().await
     }

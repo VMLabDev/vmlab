@@ -2223,7 +2223,11 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             mem_total,
             disks,
         } => {
-            let _ = inner.metrics.send(Some(MetricsSnapshot {
+            // `send_replace`, not `send`: `stats` reads the latest sample
+            // with nobody subscribed between calls, and `send` drops a value
+            // no receiver is waiting on — which froze the first sample in
+            // place for the life of the connection (#185).
+            inner.metrics.send_replace(Some(MetricsSnapshot {
                 cpu_pct,
                 mem_used,
                 mem_total,
@@ -2638,10 +2642,20 @@ mod tests {
                                         send(AgentMsg::Exited { id, code: 137 }).await;
                                     }
                                 }
+                                // An idle first sample, then a busy one
+                                // after the host has stopped waiting.
                                 HostMsg::SubscribeMetrics { .. } => {
                                     send(AgentMsg::Metrics {
-                                        cpu_pct: 12.5,
+                                        cpu_pct: 0.0,
                                         mem_used: 100,
+                                        mem_total: 200,
+                                        disks: vec![],
+                                    })
+                                    .await;
+                                    tokio::time::sleep(Duration::from_millis(300)).await;
+                                    send(AgentMsg::Metrics {
+                                        cpu_pct: 12.5,
+                                        mem_used: 150,
                                         mem_total: 200,
                                         disks: vec![],
                                     })
@@ -3880,7 +3894,20 @@ mod tests {
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
         let m = agent.stats(Duration::from_secs(5)).await.unwrap();
         assert_eq!(m.mem_total, 200);
-        assert_eq!(m.cpu_pct, 12.5);
+        assert_eq!(m.cpu_pct, 0.0);
+    }
+
+    /// A sample that lands while nobody is waiting still replaces the one
+    /// `stats` hands out (#185: the first sample used to stay forever).
+    #[tokio::test]
+    async fn stats_reads_the_latest_sample_not_the_first() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let first = agent.stats(Duration::from_secs(5)).await.unwrap();
+        assert_eq!((first.cpu_pct, first.mem_used), (0.0, 100));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let later = agent.stats(Duration::from_secs(5)).await.unwrap();
+        assert_eq!((later.cpu_pct, later.mem_used), (12.5, 150));
     }
 
     #[tokio::test]

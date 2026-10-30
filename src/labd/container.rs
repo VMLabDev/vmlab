@@ -1349,6 +1349,10 @@ impl super::machine::Machine for ContainerInstance {
         self.agent_handle().await
     }
 
+    async fn emulator_pid(&self) -> Option<u32> {
+        self.qemu.lock().await.as_ref().and_then(|p| p.pid())
+    }
+
     async fn agent_answering(&self) -> bool {
         self.agent_probe().await
     }

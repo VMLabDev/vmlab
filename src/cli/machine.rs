@@ -83,19 +83,24 @@ pub fn cmd_stats(machine_ref: &str, json: bool) -> Result<()> {
 
 /// CPU, memory and every mounted filesystem, one per line. Bytes are the wire
 /// form; a person reads sizes.
+///
+/// `cpu` is the guest's own figure, a share of all its CPUs; `host cpu` is
+/// the emulator process on the host, a share of one host core, and is left
+/// out when the daemon had none to give.
 fn render_stats(stats: &Value) -> String {
     use std::fmt::Write as _;
     let bytes = |v: &Value| v.as_u64().unwrap_or(0);
-    let mut rows = vec![
-        (
-            "cpu".to_string(),
-            format!("{:.1}%", stats["cpu_pct"].as_f64().unwrap_or(0.0)),
-        ),
-        (
-            "memory".to_string(),
-            usage(bytes(&stats["mem_used"]), bytes(&stats["mem_total"])),
-        ),
-    ];
+    let mut rows = vec![(
+        "cpu".to_string(),
+        format!("{:.1}%", stats["cpu_pct"].as_f64().unwrap_or(0.0)),
+    )];
+    if let Some(host) = stats["host_cpu_pct"].as_f64() {
+        rows.push(("host cpu".to_string(), format!("{host:.1}% of one core")));
+    }
+    rows.push((
+        "memory".to_string(),
+        usage(bytes(&stats["mem_used"]), bytes(&stats["mem_total"])),
+    ));
     for disk in stats["disks"].as_array().unwrap_or(&Vec::new()) {
         rows.push((
             format!("disk {}", disk["mount"].as_str().unwrap_or("?")),
@@ -318,6 +323,7 @@ mod tests {
     fn stats_render_bytes_as_sizes_with_a_line_per_disk() {
         let out = render_stats(&json!({
             "cpu_pct": 12.5,
+            "host_cpu_pct": 31.25,
             "mem_used": 2u64 << 30,
             "mem_total": 4u64 << 30,
             "disks": [
@@ -329,6 +335,7 @@ mod tests {
         assert_eq!(
             out,
             "cpu        12.5%\n\
+             host cpu   31.2% of one core\n\
              memory     2.0 GiB / 4.0 GiB (50%)\n\
              disk /     8.0 GiB / 20.0 GiB (40%)\n\
              disk /var  512.0 MiB / 2.0 GiB (25%)\n",
@@ -339,7 +346,9 @@ mod tests {
     /// than rendering an empty table or panicking on the missing array.
     #[test]
     fn stats_survive_a_guest_that_reported_no_disks() {
-        let out = render_stats(&json!({"cpu_pct": 0.0, "mem_used": 0, "mem_total": 0}));
+        let out = render_stats(&json!({
+            "cpu_pct": 0.0, "host_cpu_pct": null, "mem_used": 0, "mem_total": 0,
+        }));
         assert_eq!(out, "cpu     0.0%\nmemory  0 B\n");
     }
 
