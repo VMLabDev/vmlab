@@ -334,7 +334,7 @@ vmlab status [OPTIONS]
 
 | Option | Meaning |
 | --- | --- |
-| `-v`, `--verbose` | Add the raw power state, readiness, and each machine's kind-specific detail (template/hardware, image/health/last exit). |
+| `-v`, `--verbose` | Add the raw power state, readiness, the hypervisor, and each machine's kind-specific detail (template/hardware, image/health/last exit). |
 | `--json` | Print the lab daemon's status projection as JSON instead of the tables; a lab with no daemon prints `{"lab": "<name>", "running": false}`. |
 | `-h`, `--help` | Print help. |
 
@@ -391,7 +391,8 @@ way:
 the guest is ready. With `--verbose` a second line under each machine carries
 `state=`, `ready=` and `cached=`, plus `diverged=yes` on a machine
 whose agent was replaced by `vmlab machine repair-agent` (see cli-machine.md) or by
-`up`'s agent refresh. A VM
+`up`'s agent refresh. Every machine then adds `hypervisor=` (`qemu` or `vmlab`:
+its own `hypervisor`, else the host default for its kind; PRD §22). A VM
 then adds `arch`, `cpus`, `memory` and `agent` (the running agent's handshake
 stamp, or the template's sealed one before an agent answers or while stopped; an
 agent restarted inside the guest is handshaken again, so this follows it). A VM
