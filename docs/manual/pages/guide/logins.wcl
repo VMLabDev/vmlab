@@ -153,4 +153,19 @@ password is not verified: root needs no credential to become an account, which
 is why the container floor costs nothing. An account not in the guest's passwd
 fails by name.
 DOC
+
+  h3 "macOS: the same route, through launchd"
+
+  p <<'DOC'
+A macOS session takes the PAM route too. Its `su -l` reads `/etc/pam.d/su`,
+whose session module is `pam_launchd`, so the command lands in the account's
+own launchd domain, which is as close to a login as macOS comes outside the
+GUI; the banner says `via a PAM login session (/usr/bin/su -l)`. Accounts are
+looked up in the directory service rather than `/etc/passwd`, so an account
+made with `sysadminctl` or System Settings is found, and one that does not
+exist fails naming `dscl . -list /Users`. There is no `XDG_RUNTIME_DIR`:
+macOS has no `/run/user`, and launchd gives each per-user process `$TMPDIR`
+instead. A `vmlab cp --user` reads and writes as the account through Darwin's
+per-thread credential, which carries the account's groups as well.
+DOC
 }

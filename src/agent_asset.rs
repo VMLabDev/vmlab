@@ -255,6 +255,26 @@ mod tests {
         assert_eq!(win.version, "unknown");
     }
 
+    /// The macOS agent is the Rust one, keyed by arch like Linux's, and its
+    /// binary is named like Linux's too.
+    #[test]
+    fn finds_the_macos_flavour_beside_the_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_asset(tmp.path(), "macos-x86_64", "vmlab-agent", Some("agent=m"));
+        let dirs = vec![tmp.path().to_path_buf()];
+        let mac = find_in(&dirs, AgentOs::Macos, "x86_64").unwrap();
+        assert!(mac.path.ends_with("agent/macos-x86_64/vmlab-agent"));
+        assert_eq!(mac.version, "agent=m");
+        assert!(!AgentOs::Macos.is_legacy());
+        let err = find_in(&dirs, AgentOs::Linux, "x86_64").unwrap_err();
+        assert!(format!("{err}").contains("build-agent.sh linux-x86_64"));
+        let err = find_in(&[], AgentOs::Macos, "x86_64").unwrap_err();
+        assert!(
+            format!("{err}").contains("build-agent.sh macos-x86_64"),
+            "{err}"
+        );
+    }
+
     /// The legacy flavours have fixed 32-bit keys whatever the guest arch.
     #[test]
     fn finds_legacy_flavours_at_their_fixed_keys() {

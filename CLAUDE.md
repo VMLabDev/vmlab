@@ -88,6 +88,13 @@ profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
 `legacy/` builds and install scripts, and the Rust agent's own serial fallback
 for old Linux. Verified live on FreeDOS; the NT build is verified under Wine,
 and the 9x build live on Windows 95 (950, OSR2, OSR2.5) and 98 (FE, SE).
+**The macOS agent is built** (Intel, §7.4): the Rust agent cross-built for
+`x86_64-apple-darwin` with cargo-zigbuild (no Apple SDK) and ad-hoc signed,
+serving terminal, exec, fileops, tail, metrics, set_time and the console
+user's pasteboard over `/dev/cu.vmlab.agent.0` — no watch, tree or apps —
+logins through `su -l`/`pam_launchd`, installed offline from the Recovery
+Terminal by the bootstrap ISO's `macos/install.sh`, which also arms a
+one-shot first-boot `sysadminctl` administrator. Verified live on Tahoe 26.7.2.
 **Shared apps are built** (§20, ADR-0016): `vmlab app run` puts one guest
 program's windows on the host desktop over waypipe, X11 or RDP RemoteApp,
 carried on the agent channel. **USB passthrough is built** (§5.2.1):
@@ -176,20 +183,27 @@ Module map under `src/`:
   terminals (PTY/ConPTY), streaming exec, tail, metrics, clipboard, the
   handle-based file RPC session every transfer runs over (`fileops.rs`,
   §19.5), the recursive tree `watch` backing the workspace syncer
-  (`watch/`, §19.5) and the shared-app sessions (`app.rs`, §20.3: waypipe
-  and X11 connections parked and announced, RDP dialled to the guest's own
-  3389, which `windows/rdp.rs` prepares) — none of it touches the guest
-  network. `spawn.rs` is
+  (`watch/`, §19.5; Linux and Windows only) and the shared-app sessions
+  (`app.rs`, §20.3: waypipe and X11 connections parked and announced on
+  Linux, RDP dialled to the guest's own 3389, which `windows/rdp.rs`
+  prepares) — none of it touches the guest network. `spawn.rs` is
   the one seam every guest process is created through, and that a file
   session borrows
   its identity from (ADR-0015); each platform half mints §19.2's declared
   logins behind it:
-  `windows/logon.rs` a token and a loaded profile, `linux/login.rs` a real
-  login (PAM via `su -l`, else `setuid`) and the container floor. Baked into
+  `windows/logon.rs` a token and a loaded profile, `unix/login.rs` a real
+  login (PAM via `su -l`, else `setuid`) and the container floor. `unix/` is
+  the one half Linux and macOS share (PTY, exec, logins, port), with what
+  differs in `unix/linux.rs` (`/proc`, `/sys`, systemd, the features only
+  Linux serves), `unix/macos.rs` (Mach host, `getmntinfo`, `settimeofday`,
+  the directory service, `pthread_setugid_np`, the console pasteboard) and
+  the Linux-only `unix/container.rs` and `unix/shepherd.rs`; `darwin.rs` is
+  the macOS policy as values, compiled on every test host. Baked into
   templates by
   `template/agent_install.rs`; spawned by cinit inside container micro-VMs;
   `labd/vm_agent.rs` is the host-side client; `build-agent.sh` builds the
-  per-target binaries (musl + windows-gnu).
+  per-target binaries (musl, windows-gnu, and apple-darwin through
+  cargo-zigbuild and rcodesign).
 - `media/` — folder → ISO/floppy with content-addressed cache.
 - `vision/` — screenshot, template matching, OCR.
 - `record/` — console recording (§11.1): the pure core (`core.rs`: framebuffer
