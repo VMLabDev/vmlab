@@ -207,6 +207,7 @@ mod tests {
         ForwardStatus {
             machine: machine.into(),
             segment: "lan".into(),
+            bind: None,
             host_port,
             guest: format!("10.0.0.5:{guest_port}"),
             proto: proto.into(),

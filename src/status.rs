@@ -558,6 +558,11 @@ pub struct ForwardStatus {
     pub machine: String,
     /// The segment whose NAT engine carries it.
     pub segment: String,
+    /// The host address it listens on, when that is not every interface
+    /// (`0.0.0.0`): a declared `bind`, or `127.0.0.1` under worktree
+    /// isolation (PRD §9.8, §21.4). Absent from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
     /// The host port actually listening — the kernel's pick for an `auto` one.
     pub host_port: u16,
     /// The guest end, `ip:port` (the machine's lease when it was installed).

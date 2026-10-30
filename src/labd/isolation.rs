@@ -100,7 +100,7 @@ pub fn plan(
             .map(|s| s.name.clone())
             .collect(),
     };
-    let warnings = lab
+    let mut warnings: Vec<String> = lab
         .segments
         .iter()
         .flat_map(|s| s.redirect_rules.iter().map(move |r| (s, r)))
@@ -113,6 +113,7 @@ pub fn plan(
             )
         })
         .collect();
+    warnings.extend(overridden_binds(lab));
     IsolationPlan {
         role,
         generation: config.generation,
@@ -122,6 +123,34 @@ pub fn plan(
         warnings,
         family_local,
     }
+}
+
+/// A warning for each forward whose declared `bind` isolation replaces with
+/// `127.0.0.1` (§9.8, §21.4). One that already says `127.0.0.1` loses nothing.
+fn overridden_binds(lab: &Lab) -> Vec<String> {
+    let overridden = |bind: Option<Ipv4Addr>| bind.filter(|b| *b != Ipv4Addr::LOCALHOST);
+    let say = |what: String, bind: Ipv4Addr| {
+        format!(
+            "{what} declares bind = \"{bind}\", which worktree isolation overrides: it binds \
+             127.0.0.1 (PRD §21.4)"
+        )
+    };
+    let forwards = lab.segments.iter().flat_map(|s| {
+        s.forwards.iter().filter_map(move |f| {
+            let what = format!(
+                "segment \"{}\": forward to \"{}:{}\"",
+                s.name, f.vm, f.guest_port
+            );
+            Some(say(what, overridden(f.bind)?))
+        })
+    });
+    let ports = lab.containers.iter().flat_map(|c| {
+        c.ports.iter().filter_map(move |p| {
+            let what = format!("container \"{}\": port {}", c.name, p.container_port);
+            Some(say(what, overridden(p.bind)?))
+        })
+    });
+    forwards.chain(ports).collect()
 }
 
 fn global_name(role: &Role, segment: &str) -> String {
@@ -333,6 +362,38 @@ lab "l" {
         let p = plan(&lab, &main(), None, "/src/main/.vmlab".into());
         assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
         assert!(p.warnings[0].contains("127.0.0.1"), "{:?}", p.warnings);
+    }
+
+    /// A declared `bind` isolation replaces is warned about, from either
+    /// block; one already on `127.0.0.1`, or none at all, is not.
+    #[test]
+    fn a_bind_isolation_overrides_is_warned_about() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { bind = "192.168.1.5" host_port = 8443 to = "web:443" }
+    forward { bind = "127.0.0.1" host_port = 8080 to = "web:80" }
+    forward { host_port = 8022 to = "web:22" }
+  }
+  vm "web" { template = "x86_64/t" nic { segment = "lan" } }
+  container "c" { image = "nginx" nic { segment = "lan" }
+    port { bind = "0.0.0.0" host = 9090 container = 80 }
+  }
+}"#,
+        );
+        let p = plan(&lab, &worktree(), Some("feat-x"), "/src/main/.vmlab".into());
+        assert_eq!(
+            p.warnings,
+            vec![
+                "segment \"lan\": forward to \"web:443\" declares bind = \"192.168.1.5\", which \
+                 worktree isolation overrides: it binds 127.0.0.1 (PRD §21.4)"
+                    .to_string(),
+                "container \"c\": port 80 declares bind = \"0.0.0.0\", which worktree \
+                 isolation overrides: it binds 127.0.0.1 (PRD §21.4)"
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]

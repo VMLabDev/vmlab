@@ -18,11 +18,15 @@
 //! [`HostPortConflict`] — the first claimant keeps the port, the rest are
 //! dropped naming the winner — rather than all being installed and the
 //! losers failing at bind time with nothing to say why.
+//!
+//! The host address a rule listens on is decided here too (§9.8): what its
+//! block declares as `bind`, else every interface, and `127.0.0.1` under
+//! worktree isolation whatever it declares (§21.4).
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
-use crate::config::model::{Lab, MacAddr, Proto};
+use crate::config::model::{Lab, MacAddr, Proto, forward_binds_overlap};
 use crate::freeze::ports::{FamilyPorts, PortKey};
 use crate::labd::network::nic_segment_name;
 use crate::labd::plan::Skip;
@@ -54,14 +58,13 @@ impl ForwardSource {
     }
 }
 
-/// Where a forward listens on the host.
+/// Which host port a forward listens on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostBinding {
-    /// A declared port on every interface.
+    /// A declared port.
     Port(u16),
-    /// No port declared: vmlab binds a free one on every interface when it
-    /// installs the forward, preferring the one it held last time
-    /// ([`sticky_bind`]).
+    /// No port declared: vmlab binds a free one when it installs the
+    /// forward, preferring the one it held last time ([`sticky_bind`]).
     Auto,
 }
 
@@ -82,6 +85,8 @@ pub struct ForwardRule {
     pub machine: String,
     /// The segment whose NAT engine carries the forward.
     pub segment: String,
+    /// The host address the forward listens on ([`bind_address`]).
+    pub bind: Ipv4Addr,
     pub host: HostBinding,
     pub guest_ip: Ipv4Addr,
     pub guest_port: u16,
@@ -94,14 +99,17 @@ pub struct ForwardRule {
     pub prime_mac: Option<MacAddr>,
 }
 
-/// Two or more forwards claiming one host port, in plan order. Config
-/// validation already rejects this within a lab file; the plan catches
+/// Two or more forwards claiming one host port on overlapping addresses
+/// ([`forward_binds_overlap`]), in plan order. Config validation already
+/// rejects this within a lab file; the plan catches
 /// whatever reaches it anyway — a partial `up`, or a rule composed from more
 /// than one source. The first claimant keeps the port; every other is dropped
 /// from [`ForwardPlan::rules`] and appears in `skipped` naming the winner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPortConflict {
     pub host_port: u16,
+    /// The address the winner binds.
+    pub bind: Ipv4Addr,
     /// Every claimant, in plan order: `"<machine>: <source>"`.
     pub claimants: Vec<String>,
 }
@@ -129,6 +137,19 @@ pub struct Observed {
 pub struct ForwardInputs<'a> {
     pub lab: &'a Lab,
     pub observed: &'a Observed,
+    /// The lab runs under worktree isolation (§21.4): every forward binds
+    /// `127.0.0.1`, whatever it declares.
+    pub isolated: bool,
+}
+
+/// The host address a forward binds (§9.8): `127.0.0.1` under worktree
+/// isolation (§21.4) whatever `declared` says, else the declared `bind`, else
+/// every interface.
+pub fn bind_address(declared: Option<Ipv4Addr>, isolated: bool) -> Ipv4Addr {
+    if isolated {
+        return Ipv4Addr::LOCALHOST;
+    }
+    declared.unwrap_or(Ipv4Addr::UNSPECIFIED)
 }
 
 impl ForwardInputs<'_> {
@@ -149,6 +170,7 @@ impl ForwardInputs<'_> {
 struct Draft {
     machine: String,
     segment: String,
+    bind: Option<Ipv4Addr>,
     host: HostBinding,
     guest_port: u16,
     proto: Proto,
@@ -186,6 +208,7 @@ pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
                 Draft {
                     machine: fwd.vm.clone(),
                     segment: seg.name.clone(),
+                    bind: fwd.bind,
                     host: HostBinding::from_declared(fwd.host_port),
                     guest_port: fwd.guest_port,
                     proto: fwd.proto,
@@ -211,6 +234,7 @@ pub fn plan(inputs: &ForwardInputs, scope: &[String]) -> ForwardPlan {
                 Draft {
                     machine: c.name.clone(),
                     segment,
+                    bind: port.bind,
                     host: HostBinding::from_declared(port.host_port),
                     guest_port: port.container_port,
                     proto: port.proto,
@@ -297,6 +321,7 @@ fn push(plan: &mut ForwardPlan, inputs: &ForwardInputs, draft: Draft) {
     plan.rules.push(ForwardRule {
         machine: draft.machine,
         segment: draft.segment,
+        bind: bind_address(draft.bind, inputs.isolated),
         host: draft.host,
         guest_ip,
         guest_port: draft.guest_port,
@@ -306,42 +331,57 @@ fn push(plan: &mut ForwardPlan, inputs: &ForwardInputs, draft: Draft) {
     });
 }
 
-/// Settle every host port claimed more than once: the first claimant in plan
-/// order keeps it, the rest are dropped with a reason naming the winner.
+/// Settle every host port claimed more than once on overlapping addresses
+/// ([`forward_binds_overlap`]): the first claimant in plan order keeps it,
+/// the rest are dropped with a reason naming the winner. Two rules on one
+/// port but different explicit addresses both keep it.
 ///
 /// Dropping them is the point. Installing all of them and letting the losers
 /// fail at bind time is what this used to do, and a bind failure names
 /// neither the winner nor the fact that there was a contest.
 fn resolve_conflicts(plan: &mut ForwardPlan) {
-    let mut claims: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
+    // Each winner, in plan order, with the claimants it beat.
+    let mut winners: Vec<(usize, Vec<usize>)> = Vec::new();
     for (i, r) in plan.rules.iter().enumerate() {
         // An automatic port is picked free at install time; it claims
         // nothing a plan could contest.
-        if let HostBinding::Port(p) = r.host {
-            claims.entry(p).or_default().push(i);
+        let HostBinding::Port(port) = r.host else {
+            continue;
+        };
+        let beaten_by = winners.iter_mut().find(|(w, _)| {
+            let w = &plan.rules[*w];
+            w.host == HostBinding::Port(port) && forward_binds_overlap(w.bind, r.bind)
+        });
+        match beaten_by {
+            Some((_, losers)) => losers.push(i),
+            None => winners.push((i, Vec::new())),
         }
     }
+    winners.retain(|(_, losers)| !losers.is_empty());
+    winners.sort_by_key(|(w, _)| (plan.rules[*w].declared_port(), *w));
+    let describe = |r: &ForwardRule| format!("{}: {}", r.machine, r.source.describe());
     let mut dropped: Vec<usize> = Vec::new();
-    for (host_port, claimants) in claims {
-        if claimants.len() < 2 {
-            continue;
-        }
-        let describe = |i: &usize| {
-            let r = &plan.rules[*i];
-            format!("{}: {}", r.machine, r.source.describe())
-        };
-        let winner = describe(&claimants[0]);
-        for loser in &claimants[1..] {
+    for (winner, losers) in winners {
+        let w = &plan.rules[winner];
+        let host_port = w.declared_port().unwrap_or_default();
+        for loser in &losers {
             plan.skipped.push(Skip {
-                what: describe(loser),
-                why: format!("host port {host_port} is already claimed by {winner}"),
+                what: describe(&plan.rules[*loser]),
+                why: format!(
+                    "host port {host_port} is already claimed by {}",
+                    describe(w)
+                ),
             });
-            dropped.push(*loser);
         }
         plan.conflicts.push(HostPortConflict {
             host_port,
-            claimants: claimants.iter().map(describe).collect(),
+            bind: w.bind,
+            claimants: std::iter::once(winner)
+                .chain(losers.iter().copied())
+                .map(|i| describe(&plan.rules[i]))
+                .collect(),
         });
+        dropped.extend(losers);
     }
     let mut i = 0;
     plan.rules.retain(|_| {
@@ -420,6 +460,8 @@ pub struct InstalledForward {
     pub key: ForwardKey,
     /// The segment services' forward id.
     pub id: u64,
+    /// The host address it listens on.
+    pub bind: Ipv4Addr,
     /// The host port actually bound.
     pub host_port: u16,
     /// Whether vmlab picked `host_port` (the declaration omitted it).
@@ -445,8 +487,9 @@ pub struct FamilyBind<'a> {
     /// The linked worktree's name, `None` for the main lab.
     pub worktree: Option<String>,
     pub slot: u16,
-    /// Whether the host has a port free on the address forwards bind.
-    pub is_free: &'a mut dyn FnMut(u16, Proto) -> bool,
+    /// Whether the host has a port free on an address (the rule's own
+    /// [`ForwardRule::bind`]).
+    pub is_free: &'a mut dyn FnMut(Ipv4Addr, u16, Proto) -> bool,
 }
 
 /// The ports to try for each of `rules`, in order, given what the same
@@ -475,7 +518,9 @@ pub fn bind_candidates(
                 (family.as_deref_mut(), rule.port_key(worktree.as_deref()))
             {
                 let is_free = &mut *f.is_free;
-                let port = f.ports.choose(&key, f.slot, |p| is_free(p, rule.proto))?;
+                let port = f
+                    .ports
+                    .choose(&key, f.slot, |p| is_free(rule.bind, p, rule.proto))?;
                 f.ports.record(key, port);
                 return Ok(vec![port]);
             }
@@ -541,7 +586,11 @@ lab "l" {
     }
 
     fn inputs<'a>(lab: &'a Lab, observed: &'a Observed) -> ForwardInputs<'a> {
-        ForwardInputs { lab, observed }
+        ForwardInputs {
+            lab,
+            observed,
+            isolated: false,
+        }
     }
 
     /// One plan, both sources — the whole point of collapsing the two
@@ -796,6 +845,7 @@ lab "l" {
         InstalledForward {
             key: rule.key(),
             id: 1,
+            bind: rule.bind,
             host_port,
             auto: rule.host.is_auto(),
             declared: rule.declared_port(),
@@ -901,7 +951,7 @@ lab "l" {
         let p = plan(&inputs(&lab, &leased(&[("a", 10), ("b", 11)])), &[]);
         let rules: Vec<&ForwardRule> = p.rules.iter().collect();
         let mut ports = FamilyPorts::default();
-        let mut free = |_: u16, _: Proto| true;
+        let mut free = |_: Ipv4Addr, _: u16, _: Proto| true;
         let mut fam = FamilyBind {
             ports: &mut ports,
             worktree: Some("feat-x".into()),
@@ -923,7 +973,7 @@ lab "l" {
         let p = plan(&inputs(&lab, &leased(&[("a", 10), ("b", 11)])), &[]);
         let rules: Vec<&ForwardRule> = p.rules.iter().collect();
         let mut ports = FamilyPorts::default();
-        let mut held = |_: u16, _: Proto| false;
+        let mut held = |_: Ipv4Addr, _: u16, _: Proto| false;
         let mut fam = FamilyBind {
             ports: &mut ports,
             worktree: None,
@@ -941,7 +991,7 @@ lab "l" {
         let p = plan(&inputs(&lab, &leased(&[("a", 10), ("b", 11)])), &[]);
         let rules: Vec<&ForwardRule> = p.rules.iter().collect();
         let mut ports = FamilyPorts::default();
-        let mut free = |_: u16, _: Proto| true;
+        let mut free = |_: Ipv4Addr, _: u16, _: Proto| true;
         let mut fam = FamilyBind {
             ports: &mut ports,
             worktree: Some("feat-x".into()),
@@ -983,5 +1033,159 @@ lab "l" {
         assert_eq!(installed(&p.rules[0], 8081).shifted_from(), Some(8080));
         assert_eq!(installed(&p.rules[0], 8080).shifted_from(), None);
         assert_eq!(installed(&p.rules[1], 40000).shifted_from(), None);
+    }
+
+    /// A lab declaring `bind` on one forward of each source, beside one
+    /// that leaves it out.
+    fn bind_lab() -> Lab {
+        lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { bind = "127.0.0.1" host_port = 8443 to = "web:443" }
+    forward { host_port = 8080 to = "web:80" }
+  }
+  vm "web" { template = "x86_64/t" nic { segment = "lan" } }
+  container "c" { image = "nginx" nic { segment = "lan" }
+    port { bind = "192.168.1.5" container = 80 }
+  }
+}"#,
+        )
+    }
+
+    /// Each rule carries the address it binds: what it declares, else every
+    /// interface (§9.8).
+    #[test]
+    fn a_rule_binds_its_declared_address_else_every_interface() {
+        let lab = bind_lab();
+        let obs = leased(&[("web", 10), ("c", 11)]);
+        let p = plan(&inputs(&lab, &obs), &[]);
+        let binds: Vec<Ipv4Addr> = p.rules.iter().map(|r| r.bind).collect();
+        assert_eq!(
+            binds,
+            vec![
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::new(192, 168, 1, 5)
+            ]
+        );
+    }
+
+    /// Under worktree isolation every rule binds loopback, whatever it
+    /// declares (§21.4).
+    #[test]
+    fn isolation_binds_every_rule_on_loopback() {
+        let lab = bind_lab();
+        let obs = leased(&[("web", 10), ("c", 11)]);
+        let p = plan(
+            &ForwardInputs {
+                lab: &lab,
+                observed: &obs,
+                isolated: true,
+            },
+            &[],
+        );
+        assert_eq!(p.rules.len(), 3, "{p:#?}");
+        assert!(
+            p.rules.iter().all(|r| r.bind == Ipv4Addr::LOCALHOST),
+            "{p:#?}"
+        );
+        assert_eq!(
+            bind_address(Some(Ipv4Addr::new(10, 1, 1, 1)), true),
+            Ipv4Addr::LOCALHOST
+        );
+        assert_eq!(bind_address(None, false), Ipv4Addr::UNSPECIFIED);
+    }
+
+    /// Plan a lab whose two forwards share host port 8080, each binding
+    /// `a` and `b` (`None` = left out).
+    fn contest(a: Option<&str>, b: Option<&str>, isolated: bool) -> ForwardPlan {
+        let bind = |v: Option<&str>| v.map_or(String::new(), |v| format!("bind = \"{v}\" "));
+        let lab = lab_of(&format!(
+            r#"import <vmlab.wcl>
+lab "l" {{
+  segment "lan" {{ subnet = "10.0.0.0/24" nat = true
+    forward {{ {}host_port = 8080 to = "a:80" }}
+  }}
+  vm "a" {{ template = "x86_64/t" nic {{ segment = "lan" }} }}
+  container "b" {{ image = "nginx" nic {{ segment = "lan" }}
+    port {{ {}host = 8080 container = 80 }}
+  }}
+}}"#,
+            bind(a),
+            bind(b)
+        ));
+        let obs = leased(&[("a", 10), ("b", 11)]);
+        plan(
+            &ForwardInputs {
+                lab: &lab,
+                observed: &obs,
+                isolated,
+            },
+            &[],
+        )
+    }
+
+    /// One port on two different explicit addresses is two listeners, not a
+    /// contest; one address twice, or either on every interface, is.
+    #[test]
+    fn a_host_port_conflicts_only_on_overlapping_addresses() {
+        let p = contest(Some("127.0.0.1"), Some("127.0.0.2"), false);
+        assert!(p.conflicts.is_empty(), "{p:#?}");
+        assert_eq!(p.rules.len(), 2);
+
+        for (a, b) in [
+            (Some("127.0.0.1"), Some("127.0.0.1")),
+            (Some("127.0.0.1"), None),
+            (None, Some("127.0.0.2")),
+            (Some("0.0.0.0"), Some("127.0.0.2")),
+        ] {
+            let p = contest(a, b, false);
+            assert_eq!(p.conflicts.len(), 1, "{a:?} vs {b:?}: {p:#?}");
+            assert_eq!(p.rules.len(), 1, "{a:?} vs {b:?}: {p:#?}");
+            assert_eq!(p.rules[0].machine, "a", "the first claimant keeps it");
+        }
+    }
+
+    /// Isolation folds every address onto loopback, so two that were apart
+    /// collide.
+    #[test]
+    fn isolation_makes_distinct_addresses_contest() {
+        let p = contest(Some("127.0.0.1"), Some("127.0.0.2"), true);
+        assert_eq!(p.conflicts.len(), 1, "{p:#?}");
+        assert_eq!(p.conflicts[0].bind, Ipv4Addr::LOCALHOST);
+    }
+
+    /// A frozen family asks the host about the address each rule binds.
+    #[test]
+    fn a_family_tests_the_address_the_rule_binds() {
+        let lab = bind_lab();
+        let obs = leased(&[("web", 10), ("c", 11)]);
+        let p = plan(
+            &ForwardInputs {
+                lab: &lab,
+                observed: &obs,
+                isolated: true,
+            },
+            &["web".into()],
+        );
+        let rules: Vec<&ForwardRule> = p.rules.iter().collect();
+        let mut asked = Vec::new();
+        let mut free = |addr: Ipv4Addr, port: u16, _: Proto| {
+            asked.push((addr, port));
+            true
+        };
+        let mut ports = FamilyPorts::default();
+        let mut fam = FamilyBind {
+            ports: &mut ports,
+            worktree: Some("feat-x".into()),
+            slot: 1,
+            is_free: &mut free,
+        };
+        bind_candidates(&[], &rules, Some(&mut fam));
+        assert_eq!(
+            asked,
+            vec![(Ipv4Addr::LOCALHOST, 8444), (Ipv4Addr::LOCALHOST, 8081)]
+        );
     }
 }

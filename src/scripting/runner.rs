@@ -400,6 +400,7 @@ impl SegmentHandle {
                     "forward.installed",
                     serde_json::json!({
                         "what": format!("\"{vm}\": script forward"),
+                        "bind": bind.to_string(),
                         "host_port": port,
                         "auto": false,
                         "declared_port": host_port,
