@@ -176,17 +176,17 @@ async fn a_hypervisor_that_exits_during_startup_is_reported() {
     assert!(err.contains("/dev/kvm: permission denied"), "{err}");
 }
 
-/// A VM the delivered phases cannot run — linux-modern boots OVMF, phase
-/// 2c — is refused before anything spawns.
+/// A VM the delivered phases cannot run — the i440fx legacy PC, phase 4 —
+/// is refused before anything spawns.
 #[tokio::test]
-async fn an_ovmf_vm_is_refused_before_anything_spawns() {
+async fn a_legacy_pc_vm_is_refused_before_anything_spawns() {
     let dir = tempfile::tempdir().unwrap();
     let run = dir.path();
     let bin = fake_binary(run, &format!("touch {}/spawned", run.display()));
     let launch = Launch::Vm {
         lab: "lab1".into(),
         resolved: Box::new(crate::qemu::resolve::testing::resolved_vm(
-            "linux-modern",
+            "windows-legacy",
             "x86_64",
         )),
         paths: Box::default(),
@@ -198,7 +198,7 @@ async fn an_ovmf_vm_is_refused_before_anything_spawns() {
         .await
         .err()
         .expect("refused");
-    assert!(err.to_string().contains("phase 2c"), "{err}");
+    assert!(err.to_string().contains("q35"), "{err}");
     assert!(!run.join("spawned").exists());
     assert!(!run.join("machine.json").exists());
 }
@@ -212,22 +212,6 @@ fn a_vm_has_no_virtiofsd_to_serve_shares() {
         VmlabHv::new(None).virtiofsd().is_some(),
         crate::qemu::virtiofsd::found().is_some()
     );
-}
-
-#[tokio::test]
-async fn there_is_no_tpm_to_start() {
-    let dir = tempfile::tempdir().unwrap();
-    let err = VmlabHv::new(None)
-        .start_tpm(
-            "web",
-            dir.path(),
-            &dir.path().join("swtpm.sock"),
-            &dir.path().join("l"),
-        )
-        .await
-        .err()
-        .expect("refused");
-    assert!(err.to_string().contains("no TPM"), "{err}");
 }
 
 /// The orphan sweep finds a vmlab-hv by the lab's runtime directory in its
