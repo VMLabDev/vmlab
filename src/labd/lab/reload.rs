@@ -135,6 +135,14 @@ impl LabRuntime {
             *self.config.write().expect("config lock") = new.clone();
         }
 
+        for (name, action) in &plan.machines {
+            match action {
+                Action::Rebuild => self.rebind_workspace(name).await,
+                Action::Drop => self.workspaces.stop(name).await,
+                _ => {}
+            }
+        }
+
         // Forwards and container ports, live, for every running machine
         // whose forwards changed (§7.1). One that is not running installs
         // its forwards when it boots.
@@ -253,6 +261,7 @@ impl LabRuntime {
         let config = self.config();
         let Some(cfg) = config.lab.machine(name) else {
             self.drop_machine(name);
+            self.workspaces.stop(name).await;
             bail!(
                 "\"{name}\" is no longer declared in vmlab.wcl, and has been dropped from the lab"
             );
@@ -268,10 +277,33 @@ impl LabRuntime {
             .write()
             .expect("machine set lock")
             .insert(machine, config.clone());
+        self.rebind_workspace(name).await;
         tracing::info!("{name}: rebuilt from the new declaration before its boot");
         self.events
             .emit("machine.rebuilt", json!({"vm": name, "machine": name}));
         Ok(())
+    }
+
+    /// A workspace syncer outlives its machine's stop, holding the instance
+    /// it was started on; once a rebuild has replaced that instance it is
+    /// handed the new one — or stopped, when the new declaration carries no
+    /// workspace (§19.6). One that was not running stays so: `up` starts it.
+    async fn rebind_workspace(&self, name: &str) {
+        if !self.workspaces.reports().await.contains_key(name) {
+            return;
+        }
+        match (self.workspace_of(name), self.machine(name)) {
+            (Some(workspace), Ok(machine)) => {
+                self.workspaces
+                    .start(
+                        workspace,
+                        Arc::new(super::WorkspaceSessions { machine }),
+                        self.events.clone(),
+                    )
+                    .await;
+            }
+            _ => self.workspaces.stop(name).await,
+        }
     }
 
     /// Whether `name` is held on a different declaration than the lab's.
@@ -332,6 +364,7 @@ impl LabRuntime {
                 (None, false, _) => {
                     if let Ok(_gate) = self.rebuild_gate.try_write() {
                         self.drop_machine(name);
+                        self.workspaces.stop(name).await;
                         continue;
                     }
                     PendingReason::Removed
