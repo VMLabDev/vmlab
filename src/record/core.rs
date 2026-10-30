@@ -13,7 +13,9 @@
 //!
 //! With idle compression on (D4, D16) an interval is *idle* when the
 //! rectangles it received changed no more than [`IDLE_AREA`] pixels and no
-//! input was sent; a run of idle intervals longer than the threshold is cut
+//! input was sent — pixels whose value actually changed, not the area the
+//! rectangles cover, since a display may repaint far more than it changes
+//! (vmlab-hv's native protocol reports a whole-screen flush for a caret); a run of idle intervals longer than the threshold is cut
 //! to [`IDLE_KEEP`] of output. Because idle frames repeat one picture, the
 //! core holds back nothing but a duration while a run is open and emits the
 //! kept frames when it closes, so a caret or a clock never defeats the cut
@@ -27,10 +29,8 @@ use serde::{Deserialize, Serialize};
 use super::input::InputEvent;
 use super::{IDLE_KEEP, Settings, Size};
 
-/// The largest area, in source pixels, an interval's rectangles may cover and
-/// still count as idle: a blinking caret, a clock with seconds in a taskbar
-/// (QEMU reports dirt in 16-pixel cells, so even a one-pixel change arrives
-/// as at least a 16-wide strip).
+/// The most source pixels an interval's rectangles may change and still count
+/// as idle: a blinking caret, a clock with seconds in a taskbar.
 pub const IDLE_AREA: u64 = 64 * 64;
 
 /// How long a click ripple stays on screen.
@@ -237,14 +237,15 @@ impl Core {
     }
 
     /// A Raw rectangle of `B G R x` pixels painted at `(x, y)`. Pixels
-    /// outside the current size are dropped rather than failing.
+    /// outside the current size are dropped rather than failing. Only the
+    /// pixels whose value it changes count towards the interval's activity.
     pub fn rect(&mut self, at: Duration, x: u16, y: u16, w: u16, h: u16, bgrx: &[u8]) {
         self.advance(at);
         let Some(fb) = self.fb.as_mut() else {
             return;
         };
         let (fw, fh) = (fb.width(), fb.height());
-        let mut painted = 0u64;
+        let mut changed = 0u64;
         for row in 0..u32::from(h) {
             let py = u32::from(y) + row;
             if py >= fh {
@@ -259,13 +260,16 @@ impl Core {
                 if i + 3 >= bgrx.len() {
                     break;
                 }
-                fb.put_pixel(px, py, image::Rgb([bgrx[i + 2], bgrx[i + 1], bgrx[i]]));
-                painted += 1;
+                let rgb = image::Rgb([bgrx[i + 2], bgrx[i + 1], bgrx[i]]);
+                if *fb.get_pixel(px, py) != rgb {
+                    fb.put_pixel(px, py, rgb);
+                    changed += 1;
+                }
             }
         }
-        if painted > 0 {
+        if changed > 0 {
             self.fb_dirty = true;
-            self.dirty_area += painted;
+            self.dirty_area += changed;
         }
     }
 
