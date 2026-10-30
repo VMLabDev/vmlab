@@ -1310,6 +1310,41 @@ impl FileOps {
         Ok((sha256, len))
     }
 
+    /// Write `bytes` to a guest file, created (or truncated) with `mode`, and
+    /// verify it against the guest's digest. For content that exists only in
+    /// memory and must not pass through a host file — a playbook's variables
+    /// file, whose secrets would otherwise sit on the host disk too.
+    pub async fn push_bytes(&self, bytes: &[u8], remote: &str, mode: Option<u32>) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let handle = self
+            .open_for_push(remote, mode)
+            .await
+            .with_context(|| format!("push {remote}"))?;
+        let mut written = Ok(());
+        for (i, chunk) in bytes.chunks(TRANSFER_CHUNK).enumerate() {
+            let offset = (i * TRANSFER_CHUNK) as u64;
+            written = self
+                .inner
+                .expect_ok(Op::Write { handle, offset }, chunk)
+                .await
+                .with_context(|| format!("writing at offset {offset}"));
+            if written.is_err() {
+                break;
+            }
+        }
+        let closed = self.inner.expect_ok(Op::Close { handle }, &[]).await;
+        written.with_context(|| format!("push {remote}"))?;
+        closed.with_context(|| format!("push {remote}"))?;
+        let (sha256, _) = self
+            .digest_of_len(remote, bytes.len() as u64)
+            .await
+            .with_context(|| format!("push {remote}"))?;
+        if sha256 != hex::encode(Sha256::digest(bytes)) {
+            bail!("push {remote}: digest mismatch after transfer");
+        }
+        Ok(())
+    }
+
     async fn open_for_push(&self, remote: &str, mode: Option<u32>) -> Result<u64, FileOpsError> {
         self.inner
             .open_handle(Op::Open {
@@ -1669,6 +1704,24 @@ impl FileOps {
                 Err(e.context(format!("creating guest directory {path}")))
             }
         }
+    }
+
+    /// Create one directory that only its owner can enter (`0700` on Linux;
+    /// a Windows guest ignores the mode and needs its ACL set separately).
+    /// One that already exists is an error rather than success: its mode is
+    /// whatever it was made with, so it is not known to be private.
+    pub async fn mkdir_private(&self, path: &str) -> Result<()> {
+        self.inner
+            .expect_ok(
+                Op::Mkdir {
+                    path: path.to_string(),
+                    mode: Some(0o700),
+                    case_sensitive: false,
+                },
+                &[],
+            )
+            .await
+            .with_context(|| format!("creating private guest directory {path}"))
     }
 
     /// Create `dir` and every missing parent, ignoring the ones already

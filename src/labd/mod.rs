@@ -29,6 +29,7 @@ pub mod network;
 pub mod one_shot;
 pub mod plan;
 pub mod playbook;
+pub mod playbook_vars;
 pub mod provisioning;
 pub mod pull_ledger;
 pub mod record;
@@ -1094,9 +1095,7 @@ impl Handler<LabRequest> for LabdHandler {
                                     "path": p.path.display().to_string(),
                                     "play": p.play,
                                     "span": p.span,
-                                    "vars": p.vars.iter()
-                                        .map(|v| json!({"name": v.name, "value": v.value}))
-                                        .collect::<Vec<_>>(),
+                                    "vars": playbook_vars::listed(&p.vars),
                                     "running": lab.playbook_ops.op_of(machine),
                                     "timed_out": timed_out,
                                 })

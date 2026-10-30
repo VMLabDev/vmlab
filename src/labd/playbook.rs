@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::config::model::{Lab, Playbook};
 use crate::labd::lab::LabRuntime;
+use crate::labd::playbook_vars::{Redactor, var_file_source, windows_private_dir_argv};
 use crate::labd::state::TimedOutRun;
 use crate::labd::vm_agent::{AgentHandle, SessionEvent};
 use crate::proto::CommandError;
@@ -192,6 +193,19 @@ fn guest_binary_path(dir: &str, os: GuestOs) -> String {
         GuestOs::Linux => guest_join(dir, "config-weave"),
         GuestOs::Windows => guest_join(dir, "config-weave.exe"),
     }
+}
+
+/// The private directory a run's variables file is written into, under the
+/// guest directory: made fresh (`0700`, or SYSTEM and Administrators only on
+/// Windows) for each run that has variables, and removed after it.
+fn guest_vars_dir(dir: &str) -> String {
+    guest_join(dir, "vars")
+}
+
+/// The variables file inside [`guest_vars_dir`], handed to config-weave as
+/// `--var-file`.
+fn guest_vars_file(dir: &str) -> String {
+    guest_join(&guest_vars_dir(dir), "vars.wcl")
 }
 
 /// Where one playbook folder lives under the guest directory.
@@ -496,7 +510,17 @@ pub async fn run_playbook(
     };
     emit("playbook.op.start", json!({"mode": mode.verb()}));
 
-    let result = run_inner(lab, machine, pb, mode, output, op_id).await;
+    // The one place a secret variable could leave the run is past here: the
+    // lines, step events and report `run_inner` emits go through `redact`
+    // there, and its outcome and error through it here.
+    let redact = Redactor::for_vars(&pb.vars);
+    let result = run_inner(lab, machine, pb, mode, output, op_id, &redact)
+        .await
+        .map(|outcome| PlaybookOutcome {
+            report: outcome.report.map(|r| redact.scrub_json(r)),
+            ..outcome
+        })
+        .map_err(|e| redact.scrub_error(e));
     match &result {
         Ok(outcome) => {
             emit(
@@ -543,6 +567,7 @@ async fn run_inner(
     mode: PlaybookMode,
     output: &OutputSink,
     op_id: u64,
+    redact: &Redactor,
 ) -> Result<PlaybookOutcome> {
     let pb_path = pb.path.display().to_string();
     let m = lab.machine(machine)?;
@@ -554,10 +579,11 @@ async fn run_inner(
         "machine": machine, "playbook": pb_path, "play": pb.play, "op_id": op_id,
     });
     let log_line = |line: &str| {
+        let line = redact.scrub(line);
         output(format!("{line}\n"));
-        lab.playbook_ops.append_log(machine, line);
+        lab.playbook_ops.append_log(machine, &line);
         let mut payload = base.clone();
-        payload["line"] = Value::String(line.to_string());
+        payload["line"] = Value::String(line);
         lab.events.emit("playbook.op.log", payload);
     };
     // Explicit run phase ("running" ↔ "rebooting") so UIs can show a reboot
@@ -646,126 +672,204 @@ async fn run_inner(
         pb.path.display()
     ));
 
-    // Run, rebooting and re-running while apply says "reboot required".
-    let argv = run_argv(&guest_bin, &guest_dir, pb, mode);
-    if !pb.vars.is_empty() {
+    // Variables travel in a file, never on the command line, where the
+    // guest's process list and every error quoting the command would show
+    // them. The line names them only; their values stay out of the log.
+    let vars_file = if pb.vars.is_empty() {
+        None
+    } else {
+        let file = stage_var_file(&agent, os, &base_dir, pb).await?;
         log_line(&format!(
             "variables: {}",
             pb.vars
                 .iter()
-                .map(|v| format!("{}={}", v.name, v.value))
+                .map(|v| v.name.as_str())
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
-    }
-    let mut reboots = 0u32;
-    loop {
-        let agent = m.wait_agent(Duration::from_secs(300)).await?;
-        let on_line = |line: String| match serde_json::from_str::<Value>(&line) {
-            Ok(cw) => {
-                if let Some(human) = render_cw_event(&cw) {
-                    output(format!("{human}\n"));
-                    lab.playbook_ops.append_log(machine, &human);
-                }
-                let mut payload = base.clone();
-                payload["cw"] = cw;
-                lab.events.emit("playbook.op.step", payload);
-            }
-            Err(_) => log_line(&line),
-        };
-        // Each run gets its own process tree, so a timed-out run is
-        // recognisable after the fact and a run that finished never is.
-        let tree = agent
-            .has_feature(vmlab_agent_proto::features::TREE)
-            .then(|| format!("pb-{}-{op_id}", chrono::Utc::now().timestamp_millis()));
-        let (exit_code, stdout) =
-            match exec_streaming(&agent, argv.clone(), tree.as_deref(), pb.timeout, on_line).await?
-            {
-                Streamed::Exited { code, stdout } => (code, stdout),
-                Streamed::TimedOut => {
-                    return Err(timed_out(lab, machine, pb, &argv, tree).await);
-                }
-            };
-        let report = parse_report(&stdout);
+        Some(file)
+    };
 
-        if exit_code == 3 && mode == PlaybookMode::Apply {
-            {
-                if !m.can_reboot() {
-                    bail!(
-                        "playbook {} play {} on {machine}: reboot required, but this \
-                         machine cannot reboot in place (a container micro-VM restarts \
-                         from a fresh rootfs)",
-                        pb.path.display(),
-                        pb.play
-                    );
+    // Run, rebooting and re-running while apply says "reboot required".
+    let argv = run_argv(&guest_bin, &guest_dir, &pb.play, vars_file.as_deref(), mode);
+    let rounds: Result<PlaybookOutcome> = async {
+        let mut reboots = 0u32;
+        loop {
+            let agent = m.wait_agent(Duration::from_secs(300)).await?;
+            let on_line = |line: String| match serde_json::from_str::<Value>(&line) {
+                Ok(cw) => {
+                    let cw = redact.scrub_json(cw);
+                    if let Some(human) = render_cw_event(&cw) {
+                        output(format!("{human}\n"));
+                        lab.playbook_ops.append_log(machine, &human);
+                    }
+                    let mut payload = base.clone();
+                    payload["cw"] = cw;
+                    lab.events.emit("playbook.op.step", payload);
                 }
+                Err(_) => log_line(&line),
+            };
+            // Each run gets its own process tree, so a timed-out run is
+            // recognisable after the fact and a run that finished never is.
+            let tree = agent
+                .has_feature(vmlab_agent_proto::features::TREE)
+                .then(|| format!("pb-{}-{op_id}", chrono::Utc::now().timestamp_millis()));
+            let (exit_code, stdout) =
+                match exec_streaming(&agent, argv.clone(), tree.as_deref(), pb.timeout, on_line).await?
                 {
-                    if reboots >= MAX_REBOOTS {
-                        log_line(&format!(
-                            "still reboot-required after {MAX_REBOOTS} reboots — giving up"
-                        ));
-                        return Ok(PlaybookOutcome {
-                            exit_code,
-                            reboots,
-                            report,
-                        });
+                    Streamed::Exited { code, stdout } => (code, stdout),
+                    Streamed::TimedOut => {
+                        return Err(timed_out(lab, machine, pb, &argv, tree).await);
                     }
-                    reboots += 1;
-                    log_line(&format!(
-                        "reboot required — restarting {machine} (attempt {reboots}/{MAX_REBOOTS})"
-                    ));
-                    set_phase("rebooting", reboots);
-                    m.reboot_guest().await?;
-                    // Wait for the agent to actually drop before waiting for
-                    // it to come back; some guests keep answering briefly.
-                    let grace = tokio::time::Instant::now() + Duration::from_secs(120);
-                    while m.agent_answering().await && tokio::time::Instant::now() < grace {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                };
+            let report = parse_report(&stdout);
+
+            if exit_code == 3 && mode == PlaybookMode::Apply {
+                {
+                    if !m.can_reboot() {
+                        bail!(
+                            "playbook {} play {} on {machine}: reboot required, but this \
+                             machine cannot reboot in place (a container micro-VM restarts \
+                             from a fresh rootfs)",
+                            pb.path.display(),
+                            pb.play
+                        );
                     }
-                    // Narrated come-back wait: a DC's first post-promotion
-                    // boot can be quiet for many minutes, which reads as a
-                    // hang without periodic output.
-                    let started = tokio::time::Instant::now();
-                    let deadline = started + Duration::from_secs(600);
-                    let mut next_note = started + Duration::from_secs(30);
-                    loop {
-                        if m.agent_answering().await {
-                            break;
-                        }
-                        if m.state().await == crate::labd::vm::PowerState::Stopped {
-                            bail!("{machine} stopped while rebooting for the playbook");
-                        }
-                        let now = tokio::time::Instant::now();
-                        if now >= deadline {
-                            bail!("{machine}: guest did not come back within 600s of the reboot");
-                        }
-                        if now >= next_note {
+                    {
+                        if reboots >= MAX_REBOOTS {
                             log_line(&format!(
-                                "waiting for {machine} to come back ({}s)… — Windows can \
-                                 take a while here",
-                                started.elapsed().as_secs()
+                                "still reboot-required after {MAX_REBOOTS} reboots — giving up"
                             ));
-                            next_note = now + Duration::from_secs(30);
+                            return Ok(PlaybookOutcome {
+                                exit_code,
+                                reboots,
+                                report,
+                            });
                         }
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        reboots += 1;
+                        log_line(&format!(
+                            "reboot required — restarting {machine} (attempt {reboots}/{MAX_REBOOTS})"
+                        ));
+                        set_phase("rebooting", reboots);
+                        m.reboot_guest().await?;
+                        // Wait for the agent to actually drop before waiting for
+                        // it to come back; some guests keep answering briefly.
+                        let grace = tokio::time::Instant::now() + Duration::from_secs(120);
+                        while m.agent_answering().await && tokio::time::Instant::now() < grace {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        // Narrated come-back wait: a DC's first post-promotion
+                        // boot can be quiet for many minutes, which reads as a
+                        // hang without periodic output.
+                        let started = tokio::time::Instant::now();
+                        let deadline = started + Duration::from_secs(600);
+                        let mut next_note = started + Duration::from_secs(30);
+                        loop {
+                            if m.agent_answering().await {
+                                break;
+                            }
+                            if m.state().await == crate::labd::vm::PowerState::Stopped {
+                                bail!("{machine} stopped while rebooting for the playbook");
+                            }
+                            let now = tokio::time::Instant::now();
+                            if now >= deadline {
+                                bail!("{machine}: guest did not come back within 600s of the reboot");
+                            }
+                            if now >= next_note {
+                                log_line(&format!(
+                                    "waiting for {machine} to come back ({}s)… — Windows can \
+                                     take a while here",
+                                    started.elapsed().as_secs()
+                                ));
+                                next_note = now + Duration::from_secs(30);
+                            }
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        log_line(&format!(
+                            "{machine} is back after {}s — re-running {}",
+                            started.elapsed().as_secs(),
+                            mode.verb()
+                        ));
+                        set_phase("running", reboots);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
                     }
-                    log_line(&format!(
-                        "{machine} is back after {}s — re-running {}",
-                        started.elapsed().as_secs(),
-                        mode.verb()
-                    ));
-                    set_phase("running", reboots);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
                 }
             }
+            return Ok(PlaybookOutcome {
+                exit_code,
+                reboots,
+                report,
+            });
         }
-        return Ok(PlaybookOutcome {
-            exit_code,
-            reboots,
-            report,
-        });
     }
+    .await;
+
+    // Whatever became of the run — a timed-out config-weave read its file at
+    // start and needs it no longer — the variables do not stay in the guest.
+    if vars_file.is_some() {
+        let dir = guest_vars_dir(&base_dir);
+        let removed = async {
+            let ops = m
+                .wait_agent(Duration::from_secs(60))
+                .await?
+                .open_fileops(None)
+                .await?;
+            ops.remove(&guest_vars_file(&base_dir)).await?;
+            ops.rmdir(&dir).await
+        }
+        .await;
+        if let Err(e) = removed {
+            log_line(&format!(
+                "could not remove the variables directory {dir} from {machine}: {e:#}; \
+                 the next playbook run there replaces it"
+            ));
+        }
+    }
+    rounds
+}
+
+/// Write the run's `--var-file` into a fresh private directory under the
+/// guest directory, returning its guest path. Anything left there by a run
+/// that never cleaned up — a daemon killed mid-run — is replaced, not reused.
+async fn stage_var_file(
+    agent: &AgentHandle,
+    os: GuestOs,
+    base_dir: &str,
+    pb: &Playbook,
+) -> Result<String> {
+    let dir = guest_vars_dir(base_dir);
+    let file = guest_vars_file(base_dir);
+    let ops = agent.open_fileops(None).await?;
+    ops.remove(&file).await?;
+    ops.rmdir(&dir)
+        .await
+        .with_context(|| format!("clearing the variables directory {dir}"))?;
+    ops.mkdir_private(&dir).await?;
+    if os == GuestOs::Windows {
+        let out = agent
+            .exec(
+                windows_private_dir_argv(&dir),
+                Vec::new(),
+                None,
+                None,
+                Duration::from_secs(60),
+                None,
+            )
+            .await?;
+        if out.exit_code != 0 {
+            let _ = ops.rmdir(&dir).await;
+            bail!(
+                "making the variables directory {dir} private (icacls exited {}): {}",
+                out.exit_code,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    ops.push_bytes(var_file_source(&pb.vars).as_bytes(), &file, Some(0o600))
+        .await
+        .with_context(|| format!("writing the variables file {file}"))?;
+    Ok(file)
 }
 
 /// `<bin> version` in the guest — the probe every config-weave binary has to
@@ -840,22 +944,27 @@ async fn push_binary(
     Ok(guest_bin)
 }
 
-/// The guest command line for one run. Each declared variable becomes a
-/// `--var name=value` in declaration order; the value is passed through
-/// verbatim (no shell is involved), so config-weave applies its usual rule —
-/// parse it as a WCL expression where it can, string otherwise.
-fn run_argv(guest_bin: &str, guest_dir: &str, pb: &Playbook, mode: PlaybookMode) -> Vec<String> {
+/// The guest command line for one run. The block's variables, if it has
+/// any, are in the file at `vars_file` ([`stage_var_file`]) — never on the
+/// command line, which the guest's process list shows and errors quote.
+fn run_argv(
+    guest_bin: &str,
+    guest_dir: &str,
+    play: &str,
+    vars_file: Option<&str>,
+    mode: PlaybookMode,
+) -> Vec<String> {
     let mut argv = vec![
         guest_bin.to_string(),
         mode.verb().to_string(),
         guest_dir.to_string(),
-        pb.play.clone(),
+        play.to_string(),
         "--json".to_string(),
         "--events-ndjson".to_string(),
     ];
-    for var in &pb.vars {
-        argv.push("--var".to_string());
-        argv.push(format!("{}={}", var.name, var.value));
+    if let Some(file) = vars_file {
+        argv.push("--var-file".to_string());
+        argv.push(file.to_string());
     }
     argv
 }
@@ -1313,10 +1422,10 @@ lab "l" { vm "web01" { template = "x86_64/t" } }"#);
         assert!(err.contains("declares no matching playbook"), "{err}");
     }
 
-    /// Variables become repeated `--var name=value` in declaration order,
-    /// after the flags — passed verbatim, since there is no shell in between.
+    /// Variables reach config-weave as one `--var-file` after the flags, so
+    /// no value — a secret least of all — is on the guest command line.
     #[test]
-    fn argv_carries_vars_in_declaration_order() {
+    fn argv_carries_vars_in_a_file_not_on_the_command_line() {
         let lab = lab(r#"import <vmlab.wcl>
 lab "l" {
   vm "srv01" {
@@ -1324,16 +1433,18 @@ lab "l" {
     playbook "pb/ad" {
       play = "member-server"
       var "domain"   { value = "corp.example.com" }
-      var "new_name" { value = "SRV01" }
-      var "retries"  { value = "3" }
+      var "join_pw"  { value = "S3cr3t-pw" secret = true }
     }
   }
 }"#);
         let pb = resolve_playbook(&lab, "srv01", None, None).unwrap();
+        assert!(pb.vars[1].secret && !pb.vars[0].secret);
+        let base = "/var/lib/vmlab/weave";
         let argv = run_argv(
             "/var/lib/vmlab/weave/config-weave",
             "/var/lib/vmlab/weave/playbooks/pb__ad",
-            pb,
+            &pb.play,
+            Some(&guest_vars_file(base)),
             PlaybookMode::Apply,
         );
         assert_eq!(
@@ -1345,14 +1456,16 @@ lab "l" {
                 "member-server",
                 "--json",
                 "--events-ndjson",
-                "--var",
-                "domain=corp.example.com",
-                "--var",
-                "new_name=SRV01",
-                "--var",
-                "retries=3",
+                "--var-file",
+                "/var/lib/vmlab/weave/vars/vars.wcl",
             ]
         );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains("S3cr3t") || a.contains("corp"))
+        );
+        assert_eq!(guest_vars_dir("C:/weave/"), "C:/weave/vars");
     }
 
     /// The block's `guest_dir` and `guest_bin` reach the model; leaving them
@@ -1381,7 +1494,7 @@ lab "l" {
   vm "srv01" { template = "x86_64/t" playbook "pb/ad" { play = "base" } }
 }"#);
         let pb = resolve_playbook(&lab, "srv01", None, None).unwrap();
-        let argv = run_argv("cw", "/d", pb, PlaybookMode::Check);
+        let argv = run_argv("cw", "/d", &pb.play, None, PlaybookMode::Check);
         assert_eq!(
             argv,
             vec!["cw", "check", "/d", "base", "--json", "--events-ndjson"]

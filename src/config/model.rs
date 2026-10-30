@@ -926,8 +926,7 @@ pub struct Playbook {
     /// Ceiling on each config-weave invocation; every run after a reboot gets
     /// the full value again.
     pub timeout: std::time::Duration,
-    /// `--var name=value` overrides for this machine's run, in declaration
-    /// order.
+    /// Variable overrides for this machine's run, in declaration order.
     pub vars: Vec<PlaybookVar>,
     /// Guest directory the config-weave binary and the playbook folders land
     /// in. `None` = the profile's `playbook_dir`, else the family default
@@ -957,13 +956,16 @@ pub fn is_windows_absolute(path: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
 }
 
-/// One variable override passed to config-weave as `--var name=value`.
+/// One variable override handed to config-weave in the run's `--var-file`.
 #[derive(Debug, Clone)]
 pub struct PlaybookVar {
     pub name: String,
     /// Passed through verbatim; config-weave parses it as a WCL expression
     /// where it can and falls back to a string.
     pub value: String,
+    /// The value is a secret: everything the run emits carries `***` in its
+    /// place ([`crate::labd::playbook_vars::Redactor`]).
+    pub secret: bool,
     pub span: Span,
 }
 

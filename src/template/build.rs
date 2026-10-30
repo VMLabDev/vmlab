@@ -18,6 +18,7 @@ use super::store::{ResolvedTemplate, TemplateStore};
 use crate::config::model::{
     ArtefactSource, Firmware, TemplateDef, TemplateRef, TemplateSource, TemplateVariantDef,
 };
+use crate::config::wcl_str;
 use crate::labd::machine::Machine;
 use crate::qemu::resolve::KeyStore;
 use crate::scripting::OutputSink;
@@ -1724,27 +1725,6 @@ fn source_origin(source: &TemplateSource) -> Option<String> {
     }
 }
 
-/// Quote a value for a WCL string literal. Every path, label and name below
-/// comes from a template definition (or a work-dir path), so a `"` or `\` in
-/// one would otherwise produce a file that fails to parse — a confusing error a
-/// long way from its cause.
-fn wcl_str(value: impl std::fmt::Display) -> String {
-    let raw = value.to_string();
-    let mut out = String::with_capacity(raw.len() + 2);
-    out.push('"');
-    for c in raw.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// What a rendered build lab boots with — the only thing that differs between
 /// the renders below, all of which describe the same machine.
 enum BuildBoot<'a> {
@@ -2074,9 +2054,10 @@ fn synth_spec_lab(
                 for v in &p.vars {
                     write!(
                         s,
-                        " var {} {{ value = {} }}",
+                        " var {} {{ value = {}{} }}",
                         wcl_str(&v.name),
-                        wcl_str(&v.value)
+                        wcl_str(&v.value),
+                        if v.secret { " secret = true" } else { "" }
                     )
                     .unwrap();
                 }
@@ -2319,6 +2300,28 @@ mod tests {
         assert_eq!(build.playbooks.len(), 1);
         assert_eq!(build.playbooks[0].vars[0].name, "tz");
         assert_eq!(build.playbooks[0].vars[0].value, "UTC");
+    }
+
+    /// A template playbook's secret variable stays one in the build VM's
+    /// block (#183), or the build's run would show its value.
+    #[test]
+    fn a_secret_variable_stays_secret_in_the_build_lab() {
+        let d = def(concat!(
+            "import <vmlab.wcl>\n",
+            "template \"t\" { arch = \"x86_64\" version = \"1\"\n",
+            "  source \"scratch\" { }\n",
+            "  playbook \"pb\" { play = \"b\"\n",
+            "    var \"tz\" { value = \"UTC\" }\n",
+            "    var \"pw\" { value = \"s3cr3t\" secret = true }\n",
+            "  }\n",
+            "}\n"
+        ));
+        let wcl = render(&d);
+        let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root"))
+            .unwrap_or_else(|e| panic!("synthetic build lab must parse: {e:?}\n{wcl}"));
+        let vars = &lf.lab.vms[0].playbooks[0].vars;
+        assert!(!vars[0].secret, "{wcl}");
+        assert!(vars[1].secret, "{wcl}");
     }
 
     /// A template playbook's `guest_dir` and `guest_bin` (#169) reach the
