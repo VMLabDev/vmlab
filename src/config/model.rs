@@ -121,6 +121,14 @@ impl<'a> MachineCfg<'a> {
             MachineCfg::Container(c) => c.dev.as_ref(),
         }
     }
+
+    /// The whole machine block, for a diagnostic about the machine itself.
+    pub fn span(&self) -> Span {
+        match self {
+            MachineCfg::Vm(v) => v.span,
+            MachineCfg::Container(c) => c.span,
+        }
+    }
 }
 
 /// A machine's `@dev` decorator, as written (§19.1). Every argument is
@@ -500,6 +508,11 @@ pub struct Vm {
     /// it). Exclusive with `secure_boot_keys`.
     pub secure_boot_vars: Option<PathBuf>,
     pub qemu_args: Vec<String>,
+    /// The hypervisor this VM runs on (§22); None = the host config's
+    /// default for VMs. Declared on the machine alone: which program runs
+    /// the hardware is not itself hardware, so it never resolves through
+    /// template or profile (ADR-0008).
+    pub hypervisor: Option<crate::config::hypervisor::HypervisorKind>,
     pub gpu: Option<Gpu>,
     pub nics: Vec<Nic>,
     pub extra_disks: Vec<DiskBlock>,
@@ -774,6 +787,9 @@ pub struct Container {
     pub cpus: Option<u32>,
     /// Micro-VM RAM in bytes; falls back to the profile.
     pub memory: Option<u64>,
+    /// The hypervisor this micro-VM runs on (§22); None = the host config's
+    /// default for containers.
+    pub hypervisor: Option<crate::config::hypervisor::HypervisorKind>,
     /// VM or container names — the namespaces are unified. Start order
     /// (§7.2).
     pub depends_on: Vec<String>,

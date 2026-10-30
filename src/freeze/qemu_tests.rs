@@ -98,6 +98,7 @@ fn record(online: bool) -> SnapshotRecord {
         image_digest: None,
         freeze_point: None,
         frozen_in: None,
+        hypervisor: Default::default(),
     }
 }
 
