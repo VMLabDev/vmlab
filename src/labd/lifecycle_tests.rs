@@ -283,8 +283,13 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
             template_vars: None,
         },
     );
+    let on_vmlab = script.vmlab_hv;
     let hv = FakeHypervisor::new(script);
-    vm.set_hypervisor(hv.clone());
+    if on_vmlab {
+        vm = vm.on_hypervisor(crate::config::hypervisor::HypervisorKind::Vmlab, hv.clone());
+    } else {
+        vm.set_hypervisor(hv.clone());
+    }
     (vm, hv)
 }
 
@@ -2587,6 +2592,48 @@ async fn a_guest_power_off_over_vmlab_hvs_events_is_classified_as_the_guests() {
     let (cbs, mut observed) = callbacks();
     start_vm(&vm2, cbs).await.expect("start");
     assert_eq!(observed.exit().await.reason, StopReason::Crashed);
+}
+
+/// vmlab-hv ends when the guest resets itself, where QEMU resets in place
+/// (PRD §22): the VM boots it again, and to the lab it is one run — no exit,
+/// no second `ready` — that a later stop still ends as asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guest_reset_on_vmlab_hv_boots_the_vm_again_as_one_run() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        LINUX_VM,
+        on_vmlab_hv(Script {
+            runs: vec![
+                Run::guest_resets(Duration::from_millis(600)),
+                Run::forever(),
+            ],
+            ..Script::healthy()
+        }),
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    for _ in 0..100 {
+        if hv.starts() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(hv.starts(), 2, "the reset started vmlab-hv again");
+    m.wait_ready(SETTLE).await.expect("ready again");
+    assert_eq!(vm.state().await, PowerState::Running);
+    assert_eq!(observed.ready_count(), 1, "one run, announced once");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), observed.exit())
+            .await
+            .is_err(),
+        "a reset is not an exit"
+    );
+
+    vm.stop(false).await.expect("stop");
+    assert_eq!(observed.exit().await.reason, StopReason::Requested);
 }
 
 /// The stop ladder's ACPI rung over vmlab-hv's `powerdown`: the guest acts

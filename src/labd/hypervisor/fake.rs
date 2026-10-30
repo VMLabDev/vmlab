@@ -52,6 +52,10 @@ pub struct Exit {
     /// The guest powered itself off rather than the emulator dying — what
     /// separates a clean shutdown from a crash in [`super::classify_exit`].
     pub guest_initiated: bool,
+    /// The guest reset itself rather than powering off — what ends vmlab-hv
+    /// where QEMU resets in place (PRD §22). Only a vmlab-hv script reports
+    /// it, as a `shutdown { reason: guest_reset }` event.
+    pub reset: bool,
 }
 
 /// One start attempt, as the fake plays it.
@@ -106,6 +110,7 @@ impl Run {
                 after,
                 status: status.to_string(),
                 guest_initiated: false,
+                reset: false,
             }),
             ..Self::default()
         }
@@ -118,6 +123,20 @@ impl Run {
                 after,
                 status: "exit status: 0".into(),
                 guest_initiated: true,
+                reset: false,
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Comes up, then the guest resets itself, which ends vmlab-hv.
+    pub fn guest_resets(after: Duration) -> Self {
+        Self {
+            exits: Some(Exit {
+                after,
+                status: "exit status: 0".into(),
+                guest_initiated: true,
+                reset: true,
             }),
             ..Self::default()
         }
@@ -224,6 +243,11 @@ impl FakeHypervisor {
             attempts: AtomicUsize::new(0),
             helpers: Mutex::new(Vec::new()),
         })
+    }
+
+    /// How many times the emulator was started.
+    pub fn starts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
     }
 
     /// Helper processes this fake started that are still alive. Teardown is
@@ -728,7 +752,7 @@ fn serve_vmlab_hv(
     let listener = std::os::unix::net::UnixListener::bind(socket)?;
     // A guest power-off is an event and then an exit, from outside the
     // handler, which cannot broadcast through the server that owns it.
-    let (power_off, powered_off) = std::sync::mpsc::channel::<()>();
+    let (power_off, powered_off) = std::sync::mpsc::channel::<ShutdownReason>();
     let capabilities = if script.capabilities.snapshots {
         vec![Capability::Snapshots]
     } else {
@@ -744,7 +768,10 @@ fn serve_vmlab_hv(
             Command::Status | Command::Resume | Command::Pause => ok,
             Command::Powerdown => {
                 if !ignores_powerdown {
-                    let _ = tx.lock().expect("power-off sender").send(());
+                    let _ = tx
+                        .lock()
+                        .expect("power-off sender")
+                        .send(ShutdownReason::GuestShutdown);
                 }
                 ok
             }
@@ -773,10 +800,8 @@ fn serve_vmlab_hv(
     std::thread::spawn(move || server.serve(listener));
     let m = machine.clone();
     std::thread::spawn(move || {
-        if powered_off.recv().is_ok() {
-            broadcaster.broadcast(Event::Shutdown {
-                reason: ShutdownReason::GuestShutdown,
-            });
+        if let Ok(reason) = powered_off.recv() {
+            broadcaster.broadcast(Event::Shutdown { reason });
             // The event is on the wire before the exit, as vmlab-hv sends it.
             std::thread::sleep(Duration::from_millis(50));
             m.end("exit status: 0");
@@ -787,7 +812,11 @@ fn serve_vmlab_hv(
         // event that precedes it, sent a beat earlier.
         tokio::spawn(async move {
             tokio::time::sleep(exit.after.saturating_sub(Duration::from_millis(40))).await;
-            let _ = power_off.send(());
+            let _ = power_off.send(if exit.reset {
+                ShutdownReason::GuestReset
+            } else {
+                ShutdownReason::GuestShutdown
+            });
         });
     }
     let socket = socket.to_path_buf();

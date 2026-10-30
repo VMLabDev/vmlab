@@ -31,6 +31,8 @@ pub(crate) struct HvControl {
     commands: Arc<Mutex<Client>>,
     capabilities: Vec<Capability>,
     guest_shutdown: Arc<AtomicBool>,
+    /// The guest reset itself, which ends vmlab-hv.
+    guest_reset: Arc<AtomicBool>,
     asleep: watch::Sender<bool>,
     /// Flips to `true` once the event connection has closed — the
     /// hypervisor has gone and every event it sent has been read.
@@ -61,10 +63,12 @@ impl HvControl {
             "vmlab-hv control connected"
         );
         let guest_shutdown = Arc::new(AtomicBool::new(false));
+        let guest_reset = Arc::new(AtomicBool::new(false));
         let asleep = watch::Sender::new(false);
         let (closed_tx, events_closed) = watch::channel(false);
         {
             let flag = guest_shutdown.clone();
+            let reset = guest_reset.clone();
             let sleep = asleep.clone();
             std::thread::Builder::new()
                 .name("vmlab-hv-events".into())
@@ -73,7 +77,7 @@ impl HvControl {
                     // Ends with the stream: the hypervisor exited, or a
                     // message it should never send.
                     while let Ok(Some(event)) = events.wait_event() {
-                        observe(&event, &flag, &sleep);
+                        observe(&event, &flag, &reset, &sleep);
                     }
                     closed_tx.send_replace(true);
                 })
@@ -83,6 +87,7 @@ impl HvControl {
             commands: Arc::new(Mutex::new(commands)),
             capabilities,
             guest_shutdown,
+            guest_reset,
             asleep,
             events_closed,
             display: None,
@@ -108,12 +113,23 @@ impl HvControl {
 
 /// What one event says: a guest that powered itself off (or reset, which
 /// QEMU's adapter counts the same way), and whether it is asleep.
-fn observe(event: &Event, guest_shutdown: &AtomicBool, asleep: &watch::Sender<bool>) {
+fn observe(
+    event: &Event,
+    guest_shutdown: &AtomicBool,
+    guest_reset: &AtomicBool,
+    asleep: &watch::Sender<bool>,
+) {
     if let Event::Shutdown {
         reason: ShutdownReason::GuestShutdown | ShutdownReason::GuestReset,
     } = event
     {
         guest_shutdown.store(true, Ordering::SeqCst);
+    }
+    if let Event::Shutdown {
+        reason: ShutdownReason::GuestReset,
+    } = event
+    {
+        guest_reset.store(true, Ordering::SeqCst);
     }
     // One table for both hypervisors: the events mean what QEMU's do.
     let name = match event {
@@ -198,6 +214,10 @@ impl Control for HvControl {
 
     fn guest_shutdown(&self) -> bool {
         self.guest_shutdown.load(Ordering::SeqCst)
+    }
+
+    fn guest_reset(&self) -> bool {
+        self.guest_reset.load(Ordering::SeqCst)
     }
 
     fn sleep_watch(&self) -> Option<watch::Receiver<bool>> {
