@@ -94,6 +94,11 @@ pub mod features {
     /// [`AgentMsg::TimeSetFailed`]. The host uses it to bring a guest
     /// restored from an online snapshot back to the host's time (§7.3).
     pub const SET_TIME: &str = "set_time";
+    /// The agent reports the guest's system clock: it answers
+    /// [`HostMsg::GetTime`] with [`AgentMsg::Time`]. The host reads it each
+    /// time an agent handshakes, to correct a guest that booted with the
+    /// wrong time (§7.3, #186). An agent without it is left unchecked.
+    pub const GET_TIME: &str = "get_time";
     /// Shared apps over waypipe (PRD §20): [`HostMsg::OpenApp`] with
     /// [`crate::app::AppMode::Waypipe`]. Advertised by every Linux agent;
     /// whether the guest has a `waypipe` binary is the host's to probe.
@@ -533,6 +538,9 @@ pub enum HostMsg {
     SetTime {
         unix_ms: i64,
     },
+    /// Ask for the guest's system clock; the agent replies [`AgentMsg::Time`].
+    /// Only sent to an agent advertising [`features::GET_TIME`].
+    GetTime,
     /// Open a **shared app** session on channel `id` (PRD §20), which then
     /// carries length-prefixed [`app`] records rather than raw bytes. For
     /// waypipe and X11 the agent sets up the guest-side endpoint and starts
@@ -644,6 +652,9 @@ pub enum AgentMsg {
     TimeSet,
     /// Reply to [`HostMsg::SetTime`]: the guest clock could not be set.
     TimeSetFailed { msg: String },
+    /// Reply to [`HostMsg::GetTime`]: the guest's system clock, milliseconds
+    /// since the Unix epoch, UTC.
+    Time { unix_ms: i64 },
     /// Grant the host more send credit on a channel.
     WindowAdjust { id: u32, bytes: u64 },
     /// A channel failed (`id` set) or the agent hit a channel-less error.
@@ -1289,6 +1300,21 @@ mod tests {
             )
             .unwrap(),
             AgentMsg::TimeSetFailed { msg: "no".into() }
+        );
+    }
+
+    #[test]
+    fn get_time_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(HostMsg::GetTime).unwrap(),
+            serde_json::json!({"cmd": "get_time"})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentMsg::Time {
+                unix_ms: 1_760_000_000_123
+            })
+            .unwrap(),
+            serde_json::json!({"event": "time", "unix_ms": 1_760_000_000_123_i64})
         );
     }
 }

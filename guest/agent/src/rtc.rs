@@ -7,8 +7,15 @@
 //! either did gets it, through `up`'s agent update or `repair-agent`.
 //!
 //! The kernel reads the flag at boot, so one this agent had to write takes
-//! effect at the next boot; the host sets the running clock once after the
-//! push that brought it (`labd::agent_repair`).
+//! effect at the next boot. Until then the running kernel still treats the
+//! RTC as local time, and every clock set — the host's `set_time` after the
+//! push that brought this agent included (`labd::agent_repair`) — writes
+//! local time into it, so a reboot inside the guest comes back off by the
+//! guest's UTC offset (#186). Windows has no call that makes the running
+//! kernel re-read the flag or write the RTC as UTC, so nothing here can close
+//! that window; the host does instead, checking the guest's clock
+//! (`get_time`) at every handshake (`labd::boot_clock`). A template that sets
+//! the flag before it is sealed never opens it.
 //!
 //! Portable so the decision is tested on any host; the Windows half only
 //! reads and writes the registry.

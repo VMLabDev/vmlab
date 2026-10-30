@@ -383,6 +383,7 @@ impl crate::mux::Platform for LinuxPlatform {
             features::WATCH.to_string(),
             features::TREE.to_string(),
             features::SET_TIME.to_string(),
+            features::GET_TIME.to_string(),
             // Whether `waypipe` is installed is the login's business, and
             // the host learns it from the open failing; X11 needs nothing.
             features::APP_WAYPIPE.to_string(),
