@@ -823,19 +823,20 @@ pub(super) fn no_install_cdrom(name: &str) -> anyhow::Error {
     )
 }
 
-/// [`Machine::poweroff`] for a machine QEMU is running: a clean QMP `quit`,
-/// then wait for the exit monitor to settle.
+/// [`Machine::poweroff`] for a machine a hypervisor is running: a clean
+/// [`Control::quit`](super::hypervisor::Control::quit), then wait for the exit
+/// monitor to settle.
 ///
-/// The QMP call is expected to fail — QEMU exits, so the connection drops
+/// The quit is expected to fail — QEMU exits, so the connection drops
 /// mid-request — and a machine that is already down has no channel at all. The
 /// power state is the only answer that matters, so it is the only thing
 /// checked.
 pub(super) async fn quit_and_settle(
     m: &dyn Machine,
-    qmp: Result<crate::qmp::QmpClient>,
+    control: Option<Arc<dyn super::hypervisor::Control>>,
 ) -> Result<()> {
-    if let Ok(qmp) = qmp {
-        let _ = qmp.quit().await;
+    if let Some(control) = control {
+        let _ = control.quit().await;
     }
     m.wait_state(PowerState::Stopped, POWEROFF_SETTLE).await
 }

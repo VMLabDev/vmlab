@@ -27,7 +27,6 @@ use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
 use crate::qemu::container::ContainerVmPaths;
 use crate::qemu::{self, ResolvedContainer};
-use crate::qmp::QmpClient;
 
 /// Scratch (overlay upper layer) qcow2 virtual size. Sparse — real usage is
 /// whatever the container writes.
@@ -468,17 +467,27 @@ impl ContainerInstance {
         *self.last_exit.read().await
     }
 
-    /// The live QMP client, for the operations that genuinely need a
-    /// hypervisor — the scratch-disk snapshots. Absent both when the
-    /// container is stopped and when it is running under an in-memory
-    /// adapter, which is why those stay verified against a running lab
-    /// (ADR-0001).
-    pub async fn qmp(&self) -> Result<QmpClient> {
+    /// One of the running micro-VM's capabilities (ADR-0020) — the
+    /// scratch-disk snapshots are the only ones a container uses. Absent both
+    /// when the container is stopped and when its hypervisor does not report
+    /// it — an in-memory adapter reports none — and either way the answer is
+    /// that it is not running, as it always has been.
+    async fn capability<T>(&self, pick: impl FnOnce(&dyn Control) -> Option<T>) -> Result<T> {
         self.control
             .lock()
             .await
-            .as_ref()
-            .and_then(|c| c.qmp())
+            .as_deref()
+            .and_then(pick)
+            .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
+    }
+
+    /// The running micro-VM's control channel itself, for the pause and
+    /// resume an online restore brackets its load with.
+    async fn running_control(&self) -> Result<Arc<dyn Control>> {
+        self.control
+            .lock()
+            .await
+            .clone()
             .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
     }
 
@@ -1054,8 +1063,8 @@ impl ContainerInstance {
                 if let Some(why) = self.online_snapshot_refusal().await {
                     bail!("{why}");
                 }
-                let qmp = self.qmp().await?;
-                qmp.snapshot_save(name, "scratch", &["scratch"]).await?;
+                let snapshots = self.capability(|c| c.snapshots()).await?;
+                snapshots.save(name, "scratch", &["scratch"]).await?;
                 Ok(true)
             }
             PowerState::Stopped => {
@@ -1078,9 +1087,10 @@ impl ContainerInstance {
     /// events — the resumed guest never re-emits `net_up`/`started`/`health`
     /// on its own, and host-side caches need them after a fresh boot.
     async fn restore_online(&self, name: &str) -> Result<()> {
-        let qmp = self.qmp().await?;
-        qmp.stop().await?;
-        qmp.snapshot_load(name, "scratch", &["scratch"]).await?;
+        let snapshots = self.capability(|c| c.snapshots()).await?;
+        let control = self.running_control().await?;
+        control.pause().await?;
+        snapshots.load(name, "scratch", &["scratch"]).await?;
         // Drop the agent connection BEFORE resuming: the rewound guest
         // replays virtio-serial response bytes the host already consumed.
         // With no client attached, QEMU discards the replayed bytes; the
@@ -1089,7 +1099,7 @@ impl ContainerInstance {
         // not drop: live sessions hold handle clones, and a lingering
         // connection blocks QEMU's one-client chardev slot.
         self.agent.drop().await;
-        qmp.cont().await?;
+        control.resume().await?;
         self.reconnect_agent_after_load().await;
         if let Ok(ctl) = self.ctl().await {
             ctl.send(&CtlCommand::Resync).await?;
@@ -1132,8 +1142,8 @@ impl ContainerInstance {
     async fn drop_snapshot(&self, name: &str) -> Result<()> {
         match self.power_state().await {
             PowerState::Running => {
-                let qmp = self.qmp().await?;
-                qmp.snapshot_delete(name, &["scratch"]).await?;
+                let snapshots = self.capability(|c| c.snapshots()).await?;
+                snapshots.delete(name, &["scratch"]).await?;
             }
             _ => {
                 crate::template::qimg::snapshot_delete(&self.dirs.scratch_disk(), name).await?;
@@ -1244,7 +1254,10 @@ impl super::machine::Machine for ContainerInstance {
     }
 
     async fn poweroff(&self) -> Result<()> {
-        super::machine::quit_and_settle(self, ContainerInstance::qmp(self).await).await
+        // Taken out first: the exit monitor clears this slot, so the lock
+        // must not be held through the settle.
+        let control = self.control.lock().await.clone();
+        super::machine::quit_and_settle(self, control).await
     }
 
     /// Wire this container's NICs into the lab fabric — stream sockets only,

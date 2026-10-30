@@ -16,7 +16,9 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use super::error::QmpError;
-use super::types::{QmpEvent, RunState};
+use super::types::QmpEvent;
+#[cfg(test)]
+use super::types::RunState;
 
 /// Maximum value on the abs axes of QEMU's `input-send-event` (per QAPI,
 /// absolute pointer coordinates are scaled to a 0..32767 range).
@@ -181,6 +183,7 @@ impl QmpClient {
     /// [`QmpError::Closed`]. Affects every clone of this client.
     /// (Production drops the last clone instead — see `Drop` on `Inner` —
     /// but the tests close explicitly to assert in-flight behaviour.)
+    #[cfg(test)]
     pub async fn close(&self) {
         let task = self.inner.reader_task.lock_recover().take();
         if let Some(task) = task {
@@ -223,6 +226,7 @@ impl QmpClient {
 
     /// Query the VM run state (`query-status`). (The daemon watches run
     /// state via events; the QMP tests poll through this.)
+    #[cfg(test)]
     pub async fn query_status(&self) -> Result<RunState, QmpError> {
         let value = self.execute("query-status", None).await?;
         let status = value

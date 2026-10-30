@@ -2,8 +2,10 @@
 //!
 //! Everything here is the mapping layer the seam's own handle types buy —
 //! `Proc` becomes a [`Process`], the QMP client plus its SHUTDOWN-event watch
-//! become a [`Control`]. Nothing above the seam sees either concrete type
-//! again, which is what lets [`super::fake`] be in-memory.
+//! become a [`Control`], and each capability is the QMP commands its callers
+//! used to send themselves, in the same order. Nothing above the seam sees a
+//! `Proc` or a QMP client again, which is what lets [`super::fake`] be
+//! in-memory.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +14,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{Control, GuestAsset, Hypervisor, LaunchSpec, Process, Running};
+use super::{
+    Control, Frames, GuestAsset, Hotplug, Hypervisor, Input, LaunchSpec, Media, Process, Running,
+    Snapshots,
+};
 use crate::qemu::Proc;
 use crate::qmp::QmpClient;
 
@@ -183,6 +188,10 @@ impl Control for QemuControl {
         Ok(self.qmp.cont().await?)
     }
 
+    async fn pause(&self) -> Result<()> {
+        Ok(self.qmp.stop().await?)
+    }
+
     async fn powerdown(&self) -> Result<()> {
         Ok(self.qmp.system_powerdown().await?)
     }
@@ -203,8 +212,90 @@ impl Control for QemuControl {
         Ok(self.qmp.system_wakeup().await?)
     }
 
-    fn qmp(&self) -> Option<QmpClient> {
-        Some(self.qmp.clone())
+    fn snapshots(&self) -> Option<Arc<dyn Snapshots>> {
+        Some(Arc::new(QmpCapabilities(self.qmp.clone())))
+    }
+
+    fn input(&self) -> Option<Arc<dyn Input>> {
+        Some(Arc::new(QmpCapabilities(self.qmp.clone())))
+    }
+
+    fn frames(&self) -> Option<Arc<dyn Frames>> {
+        Some(Arc::new(QmpCapabilities(self.qmp.clone())))
+    }
+
+    fn hotplug(&self) -> Option<Arc<dyn Hotplug>> {
+        Some(Arc::new(QmpCapabilities(self.qmp.clone())))
+    }
+
+    fn media(&self) -> Option<Arc<dyn Media>> {
+        Some(Arc::new(QmpCapabilities(self.qmp.clone())))
+    }
+}
+
+/// Every capability QEMU has, as the QMP commands that carry it. A QMP
+/// failure stays a [`crate::qmp::QmpError`] inside the `anyhow::Error`, so a
+/// caller that tells one failure from another (a GL scanout's `no surface`)
+/// still can.
+pub(crate) struct QmpCapabilities(pub(crate) QmpClient);
+
+#[async_trait::async_trait]
+impl Snapshots for QmpCapabilities {
+    async fn save(&self, name: &str, vmstate: &str, devices: &[&str]) -> Result<()> {
+        Ok(self.0.snapshot_save(name, vmstate, devices).await?)
+    }
+
+    async fn load(&self, name: &str, vmstate: &str, devices: &[&str]) -> Result<()> {
+        Ok(self.0.snapshot_load(name, vmstate, devices).await?)
+    }
+
+    async fn delete(&self, name: &str, devices: &[&str]) -> Result<()> {
+        Ok(self.0.snapshot_delete(name, devices).await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl Input for QmpCapabilities {
+    async fn send_keys(&self, keys: &[&str]) -> Result<()> {
+        Ok(self.0.send_key(keys, None).await?)
+    }
+
+    async fn pointer_to(&self, x: u32, y: u32, width: u32, height: u32) -> Result<()> {
+        Ok(self.0.mouse_move_abs(x, y, width, height).await?)
+    }
+
+    async fn button(&self, button: &str, down: bool) -> Result<()> {
+        Ok(self.0.mouse_button(button, down).await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl Frames for QmpCapabilities {
+    async fn screendump(&self, to: &Path) -> Result<()> {
+        Ok(self.0.screendump(to).await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl Media for QmpCapabilities {
+    async fn eject_install_cdrom(&self) -> Result<()> {
+        Ok(self.0.eject(crate::qemu::cmdline::INSTALL_CDROM_ID).await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl Hotplug for QmpCapabilities {
+    async fn attach_usb(&self, plan: &crate::usb::AttachPlan) -> Result<()> {
+        Ok(self.0.device_add(plan.args.clone()).await?)
+    }
+
+    async fn detach(&self, id: &str, wait: Duration) -> Result<()> {
+        match self.0.device_del(id, wait).await {
+            Ok(()) => Ok(()),
+            // QEMU has already dropped it — unplugged, or never there.
+            Err(crate::qmp::QmpError::Command { class, .. }) if class == "DeviceNotFound" => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

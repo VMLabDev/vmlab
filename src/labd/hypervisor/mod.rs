@@ -20,6 +20,12 @@
 //! [`fake::FakeHypervisor`] runs a scripted machine with no subprocess at
 //! all, which is what every lifecycle test drives.
 //!
+//! What a running machine can do beyond the lifecycle — online snapshots,
+//! scripted input, framebuffer capture, device hot-plug — is a set of
+//! **capabilities** [`Control`] reports, each `None` where the adapter has
+//! none. A caller asks for the one it needs and refuses when it is absent; it
+//! never reaches past the seam for a protocol client (ADR-0020).
+//!
 //! Note what is *not* here: building the argv. Resolving hardware into a
 //! command line is [`crate::qemu`]'s job and is already pure and tested; this
 //! seam is about running machines, not composing them.
@@ -32,10 +38,11 @@ use anyhow::Result;
 
 use crate::guest_asset::GuestAsset;
 use crate::qemu::process::{ChildEnv, ChildFd};
-use crate::qmp::QmpClient;
 
 mod qemu;
 pub use qemu::Qemu;
+#[cfg(test)]
+pub(crate) use qemu::QmpCapabilities;
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -65,7 +72,8 @@ pub trait Process: Send + Sync + 'static {
 }
 
 /// A running machine's control channel: what the lifecycle asks a machine to
-/// do once it is up, and what it can learn about how the guest is behaving.
+/// do once it is up, what it can learn about how the guest is behaving, and
+/// which capabilities this machine has.
 ///
 /// The QMP client sits *behind* this rather than being handed out, so an
 /// adapter does not have to stand up a QMP server to be usable.
@@ -74,6 +82,10 @@ pub trait Control: Send + Sync + 'static {
     /// Release the CPUs. The emulator starts paused so the caller can
     /// subscribe to what it needs before the guest runs an instruction.
     async fn resume(&self) -> Result<()>;
+
+    /// Stop the CPUs, leaving the machine up — what an online restore does
+    /// before it loads a snapshot over the running guest.
+    async fn pause(&self) -> Result<()>;
 
     /// Ask the guest to power itself down (ACPI) — a stop-ladder rung, not a
     /// kill. Success means the request was delivered, not that the guest
@@ -107,15 +119,90 @@ pub trait Control: Send + Sync + 'static {
         anyhow::bail!("this machine cannot sleep, so there is nothing to wake")
     }
 
-    /// The live QMP client, when this machine is real QEMU.
-    ///
-    /// `None` under an in-memory adapter: snapshot save/load, the framebuffer
-    /// and scripted input genuinely need a hypervisor (ADR-0001) and stay
-    /// verified against a running lab. Callers that need one already report
-    /// "not running" when it is absent.
-    fn qmp(&self) -> Option<QmpClient> {
+    /// Online snapshots, when this machine can take them. `None` leaves the
+    /// caller's refusal standing; it does not fall back to anything.
+    fn snapshots(&self) -> Option<Arc<dyn Snapshots>> {
         None
     }
+
+    /// Scripted keyboard and pointer input over the control channel.
+    fn input(&self) -> Option<Arc<dyn Input>> {
+        None
+    }
+
+    /// Framebuffer capture over the control channel.
+    fn frames(&self) -> Option<Arc<dyn Frames>> {
+        None
+    }
+
+    /// Hot-plugging host devices into the running machine.
+    fn hotplug(&self) -> Option<Arc<dyn Hotplug>> {
+        None
+    }
+
+    /// Removable media in the running machine's drives.
+    fn media(&self) -> Option<Arc<dyn Media>> {
+        None
+    }
+}
+
+/// The **snapshots** capability: save, load and delete a snapshot of a
+/// running machine — RAM and device state into `vmstate`, every disk in
+/// `devices` captured at the same instant (PRD §7.3).
+///
+/// The names are the block-device nodes the machine was launched with
+/// (`disk0`…, a container's `scratch`). Each operation completes when it is
+/// done; there is no job to poll above the seam.
+#[async_trait::async_trait]
+pub trait Snapshots: Send + Sync {
+    async fn save(&self, name: &str, vmstate: &str, devices: &[&str]) -> Result<()>;
+
+    /// Load over the running guest. The caller pauses the machine first and
+    /// resumes it after, through [`Control`], so it can act in between.
+    async fn load(&self, name: &str, vmstate: &str, devices: &[&str]) -> Result<()>;
+
+    async fn delete(&self, name: &str, devices: &[&str]) -> Result<()>;
+}
+
+/// The **input** capability: keyboard and absolute pointer, in QEMU `qcode`
+/// key names and pixel coordinates against a `width`×`height` screen.
+#[async_trait::async_trait]
+pub trait Input: Send + Sync {
+    /// Press and release `keys` together, as one chord.
+    async fn send_keys(&self, keys: &[&str]) -> Result<()>;
+
+    async fn pointer_to(&self, x: u32, y: u32, width: u32, height: u32) -> Result<()>;
+
+    /// Press (`down`) or release a mouse button (`left`, `middle`, `right`).
+    async fn button(&self, button: &str, down: bool) -> Result<()>;
+}
+
+/// The **frames** capability: the current framebuffer, written as an image
+/// file at a path the caller chose and reads back.
+#[async_trait::async_trait]
+pub trait Frames: Send + Sync {
+    async fn screendump(&self, to: &Path) -> Result<()>;
+}
+
+/// The **hot-plug** capability: host devices attached to and detached from
+/// the running machine (PRD §5.2.1).
+#[async_trait::async_trait]
+pub trait Hotplug: Send + Sync {
+    /// Attach the host USB device `plan` resolved.
+    async fn attach_usb(&self, plan: &crate::usb::AttachPlan) -> Result<()>;
+
+    /// Detach the device with id `id`, waiting up to `wait` for the guest to
+    /// let go. A device the machine no longer has is already detached, so
+    /// that is success too.
+    async fn detach(&self, id: &str, wait: Duration) -> Result<()>;
+}
+
+/// The **media** capability: removable media in a running machine's drives.
+#[async_trait::async_trait]
+pub trait Media: Send + Sync {
+    /// Eject the install CD-ROM a VM with a `cdrom` attachment boots from,
+    /// even while the guest holds it, and leave the tray closed and empty.
+    async fn eject_install_cdrom(&self) -> Result<()>;
 }
 
 /// The guest channels a machine answers on once it is up.
