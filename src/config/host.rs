@@ -53,6 +53,11 @@ pub struct HostConfig {
     /// bundled `firmware/` set. `None` = vmlab's bundled firmware, then the
     /// host's (see `qemu::firmware`).
     pub firmware_dir: Option<std::path::PathBuf>,
+    /// The vmlab-hv binary (PRD §22); `None` = `vmlab-hv` on `PATH`.
+    pub vmlab_hv: Option<std::path::PathBuf>,
+    /// The hypervisor a machine that names none runs on, by kind (PRD §22,
+    /// `host { hypervisor { … } }`). QEMU for both until a phase flips it.
+    pub hypervisor: crate::config::hypervisor::HypervisorDefaults,
     /// The host GPUs (PRD §5.2), in declaration order: every host-specific
     /// GPU fact lives here, named, so a lab file names a GPU rather than a
     /// PCI address and stays portable between hosts.
@@ -141,6 +146,8 @@ impl Default for HostConfig {
             config_weave_bin_dir: None,
             workspace_max_file: DEFAULT_WORKSPACE_MAX_FILE,
             firmware_dir: None,
+            vmlab_hv: None,
+            hypervisor: Default::default(),
             gpus: Vec::new(),
         }
     }
@@ -206,6 +213,17 @@ impl HostConfig {
             }
             cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
             cfg.firmware_dir = r.path("firmware_dir").unspan();
+            cfg.vmlab_hv = r.path("vmlab_hv").unspan();
+            for child in r.children().filter(|c| c.kind() == "hypervisor") {
+                use crate::config::hypervisor::HypervisorKind;
+                let mut h = Reader::new(&child, r.issues());
+                if let Some(v) = h.keyword("container", HypervisorKind::NAMES).unspan() {
+                    cfg.hypervisor.container = v;
+                }
+                if let Some(v) = h.keyword("vm", HypervisorKind::NAMES).unspan() {
+                    cfg.hypervisor.vm = v;
+                }
+            }
             if let Some(span) = r.field_span("gpu_address") {
                 moved.push(super::Issue::at(span, GPU_ADDRESS_MOVED));
             }
@@ -389,6 +407,41 @@ mod tests {
         assert_eq!(cfg.workspace_max_file, DEFAULT_WORKSPACE_MAX_FILE);
         assert_eq!(cfg.firmware_dir, None);
         assert!(cfg.gpus.is_empty() && cfg.default_gpu().is_none());
+    }
+
+    /// The default hypervisor is keyed by machine kind (PRD §22) and starts
+    /// at QEMU for both; the vmlab-hv binary is a tool path like the rest.
+    #[test]
+    fn parses_the_hypervisor_defaults_and_binary() {
+        use crate::config::hypervisor::HypervisorKind;
+        let none = HostConfig::default();
+        assert_eq!(none.hypervisor.container, HypervisorKind::Qemu);
+        assert_eq!(none.hypervisor.vm, HypervisorKind::Qemu);
+        assert_eq!(none.vmlab_hv, None);
+
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+host {
+  vmlab_hv = "/opt/vmlab-hv/bin/vmlab-hv"
+  hypervisor { container = "vmlab" }
+}
+"#,
+            "<test>",
+        )
+        .unwrap();
+        assert_eq!(cfg.hypervisor.container, HypervisorKind::Vmlab);
+        assert_eq!(cfg.hypervisor.vm, HypervisorKind::Qemu);
+        assert_eq!(
+            cfg.vmlab_hv.as_deref(),
+            Some(Path::new("/opt/vmlab-hv/bin/vmlab-hv"))
+        );
+
+        let err = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { hypervisor { vm = \"xen\" } }\n",
+            "<test>",
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("xen"), "{err:?}");
     }
 
     #[test]

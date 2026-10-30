@@ -23,6 +23,12 @@ is written through QMP's `snapshot-save` into the primary disk, covering every
 disk the machine has; an offline one is written with `qemu-img` to each disk in
 turn. Snapshots are named, listed and deleted per machine.
 
+Each snapshot records the hypervisor that took it (`qemu` or `vmlab`, PRD §22).
+An online one is in that hypervisor's own format, so restoring it on a machine
+that now runs on the other is refused, naming the one that took it; switching
+the machine back makes it restorable. Offline snapshots restore under either.
+Records from before the field are QEMU's.
+
 Host USB devices passed through with `vmlab usb` are not in a snapshot. An
 online snapshot of a VM holding any is refused, naming them, until they are
 detached (`vmlab usb detach <vm> --all`); an online restore detaches every

@@ -22,6 +22,7 @@ use vmlab_cinit_proto::{
 use super::container_ctl::CtlHandle;
 use super::hypervisor::{Control, Hypervisor, Process};
 use super::vm::{PowerState, StopReason};
+use crate::config::hypervisor::HypervisorKind;
 use crate::config::model::{self, MacAddr, VolumeSource};
 use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
@@ -76,6 +77,23 @@ impl ContainerDirs {
 
     pub fn qmp_sock(&self) -> PathBuf {
         self.run.join("qmp.sock")
+    }
+
+    /// The socket the micro-VM's hypervisor is controlled on: QMP for QEMU,
+    /// vmlab-hv's own protocol beside it (§22).
+    pub fn control_sock(&self, hypervisor: HypervisorKind) -> PathBuf {
+        match hypervisor {
+            HypervisorKind::Qemu => self.qmp_sock(),
+            HypervisorKind::Vmlab => self.run.join("control.sock"),
+        }
+    }
+
+    /// Where the hypervisor's own stdout/stderr goes.
+    pub fn hypervisor_log(&self, hypervisor: HypervisorKind) -> PathBuf {
+        self.logs.join(match hypervisor {
+            HypervisorKind::Qemu => "qemu.log",
+            HypervisorKind::Vmlab => "vmlab-hv.log",
+        })
     }
     pub fn ctl_sock(&self) -> PathBuf {
         self.run.join("ctl.sock")
@@ -357,9 +375,13 @@ pub struct ContainerInstance {
     /// full VMs; the agent is spawned by cinit inside the micro-VM).
     agent: super::machine::AgentSlot,
     /// How this micro-VM reaches the host to actually run — see
-    /// [`super::hypervisor`]. Real QEMU in production; a fake in tests, which
-    /// is what makes the start ladder and the readiness gate testable.
+    /// [`super::hypervisor`]. QEMU or vmlab-hv in production (§22); a fake
+    /// in tests, which is what makes the start ladder and the readiness gate
+    /// testable.
     hv: Arc<dyn Hypervisor>,
+    /// Which hypervisor `hv` is, as the machine reports it and its snapshots
+    /// record it (§22).
+    hypervisor: HypervisorKind,
 }
 
 impl ContainerInstance {
@@ -372,6 +394,8 @@ impl ContainerInstance {
         nic_mtus: Vec<u16>,
         image: Option<PulledImage>,
         volumes: Vec<(String, PathBuf, bool)>,
+        hypervisor: HypervisorKind,
+        hv: Arc<dyn Hypervisor>,
     ) -> Arc<Self> {
         let parts = image.map(|image| {
             let spec = build_spec(&cfg, &image.config, &cfg.name);
@@ -401,18 +425,9 @@ impl ContainerInstance {
             control: Mutex::new(None),
             ctl: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
-            hv: Arc::new(super::hypervisor::Qemu),
+            hv,
+            hypervisor,
         })
-    }
-
-    /// Run this container against a different hypervisor. Tests use it to
-    /// drive the start ladder and the readiness gate.
-    /// without KVM — the same injection point [`super::vm::VmInstance`] has,
-    /// because the seam covers both machine kinds or it covers neither
-    /// (ADR-0001).
-    #[cfg(test)]
-    pub(crate) fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn Hypervisor>) {
-        Arc::get_mut(self).expect("sole owner").hv = hv;
     }
 
     /// The pulled image + merged spec, or an error while the deferred pull
@@ -739,8 +754,11 @@ impl ContainerInstance {
             let vfs_devices = self.start_virtiofsds().await?;
 
             let asset = self.hv.guest_asset(&self.resolved.arch)?;
-            let accel = qemu::pick_accel(&self.resolved.arch);
-            if accel == qemu::Accel::Tcg {
+            // vmlab-hv has no TCG to fall back to; validation refused the
+            // machine on a host without KVM (§22).
+            if self.hypervisor == HypervisorKind::Qemu
+                && qemu::pick_accel(&self.resolved.arch) == qemu::Accel::Tcg
+            {
                 tracing::warn!(
                     "{}: KVM unavailable for {} — falling back to TCG (slow)",
                     self.cfg.name,
@@ -754,18 +772,18 @@ impl ContainerInstance {
             };
             // The machine answers control shortly after spawn (-S leaves
             // CPUs paused); the hypervisor returns once it does.
-            let qemu_log = self.dirs.logs.join("qemu.log");
-            let log_from = crate::qemu::process::log_offset(&qemu_log);
+            let hv_log = self.dirs.hypervisor_log(self.hypervisor);
+            let log_from = crate::qemu::process::log_offset(&hv_log);
             let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
-                    label: format!("qemu:{}", self.cfg.name),
+                    label: format!("{}:{}", hypervisor_label(self.hypervisor), self.cfg.name),
                     machine,
                     // A micro-VM has no GPU, but its emulator still starts
                     // with the Vulkan loader variables cleared.
                     env: qemu::hostgpu::emulator_env(false, None, None, None),
-                    log: qemu_log.clone(),
-                    qmp_sock: self.dirs.qmp_sock(),
+                    log: hv_log.clone(),
+                    control_sock: self.dirs.control_sock(self.hypervisor),
                     fds: Vec::new(),
                     channels: super::hypervisor::GuestChannels {
                         agent: self.dirs.agent_sock(),
@@ -779,7 +797,14 @@ impl ContainerInstance {
 
             // QEMU creates the ctl socket at startup; retry briefly in
             // case we won the race.
-            let ctl = connect_ctl_retry(&self.dirs.ctl_sock(), &proc, &qemu_log, log_from).await?;
+            let ctl = connect_ctl_retry(
+                hypervisor_name(self.hypervisor),
+                &self.dirs.ctl_sock(),
+                &proc,
+                &hv_log,
+                log_from,
+            )
+            .await?;
             *self.ctl.lock().await = Some(ctl.clone());
             // cinit blocks its boot on the spec. Send one now (the guest
             // port is usually already open); the ctl watcher re-answers
@@ -1233,11 +1258,20 @@ impl super::machine::Machine for ContainerInstance {
 
     /// A micro-VM needs the host-arch emulator; `qemu-img` creates its
     /// scratch overlay.
+    /// `qemu-img` either way: it makes the scratch disk and takes the
+    /// offline snapshots, whichever hypervisor runs the micro-VM.
     fn required_binaries(&self) -> Vec<String> {
         vec![
             "qemu-img".to_string(),
-            qemu::emulator_binary(&self.resolved.arch),
+            match self.hypervisor {
+                HypervisorKind::Qemu => qemu::emulator_binary(&self.resolved.arch),
+                HypervisorKind::Vmlab => self.hv.emulator_binary(&self.resolved.arch),
+            },
         ]
+    }
+
+    fn hypervisor(&self) -> HypervisorKind {
+        self.hypervisor
     }
 
     async fn state(&self) -> PowerState {
@@ -1481,7 +1515,24 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
     Ok(())
 }
 
+/// How a hypervisor's process is labelled (`qemu:web`, `vmlab-hv:web`).
+fn hypervisor_label(hypervisor: HypervisorKind) -> &'static str {
+    match hypervisor {
+        HypervisorKind::Qemu => "qemu",
+        HypervisorKind::Vmlab => "vmlab-hv",
+    }
+}
+
+/// How a startup failure names the hypervisor that failed.
+fn hypervisor_name(hypervisor: HypervisorKind) -> &'static str {
+    match hypervisor {
+        HypervisorKind::Qemu => "QEMU",
+        HypervisorKind::Vmlab => "vmlab-hv",
+    }
+}
+
 async fn connect_ctl_retry(
+    hypervisor: &str,
     sock: &Path,
     proc: &Arc<dyn Process>,
     log: &Path,
@@ -1490,7 +1541,7 @@ async fn connect_ctl_retry(
     for _ in 0..100 {
         if !proc.is_running() {
             return Err(crate::qemu::process::exited_during_startup(
-                "QEMU",
+                hypervisor,
                 &proc.exit_status().unwrap_or_default(),
                 log,
                 log_from,
@@ -1535,6 +1586,7 @@ mod tests {
             profile: Some("container".into()),
             cpus: None,
             memory: None,
+            hypervisor: None,
             depends_on: vec![],
             depends_on_provision: vec![],
             nics: vec![],
@@ -1577,7 +1629,18 @@ mod tests {
             &crate::profiles::ProfileSet::shipped().unwrap(),
         )
         .unwrap();
-        ContainerInstance::new("lab", cfg, resolved, dirs, vec![], vec![], None, vec![])
+        ContainerInstance::new(
+            "lab",
+            cfg,
+            resolved,
+            dirs,
+            vec![],
+            vec![],
+            None,
+            vec![],
+            HypervisorKind::Qemu,
+            Arc::new(crate::labd::hypervisor::Qemu),
+        )
     }
 
     /// A container has no display device at all, so asking for one is a hard

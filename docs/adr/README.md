@@ -28,6 +28,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0018](0018-the-supervisor-holds-a-host-gpu-awake.md) | The supervisor holds a host GPU awake between labs | Accepted |
 | [0019](0019-a-worktree-lab-is-a-linked-clone-of-a-frozen-main-lab.md) | A worktree lab is a linked clone of a frozen main lab | Accepted |
 | [0020](0020-a-hypervisor-reports-capabilities-and-composes-its-own-launch.md) | A hypervisor reports capabilities and composes its own launch | Accepted |
+| [0021](0021-a-machine-chooses-its-hypervisor.md) | A machine chooses its hypervisor, and vmlab-hv is the second | Accepted |
 
 ## Format
 

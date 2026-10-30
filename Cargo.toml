@@ -40,6 +40,10 @@ vmlab-cinit-proto = { path = "guest/cinit-proto" }
 # Host <-> vmlab-agent contract (frame mux: terminals, exec, files, metrics)
 # for VMs and containers. Shared with the guest agent (guest/agent).
 vmlab-agent-proto = { path = "guest/agent-proto" }
+# The control protocol and machine description vmlab-hv speaks (§22,
+# ADR-0021): a machine on `hypervisor = "vmlab"` is launched from a
+# `MachineDescription` and driven over its control socket.
+vmlab-hv-proto = { git = "https://github.com/VMLabDev/vmlab-hypervisor.git", rev = "b2264caa235516b17af3c9b56de95bf033d40377" }
 
 anyhow = "1"
 thiserror = "2"

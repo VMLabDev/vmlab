@@ -294,6 +294,8 @@ type Vm {
   secure_boot_vars: utf8?
   @doc("Raw QEMU flags appended last — escape hatch")
   qemu_args: list<utf8>?
+  @doc("Hypervisor that runs the VM: `qemu` | `vmlab` (vmlab-hv; refused on a VM until its phase 2, PRD §22); unset = the host config's default for VMs, itself `qemu` unless set")
+  @options(["qemu", "vmlab"]) hypervisor: utf8?
   @doc("GPU acceleration (passthrough / virgl / vulkan)")
   @child("gpu")     gpu: Gpu?
   @doc("Network interfaces; no NICs = air-gapped (shares need ≥1 NIC)")
@@ -380,6 +382,8 @@ type Container {
   @range(1) cpus: i64?
   @doc("RAM for the micro-VM, e.g. `512MiB`; inherited from `profile` if omitted — one of the two must supply it")
   memory: std.ByteSize?
+  @doc("Hypervisor that runs the micro-VM: `qemu` | `vmlab` (vmlab-hv: x86_64 under KVM, PRD §22); unset = the host config's default for containers, itself `qemu` unless set")
+  @options(["qemu", "vmlab"]) hypervisor: utf8?
   @doc("VM/container names this one starts after, once each is ready — start order only, never their provisioning (no cycles)")
   depends_on: list<utf8>?
   @doc("VM/container names whose provision and playbook steps all finish before this one's first step; does not delay its start (no cycles)")

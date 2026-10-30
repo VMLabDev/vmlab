@@ -4,6 +4,7 @@
 pub(crate) mod block;
 mod extract;
 pub mod host;
+pub mod hypervisor;
 pub mod model;
 pub mod projection;
 pub mod validate;

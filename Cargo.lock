@@ -2538,6 +2538,7 @@ dependencies = [
  "tracing-subscriber",
  "vmlab-agent-proto",
  "vmlab-cinit-proto",
+ "vmlab-hv-proto",
  "vmlab-tap",
  "wcl_lang",
  "wscript",
@@ -2557,6 +2558,16 @@ name = "vmlab-cinit-proto"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "vmlab-hv-proto"
+version = "0.1.0"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=b2264caa235516b17af3c9b56de95bf033d40377#b2264caa235516b17af3c9b56de95bf033d40377"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

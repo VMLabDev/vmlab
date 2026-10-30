@@ -51,6 +51,7 @@ vm "<name>" {
   tpm         = false
   secure_boot = false
   qemu_args   = []
+  hypervisor  = "qemu"
   gpu       { … }
   nic       { … }
   disk "…"  { … }
@@ -94,7 +95,8 @@ SRC
       | "`secure_boot`" | "bool" | "inherited" | "Enable secure boot; OVMF only. Inherited from template, then profile." |
       | "`secure_boot_keys`" | "utf8" | "inherited, else `microsoft`" | "The key store secure boot starts from. `microsoft`: the bundled store with Microsoft's keys enrolled. `setup`: the blank store, so the firmware starts in setup mode and the guest enrolls its own keys on first boot; the VM's `OVMF_VARS.fd` keeps them. Inherited from template, then profile. Needs `secure_boot = true`. See [Host and firmware](guide_host)." |
       | "`secure_boot_vars`" | "utf8" | "none" | "A pre-enrolled UEFI VARS file, relative to the lab root, copied once at the VM's first start in place of the bundled store, so the guest enforces your keys from its first boot. Must be the size of the secure-boot firmware's VARS template. Needs `secure_boot = true`; exclusive with `secure_boot_keys`. Overrides a template's stored VARS." |
-      | "`qemu_args`" | "list<utf8>" | "none" | "Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates." |
+      | "`qemu_args`" | "list<utf8>" | "none" | "Raw QEMU flags appended last. The escape hatch; they win over everything vmlab generates. Refused on any other hypervisor." |
+      | "`hypervisor`" | "utf8" | "host default, else `qemu`" | "The program that runs the VM: `qemu`, or `vmlab` for vmlab-hv. vmlab-hv runs container micro-VMs only so far, so `vmlab` is refused on a VM. Unset takes the host config's default for VMs. Declared on the VM only; it never resolves through template or profile." |
       | "`gpu {}`" | "child" | "none" | "GPU acceleration: passthrough, virgl or vulkan." |
       | "`nic {}`" | "children" | "none" | "Network interfaces. No NICs means air-gapped. Shares need at least one." |
       | "`disk {}`" | "children" | "none" | "Additional disks beyond the primary disk." |
@@ -129,6 +131,7 @@ SRC
     li "Every name in `depends_on` and `depends_on_provision` exists in the lab and is not the VM itself."
     li "Neither key forms a cycle across VMs and containers; the error names the whole path. The two keys are separate graphs, so a loop that crosses from one to the other is allowed: starting a machine never waits for provisioning, so it cannot deadlock."
     li "`profile`, if set, names a known profile."
+    li "A VM on `hypervisor = \"vmlab\"`, declared or from the host default, is refused: vmlab-hv runs container micro-VMs only so far. The message also names `qemu_args`, `accel = \"tcg\"` and a non-x86_64 arch where the VM has them, since vmlab-hv will refuse those once it runs VMs."
     li "`cdrom` and `floppy` name files that exist under the lab root."
     li "`clock` is `host`, `snapshot`, or an RFC 3339 date-time such as `2020-01-01T00:00:00Z`."
     li "`secure_boot = true` is rejected when the firmware resolves to `seabios`. Either value may have been inherited, so the message names the layer each came from."

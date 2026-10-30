@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+use super::hypervisor::{HostFacts, HypervisorDefaults, HypervisorKind, vmlab_refusals};
 use super::model::*;
 use super::{Issue, IssueList};
 use crate::profiles::Profile;
@@ -57,6 +58,23 @@ pub trait ValidationContext {
     /// answers `Ok`.
     fn check_host_gpu(&self, _gpu: &Gpu, _arch: Option<&str>) -> Result<(), String> {
         Ok(())
+    }
+
+    /// The host config's default hypervisor per machine kind (PRD §22). A
+    /// permissive context answers QEMU for both, as a host with no config
+    /// does.
+    fn hypervisor_defaults(&self) -> HypervisorDefaults {
+        HypervisorDefaults::default()
+    }
+
+    /// The host facts vmlab-hv's refusals read: the host's arch and whether
+    /// KVM is usable (PRD §22). A permissive context answers an x86_64 KVM
+    /// host, which refuses nothing a lab file alone does not.
+    fn host_facts(&self) -> HostFacts {
+        HostFacts {
+            arch: "x86_64".into(),
+            kvm: true,
+        }
     }
 
     fn template_exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool {
@@ -460,6 +478,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         &mut issues,
     );
     check_dev_defaults(lab, &mut issues);
+    check_hypervisors(lab, ctx, &mut issues);
 
     // -- per-machine configuration steps ------------------------------------
     // `provision`/`playbook` blocks live inside the vm/container they
@@ -1790,6 +1809,24 @@ fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
 /// it spans two machine blocks: the same class as the duplicate-static-IP rule
 /// above. The message names both machines, since the point is that the reader
 /// has to choose between them.
+/// Every machine that runs on vmlab-hv, against what it cannot run yet (PRD
+/// §22) — a field it names or a default the host config gave it. The list is
+/// [`vmlab_refusals`]'s, so the daemon refuses the same machines for the same
+/// words.
+fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueList) {
+    let defaults = ctx.hypervisor_defaults();
+    let mut host = None;
+    for m in lab.machines() {
+        if defaults.effective(m) != HypervisorKind::Vmlab {
+            continue;
+        }
+        let host = host.get_or_insert_with(|| ctx.host_facts());
+        for why in vmlab_refusals(m, host) {
+            issues.push(Issue::at(m.span(), why));
+        }
+    }
+}
+
 fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
     let mut declared = lab
         .machines()
@@ -4075,5 +4112,170 @@ lab "l" {
 }"#,
         );
         assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+    }
+
+    // -- hypervisor (PRD §22) ------------------------------------------------
+
+    /// A permissive context on a host with these hypervisor defaults and
+    /// facts.
+    struct HvHost {
+        defaults: HypervisorDefaults,
+        facts: HostFacts,
+    }
+
+    impl HvHost {
+        fn kvm() -> Self {
+            Self {
+                defaults: HypervisorDefaults::default(),
+                facts: HostFacts {
+                    arch: "x86_64".into(),
+                    kvm: true,
+                },
+            }
+        }
+    }
+
+    impl ValidationContext for HvHost {
+        fn template_meta(&self, a: &str, n: &str, v: Option<&str>) -> Option<TemplateMeta> {
+            Permissive.template_meta(a, n, v)
+        }
+        fn profile(&self, name: &str) -> Option<Profile> {
+            Permissive.profile(name)
+        }
+        fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
+            Ok(())
+        }
+        fn check_script(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn hypervisor_defaults(&self) -> HypervisorDefaults {
+            self.defaults
+        }
+        fn host_facts(&self) -> HostFacts {
+            self.facts.clone()
+        }
+    }
+
+    fn hv_errs(host: &HvHost, body: &str) -> Vec<String> {
+        let src = format!("import <vmlab.wcl>\nlab \"l\" {{\n{body}\n}}");
+        validate(&lab(&src), host)
+            .into_iter()
+            .map(|i| i.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_container_on_vmlab_validates_on_an_x86_64_kvm_host() {
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"container "c" { image = "alpine" hypervisor = "vmlab" }"#,
+        );
+        assert!(es.is_empty(), "{es:#?}");
+    }
+
+    #[test]
+    fn a_vm_on_vmlab_is_refused_naming_phase_one() {
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "x86_64/t" hypervisor = "vmlab" }"#,
+        );
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("vm \"v\""), "{es:#?}");
+        assert!(es[0].contains("container micro-VMs only"), "{es:#?}");
+    }
+
+    #[test]
+    fn qemu_args_on_vmlab_are_refused() {
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "x86_64/t" hypervisor = "vmlab" qemu_args = ["-no-hpet"] }"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("`qemu_args`") && m.contains("vm \"v\"")),
+            "{es:#?}"
+        );
+        // The same declaration on QEMU is the escape hatch it always was.
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "x86_64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }"#,
+        );
+        assert!(es.is_empty(), "{es:#?}");
+    }
+
+    #[test]
+    fn tcg_and_another_arch_on_vmlab_are_refused() {
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "aarch64/t" hypervisor = "vmlab" accel = "tcg" }"#,
+        );
+        assert!(es.iter().any(|m| m.contains("accel = \"tcg\"")), "{es:#?}");
+        assert!(es.iter().any(|m| m.contains("aarch64")), "{es:#?}");
+    }
+
+    #[test]
+    fn a_container_on_vmlab_without_kvm_is_refused() {
+        let host = HvHost {
+            facts: HostFacts {
+                arch: "x86_64".into(),
+                kvm: false,
+            },
+            ..HvHost::kvm()
+        };
+        let es = hv_errs(
+            &host,
+            r#"container "c" { image = "alpine" hypervisor = "vmlab" }"#,
+        );
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("/dev/kvm"), "{es:#?}");
+        // On QEMU it falls back to TCG, as it always has.
+        let es = hv_errs(&host, r#"container "c" { image = "alpine" }"#);
+        assert!(es.is_empty(), "{es:#?}");
+    }
+
+    #[test]
+    fn a_container_on_vmlab_on_another_arch_is_refused() {
+        let host = HvHost {
+            facts: HostFacts {
+                arch: "aarch64".into(),
+                kvm: true,
+            },
+            ..HvHost::kvm()
+        };
+        let es = hv_errs(
+            &host,
+            r#"container "c" { image = "alpine" hypervisor = "vmlab" }"#,
+        );
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("x86_64 only"), "{es:#?}");
+    }
+
+    /// A host default puts every machine of its kind on vmlab-hv, and the
+    /// same refusals follow it there; a machine naming QEMU is untouched.
+    #[test]
+    fn the_hosts_default_is_validated_like_a_declaration() {
+        let host = HvHost {
+            defaults: HypervisorDefaults {
+                container: HypervisorKind::Vmlab,
+                vm: HypervisorKind::Vmlab,
+            },
+            ..HvHost::kvm()
+        };
+        let es = hv_errs(
+            &host,
+            r#"container "c" { image = "alpine" }
+vm "v" { template = "x86_64/t" }
+vm "q" { template = "x86_64/t" hypervisor = "qemu" }"#,
+        );
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("vm \"v\""), "{es:#?}");
+    }
+
+    #[test]
+    fn an_unknown_hypervisor_is_a_schema_error() {
+        let src = r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "alpine" hypervisor = "xen" } }"#;
+        let tmp = std::env::temp_dir();
+        assert!(load_lab_source(src, "<test>", &tmp).is_err());
     }
 }

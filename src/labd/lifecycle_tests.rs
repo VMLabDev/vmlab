@@ -331,7 +331,14 @@ fn container_with_volumes(
         },
         rootfs_image: dirs.root.join("rootfs.sqfs"),
     };
-    let mut ctr = ContainerInstance::new(
+    // A script that speaks vmlab-hv's control protocol is a machine on it.
+    let kind = if script.vmlab_hv {
+        crate::config::hypervisor::HypervisorKind::Vmlab
+    } else {
+        crate::config::hypervisor::HypervisorKind::Qemu
+    };
+    let hv = FakeHypervisor::new(script);
+    let ctr = ContainerInstance::new(
         "t",
         cfg,
         resolved,
@@ -340,9 +347,9 @@ fn container_with_volumes(
         Vec::new(),
         Some(image),
         volumes,
+        kind,
+        hv.clone(),
     );
-    let hv = FakeHypervisor::new(script);
-    ctr.set_hypervisor(hv.clone());
     (ctr, hv)
 }
 
@@ -2284,4 +2291,151 @@ async fn before_resume_runs_in_the_paused_window_and_can_refuse_the_start() {
     m.wait_state(PowerState::Stopped, SETTLE)
         .await
         .expect("the failed start leaves the VM stopped");
+}
+
+// ---- vmlab-hv's control protocol (§22, ADR-0021) ----------------------------
+//
+// The same machines, controlled through the vmlab-hv adapter's real protocol
+// client against a fake control server built on `vmlab_hv_proto`'s `Server`
+// (`Script::vmlab_hv`): what the lifecycle does with resume, the stop ladder,
+// a guest's own power-off and online snapshots, when the answers arrive the
+// way vmlab-hv sends them.
+
+fn on_vmlab_hv(script: Script) -> Script {
+    Script {
+        vmlab_hv: true,
+        ..script
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_on_vmlab_hv_starts_becomes_ready_and_stops() {
+    let dirs = Dirs::new();
+    let (ctr, _hv) = container(
+        &dirs,
+        WORKLOAD,
+        on_vmlab_hv(Script {
+            runs: vec![Run {
+                ctl: vec![(
+                    Duration::ZERO,
+                    vmlab_cinit_proto::CtlEvent::Started { pid: 7 },
+                )],
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        }),
+    );
+    assert_eq!(
+        Machine::hypervisor(&*ctr),
+        crate::config::hypervisor::HypervisorKind::Vmlab
+    );
+    let (cbs, mut observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = ctr.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    assert_eq!(observed.ready_count(), 1);
+
+    ctr.stop(false).await.expect("graceful stop");
+    assert_eq!(observed.exit().await.reason, StopReason::Requested);
+    assert_eq!(ctr.state().await, PowerState::Stopped);
+}
+
+/// An online snapshot of a container on vmlab-hv goes over its protocol:
+/// captured, restored into the running micro-VM, and a name it does not have
+/// refused in vmlab-hv's own words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_on_vmlab_hv_snapshots_online_over_its_protocol() {
+    let dirs = Dirs::new();
+    let (ctr, _hv) = container(
+        &dirs,
+        WORKLOAD,
+        on_vmlab_hv(Script {
+            capabilities: Capabilities {
+                snapshots: true,
+                ..Capabilities::default()
+            },
+            ..Script::healthy()
+        }),
+    );
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = ctr.clone();
+
+    assert!(m.snapshot("s1").await.expect("snapshot"), "an online one");
+    m.clone()
+        .restore(lab.clone(), "s1", true)
+        .await
+        .expect("online restore");
+    assert_eq!(ctr.state().await, PowerState::Running);
+    let err = m
+        .clone()
+        .restore(lab, "nope", true)
+        .await
+        .expect_err("no such snapshot");
+    assert!(format!("{err:#}").contains("snapshot_not_found"), "{err:#}");
+    m.delete_snapshot("s1").await.expect("delete");
+    ctr.stop(true).await.expect("stop");
+}
+
+/// Without the capability in the handshake, the refusal a machine without
+/// snapshots always gave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vmlab_hv_that_does_not_advertise_snapshots_is_refused_them() {
+    let dirs = Dirs::new();
+    let (ctr, _hv) = container(&dirs, WORKLOAD, on_vmlab_hv(Script::healthy()));
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = ctr.clone();
+    let err = m.snapshot("s1").await.expect_err("not advertised");
+    assert!(format!("{err:#}").contains("web: not running"), "{err:#}");
+    ctr.stop(true).await.expect("stop");
+}
+
+/// `classify_exit` reads the guest-shutdown flag the moment the exit is
+/// seen; on vmlab-hv that flag comes from a `shutdown` event, so a guest
+/// powering itself off still reads as the guest's doing, and the emulator
+/// dying as a crash. Driven through a VM, whose exit monitor is the one
+/// that classifies — the adapter's control logic is the same for both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guest_power_off_over_vmlab_hvs_events_is_classified_as_the_guests() {
+    let dirs = Dirs::new();
+    let (vm1, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        on_vmlab_hv(Script {
+            runs: vec![Run::guest_powers_off(Duration::from_millis(300))],
+            ..Script::healthy()
+        }),
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm1, cbs).await.expect("start");
+    assert_eq!(observed.exit().await.reason, StopReason::GuestInitiated);
+
+    let dirs = Dirs::new();
+    let (vm2, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        on_vmlab_hv(Script {
+            runs: vec![Run::dies(Duration::from_millis(300), "signal: 11")],
+            ..Script::healthy()
+        }),
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm2, cbs).await.expect("start");
+    assert_eq!(observed.exit().await.reason, StopReason::Crashed);
+}
+
+/// The stop ladder's ACPI rung over vmlab-hv's `powerdown`: the guest acts
+/// on it, sends `shutdown`, exits — a requested stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stop_ladder_powers_down_over_vmlab_hv() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, on_vmlab_hv(Script::healthy()));
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    vm.stop(false).await.expect("stop");
+    assert_eq!(observed.exit().await.reason, StopReason::Requested);
+    assert_eq!(vm.state().await, PowerState::Stopped);
 }
