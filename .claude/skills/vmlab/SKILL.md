@@ -56,6 +56,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | Snapshots, screenshots, console recording, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |
 | Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
 | The host config file, WSL 2, guest OS profiles, `vmlab osinfo` | `references/host-profiles.md` |
+| Which hypervisor runs a machine: `hypervisor = "qemu" \| "vmlab"`, the host's `hypervisor {}` defaults, vmlab-hv and what it refuses | `references/host-profiles.md`, `references/containers.md`, `references/snapshots-vision.md` |
 | Old and odd guests: the legacy agent tier (DOS, Windows 9x, NT4–XP), TempleOS, `cpu_model`, `accel` | `references/host-profiles.md`, `references/templates.md` |
 | Host USB passthrough: `usb = true`, `vmlab usb`, selectors | `references/cli-machine.md`, `references/vm.md` |
 | Lab-level CLI verbs: `up`, `down`, `status`, `validate`, `destroy`, `pull`, `lab`, `worktree`, `logs`, `eventlog`, `tail`, `dns`, `fastpath`, `playbook`, `script` | `references/cli-lab.md` |

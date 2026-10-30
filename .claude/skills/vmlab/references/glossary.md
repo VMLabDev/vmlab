@@ -21,6 +21,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | halt | The state a workspace enters when a sync pass finds a path changed on both sides. The whole workspace stops, both directions, on that one machine; nothing is written or deleted. Resolved from the host with the `vmlab dev sync` verbs. See dev-machines.md. |
 | handler | An `on "<event>" { run = … }` block in the lab file that runs a wscript when the named event fires. See automation.md. |
 | host config | `vmlab-host.wcl`, the per-user file that sets host-wide values: the store location, the viewer command, the fast path mode, the trunk port and PSK. See host-profiles.md. |
+| hypervisor | The program that runs a machine: QEMU, or vmlab-hv. Named by the machine's `hypervisor`, else the host config's `hypervisor {}` default for its kind; never resolved through template or profile. See host-profiles.md. |
 | instance | A lab file run under the effective name `<declared>-<instance>` instead of its declared name, so one lab file can run from two directories at once. Chosen by `--instance`, then `VMLAB_INSTANCE`, then the name of the linked git worktree the lab is in; an empty value means none. Every name-keyed resource follows the effective name. See architecture.md. |
 | lab | One `lab "<name>" {}` in a `vmlab.wcl`: a set of machines and segments brought up and torn down together. The name it runs under, the declared one or an instance's, is its host-global identity. See lab-file.md. |
 | lab container | A `container {}` in a lab: an OCI image pulled like a docker image and run inside a micro-VM, so it is a lab machine in every respect. See containers.md. |
@@ -33,7 +34,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | machine | A VM or a lab container. Every verb that takes a machine name accepts either kind. See architecture.md. |
 | marker file | `.vmlab-sync-halt`, the file the syncer writes at the guest's workspace root when the workspace halts, and removes when the halt clears. It is the only signal the guest side receives. See dev-machines.md. |
 | media | A `media {}` block: a host folder packed into an ISO or floppy image and attached to a machine, cached by content. See vm.md. |
-| micro-VM | The minimal QEMU guest a lab container runs in: vmlab's own kernel and initramfs, with `vmlab-cinit` as PID 1, booting the image's flattened root filesystem. See containers.md. |
+| micro-VM | The minimal guest a lab container runs in, on QEMU or vmlab-hv: vmlab's own kernel and initramfs, with `vmlab-cinit` as PID 1, booting the image's flattened root filesystem. See containers.md. |
 | OCI artifact | The form a template takes on a registry: a multi-layer, multi-arch OCI package whose tags are the template's versions. See templates.md. |
 | playbook | A `playbook {}` block that runs a config-weave playbook inside the guest, as the machine identity. It has no login rung; anything that must land as a user belongs in a provision. See automation.md. |
 | profile | A guest OS profile: WCL data naming the firmware, devices, agent install route and defaults for a family of guests, such as `linux-modern` or `windows-server`. Shipped with vmlab and overridable. See host-profiles.md. |
@@ -56,6 +57,7 @@ The words vmlab uses, in alphabetical order. Where two words are easy to confuse
 | variant | A named, sealed disk state of a template version, stored as a qcow2 overlay on its base and selected with `#<name>`; no `#` selects the default variant. Not a snapshot. See templates.md. |
 | viewer | The VNC client `vmlab up` opens for a machine with `gui = true` and `vmlab console` opens on demand. Chosen from host config, else found on `PATH`. See snapshots-vision.md. |
 | VM | A `vm {}` in a lab: a QEMU guest booted from a linked clone of a template, or from a blank disk when scratch. See vm.md. |
+| vmlab-hv | vmlab's own hypervisor, one process per machine in place of QEMU, KVM only. Runs container micro-VMs today; a VM on it is refused. Selected with `hypervisor = "vmlab"`. See host-profiles.md. |
 | watchdog | A supervisor check that fires an event on a host condition, such as `host.disk_low` when the filesystem under the store or a lab's clones passes the configured threshold. See automation.md. |
 | workspace | The host directory `@dev(workspace = …)` names, mirrored into a dev machine as a guest-local copy of that canonical host tree. The host copy is what survives `destroy`. See dev-machines.md. |
 | worktree isolation | The rules a freeze turns on for the main lab and every worktree lab built on it: NAT refuses every new flow to the host, port forwards bind `127.0.0.1`, and a worktree lab's global segments join `<segment>@<worktree>`. Shown by `vmlab status`. See worktrees.md. |
