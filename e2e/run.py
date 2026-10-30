@@ -1,9 +1,15 @@
 """Run the vmlab end-to-end suite inside the e2e container.
 
     run.py [--only SCENARIO ...] [--keep] [--list]
+           [--hypervisor qemu|vmlab] [--vmlab-phase PHASE]
 
 Scenarios run in order; each reports against the feature catalogue. The run
 fails when any feature failed or no scenario covered it.
+
+`--hypervisor vmlab` puts the suite's machines on vmlab-hv through the host
+config's default (PRD §22). A scenario with no feature inside the phases it
+has delivered (`--vmlab-phase`, default in `features.py`) does not run, and
+its features are skipped naming their phase.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import traceback
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+from features import FEATURES, PHASE_ORDER, VMLAB_DELIVERED  # noqa: E402
 from harness import RESULTS, Harness, ScenarioFailed  # noqa: E402
 
 # Order matters: later scenarios use the template `template` builds.
@@ -61,11 +68,33 @@ def start_registry() -> subprocess.Popen:
     raise SystemExit("registry did not start")
 
 
+def scenario_features(name: str) -> set[str]:
+    """The features a scenario names, which are the ones it reports."""
+    text = (pathlib.Path(__file__).resolve().parent / "scenarios" / f"{name}.py").read_text()
+    return {fid for fid in FEATURES if f'"{fid}"' in text}
+
+
+def write_host_config(h: Harness) -> None:
+    """The host config the run's supervisor reads: only what selects the
+    hypervisor, and nothing at all on QEMU, which is the default."""
+    lines = h.host_config()
+    if not lines:
+        return
+    path = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "vmlab" / "config.wcl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"import <vmlab-host.wcl>\n\nhost {{\n{lines}}}\n")
+    h.log.write(f"[setup] {path}:\n{path.read_text()}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--keep", action="store_true", help="leave labs up for inspection")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--hypervisor", choices=["qemu", "vmlab"], default="qemu",
+                    help="the hypervisor the suite's machines run on (default qemu)")
+    ap.add_argument("--vmlab-phase", choices=PHASE_ORDER[1:], default=VMLAB_DELIVERED,
+                    help=f"the last vmlab-hv phase delivered (default {VMLAB_DELIVERED})")
     args = ap.parse_args()
 
     if args.list:
@@ -76,17 +105,24 @@ def main() -> int:
     if unknown:
         raise SystemExit(f"unknown scenario(s): {', '.join(sorted(unknown))}")
 
+    h = Harness(keep=args.keep, hypervisor=args.hypervisor, delivered=args.vmlab_phase)
+    # On vmlab-hv, a scenario none of whose features apply yet does not run;
+    # the report skips its features by phase.
+    runnable = [n for n in chosen if any(not h.out_of_scope(f) for f in scenario_features(n))]
+    for name in chosen:
+        if name not in runnable:
+            print(f"== {name}\n   skipped: no feature in scope on {args.hypervisor}", flush=True)
+    write_host_config(h)
     registry = start_registry()
-    h = Harness(keep=args.keep)
     try:
-        if "template" not in chosen:
+        if "template" not in runnable:
             # Every other scenario boots the e2e template; build it without
             # reporting on it.
             h.scenario = "base"
             print("== base template", flush=True)
             importlib.import_module("scenarios.template").ensure_base(h)
         for name in SCENARIOS:
-            if name not in chosen:
+            if name not in runnable:
                 continue
             mod = importlib.import_module(f"scenarios.{name}")
             h.scenario = name
@@ -107,12 +143,9 @@ def main() -> int:
     if args.only:
         # A partial run expects exactly the features its scenarios name, so a
         # feature one of them skipped still reports as missing.
-        from features import FEATURES
-
-        here = pathlib.Path(__file__).resolve().parent / "scenarios"
-        named = "\n".join((here / f"{n}.py").read_text() for n in chosen)
+        named = set().union(*(scenario_features(n) for n in chosen))
         for fid in list(FEATURES):
-            if f'"{fid}"' not in named:
+            if fid not in named:
                 FEATURES.pop(fid)
     code = h.report()
     give_back_results()
