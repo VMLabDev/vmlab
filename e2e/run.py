@@ -33,6 +33,7 @@ SCENARIOS = [
     "template",
     "variants",
     "core",
+    "firmware",
     "sleep",
     "guest",
     "network",
@@ -127,7 +128,8 @@ def main() -> int:
                 continue
             mod = importlib.import_module(f"scenarios.{name}")
             h.scenario = name
-            write_host_config(h, vms=h.vms_follow(scenario_features(name)))
+            h.vms_here = h.hypervisor == "qemu" or h.vms_follow(scenario_features(name), name)
+            write_host_config(h, vms=h.vms_here)
             started = time.monotonic()
             print(f"== {name}", flush=True)
             try:
