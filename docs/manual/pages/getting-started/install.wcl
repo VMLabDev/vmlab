@@ -219,7 +219,7 @@ SRC
     The installer places them for you. Every release carries
     `vmlab-guest-<version>.tar.gz`, built by CI with every target: the
     micro-VM asset for x86_64 and aarch64, the Rust agent for Linux x86_64,
-    aarch64, riscv64 and x86 and for Windows x86_64 and x86, and the legacy
+    aarch64, riscv64 and x86, for Windows x86_64 and x86 and for Intel macOS, and the legacy
     agents for Windows NT, Windows 9x, DOS, old 32-bit Linux and TempleOS.
     The installer downloads it from the same release as the binary, checks it
     against the `.sha256` published beside it, unpacks it next to the target
@@ -262,6 +262,13 @@ SRC
     and x86. The Windows targets need `x86_64-w64-mingw32-gcc` and
     `i686-w64-mingw32-gcc` from mingw-w64 and are skipped with a warning
     when absent. The riscv64 target is best-effort and skipped the same way.
+    The macOS target, `macos-x86_64`, links through zig with `cargo zigbuild`,
+    so it needs no Apple SDK: it needs `zig` and `cargo-zigbuild` on `PATH`
+    and the `x86_64-apple-darwin` Rust target, and is skipped with a warning
+    when either tool is absent. The binary is then ad-hoc signed with
+    `rcodesign`; without it the binary is left unsigned, which an Intel Mac
+    runs anyway, and the strict build refuses. `scripts/guest-toolchains.sh
+    zig` installs the three pinned tools.
     `guest/build-agent-legacy.sh` builds the legacy agents: the Windows NT
     build with mingw-w64, the Windows 9x and DOS builds with OpenWatcom v2
     (found through `$WATCOM`, else `~/.local/opt/open-watcom-v2`), and the

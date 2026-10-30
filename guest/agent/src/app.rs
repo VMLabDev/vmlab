@@ -44,7 +44,7 @@ const DIAL_BUDGET: Duration = Duration::from_secs(10);
 const LISTENER_BUDGET: Duration = Duration::from_secs(120);
 
 /// What the open asked to run, for the modes that run something.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct AppSpec {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -55,7 +55,7 @@ pub struct AppSpec {
 #[derive(Clone, Copy)]
 struct Tuning {
     /// How long an accepted connection waits for the host to adopt it.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     grace: Duration,
     /// Where an RDP connection is dialled, on the guest's loopback.
     rdp_port: u16,
@@ -133,7 +133,7 @@ enum AppSession {
     /// Connections are dialled on demand; there is nothing to hold.
     Rdp,
     /// Connections are accepted, parked and adopted.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Parking(Arc<parking::Endpoint>),
 }
 
@@ -141,7 +141,7 @@ impl AppSession {
     fn close(&self) {
         match self {
             AppSession::Rdp => {}
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             AppSession::Parking(endpoint) => endpoint.close(),
         }
     }
@@ -158,11 +158,11 @@ pub fn open(
 ) {
     match mode {
         AppMode::Rdp => open_rdp(mux, platform, id, logon),
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         AppMode::Waypipe => {
             parking::open(mux, platform, id, parking::Protocol::Waypipe, spec, logon)
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         AppMode::X11 { cookie } => match app::valid_cookie(&cookie) {
             true => parking::open(
                 mux,
@@ -174,7 +174,7 @@ pub fn open(
             ),
             false => mux.send_error(Some(id), "app: an X11 cookie is 32 lowercase hex digits"),
         },
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         AppMode::Waypipe | AppMode::X11 { .. } => {
             let _ = spec;
             mux.send_error(
@@ -285,7 +285,7 @@ pub fn open_conn(mux: &Mux, id: u32, app: u32) {
     };
     match &*session {
         AppSession::Rdp => dial_rdp(mux, id, mux.apps().tuning().rdp_port),
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         AppSession::Parking(endpoint) => match endpoint.adopt(mux.apps().tuning().grace) {
             Some(stream) => match Conn::unix(stream) {
                 Ok(conn) => serve(mux, id, conn),
@@ -379,7 +379,7 @@ impl Conn {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn unix(stream: std::os::unix::net::UnixStream) -> std::io::Result<Conn> {
         let (reader, writer) = (stream.try_clone()?, stream.try_clone()?);
         Ok(Conn {
@@ -425,7 +425,7 @@ fn register_conn(
 }
 
 /// Carry an adopted connection as channel `id`.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn serve(mux: &Mux, id: u32, conn: Conn) {
     let shared = Arc::new(Mutex::new(Shared {
         shutdown: Some(conn.shutdown.clone()),
@@ -539,7 +539,7 @@ fn finish_half(mux: &Mux, id: u32, halves: &AtomicU8) {
 // ---- the parking modes: waypipe and X11 -------------------------------------
 
 /// Where a waypipe or X11 session's guest end lives, as the platform made it.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub struct AppHome {
     /// The session's private directory as the agent opens it. The platform
     /// has created it, mode 0700, owned by [`owner`](Self::owner).
@@ -556,7 +556,7 @@ pub struct AppHome {
     pub hostname: String,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod parking {
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, Read};
@@ -1030,5 +1030,5 @@ mod parking {
     pub(crate) const FAMILY_WILD: u16 = 65535;
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use parking::{FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, xauthority};

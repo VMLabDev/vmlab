@@ -49,6 +49,13 @@ page cmd_clipboard {
     working after the screen locks.
   DOC
 
+  p <<DOC
+    A macOS agent advertises `clipboard` for the same reason, and reaches the
+    pasteboard of whoever is logged in at the console. At the login window it
+    refuses with `nobody is logged in at the console, so there is no
+    pasteboard to reach`.
+  DOC
+
   h2 "vmlab clipboard get"
 
   code sh { source = "vmlab clipboard get [OPTIONS] <MACHINE>" }
@@ -115,7 +122,8 @@ page cmd_clipboard {
     (`not_found`) means the lab declares no machine by that name. Exit 6
     (`unsupported`) means the agent lacks the `clipboard` feature. A machine
     that is not running, an agent that is not answering, a guest the agent
-    cannot reach the clipboard of (nobody logged on to a Windows desktop),
+    cannot reach the clipboard of (nobody logged on to a Windows desktop or
+    at a Mac's console),
     and a request that times out all exit 1 (`failed`).
     A qualified reference to a lab that is not running exits 1. A usage
     error exits 2.

@@ -218,6 +218,35 @@ page guide_templates {
     A, D, E and F for their source.
   DOC
 
+  p <<DOC
+    For an x86_64 guest the ISO also carries the macOS agent under `macos/`,
+    with `install.sh` and `firstboot.sh` beside it. A fresh macOS runs no
+    unattended hook, so the agent goes in offline: the build boots the
+    Recovery system, opens its Terminal and types the install line, which
+    writes onto the new system's Data volume. Recovery mounts the ISO at
+    `/Volumes/VMLAB`.
+  DOC
+
+  code sh { source = <<'SRC'
+/Volumes/VMLAB/macos/install.sh --user admin --password 'pw' --full-name 'Lab Admin'
+SRC
+  }
+
+  p <<DOC
+    It installs `/Library/vmlab/vmlab-agent`, the LaunchDaemon
+    `dev.vmlab.agent` that runs it as root at every boot and restarts it if
+    it exits, and the marker that skips Setup Assistant; it also removes a
+    leftover `.AppleSetupTermsOfService`, which would bring Setup Assistant's
+    Terms page back on its own. With `--user`, the first boot creates that
+    account as an administrator with `sysadminctl`, marks its per-user setup
+    screens seen so a login lands on the desktop, then deletes itself and the
+    file holding the password. Without `--user` no account is made and the
+    agent, as root, is the only way in. The Data volume defaults to
+    `/Volumes/Macintosh HD - Data`; name another as the last argument. The
+    agent's log is `/var/log/vmlab-agent.log`, and the first boot's is
+    `/var/log/vmlab-firstboot.log`.
+  DOC
+
   h3 "Versions"
 
   p <<DOC

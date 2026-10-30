@@ -134,3 +134,14 @@ not work here" is only answerable if you can see which one you got.
 The password is not verified: root needs no credential to become an account,
 which is why the container floor costs nothing. An account not in the guest's
 passwd fails by name.
+
+### macOS: the same route, through launchd
+
+A macOS session takes the PAM route: `su -l` reads `/etc/pam.d/su`, whose session
+module `pam_launchd` puts the command in the account's own launchd domain. The
+banner says `via a PAM login session (/usr/bin/su -l)`. Accounts come from the
+directory service, not `/etc/passwd`, so one made with `sysadminctl` is found and a
+missing one fails naming `dscl . -list /Users`. There is no `XDG_RUNTIME_DIR`
+(macOS has no `/run/user`; launchd gives `$TMPDIR`). `vmlab cp --user` reads and
+writes through Darwin's per-thread credential, which carries the account's
+groups.

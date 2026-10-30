@@ -9,8 +9,9 @@
 # guarded by the require-* helpers in ../shared.just, so a missing tool reports
 # as a missing tool rather than as a confusing build failure.
 #
-# The agent's Windows code is inside the bar: `guest-windows-check` lints it for
-# x86_64-pc-windows-gnu, which needs that one rustup target and no linker.
+# The agent's Windows and macOS code is inside the bar: `guest-windows-check`
+# and `guest-macos-check` lint it for x86_64-pc-windows-gnu and
+# x86_64-apple-darwin, which need those two rustup targets and no linker.
 #
 # Deliberately outside the bar: the privileged fast-path tests
 # (`just fastpath-test` — sudo, CAP_BPF, an XDP-capable kernel), the guest asset
@@ -30,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: lint fmt-check test guest-check guest-windows-check ebpf-verify
+check: lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify
 
 # Run clippy with warnings as errors
 [group('ci')]
@@ -62,6 +63,11 @@ guest-check: (guest-crate-check 'cinit-proto') (guest-crate-check 'cinit') (gues
 [group('ci')]
 guest-windows-check: require-cargo (require-rust-target 'x86_64-pc-windows-gnu')
 	cargo clippy --target x86_64-pc-windows-gnu --manifest-path guest/agent/Cargo.toml -- -D warnings
+
+# Lint the agent's macOS code (type-checks without zig or an Apple SDK)
+[group('ci')]
+guest-macos-check: require-cargo (require-rust-target 'x86_64-apple-darwin')
+	cargo clippy --target x86_64-apple-darwin --manifest-path guest/agent/Cargo.toml -- -D warnings
 
 # Cross-build the Linux agent binaries (musl targets; CI only)
 [group('ci')]
