@@ -475,6 +475,10 @@ pub enum StreamEvent {
         h: u16,
         rgba: Vec<u8>,
     },
+    /// Where the guest's pointer is — its hotspot, in framebuffer pixels —
+    /// and whether it is shown. RFB never says; vmlab-hv's native frame
+    /// protocol does (`crate::hvdisplay`).
+    Pointer { x: i32, y: i32, visible: bool },
 }
 
 /// A framebuffer being assembled from update rectangles, with a record of

@@ -2538,6 +2538,7 @@ dependencies = [
  "tracing-subscriber",
  "vmlab-agent-proto",
  "vmlab-cinit-proto",
+ "vmlab-hv-display",
  "vmlab-hv-proto",
  "vmlab-tap",
  "wcl_lang",
@@ -2561,9 +2562,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmlab-hv-display"
+version = "0.1.0"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=710125e9d5607412965958afd30056e1f786d591#710125e9d5607412965958afd30056e1f786d591"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "vmlab-hv-proto"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=f7a018c8c7e0aa16a7be44ab0796f6ff16d49e15#f7a018c8c7e0aa16a7be44ab0796f6ff16d49e15"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=710125e9d5607412965958afd30056e1f786d591#710125e9d5607412965958afd30056e1f786d591"
 dependencies = [
  "serde",
  "serde_json",

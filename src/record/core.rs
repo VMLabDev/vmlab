@@ -133,8 +133,11 @@ pub struct Core {
     /// The last shape the guest itself defined, kept while `cursor` is
     /// hidden so a stale re-announcement of it can be recognised.
     defined: Option<CursorShape>,
-    /// Last pointer position vmlab sent, source coordinates.
+    /// Last pointer position vmlab sent — or the guest reported, where the
+    /// display says (vmlab-hv's native protocol) — source coordinates.
     pointer: Option<(i64, i64)>,
+    /// The guest hid its pointer (vmlab-hv's native protocol).
+    pointer_hidden: bool,
     ripples: Vec<Ripple>,
     /// Intervals whose end has been processed.
     intervals: u64,
@@ -161,6 +164,7 @@ impl Core {
             cursor: None,
             defined: None,
             pointer: None,
+            pointer_hidden: false,
             ripples: Vec::new(),
             intervals: 0,
             video: Duration::ZERO,
@@ -201,6 +205,7 @@ impl Core {
     pub fn connected(&mut self, at: Duration, w: u16, h: u16) {
         self.advance(at);
         self.cursor = None;
+        self.pointer_hidden = false;
         self.resize(w, h);
     }
 
@@ -280,6 +285,18 @@ impl Core {
         }
         self.defined = Some(shape.clone());
         self.cursor = Some(shape);
+    }
+
+    /// The display reported where the guest's pointer is and whether it is
+    /// shown — vmlab-hv's native protocol does; RFB never says. A move keeps
+    /// the interval active, as an input does, so it reaches the video.
+    pub fn pointer_state(&mut self, at: Duration, x: i64, y: i64, visible: bool) {
+        self.advance(at);
+        if self.pointer != Some((x, y)) || self.pointer_hidden == visible {
+            self.input_in_interval = true;
+        }
+        self.pointer = Some((x, y));
+        self.pointer_hidden = !visible;
     }
 
     /// vmlab sent `event` to the display.
@@ -480,7 +497,9 @@ impl Core {
                     draw_ripple(&mut rgb, size, cx, cy, progress);
                 }
             }
-            if let (Some(cursor), Some((px, py))) = (self.cursor.as_ref(), self.pointer) {
+            if let (Some(cursor), Some((px, py)), false) =
+                (self.cursor.as_ref(), self.pointer, self.pointer_hidden)
+            {
                 draw_cursor(&mut rgb, size, &p, cursor, px, py);
             }
         }
