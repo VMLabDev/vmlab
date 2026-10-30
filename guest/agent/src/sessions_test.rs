@@ -609,6 +609,7 @@ fn tail_sends_backlog_then_appends() {
 fn metrics_subscription_emits_samples() {
     let (mux, mut cap) = capture_mux();
     let p = platform();
+    let subscribed = std::time::Instant::now();
     open(&mux, &p, HostMsg::SubscribeMetrics { interval_secs: 1 });
     match cap.ctrl() {
         AgentMsg::Metrics {
@@ -618,6 +619,9 @@ fn metrics_subscription_emits_samples() {
         } => {
             assert!(mem_total > 0);
             assert!(mem_used <= mem_total);
+            // The first sample covers a whole interval, not the instant
+            // after the subscribe (#185).
+            assert!(subscribed.elapsed() >= std::time::Duration::from_millis(900));
         }
         other => panic!("expected metrics, got {other:?}"),
     }
