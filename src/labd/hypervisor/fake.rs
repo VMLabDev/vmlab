@@ -761,10 +761,19 @@ fn serve_vmlab_hv(
     let m = machine.clone();
     let (ignores_powerdown, ignores_quit) = (run.ignores_powerdown, run.ignores_quit);
     let tx = std::sync::Mutex::new(power_off.clone());
+    // S3, as vmlab-hv reports it: `suspend` as the guest sleeps, and a
+    // `resume` while it is asleep wakes it with `wakeup`.
+    let (wake, woken) = std::sync::mpsc::channel::<Event>();
+    let wake_tx = std::sync::Mutex::new(wake.clone());
     let server = Server::new("fake-vmlab-hv", capabilities, move |command: Command| {
         let ok = Outcome::Ok { status: None };
         let mut snapshots = m.snapshots.lock().expect("fake snapshots lock");
         match command {
+            Command::Resume if *m.asleep.borrow() => {
+                m.asleep.send_replace(false);
+                let _ = wake_tx.lock().expect("wake sender").send(Event::Wakeup);
+                ok
+            }
             Command::Status | Command::Resume | Command::Pause => ok,
             Command::Powerdown => {
                 if !ignores_powerdown {
@@ -797,7 +806,22 @@ fn serve_vmlab_hv(
         }
     });
     let broadcaster = server.clone();
+    let sleeps = server.clone();
     std::thread::spawn(move || server.serve(listener));
+    std::thread::spawn(move || {
+        while let Ok(event) = woken.recv() {
+            sleeps.broadcast(event);
+        }
+    });
+    if let Some(after) = run.sleeps_after {
+        let m = machine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            if m.is_running() {
+                let _ = wake.send(Event::Suspend);
+            }
+        });
+    }
     let m = machine.clone();
     std::thread::spawn(move || {
         if let Ok(reason) = powered_off.recv() {

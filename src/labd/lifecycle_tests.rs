@@ -2594,6 +2594,35 @@ async fn a_guest_power_off_over_vmlab_hvs_events_is_classified_as_the_guests() {
     assert_eq!(observed.exit().await.reason, StopReason::Crashed);
 }
 
+/// S3 over vmlab-hv's protocol: the guest's `suspend` is seen, and a
+/// `prevent_sleep` VM is woken with vmlab-hv's `resume`, which it answers
+/// with `wakeup`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prevent_sleep_wakes_a_vmlab_hv_guest_with_resume() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        &sleepy_vm(true),
+        on_vmlab_hv(Script {
+            runs: vec![Run::guest_sleeps(Duration::from_millis(300))],
+            ..Script::healthy()
+        }),
+    );
+    let (events, mut rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = vm.clone();
+
+    m.clone().start(lab).await.expect("start");
+    let seen = collect_events(&mut rx, &["vm.suspended", "vm.woken"], 2).await;
+    assert_eq!(seen[0].event, "vm.suspended");
+    assert_eq!(seen[1].event, "vm.woken");
+    assert_eq!(seen[1].data["cause"], "prevent_sleep");
+    m.wait_state(PowerState::Running, SETTLE)
+        .await
+        .expect("awake again");
+    vm.stop(true).await.expect("stop");
+}
+
 /// vmlab-hv ends when the guest resets itself, where QEMU resets in place
 /// (PRD §22): the VM boots it again, and to the lab it is one run — no exit,
 /// no second `ready` — that a later stop still ends as asked.
