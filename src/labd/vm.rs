@@ -1652,6 +1652,11 @@ impl super::machine::Machine for VmInstance {
         lab.ensure_pulled(&self.cfg.name).await?;
         let events = lab.events().clone();
         events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
+        self.agent.set_handshake_hook(super::boot_clock::lab_hook(
+            &self.cfg.name,
+            self.cfg.clock,
+            events.clone(),
+        ));
 
         std::fs::create_dir_all(&self.dirs.run)?;
         let attachments = super::machine::attach_all_nics(&*self, &*lab).await?;

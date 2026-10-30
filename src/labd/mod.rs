@@ -5,6 +5,7 @@
 
 pub mod agent_repair;
 pub mod app_share;
+pub mod boot_clock;
 pub mod boot_id;
 pub mod container;
 pub mod container_ctl;

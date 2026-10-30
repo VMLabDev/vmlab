@@ -1266,6 +1266,11 @@ impl super::machine::Machine for ContainerInstance {
             "container.starting",
             serde_json::json!({"container": self.cfg.name}),
         );
+        self.agent.set_handshake_hook(super::boot_clock::lab_hook(
+            &self.cfg.name,
+            self.cfg.clock,
+            events.clone(),
+        ));
 
         std::fs::create_dir_all(&self.dirs.run)?;
         // The micro-VM connects to the sockets itself, so the attachments are
