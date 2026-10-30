@@ -1,6 +1,6 @@
 # ADR-0001: The Hypervisor seam substitutes the host, and Machine is the test surface
 
-- **Status**: Accepted
+- **Status**: Accepted, amended 2026-10-30
 - **Date**: 2026-07-31
 - **Supersedes**: nothing
 - **Related**: [ADR-0002](0002-machine-is-the-only-route-to-a-machine.md)
@@ -87,3 +87,21 @@ Concretely:
 - Adapter drift: a fake that diverges from QEMU's real behaviour turns green
   tests into false confidence. The fake's failure `Script` should model failures
   that have actually been observed, not invented ones.
+
+## Amendment (2026-10-30): capabilities and the launch description
+
+[ADR-0020](0020-a-hypervisor-reports-capabilities-and-composes-its-own-launch.md)
+finishes moving the QMP client behind the seam and moves argv composition
+below it.
+
+- The seam no longer hands out a QMP client at all. What a running machine can
+  do beyond the lifecycle — online snapshots, input, frames, hot-plug, media —
+  is a capability `Control` reports or does not.
+- Composing the launch is no longer outside the seam. The seam receives a
+  typed `Launch` (resolved hardware plus the runtime paths its caller
+  computed), and each adapter composes its own; QEMU's calls the same pure
+  argv builders. Resolving hardware stays above the seam.
+- "Behaviour that genuinely requires a hypervisor stays out of reach" now
+  means what that behaviour does to a guest. The caller's side of it — the
+  ordering around a restore, the refusal when a capability is absent — is
+  tested against the fake.
