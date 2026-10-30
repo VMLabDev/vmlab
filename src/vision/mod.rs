@@ -19,5 +19,5 @@ mod ocr;
 mod screenshot;
 
 pub use matching::{Match, MatchOptions, find_template};
-pub use ocr::ocr;
+pub use ocr::{Layout, OcrOptions, ocr};
 pub use screenshot::{load_screen, save_png};

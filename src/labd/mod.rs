@@ -675,9 +675,13 @@ impl Handler<LabRequest> for LabdHandler {
                     .await?;
                 Ok(json!(true))
             }
-            LabRequest::MachineOcr { machine, region } => {
+            LabRequest::MachineOcr {
+                machine,
+                region,
+                options,
+            } => {
                 let text = display_of(lab, &machine)?
-                    .ocr(region.map(Region::as_tuple))
+                    .ocr(region.map(Region::as_tuple), &options)
                     .await?;
                 Ok(json!(text))
             }
