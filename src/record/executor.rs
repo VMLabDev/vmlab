@@ -1,10 +1,12 @@
 //! The recorder's executor: the RFB read loop, the ffmpeg child and the
 //! clock, around the pure [`Core`].
 //!
-//! Three concerns, three tasks. The *reader* owns the VNC connection and
-//! feeds every decoded rectangle to the core; when the connection drops it
-//! marks the gap and retries the socket until it is back (a `vm restart` or
-//! a snapshot restore replaces QEMU under it, D6). The *input* task drains
+//! Three concerns, three tasks. The *reader* owns the display connection —
+//! RFB on QEMU's VNC socket, or vmlab-hv's native frame protocol on its
+//! `display.sock` ([`StreamSource`]) — and feeds every decoded rectangle to
+//! the core; when the connection drops it marks the gap and retries the
+//! socket until it is back (a `vm restart` or a snapshot restore replaces the
+//! hypervisor under it, D6). The *input* task drains
 //! the display's feed into the core. The *clock* — the recorder task itself
 //! — ticks at the frame rate, takes the frames due and writes them to
 //! ffmpeg. Reading is never blocked by encoding: the reader only ever takes
@@ -22,15 +24,71 @@ use super::core::{Core, CursorShape};
 use super::encoder::{Encoder, EncoderPlan};
 use super::input::TimedInput;
 use super::{Settings, timeline_path};
+use crate::hvdisplay::NativeStream;
 use crate::vnc::{StreamEvent, VncClient};
 
 /// How often a dropped connection is retried.
 const RECONNECT_EVERY: Duration = Duration::from_millis(250);
 
+/// Where a recording's frames come from: a socket path, so a reconnect finds
+/// the hypervisor a restart put in place of the old one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamSource {
+    /// An RFB server: QEMU's `-vnc` socket.
+    Vnc(PathBuf),
+    /// vmlab-hv's native frame protocol (§22, phase 2b): damage, cursor
+    /// shape and position, resizes, with no RFB in between (HV phase-2 D8).
+    Native(PathBuf),
+}
+
+impl StreamSource {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Vnc(p) | Self::Native(p) => p,
+        }
+    }
+}
+
+/// One live connection to a [`StreamSource`].
+enum Stream {
+    Vnc(VncClient),
+    Native(NativeStream),
+}
+
+impl Stream {
+    async fn connect(source: &StreamSource) -> Result<Self> {
+        Ok(match source {
+            StreamSource::Vnc(sock) => {
+                let mut client = VncClient::connect(sock).await?;
+                client
+                    .start_stream()
+                    .await
+                    .context("starting the VNC stream")?;
+                Self::Vnc(client)
+            }
+            StreamSource::Native(sock) => Self::Native(NativeStream::connect(sock).await?),
+        })
+    }
+
+    fn size(&self) -> (u16, u16) {
+        match self {
+            Self::Vnc(c) => (c.width, c.height),
+            Self::Native(c) => (c.width, c.height),
+        }
+    }
+
+    async fn next_update(&mut self) -> Result<Vec<StreamEvent>> {
+        match self {
+            Self::Vnc(c) => c.next_update().await,
+            Self::Native(c) => c.next_update().await,
+        }
+    }
+}
+
 /// What a recorder needs: nothing about a lab (D18).
 pub struct RecorderSpec {
-    /// The VM's VNC unix socket.
-    pub sock: PathBuf,
+    /// Where the machine's frames come from.
+    pub source: StreamSource,
     /// Where the video goes; its extension chose the format.
     pub output: PathBuf,
     pub settings: Settings,
@@ -66,21 +124,18 @@ impl Recorder {
     /// socket that refuses or an ffmpeg that fails to start are errors here,
     /// not later.
     pub async fn start(spec: RecorderSpec) -> Result<Self> {
-        let mut client = VncClient::connect(&spec.sock).await?;
-        client
-            .start_stream()
+        let client = Stream::connect(&spec.source)
             .await
-            .context("starting the VNC stream")?;
+            .with_context(|| format!("connecting to {}", spec.source.path().display()))?;
         let plan = EncoderPlan::new(&spec.ffmpeg, &spec.settings, &spec.output);
         let encoder = Encoder::spawn(&plan, &spec.output)?;
 
         let started = Instant::now();
         let core = Arc::new(Mutex::new(Core::new(spec.settings.clone())));
-        core.lock().unwrap_or_else(|e| e.into_inner()).connected(
-            Duration::ZERO,
-            client.width,
-            client.height,
-        );
+        let (w, h) = client.size();
+        core.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connected(Duration::ZERO, w, h);
         let (stop, stopped) = watch::channel(false);
         let task = tokio::spawn(run(spec, client, encoder, core, started, stopped));
         Ok(Self {
@@ -106,21 +161,27 @@ impl Recorder {
 
 async fn run(
     spec: RecorderSpec,
-    client: VncClient,
+    client: Stream,
     mut encoder: Encoder,
     core: Arc<Mutex<Core>>,
     started: Instant,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<Finished> {
     let RecorderSpec {
-        sock,
+        source,
         output,
         settings,
         inputs,
         ..
     } = spec;
     let reader_stop = stopped.clone();
-    let reader = tokio::spawn(read_loop(sock, client, core.clone(), started, reader_stop));
+    let reader = tokio::spawn(read_loop(
+        source,
+        client,
+        core.clone(),
+        started,
+        reader_stop,
+    ));
     let feed = tokio::spawn(input_loop(inputs, core.clone(), started));
 
     let dt = Duration::from_nanos(1_000_000_000 / u64::from(settings.fps));
@@ -219,8 +280,8 @@ async fn run(
 
 /// Feed every update to the core; on a drop, mark the gap and reconnect.
 async fn read_loop(
-    sock: PathBuf,
-    mut client: VncClient,
+    source: StreamSource,
+    mut client: Stream,
     core: Arc<Mutex<Core>>,
     started: Instant,
     mut stopped: watch::Receiver<bool>,
@@ -254,11 +315,14 @@ async fn read_loop(
                                     rgba,
                                 },
                             ),
+                            StreamEvent::Pointer { x, y, visible } => {
+                                c.pointer_state(at, i64::from(x), i64::from(y), visible)
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("recorder: VNC stream ended: {e:#}");
+                    tracing::debug!("recorder: display stream ended: {e:#}");
                     break;
                 }
             }
@@ -266,20 +330,18 @@ async fn read_loop(
         core.lock()
             .unwrap_or_else(|e| e.into_inner())
             .disconnected(started.elapsed());
-        // Retry until the socket is back (a restart's new QEMU) or we stop.
+        // Retry until the socket is back (a restart's new hypervisor) or we
+        // stop.
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(RECONNECT_EVERY) => {}
                 _ = stopped.changed() => return,
             }
-            if let Ok(mut c) = VncClient::connect(&sock).await
-                && c.start_stream().await.is_ok()
-            {
-                core.lock().unwrap_or_else(|e| e.into_inner()).connected(
-                    started.elapsed(),
-                    c.width,
-                    c.height,
-                );
+            if let Ok(c) = Stream::connect(&source).await {
+                let (w, h) = c.size();
+                core.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .connected(started.elapsed(), w, h);
                 client = c;
                 break;
             }
@@ -334,7 +396,7 @@ mod tests {
         .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let rec = Recorder::start(RecorderSpec {
-            sock: server.path.clone(),
+            source: StreamSource::Vnc(server.path.clone()),
             output: output.clone(),
             settings,
             ffmpeg,
@@ -389,7 +451,7 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let output = dir.path().join("x.mp4");
         let err = Recorder::start(RecorderSpec {
-            sock: dir.path().join("missing.sock"),
+            source: StreamSource::Vnc(dir.path().join("missing.sock")),
             output: output.clone(),
             settings: Settings::resolve(&output, &RecordOptions::default()).unwrap(),
             ffmpeg: PathBuf::from("/nonexistent/ffmpeg"),
@@ -425,7 +487,7 @@ mod tests {
         .unwrap();
         let (_tx, rx) = mpsc::unbounded_channel();
         let rec = Recorder::start(RecorderSpec {
-            sock: server.path.clone(),
+            source: StreamSource::Vnc(server.path.clone()),
             output,
             settings,
             ffmpeg,
@@ -444,5 +506,64 @@ mod tests {
             "{done:?}"
         );
         assert!(done.duration >= Duration::from_millis(500));
+    }
+
+    /// The native source: vmlab-hv's frame protocol, across the socket going
+    /// away and coming back (a `vm restart`), with the guest's own cursor.
+    #[tokio::test]
+    async fn records_the_native_stream_across_a_restart() {
+        let avail = probe(None).await;
+        let Ok(ffmpeg) = check(&avail, Format::Mp4) else {
+            eprintln!("skipping: no ffmpeg with libx264 on this host");
+            return;
+        };
+        let display = crate::hvdisplay::fake::spawn(32, 16);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("native.mp4");
+        let settings = Settings::resolve(
+            &output,
+            &RecordOptions {
+                fps: Some(20),
+                size: Some(Size::new(64, 32)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let rec = Recorder::start(RecorderSpec {
+            source: StreamSource::Native(display.path.clone()),
+            output: output.clone(),
+            settings,
+            ffmpeg,
+            inputs: rx,
+        })
+        .await
+        .unwrap();
+        display.cursor(vmlab_hv_display::Cursor {
+            width: 2,
+            height: 2,
+            hot_x: 0,
+            hot_y: 0,
+            argb: vec![255; 16],
+            x: 3,
+            y: 3,
+            visible: true,
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        display.vanish();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        display.reappear();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            display
+                .connections
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "reconnected once the socket was back"
+        );
+        assert!(!rec.is_finished());
+        let done = rec.stop().await.unwrap();
+        assert!(done.duration >= Duration::from_millis(1000), "{done:?}");
+        assert!(output.metadata().unwrap().len() > 0);
     }
 }

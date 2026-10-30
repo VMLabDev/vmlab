@@ -579,8 +579,7 @@ pub trait Machine: Send + Sync + 'static {
     /// The hypervisor this machine runs on (PRD §22): its own `hypervisor`,
     /// else the host config's default for its kind. Recorded on every
     /// snapshot, because an online one restores only under the hypervisor
-    /// that took it. QEMU unless the machine says otherwise — every VM, until
-    /// vmlab-hv's phase 2.
+    /// that took it. QEMU unless the machine says otherwise.
     fn hypervisor(&self) -> crate::config::hypervisor::HypervisorKind {
         crate::config::hypervisor::HypervisorKind::Qemu
     }

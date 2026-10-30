@@ -343,14 +343,20 @@ pub trait Hypervisor: Send + Sync + 'static {
 }
 
 /// The adapter for a machine on `kind` (PRD §22): QEMU, or vmlab-hv at the
-/// host config's `vmlab_hv` path (else on `PATH`).
+/// host config's `vmlab_hv` path (else on `PATH`). `vm` says the machine is a
+/// VM rather than a container, which vmlab-hv runs differently.
 pub fn for_machine(
     kind: crate::config::hypervisor::HypervisorKind,
     host: &crate::config::host::HostConfig,
+    vm: bool,
 ) -> Arc<dyn Hypervisor> {
     use crate::config::hypervisor::HypervisorKind;
     match kind {
         HypervisorKind::Qemu => Arc::new(Qemu),
+        HypervisorKind::Vmlab if vm => Arc::new(VmlabHv::for_vm(
+            host.vmlab_hv.clone(),
+            host.firmware_dir.clone(),
+        )),
         HypervisorKind::Vmlab => Arc::new(VmlabHv::new(host.vmlab_hv.clone())),
     }
 }

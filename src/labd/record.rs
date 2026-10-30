@@ -180,7 +180,7 @@ impl LabRuntime {
         }
         let inputs = tap.attach();
         let recorder = Recorder::start(RecorderSpec {
-            sock: display.vnc_sock(),
+            source: display.stream_source(),
             output: output.clone(),
             settings: settings.clone(),
             ffmpeg,

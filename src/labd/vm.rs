@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::config::hypervisor::HypervisorKind;
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, VmPaths};
@@ -164,6 +165,27 @@ impl VmDirs {
 
     pub fn qmp_sock(&self) -> PathBuf {
         self.run.join("qmp.sock")
+    }
+    /// The socket the VM's hypervisor is controlled on: QMP for QEMU,
+    /// vmlab-hv's own protocol beside it (§22). vmlab-hv binds
+    /// `display.sock` and `vnc.sock` in the same directory.
+    pub fn control_sock(&self, hypervisor: HypervisorKind) -> PathBuf {
+        match hypervisor {
+            HypervisorKind::Qemu => self.qmp_sock(),
+            HypervisorKind::Vmlab => self.run.join("control.sock"),
+        }
+    }
+    /// Where the hypervisor's own stdout/stderr goes.
+    pub fn hypervisor_log(&self, hypervisor: HypervisorKind) -> PathBuf {
+        self.logs.join(match hypervisor {
+            HypervisorKind::Qemu => "qemu.log",
+            HypervisorKind::Vmlab => "vmlab-hv.log",
+        })
+    }
+    /// vmlab-hv's native frame socket (§22, phase 2b) — what screenshots,
+    /// scripted input and the recorder use on a vmlab-hv VM.
+    pub fn display_sock(&self) -> PathBuf {
+        self.run.join("display.sock")
     }
     /// vmlab-agent channel (`vmlab.agent.0`): terminals/exec/files/metrics.
     pub fn agent_sock(&self) -> PathBuf {
@@ -324,6 +346,9 @@ pub struct VmInstance {
     /// [`super::hypervisor`]). Real QEMU in production; a fake in tests, which
     /// is what makes the start ladder and the exit monitor testable.
     hv: Arc<dyn Hypervisor>,
+    /// Which hypervisor `hv` is (§22), as the machine reports it and its
+    /// snapshots record it.
+    hypervisor: HypervisorKind,
     /// Where the display publishes every input it sends, for a console
     /// recorder (§11.1). Lives as long as the machine, across restarts.
     input_tap: Arc<crate::record::InputTap>,
@@ -408,8 +433,22 @@ impl VmInstance {
             control: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
+            hypervisor: HypervisorKind::Qemu,
             input_tap: Arc::default(),
         })
+    }
+
+    /// Run this VM on `kind`, through `hv` (§22). Called once by the lab
+    /// builder, before anything else holds the machine.
+    pub fn on_hypervisor(
+        mut self: Arc<Self>,
+        kind: HypervisorKind,
+        hv: Arc<dyn Hypervisor>,
+    ) -> Arc<Self> {
+        let me = Arc::get_mut(&mut self).expect("a freshly built VM has one owner");
+        me.hypervisor = kind;
+        me.hv = hv;
+        self
     }
 
     /// Run this VM against a different hypervisor — the injection point
@@ -753,6 +792,7 @@ impl VmInstance {
             qmp_sock: self.dirs.qmp_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
+            display_sock: self.dirs.display_sock(),
             primary_disk: self.dirs.primary_disk(),
             extra_disks: self
                 .cfg
@@ -1004,6 +1044,19 @@ impl VmInstance {
         // pull can't swap them mid-boot under us).
         let t = self.template();
         let run = async {
+            // A deferred pull binds its template's hardware after the lab
+            // builder checked the placeholder, so vmlab-hv's refusals are
+            // asked again of what this start will run (§22).
+            if self.hypervisor == HypervisorKind::Vmlab {
+                let why = crate::config::hypervisor::vmlab_refusals(
+                    model::MachineCfg::Vm(&self.cfg),
+                    &crate::config::hypervisor::HostFacts::probe(),
+                    Some(&t.resolved),
+                );
+                if !why.is_empty() {
+                    bail!("{}", why.join("\n"));
+                }
+            }
             // Decided before anything is created or spawned: a declared
             // `accel = "kvm"` that KVM cannot honour refuses here (§5.2).
             let plan = qemu::plan_accel(&t.resolved, qemu::kvm_usable(&t.resolved.arch))?;
@@ -1088,11 +1141,18 @@ impl VmInstance {
             let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
-                    label: format!("qemu:{}", self.cfg.name),
+                    label: format!(
+                        "{}:{}",
+                        match self.hypervisor {
+                            HypervisorKind::Qemu => "qemu",
+                            HypervisorKind::Vmlab => "vmlab-hv",
+                        },
+                        self.cfg.name
+                    ),
                     machine,
                     env: render.env,
-                    log: self.dirs.logs.join("qemu.log"),
-                    control_sock: self.dirs.qmp_sock(),
+                    log: self.dirs.hypervisor_log(self.hypervisor),
+                    control_sock: self.dirs.control_sock(self.hypervisor),
                     fds: nic_fds,
                     channels: super::hypervisor::GuestChannels {
                         agent: self.dirs.agent_sock(),
@@ -1512,9 +1572,10 @@ impl VmInstance {
     }
 }
 
-/// A VM's display is QEMU's: screendumps over QMP (or RFB where the scanout
-/// is a GL texture), input over QMP or RFB depending on what the guest
-/// actually listens to.
+/// A VM's display is its hypervisor's: screendumps over QMP (or RFB where the
+/// scanout is a GL texture) on QEMU, over the native frame protocol on
+/// vmlab-hv (§22); input over the control channel's capability or RFB,
+/// depending on what the guest actually listens to.
 #[async_trait::async_trait]
 impl super::display::DisplayHost for VmInstance {
     fn name(&self) -> &str {
@@ -1531,6 +1592,13 @@ impl super::display::DisplayHost for VmInstance {
 
     fn vnc_sock(&self) -> PathBuf {
         self.dirs.vnc_sock()
+    }
+
+    fn stream_source(&self) -> crate::record::StreamSource {
+        match self.hypervisor {
+            HypervisorKind::Qemu => crate::record::StreamSource::Vnc(self.dirs.vnc_sock()),
+            HypervisorKind::Vmlab => crate::record::StreamSource::Native(self.dirs.display_sock()),
+        }
     }
 
     fn capture_dir(&self) -> PathBuf {
@@ -1612,8 +1680,14 @@ impl super::machine::Machine for VmInstance {
 
     /// A VM's argv carries pre-opened descriptors, so its NICs can ride the
     /// afxdp tap fast path.
+    /// QEMU inherits a tap descriptor; vmlab-hv's NICs are stream sockets
+    /// (HV-D9 leaves its fast path unfixed).
     fn takes_tap_fds(&self) -> bool {
-        true
+        self.hypervisor == HypervisorKind::Qemu
+    }
+
+    fn hypervisor(&self) -> HypervisorKind {
+        self.hypervisor
     }
 
     fn event_subject(&self) -> &'static str {
@@ -1650,7 +1724,9 @@ impl super::machine::Machine for VmInstance {
                     .is_ok_and(|p| p.gpu.is_some_and(|g| g.qemu_binary.is_some()))
             })
         });
-        if !own_qemu {
+        if self.hypervisor == HypervisorKind::Vmlab {
+            needed.push(self.hv.emulator_binary(&t.resolved.arch));
+        } else if !own_qemu {
             needed.push(qemu::emulator_binary(&t.resolved.arch));
         }
         if t.resolved.tpm {

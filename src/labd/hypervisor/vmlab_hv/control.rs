@@ -23,7 +23,8 @@ use tokio::sync::watch;
 use vmlab_hv_proto::client::{Client, ClientError};
 use vmlab_hv_proto::control::{Capability, Command, Event, Outcome, RunState, ShutdownReason};
 
-use super::super::{Control, Process, Snapshots};
+use super::super::{Control, Frames, Input, Process, Snapshots};
+use super::display::HvDisplay;
 
 /// One running `vmlab-hv`, through its control socket.
 pub(crate) struct HvControl {
@@ -34,6 +35,8 @@ pub(crate) struct HvControl {
     /// Flips to `true` once the event connection has closed — the
     /// hypervisor has gone and every event it sent has been read.
     events_closed: watch::Receiver<bool>,
+    /// The machine's display socket, for a machine launched with a display.
+    display: Option<Arc<HvDisplay>>,
 }
 
 impl HvControl {
@@ -82,7 +85,14 @@ impl HvControl {
             guest_shutdown,
             asleep,
             events_closed,
+            display: None,
         })
+    }
+
+    /// The machine has a display, served on `socket`: the frames and input
+    /// capabilities are its, where the handshake advertises them.
+    pub(crate) fn set_display(&mut self, socket: std::path::PathBuf) {
+        self.display = Some(Arc::new(HvDisplay::new(socket)));
     }
 
     /// Turns `true` once every event the hypervisor sent has been read,
@@ -200,8 +210,26 @@ impl Control for HvControl {
             .then(|| Arc::new(HvSnapshots(self.commands.clone())) as Arc<dyn Snapshots>)
     }
 
-    // Input, frames, hot-plug and media: phase 1 advertises none and the
-    // protocol has no commands for them yet, so the trait's `None` stands.
+    /// Scripted input rides the display socket (phase 2b), not a control
+    /// command.
+    fn input(&self) -> Option<Arc<dyn Input>> {
+        self.capabilities
+            .contains(&Capability::Input)
+            .then(|| self.display.clone())
+            .flatten()
+            .map(|d| d as Arc<dyn Input>)
+    }
+
+    fn frames(&self) -> Option<Arc<dyn Frames>> {
+        self.capabilities
+            .contains(&Capability::Display)
+            .then(|| self.display.clone())
+            .flatten()
+            .map(|d| d as Arc<dyn Frames>)
+    }
+
+    // Hot-plug and media: no phase delivered yet has them, so the trait's
+    // `None` stands.
 }
 
 /// The **snapshots** capability as the protocol's commands. The hypervisor
@@ -277,6 +305,10 @@ impl Process for HvProcess {
 
     async fn kill(&self) {
         self.proc.kill().await;
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.proc.pid()
     }
 }
 
@@ -470,5 +502,71 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Frames and input ride the display socket, where the handshake
+    /// advertises them and the machine has one.
+    #[tokio::test]
+    async fn frames_and_input_ride_the_display_socket() {
+        use vmlab_hv_display::Message;
+        let display = crate::hvdisplay::fake::spawn(8, 4);
+        let hv = fake_hv(vec![Capability::Display, Capability::Input], ok);
+
+        // Advertised, but no display: nothing to offer.
+        let bare = HvControl::connect(&hv.socket).await.unwrap();
+        assert!(bare.frames().is_none() && bare.input().is_none());
+
+        let mut control = HvControl::connect(&hv.socket).await.unwrap();
+        control.set_display(display.path.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("grab.ppm");
+        control
+            .frames()
+            .expect("advertised")
+            .screendump(&shot)
+            .await
+            .unwrap();
+        let img = crate::vision::load_screen(&shot).unwrap();
+        assert_eq!((img.width(), img.height()), (8, 4));
+        assert_eq!(img.get_pixel(3, 2).0, [3, 2, 3 ^ 2]);
+
+        let input = control.input().expect("advertised");
+        input.send_keys(&["ctrl", "alt", "delete"]).await.unwrap();
+        input.pointer_to(4, 2, 8, 4).await.unwrap();
+        input.button("left", true).await.unwrap();
+        input.button("right", true).await.unwrap();
+        input.button("left", false).await.unwrap();
+        let key = |q: &str, down| Message::Key {
+            qcode: q.into(),
+            down,
+        };
+        let want = vec![
+            key("ctrl", true),
+            key("alt", true),
+            key("delete", true),
+            key("delete", false),
+            key("alt", false),
+            key("ctrl", false),
+            Message::PointerAbs {
+                x: 4,
+                y: 2,
+                width: 8,
+                height: 4,
+            },
+            Message::Buttons { mask: 1 },
+            Message::Buttons { mask: 5 },
+            Message::Buttons { mask: 4 },
+        ];
+        eventually("every input", || {
+            display.inputs.lock().unwrap().len() >= want.len()
+        })
+        .await;
+        assert_eq!(*display.inputs.lock().unwrap(), want);
+
+        // Not advertised: not offered, display or none.
+        let without = fake_hv(vec![], ok);
+        let mut control = HvControl::connect(&without.socket).await.unwrap();
+        control.set_display(display.path.clone());
+        assert!(control.frames().is_none() && control.input().is_none());
     }
 }

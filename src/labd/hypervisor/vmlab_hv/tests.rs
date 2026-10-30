@@ -176,9 +176,10 @@ async fn a_hypervisor_that_exits_during_startup_is_reported() {
     assert!(err.contains("/dev/kvm: permission denied"), "{err}");
 }
 
-/// Phase 1 is containers only: a VM is refused before anything spawns.
+/// A VM the delivered phases cannot run — linux-modern boots OVMF, phase
+/// 2c — is refused before anything spawns.
 #[tokio::test]
-async fn a_vm_is_refused_before_anything_spawns() {
+async fn an_ovmf_vm_is_refused_before_anything_spawns() {
     let dir = tempfile::tempdir().unwrap();
     let run = dir.path();
     let bin = fake_binary(run, &format!("touch {}/spawned", run.display()));
@@ -192,17 +193,25 @@ async fn a_vm_is_refused_before_anything_spawns() {
         accel: crate::qemu::Accel::Kvm,
         emulator: None,
     };
-    let err = VmlabHv::new(Some(bin))
+    let err = VmlabHv::for_vm(Some(bin), None)
         .start_emulator(spec(run, launch))
         .await
         .err()
         .expect("refused");
-    assert!(
-        err.to_string().contains("container micro-VMs only"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("phase 2c"), "{err}");
     assert!(!run.join("spawned").exists());
     assert!(!run.join("machine.json").exists());
+}
+
+/// A VM's adapter reports no virtiofsd — its shares wait for phase 2e and
+/// fall back to SMB — while a container's keeps the host's.
+#[test]
+fn a_vm_has_no_virtiofsd_to_serve_shares() {
+    assert!(VmlabHv::for_vm(None, None).virtiofsd().is_none());
+    assert_eq!(
+        VmlabHv::new(None).virtiofsd().is_some(),
+        crate::qemu::virtiofsd::found().is_some()
+    );
 }
 
 #[tokio::test]

@@ -563,3 +563,27 @@ fn the_pointer_sits_above_the_ripple() {
         "the ripple is there around it: {beside:?}"
     );
 }
+
+/// A display that reports the guest's own pointer (vmlab-hv's native
+/// protocol) moves and hides it, and a move alone keeps the interval
+/// active.
+#[test]
+fn the_guests_reported_pointer_moves_and_hides_it() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, Some(0.5)));
+    core.connected(secs(0.0), 8, 8);
+    core.rect(secs(0.0), 0, 0, 8, 8, &solid(8, 8, BLACK));
+    core.cursor(secs(0.01), arrow());
+    core.pointer_state(secs(0.02), 4, 4, true);
+    let frame = core.tick(secs(0.1)).pop().unwrap();
+    assert_eq!(pixel(&frame, size, 3, 3), [255, 255, 255]);
+
+    core.pointer_state(secs(0.11), 1, 1, true);
+    let frame = core.tick(secs(0.2)).pop().expect("a move is activity");
+    assert_eq!(pixel(&frame, size, 0, 0), [255, 255, 255]);
+    assert_eq!(pixel(&frame, size, 3, 3), BLACK);
+
+    core.pointer_state(secs(0.21), 1, 1, false);
+    let frame = core.tick(secs(0.3)).pop().expect("hiding is activity");
+    assert!(all(&frame, BLACK), "a hidden pointer is not drawn");
+}

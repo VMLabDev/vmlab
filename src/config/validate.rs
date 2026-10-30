@@ -1821,10 +1821,37 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
             continue;
         }
         let host = host.get_or_insert_with(|| ctx.host_facts());
-        for why in vmlab_refusals(m, host) {
+        let hardware = match m {
+            MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
+            MachineCfg::Container(_) => None,
+        };
+        for why in vmlab_refusals(m, host, hardware.as_ref()) {
             issues.push(Issue::at(m.span(), why));
         }
     }
+}
+
+/// A VM's resolved hardware, when this context can resolve it: a store
+/// template it holds, and the profile that names. `None` otherwise — a
+/// registry template not pulled yet, an unknown profile (reported
+/// elsewhere) — and the daemon's own check, which always resolves, finishes
+/// the refusal.
+fn vm_hardware(vm: &Vm, ctx: &dyn ValidationContext) -> Option<crate::qemu::ResolvedVm> {
+    let meta = match &vm.template {
+        TemplateRef::Scratch => None,
+        TemplateRef::Store {
+            arch,
+            name,
+            version,
+            ..
+        } => Some(ctx.template_meta(arch, name, version.as_deref())?),
+        TemplateRef::Registry { .. } => return None,
+    };
+    let profiles = match effective_profile_name(vm, meta.as_ref()) {
+        Some(name) => crate::profiles::ProfileSet::of([ctx.profile(&name)?]),
+        None => crate::profiles::ProfileSet::of([]),
+    };
+    crate::qemu::resolve_vm(vm, meta.as_ref(), &profiles).ok()
 }
 
 fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
@@ -4139,8 +4166,13 @@ lab "l" {
         fn template_meta(&self, a: &str, n: &str, v: Option<&str>) -> Option<TemplateMeta> {
             Permissive.template_meta(a, n, v)
         }
+        /// The shipped profiles, so a VM's firmware and display resolve
+        /// as they would on a real host.
         fn profile(&self, name: &str) -> Option<Profile> {
-            Permissive.profile(name)
+            crate::profiles::ProfileSet::shipped()
+                .ok()?
+                .get(name)
+                .cloned()
         }
         fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
             Ok(())
@@ -4173,15 +4205,26 @@ lab "l" {
         assert!(es.is_empty(), "{es:#?}");
     }
 
+    /// Phases 2a and 2b: a SeaBIOS Linux VM on q35 validates; one the
+    /// delivered phases cannot run is refused naming the phase that brings
+    /// it, read from its resolved hardware.
     #[test]
-    fn a_vm_on_vmlab_is_refused_naming_phase_one() {
+    fn a_vm_on_vmlab_is_refused_only_what_a_later_phase_brings() {
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "x86_64/t" hypervisor = "vmlab" }"#,
+            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-generic" hypervisor = "vmlab" }"#,
+        );
+        assert!(es.is_empty(), "{es:#?}");
+        // linux-modern's own firmware is OVMF: phase 2c.
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" }"#,
         );
         assert_eq!(es.len(), 1, "{es:#?}");
-        assert!(es[0].contains("vm \"v\""), "{es:#?}");
-        assert!(es[0].contains("container micro-VMs only"), "{es:#?}");
+        assert!(
+            es[0].contains("vm \"v\"") && es[0].contains("phase 2c"),
+            "{es:#?}"
+        );
     }
 
     #[test]
@@ -4264,8 +4307,8 @@ lab "l" {
         let es = hv_errs(
             &host,
             r#"container "c" { image = "alpine" }
-vm "v" { template = "x86_64/t" }
-vm "q" { template = "x86_64/t" hypervisor = "qemu" }"#,
+vm "v" { template = "x86_64/t" usb = true }
+vm "q" { template = "x86_64/t" hypervisor = "qemu" usb = true }"#,
         );
         assert_eq!(es.len(), 1, "{es:#?}");
         assert!(es[0].contains("vm \"v\""), "{es:#?}");
