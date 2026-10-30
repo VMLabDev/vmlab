@@ -387,6 +387,11 @@ pub trait Machine: Send + Sync + 'static {
 
     /// The vmlab-agent channel, connecting on first use.
     async fn agent(&self) -> Result<AgentHandle>;
+    /// The emulator's host process id while it runs — what `machine.stats`
+    /// reads the host CPU figure from ([`super::host_cpu`]).
+    async fn emulator_pid(&self) -> Option<u32> {
+        None
+    }
     /// Whether this machine has an agent channel at all. `false` for a
     /// vintage guest whose profile predates virtio-serial — no terminal, exec,
     /// copy or readiness is possible, and no amount of waiting changes that.

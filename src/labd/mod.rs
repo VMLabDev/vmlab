@@ -13,6 +13,7 @@ pub mod events;
 pub mod forward_plan;
 pub mod freeze_clone;
 pub mod guest_os;
+pub mod host_cpu;
 pub mod hypervisor;
 pub mod identity;
 pub mod isolation;
@@ -969,14 +970,24 @@ impl Handler<LabRequest> for LabdHandler {
                 let session = agent.open_eventlog(filter).await?;
                 pump_session(session, m.as_ref(), stream).await
             }
-            // Latest guest metrics (subscribes the 2s sampler on first use).
+            // Latest guest metrics (subscribes the 2s sampler on first use),
+            // beside the emulator's own CPU use on the host over a second
+            // measured while the agent answers.
             LabRequest::MachineStats { machine } => {
-                let m = agent_of(lab, &machine)
-                    .await?
-                    .stats(std::time::Duration::from_secs(10))
-                    .await?;
+                let target = machine_of(lab, &machine)?;
+                let agent = target.agent().await?;
+                let host = async {
+                    match target.emulator_pid().await {
+                        Some(pid) => host_cpu::sample(pid).await,
+                        None => None,
+                    }
+                };
+                let (m, host_cpu_pct) =
+                    tokio::join!(agent.stats(std::time::Duration::from_secs(10)), host);
+                let m = m?;
                 Ok(json!({
                     "cpu_pct": m.cpu_pct,
+                    "host_cpu_pct": host_cpu_pct,
                     "mem_used": m.mem_used,
                     "mem_total": m.mem_total,
                     "disks": m.disks.iter().map(|d| json!({

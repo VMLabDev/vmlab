@@ -885,7 +885,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 | `vmlab script <script.ws> [--record vm=path]` | Ad-hoc script against the current lab; `--record` records a VM for exactly the run (§11.1) |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
 | `vmlab dev sync status / flush / diff / resolve` | Workspace syncer state and conflict resolution (§19.6) |
-| `vmlab machine capabilities / stats` | Per-machine probed capabilities, including agent features (§19.4) |
+| `vmlab machine capabilities / stats` | Per-machine probed capabilities, including agent features (§19.4); stats: the guest's own metrics from the agent, plus the emulator process's host CPU use |
 | `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine, to iterate on the agent without rebuilding a template, and mark it diverged; `up` runs the same push on a stale agent by default (§19.4) |
 | `vmlab template build / list / rm / export / import` | Template store |
 | `vmlab template push / pull / login` | OCI registry distribution (§6.4) |

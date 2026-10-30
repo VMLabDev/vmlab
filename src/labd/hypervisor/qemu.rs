@@ -127,6 +127,10 @@ impl Process for HostProcess {
     async fn kill(&self) {
         self.0.kill().await;
     }
+
+    fn pid(&self) -> Option<u32> {
+        self.0.pid()
+    }
 }
 
 /// QMP as the seam's [`Control`], plus the one piece of state that only the

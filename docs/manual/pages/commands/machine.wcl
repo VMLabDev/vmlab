@@ -89,18 +89,30 @@ page cmd_machine {
 
   p <<DOC
     Prints the guest's latest metrics: a `cpu` line as a percentage, a
-    `memory` line as `used / total (pct%)`, and one `disk <mount>` line per
-    mounted filesystem in the same form. Sizes are rendered in binary units;
-    a filesystem whose total the guest has not reported shows only the used
-    figure. The agent is given 10 seconds to answer.
+    `host cpu` line, a `memory` line as `used / total (pct%)`, and one
+    `disk <mount>` line per mounted filesystem in the same form. Sizes are
+    rendered in binary units; a filesystem whose total the guest has not
+    reported shows only the used figure. The agent is given 10 seconds to
+    answer.
+  DOC
+
+  p <<DOC
+    The two CPU figures measure different things. `cpu` is the guest's own
+    figure from the agent: how busy all of the guest's CPUs were over the
+    last two-second sample. `host cpu` is the QEMU process on the host,
+    measured over one second during the read: every vCPU thread plus device
+    emulation, as a share of one host core. A busy machine with two vCPUs
+    reads `100.0%` and about `200% of one core`. The `host cpu` line is left
+    out when the daemon has no emulator process to read.
   DOC
 
   p <<DOC
     Reading is not free of side effects. It subscribes the daemon's sampler,
     so a machine nothing had asked about starts being sampled every two
-    seconds from the first read. The JSON form carries `cpu_pct`, `mem_used`,
-    `mem_total` and a `disks` array of `mount`, `used` and `total`, all in
-    bytes.
+    seconds from the first read; that first read waits for one full sample.
+    The JSON form carries `cpu_pct`, `host_cpu_pct` (`null` with no emulator
+    process), `mem_used`, `mem_total` and a `disks` array of `mount`, `used`
+    and `total`, all in bytes.
   DOC
 
   h2 "vmlab machine repair-agent"

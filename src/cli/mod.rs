@@ -538,8 +538,12 @@ pub enum MachineCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Latest guest metrics: CPU, memory and mounted filesystems.
+    /// Latest guest metrics: CPU, memory and mounted filesystems, plus the
+    /// emulator's own CPU use on the host.
     ///
+    /// `cpu` is the guest's figure over its last two seconds, a share of all
+    /// its CPUs; `host cpu` is the QEMU process over one second, a share of
+    /// one host core, so it reads above 100% for a busy multi-vCPU machine.
     /// Reading is not free of side effects: it subscribes the daemon's
     /// sampler, so a machine nothing had asked about starts being sampled.
     Stats {
