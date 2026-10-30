@@ -17,11 +17,12 @@
 //!   differently and then held to the same contract — see [`stops_idempotently`]
 //!   and the pairs of tests that call it.
 //!
-//! Not covered here, deliberately: QMP snapshot save/load, the vhost-user
-//! handshake and fast-path offload genuinely need a hypervisor and stay
-//! verified against a running lab. The fake does not pretend to implement
-//! them — `Machine::snapshot` under it reports "not running", which is the
-//! honest answer.
+//! Not covered here, deliberately: what QMP snapshot save/load actually does
+//! to a guest, the vhost-user handshake and fast-path offload genuinely need
+//! a hypervisor and stay verified against a running lab. What *is* covered is
+//! the caller's side of each capability (ADR-0020): a machine whose
+//! hypervisor reports none refuses exactly as a stopped one does, and one the
+//! script grants it to gets through to the in-memory double.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
-use super::hypervisor::fake::{FakeHypervisor, Run, Script};
+use super::hypervisor::fake::{Capabilities, FakeHypervisor, Run, Script};
 use super::machine::{LabServices, Machine};
 use super::vm::{PowerState, StopReason, TemplateParts, VmDirs, VmInstance};
 use crate::oci::image::model::{ImageConfig, RuntimeDefaults};
@@ -1748,11 +1749,10 @@ async fn a_container_stops_through_its_ctl_channel() {
 
 // ---- what the seam does not cover -------------------------------------------
 
-/// The fake does not pretend to be a hypervisor. Snapshots go through QMP,
-/// which only real QEMU answers, so a machine running under the fake reports
-/// exactly what a stopped one does rather than inventing a result — the
-/// honest failure that keeps snapshot coverage where it belongs, against a
-/// running lab (ADR-0001).
+/// A machine whose hypervisor reports no snapshots capability — the fake's
+/// default — reports exactly what a stopped one does rather than inventing a
+/// result: the honest failure that keeps what a snapshot does to a guest
+/// verified where it belongs, against a running lab (ADR-0001, ADR-0020).
 #[tokio::test]
 async fn snapshots_are_out_of_the_fakes_reach_and_say_so() {
     let dirs = Dirs::new();
@@ -1765,6 +1765,179 @@ async fn snapshots_are_out_of_the_fakes_reach_and_say_so() {
     assert!(format!("{err:#}").contains("not running"), "{err:#}");
 
     ctr.stop(true).await.expect("stop");
+}
+
+// ---- capabilities (ADR-0020) ------------------------------------------------
+
+/// A running machine whose hypervisor reports none of the snapshots, input,
+/// frames, hot-plug or media capabilities refuses every operation that needs
+/// one with the message it always gave — `<name>: not running` — and nothing
+/// is half-done: the VM is still running, holds no USB device, and has no
+/// screenshot on disk.
+#[tokio::test]
+async fn a_missing_capability_is_refused_as_not_running() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB usb = true cdrom = "./install.iso" }"#,
+        Script::healthy(),
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = vm.clone();
+    let refused = |e: anyhow::Error| {
+        let e = format!("{e:#}");
+        assert!(e.contains("dc01: not running"), "{e}");
+    };
+
+    refused(m.snapshot("s1").await.expect_err("no snapshots"));
+    refused(
+        m.clone()
+            .restore(lab, "s1", true)
+            .await
+            .expect_err("no snapshots"),
+    );
+    refused(m.usb_attach(&usb_plan()).await.expect_err("no hot-plug"));
+    refused(m.eject_cdrom().await.expect_err("no media"));
+    let display = m.clone().display().expect("a VM reports a display");
+    let shot = dirs.root.join("shot.png");
+    refused(display.screenshot(&shot).await.expect_err("no frames"));
+    refused(
+        display
+            .send_keys("ctrl-alt-delete")
+            .await
+            .expect_err("no input"),
+    );
+
+    assert_eq!(vm.state().await, PowerState::Running);
+    assert!(m.usb_attached().await.is_empty());
+    assert!(!shot.exists());
+    vm.stop(true).await.expect("stop");
+}
+
+/// The same operations on a machine whose hypervisor reports each
+/// capability get through to it: the snapshot is an online one, restoring it
+/// leaves the VM running, the device is held until detached, and the
+/// screenshot lands.
+#[tokio::test]
+async fn a_reported_capability_is_used() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB usb = true cdrom = "./install.iso" }"#,
+        Script {
+            capabilities: Capabilities::all(),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = vm.clone();
+
+    assert!(m.snapshot("s1").await.expect("snapshot"), "an online one");
+    m.clone()
+        .restore(lab, "s1", true)
+        .await
+        .expect("online restore");
+    assert_eq!(vm.state().await, PowerState::Running);
+
+    let plan = usb_plan();
+    let held = m.usb_attach(&plan).await.expect("attach");
+    assert_eq!(m.usb_attached().await, vec![held.clone()]);
+    m.usb_detach(&held.qdev_id).await.expect("detach");
+    assert!(m.usb_attached().await.is_empty());
+
+    m.eject_cdrom().await.expect("eject");
+    let display = m.clone().display().expect("a VM reports a display");
+    let shot = dirs.root.join("shot.png");
+    display.screenshot(&shot).await.expect("screenshot");
+    assert!(shot.exists());
+    display.send_keys("ctrl-alt-delete").await.expect("keys");
+
+    vm.stop(true).await.expect("stop");
+}
+
+/// A container's online snapshot rides the same capability: absent, the
+/// refusal it always gave; present, an online capture it can restore.
+#[tokio::test]
+async fn a_containers_online_snapshot_rides_the_snapshots_capability() {
+    for granted in [false, true] {
+        let dirs = Dirs::new();
+        let (ctr, _hv) = container(
+            &dirs,
+            WORKLOAD,
+            Script {
+                capabilities: Capabilities {
+                    snapshots: granted,
+                    ..Capabilities::default()
+                },
+                ..Script::healthy()
+            },
+        );
+        let (cbs, _observed) = callbacks();
+        start_container(&ctr, cbs).await.expect("start");
+        let m: Arc<dyn Machine> = ctr.clone();
+        match m.snapshot("s1").await {
+            Ok(online) => {
+                assert!(granted && online, "granted={granted}");
+                let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+                let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+                m.clone()
+                    .restore(lab, "s1", true)
+                    .await
+                    .expect("online restore");
+                assert_eq!(ctr.state().await, PowerState::Running);
+            }
+            Err(e) => {
+                assert!(!granted, "{e:#}");
+                assert!(format!("{e:#}").contains("web: not running"), "{e:#}");
+            }
+        }
+        ctr.stop(true).await.expect("stop");
+    }
+}
+
+/// `poweroff` asks the hypervisor to quit through [`Control`] and waits for
+/// the exit — a requested stop, not a crash.
+#[tokio::test]
+async fn poweroff_quits_through_the_control_channel() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    m.poweroff().await.expect("poweroff");
+    assert_eq!(vm.state().await, PowerState::Stopped);
+    assert_eq!(observed.exit().await.reason, StopReason::Requested);
+}
+
+/// A host USB device the hot-plug tests attach: an ordinary flash drive.
+fn usb_plan() -> crate::usb::AttachPlan {
+    let device = crate::usb::HostDevice {
+        port: "3-2".into(),
+        bus: 3,
+        devnum: 7,
+        vendor_id: "0781".into(),
+        product_id: "5567".into(),
+        manufacturer: None,
+        product: Some("Cruzer Blade".into()),
+        serial: None,
+        speed: "480".into(),
+        class: 0,
+        interfaces: vec![crate::usb::Interface {
+            class: 8,
+            subclass: 6,
+            protocol: 80,
+        }],
+    };
+    crate::usb::AttachPlan {
+        args: serde_json::json!({"driver": "usb-host", "id": device.qdev_id()}),
+        device,
+    }
 }
 
 /// A container whose host has no guest boot asset cannot start, and says so

@@ -12,11 +12,13 @@ pub struct QmpEvent {
     pub data: Value,
     /// Host-side timestamp QEMU attached to the event. No consumer reads
     /// it today; carried so the event mirrors the wire format.
+    #[allow(dead_code)] // see above: mirrors the wire, read by nothing yet
     pub timestamp: EventTimestamp,
 }
 
 /// Timestamp attached to QMP events (`{"seconds": ..., "microseconds": ...}`).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[allow(dead_code)] // read by nothing yet, like the event's own timestamp
 pub struct EventTimestamp {
     #[serde(default)]
     pub seconds: i64,
@@ -24,7 +26,9 @@ pub struct EventTimestamp {
     pub microseconds: i64,
 }
 
-/// VM run state as reported by `query-status`.
+/// VM run state as reported by `query-status`, which only the QMP tests
+/// poll.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunState {
     Running,
@@ -46,6 +50,7 @@ pub enum RunState {
     Other(String),
 }
 
+#[cfg(test)]
 impl RunState {
     /// Map a `query-status` `status` string onto a [`RunState`].
     pub fn from_status(status: &str) -> Self {

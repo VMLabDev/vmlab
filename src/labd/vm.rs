@@ -12,11 +12,10 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, VmPaths};
-use crate::qmp::QmpClient;
 use crate::smb::VirtiofsMount;
 use crate::sync::LockRecover;
 
-use super::hypervisor::{Control, Hypervisor, Process};
+use super::hypervisor::{Control, Frames, Hypervisor, Input, Process};
 
 /// How long a VM gets to become ready: it may be running a template first-boot
 /// provision through a Windows specialize/OOBE pass and a settle reboot.
@@ -520,17 +519,27 @@ impl VmInstance {
         self.template().first_boot.is_some() && !self.dirs.firstboot_sentinel().exists()
     }
 
-    /// The live QMP client, for the operations that genuinely need a
-    /// hypervisor — snapshots, the framebuffer, scripted input. Absent both
-    /// when the VM is stopped and when it is running under an in-memory
-    /// adapter, which is why those stay verified against a running lab
-    /// (ADR-0001).
-    pub async fn qmp(&self) -> Result<QmpClient> {
+    /// One of the running machine's capabilities (ADR-0020). Absent both
+    /// when the VM is stopped and when its hypervisor does not report it —
+    /// an in-memory adapter reports none — and either way the answer is that
+    /// it is not running, as it always has been.
+    async fn capability<T>(&self, pick: impl FnOnce(&dyn Control) -> Option<T>) -> Result<T> {
         self.control
             .lock()
             .await
-            .as_ref()
-            .and_then(|c| c.qmp())
+            .as_deref()
+            .and_then(pick)
+            .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
+    }
+
+    /// The running machine's control channel itself, for the lifecycle
+    /// operations a capability brackets (an online restore pauses and
+    /// resumes around its load).
+    async fn running_control(&self) -> Result<Arc<dyn Control>> {
+        self.control
+            .lock()
+            .await
+            .clone()
             .ok_or_else(|| anyhow!("{}: not running", self.cfg.name))
     }
 
@@ -1052,30 +1061,35 @@ impl VmInstance {
                     format!("{}: installing the Vulkan PCI-filter layer", self.cfg.name)
                 })?;
             }
-            let tsc_hz = self
-                .pinned_tsc_hz(&t, accel, &render.emulator(&t.resolved.arch))
-                .await?;
-            let args = qemu::build_args(
-                &self.lab,
-                &t.resolved,
-                &self.build_paths(
+            // The probe reads the TSC through the emulator the VM will run:
+            // a host GPU's own build where one is set, else the stock one.
+            let emulator = render
+                .qemu_binary
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| qemu::emulator_binary(&t.resolved.arch));
+            let tsc_hz = self.pinned_tsc_hz(&t, accel, &emulator).await?;
+            let machine = super::hypervisor::Launch::Vm {
+                lab: self.lab.clone(),
+                resolved: Box::new(t.resolved.clone()),
+                paths: Box::new(self.build_paths(
                     &t,
                     firmware.as_ref(),
                     nic_specs,
                     vfs_devices,
                     &render,
                     tsc_hz,
-                )?,
+                )?),
                 accel,
-            )?;
+                emulator: render.qemu_binary.clone(),
+            };
             // The machine answers control shortly after spawn (-S leaves CPUs
             // paused); the hypervisor returns once it does.
             let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
-                    binary: render.emulator(&t.resolved.arch),
-                    args,
+                    machine,
                     env: render.env,
                     log: self.dirs.logs.join("qemu.log"),
                     qmp_sock: self.dirs.qmp_sock(),
@@ -1404,10 +1418,10 @@ impl VmInstance {
                 if !attached.is_empty() {
                     bail!(crate::usb::snapshot_refusal(&self.cfg.name, &attached));
                 }
-                let qmp = self.qmp().await?;
+                let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-                qmp.snapshot_save(name, "disk0", &refs).await?;
+                snapshots.save(name, "disk0", &refs).await?;
                 Ok(true)
             }
             PowerState::Stopped => {
@@ -1448,11 +1462,12 @@ impl VmInstance {
             // QEMU loads a snapshot into a running machine; one that is
             // asleep is woken first, and the snapshot decides what it runs.
             self.wake(WakeCause::Restore).await?;
-            let qmp = self.qmp().await?;
-            qmp.stop().await?;
+            let snapshots = self.capability(|c| c.snapshots()).await?;
+            let control = self.running_control().await?;
+            control.pause().await?;
             let nodes = disk_nodes(self.all_disk_paths().len());
             let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-            qmp.snapshot_load(name, "disk0", &refs).await?;
+            snapshots.load(name, "disk0", &refs).await?;
             // Drop the agent connection BEFORE resuming: the rewound guest
             // replays virtio-serial response bytes the host already
             // consumed. With no client attached QEMU discards the replayed
@@ -1460,7 +1475,7 @@ impl VmInstance {
             // fresh token, and the frame magic resyncs any mid-frame
             // garbage — see guest/agent-proto.
             self.drop_agent().await;
-            qmp.cont().await?;
+            control.resume().await?;
             Ok(())
         } else {
             // Offline: power off if needed, apply, stay off.
@@ -1482,10 +1497,10 @@ impl VmInstance {
             // Asleep is still a live QEMU holding the disks open, so the
             // offline path's qemu-img must not touch them.
             PowerState::Running | PowerState::Suspended => {
-                let qmp = self.qmp().await?;
+                let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-                qmp.snapshot_delete(name, &refs).await?;
+                snapshots.delete(name, &refs).await?;
             }
             _ => {
                 for disk in self.all_disk_paths() {
@@ -1506,8 +1521,12 @@ impl super::display::DisplayHost for VmInstance {
         &self.cfg.name
     }
 
-    async fn qmp(&self) -> Result<QmpClient> {
-        VmInstance::qmp(self).await
+    async fn input(&self) -> Result<Arc<dyn Input>> {
+        self.capability(|c| c.input()).await
+    }
+
+    async fn frames(&self) -> Result<Arc<dyn Frames>> {
+        self.capability(|c| c.frames()).await
     }
 
     fn vnc_sock(&self) -> PathBuf {
@@ -1668,16 +1687,19 @@ impl super::machine::Machine for VmInstance {
     }
 
     async fn poweroff(&self) -> Result<()> {
-        super::machine::quit_and_settle(self, VmInstance::qmp(self).await).await
+        // Taken out first: the exit monitor clears this slot, so the lock
+        // must not be held through the settle.
+        let control = self.control.lock().await.clone();
+        super::machine::quit_and_settle(self, control).await
     }
 
     async fn eject_cdrom(&self) -> Result<()> {
         if self.cfg.cdrom.is_none() {
             return Err(super::machine::no_install_cdrom(&self.cfg.name));
         }
-        VmInstance::qmp(self)
+        self.capability(|c| c.media())
             .await?
-            .eject(qemu::cmdline::INSTALL_CDROM_ID)
+            .eject_install_cdrom()
             .await
             .with_context(|| format!("vm \"{}\": ejecting the install CD-ROM", self.cfg.name))
     }
@@ -1906,8 +1928,8 @@ impl super::machine::Machine for VmInstance {
     async fn usb_attach(&self, plan: &crate::usb::AttachPlan) -> Result<crate::usb::Attachment> {
         self.usb_ready().await?;
         let mut attached = self.usb.lock().await;
-        let qmp = self.qmp().await?;
-        qmp.device_add(plan.args.clone()).await.with_context(|| {
+        let hotplug = self.capability(|c| c.hotplug()).await?;
+        hotplug.attach_usb(plan).await.with_context(|| {
             format!("attaching {} to {}", plan.device.describe(), self.cfg.name)
         })?;
         let attachment = crate::usb::Attachment {
@@ -1928,13 +1950,10 @@ impl super::machine::Machine for VmInstance {
         let gone = attached.remove(i);
         // Removed from the tracking first: a QEMU that has already dropped
         // the device, or exited, must not leave a phantom behind.
-        let qmp = self.qmp().await?;
-        match qmp.device_del(qdev_id, USB_DETACH_WAIT).await {
+        let hotplug = self.capability(|c| c.hotplug()).await?;
+        match hotplug.detach(qdev_id, USB_DETACH_WAIT).await {
             Ok(()) => Ok(gone),
-            Err(crate::qmp::QmpError::Command { class, .. }) if class == "DeviceNotFound" => {
-                Ok(gone)
-            }
-            Err(e) => Err(anyhow!(e)).with_context(|| {
+            Err(e) => Err(e).with_context(|| {
                 format!(
                     "detaching {} from {}",
                     gone.device.describe(),
