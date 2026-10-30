@@ -122,7 +122,7 @@ impl LabRuntime {
             generation,
             snapshot: snapshot.to_string(),
         };
-        let declared = ports::main_declared(forward_plan::declared_fixed(&self.config.lab));
+        let declared = ports::main_declared(forward_plan::declared_fixed(&self.config().lab));
         let mut main_ports = None;
         let committed = marked
             .save(&self.lab_local)

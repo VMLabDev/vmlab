@@ -63,7 +63,7 @@ pub(super) async fn lab_client_for(lab: Option<String>) -> Result<(String, LabCl
 /// A `lab/machine` reference names a lab that must already be running, as
 /// it does for every other verb; its file is read from the cwd when the cwd
 /// is that lab, else from the root the supervisor registered for it.
-async fn current_lab_client_for(lab: Option<String>) -> Result<(String, LabClient)> {
+async fn current_lab_client_for(lab: Option<String>, targets: &[String]) -> Result<CurrentDaemon> {
     let (name, root) = match lab {
         None => current_lab()?,
         Some(name) => {
@@ -80,8 +80,7 @@ async fn current_lab_client_for(lab: Option<String>) -> Result<(String, LabClien
             }
         }
     };
-    let client = ensure_current_daemon(&name, &root).await?;
-    Ok((name, client))
+    ensure_current_daemon(&name, &root, targets).await
 }
 
 /// What a verb that boots machines does with the lab daemon it found, given
@@ -92,53 +91,60 @@ enum DaemonFreshness {
     Current,
     /// The file changed and nothing would be lost by replacing the daemon.
     Restart,
-    /// The file changed, but replacing the daemon would take something with
-    /// it; the message says what and how to proceed.
+    /// The file changed, and replacing the daemon would take a running
+    /// machine or a download with it: the daemon reloads the file instead,
+    /// machine by machine (PRD §7.1).
+    Reload,
+    /// Something changed that only a fresh daemon can take, and replacing
+    /// this one would take something with it; the message says what and how
+    /// to proceed.
     Refuse(String),
 }
 
-/// Decide whether a lab daemon still runs the lab file on disk (PRD §12:
-/// `up` runs the lab file as it is now).
+/// Decide whether a lab daemon still runs the lab file on disk (PRD §7.1:
+/// `up` runs the lab file as it is on disk now).
 ///
-/// A daemon loads `vmlab.wcl` once, when it starts, and stays up after
-/// `down` to serve status — so without this a `down`, an edit and an `up`
-/// would boot the machines from the configuration the edit replaced. A
-/// fresh daemon is the only way to load the new file, and it cannot adopt a
-/// machine the old one is running or carry on a download the old one is
-/// doing, so either of those refuses rather than being quietly lost.
+/// A daemon loads `vmlab.wcl` when it starts and stays up after `down` to
+/// serve status — so without this a `down`, an edit and an `up` would boot
+/// the machines from the configuration the edit replaced. With nothing
+/// running and nothing downloading a fresh daemon is the simplest way to
+/// load the new file; otherwise the daemon reloads it in place, since a
+/// fresh one cannot adopt a running machine or carry on a download.
+///
+/// A moved freeze is the exception (§21.2, §21.4): what it changes — which
+/// machines clone from the main checkout, and worktree isolation — is decided
+/// when the network is assembled, so it needs a fresh daemon and refuses
+/// rather than reloads while anything runs.
 fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFreshness {
     let edited = status.config_digest != digest;
     if !edited && !status.freeze_stale {
         return DaemonFreshness::Current;
     }
-    // A worktree lab's daemon planned which machines clone from the main
-    // checkout's freeze when it started (§21.2); the freeze moving since is
-    // as much a change to what `up` would build as an edit is.
-    let (changed, load, apply) = if edited {
-        (
-            "vmlab.wcl has changed since the lab daemon loaded it",
-            "the new file",
-            "the edit (or undo the edit)",
-        )
-    } else {
-        (
-            "the main checkout's freeze (or a machine's disk) has changed since the lab \
-             daemon planned which machines clone from it",
-            "the change",
-            "it",
-        )
-    };
     let running: Vec<&str> = status
         .machines
         .iter()
         .filter(|m| m.state != crate::status::PowerState::Stopped)
         .map(|m| m.name.as_str())
         .collect();
+    let mut pulling: Vec<&str> = status.pulls.iter().map(|p| p.reference.as_str()).collect();
+    pulling.sort_unstable();
+    pulling.dedup();
+    if running.is_empty() && pulling.is_empty() {
+        return DaemonFreshness::Restart;
+    }
+    if !status.freeze_stale {
+        return DaemonFreshness::Reload;
+    }
+    // A worktree lab's daemon planned which machines clone from the main
+    // checkout's freeze when it started (§21.2); the freeze moving since is
+    // as much a change to what `up` would build as an edit is.
+    let changed = "the main checkout's freeze (or a machine's disk) has changed since the lab \
+                   daemon planned which machines clone from it";
     if !running.is_empty() {
         return DaemonFreshness::Refuse(format!(
-            "lab \"{name}\": {changed}, and {running} — the daemon cannot load \
-             {load} without stopping {them}. Run `vmlab down`, then this command \
-             again, to apply {apply}",
+            "lab \"{name}\": {changed}, and {running} — the daemon cannot take the \
+             change without stopping {them}. Run `vmlab down`, then this command \
+             again, to apply it",
             running = match running.as_slice() {
                 [one] => format!("{one} is still running"),
                 many => format!("{} are still running", many.join(", ")),
@@ -146,33 +152,58 @@ fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFresh
             them = if running.len() == 1 { "it" } else { "them" },
         ));
     }
-    let mut pulling: Vec<&str> = status.pulls.iter().map(|p| p.reference.as_str()).collect();
-    pulling.sort_unstable();
-    pulling.dedup();
-    if !pulling.is_empty() {
-        return DaemonFreshness::Refuse(format!(
-            "lab \"{name}\": {changed}, but it is still downloading {} — \
-             loading {load} would abandon the download. Wait for it to finish \
-             (or interrupt the `vmlab pull` that started it), then run this \
-             command again",
-            pulling.join(", ")
-        ));
+    DaemonFreshness::Refuse(format!(
+        "lab \"{name}\": {changed}, but it is still downloading {} — \
+         taking the change would abandon the download. Wait for it to finish \
+         (or interrupt the `vmlab pull` that started it), then run this \
+         command again",
+        pulling.join(", ")
+    ))
+}
+
+/// A lab daemon running the lab file on disk, as a boot verb is handed it.
+struct CurrentDaemon {
+    client: LabClient,
+    /// Machines among the verb's targets (every machine, for none) still on
+    /// an older declaration than the file's (PRD §7.1).
+    pending: Vec<crate::status::PendingMachine>,
+    /// The daemon reloaded the file for this verb, and its lines — pending
+    /// machines' among them — were printed.
+    reloaded: bool,
+}
+
+impl CurrentDaemon {
+    /// Say which targets are still pending, unless the reload just did.
+    fn say_pending(&self) {
+        if !self.reloaded {
+            for p in &self.pending {
+                println!("{}", p.line());
+            }
+        }
     }
-    DaemonFreshness::Restart
 }
 
 /// Connect to a lab's daemon for a verb that boots machines (`up`, `pull`,
-/// `vm start`/`restart`), restarting the daemon first when the lab file has
-/// changed since it loaded it.
+/// `vm start`/`restart`), bringing it onto the lab file as it is now first
+/// (PRD §7.1): replacing the daemon when nothing would be lost, else asking
+/// it to reload the file, which applies everything but a network change.
 ///
-/// Every verb that boots a machine builds that machine from the daemon's
-/// configuration, so each must see the file as it is now. What outlives the
-/// restart is everything on disk — clones, snapshots, `.vmlab/state.json`,
-/// the workspace ledgers — because a daemon's restart is not a `destroy`.
-async fn ensure_current_daemon(name: &str, root: &std::path::Path) -> Result<LabClient> {
+/// What outlives a replacement is everything on disk — clones, snapshots,
+/// `.vmlab/state.json`, the workspace ledgers — because a daemon's restart
+/// is not a `destroy`.
+async fn ensure_current_daemon(
+    name: &str,
+    root: &std::path::Path,
+    targets: &[String],
+) -> Result<CurrentDaemon> {
+    let targeted = |machine: &str| targets.is_empty() || targets.iter().any(|t| t == machine);
     let Some(client) = daemon::try_own_lab_daemon(name, root).await? else {
         // A daemon started now reads the file now.
-        return daemon::ensure_lab_daemon(name, root).await;
+        return Ok(CurrentDaemon {
+            client: daemon::ensure_lab_daemon(name, root).await?,
+            pending: Vec::new(),
+            reloaded: false,
+        });
     };
     // The daemon was handed the canonical root (the supervisor registers it
     // so), and the digest covers it, so load from the same path.
@@ -180,8 +211,37 @@ async fn ensure_current_daemon(name: &str, root: &std::path::Path) -> Result<Lab
     let digest = crate::config::digest(&load_lab_at(&root)?);
     let status = lab_status(&client).await?;
     match daemon_freshness(name, &status, &digest) {
-        DaemonFreshness::Current => Ok(client),
+        DaemonFreshness::Current => Ok(CurrentDaemon {
+            pending: status
+                .pending
+                .into_iter()
+                .filter(|p| targeted(&p.machine))
+                .collect(),
+            client,
+            reloaded: false,
+        }),
         DaemonFreshness::Refuse(why) => bail!(why),
+        DaemonFreshness::Reload => {
+            println!("lab \"{name}\": vmlab.wcl changed — reloading it into the running lab");
+            let reply = client.send(LabRequest::Reload {}).await.map_err(remote)?;
+            let report: crate::status::ReloadReport = serde_json::from_value(reply)
+                .context("the lab daemon sent a reload report vmlab cannot read")?;
+            for line in reload_lines(&report) {
+                println!("{line}");
+            }
+            Ok(CurrentDaemon {
+                pending: report
+                    .machines
+                    .into_iter()
+                    .filter_map(|m| match m {
+                        crate::status::MachineReload::Pending(p) if targeted(&p.machine) => Some(p),
+                        _ => None,
+                    })
+                    .collect(),
+                client,
+                reloaded: true,
+            })
+        }
         DaemonFreshness::Restart => {
             if status.config_digest != digest {
                 println!(
@@ -208,9 +268,24 @@ async fn ensure_current_daemon(name: &str, root: &std::path::Path) -> Result<Lab
                     .as_str()
                     .context("malformed lab.restart response")?,
             );
-            Ok(LabClient::connect(&socket).await?)
+            Ok(CurrentDaemon {
+                client: LabClient::connect(&socket).await?,
+                pending: Vec::new(),
+                reloaded: false,
+            })
         }
     }
+}
+
+/// What a reload did, one line per machine rebuilt, added, dropped or left
+/// pending, then the handlers and forwards (PRD §7.1).
+fn reload_lines(report: &crate::status::ReloadReport) -> Vec<String> {
+    let mut lines: Vec<String> = report.machines.iter().map(|m| m.line()).collect();
+    if report.handlers {
+        lines.push("handlers: the `on {}` handlers were swapped".to_string());
+    }
+    lines.extend(report.forwards.iter().cloned());
+    lines
 }
 
 pub(super) fn rt() -> Result<tokio::runtime::Runtime> {
@@ -227,8 +302,10 @@ pub fn cmd_up(vms: Vec<String>, record: Vec<crate::record::RecordRequest>) -> Re
         for warning in super::validate::gpu_warnings(&file, picked) {
             eprintln!("WARNING: {warning}");
         }
-        let client = ensure_current_daemon(&name, &root).await?;
-        client
+        let daemon = ensure_current_daemon(&name, &root, &vms).await?;
+        daemon.say_pending();
+        daemon
+            .client
             .send_streaming(
                 LabRequest::Up {
                     machines: vms.clone(),
@@ -274,7 +351,9 @@ pub fn cmd_pull(vms: Vec<String>) -> Result<()> {
     rt()?.block_on(async {
         super::validate::validate_current()?;
         let (name, root) = current_lab()?;
-        let client = ensure_current_daemon(&name, &root).await?;
+        let daemon = ensure_current_daemon(&name, &root, &vms).await?;
+        daemon.say_pending();
+        let client = daemon.client;
         let pull = client.send_streaming(
             LabRequest::Pull {
                 machines: vms.clone(),
@@ -1236,15 +1315,35 @@ pub fn cmd_machine_power(
         let (lab, machine) = split_vm_ref(machine_ref)?;
         // Starting a machine builds it from the daemon's configuration, so
         // start and restart need the file as it is now; a stop does not.
-        let (_name, client) = match op {
-            PowerOp::Start | PowerOp::Restart => current_lab_client_for(lab).await?,
-            PowerOp::Stop => lab_client_for(lab).await?,
+        let targets = std::slice::from_ref(&machine);
+        let (client, pending) = match op {
+            PowerOp::Start | PowerOp::Restart => {
+                let daemon = current_lab_client_for(lab, targets).await?;
+                // A restart is how a running pending machine picks up the
+                // change, so it is told it will rather than that it has not.
+                if op == PowerOp::Start {
+                    daemon.say_pending();
+                }
+                (daemon.client, daemon.pending)
+            }
+            PowerOp::Stop => (lab_client_for(lab).await?.1, Vec::new()),
         };
         let started = super::record::finished_line(&record);
         client
-            .send(op.request(machine, force, record))
+            .send(op.request(machine.clone(), force, record))
             .await
             .map_err(remote)?;
+        // A pending machine that has just booted booted on the new file.
+        let rebuilt = pending.iter().any(|p| {
+            matches!(
+                (op, p.reason),
+                (PowerOp::Restart, crate::status::PendingReason::Running)
+                    | (_, crate::status::PendingReason::Stopped)
+            )
+        });
+        if rebuilt {
+            println!("{machine}: rebuilt from the new declaration");
+        }
         if let Some(line) = started {
             println!("{}", line.replace("recorded", "recording"));
         }
@@ -2250,7 +2349,7 @@ mod tests {
     use super::{
         DaemonFreshness, LabRequest, PowerOp, Region, backup_notice, daemon_freshness,
         format_log_line, listed_state, not_running_status, pulling_machines, region_value,
-        render_dns, render_snapshots, render_status, root_for,
+        reload_lines, render_dns, render_snapshots, render_status, root_for,
     };
     use crate::cli::LogFormat;
     use crate::status::fixtures::{container, lab, vm};
@@ -2341,8 +2440,9 @@ mod tests {
     }
 
     /// A worktree lab's daemon that planned its clones against a freeze that
-    /// has since moved is replaced like one running an edited file, and
-    /// refuses the same way over a running machine, saying what moved.
+    /// has since moved is replaced like one running an edited file, but a
+    /// reload cannot take a freeze: over a running machine it refuses,
+    /// saying what moved.
     #[test]
     fn a_daemon_planned_against_a_moved_freeze_is_replaced() {
         let m = |state| crate::status::fixtures::machine("web", state, false, vm());
@@ -2381,11 +2481,11 @@ mod tests {
     }
 
     /// A fresh daemon cannot adopt a machine the old one runs, so an edit
-    /// over a running machine refuses — naming every machine in the way, in
-    /// any non-stopped state — instead of booting the old configuration or
+    /// over a machine in any non-stopped state is reloaded into the running
+    /// daemon instead (PRD §7.1) — never booting the old configuration, never
     /// stopping anything.
     #[test]
-    fn an_edit_over_running_machines_refuses_and_names_them() {
+    fn an_edit_over_running_machines_is_reloaded() {
         let m = |name, state| crate::status::fixtures::machine(name, state, false, vm());
         for state in [
             PowerState::Running,
@@ -2394,33 +2494,50 @@ mod tests {
             PowerState::Suspended,
         ] {
             let status = lab(vec![m("web", state), m("db", PowerState::Stopped)]);
-            let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &status, "edited") else {
-                panic!("state {state:?} did not refuse");
-            };
-            assert!(why.contains("web is still running"), "{why}");
-            assert!(!why.contains("db"), "{why}");
-            assert!(why.contains("vmlab down"), "{why}");
+            assert_eq!(
+                daemon_freshness("demo", &status, "edited"),
+                DaemonFreshness::Reload,
+                "{state:?}"
+            );
         }
-        let both = lab(vec![
-            m("web", PowerState::Running),
-            m("db", PowerState::Running),
-        ]);
-        let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &both, "edited") else {
-            panic!("did not refuse");
-        };
-        assert!(why.contains("web, db are still running"), "{why}");
     }
 
-    /// Replacing the daemon would abandon a download it is doing, so that
-    /// refuses too, naming the artefact once however many machines wait on it.
+    /// Replacing the daemon would abandon a download it is doing, so an edit
+    /// during one is reloaded too; the machine waiting on it is left pending.
     #[test]
-    fn an_edit_during_a_download_refuses() {
+    fn an_edit_during_a_download_is_reloaded() {
         let mut status = lab(vec![crate::status::fixtures::machine(
             "web",
             PowerState::Stopped,
             false,
             vm(),
         )]);
+        status.pulls.push(PullStatus {
+            machine: "web".into(),
+            kind: PullKind::Template,
+            reference: "ghcr.io/vmlab/win11:1".into(),
+            bytes_done: 0,
+            bytes_total: 0,
+            percent: 0,
+        });
+        assert_eq!(
+            daemon_freshness("demo", &status, "edited"),
+            DaemonFreshness::Reload
+        );
+    }
+
+    /// A moved freeze decides what the network was assembled with, which a
+    /// reload never touches: over a download it refuses, naming the artefact
+    /// once however many machines wait on it.
+    #[test]
+    fn a_moved_freeze_during_a_download_refuses() {
+        let mut status = lab(vec![crate::status::fixtures::machine(
+            "web",
+            PowerState::Stopped,
+            false,
+            vm(),
+        )]);
+        status.freeze_stale = true;
         for machine in ["web", "web2"] {
             status.pulls.push(PullStatus {
                 machine: machine.into(),
@@ -2435,6 +2552,40 @@ mod tests {
             panic!("did not refuse");
         };
         assert_eq!(why.matches("ghcr.io/vmlab/win11:1").count(), 1, "{why}");
+    }
+
+    /// The lines a reload prints: one per machine, then the handlers and the
+    /// forwards, each naming what happened.
+    #[test]
+    fn a_reload_says_what_happened_to_each_machine() {
+        use crate::status::{MachineReload, PendingMachine, PendingReason, ReloadReport};
+        let report = ReloadReport {
+            machines: vec![
+                MachineReload::Rebuilt {
+                    machine: "web".into(),
+                },
+                MachineReload::Added {
+                    machine: "cache".into(),
+                },
+                MachineReload::Dropped {
+                    machine: "old".into(),
+                },
+                MachineReload::Pending(PendingMachine {
+                    machine: "db".into(),
+                    reason: PendingReason::Running,
+                }),
+            ],
+            handlers: true,
+            forwards: Vec::new(),
+        };
+        let lines = reload_lines(&report);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(lines[0].starts_with("web: rebuilt"), "{lines:?}");
+        assert!(lines[1].starts_with("cache: added"), "{lines:?}");
+        assert!(lines[2].starts_with("old: dropped"), "{lines:?}");
+        assert!(lines[3].starts_with("db: pending"), "{lines:?}");
+        assert!(lines[3].contains("vmlab vm restart db"), "{lines:?}");
+        assert!(lines[4].contains("handlers"), "{lines:?}");
     }
 
     /// A daemon left up by `lab stop` is listed by what runs under it.
