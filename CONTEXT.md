@@ -382,7 +382,9 @@ vmlab's own hypervisor, one process per machine in place of QEMU, driven over
 its own control protocol from a machine description vmlab writes (PRD §22,
 ADR-0021). A machine is on it when its block says `hypervisor = "vmlab"` or the
 host config's default for its kind does. It runs container micro-VMs and, from
-phases 2a and 2b, modern Linux VMs on q35 and SeaBIOS; what it cannot run yet
+phases 2a to 2c, modern VMs on q35 — SeaBIOS or OVMF, secure boot, a TPM,
+Hyper-V, Linux or Windows; a guest reset ends it, and the VM is booted again
+as one run, as QEMU resets in place. What it cannot run yet
 is one list of refusals, each naming the phase that brings it, which each
 phase shrinks. An online snapshot belongs to the hypervisor that took it.
 _Avoid_: the new backend, vmm (for the product)
