@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use super::{Display, DisplayHost};
+use crate::labd::hypervisor::{Frames, Input, QmpCapabilities};
 use crate::profiles::InputTransport;
 use crate::qmp::QmpClient;
 use crate::vnc::fake::{self, FakeRfb, pattern, raw_rect, update};
@@ -80,14 +81,25 @@ struct FakeHost {
     tap: Arc<crate::record::InputTap>,
 }
 
+impl FakeHost {
+    /// The QEMU adapter's own capabilities, over a fresh connection to the
+    /// mock server — what a running VM hands its display.
+    async fn qmp(&self) -> Result<QmpCapabilities> {
+        *self.qmp_opens.lock().unwrap() += 1;
+        Ok(QmpCapabilities(QmpClient::connect(&self.qmp).await?))
+    }
+}
+
 #[async_trait::async_trait]
 impl DisplayHost for FakeHost {
     fn name(&self) -> &str {
         "fake"
     }
-    async fn qmp(&self) -> Result<QmpClient> {
-        *self.qmp_opens.lock().unwrap() += 1;
-        Ok(QmpClient::connect(&self.qmp).await?)
+    async fn input(&self) -> Result<Arc<dyn Input>> {
+        Ok(Arc::new(self.qmp().await?))
+    }
+    async fn frames(&self) -> Result<Arc<dyn Frames>> {
+        Ok(Arc::new(self.qmp().await?))
     }
     fn vnc_sock(&self) -> PathBuf {
         self.vnc.clone()

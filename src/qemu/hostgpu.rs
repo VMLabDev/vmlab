@@ -411,15 +411,6 @@ pub struct RenderPlan {
 }
 
 impl RenderPlan {
-    /// The emulator to spawn: the host GPU's `qemu_binary`, else
-    /// `qemu-system-<arch>` from PATH.
-    pub fn emulator(&self, arch: &str) -> String {
-        match &self.qemu_binary {
-            Some(path) => path.display().to_string(),
-            None => super::emulator_binary(arch),
-        }
-    }
-
     /// The `-L` directory a host GPU's own QEMU is handed (§5.2): the stock
     /// QEMU's data directory, so a minimal build finds the firmware and
     /// option ROMs it was never installed beside. QEMU still searches its
@@ -493,6 +484,15 @@ pub fn apply_qemu_env(gpu: &str, env: &mut ChildEnv, extra: &[(String, String)])
         env.set.push((key.clone(), value.clone()));
     }
     Ok(())
+}
+
+/// The emulator to spawn: a host GPU's `qemu_binary` (a
+/// [`RenderPlan::qemu_binary`]), else `qemu-system-<arch>` from PATH.
+pub fn emulator(qemu_binary: Option<&Path>, arch: &str) -> String {
+    match qemu_binary {
+        Some(path) => path.display().to_string(),
+        None => super::emulator_binary(arch),
+    }
 }
 
 /// Decide a VM's [`RenderPlan`] before the emulator spawns (ADR-0003): pick
@@ -1171,7 +1171,10 @@ mod tests {
         h.gpus[1].address = "0000:03:00.0".into();
         let pt = render_plan(Some(&gpu(GpuMode::Passthrough, None)), &h, &sysfs).unwrap();
         assert_eq!(pt.qemu_binary.as_deref(), Some(bin.as_path()));
-        assert_eq!(pt.emulator("x86_64"), bin.display().to_string());
+        assert_eq!(
+            emulator(pt.qemu_binary.as_deref(), "x86_64"),
+            bin.display().to_string()
+        );
         let h = host_with_qemu(&bin, &[]);
         for mode in [GpuMode::Virgl, GpuMode::Vulkan] {
             let plan = render_plan(Some(&gpu(mode, None)), &h, &sysfs).unwrap();
@@ -1179,7 +1182,10 @@ mod tests {
         }
         let amd = render_plan(Some(&gpu(GpuMode::Vulkan, Some("AMD1"))), &h, &sysfs).unwrap();
         assert_eq!(amd.qemu_binary, None);
-        assert_eq!(amd.emulator("x86_64"), "qemu-system-x86_64");
+        assert_eq!(
+            emulator(amd.qemu_binary.as_deref(), "x86_64"),
+            "qemu-system-x86_64"
+        );
         assert_eq!(render_plan(None, &h, &sysfs).unwrap().qemu_binary, None);
     }
 

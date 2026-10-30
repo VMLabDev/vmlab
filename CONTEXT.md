@@ -365,9 +365,14 @@ The seam between deciding a machine should run and the host actually running
 it. Stated as what running means — the machine is up, it answers control, it
 exited for this reason — rather than which binary is launched, and it hands
 back its own handle types (**Process**, **Control**) rather than a host process
-and a QMP client, so an adapter can be entirely in-memory. TPM, filesystem
-daemons, the guest boot asset and process spawning sit below it; power state,
-exit classification, readiness and teardown ordering sit above.
+and a QMP client, so an adapter can be entirely in-memory. It is handed a
+typed description of what to launch — the resolved machine and its runtime
+paths — never a command line, and each adapter composes its own launch.
+What a running machine can do beyond the lifecycle — online snapshots, input,
+frames, hot-plug, media — is a **capability** its Control reports or does not.
+TPM, filesystem daemons, the guest boot asset, launch composition and process
+spawning sit below it; hardware resolution, power state, exit classification,
+readiness and teardown ordering sit above.
 Two adapters, both live: QEMU in production, the fake in the lifecycle tests.
 _Avoid_: driver, backend, runtime
 
