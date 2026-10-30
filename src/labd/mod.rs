@@ -39,6 +39,7 @@ pub mod record;
 pub mod reload_plan;
 pub mod share_plan;
 pub mod state;
+pub mod stop_plan;
 pub mod usb;
 pub mod vm;
 pub mod vm_agent;

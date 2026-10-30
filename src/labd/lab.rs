@@ -1633,7 +1633,8 @@ impl LabRuntime {
         // instead of being handed the channel the push then restarts. A
         // machine found current releases it a handshake later.
         if let Err(e) = m.wait_agent_up(m.ready_timeout()).await {
-            self.agent_update_failed(&name, None, &asset.version, &e, output);
+            self.agent_update_unreached(m.as_ref(), &asset.version, &e, output)
+                .await;
             return;
         }
         let replacing = m.begin_agent_replacement().await;
@@ -1643,7 +1644,8 @@ impl LabRuntime {
         {
             Ok(agent) => agent.info().agent_version.clone(),
             Err(e) => {
-                self.agent_update_failed(&name, None, &asset.version, &e, output);
+                self.agent_update_unreached(m.as_ref(), &asset.version, &e, output)
+                    .await;
                 return;
             }
         };
@@ -1689,6 +1691,33 @@ impl LabRuntime {
             json!({"vm": name, "machine": name, "from": from, "to": pushed, "ok": true}),
         );
         output(format!("agent: updated \"{name}\" ({from} → {pushed})\n"));
+    }
+
+    /// A refresh that gave up waiting for the agent, before anything was
+    /// pushed: a failure where the machine is still up, but a quiet,
+    /// accurate event where it was stopped under the refresh — `ok = false`
+    /// with `stopped = true`, nothing on the caller's output, and a line in
+    /// the daemon log.
+    async fn agent_update_unreached(
+        &self,
+        m: &dyn Machine,
+        to: &str,
+        e: &anyhow::Error,
+        output: &crate::scripting::OutputSink,
+    ) {
+        use super::agent_repair::{Unreached, unreached};
+        let name = m.name();
+        match unreached(m.state().await) {
+            Unreached::Failed => self.agent_update_failed(name, None, to, e, output),
+            Unreached::Stopped => {
+                tracing::info!(machine = %name, "agent refresh: the machine stopped before its agent answered; nothing was pushed");
+                self.events.emit(
+                    "machine.agent_updated",
+                    json!({"vm": name, "machine": name, "from": null, "to": to, "ok": false, "stopped": true,
+                           "error": format!("{name} stopped before its agent answered; nothing was pushed")}),
+                );
+            }
+        }
     }
 
     /// The failed refresh: said, evented, and survived.

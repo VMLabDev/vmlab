@@ -181,7 +181,9 @@ and reports the lab up once every step has finished. Provision output streams
 live to the terminal, prefixed with the machine's name, and into the lab log.
 
 `down` walks the stop ladder on every machine — agent shutdown, then ACPI, then
-an emulator quit that flushes the disks, then a kill after a timeout — and asks
+an emulator quit that flushes the disks, then a kill after a timeout; a booting
+guest is waited for until its agent answers, and one that ignores ACPI skips that
+rung — and asks
 the supervisor to release the daemon.
 `destroy` does the same and then removes everything in `.vmlab/`.
 

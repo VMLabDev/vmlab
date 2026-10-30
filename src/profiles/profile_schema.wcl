@@ -33,6 +33,11 @@ type Profile {
   agent_transport: utf8?
   agent_channel: bool?  // superseded by agent_transport: true = virtio-serial, false = none
   input_transport: utf8?  // "qmp" (default) | "vnc" — scripted input path (§10.3)
+  // The guest shuts down on an ACPI power-button press (§7.2). Default true;
+  // false (macOS) makes a graceful stop rely on the agent alone: it waits for
+  // a booting guest's agent as long as readiness would, and skips the ACPI
+  // rung that would only delay the emulator quit.
+  acpi_shutdown: bool?
   virtiofs: bool?       // guest mounts virtiofs natively (default false) — §7.5 share transport
   // What the guest reads the RTC as (§7.3): "utc" (default — the RTC holds
   // UTC; Windows guests on the Rust agent are told so) | "localtime" (the

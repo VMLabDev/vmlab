@@ -1308,8 +1308,10 @@ impl VmInstance {
     }
 
     /// Graceful stop ladder (PRD §7.2): guest-agent shutdown → ACPI
-    /// powerdown → emulator quit → hard kill, each with a timeout.
+    /// powerdown → emulator quit → hard kill, each with a timeout. Which
+    /// rungs, and how long each waits, is [`super::stop_plan`]'s.
     async fn stop_ladder(&self, force: bool) -> Result<()> {
+        use super::stop_plan::{Rung, StopFacts, plan_stop};
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
             return Ok(()); // already stopped
@@ -1319,81 +1321,117 @@ impl VmInstance {
         if !force && let Err(e) = self.wake(WakeCause::Stop).await {
             tracing::warn!("{e:#}");
         }
+        let t = self.template();
+        let plan = plan_stop(&StopFacts {
+            force,
+            agent_channel: t.resolved.agent_transport.has_channel(),
+            agent_answered: self.agent_up_flag().await,
+            agent_sealed: t.agent_version.is_some(),
+            acpi_shutdown: t.resolved.acpi_shutdown,
+            ready_timeout: super::machine::Machine::ready_timeout(self),
+        });
         *self.stop_requested.write().await = true;
         *self.state.write().await = PowerState::Stopping;
+        let began = std::time::Instant::now();
 
-        if force {
-            proc.kill().await;
-            let _ = proc.wait_exit(Duration::from_secs(10)).await;
-            return self.settle_stopped(STOP_SETTLE).await;
-        }
-
-        // Rung 1: guest agent shutdown. The state is already Stopping so
-        // `agent()`'s Running gate can't be used: take the cached handle, or
-        // make one quick connect attempt on guests with an agent channel.
-        if self.agent_up_flag().await {
-            let agent = self.agent.cached().await;
-            let agent = match agent {
-                Some(a) => Some(a),
-                None if self.template().resolved.agent_transport.has_channel() => {
-                    super::vm_agent::AgentHandle::connect(
-                        &self.dirs.agent_sock(),
-                        Duration::from_secs(2),
-                    )
-                    .await
-                    .ok()
-                }
-                None => None,
-            };
-            if let Some(agent) = agent
-                && agent
-                    .shutdown_guest(
-                        super::vm_agent::ShutdownMode::Powerdown,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    .is_ok()
-                && proc.wait_exit(Duration::from_secs(30)).await.is_ok()
-            {
-                return self.settle_stopped(STOP_SETTLE).await;
-            }
-        }
-
-        // Rung 2: ACPI powerdown. Delivery succeeding says nothing about the
-        // guest acting on it — a guest with no ACPI daemon, or one sitting at
-        // a "really shut down?" dialog, ignores it entirely.
         // The handle is taken out of the lock first: the exit monitor's
-        // teardown clears `control`, so a guard held across the wait below
+        // teardown clears `control`, so a guard held across a wait below
         // would keep the machine from ever settling at Stopped.
         let control = self.control.lock().await.clone();
-        if let Some(control) = &control {
-            let _ = control.powerdown().await;
-            if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
-                return self.settle_stopped(STOP_SETTLE).await;
+        for rung in plan {
+            let ended = match rung {
+                // The state is already Stopping, so `agent()`'s Running gate
+                // can't be used, and the readiness poller has stopped looking:
+                // the ladder dials the agent itself, until it answers or the
+                // guest powers off on its own.
+                Rung::Agent {
+                    answer_within,
+                    exit_within,
+                } => match self.agent_for_stop(proc.as_ref(), answer_within).await {
+                    Some(agent) => {
+                        agent
+                            .shutdown_guest(
+                                super::vm_agent::ShutdownMode::Powerdown,
+                                Duration::from_secs(5),
+                            )
+                            .await
+                            .is_ok()
+                            && proc.wait_exit(exit_within).await.is_ok()
+                    }
+                    None => !proc.is_running(),
+                },
+                // Delivery succeeding says nothing about the guest acting on
+                // it — a guest with no ACPI daemon, or one sitting at a
+                // "really shut down?" dialog, ignores it entirely.
+                Rung::Acpi { exit_within } => match &control {
+                    Some(control) => {
+                        let _ = control.powerdown().await;
+                        proc.wait_exit(exit_within).await.is_ok()
+                    }
+                    None => false,
+                },
+                // The guest is not shut down, but QEMU flushes its block
+                // caches on the way out; a SIGKILL drops the qcow2 metadata it
+                // still holds, and the disk then reads as empty or unbootable.
+                // A guest that halts at "It's now safe to turn off your
+                // computer" (Windows 9x, DOS) ends every graceful stop here.
+                Rung::Quit { exit_within } => match &control {
+                    Some(control) => {
+                        tracing::warn!(
+                            "{}: guest ignored shutdown, quitting the emulator",
+                            self.cfg.name
+                        );
+                        let _ = control.quit().await;
+                        proc.wait_exit(exit_within).await.is_ok()
+                    }
+                    None => false,
+                },
+                Rung::Kill => {
+                    if !force {
+                        tracing::warn!("{}: graceful stop timed out, killing", self.cfg.name);
+                    }
+                    proc.kill().await;
+                    let _ = proc.wait_exit(Duration::from_secs(10)).await;
+                    true
+                }
+            };
+            if ended {
+                tracing::info!(
+                    "{}: stopped at the {} rung after {:.1}s",
+                    self.cfg.name,
+                    rung.name(),
+                    began.elapsed().as_secs_f64()
+                );
+                break;
             }
         }
-
-        // Rung 3: tell the emulator to quit. The guest is not shut down, but
-        // QEMU flushes its block caches on the way out; a SIGKILL drops the
-        // qcow2 metadata it still holds, and the disk then reads as empty or
-        // unbootable. A guest that halts at "It's now safe to turn off your
-        // computer" (Windows 9x, DOS) ends every graceful stop here.
-        if let Some(control) = &control {
-            tracing::warn!(
-                "{}: guest ignored shutdown, quitting the emulator",
-                self.cfg.name
-            );
-            let _ = control.quit().await;
-            if proc.wait_exit(Duration::from_secs(30)).await.is_ok() {
-                return self.settle_stopped(STOP_SETTLE).await;
-            }
-        }
-
-        // Rung 4: hard kill.
-        tracing::warn!("{}: graceful stop timed out, killing", self.cfg.name);
-        proc.kill().await;
-        let _ = proc.wait_exit(Duration::from_secs(10)).await;
         self.settle_stopped(STOP_SETTLE).await
+    }
+
+    /// The agent the stop ladder's first rung asks, dialled until it answers
+    /// or `within` runs out — one attempt when `within` is zero. `None` once
+    /// the time is up, or as soon as the guest has powered off by itself.
+    async fn agent_for_stop(
+        &self,
+        proc: &dyn Process,
+        within: Duration,
+    ) -> Option<super::vm_agent::AgentHandle> {
+        let deadline = tokio::time::Instant::now() + within;
+        let sock = self.dirs.agent_sock();
+        loop {
+            if self.agent.probe(&sock).await
+                && let Some(agent) = self.agent.cached().await
+            {
+                return Some(agent);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            // Doubles as the pause between attempts.
+            if proc.wait_exit(Duration::from_secs(1)).await.is_ok() {
+                return None;
+            }
+        }
     }
 
     /// Wait for the exit monitor to settle the power state — the interface's
