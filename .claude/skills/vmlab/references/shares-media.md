@@ -265,7 +265,9 @@ name is resolved against the lab in the current directory, and the lab daemon is
 started if none is running. The qualified form addresses a lab that is already
 running from any directory and never starts one. The machine must be running with
 an agent that advertises the `clipboard` feature (`vmlab machine capabilities`,
-cli-machine.md).
+cli-machine.md). On a macOS guest the clipboard is the pasteboard of whoever is
+logged in at the console; at the login window both subcommands refuse with
+`nobody is logged in at the console, so there is no pasteboard to reach`.
 
 ### vmlab clipboard get
 

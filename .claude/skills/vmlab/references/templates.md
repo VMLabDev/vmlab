@@ -223,6 +223,34 @@ no unattended hook, so its provision types the install line over the screen, for
 example `D:\INSTALL.BAT` from the CD, or `A:\INSTALL.BAT` from a floppy `media`
 block. The scripts probe drives A, D, E and F for their source.
 
+For an x86_64 guest the ISO also carries the **macOS agent** under `macos/`, with
+`install.sh` and `firstboot.sh`. A fresh macOS runs no unattended hook, so the
+build boots Recovery, opens its Terminal and types the install line; Recovery
+mounts the ISO at `/Volumes/VMLAB`:
+
+```sh
+/Volumes/VMLAB/macos/install.sh [--user NAME --password PW [--full-name TEXT]] [DATA-VOLUME]
+```
+
+It writes onto the new system's Data volume (default
+`/Volumes/Macintosh HD - Data`): `/Library/vmlab/vmlab-agent`, the LaunchDaemon
+`dev.vmlab.agent` (root, `RunAtLoad`, `KeepAlive`, `/etc/paths`' `PATH`, log
+`/var/log/vmlab-agent.log`), and `.AppleSetupDone`, removing a stale
+`.AppleSetupTermsOfService` that would bring the Terms page back. With `--user`
+the first boot creates that administrator with `sysadminctl`, marks its per-user
+setup screens seen, and deletes itself and the root-only file holding the
+password (log `/var/log/vmlab-firstboot.log`). Without `--user` no account is
+made. The account is an argument, never a file on the ISO, so the ISO stays the
+same for every template and no password enters the media cache.
+
+The macOS agent handshakes as `os = "macos"` and serves `terminal`, `exec`,
+`fileops`, `tail`, `metrics`, `set_time` and `clipboard`. It does not advertise
+`watch`, `tree` or any shared-app mode, so the workspace syncer, process trees
+and `vmlab app` refuse by name. Its clipboard is the console user's pasteboard and
+refuses while nobody is logged in. A repair restarts it with `launchctl kickstart -k
+system/dev.vmlab.agent`; `launchctl bootout` from inside the agent kills the
+command doing it, because a job's processes die with the job.
+
 TempleOS is the exception that proves the rule: it reads no ISO 9660 and has no
 network, so nothing can be carried in. Its agent is HolyC, and a provision types
 it at the shell with `vmlab::templeos_agent_script()` (wscript-lab-api.md), which
