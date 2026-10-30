@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
 # The end-to-end test image: vmlab, its container guest asset and the Linux
-# agent built from this checkout, beside every host tool vmlab drives. Run it
+# agent built from this checkout, and vmlab-hv at the revision Cargo.lock pins
+# its protocol crate to, beside every host tool vmlab drives. Run it
 # privileged with /dev/kvm passed through (`just e2e::run`).
 
 FROM rust:1-trixie AS build
@@ -32,6 +33,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       ./guest/build-agent.sh linux-x86_64; \
     mkdir -p /out/guest; \
     cp -r --sparse=always guest/dist/x86_64 guest/dist/agent guest/dist/firmware /out/guest/
+# vmlab-hv (PRD §22) from the commit vmlab-hv-proto is locked to, so the
+# binary speaks exactly the protocol this vmlab was built against.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/hv/target \
+    set -eux; \
+    rev=$(sed -n 's|^source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=[0-9a-f]*#\([0-9a-f]*\)"$|\1|p' Cargo.lock | head -n1); \
+    test -n "$rev"; \
+    [ -d /hv/.git ] || git init -q /hv; \
+    git -C /hv fetch -q --depth 1 https://github.com/VMLabDev/vmlab-hypervisor.git "$rev"; \
+    git -C /hv checkout -q --force FETCH_HEAD; \
+    cargo build --release --locked --manifest-path /hv/Cargo.toml --bin vmlab-hv; \
+    install -D /hv/target/release/vmlab-hv /out/vmlab-hv
 
 FROM registry:2 AS registry
 
@@ -60,6 +73,7 @@ RUN set -eux; \
     rm -rf "$deb" /tmp/virtiofsd-old
 COPY --from=registry /bin/registry /usr/local/bin/registry
 COPY --from=build /out/vmlab /usr/local/bin/vmlab
+COPY --from=build /out/vmlab-hv /usr/local/bin/vmlab-hv
 COPY --from=build /out/guest /usr/share/vmlab/guest
 # A second Linux agent with a different stamp, for the agent-refresh check.
 COPY --from=build /out/stale-agent /usr/share/vmlab/e2e/stale-agent

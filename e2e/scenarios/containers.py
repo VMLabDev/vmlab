@@ -51,7 +51,10 @@ def run(h):
         # -- container.up: the workload runs, from a pulled image -----------
         line = h.machine_line(lab, "web")
         release = sh(h, lab, "web", "cat /etc/alpine-release", check=False, container=True)
-        h.ok("container.up", "state=running" in line and "digest=sha256:" in line and release.out.startswith("3.22"),
+        # On the hypervisor the run is for, as the host config's default put it.
+        on = f"hypervisor={h.hypervisor}" in line
+        h.ok("container.up",
+             on and "state=running" in line and "digest=sha256:" in line and release.out.startswith("3.22"),
              f"{line.strip()} release={release.out.strip()}")
 
         # -- container.exec: output and exit code ---------------------------
