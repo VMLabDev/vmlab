@@ -26,9 +26,12 @@
 //! none. A caller asks for the one it needs and refuses when it is absent; it
 //! never reaches past the seam for a protocol client (ADR-0020).
 //!
-//! Note what is *not* here: building the argv. Resolving hardware into a
-//! command line is [`crate::qemu`]'s job and is already pure and tested; this
-//! seam is about running machines, not composing them.
+//! The seam receives a typed [`Launch`] — the resolved machine and the
+//! runtime paths its caller computed — and each adapter composes its own
+//! launch from it. QEMU's composes an argv by calling the same pure builders
+//! in [`crate::qemu`] (ADR-0003, ADR-0008); resolving hardware stays above
+//! the seam, and only turning the result into a command line moved below it
+//! (ADR-0020, amending ADR-0001).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,7 +40,9 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::guest_asset::GuestAsset;
+use crate::qemu::container::ContainerVmPaths;
 use crate::qemu::process::{ChildEnv, ChildFd};
+use crate::qemu::{Accel, ResolvedContainer, ResolvedVm, VmPaths};
 
 mod qemu;
 pub use qemu::Qemu;
@@ -209,7 +214,7 @@ pub trait Media: Send + Sync {
 ///
 /// QEMU binds these from the argv, so its adapter ignores them; an in-memory
 /// adapter has to stand them up itself. Naming them here rather than leaving
-/// them buried in [`LaunchSpec::args`] is what lets the fake speak the real
+/// them buried in the composed launch is what lets the fake speak the real
 /// ctl and agent protocols over a socket, the way the agent client's own
 /// tests already do.
 #[derive(Debug, Clone, Default)]
@@ -220,13 +225,35 @@ pub struct GuestChannels {
     pub ctl: Option<PathBuf>,
 }
 
-/// A prepared emulator invocation.
+/// What to launch: the resolved machine and the runtime paths its caller
+/// computed for this start — never a command line. Each adapter composes its
+/// own launch from it (ADR-0020).
+pub enum Launch {
+    /// A full VM (§5).
+    Vm {
+        lab: String,
+        resolved: Box<ResolvedVm>,
+        paths: Box<VmPaths>,
+        /// The accelerator [`crate::qemu::plan_accel`] decided on.
+        accel: Accel,
+        /// The host GPU's own emulator build, run in place of the stock one
+        /// (`gpu {}`'s `qemu_binary`, §5.2). `None` runs the stock emulator.
+        emulator: Option<PathBuf>,
+    },
+    /// A container micro-VM (§18), booting the host's guest asset.
+    Container {
+        lab: String,
+        resolved: Box<ResolvedContainer>,
+        paths: Box<ContainerVmPaths>,
+    },
+}
+
+/// A prepared machine start.
 pub struct LaunchSpec {
     /// Process label for logs and diagnostics (`qemu:dc01`).
     pub label: String,
-    /// Emulator binary (`qemu-system-x86_64`).
-    pub binary: String,
-    pub args: Vec<String>,
+    /// The machine to launch.
+    pub machine: Launch,
     /// The emulator's environment changes — the Vulkan loader variables a
     /// `gpu {}` owns (`qemu::hostgpu::emulator_env`).
     pub env: ChildEnv,
@@ -286,9 +313,10 @@ pub trait Hypervisor: Send + Sync + 'static {
         log: &Path,
     ) -> Result<Arc<dyn Process>>;
 
-    /// Spawn the emulator and return once it answers control. CPUs stay
-    /// paused (`-S`) — the caller resumes them once it has subscribed to the
-    /// events it needs.
+    /// Compose the launch [`LaunchSpec::machine`] describes, spawn it, and
+    /// return once it answers control. CPUs stay paused — the caller resumes
+    /// them once it has subscribed to the events it needs. A launch that
+    /// cannot be composed fails here, before anything is spawned.
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running>;
 
     /// The kernel + initramfs this host boots a container micro-VM from

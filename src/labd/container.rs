@@ -747,11 +747,11 @@ impl ContainerInstance {
                     self.resolved.arch
                 );
             }
-            let args = qemu::container::build_container_args(
-                &self.lab,
-                &self.resolved,
-                &self.build_paths(&asset, &parts, vfs_devices),
-            )?;
+            let machine = super::hypervisor::Launch::Container {
+                lab: self.lab.clone(),
+                resolved: Box::new(self.resolved.clone()),
+                paths: Box::new(self.build_paths(&asset, &parts, vfs_devices)),
+            };
             // The machine answers control shortly after spawn (-S leaves
             // CPUs paused); the hypervisor returns once it does.
             let qemu_log = self.dirs.logs.join("qemu.log");
@@ -760,8 +760,7 @@ impl ContainerInstance {
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
-                    binary: qemu::emulator_binary(&self.resolved.arch),
-                    args,
+                    machine,
                     // A micro-VM has no GPU, but its emulator still starts
                     // with the Vulkan loader variables cleared.
                     env: qemu::hostgpu::emulator_env(false, None, None, None),

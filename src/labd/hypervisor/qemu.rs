@@ -3,9 +3,10 @@
 //! Everything here is the mapping layer the seam's own handle types buy —
 //! `Proc` becomes a [`Process`], the QMP client plus its SHUTDOWN-event watch
 //! become a [`Control`], and each capability is the QMP commands its callers
-//! used to send themselves, in the same order. Nothing above the seam sees a
-//! `Proc` or a QMP client again, which is what lets [`super::fake`] be
-//! in-memory.
+//! used to send themselves, in the same order. A [`Launch`] becomes an argv
+//! through the pure builders in [`crate::qemu`]. Nothing above the seam sees
+//! a `Proc`, a QMP client or an argv again, which is what lets
+//! [`super::fake`] be in-memory.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,8 +16,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use super::{
-    Control, Frames, GuestAsset, Hotplug, Hypervisor, Input, LaunchSpec, Media, Process, Running,
-    Snapshots,
+    Control, Frames, GuestAsset, Hotplug, Hypervisor, Input, Launch, LaunchSpec, Media, Process,
+    Running, Snapshots,
 };
 use crate::qemu::Proc;
 use crate::qmp::QmpClient;
@@ -76,17 +77,12 @@ impl Hypervisor for Qemu {
     }
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
-        crate::qemu::process::write_launch_header(&spec.log, &spec.binary, &spec.args, &spec.env)?;
+        let (binary, args) = compose(&spec.machine)?;
+        crate::qemu::process::write_launch_header(&spec.log, &binary, &args, &spec.env)?;
         let log_from = crate::qemu::process::log_offset(&spec.log);
-        let proc = Proc::spawn_with_fds(
-            &spec.label,
-            &spec.binary,
-            &spec.args,
-            &spec.env,
-            &spec.log,
-            spec.fds,
-        )
-        .await?;
+        let proc =
+            Proc::spawn_with_fds(&spec.label, &binary, &args, &spec.env, &spec.log, spec.fds)
+                .await?;
         let qmp = connect_qmp_retry(&spec.qmp_sock, &proc, &spec.log, log_from).await?;
         // QEMU binds the guest channels itself, from the argv — this adapter
         // has nothing to stand up, only to say where they landed. It is the
@@ -106,6 +102,32 @@ impl Hypervisor for Qemu {
     fn guest_asset(&self, arch: &str) -> Result<GuestAsset> {
         crate::guest_asset::ensure_guest_asset(arch)
     }
+}
+
+/// The emulator binary and argv for a launch: the stock
+/// `qemu-system-<arch>` unless a host GPU names its own build, and the argv
+/// from the same pure builder each machine kind always used.
+fn compose(launch: &Launch) -> Result<(String, Vec<String>)> {
+    Ok(match launch {
+        Launch::Vm {
+            lab,
+            resolved,
+            paths,
+            accel,
+            emulator,
+        } => (
+            crate::qemu::hostgpu::emulator(emulator.as_deref(), &resolved.arch),
+            crate::qemu::build_args(lab, resolved, paths, *accel)?,
+        ),
+        Launch::Container {
+            lab,
+            resolved,
+            paths,
+        } => (
+            crate::qemu::emulator_binary(&resolved.arch),
+            crate::qemu::container::build_container_args(lab, resolved, paths)?,
+        ),
+    })
 }
 
 /// Present a spawned host process as the seam's [`Process`].

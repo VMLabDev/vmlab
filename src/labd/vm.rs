@@ -1025,20 +1025,26 @@ impl VmInstance {
                     format!("{}: installing the Vulkan PCI-filter layer", self.cfg.name)
                 })?;
             }
-            let args = qemu::build_args(
-                &self.lab,
-                &t.resolved,
-                &self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices, &render)?,
+            let machine = super::hypervisor::Launch::Vm {
+                lab: self.lab.clone(),
+                resolved: Box::new(t.resolved.clone()),
+                paths: Box::new(self.build_paths(
+                    &t,
+                    firmware.as_ref(),
+                    nic_specs,
+                    vfs_devices,
+                    &render,
+                )?),
                 accel,
-            )?;
+                emulator: render.qemu_binary.clone(),
+            };
             // The machine answers control shortly after spawn (-S leaves CPUs
             // paused); the hypervisor returns once it does.
             let super::hypervisor::Running { proc, control } = self
                 .hv
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!("qemu:{}", self.cfg.name),
-                    binary: render.emulator(&t.resolved.arch),
-                    args,
+                    machine,
                     env: render.env,
                     log: self.dirs.logs.join("qemu.log"),
                     qmp_sock: self.dirs.qmp_sock(),
