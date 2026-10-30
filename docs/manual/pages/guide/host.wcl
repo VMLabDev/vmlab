@@ -3,7 +3,7 @@ page guide_host {
   chapter_header "Host configuration and WSL 2" {
     kicker       = "The guide · explanation"
     reading_time = "8 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -328,6 +328,23 @@ emulated guest a couple of minutes to boot. Nested virtualisation inside a
 guest is separate: a KVM guest on x86 sees VMX or SVM only when its VM sets
 `nested = true`, and only when the host's own `kvm_intel` or `kvm_amd` module
 has nested virtualisation on. `vmlab up` warns with the fix when it is off.
+DOC
+
+  h2 "Windows guests under KVM"
+
+  p <<'DOC'
+A Windows guest from Vista on runs with the Hyper-V enlightenments: the shipped
+`windows-11`, `windows-10`, `windows-server` and `windows-legacy` profiles set
+`hyperv = true`, so under KVM the `-cpu` string gains `hv-time`, `hv-stimer`,
+`hv-synic` and the rest. Windows then reads its clock from the Hyper-V
+reference TSC page. Without them it falls back to an emulated timer, and every
+clock read becomes a trip out of the guest: on native KVM about 5.6 µs a read
+against about 20 ns, and nested under WSL 2 about 51 µs. Software that reads
+the clock often (.NET, games, build tools) runs visibly slower. Set
+`hyperv = false` on a VM to see that difference, or to rule the
+enlightenments out when you debug a guest. They are never applied under TCG or
+with a `cpu_model`. vmlab never adds `+invtsc`, because QEMU refuses to migrate
+a guest that has it, and online snapshots are migrations.
 DOC
 
   callout "A missing /dev/kvm is the first thing to check" {
