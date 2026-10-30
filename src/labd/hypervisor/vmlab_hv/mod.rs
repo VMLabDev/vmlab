@@ -14,7 +14,7 @@
 //! under QEMU: the same virtiofsd serves container volumes over vhost-user.
 //! A VM's shares wait for vmlab-hv's own virtio-fs (phase 2e), so a VM's
 //! adapter reports no virtiofsd and `transport = "auto"` shares fall back to
-//! SMB. There is no software TPM to start until phase 2c.
+//! SMB. A VM's TPM is the host's swtpm, started as for QEMU.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,6 +100,7 @@ impl describe::HostRoms {
             vgabios_virtio: find(&["vgabios-virtio.bin"]),
             // vmlab-hv's own iPXE build, never QEMU's (HV phase-2 D14, D16).
             ipxe_virtio: find(&["1af41000.rom"]),
+            ipxe_virtio_efi: find(&["virtio-net.rom", "1af41000.efirom"]),
         }
     }
 }
@@ -126,14 +127,16 @@ fn args(machine: &Path, control_sock: &Path) -> Vec<String> {
 
 #[async_trait::async_trait]
 impl Hypervisor for VmlabHv {
+    /// The same swtpm QEMU's VMs get (HV-D17): vmlab-hv's `tpm-tis` speaks
+    /// its control socket.
     async fn start_tpm(
         &self,
         machine: &str,
-        _state_dir: &Path,
-        _ctrl_sock: &Path,
-        _log: &Path,
+        state_dir: &Path,
+        ctrl_sock: &Path,
+        log: &Path,
     ) -> Result<Arc<dyn Process>> {
-        bail!("{machine}: vmlab-hv has no TPM yet — a VM with one runs on QEMU (PRD §22)")
+        super::qemu::start_host_swtpm(machine, state_dir, ctrl_sock, log).await
     }
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
