@@ -267,8 +267,10 @@ TXT
     first-boot script, no provision or playbook and nothing depending on it is
     refreshed in the background when its agent first answers, after `up` has
     returned. Its line goes to the lab daemon's log instead of your terminal;
-    the event and `diverged=yes` report it as usual. `vmlab vm start` always
-    refreshes this way. A guest that never answers is never waited for.
+    the event and `diverged=yes` report it as usual. `vmlab vm start`
+    refreshes this way too, except for a clone still owing its first-boot
+    script, which it runs and then refreshes inline, as `up` does. A guest
+    that never answers is never waited for.
   DOC
   p <<DOC
     A VM being refreshed, inline by `up` or in the background, is not

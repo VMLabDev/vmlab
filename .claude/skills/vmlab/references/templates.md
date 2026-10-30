@@ -419,10 +419,13 @@ repository `vmlab template push` publishes to.
 
 `first_boot` is read at build time and baked into the template's metadata, so a
 clone runs it on its first start without the lab needing the file. It runs
-before the VM turns ready. With `agent = true` the build waits for the
-guest-installed agent's handshake before sealing and records the agent version in
-the metadata. With `agent = false`, or on a profile with no agent channel, the
-check is skipped and the build log says so.
+before the VM turns ready, under whichever verb starts the clone first: `up`,
+`vm start`, `vm restart`, or a script's `start()`/`restart()`. A finished run
+writes `.vmlab/vms/<vm>/firstboot.done`; until then every start runs it. With
+`agent = true` the build waits for the guest-installed agent's handshake before
+sealing and records the agent version in the metadata. With `agent = false`, or
+on a profile with no agent channel, the check is skipped and the build log says
+so.
 
 How long the build waits for the agent depends on the source:
 

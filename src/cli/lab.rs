@@ -1341,8 +1341,12 @@ pub fn cmd_machine_power(
             PowerOp::Stop => (lab_client_for(lab).await?.1, Vec::new()),
         };
         let started = super::record::finished_line(&record);
+        // Streamed: a start reports its pull, and a start or restart the
+        // first boot it runs for a clone that still owes one (§6.1).
         client
-            .send(op.request(machine.clone(), force, record))
+            .send_streaming(op.request(machine.clone(), force, record), |chunk| {
+                print!("{chunk}")
+            })
             .await
             .map_err(remote)?;
         // A pending machine that has just booted booted on the new file.
