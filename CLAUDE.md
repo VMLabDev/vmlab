@@ -139,7 +139,8 @@ Module map under `src/`:
   (`gpu_keepawake.c`, also compiled by `build.rs`), the helper the
   supervisor's `supervisor/keepawake.rs` runs to hold a host GPU out of
   runtime suspend between labs (ADR-0018).
-- `qmp/` — the QMP client.
+- `qmp/` — the QMP client, used only below the Hypervisor seam by its QEMU
+  adapter.
 - `appshare/` — shared apps (§20): the CLI-side host end, because only the
   user's desktop session reaches the compositor. `select_mode` picks the
   protocol from the guest family and the host session; `waypipe.rs` and
@@ -223,6 +224,12 @@ Module map under `src/`:
   check (§21.5).
 - `labd/` — per-lab daemon: lifecycle, snapshots, network assembly, events,
   SMB integration, the lab runtime the wscript host binds to;
+  `hypervisor/` is the Hypervisor seam (ADR-0001, ADR-0020): it receives a
+  typed `Launch` (resolved machine plus runtime paths) and hands back a
+  `Process` and a `Control`, whose capabilities — snapshots, input, frames,
+  hot-plug, media — are reported or `None`; `qemu.rs` composes the argv with
+  the pure builders in `qemu/` and translates each capability to QMP, and
+  `fake.rs` is the in-memory adapter the lifecycle tests drive;
   `provisioning.rs` is §7.2's per-machine provisioning: each machine's steps
   run in parallel once it is ready, gated by `depends_on_provision`, with
   machine-prefixed output and the first failure cancelling the rest (wscript
