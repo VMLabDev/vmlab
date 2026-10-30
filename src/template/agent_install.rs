@@ -37,6 +37,7 @@ pub(crate) fn is_legacy_agent(agent_version: &str) -> bool {
 fn agent_flavour(os: &str, legacy: bool, profile: Option<&str>) -> AgentOs {
     match (os, legacy) {
         ("windows", false) => AgentOs::Windows,
+        ("macos", _) => AgentOs::Macos,
         // The NT and 9x builds both say "windows"; the machine's profile
         // tells them apart.
         ("windows", true) if profile == Some("windows-9x") => AgentOs::Windows9x,
@@ -133,6 +134,10 @@ mod tests {
         assert_eq!(
             agent_flavour("linux", is_legacy_agent("0.1.0"), None),
             AgentOs::Linux
+        );
+        assert_eq!(
+            agent_flavour("macos", is_legacy_agent("agent=1a2b3c4"), Some("macos")),
+            AgentOs::Macos
         );
     }
 

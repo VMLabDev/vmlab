@@ -35,7 +35,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 pub use config::{ShareDef, SmbConfig, SmbCredentials};
-pub use mount::{linux_mount_cmd, windows_mount_cmds, xp_net_use_string};
+pub use mount::{linux_mount_cmd, macos_mount_cmd, windows_mount_cmds, xp_net_use_string};
 pub use server::{SmbError, SmbServer};
 pub use steps::{VirtiofsMount, guest_os_hint, mount_plan};
 
@@ -50,6 +50,8 @@ pub enum OsHint {
     Windows,
     /// `net use` typed via the screen-automation surface (no agent on XP).
     WindowsXp,
+    /// `mount_smbfs` run via the guest agent.
+    Macos,
 }
 
 /// A single command to run in the guest to realise one share's mount.
@@ -208,7 +210,7 @@ impl LabSmb {
 
     /// Build the per-VM mount plan: one [`MountStep`] sequence the daemon runs
     /// (via the guest agent, or screen automation on XP) to mount every share.
-    /// `os_hint` selects Linux/Windows/XP command generation.
+    /// `os_hint` selects Linux/Windows/XP/macOS command generation.
     pub fn mount_plan(&self, vm: &str, os_hint: OsHint) -> Vec<MountStep> {
         let Some(plan) = self.vms.get(vm) else {
             return Vec::new();
@@ -257,6 +259,30 @@ impl LabSmb {
                             refused_exit: cmd.refused_exit,
                         });
                     }
+                }
+                OsHint::Macos => {
+                    steps.push(MountStep {
+                        os_hint,
+                        command: "mkdir".into(),
+                        args: vec!["-p".into(), guest.clone()],
+                        share: Some(share.clone()),
+                        refused_exit: None,
+                    });
+                    let (cmd, args) = macos_mount_cmd(
+                        gw,
+                        share,
+                        guest,
+                        &creds.username,
+                        &creds.password,
+                        *readonly,
+                    );
+                    steps.push(MountStep {
+                        os_hint,
+                        command: cmd,
+                        args,
+                        share: Some(share.clone()),
+                        refused_exit: None,
+                    });
                 }
                 OsHint::WindowsXp => {
                     // XP always maps to a drive letter; `guest` is expected to
@@ -377,6 +403,21 @@ mod tests {
         let data = cfg.shares.iter().find(|s| s.name == "data").unwrap();
         assert_eq!(data.allowed_user, config::current_unix_user());
         assert!(data.readonly);
+    }
+
+    /// A macOS guest makes the mount point, then `mount_smbfs`s the share
+    /// from the same gateway a Linux guest mounts it from.
+    #[test]
+    fn macos_mount_plan() {
+        let lab = sample();
+        let steps = lab.mount_plan("web", OsHint::Macos);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].command, "mkdir");
+        assert_eq!(steps[0].args, ["-p", "/mnt/src"]);
+        assert_eq!(steps[1].command, "/sbin/mount_smbfs");
+        assert!(steps.iter().all(|s| s.share.as_deref() == Some("src")));
+        let url = &steps[1].args[steps[1].args.len() - 2];
+        assert!(url.ends_with("@10.0.0.1/src"), "{url}");
     }
 
     #[test]

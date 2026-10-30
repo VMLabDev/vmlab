@@ -17,4 +17,5 @@ targets = [
     "riscv64gc-unknown-linux-musl",
     "i686-unknown-linux-musl",
     "x86_64-pc-windows-gnu",
+    "x86_64-apple-darwin",
 ]

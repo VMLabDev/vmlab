@@ -40,8 +40,9 @@ credential API. vmlab is not a security boundary between you and your guests.
 - A `login` with no `password` on a Windows-family profile is an error. The
   agent is SYSTEM and every credential-free logon route is one Windows
   disqualifies.
-- `elevated` on a Linux-family profile is an error. Root is root, and a
-  non-root user cannot be elevated without sudo.
+- `elevated` on a Linux-family or macOS-family profile is an error. Root is
+  root, and a non-root user cannot be elevated without sudo. The macOS agent is
+  root too, so a macOS `login` needs no `password`.
 - More than one `login` with `default = true` on a machine is an error naming
   both.
 - A machine with exactly one `login` has it as the default implicitly.
@@ -133,3 +134,14 @@ not work here" is only answerable if you can see which one you got.
 The password is not verified: root needs no credential to become an account,
 which is why the container floor costs nothing. An account not in the guest's
 passwd fails by name.
+
+### macOS: the same route, through launchd
+
+A macOS session takes the PAM route: `su -l` reads `/etc/pam.d/su`, whose session
+module `pam_launchd` puts the command in the account's own launchd domain. The
+banner says `via a PAM login session (/usr/bin/su -l)`. Accounts come from the
+directory service, not `/etc/passwd`, so one made with `sysadminctl` is found and a
+missing one fails naming `dscl . -list /Users`. There is no `XDG_RUNTIME_DIR`
+(macOS has no `/run/user`; launchd gives `$TMPDIR`). `vmlab cp --user` reads and
+writes through Darwin's per-thread credential, which carries the account's
+groups.

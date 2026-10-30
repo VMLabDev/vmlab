@@ -80,6 +80,7 @@ pub fn guest_os_hint(profile: Option<&str>) -> OsHint {
     match profile {
         Some("windows-legacy" | "windows-xp") => OsHint::WindowsXp,
         Some(p) if p.starts_with("windows") => OsHint::Windows,
+        Some(p) if p.starts_with("macos") => OsHint::Macos,
         _ => OsHint::Linux,
     }
 }
@@ -125,6 +126,19 @@ fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
                 unsupported.push(format!(
                     "virtiofs share \"{}\": XP-era guests have neither the vmlab agent nor \
                      WinFsp — mount it over smb instead (transport = \"smb\")",
+                    m.tag
+                ));
+            }
+        }
+        // macOS has no virtiofs client: Apple ships no virtio-fs driver for
+        // x86 guests. `transport = "auto"` never puts a macOS share here (the
+        // `macos` profile does not claim virtiofs); one declared
+        // `transport = "virtiofs"` is reported, not attempted.
+        OsHint::Macos => {
+            for m in mounts {
+                unsupported.push(format!(
+                    "virtiofs share \"{}\": macOS guests have no virtiofs client — mount it \
+                     over smb instead (transport = \"smb\")",
                     m.tag
                 ));
             }
@@ -236,6 +250,7 @@ mod tests {
         assert_eq!(guest_os_hint(Some("windows-legacy")), OsHint::WindowsXp);
         assert_eq!(guest_os_hint(Some("windows-xp")), OsHint::WindowsXp);
         assert_eq!(guest_os_hint(Some("linux-modern")), OsHint::Linux);
+        assert_eq!(guest_os_hint(Some("macos")), OsHint::Macos);
         assert_eq!(guest_os_hint(None), OsHint::Linux);
     }
 
@@ -316,6 +331,19 @@ mod tests {
     #[test]
     fn a_windows_guest_with_no_virtiofs_shares_registers_nothing() {
         assert!(mount_plan(OsHint::Windows, &[], Vec::new()).is_empty());
+    }
+
+    /// macOS has no virtiofs client, so a virtiofs share on it is reported as
+    /// unmountable, naming the transport that works.
+    #[test]
+    fn a_macos_guest_cannot_mount_virtiofs_and_says_so() {
+        let plan = mount_plan(OsHint::Macos, &mounts(), Vec::new());
+        assert!(plan.steps.is_empty(), "{:#?}", plan.steps);
+        assert_eq!(plan.unsupported.len(), 2);
+        assert!(
+            plan.unsupported[0].contains("transport = \"smb\""),
+            "{plan:#?}"
+        );
     }
 
     /// The divergence between the guest-OS classifications, made deliberate:

@@ -32,9 +32,9 @@ use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 
 use crate::mux::{Credit, Input, Mux};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod inotify;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use inotify as backend;
 
 #[cfg(windows)]
@@ -449,5 +449,5 @@ pub(crate) fn join_rel(dir: &str, name: &str) -> String {
 
 // The tests drive the real backend against a real tree, and the build host
 // is a Linux one.
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

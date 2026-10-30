@@ -3,7 +3,7 @@ page guide_apps {
   chapter_header "Shared apps" {
     kicker       = "The guide · explanation"
     reading_time = "8 min read"
-    updated      = "2026-10-15"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -265,6 +265,6 @@ DOC
     li "No wscript call shares an app. Scripts run in the headless lab daemon."
     li "vmlab turns on no audio, USB or printer redirection, although the protocols can carry some of them."
     li "vmlab writes no host launcher entries (`.desktop` files) for guest programs."
-    li "macOS guests and hosts are not supported."
+    li "macOS guests share no apps: `vmlab app run` refuses one by name, because macOS serves none of waypipe, X11 or RDP RemoteApp. Use `vmlab console` for its desktop. macOS hosts are not supported."
   }
 }

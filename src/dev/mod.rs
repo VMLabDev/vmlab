@@ -187,6 +187,11 @@ mod tests {
         let devs =
             resolved(r#"@dev container "buildbox" { image = "sdk:9.0" profile = "container" }"#);
         assert_eq!(devs[0].workspace_guest, "/src");
+
+        // macOS's `/` is the sealed system volume, so its profile lands the
+        // workspace on the Data volume instead.
+        let devs = resolved(r#"@dev vm "mac" { template = "x86_64/mac" profile = "macos" }"#);
+        assert_eq!(devs[0].workspace_guest, "/Users/Shared/src");
     }
 
     /// A profile with no dev keys still hosts a dev machine — the floor

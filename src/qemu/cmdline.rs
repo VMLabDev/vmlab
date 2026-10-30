@@ -8,7 +8,7 @@ use anyhow::Result;
 use vmlab_agent_proto::PORT_NAME as AGENT_PORT_NAME;
 
 use super::resolve::ResolvedVm;
-use crate::config::model::{AccelMode, GpuMode, MacAddr};
+use crate::config::model::{AccelMode, GpuMode, InputDevices, MacAddr};
 use crate::profiles::{AgentTransport, DiskBus, FirmwareKind};
 
 /// Per-VM runtime paths and attachments supplied by the lab daemon.
@@ -57,6 +57,11 @@ pub struct VmPaths {
     /// The host PCI address a `passthrough` GPU hands the guest: the
     /// declared host GPU the lab daemon picked (`hostgpu::render_plan`).
     pub gpu_passthrough: Option<String>,
+    /// The TSC frequency, in Hz, a `tsc = "host"` VM is pinned at under KVM
+    /// (§5.2): the host's, read from KVM by the lab daemon at the VM's first
+    /// start and kept (`tsc::probe_host_hz`). Required there; read nowhere
+    /// else.
+    pub tsc_hz: Option<u64>,
     /// A data directory searched ahead of QEMU's own (`-L`): the stock
     /// QEMU's, handed to a host GPU's `qemu_binary` so a minimal build finds
     /// its firmware and ROMs (`hostgpu::RenderPlan::data_dir`).
@@ -216,6 +221,33 @@ fn host_nested_problem_in(sys_module: &Path) -> Option<String> {
     None
 }
 
+/// Why a macOS guest faults on this host, with the fix — or None when there
+/// is nothing to say (§5.2). XNU reads Intel MSRs that KVM does not emulate,
+/// and KVM injects a #GP for each unless `ignore_msrs` is on; on an AMD host
+/// that is every boot. No KVM module loaded means no KVM at all, which the
+/// TCG fallback warning already covers.
+pub fn host_msrs_problem() -> Option<String> {
+    host_msrs_problem_in(Path::new("/sys/module"))
+}
+
+fn host_msrs_problem_in(sys_module: &Path) -> Option<String> {
+    let param = sys_module.join("kvm/parameters/ignore_msrs");
+    let value = std::fs::read_to_string(&param).ok()?;
+    let value = value.trim();
+    if matches!(value, "Y" | "y" | "1") {
+        return None;
+    }
+    Some(format!(
+        "a macOS guest needs KVM to ignore the MSRs it does not emulate, and this host's \
+         kvm has ignore_msrs off ({} = {value}), so the guest faults during boot — set it with \
+         `echo \"options kvm ignore_msrs=1 report_ignored_msrs=0\" | sudo tee \
+         /etc/modprobe.d/kvm-msrs.conf` and, until the next boot, \
+         `echo 1 | sudo tee {}` (PRD §5.2)",
+        param.display(),
+        param.display(),
+    ))
+}
+
 /// The Hyper-V enlightenments `hyperv = true` adds to the KVM `-cpu` string
 /// (§5.2): Windows reads its clock from the reference TSC page instead of an
 /// emulated timer, and takes fewer exits for interrupts, timers, TLB flushes
@@ -323,6 +355,43 @@ fn hyperv_apicv(vm: &ResolvedVm, accel: Accel, apic_virtualization: bool) -> Opt
     (vm.hyperv && hyperv_skipped(vm, accel).is_none()).then_some(apic_virtualization)
 }
 
+/// The OSK string the Apple SMC hands a macOS guest that asks for it
+/// (§5.2). Public knowledge, the same in every Mac; the guest refuses to boot
+/// without it, which is the only reason `apple_smc` exists.
+pub const APPLE_SMC_OSK: &str = "ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc";
+
+/// The qdev id of the xHCI controller `input = "usb"` puts the keyboard and
+/// tablet on (§5.2).
+pub const INPUT_XHCI_ID: &str = "xhci";
+
+/// Why a VM that resolved `tsc = "host"` boots without a pinned TSC under
+/// `accel` — `None` when it gets one, or never asked. The frequency is read
+/// from KVM, and `tsc-frequency` is an x86 CPU property (§5.2).
+fn tsc_skipped(vm: &ResolvedVm, accel: Accel) -> Option<&'static str> {
+    if vm.tsc.is_none() {
+        None
+    } else if accel == Accel::Tcg {
+        Some("it runs under TCG, and the frequency is read from KVM")
+    } else {
+        None
+    }
+}
+
+/// The line `up` prints for a VM that resolved `tsc = "host"` and boots
+/// without a pinned TSC under `accel` (§5.2). Unlike `hyperv`, said for an
+/// inherited one too: a guest that needs an invariant TSC — macOS — does not
+/// boot without one, and its profile is where the setting usually comes
+/// from.
+pub fn tsc_not_applied(vm: &ResolvedVm, accel: Accel) -> Option<String> {
+    tsc_skipped(vm, accel).map(|why| {
+        format!(
+            "vm \"{}\": tsc = \"host\" is not applied — {why}; it boots with QEMU's default \
+             TSC, which a macOS guest does not boot with (PRD §5.2)",
+            vm.name
+        )
+    })
+}
+
 pub fn emulator_binary(arch: &str) -> String {
     format!("qemu-system-{}", qemu_arch(arch))
 }
@@ -400,7 +469,18 @@ pub fn build_args(
         Accel::Tcg => ("tcg", "max".to_string()),
     };
     arg(&mut a, "accel", accel_name.into());
-    arg(&mut a, "cpu", vm.cpu_model.clone().unwrap_or(default_cpu));
+    let mut cpu = vm.cpu_model.clone().unwrap_or(default_cpu);
+    // `tsc = "host"` (§5.2): an invariant TSC, pinned at the host's
+    // frequency. `+invtsc` alone makes QEMU refuse every migration — and an
+    // online snapshot is one (§7.3) — unless the frequency is explicit, so
+    // the two only ever go together.
+    if vm.tsc.is_some() && tsc_skipped(vm, accel).is_none() {
+        let hz = paths.tsc_hz.ok_or_else(|| {
+            anyhow::anyhow!("tsc = \"host\" needs the host TSC frequency (PRD §5.2)")
+        })?;
+        cpu.push_str(&format!(",+invtsc,tsc-frequency={hz}"));
+    }
+    arg(&mut a, "cpu", cpu);
     arg(&mut a, "smp", vm.cpus.to_string());
     arg(&mut a, "m", format!("{}M", vm.memory >> 20));
     // A fixed clock starts the RTC at the declared instant, and a guest that
@@ -412,6 +492,17 @@ pub fn build_args(
     // AVIC stays on only without PIT tick re-injection (§5.2).
     if hyperv_apicv(vm, accel, paths.apic_virtualization) == Some(true) {
         arg(&mut a, "global", HYPERV_APICV_PIT.into());
+    }
+    // The Apple SMC (§5.2): macOS reads the OSK from it and refuses to boot
+    // where there is none, and looks for an SMBIOS baseboard (type 2) table,
+    // which QEMU only emits when asked.
+    if vm.apple_smc {
+        arg(
+            &mut a,
+            "device",
+            format!("isa-applesmc,osk={APPLE_SMC_OSK}"),
+        );
+        arg(&mut a, "smbios", "type=2".into());
     }
 
     // Always headless, with a VNC display on a unix socket (§11). A
@@ -737,17 +828,41 @@ pub fn build_args(
     // gains a second controller beside `-usb`'s. QEMU then places the
     // unaddressed tablet on the xHCI (verified on q35, QEMU 11.1) — one more
     // reason the flag is opt-in: the guest's USB topology changes with it.
+    //
+    // `input = "usb"` (§5.2) adds a USB keyboard beside the tablet, for a
+    // guest that reads no PS/2 keyboard (macOS, and OpenCore before it). On
+    // x86 both go on an xHCI of their own in place of `-usb`'s controller.
+    // Neither is bound to the display: QMP `send-key` names no console, and
+    // QEMU hands such an event to the newest *unbound* keyboard — the USB
+    // one, which takes over from PS/2 when it is created — so binding it
+    // would leave scripted keys on the PS/2 keyboard the guest ignores.
     let usbx = format!("qemu-xhci,id={}", crate::usb::CONTROLLER_ID);
+    let usb_input = vm.input == InputDevices::Usb;
     if virt {
         let xhci = if vm.usb { usbx } else { "qemu-xhci".into() };
         arg(&mut a, "device", xhci);
+        if usb_input {
+            arg(&mut a, "device", "usb-kbd".into());
+        }
+        arg(&mut a, "device", "usb-tablet".into());
+    } else if usb_input {
+        arg(&mut a, "device", format!("qemu-xhci,id={INPUT_XHCI_ID}"));
+        arg(&mut a, "device", format!("usb-kbd,bus={INPUT_XHCI_ID}.0"));
+        arg(
+            &mut a,
+            "device",
+            format!("usb-tablet,bus={INPUT_XHCI_ID}.0"),
+        );
+        if vm.usb {
+            arg(&mut a, "device", usbx);
+        }
     } else {
         a.push("-usb".into());
         if vm.usb {
             arg(&mut a, "device", usbx);
         }
+        arg(&mut a, "device", "usb-tablet".into());
     }
-    arg(&mut a, "device", "usb-tablet".into());
 
     // virtiofs shares: one vhost-user-fs device per export, tag = share
     // name — the guest agent mounts by tag once the VM is ready (§7.5).
@@ -1586,6 +1701,118 @@ mod tests {
         assert!(s.contains("virtio-gpu-pci"), "{s}");
         assert!(s.contains("tpm-tis-device,tpmdev=tpm0"), "{s}");
         assert!(s.contains("virtio-blk-pci,drive=disk0"), "{s}");
+    }
+
+    /// The `macos` profile's argv (§5.2) is Phase 0's working command line,
+    /// with vmlab's own ids, paths and plumbing around it: the Skylake model
+    /// with the VMware leaf and an invariant TSC pinned at the frequency the
+    /// lab daemon handed in, the Apple SMC and an SMBIOS type 2 table, OVMF
+    /// without secure boot, AHCI disks, VMware SVGA, a USB keyboard and
+    /// tablet on their own xHCI, virtio-net and the agent's virtio-serial
+    /// port, and no TPM.
+    #[test]
+    fn macos_shape_is_phase_0s_command_line() {
+        let vm = resolved("macos", "x86_64");
+        let mut p = paths();
+        p.extra_disks = vec![("oc".into(), "/lab/.vmlab/t/disk-oc.qcow2".into())];
+        p.serial_log = Some("/logs/l/t/serial.log".into());
+        p.tsc_hz = Some(4_291_956_000);
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert_eq!(
+            s,
+            "-name vmlab:l/t -machine q35 -accel kvm \
+             -cpu Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on,\
+             +invtsc,tsc-frequency=4291956000 \
+             -smp 4 -m 8192M \
+             -device isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc \
+             -smbios type=2 \
+             -display none -vnc unix:/run/l/t/vnc.sock,share=ignore \
+             -qmp unix:/run/l/t/qmp.sock,server=on,wait=off -monitor none \
+             -serial file:/logs/l/t/serial.log \
+             -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+             -drive if=pflash,format=raw,file=/lab/.vmlab/t/OVMF_VARS.fd \
+             -chardev socket,id=vagent0,path=/run/l/t/agent.sock,server=on,wait=off \
+             -device virtio-serial-pci \
+             -device virtserialport,chardev=vagent0,name=vmlab.agent.0 \
+             -blockdev driver=qcow2,node-name=disk0,file.driver=file,file.filename=/lab/.vmlab/t/disk0.qcow2 \
+             -device ide-hd,drive=disk0,bus=ide.0,unit=0 \
+             -blockdev driver=qcow2,node-name=disk1,file.driver=file,file.filename=/lab/.vmlab/t/disk-oc.qcow2 \
+             -device ide-hd,drive=disk1,bus=ide.1,unit=0 \
+             -netdev stream,id=net0,server=off,addr.type=unix,addr.path=/run/l/t/nic0.sock \
+             -device virtio-net-pci,netdev=net0,mac=52:54:00:00:00:01 \
+             -device vmware-svga \
+             -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
+             -S"
+        );
+        // Unaddressed PCI devices on q35 land on pcie.0 — where QEMU keeps a
+        // virtio device transitional, the mode AppleVirtIO drives.
+        assert!(!s.contains("pcie-root-port"), "{s}");
+    }
+
+    /// `tsc = "host"` needs the frequency the lab daemon reads; under TCG,
+    /// where there is no KVM to read it from, it is left off and said.
+    #[test]
+    fn a_pinned_tsc_needs_kvm_and_a_frequency() {
+        let vm = resolved("macos", "x86_64");
+        let mut p = paths();
+        let err = build_args("l", &vm, &p, Accel::Kvm).unwrap_err();
+        assert!(err.to_string().contains("host TSC frequency"), "{err}");
+        p.tsc_hz = Some(3_000_000_000);
+        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        assert!(!s.contains("invtsc") && !s.contains("tsc-frequency"), "{s}");
+        let said = tsc_not_applied(&vm, Accel::Tcg).unwrap();
+        assert!(said.contains("tsc = \"host\" is not applied"), "{said}");
+        assert_eq!(tsc_not_applied(&vm, Accel::Kvm), None);
+        assert_eq!(
+            tsc_not_applied(&resolved("linux-modern", "x86_64"), Accel::Tcg),
+            None
+        );
+        // On the host CPU too: the pin follows the accelerator default.
+        let mut host = resolved("linux-modern", "x86_64");
+        host.tsc = Some(crate::config::model::TscMode::Host);
+        let s = joined(&build_args("l", &host, &p, Accel::Kvm).unwrap());
+        assert!(
+            s.contains("-cpu host,vmx=off,svm=off,+invtsc,tsc-frequency=3000000000"),
+            "{s}"
+        );
+    }
+
+    /// `input = "usb"` beside `usb = true`: the input xHCI and the
+    /// passthrough one are separate controllers, and `-usb` is not used.
+    #[test]
+    fn usb_input_and_usb_passthrough_are_two_controllers() {
+        let mut vm = resolved("macos", "x86_64");
+        vm.usb = true;
+        let mut p = paths();
+        p.tsc_hz = Some(1);
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains("-device qemu-xhci,id=xhci "), "{s}");
+        assert!(s.contains("-device qemu-xhci,id=usbx"), "{s}");
+        assert!(!s.contains("-usb "), "{s}");
+        // Without `apple_smc`, no SMC and no SMBIOS table.
+        vm.apple_smc = false;
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(!s.contains("applesmc") && !s.contains("-smbios"), "{s}");
+    }
+
+    /// The ignore_msrs check reads the kvm module's parameter, and names the
+    /// fix when it is off.
+    #[test]
+    fn host_msrs_off_is_named_with_its_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = dir.path().join("kvm/parameters");
+        assert_eq!(host_msrs_problem_in(dir.path()), None, "no kvm module");
+        std::fs::create_dir_all(&params).unwrap();
+        std::fs::write(params.join("ignore_msrs"), "Y\n").unwrap();
+        assert_eq!(host_msrs_problem_in(dir.path()), None);
+        std::fs::write(params.join("ignore_msrs"), "N\n").unwrap();
+        let said = host_msrs_problem_in(dir.path()).unwrap();
+        assert!(said.contains("ignore_msrs = N"), "{said}");
+        assert!(
+            said.contains("options kvm ignore_msrs=1 report_ignored_msrs=0"),
+            "{said}"
+        );
+        assert!(said.contains("/etc/modprobe.d/"), "{said}");
     }
 
     /// `usb = true` (§5.2.1): an xHCI with the fixed id host devices

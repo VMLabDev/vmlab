@@ -7,7 +7,7 @@
 //! [`guest_client`], so the tests need no `socat` or Python on the host.
 
 #![cfg(test)]
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};

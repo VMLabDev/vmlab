@@ -3,7 +3,7 @@ page cmd_app {
   chapter_header "vmlab app" {
     kicker       = "Commands · reference"
     reading_time = "6 min read"
-    updated      = "2026-10-15"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -37,7 +37,10 @@ page cmd_app {
   p <<DOC
     The command reads the guest family from the machine's effective profile
     in the lab file: a profile whose name starts with `windows` is a Windows
-    guest, and every other machine, containers included, is a Linux guest.
+    guest, one starting with `macos` a macOS guest, and every other machine,
+    containers included, is a Linux guest. A macOS guest is refused before
+    anything else is checked, because macOS serves none of the three
+    protocols.
     It reads the host session from its own environment. `WAYLAND_DISPLAY`
     set means Wayland. Otherwise `DISPLAY` set means X11. With neither, it
     refuses before it sends any request.
@@ -119,6 +122,7 @@ SRC
     rows:
       | "Message" | "When" |
       | "`no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set`" | "The command was not started inside a desktop session." |
+      | "`{machine}` is a macOS guest: shared apps are not supported on macOS guests — vmlab carries waypipe and X11 from Linux guests and RDP RemoteApp from Windows ones, and macOS serves none of them; use `vmlab console` for its desktop" | "The machine's profile is `macos…`." |
       | "`nothing to run — usage: vmlab app run [lab/]machine -- <cmd> [args...]`" | "Nothing follows `--`." |
       | "`--via {mode}` shares apps from {family} guests; `{machine}` is a {other family} guest" | "`--via` names a protocol the guest family cannot serve, for example `--via rdp` on a Linux guest." |
       | "`--via waypipe` needs a Wayland session: WAYLAND_DISPLAY is not set" | "`--via waypipe` on an X11 desktop." |

@@ -197,7 +197,8 @@ impl crate::labd::workspace::syncer::GuestSessions for WorkspaceSessions {
 
     /// On a Linux-family guest the default root (`/src`) sits under a
     /// root-owned `/`, so the agent identity makes it and hands it to the
-    /// login. A Windows login can create `C:\src` itself, and a machine with
+    /// login — and on macOS, whose agent is root too, wherever the workspace
+    /// was put (BSD `chown` reads `user:` as the owner alone). A Windows login can create `C:\src` itself, and a machine with
     /// no login writes as the agent identity anyway.
     async fn claim_root(&self, root: &str) -> Result<()> {
         if self.machine.guest_os() == crate::labd::guest_os::GuestOs::Windows {

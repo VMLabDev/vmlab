@@ -17,6 +17,10 @@
 //! INSTALL.BAT                   DOS: the legacy agent from FDAUTO.BAT / AUTOEXEC.BAT
 //! linux/<arch>/vmlab-agent      static musl binary (when built)
 //! windows/x86_64/vmlab-agent.exe  (when built)
+//! macos/vmlab-agent             Intel macOS (when built, x86_64 only), with
+//! macos/install.sh              its installer, run from the Recovery
+//! macos/firstboot.sh            Terminal, and the one-shot first-boot
+//!                               account creation that installer arms
 //! legacy/nt/vmlab-agent-legacy.exe  (when built; PRD §7.4's legacy tier)
 //! legacy/9x/vmlab-agent-legacy.exe  (when built)
 //! legacy/dos/VMLABAGT.EXE       (when built; 8.3 throughout, DOS reads no Joliet)
@@ -39,6 +43,8 @@ const INSTALL_CMD: &str = include_str!("bootstrap/install.cmd");
 const INSTALL_NT_CMD: &str = include_str!("bootstrap/install-nt.cmd");
 const INSTALL_9X_BAT: &str = include_str!("bootstrap/install-9x.bat");
 const INSTALL_DOS_BAT: &str = include_str!("bootstrap/INSTALL.BAT");
+const MACOS_INSTALL_SH: &str = include_str!("bootstrap/macos-install.sh");
+const MACOS_FIRSTBOOT_SH: &str = include_str!("bootstrap/macos-firstboot.sh");
 
 /// A staged guest-ISO folder, ready for the media cache to pack.
 #[derive(Debug)]
@@ -61,7 +67,8 @@ impl StagedGuestIso {
 /// Stage `<work>/guest-iso` with every agent binary available for `arch`.
 /// The guest OS isn't known at stage time (profiles carry no OS field), so
 /// every flavour rides along when built — the legacy ones only for an x86
-/// guest, the only kind they run on; at least one must exist — a build
+/// guest, the only kind they run on, and the macOS one only for x86_64, the
+/// only Mac vmlab runs; at least one must exist — a build
 /// that wants an agent but has no binary at all is an error, not a silently
 /// agent-less template (set `agent = false` to opt out).
 pub fn stage_guest_iso_dir(work: &Path, arch: &str) -> Result<StagedGuestIso> {
@@ -72,15 +79,7 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
     let dir = work.join("guest-iso");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    std::fs::write(dir.join("install.sh"), INSTALL_SH)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            dir.join("install.sh"),
-            std::fs::Permissions::from_mode(0o755),
-        )?;
-    }
+    write_script(&dir.join("install.sh"), INSTALL_SH)?;
     std::fs::write(dir.join("install.cmd"), INSTALL_CMD)?;
     std::fs::write(dir.join("install-nt.cmd"), INSTALL_NT_CMD)?;
     std::fs::write(dir.join("install-9x.bat"), dos_batch(INSTALL_9X_BAT))?;
@@ -88,6 +87,9 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
 
     let legacy_capable = matches!(arch, "x86" | "x86_64");
     let mut flavours = vec![AgentOs::Linux, AgentOs::Windows];
+    if arch == "x86_64" {
+        flavours.push(AgentOs::Macos);
+    }
     if legacy_capable {
         flavours.extend([
             AgentOs::WindowsNt,
@@ -104,6 +106,7 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
                 let sub = match os {
                     AgentOs::Linux => dir.join("linux").join(arch),
                     AgentOs::Windows => dir.join("windows").join(arch),
+                    AgentOs::Macos => dir.join("macos"),
                     AgentOs::WindowsNt => dir.join("legacy").join("nt"),
                     AgentOs::Windows9x => dir.join("legacy").join("9x"),
                     AgentOs::Dos => dir.join("legacy").join("dos"),
@@ -113,6 +116,13 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
                 std::fs::create_dir_all(sub.parent().unwrap())?;
                 std::fs::copy(&asset.path, &sub)
                     .with_context(|| format!("staging {}", asset.path.display()))?;
+                // Recovery runs these from the ISO, which keeps Rock Ridge
+                // modes: they ride along only with the binary they install.
+                if os == AgentOs::Macos {
+                    let macos = dir.join("macos");
+                    write_script(&macos.join("install.sh"), MACOS_INSTALL_SH)?;
+                    write_script(&macos.join("firstboot.sh"), MACOS_FIRSTBOOT_SH)?;
+                }
                 versions.push((os, asset.version));
             }
             Err(e) => missing.push(format!("{e:#}")),
@@ -131,6 +141,18 @@ fn stage_with_dirs(work: &Path, arch: &str, asset_dirs: &[PathBuf]) -> Result<St
         .collect();
     std::fs::write(dir.join("VERSION"), stamp)?;
     Ok(StagedGuestIso { dir, versions })
+}
+
+/// A shell script, executable: Rock Ridge carries the mode into the guest,
+/// which runs it straight off the ISO.
+fn write_script(path: &Path, text: &str) -> Result<()> {
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// A batch file as COMMAND.COM reads it: CRLF line endings. Windows 9x's
@@ -242,6 +264,80 @@ mod tests {
             stage_with_dirs(work.path(), "aarch64", &[assets.path().to_path_buf()]).unwrap();
         assert!(!staged.dir.join("legacy").exists());
         assert_eq!(staged.version_for(AgentOs::WindowsNt), None);
+    }
+
+    /// The macOS agent rides along for an x86_64 guest under `macos/`, with
+    /// the installer Recovery runs and the first-boot script it arms, all
+    /// executable; neither script is staged without the binary they install.
+    #[test]
+    fn stages_the_macos_flavour_and_its_scripts_for_x86_64_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let assets = tempfile::tempdir().unwrap();
+        for key in ["macos-x86_64", "linux-x86_64", "linux-aarch64"] {
+            let d = assets.path().join("agent").join(key);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("vmlab-agent"), b"bin").unwrap();
+            std::fs::write(d.join("VERSION"), "agent=mac\n").unwrap();
+        }
+        let work = tempfile::tempdir().unwrap();
+        let staged =
+            stage_with_dirs(work.path(), "x86_64", &[assets.path().to_path_buf()]).unwrap();
+        for name in ["vmlab-agent", "install.sh", "firstboot.sh"] {
+            let path = staged.dir.join("macos").join(name);
+            assert!(path.exists(), "macos/{name} was not staged");
+            if name != "vmlab-agent" {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o755, "macos/{name}");
+            }
+        }
+        assert_eq!(staged.version_for(AgentOs::Macos), Some("agent=mac"));
+        let stamp = std::fs::read_to_string(staged.dir.join("VERSION")).unwrap();
+        assert!(stamp.contains("macos agent=mac\n"), "{stamp}");
+
+        let work = tempfile::tempdir().unwrap();
+        let staged =
+            stage_with_dirs(work.path(), "aarch64", &[assets.path().to_path_buf()]).unwrap();
+        assert!(!staged.dir.join("macos").exists());
+        assert_eq!(staged.version_for(AgentOs::Macos), None);
+    }
+
+    /// Both macOS scripts are POSIX sh that parses, and the installer writes
+    /// exactly the paths the agent and the first-boot daemon are run from.
+    #[test]
+    fn the_macos_scripts_parse_and_agree_on_their_paths() {
+        for (name, text) in [
+            ("install.sh", MACOS_INSTALL_SH),
+            ("firstboot.sh", MACOS_FIRSTBOOT_SH),
+        ] {
+            let out = std::process::Command::new("sh")
+                .args(["-n", "-c", text])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        for path in [
+            "/Library/vmlab/vmlab-agent",
+            "/Library/LaunchDaemons/dev.vmlab.agent.plist",
+            "/Library/vmlab/firstboot.conf",
+            "/Library/LaunchDaemons/dev.vmlab.firstboot.plist",
+        ] {
+            assert!(MACOS_INSTALL_SH.contains(path), "install.sh: {path}");
+        }
+        for path in [
+            "/Library/vmlab/firstboot.conf",
+            "/Library/LaunchDaemons/dev.vmlab.firstboot.plist",
+        ] {
+            assert!(MACOS_FIRSTBOOT_SH.contains(path), "firstboot.sh: {path}");
+        }
+        assert!(MACOS_INSTALL_SH.contains(".AppleSetupDone"));
+        assert!(
+            MACOS_INSTALL_SH.contains("rm -f \"$data/private/var/db/.AppleSetupTermsOfService\"")
+        );
+        assert!(MACOS_FIRSTBOOT_SH.contains("sysadminctl -addUser"));
     }
 
     /// FreeDOS 1.2+ boots C:\FDAUTO.BAT and never reads AUTOEXEC.BAT, so the

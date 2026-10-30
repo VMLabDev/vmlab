@@ -37,6 +37,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | GPU acceleration: `gpu {}` modes, host GPUs, Venus, keeping a GPU awake | `references/vm.md`, `references/host-profiles.md` |
 | A guest that sleeps: the `suspended` state, `prevent_sleep`, waking with `vm start` | `references/vm.md`, `references/troubleshooting.md` |
 | A slow Windows guest under KVM: Hyper-V enlightenments (`hyperv`), on by default for Windows profiles from Vista on; an idle Windows guest's host CPU cost | `references/vm.md`, `references/troubleshooting.md` |
+| macOS guests: the `macos` profile, `apple_smc`, `input = "usb"`, `tsc = "host"`, `ignore_msrs`, and what the macOS family changes (shares, logins, playbooks, `app run`) | `references/host-profiles.md`, `references/vm.md`, `references/troubleshooting.md` |
 | The guest clock: `clock`, the RTC, what a restore sets | `references/vm.md`, `references/snapshots-vision.md` |
 | Containers as lab machines, the micro-VM model, the `container {}` block | `references/containers.md` |
 | Segments, DHCP, DNS, NAT, routing, traffic rules, the eBPF fast path | `references/networking.md` |
@@ -50,7 +51,8 @@ recalling vmlab behaviour or reading vmlab's source.
 | `@dev`, the workspace syncer, and `vmlab dev sync` | `references/dev-machines.md` |
 | Lab instances (`--instance`, `VMLAB_INSTANCE`, a linked worktree's name) and moving a lab to another directory (`vmlab lab move`) | `references/architecture.md`, `references/cli-lab.md` |
 | Worktree labs: freezing the main lab, worktree clones, the freeze point, locked snapshots, thaw, worktree isolation (`vmlab worktree`) | `references/worktrees.md`, `references/cli-lab.md` |
-| `login {}`, who runs as whom, minted Windows logons, Linux sessions, `as_login` | `references/logins.md` |
+| `login {}`, who runs as whom, minted Windows logons, Linux and macOS sessions, `as_login` | `references/logins.md` |
+| The macOS agent: what it serves and refuses, installing it from Recovery (`macos/install.sh`), the first-boot admin | `references/templates.md` (bootstrap ISO) |
 | Snapshots, screenshots, console recording, keyboard and mouse input, image matching, OCR | `references/snapshots-vision.md` |
 | Shared folders, `vmlab cp`, clipboard transfer (the `media {}` block is in `vm.md`) | `references/shares-media.md` |
 | The host config file, WSL 2, guest OS profiles, `vmlab osinfo` | `references/host-profiles.md` |

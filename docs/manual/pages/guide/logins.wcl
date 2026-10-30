@@ -3,7 +3,7 @@ page guide_logins {
   chapter_header "Logins" {
     kicker       = "The guide · explanation"
     reading_time = "7 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -54,7 +54,7 @@ DOC
 
   list {
     li "A `login` with no `password` on a Windows-family profile is an error. The agent is SYSTEM and every credential-free logon route is one Windows disqualifies."
-    li "`elevated` on a Linux-family profile is an error. Root is root, and a non-root user cannot be elevated without sudo."
+    li "`elevated` on a Linux-family or macOS-family profile is an error. Root is root, and a non-root user cannot be elevated without sudo. The macOS agent is root too, so a macOS `login` needs no `password`."
     li "More than one `login` with `default = true` on a machine is an error naming both."
     li "A machine with exactly one `login` has it as the default implicitly."
   }
@@ -152,5 +152,20 @@ does not work here" is only answerable if you can see which one you got. The
 password is not verified: root needs no credential to become an account, which
 is why the container floor costs nothing. An account not in the guest's passwd
 fails by name.
+DOC
+
+  h3 "macOS: the same route, through launchd"
+
+  p <<'DOC'
+A macOS session takes the PAM route too. Its `su -l` reads `/etc/pam.d/su`,
+whose session module is `pam_launchd`, so the command lands in the account's
+own launchd domain, which is as close to a login as macOS comes outside the
+GUI; the banner says `via a PAM login session (/usr/bin/su -l)`. Accounts are
+looked up in the directory service rather than `/etc/passwd`, so an account
+made with `sysadminctl` or System Settings is found, and one that does not
+exist fails naming `dscl . -list /Users`. There is no `XDG_RUNTIME_DIR`:
+macOS has no `/run/user`, and launchd gives each per-user process `$TMPDIR`
+instead. A `vmlab cp --user` reads and writes as the account through Darwin's
+per-thread credential, which carries the account's groups as well.
 DOC
 }
