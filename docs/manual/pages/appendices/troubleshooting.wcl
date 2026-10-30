@@ -385,6 +385,20 @@ MSG
     refusals ride the ledger, so they apply to a stopped machine too.
   DOC
 
+  h2 "Online snapshots get slower each time on btrfs"
+  p <<DOC
+    An online snapshot writes the guest's RAM into its qcow2. On a
+    copy-on-write btrfs a disk that was created before vmlab set NOCOW on its
+    directory fragments with every snapshot and every guest write:
+    `filefrag .vmlab/vms/<vm>/disk0.qcow2` reports tens of thousands of
+    extents, and `lsattr` shows no `C` flag on the disk. vmlab sets NOCOW only
+    on the directory, and only new files inherit it. Stop the machine, then
+    copy the disk within its directory so the copy is created NOCOW:
+    `cp --reflink=never disk0.qcow2 disk0.new && mv disk0.new disk0.qcow2`.
+    If the host config sets `btrfs_nocow = false`, remove that line first.
+    See [Host configuration and WSL 2](guide_host).
+  DOC
+
   h2 "A USB device node cannot be opened"
   code text { source = <<'MSG'
 cannot open /dev/bus/usb/{bus}/{dev} for {vid}:{pid} {device} at port {port} — vmlab runs as {user} and needs read-write access to it.
