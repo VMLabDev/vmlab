@@ -9,7 +9,7 @@ and version, clone it into any number of labs.
 A store entry is two files: `disk.qcow2`, the sealed image, and `template.wcl`,
 its metadata. The metadata records the hardware the template was built with
 (profile, CPUs, memory, disk size, firmware, TPM, secure boot, display, CPU
-model, accelerator), where
+model, Hyper-V enlightenments, Apple SMC, input devices, TSC, accelerator), where
 it came from, the version of `vmlab-agent` baked into it, the wscript surface
 version its embedded scripts were written against, an optional first-boot
 script, and the OCI repository it publishes to. The hardware fields form the
@@ -48,7 +48,7 @@ have. Never call a variant a "snapshot" — that is a VM snapshot.
   `base_sha256`, optional `default`, `description`, `first_boot_script`,
   `wscript_surface`, `agent_version`, and hardware overrides (`profile`, `cpus`,
   `memory`, `firmware`, `tpm`, `secure_boot`, `secure_boot_keys`, `display`,
-  `cpu_model`, `hyperv`, `accel`).
+  `cpu_model`, `hyperv`, `apple_smc`, `input`, `tsc`, `accel`).
   A variant counts only when both its block and its overlay exist.
 - **Effective metadata**: the base's fields with the variant's in their place.
   Hardware resolution, first boot, the surface check and agent staleness all
@@ -82,8 +82,8 @@ template "windows-11" {
 ```
 
 - A `variant` block takes `default`, `description`, `first_boot`, the hardware
-  overrides (`profile cpus memory display cpu_model hyperv accel firmware tpm
-  secure_boot secure_boot_keys`), `qemu_args` (replaces the template's),
+  overrides (`profile cpus memory display cpu_model hyperv apple_smc input tsc
+  accel firmware tpm secure_boot secure_boot_keys`), `qemu_args` (replaces the template's),
   `gpu {}` (replaces the template's; build VM only), `nic` (replaces the
   template's when declared), `media`, and `provision`/`playbook` steps run in
   declaration order. Validation: legal unique names, not `base`; exactly one
@@ -315,6 +315,9 @@ template "<name>" {
   display     = "virtio-vga"
   cpu_model   = "pentium3"
   hyperv      = true
+  apple_smc   = false
+  input       = "ps2"
+  tsc         = "host"
   accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
@@ -347,6 +350,9 @@ template "<name>" {
 | `display` | utf8 | from profile | QEMU display device string for the build VM. |
 | `cpu_model` | utf8 | from profile | QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`. |
 | `hyperv` | bool | from profile | Hyper-V enlightenments for the build VM under KVM; the build VM resolves it like any VM, so a template on a shipped Windows profile builds with them. Recorded in the metadata and inherited by clones. Not applied under TCG or with a `cpu_model`. |
+| `apple_smc` | bool | from profile | The Apple SMC and an SMBIOS type 2 table for the build VM, which a macOS installer needs. Recorded in the metadata and inherited by clones. x86 only. |
+| `input` | utf8 | from profile | Keyboard and pointer for the build VM: `ps2` or `usb` (USB keyboard and tablet on their own xHCI). Recorded in the metadata and inherited by clones. |
+| `tsc` | utf8 | from profile | `host`: an invariant TSC pinned at the host's frequency for the build VM, KVM only. Recorded in the metadata and inherited by clones; each clone pins its own frequency at its first start. x86 only. |
 | `accel` | utf8 | from profile | Accelerator for the build VM: `kvm` or `tcg`. Inherited by clones. `tcg` cannot be combined with `nested = true`. |
 | `firmware` | utf8 | from profile | Firmware: `ovmf` or `seabios`. |
 | `tpm` | bool | from profile | Enable a TPM 2.0 device. |

@@ -2,7 +2,7 @@ page guide_host {
   title = "Host configuration and WSL 2"
   chapter_header "Host configuration and WSL 2" {
     kicker       = "The guide · explanation"
-    reading_time = "8 min read"
+    reading_time = "9 min read"
     updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
@@ -343,8 +343,48 @@ against about 20 ns, and nested under WSL 2 about 51 µs. Software that reads
 the clock often (.NET, games, build tools) runs visibly slower. Set
 `hyperv = false` on a VM to see that difference, or to rule the
 enlightenments out when you debug a guest. They are never applied under TCG or
-with a `cpu_model`. vmlab never adds `+invtsc`, because QEMU refuses to migrate
-a guest that has it, and online snapshots are migrations.
+with a `cpu_model`. The enlightenments never add `+invtsc`, because QEMU
+refuses to migrate a guest that has it without a fixed frequency, and online
+snapshots are migrations.
+DOC
+
+  h2 "macOS guests under KVM"
+
+  p <<'DOC'
+An Intel macOS guest on the shipped `macos` profile needs one thing from the
+host that no other guest does: KVM must ignore the model-specific registers it
+does not emulate. XNU reads Intel MSRs that KVM has no model for, and by
+default KVM answers each read with a general-protection fault, so the guest
+panics or hangs early in boot. On an AMD host that happens on every boot. Turn
+the `kvm` module's `ignore_msrs` parameter on for good with a modprobe file,
+and for the current boot through sysfs:
+DOC
+
+  code sh { source = <<'SRC'
+echo "options kvm ignore_msrs=1 report_ignored_msrs=0" | sudo tee /etc/modprobe.d/kvm-msrs.conf
+echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs
+SRC
+  }
+
+  p <<'DOC'
+`report_ignored_msrs=0` keeps the kernel log free of a line per ignored read.
+`vmlab up` checks the parameter for every macOS VM it starts under KVM, which
+is any VM whose profile name starts with `macos` or whose `apple_smc` resolves
+on, and prints a warning with both commands when it is not `Y`. The warning
+does not stop the VM from starting.
+DOC
+
+  p <<'DOC'
+The profile also sets `tsc = "host"`: macOS reads its clock frequency from a
+CPUID leaf QEMU fills only for an invariant TSC at a known frequency. vmlab
+reads the host's TSC frequency from KVM at the VM's first KVM start and pins it
+in `.vmlab/vms/<vm>/tsc-hz`, and every later start reuses that value. Reading
+it afresh would break restores: the host kernel recalibrates its TSC at each
+boot, and QEMU refuses to load an online snapshot taken at another frequency.
+KVM runs a pinned frequency within its tolerance of the host's without
+scaling, so an old pin costs nothing. Under TCG there is no KVM to read the
+frequency from, and `up` warns that the VM boots without the pin; macOS does
+not boot that way. See [Troubleshooting](apx_troubleshooting).
 DOC
 
   callout "A missing /dev/kvm is the first thing to check" {

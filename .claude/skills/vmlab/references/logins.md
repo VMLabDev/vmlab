@@ -40,8 +40,9 @@ credential API. vmlab is not a security boundary between you and your guests.
 - A `login` with no `password` on a Windows-family profile is an error. The
   agent is SYSTEM and every credential-free logon route is one Windows
   disqualifies.
-- `elevated` on a Linux-family profile is an error. Root is root, and a
-  non-root user cannot be elevated without sudo.
+- `elevated` on a Linux-family or macOS-family profile is an error. Root is
+  root, and a non-root user cannot be elevated without sudo. The macOS agent is
+  root too, so a macOS `login` needs no `password`.
 - More than one `login` with `default = true` on a machine is an error naming
   both.
 - A machine with exactly one `login` has it as the default implicitly.
