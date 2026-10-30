@@ -756,6 +756,7 @@ impl VmInstance {
             gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
             gpu_passthrough: render.passthrough.clone(),
             qemu_data_dir: render.data_dir(&t.resolved.arch, std::env::var_os("PATH").as_deref()),
+            apic_virtualization: qemu::host_apic_virtualization(),
         })
     }
 

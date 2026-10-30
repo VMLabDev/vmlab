@@ -347,6 +347,28 @@ with a `cpu_model`. vmlab never adds `+invtsc`, because QEMU refuses to migrate
 a guest that has it, and online snapshots are migrations.
 DOC
 
+  p <<'DOC'
+Where the host's KVM virtualises the APIC (Intel APICv, AMD AVIC), an
+enlightened guest also gets `hv-avic`, and the in-kernel PIT stops
+re-injecting missed ticks (`-global kvm-pit.lost_tick_policy=discard`). Both
+keep APICv or AVIC on for the VM, so the guest acknowledges an interrupt
+without leaving the guest. vmlab reads the host's setting from
+`/sys/module/kvm_intel/parameters/enable_apicv` or
+`/sys/module/kvm_amd/parameters/avic` when the VM starts. Where it is off,
+neither is added, because there `hv-avic` would cost an exit per interrupt
+instead of saving one.
+DOC
+
+  p <<'DOC'
+An idle Windows 11 24H2 or Windows Server 2025 guest still costs the host
+more than an idle Linux or Server 2022 guest. Those Windows releases take 512
+clock interrupts a second on every vCPU, even with nothing running, and each
+one is a trip out of the guest. No QEMU flag or device choice changes that
+rate. The cost grows with the number of vCPUs and with the price of an exit,
+which is many times higher under nested KVM such as WSL 2. See
+[Troubleshooting](apx_troubleshooting) for what you can change.
+DOC
+
   callout "A missing /dev/kvm is the first thing to check" {
     kind = :note
     body = "If every VM is slow and `vmlab logs` shows the TCG fallback warning for x86_64 guests, the host lacks KVM: on WSL 2 enable nested virtualisation in `.wslconfig`, on a bare host check that your user can open `/dev/kvm`. See [Troubleshooting](apx_troubleshooting)."
