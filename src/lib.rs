@@ -9,6 +9,7 @@ pub mod dev;
 mod freeze;
 pub mod guest_asset;
 mod hashing;
+mod hvdisplay;
 mod instance;
 pub mod lab_init;
 mod labd;

@@ -10,7 +10,8 @@
 //! Split per ADR-0003: [`core`] is the pure part (timestamped events in,
 //! frames, cuts and a timeline out, no I/O); [`encoder`] turns a format into
 //! an `ffmpeg` argv and a discovery decision as values; [`Recorder`] is the
-//! executor that owns the RFB read loop, the ffmpeg child and the clock.
+//! executor that owns the display read loop (RFB, or vmlab-hv's native
+//! frame protocol), the ffmpeg child and the clock.
 
 pub mod core;
 pub mod encoder;
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub use executor::{Finished, Recorder, RecorderSpec};
+pub use executor::{Finished, Recorder, RecorderSpec, StreamSource};
 pub use input::{InputEvent, InputTap, TimedInput};
 
 /// Where a lab keeps recordings nobody named: `.vmlab/recordings/`, beside

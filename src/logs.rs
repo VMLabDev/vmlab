@@ -203,13 +203,14 @@ fn enumerate_in(base: &Path) -> Vec<LogFile> {
 }
 
 /// The files `vmlab logs <machine>` shows for one machine, in the order it
-/// prints them: a VM's `qemu.log` then `serial.log`, or a container's
+/// prints them: a VM's `qemu.log` (or `vmlab-hv.log`) then `serial.log`, or a container's
 /// `console.log`. Only files that exist are returned; a name with no logs
 /// under either directory yields none.
 pub fn machine_files(base: &Path, machine: &str) -> Vec<PathBuf> {
     let vm = base.join("vms").join(machine);
     [
         vm.join("qemu.log"),
+        vm.join("vmlab-hv.log"),
         vm.join("serial.log"),
         base.join("containers").join(machine).join("console.log"),
     ]

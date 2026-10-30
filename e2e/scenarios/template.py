@@ -2,6 +2,7 @@
 round trip through a local OCI registry."""
 
 import json
+import re
 import shutil
 
 from harness import E2E, WORK, ScenarioFailed
@@ -55,21 +56,40 @@ def built_event(h, name: str) -> bool:
     return "template.built" in r.out
 
 
+# Alpine's BIOS cloud image, for a run whose VMs boot SeaBIOS (vmlab-hv from
+# phase 2a). The checksum is the image's; Alpine publishes its sha512 beside it.
+BIOS_URL = "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-bios-cloudinit-r0.qcow2"
+BIOS_SHA256 = "39fc293200534b03cf805620a099f2f68265220215434fde687536f67a955bc3"
+
+
+def copy_source(h):
+    """The e2e template's source in the work tree: Alpine's UEFI image, or on
+    a SeaBIOS run its BIOS image with `firmware = "seabios"` recorded, so
+    every clone boots SeaBIOS whichever hypervisor runs it."""
+    src = WORK / "template-alpine"
+    shutil.rmtree(src, ignore_errors=True)
+    shutil.copytree(E2E / "templates" / "alpine", src)
+    if h.seabios_template():
+        wcl = src / "vmlab.wcl"
+        text = wcl.read_text()
+        text = re.sub(r'url    = "[^"]+"', f'url    = "{BIOS_URL}"', text)
+        text = re.sub(r'sha256 = "[^"]+"', f'sha256 = "{BIOS_SHA256}"', text)
+        text = text.replace('  profile = "linux-modern"\n', '  profile = "linux-modern"\n  firmware = "seabios"\n')
+        assert BIOS_URL in text and 'firmware = "seabios"' in text, text
+        wcl.write_text(text)
+    return src
+
+
 def ensure_base(h) -> None:
     """Build the e2e template when the store lacks it, reporting nothing."""
     if has(h, "e2e-alpine"):
         return
-    src = WORK / "template-alpine"
-    shutil.rmtree(src, ignore_errors=True)
-    shutil.copytree(E2E / "templates" / "alpine", src)
+    src = copy_source(h)
     h.vmlab("template", "build", "--version", "1.0.0", cwd=src, timeout=900)
 
 
 def run(h):
-    src = WORK / "template-alpine"
-    if src.exists():
-        shutil.rmtree(src)
-    shutil.copytree(E2E / "templates" / "alpine", src)
+    src = copy_source(h)
 
     # A clean store, so the build is exercised rather than found.
     rm_all(h, "e2e-alpine")

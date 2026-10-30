@@ -176,7 +176,13 @@ def run(h):
 
         h.check("snapshot.list-delete", list_delete, "on1 listed, deleted, then unrestorable")
 
-    old_virtiofsd(h)
+    # QEMU's external virtiofsd: elsewhere its lab cannot even validate.
+    why = h.out_of_scope("snapshot.virtiofs.old-virtiofsd")
+    if why:
+        for feature in ("share.virtiofs.old-virtiofsd", "snapshot.virtiofs.old-virtiofsd"):
+            h.skip(feature, why)
+    else:
+        old_virtiofsd(h)
 
 
 def old_virtiofsd(h):
