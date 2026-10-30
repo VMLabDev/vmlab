@@ -175,10 +175,30 @@ page guide_networking {
   DOC
 
   p <<DOC
-    A forward listens on every host interface, except under
-    [worktree isolation](guide_worktrees), where every segment `forward {}`
-    and container `port {}` binds `127.0.0.1` instead. A forward is then
-    reachable from the host itself and nowhere else.
+    A forward listens on every host interface unless it declares `bind`, an
+    IPv4 address the host owns. `bind = "127.0.0.1"` makes a forward
+    reachable from the host itself and nowhere else, which suits a guest
+    service that trusts its caller:
+  DOC
+
+  code wcl { source = <<'SRC'
+segment "lan" {
+  subnet = "10.0.0.0/24"
+  nat    = true
+  forward { bind = "127.0.0.1" host_port = 8443 to = "web:443" }
+}
+SRC
+  }
+
+  p <<DOC
+    Validation refuses a `bind` that is not an IPv4 address literal. An
+    address the host does not have fails that forward when it is installed,
+    naming the address. Two forwards may share a host port when each binds a
+    different explicit address; on one address, or where either binds every
+    interface, they conflict. Under [worktree isolation](guide_worktrees)
+    every segment `forward {}` and container `port {}` binds `127.0.0.1`
+    whatever it declares, and `up` warns about each `bind` it overrides. See
+    [Bind address](ref_lab).
   DOC
 
   p <<DOC

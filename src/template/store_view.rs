@@ -119,6 +119,8 @@ pub struct TemplateSummary {
     pub secure_boot_keys: Option<String>,
     pub display: Option<String>,
     pub cpu_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperv: Option<bool>,
     pub accel: Option<String>,
     /// RFC 3339.
     pub created: String,
@@ -148,6 +150,7 @@ impl From<&TemplateMeta> for TemplateSummary {
             secure_boot_keys: t.secure_boot_keys.map(|k| k.as_str().to_string()),
             display: t.display.clone(),
             cpu_model: t.cpu_model.clone(),
+            hyperv: t.hyperv,
             accel: t.accel.map(|a| a.as_str().to_string()),
             created: t.created.to_rfc3339(),
             origin: t.origin.clone(),

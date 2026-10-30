@@ -211,17 +211,69 @@ fn host_nested_problem_in(sys_module: &Path) -> Option<String> {
     None
 }
 
+/// The Hyper-V enlightenments `hyperv = true` adds to the KVM `-cpu` string
+/// (§5.2): Windows reads its clock from the reference TSC page instead of an
+/// emulated timer, and takes fewer exits for interrupts, timers, TLB flushes
+/// and IPIs. `+invtsc` is deliberately absent — QEMU refuses to migrate a
+/// guest that has it, and an online snapshot is a migration (§7.3).
+pub const HYPERV_FLAGS: &str = "hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,\
+                                hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,\
+                                hv-ipi";
+
+/// Why a VM that resolved `hyperv = true` boots without the enlightenments
+/// under `accel` — `None` when it gets them, or never asked. They are KVM's
+/// (TCG does not implement them), x86's, and an addition to the host CPU, so
+/// a named `cpu_model`, which decides the CPU alone, goes without (§5.2).
+fn hyperv_skipped(vm: &ResolvedVm, accel: Accel) -> Option<&'static str> {
+    if !vm.hyperv {
+        None
+    } else if qemu_arch(&vm.arch) != "x86_64" {
+        Some("the enlightenments are x86 only")
+    } else if accel == Accel::Tcg {
+        Some("it runs under TCG, and the enlightenments are KVM's")
+    } else if vm.cpu_model.is_some() {
+        Some("a `cpu_model` names the CPU, and the enlightenments are added to the host CPU only")
+    } else {
+        None
+    }
+}
+
+/// The line `up` prints for a VM whose own block set `hyperv = true` and
+/// that boots without the enlightenments under `accel` (§5.2). `declared` is
+/// the vm block's `hyperv`: one inherited from a template or a profile says
+/// nothing, because a profile default is not something the lab author asked
+/// for.
+pub fn hyperv_not_applied(declared: Option<bool>, vm: &ResolvedVm, accel: Accel) -> Option<String> {
+    if declared != Some(true) {
+        return None;
+    }
+    hyperv_skipped(vm, accel).map(|why| {
+        format!(
+            "vm \"{}\": hyperv = true is not applied — {why}; it boots without the Hyper-V \
+             enlightenments (PRD §5.2)",
+            vm.name
+        )
+    })
+}
+
 /// The `-cpu` model under KVM. `host` passes the host CPU through, VMX/SVM
 /// included, so an x86 guest that did not ask for `nested = true` has both
 /// masked: the switch decides what the guest sees, not whatever the host
 /// happens to allow (§5.2). Masking the other vendor's flag too is harmless,
 /// and spares the builder asking which vendor the host is. Other arches pass
-/// the host CPU through unchanged.
+/// the host CPU through unchanged. A resolved `hyperv` adds
+/// [`HYPERV_FLAGS`] on x86, with `nested` or without.
 fn kvm_cpu_model(vm: &ResolvedVm) -> String {
-    if vm.nested || qemu_arch(&vm.arch) != "x86_64" {
-        "host".into()
+    let x86 = qemu_arch(&vm.arch) == "x86_64";
+    let host = if vm.nested || !x86 {
+        "host"
     } else {
-        "host,vmx=off,svm=off".into()
+        "host,vmx=off,svm=off"
+    };
+    if vm.hyperv && hyperv_skipped(vm, Accel::Kvm).is_none() {
+        format!("{host},{HYPERV_FLAGS}")
+    } else {
+        host.to_string()
     }
 }
 
@@ -1028,6 +1080,126 @@ mod tests {
         assert!(s.contains("-accel tcg -cpu max "), "{s}");
         let s = build("cpu_model = \"pentium3\"");
         assert!(s.contains("-accel tcg -cpu pentium3 "), "{s}");
+    }
+
+    /// Every combination `hyperv` meets (§5.2): the flags ride the KVM
+    /// `-cpu host` string on x86, with `nested` or without; TCG keeps `max`,
+    /// a `cpu_model` keeps the model, a non-x86 guest keeps `host`, and each
+    /// of those says why. `hyperv = false` (or unset) never adds them.
+    #[test]
+    fn hyperv_adds_the_enlightenments_under_kvm_on_the_host_cpu_only() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let resolve = |profile: &str, arch: &str, extra: &str| {
+            let v = super::super::resolve::testing::vm(&format!(
+                "vm \"t\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"{profile}\" \
+                 disk = 1GiB {extra} }}"
+            ));
+            super::super::resolve::resolve_vm(&v, None, &profiles).unwrap()
+        };
+        let cpu = |vm: &super::super::resolve::ResolvedVm, accel: Accel| {
+            let args = build_args("l", vm, &paths(), accel).unwrap();
+            let i = args.iter().position(|a| a == "-cpu").unwrap();
+            args[i + 1].clone()
+        };
+        let flags = "hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,\
+                     hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,hv-ipi";
+        assert_eq!(HYPERV_FLAGS, flags);
+        assert!(!HYPERV_FLAGS.contains("invtsc"));
+
+        // The shipped profiles that set it, under KVM.
+        for profile in [
+            "windows-11",
+            "windows-10",
+            "windows-server",
+            "windows-legacy",
+        ] {
+            for arch in ["x86_64", "x86"] {
+                let vm = resolve(profile, arch, "");
+                assert!(vm.hyperv, "{profile}");
+                assert_eq!(
+                    cpu(&vm, Accel::Kvm),
+                    format!("host,vmx=off,svm=off,{flags}"),
+                    "{profile} {arch}"
+                );
+                assert_eq!(hyperv_skipped(&vm, Accel::Kvm), None, "{profile}");
+                // Under TCG: `max`, and the reason.
+                assert_eq!(cpu(&vm, Accel::Tcg), "max", "{profile}");
+                assert!(
+                    hyperv_skipped(&vm, Accel::Tcg).is_some_and(|w| w.contains("TCG")),
+                    "{profile}"
+                );
+            }
+        }
+        // With `nested`: the whole host CPU, plus the flags.
+        let nested = resolve("windows-11", "x86_64", "nested = true");
+        assert_eq!(cpu(&nested, Accel::Kvm), format!("host,{flags}"));
+        assert_eq!(cpu(&nested, Accel::Tcg), "max");
+        // A named model replaces the host CPU, flags and all, either way.
+        let model = resolve("windows-11", "x86_64", "cpu_model = \"Skylake-Client\"");
+        assert!(model.hyperv);
+        assert_eq!(cpu(&model, Accel::Kvm), "Skylake-Client");
+        assert_eq!(cpu(&model, Accel::Tcg), "Skylake-Client");
+        assert!(hyperv_skipped(&model, Accel::Kvm).is_some_and(|w| w.contains("cpu_model")));
+        // Opted out on the vm block: the old string, nothing to say.
+        for extra in ["hyperv = false", "hyperv = false nested = true"] {
+            let off = resolve("windows-server", "x86_64", extra);
+            assert!(!off.hyperv);
+            assert!(!cpu(&off, Accel::Kvm).contains("hv-"), "{extra}");
+            assert_eq!(hyperv_skipped(&off, Accel::Kvm), None);
+            assert_eq!(hyperv_skipped(&off, Accel::Tcg), None);
+        }
+        // Profiles that do not set it: no flags, nothing to say.
+        for profile in ["windows-xp", "windows-9x", "linux-modern"] {
+            let vm = resolve(profile, "x86_64", "");
+            assert_eq!(cpu(&vm, Accel::Kvm), "host,vmx=off,svm=off", "{profile}");
+            assert_eq!(hyperv_skipped(&vm, Accel::Tcg), None, "{profile}");
+        }
+        // Opted in where the profile does not: on.
+        let xp = resolve("windows-xp", "x86_64", "hyperv = true");
+        assert_eq!(
+            cpu(&xp, Accel::Kvm),
+            format!("host,vmx=off,svm=off,{flags}")
+        );
+        // Not x86: the host CPU unchanged, and the reason.
+        let arm = resolve("linux-modern", "aarch64", "hyperv = true");
+        assert_eq!(cpu(&arm, Accel::Kvm), "host");
+        assert!(hyperv_skipped(&arm, Accel::Kvm).is_some_and(|w| w.contains("x86")));
+    }
+
+    /// `up` speaks only for a `hyperv = true` the vm block itself set and
+    /// the launch drops; a profile's default that does not apply is silent.
+    #[test]
+    fn hyperv_not_applied_speaks_for_the_vm_block_only() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let resolve = |extra: &str| {
+            let v = super::super::resolve::testing::vm(&format!(
+                "vm \"w\" {{ template = \"scratch\" arch = \"x86_64\" profile = \"windows-11\" \
+                 disk = 1GiB {extra} }}"
+            ));
+            let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
+            (v.hyperv, vm)
+        };
+        // From the profile: silent under TCG and with a model.
+        let (declared, inherited) = resolve("");
+        assert_eq!(declared, None);
+        assert_eq!(hyperv_not_applied(declared, &inherited, Accel::Tcg), None);
+        let (declared, model) = resolve("cpu_model = \"Skylake-Client\"");
+        assert_eq!(hyperv_not_applied(declared, &model, Accel::Kvm), None);
+        // From the vm block: applied under KVM, said under TCG or a model.
+        let (declared, own) = resolve("hyperv = true");
+        assert_eq!(hyperv_not_applied(declared, &own, Accel::Kvm), None);
+        let line = hyperv_not_applied(declared, &own, Accel::Tcg).unwrap();
+        assert!(
+            line.starts_with("vm \"w\": hyperv = true is not applied"),
+            "{line}"
+        );
+        assert!(line.contains("TCG"), "{line}");
+        let (declared, own_model) = resolve("hyperv = true cpu_model = \"Skylake-Client\"");
+        let line = hyperv_not_applied(declared, &own_model, Accel::Kvm).unwrap();
+        assert!(line.contains("cpu_model"), "{line}");
+        // Turned off on the vm block: nothing to say.
+        let (declared, off) = resolve("hyperv = false");
+        assert_eq!(hyperv_not_applied(declared, &off, Accel::Tcg), None);
     }
 
     /// Non-x86 KVM has no VMX/SVM to mask.

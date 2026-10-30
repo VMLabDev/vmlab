@@ -232,7 +232,7 @@ Every forward in the lab is planned before `up` installs any. When two claim the
 | `needs a nic to reach it over` | The target machine has no `nic {}`, so no segment reaches it. |
 | `no lease — is it running and ready?` | The target has a NIC but no DHCP lease yet. The forward installs once the machine is up; `vmlab status` shows the lease. |
 
-A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort: the rest of the lab still comes up, and `vmlab logs` carries a `forward.skipped` event in the same `{what}: {why}` shape, for example `"vm1": forward: cannot listen on host 0.0.0.0:14330: Address already in use (os error 98)`. Change the `host_port` or free the port. Two instances of one lab file declare the same fixed `host_port`, so the second instance's forward fails this way while the first holds the port. Omit `host_port` (or a `port {}`'s `host`) and each instance binds a free port of its own, which `vmlab status` shows marked `(auto)`.
+A host port held by an unrelated process is not detected by the plan. That forward fails at install time, which `up` treats as best effort: the rest of the lab still comes up, and `vmlab logs` carries a `forward.skipped` event in the same `{what}: {why}` shape, for example `"vm1": forward: cannot listen on host 0.0.0.0:14330: Address already in use (os error 98)`. Change the `host_port` or free the port. Two instances of one lab file declare the same fixed `host_port`, so the second instance's forward fails this way while the first holds the port. Omit `host_port` (or a `port {}`'s `host`) and each instance binds a free port of its own, which `vmlab status` shows marked `(auto)`. A `bind` naming an address the host lacks fails the same way, naming it: ``"web": container port: cannot listen on host 10.9.9.9:18490: the host has no address 10.9.9.9 (forward `bind`)``. Check `ip -4 addr` on the host, or bind `127.0.0.1`.
 
 A forward that did install leaves a `forward.installed` event naming its host port and guest address. A forward with neither event was never planned: check that `vmlab validate` lists the segment and that the machine it names has started.
 
@@ -309,6 +309,20 @@ A `vulkan` guest on a declared host GPU should list one Venus device, plus its o
 vmlab prints nothing specific to WSL 2. When nested virtualisation is disabled in `.wslconfig`, `/dev/kvm` does not open and every machine gets the TCG warning at the top of this file. Enable it under `[wsl2]` in `%USERPROFILE%\.wslconfig`, run `wsl --shutdown` from Windows, and start again. See host-profiles.md for the full setup.
 
 Some WSL 2 sessions have no `$XDG_RUNTIME_DIR`. vmlab does not fail on that: it falls back to `/tmp/vmlab-<uid>` for the supervisor socket and other runtime files, creates it with mode 0700, tightens an existing directory, and refuses one owned by another user. If the sockets are under `/tmp` rather than `/run/user/<uid>`, that is why. Networking on WSL 2 needs no tap, bridge or macvlan, so the fast path degrades to userspace silently there; a Windows-side VNC viewer is reached with `vmlab console --tcp`, which bridges the display to a localhost port.
+
+## A Windows guest is slow under nested KVM or WSL 2
+
+vmlab prints nothing for this. A Windows guest boots under KVM but anything that reads the clock often (.NET services, build tools, games) runs much slower than it should. Without the Hyper-V enlightenments Windows reads time from an emulated timer and each read exits the guest: about 5.6 µs native and 51 µs nested under WSL 2, against about 20 ns with them.
+
+They are on by default for every Windows profile from Vista on (`windows-11`, `windows-10`, `windows-server`, `windows-legacy`), so find what turned them off: `hyperv = false` on the VM or its template, a `cpu_model` (it replaces the host CPU and the flags with it), a user profile without `hyperv = true`, or the TCG fallback above. `ps -o args= -C qemu-system-x86_64` shows each machine's `-cpu`; an enlightened one carries `hv-time`. Never add `+invtsc` through `qemu_args`: QEMU then refuses to migrate the guest, and every online snapshot is a migration.
+
+## Hyper-V enlightenments were not applied
+
+```
+warning: vm "{machine}": hyperv = true is not applied — {reason}; it boots without the Hyper-V enlightenments (PRD §5.2)
+```
+
+`vmlab up` prints this when the vm block itself sets `hyperv = true` and the launch cannot apply it; the machine boots without `hv-*` flags. The reason is one of: it runs under TCG, a `cpu_model` names the CPU, or the guest is not x86. Drop the `accel = "tcg"` or the `cpu_model`, or drop `hyperv = true` to silence it. An inherited `hyperv` is never reported.
 
 ## The supervisor did not come up
 

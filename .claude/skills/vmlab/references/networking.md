@@ -119,9 +119,14 @@ dropped, naming the winner, rather than all being installed and the losers
 failing at bind time. Scripts can add forwards at runtime with
 `Segment.forward`.
 
-A forward listens on every host interface, except under worktree isolation
-(worktrees.md), where every segment `forward {}` and container `port {}` binds
-`127.0.0.1` instead and is reachable from the host itself and nowhere else.
+A forward listens on every host interface unless it declares `bind`, an IPv4
+address the host owns (`forward { bind = "127.0.0.1" host_port = 8443 to =
+"web:443" }`, and the same field on a container `port {}`). `127.0.0.1` keeps a
+forward to a service that trusts its caller off the LAN. Under worktree
+isolation (worktrees.md) every segment `forward {}` and container `port {}`
+binds `127.0.0.1` whatever it declares, is reachable from the host itself and
+nowhere else, and `up` warns about each `bind` isolation overrides. See
+`forward {}`, "Bind address".
 
 ## Guest routes and inter-segment routing
 
@@ -442,11 +447,13 @@ into the segment, which is the path for RDP, SSH and web UIs from the host.
 ```wcl
 forward { host_port = 13389 to = "dc01:3389" proto = "tcp" }
 forward { to = "dc01:80" }   # automatic host port
+forward { bind = "127.0.0.1" host_port = 8443 to = "web:443" }   # loopback only
 ```
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `host_port` | i64 | automatic | Host port to listen on, 1 to 65535. Unique across the lab. Omitted: vmlab picks a free port when it installs the forward. |
+| `host_port` | i64 | automatic | Host port to listen on, 1 to 65535. Unique across the lab on the addresses it binds. Omitted: vmlab picks a free port when it installs the forward. |
+| `bind` | utf8 | `0.0.0.0` | Host IPv4 address to listen on, one the host owns. Omitted: every interface. |
 | `to` | utf8 | required | Target as `vm:port`. The machine must be declared in this lab. |
 | `proto` | utf8 | `tcp` | Protocol: `tcp`, `udp` or `both`. |
 
@@ -455,6 +462,24 @@ name to be a VM or container in this lab, and a declared `host_port` to be
 unused by every other `forward` and every container `port {}` in the lab, since
 both compile into the same forward machinery. Omitted host ports are never
 duplicates.
+
+### Bind address
+
+- `bind` must be an IPv4 address literal. Validation refuses a hostname, IPv6
+  or `addr:port`: `forward {}: bind "localhost" is not an IPv4 address literal
+  (e.g. "127.0.0.1")` (`port {}: …` on a container).
+- The host must own the address. Validation cannot know; installing the forward
+  fails, and `forward.skipped` says `the host has no address <addr>`.
+- Two forwards on one host port conflict when they bind the same address or
+  either binds every interface (`0.0.0.0`, also the default). Two different
+  explicit addresses share a port.
+- Under worktree isolation every forward binds `127.0.0.1` whatever it
+  declares; `up` prints `warning: … declares bind = "<addr>", which worktree
+  isolation overrides`. A frozen family's port slots test the port on the
+  address the forward binds.
+- `vmlab status` shows the address in `HOST` (`127.0.0.1:8443`); `status
+  --json` and the `forward.installed` event carry it as `bind`. `vmlab port`
+  prints the port alone.
 
 ### Automatic host ports
 

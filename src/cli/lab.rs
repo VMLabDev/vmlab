@@ -667,11 +667,18 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
     if !status.forwards.is_empty() {
         // A frozen family's port slot may have bound a fixed port off its
         // declared one (§21.7): the declared port follows in brackets, where
-        // an automatic one says `(auto)`.
-        let host = |f: &crate::status::ForwardStatus| match (f.auto, f.declared_port) {
-            (true, _) => format!("{} (auto)", f.host_port),
-            (false, Some(declared)) => format!("{} ({declared})", f.host_port),
-            (false, None) => f.host_port.to_string(),
+        // an automatic one says `(auto)`. A forward on one address rather
+        // than every interface leads with it (§9.8).
+        let host = |f: &crate::status::ForwardStatus| {
+            let port = match &f.bind {
+                Some(bind) => format!("{bind}:{}", f.host_port),
+                None => f.host_port.to_string(),
+            };
+            match (f.auto, f.declared_port) {
+                (true, _) => format!("{port} (auto)"),
+                (false, Some(declared)) => format!("{port} ({declared})"),
+                (false, None) => port,
+            }
         };
         let name_w = column_width("FORWARD", status.forwards.iter().map(|f| f.machine.len()));
         let host_w = column_width("HOST", status.forwards.iter().map(|f| host(f).len()));
@@ -2488,6 +2495,7 @@ mod tests {
         let fwd = |machine: &str, host_port, auto| ForwardStatus {
             machine: machine.into(),
             segment: "lan".into(),
+            bind: None,
             host_port,
             guest: "10.0.0.5:80".into(),
             proto: "tcp".into(),
@@ -2522,6 +2530,7 @@ mod tests {
         status.forwards = vec![ForwardStatus {
             machine: "web".into(),
             segment: "lan".into(),
+            bind: None,
             host_port: 8081,
             guest: "10.0.0.5:80".into(),
             proto: "tcp".into(),
@@ -2532,6 +2541,43 @@ mod tests {
         let out = render_status(&status, false);
         assert!(
             out.contains("web     8081 (8080) 10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
+    }
+
+    /// A forward bound to one address leads its host port with it; one on
+    /// every interface shows the port alone (§9.8).
+    #[test]
+    fn the_status_table_shows_a_forward_s_bind_address() {
+        use crate::status::ForwardStatus;
+        let fwd = |bind: Option<&str>, host_port, auto| ForwardStatus {
+            machine: "web".into(),
+            segment: "lan".into(),
+            bind: bind.map(str::to_string),
+            host_port,
+            guest: "10.0.0.5:80".into(),
+            proto: "tcp".into(),
+            auto,
+            guest_port: 80,
+            declared_port: None,
+        };
+        let mut status = lab(vec![addressed("web", PowerState::Running, true, vm())]);
+        status.forwards = vec![
+            fwd(Some("127.0.0.1"), 18490, false),
+            fwd(Some("127.0.0.1"), 41234, true),
+            fwd(None, 18491, false),
+        ];
+        let out = render_status(&status, false);
+        assert!(
+            out.contains("web     127.0.0.1:18490        10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("web     127.0.0.1:41234 (auto) 10.0.0.5:80 tcp"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("web     18491                  10.0.0.5:80 tcp"),
             "got:\n{out}"
         );
     }

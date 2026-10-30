@@ -275,7 +275,7 @@ impl SegmentServices {
             // "both" forwards TCP (the common case); a second call can add UDP.
             _ => PortForwarder::spawn_tcp_forward(host_addr, engine, guest_ip, guest_port),
         }
-        .map_err(|e| format!("cannot listen on host {host_addr}: {e}"))?;
+        .map_err(|e| listen_error(host_addr, &e))?;
         let id = self
             .next_forward_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -304,6 +304,19 @@ impl SegmentServices {
         let _ = handle.await;
         true
     }
+}
+
+/// Why a forward could not listen on `addr`. A `bind` naming an address the
+/// host does not have is the one failure a lab file causes on its own, so it
+/// says so rather than leaving it to the kernel's wording (§9.8).
+fn listen_error(addr: std::net::SocketAddr, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+        return format!(
+            "cannot listen on host {addr}: the host has no address {} (forward `bind`)",
+            addr.ip()
+        );
+    }
+    format!("cannot listen on host {addr}: {e}")
 }
 
 #[cfg(test)]
@@ -559,5 +572,20 @@ mod tests {
             .await
             .expect("the forward listens on the port it reported");
         services.remove_forward(id).await;
+    }
+
+    /// A `bind` the host lacks is named as such; anything else keeps the
+    /// kernel's words.
+    #[test]
+    fn a_listen_failure_names_an_address_the_host_lacks() {
+        let addr: std::net::SocketAddr = "192.0.2.7:18490".parse().unwrap();
+        let missing = std::io::Error::from(std::io::ErrorKind::AddrNotAvailable);
+        assert_eq!(
+            listen_error(addr, &missing),
+            "cannot listen on host 192.0.2.7:18490: the host has no address 192.0.2.7 \
+             (forward `bind`)"
+        );
+        let held = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        assert!(listen_error(addr, &held).starts_with("cannot listen on host 192.0.2.7:18490: "));
     }
 }

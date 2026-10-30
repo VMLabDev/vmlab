@@ -344,6 +344,7 @@ in the config.
 | `firmware`, `secure_boot`, `tpm` | OVMF or SeaBIOS, secure boot under OVMF, and an swtpm 2.0 device. |
 | `disk_bus`, `nic_model`, `display` | The devices the guest can drive: `virtio`, `ide` or `sata` disks; a NIC model such as `virtio-net-pci`, `e1000` or `pcnet`; a display device such as `virtio-vga`, `std` or `cirrus-vga`. |
 | `cpu_model` | The QEMU `-cpu` model the guest sees instead of the host CPU (KVM) or `max` (TCG), for guests a modern CPUID breaks. No shipped profile sets one; a template pins it for its clones. |
+| `hyperv` | The Hyper-V enlightenments under KVM, which put a Windows guest's clock on the reference TSC page instead of an emulated timer. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; `windows-xp` and `windows-9x` leave it off. |
 | `accel` | The accelerator: `kvm` (required, no fallback) or `tcg` (always emulated, even where KVM works, for guests KVM cannot run reliably). Unset, KVM when usable, else TCG. No shipped profile sets one. |
 | `cpus`, `memory` | The hardware floor a VM or container inherits when neither its block nor its template says. |
 | `agent_transport` | The device the guest agent's channel rides: `virtio-serial` (default), `isa-serial` for a guest with no virtio drivers, where the legacy agent speaks over COM1, or `none` for a guest nothing can run an agent on. The older `agent_channel` bool still loads as an alias. |
@@ -403,6 +404,7 @@ profile "freebsd" {
   display     = "std"
   cpus        = 2
   memory      = 2GiB
+  hyperv      = true
   workspace_guest = "/usr/src"
 }
 ```
@@ -439,6 +441,7 @@ profile "<name>" {
   nic_model       = "virtio-net-pci"
   display         = "virtio-vga"
   cpu_model       = "pentium3"
+  hyperv          = true
   accel           = "tcg"
   cpus            = 2
   memory          = 4GiB
@@ -465,6 +468,7 @@ profile "<name>" {
 | `nic_model` | utf8 | QEMU default | NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`. |
 | `display` | utf8 | QEMU default | Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`. |
 | `cpu_model` | utf8 | unset | QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. No shipped profile sets one. |
+| `hyperv` | bool | unset | Hyper-V enlightenments (`hv-*` CPU flags) under KVM on x86, unless a `cpu_model` names the CPU. Unset is off. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; a VM or template `hyperv` wins (vm.md). |
 | `accel` | utf8 | unset | Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. No shipped profile sets one. |
 | `cpus` | i64 | unset | Default vCPU count, at least 1. |
 | `memory` | ByteSize | unset | Default RAM, for example `4GiB`. |
@@ -487,10 +491,10 @@ still hosts a dev machine; the floor of `/src` applies. On a non-x86 `virt` mach
 
 | Profile | Machine | Firmware | Secure boot | TPM | Disk bus | NIC model | Display | CPUs | Memory | Other |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `windows-11` | q35 | ovmf | true | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
-| `windows-10` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
-| `windows-server` | q35 | ovmf | false | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | |
-| `windows-legacy` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | Vista, 7 and 2008-era guests; virtio-serial agent (virtio-win covers this era). |
+| `windows-11` | q35 | ovmf | true | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | `hyperv = true`. |
+| `windows-10` | q35 | ovmf | false | false | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | `hyperv = true`. |
+| `windows-server` | q35 | ovmf | false | true | virtio | virtio-net-pci | virtio-vga | 4 | 8GiB | `hyperv = true`. |
+| `windows-legacy` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | `hyperv = true`. Vista, 7 and 2008-era guests; virtio-serial agent (virtio-win covers this era). |
 | `windows-xp` | pc | seabios | false | false | ide | e1000 | std | 2 | 2GiB | `agent_transport = "isa-serial"`, `rtc = "localtime"`: NT4 through XP/2003, the legacy agent on COM1. |
 | `windows-9x` | pc | seabios | false | false | ide | pcnet | cirrus-vga | 1 | 256MiB | `input_transport = "vnc"`, `agent_transport = "isa-serial"`, `rtc = "localtime"`. DOS, Windows 3.x to ME and 2000-era guests. |
 | `templeos` | pc | seabios | false | false | ide | e1000 | std | 2 | 512MiB | `agent_transport = "isa-serial"`. TempleOS: the HolyC agent on COM1; no network by design. |
@@ -562,6 +566,7 @@ profile "windows-10" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  hyperv      = true
   workspace_guest = "C:\\src"
 }
 
@@ -576,6 +581,7 @@ profile "windows-server" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  hyperv      = true
   workspace_guest = "C:\\src"
 }
 
@@ -590,6 +596,7 @@ profile "windows-legacy" {
   display     = "std"
   cpus        = 2
   memory      = 2GiB
+  hyperv      = true
   workspace_guest = "C:\\src"
 }
 

@@ -28,6 +28,7 @@ type TemplateMeta {
   secure_boot_keys: utf8?  // "microsoft" | "setup" | "vars" (vars: OVMF_VARS.fd beside the disk)
   display: utf8?
   cpu_model: utf8?    // QEMU -cpu model
+  hyperv: bool?       // Hyper-V enlightenments under KVM
   accel: utf8?        // "kvm" | "tcg"
   created: utf8       // RFC 3339
   origin: utf8?       // source ISO URL / registry reference
@@ -62,5 +63,6 @@ type VariantMeta {
   secure_boot_keys: utf8?  // "microsoft" | "setup" | "vars" (vars: OVMF_VARS.fd beside the disk)
   display: utf8?
   cpu_model: utf8?
+  hyperv: bool?
   accel: utf8?
 }

@@ -1982,8 +1982,9 @@ impl LabRuntime {
         observed
     }
 
-    /// Install one planned forward, returning its id and the host port it
-    /// bound.
+    /// Install one planned forward on the address it binds
+    /// ([`ForwardRule::bind`], which worktree isolation has already made
+    /// `127.0.0.1`), returning its id and the host port it bound.
     ///
     /// The single executor behind every forward the lab installs, whether it
     /// came from a segment `forward {}` or a container `port {}`. Priming the
@@ -2012,9 +2013,8 @@ impl LabRuntime {
             services.learn_mac(rule.guest_ip, mac);
         }
         let mut last = String::from("no host port to bind");
-        let bind = super::isolation::forward_bind(self.isolation.as_ref());
         for &port in ports {
-            let host_addr = std::net::SocketAddr::from((bind, port));
+            let host_addr = std::net::SocketAddr::from((rule.bind, port));
             match services.add_forward(host_addr, rule.guest_ip, rule.guest_port, rule.proto) {
                 Ok(installed) => return Ok(installed),
                 Err(e) => {
@@ -2138,6 +2138,16 @@ impl LabRuntime {
         // and before any clone or boot work, streaming progress to both the
         // CLI sink and the event feed.
         self.ensure_pulled(&targets, Some(&output)).await?;
+
+        // Hardware a machine was declared with that this launch drops — a
+        // vm block's `hyperv = true` under TCG or a named `cpu_model` — is
+        // said, not refused (§5.2). After the pull, which binds the template
+        // layer a model may come from.
+        for name in &targets {
+            for warning in self.machine(name)?.launch_warnings() {
+                output(format!("warning: {warning}\n"));
+            }
+        }
 
         self.preflight_binaries(&targets)?;
 
@@ -2328,6 +2338,7 @@ impl LabRuntime {
             &forward_plan::ForwardInputs {
                 lab: &self.config.lab,
                 observed: &forward_plan::Observed::default(),
+                isolated: self.isolation.is_some(),
             },
             &[machine.to_string()],
         );
@@ -2352,6 +2363,7 @@ impl LabRuntime {
             &forward_plan::ForwardInputs {
                 lab: &self.config.lab,
                 observed: &observed,
+                isolated: self.isolation.is_some(),
             },
             scope,
         );
@@ -2399,8 +2411,7 @@ impl LabRuntime {
                     continue;
                 }
             };
-            let bind = super::isolation::forward_bind(self.isolation.as_ref());
-            let mut is_free = |port, proto| crate::freeze::ports::host_free(bind, port, proto);
+            let mut is_free = crate::freeze::ports::host_free;
             let candidates = {
                 let mut fam =
                     family
@@ -2425,6 +2436,7 @@ impl LabRuntime {
                         let forward = InstalledForward {
                             key: rule.key(),
                             id,
+                            bind: rule.bind,
                             host_port,
                             auto: rule.host.is_auto(),
                             declared: rule.declared_port(),
@@ -2440,6 +2452,7 @@ impl LabRuntime {
                             "forward.installed",
                             json!({
                                 "what": what,
+                                "bind": rule.bind.to_string(),
                                 "host_port": host_port,
                                 "auto": rule.host.is_auto(),
                                 "declared_port": forward.shifted_from(),
@@ -3139,6 +3152,9 @@ impl LabRuntime {
             .map(|f| crate::status::ForwardStatus {
                 machine: f.key.machine.clone(),
                 segment: f.key.segment.clone(),
+                bind: Some(f.bind)
+                    .filter(|b| !b.is_unspecified())
+                    .map(|b| b.to_string()),
                 host_port: f.host_port,
                 guest: format!("{}:{}", f.guest_ip, f.key.guest_port),
                 proto: match f.key.proto {

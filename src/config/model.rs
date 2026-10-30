@@ -243,10 +243,19 @@ pub struct Forward {
     /// `None` = automatic: vmlab binds a free port when it installs the
     /// forward and reports it in `vmlab status`.
     pub host_port: Option<u16>,
+    /// The host address to listen on; `None` = every interface (`0.0.0.0`).
+    pub bind: Option<Ipv4Addr>,
     pub vm: String,
     pub guest_port: u16,
     pub proto: Proto,
     pub span: Span,
+}
+
+/// Whether two forwards listening on one host port collide (PRD §9.8): on the
+/// same address, or where either listens on every interface (`0.0.0.0`).
+/// Two different explicit addresses share a port without contest.
+pub fn forward_binds_overlap(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+    a == b || a.is_unspecified() || b.is_unspecified()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +480,9 @@ pub struct Vm {
     /// QEMU `-cpu` model (§5.2); None = inherit template→profile, and with
     /// no layer naming one the builder's accelerator default applies.
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments (§5.2); None = inherit template→profile, and
+    /// with no layer saying, off.
+    pub hyperv: Option<bool>,
     /// QEMU accelerator (§5.2); None = inherit template→profile, and with no
     /// layer naming one KVM is used when usable, TCG otherwise.
     pub accel: Option<AccelMode>,
@@ -820,6 +832,8 @@ pub struct Volume {
 pub struct PortMap {
     /// `None` = automatic, as for [`Forward::host_port`].
     pub host_port: Option<u16>,
+    /// As [`Forward::bind`].
+    pub bind: Option<Ipv4Addr>,
     pub container_port: u16,
     pub proto: Proto,
     pub span: Span,
@@ -979,6 +993,8 @@ pub struct TemplateDef {
     pub display: Option<String>,
     /// QEMU `-cpu` model for the build VM, recorded for clones (§5.2).
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments for the build VM, recorded for clones (§5.2).
+    pub hyperv: Option<bool>,
     /// QEMU accelerator for the build VM, recorded for clones (§5.2).
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
@@ -1061,6 +1077,7 @@ pub struct TemplateVariantDef {
     pub memory: Option<u64>,
     pub display: Option<String>,
     pub cpu_model: Option<String>,
+    pub hyperv: Option<bool>,
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,

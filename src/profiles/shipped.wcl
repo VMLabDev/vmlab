@@ -7,6 +7,10 @@ import <vmlab-profile.wcl>
 // No Windows profile sets `virtiofs`: virtio-win 0.1.302's VioFS driver fails
 // large reads at random, so `transport = "auto"` shares on Windows ride SMB
 // (§7.5).
+//
+// Every Windows profile from Vista on sets `hyperv`: the enlightenments put
+// Windows' clock on the Hyper-V reference TSC page instead of an emulated
+// timer (§5.2). `windows-xp` and `windows-9x` predate them.
 
 profile "windows-11" {
   description = "Windows 11: q35, OVMF with secure boot, swtpm 2.0, virtio devices"
@@ -19,6 +23,7 @@ profile "windows-11" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  hyperv      = true
   // Where an `@dev` workspace lands when the decorator names no
   // `workspace_guest` (§19.1) — the key is guest-OS-shaped, which is why it
   // is profile-sourced.
@@ -36,6 +41,7 @@ profile "windows-10" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  hyperv      = true
   workspace_guest = "C:\\src"
 }
 
@@ -50,6 +56,7 @@ profile "windows-server" {
   display     = "virtio-vga"
   cpus        = 4
   memory      = 8GiB
+  hyperv      = true
   workspace_guest = "C:\\src"
 }
 
@@ -64,6 +71,7 @@ profile "windows-legacy" {
   display     = "std"
   cpus        = 2
   memory      = 2GiB
+  hyperv      = true
   workspace_guest = "C:\\src"
 }
 

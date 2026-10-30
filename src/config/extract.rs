@@ -6,6 +6,7 @@
 //! [`super::block`] (ADR-0006); what is left here is the field mapping —
 //! which block carries which field, and what the typed model calls it.
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use wcl_lang::{Block, Document};
@@ -281,6 +282,7 @@ fn extract_forward(b: &Block, issues: &mut IssueList) -> Option<Forward> {
     let mut r = Reader::new(b, issues);
     let span = r.span();
     let host_port = r.port("host_port").unspan();
+    let bind = r.parsed("bind", |s| parse_bind("forward", s)).unspan();
     let to = r.required_string("to")?;
     let Some((vm, port_s)) = to.value.split_once(':') else {
         r.issue_at(
@@ -296,6 +298,7 @@ fn extract_forward(b: &Block, issues: &mut IssueList) -> Option<Forward> {
     let proto = r.keyword("proto", PROTOS).unspan().unwrap_or(Proto::Tcp);
     Some(Forward {
         host_port,
+        bind,
         vm: vm.to_string(),
         guest_port,
         proto,
@@ -582,6 +585,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let clock = r.parsed("clock", parse_clock).unspan().unwrap_or_default();
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
+    let hyperv = r.bool("hyperv").unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -658,6 +662,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         clock,
         display,
         cpu_model,
+        hyperv,
         accel,
         firmware,
         tpm,
@@ -856,14 +861,25 @@ fn extract_volume(b: &Block, issues: &mut IssueList) -> Option<Volume> {
     })
 }
 
+/// A forward's `bind` (PRD §9.8): an IPv4 address literal and nothing else —
+/// no hostname, no IPv6, no port. Whether the host owns it is found out when
+/// the forward is installed.
+fn parse_bind(block: &str, s: &str) -> Result<Ipv4Addr, String> {
+    s.parse().map_err(|_| {
+        format!("{block} {{}}: bind \"{s}\" is not an IPv4 address literal (e.g. \"127.0.0.1\")")
+    })
+}
+
 fn extract_port(b: &Block, issues: &mut IssueList) -> Option<PortMap> {
     let mut r = Reader::new(b, issues);
     let span = r.span();
     let host_port = r.port("host").unspan();
+    let bind = r.parsed("bind", |s| parse_bind("port", s)).unspan();
     let container_port = r.required("container", |r, n| r.port(n))?.value;
     let proto = r.keyword("proto", PROTOS).unspan().unwrap_or(Proto::Tcp);
     Some(PortMap {
         host_port,
+        bind,
         container_port,
         proto,
         span,
@@ -950,6 +966,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let disk = r.size("disk").unspan();
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
+    let hyperv = r.bool("hyperv").unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -976,6 +993,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         disk,
         display,
         cpu_model,
+        hyperv,
         accel,
         firmware,
         tpm,
@@ -1036,6 +1054,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
     let memory = r.size("memory").unspan();
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
+    let hyperv = r.bool("hyperv").unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -1053,6 +1072,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
         memory,
         display,
         cpu_model,
+        hyperv,
         accel,
         firmware,
         tpm,

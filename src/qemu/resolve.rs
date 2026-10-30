@@ -69,6 +69,10 @@ pub struct ResolvedVm {
     /// modern host), and exclusive with `nested`: the model decides the
     /// CPU features, so there is no host VMX/SVM left to pass through.
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments (§5.2), VM > template > profile, off when no
+    /// layer says. What it asks for; whether the `-cpu` string carries them
+    /// is the builder's call, which needs the accelerator and the model.
+    pub hyperv: bool,
     /// The accelerator a layer asked for (§5.2), VM > template > profile,
     /// with the layer that asked. `None` keeps vmlab's choice — KVM when
     /// usable, TCG otherwise; the launch decision itself is
@@ -588,6 +592,12 @@ pub fn resolve_vm(
         nested: lab_vm.nested,
         rtc_base: lab_vm.clock.rtc_base_for(profile.rtc),
         cpu_model: cpu_model.map(|(model, _)| model),
+        hyperv: pick(
+            lab_vm.hyperv,
+            template.and_then(|t| t.hyperv),
+            profile.hyperv,
+        )
+        .is_some_and(|(on, _)| on),
         accel,
         gpu: lab_vm.gpu.clone(),
         qemu_args: lab_vm.qemu_args.clone(),
@@ -731,6 +741,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
             created: chrono::Utc::now(),
             origin: None,
@@ -837,6 +848,34 @@ mod tests {
             model("vm \"a\" { template = \"x86_64/win\" }", Some(&meta())),
             None
         );
+    }
+
+    /// `hyperv` resolves VM block > template > profile, and is off when no
+    /// layer says — the shipped Windows profiles from Vista on say yes.
+    #[test]
+    fn hyperv_precedence_vm_over_template_over_profile() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let hyperv = |src: &str, meta: &TemplateMeta| {
+            resolve_vm(&vm(src), Some(meta), &profiles).unwrap().hyperv
+        };
+        let with = |profile: &str, hyperv: Option<bool>| TemplateMeta {
+            profile: Some(profile.into()),
+            hyperv,
+            ..meta()
+        };
+        let bare = "vm \"a\" { template = \"x86_64/win\" }";
+        // Profile floor: on for windows-11, off for windows-xp and Linux.
+        assert!(hyperv(bare, &with("windows-11", None)));
+        assert!(!hyperv(bare, &with("windows-xp", None)));
+        assert!(!hyperv(bare, &with("linux-modern", None)));
+        // The template wins over the profile, either way.
+        assert!(!hyperv(bare, &with("windows-11", Some(false))));
+        assert!(hyperv(bare, &with("windows-xp", Some(true))));
+        // The vm block wins over both.
+        let off = "vm \"a\" { template = \"x86_64/win\" hyperv = false }";
+        let on = "vm \"a\" { template = \"x86_64/win\" hyperv = true }";
+        assert!(!hyperv(off, &with("windows-11", Some(true))));
+        assert!(hyperv(on, &with("windows-xp", Some(false))));
     }
 
     /// `nested` asks for the host CPU's VMX/SVM; a named model replaces the
