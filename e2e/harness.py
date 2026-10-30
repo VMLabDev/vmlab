@@ -3,6 +3,10 @@
 Every scenario reports against the catalogue in `features.py`. A feature is
 passed, failed or skipped (with a reason); one no scenario touched is reported
 as missing, and a missing feature fails the run as surely as a failed one.
+
+A run is on one hypervisor (PRD §22). On any but QEMU, a feature outside the
+phases that hypervisor has delivered is skipped with the phase as its reason,
+whatever the scenario reported, and is not missing when no scenario ran it.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from features import FEATURES
+from features import FEATURES, PHASE_ORDER, VMLAB_DELIVERED, out_of_scope
 
 E2E = pathlib.Path(__file__).resolve().parent
 WORK = pathlib.Path(os.environ.get("E2E_WORK", "/work"))
@@ -41,8 +45,12 @@ class Result:
 
 
 class Harness:
-    def __init__(self, keep: bool = False):
+    def __init__(self, keep: bool = False, hypervisor: str = "qemu", delivered: str = VMLAB_DELIVERED):
         self.keep = keep
+        # Which hypervisor the run's machines are on, and on vmlab-hv the
+        # last phase it has delivered.
+        self.hypervisor = hypervisor
+        self.delivered = delivered
         self.results: dict[str, tuple[str, str]] = {}
         RESULTS.mkdir(parents=True, exist_ok=True)
         WORK.mkdir(parents=True, exist_ok=True)
@@ -164,11 +172,34 @@ class Harness:
             if not self.keep:
                 self.destroy(dst)
 
+    # -- hypervisor ----------------------------------------------------------
+
+    def out_of_scope(self, feature: str) -> str | None:
+        """Why `feature` does not apply to this run's hypervisor, or None."""
+        return out_of_scope(feature, self.hypervisor, self.delivered)
+
+    def host_config(self) -> str:
+        """The `host {}` lines that put this run's machines on its hypervisor.
+        VMs follow once the delivered phase reaches the first one the suite's
+        OVMF template boots on; until then a lab mixing kinds still validates,
+        its VMs on QEMU, and their features are skipped by phase."""
+        if self.hypervisor == "qemu":
+            return ""
+        kinds = ["container"]
+        if PHASE_ORDER.index(self.delivered) >= PHASE_ORDER.index("2c"):
+            kinds.append("vm")
+        pins = " ".join(f'{k} = "{self.hypervisor}"' for k in kinds)
+        return f"  hypervisor {{ {pins} }}\n"
+
     # -- recording -----------------------------------------------------------
 
     def _record(self, feature: str, status: str, detail: str) -> None:
         if feature not in FEATURES:
             raise KeyError(f"feature {feature!r} is not in the catalogue")
+        why = self.out_of_scope(feature)
+        if why:
+            # The scenario ran it, but not on the hypervisor under test.
+            status, detail = "skip", why
         prior = self.results.get(feature)
         # A failure is never overwritten by a later pass of the same feature.
         if prior and prior[0] == "fail" and status != "fail":
@@ -198,10 +229,13 @@ class Harness:
         rows = []
         failed = 0
         for fid, desc in FEATURES.items():
-            status, detail = self.results.get(fid, ("missing", "no scenario exercised it"))
+            why = self.out_of_scope(fid)
+            unreported = ("skip", why) if why else ("missing", "no scenario exercised it")
+            status, detail = self.results.get(fid, unreported)
             if status in ("fail", "missing"):
                 failed += 1
-            rows.append({"feature": fid, "description": desc, "status": status, "detail": detail})
+            rows.append({"feature": fid, "description": desc, "hypervisor": self.hypervisor,
+                         "status": status, "detail": detail})
         (RESULTS / "results.json").write_text(json.dumps(rows, indent=2))
         width = max((len(r["feature"]) for r in rows), default=0)
         counts: dict[str, int] = {}
@@ -209,5 +243,6 @@ class Harness:
             counts[r["status"]] = counts.get(r["status"], 0) + 1
             if r["status"] != "pass":
                 print(f"{r['status'].upper():8} {r['feature']:<{width}}  {r['detail'][:160]}")
-        print("\n" + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) + f" (of {len(rows)})")
+        scope = f"vmlab-hv through phase {self.delivered}" if self.hypervisor == "vmlab" else self.hypervisor
+        print("\n" + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) + f" (of {len(rows)}) on {scope}")
         return 1 if failed else 0
