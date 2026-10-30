@@ -50,6 +50,16 @@ page guide_snapshots {
     taken against. [Lab containers](guide_containers) explains the pin.
   DOC
 
+  p <<DOC
+    Each snapshot also records the hypervisor that took it, `qemu` or
+    `vmlab` (see [Host and firmware](guide_host)). An online snapshot holds
+    RAM and device state in that hypervisor's own format, so restoring it on
+    a machine that now runs on the other one is refused, naming the one that
+    took it; set the machine's `hypervisor` back and it restores again. An
+    offline snapshot is plain qcow2 and restores under either. A snapshot
+    taken before vmlab recorded the field was QEMU's.
+  DOC
+
   h2 "Lab-wide snapshots"
 
   p <<DOC
