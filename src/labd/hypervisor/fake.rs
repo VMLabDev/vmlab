@@ -162,6 +162,12 @@ pub struct Script {
     pub runs: Vec<Run>,
     /// What a running machine can do beyond the lifecycle. None by default.
     pub capabilities: Capabilities,
+    /// The machine is controlled the way vmlab-hv is (§22): a control
+    /// server built on `vmlab_hv_proto`'s own `Server` on the launch's
+    /// control socket, driven by the vmlab-hv adapter's real control client
+    /// — so the lifecycle tests run against that adapter's protocol handling
+    /// rather than the in-memory [`Control`].
+    pub vmlab_hv: bool,
 }
 
 /// Which capabilities a running fake machine reports. Each one off is a
@@ -336,6 +342,14 @@ impl Hypervisor for FakeHypervisor {
             });
         }
 
+        if self.script.vmlab_hv {
+            let control = serve_vmlab_hv(&spec.control_sock, &machine, &run, &self.script)?;
+            return Ok(Running {
+                control: Arc::new(control.await?),
+                proc: machine,
+            });
+        }
+
         Ok(Running {
             control: Arc::new(FakeControl {
                 machine: machine.clone(),
@@ -345,6 +359,10 @@ impl Hypervisor for FakeHypervisor {
             }),
             proc: machine,
         })
+    }
+
+    fn emulator_binary(&self, arch: &str) -> String {
+        format!("fake-emulator-{arch}")
     }
 
     fn guest_asset(&self, arch: &str) -> Result<GuestAsset> {
@@ -677,6 +695,93 @@ fn serve_guest(
 
 /// Bind a guest-channel socket, replacing one left by a previous run — a
 /// restarted machine rebinds its ports just as a respawned QEMU does.
+/// The machine behind a vmlab-hv control socket: the protocol crate's own
+/// server, answering each command the way the in-memory [`FakeControl`]
+/// does, and announcing a guest power-off as vmlab-hv does — a `shutdown`
+/// event, then the exit. Returns the adapter's client, connected.
+fn serve_vmlab_hv(
+    socket: &Path,
+    machine: &Arc<FakeProc>,
+    run: &Run,
+    script: &Script,
+) -> Result<impl std::future::Future<Output = Result<super::vmlab_hv::control::HvControl>> + use<>>
+{
+    use vmlab_hv_proto::control::{Capability, Command, ErrorCode, Event, Outcome, ShutdownReason};
+    use vmlab_hv_proto::server::Server;
+
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(socket);
+    let listener = std::os::unix::net::UnixListener::bind(socket)?;
+    // A guest power-off is an event and then an exit, from outside the
+    // handler, which cannot broadcast through the server that owns it.
+    let (power_off, powered_off) = std::sync::mpsc::channel::<()>();
+    let capabilities = if script.capabilities.snapshots {
+        vec![Capability::Snapshots]
+    } else {
+        Vec::new()
+    };
+    let m = machine.clone();
+    let (ignores_powerdown, ignores_quit) = (run.ignores_powerdown, run.ignores_quit);
+    let tx = std::sync::Mutex::new(power_off.clone());
+    let server = Server::new("fake-vmlab-hv", capabilities, move |command: Command| {
+        let ok = Outcome::Ok { status: None };
+        let mut snapshots = m.snapshots.lock().expect("fake snapshots lock");
+        match command {
+            Command::Status | Command::Resume | Command::Pause => ok,
+            Command::Powerdown => {
+                if !ignores_powerdown {
+                    let _ = tx.lock().expect("power-off sender").send(());
+                }
+                ok
+            }
+            Command::Quit => {
+                if !ignores_quit {
+                    m.end("exit status: 0");
+                }
+                ok
+            }
+            Command::SnapshotSave { name } => {
+                snapshots.insert(name);
+                ok
+            }
+            Command::SnapshotLoad { name } if !snapshots.contains(&name) => Outcome::Error {
+                code: ErrorCode::SnapshotNotFound,
+                message: format!("no snapshot `{name}`"),
+            },
+            Command::SnapshotLoad { .. } => ok,
+            Command::SnapshotDelete { name } => {
+                snapshots.remove(&name);
+                ok
+            }
+        }
+    });
+    let broadcaster = server.clone();
+    std::thread::spawn(move || server.serve(listener));
+    let m = machine.clone();
+    std::thread::spawn(move || {
+        if powered_off.recv().is_ok() {
+            broadcaster.broadcast(Event::Shutdown {
+                reason: ShutdownReason::GuestShutdown,
+            });
+            // The event is on the wire before the exit, as vmlab-hv sends it.
+            std::thread::sleep(Duration::from_millis(50));
+            m.end("exit status: 0");
+        }
+    });
+    if let Some(exit) = run.exits.clone().filter(|e| e.guest_initiated) {
+        // The scheduled exit above already ends the machine; this is the
+        // event that precedes it, sent a beat earlier.
+        tokio::spawn(async move {
+            tokio::time::sleep(exit.after.saturating_sub(Duration::from_millis(40))).await;
+            let _ = power_off.send(());
+        });
+    }
+    let socket = socket.to_path_buf();
+    Ok(async move { super::vmlab_hv::control::HvControl::connect(&socket).await })
+}
+
 fn bind(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

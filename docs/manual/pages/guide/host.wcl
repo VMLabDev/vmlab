@@ -330,6 +330,22 @@ guest is separate: a KVM guest on x86 sees VMX or SVM only when its VM sets
 has nested virtualisation on. `vmlab up` warns with the fix when it is off.
 DOC
 
+  h2 "QEMU or vmlab-hv"
+
+  p <<'DOC'
+QEMU runs every machine unless one says otherwise. vmlab-hv is vmlab's own
+hypervisor, built a phase at a time; it runs container micro-VMs today, on an
+x86_64 host with a usable `/dev/kvm`, and has no TCG fallback. A container
+opts in with `hypervisor = "vmlab"`, and `host { hypervisor { container =
+"vmlab" } }` moves every container that names none. `vmlab validate` refuses a
+VM on vmlab-hv, `qemu_args` on it, and a container on it where KVM is not
+usable, naming the machine and the reason. vmlab finds the binary as
+`vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`. `vmlab status -v`
+shows `hypervisor=` on every machine, and its log is `vmlab-hv.log` beside the
+console log, where QEMU's is `qemu.log`. PRD §22 and ADR-0021 record the
+design.
+DOC
+
   h2 "Windows guests under KVM"
 
   p <<'DOC'

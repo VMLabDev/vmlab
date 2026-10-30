@@ -833,6 +833,9 @@ fn machine_detail(m: &MachineStatus) -> String {
         detail.push_str(&format!(" recording={}", r.path.display()));
     }
     let mut field = |k: &str, v: String| detail.push_str(&format!(" {k}={v}"));
+    // Always: which program runs the machine is the first question when it
+    // misbehaves, and QEMU is not the only answer any more (§22).
+    field("hypervisor", m.hypervisor.to_string());
     match &m.detail {
         MachineDetail::Vm(vm) => {
             // Only for a template with variants (§6.6): which one the clone
@@ -2858,22 +2861,25 @@ mod tests {
     /// became one derived column, along with the fields only one kind has.
     #[test]
     fn verbose_adds_the_raw_state_and_the_kind_specific_fields() {
+        let mut web = addressed("web", PowerState::Stopping, false, container(None, None));
+        web.hypervisor = crate::config::hypervisor::HypervisorKind::Vmlab;
         let out = render_status(
             &lab(vec![
                 addressed("dc01", PowerState::Running, false, vm()),
-                addressed("web", PowerState::Stopping, false, container(None, None)),
+                web,
             ]),
             true,
         );
         assert!(
             out.contains(
-                "state=running ready=no cached=yes arch=x86_64 cpus=4 \
+                "state=running ready=no cached=yes hypervisor=qemu arch=x86_64 cpus=4 \
                  memory=8GiB agent=0.1.0"
             ),
             "got:\n{out}"
         );
+        // Which hypervisor runs the machine (§22).
         assert!(
-            out.contains("state=stopping ready=no cached=yes health=- exit=-"),
+            out.contains("state=stopping ready=no cached=yes hypervisor=vmlab health=- exit=-"),
             "got:\n{out}"
         );
     }

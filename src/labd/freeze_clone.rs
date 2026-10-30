@@ -593,6 +593,7 @@ mod tests {
             image_digest: None,
             freeze_point,
             frozen_in,
+            hypervisor: Default::default(),
         }
     }
 

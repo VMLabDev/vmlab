@@ -82,6 +82,12 @@ first release**: the host-side SSH facade (ADR-0012, superseded), `vmlab ssh`,
 `ssh-config` and `ssh-proxy`, the managed `~/.ssh/config` block, `dev attach`
 and `dev use`, `attachable`, and the agent's `tunnel` vocabulary. A dev
 machine is reached with `vmlab shell` and `vmlab exec`.
+**A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
+"vmlab"` on a machine, else the host config's default per kind (QEMU), puts it
+on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
+pinned by git rev). Phase 1 runs container micro-VMs only; VMs, `qemu_args`
+and hosts without KVM are refused from one list. Snapshots record their
+hypervisor and an online one refuses to restore under the other.
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the
 profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
 `guest/agent-legacy` serving `exec` and `set_time` only over COM1, the bootstrap ISO's
@@ -111,7 +117,11 @@ worktree's global segments join `<segment>@<worktree>`.
 Module map under `src/`:
 
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
-  `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005).
+  `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005);
+  `hypervisor.rs` is which hypervisor a machine runs on (§22, ADR-0021) — its
+  own `hypervisor`, else the host config's default for its kind — and
+  `vmlab_refusals`, the one list of what vmlab-hv cannot run yet, read by
+  validation and again by the lab daemon.
 - `instance.rs` — lab instances (ADR-0011's amendment, PRD §3.2): the
   effective name `<declared>-<instance>` a directory runs its lab under, from
   `--instance`, `VMLAB_INSTANCE` or the linked git worktree, slugged to a DNS
@@ -228,8 +238,14 @@ Module map under `src/`:
   typed `Launch` (resolved machine plus runtime paths) and hands back a
   `Process` and a `Control`, whose capabilities — snapshots, input, frames,
   hot-plug, media — are reported or `None`; `qemu.rs` composes the argv with
-  the pure builders in `qemu/` and translates each capability to QMP, and
-  `fake.rs` is the in-memory adapter the lifecycle tests drive;
+  the pure builders in `qemu/` and translates each capability to QMP;
+  `vmlab_hv/` is the second production adapter (§22, ADR-0021) — `describe.rs`
+  composes vmlab-hv's `MachineDescription` from a container launch,
+  `control.rs` is its control protocol as a `Control` (two connections, one
+  for commands and one read for events) — chosen per machine by
+  `for_machine`; and `fake.rs` is the in-memory adapter the lifecycle tests
+  drive, which can also put the vmlab-hv control client in front of a fake
+  protocol server;
   `provisioning.rs` is §7.2's per-machine provisioning: each machine's steps
   run in parallel once it is ready, gated by `depends_on_provision`, with
   machine-prefixed output and the first failure cancelling the rest (wscript

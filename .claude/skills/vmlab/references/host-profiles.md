@@ -66,6 +66,8 @@ host {
   config_weave_bin_dir = "~/.local/share/config-weave/bin"
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
+  vmlab_hv             = "/opt/vmlab-hv/bin/vmlab-hv"
+  hypervisor { container = "qemu" vm = "qemu" }
 }
 ```
 
@@ -85,6 +87,8 @@ host {
 | `oci_chunk_size` | ByteSize | `512MiB` | OCI layer chunk size for `vmlab template push` (see templates.md). |
 | `config_weave_bin_dir` | utf8 | `~/.local/share/config-weave/bin` | Directory holding the config-weave guest binaries playbooks push (see automation.md). |
 | `workspace_max_file` | ByteSize | `256MiB` | Workspace syncer per-file size guard. A larger file is refused by name (see dev-machines.md). |
+| `vmlab_hv` | utf8 | `vmlab-hv` on PATH | The vmlab-hv binary machines on `hypervisor = "vmlab"` run (PRD §22). |
+| `hypervisor {}` | child | `qemu` for both | Default hypervisor per machine kind, `container` and `vm`, each `qemu` or `vmlab`; a machine's own `hypervisor` wins. |
 | `firmware_dir` | utf8 | none | UEFI firmware override, `<dir>/<arch>/` with the bundled set's file names; searched before vmlab's bundled firmware and the host's (see "UEFI firmware" below). |
 
 Parser rules, all violations reported in one pass:

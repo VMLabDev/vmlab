@@ -373,8 +373,18 @@ frames, hot-plug, media — is a **capability** its Control reports or does not.
 TPM, filesystem daemons, the guest boot asset, launch composition and process
 spawning sit below it; hardware resolution, power state, exit classification,
 readiness and teardown ordering sit above.
-Two adapters, both live: QEMU in production, the fake in the lifecycle tests.
+Three adapters: QEMU and vmlab-hv in production, chosen per machine by its
+**hypervisor** field, and the fake in the lifecycle tests.
 _Avoid_: driver, backend, runtime
+
+**vmlab-hv**:
+vmlab's own hypervisor, one process per machine in place of QEMU, driven over
+its own control protocol from a machine description vmlab writes (PRD §22,
+ADR-0021). A machine is on it when its block says `hypervisor = "vmlab"` or the
+host config's default for its kind does. It runs container micro-VMs today;
+what it cannot run yet is one list of refusals, which each phase shrinks.
+An online snapshot belongs to the hypervisor that took it.
+_Avoid_: the new backend, vmm (for the product)
 
 **Spawner**:
 The guest-side counterpart of the Hypervisor seam, inside vmlab-agent: the one

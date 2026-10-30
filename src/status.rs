@@ -470,6 +470,11 @@ pub struct MachineStatus {
     /// daemon owns recordings, so `LabRuntime::status` fills it in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<crate::record::RecordingStatus>,
+    /// The hypervisor the machine runs on (PRD §22): its own `hypervisor`,
+    /// else the host config's default for its kind. A status from a daemon
+    /// that predates the field reads as QEMU, which is all it could run.
+    #[serde(default)]
+    pub hypervisor: crate::config::hypervisor::HypervisorKind,
     #[serde(flatten)]
     pub detail: MachineDetail,
 }
@@ -869,6 +874,7 @@ pub(crate) mod fixtures {
             dev: None,
             agent_diverged: false,
             recording: None,
+            hypervisor: Default::default(),
             detail,
         }
     }

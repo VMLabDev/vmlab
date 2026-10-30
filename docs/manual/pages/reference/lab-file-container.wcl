@@ -36,6 +36,7 @@ container "<name>" {
   profile    = "container"
   cpus       = 1
   memory     = 256MiB
+  hypervisor = "qemu"
   depends_on = ["db"]
   depends_on_provision = ["db"]
   clock      = "host"
@@ -63,6 +64,7 @@ SRC
       | "`profile`" | "utf8" | "none" | "Guest profile supplying micro-VM hardware defaults, for example `container`." |
       | "`cpus`" | "i64" | "from profile" | "vCPU count for the micro-VM, greater than 0. One of this field or the profile must supply it." |
       | "`memory`" | "ByteSize" | "from profile" | "RAM for the micro-VM, for example `512MiB`. One of this field or the profile must supply it." |
+      | "`hypervisor`" | "utf8" | "host default, else `qemu`" | "The program that runs the micro-VM: `qemu`, or `vmlab` for vmlab-hv, vmlab's own hypervisor (x86_64 under KVM). Unset takes the host config's default for containers. Online snapshots restore only under the hypervisor that took them. See [Host and firmware](guide_host) and [Snapshots](guide_snapshots)." |
       | "`depends_on`" | "list<utf8>" | "none" | "Start order: VM or container names that must be ready before this container starts. Their provisioning is not waited for. `down` stops in reverse. No self-reference, no cycles." |
       | "`depends_on_provision`" | "list<utf8>" | "none" | "Provisioning order: VM or container names whose provision and playbook steps must all finish before this container's first step runs. Does not delay its start. No self-reference, no cycles." |
       | "`clock`" | "utf8" | "`host`" | "Guest clock policy, as on a VM. `host`: after an online snapshot restore the lab daemon sets the micro-VM's clock to the host's current time through the agent. `snapshot`: a restored container keeps the time it was captured at. An RFC 3339 date-time such as `2020-01-01T00:00:00Z`: the RTC starts at that instant on every boot and vmlab never sets it. Declared here only. See [vm and its children](ref_vm)." |
@@ -93,6 +95,7 @@ SRC
     li "Every name in `depends_on` and `depends_on_provision` exists and is not the container itself, and neither key forms a cycle across VMs and containers. A loop that crosses from one key to the other is allowed."
     li "`clock` is `host`, `snapshot`, or an RFC 3339 date-time such as `2020-01-01T00:00:00Z`."
     li "`login {}` blocks are judged against the Linux family regardless of the profile named: `elevated` is rejected and `password` is optional."
+    li "A container on `hypervisor = \"vmlab\"`, declared or from the host default, is refused on a host that is not x86_64 or whose `/dev/kvm` is not usable: vmlab-hv has no emulation fallback yet. QEMU falls back to TCG."
   }
   code wcl {
     filename    = "examples/mixed-lab/vmlab.wcl"

@@ -228,6 +228,7 @@ impl LabRuntime {
             home: home.as_deref(),
             mtus: &mtus,
             freeze: freeze.as_ref(),
+            host: &self.host_cfg,
         };
         let mut built = Vec::new();
         for cfg in cfgs {
