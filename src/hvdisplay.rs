@@ -168,7 +168,7 @@ fn capture_blocking(path: &Path) -> Result<RgbImage> {
 /// `B G R x` pixels as an RGB image.
 fn rgb_from_bgrx(width: u32, height: u32, bgrx: &[u8]) -> RgbImage {
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for px in bgrx.chunks_exact(4) {
+    for px in bgrx.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     RgbImage::from_raw(width, height, rgb).expect("one pixel per four bytes")
@@ -361,7 +361,9 @@ fn decode(client: &Client, surface: &mut Surface, packet: Packet) -> io::Result<
             // Premultiplied ARGB words, `B G R A` in memory, to the
             // premultiplied RGBA the recorder composites.
             rgba: argb
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| [p[2], p[1], p[0], p[3]])
                 .collect(),
         }],
