@@ -29,7 +29,8 @@ scenario in a privileged container with /dev/kvm (about 16 minutes; see
 `e2e.log` with every command and its output). When several worktrees run it at
 once, give each its own image: `VMLAB_E2E_IMAGE=vmlab-e2e-<name>`. Scenarios
 live in `e2e/scenarios/`, features in `e2e/features.py`; a feature no scenario
-reports fails the run.
+reports fails the run. `--hypervisor vmlab` runs the machines on vmlab-hv and
+skips each feature past its delivered phase (`PHASES` in `features.py`).
 
 ## Gotchas
 
