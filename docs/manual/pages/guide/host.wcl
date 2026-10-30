@@ -3,7 +3,7 @@ page guide_host {
   chapter_header "Host configuration and WSL 2" {
     kicker       = "The guide · explanation"
     reading_time = "9 min read"
-    updated      = "2026-10-30"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -344,6 +344,20 @@ usable, naming the machine and the reason. vmlab finds the binary as
 shows `hypervisor=` on every machine, and its log is `vmlab-hv.log` beside the
 console log, where QEMU's is `qemu.log`. PRD §22 and ADR-0021 record the
 design.
+DOC
+
+  p <<'DOC'
+Choose vmlab-hv for a container when you want to try the new hypervisor on one
+machine inside a lab that otherwise runs on QEMU. Keep QEMU for everything
+else, and for any container that must also run on a host without KVM. Two
+things differ on a vmlab-hv machine. It has no emulation fallback, so where
+QEMU falls back to TCG, vmlab-hv refuses the machine. And an online snapshot
+is stored in the format of the hypervisor that took it, so it does not restore
+after the machine moves to the other one. Set `hypervisor` back and the
+snapshot restores again; an offline snapshot restores under either.
+`qemu-img` is still required, because the scratch disk and offline snapshots
+are made with it. The [hypervisor {}](ref_host) reference lists the host
+defaults and the rules that check them.
 DOC
 
   h2 "Windows guests under KVM"
