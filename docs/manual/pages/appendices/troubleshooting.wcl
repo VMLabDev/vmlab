@@ -770,6 +770,27 @@ MSG
     `vmlab console --tcp`, which bridges the display to a localhost port.
   DOC
 
+  h2 "A Windows guest's clock is hours off after a reboot"
+  p <<DOC
+    vmlab emits `machine.clock_drift` when it finds this, and corrects it.
+    A Windows guest whose agent set `RealTimeIsUniversal` during the current
+    boot writes local time into the RTC, and the next reboot inside the
+    guest reads that time as UTC. The clock is then off by the guest's UTC
+    offset. With `clock = "host"`, the default, the lab daemon checks the
+    guest clock each time it connects to the agent, and sets it when it is
+    more than 2 seconds off. Look in `vmlab logs` for `machine.clock_drift`
+    with `corrected = true`.
+  DOC
+  p <<DOC
+    If the clock stays wrong, check three things. A `machine.clock_unchecked`
+    event means the agent cannot report the clock: run
+    `vmlab machine repair-agent <machine>`. A `machine.clock_drift` event
+    with `corrected = false` gives the guest's reason in `error`. A machine
+    whose `clock` is `snapshot` or a date-time is never corrected, by design.
+    To remove the window entirely, set `RealTimeIsUniversal = 1` in the
+    template before it is sealed.
+  DOC
+
   h2 "A Windows guest is slow under nested KVM or WSL 2"
   p <<DOC
     vmlab prints nothing for this. The symptom is a Windows guest that boots

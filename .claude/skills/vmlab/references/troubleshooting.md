@@ -327,6 +327,10 @@ vmlab prints nothing specific to WSL 2. When nested virtualisation is disabled i
 
 Some WSL 2 sessions have no `$XDG_RUNTIME_DIR`. vmlab does not fail on that: it falls back to `/tmp/vmlab-<uid>` for the supervisor socket and other runtime files, creates it with mode 0700, tightens an existing directory, and refuses one owned by another user. If the sockets are under `/tmp` rather than `/run/user/<uid>`, that is why. Networking on WSL 2 needs no tap, bridge or macvlan, so the fast path degrades to userspace silently there; a Windows-side VNC viewer is reached with `vmlab console --tcp`, which bridges the display to a localhost port.
 
+## A Windows guest's clock is hours off after a reboot
+
+A Windows guest whose agent set `RealTimeIsUniversal` during the current boot writes local time into the RTC whenever its clock is set, and a reboot inside the guest (QEMU keeps the RTC) then reads that local time as UTC: the clock is off by the guest's UTC offset, and Kerberos (5 min tolerance) and certificate dates break. With `clock = "host"` (the default) vmlab corrects it at the next agent handshake, before the connection is used, and emits `machine.clock_drift` (`drift_ms`, `corrected = true`); check `vmlab logs`. If the clock stays wrong: `machine.clock_unchecked` means the agent has no `get_time` — run `vmlab machine repair-agent <machine>`; `machine.clock_drift` with `corrected = false` carries the guest's refusal in `error`; a `snapshot` or date-time `clock` is never corrected, by design. Setting `RealTimeIsUniversal = 1` in the template before it is sealed removes the window entirely.
+
 ## A Windows guest is slow under nested KVM or WSL 2
 
 vmlab prints nothing for this. A Windows guest boots under KVM but anything that reads the clock often (.NET services, build tools, games) runs much slower than it should. Without the Hyper-V enlightenments Windows reads time from an emulated timer and each read exits the guest: about 5.6 µs native and 51 µs nested under WSL 2, against about 20 ns with them.

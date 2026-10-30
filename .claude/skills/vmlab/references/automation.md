@@ -276,6 +276,8 @@ status and `exit_code` the container's.
 | Event | Payload fields | When |
 | --- | --- | --- |
 | `snapshot.created` | `vm`, `name`, `online` | A snapshot was taken, of a VM or a container alike, after the workspace pre-flight flush. |
+| `machine.clock_drift` | `vm`, `machine`, `drift_ms`, `guest`, `host`, `corrected`, `error` | A fresh agent handshake found a `clock = "host"` guest more than 2 s from the host and set it. `drift_ms` is guest minus host; `corrected = false` carries the guest's refusal in `error`. |
+| `machine.clock_unchecked` | `vm`, `machine`, `reason` | A `clock = "host"` machine's agent has no `get_time`, so its clock is not checked. Once per start. |
 | `snapshot.restored` | `vm`, `name`, `online`, `clock` | A snapshot was restored, after the pin check and the syncer bracket. `clock` is present for an online restore only: `set` (set to the host's time), `kept` (the machine's `clock` is `snapshot`), `fixed` (a fixed date-time) or `not_set` (it should have been set and could not; the reason is in the daemon log and the CLI warning). |
 
 Deleting a snapshot emits nothing.

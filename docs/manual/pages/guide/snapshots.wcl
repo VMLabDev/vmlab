@@ -94,7 +94,7 @@ page guide_snapshots {
   table {
     rows:
       | "`clock`" | "After an online restore" | "At boot" |
-      | "`host` (default)" | "Set to the host's current time." | "The RTC starts at the host's time." |
+      | "`host` (default)" | "Set to the host's current time." | "The RTC starts at the host's time, and the guest clock is checked at every agent handshake." |
       | "`snapshot`" | "Kept at the time the snapshot was taken." | "The RTC starts at the host's time." |
       | "An RFC 3339 date-time" | "Never set by vmlab." | "The RTC starts at that instant and runs forward from it." |
   }
@@ -107,9 +107,32 @@ page guide_snapshots {
     agent sets it again whenever it starts. Without it, Windows reads the RTC
     as local time and is wrong by its UTC offset at every cold boot. A
     template built before vmlab set the flag gets it from `up`'s agent update
-    or `vmlab machine repair-agent`. Windows reads the flag only at boot, so
-    after either one, vmlab sets the running guest's clock to the host's time
-    once (`clock = "host"` only). The flag holds from the next boot.
+    or `vmlab machine repair-agent`.
+  DOC
+
+  p <<DOC
+    Windows reads the flag only at boot. In the boot where the agent first
+    sets it, Windows still treats the RTC as local time, and every time its
+    clock is set it writes local time into the RTC. A reboot from inside the
+    guest keeps that RTC, because QEMU keeps running, so the next boot reads
+    local time as UTC and the clock is off by the guest's UTC offset. A
+    template that has the flag set before it is sealed never has this
+    window.
+  DOC
+
+  p <<DOC
+    With `clock = "host"`, vmlab corrects a clock like this one. Each time
+    the lab daemon makes a new connection to a machine's agent, it reads the
+    guest's clock before it hands the connection to anything else. That is
+    the first connection after a start, the first after a reboot inside the
+    guest, and the first after the agent restarts. When the guest is more
+    than 2 seconds from the host, the daemon sets the guest clock to the
+    host's time and emits `machine.clock_drift`, which names the machine and
+    the drift. A provision step that reboots the guest and then runs a
+    command therefore runs that command at the right time. The check needs
+    the agent feature `get_time`. An agent without it is not checked, and
+    `machine.clock_unchecked` says so once per start. A `snapshot` or fixed
+    clock is never checked.
   DOC
 
   p <<DOC
