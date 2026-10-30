@@ -467,6 +467,7 @@ impl LabRuntime {
         }
         let mut pending: BTreeMap<String, PullJob> = BTreeMap::new();
         let home = std::env::var_os("HOME").map(PathBuf::from);
+        let host_cfg = crate::config::host::HostConfig::load_default()?;
 
         let config = Arc::new(config);
         let mtus = network.mtus();
@@ -481,6 +482,7 @@ impl LabRuntime {
                 home: home.as_deref(),
                 mtus: &mtus,
                 freeze: freeze.as_ref(),
+                host: &host_cfg,
             };
             for vm_cfg in &config.lab.vms {
                 let (vm, pull) = machine_build::build_vm(&cx, vm_cfg, &mut state).await?;
@@ -518,7 +520,6 @@ impl LabRuntime {
         // DNS (auto-registration + statics + sinkholes) per segment. The MAC
         // map spans VMs and containers (one name namespace), so container
         // static IPs and lease-DNS registrations work identically.
-        let host_cfg = crate::config::host::HostConfig::load_default()?;
         let mut macs_by_vm: std::collections::HashMap<String, Vec<crate::config::model::MacAddr>> =
             state
                 .machines
@@ -3059,6 +3060,7 @@ impl LabRuntime {
                     image_digest: m.snapshot_pin(),
                     freeze_point: None,
                     frozen_in: None,
+                    hypervisor: m.hypervisor(),
                 },
             );
             state.save(&self.lab_local)?;
@@ -3127,6 +3129,12 @@ impl LabRuntime {
         }
 
         let m = self.machine(name)?;
+        // An online snapshot's RAM and device state are the format of the
+        // hypervisor that took it, which the machine may no longer run on
+        // (§22, D31). Refused before anything moves.
+        if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
+            return Err(crate::proto::CommandError::conflict(why).into());
+        }
         let workspace = self.workspace_of(name);
         // Before anything is rolled back, and before the syncer is taken off
         // the workspace: a refusal has to leave the machine exactly as it was.
@@ -5165,6 +5173,58 @@ lab "t" {
         }
     }
 
+    /// A snapshot records the hypervisor that took it, and an online one
+    /// refuses to restore under another, naming the one that took it; an
+    /// offline one restores under either (§22, D31).
+    #[tokio::test]
+    async fn an_online_snapshot_restores_only_under_the_hypervisor_that_took_it() {
+        use crate::config::hypervisor::HypervisorKind;
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "warm" { template = "x86_64/t" clock = "snapshot" }
+  vm "cold" { template = "x86_64/t" }
+}"#,
+            vec![
+                FakeMachine::clocked("warm", &sh, crate::config::model::Clock::Snapshot),
+                FakeMachine::new("cold", MachineKind::Vm, &sh),
+            ],
+        );
+        assert!(lab.snapshot("warm", "s1").await.unwrap());
+        assert!(!lab.snapshot("cold", "s1").await.unwrap());
+        // Recorded as the machine's own hypervisor at capture.
+        assert_eq!(
+            lab.state.lock().await.machines["warm"].snapshots["s1"].hypervisor,
+            HypervisorKind::Qemu
+        );
+        // As if both had been taken while the machines ran on vmlab-hv.
+        {
+            let mut state = lab.state.lock().await;
+            for m in ["warm", "cold"] {
+                state
+                    .machine_mut(m)
+                    .snapshots
+                    .get_mut("s1")
+                    .unwrap()
+                    .hypervisor = HypervisorKind::Vmlab;
+            }
+        }
+        let err = lab.restore("warm", "s1", false).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("taken online under vmlab"), "{msg}");
+        assert!(msg.contains("now runs on qemu"), "{msg}");
+        assert!(
+            err.downcast_ref::<crate::proto::CommandError>().is_some(),
+            "a conflict, not an internal error: {msg}"
+        );
+        lab.restore("cold", "s1", false)
+            .await
+            .expect("offline restores across");
+    }
+
     /// `up` reports a share that gave up, and one still retrying when its
     /// wait ran out, without waiting for the retrying one to finish.
     #[tokio::test(start_paused = true)]
@@ -5839,6 +5899,7 @@ fn main(lab: Lab) {
                     image_digest: None,
                     freeze_point,
                     frozen_in: freeze_point.xor(Some(1)),
+                    hypervisor: Default::default(),
                 },
             );
         }

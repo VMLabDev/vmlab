@@ -571,6 +571,15 @@ pub trait Machine: Send + Sync + 'static {
         None
     }
 
+    /// The hypervisor this machine runs on (PRD §22): its own `hypervisor`,
+    /// else the host config's default for its kind. Recorded on every
+    /// snapshot, because an online one restores only under the hypervisor
+    /// that took it. QEMU unless the machine says otherwise — every VM, until
+    /// vmlab-hv's phase 2.
+    fn hypervisor(&self) -> crate::config::hypervisor::HypervisorKind {
+        crate::config::hypervisor::HypervisorKind::Qemu
+    }
+
     // ---- host USB passthrough (PRD §5.2.1) ---------------------------------
 
     /// Whether this machine can take a host USB device now: running, and
@@ -772,6 +781,7 @@ impl dyn Machine {
             agent_diverged: false,
             // And the recording: the lab daemon owns it (§11.1).
             recording: None,
+            hypervisor: self.hypervisor(),
             detail,
         }
     }

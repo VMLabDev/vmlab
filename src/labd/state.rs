@@ -86,6 +86,36 @@ pub struct SnapshotRecord {
     /// (PRD §21.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_in: Option<u32>,
+    /// The hypervisor that took it (PRD §22). An online snapshot's RAM and
+    /// device state are that hypervisor's own format, so it restores only
+    /// under the same one; an offline one is plain qcow2 and restores under
+    /// either. A record from before the field was QEMU's — nothing else
+    /// could take one.
+    #[serde(default)]
+    pub hypervisor: crate::config::hypervisor::HypervisorKind,
+}
+
+impl SnapshotRecord {
+    /// Why this snapshot cannot be restored on a machine that now runs on
+    /// `now` — `None` when it can (PRD §22, D31). Only an online one is
+    /// bound to its hypervisor, and switching the machine back makes it
+    /// restorable again, so the refusal says how.
+    pub fn hypervisor_refusal(
+        &self,
+        machine: &str,
+        snap: &str,
+        now: crate::config::hypervisor::HypervisorKind,
+    ) -> Option<String> {
+        (self.online && self.hypervisor != now).then(|| {
+            format!(
+                "\"{machine}\": snapshot \"{snap}\" was taken online under {took}, and the \
+                 machine now runs on {now} — an online snapshot restores only under the \
+                 hypervisor that took it (PRD §22). Set `hypervisor = \"{took}\"` on the \
+                 machine to restore it, or restore an offline snapshot, which either can",
+                took = self.hypervisor,
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -191,6 +221,65 @@ mod tests {
         assert_eq!(a.0[0..3], [0x52, 0x54, 0x00]);
     }
 
+    use crate::config::hypervisor::HypervisorKind;
+
+    /// A record written before the field existed was QEMU's (PRD §22).
+    #[test]
+    fn a_record_without_a_hypervisor_was_qemus() {
+        let record: SnapshotRecord =
+            serde_json::from_str(r#"{"online": true, "taken_at": "2026-01-01T00:00:00Z"}"#)
+                .unwrap();
+        assert_eq!(record.hypervisor, HypervisorKind::Qemu);
+        assert_eq!(
+            record.hypervisor_refusal("m", "s", HypervisorKind::Qemu),
+            None
+        );
+    }
+
+    /// D31: an online snapshot is bound to the hypervisor that took it; an
+    /// offline one is plain qcow2 and restores under either.
+    #[test]
+    fn only_an_online_snapshot_is_bound_to_its_hypervisor() {
+        let record = |online, hypervisor| SnapshotRecord {
+            online,
+            taken_at: chrono::Utc::now(),
+            image_digest: None,
+            freeze_point: None,
+            frozen_in: None,
+            hypervisor,
+        };
+        let why = record(true, HypervisorKind::Vmlab)
+            .hypervisor_refusal("web", "warm", HypervisorKind::Qemu)
+            .expect("refused");
+        assert!(why.contains("\"web\""), "{why}");
+        assert!(why.contains("\"warm\""), "{why}");
+        assert!(why.contains("taken online under vmlab"), "{why}");
+        assert!(why.contains("now runs on qemu"), "{why}");
+        assert!(why.contains("hypervisor = \"vmlab\""), "{why}");
+        assert!(
+            record(true, HypervisorKind::Qemu)
+                .hypervisor_refusal("web", "warm", HypervisorKind::Vmlab)
+                .is_some()
+        );
+        for (took, now) in [
+            (HypervisorKind::Qemu, HypervisorKind::Vmlab),
+            (HypervisorKind::Vmlab, HypervisorKind::Qemu),
+        ] {
+            assert_eq!(
+                record(false, took).hypervisor_refusal("web", "cold", now),
+                None
+            );
+        }
+        assert_eq!(
+            record(true, HypervisorKind::Vmlab).hypervisor_refusal(
+                "web",
+                "warm",
+                HypervisorKind::Vmlab
+            ),
+            None
+        );
+    }
+
     #[test]
     fn state_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
@@ -204,6 +293,7 @@ mod tests {
                 image_digest: None,
                 freeze_point: None,
                 frozen_in: None,
+                hypervisor: Default::default(),
             },
         );
         s.machine_mut("web").snapshots.insert(
@@ -214,10 +304,26 @@ mod tests {
                 image_digest: Some("sha256:abc".into()),
                 freeze_point: None,
                 frozen_in: None,
+                hypervisor: Default::default(),
+            },
+        );
+        s.machine_mut("hv").snapshots.insert(
+            "live".into(),
+            SnapshotRecord {
+                online: true,
+                taken_at: chrono::Utc::now(),
+                image_digest: None,
+                freeze_point: None,
+                frozen_in: None,
+                hypervisor: HypervisorKind::Vmlab,
             },
         );
         s.save(tmp.path()).unwrap();
         let loaded = LabState::load(tmp.path()).unwrap();
+        assert_eq!(
+            loaded.machines["hv"].snapshots["live"].hypervisor,
+            HypervisorKind::Vmlab
+        );
         assert_eq!(loaded.machines["a"].macs.len(), 1);
         assert!(loaded.machines["a"].snapshots["clean"].online);
         assert_eq!(
