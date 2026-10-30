@@ -367,15 +367,15 @@ DOC
 QEMU runs every machine unless one says otherwise. vmlab-hv is vmlab's own
 hypervisor, built a phase at a time, on an x86_64 host with a usable
 `/dev/kvm`; it has no TCG fallback. It runs container micro-VMs, and modern
-Linux VMs on the q35 machine with SeaBIOS: `firmware = "seabios"` (the
-`ubuntu-26.04` and `almalinux-10` templates declare it, and `linux-generic`
-defaults to it), std VGA or virtio-vga, virtio or SATA disks, CD-ROMs,
-virtio-net NICs and the USB tablet. A machine opts in with
+VMs on the q35 machine: SeaBIOS or OVMF with secure boot, a TPM and the
+Hyper-V enlightenments, std VGA or virtio-vga, virtio or SATA disks, CD-ROMs,
+virtio-net NICs and the USB tablet — the Linux profiles and the Windows 10, 11
+and Server templates as they are. A guest that reboots itself is started
+again at once, with no stop in between, as QEMU resets it in place. A machine opts in with
 `hypervisor = "vmlab"`, and `host { hypervisor { container = "vmlab" vm =
 "vmlab" } }` moves every machine of that kind that names none. `vmlab
 validate` refuses what vmlab-hv cannot run yet, naming the machine, the reason
-and the phase that brings it: OVMF, secure boot, a TPM or Hyper-V (2c), a
-`gpu {}` (2d), a virtiofs share (2e), `usb = true` (2f), macOS, the i440fx
+and the phase that brings it: a `gpu {}` (2d), a virtiofs share (2e), `usb = true` (2f), macOS, the i440fx
 machine and floppies, and `qemu_args` in every phase. A VM's `auto` shares
 fall back to SMB there.
 
