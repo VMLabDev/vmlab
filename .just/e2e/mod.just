@@ -27,7 +27,7 @@ require-docker:
 image-build: require-docker
 	DOCKER_BUILDKIT=1 docker build -f e2e/Dockerfile -t {{image}} .
 
-# Run the suite (arguments go to e2e/run.py: `--only core dev`, `--keep`, `--list`)
+# Run the suite (arguments go to e2e/run.py: `--only core dev`, `--keep`, `--list`, `--hypervisor vmlab`)
 [group('e2e')]
 run *args: image-build
 	mkdir -p e2e/results
