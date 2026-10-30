@@ -1831,6 +1831,7 @@ pub(crate) mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
             created: chrono::Utc::now(),
             origin: None,
@@ -1970,6 +1971,7 @@ pub(crate) mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
         };
         let mut legacy = variant("legacy", false);

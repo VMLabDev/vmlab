@@ -1017,6 +1017,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
@@ -1614,6 +1615,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
         }
     }

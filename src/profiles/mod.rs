@@ -115,6 +115,8 @@ pub struct Profile {
     /// QEMU `-cpu` model (§5.2) — for guests that cannot run on the host
     /// CPU's CPUID, such as Windows 9x. None = the accelerator default.
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments (§5.2) under KVM. None = off.
+    pub hyperv: Option<bool>,
     /// QEMU accelerator (§5.2). None = KVM when usable, else TCG.
     pub accel: Option<crate::config::model::AccelMode>,
     pub cpus: Option<u32>,
@@ -280,6 +282,7 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
         cpu_model: r
             .parsed("cpu_model", crate::config::model::parse_cpu_model)
             .unspan(),
+        hyperv: r.bool("hyperv").unspan(),
         accel: r.keyword("accel", crate::config::model::ACCELS).unspan(),
         cpus: r.int_at_least("cpus", 1).unspan(),
         memory: r.size("memory").unspan(),
@@ -390,6 +393,31 @@ mod tests {
         let shipped = ProfileSet::shipped().unwrap();
         for name in shipped.names() {
             assert_eq!(shipped.get(name).unwrap().accel, None, "{name}");
+        }
+    }
+
+    /// The shipped Windows profiles from Vista on turn the Hyper-V
+    /// enlightenments on (§5.2); `windows-xp`, `windows-9x` and every
+    /// non-Windows profile leave them unset.
+    #[test]
+    fn hyperv_is_on_for_the_enlightened_windows_profiles_only() {
+        let ok = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"p\" { hyperv = false }\n",
+            "<test>",
+        )
+        .unwrap();
+        assert_eq!(ok[0].hyperv, Some(false));
+
+        let shipped = ProfileSet::shipped().unwrap();
+        let on = [
+            "windows-11",
+            "windows-10",
+            "windows-server",
+            "windows-legacy",
+        ];
+        for name in shipped.names() {
+            let want = on.contains(&name).then_some(true);
+            assert_eq!(shipped.get(name).unwrap().hyperv, want, "{name}");
         }
     }
 

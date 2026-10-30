@@ -45,6 +45,8 @@ pub struct TemplateMeta {
     pub display: Option<String>,
     /// QEMU `-cpu` model the template pins for its clones (§5.2).
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments the template pins for its clones (§5.2).
+    pub hyperv: Option<bool>,
     /// QEMU accelerator the template pins for its clones (§5.2).
     pub accel: Option<crate::config::model::AccelMode>,
     pub created: DateTime<Utc>,
@@ -103,6 +105,7 @@ pub struct VariantMeta {
     pub secure_boot_keys: Option<SecureBootKeys>,
     pub display: Option<String>,
     pub cpu_model: Option<String>,
+    pub hyperv: Option<bool>,
     pub accel: Option<crate::config::model::AccelMode>,
 }
 
@@ -293,6 +296,7 @@ impl TemplateMeta {
         over(&mut m.secure_boot_keys, &v.secure_boot_keys);
         over(&mut m.display, &v.display);
         over(&mut m.cpu_model, &v.cpu_model);
+        over(&mut m.hyperv, &v.hyperv);
         over(&mut m.accel, &v.accel);
         over(&mut m.first_boot_script, &v.first_boot_script);
         over(&mut m.agent_version, &v.agent_version);
@@ -350,6 +354,9 @@ impl TemplateMeta {
         }
         if let Some(c) = &self.cpu_model {
             let _ = writeln!(out, "  cpu_model = {}", quote(c));
+        }
+        if let Some(h) = self.hyperv {
+            let _ = writeln!(out, "  hyperv = {h}");
         }
         if let Some(a) = self.accel {
             let _ = writeln!(out, "  accel = {}", quote(a.as_str()));
@@ -470,6 +477,9 @@ fn write_variant(out: &mut String, v: &VariantMeta) {
     if let Some(c) = &v.cpu_model {
         let _ = writeln!(out, "    cpu_model = {}", quote(c));
     }
+    if let Some(h) = v.hyperv {
+        let _ = writeln!(out, "    hyperv = {h}");
+    }
     if let Some(a) = v.accel {
         let _ = writeln!(out, "    accel = {}", quote(a.as_str()));
     }
@@ -524,6 +534,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
     let cpu_model = r
         .parsed("cpu_model", crate::config::model::parse_cpu_model)
         .unspan();
+    let hyperv = r.bool("hyperv").unspan();
     // Lenient, like `firmware`: a spelling this build does not know reads
     // as unset rather than making the store entry unreadable.
     let accel = r
@@ -556,6 +567,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         secure_boot_keys,
         display,
         cpu_model,
+        hyperv,
         accel,
         origin,
         registry,
@@ -653,6 +665,7 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
     let cpu_model = r
         .parsed("cpu_model", crate::config::model::parse_cpu_model)
         .unspan();
+    let hyperv = r.bool("hyperv").unspan();
     let accel = r
         .string("accel")
         .unspan()
@@ -676,6 +689,7 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
         secure_boot_keys,
         display,
         cpu_model,
+        hyperv,
         accel,
     })
 }
@@ -739,6 +753,7 @@ mod tests {
             secure_boot_keys: Some(SecureBootKeys::Setup),
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
+            hyperv: Some(false),
             accel: Some(crate::config::model::AccelMode::Tcg),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
@@ -769,6 +784,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
@@ -1025,6 +1041,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
         }
     }

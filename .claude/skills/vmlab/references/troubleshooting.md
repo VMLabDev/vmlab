@@ -310,6 +310,20 @@ vmlab prints nothing specific to WSL 2. When nested virtualisation is disabled i
 
 Some WSL 2 sessions have no `$XDG_RUNTIME_DIR`. vmlab does not fail on that: it falls back to `/tmp/vmlab-<uid>` for the supervisor socket and other runtime files, creates it with mode 0700, tightens an existing directory, and refuses one owned by another user. If the sockets are under `/tmp` rather than `/run/user/<uid>`, that is why. Networking on WSL 2 needs no tap, bridge or macvlan, so the fast path degrades to userspace silently there; a Windows-side VNC viewer is reached with `vmlab console --tcp`, which bridges the display to a localhost port.
 
+## A Windows guest is slow under nested KVM or WSL 2
+
+vmlab prints nothing for this. A Windows guest boots under KVM but anything that reads the clock often (.NET services, build tools, games) runs much slower than it should. Without the Hyper-V enlightenments Windows reads time from an emulated timer and each read exits the guest: about 5.6 µs native and 51 µs nested under WSL 2, against about 20 ns with them.
+
+They are on by default for every Windows profile from Vista on (`windows-11`, `windows-10`, `windows-server`, `windows-legacy`), so find what turned them off: `hyperv = false` on the VM or its template, a `cpu_model` (it replaces the host CPU and the flags with it), a user profile without `hyperv = true`, or the TCG fallback above. `ps -o args= -C qemu-system-x86_64` shows each machine's `-cpu`; an enlightened one carries `hv-time`. Never add `+invtsc` through `qemu_args`: QEMU then refuses to migrate the guest, and every online snapshot is a migration.
+
+## Hyper-V enlightenments were not applied
+
+```
+warning: vm "{machine}": hyperv = true is not applied — {reason}; it boots without the Hyper-V enlightenments (PRD §5.2)
+```
+
+`vmlab up` prints this when the vm block itself sets `hyperv = true` and the launch cannot apply it; the machine boots without `hv-*` flags. The reason is one of: it runs under TCG, a `cpu_model` names the CPU, or the guest is not x86. Drop the `accel = "tcg"` or the `cpu_model`, or drop `hyperv = true` to silence it. An inherited `hyperv` is never reported.
+
 ## The supervisor did not come up
 
 ```

@@ -6,7 +6,7 @@ page apx_troubleshooting {
   chapter_header "Troubleshooting" {
     kicker       = "Appendices · reference"
     reading_time = "18 min read"
-    updated      = "2026-10-25"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -738,6 +738,40 @@ MSG
     WSL 2 needs no tap, bridge or macvlan, so the fast path degrades to
     userspace silently there; a Windows-side VNC viewer is reached with
     `vmlab console --tcp`, which bridges the display to a localhost port.
+  DOC
+
+  h2 "A Windows guest is slow under nested KVM or WSL 2"
+  p <<DOC
+    vmlab prints nothing for this. The symptom is a Windows guest that boots
+    under KVM but runs software that reads the clock often, such as .NET
+    services, build tools and games, much slower than it should. Without the
+    Hyper-V enlightenments Windows reads time from an emulated timer, and
+    each read leaves the guest: about 5.6 µs a read on native KVM and about
+    51 µs nested under WSL 2, against about 20 ns with them.
+  DOC
+  p <<DOC
+    The enlightenments are on by default for every Windows profile from Vista
+    on (`windows-11`, `windows-10`, `windows-server`, `windows-legacy`), so
+    check what turned them off. Look for `hyperv = false` on the VM or its
+    template, a `cpu_model`, which replaces the host CPU and the flags with
+    it, a profile of your own that does not set `hyperv = true`, and the TCG
+    warning above. To confirm, `ps -o args= -C qemu-system-x86_64` lists each
+    machine's `-cpu`; an enlightened one carries `hv-time`. Never add
+    `+invtsc` through `qemu_args` to go faster: QEMU then refuses to migrate
+    the guest, and every online snapshot is a migration.
+  DOC
+
+  h2 "Hyper-V enlightenments were not applied"
+  code text { source = "warning: vm \"{machine}\": hyperv = true is not applied — {reason}; it boots without the Hyper-V enlightenments (PRD §5.2)" }
+  p <<DOC
+    `vmlab up` prints this when a vm block sets `hyperv = true` itself and
+    the launch cannot apply it. The machine still boots, with no `hv-*`
+    flags. The reason names one of three causes: the machine runs under TCG,
+    which does not implement the enlightenments; a `cpu_model` names the CPU,
+    and the flags are only ever added to the host CPU; or the guest is not
+    x86. Drop the `accel = "tcg"` or the `cpu_model` if the guest does not
+    need it, or drop `hyperv = true` to silence the line. A `hyperv` the VM
+    inherits from a profile or a template is not reported.
   DOC
 
   h2 "The supervisor did not come up"

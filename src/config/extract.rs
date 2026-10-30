@@ -585,6 +585,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let clock = r.parsed("clock", parse_clock).unspan().unwrap_or_default();
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
+    let hyperv = r.bool("hyperv").unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -661,6 +662,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         clock,
         display,
         cpu_model,
+        hyperv,
         accel,
         firmware,
         tpm,
@@ -964,6 +966,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let disk = r.size("disk").unspan();
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
+    let hyperv = r.bool("hyperv").unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -990,6 +993,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         disk,
         display,
         cpu_model,
+        hyperv,
         accel,
         firmware,
         tpm,
@@ -1050,6 +1054,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
     let memory = r.size("memory").unspan();
     let display = r.string("display").unspan();
     let cpu_model = r.parsed("cpu_model", parse_cpu_model).unspan();
+    let hyperv = r.bool("hyperv").unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
@@ -1067,6 +1072,7 @@ fn extract_template_variant(b: &Block, issues: &mut IssueList) -> Option<Templat
         memory,
         display,
         cpu_model,
+        hyperv,
         accel,
         firmware,
         tpm,

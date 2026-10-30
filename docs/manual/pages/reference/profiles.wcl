@@ -3,7 +3,7 @@ page ref_profiles {
   chapter_header "Guest OS profile files" {
     kicker       = "Reference · reference"
     reading_time = "7 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -61,6 +61,7 @@ profile "<name>" {
   nic_model       = "virtio-net-pci"
   display         = "virtio-vga"
   cpu_model       = "pentium3"
+  hyperv          = true
   accel           = "tcg"
   cpus            = 2
   memory          = 4GiB
@@ -88,6 +89,7 @@ SRC
       | "`nic_model`" | "utf8" | "QEMU default" | "NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`." |
       | "`display`" | "utf8" | "QEMU default" | "Display device, for example `virtio-vga`, `qxl`, `std` or `cirrus-vga`." |
       | "`cpu_model`" | "utf8" | "unset" | "QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. No shipped profile sets one." |
+      | "`hyperv`" | "bool" | "unset" | "Hyper-V enlightenments (`hv-*` CPU flags) under KVM on x86, unless a `cpu_model` names the CPU. Unset is off. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; a VM or template `hyperv` wins. See [Lab file: vm and its children](ref_vm)." |
       | "`accel`" | "utf8" | "unset" | "Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. No shipped profile sets one." |
       | "`cpus`" | "i64" | "unset" | "Default vCPU count, at least 1." |
       | "`memory`" | "ByteSize" | "unset" | "Default RAM, for example `4GiB`." |
@@ -119,7 +121,9 @@ SRC
   h2 "Shipped profiles"
   p <<DOC
     The shipped set, with the values each one carries. A blank cell means
-    the field is unset. Every Windows profile lands an `@dev` workspace at
+    the field is unset. `windows-11`, `windows-10`, `windows-server` and
+    `windows-legacy` also set `hyperv = true`; `windows-xp` and `windows-9x`
+    predate the enlightenments and leave it unset. Every Windows profile lands an `@dev` workspace at
     `C:\\src` and every Linux one at `/src`.
   DOC
   table {

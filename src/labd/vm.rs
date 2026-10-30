@@ -1741,6 +1741,19 @@ impl super::machine::Machine for VmInstance {
         VM_READY_TIMEOUT
     }
 
+    /// A `hyperv = true` the vm block set that this host's launch drops —
+    /// TCG, a named `cpu_model` (§5.2). The accelerator is decided the way
+    /// [`Self::start`] decides it; one `start` would refuse is its to report.
+    fn launch_warnings(&self) -> Vec<String> {
+        let t = self.template();
+        let kvm = qemu::kvm_usable(&t.resolved.arch);
+        qemu::plan_accel(&t.resolved, kvm)
+            .ok()
+            .and_then(|plan| qemu::hyperv_not_applied(self.cfg.hyperv, &t.resolved, plan.accel()))
+            .into_iter()
+            .collect()
+    }
+
     fn pending_first_boot(&self) -> Option<super::machine::FirstBootProvision> {
         if !self.first_boot_pending() {
             return None;

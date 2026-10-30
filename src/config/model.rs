@@ -480,6 +480,9 @@ pub struct Vm {
     /// QEMU `-cpu` model (§5.2); None = inherit template→profile, and with
     /// no layer naming one the builder's accelerator default applies.
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments (§5.2); None = inherit template→profile, and
+    /// with no layer saying, off.
+    pub hyperv: Option<bool>,
     /// QEMU accelerator (§5.2); None = inherit template→profile, and with no
     /// layer naming one KVM is used when usable, TCG otherwise.
     pub accel: Option<AccelMode>,
@@ -990,6 +993,8 @@ pub struct TemplateDef {
     pub display: Option<String>,
     /// QEMU `-cpu` model for the build VM, recorded for clones (§5.2).
     pub cpu_model: Option<String>,
+    /// Hyper-V enlightenments for the build VM, recorded for clones (§5.2).
+    pub hyperv: Option<bool>,
     /// QEMU accelerator for the build VM, recorded for clones (§5.2).
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
@@ -1072,6 +1077,7 @@ pub struct TemplateVariantDef {
     pub memory: Option<u64>,
     pub display: Option<String>,
     pub cpu_model: Option<String>,
+    pub hyperv: Option<bool>,
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,

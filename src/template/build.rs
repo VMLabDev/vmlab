@@ -699,6 +699,7 @@ fn variant_meta(v: &TemplateVariantDef, image: VariantImage) -> super::meta::Var
         secure_boot_keys: v.secure_boot_keys,
         display: v.display.clone(),
         cpu_model: v.cpu_model.clone(),
+        hyperv: v.hyperv,
         accel: v.accel,
     }
 }
@@ -1361,6 +1362,7 @@ struct EffectiveHardware {
     key_store: Option<KeyStore>,
     display: Option<String>,
     cpu_model: Option<String>,
+    hyperv: Option<bool>,
     accel: Option<crate::config::model::AccelMode>,
 }
 
@@ -1386,6 +1388,7 @@ impl EffectiveHardware {
             key_store: v.secure_boot_keys.map(KeyStore::of_keys),
             display: v.display.clone(),
             cpu_model: v.cpu_model.clone(),
+            hyperv: v.hyperv,
             accel: v.accel,
         }
         .over(Some(base))
@@ -1407,6 +1410,7 @@ impl EffectiveHardware {
                 .or(def.secure_boot_keys.map(KeyStore::of_keys)),
             display: def.display.clone(),
             cpu_model: def.cpu_model.clone(),
+            hyperv: def.hyperv,
             accel: def.accel,
         }
     }
@@ -1449,6 +1453,7 @@ impl EffectiveHardware {
             cpu_model: self
                 .cpu_model
                 .or_else(|| source.and_then(|m| m.cpu_model.clone())),
+            hyperv: self.hyperv.or_else(|| source.and_then(|m| m.hyperv)),
             accel: self.accel.or_else(|| source.and_then(|m| m.accel)),
         }
     }
@@ -1696,6 +1701,7 @@ fn seal_meta(
         secure_boot_keys: hw.key_store.as_ref().map(KeyStore::recorded),
         display: hw.display.clone(),
         cpu_model: hw.cpu_model.clone(),
+        hyperv: hw.hyperv,
         accel: hw.accel,
         created: chrono::Utc::now(),
         origin: source_origin(&def.source),
@@ -1873,6 +1879,7 @@ fn synth_spec_lab(
         key_store,
         display,
         cpu_model,
+        hyperv,
         accel,
     } = hw;
     let mut s = String::from("import <vmlab.wcl>\n\n");
@@ -1907,6 +1914,9 @@ fn synth_spec_lab(
     }
     if let Some(c) = cpu_model {
         writeln!(s, "    cpu_model = {}", wcl_str(c)).unwrap();
+    }
+    if let Some(h) = hyperv {
+        writeln!(s, "    hyperv   = {h}").unwrap();
     }
     if let Some(a) = accel {
         writeln!(s, "    accel = {}", wcl_str(a.as_str())).unwrap();
@@ -2182,6 +2192,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
@@ -2533,6 +2544,33 @@ mod tests {
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
         let resolved = crate::qemu::resolve::resolve_vm(&lf.lab.vms[0], None, &profiles).unwrap();
         assert_eq!(resolved.cpu_model.as_deref(), Some("pentium3"));
+    }
+
+    /// A template's `hyperv` reaches its build VM and its sealed metadata;
+    /// left unset, the build VM resolves the profile's like any VM (§5.2).
+    #[test]
+    fn hyperv_reaches_the_build_vm_and_the_metadata() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let build = |extra: &str| {
+            let d = def(&format!(
+                "import <vmlab.wcl>\ntemplate \"t\" {{ arch = \"x86_64\" version = \"1\"\n  \
+                 profile = \"windows-server\"\n  disk = 1GiB\n{extra}  source \"scratch\" {{ }}\n}}\n"
+            ));
+            let wcl = render(&d);
+            let lf = crate::config::load_lab_source(&wcl, "<build>", Path::new("/root")).unwrap();
+            let vm = lf.lab.vms[0].clone();
+            let resolved = crate::qemu::resolve::resolve_vm(&vm, None, &profiles).unwrap();
+            (
+                vm.hyperv,
+                resolved.hyperv,
+                EffectiveHardware::resolve(&d, None).hyperv,
+            )
+        };
+        assert_eq!(build(""), (None, true, None));
+        assert_eq!(
+            build("  hyperv = false\n"),
+            (Some(false), false, Some(false))
+        );
     }
 
     /// A `cpu_model` inherited from a layered source meets the block's own
@@ -3312,6 +3350,7 @@ mod tests {
             secure_boot_keys: None,
             display: None,
             cpu_model: None,
+            hyperv: None,
             accel: None,
         }];
         let only = order(&["extra"]);
@@ -3749,6 +3788,7 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
                 secure_boot_keys: None,
                 display: None,
                 cpu_model: None,
+                hyperv: None,
                 accel: None,
             });
         }

@@ -3,7 +3,7 @@ page guide_templates {
   chapter_header "Templates and the store" {
     kicker       = "The guide · explanation"
     reading_time = "10 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -24,7 +24,7 @@ page guide_templates {
     A store entry is two files: `disk.qcow2`, the sealed image, and
     `template.wcl`, its metadata. The metadata records the hardware the
     template was built with (profile, CPUs, memory, disk size, firmware, TPM,
-    secure boot, display, CPU model, accelerator), where it came from, the version of `vmlab-agent`
+    secure boot, display, CPU model, Hyper-V enlightenments, accelerator), where it came from, the version of `vmlab-agent`
     baked into it, the wscript surface version its embedded scripts were
     written against, an optional first-boot script, and the OCI repository it
     publishes to. The hardware fields form the template layer of the

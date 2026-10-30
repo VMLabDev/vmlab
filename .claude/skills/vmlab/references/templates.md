@@ -48,7 +48,7 @@ have. Never call a variant a "snapshot" — that is a VM snapshot.
   `base_sha256`, optional `default`, `description`, `first_boot_script`,
   `wscript_surface`, `agent_version`, and hardware overrides (`profile`, `cpus`,
   `memory`, `firmware`, `tpm`, `secure_boot`, `secure_boot_keys`, `display`,
-  `cpu_model`, `accel`).
+  `cpu_model`, `hyperv`, `accel`).
   A variant counts only when both its block and its overlay exist.
 - **Effective metadata**: the base's fields with the variant's in their place.
   Hardware resolution, first boot, the surface check and agent staleness all
@@ -82,7 +82,7 @@ template "windows-11" {
 ```
 
 - A `variant` block takes `default`, `description`, `first_boot`, the hardware
-  overrides (`profile cpus memory display cpu_model accel firmware tpm
+  overrides (`profile cpus memory display cpu_model hyperv accel firmware tpm
   secure_boot secure_boot_keys`), `qemu_args` (replaces the template's),
   `gpu {}` (replaces the template's; build VM only), `nic` (replaces the
   template's when declared), `media`, and `provision`/`playbook` steps run in
@@ -314,6 +314,7 @@ template "<name>" {
   disk        = 20GiB
   display     = "virtio-vga"
   cpu_model   = "pentium3"
+  hyperv      = true
   accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
@@ -345,6 +346,7 @@ template "<name>" {
 | `disk` | ByteSize | from source | Working disk size for the build, for example `64GiB`. Required for a `scratch` source. |
 | `display` | utf8 | from profile | QEMU display device string for the build VM. |
 | `cpu_model` | utf8 | from profile | QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`. |
+| `hyperv` | bool | from profile | Hyper-V enlightenments for the build VM under KVM; the build VM resolves it like any VM, so a template on a shipped Windows profile builds with them. Recorded in the metadata and inherited by clones. Not applied under TCG or with a `cpu_model`. |
 | `accel` | utf8 | from profile | Accelerator for the build VM: `kvm` or `tcg`. Inherited by clones. `tcg` cannot be combined with `nested = true`. |
 | `firmware` | utf8 | from profile | Firmware: `ovmf` or `seabios`. |
 | `tpm` | bool | from profile | Enable a TPM 2.0 device. |

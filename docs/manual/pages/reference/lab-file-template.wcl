@@ -3,7 +3,7 @@ page ref_template {
   chapter_header "Lab file: template and source" {
     kicker       = "Reference · reference"
     reading_time = "9 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -37,6 +37,7 @@ template "<name>" {
   disk        = 20GiB
   display     = "virtio-vga"
   cpu_model   = "pentium3"
+  hyperv      = true
   accel       = "tcg"
   firmware    = "ovmf"
   tpm         = false
@@ -70,6 +71,7 @@ SRC
       | "`disk`" | "ByteSize" | "from source" | "Working disk size for the build, for example `64GiB`. Required for a `scratch` source." |
       | "`display`" | "utf8" | "from profile" | "QEMU display device string for the build VM." |
       | "`cpu_model`" | "utf8" | "from profile" | "QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`." |
+      | "`hyperv`" | "bool" | "from profile" | "Hyper-V enlightenments for the build VM under KVM; the build VM resolves it like any VM, so a template on a shipped Windows profile builds with them. Recorded in the metadata and inherited by clones. Not applied under TCG or with a `cpu_model`." |
       | "`accel`" | "utf8" | "from profile" | "Accelerator for the build VM: `kvm` or `tcg`. Inherited by clones. `tcg` cannot be combined with `nested = true`." |
       | "`firmware`" | "utf8" | "from profile" | "Firmware: `ovmf` or `seabios`." |
       | "`tpm`" | "bool" | "from profile" | "Enable a TPM 2.0 device." |
@@ -228,6 +230,7 @@ SRC
       | "`memory`" | "ByteSize" | "the base's" | "RAM, for example `8GiB`." |
       | "`display`" | "utf8" | "the base's" | "QEMU display device string." |
       | "`cpu_model`" | "utf8" | "the base's" | "QEMU `-cpu` model." |
+      | "`hyperv`" | "bool" | "the base's" | "Hyper-V enlightenments under KVM." |
       | "`accel`" | "utf8" | "the base's" | "Accelerator: `kvm` or `tcg`." |
       | "`firmware`" | "utf8" | "the base's" | "Firmware: `ovmf` or `seabios`." |
       | "`tpm`" | "bool" | "the base's" | "Enable a TPM 2.0 device." |
