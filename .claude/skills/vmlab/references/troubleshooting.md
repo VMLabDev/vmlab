@@ -162,6 +162,23 @@ A machine whose agent is older than the host's lacks features the host expects, 
 | ``"{machine}"'s agent serves no `fileops`, so it cannot be handed a binary over its own channel — this one can only be replaced by rebuilding the template (§19.4)`` | The old agent cannot receive a file. Rebuild the template. |
 | `this machine's agent lives in the initramfs guest asset this host installed, not in anything it boots — it already tracks the vmlab you are running and cannot go stale, so there is nothing to push into it. Refreshing it means reinstalling the guest asset (§19.4)` | The machine is a container. Reinstall the guest asset instead. |
 
+## An edit to the lab file did not take effect
+
+`<m>: pending — still running the declaration it was started with; …` The machine
+ran when a boot verb reloaded the edited file, so it keeps its old declaration
+until it next boots. `vmlab status` names it. `vmlab vm restart <m>` (or
+`container restart`) rebuilds it between stop and start; a machine stopped any
+other way (guest shutdown included) is rebuilt by its next boot.
+
+## The lab file changes the network
+
+`vmlab.wcl changes the lab's network, which cannot change while the lab runs: …
+Nothing was reloaded.` A reload never touches segments, DNS records/sinkholes or
+a NIC's segment/IP/MAC/gateway, nor admits an added machine needing a static IP,
+gateway NIC, global segment or unassembled segment. Nothing else in the edit
+was applied either. `vmlab down`, then the command again, or undo the network
+part of the edit.
+
 ## The workspace has stopped syncing
 
 ```

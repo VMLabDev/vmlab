@@ -137,8 +137,9 @@ page cmd_lab {
     to the [lab file](guide_lab_file) without starting anything, and it
     recovers a daemon whose lab file no longer loads. You do not need it
     before [vmlab up](cmd_up): a full `down` already reaps the daemon, and
-    `up`, `pull` and `vm start`/`restart` replace a daemon that outlived a
-    partial stop themselves when the file has changed. Run it from the lab's
+    `up`, `pull` and `vm start`/`restart` bring a daemon that outlived a
+    partial stop onto an edited file themselves, by replacing it or, while
+    a machine runs, by reloading the file into it. Run it from the lab's
     directory when the lab is not registered (after a full `down` or
     `lab stop`); by name elsewhere it needs the registration.
   DOC

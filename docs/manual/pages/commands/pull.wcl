@@ -37,9 +37,9 @@ page cmd_pull {
 
   p <<DOC
     `pull` downloads what the lab file declares now. When `vmlab.wcl` has
-    changed since the lab daemon loaded it, the verb replaces the daemon
-    first, exactly as [vmlab up](cmd_up) does, so an edited `template` or
-    `image` line is what gets fetched.
+    changed since the lab daemon loaded it, the verb replaces or reloads the
+    daemon first, exactly as [vmlab up](cmd_up) does, so an edited
+    `template` or `image` line is what gets fetched.
   DOC
 
   p <<DOC

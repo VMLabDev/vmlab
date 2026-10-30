@@ -138,7 +138,7 @@ SRC
 
   p <<DOC
     `up` always runs the lab file as it is on disk now. The lab daemon reads
-    `vmlab.wcl` once, when it starts. A full [vmlab down](cmd_down) reaps it,
+    `vmlab.wcl` when it starts, and again when a verb asks it to reload. A full [vmlab down](cmd_down) reaps it,
     so `down`, an edit and `up` start a fresh daemon that reads the edit. A
     daemon also outlives a partial `down`, a `vm stop` of every machine and an
     `up` that failed, and such a daemon may hold an older version of the
@@ -161,13 +161,55 @@ SRC
   p <<DOC
     A new daemon cannot take over a machine the old one is running, nor a
     download the old one is doing. When the file has changed and any machine
-    in the lab is running, starting, stopping or suspended, `up` refuses,
-    names those machines, and changes nothing:
+    in the lab is running, starting, stopping or suspended, or a download is
+    in flight, `up` asks the running daemon to reload the file instead. The
+    daemon reads the file again, compares it machine by machine with what it
+    holds, and applies what it can:
   DOC
-  code text { source = "lab \"ad-lab\": vmlab.wcl has changed since the lab daemon loaded it, and dc01 is still running — the daemon cannot load the new file without stopping it. Run `vmlab down`, then this command again, to apply the edit (or undo the edit)" }
+  table {
+    rows:
+      | "Change" | "What the reload does" |
+      | "A machine that is not running changed" | "Rebuilt from the new declaration: hardware, `qemu_args`, provisions, `depends_on`, `agent_update` and every other machine field. Its disks, MACs and `state.json` record stay." |
+      | "A running machine changed" | "Keeps running on the declaration it was started with, and is **pending**. Its next boot rebuilds it first: `vmlab vm restart <m>`, or a stop and a start." |
+      | "A machine added" | "Built, and joins the lab. It starts when asked, like any stopped machine." |
+      | "A machine removed" | "Dropped if it is not running, pending until it stops if it is. Its disks stay until [vmlab destroy](cmd_destroy)." |
+      | "A segment `forward {}` or a container `port {}`" | "Reinstalled at once for a running machine; a stopped one installs them when it boots." |
+      | "The `on {}` handlers" | "Swapped at once." |
+      | "A download in flight for a changed machine" | "That machine is pending; its next boot after the download rebuilds it." |
+  }
   p <<DOC
-    A download still in flight refuses the same way and names the artefact;
-    wait for it to finish, or interrupt the `vmlab pull` that started it.
+    `up` prints one line per machine rebuilt, added, dropped or left pending,
+    then carries on:
+  DOC
+  code text {
+    source = <<TXT
+lab "ad-lab": vmlab.wcl changed — reloading it into the running lab
+srv01: rebuilt from the new declaration
+dc01: pending — still running the declaration it was started with; restart it (`vmlab vm restart dc01`, or a stop and a start) to pick up the change
+TXT
+  }
+  p <<DOC
+    A pending machine is never quietly running the new file: `up`,
+    `vm start` and [vmlab status](cmd_status) name it until it has booted on
+    the new declaration.
+  DOC
+  p <<DOC
+    The network is assembled once, when the daemon starts, so a reload cannot
+    change it. Adding, removing or changing a segment (its subnet, NAT, DHCP,
+    DNS, MTU, routes, `global` or `connect`), the lab's DNS records and
+    sinkholes, and a NIC's segment, static IP, MAC or `gateway` flag are
+    network changes. So is an added machine whose NIC needs the assembled
+    network to know it: a static IP, a `gateway` NIC, a global segment, or a
+    segment the daemon does not have. On a network change the reload applies
+    nothing, and `up` refuses, naming each change:
+  DOC
+  code text { source = "vmlab.wcl changes the lab's network, which cannot change while the lab runs: segment \"lan\" changed (mtu). Nothing was reloaded. Run `vmlab down`, then this command again, to apply the edit (or undo it)" }
+  p <<DOC
+    Shares served over SMB are the other lab-wide piece. The lab's SMB server
+    exports a fixed set of shares. When a reload changes that set while a
+    machine runs, the server keeps serving the old set and the reload says
+    so. With nothing running it is stopped, and the next boot starts it on
+    the new set. Shares that ride virtiofs follow their machine.
   DOC
   p <<DOC
     Most edits simply take effect on the next boot of the machine. One kind
@@ -193,8 +235,10 @@ SRC
     machines clone from the main checkout's freeze. When the main checkout
     has been frozen, frozen again or thawed since, or a machine has lost its
     disk, `up`, `pull`, `vm start` and `vm restart` replace the daemon the
-    same way, in the main lab and in a worktree lab, with the same refusals
-    while a machine is running, and print:
+    same way, in the main lab and in a worktree lab, and print the line
+    below. A reload cannot take this change, since it decides how the network
+    is assembled: while a machine is running or a download is in flight, the
+    verb refuses, names what is in the way and points at `vmlab down`.
   DOC
   code text { source = "lab \"app-feat-x\": the main checkout's freeze or a machine's disk changed — restarting the lab daemon to plan its clones again" }
 

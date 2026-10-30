@@ -287,6 +287,36 @@ MSG
       | "`this machine's agent lives in the initramfs guest asset this host installed, not in anything it boots — it already tracks the vmlab you are running and cannot go stale, so there is nothing to push into it. Refreshing it means reinstalling the guest asset (§19.4)`" | "The machine is a container. Reinstall the guest asset instead." |
   }
 
+  h2 "An edit to the lab file did not take effect"
+  code text { source = <<'MSG'
+dc01: pending — still running the declaration it was started with; restart it (`vmlab vm restart dc01`, or a stop and a start) to pick up the change
+MSG
+  }
+  p <<DOC
+    The machine was running when `up`, `pull` or `vm start` reloaded the
+    edited lab file, so it still runs the declaration it booted with.
+    `vmlab status` names it until then. Run `vmlab vm restart <machine>` (or
+    `container restart`): the restart rebuilds it from the file between the
+    stop and the start. A machine that has stopped by any other route,
+    including a guest shutdown, is rebuilt the next time it boots. See
+    [Editing the lab file between runs](cmd_up).
+  DOC
+
+  h2 "The lab file changes the network"
+  code text { source = <<'MSG'
+vmlab.wcl changes the lab's network, which cannot change while the lab runs: segment "lan" changed (mtu). Nothing was reloaded. Run `vmlab down`, then this command again, to apply the edit (or undo it)
+MSG
+  }
+  p <<DOC
+    Segments, their gateways and DHCP reservations are assembled when the lab
+    daemon starts. A reload cannot change them while a machine runs. Each
+    named change is a segment's attribute, the lab's DNS records or
+    sinkholes, a NIC's segment, static IP, MAC or `gateway` flag, or a NIC of
+    an added machine that the assembled network would have to know about.
+    Nothing was applied, the other edits included. Run `vmlab down`, then the
+    command again, or undo the network part of the edit and keep the rest.
+  DOC
+
   h2 "The workspace has stopped syncing"
   code text { source = <<'MSG'
 the workspace on "{machine}" has stopped, both directions, on {n} conflicting paths

@@ -79,11 +79,17 @@ page cmd_vm {
 
   p <<DOC
     The VM is built from the lab file as it is on disk now. If `vmlab.wcl`
-    has changed since the lab daemon loaded it, the verb replaces the daemon
-    first, as [vmlab up](cmd_up) does, and refuses when another machine in
-    the lab is still running. A VM whose clone was made from a different
-    template than the one the file now names refuses to boot; see
-    [Editing the lab file between runs](cmd_up).
+    has changed since the lab daemon loaded it, the verb brings the daemon
+    onto it first, as [vmlab up](cmd_up) does: it replaces the daemon when
+    nothing in the lab runs, and otherwise asks the daemon to reload the
+    file, printing a line per machine rebuilt, added, dropped or left
+    pending. A network change refuses. `vm start` on a running VM that a
+    reload left pending says so: the VM keeps the declaration it was started
+    with. `vm restart` is how it picks the change up. The restart rebuilds it
+    between the stop and the start, and prints
+    `<vm>: rebuilt from the new declaration`. A VM whose clone was made from
+    a different template than the one the file now names refuses to boot;
+    see [Editing the lab file between runs](cmd_up).
   DOC
 
   h2 "vmlab vm ip"

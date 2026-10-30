@@ -62,8 +62,11 @@ page cmd_container {
   p <<DOC
     The container is built from the lab file as it is on disk now: if
     `vmlab.wcl` has changed since the lab daemon loaded it, the daemon is
-    replaced first, and the verb refuses while another machine in the lab
-    still runs. See [Editing the lab file between runs](cmd_up).
+    replaced first when nothing in the lab runs, and asked to reload the
+    file otherwise. A running container the reload left pending keeps its
+    old declaration until `container restart` rebuilds it. A change to its
+    `port {}` blocks alone is applied at once and leaves it running. See
+    [Editing the lab file between runs](cmd_up).
   DOC
 
   h2 "vmlab container stop"
