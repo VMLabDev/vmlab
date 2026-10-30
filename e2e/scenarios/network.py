@@ -24,6 +24,7 @@ BULK_FLOOR = 20e6  # bytes/s over the time spent moving data
 GUEST_MARKER = "e2e-guest-marker"
 FORWARD_PORT = 18280
 PROVISIONED_FORWARD_PORT = 18281
+BOUND_FORWARD_PORT = 18282
 ROUTER_MARKER = "e2e-router-marker"
 
 
@@ -311,7 +312,37 @@ def forward(h, lab):
         events = h.vmlab("logs", "-o", "jsonl", "-n", "200", cwd=lab, check=False).out
         skips = [l for l in events.splitlines() if "forward.skipped" in l]
         h.ok("net.forward", False, f"host :{FORWARD_PORT} refused after the VM became ready; skips: {skips[-3:]}")
+    forward_bind(h, lab)
     forward_provisioned(h, lab)
+
+
+def forward_bind(h, lab):
+    """A forward declaring `bind = "127.0.0.1"` (PRD §9.8): it answers on
+    loopback, the container's own address is refused, and `status --json`
+    carries the address it listens on."""
+    gsh(
+        h,
+        lab,
+        "vm01",
+        "setsid nohup python3 -m http.server 8083 --directory /tmp/www >/dev/null 2>&1 </dev/null &",
+    )
+    url = f"http://127.0.0.1:{BOUND_FORWARD_PORT}/g"
+    try:
+        h.wait_until(lambda: GUEST_MARKER in curl(h, url), timeout=30, what=f"127.0.0.1:{BOUND_FORWARD_PORT}")
+        on_loopback = True
+    except ScenarioFailed:
+        on_loopback = False
+    host = host_ip()
+    on_host = GUEST_MARKER in curl(h, f"http://{host}:{BOUND_FORWARD_PORT}/g")
+    status = json.loads(h.vmlab("status", "--json", cwd=lab).out)
+    entry = next((f for f in status.get("forwards", []) if f["host_port"] == BOUND_FORWARD_PORT), None)
+    bind = entry.get("bind") if entry else None
+    h.ok(
+        "net.forward.bind",
+        on_loopback and not on_host and bind == "127.0.0.1",
+        f"127.0.0.1:{BOUND_FORWARD_PORT} answered={on_loopback}, {host}:{BOUND_FORWARD_PORT} answered={on_host}, "
+        f"status bind={bind!r}",
+    )
 
 
 def forward_provisioned(h, lab):

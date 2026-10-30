@@ -20,6 +20,9 @@ lab "e2e-network" {
     // To a machine `up` waits on, through its provision: installed when it
     // becomes ready and again once `up` has provisioned it.
     forward  { host_port = 18281 to = "router:8080" }
+    // Loopback only (§9.8): reachable on 127.0.0.1, refused on the
+    // container's own address.
+    forward  { bind = "127.0.0.1" host_port = 18282 to = "vm01:8083" }
 
     block    { cidr = "@HOST@/32" proto = "tcp" port = 9002 }
     redirect { from = "192.0.2.10:80" to = "@HOST@:9001" proto = "tcp" }

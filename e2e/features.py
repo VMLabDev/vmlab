@@ -126,6 +126,7 @@ FEATURES: dict[str, str] = {
     "net.nat.bulk": "a long NAT download keeps its throughput while the guest's receive window closes and reopens",
     "net.isolated": "`nic { isolated = true }`",
     "net.forward": "segment `forward` to a machine port",
+    "net.forward.bind": "a forward declaring `bind = \"127.0.0.1\"` answers on loopback, is refused on the host's own address, and `status --json` names the address",
     "net.forward.provisioned": "segment `forward` to a machine `up` provisions, installed and logged as `forward.installed`",
     "port.verb": "`vmlab port` prints a forward's bound host port (and `--json` its status entry) as `status --json` reports it, and fails naming the installed forwards",
     "net.routes": "daemon routing between `routes_to` segments (source kept, rules applied, the rest isolated) and `route` blocks",
