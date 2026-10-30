@@ -29,6 +29,9 @@ type TemplateMeta {
   display: utf8?
   cpu_model: utf8?    // QEMU -cpu model
   hyperv: bool?       // Hyper-V enlightenments under KVM
+  apple_smc: bool?    // Apple SMC device (macOS)
+  input: utf8?        // "ps2" | "usb"
+  tsc: utf8?          // "host"
   accel: utf8?        // "kvm" | "tcg"
   created: utf8       // RFC 3339
   origin: utf8?       // source ISO URL / registry reference
@@ -64,5 +67,8 @@ type VariantMeta {
   display: utf8?
   cpu_model: utf8?
   hyperv: bool?
+  apple_smc: bool?
+  input: utf8?
+  tsc: utf8?
   accel: utf8?
 }

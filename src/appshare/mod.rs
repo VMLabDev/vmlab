@@ -27,17 +27,32 @@ use vmlab_agent_proto::app::{AppRecord, RecordDecoder};
 use crate::proto::client::LabClient;
 use crate::proto::{CommandError, ErrorCode, LabRequest};
 
+/// Why a macOS guest shares no app (PRD §20.1): the three protocols are
+/// waypipe and X11 from a Linux guest and RDP RemoteApp from a Windows one,
+/// and macOS serves none of them.
+pub const MACOS_UNSHARED: &str = "shared apps are not supported on macOS guests — vmlab carries \
+     waypipe and X11 from Linux guests and RDP RemoteApp from Windows ones, and macOS serves \
+     none of them; use `vmlab console` for its desktop";
+
+/// The refusal for a macOS `machine`.
+fn unshared(machine: &str) -> String {
+    format!("`{machine}` is a macOS guest: {MACOS_UNSHARED}")
+}
+
 /// The refusal when the CLI has no desktop to put a window on (PRD §20.1).
 pub const NO_GRAPHICAL_SESSION: &str =
     "no graphical session: neither WAYLAND_DISPLAY nor DISPLAY is set";
 
 /// Which guest family a machine belongs to, as far as sharing an app goes:
-/// Windows when its effective profile name starts with `windows`, else Linux
-/// (the same rule as `labd::guest_os`). A container is Linux.
+/// Windows when its effective profile name starts with `windows`, macOS when
+/// it starts with `macos`, else Linux (the same rule as `labd::guest_os`). A
+/// container is Linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestFamily {
     Linux,
     Windows,
+    /// No window protocol vmlab carries runs on macOS, so it shares none.
+    Macos,
 }
 
 impl GuestFamily {
@@ -45,6 +60,7 @@ impl GuestFamily {
     pub fn of_profile(profile: Option<&str>) -> Self {
         match profile {
             Some(p) if p.starts_with("windows") => Self::Windows,
+            Some(p) if p.starts_with("macos") => Self::Macos,
             _ => Self::Linux,
         }
     }
@@ -53,6 +69,7 @@ impl GuestFamily {
         match self {
             Self::Linux => "a Linux guest",
             Self::Windows => "a Windows guest",
+            Self::Macos => "a macOS guest",
         }
     }
 }
@@ -147,6 +164,10 @@ pub fn select_mode(
     via: Option<Mode>,
     host: &HostEnv,
 ) -> Result<Selected, String> {
+    // Before anything about the host: no host could share from it.
+    if family == GuestFamily::Macos {
+        return Err(unshared(machine));
+    }
     if !host.wayland && !host.x11 {
         return Err(NO_GRAPHICAL_SESSION.into());
     }
@@ -159,12 +180,14 @@ pub fn select_mode(
             match mode.family() {
                 GuestFamily::Linux => "Linux guest",
                 GuestFamily::Windows => "Windows guest",
+                GuestFamily::Macos => "macOS guest",
             },
             family.noun(),
         ));
     }
     let chosen = |mode| Ok(Selected { mode, notice: None });
     match (family, via) {
+        (GuestFamily::Macos, _) => Err(unshared(machine)),
         (GuestFamily::Windows, _) => match host.freerdp {
             Some(_) => chosen(Mode::Rdp),
             None => Err(

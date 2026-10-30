@@ -43,6 +43,7 @@ fn agent_flavour(os: &str, legacy: bool, profile: Option<&str>) -> AgentOs {
         ("windows", true) => AgentOs::WindowsNt,
         ("dos", _) => AgentOs::Dos,
         ("templeos", _) => AgentOs::TempleOs,
+        ("macos", _) => AgentOs::Macos,
         _ => AgentOs::Linux,
     }
 }

@@ -10,10 +10,13 @@
 
 use std::path::PathBuf;
 
-use crate::config::model::{AccelMode, Container, Firmware, Gpu, SecureBootKeys, TemplateRef, Vm};
+use crate::config::model::{
+    AccelMode, Container, Firmware, Gpu, InputDevices, SecureBootKeys, TemplateRef, TscMode, Vm,
+};
 use crate::profiles::{
     AgentTransport, DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet,
 };
+use crate::qemu::cmdline::qemu_arch;
 use crate::template::TemplateMeta;
 
 /// Fully resolved hardware for one VM — input to the cmdline builder.
@@ -73,6 +76,16 @@ pub struct ResolvedVm {
     /// layer says. What it asks for; whether the `-cpu` string carries them
     /// is the builder's call, which needs the accelerator and the model.
     pub hyperv: bool,
+    /// The Apple SMC device a macOS guest checks for (§5.2), VM > template >
+    /// profile, off when no layer says.
+    pub apple_smc: bool,
+    /// The keyboard and pointer devices (§5.2), VM > template > profile,
+    /// PS/2 keyboard and USB tablet when no layer says.
+    pub input: InputDevices,
+    /// The guest's TSC (§5.2), VM > template > profile, QEMU's default when
+    /// no layer says. What it asks for: the frequency `host` pins is read
+    /// from KVM by the lab daemon at start and handed to the builder.
+    pub tsc: Option<TscMode>,
     /// The accelerator a layer asked for (§5.2), VM > template > profile,
     /// with the layer that asked. `None` keeps vmlab's choice — KVM when
     /// usable, TCG otherwise; the launch decision itself is
@@ -454,6 +467,9 @@ fn display_device_name(d: &str, arch: &str) -> String {
         // Pure virtio GPU, no VGA compatibility.
         "virtio-gpu" => "virtio-gpu-pci".to_string(),
         "std" => "VGA".to_string(),
+        // VMware's SVGA II: what macOS drives without a GPU driver of its
+        // own — there is no Apple virtio GPU driver on x86.
+        "vmware" => "vmware-svga".to_string(),
         other => other.to_string(), // power users may name a QEMU device directly
     }
 }
@@ -549,6 +565,30 @@ pub fn resolve_vm(
         from: layer.label(profile_name.as_deref()),
     });
 
+    let apple_smc = pick(
+        lab_vm.apple_smc,
+        template.and_then(|t| t.apple_smc),
+        profile.apple_smc,
+    );
+    let tsc = pick(lab_vm.tsc, template.and_then(|t| t.tsc), profile.tsc);
+    // Both are x86 devices and properties — an ISA device and an x86 CPU
+    // property — so a VM of another arch that inherited one cannot boot.
+    if qemu_arch(&arch) != "x86_64" {
+        let x86_only = [
+            apple_smc
+                .filter(|(on, _)| *on)
+                .map(|(_, layer)| ("apple_smc = true", layer)),
+            tsc.map(|(_, layer)| ("tsc = \"host\"", layer)),
+        ];
+        if let Some((what, layer)) = x86_only.into_iter().flatten().next() {
+            anyhow::bail!(
+                "vm \"{}\": {what} (from {}) is x86 only, and this VM is {arch} (PRD §5.2)",
+                lab_vm.name,
+                layer.label(profile_name.as_deref()),
+            );
+        }
+    }
+
     let display_device = lab_vm
         .display
         .clone()
@@ -598,6 +638,10 @@ pub fn resolve_vm(
             profile.hyperv,
         )
         .is_some_and(|(on, _)| on),
+        apple_smc: apple_smc.is_some_and(|(on, _)| on),
+        input: pick(lab_vm.input, template.and_then(|t| t.input), profile.input)
+            .map_or(InputDevices::Ps2, |(input, _)| input),
+        tsc: tsc.map(|(tsc, _)| tsc),
         accel,
         gpu: lab_vm.gpu.clone(),
         qemu_args: lab_vm.qemu_args.clone(),
@@ -742,6 +786,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
             created: chrono::Utc::now(),
             origin: None,
@@ -876,6 +923,81 @@ mod tests {
         let on = "vm \"a\" { template = \"x86_64/win\" hyperv = true }";
         assert!(!hyperv(off, &with("windows-11", Some(true))));
         assert!(hyperv(on, &with("windows-xp", Some(false))));
+    }
+
+    /// `apple_smc`, `input` and `tsc` resolve VM block > template > profile
+    /// (§5.2): the `macos` profile asks for all three, a template or the vm
+    /// block may say otherwise, and nothing saying leaves QEMU's shape.
+    #[test]
+    fn macos_hardware_precedence_vm_over_template_over_profile() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let mac = |profile: &str| TemplateMeta {
+            profile: Some(profile.into()),
+            ..meta()
+        };
+        let hw = |src: &str, meta: &TemplateMeta| {
+            let r = resolve_vm(&vm(src), Some(meta), &profiles).unwrap();
+            (r.apple_smc, r.input, r.tsc)
+        };
+        let bare = "vm \"a\" { template = \"x86_64/mac\" }";
+        assert_eq!(
+            hw(bare, &mac("macos")),
+            (true, InputDevices::Usb, Some(TscMode::Host))
+        );
+        assert_eq!(
+            hw(bare, &mac("linux-modern")),
+            (false, InputDevices::Ps2, None)
+        );
+        let pinned = TemplateMeta {
+            apple_smc: Some(false),
+            input: Some(InputDevices::Ps2),
+            ..mac("macos")
+        };
+        assert_eq!(
+            hw(bare, &pinned),
+            (false, InputDevices::Ps2, Some(TscMode::Host))
+        );
+        assert_eq!(
+            hw(
+                "vm \"a\" { template = \"x86_64/mac\" apple_smc = true input = \"usb\" tsc = \"host\" }",
+                &mac("linux-modern")
+            ),
+            (true, InputDevices::Usb, Some(TscMode::Host))
+        );
+    }
+
+    /// The Apple SMC and a pinned TSC exist on x86 only; a VM of another
+    /// arch that inherits either is refused, naming the layer.
+    #[test]
+    fn apple_smc_and_tsc_are_refused_off_x86() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm(
+            "vm \"a\" { template = \"scratch\" arch = \"aarch64\" profile = \"macos\" disk = 10GiB }",
+        );
+        let err = resolve_vm(&v, None, &profiles).unwrap_err().to_string();
+        assert!(
+            err.contains("apple_smc = true (from profile \"macos\") is x86 only"),
+            "{err}"
+        );
+        let v = vm(
+            "vm \"a\" { template = \"scratch\" arch = \"aarch64\" profile = \"linux-modern\" disk = 10GiB tsc = \"host\" }",
+        );
+        let err = resolve_vm(&v, None, &profiles).unwrap_err().to_string();
+        assert!(err.contains("tsc = \"host\" (from the vm block)"), "{err}");
+    }
+
+    /// `display = "vmware"` is VMware's SVGA II device.
+    #[test]
+    fn vmware_display_is_the_svga_device() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm(
+            "vm \"a\" { template = \"scratch\" arch = \"x86_64\" profile = \"macos\" disk = 10GiB }",
+        );
+        let r = resolve_vm(&v, None, &profiles).unwrap();
+        assert_eq!(r.display_device.as_deref(), Some("vmware-svga"));
+        assert_eq!(r.disk_bus, DiskBus::Sata);
+        assert!(!r.hyperv);
+        assert!(!r.tpm && !r.secure_boot);
     }
 
     /// `nested` asks for the host CPU's VMX/SVM; a named model replaces the

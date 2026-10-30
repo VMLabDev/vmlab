@@ -483,6 +483,15 @@ pub struct Vm {
     /// Hyper-V enlightenments (§5.2); None = inherit template→profile, and
     /// with no layer saying, off.
     pub hyperv: Option<bool>,
+    /// The Apple SMC device a macOS guest checks for (§5.2); None = inherit
+    /// template→profile, and with no layer saying, off.
+    pub apple_smc: Option<bool>,
+    /// The keyboard and pointer devices (§5.2); None = inherit
+    /// template→profile, and with no layer saying, [`InputDevices::Ps2`].
+    pub input: Option<InputDevices>,
+    /// The guest's TSC frequency (§5.2); None = inherit template→profile,
+    /// and with no layer saying, QEMU's default.
+    pub tsc: Option<TscMode>,
     /// QEMU accelerator (§5.2); None = inherit template→profile, and with no
     /// layer naming one KVM is used when usable, TCG otherwise.
     pub accel: Option<AccelMode>,
@@ -575,6 +584,72 @@ impl AccelMode {
 
 /// The `accel =` keyword table, shared by every block that declares one.
 pub const ACCELS: &[(&str, AccelMode)] = &[("kvm", AccelMode::Kvm), ("tcg", AccelMode::Tcg)];
+
+/// The guest's keyboard and pointer (§5.2). `Ps2` is QEMU's own shape: the
+/// machine's PS/2 keyboard, and a USB tablet on the default controller for
+/// absolute pointing. `Usb` puts both on an xHCI controller — a USB keyboard
+/// and a USB tablet — for a guest whose firmware or OS reads no PS/2
+/// keyboard, such as macOS. Either way scripted input reaches the keyboard
+/// over QMP: QEMU hands an event that names no console to the newest
+/// unbound keyboard, which is the USB one when there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputDevices {
+    Ps2,
+    Usb,
+}
+
+impl InputDevices {
+    /// The schema spelling, which every surface that writes one back out
+    /// (rendered lab files, template metadata) names it by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InputDevices::Ps2 => "ps2",
+            InputDevices::Usb => "usb",
+        }
+    }
+
+    /// The inverse of [`InputDevices::as_str`]; a spelling this build does
+    /// not know is `None`, as for [`AccelMode::parse`].
+    pub fn parse(s: &str) -> Option<InputDevices> {
+        INPUTS.iter().find(|(k, _)| *k == s).map(|(_, v)| *v)
+    }
+}
+
+/// The `input =` keyword table, shared by every block that declares one.
+pub const INPUTS: &[(&str, InputDevices)] =
+    &[("ps2", InputDevices::Ps2), ("usb", InputDevices::Usb)];
+
+/// The guest's TSC (§5.2). `Host` gives the guest an invariant TSC pinned at
+/// the host's TSC frequency: QEMU's `+invtsc` with an explicit
+/// `tsc-frequency`, read from KVM once per start. The pinned frequency is
+/// what lets an invariant-TSC guest be migrated — and an online snapshot is
+/// a migration (§7.3) — where `+invtsc` alone blocks it. macOS needs it:
+/// XNU reads its TSC frequency from the hypervisor CPUID leaf QEMU only
+/// fills in for a known, stable TSC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TscMode {
+    Host,
+}
+
+impl TscMode {
+    /// The schema spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TscMode::Host => "host",
+        }
+    }
+
+    /// The inverse of [`TscMode::as_str`]; a spelling this build does not
+    /// know is `None`, as for [`AccelMode::parse`].
+    pub fn parse(s: &str) -> Option<TscMode> {
+        TSCS.iter().find(|(k, _)| *k == s).map(|(_, v)| *v)
+    }
+}
+
+/// The `tsc =` keyword table, shared by every block that declares one.
+pub const TSCS: &[(&str, TscMode)] = &[("host", TscMode::Host)];
 
 /// The UEFI key store a secure-boot machine's variable store starts from
 /// (§5.2). `Microsoft` is the default: the bundled VARS with Microsoft's
@@ -995,6 +1070,13 @@ pub struct TemplateDef {
     pub cpu_model: Option<String>,
     /// Hyper-V enlightenments for the build VM, recorded for clones (§5.2).
     pub hyperv: Option<bool>,
+    /// The Apple SMC device for the build VM, recorded for clones (§5.2).
+    pub apple_smc: Option<bool>,
+    /// Keyboard and pointer devices for the build VM, recorded for clones
+    /// (§5.2).
+    pub input: Option<InputDevices>,
+    /// TSC frequency for the build VM, recorded for clones (§5.2).
+    pub tsc: Option<TscMode>,
     /// QEMU accelerator for the build VM, recorded for clones (§5.2).
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
@@ -1078,6 +1160,9 @@ pub struct TemplateVariantDef {
     pub display: Option<String>,
     pub cpu_model: Option<String>,
     pub hyperv: Option<bool>,
+    pub apple_smc: Option<bool>,
+    pub input: Option<InputDevices>,
+    pub tsc: Option<TscMode>,
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
     pub tpm: Option<bool>,

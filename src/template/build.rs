@@ -700,6 +700,9 @@ fn variant_meta(v: &TemplateVariantDef, image: VariantImage) -> super::meta::Var
         display: v.display.clone(),
         cpu_model: v.cpu_model.clone(),
         hyperv: v.hyperv,
+        apple_smc: v.apple_smc,
+        input: v.input,
+        tsc: v.tsc,
         accel: v.accel,
     }
 }
@@ -1363,6 +1366,9 @@ struct EffectiveHardware {
     display: Option<String>,
     cpu_model: Option<String>,
     hyperv: Option<bool>,
+    apple_smc: Option<bool>,
+    input: Option<crate::config::model::InputDevices>,
+    tsc: Option<crate::config::model::TscMode>,
     accel: Option<crate::config::model::AccelMode>,
 }
 
@@ -1389,6 +1395,9 @@ impl EffectiveHardware {
             display: v.display.clone(),
             cpu_model: v.cpu_model.clone(),
             hyperv: v.hyperv,
+            apple_smc: v.apple_smc,
+            input: v.input,
+            tsc: v.tsc,
             accel: v.accel,
         }
         .over(Some(base))
@@ -1411,6 +1420,9 @@ impl EffectiveHardware {
             display: def.display.clone(),
             cpu_model: def.cpu_model.clone(),
             hyperv: def.hyperv,
+            apple_smc: def.apple_smc,
+            input: def.input,
+            tsc: def.tsc,
             accel: def.accel,
         }
     }
@@ -1454,6 +1466,9 @@ impl EffectiveHardware {
                 .cpu_model
                 .or_else(|| source.and_then(|m| m.cpu_model.clone())),
             hyperv: self.hyperv.or_else(|| source.and_then(|m| m.hyperv)),
+            apple_smc: self.apple_smc.or_else(|| source.and_then(|m| m.apple_smc)),
+            input: self.input.or_else(|| source.and_then(|m| m.input)),
+            tsc: self.tsc.or_else(|| source.and_then(|m| m.tsc)),
             accel: self.accel.or_else(|| source.and_then(|m| m.accel)),
         }
     }
@@ -1702,6 +1717,9 @@ fn seal_meta(
         display: hw.display.clone(),
         cpu_model: hw.cpu_model.clone(),
         hyperv: hw.hyperv,
+        apple_smc: hw.apple_smc,
+        input: hw.input,
+        tsc: hw.tsc,
         accel: hw.accel,
         created: chrono::Utc::now(),
         origin: source_origin(&def.source),
@@ -1880,6 +1898,9 @@ fn synth_spec_lab(
         display,
         cpu_model,
         hyperv,
+        apple_smc,
+        input,
+        tsc,
         accel,
     } = hw;
     let mut s = String::from("import <vmlab.wcl>\n\n");
@@ -1917,6 +1938,15 @@ fn synth_spec_lab(
     }
     if let Some(h) = hyperv {
         writeln!(s, "    hyperv   = {h}").unwrap();
+    }
+    if let Some(a) = apple_smc {
+        writeln!(s, "    apple_smc = {a}").unwrap();
+    }
+    if let Some(i) = input {
+        writeln!(s, "    input = {}", wcl_str(i.as_str())).unwrap();
+    }
+    if let Some(t) = tsc {
+        writeln!(s, "    tsc = {}", wcl_str(t.as_str())).unwrap();
     }
     if let Some(a) = accel {
         writeln!(s, "    accel = {}", wcl_str(a.as_str())).unwrap();
@@ -2193,6 +2223,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
@@ -3351,6 +3384,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
         }];
         let only = order(&["extra"]);
@@ -3789,6 +3825,9 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
                 display: None,
                 cpu_model: None,
                 hyperv: None,
+                apple_smc: None,
+                input: None,
+                tsc: None,
                 accel: None,
             });
         }
