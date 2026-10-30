@@ -17,6 +17,7 @@
 //! .vmlab/freeze/<n>/<machine>/scratch.qcow2  a container's writable layer
 //! .vmlab/freeze/<n>/<machine>/OVMF_VARS.fd   copied, not frozen
 //! .vmlab/freeze/<n>/<machine>/tpm-state/
+//! .vmlab/freeze/<n>/<machine>/tsc-hz         a pinned TSC frequency, copied
 //! .vmlab/freeze/<n>/<machine>/state.json     the machine's state record
 //! .vmlab/freeze/<n>/volumes/<name>/          the lab's named volumes
 //! ```

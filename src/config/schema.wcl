@@ -276,7 +276,7 @@ type Vm {
   apple_smc: bool?
   @doc("Keyboard and pointer: `ps2` (default; PS/2 keyboard, USB tablet) | `usb` (USB keyboard and tablet on an xHCI controller, for guests that read no PS/2 keyboard, such as macOS); inherited from template→profile")
   @options(["ps2", "usb"]) input: utf8?
-  @doc("TSC: `host` gives the guest an invariant TSC pinned at the host's frequency (`+invtsc,tsc-frequency=`), read from KVM at each start, which online snapshots allow where a bare `+invtsc` blocks them; KVM only; inherited from template→profile (the `macos` profile sets it); unset = QEMU's default")
+  @doc("TSC: `host` gives the guest an invariant TSC pinned at the host's frequency (`+invtsc,tsc-frequency=`), read from KVM at the VM's first start and kept, which online snapshots allow where a bare `+invtsc` blocks them; KVM only; inherited from template→profile (the `macos` profile sets it); unset = QEMU's default")
   @options(["host"]) tsc: utf8?
   @doc("Accelerator: `kvm` (required, no fallback) | `tcg` (always emulate, even where KVM works); unset = KVM when usable, else TCG; inherited from template→profile; `tcg` conflicts with `nested`")
   @options(["kvm", "tcg"]) accel: utf8?

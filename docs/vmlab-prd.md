@@ -2357,8 +2357,8 @@ container's `scratch.qcow2`), the freeze:
 
 The main lab therefore keeps the exact state it had, and the frozen file's
 current state is `<snapshot>`. The freeze also copies each machine's
-`OVMF_VARS.fd` and `tpm-state`, the lab's named volumes, and each machine's
-record from `.vmlab/state.json` into `.vmlab/freeze/<n>/`. It then writes
+`OVMF_VARS.fd`, `tpm-state` and pinned TSC frequency (`tsc-hz`, §5.2), the
+lab's named volumes, and each machine's record from `.vmlab/state.json` into `.vmlab/freeze/<n>/`. It then writes
 `.vmlab/worktree.json`, naming generation `<n>` and `<snapshot>`. A freeze is
 all or nothing: a failure on any disk leaves every machine as it was.
 
@@ -2387,7 +2387,7 @@ Building a machine from the freeze:
 
 - creates an overlay in the worktree's own `.vmlab/vms/<machine>/` for each
   frozen disk, backed by the frozen file by absolute path;
-- copies the machine's `OVMF_VARS.fd`, `tpm-state`, and state record: its
+- copies the machine's `OVMF_VARS.fd`, `tpm-state`, `tsc-hz`, and state record: its
   **MACs** unchanged, its first-boot marker, a container's image pin, and the
   record of `<snapshot>`;
 - copies the lab's named volumes on first build, with `cp --reflink=auto`;
