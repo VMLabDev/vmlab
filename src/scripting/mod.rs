@@ -6,6 +6,7 @@
 //! provision `up` abandons stops at its next host call).
 
 mod cancel;
+mod ocr;
 pub mod record;
 mod runner;
 mod surface;
@@ -373,6 +374,50 @@ impl MachineHandle {
             logon,
             run: self.run,
         })
+    }
+
+    /// `m.ocr()`, `m.ocr_region()` and `m.ocr_opts()`: one capture, read.
+    fn ocr(&self, req: ocr::OcrRequest) -> Result<String, String> {
+        self.block(self.display()?.ocr(req.region, &req.options))
+            .map_err(estr)
+    }
+
+    /// `m.wait_for_text()` and `m.wait_for_text_opts()`: OCR the screen once
+    /// a second until `pattern` matches or `timeout_secs` runs out.
+    fn wait_for_text(
+        &self,
+        pattern: &str,
+        timeout_secs: i64,
+        req: ocr::OcrRequest,
+    ) -> Result<ScriptMatch, String> {
+        let display = self.display()?;
+        let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
+        loop {
+            let img = self.block(display.grab()).map_err(estr)?;
+            let text = self
+                .block(vision::ocr(&img, req.region, &req.options))
+                .map_err(estr)?;
+            if let Some(found) = re.find(&text) {
+                return Ok(ScriptMatch {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                    score: 1.0,
+                    cx: 0,
+                    cy: 0,
+                    text: found.as_str().to_string(),
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout_secs}s waiting for /{pattern}/ on {}",
+                    self.name()
+                ));
+            }
+            cancel::sleep(Duration::from_millis(1000));
+        }
     }
 
     /// `m.record(path, opts)` (§11.1): start recording this machine's
@@ -1065,14 +1110,23 @@ pub fn lab_module() -> Module {
             },
         )
         .method("ocr", |h: &MachineHandle| -> Result<String, String> {
-            h.block(h.display()?.ocr(None)).map_err(estr)
+            h.ocr(ocr::OcrRequest::default())
         })
         .method(
             "ocr_region",
             |h: &MachineHandle, region: Vec<i64>| -> Result<String, String> {
                 let opts = MachineHandle::match_opts(0.9, region)?;
-                h.block(h.display()?.ocr(opts.region)).map_err(estr)
+                h.ocr(ocr::OcrRequest {
+                    region: opts.region,
+                    ..Default::default()
+                })
             },
+        )
+        .method(
+            "ocr_opts",
+            |h: &MachineHandle,
+             opts: std::collections::HashMap<String, String>|
+             -> Result<String, String> { h.ocr(ocr::parse_opts(&opts)?) },
         )
         .method(
             "wait_for_text",
@@ -1080,33 +1134,17 @@ pub fn lab_module() -> Module {
              pattern: String,
              timeout_secs: i64|
              -> Result<ScriptMatch, String> {
-                let display = h.display()?;
-                let re = regex::Regex::new(&pattern).map_err(|e| format!("bad pattern: {e}"))?;
-                let deadline =
-                    std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
-                loop {
-                    let img = h.block(display.grab()).map_err(estr)?;
-                    let text = h.block(vision::ocr(&img, None)).map_err(estr)?;
-                    if let Some(found) = re.find(&text) {
-                        return Ok(ScriptMatch {
-                            x: 0,
-                            y: 0,
-                            w: 0,
-                            h: 0,
-                            score: 1.0,
-                            cx: 0,
-                            cy: 0,
-                            text: found.as_str().to_string(),
-                        });
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Err(format!(
-                            "timed out after {timeout_secs}s waiting for /{pattern}/ on {}",
-                            h.name()
-                        ));
-                    }
-                    cancel::sleep(Duration::from_millis(1000));
-                }
+                h.wait_for_text(&pattern, timeout_secs, ocr::OcrRequest::default())
+            },
+        )
+        .method(
+            "wait_for_text_opts",
+            |h: &MachineHandle,
+             pattern: String,
+             timeout_secs: i64,
+             opts: std::collections::HashMap<String, String>|
+             -> Result<ScriptMatch, String> {
+                h.wait_for_text(&pattern, timeout_secs, ocr::parse_opts(&opts)?)
             },
         )
         // Guest agent (§10.3). Exec and file transfer ride the vmlab-agent
@@ -1614,6 +1652,29 @@ fn main(lab: Lab) {
         check_script_source(src).expect("record API surface should type-check");
     }
 
+    /// The OCR options surface (surface 5): `ocr_opts` and
+    /// `wait_for_text_opts` beside the plain calls they extend.
+    #[test]
+    fn ocr_options_api_compiles() {
+        let src = r#"
+use vmlab
+
+fn main(lab: Lab) {
+    let Ok(vm) = lab.vm("box") else { return }
+    let all: string = vm.ocr().expect("ocr")
+    let top: string = vm.ocr_region([0, 0, 1024, 40]).expect("ocr_region")
+    let sparse: string = vm.ocr_opts(#{ "layout": "sparse", "scale": "2" }).expect("ocr_opts")
+    let title: string = vm.ocr_opts(#{ "region": "0,0,1024,40", "layout": "line" }).expect("line")
+    match vm.wait_for_text_opts("(?i)password", 30, #{ "scale": "4" }) {
+        Ok(m) => lab.log(m.text),
+        Err(e) => lab.log(e),
+    }
+    let plain = vm.wait_for_text("login:", 30)
+}
+"#;
+        check_script_source(src).expect("OCR options surface should type-check");
+    }
+
     #[test]
     fn terminal_api_compiles() {
         // The send/expect terminal handle + metrics, on VMs and containers.
@@ -1719,6 +1780,7 @@ fn main(lab: Lab) {
         ensure_wscript_surface_supported("x86_64/win11@v2", Some(2.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@v3", Some(3.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@v4", Some(4.into())).unwrap();
+        ensure_wscript_surface_supported("x86_64/win11@v5", Some(5.into())).unwrap();
         ensure_wscript_surface_supported("x86_64/win11@current", Some(WSCRIPT_SURFACE_VERSION))
             .unwrap();
     }
@@ -1726,10 +1788,10 @@ fn main(lab: Lab) {
     #[test]
     fn a_template_above_the_surface_ceiling_asks_for_a_newer_vmlab() {
         let err =
-            ensure_wscript_surface_supported("x86_64/win11@newer", Some(5.into())).unwrap_err();
+            ensure_wscript_surface_supported("x86_64/win11@newer", Some(6.into())).unwrap_err();
         assert_eq!(
             err,
-            "template `x86_64/win11@newer` records wscript surface 5, newer than this host's 4; \
+            "template `x86_64/win11@newer` records wscript surface 6, newer than this host's 5; \
              upgrade vmlab to use it"
         );
     }

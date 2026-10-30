@@ -405,9 +405,17 @@ mod tests {
                 w: 3,
                 h: 4,
             }),
+            options: crate::vision::OcrOptions {
+                scale: Some(2),
+                layout: Some(crate::vision::Layout::Line),
+            },
         };
         let (cmd, args) = req.to_wire();
         assert_eq!(args["region"], serde_json::json!([1, 2, 3, 4]));
+        assert_eq!(
+            args["options"],
+            serde_json::json!({"scale": 2, "layout": "line"})
+        );
         assert_eq!(LabRequest::from_wire(cmd, args).unwrap(), req);
     }
 }

@@ -34,8 +34,9 @@ pub(crate) struct EmbeddedWscript {
 /// `usb_attach_force()`, `usb_detach()`, `usb_detach_all()` and
 /// `usb_attached()`. Four adds console recording (§11.1): `record()` on the
 /// machine handle and the `Recording` handle it returns, with `stop()` and
-/// `path()`.
-pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(4);
+/// `path()`. Five adds OCR options (§10.3): `ocr_opts()` and
+/// `wait_for_text_opts()` on the machine handle.
+pub(crate) const WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(5);
 /// Oldest stamped surface this host promises to compile. Unstamped templates
 /// are legacy and remain accepted through compatibility aliases.
 const MIN_WSCRIPT_SURFACE_VERSION: WscriptSurfaceVersion = WscriptSurfaceVersion(1);

@@ -464,6 +464,15 @@ pub enum VmCmd {
         /// Restrict to a region: x y w h
         #[arg(long, num_args = 4, value_names = ["X", "Y", "W", "H"])]
         region: Option<Vec<i64>>,
+        /// Upscale the frame this many times before reading it, 1 to 4
+        /// (default 3; 1 reads it at its own size)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
+        scale: Option<u32>,
+        /// Page segmentation: block (one block of text: consoles, dialogs),
+        /// sparse (scattered text: desktops, lock screens), line (one line),
+        /// auto (tesseract's page analysis) [default: block]
+        #[arg(long, value_parser = ["block", "sparse", "line", "auto"])]
+        layout: Option<String>,
     },
     /// Search the screen for a template image
     FindImage {
@@ -733,7 +742,12 @@ pub fn run() -> ExitCode {
             VmCmd::MouseMove { vm, x, y } => lab::cmd_vm_mouse_move(&vm, x, y),
             VmCmd::Click { vm, x, y, button } => lab::cmd_vm_click(&vm, x, y, &button),
             VmCmd::Drag { vm, x1, y1, x2, y2 } => lab::cmd_vm_drag(&vm, x1, y1, x2, y2),
-            VmCmd::Ocr { vm, region } => lab::cmd_vm_ocr(&vm, region),
+            VmCmd::Ocr {
+                vm,
+                region,
+                scale,
+                layout,
+            } => lab::cmd_vm_ocr(&vm, region, scale, layout.as_deref()),
             VmCmd::FindImage {
                 vm,
                 image,

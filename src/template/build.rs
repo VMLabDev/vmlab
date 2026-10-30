@@ -3202,14 +3202,14 @@ mod tests {
         std::fs::write(staging.path().join(DISK_FILE), b"").unwrap();
         let mut meta = source_meta();
         meta.first_boot_script = Some("use vmlab\nfn main(lab: Lab) {}\n".into());
-        meta.wscript_surface = Some(5.into());
+        meta.wscript_surface = Some(6.into());
         store.install(&staging.keep(), &meta, false).unwrap();
 
         let err = super::resolve_layered_source(&layered(""), &store).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "template `x86_64/win11@26100.1` records wscript surface 5, newer than this host's \
-             4; upgrade vmlab to use it"
+            "template `x86_64/win11@26100.1` records wscript surface 6, newer than this host's \
+             5; upgrade vmlab to use it"
         );
 
         meta.wscript_surface = Some(crate::scripting::WSCRIPT_SURFACE_VERSION);
