@@ -470,17 +470,20 @@ rejected unless it names a `guest_bin`.
 
 ## var {}
 
-One variable override for the enclosing `playbook {}`, passed to config-weave as
-`--var name=value` for this machine's run only.
+One variable override for the enclosing `playbook {}`, for this machine's run
+only. It reaches config-weave in a `--var-file` written to a private guest
+directory for the run, never on the guest command line.
 
 ```wcl
 var "tz" { value = "UTC" }
+var "join_password" { value = "Pa55w0rd!" secret = true }
 ```
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `name` | utf8 (label) | required | Variable name; must be a WCL identifier. The inline block label. |
 | `value` | utf8 | required | Value, passed through verbatim. config-weave reads it as a WCL expression where it can (`3` is an int, `true` a bool) and as a string otherwise. |
+| `secret` | bool | `false` | Treat the value as a secret: vmlab prints `***` in its place in run output, the lab log, `playbook.op.*` events, errors and `vmlab playbook list`. |
 
 Validation requires the name to be letters, digits and underscores, not starting
 with a digit, because config-weave binds each override as a `let` inside the

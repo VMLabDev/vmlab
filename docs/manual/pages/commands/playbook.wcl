@@ -3,7 +3,7 @@ page cmd_playbook {
   chapter_header "vmlab playbook" {
     kicker       = "Commands · reference"
     reading_time = "5 min read"
-    updated      = "2026-09-02"
+    updated      = "2026-10-30"
     version      = "vmlab 0.9"
   }
 
@@ -45,7 +45,8 @@ page cmd_playbook {
   p <<DOC
     Prints one line per `playbook {}` block, `<machine> → <path> play
     <play>`, followed by an indented `var <name>=<value>` line for each
-    variable override the block declares, and, when a run is in progress on
+    variable override the block declares (`<value>` is `***` for a
+    `secret = true` variable), and, when a run is in progress on
     that machine, `<check|apply> running since <time>`. A block whose last
     run hit its `timeout` adds a `timed out at <time>` line saying whether
     the processes that run started are still running, have finished, or

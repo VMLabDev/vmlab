@@ -1294,7 +1294,8 @@ vmlab playbook list
 | `-h`, `--help` | Print help. |
 
 Prints one line per `playbook {}` block, `<machine> → <path> play <play>`, followed by an
-indented `var <name>=<value>` line for each variable override the block declares, and, when
+indented `var <name>=<value>` line for each variable override the block declares (`***` for a
+`secret = true` value), and, when
 a run is in progress on that machine, `<check|apply> running since <time>`. A block whose last
 run hit its `timeout` adds a `timed out at <time>` line saying whether the processes that run
 started are still running, have finished, or cannot be asked about because the guest is not

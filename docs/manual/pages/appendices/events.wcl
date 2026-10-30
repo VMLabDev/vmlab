@@ -3,7 +3,7 @@ page ref_events {
   chapter_header "Events" {
     kicker       = "Appendices · reference"
     reading_time = "12 min read"
-    updated      = "2026-10-29"
+    updated      = "2026-10-30"
     version      = "vmlab 0.35"
   }
 
@@ -149,7 +149,7 @@ SRC
     rows:
       | "Event" | "Payload fields" | "When" |
       | "`playbook.op.start`" | "base, `mode`: `apply` or `check`" | "A run was admitted." |
-      | "`playbook.op.log`" | "base, `line`" | "One human-readable line from the run." |
+      | "`playbook.op.log`" | "base, `line`" | "One human-readable line from the run. Every `playbook.op.*` payload carries `***` in place of a `secret = true` variable's value." |
       | "`playbook.op.phase`" | "base, `phase`: `running` or `rebooting`, `attempt`, `max`" | "The run changed phase, so a reboot shows as one rather than a stall." |
       | "`playbook.op.step`" | "base, `cw`: the engine's structured event" | "One structured line from the guest engine." |
       | "`playbook.op.done`" | "base, `exit_code`, `reboots`, `report`" | "The run finished without an infrastructure error, whatever its exit code." |

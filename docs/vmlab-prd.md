@@ -158,7 +158,7 @@ lab "ad-lab" {
     provision "scripts/setup.ws" { }
     playbook "playbooks/baseline" {
       play = "baseline"
-      var "tz" { value = "UTC" }       # --var tz=UTC, for this machine only
+      var "tz" { value = "UTC" }       # tz = UTC in the run's --var-file, for this machine only
     }
   }
 
@@ -185,7 +185,7 @@ lab "ad-lab" {
 
 ### 5.1 Validation
 
-Configuration steps target structurally: `provision {}` and `playbook {}` are declared *inside* the `vm {}` or `container {}` they configure, so the machine is the target and there is nothing to cross-reference. A machine's steps run in the order its blocks appear, once it is ready. Different machines provision in parallel; `depends_on_provision` (§7.2) is the only thing that orders one machine's steps after another's. A `playbook {}` may carry `var "<name>" { value = "…" }` children, passed to config-weave as `--var name=value` for that machine's run only — the mechanism for giving one play different settings per machine.
+Configuration steps target structurally: `provision {}` and `playbook {}` are declared *inside* the `vm {}` or `container {}` they configure, so the machine is the target and there is nothing to cross-reference. A machine's steps run in the order its blocks appear, once it is ready. Different machines provision in parallel; `depends_on_provision` (§7.2) is the only thing that orders one machine's steps after another's. A `playbook {}` may carry `var "<name>" { value = "…" }` children, passed to config-weave for that machine's run only — the mechanism for giving one play different settings per machine. They travel in a `--var-file` written for the run into a private guest directory (`0700`, or SYSTEM and Administrators only on Windows) and removed after it, never on the guest command line, where the process list and any error quoting the command would show them. A `var` marked `secret = true` has its value replaced by `***` in everything vmlab emits for the run — CLI output, the lab log, `playbook.op.*` events, the run report, errors and `vmlab playbook list` — in both its spellings: as written, and as config-weave prints it once evaluated. Run lines name variables, never their values.
 
 A playbook run pushes config-weave and the playbook folder into one **guest directory**: the block's `guest_dir`, else the machine's profile's `playbook_dir` (§5.3), else `/var/lib/vmlab/weave` on Linux and `C:\weave` on Windows. The Linux default sits under `/var` because that is writable on read-only-root guests (image-based and verity-rooted systems, NixOS) and persists across reboots; vmlab creates the directory before pushing. The binary lands at `<dir>/config-weave` (`config-weave.exe` on Windows) and each playbook at `<dir>/playbooks/<flattened path>`. vmlab re-pushes the binary when the one last pushed to that machine had a different SHA-256 **or went to a different path**, or when `<binary> version` fails in the guest (a snapshot restore rolled it away). A block naming **`guest_bin`** — the absolute path of a config-weave already in the guest, as an image that converges its own `/etc` ships one — pushes no binary: vmlab probes `<guest_bin> version` and fails naming the path when it is missing or does not answer, and the playbook folder is still pushed to the guest directory. Such a block needs no host-side config-weave binary and is not subject to the x86_64 limit.
 
