@@ -645,6 +645,15 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
         }
     }
 
+    // Machines still on an older declaration than the file's (§7.1): rare,
+    // a sentence each, and what somebody who edited the file looks for.
+    if !status.pending.is_empty() {
+        let _ = writeln!(out);
+        for p in &status.pending {
+            let _ = writeln!(out, "  {}", p.line());
+        }
+    }
+
     // Recordings (§11.1), in their own section for the same reason as dev
     // machines below: most of the time there are none, and the path and the
     // elapsed time do not fit a shared row.
@@ -2763,6 +2772,25 @@ mod tests {
             out.contains("global segment \"corp\" joins as \"corp@feat-x\""),
             "got:\n{out}"
         );
+    }
+
+    /// A machine a reload left pending is named under the table, with why
+    /// and what picks the change up (PRD §7.1); a lab with none says nothing.
+    #[test]
+    fn the_status_table_names_pending_machines() {
+        use crate::status::{PendingMachine, PendingReason};
+        let mut status = lab(vec![addressed("web", PowerState::Running, true, vm())]);
+        assert!(!render_status(&status, false).contains("pending"));
+        status.pending = vec![PendingMachine {
+            machine: "web".into(),
+            reason: PendingReason::Running,
+        }];
+        let out = render_status(&status, false);
+        assert!(
+            out.contains("web: pending — still running the declaration it was started with"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("vmlab vm restart web"), "got:\n{out}");
     }
 
     /// `vmlab status` names which machine is the dev machine, off the same

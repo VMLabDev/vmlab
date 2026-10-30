@@ -13,7 +13,8 @@ LAB = "e2e-core"
 OWNED = [
     "lab.validate", "lab.validate.reject", "lab.up", "lab.up.partial", "lab.depends_on",
     "lab.depends_on_provision", "lab.provision.parallel",
-    "lab.status", "lab.down", "lab.up.reload", "lab.up.template-changed", "lab.destroy",
+    "lab.status", "lab.down", "lab.up.reload", "lab.reload.stopped", "lab.reload.network",
+    "lab.up.template-changed", "lab.destroy",
     "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory",
     "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
     "vm.hw.qemu_args", "vm.hw.nested", "vm.scratch", "vm.media.iso", "vm.media.floppy",
@@ -241,10 +242,32 @@ def edit_lab(lab: pathlib.Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new, 1))
 
 
+def qemu_pid(vm: str) -> str:
+    """The running QEMU's pid for `vm` of this lab, or "" when none runs."""
+    want = f"vmlab:{LAB}/{vm}"
+    for p in pathlib.Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            args = [a.decode(errors="replace") for a in (p / "cmdline").read_bytes().split(b"\0") if a]
+        except OSError:
+            continue
+        if args and "qemu-system" in args[0] and want in args:
+            return p.name
+    return ""
+
+
+def memory_of(argv: list[str]) -> str:
+    """The `-m` value in a QEMU argv."""
+    i = argv.index("-m") if "-m" in argv else -1
+    return argv[i + 1] if 0 <= i < len(argv) - 1 else "?"
+
+
 def reload_after_down(h, lab: pathlib.Path) -> None:
     """The lab daemon outlives `down`. `up` must still run the lab file as it
-    is on disk now, not the one the daemon loaded, and must refuse an edit it
-    cannot apply rather than quietly running the old one."""
+    is on disk now, not the one the daemon loaded (PRD §7.1): replacing the
+    daemon when nothing runs, else reloading the file into it machine by
+    machine — never quietly running the old one."""
     # An edited qemu_args takes effect on the next `up`.
     edit_lab(lab, "serial=E2E-QEMU-ARGS\"", "serial=E2E-QEMU-ARGS-2\"")
     up = h.vmlab("up", "vm01", cwd=lab, timeout=600, check=False)
@@ -254,34 +277,73 @@ def reload_after_down(h, lab: pathlib.Path) -> None:
     argv = qemu_argv("vm01")
     applied = up.code == 0 and serial == "E2E-QEMU-ARGS-2" and "type=1,serial=E2E-QEMU-ARGS-2" in argv
 
-    # Edited again while vm01 runs: a fresh daemon cannot adopt it, so `up`
-    # refuses by name and vm01 keeps what it booted with. The `up vm01` above
-    # pulled vm03 in through vm01's depends_on_provision, so both are named.
+    # Edited again while vm01 and vm03 run (the `up vm01` above pulled vm03
+    # in through vm01's depends_on_provision): the daemon reloads the file,
+    # `up` succeeds, and vm01 is named pending and keeps what it booted with
+    # until a restart rebuilds it.
     edit_lab(lab, "serial=E2E-QEMU-ARGS-2\"", "serial=E2E-QEMU-ARGS-3\"")
-    busy = h.vmlab("up", "vm01", cwd=lab, timeout=120, check=False)
-    refused = (
-        busy.code != 0 and "vm01, vm03 are still running" in busy.text and "vmlab down" in busy.text
+    busy = h.vmlab("up", "vm01", cwd=lab, timeout=300, check=False)
+    pending = (
+        busy.code == 0 and "reloading it into the running lab" in busy.text
+        and "vm01: pending" in busy.text
         and "type=1,serial=E2E-QEMU-ARGS-2" in qemu_argv("vm01")
+    )
+    rs = h.vmlab("vm", "restart", "vm01", cwd=lab, timeout=600, check=False)
+    if rs.code == 0:
+        h.wait_ready(lab, "vm01")
+    restarted = (
+        rs.code == 0 and "vm01: rebuilt" in rs.text
+        and "type=1,serial=E2E-QEMU-ARGS-3" in qemu_argv("vm01")
+        and "pending" not in h.vmlab("status", cwd=lab, check=False).out
+    )
+
+    # A stopped machine edited while others run is rebuilt by the reload and
+    # boots on the new declaration, and nothing running is stopped for it.
+    vm01_pid = qemu_pid("vm01")
+    edit_lab(lab, "memory     = 512MiB\n    floppy", "memory     = 640MiB\n    floppy")
+    stopped = h.vmlab("up", "vm02", cwd=lab, timeout=600, check=False)
+    vm02_memory = memory_of(qemu_argv("vm02"))
+    h.ok(
+        "lab.reload.stopped",
+        stopped.code == 0 and "vm02: rebuilt from the new declaration" in stopped.text
+        and vm02_memory == "640M" and vm01_pid != "" and qemu_pid("vm01") == vm01_pid,
+        f"exit {stopped.code}; vm02 boots -m {vm02_memory}; vm01 kept pid {vm01_pid}: "
+        f"{qemu_pid('vm01') == vm01_pid}; "
+        + next((l.strip() for l in stopped.text.splitlines() if l.startswith("vm02:")), stopped.text.strip()[-200:]),
+    )
+
+    # A network change cannot apply while the lab runs: refused, naming the
+    # segment and `vmlab down`, with nothing reloaded.
+    edit_lab(lab, 'segment "lan" { subnet = "10.80.0.0/24" }', 'segment "lan" { subnet = "10.80.0.0/24" mtu = 1400 }')
+    net = h.vmlab("up", cwd=lab, timeout=120, check=False)
+    edit_lab(lab, 'segment "lan" { subnet = "10.80.0.0/24" mtu = 1400 }', 'segment "lan" { subnet = "10.80.0.0/24" }')
+    h.ok(
+        "lab.reload.network",
+        net.code != 0 and 'segment "lan" changed (mtu)' in net.text and "vmlab down" in net.text
+        and qemu_pid("vm01") == vm01_pid,
+        f"exit {net.code}: "
+        + next((l.strip() for l in net.text.splitlines() if "network" in l), net.text.strip()[-200:]),
     )
 
     # `vm stop` leaves the daemon up with nothing running, still holding the
     # file it loaded: `vm start` replaces it and boots the edit.
-    h.vmlab("vm", "stop", "vm01", cwd=lab, check=False, timeout=180)
-    h.vmlab("vm", "stop", "vm03", cwd=lab, check=False, timeout=180)
+    edit_lab(lab, "serial=E2E-QEMU-ARGS-3\"", "serial=E2E-QEMU-ARGS-4\"")
+    for vm in ("vm02", "vm01", "vm03"):
+        h.vmlab("vm", "stop", vm, cwd=lab, check=False, timeout=180)
     sv = h.vmlab("vm", "start", "vm01", cwd=lab, timeout=600, check=False)
     if sv.code == 0:
         h.wait_ready(lab, "vm01")
     replaced = (
         sv.code == 0 and "restarting the lab daemon" in sv.text
-        and "type=1,serial=E2E-QEMU-ARGS-3" in qemu_argv("vm01")
+        and "type=1,serial=E2E-QEMU-ARGS-4" in qemu_argv("vm01")
     )
     h.ok(
         "lab.up.reload",
-        applied and refused and replaced,
+        applied and pending and restarted and replaced,
         f"after down + edit: up exit {up.code}, guest serial {serial!r}; "
-        f"edit over running vm01: exit {busy.code}, "
-        + next((l.strip() for l in busy.text.splitlines() if "still running" in l), busy.text.strip()[-200:])
-        + f"; vm stop + vm start: exit {sv.code}, replaced daemon and booted serial 3={replaced}",
+        f"edit over running vm01: up exit {busy.code}, pending and on its old argv={pending}, "
+        f"vm restart exit {rs.code} on the new argv={restarted}; "
+        f"vm stop + vm start: exit {sv.code}, replaced daemon and booted serial 4={replaced}",
     )
 
     # A clone cannot move to another template: `up` refuses before starting
