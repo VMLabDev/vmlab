@@ -187,7 +187,10 @@ struct Inner {
     shutting_down: watch::Sender<u64>,
     /// Incremented per `time_set` / `time_set_failed`, with the failure.
     time_set: watch::Sender<(u64, Option<String>)>,
-    /// One set_time request in flight at a time: the answers carry no id.
+    /// Incremented per `time` reply, with the guest's clock in Unix ms.
+    guest_time: watch::Sender<(u64, i64)>,
+    /// One set_time or get_time request in flight at a time: the answers
+    /// carry no id.
     time_op: Mutex<()>,
     /// Whether `subscribe_metrics` has been sent on this connection.
     metrics_subscribed: AtomicBool,
@@ -274,6 +277,7 @@ impl AgentHandle {
             tree_op: Mutex::new(()),
             shutting_down: watch::Sender::new(0),
             time_set: watch::Sender::new((0, None)),
+            guest_time: watch::Sender::new((0, 0)),
             time_op: Mutex::new(()),
             metrics_subscribed: AtomicBool::new(false),
             token,
@@ -866,6 +870,24 @@ impl AgentHandle {
             None => Ok(()),
             Some(msg) => Err(anyhow!("the guest refused to set its clock: {msg}")),
         }
+    }
+
+    /// Read the guest's system clock, in milliseconds since the Unix epoch
+    /// (§7.3). Refused on an agent that does not advertise
+    /// [`features::GET_TIME`], which would drop the request unanswered.
+    pub async fn get_time(&self, timeout: Duration) -> Result<i64> {
+        if !self.has_feature(features::GET_TIME) {
+            bail!("the guest's agent cannot report the clock (no `get_time` feature)");
+        }
+        let _op = self.inner.time_op.lock().await;
+        let mut rx = self.inner.guest_time.subscribe();
+        rx.mark_unchanged();
+        self.send_msg(&HostMsg::GetTime).await?;
+        tokio::time::timeout(timeout, rx.changed())
+            .await
+            .map_err(|_| anyhow!("agent did not answer get_time within {timeout:?}"))?
+            .map_err(|_| anyhow!("agent channel closed"))?;
+        Ok(rx.borrow().1)
     }
 
     /// Ask the guest to shut down. The agent acks and then the whole
@@ -2273,6 +2295,10 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
             let seq = inner.time_set.borrow().0 + 1;
             let _ = inner.time_set.send((seq, Some(msg)));
         }
+        AgentMsg::Time { unix_ms } => {
+            let seq = inner.guest_time.borrow().0 + 1;
+            let _ = inner.guest_time.send((seq, unix_ms));
+        }
         AgentMsg::Pong { instance } => {
             let seq = inner.pong.borrow().0 + 1;
             let _ = inner.pong.send((seq, instance));
@@ -2704,6 +2730,18 @@ mod tests {
                                 }
                                 HostMsg::Shutdown { mode } => {
                                     send(AgentMsg::ShuttingDown { mode }).await;
+                                }
+                                // A guest clock an hour ahead of the host's.
+                                HostMsg::GetTime => {
+                                    send(AgentMsg::Time {
+                                        unix_ms: MOCK_CLOCK_AHEAD_MS
+                                            + std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis()
+                                                as i64,
+                                    })
+                                    .await;
                                 }
                                 // A clock before 2000 is refused, as a guest
                                 // without the privilege would refuse any.
@@ -3686,6 +3724,8 @@ mod tests {
     }
 
     const MOCK_NO_DESKTOP: &str = "no one is logged on to the desktop";
+    /// How far ahead of the host the mock guest's clock runs.
+    const MOCK_CLOCK_AHEAD_MS: i64 = 3_600_000;
 
     fn clipboard_features(extra: &[&str]) -> Vec<String> {
         ["terminal", features::CLIPBOARD]
@@ -3844,6 +3884,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("set_time"), "{err}");
+    }
+
+    /// **A fresh handshake checks the guest clock before anyone gets the
+    /// handle** (§7.3, #186): the slot's hook reads the mock guest an hour
+    /// ahead, sets it and says so; a handle reused while its agent answers
+    /// does not check again.
+    #[tokio::test]
+    async fn a_fresh_handshake_corrects_a_drifted_guest_clock() {
+        let (_dir, path) = mock_agent_with(
+            true,
+            vec!["exec".into(), "get_time".into(), "set_time".into()],
+        )
+        .await;
+        let seen = Arc::new(std::sync::Mutex::new(
+            Vec::<(String, serde_json::Value)>::new(),
+        ));
+        let sink = Arc::clone(&seen);
+        let slot = super::super::machine::AgentSlot::default();
+        slot.set_handshake_hook(super::super::boot_clock::hook(
+            "dc1".into(),
+            crate::config::model::Clock::Host,
+            Arc::new(move |e: &str, v| sink.lock().unwrap().push((e.to_string(), v))),
+        ));
+        assert!(slot.probe(&path).await);
+        slot.connect("dc1", &path, "no agent").await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, "machine.clock_drift");
+        assert_eq!(seen[0].1["corrected"], true);
+        let drift = seen[0].1["drift_ms"].as_i64().unwrap();
+        assert!(
+            (MOCK_CLOCK_AHEAD_MS - 1_000..MOCK_CLOCK_AHEAD_MS + 5_000).contains(&drift),
+            "{drift}"
+        );
+    }
+
+    /// `get_time` answers the guest's clock, and is refused by name on an
+    /// agent that cannot report it.
+    #[tokio::test]
+    async fn get_time_round_trips_and_is_refused_without_the_feature() {
+        let wait = Duration::from_secs(5);
+        let (_dir, path) = mock_agent_with(true, vec!["exec".into(), "get_time".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let host = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let guest = agent.get_time(wait).await.expect("read");
+        let ahead = guest - host;
+        assert!(
+            (MOCK_CLOCK_AHEAD_MS..MOCK_CLOCK_AHEAD_MS + 5_000).contains(&ahead),
+            "{ahead}"
+        );
+
+        let (_dir, path) = mock_agent_with(true, vec!["exec".into(), "set_time".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent.get_time(wait).await.unwrap_err();
+        assert!(err.to_string().contains("get_time"), "{err}");
     }
 
     #[tokio::test]

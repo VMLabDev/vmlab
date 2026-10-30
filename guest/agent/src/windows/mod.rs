@@ -63,7 +63,7 @@ fn ensure_rtc_is_utc() {
     ) {
         Ok(false) => {}
         Ok(true) => eprintln!(
-            r"vmlab-agent: set HKLM\{KEY}\{VALUE} = 1; the RTC is read as UTC from the next boot"
+            r"vmlab-agent: set HKLM\{KEY}\{VALUE} = 1; the RTC is read as UTC from the next boot, and until then any clock set writes local time into it"
         ),
         Err(e) => eprintln!("vmlab-agent: could not make the RTC read as UTC: {e}"),
     }
@@ -127,6 +127,7 @@ impl crate::mux::Platform for WindowsPlatform {
             features::CLIPBOARD_REPLY.to_string(),
             features::TREE.to_string(),
             features::SET_TIME.to_string(),
+            features::GET_TIME.to_string(),
             features::APP_RDP.to_string(),
         ]
     }

@@ -1008,6 +1008,10 @@ pub(super) struct AgentSlot {
     /// itself reconnects through
     /// [`connect_during_replacement`](Self::connect_during_replacement).
     replacing: Arc<tokio::sync::Semaphore>,
+    /// Run on every fresh handshake before the handle is handed out: the
+    /// guest-clock check of §7.3 ([`super::boot_clock`]), installed by the
+    /// machine at each start.
+    on_handshake: std::sync::Mutex<Option<super::boot_clock::HandshakeHook>>,
 }
 
 impl Default for AgentSlot {
@@ -1017,11 +1021,29 @@ impl Default for AgentSlot {
             failed_at: tokio::sync::Mutex::new(None),
             answered: std::sync::Mutex::new(None),
             replacing: Arc::new(tokio::sync::Semaphore::new(1)),
+            on_handshake: std::sync::Mutex::new(None),
         }
     }
 }
 
 impl AgentSlot {
+    /// Install what every fresh handshake runs from now on (see
+    /// `on_handshake`), replacing the last start's.
+    pub fn set_handshake_hook(&self, hook: super::boot_clock::HandshakeHook) {
+        *self.on_handshake.lock_recover() = Some(hook);
+    }
+
+    /// Run the handshake hook on a handle that just handshook. Called with
+    /// the slot's handle lock held, so a concurrent caller waits for it
+    /// rather than racing a clock step; the hook talks to the handle it is
+    /// given and never back through the slot.
+    async fn handshook(&self, handle: &AgentHandle) {
+        let hook = self.on_handshake.lock_recover().clone();
+        if let Some(hook) = hook {
+            hook(handle.clone()).await;
+        }
+    }
+
     /// Connect (or reuse), with the token handshake. A guest reboot or an
     /// agent restart leaves the old connection open but talking to a fresh
     /// agent instance, so a live handle is pinged before it is handed out, and
@@ -1132,6 +1154,7 @@ impl AgentSlot {
                 *self.failed_at.lock().await = None;
                 self.note_answered(&handle);
                 *agent = Some(handle.clone());
+                self.handshook(&handle).await;
                 Ok(handle)
             }
             Err(e) => {
@@ -1168,7 +1191,8 @@ impl AgentSlot {
             Ok(handle) => {
                 *self.failed_at.lock().await = None;
                 self.note_answered(&handle);
-                *agent = Some(handle);
+                *agent = Some(handle.clone());
+                self.handshook(&handle).await;
                 true
             }
             Err(_) => false,

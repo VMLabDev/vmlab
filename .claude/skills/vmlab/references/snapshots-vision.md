@@ -49,8 +49,16 @@ The legacy agent sets the clock too; the TempleOS agent does not.
 The RTC holds UTC. Windows guests on `vmlab-agent` read it as UTC because the
 bootstrap installer sets `RealTimeIsUniversal = 1` and the agent re-ensures it
 at every start; an older template gets it from `up`'s agent update or
-`vmlab machine repair-agent`, after which the daemon sets the running clock
-once (`clock = "host"`), the flag holding from the next boot. Profiles with
+`vmlab machine repair-agent`. Windows reads the flag only at boot: in the boot
+where the agent first sets it, every clock set writes local time into the RTC,
+so the next reboot inside the guest (QEMU keeps the RTC) comes up off by the
+guest's UTC offset. A template with the flag set before sealing has no such
+window. Under `clock = "host"` the daemon corrects it: at every fresh agent
+handshake (first after a start, after a guest reboot, after an agent restart)
+it reads the guest clock (`get_time`) before handing the connection out, and
+past 2 s sets it to the host's and emits `machine.clock_drift` with the drift.
+An agent without `get_time` is unchecked, said once per start by
+`machine.clock_unchecked`. Profiles with
 `rtc = "localtime"` (`windows-xp`, `windows-9x`) start the RTC at the host's
 local time instead (`-rtc base=localtime`; a fixed instant converted to host
 local time). Such a guest is right when its time zone matches the host's. vmlab
