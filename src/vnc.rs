@@ -1,11 +1,11 @@
 //! Minimal RFB (VNC) client for scripted input and framebuffer capture.
 //!
 //! vmlab normally injects input via QMP (`send-key` / `input-send-event`),
-//! but `send-key` only drives QEMU's PS/2 keyboard. USB-HID-only guests —
-//! notably macOS booted through OpenCore — ignore PS/2, so scripted keys
-//! never land. A real VNC viewer's input *does* reach them because it flows
-//! through QEMU's VNC server to the USB devices. This client speaks just
-//! enough of RFB 3.8 to do the same from a provision/`vmlab script`: it
+//! which reaches whichever keyboard QEMU routes unbound input to — the
+//! machine's PS/2 keyboard, or the USB one `input = "usb"` adds (how macOS
+//! is driven). Input a real VNC viewer sends takes the same route through
+//! QEMU's VNC server, and some guests only behave with it. This client
+//! speaks just enough of RFB 3.8 to do the same from a provision/`vmlab script`: it
 //! connects to the VM's `vnc.sock`, completes the (auth-less) handshake, and
 //! sends `KeyEvent`/`PointerEvent` messages.
 //!

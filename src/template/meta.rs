@@ -47,6 +47,12 @@ pub struct TemplateMeta {
     pub cpu_model: Option<String>,
     /// Hyper-V enlightenments the template pins for its clones (§5.2).
     pub hyperv: Option<bool>,
+    /// The Apple SMC device the template pins for its clones (§5.2).
+    pub apple_smc: Option<bool>,
+    /// Keyboard and pointer devices the template pins for its clones (§5.2).
+    pub input: Option<crate::config::model::InputDevices>,
+    /// The TSC the template pins for its clones (§5.2).
+    pub tsc: Option<crate::config::model::TscMode>,
     /// QEMU accelerator the template pins for its clones (§5.2).
     pub accel: Option<crate::config::model::AccelMode>,
     pub created: DateTime<Utc>,
@@ -106,6 +112,9 @@ pub struct VariantMeta {
     pub display: Option<String>,
     pub cpu_model: Option<String>,
     pub hyperv: Option<bool>,
+    pub apple_smc: Option<bool>,
+    pub input: Option<crate::config::model::InputDevices>,
+    pub tsc: Option<crate::config::model::TscMode>,
     pub accel: Option<crate::config::model::AccelMode>,
 }
 
@@ -297,6 +306,9 @@ impl TemplateMeta {
         over(&mut m.display, &v.display);
         over(&mut m.cpu_model, &v.cpu_model);
         over(&mut m.hyperv, &v.hyperv);
+        over(&mut m.apple_smc, &v.apple_smc);
+        over(&mut m.input, &v.input);
+        over(&mut m.tsc, &v.tsc);
         over(&mut m.accel, &v.accel);
         over(&mut m.first_boot_script, &v.first_boot_script);
         over(&mut m.agent_version, &v.agent_version);
@@ -357,6 +369,15 @@ impl TemplateMeta {
         }
         if let Some(h) = self.hyperv {
             let _ = writeln!(out, "  hyperv = {h}");
+        }
+        if let Some(a) = self.apple_smc {
+            let _ = writeln!(out, "  apple_smc = {a}");
+        }
+        if let Some(i) = self.input {
+            let _ = writeln!(out, "  input = {}", quote(i.as_str()));
+        }
+        if let Some(t) = self.tsc {
+            let _ = writeln!(out, "  tsc = {}", quote(t.as_str()));
         }
         if let Some(a) = self.accel {
             let _ = writeln!(out, "  accel = {}", quote(a.as_str()));
@@ -480,6 +501,15 @@ fn write_variant(out: &mut String, v: &VariantMeta) {
     if let Some(h) = v.hyperv {
         let _ = writeln!(out, "    hyperv = {h}");
     }
+    if let Some(a) = v.apple_smc {
+        let _ = writeln!(out, "    apple_smc = {a}");
+    }
+    if let Some(i) = v.input {
+        let _ = writeln!(out, "    input = {}", quote(i.as_str()));
+    }
+    if let Some(t) = v.tsc {
+        let _ = writeln!(out, "    tsc = {}", quote(t.as_str()));
+    }
     if let Some(a) = v.accel {
         let _ = writeln!(out, "    accel = {}", quote(a.as_str()));
     }
@@ -535,6 +565,16 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         .parsed("cpu_model", crate::config::model::parse_cpu_model)
         .unspan();
     let hyperv = r.bool("hyperv").unspan();
+    let apple_smc = r.bool("apple_smc").unspan();
+    // Lenient, like `accel`.
+    let input = r
+        .string("input")
+        .unspan()
+        .and_then(|s| crate::config::model::InputDevices::parse(&s));
+    let tsc = r
+        .string("tsc")
+        .unspan()
+        .and_then(|s| crate::config::model::TscMode::parse(&s));
     // Lenient, like `firmware`: a spelling this build does not know reads
     // as unset rather than making the store entry unreadable.
     let accel = r
@@ -568,6 +608,9 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         display,
         cpu_model,
         hyperv,
+        apple_smc,
+        input,
+        tsc,
         accel,
         origin,
         registry,
@@ -666,6 +709,16 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
         .parsed("cpu_model", crate::config::model::parse_cpu_model)
         .unspan();
     let hyperv = r.bool("hyperv").unspan();
+    let apple_smc = r.bool("apple_smc").unspan();
+    // Lenient, like `accel`.
+    let input = r
+        .string("input")
+        .unspan()
+        .and_then(|s| crate::config::model::InputDevices::parse(&s));
+    let tsc = r
+        .string("tsc")
+        .unspan()
+        .and_then(|s| crate::config::model::TscMode::parse(&s));
     let accel = r
         .string("accel")
         .unspan()
@@ -690,6 +743,9 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
         display,
         cpu_model,
         hyperv,
+        apple_smc,
+        input,
+        tsc,
         accel,
     })
 }
@@ -754,6 +810,9 @@ mod tests {
             display: Some("vnc".into()),
             cpu_model: Some("pentium3".into()),
             hyperv: Some(false),
+            apple_smc: Some(true),
+            input: Some(crate::config::model::InputDevices::Usb),
+            tsc: Some(crate::config::model::TscMode::Host),
             accel: Some(crate::config::model::AccelMode::Tcg),
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
@@ -785,6 +844,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
@@ -1042,6 +1104,9 @@ mod tests {
             display: None,
             cpu_model: None,
             hyperv: None,
+            apple_smc: None,
+            input: None,
+            tsc: None,
             accel: None,
         }
     }

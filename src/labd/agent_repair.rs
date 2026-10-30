@@ -86,6 +86,11 @@ pub struct RepairPlan {
     pub replaced: Option<String>,
 }
 
+/// Where the macOS bootstrap installs the agent, and the LaunchDaemon label
+/// that runs it as root at boot (§7.4).
+pub const MACOS_INSTALL: &str = "/Library/vmlab/vmlab-agent";
+pub const MACOS_LAUNCHD_LABEL: &str = "dev.vmlab.agent";
+
 /// The plan for `guest_os`.
 ///
 /// Both paths are the ones the bootstrap installer wrote at build time
@@ -126,6 +131,32 @@ pub fn plan(guest_os: GuestOs) -> RepairPlan {
                 // `mv -f` consumes it: the replaced binary survives only as
                 // the inode the running process still has open, which is
                 // nothing a developer can go and look at.
+                replaced: None,
+                staging,
+                install,
+            }
+        }
+        GuestOs::Macos => {
+            let install = MACOS_INSTALL.to_string();
+            let staging = format!("{install}.new");
+            RepairPlan {
+                // As on Linux: the rename replaces the directory entry, and
+                // the running agent keeps the file it was started from.
+                swap: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("chmod 0755 '{staging}' && mv -f '{staging}' '{install}'"),
+                ],
+                // launchd owns the job, so a kickstart asked for from inside
+                // it completes even though the requester is what it kills.
+                restart: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "{{ sleep 1; launchctl kickstart -k system/{MACOS_LAUNCHD_LABEL}; }} \
+                         >/dev/null 2>&1 &"
+                    ),
+                ],
                 replaced: None,
                 staging,
                 install,
@@ -220,6 +251,7 @@ pub fn shipped_asset(m: &dyn Machine) -> Result<AgentAsset> {
     let os = match m.guest_os() {
         GuestOs::Windows => AgentOs::Windows,
         GuestOs::Linux => AgentOs::Linux,
+        GuestOs::Macos => AgentOs::Macos,
     };
     ensure_agent_asset(os, &m.arch())
 }

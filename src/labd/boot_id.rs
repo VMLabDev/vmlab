@@ -17,6 +17,8 @@
 //!   `set_time` makes. Where that value is missing (NT4 through XP/2003) the
 //!   last boot time from WMI, `wmic` first and PowerShell where Windows has
 //!   dropped `wmic`, normalised to UTC at full precision.
+//! - **macOS**: `kern.bootsessionuuid`, a UUID the kernel draws once per
+//!   boot, read with `sysctl`.
 //! - **Windows 9x/ME, DOS and TempleOS** have nothing a command can read that
 //!   survives the boot and changes with the next one, so they refuse by name.
 
@@ -36,6 +38,11 @@ pub struct Probe {
 
 const LINUX: &[Probe] = &[Probe {
     argv: &["cat", "/proc/sys/kernel/random/boot_id"],
+    parse: parse_linux,
+}];
+
+const MACOS: &[Probe] = &[Probe {
+    argv: &["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
     parse: parse_linux,
 }];
 
@@ -71,6 +78,7 @@ pub fn probes(os: &str, profile: Option<&str>) -> Result<&'static [Probe], Strin
         (_, Some("windows-9x")) => Err(no_identity("Windows 9x/ME")),
         ("linux", _) => Ok(LINUX),
         ("windows", _) => Ok(WINDOWS),
+        ("macos", _) => Ok(MACOS),
         ("dos", _) => Err(no_identity("DOS")),
         ("templeos", _) => Err(no_identity("TempleOS")),
         (other, _) => Err(no_identity(&format!(
@@ -86,7 +94,8 @@ fn no_identity(family: &str) -> String {
     )
 }
 
-/// The kernel's boot UUID, as it prints it.
+/// The kernel's boot UUID, as it prints it — Linux's `boot_id` and macOS's
+/// `kern.bootsessionuuid` alike.
 pub fn parse_linux(out: &str) -> Option<String> {
     let id = out.trim();
     let ok = id.len() == 36
@@ -237,6 +246,14 @@ mod tests {
         assert_eq!(win[0].argv[4], "BootId");
         assert_eq!(win[1].argv[0], "wmic");
         assert_eq!(win[2].argv[0], "powershell.exe");
+        assert_eq!(
+            probes("macos", Some("macos")).unwrap()[0].argv,
+            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"]
+        );
+        assert_eq!(
+            parse_linux("9F1D3C2A-6B1E-4C7D-8E2F-0123456789AB\n").as_deref(),
+            Some("9f1d3c2a-6b1e-4c7d-8e2f-0123456789ab")
+        );
         // The legacy agent says `windows` on NT and 9x alike; NT gets the
         // probes and falls through to WMI, 9x is refused by its profile.
         assert_eq!(probes("windows", Some("windows-xp")).unwrap().len(), 3);
