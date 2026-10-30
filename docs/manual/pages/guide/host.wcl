@@ -60,6 +60,7 @@ SRC
       | "`config_weave_bin_dir`" | "The directory holding the config-weave guest binaries. See [Playbooks](guide_playbooks)." | "`~/.local/share/config-weave/bin`" |
       | "`workspace_max_file`" | "The workspace syncer's per-file size guard; a larger file is refused by name." | "`256MiB`" |
       | "`firmware_dir`" | "A UEFI firmware override, laid out `<dir>/<arch>/`. See the UEFI firmware section below." | "vmlab's bundled firmware" |
+      | "`btrfs_nocow`" | "Whether a machine's disk directory on btrfs gets NOCOW before its first disk. See Disks on btrfs below." | "`true`" |
   }
 
   p <<'DOC'
@@ -297,6 +298,36 @@ files. vmlab creates it `0700`, tightens an existing one, and refuses one
 owned by someone else. `VMLAB_WORK_DIR` relocates every lab's `.vmlab/` under
 one base, namespaced by lab name and a hash of its root, which keeps the
 write-heavy working data off a slow filesystem while the lab file stays put.
+DOC
+
+  h3 "Disks on btrfs"
+
+  p <<'DOC'
+A qcow2 on a copy-on-write btrfs gains a new extent with every guest write,
+and an online snapshot writes the guest's RAM into the same file. After a few
+snapshots of a busy guest the disk holds tens of thousands of extents, and
+each snapshot is slower than the last. When a machine's disk directory
+(`.vmlab/vms/<vm>/` or `.vmlab/containers/<name>/`) is on btrfs, the lab
+daemon therefore sets NOCOW (`chattr +C`) on that directory before it creates
+the first disk in it. `up` and `vm start` print one line when they set it, and
+`vmlab validate` prints what `up` will do:
+DOC
+
+  code text { source = <<'OUT'
+alp: /home/me/lab/.vmlab/vms/alp is on btrfs: set NOCOW (chattr +C) on it before creating disks, so they stay unfragmented under online snapshots; btrfs does not checksum or compress NOCOW files (`btrfs_nocow = false` in the host config opts out)
+OUT
+  }
+
+  p <<'DOC'
+btrfs honours NOCOW only on a file created after the flag is set, and vmlab
+never changes the attributes of a file that already exists. Disks already in
+the directory keep copy-on-write, and the line names them. To convert one, stop
+the machine and copy the disk within its directory:
+`cp --reflink=never disk0.qcow2 disk0.new && mv disk0.new disk0.qcow2`. A
+`destroy` followed by `up` also recreates the disks under the flag, but
+destroy deletes their snapshots too. NOCOW has a cost: btrfs keeps no data
+checksums for those files and does not compress them. Set `btrfs_nocow = false`
+to keep copy-on-write. On any other filesystem nothing changes.
 DOC
 
   h2 "WSL 2"
