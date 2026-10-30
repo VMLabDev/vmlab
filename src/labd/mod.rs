@@ -574,6 +574,7 @@ impl Handler<LabRequest> for LabdHandler {
                 // the internal pull in start is then a no-op.
                 let only = std::slice::from_ref(&machine);
                 streamed(lab, stream, |output| async move {
+                    lab.prepare_disk_dir(&only[0], Some(&output))?;
                     lab.ensure_pulled(only, Some(&output)).await
                 })
                 .await?;

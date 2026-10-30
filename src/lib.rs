@@ -16,6 +16,7 @@ mod lifecycle;
 pub mod logs;
 mod media;
 mod net;
+mod nocow;
 mod oci;
 pub mod paths;
 pub mod profiles;
