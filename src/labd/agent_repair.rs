@@ -640,9 +640,43 @@ pub fn decide(
     }
 }
 
+/// How a refresh ends that failed before its push began — while it waited
+/// for the agent to answer (§19.4), decided from the machine's power state
+/// once the wait gave up (ADR-0003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreached {
+    /// The machine is stopping or stopped: somebody stopped it, so nothing
+    /// was pushed and nothing went wrong. A quiet event, no `warning:`.
+    Stopped,
+    /// The machine is still up and its agent did not answer: a real failure.
+    Failed,
+}
+
+/// Classify a refresh that never reached its push. Starting counts as up:
+/// a wait does not give up on a machine still on its way.
+pub fn unreached(state: crate::status::PowerState) -> Unreached {
+    use crate::status::PowerState;
+    match state {
+        PowerState::Stopping | PowerState::Stopped => Unreached::Stopped,
+        PowerState::Starting | PowerState::Running | PowerState::Suspended => Unreached::Failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refresh whose machine stopped under it was stopped, not failed;
+    /// one whose machine is still up and never answered failed.
+    #[test]
+    fn a_refresh_cut_short_by_a_stop_is_not_a_failure() {
+        use crate::status::PowerState;
+        assert_eq!(unreached(PowerState::Stopping), Unreached::Stopped);
+        assert_eq!(unreached(PowerState::Stopped), Unreached::Stopped);
+        assert_eq!(unreached(PowerState::Running), Unreached::Failed);
+        assert_eq!(unreached(PowerState::Suspended), Unreached::Failed);
+        assert_eq!(unreached(PowerState::Starting), Unreached::Failed);
+    }
 
     /// A push sets a Windows guest's clock once the new agent answers — the
     /// boot it is running read the RTC as local time (#166) — when the clock
