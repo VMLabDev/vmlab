@@ -58,6 +58,9 @@ pub struct HostConfig {
     /// The hypervisor a machine that names none runs on, by kind (PRD §22,
     /// `host { hypervisor { … } }`). QEMU for both until a phase flips it.
     pub hypervisor: crate::config::hypervisor::HypervisorDefaults,
+    /// Set NOCOW on a machine's disk directory on btrfs before its disks
+    /// are created (PRD §7.1, `nocow.rs`); `false` keeps them copy-on-write.
+    pub btrfs_nocow: bool,
     /// The host GPUs (PRD §5.2), in declaration order: every host-specific
     /// GPU fact lives here, named, so a lab file names a GPU rather than a
     /// PCI address and stays portable between hosts.
@@ -148,6 +151,7 @@ impl Default for HostConfig {
             firmware_dir: None,
             vmlab_hv: None,
             hypervisor: Default::default(),
+            btrfs_nocow: true,
             gpus: Vec::new(),
         }
     }
@@ -214,6 +218,9 @@ impl HostConfig {
             cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
             cfg.firmware_dir = r.path("firmware_dir").unspan();
             cfg.vmlab_hv = r.path("vmlab_hv").unspan();
+            if let Some(v) = r.bool("btrfs_nocow").unspan() {
+                cfg.btrfs_nocow = v;
+            }
             for child in r.children().filter(|c| c.kind() == "hypervisor") {
                 use crate::config::hypervisor::HypervisorKind;
                 let mut h = Reader::new(&child, r.issues());
@@ -406,6 +413,7 @@ mod tests {
         assert_eq!(cfg.oci_chunk_size, 512 << 20);
         assert_eq!(cfg.workspace_max_file, DEFAULT_WORKSPACE_MAX_FILE);
         assert_eq!(cfg.firmware_dir, None);
+        assert!(cfg.btrfs_nocow);
         assert!(cfg.gpus.is_empty() && cfg.default_gpu().is_none());
     }
 
@@ -461,6 +469,7 @@ host {
   waypipe          = "/opt/waypipe/bin/waypipe"
   ffmpeg           = "/opt/ffmpeg/bin/ffmpeg"
   freerdp          = "/usr/bin/sdl-freerdp3"
+  btrfs_nocow      = false
 }
 "#,
             "<test>",
@@ -474,6 +483,7 @@ host {
         assert_eq!(cfg.oci_chunk_size, 128 << 20);
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
         assert_eq!(cfg.workspace_max_file, 2 << 30);
+        assert!(!cfg.btrfs_nocow);
         assert_eq!(cfg.firmware_dir.as_deref(), Some(Path::new("/opt/edk2")));
         assert_eq!(
             cfg.waypipe.as_deref(),
