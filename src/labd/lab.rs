@@ -1274,12 +1274,32 @@ impl LabRuntime {
     /// Boot one machine, whichever kind it is.
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
         self.settle_pending(name).await?;
+        self.prepare_disk_dir(name, None)?;
         self.clone_from_freeze(name).await?;
         // A download is the one long wait a start can make: outside the
         // gate, so a reload is not held up behind it (§7.1).
         self.ensure_pulled(&[name.to_string()], None).await?;
         let _gate = self.rebuild_gate.read().await;
         self.machine(name)?.start(self.services()).await
+    }
+
+    /// Set NOCOW on `name`'s disk directory when it is on btrfs, before the
+    /// first disk is made in it (PRD §7.1, `crate::nocow`), and say so
+    /// through `output` — the log when there is none. Silent once set, so a
+    /// caller that streams says it first and the boot after finds it done.
+    pub fn prepare_disk_dir(
+        &self,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
+        let m = self.machine(name)?;
+        if let Some(line) = crate::nocow::prepare(name, m.local_dir()) {
+            match output {
+                Some(output) => output(format!("{line}\n")),
+                None => tracing::info!("{line}"),
+            }
+        }
+        Ok(())
     }
 
     /// Build `name` from the main checkout's freeze when this daemon planned
@@ -1968,6 +1988,11 @@ impl LabRuntime {
                     plan.main_root.display()
                 ));
             }
+        }
+        // Before any disk exists to miss it: NOCOW reaches only files made
+        // after it is set (PRD §7.1).
+        for name in &targets {
+            self.prepare_disk_dir(name, Some(&output))?;
         }
         // Before anything downloads or boots, so the waves below see each
         // clone's first-boot marker and the pull its image pin.

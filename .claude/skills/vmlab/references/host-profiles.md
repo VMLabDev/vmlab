@@ -67,6 +67,7 @@ host {
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
   vmlab_hv             = "/opt/vmlab-hv/bin/vmlab-hv"
+  btrfs_nocow          = true
   hypervisor { container = "qemu" vm = "qemu" }
 }
 ```
@@ -89,6 +90,7 @@ host {
 | `workspace_max_file` | ByteSize | `256MiB` | Workspace syncer per-file size guard. A larger file is refused by name (see dev-machines.md). |
 | `vmlab_hv` | utf8 | `vmlab-hv` on PATH | The vmlab-hv binary machines on `hypervisor = "vmlab"` run (PRD §22). |
 | `hypervisor {}` | child | `qemu` for both | Default hypervisor per machine kind, `container` and `vm`, each `qemu` or `vmlab`; a machine's own `hypervisor` wins. |
+| `btrfs_nocow` | bool | `true` | On btrfs, the lab daemon sets NOCOW (`chattr +C`) on a machine's disk directory (`.vmlab/vms/<vm>/`, `.vmlab/containers/<name>/`) before its first disk, at `up`, `vm start` or a freeze clone, and prints one line; `validate` prints what `up` will do. Only files created afterwards inherit it, and existing files are never touched, so older disks stay copy-on-write and are named in the line. NOCOW files lose btrfs checksums and compression. `false` keeps copy-on-write. Ignored off btrfs. |
 | `firmware_dir` | utf8 | none | UEFI firmware override, `<dir>/<arch>/` with the bundled set's file names; searched before vmlab's bundled firmware and the host's (see "UEFI firmware" below). |
 
 Parser rules, all violations reported in one pass:

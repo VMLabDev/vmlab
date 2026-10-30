@@ -64,6 +64,7 @@ host {
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
   vmlab_hv             = "/opt/vmlab-hv/bin/vmlab-hv"
+  btrfs_nocow          = true
   hypervisor {
     container = "qemu"
     vm        = "qemu"
@@ -90,6 +91,7 @@ SRC
       | "`workspace_max_file`" | "ByteSize" | "`256MiB`" | "Workspace syncer per-file size guard. A larger file is refused by name." |
       | "`firmware_dir`" | "utf8" | "none" | "UEFI firmware override, laid out `<dir>/<arch>/` with the bundled set's file names. Searched before vmlab's bundled firmware and the host's." |
       | "`vmlab_hv`" | "utf8" | "`vmlab-hv` on PATH" | "The vmlab-hv binary that machines on `hypervisor = \"vmlab\"` run. `up` checks that it exists before it starts anything." |
+      | "`btrfs_nocow`" | "bool" | "`true`" | "On btrfs, set NOCOW (`chattr +C`) on each machine's disk directory before its first disk is created, so online snapshots do not fragment the disks. NOCOW files have no btrfs checksums or compression. `false` keeps them copy-on-write. Ignored on other filesystems." |
       | "`hypervisor {}`" | "child" | "`qemu` for both" | "The hypervisor a machine runs on when it does not name one, by machine kind: `container` and `vm`, each `qemu` or `vmlab`. Keyed by kind because vmlab-hv takes machines over one phase at a time. A machine's own `hypervisor` wins." |
   }
   p "The parser enforces these rules, and reports every violation in one pass:"
