@@ -3,7 +3,7 @@ page cmd_vm {
   chapter_header "vmlab vm" {
     kicker       = "Commands · reference"
     reading_time = "10 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -45,6 +45,15 @@ page cmd_vm {
   DOC
 
   p <<DOC
+    A running template build's VM is the reference
+    `build-<arch>-<name>/build`. `screenshot`, `sendkeys`, `mouse-move`,
+    `click`, `drag`, `ocr` and `find-image` work on it while the build runs.
+    `start`, `stop`, `restart` and `destroy` fail with `unsupported` (6),
+    because the build owns the VM's power (see
+    [vmlab template](cmd_template)).
+  DOC
+
+  p <<DOC
     The power subcommands and `ip` accept a container name too and behave the
     same; [vmlab container](cmd_container) is the same request under the other
     noun. The display subcommands need a framebuffer, which a container never
@@ -69,12 +78,22 @@ page cmd_vm {
     no provision scripts, no playbooks. Any deferred download the VM needs
     runs first with progress on the terminal, then the host binaries are
     checked, then the VM boots. A VM whose clone does not exist yet gets one
-    created from its template, and its first-boot script runs before it
-    reports ready, exactly as under [vmlab up](cmd_up). A VM that is already
+    created from its template. A VM that is already
     running is left alone. A `suspended` VM, one whose guest put itself to
     sleep, is woken with QMP `system_wakeup` instead: no second QEMU, no
     agent refresh, and the verb returns once the guest runs again, emitting
-    `vm.woken` with `cause = start`. Nothing is printed on success.
+    `vm.woken` with `cause = start`. Otherwise the verb returns once the VM
+    has booted, without waiting for its agent, and prints nothing on success.
+  DOC
+
+  p <<DOC
+    A clone that has not finished its template's first-boot script runs it
+    here, exactly as under [vmlab up](cmd_up): the script, then any agent
+    refresh, then readiness. That is a new clone, or one whose
+    `.vmlab/vms/<vm>/firstboot.done` is missing because an earlier first boot
+    failed or the file was deleted. The verb prints the script's output and
+    returns once the VM is ready, or fails with the script's error and leaves
+    the VM running for inspection. `vm restart` does the same.
   DOC
 
   p <<DOC
@@ -152,7 +171,8 @@ page cmd_vm {
   p <<DOC
     Stops the VM through the graceful ladder, waits up to 60 seconds for it
     to settle as stopped, and boots it again. The clone is kept, so the guest
-    comes back with its disk state and no first-boot script. Port forwards
+    comes back with its disk state, and runs its first-boot script only if
+    the clone has not finished one (see `vm start`). Port forwards
     that target the VM are re-installed by the daemon when it gets a new
     lease. A VM that does not settle in time fails with `<name> did not stop
     for restart`.
@@ -303,6 +323,8 @@ page cmd_vm {
       | "Option" | "Meaning" |
       | "`<VM>`" | "The VM, as `[lab/]name`." |
       | "`--region <X> <Y> <W> <H>`" | "Restrict to a region: x y w h." |
+      | "`--scale <SCALE>`" | "Upscale the frame this many times before reading it, 1 to 4. Default 3; 1 reads it at its own size." |
+      | "`--layout <LAYOUT>`" | "Page segmentation: `block` (one block of text: consoles, dialogs), `sparse` (scattered text: desktops, lock screens), `line` (one line), `auto` (tesseract's page analysis). Default `block`." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -310,7 +332,8 @@ page cmd_vm {
     Runs OCR over the current screen, or over the rectangle `--region`
     names, and prints the recognised text followed by a newline. The four
     region values are separate arguments; negative values are clamped to 0.
-    The recogniser and its limits are described in
+    A scale outside 1 to 4 or an unknown layout is refused before any daemon
+    is contacted. The recogniser, its options and its limits are described in
     [Screens, input and vision](guide_vision).
   DOC
 
@@ -351,6 +374,7 @@ SRC
 vmlab vm sendkeys client01 ctrl-alt-delete
 vmlab vm screenshot client01 /tmp/login.png
 vmlab vm ocr client01 --region 0 400 1024 200
+vmlab vm ocr client01 --layout sparse
 SRC
   }
 

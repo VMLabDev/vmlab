@@ -172,21 +172,55 @@ DOC
   p <<'DOC'
 `m.ocr()` returns the text on screen and `m.ocr_region([x, y, w, h])` the
 text in one region, both as tesseract's output verbatim, trailing whitespace
-included. vmlab drives the `tesseract` binary as a subprocess with page
-segmentation mode 6, which assumes one uniform block of text and suits console
-and dialog screenshots. If the binary is not on `PATH` the call fails with a
-message telling you to install tesseract-ocr. A region whose origin lies
-outside the image is an error; a region that runs past the edge is clipped.
+included. vmlab drives the `tesseract` binary as a subprocess. Before
+tesseract reads the frame, vmlab turns it to greyscale and enlarges it three
+times with a smoothing filter. Tesseract is trained on text much larger than a
+console's 8x16 cell, so without the enlargement it misreads console fonts: it
+reads OpenCore's boot menu as "Dperating Systen" and drops a lone `-bash-3.2#`
+prompt. Light text on a dark background needs no extra step, because tesseract
+inverts each line it finds. A frame larger than 1280x800 is enlarged less, so
+a 4K display does not cost more than the default. If the binary is not on
+`PATH` the call fails with a message telling you to install tesseract-ocr. A
+region whose origin lies outside the image is an error; a region that runs
+past the edge is clipped.
+DOC
+
+  p <<'DOC'
+`m.ocr_opts(opts)` takes the same choices as a map of strings: `region`
+(`"x,y,w,h"`), `scale` (1 to 4, default 3) and `layout`. The layout sets
+tesseract's page segmentation mode:
+DOC
+
+  table {
+    rows:
+      | "`layout`" | "Page segmentation" | "Suits" |
+      | "`block` (default)" | "One uniform block of text (mode 6). Lines come back in order." | "Consoles, terminals, dialogs." |
+      | "`sparse`" | "Scattered text in no order (mode 11)." | "Desktops, lock screens, menus laid out in columns." |
+      | "`line`" | "A single line (mode 7)." | "A region cropped to one line." |
+      | "`auto`" | "Tesseract's own page analysis (mode 3)." | "Columns and paragraphs." |
+  }
+
+  p <<'DOC'
+`scale` trades time for accuracy. A full 1280x800 frame takes about 450 ms to
+read at the default and about 180 ms at `"1"`, which reads the frame at its
+own size and suits large text. `"4"` helps the smallest fonts. `vmlab vm ocr`
+takes the same choices as `--scale` and `--layout`.
 DOC
 
   p <<'DOC'
 `m.wait_for_text(pattern, timeout_secs)` grabs the screen once a second, runs
-OCR over the whole of it and returns as soon as the regex matches. The
+OCR over the whole of it and returns as soon as the regex matches.
+`m.wait_for_text_opts(pattern, timeout_secs, opts)` reads each grab the way
+`ocr_opts` does; a region makes each attempt faster and keeps the rest of the
+screen from matching. The
 returned `Match` carries the matched text in `text` and zero for the position
 fields, because OCR does not report where on screen it read a line. OCR is
-fuzzy: different tesseract versions read edge glyphs differently, so match a
+fuzzy: different tesseract versions read edge glyphs differently, and a VGA
+text console's `w` and `~` still come back as `u` and `™`, so match a
 distinctive word rather than a whole sentence, and prefer image matching where
-you can crop a stable reference.
+you can crop a stable reference. Text over a photograph, such as the macOS
+login window, defeats tesseract at any scale; read it with image matching
+instead.
 DOC
 
   h2 "Choosing between them"

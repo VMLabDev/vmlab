@@ -1341,8 +1341,12 @@ pub fn cmd_machine_power(
             PowerOp::Stop => (lab_client_for(lab).await?.1, Vec::new()),
         };
         let started = super::record::finished_line(&record);
+        // Streamed: a start reports its pull, and a start or restart the
+        // first boot it runs for a clone that still owes one (§6.1).
         client
-            .send(op.request(machine.clone(), force, record))
+            .send_streaming(op.request(machine.clone(), force, record), |chunk| {
+                print!("{chunk}")
+            })
             .await
             .map_err(remote)?;
         // A pending machine that has just booted booted on the new file.
@@ -1713,8 +1717,20 @@ pub fn cmd_vm_drag(vm_ref: &str, x1: i64, y1: i64, x2: i64, y2: i64) -> Result<(
     })
 }
 
-pub fn cmd_vm_ocr(vm_ref: &str, region: Option<Vec<i64>>) -> Result<()> {
+pub fn cmd_vm_ocr(
+    vm_ref: &str,
+    region: Option<Vec<i64>>,
+    scale: Option<u32>,
+    layout: Option<&str>,
+) -> Result<()> {
     let region = region_value(region)?;
+    let options = crate::vision::OcrOptions {
+        scale,
+        layout: layout
+            .map(str::parse::<crate::vision::Layout>)
+            .transpose()
+            .map_err(|e| anyhow!(e))?,
+    };
     rt()?.block_on(async {
         let (lab, vm) = split_vm_ref(vm_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
@@ -1722,6 +1738,7 @@ pub fn cmd_vm_ocr(vm_ref: &str, region: Option<Vec<i64>>) -> Result<()> {
             .send(LabRequest::MachineOcr {
                 machine: vm,
                 region,
+                options,
             })
             .await
             .map_err(remote)?;

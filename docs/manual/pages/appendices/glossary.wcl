@@ -6,7 +6,7 @@ page apx_glossary {
   chapter_header "Glossary" {
     kicker       = "Appendices · reference"
     reading_time = "8 min read"
-    updated      = "2026-10-30"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -36,6 +36,7 @@ page apx_glossary {
       | "halt" | "The state a workspace enters when a sync pass finds a path changed on both sides. The whole workspace stops, both directions, on that one machine; nothing is written or deleted. Resolved from the host with the `vmlab dev sync` verbs. See [Dev machines and the workspace syncer](guide_dev)." |
       | "handler" | "An `on \"<event>\" { run = … }` block in the lab file that runs a wscript when the named event fires. See [Events and handlers](guide_events)." |
       | "host config" | "`vmlab-host.wcl`, the per-user file that sets host-wide values: the store location, the viewer command, the fast path mode, the trunk port and PSK. See [Host configuration and WSL 2](guide_host) and the [Host configuration file](ref_host) reference." |
+      | "hypervisor" | "The program that runs a machine: QEMU, or vmlab-hv. A machine names it with `hypervisor`, else takes the host config's default for its kind from `host { hypervisor {} }`. Not hardware: it never resolves through a template or a profile. See [Host configuration and WSL 2](guide_host) and the [Host configuration file](ref_host) reference." |
       | "instance" | "A lab file run under the effective name `<declared>-<instance>` instead of its declared name, so one lab file can run from two directories at once. Chosen by `--instance`, then `VMLAB_INSTANCE`, then the name of the linked git worktree the lab is in; an empty value means none. Every name-keyed resource follows the effective name. See [How vmlab runs a lab](guide_architecture)." |
       | "lab" | "One `lab \"<name>\" {}` in a `vmlab.wcl`: a set of machines and segments brought up and torn down together. The name it runs under, the declared one or an instance's, is its host-global identity. See [The lab file](guide_lab_file)." |
       | "lab container" | "A `container {}` in a lab: an OCI image pulled like a docker image and run inside a micro-VM, so it is a lab machine in every respect. See [Lab containers](guide_containers)." |
@@ -48,7 +49,7 @@ page apx_glossary {
       | "machine" | "A VM or a lab container. Every verb that takes a machine name accepts either kind. See [How vmlab runs a lab](guide_architecture)." |
       | "marker file" | "`.vmlab-sync-halt`, the file the syncer writes at the guest's workspace root when the workspace halts, and removes when the halt clears. It is the only signal the guest side receives. See [Dev machines and the workspace syncer](guide_dev)." |
       | "media" | "A `media {}` block: a host folder packed into an ISO or floppy image and attached to a machine, cached by content. See [Lab file: vm and its children](ref_vm)." |
-      | "micro-VM" | "The minimal QEMU guest a lab container runs in: vmlab's own kernel and initramfs, with `vmlab-cinit` as PID 1, booting the image's flattened root filesystem. See [Lab containers](guide_containers)." |
+      | "micro-VM" | "The minimal guest a lab container runs in, on QEMU or vmlab-hv: vmlab's own kernel and initramfs, with `vmlab-cinit` as PID 1, booting the image's flattened root filesystem. See [Lab containers](guide_containers)." |
       | "OCI artifact" | "The form a template takes on a registry: a multi-layer, multi-arch OCI package whose tags are the template's versions. See [Distributing templates over registries](guide_registries)." |
       | "playbook" | "A `playbook {}` block that runs a config-weave playbook inside the guest, as the machine identity. It has no login rung; anything that must land as a user belongs in a provision. See [Playbooks](guide_playbooks)." |
       | "profile" | "A guest OS profile: WCL data naming the firmware, devices, agent install route and defaults for a family of guests, such as `linux-modern` or `windows-server`. Shipped with vmlab and overridable. See [Guest OS profiles](guide_profiles)." |
@@ -71,6 +72,7 @@ page apx_glossary {
       | "variant" | "A named, sealed disk state of a template version, stored as a qcow2 overlay on its base and selected with `#<name>`. A reference without `#` selects the default variant. Not a snapshot. See [Templates](guide_templates)." |
       | "viewer" | "The VNC client `vmlab up` opens for a machine with `gui = true` and `vmlab console` opens on demand. Chosen from host config, else found on `PATH`. See [Screens, input and vision](guide_vision)." |
       | "VM" | "A `vm {}` in a lab: a QEMU guest booted from a linked clone of a template, or from a blank disk when scratch. See [Lab file: vm and its children](ref_vm)." |
+      | "vmlab-hv" | "vmlab's own hypervisor, which runs one process per machine in place of QEMU, under KVM only. It takes machines over one phase at a time and runs container micro-VMs today; a VM on it is refused. Selected with `hypervisor = \"vmlab\"`. See [Host configuration and WSL 2](guide_host)." |
       | "watchdog" | "A supervisor check that fires an event on a host condition, such as `host.disk_low` when the filesystem under the store or a lab's clones passes the configured threshold. See [Events and handlers](guide_events)." |
       | "workspace" | "The host directory `@dev(workspace = …)` names, mirrored into a dev machine as a guest-local copy of that canonical host tree. The host copy is what survives `destroy`. See [Dev machines and the workspace syncer](guide_dev)." |
       | "worktree isolation" | "The rules a freeze turns on for the main lab and every worktree lab built on it: NAT refuses every new flow to the host, port forwards bind `127.0.0.1`, and a worktree lab's global segments join `<segment>@<worktree>`. Shown by `vmlab status`. See [Worktree labs](guide_worktrees)." |

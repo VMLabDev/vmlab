@@ -3,7 +3,7 @@ page ref_events {
   chapter_header "Events" {
     kicker       = "Appendices · reference"
     reading_time = "12 min read"
-    updated      = "2026-10-30"
+    updated      = "2026-10-31"
     version      = "vmlab 0.35"
   }
 
@@ -70,7 +70,7 @@ SRC
       | "`container.unhealthy`" | "`container`" | "The container's healthcheck reported not healthy." |
       | "`container.destroyed`" | "`container`" | "`vmlab container destroy` removed everything the container materialised." |
       | "`machine.agent_repaired`" | "`vm`, `machine`, `agent_version`" | "`vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template." |
-      | "`machine.agent_updated`" | "`vm`, `machine`, `from`, `to`, `ok`, `error`" | "`vmlab up` or `vmlab vm start` found the VM's agent stamp differing from the shipped agent and pushed it. With `ok = true` the machine is now diverged; with `ok = false`, `error` says why the push failed and the old agent is still in place. `from` is null when the agent never answered." |
+      | "`machine.agent_updated`" | "`vm`, `machine`, `from`, `to`, `ok`, `error`" | "`vmlab up` or `vmlab vm start` found the VM's agent stamp differing from the shipped agent and pushed it. With `ok = true` the machine is now diverged; with `ok = false`, `error` says why the push failed and the old agent is still in place. `from` is null when the agent never answered. `stopped = true` (with `ok = false`) means the machine was stopped while the refresh still waited for its agent: nothing was pushed, and `up` printed no warning." |
       | "`machine.clock_drift`" | "`vm`, `machine`, `drift_ms`, `guest`, `host`, `corrected`, `error`" | "A fresh agent handshake found the guest clock more than 2 s from the host's, on a machine whose `clock` is `host`, and set it. `drift_ms` is guest minus host (positive when the guest is ahead); `guest` and `host` are the two times, RFC 3339. With `corrected = false`, `error` says why the guest refused. See [Snapshots](guide_snapshots)." |
       | "`machine.clock_unchecked`" | "`vm`, `machine`, `reason`" | "The machine's `clock` is `host` but its agent cannot report the guest clock (no `get_time` feature), so a clock wrong after a reboot is not corrected. Emitted once per start." |
       | "`share.unmountable`" | "`vm`, `share`, `reason`" | "The mount plan holds a share this guest cannot mount, or a mount step still failed when its retries ran out (`share` is set then). See [Shared folders](guide_shares)." |
@@ -171,7 +171,7 @@ SRC
     rows:
       | "Event" | "Payload fields" | "When" |
       | "`template.op.start`" | "base; `version` for a push" | "A build or push was admitted." |
-      | "`template.op.console`" | "base" | "The build VM's console socket is available." |
+      | "`template.op.console`" | "base, `machine`" | "The build VM became reachable by the machine verbs, with `machine` its `<lab>/<vm>` reference, or stopped being reachable, with `machine` null." |
       | "`template.op.step`" | "base, `event`, `data`" | "The build's synthetic lab emitted a `playbook.*` event, forwarded with its name and payload inside." |
       | "`template.op.log`" | "base, `line`" | "One non-blank output line from a build or push." |
       | "`template.op.done`" | "base, `version`" | "The build sealed that version, or the push completed." |

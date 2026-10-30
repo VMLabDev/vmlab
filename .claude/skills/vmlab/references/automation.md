@@ -268,7 +268,7 @@ status and `exit_code` the container's.
 | `container.unhealthy` | `container` | The container's healthcheck reported not healthy. |
 | `container.destroyed` | `container` | `vmlab container destroy` removed everything the container materialised. |
 | `machine.agent_repaired` | `vm`, `machine`, `agent_version` | `vmlab machine repair-agent` pushed the host's agent; the machine is now diverged from its template. |
-| `machine.agent_updated` | `vm`, `machine`, `from`, `to`, `ok`, `error` | `vmlab up` or `vmlab vm start` found the VM's agent stamp differing from the shipped agent and pushed it. With `ok = true` the machine is now diverged; with `ok = false`, `error` says why the push failed and the old agent is still in place. `from` is null when the agent never answered. |
+| `machine.agent_updated` | `vm`, `machine`, `from`, `to`, `ok`, `error` | `vmlab up` or `vmlab vm start` found the VM's agent stamp differing from the shipped agent and pushed it. With `ok = true` the machine is now diverged; with `ok = false`, `error` says why the push failed and the old agent is still in place. `from` is null when the agent never answered. `stopped = true` (with `ok = false`) means the machine was stopped while the refresh still waited for its agent: nothing was pushed, and no warning was printed. |
 | `share.unmountable` | `vm`, `share`, `reason` | The mount plan holds a share this guest cannot mount, or a mount step still failed when its retries ran out (`share` is set then). See shares-media.md. |
 
 ### Snapshots
@@ -438,12 +438,18 @@ variable name that is not a WCL identifier and a name set twice on one block.
 prints `***` in place of the value in everything it emits for the run — the CLI
 stream, the lab log, `playbook.op.*` events, the run report, errors and `vmlab
 playbook list` — catching it as written and as config-weave prints it once
-evaluated. The run's `variables:` line names variables only, never values. No
-variable is ever on the guest command line: the variables file is written for
-each run into `<dir>/vars` (`0700`, the file `0600`; SYSTEM and Administrators
-only on Windows) and removed when the run ends, timed out or not. config-weave
-does not know which variables are secret, so its own `--log-file` and anything
-a step writes in the guest can still hold the value.
+evaluated. The run's `variables:` line names variables only, never values.
+Secret values also go in their own file, passed as `--secret-var-file`, so
+config-weave scrubs them from everything it writes itself, `--log-file`
+included. A binary older than config-weave 0.12.2 lacks the flag; vmlab
+decides once per run from the `version` probe it already makes (else from
+`--help`). An older binary gets every variable in the one `--var-file`, and the
+run prints one line naming the release needed. No variable is ever on the guest
+command line: the variables files are written for each run into `<dir>/vars`
+(`0700`, each file `0600`; SYSTEM and Administrators only on Windows) and
+removed when the run ends, timed out or not. config-weave does not mask a value
+shorter than four characters (vmlab still does, in what it relays), and nothing
+masks one a step writes into a guest file.
 
 ### Where the binary comes from
 
@@ -515,7 +521,9 @@ for the machine's agent, then does five things in order.
    fast edit-then-run loop is the point of always pushing.
 4. **Run the verb.** The guest command is
    `config-weave check|apply <dir> <play> --json --events-ndjson` plus
-   `--var-file <dir>/vars/vars.wcl` when the block has variables. Progress events arrive on stderr as JSON lines and are
+   `--var-file <dir>/vars/vars.wcl` when the block has variables, and
+   `--secret-var-file <dir>/vars/secret-vars.wcl` when it has secret ones and
+   the binary takes the flag. Progress events arrive on stderr as JSON lines and are
    rendered into human lines on the CLI stream and the lab log; the final
    `--json` report on stdout is parsed and attached to the completion event.
 5. **Report the verdict.** Infrastructure failures, a push that will not land or

@@ -6,7 +6,9 @@
 //! pre-seeded from the source, so it reuses the entire lab runtime
 //! (lifecycle, networking, the wscript build scripts). The build runs
 //! in-process — no daemon — and seals by flattening the working disk into
-//! the store.
+//! the store. While it runs, that lab's control socket is served for
+//! inspection and input ([`crate::labd::build_lab`]), so the machine verbs
+//! reach the build VM by its [`BuildMachine`] reference.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,8 +25,33 @@ use crate::labd::machine::Machine;
 use crate::qemu::resolve::KeyStore;
 use crate::scripting::OutputSink;
 
-/// Called once the build VM's VNC socket is accepting connections.
-pub type ConsoleReady = Arc<dyn Fn(PathBuf) + Send + Sync>;
+/// A build VM as the machine verbs address it, `<lab>/<vm>` (PRD §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildMachine {
+    pub lab: String,
+    pub vm: String,
+}
+
+impl BuildMachine {
+    /// The `[lab/]vm` reference `vmlab vm screenshot` and its kin take.
+    pub fn reference(&self) -> String {
+        format!("{}/{}", self.lab, self.vm)
+    }
+
+    /// The log line a build prints once its VM can be inspected: the
+    /// reference, and the verbs that reach it.
+    fn announcement(&self) -> String {
+        let r = self.reference();
+        format!(
+            "build VM is `{r}`: `vmlab vm screenshot {r} <file.png>`, \
+             `vmlab console {r}`, `vmlab vm sendkeys {r} <chord>`\n"
+        )
+    }
+}
+
+/// Called with the build VM once its display is up and its lab's socket is
+/// served, and with `None` once neither is any longer.
+pub type Inspectable = Arc<dyn Fn(Option<&BuildMachine>) + Send + Sync>;
 
 /// Called for every structured event the synthetic build lab emits whose
 /// kind starts with `playbook.` — the config-weave step stream (§10.4). The
@@ -61,7 +88,7 @@ pub struct BuildTarget<'a> {
 /// Optional controls supplied by an interactive build caller.
 #[derive(Default)]
 pub struct BuildControl {
-    pub console_ready: Option<ConsoleReady>,
+    pub inspectable: Option<Inspectable>,
     pub on_event: Option<BuildEvent>,
     pub on_variant: Option<VariantStarted>,
     pub in_use: Option<InUse>,
@@ -505,7 +532,7 @@ async fn build_variant(
                         &machine,
                         wants_agent,
                         staged.as_deref(),
-                        std::time::Duration::from_secs(600),
+                        Some(std::time::Duration::from_secs(600)),
                         &log,
                     )
                     .await?;
@@ -533,25 +560,11 @@ async fn build_variant(
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
     }
-    let console_watch = control.console_ready.clone().map(|ready| {
-        let sock = vm.dirs.vnc_sock();
-        tokio::spawn(async move {
-            loop {
-                if sock.exists() {
-                    ready(sock);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        })
-    });
+    let inspection = Inspection::open(&runtime, &vm, control.inspectable.clone(), log).await?;
     let up_result = tokio::select! {
         result = runtime.up(&[], log.clone()) => Some(result),
         () = control.cancel.cancelled() => None,
     };
-    if let Some(watch) = console_watch {
-        watch.abort();
-    }
     let sealed = async {
         match up_result {
             Some(result) => result.context("variant build boot/provision failed")?,
@@ -576,6 +589,7 @@ async fn build_variant(
         bail!("build cancelled");
     }
     let events = runtime.events.clone();
+    drop(inspection);
     drop(runtime);
 
     // The overlay was written against the base by its absolute path; the
@@ -787,6 +801,76 @@ async fn list_registry_versions(repo: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// A build lab served for inspection (PRD §6.1): its control socket bound,
+/// and a watch that announces the VM once QEMU's display socket exists.
+/// Dropping it closes the socket and tells the caller the VM is gone.
+struct Inspection {
+    _server: Option<crate::labd::build_lab::BuildLabServer>,
+    watch: tokio::task::JoinHandle<()>,
+    announced: Arc<std::sync::atomic::AtomicBool>,
+    inspectable: Option<Inspectable>,
+}
+
+impl Inspection {
+    /// Serve `runtime`'s lab and watch for `vm`'s display. A build whose lab
+    /// name a running daemon already holds is not inspectable by name, and
+    /// says so rather than taking the socket from that lab.
+    async fn open(
+        runtime: &Arc<crate::labd::lab::LabRuntime>,
+        vm: &crate::labd::vm::VmInstance,
+        inspectable: Option<Inspectable>,
+        log: &OutputSink,
+    ) -> Result<Self> {
+        let machine = BuildMachine {
+            lab: runtime.config().lab.name.clone(),
+            vm: vm.name().to_string(),
+        };
+        let server = crate::labd::build_lab::serve(runtime).await?;
+        let announced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sock = vm.dirs.vnc_sock();
+        let watch = {
+            let (announced, inspectable, log) =
+                (announced.clone(), inspectable.clone(), log.clone());
+            let served = server.is_some();
+            tokio::spawn(async move {
+                while !sock.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if !served {
+                    log(format!(
+                        "lab `{}` is already running under its own daemon, so this build's \
+                         VM cannot be inspected by name\n",
+                        machine.lab
+                    ));
+                    return;
+                }
+                log(machine.announcement());
+                announced.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(ready) = &inspectable {
+                    ready(Some(&machine));
+                }
+            })
+        };
+        Ok(Self {
+            _server: server,
+            watch,
+            announced,
+            inspectable,
+        })
+    }
+}
+
+impl Drop for Inspection {
+    fn drop(&mut self) {
+        self.watch.abort();
+        if self.announced.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(gone) = &self.inspectable
+        {
+            gone(None);
+        }
+    }
+}
+
 struct WorkdirGuard(PathBuf);
 impl Drop for WorkdirGuard {
     fn drop(&mut self) {
@@ -952,20 +1036,15 @@ async fn run_build(
         def.source,
         TemplateSource::Iso(_) | TemplateSource::Scratch { .. }
     );
-    let verify_task: Option<tokio::task::JoinHandle<Result<Option<String>>>> = if verify_concurrent
-    {
+    let verify_task: Option<AbortOnDrop<Result<Option<String>>>> = if verify_concurrent {
         let vm = vm.clone();
         let wants_agent = def.agent;
         let staged = staged.clone();
         let out = log.clone();
-        Some(tokio::spawn(async move {
-            // Wait for `up` to actually start the VM, capped so a build that
-            // dies before boot doesn't strand this task.
-            let started = tokio::time::Instant::now();
+        // No deadline of its own: the provisions are the installer, and they
+        // bound this wait. The build's deadline starts when they return.
+        Some(AbortOnDrop(tokio::spawn(async move {
             while vm.state().await == crate::labd::vm::PowerState::Stopped {
-                if started.elapsed() > std::time::Duration::from_secs(600) {
-                    bail!("build VM never started");
-                }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             let log = move |s: String| out(s);
@@ -973,11 +1052,11 @@ async fn run_build(
                 &(vm.clone() as Arc<dyn Machine>),
                 wants_agent,
                 staged.as_deref(),
-                std::time::Duration::from_secs(3600),
+                None,
                 &log,
             )
             .await
-        }))
+        })))
     } else {
         let wants_agent = def.agent;
         let staged = staged.clone();
@@ -992,7 +1071,7 @@ async fn run_build(
                         &machine,
                         wants_agent,
                         staged.as_deref(),
-                        std::time::Duration::from_secs(600),
+                        Some(std::time::Duration::from_secs(600)),
                         &log,
                     )
                     .await?;
@@ -1056,25 +1135,11 @@ async fn run_build(
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
     }
-    let console_watch = run.control.console_ready.clone().map(|ready| {
-        let sock = vm.dirs.vnc_sock();
-        tokio::spawn(async move {
-            loop {
-                if sock.exists() {
-                    ready(sock);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        })
-    });
+    let inspection = Inspection::open(&runtime, &vm, run.control.inspectable.clone(), log).await?;
     let up_result = tokio::select! {
         result = runtime.up(&[], log.clone()) => Some(result),
         () = run.control.cancel.cancelled() => None,
     };
-    if let Some(watch) = console_watch {
-        watch.abort();
-    }
     // Through graceful shutdown as one fallible step: a failed boot,
     // provision or seal must stop the build VM (QEMU/swtpm outlive the CLI
     // otherwise), not just delete its workdir.
@@ -1084,57 +1149,31 @@ async fn run_build(
             None => bail!("build cancelled"),
         }
         // In a live-handshake build (Windows FirstLogonCommands run while
-        // the VM is still up) the concurrent verify finished minutes ago —
-        // give a near-complete one a short grace. An installer that powered
-        // the VM off from a throwaway live session (subiquity) can never
-        // complete it: the agent is installed into the target but has not
-        // run yet, so abort and boot the installed system for verification
-        // below.
+        // the VM is still up) the background wait finished minutes ago, or
+        // finishes within the grace below. An installer that powered the VM
+        // off from a throwaway live session (subiquity) can never complete
+        // it: the agent is installed into the target but has not run yet, so
+        // boot the installed system for verification below.
         let mut verify_boot = false;
-        if let Some(task) = verify_task {
-            let grace = if vm.state().await == crate::labd::vm::PowerState::Stopped {
-                std::time::Duration::ZERO
-            } else {
-                std::time::Duration::from_secs(60)
-            };
-            let abort = task.abort_handle();
-            match tokio::time::timeout(grace, task).await {
+        if let Some(mut task) = verify_task {
+            let stopped = vm.state().await == crate::labd::vm::PowerState::Stopped;
+            let waited = match tokio::time::timeout(post_provision_grace(stopped), &mut task.0)
+                .await
+            {
                 Ok(joined) => {
-                    let waited =
-                        joined.map_err(|e| anyhow::anyhow!("agent verify task panicked: {e}"))?;
-                    let version = match waited {
-                        Ok(version) => version,
-                        // The background wait has a fixed deadline from boot,
-                        // and a provision that installs the OS can outlast it:
-                        // Windows 9x Setup takes about two hours on a loaded
-                        // host. The provisions are done now, so an agent they
-                        // installed answers at once; only a VM that is still
-                        // up can be asked.
-                        Err(e) if vm.state().await != crate::labd::vm::PowerState::Stopped => {
-                            log(format!(
-                                "agent: the background wait gave up ({e:#}); verifying again now that the provisions are done\n"
-                            ));
-                            let vlog = {
-                                let out = log.clone();
-                                move |s: String| out(s)
-                            };
-                            super::agent_install::verify(
-                                &(vm.clone() as Arc<dyn Machine>),
-                                wants_agent,
-                                staged.as_deref(),
-                                std::time::Duration::from_secs(120),
-                                &vlog,
-                            )
-                            .await?
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    match joined.map_err(|e| anyhow::anyhow!("agent verify task panicked: {e}"))? {
+                        Ok(version) => BackgroundWait::Answered(version),
+                        Err(e) => BackgroundWait::Failed(e),
+                    }
+                }
+                Err(_) => BackgroundWait::Pending,
+            };
+            match settle_background_wait(waited, wants_agent) {
+                AgentSettle::Verified(version) => {
                     *agent_version.lock().expect("agent_version lock") = version;
                 }
-                Err(_) => {
-                    abort.abort();
-                    verify_boot = wants_agent;
-                }
+                AgentSettle::VerificationBoot => verify_boot = true,
+                AgentSettle::Fail(e) => return Err(e),
             }
         }
         log("sealing: graceful shutdown\n".to_string());
@@ -1161,6 +1200,7 @@ async fn run_build(
     // Free the build runtime's sockets/watchers before any verification
     // boot reuses the same lab dirs; keep the event log for the final emit.
     let events = runtime.events.clone();
+    drop(inspection);
     drop(runtime);
 
     // Boot the installed system once — same workdir and disk, no installer
@@ -1182,6 +1222,8 @@ async fn run_build(
         )
         .await?;
         let vm2 = runtime2.vm(build_vm)?;
+        let _inspection =
+            Inspection::open(&runtime2, &vm2, run.control.inspectable.clone(), log).await?;
         let verified = async {
             let up = tokio::select! {
                 result = runtime2.up(&[], log.clone()) => Some(result),
@@ -1199,7 +1241,7 @@ async fn run_build(
                 &(vm2.clone() as Arc<dyn Machine>),
                 def.agent,
                 staged.as_deref(),
-                std::time::Duration::from_secs(900),
+                Some(VERIFICATION_BOOT_AGENT_WAIT),
                 &vlog,
             )
             .await?;
@@ -1560,6 +1602,73 @@ fn resolve_layered_source(
         .map_err(anyhow::Error::msg)?;
     }
     Ok(Some(resolved))
+}
+
+/// How long an installer-driven build still listens for the agent once its
+/// provisions have returned with the VM up: an agent they installed answers
+/// within it, the legacy tier's slow handshake included.
+const POST_PROVISION_AGENT_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the verification boot waits for the installed system's agent.
+const VERIFICATION_BOOT_AGENT_WAIT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// A spawned task aborted when its handle is dropped. The background agent
+/// wait has no deadline of its own, so every way out of a build must end it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What the background agent wait of an ISO or scratch build came to, read
+/// once the provisions have returned and [`post_provision_grace`] has passed.
+#[derive(Debug)]
+enum BackgroundWait {
+    /// The agent answered (the version verified; `None` when skipped).
+    Answered(Option<String>),
+    /// The wait failed for a reason more waiting would not cure.
+    Failed(anyhow::Error),
+    /// The agent had not answered.
+    Pending,
+}
+
+/// How a build settles its agent contract after the provisions.
+#[derive(Debug)]
+enum AgentSettle {
+    Verified(Option<String>),
+    /// Boot the installed disk once more, with no media and no provisions,
+    /// and verify there.
+    VerificationBoot,
+    Fail(anyhow::Error),
+}
+
+/// The deadline an installer-driven build puts on its agent, which starts
+/// when the provisions return, never at boot: an install runs as long as its
+/// provisions take (Windows 9x Setup, a macOS install, past an hour), and a
+/// wait timed from boot gave up under them. A VM still up gets
+/// [`POST_PROVISION_AGENT_WAIT`] to answer; a VM its provisions powered off
+/// gets none, since nothing is left running to answer.
+fn post_provision_grace(vm_stopped: bool) -> std::time::Duration {
+    if vm_stopped {
+        std::time::Duration::ZERO
+    } else {
+        POST_PROVISION_AGENT_WAIT
+    }
+}
+
+/// What the build does with its background agent wait (ADR-0003): an agent
+/// that answered is the verified one; one that has not answered, whether the
+/// VM is off or the grace ran out, is verified on a fresh boot of the
+/// installed disk. Only a wait that failed outright fails the build.
+fn settle_background_wait(wait: BackgroundWait, wants_agent: bool) -> AgentSettle {
+    match wait {
+        BackgroundWait::Answered(version) => AgentSettle::Verified(version),
+        BackgroundWait::Failed(e) => AgentSettle::Fail(e),
+        BackgroundWait::Pending if wants_agent => AgentSettle::VerificationBoot,
+        BackgroundWait::Pending => AgentSettle::Verified(None),
+    }
 }
 
 /// Whether the build stages the VMLAB bootstrap ISO (agent binaries + install
@@ -2128,6 +2237,23 @@ mod tests {
         assert_eq!(build_lab_name(&x64), "build-x86_64-windows-vista");
         assert_eq!(build_lab_name(&x86), "build-x86-windows-vista");
         assert_ne!(build_lab_name(&x64), build_lab_name(&x86));
+    }
+
+    #[test]
+    fn a_build_machine_announces_the_verbs_that_reach_it() {
+        let m = super::BuildMachine {
+            lab: "build-x86_64-alpine".into(),
+            vm: "build".into(),
+        };
+        assert_eq!(m.reference(), "build-x86_64-alpine/build");
+        let line = m.announcement();
+        for verb in [
+            "vmlab vm screenshot build-x86_64-alpine/build",
+            "vmlab console build-x86_64-alpine/build",
+            "vmlab vm sendkeys build-x86_64-alpine/build",
+        ] {
+            assert!(line.contains(verb), "{line}");
+        }
     }
 
     /// A supervisor that was killed mid-build leaves its working disk behind
@@ -3202,14 +3328,14 @@ mod tests {
         std::fs::write(staging.path().join(DISK_FILE), b"").unwrap();
         let mut meta = source_meta();
         meta.first_boot_script = Some("use vmlab\nfn main(lab: Lab) {}\n".into());
-        meta.wscript_surface = Some(5.into());
+        meta.wscript_surface = Some(6.into());
         store.install(&staging.keep(), &meta, false).unwrap();
 
         let err = super::resolve_layered_source(&layered(""), &store).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "template `x86_64/win11@26100.1` records wscript surface 5, newer than this host's \
-             4; upgrade vmlab to use it"
+            "template `x86_64/win11@26100.1` records wscript surface 6, newer than this host's \
+             5; upgrade vmlab to use it"
         );
 
         meta.wscript_surface = Some(crate::scripting::WSCRIPT_SURFACE_VERSION);
@@ -3894,6 +4020,53 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
             r.meta.first_boot().is_none(),
             "#base runs no first-boot script"
         );
+    }
+
+    /// The agent deadline of an installer-driven build starts when its
+    /// provisions return: a VM still up is given the post-provision wait, a
+    /// VM they powered off none (V5).
+    #[test]
+    fn the_post_provision_grace_depends_only_on_the_vm_being_up() {
+        assert_eq!(
+            super::post_provision_grace(false),
+            super::POST_PROVISION_AGENT_WAIT
+        );
+        assert_eq!(super::post_provision_grace(true), std::time::Duration::ZERO);
+    }
+
+    /// An agent that has not answered by the end of the provisions sends the
+    /// build to a verification boot — the VM powered off or not — and never
+    /// fails it there and then. Only a wait that failed outright does (V5).
+    #[test]
+    fn an_unanswered_background_wait_settles_on_a_verification_boot() {
+        use super::{AgentSettle, BackgroundWait, settle_background_wait};
+        assert!(matches!(
+            settle_background_wait(BackgroundWait::Pending, true),
+            AgentSettle::VerificationBoot
+        ));
+        assert!(matches!(
+            settle_background_wait(BackgroundWait::Pending, false),
+            AgentSettle::Verified(None)
+        ));
+        assert!(matches!(
+            settle_background_wait(BackgroundWait::Answered(Some("v1".into())), true),
+            AgentSettle::Verified(Some(v)) if v == "v1"
+        ));
+        assert!(matches!(
+            settle_background_wait(BackgroundWait::Failed(anyhow::anyhow!("no ISO")), true),
+            AgentSettle::Fail(e) if e.to_string() == "no ISO"
+        ));
+    }
+
+    /// The background wait has no deadline, so a build that leaves early —
+    /// a failed boot or provision — must not strand it.
+    #[tokio::test]
+    async fn dropping_the_background_wait_aborts_it() {
+        let task = super::AbortOnDrop(tokio::spawn(std::future::pending::<()>()));
+        let abort = task.0.abort_handle();
+        drop(task);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
     }
 
     /// The surface check reads the selected variant's script: a default whose

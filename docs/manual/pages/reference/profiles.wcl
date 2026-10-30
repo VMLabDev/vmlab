@@ -70,6 +70,7 @@ profile "<name>" {
   memory          = 4GiB
   agent_transport = "virtio-serial"
   input_transport = "qmp"
+  acpi_shutdown   = true
   virtiofs        = false
   rtc             = "utc"
   workspace_guest = "/src"
@@ -102,6 +103,7 @@ SRC
       | "`agent_transport`" | "utf8" | "`virtio-serial`" | "The guest agent channel's device: `virtio-serial`, `isa-serial` (a 16550 on COM1 for the legacy agent; the serial log moves to COM2), or `none` (no agent; never ready by handshake)." |
       | "`agent_channel`" | "bool" | "unset" | "Superseded by `agent_transport`; still accepted: `true` reads as `virtio-serial`, `false` as `none`, and `agent_transport` wins when both are present." |
       | "`input_transport`" | "utf8" | "`qmp`" | "How scripted input reaches the guest: `qmp` send-key, or `vnc` through the VM's VNC socket. A guest that reads no PS/2 keyboard needs `input = \"usb\"`, not `vnc`." |
+      | "`acpi_shutdown`" | "bool" | "`true`" | "The guest shuts down on an ACPI power-button press. `false` makes a graceful stop rely on the agent: it waits for a booting guest's agent as long as readiness would, skips the ACPI rung, and gives the guest two minutes to power off. See [vmlab down](cmd_down). Set to `false` by `macos`." |
       | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
       | "`rtc`" | "utf8" | "`utc`" | "What the guest reads the real-time clock as: `utc`, or `localtime` for a guest that cannot read it as UTC, whose RTC then starts at the host's local time (QEMU `-rtc base=localtime`; a fixed `clock` is converted to the host's local time at that instant). Only `windows-xp` and `windows-9x` set `localtime`." |
       | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |
@@ -144,7 +146,7 @@ SRC
       | "`windows-9x`" | "pc" | "seabios" | "false" | "false" | "ide" | "pcnet" | "cirrus-vga" | "1" | "256MiB" | "`input_transport = \"vnc\"`, `agent_transport = \"isa-serial\"`, `rtc = \"localtime\"`. DOS, Windows 3.x to ME and 2000-era guests." |
       | "`linux-modern`" | "q35" | "ovmf" | "false" | "false" | "virtio" | "virtio-net-pci" | "virtio-vga" | "2" | "4GiB" | "`virtiofs = true`." |
       | "`linux-generic`" | "q35" | "seabios" | "false" | "false" | "virtio" | "virtio-net-pci" | "std" | "2" | "2GiB" | "Older or unusual distros." |
-      | "`macos`" | "q35" | "ovmf" | "false" | "false" | "sata" | "virtio-net-pci" | "vmware" | "4" | "8GiB" | "`cpu_model = \"Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on\"`, `hyperv = false`, `apple_smc = true`, `input = \"usb\"`, `tsc = \"host\"`. Intel macOS through OpenCore, which the template carries." |
+      | "`macos`" | "q35" | "ovmf" | "false" | "false" | "sata" | "virtio-net-pci" | "vmware" | "4" | "8GiB" | "`cpu_model = \"Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on\"`, `hyperv = false`, `apple_smc = true`, `input = \"usb\"`, `tsc = \"host\"`, `acpi_shutdown = false`. Intel macOS through OpenCore, which the template carries." |
       | "`container`" | "" | "" | "" | "" | "" | "" | "" | "1" | "256MiB" | "Micro-VM size for an OCI container; nothing else applies to a container." |
       | "`custom`" | "" | "" | "" | "" | "" | "" | "" | "" | "" | "Nothing assumed; supply everything on the VM or template and in `qemu_args`." |
   }

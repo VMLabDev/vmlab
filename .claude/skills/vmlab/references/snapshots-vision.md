@@ -334,19 +334,44 @@ reaches the threshold.
 
 `m.ocr()` returns the text on screen and `m.ocr_region([x, y, w, h])` the text
 in one region, both as tesseract's output verbatim, trailing whitespace
-included. vmlab drives the `tesseract` binary as a subprocess with page
-segmentation mode 6, which assumes one uniform block of text and suits console
-and dialog screenshots. If the binary is not on `PATH` the call fails with a
-message telling you to install tesseract-ocr. A region whose origin lies
-outside the image is an error; a region that runs past the edge is clipped.
+included. vmlab drives the `tesseract` binary as a subprocess. Before tesseract
+reads the frame, vmlab turns it to greyscale and enlarges it three times with a
+smoothing filter, because at its own size tesseract misreads console fonts: it
+reads OpenCore's menu as "Dperating Systen" and drops a lone `-bash-3.2#`
+prompt. Light-on-dark text needs no extra step; tesseract inverts each line
+itself. A frame larger than 1280x800 is enlarged less, so a 4K display costs
+about the same. If the binary is not on `PATH` the call fails with a message
+telling you to install tesseract-ocr. A region whose origin lies outside the
+image is an error; a region that runs past the edge is clipped.
+
+`m.ocr_opts(opts)` (surface 5) takes the choices as a string map: `region`
+(`"x,y,w,h"`), `scale` (`"1"` to `"4"`, default `"3"`) and `layout`, which sets
+tesseract's page segmentation mode:
+
+| `layout` | Page segmentation | Suits |
+| --- | --- | --- |
+| `block` (default) | One uniform block of text (mode 6); lines in order. | Consoles, terminals, dialogs. |
+| `sparse` | Scattered text in no order (mode 11). | Desktops, lock screens, menus in columns. |
+| `line` | A single line (mode 7). | A region cropped to one line. |
+| `auto` | Tesseract's page analysis (mode 3). | Columns and paragraphs. |
+
+`scale` trades time for accuracy: a full 1280x800 frame takes about 450 ms at
+the default and about 180 ms at `"1"`, which suits large text; `"4"` helps the
+smallest fonts. `vmlab vm ocr` takes the same choices as `--scale` and
+`--layout`.
 
 `m.wait_for_text(pattern, timeout_secs)` grabs the screen once a second, runs
-OCR over the whole of it and returns as soon as the regex matches. The returned
-`Match` carries the matched text in `text` and zero for the position fields,
-because OCR does not report where on screen it read a line. OCR is fuzzy:
-different tesseract versions read edge glyphs differently, so match a
-distinctive word rather than a whole sentence, and prefer image matching where a
-stable reference can be cropped.
+OCR over the whole of it and returns as soon as the regex matches.
+`m.wait_for_text_opts(pattern, timeout_secs, opts)` (surface 5) reads each grab
+the way `ocr_opts` does; a region makes each attempt faster and keeps the rest
+of the screen from matching. The returned `Match` carries the matched text in
+`text` and zero for the position fields, because OCR does not report where on
+screen it read a line. OCR is fuzzy: tesseract versions read edge glyphs
+differently, and a VGA text console's `w` and `~` still come back as `u` and
+`™`, so match a distinctive word rather than a whole sentence, and prefer image
+matching where a stable reference can be cropped. Text over a photograph, such
+as the macOS login window, defeats tesseract at any scale; match an image
+there.
 
 ### Choosing between them
 

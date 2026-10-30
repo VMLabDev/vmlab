@@ -181,7 +181,9 @@ and reports the lab up once every step has finished. Provision output streams
 live to the terminal, prefixed with the machine's name, and into the lab log.
 
 `down` walks the stop ladder on every machine — agent shutdown, then ACPI, then
-an emulator quit that flushes the disks, then a kill after a timeout — and asks
+an emulator quit that flushes the disks, then a kill after a timeout; a booting
+guest is waited for until its agent answers, and one that ignores ACPI skips that
+rung — and asks
 the supervisor to release the daemon.
 `destroy` does the same and then removes everything in `.vmlab/`.
 
@@ -389,7 +391,7 @@ catalogue and global segments.
 | Lab daemons | `lab.ensure`, `lab.release`, `lab.restart` | CLI |
 | Global segments | `global.attach`, `global.detach`, `global.list` | Lab daemons only |
 | Host USB | `usb.list` | CLI, and lab daemons for a script's `lab.usb_devices()` |
-| Template builds | `template.list`, `template.build`, `template.stop_build` | CLI |
+| Template builds | `template.list`, `template.build`, `template.stop_build`, `template.status` | CLI |
 | The store | `store.list`, `store.remove`, `store.prune`, `store.export`, `store.import`, `store.pull`, `store.push`, `store.stop_push` | CLI |
 | Registries | `registry.search`, `registry.login`, `registry.namespaces`, `registry.namespace_add`, `registry.namespace_remove` | CLI |
 

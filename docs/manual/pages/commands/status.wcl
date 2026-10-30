@@ -3,7 +3,7 @@ page cmd_status {
   chapter_header "vmlab status" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-10-29"
+    updated      = "2026-10-31"
     version      = "vmlab 0.35"
   }
 
@@ -20,7 +20,7 @@ page cmd_status {
   table {
     rows:
       | "Option" | "Meaning" |
-      | "`-v`, `--verbose`" | "Add the raw power state, readiness, and each machine's kind-specific detail (template/hardware, image/health/last exit)." |
+      | "`-v`, `--verbose`" | "Add the raw power state, readiness, the hypervisor, and each machine's kind-specific detail (template/hardware, image/health/last exit)." |
       | "`--json`" | "Print the lab daemon's status projection as JSON instead of the tables. A lab with no daemon prints `{\"lab\": \"<name>\", \"running\": false}`." |
       | "`-h`, `--help`" | "Print help." |
   }
@@ -128,7 +128,9 @@ SRC
     machine carries `state=`, `ready=` and `cached=`, plus
     `diverged=yes` on a machine whose agent was replaced by
     [vmlab machine repair-agent](cmd_machine) or by the agent refresh in
-    [vmlab up](cmd_up). A VM on a template with variants then adds
+    [vmlab up](cmd_up). Every machine then adds `hypervisor=`, `qemu` or
+    `vmlab`: the hypervisor it runs on, its own `hypervisor` or the
+    [host default](ref_host) for its kind. A VM on a template with variants then adds
     `variant=`, the variant its clone is backed on, including the default a
     reference without `#` picked. Every VM adds `arch`, `cpus`,
     `memory` and `agent`: the version of the agent running in the guest, as

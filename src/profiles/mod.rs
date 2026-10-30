@@ -133,6 +133,9 @@ pub struct Profile {
     /// older profile file still reads as [`AgentTransport::None`].
     pub agent_transport: AgentTransport,
     pub input_transport: InputTransport,
+    /// The guest acts on an ACPI power-button press (§7.2). `None` = it
+    /// does.
+    pub acpi_shutdown: Option<bool>,
     /// The guest OS mounts virtiofs natively (`mount -t virtiofs` on Linux,
     /// the virtio-win driver + WinFsp on Windows) — makes it a candidate
     /// for `transport = "auto"` shares (§7.5).
@@ -326,6 +329,7 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             )
             .unspan()
             .unwrap_or_default(),
+        acpi_shutdown: r.bool("acpi_shutdown").unspan(),
         virtiofs: r.bool("virtiofs").unspan().unwrap_or(false),
         rtc: r
             .keyword("rtc", &[("utc", Rtc::Utc), ("localtime", Rtc::Localtime)])
