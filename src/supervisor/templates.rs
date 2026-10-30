@@ -27,7 +27,9 @@ struct OpState {
     /// Structured playbook progress (`playbook.op.*` from the synthetic build
     /// lab, forwarded live as `template.op.step`), kept for resync.
     steps: VecDeque<Value>,
-    console: Option<PathBuf>,
+    /// The build VM's `<lab>/<vm>` reference while it can be inspected
+    /// (§6.1), for `template.status`.
+    machine: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -74,7 +76,7 @@ impl TemplateOps {
                 variant: None,
                 log: VecDeque::new(),
                 steps: VecDeque::new(),
-                console: None,
+                machine: None,
                 cancel: cancel.clone(),
             },
         );
@@ -112,10 +114,10 @@ impl TemplateOps {
         }
     }
 
-    fn set_console(&self, lab: &str, arch: &str, template: &str, path: PathBuf) {
+    fn set_machine(&self, lab: &str, arch: &str, template: &str, machine: Option<String>) {
         let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
-            op.console = Some(path);
+            op.machine = machine;
         }
     }
 
@@ -166,6 +168,27 @@ impl TemplateOps {
         }
         op.cancel.cancel();
         Ok(())
+    }
+
+    /// Every running operation, oldest first, for `template.status`.
+    fn running(&self) -> Vec<crate::template::store_view::RunningOp> {
+        let ops = self.inner.lock_recover();
+        let mut rows: Vec<_> = ops
+            .iter()
+            .map(
+                |((lab, arch, template), op)| crate::template::store_view::RunningOp {
+                    lab: lab.clone(),
+                    arch: arch.clone(),
+                    template: template.clone(),
+                    kind: op.kind.to_string(),
+                    started: op.started.to_rfc3339(),
+                    variant: op.variant.clone(),
+                    machine: op.machine.clone(),
+                },
+            )
+            .collect();
+        rows.sort_by(|a, b| a.started.cmp(&b.started));
+        rows
     }
 
     /// The running operation for `(lab, template)`, as JSON for `template.list`.
@@ -344,14 +367,25 @@ pub async fn start_build(
         let ready_lab = lab.clone();
         let ready_arch = arch.clone();
         let ready_template = template.clone();
-        let console_ready: crate::template::build::ConsoleReady = Arc::new(move |path| {
-            ready_sup
-                .template_ops
-                .set_console(&ready_lab, &ready_arch, &ready_template, path);
+        // The build VM, while the machine verbs can reach it: kept on the op
+        // for `template.status` and announced as `template.op.console`.
+        let inspectable: crate::template::build::Inspectable = Arc::new(move |machine| {
+            let machine = machine.map(crate::template::build::BuildMachine::reference);
+            ready_sup.template_ops.set_machine(
+                &ready_lab,
+                &ready_arch,
+                &ready_template,
+                machine.clone(),
+            );
             ready_sup.emit(Event::new(
                 "template.op.console",
                 &*ready_lab,
-                json!({"template": ready_template, "arch": ready_arch, "kind": "build"}),
+                json!({
+                    "template": ready_template,
+                    "arch": ready_arch,
+                    "kind": "build",
+                    "machine": machine,
+                }),
             ));
         });
         // Forward the synthetic build lab's playbook step stream as
@@ -416,7 +450,7 @@ pub async fn start_build(
                 variants: variants.as_deref(),
             },
             crate::template::build::BuildControl {
-                console_ready: Some(console_ready),
+                inspectable: Some(inspectable),
                 on_event: Some(on_event),
                 on_variant: Some(on_variant),
                 in_use: Some(in_use),
@@ -443,6 +477,11 @@ pub async fn start_build(
         }
     });
     Ok(json!({"started": true}))
+}
+
+/// `template.status`: every running template operation.
+pub fn status(ops: &TemplateOps) -> Value {
+    json!(ops.running())
 }
 
 /// Stop the active build for one exact architecture/template pair.
@@ -550,6 +589,36 @@ mod tests {
         let op = ops.op_of("lab1", "x86_64", "base");
         assert_eq!(op["kind"], "push");
         assert!(op["started"].as_str().is_some());
+    }
+
+    /// `template status` names the build VM while it can be reached, across
+    /// every lab, and forgets it again when the build lets it go.
+    #[test]
+    fn running_ops_carry_the_build_machine_while_it_is_inspectable() {
+        let ops = TemplateOps::default();
+        assert!(ops.running().is_empty());
+        let _build = ops.try_begin("lab-a", "x86_64", "base", "build").unwrap();
+        let _push = ops.try_begin("", "x86_64", "other", "push").unwrap();
+        let rows = ops.running();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.machine.is_none()));
+
+        ops.set_machine(
+            "lab-a",
+            "x86_64",
+            "base",
+            Some("build-x86_64-base/build".into()),
+        );
+        let build = ops
+            .running()
+            .into_iter()
+            .find(|r| r.kind == "build")
+            .unwrap();
+        assert_eq!(build.lab, "lab-a");
+        assert_eq!(build.machine.as_deref(), Some("build-x86_64-base/build"));
+
+        ops.set_machine("lab-a", "x86_64", "base", None);
+        assert!(ops.running().iter().all(|r| r.machine.is_none()));
     }
 
     #[tokio::test]

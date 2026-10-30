@@ -42,6 +42,7 @@ the code is the contract.
 | `template.list` | `lab: String`, `root: std::path::PathBuf`, `file: Option<std::path::PathBuf>` | `cli` | The templates a file declares, with their store and build state. |
 | `template.build` | `lab: String`, `root: std::path::PathBuf`, `template: String`, `arch: Option<String>`, `version: Option<String>`, `file: Option<std::path::PathBuf>`, `variants: Option<Vec<String>>` | `cli` | Start building one declared template. |
 | `template.stop_build` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running build. |
+| `template.status` | — | `cli` | Every running template operation, from whichever lab it was filed under, with the build VM's `<lab>/<vm>` reference while the machine verbs can reach it (§6.1). |
 | `store.list` | `remote: bool` | `cli` | Every template in the store, with its size and, on request, whether that exact version is published. |
 | `store.remove` | `reference: String`, `force: bool` | `cli` | Remove one exact store version `<arch>/<name>@<version>`. |
 | `store.prune` | `filter: Option<String>`, `keep: usize`, `apply: bool`, `force: bool` | `cli` | Plan a prune of superseded builds, and carry it out when `apply`. |
@@ -167,6 +168,7 @@ Deliberate, with the reason recorded beside the declaration:
 - `version` — What `vmlab daemon status` prints: which build of the supervisor is running on this host, asked by whoever is standing in front of it.
 - `lab.ensure` — Spawning-or-finding a lab daemon belongs in one place, and that place is the helper in `src/cli/daemon.rs` — the web layer calls it rather than asking the supervisor itself. One call site is the decision; the scan reports it as the CLI because that is where the helper lives.
 - `lab.release` — The other half of `lab.ensure`, and a shell's alone: a command finishes and gives the daemon back. The console does not finish, and leaves it up for the next request.
+- `template.status` — It answers the person at the terminal which build is running and which machine reference reaches its VM; a script runs inside a lab and has no build of its own to look for.
 - `store.list` — The store is host-wide; every template command the console has is scoped to the lab it has open, and it has no view of the store as a whole to hang this on. Giving it one is a separate decision from putting the operations on the protocol, which is what this namespace does.
 - `store.remove` — Store management, for the reason on `store.list`.
 - `store.prune` — Store management, for the reason on `store.list`.

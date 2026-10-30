@@ -42,7 +42,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | Containers as lab machines, the micro-VM model, the `container {}` block | `references/containers.md` |
 | Segments, DHCP, DNS, NAT, routing, traffic rules, the eBPF fast path | `references/networking.md` |
 | Port forwards and their host ports: automatic ports, port slots, `vmlab port` | `references/networking.md`, `references/cli-machine.md` |
-| Templates, the store, builds, `source {}`, linked clones, scratch VMs, OCI distribution, and the published templates anyone can pull (`ghcr.io/vmlabdev/vmlab-templates`, Windows included) | `references/templates.md` |
+| Templates, the store, builds, watching or unsticking a running build (`build-<arch>-<name>/build`, `template status`), `source {}`, linked clones, scratch VMs, OCI distribution, and the published templates anyone can pull (`ghcr.io/vmlabdev/vmlab-templates`, Windows included) | `references/templates.md` |
 | The wscript language: types, control flow, matching, modules, stdlib | `references/wscript-language.md` |
 | wscript `Lab`, `Segment`, `Term` and `Recording` methods, and the shared types (`Match`, `ExecResult`, `Login`, `GuestStats`, `UsbDevice`, `Event`) | `references/wscript-lab-api.md` |
 | wscript `Machine` methods — lifecycle, exec, files, input, vision, snapshots, host USB, console recording (`record`) | `references/wscript-machine-api.md` |

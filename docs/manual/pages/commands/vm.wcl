@@ -3,7 +3,7 @@ page cmd_vm {
   chapter_header "vmlab vm" {
     kicker       = "Commands · reference"
     reading_time = "10 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -42,6 +42,15 @@ page cmd_vm {
     that is already running from any directory and never starts one; it fails
     with `lab "<name>" is not running` otherwise. A malformed reference such as
     `lab/` is refused before anything is contacted.
+  DOC
+
+  p <<DOC
+    A running template build's VM is the reference
+    `build-<arch>-<name>/build`. `screenshot`, `sendkeys`, `mouse-move`,
+    `click`, `drag`, `ocr` and `find-image` work on it while the build runs.
+    `start`, `stop`, `restart` and `destroy` fail with `unsupported` (6),
+    because the build owns the VM's power (see
+    [vmlab template](cmd_template)).
   DOC
 
   p <<DOC

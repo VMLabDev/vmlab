@@ -3,7 +3,7 @@ page ref_events {
   chapter_header "Events" {
     kicker       = "Appendices · reference"
     reading_time = "12 min read"
-    updated      = "2026-10-30"
+    updated      = "2026-10-31"
     version      = "vmlab 0.35"
   }
 
@@ -171,7 +171,7 @@ SRC
     rows:
       | "Event" | "Payload fields" | "When" |
       | "`template.op.start`" | "base; `version` for a push" | "A build or push was admitted." |
-      | "`template.op.console`" | "base" | "The build VM's console socket is available." |
+      | "`template.op.console`" | "base, `machine`" | "The build VM became reachable by the machine verbs, with `machine` its `<lab>/<vm>` reference, or stopped being reachable, with `machine` null." |
       | "`template.op.step`" | "base, `event`, `data`" | "The build's synthetic lab emitted a `playbook.*` event, forwarded with its name and payload inside." |
       | "`template.op.log`" | "base, `line`" | "One non-blank output line from a build or push." |
       | "`template.op.done`" | "base, `version`" | "The build sealed that version, or the push completed." |

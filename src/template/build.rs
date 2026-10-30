@@ -6,7 +6,9 @@
 //! pre-seeded from the source, so it reuses the entire lab runtime
 //! (lifecycle, networking, the wscript build scripts). The build runs
 //! in-process — no daemon — and seals by flattening the working disk into
-//! the store.
+//! the store. While it runs, that lab's control socket is served for
+//! inspection and input ([`crate::labd::build_lab`]), so the machine verbs
+//! reach the build VM by its [`BuildMachine`] reference.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,8 +25,33 @@ use crate::labd::machine::Machine;
 use crate::qemu::resolve::KeyStore;
 use crate::scripting::OutputSink;
 
-/// Called once the build VM's VNC socket is accepting connections.
-pub type ConsoleReady = Arc<dyn Fn(PathBuf) + Send + Sync>;
+/// A build VM as the machine verbs address it, `<lab>/<vm>` (PRD §6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildMachine {
+    pub lab: String,
+    pub vm: String,
+}
+
+impl BuildMachine {
+    /// The `[lab/]vm` reference `vmlab vm screenshot` and its kin take.
+    pub fn reference(&self) -> String {
+        format!("{}/{}", self.lab, self.vm)
+    }
+
+    /// The log line a build prints once its VM can be inspected: the
+    /// reference, and the verbs that reach it.
+    fn announcement(&self) -> String {
+        let r = self.reference();
+        format!(
+            "build VM is `{r}`: `vmlab vm screenshot {r} <file.png>`, \
+             `vmlab console {r}`, `vmlab vm sendkeys {r} <chord>`\n"
+        )
+    }
+}
+
+/// Called with the build VM once its display is up and its lab's socket is
+/// served, and with `None` once neither is any longer.
+pub type Inspectable = Arc<dyn Fn(Option<&BuildMachine>) + Send + Sync>;
 
 /// Called for every structured event the synthetic build lab emits whose
 /// kind starts with `playbook.` — the config-weave step stream (§10.4). The
@@ -61,7 +88,7 @@ pub struct BuildTarget<'a> {
 /// Optional controls supplied by an interactive build caller.
 #[derive(Default)]
 pub struct BuildControl {
-    pub console_ready: Option<ConsoleReady>,
+    pub inspectable: Option<Inspectable>,
     pub on_event: Option<BuildEvent>,
     pub on_variant: Option<VariantStarted>,
     pub in_use: Option<InUse>,
@@ -533,25 +560,11 @@ async fn build_variant(
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
     }
-    let console_watch = control.console_ready.clone().map(|ready| {
-        let sock = vm.dirs.vnc_sock();
-        tokio::spawn(async move {
-            loop {
-                if sock.exists() {
-                    ready(sock);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        })
-    });
+    let inspection = Inspection::open(&runtime, &vm, control.inspectable.clone(), log).await?;
     let up_result = tokio::select! {
         result = runtime.up(&[], log.clone()) => Some(result),
         () = control.cancel.cancelled() => None,
     };
-    if let Some(watch) = console_watch {
-        watch.abort();
-    }
     let sealed = async {
         match up_result {
             Some(result) => result.context("variant build boot/provision failed")?,
@@ -576,6 +589,7 @@ async fn build_variant(
         bail!("build cancelled");
     }
     let events = runtime.events.clone();
+    drop(inspection);
     drop(runtime);
 
     // The overlay was written against the base by its absolute path; the
@@ -785,6 +799,76 @@ async fn list_registry_versions(repo: &str) -> Result<Vec<String>> {
         .into_iter()
         .filter(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .collect())
+}
+
+/// A build lab served for inspection (PRD §6.1): its control socket bound,
+/// and a watch that announces the VM once QEMU's display socket exists.
+/// Dropping it closes the socket and tells the caller the VM is gone.
+struct Inspection {
+    _server: Option<crate::labd::build_lab::BuildLabServer>,
+    watch: tokio::task::JoinHandle<()>,
+    announced: Arc<std::sync::atomic::AtomicBool>,
+    inspectable: Option<Inspectable>,
+}
+
+impl Inspection {
+    /// Serve `runtime`'s lab and watch for `vm`'s display. A build whose lab
+    /// name a running daemon already holds is not inspectable by name, and
+    /// says so rather than taking the socket from that lab.
+    async fn open(
+        runtime: &Arc<crate::labd::lab::LabRuntime>,
+        vm: &crate::labd::vm::VmInstance,
+        inspectable: Option<Inspectable>,
+        log: &OutputSink,
+    ) -> Result<Self> {
+        let machine = BuildMachine {
+            lab: runtime.config().lab.name.clone(),
+            vm: vm.name().to_string(),
+        };
+        let server = crate::labd::build_lab::serve(runtime).await?;
+        let announced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sock = vm.dirs.vnc_sock();
+        let watch = {
+            let (announced, inspectable, log) =
+                (announced.clone(), inspectable.clone(), log.clone());
+            let served = server.is_some();
+            tokio::spawn(async move {
+                while !sock.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if !served {
+                    log(format!(
+                        "lab `{}` is already running under its own daemon, so this build's \
+                         VM cannot be inspected by name\n",
+                        machine.lab
+                    ));
+                    return;
+                }
+                log(machine.announcement());
+                announced.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(ready) = &inspectable {
+                    ready(Some(&machine));
+                }
+            })
+        };
+        Ok(Self {
+            _server: server,
+            watch,
+            announced,
+            inspectable,
+        })
+    }
+}
+
+impl Drop for Inspection {
+    fn drop(&mut self) {
+        self.watch.abort();
+        if self.announced.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(gone) = &self.inspectable
+        {
+            gone(None);
+        }
+    }
 }
 
 struct WorkdirGuard(PathBuf);
@@ -1056,25 +1140,11 @@ async fn run_build(
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
     }
-    let console_watch = run.control.console_ready.clone().map(|ready| {
-        let sock = vm.dirs.vnc_sock();
-        tokio::spawn(async move {
-            loop {
-                if sock.exists() {
-                    ready(sock);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        })
-    });
+    let inspection = Inspection::open(&runtime, &vm, run.control.inspectable.clone(), log).await?;
     let up_result = tokio::select! {
         result = runtime.up(&[], log.clone()) => Some(result),
         () = run.control.cancel.cancelled() => None,
     };
-    if let Some(watch) = console_watch {
-        watch.abort();
-    }
     // Through graceful shutdown as one fallible step: a failed boot,
     // provision or seal must stop the build VM (QEMU/swtpm outlive the CLI
     // otherwise), not just delete its workdir.
@@ -1161,6 +1231,7 @@ async fn run_build(
     // Free the build runtime's sockets/watchers before any verification
     // boot reuses the same lab dirs; keep the event log for the final emit.
     let events = runtime.events.clone();
+    drop(inspection);
     drop(runtime);
 
     // Boot the installed system once — same workdir and disk, no installer
@@ -1182,6 +1253,8 @@ async fn run_build(
         )
         .await?;
         let vm2 = runtime2.vm(build_vm)?;
+        let _inspection =
+            Inspection::open(&runtime2, &vm2, run.control.inspectable.clone(), log).await?;
         let verified = async {
             let up = tokio::select! {
                 result = runtime2.up(&[], log.clone()) => Some(result),
@@ -2128,6 +2201,23 @@ mod tests {
         assert_eq!(build_lab_name(&x64), "build-x86_64-windows-vista");
         assert_eq!(build_lab_name(&x86), "build-x86-windows-vista");
         assert_ne!(build_lab_name(&x64), build_lab_name(&x86));
+    }
+
+    #[test]
+    fn a_build_machine_announces_the_verbs_that_reach_it() {
+        let m = super::BuildMachine {
+            lab: "build-x86_64-alpine".into(),
+            vm: "build".into(),
+        };
+        assert_eq!(m.reference(), "build-x86_64-alpine/build");
+        let line = m.announcement();
+        for verb in [
+            "vmlab vm screenshot build-x86_64-alpine/build",
+            "vmlab console build-x86_64-alpine/build",
+            "vmlab vm sendkeys build-x86_64-alpine/build",
+        ] {
+            assert!(line.contains(verb), "{line}");
+        }
     }
 
     /// A supervisor that was killed mid-build leaves its working disk behind

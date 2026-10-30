@@ -17,6 +17,7 @@ vmlab template <COMMAND>
 | --- | --- |
 | `build` | Build templates defined in a lab or template file. |
 | `stop` | Stop a build or push running for a template, whoever started it. |
+| `status` | List running builds and pushes, with the machine reference that reaches a build's VM. |
 | `list` | List templates in the store. |
 | `search` | Search a registry for published templates. |
 | `rm` | Remove one template version. |
@@ -93,6 +94,13 @@ vmlab template build win2022
 vmlab template build -f templates.wcl --version 1.4.0 alpine
 ```
 
+While the build runs, its VM is the machine reference
+`build-<arch>-<name>/build`, and the log prints it once the display is up.
+`vmlab vm screenshot`, `ocr`, `find-image`, `sendkeys`, `mouse-move`, `click`,
+`drag`, `vmlab console` and `vmlab machine capabilities` work on it; every
+other verb on that lab fails with `unsupported` (6). See templates.md
+("Watching a running build").
+
 Exit status is 0 on success, `conflict` (5), `not_found` (4),
 `invalid_argument` (2), or 1.
 
@@ -122,6 +130,27 @@ vmlab template stop win2022
 
 Exit status is 0 on success. `not_found` (4) means nothing is running for that
 template in this lab. Any other failure is `failed` (1).
+
+## vmlab template status
+
+```sh
+vmlab template status [--json]
+```
+
+Lists every running build and push, from every lab, oldest first. Columns:
+`TEMPLATE` (`<arch>/<name>`, plus `#<variant>` once a build reaches one), `OP`
+(`build`/`push`), `LAB` (`-` when started outside a lab), `STARTED`, `MACHINE`
+(the build VM's `<lab>/<vm>` reference while it is reachable, else `-`).
+Nothing running prints `no template build or push is running`. `--json` emits
+objects with `lab`, `arch`, `template`, `kind`, `started` (RFC 3339), `variant`
+and `machine` (the last two `null` when absent). Exit status 0, or 1 when the
+supervisor cannot be reached.
+
+```sh
+$ vmlab template status
+TEMPLATE      OP    LAB STARTED              MACHINE
+x86_64/alpine build -   2026-10-31 00:03:05  build-x86_64-alpine/build
+```
 
 ## vmlab template list
 
