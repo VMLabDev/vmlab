@@ -3,7 +3,7 @@ page ref_host {
   chapter_header "Host configuration file" {
     kicker       = "Reference · reference"
     reading_time = "5 min read"
-    updated      = "2026-10-21"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -125,6 +125,44 @@ SRC
     format it cannot write, naming this key. Nothing looks for ffmpeg at
     `vmlab up` unless `--record` is given. See
     [Console recording](guide_recording).
+  DOC
+  h2 "hypervisor {}"
+  p <<DOC
+    The hypervisor a machine runs on when its own `vm {}` or `container {}`
+    names none, one default per machine kind. It is a child of `host {}`, at
+    most one. vmlab-hv takes machines over one phase at a time, so the default
+    is keyed by kind: a phase that is ready flips the default for its own
+    machines and leaves the rest on QEMU.
+  DOC
+  code wcl { source = <<'SRC'
+host {
+  vmlab_hv = "/opt/vmlab-hv/bin/vmlab-hv"
+  hypervisor {
+    container = "vmlab"
+    vm        = "qemu"
+  }
+}
+SRC
+  }
+  table {
+    rows:
+      | "Field" | "Type" | "Default" | "Meaning" |
+      | "`container`" | "utf8" | "`qemu`" | "The hypervisor for every `container {}` that does not set `hypervisor`: `qemu` or `vmlab`." |
+      | "`vm`" | "utf8" | "`qemu`" | "The hypervisor for every `vm {}` that does not set `hypervisor`: `qemu` or `vmlab`. vmlab-hv runs no VMs yet, so `vmlab` here makes every VM that names none fail validation." |
+  }
+  p "These rules apply:"
+  list {
+    li "Each field is `qemu` or `vmlab`. Any other value is rejected with a parse error that names it."
+    li "A machine's own `hypervisor` wins over this block. The field never resolves through a template or a profile."
+    li "A default is checked against each machine it reaches, as a declared value is. `vmlab validate` refuses a machine that vmlab-hv cannot run yet and names the machine and the reason: any VM, `qemu_args`, an architecture other than x86_64, `accel = \"tcg\"`, or a container on a host where `/dev/kvm` is not usable."
+    li "Changing a default moves every machine it reaches on its next start. An online snapshot taken under the old hypervisor does not restore under the new one, and the refusal names the hypervisor that took it. An offline snapshot restores under either."
+  }
+  p <<DOC
+    vmlab looks for the binary at the `vmlab_hv` field above, else as
+    `vmlab-hv` on `PATH`. `vmlab up` checks that it exists before it starts
+    anything. `vmlab status -v` shows the hypervisor each machine resolved to
+    as `hypervisor=`. See [Host configuration and WSL 2](guide_host) and
+    [Snapshots](guide_snapshots).
   DOC
   h2 "gpu \"<name>\" {}"
   p <<DOC

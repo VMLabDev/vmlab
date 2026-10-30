@@ -110,6 +110,56 @@ variable and the XDG default.
 is about this developer's link to the guest, not the lab everyone shares; the
 refusal message names the field.
 
+### `hypervisor {}`
+
+Child of `host {}`, at most one: the hypervisor a machine runs on when its own
+`vm {}` or `container {}` names none, one default per machine kind (PRD §22,
+ADR-0021). Keyed by kind because vmlab-hv takes machines over one phase at a
+time; a phase that is ready flips the default for its own machines only.
+
+```wcl
+host {
+  vmlab_hv = "/opt/vmlab-hv/bin/vmlab-hv"
+  hypervisor {
+    container = "vmlab"
+    vm        = "qemu"
+  }
+}
+```
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `container` | utf8 | `qemu` | Hypervisor for every `container {}` without `hypervisor`: `qemu` or `vmlab`. |
+| `vm` | utf8 | `qemu` | Hypervisor for every `vm {}` without `hypervisor`: `qemu` or `vmlab`. vmlab-hv runs no VMs yet, so `vmlab` here fails validation for every VM that names none. |
+
+- Any value other than `qemu` or `vmlab` is a parse error naming it.
+- A machine's own `hypervisor` wins. The field never resolves through a
+  template or a profile.
+- A default is checked like a declared value. `vmlab validate` (and the lab
+  daemon again before it builds the machine) refuses what vmlab-hv cannot run
+  yet, naming the machine and the reason: any VM, `qemu_args`, a non-x86_64
+  arch, `accel = "tcg"`, a container where `/dev/kvm` is not usable.
+- Changing a default moves every machine it reaches on its next start; an
+  online snapshot taken under the old hypervisor then refuses to restore
+  (snapshots-vision.md), an offline one restores under either.
+
+### QEMU or vmlab-hv
+
+QEMU runs every machine unless one says otherwise. vmlab-hv is vmlab's own
+hypervisor (one process per machine, driven over its own control protocol). It
+runs only container micro-VMs today, x86_64 under KVM, with no TCG fallback.
+Pick it for a container to try it on one machine inside an otherwise-QEMU lab.
+Keep QEMU for VMs, for `qemu_args`, and for any container that must also run
+on a host without KVM. What differs on a vmlab-hv machine:
+
+- `up` checks for the binary (`vmlab_hv`, else `vmlab-hv` on `PATH`) before it
+  starts anything, as it does `qemu-system-<arch>`.
+- Its log is `vmlab-hv.log` beside the console log, where QEMU's is `qemu.log`.
+- `vmlab status -v` shows `hypervisor=vmlab` (every machine shows its value).
+- Online snapshots are in vmlab-hv's own format and restore only under
+  vmlab-hv. `qemu-img` is still needed for the scratch disk and offline
+  snapshots.
+
 ### gpu "<name>" {}
 
 A **host GPU**, declared beside `host {}`, zero or more of them. A lab's
