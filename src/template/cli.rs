@@ -27,7 +27,7 @@ use crate::proto::{Event, SupRequest};
 use crate::template::catalog::CatalogSearch;
 use crate::template::registries::RegistryEntry;
 use crate::template::store_view::{
-    InstalledVersion, PrunePlan, PushStarted, StoreEntry, StoredVersion,
+    InstalledVersion, PrunePlan, PushStarted, RunningOp, StoreEntry, StoredVersion,
 };
 
 /// The two fields a build needs from `template.list`: which templates the
@@ -67,6 +67,14 @@ pub enum TemplateCmd {
         /// Architecture, when the name is declared for more than one
         #[arg(long)]
         arch: Option<String>,
+    },
+    /// Show running builds and pushes, with the `<lab>/<vm>` reference
+    /// that reaches a build's VM (`vmlab vm screenshot`, `vmlab console`,
+    /// `vmlab vm sendkeys`)
+    Status {
+        /// Emit a JSON array instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// List templates in the store
     List {
@@ -229,6 +237,7 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
             } => build(&sup, file, name, version, variant).await,
             TemplateCmd::Stop { name, arch } => stop(&sup, name, arch).await,
             TemplateCmd::List { json, remote } => list(&sup, json, remote).await,
+            TemplateCmd::Status { json } => status(&sup, json).await,
             TemplateCmd::Search {
                 query,
                 registry,
@@ -604,6 +613,60 @@ async fn push(
 // ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
+
+/// `vmlab template status`: the running operations, from every lab.
+async fn status(sup: &SupClient, json: bool) -> Result<()> {
+    let rows: Vec<RunningOp> = ask(sup, SupRequest::TemplateStatus {}).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print!("{}", status_table(&rows));
+    }
+    Ok(())
+}
+
+/// The `template status` table. A build whose VM the machine verbs cannot
+/// reach yet (still downloading, seeding, or sealing) shows `-`.
+fn status_table(rows: &[RunningOp]) -> String {
+    if rows.is_empty() {
+        return "no template build or push is running\n".into();
+    }
+    let what = |r: &RunningOp| match &r.variant {
+        Some(v) => format!("{}/{}#{v}", r.arch, r.template),
+        None => format!("{}/{}", r.arch, r.template),
+    };
+    let lab = |r: &RunningOp| {
+        if r.lab.is_empty() {
+            "-".to_string()
+        } else {
+            r.lab.clone()
+        }
+    };
+    let what_w = rows.iter().map(|r| what(r).len()).max().unwrap_or(0).max(8);
+    let lab_w = rows.iter().map(|r| lab(r).len()).max().unwrap_or(0).max(3);
+    let mut out = format!(
+        "{:<what_w$} {:<5} {:<lab_w$} {:<20} MACHINE\n",
+        "TEMPLATE", "OP", "LAB", "STARTED"
+    );
+    for r in rows {
+        let started = chrono::DateTime::parse_from_rfc3339(&r.started)
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|_| r.started.clone());
+        out.push_str(&format!(
+            "{:<what_w$} {:<5} {:<lab_w$} {:<20} {}\n",
+            what(r),
+            r.kind,
+            lab(r),
+            started,
+            r.machine.as_deref().unwrap_or("-"),
+        ));
+    }
+    out
+}
 
 async fn list(sup: &SupClient, json: bool, check_remote: bool) -> Result<()> {
     let rows: Vec<StoreEntry> = ask(
@@ -1227,6 +1290,42 @@ mod tests {
     /// The acceptance test of the whole change: nothing on the CLI's template
     /// surface opens the store or dials a registry. Every one of these used
     /// to appear in this file, and each is now the supervisor's.
+    fn running(kind: &str, machine: Option<&str>) -> RunningOp {
+        RunningOp {
+            lab: String::new(),
+            arch: "x86_64".into(),
+            template: "alpine".into(),
+            kind: kind.into(),
+            started: "2026-10-30T10:00:00+00:00".into(),
+            variant: None,
+            machine: machine.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_status_table_names_the_build_machine() {
+        assert_eq!(status_table(&[]), "no template build or push is running\n");
+        let table = status_table(&[
+            running("build", Some("build-x86_64-alpine/build")),
+            RunningOp {
+                variant: Some("cloud".into()),
+                lab: "templates".into(),
+                ..running("push", None)
+            },
+        ]);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3, "{table}");
+        assert!(lines[0].starts_with("TEMPLATE"), "{table}");
+        assert!(lines[0].ends_with("MACHINE"), "{table}");
+        assert!(lines[1].starts_with("x86_64/alpine "), "{table}");
+        assert!(lines[1].ends_with("build-x86_64-alpine/build"), "{table}");
+        // Filed outside a lab, and not reachable yet: both say so with `-`.
+        assert!(lines[1].contains(" - "), "{table}");
+        assert!(lines[2].starts_with("x86_64/alpine#cloud"), "{table}");
+        assert!(lines[2].contains("templates"), "{table}");
+        assert!(lines[2].ends_with(" -"), "{table}");
+    }
+
     #[test]
     fn the_template_verbs_reach_the_store_only_through_the_supervisor() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/template/cli.rs");

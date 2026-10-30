@@ -685,6 +685,7 @@ impl Handler<SupRequest> for SupervisorHandler {
                 arch,
                 template,
             } => templates::stop_build(sup.clone(), lab, arch, template),
+            SupRequest::TemplateStatus {} => Ok(templates::status(&sup.template_ops)),
             // The template store and its registries (PRD §3, §6): the
             // supervisor is the only thing that opens either.
             SupRequest::StoreList { remote } => store::list(remote).await,
