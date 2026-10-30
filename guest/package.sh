@@ -47,6 +47,7 @@ EXPECTED=(
   agent/linux-x86/vmlab-agent agent/linux-x86/VERSION
   agent/windows-x86_64/vmlab-agent.exe agent/windows-x86_64/VERSION
   agent/windows-x86/vmlab-agent.exe agent/windows-x86/VERSION
+  agent/macos-x86_64/vmlab-agent agent/macos-x86_64/VERSION
   agent/windows-nt-x86/vmlab-agent-legacy.exe agent/windows-nt-x86/VERSION
   agent/windows-9x-x86/vmlab-agent-legacy.exe agent/windows-9x-x86/VERSION
   agent/dos-i386/VMLABAGT.EXE agent/dos-i386/VERSION

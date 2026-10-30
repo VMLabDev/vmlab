@@ -42,8 +42,8 @@ jobs:
 
   # The guest-side crates (cinit, agent, and their proto contracts) are
   # standalone — never swept into the host build — so lint/test them and the
-  # agent's cross targets (musl, windows-gnu) explicitly. cargo check on the
-  # Windows target type-checks without needing a linker.
+  # agent's cross targets (musl, windows-gnu, apple-darwin) explicitly. clippy
+  # on the Windows and macOS targets type-checks without needing a linker.
   guest-crates:
     name: guest crates (cinit + agent)
     runs-on: ubuntu-latest
@@ -53,7 +53,7 @@ jobs:
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
-          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, riscv64gc-unknown-linux-musl, x86_64-pc-windows-gnu
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, riscv64gc-unknown-linux-musl, x86_64-pc-windows-gnu, x86_64-apple-darwin
       - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2
         with:
@@ -64,6 +64,7 @@ jobs:
             guest/agent
       - run: just ci::guest-check
       - run: just ci::guest-windows-check
+      - run: just ci::guest-macos-check
       - run: just ci::guest-cross-build
 
   # The committed BPF fast-path objects (src/net/fastpath/bpf/) must match
@@ -256,6 +257,9 @@ jobs:
           key: open-watcom-${{ runner.os }}-${{ hashFiles('scripts/guest-toolchains.sh') }}
       - name: Install OpenWatcom
         run: ./scripts/guest-toolchains.sh watcom
+      # zig, cargo-zigbuild and rcodesign for the macOS agent, all pinned there.
+      - name: Install the macOS agent toolchain
+        run: ./scripts/guest-toolchains.sh zig
       - uses: Swatinem/rust-cache@v2
         with:
           key: guest-assets
