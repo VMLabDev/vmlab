@@ -18,7 +18,8 @@ Method groups:
 - Input: `send_keys`, `type_text`, `type_text_paced`, `mouse_move`,
   `mouse_click`, `mouse_drag`.
 - Screen: `screenshot`, `wait_for_image`, `wait_for_image_opts`,
-  `wait_for_any`, `find_image`, `ocr`, `ocr_region`, `wait_for_text`.
+  `wait_for_any`, `find_image`, `ocr`, `ocr_region`, `ocr_opts`,
+  `wait_for_text`, `wait_for_text_opts`.
 - Guest agent: `exec`, `exec_timeout`, `copy_to`, `copy_from`, `logs`,
   `terminal`, `stats`.
 - Identity: `logins`, `as_login`, `as_account`.
@@ -26,6 +27,7 @@ Method groups:
   `usb_detach_all`, `usb_attached`.
 - Console recording (surface 4): `record`, returning a `Recording` handle
   (wscript-lab-api.md).
+- OCR options (surface 5): `ocr_opts`, `wait_for_text_opts`.
 
 Two conventions apply throughout. Relative host paths, for reference images,
 screenshots and file transfers, resolve against the directory the running
@@ -929,6 +931,37 @@ fn main(lab: Lab) {
 }
 ```
 
+## Machine.ocr_opts
+
+Read the text on the display with a region, upscale and layout of your
+choosing (wscript surface 5).
+
+```wscript
+fn ocr_opts(self, opts: Map[string, string]) -> Result[string, string]
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `opts` | Map[string, string] | OCR options, every value a string: `region` (`"x,y,w,h"` in framebuffer pixels), `scale` (`"1"` to `"4"`, default `"3"`), `layout` (`"block"`, `"sparse"`, `"line"` or `"auto"`, default `"block"`). Pass `#{}` for the defaults, which is `Machine.ocr`. |
+
+`Machine.ocr` with its choices exposed. `scale` is how many times the frame is
+enlarged before the engine reads it; `"1"` reads it at its own size, which is
+faster and suits large text. `layout` is how the engine segments the page:
+`block` for a console or dialog, `sparse` for text scattered over a desktop or
+lock screen, `line` for a region cropped to one line, `auto` for the engine's
+own page analysis. It fails when a key is unknown or its value malformed (the
+error names which), when `scale` is outside 1 to 4, when the region's origin
+lies outside the frame, on a machine without a display, and with the engine's
+error otherwise.
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(dc) = lab.vm("dc01") else { return }
+    let clock = dc.ocr_opts(#{ "layout": "sparse" })
+    let title = dc.ocr_opts(#{ "region": "0,0,1024,40", "layout": "line" })
+}
+```
+
 ## Machine.wait_for_text
 
 Wait until OCR of the display matches a regular expression.
@@ -954,6 +987,36 @@ fn main(lab: Lab) {
     let Ok(dc) = lab.vm("dc01") else { return }
     match dc.wait_for_text("Press Ctrl.Alt.Del", 300) {
         Ok(m) => lab.log("saw: " + m.text),
+        Err(e) => lab.log(e),
+    }
+}
+```
+
+## Machine.wait_for_text_opts
+
+Wait until OCR of the display matches, with a region, upscale and layout of
+your choosing (wscript surface 5).
+
+```wscript
+fn wait_for_text_opts(self, pattern: string, timeout_secs: int, opts: Map[string, string]) -> Result[Match, string]
+```
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `pattern` | string | A regular expression, matched anywhere in the recognised text. |
+| `timeout_secs` | int | How long to keep looking, in seconds. |
+| `opts` | Map[string, string] | The keys `Machine.ocr_opts` takes: `region`, `scale`, `layout`. |
+
+`Machine.wait_for_text` reading each grab the way `Machine.ocr_opts` does. A
+region keeps the rest of the screen from slowing each attempt or matching by
+accident. It fails as `Machine.wait_for_text` does, and as `Machine.ocr_opts`
+does for a bad `opts` map.
+
+```wscript
+fn main(lab: Lab) {
+    let Ok(mac) = lab.vm("mac") else { return }
+    match mac.wait_for_text_opts("-bash-3\\.2#", 60, #{ "region": "0,40,900,200" }) {
+        Ok(m) => lab.log("prompt: " + m.text),
         Err(e) => lab.log(e),
     }
 }

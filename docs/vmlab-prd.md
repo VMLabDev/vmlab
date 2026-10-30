@@ -384,7 +384,7 @@ A failed variant build reports which variant failed and stops; the base and ever
 ### 6.2 Store, addressing, export
 
 - Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>][#<variant>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store; the `#<variant>` suffix selects one disk of a version that has variants (§6.6). `vmlab validate` rejects archless references.
-- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle. Surface 3 adds host USB passthrough (§5.2.1): `lab.usb_devices()`, and `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` on the machine handle. Surface 4 adds console recording (§11.1): `record` on the machine handle, and the `Recording` handle it returns with `stop` and `path`.
+- Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle. Surface 3 adds host USB passthrough (§5.2.1): `lab.usb_devices()`, and `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` on the machine handle. Surface 4 adds console recording (§11.1): `record` on the machine handle, and the `Recording` handle it returns with `stop` and `path`. Surface 5 adds OCR options (§10.3): `ocr_opts` and `wait_for_text_opts` on the machine handle.
 - `vmlab template list / rm` manage the store. `list` shows each version's variants beneath it, the default marked and a stale one flagged; `rm <arch>/<name>@<version>` removes the version with all its variants, and `rm …#<variant>` removes that one variant (§6.6).
 - `vmlab template export` produces a single portable archive (qcow2 + metadata, and every variant's `variants/<variant>/disk.qcow2` with the full `template.wcl`); `vmlab template import` installs one, refusing any variant whose overlay is not the one its block's `sha256` names or whose `base_sha256` is not the archive's base — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).
@@ -811,12 +811,15 @@ m.screenshot(path?) -> Image
 m.wait_for_image(ref, opts) -> Match        # opts: timeout, threshold,
 m.wait_for_any([refs], opts) -> Match       #   region{x,y,w,h}, interval
 m.find_image(ref, opts) -> Match | None     # single-shot, no wait
-m.ocr(opts) -> string                       # Tesseract; optional region
+m.ocr(opts) -> string                       # Tesseract; opts: region, scale,
+                                            #   layout
 m.wait_for_text(pattern, opts) -> Match     # OCR-based wait, regex pattern
 m.record(path, opts) -> Recording           # console video (§11.1); opts: fps,
                                             #   size, compress_idle, timeline,
                                             #   max_duration; r.stop() -> path
 ```
+
+OCR reads the frame (or the region) in greyscale, enlarged `scale` times (1–4, default 3) with a Lanczos3 filter and capped at 16.4 MP, because tesseract misreads console-sized fonts at their own size; `layout` picks tesseract's page segmentation: `block` (psm 6, the default), `sparse` (11), `line` (7) or `auto` (3).
 
 Reference images are paths relative to the lab (convention: `images/` beside `vmlab.wcl`). Matching is normalised template matching with a similarity threshold (default ~0.9, overridable). `Match` carries location + score, so a found image can anchor a relative mouse click.
 
