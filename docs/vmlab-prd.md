@@ -12,7 +12,7 @@ vmlab is a single-host virtual machine lab orchestrator. It defines **labs** —
 
 A two-tier daemon system owns all runtime state: a per-user **supervisor** manages lab lifecycle, the template store, and cross-lab/cross-host networking, and spawns one **lab daemon** per running lab that owns that lab's QEMU processes, network fabric, and state — so labs are fault- and contention-isolated from each other. The CLI is a client of both tiers; wscript scripts are written against a clean lab/VM API and are never aware of the daemons' existence.
 
-vmlab targets QEMU/KVM exclusively, driven directly over QMP — no libvirt. Hosts are Linux, with **WSL2 explicitly supported as a first-class host environment**, which constrains the networking design (see §9).
+vmlab runs machines on QEMU/KVM, driven directly over QMP — no libvirt — and, per machine, on vmlab-hv, its own hypervisor, as that grows (§22). Hosts are Linux, with **WSL2 explicitly supported as a first-class host environment**, which constrains the networking design (see §9).
 
 ### 1.1 Goals
 
@@ -28,7 +28,7 @@ vmlab targets QEMU/KVM exclusively, driven directly over QMP — no libvirt. Hos
 - **Multi-host scheduling.** vmlab runs VMs on one host. The only cross-host feature is attaching a network segment to a peer daemon (§9.4); placing or migrating VMs across hosts is out of scope.
 - **Security isolation / multi-tenancy.** vmlab is a lab tool for a single trusted user. It is not a security boundary and makes no hardening claims.
 - **libvirt compatibility.** No domain XML, no virsh interop.
-- **Hypervisors other than QEMU/KVM.**
+- **Hypervisors other than QEMU/KVM and vmlab-hv.** vmlab runs machines on QEMU and, machine by machine, on its own hypervisor vmlab-hv (§22, ADR-0021); it does not drive Xen, Hyper-V, VirtualBox, cloud-hypervisor or any other.
 
 ---
 
@@ -2481,3 +2481,58 @@ ports (§9.8) are unchanged.
 
 Outside a frozen family nothing here applies, and two instances of one lab file
 declaring one fixed port still collide (§3.2).
+
+## 22. Hypervisors
+
+Every machine runs on exactly one hypervisor: **QEMU**, driven over QMP, or
+**vmlab-hv**, vmlab's own hypervisor (github.com/VMLabDev/vmlab-hypervisor),
+driven over its own control protocol. ADR-0021 records the decision; the
+Hypervisor seam (ADR-0001, ADR-0020) is what lets both run behind one
+lifecycle.
+
+**Selection.** A `vm` or `container` block names its hypervisor with
+`hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
+default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
+`qemu` for both until changed. The field is declared on the machine only and
+never resolves through template or profile. vmlab finds the binary as
+`vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
+there before it starts anything, as it does `qemu-system-<arch>`.
+`vmlab status -v` shows `hypervisor=` on every machine.
+
+**Phases.** vmlab-hv takes machines over a phase at a time, and the host
+default for a phase's machines flips only once that phase has passed its gate:
+
+| Phase | Runs | Status |
+| --- | --- | --- |
+| 1 | Container micro-VMs (§18), x86_64 under KVM | Selectable |
+| 2 | Modern x86_64 VMs, QEMU-identical guest hardware | Refused |
+| 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
+| 4 | Legacy PCs | Refused |
+
+**Refusals.** Validation (§5.1), and the lab daemon again before it builds a
+machine, refuse a machine on vmlab-hv that it cannot run yet, naming the
+machine and the reason: any VM (phase 1 runs containers only); `qemu_args`,
+which is QEMU's argv; a non-x86_64 architecture or `accel = "tcg"`; and a
+container on a host whose `/dev/kvm` is not usable — vmlab-hv has no
+emulation fallback, where QEMU falls back to TCG. The refusals are one list in
+code, which each phase shrinks.
+
+**Launch.** For a container, vmlab writes a machine description beside the
+machine's control socket in its runtime directory — the guest asset's kernel
+and initramfs and the same kernel command line QEMU boots, the rootfs read-only
+and raw, the scratch qcow2 carrying the snapshot's RAM and device state, the
+`vmlab.ctl.0` and `vmlab.agent.0` ports, each NIC on its segment switch
+socket, each virtiofs volume on the virtiofsd vmlab starts, and a fixed clock's
+RTC base — and runs `vmlab-hv --machine <file> --control <socket> --paused`.
+The hypervisor's output goes to `vmlab-hv.log` beside the console log. An
+orphaned vmlab-hv is reaped by the same sweep as an orphaned QEMU, by the lab's
+runtime directory in its argv. What a running machine can do beyond the
+lifecycle is what vmlab-hv's handshake advertises: online snapshots in phase 1.
+
+**Snapshots.** Every snapshot records the hypervisor that took it. An online
+snapshot holds RAM and device state in that hypervisor's own format, so
+restoring it on a machine that now runs on the other one is refused, naming the
+hypervisor that took it; setting the machine's `hypervisor` back makes it
+restorable again. An offline snapshot is a plain qcow2 internal snapshot and
+restores under either. A snapshot recorded before vmlab kept the field was
+QEMU's.
