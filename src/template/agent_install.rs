@@ -54,12 +54,13 @@ fn agent_flavour(os: &str, legacy: bool, profile: Option<&str>) -> AgentOs {
 /// layered/qcow2 source starts the agent within its first boot, but a fresh
 /// install from ISO only gets one once the unattended installer has laid
 /// down the OS and run its first-logon hooks — routinely 15–45 minutes for
-/// Windows.
+/// Windows. `None` probes until the caller drops the future: the wait an
+/// installer-driven build runs beside its provisions, which bound it.
 pub async fn verify(
     machine: &Arc<dyn Machine>,
     wants_agent: bool,
     staged: Option<&StagedGuestIso>,
-    wait: Duration,
+    wait: Option<Duration>,
     log: &(dyn Fn(String) + Sync),
 ) -> Result<Option<String>> {
     if !wants_agent {
@@ -77,23 +78,19 @@ pub async fn verify(
     // which `machine.agent()` remembers for 30 s — clear that memory before each
     // attempt. Never drop_agent here: a concurrent provision may be using
     // the cached handle, and teardown at seal time cleans it up anyway.
-    let deadline = tokio::time::Instant::now() + wait;
-    let handle = loop {
-        machine.clear_agent_failure().await;
-        match machine.agent().await {
-            Ok(handle) => break handle,
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e).context(
-                        "the guest-installed vmlab-agent never answered its handshake \
-                         (did the template's unattended install run the VMLAB ISO's \
-                         install script?)",
-                    );
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
+    let handle = probe_until_answered(
+        || async {
+            machine.clear_agent_failure().await;
+            machine.agent().await
+        },
+        wait,
+    )
+    .await
+    .context(
+        "the guest-installed vmlab-agent never answered its handshake \
+         (did the template's unattended install run the VMLAB ISO's \
+         install script?)",
+    )?;
 
     let info = handle.info();
     let legacy = is_legacy_agent(&info.agent_version);
@@ -115,6 +112,23 @@ pub async fn verify(
         version
     ));
     Ok(Some(version))
+}
+
+/// Try `attempt` every five seconds until it succeeds or `wait` has passed
+/// (the last error); `None` never gives up.
+async fn probe_until_answered<T, F, Fut>(mut attempt: F, wait: Option<Duration>) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
+    loop {
+        match attempt().await {
+            Ok(answered) => return Ok(answered),
+            Err(e) if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) => return Err(e),
+            Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +180,64 @@ mod tests {
             agent_flavour("templeos", is_legacy_agent("agent-templeos=1a2b3c4"), None),
             AgentOs::TempleOs
         );
+    }
+
+    /// An agent that answers after `after` of virtual time, counting attempts.
+    fn answering_after(
+        after: Duration,
+        attempts: &std::sync::atomic::AtomicU32,
+    ) -> impl FnMut() -> std::future::Ready<Result<&'static str>> + '_ {
+        let start = tokio::time::Instant::now();
+        move || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(if start.elapsed() >= after {
+                Ok("answered")
+            } else {
+                Err(anyhow::anyhow!("no handshake yet"))
+            })
+        }
+    }
+
+    /// The wait an installer-driven build runs beside its provisions has no
+    /// deadline of its own: an install that outlasts the hour the wait used
+    /// to give up after is still heard when its agent answers (V5).
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_probe_outlasts_a_long_install() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let answered = probe_until_answered(
+            answering_after(Duration::from_secs(2 * 3600), &attempts),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answered, "answered");
+        assert!(attempts.into_inner() > 1000);
+    }
+
+    /// A bounded probe gives up at its deadline with the last error, and
+    /// answers at once when the agent already does.
+    #[tokio::test(start_paused = true)]
+    async fn a_bounded_probe_gives_up_at_its_deadline() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let err = probe_until_answered(
+            answering_after(Duration::from_secs(3600), &attempts),
+            Some(Duration::from_secs(60)),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no handshake yet"), "{err}");
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(70));
+
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let answered = probe_until_answered(
+            answering_after(Duration::ZERO, &attempts),
+            Some(Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answered, "answered");
+        assert_eq!(attempts.into_inner(), 1);
     }
 }

@@ -192,7 +192,11 @@ page guide_templates {
     late command, or an autounattend first-logon command, mounts that ISO and
     runs the script. The guest installs the agent itself, so no host channel
     is needed before the agent exists, and the build verifies the handshake
-    before sealing. Clones never see this ISO. Set `agent = false` on the
+    before sealing. For an `iso` or `scratch` build that wait has no
+    deadline while the provisions run, however long the install takes; it
+    starts when they return, and a VM they powered off is verified on one
+    more boot from its disk (see
+    [The template block](ref_template)). Clones never see this ISO. Set `agent = false` on the
     block to skip baking the agent, at the cost of a template that never
     reports ready.
   DOC

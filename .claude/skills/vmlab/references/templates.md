@@ -205,8 +205,8 @@ agent binaries and an install script per OS. The template's own
 unattended-install hook — a cloud-init `runcmd`, a subiquity late command, an
 autounattend first-logon command — mounts that ISO and runs the script. The
 guest installs the agent itself, so no host channel is needed before the agent
-exists, and the build verifies the handshake before sealing. Clones never see
-this ISO. Set `agent = false` on the block to skip baking the agent, at the cost
+exists, and the build verifies the handshake before sealing (how long it waits:
+"The first-boot script and the agent" below). Clones never see this ISO. Set `agent = false` on the block to skip baking the agent, at the cost
 of a template that never reports ready.
 
 The build VM always runs with `prevent_sleep` on (vm.md). A build is unattended,
@@ -423,6 +423,17 @@ before the VM turns ready. With `agent = true` the build waits for the
 guest-installed agent's handshake before sealing and records the agent version in
 the metadata. With `agent = false`, or on a profile with no agent channel, the
 check is skipped and the build log says so.
+
+How long the build waits for the agent depends on the source:
+
+- `qcow2` or `template`: verified before the first provision, ten minutes from
+  boot.
+- `iso` or `scratch`: the provisions are the installer, so the build listens for
+  as long as they run, with **no deadline**. The deadline starts when they
+  return. A VM still running has two minutes more to answer. A VM they powered
+  off, or one silent for those two minutes, is shut down and booted once more
+  from its disk alone (no media, no provisions), and its agent has fifteen
+  minutes. An install may run for hours and end with the VM off or running.
 
 ### Validation
 

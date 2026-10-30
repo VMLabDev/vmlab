@@ -143,6 +143,18 @@ SRC
     profile with no agent channel, the check is skipped and the build log
     says so.
   DOC
+  p <<DOC
+    How long the build waits depends on the source. A `qcow2` or `template`
+    build verifies before its first provision and gives the agent ten
+    minutes from boot. An `iso` or `scratch` build's provisions are the
+    installer, so the build listens for the handshake for as long as they
+    run, with no deadline. The deadline starts when they return: a VM still
+    running has two minutes more to answer. A VM the provisions powered off,
+    or one that has not answered in those two minutes, is shut down and
+    booted once more from its disk alone, with no media and no provisions,
+    and its agent has fifteen minutes. An install can therefore run for
+    hours, and its provision can end with the VM powered off or running.
+  DOC
   h3 "Validation"
   list {
     li "`arch` is one of the known architectures: `x86_64`, `x86`, `aarch64`, `riscv64`, `loongarch64`, `s390x`, `ppc64`."
