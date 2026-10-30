@@ -12,6 +12,11 @@
 //! following the agent client's own tests. A scenario is then a [`Script`]:
 //! what fails, what the guest reports, and how the machine ends.
 //!
+//! A machine's capabilities (ADR-0020) are scripted too: none by default, so
+//! every operation that needs one meets the same refusal a stopped machine
+//! gives, and each one a test grants is an in-memory double — snapshots a
+//! set of names, hot-plug a set of device ids — rather than a QMP server.
+//!
 //! Every failure modelled here has been seen against real QEMU — a swtpm that
 //! never binds its control socket, a virtiofsd that dies during startup, an
 //! emulator that exits before QMP answers, a guest that ignores ACPI, a
@@ -32,7 +37,10 @@ use vmlab_agent_proto::{
 };
 use vmlab_cinit_proto::{CtlCommand, CtlEvent, PROTO_VERSION as CTL_PROTO};
 
-use super::{Control, GuestAsset, GuestChannels, Hypervisor, LaunchSpec, Process, Running};
+use super::{
+    Control, Frames, GuestAsset, GuestChannels, Hotplug, Hypervisor, Input, LaunchSpec, Media,
+    Process, Running, Snapshots,
+};
 
 /// How a scripted machine ends by itself.
 #[derive(Debug, Clone)]
@@ -152,6 +160,32 @@ pub struct Script {
     /// One entry per start attempt, in order. The last repeats once the list
     /// is exhausted — a crash-looping container keeps crash-looping.
     pub runs: Vec<Run>,
+    /// What a running machine can do beyond the lifecycle. None by default.
+    pub capabilities: Capabilities,
+}
+
+/// Which capabilities a running fake machine reports. Each one off is a
+/// `None` from [`Control`], which is what an adapter that cannot do it says.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Capabilities {
+    pub snapshots: bool,
+    pub input: bool,
+    pub frames: bool,
+    pub hotplug: bool,
+    pub media: bool,
+}
+
+impl Capabilities {
+    /// Everything QEMU reports.
+    pub fn all() -> Self {
+        Self {
+            snapshots: true,
+            input: true,
+            frames: true,
+            hotplug: true,
+            media: true,
+        }
+    }
 }
 
 impl Script {
@@ -307,6 +341,7 @@ impl Hypervisor for FakeHypervisor {
                 machine: machine.clone(),
                 ignores_powerdown: run.ignores_powerdown,
                 ignores_quit: run.ignores_quit,
+                capabilities: self.script.capabilities,
             }),
             proc: machine,
         })
@@ -339,6 +374,11 @@ pub(crate) struct FakeProc {
     asleep: watch::Sender<bool>,
     /// The agent process the guest is running right now.
     agent: std::sync::Mutex<FakeAgent>,
+    /// The machine's online snapshots, by name, when it reports the
+    /// capability.
+    snapshots: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The ids of the host devices hot-plugged into it.
+    plugged: std::sync::Mutex<Vec<String>>,
 }
 
 /// Which agent process answers, and what it calls itself.
@@ -361,6 +401,8 @@ impl FakeProc {
                 version: "0.0.0-fake".into(),
                 down: false,
             }),
+            snapshots: Default::default(),
+            plugged: Default::default(),
         }
     }
 
@@ -439,11 +481,23 @@ struct FakeControl {
     machine: Arc<FakeProc>,
     ignores_powerdown: bool,
     ignores_quit: bool,
+    capabilities: Capabilities,
+}
+
+impl FakeControl {
+    /// The machine as a capability, when the script grants it.
+    fn granted(&self, granted: bool) -> Option<Arc<FakeCapabilities>> {
+        granted.then(|| Arc::new(FakeCapabilities(self.machine.clone())))
+    }
 }
 
 #[async_trait::async_trait]
 impl Control for FakeControl {
     async fn resume(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn pause(&self) -> Result<()> {
         Ok(())
     }
 
@@ -476,6 +530,123 @@ impl Control for FakeControl {
         // QEMU refuses `system_wakeup` on a guest that is not asleep; the
         // callers above the seam only ask while the watch says it is.
         self.machine.asleep.send_replace(false);
+        Ok(())
+    }
+
+    fn snapshots(&self) -> Option<Arc<dyn Snapshots>> {
+        self.granted(self.capabilities.snapshots)
+            .map(|c| c as Arc<dyn Snapshots>)
+    }
+
+    fn input(&self) -> Option<Arc<dyn Input>> {
+        self.granted(self.capabilities.input)
+            .map(|c| c as Arc<dyn Input>)
+    }
+
+    fn frames(&self) -> Option<Arc<dyn Frames>> {
+        self.granted(self.capabilities.frames)
+            .map(|c| c as Arc<dyn Frames>)
+    }
+
+    fn hotplug(&self) -> Option<Arc<dyn Hotplug>> {
+        self.granted(self.capabilities.hotplug)
+            .map(|c| c as Arc<dyn Hotplug>)
+    }
+
+    fn media(&self) -> Option<Arc<dyn Media>> {
+        self.granted(self.capabilities.media)
+            .map(|c| c as Arc<dyn Media>)
+    }
+}
+
+/// Every capability, in memory, against the one machine.
+struct FakeCapabilities(Arc<FakeProc>);
+
+#[async_trait::async_trait]
+impl Snapshots for FakeCapabilities {
+    async fn save(&self, name: &str, _vmstate: &str, _devices: &[&str]) -> Result<()> {
+        self.0
+            .snapshots
+            .lock()
+            .expect("fake snapshots lock")
+            .insert(name.to_string());
+        Ok(())
+    }
+
+    async fn load(&self, name: &str, _vmstate: &str, _devices: &[&str]) -> Result<()> {
+        // QEMU's own answer for a tag the disks do not carry.
+        if !self
+            .0
+            .snapshots
+            .lock()
+            .expect("fake snapshots lock")
+            .contains(name)
+        {
+            bail!("Snapshot '{name}' does not exist");
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, name: &str, _devices: &[&str]) -> Result<()> {
+        self.0
+            .snapshots
+            .lock()
+            .expect("fake snapshots lock")
+            .remove(name);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Input for FakeCapabilities {
+    async fn send_keys(&self, _keys: &[&str]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn pointer_to(&self, _x: u32, _y: u32, _width: u32, _height: u32) -> Result<()> {
+        Ok(())
+    }
+
+    async fn button(&self, _button: &str, _down: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Frames for FakeCapabilities {
+    /// A blank 4×3 screen, as the PPM QEMU's `screendump` writes.
+    async fn screendump(&self, to: &Path) -> Result<()> {
+        let mut ppm = b"P6\n4 3\n255\n".to_vec();
+        ppm.extend_from_slice(&[0u8; 4 * 3 * 3]);
+        std::fs::write(to, ppm)?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Hotplug for FakeCapabilities {
+    async fn attach_usb(&self, plan: &crate::usb::AttachPlan) -> Result<()> {
+        self.0
+            .plugged
+            .lock()
+            .expect("fake hotplug lock")
+            .push(plan.device.qdev_id());
+        Ok(())
+    }
+
+    async fn detach(&self, id: &str, _wait: Duration) -> Result<()> {
+        self.0
+            .plugged
+            .lock()
+            .expect("fake hotplug lock")
+            .retain(|d| d != id);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Media for FakeCapabilities {
+    async fn eject_install_cdrom(&self) -> Result<()> {
         Ok(())
     }
 }

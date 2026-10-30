@@ -8,7 +8,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 
 | # | Decision | Status |
 | --- | --- | --- |
-| [0001](0001-hypervisor-seam-substitutes-the-host.md) | The Hypervisor seam substitutes the host, and Machine is the test surface | Accepted |
+| [0001](0001-hypervisor-seam-substitutes-the-host.md) | The Hypervisor seam substitutes the host, and Machine is the test surface | Accepted, amended 2026-10-30 |
 | [0002](0002-machine-is-the-only-route-to-a-machine.md) | The Machine interface is the only route to a machine | Accepted |
 | [0003](0003-decisions-are-values-computed-before-execution.md) | Decisions are computed as values before execution | Accepted |
 | [0004](0004-lab-status-is-a-typed-projection.md) | Lab status is a typed projection, not an untyped map | Accepted |
@@ -27,6 +27,7 @@ records speak in; where an ADR introduces a term, the glossary carries it too.
 | [0017](0017-a-template-version-is-a-base-plus-sealed-variants.md) | A template version is a base plus sealed variants, stored as overlays | Accepted |
 | [0018](0018-the-supervisor-holds-a-host-gpu-awake.md) | The supervisor holds a host GPU awake between labs | Accepted |
 | [0019](0019-a-worktree-lab-is-a-linked-clone-of-a-frozen-main-lab.md) | A worktree lab is a linked clone of a frozen main lab | Accepted |
+| [0020](0020-a-hypervisor-reports-capabilities-and-composes-its-own-launch.md) | A hypervisor reports capabilities and composes its own launch | Accepted |
 
 ## Format
 

@@ -8,8 +8,8 @@
 //! container, and a container that one day runs a display server reports a
 //! `Display` like anything else.
 //!
-//! What a display needs from the machine underneath it is [`DisplayHost`] — a
-//! QMP channel, a VNC socket, somewhere to drop a capture, which of the two
+//! What a display needs from the machine underneath it is [`DisplayHost`] —
+//! the machine's input and frames capabilities, a VNC socket, somewhere to drop a capture, which of the two
 //! input transports the guest actually listens to, and whether its scanout is
 //! a GL texture that only the VNC path can capture. That is the whole
 //! contract, and it is why this module lives beside the machine rather than
@@ -27,8 +27,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use image::RgbImage;
 
+use super::hypervisor::{Frames, Input};
 use crate::profiles::InputTransport;
-use crate::qmp::QmpClient;
 use crate::record::{InputEvent, InputTap};
 use crate::vision::{self, Match, MatchOptions};
 
@@ -42,8 +42,12 @@ use crate::vision::{self, Match, MatchOptions};
 pub trait DisplayHost: Send + Sync + 'static {
     /// The machine's name, for error messages.
     fn name(&self) -> &str;
-    /// The QMP channel driving the framebuffer.
-    async fn qmp(&self) -> Result<QmpClient>;
+    /// The machine's **input** capability (ADR-0020), for guests whose
+    /// input rides the control channel. An error when it has none.
+    async fn input(&self) -> Result<Arc<dyn Input>>;
+    /// The machine's **frames** capability, for captures that do not need
+    /// the VNC path. An error when it has none.
+    async fn frames(&self) -> Result<Arc<dyn Frames>>;
     /// The machine's VNC socket, for guests whose input rides RFB.
     fn vnc_sock(&self) -> PathBuf;
     /// Where a screendump may be written and immediately deleted.
@@ -106,7 +110,7 @@ impl Display {
         if self.host.gl_display() {
             return self.grab_vnc().await;
         }
-        match self.grab_qmp().await {
+        match self.grab_frames().await {
             Err(e) if is_no_surface(&e) => self
                 .grab_vnc()
                 .await
@@ -115,14 +119,14 @@ impl Display {
         }
     }
 
-    /// QMP screendump → decoded image.
-    async fn grab_qmp(&self) -> Result<RgbImage> {
-        let qmp = self.host.qmp().await?;
+    /// The frames capability's screendump → decoded image.
+    async fn grab_frames(&self) -> Result<RgbImage> {
+        let frames = self.host.frames().await?;
         let tmp = self
             .host
             .capture_dir()
             .join(format!(".grab-{}.ppm", self.host.name()));
-        qmp.screendump(&tmp).await?;
+        frames.screendump(&tmp).await?;
         let img = vision::load_screen(&tmp)?;
         let _ = std::fs::remove_file(&tmp);
         Ok(img)
@@ -166,8 +170,8 @@ impl Display {
             return c.chord(&syms).await;
         }
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let qmp = self.host.qmp().await?;
-        qmp.send_key(&refs, None).await?;
+        let input = self.host.input().await?;
+        input.send_keys(&refs).await?;
         Ok(())
     }
 
@@ -195,11 +199,11 @@ impl Display {
             }
             return Ok(());
         }
-        let qmp = self.host.qmp().await?;
+        let input = self.host.input().await?;
         for ch in text.chars() {
             let keys = keymap::char_keys(ch).map_err(|e| anyhow!(e))?;
             let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            qmp.send_key(&refs, None).await?;
+            input.send_keys(&refs).await?;
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         Ok(())
@@ -219,8 +223,9 @@ impl Display {
             return c.mouse_move(x, y).await;
         }
         let (w, h) = self.size().await?;
-        let qmp = self.host.qmp().await?;
-        qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
+        let input = self.host.input().await?;
+        input
+            .pointer_to(x.max(0) as u32, y.max(0) as u32, w, h)
             .await?;
         Ok(())
     }
@@ -243,10 +248,10 @@ impl Display {
         if let Some((x, y)) = at {
             self.move_pointer(x, y).await?;
         }
-        let qmp = self.host.qmp().await?;
-        qmp.mouse_button(button, true).await?;
+        let input = self.host.input().await?;
+        input.button(button, true).await?;
         tokio::time::sleep(Duration::from_millis(60)).await;
-        qmp.mouse_button(button, false).await?;
+        input.button(button, false).await?;
         Ok(())
     }
 
@@ -269,18 +274,20 @@ impl Display {
             return c.pointer(x2, y2, 0).await;
         }
         let (w, h) = self.size().await?;
-        let qmp = self.host.qmp().await?;
-        qmp.mouse_move_abs(x1.max(0) as u32, y1.max(0) as u32, w, h)
+        let input = self.host.input().await?;
+        input
+            .pointer_to(x1.max(0) as u32, y1.max(0) as u32, w, h)
             .await?;
-        qmp.mouse_button("left", true).await?;
+        input.button("left", true).await?;
         for step in 1..=8 {
             let x = x1 + (x2 - x1) * step / 8;
             let y = y1 + (y2 - y1) * step / 8;
-            qmp.mouse_move_abs(x.max(0) as u32, y.max(0) as u32, w, h)
+            input
+                .pointer_to(x.max(0) as u32, y.max(0) as u32, w, h)
                 .await?;
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        qmp.mouse_button("left", false).await?;
+        input.button("left", false).await?;
         Ok(())
     }
 
@@ -309,7 +316,8 @@ impl Display {
 }
 
 /// Whether a capture failed because QEMU's console has no 2D surface — the
-/// answer `screendump` gives for a GL scanout.
+/// answer `screendump` gives for a GL scanout. The frames capability keeps
+/// QEMU's error inside the one it returns, so it still reads here.
 fn is_no_surface(e: &anyhow::Error) -> bool {
     matches!(
         e.downcast_ref::<crate::qmp::QmpError>(),
