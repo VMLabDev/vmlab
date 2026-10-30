@@ -33,14 +33,16 @@ def side_env(side: str) -> dict[str, str]:
     return env
 
 
-def prepare_home(side: str) -> None:
+def prepare_home(h, side: str) -> None:
     home = WORK / f"peers-home-{side}"
     shutil.rmtree(home, ignore_errors=True)
     (home / "run").mkdir(parents=True, mode=0o700)
     (home / "config" / "vmlab").mkdir(parents=True)
     (home / "state").mkdir(parents=True)
     (home / "config" / "vmlab" / "config.wcl").write_text(
-        f'import <vmlab-host.wcl>\n\nhost {{\n  psk        = "{PSK}"\n  trunk_port = {PORTS[side]}\n}}\n'
+        f'import <vmlab-host.wcl>\n\nhost {{\n  psk        = "{PSK}"\n  trunk_port = {PORTS[side]}\n'
+        # Each side's own config, so it carries the run's hypervisor too.
+        f'{h.host_config()}}}\n'
     )
 
 
@@ -98,7 +100,7 @@ def run(h):
     subs: dict[str, Subscriber] = {}
     try:
         for s in sides:
-            prepare_home(s)
+            prepare_home(h, s)
             lab = WORK / f"peers-{s}"
             shutil.rmtree(lab, ignore_errors=True)
             shutil.copytree(E2E / "labs" / f"peers-{s}", lab)

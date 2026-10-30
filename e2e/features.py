@@ -210,3 +210,114 @@ FEATURES: dict[str, str] = {
     # -- architectures -----------------------------------------------------
     "arch.emulated": "a non-x86 guest under TCG emulation",
 }
+
+# -- hypervisor scope (PRD §22) --------------------------------------------
+#
+# Each feature carries the vmlab-hv phase that makes it applicable: a run on
+# `vmlab` reports a feature past the phases delivered as skipped, whatever its
+# scenario did, because a lab mixing kinds still runs its VMs on QEMU and a
+# pass there says nothing about vmlab-hv. `host` marks a feature no hypervisor
+# takes part in (the template store, validation, the supervisor); it runs on
+# both. Phase 2's sub-phases (2a platform and SeaBIOS, 2b frames, 2c OVMF, SMM,
+# TPM and Windows, 2d GPU, 2e virtio-fs and audio, 2f USB and vfio) land in
+# order, and the suite's one VM template boots OVMF, so no VM feature here is
+# applicable before 2c. A feature that touches a VM and a container is tagged
+# by the VM.
+
+HOST = "host"
+
+# Every phase in the order vmlab-hv delivers them.
+PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
+
+# The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
+VMLAB_DELIVERED = "1"
+
+_GROUPS: dict[str, list[str]] = {
+    HOST: [
+        "template.list", "template.export", "template.import", "template.rm", "template.clean",
+        "template.registry.login", "template.registry.push", "template.registry.pull",
+        "template.registry.search", "template.registry.search-latest", "template.registry.list-remote",
+        "template.registry.config", "template.event", "lab.pull",
+        "lab.validate", "lab.validate.reject", "daemon.lifecycle", "usb.list", "net.fastpath",
+    ],
+    # Container micro-VMs.
+    "1": [
+        "container.up", "container.idle", "container.env", "container.volume", "container.port",
+        "container.healthcheck", "container.exec", "container.logs", "container.shell", "container.power",
+        "snapshot.container", "snapshot.clock.kept", "snapshot.clock.fixed",
+        "dev.sync.host-to-guest", "dev.sync.guest-to-host", "dev.sync.modes", "dev.sync.status-flush",
+        "dev.sync.conflict", "dev.select", "dev.snapshot-bracket",
+        "app.x11", "app.interrupt", "app.exit-code", "app.waypipe",
+    ],
+    # Modern x86_64 VMs, on the e2e template's OVMF.
+    "2c": [
+        "template.build.qcow2", "template.build.layered", "template.registry.lab-ref",
+        "template.variant.build", "template.variant.select", "template.variant.rebuild",
+        "lab.up", "lab.up.partial", "lab.depends_on", "lab.depends_on_provision", "lab.provision.parallel",
+        "lab.status", "lab.down", "lab.up.reload", "lab.reload.stopped", "lab.reload.network",
+        "lab.up.template-changed", "lab.destroy", "lab.list", "lab.info", "lab.stop", "lab.down.release",
+        "lab.move", "lab.status.conflict", "lab.restart", "lab.destroy.named",
+        "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.sleep", "vm.prevent_sleep",
+        "vm.hw.cpus-memory", "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.tpm",
+        "vm.hw.firmware", "vm.hw.secure_boot", "vm.hw.nested", "vm.scratch", "vm.media.iso",
+        "agent.exec", "agent.exec.timeout", "agent.shell", "agent.cp.push", "agent.cp.pull", "agent.tail",
+        "agent.osinfo", "agent.stats", "agent.capabilities", "agent.clipboard", "agent.rehandshake",
+        "agent.update", "agent.repair", "agent.eventlog",
+        "login.default", "login.user", "login.password", "login.elevated",
+        "vision.screenshot", "vision.ocr", "vision.find-image", "vision.sendkeys", "vision.mouse",
+        "console.tcp", "console.viewer",
+        "record.status", "record.up-from-boot", "record.probe", "record.timeline", "record.ocr",
+        "record.ripple", "record.compress-idle", "record.webm", "record.refusals", "record.restart",
+        "record.script", "record.wscript",
+        "net.dhcp", "net.static-ip", "net.dns.records", "net.dns.sinkhole", "net.dns.verb", "net.nat",
+        "net.nat.bulk", "net.isolated", "net.forward", "net.forward.bind", "net.forward.provisioned",
+        "port.verb", "net.routes", "net.l3.block", "net.l3.redirect", "net.mtu", "net.global", "net.peer",
+        "net.fastpath.kernel", "share.smb",
+        "snapshot.vm.online", "snapshot.vm.offline", "snapshot.lab", "snapshot.list-delete",
+        "snapshot.clock.set",
+        "worktree.isolation.status", "worktree.isolation.forward", "worktree.isolation.nat",
+        "worktree.isolation.global", "worktree.ports.shift", "worktree.ports.stable",
+        "worktree.clone", "worktree.clone.macs",
+        "script.run", "script.provision", "script.as_login", "script.segment-api", "script.vision-api",
+        "script.terminal", "script.snapshot-api", "events.handlers", "logs.streams", "logs.follow",
+        "playbook.up", "playbook.list", "playbook.check-apply", "playbook.timeout",
+        "app.rdp",
+    ],
+    "2d": ["vm.hw.gpu"],
+    "2e": ["share.virtiofs", "share.readonly", "share.unmountable"],
+    "2f": ["usb.controller", "usb.refusals", "usb.attach"],
+    # TCG emulation.
+    "3": ["arch.emulated"],
+    # The legacy PC: floppy controller, SMB1 guests.
+    "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1"],
+}
+
+# Features only QEMU can ever run, and why; skipped on every other hypervisor.
+QEMU_ONLY: dict[str, str] = {
+    "vm.hw.qemu_args": "`qemu_args` is QEMU's command line; vmlab-hv refuses it",
+    "share.virtiofs.old-virtiofsd": "tests QEMU's external virtiofsd; vmlab-hv serves virtio-fs in process",
+    "snapshot.virtiofs.old-virtiofsd": "tests QEMU's external virtiofsd; vmlab-hv serves virtio-fs in process",
+}
+
+PHASES: dict[str, str] = {fid: phase for phase, ids in _GROUPS.items() for fid in ids}
+
+_untagged = set(FEATURES) - set(PHASES) - set(QEMU_ONLY)
+_unknown = (set(PHASES) | set(QEMU_ONLY)) - set(FEATURES)
+_twice = sum(len(ids) for ids in _GROUPS.values()) + len(QEMU_ONLY) - len(set(PHASES) | set(QEMU_ONLY))
+assert not _untagged and not _unknown and not _twice, (
+    f"phase tags out of step with FEATURES: untagged {sorted(_untagged)}, unknown {sorted(_unknown)}, "
+    f"{_twice} tagged twice"
+)
+
+
+def out_of_scope(feature: str, hypervisor: str, delivered: str = VMLAB_DELIVERED) -> str | None:
+    """Why `feature` does not apply on `hypervisor` with phases through
+    `delivered` landed, or None when it does."""
+    if hypervisor == "qemu":
+        return None
+    if feature in QEMU_ONLY:
+        return f"QEMU only: {QEMU_ONLY[feature]}"
+    phase = PHASES[feature]
+    if PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered):
+        return f"vmlab-hv phase {phase}"
+    return None
