@@ -19,7 +19,10 @@ use serde_json::{Value, json};
 
 use crate::config::model::{Lab, Playbook};
 use crate::labd::lab::LabRuntime;
-use crate::labd::playbook_vars::{Redactor, var_file_source, windows_private_dir_argv};
+use crate::labd::playbook_vars::{
+    Redactor, SecretVarFile, VarFiles, secret_var_file_by_help, secret_var_file_by_version,
+    secret_var_file_notice, split_vars, var_file_source, windows_private_dir_argv,
+};
 use crate::labd::state::TimedOutRun;
 use crate::labd::vm_agent::{AgentHandle, SessionEvent};
 use crate::proto::CommandError;
@@ -212,6 +215,25 @@ fn guest_vars_dir(dir: &str) -> String {
 /// `--var-file`.
 fn guest_vars_file(dir: &str) -> String {
     guest_join(&guest_vars_dir(dir), "vars.wcl")
+}
+
+/// The secret variables' file beside [`guest_vars_file`], handed to
+/// config-weave as `--secret-var-file`.
+fn guest_secret_vars_file(dir: &str) -> String {
+    guest_join(&guest_vars_dir(dir), "secret-vars.wcl")
+}
+
+/// The guest paths of the var files a run was handed, if any.
+#[derive(Debug, Default, Clone)]
+struct StagedVars {
+    plain: Option<String>,
+    secret: Option<String>,
+}
+
+impl StagedVars {
+    fn is_empty(&self) -> bool {
+        self.plain.is_none() && self.secret.is_none()
+    }
 }
 
 /// Where one playbook folder lives under the guest directory.
@@ -632,13 +654,25 @@ async fn run_inner(
             )
         })?;
 
-    let guest_bin = match &pb.guest_bin {
+    // `version` answers either way, so the binary's own word on what it is
+    // comes back with it at no extra round trip.
+    let (guest_bin, version_out) = match &pb.guest_bin {
         // A guest-resident binary: nothing to push, but it has to answer.
-        Some(bin) => {
-            probe_guest_resident(&agent, machine, bin).await?;
-            bin.clone()
-        }
+        Some(bin) => (
+            bin.clone(),
+            probe_guest_resident(&agent, machine, bin).await?,
+        ),
         None => push_binary(lab, machine, &agent, os, &arch, &base_dir, &log_line).await?,
+    };
+    // Whether secret variables can have a file of their own, decided once
+    // for the run and only when it has some.
+    let support = if pb.vars.iter().any(|v| v.secret) {
+        match secret_var_file_by_version(&version_out) {
+            Some(support) => support,
+            None => secret_var_file_by_help(probe_help(&agent, &guest_bin).await.as_deref()),
+        }
+    } else {
+        SecretVarFile::Unsupported { found: None }
     };
 
     // Playbook folder: pre-clean then push fresh every run, so deleted
@@ -677,13 +711,16 @@ async fn run_inner(
         pb.path.display()
     ));
 
-    // Variables travel in a file, never on the command line, where the
+    // Variables travel in files, never on the command line, where the
     // guest's process list and every error quoting the command would show
-    // them. The line names them only; their values stay out of the log.
-    let vars_file = if pb.vars.is_empty() {
-        None
+    // them — the secret ones in their own, which config-weave scrubs from
+    // its own output. The line names them only; their values stay out of
+    // the log.
+    let staged = if pb.vars.is_empty() {
+        StagedVars::default()
     } else {
-        let file = stage_var_file(&agent, os, &base_dir, pb).await?;
+        let staged =
+            stage_var_files(&agent, os, &base_dir, &split_vars(&pb.vars, &support)).await?;
         log_line(&format!(
             "variables: {}",
             pb.vars
@@ -692,11 +729,14 @@ async fn run_inner(
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
-        Some(file)
+        if let Some(notice) = secret_var_file_notice(&pb.vars, &support) {
+            log_line(&notice);
+        }
+        staged
     };
 
     // Run, rebooting and re-running while apply says "reboot required".
-    let argv = run_argv(&guest_bin, &guest_dir, &pb.play, vars_file.as_deref(), mode);
+    let argv = run_argv(&guest_bin, &guest_dir, &pb.play, &staged, mode);
     let rounds: Result<PlaybookOutcome> = async {
         let mut reboots = 0u32;
         loop {
@@ -810,9 +850,10 @@ async fn run_inner(
     }
     .await;
 
-    // Whatever became of the run — a timed-out config-weave read its file at
-    // start and needs it no longer — the variables do not stay in the guest.
-    if vars_file.is_some() {
+    // Whatever became of the run — a timed-out config-weave read its files
+    // at start and needs them no longer — the variables do not stay in the
+    // guest.
+    if !staged.is_empty() {
         let dir = guest_vars_dir(&base_dir);
         let removed = async {
             let ops = m
@@ -821,6 +862,7 @@ async fn run_inner(
                 .open_fileops(None)
                 .await?;
             ops.remove(&guest_vars_file(&base_dir)).await?;
+            ops.remove(&guest_secret_vars_file(&base_dir)).await?;
             ops.rmdir(&dir).await
         }
         .await;
@@ -834,19 +876,21 @@ async fn run_inner(
     rounds
 }
 
-/// Write the run's `--var-file` into a fresh private directory under the
-/// guest directory, returning its guest path. Anything left there by a run
-/// that never cleaned up — a daemon killed mid-run — is replaced, not reused.
-async fn stage_var_file(
+/// Write the run's var files — `--var-file`, and `--secret-var-file` when
+/// `files` has secrets of their own — into a fresh private directory under
+/// the guest directory, returning their guest paths. Anything left there by
+/// a run that never cleaned up — a daemon killed mid-run — is replaced, not
+/// reused.
+async fn stage_var_files(
     agent: &AgentHandle,
     os: GuestOs,
     base_dir: &str,
-    pb: &Playbook,
-) -> Result<String> {
+    files: &VarFiles<'_>,
+) -> Result<StagedVars> {
     let dir = guest_vars_dir(base_dir);
-    let file = guest_vars_file(base_dir);
     let ops = agent.open_fileops(None).await?;
-    ops.remove(&file).await?;
+    ops.remove(&guest_vars_file(base_dir)).await?;
+    ops.remove(&guest_secret_vars_file(base_dir)).await?;
     ops.rmdir(&dir)
         .await
         .with_context(|| format!("clearing the variables directory {dir}"))?;
@@ -871,16 +915,43 @@ async fn stage_var_file(
             );
         }
     }
-    ops.push_bytes(var_file_source(&pb.vars).as_bytes(), &file, Some(0o600))
-        .await
-        .with_context(|| format!("writing the variables file {file}"))?;
-    Ok(file)
+    let mut staged = StagedVars::default();
+    for (vars, file, slot) in [
+        (&files.plain, guest_vars_file(base_dir), &mut staged.plain),
+        (
+            &files.secret,
+            guest_secret_vars_file(base_dir),
+            &mut staged.secret,
+        ),
+    ] {
+        if vars.is_empty() {
+            continue;
+        }
+        let written = ops
+            .push_bytes(
+                var_file_source(vars.iter().copied()).as_bytes(),
+                &file,
+                Some(0o600),
+            )
+            .await
+            .with_context(|| format!("writing the variables file {file}"));
+        if let Err(e) = written {
+            // The run's own cleanup is not armed yet: a file written before
+            // this one must not wait for the next run to be removed.
+            let _ = ops.remove(&guest_vars_file(base_dir)).await;
+            let _ = ops.remove(&guest_secret_vars_file(base_dir)).await;
+            let _ = ops.rmdir(&dir).await;
+            return Err(e);
+        }
+        *slot = Some(file);
+    }
+    Ok(staged)
 }
 
 /// `<bin> version` in the guest — the probe every config-weave binary has to
-/// pass before vmlab runs a play with it. `Err` when the binary cannot be
-/// started or does not exit 0.
-async fn probe_version(agent: &AgentHandle, bin: &str) -> Result<()> {
+/// pass before vmlab runs a play with it. Its stdout, which names the
+/// version; `Err` when the binary cannot be started or does not exit 0.
+async fn probe_version(agent: &AgentHandle, bin: &str) -> Result<String> {
     let out = agent
         .exec(
             vec![bin.to_string(), "version".to_string()],
@@ -898,19 +969,36 @@ async fn probe_version(agent: &AgentHandle, bin: &str) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `<bin> --help` in the guest, asked only when `version` named nothing
+/// vmlab could read. `None` when it would not answer.
+async fn probe_help(agent: &AgentHandle, bin: &str) -> Option<String> {
+    let out = agent
+        .exec(
+            vec![bin.to_string(), "--help".to_string()],
+            Vec::new(),
+            None,
+            None,
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .ok()?;
+    (out.exit_code == 0).then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// A `guest_bin` the block names: vmlab pushes nothing, so the only thing to
-/// establish is that the binary is there and answers.
-async fn probe_guest_resident(agent: &AgentHandle, machine: &str, bin: &str) -> Result<()> {
+/// establish is that the binary is there and answers. Its `version` output.
+async fn probe_guest_resident(agent: &AgentHandle, machine: &str, bin: &str) -> Result<String> {
     probe_version(agent, bin).await.map_err(|e| {
         anyhow!("guest_bin {bin} on {machine} is missing or did not answer `version`: {e:#}")
     })
 }
 
 /// Ensure the host's config-weave binary is at its place under `base_dir`,
-/// returning that guest path. Re-pushes when the cache has no entry for this
+/// returning that guest path and its `version` output. Re-pushes when the cache has no entry for this
 /// (path, sha256) — the host binary changed, or the guest directory moved —
 /// or when a probe says the guest lost it (a snapshot restore rolls the disk
 /// back under a warm cache).
@@ -922,41 +1010,46 @@ async fn push_binary(
     arch: &str,
     base_dir: &str,
     log_line: &impl Fn(&str),
-) -> Result<String> {
+) -> Result<(String, String)> {
     let bin_dir = default_bin_dir(lab.host_cfg.config_weave_bin_dir.as_deref());
     let host_bin = weave_binary(&bin_dir, os, arch)?;
     let host_sha = crate::template::store::sha256_file(&host_bin)?;
     let guest_bin = guest_binary_path(base_dir, os);
-    let need_push = !lab
+    let in_place = if lab
         .playbook_ops
         .pushed_matches(machine, &guest_bin, &host_sha)
-        || probe_version(agent, &guest_bin).await.is_err();
-    if need_push {
-        log_line(&format!("pushing config-weave to {machine}:{guest_bin}"));
-        retry_push("config-weave binary push", log_line, || {
-            let agent = agent.clone();
-            let host_bin = host_bin.clone();
-            let guest_bin = guest_bin.clone();
-            async move {
-                agent.push_file(&host_bin, &guest_bin, Some(0o755)).await?;
-                probe_version(&agent, &guest_bin).await
-            }
-        })
-        .await
-        .with_context(|| format!("pushing config-weave into {machine} at {guest_bin}"))?;
-        lab.playbook_ops.set_pushed(machine, &guest_bin, &host_sha);
+    {
+        probe_version(agent, &guest_bin).await.ok()
+    } else {
+        None
+    };
+    if let Some(version_out) = in_place {
+        return Ok((guest_bin, version_out));
     }
-    Ok(guest_bin)
+    log_line(&format!("pushing config-weave to {machine}:{guest_bin}"));
+    let version_out = retry_push("config-weave binary push", log_line, || {
+        let agent = agent.clone();
+        let host_bin = host_bin.clone();
+        let guest_bin = guest_bin.clone();
+        async move {
+            agent.push_file(&host_bin, &guest_bin, Some(0o755)).await?;
+            probe_version(&agent, &guest_bin).await
+        }
+    })
+    .await
+    .with_context(|| format!("pushing config-weave into {machine} at {guest_bin}"))?;
+    lab.playbook_ops.set_pushed(machine, &guest_bin, &host_sha);
+    Ok((guest_bin, version_out))
 }
 
 /// The guest command line for one run. The block's variables, if it has
-/// any, are in the file at `vars_file` ([`stage_var_file`]) — never on the
-/// command line, which the guest's process list shows and errors quote.
+/// any, are in the files `staged` names ([`stage_var_files`]) — never on
+/// the command line, which the guest's process list shows and errors quote.
 fn run_argv(
     guest_bin: &str,
     guest_dir: &str,
     play: &str,
-    vars_file: Option<&str>,
+    staged: &StagedVars,
     mode: PlaybookMode,
 ) -> Vec<String> {
     let mut argv = vec![
@@ -967,9 +1060,13 @@ fn run_argv(
         "--json".to_string(),
         "--events-ndjson".to_string(),
     ];
-    if let Some(file) = vars_file {
+    if let Some(file) = &staged.plain {
         argv.push("--var-file".to_string());
-        argv.push(file.to_string());
+        argv.push(file.clone());
+    }
+    if let Some(file) = &staged.secret {
+        argv.push("--secret-var-file".to_string());
+        argv.push(file.clone());
     }
     argv
 }
@@ -1445,32 +1542,82 @@ lab "l" {
         let pb = resolve_playbook(&lab, "srv01", None, None).unwrap();
         assert!(pb.vars[1].secret && !pb.vars[0].secret);
         let base = "/var/lib/vmlab/weave";
-        let argv = run_argv(
-            "/var/lib/vmlab/weave/config-weave",
-            "/var/lib/vmlab/weave/playbooks/pb__ad",
-            &pb.play,
-            Some(&guest_vars_file(base)),
-            PlaybookMode::Apply,
-        );
-        assert_eq!(
-            argv,
-            vec![
+        let argv = |staged: &StagedVars| {
+            run_argv(
                 "/var/lib/vmlab/weave/config-weave",
-                "apply",
                 "/var/lib/vmlab/weave/playbooks/pb__ad",
-                "member-server",
-                "--json",
-                "--events-ndjson",
-                "--var-file",
-                "/var/lib/vmlab/weave/vars/vars.wcl",
+                &pb.play,
+                staged,
+                PlaybookMode::Apply,
+            )
+        };
+        let head = [
+            "/var/lib/vmlab/weave/config-weave",
+            "apply",
+            "/var/lib/vmlab/weave/playbooks/pb__ad",
+            "member-server",
+            "--json",
+            "--events-ndjson",
+        ];
+        // An older config-weave: one file for everything.
+        let one = argv(&StagedVars {
+            plain: Some(guest_vars_file(base)),
+            secret: None,
+        });
+        assert_eq!(
+            one,
+            [
+                &head[..],
+                &["--var-file", "/var/lib/vmlab/weave/vars/vars.wcl"]
             ]
+            .concat()
         );
-        assert!(
-            !argv
-                .iter()
-                .any(|a| a.contains("S3cr3t") || a.contains("corp"))
+        // One that takes `--secret-var-file`: the secret its own.
+        let two = argv(&StagedVars {
+            plain: Some(guest_vars_file(base)),
+            secret: Some(guest_secret_vars_file(base)),
+        });
+        assert_eq!(
+            two,
+            [
+                &head[..],
+                &[
+                    "--var-file",
+                    "/var/lib/vmlab/weave/vars/vars.wcl",
+                    "--secret-var-file",
+                    "/var/lib/vmlab/weave/vars/secret-vars.wcl",
+                ]
+            ]
+            .concat()
         );
+        // Every variable secret: no ordinary file at all.
+        let secret_only = argv(&StagedVars {
+            plain: None,
+            secret: Some(guest_secret_vars_file(base)),
+        });
+        assert_eq!(
+            secret_only,
+            [
+                &head[..],
+                &[
+                    "--secret-var-file",
+                    "/var/lib/vmlab/weave/vars/secret-vars.wcl"
+                ]
+            ]
+            .concat()
+        );
+        for argv in [one, two, secret_only] {
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a.contains("S3cr3t") || a.contains("corp"))
+            );
+        }
         assert_eq!(guest_vars_dir("C:/weave/"), "C:/weave/vars");
+        assert_eq!(
+            guest_secret_vars_file("C:/weave/"),
+            "C:/weave/vars/secret-vars.wcl"
+        );
     }
 
     /// The block's `guest_dir` and `guest_bin` reach the model; leaving them
@@ -1499,7 +1646,13 @@ lab "l" {
   vm "srv01" { template = "x86_64/t" playbook "pb/ad" { play = "base" } }
 }"#);
         let pb = resolve_playbook(&lab, "srv01", None, None).unwrap();
-        let argv = run_argv("cw", "/d", &pb.play, None, PlaybookMode::Check);
+        let argv = run_argv(
+            "cw",
+            "/d",
+            &pb.play,
+            &StagedVars::default(),
+            PlaybookMode::Check,
+        );
         assert_eq!(
             argv,
             vec!["cw", "check", "/d", "base", "--json", "--events-ndjson"]

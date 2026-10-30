@@ -79,18 +79,34 @@ never shows a value, secret or not.
 DOC
 
   p <<'DOC'
+config-weave scrubs the secret too. Secret variables go into a second file,
+`<dir>/vars/secret-vars.wcl`, passed as `--secret-var-file`. config-weave
+then replaces their values in everything it writes itself, including its
+`--log-file`. vmlab decides whether to do this once per run. It reads the
+output of `config-weave version`, which every run already probes. If that
+output names no release, it asks `--help`. A binary older than
+config-weave 0.12.2 cannot take the flag, so every variable goes into the
+one `--var-file`. The run then prints one line such as:
+DOC
+
+  code text { source = <<'OUT'
+config-weave 0.11.0-alpha has no --secret-var-file, so its own logs (--log-file) do not scrub secret variables; config-weave 0.12.2 or later does (vmlab still redacts everything the run sends it)
+OUT
+  }
+
+  p <<'DOC'
 No variable reaches the guest command line, where the guest's process list
-and any error quoting the command would show it. The variables file is
+and any error quoting the command would show it. The variables files are
 written for each run into `<dir>/vars`, a directory only root can enter on
-Linux (`0700`, the file `0600`) and only SYSTEM and Administrators on Windows,
+Linux (`0700`, each file `0600`) and only SYSTEM and Administrators on Windows,
 and removed when the run ends, including a run that timed out. A file left
 by a lab daemon that died mid-run is replaced by the next run.
 DOC
 
-  callout "Redaction covers what vmlab emits" { kind = :note body = <<DOC
-config-weave does not know which variables vmlab marked secret. Its own
-`--log-file`, and anything a step writes inside the guest, can still hold the
-value. The secret is also in the lab file in plain text, like a login's.
+  callout "What redaction cannot cover" { kind = :note body = <<DOC
+config-weave does not mask a secret shorter than four characters. Neither
+side can reach what a step writes into a file inside the guest. The secret
+is also in the lab file in plain text, like a login's.
 DOC
   }
 
@@ -164,7 +180,7 @@ DOC
     li "**Make the guest directory.** The block's `guest_dir`, else the profile's `playbook_dir`, else `/var/lib/vmlab/weave` on Linux and `C:\\weave` on Windows. It is created if missing."
     li "**Ensure the guest binary.** vmlab remembers the SHA-256 of the binary it last pushed to each machine, and the guest path it pushed it to, and probes the guest with `config-weave version`. It pushes again when the host binary changed, the guest directory moved, or the probe fails, which is what happens after a snapshot restore rolls the disk back under a warm cache. The host-side files are named `config-weave-linux-x86_64` and `config-weave-windows-x86_64.exe`; in the guest they land at `<dir>/config-weave` on Linux and `<dir>\\config-weave.exe` on Windows. A block naming `guest_bin` skips the push and probes that binary instead."
     li "**Push the playbook folder, every time.** The folder lands under `<dir>/playbooks`. The guest copy is removed and re-pushed on each run so deleted source files never linger. The lab-relative path is flattened into one guest directory name, `playbooks/baseline` becoming `playbooks__baseline`, so two playbooks in one lab cannot collide. A fast edit-then-run loop is the point of always pushing."
-    li "**Run the verb.** The guest command is `config-weave check|apply <dir> <play> --json --events-ndjson` plus `--var-file <dir>/vars/vars.wcl` when the block has variables. Progress events arrive on stderr as JSON lines and are rendered into human lines on the CLI stream and the lab log; the final `--json` report on stdout is parsed and attached to the completion event."
+    li "**Run the verb.** The guest command is `config-weave check|apply <dir> <play> --json --events-ndjson` plus `--var-file <dir>/vars/vars.wcl` when the block has variables, and `--secret-var-file <dir>/vars/secret-vars.wcl` when it has secret ones and the binary takes the flag. Progress events arrive on stderr as JSON lines and are rendered into human lines on the CLI stream and the lab log; the final `--json` report on stdout is parsed and attached to the completion event."
     li "**Report the verdict.** Infrastructure failures, a push that will not land or a guest that stops answering, are errors. config-weave's own verdict comes back as its exit code: 0 for converged, 1 for a step error, 2 for a validation failure, and 3 for reboot still required."
   }
 
