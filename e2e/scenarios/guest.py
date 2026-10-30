@@ -331,7 +331,7 @@ def _run(h):
         full = h.wait_until(
             lambda: (lambda t: t if "login" in t else None)(h.vmlab("vm", "ocr", VM, cwd=lab, check=False).out),
             timeout=60, interval=3, what="the login prompt on the console")
-        # The banner's first text line only, located from the screenshot: the
+        # The console's first text line only, located from the screenshot: the
         # login line below it is outside the region.
         try:
             lit = [y for y, row in enumerate(png_read(shot)[3]) if any(row)]
@@ -342,7 +342,10 @@ def _run(h):
         ry = max(0, top - 8)
         rh = bottom - ry + 3
         region = h.vmlab("vm", "ocr", "--region", "0", str(ry), str(w or 1280), str(rh), VM, cwd=lab, check=False)
-        h.ok("vision.ocr", "login" in full and region.code == 0 and "Alpine" in region.out
+        # The UEFI image's console starts with Alpine's banner; the BIOS one
+        # (a SeaBIOS run) with SYSLINUX's "Loading vmlinuz-virt... ok" above it.
+        first = "Loading" if h.seabios_template() else "Alpine"
+        h.ok("vision.ocr", "login" in full and region.code == 0 and first in region.out
              and "login" not in region.out,
              f"screen: {full.strip().splitlines()[-1][:40]!r}; region 0,{ry},{w},{rh}: {region.out.strip()[:50]!r}")
 

@@ -197,6 +197,14 @@ impl ProfileSet {
         Self::load(&crate::paths::config_dir().join("profiles"))
     }
 
+    /// Exactly these profiles — what a caller that looked one up elsewhere
+    /// (validation's context) hands the resolver.
+    pub fn of(profiles: impl IntoIterator<Item = Profile>) -> Self {
+        Self {
+            profiles: profiles.into_iter().map(|p| (p.name.clone(), p)).collect(),
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<&Profile> {
         self.profiles.get(name)
     }

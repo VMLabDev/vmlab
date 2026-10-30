@@ -5,12 +5,16 @@
 //! the machine's runtime directory ([`describe`]); the process is
 //! `vmlab-hv --machine <file> --control <socket> --paused`; and its control
 //! socket becomes the seam's [`Control`] ([`control`]). Phase 1 runs
-//! container micro-VMs on x86_64 under KVM, so a VM launch is refused here
-//! as it is in validation.
+//! container micro-VMs on x86_64 under KVM; phases 2a and 2b a modern Linux
+//! VM on q35 and SeaBIOS, whose framebuffer and input are vmlab-hv's native
+//! frame protocol on `display.sock` beside the control socket ([`display`]),
+//! with an RFB server on `vnc.sock` for human viewers.
 //!
 //! The helpers a machine needs beside its hypervisor are the host's, as
-//! under QEMU: the same virtiofsd serves volumes over vhost-user. There is no
-//! software TPM to start, because there is no VM to give one to yet.
+//! under QEMU: the same virtiofsd serves container volumes over vhost-user.
+//! A VM's shares wait for vmlab-hv's own virtio-fs (phase 2e), so a VM's
+//! adapter reports no virtiofsd and `transport = "auto"` shares fall back to
+//! SMB. There is no software TPM to start until phase 2c.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +27,7 @@ use crate::qemu::Proc;
 
 pub(crate) mod control;
 pub(crate) mod describe;
+pub(crate) mod display;
 
 use control::{HvControl, HvProcess};
 
@@ -33,6 +38,12 @@ pub const BINARY: &str = "vmlab-hv";
 /// `vmlab-hv` on this host.
 pub struct VmlabHv {
     binary: PathBuf,
+    /// Whether this adapter runs a VM, whose shares have no virtio-fs to
+    /// ride until phase 2e.
+    vm: bool,
+    /// The host config's `firmware_dir`, searched for SeaBIOS and the
+    /// option ROMs ahead of the host distro's.
+    firmware_dir: Option<PathBuf>,
 }
 
 impl VmlabHv {
@@ -41,6 +52,54 @@ impl VmlabHv {
     pub fn new(binary: Option<PathBuf>) -> Self {
         Self {
             binary: binary.unwrap_or_else(|| PathBuf::from(BINARY)),
+            vm: false,
+            firmware_dir: None,
+        }
+    }
+
+    /// The adapter for a VM, finding its firmware under `firmware_dir`
+    /// first.
+    pub fn for_vm(binary: Option<PathBuf>, firmware_dir: Option<PathBuf>) -> Self {
+        Self {
+            vm: true,
+            firmware_dir,
+            ..Self::new(binary)
+        }
+    }
+}
+
+/// Where the host keeps SeaBIOS and SeaVGABIOS: the host config's
+/// `firmware_dir` in its `<arch>/` layout, then the distro's.
+fn rom_dirs(firmware_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = firmware_dir.map(|d| d.join("x86_64")).into_iter().collect();
+    dirs.extend(
+        [
+            "/usr/share/qemu",
+            "/usr/share/seabios",
+            "/usr/share/vmlab-hv",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+    dirs
+}
+
+impl describe::HostRoms {
+    /// This host's firmware and option ROMs, each the first of its names
+    /// found in [`rom_dirs`].
+    pub(crate) fn probe(firmware_dir: Option<&Path>) -> Self {
+        let dirs = rom_dirs(firmware_dir);
+        let find = |names: &[&str]| {
+            dirs.iter()
+                .flat_map(|d| names.iter().map(move |n| d.join(n)))
+                .find(|p| p.is_file())
+        };
+        Self {
+            seabios: find(&["bios-256k.bin"]),
+            vgabios_std: find(&["vgabios-stdvga.bin"]),
+            vgabios_virtio: find(&["vgabios-virtio.bin"]),
+            // vmlab-hv's own iPXE build, never QEMU's (HV phase-2 D14, D16).
+            ipxe_virtio: find(&["1af41000.rom"]),
         }
     }
 }
@@ -78,6 +137,9 @@ impl Hypervisor for VmlabHv {
     }
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
+        if self.vm {
+            return None;
+        }
         crate::qemu::virtiofsd::found()
     }
 
@@ -93,18 +155,26 @@ impl Hypervisor for VmlabHv {
     }
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
-        let Launch::Container {
-            lab,
-            resolved,
-            paths,
-        } = &spec.machine
-        else {
-            bail!(
-                "{}: vmlab-hv runs container micro-VMs only so far; a VM runs on QEMU (PRD §22)",
-                spec.label
-            );
+        let description = match &spec.machine {
+            Launch::Container {
+                lab,
+                resolved,
+                paths,
+            } => describe::container(lab, resolved, paths)?,
+            Launch::Vm {
+                lab,
+                resolved,
+                paths,
+                accel,
+                ..
+            } => describe::vm(
+                lab,
+                resolved,
+                paths,
+                *accel,
+                &describe::HostRoms::probe(self.firmware_dir.as_deref()),
+            )?,
         };
-        let description = describe::container(lab, resolved, paths)?;
         let control_sock = &spec.control_sock;
         let machine = machine_file(control_sock);
         if let Some(dir) = machine.parent() {
@@ -115,16 +185,31 @@ impl Hypervisor for VmlabHv {
         // vmlab-hv binds every socket it serves and refuses a path that is
         // already there; QEMU unlinks a stale one itself. A previous run that
         // was killed leaves them behind.
+        // The display sockets, where the description names them, else
+        // beside the control socket.
+        let display_socks = description.display.as_ref().map(|d| {
+            [
+                d.socket
+                    .clone()
+                    .unwrap_or_else(|| display::native_sock(control_sock)),
+                d.vnc_socket
+                    .clone()
+                    .unwrap_or_else(|| display::rfb_sock(control_sock)),
+            ]
+        });
         for stale in description
             .ports
             .iter()
-            .map(|p| p.socket.as_path())
-            .chain([control_sock.as_path()])
+            .map(|p| p.socket.clone())
+            .chain([control_sock.clone()])
+            .chain(display_socks.iter().flatten().cloned())
         {
-            match std::fs::remove_file(stale) {
+            match std::fs::remove_file(&stale) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("removing {}", stale.display())),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing {}", stale.display()));
+                }
             }
         }
 
@@ -136,7 +221,10 @@ impl Hypervisor for VmlabHv {
             Proc::spawn_with_fds(&spec.label, &binary, &args, &spec.env, &spec.log, spec.fds)
                 .await?;
         let proc: Arc<dyn Process> = super::qemu::host_process(proc);
-        let control = connect_retry(control_sock, &proc, &spec.log, log_from).await?;
+        let mut control = connect_retry(control_sock, &proc, &spec.log, log_from).await?;
+        if let Some([native, _]) = display_socks {
+            control.set_display(native);
+        }
         tracing::debug!(
             machine = %spec.label,
             agent = %spec.channels.agent.display(),

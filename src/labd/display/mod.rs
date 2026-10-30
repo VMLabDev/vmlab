@@ -29,7 +29,7 @@ use image::RgbImage;
 
 use super::hypervisor::{Frames, Input};
 use crate::profiles::InputTransport;
-use crate::record::{InputEvent, InputTap};
+use crate::record::{InputEvent, InputTap, StreamSource};
 use crate::vision::{self, Match, MatchOptions};
 
 /// What a [`Display`] needs from the machine behind it.
@@ -50,6 +50,14 @@ pub trait DisplayHost: Send + Sync + 'static {
     async fn frames(&self) -> Result<Arc<dyn Frames>>;
     /// The machine's VNC socket, for guests whose input rides RFB.
     fn vnc_sock(&self) -> PathBuf;
+    /// Where a console recorder streams this machine's frames from (§11.1):
+    /// the VNC socket, unless the hypervisor serves a stream of its own —
+    /// vmlab-hv's native frame protocol (§22). A socket path rather than the
+    /// frames capability, because a recording is armed before the machine's
+    /// control channel is published (D20) and outlives it across a restart.
+    fn stream_source(&self) -> StreamSource {
+        StreamSource::Vnc(self.vnc_sock())
+    }
     /// Where a screendump may be written and immediately deleted.
     fn capture_dir(&self) -> PathBuf;
     /// Whether input goes over QMP or VNC — a resolved hardware fact, not a
@@ -88,6 +96,11 @@ impl Display {
     /// own, separate connection (§11.1).
     pub fn vnc_sock(&self) -> PathBuf {
         self.host.vnc_sock()
+    }
+
+    /// Where a console recorder streams this machine's frames from.
+    pub fn stream_source(&self) -> StreamSource {
+        self.host.stream_source()
     }
 
     /// The feed a recorder attaches to for every input this display sends.

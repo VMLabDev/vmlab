@@ -381,10 +381,19 @@ _Avoid_: driver, backend, runtime
 vmlab's own hypervisor, one process per machine in place of QEMU, driven over
 its own control protocol from a machine description vmlab writes (PRD §22,
 ADR-0021). A machine is on it when its block says `hypervisor = "vmlab"` or the
-host config's default for its kind does. It runs container micro-VMs today;
-what it cannot run yet is one list of refusals, which each phase shrinks.
-An online snapshot belongs to the hypervisor that took it.
+host config's default for its kind does. It runs container micro-VMs and, from
+phases 2a and 2b, modern Linux VMs on q35 and SeaBIOS; what it cannot run yet
+is one list of refusals, each naming the phase that brings it, which each
+phase shrinks. An online snapshot belongs to the hypervisor that took it.
 _Avoid_: the new backend, vmm (for the product)
+
+**Native frames**:
+vmlab-hv's own display protocol on a VM's `display.sock`: shared-memory frames
+with their damage, the cursor as a shape and a position, keys and an absolute
+pointer. What screenshots, vision, scripted input and the console recorder use
+on a vmlab-hv VM, where QEMU's are QMP and RFB; RFB (`vnc.sock`) stays for
+human viewers on both.
+_Avoid_: the frame socket, VNC (for this protocol)
 
 **Spawner**:
 The guest-side counterpart of the Hypervisor seam, inside vmlab-agent: the one

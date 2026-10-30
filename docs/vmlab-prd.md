@@ -2556,17 +2556,36 @@ default for a phase's machines flips only once that phase has passed its gate:
 | Phase | Runs | Status |
 | --- | --- | --- |
 | 1 | Container micro-VMs (§18), x86_64 under KVM | Selectable |
-| 2 | Modern x86_64 VMs, QEMU-identical guest hardware | Refused |
+| 2a | Modern x86_64 VMs: q35 on SeaBIOS, virtio and AHCI disks, AHCI CD-ROMs, virtio-net, the USB tablet | Selectable |
+| 2b | Their display: the native frame protocol (screenshots, vision, input, the recorder) and an RFB server | Selectable |
+| 2c | OVMF, secure boot, a TPM, Hyper-V, Windows | Refused |
+| 2d | Paravirtual GPUs (`gpu {}`) | Refused |
+| 2e | virtio-fs shares and audio | Refused |
+| 2f | Host USB (`usb = true`) and vfio | Refused |
 | 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
 | 4 | Legacy PCs | Refused |
 
+macOS guests are a phase of their own after 2.
+
 **Refusals.** Validation (§5.1), and the lab daemon again before it builds a
-machine, refuse a machine on vmlab-hv that it cannot run yet, naming the
-machine and the reason: any VM (phase 1 runs containers only); `qemu_args`,
-which is QEMU's argv; a non-x86_64 architecture or `accel = "tcg"`; and a
-container on a host whose `/dev/kvm` is not usable — vmlab-hv has no
-emulation fallback, where QEMU falls back to TCG. The refusals are one list in
-code, which each phase shrinks.
+machine and before each start, refuse a machine on vmlab-hv that it cannot run
+yet, naming the machine, the reason and the phase that brings it. A VM runs
+from phase 2a when it is x86_64 under KVM on the q35 machine with SeaBIOS
+(`firmware = "seabios"`), std VGA or a 2D virtio-vga, virtio, SATA or IDE disks
+(both on AHCI), virtio-net NICs and the PS/2 keyboard with the USB tablet.
+Everything else is refused: OVMF, secure boot, a TPM or Hyper-V (2c); a `gpu
+{}` (2d); a share with `transport = "virtiofs"` (2e) — an `auto` share falls
+back to SMB, since a VM on vmlab-hv reports no virtiofsd; `usb = true` (2f); a
+macOS guest (its own phase); the i440fx machine, a floppy or
+`agent_transport = "isa-serial"` (4); `accel = "tcg"` (3); another display
+device, NIC model or `cpu_model`; a pinned `tsc` or `input = "usb"`, which a
+later phase brings; and `qemu_args`, QEMU's own argv, in every phase. A
+container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
+no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
+comes from its template and profile, so validation reads the resolved
+hardware where the template is in the store, and the daemon, which always
+resolves it, finishes the check. The refusals are one list in code, which each
+phase shrinks.
 
 **Launch.** For a container, vmlab writes a machine description beside the
 machine's control socket in its runtime directory — the guest asset's kernel
@@ -2578,7 +2597,33 @@ RTC base — and runs `vmlab-hv --machine <file> --control <socket> --paused`.
 The hypervisor's output goes to `vmlab-hv.log` beside the console log. An
 orphaned vmlab-hv is reaped by the same sweep as an orphaned QEMU, by the lab's
 runtime directory in its argv. What a running machine can do beyond the
-lifecycle is what vmlab-hv's handshake advertises: online snapshots in phase 1.
+lifecycle is what vmlab-hv's handshake advertises: online snapshots from phase
+1, and a VM's display and input from 2b.
+
+For a VM the description is the q35 machine QEMU runs for the same
+declaration, device for device at the PCI addresses QEMU's q35 gives the argv
+§5.2 composes, so a template built under QEMU finds its hardware where it left
+it: the agent's virtio-serial controller, the disks (`disk0` the linked clone
+and the snapshot's RAM and device state carrier), the NICs with their MACs,
+MTUs, switch sockets and vmlab-hv's own iPXE build as their option ROM where
+the host has one (`1af41000.rom`), the display device and its SeaVGABIOS, and
+the USB tablet on an xHCI in the slot after the display, where QEMU's `-usb`
+has ICH9 UHCI and EHCI controllers instead — vmlab-hv's one approved hardware
+difference. CD-ROMs sit on AHCI ports after the AHCI disks, and SeaBIOS boots
+in `bootindex` order: install media, then disks. SeaBIOS, SeaVGABIOS and the
+iPXE ROM are found under the host config's `firmware_dir/x86_64/`, then the
+distro's `/usr/share/qemu` and `/usr/share/seabios`. CPU policy is the host's
+CPU with VMX and SVM masked unless `nested`.
+
+**Display.** A VM on vmlab-hv has no QMP: its framebuffer and input are
+vmlab-hv's native frame protocol on `display.sock` in the machine's runtime
+directory — shared-memory frames with damage rectangles, the cursor as its own
+shape and position, resizes, keys by QEMU qcode and an absolute pointer. Screenshots,
+OCR, image matching, `send_keys`, `type_text` and the mouse use it, and so
+does the console recorder (§11.1), which reconnects across a restart or a
+restore like it does to RFB and draws the guest's own pointer where the guest
+puts it. vmlab-hv serves RFB on `vnc.sock` beside it for human viewers, so
+`vmlab console` and `gui = true` work unchanged.
 
 **Snapshots.** Every snapshot records the hypervisor that took it. An online
 snapshot holds RAM and device state in that hypervisor's own format, so

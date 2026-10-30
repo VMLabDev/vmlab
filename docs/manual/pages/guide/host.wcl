@@ -365,12 +365,25 @@ DOC
 
   p <<'DOC'
 QEMU runs every machine unless one says otherwise. vmlab-hv is vmlab's own
-hypervisor, built a phase at a time; it runs container micro-VMs today, on an
-x86_64 host with a usable `/dev/kvm`, and has no TCG fallback. A container
-opts in with `hypervisor = "vmlab"`, and `host { hypervisor { container =
-"vmlab" } }` moves every container that names none. `vmlab validate` refuses a
-VM on vmlab-hv, `qemu_args` on it, and a container on it where KVM is not
-usable, naming the machine and the reason. vmlab finds the binary as
+hypervisor, built a phase at a time, on an x86_64 host with a usable
+`/dev/kvm`; it has no TCG fallback. It runs container micro-VMs, and modern
+Linux VMs on the q35 machine with SeaBIOS: `firmware = "seabios"` (the
+`ubuntu-26.04` and `almalinux-10` templates declare it, and `linux-generic`
+defaults to it), std VGA or virtio-vga, virtio or SATA disks, CD-ROMs,
+virtio-net NICs and the USB tablet. A machine opts in with
+`hypervisor = "vmlab"`, and `host { hypervisor { container = "vmlab" vm =
+"vmlab" } }` moves every machine of that kind that names none. `vmlab
+validate` refuses what vmlab-hv cannot run yet, naming the machine, the reason
+and the phase that brings it: OVMF, secure boot, a TPM or Hyper-V (2c), a
+`gpu {}` (2d), a virtiofs share (2e), `usb = true` (2f), macOS, the i440fx
+machine and floppies, and `qemu_args` in every phase. A VM's `auto` shares
+fall back to SMB there.
+
+Screenshots, OCR, image matching, scripted keys and mouse, and `vmlab record`
+work on a vmlab-hv VM through its own frame protocol on `display.sock`, and
+`vmlab console` and `gui = true` reach its RFB server on `vnc.sock`, the
+socket QEMU's display uses. Online and offline snapshots work as on QEMU, but
+an online snapshot only restores on the hypervisor that took it. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`. `vmlab status -v`
 shows `hypervisor=` on every machine, and its log is `vmlab-hv.log` beside the
 console log, where QEMU's is `qemu.log`. PRD §22 and ADR-0021 record the

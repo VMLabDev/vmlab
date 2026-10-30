@@ -85,8 +85,13 @@ machine is reached with `vmlab shell` and `vmlab exec`.
 **A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
 "vmlab"` on a machine, else the host config's default per kind (QEMU), puts it
 on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
-pinned by git rev). Phase 1 runs container micro-VMs only; VMs, `qemu_args`
-and hosts without KVM are refused from one list. Snapshots record their
+pinned by git rev). Phase 1 runs container micro-VMs; phases 2a and 2b a
+modern Linux VM on q35 and SeaBIOS (`vmlab_hv/describe.rs` places every device
+where QEMU's q35 would), its screen, input and recording over vmlab-hv's
+native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
+`vnc.sock` for viewers. Everything else — OVMF, TPM, GPU, virtiofs, USB,
+macOS, i440fx, `qemu_args`, hosts without KVM — is refused from one list
+naming the phase that brings it. Snapshots record their
 hypervisor and an online one refuses to restore under the other.
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the
 profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
@@ -217,6 +222,10 @@ Module map under `src/`:
   cargo-zigbuild and rcodesign).
 - `media/` — folder → ISO/floppy with content-addressed cache.
 - `vision/` — screenshot, template matching, OCR.
+- `hvdisplay.rs` — vmlab-hv's native frame protocol as vmlab consumes it
+  (§22, phase 2b): one-shot captures, the input connection and the
+  recorder's `NativeStream`, all on a VM's `display.sock`; `hvdisplay/fake.rs`
+  is vmlab-hv's own server core behind a test-painted frame source.
 - `record/` — console recording (§11.1): the pure core (`core.rs`: framebuffer
   rectangles, cursor shapes and the inputs vmlab sent in; letterboxed frames
   on a constant clock, the pointer at the last position vmlab sent, click

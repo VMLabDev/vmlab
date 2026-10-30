@@ -563,3 +563,64 @@ fn the_pointer_sits_above_the_ripple() {
         "the ripple is there around it: {beside:?}"
     );
 }
+
+/// A display that reports the guest's own pointer (vmlab-hv's native
+/// protocol) moves and hides it, and a move alone keeps the interval
+/// active.
+#[test]
+fn the_guests_reported_pointer_moves_and_hides_it() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, Some(0.5)));
+    core.connected(secs(0.0), 8, 8);
+    core.rect(secs(0.0), 0, 0, 8, 8, &solid(8, 8, BLACK));
+    core.cursor(secs(0.01), arrow());
+    core.pointer_state(secs(0.02), 4, 4, true);
+    let frame = core.tick(secs(0.1)).pop().unwrap();
+    assert_eq!(pixel(&frame, size, 3, 3), [255, 255, 255]);
+
+    core.pointer_state(secs(0.11), 1, 1, true);
+    let frame = core.tick(secs(0.2)).pop().expect("a move is activity");
+    assert_eq!(pixel(&frame, size, 0, 0), [255, 255, 255]);
+    assert_eq!(pixel(&frame, size, 3, 3), BLACK);
+
+    core.pointer_state(secs(0.21), 1, 1, false);
+    let frame = core.tick(secs(0.3)).pop().expect("hiding is activity");
+    assert!(all(&frame, BLACK), "a hidden pointer is not drawn");
+}
+
+/// A display may repaint far more than it changes — vmlab-hv's native
+/// protocol reports a whole-screen flush for every caret blink. Only the
+/// pixels that change count, so the stretch is still idle and cut.
+#[test]
+fn a_whole_screen_repaint_that_changes_a_caret_is_idle() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, Some(1.0)));
+    core.connected(secs(0.0), 100, 100);
+    let mut screen = solid(100, 100, RED);
+    core.rect(secs(0.0), 0, 0, 100, 100, &screen);
+    assert_eq!(
+        core.tick(secs(0.1)).len(),
+        1,
+        "the first picture is activity"
+    );
+
+    // 3 s of whole-screen repaints, each toggling an 8x16 caret.
+    for i in 1..=30 {
+        let colour = if i % 2 == 0 { RED } else { GREEN };
+        for row in 0..16 {
+            for col in 0..8 {
+                let p = (row * 100 + col) * 4;
+                screen[p..p + 3].copy_from_slice(&[colour[2], colour[1], colour[0]]);
+            }
+        }
+        core.rect(secs(0.1 * f64::from(i) + 0.05), 0, 0, 100, 100, &screen);
+    }
+    assert_eq!(
+        core.tick(secs(3.1)).len(),
+        0,
+        "an open idle run emits nothing yet"
+    );
+    let frames = core.finish(secs(3.1));
+    assert_eq!(frames.len(), 5, "3 s of caret blinks becomes 0.5 s");
+    assert_eq!(core.cuts().len(), 1);
+}

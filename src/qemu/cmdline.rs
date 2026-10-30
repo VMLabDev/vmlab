@@ -19,6 +19,9 @@ pub struct VmPaths {
     /// streaming exec, file transfer, metrics — see `guest/agent-proto`.
     pub agent_sock: PathBuf,
     pub vnc_sock: PathBuf,
+    /// vmlab-hv's native frame socket (§22, phase 2b), beside `vnc_sock`.
+    /// QEMU has none and ignores it.
+    pub display_sock: PathBuf,
     /// Primary disk qcow2 (linked clone or blank).
     pub primary_disk: PathBuf,
     /// Additional disks in declaration order: (name, path).
