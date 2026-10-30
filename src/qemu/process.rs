@@ -306,7 +306,8 @@ pub async fn spawn_swtpm(
 ///   the trailing `/` keeps `foo` from matching `foobar`'s VMs,
 /// - the lab's runtime directory, which appears in every helper's argv as a
 ///   socket or state path (`swtpm --ctrl …/swtpm.sock`, `virtiofsd
-///   --socket-path …/virtiofs0.sock`),
+///   --socket-path …/virtiofs0.sock`) and in vmlab-hv's (`--machine
+///   …/machine.json --control …/control.sock`, PRD §22),
 /// - the lab's SMB state directory, which is how `smbd -s <…>/smb/smb.conf`
 ///   is recognised — it carries no runtime-dir path (needs `root`).
 ///
@@ -323,6 +324,13 @@ fn lab_process_markers(lab: &str, root: Option<&Path>) -> Vec<String> {
     markers
 }
 
+/// Whether a raw `/proc/<pid>/cmdline` is one [`kill_lab_orphans`] would
+/// reap for `lab` — for the tests of argvs composed elsewhere (vmlab-hv's).
+#[cfg(test)]
+pub(crate) fn cmdline_belongs_to(cmdline: &[u8], lab: &str) -> bool {
+    cmdline_matches(cmdline, &lab_process_markers(lab, None))
+}
+
 /// Does this raw `/proc/<pid>/cmdline` (NUL-separated argv) belong to `lab`?
 fn cmdline_matches(cmdline: &[u8], markers: &[String]) -> bool {
     cmdline.split(|b| *b == 0).any(|arg| {
@@ -336,8 +344,8 @@ fn cmdline_matches(cmdline: &[u8], markers: &[String]) -> bool {
     })
 }
 
-/// SIGKILL every process belonging to `lab` — QEMU **and** its helpers (swtpm,
-/// virtiofsd, smbd). Returns how many were signalled.
+/// SIGKILL every process belonging to `lab` — QEMU or vmlab-hv **and** their
+/// helpers (swtpm, virtiofsd, smbd). Returns how many were signalled.
 ///
 /// Used to reap what a lab daemon orphaned by dying without stopping anything:
 /// there is no `Proc` handle left, so we scan `/proc` for the lab's markers.

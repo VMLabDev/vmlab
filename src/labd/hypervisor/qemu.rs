@@ -68,12 +68,7 @@ impl Hypervisor for Qemu {
         readonly: bool,
         log: &Path,
     ) -> Result<Arc<dyn Process>> {
-        let proc = crate::qemu::virtiofsd::spawn(machine, socket, shared_dir, readonly, log)
-            .await
-            .with_context(|| {
-                format!("{machine}: starting virtiofsd for {}", shared_dir.display())
-            })?;
-        Ok(host_process(proc))
+        start_host_virtiofsd(machine, socket, shared_dir, readonly, log).await
     }
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
@@ -83,7 +78,7 @@ impl Hypervisor for Qemu {
         let proc =
             Proc::spawn_with_fds(&spec.label, &binary, &args, &spec.env, &spec.log, spec.fds)
                 .await?;
-        let qmp = connect_qmp_retry(&spec.qmp_sock, &proc, &spec.log, log_from).await?;
+        let qmp = connect_qmp_retry(&spec.control_sock, &proc, &spec.log, log_from).await?;
         // QEMU binds the guest channels itself, from the argv — this adapter
         // has nothing to stand up, only to say where they landed. It is the
         // first thing anyone wants when a terminal will not attach.
@@ -97,6 +92,10 @@ impl Hypervisor for Qemu {
             proc: host_process(proc),
             control: Arc::new(QemuControl::new(qmp)),
         })
+    }
+
+    fn emulator_binary(&self, arch: &str) -> String {
+        crate::qemu::emulator_binary(arch)
     }
 
     fn guest_asset(&self, arch: &str) -> Result<GuestAsset> {
@@ -130,8 +129,23 @@ fn compose(launch: &Launch) -> Result<(String, Vec<String>)> {
     })
 }
 
+/// One virtiofsd on this host — the same daemon whichever hypervisor
+/// connects to it over vhost-user.
+pub(super) async fn start_host_virtiofsd(
+    machine: &str,
+    socket: &Path,
+    shared_dir: &Path,
+    readonly: bool,
+    log: &Path,
+) -> Result<Arc<dyn Process>> {
+    let proc = crate::qemu::virtiofsd::spawn(machine, socket, shared_dir, readonly, log)
+        .await
+        .with_context(|| format!("{machine}: starting virtiofsd for {}", shared_dir.display()))?;
+    Ok(host_process(proc))
+}
+
 /// Present a spawned host process as the seam's [`Process`].
-fn host_process(proc: Arc<Proc>) -> Arc<dyn Process> {
+pub(super) fn host_process(proc: Arc<Proc>) -> Arc<dyn Process> {
     Arc::new(HostProcess(proc))
 }
 

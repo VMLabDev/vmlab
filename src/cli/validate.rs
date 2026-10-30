@@ -56,6 +56,16 @@ impl ValidationContext for HostContext {
             .map_err(|e| format!("{e:#}"))
     }
 
+    fn hypervisor_defaults(&self) -> crate::config::hypervisor::HypervisorDefaults {
+        crate::config::host::HostConfig::load_default()
+            .map(|h| h.hypervisor)
+            .unwrap_or_default()
+    }
+
+    fn host_facts(&self) -> crate::config::hypervisor::HostFacts {
+        crate::config::hypervisor::HostFacts::probe()
+    }
+
     fn check_script(&self, path: &Path) -> Result<(), String> {
         let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         crate::scripting::check_script_source(&source)
