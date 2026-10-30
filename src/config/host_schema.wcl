@@ -42,6 +42,8 @@ type HostConfig {
   firmware_dir: utf8?
   @doc("The vmlab-hv binary machines on `hypervisor = \"vmlab\"` run (PRD §22); default: `vmlab-hv` on PATH")
   vmlab_hv: utf8?
+  @doc("Set NOCOW (`chattr +C`) on a machine's disk directory on btrfs before its disks are created, so online snapshots do not fragment them; NOCOW files lose btrfs checksums and compression; default `true`")
+  btrfs_nocow: bool?
   @doc("The hypervisor a machine runs on when it names none, by machine kind (PRD §22)")
   @child("hypervisor") hypervisor: HostHypervisor?
 }

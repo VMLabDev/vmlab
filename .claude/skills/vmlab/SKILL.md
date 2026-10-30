@@ -37,6 +37,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | GPU acceleration: `gpu {}` modes, host GPUs, Venus, keeping a GPU awake | `references/vm.md`, `references/host-profiles.md` |
 | A guest that sleeps: the `suspended` state, `prevent_sleep`, waking with `vm start` | `references/vm.md`, `references/troubleshooting.md` |
 | A slow Windows guest under KVM: Hyper-V enlightenments (`hyperv`), on by default for Windows profiles from Vista on; an idle Windows guest's host CPU cost | `references/vm.md`, `references/troubleshooting.md` |
+| Slow or worsening online snapshots on btrfs; NOCOW on disk directories (`btrfs_nocow`) | `references/host-profiles.md`, `references/troubleshooting.md` |
 | macOS guests: the `macos` profile, `apple_smc`, `input = "usb"`, `tsc = "host"`, `ignore_msrs`, and what the macOS family changes (shares, logins, playbooks, `app run`) | `references/host-profiles.md`, `references/vm.md`, `references/troubleshooting.md` |
 | The guest clock: `clock`, the RTC, what a restore sets | `references/vm.md`, `references/snapshots-vision.md` |
 | Containers as lab machines, the micro-VM model, the `container {}` block | `references/containers.md` |

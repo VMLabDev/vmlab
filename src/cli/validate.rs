@@ -164,6 +164,9 @@ pub fn cmd_validate() -> Result<()> {
     for warning in gpu_warnings(&file, |_| true) {
         eprintln!("WARNING: {warning}");
     }
+    for line in nocow_notes(&file) {
+        println!("{line}");
+    }
     println!(
         "ok: lab \"{}\" — {} vm(s), {} container(s), {} segment(s)",
         file.lab.name,
@@ -172,6 +175,33 @@ pub fn cmd_validate() -> Result<()> {
         file.lab.segments.len()
     );
     Ok(())
+}
+
+/// What `up` will do to each machine's disk directory on btrfs (PRD §7.1,
+/// `crate::nocow`): a line per directory it will set NOCOW on, or a
+/// warning where the filesystem could not be asked. Nothing off btrfs,
+/// opted out, or once set.
+fn nocow_notes(file: &crate::config::LabFile) -> Vec<String> {
+    let local = crate::paths::lab_local_dir(&file.root);
+    let machines = file
+        .lab
+        .vms
+        .iter()
+        .map(|vm| (vm.name.as_str(), local.join("vms").join(&vm.name)))
+        .chain(
+            file.lab
+                .containers
+                .iter()
+                .map(|c| (c.name.as_str(), local.join("containers").join(&c.name))),
+        );
+    machines
+        .filter_map(
+            |(name, dir)| match crate::nocow::decide_on_host(name, &dir) {
+                Ok(plan) => plan.describe(name, &dir, false),
+                Err(warning) => Some(warning),
+            },
+        )
+        .collect()
 }
 
 /// What the chosen VMs' `gpu {}` blocks earn on this host short of an error

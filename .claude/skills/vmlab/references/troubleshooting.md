@@ -197,6 +197,10 @@ Two other messages come from the same loop and look like a halt but are not:
 - Volume warning: ``this pass is carrying {n} paths ({m} MiB) under {prefix} — syncing continues, and adding `{prefix}/` to .vmlabignore makes that subtree guest-owned if it is build output``. Never halts.
 - A line under `deferred while git holds a lock` is timing, not a conflict, and clears itself when the lock goes.
 
+## Online snapshots get slower each time on btrfs
+
+An online snapshot writes guest RAM into the machine's qcow2. A disk created on copy-on-write btrfs before vmlab set NOCOW on its directory fragments with every snapshot and guest write: `filefrag .vmlab/vms/<vm>/disk0.qcow2` shows tens of thousands of extents and `lsattr` shows no `C`. Only files created after the directory's flag inherit it, so stop the machine and copy the disk within its directory: `cp --reflink=never disk0.qcow2 disk0.new && mv disk0.new disk0.qcow2` (snapshots inside it survive). With `btrfs_nocow = false` in the host config, remove it first (host-profiles.md).
+
 ## A snapshot capture is refused
 
 ```
