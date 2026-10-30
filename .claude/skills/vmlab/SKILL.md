@@ -36,7 +36,7 @@ recalling vmlab behaviour or reading vmlab's source.
 | The `vm {}` block and every child block: attributes, types, defaults | `references/vm.md` |
 | GPU acceleration: `gpu {}` modes, host GPUs, Venus, keeping a GPU awake | `references/vm.md`, `references/host-profiles.md` |
 | A guest that sleeps: the `suspended` state, `prevent_sleep`, waking with `vm start` | `references/vm.md`, `references/troubleshooting.md` |
-| A slow Windows guest under KVM: Hyper-V enlightenments (`hyperv`), on by default for Windows profiles from Vista on | `references/vm.md`, `references/troubleshooting.md` |
+| A slow Windows guest under KVM: Hyper-V enlightenments (`hyperv`), on by default for Windows profiles from Vista on; an idle Windows guest's host CPU cost | `references/vm.md`, `references/troubleshooting.md` |
 | The guest clock: `clock`, the RTC, what a restore sets | `references/vm.md`, `references/snapshots-vision.md` |
 | Containers as lab machines, the micro-VM model, the `container {}` block | `references/containers.md` |
 | Segments, DHCP, DNS, NAT, routing, traffic rules, the eBPF fast path | `references/networking.md` |

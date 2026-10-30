@@ -791,6 +791,45 @@ MSG
     the guest, and every online snapshot is a migration.
   DOC
 
+  h2 "An idle Windows guest costs host CPU"
+  p <<DOC
+    vmlab prints nothing for this. The symptom is a qemu process that uses
+    several percent of a host core, or a quarter of one under WSL 2, while
+    Task Manager inside the guest shows it idle. Windows 11 24H2, 25H2 and
+    Windows Server 2025 take 512 clock interrupts a second on every vCPU even
+    when idle, against 64 for Server 2022, and each one leaves the guest. On
+    a native AMD host a 4-vCPU Server 2025 guest measured about 4% of a core
+    and 6,900 exits a second at idle, Server 2022 about 1% and 700, and Debian
+    13 under 1% and 160. Nested under WSL 2 each exit costs many times more,
+    which is where 23-29% of a core comes from. The rate does not change with
+    `hyperv`, HPET, the USB controller, the RTC, `+invtsc`, the guest's power
+    plan or its `bcdedit` tick settings, and the vmlab agent plays no part in
+    it.
+  DOC
+  p <<DOC
+    vmlab removes the exits it can. Where the host's KVM virtualises the APIC
+    it adds `hv-avic` and stops PIT tick re-injection, which takes an idle
+    Server 2025 guest from about 6,900 to about 4,900 exits a second. Check
+    that the host has it on: `cat /sys/module/kvm_amd/parameters/avic` on
+    AMD, `cat /sys/module/kvm_intel/parameters/enable_apicv` on Intel. If it
+    is off, turn it on with
+    `echo "options kvm_amd avic=1" | sudo tee /etc/modprobe.d/kvm-avic.conf`
+    (Intel: `options kvm_intel enable_apicv=1`) and reload the module with no
+    VM running. Under WSL 2 the setting belongs to the WSL kernel's KVM and
+    may not be available at all, and then nothing on the vmlab side reduces
+    the cost. Halt polling (`/sys/module/kvm/parameters/halt_poll_ns`) is not
+    the lever: the guest sleeps about 2 ms between ticks, longer than KVM
+    polls, so KVM's adaptive polling turns itself off (on the host measured,
+    about 2 polls a second against 2,000 halts).
+  DOC
+  p <<DOC
+    What you can change is the guest. The cost is per vCPU, so an idle
+    machine with 2 vCPUs costs half of one with 4: set `cpus` on the VM. A
+    machine that does not need Server 2025 takes a tenth of the exits on
+    Server 2022. A machine you are not using costs nothing once you stop it with
+    `vmlab vm stop`.
+  DOC
+
   h2 "Hyper-V enlightenments were not applied"
   code text { source = "warning: vm \"{machine}\": hyperv = true is not applied — {reason}; it boots without the Hyper-V enlightenments (PRD §5.2)" }
   p <<DOC
