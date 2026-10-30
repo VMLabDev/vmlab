@@ -587,3 +587,40 @@ fn the_guests_reported_pointer_moves_and_hides_it() {
     let frame = core.tick(secs(0.3)).pop().expect("hiding is activity");
     assert!(all(&frame, BLACK), "a hidden pointer is not drawn");
 }
+
+/// A display may repaint far more than it changes — vmlab-hv's native
+/// protocol reports a whole-screen flush for every caret blink. Only the
+/// pixels that change count, so the stretch is still idle and cut.
+#[test]
+fn a_whole_screen_repaint_that_changes_a_caret_is_idle() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, Some(1.0)));
+    core.connected(secs(0.0), 100, 100);
+    let mut screen = solid(100, 100, RED);
+    core.rect(secs(0.0), 0, 0, 100, 100, &screen);
+    assert_eq!(
+        core.tick(secs(0.1)).len(),
+        1,
+        "the first picture is activity"
+    );
+
+    // 3 s of whole-screen repaints, each toggling an 8x16 caret.
+    for i in 1..=30 {
+        let colour = if i % 2 == 0 { RED } else { GREEN };
+        for row in 0..16 {
+            for col in 0..8 {
+                let p = (row * 100 + col) * 4;
+                screen[p..p + 3].copy_from_slice(&[colour[2], colour[1], colour[0]]);
+            }
+        }
+        core.rect(secs(0.1 * f64::from(i) + 0.05), 0, 0, 100, 100, &screen);
+    }
+    assert_eq!(
+        core.tick(secs(3.1)).len(),
+        0,
+        "an open idle run emits nothing yet"
+    );
+    let frames = core.finish(secs(3.1));
+    assert_eq!(frames.len(), 5, "3 s of caret blinks becomes 0.5 s");
+    assert_eq!(core.cuts().len(), 1);
+}
