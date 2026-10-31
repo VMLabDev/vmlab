@@ -24,6 +24,12 @@ impl HostContext {
 }
 
 impl ValidationContext for HostContext {
+    fn check_apple_smc_osk(&self) -> Result<(), String> {
+        let host = crate::config::host::HostConfig::load_default().map_err(|e| e.to_string())?;
+        host.apple_smc_osk
+            .ok_or_else(|| crate::config::host::APPLE_SMC_OSK_REQUIRED.to_string())
+            .map(|_| ())
+    }
     /// Resolved through the store, so a version pin resolves the same way
     /// it will at `up` (PRD §6.2) and a half-installed entry — metadata
     /// without its disk, or the reverse — reads as absent rather than

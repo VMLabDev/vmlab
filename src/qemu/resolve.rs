@@ -264,6 +264,18 @@ impl Layer {
 }
 
 /// First layer that declared a value, and which layer that was.
+pub fn resolve_apple_smc(
+    vm: &Vm,
+    template: Option<&TemplateMeta>,
+    profile: &Profile,
+) -> Option<(bool, Layer)> {
+    pick(
+        vm.apple_smc,
+        template.and_then(|t| t.apple_smc),
+        profile.apple_smc,
+    )
+}
+
 fn pick<T>(vm: Option<T>, template: Option<T>, profile: Option<T>) -> Option<(T, Layer)> {
     vm.map(|v| (v, Layer::Vm))
         .or_else(|| template.map(|v| (v, Layer::Template)))
@@ -574,11 +586,7 @@ pub fn resolve_vm(
         from: layer.label(profile_name.as_deref()),
     });
 
-    let apple_smc = pick(
-        lab_vm.apple_smc,
-        template.and_then(|t| t.apple_smc),
-        profile.apple_smc,
-    );
+    let apple_smc = resolve_apple_smc(lab_vm, template, profile);
     let tsc = pick(lab_vm.tsc, template.and_then(|t| t.tsc), profile.tsc);
     // Both are x86 devices and properties — an ISA device and an x86 CPU
     // property — so a VM of another arch that inherited one cannot boot.

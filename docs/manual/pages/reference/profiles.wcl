@@ -129,6 +129,14 @@ SRC
 
   h2 "Shipped profiles"
   p <<DOC
+    The `macos` profile enables `apple_smc`. vmlab refuses these machines
+    until `host.apple_smc_osk` is set to the key obtained from your own Apple
+    hardware. The public `smc_read` approach reads `OSK0` followed by `OSK1`.
+    See [Apple SMC OSK in host configuration](ref_host) for the format and
+    setup. The key belongs only in host configuration, never in a profile,
+    lab file, template or OCI image.
+  DOC
+  p <<DOC
     The shipped set, with the values each one carries. A blank cell means
     the field is unset. `windows-11`, `windows-10`, `windows-server` and
     `windows-legacy` also set `hyperv = true`; `windows-xp` and `windows-9x`

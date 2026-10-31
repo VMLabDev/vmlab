@@ -15,6 +15,44 @@ use anyhow::{Context, Result};
 use tokio::process::Command;
 use tokio::sync::watch;
 
+/// Conservatively hide the remainder of any argv element carrying an OSK.
+pub fn redact_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|arg| match arg.split_once("osk=") {
+            Some((prefix, _)) => format!("{prefix}osk=[REDACTED]"),
+            None => arg.clone(),
+        })
+        .collect()
+}
+
+fn osk_secrets(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter_map(|arg| arg.split_once("osk=").map(|(_, value)| value))
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| [value.to_string(), value.replace(",,", ",")])
+        .collect()
+}
+
+async fn copy_redacted(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    log: std::fs::File,
+    secrets: Vec<String>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut reader = BufReader::new(stream);
+    let mut log = tokio::fs::File::from_std(log);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).await? != 0 {
+        let mut text = String::from_utf8_lossy(&line).into_owned();
+        for secret in &secrets {
+            text = text.replace(secret, "[REDACTED]");
+        }
+        log.write_all(text.as_bytes()).await?;
+        line.clear();
+    }
+    log.flush().await
+}
+
 /// A spawned VM (or helper) process.
 pub struct Proc {
     pub name: String,
@@ -71,12 +109,22 @@ impl Proc {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
         let log_err = log.try_clone()?;
+        let secrets = osk_secrets(args);
+        let filter_output = !secrets.is_empty();
 
         let mut cmd = Command::new(binary);
         cmd.args(args)
             .stdin(Stdio::null())
-            .stdout(log)
-            .stderr(log_err)
+            .stdout(if filter_output {
+                Stdio::piped()
+            } else {
+                Stdio::from(log.try_clone()?)
+            })
+            .stderr(if filter_output {
+                Stdio::piped()
+            } else {
+                Stdio::from(log_err.try_clone()?)
+            })
             .kill_on_drop(false);
         for var in &env.remove {
             cmd.env_remove(var);
@@ -106,6 +154,17 @@ impl Proc {
             .spawn()
             .with_context(|| format!("spawning {binary} for {name}"))?;
 
+        let output = if filter_output {
+            let stdout = child.stdout.take().expect("piped stdout");
+            let stderr = child.stderr.take().expect("piped stderr");
+            Some((
+                tokio::spawn(copy_redacted(stdout, log, secrets.clone())),
+                tokio::spawn(copy_redacted(stderr, log_err, secrets)),
+            ))
+        } else {
+            None
+        };
+
         let (tx, rx) = watch::channel(None);
         let proc = Arc::new(Proc {
             name: name.to_string(),
@@ -118,6 +177,13 @@ impl Proc {
         let watcher = proc.clone();
         tokio::spawn(async move {
             let status = child.wait().await;
+            if let Some((stdout, stderr)) = output {
+                for task in [stdout, stderr] {
+                    if !matches!(task.await, Ok(Ok(()))) {
+                        tracing::warn!("emulator output could not be written to its log");
+                    }
+                }
+            }
             let s = match status {
                 Ok(st) => st.to_string(),
                 Err(e) => format!("wait failed: {e}"),
@@ -209,7 +275,7 @@ pub fn write_launch_header(
     writeln!(
         f,
         "{LAUNCH_LOG_PREFIX}argv: {binary} {}\n{LAUNCH_LOG_PREFIX}env: {}",
-        args.join(" "),
+        redact_args(args).join(" "),
         if set.is_empty() {
             "(none set)".to_string()
         } else {
@@ -406,6 +472,52 @@ fn matching_pids(markers: &[String]) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn apple_smc_osk_is_redacted_in_headers_output_and_startup_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("qemu.log");
+        let key = "TEST".repeat(16);
+        let args = vec![
+            "-c".into(),
+            "printf '%s\\n' \"$0\"; printf '%s\\n' \"$0\" >&2; exit 1".into(),
+            format!("isa-applesmc,osk={key}"),
+        ];
+        super::write_launch_header(&log, "/bin/sh", &args, &Default::default()).unwrap();
+        let proc = super::Proc::spawn("redaction", "/bin/sh", &args, &Default::default(), &log)
+            .await
+            .unwrap();
+        let status = proc
+            .wait_exit(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains(&key));
+        assert_eq!(text.matches("osk=[REDACTED]").count(), 3);
+        let error = super::exited_during_startup("QEMU", &status, &log, 0).to_string();
+        assert!(error.contains("[REDACTED]"));
+        assert!(!error.contains(&key));
+    }
+    #[tokio::test]
+    async fn redaction_hides_both_qemu_escaped_and_raw_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("qemu.log");
+        let key = "T, ".repeat(21) + "~";
+        let escaped = key.replace(',', ",,");
+        let args = vec![format!("isa-applesmc,osk={escaped}")];
+        let output = format!("device option: {}\nraw key: {key}", args[0]);
+        copy_redacted(
+            output.as_bytes(),
+            std::fs::File::create(&log).unwrap(),
+            osk_secrets(&args),
+        )
+        .await
+        .unwrap();
+        let text = std::fs::read_to_string(log).unwrap();
+        assert!(!text.contains(&key));
+        assert!(!text.contains(&escaped));
+        assert_eq!(text.matches("[REDACTED]").count(), 2);
+    }
 
     /// Only this run's output is quoted: the log is appended to across runs,
     /// and an earlier run's failure must not be passed off as this one's.

@@ -19,6 +19,34 @@ pub const HOST_SCHEMA_WCL: &str = include_str!("host_schema.wcl");
 /// happens to be large, and that warns rather than refuses.
 pub const DEFAULT_WORKSPACE_MAX_FILE: u64 = 256 << 20;
 
+pub const APPLE_SMC_OSK_REQUIRED: &str = "apple_smc = true requires host.apple_smc_osk in \
+    ~/.config/vmlab/config.wcl; obtain it from your own Apple hardware. \
+    See docs/manual/pages/reference/host-config.wcl (Apple SMC OSK)";
+
+/// A host-supplied key. Debug output must never expose its contents.
+#[derive(Clone)]
+pub struct AppleSmcOsk(String);
+
+impl std::fmt::Debug for AppleSmcOsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl AppleSmcOsk {
+    pub fn parse(value: String) -> Result<Self> {
+        anyhow::ensure!(
+            value.len() == 64 && value.bytes().all(|b| (b' '..=b'~').contains(&b)),
+            "host.apple_smc_osk must be exactly 64 printable ASCII characters"
+        );
+        Ok(Self(value))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub subnet_pool: ipnet::Ipv4Net,
@@ -26,6 +54,7 @@ pub struct HostConfig {
     pub dns_upstream: Option<String>,
     pub disk_low_percent: u8,
     pub psk: Option<String>,
+    pub apple_smc_osk: Option<AppleSmcOsk>,
     /// TCP listen port for inbound cross-host segment trunks (§9.2).
     pub trunk_port: u16,
     pub viewer: Option<String>,
@@ -139,6 +168,7 @@ impl Default for HostConfig {
             dns_upstream: None,
             disk_low_percent: 10,
             psk: None,
+            apple_smc_osk: None,
             trunk_port: 13947,
             viewer: None,
             waypipe: None,
@@ -202,6 +232,12 @@ impl HostConfig {
                 cfg.disk_low_percent = v;
             }
             cfg.psk = r.string("psk").unspan();
+            if let Some(v) = r.string("apple_smc_osk") {
+                match AppleSmcOsk::parse(v.value) {
+                    Ok(key) => cfg.apple_smc_osk = Some(key),
+                    Err(why) => r.issue_at(v.span, why.to_string()),
+                }
+            }
             if let Some(v) = r.port("trunk_port").unspan() {
                 cfg.trunk_port = v;
             }
@@ -302,7 +338,13 @@ impl HostConfig {
             cfg.gpus.push(gpu);
         }
         super::supersede(&mut issues, moved);
-        Ok(finish(name, source, issues, Some(cfg))?)
+        // Preserve byte offsets and lines without retaining secret-bearing
+        // source excerpts in diagnostics.
+        let diagnostic_source: String = source
+            .bytes()
+            .map(|b| if b == b'\n' { '\n' } else { ' ' })
+            .collect();
+        Ok(finish(name, &diagnostic_source, issues, Some(cfg))?)
     }
 
     /// The host GPU named `name`, matched case-insensitively.
@@ -403,6 +445,39 @@ pub fn spawn_disk_watchdog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_smc_osk_is_optional_validated_and_hidden() {
+        assert!(HostConfig::default().apple_smc_osk.is_none());
+        for value in ["T".repeat(64), " ".repeat(64), ",\"\\".repeat(21) + "~"] {
+            let source = format!(
+                "import <vmlab-host.wcl>\nhost {{ apple_smc_osk = {} }}",
+                serde_json::to_string(&value).unwrap()
+            );
+            let host = HostConfig::parse(&source, "<test>").unwrap();
+            assert_eq!(host.apple_smc_osk.as_ref().unwrap().expose(), value);
+            assert!(!format!("{host:?}").contains(&value));
+        }
+        for value in [
+            "T".repeat(63),
+            "T".repeat(65),
+            "é".repeat(32),
+            "\t".repeat(64),
+            "\n".repeat(64),
+            "\u{7f}".repeat(64),
+        ] {
+            let source = format!(
+                "import <vmlab-host.wcl>\nhost {{ apple_smc_osk = {} }}",
+                serde_json::to_string(&value).unwrap()
+            );
+            let error = HostConfig::parse(&source, "<test>").unwrap_err();
+            assert!(
+                error.to_string().contains("exactly 64 printable ASCII"),
+                "{error}"
+            );
+            assert!(!format!("{error:?}").contains(&source));
+        }
+    }
 
     #[test]
     fn defaults_when_absent() {

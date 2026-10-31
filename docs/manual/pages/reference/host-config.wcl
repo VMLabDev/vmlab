@@ -80,6 +80,7 @@ SRC
       | "`dns_upstream`" | "utf8" | "host resolver" | "Upstream resolver as `ip[:port]` for queries the lab DNS cannot answer." |
       | "`disk_low_percent`" | "i64" | "`10`" | "Free-space percentage, 0 to 100, below which the `host.disk_low` watchdog fires." |
       | "`psk`" | "utf8" | "none" | "Pre-shared key for cross-host segment links. Set the same value on both hosts." |
+      | "`apple_smc_osk`" | "utf8" | "none" | "Apple SMC OSK from your own Apple hardware, exactly 64 printable ASCII characters. Required for any machine resolving `apple_smc = true`. Inline only; no file-path key." |
       | "`trunk_port`" | "i64" | "`13947`" | "TCP port the supervisor listens on for inbound cross-host segment trunks, 1 to 65535." |
       | "`viewer`" | "utf8" | "none" | "VNC viewer command; `{}` is replaced by the target." |
       | "`waypipe`" | "utf8" | "`waypipe` on `PATH`" | "Path to the host's waypipe client for [shared apps](guide_apps) from Linux guests." |
@@ -128,6 +129,37 @@ SRC
     `vmlab up` unless `--record` is given. See
     [Console recording](guide_recording).
   DOC
+  h2 "Apple SMC OSK"
+  p <<DOC
+    vmlab does not ship an OSK or download one. Obtain the key from your own
+    Apple hardware. The public `smc_read` approach reads the SMC keys `OSK0`
+    and `OSK1` on an Intel Mac. Concatenate their 32-character values in that
+    order, without a separator or trailing newline.
+  DOC
+  p <<DOC
+    Set `apple_smc_osk = "<your key>"` inside `host {}` in
+    `~/.config/vmlab/config.wcl`. Replace the illustrative placeholder with
+    your 64-character key. Spaces and other printable ASCII characters are
+    accepted; control characters, non-ASCII text and any other length are
+    rejected. Escape quotes and backslashes using WCL string syntax.
+    Keep this host file private and out of version control.
+  DOC
+  p <<DOC
+    `vmlab validate` refuses machines that resolve `apple_smc = true` until
+    this key is set, including the shipped `macos` profile. `vmlab up`
+    checks every target after template pulls and before any machine boots;
+    individual starts check again. The host file is read for these checks
+    and at launch, so updating this key requires no daemon restart.
+  DOC
+  p <<DOC
+    QEMU receives the key in `isa-applesmc,osk=<value>`. vmlab redacts it
+    from launch headers, emulator output and startup errors. Debug dumps of
+    host configuration and launch paths also redact it. The key is never
+    recorded in templates or OCI metadata. It remains visible to host
+    processes allowed to read QEMU's operating-system process arguments.
+    vmlab-hv continues to refuse Apple SMC machines until its macOS phase.
+  DOC
+
   h2 "hypervisor {}"
   p <<DOC
     The hypervisor a machine runs on when its own `vm {}` or `container {}`

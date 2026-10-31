@@ -284,6 +284,10 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
         },
     );
     let on_vmlab = script.vmlab_hv;
+    vm.set_host_config(crate::config::host::HostConfig::parse(
+        "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST\" }",
+        "<test>",
+    ).unwrap());
     let hv = FakeHypervisor::new(script);
     if on_vmlab {
         vm = vm.on_hypervisor(crate::config::hypervisor::HypervisorKind::Vmlab, hv.clone());
@@ -2649,6 +2653,54 @@ async fn a_vmlab_hv_vm_on_a_host_without_kvm_is_refused_at_start() {
     assert!(format!("{err:#}").contains("/dev/kvm"), "{err:#}");
     assert_eq!(hv.starts(), 0, "nothing was started");
     assert_eq!(vm.state().await, PowerState::Stopped);
+}
+
+#[tokio::test]
+async fn apple_smc_without_a_host_key_is_refused_before_launch() {
+    let dirs = Dirs::new();
+    let (mut vm, _hv) = vm(
+        &dirs,
+        r#"vm "mac" { template = "scratch" arch = "x86_64" profile = "macos" disk = 10GiB }"#,
+        Script::healthy(),
+    );
+    vm.set_host_config(Default::default());
+    let error = vm.check_host_config().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        crate::config::host::APPLE_SMC_OSK_REQUIRED
+    );
+    let (cbs, _observed) = callbacks();
+    let error = start_vm(&vm, cbs).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        crate::config::host::APPLE_SMC_OSK_REQUIRED
+    );
+    assert_eq!(vm.state().await, PowerState::Stopped);
+    assert!(!vm.run_dir().exists());
+}
+
+#[tokio::test]
+async fn apple_smc_preflight_refuses_the_whole_lab_before_any_boot() {
+    let linux_dirs = Dirs::new();
+    let mac_dirs = Dirs::new();
+    let mac_decl =
+        r#"vm "mac" { template = "scratch" arch = "x86_64" profile = "macos" disk = 10GiB }"#;
+    let (linux, _) = vm(&linux_dirs, LINUX_VM, Script::healthy());
+    let (mut mac, _) = vm(&mac_dirs, mac_decl, Script::healthy());
+    mac.set_host_config(Default::default());
+    let source = format!("import <vmlab.wcl>\nlab \"t\" {{ {LINUX_VM} {mac_decl} }}");
+    let config = crate::config::load_lab_source(&source, "<test>", &linux_dirs.root).unwrap();
+    let lab =
+        super::lab::LabRuntime::with_machines(config, vec![linux.clone(), mac.clone()]).unwrap();
+    let error = lab
+        .preflight_binaries(&["dc01".into(), "mac".into()])
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        crate::config::host::APPLE_SMC_OSK_REQUIRED
+    );
+    assert!(!linux.run_dir().exists());
+    assert!(!mac.run_dir().exists());
 }
 
 /// A guest reset on vmlab-hv happens in place (PRD §22): the same process

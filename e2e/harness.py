@@ -28,6 +28,11 @@ WORK = pathlib.Path(os.environ.get("E2E_WORK", "/work"))
 RESULTS = pathlib.Path(os.environ.get("E2E_RESULTS", "/results"))
 
 
+def redact_osk(text: str) -> str:
+    """Hide device options, including keys containing printable whitespace."""
+    return re.sub(r"osk=[^\r\n\x00]*", "osk=[REDACTED]", text)
+
+
 class ScenarioFailed(Exception):
     """A step a scenario cannot continue past."""
 
@@ -73,7 +78,7 @@ class Harness:
     ) -> Result:
         """Run a command, log it and its output, and fail the step on a
         nonzero exit when `check` is set."""
-        self.log.write(f"\n[{self.scenario}] $ {' '.join(argv)}  (cwd={cwd or WORK})\n")
+        self.log.write(redact_osk(f"\n[{self.scenario}] $ {' '.join(argv)}  (cwd={cwd or WORK})\n"))
         full_env = dict(os.environ, **(env or {}))
         try:
             p = subprocess.run(
@@ -90,12 +95,15 @@ class Harness:
             out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
             err = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
             r = Result(argv, 124, out, err + f"\n[timed out after {timeout}s]")
+        r.out = redact_osk(r.out)
+        r.err = redact_osk(r.err)
+        r.argv = [redact_osk(arg) for arg in r.argv]
         self.log.write(r.out)
         if r.err:
             self.log.write("[stderr] " + r.err)
         self.log.write(f"[exit {r.code}]\n")
         if check and r.code != 0:
-            raise ScenarioFailed(f"`{' '.join(argv)}` exited {r.code}: {r.text.strip()[-800:]}")
+            raise ScenarioFailed(f"`{' '.join(r.argv)}` exited {r.code}: {r.text.strip()[-800:]}")
         return r
 
     def vmlab(self, *args: str, **kw) -> Result:
@@ -112,7 +120,7 @@ class Harness:
         )
 
     def background(self, argv: list[str], cwd: pathlib.Path | None = None) -> subprocess.Popen:
-        self.log.write(f"\n[{self.scenario}] $ {' '.join(argv)} &\n")
+        self.log.write(redact_osk(f"\n[{self.scenario}] $ {' '.join(argv)} &\n"))
         return subprocess.Popen(
             argv,
             cwd=cwd or WORK,

@@ -262,6 +262,12 @@ pub trait Machine: Send + Sync + 'static {
     /// failure mid-`up`.
     fn required_binaries(&self) -> Vec<String>;
 
+    /// Host settings required by resolved hardware, checked for every target
+    /// after pulls and before any machine boots.
+    fn check_host_config(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Refuse when the disks this machine already has cannot boot under its
     /// declaration — a VM's clone of a template the lab file no longer names
     /// (§7.1). `up` asks every target before anything downloads or boots, so

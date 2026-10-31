@@ -25,6 +25,7 @@ pub struct HypervisorShare {
 /// Per-VM runtime paths and attachments supplied by the lab daemon.
 #[derive(Debug, Clone, Default)]
 pub struct VmPaths {
+    pub apple_smc_osk: Option<crate::config::host::AppleSmcOsk>,
     pub qmp_sock: PathBuf,
     /// vmlab-agent channel (`vmlab.agent.0`): interactive terminals,
     /// streaming exec, file transfer, metrics — see `guest/agent-proto`.
@@ -373,11 +374,6 @@ fn hyperv_apicv(vm: &ResolvedVm, accel: Accel, apic_virtualization: bool) -> Opt
     (vm.hyperv && hyperv_skipped(vm, accel).is_none()).then_some(apic_virtualization)
 }
 
-/// The OSK string the Apple SMC hands a macOS guest that asks for it
-/// (§5.2). Public knowledge, the same in every Mac; the guest refuses to boot
-/// without it, which is the only reason `apple_smc` exists.
-pub const APPLE_SMC_OSK: &str = "ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc";
-
 /// The qdev id of the xHCI controller `input = "usb"` puts the keyboard and
 /// tablet on (§5.2).
 pub const INPUT_XHCI_ID: &str = "xhci";
@@ -515,10 +511,14 @@ pub fn build_args(
     // where there is none, and looks for an SMBIOS baseboard (type 2) table,
     // which QEMU only emits when asked.
     if vm.apple_smc {
+        let key = paths
+            .apple_smc_osk
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(crate::config::host::APPLE_SMC_OSK_REQUIRED))?;
         arg(
             &mut a,
             "device",
-            format!("isa-applesmc,osk={APPLE_SMC_OSK}"),
+            format!("isa-applesmc,osk={}", key.expose().replace(',', ",,")),
         );
         arg(&mut a, "smbios", "type=2".into());
     }
@@ -922,6 +922,10 @@ mod tests {
     /// depends on this build host shipping edk2.
     fn paths() -> VmPaths {
         VmPaths {
+            apple_smc_osk: crate::config::host::HostConfig::parse(
+                "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST\" }",
+                "<test>",
+            ).unwrap().apple_smc_osk,
             qmp_sock: "/run/l/t/qmp.sock".into(),
             agent_sock: "/run/l/t/agent.sock".into(),
             vnc_sock: "/run/l/t/vnc.sock".into(),
@@ -1742,7 +1746,7 @@ mod tests {
              -cpu Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on,\
              +invtsc,tsc-frequency=4291956000 \
              -smp 4 -m 8192M \
-             -device isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc \
+             -device isa-applesmc,osk=TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST \
              -smbios type=2 \
              -display none -vnc unix:/run/l/t/vnc.sock,share=ignore \
              -qmp unix:/run/l/t/qmp.sock,server=on,wait=off -monitor none \
@@ -1765,6 +1769,24 @@ mod tests {
         // Unaddressed PCI devices on q35 land on pcie.0 — where QEMU keeps a
         // virtio device transitional, the mode AppleVirtIO drives.
         assert!(!s.contains("pcie-root-port"), "{s}");
+    }
+
+    #[test]
+    fn apple_smc_requires_the_host_key_and_escapes_commas() {
+        let vm = resolved("macos", "x86_64");
+        let mut p = paths();
+        p.tsc_hz = Some(3_000_000_000);
+        p.apple_smc_osk = None;
+        let error = build_args("l", &vm, &p, Accel::Kvm).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            crate::config::host::APPLE_SMC_OSK_REQUIRED
+        );
+        let key = ",".repeat(64);
+        p.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse(key).unwrap());
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap();
+        assert!(args.contains(&format!("isa-applesmc,osk={}", ",,".repeat(64))));
+        assert!(!format!("{p:?}").contains(&",".repeat(64)));
     }
 
     /// `tsc = "host"` needs the frequency the lab daemon reads; under TCG,

@@ -8,7 +8,7 @@ import pathlib
 import re
 from datetime import datetime, timezone
 
-from harness import E2E, ScenarioFailed
+from harness import E2E, ScenarioFailed, redact_osk
 
 LAB = "e2e-core"
 OWNED = [
@@ -47,7 +47,7 @@ def qemu_argv_of(lab: str, vm: str) -> list[str]:
             continue
         args = [a.decode(errors="replace") for a in argv if a]
         if args and "qemu-system" in args[0] and want in args:
-            return args
+            return [redact_osk(arg) for arg in args]
     return []
 
 

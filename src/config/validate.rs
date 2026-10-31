@@ -27,6 +27,9 @@ use crate::template::meta::Purpose;
 /// about hardware have to resolve it first — a VM's firmware or secure boot
 /// may have been inherited from either layer (§5.2).
 pub trait ValidationContext {
+    fn check_apple_smc_osk(&self) -> Result<(), String> {
+        Err(super::host::APPLE_SMC_OSK_REQUIRED.into())
+    }
     /// Recorded metadata for a template version in the store, if it is there,
     /// with its installed variants (§6.6). Validation selects the variant a
     /// reference names itself, through [`TemplateMeta::select_variant`].
@@ -1038,6 +1041,17 @@ fn check_vm_hardware(
     check_key_store(vm, ctx, issues);
     check_nested_cpu_model(vm, ctx, issues);
     check_nested_tcg(vm, ctx, issues);
+    let layer = TemplateLayer::of(vm, ctx);
+    let profile = effective_profile_name(vm, layer.meta())
+        .as_deref()
+        .and_then(|name| ctx.profile(name))
+        .unwrap_or_else(default_profile);
+    if crate::qemu::resolve::resolve_apple_smc(vm, layer.meta(), &profile)
+        .is_some_and(|(enabled, _)| enabled)
+        && let Err(why) = ctx.check_apple_smc_osk()
+    {
+        issues.push(Issue::at(vm.span, why));
+    }
 }
 
 /// `nested = true` passes the host CPU's VMX/SVM through, which only KVM
@@ -2001,6 +2015,7 @@ pub(crate) mod tests {
     struct Hardware {
         profiles: crate::profiles::ProfileSet,
         meta: Option<TemplateMeta>,
+        host: crate::config::host::HostConfig,
     }
 
     impl Hardware {
@@ -2012,6 +2027,7 @@ pub(crate) mod tests {
             Self {
                 profiles: crate::profiles::ProfileSet::shipped().expect("shipped profiles"),
                 meta: Some(meta),
+                host: Default::default(),
             }
         }
         /// No such template in the store — the template layer is unknown.
@@ -2019,11 +2035,19 @@ pub(crate) mod tests {
             Self {
                 profiles: crate::profiles::ProfileSet::shipped().expect("shipped profiles"),
                 meta: None,
+                host: Default::default(),
             }
         }
     }
 
     impl ValidationContext for Hardware {
+        fn check_apple_smc_osk(&self) -> Result<(), String> {
+            self.host
+                .apple_smc_osk
+                .as_ref()
+                .map(|_| ())
+                .ok_or_else(|| super::super::host::APPLE_SMC_OSK_REQUIRED.into())
+        }
         fn template_meta(&self, _: &str, _: &str, _: Option<&str>) -> Option<TemplateMeta> {
             self.meta.clone()
         }
@@ -2046,6 +2070,42 @@ pub(crate) mod tests {
             .into_iter()
             .map(|i| i.message)
             .collect()
+    }
+
+    #[test]
+    fn apple_smc_requires_host_configuration_through_every_hardware_layer() {
+        let refusal = super::super::host::APPLE_SMC_OSK_REQUIRED;
+        let ctx = Hardware::blank();
+        for declaration in [
+            "template = \"scratch\" arch = \"x86_64\" disk = 10GiB profile = \"macos\"",
+            "template = \"scratch\" arch = \"x86_64\" disk = 10GiB apple_smc = true",
+        ] {
+            let source =
+                format!("import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ {declaration} }} }}");
+            assert!(hw_errs(&ctx, &source).iter().any(|e| e == refusal));
+            let source = source.replace("vm \"a\" {", "vm \"a\" { apple_smc = false");
+            // The profile case exercises an explicit false overriding the floor.
+            if !declaration.contains("apple_smc") {
+                assert!(!hw_errs(&ctx, &source).iter().any(|e| e == refusal));
+            }
+        }
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.apple_smc = Some(true);
+        let inherited = Hardware::with_meta(meta);
+        let source = "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" } }";
+        assert!(hw_errs(&inherited, source).iter().any(|e| e == refusal));
+        let mut configured = Hardware::with_meta(inherited.meta.clone().unwrap());
+        configured.host = crate::config::host::HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST\" }",
+            "<test>",
+        ).unwrap();
+        assert!(!hw_errs(&configured, source).iter().any(|e| e == refusal));
+        let override_source = source.replace("template =", "apple_smc = false template =");
+        assert!(
+            !hw_errs(&inherited, &override_source)
+                .iter()
+                .any(|e| e == refusal)
+        );
     }
 
     fn assert_secure_boot_conflict(ctx: &Hardware, src: &str, needles: &[&str]) {
