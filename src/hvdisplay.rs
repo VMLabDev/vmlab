@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use image::RgbImage;
 use vmlab_hv_display::protocol::{ARGB8888, XRGB8888};
-use vmlab_hv_display::{Capabilities, Client, Message, Packet, SurfaceKind};
+use vmlab_hv_display::{Capabilities, Client, FrameFlags, Message, Packet, SurfaceKind};
 
 use crate::vnc::StreamEvent;
 
@@ -129,16 +129,24 @@ impl Surface {
 /// One full frame from the machine's display, as RGB.
 pub async fn capture(path: &Path) -> Result<RgbImage> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || capture_blocking(&path))
+    tokio::task::spawn_blocking(move || capture_blocking(&path, FIRST_FRAME))
         .await
         .context("vmlab-hv capture task")?
 }
 
-fn capture_blocking(path: &Path) -> Result<RgbImage> {
-    let client = connect(path, Capabilities::FRAMES)?;
-    client.stream().set_read_timeout(Some(FIRST_FRAME))?;
+fn capture_blocking(path: &Path, patience: Duration) -> Result<RgbImage> {
+    let client = connect(path, Capabilities::FRAMES | Capabilities::FRAME_FLAGS)?;
+    let deadline = Instant::now() + patience;
     let mut surface: Option<Surface> = None;
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "no guest display output on {} within {patience:?}",
+                path.display()
+            );
+        }
+        client.stream().set_read_timeout(Some(remaining))?;
         let Packet { message, fds } = client
             .receive()
             .with_context(|| format!("waiting for a frame on {}", path.display()))?;
@@ -148,8 +156,13 @@ fn capture_blocking(path: &Path) -> Result<RgbImage> {
                 surface_id,
                 buffer,
                 seq,
+                flags,
                 ..
             } => {
+                if flags.has(FrameFlags::PLACEHOLDER) {
+                    client.release(*surface_id, *buffer, *seq)?;
+                    continue;
+                }
                 let current = surface.as_ref().filter(|s| s.id == *surface_id);
                 let Some(s) = current else {
                     client.release(*surface_id, *buffer, *seq)?;
@@ -239,7 +252,10 @@ impl NativeStream {
     pub async fn connect(path: &Path) -> Result<Self> {
         let at = path.to_path_buf();
         let (client, surface) = tokio::task::spawn_blocking(move || {
-            let client = connect(&at, Capabilities::FRAMES | Capabilities::CURSOR)?;
+            let client = connect(
+                &at,
+                Capabilities::FRAMES | Capabilities::CURSOR | Capabilities::FRAME_FLAGS,
+            )?;
             client.stream().set_read_timeout(Some(FIRST_FRAME))?;
             loop {
                 let Packet { message, fds } = client
@@ -323,12 +339,13 @@ fn decode(client: &Client, surface: &mut Surface, packet: Packet) -> io::Result<
             buffer,
             seq,
             damage,
+            flags,
             ..
         } => {
             let mut events = Vec::new();
             // A frame from a superseded configure is released unread: the
             // configure that replaced it promises a full frame of its own.
-            if *surface_id == surface.id {
+            if *surface_id == surface.id && !flags.has(FrameFlags::PLACEHOLDER) {
                 for r in damage {
                     let (x, y) = (r.x.min(surface.width), r.y.min(surface.height));
                     let w = r.width.min(surface.width - x);

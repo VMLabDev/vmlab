@@ -39,6 +39,39 @@ const RED: [u8; 3] = [255, 0, 0];
 const GREEN: [u8; 3] = [0, 255, 0];
 const BLACK: [u8; 3] = [0, 0, 0];
 
+#[test]
+fn native_wait_excludes_initial_time_but_accepts_guest_black() {
+    let mut core = Core::new(settings(10, Size::new(8, 4), Some(0.2)));
+    core.wait_for_frame();
+    core.connected(secs(0.0), 8, 4);
+    assert!(core.tick(secs(2.0)).is_empty());
+    core.input(
+        secs(2.01),
+        InputEvent::Text {
+            text: "boot".into(),
+        },
+    );
+    assert_eq!(core.timeline()[0].at, 0.0);
+    assert_eq!(core.timeline()[0].wall, 2.01);
+    core.rect(secs(2.02), 0, 0, 8, 4, &solid(8, 4, BLACK));
+    let frames = core.finish(secs(2.1));
+    assert_eq!(frames.len(), 1);
+    assert!(all(&frames[0], BLACK));
+    assert_eq!(core.video_duration(), secs(0.1));
+    assert!(core.cuts().is_empty());
+}
+
+#[test]
+fn native_wait_stopped_without_guest_output_is_playable() {
+    let mut core = Core::new(settings(10, Size::new(8, 4), None));
+    core.wait_for_frame();
+    core.connected(secs(0.0), 8, 4);
+    assert!(core.tick(secs(2.0)).is_empty());
+    let frames = core.finish(secs(2.0));
+    assert_eq!(frames.len(), 1);
+    assert!(all(&frames[0], BLACK));
+}
+
 /// With nothing arriving, one frame per interval still comes out, black
 /// before any screen is known and repeating the last picture after.
 #[test]

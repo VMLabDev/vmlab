@@ -131,7 +131,11 @@ impl Recorder {
         let encoder = Encoder::spawn(&plan, &spec.output)?;
 
         let started = Instant::now();
-        let core = Arc::new(Mutex::new(Core::new(spec.settings.clone())));
+        let mut initial = Core::new(spec.settings.clone());
+        if matches!(spec.source, StreamSource::Native(_)) {
+            initial.wait_for_frame();
+        }
+        let core = Arc::new(Mutex::new(initial));
         let (w, h) = client.size();
         core.lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -565,5 +569,90 @@ mod tests {
         let done = rec.stop().await.unwrap();
         assert!(done.duration >= Duration::from_millis(1000), "{done:?}");
         assert!(output.metadata().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn native_recording_excludes_placeholders_and_compresses_the_gap() {
+        let avail = probe(None).await;
+        let Ok(ffmpeg) = check(&avail, Format::Mp4) else {
+            eprintln!("skipping: no ffmpeg with libx264 on this host");
+            return;
+        };
+        let display = crate::hvdisplay::fake::spawn(128, 64);
+        display.placeholder();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("placeholder.mp4");
+        let settings = Settings::resolve(
+            &output,
+            &RecordOptions {
+                fps: Some(20),
+                size: Some(Size::new(128, 64)),
+                compress_idle: Some(0.2),
+                timeline: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let rec = Recorder::start(RecorderSpec {
+            source: StreamSource::Native(display.path.clone()),
+            output: output.clone(),
+            settings,
+            ffmpeg,
+            inputs: rx,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let green = [0, 255, 0, 0].repeat(128 * 64);
+        display.show(
+            128,
+            64,
+            green.clone(),
+            vec![vmlab_hv_display::Rect {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 64,
+            }],
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..8 {
+            display.placeholder();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        display.show(128, 64, green, vec![]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let done = rec.stop().await.unwrap();
+        let timeline: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(done.timeline.unwrap()).unwrap()).unwrap();
+        assert!(
+            timeline["cuts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cut| cut["wall_start"].as_f64().unwrap() >= 0.35
+                    && cut["wall_end"].as_f64().unwrap() - cut["wall_start"].as_f64().unwrap()
+                        > 0.5),
+            "{timeline}"
+        );
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+            .output()
+            .await
+            .unwrap();
+        assert!(decoded.status.success());
+        assert!(!decoded.stdout.is_empty());
+        assert!(
+            decoded
+                .stdout
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|p| p[0] < 10 && p[1] > 240 && p[2] < 10),
+            "every encoded frame is guest green, including the first and reset gap"
+        );
     }
 }

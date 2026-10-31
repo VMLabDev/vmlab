@@ -33,6 +33,66 @@ async fn a_capture_is_the_whole_frame_as_rgb() {
 }
 
 #[tokio::test]
+async fn capture_waits_past_placeholder_for_guest_black() {
+    let display = fake::spawn(16, 8);
+    display.placeholder();
+    let path = display.path.clone();
+    let capture = tokio::spawn(async move { super::capture(&path).await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!capture.is_finished(), "a placeholder is not a screenshot");
+    display.show(16, 8, vec![0; 16 * 8 * 4], vec![]);
+    let image = tokio::time::timeout(Duration::from_secs(2), capture)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(image.as_raw().iter().all(|b| *b == 0));
+}
+
+#[tokio::test]
+async fn repeated_placeholders_do_not_extend_capture_timeout() {
+    let display = fake::spawn(16, 8);
+    display.placeholder();
+    let path = display.path.clone();
+    let capture =
+        tokio::task::spawn_blocking(move || capture_blocking(&path, Duration::from_millis(200)));
+    for _ in 0..10 {
+        display.placeholder();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        capture.is_finished(),
+        "placeholder traffic must not renew the deadline"
+    );
+    let error = format!("{:#}", capture.await.unwrap().unwrap_err());
+    assert!(error.contains("display.sock"), "{error}");
+}
+
+#[tokio::test]
+async fn stream_releases_placeholders_without_rectangles() {
+    let display = fake::spawn(16, 8);
+    display.placeholder();
+    let mut stream = NativeStream::connect(&display.path).await.unwrap();
+    // Publishing more than the ring size also proves buffers are released.
+    for _ in 0..5 {
+        let events = stream.next_update().await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Rect { .. })),
+            "{events:?}"
+        );
+        display.placeholder();
+    }
+    display.show(16, 8, vec![0; 16 * 8 * 4], vec![]);
+    let events = next_events(&mut stream).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Rect { bgrx, .. } if bgrx.iter().all(|b| *b == 0))),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_capture_of_a_socket_nobody_serves_fails_naming_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("display.sock");

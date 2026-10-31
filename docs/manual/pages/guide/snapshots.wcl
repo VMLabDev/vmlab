@@ -3,7 +3,7 @@ page guide_snapshots {
   chapter_header "Snapshots" {
     kicker       = "The guide · explanation"
     reading_time = "9 min read"
-    updated      = "2026-10-28"
+    updated      = "2026-10-31"
     version      = "vmlab 0.9"
   }
 
@@ -59,6 +59,11 @@ page guide_snapshots {
     offline snapshot is plain qcow2 and restores under either. A snapshot
     taken before vmlab recorded the field was QEMU's.
   DOC
+
+  callout "Retake older Windows snapshots on vmlab-hv" {
+    kind = :warning
+    body = "Retake Windows online snapshots made with vmlab-hv before the pin to `36e90a92010ff37745f4ae053a4e2f802006571d`. Those snapshots lack CET state that the updated hypervisor saves and restores. Offline snapshots and QEMU snapshots are unaffected."
+  }
 
   h2 "Lab-wide snapshots"
 

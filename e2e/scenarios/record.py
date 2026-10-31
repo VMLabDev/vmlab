@@ -107,7 +107,8 @@ def run(h):
 
         # -- up --record: the video starts at the firmware's first frame.
         boot = rec / "boot.mp4"
-        h.vmlab("up", "--record", f"vm01={boot}", cwd=lab, timeout=600)
+        # The container's no-display refusal does not require it to run.
+        h.vmlab("up", "vm01", "--record", f"vm01={boot}", cwd=lab, timeout=600)
         h.wait_ready(lab, "vm01")
         status = h.vmlab("status", cwd=lab).text
         h.ok("record.status", "RECORDING" in status and str(boot) in status,
