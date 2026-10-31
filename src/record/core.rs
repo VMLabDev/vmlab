@@ -148,6 +148,8 @@ pub struct Core {
     cuts: Vec<Cut>,
     timeline: Vec<TimelineEntry>,
     out: Vec<Frame>,
+    /// Native recording waits for guest pixels, excluding host placeholders.
+    waiting_for_frame: bool,
 }
 
 impl Core {
@@ -172,11 +174,18 @@ impl Core {
             cuts: Vec::new(),
             timeline: Vec::new(),
             out: Vec::new(),
+            waiting_for_frame: false,
         }
     }
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Suppress initial output until guest pixels arrive. Set before the
+    /// clock starts, only for a source that distinguishes host placeholders.
+    pub fn wait_for_frame(&mut self) {
+        self.waiting_for_frame = true;
     }
 
     /// Output video length so far, cuts applied.
@@ -241,6 +250,7 @@ impl Core {
     /// pixels whose value it changes count towards the interval's activity.
     pub fn rect(&mut self, at: Duration, x: u16, y: u16, w: u16, h: u16, bgrx: &[u8]) {
         self.advance(at);
+        self.waiting_for_frame = false;
         let Some(fb) = self.fb.as_mut() else {
             return;
         };
@@ -341,7 +351,11 @@ impl Core {
         // open idle run will contribute when this input closes it, plus the
         // way into the current interval.
         let pending = self.idle.map(|(_, len)| self.kept(len)).unwrap_or_default();
-        let into = at.saturating_sub(self.interval_start());
+        let into = if self.waiting_for_frame {
+            Duration::ZERO
+        } else {
+            at.saturating_sub(self.interval_start())
+        };
         self.timeline.push(TimelineEntry {
             at: (self.video + pending + into).as_secs_f64(),
             wall: at.as_secs_f64(),
@@ -390,6 +404,13 @@ impl Core {
 
     /// Close the interval ending at `end`.
     fn step(&mut self, end: Duration) {
+        if self.waiting_for_frame {
+            self.intervals += 1;
+            self.dirty_area = 0;
+            self.input_in_interval = false;
+            self.ripples.retain(|r| end < r.start + RIPPLE_DURATION);
+            return;
+        }
         let start = self.interval_start();
         let ripple_live = self
             .ripples

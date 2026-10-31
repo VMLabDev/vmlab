@@ -16,11 +16,12 @@ use std::sync::{Arc, Mutex};
 
 use vmlab_hv_display::protocol::XRGB8888;
 use vmlab_hv_display::{
-    Cursor, DisplayServer, Frame, FrameSource, InputSink, Message, Pixels, Rect,
+    Cursor, DisplayServer, Frame, FrameFlags, FrameSource, InputSink, Message, Pixels, Rect,
 };
 
 /// The picture the source currently shows.
 struct Painted {
+    flags: FrameFlags,
     generation: u64,
     width: u32,
     height: u32,
@@ -34,6 +35,7 @@ impl FrameSource for Source {
     fn frame(&self) -> io::Result<Frame> {
         let p = self.0.lock().unwrap();
         Ok(Frame {
+            flags: p.flags,
             generation: p.generation,
             width: p.width,
             height: p.height,
@@ -87,6 +89,7 @@ pub(crate) fn spawn(width: u32, height: u32) -> FakeDisplay {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("display.sock");
     let source = Arc::new(Source(Mutex::new(Painted {
+        flags: FrameFlags::default(),
         generation: 1,
         width,
         height,
@@ -139,6 +142,7 @@ impl FakeDisplay {
                 p.generation += 1;
             }
             *p = Painted {
+                flags: FrameFlags::default(),
                 generation: p.generation,
                 width,
                 height,
@@ -151,6 +155,21 @@ impl FakeDisplay {
 
     pub(crate) fn cursor(&self, cursor: Cursor) {
         self.server.set_cursor(cursor).unwrap();
+    }
+
+    pub(crate) fn placeholder(&self) {
+        {
+            let mut p = self.source.0.lock().unwrap();
+            p.flags = FrameFlags(FrameFlags::PLACEHOLDER);
+            p.pixels = Arc::new([42, 42, 42, 0].repeat((p.width * p.height) as usize));
+            p.damage = vec![Rect {
+                x: 0,
+                y: 0,
+                width: p.width,
+                height: p.height,
+            }];
+        }
+        self.server.publish().unwrap();
     }
 
     /// Drop every connection and take the socket away.
