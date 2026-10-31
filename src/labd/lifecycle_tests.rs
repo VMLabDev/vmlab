@@ -2651,20 +2651,22 @@ async fn a_vmlab_hv_vm_on_a_host_without_kvm_is_refused_at_start() {
     assert_eq!(vm.state().await, PowerState::Stopped);
 }
 
-/// vmlab-hv ends when the guest resets itself, where QEMU resets in place
-/// (PRD §22): the VM boots it again, and to the lab it is one run — no exit,
-/// no second `ready` — that a later stop still ends as asked.
+/// A guest reset on vmlab-hv happens in place (PRD §22): the same process
+/// runs on, so to the lab it is one run — no second start, no exit, no second
+/// `ready` — but readiness drops while the guest reboots and comes back once
+/// the rebooted guest's agent has been handshaken, and a later stop still
+/// ends it as asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_guest_reset_on_vmlab_hv_boots_the_vm_again_as_one_run() {
+async fn a_guest_reset_on_vmlab_hv_happens_in_place_as_one_run() {
     let dirs = Dirs::new();
     let (vm, hv) = vm(
         &dirs,
         LINUX_VM,
         on_vmlab_hv(Script {
-            runs: vec![
-                Run::guest_resets(Duration::from_millis(600)),
-                Run::forever(),
-            ],
+            runs: vec![Run::guest_resets(
+                Duration::from_millis(600),
+                Duration::from_millis(800),
+            )],
             ..Script::healthy()
         }),
     );
@@ -2672,15 +2674,29 @@ async fn a_guest_reset_on_vmlab_hv_boots_the_vm_again_as_one_run() {
     start_vm(&vm, cbs).await.expect("start");
     let m: Arc<dyn Machine> = vm.clone();
     m.wait_ready(SETTLE).await.expect("ready");
-    for _ in 0..100 {
-        if hv.starts() >= 2 {
-            break;
+    let before = m.agent().await.expect("agent").info();
+
+    // Readiness drops with the reset...
+    tokio::time::timeout(SETTLE, async {
+        while m.is_ready().await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(hv.starts(), 2, "the reset started vmlab-hv again");
+    })
+    .await
+    .expect("readiness never dropped for the reset");
+    assert_eq!(
+        vm.state().await,
+        PowerState::Running,
+        "a reset is not a stop"
+    );
+    // ...and returns with the rebooted guest's agent.
     m.wait_ready(SETTLE).await.expect("ready again");
-    assert_eq!(vm.state().await, PowerState::Running);
+    let after = m.agent().await.expect("agent").info();
+    assert_ne!(
+        after.instance, before.instance,
+        "the new agent was handshaken"
+    );
+    assert_eq!(hv.starts(), 1, "the reset happened in place");
     assert_eq!(observed.ready_count(), 1, "one run, announced once");
     assert!(
         tokio::time::timeout(Duration::from_millis(300), observed.exit())
