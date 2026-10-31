@@ -2666,11 +2666,14 @@ with `avic` where the host's KVM virtualises the APIC. A NIC's option ROM is
 vmlab-hv's combined legacy and EFI iPXE image (`virtio-net.rom`) where the host
 has it.
 
-**Guest reset.** QEMU resets a VM in place when its guest reboots; vmlab-hv
-ends instead, reporting `shutdown { reason: guest_reset }`. vmlab boots such a
-VM again at once with the same NICs, a fresh swtpm and its readiness kept, so
-to the lab it is one run, as on QEMU: no `vm.stopped`, no second `vm.ready`,
-and a script waiting with `wait_rebooted` sees the new boot. A Windows clone
+**Guest reset.** vmlab-hv resets a VM in place when its guest reboots, as
+QEMU does: the process runs on, its control, display, agent and NIC sockets
+stay open, and it reports a `reset` event (its description's `exit_on_reset`
+would end the process instead; vmlab never sets it). To the lab it is one run:
+no `vm.stopped`, no second `vm.ready`, and a script waiting with
+`wait_rebooted` sees the new boot. On the event vmlab drops its connection to
+the old agent and clears the VM's readiness, which returns once the rebooted
+guest's agent answers the handshake; a recording carries on across it. A Windows clone
 reboots through sysprep's specialize pass and its first-boot provision on
 every first start.
 
