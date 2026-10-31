@@ -26,8 +26,19 @@ def project_vms(proc_root=pathlib.Path("/proc")) -> list[int]:
             executable = pathlib.Path(os.fsdecode(argv[0])).name
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
-        if (executable.startswith("qemu-system-") or executable == "vmlab-hv") and b"-avd" not in argv:
+        if b"-avd" in argv:
+            continue
+        if executable.startswith(("qemu-system-", "vmlab-hv")):
             found.append(int(proc.name))
+            continue
+        # Acceptance tests can own a KVM VM inside a Rust test executable.
+        for descriptor in (proc / "fd").glob("*"):
+            try:
+                if os.readlink(descriptor) == "anon_inode:kvm-vm":
+                    found.append(int(proc.name))
+                    break
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
     return found
 
 

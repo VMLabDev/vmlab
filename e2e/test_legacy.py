@@ -29,6 +29,29 @@ class ProjectVmCount(unittest.TestCase):
             (root / "100").mkdir()
             self.assertEqual(project_vms(root), [])
 
+    def test_counts_an_isolated_hypervisor_verification_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            process = root / "100"
+            process.mkdir()
+            (process / "cmdline").write_bytes(b"/work/target/debug/vmlab-hv-test-plain\0")
+            self.assertEqual(project_vms(root), [100])
+
+    def test_counts_a_rust_test_only_when_it_owns_a_kvm_vm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for pid in [100, 101, 102]:
+                process = root / str(pid)
+                process.mkdir()
+                (process / "cmdline").write_bytes(b"/work/target/debug/vmlab_hv-test\0")
+                (process / "fd").mkdir()
+            (root / "100/fd/4").symlink_to("anon_inode:kvm-vm")
+            (root / "100/fd/5").symlink_to("anon_inode:kvm-vm")
+            (root / "101/fd/4").symlink_to("anon_inode:kvm-vcpu")
+            (root / "102/fd/4").symlink_to("anon_inode:kvm-vm")
+            (root / "102/cmdline").write_bytes(b"qemu-system-x86_64\0-avd\0owner\0")
+            self.assertEqual(project_vms(root), [100])
+
 
 if __name__ == "__main__":
     unittest.main()
