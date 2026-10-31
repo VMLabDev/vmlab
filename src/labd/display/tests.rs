@@ -77,6 +77,8 @@ struct FakeHost {
     qmp: PathBuf,
     vnc: PathBuf,
     gl: bool,
+    native: bool,
+    transport: InputTransport,
     qmp_opens: Mutex<usize>,
     tap: Arc<crate::record::InputTap>,
 }
@@ -108,7 +110,14 @@ impl DisplayHost for FakeHost {
         self.dir.path().to_path_buf()
     }
     fn input_transport(&self) -> InputTransport {
-        InputTransport::Qmp
+        self.transport
+    }
+    fn stream_source(&self) -> crate::record::StreamSource {
+        if self.native {
+            crate::record::StreamSource::Native(self.dir.path().join("display.sock"))
+        } else {
+            crate::record::StreamSource::Vnc(self.vnc.clone())
+        }
     }
     fn gl_display(&self) -> bool {
         self.gl
@@ -135,6 +144,8 @@ fn display(
         qmp,
         vnc: rfb.path.clone(),
         gl,
+        native: false,
+        transport: InputTransport::Qmp,
         qmp_opens: Mutex::new(0),
         tap: Arc::default(),
     });
@@ -191,6 +202,8 @@ async fn grab_reports_no_surface_when_the_vnc_fallback_fails_too() {
         qmp,
         vnc,
         gl: false,
+        native: false,
+        transport: InputTransport::Qmp,
         qmp_opens: Mutex::new(0),
         tap: Arc::default(),
     }));
@@ -254,4 +267,33 @@ async fn inputs_are_published_to_the_tap() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn a_native_display_routes_a_vnc_profile_through_its_input_capability() {
+    let (mut d, mut host, rfb, _) = display(false, Screendump::Writes(qmp_image()), &qmp_image());
+    drop(d);
+    let h = Arc::get_mut(&mut host).unwrap();
+    h.native = true;
+    h.transport = InputTransport::Vnc;
+    d = Display::new(host.clone());
+    d.send_keys("ctrl-c").await.unwrap();
+    d.type_text("hi", 0).await.unwrap();
+    d.mouse_move(1, 2).await.unwrap();
+    d.mouse_click("left", None).await.unwrap();
+    d.mouse_drag(1, 1, 2, 2).await.unwrap();
+    assert!(*host.qmp_opens.lock().unwrap() >= 5);
+    assert!(rfb.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_qemu_display_keeps_vnc_input_for_a_vnc_profile() {
+    let (d, mut host, rfb, _) = display(false, Screendump::Writes(qmp_image()), &qmp_image());
+    drop(d);
+    Arc::get_mut(&mut host).unwrap().transport = InputTransport::Vnc;
+    let d = Display::new(host.clone());
+    assert!(d.input_vnc());
+    d.send_keys("ctrl-c").await.unwrap();
+    assert_eq!(*host.qmp_opens.lock().unwrap(), 0);
+    assert!(!rfb.received.lock().unwrap().is_empty());
 }

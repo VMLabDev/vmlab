@@ -298,7 +298,7 @@ type Vm {
   secure_boot_vars: utf8?
   @doc("Raw QEMU flags appended last — escape hatch")
   qemu_args: list<utf8>?
-  @doc("Hypervisor that runs the VM: `qemu` | `vmlab` (vmlab-hv; refused on a VM until its phase 2, PRD §22); unset = the host config's default for VMs, itself `qemu` unless set")
+  @doc("Hypervisor that runs the VM: `qemu` | `vmlab` (vmlab-hv; q35 VMs supported, legacy pc support in progress in phases 4a-4e, PRD §22); unset = the host config's default for VMs, itself `qemu` unless set")
   @options(["qemu", "vmlab"]) hypervisor: utf8?
   @doc("GPU acceleration (passthrough / virgl / vulkan)")
   @child("gpu")     gpu: Gpu?

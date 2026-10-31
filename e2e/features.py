@@ -210,6 +210,10 @@ FEATURES: dict[str, str] = {
     "worktree.clone.macs": "a worktree machine keeps the frozen MACs, and the main and worktree labs run at once",
     # -- architectures -----------------------------------------------------
     "arch.emulated": "a non-x86 guest under TCG emulation",
+    "vm.legacy.freedos": "FreeDOS 1.3: agent, exec, disk roundtrip, display and stop",
+    "vm.legacy.windows98": "Windows 98 SE: agent, exec, disk roundtrip, display and stop",
+    "vm.legacy.windows7": "Windows 7 7600.0.1: agent, exec, disk roundtrip, display and stop",
+    "vm.legacy.templeos": "TempleOS: HolyC agent, exec, disk roundtrip, display and stop",
 }
 
 # -- hypervisor scope (PRD §22) --------------------------------------------
@@ -294,7 +298,8 @@ _GROUPS: dict[str, list[str]] = {
     # TCG emulation.
     "3": ["arch.emulated"],
     # The legacy PC: floppy controller, SMB1 guests.
-    "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1"],
+    "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1",
+          "vm.legacy.freedos", "vm.legacy.windows98", "vm.legacy.windows7", "vm.legacy.templeos"],
 }
 
 # Scenarios whose VMs stay on QEMU on a vmlab-hv run, and why: `core` proves
