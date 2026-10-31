@@ -27,6 +27,7 @@ import "./pages/guide/networking.wcl"
 import "./pages/guide/containers.wcl"
 import "./pages/guide/shares.wcl"
 import "./pages/guide/usb.wcl"
+import "./pages/guide/audio.wcl"
 import "./pages/guide/snapshots.wcl"
 import "./pages/guide/worktrees.wcl"
 import "./pages/guide/scripting.wcl"
@@ -133,6 +134,7 @@ site manual {
       chapter "Lab containers"                       { page = guide_containers }
       chapter "Shared folders"                       { page = guide_shares }
       chapter "Host USB devices"                     { page = guide_usb }
+      chapter "Guest audio"                          { page = guide_audio }
       chapter "Snapshots"                            { page = guide_snapshots }
       chapter "Worktree labs"                        { page = guide_worktrees }
       chapter "Guest automation with wscript"        { page = guide_scripting }

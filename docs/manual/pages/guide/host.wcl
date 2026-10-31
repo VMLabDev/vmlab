@@ -370,14 +370,26 @@ hypervisor, built a phase at a time, on an x86_64 host with a usable
 VMs on the q35 machine: SeaBIOS or OVMF with secure boot, a TPM and the
 Hyper-V enlightenments, std VGA or virtio-vga, virtio or SATA disks, CD-ROMs,
 virtio-net NICs and the USB tablet — the Linux profiles and the Windows 10, 11
-and Server templates as they are. A guest that reboots itself is started
-again at once, with no stop in between, as QEMU resets it in place. A machine opts in with
-`hypervisor = "vmlab"`, and `host { hypervisor { container = "vmlab" vm =
-"vmlab" } }` moves every machine of that kind that names none. `vmlab
-validate` refuses what vmlab-hv cannot run yet, naming the machine, the reason
-and the phase that brings it: a `gpu {}` (2d), a virtiofs share (2e), `usb = true` (2f), macOS, the i440fx
-machine and floppies, and `qemu_args` in every phase. A VM's `auto` shares
-fall back to SMB there.
+and Server templates as they are — plus a `gpu {}` of any mode, virtio-fs
+shares, `usb = true` and [guest audio](guide_audio). A guest that reboots
+itself is started again at once, with no stop in between, as QEMU resets it
+in place. A machine opts in with `hypervisor = "vmlab"`, and `host {
+hypervisor { container = "vmlab" vm = "vmlab" } }` moves every machine of that
+kind that names none. `vmlab validate` refuses what vmlab-hv cannot run yet,
+naming the machine, the reason and the phase that brings it: macOS, the i440fx
+machine and floppies, `accel = "tcg"`, a pinned `tsc`, `input = "usb"`, and
+`qemu_args` in every phase.
+
+A `virgl` or `vulkan` GPU renders on the render node of the host GPU your host
+config picks, exactly as under QEMU, with the same Vulkan filter and
+keep-awake; with no declared GPU it renders on the host's first render node,
+and `up` says which. A host GPU's `qemu_binary` and `qemu_env` are QEMU's, so
+on vmlab-hv each one set is a warning and is ignored. `passthrough` needs the
+GPU already bound to `vfio-pci`, which you do yourself; vmlab-hv refuses one
+that is not, and neither it nor vmlab ever rebinds a device. Shares are
+served by vmlab-hv itself from the host directory, so no virtiofsd runs for a
+VM, and `auto` shares follow the same rules as on QEMU. A VM with a GPU takes
+no online snapshot on vmlab-hv; stop it and take an offline one.
 
 Screenshots, OCR, image matching, scripted keys and mouse, and `vmlab record`
 work on a vmlab-hv VM through its own frame protocol on `display.sock`, and
