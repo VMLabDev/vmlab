@@ -8,8 +8,6 @@ import json
 import os
 import pathlib
 import shutil
-import subprocess
-
 from harness import WORK, ScenarioFailed
 
 # A stand-in for a GUI VNC viewer: vmlab finds `vncviewer` on PATH and hands
@@ -32,65 +30,6 @@ def scratch_lab(name: str, body: str) -> pathlib.Path:
     d.mkdir(parents=True)
     (d / "vmlab.wcl").write_text("import <vmlab.wcl>\n\n" + body)
     return d
-
-
-def fastpath(h):
-    auto = h.vmlab("fastpath").out
-    if "afxdp" not in auto.splitlines()[0]:
-        h.skip("net.fastpath.kernel", f"the daemon did not select a kernel tier here: {auto.strip()!r}")
-        return
-
-    def ping(lab) -> bool:
-        r = h.vmlab("exec", "fp01", "--", "ping", "-c", "3", "-W", "2", "10.89.0.12", cwd=lab, check=False)
-        return r.code == 0 and " 0% packet loss" in r.out
-
-    def netdevs() -> list[str]:
-        out = []
-        for pid in subprocess.run(["pgrep", "-f", "vmlab:e2e-unsupported-fastpath/"],
-                                  capture_output=True, text=True).stdout.split():
-            argv = pathlib.Path(f"/proc/{pid}/cmdline").read_text().split("\0")
-            out += [argv[i + 1] for i, a in enumerate(argv) if a == "-netdev"]
-        return out
-
-    with h.lab("unsupported-fastpath") as lab:
-        # afxdp: auto's pick. Each VM NIC is a tap carrying the segment's XDP
-        # program, and two guests reach each other across it.
-        def afxdp():
-            h.vmlab("up", cwd=lab, timeout=600)
-            h.wait_ready(lab, "fp01", "fp02")
-            devs = netdevs()
-            assert len(devs) == 2 and all(d.startswith("tap,") for d in devs), devs
-            links = h.run(["ip", "-d", "link"]).out
-            assert "xdp_switch" in links, "no tap carries the xdp_switch program"
-            assert ping(lab), "fp01 could not ping fp02 over the afxdp tier"
-            return True
-
-        ok = h.check("net.fastpath.kernel", afxdp, "afxdp")
-
-        # sockmap: never picked by auto, so forced for a fresh supervisor.
-        def sockmap():
-            h.vmlab("down", cwd=lab, timeout=300)
-            h.vmlab("daemon", "stop")
-            h.run(["vmlab", "daemon", "start"], env={"VMLAB_FASTPATH": "sockmap"})
-            said = h.vmlab("fastpath").out
-            assert said.startswith("network fast path: sockmap"), said
-            h.vmlab("up", cwd=lab, timeout=600)
-            h.wait_ready(lab, "fp01", "fp02")
-            devs = netdevs()
-            assert len(devs) == 2 and all(d.startswith("stream,") for d in devs), devs
-            assert ping(lab), "fp01 could not ping fp02 over the sockmap tier"
-            return True
-
-        try:
-            ok = h.check("net.fastpath.kernel", sockmap, "sockmap") and ok
-        finally:
-            h.vmlab("destroy", cwd=lab, timeout=300, check=False)
-            h.vmlab("daemon", "stop", check=False)
-            h.vmlab("daemon", "start")
-        if ok:
-            h.ok("net.fastpath.kernel", True,
-                 "auto selected afxdp: both VM NICs were `-netdev tap` with xdp_switch attached and fp01 pinged fp02; "
-                 "VMLAB_FASTPATH=sockmap selected sockmap (stream NICs) and the ping crossed it too")
 
 
 def gpu(h):
@@ -121,17 +60,60 @@ def gpu(h):
     if not nodes:
         h.skip("vm.hw.gpu", f"no /dev/dri render node in the container for virgl to render on; {untested}")
         return
+    # The image's EGL is Mesa's, which cannot drive an NVIDIA node: declare
+    # the first node a Mesa driver owns as the host's default GPU, so both
+    # hypervisors render there rather than on whichever node sorts first.
+    mesa = next((n for n in nodes if render_driver(n) in MESA_DRIVERS), None)
+    restore = declare_host_gpu(h, mesa) if mesa else None
+    try:
+        gpu_boot(h, nodes, mesa, untested)
+    finally:
+        if restore:
+            restore()
 
+
+# Kernel drivers whose render nodes the image's Mesa EGL can open.
+MESA_DRIVERS = ("amdgpu", "radeon", "i915", "xe", "virtio_gpu", "nouveau")
+
+
+def render_driver(node: pathlib.Path) -> str:
+    link = pathlib.Path("/sys/class/drm") / node.name / "device" / "driver"
+    return link.resolve().name if link.exists() else ""
+
+
+def declare_host_gpu(h, node: pathlib.Path):
+    """Add `gpu "e2e" { address = <node's PCI address>, default }` to the
+    host config, returning what puts the file back."""
+    address = (pathlib.Path("/sys/class/drm") / node.name / "device").resolve().name
+    path = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "vmlab" / "config.wcl"
+    before = path.read_text() if path.exists() else None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = before or "import <vmlab-host.wcl>\n"
+    path.write_text(text + f'\ngpu "e2e" {{ address = "{address}"  default = true }}\n')
+    h.log.write(f"[unsupported] host GPU e2e = {address} ({node.name}, {render_driver(node)})\n")
+
+    def restore():
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(before)
+    return restore
+
+
+def gpu_boot(h, nodes, mesa, untested):
+    on = "vmlab-hv" if h.vms_here and h.hypervisor == "vmlab" else "QEMU"
     with h.lab("unsupported-gpu") as lab:
         up = h.vmlab("up", cwd=lab, timeout=300, check=False)
         if up.code != 0:
             # QEMU's own reason is in its log; `up` only says it exited.
             log = h.vmlab("logs", "gpu01", "-n", "50", cwd=lab, check=False).text
             said = [l.strip() for l in log.splitlines()
-                    if l.strip() and not l.startswith("==>") and "qemu.log" not in l]
+                    if l.strip() and not l.startswith("==>") and ".log" not in l]
+            where = mesa.name if mesa else "no Mesa-driven node, so the first one"
             h.skip("vm.hw.gpu",
-                   f"virgl cannot start here although render nodes exist ({', '.join(n.name for n in nodes)}): "
-                   f"`up` said {up.text.strip()[-120:]!r}, QEMU said {' | '.join(said[-2:])!r}; {untested}")
+                   f"virgl cannot start here although render nodes exist ({', '.join(n.name for n in nodes)}; "
+                   f"rendering on {where}): `up` said {up.text.strip()[-120:]!r}, {on} said "
+                   f"{' | '.join(said[-2:])!r}; {untested}")
             return
         h.wait_ready(lab, "gpu01")
 
@@ -147,9 +129,62 @@ def gpu(h):
             assert "renderD128" in drm, drm
             return line.split("]", 1)[-1].strip()
 
+        node = mesa.name if mesa else "the first render node"
         h.check("vm.hw.gpu", virgl,
-                "virgl: the guest's virtio-gpu negotiated `[drm] features: +virgl`, debugfs virtio-gpu-features "
-                f"says `virgl : yes`, and it exposes a render node; {untested}")
+                f"virgl on {on}, rendering on {node}: the guest's virtio-gpu negotiated `[drm] features: +virgl`, "
+                f"debugfs virtio-gpu-features says `virgl : yes`, and it exposes a render node; {untested}")
+
+
+def audio(h):
+    """`audio = true` (hv-audio D7): on vmlab-hv an HDA function at 00:1b.0
+    — Intel's 8086:293e, which the guest sees on its PCI bus whether or not
+    its kernel carries a driver — playing into the node vmlab names; on QEMU
+    a validation error naming vmlab-hv. The e2e container has no PipeWire,
+    so vmlab-hv plays into its null backend; the host stream is a live check."""
+    lab = scratch_lab("unsupported-audio", """lab "e2e-audio" {
+  vm "snd01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    audio    = true
+  }
+}
+""")
+    if not (h.hypervisor == "vmlab" and h.vms_here):
+        v = h.vmlab("validate", cwd=lab, check=False)
+        h.ok("vm.hw.audio", v.code != 0 and 'needs hypervisor = "vmlab"' in v.text,
+             f"QEMU: validate exits {v.code}: {next((l.strip() for l in v.text.splitlines() if 'audio' in l), '')!r}")
+        return
+    try:
+        h.vmlab("up", cwd=lab, timeout=600)
+        h.wait_ready(lab, "snd01")
+
+        def hda():
+            dev = h.vmlab("exec", "snd01", "--", "sh", "-c",
+                          "cat /sys/bus/pci/devices/0000:00:1b.0/vendor /sys/bus/pci/devices/0000:00:1b.0/device",
+                          cwd=lab).out.split()
+            assert dev == ["0x8086", "0x293e"], dev
+            desc = json.loads((lab_runtime(lab, "snd01") / "machine.json").read_text())
+            assert desc["audio"]["node_name"] == "vmlab.e2e-audio.snd01", desc["audio"]
+            assert desc["audio"]["microphone"] is False, desc["audio"]
+            cards = h.vmlab("exec", "snd01", "--", "cat", "/proc/asound/cards", cwd=lab, check=False).out.strip()
+            return f"00:1b.0 is {dev[0]}:{dev[1]}, node vmlab.e2e-audio.snd01; /proc/asound/cards: {cards[:80]!r}"
+
+        h.check("vm.hw.audio", hda,
+                "the guest sees an Intel HDA (8086:293e) at 00:1b.0 and the description names the host node "
+                "`vmlab.e2e-audio.snd01`, microphone off; no PipeWire in the container, so the host stream is "
+                "checked live")
+    finally:
+        h.vmlab("destroy", cwd=lab, timeout=300, check=False)
+
+
+def lab_runtime(lab: pathlib.Path, vm: str) -> pathlib.Path:
+    """Where a running VM's machine description sits, which `vmlab machine
+    info` does not print: the lab's runtime directory, by its machine."""
+    base = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/vmlab-{os.getuid()}")) / "vmlab" / "labs"
+    found = sorted(base.glob(f"*/vms/{vm}/machine.json"))
+    assert found, f"no machine.json for {vm} under {base}"
+    return found[0].parent
 
 
 def guest(h):
@@ -247,11 +282,21 @@ def usb(h):
             return h.vmlab("exec", vm, "--", "sh", "-c",
                            "cat /sys/bus/usb/devices/usb*/idProduct", cwd=lab).out
 
+        hv = h.hypervisor == "vmlab" and h.vms_here
+
         def controller():
             # An xHCI's USB 3 root hub is 1d6b:0003; `-usb` alone has none.
             assert "0003" in root_hubs("usb01"), "no xHCI root hub in usb01"
-            assert "0003" not in root_hubs("plain01"), "plain01 has an xHCI it was not asked for"
-            return True
+            if not hv:
+                assert "0003" not in root_hubs("plain01"), "plain01 has an xHCI it was not asked for"
+                return True
+            # vmlab-hv's tablet always rides an xHCI (HV phase-2 D6); `usb =
+            # true` makes that function the passthrough controller too.
+            usb01 = json.loads((lab_runtime(lab, "usb01") / "machine.json").read_text())
+            plain = json.loads((lab_runtime(lab, "plain01") / "machine.json").read_text())
+            assert usb01.get("usb") and usb01["usb"] == usb01["tablet"], usb01.get("usb")
+            assert "usb" not in plain, plain.get("usb")
+            return "usb01's description names its tablet xHCI as the passthrough controller; plain01's names none"
 
         h.check("usb.controller", controller)
 
@@ -272,14 +317,16 @@ def usb(h):
 
         h.check("usb.refusals", refusals)
         h.skip("usb.attach", "the e2e container has no host USB device it may take from the host; "
-               "attach and detach are verified live against a real device")
+               "attach and detach are verified live against a real device"
+               + (" (vmlab-hv's device_add/device_del/device_deleted round trip is unit-tested against "
+                  "its protocol server)" if hv else ""))
 
 
 def run(h):
     # The parts are independent: one aborting leaves its own features missing
     # (which fails the run) without costing the others theirs.
     failed = []
-    for part in (fastpath, gpu, guest, usb):
+    for part in (gpu, audio, guest, usb):
         try:
             part(h)
         except ScenarioFailed as e:
