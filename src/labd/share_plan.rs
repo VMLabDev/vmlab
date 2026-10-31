@@ -215,6 +215,10 @@ pub struct ShareInputs<'a> {
     pub home: Option<&'a Path>,
     /// What this host's virtiofsd can serve.
     pub host_virtiofsd: HostVirtiofsd,
+    /// Machines whose virtio-fs is served by something other than the
+    /// host's virtiofsd — vmlab-hv's in-process device (§22) — and what that
+    /// serves. A machine absent from the map takes [`Self::host_virtiofsd`].
+    pub machine_virtiofsd: &'a BTreeMap<String, HostVirtiofsd>,
     /// Per VM: does its resolved profile say the guest mounts virtiofs
     /// natively? A VM absent from the map is assumed not to.
     pub guest_virtiofs: &'a BTreeMap<String, bool>,
@@ -225,6 +229,16 @@ pub struct ShareInputs<'a> {
     /// Each segment's service address — where a guest reaches the lab's
     /// gateway services. A segment absent from the map has no gateway.
     pub gateways: &'a BTreeMap<String, Ipv4Addr>,
+}
+
+impl ShareInputs<'_> {
+    /// What serves `machine`'s virtio-fs.
+    fn virtiofsd_for(&self, machine: &str) -> HostVirtiofsd {
+        self.machine_virtiofsd
+            .get(machine)
+            .copied()
+            .unwrap_or(self.host_virtiofsd)
+    }
 }
 
 /// The half-built plan, so the two machine kinds can hand their SMB exports
@@ -304,7 +318,7 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
             let host = resolve_share_host(inputs.root, inputs.home, &share.host);
             match transport_of(
                 share.transport,
-                inputs.host_virtiofsd,
+                inputs.virtiofsd_for(&vm.name),
                 guest_ok,
                 share.readonly,
             ) {
@@ -353,7 +367,9 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         }
         let hosts = resolve_volume_hosts(c, inputs.root);
         let any_readonly = hosts.iter().any(|(_, _, readonly)| *readonly);
-        if container_volume_transport(inputs.host_virtiofsd, any_readonly) == Transport::Virtiofs {
+        if container_volume_transport(inputs.virtiofsd_for(&c.name), any_readonly)
+            == Transport::Virtiofs
+        {
             for (i, ((name, host, readonly), vol)) in hosts.iter().zip(&c.volumes).enumerate() {
                 b.virtiofs.push(VirtiofsShare {
                     machine: c.name.clone(),
@@ -581,6 +597,7 @@ mod tests {
 
     struct Host {
         virtiofsd: HostVirtiofsd,
+        machine_virtiofsd: BTreeMap<String, HostVirtiofsd>,
         guest_virtiofs: BTreeMap<String, bool>,
         windows_guests: BTreeSet<String>,
         gateways: BTreeMap<String, Ipv4Addr>,
@@ -592,6 +609,7 @@ mod tests {
         fn with_virtiofsd(guests: &[&str]) -> Self {
             Host {
                 virtiofsd: HostVirtiofsd::Full,
+                machine_virtiofsd: BTreeMap::new(),
                 guest_virtiofs: guests.iter().map(|g| (g.to_string(), true)).collect(),
                 windows_guests: BTreeSet::new(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
@@ -602,6 +620,7 @@ mod tests {
         fn bare() -> Self {
             Host {
                 virtiofsd: HostVirtiofsd::Absent,
+                machine_virtiofsd: BTreeMap::new(),
                 guest_virtiofs: BTreeMap::new(),
                 windows_guests: BTreeSet::new(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
@@ -616,6 +635,7 @@ mod tests {
                 root: Path::new("/lab"),
                 home: Some(Path::new("/home/dev")),
                 host_virtiofsd: host.virtiofsd,
+                machine_virtiofsd: &host.machine_virtiofsd,
                 guest_virtiofs: &host.guest_virtiofs,
                 windows_guests: &host.windows_guests,
                 gateways: &host.gateways,
@@ -686,6 +706,7 @@ lab "l" {
         for (host_has, guest_ok, want) in cases {
             let host = Host {
                 virtiofsd: host_has,
+                machine_virtiofsd: BTreeMap::new(),
                 guest_virtiofs: BTreeMap::from([("web".to_string(), guest_ok)]),
                 windows_guests: BTreeSet::new(),
                 gateways: BTreeMap::from([("lan".to_string(), Ipv4Addr::new(10, 0, 0, 1))]),
@@ -874,6 +895,7 @@ lab "l" {
         );
         let host = Host {
             virtiofsd: HostVirtiofsd::Absent,
+            machine_virtiofsd: BTreeMap::new(),
             guest_virtiofs: BTreeMap::new(),
             windows_guests: BTreeSet::new(),
             gateways: BTreeMap::from([
@@ -884,6 +906,37 @@ lab "l" {
         };
         let p = plan_on(&lab, &host, &AllFree).unwrap();
         assert_eq!(p.smb.unwrap().gateway_segments, ["lan", "dmz"]);
+    }
+
+    /// What serves virtio-fs is per machine: a vmlab-hv VM's in-process
+    /// device takes its `auto` shares — read-only ones too — on a host with
+    /// no virtiofsd, while a QEMU VM beside it falls back to SMB.
+    #[test]
+    fn a_machine_that_serves_its_own_virtio_fs_is_asked_for_itself() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" }
+  vm "hv" { template = "x86_64/t" nic { segment = "lan" }
+    share { host = "./a" guest = "/mnt/a" name = "a" readonly = true } }
+  vm "qemu" { template = "x86_64/t" nic { segment = "lan" }
+    share { host = "./b" guest = "/mnt/b" name = "b" } }
+}"#,
+        );
+        let mut host = Host::bare();
+        host.guest_virtiofs = BTreeMap::from([("hv".into(), true), ("qemu".into(), true)]);
+        host.machine_virtiofsd = BTreeMap::from([("hv".into(), HostVirtiofsd::Full)]);
+        let p = plan_on(&lab, &host, &AllFree).unwrap();
+        let on_virtiofs: Vec<_> = p.virtiofs.iter().map(|v| v.machine.as_str()).collect();
+        assert_eq!(on_virtiofs, ["hv"]);
+        let exports: Vec<_> = p
+            .smb
+            .unwrap()
+            .exports
+            .iter()
+            .flat_map(|e| e.shares.iter().map(|s| s.name.clone()))
+            .collect();
+        assert_eq!(exports, ["b"]);
     }
 
     /// A machine sharing over a segment with no gateway is named, not
@@ -900,6 +953,7 @@ lab "l" {
         );
         let host = Host {
             virtiofsd: HostVirtiofsd::Absent,
+            machine_virtiofsd: BTreeMap::new(),
             guest_virtiofs: BTreeMap::new(),
             windows_guests: BTreeSet::new(),
             gateways: BTreeMap::new(), // the lab is not up

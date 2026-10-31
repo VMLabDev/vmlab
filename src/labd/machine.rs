@@ -224,6 +224,13 @@ pub trait Machine: Send + Sync + 'static {
     /// substituted one disagrees with itself.
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd>;
 
+    /// Whether this machine's hypervisor serves its virtio-fs itself, in
+    /// which case [`virtiofsd`](Machine::virtiofsd) describes that device and
+    /// not the host's daemon.
+    fn virtiofs_in_process(&self) -> bool {
+        false
+    }
+
     /// Host socket for the i-th NIC of the current run.
     fn nic_sock(&self, i: usize) -> PathBuf;
 

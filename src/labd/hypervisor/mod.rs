@@ -319,6 +319,14 @@ pub trait Hypervisor: Send + Sync + 'static {
     /// with those devices can be snapshotted online.
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd>;
 
+    /// Whether the emulator serves a VM's virtio-fs shares itself, from the
+    /// host directory, so none of [`start_virtiofsd`](Hypervisor::start_virtiofsd)'s
+    /// daemons is started for them ([`crate::qemu::VmPaths::hypervisor_shares`]).
+    /// [`virtiofsd`](Hypervisor::virtiofsd) then describes that device.
+    fn virtiofs_in_process(&self) -> bool {
+        false
+    }
+
     /// Start one virtiofsd exporting `shared_dir` on `socket`. These are
     /// vhost-user backends, so they must be listening before the emulator
     /// spawns.

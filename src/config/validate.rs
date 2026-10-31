@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-use super::hypervisor::{HostFacts, HypervisorDefaults, HypervisorKind, vmlab_refusals};
+use super::hypervisor::{
+    HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, vmlab_refusals,
+};
 use super::model::*;
 use super::{Issue, IssueList};
 use crate::profiles::Profile;
@@ -52,11 +54,17 @@ pub trait ValidationContext {
     /// pick and sysfs resolution a start runs: a passthrough `host_gpu` this
     /// host lacks, or nothing to pick, or a picked GPU sysfs or its
     /// `vulkan_icd` or `qemu_binary` does not bear out — the latter judged
-    /// against `arch`, the VM's arch where it is known. The reason when not.
+    /// against `arch`, the VM's arch where it is known, and only on QEMU
+    /// (`hypervisor`), since vmlab-hv ignores it. The reason when not.
     /// A paravirtual
     /// name this host lacks is a warning, not this. A permissive context
     /// answers `Ok`.
-    fn check_host_gpu(&self, _gpu: &Gpu, _arch: Option<&str>) -> Result<(), String> {
+    fn check_host_gpu(
+        &self,
+        _gpu: &Gpu,
+        _arch: Option<&str>,
+        _hypervisor: HypervisorKind,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -234,7 +242,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     let mut static_ips: HashMap<Ipv4Addr, Span> = HashMap::new();
     let mut macs: HashMap<MacAddr, Span> = HashMap::new();
     let mut segment_gateways: HashMap<String, Span> = HashMap::new();
+    let hypervisors = ctx.hypervisor_defaults();
     for vm in &lab.vms {
+        let vm_hypervisor = hypervisors.effective(MachineCfg::Vm(vm));
         if !machine_names.insert(&vm.name) {
             issues.push(Issue::at(
                 vm.span,
@@ -307,7 +317,10 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     ),
                 ));
             }
+            // vmlab-hv serves its VMs' shares itself (§22, phase 2e): the
+            // host's virtiofsd is not asked.
             if share.transport == ShareTransport::Virtiofs
+                && vm_hypervisor != HypervisorKind::Vmlab
                 && let Err(why) = ctx.check_virtiofs_share(share)
             {
                 issues.push(Issue::at(share.span, why));
@@ -334,6 +347,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 &format!("vm \"{}\"", vm.name),
                 gpu,
                 vm_arch(vm).as_deref(),
+                vm_hypervisor,
                 ctx,
                 &mut issues,
             );
@@ -617,6 +631,8 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
 
     // -- template definitions -----------------------------------------------
     let mut tdefs: HashSet<(&str, &str, &str)> = HashSet::new();
+    // A build VM names no hypervisor, so it runs on the host's VM default.
+    let build_hypervisor = ctx.hypervisor_defaults().vm;
     for t in &file.templates {
         if !tdefs.insert((&t.arch, &t.name, &t.version)) {
             issues.push(Issue::at(
@@ -755,6 +771,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 &format!("template \"{}\"", t.name),
                 gpu,
                 Some(&t.arch),
+                build_hypervisor,
                 ctx,
                 &mut issues,
             );
@@ -765,6 +782,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     &format!("template \"{}\" variant \"{}\"", t.name, v.name),
                     gpu,
                     Some(&t.arch),
+                    build_hypervisor,
                     ctx,
                     &mut issues,
                 );
@@ -1751,6 +1769,7 @@ fn check_gpu(
     who: &str,
     gpu: &Gpu,
     arch: Option<&str>,
+    hypervisor: HypervisorKind,
     ctx: &dyn ValidationContext,
     issues: &mut IssueList,
 ) {
@@ -1761,7 +1780,7 @@ fn check_gpu(
         ));
         return;
     }
-    if let Err(why) = ctx.check_host_gpu(gpu, arch) {
+    if let Err(why) = ctx.check_host_gpu(gpu, arch, hypervisor) {
         issues.push(Issue::at(gpu.span, format!("{who}: {why}")));
     }
 }
@@ -1817,7 +1836,25 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
     let defaults = ctx.hypervisor_defaults();
     let mut host = None;
     for m in lab.machines() {
+        if let MachineCfg::Vm(vm) = m
+            && vm.microphone
+            && !vm.audio
+        {
+            issues.push(Issue::at(
+                vm.span,
+                format!(
+                    "vm \"{}\": microphone = true is the sound card's capture stream, and \
+                     the VM has no sound card — set audio = true as well",
+                    vm.name
+                ),
+            ));
+        }
         if defaults.effective(m) != HypervisorKind::Vmlab {
+            if let MachineCfg::Vm(vm) = m {
+                for why in qemu_refusals(vm) {
+                    issues.push(Issue::at(vm.span, why));
+                }
+            }
             continue;
         }
         let host = host.get_or_insert_with(|| ctx.host_facts());
@@ -3128,10 +3165,22 @@ lab "l" {
         fn check_script(&self, _: &Path) -> Result<(), String> {
             Ok(())
         }
-        fn check_host_gpu(&self, gpu: &Gpu, arch: Option<&str>) -> Result<(), String> {
-            crate::qemu::hostgpu::render_plan(Some(gpu), arch, &self.1, &self.0, Path::new("/data"))
-                .map(|_| ())
-                .map_err(|e| format!("{e:#}"))
+        fn check_host_gpu(
+            &self,
+            gpu: &Gpu,
+            arch: Option<&str>,
+            hypervisor: HypervisorKind,
+        ) -> Result<(), String> {
+            crate::qemu::hostgpu::render_plan(
+                Some(gpu),
+                arch,
+                &self.1,
+                &self.0,
+                Path::new("/data"),
+                hypervisor,
+            )
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
         }
     }
 
@@ -4205,26 +4254,86 @@ lab "l" {
         assert!(es.is_empty(), "{es:#?}");
     }
 
-    /// A Windows 11 VM — OVMF, secure boot, a TPM, Hyper-V — validates on
-    /// vmlab-hv from phase 2c; one the delivered phases cannot run is refused
-    /// naming the phase that brings it, read from its resolved hardware.
+    /// A Windows 11 VM — OVMF, secure boot, a TPM, Hyper-V, a sound card —
+    /// validates on vmlab-hv from phase 2c to 2f; one the delivered phases
+    /// cannot run is refused naming the phase that brings it, read from its
+    /// resolved hardware.
     #[test]
     fn a_vm_on_vmlab_is_refused_only_what_a_later_phase_brings() {
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-11" hypervisor = "vmlab" }"#,
+            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-11" hypervisor = "vmlab" usb = true audio = true microphone = true }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
-        // A paravirtual GPU: phase 2d.
+        // A pinned TSC waits for vmlab-hv's host probe.
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" gpu { mode = "virgl" } }"#,
+            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" tsc = "host" }"#,
         );
         assert!(
             es.iter()
-                .any(|e| e.contains("vm \"v\"") && e.contains("phase 2d")),
+                .any(|e| e.contains("vm \"v\"") && e.contains("D10")),
             "{es:#?}"
         );
+    }
+
+    /// Audio is vmlab-hv's (hv-audio D7): on QEMU — named or the host's
+    /// default — each key is refused naming the hypervisor that brings it,
+    /// and a microphone with no sound card is refused on either.
+    #[test]
+    fn audio_needs_vmlab_hv_and_a_microphone_needs_audio() {
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "q" { template = "x86_64/t" audio = true microphone = true }"#,
+        );
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(
+            es.iter()
+                .all(|e| e.contains("needs hypervisor = \"vmlab\"")),
+            "{es:#?}"
+        );
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "x86_64/t" hypervisor = "vmlab" microphone = true }"#,
+        );
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("set audio = true"), "{es:#?}");
+    }
+
+    /// vmlab-hv serves a VM's virtio-fs itself, so an explicit virtiofs
+    /// share on it is not checked against the host's virtiofsd.
+    #[test]
+    fn a_virtiofs_share_on_vmlab_hv_does_not_ask_the_hosts_virtiofsd() {
+        struct NoVirtiofsd;
+        impl ValidationContext for NoVirtiofsd {
+            fn template_meta(&self, a: &str, n: &str, v: Option<&str>) -> Option<TemplateMeta> {
+                Permissive.template_meta(a, n, v)
+            }
+            fn profile(&self, name: &str) -> Option<Profile> {
+                Permissive.profile(name)
+            }
+            fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
+                Ok(())
+            }
+            fn check_script(&self, _: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn check_virtiofs_share(&self, share: &Share) -> Result<(), String> {
+                Err(format!("{}: no virtiofsd", share.name))
+            }
+        }
+        let f = lab(r#"import <vmlab.wcl>
+lab "l" {
+  vm "hv" { template = "x86_64/t" hypervisor = "vmlab"
+    share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" } }
+  vm "q" { template = "x86_64/t"
+    share { host = "." guest = "/mnt/w" name = "w" transport = "virtiofs" } }
+}"#);
+        let es: Vec<String> = validate(&f, &NoVirtiofsd)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert_eq!(es, ["w: no virtiofsd"], "{es:#?}");
     }
 
     #[test]
@@ -4307,8 +4416,8 @@ lab "l" {
         let es = hv_errs(
             &host,
             r#"container "c" { image = "alpine" }
-vm "v" { template = "x86_64/t" usb = true }
-vm "q" { template = "x86_64/t" hypervisor = "qemu" usb = true }"#,
+vm "v" { template = "x86_64/t" accel = "tcg" }
+vm "q" { template = "x86_64/t" hypervisor = "qemu" accel = "tcg" }"#,
         );
         assert_eq!(es.len(), 1, "{es:#?}");
         assert!(es[0].contains("vm \"v\""), "{es:#?}");
