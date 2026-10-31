@@ -115,6 +115,13 @@ pub trait Control: Send + Sync + 'static {
     /// shutdown or a crash depending on this answer.
     fn guest_shutdown(&self) -> bool;
 
+    /// Whether the guest reset itself and the hypervisor ended for it rather
+    /// than resetting in place — vmlab-hv's contract (PRD §22), where QEMU
+    /// resets a VM in place and never reports this. The VM boots it again.
+    fn guest_reset(&self) -> bool {
+        false
+    }
+
     /// Whether the guest is asleep — suspended to RAM (ACPI S3), the emulator
     /// alive with its vCPUs stopped — as a channel that changes on every
     /// transition. QEMU's q35 machine advertises S3, and a Windows client

@@ -1,6 +1,7 @@
 """Core: validation, the lab lifecycle, per-VM power, declared hardware and
 attached media, each proved from inside the guest where the guest can see it
-and from QEMU's own argv where it cannot."""
+and from QEMU's own argv where it cannot. Firmware, the TPM and secure boot
+are the `firmware` scenario's, which proves them on either hypervisor."""
 
 import json
 import pathlib
@@ -16,7 +17,7 @@ OWNED = [
     "lab.status", "lab.down", "lab.up.reload", "lab.reload.stopped", "lab.reload.network",
     "lab.up.template-changed", "lab.destroy",
     "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory",
-    "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
+    "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy",
     "vm.hw.qemu_args", "vm.hw.nested", "vm.scratch", "vm.media.iso", "vm.media.floppy",
     "share.unmountable",
 ]
@@ -173,46 +174,6 @@ def run(h):
         for f in OWNED:
             if f not in h.results:
                 h.ok(f, False, "not reached: the scenario stopped before this step")
-
-
-def secure_boot(h):
-    """`secure_boot = true` enforces: QEMU runs the secboot build with secure
-    pflash, the VM's VARS carry enrolled keys (PK, KEK, db), and the firmware
-    refuses the Alpine image's unsigned bootloader — which boots in the core
-    lab without secure boot. Enforced, it never reaches a guest to ask."""
-    with h.lab("core-secureboot") as lab:
-        up = h.vmlab("up", cwd=lab, timeout=300, check=False)
-        serial = pathlib.Path.home() / ".local/state/vmlab/labs/e2e-core-secureboot/vms/sb/serial.log"
-        refused = ""
-        try:
-            refused = h.wait_until(
-                lambda: next(
-                    (l.strip() for l in (serial.read_text(errors="replace") if serial.exists() else "").splitlines()
-                     if "failed to load" in l and "Access Denied" in l),
-                    None,
-                ),
-                timeout=120, interval=2, what="the firmware to refuse the unsigned bootloader",
-            )
-        except ScenarioFailed:
-            pass
-        argv = qemu_argv_of("e2e-core-secureboot", "sb")
-        code = next((a for a in argv if "OVMF_CODE" in a), "")
-        vars_file = lab / ".vmlab" / "vms" / "sb" / "OVMF_VARS.fd"
-        blob = vars_file.read_bytes() if vars_file.exists() else b""
-        keys = [k for k in ("PK", "KEK", "db") if (k + "\0").encode("utf-16-le") in blob]
-        # vmlab's own firmware, not the host's: the image carries no OVMF
-        # package, and the VM's VARS started as the bundled enrolled template.
-        bundled = code.startswith(f"if=pflash,format=raw,readonly=on,file={BUNDLED_FIRMWARE}/x86_64/")
-        template = pathlib.Path(BUNDLED_FIRMWARE, "x86_64", "OVMF_VARS_4M.ms.fd")
-        same_size = template.exists() and len(blob) == template.stat().st_size
-        h.ok(
-            "vm.hw.secure_boot",
-            up.code == 0 and "secboot" in code and bundled and same_size
-            and "driver=cfi.pflash01,property=secure,value=on" in argv
-            and keys == ["PK", "KEK", "db"] and bool(refused),
-            f"qemu runs the bundled {code.rsplit('=', 1)[-1]} with secure pflash; the VM's VARS enrol "
-            f"{keys}; serial: {refused or 'no refusal seen'!r}",
-        )
 
 
 def unmountable(h):
@@ -374,7 +335,6 @@ def _run(h):
         f"exit {bad.code}: " + next((l.strip(" ×") for l in bad.text.splitlines() if "at least" in l), bad.text.strip()[-120:]),
     )
 
-    secure_boot(h)
     unmountable(h)
 
     with h.lab("core-lab") as lab:
@@ -476,14 +436,7 @@ def _run(h):
         )
         h.ok("vm.hw.cdrom", p.get("cdrom") == "cdrom attachment e2e", f"E2ECDROM mounted: cdrom.txt={p.get('cdrom')!r}")
         h.ok("vm.media.iso", p.get("media_iso") == "media iso e2e", f"E2EMEDIA mounted: {p.get('media_iso')!r}")
-        swtpm = process_running(f"--tpmstate dir={lab}/.vmlab/vms/vm01/tpm-state")
         argv1 = qemu_argv("vm01")
-        h.ok(
-            "vm.hw.tpm",
-            swtpm and "tpm-tis,tpmdev=tpm0" in argv1 and p.get("tpm2_acpi") == "yes",
-            f"swtpm running={swtpm}; qemu has tpm-tis; guest ACPI TPM2 table={p.get('tpm2_acpi')} "
-            "(the Alpine virt kernel ships no tpm_tis driver, so no /dev/tpm0)",
-        )
         h.ok("vm.hw.qemu_args", p.get("serial") == "E2E-QEMU-ARGS", f"guest DMI product_serial={p.get('serial')!r}")
         # vm01 declares `nested = true`, vm02 does not: the switch decides
         # what the guest CPU carries, whatever the host allows.
@@ -500,15 +453,6 @@ def _run(h):
         blank_screen = h.wait_until(
             lambda: (lambda t: t if "bootable" in t else None)(h.vmlab("vm", "ocr", "blank", cwd=lab, check=False).out),
             timeout=90, interval=3, what="the scratch VM's boot failure screen",
-        )
-        code1 = next((a for a in argv1 if "OVMF_CODE" in a), "")
-        h.ok(
-            "vm.hw.firmware",
-            p.get("efi") == "yes" and f"file={BUNDLED_FIRMWARE}/x86_64/OVMF_CODE" in code1
-            and "SeaBIOS" in blank_screen
-            and not any("OVMF" in a for a in qemu_argv("blank")),
-            f"vm01 (firmware=ovmf) has /sys/firmware/efi and the bundled pflash {code1.rsplit('=', 1)[-1]}; "
-            "blank (seabios) shows the SeaBIOS banner",
         )
         disk = lab / ".vmlab" / "vms" / "blank" / "disk0.qcow2"
         info = h.run(["qemu-img", "info", "-U", "--output=json", str(disk)], check=False)

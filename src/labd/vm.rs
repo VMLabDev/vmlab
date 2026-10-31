@@ -141,6 +141,14 @@ pub enum StopReason {
     Crashed,
 }
 
+/// The callbacks a boot runs with, shared so a relaunch can reuse them.
+#[derive(Clone)]
+struct BootHooks {
+    on_exit: Arc<dyn Fn(StopReason, String) + Send + Sync>,
+    on_ready: Arc<dyn Fn() + Send + Sync>,
+    on_sleep: Arc<dyn Fn(SleepChange) + Send + Sync>,
+}
+
 pub struct VmDirs {
     /// `.vmlab/vms/<vm>` — disks, OVMF VARS, TPM state.
     pub local: PathBuf,
@@ -349,6 +357,10 @@ pub struct VmInstance {
     /// Which hypervisor `hv` is (§22), as the machine reports it and its
     /// snapshots record it.
     hypervisor: HypervisorKind,
+    /// The host facts vmlab-hv's refusals read at each start (§22): this
+    /// host, probed, in production; a test's own, so a machine on a fake
+    /// hypervisor does not depend on the host running the test.
+    host_facts: Arc<dyn Fn() -> crate::config::hypervisor::HostFacts + Send + Sync>,
     /// Where the display publishes every input it sends, for a console
     /// recorder (§11.1). Lives as long as the machine, across restarts.
     input_tap: Arc<crate::record::InputTap>,
@@ -434,6 +446,7 @@ impl VmInstance {
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
             hypervisor: HypervisorKind::Qemu,
+            host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
             input_tap: Arc::default(),
         })
     }
@@ -459,6 +472,17 @@ impl VmInstance {
     #[cfg(test)]
     pub(crate) fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn Hypervisor>) {
         Arc::get_mut(self).expect("sole owner").hv = hv;
+    }
+
+    /// Answer vmlab-hv's host-fact questions with `facts` instead of probing
+    /// this host — the injection point that keeps fake-driven tests off the
+    /// test host's `/dev/kvm`.
+    #[cfg(test)]
+    pub(crate) fn set_host_facts(
+        self: &mut Arc<Self>,
+        facts: crate::config::hypervisor::HostFacts,
+    ) {
+        Arc::get_mut(self).expect("sole owner").host_facts = Arc::new(move || facts.clone());
     }
 
     /// Indices into `cfg.shares` that ride virtiofs (§7.5).
@@ -1031,6 +1055,34 @@ impl VmInstance {
         before_resume: impl std::future::Future<Output = Result<()>> + Send + 'static,
         on_sleep: impl Fn(SleepChange) + Send + Sync + 'static,
     ) -> Result<()> {
+        let hooks = BootHooks {
+            on_exit: Arc::new(on_exit),
+            on_ready: Arc::new(on_ready),
+            on_sleep: Arc::new(on_sleep),
+        };
+        Arc::clone(self)
+            .boot_with(hooks, Box::pin(before_ready), Box::pin(before_resume))
+            .await
+    }
+
+    /// [`boot`](Self::boot) with its callbacks shared, so the exit monitor can
+    /// boot the machine again with the same ones when a guest reset ended a
+    /// hypervisor that does not reset in place (see [`Self::relaunch`]).
+    fn boot_with(
+        self: Arc<Self>,
+        hooks: BootHooks,
+        before_ready: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        before_resume: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+        Box::pin(async move { self.boot_inner(hooks, before_ready, before_resume).await })
+    }
+
+    async fn boot_inner(
+        self: &Arc<Self>,
+        hooks: BootHooks,
+        before_ready: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        before_resume: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
+    ) -> Result<()> {
         {
             let mut st = self.state.write().await;
             if *st != PowerState::Stopped {
@@ -1047,19 +1099,25 @@ impl VmInstance {
             // A deferred pull binds its template's hardware after the lab
             // builder checked the placeholder, so vmlab-hv's refusals are
             // asked again of what this start will run (§22).
-            if self.hypervisor == HypervisorKind::Vmlab {
+            let kvm = if self.hypervisor == HypervisorKind::Vmlab {
+                let host = (self.host_facts)();
                 let why = crate::config::hypervisor::vmlab_refusals(
                     model::MachineCfg::Vm(&self.cfg),
-                    &crate::config::hypervisor::HostFacts::probe(),
+                    &host,
                     Some(&t.resolved),
                 );
                 if !why.is_empty() {
                     bail!("{}", why.join("\n"));
                 }
-            }
+                // The refusals above vouch for the arch; the host fact is
+                // the one they read.
+                host.kvm
+            } else {
+                qemu::kvm_usable(&t.resolved.arch)
+            };
             // Decided before anything is created or spawned: a declared
             // `accel = "kvm"` that KVM cannot honour refuses here (§5.2).
-            let plan = qemu::plan_accel(&t.resolved, qemu::kvm_usable(&t.resolved.arch))?;
+            let plan = qemu::plan_accel(&t.resolved, kvm)?;
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
             self.ensure_disks().await?;
@@ -1190,16 +1248,29 @@ impl VmInstance {
         // the spot. Only Running and Suspended trade places here: a guest
         // that sleeps while the stop ladder has it stays Stopping.
         if let Some(asleep) = control.sleep_watch() {
-            tokio::spawn(Arc::clone(self).watch_sleep(asleep, on_sleep));
+            let on_sleep = hooks.on_sleep.clone();
+            tokio::spawn(Arc::clone(self).watch_sleep(asleep, move |change| on_sleep(change)));
         }
 
         // Exit monitor: classify why QEMU ended (PRD §8.1 stop reasons).
         let me = self.clone();
+        let exit_hooks = hooks.clone();
         tokio::spawn(async move {
             let status = proc
                 .wait_exit(Duration::from_secs(60 * 60 * 24 * 365))
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
+            // A guest that reset itself, on a hypervisor that ends rather
+            // than resetting in place: boot it again, as QEMU would have
+            // reset it, with no stop in between for anyone to see.
+            if control.guest_reset()
+                && me.hypervisor == HypervisorKind::Vmlab
+                && !*me.stop_requested.read().await
+            {
+                me.relaunch(exit_hooks, &status).await;
+                return;
+            }
+            let on_exit = exit_hooks.on_exit;
             let reason = super::hypervisor::classify_exit(
                 *me.stop_requested.read().await,
                 control.guest_shutdown(),
@@ -1226,6 +1297,7 @@ impl VmInstance {
         // where it does, it returns success or failure, bounded, so the
         // machine always ends ready.
         let me = self.clone();
+        let on_ready = hooks.on_ready;
         tokio::spawn(async move {
             let defer_ready = me.first_boot_pending();
             loop {
@@ -1261,6 +1333,48 @@ impl VmInstance {
         });
 
         Ok(())
+    }
+
+    /// Boot the machine again after the guest reset itself and vmlab-hv,
+    /// which ends on a guest reset rather than resetting in place, exited
+    /// (PRD §22). QEMU resets in place, so to everyone above the seam this is
+    /// one run: no `stopped` event, the NICs kept attached, readiness kept if
+    /// the guest had it — a first-boot provision waiting out the reboot with
+    /// `wait_rebooted` sees a new boot, as it would on QEMU. What a run owns
+    /// below the seam starts afresh: the hypervisor, and the swtpm that ended
+    /// with it. A relaunch that fails is a crash.
+    async fn relaunch(self: &Arc<Self>, hooks: BootHooks, status: &str) {
+        tracing::info!(
+            "{}: the guest reset itself; starting vmlab-hv again ({status})",
+            self.cfg.name
+        );
+        let nics = std::mem::take(&mut *self.nic_attachments.lock().await);
+        let was_ready = *self.ready.read().await;
+        self.teardown().await;
+        *self.nic_attachments.lock().await = nics;
+        *self.agent_up.write().await = false;
+        *self.state.write().await = PowerState::Stopped;
+        let on_ready = hooks.on_ready.clone();
+        let again = BootHooks {
+            // Ready already, as a reset leaves it under QEMU: nothing to
+            // announce when the agent answers again.
+            on_ready: if was_ready { Arc::new(|| {}) } else { on_ready },
+            ..hooks.clone()
+        };
+        let booted = Arc::clone(self)
+            .boot_with(
+                again,
+                Box::pin(std::future::ready(())),
+                Box::pin(std::future::ready(Ok(()))),
+            )
+            .await;
+        if let Err(e) = booted {
+            *self.ready.write().await = false;
+            (hooks.on_exit)(
+                StopReason::Crashed,
+                format!("restarting vmlab-hv after a guest reset failed: {e:#}"),
+            );
+        }
     }
 
     /// Follow the guest's sleep transitions for the life of this run (see

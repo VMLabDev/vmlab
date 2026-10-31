@@ -220,11 +220,11 @@ FEATURES: dict[str, str] = {
 # takes part in (the template store, validation, the supervisor); it runs on
 # both. Phase 2's sub-phases (2a platform and SeaBIOS, 2b frames, 2c OVMF, SMM,
 # TPM and Windows, 2d GPU, 2e virtio-fs and audio, 2f USB and vfio) land in
-# order. On vmlab-hv from 2a the suite builds its VM template from Alpine's
-# BIOS image on SeaBIOS (`scenarios/template.py`); a feature is tagged 2a or 2b
-# only where its scenario's labs declare nothing a later phase brings, so
-# `core` (OVMF, a TPM, floppies, `qemu_args`) and `sleep` (S3) wait for 2c. A
-# feature that touches a VM and a container is tagged by the VM.
+# order. On a vmlab-hv run delivered through 2a or 2b the suite builds its VM
+# template from Alpine's BIOS image on SeaBIOS (`scenarios/template.py`); from
+# 2c it boots the UEFI one again. A feature is tagged 2a or 2b only where its
+# scenario's labs declare nothing a later phase brings. A feature that touches
+# a VM and a container is tagged by the VM.
 
 HOST = "host"
 
@@ -232,7 +232,7 @@ HOST = "host"
 PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
 
 # The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
-VMLAB_DELIVERED = "2b"
+VMLAB_DELIVERED = "2c"
 
 _GROUPS: dict[str, list[str]] = {
     HOST: [
@@ -294,6 +294,19 @@ _GROUPS: dict[str, list[str]] = {
     "3": ["arch.emulated"],
     # The legacy PC: floppy controller, SMB1 guests.
     "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1"],
+}
+
+# Scenarios whose VMs stay on QEMU on a vmlab-hv run, and why: `core` proves
+# most of what it covers from QEMU's own argv and pid, and its lab declares
+# `qemu_args` and floppies. Their host and container features still count;
+# a VM feature they report is skipped with the reason, never passed, since a
+# pass on QEMU says nothing about vmlab-hv (`Harness._record`).
+QEMU_SCENARIOS: dict[str, str] = {
+    "core": "`core` proves it from QEMU's argv, and its lab declares `qemu_args` and floppies",
+    "containers": "the `containers` lab's VM declares virtiofs shares (phase 2e)",
+    "admin": "the `admin` lab declares an emulated aarch64 VM (phase 3)",
+    "unsupported": "the `unsupported` labs declare `usb = true` and a `gpu {}` (phases 2f, 2d), "
+    "and its fast-path check reads QEMU's tap netdevs",
 }
 
 # Features only QEMU can ever run, and why; skipped on every other hypervisor.

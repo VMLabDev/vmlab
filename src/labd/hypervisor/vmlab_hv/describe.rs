@@ -17,7 +17,7 @@ use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
     Accel, Arch, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display, DisplayDevice, FirmwareKind,
-    FsShare, Machine, Nic, NicAttachment, PciAddress, SerialPort,
+    FsShare, HyperV, Machine, Nic, NicAttachment, PciAddress, SerialPort, Tpm,
 };
 
 use crate::profiles::AgentTransport;
@@ -47,6 +47,9 @@ pub(crate) struct HostRoms {
     /// Absent leaves the NICs without an option ROM — no network boot, which
     /// a disk-booting template never asks for.
     pub ipxe_virtio: Option<PathBuf>,
+    /// The same build for a VM on OVMF: the combined legacy and EFI image
+    /// (`virtio-net.rom`), as QEMU's `efi-virtio.rom` is, else the EFI one.
+    pub ipxe_virtio_efi: Option<PathBuf>,
 }
 
 /// The QEMU `-rtc base=` form the resolver writes — UTC without a zone — as
@@ -204,10 +207,33 @@ fn ahci_boot_path(port: u8) -> String {
     )
 }
 
-/// The machine description for one VM: q35 on SeaBIOS, as QEMU runs the same
-/// resolved machine (§22, phases 2a and 2b). Refuses whatever validation
-/// refuses too, as the last word before a spawn, and what only the launch
-/// knows — a tap NIC, a host without SeaBIOS.
+/// The enlightenments a `hyperv` VM gets: QEMU's [`crate::qemu::cmdline::HYPERV_FLAGS`],
+/// name for name, and `avic` with them where the host virtualises the APIC,
+/// as the QEMU path adds [`crate::qemu::cmdline::HYPERV_APICV_FLAG`].
+fn hyperv_list(resolved: &ResolvedVm, apic_virtualization: bool) -> Result<Vec<HyperV>> {
+    if !resolved.hyperv {
+        return Ok(Vec::new());
+    }
+    let mut flags: Vec<&str> = crate::qemu::cmdline::HYPERV_FLAGS.split(',').collect();
+    if apic_virtualization {
+        flags.push(crate::qemu::cmdline::HYPERV_APICV_FLAG);
+    }
+    flags
+        .into_iter()
+        .map(|flag| {
+            // `hv-spinlocks=0x1fff` names `spinlocks`; vmlab-hv fixes the count.
+            let name = flag.trim().trim_start_matches("hv-");
+            let name = name.split('=').next().unwrap_or(name);
+            serde_json::from_value(serde_json::Value::String(name.to_string()))
+                .map_err(|_| anyhow::anyhow!("vmlab-hv has no Hyper-V enlightenment `{name}`"))
+        })
+        .collect()
+}
+
+/// The machine description for one VM: q35 on SeaBIOS or OVMF, as QEMU runs
+/// the same resolved machine (§22, phases 2a to 2c). Refuses whatever
+/// validation refuses too, as the last word before a spawn, and what only the
+/// launch knows — a tap NIC, a host without its firmware.
 pub(crate) fn vm(
     lab: &str,
     resolved: &ResolvedVm,
@@ -231,9 +257,7 @@ pub(crate) fn vm(
             resolved.machine
         );
     }
-    if resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf) {
-        bail!("vm \"{name}\": vmlab-hv boots SeaBIOS only until phase 2c (PRD §22)");
-    }
+    let ovmf = resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf);
     let display_device = match resolved.display_device.as_deref() {
         // QEMU's q35 adds a std VGA of its own where nothing names one.
         None | Some("VGA") => DisplayDevice::StdVga,
@@ -244,12 +268,23 @@ pub(crate) fn vm(
             )
         }
     };
-    let Some(seabios) = &roms.seabios else {
-        bail!(
-            "vm \"{name}\": vmlab-hv boots it on SeaBIOS, and this host has no bios-256k.bin — \
-             install SeaBIOS (the `seabios` package), or put it under the host config's \
-             `firmware_dir`/x86_64/"
-        );
+    // OVMF: the CODE image vmlab's firmware lookup chose for this VM's
+    // secure-boot setting, and the VM's own VARS copy — never the template's
+    // — exactly as QEMU's two pflash drives get them.
+    let firmware = if ovmf {
+        let (Some(code), Some(vars)) = (&paths.firmware_code, &paths.ovmf_vars) else {
+            bail!("vm \"{name}\": OVMF needs its CODE image and the VM's own VARS file");
+        };
+        (FirmwareKind::Ovmf, code.clone(), Some(vars.clone()))
+    } else {
+        let Some(seabios) = &roms.seabios else {
+            bail!(
+                "vm \"{name}\": vmlab-hv boots it on SeaBIOS, and this host has no bios-256k.bin — \
+                 install SeaBIOS (the `seabios` package), or put it under the host config's \
+                 `firmware_dir`/x86_64/"
+            );
+        };
+        (FirmwareKind::Seabios, seabios.clone(), None)
     };
     let Some(serial_log) = &paths.serial_log else {
         bail!("vm \"{name}\": vmlab-hv needs a serial log path");
@@ -341,7 +376,11 @@ pub(crate) fn vm(
             );
         };
         nics.push(Nic {
-            rom: roms.ipxe_virtio.clone(),
+            rom: if ovmf {
+                roms.ipxe_virtio_efi.clone()
+            } else {
+                roms.ipxe_virtio.clone()
+            },
             pci: Some(slots.next()),
             mac: nic.mac.to_string(),
             mtu: nic.mtu.filter(|m| *m != 1500),
@@ -367,7 +406,7 @@ pub(crate) fn vm(
         } else {
             CpuPolicy::Host
         },
-        hyperv: Vec::new(),
+        hyperv: hyperv_list(resolved, paths.apic_virtualization)?,
         // Both named rather than left beside the control socket, so the
         // paths every consumer looks for are the ones this machine has.
         display: Some(Display {
@@ -378,7 +417,8 @@ pub(crate) fn vm(
             vnc_socket: Some(paths.vnc_sock.clone()),
         }),
         tablet,
-        tpm: None,
+        // The swtpm vmlab started before the spawn, as QEMU's `tpm-tis`.
+        tpm: paths.tpm_sock.clone().map(|socket| Tpm { socket }),
         console_pci,
         ahci_pci: Some(AHCI),
         name: format!("vmlab:{lab}/{name}"),
@@ -387,11 +427,17 @@ pub(crate) fn vm(
         vcpus: resolved.cpus,
         memory_mib: resolved.memory >> 20,
         boot: Boot::Firmware {
-            firmware: FirmwareKind::Seabios,
-            code: seabios.clone(),
-            vars: None,
-            secure_boot: false,
-            bootorder: boot.into_iter().map(|(_, at)| at).collect(),
+            firmware: firmware.0,
+            code: firmware.1,
+            vars: firmware.2,
+            secure_boot: ovmf && resolved.secure_boot,
+            // QEMU sets `bootindex` under SeaBIOS only; OVMF keeps its own
+            // boot order in the VM's VARS.
+            bootorder: if ovmf {
+                Vec::new()
+            } else {
+                boot.into_iter().map(|(_, at)| at).collect()
+            },
         },
         disks,
         nics,
@@ -552,6 +598,7 @@ mod tests {
             vgabios_std: Some("/usr/share/qemu/vgabios-stdvga.bin".into()),
             vgabios_virtio: Some("/usr/share/qemu/vgabios-virtio.bin".into()),
             ipxe_virtio: Some("/fw/x86_64/1af41000.rom".into()),
+            ipxe_virtio_efi: Some("/fw/x86_64/virtio-net.rom".into()),
         }
     }
 
@@ -577,16 +624,22 @@ mod tests {
     /// A VM declared with `body` beside its scratch disk, resolved against
     /// the shipped profiles and `extra`.
     fn declared(body: &str, extra: Option<crate::profiles::Profile>) -> Resolved {
-        let mut profiles: Vec<_> = ["linux-modern", "linux-generic", "windows-legacy"]
-            .iter()
-            .map(|n| {
-                crate::profiles::ProfileSet::shipped()
-                    .unwrap()
-                    .get(n)
-                    .unwrap()
-                    .clone()
-            })
-            .collect();
+        let mut profiles: Vec<_> = [
+            "linux-modern",
+            "linux-generic",
+            "windows-legacy",
+            "windows-10",
+            "windows-11",
+        ]
+        .iter()
+        .map(|n| {
+            crate::profiles::ProfileSet::shipped()
+                .unwrap()
+                .get(n)
+                .unwrap()
+                .clone()
+        })
+        .collect();
         profiles.extend(extra);
         let v = crate::qemu::resolve::testing::vm(&format!(
             "vm \"t\" {{ template = \"scratch\" arch = \"x86_64\" disk = 10GiB {body} }}"
@@ -804,9 +857,9 @@ mod tests {
             format!("{:#}", vm("l", r, p, accel, roms).unwrap_err())
         };
         let ok = seabios_modern();
-        // linux-modern's own firmware is OVMF.
+        // OVMF without the paths the lab daemon assembles for it.
         let ovmf = resolved_vm("linux-modern", "x86_64");
-        assert!(refused(&ovmf, &vm_paths(), QemuAccel::Kvm, &roms()).contains("2c"));
+        assert!(refused(&ovmf, &vm_paths(), QemuAccel::Kvm, &roms()).contains("VARS"));
         assert!(refused(&ok, &vm_paths(), QemuAccel::Tcg, &roms()).contains("KVM"));
         let no_bios = HostRoms {
             seabios: None,
@@ -833,5 +886,127 @@ mod tests {
         let back: MachineDescription = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
         assert!(json.contains(r#""machine":"q35""#), "{json}");
+    }
+
+    // -- OVMF, secure boot, TPM, Hyper-V (phase 2c) -----------------------
+
+    /// The paths the lab daemon assembles for an OVMF VM: the CODE image its
+    /// firmware lookup chose, the VM's own VARS copy, and swtpm's socket.
+    fn ovmf_paths(tpm: bool) -> VmPaths {
+        VmPaths {
+            firmware_code: Some("/fw/x86_64/OVMF_CODE_4M.secboot.fd".into()),
+            ovmf_vars: Some("/lab/.vmlab/vms/v/OVMF_VARS.fd".into()),
+            tpm_sock: tpm.then(|| "/run/l/v/tpm.sock".into()),
+            ..vm_paths()
+        }
+    }
+
+    const QEMU_HYPERV: [HyperV; 12] = [
+        HyperV::Relaxed,
+        HyperV::Vapic,
+        HyperV::Spinlocks,
+        HyperV::Vpindex,
+        HyperV::Runtime,
+        HyperV::Time,
+        HyperV::Synic,
+        HyperV::Stimer,
+        HyperV::Frequencies,
+        HyperV::Reset,
+        HyperV::Tlbflush,
+        HyperV::Ipi,
+    ];
+
+    /// Windows 11 as QEMU runs it: OVMF's secure-boot CODE with the VM's own
+    /// VARS, secure boot on, the TPM on swtpm's socket, QEMU's enlightenments
+    /// in QEMU's order, no `bootorder` (OVMF keeps its own), and the EFI iPXE
+    /// image on the NIC. The slots are SeaBIOS's: firmware changes none.
+    #[test]
+    fn windows_11_is_ovmf_secure_boot_tpm_and_hyperv() {
+        let r = declared(r#"profile = "windows-11""#, None);
+        let d = vm("l", &r, &ovmf_paths(true), QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(
+            d.boot,
+            Boot::Firmware {
+                firmware: FirmwareKind::Ovmf,
+                code: "/fw/x86_64/OVMF_CODE_4M.secboot.fd".into(),
+                vars: Some("/lab/.vmlab/vms/v/OVMF_VARS.fd".into()),
+                secure_boot: true,
+                bootorder: Vec::new(),
+            }
+        );
+        assert_eq!(
+            d.tpm,
+            Some(Tpm {
+                socket: "/run/l/v/tpm.sock".into()
+            })
+        );
+        assert_eq!(d.hyperv, QEMU_HYPERV.to_vec());
+        assert_eq!(
+            d.nics[0].rom.as_deref(),
+            Some(Path::new("/fw/x86_64/virtio-net.rom"))
+        );
+        assert_eq!(
+            (d.console_pci, d.disks[0].pci, d.nics[0].pci, d.tablet),
+            (at(1), at(2), at(3), at(5))
+        );
+        assert_eq!(d.display.unwrap().pci, at(4).unwrap());
+    }
+
+    /// The APICv/AVIC host adds `avic`, as QEMU's `-cpu` gains `hv-avic`.
+    #[test]
+    fn avic_follows_the_hosts_apic_virtualization() {
+        let r = declared(r#"profile = "windows-10""#, None);
+        let mut p = ovmf_paths(false);
+        p.apic_virtualization = true;
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        let mut want = QEMU_HYPERV.to_vec();
+        want.push(HyperV::Avic);
+        assert_eq!(d.hyperv, want);
+        // Windows 10: no TPM, no secure boot.
+        assert_eq!(d.tpm, None);
+        let Boot::Firmware { secure_boot, .. } = d.boot else {
+            panic!()
+        };
+        assert!(!secure_boot);
+    }
+
+    /// The QEMU flags are the one list: each maps onto an enlightenment
+    /// vmlab-hv knows, so a flag added there cannot be dropped silently here.
+    #[test]
+    fn every_qemu_enlightenment_maps_onto_vmlab_hv() {
+        let r = declared(r#"profile = "windows-10""#, None);
+        assert_eq!(hyperv_list(&r, false).unwrap().len(), QEMU_HYPERV.len());
+        // A Linux profile asks for none.
+        let linux = declared(r#"profile = "linux-modern""#, None);
+        assert!(hyperv_list(&linux, true).unwrap().is_empty());
+    }
+
+    /// UEFI Linux without secure boot: OVMF's plain CODE, the VM's VARS, no
+    /// TPM, no enlightenments; `secure_boot = true` on the VM turns it on.
+    #[test]
+    fn uefi_linux_with_and_without_secure_boot() {
+        let r = declared(r#"profile = "linux-modern""#, None);
+        let mut p = ovmf_paths(false);
+        p.firmware_code = Some("/fw/x86_64/OVMF_CODE_4M.fd".into());
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        let Boot::Firmware {
+            firmware,
+            code,
+            secure_boot,
+            ..
+        } = &d.boot
+        else {
+            panic!()
+        };
+        assert_eq!(*firmware, FirmwareKind::Ovmf);
+        assert_eq!(code, &PathBuf::from("/fw/x86_64/OVMF_CODE_4M.fd"));
+        assert!(!secure_boot && d.hyperv.is_empty() && d.tpm.is_none());
+
+        let r = declared(r#"profile = "linux-modern" secure_boot = true"#, None);
+        let d = vm("l", &r, &ovmf_paths(false), QemuAccel::Kvm, &roms()).unwrap();
+        let Boot::Firmware { secure_boot, .. } = d.boot else {
+            panic!()
+        };
+        assert!(secure_boot);
     }
 }

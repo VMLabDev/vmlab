@@ -4205,24 +4205,24 @@ lab "l" {
         assert!(es.is_empty(), "{es:#?}");
     }
 
-    /// Phases 2a and 2b: a SeaBIOS Linux VM on q35 validates; one the
-    /// delivered phases cannot run is refused naming the phase that brings
-    /// it, read from its resolved hardware.
+    /// A Windows 11 VM — OVMF, secure boot, a TPM, Hyper-V — validates on
+    /// vmlab-hv from phase 2c; one the delivered phases cannot run is refused
+    /// naming the phase that brings it, read from its resolved hardware.
     #[test]
     fn a_vm_on_vmlab_is_refused_only_what_a_later_phase_brings() {
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-generic" hypervisor = "vmlab" }"#,
+            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-11" hypervisor = "vmlab" }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
-        // linux-modern's own firmware is OVMF: phase 2c.
+        // A paravirtual GPU: phase 2d.
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" }"#,
+            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" gpu { mode = "virgl" } }"#,
         );
-        assert_eq!(es.len(), 1, "{es:#?}");
         assert!(
-            es[0].contains("vm \"v\"") && es[0].contains("phase 2c"),
+            es.iter()
+                .any(|e| e.contains("vm \"v\"") && e.contains("phase 2d")),
             "{es:#?}"
         );
     }
