@@ -26,9 +26,9 @@ The host needs Docker and a usable `/dev/kvm`. The container runs privileged. If
 
 ## Hypervisors
 
-A run is on one hypervisor (PRD §22): `--hypervisor qemu`, the default, or `--hypervisor vmlab`. The image builds `vmlab-hv` from the vmlab-hypervisor commit that `Cargo.lock` pins `vmlab-hv-proto` to, so the binary always speaks the protocol this vmlab was built against.
+A run is on one hypervisor (PRD §22): `--hypervisor qemu`, the default, or `--hypervisor vmlab`. The image builds `vmlab-hv` from the vmlab-hypervisor commit that `Cargo.lock` pins `vmlab-hv-proto` to, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
 
-On `vmlab`, the runner writes a host config whose `hypervisor {}` block puts containers on vmlab-hv, and a scenario's VMs too when it covers a VM feature of a delivered phase (2a onward). It is rewritten per scenario. `QEMU_SCENARIOS` names the scenarios whose VMs stay on QEMU, with the reason: `core` proves most of what it covers from QEMU's argv and its lab declares `qemu_args` and floppies. A VM feature such a scenario reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
+On `vmlab`, the runner writes a host config whose `hypervisor {}` block puts containers on vmlab-hv, and a scenario's VMs too when it covers a VM feature of a delivered phase (2a onward). It is rewritten per scenario. `QEMU_SCENARIOS` names the scenarios whose VMs stay on QEMU, with the reason: `core` proves most of what it covers from QEMU's argv and its lab declares `qemu_args` and floppies, `admin` declares an emulated aarch64 VM, and `fastpath` attaches its VM NICs as taps, which vmlab-hv does not take. A VM feature such a scenario reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
 
 The suite's VM template is Alpine's UEFI image, except on a vmlab run delivered through 2a or 2b, where it is Alpine's BIOS image with `firmware = "seabios"`.
 
@@ -36,7 +36,7 @@ Every feature in `features.py` carries a phase tag in `PHASES`:
 
 - `host`: no hypervisor takes part, such as the template store, validation or the supervisor. The feature runs on both.
 - `1`: container micro-VMs.
-- `2a` to `2f`: modern x86_64 VMs: the q35 platform on SeaBIOS (2a), the native frame protocol (2b), OVMF, secure boot, the TPM and Windows (2c), GPU (2d), virtio-fs (2e), USB and vfio (2f).
+- `2a` to `2f`: modern x86_64 VMs: the q35 platform on SeaBIOS (2a), the native frame protocol (2b), OVMF, secure boot, the TPM and Windows (2c), GPU (2d), virtio-fs and audio (2e), USB and vfio (2f).
 - `3`: TCG guests.
 - `4`: the legacy PC.
 

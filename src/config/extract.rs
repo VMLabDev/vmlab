@@ -596,6 +596,8 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let tpm = r.bool("tpm").unspan();
     let usb = r.bool("usb").unspan();
+    let audio = r.bool("audio").unspan().unwrap_or(false);
+    let microphone = r.bool("microphone").unspan().unwrap_or(false);
     let secure_boot = r.bool("secure_boot").unspan();
     let secure_boot_keys = r.keyword("secure_boot_keys", SECURE_BOOT_KEYS).unspan();
     let secure_boot_vars = r.path("secure_boot_vars").unspan();
@@ -677,6 +679,8 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         firmware,
         tpm,
         usb,
+        audio,
+        microphone,
         secure_boot,
         secure_boot_keys,
         secure_boot_vars,

@@ -803,6 +803,15 @@ fn serve_vmlab_hv(
                 snapshots.remove(&name);
                 ok
             }
+            Command::DeviceAdd { .. } => ok,
+            // A USB unplug completes as it is asked for.
+            Command::DeviceDel { id } => {
+                let _ = wake_tx
+                    .lock()
+                    .expect("wake sender")
+                    .send(Event::DeviceDeleted { id });
+                ok
+            }
         }
     });
     let broadcaster = server.clone();

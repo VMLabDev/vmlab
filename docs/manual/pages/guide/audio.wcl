@@ -1,0 +1,79 @@
+page guide_audio {
+  title = "Guest audio"
+  chapter_header "Guest audio" {
+    kicker       = "The guide · explanation"
+    reading_time = "3 min read"
+    updated      = "2026-10-31"
+    version      = "vmlab 0.9"
+  }
+
+  p <<'DOC'
+A VM is silent unless you ask for sound. With `audio = true` the guest gets a
+sound card, and what it plays comes out of your desktop like any application,
+under a volume control of its own. This chapter covers turning it on, the
+microphone, and where the sound goes. Audio needs vmlab-hv; a VM on QEMU has
+no sound card (see [The host](guide_host)).
+DOC
+
+  h2 "Turn it on"
+
+  p <<'DOC'
+Set `audio = true` on the `vm` block, beside `hypervisor = "vmlab"` or on a
+host whose VM default is vmlab-hv. Add `microphone = true` to hand the guest
+your default microphone too. Both are off by default, and both belong to the
+VM alone: a template or profile cannot turn them on.
+DOC
+
+  code wcl { filename = "vmlab.wcl" source = <<'SRC'
+import <vmlab.wcl>
+
+lab "media" {
+  vm "desk" {
+    template   = "x86_64/ubuntu-26.04"
+    hypervisor = "vmlab"
+    audio      = true
+    microphone = true
+  }
+}
+SRC
+  }
+
+  p <<'DOC'
+The guest sees an Intel HDA controller, which Windows and Linux drive with the
+drivers they ship; nothing is installed in the guest. `vmlab validate` refuses
+`audio` or `microphone` on a QEMU VM, naming vmlab-hv, and refuses
+`microphone` without `audio`.
+DOC
+
+  h2 "Where the sound goes"
+
+  p <<'DOC'
+vmlab-hv plays the guest's sound straight into your audio session from its own
+process: PipeWire when its socket is under `XDG_RUNTIME_DIR`, else the
+PulseAudio server `PULSE_SERVER` names, which is how WSLg's audio is reached.
+Each VM is its own node, `vmlab.<lab>.<machine>`, shown as
+`vmlab <lab>/<machine>`, so `wpctl status` lists it and pavucontrol sets its
+volume, mutes it or moves it to another output like any application.
+DOC
+
+  code shell { source = <<'SRC'
+$ wpctl status | grep vmlab
+ │      74. vmlab media/desk                    [vol: 1.00]
+SRC
+  }
+
+  p <<'DOC'
+With `microphone = true` the card's capture stream records from your default
+source. Without it no capture stream exists for that VM, so nothing in the
+guest can listen. A host with neither PipeWire nor PulseAudio plays into a
+silent sink, and the VM's `vmlab-hv.log` says so once.
+DOC
+
+  h2 "Snapshots and recordings"
+
+  p <<'DOC'
+An online snapshot of an audio VM restores with its sound resuming; at most
+one period glitches as the host stream reopens. [Console recordings](guide_recording)
+carry no audio.
+DOC
+}

@@ -286,6 +286,10 @@ type Vm {
   tpm: bool?
   @doc("Boot with a hot-plug xHCI controller so `vmlab usb attach` can pass host USB devices in; inherited from the profile, default false. Adding it changes the VM's hardware, so online snapshots taken without it no longer restore")
   usb: bool?
+  @doc("Give the guest a sound card (Intel HDA) whose playback is its own PipeWire node, `vmlab.<lab>.<machine>`, on the host's audio session; default false, never inherited. Needs `hypervisor = \"vmlab\"`")
+  audio: bool?
+  @doc("Hand the guest the host's default microphone as the sound card's capture stream; default false, never inherited. Needs `audio = true` and `hypervisor = \"vmlab\"`")
+  microphone: bool?
   @doc("Enable secure boot (OVMF only); inherited from template→profile")
   secure_boot: bool?
   @doc("Key store secure boot starts from: `microsoft` (default; Microsoft's keys enrolled) | `setup` (blank store, so the firmware starts in setup mode and the guest enrolls its own keys); inherited from template→profile; needs `secure_boot = true`; exclusive with `secure_boot_vars`")

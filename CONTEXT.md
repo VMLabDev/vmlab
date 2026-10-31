@@ -382,12 +382,21 @@ vmlab's own hypervisor, one process per machine in place of QEMU, driven over
 its own control protocol from a machine description vmlab writes (PRD §22,
 ADR-0021). A machine is on it when its block says `hypervisor = "vmlab"` or the
 host config's default for its kind does. It runs container micro-VMs and, from
-phases 2a to 2c, modern VMs on q35 — SeaBIOS or OVMF, secure boot, a TPM,
-Hyper-V, Linux or Windows; a guest reset ends it, and the VM is booted again
-as one run, as QEMU resets in place. What it cannot run yet
-is one list of refusals, each naming the phase that brings it, which each
-phase shrinks. An online snapshot belongs to the hypervisor that took it.
+phases 2a to 2f, modern VMs on q35 — SeaBIOS or OVMF, secure boot, a TPM,
+Hyper-V, Linux or Windows, a GPU on a host render node or passed through,
+virtio-fs shares it serves itself, host USB and a sound card; a guest reset
+ends it, and the VM is booted again as one run, as QEMU resets in place. What
+it cannot run yet is one list of refusals, each naming the phase that brings
+it, which each phase shrinks. An online snapshot belongs to the hypervisor
+that took it, and a vmlab-hv VM with a GPU takes none.
 _Avoid_: the new backend, vmm (for the product)
+
+**Audio node**:
+The host audio-session node a VM with `audio = true` plays into, named
+`vmlab.<lab>.<machine>` and fed by vmlab-hv's own process — PipeWire, else
+PulseAudio — so a mixer sets its volume like an application's. vmlab-hv only;
+a QEMU VM has no sound card (PRD §11).
+_Avoid_: sink, audio device (for the host side)
 
 **Native frames**:
 vmlab-hv's own display protocol on a VM's `display.sock`: shared-memory frames

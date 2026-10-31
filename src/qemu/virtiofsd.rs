@@ -83,6 +83,19 @@ pub struct Virtiofsd {
 }
 
 impl Virtiofsd {
+    /// A hypervisor's own virtio-fs device standing in for a virtiofsd
+    /// (vmlab-hv, §22 phase 2e): it serves read-only shares, and its state
+    /// rides the hypervisor's snapshots (HV-D33). `binary` names it in
+    /// messages.
+    pub fn in_process(binary: &Path) -> Self {
+        Self {
+            path: binary.to_path_buf(),
+            version: Some("in-process virtio-fs".into()),
+            migration: true,
+            readonly: true,
+        }
+    }
+
     /// `virtiofsd 1.10.0 (/usr/libexec/virtiofsd)`, for messages.
     pub fn describe(&self) -> String {
         describe(&self.path, self.version.as_deref())

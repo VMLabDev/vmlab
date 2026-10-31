@@ -75,6 +75,7 @@ impl ValidationContext for HostContext {
         &self,
         gpu: &crate::config::model::Gpu,
         arch: Option<&str>,
+        hypervisor: crate::config::hypervisor::HypervisorKind,
     ) -> Result<(), String> {
         let host = crate::config::host::HostConfig::load_default().map_err(|e| format!("{e:#}"))?;
         crate::qemu::hostgpu::render_plan(
@@ -83,6 +84,7 @@ impl ValidationContext for HostContext {
             &host,
             &crate::qemu::hostgpu::Sysfs::host(),
             &crate::paths::data_dir(),
+            hypervisor,
         )
         .map(|_| ())
         .map_err(|e| format!("{e:#}"))

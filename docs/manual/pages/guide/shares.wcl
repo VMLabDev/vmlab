@@ -39,7 +39,8 @@ SRC
   p <<DOC
     **virtiofs** is the fast path. vmlab runs one `virtiofsd` per share and
     attaches it as a vhost-user-fs device, which the guest mounts natively
-    with `mount -t virtiofs`. No guest network is involved and no credential
+    with `mount -t virtiofs`; on a VM that runs on vmlab-hv the hypervisor
+    serves the share itself from the host directory, and no `virtiofsd` runs. No guest network is involved and no credential
     exists. It needs a virtiofs client in the guest: Linux kernels from 5.4
     have one, and a Windows guest needs the virtio-win driver and WinFsp
     baked into its template. A [profile](guide_profiles) declares whether

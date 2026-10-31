@@ -69,6 +69,7 @@ FEATURES: dict[str, str] = {
     "vm.hw.qemu_args": "`qemu_args` passthrough",
     "vm.hw.nested": "`nested = true`",
     "vm.hw.gpu": "`gpu {}` passthrough / virgl",
+    "vm.hw.audio": "`audio = true` gives a vmlab-hv VM an HDA sound card on its own host node; QEMU refuses it by name",
     # -- host USB passthrough (§5.2.1) ---------------------------------------
     "usb.list": "`vmlab usb list` (and `--json`) lists the host's devices, or says it has none",
     "usb.controller": "`usb = true` boots the VM with an xHCI controller; a VM without it gets none",
@@ -232,7 +233,7 @@ HOST = "host"
 PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
 
 # The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
-VMLAB_DELIVERED = "2c"
+VMLAB_DELIVERED = "2f"
 
 _GROUPS: dict[str, list[str]] = {
     HOST: [
@@ -288,7 +289,7 @@ _GROUPS: dict[str, list[str]] = {
         "playbook.up", "playbook.list", "playbook.check-apply", "playbook.timeout", "app.rdp",
     ],
     "2d": ["vm.hw.gpu"],
-    "2e": ["share.virtiofs", "share.readonly", "share.unmountable"],
+    "2e": ["share.virtiofs", "share.readonly", "share.unmountable", "vm.hw.audio"],
     "2f": ["usb.controller", "usb.refusals", "usb.attach"],
     # TCG emulation.
     "3": ["arch.emulated"],
@@ -303,10 +304,8 @@ _GROUPS: dict[str, list[str]] = {
 # pass on QEMU says nothing about vmlab-hv (`Harness._record`).
 QEMU_SCENARIOS: dict[str, str] = {
     "core": "`core` proves it from QEMU's argv, and its lab declares `qemu_args` and floppies",
-    "containers": "the `containers` lab's VM declares virtiofs shares (phase 2e)",
     "admin": "the `admin` lab declares an emulated aarch64 VM (phase 3)",
-    "unsupported": "the `unsupported` labs declare `usb = true` and a `gpu {}` (phases 2f, 2d), "
-    "and its fast-path check reads QEMU's tap netdevs",
+    "fastpath": "the kernel fast-path tiers attach VM NICs as taps, and vmlab-hv takes stream sockets only",
 }
 
 # Features only QEMU can ever run, and why; skipped on every other hypervisor.

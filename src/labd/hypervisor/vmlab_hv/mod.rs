@@ -12,9 +12,10 @@
 //!
 //! The helpers a machine needs beside its hypervisor are the host's, as
 //! under QEMU: the same virtiofsd serves container volumes over vhost-user.
-//! A VM's shares wait for vmlab-hv's own virtio-fs (phase 2e), so a VM's
-//! adapter reports no virtiofsd and `transport = "auto"` shares fall back to
-//! SMB. A VM's TPM is the host's swtpm, started as for QEMU.
+//! A VM's shares are vmlab-hv's own in-process virtio-fs (phase 2e), on the
+//! host directory, so no virtiofsd runs for them; SMB still takes what the
+//! guest cannot mount, by the share plan's rules. A VM's TPM is the host's
+//! swtpm, started as for QEMU.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,8 +39,8 @@ pub const BINARY: &str = "vmlab-hv";
 /// `vmlab-hv` on this host.
 pub struct VmlabHv {
     binary: PathBuf,
-    /// Whether this adapter runs a VM, whose shares have no virtio-fs to
-    /// ride until phase 2e.
+    /// Whether this adapter runs a VM, whose shares vmlab-hv serves in
+    /// process rather than through a virtiofsd.
     vm: bool,
     /// The host config's `firmware_dir`, searched for SeaBIOS and the
     /// option ROMs ahead of the host distro's.
@@ -141,9 +142,13 @@ impl Hypervisor for VmlabHv {
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
         if self.vm {
-            return None;
+            return Some(crate::qemu::virtiofsd::Virtiofsd::in_process(&self.binary));
         }
         crate::qemu::virtiofsd::found()
+    }
+
+    fn virtiofs_in_process(&self) -> bool {
+        self.vm
     }
 
     async fn start_virtiofsd(
