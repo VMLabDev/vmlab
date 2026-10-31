@@ -125,15 +125,19 @@ def run(h):
             # The firmware banner is on screen within the first half second
             # and gone again before the kernel paints; a video that started
             # late would open black and then on the login prompt instead.
+            # Scanned past the bar, so a miss says when the screen first lit.
             lit_at = None
-            for tenth in range(1, 8):
+            for tenth in range(1, 51):
                 at = tenth / 10
                 w, hh, rows = png_read(frame_at(boot, at, rec / "boot-early.png"))
                 lit = sum(1 for row in rows[::8] for px in row[::8] if max(px) > 60)
                 if lit > 20:
                     lit_at = at
                     break
-            assert lit_at is not None, "no lit frame in the first 0.7 s: the recording missed the firmware"
+            assert lit_at is not None and lit_at <= 0.7, (
+                f"no lit frame in the first 0.7 s: the recording missed the firmware "
+                f"(first lit at {lit_at if lit_at is not None else 'none within 5'} s)"
+            )
             return True
 
         h.check("record.up-from-boot", from_boot, "`up --record` captured the firmware screen; ffprobe reads 1920x1080 h264")

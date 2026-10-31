@@ -90,10 +90,11 @@ const VMLAB_ARCH: &str = "x86_64";
 /// each naming the machine, the reason and the vmlab-hv phase that brings it
 /// (or what to do instead); empty when it can.
 ///
-/// Phase 1 runs container micro-VMs, and phases 2a and 2b run a modern Linux
-/// VM: x86_64 under KVM, the q35 machine on SeaBIOS, std VGA or a 2D
-/// virtio-vga, virtio or AHCI disks, AHCI CD-ROMs, virtio-net NICs and the
-/// USB tablet. `hardware` is the VM's resolved hardware where the caller has
+/// Phase 1 runs container micro-VMs, and phases 2a to 2c a modern x86_64 VM:
+/// under KVM, the q35 machine on SeaBIOS or OVMF (secure boot included), std
+/// VGA or a 2D virtio-vga, virtio or AHCI disks, AHCI CD-ROMs, virtio-net
+/// NICs, the USB tablet, a TPM and the Hyper-V enlightenments — Linux and
+/// Windows 10, 11 and Server. `hardware` is the VM's resolved hardware where the caller has
 /// it — the lab daemon always does; validation does when the template is in
 /// the store — because most of what decides a VM (its firmware, display,
 /// machine type) comes from the template and profile rather than the lab
@@ -165,7 +166,7 @@ fn vm_refusals(vm: &Vm, host: &HostFacts, hardware: Option<&ResolvedVm>) -> Vec<
 
 /// What the resolved hardware asks for that vmlab-hv cannot present yet.
 fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
-    use crate::profiles::{AgentTransport, FirmwareKind};
+    use crate::profiles::AgentTransport;
     // A macOS guest and the legacy PC are phases of their own: their
     // hardware differs everywhere, so the one reason says all of it.
     if h.profile.as_deref() == Some("macos") || h.apple_smc {
@@ -183,18 +184,6 @@ fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
             "4 (the legacy PC)",
         ));
         return;
-    }
-    if h.firmware == Some(FirmwareKind::Ovmf) {
-        why.push(phase(name, "firmware = \"ovmf\" (UEFI)", "2c"));
-    }
-    if h.secure_boot {
-        why.push(phase(name, "secure boot", "2c"));
-    }
-    if h.tpm {
-        why.push(phase(name, "a TPM", "2c"));
-    }
-    if h.hyperv {
-        why.push(phase(name, "Hyper-V enlightenments", "2c"));
     }
     match h.display_device.as_deref() {
         None | Some("VGA") | Some("virtio-vga") => {}
@@ -369,13 +358,18 @@ mod tests {
         vmlab_refusals(m, &kvm_host(), Some(&hw))
     }
 
-    /// Phases 2a and 2b: a modern Linux VM on q35 and SeaBIOS, std VGA or a
-    /// 2D virtio-vga, virtio or AHCI disks, virtio-net — refused nothing.
+    /// Phases 2a to 2c: a modern VM on q35 — SeaBIOS or OVMF, secure boot,
+    /// a TPM, Hyper-V, Linux or Windows — is refused nothing.
     #[test]
-    fn a_seabios_linux_vm_on_q35_is_refused_nothing() {
+    fn a_modern_vm_on_q35_is_refused_nothing() {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
         for body in [
             format!(r#"{base} profile = "linux-modern" firmware = "seabios""#),
+            format!(r#"{base} profile = "linux-modern""#),
+            format!(r#"{base} profile = "linux-modern" secure_boot = true tpm = true"#),
+            format!(r#"{base} profile = "windows-10""#),
+            format!(r#"{base} profile = "windows-11""#),
+            format!(r#"{base} profile = "windows-server""#),
             format!(r#"{base} profile = "linux-generic""#),
             format!(r#"{base} profile = "linux-generic" display = "virtio-vga""#),
             format!(r#"{base} profile = "linux-generic" nested = true"#),
@@ -390,9 +384,6 @@ mod tests {
     fn what_a_later_phase_brings_is_refused_naming_that_phase() {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
         let cases = [
-            // linux-modern's own firmware is OVMF.
-            (r#"profile = "linux-modern""#, "phase 2c"),
-            (r#"profile = "windows-11""#, "phase 2c"),
             (
                 r#"profile = "linux-generic" gpu { mode = "virgl" }"#,
                 "phase 2d",

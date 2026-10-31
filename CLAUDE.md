@@ -85,12 +85,13 @@ machine is reached with `vmlab shell` and `vmlab exec`.
 **A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
 "vmlab"` on a machine, else the host config's default per kind (QEMU), puts it
 on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
-pinned by git rev). Phase 1 runs container micro-VMs; phases 2a and 2b a
-modern Linux VM on q35 and SeaBIOS (`vmlab_hv/describe.rs` places every device
-where QEMU's q35 would), its screen, input and recording over vmlab-hv's
+pinned by git rev). Phase 1 runs container micro-VMs; phases 2a to 2c a
+modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
+or Windows (`vmlab_hv/describe.rs` places every device where QEMU's q35 would;
+a guest reset, which ends vmlab-hv, boots the VM again as one run), its screen, input and recording over vmlab-hv's
 native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
-`vnc.sock` for viewers. Everything else — OVMF, TPM, GPU, virtiofs, USB,
-macOS, i440fx, `qemu_args`, hosts without KVM — is refused from one list
+`vnc.sock` for viewers. Everything else — GPU, virtiofs, USB, macOS, i440fx,
+`qemu_args`, hosts without KVM — is refused from one list
 naming the phase that brings it. Snapshots record their
 hypervisor and an online one refuses to restore under the other.
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the

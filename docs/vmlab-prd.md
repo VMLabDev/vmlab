@@ -2558,7 +2558,7 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 1 | Container micro-VMs (§18), x86_64 under KVM | Selectable |
 | 2a | Modern x86_64 VMs: q35 on SeaBIOS, virtio and AHCI disks, AHCI CD-ROMs, virtio-net, the USB tablet | Selectable |
 | 2b | Their display: the native frame protocol (screenshots, vision, input, the recorder) and an RFB server | Selectable |
-| 2c | OVMF, secure boot, a TPM, Hyper-V, Windows | Refused |
+| 2c | OVMF, secure boot, a TPM, Hyper-V, Windows | Selectable |
 | 2d | Paravirtual GPUs (`gpu {}`) | Refused |
 | 2e | virtio-fs shares and audio | Refused |
 | 2f | Host USB (`usb = true`) and vfio | Refused |
@@ -2570,10 +2570,11 @@ macOS guests are a phase of their own after 2.
 **Refusals.** Validation (§5.1), and the lab daemon again before it builds a
 machine and before each start, refuse a machine on vmlab-hv that it cannot run
 yet, naming the machine, the reason and the phase that brings it. A VM runs
-from phase 2a when it is x86_64 under KVM on the q35 machine with SeaBIOS
-(`firmware = "seabios"`), std VGA or a 2D virtio-vga, virtio, SATA or IDE disks
-(both on AHCI), virtio-net NICs and the PS/2 keyboard with the USB tablet.
-Everything else is refused: OVMF, secure boot, a TPM or Hyper-V (2c); a `gpu
+when it is x86_64 under KVM on the q35 machine with SeaBIOS (2a) or OVMF,
+secure boot included (2c), std VGA or a 2D virtio-vga, virtio, SATA or IDE
+disks (both on AHCI), virtio-net NICs, the PS/2 keyboard with the USB tablet,
+and a TPM or the Hyper-V enlightenments where it asks (2c) — the Linux
+profiles and Windows 10, 11 and Server. Everything else is refused: a `gpu
 {}` (2d); a share with `transport = "virtiofs"` (2e) — an `auto` share falls
 back to SMB, since a VM on vmlab-hv reports no virtiofsd; `usb = true` (2f); a
 macOS guest (its own phase); the i440fx machine, a floppy or
@@ -2614,6 +2615,24 @@ in `bootindex` order: install media, then disks. SeaBIOS, SeaVGABIOS and the
 iPXE ROM are found under the host config's `firmware_dir/x86_64/`, then the
 distro's `/usr/share/qemu` and `/usr/share/seabios`. CPU policy is the host's
 CPU with VMX and SVM masked unless `nested`.
+
+On OVMF the firmware is QEMU's two pflash drives: the CODE image vmlab's
+firmware lookup chose for the VM's secure-boot setting and the VM's own VARS
+copy, never the template's, with secure boot armed where the VM asks. There
+is no `bootorder` under OVMF, which keeps its own in the VARS, as QEMU sets
+`bootindex` under SeaBIOS only. A TPM is the swtpm vmlab starts for QEMU's VMs,
+on the same socket. The Hyper-V enlightenments are QEMU's list, name for name,
+with `avic` where the host's KVM virtualises the APIC. A NIC's option ROM is
+vmlab-hv's combined legacy and EFI iPXE image (`virtio-net.rom`) where the host
+has it.
+
+**Guest reset.** QEMU resets a VM in place when its guest reboots; vmlab-hv
+ends instead, reporting `shutdown { reason: guest_reset }`. vmlab boots such a
+VM again at once with the same NICs, a fresh swtpm and its readiness kept, so
+to the lab it is one run, as on QEMU: no `vm.stopped`, no second `vm.ready`,
+and a script waiting with `wait_rebooted` sees the new boot. A Windows clone
+reboots through sysprep's specialize pass and its first-boot provision on
+every first start.
 
 **Display.** A VM on vmlab-hv has no QMP: its framebuffer and input are
 vmlab-hv's native frame protocol on `display.sock` in the machine's runtime

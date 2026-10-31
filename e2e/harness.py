@@ -21,7 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from features import FEATURES, PHASE_ORDER, PHASES, VMLAB_DELIVERED, out_of_scope
+from features import FEATURES, HOST, PHASE_ORDER, PHASES, QEMU_SCENARIOS, VMLAB_DELIVERED, out_of_scope
 
 E2E = pathlib.Path(__file__).resolve().parent
 WORK = pathlib.Path(os.environ.get("E2E_WORK", "/work"))
@@ -50,6 +50,9 @@ class Harness:
         # Which hypervisor the run's machines are on, and on vmlab-hv the
         # last phase it has delivered.
         self.hypervisor = hypervisor
+        # Whether the scenario running now has its VMs on the hypervisor
+        # under test (`run.py` sets it per scenario).
+        self.vms_here = hypervisor == "qemu"
         self.delivered = delivered
         self.results: dict[str, tuple[str, str]] = {}
         RESULTS.mkdir(parents=True, exist_ok=True)
@@ -180,19 +183,22 @@ class Harness:
 
     def seabios_template(self) -> bool:
         """Whether the suite's VM template is built for SeaBIOS: on vmlab-hv
-        from phase 2a, which boots SeaBIOS and not yet OVMF. QEMU boots
-        either, so the scenarios whose VMs stay there do not mind."""
-        return self.hypervisor != "qemu" and PHASE_ORDER.index(self.delivered) >= PHASE_ORDER.index("2a")
+        delivered through phase 2a or 2b, which boot SeaBIOS and not yet OVMF.
+        From 2c it is the UEFI one, as on QEMU."""
+        return self.hypervisor != "qemu" and self.delivered in ("2a", "2b")
 
-    def vms_follow(self, features) -> bool:
+    def vms_follow(self, features, scenario: str = "") -> bool:
         """Whether a scenario's VMs run on vmlab-hv: it covers a VM feature of
         a delivered phase (2a onwards). A scenario whose VM features are all
         later keeps its VMs on QEMU, where a lab declaring OVMF or a TPM still
         validates, and its features are skipped by phase."""
-        if self.hypervisor == "qemu":
+        if self.hypervisor == "qemu" or scenario in QEMU_SCENARIOS:
             return False
         lo, hi = PHASE_ORDER.index("2a"), PHASE_ORDER.index(self.delivered)
-        return any(f in PHASES and lo <= PHASE_ORDER.index(PHASES[f]) <= hi for f in features)
+        return any(
+            f in PHASES and lo <= PHASE_ORDER.index(PHASES[f]) <= hi and not self.out_of_scope(f)
+            for f in features
+        )
 
     def host_config(self, vms: bool = False) -> str:
         """The `host {}` lines that put this run's machines on its hypervisor:
@@ -214,9 +220,16 @@ class Harness:
         if why:
             # The scenario ran it, but not on the hypervisor under test.
             status, detail = "skip", why
+        elif (self.hypervisor != "qemu" and not self.vms_here
+              and PHASES.get(feature, HOST) not in (HOST, "1")):
+            # A VM feature from a scenario whose VMs ran on QEMU.
+            status, detail = "skip", f"not on vmlab-hv yet: {QEMU_SCENARIOS.get(self.scenario, 'VMs on QEMU')}"
         prior = self.results.get(feature)
-        # A failure is never overwritten by a later pass of the same feature.
+        # A failure is never overwritten by a later pass of the same feature,
+        # nor a pass by a skip from a scenario that could not run it.
         if prior and prior[0] == "fail" and status != "fail":
+            return
+        if prior and prior[0] == "pass" and status == "skip":
             return
         self.results[feature] = (status, detail)
         self.log.write(f"[{self.scenario}] {status.upper()} {feature}: {detail}\n")

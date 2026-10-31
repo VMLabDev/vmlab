@@ -248,13 +248,15 @@ def run(h):
             vm = h.vmlab("logs", "vm01", "-n", "200", cwd=lab, check=False)
             sections = _sections(vm.out)
             serial = next((v for k, v in sections.items() if k.endswith("serial.log")), "")
-            qemu = next((k for k in sections if k.endswith("qemu.log")), None)
+            # The hypervisor's own log, which vmlab opens with the launch it
+            # ran: `qemu.log`, or `vmlab-hv.log` on vmlab-hv.
+            qemu = next((k for k in sections if k.endswith(("qemu.log", "vmlab-hv.log"))), None)
             if not serial.strip():
                 problems.append(f"serial: empty ({vm.text.strip()[:200]!r})")
             if qemu is None:
-                problems.append("qemu: no qemu.log section")
+                problems.append("hypervisor: no qemu.log or vmlab-hv.log section")
             elif not sections[qemu].strip():
-                problems.append("qemu: qemu.log is empty")
+                problems.append(f"hypervisor: {qemu} is empty")
             con = h.vmlab("logs", f"{LAB}/web", "-n", "50", cwd=lab, check=False)
             if con.code != 0 or not con.out.strip():
                 problems.append(f"console: `vmlab logs {LAB}/web` exited {con.code}: {con.text.strip()[:200]!r}")

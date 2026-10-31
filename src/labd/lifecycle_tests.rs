@@ -283,9 +283,24 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
             template_vars: None,
         },
     );
+    let on_vmlab = script.vmlab_hv;
     let hv = FakeHypervisor::new(script);
-    vm.set_hypervisor(hv.clone());
+    if on_vmlab {
+        vm = vm.on_hypervisor(crate::config::hypervisor::HypervisorKind::Vmlab, hv.clone());
+        // The fake runs anywhere: a KVM host, whatever runs the test.
+        vm.set_host_facts(kvm_host());
+    } else {
+        vm.set_hypervisor(hv.clone());
+    }
     (vm, hv)
+}
+
+/// An x86_64 host with a usable `/dev/kvm`, as vmlab-hv's refusals read it.
+fn kvm_host() -> crate::config::hypervisor::HostFacts {
+    crate::config::hypervisor::HostFacts {
+        arch: "x86_64".into(),
+        kvm: true,
+    }
 }
 
 /// A container on a fake hypervisor, image already bound. `decl` is the
@@ -2587,6 +2602,95 @@ async fn a_guest_power_off_over_vmlab_hvs_events_is_classified_as_the_guests() {
     let (cbs, mut observed) = callbacks();
     start_vm(&vm2, cbs).await.expect("start");
     assert_eq!(observed.exit().await.reason, StopReason::Crashed);
+}
+
+/// S3 over vmlab-hv's protocol: the guest's `suspend` is seen, and a
+/// `prevent_sleep` VM is woken with vmlab-hv's `resume`, which it answers
+/// with `wakeup`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prevent_sleep_wakes_a_vmlab_hv_guest_with_resume() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        &sleepy_vm(true),
+        on_vmlab_hv(Script {
+            runs: vec![Run::guest_sleeps(Duration::from_millis(300))],
+            ..Script::healthy()
+        }),
+    );
+    let (events, mut rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = vm.clone();
+
+    m.clone().start(lab).await.expect("start");
+    let seen = collect_events(&mut rx, &["vm.suspended", "vm.woken"], 2).await;
+    assert_eq!(seen[0].event, "vm.suspended");
+    assert_eq!(seen[1].event, "vm.woken");
+    assert_eq!(seen[1].data["cause"], "prevent_sleep");
+    m.wait_state(PowerState::Running, SETTLE)
+        .await
+        .expect("awake again");
+    vm.stop(true).await.expect("stop");
+}
+
+/// The start-time refusal itself: on a host whose `/dev/kvm` is not usable a
+/// VM on vmlab-hv is refused before anything spawns, naming KVM — vmlab-hv
+/// has no emulation to fall back on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vmlab_hv_vm_on_a_host_without_kvm_is_refused_at_start() {
+    let dirs = Dirs::new();
+    let (mut vm, hv) = vm(&dirs, LINUX_VM, on_vmlab_hv(Script::healthy()));
+    vm.set_host_facts(crate::config::hypervisor::HostFacts {
+        kvm: false,
+        ..kvm_host()
+    });
+    let (cbs, _observed) = callbacks();
+    let err = start_vm(&vm, cbs).await.expect_err("refused");
+    assert!(format!("{err:#}").contains("/dev/kvm"), "{err:#}");
+    assert_eq!(hv.starts(), 0, "nothing was started");
+    assert_eq!(vm.state().await, PowerState::Stopped);
+}
+
+/// vmlab-hv ends when the guest resets itself, where QEMU resets in place
+/// (PRD §22): the VM boots it again, and to the lab it is one run — no exit,
+/// no second `ready` — that a later stop still ends as asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guest_reset_on_vmlab_hv_boots_the_vm_again_as_one_run() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        LINUX_VM,
+        on_vmlab_hv(Script {
+            runs: vec![
+                Run::guest_resets(Duration::from_millis(600)),
+                Run::forever(),
+            ],
+            ..Script::healthy()
+        }),
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    m.wait_ready(SETTLE).await.expect("ready");
+    for _ in 0..100 {
+        if hv.starts() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(hv.starts(), 2, "the reset started vmlab-hv again");
+    m.wait_ready(SETTLE).await.expect("ready again");
+    assert_eq!(vm.state().await, PowerState::Running);
+    assert_eq!(observed.ready_count(), 1, "one run, announced once");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), observed.exit())
+            .await
+            .is_err(),
+        "a reset is not an exit"
+    );
+
+    vm.stop(false).await.expect("stop");
+    assert_eq!(observed.exit().await.reason, StopReason::Requested);
 }
 
 /// The stop ladder's ACPI rung over vmlab-hv's `powerdown`: the guest acts

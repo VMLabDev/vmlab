@@ -34,26 +34,7 @@ impl Hypervisor for Qemu {
         ctrl_sock: &Path,
         log: &Path,
     ) -> Result<Arc<dyn Process>> {
-        let proc = crate::qemu::process::spawn_swtpm(machine, state_dir, ctrl_sock, log).await?;
-        // swtpm binds its control socket a moment after exec; QEMU's chardev
-        // connects at startup, so racing it means a hard boot failure.
-        for _ in 0..50 {
-            if ctrl_sock.exists() {
-                return Ok(host_process(proc));
-            }
-            if !proc.is_running() {
-                bail!(
-                    "{machine}: swtpm exited before binding its socket: {}",
-                    proc.exit_status().unwrap_or_default()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        proc.kill().await;
-        bail!(
-            "{machine}: swtpm never bound {} — the guest would boot with no TPM",
-            ctrl_sock.display()
-        )
+        start_host_swtpm(machine, state_dir, ctrl_sock, log).await
     }
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
@@ -127,6 +108,37 @@ fn compose(launch: &Launch) -> Result<(String, Vec<String>)> {
             crate::qemu::container::build_container_args(lab, resolved, paths)?,
         ),
     })
+}
+
+/// Start the host's swtpm on `ctrl_sock` and wait for it to bind: the
+/// emulator connects at startup and fails hard if it is not there yet. Both
+/// hypervisors' VMs take the same one (HV-D17).
+pub(super) async fn start_host_swtpm(
+    machine: &str,
+    state_dir: &Path,
+    ctrl_sock: &Path,
+    log: &Path,
+) -> Result<Arc<dyn Process>> {
+    let proc = crate::qemu::process::spawn_swtpm(machine, state_dir, ctrl_sock, log).await?;
+    // swtpm binds its control socket a moment after exec; QEMU's chardev
+    // connects at startup, so racing it means a hard boot failure.
+    for _ in 0..50 {
+        if ctrl_sock.exists() {
+            return Ok(host_process(proc));
+        }
+        if !proc.is_running() {
+            bail!(
+                "{machine}: swtpm exited before binding its socket: {}",
+                proc.exit_status().unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    proc.kill().await;
+    bail!(
+        "{machine}: swtpm never bound {} — the guest would boot with no TPM",
+        ctrl_sock.display()
+    )
 }
 
 /// One virtiofsd on this host — the same daemon whichever hypervisor
