@@ -273,6 +273,7 @@ Each VM block can express:
 - `secure_boot_keys` and `secure_boot_vars` — the **key store** secure boot starts from, for guests signed with keys that are not Microsoft's (image-based systems that sign their UKI with a key the user generated, and enroll it themselves). `secure_boot_keys = "microsoft"` is the default and today's behaviour. `secure_boot_keys = "setup"` pairs the secure-boot CODE with the **blank** VARS, so the firmware starts in setup mode and the guest enrolls its own keys on first boot (systemd-boot's auto-enroll); the VM's own VARS copy keeps what it enrolled, and every later boot enforces it. Setup mode is only ever this explicit opt-in — the refusal above stands without it. `secure_boot_vars = "<path>"` (relative to the lab file) names a **pre-enrolled** VARS file — PK, KEK and db already set, e.g. by `virt-fw-vars` — copied once at first start in place of the bundled template, so the guest enforces from its first boot; it boots under the secure-boot CODE and must be the size of that CODE's VARS template (a start refuses another size). `secure_boot_keys` resolves VM > template > profile like the rest of this list; `secure_boot_vars` is declared on a vm or template block. The two are exclusive on one block, and both need `secure_boot = true` under OVMF: validation rejects either where secure boot resolves off, naming the layer each side came from — except a key store inherited from below the layer that turned secure boot off, which that layer has made moot. A template built with either records it in its metadata (`secure_boot_keys = "setup"`, or `"vars"` with the file stored beside its disk as `OVMF_VARS.fd`, carried by export/import and in the OCI config blob), so its clones start from the same store unless the VM names its own; a variant may override `secure_boot_keys` but carries no file of its own. Like every VARS copy, an existing VM's store is never replaced: changing the key store of a VM that has already started means deleting its `OVMF_VARS.fd`.
 - **UEFI firmware ships with vmlab.** The guest asset set carries Debian's edk2 builds under `firmware/<arch>/`, pinned by version and sha256: for x86_64 the 4 MiB OVMF pair and its secure-boot pair (`OVMF_CODE_4M.secboot.fd` with `OVMF_VARS_4M.ms.fd`, Microsoft's and the distro's keys enrolled — Microsoft's 2011 and 2023 certificates both, since a Windows boot manager signed by the 2023 CA is refused by a store that has only the 2011 ones); for aarch64 the AAVMF pair and its secure-boot pair. A host needs no OVMF package, and every host boots the same bytes. The lookup, for plain UEFI and secure boot alike: the host config's `firmware_dir` (laid out `<dir>/<arch>/` like the bundled set, and authoritative for an arch it has a directory for), then the bundled set in the guest asset directories' order, then the host's distro firmware. A secure-boot CODE build is only ever taken with its enrolled VARS, unless the machine asks for setup mode or names its own VARS file (`secure_boot_keys`/`secure_boot_vars` above). Each VM copies its VARS template once, at first start, and keeps that copy; one whose store was created under a firmware of another flash layout keeps booting a build of that layout. Nothing host-specific about firmware enters a template's sealed metadata — it records `firmware`, `secure_boot` and `secure_boot_keys`, never a path.
 - `usb = true` — boot with a hot-plug xHCI controller that host USB devices can be passed through to at runtime (§5.2.1). Set on the VM or the profile; a template has no say in it. Default off.
+- `audio = true` — give the guest a sound card whose playback is a host audio node of its own (§11). `microphone = true` adds the host's default microphone as its capture stream and needs `audio`. Both are the VM's alone — neither template nor profile has a say — default off, and need `hypervisor = "vmlab"` (§22): on a QEMU VM either is a validation error.
 - `qemu_args = [...]` — **escape hatch**: raw arguments appended verbatim to the QEMU command line, last so they win
 
 Values not set on the VM inherit from the template's recorded hardware; values not set there come from the profile; the profile's defaults are the floor. Precedence: **VM block > template > profile** (no template layer for `scratch` VMs, §6.5).
@@ -873,6 +874,8 @@ Every VM gets a VNC display served on a unix socket (TCP optional, off by defaul
 `gui = true` (per VM, or as a lab-wide default) is a convenience that auto-opens a viewer on `vmlab up` — and watches the build VM during `vmlab template build`. It is **never** QEMU's own GTK window: the VM always runs headless behind VNC, so the viewer is a separate client process and closing its window only disconnects (the VM keeps running; `vmlab console` reattaches). The viewer is launched from the interactive CLI, not the headless lab daemon.
 
 The viewer is chosen automatically: an explicit `viewer` in host config wins, else the first of `remote-viewer` (virt-viewer), `gvncviewer`, `vncviewer` found on `PATH`. `remote-viewer` dials the VNC unix socket directly; the others are TCP-only, so vmlab bridges the socket to a localhost display port for them. Neither `vmlab console` nor the `gui = true` auto-open ties up the terminal: a TCP viewer's bridge runs in a detached helper (`vmlab __vncbridge`, in its own session) that exits when the viewer window closes. With no viewer at all, `vmlab console` falls back to bridging and printing the address to attach to manually (the WSL2 path, also forced with `--tcp`).
+
+**Audio.** A VM is silent unless it declares `audio = true`, because most labs are headless automation and a sound card in every guest is noise for nothing. With it, a VM on vmlab-hv (§22) gets an Intel HDA controller at 00:1b.0, which Windows and Linux drive with no guest driver installed, and vmlab-hv plays its PCM straight into the user's audio session from its own process: PipeWire where its socket is under `XDG_RUNTIME_DIR`, else the PulseAudio server `PULSE_SERVER` names (WSLg), which vmlab-hv inherits from the lab daemon. Each such VM is its own node, `vmlab.<lab>.<machine>`, described as `vmlab <lab>/<machine>`, so `wpctl` or pavucontrol sets its volume, mutes it or routes it like any application. `microphone = true` attaches the host's default source as the card's capture stream; without it no capture stream exists. A host with neither server plays into a null sink. A Linux guest moves to virtio-snd once vmlab-hv ships it. QEMU VMs get no sound card, and `audio` or `microphone` on one is a validation error naming vmlab-hv. The console recorder (§11.1) carries no audio either way.
 
 ### 11.1 Console recording
 
@@ -2559,9 +2562,9 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 2a | Modern x86_64 VMs: q35 on SeaBIOS, virtio and AHCI disks, AHCI CD-ROMs, virtio-net, the USB tablet | Selectable |
 | 2b | Their display: the native frame protocol (screenshots, vision, input, the recorder) and an RFB server | Selectable |
 | 2c | OVMF, secure boot, a TPM, Hyper-V, Windows | Selectable |
-| 2d | Paravirtual GPUs (`gpu {}`) | Refused |
-| 2e | virtio-fs shares and audio | Refused |
-| 2f | Host USB (`usb = true`) and vfio | Refused |
+| 2d | GPUs (`gpu {}`): virgl and Venus on a host render node | Selectable |
+| 2e | virtio-fs shares, served in process, and audio (HDA) | Selectable |
+| 2f | Host USB (`usb = true`) and vfio (`gpu { mode = "passthrough" }`) | Selectable |
 | 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
 | 4 | Legacy PCs | Refused |
 
@@ -2571,16 +2574,17 @@ macOS guests are a phase of their own after 2.
 machine and before each start, refuse a machine on vmlab-hv that it cannot run
 yet, naming the machine, the reason and the phase that brings it. A VM runs
 when it is x86_64 under KVM on the q35 machine with SeaBIOS (2a) or OVMF,
-secure boot included (2c), std VGA or a 2D virtio-vga, virtio, SATA or IDE
+secure boot included (2c), std VGA or a virtio-vga, virtio, SATA or IDE
 disks (both on AHCI), virtio-net NICs, the PS/2 keyboard with the USB tablet,
-and a TPM or the Hyper-V enlightenments where it asks (2c) — the Linux
-profiles and Windows 10, 11 and Server. Everything else is refused: a `gpu
-{}` (2d); a share with `transport = "virtiofs"` (2e) — an `auto` share falls
-back to SMB, since a VM on vmlab-hv reports no virtiofsd; `usb = true` (2f); a
+a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
+(2d, 2f), virtio-fs shares and a sound card (2e) and `usb = true` (2f) — the
+Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
 macOS guest (its own phase); the i440fx machine, a floppy or
 `agent_transport = "isa-serial"` (4); `accel = "tcg"` (3); another display
-device, NIC model or `cpu_model`; a pinned `tsc` or `input = "usb"`, which a
-later phase brings; and `qemu_args`, QEMU's own argv, in every phase. A
+device, NIC model or `cpu_model`; `input = "usb"`; a pinned `tsc`, which waits
+for vmlab-hv's host-facts probe (vmlab reads the host's TSC frequency through
+a paused QEMU today, and vmlab-hv has neither the probe nor a frequency to
+pin); and `qemu_args`, QEMU's own argv, in every phase. A
 container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
 no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
@@ -2616,6 +2620,42 @@ iPXE ROM are found under the host config's `firmware_dir/x86_64/`, then the
 distro's `/usr/share/qemu` and `/usr/share/seabios`. CPU policy is the host's
 CPU with VMX and SVM masked unless `nested`.
 
+**GPUs.** A `virgl` or `vulkan` GPU is the VM's one display adapter, a
+virtio-vga accelerated by vmlab-hv's virtio-gpu (rutabaga and virglrenderer;
+`vulkan` is its Venus mode) in the slot QEMU's `virtio-vga-gl` takes. It
+renders on the host render node §5.2's host GPU pick resolves, which the
+description names; vmlab-hv never chooses one, so a paravirtual GPU no declared
+host GPU resolves for renders on the host's first render node and the start
+says so. The Vulkan environment, the PCI filter layer and keep-awake are the
+ones vmlab computes for QEMU, in vmlab-hv's own environment. A host GPU's
+`qemu_binary` and `qemu_env` are QEMU's: on vmlab-hv each set one is a warning
+and is ignored. Scanouts reach the native frame protocol as dma-bufs, so
+screenshots, vision and the recorder see the GL desktop. `passthrough` hands
+the declared host GPU to the guest as a vfio device ahead of the VM's own
+display, at the address QEMU's `vfio-pci` takes. vmlab-hv takes only a function
+already bound to `vfio-pci` and refuses the machine otherwise; neither it nor
+vmlab ever binds, unbinds or resets a host device, so binding is the host
+owner's, as under QEMU.
+
+**Shares.** A VM's virtio-fs shares are served by vmlab-hv's own in-process
+virtio-fs device straight from the host directory, read-only where the share
+is, after the tablet as QEMU's `vhost-user-fs-pci` devices come last — no
+virtiofsd runs for them, and their state rides vmlab-hv's online snapshots.
+What serves virtio-fs is asked per machine: a share whose guest cannot mount
+virtio-fs falls back to SMB by §7.5's rules, a Windows guest is warned about
+as there, and a QEMU VM in the same lab still uses the host's virtiofsd or SMB.
+Container volumes stay on the host's virtiofsd over vhost-user.
+
+**USB.** Under `usb = true` the tablet's xHCI is also the passthrough
+controller, `usbx`, which QEMU adds in the same slot and hangs the tablet on
+too. `vmlab usb attach` and `detach` (§5.2.1) are vmlab-hv's `device_add` and
+`device_del` with QEMU's `usb-host` arguments, and a detach completes when
+vmlab-hv reports `device_deleted` for the device, as QEMU's `DEVICE_DELETED`.
+
+**Audio.** `audio = true` (§11) is an HDA function at 00:1b.0 whose node
+vmlab names `vmlab.<lab>.<machine>`, with the microphone as its capture
+stream where `microphone = true`.
+
 On OVMF the firmware is QEMU's two pflash drives: the CODE image vmlab's
 firmware lookup chose for the VM's secure-boot setting and the VM's own VARS
 copy, never the template's, with secure boot armed where the VM asks. There
@@ -2650,4 +2690,8 @@ restoring it on a machine that now runs on the other one is refused, naming the
 hypervisor that took it; setting the machine's `hypervisor` back makes it
 restorable again. An offline snapshot is a plain qcow2 internal snapshot and
 restores under either. A snapshot recorded before vmlab kept the field was
-QEMU's.
+QEMU's. A VM on vmlab-hv with a `gpu {}` of any mode takes no online snapshot
+and loads none, because neither an accelerated renderer's state nor a
+passed-through device's is vmlab-hv's to save; offline snapshots are
+unaffected. Host USB devices refuse an online snapshot while attached, on
+either hypervisor (§5.2.1).

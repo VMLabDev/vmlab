@@ -42,6 +42,11 @@ pub struct ResolvedVm {
     /// what a VM may have plugged into it is a property of the lab, not of
     /// the image.
     pub usb: bool,
+    /// A sound card on the host's audio session (§11), and the host
+    /// microphone as its capture stream. The VM's own, never inherited: a
+    /// lab says whether its machines make noise, not the image.
+    pub audio: bool,
+    pub microphone: bool,
     pub disk_bus: DiskBus,
     pub nic_model: String,
     /// VGA/display device QEMU name (None = profile said nothing and the
@@ -624,6 +629,8 @@ pub fn resolve_vm(
             .or(profile.tpm)
             .unwrap_or(false),
         usb: lab_vm.usb.or(profile.usb).unwrap_or(false),
+        audio: lab_vm.audio,
+        microphone: lab_vm.microphone,
         disk_bus: profile.disk_bus.unwrap_or(DiskBus::Virtio),
         nic_model: profile
             .nic_model

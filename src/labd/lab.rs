@@ -1079,11 +1079,12 @@ impl LabRuntime {
     /// Whether this lab's host can serve virtiofs, asked through the same
     /// [`Hypervisor`](super::hypervisor::Hypervisor) the machines start
     /// against rather than probed again here — every machine in a lab runs on
-    /// one host, so any of them answers for all. A lab with no machines has
-    /// no shares either, so the fallback never decides anything.
+    /// one host, so any whose hypervisor uses the host's virtiofsd answers
+    /// for all. A lab with no machines has no shares either, so the fallback
+    /// never decides anything.
     fn host_virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
         self.machines()
-            .next()
+            .find(|m| !m.virtiofs_in_process())
             .map_or_else(crate::qemu::virtiofsd::found, |m| m.virtiofsd())
     }
 
@@ -1114,6 +1115,18 @@ impl LabRuntime {
             })
             .map(|(name, _)| name.clone())
             .collect();
+        // A machine whose hypervisor serves virtio-fs itself answers for
+        // itself; the rest share the host's virtiofsd.
+        let machine_virtiofsd: BTreeMap<String, share_plan::HostVirtiofsd> = self
+            .machines()
+            .filter(|m| m.virtiofs_in_process())
+            .map(|m| {
+                (
+                    m.name().to_string(),
+                    share_plan::HostVirtiofsd::of(m.virtiofsd().as_ref()),
+                )
+            })
+            .collect();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         share_plan::plan(
             &share_plan::ShareInputs {
@@ -1121,6 +1134,7 @@ impl LabRuntime {
                 root: &self.root,
                 home: home.as_deref(),
                 host_virtiofsd: share_plan::HostVirtiofsd::of(self.host_virtiofsd().as_ref()),
+                machine_virtiofsd: &machine_virtiofsd,
                 guest_virtiofs: &guest_virtiofs,
                 windows_guests: &windows_guests,
                 gateways: &gateways,

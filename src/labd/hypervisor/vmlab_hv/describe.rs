@@ -16,9 +16,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display, DisplayDevice, FirmwareKind,
-    FsShare, HyperV, Machine, Nic, NicAttachment, PciAddress, SerialPort, Tpm,
+    Accel, Arch, Audio, AudioDevice, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
+    DisplayDevice, FirmwareKind, FsShare, GpuMode, HyperV, Machine, Nic, NicAttachment, PciAddress,
+    SerialPort, Tpm, VfioDevice,
 };
+
+use crate::config::model::GpuMode as VmGpuMode;
 
 use crate::profiles::AgentTransport;
 use crate::qemu::container::{ContainerVmPaths, kernel_cmdline};
@@ -151,18 +154,51 @@ pub(crate) fn container(
                 socket: paths.agent_sock.clone(),
             },
         ],
+        // A container's volumes are the host virtiofsd's, over vhost-user,
+        // which is started read-only where a volume is.
         shares: paths
             .volumes
             .iter()
             .map(|(tag, socket)| FsShare {
                 pci: None,
                 tag: tag.clone(),
-                socket: socket.clone(),
+                socket: Some(socket.clone()),
+                path: None,
+                read_only: false,
             })
             .collect(),
         // A container micro-VM has no sound card.
         audio: None,
+        vfio: Vec::new(),
+        usb: None,
         rtc_base,
+    })
+}
+
+/// q35's HDA function, where real ICH9 places it (HV phase-2 D11).
+const HDA: PciAddress = PciAddress {
+    bus: 0,
+    device: 0x1b,
+    function: 0,
+};
+
+/// The host audio node a VM's sound card plays into (hv-audio D7):
+/// `vmlab.<lab>.<machine>`, which `wpctl status` and pavucontrol list.
+pub(crate) fn audio_node_name(lab: &str, machine: &str) -> String {
+    format!("vmlab.{lab}.{machine}")
+}
+
+/// The sound card a VM with `audio = true` gets (§11): HDA, which Windows
+/// and Linux both drive with no guest driver installed. Linux would take
+/// virtio-snd once vmlab-hv ships it (hv-audio D2); the pinned vmlab-hv
+/// refuses that device, so every guest gets HDA for now.
+fn audio(lab: &str, resolved: &ResolvedVm) -> Option<Audio> {
+    resolved.audio.then(|| Audio {
+        pci: Some(HDA),
+        device: AudioDevice::Hda,
+        microphone: resolved.microphone,
+        node_name: audio_node_name(lab, &resolved.name),
+        node_description: format!("vmlab {lab}/{}", resolved.name),
     })
 }
 
@@ -290,9 +326,36 @@ pub(crate) fn vm(
         bail!("vm \"{name}\": vmlab-hv needs a serial log path");
     };
 
+    // `virgl` and `vulkan` are the one display adapter, a virtio-vga
+    // accelerated on the host render node the lab daemon resolved, as
+    // QEMU's `virtio-vga-gl`; `passthrough` hands over the declared host GPU
+    // as a vfio device beside the VM's own display.
+    let gpu = resolved.gpu.as_ref().map(|g| g.mode);
+    let accelerated = match gpu {
+        Some(VmGpuMode::Virgl) => Some(GpuMode::Virgl),
+        Some(VmGpuMode::Vulkan) => Some(GpuMode::Venus),
+        Some(VmGpuMode::Passthrough) | None => None,
+    };
+    let render_node = match (accelerated, &paths.gpu_render_node) {
+        (None, _) => None,
+        (Some(_), Some(node)) => Some(node.clone()),
+        (Some(_), None) => bail!(
+            "vm \"{name}\": vmlab-hv renders its GPU on a host render node, and none was resolved"
+        ),
+    };
+    let passthrough = match (gpu, &paths.gpu_passthrough) {
+        (Some(VmGpuMode::Passthrough), Some(host)) => Some(host.clone()),
+        (Some(VmGpuMode::Passthrough), None) => {
+            bail!("vm \"{name}\": gpu passthrough needs a host GPU (PRD §5.2)")
+        }
+        _ => None,
+    };
+
     let mut slots = Slots(1);
-    // The default VGA is created with the machine, ahead of every `-device`.
-    let default_vga = resolved.display_device.is_none().then(|| slots.next());
+    // The default VGA is created with the machine, ahead of every `-device`
+    // — unless the GL adapter, a VGA device itself, stands in for it.
+    let default_vga =
+        (resolved.display_device.is_none() && accelerated.is_none()).then(|| slots.next());
 
     // The agent's virtio-serial controller is the first `-device`.
     let agent = resolved.agent_transport == AgentTransport::VirtioSerial;
@@ -390,14 +453,49 @@ pub(crate) fn vm(
         });
     }
 
+    // The passed-through GPU, then the VM's own display device, as the
+    // argv orders `vfio-pci` and the `display` device. vmlab-hv takes only
+    // a function already bound to vfio-pci; vmlab binds nothing.
+    let vfio: Vec<VfioDevice> = passthrough
+        .into_iter()
+        .map(|host| VfioDevice {
+            host,
+            pci: slots.next(),
+        })
+        .collect();
     let display_pci = default_vga.unwrap_or_else(|| slots.next());
+    let display_device = if accelerated.is_some() {
+        DisplayDevice::VirtioVga
+    } else {
+        display_device
+    };
     let rom = match display_device {
         DisplayDevice::StdVga => roms.vgabios_std.clone(),
         DisplayDevice::VirtioVga => roms.vgabios_virtio.clone(),
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
-    // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead.
+    // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead. Under
+    // `usb = true` it is also the passthrough controller, `usbx`, which
+    // QEMU adds in the same place and hangs the tablet on too.
     let tablet = Some(slots.next());
+    let usb = tablet.filter(|_| resolved.usb);
+
+    // virtio-fs shares last, as the argv's `vhost-user-fs-pci` devices, but
+    // served by vmlab-hv's own device on the host directory: no virtiofsd.
+    let shares = paths
+        .hypervisor_shares
+        .iter()
+        .map(|share| FsShare {
+            pci: Some(slots.next()),
+            tag: share.tag.clone(),
+            socket: None,
+            path: Some(share.host.clone()),
+            read_only: share.readonly,
+        })
+        .collect();
+    if slots.0 >= 0x1b {
+        bail!("vm \"{name}\": more PCI devices than q35's bus 0 has slots for under vmlab-hv");
+    }
 
     Ok(MachineDescription {
         machine: Machine::Q35,
@@ -411,6 +509,8 @@ pub(crate) fn vm(
         // paths every consumer looks for are the ones this machine has.
         display: Some(Display {
             device: display_device,
+            gpu: accelerated,
+            render_node,
             pci: display_pci,
             rom,
             socket: Some(paths.display_sock.clone()),
@@ -443,8 +543,10 @@ pub(crate) fn vm(
         nics,
         serial_log: serial_log.clone(),
         ports,
-        shares: Vec::new(),
-        audio: None,
+        shares,
+        audio: audio(lab, resolved),
+        vfio,
+        usb,
         rtc_base: rtc_base("vm", name, &resolved.rtc_base)?,
     })
 }
@@ -542,7 +644,9 @@ mod tests {
             vec![FsShare {
                 pci: None,
                 tag: "data".into(),
-                socket: "/run/l/web/virtiofs0.sock".into()
+                socket: Some("/run/l/web/virtiofs0.sock".into()),
+                path: None,
+                read_only: false,
             }]
         );
         assert_eq!(d.serial_log, PathBuf::from("/logs/l/web/console.log"));
@@ -1008,5 +1112,211 @@ mod tests {
             panic!()
         };
         assert!(secure_boot);
+    }
+
+    // -- phases 2d to 2f -------------------------------------------------
+
+    fn gpu_paths() -> VmPaths {
+        VmPaths {
+            gpu_render_node: Some("/dev/dri/renderD129".into()),
+            ..vm_paths()
+        }
+    }
+
+    /// `virgl` and `vulkan` are the one display adapter, a virtio-vga
+    /// accelerated on the render node the daemon resolved, in the slot the
+    /// argv's `virtio-vga-gl` takes; `vulkan` is vmlab-hv's Venus. 2D stays
+    /// what it was, and accelerated without a node is refused.
+    #[test]
+    fn a_paravirtual_gpu_is_an_accelerated_virtio_vga_on_its_render_node() {
+        for (mode, want) in [("virgl", GpuMode::Virgl), ("vulkan", GpuMode::Venus)] {
+            let r = declared(
+                &format!(
+                    r#"profile = "linux-modern" firmware = "seabios" gpu {{ mode = "{mode}" }}"#
+                ),
+                None,
+            );
+            let d = vm("l", &r, &gpu_paths(), QemuAccel::Kvm, &roms()).unwrap();
+            let display = d.display.unwrap();
+            assert_eq!(display.device, DisplayDevice::VirtioVga, "{mode}");
+            assert_eq!(display.gpu, Some(want), "{mode}");
+            assert_eq!(
+                display.render_node.as_deref(),
+                Some(Path::new("/dev/dri/renderD129"))
+            );
+            assert_eq!(display.pci, at(4).unwrap());
+            assert!(d.vfio.is_empty());
+            // A std-VGA profile's display is replaced by the GL adapter, as
+            // in the argv.
+            let std = declared(
+                &format!(
+                    r#"profile = "linux-modern" firmware = "seabios" display = "std" gpu {{ mode = "{mode}" }}"#
+                ),
+                None,
+            );
+            let d = vm("l", &std, &gpu_paths(), QemuAccel::Kvm, &roms()).unwrap();
+            assert_eq!(d.display.unwrap().device, DisplayDevice::VirtioVga);
+        }
+        let plain = vm(
+            "l",
+            &seabios_modern(),
+            &gpu_paths(),
+            QemuAccel::Kvm,
+            &roms(),
+        )
+        .unwrap();
+        let display = plain.display.unwrap();
+        assert_eq!((display.gpu, display.render_node), (None, None));
+
+        let r = declared(
+            r#"profile = "linux-modern" firmware = "seabios" gpu { mode = "virgl" }"#,
+            None,
+        );
+        let err = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap_err();
+        assert!(err.to_string().contains("render node"), "{err}");
+    }
+
+    /// `passthrough` hands the declared host GPU over as a vfio device in
+    /// the slot the argv's `vfio-pci` takes, ahead of the VM's own display.
+    #[test]
+    fn a_passed_through_gpu_is_a_vfio_device_before_the_display() {
+        let r = declared(
+            r#"profile = "linux-modern" firmware = "seabios" gpu { mode = "passthrough" }"#,
+            None,
+        );
+        let paths = VmPaths {
+            gpu_passthrough: Some("0000:05:00.0".into()),
+            ..vm_paths()
+        };
+        let d = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(
+            d.vfio,
+            vec![VfioDevice {
+                host: "0000:05:00.0".into(),
+                pci: at(4).unwrap(),
+            }]
+        );
+        let display = d.display.unwrap();
+        assert_eq!(
+            (display.device, display.gpu),
+            (DisplayDevice::VirtioVga, None)
+        );
+        assert_eq!(display.pci, at(5).unwrap());
+        assert_eq!(d.tablet, at(6));
+        let err = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap_err();
+        assert!(err.to_string().contains("needs a host GPU"), "{err}");
+    }
+
+    /// `usb = true`: the tablet's xHCI is also `usbx`, the controller host
+    /// devices hot-plug onto — one function, as vmlab-hv requires.
+    #[test]
+    fn usb_passthrough_shares_the_tablets_xhci() {
+        let r = declared(
+            r#"profile = "linux-modern" firmware = "seabios" usb = true"#,
+            None,
+        );
+        let d = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(d.tablet, at(5));
+        assert_eq!(d.usb, d.tablet);
+        let plain = vm("l", &seabios_modern(), &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(plain.usb, None);
+    }
+
+    /// virtio-fs shares are vmlab-hv's in-process device on the host
+    /// directory — no socket — after the tablet, as the argv's
+    /// `vhost-user-fs-pci` devices come last.
+    #[test]
+    fn shares_are_served_in_process_from_the_host_directory() {
+        let paths = VmPaths {
+            hypervisor_shares: vec![
+                crate::qemu::HypervisorShare {
+                    tag: "src".into(),
+                    host: "/lab/src".into(),
+                    readonly: false,
+                },
+                crate::qemu::HypervisorShare {
+                    tag: "ro".into(),
+                    host: "/lab/ro".into(),
+                    readonly: true,
+                },
+            ],
+            ..vm_paths()
+        };
+        let d = vm("l", &seabios_modern(), &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(
+            d.shares,
+            vec![
+                FsShare {
+                    pci: at(6),
+                    tag: "src".into(),
+                    socket: None,
+                    path: Some("/lab/src".into()),
+                    read_only: false,
+                },
+                FsShare {
+                    pci: at(7),
+                    tag: "ro".into(),
+                    socket: None,
+                    path: Some("/lab/ro".into()),
+                    read_only: true,
+                },
+            ]
+        );
+        assert!(d.shares.iter().all(|s| s.backing().is_some()));
+    }
+
+    /// `audio = true` is an HDA at 00:1b.0 playing into the host node
+    /// `vmlab.<lab>.<machine>`; the microphone follows its own key; no
+    /// `audio` is no sound card.
+    #[test]
+    fn audio_is_hda_on_its_own_host_node() {
+        let r = declared(
+            r#"profile = "windows-11" audio = true microphone = true"#,
+            None,
+        );
+        let d = vm("lab1", &r, &ovmf_paths(true), QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(
+            d.audio,
+            Some(Audio {
+                pci: Some(HDA),
+                device: AudioDevice::Hda,
+                microphone: true,
+                node_name: "vmlab.lab1.t".into(),
+                node_description: "vmlab lab1/t".into(),
+            })
+        );
+        let r = declared(
+            r#"profile = "linux-modern" firmware = "seabios" audio = true"#,
+            None,
+        );
+        let d = vm("lab1", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+        let audio = d.audio.unwrap();
+        assert_eq!((audio.device, audio.microphone), (AudioDevice::Hda, false));
+        let quiet = vm("l", &seabios_modern(), &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(quiet.audio, None);
+    }
+
+    /// The new sections ride the wire as vmlab-hv reads them.
+    #[test]
+    fn a_phase_2f_description_round_trips_as_json() {
+        let r = declared(
+            r#"profile = "linux-modern" firmware = "seabios" usb = true audio = true gpu { mode = "passthrough" }"#,
+            None,
+        );
+        let paths = VmPaths {
+            gpu_passthrough: Some("0000:05:00.0".into()),
+            hypervisor_shares: vec![crate::qemu::HypervisorShare {
+                tag: "s".into(),
+                host: "/s".into(),
+                readonly: false,
+            }],
+            ..vm_paths()
+        };
+        let d = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MachineDescription>(&json).unwrap(),
+            d
+        );
     }
 }

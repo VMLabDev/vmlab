@@ -509,10 +509,17 @@ impl VmInstance {
     }
 
     /// Why an online snapshot of this VM cannot be taken or loaded right
-    /// now — `None` when it can. A live QEMU answers with the virtiofsd its
+    /// now — `None` when it can. On vmlab-hv a GPU of any mode refuses it
+    /// (HV phase-2 D9). A live QEMU answers with the virtiofsd its
     /// run started; a stopped one, which an online restore boots first, with
     /// the virtiofsd it would start.
     async fn online_snapshot_refusal(&self) -> Option<String> {
+        if self.hypervisor == HypervisorKind::Vmlab
+            && let Some(why) =
+                crate::config::hypervisor::vmlab_online_snapshot_refusal(&self.template().resolved)
+        {
+            return Some(why);
+        }
         if self.power_state().await != PowerState::Stopped {
             return self.snapshot_refusal.lock().expect("refusal lock").clone();
         }
@@ -808,7 +815,7 @@ impl VmInstance {
         t: &TemplateParts,
         firmware: Option<&qemu::firmware::UefiFirmware>,
         nics: Vec<qemu::NicSpec>,
-        virtiofs_shares: Vec<(String, PathBuf)>,
+        (virtiofs_shares, hypervisor_shares): (Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>),
         render: &qemu::hostgpu::RenderPlan,
         tsc_hz: Option<u64>,
     ) -> Result<VmPaths> {
@@ -834,6 +841,7 @@ impl VmInstance {
             tpm_sock: t.resolved.tpm.then(|| self.dirs.tpm_sock()),
             serial_log: Some(self.dirs.logs.join("serial.log")),
             virtiofs_shares,
+            hypervisor_shares,
             gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
             gpu_passthrough: render.passthrough.clone(),
             tsc_hz,
@@ -881,9 +889,10 @@ impl VmInstance {
             &host,
             &qemu::hostgpu::Sysfs::host(),
             &crate::paths::data_dir(),
+            self.hypervisor,
         )
         .with_context(|| format!("{}: gpu", self.cfg.name))?;
-        if let Some(warning) = &plan.warning {
+        for warning in &plan.warnings {
             tracing::warn!("{}: {warning}", self.cfg.name);
         }
         *self.host_gpu.lock_recover() = plan.name.clone();
@@ -933,11 +942,17 @@ impl VmInstance {
     }
 
     /// Spawn one virtiofsd per virtiofs share (listening before QEMU
-    /// starts) and return the (tag, socket) device list; also records the
-    /// ready-time mount plan and whether the run can be snapshotted online.
-    /// Explicit `transport = "virtiofs"` with no host virtiofsd, or a
-    /// read-only one on a virtiofsd with no `--readonly`, is a start error.
-    async fn start_virtiofsds(&self) -> Result<Vec<(String, PathBuf)>> {
+    /// starts) and return the (tag, socket) device list — or, on a
+    /// hypervisor that serves virtio-fs itself, spawn nothing and return the
+    /// shares it is to serve; also records the ready-time mount plan and
+    /// whether the run can be snapshotted online. Explicit `transport =
+    /// "virtiofs"` with no host virtiofsd, or a read-only one on a virtiofsd
+    /// with no `--readonly`, is a start error.
+    async fn start_virtiofsds(
+        &self,
+    ) -> Result<(Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>)> {
+        let in_process = self.hv.virtiofs_in_process();
+        let mut served = Vec::new();
         let mut procs = Vec::new();
         let mut devices = Vec::new();
         let mut mounts = Vec::new();
@@ -969,6 +984,19 @@ impl VmInstance {
                 .cloned()
                 .unwrap_or_else(|| share.host.clone());
             let tag = crate::qemu::virtiofsd::mount_tag(&share.name);
+            mounts.push(VirtiofsMount {
+                tag: tag.clone(),
+                guest: share.guest.clone(),
+                readonly: share.readonly,
+            });
+            if in_process {
+                served.push(qemu::HypervisorShare {
+                    tag,
+                    host,
+                    readonly: share.readonly,
+                });
+                continue;
+            }
             let sock = self.dirs.vfs_sock(i);
             let proc = self
                 .hv
@@ -981,16 +1009,11 @@ impl VmInstance {
                 )
                 .await?;
             procs.push(proc);
-            devices.push((tag.clone(), sock));
-            mounts.push(VirtiofsMount {
-                tag,
-                guest: share.guest.clone(),
-                readonly: share.readonly,
-            });
+            devices.push((tag, sock));
         }
         *self.virtiofsd.lock().await = procs;
         *self.virtiofs_mounts.lock().await = mounts;
-        Ok(devices)
+        Ok((devices, served))
     }
 
     /// Per-NIC argv specs + the child fd mappings tap attachments need,
@@ -1778,6 +1801,10 @@ impl super::display::DisplayHost for VmInstance {
 impl super::machine::Machine for VmInstance {
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
         self.hv.virtiofsd()
+    }
+
+    fn virtiofs_in_process(&self) -> bool {
+        self.hv.virtiofs_in_process()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {

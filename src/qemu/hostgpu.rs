@@ -31,6 +31,7 @@ use anyhow::{Context, Result, bail};
 use super::process::ChildEnv;
 use super::vk_layer;
 use crate::config::host::{HostConfig, HostGpu, KeepAwake};
+use crate::config::hypervisor::HypervisorKind;
 use crate::config::model::{Gpu, GpuMode};
 
 /// One host GPU with a render node.
@@ -402,8 +403,10 @@ pub struct RenderPlan {
     /// emulator spawns ([`vk_layer::install`]); set when the environment
     /// names it.
     pub vk_layer: Option<PathBuf>,
-    /// A missing `host_gpu` the plan fell back from ([`Picked::warning`]).
-    pub warning: Option<String>,
+    /// What the start should warn about, once each: a missing `host_gpu`
+    /// the plan fell back from ([`Picked::warning`]), and on vmlab-hv the
+    /// host GPU's QEMU-only keys it ignored and the render node it chose.
+    pub warnings: Vec<String>,
     /// Whether the supervisor should hold [`Self::gpu`] awake before the
     /// emulator spawns ([`keepawake_wanted`]).
     pub keepawake: bool,
@@ -502,12 +505,20 @@ pub fn emulator(qemu_binary: Option<&Path>, arch: &str) -> String {
 /// mode, must run and suit `arch` (the VM's arch, when known); its
 /// `qemu_env` goes on last. A `vulkan` GPU's PCI-filter layer is planned
 /// under `data` ([`vk_layer::dir`]), not written.
+///
+/// On vmlab-hv (`hypervisor`, PRD §22, HV phase-2 D10) the render node, the
+/// Vulkan environment, the filter layer and keep-awake are planned the same
+/// way, but `qemu_binary` and `qemu_env` belong to QEMU: they are neither
+/// checked nor applied, and each set one is a warning. vmlab-hv renders on a
+/// node it is named, never one it finds, so a paravirtual GPU no declared
+/// GPU resolves for renders on this host's first render node, and says so.
 pub fn render_plan(
     gpu: Option<&Gpu>,
     arch: Option<&str>,
     host: &HostConfig,
     sysfs: &Sysfs,
     data: &Path,
+    hypervisor: HypervisorKind,
 ) -> Result<RenderPlan> {
     let Some(gpu) = gpu else {
         return Ok(RenderPlan {
@@ -516,9 +527,10 @@ pub fn render_plan(
         });
     };
     let picked = pick(gpu, host)?;
+    let vmlab = hypervisor == HypervisorKind::Vmlab;
     let mut plan = RenderPlan {
         name: picked.gpu.map(|g| g.name.clone()),
-        warning: picked.warning(),
+        warnings: picked.warning().into_iter().collect(),
         ..Default::default()
     };
     let decl = picked.gpu;
@@ -536,6 +548,22 @@ pub fn render_plan(
             .map(|g| sysfs.resolve(&g.address))
             .transpose()
             .with_context(context)?;
+        if vmlab && plan.gpu.is_none() {
+            let Some(first) = sysfs.render_gpus().into_iter().next() else {
+                bail!(
+                    "vmlab-hv renders `{}` on a host GPU's render node, and this host has \
+                     none — {DECLARE_ONE}, or use hypervisor = \"qemu\"",
+                    gpu.mode.as_str()
+                );
+            };
+            plan.warnings.push(format!(
+                "no declared host GPU resolves for this `gpu {{}}`; vmlab-hv renders on the \
+                 first render node, {} ({})",
+                first.render_node.display(),
+                first.address
+            ));
+            plan.gpu = Some(first);
+        }
         let vulkan = gpu.mode == GpuMode::Vulkan;
         let icd = decl
             .and_then(|g| g.vulkan_icd.as_deref())
@@ -553,7 +581,27 @@ pub fn render_plan(
         }
         plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd, plan.vk_layer.as_deref());
     }
-    if let Some(decl) = decl {
+    if let Some(decl) = decl
+        && vmlab
+    {
+        // HV phase-2 D10: QEMU's keys mean nothing to vmlab-hv.
+        if let Some(binary) = &decl.qemu_binary {
+            plan.warnings.push(format!(
+                "host GPU `{}`: qemu_binary {} is QEMU's and does not apply on vmlab-hv; \
+                 ignored",
+                decl.name,
+                binary.display()
+            ));
+        }
+        if !decl.qemu_env.is_empty() {
+            let keys: Vec<&str> = decl.qemu_env.iter().map(|(k, _)| k.as_str()).collect();
+            plan.warnings.push(format!(
+                "host GPU `{}`: qemu_env ({}) is QEMU's and does not apply on vmlab-hv; ignored",
+                decl.name,
+                keys.join(", ")
+            ));
+        }
+    } else if let Some(decl) = decl {
         if let Some(binary) = &decl.qemu_binary {
             check_qemu_binary(&decl.name, binary, arch)?;
             plan.qemu_binary = Some(binary.clone());
@@ -842,7 +890,14 @@ mod tests {
     /// [`super::render_plan`] for an x86_64 VM, the arch every test here
     /// but the arch checks runs.
     fn render_plan(gpu: Option<&Gpu>, host: &HostConfig, sysfs: &Sysfs) -> Result<RenderPlan> {
-        super::render_plan(gpu, Some("x86_64"), host, sysfs, Path::new(DATA))
+        super::render_plan(
+            gpu,
+            Some("x86_64"),
+            host,
+            sysfs,
+            Path::new(DATA),
+            HypervisorKind::Qemu,
+        )
     }
 
     /// The layer variables a `vulkan` plan on `address` sets after the
@@ -906,7 +961,7 @@ mod tests {
         assert_eq!(plan.gpu.unwrap().address, "0000:72:00.0");
         assert_eq!(set(&plan.env)[0], ("VK_LOADER_DRIVERS_SELECT", "*radeon*"));
         assert_eq!(owned(&plan.env)[1..], layer_env("0000:72:00.0"));
-        assert_eq!(plan.warning, None);
+        assert!(plan.warnings.is_empty());
     }
 
     /// No `host_gpu` takes the default: the marked one, else a lone one.
@@ -938,7 +993,7 @@ mod tests {
         let plan = render_plan(Some(&gpu(GpuMode::Vulkan, Some("Nope"))), &host(), &sysfs).unwrap();
         assert_eq!(plan.name.as_deref(), Some("Nvidia1"));
         assert_eq!(
-            plan.warning.as_deref(),
+            plan.warnings.first().map(String::as_str),
             Some("host GPU `Nope` is not declared on this host; using the default `Nvidia1`")
         );
         let w = warnings(
@@ -1025,7 +1080,7 @@ mod tests {
         )
         .unwrap();
         assert!(plan.gpu.is_none());
-        assert!(plan.warning.unwrap().contains("it has no default"));
+        assert!(plan.warnings[0].contains("it has no default"));
     }
 
     /// A host GPU's `vulkan_icd` replaces the driver filter under `vulkan`
@@ -1212,7 +1267,8 @@ mod tests {
                 None,
                 &h,
                 &sysfs,
-                Path::new(DATA)
+                Path::new(DATA),
+                HypervisorKind::Qemu,
             )
             .is_ok()
         );
@@ -1229,9 +1285,61 @@ mod tests {
                 Some("x86"),
                 &h,
                 &sysfs,
-                Path::new(DATA)
+                Path::new(DATA),
+                HypervisorKind::Qemu,
             )
             .is_ok()
+        );
+    }
+
+    /// On vmlab-hv (HV phase-2 D10) a host GPU's `qemu_binary` and
+    /// `qemu_env` are not checked or applied, and each warns; the render
+    /// node, the Vulkan environment and the filter layer are QEMU's plan
+    /// unchanged. With no declared GPU, vmlab-hv is named the host's first
+    /// render node rather than left to find one.
+    #[test]
+    fn on_vmlab_hv_the_qemu_keys_warn_and_a_render_node_is_always_named() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let gone = sys.path().join("nope/qemu-system-x86_64");
+        let h = host_with_qemu(&gone, &[("RENDER_SERVER_EXEC_PATH", "/x")]);
+        let on = |gpu: &Gpu, h: &HostConfig| {
+            super::render_plan(
+                Some(gpu),
+                Some("x86_64"),
+                h,
+                &sysfs,
+                Path::new(DATA),
+                HypervisorKind::Vmlab,
+            )
+        };
+        let plan = on(&gpu(GpuMode::Vulkan, None), &h).unwrap();
+        assert_eq!(plan.qemu_binary, None);
+        assert!(
+            !plan
+                .env
+                .set
+                .iter()
+                .any(|(k, _)| k == "RENDER_SERVER_EXEC_PATH")
+        );
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("qemu_binary") && plan.warnings[0].contains("ignored"));
+        assert!(plan.warnings[1].contains("qemu_env (RENDER_SERVER_EXEC_PATH)"));
+        let qemu = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &host(), &sysfs).unwrap();
+        let vmlab = on(&gpu(GpuMode::Vulkan, None), &host()).unwrap();
+        assert_eq!(
+            (vmlab.gpu, vmlab.env, vmlab.vk_layer),
+            (qemu.gpu, qemu.env, qemu.vk_layer)
+        );
+
+        let none = HostConfig::default();
+        let plan = on(&gpu(GpuMode::Virgl, None), &none).unwrap();
+        let first = sysfs.render_gpus().into_iter().next().unwrap();
+        assert_eq!(plan.gpu.as_ref(), Some(&first));
+        assert!(
+            plan.warnings[0].contains("first render node"),
+            "{:?}",
+            plan.warnings
         );
     }
 

@@ -203,13 +203,20 @@ async fn a_legacy_pc_vm_is_refused_before_anything_spawns() {
     assert!(!run.join("machine.json").exists());
 }
 
-/// A VM's adapter reports no virtiofsd — its shares wait for phase 2e and
-/// fall back to SMB — while a container's keeps the host's.
+/// A VM's adapter serves its shares in process (phase 2e): read-only and
+/// snapshot-carrying, whatever the host's virtiofsd is — while a
+/// container's volumes keep the host's virtiofsd.
 #[test]
-fn a_vm_has_no_virtiofsd_to_serve_shares() {
-    assert!(VmlabHv::for_vm(None, None).virtiofsd().is_none());
+fn a_vm_serves_its_shares_in_process() {
+    let vm = VmlabHv::for_vm(None, None);
+    assert!(vm.virtiofs_in_process());
+    let device = vm.virtiofsd().expect("the in-process device");
+    assert!(device.readonly && device.migration, "{device:?}");
+    assert_eq!(device.snapshot_refusal("v"), None);
+    let container = VmlabHv::new(None);
+    assert!(!container.virtiofs_in_process());
     assert_eq!(
-        VmlabHv::new(None).virtiofsd().is_some(),
+        container.virtiofsd().is_some(),
         crate::qemu::virtiofsd::found().is_some()
     );
 }

@@ -48,6 +48,7 @@ SCENARIOS = [
     "apps",
     "peers",
     "admin",
+    "fastpath",
     "unsupported",
 ]
 

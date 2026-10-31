@@ -85,15 +85,23 @@ machine is reached with `vmlab shell` and `vmlab exec`.
 **A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
 "vmlab"` on a machine, else the host config's default per kind (QEMU), puts it
 on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
-pinned by git rev). Phase 1 runs container micro-VMs; phases 2a to 2c a
+pinned by git rev). Phase 1 runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
 or Windows (`vmlab_hv/describe.rs` places every device where QEMU's q35 would;
 a guest reset, which ends vmlab-hv, boots the VM again as one run), its screen, input and recording over vmlab-hv's
 native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
-`vnc.sock` for viewers. Everything else — GPU, virtiofs, USB, macOS, i440fx,
-`qemu_args`, hosts without KVM — is refused from one list
-naming the phase that brings it. Snapshots record their
-hypervisor and an online one refuses to restore under the other.
+`vnc.sock` for viewers; a `gpu {}` (virgl and Venus on the render node the
+host GPU pick resolves, a host GPU's `qemu_*` keys warned about and ignored;
+passthrough as a vfio device vmlab-hv takes only pre-bound), virtio-fs shares
+it serves in process (no virtiofsd; the share plan asks each machine what
+serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
+`device_del`, waiting on `device_deleted`), and **guest audio** — `audio` and
+`microphone` on a VM (§11, hv-audio D7), an HDA on the host node
+`vmlab.<lab>.<machine>`, refused on QEMU. Everything else — macOS, i440fx,
+a pinned TSC (no host-facts probe in vmlab-hv yet), `qemu_args`, hosts without
+KVM — is refused from one list naming the phase that brings it. Snapshots
+record their hypervisor and an online one refuses to restore under the other;
+a vmlab-hv VM with a GPU takes none (HV D9).
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the
 profile, `windows-xp` and `windows-9x` on `isa-serial`, the C agent under
 `guest/agent-legacy` serving `exec` and `set_time` only over COM1, the bootstrap ISO's
@@ -264,9 +272,9 @@ Module map under `src/`:
   hot-plug, media — are reported or `None`; `qemu.rs` composes the argv with
   the pure builders in `qemu/` and translates each capability to QMP;
   `vmlab_hv/` is the second production adapter (§22, ADR-0021) — `describe.rs`
-  composes vmlab-hv's `MachineDescription` from a container launch,
+  composes vmlab-hv's `MachineDescription` from a container or VM launch,
   `control.rs` is its control protocol as a `Control` (two connections, one
-  for commands and one read for events) — chosen per machine by
+  for commands and one read for events; hot-plug among its capabilities) — chosen per machine by
   `for_machine`; and `fake.rs` is the in-memory adapter the lifecycle tests
   drive, which can also put the vmlab-hv control client in front of a fake
   protocol server;
