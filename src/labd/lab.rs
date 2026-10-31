@@ -1234,6 +1234,7 @@ impl LabRuntime {
     pub fn preflight_binaries(&self, targets: &[String]) -> Result<()> {
         let mut needed: Vec<String> = Vec::new();
         for name in targets {
+            self.machine(name)?.check_host_config()?;
             for binary in self.machine(name)?.required_binaries() {
                 if !needed.contains(&binary) {
                     needed.push(binary);

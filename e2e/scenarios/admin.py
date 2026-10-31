@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import time
 
-from harness import WORK
+from harness import WORK, redact_osk
 
 LAB = "e2e-admin"
 QEMU_NAME = f"vmlab:{LAB}/arm01"
@@ -30,7 +30,7 @@ def alive(pid: int) -> bool:
 
 
 def argv_of(pid: int) -> list[str]:
-    return pathlib.Path(f"/proc/{pid}/cmdline").read_text().split("\0")
+    return [redact_osk(arg) for arg in pathlib.Path(f"/proc/{pid}/cmdline").read_text().split("\0")]
 
 
 def listed(h) -> dict[str, str]:

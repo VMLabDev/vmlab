@@ -361,6 +361,7 @@ pub struct VmInstance {
     /// host, probed, in production; a test's own, so a machine on a fake
     /// hypervisor does not depend on the host running the test.
     host_facts: Arc<dyn Fn() -> crate::config::hypervisor::HostFacts + Send + Sync>,
+    host_config: Arc<dyn Fn() -> Result<crate::config::host::HostConfig> + Send + Sync>,
     /// Where the display publishes every input it sends, for a console
     /// recorder (§11.1). Lives as long as the machine, across restarts.
     input_tap: Arc<crate::record::InputTap>,
@@ -447,6 +448,7 @@ impl VmInstance {
             hv: Arc::new(super::hypervisor::Qemu),
             hypervisor: HypervisorKind::Qemu,
             host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
+            host_config: Arc::new(crate::config::host::HostConfig::load_default),
             input_tap: Arc::default(),
         })
     }
@@ -483,6 +485,11 @@ impl VmInstance {
         facts: crate::config::hypervisor::HostFacts,
     ) {
         Arc::get_mut(self).expect("sole owner").host_facts = Arc::new(move || facts.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_host_config(self: &mut Arc<Self>, config: crate::config::host::HostConfig) {
+        Arc::get_mut(self).expect("sole owner").host_config = Arc::new(move || Ok(config.clone()));
     }
 
     /// Indices into `cfg.shares` that ride virtiofs (§7.5).
@@ -820,6 +827,11 @@ impl VmInstance {
         tsc_hz: Option<u64>,
     ) -> Result<VmPaths> {
         Ok(VmPaths {
+            apple_smc_osk: if t.resolved.apple_smc {
+                (self.host_config)()?.apple_smc_osk
+            } else {
+                None
+            },
             qmp_sock: self.dirs.qmp_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
@@ -1098,6 +1110,16 @@ impl VmInstance {
         Box::pin(async move { self.boot_inner(hooks, before_ready, before_resume).await })
     }
 
+    fn check_apple_smc_osk(&self) -> Result<()> {
+        if self.template().resolved.apple_smc {
+            anyhow::ensure!(
+                (self.host_config)()?.apple_smc_osk.is_some(),
+                crate::config::host::APPLE_SMC_OSK_REQUIRED
+            );
+        }
+        Ok(())
+    }
+
     async fn boot_inner(
         self: &Arc<Self>,
         hooks: BootHooks,
@@ -1117,6 +1139,7 @@ impl VmInstance {
         // pull can't swap them mid-boot under us).
         let t = self.template();
         let run = async {
+            self.check_apple_smc_osk()?;
             // A deferred pull binds its template's hardware after the lab
             // builder checked the placeholder, so vmlab-hv's refusals are
             // asked again of what this start will run (§22).
@@ -1892,6 +1915,10 @@ impl super::machine::Machine for VmInstance {
     /// resolved hardware wants a TPM. A VM whose host GPU carries its own
     /// `qemu_binary` needs no emulator on PATH: the start checks that one
     /// itself, naming the GPU (§5.2).
+    fn check_host_config(&self) -> Result<()> {
+        self.check_apple_smc_osk()
+    }
+
     fn required_binaries(&self) -> Vec<String> {
         let t = self.template();
         let mut needed = vec!["qemu-img".to_string()];

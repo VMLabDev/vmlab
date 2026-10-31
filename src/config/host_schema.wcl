@@ -20,6 +20,8 @@ type HostConfig {
   disk_low_percent: i64?
   @doc("Pre-shared key for cross-host segment links")
   psk: utf8?
+  @doc("Apple SMC OSK from your own Apple hardware: exactly 64 printable ASCII characters; required for apple_smc = true; no default")
+  apple_smc_osk: utf8?
   @doc("TCP listen port for inbound cross-host segment trunks; default 13947")
   trunk_port: i64?
   @doc("VNC viewer command; `{}` is replaced by the target")
