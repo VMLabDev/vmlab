@@ -385,7 +385,7 @@ host config's default for its kind does. It runs container micro-VMs and, from
 phases 2a to 2f, modern VMs on q35 — SeaBIOS or OVMF, secure boot, a TPM,
 Hyper-V, Linux or Windows, a GPU on a host render node or passed through,
 virtio-fs shares it serves itself, host USB and a sound card; a guest reset
-ends it, and the VM is booted again as one run, as QEMU resets in place. What
+happens in place, as on QEMU, and is one run to the lab. What
 it cannot run yet is one list of refusals, each naming the phase that brings
 it, which each phase shrinks. An online snapshot belongs to the hypervisor
 that took it, and a vmlab-hv VM with a GPU takes none.

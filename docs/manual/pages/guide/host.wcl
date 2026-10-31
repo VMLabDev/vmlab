@@ -372,8 +372,8 @@ Hyper-V enlightenments, std VGA or virtio-vga, virtio or SATA disks, CD-ROMs,
 virtio-net NICs and the USB tablet — the Linux profiles and the Windows 10, 11
 and Server templates as they are — plus a `gpu {}` of any mode, virtio-fs
 shares, `usb = true` and [guest audio](guide_audio). A guest that reboots
-itself is started again at once, with no stop in between, as QEMU resets it
-in place. A machine opts in with `hypervisor = "vmlab"`, and `host {
+itself is reset in place, as on QEMU; the VM reads as not ready until its
+agent answers again. A machine opts in with `hypervisor = "vmlab"`, and `host {
 hypervisor { container = "vmlab" vm = "vmlab" } }` moves every machine of that
 kind that names none. `vmlab validate` refuses what vmlab-hv cannot run yet,
 naming the machine, the reason and the phase that brings it: macOS, the i440fx

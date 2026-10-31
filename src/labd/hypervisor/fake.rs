@@ -52,10 +52,6 @@ pub struct Exit {
     /// The guest powered itself off rather than the emulator dying — what
     /// separates a clean shutdown from a crash in [`super::classify_exit`].
     pub guest_initiated: bool,
-    /// The guest reset itself rather than powering off — what ends vmlab-hv
-    /// where QEMU resets in place (PRD §22). Only a vmlab-hv script reports
-    /// it, as a `shutdown { reason: guest_reset }` event.
-    pub reset: bool,
 }
 
 /// One start attempt, as the fake plays it.
@@ -95,6 +91,9 @@ pub struct Run {
     /// The guest's agent first answers this long after the machine comes
     /// up — a guest still booting. Without it the agent answers at once.
     pub agent_answers_after: Option<Duration>,
+    /// The guest resets in place this long after coming up, its agent gone
+    /// for the second duration ([`Run::guest_resets`]).
+    pub resets: Option<(Duration, Duration)>,
 }
 
 impl Run {
@@ -110,7 +109,6 @@ impl Run {
                 after,
                 status: status.to_string(),
                 guest_initiated: false,
-                reset: false,
             }),
             ..Self::default()
         }
@@ -123,21 +121,18 @@ impl Run {
                 after,
                 status: "exit status: 0".into(),
                 guest_initiated: true,
-                reset: false,
             }),
             ..Self::default()
         }
     }
 
-    /// Comes up, then the guest resets itself, which ends vmlab-hv.
-    pub fn guest_resets(after: Duration) -> Self {
+    /// Comes up, then the guest resets itself in place after `after`: its
+    /// agent goes away, the `reset` event is sent, and a new agent instance
+    /// answers `gap` later on the same channel. Only a vmlab-hv script
+    /// reports the event (PRD §22).
+    pub fn guest_resets(after: Duration, gap: Duration) -> Self {
         Self {
-            exits: Some(Exit {
-                after,
-                status: "exit status: 0".into(),
-                guest_initiated: true,
-                reset: true,
-            }),
+            resets: Some((after, gap)),
             ..Self::default()
         }
     }
@@ -824,11 +819,30 @@ fn serve_vmlab_hv(
     });
     if let Some(after) = run.sleeps_after {
         let m = machine.clone();
+        let wake = wake.clone();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
             if m.is_running() {
                 let _ = wake.send(Event::Suspend);
             }
+        });
+    }
+    // An in-place reset: the old agent goes with the guest, the event is
+    // sent, and the rebooted guest's agent answers after the gap.
+    if let Some((after, gap)) = run.resets {
+        let m = machine.clone();
+        let wake = wake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            if !m.is_running() {
+                return;
+            }
+            m.agent.lock().expect("fake agent lock").down = true;
+            let _ = wake.send(Event::Reset);
+            tokio::time::sleep(gap).await;
+            let mut agent = m.agent.lock().expect("fake agent lock");
+            agent.instance += 1;
+            agent.down = false;
         });
     }
     let m = machine.clone();
@@ -845,11 +859,7 @@ fn serve_vmlab_hv(
         // event that precedes it, sent a beat earlier.
         tokio::spawn(async move {
             tokio::time::sleep(exit.after.saturating_sub(Duration::from_millis(40))).await;
-            let _ = power_off.send(if exit.reset {
-                ShutdownReason::GuestReset
-            } else {
-                ShutdownReason::GuestShutdown
-            });
+            let _ = power_off.send(ShutdownReason::GuestShutdown);
         });
     }
     let socket = socket.to_path_buf();

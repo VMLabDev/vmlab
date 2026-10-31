@@ -115,11 +115,13 @@ pub trait Control: Send + Sync + 'static {
     /// shutdown or a crash depending on this answer.
     fn guest_shutdown(&self) -> bool;
 
-    /// Whether the guest reset itself and the hypervisor ended for it rather
-    /// than resetting in place — vmlab-hv's contract (PRD §22), where QEMU
-    /// resets a VM in place and never reports this. The VM boots it again.
-    fn guest_reset(&self) -> bool {
-        false
+    /// The guest's in-place resets, as a count that grows by one with each:
+    /// the machine keeps running, its sockets stay open, and the guest boots
+    /// again behind them (PRD §22). `None` from an adapter that reports none
+    /// — QEMU's, whose resets the machine leaves to the agent's lazy
+    /// reconnect.
+    fn reset_watch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
     }
 
     /// Whether the guest is asleep — suspended to RAM (ACPI S3), the emulator

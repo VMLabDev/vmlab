@@ -141,7 +141,7 @@ pub enum StopReason {
     Crashed,
 }
 
-/// The callbacks a boot runs with, shared so a relaunch can reuse them.
+/// The callbacks a boot runs with, shared by the tasks the boot spawns.
 #[derive(Clone)]
 struct BootHooks {
     on_exit: Arc<dyn Fn(StopReason, String) + Send + Sync>,
@@ -1088,9 +1088,7 @@ impl VmInstance {
             .await
     }
 
-    /// [`boot`](Self::boot) with its callbacks shared, so the exit monitor can
-    /// boot the machine again with the same ones when a guest reset ended a
-    /// hypervisor that does not reset in place (see [`Self::relaunch`]).
+    /// [`boot`](Self::boot) with its callbacks shared by the tasks it spawns.
     fn boot_with(
         self: Arc<Self>,
         hooks: BootHooks,
@@ -1275,6 +1273,12 @@ impl VmInstance {
             tokio::spawn(Arc::clone(self).watch_sleep(asleep, move |change| on_sleep(change)));
         }
 
+        // In-place resets: the machine runs on and the guest boots again
+        // behind sockets that stayed open (PRD §22).
+        if let Some(resets) = control.reset_watch() {
+            tokio::spawn(Arc::clone(self).watch_resets(resets));
+        }
+
         // Exit monitor: classify why QEMU ended (PRD §8.1 stop reasons).
         let me = self.clone();
         let exit_hooks = hooks.clone();
@@ -1283,16 +1287,6 @@ impl VmInstance {
                 .wait_exit(Duration::from_secs(60 * 60 * 24 * 365))
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
-            // A guest that reset itself, on a hypervisor that ends rather
-            // than resetting in place: boot it again, as QEMU would have
-            // reset it, with no stop in between for anyone to see.
-            if control.guest_reset()
-                && me.hypervisor == HypervisorKind::Vmlab
-                && !*me.stop_requested.read().await
-            {
-                me.relaunch(exit_hooks, &status).await;
-                return;
-            }
             let on_exit = exit_hooks.on_exit;
             let reason = super::hypervisor::classify_exit(
                 *me.stop_requested.read().await,
@@ -1358,45 +1352,49 @@ impl VmInstance {
         Ok(())
     }
 
-    /// Boot the machine again after the guest reset itself and vmlab-hv,
-    /// which ends on a guest reset rather than resetting in place, exited
-    /// (PRD §22). QEMU resets in place, so to everyone above the seam this is
-    /// one run: no `stopped` event, the NICs kept attached, readiness kept if
-    /// the guest had it — a first-boot provision waiting out the reboot with
-    /// `wait_rebooted` sees a new boot, as it would on QEMU. What a run owns
-    /// below the seam starts afresh: the hypervisor, and the swtpm that ended
-    /// with it. A relaunch that fails is a crash.
-    async fn relaunch(self: &Arc<Self>, hooks: BootHooks, status: &str) {
-        tracing::info!(
-            "{}: the guest reset itself; starting vmlab-hv again ({status})",
-            self.cfg.name
-        );
-        let nics = std::mem::take(&mut *self.nic_attachments.lock().await);
-        let was_ready = *self.ready.read().await;
-        self.teardown().await;
-        *self.nic_attachments.lock().await = nics;
-        *self.agent_up.write().await = false;
-        *self.state.write().await = PowerState::Stopped;
-        let on_ready = hooks.on_ready.clone();
-        let again = BootHooks {
-            // Ready already, as a reset leaves it under QEMU: nothing to
-            // announce when the agent answers again.
-            on_ready: if was_ready { Arc::new(|| {}) } else { on_ready },
-            ..hooks.clone()
-        };
-        let booted = Arc::clone(self)
-            .boot_with(
-                again,
-                Box::pin(std::future::ready(())),
-                Box::pin(std::future::ready(Ok(()))),
-            )
-            .await;
-        if let Err(e) = booted {
-            *self.ready.write().await = false;
-            (hooks.on_exit)(
-                StopReason::Crashed,
-                format!("restarting vmlab-hv after a guest reset failed: {e:#}"),
+    /// Follow the guest's in-place resets for the life of this run (see
+    /// [`Control::reset_watch`]). A reset is one run going on, as QEMU's is
+    /// to the lab: no stop, no second `ready`. But the guest behind the
+    /// sockets has booted again, so each reset drops the agent connection —
+    /// the next use re-handshakes with the new agent — and readiness with
+    /// it, and readiness comes back once that agent answers. A machine that
+    /// was not ready yet (still booting, or a first-boot provision running)
+    /// gets back its agent and nothing more: whoever owed it readiness still
+    /// does. Ends when the run's control channel goes.
+    async fn watch_resets(self: Arc<Self>, mut resets: tokio::sync::watch::Receiver<u64>) {
+        resets.borrow_and_update();
+        // Readiness a reset took away, kept across a second reset that comes
+        // before the agent answers.
+        let mut owed = false;
+        while resets.changed().await.is_ok() {
+            resets.borrow_and_update();
+            owed |= std::mem::replace(&mut *self.ready.write().await, false);
+            *self.agent_up.write().await = false;
+            self.drop_agent().await;
+            tracing::info!(
+                "{}: the guest reset itself; waiting for its agent again",
+                self.cfg.name
             );
+            loop {
+                if !matches!(
+                    self.power_state().await,
+                    PowerState::Running | PowerState::Suspended
+                ) {
+                    return;
+                }
+                // Another reset before the agent answered starts over.
+                if resets.has_changed().unwrap_or(true) {
+                    break;
+                }
+                if self.agent_probe().await {
+                    *self.agent_up.write().await = true;
+                    if std::mem::take(&mut owed) {
+                        *self.ready.write().await = true;
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
     }
 

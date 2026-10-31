@@ -99,6 +99,8 @@ pub(crate) fn container(
         vmstate,
     };
     Ok(MachineDescription {
+        // A guest reset happens in place, as under QEMU.
+        exit_on_reset: false,
         machine: Machine::Microvm,
         cpu: CpuPolicy::Host,
         hyperv: Vec::new(),
@@ -498,6 +500,9 @@ pub(crate) fn vm(
     }
 
     Ok(MachineDescription {
+        // A guest reset happens in place, as under QEMU: the process, its
+        // sockets and every connection to them stay (PRD §22).
+        exit_on_reset: false,
         machine: Machine::Q35,
         cpu: if resolved.nested {
             CpuPolicy::Nested
@@ -773,6 +778,8 @@ mod tests {
     fn a_seabios_linux_vm_takes_the_slots_qemu_gives_it() {
         let d = vm("l", &seabios_modern(), &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
         assert_eq!(d.machine, Machine::Q35);
+        // A guest reset happens in place, as under QEMU.
+        assert!(!d.exit_on_reset);
         assert_eq!(d.name, "vmlab:l/t");
         assert_eq!((d.vcpus, d.memory_mib), (2, 4096));
         assert_eq!(d.cpu, CpuPolicy::Host);
