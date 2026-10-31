@@ -287,10 +287,20 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
     let hv = FakeHypervisor::new(script);
     if on_vmlab {
         vm = vm.on_hypervisor(crate::config::hypervisor::HypervisorKind::Vmlab, hv.clone());
+        // The fake runs anywhere: a KVM host, whatever runs the test.
+        vm.set_host_facts(kvm_host());
     } else {
         vm.set_hypervisor(hv.clone());
     }
     (vm, hv)
+}
+
+/// An x86_64 host with a usable `/dev/kvm`, as vmlab-hv's refusals read it.
+fn kvm_host() -> crate::config::hypervisor::HostFacts {
+    crate::config::hypervisor::HostFacts {
+        arch: "x86_64".into(),
+        kvm: true,
+    }
 }
 
 /// A container on a fake hypervisor, image already bound. `decl` is the
@@ -2621,6 +2631,24 @@ async fn prevent_sleep_wakes_a_vmlab_hv_guest_with_resume() {
         .await
         .expect("awake again");
     vm.stop(true).await.expect("stop");
+}
+
+/// The start-time refusal itself: on a host whose `/dev/kvm` is not usable a
+/// VM on vmlab-hv is refused before anything spawns, naming KVM — vmlab-hv
+/// has no emulation to fall back on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vmlab_hv_vm_on_a_host_without_kvm_is_refused_at_start() {
+    let dirs = Dirs::new();
+    let (mut vm, hv) = vm(&dirs, LINUX_VM, on_vmlab_hv(Script::healthy()));
+    vm.set_host_facts(crate::config::hypervisor::HostFacts {
+        kvm: false,
+        ..kvm_host()
+    });
+    let (cbs, _observed) = callbacks();
+    let err = start_vm(&vm, cbs).await.expect_err("refused");
+    assert!(format!("{err:#}").contains("/dev/kvm"), "{err:#}");
+    assert_eq!(hv.starts(), 0, "nothing was started");
+    assert_eq!(vm.state().await, PowerState::Stopped);
 }
 
 /// vmlab-hv ends when the guest resets itself, where QEMU resets in place

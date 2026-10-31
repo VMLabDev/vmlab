@@ -357,6 +357,10 @@ pub struct VmInstance {
     /// Which hypervisor `hv` is (§22), as the machine reports it and its
     /// snapshots record it.
     hypervisor: HypervisorKind,
+    /// The host facts vmlab-hv's refusals read at each start (§22): this
+    /// host, probed, in production; a test's own, so a machine on a fake
+    /// hypervisor does not depend on the host running the test.
+    host_facts: Arc<dyn Fn() -> crate::config::hypervisor::HostFacts + Send + Sync>,
     /// Where the display publishes every input it sends, for a console
     /// recorder (§11.1). Lives as long as the machine, across restarts.
     input_tap: Arc<crate::record::InputTap>,
@@ -442,6 +446,7 @@ impl VmInstance {
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
             hypervisor: HypervisorKind::Qemu,
+            host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
             input_tap: Arc::default(),
         })
     }
@@ -467,6 +472,17 @@ impl VmInstance {
     #[cfg(test)]
     pub(crate) fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn Hypervisor>) {
         Arc::get_mut(self).expect("sole owner").hv = hv;
+    }
+
+    /// Answer vmlab-hv's host-fact questions with `facts` instead of probing
+    /// this host — the injection point that keeps fake-driven tests off the
+    /// test host's `/dev/kvm`.
+    #[cfg(test)]
+    pub(crate) fn set_host_facts(
+        self: &mut Arc<Self>,
+        facts: crate::config::hypervisor::HostFacts,
+    ) {
+        Arc::get_mut(self).expect("sole owner").host_facts = Arc::new(move || facts.clone());
     }
 
     /// Indices into `cfg.shares` that ride virtiofs (§7.5).
@@ -1083,19 +1099,25 @@ impl VmInstance {
             // A deferred pull binds its template's hardware after the lab
             // builder checked the placeholder, so vmlab-hv's refusals are
             // asked again of what this start will run (§22).
-            if self.hypervisor == HypervisorKind::Vmlab {
+            let kvm = if self.hypervisor == HypervisorKind::Vmlab {
+                let host = (self.host_facts)();
                 let why = crate::config::hypervisor::vmlab_refusals(
                     model::MachineCfg::Vm(&self.cfg),
-                    &crate::config::hypervisor::HostFacts::probe(),
+                    &host,
                     Some(&t.resolved),
                 );
                 if !why.is_empty() {
                     bail!("{}", why.join("\n"));
                 }
-            }
+                // The refusals above vouch for the arch; the host fact is
+                // the one they read.
+                host.kvm
+            } else {
+                qemu::kvm_usable(&t.resolved.arch)
+            };
             // Decided before anything is created or spawned: a declared
             // `accel = "kvm"` that KVM cannot honour refuses here (§5.2).
-            let plan = qemu::plan_accel(&t.resolved, qemu::kvm_usable(&t.resolved.arch))?;
+            let plan = qemu::plan_accel(&t.resolved, kvm)?;
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
             self.ensure_disks().await?;
