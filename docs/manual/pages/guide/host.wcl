@@ -380,6 +380,16 @@ naming the machine, the reason and the phase that brings it: macOS, the i440fx
 machine and floppies, `accel = "tcg"`, a pinned `tsc`, `input = "usb"`, and
 `qemu_args` in every phase.
 
+Legacy pc support is in progress in phase 4. Sub-phase 4a brings i440fx,
+IDE, std VGA, the agent on COM1 with its log on COM2, named CPUs and
+local-time RTCs. Sub-phase 4b adds e1000 and PCnet; 4c adds the floppy and
+PIIX3 UHCI tablet; 4d adds Cirrus; and 4e integrates vmlab and its legacy
+e2e lab. These hardware gates remain closed until the pinned hypervisor
+passes their acceptance checks. Each missing sub-phase is reported
+separately. Every pc VM needs 4c because its hardware includes the UHCI
+tablet even without a floppy. FreeDOS 1.3, Windows 98 SE, Windows 7
+7600.0.1 and TempleOS are the gate guests.
+
 A `virgl` or `vulkan` GPU renders on the render node of the host GPU your host
 config picks, exactly as under QEMU, with the same Vulkan filter and
 keep-awake; with no declared GPU it renders on the host's first render node,
@@ -394,7 +404,9 @@ no online snapshot on vmlab-hv; stop it and take an offline one.
 Screenshots, OCR, image matching, scripted keys and mouse, and `vmlab record`
 work on a vmlab-hv VM through its own frame protocol on `display.sock`, and
 `vmlab console` and `gui = true` reach its RFB server on `vnc.sock`, the
-socket QEMU's display uses. Online and offline snapshots work as on QEMU, but
+socket QEMU's display uses. A profile's `input_transport = "vnc"` also uses
+the native input path on vmlab-hv; QEMU continues to use VNC for that setting.
+Online and offline snapshots work as on QEMU, but
 an online snapshot only restores on the hypervisor that took it. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`. `vmlab status -v`
 shows `hypervisor=` on every machine, and its log is `vmlab-hv.log` beside the
@@ -404,8 +416,8 @@ DOC
 
   p <<'DOC'
 Choose vmlab-hv for a container when you want to try the new hypervisor on one
-machine inside a lab that otherwise runs on QEMU. Keep QEMU for everything
-else, and for any container that must also run on a host without KVM. Two
+machine inside a lab that otherwise runs on QEMU. Keep QEMU for legacy PCs
+until their phase-4 gates pass, and for any container that must also run on a host without KVM. Two
 things differ on a vmlab-hv machine. It has no emulation fallback, so where
 QEMU falls back to TCG, vmlab-hv refuses the machine. And an online snapshot
 is stored in the format of the hypervisor that took it, so it does not restore

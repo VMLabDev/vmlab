@@ -198,7 +198,7 @@ async fn a_legacy_pc_vm_is_refused_before_anything_spawns() {
         .await
         .err()
         .expect("refused");
-    assert!(err.to_string().contains("q35"), "{err}");
+    assert!(err.to_string().contains("phase 4a"), "{err}");
     assert!(!run.join("spawned").exists());
     assert!(!run.join("machine.json").exists());
 }

@@ -2591,9 +2591,19 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 2e | virtio-fs shares, served in process, and audio (HDA) | Selectable |
 | 2f | Host USB (`usb = true`) and vfio (`gpu { mode = "passthrough" }`) | Selectable |
 | 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
-| 4 | Legacy PCs | Refused |
+| 4 | Legacy PCs: i440fx, IDE, ISA serial, e1000, PCnet, floppy, UHCI and Cirrus | In progress; gated by sub-phase |
 
 macOS guests are a phase of their own after 2.
+
+Phase 4 lands as 4a, the pc machine core with IDE, std VGA, COM1 agent and
+COM2 log, named CPUs and local-time RTCs; 4b, e1000 and PCnet; 4c, floppy
+and the PIIX3 UHCI tablet; 4d, Cirrus; and 4e, vmlab integration and the
+legacy e2e lab. The four hypervisor delivery gates remain closed until the
+pinned revision passes their acceptance checks. Each sub-phase has one
+delivery flag in `src/config/hypervisor.rs`. A pc VM still needs 4c without
+a floppy, because the QEMU hardware it mirrors always includes the UHCI
+tablet. The gate guests are FreeDOS 1.3, Windows 98 SE, Windows 7 7600.0.1
+and TempleOS.
 
 **Refusals.** Validation (§5.1), and the lab daemon again before it builds a
 machine and before each start, refuse a machine on vmlab-hv that it cannot run
@@ -2604,8 +2614,9 @@ disks (both on AHCI), virtio-net NICs, the PS/2 keyboard with the USB tablet,
 a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
 (2d, 2f), virtio-fs shares and a sound card (2e) and `usb = true` (2f) — the
 Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
-macOS guest (its own phase); the i440fx machine, a floppy or
-`agent_transport = "isa-serial"` (4); `accel = "tcg"` (3); another display
+macOS guest (its own phase); the i440fx machine, IDE, a named CPU or
+`agent_transport = "isa-serial"` on pc (4a); e1000 or PCnet on pc (4b);
+a floppy or pc's UHCI tablet (4c); Cirrus on pc (4d); `accel = "tcg"` (3); another display
 device, NIC model or `cpu_model`; `input = "usb"`; a pinned `tsc`, which waits
 for vmlab-hv's host-facts probe (vmlab reads the host's TSC frequency through
 a paused QEMU today, and vmlab-hv has neither the probe nor a frequency to
@@ -2615,7 +2626,10 @@ no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
 hardware where the template is in the store, and the daemon, which always
 resolves it, finishes the check. The refusals are one list in code, which each
-phase shrinks.
+phase shrinks. Legacy pc reasons are collected separately, so a missing
+machine core does not hide the later device requirements. A named CPU on
+q35, an unknown display or NIC model, and a floppy outside pc remain
+unsupported after phase 4.
 
 **Launch.** For a container, vmlab writes a machine description beside the
 machine's control socket in its runtime directory — the guest asset's kernel

@@ -338,6 +338,12 @@ impl Supervisor {
         {
             let reg = self.registry.lock().await;
             reg.check_name(name, &root)?;
+            if self.template_ops.owns_build_lab(name) {
+                return Err(CommandError::conflict(format!(
+                    "lab `{name}` belongs to an active template build and serves inspection and \
+                     input only; use `vmlab template stop` to stop the build"
+                )));
+            }
             if let Some(entry) = reg.get(name)
                 && entry.state == LabState::Running
                 && let Ok(c) = LabClient::connect(&sock).await
@@ -756,6 +762,184 @@ impl Handler<SupRequest> for SupervisorHandler {
 #[cfg(test)]
 mod tests {
     use super::process_running;
+
+    const BUILD_INSPECTION_HELPER: &str = "VMLAB_TEST_BUILD_INSPECTION_ROOT";
+
+    #[test]
+    fn a_script_cannot_shadow_an_active_build_inspection_lab() {
+        let scratch = tempfile::tempdir().unwrap();
+        let test_exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(test_exe)
+            .args([
+                "--exact",
+                "supervisor::tests::build_inspection_cli_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(BUILD_INSPECTION_HELPER, scratch.path())
+            .env_remove("VMLAB_TEST_CLI")
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Real empty build and supervisor runtimes, isolated from the test
+    /// process's paths. No machine is declared or booted.
+    #[test]
+    #[ignore = "subprocess helper for a_script_cannot_shadow_an_active_build_inspection_lab"]
+    fn build_inspection_cli_helper() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::proto::client::LabClient;
+        use crate::proto::server::Server;
+        use crate::proto::{LabRequest, SupRequest};
+
+        let Some(root) = std::env::var_os(BUILD_INSPECTION_HELPER) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let name = "build-x86-base";
+            let source = format!("import <vmlab.wcl>\nlab \"{name}\" {{ }}\n");
+            std::fs::write(root.join("vmlab.wcl"), &source).unwrap();
+            std::fs::write(root.join("probe.ws"), "use vmlab\nfn main(lab: Lab) { }\n")
+                .unwrap();
+            let config = crate::config::load_lab_source(&source, "vmlab.wcl", &root).unwrap();
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let log = Arc::new(crate::labd::events::EventLog::new(name, events.clone()).unwrap());
+            let lab = crate::labd::lab::LabRuntime::build(
+                config,
+                log,
+                &crate::profiles::ProfileSet::shipped().unwrap(),
+            )
+            .await
+            .unwrap();
+            let _inspection = crate::labd::build_lab::serve(&lab).await.unwrap().unwrap();
+            let socket = crate::paths::lab_socket(name);
+            let inode_before = std::fs::metadata(&socket).unwrap().ino();
+
+            let host = crate::config::host::HostConfig::default();
+            let supervisor = Arc::new(super::Supervisor {
+                registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+                events: events.clone(),
+                globals: super::GlobalSegments::new(&host, events.clone()),
+                ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                template_ops: super::templates::TemplateOps::default(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                keepers: super::keepawake::Keepers::default(),
+            });
+            let _build = supervisor
+                .template_ops
+                .try_begin("source", "x86", "base", "build")
+                .unwrap();
+            let handler = Arc::new(super::SupervisorHandler {
+                sup: supervisor.clone(),
+                tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
+            });
+            let _server = Server::<SupRequest>::bind(&crate::paths::supervisor_socket(), handler)
+                .await
+                .unwrap();
+
+            let output = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "supervisor::tests::build_inspection_script_cli_helper",
+                        "--include-ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .current_dir(&root)
+                    .env("VMLAB_INSTANCE", "")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("the CLI request must finish")
+            .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let shadow_log = crate::paths::state_dir().join(format!("labd-{name}.log"));
+            let entries = supervisor.registry.lock().await.labs().to_vec();
+            println!(
+                "script helper status={} shadow_log={} registry_entries={} socket_inode_before={} socket_inode_after={} stderr={stderr}",
+                output.status,
+                shadow_log.exists(),
+                entries.len(),
+                inode_before,
+                std::fs::metadata(&socket).unwrap().ino(),
+            );
+            // Before the guard, the unwanted __labd child is this test
+            // executable and rejects that argument. Let its reaper finish.
+            for entry in &entries {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while process_running(entry.pid) && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!process_running(entry.pid), "private child did not exit");
+            }
+            assert!(!shadow_log.exists(), "lab.ensure spawned a shadow daemon");
+            assert!(entries.is_empty(), "lab.ensure registered a shadow daemon");
+            assert!(
+                output.status.success(),
+                "CLI helper failed:\n{}\n{stderr}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(stderr.contains("active template build"), "{stderr}");
+            assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode_before);
+            let inspection = LabClient::connect(&socket).await.unwrap();
+            assert!(inspection.send(LabRequest::Ping {}).await.is_ok());
+
+            let other = root.join("other");
+            std::fs::create_dir(&other).unwrap();
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: name.into(),
+                    root: other.clone(),
+                    pid: std::process::id(),
+                    state: super::registry::LabState::Running,
+                })
+                .unwrap();
+            let conflict = supervisor.ensure_lab(name, root.clone()).await.unwrap_err();
+            assert!(conflict.message.contains("already registered from"), "{conflict}");
+            assert!(conflict.message.contains(&other.display().to_string()), "{conflict}");
+            assert!(!conflict.message.contains("active template build"), "{conflict}");
+            supervisor.registry.lock().await.remove(name);
+        });
+    }
+
+    #[test]
+    #[ignore = "CLI subprocess for build_inspection_cli_helper"]
+    fn build_inspection_script_cli_helper() {
+        use clap::Parser;
+
+        if std::env::var_os(BUILD_INSPECTION_HELPER).is_none() {
+            return;
+        }
+        let cli = crate::cli::Cli::parse_from(["vmlab", "script", "probe.ws"]);
+        let exit = crate::cli::run_parsed(cli);
+        assert_eq!(
+            exit,
+            std::process::ExitCode::from(crate::proto::ErrorCode::Conflict.exit_code())
+        );
+    }
 
     #[test]
     fn an_exited_child_is_not_running_before_it_is_reaped() {

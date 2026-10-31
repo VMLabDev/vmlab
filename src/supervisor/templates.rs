@@ -87,6 +87,17 @@ impl TemplateOps {
         })
     }
 
+    /// Reserve a build's synthetic lab for its full lifetime, including
+    /// preparation and verification when no display is advertised yet.
+    pub(super) fn owns_build_lab(&self, name: &str) -> bool {
+        self.inner
+            .lock_recover()
+            .iter()
+            .any(|((_, arch, template), op)| {
+                op.kind == "build" && crate::template::build::build_lab_name(arch, template) == name
+            })
+    }
+
     fn append_log(&self, lab: &str, arch: &str, template: &str, line: &str) {
         let mut ops = self.inner.lock_recover();
         if let Some(op) = ops.get_mut(&(lab.to_string(), arch.to_string(), template.to_string())) {
@@ -519,6 +530,45 @@ pub(super) fn op_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_reserves_its_lab_before_and_after_display_announcements() {
+        let ops = TemplateOps::default();
+        let guard = ops.try_begin("source", "x86", "base", "build").unwrap();
+        assert!(ops.owns_build_lab("build-x86-base"));
+        assert!(!ops.owns_build_lab("build-x86_64-base"));
+        assert!(!ops.owns_build_lab("build-x86-other"));
+
+        ops.set_machine("source", "x86", "base", Some("build-x86-base/build".into()));
+        assert!(ops.owns_build_lab("build-x86-base"));
+        ops.set_machine("source", "x86", "base", None);
+        assert!(ops.owns_build_lab("build-x86-base"));
+        ops.set_variant("source", "x86", "base", "desktop");
+        assert!(ops.owns_build_lab("build-x86-base"));
+        assert!(!ops.owns_build_lab("build-x86-base-desktop"));
+
+        drop(guard);
+        assert!(!ops.owns_build_lab("build-x86-base"));
+    }
+
+    #[test]
+    fn a_push_does_not_reserve_a_build_lab() {
+        let ops = TemplateOps::default();
+        let _push = ops.try_begin("source", "x86", "base", "push").unwrap();
+        assert!(!ops.owns_build_lab("build-x86-base"));
+    }
+
+    #[test]
+    fn concurrent_architectures_reserve_separate_build_labs() {
+        let ops = TemplateOps::default();
+        let x86 = ops.try_begin("source", "x86", "base", "build").unwrap();
+        let _x64 = ops.try_begin("source", "x86_64", "base", "build").unwrap();
+        assert!(ops.owns_build_lab("build-x86-base"));
+        assert!(ops.owns_build_lab("build-x86_64-base"));
+        drop(x86);
+        assert!(!ops.owns_build_lab("build-x86-base"));
+        assert!(ops.owns_build_lab("build-x86_64-base"));
+    }
 
     /// A build is filed under the lab it was started from, and a stop asks
     /// with the lab the operator is standing in. Those differ routinely — the

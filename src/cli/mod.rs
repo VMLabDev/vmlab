@@ -702,7 +702,11 @@ pub struct As {
 }
 
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    run_parsed(Cli::parse())
+}
+
+/// Execute a parsed command with the CLI's diagnostics and exit mapping.
+pub(crate) fn run_parsed(cli: Cli) -> ExitCode {
     if let Some(instance) = cli.instance.clone() {
         crate::instance::set_flag(instance);
     }

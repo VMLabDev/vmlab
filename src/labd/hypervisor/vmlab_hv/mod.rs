@@ -99,6 +99,7 @@ impl describe::HostRoms {
             seabios: find(&["bios-256k.bin"]),
             vgabios_std: find(&["vgabios-stdvga.bin"]),
             vgabios_virtio: find(&["vgabios-virtio.bin"]),
+            vgabios_cirrus: find(&["vgabios-cirrus.bin"]),
             // vmlab-hv's own iPXE build, never QEMU's (HV phase-2 D14, D16).
             ipxe_virtio: find(&["1af41000.rom"]),
             ipxe_virtio_efi: find(&["virtio-net.rom", "1af41000.efirom"]),
@@ -175,13 +176,23 @@ impl Hypervisor for VmlabHv {
                 paths,
                 accel,
                 ..
-            } => describe::vm(
-                lab,
-                resolved,
-                paths,
-                *accel,
-                &describe::HostRoms::probe(self.firmware_dir.as_deref()),
-            )?,
+            } => {
+                let refusals = crate::config::hypervisor::vmlab_vm_launch_refusals(
+                    resolved,
+                    !paths.nics.is_empty(),
+                    paths.floppy.is_some(),
+                );
+                if !refusals.is_empty() {
+                    bail!("{}", refusals.join("\n"));
+                }
+                describe::vm(
+                    lab,
+                    resolved,
+                    paths,
+                    *accel,
+                    &describe::HostRoms::probe(self.firmware_dir.as_deref()),
+                )?
+            }
         };
         let control_sock = &spec.control_sock;
         let machine = machine_file(control_sock);
