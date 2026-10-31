@@ -1,0 +1,25 @@
+import <vmlab.wcl>
+
+lab "e2e-legacy" {
+  segment "lan" { subnet = "10.84.0.0/24" }
+
+  vm "freedos" {
+    template = "x86/freedos-1.3@1.3.0"
+    agent_update = false
+    nic { segment = "lan" }
+  }
+  vm "win98" {
+    template = "x86/windows-98-se@4.10.2222.5"
+    agent_update = false
+    nic { segment = "lan" }
+  }
+  vm "win7" {
+    template = "x86_64/windows-7@7600.0.1"
+    agent_update = false
+    nic { segment = "lan" }
+  }
+  vm "temple" {
+    template = "x86_64/templeos@5.03.2"
+    agent_update = false
+  }
+}

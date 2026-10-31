@@ -49,3 +49,35 @@ On `vmlab`, a feature past the delivered phase (`VMLAB_DELIVERED`, or `--vmlab-p
 To cover a new feature, add it to `features.py` and tag its phase, then report it from a scenario with `h.ok`, `h.check` or `h.skip`. `features.py` refuses to load while a feature has no tag. `harness.py` documents the API.
 
 Keep labs small: 1 CPU, 512 MiB to 1 GiB of memory, and the e2e template or small container images. `vmlab up` returns once machines have started, before they are ready. Call `h.wait_ready` before talking to a guest.
+
+## Legacy PC gate
+
+The `legacy` scenario boots FreeDOS 1.3, Windows 98 SE, Windows 7 7600.0.1 and
+TempleOS sequentially. It checks agent readiness, exec, a disk write/read,
+a PNG screenshot and emulator exit status zero after `vm stop`. Windows 98
+may reach the emulator-quit rung after ignoring guest shutdown. That is a
+flushed emulator exit, not proof that Windows shut itself down.
+
+The scenario uses these installed templates and disables automatic agent
+refresh:
+
+```text
+x86/freedos-1.3@1.3.0
+x86/windows-98-se@4.10.2222.5
+x86_64/windows-7@7600.0.1
+x86_64/templeos@5.03.2
+```
+
+If a template is missing, the scenario skips with the missing reference.
+`VMLAB_E2E_LEGACY_STORE` can name a populated source store. The scenario copies
+only its four template versions into the run's store, using sparse files and
+reflinks where available. In a container, mount that source read-only and set
+the variable to its container path. Give the e2e container a 64 GiB limit.
+`--only legacy` does not build the unrelated Alpine base template.
+
+Before each boot, the scenario waits until fewer than two project VMs run on
+the host, excluding `qemu-system-* -avd` Android emulators. Containers need
+`--pid=host` for that count. On a shared development host, run the VM-owning
+processes inside `systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0`.
+The four `vm.legacy.*` features remain tagged phase 4 and skip on vmlab-hv
+until that phase is delivered.

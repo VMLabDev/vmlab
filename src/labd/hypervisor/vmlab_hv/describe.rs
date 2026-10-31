@@ -8,7 +8,7 @@
 //! mirrors [`crate::qemu::container::build_container_args`], device for
 //! device. A VM's guest is a template built under QEMU, which has to find the
 //! same hardware at the same addresses (HV-D30), so [`vm`] places every PCI
-//! device in the slot QEMU's q35 gives the argv [`crate::qemu::build_args`]
+//! device in the slot QEMU's q35 or pc gives the argv [`crate::qemu::build_args`]
 //! composes for the same machine.
 
 use std::path::{Path, PathBuf};
@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Audio, AudioDevice, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
-    DisplayDevice, FirmwareKind, FsShare, GpuMode, HyperV, Machine, Nic, NicAttachment, PciAddress,
-    SerialPort, Tpm, VfioDevice,
+    Accel, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
+    DisplayDevice, FirmwareKind, FsShare, GpuMode, HyperV, Machine, Nic, NicAttachment, NicModel,
+    PciAddress, SerialPort, SerialTransport, Tpm, VfioDevice,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -46,6 +46,8 @@ pub(crate) struct HostRoms {
     pub vgabios_std: Option<PathBuf>,
     /// SeaVGABIOS for virtio-vga (`vgabios-virtio.bin`).
     pub vgabios_virtio: Option<PathBuf>,
+    /// SeaVGABIOS for the legacy Cirrus adapter.
+    pub vgabios_cirrus: Option<PathBuf>,
     /// vmlab-hv's reproducible iPXE build for `1af4:1000` (HV phase-2 D16).
     /// Absent leaves the NICs without an option ROM — no network boot, which
     /// a disk-booting template never asks for.
@@ -60,6 +62,7 @@ pub(crate) struct HostRoms {
 fn rtc_base(kind: &str, name: &str, base: &Option<String>) -> Result<Option<String>> {
     match base {
         None => Ok(None),
+        Some(base) if base == "localtime" => Ok(Some(base.clone())),
         Some(base) => match chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%dT%H:%M:%S") {
             Ok(at) => Ok(Some(
                 at.and_utc()
@@ -91,6 +94,8 @@ pub(crate) fn container(
         pci: None,
         bus: DiskBus::Virtio,
         port: None,
+        channel: None,
+        unit: None,
         cdrom: false,
         id: id.into(),
         path: Some(path.to_path_buf()),
@@ -103,6 +108,7 @@ pub(crate) fn container(
         exit_on_reset: false,
         machine: Machine::Microvm,
         cpu: CpuPolicy::Host,
+        cpu_model: None,
         hyperv: Vec::new(),
         display: None,
         tablet: None,
@@ -136,6 +142,7 @@ pub(crate) fn container(
             .nics
             .iter()
             .map(|(mac, socket, mtu)| Nic {
+                model: NicModel::Virtio,
                 rom: None,
                 pci: None,
                 mac: mac.to_string(),
@@ -146,12 +153,15 @@ pub(crate) fn container(
             })
             .collect(),
         serial_log: paths.serial_log.clone(),
+        serial_log_port: ComPort::Com1,
         ports: vec![
             SerialPort {
+                transport: SerialTransport::Virtio,
                 name: "vmlab.ctl.0".into(),
                 socket: paths.ctl_sock.clone(),
             },
             SerialPort {
+                transport: SerialTransport::Virtio,
                 name: vmlab_agent_proto::PORT_NAME.into(),
                 socket: paths.agent_sock.clone(),
             },
@@ -174,6 +184,7 @@ pub(crate) fn container(
         vfio: Vec::new(),
         usb: None,
         rtc_base,
+        floppy: None,
     })
 }
 
@@ -245,11 +256,20 @@ fn ahci_boot_path(port: u8) -> String {
     )
 }
 
+/// The PIIX3 IDE function at 00:01.1, with two units per channel.
+fn ide_boot_path(slot: u8) -> String {
+    format!(
+        "/pci@i0cf8/ide@1,1/drive@{:x}/disk@{:x}",
+        slot / 2,
+        slot % 2
+    )
+}
+
 /// The enlightenments a `hyperv` VM gets: QEMU's [`crate::qemu::cmdline::HYPERV_FLAGS`],
 /// name for name, and `avic` with them where the host virtualises the APIC,
 /// as the QEMU path adds [`crate::qemu::cmdline::HYPERV_APICV_FLAG`].
 fn hyperv_list(resolved: &ResolvedVm, apic_virtualization: bool) -> Result<Vec<HyperV>> {
-    if !resolved.hyperv {
+    if !resolved.hyperv || resolved.cpu_model.is_some() {
         return Ok(Vec::new());
     }
     let mut flags: Vec<&str> = crate::qemu::cmdline::HYPERV_FLAGS.split(',').collect();
@@ -268,8 +288,8 @@ fn hyperv_list(resolved: &ResolvedVm, apic_virtualization: bool) -> Result<Vec<H
         .collect()
 }
 
-/// The machine description for one VM: q35 on SeaBIOS or OVMF, as QEMU runs
-/// the same resolved machine (§22, phases 2a to 2c). Refuses whatever
+/// The machine description for one VM: q35 or pc on SeaBIOS or OVMF, as QEMU
+/// runs the same resolved machine (§22, phases 2 and 4). Refuses whatever
 /// validation refuses too, as the last word before a spawn, and what only the
 /// launch knows — a tap NIC, a host without its firmware.
 pub(crate) fn vm(
@@ -289,9 +309,10 @@ pub(crate) fn vm(
     if accel != crate::qemu::Accel::Kvm {
         bail!("vm \"{name}\": vmlab-hv runs under KVM only, and KVM is not usable here (PRD §22)");
     }
-    if !resolved.machine.starts_with("q35") {
+    let pc = resolved.machine == "pc" || resolved.machine.starts_with("pc-i440fx");
+    if !pc && !resolved.machine.starts_with("q35") {
         bail!(
-            "vm \"{name}\": vmlab-hv runs the q35 machine only so far, and this is `{}` (PRD §22)",
+            "vm \"{name}\": vmlab-hv describes q35 and pc machines, and this is `{}` (PRD §22)",
             resolved.machine
         );
     }
@@ -300,6 +321,7 @@ pub(crate) fn vm(
         // QEMU's q35 adds a std VGA of its own where nothing names one.
         None | Some("VGA") => DisplayDevice::StdVga,
         Some("virtio-vga") => DisplayDevice::VirtioVga,
+        Some("cirrus-vga") if pc => DisplayDevice::CirrusVga,
         Some(other) => {
             bail!(
                 "vm \"{name}\": vmlab-hv presents std VGA and virtio-vga only, not `{other}` (PRD §22)"
@@ -353,7 +375,8 @@ pub(crate) fn vm(
         _ => None,
     };
 
-    let mut slots = Slots(1);
+    // pc reserves slot 1 for the PIIX functions; q35 starts at slot 1.
+    let mut slots = Slots(if pc { 2 } else { 1 });
     // The default VGA is created with the machine, ahead of every `-device`
     // — unless the GL adapter, a VGA device itself, stands in for it.
     let default_vga =
@@ -362,8 +385,13 @@ pub(crate) fn vm(
     // The agent's virtio-serial controller is the first `-device`.
     let agent = resolved.agent_transport == AgentTransport::VirtioSerial;
     let console_pci = agent.then(|| slots.next());
-    let ports = if agent {
+    let ports = if resolved.agent_transport.has_channel() {
         vec![SerialPort {
+            transport: if agent {
+                SerialTransport::Virtio
+            } else {
+                SerialTransport::Com1
+            },
             name: vmlab_agent_proto::PORT_NAME.into(),
             socket: paths.agent_sock.clone(),
         }]
@@ -372,12 +400,12 @@ pub(crate) fn vm(
     };
 
     // Disks: disk0 (the primary) then the extras, each `bootindex` 50+i;
-    // AHCI disks take the ports from 0, and the CD-ROMs carry on after them.
+    // IDE/AHCI disks take slots from 0, and the CD-ROMs carry on after them.
     let mut disks = Vec::new();
     let mut boot: Vec<(usize, String)> = Vec::new();
     let all_disks = std::iter::once(paths.primary_disk.as_path())
         .chain(paths.extra_disks.iter().map(|(_, p)| p.as_path()));
-    let mut ahci_ports = 0u8;
+    let mut storage_slots = 0u8;
     for (i, path) in all_disks.enumerate() {
         let (pci, bus, port, at) = match resolved.disk_bus {
             crate::profiles::DiskBus::Virtio => {
@@ -387,9 +415,13 @@ pub(crate) fn vm(
             // On q35 an `ide-hd` sits on an AHCI port, whichever the profile
             // calls it.
             crate::profiles::DiskBus::Ide | crate::profiles::DiskBus::Sata => {
-                let port = ahci_ports;
-                ahci_ports += 1;
-                (None, DiskBus::Ahci, Some(port), ahci_boot_path(port))
+                let port = storage_slots;
+                storage_slots += 1;
+                if pc {
+                    (None, DiskBus::Ide, None, ide_boot_path(port))
+                } else {
+                    (None, DiskBus::Ahci, Some(port), ahci_boot_path(port))
+                }
             }
         };
         boot.push((50 + i, at));
@@ -397,6 +429,8 @@ pub(crate) fn vm(
         // QEMU, so a snapshot's disks are named alike on either.
         let id = format!("disk{i}");
         disks.push(Disk {
+            channel: (bus == DiskBus::Ide).then(|| (storage_slots - 1) / 2),
+            unit: (bus == DiskBus::Ide).then(|| (storage_slots - 1) % 2),
             pci,
             bus,
             port,
@@ -409,13 +443,22 @@ pub(crate) fn vm(
         });
     }
     for (i, iso) in paths.cdroms.iter().enumerate() {
-        let port = ahci_ports;
-        ahci_ports += 1;
-        boot.push((i, ahci_boot_path(port)));
+        let port = storage_slots;
+        storage_slots += 1;
+        boot.push((
+            i,
+            if pc {
+                ide_boot_path(port)
+            } else {
+                ahci_boot_path(port)
+            },
+        ));
         disks.push(Disk {
+            channel: pc.then_some(port / 2),
+            unit: pc.then_some(port % 2),
             pci: None,
-            bus: DiskBus::Ahci,
-            port: Some(port),
+            bus: if pc { DiskBus::Ide } else { DiskBus::Ahci },
+            port: (!pc).then_some(port),
             cdrom: true,
             id: format!("cd{i}"),
             path: Some(iso.clone()),
@@ -424,31 +467,44 @@ pub(crate) fn vm(
             vmstate: false,
         });
     }
-    if ahci_ports > 6 {
-        bail!("vm \"{name}\": q35's AHCI controller has six ports, and this VM needs {ahci_ports}");
+    if storage_slots > if pc { 4 } else { 6 } {
+        bail!(
+            "vm \"{name}\": {} has {} storage slots, and this VM needs {storage_slots}",
+            if pc { "pc IDE" } else { "q35 AHCI" },
+            if pc { 4 } else { 6 }
+        );
     }
-    if paths.floppy.is_some() {
-        bail!("vm \"{name}\": vmlab-hv has no floppy drive until phase 4 (PRD §22)");
+    if !pc && paths.floppy.is_some() {
+        bail!("vm \"{name}\": vmlab-hv supports a floppy drive only on pc (PRD §22)");
     }
     // SeaBIOS tries them in `bootindex` order: install media, then disks.
     boot.sort_by_key(|(index, _)| *index);
 
     let mut nics = Vec::new();
     for nic in &paths.nics {
+        let model = match resolved.nic_model.as_str() {
+            "virtio-net-pci" => NicModel::Virtio,
+            "e1000" if pc => NicModel::E1000,
+            "pcnet" if pc => NicModel::Pcnet,
+            other => bail!("vm \"{name}\": vmlab-hv cannot describe NIC model `{other}`"),
+        };
         let NicBackend::Stream { sock } = &nic.backend else {
             bail!(
                 "vm \"{name}\": vmlab-hv attaches NICs by stream socket only, not a tap descriptor"
             );
         };
         nics.push(Nic {
-            rom: if ovmf {
+            model,
+            rom: if model != NicModel::Virtio {
+                None
+            } else if ovmf {
                 roms.ipxe_virtio_efi.clone()
             } else {
                 roms.ipxe_virtio.clone()
             },
             pci: Some(slots.next()),
             mac: nic.mac.to_string(),
-            mtu: nic.mtu.filter(|m| *m != 1500),
+            mtu: nic.mtu.filter(|m| *m != 1500 && model == NicModel::Virtio),
             attachment: NicAttachment::Stream {
                 socket: sock.clone(),
             },
@@ -474,13 +530,26 @@ pub(crate) fn vm(
     let rom = match display_device {
         DisplayDevice::StdVga => roms.vgabios_std.clone(),
         DisplayDevice::VirtioVga => roms.vgabios_virtio.clone(),
+        DisplayDevice::CirrusVga => roms.vgabios_cirrus.clone(),
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
     // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead. Under
     // `usb = true` it is also the passthrough controller, `usbx`, which
     // QEMU adds in the same place and hangs the tablet on too.
-    let tablet = Some(slots.next());
-    let usb = tablet.filter(|_| resolved.usb);
+    let tablet = Some(if pc {
+        PciAddress {
+            bus: 0,
+            device: 1,
+            function: 2,
+        }
+    } else {
+        slots.next()
+    });
+    let usb = if pc {
+        resolved.usb.then(|| slots.next())
+    } else {
+        tablet.filter(|_| resolved.usb)
+    };
 
     // virtio-fs shares last, as the argv's `vhost-user-fs-pci` devices, but
     // served by vmlab-hv's own device on the host directory: no virtiofsd.
@@ -503,7 +572,8 @@ pub(crate) fn vm(
         // A guest reset happens in place, as under QEMU: the process, its
         // sockets and every connection to them stay (PRD §22).
         exit_on_reset: false,
-        machine: Machine::Q35,
+        machine: if pc { Machine::Pc } else { Machine::Q35 },
+        cpu_model: resolved.cpu_model.clone(),
         cpu: if resolved.nested {
             CpuPolicy::Nested
         } else {
@@ -525,7 +595,7 @@ pub(crate) fn vm(
         // The swtpm vmlab started before the spawn, as QEMU's `tpm-tis`.
         tpm: paths.tpm_sock.clone().map(|socket| Tpm { socket }),
         console_pci,
-        ahci_pci: Some(AHCI),
+        ahci_pci: (!pc).then_some(AHCI),
         name: format!("vmlab:{lab}/{name}"),
         arch: Arch::X86_64,
         accel: Accel::Kvm,
@@ -547,12 +617,18 @@ pub(crate) fn vm(
         disks,
         nics,
         serial_log: serial_log.clone(),
+        serial_log_port: if resolved.agent_transport == AgentTransport::IsaSerial {
+            ComPort::Com2
+        } else {
+            ComPort::Com1
+        },
         ports,
         shares,
         audio: audio(lab, resolved),
         vfio,
         usb,
         rtc_base: rtc_base("vm", name, &resolved.rtc_base)?,
+        floppy: paths.floppy.clone(),
     })
 }
 
@@ -706,6 +782,7 @@ mod tests {
             seabios: Some("/usr/share/qemu/bios-256k.bin".into()),
             vgabios_std: Some("/usr/share/qemu/vgabios-stdvga.bin".into()),
             vgabios_virtio: Some("/usr/share/qemu/vgabios-virtio.bin".into()),
+            vgabios_cirrus: Some("/usr/share/qemu/vgabios-cirrus.bin".into()),
             ipxe_virtio: Some("/fw/x86_64/1af41000.rom".into()),
             ipxe_virtio_efi: Some("/fw/x86_64/virtio-net.rom".into()),
         }
@@ -737,6 +814,9 @@ mod tests {
             "linux-modern",
             "linux-generic",
             "windows-legacy",
+            "windows-xp",
+            "windows-9x",
+            "templeos",
             "windows-10",
             "windows-11",
         ]
@@ -980,8 +1060,6 @@ mod tests {
         let mut tap = vm_paths();
         tap.nics[0].backend = NicBackend::Tap { child_fd: 10 };
         assert!(refused(&ok, &tap, QemuAccel::Kvm, &roms()).contains("tap"));
-        let legacy = resolved_vm("windows-legacy", "x86_64");
-        assert!(refused(&legacy, &vm_paths(), QemuAccel::Kvm, &roms()).contains("q35"));
         let qxl = declared(
             r#"profile = "linux-modern" firmware = "seabios" display = "qxl""#,
             None,
@@ -1325,5 +1403,195 @@ mod tests {
             serde_json::from_str::<MachineDescription>(&json).unwrap(),
             d
         );
+    }
+
+    fn legacy_matches_qemu(profile: &str, model: NicModel, display: DisplayDevice) {
+        let r = declared(&format!("profile = \"{profile}\""), None);
+        let mut paths = vm_paths();
+        paths
+            .extra_disks
+            .push(("data".into(), "/data.qcow2".into()));
+        paths.cdroms = vec!["/install.iso".into(), "/bootstrap.iso".into()];
+        paths.floppy = Some("/answer.img".into());
+        if profile == "templeos" {
+            paths.nics.clear();
+        }
+        let args = crate::qemu::build_args("l", &r, &paths, QemuAccel::Kvm).unwrap();
+        let values = |flag: &str| -> Vec<&str> {
+            args.windows(2)
+                .filter(|a| a[0] == flag)
+                .map(|a| a[1].as_str())
+                .collect()
+        };
+        let devices = values("-device");
+        let d = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(values("-machine"), ["pc"]);
+        assert_eq!(d.machine, Machine::Pc);
+        assert_eq!(d.ahci_pci, None);
+        assert_eq!(
+            d.tablet,
+            Some(PciAddress {
+                bus: 0,
+                device: 1,
+                function: 2
+            })
+        );
+        assert!(args.iter().any(|a| a == "-usb") && devices.contains(&"usb-tablet"));
+        assert_eq!(d.disks.len(), 4);
+        for (i, disk) in d.disks.iter().enumerate() {
+            let (channel, unit) = ((i / 2) as u8, (i % 2) as u8);
+            assert_eq!(
+                (disk.bus, disk.port, disk.channel, disk.unit),
+                (DiskBus::Ide, None, Some(channel), Some(unit))
+            );
+            let dev = if disk.cdrom { "ide-cd" } else { "ide-hd" };
+            let index = if disk.cdrom { i - 2 } else { 50 + i };
+            assert!(
+                devices.contains(
+                    &format!(
+                        "{dev},drive={},bus=ide.{channel},unit={unit},bootindex={index}",
+                        disk.id
+                    )
+                    .as_str()
+                ),
+                "{args:?}"
+            );
+        }
+        let Boot::Firmware { bootorder, .. } = &d.boot else {
+            panic!("pc boots firmware")
+        };
+        assert_eq!(
+            bootorder,
+            &[
+                "/pci@i0cf8/ide@1,1/drive@1/disk@0",
+                "/pci@i0cf8/ide@1,1/drive@1/disk@1",
+                "/pci@i0cf8/ide@1,1/drive@0/disk@0",
+                "/pci@i0cf8/ide@1,1/drive@0/disk@1",
+            ]
+        );
+        assert_eq!(d.floppy, paths.floppy);
+        assert_eq!(values("-drive"), ["if=floppy,format=raw,file=/answer.img"]);
+        assert!(!bootorder.iter().any(|p| p.contains("floppy")));
+        assert_eq!(d.display.as_ref().unwrap().device, display);
+        assert!(devices.contains(&r.display_device.as_deref().unwrap()));
+        let serial = r.agent_transport == AgentTransport::IsaSerial;
+        assert_eq!(
+            d.ports[0].transport,
+            if serial {
+                SerialTransport::Com1
+            } else {
+                SerialTransport::Virtio
+            }
+        );
+        assert_eq!(
+            d.serial_log_port,
+            if serial { ComPort::Com2 } else { ComPort::Com1 }
+        );
+        assert_eq!(d.console_pci, (!serial).then(|| at(2).unwrap()));
+        assert_eq!(d.ports[0].socket, paths.agent_sock);
+        if serial {
+            assert!(devices.contains(&"isa-serial,chardev=vagent0,index=0"));
+            assert!(devices.contains(&"isa-serial,chardev=serlog,index=1"));
+        } else {
+            assert!(devices.contains(&"virtio-serial-pci"));
+            assert_eq!(values("-serial"), ["file:/logs/l/v/serial.log"]);
+        }
+        assert_eq!(d.rtc_base, r.rtc_base);
+        if let Some(base) = &d.rtc_base {
+            assert_eq!(values("-rtc"), [format!("base={base}")]);
+        }
+        if profile != "templeos" {
+            assert_eq!(d.nics[0].model, model);
+            assert_eq!(d.nics[0].pci, at(if serial { 2 } else { 3 }));
+            assert!(
+                devices.contains(
+                    &format!("{},netdev=net0,mac=52:54:00:00:00:01", r.nic_model).as_str()
+                )
+            );
+        } else {
+            assert!(d.nics.is_empty());
+        }
+        let cpu = values("-cpu")[0];
+        assert_eq!(!d.hyperv.is_empty(), cpu.contains("hv-relaxed"));
+        assert_eq!(
+            d.display.as_ref().unwrap().pci,
+            at(if profile == "templeos" {
+                2
+            } else if serial {
+                3
+            } else {
+                4
+            })
+            .unwrap()
+        );
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MachineDescription>(&json).unwrap(),
+            d
+        );
+    }
+
+    #[test]
+    fn windows_legacy_matches_the_qemu_argv() {
+        legacy_matches_qemu("windows-legacy", NicModel::E1000, DisplayDevice::StdVga);
+    }
+
+    #[test]
+    fn windows_xp_matches_the_qemu_argv() {
+        legacy_matches_qemu("windows-xp", NicModel::E1000, DisplayDevice::StdVga);
+    }
+
+    #[test]
+    fn windows_9x_matches_the_qemu_argv() {
+        legacy_matches_qemu("windows-9x", NicModel::Pcnet, DisplayDevice::CirrusVga);
+    }
+
+    #[test]
+    fn templeos_matches_the_qemu_argv() {
+        legacy_matches_qemu("templeos", NicModel::E1000, DisplayDevice::StdVga);
+    }
+
+    #[test]
+    fn a_named_pc_cpu_suppresses_hyperv_as_under_qemu() {
+        let r = declared(
+            r#"profile = "windows-legacy" cpu_model = "pentium3" hyperv = true"#,
+            None,
+        );
+        let p = vm_paths();
+        let args = crate::qemu::build_args("l", &r, &p, QemuAccel::Kvm).unwrap();
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(d.cpu_model.as_deref(), Some("pentium3"));
+        assert!(args.windows(2).any(|a| a == ["-cpu", "pentium3"]));
+        assert!(d.hyperv.is_empty());
+    }
+
+    #[test]
+    fn pc_ide_has_four_slots_and_virtio_disks_leave_them_for_cds() {
+        let r = declared(r#"profile = "templeos""#, None);
+        let mut p = vm_paths();
+        p.cdroms = vec![
+            "/1.iso".into(),
+            "/2.iso".into(),
+            "/3.iso".into(),
+            "/4.iso".into(),
+        ];
+        assert!(
+            vm("l", &r, &p, QemuAccel::Kvm, &roms())
+                .unwrap_err()
+                .to_string()
+                .contains("4 storage slots")
+        );
+        let mut profile = crate::profiles::ProfileSet::shipped()
+            .unwrap()
+            .get("templeos")
+            .unwrap()
+            .clone();
+        profile.name = "temple-virtio".into();
+        profile.disk_bus = Some(crate::profiles::DiskBus::Virtio);
+        let r = declared(r#"profile = "temple-virtio""#, Some(profile));
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(d.disks[0].bus, DiskBus::Virtio);
+        assert_eq!((d.disks[1].channel, d.disks[1].unit), (Some(0), Some(0)));
+        assert_eq!((d.disks[4].channel, d.disks[4].unit), (Some(1), Some(1)));
     }
 }

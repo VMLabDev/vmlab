@@ -481,7 +481,7 @@ async fn build_variant(
         None
     };
 
-    let lab_name = build_lab_name(def);
+    let lab_name = build_lab_name(&def.arch, &def.name);
     // No bootstrap ISO: the base already carries the agent it was sealed
     // with, and the staged copy is only what its handshake is checked
     // against.
@@ -970,7 +970,7 @@ async fn run_build(
     };
 
     // Synthesize a one-VM scratch lab for the build.
-    let lab_name = build_lab_name(def);
+    let lab_name = build_lab_name(&def.arch, &def.name);
     let lab_wcl = synth_lab(
         def,
         &hw,
@@ -1381,8 +1381,8 @@ async fn resolve_artefact(src: &ArtefactSource, root: &Path, log: &OutputSink) -
 /// agent and VNC sockets — the second QEMU to start rebinds them and the
 /// first build loses its control channel and hangs out its budget. Their
 /// disks were always separate; only this name collided (2026-09-03).
-fn build_lab_name(def: &TemplateDef) -> String {
-    format!("build-{}-{}", def.arch, def.name)
+pub(crate) fn build_lab_name(arch: &str, name: &str) -> String {
+    format!("build-{arch}-{name}")
 }
 
 /// Effective build hardware: what a build boots on and seals, the template
@@ -1715,7 +1715,7 @@ fn check_spec_hardware(
     // attachments (extra disks, media, steps), and none of them can change the
     // hardware this resolves. Its own source label, so an issue reported
     // against the render names the render that produced it.
-    let lab_name = build_lab_name(def);
+    let lab_name = build_lab_name(&def.arch, &def.name);
     let wcl = synth_spec_lab(spec, hw, &lab_name, build_vm, root, BuildBoot::Bare)?;
     let labfile = crate::config::load_lab_source(&wcl, "<preflight>", root)
         .map_err(|e| anyhow::anyhow!("internal build lab invalid: {e:?}"))?;
@@ -2235,9 +2235,18 @@ mod tests {
         let x86 = def(r#"import <vmlab.wcl>
                template "windows-vista" { arch = "x86" version = "1" profile = "windows-legacy"
                  disk = 40GiB source "iso" { path = "/i.iso" } }"#);
-        assert_eq!(build_lab_name(&x64), "build-x86_64-windows-vista");
-        assert_eq!(build_lab_name(&x86), "build-x86-windows-vista");
-        assert_ne!(build_lab_name(&x64), build_lab_name(&x86));
+        assert_eq!(
+            build_lab_name(&x64.arch, &x64.name),
+            "build-x86_64-windows-vista"
+        );
+        assert_eq!(
+            build_lab_name(&x86.arch, &x86.name),
+            "build-x86-windows-vista"
+        );
+        assert_ne!(
+            build_lab_name(&x64.arch, &x64.name),
+            build_lab_name(&x86.arch, &x86.name)
+        );
     }
 
     #[test]
