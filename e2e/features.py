@@ -303,6 +303,10 @@ _GROUPS: dict[str, list[str]] = {
 # pass on QEMU says nothing about vmlab-hv (`Harness._record`).
 QEMU_SCENARIOS: dict[str, str] = {
     "core": "`core` proves it from QEMU's argv, and its lab declares `qemu_args` and floppies",
+    "containers": "the `containers` lab's VM declares virtiofs shares (phase 2e)",
+    "admin": "the `admin` lab declares an emulated aarch64 VM (phase 3)",
+    "unsupported": "the `unsupported` labs declare `usb = true` and a `gpu {}` (phases 2f, 2d), "
+    "and its fast-path check reads QEMU's tap netdevs",
 }
 
 # Features only QEMU can ever run, and why; skipped on every other hypervisor.
