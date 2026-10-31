@@ -33,11 +33,29 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       ./guest/build-agent.sh linux-x86_64; \
     mkdir -p /out/guest; \
     cp -r --sparse=always guest/dist/x86_64 guest/dist/agent guest/dist/firmware /out/guest/
+# virglrenderer 1.3.0, which vmlab-hv's virtio-gpu builds against (phase 2d)
+# and trixie does not ship (1.1.0). Installed under /opt/virgl, apart from the
+# distro's: vmlab-hv finds it by rpath, and QEMU keeps trixie's.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends meson ninja-build pkg-config python3-yaml \
+      libepoxy-dev libdrm-dev libgbm-dev libegl-dev libvulkan-dev glslang-tools \
+ && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    curl -fsSL -o /tmp/virgl.tar.gz \
+      https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/1.3.0/virglrenderer-1.3.0.tar.gz; \
+    echo "065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3  /tmp/virgl.tar.gz" | sha256sum -c -; \
+    tar -C /tmp -xzf /tmp/virgl.tar.gz; \
+    meson setup /tmp/virgl-build /tmp/virglrenderer-1.3.0 --prefix=/opt/virgl --libdir=lib \
+      --buildtype=release -Dvenus=true -Dtests=false; \
+    ninja -C /tmp/virgl-build install; \
+    rm -rf /tmp/virgl.tar.gz /tmp/virglrenderer-1.3.0 /tmp/virgl-build
 # vmlab-hv (PRD §22) from the commit vmlab-hv-proto is locked to, so the
 # binary speaks exactly the protocol this vmlab was built against.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/hv/target \
     set -eux; \
+    export PKG_CONFIG_PATH=/opt/virgl/lib/pkgconfig \
+      RUSTFLAGS="-C link-arg=-Wl,-rpath,/opt/virgl/lib"; \
     rev=$(sed -n 's|^source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=[0-9a-f]*#\([0-9a-f]*\)"$|\1|p' Cargo.lock | head -n1); \
     test -n "$rev"; \
     [ -d /hv/.git ] || git init -q /hv; \
@@ -55,7 +73,7 @@ FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       qemu-system-x86 qemu-system-arm qemu-system-modules-opengl \
-      libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri libgbm1 libopengl0 \
+      libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri libgbm1 libopengl0 libepoxy0 libvulkan1 \
       qemu-utils \
       swtpm swtpm-tools virtiofsd \
       samba xorriso mtools dosfstools squashfs-tools tesseract-ocr ffmpeg \
@@ -74,6 +92,7 @@ RUN set -eux; \
 COPY --from=registry /bin/registry /usr/local/bin/registry
 COPY --from=build /out/vmlab /usr/local/bin/vmlab
 COPY --from=build /out/vmlab-hv /usr/local/bin/vmlab-hv
+COPY --from=build /opt/virgl /opt/virgl
 COPY --from=build /out/guest /usr/share/vmlab/guest
 # A second Linux agent with a different stamp, for the agent-refresh check.
 COPY --from=build /out/stale-agent /usr/share/vmlab/e2e/stale-agent
