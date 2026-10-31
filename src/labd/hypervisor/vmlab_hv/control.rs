@@ -13,6 +13,7 @@
 //! Kept apart from spawning so it can be driven by a fake server built on
 //! `vmlab_hv_proto::server::Server` — no hypervisor binary, no KVM.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,9 +22,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::watch;
 use vmlab_hv_proto::client::{Client, ClientError};
-use vmlab_hv_proto::control::{Capability, Command, Event, Outcome, RunState, ShutdownReason};
+use vmlab_hv_proto::control::{
+    Capability, Command, ErrorCode, Event, Outcome, RunState, ShutdownReason,
+};
 
-use super::super::{Control, Frames, Input, Process, Snapshots};
+use super::super::{Control, Frames, Hotplug, Input, Process, Snapshots};
 use super::display::HvDisplay;
 
 /// One running `vmlab-hv`, through its control socket.
@@ -39,6 +42,9 @@ pub(crate) struct HvControl {
     events_closed: watch::Receiver<bool>,
     /// The machine's display socket, for a machine launched with a display.
     display: Option<Arc<HvDisplay>>,
+    /// The ids of hot-plugged devices `device_deleted` has reported gone
+    /// since a detach last asked about them.
+    deleted: watch::Sender<BTreeSet<String>>,
 }
 
 impl HvControl {
@@ -65,11 +71,13 @@ impl HvControl {
         let guest_shutdown = Arc::new(AtomicBool::new(false));
         let guest_reset = Arc::new(AtomicBool::new(false));
         let asleep = watch::Sender::new(false);
+        let deleted = watch::Sender::new(BTreeSet::new());
         let (closed_tx, events_closed) = watch::channel(false);
         {
             let flag = guest_shutdown.clone();
             let reset = guest_reset.clone();
             let sleep = asleep.clone();
+            let gone = deleted.clone();
             std::thread::Builder::new()
                 .name("vmlab-hv-events".into())
                 .spawn(move || {
@@ -77,6 +85,11 @@ impl HvControl {
                     // Ends with the stream: the hypervisor exited, or a
                     // message it should never send.
                     while let Ok(Some(event)) = events.wait_event() {
+                        if let Event::DeviceDeleted { id } = &event {
+                            gone.send_modify(|ids| {
+                                ids.insert(id.clone());
+                            });
+                        }
                         observe(&event, &flag, &reset, &sleep);
                     }
                     closed_tx.send_replace(true);
@@ -91,6 +104,7 @@ impl HvControl {
             asleep,
             events_closed,
             display: None,
+            deleted,
         })
     }
 
@@ -139,17 +153,18 @@ fn observe(
         Event::Resumed => "RESUME",
         Event::Suspend => "SUSPEND",
         Event::Wakeup => "WAKEUP",
+        Event::DeviceDeleted { .. } => "DEVICE_DELETED",
     };
     if let Some(now) = super::super::sleep_transition(name) {
         asleep.send_if_modified(|was| std::mem::replace(was, now) != now);
     }
 }
 
-/// Send one command on the blocking pool and turn its outcome into a result.
-async fn call(client: &Arc<Mutex<Client>>, command: Command) -> Result<Option<RunState>> {
+/// Send one command on the blocking pool and return its outcome as sent.
+async fn send(client: &Arc<Mutex<Client>>, command: Command) -> Result<Outcome> {
     let client = client.clone();
     let what = command_name(&command);
-    let outcome = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let mut client = client.lock().unwrap_or_else(|p| p.into_inner());
         let outcome = client.call(command);
         // The event connection reads these; this one's copies go.
@@ -158,7 +173,17 @@ async fn call(client: &Arc<Mutex<Client>>, command: Command) -> Result<Option<Ru
     })
     .await
     .context("vmlab-hv control task")?
-    .map_err(|e| anyhow!(e).context(format!("vmlab-hv `{what}`")))?;
+    .map_err(|e| anyhow!(e).context(format!("vmlab-hv `{what}`")))
+}
+
+/// Send one command and turn its outcome into a result.
+async fn call(client: &Arc<Mutex<Client>>, command: Command) -> Result<Option<RunState>> {
+    let what = command_name(&command);
+    refused(&what, send(client, command).await?)
+}
+
+/// An outcome as a result, a refusal naming the command and its code.
+fn refused(what: &str, outcome: Outcome) -> Result<Option<RunState>> {
     match outcome {
         Outcome::Ok { status } => Ok(status),
         Outcome::Error { code, message } => Err(anyhow!(
@@ -254,8 +279,66 @@ impl Control for HvControl {
             .map(|d| d as Arc<dyn Frames>)
     }
 
-    // Hot-plug and media: no phase delivered yet has them, so the trait's
-    // `None` stands.
+    /// Host USB passthrough (phase 2f), on a machine launched with the
+    /// `usbx` controller.
+    fn hotplug(&self) -> Option<Arc<dyn Hotplug>> {
+        self.capabilities.contains(&Capability::Hotplug).then(|| {
+            Arc::new(HvHotplug {
+                commands: self.commands.clone(),
+                deleted: self.deleted.clone(),
+            }) as Arc<dyn Hotplug>
+        })
+    }
+
+    // Media: no phase delivered yet has it, so the trait's `None` stands.
+}
+
+/// The **hot-plug** capability as `device_add` and `device_del`, the
+/// latter confirmed by the `device_deleted` event once the device is back on
+/// the host — QEMU's `DEVICE_DELETED`, and waited for the same way.
+struct HvHotplug {
+    commands: Arc<Mutex<Client>>,
+    deleted: watch::Sender<BTreeSet<String>>,
+}
+
+#[async_trait::async_trait]
+impl Hotplug for HvHotplug {
+    /// The plan's arguments are QEMU's `usb-host` ones, which the protocol
+    /// carries field for field.
+    async fn attach_usb(&self, plan: &crate::usb::AttachPlan) -> Result<()> {
+        let mut command = plan.args.clone();
+        command["command"] = "device_add".into();
+        let command: Command = serde_json::from_value(command)
+            .context("the attach plan is not a vmlab-hv `device_add`")?;
+        call(&self.commands, command).await.map(drop)
+    }
+
+    async fn detach(&self, id: &str, wait: Duration) -> Result<()> {
+        // Forget an earlier unplug of the same id, so only this one counts.
+        self.deleted.send_modify(|ids| {
+            ids.remove(id);
+        });
+        let mut gone = self.deleted.subscribe();
+        let outcome = send(&self.commands, Command::DeviceDel { id: id.into() }).await?;
+        match outcome {
+            // vmlab-hv has already dropped it — unplugged, or never there.
+            Outcome::Error {
+                code: ErrorCode::DeviceNotFound,
+                ..
+            } => return Ok(()),
+            other => refused("device_del", other).map(drop)?,
+        }
+        tokio::time::timeout(wait, gone.wait_for(|ids| ids.contains(id)))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "vmlab-hv did not report `{id}` gone within {}s of `device_del`",
+                    wait.as_secs()
+                )
+            })?
+            .map_err(|_| anyhow!("vmlab-hv exited before reporting `{id}` gone"))?;
+        Ok(())
+    }
 }
 
 /// The **snapshots** capability as the protocol's commands. The hypervisor
@@ -594,6 +677,95 @@ mod tests {
         let mut control = HvControl::connect(&without.socket).await.unwrap();
         control.set_display(display.path.clone());
         assert!(control.frames().is_none() && control.input().is_none());
+    }
+
+    /// USB passthrough (phase 2f): an attach plan is `device_add` field for
+    /// field, a detach is `device_del` that returns once `device_deleted`
+    /// names the device — not on another device's — and a device vmlab-hv
+    /// no longer has is already detached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usb_attach_and_detach_ride_device_add_and_device_deleted() {
+        let hv = fake_hv(vec![Capability::Hotplug], |c| match c {
+            Command::DeviceDel { id } if id == "usbhost-gone" => Outcome::Error {
+                code: ErrorCode::DeviceNotFound,
+                message: "no device `usbhost-gone`".into(),
+            },
+            _ => Outcome::Ok { status: None },
+        });
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        let hotplug = control.hotplug().expect("advertised");
+        let plan = crate::usb::AttachPlan {
+            device: crate::usb::HostDevice {
+                port: "3-1.2".into(),
+                bus: 3,
+                devnum: 5,
+                vendor_id: "1234".into(),
+                product_id: "5678".into(),
+                manufacturer: None,
+                product: None,
+                serial: None,
+                speed: "480".into(),
+                class: 0,
+                interfaces: Vec::new(),
+            },
+            args: serde_json::json!({
+                "driver": "usb-host", "id": "usbhost-3-1.2", "bus": "usbx.0",
+                "hostbus": 3, "hostaddr": 5, "hostport": "1.2",
+            }),
+        };
+        hotplug.attach_usb(&plan).await.unwrap();
+        assert_eq!(
+            hv.seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Command::DeviceAdd {
+                id: "usbhost-3-1.2".into(),
+                driver: "usb-host".into(),
+                bus: Some("usbx.0".into()),
+                hostbus: 3,
+                hostaddr: 5,
+                hostport: "1.2".into(),
+            }
+        );
+
+        let detach = {
+            let hotplug = hotplug.clone();
+            tokio::spawn(async move {
+                hotplug
+                    .detach("usbhost-3-1.2", Duration::from_secs(5))
+                    .await
+            })
+        };
+        assert_eq!(
+            hv.seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Command::DeviceDel {
+                id: "usbhost-3-1.2".into()
+            }
+        );
+        (hv.events)(Event::DeviceDeleted {
+            id: "usbhost-other".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !detach.is_finished(),
+            "another device's event is not this one"
+        );
+        (hv.events)(Event::DeviceDeleted {
+            id: "usbhost-3-1.2".into(),
+        });
+        tokio::time::timeout(Duration::from_secs(5), detach)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        hotplug
+            .detach("usbhost-gone", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let err = hotplug
+            .detach("usbhost-slow", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("did not report"), "{err:#}");
     }
 
     /// A wake is vmlab-hv's `resume`, which takes a guest out of S3.

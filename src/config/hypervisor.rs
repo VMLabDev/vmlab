@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{AccelMode, Container, MachineCfg, Vm};
+use super::model::{AccelMode, Container, GpuMode, MachineCfg, Vm};
 use crate::qemu::ResolvedVm;
 
 /// A hypervisor a machine can run on.
@@ -90,11 +90,14 @@ const VMLAB_ARCH: &str = "x86_64";
 /// each naming the machine, the reason and the vmlab-hv phase that brings it
 /// (or what to do instead); empty when it can.
 ///
-/// Phase 1 runs container micro-VMs, and phases 2a to 2c a modern x86_64 VM:
+/// Phase 1 runs container micro-VMs, and phases 2a to 2f a modern x86_64 VM:
 /// under KVM, the q35 machine on SeaBIOS or OVMF (secure boot included), std
-/// VGA or a 2D virtio-vga, virtio or AHCI disks, AHCI CD-ROMs, virtio-net
-/// NICs, the USB tablet, a TPM and the Hyper-V enlightenments — Linux and
-/// Windows 10, 11 and Server. `hardware` is the VM's resolved hardware where the caller has
+/// VGA or virtio-vga — 2D, or accelerated by a host GPU under `virgl` and
+/// `vulkan` — or a host GPU passed through, virtio or AHCI disks, AHCI
+/// CD-ROMs, virtio-net NICs, the USB tablet and `usb = true`'s hot-plug
+/// xHCI, a TPM, the Hyper-V enlightenments, virtio-fs shares served in
+/// process and an HDA sound card — Linux and Windows 10, 11 and Server.
+/// `hardware` is the VM's resolved hardware where the caller has
 /// it — the lab daemon always does; validation does when the template is in
 /// the store — because most of what decides a VM (its firmware, display,
 /// machine type) comes from the template and profile rather than the lab
@@ -136,19 +139,6 @@ fn vm_refusals(vm: &Vm, host: &HostFacts, hardware: Option<&ResolvedVm>) -> Vec<
              on this host — vmlab-hv has no emulation until phase 3 (PRD §22); use \
              hypervisor = \"qemu\", which falls back to TCG"
         ));
-    }
-    if vm.usb == Some(true) || hardware.is_some_and(|h| h.usb) {
-        why.push(phase(name, "usb = true (host USB passthrough)", "2f"));
-    }
-    if vm.gpu.is_some() || hardware.is_some_and(|h| h.gpu.is_some()) {
-        why.push(phase(name, "a `gpu {}` block", "2d"));
-    }
-    if vm
-        .shares
-        .iter()
-        .any(|s| s.transport == crate::config::model::ShareTransport::Virtiofs)
-    {
-        why.push(phase(name, "a share with transport = \"virtiofs\"", "2e"));
     }
     if vm.floppy.is_some()
         || vm
@@ -216,13 +206,52 @@ fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
              (PRD §22); remove it, or use hypervisor = \"qemu\""
         ));
     }
+    // vmlab reads the host's TSC frequency through a paused QEMU, and
+    // vmlab-hv has neither the probe that would replace it (HV phase-2 D10)
+    // nor a frequency to pin in its machine description yet.
     if h.tsc.is_some() {
         why.push(phase(
             name,
             "a pinned TSC (`tsc`)",
-            "after 2b (D10's host probe)",
+            "after 2f (D10's host probe)",
         ));
     }
+}
+
+/// Why QEMU cannot run `vm` as declared — what only vmlab-hv brings, one
+/// sentence per reason; empty when it can. Read by validation for every VM
+/// that runs on QEMU, as [`vmlab_refusals`] is for every one that does not.
+pub fn qemu_refusals(vm: &Vm) -> Vec<String> {
+    let name = &vm.name;
+    let mut why = Vec::new();
+    // vmlab gives QEMU no audio device (hv-audio D7): audio is vmlab-hv's.
+    for (key, on) in [("audio", vm.audio), ("microphone", vm.microphone)] {
+        if on {
+            why.push(format!(
+                "vm \"{name}\": {key} = true needs hypervisor = \"vmlab\" — vmlab gives a QEMU \
+                 machine no sound card (PRD §11, §22); set hypervisor = \"vmlab\", or drop `{key}`"
+            ));
+        }
+    }
+    why
+}
+
+/// Why an online snapshot of a running vmlab-hv VM with `hardware` cannot be
+/// taken or loaded — `None` when it can. An accelerated GPU's renderer state
+/// and a passed-through device's are not vmlab-hv's to save (HV phase-2 D9);
+/// offline snapshots are unaffected. USB devices are refused while attached,
+/// on either hypervisor, by [`crate::usb::snapshot_refusal`].
+pub fn vmlab_online_snapshot_refusal(hardware: &ResolvedVm) -> Option<String> {
+    let gpu = hardware.gpu.as_ref()?;
+    let what = match gpu.mode {
+        GpuMode::Passthrough => "a host GPU passed through (`gpu { mode = \"passthrough\" }`)",
+        GpuMode::Virgl | GpuMode::Vulkan => "an accelerated GPU (`gpu {}`)",
+    };
+    Some(format!(
+        "\"{}\" runs on vmlab-hv with {what}, whose state vmlab-hv cannot save (PRD §22) — \
+         stop the machine and take an offline snapshot instead",
+        hardware.name
+    ))
 }
 
 /// A VM refused for something a later vmlab-hv phase brings.
@@ -358,8 +387,9 @@ mod tests {
         vmlab_refusals(m, &kvm_host(), Some(&hw))
     }
 
-    /// Phases 2a to 2c: a modern VM on q35 — SeaBIOS or OVMF, secure boot,
-    /// a TPM, Hyper-V, Linux or Windows — is refused nothing.
+    /// Phases 2a to 2f: a modern VM on q35 — SeaBIOS or OVMF, secure boot,
+    /// a TPM, Hyper-V, Linux or Windows, a GPU of any mode, virtio-fs
+    /// shares, USB passthrough and a sound card — is refused nothing.
     #[test]
     fn a_modern_vm_on_q35_is_refused_nothing() {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
@@ -373,6 +403,14 @@ mod tests {
             format!(r#"{base} profile = "linux-generic""#),
             format!(r#"{base} profile = "linux-generic" display = "virtio-vga""#),
             format!(r#"{base} profile = "linux-generic" nested = true"#),
+            format!(r#"{base} profile = "linux-generic" gpu {{ mode = "virgl" }}"#),
+            format!(r#"{base} profile = "linux-modern" gpu {{ mode = "vulkan" }}"#),
+            format!(r#"{base} profile = "linux-modern" gpu {{ mode = "passthrough" }}"#),
+            format!(r#"{base} profile = "linux-generic" usb = true"#),
+            format!(
+                r#"{base} profile = "linux-generic" share "s" {{ host = "." guest = "/s" transport = "virtiofs" }}"#
+            ),
+            format!(r#"{base} profile = "windows-11" audio = true microphone = true"#),
         ] {
             let why = refused(&body);
             assert!(why.is_empty(), "{body}: {why:?}");
@@ -385,13 +423,8 @@ mod tests {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
         let cases = [
             (
-                r#"profile = "linux-generic" gpu { mode = "virgl" }"#,
-                "phase 2d",
-            ),
-            (r#"profile = "linux-generic" usb = true"#, "phase 2f"),
-            (
-                r#"profile = "linux-generic" share "s" { host = "." guest = "/s" transport = "virtiofs" }"#,
-                "phase 2e",
+                r#"profile = "linux-generic" tsc = "host""#,
+                "phase after 2f",
             ),
             (r#"profile = "macos""#, "phase macOS"),
             (r#"profile = "windows-legacy""#, "phase 4"),
@@ -438,13 +471,56 @@ mod tests {
     /// refused only what its declaration says; the daemon checks the rest.
     #[test]
     fn without_hardware_only_the_declaration_is_checked() {
-        let file = lab(r#"lab "l" { vm "v" { template = "x86_64/t" usb = true } }"#);
+        let file = lab(r#"lab "l" { vm "v" { template = "x86_64/t" floppy = "./f" } }"#);
         let why = vmlab_refusals(file.lab.machine("v").unwrap(), &kvm_host(), None);
         assert_eq!(why.len(), 1, "{why:?}");
-        assert!(why[0].contains("phase 2f"), "{}", why[0]);
+        assert!(why[0].contains("phase 4"), "{}", why[0]);
 
         let plain = lab(r#"lab "l" { vm "v" { template = "x86_64/t" } }"#);
         assert!(vmlab_refusals(plain.lab.machine("v").unwrap(), &kvm_host(), None).is_empty());
+    }
+
+    /// Audio is vmlab-hv's alone: on QEMU each key is its own refusal,
+    /// naming the hypervisor that brings it.
+    #[test]
+    fn audio_on_qemu_is_refused_naming_vmlab() {
+        let file = lab(r#"lab "l" {
+  vm "loud" { template = "x86_64/t" audio = true microphone = true }
+  vm "quiet" { template = "x86_64/t" }
+}"#);
+        let vm = |n: &str| match file.lab.machine(n).unwrap() {
+            crate::config::model::MachineCfg::Vm(vm) => vm,
+            _ => unreachable!(),
+        };
+        let why = qemu_refusals(vm("loud"));
+        assert_eq!(why.len(), 2, "{why:?}");
+        assert!(why[0].contains("audio = true") && why[0].contains("hypervisor = \"vmlab\""));
+        assert!(why[1].contains("microphone = true"), "{why:?}");
+        assert!(qemu_refusals(vm("quiet")).is_empty());
+    }
+
+    /// D9: an accelerated or passed-through GPU blocks online snapshots on
+    /// vmlab-hv, naming which; no GPU blocks nothing.
+    #[test]
+    fn a_gpu_refuses_online_snapshots_on_vmlab_hv() {
+        let hw = |body: &str| {
+            let file = lab(&format!(
+                r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" {body} }} }}"#
+            ));
+            let crate::config::model::MachineCfg::Vm(vm) = file.lab.machine("v").unwrap() else {
+                unreachable!()
+            };
+            crate::qemu::resolve_vm(vm, None, &crate::profiles::ProfileSet::shipped().unwrap())
+                .unwrap()
+        };
+        assert_eq!(vmlab_online_snapshot_refusal(&hw("")), None);
+        let virgl = vmlab_online_snapshot_refusal(&hw(r#"gpu { mode = "virgl" }"#)).unwrap();
+        assert!(
+            virgl.contains("accelerated GPU") && virgl.contains("offline"),
+            "{virgl}"
+        );
+        let vfio = vmlab_online_snapshot_refusal(&hw(r#"gpu { mode = "passthrough" }"#)).unwrap();
+        assert!(vfio.contains("passed through"), "{vfio}");
     }
 
     #[test]

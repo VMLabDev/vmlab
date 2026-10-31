@@ -13,7 +13,7 @@ pub mod virtiofsd;
 pub mod vk_layer;
 
 pub use cmdline::{
-    Accel, AccelPlan, NicBackend, NicSpec, VmPaths, build_args, emulator_binary,
+    Accel, AccelPlan, HypervisorShare, NicBackend, NicSpec, VmPaths, build_args, emulator_binary,
     host_apic_virtualization, host_msrs_problem, host_nested_problem, hyperv_not_applied,
     kvm_available, kvm_usable, pick_accel, plan_accel, qemu_arch, tsc_not_applied,
 };

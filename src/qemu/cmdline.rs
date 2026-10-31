@@ -11,6 +11,17 @@ use super::resolve::ResolvedVm;
 use crate::config::model::{AccelMode, GpuMode, InputDevices, MacAddr};
 use crate::profiles::{AgentTransport, DiskBus, FirmwareKind};
 
+/// One virtio-fs share a hypervisor serves in process
+/// ([`VmPaths::hypervisor_shares`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HypervisorShare {
+    /// The mount tag the guest mounts by.
+    pub tag: String,
+    /// The host directory exported.
+    pub host: PathBuf,
+    pub readonly: bool,
+}
+
 /// Per-VM runtime paths and attachments supplied by the lab daemon.
 #[derive(Debug, Clone, Default)]
 pub struct VmPaths {
@@ -53,6 +64,10 @@ pub struct VmPaths {
     /// The daemons must be listening before QEMU spawns; non-empty switches
     /// the RAM to a shared memory-backend-memfd (§7.5).
     pub virtiofs_shares: Vec<(String, PathBuf)>,
+    /// virtio-fs shares a hypervisor serves itself, in process, from the
+    /// host directory (vmlab-hv, §22 phase 2e): no virtiofsd, no socket.
+    /// QEMU has no such device and is never handed any.
+    pub hypervisor_shares: Vec<HypervisorShare>,
     /// The host render node a `virgl`/`vulkan` GPU's `egl-headless` display
     /// renders on (`hostgpu::Sysfs::resolve`). Resolved by the lab daemon from
     /// sysfs; `None` leaves QEMU's choice.

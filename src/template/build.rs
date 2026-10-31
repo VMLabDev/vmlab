@@ -1752,11 +1752,12 @@ fn log_build_gpu(spec: &BuildSpec<'_>, arch: &str, log: &OutputSink) {
         &host,
         &crate::qemu::hostgpu::Sysfs::host(),
         &crate::paths::data_dir(),
+        host.hypervisor.vm,
     );
     let Ok(plan) = plan else {
         return;
     };
-    if let Some(warning) = &plan.warning {
+    for warning in &plan.warnings {
         log(format!("warning: build VM: {warning}\n"));
     }
     log(gpu_log_line(gpu, &plan));
@@ -3802,6 +3803,7 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
                 &host,
                 &crate::qemu::hostgpu::Sysfs::new(sys.path()),
                 Path::new("/data"),
+                crate::config::hypervisor::HypervisorKind::Qemu,
             )
             .unwrap()
         };
@@ -3823,10 +3825,7 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         );
         let fallen = plan(gpu(2));
         assert!(
-            fallen
-                .warning
-                .as_deref()
-                .is_some_and(|w| w.contains("Nope")),
+            fallen.warnings.iter().any(|w| w.contains("Nope")),
             "{fallen:?}"
         );
         assert_eq!(
@@ -3840,6 +3839,7 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
             &crate::config::host::HostConfig::default(),
             &crate::qemu::hostgpu::Sysfs::new(sys.path()),
             Path::new("/data"),
+            crate::config::hypervisor::HypervisorKind::Qemu,
         )
         .unwrap();
         assert_eq!(

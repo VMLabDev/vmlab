@@ -508,6 +508,12 @@ pub struct Vm {
     /// A hot-plug xHCI controller for host USB passthrough (§5.2.1); None =
     /// inherit the profile's, and with neither saying, off.
     pub usb: Option<bool>,
+    /// A sound card whose playback is a host PipeWire node of its own (§11);
+    /// declared per VM, default off, inherited from nothing. vmlab-hv only.
+    pub audio: bool,
+    /// The host's default microphone as that card's capture stream (§11);
+    /// default off, and only with `audio`. vmlab-hv only.
+    pub microphone: bool,
     pub secure_boot: Option<bool>,
     /// The key store secure boot starts from (§5.2); None = inherit
     /// template→profile, and with no layer naming one, Microsoft's.
