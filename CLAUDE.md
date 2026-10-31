@@ -88,7 +88,8 @@ on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
 pinned by git rev). Phase 1 runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
 or Windows (`vmlab_hv/describe.rs` places every device where QEMU's q35 would;
-a guest reset, which ends vmlab-hv, boots the VM again as one run), its screen, input and recording over vmlab-hv's
+a guest reset happens in place, readiness dropping until the rebooted
+guest's agent answers), its screen, input and recording over vmlab-hv's
 native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
 `vnc.sock` for viewers; a `gpu {}` (virgl and Venus on the render node the
 host GPU pick resolves, a host GPU's `qemu_*` keys warned about and ignored;

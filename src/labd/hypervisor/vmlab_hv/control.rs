@@ -34,8 +34,8 @@ pub(crate) struct HvControl {
     commands: Arc<Mutex<Client>>,
     capabilities: Vec<Capability>,
     guest_shutdown: Arc<AtomicBool>,
-    /// The guest reset itself, which ends vmlab-hv.
-    guest_reset: Arc<AtomicBool>,
+    /// How many times the guest has reset in place.
+    resets: watch::Sender<u64>,
     asleep: watch::Sender<bool>,
     /// Flips to `true` once the event connection has closed — the
     /// hypervisor has gone and every event it sent has been read.
@@ -69,13 +69,13 @@ impl HvControl {
             "vmlab-hv control connected"
         );
         let guest_shutdown = Arc::new(AtomicBool::new(false));
-        let guest_reset = Arc::new(AtomicBool::new(false));
+        let resets = watch::Sender::new(0u64);
         let asleep = watch::Sender::new(false);
         let deleted = watch::Sender::new(BTreeSet::new());
         let (closed_tx, events_closed) = watch::channel(false);
         {
             let flag = guest_shutdown.clone();
-            let reset = guest_reset.clone();
+            let reset = resets.clone();
             let sleep = asleep.clone();
             let gone = deleted.clone();
             std::thread::Builder::new()
@@ -100,7 +100,7 @@ impl HvControl {
             commands: Arc::new(Mutex::new(commands)),
             capabilities,
             guest_shutdown,
-            guest_reset,
+            resets,
             asleep,
             events_closed,
             display: None,
@@ -125,12 +125,14 @@ impl HvControl {
     }
 }
 
-/// What one event says: a guest that powered itself off (or reset, which
-/// QEMU's adapter counts the same way), and whether it is asleep.
+/// What one event says: a guest that powered itself off, a guest that
+/// reset in place, and whether it is asleep. vmlab-hv ends on a reset only
+/// where the description opts in (`exit_on_reset`), which vmlab never does;
+/// such an end would count as the guest's own, as QEMU's `-no-reboot` does.
 fn observe(
     event: &Event,
     guest_shutdown: &AtomicBool,
-    guest_reset: &AtomicBool,
+    resets: &watch::Sender<u64>,
     asleep: &watch::Sender<bool>,
 ) {
     if let Event::Shutdown {
@@ -139,11 +141,8 @@ fn observe(
     {
         guest_shutdown.store(true, Ordering::SeqCst);
     }
-    if let Event::Shutdown {
-        reason: ShutdownReason::GuestReset,
-    } = event
-    {
-        guest_reset.store(true, Ordering::SeqCst);
+    if let Event::Reset = event {
+        resets.send_modify(|n| *n += 1);
     }
     // One table for both hypervisors: the events mean what QEMU's do.
     let name = match event {
@@ -241,8 +240,8 @@ impl Control for HvControl {
         self.guest_shutdown.load(Ordering::SeqCst)
     }
 
-    fn guest_reset(&self) -> bool {
-        self.guest_reset.load(Ordering::SeqCst)
+    fn reset_watch(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.resets.subscribe())
     }
 
     fn sleep_watch(&self) -> Option<watch::Receiver<bool>> {
@@ -766,6 +765,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("did not report"), "{err:#}");
+    }
+
+    /// Each in-place `reset` grows the reset count by one, and neither ends
+    /// the machine nor counts as the guest powering off.
+    #[tokio::test]
+    async fn a_reset_event_counts_an_in_place_reset() {
+        let hv = fake_hv(vec![], ok);
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        control.pause().await.unwrap();
+        let mut resets = control.reset_watch().expect("a watch");
+        assert_eq!(*resets.borrow(), 0);
+        (hv.events)(Event::Reset);
+        tokio::time::timeout(Duration::from_secs(5), resets.wait_for(|n| *n == 1))
+            .await
+            .unwrap()
+            .unwrap();
+        (hv.events)(Event::Reset);
+        tokio::time::timeout(Duration::from_secs(5), resets.wait_for(|n| *n == 2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!control.guest_shutdown());
     }
 
     /// A wake is vmlab-hv's `resume`, which takes a guest out of S3.
