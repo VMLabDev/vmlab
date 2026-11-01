@@ -1,0 +1,31 @@
+// The core lab without QEMU arguments or floppy drives. The scenario copies
+// its media and provision script from core-lab before validation.
+import <vmlab.wcl>
+
+lab "e2e-core" {
+  segment "lan" { subnet = "10.80.0.0/24" }
+
+  vm "vm01" {
+    template  = "x86_64/e2e-alpine"
+    cpus      = 2
+    memory    = 768MiB
+    firmware  = "ovmf"
+    tpm       = true
+    nested    = true
+    cdrom     = "./cd.iso"
+    nic { segment = "lan" ip = "10.80.0.10" }
+    disk "data" { size = 1GiB }
+    disk "payload" { from = "./payload/" }
+    media { kind = "iso" from = "./media-iso/" label = "E2EMEDIA" }
+    provision "scripts/prov.ws" { }
+  }
+
+  vm "vm02" {
+    template = "x86_64/e2e-alpine"
+    cpus       = 1
+    memory     = 512MiB
+    depends_on = ["vm01"]
+    nic { segment = "lan" }
+    provision "scripts/prov.ws" { }
+  }
+}

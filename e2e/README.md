@@ -28,7 +28,13 @@ The host needs Docker and a usable `/dev/kvm`. The container runs privileged. If
 
 A run is on one hypervisor (PRD §22): `--hypervisor qemu`, the default, or `--hypervisor vmlab`. The image builds `vmlab-hv` from the vmlab-hypervisor commit that `Cargo.lock` pins `vmlab-hv-proto` to, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
 
-On `vmlab`, the runner writes a host config whose `hypervisor {}` block puts containers on vmlab-hv, and a scenario's VMs too when it covers a VM feature of a delivered phase (2a onward). It is rewritten per scenario. `QEMU_SCENARIOS` names the scenarios whose VMs stay on QEMU, with the reason: `core` proves most of what it covers from QEMU's argv and its lab declares `qemu_args` and floppies, `admin` declares an emulated aarch64 VM, and `fastpath` attaches its VM NICs as taps, which vmlab-hv does not take. A VM feature such a scenario reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
+On `vmlab`, the runner writes a host config whose `hypervisor {}` block puts containers on vmlab-hv, and a scenario's VMs too when it covers a VM feature of a delivered phase (2a onward). It is rewritten per scenario. `QEMU_SCENARIOS` names the scenarios whose VMs stay on QEMU, with the reason. Only `fastpath` stays pinned: it attaches VM NICs as taps, which vmlab-hv does not take. A VM feature it reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
+
+`core` keeps the four-machine `core-lab` on QEMU. On vmlab-hv it runs three labs in sequence. Normal cleanup keeps at most two VMs running at once. `core-hv` covers lifecycle, hardware and parallel provisions with two machines. `core-hv-provision` checks a provision dependency with two machines. `core-hv-scratch` checks the blank-disk boot and forced stop with one machine. The labs reuse `core-lab`'s media and provision script. QEMU arguments and both floppy features retain their QEMU-only or phase-4 skip reasons. Reload checks edit QEMU's SMBIOS arguments on QEMU and memory on vmlab-hv. They check the live launch and the guest, including a pending edit, restart, a stopped-machine rebuild, and an unchanged peer PID. `core-unmountable` runs on both hypervisors.
+
+`admin` keeps its aarch64 `admin-lab` and emulation check on QEMU. On vmlab-hv it uses the x86_64 scratch VM in `admin-hv` for the same administration checks and skips only the phase-3 emulation feature. `admin-roots` runs on both. Process checks identify a live QEMU by its lab name or a live vmlab-hv by its exact `--machine` path, so a leftover description file cannot pass a shutdown check.
+
+`core-admin-coverage.md` lists the 33 formerly suppressed features, their original labs, and the reason each was skipped.
 
 The suite's VM template is Alpine's UEFI image, except on a vmlab run delivered through 2a or 2b, where it is Alpine's BIOS image with `firmware = "seabios"`.
 
@@ -47,5 +53,7 @@ On `vmlab`, a feature past the delivered phase (`VMLAB_DELIVERED`, or `--vmlab-p
 ## Adding coverage
 
 To cover a new feature, add it to `features.py` and tag its phase, then report it from a scenario with `h.ok`, `h.check` or `h.skip`. `features.py` refuses to load while a feature has no tag. `harness.py` documents the API.
+
+Run `python3 -m unittest discover -s e2e -p 'test_*.py'` to check hypervisor routing and result accounting without booting VMs.
 
 Keep labs small: 1 CPU, 512 MiB to 1 GiB of memory, and the e2e template or small container images. `vmlab up` returns once machines have started, before they are ready. Call `h.wait_ready` before talking to a guest.

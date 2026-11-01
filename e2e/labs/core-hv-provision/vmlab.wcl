@@ -1,0 +1,19 @@
+// Provision ordering needs two machines. Their script is shared with core-lab.
+import <vmlab.wcl>
+
+lab "e2e-core-provision" {
+  vm "vm01" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    depends_on_provision = ["vm03"]
+    provision "scripts/prov.ws" { }
+  }
+
+  vm "vm03" {
+    template = "x86_64/e2e-alpine"
+    cpus     = 1
+    memory   = 512MiB
+    provision "scripts/prov.ws" { }
+  }
+}

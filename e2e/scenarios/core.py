@@ -1,9 +1,10 @@
 """Core: validation, the lab lifecycle, per-VM power, declared hardware and
-attached media, each proved from inside the guest where the guest can see it
-and from QEMU's own argv where it cannot. Firmware, the TPM and secure boot
-are the `firmware` scenario's, which proves them on either hypervisor."""
+attached media, proved from the guest and the selected hypervisor's launch.
+Firmware, the TPM and secure boot are the `firmware` scenario's, which proves
+them on either hypervisor."""
 
 import json
+import os
 import pathlib
 import re
 from datetime import datetime, timezone
@@ -203,19 +204,40 @@ def edit_lab(lab: pathlib.Path, old: str, new: str) -> None:
     path.write_text(text.replace(old, new, 1))
 
 
-def qemu_pid(vm: str) -> str:
-    """The running QEMU's pid for `vm` of this lab, or "" when none runs."""
-    want = f"vmlab:{LAB}/{vm}"
+def machine_pid(lab: str, vm: str) -> str:
+    """The live hypervisor PID, identified by QEMU's name or vmlab-hv's
+    exact machine-description path. A stale machine.json is not a process."""
+    run = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    description = str(run / "vmlab" / "labs" / lab / "vms" / vm / "machine.json")
     for p in pathlib.Path("/proc").iterdir():
         if not p.name.isdigit():
             continue
         try:
             args = [a.decode(errors="replace") for a in (p / "cmdline").read_bytes().split(b"\0") if a]
-        except OSError:
+            state = (p / "stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
             continue
-        if args and "qemu-system" in args[0] and want in args:
+        if not args or state == "Z":
+            continue
+        if "qemu-system" in args[0] and f"vmlab:{lab}/{vm}" in args:
             return p.name
+        if pathlib.Path(args[0]).name == "vmlab-hv" and "--machine" in args:
+            i = args.index("--machine")
+            if i + 1 < len(args) and args[i + 1] == description:
+                return p.name
     return ""
+
+
+def launched_memory(h, vm: str) -> int:
+    """Configured MiB in the launch of a live machine."""
+    if not machine_pid(LAB, vm):
+        return 0
+    if h.hypervisor == "qemu":
+        value = memory_of(qemu_argv(vm))
+        return int(value.removesuffix("M")) if value.endswith("M") else 0
+    run = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    desc = json.loads((run / "vmlab" / "labs" / LAB / "vms" / vm / "machine.json").read_text())
+    return desc["memory_mib"]
 
 
 def memory_of(argv: list[str]) -> str:
@@ -224,52 +246,73 @@ def memory_of(argv: list[str]) -> str:
     return argv[i + 1] if 0 <= i < len(argv) - 1 else "?"
 
 
-def reload_after_down(h, lab: pathlib.Path) -> None:
+def reload_after_down(h, lab: pathlib.Path, worker: str = "vm03") -> None:
     """The lab daemon outlives `down`. `up` must still run the lab file as it
     is on disk now, not the one the daemon loaded (PRD §7.1): replacing the
     daemon when nothing runs, else reloading the file into it machine by
     machine — never quietly running the old one."""
-    # An edited qemu_args takes effect on the next `up`.
-    edit_lab(lab, "serial=E2E-QEMU-ARGS\"", "serial=E2E-QEMU-ARGS-2\"")
+    # Keep the QEMU passthrough check. On vmlab-hv edit memory instead,
+    # proving each generation from the live launch and the guest.
+    def edit_generation(before: int, after: int):
+        if h.hypervisor == "qemu":
+            def serial(n):
+                return "serial=E2E-QEMU-ARGS" + (f"-{n}" if n > 1 else "") + '"'
+            edit_lab(lab, serial(before), serial(after))
+        else:
+            edit_lab(lab, f"memory    = {768 + (before - 1) * 64}MiB",
+                     f"memory    = {768 + (after - 1) * 64}MiB")
+
+    def generation_applied(n: int):
+        if h.hypervisor == "qemu":
+            return f"type=1,serial=E2E-QEMU-ARGS-{n}" in qemu_argv("vm01")
+        expected = 768 + (n - 1) * 64
+        mem = sh(h, lab, "vm01", "awk '/MemTotal/ {print $2}' /proc/meminfo", check=False)
+        return (launched_memory(h, "vm01") == expected and mem.code == 0
+                and (expected - 128) * 1024 < int(mem.out.strip() or 0) <= expected * 1024)
+
+    edit_generation(1, 2)
     up = h.vmlab("up", "vm01", cwd=lab, timeout=600, check=False)
     if up.code == 0:
         h.wait_ready(lab, "vm01")
-    serial = sh(h, lab, "vm01", "cat /sys/class/dmi/id/product_serial", check=False).out.strip()
-    argv = qemu_argv("vm01")
-    applied = up.code == 0 and serial == "E2E-QEMU-ARGS-2" and "type=1,serial=E2E-QEMU-ARGS-2" in argv
+    applied = up.code == 0 and generation_applied(2)
+    if h.hypervisor == "qemu":
+        applied = applied and sh(h, lab, "vm01", "cat /sys/class/dmi/id/product_serial", check=False).out.strip() == "E2E-QEMU-ARGS-2"
 
-    # Edited again while vm01 and vm03 run (the `up vm01` above pulled vm03
-    # in through vm01's depends_on_provision): the daemon reloads the file,
+    # Edited again while vm01 runs (the QEMU lab also pulled in vm03
+    # through depends_on_provision): the daemon reloads the file,
     # `up` succeeds, and vm01 is named pending and keeps what it booted with
     # until a restart rebuilds it.
-    edit_lab(lab, "serial=E2E-QEMU-ARGS-2\"", "serial=E2E-QEMU-ARGS-3\"")
+    edit_generation(2, 3)
     busy = h.vmlab("up", "vm01", cwd=lab, timeout=300, check=False)
     pending = (
         busy.code == 0 and "reloading it into the running lab" in busy.text
         and "vm01: pending" in busy.text
-        and "type=1,serial=E2E-QEMU-ARGS-2" in qemu_argv("vm01")
+        and generation_applied(2)
     )
     rs = h.vmlab("vm", "restart", "vm01", cwd=lab, timeout=600, check=False)
     if rs.code == 0:
         h.wait_ready(lab, "vm01")
     restarted = (
         rs.code == 0 and "vm01: rebuilt" in rs.text
-        and "type=1,serial=E2E-QEMU-ARGS-3" in qemu_argv("vm01")
+        and generation_applied(3)
         and "pending" not in h.vmlab("status", cwd=lab, check=False).out
     )
 
     # A stopped machine edited while others run is rebuilt by the reload and
     # boots on the new declaration, and nothing running is stopped for it.
-    vm01_pid = qemu_pid("vm01")
-    edit_lab(lab, "memory     = 512MiB\n    floppy", "memory     = 640MiB\n    floppy")
+    vm01_pid = machine_pid(LAB, "vm01")
+    edit_lab(lab, "memory     = 512MiB", "memory     = 640MiB")
     stopped = h.vmlab("up", "vm02", cwd=lab, timeout=600, check=False)
-    vm02_memory = memory_of(qemu_argv("vm02"))
+    vm02_memory = launched_memory(h, "vm02")
+    guest_memory = sh(h, lab, "vm02", "awk '/MemTotal/ {print $2}' /proc/meminfo", check=False)
     h.ok(
         "lab.reload.stopped",
         stopped.code == 0 and "vm02: rebuilt from the new declaration" in stopped.text
-        and vm02_memory == "640M" and vm01_pid != "" and qemu_pid("vm01") == vm01_pid,
-        f"exit {stopped.code}; vm02 boots -m {vm02_memory}; vm01 kept pid {vm01_pid}: "
-        f"{qemu_pid('vm01') == vm01_pid}; "
+        and vm02_memory == 640 and guest_memory.code == 0
+        and 512 * 1024 < int(guest_memory.out.strip() or 0) <= 640 * 1024
+        and vm01_pid != "" and machine_pid(LAB, "vm01") == vm01_pid,
+        f"exit {stopped.code}; vm02 launch {vm02_memory}MiB, guest {guest_memory.out.strip()}kB; vm01 kept pid {vm01_pid}: "
+        f"{machine_pid(LAB, 'vm01') == vm01_pid}; "
         + next((l.strip() for l in stopped.text.splitlines() if l.startswith("vm02:")), stopped.text.strip()[-200:]),
     )
 
@@ -281,30 +324,30 @@ def reload_after_down(h, lab: pathlib.Path) -> None:
     h.ok(
         "lab.reload.network",
         net.code != 0 and 'segment "lan" changed (mtu)' in net.text and "vmlab down" in net.text
-        and qemu_pid("vm01") == vm01_pid,
+        and vm01_pid != "" and machine_pid(LAB, "vm01") == vm01_pid,
         f"exit {net.code}: "
         + next((l.strip() for l in net.text.splitlines() if "network" in l), net.text.strip()[-200:]),
     )
 
     # `vm stop` leaves the daemon up with nothing running, still holding the
     # file it loaded: `vm start` replaces it and boots the edit.
-    edit_lab(lab, "serial=E2E-QEMU-ARGS-3\"", "serial=E2E-QEMU-ARGS-4\"")
-    for vm in ("vm02", "vm01", "vm03"):
+    edit_generation(3, 4)
+    for vm in dict.fromkeys(("vm02", "vm01", worker)):
         h.vmlab("vm", "stop", vm, cwd=lab, check=False, timeout=180)
     sv = h.vmlab("vm", "start", "vm01", cwd=lab, timeout=600, check=False)
     if sv.code == 0:
         h.wait_ready(lab, "vm01")
     replaced = (
         sv.code == 0 and "restarting the lab daemon" in sv.text
-        and "type=1,serial=E2E-QEMU-ARGS-4" in qemu_argv("vm01")
+        and generation_applied(4)
     )
     h.ok(
         "lab.up.reload",
         applied and pending and restarted and replaced,
-        f"after down + edit: up exit {up.code}, guest serial {serial!r}; "
-        f"edit over running vm01: up exit {busy.code}, pending and on its old argv={pending}, "
-        f"vm restart exit {rs.code} on the new argv={restarted}; "
-        f"vm stop + vm start: exit {sv.code}, replaced daemon and booted serial 4={replaced}",
+        f"after down + edit: up exit {up.code}, generation 2 applied={applied}; "
+        f"edit over running vm01: up exit {busy.code}, pending and on its old launch={pending}, "
+        f"vm restart exit {rs.code} on the new launch={restarted}; "
+        f"vm stop + vm start: exit {sv.code}, replaced daemon and booted generation 4={replaced}",
     )
 
     # A clone cannot move to another template: `up` refuses before starting
@@ -315,12 +358,12 @@ def reload_after_down(h, lab: pathlib.Path) -> None:
         'template = "x86_64/e2e-alpine"',
         'template = "scratch"\n    arch     = "x86_64"\n    profile  = "linux-generic"\n    disk     = 1GiB',
     )
-    moved = h.vmlab("up", "vm03", cwd=lab, timeout=300, check=False)
+    moved = h.vmlab("up", worker, cwd=lab, timeout=300, check=False)
     h.ok(
         "lab.up.template-changed",
-        moved.code != 0 and "vmlab vm destroy vm03" in moved.text
-        and state_of(h, lab, "vm03") == "stopped"
-        and (lab / ".vmlab" / "vms" / "vm03" / "disk0.qcow2").exists(),
+        moved.code != 0 and f"vmlab vm destroy {worker}" in moved.text
+        and state_of(h, lab, worker) == "stopped"
+        and (lab / ".vmlab" / "vms" / worker / "disk0.qcow2").exists(),
         f"exit {moved.code}: "
         + next((l.strip() for l in moved.text.splitlines() if "clone" in l), moved.text.strip()[-200:]),
     )
@@ -336,6 +379,11 @@ def _run(h):
     )
 
     unmountable(h)
+
+    if h.hypervisor == "vmlab":
+        from scenarios import core_hv
+        core_hv.run(h)
+        return
 
     with h.lab("core-lab") as lab:
         build_images(h, lab)
@@ -510,9 +558,9 @@ def _run(h):
         h.ok(
             "vm.stop",
             sp.code == 0 and sf.code == 0 and state_of(h, lab, "vm02") == "stopped"
-            and state_of(h, lab, "blank") == "stopped" and not qemu_argv("vm02") and not qemu_argv("blank")
+            and state_of(h, lab, "blank") == "stopped" and not machine_pid(LAB, "vm02") and not machine_pid(LAB, "blank")
             and state_of(h, lab, "vm01") == "running",
-            "vm02 (graceful) and blank (--force) stopped with their QEMU gone; vm01 untouched",
+            "vm02 (graceful) and blank (--force) stopped with their hypervisor processes gone; vm01 untouched",
         )
 
         dn = h.vmlab("down", cwd=lab, check=False, timeout=300)
@@ -520,13 +568,13 @@ def _run(h):
         # lab daemon, releasing the name (#142); checked at once, since the
         # release waits for the daemon.
         after_down = h.vmlab("status", cwd=lab, check=False).out
-        running = [m for m in ("vm01", "vm02", "vm03", "blank") if qemu_argv(m)]
+        running = [m for m in ("vm01", "vm02", "vm03", "blank") if machine_pid(LAB, m)]
         h.ok(
             "lab.down",
             dn.code == 0 and not running and "not running" in after_down
             and LAB not in h.vmlab("lab", "list").out
             and (lab / ".vmlab" / "vms" / "vm01").exists(),
-            f"no QEMU left ({running or 'none running'}), daemon released "
+            f"no hypervisor processes left ({running or 'none running'}), daemon released "
             f"({after_down.strip()!r}), clones kept",
         )
 
