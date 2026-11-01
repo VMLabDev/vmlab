@@ -96,6 +96,8 @@ pub enum FirmwareKind {
 #[derive(Debug, Clone, Default)]
 pub struct Profile {
     pub name: String,
+    /// VM hypervisor default; the machine's explicit choice wins.
+    pub hypervisor: Option<crate::config::hypervisor::HypervisorKind>,
     /// Human-readable summary from the profile's WCL `description`. Nothing
     /// surfaces it yet (there is no `profile list` verb); parsed for schema
     /// parity.
@@ -267,6 +269,12 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
     let name = r.label();
     let profile = Profile {
         name: String::new(),
+        hypervisor: r
+            .keyword(
+                "hypervisor",
+                crate::config::hypervisor::HypervisorKind::NAMES,
+            )
+            .unspan(),
         description: r.string("description").unspan(),
         machine: r
             .keyword("machine", &[("q35", Machine::Q35), ("pc", Machine::I440fx)])
@@ -508,6 +516,10 @@ mod tests {
         use crate::config::model::{InputDevices, TscMode};
         let set = ProfileSet::shipped().unwrap();
         let mac = set.get("macos").unwrap();
+        assert_eq!(
+            mac.hypervisor,
+            Some(crate::config::hypervisor::HypervisorKind::Vmlab)
+        );
         assert_eq!(mac.machine, Some(Machine::Q35));
         assert_eq!(mac.firmware, Some(FirmwareKind::Ovmf));
         assert_eq!(mac.secure_boot, Some(false));

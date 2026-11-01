@@ -92,10 +92,10 @@ SRC
       | "`disk_bus`" | "utf8" | "QEMU default" | "Primary disk bus: `virtio`, `ide` or `sata`." |
       | "`nic_model`" | "utf8" | "QEMU default" | "NIC device model, for example `virtio-net-pci`, `e1000`, `rtl8139` or `pcnet`." |
       | "`display`" | "utf8" | "QEMU default" | "Display device, for example `virtio-vga`, `qxl`, `std`, `cirrus-vga`, or `vmware` for VMware SVGA II (`vmware-svga`)." |
-      | "`cpu_model`" | "utf8" | "unset" | "QEMU `-cpu` model, for example `pentium3`, replacing `host` under KVM and `max` under TCG. Only `macos` sets one." |
+      | "`cpu_model`" | "utf8" | "unset" | "Named CPU and feature edits. QEMU uses its `-cpu` catalogue. vmlab-hv supports `host` and the pinned `Skylake-Client-v4` with the shipped macOS edits; unsupported edits are refused." |
       | "`hyperv`" | "bool" | "unset" | "Hyper-V enlightenments (`hv-*` CPU flags) under KVM on x86, unless a `cpu_model` names the CPU. Unset is off. Set by `windows-11`, `windows-10`, `windows-server` and `windows-legacy`; a VM or template `hyperv` wins. See [Lab file: vm and its children](ref_vm)." |
-      | "`apple_smc`" | "bool" | "unset" | "The Apple SMC device (`isa-applesmc` with Apple's OSK) and an SMBIOS type 2 table, which macOS refuses to boot without. Unset is off. x86 only. Set by `macos`." |
-      | "`input`" | "utf8" | "unset (`ps2`)" | "Keyboard and pointer: `ps2` (PS/2 keyboard, USB tablet) or `usb` (USB keyboard and tablet on an xHCI of their own, unbound so QMP `send-key` reaches the keyboard). Set to `usb` by `macos`." |
+      | "`apple_smc`" | "bool" | "unset" | "Apple SMC and SMBIOS type 2, with the owner-supplied `host.apple_smc_osk`. vmlab-hv only. x86 only. Set by `macos`." |
+      | "`input`" | "utf8" | "unset (`ps2`)" | "Keyboard and pointer: `ps2` or `usb`. The `macos` profile selects a USB keyboard and tablet on vmlab-hv, driven through its native display protocol." |
       | "`tsc`" | "utf8" | "unset" | "`host`: an invariant TSC pinned at the host's frequency under KVM, read at a VM's first KVM start and kept. Unset is QEMU's default. x86 only. Set by `macos`." |
       | "`accel`" | "utf8" | "unset" | "Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. No shipped profile sets one." |
       | "`cpus`" | "i64" | "unset" | "Default vCPU count, at least 1." |
@@ -128,8 +128,10 @@ SRC
   DOC
 
   h2 "Shipped profiles"
+  p "A VM selects its hypervisor from its own field, then the effective profile, then the host default. The optional profile field `hypervisor` accepts `qemu` or `vmlab`. Only the shipped `macos` profile sets it. No KVM module options are needed for macOS."
   p <<DOC
-    The `macos` profile enables `apple_smc`. vmlab refuses these machines
+    The `macos` profile selects `hypervisor = "vmlab"` and enables `apple_smc`.
+    macOS runs only on vmlab-hv. vmlab refuses these machines
     until `host.apple_smc_osk` is set to the key obtained from your own Apple
     hardware. The public `smc_read` approach reads `OSK0` followed by `OSK1`.
     See [Apple SMC OSK in host configuration](ref_host) for the format and

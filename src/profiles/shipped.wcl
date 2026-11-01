@@ -161,6 +161,7 @@ profile "linux-generic" {
 }
 
 profile "macos" {
+  hypervisor  = "vmlab"
   description = "Intel macOS (Tahoe and earlier) booted through OpenCore: q35, OVMF, AHCI disks, VMware SVGA, USB keyboard and tablet, Apple SMC, invariant TSC"
   machine     = "q35"
   // OpenCore is a UEFI application, and macOS has no use for secure boot or
@@ -185,8 +186,8 @@ profile "macos" {
   apple_smc   = true
   // OpenCore and macOS read no PS/2 keyboard.
   input       = "usb"
-  // QEMU fills the VMware leaf only for a known, stable TSC; pinning it at
-  // the host's frequency keeps online snapshots working.
+  // The VMware frequency leaf uses the actual KVM rate, pinned before the
+  // first resume and reused by later starts and online snapshots.
   tsc         = "host"
   cpus        = 4
   memory      = 8GiB

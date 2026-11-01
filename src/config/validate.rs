@@ -247,7 +247,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     let mut segment_gateways: HashMap<String, Span> = HashMap::new();
     let hypervisors = ctx.hypervisor_defaults();
     for vm in &lab.vms {
-        let vm_hypervisor = hypervisors.effective(MachineCfg::Vm(vm));
+        let vm_hypervisor = vm_hypervisor(vm, ctx, hypervisors);
         if !machine_names.insert(&vm.name) {
             issues.push(Issue::at(
                 vm.span,
@@ -1863,19 +1863,23 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
                 ),
             ));
         }
-        if defaults.effective(m) != HypervisorKind::Vmlab {
+        let hardware = match m {
+            MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
+            MachineCfg::Container(_) => None,
+        };
+        let kind = match m {
+            MachineCfg::Vm(vm) => vm_hypervisor(vm, ctx, defaults),
+            MachineCfg::Container(_) => defaults.effective(m),
+        };
+        if kind != HypervisorKind::Vmlab {
             if let MachineCfg::Vm(vm) = m {
-                for why in qemu_refusals(vm) {
+                for why in qemu_refusals(vm, hardware.as_ref()) {
                     issues.push(Issue::at(vm.span, why));
                 }
             }
             continue;
         }
         let host = host.get_or_insert_with(|| ctx.host_facts());
-        let hardware = match m {
-            MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
-            MachineCfg::Container(_) => None,
-        };
         for why in vmlab_refusals(m, host, hardware.as_ref()) {
             issues.push(Issue::at(m.span(), why));
         }
@@ -1888,21 +1892,31 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
 /// elsewhere) — and the daemon's own check, which always resolves, finishes
 /// the refusal.
 fn vm_hardware(vm: &Vm, ctx: &dyn ValidationContext) -> Option<crate::qemu::ResolvedVm> {
-    let meta = match &vm.template {
-        TemplateRef::Scratch => None,
-        TemplateRef::Store {
-            arch,
-            name,
-            version,
-            ..
-        } => Some(ctx.template_meta(arch, name, version.as_deref())?),
-        TemplateRef::Registry { .. } => return None,
-    };
-    let profiles = match effective_profile_name(vm, meta.as_ref()) {
+    let layer = TemplateLayer::of(vm, ctx);
+    if !layer.is_known() {
+        return None;
+    }
+    let meta = layer.meta();
+    let profiles = match effective_profile_name(vm, meta) {
         Some(name) => crate::profiles::ProfileSet::of([ctx.profile(&name)?]),
         None => crate::profiles::ProfileSet::of([]),
     };
-    crate::qemu::resolve_vm(vm, meta.as_ref(), &profiles).ok()
+    crate::qemu::resolve_vm(vm, meta, &profiles).ok()
+}
+
+fn vm_hypervisor(
+    vm: &Vm,
+    ctx: &dyn ValidationContext,
+    defaults: HypervisorDefaults,
+) -> HypervisorKind {
+    let layer = TemplateLayer::of(vm, ctx);
+    vm.hypervisor
+        .or_else(|| {
+            effective_profile_name(vm, layer.meta())
+                .and_then(|name| ctx.profile(&name))
+                .and_then(|p| p.hypervisor)
+        })
+        .unwrap_or(defaults.vm)
 }
 
 fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
@@ -2105,6 +2119,85 @@ pub(crate) mod tests {
             !hw_errs(&inherited, &override_source)
                 .iter()
                 .any(|e| e == refusal)
+        );
+    }
+
+    #[test]
+    fn a_template_profile_requires_the_host_osk_at_validation() {
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.profile = Some("macos".into());
+        let ctx = Hardware::with_meta(meta);
+        let errors = hw_errs(
+            &ctx,
+            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" } }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == super::super::host::APPLE_SMC_OSK_REQUIRED),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_backend_selection_and_qemu_refusal_follow_the_effective_profile() {
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.profile = Some("macos".into());
+        let ctx = Hardware::with_meta(meta);
+        let source = "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" } }";
+        let file = lab(source);
+        assert_eq!(
+            vm_hypervisor(&file.lab.vms[0], &ctx, HypervisorDefaults::default()),
+            HypervisorKind::Vmlab
+        );
+        assert!(
+            !hw_errs(&ctx, source)
+                .iter()
+                .any(|e| e.contains("requires vmlab-hv"))
+        );
+        let qemu = source.replace("template =", "hypervisor = \"qemu\" template =");
+        assert!(
+            hw_errs(&ctx, &qemu)
+                .iter()
+                .any(|e| e.contains("requires vmlab-hv"))
+        );
+        let custom = source.replace("template =", "profile = \"custom\" template =");
+        assert_eq!(
+            vm_hypervisor(
+                &lab(&custom).lab.vms[0],
+                &ctx,
+                HypervisorDefaults::default()
+            ),
+            HypervisorKind::Qemu
+        );
+    }
+
+    #[test]
+    fn a_variant_profile_validates_the_osk_and_selects_vmlab_hv() {
+        let mut meta = variant_meta();
+        meta.variants[0].profile = Some("macos".into());
+        let ctx = Hardware::with_meta(meta);
+        let source = "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" } }";
+        let file = lab(source);
+        let vm = &file.lab.vms[0];
+        assert_eq!(
+            vm_hardware(vm, &ctx).unwrap().profile.as_deref(),
+            Some("macos")
+        );
+        assert_eq!(
+            vm_hypervisor(vm, &ctx, HypervisorDefaults::default()),
+            HypervisorKind::Vmlab
+        );
+        assert!(
+            hw_errs(&ctx, source)
+                .iter()
+                .any(|e| e == super::super::host::APPLE_SMC_OSK_REQUIRED)
+        );
+        let qemu = source.replace("template =", "hypervisor = \"qemu\" template =");
+        assert!(
+            hw_errs(&ctx, &qemu)
+                .iter()
+                .any(|e| e.contains("requires vmlab-hv"))
         );
     }
 
@@ -4203,6 +4296,7 @@ lab "l" {
   vm "mac" {
     template = "x86_64/t"
     profile = "macos"
+    hypervisor = "vmlab"
     playbook "playbooks/base" { play = "base" }
   }
 }"#,
@@ -4217,6 +4311,7 @@ lab "l" {
   vm "mac" {
     template = "x86_64/t"
     profile = "macos"
+    hypervisor = "vmlab"
     playbook "playbooks/base" { play = "base" guest_bin = "/usr/local/bin/config-weave" }
     login "dev" { user = "dev" }
   }
@@ -4325,16 +4420,12 @@ lab "l" {
             r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-11" hypervisor = "vmlab" usb = true audio = true microphone = true }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
-        // A pinned TSC waits for vmlab-hv's host probe.
+        // vmlab-hv reports the rate to pin before the guest resumes.
         let es = hv_errs(
             &HvHost::kvm(),
             r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" tsc = "host" }"#,
         );
-        assert!(
-            es.iter()
-                .any(|e| e.contains("vm \"v\"") && e.contains("D10")),
-            "{es:#?}"
-        );
+        assert!(es.is_empty(), "{es:#?}");
     }
 
     /// Audio is vmlab-hv's (hv-audio D7): on QEMU — named or the host's

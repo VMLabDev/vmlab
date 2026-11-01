@@ -381,7 +381,11 @@ _Avoid_: driver, backend, runtime
 vmlab's own hypervisor, one process per machine in place of QEMU, driven over
 its own control protocol from a machine description vmlab writes (PRD §22,
 ADR-0021). A machine is on it when its block says `hypervisor = "vmlab"` or the
-host config's default for its kind does. It runs container micro-VMs and, from
+effective profile selects it, or the host config's default for its kind does.
+The machine's explicit field wins over the profile, which wins over the host.
+The macos profile selects vmlab-hv; macOS is refused on QEMU and needs no
+host-wide KVM MSR option. Its private launch descriptor carries the host's
+Apple SMC key, while retained descriptions and logs redact it. It runs container micro-VMs and, from
 phases 2a to 2f, modern VMs on q35 — SeaBIOS or OVMF, secure boot, a TPM,
 Hyper-V, Linux or Windows, a GPU on a host render node or passed through,
 virtio-fs shares it serves itself, host USB and a sound card; a guest reset

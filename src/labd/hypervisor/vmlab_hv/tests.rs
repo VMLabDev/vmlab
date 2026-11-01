@@ -239,3 +239,102 @@ fn an_orphaned_vmlab_hv_matches_its_labs_markers() {
     assert!(crate::qemu::process::cmdline_belongs_to(&cmdline, "lab1"));
     assert!(!crate::qemu::process::cmdline_belongs_to(&cmdline, "lab"));
 }
+
+fn macos_launch(run: &Path, pin: Option<u64>) -> Launch {
+    Launch::Vm {
+        lab: "lab1".into(),
+        resolved: Box::new(crate::qemu::resolve::testing::resolved_vm(
+            "macos", "x86_64",
+        )),
+        paths: Box::new(crate::qemu::VmPaths {
+            primary_disk: run.join("disk0.qcow2"),
+            firmware_code: Some(run.join("CODE.fd")),
+            ovmf_vars: Some(run.join("VARS.fd")),
+            serial_log: Some(run.join("serial.log")),
+            tsc_hz: pin,
+            apple_smc_osk: Some(
+                crate::config::host::AppleSmcOsk::parse("FAKE".repeat(16)).unwrap(),
+            ),
+            ..Default::default()
+        }),
+        accel: crate::qemu::Accel::Kvm,
+        emulator: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn macos_launch_is_private_and_pins_the_reported_tsc_before_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path();
+    let argv = run.join("argv");
+    let bin = fake_binary(
+        run,
+        &format!(
+            "cat \"$2\" >&2\necho >&2\necho 'vmlab-hv: tsc_khz=4291934' >&2\necho \"$@\" > {}\nexec sleep 30",
+            argv.display()
+        ),
+    );
+    let seen = serve_once_spawned(argv.clone(), run.join("control.sock"), vec![]);
+    let key = "FAKE\"\\ ".repeat(8) + "FAKEFAKE";
+    let mut launch = macos_launch(run, None);
+    let Launch::Vm { paths, .. } = &mut launch else {
+        unreachable!()
+    };
+    paths.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse(key.clone()).unwrap());
+    let running = VmlabHv::for_vm(Some(bin), None)
+        .start_emulator(spec(run, launch))
+        .await
+        .unwrap();
+    assert!(seen.try_iter().next().is_none(), "guest is still paused");
+    assert_eq!(
+        crate::qemu::tsc::read_pin(&run.join("tsc-hz")).unwrap(),
+        Some(4_291_934_000)
+    );
+    let argv = std::fs::read_to_string(argv).unwrap();
+    assert!(argv.starts_with("--machine /proc/"));
+    assert!(!argv.contains(&"FAKE".repeat(16)));
+    for path in ["machine.json", "vmlab-hv.log"] {
+        let dump = std::fs::read_to_string(run.join(path)).unwrap();
+        assert!(!dump.contains(&key), "{path} leaked the OSK");
+        let escaped = serde_json::to_string(&key).unwrap();
+        assert!(
+            !dump.contains(&escaped[1..escaped.len() - 1]),
+            "{path} leaked the escaped OSK"
+        );
+        assert!(dump.to_lowercase().contains("redacted"));
+    }
+    running.proc.kill().await;
+    running
+        .proc
+        .wait_exit(Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn macos_startup_errors_cannot_echo_the_private_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path();
+    let bin = fake_binary(run, "cat \"$2\" >&2; exit 2");
+    let error = VmlabHv::for_vm(Some(bin), None)
+        .start_emulator(spec(run, macos_launch(run, None)))
+        .await
+        .err()
+        .unwrap();
+    assert!(!format!("{error:#}").contains(&"FAKE".repeat(16)));
+    let log = std::fs::read_to_string(run.join("vmlab-hv.log")).unwrap();
+    assert!(!log.contains(&"FAKE".repeat(16)));
+}
+
+#[test]
+fn tsc_reports_are_positive_and_belong_to_this_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("hv.log");
+    std::fs::write(&log, "vmlab-hv: tsc_khz=1234\n").unwrap();
+    let from = crate::qemu::process::log_offset(&log);
+    assert!(reported_tsc_hz(&log, from).is_err());
+    for value in ["0", "bad", "4294967296"] {
+        std::fs::write(&log, format!("vmlab-hv: tsc_khz={value}\n")).unwrap();
+        assert!(reported_tsc_hz(&log, 0).is_err());
+    }
+}

@@ -879,24 +879,15 @@ MSG
   DOC
 
   h2 "A macOS guest hangs or panics early in boot"
-  code text { source = "warning: vm \"{machine}\": a macOS guest needs KVM to ignore the MSRs it does not emulate, and this host's kvm has ignore_msrs off (/sys/module/kvm/parameters/ignore_msrs = {value}), so the guest faults during boot — set it with `echo \"options kvm ignore_msrs=1 report_ignored_msrs=0\" | sudo tee /etc/modprobe.d/kvm-msrs.conf` and, until the next boot, `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` (PRD §5.2)" }
   p <<DOC
-    The symptom is a macOS guest that stops at the Apple logo, reboots in a
-    loop, or shows a kernel panic within the first seconds of boot. XNU reads
-    Intel model-specific registers that KVM does not emulate, and unless the
-    `kvm` module's `ignore_msrs` parameter is on, KVM answers each read with a
-    general-protection fault. On an AMD host that happens on every boot.
-    `vmlab up` prints the warning above for any VM it starts under KVM whose
-    profile name starts with `macos` or whose `apple_smc` resolves on, but it
-    still starts the VM.
-  DOC
-  p <<DOC
-    Run both commands from the warning: the first makes the setting permanent
-    from the next module load, and the second turns it on now. Then restart
-    the VM with `vmlab vm restart`. `cat /sys/module/kvm/parameters/ignore_msrs`
-    prints `Y` once it is on. `report_ignored_msrs=0` keeps the kernel log
-    free of a line for every ignored read. See
-    [Host configuration and WSL 2](guide_host).
+    macOS runs only on vmlab-hv. Check `vmlab status -v` for
+    `hypervisor=vmlab` and inspect `vmlab-hv.log` for startup failures.
+    The shipped `macos` profile supplies the named Intel CPU, invariant
+    pinned TSC, USB keyboard and VMware SVGA display. The template must
+    carry OpenCore in its EFI partition, and the host configuration must
+    supply `apple_smc_osk`. vmlab-hv handles unknown MSRs per machine;
+    do not change the host's `kvm.ignore_msrs` setting for macOS.
+    See [Host configuration and WSL 2](guide_host).
   DOC
 
   h2 "A pinned TSC was not applied"

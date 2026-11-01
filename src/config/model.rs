@@ -523,10 +523,8 @@ pub struct Vm {
     /// it). Exclusive with `secure_boot_keys`.
     pub secure_boot_vars: Option<PathBuf>,
     pub qemu_args: Vec<String>,
-    /// The hypervisor this VM runs on (§22); None = the host config's
-    /// default for VMs. Declared on the machine alone: which program runs
-    /// the hardware is not itself hardware, so it never resolves through
-    /// template or profile (ADR-0008).
+    /// The hypervisor this VM runs on (§22); machine > effective profile >
+    /// host default. A template can select the profile, not the hypervisor.
     pub hypervisor: Option<crate::config::hypervisor::HypervisorKind>,
     pub gpu: Option<Gpu>,
     pub nics: Vec<Nic>,

@@ -5,6 +5,12 @@ Anything left unreported is a gap in the suite and fails the run.
 """
 
 FEATURES: dict[str, str] = {
+    "macos.ready": "macOS on vmlab-hv reaches agent-ready",
+    "macos.exec": "macOS executes a command over the agent",
+    "macos.cp": "macOS copies files in both directions",
+    "macos.screenshot": "macOS supplies a screenshot",
+    "macos.snapshot": "macOS online snapshot restores disk contents and the TSC pin",
+    "macos.stop": "macOS stops through its agent",
     # -- templates ---------------------------------------------------------
     "template.build.qcow2": "build a template from a cloud qcow2 source",
     "template.build.layered": "build a template layered on another (`source \"template\"`)",
@@ -230,12 +236,13 @@ FEATURES: dict[str, str] = {
 HOST = "host"
 
 # Every phase in the order vmlab-hv delivers them.
-PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
+PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "macos", "3", "4")
 
 # The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
-VMLAB_DELIVERED = "2f"
+VMLAB_DELIVERED = "macos"
 
 _GROUPS: dict[str, list[str]] = {
+    "macos": ["macos.ready", "macos.exec", "macos.cp", "macos.screenshot", "macos.snapshot", "macos.stop"],
     HOST: [
         "template.list", "template.export", "template.import", "template.rm", "template.clean",
         "template.registry.login", "template.registry.push", "template.registry.pull",
@@ -330,6 +337,8 @@ def out_of_scope(feature: str, hypervisor: str, delivered: str = VMLAB_DELIVERED
     """Why `feature` does not apply on `hypervisor` with phases through
     `delivered` landed, or None when it does."""
     if hypervisor == "qemu":
+        if PHASES.get(feature) == "macos":
+            return "macOS requires vmlab-hv"
         return None
     if feature in QEMU_ONLY:
         return f"QEMU only: {QEMU_ONLY[feature]}"
