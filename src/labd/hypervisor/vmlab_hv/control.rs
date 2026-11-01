@@ -62,7 +62,19 @@ impl HvControl {
         .context("vmlab-hv control connect task")?
         .with_context(|| format!("vmlab-hv control socket {}", socket.display()))?;
 
-        let capabilities = commands.capabilities().to_vec();
+        let capabilities = commands
+            .capabilities()
+            .iter()
+            .filter(|capability| {
+                if let Capability::Unknown(name) = capability {
+                    tracing::debug!(capability = name, "ignoring unknown vmlab-hv capability");
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         tracing::debug!(
             hv_version = commands.hv_version(),
             ?capabilities,
@@ -154,6 +166,10 @@ fn observe(
         Event::Wakeup => "WAKEUP",
         Event::DeviceDeleted { .. } => "DEVICE_DELETED",
         Event::Exiting { .. } | Event::DiagnosticsDumped { .. } => return,
+        Event::Unknown { name } => {
+            tracing::debug!(event = name, "ignoring unknown vmlab-hv event");
+            return;
+        }
     };
     if let Some(now) = super::super::sleep_transition(name) {
         asleep.send_if_modified(|was| std::mem::replace(was, now) != now);
@@ -188,7 +204,7 @@ fn refused(what: &str, outcome: Outcome) -> Result<Option<RunState>> {
         Outcome::Ok { status } => Ok(status),
         Outcome::Error { code, message } => Err(anyhow!(
             "vmlab-hv refused `{what}`: {message} ({})",
-            serde_json::to_value(code)
+            serde_json::to_value(&code)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("{code:?}"))
@@ -477,6 +493,48 @@ mod tests {
             hv.seen.try_iter().collect::<Vec<_>>(),
             vec![Command::Resume]
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_capabilities_and_events_do_not_change_state_or_end_the_stream() {
+        let hv = fake_hv(
+            vec![
+                Capability::Unknown("future_capability".into()),
+                Capability::Snapshots,
+            ],
+            ok,
+        );
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        assert_eq!(control.capabilities, vec![Capability::Snapshots]);
+        assert!(control.snapshots().is_some());
+        assert!(control.frames().is_none() && control.input().is_none());
+        assert!(control.hotplug().is_none());
+        control.pause().await.unwrap();
+        (hv.events)(Event::Unknown {
+            name: "future_event".into(),
+        });
+        (hv.events)(Event::Reset);
+        eventually("reset after unknown event", || {
+            *control.resets.borrow() == 1
+        })
+        .await;
+        assert!(!control.guest_shutdown());
+        assert!(!*control.asleep.borrow());
+        assert!(!*control.events_closed.borrow());
+        control.resume().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_error_code_is_reported_as_a_generic_refusal() {
+        let hv = fake_hv(vec![], |_| Outcome::Error {
+            code: ErrorCode::Unknown("future_error".into()),
+            message: "operation refused".into(),
+        });
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        let err = format!("{:#}", control.resume().await.unwrap_err());
+        assert!(err.contains("`resume`"), "{err}");
+        assert!(err.contains("future_error"), "{err}");
+        assert!(err.contains("operation refused"), "{err}");
     }
 
     #[tokio::test]
