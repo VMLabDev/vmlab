@@ -303,16 +303,7 @@ impl Fixture {
                 "exec" => {
                     check!("exec", exec_case(&handle, &root));
                     check!("flow_control", self.flow_control(&handle));
-                    match tokio::time::timeout(BUDGET, self.cancellation(&handle, &root)).await {
-                        Ok(Ok(true)) => report.deviation(
-                            "cancellation",
-                            "F11",
-                            "process killed, but closed channel emitted EOF/exited",
-                        ),
-                        Ok(Ok(false)) => report.check("cancellation", Ok(())),
-                        Ok(Err(e)) => report.check("cancellation", Err(e)),
-                        Err(e) => report.check("cancellation", Err(e.into())),
-                    }
+                    check!("cancellation", self.cancellation(&handle, &root));
                 }
                 "terminal" => check!("terminal", terminal_case(&handle)),
                 "fileops" => check!("fileops", fileops_case(&handle, &root)),
@@ -546,18 +537,49 @@ impl Fixture {
         Ok(())
     }
 
-    async fn cancellation(&self, handle: &AgentHandle, root: &str) -> Result<bool> {
+    async fn cancellation(&self, handle: &AgentHandle, root: &str) -> Result<()> {
         let path = format!("{root}/cancelled");
-        let script = "import os,sys,time; time.sleep(0.8); open(sys.argv[1],'w').write('alive')";
-        let session = handle
-            .open_exec(
-                vec!["python3".into(), "-c".into(), script.into(), path.clone()],
-                vec![],
-                None,
-                None,
-            )
-            .await?;
+        let script = "import sys,time; sys.stdout.write('cancel-ready'); sys.stdout.flush(); time.sleep(0.8); open(sys.argv[1],'w').write('alive')";
+        let argv = || vec!["python3".into(), "-c".into(), script.into(), path.clone()];
+        let session = handle.open_exec(argv(), vec![], None, None).await?;
+        self.cancel_session(handle, session, path.clone()).await?;
+        if handle.has_feature("terminal") {
+            let mut command = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec \"$@\"".into(),
+                "sh".into(),
+            ];
+            command.extend(argv());
+            let session = handle
+                .open_terminal(80, 24, Some(command), vec![], None)
+                .await?;
+            self.cancel_session(handle, session, path).await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_session(
+        &self,
+        handle: &AgentHandle,
+        mut session: AgentSession,
+        path: String,
+    ) -> Result<()> {
         let id = session.id;
+        let mut ready = Vec::new();
+        while !ready
+            .windows(b"cancel-ready".len())
+            .any(|w| w == b"cancel-ready")
+        {
+            match tokio::time::timeout(BUDGET, session.recv()).await? {
+                Some(SessionEvent::Data(bytes)) => ready.extend(bytes),
+                other => bail!("cancelled process did not become ready: {other:?}"),
+            }
+        }
+        let (before, data_before) = {
+            let trace = self.trace.lock().unwrap();
+            (trace.ctrl.len(), trace.data.get(&id).copied().unwrap_or(0))
+        };
         session.close().await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
         let out = handle
@@ -570,14 +592,23 @@ impl Fixture {
                 None,
             )
             .await?;
-        ensure(out.exit_code == 0, "closed exec continued running")?;
+        ensure(out.exit_code == 0, "closed process continued running")?;
         let trace = self.trace.lock().unwrap();
         ensure(
-            trace.data.get(&id).copied().unwrap_or(0) == 0,
-            "closed silent process emitted data",
+            trace.data.get(&id).copied().unwrap_or(0) == data_before,
+            "closed process emitted more data",
         )?;
-        Ok(trace.ctrl.iter().any(|m|
-            matches!(m, AgentMsg::Exited { id: channel, .. } | AgentMsg::Eof { id: channel } if *channel == id)))
+        ensure(
+            !trace.ctrl[before..].iter().any(|m| {
+                matches!(m,
+                AgentMsg::Opened { id: channel }
+                | AgentMsg::WindowAdjust { id: channel, .. }
+                | AgentMsg::Exited { id: channel, .. }
+                | AgentMsg::Eof { id: channel }
+                | AgentMsg::Error { id: Some(channel), .. } if *channel == id)
+            }),
+            "F11: closed channel emitted a control frame",
+        )
     }
 
     async fn metrics(&self, handle: &AgentHandle) -> Result<()> {
@@ -726,7 +757,6 @@ struct Report {
     failures: Vec<String>,
     skipped: usize,
     passed: usize,
-    known: usize,
 }
 
 impl Report {
@@ -746,22 +776,12 @@ impl Report {
         self.skipped += 1;
         eprintln!("CONFORMANCE {feature} SKIP {reason}");
     }
-    fn deviation(&mut self, feature: &str, id: &str, reason: &str) {
-        let allowed = std::env::var("VMLAB_CONFORMANCE_ALLOW_FINDINGS").unwrap_or_default();
-        if allowed.split(',').any(|s| s == id) {
-            self.known += 1;
-            eprintln!("CONFORMANCE {feature} KNOWN {id}: {reason}");
-        } else {
-            self.check(feature, Err(anyhow!("{id}: {reason}")));
-        }
-    }
     fn finish(self) -> Result<()> {
         eprintln!(
-            "CONFORMANCE total PASS={} FAIL={} SKIP={} KNOWN={}",
+            "CONFORMANCE total PASS={} FAIL={} SKIP={}",
             self.passed,
             self.failures.len(),
-            self.skipped,
-            self.known
+            self.skipped
         );
         ensure(
             self.failures.is_empty(),

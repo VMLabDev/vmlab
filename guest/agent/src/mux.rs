@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -84,6 +85,7 @@ impl Credit {
 
 /// One live channel.
 struct Session {
+    channel: Channel,
     input: Option<SyncSender<Input>>,
     credit: Arc<Credit>,
     /// Applies a terminal resize (PTY sessions only).
@@ -97,13 +99,42 @@ struct Session {
 #[derive(Clone)]
 pub struct Mux {
     inner: Arc<MuxInner>,
+    channel: Option<Channel>,
+}
+
+#[derive(Clone)]
+struct Channel {
+    id: u32,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Channel {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+struct Outbound {
+    bytes: Vec<u8>,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl Outbound {
+    fn cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
 }
 
 struct MuxInner {
     /// Encoded frames for the port writer thread. Bounded: senders block
     /// when the host is slow/absent, which is the flow-control backstop for
     /// control traffic (data traffic is credit-limited before it gets here).
-    out: SyncSender<Vec<u8>>,
+    out: SyncSender<Outbound>,
     sessions: Mutex<HashMap<u32, Session>>,
     /// This process, as the handshake and every pong name it: a restarted
     /// agent answers the host's pings on the same channel, and only a
@@ -181,7 +212,7 @@ fn write_was_abandoned(e: &std::io::Error) -> bool {
 impl Mux {
     /// Start the writer thread over the port's write half and return the mux.
     pub fn new(mut port_w: impl Write + Send + 'static) -> Mux {
-        let (out, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(OUT_QUEUE);
+        let (out, rx): (SyncSender<Outbound>, Receiver<Outbound>) = sync_channel(OUT_QUEUE);
         thread::spawn(move || {
             for frame in rx {
                 // Blocks until the host side is connected — that is the
@@ -197,7 +228,10 @@ impl Mux {
                 // exception is a write the driver still owns, which it will
                 // deliver itself.
                 let mut told = false;
-                while let Err(e) = port_w.write_all(&frame) {
+                while !frame.cancelled() {
+                    let Err(e) = port_w.write_all(&frame.bytes) else {
+                        break;
+                    };
                     if write_was_abandoned(&e) {
                         break;
                     }
@@ -211,6 +245,7 @@ impl Mux {
             }
         });
         Mux {
+            channel: None,
             inner: Arc::new(MuxInner {
                 out,
                 sessions: Mutex::new(HashMap::new()),
@@ -220,15 +255,34 @@ impl Mux {
         }
     }
 
+    /// Bind all replies and cleanup to this opening of a channel. Old
+    /// workers retain its cancellation flag even if the host reuses the id.
+    pub fn for_channel(&self, id: u32) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            channel: Some(Channel::new(id)),
+        }
+    }
+
+    fn send(&self, bytes: Vec<u8>) {
+        let frame = Outbound {
+            bytes,
+            cancelled: self.channel.as_ref().map(|c| c.cancelled.clone()),
+        };
+        if !frame.cancelled() {
+            let _ = self.inner.out.send(frame);
+        }
+    }
+
     /// Send a control message to the host.
     pub fn send_ctrl(&self, msg: &AgentMsg) {
-        let _ = self.inner.out.send(encode_ctrl(msg));
+        self.send(encode_ctrl(msg));
     }
 
     /// Send channel payload bytes. The caller must have taken credit first.
     pub fn send_data(&self, kind: FrameKind, channel: u32, payload: &[u8]) {
         debug_assert!(payload.len() <= MAX_PAYLOAD);
-        let _ = self.inner.out.send(encode_frame(kind, channel, payload));
+        self.send(encode_frame(kind, channel, payload));
     }
 
     /// The shared-app session table.
@@ -245,7 +299,8 @@ impl Mux {
 
     /// Register a new session. Returns the input receiver for the session's
     /// pump and its send credit, or `None` (+ an error to the host) if the
-    /// id is already live.
+    /// id is already live. Use a channel-bound mux from [`Mux::for_channel`]
+    /// for registration and every worker belonging to the session.
     pub fn register(
         &self,
         id: u32,
@@ -260,9 +315,12 @@ impl Mux {
         }
         let (tx, rx) = sync_channel(INPUT_QUEUE);
         let credit = Arc::new(Credit::new());
+        let channel = self.channel.clone().expect("channel-bound session mux");
+        assert_eq!(channel.id, id);
         sessions.insert(
             id,
             Session {
+                channel,
                 input: Some(tx),
                 credit: credit.clone(),
                 resize,
@@ -280,8 +338,8 @@ impl Mux {
     pub fn set_kill(&self, id: u32, kill: Box<dyn FnOnce() + Send>) {
         let mut sessions = self.inner.sessions.lock().unwrap();
         match sessions.get_mut(&id) {
-            Some(s) => s.kill = Some(kill),
-            None => {
+            Some(s) if self.owns(s) => s.kill = Some(kill),
+            _ => {
                 drop(sessions);
                 kill();
             }
@@ -293,6 +351,7 @@ impl Mux {
     pub fn remove(&self, id: u32) {
         let session = self.inner.sessions.lock().unwrap().remove(&id);
         if let Some(mut s) = session {
+            s.channel.cancelled.store(true, Ordering::SeqCst);
             s.credit.close();
             s.input = None; // drop the sender: input pump sees EOF
             if let Some(kill) = s.kill.take() {
@@ -305,12 +364,24 @@ impl Mux {
     /// without the kill hook (the process is already reaped; its pid may
     /// have been recycled).
     pub fn remove_finished(&self, id: u32) {
-        let session = self.inner.sessions.lock().unwrap().remove(&id);
+        let session = {
+            let mut sessions = self.inner.sessions.lock().unwrap();
+            if !sessions.get(&id).is_some_and(|s| self.owns(s)) {
+                return;
+            }
+            sessions.remove(&id)
+        };
         if let Some(mut s) = session {
             s.credit.close();
             s.input = None;
             s.kill = None;
         }
+    }
+
+    fn owns(&self, session: &Session) -> bool {
+        self.channel
+            .as_ref()
+            .is_none_or(|c| Arc::ptr_eq(&c.cancelled, &session.channel.cancelled))
     }
 
     /// The port connection was reset under every live session: fail each
@@ -914,6 +985,7 @@ mod tests {
         for id in [3u32, 4] {
             let k = killed.clone();
             let (input, credit) = mux
+                .for_channel(id)
                 .register(id, None, Some(Box::new(move || k.lock().unwrap().push(id))))
                 .unwrap();
             inputs.push((input, credit));
@@ -949,9 +1021,9 @@ mod tests {
     #[test]
     fn duplicate_channel_id_is_an_error() {
         let (mux, mut cap) = capture_mux();
-        let first = mux.register(7, None, None);
+        let first = mux.for_channel(7).register(7, None, None);
         assert!(first.is_some());
-        assert!(mux.register(7, None, None).is_none());
+        assert!(mux.for_channel(7).register(7, None, None).is_none());
         match cap.ctrl() {
             AgentMsg::Error { id: Some(7), .. } => {}
             other => panic!("expected error for id 7, got {other:?}"),
@@ -961,7 +1033,7 @@ mod tests {
     #[test]
     fn channel_zero_cannot_be_a_session() {
         let (mux, _cap) = capture_mux();
-        assert!(mux.register(0, None, None).is_none());
+        assert!(mux.for_channel(0).register(0, None, None).is_none());
     }
 
     #[test]
@@ -993,6 +1065,7 @@ mod tests {
         let killed = Arc::new(Mutex::new(false));
         let k = killed.clone();
         let (input, credit) = mux
+            .for_channel(3)
             .register(3, None, Some(Box::new(move || *k.lock().unwrap() = true)))
             .unwrap();
         mux.remove(3);
@@ -1005,9 +1078,83 @@ mod tests {
     }
 
     #[test]
+    fn close_discards_queued_frames_and_old_workers_cannot_retire_a_reused_id() {
+        struct BlockedPort {
+            frames: std::sync::mpsc::Sender<Vec<u8>>,
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            first: bool,
+        }
+        impl Write for BlockedPort {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.first) {
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                self.frames.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let mux = Mux::new(BlockedPort {
+            frames: tx,
+            entered: entered_tx,
+            release: release_rx,
+            first: true,
+        });
+        let barrier = AgentMsg::Pong { instance: None };
+        mux.send_ctrl(&barrier);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+
+        let old = mux.for_channel(7);
+        let (_input, credit) = old.register(7, None, None).unwrap();
+        assert_eq!(credit.take(10), 10);
+        old.send_data(FrameKind::Data, 7, b"queued stdout");
+        old.send_data(FrameKind::DataErr, 7, b"queued stderr");
+        old.send_ctrl(&AgentMsg::WindowAdjust { id: 7, bytes: 10 });
+        old.send_error(Some(7), "queued error");
+        old.send_ctrl(&AgentMsg::Eof { id: 7 });
+        old.send_ctrl(&AgentMsg::Exited { id: 7, code: 9 });
+        mux.remove(7);
+
+        let current = mux.for_channel(7);
+        let (_input, _credit) = current.register(7, None, None).unwrap();
+        old.send_ctrl(&AgentMsg::Exited { id: 7, code: 9 });
+        old.remove_finished(7);
+        assert!(mux.inner.sessions.lock().unwrap().contains_key(&7));
+        let opened = AgentMsg::Opened { id: 7 };
+        let eof = AgentMsg::Eof { id: 7 };
+        let exited = AgentMsg::Exited { id: 7, code: 0 };
+        current.send_ctrl(&opened);
+        current.send_ctrl(&eof);
+        current.send_ctrl(&exited);
+        current.remove_finished(7);
+        mux.send_ctrl(&barrier);
+        release_tx.send(()).unwrap();
+
+        for msg in [&barrier, &opened, &eof, &exited, &barrier] {
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+                encode_ctrl(msg)
+            );
+        }
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn route_input_reaches_session_and_ignores_strays() {
         let (mux, _cap) = capture_mux();
-        let (input, _credit) = mux.register(9, None, None).unwrap();
+        let (input, _credit) = mux.for_channel(9).register(9, None, None).unwrap();
         mux.route_input(9, Input::Bytes(b"abc".to_vec()));
         mux.route_input(9, Input::Eof);
         mux.route_input(1234, Input::Bytes(b"stray".to_vec())); // no panic
@@ -1021,6 +1168,7 @@ mod tests {
     #[test]
     fn pump_out_respects_credit_and_frames_data() {
         let (mux, mut cap) = capture_mux();
+        let mux = mux.for_channel(5);
         let (_input, credit) = mux.register(5, None, None).unwrap();
         let data = vec![7u8; 100_000]; // > one frame, < initial window
         pump_out(&mux, 5, FrameKind::Data, &credit, &data[..]);

@@ -2668,9 +2668,9 @@ mod tests {
                                     }
                                 }
                                 HostMsg::Close { id } => {
-                                    if terminals.contains(&id) {
-                                        send(AgentMsg::Exited { id, code: 137 }).await;
-                                    }
+                                    terminals.retain(|&channel| channel != id);
+                                    files.remove(&id);
+                                    watches.remove(&id);
                                 }
                                 // An idle first sample, then a busy one
                                 // after the host has stopped waiting.

@@ -46,6 +46,7 @@ use rdcw as backend;
 /// host's list of root-relative directory prefixes to register no watcher
 /// under (§19.6): registration is pruned, filtering stays host-side.
 pub fn open(mux: &Mux, id: u32, root: String, prune: Vec<String>) {
+    let mux = &mux.for_channel(id);
     match std::fs::metadata(&root) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => {

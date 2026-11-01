@@ -170,8 +170,9 @@ an EOF message. Terminal input EOF is ignored.
 Closing exec kills its direct process, not arbitrary descendants. `tree` counts
 descendants but does not make close a tree-kill operation. Closed IDs must emit
 no new frames, although already-written bytes can still arrive at the host.
-The Rust reapers intentionally still report EOF and exit after close, contrary
-to this type-level contract. F11 records that disagreement.
+The Rust mux cancels pending channel frames and suppresses later sends from
+session workers, including EOF, exit status, errors, and credit grants.
+Processes that finish before close still report their output and exit normally.
 Unknown close, EOF, data, and credit for vanished Rust channels are ignored.
 
 Credit prevents one stream from growing without limit. It does not guarantee
@@ -393,14 +394,14 @@ message. TempleOS is synchronous and has the output cap described above.
 | F8 | Cache key omits elevation (`guest/agent/src/logon.rs:42-53`, `guest/agent/src/windows/logon.rs:115`), while mint applies it once (`guest/agent/src/windows/logon.rs:174`). | Same credentials can reuse the first elevation selection. Source-confirmed, Windows not executed here. |
 | F9 | TempleOS comment says stdin is credited (`guest/agent-templeos/VmlabAgt.HC:476`); main loop discards data without credit (`:650-653`). | Input larger than initial window can stall. |
 | F10 | Legacy accepts 64 argv values into an array of 64 pointers without a reserved NULL slot (`guest/agent-legacy/src/agent.c:301`, `:349-358`), then passes it to execvp (`guest/agent-legacy/src/plat_posix.c:187`). | Source concern; boundary not reproduced. |
-| F11 | Close says no more frames (`guest/agent-proto/src/lib.rs`, `HostMsg::Close`), but exec sends EOF and exit unconditionally (`guest/agent/src/exec.rs:115-120`), and terminal sends exit (`guest/agent/src/terminal.rs:106`). `guest/agent/src/sessions_test.rs:113` explicitly expects late terminal exit. | Reproduced on full Linux. Cancellation kills the process, but quiet close is not met. Preserved because existing tests require it. |
+| F11 | Exec and terminal reapers emitted EOF or exit after host close, contrary to `HostMsg::Close` (`guest/agent-proto/src/lib.rs`). | Resolved. The Rust mux cancels queued frames and suppresses worker replies for closed channels across exec, terminal, tail, watch, fileops, apps, and eventlog. Regression tests cover delayed exit and channel-ID reuse. Quiet cancellation is a required conformance pass. |
 | F12 | Legacy refusal dispatch used `open_fileops` and `open_eventlog`, while serde sends `open_file_ops` and `open_event_log` (`guest/agent-proto/src/lib.rs:1168`, `:1250`; corrected dispatch in `guest/agent-legacy/src/agent.c:510-517`). TempleOS has the same spellings (`guest/agent-templeos/VmlabAgt.HC:627`, `:633`). | Reproduced C timeout. C fixed in `a9b80fa`, retaining old aliases. TempleOS not changed or executed. |
 | F13 | C errors take signed `long` and omit negative IDs (`guest/agent-legacy/src/agent.c:93-101`), but the wire permits all nonzero uint32 IDs. Dispatch casts an unsigned channel ID to `long` (`:509-519`). | On 32-bit legacy targets, IDs above 2147483647 lose error correlation. Source concern; those targets were not executed. |
 
 These findings are not silently normalized into requirements for every tier.
 A new full agent should implement the shared semantics and explicitly choose
-compatibility where a listed implementation disagrees. Only the clearly
-incorrect C refusal dispatch is fixed. Other findings remain unchanged.
+compatibility where a listed implementation disagrees. The C refusal dispatch
+and Rust quiet close are fixed. Other findings remain unchanged.
 
 ## Run conformance
 
@@ -422,13 +423,16 @@ It never boots a VM.
 
 ```sh
 CARGO_BUILD_JOBS=8 cargo build --manifest-path guest/agent/Cargo.toml
-CARGO_BUILD_JOBS=8 VMLAB_CONFORMANCE_ALLOW_FINDINGS=F11 just agent-conformance guest/agent/target/debug/vmlab-agent pty full
+CARGO_BUILD_JOBS=8 just agent-conformance guest/agent/target/debug/vmlab-agent pty full
 ```
 
 The C POSIX build and the same cases run with:
 
 ```sh
-CARGO_BUILD_JOBS=8 cargo test --lib legacy_agent_conformance -- --nocapture
+legacy_build_dir=$(mktemp -d)
+cc -std=c99 -Wall -Wextra -Werror -O1 '-DAGENT_VERSION="agent-legacy=test"' \
+  -o "$legacy_build_dir/agent" guest/agent-legacy/src/{json,wire,agent,plat_posix}.c
+CARGO_BUILD_JOBS=8 just agent-conformance "$legacy_build_dir/agent" listen legacy
 ```
 
 A future implementation needs no runner changes:
@@ -455,11 +459,9 @@ fixtures use POSIX commands. DOS, Windows, macOS, and TempleOS runtime semantics
 are documented here but are not certified by a Linux POSIX run. A non-POSIX
 endpoint reports command failures; selecting its tier does not translate commands.
 
-Each case prints `CONFORMANCE <name> PASS`, `FAIL <reason>`, `SKIP <reason>`, or
-`KNOWN <finding>: <reason>`. By default every deviation fails. An explicit
-comma-separated `VMLAB_CONFORMANCE_ALLOW_FINDINGS` permits only named findings.
-CI accepts F11 for the unchanged Rust agent. KNOWN and SKIP are counted
-separately from PASS. Any other failure gives a nonzero exit.
+Each case prints `CONFORMANCE <name> PASS`, `FAIL <reason>`, or `SKIP <reason>`.
+Every deviation fails, including frames emitted after close. SKIP is counted
+separately from PASS. Any failure gives a nonzero exit.
 `AGENT` records the build stamp, OS, and advertisement. Cases cover baseline
 metadata, injected noise in both directions, false magic, exec fields and errors,
 multiplexing, a stalled receive window, duplex megabyte transfers, cancellation,
@@ -493,7 +495,7 @@ The full agent advertised no clipboard in the isolated, headless environment.
 | Injected garbage and invalid headers | PASS | PASS |
 | Exec fields, error paths, multiplexing | PASS | PASS |
 | Megabyte duplex transfer and stalled-window control responsiveness | PASS | PASS |
-| Cancellation | KNOWN F11: child killed, late EOF/exit | PASS |
+| Cancellation, including quiet close | PASS, exec and terminal | PASS, exec |
 | Terminal input, resize, exit | PASS | Not advertised; refusal checked |
 | Fileops, pipelining, handle scope, flags, limits, errors, digest | PASS | Not advertised; refusal checked |
 | Tail, truncation, rotation | PASS | Not advertised; refusal checked |
@@ -510,11 +512,10 @@ The full agent advertised no clipboard in the isolated, headless environment.
 | Invalid logon | PASS | PASS |
 | Same-stream hello kills the old epoch; instance stable | PASS | PASS |
 | Powerdown, reboot, halt acknowledgements | PASS | PASS |
-| Runner totals | 20 PASS, 1 KNOWN, 0 FAIL, 0 SKIP | 12 PASS, 0 FAIL, 0 SKIP |
+| Runner totals | 21 PASS, 0 FAIL, 0 SKIP | 12 PASS, 0 FAIL, 0 SKIP |
 
-The strict Rust run returns nonzero for F11. The named CI exception changes its
-report to KNOWN, not PASS. The standalone already-listening socket recipe was
-also exercised against C POSIX: 10 PASS, 2 SKIP, 0 FAIL. Its two skips are clock
+The standalone already-listening socket recipe was also exercised against C
+POSIX: 10 PASS, 2 SKIP, 0 FAIL. Its two skips are clock
 writes and power operations because that runner cannot establish isolation.
 
 `CARGO_BUILD_JOBS=8 just ci::check` passed. Later attempts intermittently hit
