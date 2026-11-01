@@ -297,14 +297,11 @@ _GROUPS: dict[str, list[str]] = {
     "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1"],
 }
 
-# Scenarios whose VMs stay on QEMU on a vmlab-hv run, and why: `core` proves
-# most of what it covers from QEMU's own argv and pid, and its lab declares
-# `qemu_args` and floppies. Their host and container features still count;
+# Scenarios whose VMs stay on QEMU on a vmlab-hv run, and why.
+# Their host and container features still count;
 # a VM feature they report is skipped with the reason, never passed, since a
 # pass on QEMU says nothing about vmlab-hv (`Harness._record`).
 QEMU_SCENARIOS: dict[str, str] = {
-    "core": "`core` proves it from QEMU's argv, and its lab declares `qemu_args` and floppies",
-    "admin": "the `admin` lab declares an emulated aarch64 VM (phase 3)",
     "fastpath": "the kernel fast-path tiers attach VM NICs as taps, and vmlab-hv takes stream sockets only",
 }
 

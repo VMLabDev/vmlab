@@ -1,0 +1,13 @@
+// A supported x86_64 VM for the same administration checks as admin-lab.
+import <vmlab.wcl>
+
+lab "e2e-admin" {
+  vm "blank" {
+    template = "scratch"
+    arch     = "x86_64"
+    profile  = "linux-generic"
+    cpus     = 1
+    memory   = 256MiB
+    disk     = 1GiB
+  }
+}

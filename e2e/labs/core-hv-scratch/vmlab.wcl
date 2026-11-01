@@ -1,0 +1,13 @@
+// The scratch boot and forced stop need no other VM running.
+import <vmlab.wcl>
+
+lab "e2e-core-scratch" {
+  vm "blank" {
+    template = "scratch"
+    arch     = "x86_64"
+    profile  = "linux-generic"
+    disk     = 1GiB
+    cpus     = 1
+    memory   = 256MiB
+  }
+}

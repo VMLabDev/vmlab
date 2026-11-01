@@ -1,6 +1,6 @@
 """Host-wide administration: the `vmlab lab` verbs against a running lab, the
-supervisor's own lifecycle, and an emulated (non-x86) guest — the lab's one
-machine is an aarch64 VM under TCG, so it doubles as the thing to administer.
+supervisor's own lifecycle, and an emulated (non-x86) guest on QEMU.
+On vmlab-hv, a supported x86_64 scratch VM exercises the same lab verbs.
 """
 
 import pathlib
@@ -9,6 +9,7 @@ import subprocess
 import time
 
 from harness import WORK, redact_osk
+from scenarios.core import machine_pid
 
 LAB = "e2e-admin"
 QEMU_NAME = f"vmlab:{LAB}/arm01"
@@ -50,11 +51,9 @@ def two_roots(h):
     (#143)."""
     with h.lab("admin-roots", under="a") as a, h.lab("admin-roots", under="b") as b:
         h.vmlab("up", cwd=a, timeout=300)
-        qemu = f"vmlab:{ROOTS}/blank"
-
         st = h.vmlab("status", cwd=b, check=False)
         dn = h.vmlab("down", cwd=b, check=False, timeout=120)
-        still = bool([p for p in pids(qemu) if alive(p)])
+        still = bool(machine_pid(ROOTS, "blank"))
         h.ok(
             "lab.status.conflict",
             st.code == 5 and str(a) in st.text and "blank" not in st.out
@@ -107,7 +106,7 @@ def two_roots(h):
             assert up.code == 0, up.text
             busy = h.vmlab("lab", "move", ROOTS, cwd=b, check=False)
             assert busy.code == 5 and "still has machines running" in busy.text, busy.text
-            assert [p for p in pids(f"vmlab:{ROOTS}/blank") if alive(p)], "the refused move stopped a's VM"
+            assert machine_pid(ROOTS, "blank"), "the refused move stopped a's VM"
             h.vmlab("down", cwd=a, timeout=300)
             return True
 
@@ -120,7 +119,8 @@ def two_roots(h):
 
 
 def run(h):
-    with h.lab("admin-lab") as lab:
+    vm = "arm01" if h.hypervisor == "qemu" else "blank"
+    with h.lab("admin-lab" if h.hypervisor == "qemu" else "admin-hv") as lab:
         h.vmlab("up", cwd=lab, timeout=300)
 
         # -- an aarch64 guest under TCG ----------------------------------------
@@ -144,33 +144,36 @@ def run(h):
             assert data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 1000, f"{len(data)} bytes"
             return True
 
-        h.check("arch.emulated", emulated,
-                "qemu-system-aarch64 -accel tcg; the bundled AAVMF reached its UEFI shell on serial; vm screenshot wrote a PNG")
+        if h.hypervisor == "qemu":
+            h.check("arch.emulated", emulated,
+                    "qemu-system-aarch64 -accel tcg; the bundled AAVMF reached its UEFI shell on serial; vm screenshot wrote a PNG")
+        else:
+            h.skip("arch.emulated", "vmlab-hv phase 3: aarch64 TCG emulation")
 
         # -- lab verbs -------------------------------------------------------
         h.check("lab.list",
                 lambda: listed(h).get(LAB) == "running" and str(lab) in h.vmlab("lab", "list").out,
                 "e2e-admin listed running with its directory")
         h.check("lab.info",
-                lambda: "arm01" in (i := h.vmlab("lab", "info", LAB).out) and str(lab) in i,
-                "names arm01 and the lab directory")
+                lambda: vm in (i := h.vmlab("lab", "info", LAB).out) and str(lab) in i,
+                f"names {vm} and the lab directory")
 
         refused = h.vmlab("lab", "restart", LAB, check=False)
         refused_ok = refused.code != 0 and "still has machines running" in refused.text
 
         def stop():
             h.vmlab("lab", "stop", LAB, timeout=300)
-            h.wait_until(lambda: not [p for p in pids(QEMU_NAME) if alive(p)], timeout=60,
-                         what="arm01's QEMU to exit")
+            h.wait_until(lambda: not machine_pid(LAB, vm), timeout=60,
+                         what=f"{vm}'s hypervisor process to exit")
             # A full stop by name is a full `down`: the daemon is reaped and
             # the name released (#142), checked at once since the release
             # waits for the daemon.
             assert not [p for p in pids(f"__labd --lab {LAB} ") if alive(p)], "the lab daemon outlived `lab stop`"
             assert LAB not in listed(h), h.vmlab("lab", "list").out
-            assert (lab / ".vmlab" / "vms" / "arm01").exists(), "clones were not retained"
+            assert (lab / ".vmlab" / "vms" / vm).exists(), "clones were not retained"
             return True
 
-        h.check("lab.stop", stop, "QEMU exited, the lab daemon reaped and the lab unlisted, clone retained")
+        h.check("lab.stop", stop, "hypervisor exited, the lab daemon reaped and the lab unlisted, clone retained")
 
         def restart():
             before = [p for p in pids(f"__labd --lab {LAB}") if alive(p)]
@@ -180,7 +183,7 @@ def run(h):
             assert "restarted" in r.out, r.out
             after = [p for p in pids(f"__labd --lab {LAB}") if alive(p)]
             assert after and set(after) != set(before), f"labd pids {before} -> {after}"
-            assert "arm01" in h.vmlab("lab", "info", LAB).out
+            assert vm in h.vmlab("lab", "info", LAB).out
             return True
 
         h.ok("lab.restart", refused_ok and h.check("lab.restart", restart),
