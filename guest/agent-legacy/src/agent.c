@@ -507,14 +507,16 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
         handle_set_time(js, ntok);
     } else if (strcmp(cmd, "open_terminal") == 0) {
         send_error((long)id, "legacy agent: no terminal (features: exec, set_time)");
-    } else if (strcmp(cmd, "open_fileops") == 0) {
+    } else if (strcmp(cmd, "open_file_ops") == 0 || strcmp(cmd, "open_fileops") == 0) {
         send_error((long)id, "legacy agent: no fileops (features: exec, set_time)");
     } else if (strcmp(cmd, "open_tail") == 0) {
         send_error((long)id, "legacy agent: no tail (features: exec, set_time)");
     } else if (strcmp(cmd, "open_watch") == 0) {
         send_error((long)id, "legacy agent: no watch (features: exec, set_time)");
-    } else if (strcmp(cmd, "open_eventlog") == 0) {
+    } else if (strcmp(cmd, "open_event_log") == 0 || strcmp(cmd, "open_eventlog") == 0) {
         send_error((long)id, "legacy agent: no eventlog (features: exec, set_time)");
+    } else if (strcmp(cmd, "open_app") == 0 || strcmp(cmd, "open_app_conn") == 0) {
+        send_error((long)id, "legacy agent: no apps (features: exec, set_time)");
     } else if (strcmp(cmd, "resize") == 0) {
         /* No terminals, so nothing to resize; silently fine. */
     } else if (strcmp(cmd, "subscribe_metrics") == 0 ||
