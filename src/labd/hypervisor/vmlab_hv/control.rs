@@ -153,6 +153,7 @@ fn observe(
         Event::Suspend => "SUSPEND",
         Event::Wakeup => "WAKEUP",
         Event::DeviceDeleted { .. } => "DEVICE_DELETED",
+        Event::Exiting { .. } | Event::DiagnosticsDumped { .. } => return,
     };
     if let Some(now) = super::super::sleep_transition(name) {
         asleep.send_if_modified(|was| std::mem::replace(was, now) != now);
@@ -463,6 +464,19 @@ mod tests {
 
     fn ok(_: &Command) -> Outcome {
         Outcome::Ok { status: None }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_in_the_handshake_preserves_lifecycle_capabilities() {
+        let hv = fake_hv(vec![Capability::Diagnostics, Capability::Snapshots], ok);
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        assert!(control.capabilities.contains(&Capability::Diagnostics));
+        assert!(control.snapshots().is_some());
+        control.resume().await.unwrap();
+        assert_eq!(
+            hv.seen.try_iter().collect::<Vec<_>>(),
+            vec![Command::Resume]
+        );
     }
 
     #[tokio::test]

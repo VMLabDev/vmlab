@@ -91,6 +91,8 @@ pub(crate) fn container(
         pci: None,
         bus: DiskBus::Virtio,
         port: None,
+        channel: None,
+        unit: None,
         cdrom: false,
         id: id.into(),
         path: Some(path.to_path_buf()),
@@ -102,6 +104,16 @@ pub(crate) fn container(
         // A guest reset happens in place, as under QEMU.
         exit_on_reset: false,
         machine: Machine::Microvm,
+        cpu_model: None,
+        invtsc: false,
+        tsc_khz: None,
+        vmware_cpuid_freq: false,
+        msr_policy: Default::default(),
+        applesmc: None,
+        usb_keyboard: false,
+        smbios_type2: false,
+        serial_log_port: Default::default(),
+        floppy: None,
         cpu: CpuPolicy::Host,
         hyperv: Vec::new(),
         display: None,
@@ -136,6 +148,7 @@ pub(crate) fn container(
             .nics
             .iter()
             .map(|(mac, socket, mtu)| Nic {
+                model: Default::default(),
                 rom: None,
                 pci: None,
                 mac: mac.to_string(),
@@ -148,10 +161,12 @@ pub(crate) fn container(
         serial_log: paths.serial_log.clone(),
         ports: vec![
             SerialPort {
+                transport: Default::default(),
                 name: "vmlab.ctl.0".into(),
                 socket: paths.ctl_sock.clone(),
             },
             SerialPort {
+                transport: Default::default(),
                 name: vmlab_agent_proto::PORT_NAME.into(),
                 socket: paths.agent_sock.clone(),
             },
@@ -364,6 +379,7 @@ pub(crate) fn vm(
     let console_pci = agent.then(|| slots.next());
     let ports = if agent {
         vec![SerialPort {
+            transport: Default::default(),
             name: vmlab_agent_proto::PORT_NAME.into(),
             socket: paths.agent_sock.clone(),
         }]
@@ -400,6 +416,8 @@ pub(crate) fn vm(
             pci,
             bus,
             port,
+            channel: None,
+            unit: None,
             cdrom: false,
             vmstate: id == VM_VMSTATE_DISK,
             id,
@@ -416,6 +434,8 @@ pub(crate) fn vm(
             pci: None,
             bus: DiskBus::Ahci,
             port: Some(port),
+            channel: None,
+            unit: None,
             cdrom: true,
             id: format!("cd{i}"),
             path: Some(iso.clone()),
@@ -441,6 +461,7 @@ pub(crate) fn vm(
             );
         };
         nics.push(Nic {
+            model: Default::default(),
             rom: if ovmf {
                 roms.ipxe_virtio_efi.clone()
             } else {
@@ -474,6 +495,9 @@ pub(crate) fn vm(
     let rom = match display_device {
         DisplayDevice::StdVga => roms.vgabios_std.clone(),
         DisplayDevice::VirtioVga => roms.vgabios_virtio.clone(),
+        DisplayDevice::CirrusVga | DisplayDevice::VmwareSvga => {
+            bail!("vm \"{name}\": vmlab-hv adapter supports std VGA and virtio VGA only")
+        }
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
     // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead. Under
@@ -504,6 +528,16 @@ pub(crate) fn vm(
         // sockets and every connection to them stay (PRD §22).
         exit_on_reset: false,
         machine: Machine::Q35,
+        cpu_model: None,
+        invtsc: false,
+        tsc_khz: None,
+        vmware_cpuid_freq: false,
+        msr_policy: Default::default(),
+        applesmc: None,
+        usb_keyboard: false,
+        smbios_type2: false,
+        serial_log_port: Default::default(),
+        floppy: None,
         cpu: if resolved.nested {
             CpuPolicy::Nested
         } else {
