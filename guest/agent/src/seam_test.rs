@@ -295,9 +295,46 @@ fn terminal_close_kills_the_shell_through_the_seam() {
     let shell = p.spawner.process(0);
 
     mux.remove(1);
-    let (_out, _err, code) = cap.until_exited(1);
     assert!(shell.killed());
-    assert_eq!(code, 128 + 9, "expected the SIGKILL-shaped code");
+    cap.assert_silent();
+}
+
+#[test]
+fn exec_and_terminal_close_stay_silent_when_exit_is_delayed() {
+    for terminal in [false, true] {
+        let (mux, mut cap) = capture_mux();
+        let p = TestPlatform::new();
+        let msg = if terminal {
+            HostMsg::OpenTerminal {
+                id: 1,
+                cols: 80,
+                rows: 24,
+                command: None,
+                env: vec![],
+                logon: None,
+            }
+        } else {
+            HostMsg::OpenExec {
+                id: 1,
+                argv: vec!["test".into()],
+                env: vec![],
+                cwd: None,
+                logon: None,
+                tree: None,
+            }
+        };
+        open(&mux, &p, msg);
+        assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
+        let child = p.spawner.process(0);
+        child.defer_exit_on_kill();
+        open(&mux, &p, HostMsg::Close { id: 1 });
+        assert!(child.killed());
+        cap.assert_silent();
+        child.say(b"late stdout");
+        child.say_err(b"late stderr");
+        child.finish(7);
+        cap.assert_silent();
+    }
 }
 
 #[test]
@@ -355,6 +392,30 @@ fn exec_splits_stdout_and_stderr_and_closes_stdin_on_eof() {
     assert_eq!(err, b"err-here");
     assert_eq!(code, 3);
     child.expect_input(b"piped-through");
+}
+
+#[test]
+fn exec_natural_exit_still_reports_eof_then_exit() {
+    let (mux, mut cap) = capture_mux();
+    let p = TestPlatform::new();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 1,
+            argv: vec!["test".into()],
+            env: vec![],
+            cwd: None,
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 1 });
+    let child = p.spawner.process(0);
+    child.finish(7);
+    assert_eq!(cap.ctrl(), AgentMsg::Eof { id: 1 });
+    assert_eq!(cap.ctrl(), AgentMsg::Exited { id: 1, code: 7 });
+    assert!(!child.killed());
 }
 
 #[test]

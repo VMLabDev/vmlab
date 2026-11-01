@@ -99,20 +99,78 @@ fn terminal_close_kills_the_shell() {
             id: 3,
             cols: 80,
             rows: 24,
-            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()]),
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'PID=%s END_PID\\n' $$; exec sleep 300".into(),
+            ]),
             env: vec![],
             logon: None,
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
-    mux.remove(3);
-    // The reaper still reports the (signal) death it observed.
+    let (out, _) = cap.data_until(3, b"END_PID");
+    let pid = process_id(&out);
+    open(&mux, &p, HostMsg::Close { id: 3 });
+    assert_process_gone(pid);
+    cap.assert_silent();
+}
+
+fn process_id(output: &[u8]) -> i32 {
+    String::from_utf8_lossy(output)
+        .split_once("PID=")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn assert_process_gone(pid: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if let AgentMsg::Exited { id: 3, code } = cap.ctrl() {
-            assert_eq!(code, 128 + 9, "expected SIGKILL death");
-            break;
+        // SAFETY: signal zero only checks whether the process exists.
+        if unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process survived close"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+#[test]
+fn exec_close_kills_the_process_and_stays_silent() {
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 3,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'PID=%s END_PID\\n' $$; exec sleep 300".into(),
+            ],
+            env: vec![],
+            cwd: None,
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
+    let (out, _) = cap.data_until(3, b"END_PID");
+    let pid = process_id(&out);
+    open(&mux, &p, HostMsg::Close { id: 3 });
+    assert_process_gone(pid);
+    cap.assert_silent();
 }
 
 #[test]

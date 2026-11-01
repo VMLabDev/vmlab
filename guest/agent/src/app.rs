@@ -156,6 +156,7 @@ pub fn open(
     spec: AppSpec,
     logon: Option<Logon>,
 ) {
+    let mux = &mux.for_channel(id);
     match mode {
         AppMode::Rdp => open_rdp(mux, platform, id, logon),
         #[cfg(target_os = "linux")]
@@ -279,6 +280,7 @@ fn await_listener(
 /// `HostMsg::OpenAppConn`: one transport connection of session `app`, as
 /// channel `id`.
 pub fn open_conn(mux: &Mux, id: u32, app: u32) {
+    let mux = &mux.for_channel(id);
     let Some(session) = mux.apps().get(app) else {
         mux.send_error(Some(id), format!("app: no app session {app}"));
         return;

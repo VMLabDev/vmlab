@@ -17,6 +17,7 @@ use crate::mux::{Input, Mux, pump_out};
 use crate::spawn::{Identity, ProcessSpec, Spawned, Spawner};
 
 pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec: ProcessSpec) {
+    let mux = &mux.for_channel(id);
     let Some(exe) = spec.argv.first().cloned() else {
         mux.send_error(Some(id), "exec: empty argv");
         return;
@@ -107,7 +108,8 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
         }
         // Both pipes are drained: the channel's guest→host bytes are
         // complete. A consumer that only wants the output no longer has to
-        // read `exited` to learn that.
+        // read `exited` to learn that. The channel-bound mux suppresses both
+        // messages if the host already closed the channel.
         mux.send_ctrl(&AgentMsg::Eof { id });
         mux.send_ctrl(&AgentMsg::Exited { id, code });
         mux.remove_finished(id);

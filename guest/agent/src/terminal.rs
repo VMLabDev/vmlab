@@ -17,6 +17,7 @@ use crate::mux::{Input, Mux, pump_out};
 use crate::spawn::{Identity, Spawned, Spawner, TerminalSpec};
 
 pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec: TerminalSpec) {
+    let mux = &mux.for_channel(id);
     let Spawned {
         mut input,
         output,
@@ -88,6 +89,7 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
         let code = wait();
         done.store(true, Ordering::SeqCst);
         let _ = out_pump.join();
+        // The channel-bound mux suppresses this reply after host close.
         mux.send_ctrl(&AgentMsg::Exited { id, code });
         mux.remove_finished(id);
     });

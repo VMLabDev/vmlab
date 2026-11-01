@@ -43,6 +43,10 @@ pub use vmlab_agent_proto::{Logon, NetInterface, OsInfo, ShutdownMode};
 
 use crate::sync::LockRecover;
 
+#[cfg(test)]
+#[path = "agent_conformance.rs"]
+pub(super) mod conformance;
+
 /// What the agent said about itself in the handshake.
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -2664,9 +2668,9 @@ mod tests {
                                     }
                                 }
                                 HostMsg::Close { id } => {
-                                    if terminals.contains(&id) {
-                                        send(AgentMsg::Exited { id, code: 137 }).await;
-                                    }
+                                    terminals.retain(|&channel| channel != id);
+                                    files.remove(&id);
+                                    watches.remove(&id);
                                 }
                                 // An idle first sample, then a busy one
                                 // after the host has stopped waiting.

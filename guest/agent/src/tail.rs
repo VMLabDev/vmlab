@@ -25,6 +25,7 @@ const POLL: Duration = Duration::from_millis(250);
 const BACKLOG: u64 = 64 * 1024;
 
 pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, path: String) {
+    let mux = &mux.for_channel(id);
     // Minting can fail — a missing account, a wrong secret — and §19.2 says
     // that is loud rather than a silent fall back to the agent identity.
     let adopter = match spawner.adopter(identity) {

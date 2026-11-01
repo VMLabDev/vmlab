@@ -343,13 +343,7 @@ fn the_xauthority_file_holds_the_cookie_twice_and_only_for_its_owner() {
     );
 
     send(&mux, &p, HostMsg::Close { id: 1 });
-    assert_eq!(
-        host.ctrl(|m| matches!(m, AgentMsg::Exited { .. })),
-        AgentMsg::Exited {
-            id: 1,
-            code: 128 + 9
-        }
-    );
+    host.cap.assert_silent();
     assert!(!file.exists(), "closing removes the private directory");
 }
 
@@ -395,10 +389,7 @@ fn closing_a_session_kills_the_programs_children_too() {
     };
 
     send(&mux, &p, HostMsg::Close { id: 1 });
-    assert!(matches!(
-        host.ctrl(|m| matches!(m, AgentMsg::Exited { .. })),
-        AgentMsg::Exited { id: 1, .. }
-    ));
+    host.cap.assert_silent();
     let gone = |pid: u32| match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Err(_) => true,
         // A zombie is dead, waiting only for whoever adopted it to reap it.
@@ -594,7 +585,7 @@ fn a_parked_connection_past_the_grace_is_closed() {
         other => panic!("expected the open to fail, got {other:?}"),
     }
     send(&mux, &p, HostMsg::Close { id: 1 });
-    host.ctrl(|m| matches!(m, AgentMsg::Exited { id: 1, .. }));
+    host.cap.assert_silent();
 }
 
 /// An `open_app_conn` naming no live session fails, rather than hanging.

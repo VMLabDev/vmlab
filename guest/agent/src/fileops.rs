@@ -64,6 +64,7 @@ const WORK_QUEUE: usize = 64;
 /// filesystem. `resolve` maps host-supplied guest paths (a container
 /// micro-VM resolves them inside its rootfs).
 pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, resolve: PathResolver) {
+    let mux = &mux.for_channel(id);
     // Minting can fail — a missing account, a wrong secret — and §19.2 says
     // that is loud rather than a silent fall back to the agent identity.
     let adopter = match spawner.adopter(identity) {

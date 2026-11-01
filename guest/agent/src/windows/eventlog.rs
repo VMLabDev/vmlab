@@ -27,6 +27,7 @@ struct Subscription(EVT_HANDLE, *mut SubCtx);
 unsafe impl Send for Subscription {}
 
 pub fn open(mux: &Mux, id: u32, filter: Option<String>) {
+    let mux = &mux.for_channel(id);
     let query = wide(filter.as_deref().unwrap_or("*"));
     let channel = wide("System");
 

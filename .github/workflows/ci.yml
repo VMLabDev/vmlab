@@ -27,7 +27,7 @@ jobs:
             ovmf seabios swtpm \
             qemu-efi-aarch64 qemu-efi-riscv64 \
             tesseract-ocr passt \
-            xorriso mtools dosfstools samba
+            xorriso mtools dosfstools samba bubblewrap waypipe
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
@@ -39,6 +39,7 @@ jobs:
       - run: just ci::fmt-check
       - run: just ci::lint
       - run: just ci::test
+      - run: just ci::agent-conformance
 
   # The guest-side crates (cinit, agent, and their proto contracts) are
   # standalone — never swept into the host build — so lint/test them and the

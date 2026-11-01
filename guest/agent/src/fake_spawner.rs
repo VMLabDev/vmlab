@@ -49,6 +49,7 @@ pub struct FakeProcess {
     stderr: Arc<Mutex<Option<SyncSender<Vec<u8>>>>>,
     resizes: Arc<Mutex<Vec<(u16, u16)>>>,
     killed: Arc<AtomicBool>,
+    defer_exit_on_kill: Arc<AtomicBool>,
     exit: SyncSender<i32>,
 }
 
@@ -95,6 +96,11 @@ impl FakeProcess {
     /// Whether the session force-stopped the process.
     pub fn killed(&self) -> bool {
         self.killed.load(Ordering::SeqCst)
+    }
+
+    /// Let the test release output and wait after the kill hook returns.
+    pub fn defer_exit_on_kill(&self) {
+        self.defer_exit_on_kill.store(true, Ordering::SeqCst);
     }
 
     /// End the process: close its output streams — which is what lets the
@@ -160,6 +166,7 @@ impl FakeSpawner {
             stderr: Arc::new(Mutex::new((!hosted).then_some(err_tx))),
             resizes: Arc::new(Mutex::new(Vec::new())),
             killed: Arc::new(AtomicBool::new(false)),
+            defer_exit_on_kill: Arc::new(AtomicBool::new(false)),
             exit: exit_tx,
         };
         self.processes.lock().unwrap().push(handle.clone());
@@ -180,7 +187,9 @@ impl FakeSpawner {
             }),
             kill: Box::new(move || {
                 kill_handle.killed.store(true, Ordering::SeqCst);
-                kill_handle.finish(128 + 9);
+                if !kill_handle.defer_exit_on_kill.load(Ordering::SeqCst) {
+                    kill_handle.finish(128 + 9);
+                }
             }),
             wait: Box::new(move || exit_rx.recv().unwrap_or(127)),
         }

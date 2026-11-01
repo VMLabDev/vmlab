@@ -61,6 +61,15 @@ pub fn capture_mux() -> (Mux, Capture) {
 }
 
 impl Capture {
+    /// Fail if any frame arrives during the observation window.
+    pub fn assert_silent(&mut self) {
+        assert!(self.dec.next_frame().is_none(), "unexpected buffered frame");
+        assert!(
+            self.rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "closed channel emitted a frame"
+        );
+    }
+
     /// Next frame off the wire (10s timeout).
     pub fn frame(&mut self) -> Frame {
         loop {
