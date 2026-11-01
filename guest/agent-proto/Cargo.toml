@@ -14,6 +14,9 @@ description = "Host <-> guest agent (vmlab-agent) wire contract for vmlab VMs an
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+syn = { version = "2", features = ["full"] }
+
 [lints.rust]
 unsafe_code = "deny"
 

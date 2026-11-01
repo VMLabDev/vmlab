@@ -43,6 +43,10 @@ pub use vmlab_agent_proto::{Logon, NetInterface, OsInfo, ShutdownMode};
 
 use crate::sync::LockRecover;
 
+#[cfg(test)]
+#[path = "agent_conformance.rs"]
+pub(super) mod conformance;
+
 /// What the agent said about itself in the handshake.
 #[derive(Debug, Clone)]
 pub struct AgentInfo {

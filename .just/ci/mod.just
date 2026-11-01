@@ -31,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify
+check: lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance
 
 # Run clippy with warnings as errors
 [group('ci')]
@@ -45,8 +45,14 @@ fmt-check: require-cargo
 
 # Run the test suite
 [group('ci')]
-test: require-cargo
+test: require-cargo require-bwrap
 	cargo test --all-features
+
+# Run the Linux agent; F11's documented post-close exit remains an explicit known deviation
+[group('ci')]
+agent-conformance: require-cargo require-bwrap require-waypipe
+	cargo build --manifest-path guest/agent/Cargo.toml --target-dir guest/agent/target
+	VMLAB_CONFORMANCE_AGENT=guest/agent/target/debug/vmlab-agent VMLAB_CONFORMANCE_TIER=full VMLAB_CONFORMANCE_ALLOW_FINDINGS=F11 cargo test --lib external_agent -- --ignored --nocapture --test-threads=1
 
 # Format check, lint and test one guest-side crate
 [group('ci')]

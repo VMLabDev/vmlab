@@ -57,6 +57,21 @@ agent-legacy-build target='':
 proto-generate:
 	VMLAB_WRITE_PROTOCOL_DOCS=1 cargo test --lib proto::report::tests::generated_artefacts_are_current
 
+# Refresh the guest agent's generated message and field tables
+[group('docs')]
+agent-proto-generate: require-cargo
+	VMLAB_WRITE_AGENT_PROTOCOL=1 cargo test --manifest-path guest/agent-proto/Cargo.toml --test report generated_tables_are_current
+
+# Drive an agent executable (pty or listen) through the production client
+[group('test')]
+agent-conformance agent transport='pty' tier='auto': require-cargo require-bwrap
+	VMLAB_CONFORMANCE_AGENT={{quote(agent)}} VMLAB_CONFORMANCE_TRANSPORT={{quote(transport)}} VMLAB_CONFORMANCE_TIER={{quote(tier)}} cargo test --lib external_agent -- --ignored --nocapture --test-threads=1
+
+# Drive an already-listening Unix socket (power and clock mutations skipped)
+[group('test')]
+agent-socket-conformance socket root tier='auto': require-cargo
+	VMLAB_CONFORMANCE_SOCKET={{quote(socket)}} VMLAB_CONFORMANCE_ROOT={{quote(root)}} VMLAB_CONFORMANCE_TIER={{quote(tier)}} cargo test --lib external_agent -- --ignored --nocapture --test-threads=1
+
 # Build + install the guest asset and agent binaries into ~/.local/share/vmlab/guest
 [group('build')]
 guest-install: guest-build agent-build agent-legacy-build

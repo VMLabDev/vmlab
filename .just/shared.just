@@ -10,6 +10,14 @@ require-cargo:
 	@command -v cargo > /dev/null 2>&1 || (echo 'cargo is required: install the Rust toolchain from https://rustup.rs' && exit 1)
 
 [private]
+require-bwrap:
+	@command -v bwrap > /dev/null 2>&1 || (echo 'bubblewrap is required for isolated host-process agent conformance' && exit 1)
+
+[private]
+require-waypipe:
+	@command -v waypipe > /dev/null 2>&1 || (echo 'waypipe is required for the Linux agent app conformance case' && exit 1)
+
+[private]
 require-rustup:
 	@command -v rustup > /dev/null 2>&1 || (echo 'rustup is required: ebpf/rust-toolchain.toml pins the nightly the BPF objects build with' && exit 1)
 
