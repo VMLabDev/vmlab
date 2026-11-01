@@ -1481,7 +1481,7 @@ async fn a_booting_guest_that_ignores_acpi_is_stopped_through_its_agent() {
     let (vm, _hv) = vm(
         &dirs,
         r#"vm "mac" { template = "scratch" arch = "x86_64" profile = "macos" disk = 10GiB }"#,
-        Script {
+        on_vmlab_hv(Script {
             runs: vec![Run {
                 agent_answers_after: Some(Duration::from_secs(2)),
                 ignores_powerdown: true,
@@ -1489,7 +1489,7 @@ async fn a_booting_guest_that_ignores_acpi_is_stopped_through_its_agent() {
                 ..Run::forever()
             }],
             ..Script::healthy()
-        },
+        }),
     );
     assert!(!vm.template().resolved.acpi_shutdown);
     let (cbs, mut observed) = callbacks();

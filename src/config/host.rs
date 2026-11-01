@@ -492,6 +492,21 @@ mod tests {
         assert!(cfg.gpus.is_empty() && cfg.default_gpu().is_none());
     }
 
+    #[test]
+    fn a_private_host_document_can_be_imported_without_copying_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private.wcl");
+        std::fs::write(&private,
+            "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\" }").unwrap();
+        let source = format!(
+            "import <vmlab-host.wcl>\nimport {}\n",
+            serde_json::to_string(&private.display().to_string()).unwrap()
+        );
+        let host = HostConfig::parse(&source, "<test>").unwrap();
+        assert_eq!(host.apple_smc_osk.unwrap().expose(), "FAKE".repeat(16));
+        assert!(!source.contains(&"FAKE".repeat(16)));
+    }
+
     /// The default hypervisor is keyed by machine kind (PRD §22) and starts
     /// at QEMU for both; the vmlab-hv binary is a tool path like the rest.
     #[test]

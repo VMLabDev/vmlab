@@ -16,6 +16,17 @@ fn run(root: &Path, verb: &str) -> Output {
         .unwrap()
 }
 
+fn assert_valid_or_missing_kvm(output: &Output) {
+    let error = String::from_utf8_lossy(&output.stderr);
+    if vmlab::config::hypervisor::HostFacts::probe().kvm {
+        assert!(output.status.success(), "{error}");
+    } else {
+        assert!(!output.status.success());
+        assert!(!error.contains("requires host.apple_smc_osk"), "{error}");
+        assert!(error.contains("needs KVM"), "{error}");
+    }
+}
+
 fn lab(root: &Path) {
     std::fs::write(
         root.join("vmlab.wcl"),
@@ -59,10 +70,43 @@ fn a_fake_host_key_allows_macos_validation() {
         "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST\" }\n"
     ).unwrap();
     let output = run(scratch.path(), "validate");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("ok: lab"));
+    assert_valid_or_missing_kvm(&output);
+    if output.status.success() {
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ok: lab"));
+    }
+}
+
+#[test]
+fn a_template_profile_requires_the_osk_and_refuses_qemu_at_validation() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let version = root.join("data/vmlab/templates/x86_64/macos-test/1");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("disk.qcow2"), b"").unwrap();
+    vmlab::template::TemplateMeta::from_wcl(
+        "import <vmlab-meta.wcl>\ntemplate_meta \"macos-test\" { arch = \"x86_64\" version = \"1\" created = \"2026-01-01T00:00:00Z\" profile = \"macos\" }", "<test>")
+        .unwrap().write_to(&version.join("template.wcl")).unwrap();
+    let source = "import <vmlab.wcl>\nlab \"template-osk-check\" { vm \"mac\" { template = \"x86_64/macos-test\" } }";
+    std::fs::write(root.join("vmlab.wcl"), source).unwrap();
+    let missing = run(root, "validate");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("requires host.apple_smc_osk"));
+    assert!(!root.join(".vmlab").exists());
+
+    let config = root.join("config/vmlab");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.wcl"),
+        "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\" }\n").unwrap();
+    let configured = run(root, "validate");
+    assert_valid_or_missing_kvm(&configured);
+    std::fs::write(
+        root.join("vmlab.wcl"),
+        source.replace("template =", "hypervisor = \"qemu\" template ="),
+    )
+    .unwrap();
+    let qemu = run(root, "validate");
+    assert!(!qemu.status.success());
+    let error = String::from_utf8_lossy(&qemu.stderr);
+    assert!(error.contains("requires vmlab-hv"), "{error}");
+    assert!(!error.contains(&"FAKE".repeat(16)));
 }

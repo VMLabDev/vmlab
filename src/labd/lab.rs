@@ -852,15 +852,21 @@ impl LabRuntime {
             // kind-aware: binding a downloaded template needs the concrete
             // type that holds one. Not a decision — this path only ever runs
             // for a machine whose artefact is a template.
-            self.vm(vm_name)?.set_template(super::vm::TemplateParts {
-                resolved: resolved_vm,
-                backing: Some(resolved.disk_path.clone()),
-                disk_size: None,
-                first_boot: resolved.meta.first_boot(),
-                agent_version: resolved.meta.agent_version.clone(),
-                variant: resolved.variant.clone(),
-                template_vars: crate::template::store::template_vars(&resolved.dir, &resolved.meta),
-            });
+            self.vm(vm_name)?.bind_template(
+                super::vm::TemplateParts {
+                    resolved: resolved_vm,
+                    backing: Some(resolved.disk_path.clone()),
+                    disk_size: None,
+                    first_boot: resolved.meta.first_boot(),
+                    agent_version: resolved.meta.agent_version.clone(),
+                    variant: resolved.variant.clone(),
+                    template_vars: crate::template::store::template_vars(
+                        &resolved.dir,
+                        &resolved.meta,
+                    ),
+                },
+                &self.host_cfg,
+            )?;
         }
         Ok(())
     }
@@ -4177,6 +4183,76 @@ mod tests {
 
     fn quiet() -> crate::scripting::OutputSink {
         Arc::new(|_| {})
+    }
+
+    #[test]
+    fn a_pulled_macos_profile_selects_its_hypervisor_before_launch() {
+        use crate::config::hypervisor::HypervisorKind;
+        for (choice, expected) in [
+            ("", HypervisorKind::Vmlab),
+            ("hypervisor = \"qemu\"", HypervisorKind::Qemu),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = format!(
+                "import <vmlab.wcl>\nlab \"pulled-macos-test\" {{ vm \"mac\" {{ template = \"ghcr.io/example/macos:test\" arch = \"x86_64\" {choice} }} }}"
+            );
+            let config = crate::config::load_lab_source(&source, "<test>", dir.path()).unwrap();
+            let cfg = config.lab.vms[0].clone();
+            let profiles = ProfileSet::shipped().unwrap();
+            let placeholder = VmInstance::new(
+                "pulled-macos-test",
+                cfg.clone(),
+                VmDirs::new("pulled-macos-test", "mac", &dir.path().join(".vmlab")),
+                vec![],
+                vec![],
+                vec![],
+                None,
+                vec![],
+                super::super::vm::TemplateParts {
+                    resolved: crate::qemu::resolve_vm(&cfg, None, &profiles).unwrap(),
+                    backing: None,
+                    disk_size: None,
+                    first_boot: None,
+                    agent_version: None,
+                    variant: None,
+                    template_vars: None,
+                },
+            );
+            let lab = LabRuntime::with_machines(config, vec![]).unwrap();
+            lab.machines
+                .write()
+                .unwrap()
+                .insert(Built::Vm(placeholder.clone()), lab.config());
+            let meta = crate::template::TemplateMeta::from_wcl(
+                "import <vmlab-meta.wcl>\ntemplate_meta \"macos\" { arch = \"x86_64\" version = \"1\" created = \"2026-01-01T00:00:00Z\" profile = \"macos\" }", "<test>").unwrap();
+            lab.bind_template(
+                &PullBatch {
+                    job: PullJob::Template {
+                        reference: "ghcr.io/example/macos:test".into(),
+                        arch: "x86_64".into(),
+                    },
+                    machines: vec!["mac".into()],
+                },
+                &crate::template::store::TemplateVersion {
+                    dir: dir.path().into(),
+                    disk_path: dir.path().join("disk.qcow2"),
+                    meta,
+                },
+            )
+            .unwrap();
+            assert_eq!(lab.vm("mac").unwrap().hypervisor(), expected);
+            assert!(Arc::ptr_eq(&placeholder, &lab.vm("mac").unwrap()));
+            assert_eq!(placeholder.hypervisor(), expected);
+            assert_eq!(
+                lab.vm("mac")
+                    .unwrap()
+                    .template()
+                    .resolved
+                    .profile
+                    .as_deref(),
+                Some("macos")
+            );
+        }
     }
 
     /// A main checkout at `<tmp>/main` frozen at generation 1, and a linked

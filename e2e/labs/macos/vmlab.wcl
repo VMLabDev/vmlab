@@ -1,0 +1,9 @@
+import <vmlab.wcl>
+
+lab "e2e-macos" {
+  vm "mac" {
+    template = "x86_64/macos-tahoe"
+    hypervisor = "vmlab"
+    agent_update = false
+  }
+}

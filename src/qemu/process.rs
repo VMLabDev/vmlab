@@ -100,6 +100,19 @@ impl Proc {
         log_path: &Path,
         fds: Vec<ChildFd>,
     ) -> Result<Arc<Proc>> {
+        Self::spawn_with_secrets(name, binary, args, env, log_path, fds, Vec::new()).await
+    }
+
+    /// Spawn with additional private values removed from stdout and stderr.
+    pub async fn spawn_with_secrets(
+        name: &str,
+        binary: &str,
+        args: &[String],
+        env: &ChildEnv,
+        log_path: &Path,
+        fds: Vec<ChildFd>,
+        secrets: Vec<String>,
+    ) -> Result<Arc<Proc>> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -109,7 +122,11 @@ impl Proc {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
         let log_err = log.try_clone()?;
-        let secrets = osk_secrets(args);
+        let secrets: Vec<_> = osk_secrets(args)
+            .into_iter()
+            .chain(secrets)
+            .filter(|s| !s.is_empty())
+            .collect();
         let filter_output = !secrets.is_empty();
 
         let mut cmd = Command::new(binary);

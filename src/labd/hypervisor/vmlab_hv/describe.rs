@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Audio, AudioDevice, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
-    DisplayDevice, FirmwareKind, FsShare, GpuMode, HyperV, Machine, Nic, NicAttachment, PciAddress,
-    SerialPort, Tpm, VfioDevice,
+    Accel, AppleSmc, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat,
+    Display, DisplayDevice, FirmwareKind, FsShare, GpuMode, HyperV, Machine, MsrPolicy, Nic,
+    NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm, VfioDevice,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -88,6 +88,8 @@ pub(crate) fn container(
     }
     let rtc_base = rtc_base("container", &resolved.name, &resolved.rtc_base)?;
     let disk = |id: &str, path: &Path, format, read_only, vmstate| Disk {
+        channel: None,
+        unit: None,
         pci: None,
         bus: DiskBus::Virtio,
         port: None,
@@ -103,6 +105,15 @@ pub(crate) fn container(
         exit_on_reset: false,
         machine: Machine::Microvm,
         cpu: CpuPolicy::Host,
+        cpu_model: None,
+        invtsc: false,
+        tsc_khz: None,
+        vmware_cpuid_freq: false,
+        msr_policy: MsrPolicy::Fault,
+        applesmc: None,
+        usb_keyboard: false,
+        smbios_type2: false,
+        floppy: None,
         hyperv: Vec::new(),
         display: None,
         tablet: None,
@@ -136,6 +147,7 @@ pub(crate) fn container(
             .nics
             .iter()
             .map(|(mac, socket, mtu)| Nic {
+                model: NicModel::Virtio,
                 rom: None,
                 pci: None,
                 mac: mac.to_string(),
@@ -146,12 +158,15 @@ pub(crate) fn container(
             })
             .collect(),
         serial_log: paths.serial_log.clone(),
+        serial_log_port: ComPort::Com1,
         ports: vec![
             SerialPort {
+                transport: SerialTransport::Virtio,
                 name: "vmlab.ctl.0".into(),
                 socket: paths.ctl_sock.clone(),
             },
             SerialPort {
+                transport: SerialTransport::Virtio,
                 name: vmlab_agent_proto::PORT_NAME.into(),
                 socket: paths.agent_sock.clone(),
             },
@@ -268,6 +283,31 @@ fn hyperv_list(resolved: &ResolvedVm, apic_virtualization: bool) -> Result<Vec<H
         .collect()
 }
 
+/// The pinned Skylake model includes these feature edits in its CPUID table.
+/// Reject other edits rather than silently discarding a requested CPU feature.
+pub(crate) fn cpu_model(model: Option<&str>) -> Result<(Option<String>, bool)> {
+    let Some(model) = model else {
+        return Ok((None, false));
+    };
+    let mut parts = model.split(',');
+    let name = parts.next().unwrap_or_default();
+    anyhow::ensure!(
+        matches!(name, "host" | "Skylake-Client-v4"),
+        "vmlab-hv does not support CPU model `{name}` on q35 (PRD §22)"
+    );
+    let mut frequency = false;
+    for edit in parts {
+        match (name, edit) {
+            ("Skylake-Client-v4", "-hle" | "-rtm" | "kvm=on" | "vendor=GenuineIntel") => {}
+            (_, "vmware-cpuid-freq=on") => frequency = true,
+            _ => {
+                bail!("vmlab-hv does not support CPU feature edit `{edit}` for `{name}` (PRD §22)")
+            }
+        }
+    }
+    Ok((Some(name.into()), frequency))
+}
+
 /// The machine description for one VM: q35 on SeaBIOS or OVMF, as QEMU runs
 /// the same resolved machine (§22, phases 2a to 2c). Refuses whatever
 /// validation refuses too, as the last word before a spawn, and what only the
@@ -300,9 +340,10 @@ pub(crate) fn vm(
         // QEMU's q35 adds a std VGA of its own where nothing names one.
         None | Some("VGA") => DisplayDevice::StdVga,
         Some("virtio-vga") => DisplayDevice::VirtioVga,
+        Some("vmware-svga") => DisplayDevice::VmwareSvga,
         Some(other) => {
             bail!(
-                "vm \"{name}\": vmlab-hv presents std VGA and virtio-vga only, not `{other}` (PRD §22)"
+                "vm \"{name}\": vmlab-hv presents std VGA, virtio-vga and VMware SVGA, not `{other}` (PRD §22)"
             )
         }
     };
@@ -364,6 +405,7 @@ pub(crate) fn vm(
     let console_pci = agent.then(|| slots.next());
     let ports = if agent {
         vec![SerialPort {
+            transport: SerialTransport::Virtio,
             name: vmlab_agent_proto::PORT_NAME.into(),
             socket: paths.agent_sock.clone(),
         }]
@@ -397,6 +439,8 @@ pub(crate) fn vm(
         // QEMU, so a snapshot's disks are named alike on either.
         let id = format!("disk{i}");
         disks.push(Disk {
+            channel: None,
+            unit: None,
             pci,
             bus,
             port,
@@ -413,6 +457,8 @@ pub(crate) fn vm(
         ahci_ports += 1;
         boot.push((i, ahci_boot_path(port)));
         disks.push(Disk {
+            channel: None,
+            unit: None,
             pci: None,
             bus: DiskBus::Ahci,
             port: Some(port),
@@ -441,6 +487,7 @@ pub(crate) fn vm(
             );
         };
         nics.push(Nic {
+            model: NicModel::Virtio,
             rom: if ovmf {
                 roms.ipxe_virtio_efi.clone()
             } else {
@@ -474,6 +521,8 @@ pub(crate) fn vm(
     let rom = match display_device {
         DisplayDevice::StdVga => roms.vgabios_std.clone(),
         DisplayDevice::VirtioVga => roms.vgabios_virtio.clone(),
+        DisplayDevice::VmwareSvga => roms.vgabios_std.clone(),
+        DisplayDevice::CirrusVga => bail!("vmlab-hv does not support Cirrus VGA on q35"),
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
     // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead. Under
@@ -499,11 +548,46 @@ pub(crate) fn vm(
         bail!("vm \"{name}\": more PCI devices than q35's bus 0 has slots for under vmlab-hv");
     }
 
+    let (cpu_model, vmware_cpuid_freq) = cpu_model(resolved.cpu_model.as_deref())?;
+    let tsc_khz = paths
+        .tsc_hz
+        .map(|hz| {
+            anyhow::ensure!(
+                hz > 0 && hz.is_multiple_of(1000),
+                "vmlab-hv TSC pin must be a positive whole kHz"
+            );
+            u32::try_from(hz / 1000).map_err(anyhow::Error::from)
+        })
+        .transpose()?;
+    let applesmc = if resolved.apple_smc {
+        let key = paths
+            .apple_smc_osk
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(crate::config::host::APPLE_SMC_OSK_REQUIRED))?;
+        Some(AppleSmc {
+            osk: key.expose().to_string(),
+        })
+    } else {
+        None
+    };
     Ok(MachineDescription {
         // A guest reset happens in place, as under QEMU: the process, its
         // sockets and every connection to them stay (PRD §22).
         exit_on_reset: false,
         machine: Machine::Q35,
+        cpu_model,
+        invtsc: resolved.tsc.is_some(),
+        tsc_khz,
+        vmware_cpuid_freq,
+        msr_policy: if resolved.apple_smc {
+            MsrPolicy::Ignore
+        } else {
+            MsrPolicy::Fault
+        },
+        applesmc,
+        usb_keyboard: resolved.input == crate::config::model::InputDevices::Usb,
+        smbios_type2: resolved.apple_smc,
+        floppy: None,
         cpu: if resolved.nested {
             CpuPolicy::Nested
         } else {
@@ -547,6 +631,7 @@ pub(crate) fn vm(
         disks,
         nics,
         serial_log: serial_log.clone(),
+        serial_log_port: ComPort::Com1,
         ports,
         shares,
         audio: audio(lab, resolved),
@@ -656,6 +741,67 @@ mod tests {
         );
         assert_eq!(d.serial_log, PathBuf::from("/logs/l/web/console.log"));
         assert_eq!(d.rtc_base, None);
+    }
+
+    #[test]
+    fn macos_uses_the_published_machine_contract() {
+        let r = resolved_vm("macos", "x86_64");
+        let mut p = ovmf_paths(false);
+        p.tsc_hz = Some(4_291_934_000);
+        p.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse("FAKE".repeat(16)).unwrap());
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(d.cpu_model.as_deref(), Some("Skylake-Client-v4"));
+        assert!(d.invtsc && d.vmware_cpuid_freq && d.usb_keyboard && d.smbios_type2);
+        assert_eq!(d.tsc_khz, Some(4_291_934));
+        assert_eq!(d.msr_policy, MsrPolicy::Ignore);
+        assert_eq!(d.applesmc.as_ref().unwrap().osk, "FAKE".repeat(16));
+        assert_eq!(
+            d.display.as_ref().unwrap().device,
+            DisplayDevice::VmwareSvga
+        );
+        assert_eq!(d.console_pci, at(1));
+        assert_eq!(d.nics[0].pci, at(2));
+        assert_eq!(d.display.as_ref().unwrap().pci, at(3).unwrap());
+        assert_eq!(d.tablet, at(4));
+        assert_eq!(d.disks[0].bus, DiskBus::Ahci);
+        assert!(d.hyperv.is_empty() && d.tpm.is_none());
+        let Boot::Firmware { secure_boot, .. } = &d.boot else {
+            panic!("firmware boot");
+        };
+        assert!(!secure_boot);
+        for dump in [
+            format!("{d:?}"),
+            serde_json::to_string(&d.redacted()).unwrap(),
+        ] {
+            assert!(!dump.contains(&"FAKE".repeat(16)));
+            assert!(dump.contains("redacted"));
+        }
+        p.apple_smc_osk = None;
+        assert_eq!(
+            vm("l", &r, &p, QemuAccel::Kvm, &roms())
+                .unwrap_err()
+                .to_string(),
+            crate::config::host::APPLE_SMC_OSK_REQUIRED
+        );
+    }
+
+    #[test]
+    fn a_fresh_macos_machine_leaves_the_tsc_rate_to_kvm() {
+        let r = resolved_vm("macos", "x86_64");
+        let mut p = ovmf_paths(false);
+        p.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse("FAKE".repeat(16)).unwrap());
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        assert!(d.invtsc);
+        assert_eq!(d.tsc_khz, None);
+        p.tsc_hz = Some(1234);
+        assert!(vm("l", &r, &p, QemuAccel::Kvm, &roms()).is_err());
+    }
+
+    #[test]
+    fn unsupported_cpu_edits_are_refused() {
+        assert!(cpu_model(Some("Skylake-Client-v4,+hle")).is_err());
+        assert!(cpu_model(Some("Skylake-Client-v4,vendor=AuthenticAMD")).is_err());
+        assert!(cpu_model(Some("unknown")).is_err());
     }
 
     /// The description is the file vmlab-hv parses with

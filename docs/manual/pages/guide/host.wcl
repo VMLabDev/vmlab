@@ -364,7 +364,8 @@ DOC
   h2 "QEMU or vmlab-hv"
 
   p <<'DOC'
-QEMU runs every machine unless one says otherwise. vmlab-hv is vmlab's own
+QEMU is the host default; a VM's effective profile can override it.
+vmlab-hv is vmlab's own
 hypervisor, built a phase at a time, on an x86_64 host with a usable
 `/dev/kvm`; it has no TCG fallback. It runs container micro-VMs, and modern
 VMs on the q35 machine: SeaBIOS or OVMF with secure boot, a TPM and the
@@ -376,9 +377,10 @@ itself is reset in place, as on QEMU; the VM reads as not ready until its
 agent answers again. A machine opts in with `hypervisor = "vmlab"`, and `host {
 hypervisor { container = "vmlab" vm = "vmlab" } }` moves every machine of that
 kind that names none. `vmlab validate` refuses what vmlab-hv cannot run yet,
-naming the machine, the reason and the phase that brings it: macOS, the i440fx
-machine and floppies, `accel = "tcg"`, a pinned `tsc`, `input = "usb"`, and
-`qemu_args` in every phase.
+naming the machine, the reason and the phase that brings it: the i440fx
+machine and floppies, `accel = "tcg"`, and `qemu_args` in every phase.
+Intel macOS, a USB keyboard, the named Skylake CPU, VMware SVGA and a pinned
+TSC are supported. The `macos` profile selects vmlab-hv; QEMU refuses macOS.
 
 A `virgl` or `vulkan` GPU renders on the render node of the host GPU your host
 config picks, exactly as under QEMU, with the same Vulkan filter and
@@ -403,9 +405,9 @@ design.
 DOC
 
   p <<'DOC'
-Choose vmlab-hv for a container when you want to try the new hypervisor on one
-machine inside a lab that otherwise runs on QEMU. Keep QEMU for everything
-else, and for any container that must also run on a host without KVM. Two
+Choose vmlab-hv for Intel macOS or a supported modern VM or container.
+Keep QEMU for emulated architectures and legacy PCs, and for containers that
+must also run on a host without KVM. Two
 things differ on a vmlab-hv machine. It has no emulation fallback, so where
 QEMU falls back to TCG, vmlab-hv refuses the machine. And an online snapshot
 is stored in the format of the hypervisor that took it, so it does not restore
@@ -437,40 +439,21 @@ DOC
   h2 "macOS guests under KVM"
 
   p <<'DOC'
-An Intel macOS guest on the shipped `macos` profile needs one thing from the
-host that no other guest does: KVM must ignore the model-specific registers it
-does not emulate. XNU reads Intel MSRs that KVM has no model for, and by
-default KVM answers each read with a general-protection fault, so the guest
-panics or hangs early in boot. On an AMD host that happens on every boot. Turn
-the `kvm` module's `ignore_msrs` parameter on for good with a modprobe file,
-and for the current boot through sysfs:
-DOC
+Intel macOS runs only on vmlab-hv. The shipped `macos` profile selects it
+by default. Set `host.apple_smc_osk` to the 64-character key from your own
+Apple hardware; see [Apple SMC OSK](ref_host). QEMU refuses macOS machines.
 
-  code sh { source = <<'SRC'
-echo "options kvm ignore_msrs=1 report_ignored_msrs=0" | sudo tee /etc/modprobe.d/kvm-msrs.conf
-echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs
-SRC
-  }
-
-  p <<'DOC'
-`report_ignored_msrs=0` keeps the kernel log free of a line per ignored read.
-`vmlab up` checks the parameter for every macOS VM it starts under KVM, which
-is any VM whose profile name starts with `macos` or whose `apple_smc` resolves
-on, and prints a warning with both commands when it is not `Y`. The warning
-does not stop the VM from starting.
+vmlab-hv handles unknown Intel MSRs for this machine: reads return zero,
+writes are dropped, and each MSR index is logged once. No host-wide
+`kvm.ignore_msrs` module option is needed.
 DOC
 
   p <<'DOC'
-The profile also sets `tsc = "host"`: macOS reads its clock frequency from a
-CPUID leaf QEMU fills only for an invariant TSC at a known frequency. vmlab
-reads the host's TSC frequency from KVM at the VM's first KVM start and pins it
-in `.vmlab/vms/<vm>/tsc-hz`, and every later start reuses that value. Reading
-it afresh would break restores: the host kernel recalibrates its TSC at each
-boot, and QEMU refuses to load an online snapshot taken at another frequency.
-KVM runs a pinned frequency within its tolerance of the host's without
-scaling, so an old pin costs nothing. Under TCG there is no KVM to read the
-frequency from, and `up` warns that the VM boots without the pin; macOS does
-not boot that way. See [Troubleshooting](apx_troubleshooting).
+The profile sets `tsc = "host"`. Before its first resume, vmlab-hv reports
+the actual KVM TSC frequency and vmlab pins it in
+`.vmlab/vms/<vm>/tsc-hz`. Later starts reuse that pin, including online
+snapshot restores. The invariant TSC and CPUID leaf `0x40000010` expose the
+same rate to macOS. This path does not launch a QEMU frequency probe.
 DOC
 
   p <<'DOC'

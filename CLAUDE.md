@@ -83,7 +83,8 @@ first release**: the host-side SSH facade (ADR-0012, superseded), `vmlab ssh`,
 and `dev use`, `attachable`, and the agent's `tunnel` vocabulary. A dev
 machine is reached with `vmlab shell` and `vmlab exec`.
 **A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
-"vmlab"` on a machine, else the host config's default per kind (QEMU), puts it
+"vmlab"` on a machine, else a VM's effective profile, then the host config's
+default per kind (QEMU), puts it
 on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
 pinned by git rev). Phase 1 runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
@@ -98,9 +99,12 @@ it serves in process (no virtiofsd; the share plan asks each machine what
 serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
 `device_del`, waiting on `device_deleted`), and **guest audio** — `audio` and
 `microphone` on a VM (§11, hv-audio D7), an HDA on the host node
-`vmlab.<lab>.<machine>`, refused on QEMU. Everything else — macOS, i440fx,
-a pinned TSC (no host-facts probe in vmlab-hv yet), `qemu_args`, hosts without
-KVM — is refused from one list naming the phase that brings it. Snapshots
+`vmlab.<lab>.<machine>`, refused on QEMU. Intel macOS runs on vmlab-hv only;
+the macos profile selects it. Its named Intel CPU, invariant pinned TSC,
+Apple SMC, VMware SVGA and USB keyboard use the macOS protocol. The host's
+OSK travels through an anonymous descriptor; retained descriptions and logs
+redact it. No host KVM MSR option is needed. i440fx, `qemu_args` and hosts
+without KVM are refused from one list naming the phase that brings it. Snapshots
 record their hypervisor and an online one refuses to restore under the other;
 a vmlab-hv VM with a GPU takes none (HV D9).
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the

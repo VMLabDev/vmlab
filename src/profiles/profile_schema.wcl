@@ -10,6 +10,7 @@ type ProfileDoc {
 type Profile {
   @inline(0) name: utf8
   description: utf8?
+  hypervisor: utf8?     // "qemu" | "vmlab"; machine > profile > host default
   machine: utf8?        // "q35" | "pc" (i440fx)
   firmware: utf8?       // "ovmf" | "seabios"
   secure_boot: bool?
@@ -21,7 +22,7 @@ type Profile {
   display: utf8?        // "qxl" | "virtio-vga" | "virtio-gpu" | "std" | "vmware"
   cpu_model: utf8?      // QEMU -cpu model, e.g. "pentium3"; unset = host (KVM) / max (TCG)
   hyperv: bool?         // Hyper-V enlightenments (hv-* flags) under KVM, unless a cpu_model names the CPU; default false
-  apple_smc: bool?      // Apple SMC device (isa-applesmc + SMBIOS type 2) a macOS guest needs; default false
+  apple_smc: bool?      // Apple SMC and SMBIOS type 2 on vmlab-hv only; default false
   input: utf8?          // "ps2" (default: PS/2 keyboard, USB tablet) | "usb" (USB keyboard and tablet on xHCI)
   tsc: utf8?            // "host": invariant TSC pinned at the host's frequency (KVM only); unset = QEMU's default
   accel: utf8?          // "kvm" (required) | "tcg" (always); unset = KVM when usable, else TCG

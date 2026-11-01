@@ -350,13 +350,9 @@ pub struct VmInstance {
     control: Mutex<Option<Arc<dyn Control>>>,
     /// Lazy vmlab-agent connection (terminals/exec/files — §"agent channel").
     agent: super::machine::AgentSlot,
-    /// How this machine reaches the host to actually run (see
-    /// [`super::hypervisor`]). Real QEMU in production; a fake in tests, which
-    /// is what makes the start ladder and the exit monitor testable.
-    hv: Arc<dyn Hypervisor>,
-    /// Which hypervisor `hv` is (§22), as the machine reports it and its
-    /// snapshots record it.
-    hypervisor: HypervisorKind,
+    /// The selected adapter, updated when a deferred template reveals its
+    /// profile default. Binding is allowed only while the VM is stopped.
+    hypervisor: std::sync::RwLock<VmHypervisor>,
     /// The host facts vmlab-hv's refusals read at each start (§22): this
     /// host, probed, in production; a test's own, so a machine on a fake
     /// hypervisor does not depend on the host running the test.
@@ -365,6 +361,11 @@ pub struct VmInstance {
     /// Where the display publishes every input it sends, for a console
     /// recorder (§11.1). Lives as long as the machine, across restarts.
     input_tap: Arc<crate::record::InputTap>,
+}
+
+struct VmHypervisor {
+    kind: HypervisorKind,
+    adapter: Arc<dyn Hypervisor>,
 }
 
 /// What a VM's primary disk is made from, as the lab file declares it: the
@@ -445,8 +446,10 @@ impl VmInstance {
             usb: Mutex::new(Vec::new()),
             control: Mutex::new(None),
             agent: super::machine::AgentSlot::default(),
-            hv: Arc::new(super::hypervisor::Qemu),
-            hypervisor: HypervisorKind::Qemu,
+            hypervisor: std::sync::RwLock::new(VmHypervisor {
+                kind: HypervisorKind::Qemu,
+                adapter: Arc::new(super::hypervisor::Qemu),
+            }),
             host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
             host_config: Arc::new(crate::config::host::HostConfig::load_default),
             input_tap: Arc::default(),
@@ -461,9 +464,20 @@ impl VmInstance {
         hv: Arc<dyn Hypervisor>,
     ) -> Arc<Self> {
         let me = Arc::get_mut(&mut self).expect("a freshly built VM has one owner");
-        me.hypervisor = kind;
-        me.hv = hv;
+        me.hypervisor = std::sync::RwLock::new(VmHypervisor { kind, adapter: hv });
         self
+    }
+
+    fn hypervisor_kind(&self) -> HypervisorKind {
+        self.hypervisor.read().expect("hypervisor lock").kind
+    }
+
+    fn hv(&self) -> Arc<dyn Hypervisor> {
+        self.hypervisor
+            .read()
+            .expect("hypervisor lock")
+            .adapter
+            .clone()
     }
 
     /// Run this VM against a different hypervisor — the injection point
@@ -473,7 +487,12 @@ impl VmInstance {
     /// (see `labd::lab`'s tests).
     #[cfg(test)]
     pub(crate) fn set_hypervisor(self: &mut Arc<Self>, hv: Arc<dyn Hypervisor>) {
-        Arc::get_mut(self).expect("sole owner").hv = hv;
+        Arc::get_mut(self)
+            .expect("sole owner")
+            .hypervisor
+            .get_mut()
+            .expect("hypervisor lock")
+            .adapter = hv;
     }
 
     /// Answer vmlab-hv's host-fact questions with `facts` instead of probing
@@ -502,7 +521,7 @@ impl VmInstance {
     /// a real one.
     pub fn virtiofs_share_indices(&self) -> Vec<usize> {
         use crate::labd::share_plan::{HostVirtiofsd, Transport, transport_of};
-        let host = HostVirtiofsd::of(self.hv.virtiofsd().as_ref());
+        let host = HostVirtiofsd::of(self.hv().virtiofsd().as_ref());
         let guest_ok = self.template().resolved.virtiofs;
         self.cfg
             .shares
@@ -521,7 +540,7 @@ impl VmInstance {
     /// run started; a stopped one, which an online restore boots first, with
     /// the virtiofsd it would start.
     async fn online_snapshot_refusal(&self) -> Option<String> {
-        if self.hypervisor == HypervisorKind::Vmlab
+        if self.hypervisor_kind() == HypervisorKind::Vmlab
             && let Some(why) =
                 crate::config::hypervisor::vmlab_online_snapshot_refusal(&self.template().resolved)
         {
@@ -533,7 +552,7 @@ impl VmInstance {
         if self.virtiofs_share_indices().is_empty() {
             return None;
         }
-        self.hv
+        self.hv()
             .virtiofsd()
             .and_then(|v| v.snapshot_refusal(&self.cfg.name))
     }
@@ -553,6 +572,36 @@ impl VmInstance {
     /// Bind the template parts resolved by a deferred pull.
     pub fn set_template(&self, parts: TemplateParts) {
         *self.template.write().expect("template lock") = Arc::new(parts);
+    }
+
+    /// Bind a downloaded template and its profile's backend default together.
+    /// Existing machine handles keep the same instance across the pull.
+    pub(crate) fn bind_template(
+        &self,
+        parts: TemplateParts,
+        host: &crate::config::host::HostConfig,
+    ) -> Result<()> {
+        let state = self.state.try_read().map_err(|_| {
+            anyhow::anyhow!(
+                "{}: template binding raced a power transition",
+                self.cfg.name
+            )
+        })?;
+        anyhow::ensure!(
+            *state == PowerState::Stopped,
+            "{}: cannot bind a template while running",
+            self.cfg.name
+        );
+        let kind = parts.resolved.hypervisor.unwrap_or(host.hypervisor.vm);
+        let mut selected = self.hypervisor.write().expect("hypervisor lock");
+        if selected.kind != kind {
+            *selected = VmHypervisor {
+                kind,
+                adapter: super::hypervisor::for_machine(kind, host, true),
+            };
+        }
+        self.set_template(parts);
+        Ok(())
     }
 
     /// Install this run's NIC attachments (wired by `start_vm` just before
@@ -880,6 +929,10 @@ impl VmInstance {
         if let Some(hz) = qemu::tsc::read_pin(&pin)? {
             return Ok(Some(hz));
         }
+        if self.hypervisor_kind() == HypervisorKind::Vmlab {
+            // The paused machine reports its actual KVM rate at startup.
+            return Ok(None);
+        }
         let hz = qemu::tsc::probe_host_hz(emulator)
             .await
             .with_context(|| format!("{}: tsc = \"host\"", self.cfg.name))?;
@@ -901,7 +954,7 @@ impl VmInstance {
             &host,
             &qemu::hostgpu::Sysfs::host(),
             &crate::paths::data_dir(),
-            self.hypervisor,
+            self.hypervisor_kind(),
         )
         .with_context(|| format!("{}: gpu", self.cfg.name))?;
         for warning in &plan.warnings {
@@ -963,12 +1016,12 @@ impl VmInstance {
     async fn start_virtiofsds(
         &self,
     ) -> Result<(Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>)> {
-        let in_process = self.hv.virtiofs_in_process();
+        let in_process = self.hv().virtiofs_in_process();
         let mut served = Vec::new();
         let mut procs = Vec::new();
         let mut devices = Vec::new();
         let mut mounts = Vec::new();
-        let vfsd = self.hv.virtiofsd();
+        let vfsd = self.hv().virtiofsd();
         let indices = self.virtiofs_share_indices();
         *self.snapshot_refusal.lock().expect("refusal lock") = match &vfsd {
             Some(v) if !indices.is_empty() => v.snapshot_refusal(&self.cfg.name),
@@ -1011,7 +1064,7 @@ impl VmInstance {
             }
             let sock = self.dirs.vfs_sock(i);
             let proc = self
-                .hv
+                .hv()
                 .start_virtiofsd(
                     &format!("{}/{}", self.cfg.name, share.name),
                     &sock,
@@ -1143,7 +1196,7 @@ impl VmInstance {
             // A deferred pull binds its template's hardware after the lab
             // builder checked the placeholder, so vmlab-hv's refusals are
             // asked again of what this start will run (§22).
-            let kvm = if self.hypervisor == HypervisorKind::Vmlab {
+            let kvm = if self.hypervisor_kind() == HypervisorKind::Vmlab {
                 let host = (self.host_facts)();
                 let why = crate::config::hypervisor::vmlab_refusals(
                     model::MachineCfg::Vm(&self.cfg),
@@ -1157,6 +1210,8 @@ impl VmInstance {
                 // the one they read.
                 host.kvm
             } else {
+                let why = crate::config::hypervisor::qemu_refusals(&self.cfg, Some(&t.resolved));
+                anyhow::ensure!(why.is_empty(), "{}", why.join("\n"));
                 qemu::kvm_usable(&t.resolved.arch)
             };
             // Decided before anything is created or spawned: a declared
@@ -1179,7 +1234,7 @@ impl VmInstance {
 
             if t.resolved.tpm {
                 let swtpm = self
-                    .hv
+                    .hv()
                     .start_tpm(
                         &self.cfg.name,
                         &self.dirs.tpm_state(),
@@ -1241,11 +1296,11 @@ impl VmInstance {
             // The machine answers control shortly after spawn (-S leaves CPUs
             // paused); the hypervisor returns once it does.
             let super::hypervisor::Running { proc, control } = self
-                .hv
+                .hv()
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!(
                         "{}:{}",
-                        match self.hypervisor {
+                        match self.hypervisor_kind() {
                             HypervisorKind::Qemu => "qemu",
                             HypervisorKind::Vmlab => "vmlab-hv",
                         },
@@ -1253,8 +1308,8 @@ impl VmInstance {
                     ),
                     machine,
                     env: render.env,
-                    log: self.dirs.hypervisor_log(self.hypervisor),
-                    control_sock: self.dirs.control_sock(self.hypervisor),
+                    log: self.dirs.hypervisor_log(self.hypervisor_kind()),
+                    control_sock: self.dirs.control_sock(self.hypervisor_kind()),
                     fds: nic_fds,
                     channels: super::hypervisor::GuestChannels {
                         agent: self.dirs.agent_sock(),
@@ -1791,7 +1846,7 @@ impl super::display::DisplayHost for VmInstance {
     }
 
     fn stream_source(&self) -> crate::record::StreamSource {
-        match self.hypervisor {
+        match self.hypervisor_kind() {
             HypervisorKind::Qemu => crate::record::StreamSource::Vnc(self.dirs.vnc_sock()),
             HypervisorKind::Vmlab => crate::record::StreamSource::Native(self.dirs.display_sock()),
         }
@@ -1821,11 +1876,11 @@ impl super::display::DisplayHost for VmInstance {
 #[async_trait::async_trait]
 impl super::machine::Machine for VmInstance {
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
-        self.hv.virtiofsd()
+        self.hv().virtiofsd()
     }
 
     fn virtiofs_in_process(&self) -> bool {
-        self.hv.virtiofs_in_process()
+        self.hv().virtiofs_in_process()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {
@@ -1883,11 +1938,11 @@ impl super::machine::Machine for VmInstance {
     /// QEMU inherits a tap descriptor; vmlab-hv's NICs are stream sockets
     /// (HV-D9 leaves its fast path unfixed).
     fn takes_tap_fds(&self) -> bool {
-        self.hypervisor == HypervisorKind::Qemu
+        self.hypervisor_kind() == HypervisorKind::Qemu
     }
 
     fn hypervisor(&self) -> HypervisorKind {
-        self.hypervisor
+        self.hypervisor_kind()
     }
 
     fn event_subject(&self) -> &'static str {
@@ -1928,8 +1983,8 @@ impl super::machine::Machine for VmInstance {
                     .is_ok_and(|p| p.gpu.is_some_and(|g| g.qemu_binary.is_some()))
             })
         });
-        if self.hypervisor == HypervisorKind::Vmlab {
-            needed.push(self.hv.emulator_binary(&t.resolved.arch));
+        if self.hypervisor_kind() == HypervisorKind::Vmlab {
+            needed.push(self.hv().emulator_binary(&t.resolved.arch));
         } else if !own_qemu {
             needed.push(qemu::emulator_binary(&t.resolved.arch));
         }
@@ -2098,29 +2153,20 @@ impl super::machine::Machine for VmInstance {
     /// TCG, a named `cpu_model` (§5.2). The accelerator is decided the way
     /// [`Self::start`] decides it; one `start` would refuse is its to report.
     ///
-    /// And for a macOS guest (§5.2), what the host lacks for it: KVM's
-    /// `ignore_msrs`, without which the guest faults on the Intel MSRs it
-    /// reads, and a pinned TSC, which TCG cannot give it.
+    /// A pinned TSC cannot be applied under TCG (§5.2).
     fn launch_warnings(&self) -> Vec<String> {
         let t = self.template();
         let kvm = qemu::kvm_usable(&t.resolved.arch);
         let Ok(plan) = qemu::plan_accel(&t.resolved, kvm) else {
             return Vec::new();
         };
-        let mut warnings: Vec<String> = [
+        let warnings: Vec<String> = [
             qemu::hyperv_not_applied(self.cfg.hyperv, &t.resolved, plan.accel()),
             qemu::tsc_not_applied(&t.resolved, plan.accel()),
         ]
         .into_iter()
         .flatten()
         .collect();
-        let macos = t.resolved.apple_smc || self.guest_os() == super::guest_os::GuestOs::Macos;
-        if macos
-            && plan.accel() == qemu::Accel::Kvm
-            && let Some(problem) = qemu::host_msrs_problem()
-        {
-            warnings.push(format!("vm \"{}\": {problem}", self.cfg.name));
-        }
         warnings
     }
 
@@ -2577,6 +2623,63 @@ mod tests {
 
     fn vm(decl: &str) -> crate::config::model::Vm {
         crate::qemu::resolve::testing::vm(decl)
+    }
+
+    #[tokio::test]
+    async fn a_template_cannot_change_the_backend_during_a_run() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = vm(
+            r#"vm "a" { template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 1GiB }"#,
+        );
+        let resolved =
+            crate::qemu::resolve_vm(&cfg, None, &crate::profiles::ProfileSet::shipped().unwrap())
+                .unwrap();
+        let parts = |resolved| TemplateParts {
+            resolved,
+            backing: None,
+            disk_size: None,
+            first_boot: None,
+            agent_version: None,
+            variant: None,
+            template_vars: None,
+        };
+        let instance = VmInstance::new(
+            "l",
+            cfg,
+            VmDirs {
+                local: dir.path().join("local"),
+                run: dir.path().join("run"),
+                logs: dir.path().join("logs"),
+            },
+            vec![],
+            vec![],
+            vec![],
+            None,
+            vec![],
+            parts(resolved.clone()),
+        );
+        let mut pulled = resolved;
+        pulled.hypervisor = Some(HypervisorKind::Vmlab);
+        for state in [
+            PowerState::Starting,
+            PowerState::Running,
+            PowerState::Suspended,
+            PowerState::Stopping,
+        ] {
+            *instance.state.write().await = state;
+            assert!(
+                instance
+                    .bind_template(parts(pulled.clone()), &Default::default())
+                    .is_err()
+            );
+            assert_eq!(instance.hypervisor_kind(), HypervisorKind::Qemu);
+        }
+        *instance.state.write().await = PowerState::Stopped;
+        instance
+            .bind_template(parts(pulled), &Default::default())
+            .unwrap();
+        assert_eq!(instance.hypervisor_kind(), HypervisorKind::Vmlab);
     }
 
     /// The source is the declaration: a store reference as written (so an

@@ -152,12 +152,11 @@ SRC
     and at launch, so updating this key requires no daemon restart.
   DOC
   p <<DOC
-    QEMU receives the key in `isa-applesmc,osk=<value>`. vmlab redacts it
-    from launch headers, emulator output and startup errors. Debug dumps of
-    host configuration and launch paths also redact it. The key is never
-    recorded in templates or OCI metadata. It remains visible to host
-    processes allowed to read QEMU's operating-system process arguments.
-    vmlab-hv continues to refuse Apple SMC machines until its macOS phase.
+    macOS runs only on vmlab-hv. Its private launch descriptor carries the
+    key, while the retained machine description, debug output, emulator
+    logs and startup errors redact it. The key is never recorded in
+    templates, OCI metadata or process arguments. No host-wide
+    `kvm.ignore_msrs` module option is needed.
   DOC
 
   h2 "hypervisor {}"
@@ -182,13 +181,13 @@ SRC
     rows:
       | "Field" | "Type" | "Default" | "Meaning" |
       | "`container`" | "utf8" | "`qemu`" | "The hypervisor for every `container {}` that does not set `hypervisor`: `qemu` or `vmlab`." |
-      | "`vm`" | "utf8" | "`qemu`" | "The hypervisor for every `vm {}` that does not set `hypervisor`: `qemu` or `vmlab`. vmlab-hv runs no VMs yet, so `vmlab` here makes every VM that names none fail validation." |
+      | "`vm`" | "utf8" | "`qemu`" | "The hypervisor for a VM that names none and whose effective profile names none: `qemu` or `vmlab`. The `macos` profile selects `vmlab`." |
   }
   p "These rules apply:"
   list {
     li "Each field is `qemu` or `vmlab`. Any other value is rejected with a parse error that names it."
-    li "A machine's own `hypervisor` wins over this block. The field never resolves through a template or a profile."
-    li "A default is checked against each machine it reaches, as a declared value is. `vmlab validate` refuses a machine that vmlab-hv cannot run yet and names the machine and the reason: any VM, `qemu_args`, an architecture other than x86_64, `accel = \"tcg\"`, or a container on a host where `/dev/kvm` is not usable."
+    li "A machine's own `hypervisor` wins. For VMs, the effective profile's `hypervisor` wins over the host default; the shipped `macos` profile selects `vmlab`."
+    li "Validation checks the resolved hardware. vmlab-hv refuses unsupported architectures, legacy PCs, `accel = \"tcg\"`, `qemu_args` and hosts without usable KVM. QEMU refuses macOS and `apple_smc` machines, naming vmlab-hv."
     li "Changing a default moves every machine it reaches on its next start. An online snapshot taken under the old hypervisor does not restore under the new one, and the refusal names the hypervisor that took it. An offline snapshot restores under either."
   }
   p <<DOC

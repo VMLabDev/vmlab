@@ -23,6 +23,7 @@ use crate::template::TemplateMeta;
 #[derive(Debug, Clone)]
 pub struct ResolvedVm {
     pub name: String,
+    pub hypervisor: Option<crate::config::hypervisor::HypervisorKind>,
     /// Effective profile name (vm.profile > template.profile), if any —
     /// consumers like SMB mount-command selection key off it.
     pub profile: Option<String>,
@@ -615,6 +616,7 @@ pub fn resolve_vm(
 
     Ok(ResolvedVm {
         name: lab_vm.name.clone(),
+        hypervisor: lab_vm.hypervisor.or(profile.hypervisor),
         profile: profile_name,
         arch,
         cpus: lab_vm

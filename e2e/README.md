@@ -8,6 +8,7 @@ just e2e::run --only core guest      # named scenarios only
 just e2e::run --only dev --keep      # leave the labs up for inspection
 just e2e::run --list                 # scenario names
 just e2e::run --hypervisor vmlab     # the machines on vmlab-hv, by phase
+just e2e::run --only macos --hypervisor vmlab
 ```
 
 The host needs Docker and a usable `/dev/kvm`. The container runs privileged. If `~/.local/share/config-weave/bin` exists, the playbook scenario mounts it into the container.
@@ -43,12 +44,29 @@ Every feature in `features.py` carries a phase tag in `PHASES`:
 - `host`: no hypervisor takes part, such as the template store, validation or the supervisor. The feature runs on both.
 - `1`: container micro-VMs.
 - `2a` to `2f`: modern x86_64 VMs: the q35 platform on SeaBIOS (2a), the native frame protocol (2b), OVMF, secure boot, the TPM and Windows (2c), GPU (2d), virtio-fs and audio (2e), USB and vfio (2f).
+- `macos`: Intel macOS on vmlab-hv only, after 2f. Agent readiness, exec, copy both ways, screenshot, online snapshot and agent stop.
 - `3`: TCG guests.
 - `4`: the legacy PC.
 
 `QEMU_ONLY` lists the features no other hypervisor runs, each with its reason: `qemu_args` and the external-virtiofsd checks.
 
 On `vmlab`, a feature past the delivered phase (`VMLAB_DELIVERED`, or `--vmlab-phase`) is reported as skipped with the reason `vmlab-hv phase N`, whatever its scenario did. A pass from a VM that ran on QEMU says nothing about vmlab-hv. A scenario with no feature in scope does not run. Every feature still passes, fails or skips with a reason, and each row in `results.json` names the run's hypervisor. vmlab-hv's parity gate for a phase is a `--hypervisor vmlab` run that passes every feature in that phase.
+
+## macOS scenario
+
+The `macos` scenario needs an existing `x86_64/macos-tahoe` template with
+OpenCore and the macOS agent. It skips when the template or
+`host.apple_smc_osk` is absent. It never runs on QEMU and needs no Alpine
+base-template build. The template is cloned; the agent is left unchanged.
+
+For an isolated macOS-only run, set `E2E_HOST_CONFIG` to an existing private
+host configuration and use a separate `XDG_CONFIG_HOME`. The runner imports
+that file without reading its contents into logs. In a container, mount the
+private configuration and the macOS template read-only, pass
+`E2E_HOST_CONFIG`, and use `--memory 64g`. Never attach the private config
+or an unredacted launch description to results. The runtime `machine.json`
+is redacted. Delete the scenario's online snapshot after the check because
+guest RAM can contain SMC responses.
 
 ## Adding coverage
 

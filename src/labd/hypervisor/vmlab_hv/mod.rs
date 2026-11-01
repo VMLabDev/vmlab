@@ -17,6 +17,8 @@
 //! guest cannot mount, by the share plan's rules. A VM's TPM is the host's
 //! swtpm, started as for QEMU.
 
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -163,7 +165,7 @@ impl Hypervisor for VmlabHv {
     }
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
-        let description = match &spec.machine {
+        let mut description = match &spec.machine {
             Launch::Container {
                 lab,
                 resolved,
@@ -188,8 +190,42 @@ impl Hypervisor for VmlabHv {
         if let Some(dir) = machine.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&machine, serde_json::to_vec_pretty(&description)?)
-            .with_context(|| format!("writing {}", machine.display()))?;
+        std::fs::write(
+            &machine,
+            serde_json::to_vec_pretty(&description.redacted())?,
+        )
+        .with_context(|| format!("writing {}", machine.display()))?;
+        // Only the private launch transport contains the OSK. The runtime
+        // dump is safe to collect in logs and e2e artefacts.
+        let private = if description.applesmc.is_some() {
+            let fd = nix::sys::memfd::memfd_create(
+                "vmlab-hv-machine",
+                nix::sys::memfd::MFdFlags::MFD_CLOEXEC,
+            )?;
+            let mut file = std::fs::File::from(fd);
+            file.write_all(&serde_json::to_vec(&description)?)?;
+            Some(file)
+        } else {
+            None
+        };
+        let launch_file = private
+            .as_ref()
+            .map(|file| {
+                PathBuf::from(format!(
+                    "/proc/{}/fd/{}",
+                    std::process::id(),
+                    file.as_raw_fd()
+                ))
+            })
+            .unwrap_or_else(|| machine.clone());
+        let secrets = description
+            .applesmc
+            .as_ref()
+            .map(|smc| {
+                let json = serde_json::to_string(&smc.osk).expect("string serialization");
+                vec![smc.osk.clone(), json[1..json.len() - 1].to_string()]
+            })
+            .unwrap_or_default();
         // vmlab-hv binds every socket it serves and refuses a path that is
         // already there; QEMU unlinks a stale one itself. A previous run that
         // was killed leaves them behind.
@@ -222,14 +258,60 @@ impl Hypervisor for VmlabHv {
         }
 
         let binary = self.binary.display().to_string();
-        let args = args(&machine, control_sock);
+        let args = args(&launch_file, control_sock);
         crate::qemu::process::write_launch_header(&spec.log, &binary, &args, &spec.env)?;
         let log_from = crate::qemu::process::log_offset(&spec.log);
-        let proc =
-            Proc::spawn_with_fds(&spec.label, &binary, &args, &spec.env, &spec.log, spec.fds)
-                .await?;
+        let proc = Proc::spawn_with_secrets(
+            &spec.label,
+            &binary,
+            &args,
+            &spec.env,
+            &spec.log,
+            spec.fds,
+            secrets,
+        )
+        .await?;
         let proc: Arc<dyn Process> = super::qemu::host_process(proc);
         let mut control = connect_retry(control_sock, &proc, &spec.log, log_from).await?;
+        drop(private);
+        if matches!(&spec.machine, Launch::Vm { resolved, .. } if resolved.tsc.is_some()) {
+            // Secret filtering drains piped stderr asynchronously. Wait for
+            // its startup report before pinning, while CPUs remain paused.
+            for _ in 0..20 {
+                if reported_tsc_hz(&spec.log, log_from).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if let Launch::Vm {
+            resolved, paths, ..
+        } = &spec.machine
+            && resolved.tsc.is_some()
+        {
+            let result = (|| -> Result<()> {
+                let hz = reported_tsc_hz(&spec.log, log_from)?;
+                if let Some(pin) = paths.tsc_hz {
+                    anyhow::ensure!(
+                        pin == hz,
+                        "vmlab-hv reported a TSC frequency different from the pin"
+                    );
+                } else {
+                    let dir = paths.primary_disk.parent().context("VM disk directory")?;
+                    crate::qemu::tsc::write_pin(&dir.join("tsc-hz"), hz)?;
+                }
+                description.tsc_khz = Some(u32::try_from(hz / 1000)?);
+                std::fs::write(
+                    &machine,
+                    serde_json::to_vec_pretty(&description.redacted())?,
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                proc.kill().await;
+                return Err(error);
+            }
+        }
         if let Some([native, _]) = display_socks {
             control.set_display(native);
         }
@@ -255,6 +337,16 @@ impl Hypervisor for VmlabHv {
     fn guest_asset(&self, arch: &str) -> Result<GuestAsset> {
         crate::guest_asset::ensure_guest_asset(arch)
     }
+}
+
+fn reported_tsc_hz(log: &Path, from: u64) -> Result<u64> {
+    crate::qemu::process::log_tail_since(log, from, usize::MAX)
+        .iter()
+        .find_map(|line| line.strip_prefix("vmlab-hv: tsc_khz="))
+        .and_then(|khz| khz.parse::<u32>().ok())
+        .filter(|khz| *khz > 0)
+        .map(|khz| u64::from(khz) * 1000)
+        .context("vmlab-hv did not report a positive TSC frequency before its control handshake")
 }
 
 /// Wait for the control socket to answer the handshake, failing fast — and

@@ -30,7 +30,35 @@ RESULTS = pathlib.Path(os.environ.get("E2E_RESULTS", "/results"))
 
 def redact_osk(text: str) -> str:
     """Hide device options, including keys containing printable whitespace."""
-    return re.sub(r"osk=[^\r\n\x00]*", "osk=[REDACTED]", text)
+    text = re.sub(r"osk=[^\r\n\x00]*", "osk=[REDACTED]", text)
+    decoder = json.JSONDecoder()
+
+    def redact(value):
+        if isinstance(value, dict):
+            return {key: "[redacted]" if key == "osk" else redact(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    # Logs can interleave text and complete JSON descriptions.
+    at = 0
+    parts = []
+    while at < len(text):
+        start = text.find("{", at)
+        if start < 0:
+            break
+        parts.append(text[at:start])
+        try:
+            value, size = decoder.raw_decode(text[start:])
+        except ValueError:
+            parts.append("{")
+            at = start + 1
+            continue
+        hidden = redact(value)
+        parts.append(json.dumps(hidden) if hidden != value else text[start:start + size])
+        at = start + size
+    parts.append(text[at:])
+    return "".join(parts)
 
 
 class ScenarioFailed(Exception):

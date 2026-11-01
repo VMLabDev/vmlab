@@ -126,9 +126,10 @@ host-config reference, "Apple SMC OSK".
 Validation refuses any machine resolving `apple_smc = true` without this key.
 `up` checks all targets after template pulls and before any machine boots;
 launch checks again and reads the current host configuration. The key is not
-template or OCI metadata. QEMU receives it as a device option; launch headers,
-emulator output, startup errors and debug launch dumps redact it. Host users
-permitted to inspect QEMU's process arguments can still read it.
+template or OCI metadata. macOS runs only on vmlab-hv, which receives the
+key through an anonymous launch descriptor. Runtime machine dumps, debug
+output, emulator logs and startup errors redact it. The key never enters
+the process arguments or the retained machine description.
 
 ---
 
@@ -228,9 +229,9 @@ Each VM block can express:
 - `nested = true` — enables nested virtualisation: the guest CPU carries VMX/SVM. Under KVM on x86 a VM without it has both masked (`-cpu host,vmx=off,svm=off`), so the switch — not the host — decides what the guest sees; with it the host CPU passes through whole. `up` warns, naming the fix, when the host's `kvm_intel`/`kvm_amd` module has its own `nested` parameter off. TCG and non-x86 guests are unaffected
 - `cpu_model = "pentium3"` — the QEMU `-cpu` model the guest sees, for guests the host CPU's CPUID breaks (Windows 95/98 Setup on a modern host). Set on a profile, a template or the VM and inherited like the hardware below; when one resolves it replaces the accelerator default (`host` under KVM, `max` under TCG) under either accelerator. Any non-empty name is accepted — QEMU owns the catalogue and refuses one it does not know at start. Exclusive with `nested = true`: the named model decides the CPU features, so validation refuses the pair, naming the layer the model came from
 - `hyperv = true` — Hyper-V enlightenments for a Windows guest. Under KVM the `-cpu` string gains `hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,hv-ipi`, so Windows reads its clock from the Hyper-V reference TSC page instead of an emulated timer (about 5.7 µs a read on native KVM and 51 µs nested under WSL2, against about 20 ns) and takes fewer exits for interrupts, timers, TLB flushes and IPIs. Set on a profile, a template or the VM and inherited like the hardware below; the shipped `windows-11`, `windows-10`, `windows-server` and `windows-legacy` profiles set it, `windows-xp` and `windows-9x` do not, and `hyperv = false` on a VM turns it off. It applies under KVM only and never with a `cpu_model`: under TCG or a named model it is not applied, and `up` says so when the VM itself set it. Where the host's KVM virtualises the APIC (`kvm_intel` `enable_apicv` or `kvm_amd` `avic` on), the string also gains `hv-avic` and the argv `-global kvm-pit.lost_tick_policy=discard`: SynIC's AutoEOI otherwise turns APICv/AVIC off for the VM, and PIT tick re-injection turns AVIC off, so every end-of-interrupt is an exit — about a third of an idle Windows 11 24H2 or Server 2025 guest's exits, since that guest takes 512 clock interrupts a second on every vCPU. Without APICv/AVIC neither is added, because giving up AutoEOI there costs an exit per interrupt. `+invtsc` is deliberately not among the flags: it makes QEMU refuse migration, and with it online snapshots (§7.3). Template build VMs resolve it like any VM, so builds get it too
-- `apple_smc = true` — the Apple SMC a macOS guest reads its OSK from and refuses to boot without: `-device isa-applesmc,osk=<host.apple_smc_osk>` and `-smbios type=2`, the baseboard table macOS looks for and QEMU emits only when asked. The host must supply the key from its owner's Apple hardware. Set on a profile, a template or the VM and inherited like the hardware below; off when no layer says, and set by the shipped `macos` profile only
+- `apple_smc = true` supplies the Apple SMC and SMBIOS type 2 table macOS needs. The host must set `host.apple_smc_osk` from its owner's Apple hardware. This is vmlab-hv only; QEMU refuses it. Set on a profile, a template or the VM and inherited like the hardware below; off when no layer says, and set by the shipped `macos` profile only
 - `input = "ps2" | "usb"` — the keyboard and pointer. `ps2` (the default) is the machine's PS/2 keyboard and a `usb-tablet` on `-usb`'s controller. `usb` is for a guest that reads no PS/2 keyboard (macOS, and OpenCore before it): on `q35`/`pc` a `qemu-xhci` with the id `xhci` carries a `usb-kbd` and a `usb-tablet`, and `-usb` is not added; on `virt` the `usb-kbd` joins the tablet on the xHCI it already has. Neither device is bound to the display: QMP `send-key` names no console, and QEMU hands console-less input to the newest unbound keyboard — the USB one, created after the PS/2 one — so scripted keys reach the keyboard the guest reads, and `input_transport = "qmp"` works on such a guest. Set on a profile, a template or the VM and inherited like the hardware below
-- `tsc = "host"` — an invariant TSC pinned at the host's frequency: under KVM the `-cpu` string gains `,+invtsc,tsc-frequency=<Hz>`. macOS needs it, because QEMU fills the VMware CPUID leaf XNU reads its TSC frequency from only for a known, stable TSC. A bare `+invtsc` makes QEMU refuse migration, and with it online snapshots (§7.3); an explicit frequency lifts that, so the two only ever go together. The frequency is read from KVM at the VM's **first** KVM start — a paused emulator with no devices, the same QEMU binary the VM runs, asked over QMP for its vCPU's `tsc-frequency` and told to quit — and pinned in `.vmlab/vms/<vm>/tsc-hz`; every later start reuses the pin. Reading it afresh would break restores: the host kernel recalibrates its TSC at every boot, and QEMU refuses to load an online snapshot whose recorded frequency differs from the one the VM started with, while KVM runs a pin within its tolerance of the host's without scaling. Under TCG it is not applied — the frequency comes from KVM — and `up` says so, inherited or not, because a guest that asked for it usually does not boot without it. Set on a profile, a template or the VM and inherited like the hardware below; unset is QEMU's default TSC
+- `tsc = "host"` gives the guest an invariant TSC pinned at a known frequency under KVM. vmlab-hv reports its actual KVM frequency before the guest resumes; vmlab pins that rate in `.vmlab/vms/<vm>/tsc-hz` at first start and reuses it later. The machine description uses kHz, while the pin records Hz. QEMU machines with this setting retain their paused QMP frequency probe. Under TCG the setting is not applied and `up` warns. This field is inherited VM > template > profile; unset keeps the hypervisor default. macOS runs on vmlab-hv only.
 
   `apple_smc` and `tsc` are x86 only: a VM of another arch that resolves either is refused, naming the layer it came from. Both, with `input`, are recorded in a template's metadata and its OCI config blob (§6.4) beside `cpu_model` and `hyperv`, and a variant may override each (§6.6)
 - `accel = "tcg"` — the accelerator, `kvm` or `tcg`, for guests KVM cannot run reliably (Windows 95 on an AMD host hangs on the Win9x TLB-invalidation bug, whose only KVM workaround — `kvm_amd npt=0` — is host-wide; TCG emulates the TLB). Set on a profile, a template or the VM and inherited like the hardware below. Unset, vmlab picks KVM when it is usable and falls back to TCG with a warning; `tcg` always emulates, even where KVM works, with no warning, and `-cpu` stays `max` unless `cpu_model` names one; `kvm` refuses to start the VM, naming the setting, when KVM is unusable rather than falling back. `tcg` is exclusive with `nested = true`, which needs KVM, so validation refuses the pair, naming the layer the `tcg` came from
@@ -349,13 +350,14 @@ Besides hardware, a profile says how its guest behaves when stopped: `acpi_shutd
 
 #### macOS guests
 
-The `macos` profile boots Intel macOS (Tahoe and earlier) through OpenCore. **OpenCore is not vmlab's**: the template carries it in its disk's EFI system partition, and OVMF boots it like any UEFI application. The profile is the command line that boots it: `machine = "q35"`, `firmware = "ovmf"`, `secure_boot = false`, `tpm = false`, `disk_bus = "sata"` (macOS's own AHCI driver — OpenCore does not boot from AppleVirtIO's block personality), `nic_model = "virtio-net-pci"` (native from Big Sur on; it and the agent's virtio-serial port sit on `pcie.0`, where QEMU keeps them transitional, the only mode AppleVirtIO drives), `display = "vmware"` (there is no Apple virtio GPU driver on x86; the screen is OpenCore's GOP mode, 1280×800), `cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"` (a model macOS supports, the TSX flags it lacks off, and the VMware CPUID leaf XNU reads its TSC and bus frequencies from), `hyperv = false`, `apple_smc = true`, `input = "usb"`, `tsc = "host"` (§5.2), `cpus = 4`, `memory = 8GiB`, `workspace_guest = "/Users/Shared/src"`, and `acpi_shutdown = false`: macOS does not act on the ACPI power button, so its graceful stop is the agent's (§7.2). It leaves the `virtiofs` capability off.
+The `macos` profile boots Intel macOS (Tahoe and earlier) through OpenCore. **OpenCore is not vmlab's**: the template carries it in its disk's EFI system partition, and OVMF boots it like any UEFI application. The profile describes the hardware that boots it: `hypervisor = "vmlab"`, `machine = "q35"`, `firmware = "ovmf"`, `secure_boot = false`, `tpm = false`, `disk_bus = "sata"` (macOS's own AHCI driver — OpenCore does not boot from AppleVirtIO's block personality), `nic_model = "virtio-net-pci"` (native from Big Sur on; it and the agent's virtio-serial port sit on `pcie.0`, where QEMU keeps them transitional, the only mode AppleVirtIO drives), `display = "vmware"` (there is no Apple virtio GPU driver on x86; the screen is OpenCore's GOP mode, 1280×800), `cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"` (a model macOS supports, the TSX flags it lacks off, and the VMware CPUID leaf XNU reads its TSC and bus frequencies from), `hyperv = false`, `apple_smc = true`, `input = "usb"`, `tsc = "host"` (§5.2), `cpus = 4`, `memory = 8GiB`, `workspace_guest = "/Users/Shared/src"`, and `acpi_shutdown = false`: macOS does not act on the ACPI power button, so its graceful stop is the agent's (§7.2). It leaves the `virtiofs` capability off.
 
 The profile requires `host.apple_smc_osk` in host configuration before validation
 or launch can succeed. Obtain the 64-character key from your own Apple hardware
 by reading `OSK0` and `OSK1` with the public `smc_read` approach. vmlab contains
 no copy of the key. The manual's host-config reference explains how to set it.
-vmlab-hv continues to refuse macOS machines until its macOS phase.
+The profile defaults to `hypervisor = "vmlab"`. QEMU refuses macOS and
+`apple_smc` machines with a message naming vmlab-hv.
 
 **The family.** A profile whose name starts with `macos` makes the machine a macOS guest, the way `windows…` makes a Windows one; vmlab's own surfaces then behave as follows.
 
@@ -368,7 +370,11 @@ vmlab-hv continues to refuse macOS machines until its macOS phase.
 - **Dev machines** (§19.1) land their workspace at `/Users/Shared/src`: `/` is the sealed system volume, and `/Users/Shared` is on the Data volume, where any login can make a directory.
 - **`vmlab machine repair-agent`** (§19.4) stages `/Library/vmlab/vmlab-agent.new`, renames it over `/Library/vmlab/vmlab-agent` and restarts the job with `launchctl kickstart -k system/dev.vmlab.agent`, detached so it completes though the requester is what it kills.
 
-**The host.** XNU reads Intel MSRs KVM does not emulate, and KVM injects a #GP for each unless the `kvm` module's `ignore_msrs` is on — on an AMD host that is every boot. So `up` warns for a macOS VM (its profile's family, or `apple_smc` resolved on) running under KVM when `/sys/module/kvm/parameters/ignore_msrs` is not `Y`, naming the fix: `options kvm ignore_msrs=1 report_ignored_msrs=0` in a file under `/etc/modprobe.d`, and `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` until the next boot. It is a warning, not a refusal; the guest then faults during boot.
+**The host.** vmlab-hv handles unknown MSRs per machine: reads return zero,
+writes are dropped, and each MSR index is logged once. macOS needs no
+`kvm.ignore_msrs` module option. The profile's invariant TSC and CPUID leaf
+`0x40000010` use the actual KVM frequency vmlab-hv reports before the first
+resume. vmlab pins it in `.vmlab/vms/<vm>/tsc-hz` and reuses it on later starts.
 
 ---
 
@@ -2572,8 +2578,9 @@ lifecycle.
 **Selection.** A `vm` or `container` block names its hypervisor with
 `hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
-`qemu` for both until changed. The field is declared on the machine only and
-never resolves through template or profile. vmlab finds the binary as
+`qemu` for both until changed. For VMs, the effective profile's `hypervisor`
+takes precedence over the host default; the machine's explicit field wins
+over both. The `macos` profile selects `vmlab`. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
 `vmlab status -v` shows `hypervisor=` on every machine.
@@ -2590,10 +2597,13 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 2d | GPUs (`gpu {}`): virgl and Venus on a host render node | Selectable |
 | 2e | virtio-fs shares, served in process, and audio (HDA) | Selectable |
 | 2f | Host USB (`usb = true`) and vfio (`gpu { mode = "passthrough" }`) | Selectable |
+| macOS | Intel macOS through OpenCore: named Intel CPU, invariant pinned TSC, Apple SMC, VMware SVGA, USB keyboard | Default for `macos`; vmlab-hv only |
 | 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
 | 4 | Legacy PCs | Refused |
 
-macOS guests are a phase of their own after 2.
+The macOS phase follows 2f and runs on vmlab-hv only. The `macos` e2e
+scenario checks agent readiness, exec, copies both ways, a screenshot, an
+online snapshot round-trip and stop. It skips without the template or host key.
 
 **Refusals.** Validation (§5.1), and the lab daemon again before it builds a
 machine and before each start, refuse a machine on vmlab-hv that it cannot run
@@ -2603,13 +2613,12 @@ secure boot included (2c), std VGA or a virtio-vga, virtio, SATA or IDE
 disks (both on AHCI), virtio-net NICs, the PS/2 keyboard with the USB tablet,
 a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
 (2d, 2f), virtio-fs shares and a sound card (2e) and `usb = true` (2f) — the
-Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
-macOS guest (its own phase); the i440fx machine, a floppy or
-`agent_transport = "isa-serial"` (4); `accel = "tcg"` (3); another display
-device, NIC model or `cpu_model`; `input = "usb"`; a pinned `tsc`, which waits
-for vmlab-hv's host-facts probe (vmlab reads the host's TSC frequency through
-a paused QEMU today, and vmlab-hv has neither the probe nor a frequency to
-pin); and `qemu_args`, QEMU's own argv, in every phase. A
+Linux profiles and Windows 10, 11 and Server. The macOS phase adds Intel
+macOS, VMware SVGA, a USB keyboard, the named Skylake CPU and pinned TSC.
+The i440fx machine, a floppy or `agent_transport = "isa-serial"` wait for
+phase 4; `accel = "tcg"` waits for phase 3. Unsupported display devices,
+NIC models, CPU models or feature edits are refused. So is `qemu_args`,
+QEMU's own argv, in every phase. A
 container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
 no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved

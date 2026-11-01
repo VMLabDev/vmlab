@@ -119,7 +119,10 @@ GPU driver for x86, and the screen is OpenCore's 1280×800. The CPU is
 `Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on`,
 an Intel model macOS supports, with the TSX flags it lacks turned off and the
 VMware CPUID leaf it reads its clock frequencies from. `hyperv` is off by
-name. The host needs KVM's `ignore_msrs` on; see
+name. The profile selects `hypervisor = "vmlab"`; macOS runs only on
+vmlab-hv. Set `host.apple_smc_osk` to your own Apple hardware's key before
+validation or launch. vmlab-hv handles unknown MSRs per machine, so no
+`kvm.ignore_msrs` module option is needed. See
 [Host configuration and WSL 2](guide_host).
 DOC
 
@@ -129,7 +132,7 @@ DOC
 
   list {
     li "**The agent** is `vmlab-agent` built for macOS, on the same virtio-serial channel as on Linux, running as root under launchd."
-    li "**Scripted input** goes over QMP as usual. The USB keyboard `input = \"usb\"` adds is not bound to the display, so `send_keys` reaches it."
+    li "**Scripted input** goes over vmlab-hv's native display protocol to the USB keyboard selected by `input = \"usb\"`."
     li "**`boot_id`** reads `kern.bootsessionuuid` with `sysctl`."
     li "**Stopping** goes through the agent, because macOS ignores the ACPI power button (`acpi_shutdown = false`). A `down` while the guest is still booting waits for its agent rather than ending in an emulator quit, which the guest would see as a power cut."
     li "**Shares** mount over SMB with `mount_smbfs`. macOS has no virtiofs client, so a share declared `transport = \"virtiofs\"` is reported unmountable and `auto` picks SMB. See [Shared folders](guide_shares)."

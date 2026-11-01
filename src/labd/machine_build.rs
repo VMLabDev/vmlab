@@ -347,13 +347,20 @@ fn hypervisor_for(
     machine: MachineCfg<'_>,
     hardware: Option<&crate::qemu::ResolvedVm>,
 ) -> Result<HypervisorKind> {
-    let kind = cx.host.hypervisor.effective(machine);
+    let kind = hardware
+        .and_then(|h| h.hypervisor)
+        .unwrap_or_else(|| cx.host.hypervisor.effective(machine));
     if kind == HypervisorKind::Vmlab {
         let why = crate::config::hypervisor::vmlab_refusals(
             machine,
             &crate::config::hypervisor::HostFacts::probe(),
             hardware,
         );
+        if !why.is_empty() {
+            bail!("{}", why.join("\n"));
+        }
+    } else if let MachineCfg::Vm(vm) = machine {
+        let why = crate::config::hypervisor::qemu_refusals(vm, hardware);
         if !why.is_empty() {
             bail!("{}", why.join("\n"));
         }

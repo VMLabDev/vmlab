@@ -157,16 +157,6 @@ fn vm_refusals(vm: &Vm, host: &HostFacts, hardware: Option<&ResolvedVm>) -> Vec<
 /// What the resolved hardware asks for that vmlab-hv cannot present yet.
 fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
     use crate::profiles::AgentTransport;
-    // A macOS guest and the legacy PC are phases of their own: their
-    // hardware differs everywhere, so the one reason says all of it.
-    if h.profile.as_deref() == Some("macos") || h.apple_smc {
-        why.push(phase(
-            name,
-            "a macOS guest",
-            "macOS (its own phase, after 2)",
-        ));
-        return;
-    }
     if !h.machine.starts_with("q35") {
         why.push(phase(
             name,
@@ -176,10 +166,10 @@ fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
         return;
     }
     match h.display_device.as_deref() {
-        None | Some("VGA") | Some("virtio-vga") => {}
+        None | Some("VGA") | Some("virtio-vga") | Some("vmware-svga") => {}
         Some(other) => why.push(format!(
-            "vm \"{name}\": display device `{other}` — vmlab-hv presents std VGA and \
-             virtio-vga only (PRD §22); set display = \"std\" or \"virtio-vga\", or use \
+            "vm \"{name}\": display device `{other}` — vmlab-hv presents std VGA, \
+             virtio-vga and VMware SVGA (PRD §22); set display = \"std\" or \"virtio-vga\", or use \
              hypervisor = \"qemu\""
         )),
     }
@@ -197,33 +187,33 @@ fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
             "4 (the legacy PC)",
         ));
     }
-    if h.input == crate::config::model::InputDevices::Usb {
-        why.push(phase(name, "input = \"usb\" (a USB keyboard)", "after 2b"));
-    }
-    if let Some(model) = &h.cpu_model {
-        why.push(format!(
-            "vm \"{name}\": cpu_model = \"{model}\" — vmlab-hv runs the host CPU only \
-             (PRD §22); remove it, or use hypervisor = \"qemu\""
-        ));
-    }
-    // vmlab reads the host's TSC frequency through a paused QEMU, and
-    // vmlab-hv has neither the probe that would replace it (HV phase-2 D10)
-    // nor a frequency to pin in its machine description yet.
-    if h.tsc.is_some() {
-        why.push(phase(
-            name,
-            "a pinned TSC (`tsc`)",
-            "after 2f (D10's host probe)",
-        ));
+    if let Err(error) =
+        crate::labd::hypervisor::vmlab_hv::describe::cpu_model(h.cpu_model.as_deref())
+    {
+        why.push(format!("vm \"{name}\": {error}"));
     }
 }
 
 /// Why QEMU cannot run `vm` as declared — what only vmlab-hv brings, one
 /// sentence per reason; empty when it can. Read by validation for every VM
 /// that runs on QEMU, as [`vmlab_refusals`] is for every one that does not.
-pub fn qemu_refusals(vm: &Vm) -> Vec<String> {
+pub fn qemu_refusals(vm: &Vm, hardware: Option<&ResolvedVm>) -> Vec<String> {
     let name = &vm.name;
     let mut why = Vec::new();
+    if hardware.map_or_else(
+        || {
+            vm.apple_smc == Some(true)
+                || vm
+                    .profile
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with("macos"))
+        },
+        |h| h.apple_smc || h.profile.as_deref().is_some_and(|p| p.starts_with("macos")),
+    ) {
+        why.push(format!(
+            "vm \"{name}\": macOS (apple_smc) requires vmlab-hv; set hypervisor = \"vmlab\" (PRD §22)"
+        ));
+    }
     // vmlab gives QEMU no audio device (hv-audio D7): audio is vmlab-hv's.
     for (key, on) in [("audio", vm.audio), ("microphone", vm.microphone)] {
         if on {
@@ -421,14 +411,7 @@ mod tests {
     #[test]
     fn what_a_later_phase_brings_is_refused_naming_that_phase() {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
-        let cases = [
-            (
-                r#"profile = "linux-generic" tsc = "host""#,
-                "phase after 2f",
-            ),
-            (r#"profile = "macos""#, "phase macOS"),
-            (r#"profile = "windows-legacy""#, "phase 4"),
-        ];
+        let cases = [(r#"profile = "windows-legacy""#, "phase 4")];
         for (body, phase) in cases {
             let why = refused(&format!("{base} {body}"));
             assert!(
@@ -437,9 +420,8 @@ mod tests {
                 "{body}: expected {phase} in {why:?}"
             );
         }
-        // macOS and the legacy PC are one reason each, not a list of their
-        // hardware.
-        assert_eq!(refused(&format!(r#"{base} profile = "macos""#)).len(), 1);
+        assert!(refused(&format!(r#"{base} profile = "macos""#)).is_empty());
+        assert!(refused(&format!(r#"{base} profile = "linux-generic" tsc = "host""#)).is_empty());
     }
 
     /// What no phase brings says so, and what to do.
@@ -492,11 +474,11 @@ mod tests {
             crate::config::model::MachineCfg::Vm(vm) => vm,
             _ => unreachable!(),
         };
-        let why = qemu_refusals(vm("loud"));
+        let why = qemu_refusals(vm("loud"), None);
         assert_eq!(why.len(), 2, "{why:?}");
         assert!(why[0].contains("audio = true") && why[0].contains("hypervisor = \"vmlab\""));
         assert!(why[1].contains("microphone = true"), "{why:?}");
-        assert!(qemu_refusals(vm("quiet")).is_empty());
+        assert!(qemu_refusals(vm("quiet"), None).is_empty());
     }
 
     /// D9: an accelerated or passed-through GPU blocks online snapshots on

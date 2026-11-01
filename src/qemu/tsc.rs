@@ -8,6 +8,9 @@
 //! emulator the VM itself runs under, it reads exactly the value that VM
 //! would see.
 //!
+//! vmlab-hv machines use their own startup TSC report instead of this probe.
+//! Both adapters share the pin file's Hz format and read/write helpers.
+//!
 //! The lab daemon pins the answer per VM, at its first KVM start, rather than
 //! reading it afresh each time: the host kernel recalibrates its TSC at every
 //! boot, and QEMU refuses to load an online snapshot whose recorded frequency

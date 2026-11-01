@@ -34,6 +34,7 @@ SCENARIOS = [
     "variants",
     "core",
     "firmware",
+    "macos",
     "sleep",
     "guest",
     "network",
@@ -80,6 +81,20 @@ def write_host_config(h: Harness, vms: bool = False) -> None:
     """The host config the run's supervisor and lab daemons read: only what
     selects the hypervisor, and nothing at all on QEMU, which is the default.
     Rewritten per scenario, since whether VMs follow is the scenario's."""
+    private_config = os.environ.get("E2E_HOST_CONFIG")
+    if private_config:
+        # Import the complete host document without reading or logging it.
+        # The macOS lab selects its backend explicitly.
+        if h.scenario not in ("-", "macos"):
+            raise SystemExit("E2E_HOST_CONFIG is supported only with --only macos")
+        path = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "vmlab" / "config.wcl"
+        if path.resolve() == pathlib.Path(private_config).resolve():
+            raise SystemExit("E2E_HOST_CONFIG needs a separate XDG_CONFIG_HOME")
+        import json
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"import <vmlab-host.wcl>\nimport {json.dumps(str(pathlib.Path(private_config).resolve()))}\n")
+        h.log.write("[setup] private host configuration imported; contents omitted\n")
+        return
     lines = h.host_config(vms)
     if not lines:
         return
@@ -104,6 +119,8 @@ def main() -> int:
         print("\n".join(SCENARIOS))
         return 0
     chosen = args.only or SCENARIOS
+    if os.environ.get("E2E_HOST_CONFIG") and chosen != ["macos"]:
+        raise SystemExit("E2E_HOST_CONFIG is supported only with --only macos")
     unknown = set(chosen) - set(SCENARIOS)
     if unknown:
         raise SystemExit(f"unknown scenario(s): {', '.join(sorted(unknown))}")
@@ -116,9 +133,9 @@ def main() -> int:
         if name not in runnable:
             print(f"== {name}\n   skipped: no feature in scope on {args.hypervisor}", flush=True)
     write_host_config(h)
-    registry = start_registry()
+    registry = start_registry() if any(n != "macos" for n in runnable) else None
     try:
-        if "template" not in runnable:
+        if "template" not in runnable and any(n != "macos" for n in runnable):
             # Every other scenario boots the e2e template; build it without
             # reporting on it.
             h.scenario = "base"
@@ -143,7 +160,8 @@ def main() -> int:
             h.log.write(f"[{name}] {verdict}\n")
             print(f"   {verdict.splitlines()[0]} ({time.monotonic() - started:.0f}s)", flush=True)
     finally:
-        registry.terminate()
+        if registry is not None:
+            registry.terminate()
         subprocess.run(["vmlab", "daemon", "stop"], capture_output=True)
     if args.only:
         # A partial run expects exactly the features its scenarios name, so a
