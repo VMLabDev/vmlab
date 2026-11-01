@@ -43,11 +43,10 @@ vmlab-agent-proto = { path = "guest/agent-proto" }
 # The control protocol and machine description vmlab-hv speaks (§22,
 # ADR-0021): a machine on `hypervisor = "vmlab"` is launched from a
 # `MachineDescription` and driven over its control socket.
-# Local testing pin. Replace the URL and revision after the hypervisor is published.
-vmlab-hv-proto = { git = "file:///home/wil/dev/vmlab-hypervisor", rev = "4a03a84daa6aadf851f555340fe41ca4fbcb55ee" }
+vmlab-hv-proto = { git = "https://github.com/VMLabDev/vmlab-hypervisor.git", rev = "41e53e474b537e6d6de48a34ad55c317d8d95ab7" }
 # vmlab-hv's native frame protocol (§22, phase 2b): screenshots, scripted
 # input and the recorder's frame stream on a vmlab-hv VM's `display.sock`.
-vmlab-hv-display = { git = "https://github.com/VMLabDev/vmlab-hypervisor.git", rev = "a8fdf05e2fc743217755c17b6085c11fcca7879b" }
+vmlab-hv-display = { git = "https://github.com/VMLabDev/vmlab-hypervisor.git", rev = "41e53e474b537e6d6de48a34ad55c317d8d95ab7" }
 
 anyhow = "1"
 thiserror = "2"
