@@ -35,7 +35,7 @@ fetch() {
 main() {
   local tool
   for tool in curl tar xz patch make gcc g++ nasm iasl python3 sha256sum dpkg-buildflags; do
-    command -v "$tool" >/dev/null || die "missing $tool; rebuild vmlab-build (build/Dockerfile)"
+    command -v "$tool" >/dev/null || die "missing $tool; run through the build container: ./build/run.sh bash guest/build-firmware.sh x86_64"
   done
   [[ -s "$OUT/OVMF_VARS_4M.fd" && -s "$OUT/OVMF_VARS_4M.ms.fd" ]] ||
     die "run guest/fetch-firmware.sh x86_64 first"

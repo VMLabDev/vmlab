@@ -36,7 +36,24 @@ was.
 
 ## How it runs
 
-`build/run.sh` starts the container for both recipes:
+`build/run.sh` starts the container and builds the image first if its tag is
+missing. Set `VMLAB_BUILD_IMAGE` to use another tag. An existing image is not
+rebuilt automatically; use `just buildbox::image` after toolchain changes.
+
+`just guest-build` and `just guest-install` build the kernel and initramfs on
+the host, then run firmware fetching, OVMF, iPXE, and SeaBIOS through
+`build/run.sh`. Docker must be available to your user. To build only firmware:
+
+```sh
+bash guest/build-firmware.sh x86_64
+```
+
+The image and `build/run.sh` set `VMLAB_BUILD_ENV=1`. Firmware runs directly
+when that marker is present, so `buildbox::dist` does not start a nested
+container. The release CI job sets the same marker because it installs the
+toolchains directly on its runner.
+
+The container setup:
 
 - It bind-mounts the checkout at its own absolute path, and also the git common
   directory when the checkout is a worktree, so git works inside the container.

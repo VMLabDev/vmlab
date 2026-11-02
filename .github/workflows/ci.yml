@@ -229,6 +229,9 @@ jobs:
   # the one list of what that takes; this job only caches the two slow stages.
   guest-assets:
     name: Build guest assets
+    # This job installs the build container's toolchains directly on the runner.
+    env:
+      VMLAB_BUILD_ENV: '1'
     needs: [version, check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest

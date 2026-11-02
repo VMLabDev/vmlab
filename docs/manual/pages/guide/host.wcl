@@ -280,7 +280,13 @@ the menu for the one-second splash delay.
 In a source checkout, `guest/logo/wordmark.svg` is the editable logo.
 `guest/logo/render.sh` generates the 193 by 58 pixel, 24-bit `Logo.bmp`
 and `bootsplash.jpg`. `guest/build-ovmf.sh` builds the branded CODE during the
-guest build. `guest/OVMF.md` documents the pins, build command, and compatibility
+guest build. From a checkout, `just guest-install` builds and installs the
+guest assets, including firmware. `just guest-build` leaves them in `guest/dist/`.
+Both recipes run the firmware steps in the `vmlab-build` container and build
+its image first if missing. Your user needs access to Docker; the kernel and
+initramfs still use the host's Rust toolchains. Inside the build container,
+firmware runs directly without starting another container.
+`guest/OVMF.md` documents the pins, build command, and compatibility
 checks. AArch64 retains Debian's logo pending its cross toolchain and guest
 compatibility test.
 DOC

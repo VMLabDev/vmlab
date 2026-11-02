@@ -341,14 +341,7 @@ main() {
     log "building guest asset for $arch"
     build_arch "$arch"
   done
-  "$SCRIPT_DIR/fetch-firmware.sh" "${arches[@]}"
-  for arch in "${arches[@]}"; do
-    if [[ "$arch" == x86_64 ]]; then
-      "$SCRIPT_DIR/build-ovmf.sh"
-      python3 "$SCRIPT_DIR/ipxe/build.py"
-      bash "$SCRIPT_DIR/build-seabios.sh"
-    fi
-  done
+  bash "$SCRIPT_DIR/build-firmware.sh" "${arches[@]}"
   log "done"
 }
 
