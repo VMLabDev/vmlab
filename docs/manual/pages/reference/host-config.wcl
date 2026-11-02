@@ -3,7 +3,7 @@ page ref_host {
   chapter_header "Host configuration file" {
     kicker       = "Reference · reference"
     reading_time = "5 min read"
-    updated      = "2026-10-31"
+    updated      = "2026-11-02"
     version      = "vmlab 0.9"
   }
 
@@ -64,6 +64,8 @@ host {
   workspace_max_file   = 256MiB
   firmware_dir         = "/opt/vmlab-firmware"
   vmlab_hv             = "/opt/vmlab-hv/bin/vmlab-hv"
+  vmlab_hv_viewer      = "/opt/vmlab-hv/bin/vmlab-hv-viewer"
+  viewer_release_chord = "ctrl_r+alt_r"
   btrfs_nocow          = true
   hypervisor {
     container = "qemu"
@@ -92,6 +94,8 @@ SRC
       | "`workspace_max_file`" | "ByteSize" | "`256MiB`" | "Workspace syncer per-file size guard. A larger file is refused by name." |
       | "`firmware_dir`" | "utf8" | "none" | "UEFI firmware override, laid out `<dir>/<arch>/` with the bundled set's file names. Searched before vmlab's bundled firmware and the host's." |
       | "`vmlab_hv`" | "utf8" | "`vmlab-hv` on PATH" | "The vmlab-hv binary that machines on `hypervisor = \"vmlab\"` run. `up` checks that it exists before it starts anything." |
+      | "`vmlab_hv_viewer`" | "utf8" | "`vmlab-hv-viewer` beside configured `vmlab_hv`, then on `PATH`" | "Native viewer binary for vmlab-hv machines. A path or a binary name, without arguments. Overrides discovery; a missing or non-executable binary falls back to VNC with an installation notice." |
+      | "`viewer_release_chord`" | "utf8" | "viewer's left Ctrl+Alt" | "Native viewer grab release chord, passed as `--release-chord`. Example: `ctrl_r+alt_r`. The viewer validates chord syntax; this key does not affect VNC viewers." |
       | "`btrfs_nocow`" | "bool" | "`true`" | "On btrfs, set NOCOW (`chattr +C`) on each machine's disk directory before its first disk is created, so online snapshots do not fragment the disks. NOCOW files have no btrfs checksums or compression. `false` keeps them copy-on-write. Ignored on other filesystems." |
       | "`hypervisor {}`" | "child" | "`qemu` for both" | "The hypervisor a machine runs on when it does not name one, by machine kind: `container` and `vm`, each `qemu` or `vmlab`. Keyed by kind because vmlab-hv takes machines over one phase at a time. A machine's own `hypervisor` wins." |
   }
@@ -115,6 +119,17 @@ SRC
     for: a pair missing from `<dir>/<arch>/` is an error, never a fall back to
     firmware you did not choose. An architecture with no directory there uses
     the bundled set. See [Host configuration and WSL 2](guide_host).
+  DOC
+  p <<DOC
+    `vmlab console` and the `gui = true` auto-open on `vmlab up` read
+    `vmlab_hv_viewer` and `viewer_release_chord` in the CLI, so changes
+    apply to the next window without a daemon restart. These keys affect
+    only machines whose status reports `hypervisor = \"vmlab\"`.
+    An explicit `--tcp` uses VNC on either hypervisor. The native viewer
+    handles socket readiness, reconnection, and shared-memory selection
+    under WSLg itself. If it is missing, install `vmlab-hv-viewer` from
+    `VMLabDev/vmlab-hypervisor` beside `vmlab-hv`, on `PATH`, or at this
+    override. See [vmlab console](cmd_console) for VNC fallback behavior.
   DOC
   p <<DOC
     `waypipe` and `freerdp` are read by `vmlab app run` itself rather than by

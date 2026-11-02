@@ -1226,4 +1226,30 @@ mod tests {
         let back: LabStatus = serde_json::from_value(json).unwrap();
         assert_eq!(back, status);
     }
+
+    #[test]
+    fn hypervisor_status_is_additive_and_serializes_both_hypervisors() {
+        use crate::config::hypervisor::HypervisorKind;
+        let mut native = machine("native", PowerState::Running, true, vm());
+        native.hypervisor = HypervisorKind::Vmlab;
+        let status = lab(vec![
+            machine("qemu", PowerState::Running, true, vm()),
+            native,
+        ]);
+        let mut json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["machines"][0]["hypervisor"], "qemu");
+        assert_eq!(json["machines"][1]["hypervisor"], "vmlab");
+        assert_eq!(
+            serde_json::from_value::<LabStatus>(json.clone()).unwrap(),
+            status
+        );
+        json["machines"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("hypervisor");
+        assert_eq!(
+            serde_json::from_value::<LabStatus>(json).unwrap().machines[0].hypervisor,
+            HypervisorKind::Qemu
+        );
+    }
 }
