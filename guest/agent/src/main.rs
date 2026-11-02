@@ -120,7 +120,11 @@ fn main() {
             // service spawns (see windows/clipboard.rs).
             #[cfg(windows)]
             "--clipboard-helper" => {
-                windows::clipboard::helper_main();
+                let Some(pipe) = args_iter.next() else {
+                    eprintln!("vmlab-agent: --clipboard-helper needs a pipe path");
+                    std::process::exit(2);
+                };
+                windows::clipboard::helper_main(pipe);
             }
             // Undocumented live-test aid: run the shared-app RDP preparation
             // once for an account and print what it changed (PRD §20.3).
