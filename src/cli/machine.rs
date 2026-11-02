@@ -54,6 +54,7 @@ fn render_capabilities(caps: &Value) -> String {
     for (label, value) in [
         ("kind", caps["kind"].as_str().unwrap_or("?")),
         ("display", flag("display")),
+        ("debug", flag("debug")),
         ("console log", flag("console_log")),
         ("reboot", flag("reboot")),
         ("healthcheck", flag("healthcheck")),
@@ -256,6 +257,7 @@ mod tests {
     #[test]
     fn capabilities_report_every_probed_flag_and_the_agent_features() {
         let caps = Capabilities {
+            debug: true,
             kind: MachineKind::Vm,
             display: true,
             console_log: false,
@@ -280,6 +282,7 @@ mod tests {
     #[test]
     fn a_machine_with_no_agent_answering_reports_a_dash() {
         let caps = Capabilities {
+            debug: false,
             kind: MachineKind::Container,
             display: false,
             console_log: true,

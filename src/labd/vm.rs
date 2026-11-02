@@ -1820,6 +1820,30 @@ impl super::display::DisplayHost for VmInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for VmInstance {
+    async fn debug_available(&self) -> bool {
+        self.control
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|control| control.debugger().is_some())
+    }
+
+    async fn debug(
+        &self,
+        request: vmlab_hv_proto::debug::DebugRequest,
+    ) -> Result<vmlab_hv_proto::debug::DebugResponse> {
+        self.running_control()
+            .await?
+            .debugger()
+            .ok_or_else(|| {
+                crate::proto::CommandError::unsupported(
+                    "this machine does not provide the debug feature",
+                )
+            })?
+            .request(request)
+            .await
+    }
+
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
         self.hv.virtiofsd()
     }

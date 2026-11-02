@@ -94,6 +94,10 @@ pub trait Process: Send + Sync + 'static {
 /// adapter does not have to stand up a QMP server to be usable.
 #[async_trait::async_trait]
 pub trait Control: Send + Sync + 'static {
+    /// Whole-machine debugging, when the running backend advertises it.
+    fn debugger(&self) -> Option<Arc<dyn Debugger>> {
+        None
+    }
     /// Release the CPUs. The emulator starts paused so the caller can
     /// subscribe to what it needs before the guest runs an instruction.
     async fn resume(&self) -> Result<()>;
@@ -168,6 +172,15 @@ pub trait Control: Send + Sync + 'static {
     fn media(&self) -> Option<Arc<dyn Media>> {
         None
     }
+}
+
+/// Optional whole-machine debugger capability.
+#[async_trait::async_trait]
+pub trait Debugger: Send + Sync + 'static {
+    async fn request(
+        &self,
+        request: vmlab_hv_proto::debug::DebugRequest,
+    ) -> Result<vmlab_hv_proto::debug::DebugResponse>;
 }
 
 /// The **snapshots** capability: save, load and delete a snapshot of a

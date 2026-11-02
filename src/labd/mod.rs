@@ -645,6 +645,9 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::MachineCapabilities { machine } => {
                 Ok(json!(machine_of(lab, &machine)?.capabilities().await))
             }
+            LabRequest::MachineDebug { machine, request } => {
+                Ok(json!(machine_of(lab, &machine)?.debug(request).await?))
+            }
             LabRequest::MachineIp { machine, nic } => {
                 let ip = machine_of(lab, &machine)?.guest_ip(nic).await?;
                 Ok(json!(ip))

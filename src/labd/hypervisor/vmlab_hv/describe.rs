@@ -101,6 +101,7 @@ pub(crate) fn container(
         vmstate,
     };
     Ok(MachineDescription {
+        fw_cfg: Vec::new(),
         // A guest reset happens in place, as under QEMU.
         exit_on_reset: false,
         machine: Machine::Microvm,
@@ -524,6 +525,7 @@ pub(crate) fn vm(
     }
 
     Ok(MachineDescription {
+        fw_cfg: Vec::new(),
         // A guest reset happens in place, as under QEMU: the process, its
         // sockets and every connection to them stay (PRD §22).
         exit_on_reset: false,
@@ -566,6 +568,7 @@ pub(crate) fn vm(
         vcpus: resolved.cpus,
         memory_mib: resolved.memory >> 20,
         boot: Boot::Firmware {
+            boot_menu: false,
             firmware: firmware.0,
             code: firmware.1,
             vars: firmware.2,
@@ -629,6 +632,7 @@ mod tests {
             "x86_64",
         );
         let d = container("lab1", &r, &paths()).unwrap();
+        assert!(d.fw_cfg.is_empty());
         assert_eq!(d.name, "vmlab:lab1/web");
         assert_eq!((d.arch, d.accel), (Arch::X86_64, Accel::Kvm));
         assert_eq!((d.vcpus, d.memory_mib), (2, 512));
@@ -811,6 +815,7 @@ mod tests {
     #[test]
     fn a_seabios_linux_vm_takes_the_slots_qemu_gives_it() {
         let d = vm("l", &seabios_modern(), &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+        assert!(d.fw_cfg.is_empty());
         assert_eq!(d.machine, Machine::Q35);
         // A guest reset happens in place, as under QEMU.
         assert!(!d.exit_on_reset);
@@ -844,6 +849,7 @@ mod tests {
         assert_eq!(
             d.boot,
             Boot::Firmware {
+                boot_menu: false,
                 firmware: FirmwareKind::Seabios,
                 code: "/usr/share/qemu/bios-256k.bin".into(),
                 vars: None,
@@ -1072,6 +1078,7 @@ mod tests {
         assert_eq!(
             d.boot,
             Boot::Firmware {
+                boot_menu: false,
                 firmware: FirmwareKind::Ovmf,
                 code: "/fw/x86_64/OVMF_CODE_4M.secboot.fd".into(),
                 vars: Some("/lab/.vmlab/vms/v/OVMF_VARS.fd".into()),
