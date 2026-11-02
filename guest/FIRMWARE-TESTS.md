@@ -127,3 +127,35 @@ SeaBIOS branding needs `bootsplash.jpg` with JPEG bytes and
 duplicate/reserved names and oversized data and test firmware consumption.
 After that upstream change, vmlab must update its protocol pin, fill the files
 in describe.rs and remove the FW5 refusal. No hypervisor files are changed here.
+
+## FW6: optional Microsoft-plus-lab trust
+
+The offline enrollment tool appends public certificates to db in a new copy
+of Microsoft's 540,672-byte VARS. Seven focused tests cover deterministic
+output, unchanged source bytes, PEM/DER equivalence, explicit owner GUID,
+no overwrite, private-key and blank-template rejection, malformed second
+certificate atomicity and empty-input rejection. Python lint and format checks
+pass. The script's adjacent uv lock pins the dependency set.
+
+The review runs the actual locked CLI using an ephemeral public test certificate,
+then boots a signed EFI probe under the resulting store with SecureBoot=1
+(`review2-fw6-signed`). The unsigned probe is rejected under that same store
+(`review2-fw6-unsigned`), and the signed probe is rejected under Microsoft-only
+VARS (`review2-fw6-ms-only`). All three assertions pass on the final RELEASE
+secboot image. The earlier DEBUG/secboot signed-payload check also passes
+(`fw6-final-debug-signed`).
+
+The existing Microsoft-signed Ubuntu installation boots under the combined
+store through `secure_boot_vars` and reports SecureBoot=1
+(`fw6-ubuntu-combined`, 7.957 s agent-ready). The final Windows 11 clone also
+boots the current secboot CODE with its existing Microsoft VARS and TPM state;
+Confirm-SecureBootUEFI returns True. Its source disk modification time and
+VARS hash are unchanged (`.scratch/boot-logo/windows-qemu-firmware-final/`).
+These are compatibility checks, not boot-speed measurements.
+
+No production vmlab certificate was supplied. The shipped default remains
+Microsoft-only; no signing private key or invented production identity is
+included. Lab trust is opt-in via public certificates and the existing custom
+VARS path, which both hypervisor adapters already support. No FW6 hypervisor
+change is required. OVMF's existing option-ROM policy permits unsigned PCI ROMs;
+payload signature enforcement is demonstrated separately above.

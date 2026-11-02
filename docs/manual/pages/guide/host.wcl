@@ -319,6 +319,20 @@ the same keys unless it names its own. `firmware_dir` is unchanged by all of
 this: it still replaces the whole firmware set for an architecture, host-wide.
 DOC
 
+  p <<'DOC'
+To trust a lab signer alongside Microsoft's keys on x86_64, run
+`uv run --frozen --script guest/enroll-secureboot.py --certificate /path/to/vmlab-public.pem --output keys/OVMF_VARS_4M.vmlab.fd`
+from a source checkout after fetching firmware. Create `keys/` first. Repeat
+`--certificate` for multiple public X.509 PEM or DER certificates. Select the
+result with `secure_boot = true` and `secure_boot_vars` on a new VM. Do not
+also set `secure_boot_keys`. The tool preserves PK, KEK, dbx, Microsoft's db
+entries and all other variables. It refuses to overwrite an existing output.
+Keep signing private keys outside the checkout and firmware bundle. No
+production vmlab certificate is supplied. Existing VMs keep their own stores;
+this offline tool does not update them. See `guest/SECUREBOOT.md` for the
+source-checkout workflow and signature-policy limits.
+DOC
+
   h2 "Directories"
 
   p "vmlab follows the XDG layout and honours each variable that overrides it:"

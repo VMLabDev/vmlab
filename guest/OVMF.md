@@ -100,6 +100,14 @@ current adapter rejects an explicit size request with that requirement named.
 The firmware patch and host fields are ready for that coordinated update;
 no hypervisor source is changed here.
 
+## Add trusted lab signers
+
+`enroll-secureboot.py` creates an optional Microsoft-plus-lab VARS template
+from public certificates. It preserves Microsoft's trust and never overwrites
+an existing output. Select the new template with `secure_boot_vars`; existing
+VM stores remain untouched. See `SECUREBOOT.md` for the command, invariants
+and option-ROM policy. No production vmlab signing identity is bundled.
+
 ## Replace the logo
 
 The source and rendering command are documented in `logo/README.md`. Rebuild the
