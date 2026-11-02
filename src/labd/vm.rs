@@ -849,6 +849,10 @@ impl VmInstance {
             floppy: self.floppy.clone(),
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
+            firmware_boot_hints: firmware
+                .map(|fw| fw.features().map(|features| features.boot_hints))
+                .transpose()?
+                .unwrap_or(false),
             ovmf_vars: firmware.map(|_| self.dirs.ovmf_vars()),
             bootsplash: if self.hypervisor == HypervisorKind::Qemu
                 && qemu::qemu_arch(&t.resolved.arch) == "x86_64"

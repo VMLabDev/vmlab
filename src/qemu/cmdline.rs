@@ -54,6 +54,8 @@ pub struct VmPaths {
     /// lab daemon does it once when it assembles these paths — this builder
     /// stays a pure function of what it is handed (ADR-0008).
     pub firmware_code: Option<PathBuf>,
+    /// The selected firmware accepts connection hints without rewriting BootOrder.
+    pub firmware_boot_hints: bool,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
     /// the template in `firmware::UefiFirmware::vars_template`).
     pub ovmf_vars: Option<PathBuf>,
@@ -648,12 +650,13 @@ pub fn build_args(
 
     // Primary + extra disks: explicit blockdev node names (disk0, disk1, …)
     // so QMP snapshot commands can address them (§7.3).
-    // SeaBIOS honours an explicit boot order; OVMF/UEFI boots removable media
-    // on its own. Without it, SeaBIOS tries the (blank) disk and any floppy
-    // before the install CD and stalls. So under SeaBIOS we give CD-ROMs the
-    // lowest bootindex (install media boots first), disks the next, and leave
-    // the answer-file floppy unindexed (never a boot candidate).
-    let seabios = vm.firmware != Some(FirmwareKind::Ovmf);
+    // x86 OVMF uses these paths to connect attached boot devices selectively.
+    // Its bundled build preserves the guest's persistent boot order. SeaBIOS
+    // boots install media before disks; the answer-file floppy stays unindexed.
+    let uefi_hints = vm.firmware == Some(FirmwareKind::Ovmf)
+        && qemu_arch(&vm.arch) == "x86_64"
+        && paths.firmware_boot_hints;
+    let indexed_boot = vm.firmware != Some(FirmwareKind::Ovmf) || uefi_hints;
     let machine_kind = if vm.machine.starts_with("virt") {
         MachineKind::Virt
     } else if vm.machine.starts_with("q35") {
@@ -670,7 +673,7 @@ pub fn build_args(
             path.display()
         ));
         a.push("-device".into());
-        let boot = if seabios {
+        let boot = if indexed_boot {
             format!(",bootindex={}", 50 + disk_index)
         } else {
             String::new()
@@ -716,7 +719,7 @@ pub fn build_args(
             iso.display()
         ));
         a.push("-device".into());
-        let boot = if seabios {
+        let boot = if indexed_boot {
             format!(",bootindex={i}")
         } else {
             String::new()
@@ -769,10 +772,18 @@ pub fn build_args(
             .filter(|m| *m != 1500 && vm.nic_model.starts_with("virtio-net"))
             .map(|m| format!(",host_mtu={m}"))
             .unwrap_or_default();
+        let boot = if uefi_hints {
+            format!(",bootindex={}", 90 + i)
+        } else {
+            String::new()
+        };
         arg(
             &mut a,
             "device",
-            format!("{},netdev=net{i},mac={}{host_mtu}", vm.nic_model, nic.mac),
+            format!(
+                "{},netdev=net{i},mac={}{host_mtu}{boot}",
+                vm.nic_model, nic.mac
+            ),
         );
     }
     if paths.nics.is_empty() {
@@ -929,6 +940,18 @@ mod tests {
     // precedence chain rather than against the chain (ADR-0008).
     use super::super::resolve::testing::resolved_gpu_vm as resolved_gpu;
     use super::super::resolve::testing::resolved_vm as resolved;
+
+    #[test]
+    fn selective_uefi_connection_requires_patched_firmware() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(!args.contains("bootindex="), "{args}");
+        p.firmware_boot_hints = true;
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(args.contains("bootindex=50"), "{args}");
+        assert!(args.contains("bootindex=90"), "{args}");
+    }
 
     /// Runtime paths the lab daemon would hand the builder, including the
     /// firmware it discovered on the host. Both firmware paths are always

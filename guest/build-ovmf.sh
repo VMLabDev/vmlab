@@ -59,6 +59,8 @@ main() {
   # The upstream DSC uses CRLF; normalize it before our LF patch.
   sed -i 's/\r$//' "$work/OvmfPkg/Include/Dsc/NetworkComponents.dsc.inc"
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/reproducible-iscsi-pcd.patch"
+  sed -i 's/\r$//' "$work/OvmfPkg/Library/PlatformBootManagerLib/BdsPlatform.c"
+  patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/boot-without-waits.patch"
   cp "$SCRIPT_DIR/logo/Logo.bmp" "$work/MdeModulePkg/Logo/Logo.bmp"
 
   (
@@ -81,6 +83,7 @@ main() {
       -DCC_MEASUREMENT_ENABLE=TRUE -DNETWORK_HTTP_BOOT_ENABLE=TRUE
       -DNETWORK_IP6_ENABLE=TRUE -DNETWORK_TLS_ENABLE -DTPM2_ENABLE=TRUE
       -DFD_SIZE_4MB --pcd PcdUninstallMemAttrProtocol=TRUE
+      --pcd PcdPlatformBootTimeOut=0
       --pcd 'PcdFirmwareVendor=Lvmlab\0'
       --pcd 'PcdFirmwareVersionString=L2026.08+ds-2-vmlab\0'
       --pcd 'PcdFirmwareReleaseDateString=L08/12/2026\0'
@@ -106,6 +109,7 @@ main() {
     done
   )
   install -m 0644 "$work/OVMF_CODE_4M"*.fd "$OUT/"
+  printf '{"boot_hints":true}\n' >"$OUT/features.json"
   {
     printf 'edk2_tag=%s\nedk2_commit=%s\ndebian_source=%s\nsource_date_epoch=%s\n' \
       "$EDK2_TAG" "$EDK2_COMMIT" "$DEBIAN_VERSION" "$SOURCE_DATE_EPOCH"
@@ -118,6 +122,7 @@ main() {
     python3 --version
     sha256sum "$SCRIPT_DIR/build-ovmf.sh" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/reproducible-iscsi-pcd.patch" | sed "s|$SCRIPT_DIR/||"
+    sha256sum "$SCRIPT_DIR/ovmf/boot-without-waits.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/logo/Logo.bmp" | sed "s|$SCRIPT_DIR/||"
     (cd "$OUT" && sha256sum OVMF_CODE_4M*.fd OVMF_VARS_4M*.fd)
   } >"$OUT/BUILDINFO"

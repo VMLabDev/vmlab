@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 /// A resolved UEFI firmware pair: read-only CODE image plus a pristine VARS
 /// template to copy per VM.
@@ -37,6 +37,26 @@ use anyhow::{Result, anyhow};
 pub struct UefiFirmware {
     pub code: PathBuf,
     pub vars_template: PathBuf,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct FirmwareFeatures {
+    #[serde(default)]
+    pub boot_hints: bool,
+}
+
+impl UefiFirmware {
+    pub fn features(&self) -> Result<FirmwareFeatures> {
+        let path = self.code.with_file_name("features.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid firmware features: {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(FirmwareFeatures::default())
+            }
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
 }
 
 /// Which CODE build is paired with which VARS template (§5.2).
@@ -598,6 +618,19 @@ mod tests {
         fn path(&self, rel: &str) -> PathBuf {
             self.dir.path().join(rel)
         }
+    }
+
+    #[test]
+    fn firmware_features_are_explicit_and_validated() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86);
+        let fw = f.sources(false).lookup("x86_64", Pairing::Plain).unwrap();
+        assert!(!fw.features().unwrap().boot_hints);
+        let manifest = fw.code.with_file_name("features.json");
+        std::fs::write(&manifest, br#"{"boot_hints":true}"#).unwrap();
+        assert!(fw.features().unwrap().boot_hints);
+        std::fs::write(&manifest, br#"{"boot_hints":"yes"}"#).unwrap();
+        assert!(fw.features().is_err());
     }
 
     const DEBIAN_X86: &[&str] = &[

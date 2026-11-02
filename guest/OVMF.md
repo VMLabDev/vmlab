@@ -41,6 +41,17 @@ Sources:
 
 ## Variable-store compatibility
 
+The bundled x86 firmware forces the boot-menu timeout to zero, including when
+the host requests a menu. vmlab supplies attached disk, CD and NIC paths as
+connection hints, so OVMF need not connect every possible boot controller.
+The firmware does not copy these hints into the guest's persistent `BootOrder`
+or prune its recovery entries. Missing or invalid hints retain edk2's full
+connection fallback. A selected controller can still probe its own ports.
+
+`features.json` beside CODE advertises `boot_hints: true`. Stock firmware,
+older bundles and overrides without this capability receive no OVMF bootindex
+or bootorder hints, because unpatched edk2 can rewrite persistent boot entries.
+
 Each CODE image is 3,653,632 bytes. The VARS region is 540,672 bytes, making
 4,194,304 bytes together. The flash starts at `0xffc00000`; CODE starts at
 `0xffc84000`. No flash-layout PCD is changed. The build compares its generated

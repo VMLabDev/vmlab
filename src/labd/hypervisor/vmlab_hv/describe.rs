@@ -451,16 +451,17 @@ pub(crate) fn vm(
     if paths.floppy.is_some() {
         bail!("vm \"{name}\": vmlab-hv has no floppy drive until phase 4 (PRD §22)");
     }
-    // SeaBIOS tries them in `bootindex` order: install media, then disks.
-    boot.sort_by_key(|(index, _)| *index);
-
     let mut nics = Vec::new();
-    for nic in &paths.nics {
+    for (index, nic) in paths.nics.iter().enumerate() {
         let NicBackend::Stream { sock } = &nic.backend else {
             bail!(
                 "vm \"{name}\": vmlab-hv attaches NICs by stream socket only, not a tap descriptor"
             );
         };
+        let pci = slots.next();
+        if ovmf && paths.firmware_boot_hints {
+            boot.push((90 + index, format!("/pci@i0cf8/ethernet@{:x}", pci.device)));
+        }
         nics.push(Nic {
             model: Default::default(),
             rom: if ovmf {
@@ -468,7 +469,7 @@ pub(crate) fn vm(
             } else {
                 roms.ipxe_virtio.clone()
             },
-            pci: Some(slots.next()),
+            pci: Some(pci),
             mac: nic.mac.to_string(),
             mtu: nic.mtu.filter(|m| *m != 1500),
             attachment: NicAttachment::Stream {
@@ -476,6 +477,7 @@ pub(crate) fn vm(
             },
         });
     }
+    boot.sort_by_key(|(index, _)| *index);
 
     // The passed-through GPU, then the VM's own display device, as the
     // argv orders `vfio-pci` and the `display` device. vmlab-hv takes only
@@ -573,12 +575,12 @@ pub(crate) fn vm(
             code: firmware.1,
             vars: firmware.2,
             secure_boot: ovmf && resolved.secure_boot,
-            // QEMU sets `bootindex` under SeaBIOS only; OVMF keeps its own
-            // boot order in the VM's VARS.
-            bootorder: if ovmf {
-                Vec::new()
-            } else {
+            // OVMF uses host paths for selective connection. Its bundled
+            // build retains the guest's persistent BootOrder.
+            bootorder: if !ovmf || paths.firmware_boot_hints {
                 boot.into_iter().map(|(_, at)| at).collect()
+            } else {
+                Vec::new()
             },
         },
         disks,
@@ -1102,6 +1104,21 @@ mod tests {
             (at(1), at(2), at(3), at(5))
         );
         assert_eq!(d.display.unwrap().pci, at(4).unwrap());
+    }
+
+    #[test]
+    fn patched_ovmf_receives_connection_hints() {
+        let r = declared(r#"profile = "windows-11""#, None);
+        let mut p = ovmf_paths(true);
+        p.firmware_boot_hints = true;
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        let Boot::Firmware { bootorder, .. } = d.boot else {
+            panic!()
+        };
+        assert_eq!(
+            bootorder,
+            ["/pci@i0cf8/scsi@2/disk@0,0", "/pci@i0cf8/ethernet@3"]
+        );
     }
 
     /// The APICv/AVIC host adds `avic`, as QEMU's `-cpu` gains `hv-avic`.

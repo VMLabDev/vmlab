@@ -1,0 +1,26 @@
+Subject: Use host boot paths as connection hints without changing guest order
+
+Keep the platform timeout at zero even when a host enables a boot menu.
+The host's bootorder narrows device connection, but must not replace or prune
+the guest's persistent BootOrder and recovery entries.
+
+--- a/OvmfPkg/Library/PlatformBootManagerLib/BdsPlatform.c
++++ b/OvmfPkg/Library/PlatformBootManagerLib/BdsPlatform.c
+@@ -297,7 +297,7 @@
+     XenDetected () ? gXenPlatformConsole : gPlatformConsole
+     );
+ 
+-  FrontPageTimeout = GetFrontPageTimeoutFromQemu ();
++  FrontPageTimeout = 0;
+   PcdStatus        = PcdSet16S (PcdPlatformBootTimeOut, FrontPageTimeout);
+   ASSERT_RETURN_ERROR (PcdStatus);
+   //
+@@ -1707,7 +1707,7 @@
+   );
+ 
+   RemoveStaleFvFileOptions ();
+-  SetBootOrderFromQemu ();
++  // The host bootorder is a connection hint; retain the guest's boot order.
+ 
+   PlatformBmPrintScRegisterHandler ();
+ }
