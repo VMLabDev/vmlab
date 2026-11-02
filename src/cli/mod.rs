@@ -5,6 +5,7 @@ pub mod app;
 mod broken_pipe;
 pub mod console;
 pub mod daemon;
+pub mod debug;
 pub mod dev;
 pub mod lab;
 mod lab_move;
@@ -76,6 +77,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Whole-VM debugger for x86 KVM machines on vmlab-hv.
+    Debug(debug::DebugArgs),
     /// Create/start the lab (or a subset of VMs), run provision scripts
     Up {
         /// VMs to bring up (default: all)
@@ -797,6 +800,7 @@ pub fn run() -> ExitCode {
                 json,
             } => machine::cmd_clipboard_set(&machine, text, json),
         },
+        Command::Debug(args) => debug::run(args),
         Command::Usb { cmd } => usb::cmd_usb(cmd),
         Command::Record { cmd } => record::cmd_record(cmd),
         Command::Dns { json } => lab::cmd_dns(json),

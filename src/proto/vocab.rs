@@ -544,6 +544,12 @@ vocabulary! {
         MachineCapabilities = "machine.capabilities" {
             #[serde(alias = "vm", alias = "container")] machine: String,
         },
+        /// Whole-machine debugger operation on a backend advertising the capability.
+        #[one_way("cli", "The native debugger is driven by the CLI or its GDB bridge; daemon-to-daemon orchestration does not debug guests.")]
+        MachineDebug = "machine.debug" {
+            machine: String,
+            request: vmlab_hv_proto::debug::DebugRequest,
+        },
         /// The machine's guest IP, optionally for one NIC index.
         #[one_way(
             "cli",

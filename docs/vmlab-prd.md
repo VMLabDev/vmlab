@@ -949,6 +949,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
 | `vmlab dev sync status / flush / diff / resolve` | Workspace syncer state and conflict resolution (§19.6) |
 | `vmlab machine capabilities / stats` | Per-machine probed capabilities, including agent features (§19.4); stats: the guest's own metrics from the agent, plus the emulator process's host CPU use |
+| `vmlab debug <machine> <operation>` | Whole-VM debugging on x86 KVM vmlab-hv machines: memory, registers, hardware breakpoints, stepping, search, dumps, and GDB or LLDB attachment (§22) |
 | `vmlab machine repair-agent <machine>` | Push the shipped agent into a running machine, to iterate on the agent without rebuilding a template, and mark it diverged; `up` runs the same push on a stale agent by default (§19.4) |
 | `vmlab template build / status / list / rm / export / import` | Template store; `status` lists running builds and pushes with the build VM's machine reference (§6.1) |
 | `vmlab template push / pull / login` | OCI registry distribution (§6.4) |
@@ -2577,6 +2578,16 @@ never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
 `vmlab status -v` shows `hypervisor=` on every machine.
+
+**Debug feature.** A running x86 KVM machine whose hypervisor advertises `debug`
+supports whole-VM memory reads and writes, hardware watchpoints and execution
+breakpoints, register inspection and editing, single-step, memory search, and
+dumps. `vmlab debug <machine>` exposes the operations and a loopback-only GDB
+Remote Serial Protocol listener for GDB or LLDB. `machine.capabilities` reports
+availability. QEMU and emulated architectures do not provide this capability.
+The debugger stops all vCPUs for memory and register access. Process selection
+by PID is outside its scope. `docs/debug-feature.md` records syntax, limits,
+detach behavior, and the distinction between physical and virtual addresses.
 
 **Phases.** vmlab-hv takes machines over a phase at a time, and the host
 default for a phase's machines flips only once that phase has passed its gate:

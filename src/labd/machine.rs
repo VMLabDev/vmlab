@@ -71,6 +71,8 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// becoming an empty answer there (ADR-0004's lesson).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
+    #[serde(default)]
+    pub debug: bool,
     pub kind: MachineKind,
     /// A framebuffer: screenshots, key/pointer input, OCR, image matching.
     pub display: bool,
@@ -184,6 +186,19 @@ pub trait LabServices: Send + Sync + 'static {
 /// [`super::lab::LabRuntime::machine`].
 #[async_trait::async_trait]
 pub trait Machine: Send + Sync + 'static {
+    async fn debug_available(&self) -> bool {
+        false
+    }
+
+    async fn debug(
+        &self,
+        _request: vmlab_hv_proto::debug::DebugRequest,
+    ) -> Result<vmlab_hv_proto::debug::DebugResponse> {
+        Err(crate::proto::CommandError::unsupported(
+            "this machine does not provide the debug feature",
+        )
+        .into())
+    }
     // ---- identity ---------------------------------------------------------
 
     fn name(&self) -> &str;
@@ -731,6 +746,7 @@ impl dyn Machine {
     /// not yet answering reports an empty list rather than a guess.
     pub async fn capabilities(self: &Arc<Self>) -> Capabilities {
         Capabilities {
+            debug: self.debug_available().await,
             kind: self.kind(),
             display: self.clone().display().is_some(),
             console_log: self.console_log(1).is_some(),

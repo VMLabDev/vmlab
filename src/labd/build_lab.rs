@@ -61,6 +61,7 @@ pub fn serves(req: &LabRequest) -> bool {
         | LabRequest::MachineStop { .. }
         | LabRequest::MachineRestart { .. }
         | LabRequest::MachineDestroy { .. }
+        | LabRequest::MachineDebug { .. }
         | LabRequest::Shutdown {}
         // State the sealed image would carry, or a build would roll back.
         | LabRequest::SnapshotTake { .. }

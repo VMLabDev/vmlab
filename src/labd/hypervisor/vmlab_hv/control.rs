@@ -26,7 +26,7 @@ use vmlab_hv_proto::control::{
     Capability, Command, ErrorCode, Event, Outcome, RunState, ShutdownReason,
 };
 
-use super::super::{Control, Frames, Hotplug, Input, Process, Snapshots};
+use super::super::{Control, Debugger, Frames, Hotplug, Input, Process, Snapshots};
 use super::display::HvDisplay;
 
 /// One running `vmlab-hv`, through its control socket.
@@ -165,7 +165,9 @@ fn observe(
         Event::Suspend => "SUSPEND",
         Event::Wakeup => "WAKEUP",
         Event::DeviceDeleted { .. } => "DEVICE_DELETED",
-        Event::Exiting { .. } | Event::DiagnosticsDumped { .. } => return,
+        Event::Exiting { .. } | Event::DiagnosticsDumped { .. } | Event::DebugStopped { .. } => {
+            return;
+        }
         Event::Unknown { name } => {
             tracing::debug!(event = name, "ignoring unknown vmlab-hv event");
             return;
@@ -201,6 +203,7 @@ async fn call(client: &Arc<Mutex<Client>>, command: Command) -> Result<Option<Ru
 /// An outcome as a result, a refusal naming the command and its code.
 fn refused(what: &str, outcome: Outcome) -> Result<Option<RunState>> {
     match outcome {
+        Outcome::Debug { .. } => Err(anyhow!("unexpected debugger reply to `{what}`")),
         Outcome::Ok { status } => Ok(status),
         Outcome::Error { code, message } => Err(anyhow!(
             "vmlab-hv refused `{what}`: {message} ({})",
@@ -222,6 +225,11 @@ fn command_name(command: &Command) -> String {
 
 #[async_trait::async_trait]
 impl Control for HvControl {
+    fn debugger(&self) -> Option<Arc<dyn Debugger>> {
+        self.capabilities
+            .contains(&Capability::Debug)
+            .then(|| Arc::new(HvDebugger(self.commands.clone())) as Arc<dyn Debugger>)
+    }
     async fn resume(&self) -> Result<()> {
         self.call(Command::Resume).await.map(drop)
     }
@@ -307,6 +315,30 @@ impl Control for HvControl {
     }
 
     // Media: no phase delivered yet has it, so the trait's `None` stands.
+}
+
+struct HvDebugger(Arc<Mutex<Client>>);
+
+#[async_trait::async_trait]
+impl Debugger for HvDebugger {
+    async fn request(
+        &self,
+        request: vmlab_hv_proto::debug::DebugRequest,
+    ) -> Result<vmlab_hv_proto::debug::DebugResponse> {
+        match send(&self.0, Command::Debug { request }).await? {
+            Outcome::Debug { response } => Ok(response),
+            Outcome::Error { code, message } => {
+                let code = match code {
+                    ErrorCode::InvalidArgument => crate::proto::ErrorCode::InvalidArgument,
+                    ErrorCode::InvalidState => crate::proto::ErrorCode::Conflict,
+                    ErrorCode::Unsupported => crate::proto::ErrorCode::Unsupported,
+                    _ => crate::proto::ErrorCode::Failed,
+                };
+                Err(crate::proto::CommandError::new(code, message).into())
+            }
+            _ => Err(anyhow!("unexpected debugger response")),
+        }
+    }
 }
 
 /// The **hot-plug** capability as `device_add` and `device_del`, the
@@ -480,6 +512,46 @@ mod tests {
 
     fn ok(_: &Command) -> Outcome {
         Outcome::Ok { status: None }
+    }
+
+    #[tokio::test]
+    async fn debug_feature_is_optional_and_preserves_typed_errors() {
+        use vmlab_hv_proto::debug::{DebugRequest, DebugResponse};
+        let unavailable = fake_hv(vec![], ok);
+        let control = HvControl::connect(&unavailable.socket).await.unwrap();
+        assert!(control.debugger().is_none());
+        let available = fake_hv(vec![Capability::Debug], |command| match command {
+            Command::Debug {
+                request: DebugRequest::Pause,
+            } => Outcome::Debug {
+                response: DebugResponse::Done,
+            },
+            _ => Outcome::Error {
+                code: ErrorCode::InvalidArgument,
+                message: "invalid debugger argument".into(),
+            },
+        });
+        let control = HvControl::connect(&available.socket).await.unwrap();
+        let debugger = control.debugger().unwrap();
+        assert_eq!(
+            debugger.request(DebugRequest::Pause).await.unwrap(),
+            DebugResponse::Done
+        );
+        let error = debugger
+            .request(DebugRequest::ReadRegisters { vcpu: 255 })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::proto::CommandError>()
+                .unwrap()
+                .code,
+            crate::proto::ErrorCode::InvalidArgument
+        );
+        assert!(matches!(
+            available.seen.try_iter().collect::<Vec<_>>().as_slice(),
+            [Command::Debug { .. }, Command::Debug { .. }]
+        ));
     }
 
     #[tokio::test]

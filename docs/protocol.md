@@ -78,6 +78,7 @@ the code is the contract.
 | `machine.restart` | `machine: String`, `force: bool`, `record: Vec<RecordRequest>` | `cli` | Stop one machine, wait for it to settle, and boot it again. |
 | `machine.destroy` | `machine: String` | `cli` | Stop one machine and delete everything it materialised. |
 | `machine.capabilities` | `machine: String` | `cli` | What this machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, and whichever features its agent negotiated. |
+| `machine.debug` | `machine: String`, `request: vmlab_hv_proto::debug::DebugRequest` | `cli` | Whole-machine debugger operation on a backend advertising the capability. |
 | `machine.ip` | `machine: String`, `nic: Option<usize>` | `cli` | The machine's guest IP, optionally for one NIC index. |
 | `machine.screenshot` | `machine: String`, `path: String` | `cli` | Write a PNG of the machine's framebuffer to a host path. |
 | `machine.sendkeys` | `machine: String`, `keys: String` | `cli` | Send a key chord to the machine's display. |
@@ -142,6 +143,7 @@ Deliberate, with the reason recorded beside the declaration:
 - `version` — The build check is the CLI's: it is the one process that can be a different build from the daemon it connects to, and a script runs inside the daemon that would answer.
 - `lab.reload` — A boot verb asks for a reload when it finds the daemon running an edited-away file it cannot replace; a script runs inside the daemon whose file it would be reloading.
 - `run` — A scratch script is a shell verb: it comes from a file the caller already has and streams its output back to the terminal that ran it. What the console runs is declared playbooks.
+- `machine.debug` — The native debugger is driven by the CLI or its GDB bridge; daemon-to-daemon orchestration does not debug guests.
 - `machine.ip` — A scripting shortcut over data the console already holds: the lab status projection carries every machine's address, so the console reads it there rather than asking a second time.
 - `machine.mouse_move` — The console drives a machine through a live VNC canvas, where a human moves the pointer themselves. Scripted pointer input is for callers that have no canvas.
 - `machine.mouse_click` — Scripted input, for the same reason as `machine.mouse_move`: a console user clicks the VNC canvas directly.
