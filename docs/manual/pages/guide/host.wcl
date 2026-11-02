@@ -260,10 +260,10 @@ For a firmware hang, set `firmware_debug = true` on that VM and read
 `vmlab logs <lab>/<vm>`. The DEBUG variant logs through port 0x402 into the
 machine's serial log on either hypervisor. It remains opt-in and keeps the
 same secure-boot and network settings. Firmware logs can expose guest boot paths.
-For a QEMU VM, `firmware_width = 1024` and `firmware_height = 768` request a
+For either hypervisor, `firmware_width = 1024` and `firmware_height = 768` request a
 supported GOP mode at boot without changing its saved firmware preference.
-Supply both fields. This does not resize a running guest. vmlab-hv needs the
-fw_cfg protocol extension before it can accept those fields.
+Supply both fields. This does not resize a running guest. vmlab-hv needs a
+binary built from revision 450de8c or later, matching the pinned protocol.
 DOC
 
   p <<'DOC'
@@ -273,8 +273,9 @@ Bundled SeaBIOS paints a 640 by 480 pixel splash during POST without adding a
 boot-menu delay. q35 uses a build without floppy or IDE probing; i440fx keeps
 the legacy drivers in a separate image. A fast boot may make the splash brief.
 Host SeaBIOS fallback retains the one-second splash setting.
-SeaBIOS on vmlab-hv has no splash because its machine protocol cannot pass
-extra fw_cfg files yet.
+vmlab-hv receives the same splash and delay through read-only fw_cfg files.
+Bundled SeaBIOS keeps its boot menu disabled; stock SeaBIOS fallback enables
+the menu for the one-second splash delay.
 
 In a source checkout, `guest/logo/wordmark.svg` is the editable logo.
 `guest/logo/render.sh` generates the 193 by 58 pixel, 24-bit `Logo.bmp`

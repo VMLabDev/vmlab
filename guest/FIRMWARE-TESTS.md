@@ -117,7 +117,7 @@ focused checks pass 9 firmware-named Rust tests and 167 QEMU tests; CLI
 validation passes all five cases. Shell syntax, isolated ShellCheck, schema
 validation and HTML manual rendering also pass.
 
-The pinned vmlab-hv protocol at 41e53e474b537e6d6de48a34ad55c317d8d95ab7
+At the FW5 checkpoint, the pinned vmlab-hv protocol at 41e53e474b537e6d6de48a34ad55c317d8d95ab7
 has only firmware kind, CODE, VARS, secure_boot and bootorder in Boot::Firmware.
 It needs a default-empty named-byte-file collection, passed by its q35 builder
 to FwCfg::add_file before fw_cfg realization. FW5 needs `opt/vmlab/gop-width`
@@ -125,8 +125,8 @@ and `opt/vmlab/gop-height` containing decimal ASCII, without a required NUL.
 SeaBIOS branding needs `bootsplash.jpg` with JPEG bytes and
 `etc/boot-menu-wait` with a little-endian u16 zero. The protocol should reject
 duplicate/reserved names and oversized data and test firmware consumption.
-After that upstream change, vmlab must update its protocol pin, fill the files
-in describe.rs and remove the FW5 refusal. No hypervisor files are changed here.
+That dependency is now resolved by the 450de8c integration recorded below.
+No hypervisor files are changed in this repository.
 
 ## FW6: optional Microsoft-plus-lab trust
 
@@ -199,3 +199,46 @@ dbx revocations, plus the existing FW6 cases. Shell syntax, ShellCheck, Python
 lint/format and manual validation/rendering pass. No authenticated key update
 to an existing VM was attempted: that needs the appropriate PK/KEK-signed
 payload and guest servicing policy, not offline replacement of VARS.
+
+## vmlab-hv fw_cfg integration
+
+Both vmlab-hv dependencies now pin
+450de8c37bfc1235f9404308de1429e9bb037f5c. The launch description sends GOP
+dimensions as inline decimal bytes, SeaBIOS branding as a host-file JPEG, and
+its delay as a little-endian u16. Bundled SeaBIOS uses delay zero and no boot
+menu; stock fallback uses 1000 ms and enables Boot::Firmware.boot_menu. The
+FW5 validation refusal is removed. The binary must match the new protocol;
+older strict launch parsers cannot accept the fw_cfg field.
+
+The new pin also adds debugger wire variants. The adapter ignores debugger
+stop events for lifecycle purposes, refuses a debugger outcome as a lifecycle
+acknowledgement, and the lifecycle fake returns unsupported for debugger
+commands. No debugger feature is added. An initial focused compile caught the
+three exhaustive-match changes; the corrected run passes 43 adapter tests,
+12 hypervisor-configuration tests and 167 QEMU tests, plus the CLI build.
+
+Actual vmlab CLI boots use a copied binary from the clean upstream 450de8c
+checkout, SHA256 dfa48b9c3593d40876632be3580bca8020ba92f242a44a597a57c0c9576e8b92.
+No installed binary or firmware is replaced. With a saved 800x600 preference,
+firmware frames are 1024x768 before bootloader handoff; a following capture
+shows the vmlab wordmark at that size. The saved PlatformConfig remains
+800x600. The Ubuntu guest reaches agent-ready (`fwcfg-hv-gop`).
+
+SeaBIOS shows the vmlab wordmark during POST and boots the prepared Ubuntu
+BIOS fixture to agent-ready (`fwcfg-hv-bios`). Its captured machine.json has
+bootsplash.jpg, delay bytes [0,0], and boot_menu false. GOP CODE and settings
+also match their captured machine.json. The capture-heavy single runs take
+10.218 s and 10.074 s to agent-ready respectively; these are functional checks,
+not performance comparisons. The source backing disks and VARS remain
+unchanged, and no test VM remains running.
+
+Screenshots:
+
+- `.scratch/firmware-followups/fwcfg-hv-gop/boot-frames/0003.png`, 1024x768 logo.
+- `.scratch/firmware-followups/fwcfg-hv-bios/boot-frames/0002.png`, zero-wait POST splash.
+
+The same directories retain launch descriptions, timestamped captures, guest
+proofs and results. The 1000 ms stock-fallback branch is covered by adapter
+tests; it is not separately booted in this integration check. Snapshot restore
+with changed fw_cfg bytes is not tested here; upstream defines those bytes as
+read-only snapshot inputs and covers their matching in its S1 tests.

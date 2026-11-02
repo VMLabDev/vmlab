@@ -881,8 +881,7 @@ impl VmInstance {
             ),
             firmware_boot_hints: firmware_features.boot_hints,
             ovmf_vars: firmware.map(|_| self.dirs.ovmf_vars()),
-            bootsplash: if self.hypervisor == HypervisorKind::Qemu
-                && qemu::qemu_arch(&t.resolved.arch) == "x86_64"
+            bootsplash: if qemu::qemu_arch(&t.resolved.arch) == "x86_64"
                 && t.resolved.firmware != Some(crate::profiles::FirmwareKind::Ovmf)
             {
                 Some(qemu::bootsplash::install(&self.dirs.local)?)

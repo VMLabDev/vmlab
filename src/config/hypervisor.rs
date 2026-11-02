@@ -117,9 +117,6 @@ pub fn vmlab_refusals(
 fn vm_refusals(vm: &Vm, host: &HostFacts, hardware: Option<&ResolvedVm>) -> Vec<String> {
     let name = &vm.name;
     let mut why = Vec::new();
-    if vm.firmware_width.is_some() || vm.firmware_height.is_some() {
-        why.push(format!("vm \"{name}\": firmware resolution needs a vmlab-hv fw_cfg protocol extension; use hypervisor = \"qemu\" until it is available"));
-    }
     if !vm.qemu_args.is_empty() {
         why.push(qemu_args_refusal("vm", name));
     }
@@ -421,12 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn firmware_resolution_names_the_missing_fw_cfg_extension() {
+    fn firmware_resolution_is_supported_by_fw_cfg() {
         let why = refused(
             r#"template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 10GiB firmware_width = 1024 firmware_height = 768"#,
         );
-        assert_eq!(why.len(), 1, "{why:?}");
-        assert!(why[0].contains("fw_cfg protocol extension"), "{why:?}");
+        assert!(why.is_empty(), "{why:?}");
     }
 
     /// Everything else names the phase that brings it.

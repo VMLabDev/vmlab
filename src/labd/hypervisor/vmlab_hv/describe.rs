@@ -17,8 +17,8 @@ use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
     Accel, Arch, Audio, AudioDevice, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
-    DisplayDevice, FirmwareKind, FsShare, GpuMode, HyperV, Machine, Nic, NicAttachment, PciAddress,
-    SerialPort, Tpm, VfioDevice,
+    DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV, Machine, Nic,
+    NicAttachment, PciAddress, SerialPort, Tpm, VfioDevice,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -331,7 +331,7 @@ pub(crate) fn vm(
         };
         (FirmwareKind::Ovmf, code.clone(), Some(vars.clone()))
     } else {
-        let Some(seabios) = &roms.seabios else {
+        let Some(seabios) = paths.seabios_code.as_ref().or(roms.seabios.as_ref()) else {
             bail!(
                 "vm \"{name}\": vmlab-hv boots it on SeaBIOS, and this host has no bios-256k.bin — \
                  install SeaBIOS (the `seabios` package), or put it under the host config's \
@@ -343,6 +343,41 @@ pub(crate) fn vm(
     let Some(serial_log) = &paths.serial_log else {
         bail!("vm \"{name}\": vmlab-hv needs a serial log path");
     };
+
+    let mut fw_cfg = Vec::new();
+    if ovmf {
+        if let Some((width, height)) = paths.firmware_resolution {
+            for (name, dimension) in [
+                ("opt/vmlab/gop-width", width),
+                ("opt/vmlab/gop-height", height),
+            ] {
+                fw_cfg.push(FwCfgFile {
+                    name: name.into(),
+                    source: FwCfgSource::Inline {
+                        bytes: dimension.to_string().into_bytes(),
+                    },
+                });
+            }
+        }
+    } else if let Some(splash) = &paths.bootsplash {
+        fw_cfg.push(FwCfgFile {
+            name: "bootsplash.jpg".into(),
+            source: FwCfgSource::File {
+                path: splash.clone(),
+            },
+        });
+        let delay: u16 = if paths.seabios_code.is_some() {
+            0
+        } else {
+            1000
+        };
+        fw_cfg.push(FwCfgFile {
+            name: "etc/boot-menu-wait".into(),
+            source: FwCfgSource::Inline {
+                bytes: delay.to_le_bytes().to_vec(),
+            },
+        });
+    }
 
     // `virgl` and `vulkan` are the one display adapter, a virtio-vga
     // accelerated on the host render node the lab daemon resolved, as
@@ -527,7 +562,7 @@ pub(crate) fn vm(
     }
 
     Ok(MachineDescription {
-        fw_cfg: Vec::new(),
+        fw_cfg,
         // A guest reset happens in place, as under QEMU: the process, its
         // sockets and every connection to them stay (PRD §22).
         exit_on_reset: false,
@@ -570,7 +605,7 @@ pub(crate) fn vm(
         vcpus: resolved.cpus,
         memory_mib: resolved.memory >> 20,
         boot: Boot::Firmware {
-            boot_menu: false,
+            boot_menu: !ovmf && paths.bootsplash.is_some() && paths.seabios_code.is_none(),
             firmware: firmware.0,
             code: firmware.1,
             vars: firmware.2,
@@ -708,6 +743,13 @@ mod tests {
         );
         let d = container("l", &r, &paths()).unwrap();
         let json = serde_json::to_string(&d).unwrap();
+        assert!(d.fw_cfg.is_empty());
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json)
+                .unwrap()
+                .get("fw_cfg")
+                .is_none()
+        );
         let back: MachineDescription = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
     }
@@ -1119,6 +1161,91 @@ mod tests {
             bootorder,
             ["/pci@i0cf8/scsi@2/disk@0,0", "/pci@i0cf8/ethernet@3"]
         );
+    }
+
+    #[test]
+    fn ovmf_resolution_is_decimal_inline_fw_cfg_without_a_boot_menu() {
+        let r = declared(r#"profile = "windows-11""#, None);
+        let mut p = ovmf_paths(true);
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        assert!(d.fw_cfg.is_empty());
+        p.firmware_resolution = Some((1024, 768));
+        p.bootsplash = Some("/lab/splash.jpg".into());
+        let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(
+            d.fw_cfg,
+            vec![
+                FwCfgFile {
+                    name: "opt/vmlab/gop-width".into(),
+                    source: FwCfgSource::Inline {
+                        bytes: b"1024".to_vec()
+                    }
+                },
+                FwCfgFile {
+                    name: "opt/vmlab/gop-height".into(),
+                    source: FwCfgSource::Inline {
+                        bytes: b"768".to_vec()
+                    }
+                },
+            ]
+        );
+        assert!(matches!(
+            d.boot,
+            Boot::Firmware {
+                boot_menu: false,
+                ..
+            }
+        ));
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MachineDescription>(&json).unwrap(),
+            d
+        );
+    }
+
+    #[test]
+    fn seabios_splash_matches_qemu_post_and_stock_delay_settings() {
+        let r = declared(r#"profile = "linux-modern" firmware = "seabios""#, None);
+        for bundled in [true, false] {
+            let mut p = vm_paths();
+            p.bootsplash = Some("/lab/with,comma/splash.jpg".into());
+            p.seabios_code = bundled.then(|| "/fw/bios-vmlab-q35.bin".into());
+            p.firmware_resolution = Some((1024, 768));
+            let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
+            let delay: u16 = if bundled { 0 } else { 1000 };
+            assert_eq!(
+                d.fw_cfg,
+                vec![
+                    FwCfgFile {
+                        name: "bootsplash.jpg".into(),
+                        source: FwCfgSource::File {
+                            path: p.bootsplash.unwrap()
+                        }
+                    },
+                    FwCfgFile {
+                        name: "etc/boot-menu-wait".into(),
+                        source: FwCfgSource::Inline {
+                            bytes: delay.to_le_bytes().to_vec()
+                        }
+                    },
+                ]
+            );
+            let Boot::Firmware {
+                boot_menu, code, ..
+            } = d.boot
+            else {
+                panic!()
+            };
+            assert_eq!(boot_menu, !bundled);
+            assert_eq!(
+                code,
+                if bundled {
+                    PathBuf::from("/fw/bios-vmlab-q35.bin")
+                } else {
+                    roms().seabios.unwrap()
+                }
+            );
+        }
     }
 
     /// The APICv/AVIC host adds `avic`, as QEMU's `-cpu` gains `hv-avic`.

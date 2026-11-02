@@ -87,7 +87,7 @@ RELEASE/DEBUG, plain/secure and iPXE/native networking use the same flash layout
 
 ## Set the boot display size
 
-On a QEMU x86_64 OVMF VM, set both `firmware_width` and `firmware_height` to
+On a QEMU or vmlab-hv x86_64 OVMF VM, set both `firmware_width` and `firmware_height` to
 request a GOP mode at boot. Width is 320..8192 and height is 200..8192. The host
 passes decimal ASCII in fw_cfg files `opt/vmlab/gop-width` and
 `opt/vmlab/gop-height`. The bundled firmware applies a valid pair ahead of the
@@ -100,10 +100,9 @@ resolution, and do not implement live viewer resizing. Overrides must advertise
 `gop_resolution: true` in `features.json`; unsupported firmware is reported
 rather than silently ignoring an explicit size request.
 
-vmlab-hv needs a protocol/builder extension to supply these fw_cfg files. Its
-current adapter rejects an explicit size request with that requirement named.
-The firmware patch and host fields are ready for that coordinated update;
-no hypervisor source is changed here.
+vmlab-hv receives the same decimal bytes through MachineDescription.fw_cfg.
+Its binary must include revision 450de8c, matching the pinned protocol; older
+binaries reject these launch fields. No hypervisor source is changed here.
 
 ## Add trusted lab signers
 
@@ -118,15 +117,17 @@ and option-ROM policy. No production vmlab signing identity is bundled.
 The source and rendering command are documented in `logo/README.md`. Rebuild the
 guest assets after changing the rendered BMP. No firmware lookup names change.
 
-## Required vmlab-hv follow-up
+## vmlab-hv firmware inputs
 
-The pinned protocol `41e53e474b537e6d6de48a34ad55c317d8d95ab7` has no
-arbitrary fw_cfg file field in `MachineDescription` or `Boot::Firmware`.
-The hypervisor needs a typed splash path and delay, or extra fw_cfg files, passed
-through its VMM builder to `FwCfg::add_file`. SeaBIOS needs `bootsplash.jpg` and
-the little-endian 16-bit `etc/boot-menu-wait` delay. No hypervisor source is changed
-here. OVMF branding needs no such extension; FW5 resolution hints need the
-same extra-file mechanism with the two names documented above.
+Both vmlab-hv crates are pinned to
+`450de8c37bfc1235f9404308de1429e9bb037f5c`. MachineDescription.fw_cfg carries
+inline decimal resolution bytes and a host-file source for bootsplash.jpg.
+SeaBIOS also receives etc/boot-menu-wait as a little-endian u16: zero for
+bundled POST branding, 1000 ms for stock fallback. Boot::Firmware.boot_menu is
+false for OVMF and bundled SeaBIOS, true only for stock splash fallback.
+The hypervisor captures the read-only inputs at launch. A changed firmware
+input can invalidate a saved snapshot, so preserve the original splash and
+resolution when restoring one. See the upstream docs/control-protocol.md.
 
 ## Logo PR baseline outputs
 
