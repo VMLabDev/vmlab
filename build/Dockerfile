@@ -35,7 +35,7 @@ RUN apt-get update -q \
       ovmf seabios swtpm \
       qemu-efi-aarch64 qemu-efi-riscv64 \
       tesseract-ocr passt \
-      xorriso mtools dosfstools samba \
+      xorriso mtools dosfstools samba liblzma-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/vmlab-build

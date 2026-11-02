@@ -88,24 +88,33 @@ main() {
       --pcd 'PcdFirmwareVersionString=L2026.08+ds-2-vmlab\0'
       --pcd 'PcdFirmwareReleaseDateString=L08/12/2026\0'
     )
+    local network
+    for network in ipxe native; do
     for mode in plain secboot; do
       local -a extra=()
       [[ "$mode" == plain ]] || extra=(-DBUILD_SHELL=FALSE -DSECURE_BOOT_ENABLE=TRUE -DSMM_REQUIRE=TRUE)
-      log "building $mode from $EDK2_TAG ($EDK2_COMMIT)"
+      if [[ "$network" == ipxe ]]; then
+        extra+=(-DNETWORK_ENABLE=FALSE)
+      else
+        extra+=(-DNETWORK_ALLOW_HTTP_CONNECTIONS=TRUE)
+      fi
+      log "building $mode/$network from $EDK2_TAG ($EDK2_COMMIT)"
       {
-        printf '%s:' "$mode"
+        printf '%s/%s:' "$mode" "$network"
         printf ' %q' "${flags[@]}" "${extra[@]}"
         printf '\n'
       } >>"$work/flags.txt"
       build "${flags[@]}" "${extra[@]}"
       local fv=Build/OvmfX64/RELEASE_GCC/FV dest=OVMF_CODE_4M.fd
       [[ "$mode" == plain ]] || dest=OVMF_CODE_4M.secboot.fd
+      [[ "$network" == ipxe ]] || dest="${dest%.fd}.network.fd"
       [[ "$(stat -c %s "$fv/OVMF_CODE.fd")" == 3653632 ]] || die "unexpected CODE flash size"
       [[ "$(stat -c %s "$fv/OVMF_VARS.fd")" == 540672 ]] || die "unexpected VARS flash size"
       cmp "$fv/OVMF_VARS.fd" "$OUT/OVMF_VARS_4M.fd" || die "VARS layout/content differs from Debian"
       install -m 0644 "$fv/OVMF_CODE.fd" "$work/$dest"
       # Defines change between modes; never reuse modules from the other build.
       rm -rf Build
+    done
     done
   )
   install -m 0644 "$work/OVMF_CODE_4M"*.fd "$OUT/"

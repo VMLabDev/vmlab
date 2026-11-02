@@ -74,6 +74,11 @@ impl VmlabHv {
 fn rom_dirs(firmware_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = firmware_dir.map(|d| d.join("x86_64")).into_iter().collect();
     dirs.extend(
+        crate::guest_asset::candidate_dirs()
+            .into_iter()
+            .map(|dir| dir.join("firmware/x86_64")),
+    );
+    dirs.extend(
         [
             "/usr/share/qemu",
             "/usr/share/seabios",

@@ -59,6 +59,12 @@ EXPECTED=(
   firmware/x86_64/VERSION
   firmware/x86_64/BUILDINFO
   firmware/x86_64/features.json
+  firmware/x86_64/OVMF_CODE_4M.network.fd
+  firmware/x86_64/OVMF_CODE_4M.secboot.network.fd
+  firmware/x86_64/virtio-net.rom firmware/x86_64/e1000.rom
+  firmware/x86_64/rtl8139.rom firmware/x86_64/pcnet.rom
+  firmware/x86_64/1af41000.rom firmware/x86_64/1af41000.efirom
+  firmware/x86_64/IPXE-SHA256SUMS firmware/x86_64/ipxe-source.tar
   firmware/x86_64/COPYRIGHT
   firmware/aarch64/AAVMF_CODE.fd firmware/aarch64/AAVMF_VARS.fd
   firmware/aarch64/AAVMF_CODE.secboot.fd firmware/aarch64/AAVMF_VARS.ms.fd

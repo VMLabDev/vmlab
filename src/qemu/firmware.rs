@@ -46,6 +46,26 @@ pub struct FirmwareFeatures {
 }
 
 impl UefiFirmware {
+    pub fn with_network_stack(mut self, enabled: bool) -> Result<Self> {
+        if enabled {
+            let name = self
+                .code
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".fd"))
+                .ok_or_else(|| anyhow!("invalid OVMF CODE filename"))?;
+            let candidate = self.code.with_file_name(format!("{name}.network.fd"));
+            if !candidate.is_file() {
+                return Err(anyhow!(
+                    "native OVMF network stack requested but {} is missing",
+                    candidate.display()
+                ));
+            }
+            self.code = candidate;
+        }
+        Ok(self)
+    }
+
     pub fn features(&self) -> Result<FirmwareFeatures> {
         let path = self.code.with_file_name("features.json");
         match std::fs::read(&path) {
@@ -57,6 +77,27 @@ impl UefiFirmware {
             Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
         }
     }
+}
+
+/// Option ROMs follow the firmware override and guest asset lookup order.
+pub fn option_rom(firmware_dir: Option<&Path>, model: &str) -> Option<PathBuf> {
+    let name = match model {
+        "virtio-net-pci" | "virtio-net" => "virtio-net.rom",
+        "e1000" => "e1000.rom",
+        "rtl8139" => "rtl8139.rom",
+        "pcnet" => "pcnet.rom",
+        _ => return None,
+    };
+    firmware_dir
+        .into_iter()
+        .map(|dir| dir.join("x86_64"))
+        .chain(
+            crate::guest_asset::candidate_dirs()
+                .into_iter()
+                .map(|dir| dir.join("firmware/x86_64")),
+        )
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 /// Which CODE build is paired with which VARS template (§5.2).
@@ -631,6 +672,22 @@ mod tests {
         assert!(fw.features().unwrap().boot_hints);
         std::fs::write(&manifest, br#"{"boot_hints":"yes"}"#).unwrap();
         assert!(fw.features().is_err());
+    }
+
+    #[test]
+    fn native_network_stack_is_an_explicit_code_variant() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86);
+        let fw = f
+            .sources(false)
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap();
+        assert_eq!(fw.clone().with_network_stack(false).unwrap(), fw);
+        assert!(fw.clone().with_network_stack(true).is_err());
+        f.put("guest/firmware/x86_64/OVMF_CODE_4M.secboot.network.fd", 0);
+        let selected = fw.clone().with_network_stack(true).unwrap();
+        assert_eq!(selected.vars_template, fw.vars_template);
+        assert!(selected.code.ends_with("OVMF_CODE_4M.secboot.network.fd"));
     }
 
     const DEBIAN_X86: &[&str] = &[

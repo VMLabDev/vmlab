@@ -504,6 +504,8 @@ pub struct Vm {
     /// layer naming one KVM is used when usable, TCG otherwise.
     pub accel: Option<AccelMode>,
     pub firmware: Option<Firmware>,
+    /// Use edk2's native HTTP/PXE stack instead of the default external iPXE ROM.
+    pub firmware_network_stack: bool,
     pub tpm: Option<bool>,
     /// A hot-plug xHCI controller for host USB passthrough (§5.2.1); None =
     /// inherit the profile's, and with neither saying, off.

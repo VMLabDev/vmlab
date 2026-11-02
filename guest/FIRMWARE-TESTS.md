@@ -36,3 +36,22 @@ runs required explicit cleanup after force-stop; that harness defect was fixed
 before the candidate runs. Source disk modification time and VARS hash remained
 unchanged. Test VMs were limited to six host-wide and scoped to 24 GiB with
 swap disabled.
+
+## FW2: network-free OVMF and iPXE
+
+All four RELEASE CODE variants build with unchanged flash sizes and a generated
+blank VARS identical to Debian's. A clean iPXE rebuild produces identical hashes
+for all four combined ROMs, both individual virtio ROMs and the corresponding
+source archive. The build uses GCC 13.3.0 and binutils 2.42 in the build container.
+
+QEMU boots both SeaBIOS and network-free OVMF through the built virtio iPXE ROM,
+obtains a DHCP boot URL, fetches an HTTP script and executes its unique success
+marker. Runs: `ipxe-bios-2` and `ipxe-uefi-minimal2`. EFI console and iPXE serial
+output duplicate characters on COM1; the assertion recognizes that actual output.
+The first UEFI assertion timed out despite the HTTP fetch and marker; it is not
+counted as a passing test.
+
+Ubuntu reaches agent-ready using network-free CODE on QEMU and vmlab-hv, and
+using the native-network variant selected through `firmware_network_stack` on
+QEMU (`fw2-qemu`, `fw2-hv`, `fw2-native`). QEMU and configuration focused tests
+pass. `wcl check src/config/schema.wcl` and `wcl check docs/manual/main.wcl` pass.

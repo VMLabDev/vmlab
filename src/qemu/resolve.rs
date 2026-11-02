@@ -534,6 +534,14 @@ pub fn resolve_vm(
     };
 
     let firmware_choice = resolve_firmware(lab_vm, template, profile, &arch);
+    if lab_vm.firmware_network_stack
+        && (qemu_arch(&arch) != "x86_64" || firmware_choice.firmware != Some(FirmwareKind::Ovmf))
+    {
+        anyhow::bail!(
+            "vm \"{}\": firmware_network_stack needs x86_64 OVMF",
+            lab_vm.name
+        );
+    }
     // Validation rejects this combination against the source span, but it
     // cannot always see the template layer — a registry template is not
     // pulled at validate time. By the time a machine resolves, every layer

@@ -56,6 +56,8 @@ pub struct VmPaths {
     pub firmware_code: Option<PathBuf>,
     /// The selected firmware accepts connection hints without rewriting BootOrder.
     pub firmware_boot_hints: bool,
+    /// The reproducible PCI ROM for the resolved NIC model.
+    pub nic_rom: Option<PathBuf>,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
     /// the template in `firmware::UefiFirmware::vars_template`).
     pub ovmf_vars: Option<PathBuf>,
@@ -777,11 +779,16 @@ pub fn build_args(
         } else {
             String::new()
         };
+        let rom = paths
+            .nic_rom
+            .as_ref()
+            .map(|path| format!(",romfile={}", path.display().to_string().replace(',', ",,")))
+            .unwrap_or_default();
         arg(
             &mut a,
             "device",
             format!(
-                "{},netdev=net{i},mac={}{host_mtu}{boot}",
+                "{},netdev=net{i},mac={}{host_mtu}{boot}{rom}",
                 vm.nic_model, nic.mac
             ),
         );
@@ -951,6 +958,15 @@ mod tests {
         let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
         assert!(args.contains("bootindex=50"), "{args}");
         assert!(args.contains("bootindex=90"), "{args}");
+    }
+
+    #[test]
+    fn an_explicit_nic_rom_is_passed_to_qemu() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.nic_rom = Some("/fw/virtio-net.rom".into());
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(args.contains("romfile=/fw/virtio-net.rom"), "{args}");
     }
 
     /// Runtime paths the lab daemon would hand the builder, including the

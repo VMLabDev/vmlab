@@ -28,7 +28,10 @@ remains `"no"`. The Python hash seed is fixed. Downloads are cached under
 
 The build follows Debian's `debian/rules` for `OvmfPkg/OvmfPkgX64.dsc`,
 X64, GCC, RELEASE, and 4 MiB flash. Both images enable CC measurement,
-HTTP boot, IPv6, TLS, TPM2, and Debian's `UninstallMemAttrProtocol` shim workaround.
+TPM2 and Debian's `UninstallMemAttrProtocol` shim workaround. The default CODE
+disables edk2 networking and uses the reproducible iPXE option ROM. The
+`.network.fd` variants retain HTTP boot, IPv6 and TLS and allow plain HTTP;
+`firmware_network_stack = true` selects them per VM. See `ipxe/README.md`.
 The secure-boot image additionally enables secure boot, requires SMM, and excludes
 the UEFI shell. Firmware vendor and version identify vmlab. The build replaces
 the logo asset and those identification strings relative to this configuration.

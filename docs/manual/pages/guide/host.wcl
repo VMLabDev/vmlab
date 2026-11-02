@@ -246,6 +246,16 @@ DOC
   h3 "Boot logo"
 
   p <<'DOC'
+The bundled x86_64 OVMF has a zero boot-menu timeout. It uses host device paths
+to limit boot-controller connection while retaining the guest's persistent
+boot order. Stock firmware without the bundled capability manifest receives
+no such hints. The default CODE excludes edk2 networking; attached NICs use
+vmlab's reproducible iPXE option ROM for BIOS and UEFI network boot. Set
+`firmware_network_stack = true` on an x86_64 OVMF VM to use the bundled native
+UEFI HTTP/PXE variant instead. Its VARS layout and enrolled keys are unchanged.
+DOC
+
+  p <<'DOC'
 Both hypervisors display the vmlab wordmark when using the bundled x86_64
 OVMF CODE. Windows can reuse the firmware's BGRT logo during its boot animation.
 QEMU SeaBIOS guests receive a 640 by 480 pixel splash with a one-second delay.

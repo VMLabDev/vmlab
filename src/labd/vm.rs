@@ -786,10 +786,14 @@ impl VmInstance {
             return Ok(Some(
                 sources
                     .lookup_for_vars(arch, pairing, m.len())
-                    .with_context(context)?,
+                    .with_context(context)?
+                    .with_network_stack(self.cfg.firmware_network_stack)?,
             ));
         }
-        let fw = sources.lookup(arch, pairing).with_context(context)?;
+        let fw = sources
+            .lookup(arch, pairing)
+            .with_context(context)?
+            .with_network_stack(self.cfg.firmware_network_stack)?;
         // A pre-enrolled store replaces the VARS template at the first start.
         let vars_file = match (&t.resolved.key_store, t.resolved.secure_boot) {
             (_, false) => None,
@@ -849,6 +853,10 @@ impl VmInstance {
             floppy: self.floppy.clone(),
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
+            nic_rom: qemu::firmware::option_rom(
+                (self.host_config)()?.firmware_dir.as_deref(),
+                &t.resolved.nic_model,
+            ),
             firmware_boot_hints: firmware
                 .map(|fw| fw.features().map(|features| features.boot_hints))
                 .transpose()?

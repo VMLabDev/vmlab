@@ -345,6 +345,7 @@ main() {
   for arch in "${arches[@]}"; do
     if [[ "$arch" == x86_64 ]]; then
       "$SCRIPT_DIR/build-ovmf.sh"
+      python3 "$SCRIPT_DIR/ipxe/build.py"
     fi
   done
   log "done"
