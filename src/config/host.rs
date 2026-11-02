@@ -84,6 +84,10 @@ pub struct HostConfig {
     pub firmware_dir: Option<std::path::PathBuf>,
     /// The vmlab-hv binary (PRD §22); `None` = `vmlab-hv` on `PATH`.
     pub vmlab_hv: Option<std::path::PathBuf>,
+    /// Native console viewer (PRD §11); otherwise beside `vmlab_hv`, then PATH.
+    pub vmlab_hv_viewer: Option<std::path::PathBuf>,
+    /// Native viewer grab release chord; `None` keeps the viewer's default.
+    pub viewer_release_chord: Option<String>,
     /// The hypervisor a machine that names none runs on, by kind (PRD §22,
     /// `host { hypervisor { … } }`). QEMU for both until a phase flips it.
     pub hypervisor: crate::config::hypervisor::HypervisorDefaults,
@@ -180,6 +184,8 @@ impl Default for HostConfig {
             workspace_max_file: DEFAULT_WORKSPACE_MAX_FILE,
             firmware_dir: None,
             vmlab_hv: None,
+            vmlab_hv_viewer: None,
+            viewer_release_chord: None,
             hypervisor: Default::default(),
             btrfs_nocow: true,
             gpus: Vec::new(),
@@ -254,6 +260,8 @@ impl HostConfig {
             cfg.config_weave_bin_dir = r.path("config_weave_bin_dir").unspan();
             cfg.firmware_dir = r.path("firmware_dir").unspan();
             cfg.vmlab_hv = r.path("vmlab_hv").unspan();
+            cfg.vmlab_hv_viewer = r.path("vmlab_hv_viewer").unspan();
+            cfg.viewer_release_chord = r.string("viewer_release_chord").unspan();
             if let Some(v) = r.bool("btrfs_nocow").unspan() {
                 cfg.btrfs_nocow = v;
             }
@@ -501,11 +509,15 @@ mod tests {
         assert_eq!(none.hypervisor.container, HypervisorKind::Qemu);
         assert_eq!(none.hypervisor.vm, HypervisorKind::Qemu);
         assert_eq!(none.vmlab_hv, None);
+        assert_eq!(none.vmlab_hv_viewer, None);
+        assert_eq!(none.viewer_release_chord, None);
 
         let cfg = HostConfig::parse(
             r#"import <vmlab-host.wcl>
 host {
   vmlab_hv = "/opt/vmlab-hv/bin/vmlab-hv"
+  vmlab_hv_viewer = "/opt/viewer with spaces/vmlab-hv-viewer"
+  viewer_release_chord = "ctrl_r+alt_r"
   hypervisor { container = "vmlab" }
 }
 "#,
@@ -518,6 +530,11 @@ host {
             cfg.vmlab_hv.as_deref(),
             Some(Path::new("/opt/vmlab-hv/bin/vmlab-hv"))
         );
+        assert_eq!(
+            cfg.vmlab_hv_viewer.as_deref(),
+            Some(Path::new("/opt/viewer with spaces/vmlab-hv-viewer"))
+        );
+        assert_eq!(cfg.viewer_release_chord.as_deref(), Some("ctrl_r+alt_r"));
 
         let err = HostConfig::parse(
             "import <vmlab-host.wcl>\nhost { hypervisor { vm = \"xen\" } }\n",

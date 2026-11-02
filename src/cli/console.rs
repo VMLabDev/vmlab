@@ -1,4 +1,4 @@
-//! `vmlab console` — attach a viewer to a VM's VNC display (PRD §11).
+//! `vmlab console` attaches a native or VNC viewer to a VM (PRD §11).
 //!
 //! Every VM serves VNC on a unix socket. We pick a viewer with
 //! [`crate::viewer::detect`] and launch it: a unix-socket viewer
@@ -11,9 +11,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::lab::{current_lab, split_vm_ref};
+use super::lab::{current_lab, lab_status, split_vm_ref};
 use crate::cli::daemon;
-use crate::viewer::{self, Transport};
+use crate::status::{MachineKind, PowerState};
+use crate::viewer::{self, ConsoleViewer, Transport};
 
 pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -30,17 +31,32 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
             }
         };
         // Ensure the lab daemon is up so the socket exists.
-        let _client = daemon::try_lab_daemon(&lab)
+        let client = daemon::try_lab_daemon(&lab)
             .await?
             .ok_or_else(|| anyhow!("lab \"{lab}\" is not running — `vmlab up` first"))?;
+
+        let status = lab_status(&client).await?;
+        let machine = status
+            .machines
+            .iter()
+            .find(|m| m.name == vm)
+            .ok_or_else(|| anyhow!("machine {lab}/{vm} not found"))?;
+        if machine.kind() != MachineKind::Vm {
+            bail!("machine {lab}/{vm} has no console display");
+        }
+        if machine.state == PowerState::Stopped {
+            bail!("machine {lab}/{vm} is stopped — start it first");
+        }
+        let viewer = match viewer::detect_for(machine.hypervisor, tcp) {
+            ConsoleViewer::Native(viewer) => return viewer.launch(&lab, &vm),
+            ConsoleViewer::Vnc(viewer) => viewer,
+        };
 
         let sock = crate::paths::machine_runtime_dir(&lab, crate::paths::MachineKind::Vm, &vm)
             .join("vnc.sock");
         if !sock.exists() {
             bail!("VNC socket for {lab}/{vm} not found ({})", sock.display());
         }
-
-        let viewer = viewer::detect();
 
         // No viewer (or --tcp forced): bridge and print the address for the
         // user to point any VNC client at (the WSL2 path).

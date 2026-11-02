@@ -320,18 +320,27 @@ pub fn cmd_up(vms: Vec<String>, record: Vec<crate::record::RecordRequest>) -> Re
             println!("{}", line.replace("recorded", "recording"));
         }
 
-        // `gui = true` VMs get a detached VNC viewer opened from this
+        // `gui = true` VMs get a separate viewer opened from this
         // interactive session (the daemon is headless and can't reach the
         // user's display). Closing the viewer only disconnects; the VM
         // keeps running (§11). Done CLI-side so VMs always boot headless.
         let file = load_lab_at(&root)?;
         let lab_gui = file.lab.gui.unwrap_or(false);
-        for vm in &file.lab.vms {
-            if !vm.gui.unwrap_or(lab_gui) {
-                continue;
-            }
-            if vms.is_empty() || vms.iter().any(|v| v == &vm.name) {
-                crate::viewer::open_for(&name, &vm.name)?;
+        let gui_vms: Vec<_> = file
+            .lab
+            .vms
+            .iter()
+            .filter(|vm| vm.gui.unwrap_or(lab_gui) && picked(vm))
+            .collect();
+        if !gui_vms.is_empty() {
+            let status = lab_status(&daemon.client).await?;
+            for vm in gui_vms {
+                let machine = status
+                    .machines
+                    .iter()
+                    .find(|m| m.name == vm.name)
+                    .with_context(|| format!("machine {name}/{} not found in status", vm.name))?;
+                crate::viewer::open_for(&name, &vm.name, machine.hypervisor)?;
             }
         }
         Ok(())

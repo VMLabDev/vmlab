@@ -3,15 +3,15 @@ page cmd_console {
   chapter_header "vmlab console" {
     kicker       = "Commands · reference"
     reading_time = "4 min read"
-    updated      = "2026-10-31"
+    updated      = "2026-11-02"
     version      = "vmlab 0.9"
   }
 
   p <<DOC
-    `vmlab console` attaches a VNC viewer to a VM's display. Every VM serves
-    VNC on a unix socket in the lab's runtime directory, and this command
-    either launches a viewer against that socket or bridges the socket to a
-    localhost TCP port and prints the address. It is the interactive
+    `vmlab console` attaches a viewer to a VM's display. Machines on
+    vmlab-hv use `vmlab-hv-viewer`, which connects to their native display
+    socket. QEMU machines use an external VNC viewer or a localhost TCP
+    bridge. It is the interactive
     counterpart of the screen verbs described in
     [Screens, input and vision](guide_vision).
   DOC
@@ -29,9 +29,9 @@ page cmd_console {
   p <<DOC
     The command requires the lab daemon to be running already and never
     starts one: a stopped lab is refused with `lab \"<name>\" is not running`.
-    It then checks the VM's `vnc.sock` exists and refuses when it does not,
-    which is what a VM that has not been started looks like. Containers have
-    no display, so this verb is for VMs only.
+    Machine status supplies the actual hypervisor, also reported as `qemu`
+    or `vmlab` in `vmlab status --json`. An unknown or stopped machine is
+    refused. Containers have no display, so this verb is for VMs only.
   DOC
 
   p <<DOC
@@ -41,7 +41,25 @@ page cmd_console {
   DOC
 
   p <<DOC
-    The viewer comes from the `viewer` command template in the
+    For vmlab-hv, the command passes `--display <display.sock>`,
+    `--lab-socket <control.sock>`, and `--machine <name>` to the native
+    viewer. The viewer waits for the display socket and reconnects after
+    guest reboots. Closing its window leaves the VM running. `gui = true`
+    opens the same viewer on `vmlab up`.
+  DOC
+
+  p <<DOC
+    The native binary comes from `host.vmlab_hv_viewer` when set. Otherwise
+    vmlab looks for `vmlab-hv-viewer` beside the configured `host.vmlab_hv`,
+    then on `PATH`. A missing native viewer prints a one-line installation
+    notice and falls back to VNC. Install the viewer from
+    `VMLabDev/vmlab-hypervisor`; it is a separate binary. The optional
+    `host.viewer_release_chord` is passed as `--release-chord`, for example
+    `ctrl_r+alt_r`. Without it, the viewer uses left Ctrl+Alt.
+  DOC
+
+  p <<DOC
+    For QEMU and the VNC fallback, the viewer comes from the `viewer` command template in the
     [host configuration](guide_host) when one is set. Otherwise the command
     looks on `PATH` for `remote-viewer`, then `gvncviewer`, then `vncviewer`.
     A configured viewer is handed the socket path directly. A detected
@@ -49,15 +67,17 @@ page cmd_console {
     unix-to-TCP bridge open, launches the viewer against it, and prints
     `opened <lab>/<vm> in a viewer (closes with the window)`. The terminal is
     free straight away, and the bridge ends when the viewer window closes.
+    This path requires the VM's `vnc.sock` to exist.
   DOC
 
   p <<DOC
-    With `--tcp`, or when no viewer is found, the command binds a localhost
+    With `--tcp` on either hypervisor, or when no viewer is found, the command binds a localhost
     port itself, preferring a VNC display port from 5900 upward so a client
     that takes `host:display` works, and prints
     `VNC for <lab>/<vm> on 127.0.0.1:<port>`. It then holds the bridge until
-    Ctrl-C. This is the path to use under WSL 2, where the viewer lives on
-    the Windows side and connects to the forwarded port.
+    Ctrl-C. This supports a Windows-side VNC viewer under WSL 2.
+    The native viewer runs under WSLg and selects its shared-memory mode
+    itself, without a TCP bridge or a `--shm` argument from vmlab.
   DOC
 
   p <<DOC
@@ -73,8 +93,9 @@ SRC
   }
 
   p <<DOC
-    Exit status is 0 on success. The command sends no request that can fail
-    after the liveness check, so every failure, including a lab that is not
-    running or a missing socket, exits 1.
+    Exit status is 0 after launching the viewer or ending the foreground
+    bridge. Daemon, status, socket, and viewer-launch errors produce a
+    nonzero exit status and a diagnostic on stderr. A detached viewer's
+    later failure does not change the CLI's exit status.
   DOC
 }
