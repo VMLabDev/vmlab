@@ -1,6 +1,7 @@
 //! QEMU integration: hardware resolution, command-line construction,
 //! firmware lookup, process management (PRD §3, §5.2).
 
+pub mod bootsplash;
 pub mod cmdline;
 pub mod container;
 pub mod firmware;

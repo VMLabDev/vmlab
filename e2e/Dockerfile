@@ -8,6 +8,7 @@
 FROM rust:1-trixie AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cpio curl git xz-utils \
+      nasm acpica-tools uuid-dev python3 patch \
  && rm -rf /var/lib/apt/lists/*
 RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /src

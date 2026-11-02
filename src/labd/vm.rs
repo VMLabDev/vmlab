@@ -850,6 +850,14 @@ impl VmInstance {
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
             ovmf_vars: firmware.map(|_| self.dirs.ovmf_vars()),
+            bootsplash: if self.hypervisor == HypervisorKind::Qemu
+                && qemu::qemu_arch(&t.resolved.arch) == "x86_64"
+                && t.resolved.firmware != Some(crate::profiles::FirmwareKind::Ovmf)
+            {
+                Some(qemu::bootsplash::install(&self.dirs.local)?)
+            } else {
+                None
+            },
             tpm_sock: t.resolved.tpm.then(|| self.dirs.tpm_sock()),
             serial_log: Some(self.dirs.logs.join("serial.log")),
             virtiofs_shares,

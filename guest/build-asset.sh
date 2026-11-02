@@ -18,10 +18,9 @@
 # v3.22 main/community repos. apk files are plain tar.gz — unpacked without
 # root; the cpio owner flag maps everything to root:root.
 #
-# The same run fetches the UEFI firmware vmlab ships for each arch into
-# guest/dist/firmware/<arch>/ (guest/fetch-firmware.sh — Debian's edk2
-# builds, pinned the same way), so everything that installs the guest asset
-# installs the firmware with it.
+# The same run fetches Debian's VARS and AAVMF and builds branded x86_64
+# OVMF CODE into guest/dist/firmware/<arch>/, so everything that installs
+# the guest asset installs the firmware with it.
 #
 # Usage: guest/build-asset.sh [arch...]      (default: x86_64 aarch64)
 
@@ -343,6 +342,11 @@ main() {
     build_arch "$arch"
   done
   "$SCRIPT_DIR/fetch-firmware.sh" "${arches[@]}"
+  for arch in "${arches[@]}"; do
+    if [[ "$arch" == x86_64 ]]; then
+      "$SCRIPT_DIR/build-ovmf.sh"
+    fi
+  done
   log "done"
 }
 

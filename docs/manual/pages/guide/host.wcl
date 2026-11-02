@@ -200,8 +200,10 @@ DOC
   h2 "UEFI firmware"
 
   p <<'DOC'
-vmlab ships its own UEFI firmware. The guest assets carry Debian's edk2
-builds, pinned by version and sha256, under `firmware/<arch>/`:
+vmlab ships its own UEFI firmware under `firmware/<arch>/`. On x86_64,
+the CODE images are built from pinned edk2 sources with the vmlab wordmark.
+The VARS templates remain Debian's, including its Microsoft-enrolled store.
+AArch64 uses Debian's pinned AAVMF builds without logo changes:
 DOC
 
   table {
@@ -215,7 +217,10 @@ DOC
 So a host needs no `ovmf` or `qemu-efi-aarch64` package, and every host boots
 the same firmware, which is what lets a Windows 11 template built on one host
 boot under secure boot on another. `firmware/VERSION` names the Debian
-packages the set came from. For each UEFI VM, vmlab looks in three places, in
+packages. `firmware/x86_64/BUILDINFO` records the edk2 commit, source and
+logo digests, tool versions, and output hashes. The 4 MiB flash layout is
+unchanged, so existing per-VM variable stores keep their keys and boot entries.
+For each UEFI VM, vmlab looks in three places, in
 order, for plain UEFI and secure boot alike:
 DOC
 
@@ -236,6 +241,23 @@ included. A VM created under a firmware of a different flash layout, such as a
 host's old 2 MiB OVMF, keeps booting a build of that layout. Templates record
 `firmware`, `secure_boot` and `secure_boot_keys`, never a firmware path, so
 nothing about the building host travels with them.
+DOC
+
+  h3 "Boot logo"
+
+  p <<'DOC'
+Both hypervisors display the vmlab wordmark when using the bundled x86_64
+OVMF CODE. Windows can reuse the firmware's BGRT logo during its boot animation.
+QEMU SeaBIOS guests receive a 640 by 480 pixel splash with a one-second delay.
+SeaBIOS on vmlab-hv has no splash because its machine protocol cannot pass
+extra fw_cfg files yet.
+
+In a source checkout, `guest/logo/wordmark.svg` is the editable logo.
+`guest/logo/render.sh` generates the 193 by 58 pixel, 24-bit `Logo.bmp`
+and `bootsplash.jpg`. `guest/build-ovmf.sh` builds the branded CODE during the
+guest build. `guest/OVMF.md` documents the pins, build command, and compatibility
+checks. AArch64 retains Debian's logo pending its cross toolchain and guest
+compatibility test.
 DOC
 
   h3 "Your own secure-boot keys"

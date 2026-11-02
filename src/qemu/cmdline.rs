@@ -57,6 +57,8 @@ pub struct VmPaths {
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
     /// the template in `firmware::UefiFirmware::vars_template`).
     pub ovmf_vars: Option<PathBuf>,
+    /// SeaBIOS JPEG splash, staged by the daemon for x86 QEMU guests only.
+    pub bootsplash: Option<PathBuf>,
     /// swtpm control socket (when tpm enabled).
     pub tpm_sock: Option<PathBuf>,
     /// Serial console log file.
@@ -595,7 +597,19 @@ pub fn build_args(
             a.push("driver=cfi.pflash01,property=secure,value=on".into());
         }
     }
-    // SeaBIOS is the QEMU default on x86 — nothing to add.
+    if vm.firmware != Some(FirmwareKind::Ovmf)
+        && qemu_arch(&vm.arch) == "x86_64"
+        && let Some(splash) = &paths.bootsplash
+    {
+        arg(
+            &mut a,
+            "boot",
+            format!(
+                "menu=on,splash={},splash-time=1000",
+                splash.display().to_string().replace(',', ",,")
+            ),
+        );
+    }
 
     // Guest agent channel (§7.4): the vmlab-agent port (interactive
     // terminals / exec / files / net-info / shutdown — guest/agent-proto).
@@ -945,6 +959,23 @@ mod tests {
 
     fn joined(args: &[String]) -> String {
         args.join(" ")
+    }
+
+    #[test]
+    fn splash_is_only_passed_to_x86_seabios() {
+        let mut vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.bootsplash = Some("/lab/with,comma/bootsplash.jpg".into());
+        assert!(!joined(&build_args("lab", &vm, &p, Accel::Kvm).unwrap()).contains("splash="));
+        vm.firmware = Some(FirmwareKind::Seabios);
+        let args = build_args("lab", &vm, &p, Accel::Kvm).unwrap();
+        assert!(args.windows(2).any(|a| a[0] == "-boot"
+            && a[1] == "menu=on,splash=/lab/with,,comma/bootsplash.jpg,splash-time=1000"));
+        p.bootsplash = None;
+        assert!(!joined(&build_args("lab", &vm, &p, Accel::Kvm).unwrap()).contains("splash="));
+        p.bootsplash = Some("/lab/bootsplash.jpg".into());
+        vm.arch = "aarch64".into();
+        assert!(!joined(&build_args("lab", &vm, &p, Accel::Tcg).unwrap()).contains("splash="));
     }
 
     /// virtiofs shares attach as vhost-user-fs devices and flip the RAM to

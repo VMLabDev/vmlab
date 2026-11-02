@@ -57,9 +57,12 @@ EXPECTED=(
   firmware/x86_64/OVMF_CODE_4M.fd firmware/x86_64/OVMF_VARS_4M.fd
   firmware/x86_64/OVMF_CODE_4M.secboot.fd firmware/x86_64/OVMF_VARS_4M.ms.fd
   firmware/x86_64/VERSION
+  firmware/x86_64/BUILDINFO
+  firmware/x86_64/COPYRIGHT
   firmware/aarch64/AAVMF_CODE.fd firmware/aarch64/AAVMF_VARS.fd
   firmware/aarch64/AAVMF_CODE.secboot.fd firmware/aarch64/AAVMF_VARS.ms.fd
   firmware/aarch64/VERSION
+  firmware/aarch64/COPYRIGHT
 )
 
 main() {

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Fetch the UEFI firmware vmlab ships (PRD §5.2) into
+# Fetch Debian's UEFI variable stores and AAVMF (PRD §5.2) into
 # guest/dist/firmware/<arch>/, beside the micro-VM asset, so a host needs no
 # OVMF package and every host boots the same bytes. src/qemu/firmware.rs looks
 # it up under <guest asset dir>/firmware/<arch>/ before the host's own.
 #
-#   x86_64   Debian `ovmf-generic`:
-#              OVMF_CODE_4M.fd          + OVMF_VARS_4M.fd      plain UEFI
-#              OVMF_CODE_4M.secboot.fd  + OVMF_VARS_4M.ms.fd   secure boot,
-#                                         Microsoft + distro keys enrolled
+#   x86_64   Debian `ovmf-generic` VARS only:
+#              OVMF_VARS_4M.fd         plain UEFI / setup mode
+#              OVMF_VARS_4M.ms.fd      Microsoft + distro keys enrolled
+#            build-ovmf.sh supplies the two branded CODE images.
 #   aarch64  Debian `qemu-efi-aarch64`:
 #              AAVMF_CODE.fd            + AAVMF_VARS.fd        plain UEFI
 #              AAVMF_CODE.secboot.fd    + AAVMF_VARS.ms.fd     secure boot
@@ -46,16 +46,16 @@ PACKAGES=(
 files_for() {
   case "$1" in
     x86_64)
-      echo "OVMF_CODE_4M.fd|usr/share/OVMF/OVMF_CODE_4M.fd"
       echo "OVMF_VARS_4M.fd|usr/share/OVMF/OVMF_VARS_4M.fd"
-      echo "OVMF_CODE_4M.secboot.fd|usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
       echo "OVMF_VARS_4M.ms.fd|usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+      echo "COPYRIGHT|usr/share/doc/ovmf-generic/copyright"
       ;;
     aarch64)
       echo "AAVMF_CODE.fd|usr/share/AAVMF/AAVMF_CODE.no-secboot.fd"
       echo "AAVMF_VARS.fd|usr/share/AAVMF/AAVMF_VARS.fd"
       echo "AAVMF_CODE.secboot.fd|usr/share/AAVMF/AAVMF_CODE.secboot.fd"
       echo "AAVMF_VARS.ms.fd|usr/share/AAVMF/AAVMF_VARS.ms.fd"
+      echo "COPYRIGHT|usr/share/doc/qemu-efi-aarch64/copyright"
       ;;
     *) die "no bundled firmware for arch '$1' (supported: x86_64 aarch64)" ;;
   esac
@@ -122,7 +122,6 @@ fetch_arch() {
     tar -xJf "$work/data.tar.xz" -C "$work" || die "unpack failed: $deb"
 
     local out="$OUT_DIR/$arch" line dest src
-    rm -rf "$out"
     mkdir -p "$out"
     while IFS= read -r line; do
       dest="${line%%|*}"

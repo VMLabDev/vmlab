@@ -1,8 +1,8 @@
 //! Locate UEFI firmware (OVMF/AAVMF/RiscVVirt) for a VM.
 //!
-//! vmlab ships its own: the guest asset set carries Debian's edk2 builds
-//! under `firmware/<arch>/` (`guest/build-asset.sh` fetches them pinned by
-//! sha256), so a host needs no OVMF package and every host boots the same
+//! vmlab ships branded x86_64 OVMF CODE with Debian's VARS, and Debian's
+//! AAVMF under `firmware/<arch>/` (`guest/build-asset.sh` builds or fetches
+//! them from pinned sources), so a host needs no OVMF package and every host boots the same
 //! bytes. The search, highest priority first (PRD §5.2):
 //!
 //!  1. the host config's `firmware_dir` — `<firmware_dir>/<arch>/`, laid out

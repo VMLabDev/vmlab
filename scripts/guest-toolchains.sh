@@ -73,6 +73,7 @@ stage_apt() {
   as_root env DEBIAN_FRONTEND=noninteractive apt-get update -q
   as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
     ca-certificates curl git xz-utils bzip2 cpio gzip make file \
+    nasm acpica-tools uuid-dev python3 patch \
     build-essential gcc-multilib \
     gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 binutils-mingw-w64 mingw-w64-common
 }

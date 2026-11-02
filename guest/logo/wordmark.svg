@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="193" height="58" viewBox="0 0 193 58">
+  <title>vmlab</title>
+  <g fill="#f5f5f5">
+    <path d="M3 18h10l7 23 7-23h10L25 51H15z"/>
+    <path d="M42 18h9v4c3-4 10-7 16 0 7-7 20-7 20 8v21h-9V32c0-8-9-8-9 0v19h-9V32c0-8-9-8-9 0v19h-9z"/>
+    <path d="M94 7h9v44h-9z"/>
+    <path fill-rule="evenodd" d="M127 17c-10 0-15 5-15 11h9c0-5 12-5 12 1v1h-8c-20 0-18 22-4 22 5 0 9-2 12-5v4h9V30c0-9-6-13-15-13zm6 19h-7c-9 0-9 9-2 9 5 0 9-4 9-9z"/>
+    <path fill-rule="evenodd" d="M150 7h9v15c4-6 10-6 13-5 20 3 20 33 0 35-5 0-10-1-13-5v4h-9zm9 28c0 14 19 14 19 0s-19-14-19 0z"/>
+  </g>
+</svg>
