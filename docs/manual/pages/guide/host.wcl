@@ -383,8 +383,9 @@ machine and floppies, `accel = "tcg"`, a pinned `tsc`, `input = "usb"`, and
 A `virgl` or `vulkan` GPU renders on the render node of the host GPU your host
 config picks, exactly as under QEMU, with the same Vulkan filter and
 keep-awake; with no declared GPU it renders on the host's first render node,
-and `up` says which. A host GPU's `qemu_binary` and `qemu_env` are QEMU's, so
-on vmlab-hv each one set is a warning and is ignored. `passthrough` needs the
+and `up` says which. A host GPU's `qemu_env` also applies to vmlab-hv,
+including `RENDER_SERVER_EXEC_PATH` for the Venus render server.
+`qemu_binary` is ignored with a warning. `passthrough` needs the
 GPU already bound to `vfio-pci`, which you do yourself; vmlab-hv refuses one
 that is not, and neither it nor vmlab ever rebinds a device. Shares are
 served by vmlab-hv itself from the host directory, so no virtiofsd runs for a

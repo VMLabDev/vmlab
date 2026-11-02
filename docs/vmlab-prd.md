@@ -2653,8 +2653,9 @@ description names; vmlab-hv never chooses one, so a paravirtual GPU no declared
 host GPU resolves for renders on the host's first render node and the start
 says so. The Vulkan environment, the PCI filter layer and keep-awake are the
 ones vmlab computes for QEMU, in vmlab-hv's own environment. A host GPU's
-`qemu_binary` and `qemu_env` are QEMU's: on vmlab-hv each set one is a warning
-and is ignored. Scanouts reach the native frame protocol as dma-bufs, so
+`qemu_env` also applies to vmlab-hv, including `RENDER_SERVER_EXEC_PATH` for
+virglrenderer's Venus render server. `qemu_binary` is ignored with a warning.
+Scanouts reach the native frame protocol as dma-bufs, so
 screenshots, vision and the recorder see the GL desktop. `passthrough` hands
 the declared host GPU to the guest as a vfio device ahead of the VM's own
 display, at the address QEMU's `vfio-pci` takes. vmlab-hv takes only a function

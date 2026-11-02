@@ -508,8 +508,8 @@ pub fn emulator(qemu_binary: Option<&Path>, arch: &str) -> String {
 ///
 /// On vmlab-hv (`hypervisor`, PRD §22, HV phase-2 D10) the render node, the
 /// Vulkan environment, the filter layer and keep-awake are planned the same
-/// way, but `qemu_binary` and `qemu_env` belong to QEMU: they are neither
-/// checked nor applied, and each set one is a warning. vmlab-hv renders on a
+/// way. `qemu_env` also applies to its shared virglrenderer runtime, while
+/// `qemu_binary` is ignored with a warning. vmlab-hv renders on a
 /// node it is named, never one it finds, so a paravirtual GPU no declared
 /// GPU resolves for renders on this host's first render node, and says so.
 pub fn render_plan(
@@ -584,7 +584,7 @@ pub fn render_plan(
     if let Some(decl) = decl
         && vmlab
     {
-        // HV phase-2 D10: QEMU's keys mean nothing to vmlab-hv.
+        // The executable override is specific to QEMU.
         if let Some(binary) = &decl.qemu_binary {
             plan.warnings.push(format!(
                 "host GPU `{}`: qemu_binary {} is QEMU's and does not apply on vmlab-hv; \
@@ -593,19 +593,13 @@ pub fn render_plan(
                 binary.display()
             ));
         }
-        if !decl.qemu_env.is_empty() {
-            let keys: Vec<&str> = decl.qemu_env.iter().map(|(k, _)| k.as_str()).collect();
-            plan.warnings.push(format!(
-                "host GPU `{}`: qemu_env ({}) is QEMU's and does not apply on vmlab-hv; ignored",
-                decl.name,
-                keys.join(", ")
-            ));
-        }
-    } else if let Some(decl) = decl {
-        if let Some(binary) = &decl.qemu_binary {
-            check_qemu_binary(&decl.name, binary, arch)?;
-            plan.qemu_binary = Some(binary.clone());
-        }
+    } else if let Some(decl) = decl
+        && let Some(binary) = &decl.qemu_binary
+    {
+        check_qemu_binary(&decl.name, binary, arch)?;
+        plan.qemu_binary = Some(binary.clone());
+    }
+    if let Some(decl) = decl {
         apply_qemu_env(&decl.name, &mut plan.env, &decl.qemu_env)?;
     }
     Ok(plan)
@@ -1292,13 +1286,10 @@ mod tests {
         );
     }
 
-    /// On vmlab-hv (HV phase-2 D10) a host GPU's `qemu_binary` and
-    /// `qemu_env` are not checked or applied, and each warns; the render
-    /// node, the Vulkan environment and the filter layer are QEMU's plan
-    /// unchanged. With no declared GPU, vmlab-hv is named the host's first
-    /// render node rather than left to find one.
+    /// vmlab-hv shares virglrenderer with QEMU, including its render-server
+    /// environment. The QEMU binary override still does not apply.
     #[test]
-    fn on_vmlab_hv_the_qemu_keys_warn_and_a_render_node_is_always_named() {
+    fn on_vmlab_hv_gpu_environment_is_applied_and_a_render_node_is_always_named() {
         let sys = fake_host();
         let sysfs = Sysfs::new(sys.path());
         let gone = sys.path().join("nope/qemu-system-x86_64");
@@ -1316,15 +1307,31 @@ mod tests {
         let plan = on(&gpu(GpuMode::Vulkan, None), &h).unwrap();
         assert_eq!(plan.qemu_binary, None);
         assert!(
-            !plan
+            plan.env
+                .set
+                .iter()
+                .any(|(k, v)| k == "RENDER_SERVER_EXEC_PATH" && v == "/x")
+        );
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("qemu_binary") && plan.warnings[0].contains("ignored"));
+        let override_env = host_with_qemu(&gone, &[("VK_LOADER_DRIVERS_SELECT", "*custom*")]);
+        let override_plan = on(&gpu(GpuMode::Vulkan, None), &override_env).unwrap();
+        assert_eq!(
+            override_plan
                 .env
                 .set
                 .iter()
-                .any(|(k, _)| k == "RENDER_SERVER_EXEC_PATH")
+                .filter(|(k, _)| k == "VK_LOADER_DRIVERS_SELECT")
+                .collect::<Vec<_>>(),
+            vec![&("VK_LOADER_DRIVERS_SELECT".into(), "*custom*".into())]
         );
-        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
-        assert!(plan.warnings[0].contains("qemu_binary") && plan.warnings[0].contains("ignored"));
-        assert!(plan.warnings[1].contains("qemu_env (RENDER_SERVER_EXEC_PATH)"));
+        let invalid = host_with_qemu(&gone, &[("A=B", "x")]);
+        assert!(
+            on(&gpu(GpuMode::Vulkan, None), &invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("variable name containing `=`")
+        );
         let qemu = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &host(), &sysfs).unwrap();
         let vmlab = on(&gpu(GpuMode::Vulkan, None), &host()).unwrap();
         assert_eq!(

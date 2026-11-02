@@ -223,7 +223,7 @@ SRC
       | "`vulkan_icd`" | "utf8" | "none" | "Path to a Vulkan ICD JSON a `vulkan` guest's renderer loads, set as `VK_DRIVER_FILES`. Overrides the driver picked from the GPU's kernel driver." |
       | "`default`" | "bool" | "`false`" | "The GPU a lab gets when it names none, or names one this host lacks under virgl or vulkan. A lone `gpu` block is the default without it." |
       | "`qemu_binary`" | "utf8" | "none" | "Absolute path to the QEMU every VM on this GPU runs, in every mode including passthrough, instead of `qemu-system-<arch>` from `PATH`. vmlab also passes it `-L <dir>` (see below)." |
-      | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives." |
+      | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU or vmlab-hv process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for the Venus render server." |
       | "`keepawake`" | "utf8" | "`auto`" | "Whether the supervisor holds this GPU out of runtime suspend from the first virgl or vulkan VM started on it until the supervisor stops. `auto`: only an NVIDIA GPU that can runtime-suspend. `on`: always, on any driver with EGL. `off`: never. See below." |
   }
   p "The parser enforces these rules:"

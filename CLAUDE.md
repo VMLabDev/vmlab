@@ -92,7 +92,8 @@ a guest reset happens in place, readiness dropping until the rebooted
 guest's agent answers), its screen, input and recording over vmlab-hv's
 native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
 `vnc.sock` for viewers; a `gpu {}` (virgl and Venus on the render node the
-host GPU pick resolves, a host GPU's `qemu_*` keys warned about and ignored;
+host GPU pick resolves, with the host GPU's `qemu_env` applied and
+`qemu_binary` ignored with a warning;
 passthrough as a vfio device vmlab-hv takes only pre-bound), virtio-fs shares
 it serves in process (no virtiofsd; the share plan asks each machine what
 serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
