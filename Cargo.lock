@@ -2564,7 +2564,7 @@ dependencies = [
 [[package]]
 name = "vmlab-hv-display"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=a8fdf05e2fc743217755c17b6085c11fcca7879b#a8fdf05e2fc743217755c17b6085c11fcca7879b"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=41e53e474b537e6d6de48a34ad55c317d8d95ab7#41e53e474b537e6d6de48a34ad55c317d8d95ab7"
 dependencies = [
  "libc",
 ]
@@ -2572,7 +2572,7 @@ dependencies = [
 [[package]]
 name = "vmlab-hv-proto"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=a8fdf05e2fc743217755c17b6085c11fcca7879b#a8fdf05e2fc743217755c17b6085c11fcca7879b"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=41e53e474b537e6d6de48a34ad55c317d8d95ab7#41e53e474b537e6d6de48a34ad55c317d8d95ab7"
 dependencies = [
  "serde",
  "serde_json",

@@ -799,6 +799,10 @@ fn serve_vmlab_hv(
                 ok
             }
             Command::DeviceAdd { .. } => ok,
+            Command::Unsupported => Outcome::Error {
+                code: ErrorCode::Unsupported,
+                message: "unsupported request".into(),
+            },
             Command::SetLogFilter { .. } | Command::DumpDiagnostics => Outcome::Error {
                 code: ErrorCode::Unsupported,
                 message: "diagnostics are not advertised by this fake".into(),
