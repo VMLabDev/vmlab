@@ -61,6 +61,10 @@ EXPECTED=(
   firmware/x86_64/features.json
   firmware/x86_64/OVMF_CODE_4M.network.fd
   firmware/x86_64/OVMF_CODE_4M.secboot.network.fd
+  firmware/x86_64/OVMF_CODE_4M.debug.fd
+  firmware/x86_64/OVMF_CODE_4M.secboot.debug.fd
+  firmware/x86_64/OVMF_CODE_4M.network.debug.fd
+  firmware/x86_64/OVMF_CODE_4M.secboot.network.debug.fd
   firmware/x86_64/virtio-net.rom firmware/x86_64/e1000.rom
   firmware/x86_64/rtl8139.rom firmware/x86_64/pcnet.rom
   firmware/x86_64/1af41000.rom firmware/x86_64/1af41000.efirom

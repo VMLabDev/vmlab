@@ -58,6 +58,7 @@ pub struct VmPaths {
     pub seabios_code: Option<PathBuf>,
     /// The selected firmware accepts connection hints without rewriting BootOrder.
     pub firmware_boot_hints: bool,
+    pub firmware_debug: bool,
     /// The reproducible PCI ROM for the resolved NIC model.
     pub nic_rom: Option<PathBuf>,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
@@ -561,19 +562,40 @@ pub fn build_args(
     a.push("none".into());
 
     if let Some(log) = &paths.serial_log {
-        match vm.agent_transport {
-            // `-serial` claims ISA index 0 (COM1) before any `-device` is
-            // placed, so where the agent needs COM1 the log is placed
-            // explicitly on COM2 instead.
-            AgentTransport::IsaSerial => {
-                arg(
-                    &mut a,
-                    "chardev",
-                    format!("file,id=serlog,path={}", log.display()),
-                );
-                arg(&mut a, "device", "isa-serial,chardev=serlog,index=1".into());
+        if paths.firmware_debug {
+            arg(
+                &mut a,
+                "chardev",
+                format!(
+                    "file,id=fwlog,path={},append=on,mux=on",
+                    log.display().to_string().replace(',', ",,")
+                ),
+            );
+            if vm.agent_transport == AgentTransport::IsaSerial {
+                arg(&mut a, "device", "isa-serial,chardev=fwlog,index=1".into());
+            } else {
+                arg(&mut a, "serial", "chardev:fwlog".into());
             }
-            _ => arg(&mut a, "serial", format!("file:{}", log.display())),
+            arg(
+                &mut a,
+                "device",
+                "isa-debugcon,iobase=0x402,chardev=fwlog".into(),
+            );
+        } else {
+            match vm.agent_transport {
+                // `-serial` claims ISA index 0 (COM1) before any `-device` is
+                // placed, so where the agent needs COM1 the log is placed
+                // explicitly on COM2 instead.
+                AgentTransport::IsaSerial => {
+                    arg(
+                        &mut a,
+                        "chardev",
+                        format!("file,id=serlog,path={}", log.display()),
+                    );
+                    arg(&mut a, "device", "isa-serial,chardev=serlog,index=1".into());
+                }
+                _ => arg(&mut a, "serial", format!("file:{}", log.display())),
+            }
         }
     }
 
@@ -998,6 +1020,24 @@ mod tests {
         assert!(args.contains("-bios /fw/bios-vmlab-q35.bin"), "{args}");
         assert!(
             args.contains("menu=off,splash=/lab/splash.jpg,splash-time=0"),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn debug_port_and_uart_share_one_append_log() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.firmware_debug = true;
+        p.serial_log = Some("/lab/serial.log".into());
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(
+            args.contains("file,id=fwlog,path=/lab/serial.log,append=on,mux=on"),
+            "{args}"
+        );
+        assert!(args.contains("-serial chardev:fwlog"), "{args}");
+        assert!(
+            args.contains("isa-debugcon,iobase=0x402,chardev=fwlog"),
             "{args}"
         );
     }

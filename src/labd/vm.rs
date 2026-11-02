@@ -787,13 +787,15 @@ impl VmInstance {
                 sources
                     .lookup_for_vars(arch, pairing, m.len())
                     .with_context(context)?
-                    .with_network_stack(self.cfg.firmware_network_stack)?,
+                    .with_network_stack(self.cfg.firmware_network_stack)?
+                    .with_debug(self.cfg.firmware_debug)?,
             ));
         }
         let fw = sources
             .lookup(arch, pairing)
             .with_context(context)?
-            .with_network_stack(self.cfg.firmware_network_stack)?;
+            .with_network_stack(self.cfg.firmware_network_stack)?
+            .with_debug(self.cfg.firmware_debug)?;
         // A pre-enrolled store replaces the VARS template at the first start.
         let vars_file = match (&t.resolved.key_store, t.resolved.secure_boot) {
             (_, false) => None,
@@ -853,6 +855,7 @@ impl VmInstance {
             floppy: self.floppy.clone(),
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
+            firmware_debug: self.cfg.firmware_debug,
             seabios_code: if firmware.is_none() && qemu::qemu_arch(&t.resolved.arch) == "x86_64" {
                 qemu::firmware::seabios(
                     (self.host_config)()?.firmware_dir.as_deref(),

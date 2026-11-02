@@ -79,3 +79,15 @@ Python bytecode embedded temporary build paths; disabling bytecode and
 excluding its cache resolves the same comparison. Focused QEMU and vmlab-hv
 tests pass. The manual validates. The legacy image builds with IDE/floppy
 drivers, but a legacy guest boot was not exercised here.
+
+## FW4: opt-in DEBUG OVMF
+
+All eight CODE combinations build and retain the Debian VARS layout/content.
+Ubuntu reaches agent-ready with `firmware_debug = true` on QEMU and vmlab-hv,
+and with both debug and native-network selectors on QEMU (`fw4-qemu`, `fw4-hv`,
+`fw4-native`). Their machine `serial.log` files contain SEC/PEI/DXE diagnostics
+beginning with `SecCoreStartupWithStack`, not only the normal UART banner.
+QEMU's debug port and UART share an append-only multiplexed file. The existing
+pinned vmlab-hv capture needs no source change. DEBUG firmware timing is not
+compared with RELEASE timing. Focused QEMU/configuration tests and manual/schema
+validation pass.

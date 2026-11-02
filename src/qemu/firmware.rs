@@ -46,6 +46,25 @@ pub struct FirmwareFeatures {
 }
 
 impl UefiFirmware {
+    pub fn with_debug(mut self, enabled: bool) -> Result<Self> {
+        if enabled {
+            let stem = self
+                .code
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("invalid OVMF CODE filename"))?;
+            let candidate = self.code.with_file_name(format!("{stem}.debug.fd"));
+            if !candidate.is_file() {
+                return Err(anyhow!(
+                    "debug OVMF requested but {} is missing",
+                    candidate.display()
+                ));
+            }
+            self.code = candidate;
+        }
+        Ok(self)
+    }
+
     pub fn with_network_stack(mut self, enabled: bool) -> Result<Self> {
         if enabled {
             let name = self
@@ -706,6 +725,32 @@ mod tests {
         let selected = fw.clone().with_network_stack(true).unwrap();
         assert_eq!(selected.vars_template, fw.vars_template);
         assert!(selected.code.ends_with("OVMF_CODE_4M.secboot.network.fd"));
+    }
+
+    #[test]
+    fn debug_selection_preserves_network_and_secure_boot() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86)
+            .put("guest/firmware/x86_64/OVMF_CODE_4M.secboot.network.fd", 0);
+        let fw = f
+            .sources(false)
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap()
+            .with_network_stack(true)
+            .unwrap();
+        assert!(fw.clone().with_debug(true).is_err());
+        assert_eq!(fw.clone().with_debug(false).unwrap(), fw);
+        f.put(
+            "guest/firmware/x86_64/OVMF_CODE_4M.secboot.network.debug.fd",
+            0,
+        );
+        let selected = fw.clone().with_debug(true).unwrap();
+        assert_eq!(selected.vars_template, fw.vars_template);
+        assert!(
+            selected
+                .code
+                .ends_with("OVMF_CODE_4M.secboot.network.debug.fd")
+        );
     }
 
     const DEBIAN_X86: &[&str] = &[

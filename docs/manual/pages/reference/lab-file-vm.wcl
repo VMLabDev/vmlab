@@ -93,6 +93,7 @@ SRC
       | "`accel`" | "utf8" | "inherited" | "Accelerator: `kvm` or `tcg`. Unset, KVM when usable, else TCG with a warning. `tcg` always emulates, even where KVM works, for guests KVM cannot run reliably, such as Windows 95 on an AMD host; `-cpu` stays `max` unless `cpu_model` names one. `kvm` refuses to start the VM when KVM is unusable rather than falling back. Inherited from template, then profile. `tcg` cannot be combined with `nested = true`." |
       | "`firmware`" | "utf8" | "inherited" | "Firmware: `ovmf` or `seabios`. Inherited from template, then profile." |
       | "`firmware_network_stack`" | "bool" | "`false`" | "Select the bundled OVMF variant with edk2 HTTP/PXE networking. The default uses the reproducible iPXE option ROM. x86_64 OVMF only; declared on the VM, never inherited." |
+      | "`firmware_debug`" | "bool" | "`false`" | "Select DEBUG OVMF for firmware-hang diagnosis. I/O port 0x402 output joins the machine serial log on QEMU and vmlab-hv. Preserves secure boot, network variant and VARS. x86_64 OVMF only; per VM." |
       | "`tpm`" | "bool" | "inherited" | "Enable a TPM 2.0 device. Inherited from template, then profile." |
       | "`audio`" | "bool" | "`false`" | "A sound card (Intel HDA) whose playback is the host audio node `vmlab.<lab>.<machine>`. The VM's own; never inherited. Needs `hypervisor = \"vmlab\"`. See [Guest audio](guide_audio)." |
       | "`microphone`" | "bool" | "`false`" | "The host's default microphone as the sound card's capture stream. Needs `audio = true` and `hypervisor = \"vmlab\"`." |

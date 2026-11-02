@@ -253,6 +253,10 @@ no such hints. The default CODE excludes edk2 networking; attached NICs use
 vmlab's reproducible iPXE option ROM for BIOS and UEFI network boot. Set
 `firmware_network_stack = true` on an x86_64 OVMF VM to use the bundled native
 UEFI HTTP/PXE variant instead. Its VARS layout and enrolled keys are unchanged.
+For a firmware hang, set `firmware_debug = true` on that VM and read
+`vmlab logs <lab>/<vm>`. The DEBUG variant logs through port 0x402 into the
+machine's serial log on either hypervisor. It remains opt-in and keeps the
+same secure-boot and network settings. Firmware logs can expose guest boot paths.
 DOC
 
   p <<'DOC'

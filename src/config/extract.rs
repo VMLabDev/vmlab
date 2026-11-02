@@ -595,6 +595,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
     let firmware_network_stack = r.bool("firmware_network_stack").unspan().unwrap_or(false);
+    let firmware_debug = r.bool("firmware_debug").unspan().unwrap_or(false);
     let tpm = r.bool("tpm").unspan();
     let usb = r.bool("usb").unspan();
     let audio = r.bool("audio").unspan().unwrap_or(false);
@@ -679,6 +680,7 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         accel,
         firmware,
         firmware_network_stack,
+        firmware_debug,
         tpm,
         usb,
         audio,

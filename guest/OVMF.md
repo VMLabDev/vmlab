@@ -66,6 +66,21 @@ AAVMF remains Debian's pinned build. The build container has no AArch64 firmware
 cross compiler, and this change has no AArch64 guest with an existing VARS store
 for compatibility validation. Branding it requires that toolchain and boot check.
 
+## Diagnose firmware hangs
+
+Set `firmware_debug = true` on an x86_64 OVMF VM to select the matching DEBUG
+CODE image. Secure boot, the native-network selector and the existing VARS
+remain unchanged. The build omits `DEBUG_ON_SERIAL_PORT`, so firmware logs
+use I/O port 0x402 rather than taking over COM1. QEMU routes the debug port
+and the guest UART into one append-only multiplexed file; the pinned vmlab-hv
+already captures port 0x402 into `serial.log`. Read it with
+`vmlab logs <lab>/<vm>`. DEBUG is opt-in because logs are verbose and can expose
+guest boot paths. It is not the performance benchmark build.
+
+An override directory must contain the requested `.debug.fd` CODE variant;
+there is no silent fallback to a RELEASE image. All eight combinations of
+RELEASE/DEBUG, plain/secure and iPXE/native networking use the same flash layout.
+
 ## Replace the logo
 
 The source and rendering command are documented in `logo/README.md`. Rebuild the

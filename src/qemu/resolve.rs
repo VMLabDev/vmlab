@@ -534,11 +534,11 @@ pub fn resolve_vm(
     };
 
     let firmware_choice = resolve_firmware(lab_vm, template, profile, &arch);
-    if lab_vm.firmware_network_stack
+    if (lab_vm.firmware_network_stack || lab_vm.firmware_debug)
         && (qemu_arch(&arch) != "x86_64" || firmware_choice.firmware != Some(FirmwareKind::Ovmf))
     {
         anyhow::bail!(
-            "vm \"{}\": firmware_network_stack needs x86_64 OVMF",
+            "vm \"{}\": firmware_network_stack and firmware_debug need x86_64 OVMF",
             lab_vm.name
         );
     }
