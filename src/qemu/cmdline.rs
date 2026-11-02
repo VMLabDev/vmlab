@@ -54,6 +54,8 @@ pub struct VmPaths {
     /// lab daemon does it once when it assembles these paths — this builder
     /// stays a pure function of what it is handed (ADR-0008).
     pub firmware_code: Option<PathBuf>,
+    /// Reproducible SeaBIOS selected for q35 or legacy PC hardware.
+    pub seabios_code: Option<PathBuf>,
     /// The selected firmware accepts connection hints without rewriting BootOrder.
     pub firmware_boot_hints: bool,
     /// The reproducible PCI ROM for the resolved NIC model.
@@ -603,14 +605,30 @@ pub fn build_args(
     }
     if vm.firmware != Some(FirmwareKind::Ovmf)
         && qemu_arch(&vm.arch) == "x86_64"
+        && let Some(code) = &paths.seabios_code
+    {
+        arg(&mut a, "bios", code.display().to_string());
+    }
+    if vm.firmware != Some(FirmwareKind::Ovmf)
+        && qemu_arch(&vm.arch) == "x86_64"
         && let Some(splash) = &paths.bootsplash
     {
         arg(
             &mut a,
             "boot",
             format!(
-                "menu=on,splash={},splash-time=1000",
-                splash.display().to_string().replace(',', ",,")
+                "menu={},splash={},splash-time={}",
+                if paths.seabios_code.is_some() {
+                    "off"
+                } else {
+                    "on"
+                },
+                splash.display().to_string().replace(',', ",,"),
+                if paths.seabios_code.is_some() {
+                    0
+                } else {
+                    1000
+                }
             ),
         );
     }
@@ -967,6 +985,21 @@ mod tests {
         p.nic_rom = Some("/fw/virtio-net.rom".into());
         let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
         assert!(args.contains("romfile=/fw/virtio-net.rom"), "{args}");
+    }
+
+    #[test]
+    fn bundled_seabios_has_no_splash_or_menu_wait() {
+        let mut vm = resolved("linux-modern", "x86_64");
+        vm.firmware = Some(FirmwareKind::Seabios);
+        let mut p = paths();
+        p.seabios_code = Some("/fw/bios-vmlab-q35.bin".into());
+        p.bootsplash = Some("/lab/splash.jpg".into());
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(args.contains("-bios /fw/bios-vmlab-q35.bin"), "{args}");
+        assert!(
+            args.contains("menu=off,splash=/lab/splash.jpg,splash-time=0"),
+            "{args}"
+        );
     }
 
     /// Runtime paths the lab daemon would hand the builder, including the

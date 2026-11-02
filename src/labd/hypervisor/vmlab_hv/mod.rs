@@ -101,7 +101,7 @@ impl describe::HostRoms {
                 .find(|p| p.is_file())
         };
         Self {
-            seabios: find(&["bios-256k.bin"]),
+            seabios: find(&["bios-vmlab-q35.bin", "bios-256k.bin"]),
             vgabios_std: find(&["vgabios-stdvga.bin"]),
             vgabios_virtio: find(&["vgabios-virtio.bin"]),
             // vmlab-hv's own iPXE build, never QEMU's (HV phase-2 D14, D16).

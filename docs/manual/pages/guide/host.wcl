@@ -258,7 +258,10 @@ DOC
   p <<'DOC'
 Both hypervisors display the vmlab wordmark when using the bundled x86_64
 OVMF CODE. Windows can reuse the firmware's BGRT logo during its boot animation.
-QEMU SeaBIOS guests receive a 640 by 480 pixel splash with a one-second delay.
+Bundled SeaBIOS paints a 640 by 480 pixel splash during POST without adding a
+boot-menu delay. q35 uses a build without floppy or IDE probing; i440fx keeps
+the legacy drivers in a separate image. A fast boot may make the splash brief.
+Host SeaBIOS fallback retains the one-second splash setting.
 SeaBIOS on vmlab-hv has no splash because its machine protocol cannot pass
 extra fw_cfg files yet.
 

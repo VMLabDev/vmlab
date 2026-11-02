@@ -346,6 +346,7 @@ main() {
     if [[ "$arch" == x86_64 ]]; then
       "$SCRIPT_DIR/build-ovmf.sh"
       python3 "$SCRIPT_DIR/ipxe/build.py"
+      bash "$SCRIPT_DIR/build-seabios.sh"
     fi
   done
   log "done"

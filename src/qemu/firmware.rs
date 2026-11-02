@@ -100,6 +100,24 @@ pub fn option_rom(firmware_dir: Option<&Path>, model: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+pub fn seabios(firmware_dir: Option<&Path>, machine: &str) -> Option<PathBuf> {
+    let name = if machine.contains("q35") {
+        "bios-vmlab-q35.bin"
+    } else {
+        "bios-vmlab-legacy.bin"
+    };
+    firmware_dir
+        .into_iter()
+        .map(|dir| dir.join("x86_64"))
+        .chain(
+            crate::guest_asset::candidate_dirs()
+                .into_iter()
+                .map(|dir| dir.join("firmware/x86_64")),
+        )
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
 /// Which CODE build is paired with which VARS template (§5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pairing {

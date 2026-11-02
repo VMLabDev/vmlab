@@ -853,6 +853,14 @@ impl VmInstance {
             floppy: self.floppy.clone(),
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
+            seabios_code: if firmware.is_none() && qemu::qemu_arch(&t.resolved.arch) == "x86_64" {
+                qemu::firmware::seabios(
+                    (self.host_config)()?.firmware_dir.as_deref(),
+                    &t.resolved.machine,
+                )
+            } else {
+                None
+            },
             nic_rom: qemu::firmware::option_rom(
                 (self.host_config)()?.firmware_dir.as_deref(),
                 &t.resolved.nic_model,

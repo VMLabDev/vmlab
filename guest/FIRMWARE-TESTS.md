@@ -55,3 +55,27 @@ Ubuntu reaches agent-ready using network-free CODE on QEMU and vmlab-hv, and
 using the native-network variant selected through `firmware_network_stack` on
 QEMU (`fw2-qemu`, `fw2-hv`, `fw2-native`). QEMU and configuration focused tests
 pass. `wcl check src/config/schema.wcl` and `wcl check docs/manual/main.wcl` pass.
+
+## FW3: reproducible SeaBIOS
+
+The existing Ubuntu image is UEFI-only: stock SeaBIOS stops at `Booting from
+Hard Disk`. A disposable overlay installs `grub-pc-bin`, reuses its former ESP
+as a BIOS boot partition, and masks that ESP's mount. The source disk is never
+changed. All BIOS timing runs use fresh overlays of this same prepared disk.
+The baseline uses the logo PR's host SeaBIOS and one-second splash; the candidate
+uses the new bundled image, zero wait and the built iPXE ROM. OS configuration
+is identical between the two groups. CPU-resume to daemon agent-ready has a
+median of **6.836 s before, 5.137 s after** over three boots per group. Ranges
+are 6.457–7.765 s before and 4.937–5.275 s after on this shared host.
+
+Runs: `baseline-bios-1` through `baseline-bios-3` and `fw3-bios-1` through
+`fw3-bios-3`. `fw3-bios-hv` also reaches agent-ready on vmlab-hv. The POST
+capture `bios-post-capture/0099.png` shows the vmlab splash with a zero host
+menu wait. No minimum splash duration is added.
+
+Two clean builds produce identical BIOS images, expanded configs, source
+archive and BUILDINFO. The first source-archive comparison failed because
+Python bytecode embedded temporary build paths; disabling bytecode and
+excluding its cache resolves the same comparison. Focused QEMU and vmlab-hv
+tests pass. The manual validates. The legacy image builds with IDE/floppy
+drivers, but a legacy guest boot was not exercised here.
