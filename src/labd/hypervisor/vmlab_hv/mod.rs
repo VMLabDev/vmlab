@@ -74,6 +74,11 @@ impl VmlabHv {
 fn rom_dirs(firmware_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = firmware_dir.map(|d| d.join("x86_64")).into_iter().collect();
     dirs.extend(
+        crate::guest_asset::candidate_dirs()
+            .into_iter()
+            .map(|dir| dir.join("firmware/x86_64")),
+    );
+    dirs.extend(
         [
             "/usr/share/qemu",
             "/usr/share/seabios",
@@ -96,7 +101,7 @@ impl describe::HostRoms {
                 .find(|p| p.is_file())
         };
         Self {
-            seabios: find(&["bios-256k.bin"]),
+            seabios: find(&["bios-vmlab-q35.bin", "bios-256k.bin"]),
             vgabios_std: find(&["vgabios-stdvga.bin"]),
             vgabios_virtio: find(&["vgabios-virtio.bin"]),
             // vmlab-hv's own iPXE build, never QEMU's (HV phase-2 D14, D16).

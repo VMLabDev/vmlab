@@ -1,0 +1,47 @@
+Subject: Accept a transient GOP size hint through fw_cfg
+
+--- a/OvmfPkg/PlatformDxe/Platform.c
++++ b/OvmfPkg/PlatformDxe/Platform.c
+@@ -17,5 +17,6 @@
+ #include <Library/MemoryAllocationLib.h>
+ #include <Library/PrintLib.h>
++#include <Library/QemuFwCfgSimpleParserLib.h>
+ #include <Library/UefiBootServicesTableLib.h>
+ #include <Library/UefiHiiServicesLib.h>
+ #include <Protocol/DevicePath.h>
+@@ -820,8 +821,26 @@ ExecutePlatformConfig (
+   PLATFORM_CONFIG  PlatformConfig;
+   UINT64           OptionalElements;
+   RETURN_STATUS    PcdStatus;
++  UINT32           HostWidth;
++  UINT32           HostHeight;
+ 
+   Status = PlatformConfigLoad (&PlatformConfig, &OptionalElements);
++  if (!EFI_ERROR (QemuFwCfgParseUint32 (
++                    "opt/vmlab/gop-width", FALSE, &HostWidth
++                    )) &&
++      !EFI_ERROR (QemuFwCfgParseUint32 (
++                    "opt/vmlab/gop-height", FALSE, &HostHeight
++                    )) &&
++      (HostWidth >= 320) && (HostWidth <= 8192) &&
++      (HostHeight >= 200) && (HostHeight <= 8192))
++  {
++    PlatformConfig.HorizontalResolution = HostWidth;
++    PlatformConfig.VerticalResolution   = HostHeight;
++    OptionalElements                    = PLATFORM_CONFIG_F_GRAPHICS_RESOLUTION;
++    Status                              = EFI_SUCCESS;
++    DEBUG ((DEBUG_INFO, "vmlab: host GOP hint %ux%u\n", HostWidth, HostHeight));
++  }
++
+   if (EFI_ERROR (Status)) {
+     DEBUG ((
+       (Status == EFI_NOT_FOUND) ? DEBUG_VERBOSE : DEBUG_ERROR,
+--- a/OvmfPkg/PlatformDxe/Platform.inf
++++ b/OvmfPkg/PlatformDxe/Platform.inf
+@@ -40,5 +40,6 @@
+   MemoryAllocationLib
+   PrintLib
++  QemuFwCfgSimpleParserLib
+   UefiBootServicesTableLib
+   UefiHiiServicesLib
+   UefiLib

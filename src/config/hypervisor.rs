@@ -417,6 +417,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn firmware_resolution_is_supported_by_fw_cfg() {
+        let why = refused(
+            r#"template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 10GiB firmware_width = 1024 firmware_height = 768"#,
+        );
+        assert!(why.is_empty(), "{why:?}");
+    }
+
     /// Everything else names the phase that brings it.
     #[test]
     fn what_a_later_phase_brings_is_refused_naming_that_phase() {

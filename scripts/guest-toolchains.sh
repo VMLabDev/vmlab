@@ -15,6 +15,7 @@
 #           targets (rust-lld rides along with that toolchain) and
 #           x86_64-apple-darwin, and the nightly ebpf/rust-toolchain.toml
 #           pins, with rust-src, for the win7 targets' build-std
+#   uv      pinned Python environment runner for the Secure Boot template build
 #   zig     the macOS agent's linker and signer, all pinned below: zig into
 #           $ZIG_DIR (default ~/.local/opt/zig), cargo-zigbuild into cargo's
 #           bin, rcodesign into $VMLAB_BIN_DIR; each skipped when present
@@ -28,7 +29,7 @@
 #   ebpf    bpf-linker, built against the nightly ebpf/rust-toolchain.toml
 #           pins (`just ebpf-tools`) — not a bundle toolchain, so not in the
 #           default set; CI's ebpf-verify job and build/Dockerfile run it
-# No stage given: the first six, in that order.
+# No stage given: apt, uv, rust, zig, msvcrt, watcom, just.
 #
 # Runs as root or as a user with passwordless sudo (apt only).
 
@@ -45,6 +46,9 @@ OW_URL="https://github.com/open-watcom/open-watcom-v2/releases/download/$OW_TAG/
 # bpf-linker links against the pinned nightly's libLLVM through its proxy, so
 # the objects are reproducible given this version and the channel pin.
 BPF_LINKER_VERSION="0.10.3"
+UV_VERSION="0.10.6"
+UV_SHA256="aaa402e19d14a6b9a4267fcf4ec35380f804c68923525cea67cd6ee05bb4e930"
+UV_URL="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-x86_64-unknown-linux-gnu.tar.gz"
 
 # The macOS agent (x86_64-apple-darwin) links through zig, which carries the
 # libSystem stubs an Apple SDK would otherwise provide, and is ad-hoc signed
@@ -73,6 +77,7 @@ stage_apt() {
   as_root env DEBIAN_FRONTEND=noninteractive apt-get update -q
   as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
     ca-certificates curl git xz-utils bzip2 cpio gzip make file \
+    nasm acpica-tools uuid-dev python3 patch \
     build-essential gcc-multilib \
     gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 binutils-mingw-w64 mingw-w64-common
 }
@@ -223,14 +228,28 @@ stage_just() {
     bash -s -- --to "$bin"
 }
 
+stage_uv() {
+  if command -v uv >/dev/null 2>&1 && [[ "$(uv --version)" == "uv $UV_VERSION" ]]; then
+    log "uv: $UV_VERSION already on PATH"
+    return
+  fi
+  local bin="${VMLAB_BIN_DIR:-$HOME/.local/bin}" tmp
+  mkdir -p "$bin"
+  tmp="$(mktemp -d)"
+  fetch_pinned "$UV_URL" "$tmp/uv.tar.gz" "$UV_SHA256"
+  tar -xzf "$tmp/uv.tar.gz" -C "$tmp" --strip-components=1
+  install -m 0755 "$tmp/uv" "$bin/uv"
+  rm -rf "$tmp"
+}
+
 main() {
   local -a stages=("$@")
-  [[ ${#stages[@]} -gt 0 ]] || stages=(apt rust zig msvcrt watcom just)
+  [[ ${#stages[@]} -gt 0 ]] || stages=(apt uv rust zig msvcrt watcom just)
   local s
   for s in "${stages[@]}"; do
     case "$s" in
-      apt | rust | zig | msvcrt | watcom | just | ebpf) "stage_$s" ;;
-      *) die "unknown stage '$s' (known: apt rust zig msvcrt watcom just ebpf)" ;;
+      apt | uv | rust | zig | msvcrt | watcom | just | ebpf) "stage_$s" ;;
+      *) die "unknown stage '$s' (known: apt uv rust zig msvcrt watcom just ebpf)" ;;
     esac
   done
 }

@@ -1,8 +1,8 @@
 //! Locate UEFI firmware (OVMF/AAVMF/RiscVVirt) for a VM.
 //!
-//! vmlab ships its own: the guest asset set carries Debian's edk2 builds
-//! under `firmware/<arch>/` (`guest/build-asset.sh` fetches them pinned by
-//! sha256), so a host needs no OVMF package and every host boots the same
+//! vmlab ships branded x86_64 OVMF CODE with Debian-derived VARS, and Debian's
+//! AAVMF under `firmware/<arch>/` (`guest/build-asset.sh` builds or fetches
+//! them from pinned sources), so a host needs no OVMF package and every host boots the same
 //! bytes. The search, highest priority first (PRD §5.2):
 //!
 //!  1. the host config's `firmware_dir` — `<firmware_dir>/<arch>/`, laid out
@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 /// A resolved UEFI firmware pair: read-only CODE image plus a pristine VARS
 /// template to copy per VM.
@@ -37,6 +37,106 @@ use anyhow::{Result, anyhow};
 pub struct UefiFirmware {
     pub code: PathBuf,
     pub vars_template: PathBuf,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct FirmwareFeatures {
+    #[serde(default)]
+    pub boot_hints: bool,
+    #[serde(default)]
+    pub gop_resolution: bool,
+}
+
+impl UefiFirmware {
+    pub fn with_debug(mut self, enabled: bool) -> Result<Self> {
+        if enabled {
+            let stem = self
+                .code
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("invalid OVMF CODE filename"))?;
+            let candidate = self.code.with_file_name(format!("{stem}.debug.fd"));
+            if !candidate.is_file() {
+                return Err(anyhow!(
+                    "debug OVMF requested but {} is missing",
+                    candidate.display()
+                ));
+            }
+            self.code = candidate;
+        }
+        Ok(self)
+    }
+
+    pub fn with_network_stack(mut self, enabled: bool) -> Result<Self> {
+        if enabled {
+            let name = self
+                .code
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".fd"))
+                .ok_or_else(|| anyhow!("invalid OVMF CODE filename"))?;
+            let candidate = self.code.with_file_name(format!("{name}.network.fd"));
+            if !candidate.is_file() {
+                return Err(anyhow!(
+                    "native OVMF network stack requested but {} is missing",
+                    candidate.display()
+                ));
+            }
+            self.code = candidate;
+        }
+        Ok(self)
+    }
+
+    pub fn features(&self) -> Result<FirmwareFeatures> {
+        let path = self.code.with_file_name("features.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid firmware features: {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(FirmwareFeatures::default())
+            }
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+}
+
+/// Option ROMs follow the firmware override and guest asset lookup order.
+pub fn option_rom(firmware_dir: Option<&Path>, model: &str) -> Option<PathBuf> {
+    let name = match model {
+        "virtio-net-pci" | "virtio-net" => "virtio-net.rom",
+        "e1000" => "e1000.rom",
+        "rtl8139" => "rtl8139.rom",
+        "pcnet" => "pcnet.rom",
+        _ => return None,
+    };
+    firmware_dir
+        .into_iter()
+        .map(|dir| dir.join("x86_64"))
+        .chain(
+            crate::guest_asset::candidate_dirs()
+                .into_iter()
+                .map(|dir| dir.join("firmware/x86_64")),
+        )
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+pub fn seabios(firmware_dir: Option<&Path>, machine: &str) -> Option<PathBuf> {
+    let name = if machine.contains("q35") {
+        "bios-vmlab-q35.bin"
+    } else {
+        "bios-vmlab-legacy.bin"
+    };
+    firmware_dir
+        .into_iter()
+        .map(|dir| dir.join("x86_64"))
+        .chain(
+            crate::guest_asset::candidate_dirs()
+                .into_iter()
+                .map(|dir| dir.join("firmware/x86_64")),
+        )
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 /// Which CODE build is paired with which VARS template (§5.2).
@@ -78,8 +178,9 @@ impl Pairing {
 /// has no such build: riscv64 has no secure-boot variant.
 pub fn bundled_names(arch: &str, pairing: Pairing) -> Option<(&'static str, &'static str)> {
     Some(match (arch, pairing) {
-        // Debian `ovmf`: the 4 MiB builds; `.ms` carries Microsoft's keys
-        // (and the distro's) enrolled, which Windows and shim boot under.
+        // The 4 MiB builds; `.ms` retains Debian's PK and both Microsoft key
+        // generations, with the pinned current x64 dbx. The pristine Debian
+        // store is selectable through secure_boot_vars.
         ("x86_64", Pairing::Plain) => ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
         ("x86_64", Pairing::Enrolled) => ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.ms.fd"),
         ("x86_64", Pairing::Setup) => ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.fd"),
@@ -598,6 +699,68 @@ mod tests {
         fn path(&self, rel: &str) -> PathBuf {
             self.dir.path().join(rel)
         }
+    }
+
+    #[test]
+    fn firmware_features_are_explicit_and_validated() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86);
+        let fw = f.sources(false).lookup("x86_64", Pairing::Plain).unwrap();
+        assert!(!fw.features().unwrap().boot_hints);
+        assert!(!fw.features().unwrap().gop_resolution);
+        let manifest = fw.code.with_file_name("features.json");
+        std::fs::write(&manifest, br#"{"boot_hints":true}"#).unwrap();
+        assert!(fw.features().unwrap().boot_hints);
+        assert!(!fw.features().unwrap().gop_resolution);
+        std::fs::write(&manifest, br#"{"gop_resolution":true}"#).unwrap();
+        assert!(fw.features().unwrap().gop_resolution);
+        assert!(!fw.features().unwrap().boot_hints);
+        std::fs::write(&manifest, br#"{"gop_resolution":"yes"}"#).unwrap();
+        assert!(fw.features().is_err());
+        std::fs::write(&manifest, br#"{"boot_hints":"yes"}"#).unwrap();
+        assert!(fw.features().is_err());
+    }
+
+    #[test]
+    fn native_network_stack_is_an_explicit_code_variant() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86);
+        let fw = f
+            .sources(false)
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap();
+        assert_eq!(fw.clone().with_network_stack(false).unwrap(), fw);
+        assert!(fw.clone().with_network_stack(true).is_err());
+        f.put("guest/firmware/x86_64/OVMF_CODE_4M.secboot.network.fd", 0);
+        let selected = fw.clone().with_network_stack(true).unwrap();
+        assert_eq!(selected.vars_template, fw.vars_template);
+        assert!(selected.code.ends_with("OVMF_CODE_4M.secboot.network.fd"));
+    }
+
+    #[test]
+    fn debug_selection_preserves_network_and_secure_boot() {
+        let f = Fake::new();
+        f.bundled("x86_64", BUNDLED_X86)
+            .put("guest/firmware/x86_64/OVMF_CODE_4M.secboot.network.fd", 0);
+        let fw = f
+            .sources(false)
+            .lookup("x86_64", Pairing::Enrolled)
+            .unwrap()
+            .with_network_stack(true)
+            .unwrap();
+        assert!(fw.clone().with_debug(true).is_err());
+        assert_eq!(fw.clone().with_debug(false).unwrap(), fw);
+        f.put(
+            "guest/firmware/x86_64/OVMF_CODE_4M.secboot.network.debug.fd",
+            0,
+        );
+        let selected = fw.clone().with_debug(true).unwrap();
+        assert_eq!(selected.vars_template, fw.vars_template);
+        assert!(
+            selected
+                .code
+                .ends_with("OVMF_CODE_4M.secboot.network.debug.fd")
+        );
     }
 
     const DEBIAN_X86: &[&str] = &[

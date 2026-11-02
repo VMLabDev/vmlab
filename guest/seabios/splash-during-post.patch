@@ -1,0 +1,40 @@
+Subject: Paint the splash during useful POST work without a menu wait
+
+--- a/src/post.c
++++ b/src/post.c
+@@ -209,6 +209,7 @@ maininit(void)
+     vgarom_setup();
+     sercon_setup();
+     enable_vga_console();
++    enable_bootsplash();
+ 
+     // Do hardware initialization (if running synchronously)
+     if (!threads_during_optionroms()) {
+@@ -223,6 +224,7 @@ maininit(void)
+     // Allow user to modify overall boot order.
+     interactive_bootmenu();
+     wait_threads();
++    disable_bootsplash();
+ 
+     // Prepare for boot.
+     prepareboot();
+--- a/src/boot.c
++++ b/src/boot.c
+@@ -691,7 +691,7 @@ get_keystroke(int msec)
+  * Boot menu and BCV execution
+  ****************************************************************/
+ 
+-#define DEFAULT_BOOTMENU_WAIT 2500
++#define DEFAULT_BOOTMENU_WAIT 0
+ 
+ static const char menuchars[] = {
+     '1', '2', '3', '4', '5', '6', '7', '8', '9',
+@@ -725,6 +725,8 @@ interactive_bootmenu(void)
+     }
+ 
+     int menutime = romfile_loadint("etc/boot-menu-wait", DEFAULT_BOOTMENU_WAIT);
++    if (!menutime)
++        return;
+     int menukey = romfile_loadint("etc/boot-menu-key", 1);
+     int scan_code;
+     if (menutime >= 0) {

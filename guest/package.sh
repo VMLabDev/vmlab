@@ -56,10 +56,29 @@ EXPECTED=(
   firmware/VERSION
   firmware/x86_64/OVMF_CODE_4M.fd firmware/x86_64/OVMF_VARS_4M.fd
   firmware/x86_64/OVMF_CODE_4M.secboot.fd firmware/x86_64/OVMF_VARS_4M.ms.fd
+  firmware/x86_64/OVMF_VARS_4M.ms.debian.fd firmware/x86_64/SECUREBOOT-BUILDINFO.json
   firmware/x86_64/VERSION
+  firmware/x86_64/BUILDINFO
+  firmware/x86_64/features.json
+  firmware/x86_64/OVMF_CODE_4M.network.fd
+  firmware/x86_64/OVMF_CODE_4M.secboot.network.fd
+  firmware/x86_64/OVMF_CODE_4M.debug.fd
+  firmware/x86_64/OVMF_CODE_4M.secboot.debug.fd
+  firmware/x86_64/OVMF_CODE_4M.network.debug.fd
+  firmware/x86_64/OVMF_CODE_4M.secboot.network.debug.fd
+  firmware/x86_64/virtio-net.rom firmware/x86_64/e1000.rom
+  firmware/x86_64/rtl8139.rom firmware/x86_64/pcnet.rom
+  firmware/x86_64/1af41000.rom firmware/x86_64/1af41000.efirom
+  firmware/x86_64/IPXE-SHA256SUMS firmware/x86_64/ipxe-source.tar
+  firmware/x86_64/bios-vmlab-q35.bin firmware/x86_64/bios-vmlab-legacy.bin
+  firmware/x86_64/seabios-q35.config firmware/x86_64/seabios-legacy.config
+  firmware/x86_64/SEABIOS-BUILDINFO firmware/x86_64/seabios-source.tar.gz
+  firmware/x86_64/SeaBIOS-COPYING firmware/x86_64/SeaBIOS-COPYING.LESSER
+  firmware/x86_64/COPYRIGHT
   firmware/aarch64/AAVMF_CODE.fd firmware/aarch64/AAVMF_VARS.fd
   firmware/aarch64/AAVMF_CODE.secboot.fd firmware/aarch64/AAVMF_VARS.ms.fd
   firmware/aarch64/VERSION
+  firmware/aarch64/COPYRIGHT
 )
 
 main() {

@@ -555,6 +555,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_debug_outcome_cannot_acknowledge_a_lifecycle_command() {
+        let hv = fake_hv(vec![], |_| Outcome::Debug {
+            response: vmlab_hv_proto::debug::DebugResponse::Done,
+        });
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        let error = control.resume().await.unwrap_err().to_string();
+        assert!(
+            error.contains("unexpected debugger reply to `resume`"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn diagnostics_in_the_handshake_preserves_lifecycle_capabilities() {
         let hv = fake_hv(vec![Capability::Diagnostics, Capability::Snapshots], ok);
         let control = HvControl::connect(&hv.socket).await.unwrap();
@@ -584,6 +597,14 @@ mod tests {
         control.pause().await.unwrap();
         (hv.events)(Event::Unknown {
             name: "future_event".into(),
+        });
+        (hv.events)(Event::DebugStopped {
+            stop: vmlab_hv_proto::debug::DebugStop {
+                sequence: 1,
+                vcpu: 0,
+                pc: 0xfff0,
+                reason: vmlab_hv_proto::debug::StopReason::Pause,
+            },
         });
         (hv.events)(Event::Reset);
         eventually("reset after unknown event", || {

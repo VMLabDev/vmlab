@@ -282,6 +282,14 @@ type Vm {
   @options(["kvm", "tcg"]) accel: utf8?
   @doc("Firmware: `ovmf` | `seabios`; inherited from template→profile")
   @options(["ovmf", "seabios"]) firmware: utf8?
+  @doc("Use the bundled OVMF native HTTP/PXE stack; default false uses the reproducible iPXE option ROM. Per VM, not inherited; x86 OVMF only")
+  firmware_network_stack: bool?
+  @doc("Use DEBUG OVMF and capture firmware I/O port 0x402 in the machine serial log; default false; x86_64 OVMF only, per VM")
+  firmware_debug: bool?
+  @doc("Boot-time GOP width hint, 320..8192; paired with firmware_height; x86_64 OVMF on QEMU or vmlab-hv, never inherited")
+  @range(320, 8192) firmware_width: i64?
+  @doc("Boot-time GOP height hint, 200..8192; paired with firmware_width; x86_64 OVMF on QEMU or vmlab-hv, never inherited")
+  @range(200, 8192) firmware_height: i64?
   @doc("Enable a TPM 2.0 device; inherited from template→profile")
   tpm: bool?
   @doc("Boot with a hot-plug xHCI controller so `vmlab usb attach` can pass host USB devices in; inherited from the profile, default false. Adding it changes the VM's hardware, so online snapshots taken without it no longer restore")

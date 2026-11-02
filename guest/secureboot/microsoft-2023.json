@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "release": "v1.7.1",
+  "commit": "daa32713651f2ffe97b18df5aaf93ffe238aa464",
+  "checked_on": "2026-11-02",
+  "template_sha256": "42ca3d90cbabb32c797f0253c26bead4bee9790f18cccf43993a88fa033ffa29",
+  "owner": "77fa9abd-0359-4d32-bd60-28f4e78f784b",
+  "certificates": [
+    {
+      "variable": "KEK",
+      "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/PreSignedObjects/KEK/Certificates/MicCorKEKCA2011_2011-06-24.der",
+      "sha256": "a1117f516a32cefcba3f2d1ace10a87972fd6bbe8fe0d0b996e09e65d802a503"
+    },
+    {
+      "variable": "KEK",
+      "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/PreSignedObjects/KEK/Certificates/microsoft%20corporation%20kek%202k%20ca%202023.der",
+      "sha256": "3cd3f0309edae228767a976dd40d9f4affc4fbd5218f2e8cc3c9dd97e8ac6f9d"
+    },
+    {
+      "variable": "db",
+      "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/PreSignedObjects/DB/Certificates/MicWinProPCA2011_2011-10-19.der",
+      "sha256": "e8e95f0733a55e8bad7be0a1413ee23c51fcea64b3c8fa6a786935fddcc71961"
+    },
+    {
+      "variable": "db",
+      "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/PreSignedObjects/DB/Certificates/windows%20uefi%20ca%202023.der",
+      "sha256": "076f1fea90ac29155ebf77c17682f75f1fdd1be196da302dc8461e350a9ae330"
+    },
+    {
+      "variable": "db",
+      "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/PreSignedObjects/DB/Certificates/MicCorUEFCA2011_2011-06-27.der",
+      "sha256": "48e99b991f57fc52f76149599bff0a58c47154229b9f8d603ac40d3500248507"
+    },
+    {
+      "variable": "db",
+      "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/PreSignedObjects/DB/Certificates/microsoft%20uefi%20ca%202023.der",
+      "sha256": "f6124e34125bee3fe6d79a574eaa7b91c0e7bd9d929c1a321178efd611dad901"
+    },
+    {
+      "variable": "db",
+      "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/PreSignedObjects/DB/Certificates/microsoft%20option%20rom%20uefi%20ca%202023.der",
+      "sha256": "e5be3e64c6e66a281457ecdece0d6d0787577aad2a3a0144262c10c14ba8d8f1"
+    }
+  ],
+  "dbx": {
+    "url": "https://github.com/microsoft/secureboot_objects/releases/download/v1.7.1/edk2-x64-secureboot-binaries.tar.gz",
+    "sha256": "a90ec9bc9f3982218c431bbf8698c2ac2cdb3dbd036119b298600230ec5ebea6",
+    "member": "./LegacyFirmwareDefaults/Firmware/DefaultDbx.bin",
+    "member_sha256": "7fbf186e4d045556ed92f449234606943006a105d11d078b9271a794225fd338",
+    "entries": 445
+  },
+  "license": {
+    "url": "https://raw.githubusercontent.com/microsoft/secureboot_objects/daa32713651f2ffe97b18df5aaf93ffe238aa464/License.txt",
+    "sha256": "840a8918b28ff140fa720bd3d1b4845a74047914d16883ea74df6977234845fb"
+  }
+}

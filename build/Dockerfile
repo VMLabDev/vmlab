@@ -35,13 +35,14 @@ RUN apt-get update -q \
       ovmf seabios swtpm \
       qemu-efi-aarch64 qemu-efi-riscv64 \
       tesseract-ocr passt \
-      xorriso mtools dosfstools samba \
+      xorriso mtools dosfstools samba liblzma-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/vmlab-build
 COPY scripts/guest-toolchains.sh scripts/
 
 RUN ./scripts/guest-toolchains.sh apt && rm -rf /var/lib/apt/lists/*
+RUN VMLAB_BIN_DIR=/usr/local/bin ./scripts/guest-toolchains.sh uv
 
 COPY rust-toolchain.toml ./
 COPY ebpf/rust-toolchain.toml ebpf/

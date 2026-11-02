@@ -594,6 +594,10 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
     let tsc = r.keyword("tsc", TSCS).unspan();
     let accel = r.keyword("accel", ACCELS).unspan();
     let firmware = r.keyword("firmware", FIRMWARES).unspan();
+    let firmware_network_stack = r.bool("firmware_network_stack").unspan().unwrap_or(false);
+    let firmware_debug = r.bool("firmware_debug").unspan().unwrap_or(false);
+    let firmware_width = r.int_at_least("firmware_width", 320).unspan();
+    let firmware_height = r.int_at_least("firmware_height", 200).unspan();
     let tpm = r.bool("tpm").unspan();
     let usb = r.bool("usb").unspan();
     let audio = r.bool("audio").unspan().unwrap_or(false);
@@ -677,6 +681,10 @@ fn extract_vm(b: &Block, issues: &mut IssueList) -> Option<Vm> {
         tsc,
         accel,
         firmware,
+        firmware_network_stack,
+        firmware_debug,
+        firmware_width,
+        firmware_height,
         tpm,
         usb,
         audio,

@@ -54,9 +54,19 @@ pub struct VmPaths {
     /// lab daemon does it once when it assembles these paths — this builder
     /// stays a pure function of what it is handed (ADR-0008).
     pub firmware_code: Option<PathBuf>,
+    /// Reproducible SeaBIOS selected for q35 or legacy PC hardware.
+    pub seabios_code: Option<PathBuf>,
+    /// The selected firmware accepts connection hints without rewriting BootOrder.
+    pub firmware_boot_hints: bool,
+    pub firmware_debug: bool,
+    pub firmware_resolution: Option<(u32, u32)>,
+    /// The reproducible PCI ROM for the resolved NIC model.
+    pub nic_rom: Option<PathBuf>,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
     /// the template in `firmware::UefiFirmware::vars_template`).
     pub ovmf_vars: Option<PathBuf>,
+    /// SeaBIOS JPEG splash, staged by the daemon for x86 QEMU guests only.
+    pub bootsplash: Option<PathBuf>,
     /// swtpm control socket (when tpm enabled).
     pub tpm_sock: Option<PathBuf>,
     /// Serial console log file.
@@ -553,24 +563,57 @@ pub fn build_args(
     a.push("none".into());
 
     if let Some(log) = &paths.serial_log {
-        match vm.agent_transport {
-            // `-serial` claims ISA index 0 (COM1) before any `-device` is
-            // placed, so where the agent needs COM1 the log is placed
-            // explicitly on COM2 instead.
-            AgentTransport::IsaSerial => {
-                arg(
-                    &mut a,
-                    "chardev",
-                    format!("file,id=serlog,path={}", log.display()),
-                );
-                arg(&mut a, "device", "isa-serial,chardev=serlog,index=1".into());
+        if paths.firmware_debug {
+            arg(
+                &mut a,
+                "chardev",
+                format!(
+                    "file,id=fwlog,path={},append=on,mux=on",
+                    log.display().to_string().replace(',', ",,")
+                ),
+            );
+            if vm.agent_transport == AgentTransport::IsaSerial {
+                arg(&mut a, "device", "isa-serial,chardev=fwlog,index=1".into());
+            } else {
+                arg(&mut a, "serial", "chardev:fwlog".into());
             }
-            _ => arg(&mut a, "serial", format!("file:{}", log.display())),
+            arg(
+                &mut a,
+                "device",
+                "isa-debugcon,iobase=0x402,chardev=fwlog".into(),
+            );
+        } else {
+            match vm.agent_transport {
+                // `-serial` claims ISA index 0 (COM1) before any `-device` is
+                // placed, so where the agent needs COM1 the log is placed
+                // explicitly on COM2 instead.
+                AgentTransport::IsaSerial => {
+                    arg(
+                        &mut a,
+                        "chardev",
+                        format!("file,id=serlog,path={}", log.display()),
+                    );
+                    arg(&mut a, "device", "isa-serial,chardev=serlog,index=1".into());
+                }
+                _ => arg(&mut a, "serial", format!("file:{}", log.display())),
+            }
         }
     }
 
     // UEFI firmware: CODE read-only pflash + per-VM writable VARS.
     if vm.firmware == Some(FirmwareKind::Ovmf) {
+        if let Some((width, height)) = paths.firmware_resolution {
+            arg(
+                &mut a,
+                "fw_cfg",
+                format!("name=opt/vmlab/gop-width,string={width}"),
+            );
+            arg(
+                &mut a,
+                "fw_cfg",
+                format!("name=opt/vmlab/gop-height,string={height}"),
+            );
+        }
         let code = paths
             .firmware_code
             .as_ref()
@@ -595,7 +638,35 @@ pub fn build_args(
             a.push("driver=cfi.pflash01,property=secure,value=on".into());
         }
     }
-    // SeaBIOS is the QEMU default on x86 — nothing to add.
+    if vm.firmware != Some(FirmwareKind::Ovmf)
+        && qemu_arch(&vm.arch) == "x86_64"
+        && let Some(code) = &paths.seabios_code
+    {
+        arg(&mut a, "bios", code.display().to_string());
+    }
+    if vm.firmware != Some(FirmwareKind::Ovmf)
+        && qemu_arch(&vm.arch) == "x86_64"
+        && let Some(splash) = &paths.bootsplash
+    {
+        arg(
+            &mut a,
+            "boot",
+            format!(
+                "menu={},splash={},splash-time={}",
+                if paths.seabios_code.is_some() {
+                    "off"
+                } else {
+                    "on"
+                },
+                splash.display().to_string().replace(',', ",,"),
+                if paths.seabios_code.is_some() {
+                    0
+                } else {
+                    1000
+                }
+            ),
+        );
+    }
 
     // Guest agent channel (§7.4): the vmlab-agent port (interactive
     // terminals / exec / files / net-info / shutdown — guest/agent-proto).
@@ -634,12 +705,13 @@ pub fn build_args(
 
     // Primary + extra disks: explicit blockdev node names (disk0, disk1, …)
     // so QMP snapshot commands can address them (§7.3).
-    // SeaBIOS honours an explicit boot order; OVMF/UEFI boots removable media
-    // on its own. Without it, SeaBIOS tries the (blank) disk and any floppy
-    // before the install CD and stalls. So under SeaBIOS we give CD-ROMs the
-    // lowest bootindex (install media boots first), disks the next, and leave
-    // the answer-file floppy unindexed (never a boot candidate).
-    let seabios = vm.firmware != Some(FirmwareKind::Ovmf);
+    // x86 OVMF uses these paths to connect attached boot devices selectively.
+    // Its bundled build preserves the guest's persistent boot order. SeaBIOS
+    // boots install media before disks; the answer-file floppy stays unindexed.
+    let uefi_hints = vm.firmware == Some(FirmwareKind::Ovmf)
+        && qemu_arch(&vm.arch) == "x86_64"
+        && paths.firmware_boot_hints;
+    let indexed_boot = vm.firmware != Some(FirmwareKind::Ovmf) || uefi_hints;
     let machine_kind = if vm.machine.starts_with("virt") {
         MachineKind::Virt
     } else if vm.machine.starts_with("q35") {
@@ -656,7 +728,7 @@ pub fn build_args(
             path.display()
         ));
         a.push("-device".into());
-        let boot = if seabios {
+        let boot = if indexed_boot {
             format!(",bootindex={}", 50 + disk_index)
         } else {
             String::new()
@@ -702,7 +774,7 @@ pub fn build_args(
             iso.display()
         ));
         a.push("-device".into());
-        let boot = if seabios {
+        let boot = if indexed_boot {
             format!(",bootindex={i}")
         } else {
             String::new()
@@ -755,10 +827,23 @@ pub fn build_args(
             .filter(|m| *m != 1500 && vm.nic_model.starts_with("virtio-net"))
             .map(|m| format!(",host_mtu={m}"))
             .unwrap_or_default();
+        let boot = if uefi_hints {
+            format!(",bootindex={}", 90 + i)
+        } else {
+            String::new()
+        };
+        let rom = paths
+            .nic_rom
+            .as_ref()
+            .map(|path| format!(",romfile={}", path.display().to_string().replace(',', ",,")))
+            .unwrap_or_default();
         arg(
             &mut a,
             "device",
-            format!("{},netdev=net{i},mac={}{host_mtu}", vm.nic_model, nic.mac),
+            format!(
+                "{},netdev=net{i},mac={}{host_mtu}{boot}{rom}",
+                vm.nic_model, nic.mac
+            ),
         );
     }
     if paths.nics.is_empty() {
@@ -916,6 +1001,81 @@ mod tests {
     use super::super::resolve::testing::resolved_gpu_vm as resolved_gpu;
     use super::super::resolve::testing::resolved_vm as resolved;
 
+    #[test]
+    fn selective_uefi_connection_requires_patched_firmware() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(!args.contains("bootindex="), "{args}");
+        p.firmware_boot_hints = true;
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(args.contains("bootindex=50"), "{args}");
+        assert!(args.contains("bootindex=90"), "{args}");
+    }
+
+    #[test]
+    fn an_explicit_nic_rom_is_passed_to_qemu() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.nic_rom = Some("/fw/virtio-net.rom".into());
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(args.contains("romfile=/fw/virtio-net.rom"), "{args}");
+    }
+
+    #[test]
+    fn bundled_seabios_has_no_splash_or_menu_wait() {
+        let mut vm = resolved("linux-modern", "x86_64");
+        vm.firmware = Some(FirmwareKind::Seabios);
+        let mut p = paths();
+        p.seabios_code = Some("/fw/bios-vmlab-q35.bin".into());
+        p.bootsplash = Some("/lab/splash.jpg".into());
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(args.contains("-bios /fw/bios-vmlab-q35.bin"), "{args}");
+        assert!(
+            args.contains("menu=off,splash=/lab/splash.jpg,splash-time=0"),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn debug_port_and_uart_share_one_append_log() {
+        let vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.firmware_debug = true;
+        p.serial_log = Some("/lab/serial.log".into());
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(
+            args.contains("file,id=fwlog,path=/lab/serial.log,append=on,mux=on"),
+            "{args}"
+        );
+        assert!(args.contains("-serial chardev:fwlog"), "{args}");
+        assert!(
+            args.contains("isa-debugcon,iobase=0x402,chardev=fwlog"),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn firmware_resolution_is_two_decimal_fw_cfg_files() {
+        let mut vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(!args.contains("opt/vmlab/gop-"), "{args}");
+        p.firmware_resolution = Some((1024, 768));
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(
+            args.contains("name=opt/vmlab/gop-width,string=1024"),
+            "{args}"
+        );
+        assert!(
+            args.contains("name=opt/vmlab/gop-height,string=768"),
+            "{args}"
+        );
+        vm.firmware = Some(FirmwareKind::Seabios);
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(!args.contains("opt/vmlab/gop-"), "{args}");
+    }
+
     /// Runtime paths the lab daemon would hand the builder, including the
     /// firmware it discovered on the host. Both firmware paths are always
     /// present here; `build_args` only reads them under OVMF, and no test
@@ -945,6 +1105,23 @@ mod tests {
 
     fn joined(args: &[String]) -> String {
         args.join(" ")
+    }
+
+    #[test]
+    fn splash_is_only_passed_to_x86_seabios() {
+        let mut vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        p.bootsplash = Some("/lab/with,comma/bootsplash.jpg".into());
+        assert!(!joined(&build_args("lab", &vm, &p, Accel::Kvm).unwrap()).contains("splash="));
+        vm.firmware = Some(FirmwareKind::Seabios);
+        let args = build_args("lab", &vm, &p, Accel::Kvm).unwrap();
+        assert!(args.windows(2).any(|a| a[0] == "-boot"
+            && a[1] == "menu=on,splash=/lab/with,,comma/bootsplash.jpg,splash-time=1000"));
+        p.bootsplash = None;
+        assert!(!joined(&build_args("lab", &vm, &p, Accel::Kvm).unwrap()).contains("splash="));
+        p.bootsplash = Some("/lab/bootsplash.jpg".into());
+        vm.arch = "aarch64".into();
+        assert!(!joined(&build_args("lab", &vm, &p, Accel::Tcg).unwrap()).contains("splash="));
     }
 
     /// virtiofs shares attach as vhost-user-fs devices and flip the RAM to
