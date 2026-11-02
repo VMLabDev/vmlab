@@ -59,6 +59,7 @@ pub struct VmPaths {
     /// The selected firmware accepts connection hints without rewriting BootOrder.
     pub firmware_boot_hints: bool,
     pub firmware_debug: bool,
+    pub firmware_resolution: Option<(u32, u32)>,
     /// The reproducible PCI ROM for the resolved NIC model.
     pub nic_rom: Option<PathBuf>,
     /// Writable OVMF VARS copy for this VM (created by the lab daemon from
@@ -601,6 +602,18 @@ pub fn build_args(
 
     // UEFI firmware: CODE read-only pflash + per-VM writable VARS.
     if vm.firmware == Some(FirmwareKind::Ovmf) {
+        if let Some((width, height)) = paths.firmware_resolution {
+            arg(
+                &mut a,
+                "fw_cfg",
+                format!("name=opt/vmlab/gop-width,string={width}"),
+            );
+            arg(
+                &mut a,
+                "fw_cfg",
+                format!("name=opt/vmlab/gop-height,string={height}"),
+            );
+        }
         let code = paths
             .firmware_code
             .as_ref()
@@ -1040,6 +1053,27 @@ mod tests {
             args.contains("isa-debugcon,iobase=0x402,chardev=fwlog"),
             "{args}"
         );
+    }
+
+    #[test]
+    fn firmware_resolution_is_two_decimal_fw_cfg_files() {
+        let mut vm = resolved("linux-modern", "x86_64");
+        let mut p = paths();
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(!args.contains("opt/vmlab/gop-"), "{args}");
+        p.firmware_resolution = Some((1024, 768));
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(
+            args.contains("name=opt/vmlab/gop-width,string=1024"),
+            "{args}"
+        );
+        assert!(
+            args.contains("name=opt/vmlab/gop-height,string=768"),
+            "{args}"
+        );
+        vm.firmware = Some(FirmwareKind::Seabios);
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
+        assert!(!args.contains("opt/vmlab/gop-"), "{args}");
     }
 
     /// Runtime paths the lab daemon would hand the builder, including the

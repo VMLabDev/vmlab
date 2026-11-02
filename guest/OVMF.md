@@ -27,7 +27,7 @@ remains `"no"`. The Python hash seed is fixed. Downloads are cached under
 `guest/.cache/edk2/`. The fixed build epoch is the upstream commit's timestamp.
 
 The build follows Debian's `debian/rules` for `OvmfPkg/OvmfPkgX64.dsc`,
-X64, GCC, RELEASE, and 4 MiB flash. Both images enable CC measurement,
+X64, GCC, RELEASE/DEBUG, and 4 MiB flash. Both images enable CC measurement,
 TPM2 and Debian's `UninstallMemAttrProtocol` shim workaround. The default CODE
 disables edk2 networking and uses the reproducible iPXE option ROM. The
 `.network.fd` variants retain HTTP boot, IPv6 and TLS and allow plain HTTP;
@@ -62,9 +62,8 @@ blank VARS byte for byte with the pinned Debian template and refuses a mismatch.
 It discards the generated store and ships Debian's blank and Microsoft-enrolled
 templates unchanged. Existing per-VM VARS retain their keys and boot entries.
 
-AAVMF remains Debian's pinned build. The build container has no AArch64 firmware
-cross compiler, and this change has no AArch64 guest with an existing VARS store
-for compatibility validation. Branding it requires that toolchain and boot check.
+AAVMF remains Debian's pinned build. The owner deferred ARM branding and speed
+work (FW7) until phase 3 resumes; this branch does not build ARM firmware.
 
 ## Diagnose firmware hangs
 
@@ -81,6 +80,26 @@ An override directory must contain the requested `.debug.fd` CODE variant;
 there is no silent fallback to a RELEASE image. All eight combinations of
 RELEASE/DEBUG, plain/secure and iPXE/native networking use the same flash layout.
 
+## Set the boot display size
+
+On a QEMU x86_64 OVMF VM, set both `firmware_width` and `firmware_height` to
+request a GOP mode at boot. Width is 320..8192 and height is 200..8192. The host
+passes decimal ASCII in fw_cfg files `opt/vmlab/gop-width` and
+`opt/vmlab/gop-height`. The bundled firmware applies a valid pair ahead of the
+persisted platform preference without writing it back to VARS. Missing,
+malformed or out-of-range pairs leave the existing NV/default path unchanged.
+
+The GPU must expose the requested mode; otherwise its normal mode fallback
+applies. These files set the firmware's boot default, not the running guest's
+resolution, and do not implement live viewer resizing. Overrides must advertise
+`gop_resolution: true` in `features.json`; unsupported firmware is reported
+rather than silently ignoring an explicit size request.
+
+vmlab-hv needs a protocol/builder extension to supply these fw_cfg files. Its
+current adapter rejects an explicit size request with that requirement named.
+The firmware patch and host fields are ready for that coordinated update;
+no hypervisor source is changed here.
+
 ## Replace the logo
 
 The source and rendering command are documented in `logo/README.md`. Rebuild the
@@ -93,12 +112,14 @@ arbitrary fw_cfg file field in `MachineDescription` or `Boot::Firmware`.
 The hypervisor needs a typed splash path and delay, or extra fw_cfg files, passed
 through its VMM builder to `FwCfg::add_file`. SeaBIOS needs `bootsplash.jpg` and
 the little-endian 16-bit `etc/boot-menu-wait` delay. No hypervisor source is changed
-here. OVMF needs no such protocol extension.
+here. OVMF branding needs no such extension; FW5 resolution hints need the
+same extra-file mechanism with the two names documented above.
 
-## Verified outputs
+## Logo PR baseline outputs
 
-The 2026-11-02 build uses GCC 13.3.0, binutils 2.42, NASM 2.16.01, and
-iasl 20230628 in the Ubuntu 24.04 build container.
+The initial logo PR build on 2026-11-02 uses GCC 13.3.0, binutils 2.42, NASM
+2.16.01 and iasl 20230628 in the Ubuntu 24.04 build container. The hashes below
+identify that baseline; current variant hashes are in the generated BUILDINFO.
 
 | File | SHA256 |
 | --- | --- |

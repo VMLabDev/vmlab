@@ -534,11 +534,27 @@ pub fn resolve_vm(
     };
 
     let firmware_choice = resolve_firmware(lab_vm, template, profile, &arch);
-    if (lab_vm.firmware_network_stack || lab_vm.firmware_debug)
+    if (lab_vm.firmware_network_stack
+        || lab_vm.firmware_debug
+        || lab_vm.firmware_width.is_some()
+        || lab_vm.firmware_height.is_some())
         && (qemu_arch(&arch) != "x86_64" || firmware_choice.firmware != Some(FirmwareKind::Ovmf))
     {
         anyhow::bail!(
-            "vm \"{}\": firmware_network_stack and firmware_debug need x86_64 OVMF",
+            "vm \"{}\": firmware network, debug and resolution options need x86_64 OVMF",
+            lab_vm.name
+        );
+    }
+    if lab_vm.firmware_width.is_some() != lab_vm.firmware_height.is_some()
+        || lab_vm
+            .firmware_width
+            .is_some_and(|width| !(320..=8192).contains(&width))
+        || lab_vm
+            .firmware_height
+            .is_some_and(|height| !(200..=8192).contains(&height))
+    {
+        anyhow::bail!(
+            "vm \"{}\": firmware_width and firmware_height must be paired within 320..8192 by 200..8192",
             lab_vm.name
         );
     }

@@ -507,6 +507,8 @@ pub struct Vm {
     /// Use edk2's native HTTP/PXE stack instead of the default external iPXE ROM.
     pub firmware_network_stack: bool,
     pub firmware_debug: bool,
+    pub firmware_width: Option<u32>,
+    pub firmware_height: Option<u32>,
     pub tpm: Option<bool>,
     /// A hot-plug xHCI controller for host USB passthrough (§5.2.1); None =
     /// inherit the profile's, and with neither saying, off.

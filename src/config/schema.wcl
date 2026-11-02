@@ -286,6 +286,10 @@ type Vm {
   firmware_network_stack: bool?
   @doc("Use DEBUG OVMF and capture firmware I/O port 0x402 in the machine serial log; default false; x86_64 OVMF only, per VM")
   firmware_debug: bool?
+  @doc("Boot-time GOP width hint, 320..8192; paired with firmware_height; x86_64 OVMF on QEMU only, never inherited")
+  @range(320, 8192) firmware_width: i64?
+  @doc("Boot-time GOP height hint, 200..8192; paired with firmware_width; x86_64 OVMF on QEMU only, never inherited")
+  @range(200, 8192) firmware_height: i64?
   @doc("Enable a TPM 2.0 device; inherited from template→profile")
   tpm: bool?
   @doc("Boot with a hot-plug xHCI controller so `vmlab usb attach` can pass host USB devices in; inherited from the profile, default false. Adding it changes the VM's hardware, so online snapshots taken without it no longer restore")

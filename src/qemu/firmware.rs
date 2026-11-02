@@ -43,6 +43,8 @@ pub struct UefiFirmware {
 pub struct FirmwareFeatures {
     #[serde(default)]
     pub boot_hints: bool,
+    #[serde(default)]
+    pub gop_resolution: bool,
 }
 
 impl UefiFirmware {
@@ -704,9 +706,16 @@ mod tests {
         f.bundled("x86_64", BUNDLED_X86);
         let fw = f.sources(false).lookup("x86_64", Pairing::Plain).unwrap();
         assert!(!fw.features().unwrap().boot_hints);
+        assert!(!fw.features().unwrap().gop_resolution);
         let manifest = fw.code.with_file_name("features.json");
         std::fs::write(&manifest, br#"{"boot_hints":true}"#).unwrap();
         assert!(fw.features().unwrap().boot_hints);
+        assert!(!fw.features().unwrap().gop_resolution);
+        std::fs::write(&manifest, br#"{"gop_resolution":true}"#).unwrap();
+        assert!(fw.features().unwrap().gop_resolution);
+        assert!(!fw.features().unwrap().boot_hints);
+        std::fs::write(&manifest, br#"{"gop_resolution":"yes"}"#).unwrap();
+        assert!(fw.features().is_err());
         std::fs::write(&manifest, br#"{"boot_hints":"yes"}"#).unwrap();
         assert!(fw.features().is_err());
     }

@@ -1134,6 +1134,42 @@ fn check_secure_boot(vm: &Vm, ctx: &dyn ValidationContext, issues: &mut IssueLis
     };
 
     let choice = resolve_firmware(vm, layer.meta(), &profile, &arch);
+    if vm.firmware_width.is_some() != vm.firmware_height.is_some() {
+        issues.push(Issue::at(
+            vm.span,
+            format!(
+                "vm \"{}\": firmware_width and firmware_height must be set together",
+                vm.name
+            ),
+        ));
+    }
+    if vm.firmware_width.is_some_and(|width| width > 8192)
+        || vm.firmware_height.is_some_and(|height| height > 8192)
+    {
+        issues.push(Issue::at(
+            vm.span,
+            format!(
+                "vm \"{}\": firmware dimensions must not exceed 8192",
+                vm.name
+            ),
+        ));
+    }
+    if (vm.firmware_network_stack
+        || vm.firmware_debug
+        || vm.firmware_width.is_some()
+        || vm.firmware_height.is_some())
+        && (crate::qemu::qemu_arch(&arch) != "x86_64"
+            || (choice.firmware != Some(crate::profiles::FirmwareKind::Ovmf)
+                && (layer.is_known() || choice.firmware_layer == Layer::Vm)))
+    {
+        issues.push(Issue::at(
+            vm.span,
+            format!(
+                "vm \"{}\": firmware network, debug and resolution options need x86_64 OVMF",
+                vm.name
+            ),
+        ));
+    }
     if !choice.secure_boot_unsupported() {
         return;
     }
@@ -2070,6 +2106,31 @@ pub(crate) mod tests {
             .into_iter()
             .map(|i| i.message)
             .collect()
+    }
+
+    #[test]
+    fn firmware_dimensions_are_paired_and_bounded_before_start() {
+        let ctx = Hardware::blank();
+        for (settings, message) in [
+            ("firmware_width = 1024", "must be set together"),
+            (
+                "firmware_width = 8193 firmware_height = 768",
+                "must not exceed 8192",
+            ),
+            (
+                "firmware_width = 1024 firmware_height = 8193",
+                "must not exceed 8192",
+            ),
+        ] {
+            let source = format!(
+                "import <vmlab.wcl>\nlab \"l\" {{ vm \"v\" {{ template = \"scratch\" arch = \"x86_64\" profile = \"linux-modern\" disk = 1GiB {settings} }} }}"
+            );
+            let errors = hw_errs(&ctx, &source);
+            assert!(
+                errors.iter().any(|error| error.contains(message)),
+                "{errors:?}"
+            );
+        }
     }
 
     #[test]

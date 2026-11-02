@@ -257,6 +257,10 @@ For a firmware hang, set `firmware_debug = true` on that VM and read
 `vmlab logs <lab>/<vm>`. The DEBUG variant logs through port 0x402 into the
 machine's serial log on either hypervisor. It remains opt-in and keeps the
 same secure-boot and network settings. Firmware logs can expose guest boot paths.
+For a QEMU VM, `firmware_width = 1024` and `firmware_height = 768` request a
+supported GOP mode at boot without changing its saved firmware preference.
+Supply both fields. This does not resize a running guest. vmlab-hv needs the
+fw_cfg protocol extension before it can accept those fields.
 DOC
 
   p <<'DOC'

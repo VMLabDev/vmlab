@@ -832,6 +832,16 @@ impl VmInstance {
         render: &qemu::hostgpu::RenderPlan,
         tsc_hz: Option<u64>,
     ) -> Result<VmPaths> {
+        let firmware_features = firmware
+            .map(|fw| fw.features())
+            .transpose()?
+            .unwrap_or_default();
+        if self.cfg.firmware_width.is_some() && !firmware_features.gop_resolution {
+            anyhow::bail!(
+                "{}: selected firmware does not advertise fw_cfg GOP resolution support",
+                self.cfg.name
+            );
+        }
         Ok(VmPaths {
             apple_smc_osk: if t.resolved.apple_smc {
                 (self.host_config)()?.apple_smc_osk
@@ -856,6 +866,7 @@ impl VmInstance {
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
             firmware_debug: self.cfg.firmware_debug,
+            firmware_resolution: self.cfg.firmware_width.zip(self.cfg.firmware_height),
             seabios_code: if firmware.is_none() && qemu::qemu_arch(&t.resolved.arch) == "x86_64" {
                 qemu::firmware::seabios(
                     (self.host_config)()?.firmware_dir.as_deref(),
@@ -868,10 +879,7 @@ impl VmInstance {
                 (self.host_config)()?.firmware_dir.as_deref(),
                 &t.resolved.nic_model,
             ),
-            firmware_boot_hints: firmware
-                .map(|fw| fw.features().map(|features| features.boot_hints))
-                .transpose()?
-                .unwrap_or(false),
+            firmware_boot_hints: firmware_features.boot_hints,
             ovmf_vars: firmware.map(|_| self.dirs.ovmf_vars()),
             bootsplash: if self.hypervisor == HypervisorKind::Qemu
                 && qemu::qemu_arch(&t.resolved.arch) == "x86_64"

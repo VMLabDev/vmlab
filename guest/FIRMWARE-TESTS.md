@@ -91,3 +91,39 @@ QEMU's debug port and UART share an append-only multiplexed file. The existing
 pinned vmlab-hv capture needs no source change. DEBUG firmware timing is not
 compared with RELEASE timing. Focused QEMU/configuration tests and manual/schema
 validation pass.
+
+## FW5: host-selected OVMF resolution
+
+All eight CODE variants build with the resolution patch and retain the Debian
+VARS layout. A GOP probe with a saved 800x600 PlatformConfig selects 1024x768
+when both decimal fw_cfg hints are valid. Malformed, missing, out-of-range and
+absent hints each retain 800x600. All five runs reparse the resulting VARS and
+confirm the saved PlatformConfig bytes remain unchanged. The probe CODE hash
+matches the shipped RELEASE image; no bootable disk is attached for these
+captures.
+
+The shipped RELEASE image also boots Ubuntu to agent-ready through the actual
+host fields on QEMU (`fw5-host-size`, 7.220 s). With no hints it boots on
+vmlab-hv (`fw5-hv-default`, 7.973 s). These single runs demonstrate bootability,
+not a speed comparison. CLI validation accepts a valid pair and rejects a half
+pair, excessive dimensions and explicit vmlab-hv resolution settings. Starting
+with an override lacking the capability manifest fails before VM launch
+(`fw5-unsupported`).
+
+The continuation review repeats all five GOP cases against the shipped image
+(`review2-gop-*`) and boots through the rebuilt CLI's paired fields
+(`review-host-size`, 1.457 s handoff, 7.244 s agent-ready). All pass. The
+focused checks pass 9 firmware-named Rust tests and 167 QEMU tests; CLI
+validation passes all five cases. Shell syntax, isolated ShellCheck, schema
+validation and HTML manual rendering also pass.
+
+The pinned vmlab-hv protocol at 41e53e474b537e6d6de48a34ad55c317d8d95ab7
+has only firmware kind, CODE, VARS, secure_boot and bootorder in Boot::Firmware.
+It needs a default-empty named-byte-file collection, passed by its q35 builder
+to FwCfg::add_file before fw_cfg realization. FW5 needs `opt/vmlab/gop-width`
+and `opt/vmlab/gop-height` containing decimal ASCII, without a required NUL.
+SeaBIOS branding needs `bootsplash.jpg` with JPEG bytes and
+`etc/boot-menu-wait` with a little-endian u16 zero. The protocol should reject
+duplicate/reserved names and oversized data and test firmware consumption.
+After that upstream change, vmlab must update its protocol pin, fill the files
+in describe.rs and remove the FW5 refusal. No hypervisor files are changed here.

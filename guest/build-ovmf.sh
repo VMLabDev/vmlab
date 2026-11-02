@@ -61,6 +61,8 @@ main() {
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/reproducible-iscsi-pcd.patch"
   sed -i 's/\r$//' "$work/OvmfPkg/Library/PlatformBootManagerLib/BdsPlatform.c"
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/boot-without-waits.patch"
+  sed -i 's/\r$//' "$work/OvmfPkg/PlatformDxe/Platform.c" "$work/OvmfPkg/PlatformDxe/Platform.inf"
+  patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/host-resolution.patch"
   cp "$SCRIPT_DIR/logo/Logo.bmp" "$work/MdeModulePkg/Logo/Logo.bmp"
 
   (
@@ -121,7 +123,7 @@ main() {
     done
   )
   install -m 0644 "$work/OVMF_CODE_4M"*.fd "$OUT/"
-  printf '{"boot_hints":true}\n' >"$OUT/features.json"
+  printf '{"boot_hints":true,"gop_resolution":true}\n' >"$OUT/features.json"
   {
     printf 'edk2_tag=%s\nedk2_commit=%s\ndebian_source=%s\nsource_date_epoch=%s\n' \
       "$EDK2_TAG" "$EDK2_COMMIT" "$DEBIAN_VERSION" "$SOURCE_DATE_EPOCH"
@@ -135,6 +137,7 @@ main() {
     sha256sum "$SCRIPT_DIR/build-ovmf.sh" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/reproducible-iscsi-pcd.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/boot-without-waits.patch" | sed "s|$SCRIPT_DIR/||"
+    sha256sum "$SCRIPT_DIR/ovmf/host-resolution.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/logo/Logo.bmp" | sed "s|$SCRIPT_DIR/||"
     (cd "$OUT" && sha256sum OVMF_CODE_4M*.fd OVMF_VARS_4M*.fd)
   } >"$OUT/BUILDINFO"
