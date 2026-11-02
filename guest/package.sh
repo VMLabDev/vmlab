@@ -56,6 +56,7 @@ EXPECTED=(
   firmware/VERSION
   firmware/x86_64/OVMF_CODE_4M.fd firmware/x86_64/OVMF_VARS_4M.fd
   firmware/x86_64/OVMF_CODE_4M.secboot.fd firmware/x86_64/OVMF_VARS_4M.ms.fd
+  firmware/x86_64/OVMF_VARS_4M.ms.debian.fd firmware/x86_64/SECUREBOOT-BUILDINFO.json
   firmware/x86_64/VERSION
   firmware/x86_64/BUILDINFO
   firmware/x86_64/features.json

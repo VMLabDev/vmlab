@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Fetch Debian's UEFI variable stores and AAVMF (PRD §5.2) into
+# Fetch Debian's UEFI variable stores and AAVMF, then refresh the pristine
+# x86_64 Microsoft template from pinned official inputs (PRD §5.2), into
 # guest/dist/firmware/<arch>/, beside the micro-VM asset, so a host needs no
 # OVMF package and every host boots the same bytes. src/qemu/firmware.rs looks
 # it up under <guest asset dir>/firmware/<arch>/ before the host's own.
 #
 #   x86_64   Debian `ovmf-generic` VARS only:
 #              OVMF_VARS_4M.fd         plain UEFI / setup mode
-#              OVMF_VARS_4M.ms.fd      Microsoft + distro keys enrolled
+#              OVMF_VARS_4M.ms.debian.fd  original Microsoft + distro keys
+#            build-secureboot.sh supplies OVMF_VARS_4M.ms.fd with current dbx.
 #            build-ovmf.sh supplies the two branded CODE images.
 #   aarch64  Debian `qemu-efi-aarch64`:
 #              AAVMF_CODE.fd            + AAVMF_VARS.fd        plain UEFI
@@ -47,7 +49,7 @@ files_for() {
   case "$1" in
     x86_64)
       echo "OVMF_VARS_4M.fd|usr/share/OVMF/OVMF_VARS_4M.fd"
-      echo "OVMF_VARS_4M.ms.fd|usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+      echo "OVMF_VARS_4M.ms.debian.fd|usr/share/OVMF/OVMF_VARS_4M.ms.fd"
       echo "COPYRIGHT|usr/share/doc/ovmf-generic/copyright"
       ;;
     aarch64)
@@ -154,6 +156,9 @@ main() {
   for arch in "${arches[@]}"; do
     files_for "$arch" >/dev/null
     fetch_arch "$arch"
+    if [[ "$arch" == x86_64 ]]; then
+      bash "$SCRIPT_DIR/build-secureboot.sh"
+    fi
   done
   write_manifest
 }

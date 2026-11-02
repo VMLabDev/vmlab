@@ -1,7 +1,9 @@
 # Add lab signers alongside Microsoft's keys
 
-The default VARS remains Debian's Microsoft-enrolled template. Enrollment is
-optional and offline. It needs only public X.509 certificates; keep signing
+The default x86_64 VARS starts with Debian's Microsoft-enrolled template and
+adds the pinned current Microsoft x64 dbx. Both 2011 and 2023 certificate sets
+remain trusted. Additional lab enrollment is optional and offline. It needs
+only public X.509 certificates; keep signing
 private keys outside this repository and its firmware bundle. No production
 vmlab signing certificate is included until the owner supplies that identity.
 
@@ -63,3 +65,12 @@ from signature checking. A lab needing signed option ROM enforcement must
 also change that policy and arrange ROM signing, or use native edk2 networking.
 
 Tool source and behavior: https://gitlab.com/kraxel/virt-firmware
+
+## Microsoft certificate transition and existing VMs
+
+See `secureboot/README.md` for the exact Debian inventory, official Microsoft
+URLs and hashes, reproducible default build, old-template selection and the
+existing-VM servicing procedure. Fetching or installing firmware does not
+change an existing VM's per-VM VARS. The Microsoft build mode refuses any
+input other than the pinned pristine Debian template; it cannot refresh a
+guest store or create authenticated runtime updates.

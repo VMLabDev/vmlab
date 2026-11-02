@@ -159,3 +159,43 @@ included. Lab trust is opt-in via public certificates and the existing custom
 VARS path, which both hypervisor adapters already support. No FW6 hypervisor
 change is required. OVMF's existing option-ROM policy permits unsigned PCI ROMs;
 payload signature enforcement is demonstrated separately above.
+
+## Microsoft 2023 trust-store follow-up
+
+The exact Debian inventory is committed as
+`guest/secureboot/debian-inventory.json`: one Debian PK, three KEK certificates
+including Microsoft's 2011 and 2023 KEKs, all five requested db certificates,
+and 443 SHA256 dbx image hashes. Every requested 2023 CA was already present.
+Microsoft's latest published v1.7.1 compatible x64 dbx adds two hashes and
+removes none, producing 445 entries without revoking either 2011 CA.
+
+The FW6 Microsoft mode verifies all official certificate fingerprints and
+appends compatible revocations to the pinned pristine Debian input. Host and
+Ubuntu 24.04 container runs produce byte-identical VARS and
+SECUREBOOT-BUILDINFO.json. The original remains selectable as
+OVMF_VARS_4M.ms.debian.fd. Both files remain 540,672 bytes. The new default
+SHA256 is dd4e1c140f74bbc0ef40caa6b7965be04a198a92733a8808d0080a53f388b32d.
+CODE images are unchanged; this follow-up does not rebuild them.
+
+QEMU boots a Windows 11 clone with the new default store and copied TPM state;
+Confirm-SecureBootUEFI returns True. Ubuntu also boots with SecureBoot=1.
+An additional Linux run sets BootNext to the explicit Ubuntu shimx64.efi entry,
+restarts, confirms that entry as BootCurrent, and reaches the guest agent with
+SecureBoot=1. Raw PK/KEK/db/dbx bytes are read inside both guest families,
+parsed on the host and compared against the expected entries. Both inventories
+contain one PK, three KEK certificates, five db certificates and 445 dbx hashes.
+All expected 2011 and 2023 certificate fingerprints match.
+
+Evidence is under `.scratch/boot-logo/linux-qemu-ms2023/`,
+`windows-qemu-ms2023/` and `linux-qemu-ms2023-shim/`: guest-inventory.json,
+guest-variables-base64.json, guest-proof.txt, secure-boot-proof.txt on Linux,
+result.json and captures. The source disk modification times and VARS hashes
+remain unchanged. Test VMs are stopped and their isolated runtime directories
+removed. Installed firmware and owner lab VMs are untouched.
+
+Eleven focused enrollment tests cover deterministic generation and
+preservation, refusal of modified stores, corrupt inputs and certificate-level
+dbx revocations, plus the existing FW6 cases. Shell syntax, ShellCheck, Python
+lint/format and manual validation/rendering pass. No authenticated key update
+to an existing VM was attempted: that needs the appropriate PK/KEK-signed
+payload and guest servicing policy, not offline replacement of VARS.

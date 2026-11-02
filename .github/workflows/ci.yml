@@ -236,7 +236,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@just
       - name: Install host packages
-        run: ./scripts/guest-toolchains.sh apt
+        run: |
+          ./scripts/guest-toolchains.sh apt uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install Rust toolchains
         run: ./scripts/guest-toolchains.sh rust
       # The msvcrt CRT is a ~5 minute build from source; key it on the script

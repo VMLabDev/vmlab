@@ -4,7 +4,8 @@
 artefacts need: stable Rust with the four musl targets and
 `x86_64-apple-darwin`, the pinned nightly with `rust-src`, mingw-w64 and the
 msvcrt CRT, OpenWatcom v2, `gcc-multilib`, zig with `cargo-zigbuild` and
-`rcodesign` for the macOS agent, `bpf-linker`, and `just`. It also holds what
+`rcodesign` for the macOS agent, `bpf-linker`, `just`, and the pinned `uv` runner
+for the reproducible Secure Boot VARS build. It also holds what
 `just ci::check` needs: rustfmt, clippy, the `x86_64-pc-windows-gnu` target,
 and the QEMU and helper packages
 the tests probe for. It holds none of the checkout. The toolchains come from

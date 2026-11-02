@@ -1,6 +1,6 @@
 //! Locate UEFI firmware (OVMF/AAVMF/RiscVVirt) for a VM.
 //!
-//! vmlab ships branded x86_64 OVMF CODE with Debian's VARS, and Debian's
+//! vmlab ships branded x86_64 OVMF CODE with Debian-derived VARS, and Debian's
 //! AAVMF under `firmware/<arch>/` (`guest/build-asset.sh` builds or fetches
 //! them from pinned sources), so a host needs no OVMF package and every host boots the same
 //! bytes. The search, highest priority first (PRD §5.2):
@@ -178,8 +178,9 @@ impl Pairing {
 /// has no such build: riscv64 has no secure-boot variant.
 pub fn bundled_names(arch: &str, pairing: Pairing) -> Option<(&'static str, &'static str)> {
     Some(match (arch, pairing) {
-        // Debian `ovmf`: the 4 MiB builds; `.ms` carries Microsoft's keys
-        // (and the distro's) enrolled, which Windows and shim boot under.
+        // The 4 MiB builds; `.ms` retains Debian's PK and both Microsoft key
+        // generations, with the pinned current x64 dbx. The pristine Debian
+        // store is selectable through secure_boot_vars.
         ("x86_64", Pairing::Plain) => ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
         ("x86_64", Pairing::Enrolled) => ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.ms.fd"),
         ("x86_64", Pairing::Setup) => ("OVMF_CODE_4M.secboot.fd", "OVMF_VARS_4M.fd"),

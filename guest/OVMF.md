@@ -59,8 +59,13 @@ Each CODE image is 3,653,632 bytes. The VARS region is 540,672 bytes, making
 4,194,304 bytes together. The flash starts at `0xffc00000`; CODE starts at
 `0xffc84000`. No flash-layout PCD is changed. The build compares its generated
 blank VARS byte for byte with the pinned Debian template and refuses a mismatch.
-It discards the generated store and ships Debian's blank and Microsoft-enrolled
-templates unchanged. Existing per-VM VARS retain their keys and boot entries.
+It discards the generated store and ships Debian's blank template unchanged.
+The default Microsoft-enrolled template preserves Debian's PK, KEK and db,
+including both certificate generations, and adds the pinned Microsoft x64 dbx
+revocations. The original remains `OVMF_VARS_4M.ms.debian.fd`. Both stores keep
+the same layout. `SECUREBOOT-BUILDINFO.json` records the default template's
+inputs, output hash, complete inventory and Microsoft license. See
+`secureboot/README.md`. Existing per-VM VARS retain their keys and boot entries.
 
 AAVMF remains Debian's pinned build. The owner deferred ARM branding and speed
 work (FW7) until phase 3 resumes; this branch does not build ARM firmware.

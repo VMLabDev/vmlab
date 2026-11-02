@@ -1,7 +1,12 @@
 """Exercise offline enrollment against the shipped Microsoft VARS template."""
 
 import datetime
+import hashlib
 import importlib.util
+import io
+import json
+import shutil
+import tarfile
 import tempfile
 import unittest
 import uuid
@@ -111,6 +116,107 @@ class EnrollmentTests(unittest.TestCase):
                 [self.pem],
                 self.root / "vars.fd",
             )
+
+    def test_microsoft_template_rebuilds_reproducibly_and_preserves_entries(self):
+        template = GUEST / "dist/firmware/x86_64/OVMF_VARS_4M.ms.debian.fd"
+        manifest = GUEST / "secureboot/microsoft-2023.json"
+        original = template.read_bytes()
+        inventory = json.loads((GUEST / "secureboot/debian-inventory.json").read_text())
+        self.assertEqual(ENROLL.inspect_store(template), inventory["variables"])
+        first, second = self.root / "first.fd", self.root / "second.fd"
+        report = ENROLL.enroll(template, [], first, microsoft_manifest=manifest)
+        ENROLL.enroll(template, [], second, microsoft_manifest=manifest)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(template.read_bytes(), original)
+        before = ENROLL.Edk2VarStore(str(template)).get_varlist()
+        after = ENROLL.Edk2VarStore(str(first)).get_varlist()
+        self.assertEqual(ENROLL.snapshot(before["PK"]), ENROLL.snapshot(after["PK"]))
+        self.assertEqual(before.keys(), after.keys())
+        for name in ("KEK", "db", "dbx"):
+            self.assertLessEqual(
+                ENROLL.signature_entries(before[name]),
+                ENROLL.signature_entries(after[name]),
+            )
+            self.assertEqual(
+                ENROLL.snapshot(before[name])[1:], ENROLL.snapshot(after[name])[1:]
+            )
+        for entry in json.loads(manifest.read_text())["certificates"]:
+            fingerprints = {
+                item["sha256"]
+                for group in report["variables"][entry["variable"]]["lists"]
+                for item in group["entries"]
+            }
+            self.assertIn(entry["sha256"], fingerprints)
+        self.assertEqual(sum(len(group) for group in after["dbx"].sigdb), 445)
+
+    def test_microsoft_mode_refuses_a_modified_guest_store(self):
+        modified = self.root / "guest.fd"
+        ENROLL.enroll(self.template, [self.pem], modified)
+        output = self.root / "output.fd"
+        with self.assertRaisesRegex(ValueError, "pristine Debian"):
+            ENROLL.enroll(
+                modified,
+                [],
+                output,
+                microsoft_manifest=GUEST / "secureboot/microsoft-2023.json",
+            )
+        self.assertFalse(output.exists())
+
+    def test_a_corrupt_pinned_download_is_rejected_without_output(self):
+        manifest = json.loads((GUEST / "secureboot/microsoft-2023.json").read_text())
+        cache = self.root / "cache"
+        cache.mkdir()
+        artifact = manifest["license"]
+        (cache / artifact["sha256"]).write_bytes(b"corrupt cached download")
+        path = self.root / "manifest.json"
+        path.write_text(json.dumps(manifest))
+        output = self.root / "vars.fd"
+        with self.assertRaisesRegex(ValueError, "digest or size mismatch"):
+            ENROLL.enroll(
+                GUEST / "dist/firmware/x86_64/OVMF_VARS_4M.ms.debian.fd",
+                [],
+                output,
+                microsoft_manifest=path,
+                cache=cache,
+            )
+        self.assertFalse(output.exists())
+
+    def test_certificate_level_dbx_revocations_are_not_a_compatible_default(self):
+        manifest = json.loads((GUEST / "secureboot/microsoft-2023.json").read_text())
+        cache = self.root / "cache"
+        cache.mkdir()
+        license_hash = manifest["license"]["sha256"]
+        shutil.copyfile(
+            GUEST / ".cache/secureboot" / license_hash, cache / license_hash
+        )
+        manifest["certificates"] = []
+        variables = ENROLL.Edk2VarStore(str(self.template)).get_varlist()
+        data = variables["PK"].data
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w:gz") as output:
+            info = tarfile.TarInfo("dbx.bin")
+            info.size = len(data)
+            output.addfile(info, io.BytesIO(data))
+        digest = hashlib.sha256(archive.getvalue()).hexdigest()
+        (cache / digest).write_bytes(archive.getvalue())
+        manifest["dbx"].update(
+            sha256=digest,
+            member="dbx.bin",
+            member_sha256=hashlib.sha256(data).hexdigest(),
+            entries=1,
+        )
+        path = self.root / "manifest.json"
+        path.write_text(json.dumps(manifest))
+        output = self.root / "vars.fd"
+        with self.assertRaisesRegex(ValueError, "only SHA256 image revocations"):
+            ENROLL.enroll(
+                GUEST / "dist/firmware/x86_64/OVMF_VARS_4M.ms.debian.fd",
+                [],
+                output,
+                microsoft_manifest=path,
+                cache=cache,
+            )
+        self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

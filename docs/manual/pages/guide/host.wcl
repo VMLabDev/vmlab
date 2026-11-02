@@ -202,7 +202,10 @@ DOC
   p <<'DOC'
 vmlab ships its own UEFI firmware under `firmware/<arch>/`. On x86_64,
 the CODE images are built from pinned edk2 sources with the vmlab wordmark.
-The VARS templates remain Debian's, including its Microsoft-enrolled store.
+The blank VARS remains Debian's. The Microsoft-enrolled x86_64 store retains
+Debian's PK and both Microsoft certificate generations, with the pinned current
+x64 dbx. The original remains selectable as `OVMF_VARS_4M.ms.debian.fd` through
+`secure_boot_vars`. `SECUREBOOT-BUILDINFO.json` lists every input and output hash.
 AArch64 uses Debian's pinned AAVMF builds without logo changes:
 DOC
 
@@ -311,8 +314,10 @@ Setup mode is never chosen for you: without `secure_boot_keys = "setup"`, a
 host that has a secure-boot CODE but no enrolled store is still refused.
 Neither setting means anything without secure boot, so validation rejects them
 where `secure_boot` resolves off or the firmware is SeaBIOS. The store is
-copied at the VM's first start only; to change the key store of a VM that has
-already started, delete its `OVMF_VARS.fd`, losing its boot entries. A
+copied at the VM's first start only. Do not delete or replace an existing VM's
+`OVMF_VARS.fd` to update certificates; that loses boot entries, custom keys and
+revocations and can trigger BitLocker recovery. Use authenticated guest-side
+servicing. A
 template built with either setting records it, and one built with
 `secure_boot_vars` stores the file beside its disk, so every clone starts from
 the same keys unless it names its own. `firmware_dir` is unchanged by all of
@@ -331,6 +336,28 @@ Keep signing private keys outside the checkout and firmware bundle. No
 production vmlab certificate is supplied. Existing VMs keep their own stores;
 this offline tool does not update them. See `guest/SECUREBOOT.md` for the
 source-checkout workflow and signature-policy limits.
+DOC
+
+  h3 "Update existing Secure Boot certificates"
+
+  p <<'DOC'
+Installing new firmware assets does not replace existing per-VM VARS. On
+Windows, use Windows Update and Microsoft's supported Secure Boot servicing
+procedure to add the 2023 db certificates before deploying a newly signed boot
+manager. Check `Confirm-SecureBootUEFI` and `Get-SecureBootUEFI -Name db` and
+`-Name KEK`; Secure Boot being enabled alone does not prove the new keys exist.
+The KEK transition needs an authenticated update signed by the platform's PK.
+The bundled store uses Debian's PK; vmlab has no private PK and cannot sign
+that update. On Linux, use distribution-supported shim/grub and fwupd updates.
+Keep recovery media and BitLocker recovery material available before servicing.
+
+There is no vmlab-side refresh of existing stores. The offline Microsoft build
+mode only accepts the pristine pinned Debian template. Certificate expiry alone
+does not stop an already trusted, unrevoked boot chain from starting. A
+2011-only db cannot validate a payload signed only by a 2023 CA; future boot-chain
+security updates may also be unavailable. The new default retains both sets
+and uses compatible image-hash dbx revocations, without revoking either 2011 CA.
+See `guest/secureboot/README.md` for exact entries, pins and servicing sources.
 DOC
 
   h2 "Directories"
