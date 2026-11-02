@@ -77,6 +77,7 @@ RUN ./scripts/guest-toolchains.sh msvcrt
 RUN mkdir -p /var/cache/vmlab-build/cargo /home/build \
  && chmod 1777 /var/cache/vmlab-build/cargo /home/build
 ENV HOME=/home/build \
+    VMLAB_BUILD_ENV=1 \
     CARGO_HOME=/var/cache/vmlab-build/cargo
 WORKDIR /
 CMD ["bash"]

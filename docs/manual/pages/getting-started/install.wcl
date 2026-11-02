@@ -257,7 +257,10 @@ SRC
     It runs without root and needs `curl`, `tar`, `gzip`, `cpio`,
     `sha256sum`, `cargo`, `rustup` and `git` on the host, plus the
     `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` Rust targets
-    installed with `rustup target add`. `guest/build-agent.sh` cross-compiles
+    installed with `rustup target add`. Firmware fetching and the OVMF,
+    iPXE, and SeaBIOS builds run through `build/run.sh` in the `vmlab-build`
+    container. Your user needs access to Docker. The image is built first
+    if missing; an existing image is reused. `guest/build-agent.sh` cross-compiles
     the agent for Linux x86_64, aarch64 and riscv64 and for Windows x86_64
     and x86. The Windows targets need `x86_64-w64-mingw32-gcc` and
     `i686-w64-mingw32-gcc` from mingw-w64 and are skipped with a warning

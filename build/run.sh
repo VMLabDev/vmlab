@@ -35,6 +35,10 @@ fi
   exit 2
 }
 
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  DOCKER_BUILDKIT=1 docker build -f "$ROOT/build/Dockerfile" -t "$IMAGE" "$ROOT"
+fi
+
 # One set of target volumes per checkout: two worktrees must never share a
 # target dir, since cargo judges freshness by mtime.
 key="$(printf '%s' "$ROOT" | sha256sum | cut -c1-12)"
@@ -66,7 +70,7 @@ if [[ -n "$common" && "$common" != "$ROOT"/* ]]; then
   mounts+=(-v "$common:$common")
 fi
 
-env_args=(-e TERM="${TERM:-xterm}" -e VMLAB_BUILD_IDS="$(id -u):$(id -g)" -e VMLAB_BUILD_OWNED="${#owned[@]}")
+env_args=(-e TERM="${TERM:-xterm}" -e VMLAB_BUILD_ENV=1 -e VMLAB_BUILD_IDS="$(id -u):$(id -g)" -e VMLAB_BUILD_OWNED="${#owned[@]}")
 [[ -z "${SOURCE_DATE_EPOCH:-}" ]] || env_args+=(-e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH")
 
 # Root for the chown alone; everything after setpriv runs as the host uid:gid.
