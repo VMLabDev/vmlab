@@ -529,7 +529,12 @@ mod tests {
 
     impl Scripted {
         async fn say(&self, msg: AgentMsg) {
-            let _ = self.tx.lock().await.write_all(&encode_ctrl(&msg)).await;
+            let _ = self
+                .tx
+                .lock()
+                .await
+                .write_all(&encode_ctrl(&msg).unwrap())
+                .await;
         }
 
         async fn data(&self, id: u32, bytes: &[u8]) {
@@ -635,7 +640,11 @@ mod tests {
                                 token,
                                 instance: None,
                             };
-                            let _ = tx.lock().await.write_all(&encode_ctrl(&hello)).await;
+                            let _ = tx
+                                .lock()
+                                .await
+                                .write_all(&encode_ctrl(&hello).unwrap())
+                                .await;
                         }
                         HostMsg::WindowAdjust { .. } => {}
                         msg => {

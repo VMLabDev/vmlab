@@ -264,7 +264,9 @@ fn fileops_writes_at_offsets_applies_the_mode_and_digests_what_landed() {
 
     // Offset-addressed: the chunks go out back to back without waiting, and
     // the file is assembled from where each one says it belongs.
-    let chunks: Vec<&[u8]> = payload.chunks(64 * 1024).collect();
+    let chunks: Vec<&[u8]> = payload
+        .chunks(vmlab_agent_proto::fileops::MAX_DATA)
+        .collect();
     for (i, chunk) in chunks.iter().enumerate() {
         ask_with(
             &mux,
@@ -272,7 +274,7 @@ fn fileops_writes_at_offsets_applies_the_mode_and_digests_what_landed() {
             100 + i as u64,
             Op::Write {
                 handle,
-                offset: (i * 64 * 1024) as u64,
+                offset: (i * vmlab_agent_proto::fileops::MAX_DATA) as u64,
             },
             chunk,
         );

@@ -332,10 +332,9 @@ impl AgentHandle {
     }
 
     async fn send_msg(&self, msg: &HostMsg) -> Result<()> {
+        let frame = encode_ctrl(msg)?;
         let mut w = self.inner.writer.lock().await;
-        w.write_all(&encode_ctrl(msg))
-            .await
-            .context("agent write")?;
+        w.write_all(&frame).await.context("agent write")?;
         w.flush().await.context("agent flush")?;
         Ok(())
     }
@@ -2328,7 +2327,8 @@ async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
             entry.credit.close();
         }
         let mut w = inner.writer.lock().await;
-        let _ = w.write_all(&encode_ctrl(&HostMsg::Close { id })).await;
+        let frame = encode_ctrl(&HostMsg::Close { id }).expect("close fits one control frame");
+        let _ = w.write_all(&frame).await;
         return;
     }
     if terminal {
@@ -2512,7 +2512,7 @@ mod tests {
             let send = |msg: AgentMsg| {
                 let tx = tx.clone();
                 async move {
-                    let _ = tx.lock().await.write_all(&encode_ctrl(&msg)).await;
+                    let _ = tx.lock().await.write_all(&encode_ctrl(&msg).unwrap()).await;
                 }
             };
             let send_data = |id: u32, payload: Vec<u8>| {
@@ -3228,7 +3228,8 @@ mod tests {
                                 features: vec![],
                                 token,
                                 instance: None,
-                            });
+                            })
+                            .unwrap();
                             let _ = stream.write_all(&reply).await;
                         }
                     }
@@ -3249,6 +3250,30 @@ mod tests {
         let third = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
         assert_eq!(third.info().agent_version, "seq-mock");
         drop(keep_alive);
+    }
+
+    #[tokio::test]
+    async fn oversized_control_requests_leave_the_connection_usable() {
+        let (_dir, path) = mock_agent_with(
+            true,
+            vec!["clipboard".into(), "clipboard_reply".into(), "exec".into()],
+        )
+        .await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let error = agent
+            .set_clipboard("x".repeat(300_000), HANDSHAKE)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum is 65536 bytes"));
+        let error = agent
+            .open_exec(vec!["x".repeat(300_000)], vec![], None, None)
+            .await
+            .err()
+            .expect("oversized open must fail");
+        assert!(error.to_string().contains("maximum is 65536 bytes"));
+        assert!(agent.inner.sessions.lock().await.is_empty());
+        assert!(agent.inner.open_waiters.lock().unwrap().is_empty());
+        assert!(agent.ping(HANDSHAKE).await);
     }
 
     #[tokio::test]

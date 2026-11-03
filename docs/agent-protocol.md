@@ -52,6 +52,19 @@ uses kind 2. Rust tolerates host kind 2 as stdin, but a host must send kind 1.
 An empty data frame is valid and is not EOF. Receivers accept arbitrarily split
 headers, split payloads, and multiple frames in a read.
 
+The 65536-byte limit applies to the complete serialized JSON payload of a
+control message, including field names and JSON escaping. Control messages
+cannot span frames. The Rust host rejects an oversized request before writing
+any bytes to the port. The Rust agent answers an oversized clipboard reply with
+`clipboard_failed`; other oversized replies produce `error`, or `time_set_failed`
+for a failed clock update. The connection remains usable. Clipboard text of a
+few hundred KiB exceeds this protocol limit on both QEMU and vmlab-hv.
+
+Exec stdin, stdout, and stderr are byte streams and can exceed 65536 bytes.
+Senders split these streams into credit-controlled data frames. Fileops records
+can contain up to 131072 data bytes plus metadata and therefore also span outer
+frames. The fileops record decoder reassembles those bytes before dispatch.
+
 The Rust and C decoders scan for magic after noise. If a candidate header has an
 unknown kind or payload length over 65536, they discard one byte and resume the
 scan. With no magic, they retain at most three trailing bytes for split magic.
