@@ -460,13 +460,19 @@ mod tests {
             binary: binary.clone(),
             release_chord: Some("ctrl_r+alt_r".into()),
         };
-        assert!(
-            viewer
-                .command("fake-lab", "fake-vm")
-                .status()
-                .unwrap()
-                .success()
-        );
+        // A fork in a parallel test can briefly inherit the write handle
+        // `fs::write` held, and exec then fails with ETXTBSY until that child
+        // execs or exits; retry only that error.
+        let status = (0..50)
+            .find_map(|_| match viewer.command("fake-lab", "fake-vm").status() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+                other => Some(other.unwrap()),
+            })
+            .expect("fake viewer stayed busy");
+        assert!(status.success());
         let args = std::fs::read_to_string(binary.with_file_name("fake viewer.args")).unwrap();
         assert_eq!(
             args.lines().collect::<Vec<_>>(),
