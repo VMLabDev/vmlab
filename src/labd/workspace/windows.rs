@@ -260,6 +260,7 @@ mod tests {
             password: Some("vmlab123!".into()),
             elevated,
             default: default.then_some(true),
+            origin: Default::default(),
             span: NO_SPAN,
         }
     }

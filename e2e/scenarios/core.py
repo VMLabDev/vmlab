@@ -19,12 +19,27 @@ OWNED = [
     "lab.up.template-changed", "lab.destroy",
     "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory",
     "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy",
-    "vm.hw.qemu_args", "vm.hw.nested", "vm.scratch", "vm.media.iso", "vm.media.floppy",
+    "vm.hw.qemu_args", "vm.hw.nested", "vm.hw.tsc", "vm.scratch", "vm.media.iso", "vm.media.floppy",
     "share.unmountable",
 ]
 
 
 # -- local helpers -------------------------------------------------------------
+
+def pinned_tsc(h, lab):
+    pin = int((lab / ".vmlab/vms/vm01/tsc-hz").read_text().strip())
+    argv = qemu_argv("vm01")
+    if argv:
+        applied = f"tsc-frequency={pin}" in cpu_model(argv) and "+invtsc" in cpu_model(argv)
+    else:
+        run = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        desc = json.loads((run / "vmlab/labs" / LAB / "vms/vm01/machine.json").read_text())
+        applied = desc.get("invtsc") is True and desc.get("tsc_khz", 0) * 1000 == pin
+    dmesg = sh(h, lab, "vm01", "dmesg").out
+    match = re.search(r"tsc: Detected ([0-9.]+) MHz", dmesg)
+    measured = float(match[1]) * 1_000_000 if match else 0
+    h.ok("vm.hw.tsc", applied and abs(measured - pin) < 2000,
+         f"pin={pin}Hz, guest={measured}Hz, launch matches={applied}")
 
 
 def qemu_argv(vm: str) -> list[str]:
@@ -463,6 +478,7 @@ def _run(h):
         h.ok("vm.ip", ip == "10.80.0.10" and ip_nic.startswith("10.80.0."), f"vm01 {ip!r}, vm02 --nic 0 {ip_nic!r}")
 
         # Hardware, from inside vm01.
+        pinned_tsc(h, lab)
         p = kv(sh(h, lab, "vm01", PROBE_VM01).out)
         memkb = int(p.get("memkb", "0") or 0)
         h.ok(

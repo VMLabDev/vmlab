@@ -27,7 +27,7 @@ class ScenarioScopeTests(unittest.TestCase):
         self.addCleanup(h.log.close)
         return h
 
-    def test_all_33_delivered_core_and_admin_features_follow_vmlab(self):
+    def test_all_34_delivered_core_and_admin_features_follow_vmlab(self):
         h = self.new_harness("vmlab")
         delivered = set()
         for name in ("core", "admin"):
@@ -41,7 +41,8 @@ class ScenarioScopeTests(unittest.TestCase):
                 delivered.add(feature)
                 h.ok(feature, True, "scope regression")
                 self.assertEqual(h.results[feature][0], "pass", feature)
-        self.assertEqual(len(delivered), 33)
+        self.assertIn("vm.hw.tsc", delivered)
+        self.assertEqual(len(delivered), 34)
 
     def test_unsupported_features_keep_their_reasons(self):
         h = self.new_harness("vmlab")

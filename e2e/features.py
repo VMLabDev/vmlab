@@ -68,6 +68,7 @@ FEATURES: dict[str, str] = {
     "vm.hw.secure_boot": "`secure_boot = true`",
     "vm.hw.qemu_args": "`qemu_args` passthrough",
     "vm.hw.nested": "`nested = true`",
+    "vm.hw.tsc": "`tsc = \"host\"` pins an invariant TSC through the selected hypervisor",
     "vm.hw.gpu": "`gpu {}` passthrough / virgl",
     "vm.hw.audio": "`audio = true` gives a vmlab-hv VM an HDA sound card on its own host node; QEMU refuses it by name",
     # -- host USB passthrough (§5.2.1) ---------------------------------------
@@ -290,7 +291,7 @@ _GROUPS: dict[str, list[str]] = {
     ],
     "2d": ["vm.hw.gpu"],
     "2e": ["share.virtiofs", "share.readonly", "share.unmountable", "vm.hw.audio"],
-    "2f": ["usb.controller", "usb.refusals", "usb.attach"],
+    "2f": ["usb.controller", "usb.refusals", "usb.attach", "vm.hw.tsc"],
     # TCG emulation.
     "3": ["arch.emulated"],
     # The legacy PC: floppy controller, SMB1 guests.

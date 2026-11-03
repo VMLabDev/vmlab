@@ -15,6 +15,7 @@ use miette::{Diagnostic, NamedSource};
 use thiserror::Error;
 use wcl_lang::{Document, Environment, Registry, disk_loader};
 
+pub(crate) use extract::extract_login;
 pub use model::{LabFile, TemplateFile};
 pub use validate::{ValidationContext, validate};
 

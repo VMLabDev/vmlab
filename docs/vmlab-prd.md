@@ -46,7 +46,7 @@ vmlab runs machines on QEMU/KVM, driven directly over QMP — no libvirt — and
 | **Ready** | A VM is *ready* when its vmlab guest agent answers its handshake. A lab is *up* when all VMs are ready and all provision scripts have completed. |
 | **Dev machine** | A machine marked `@dev`: a machine with a synced workspace (§19). VM or container, Windows or Linux — one contract for both. |
 | **Workspace** | A dev machine's source tree: a guest-local working copy of a canonical host directory, kept in step by vmlab's syncer (§19.6). Not a `share {}`. |
-| **Login** | A labelled identity declared on a machine — an account, its secret, and whether it is elevated. What a surface runs *as* (§19.2). |
+| **Login** | A labelled identity declared on a machine or inherited from its template: an account, its secret, and whether it is elevated. Inherited logins are never the default identity (§19.2). |
 | **Instance** | A lab file run under the effective name `<declared>-<instance>` rather than its declared name, so one lab file can run from two directories at once (§3.2). |
 
 ---
@@ -230,7 +230,7 @@ Each VM block can express:
 - `hyperv = true` — Hyper-V enlightenments for a Windows guest. Under KVM the `-cpu` string gains `hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,hv-ipi`, so Windows reads its clock from the Hyper-V reference TSC page instead of an emulated timer (about 5.7 µs a read on native KVM and 51 µs nested under WSL2, against about 20 ns) and takes fewer exits for interrupts, timers, TLB flushes and IPIs. Set on a profile, a template or the VM and inherited like the hardware below; the shipped `windows-11`, `windows-10`, `windows-server` and `windows-legacy` profiles set it, `windows-xp` and `windows-9x` do not, and `hyperv = false` on a VM turns it off. It applies under KVM only and never with a `cpu_model`: under TCG or a named model it is not applied, and `up` says so when the VM itself set it. Where the host's KVM virtualises the APIC (`kvm_intel` `enable_apicv` or `kvm_amd` `avic` on), the string also gains `hv-avic` and the argv `-global kvm-pit.lost_tick_policy=discard`: SynIC's AutoEOI otherwise turns APICv/AVIC off for the VM, and PIT tick re-injection turns AVIC off, so every end-of-interrupt is an exit — about a third of an idle Windows 11 24H2 or Server 2025 guest's exits, since that guest takes 512 clock interrupts a second on every vCPU. Without APICv/AVIC neither is added, because giving up AutoEOI there costs an exit per interrupt. `+invtsc` is deliberately not among the flags: it makes QEMU refuse migration, and with it online snapshots (§7.3). Template build VMs resolve it like any VM, so builds get it too
 - `apple_smc = true` — the Apple SMC a macOS guest reads its OSK from and refuses to boot without: `-device isa-applesmc,osk=<host.apple_smc_osk>` and `-smbios type=2`, the baseboard table macOS looks for and QEMU emits only when asked. The host must supply the key from its owner's Apple hardware. Set on a profile, a template or the VM and inherited like the hardware below; off when no layer says, and set by the shipped `macos` profile only
 - `input = "ps2" | "usb"` — the keyboard and pointer. `ps2` (the default) is the machine's PS/2 keyboard and a `usb-tablet` on `-usb`'s controller. `usb` is for a guest that reads no PS/2 keyboard (macOS, and OpenCore before it): on `q35`/`pc` a `qemu-xhci` with the id `xhci` carries a `usb-kbd` and a `usb-tablet`, and `-usb` is not added; on `virt` the `usb-kbd` joins the tablet on the xHCI it already has. Neither device is bound to the display: QMP `send-key` names no console, and QEMU hands console-less input to the newest unbound keyboard — the USB one, created after the PS/2 one — so scripted keys reach the keyboard the guest reads, and `input_transport = "qmp"` works on such a guest. Set on a profile, a template or the VM and inherited like the hardware below
-- `tsc = "host"` — an invariant TSC pinned at the host's frequency: under KVM the `-cpu` string gains `,+invtsc,tsc-frequency=<Hz>`. macOS needs it, because QEMU fills the VMware CPUID leaf XNU reads its TSC frequency from only for a known, stable TSC. A bare `+invtsc` makes QEMU refuse migration, and with it online snapshots (§7.3); an explicit frequency lifts that, so the two only ever go together. The frequency is read from KVM at the VM's **first** KVM start — a paused emulator with no devices, the same QEMU binary the VM runs, asked over QMP for its vCPU's `tsc-frequency` and told to quit — and pinned in `.vmlab/vms/<vm>/tsc-hz`; every later start reuses the pin. Reading it afresh would break restores: the host kernel recalibrates its TSC at every boot, and QEMU refuses to load an online snapshot whose recorded frequency differs from the one the VM started with, while KVM runs a pin within its tolerance of the host's without scaling. Under TCG it is not applied — the frequency comes from KVM — and `up` says so, inherited or not, because a guest that asked for it usually does not boot without it. Set on a profile, a template or the VM and inherited like the hardware below; unset is QEMU's default TSC
+- `tsc = "host"` — an invariant TSC pinned at the host's frequency. Under QEMU with KVM the `-cpu` string gains `,+invtsc,tsc-frequency=<Hz>`. macOS needs it, because QEMU fills the VMware CPUID leaf XNU reads its TSC frequency from only for a known, stable TSC. A bare `+invtsc` makes QEMU refuse migration, and with it online snapshots (§7.3); an explicit frequency lifts that, so the two only ever go together. The frequency is read from KVM at the VM's **first** KVM start and pinned in `.vmlab/vms/<vm>/tsc-hz`; every later start reuses the pin. QEMU probes through a paused emulator with no devices, using the VM's QEMU binary and its vCPU's QMP `tsc-frequency` property. With `hypervisor = "vmlab"`, `vmlab-hv --probe` reads KVM through an unstarted scratch vCPU and reports the frequency and invariant/stable flags; an unavailable, non-invariant or unstable TSC refuses the first pin. The machine description carries `invtsc = true` and `tsc_khz`, applied to every vCPU. Both hypervisors record the guest frequency in online snapshots and refuse a restore at a different guest frequency. A different host must support the original pin; KVM runs a pin within its tolerance of the host's without scaling and otherwise requires scaling support. Reading the frequency afresh would break restores after the host kernel recalibrates its TSC at a reboot. Under TCG it is not applied, and `up` says so, inherited or not, because a guest that asked for it usually does not boot without it. Set on a profile, a template or the VM and inherited like the hardware below; unset is the hypervisor's default TSC
 
   `apple_smc` and `tsc` are x86 only: a VM of another arch that resolves either is refused, naming the layer it came from. Both, with `input`, are recorded in a template's metadata and its OCI config blob (§6.4) beside `cpu_model` and `hyperv`, and a variant may override each (§6.6)
 - `accel = "tcg"` — the accelerator, `kvm` or `tcg`, for guests KVM cannot run reliably (Windows 95 on an AMD host hangs on the Win9x TLB-invalidation bug, whose only KVM workaround — `kvm_amd npt=0` — is host-wide; TCG emulates the TLB). Set on a profile, a template or the VM and inherited like the hardware below. Unset, vmlab picks KVM when it is usable and falls back to TCG with a warning; `tcg` always emulates, even where KVM works, with no warning, and `-cpu` stays `max` unless `cpu_model` names one; `kvm` refuses to start the VM, naming the setting, when KVM is unusable rather than falling back. `tcg` is exclusive with `nested = true`, which needs KVM, so validation refuses the pair, naming the layer the `tcg` came from
@@ -415,6 +415,7 @@ A failed variant build reports which variant failed and stops; the base and ever
 - Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>][#<variant>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store; the `#<variant>` suffix selects one disk of a version that has variants (§6.6). `vmlab validate` rejects archless references.
 - Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle. Surface 3 adds host USB passthrough (§5.2.1): `lab.usb_devices()`, and `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` on the machine handle. Surface 4 adds console recording (§11.1): `record` on the machine handle, and the `Recording` handle it returns with `stop` and `path`. Surface 5 adds OCR options (§10.3): `ocr_opts` and `wait_for_text_opts` on the machine handle.
 - `vmlab template list / rm` manage the store. `list` shows each version's variants beneath it, the default marked and a stale one flagged; `rm <arch>/<name>@<version>` removes the version with all its variants, and `rm …#<variant>` removes that one variant (§6.6).
+- Surface 6 adds template-declared logins (§19.2), recorded in `template.wcl` even when there is no embedded first-boot script. Older metadata schemas reject the new `login` blocks before they can report a surface-version mismatch. Templates declaring logins therefore require a surface-6 host.
 - `vmlab template export` produces a single portable archive (qcow2 + metadata, and every variant's `variants/<variant>/disk.qcow2` with the full `template.wcl`); `vmlab template import` installs one, refusing any variant whose overlay is not the one its block's `sha256` names or whose `base_sha256` is not the archive's base — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).
 
@@ -1252,7 +1253,7 @@ rule.
 **The machine declares who you are, and vmlab logs you on as them.** Identity is
 a property of the machine, not of the command, and is declared with a repeatable
 `login "<label>" { user, password?, elevated?, default? }` block on `vm` and
-`container`. A child block rather than flat fields because the account and its
+`container`, or on a template whose build created the account. A child block rather than flat fields because the account and its
 secret are meaningless split, and because `elevated` needs somewhere to land.
 
 **A surface selects a login by its *label*.** `vmlab shell dev01` runs as the
@@ -1269,6 +1270,19 @@ credential store, no login verb, no wscript credential API, and no second WCL
 dependency** (WCL has no environment or file interpolation, so "declare it but
 do not commit it" was never available). Consistent with §1.2 — vmlab is not a
 security boundary.
+
+**A template may declare the same login blocks.** Its build records them in
+the store entry's `template.wcl`, with plaintext secrets: the template's own
+build already contains them, for example in an unattend file. A clone whose
+machine declares no logins inherits all of its template's logins in declaration
+order. A machine declaring any logins inherits none. There is no merging.
+Inherited logins are marked as coming from the template in machine information.
+
+**An inherited login is never the machine's default identity**, even when it
+is the only login or declares `default = true`. `--user <label>` and
+`as_login(label)` may select it explicitly. Otherwise `exec`, `shell`,
+provisions, and the workspace syncer retain the agent identity. RDP's fallback
+to the first inherited login is the sole exception (§20.2).
 
 **Precedence: CLI flag → wscript → `login {}` → agent identity.** `vmlab shell
 --user admin dev01`; `--user`/`--password` on `exec`/`shell` for an account the
@@ -1424,7 +1438,8 @@ into `systemprofile`.
 > - More than one `login` with `default = true` on a machine is a validation
 >   error, naming both.
 
-A lone `login {}` is the default implicitly, matching `@dev`'s shape.
+A lone machine-declared `login {}` is the default implicitly, matching
+`@dev`'s shape. Template-inherited logins never participate in this rule.
 
 ### 19.3 The SSH facade
 
@@ -2300,9 +2315,12 @@ Enterprise, Education or Server"*.
 
 A shared app runs as a declared login, resolved exactly as for `exec` and
 `shell` (§19.2): `--user`/`--password`, else the machine's default login, else
-the agent identity. RDP cannot log on as the agent identity, so a Windows
-machine with no login and no `--user` is refused with *"RDP needs an account:
-declare a `login {}` on `<machine>` or pass --user/--password"*.
+the agent identity. RDP cannot log on as the agent identity. With no explicit
+`--user`, it first uses the machine's default login, then the template's first
+inherited login. If neither exists, it refuses with *"RDP needs an account:
+declare a `login {}` on `<machine>` or pass --user/--password; the template
+declares no account"*. An explicit `--user SYSTEM` remains a refusal, not a
+request to use the template fallback.
 
 ### 20.3 Session shape
 
@@ -2344,6 +2362,17 @@ connection (`guest/agent-proto/src/app.rs`):
 Waypipe runs with `--compress lz4` on both ends, because a client and server
 that disagree on compression refuse each other.
 
+Protocol diagnostics stay separate from application output. By default,
+FreeRDP's stdout and stderr go to `freerdp.log` in the private session runtime
+directory. A real failure
+prints that path and up to 20 trailing non-backtrace lines, and retains the
+log for inspection. Success, normal disconnect, and user logoff are not
+failures (FreeRDP codes 0, 1, 2, 11, and 12).
+`vmlab app run --verbose` restores protocol diagnostics to the terminal.
+Waypipe's own logs are hidden unless verbose, while the program's output,
+including stderr, remains visible. New agents advertise the log split;
+older agents keep their existing mixed output. `--detach` preserves this choice.
+
 Windows allows one session per account: client editions always, and Server
 while "Restrict each user to a single session" (`fSingleSessionPerUser`) is
 on, which is its default. A second RDP connection as the same account takes the
@@ -2355,7 +2384,8 @@ each `app run` its own session and connection.
 The waypipe and X11 sessions end when the program exits, and `app run` exits
 with its code. Interrupting `app run` closes the session, which kills the guest
 program. The RDP session ends when FreeRDP exits, and `app run` exits with
-FreeRDP's code. Interrupting it disconnects the Windows session rather than
+FreeRDP's code on failure, or zero for a normal disconnect or user logoff.
+Interrupting it disconnects the Windows session rather than
 logging it off, as closing an RDP client does: the program keeps running there,
 and its windows come back with the account's next shared app on that machine.
 vmlab does not log the session off, because on a client edition it can be the
@@ -2617,14 +2647,13 @@ when it is x86_64 under KVM on the q35 machine with SeaBIOS (2a) or OVMF,
 secure boot included (2c), std VGA or a virtio-vga, virtio, SATA or IDE
 disks (both on AHCI), virtio-net NICs, the PS/2 keyboard with the USB tablet,
 a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
-(2d, 2f), virtio-fs shares and a sound card (2e) and `usb = true` (2f) — the
+(2d, 2f), virtio-fs shares and a sound card (2e), `usb = true` (2f), and
+a pinned `tsc` (§5.2) — the
 Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
 macOS guest (its own phase); the i440fx machine, a floppy or
 `agent_transport = "isa-serial"` (4); `accel = "tcg"` (3); another display
-device, NIC model or `cpu_model`; `input = "usb"`; a pinned `tsc`, which waits
-for vmlab-hv's host-facts probe (vmlab reads the host's TSC frequency through
-a paused QEMU today, and vmlab-hv has neither the probe nor a frequency to
-pin); and `qemu_args`, QEMU's own argv, in every phase. A
+device, NIC model or `cpu_model`; `input = "usb"`; and `qemu_args`, QEMU's
+own argv, in every phase. A
 container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
 no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved

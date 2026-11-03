@@ -117,10 +117,28 @@ that login's.
 DOC
 
   p <<'DOC'
-RDP cannot log on as the agent identity, which is SYSTEM. A Windows machine
-with no `login {}` and no `--user`, or with `--user SYSTEM`, is refused with
-`RDP needs an account`. Declare a login with its password, or pass `--user`
-and `--password`.
+RDP cannot log on as the agent identity, which is SYSTEM. With no `--user`,
+it uses the machine's default login, then the first login inherited from the
+template. Inherited logins never change the default identity for `exec`,
+`shell`, provisions, or the workspace syncer. A machine that declares any
+logins inherits none. If neither a default nor an inherited login exists,
+the refusal says `RDP needs an account` and that the template declares no
+account. Declare a login with its password, or pass `--user` and `--password`.
+An explicit `--user SYSTEM` remains a refusal.
+DOC
+
+  h2 "Protocol diagnostics"
+
+  p <<'DOC'
+The program's output, including stderr, stays visible. By default, FreeRDP's
+stdout and stderr go to `freerdp.log` in the private session runtime directory.
+A failed session
+prints the retained log's path and up to 20 trailing lines, excluding
+backtraces. Normal disconnect and user logoff are successful endings and
+print no failure report. Waypipe's own logs are hidden on both ends.
+Add `--verbose` to show protocol diagnostics while troubleshooting.
+Older guest agents still return mixed waypipe and application output;
+repair the agent to get the separate diagnostic channel.
 DOC
 
   h2 "Windows: editions and the console session"
@@ -233,8 +251,9 @@ DOC
   h3 "A Windows VM"
 
   p <<'DOC'
-The machine needs an account with a password for RDP to log on as, so declare
-one:
+The machine needs an account with a password for RDP to log on as. A template
+may supply it. To use a different account and make it the machine's default,
+declare one:
 DOC
 
   code wcl { filename = "vmlab.wcl" source = <<'SRC'
@@ -256,7 +275,8 @@ SRC
   p <<'DOC'
 The provision that creates `dev` must run before the first shared app, as it
 must before `vmlab exec` runs as that login. `app run` returns when FreeRDP
-exits, with FreeRDP's exit code.
+exits. A normal disconnect or user logoff returns zero; failures return
+FreeRDP's exit code.
 DOC
 
   h2 "What shared apps do not do"

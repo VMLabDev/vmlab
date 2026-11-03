@@ -46,6 +46,7 @@ const BACKLOG_LIMIT: usize = 4 * 1024 * 1024;
 pub struct Target {
     pub name: String,
     pub guest_os: GuestOs,
+    pub has_logins: bool,
     /// Where the session's sockets go, beside the machine's terminal sockets.
     pub run_dir: PathBuf,
 }
@@ -151,9 +152,15 @@ pub async fn open(
 
     let logon = logon()?;
     if via == Via::Rdp && logon.is_none() {
+        if target.has_logins {
+            return Err(CommandError::invalid(format!(
+                "RDP needs an account: select a login on `{machine}` with --user <label>, \
+                 or pass --user/--password; no template account was selected"
+            )));
+        }
         return Err(CommandError::invalid(format!(
             "RDP needs an account: declare a `login {{}}` on `{machine}` or pass \
-             --user/--password"
+             --user/--password; the template declares no account"
         )));
     }
 
@@ -529,7 +536,12 @@ mod tests {
 
     impl Scripted {
         async fn say(&self, msg: AgentMsg) {
-            let _ = self.tx.lock().await.write_all(&encode_ctrl(&msg)).await;
+            let _ = self
+                .tx
+                .lock()
+                .await
+                .write_all(&encode_ctrl(&msg).unwrap())
+                .await;
         }
 
         async fn data(&self, id: u32, bytes: &[u8]) {
@@ -635,7 +647,11 @@ mod tests {
                                 token,
                                 instance: None,
                             };
-                            let _ = tx.lock().await.write_all(&encode_ctrl(&hello)).await;
+                            let _ = tx
+                                .lock()
+                                .await
+                                .write_all(&encode_ctrl(&hello).unwrap())
+                                .await;
                         }
                         HostMsg::WindowAdjust { .. } => {}
                         msg => {
@@ -654,10 +670,43 @@ mod tests {
 
     const ALL: &[&str] = &[features::APP_WAYPIPE, features::APP_X11, features::APP_RDP];
 
+    #[tokio::test]
+    async fn waypipe_log_split_is_negotiated_with_the_agent() {
+        for supported in [false, true] {
+            let advertised = if supported {
+                vec![features::APP_WAYPIPE, features::APP_LOG_SPLIT]
+            } else {
+                vec![features::APP_WAYPIPE]
+            };
+            let (_dir, agent, mut script) = scripted(&advertised).await;
+            let opening = agent.open_app(AppMode::Waypipe, vec!["true".into()], vec![], None, None);
+            let accepting = async {
+                let message = script.next_ctrl().await;
+                let wire = serde_json::to_value(&message).unwrap();
+                if supported {
+                    assert_eq!(wire["split_logs"], true);
+                } else {
+                    assert!(
+                        wire.get("split_logs").is_none(),
+                        "old agents get the old open"
+                    );
+                }
+                let HostMsg::OpenApp { id, split_logs, .. } = message else {
+                    panic!("expected open_app");
+                };
+                assert_eq!(split_logs, supported);
+                script.say(AgentMsg::Opened { id }).await;
+            };
+            let (opened, ()) = tokio::join!(opening, accepting);
+            opened.unwrap().close().await;
+        }
+    }
+
     fn target(dir: &Path, os: GuestOs) -> Target {
         Target {
             name: "web".into(),
             guest_os: os,
+            has_logins: false,
             run_dir: dir.join("run"),
         }
     }
@@ -1104,7 +1153,7 @@ mod tests {
                 (
                     InvalidArgument,
                     "RDP needs an account: declare a `login {}` on `web` or pass \
-                     --user/--password",
+                     --user/--password; the template declares no account",
                 ),
             ),
             (
@@ -1140,6 +1189,24 @@ mod tests {
         for ((code, message), (want_code, want)) in cases {
             assert_eq!((code, message.as_str()), (want_code, want));
         }
+    }
+
+    #[tokio::test]
+    async fn no_selected_rdp_account_stays_invalid_when_logins_exist() {
+        let (dir, agent, _script) = scripted(ALL).await;
+        let mut target = target(dir.path(), GuestOs::Windows);
+        target.has_logins = true;
+        let err = open(&target, &agent, request("rdp", &[]), || Ok(None))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CommandError::invalid(
+                "RDP needs an account: select a login on `web` with --user <label>, \
+                 or pass --user/--password; no template account was selected"
+            )
+        );
+        assert!(!err.message.contains("template declares no account"));
     }
 
     /// A login resolution that fails is the reply, unchanged.

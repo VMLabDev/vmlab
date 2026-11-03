@@ -31,6 +31,7 @@ use crate::qemu::Proc;
 pub(crate) mod control;
 pub(crate) mod describe;
 pub(crate) mod display;
+pub(crate) mod tsc;
 
 use control::{HvControl, HvProcess};
 

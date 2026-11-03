@@ -52,6 +52,19 @@ uses kind 2. Rust tolerates host kind 2 as stdin, but a host must send kind 1.
 An empty data frame is valid and is not EOF. Receivers accept arbitrarily split
 headers, split payloads, and multiple frames in a read.
 
+The 65536-byte limit applies to the complete serialized JSON payload of a
+control message, including field names and JSON escaping. Control messages
+cannot span frames. The Rust host rejects an oversized request before writing
+any bytes to the port. The Rust agent answers an oversized clipboard reply with
+`clipboard_failed`; other oversized replies produce `error`, or `time_set_failed`
+for a failed clock update. The connection remains usable. Clipboard text of a
+few hundred KiB exceeds this protocol limit on both QEMU and vmlab-hv.
+
+Exec stdin, stdout, and stderr are byte streams and can exceed 65536 bytes.
+Senders split these streams into credit-controlled data frames. Fileops records
+can contain up to 131072 data bytes plus metadata and therefore also span outer
+frames. The fileops record decoder reassembles those bytes before dispatch.
+
 The Rust and C decoders scan for magic after noise. If a candidate header has an
 unknown kind or payload length over 65536, they discard one byte and resume the
 scan. With no magic, they retain at most three trailing bytes for split magic.
@@ -108,7 +121,7 @@ The conformance runner flags them as untested instead of certifying them.
 
 | Tier | Required current advertisement | Conditional or unavailable |
 |---|---|---|
-| Full Linux | `terminal`, `exec`, `fileops`, `tail`, `metrics`, `watch`, `tree`, `set_time`, `get_time`, `app_waypipe`, `app_x11` | `clipboard` and `clipboard_reply` depend on the startup display-server probe. No `eventlog` or `app_rdp`. |
+| Full Linux | `terminal`, `exec`, `fileops`, `tail`, `metrics`, `watch`, `tree`, `set_time`, `get_time`, `app_waypipe`, `app_x11`, `app_log_split` | `clipboard` and `clipboard_reply` depend on the startup display-server probe. No `eventlog` or `app_rdp`. |
 | Full Windows | `terminal`, `exec`, `fileops`, `tail`, `metrics`, `watch`, `tree`, `set_time`, `get_time`, `clipboard`, `clipboard_reply`, `eventlog`, `app_rdp` | Clipboard can fail while nobody is logged on. RDP can fail for guest edition, policy, logon, or listener readiness. |
 | Full macOS | `terminal`, `exec`, `fileops`, `tail`, `metrics`, `set_time`, `get_time` | Clipboard and reply depend on platform probe. No watch, tree, eventlog, or apps. |
 | Legacy C | `exec`, `set_time` | No terminal, files, watch, metrics, clipboard, tree, get_time, or apps. No logon minting. |
@@ -321,13 +334,21 @@ Sources: `guest/agent/src/metrics.rs:41`, `guest/agent/src/clipboard.rs:27`,
 `open_app` flattens `mode` and, for X11, `cookie` into the open object. App session
 data is `uint32 LE length | UTF-8 JSON`, capped at 1048576 bytes per record.
 `ready` precedes connection announcements. Agent records are `ready`, `pending`,
-and `log`. App `exited` and `failed` records are daemon-to-CLI translations and
-must never come from an agent. The control channel carries agent exit or error.
+`log`, and negotiated `diagnostic`. App `exited` and `failed` records are
+daemon-to-CLI translations and must never come from an agent. The control
+channel carries agent exit or error.
 
 For waypipe, the agent listens privately and starts
 `waypipe --socket <endpoint> server -- <argv>`. For X11, it allocates a display,
 writes Xauthority with the host's 32-lowercase-hex-digit cookie, and starts argv
 with `DISPLAY` and `XAUTHORITY`. stdout and stderr become lossy UTF-8 log lines.
+When the agent advertises `app_log_split`, the host may set `split_logs = true`
+on `open_app`. For waypipe, the agent redirects the program's stderr to its
+original stdout through an argument-preserving shell wrapper. Waypipe's own
+stderr stays on a separate pipe and becomes `diagnostic` records, hidden by
+the CLI unless `--verbose` is set. The program's stdout and stderr remain
+`log` records. No line-pattern filtering is used. Without the feature, the
+host omits `split_logs` and the agent keeps the existing mixed output.
 Each accepted connection is parked and announced by one `pending`. A host
 `open_app_conn` adopts the oldest parked connection. Unadopted connections expire
 after 30 seconds. With nothing parked, connection open fails.
@@ -569,6 +590,7 @@ not binary encodings. Arrays of pairs encode environment entries.
 | `set_time` | The agent sets the guest's system clock: it answers [`HostMsg::SetTime`] with [`AgentMsg::TimeSet`] or [`AgentMsg::TimeSetFailed`]. The host uses it to bring a guest restored from an online snapshot back to the host's time (§7.3). |
 | `get_time` | The agent reports the guest's system clock: it answers [`HostMsg::GetTime`] with [`AgentMsg::Time`]. The host reads it each time an agent handshakes, to correct a guest that booted with the wrong time (§7.3, #186). An agent without it is left unchecked. |
 | `app_waypipe` | Shared apps over waypipe (PRD §20): [`HostMsg::OpenApp`] with [`crate::app::AppMode::Waypipe`]. Advertised by every Linux agent; whether the guest has a `waypipe` binary is the host's to probe. |
+| `app_log_split` | Shared apps can separate waypipe's diagnostics from program output. Hosts opt in through `split_logs` on [`HostMsg::OpenApp`]. |
 | `app_x11` | Shared apps over X11 (PRD §20): [`HostMsg::OpenApp`] with [`crate::app::AppMode::X11`]. Needs nothing installed in the guest. |
 | `app_rdp` | Shared apps over RDP RemoteApp (PRD §20): [`HostMsg::OpenApp`] with [`crate::app::AppMode::Rdp`]. Advertised by the Windows agent; an edition with no RDP host refuses the open by name. |
 
@@ -715,6 +737,7 @@ No additional fields.
 | `env` | `array<[string, string]>` | [] |  |
 | `cwd` | `string or null` | null |  |
 | `logon` | `Logon or null` | null |  |
+| `split_logs` | `boolean` | false | Request [`app::AppRecord::Diagnostic`] for waypipe's own stderr. Only sent when the agent advertises [`features::APP_LOG_SPLIT`]. |
 
 #### `cmd: open_app_conn`
 
@@ -1258,6 +1281,12 @@ No additional fields.
 No additional fields.
 
 #### `record: log`
+
+| Field | JSON type | When absent | Meaning |
+|---|---|---|---|
+| `text` | `string` | required |  |
+
+#### `record: diagnostic`
 
 | Field | JSON type | When absent | Meaning |
 |---|---|---|---|

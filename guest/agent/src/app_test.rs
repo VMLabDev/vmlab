@@ -102,6 +102,7 @@ fn open_app(mode: AppMode, argv: Vec<String>, env: Vec<(&str, String)>) -> HostM
         env: env.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         cwd: None,
         logon: None,
+        split_logs: false,
     }
 }
 
@@ -518,11 +519,83 @@ fn a_waypipe_session_runs_waypipe_server_and_carries_its_connection() {
     assert!(!dir.exists(), "the private directory is removed");
 }
 
+#[test]
+fn waypipe_logs_are_separate_only_when_negotiated() {
+    for split in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let fake = bin.join("waypipe");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'waypipe diagnostic' >&2\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let p = platform(tmp.path());
+        let (mux, cap) = capture_mux();
+        let mut host = Host::new(cap);
+        let request = open_app(
+            AppMode::Waypipe,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s\\n' \"$1\" \"$VMLAB_TEST_ENV\"; pwd; echo 'Warning: Missing charsets' >&2; echo 'waypipe diagnostic' >&2; exit 7".into(),
+                "sh".into(),
+                "spaces ' quotes $dollar".into(),
+            ],
+            vec![
+                ("PATH", format!("{}:/usr/bin:/bin", bin.display())),
+                ("VMLAB_TEST_ENV", "environment preserved".into()),
+            ],
+        );
+        let mut wire = serde_json::to_value(request).unwrap();
+        wire["split_logs"] = split.into();
+        wire["cwd"] = tmp.path().display().to_string().into();
+        send(&mux, &p, serde_json::from_value(wire).unwrap());
+        assert_eq!(
+            host.ctrl(|m| matches!(m, AgentMsg::Exited { .. })),
+            AgentMsg::Exited { id: 1, code: 7 }
+        );
+        let mut program = Vec::new();
+        let mut diagnostics = Vec::new();
+        while let Some(record) = host.records.next_record().unwrap() {
+            let record = serde_json::to_value(record).unwrap();
+            match record["record"].as_str() {
+                Some("log") => program.push(record["text"].as_str().unwrap().to_string()),
+                Some("diagnostic") => {
+                    diagnostics.push(record["text"].as_str().unwrap().to_string())
+                }
+                _ => {}
+            }
+        }
+        assert!(program.contains(&"spaces ' quotes $dollar".into()));
+        assert!(program.contains(&"environment preserved".into()));
+        assert!(program.contains(&tmp.path().display().to_string()));
+        assert!(program.contains(&"Warning: Missing charsets".into()));
+        assert_eq!(
+            program
+                .iter()
+                .filter(|s| *s == "waypipe diagnostic")
+                .count(),
+            if split { 1 } else { 2 }
+        );
+        assert_eq!(
+            diagnostics,
+            if split {
+                vec!["waypipe diagnostic"]
+            } else {
+                vec![]
+            }
+        );
+    }
+}
+
 /// `XDG_RUNTIME_DIR` is the login's to set; the wrapper only fills it in
 /// where the login left it unset, and hands waypipe its argv untouched.
 #[test]
 fn the_waypipe_wrapper_fills_in_xdg_runtime_dir_only_when_unset() {
-    let argv = waypipe_argv("/run/vmlab-app/9-1", vec!["printenv".into()]);
+    let argv = waypipe_argv("/run/vmlab-app/9-1", vec!["printenv".into()], false);
     let run = |env: &[(&str, &str)]| {
         let mut argv = argv.clone();
         // Stand `env` in for waypipe, which is what the wrapper execs.

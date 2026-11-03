@@ -64,7 +64,8 @@ pub enum AppMode {
 
 /// One record on an app channel. Each variant travels in one direction only.
 ///
-/// The agent writes `Ready`, `Pending` and `Log`. `Exited` and `Failed` are
+/// The agent writes `Ready`, `Pending`, `Log` and negotiated `Diagnostic`
+/// records. `Exited` and `Failed` are
 /// written by the lab daemon on its relay to the CLI, translating the
 /// control-channel [`AgentMsg::Exited`](crate::AgentMsg::Exited) and
 /// [`AgentMsg::Error`](crate::AgentMsg::Error) the CLI never sees; an agent
@@ -85,9 +86,13 @@ pub enum AppRecord {
     /// until the host opens an [`OpenAppConn`](crate::HostMsg::OpenAppConn)
     /// for it. One record per connection. Never sent in [`AppMode::Rdp`].
     Pending,
-    /// **agent→host**: a line the program (or waypipe) wrote to stdout or
-    /// stderr, lossily decoded, without its trailing newline.
+    /// **agent→host**: a line the program wrote to stdout or stderr, lossily
+    /// decoded, without its trailing newline. Includes waypipe's stderr
+    /// unless `open_app.split_logs` was negotiated.
     Log { text: String },
+    /// **agent→host**: waypipe's own stderr, separate from program output.
+    /// Only sent after a host opts in with `open_app.split_logs`.
+    Diagnostic { text: String },
     /// **daemon→CLI**: the program exited with `code`; the session is over.
     Exited { code: i32 },
     /// **daemon→CLI**: the session failed and is over.
@@ -175,6 +180,9 @@ mod tests {
             AppRecord::Pending,
             AppRecord::Log {
                 text: "waypipe: hello".into(),
+            },
+            AppRecord::Diagnostic {
+                text: "waypipe: warning".into(),
             },
             AppRecord::Exited { code: 3 },
             AppRecord::Failed { msg: "gone".into() },

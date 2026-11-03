@@ -637,6 +637,8 @@ type TemplateDef {
   @children("nic")       nics: list<Nic>
   @doc("Additional disks attached during the build")
   @children("disk")      extra_disks: list<DiskBlock>
+  @doc("Accounts the template build creates; clones inherit these only when they declare no logins; never a machine's default identity")
+  @children("login")     logins: list<Login>
   @doc("Sealed variants built on the base, each its own disk state (§6.6); in declaration order")
   @children("variant")   variants: list<TemplateVariant>
 }

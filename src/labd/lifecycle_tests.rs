@@ -280,6 +280,7 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
             disk_size: Some(10 << 30),
             first_boot: None,
             agent_version: Some("0.1.0".into()),
+            logins: Vec::new(),
             variant: None,
             template_vars: None,
         },
@@ -469,6 +470,58 @@ async fn ejecting_a_cdrom_that_is_not_there_says_so() {
     }
 }
 
+#[tokio::test]
+async fn deferred_template_logins_reach_selectors_and_status_without_a_default() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB }"#,
+        Script::healthy(),
+    );
+    let m: Arc<dyn Machine> = vm.clone();
+    assert!(m.logins().is_empty());
+    let mut template = crate::config::load_template_source(
+        r#"import <vmlab.wcl>
+template "t" { arch = "x86_64" version = "1" source "scratch" {}
+login "stock" { user = "dev" password = "never-in-status" default = true }
+}"#,
+        "<test>",
+        std::path::Path::new("/tmp"),
+    )
+    .unwrap();
+    let parts = vm.template();
+    vm.set_template(TemplateParts {
+        resolved: parts.resolved.clone(),
+        backing: parts.backing.clone(),
+        disk_size: parts.disk_size,
+        first_boot: parts.first_boot.clone(),
+        agent_version: parts.agent_version.clone(),
+        logins: template.templates.remove(0).logins,
+        variant: parts.variant.clone(),
+        template_vars: parts.template_vars.clone(),
+    });
+    let logins = m.logins();
+    assert!(crate::config::model::default_login(&logins).is_none());
+    assert!(
+        super::identity::resolve(m.name(), &logins, m.guest_os(), None, None)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        super::identity::resolve(m.name(), &logins, m.guest_os(), Some("stock"), None)
+            .unwrap()
+            .unwrap()
+            .user,
+        "dev"
+    );
+    let status = serde_json::to_value(m.status().await).unwrap();
+    assert_eq!(status["logins"][0]["label"], "stock");
+    assert_eq!(status["logins"][0]["origin"], "template");
+    assert_eq!(status["logins"][0]["default"], false);
+    assert!(!status.to_string().contains("never-in-status"));
+    assert!(status["logins"][0].get("password").is_none());
+}
+
 /// A VM reports the hardware it resolved to (VM > template > profile), not
 /// what it declared: one that leaves its arch or size to its template must
 /// not show a dash for each.
@@ -491,6 +544,7 @@ async fn a_vms_status_reports_its_resolved_hardware() {
         disk_size: parts.disk_size,
         first_boot: None,
         agent_version: parts.agent_version.clone(),
+        logins: parts.logins.clone(),
         variant: None,
         template_vars: None,
     });
@@ -1708,6 +1762,7 @@ async fn an_agentless_clone_is_ready_once_it_is_running() {
         agent_version: None,
         variant: None,
         template_vars: None,
+        logins: parts.logins.clone(),
     });
 
     let m: Arc<dyn Machine> = vm.clone();
@@ -1742,6 +1797,7 @@ async fn a_clone_with_an_agent_still_waits_for_the_handshake() {
         disk_size: parts.disk_size,
         first_boot: parts.first_boot.clone(),
         agent_version: parts.agent_version.clone(), // an agent IS baked in
+        logins: parts.logins.clone(),
         variant: None,
         template_vars: None,
     });

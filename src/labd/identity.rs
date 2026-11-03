@@ -85,6 +85,29 @@ pub fn resolve(
     }
 }
 
+/// RDP alone may use the first inherited template login as its fallback.
+/// An explicit selector, including `SYSTEM`, always wins.
+pub fn resolve_app(
+    machine: &str,
+    logins: &[Login],
+    guest_os: GuestOs,
+    user: Option<&str>,
+    password: Option<&str>,
+    rdp: bool,
+) -> Result<Option<Logon>> {
+    let logon = resolve(machine, logins, guest_os, user, password)?;
+    if logon.is_none()
+        && rdp
+        && user.is_none()
+        && let Some(login) = logins
+            .iter()
+            .find(|login| login.origin == crate::config::model::LoginOrigin::Template)
+    {
+        return Ok(Some(as_logon(machine, login, guest_os)?));
+    }
+    Ok(logon)
+}
+
 /// Whether a selector names the agent's own identity on this guest family.
 fn is_floor(selector: &str, guest_os: GuestOs) -> bool {
     selector.eq_ignore_ascii_case(floor(guest_os))
@@ -154,6 +177,7 @@ mod tests {
             password: password.map(str::to_string),
             elevated: None,
             default: None,
+            origin: Default::default(),
             span: NO_SPAN,
         }
     }
@@ -168,6 +192,71 @@ mod tests {
             login("admin", r"PROBE\administrator", Some("adm1n!")),
             standard,
         ]
+    }
+
+    #[test]
+    fn template_logins_are_selectable_but_never_default() {
+        use crate::config::model::{LoginOrigin, effective_logins};
+        for default in [None, Some(false), Some(true)] {
+            let mut template = login("dev", "dev", Some("pw"));
+            template.default = default;
+            let inherited = effective_logins(&[], &[template]);
+            assert_eq!(inherited[0].origin, LoginOrigin::Template);
+            assert!(default_login(&inherited).is_none());
+            for family in [GuestOs::Windows, GuestOs::Linux, GuestOs::Macos] {
+                assert!(
+                    resolve("m", &inherited, family, None, None)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    resolve("m", &inherited, family, Some("dev"), None)
+                        .unwrap()
+                        .unwrap()
+                        .user,
+                    "dev"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn machine_logins_replace_all_template_logins() {
+        use crate::config::model::{LoginOrigin, effective_logins};
+        let template = [login("stock", "stock", Some("template-secret"))];
+        let declared = [login("custom", "custom", Some("machine-secret"))];
+        let effective = effective_logins(&declared, &template);
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].label, "custom");
+        assert_eq!(effective[0].origin, LoginOrigin::Machine);
+        assert_eq!(default_login(&effective).unwrap().label, "custom");
+        assert!(resolve("m", &effective, GuestOs::Windows, Some("stock"), None).is_err());
+    }
+
+    #[test]
+    fn rdp_uses_the_default_then_the_first_inherited_login() {
+        use crate::config::model::effective_logins;
+        let inherited = effective_logins(
+            &[],
+            &[
+                login("first", "stock", Some("stock-secret")),
+                login("second", "other", Some("other-secret")),
+            ],
+        );
+        let rdp = |logins: &[Login], user, via_rdp| {
+            resolve_app("m", logins, GuestOs::Windows, user, None, via_rdp).unwrap()
+        };
+        assert_eq!(rdp(&inherited, None, true).unwrap().user, "stock");
+        assert_eq!(rdp(&inherited, Some("second"), true).unwrap().user, "other");
+        assert!(rdp(&inherited, Some("SYSTEM"), true).is_none());
+        assert!(rdp(&inherited, None, false).is_none());
+        assert!(rdp(&[], None, true).is_none());
+        let declared = declared();
+        assert_eq!(rdp(&declared, None, true).unwrap().user, r"PROBE\dev");
+        let overridden = effective_logins(&declared, &inherited);
+        assert_eq!(rdp(&overridden, None, true).unwrap().user, r"PROBE\dev");
+        let multiple = [login("a", "a", Some("pw")), login("b", "b", Some("pw"))];
+        assert!(rdp(&effective_logins(&multiple, &inherited), None, true).is_none());
     }
 
     /// With nothing on the command line, a person-invoked verb is the

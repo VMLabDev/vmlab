@@ -12,6 +12,7 @@ lab "e2e-core" {
     firmware  = "ovmf"
     tpm       = true
     nested    = true
+    tsc       = "host"
     cdrom     = "./cd.iso"
     nic { segment = "lan" ip = "10.80.0.10" }
     disk "data" { size = 1GiB }

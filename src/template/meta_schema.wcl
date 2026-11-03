@@ -41,7 +41,17 @@ type TemplateMeta {
   agent_version: utf8?      // vmlab-agent stamp baked in by the template build
   wscript_surface: i64?     // host scripting surface used by embedded scripts
   variants_expected: bool?  // built from a definition with variants: never cloned bare
+  @children("login") logins: list<Login>
   @children("variant") variants: list<VariantMeta>
+}
+
+@block("login")
+type Login {
+  @inline(0) label: utf8
+  user: utf8
+  password: utf8?
+  elevated: bool?
+  default: bool?
 }
 
 // One sealed variant. Every optional field overrides the base's own, field
