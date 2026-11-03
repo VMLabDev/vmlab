@@ -661,7 +661,7 @@ Each segment is a virtual L2 switch inside its owning daemon (lab daemon for lab
 
 The substitution seam above is exercised by two opt-in eBPF fast-path tiers, selected empirically at daemon startup and surfaced by `vmlab fastpath` (and a badge in the web UI):
 
-- **afxdp** — VM NICs attach as tap devices (`-netdev tap,fd=`) with a per-segment XDP program forwarding known non-isolated guest unicast tap-to-tap in-kernel. Broadcast, gateway-addressed, unknown, and isolated traffic punts to the daemon over a tagged host tap and traverses the userspace switch as before.
+- **afxdp** — VM NICs attach as TAP devices, inherited by QEMU or passed to vmlab-hv over its control socket, with a per-segment XDP program forwarding known non-isolated guest unicast tap-to-tap in-kernel. Broadcast, gateway-addressed, unknown, and isolated traffic punts to the daemon over a tagged host tap and traverses the userspace switch as before.
 - **sockmap** — the stream-socket attachment is kept, but sk_skb programs splice known guest-to-guest unicast between the QEMU sockets in-kernel; everything else passes to the daemon's readers unchanged. Functionally validated but *measured slower* than the userspace fabric (af_unix redirects ride the kernel's psock backlog workqueue), so `auto` never selects it — it exists for explicit evaluation via `fastpath = "sockmap"`.
 - **userspace** — the fabric exactly as specified above; always the fallback.
 
@@ -2674,12 +2674,38 @@ runtime directory in its argv. What a running machine can do beyond the
 lifecycle is what vmlab-hv's handshake advertises: online snapshots from phase
 1, and a VM's display and input from 2b.
 
+**Passed network backends.** On the AF_XDP tier, the daemon creates one
+multiqueue TAP interface per VM NIC, with one queue per virtio RX/TX pair
+and 12-byte virtio-net headers. It sends the queue descriptors to vmlab-hv
+with `SCM_RIGHTS` after the control handshake advertises `net_fds`. The
+machine remains paused until every required NIC is attached. The daemon
+retains its handles for interface and XDP-map cleanup. vmlab-hv never
+creates a TAP or requires `CAP_NET_ADMIN`.
+
+When available, the daemon also sends one `/dev/vhost-net` descriptor per
+queue pair. All pairs use vhost-net, or all use the userspace TAP backend
+when those optional files cannot be opened. Attachment errors fail launch.
+Backend configuration errors are reported without silently changing the
+datapath. The descriptor
+order is all TAP queues followed by all vhost files, with the pair order
+preserved in each group. The control queue remains in userspace. Kernel
+backends quiesce before snapshots and reattach after queue state is restored.
+The AF_XDP redirect and tagged host punt carry raw Ethernet without virtio
+offload metadata. These NICs use the `tap_raw` attachment, which does not
+advertise checksum, TCP segmentation or UDP segmentation offloads. Guests
+compute checksums and segment packets in software, including when vhost-net
+owns the rings. Multiqueue and vhost-net remain available. The switch
+completes offloads and segments large vnet stream packets before raw TAP
+egress. The hypervisor's ordinary `tap` protocol attachment retains offloads
+for use with the normal kernel network stack. AF_XDP does not rely on the
+kernel normalizing GSO or partial checksums during an XDP redirect.
+
 For a VM the description is the q35 machine QEMU runs for the same
 declaration, device for device at the PCI addresses QEMU's q35 gives the argv
 §5.2 composes, so a template built under QEMU finds its hardware where it left
 it: the agent's virtio-serial controller, the disks (`disk0` the linked clone
 and the snapshot's RAM and device state carrier), the NICs with their MACs,
-MTUs, switch sockets and vmlab-hv's own iPXE build as their option ROM where
+MTUs, stream sockets or passed TAP queues, and vmlab-hv's own iPXE build as their option ROM where
 the host has one (`1af41000.rom`), the display device and its SeaVGABIOS, and
 the USB tablet on an xHCI in the slot after the display, where QEMU's `-usb`
 has ICH9 UHCI and EHCI controllers instead — vmlab-hv's one approved hardware

@@ -1264,6 +1264,16 @@ impl super::machine::Machine for ContainerInstance {
         self.dirs.nic_sock(i)
     }
 
+    fn net_framing(&self) -> crate::net::framing::FramingMode {
+        if self.hypervisor == HypervisorKind::Vmlab {
+            crate::net::framing::FramingMode::Vnet {
+                queue_pairs: crate::net::framing::queue_pairs(self.resolved.cpus),
+            }
+        } else {
+            crate::net::framing::FramingMode::Raw
+        }
+    }
+
     fn event_subject(&self) -> &'static str {
         "container"
     }

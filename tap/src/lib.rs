@@ -14,6 +14,8 @@ use std::os::unix::fs::OpenOptionsExt;
 
 /// `_IOW('T', 202, int)` — same value on every Linux arch vmlab targets.
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
+const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
 
 /// A created TAP device: the kernel-assigned name and its queue fd.
 pub struct Tap {
@@ -21,9 +23,89 @@ pub struct Tap {
     pub fd: OwnedFd,
 }
 
+/// Multiple queues of one TAP, using 12-byte virtio-net headers.
+pub struct VnetTap {
+    pub name: String,
+    pub queues: Vec<OwnedFd>,
+}
+
+/// Create raw AF_XDP queues with 12-byte virtio headers and offloads disabled.
+pub fn create_vnet(pattern: &str, mtu: u32, queue_pairs: u16) -> io::Result<VnetTap> {
+    create_vnet_with(pattern, queue_pairs, |name| {
+        let tap = create_queue(name, mtu, libc::IFF_MULTI_QUEUE | libc::IFF_VNET_HDR)?;
+        configure_vnet(&tap.fd)?;
+        Ok(tap)
+    })
+}
+
+fn create_vnet_with(
+    pattern: &str,
+    queue_pairs: u16,
+    mut open: impl FnMut(&str) -> io::Result<Tap>,
+) -> io::Result<VnetTap> {
+    if !(1..=31).contains(&queue_pairs) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TAP needs 1..=31 queue pairs",
+        ));
+    }
+    let first = open(pattern)?;
+    let name = first.name;
+    let mut queues = Vec::with_capacity(usize::from(queue_pairs));
+    queues.push(first.fd);
+    for _ in 1..queue_pairs {
+        let queue = open(&name)?;
+        if queue.name != name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TAP queue belongs to another interface",
+            ));
+        }
+        queues.push(queue.fd);
+    }
+    Ok(VnetTap { name, queues })
+}
+
+fn configure_vnet(fd: &OwnedFd) -> io::Result<()> {
+    configure_vnet_with(
+        |size| {
+            // SAFETY: the fd is an open TAP queue and size is live through ioctl.
+            #[allow(unsafe_code)]
+            let result = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETVNETHDRSZ, &size) };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        |flags| {
+            // SAFETY: TUNSETOFFLOAD takes the mask by value, not a pointer.
+            #[allow(unsafe_code)]
+            let result = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETOFFLOAD, flags) };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn configure_vnet_with(
+    set_header: impl FnOnce(libc::c_int) -> io::Result<()>,
+    set_offloads: impl FnOnce(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    set_header(12)?;
+    set_offloads(0)
+}
+
 /// Create a TAP device from `pattern` (e.g. `"vmfp%d"` — the kernel picks
 /// the number), set `mtu`, and bring it up.
 pub fn create(pattern: &str, mtu: u32) -> io::Result<Tap> {
+    create_queue(pattern, mtu, 0)
+}
+
+fn create_queue(pattern: &str, mtu: u32, extra_flags: libc::c_int) -> io::Result<Tap> {
     let tun = OpenOptions::new()
         .read(true)
         .write(true)
@@ -44,7 +126,7 @@ pub fn create(pattern: &str, mtu: u32) -> io::Result<Tap> {
     }
     #[allow(unsafe_code)]
     unsafe {
-        ifr.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+        ifr.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI | extra_flags) as libc::c_short;
         if libc::ioctl(tun.as_raw_fd(), TUNSETIFF, &mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -108,6 +190,98 @@ impl Drop for ScratchSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiqueue_uses_the_first_queues_interface_name() {
+        let mut names = Vec::new();
+        let tap = create_vnet_with("vmfp%d", 3, |name| {
+            names.push(name.to_owned());
+            let (fd, _) = std::os::unix::net::UnixDatagram::pair()?;
+            Ok(Tap {
+                name: "vmfp17".into(),
+                fd: fd.into(),
+            })
+        })
+        .unwrap();
+        assert_eq!(names, ["vmfp%d", "vmfp17", "vmfp17"]);
+        assert_eq!(tap.name, "vmfp17");
+        assert_eq!(tap.queues.len(), 3);
+    }
+
+    #[test]
+    fn invalid_queue_counts_do_not_open_a_device() {
+        for count in [0, 32, u16::MAX] {
+            assert!(
+                create_vnet_with("vmfp%d", count, |_| panic!("invalid count opened TAP")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn vnet_queues_keep_offloads_disabled() {
+        let mut sizes = Vec::new();
+        let mut masks = Vec::new();
+        configure_vnet_with(
+            |size| {
+                sizes.push(size);
+                Ok(())
+            },
+            |mask| {
+                masks.push(mask);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sizes, [12]);
+        assert_eq!(masks, [0]);
+    }
+
+    #[test]
+    fn a_queue_creation_error_stops_the_attachment() {
+        let mut opened = 0;
+        let error = create_vnet_with("vmfp%d", 3, |_| {
+            opened += 1;
+            if opened == 2 {
+                return Err(io::Error::from_raw_os_error(libc::EMFILE));
+            }
+            let (fd, _) = std::os::unix::net::UnixDatagram::pair()?;
+            Ok(Tap {
+                name: "vmfp17".into(),
+                fd: fd.into(),
+            })
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert_eq!(opened, 2);
+    }
+
+    #[test]
+    fn vnet_configuration_errors_are_reported() {
+        let error = configure_vnet_with(
+            |_| Err(io::Error::from_raw_os_error(libc::ENOTTY)),
+            |_| panic!("offloads configured after a header failure"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTTY));
+        for errno in [libc::EINVAL, libc::EIO] {
+            let mut attempts = 0;
+            let error = configure_vnet_with(
+                |size| {
+                    assert_eq!(size, 12);
+                    Ok(())
+                },
+                |mask| {
+                    attempts += 1;
+                    assert_eq!(mask, 0);
+                    Err(io::Error::from_raw_os_error(errno))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+    }
 
     #[test]
     fn create_needs_net_admin_or_succeeds() {

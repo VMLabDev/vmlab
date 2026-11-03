@@ -2600,7 +2600,7 @@ dependencies = [
 [[package]]
 name = "vmlab-hv-display"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=02f05c3e646287413059c2d7d54678f9c1ba7a2a#02f05c3e646287413059c2d7d54678f9c1ba7a2a"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=39ffa487220504ec6f995cb61ca0e80eeb7a5a17#39ffa487220504ec6f995cb61ca0e80eeb7a5a17"
 dependencies = [
  "libc",
  "log",
@@ -2609,10 +2609,11 @@ dependencies = [
 [[package]]
 name = "vmlab-hv-proto"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=02f05c3e646287413059c2d7d54678f9c1ba7a2a#02f05c3e646287413059c2d7d54678f9c1ba7a2a"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=39ffa487220504ec6f995cb61ca0e80eeb7a5a17#39ffa487220504ec6f995cb61ca0e80eeb7a5a17"
 dependencies = [
  "gdbstub",
  "gdbstub_arch",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",

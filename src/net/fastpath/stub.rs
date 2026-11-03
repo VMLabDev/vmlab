@@ -74,10 +74,28 @@ impl SegmentXdp {
     ) -> anyhow::Result<TapNic> {
         match self.never {}
     }
+
+    pub fn add_nic_with_framing(
+        self: &Arc<Self>,
+        _switch: &Arc<crate::net::switch::Switch>,
+        _mac: MacAddr,
+        _isolated: bool,
+        _framing: crate::net::framing::FramingMode,
+    ) -> anyhow::Result<TapNic> {
+        match self.never {}
+    }
 }
 
 impl TapNic {
     pub fn qemu_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        match self.never {}
+    }
+
+    pub fn queue_fds(&self) -> std::io::Result<Vec<std::os::fd::OwnedFd>> {
+        match self.never {}
+    }
+
+    pub fn vhost_fds(&self) -> std::io::Result<Vec<std::os::fd::OwnedFd>> {
         match self.never {}
     }
 }

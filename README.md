@@ -226,6 +226,18 @@ selected tier, and an unavailable fast path silently falls back to userspace.
 The fast path needs `CAP_BPF` and `CAP_NET_ADMIN`, which `install.sh` offers
 to grant the binary with `sudo setcap` (`--fastpath` / `--no-fastpath`).
 
+The AF_XDP tier supports QEMU and vmlab-hv VMs. The daemon creates TAP queues
+and passes them to vmlab-hv over its paused-launch control socket. If
+`/dev/vhost-net` is available, it also passes one kernel backend per queue
+pair. Otherwise vmlab-hv drives the TAP queues in userspace. The hypervisor
+does not create interfaces or need `CAP_NET_ADMIN`.
+
+AF_XDP carries raw Ethernet. Its vmlab-hv NICs use `tap_raw` attachments
+without checksum, TSO or USO offloads, so guests compute checksums and
+segment packets in software. Multiqueue and optional vhost-net remain
+available. The switch completes offloads and segments large stream packets
+before forwarding them to raw TAP ports.
+
 ## WSL2
 
 vmlab is WSL2-clean by design (PRD §13): KVM requires nested virtualisation

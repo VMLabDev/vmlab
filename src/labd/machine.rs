@@ -144,6 +144,7 @@ pub trait LabServices: Send + Sync + 'static {
         mac: MacAddr,
         isolated: bool,
         tap_ok: bool,
+        framing: crate::net::framing::FramingMode,
     ) -> Result<NicAttachment>;
 
     /// This machine's agent has answered and it is about to be reported
@@ -254,6 +255,11 @@ pub trait Machine: Send + Sync + 'static {
     /// line is built, not a preference.
     fn takes_tap_fds(&self) -> bool {
         false
+    }
+
+    /// Wire format selected before attachment, without an in-band handshake.
+    fn net_framing(&self) -> crate::net::framing::FramingMode {
+        crate::net::framing::FramingMode::Raw
     }
 
     /// The word this machine's events name it under (`vm.stopped` vs
@@ -850,6 +856,7 @@ pub(super) async fn attach_all_nics(
                 mac,
                 nic.isolated,
                 tap_ok,
+                m.net_framing(),
             )
             .await?,
         );

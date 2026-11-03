@@ -117,7 +117,7 @@ pub struct NicSpec {
     pub backend: NicBackend,
 }
 
-/// How QEMU reaches the segment for one NIC.
+/// The network backend carried by the typed VM launch.
 #[derive(Debug, Clone)]
 pub enum NicBackend {
     /// Stream-socket netdev into the userspace switch (§9.1); the daemon
@@ -126,6 +126,12 @@ pub enum NicBackend {
     /// Pre-opened tap fd inherited at this descriptor number (the afxdp
     /// fast path; the daemon maps the fd in at spawn).
     Tap { child_fd: i32 },
+    /// Descriptors retained by vmlab and sent to vmlab-hv over its control socket.
+    /// The entries name `LaunchSpec::fds` mappings, not inherited descriptors.
+    TapQueues {
+        tap_fds: Vec<i32>,
+        vhost_fds: Vec<i32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -818,6 +824,11 @@ pub fn build_args(
             ),
             NicBackend::Tap { child_fd } => {
                 arg(&mut a, "netdev", format!("tap,id=net{i},fd={child_fd}"));
+            }
+            NicBackend::TapQueues { .. } => {
+                return Err(anyhow::anyhow!(
+                    "control-socket TAP queues require vmlab-hv"
+                ));
             }
         }
         // virtio-net negotiates a jumbo MTU with the guest via `host_mtu`;

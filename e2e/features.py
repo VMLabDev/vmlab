@@ -302,9 +302,7 @@ _GROUPS: dict[str, list[str]] = {
 # Their host and container features still count;
 # a VM feature they report is skipped with the reason, never passed, since a
 # pass on QEMU says nothing about vmlab-hv (`Harness._record`).
-QEMU_SCENARIOS: dict[str, str] = {
-    "fastpath": "the kernel fast-path tiers attach VM NICs as taps, and vmlab-hv takes stream sockets only",
-}
+QEMU_SCENARIOS: dict[str, str] = {}
 
 # Features only QEMU can ever run, and why; skipped on every other hypervisor.
 QEMU_ONLY: dict[str, str] = {

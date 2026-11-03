@@ -294,8 +294,8 @@ pub struct LaunchSpec {
     /// The control socket the hypervisor will bind, connected once it is up
     /// — QMP for QEMU, the vmlab-hv control protocol for vmlab-hv.
     pub control_sock: PathBuf,
-    /// Pre-opened descriptors installed at fixed numbers in the child (tap
-    /// NIC fds).
+    /// Pre-opened NIC descriptors. QEMU inherits the fixed mappings;
+    /// vmlab-hv consumes the typed TAP lists and sends them over control.
     pub fds: Vec<ChildFd>,
     /// The guest channels this machine exposes — see [`GuestChannels`].
     pub channels: GuestChannels,

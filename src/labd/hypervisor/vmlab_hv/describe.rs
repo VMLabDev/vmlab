@@ -154,8 +154,9 @@ pub(crate) fn container(
                 pci: None,
                 mac: mac.to_string(),
                 mtu: *mtu,
-                attachment: NicAttachment::Stream {
+                attachment: NicAttachment::StreamVnet {
                     socket: socket.clone(),
+                    queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
                 },
             })
             .collect(),
@@ -287,7 +288,7 @@ fn hyperv_list(resolved: &ResolvedVm, apic_virtualization: bool) -> Result<Vec<H
 /// The machine description for one VM: q35 on SeaBIOS or OVMF, as QEMU runs
 /// the same resolved machine (§22, phases 2a to 2c). Refuses whatever
 /// validation refuses too, as the last word before a spawn, and what only the
-/// launch knows — a tap NIC, a host without its firmware.
+/// launch knows, including a host without its firmware or invalid TAP queues.
 pub(crate) fn vm(
     lab: &str,
     resolved: &ResolvedVm,
@@ -488,10 +489,27 @@ pub(crate) fn vm(
     }
     let mut nics = Vec::new();
     for (index, nic) in paths.nics.iter().enumerate() {
-        let NicBackend::Stream { sock } = &nic.backend else {
-            bail!(
-                "vm \"{name}\": vmlab-hv attaches NICs by stream socket only, not a tap descriptor"
-            );
+        let attachment = match &nic.backend {
+            NicBackend::Stream { sock } => NicAttachment::StreamVnet {
+                socket: sock.clone(),
+                queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
+            },
+            NicBackend::TapQueues { tap_fds, vhost_fds } => {
+                let pairs = crate::net::framing::queue_pairs(resolved.cpus);
+                if tap_fds.len() != usize::from(pairs)
+                    || (!vhost_fds.is_empty() && vhost_fds.len() != tap_fds.len())
+                {
+                    bail!(
+                        "vm \"{name}\": TAP and vhost-net queue counts do not match its {pairs} virtio queue pairs"
+                    );
+                }
+                // The AF_XDP redirect and host punt carry raw Ethernet,
+                // without the checksum/GSO metadata a capable TAP can carry.
+                NicAttachment::TapRaw { queue_pairs: pairs }
+            }
+            NicBackend::Tap { .. } => {
+                bail!("vm \"{name}\": vmlab-hv requires typed TAP queue descriptors")
+            }
         };
         let pci = slots.next();
         if ovmf && paths.firmware_boot_hints {
@@ -507,9 +525,7 @@ pub(crate) fn vm(
             pci: Some(pci),
             mac: nic.mac.to_string(),
             mtu: nic.mtu.filter(|m| *m != 1500),
-            attachment: NicAttachment::Stream {
-                socket: sock.clone(),
-            },
+            attachment,
         });
     }
     boot.sort_by_key(|(index, _)| *index);
@@ -726,8 +742,9 @@ mod tests {
         assert_eq!(d.nics[1].mtu, Some(9000));
         assert_eq!(
             d.nics[1].attachment,
-            NicAttachment::Stream {
-                socket: "/run/l/web/nic1.sock".into()
+            NicAttachment::StreamVnet {
+                socket: "/run/l/web/nic1.sock".into(),
+                queue_pairs: 2,
             }
         );
 
@@ -1077,8 +1094,11 @@ mod tests {
         };
         assert!(refused(&ok, &vm_paths(), QemuAccel::Kvm, &no_bios).contains("bios-256k.bin"));
         let mut tap = vm_paths();
-        tap.nics[0].backend = NicBackend::Tap { child_fd: 10 };
-        assert!(refused(&ok, &tap, QemuAccel::Kvm, &roms()).contains("tap"));
+        tap.nics[0].backend = NicBackend::TapQueues {
+            tap_fds: vec![10],
+            vhost_fds: vec![],
+        };
+        assert!(refused(&ok, &tap, QemuAccel::Kvm, &roms()).contains("queue counts"));
         let legacy = resolved_vm("windows-legacy", "x86_64");
         assert!(refused(&legacy, &vm_paths(), QemuAccel::Kvm, &roms()).contains("q35"));
         let qxl = declared(
@@ -1096,6 +1116,31 @@ mod tests {
         let back: MachineDescription = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
         assert!(json.contains(r#""machine":"q35""#), "{json}");
+    }
+
+    #[test]
+    fn tap_description_defers_descriptor_installation_until_control_connects() {
+        let resolved = seabios_modern();
+        let mut paths = vm_paths();
+        paths.nics[0].backend = NicBackend::TapQueues {
+            tap_fds: vec![10, 11],
+            vhost_fds: vec![12, 13],
+        };
+        let description = vm("l", &resolved, &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(
+            description.nics[0].attachment,
+            NicAttachment::TapRaw { queue_pairs: 2 }
+        );
+        let json = serde_json::to_string(&description).unwrap();
+        assert!(!json.contains("tap_fds"));
+        let attachment =
+            serde_json::to_value(&description).unwrap()["nics"][0]["attachment"].clone();
+        assert_eq!(attachment["kind"], "tap_raw");
+        assert_eq!(attachment["queue_pairs"], 2);
+        assert_eq!(
+            serde_json::from_str::<MachineDescription>(&json).unwrap(),
+            description
+        );
     }
 
     // -- OVMF, secure boot, TPM, Hyper-V (phase 2c) -----------------------
