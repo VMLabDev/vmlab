@@ -1,0 +1,14 @@
+Normalize compiler source paths as well as GenFw's CodeView record. DEBUG
+builds retain assertions and their __FILE__ strings in the firmware.
+
+--- a/OvmfPkg/OvmfPkgX64.dsc
++++ b/OvmfPkg/OvmfPkgX64.dsc
+@@ -94,7 +94,7 @@
+   INTEL:RELEASE_*_*_CC_FLAGS           = /D MDEPKG_NDEBUG
+   MSFT:RELEASE_*_*_CC_FLAGS            = /D MDEPKG_NDEBUG
+ !if $(TOOL_CHAIN_TAG) != "XCODE5" && $(TOOL_CHAIN_TAG) != "CLANGPDB"
+-  GCC:*_*_*_CC_FLAGS                   = -mno-mmx -mno-sse
++  GCC:*_*_*_CC_FLAGS                   = -mno-mmx -mno-sse -ffile-prefix-map=$(WORKSPACE)/=
+ !endif
+ !if $(SOURCE_DEBUG_ENABLE) == TRUE
+   MSFT:*_*_X64_GENFW_FLAGS  = --keepexceptiontable

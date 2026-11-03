@@ -65,6 +65,8 @@ main() {
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/host-resolution.patch"
   sed -i 's/\r$//' "$work/BaseTools/Source/C/GenFw/Elf64Convert.c"
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/reproducible-debug-path.patch"
+  sed -i 's/\r$//' "$work/OvmfPkg/OvmfPkgX64.dsc"
+  patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/reproducible-source-path.patch"
   cp "$SCRIPT_DIR/logo/Logo.bmp" "$work/MdeModulePkg/Logo/Logo.bmp"
 
   (
@@ -142,6 +144,7 @@ main() {
     sha256sum "$SCRIPT_DIR/ovmf/boot-without-waits.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/host-resolution.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/reproducible-debug-path.patch" | sed "s|$SCRIPT_DIR/||"
+    sha256sum "$SCRIPT_DIR/ovmf/reproducible-source-path.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/test-genfw-reproducible.py" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/logo/Logo.bmp" | sed "s|$SCRIPT_DIR/||"
     (cd "$OUT" && sha256sum OVMF_CODE_4M*.fd OVMF_VARS_4M*.fd)
