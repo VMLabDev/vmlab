@@ -11,6 +11,7 @@ import '../shared.just'
 
 # Override per checkout (VMLAB_E2E_IMAGE) when several worktrees run the suite at once.
 image := env('VMLAB_E2E_IMAGE', 'vmlab-e2e')
+build_image := env('VMLAB_BUILD_IMAGE', 'vmlab-build')
 cache := 'vmlab-e2e-cache'
 
 [default, private]
@@ -25,7 +26,8 @@ require-docker:
 # Build the e2e image from this checkout
 [group('e2e')]
 image-build: require-docker
-	DOCKER_BUILDKIT=1 docker build -f e2e/Dockerfile -t {{image}} .
+	DOCKER_BUILDKIT=1 docker build -f build/Dockerfile -t {{build_image}} .
+	DOCKER_BUILDKIT=1 docker build --build-arg VMLAB_BUILD_IMAGE={{build_image}} -f e2e/Dockerfile -t {{image}} .
 
 # Run the suite (arguments go to e2e/run.py: `--only core dev`, `--keep`, `--list`, `--hypervisor vmlab`)
 [group('e2e')]

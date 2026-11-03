@@ -12,6 +12,8 @@ just e2e::run --hypervisor qemu      # explicit QEMU coverage
 
 The host needs Docker and a usable `/dev/kvm`. The container runs privileged. If `~/.local/share/config-weave/bin` exists, the playbook scenario mounts it into the container.
 
+The image recipe first builds the release toolchain image from `build/Dockerfile`, using `VMLAB_BUILD_IMAGE` or `vmlab-build`. The e2e build stage inherits those toolchains and `VMLAB_BUILD_ENV=1`, so `build-asset.sh` builds firmware in place. The runtime carries the same branded OVMF variants, Secure Boot VARS, SeaBIOS and iPXE ROMs as `just guest-install`, plus AAVMF for the QEMU administration checks.
+
 ## How a run works
 
 - **Base template.** `templates/alpine` builds `x86_64/e2e-alpine` from Alpine's NoCloud cloud image. The build adds the vmlab agent and nothing else: no package installs and no updates. A build takes about 45 seconds once the image is cached.

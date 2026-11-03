@@ -5,15 +5,14 @@
 # its protocol crate to, beside every host tool vmlab drives. Run it
 # privileged with /dev/kvm passed through (`just e2e::run`).
 
-FROM rust:1-trixie AS build
-RUN apt-get update \
- && apt-get install -y --no-install-recommends cpio curl git xz-utils \
-      nasm acpica-tools uuid-dev python3 patch \
- && rm -rf /var/lib/apt/lists/*
-RUN rustup target add x86_64-unknown-linux-musl
+ARG VMLAB_BUILD_IMAGE=vmlab-build
+# The release toolchains include OVMF, Secure Boot VARS, SeaBIOS and iPXE's
+# build dependencies. VMLAB_BUILD_ENV=1 is inherited, so build-asset.sh builds
+# firmware here instead of trying to launch Docker inside this build.
+FROM ${VMLAB_BUILD_IMAGE} AS build
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/src/guest/agent/target \
     --mount=type=cache,target=/src/guest/cinit/target \
@@ -52,7 +51,7 @@ RUN set -eux; \
     rm -rf /tmp/virgl.tar.gz /tmp/virglrenderer-1.3.0 /tmp/virgl-build
 # vmlab-hv (PRD §22) from the commit vmlab-hv-proto is locked to, so the
 # binary speaks exactly the protocol this vmlab was built against.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
     --mount=type=cache,target=/hv/target \
     set -eux; \
     export PKG_CONFIG_PATH=/opt/virgl/lib/pkgconfig \
