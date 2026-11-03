@@ -2824,7 +2824,9 @@ a machine does not convert its snapshots. Offline snapshots remain portable.
 The e2e runner defaults to `--hypervisor vmlab` and explicitly pins both machine
 kinds for each scenario, retaining QEMU-only scenarios.
 
-The default-switch PR remains a draft pending N6-N8 network support and pinned
-TSC support. Rebase against both packages, update the protocol pin as required,
-remove the delivered TSC refusal, review fast-path routing, and rerun the gate
-and live checks before marking it ready.
+Pinned TSC and N6-N8 networking are supported on vmlab-hv. A supported new VM
+with `tsc = "host"` still selects vmlab-hv; its first KVM start probes and
+persists the frequency as described in §5.2. The e2e `fastpath` scenario follows
+the selected hypervisor. Kernel fast-path tiers require the host capabilities
+described in §9.1. `qemu_args`, legacy PC/i440fx, macOS and non-KVM policies
+continue to select QEMU automatically.

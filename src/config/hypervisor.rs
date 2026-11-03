@@ -440,7 +440,6 @@ mod tests {
         for setting in [
             r#"profile = "windows-legacy""#,
             r#"profile = "macos""#,
-            r#"profile = "linux-modern" tsc = "host""#,
             r#"profile = "linux-modern" accel = "tcg""#,
         ] {
             let file = lab(&format!(
@@ -459,6 +458,27 @@ mod tests {
                 picked.fallback_reason,
                 Some(vmlab_refusals(MachineCfg::Vm(vm), &kvm_host(), Some(&hw)).join("; "))
             );
+        }
+    }
+
+    #[test]
+    fn automatic_selection_supports_pinned_tsc_on_modern_vms() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        for profile in ["linux-modern", "windows-11"] {
+            let file = lab(&format!(
+                r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB profile = "{profile}" tsc = "host" }} }}"#
+            ));
+            let vm = &file.lab.vms[0];
+            let hardware = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
+            assert!(hardware.tsc.is_some());
+            let picked = HypervisorDefaults::default().select(
+                MachineCfg::Vm(vm),
+                &kvm_host(),
+                Some(&hardware),
+                None,
+            );
+            assert_eq!(picked.kind, HypervisorKind::Vmlab, "{profile}");
+            assert!(picked.fallback_reason.is_none(), "{profile}: {picked:?}");
         }
     }
 

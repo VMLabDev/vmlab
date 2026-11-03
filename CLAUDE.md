@@ -105,7 +105,10 @@ serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
 `microphone` on a VM (§11, hv-audio D7), an HDA on the host node
 `vmlab.<lab>.<machine>`, refused on QEMU. A pinned TSC uses `vmlab-hv --probe`
 at the first KVM start, keeps `tsc-hz`, and passes `invtsc` and `tsc_khz`
-in the machine description. Everything else — macOS, i440fx, `qemu_args`, hosts without
+in the machine description. N6-N8 networking supplies offloaded multiqueue
+virtio-net streams and passed TAP/vhost-net descriptors; the e2e `fastpath`
+scenario follows the selected hypervisor. Kernel tiers still require host
+capabilities. Everything else — macOS, i440fx, `qemu_args`, hosts without
 KVM — is refused from one list naming the phase that brings it. Snapshots
 record their hypervisor and an online one refuses to restore under the other;
 a vmlab-hv VM with a GPU takes none (HV D9).

@@ -104,6 +104,8 @@ stranding its online snapshots merely because vmlab's default changed.
 Worktree clones inherit identity. Deferred pulls select against the downloaded
 template hardware. Runtime errors and missing binaries remain errors.
 
-The default-switch PR stays draft until N6-N8 and pinned TSC merge. Its rebase
-must review the protocol pin, remove the delivered TSC refusal, review fast-path
-routing and rerun unit tests, `just ci::check`, and isolated live checks.
+Pinned TSC and N6-N8 networking are supported on vmlab-hv. A supported q35 VM
+with `tsc = "host"` selects vmlab-hv automatically, and the e2e `fastpath`
+scenario follows the selected hypervisor. Kernel fast-path tiers retain their
+host capability requirements. Automatic QEMU fallback remains for `qemu_args`,
+legacy PC/i440fx, macOS and hosts without KVM.
