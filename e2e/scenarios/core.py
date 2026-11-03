@@ -38,8 +38,11 @@ def pinned_tsc(h, lab):
     dmesg = sh(h, lab, "vm01", "dmesg").out
     match = re.search(r"tsc: Detected ([0-9.]+) MHz", dmesg)
     measured = float(match[1]) * 1_000_000 if match else 0
-    h.ok("vm.hw.tsc", applied and abs(measured - pin) < 2000,
-         f"pin={pin}Hz, guest={measured}Hz, launch matches={applied}")
+    # KVM leaves rates within its default 250 ppm window unscaled.
+    # dmesg is a guest calibration check. The launch must match exactly.
+    tolerance = max(2000, pin * 250 / 1_000_000)
+    h.ok("vm.hw.tsc", applied and pin > 0 and measured > 0 and abs(measured - pin) <= tolerance,
+         f"pin={pin}Hz, guest={measured}Hz, launch matches={applied}, tolerance={tolerance}Hz")
 
 
 def qemu_argv(vm: str) -> list[str]:
