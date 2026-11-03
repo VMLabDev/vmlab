@@ -4386,16 +4386,11 @@ lab "l" {
             r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-11" hypervisor = "vmlab" usb = true audio = true microphone = true }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
-        // A pinned TSC waits for vmlab-hv's host probe.
         let es = hv_errs(
             &HvHost::kvm(),
             r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" tsc = "host" }"#,
         );
-        assert!(
-            es.iter()
-                .any(|e| e.contains("vm \"v\"") && e.contains("D10")),
-            "{es:#?}"
-        );
+        assert!(es.is_empty(), "{es:#?}");
     }
 
     /// Audio is vmlab-hv's (hv-audio D7): on QEMU — named or the host's

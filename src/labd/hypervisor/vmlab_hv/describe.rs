@@ -561,6 +561,21 @@ pub(crate) fn vm(
         bail!("vm \"{name}\": more PCI devices than q35's bus 0 has slots for under vmlab-hv");
     }
 
+    let tsc_khz = if resolved.tsc.is_some() {
+        let hz = paths.tsc_hz.ok_or_else(|| {
+            anyhow::anyhow!(
+                "vm \"{name}\": tsc = \"host\" needs the pinned TSC frequency (PRD §5.2)"
+            )
+        })?;
+        if hz == 0 || !hz.is_multiple_of(1000) {
+            bail!("vm \"{name}\": pinned TSC frequency {hz} Hz must be positive and a whole kHz");
+        }
+        Some(u32::try_from(hz / 1000).map_err(|_| {
+            anyhow::anyhow!("vm \"{name}\": pinned TSC frequency {hz} Hz exceeds KVM's range")
+        })?)
+    } else {
+        None
+    };
     Ok(MachineDescription {
         fw_cfg,
         // A guest reset happens in place, as under QEMU: the process, its
@@ -568,8 +583,8 @@ pub(crate) fn vm(
         exit_on_reset: false,
         machine: Machine::Q35,
         cpu_model: None,
-        invtsc: false,
-        tsc_khz: None,
+        invtsc: tsc_khz.is_some(),
+        tsc_khz,
         vmware_cpuid_freq: false,
         msr_policy: Default::default(),
         applesmc: None,
@@ -1084,6 +1099,51 @@ mod tests {
     }
 
     // -- OVMF, secure boot, TPM, Hyper-V (phase 2c) -----------------------
+
+    #[test]
+    fn pinned_tsc_description_is_invariant_and_round_trips() {
+        for profile in ["linux-modern", "windows-11"] {
+            let resolved = declared(&format!(r#"profile = "{profile}" tsc = "host""#), None);
+            let mut paths = ovmf_paths(profile == "windows-11");
+            paths.tsc_hz = Some(4_291_956_000);
+            let desc = vm("l", &resolved, &paths, QemuAccel::Kvm, &roms()).unwrap();
+            assert!(desc.invtsc);
+            assert_eq!(desc.tsc_khz, Some(4_291_956));
+            assert!(!desc.vmware_cpuid_freq);
+            assert_eq!(
+                serde_json::from_str::<MachineDescription>(&serde_json::to_string(&desc).unwrap())
+                    .unwrap(),
+                desc
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_tsc_description_requires_an_exact_nonzero_khz_pin() {
+        let resolved = declared(
+            r#"profile = "linux-modern" firmware = "seabios" tsc = "host""#,
+            None,
+        );
+        for hz in [
+            None,
+            Some(0),
+            Some(4_291_956_001),
+            Some(u64::from(u32::MAX) * 1000 + 1000),
+        ] {
+            let mut paths = vm_paths();
+            paths.tsc_hz = hz;
+            let error = vm("l", &resolved, &paths, QemuAccel::Kvm, &roms()).unwrap_err();
+            assert!(
+                error.to_string().contains("TSC frequency"),
+                "{hz:?}: {error}"
+            );
+        }
+        let mut paths = vm_paths();
+        paths.tsc_hz = Some(4_291_956_000);
+        let desc = vm("l", &seabios_modern(), &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert!(!desc.invtsc);
+        assert_eq!(desc.tsc_khz, None);
+    }
 
     /// The paths the lab daemon assembles for an OVMF VM: the CODE image its
     /// firmware lookup chose, the VM's own VARS copy, and swtpm's socket.

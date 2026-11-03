@@ -918,9 +918,13 @@ impl VmInstance {
         if let Some(hz) = qemu::tsc::read_pin(&pin)? {
             return Ok(Some(hz));
         }
-        let hz = qemu::tsc::probe_host_hz(emulator)
-            .await
-            .with_context(|| format!("{}: tsc = \"host\"", self.cfg.name))?;
+        let hz = match self.hypervisor {
+            HypervisorKind::Qemu => qemu::tsc::probe_host_hz(emulator).await,
+            HypervisorKind::Vmlab => {
+                super::hypervisor::vmlab_hv::tsc::probe_host_hz(Path::new(emulator)).await
+            }
+        }
+        .with_context(|| format!("{}: tsc = \"host\"", self.cfg.name))?;
         std::fs::create_dir_all(&self.dirs.local)?;
         qemu::tsc::write_pin(&pin, hz)?;
         Ok(Some(hz))
@@ -1254,13 +1258,15 @@ impl VmInstance {
                     format!("{}: installing the Vulkan PCI-filter layer", self.cfg.name)
                 })?;
             }
-            // The probe reads the TSC through the emulator the VM will run:
-            // a host GPU's own build where one is set, else the stock one.
-            let emulator = render
-                .qemu_binary
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| qemu::emulator_binary(&t.resolved.arch));
+            // Use the selected hypervisor, including its configured binary.
+            let emulator = match self.hypervisor {
+                HypervisorKind::Vmlab => self.hv.emulator_binary(&t.resolved.arch),
+                HypervisorKind::Qemu => render
+                    .qemu_binary
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| qemu::emulator_binary(&t.resolved.arch)),
+            };
             let tsc_hz = self.pinned_tsc_hz(&t, accel, &emulator).await?;
             let machine = super::hypervisor::Launch::Vm {
                 lab: self.lab.clone(),
