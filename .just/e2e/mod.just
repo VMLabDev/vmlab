@@ -33,7 +33,8 @@ image-build: require-docker
 [group('e2e')]
 run *args: image-build
 	mkdir -p e2e/results
-	docker run --rm --init --privileged --device /dev/kvm \
+	docker run --rm --init --privileged --device /dev/kvm --memory 24g --memory-swap 24g \
+		-e VMLAB_E2E_RENDER_NODE \
 		-v {{cache}}:/root/.local/share/vmlab/cache/artefacts \
 		-v "$PWD/e2e:/e2e:ro" \
 		-v "$PWD/e2e/results:/results" \

@@ -10,7 +10,7 @@ just e2e::run --list                 # scenario names
 just e2e::run --hypervisor qemu      # explicit QEMU coverage
 ```
 
-The host needs Docker and a usable `/dev/kvm`. The container runs privileged. If `~/.local/share/config-weave/bin` exists, the playbook scenario mounts it into the container.
+The host needs Docker and a usable `/dev/kvm`. The container runs privileged, with a 24 GiB memory limit and no swap. If `~/.local/share/config-weave/bin` exists, the playbook scenario mounts it into the container. GPU rendering is skipped unless `VMLAB_E2E_RENDER_NODE` names a host render device designated for testing, such as `/dev/dri/renderD128`. The suite never selects a host GPU automatically.
 
 The image recipe first builds the release toolchain image from `build/Dockerfile`, using `VMLAB_BUILD_IMAGE` or `vmlab-build`. The e2e build stage inherits those toolchains and `VMLAB_BUILD_ENV=1`, so `build-asset.sh` builds firmware in place. The runtime carries the same branded OVMF variants, Secure Boot VARS, SeaBIOS and iPXE ROMs as `just guest-install`, plus AAVMF for the QEMU administration checks.
 
