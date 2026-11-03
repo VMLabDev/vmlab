@@ -46,7 +46,7 @@ vmlab runs machines on QEMU/KVM, driven directly over QMP — no libvirt — and
 | **Ready** | A VM is *ready* when its vmlab guest agent answers its handshake. A lab is *up* when all VMs are ready and all provision scripts have completed. |
 | **Dev machine** | A machine marked `@dev`: a machine with a synced workspace (§19). VM or container, Windows or Linux — one contract for both. |
 | **Workspace** | A dev machine's source tree: a guest-local working copy of a canonical host directory, kept in step by vmlab's syncer (§19.6). Not a `share {}`. |
-| **Login** | A labelled identity declared on a machine — an account, its secret, and whether it is elevated. What a surface runs *as* (§19.2). |
+| **Login** | A labelled identity declared on a machine or inherited from its template: an account, its secret, and whether it is elevated. Inherited logins are never the default identity (§19.2). |
 | **Instance** | A lab file run under the effective name `<declared>-<instance>` rather than its declared name, so one lab file can run from two directories at once (§3.2). |
 
 ---
@@ -415,6 +415,7 @@ A failed variant build reports which variant failed and stops; the base and ever
 - Store key is **arch + name + version**. References take the form **`<arch>/<name>[@<version>][#<variant>]`** — arch is mandatory, always explicit, never inferred from the host; version omitted means highest in the store; the `#<variant>` suffix selects one disk of a version that has variants (§6.6). `vmlab validate` rejects archless references.
 - Each store entry's `template.wcl` records its hardware and provenance, baked agent version, and the wscript-surface version used by embedded scripts. A missing surface version identifies a legacy pre-versioning template and is accepted. A host compiles a band of surfaces, a floor up to its own: a template recording a surface below the floor is refused with one message to rebuild it, and one recording a surface newer than the host's is refused by name with one message to upgrade vmlab — before any embedded script compiles, whether at a clone's first boot or as a layered build's source. Surface 2 adds `boot_id`, `wait_rebooted`, `eject_cdrom`, `logins`, `as_login` and `as_account` on the machine handle. Surface 3 adds host USB passthrough (§5.2.1): `lab.usb_devices()`, and `usb_attach`, `usb_attach_force`, `usb_detach`, `usb_detach_all` and `usb_attached` on the machine handle. Surface 4 adds console recording (§11.1): `record` on the machine handle, and the `Recording` handle it returns with `stop` and `path`. Surface 5 adds OCR options (§10.3): `ocr_opts` and `wait_for_text_opts` on the machine handle.
 - `vmlab template list / rm` manage the store. `list` shows each version's variants beneath it, the default marked and a stale one flagged; `rm <arch>/<name>@<version>` removes the version with all its variants, and `rm …#<variant>` removes that one variant (§6.6).
+- Surface 6 adds template-declared logins (§19.2), recorded in `template.wcl` even when there is no embedded first-boot script. Older metadata schemas reject the new `login` blocks before they can report a surface-version mismatch. Templates declaring logins therefore require a surface-6 host.
 - `vmlab template export` produces a single portable archive (qcow2 + metadata, and every variant's `variants/<variant>/disk.qcow2` with the full `template.wcl`); `vmlab template import` installs one, refusing any variant whose overlay is not the one its block's `sha256` names or whose `base_sha256` is not the archive's base — the offline/sneakernet sharing path.
 - The online sharing path is OCI registries (§6.4).
 
@@ -1252,7 +1253,7 @@ rule.
 **The machine declares who you are, and vmlab logs you on as them.** Identity is
 a property of the machine, not of the command, and is declared with a repeatable
 `login "<label>" { user, password?, elevated?, default? }` block on `vm` and
-`container`. A child block rather than flat fields because the account and its
+`container`, or on a template whose build created the account. A child block rather than flat fields because the account and its
 secret are meaningless split, and because `elevated` needs somewhere to land.
 
 **A surface selects a login by its *label*.** `vmlab shell dev01` runs as the
@@ -1269,6 +1270,19 @@ credential store, no login verb, no wscript credential API, and no second WCL
 dependency** (WCL has no environment or file interpolation, so "declare it but
 do not commit it" was never available). Consistent with §1.2 — vmlab is not a
 security boundary.
+
+**A template may declare the same login blocks.** Its build records them in
+the store entry's `template.wcl`, with plaintext secrets: the template's own
+build already contains them, for example in an unattend file. A clone whose
+machine declares no logins inherits all of its template's logins in declaration
+order. A machine declaring any logins inherits none. There is no merging.
+Inherited logins are marked as coming from the template in machine information.
+
+**An inherited login is never the machine's default identity**, even when it
+is the only login or declares `default = true`. `--user <label>` and
+`as_login(label)` may select it explicitly. Otherwise `exec`, `shell`,
+provisions, and the workspace syncer retain the agent identity. RDP's fallback
+to the first inherited login is the sole exception (§20.2).
 
 **Precedence: CLI flag → wscript → `login {}` → agent identity.** `vmlab shell
 --user admin dev01`; `--user`/`--password` on `exec`/`shell` for an account the
@@ -1424,7 +1438,8 @@ into `systemprofile`.
 > - More than one `login` with `default = true` on a machine is a validation
 >   error, naming both.
 
-A lone `login {}` is the default implicitly, matching `@dev`'s shape.
+A lone machine-declared `login {}` is the default implicitly, matching
+`@dev`'s shape. Template-inherited logins never participate in this rule.
 
 ### 19.3 The SSH facade
 
@@ -2300,9 +2315,12 @@ Enterprise, Education or Server"*.
 
 A shared app runs as a declared login, resolved exactly as for `exec` and
 `shell` (§19.2): `--user`/`--password`, else the machine's default login, else
-the agent identity. RDP cannot log on as the agent identity, so a Windows
-machine with no login and no `--user` is refused with *"RDP needs an account:
-declare a `login {}` on `<machine>` or pass --user/--password"*.
+the agent identity. RDP cannot log on as the agent identity. With no explicit
+`--user`, it first uses the machine's default login, then the template's first
+inherited login. If neither exists, it refuses with *"RDP needs an account:
+declare a `login {}` on `<machine>` or pass --user/--password; the template
+declares no account"*. An explicit `--user SYSTEM` remains a refusal, not a
+request to use the template fallback.
 
 ### 20.3 Session shape
 
@@ -2344,6 +2362,17 @@ connection (`guest/agent-proto/src/app.rs`):
 Waypipe runs with `--compress lz4` on both ends, because a client and server
 that disagree on compression refuse each other.
 
+Protocol diagnostics stay separate from application output. By default,
+FreeRDP's stdout and stderr go to `freerdp.log` in the private session runtime
+directory. A real failure
+prints that path and up to 20 trailing non-backtrace lines, and retains the
+log for inspection. Success, normal disconnect, and user logoff are not
+failures (FreeRDP codes 0, 1, 2, 11, and 12).
+`vmlab app run --verbose` restores protocol diagnostics to the terminal.
+Waypipe's own logs are hidden unless verbose, while the program's output,
+including stderr, remains visible. New agents advertise the log split;
+older agents keep their existing mixed output. `--detach` preserves this choice.
+
 Windows allows one session per account: client editions always, and Server
 while "Restrict each user to a single session" (`fSingleSessionPerUser`) is
 on, which is its default. A second RDP connection as the same account takes the
@@ -2355,7 +2384,8 @@ each `app run` its own session and connection.
 The waypipe and X11 sessions end when the program exits, and `app run` exits
 with its code. Interrupting `app run` closes the session, which kills the guest
 program. The RDP session ends when FreeRDP exits, and `app run` exits with
-FreeRDP's code. Interrupting it disconnects the Windows session rather than
+FreeRDP's code on failure, or zero for a normal disconnect or user logoff.
+Interrupting it disconnects the Windows session rather than
 logging it off, as closing an RDP client does: the program keeps running there,
 and its windows come back with the account's next shared app on that machine.
 vmlab does not log the session off, because on a client edition it can be the

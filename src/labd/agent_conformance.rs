@@ -353,6 +353,12 @@ impl Fixture {
                     )
                 ),
                 "app_waypipe" => check!("app_waypipe", app_case(&handle, AppMode::Waypipe)),
+                "app_log_split" => check!("app_log_split", async {
+                    ensure(
+                        handle.has_feature("app_waypipe"),
+                        "app_log_split requires app_waypipe",
+                    )
+                }),
                 "app_rdp" => check!("app_rdp", async {
                     let result = handle
                         .open_app(AppMode::Rdp, vec![], vec![], None, None)
@@ -667,6 +673,7 @@ impl Fixture {
                     env: vec![],
                     cwd: None,
                     logon: None,
+                    split_logs: false,
                 })
                 .await?;
             tokio::time::timeout(BUDGET, async {
@@ -1474,7 +1481,7 @@ async fn app_case(handle: &AgentHandle, mode: AppMode) -> Result<()> {
                                 connection.close().await;
                             }
                         }
-                        AppRecord::Log { .. } => {}
+                        AppRecord::Log { .. } | AppRecord::Diagnostic { .. } => {}
                         other => bail!("agent sent daemon-only app record {other:?}"),
                     }
                 }

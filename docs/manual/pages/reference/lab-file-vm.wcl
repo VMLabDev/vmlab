@@ -201,6 +201,13 @@ SRC
     one account may be declared twice at different elevation, and `--user`
     selects between labels.
   DOC
+  p <<DOC
+    With no machine-declared logins, a VM inherits its template's logins.
+    Declaring any login replaces all inherited logins. Inherited logins can
+    be selected by label but never become the machine's default, including
+    when the template declares `default = true`. RDP alone falls back to the
+    first inherited login when there is no machine default.
+  DOC
   code wcl { source = <<'SRC'
 login "<label>" {
   user     = "PROBE\\dev"

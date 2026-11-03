@@ -43,13 +43,18 @@ pub struct Client {
 
 impl Client {
     /// Start the client and wait for its socket to appear.
-    pub async fn start(bin: &Path) -> Result<Self> {
+    pub async fn start(bin: &Path, verbose: bool) -> Result<Self> {
         let dir = super::private_dir()?;
         let socket = dir.path().join("wp.sock");
         let mut child = tokio::process::Command::new(bin)
             .args(client_args(&socket))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
+            .stderr(if verbose {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting `{}`", bin.display()))?;
@@ -101,6 +106,51 @@ impl Client {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn stderr_probe() {
+        let Some(bin) = std::env::var_os("VMLAB_TEST_WAYPIPE_BIN") else {
+            return;
+        };
+        let verbose = std::env::var_os("VMLAB_TEST_WAYPIPE_VERBOSE").is_some();
+        let _client = Client::start(Path::new(&bin), verbose).await.unwrap();
+    }
+
+    #[test]
+    fn host_diagnostics_are_quiet_unless_verbose() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let fake = scratch.path().join("waypipe");
+        std::fs::write(
+            &fake,
+            "#!/usr/bin/env python3\nimport socket, sys, time\nprint('host-waypipe-diagnostic', file=sys.stderr, flush=True)\ns = socket.socket(socket.AF_UNIX); s.bind(sys.argv[sys.argv.index('--socket') + 1]); s.listen(1)\ntime.sleep(60)\n",
+        ).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for verbose in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "appshare::waypipe::tests::stderr_probe",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("VMLAB_TEST_WAYPIPE_BIN", &fake)
+                .env_remove("VMLAB_TEST_WAYPIPE_VERBOSE");
+            if verbose {
+                command.env("VMLAB_TEST_WAYPIPE_VERBOSE", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr).contains("host-waypipe-diagnostic"),
+                verbose
+            );
+        }
+    }
+
     /// The client listens on the session's private socket, with the
     /// compression the agent's server is started with.
     #[test]
@@ -137,7 +187,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let client = Client::start(&fake).await.unwrap();
+        let client = Client::start(&fake, false).await.unwrap();
         let dir = client.socket.parent().unwrap().to_path_buf();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);

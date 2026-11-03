@@ -276,7 +276,25 @@ impl Mux {
 
     /// Send a control message to the host.
     pub fn send_ctrl(&self, msg: &AgentMsg) {
-        self.send(encode_ctrl(msg));
+        let bytes = encode_ctrl(msg).unwrap_or_else(|error| {
+            let detail = error.to_string();
+            let reply = match msg {
+                AgentMsg::Clipboard { .. } | AgentMsg::ClipboardFailed { .. } => {
+                    AgentMsg::ClipboardFailed { msg: detail }
+                }
+                AgentMsg::TimeSetFailed { .. } => AgentMsg::TimeSetFailed { msg: detail },
+                AgentMsg::Error { id, .. } => AgentMsg::Error {
+                    id: *id,
+                    msg: detail,
+                },
+                _ => AgentMsg::Error {
+                    id: None,
+                    msg: detail,
+                },
+            };
+            encode_ctrl(&reply).expect("bounded control error serializes")
+        });
+        self.send(bytes);
     }
 
     /// Send channel payload bytes. The caller must have taken credit first.
@@ -626,7 +644,20 @@ impl Mux {
                 env,
                 cwd,
                 logon,
-            } => crate::app::open(self, platform, id, mode, AppSpec { argv, env, cwd }, logon),
+                split_logs,
+            } => crate::app::open(
+                self,
+                platform,
+                id,
+                mode,
+                AppSpec {
+                    argv,
+                    env,
+                    cwd,
+                    split_logs,
+                },
+                logon,
+            ),
             HostMsg::OpenAppConn { id, app } => crate::app::open_conn(self, id, app),
             HostMsg::WindowAdjust { id, bytes } => self.grant(id, bytes),
             HostMsg::Close { id } => self.remove(id),
@@ -1142,7 +1173,7 @@ mod tests {
         for msg in [&barrier, &opened, &eof, &exited, &barrier] {
             assert_eq!(
                 rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
-                encode_ctrl(msg)
+                encode_ctrl(msg).unwrap()
             );
         }
         assert!(
@@ -1163,6 +1194,45 @@ mod tests {
             Input::Eof => panic!("bytes first"),
         }
         assert!(matches!(input.recv().unwrap(), Input::Eof));
+    }
+
+    #[test]
+    fn oversized_control_replies_fail_without_stopping_the_writer() {
+        let (mux, mut cap) = capture_mux();
+        mux.send_ctrl(&AgentMsg::Clipboard {
+            text: "x".repeat(300_000),
+        });
+        assert!(matches!(cap.ctrl(), AgentMsg::ClipboardFailed { msg }
+            if msg.contains("65536")));
+        mux.send_ctrl(&AgentMsg::OsInfo {
+            info: OsInfo {
+                id: "linux".into(),
+                name: "x".repeat(300_000),
+                version: String::new(),
+                kernel: String::new(),
+                arch: String::new(),
+                hostname: String::new(),
+            },
+        });
+        assert!(matches!(cap.ctrl(), AgentMsg::Error { id: None, msg }
+            if msg.contains("65536")));
+        mux.send_ctrl(&AgentMsg::Metrics {
+            cpu_pct: 0.0,
+            mem_used: 0,
+            mem_total: 0,
+            disks: vec![vmlab_agent_proto::DiskUsage {
+                mount: "x".repeat(300_000),
+                used: 0,
+                total: 0,
+            }],
+        });
+        assert!(matches!(cap.ctrl(), AgentMsg::Error { id: None, msg }
+            if msg.contains("65536")));
+        mux.send_error(Some(7), "x".repeat(300_000));
+        assert!(matches!(cap.ctrl(), AgentMsg::Error { id: Some(7), msg }
+            if msg.contains("65536")));
+        mux.send_ctrl(&AgentMsg::Pong { instance: None });
+        assert_eq!(cap.ctrl(), AgentMsg::Pong { instance: None });
     }
 
     #[test]

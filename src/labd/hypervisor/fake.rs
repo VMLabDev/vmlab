@@ -1025,7 +1025,10 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                 _ => continue,
             };
             let shutting_down = matches!(reply, AgentMsg::ShuttingDown { .. });
-            if tx.write_all(&encode_ctrl(&reply)).await.is_err() {
+            let Ok(frame) = encode_ctrl(&reply) else {
+                return;
+            };
+            if tx.write_all(&frame).await.is_err() {
                 return;
             }
             if shutting_down {

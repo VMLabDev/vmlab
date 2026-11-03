@@ -30,6 +30,9 @@ pub struct RunArgs {
     /// Hand the session to a background helper and return at once
     #[arg(long)]
     pub detach: bool,
+    /// Show the window protocol clients' diagnostic output
+    #[arg(long)]
+    pub verbose: bool,
     /// Guest working directory for the program
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<String>,
@@ -48,6 +51,9 @@ impl RunArgs {
         if let Some(via) = self.via {
             out.extend(["--via".into(), via.as_str().into()]);
         }
+        if self.verbose {
+            out.push("--verbose".into());
+        }
         if let Some(cwd) = &self.cwd {
             out.extend(["--cwd".into(), cwd.clone()]);
         }
@@ -64,7 +70,7 @@ impl RunArgs {
 }
 
 /// `vmlab app run` — show a guest program's windows on this desktop, and exit
-/// with the program's code (FreeRDP's, for a Windows guest).
+/// with the program's code (FreeRDP's on failure for a Windows guest).
 pub fn cmd_app_run(args: RunArgs) -> Result<()> {
     if args.cmd.is_empty() {
         bail!("nothing to run — usage: vmlab app run [lab/]machine -- <cmd> [args...]");
@@ -92,6 +98,7 @@ pub fn cmd_app_run(args: RunArgs) -> Result<()> {
         cwd: args.cwd,
         user: args.run_as.user,
         password: args.run_as.password,
+        verbose: args.verbose,
     };
     let code = rt.block_on(async {
         let (_name, client) = lab_client_for(lab).await?;
@@ -184,6 +191,7 @@ mod tests {
             machine: "lab/web".into(),
             via: Some(Mode::X11),
             detach: true,
+            verbose: true,
             cwd: Some("/srv".into()),
             run_as: As {
                 user: Some("dev".into()),

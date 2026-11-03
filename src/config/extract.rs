@@ -392,7 +392,7 @@ fn extract_media(b: &Block, issues: &mut IssueList) -> Option<Media> {
 /// A machine's `login {}` block (§19.2). `elevated` and `default` stay
 /// optional in the model: both rules that read them ask whether the author
 /// *wrote* the field, not what it would resolve to.
-fn extract_login(b: &Block, issues: &mut IssueList) -> Option<Login> {
+pub(crate) fn extract_login(b: &Block, issues: &mut IssueList) -> Option<Login> {
     let mut r = Reader::new(b, issues);
     let label = r.label();
     let span = r.span();
@@ -403,6 +403,7 @@ fn extract_login(b: &Block, issues: &mut IssueList) -> Option<Login> {
         password: r.string("password").unspan(),
         elevated: r.bool("elevated").unspan(),
         default: r.bool("default").unspan(),
+        origin: LoginOrigin::Machine,
         span,
     })
 }
@@ -949,10 +950,16 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
     let mut nics = Vec::new();
     let mut extra_disks = Vec::new();
     let mut variants = Vec::new();
+    let mut logins = Vec::new();
     let mut gpu = None;
     for child in r.children() {
         match child.kind() {
             "source" => source = extract_source(&child, r.issues()),
+            "login" => {
+                if let Some(login) = extract_login(&child, r.issues()) {
+                    logins.push(login);
+                }
+            }
             "gpu" => gpu = extract_gpu(&child, r.issues()),
             "media" => {
                 if let Some(m) = extract_media(&child, r.issues()) {
@@ -1014,6 +1021,7 @@ fn extract_template(b: &Block, issues: &mut IssueList) -> Option<TemplateDef> {
         arch: arch?.value,
         version: version?.value,
         source: source?,
+        logins,
         registry,
         profile,
         cpus,

@@ -456,19 +456,21 @@ The port-forward rules a lab's machines require, resolved to leases and
 gateways before any is installed.
 
 **Login**:
-A labelled identity declared on a machine with a repeatable `login {}` block —
+A labelled identity declared on a machine or inherited from its template with a repeatable `login {}` block —
 an account, its secret, and whether it is elevated. What a surface runs *as*,
 selected by label — `--user`, `as_login`, or the **default login** — never by
 the raw account. Declared on the machine rather than on `@dev`, because `exec`,
 `shell` and `vmlab cp` reach every machine: an unmarked machine needs an
-identity too. A machine may declare any number, or none — with none, everything falls to the
-**agent identity**.
+identity too. A machine may declare any number, or none. With none, it inherits
+the template's logins for explicit selection and RDP's fallback. Those logins
+never change its default **agent identity**. Declaring any machine login
+replaces all template logins; there is no merging.
 _Avoid_: user (that is a person, or the guest's OS account), credential (that
 is the secret alone), account (the guest owns those; vmlab owns the login)
 
 **Default login**:
 The login carrying `default = true`, or — where none does — the only login the
-machine declares. The same implicit-lone rule as the **default dev machine**,
+machine declares. An inherited login is never the default. The same implicit-lone rule as the **default dev machine**,
 and for the same reason: a lone declaration never has to meet the concept.
 
 **Script identity**:
