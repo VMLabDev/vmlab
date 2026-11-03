@@ -206,16 +206,6 @@ fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
              (PRD §22); remove it, or use hypervisor = \"qemu\""
         ));
     }
-    // vmlab reads the host's TSC frequency through a paused QEMU, and
-    // vmlab-hv has neither the probe that would replace it (HV phase-2 D10)
-    // nor a frequency to pin in its machine description yet.
-    if h.tsc.is_some() {
-        why.push(phase(
-            name,
-            "a pinned TSC (`tsc`)",
-            "after 2f (D10's host probe)",
-        ));
-    }
 }
 
 /// Why QEMU cannot run `vm` as declared — what only vmlab-hv brings, one
@@ -403,6 +393,8 @@ mod tests {
             format!(r#"{base} profile = "linux-generic""#),
             format!(r#"{base} profile = "linux-generic" display = "virtio-vga""#),
             format!(r#"{base} profile = "linux-generic" nested = true"#),
+            format!(r#"{base} profile = "linux-generic" tsc = "host""#),
+            format!(r#"{base} profile = "windows-11" tsc = "host""#),
             format!(r#"{base} profile = "linux-generic" gpu {{ mode = "virgl" }}"#),
             format!(r#"{base} profile = "linux-modern" gpu {{ mode = "vulkan" }}"#),
             format!(r#"{base} profile = "linux-modern" gpu {{ mode = "passthrough" }}"#),
@@ -430,10 +422,6 @@ mod tests {
     fn what_a_later_phase_brings_is_refused_naming_that_phase() {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
         let cases = [
-            (
-                r#"profile = "linux-generic" tsc = "host""#,
-                "phase after 2f",
-            ),
             (r#"profile = "macos""#, "phase macOS"),
             (r#"profile = "windows-legacy""#, "phase 4"),
         ];
