@@ -63,6 +63,8 @@ main() {
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/boot-without-waits.patch"
   sed -i 's/\r$//' "$work/OvmfPkg/PlatformDxe/Platform.c" "$work/OvmfPkg/PlatformDxe/Platform.inf"
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/host-resolution.patch"
+  sed -i 's/\r$//' "$work/BaseTools/Source/C/GenFw/Elf64Convert.c"
+  patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/reproducible-debug-path.patch"
   cp "$SCRIPT_DIR/logo/Logo.bmp" "$work/MdeModulePkg/Logo/Logo.bmp"
 
   (
@@ -78,6 +80,7 @@ main() {
     . ./edksetup.sh
     set -u
     make -C BaseTools -j "${VMLAB_OVMF_JOBS:-8}"
+    python3 "$SCRIPT_DIR/ovmf/test-genfw-reproducible.py" "$work/BaseTools/Source/C/bin/GenFw"
     local mode
     local -a flags=(
       -a X64 -t GCC -p OvmfPkg/OvmfPkgX64.dsc
@@ -138,6 +141,8 @@ main() {
     sha256sum "$SCRIPT_DIR/ovmf/reproducible-iscsi-pcd.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/boot-without-waits.patch" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/ovmf/host-resolution.patch" | sed "s|$SCRIPT_DIR/||"
+    sha256sum "$SCRIPT_DIR/ovmf/reproducible-debug-path.patch" | sed "s|$SCRIPT_DIR/||"
+    sha256sum "$SCRIPT_DIR/ovmf/test-genfw-reproducible.py" | sed "s|$SCRIPT_DIR/||"
     sha256sum "$SCRIPT_DIR/logo/Logo.bmp" | sed "s|$SCRIPT_DIR/||"
     (cd "$OUT" && sha256sum OVMF_CODE_4M*.fd OVMF_VARS_4M*.fd)
   } >"$OUT/BUILDINFO"
