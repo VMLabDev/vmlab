@@ -72,10 +72,13 @@ pub trait ValidationContext {
     }
 
     /// The host config's default hypervisor per machine kind (PRD §22). A
-    /// permissive context answers QEMU for both, as a host with no config
-    /// does.
+    /// permissive context uses automatic VM selection and QEMU containers.
     fn hypervisor_defaults(&self) -> HypervisorDefaults {
         HypervisorDefaults::default()
+    }
+
+    fn existing_hypervisor(&self, _machine: &str) -> Option<HypervisorKind> {
+        None
     }
 
     /// The host facts vmlab-hv's refusals read: the host's arch and whether
@@ -245,9 +248,8 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     let mut static_ips: HashMap<Ipv4Addr, Span> = HashMap::new();
     let mut macs: HashMap<MacAddr, Span> = HashMap::new();
     let mut segment_gateways: HashMap<String, Span> = HashMap::new();
-    let hypervisors = ctx.hypervisor_defaults();
     for vm in &lab.vms {
-        let vm_hypervisor = hypervisors.effective(MachineCfg::Vm(vm));
+        let vm_hypervisor = selected_hypervisor(MachineCfg::Vm(vm), ctx);
         if !machine_names.insert(&vm.name) {
             issues.push(Issue::at(
                 vm.span,
@@ -635,7 +637,10 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     // -- template definitions -----------------------------------------------
     let mut tdefs: HashSet<(&str, &str, &str)> = HashSet::new();
     // A build VM names no hypervisor, so it runs on the host's VM default.
-    let build_hypervisor = ctx.hypervisor_defaults().vm;
+    let build_hypervisor = ctx
+        .hypervisor_defaults()
+        .vm
+        .unwrap_or(HypervisorKind::Vmlab);
     for t in &file.templates {
         if !tdefs.insert((&t.arch, &t.name, &t.version)) {
             issues.push(Issue::at(
@@ -1883,7 +1888,6 @@ fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
 /// [`vmlab_refusals`]'s, so the daemon refuses the same machines for the same
 /// words.
 fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueList) {
-    let defaults = ctx.hypervisor_defaults();
     let mut host = None;
     for m in lab.machines() {
         if let MachineCfg::Vm(vm) = m
@@ -1899,7 +1903,7 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
                 ),
             ));
         }
-        if defaults.effective(m) != HypervisorKind::Vmlab {
+        if selected_hypervisor(m, ctx) != HypervisorKind::Vmlab {
             if let MachineCfg::Vm(vm) = m {
                 for why in qemu_refusals(vm) {
                     issues.push(Issue::at(vm.span, why));
@@ -1916,6 +1920,21 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
             issues.push(Issue::at(m.span(), why));
         }
     }
+}
+
+fn selected_hypervisor(machine: MachineCfg<'_>, ctx: &dyn ValidationContext) -> HypervisorKind {
+    let hardware = match machine {
+        MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
+        MachineCfg::Container(_) => None,
+    };
+    ctx.hypervisor_defaults()
+        .select(
+            machine,
+            &ctx.host_facts(),
+            hardware.as_ref(),
+            ctx.existing_hypervisor(machine.name()),
+        )
+        .kind
 }
 
 /// A VM's resolved hardware, when this context can resolve it: a store
@@ -3257,7 +3276,7 @@ lab "l" {
         let f = lab(r#"import <vmlab.wcl>
 lab "l" {
   segment "s" { }
-  vm "a" { template = "x86_64/t" nic { segment = "s" }
+  vm "a" { template = "x86_64/t" hypervisor = "qemu" nic { segment = "s" }
     share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" }
     share { host = "." guest = "/mnt/a" name = "a" }
     share { host = "." guest = "/mnt/s" name = "s" transport = "smb" } }
@@ -3428,7 +3447,7 @@ template "t" {{
             )
             .unwrap();
             let f = lab(r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" gpu { mode = "vulkan" } } }"#);
+lab "l" { vm "a" { template = "x86_64/t" hypervisor = "qemu" gpu { mode = "vulkan" } } }"#);
             validate(
                 &f,
                 &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path()), host),
@@ -4405,7 +4424,7 @@ lab "l" {
     fn audio_needs_vmlab_hv_and_a_microphone_needs_audio() {
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "q" { template = "x86_64/t" audio = true microphone = true }"#,
+            r#"vm "q" { template = "x86_64/t" hypervisor = "qemu" audio = true microphone = true }"#,
         );
         assert_eq!(es.len(), 2, "{es:#?}");
         assert!(
@@ -4447,7 +4466,7 @@ lab "l" {
 lab "l" {
   vm "hv" { template = "x86_64/t" hypervisor = "vmlab"
     share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" } }
-  vm "q" { template = "x86_64/t"
+  vm "q" { template = "x86_64/t" hypervisor = "qemu"
     share { host = "." guest = "/mnt/w" name = "w" transport = "virtiofs" } }
 }"#);
         let es: Vec<String> = validate(&f, &NoVirtiofsd)
@@ -4474,6 +4493,27 @@ lab "l" {
             r#"vm "v" { template = "x86_64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
+    }
+
+    #[test]
+    fn automatic_fallback_validates_while_an_explicit_vmlab_still_refuses() {
+        for setting in [
+            r#"profile = "linux-modern" qemu_args = ["-no-hpet"]"#,
+            r#"profile = "linux-modern" accel = "tcg""#,
+            r#"profile = "windows-legacy""#,
+            r#"profile = "linux-modern" tsc = "host""#,
+        ] {
+            let body = format!(
+                r#"vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }}"#
+            );
+            let errors = hv_errs(&HvHost::kvm(), &body);
+            assert!(errors.is_empty(), "{body}: {errors:?}");
+        }
+        let es = hv_errs(
+            &HvHost::kvm(),
+            r#"vm "v" { template = "scratch" arch = "x86_64" disk = 1GiB profile = "linux-modern" audio = true }"#,
+        );
+        assert!(es.is_empty(), "{es:?}");
     }
 
     #[test]
@@ -4530,7 +4570,7 @@ lab "l" {
         let host = HvHost {
             defaults: HypervisorDefaults {
                 container: HypervisorKind::Vmlab,
-                vm: HypervisorKind::Vmlab,
+                vm: Some(HypervisorKind::Vmlab),
             },
             ..HvHost::kvm()
         };

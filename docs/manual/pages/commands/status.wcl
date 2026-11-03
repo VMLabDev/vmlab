@@ -103,6 +103,13 @@ SRC
   h3 "Machines"
 
   p <<DOC
+    A VM using automatic QEMU fallback prints `hypervisor=qemu fallback:`
+    and its reason below the machine row, even without `--verbose`.
+    JSON status includes `hypervisor` and optional `hypervisor_fallback`.
+    A preserved QEMU identity also reports why it stays on QEMU.
+  DOC
+
+  p <<DOC
     One row per machine with the columns `NAME`, `KIND` (`vm` or
     `container`), `STATUS`, `IP` and `TEMPLATE/IMAGE`. `STATUS` is a label
     the daemon derives from the power state, readiness and health, so every
@@ -129,8 +136,9 @@ SRC
     `diverged=yes` on a machine whose agent was replaced by
     [vmlab machine repair-agent](cmd_machine) or by the agent refresh in
     [vmlab up](cmd_up). Every machine then adds `hypervisor=`, `qemu` or
-    `vmlab`: the hypervisor it runs on, its own `hypervisor` or the
-    [host default](ref_host) for its kind. A VM on a template with variants then adds
+    `vmlab`: the selected hypervisor, resolved from explicit settings,
+    persisted VM identity, or automatic selection. See [Host configuration](ref_host).
+    A VM on a template with variants then adds
     `variant=`, the variant its clone is backed on, including the default a
     reference without `#` picked. Every VM adds `arch`, `cpus`,
     `memory` and `agent`: the version of the agent running in the guest, as

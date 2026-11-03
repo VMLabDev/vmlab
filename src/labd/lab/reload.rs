@@ -198,7 +198,7 @@ impl LabRuntime {
     /// Build `cfgs`, against the network and freeze this daemon assembled,
     /// persisting the MACs and pins they settle on. Fails naming the first
     /// machine that cannot be built.
-    async fn build_machines(
+    pub(super) async fn build_machines(
         &self,
         cfgs: &[MachineCfg<'_>],
     ) -> Result<Vec<(Built, Option<PullJob>)>> {
@@ -289,7 +289,7 @@ impl LabRuntime {
     /// it was started on; once a rebuild has replaced that instance it is
     /// handed the new one — or stopped, when the new declaration carries no
     /// workspace (§19.6). One that was not running stays so: `up` starts it.
-    async fn rebind_workspace(&self, name: &str) {
+    pub(super) async fn rebind_workspace(&self, name: &str) {
         if !self.workspaces.reports().await.contains_key(name) {
             return;
         }

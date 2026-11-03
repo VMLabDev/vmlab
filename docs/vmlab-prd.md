@@ -2739,3 +2739,37 @@ and loads none, because neither an accelerated renderer's state nor a
 passed-through device's is vmlab-hv's to save; offline snapshots are
 unaffected. Host USB devices refuse an online snapshot while attached, on
 either hypervisor (§5.2.1).
+
+### 22.1 Amendment: automatic selection for modern VMs (2026-11-03)
+
+This amendment replaces the original QEMU VM default above. Containers still
+default to QEMU. Selection follows this order:
+
+1. The machine's explicit `hypervisor`.
+2. An explicit host `hypervisor { vm = ... }` setting.
+3. The VM's persisted hypervisor identity.
+4. For a new VM, vmlab-hv when `vmlab_refusals` returns no reasons, otherwise QEMU.
+
+Automatic fallback does not raise a vmlab-hv validation error. `status` shows
+the selected hypervisor and fallback reason. JSON includes `hypervisor` and
+`hypervisor_fallback`; `up` prints an info line naming the VM and reason.
+Explicit vmlab selections, including a host override, still refuse unsupported
+hardware. Missing binaries and runtime failures do not trigger fallback.
+
+Before the first boot can create disks, vmlab persists the selected hypervisor
+in `.vmlab/state.json`. The choice survives stops, reloads and daemon restarts
+until `destroy` or an explicit machine or host setting. Existing disks without
+an identity are treated as QEMU; where snapshots record a hypervisor, the most
+recent record supplies the identity. A recorded identity takes precedence over
+snapshot history. Worktree clones inherit the source identity. Deferred template
+pulls resolve selection against the downloaded hardware before boot.
+
+Online snapshots remain bound to their recorded hypervisor. Explicitly moving
+a machine does not convert its snapshots. Offline snapshots remain portable.
+The e2e runner defaults to `--hypervisor vmlab` and explicitly pins both machine
+kinds for each scenario, retaining QEMU-only scenarios.
+
+The default-switch PR remains a draft pending N6-N8 network support and pinned
+TSC support. Rebase against both packages, update the protocol pin as required,
+remove the delivered TSC refusal, review fast-path routing, and rerun the gate
+and live checks before marking it ready.

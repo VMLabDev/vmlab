@@ -307,6 +307,21 @@ fn kvm_host() -> crate::config::hypervisor::HostFacts {
     }
 }
 
+#[test]
+fn automatic_hypervisor_selection_follows_a_deferred_templates_hardware() {
+    use crate::config::hypervisor::HypervisorKind;
+    let dirs = Dirs::new();
+    let (mut machine, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    machine.set_host_facts(kvm_host());
+    let machine = machine.with_automatic_hypervisor(Some(Default::default()));
+    assert_eq!(machine.hypervisor(), HypervisorKind::Vmlab);
+    let mut parts = (*machine.template()).clone();
+    parts.resolved.machine = "pc".into();
+    machine.set_template(parts);
+    assert_eq!(machine.hypervisor(), HypervisorKind::Qemu);
+    assert!(machine.hypervisor_fallback().unwrap().contains("i440fx"));
+}
+
 /// A container on a fake hypervisor, image already bound. `decl` is the
 /// `container "…" { … }` block.
 fn container(

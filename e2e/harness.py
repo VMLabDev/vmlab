@@ -50,7 +50,7 @@ class Result:
 
 
 class Harness:
-    def __init__(self, keep: bool = False, hypervisor: str = "qemu", delivered: str = VMLAB_DELIVERED):
+    def __init__(self, keep: bool = False, hypervisor: str = "vmlab", delivered: str = VMLAB_DELIVERED):
         self.keep = keep
         # Which hypervisor the run's machines are on, and on vmlab-hv the
         # last phase it has delivered.
@@ -211,13 +211,8 @@ class Harness:
     def host_config(self, vms: bool = False) -> str:
         """The `host {}` lines that put this run's machines on its hypervisor:
         containers always, VMs where `vms` says (`vms_follow`)."""
-        if self.hypervisor == "qemu":
-            return ""
-        kinds = ["container"]
-        if vms:
-            kinds.append("vm")
-        pins = " ".join(f'{k} = "{self.hypervisor}"' for k in kinds)
-        return f"  hypervisor {{ {pins} }}\n"
+        vm = self.hypervisor if vms else "qemu"
+        return f'  hypervisor {{ container = "{self.hypervisor}" vm = "{vm}" }}\n'
 
     # -- recording -----------------------------------------------------------
 

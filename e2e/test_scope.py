@@ -41,6 +41,15 @@ class ScenarioScopeTests(unittest.TestCase):
                 self.assertEqual(h.results[feature][0], "pass", feature)
         self.assertEqual(len(delivered), 33)
 
+    def test_host_config_pins_both_kinds_for_every_run(self):
+        for hypervisor in ("qemu", "vmlab"):
+            h = self.new_harness(hypervisor)
+            for vms in (False, True):
+                config = h.host_config(vms)
+                self.assertIn(f'container = "{hypervisor}"', config)
+                vm = hypervisor if vms else "qemu"
+                self.assertIn(f'vm = "{vm}"', config)
+
     def test_unsupported_features_keep_their_reasons(self):
         h = self.new_harness("vmlab")
         h.vms_here = True

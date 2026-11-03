@@ -89,7 +89,7 @@ pub struct HostConfig {
     /// Native viewer grab release chord; `None` keeps the viewer's default.
     pub viewer_release_chord: Option<String>,
     /// The hypervisor a machine that names none runs on, by kind (PRD §22,
-    /// `host { hypervisor { … } }`). QEMU for both until a phase flips it.
+    /// `host { hypervisor { … } }`). Automatic VMs; QEMU containers.
     pub hypervisor: crate::config::hypervisor::HypervisorDefaults,
     /// Set NOCOW on a machine's disk directory on btrfs before its disks
     /// are created (PRD §7.1, `nocow.rs`); `false` keeps them copy-on-write.
@@ -272,7 +272,7 @@ impl HostConfig {
                     cfg.hypervisor.container = v;
                 }
                 if let Some(v) = h.keyword("vm", HypervisorKind::NAMES).unspan() {
-                    cfg.hypervisor.vm = v;
+                    cfg.hypervisor.vm = Some(v);
                 }
             }
             if let Some(span) = r.field_span("gpu_address") {
@@ -507,7 +507,7 @@ mod tests {
         use crate::config::hypervisor::HypervisorKind;
         let none = HostConfig::default();
         assert_eq!(none.hypervisor.container, HypervisorKind::Qemu);
-        assert_eq!(none.hypervisor.vm, HypervisorKind::Qemu);
+        assert_eq!(none.hypervisor.vm, None);
         assert_eq!(none.vmlab_hv, None);
         assert_eq!(none.vmlab_hv_viewer, None);
         assert_eq!(none.viewer_release_chord, None);
@@ -525,7 +525,7 @@ host {
         )
         .unwrap();
         assert_eq!(cfg.hypervisor.container, HypervisorKind::Vmlab);
-        assert_eq!(cfg.hypervisor.vm, HypervisorKind::Qemu);
+        assert_eq!(cfg.hypervisor.vm, None);
         assert_eq!(
             cfg.vmlab_hv.as_deref(),
             Some(Path::new("/opt/vmlab-hv/bin/vmlab-hv"))

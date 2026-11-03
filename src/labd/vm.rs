@@ -17,6 +17,7 @@ use crate::smb::VirtiofsMount;
 use crate::sync::LockRecover;
 
 use super::hypervisor::{Control, Frames, Hypervisor, Input, Process};
+use super::machine::Machine;
 
 /// How long a VM gets to become ready: it may be running a template first-boot
 /// provision through a Windows specialize/OOBE pass and a settle reboot.
@@ -255,6 +256,7 @@ impl VmDirs {
 /// registry pull can bind the real parts after the daemon is already up —
 /// `build()` installs a meta-less placeholder when the template isn't cached
 /// yet, and `LabRuntime::ensure_pulled` swaps in the resolved parts.
+#[derive(Clone)]
 pub struct TemplateParts {
     pub resolved: qemu::ResolvedVm,
     /// Backing template disk in the store (None for scratch / not yet pulled).
@@ -357,6 +359,9 @@ pub struct VmInstance {
     /// Which hypervisor `hv` is (§22), as the machine reports it and its
     /// snapshots record it.
     hypervisor: HypervisorKind,
+    hypervisor_fallback: Option<String>,
+    automatic_hypervisor: Option<crate::config::host::HostConfig>,
+    pinned_selection: std::sync::OnceLock<crate::config::hypervisor::HypervisorSelection>,
     /// The host facts vmlab-hv's refusals read at each start (§22): this
     /// host, probed, in production; a test's own, so a machine on a fake
     /// hypervisor does not depend on the host running the test.
@@ -447,6 +452,9 @@ impl VmInstance {
             agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
             hypervisor: HypervisorKind::Qemu,
+            hypervisor_fallback: None,
+            automatic_hypervisor: None,
+            pinned_selection: std::sync::OnceLock::new(),
             host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
             host_config: Arc::new(crate::config::host::HostConfig::load_default),
             input_tap: Arc::default(),
@@ -464,6 +472,51 @@ impl VmInstance {
         me.hypervisor = kind;
         me.hv = hv;
         self
+    }
+
+    pub(super) fn with_hypervisor_fallback(
+        mut self: Arc<Self>,
+        reason: Option<String>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("a freshly built VM has one owner")
+            .hypervisor_fallback = reason;
+        self
+    }
+
+    pub(super) fn with_automatic_hypervisor(
+        mut self: Arc<Self>,
+        host: Option<crate::config::host::HostConfig>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("a freshly built VM has one owner")
+            .automatic_hypervisor = host;
+        self
+    }
+
+    fn selection(&self) -> crate::config::hypervisor::HypervisorSelection {
+        if let Some(selection) = self.pinned_selection.get() {
+            return selection.clone();
+        }
+        match &self.automatic_hypervisor {
+            Some(host) => host.hypervisor.select(
+                crate::config::model::MachineCfg::Vm(&self.cfg),
+                &(self.host_facts)(),
+                Some(&self.template().resolved),
+                None,
+            ),
+            None => crate::config::hypervisor::HypervisorSelection {
+                kind: self.hypervisor,
+                fallback_reason: self.hypervisor_fallback.clone(),
+            },
+        }
+    }
+
+    fn emulator(&self) -> Arc<dyn Hypervisor> {
+        match &self.automatic_hypervisor {
+            Some(host) => super::hypervisor::for_machine(self.hypervisor(), host, true),
+            None => self.hv.clone(),
+        }
     }
 
     /// Run this VM against a different hypervisor — the injection point
@@ -502,7 +555,7 @@ impl VmInstance {
     /// a real one.
     pub fn virtiofs_share_indices(&self) -> Vec<usize> {
         use crate::labd::share_plan::{HostVirtiofsd, Transport, transport_of};
-        let host = HostVirtiofsd::of(self.hv.virtiofsd().as_ref());
+        let host = HostVirtiofsd::of(self.emulator().virtiofsd().as_ref());
         let guest_ok = self.template().resolved.virtiofs;
         self.cfg
             .shares
@@ -521,7 +574,7 @@ impl VmInstance {
     /// run started; a stopped one, which an online restore boots first, with
     /// the virtiofsd it would start.
     async fn online_snapshot_refusal(&self) -> Option<String> {
-        if self.hypervisor == HypervisorKind::Vmlab
+        if self.hypervisor() == HypervisorKind::Vmlab
             && let Some(why) =
                 crate::config::hypervisor::vmlab_online_snapshot_refusal(&self.template().resolved)
         {
@@ -533,7 +586,7 @@ impl VmInstance {
         if self.virtiofs_share_indices().is_empty() {
             return None;
         }
-        self.hv
+        self.emulator()
             .virtiofsd()
             .and_then(|v| v.snapshot_refusal(&self.cfg.name))
     }
@@ -939,7 +992,7 @@ impl VmInstance {
             &host,
             &qemu::hostgpu::Sysfs::host(),
             &crate::paths::data_dir(),
-            self.hypervisor,
+            self.hypervisor(),
         )
         .with_context(|| format!("{}: gpu", self.cfg.name))?;
         for warning in &plan.warnings {
@@ -1001,12 +1054,12 @@ impl VmInstance {
     async fn start_virtiofsds(
         &self,
     ) -> Result<(Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>)> {
-        let in_process = self.hv.virtiofs_in_process();
+        let in_process = self.emulator().virtiofs_in_process();
         let mut served = Vec::new();
         let mut procs = Vec::new();
         let mut devices = Vec::new();
         let mut mounts = Vec::new();
-        let vfsd = self.hv.virtiofsd();
+        let vfsd = self.emulator().virtiofsd();
         let indices = self.virtiofs_share_indices();
         *self.snapshot_refusal.lock().expect("refusal lock") = match &vfsd {
             Some(v) if !indices.is_empty() => v.snapshot_refusal(&self.cfg.name),
@@ -1049,7 +1102,7 @@ impl VmInstance {
             }
             let sock = self.dirs.vfs_sock(i);
             let proc = self
-                .hv
+                .emulator()
                 .start_virtiofsd(
                     &format!("{}/{}", self.cfg.name, share.name),
                     &sock,
@@ -1178,10 +1231,16 @@ impl VmInstance {
         let t = self.template();
         let run = async {
             self.check_apple_smc_osk()?;
+            if self.hypervisor() == HypervisorKind::Qemu {
+                let why = crate::config::hypervisor::qemu_refusals(&self.cfg);
+                if !why.is_empty() {
+                    bail!("{}", why.join("\n"));
+                }
+            }
             // A deferred pull binds its template's hardware after the lab
             // builder checked the placeholder, so vmlab-hv's refusals are
             // asked again of what this start will run (§22).
-            let kvm = if self.hypervisor == HypervisorKind::Vmlab {
+            let kvm = if self.hypervisor() == HypervisorKind::Vmlab {
                 let host = (self.host_facts)();
                 let why = crate::config::hypervisor::vmlab_refusals(
                     model::MachineCfg::Vm(&self.cfg),
@@ -1217,7 +1276,7 @@ impl VmInstance {
 
             if t.resolved.tpm {
                 let swtpm = self
-                    .hv
+                    .emulator()
                     .start_tpm(
                         &self.cfg.name,
                         &self.dirs.tpm_state(),
@@ -1279,11 +1338,11 @@ impl VmInstance {
             // The machine answers control shortly after spawn (-S leaves CPUs
             // paused); the hypervisor returns once it does.
             let super::hypervisor::Running { proc, control } = self
-                .hv
+                .emulator()
                 .start_emulator(super::hypervisor::LaunchSpec {
                     label: format!(
                         "{}:{}",
-                        match self.hypervisor {
+                        match self.hypervisor() {
                             HypervisorKind::Qemu => "qemu",
                             HypervisorKind::Vmlab => "vmlab-hv",
                         },
@@ -1291,8 +1350,8 @@ impl VmInstance {
                     ),
                     machine,
                     env: render.env,
-                    log: self.dirs.hypervisor_log(self.hypervisor),
-                    control_sock: self.dirs.control_sock(self.hypervisor),
+                    log: self.dirs.hypervisor_log(self.hypervisor()),
+                    control_sock: self.dirs.control_sock(self.hypervisor()),
                     fds: nic_fds,
                     channels: super::hypervisor::GuestChannels {
                         agent: self.dirs.agent_sock(),
@@ -1829,7 +1888,7 @@ impl super::display::DisplayHost for VmInstance {
     }
 
     fn stream_source(&self) -> crate::record::StreamSource {
-        match self.hypervisor {
+        match self.hypervisor() {
             HypervisorKind::Qemu => crate::record::StreamSource::Vnc(self.dirs.vnc_sock()),
             HypervisorKind::Vmlab => crate::record::StreamSource::Native(self.dirs.display_sock()),
         }
@@ -1883,11 +1942,11 @@ impl super::machine::Machine for VmInstance {
     }
 
     fn virtiofsd(&self) -> Option<crate::qemu::virtiofsd::Virtiofsd> {
-        self.hv.virtiofsd()
+        self.emulator().virtiofsd()
     }
 
     fn virtiofs_in_process(&self) -> bool {
-        self.hv.virtiofs_in_process()
+        self.emulator().virtiofs_in_process()
     }
 
     fn as_machine(&self) -> &dyn super::machine::Machine {
@@ -1945,11 +2004,15 @@ impl super::machine::Machine for VmInstance {
     /// QEMU inherits a tap descriptor; vmlab-hv's NICs are stream sockets
     /// (HV-D9 leaves its fast path unfixed).
     fn takes_tap_fds(&self) -> bool {
-        self.hypervisor == HypervisorKind::Qemu
+        self.hypervisor() == HypervisorKind::Qemu
     }
 
     fn hypervisor(&self) -> HypervisorKind {
-        self.hypervisor
+        self.selection().kind
+    }
+
+    fn hypervisor_fallback(&self) -> Option<String> {
+        self.selection().fallback_reason
     }
 
     fn event_subject(&self) -> &'static str {
@@ -1990,8 +2053,8 @@ impl super::machine::Machine for VmInstance {
                     .is_ok_and(|p| p.gpu.is_some_and(|g| g.qemu_binary.is_some()))
             })
         });
-        if self.hypervisor == HypervisorKind::Vmlab {
-            needed.push(self.hv.emulator_binary(&t.resolved.arch));
+        if self.hypervisor() == HypervisorKind::Vmlab {
+            needed.push(self.emulator().emulator_binary(&t.resolved.arch));
         } else if !own_qemu {
             needed.push(qemu::emulator_binary(&t.resolved.arch));
         }
@@ -2060,6 +2123,9 @@ impl super::machine::Machine for VmInstance {
         // Safety net for paths that don't pull explicitly (restore, wscript):
         // a no-op unless this VM's template download is still pending.
         lab.ensure_pulled(&self.cfg.name).await?;
+        self.pinned_selection.get_or_init(|| self.selection());
+        lab.record_hypervisor(&self.cfg.name, self.hypervisor())
+            .await?;
         let events = lab.events().clone();
         events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
         self.agent.set_handshake_hook(super::boot_clock::lab_hook(

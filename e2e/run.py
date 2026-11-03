@@ -78,7 +78,7 @@ def scenario_features(name: str) -> set[str]:
 
 def write_host_config(h: Harness, vms: bool = False) -> None:
     """The host config the run's supervisor and lab daemons read: only what
-    selects the hypervisor, and nothing at all on QEMU, which is the default.
+    selects both machine kinds explicitly, including QEMU-only scenarios.
     Rewritten per scenario, since whether VMs follow is the scenario's."""
     lines = h.host_config(vms)
     if not lines:
@@ -94,8 +94,8 @@ def main() -> int:
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--keep", action="store_true", help="leave labs up for inspection")
     ap.add_argument("--list", action="store_true")
-    ap.add_argument("--hypervisor", choices=["qemu", "vmlab"], default="qemu",
-                    help="the hypervisor the suite's machines run on (default qemu)")
+    ap.add_argument("--hypervisor", choices=["qemu", "vmlab"], default="vmlab",
+                    help="the hypervisor the suite's machines run on (default vmlab)")
     ap.add_argument("--vmlab-phase", choices=PHASE_ORDER[1:], default=VMLAB_DELIVERED,
                     help=f"the last vmlab-hv phase delivered (default {VMLAB_DELIVERED})")
     args = ap.parse_args()

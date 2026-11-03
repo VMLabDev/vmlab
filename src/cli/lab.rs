@@ -651,6 +651,9 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
             if verbose {
                 let _ = writeln!(out, "      {}", machine_detail(m));
             }
+            if let Some(reason) = &m.hypervisor_fallback {
+                let _ = writeln!(out, "      hypervisor={} fallback: {reason}", m.hypervisor);
+            }
         }
     }
 
@@ -2643,6 +2646,22 @@ mod tests {
     /// Both kinds share one table and one `STATUS` column carrying the label
     /// the daemon derived, so the CLI and the console cannot word a machine
     /// differently.
+    #[test]
+    fn the_status_table_reports_fallback_reasons_without_verbose() {
+        let mut vm = crate::status::fixtures::machine("old", PowerState::Stopped, false, vm());
+        vm.hypervisor_fallback = Some("old: `qemu_args` requires QEMU".into());
+        let status = lab(vec![vm]);
+        assert!(
+            render_status(&status, false).contains("hypervisor=qemu fallback: old: `qemu_args`")
+        );
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["machines"][0]["hypervisor"], "qemu");
+        assert_eq!(
+            json["machines"][0]["hypervisor_fallback"],
+            "old: `qemu_args` requires QEMU"
+        );
+    }
+
     #[test]
     fn the_status_table_reports_the_derived_label_for_both_kinds() {
         let out = render_status(

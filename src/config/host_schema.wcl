@@ -60,7 +60,7 @@ type HostConfig {
 type HostHypervisor {
   @doc("Default for `container` blocks: `qemu` (default) | `vmlab`")
   container: utf8?
-  @doc("Default for `vm` blocks: `qemu` (default) | `vmlab` (refused on a VM until vmlab-hv's phase 2)")
+  @doc("Explicit default for `vm` blocks: `qemu` | `vmlab`; unset preserves existing identity, then selects vmlab-hv for supported VMs or QEMU with a fallback reason")
   vm: utf8?
 }
 
