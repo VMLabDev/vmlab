@@ -555,7 +555,7 @@ async fn build_variant(
     )
     .await?;
 
-    log_build_gpu(&spec, &def.arch, log);
+    log_build_gpu(&spec, &def.arch, vm.hypervisor(), log);
     log(format!("booting variant build VM ({})\n", v.name));
     if def.gui {
         crate::viewer::open_when_ready(vm.dirs.vnc_sock());
@@ -1134,7 +1134,7 @@ async fn run_build(
     }
 
     // Boot + run build provision scripts (PRD §6.1, §10.4).
-    log_build_gpu(&BuildSpec::base(def), &def.arch, log);
+    log_build_gpu(&BuildSpec::base(def), &def.arch, vm.hypervisor(), log);
     log("booting build VM\n".to_string());
     // `gui = true` builds get a viewer once QEMU creates the VNC socket;
     // up() below blocks through provisioning, so this watches concurrently.
@@ -1748,7 +1748,12 @@ fn check_spec_hardware(
 /// boot then does. A `host_gpu` this host lacks warns here as a lab's does.
 /// A pick this host refuses is left to the start, which refuses with the
 /// same words; nothing is said for a build with no `gpu {}`.
-fn log_build_gpu(spec: &BuildSpec<'_>, arch: &str, log: &OutputSink) {
+fn log_build_gpu(
+    spec: &BuildSpec<'_>,
+    arch: &str,
+    hypervisor: crate::config::hypervisor::HypervisorKind,
+    log: &OutputSink,
+) {
     let Some(gpu) = spec.gpu else {
         return;
     };
@@ -1761,7 +1766,7 @@ fn log_build_gpu(spec: &BuildSpec<'_>, arch: &str, log: &OutputSink) {
         &host,
         &crate::qemu::hostgpu::Sysfs::host(),
         &crate::paths::data_dir(),
-        host.hypervisor.vm,
+        hypervisor,
     );
     let Ok(plan) = plan else {
         return;

@@ -15,6 +15,9 @@ use crate::config::model::MacAddr;
 /// the image fields simply stay `None` on a VM.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MachineState {
+    /// The hypervisor owning this machine's disks. Cleared by destroy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor: Option<crate::config::hypervisor::HypervisorKind>,
     /// MAC per NIC index — generated deterministically, persisted so DHCP
     /// reservations stay stable (PRD §9.4).
     #[serde(default)]
@@ -53,6 +56,29 @@ pub struct MachineState {
     /// restarted between the timeout and the next run must still refuse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timed_out_run: Option<TimedOutRun>,
+}
+
+impl MachineState {
+    /// Old disks without an identity predate automatic selection. Preserve
+    /// QEMU unless a snapshot records a later vmlab-hv run.
+    pub fn existing_hypervisor(
+        &self,
+        local: &Path,
+    ) -> Option<crate::config::hypervisor::HypervisorKind> {
+        self.hypervisor
+            .or_else(|| {
+                self.snapshots
+                    .values()
+                    .max_by_key(|s| s.taken_at)
+                    .map(|s| s.hypervisor)
+            })
+            .or_else(|| {
+                local
+                    .join("disk0.qcow2")
+                    .exists()
+                    .then_some(crate::config::hypervisor::HypervisorKind::Qemu)
+            })
+    }
 }
 
 /// A config-weave run that timed out, and the process tree it ran in.
@@ -414,6 +440,25 @@ mod tests {
     }
 
     /// A lab that has never run has no state file, and that is not an error.
+    #[test]
+    fn existing_disks_and_persisted_identity_survive_default_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = LabState::default();
+        assert_eq!(state.machine_mut("v").existing_hypervisor(tmp.path()), None);
+        std::fs::write(tmp.path().join("disk0.qcow2"), []).unwrap();
+        assert_eq!(
+            state.machine_mut("v").existing_hypervisor(tmp.path()),
+            Some(HypervisorKind::Qemu)
+        );
+        state.machine_mut("v").hypervisor = Some(HypervisorKind::Vmlab);
+        state.save(tmp.path()).unwrap();
+        let loaded = LabState::load(tmp.path()).unwrap();
+        assert_eq!(
+            loaded.machines["v"].existing_hypervisor(tmp.path()),
+            Some(HypervisorKind::Vmlab)
+        );
+    }
+
     #[test]
     fn a_missing_state_file_is_a_fresh_lab() {
         let tmp = tempfile::tempdir().unwrap();

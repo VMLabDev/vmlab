@@ -127,6 +127,15 @@ pub trait LabServices: Send + Sync + 'static {
     /// no-op once cached, so a fully-cached lab stays offline.
     async fn ensure_pulled(&self, machine: &str) -> Result<()>;
 
+    /// Save the disk owner's identity before boot can materialise disks.
+    async fn record_hypervisor(
+        &self,
+        _machine: &str,
+        _kind: crate::config::hypervisor::HypervisorKind,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Make sure the lab's shared-folder server is serving. Idempotent.
     async fn ensure_shares(&self);
 
@@ -618,6 +627,10 @@ pub trait Machine: Send + Sync + 'static {
         crate::config::hypervisor::HypervisorKind::Qemu
     }
 
+    fn hypervisor_fallback(&self) -> Option<String> {
+        None
+    }
+
     // ---- host USB passthrough (PRD §5.2.1) ---------------------------------
 
     /// Whether this machine can take a host USB device now: running, and
@@ -822,6 +835,7 @@ impl dyn Machine {
             // And the recording: the lab daemon owns it (§11.1).
             recording: None,
             hypervisor: self.hypervisor(),
+            hypervisor_fallback: self.hypervisor_fallback(),
             detail,
         }
     }

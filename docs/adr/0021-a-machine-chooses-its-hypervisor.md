@@ -86,3 +86,26 @@ default for its kind, which starts at QEMU (D11, D27, D29).**
 - The protocol pin. The crate is a git revision; a protocol version bump on
   the hypervisor side fails the handshake with both versions named, which is
   the cue to move the pin.
+
+## Amendment: modern VMs select vmlab-hv automatically (2026-11-03)
+
+For a new VM with no explicit machine or host hypervisor setting, select
+vmlab-hv when `vmlab_refusals` is empty. Otherwise select QEMU and expose the
+reason in ordinary status, JSON status, and an info line during `up`.
+Explicit `vmlab` settings still fail validation for refused hardware.
+Containers retain their QEMU default.
+
+Selection precedence is machine setting, explicit per-kind host setting,
+persisted VM identity, then automatic selection. Persist identity before boot
+creates disks and retain it until destroy or an explicit override. Existing
+disks without an identity stay on QEMU; the newest snapshot supplies an identity
+where recorded. This avoids changing the hardware beneath an existing guest or
+stranding its online snapshots merely because vmlab's default changed.
+Worktree clones inherit identity. Deferred pulls select against the downloaded
+template hardware. Runtime errors and missing binaries remain errors.
+
+Pinned TSC and N6-N8 networking are supported on vmlab-hv. A supported q35 VM
+with `tsc = "host"` selects vmlab-hv automatically, and the e2e `fastpath`
+scenario follows the selected hypervisor. Kernel fast-path tiers retain their
+host capability requirements. Automatic QEMU fallback remains for `qemu_args`,
+legacy PC/i440fx, macOS and hosts without KVM.

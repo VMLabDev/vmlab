@@ -161,7 +161,33 @@ pub(super) async fn build_vm(
     let resolved = crate::qemu::resolve_vm(vm_cfg, meta.as_ref(), cx.profiles)?;
     // A VM on vmlab-hv is refused anything its delivered phases cannot run;
     // a pending pull's placeholder hardware is checked again once it binds.
-    let hypervisor = hypervisor_for(cx, MachineCfg::Vm(vm_cfg), Some(&resolved))?;
+    let dirs = VmDirs::new(cx.lab, &vm_cfg.name, cx.lab_local);
+    let existing = state
+        .machines
+        .get(&vm_cfg.name)
+        .cloned()
+        .unwrap_or_default()
+        .existing_hypervisor(&dirs.local)
+        .or_else(|| {
+            cx.freeze
+                .and_then(|f| f.record(&vm_cfg.name))
+                .and_then(|record| record.existing_hypervisor(&dirs.local))
+        })
+        .or_else(|| dirs.qmp_sock().exists().then_some(HypervisorKind::Qemu));
+    let selection = cx.host.hypervisor.select(
+        MachineCfg::Vm(vm_cfg),
+        &crate::config::hypervisor::HostFacts::probe(),
+        Some(&resolved),
+        existing,
+    );
+    let hypervisor = checked_hypervisor(MachineCfg::Vm(vm_cfg), Some(&resolved), selection.kind)?;
+    // Persist a migrated identity before a reload or deferred pull can rebuild it.
+    if existing.is_some()
+        && cx.freeze.and_then(|f| f.record(&vm_cfg.name)).is_none()
+        && state.machine_mut(&vm_cfg.name).hypervisor.is_none()
+    {
+        state.machine_mut(&vm_cfg.name).hypervisor = existing;
+    }
 
     // Stable MACs: explicit > persisted > generated (PRD §9.4). A
     // machine about to be cloned from the freeze has no disk, so
@@ -184,7 +210,6 @@ pub(super) async fn build_vm(
         state.machine_mut(&vm_cfg.name).macs = macs.clone();
     }
 
-    let dirs = VmDirs::new(cx.lab, &vm_cfg.name, cx.lab_local);
     let mut cdroms = Vec::new();
     if let Some(c) = &vm_cfg.cdrom {
         cdroms.push(cx.root.join(c));
@@ -254,7 +279,16 @@ pub(super) async fn build_vm(
         hypervisor,
         super::hypervisor::for_machine(hypervisor, cx.host, true),
     );
-    Ok((vm, pending))
+    Ok((
+        vm.with_hypervisor_fallback(selection.fallback_reason)
+            .with_automatic_hypervisor(
+                (vm_cfg.hypervisor.is_none()
+                    && cx.host.hypervisor.vm.is_none()
+                    && existing.is_none())
+                .then(|| cx.host.clone()),
+            ),
+        pending,
+    ))
 }
 
 /// Build one container, and the download it is waiting on when its image is
@@ -348,13 +382,38 @@ fn hypervisor_for(
     machine: MachineCfg<'_>,
     hardware: Option<&crate::qemu::ResolvedVm>,
 ) -> Result<HypervisorKind> {
-    let kind = cx.host.hypervisor.effective(machine);
+    let kind = cx
+        .host
+        .hypervisor
+        .select(
+            machine,
+            &crate::config::hypervisor::HostFacts::probe(),
+            hardware,
+            None,
+        )
+        .kind;
+    checked_hypervisor(machine, hardware, kind)
+}
+
+fn checked_hypervisor(
+    machine: MachineCfg<'_>,
+    hardware: Option<&crate::qemu::ResolvedVm>,
+    kind: HypervisorKind,
+) -> Result<HypervisorKind> {
     if kind == HypervisorKind::Vmlab {
         let why = crate::config::hypervisor::vmlab_refusals(
             machine,
             &crate::config::hypervisor::HostFacts::probe(),
             hardware,
         );
+        if !why.is_empty() {
+            bail!("{}", why.join("\n"));
+        }
+    }
+    if kind == HypervisorKind::Qemu
+        && let MachineCfg::Vm(vm) = machine
+    {
+        let why = crate::config::hypervisor::qemu_refusals(vm);
         if !why.is_empty() {
             bail!("{}", why.join("\n"));
         }

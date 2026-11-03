@@ -455,18 +455,23 @@ DOC
   h2 "QEMU or vmlab-hv"
 
   p <<'DOC'
-QEMU runs every machine unless one says otherwise. vmlab-hv is vmlab's own
+Supported new x86_64 KVM VMs default to vmlab-hv. Other new VMs fall back
+to QEMU, with the reason in `status`, `status --json`, and an info line at `up`.
+Containers still default to QEMU. vmlab-hv is vmlab's own
 hypervisor, built a phase at a time, on an x86_64 host with a usable
 `/dev/kvm`; it has no TCG fallback. It runs container micro-VMs, and modern
 VMs on the q35 machine: SeaBIOS or OVMF with secure boot, a TPM and the
 Hyper-V enlightenments, std VGA or virtio-vga, virtio or SATA disks, CD-ROMs,
 virtio-net NICs and the USB tablet — the Linux profiles and the Windows 10, 11
 and Server templates as they are — plus a `gpu {}` of any mode, virtio-fs
-shares, `usb = true`, a pinned `tsc`, and [guest audio](guide_audio). A guest that reboots
+shares, `usb = true`, a pinned `tsc`, and [guest audio](guide_audio). Supported
+new VMs with `tsc = "host"` also select vmlab-hv automatically. Its virtio-net
+NICs support offloaded multiqueue streams and passed TAP/vhost-net descriptors
+for the kernel fast path, subject to the host's capabilities. A guest that reboots
 itself is reset in place, as on QEMU; the VM reads as not ready until its
-agent answers again. A machine opts in with `hypervisor = "vmlab"`, and `host {
+agent answers again. A machine can force `hypervisor = "vmlab"`, and `host {
 hypervisor { container = "vmlab" vm = "vmlab" } }` moves every machine of that
-kind that names none. `vmlab validate` refuses what vmlab-hv cannot run yet,
+kind that names none. For explicit vmlab settings, validation refuses what it cannot run yet,
 naming the machine, the reason and the phase that brings it: macOS, the i440fx
 machine and floppies, `accel = "tcg"`, `input = "usb"`, and
 `qemu_args` in every phase.
@@ -495,9 +500,11 @@ design.
 DOC
 
   p <<'DOC'
-Choose vmlab-hv for a container when you want to try the new hypervisor on one
-machine inside a lab that otherwise runs on QEMU. Keep QEMU for everything
-else, and for any container that must also run on a host without KVM. Two
+An existing VM keeps its recorded hypervisor until destroy or an explicit
+machine or host setting. Old disks without a record stay on QEMU; snapshot
+history supplies the identity where available. To force QEMU for VMs, set
+`host { hypervisor { vm = "qemu" } }`. Containers require an explicit vmlab
+setting to move to vmlab-hv. Two
 things differ on a vmlab-hv machine. It has no emulation fallback, so where
 QEMU falls back to TCG, vmlab-hv refuses the machine. And an online snapshot
 is stored in the format of the hypervisor that took it, so it does not restore

@@ -83,7 +83,11 @@ first release**: the host-side SSH facade (ADR-0012, superseded), `vmlab ssh`,
 and `dev use`, `attachable`, and the agent's `tunnel` vocabulary. A dev
 machine is reached with `vmlab shell` and `vmlab exec`.
 **A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
-"vmlab"` on a machine, else the host config's default per kind (QEMU), puts it
+"vmlab"` on a machine, else an explicit host default, else the VM's persisted
+identity, selects its hypervisor. New supported x86_64 KVM VMs default to
+vmlab-hv; refused declarations fall back to QEMU with a status and `up` reason.
+Containers still default to QEMU. VM identity sticks until destroy or an explicit
+setting; old disks without an identity stay on QEMU. The selection puts it
 on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
 pinned by git rev). Phase 1 runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
@@ -101,7 +105,10 @@ serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
 `microphone` on a VM (§11, hv-audio D7), an HDA on the host node
 `vmlab.<lab>.<machine>`, refused on QEMU. A pinned TSC uses `vmlab-hv --probe`
 at the first KVM start, keeps `tsc-hz`, and passes `invtsc` and `tsc_khz`
-in the machine description. Everything else — macOS, i440fx, `qemu_args`, hosts without
+in the machine description. N6-N8 networking supplies offloaded multiqueue
+virtio-net streams and passed TAP/vhost-net descriptors; the e2e `fastpath`
+scenario follows the selected hypervisor. Kernel tiers still require host
+capabilities. Everything else — macOS, i440fx, `qemu_args`, hosts without
 KVM — is refused from one list naming the phase that brings it. Snapshots
 record their hypervisor and an online one refuses to restore under the other;
 a vmlab-hv VM with a GPU takes none (HV D9).
@@ -143,7 +150,7 @@ Module map under `src/`:
 - `config/` — WCL schema, typed model, §5.1 validation, host config, profiles;
   `projection.rs` reflects `schema.wcl` into the Schema projection (ADR-0005);
   `hypervisor.rs` is which hypervisor a machine runs on (§22, ADR-0021) — its
-  own `hypervisor`, else the host config's default for its kind — and
+  explicit settings, persisted VM identity, then automatic selection — and
   `vmlab_refusals`, the one list of what vmlab-hv cannot run yet, read by
   validation and again by the lab daemon.
 - `instance.rs` — lab instances (ADR-0011's amendment, PRD §3.2): the

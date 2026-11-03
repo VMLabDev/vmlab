@@ -2,8 +2,9 @@
 //! one cannot run yet.
 //!
 //! A machine names its hypervisor with `hypervisor = "qemu" | "vmlab"`; one
-//! that names none takes the host config's default for its kind, which
-//! starts at QEMU for both. `vmlab` is `vmlab-hv`, vmlab's own hypervisor,
+//! that names none takes an explicit host default, its existing hypervisor,
+//! or automatic VM selection. Containers still default to QEMU.
+//! `vmlab` is `vmlab-hv`, vmlab's own hypervisor,
 //! which grows phase by phase. [`vmlab_refusals`] is **the** list of what it
 //! cannot run yet — validation reads it, and so does the lab daemon before
 //! it builds a machine — so a phase that lands shrinks one function.
@@ -50,16 +51,45 @@ impl std::fmt::Display for HypervisorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HypervisorDefaults {
     pub container: HypervisorKind,
-    pub vm: HypervisorKind,
+    /// `None` selects vmlab-hv for supported new VMs, QEMU otherwise.
+    pub vm: Option<HypervisorKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HypervisorSelection {
+    pub kind: HypervisorKind,
+    pub fallback_reason: Option<String>,
 }
 
 impl HypervisorDefaults {
-    /// The hypervisor `machine` runs on: its own `hypervisor`, else this
-    /// host's default for its kind.
-    pub fn effective(&self, machine: MachineCfg<'_>) -> HypervisorKind {
-        match machine {
-            MachineCfg::Vm(vm) => vm.hypervisor.unwrap_or(self.vm),
-            MachineCfg::Container(c) => c.hypervisor.unwrap_or(self.container),
+    /// Explicit settings win over persisted identity. Only automatic VM
+    /// selection falls back; an explicit vmlab selection is still validated.
+    pub fn select(
+        &self,
+        machine: MachineCfg<'_>,
+        host: &HostFacts,
+        hardware: Option<&ResolvedVm>,
+        existing: Option<HypervisorKind>,
+    ) -> HypervisorSelection {
+        let explicit = match machine {
+            MachineCfg::Vm(vm) => vm.hypervisor.or(self.vm),
+            MachineCfg::Container(c) => Some(c.hypervisor.unwrap_or(self.container)),
+        };
+        if let Some(kind) = explicit.or(existing) {
+            return HypervisorSelection {
+                kind,
+                fallback_reason: (explicit.is_none() && kind == HypervisorKind::Qemu)
+                    .then(|| format!("{}: keeping existing QEMU machine until destroy or an explicit hypervisor setting", machine.name())),
+            };
+        }
+        let why = vmlab_refusals(machine, host, hardware);
+        HypervisorSelection {
+            kind: if why.is_empty() {
+                HypervisorKind::Vmlab
+            } else {
+                HypervisorKind::Qemu
+            },
+            fallback_reason: (!why.is_empty()).then(|| why.join("; ")),
         }
     }
 }
@@ -117,6 +147,9 @@ pub fn vmlab_refusals(
 fn vm_refusals(vm: &Vm, host: &HostFacts, hardware: Option<&ResolvedVm>) -> Vec<String> {
     let name = &vm.name;
     let mut why = Vec::new();
+    if host.arch != VMLAB_ARCH {
+        why.push(arch_refusal("vm host", name, &host.arch));
+    }
     if !vm.qemu_args.is_empty() {
         why.push(qemu_args_refusal("vm", name));
     }
@@ -312,23 +345,141 @@ mod tests {
 }"#);
         let defaults = HypervisorDefaults {
             container: HypervisorKind::Qemu,
-            vm: HypervisorKind::Vmlab,
+            vm: Some(HypervisorKind::Vmlab),
         };
-        let pick = |name: &str| defaults.effective(file.lab.machine(name).unwrap());
+        let pick = |name: &str| {
+            defaults
+                .select(file.lab.machine(name).unwrap(), &kvm_host(), None, None)
+                .kind
+        };
         assert_eq!(pick("a"), HypervisorKind::Vmlab);
         assert_eq!(pick("b"), HypervisorKind::Qemu);
         assert_eq!(pick("c"), HypervisorKind::Qemu);
         assert_eq!(pick("d"), HypervisorKind::Vmlab);
-        // With no host config, everything is QEMU.
+        // Containers keep QEMU; supported new VMs select vmlab-hv.
         let none = HypervisorDefaults::default();
         assert_eq!(
-            none.effective(file.lab.machine("b").unwrap()),
+            none.select(file.lab.machine("b").unwrap(), &kvm_host(), None, None)
+                .kind,
             HypervisorKind::Qemu
         );
         assert_eq!(
-            none.effective(file.lab.machine("d").unwrap()),
-            HypervisorKind::Qemu
+            none.select(file.lab.machine("d").unwrap(), &kvm_host(), None, None)
+                .kind,
+            HypervisorKind::Vmlab
         );
+    }
+
+    #[test]
+    fn automatic_vm_selection_falls_back_and_preserves_explicit_and_existing_choices() {
+        let file = lab(r#"lab "l" {
+          vm "modern" { template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 1GiB }
+          vm "args" { template = "x86_64/t" qemu_args = ["-no-hpet"] }
+          vm "explicit" { template = "x86_64/t" hypervisor = "vmlab" qemu_args = ["-no-hpet"] }
+        }"#);
+        let defaults = HypervisorDefaults::default();
+        let args = file.lab.machine("args").unwrap();
+        let picked = defaults.select(args, &kvm_host(), None, None);
+        assert_eq!(picked.kind, HypervisorKind::Qemu);
+        assert!(picked.fallback_reason.unwrap().contains("`qemu_args`"));
+        let explicit = defaults.select(
+            file.lab.machine("explicit").unwrap(),
+            &kvm_host(),
+            None,
+            None,
+        );
+        assert_eq!(explicit.kind, HypervisorKind::Vmlab);
+        assert!(explicit.fallback_reason.is_none());
+        let modern = file.lab.machine("modern").unwrap();
+        let hardware = crate::qemu::resolve_vm(
+            &file.lab.vms[0],
+            None,
+            &crate::profiles::ProfileSet::shipped().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            defaults
+                .select(modern, &kvm_host(), Some(&hardware), None)
+                .kind,
+            HypervisorKind::Vmlab
+        );
+        for kind in [HypervisorKind::Qemu, HypervisorKind::Vmlab] {
+            assert_eq!(
+                defaults
+                    .select(modern, &kvm_host(), Some(&hardware), Some(kind))
+                    .kind,
+                kind
+            );
+            let host = HypervisorDefaults {
+                vm: Some(kind),
+                ..defaults
+            };
+            assert_eq!(
+                host.select(
+                    modern,
+                    &kvm_host(),
+                    Some(&hardware),
+                    Some(HypervisorKind::Vmlab)
+                )
+                .kind,
+                kind
+            );
+        }
+        let no_kvm = HostFacts {
+            kvm: false,
+            ..kvm_host()
+        };
+        let picked = defaults.select(modern, &no_kvm, Some(&hardware), None);
+        assert_eq!(picked.kind, HypervisorKind::Qemu);
+        assert!(picked.fallback_reason.unwrap().contains("/dev/kvm"));
+    }
+
+    #[test]
+    fn automatic_selection_uses_the_resolved_refusal_list() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        for setting in [
+            r#"profile = "windows-legacy""#,
+            r#"profile = "macos""#,
+            r#"profile = "linux-modern" accel = "tcg""#,
+        ] {
+            let file = lab(&format!(
+                r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }} }}"#
+            ));
+            let vm = &file.lab.vms[0];
+            let hw = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
+            let picked = HypervisorDefaults::default().select(
+                MachineCfg::Vm(vm),
+                &kvm_host(),
+                Some(&hw),
+                None,
+            );
+            assert_eq!(picked.kind, HypervisorKind::Qemu, "{setting}");
+            assert_eq!(
+                picked.fallback_reason,
+                Some(vmlab_refusals(MachineCfg::Vm(vm), &kvm_host(), Some(&hw)).join("; "))
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_selection_supports_pinned_tsc_on_modern_vms() {
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        for profile in ["linux-modern", "windows-11"] {
+            let file = lab(&format!(
+                r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB profile = "{profile}" tsc = "host" }} }}"#
+            ));
+            let vm = &file.lab.vms[0];
+            let hardware = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
+            assert!(hardware.tsc.is_some());
+            let picked = HypervisorDefaults::default().select(
+                MachineCfg::Vm(vm),
+                &kvm_host(),
+                Some(&hardware),
+                None,
+            );
+            assert_eq!(picked.kind, HypervisorKind::Vmlab, "{profile}");
+            assert!(picked.fallback_reason.is_none(), "{profile}: {picked:?}");
+        }
     }
 
     #[test]

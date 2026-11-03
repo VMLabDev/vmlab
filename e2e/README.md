@@ -7,7 +7,7 @@ just e2e::run                        # every scenario, about 16 minutes
 just e2e::run --only core guest      # named scenarios only
 just e2e::run --only dev --keep      # leave the labs up for inspection
 just e2e::run --list                 # scenario names
-just e2e::run --hypervisor vmlab     # the machines on vmlab-hv, by phase
+just e2e::run --hypervisor qemu      # explicit QEMU coverage
 ```
 
 The host needs Docker and a usable `/dev/kvm`. The container runs privileged. If `~/.local/share/config-weave/bin` exists, the playbook scenario mounts it into the container.
@@ -26,9 +26,9 @@ The host needs Docker and a usable `/dev/kvm`. The container runs privileged. If
 
 ## Hypervisors
 
-A run is on one hypervisor (PRD §22): `--hypervisor qemu`, the default, or `--hypervisor vmlab`. The image builds `vmlab-hv` from the vmlab-hypervisor commit that `Cargo.lock` pins `vmlab-hv-proto` to, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
+A run defaults to `--hypervisor vmlab` (PRD §22); `--hypervisor qemu` retains QEMU coverage. The image builds `vmlab-hv` from the vmlab-hypervisor commit that `Cargo.lock` pins `vmlab-hv-proto` to, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
 
-On `vmlab`, the runner writes a host config whose `hypervisor {}` block puts containers on vmlab-hv, and a scenario's VMs too when it covers a VM feature of a delivered phase (2a onward). It is rewritten per scenario. `QEMU_SCENARIOS` names the scenarios whose VMs stay on QEMU, with the reason. Only `fastpath` stays pinned: it attaches VM NICs as taps, which vmlab-hv does not take. A VM feature it reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
+The runner writes an explicit host config for both machine kinds in every scenario. On `vmlab`, containers use vmlab-hv, and VMs do too when the scenario covers a delivered VM phase. Other VMs are explicitly pinned to QEMU. A QEMU run pins both kinds to QEMU. `QEMU_SCENARIOS` names exceptions and their reasons. `fastpath` remains pinned to QEMU until N6-N8 lands. A VM feature it reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
 
 `core` keeps the four-machine `core-lab` on QEMU. On vmlab-hv it runs three labs in sequence. Normal cleanup keeps at most two VMs running at once. `core-hv` covers lifecycle, hardware and parallel provisions with two machines. `core-hv-provision` checks a provision dependency with two machines. `core-hv-scratch` checks the blank-disk boot and forced stop with one machine. The labs reuse `core-lab`'s media and provision script. QEMU arguments and both floppy features retain their QEMU-only or phase-4 skip reasons. Reload checks edit QEMU's SMBIOS arguments on QEMU and memory on vmlab-hv. They check the live launch and the guest, including a pending edit, restart, a stopped-machine rebuild, and an unchanged peer PID. `core-unmountable` runs on both hypervisors.
 

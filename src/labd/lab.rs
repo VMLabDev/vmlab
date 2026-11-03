@@ -1470,6 +1470,8 @@ impl LabRuntime {
             // they carried goes with them: what comes back is the artefact's
             // own agent again (§19.4).
             entry.repaired_agent = None;
+            entry.hypervisor = None;
+            entry.snapshots.clear();
             m.forget_artefacts(entry).await;
             state.save(&self.lab_local)?;
         }
@@ -1477,6 +1479,25 @@ impl LabRuntime {
             &format!("{}.destroyed", m.event_subject()),
             json!({ m.event_subject(): name.to_string() }),
         );
+        // A sticky QEMU instance must be resolved again even when its lab
+        // declaration did not change. Destroy releases its disk identity.
+        if m.hypervisor_fallback().is_some() {
+            let _gate = self.rebuild_gate.write().await;
+            let config = self.config();
+            if let Some(cfg) = config.lab.machine(name) {
+                let (machine, pull) = self
+                    .build_machines(&[cfg])
+                    .await?
+                    .pop()
+                    .expect("one machine built");
+                self.pulls.lock_recover().set_pending(name, pull);
+                self.machines
+                    .write()
+                    .expect("machine set lock")
+                    .insert(machine, config.clone());
+                self.rebind_workspace(name).await;
+            }
+        }
         Ok(())
     }
 
@@ -2027,6 +2048,9 @@ impl LabRuntime {
         // said, not refused (§5.2). After the pull, which binds the template
         // layer a model may come from.
         for name in &targets {
+            if let Some(reason) = self.machine(name)?.hypervisor_fallback() {
+                output(format!("info: {name}: using QEMU: {reason}\n"));
+            }
             for warning in self.machine(name)?.launch_warnings() {
                 output(format!("warning: {warning}\n"));
             }
@@ -3521,6 +3545,16 @@ async fn wait_settled(m: &dyn Machine) {
 /// what kind of machine is asking.
 #[async_trait::async_trait]
 impl crate::labd::machine::LabServices for LabRuntime {
+    async fn record_hypervisor(
+        &self,
+        machine: &str,
+        kind: crate::config::hypervisor::HypervisorKind,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.machine_mut(machine).hypervisor = Some(kind);
+        state.save(&self.lab_local)
+    }
+
     fn events(&self) -> &Arc<EventLog> {
         &self.events
     }

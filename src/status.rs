@@ -478,6 +478,8 @@ pub struct MachineStatus {
     /// that predates the field reads as QEMU, which is all it could run.
     #[serde(default)]
     pub hypervisor: crate::config::hypervisor::HypervisorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor_fallback: Option<String>,
     #[serde(flatten)]
     pub detail: MachineDetail,
 }
@@ -902,6 +904,7 @@ pub(crate) mod fixtures {
             agent_diverged: false,
             recording: None,
             hypervisor: Default::default(),
+            hypervisor_fallback: None,
             detail,
         }
     }

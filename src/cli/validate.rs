@@ -12,18 +12,41 @@ use crate::config::{self, ConfigErrors, ValidationContext};
 pub struct HostContext {
     profiles: crate::profiles::ProfileSet,
     store: crate::template::TemplateStore,
+    state: crate::labd::state::LabState,
+    lab_local: std::path::PathBuf,
 }
 
 impl HostContext {
     pub fn new() -> Result<Self> {
+        let cwd = std::env::current_dir()?;
+        let root = crate::paths::find_lab_root(&cwd).unwrap_or(cwd);
+        Self::at(&root)
+    }
+
+    fn at(root: &Path) -> Result<Self> {
+        let lab_local = crate::paths::lab_local_dir(root);
         Ok(Self {
             profiles: crate::profiles::ProfileSet::load_default()?,
             store: crate::template::TemplateStore::new(crate::paths::template_store_dir()),
+            state: crate::labd::state::LabState::load(&lab_local)?,
+            lab_local,
         })
     }
 }
 
 impl ValidationContext for HostContext {
+    fn existing_hypervisor(
+        &self,
+        machine: &str,
+    ) -> Option<crate::config::hypervisor::HypervisorKind> {
+        self.state
+            .machines
+            .get(machine)
+            .cloned()
+            .unwrap_or_default()
+            .existing_hypervisor(&self.lab_local.join("vms").join(machine))
+    }
+
     fn check_apple_smc_osk(&self) -> Result<(), String> {
         let host = crate::config::host::HostConfig::load_default().map_err(|e| e.to_string())?;
         host.apple_smc_osk
@@ -147,7 +170,7 @@ pub fn validate_source(content: &str, root: &Path) -> std::result::Result<(), Ve
                 .collect());
         }
     };
-    let ctx = match HostContext::new() {
+    let ctx = match HostContext::at(root) {
         Ok(c) => c,
         Err(e) => {
             return Err(vec![SourceIssue {
@@ -240,7 +263,7 @@ pub fn validate_current() -> Result<crate::config::LabFile> {
     let mut file = config::load_lab_root(&root).map_err(miette_to_anyhow)?;
     // Validation checks the name the file declares; the instance this
     // directory runs as (crate::instance) is applied after it.
-    let issues = config::validate(&file, &HostContext::new()?);
+    let issues = config::validate(&file, &HostContext::at(&root)?);
     if issues.is_empty() {
         crate::instance::apply(&mut file, &root)?;
         return Ok(file);
