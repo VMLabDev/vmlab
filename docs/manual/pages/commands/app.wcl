@@ -28,6 +28,7 @@ page cmd_app {
       | "`[CMD]...`" | "The program and its arguments, after `--`." |
       | "`--via <VIA>`" | "The window protocol: `waypipe`, `x11` or `rdp`. Default: chosen from the guest family and this desktop session." |
       | "`--detach`" | "Hand the session to a background helper and return at once." |
+      | "`--verbose`" | "Show FreeRDP and waypipe diagnostics. Application output is always shown." |
       | "`--cwd <DIR>`" | "Guest working directory for the program." |
       | "`--user <LOGIN>`" | "Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity." |
       | "`--password <PASSWORD>`" | "Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`." |
@@ -75,6 +76,24 @@ page cmd_app {
     `--cwd` becomes its working directory there. An argument holding an
     apostrophe, or another character FreeRDP's option parser would change,
     is refused rather than passed on altered.
+  DOC
+
+  p <<DOC
+    With no `--user`, RDP falls back from the machine's default login to
+    the first login inherited from its template. A machine declaring any
+    logins inherits none. An inherited login never becomes the default for
+    `exec`, `shell`, provisions, or the workspace syncer. `--user <label>`
+    can select one explicitly. `--user SYSTEM` does not use the fallback.
+  DOC
+
+  p <<DOC
+    FreeRDP stderr is logged to `freerdp.log` in the session's private
+    runtime directory. On failure, the command retains the log and prints
+    its path and up to 20 trailing non-backtrace lines. Waypipe's own
+    diagnostics are hidden; the guest program's stderr still comes through.
+    `--verbose` shows protocol diagnostics in the foreground. A detached
+    helper retains the option but has no terminal. Older guest agents keep their previous mixed output until
+    repaired.
   DOC
 
   p <<DOC
@@ -131,14 +150,16 @@ SRC
       | "no FreeRDP 3 on this host: shared apps from a Windows guest need `xfreerdp3` or `xfreerdp` on PATH, or `freerdp` in config.wcl" | "A Windows guest and no FreeRDP client." |
       | "`{machine}` has no `waypipe` on PATH for `{login}`" | "The guest has no waypipe for the login, and the host has no `DISPLAY` to fall back to." |
       | "the agent on `{machine}` predates shared apps over `{mode}`; run `vmlab machine repair-agent {machine}`" | "The guest agent was built before shared apps." |
-      | "RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password" | "A Windows guest with no login, or `--user SYSTEM`." |
+      | "RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password; the template declares no account" | "A Windows guest with no declared or inherited logins." |
+      | "RDP needs an account: select a login on `{machine}` with --user <label>, or pass --user/--password; no template account was selected" | "Logins exist but no account was selected, such as `--user SYSTEM` or multiple machine logins without a default." |
       | "{machine}: Windows `{edition}` has no Remote Desktop host; shared apps need Pro, Enterprise, Education or Server" | "A Windows Home edition." |
       | "FreeRDP's `/app` option cannot carry `{value}` intact: its comma, quote and backslash rules would change it" | "A Windows argument FreeRDP would split or alter." |
   }
 
   p <<DOC
     Exit status is the guest program's exit code for a waypipe or X11
-    session, and FreeRDP's for an RDP session. Ctrl-C exits 130 and SIGTERM
+    session, and FreeRDP's for an RDP failure. FreeRDP codes 0, 1, 2, 11,
+    and 12 are successful endings and return zero. Ctrl-C exits 130 and SIGTERM
     143. A refusal from the lab daemon exits with its protocol error code:
     `invalid_argument` (2) for an RDP session with no account, and
     `unsupported` (6) for a guest with no waypipe or an agent that predates

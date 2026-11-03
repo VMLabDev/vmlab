@@ -90,6 +90,7 @@ SRC
       | "`first_boot`" | "utf8" | "none" | "wscript run on the first instantiation of a clone, before it turns ready." |
       | "`agent`" | "bool" | "`true`" | "Bake the vmlab-agent service into the image." |
       | "`source {}`" | "child" | "required" | "What the build starts from. Exactly one of four forms." |
+      | "`login {}`" | "children" | "none" | "Accounts the build creates, recorded in template.wcl. Machines with no declared logins inherit these for explicit selection and RDP, never as their default identity. Same fields as a machine login; requires surface 6." |
       | "`gpu {}`" | "child" | "none" | "GPU acceleration for the build VM only: passthrough, virgl or vulkan, with an optional `host_gpu`. Never recorded for clones." |
       | "`media {}`" | "children" | "none" | "ISO or floppy images attached to the build." |
       | "`provision {}`" | "children" | "none" | "Provision scripts that drive the build." |

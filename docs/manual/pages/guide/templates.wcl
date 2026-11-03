@@ -34,6 +34,15 @@ page guide_templates {
   DOC
 
   p <<DOC
+    A template can also declare `login` blocks for accounts its build
+    creates. The build records these plaintext credentials in `template.wcl`.
+    A machine with no login declarations inherits them for explicit selection
+    and RDP's fallback, but never as its default identity. A machine with any
+    login declarations inherits none. See [Logins](guide_logins).
+    This metadata requires a surface-6 host; older vmlab versions reject it.
+  DOC
+
+  p <<DOC
     Templates are keyed by **arch, name and version**, and a reference is
     written `<arch>/<name>[@<version>][#<variant>]`. The arch is mandatory
     and never inferred from the host, because it selects which QEMU system
