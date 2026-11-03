@@ -245,10 +245,20 @@ pub fn encode_frame(kind: FrameKind, channel: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Encode a control message (JSON payload on channel 0).
-pub fn encode_ctrl<T: Serialize>(msg: &T) -> Vec<u8> {
-    let payload = serde_json::to_vec(msg).expect("ctl message serializes");
-    encode_frame(FrameKind::Ctrl, 0, &payload)
+/// Encode a control message as JSON on channel 0.
+/// Returns `InvalidInput` if the serialized payload exceeds [`MAX_PAYLOAD`].
+pub fn encode_ctrl<T: Serialize>(msg: &T) -> std::io::Result<Vec<u8>> {
+    let payload = serde_json::to_vec(msg).map_err(std::io::Error::other)?;
+    if payload.len() > MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "agent control payload is {} bytes; maximum is {MAX_PAYLOAD} bytes",
+                payload.len()
+            ),
+        ));
+    }
+    Ok(encode_frame(FrameKind::Ctrl, 0, &payload))
 }
 
 /// Incremental frame decoder with desync recovery: feed raw bytes with
@@ -1268,8 +1278,36 @@ mod tests {
     }
 
     #[test]
+    fn control_encoding_checks_serialized_size_including_json_escaping() {
+        let overhead = serde_json::to_vec(&HostMsg::SetClipboard {
+            text: String::new(),
+        })
+        .unwrap()
+        .len();
+        let fitting = HostMsg::SetClipboard {
+            text: "x".repeat(MAX_PAYLOAD - overhead),
+        };
+        let wire = encode_ctrl(&fitting).unwrap();
+        let mut decoder = FrameDecoder::new();
+        for bytes in wire.chunks(4093) {
+            decoder.push(bytes);
+        }
+        let frame = decoder.next_frame().unwrap();
+        assert_eq!(frame.payload.len(), MAX_PAYLOAD);
+        assert_eq!(
+            serde_json::from_slice::<HostMsg>(&frame.payload).unwrap(),
+            fitting
+        );
+        for text in ["x".repeat(MAX_PAYLOAD - overhead + 1), "\0".repeat(12_000)] {
+            let error = encode_ctrl(&HostMsg::SetClipboard { text }).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("maximum is 65536 bytes"));
+        }
+    }
+
+    #[test]
     fn encode_ctrl_produces_a_channel0_ctrl_frame() {
-        let wire = encode_ctrl(&HostMsg::Ping);
+        let wire = encode_ctrl(&HostMsg::Ping).unwrap();
         let mut dec = FrameDecoder::new();
         dec.push(&wire);
         let f = dec.next_frame().unwrap();
