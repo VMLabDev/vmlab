@@ -78,6 +78,8 @@ pub struct TemplateMeta {
     /// once the overlays are gone — a lab ref is refused rather than cloning
     /// it. Written `variants_expected = true`; absent means false.
     pub variants_expected: bool,
+    /// Accounts created by the template build, selectable by its clones.
+    pub logins: Vec<crate::config::model::Login>,
     /// The version's sealed variants, in the order the file lists them
     /// (§6.6). Empty for a base-only template. A file that reads back always
     /// obeys the default-variant rule (see [`TemplateMeta::default_variant`]).
@@ -313,6 +315,9 @@ impl TemplateMeta {
         over(&mut m.first_boot_script, &v.first_boot_script);
         over(&mut m.agent_version, &v.agent_version);
         over(&mut m.wscript_surface, &v.wscript_surface);
+        if !m.logins.is_empty() {
+            m.wscript_surface = m.wscript_surface.max(self.wscript_surface);
+        }
         m.created = v.created;
         m.sha256 = Some(v.sha256.clone());
         m
@@ -404,6 +409,9 @@ impl TemplateMeta {
         if self.variants_expected {
             let _ = writeln!(out, "  variants_expected = true");
         }
+        for login in &self.logins {
+            write_login(&mut out, login);
+        }
         for v in &self.variants {
             write_variant(&mut out, v);
         }
@@ -432,7 +440,32 @@ impl TemplateMeta {
             Some(block) => extract(&block, &mut issues),
             None => bail!("{name}: no `template_meta` block found"),
         };
-        Ok(finish(name, source, issues, meta)?)
+        let meta = finish(name, source, issues, meta)?;
+        meta.ensure_login_surface()?;
+        Ok(meta)
+    }
+
+    /// Logins use surface 6 even where the template embeds no script.
+    pub(crate) fn ensure_login_surface(&self) -> Result<()> {
+        if !self.logins.is_empty() {
+            if self
+                .wscript_surface
+                .is_none_or(|version| version < 6.into())
+            {
+                bail!(
+                    "template `{}/{}@{}` declares logins but does not record surface 6 or newer; rebuild the template",
+                    self.arch,
+                    self.name,
+                    self.version
+                );
+            }
+            crate::scripting::ensure_wscript_surface_supported(
+                &format!("{}/{}@{}", self.arch, self.name, self.version),
+                self.wscript_surface,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
     }
 
     /// Write to a file (overwriting).
@@ -447,6 +480,21 @@ impl TemplateMeta {
             .with_context(|| format!("cannot read {}", path.display()))?;
         Self::from_wcl(&source, &path.display().to_string())
     }
+}
+
+fn write_login(out: &mut String, login: &crate::config::model::Login) {
+    let _ = writeln!(out, "  login {} {{", quote(&login.label));
+    let _ = writeln!(out, "    user = {}", quote(&login.user));
+    if let Some(password) = &login.password {
+        let _ = writeln!(out, "    password = {}", quote(password));
+    }
+    if let Some(elevated) = login.elevated {
+        let _ = writeln!(out, "    elevated = {elevated}");
+    }
+    if let Some(default) = login.default {
+        let _ = writeln!(out, "    default = {default}");
+    }
+    let _ = writeln!(out, "  }}");
 }
 
 /// Emit one `variant` block, indented inside `template_meta`, in the same
@@ -591,6 +639,11 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         .map(|version| version.map(Into::into))
         .unspan();
     let variants_expected = r.bool("variants_expected").unspan().unwrap_or(false);
+    let logins = r
+        .children()
+        .filter(|child| child.kind() == "login")
+        .filter_map(|child| crate::config::extract_login(&child, r.issues()))
+        .collect();
     let variants = extract_variants(&mut r);
     Some(TemplateMeta {
         name: name?,
@@ -619,6 +672,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         agent_version,
         wscript_surface,
         variants_expected,
+        logins,
         variants: variants?,
     })
 }
@@ -794,6 +848,60 @@ fn quote(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn template_logins_round_trip_and_require_surface_six_without_scripts() {
+        let source = r#"import <vmlab-meta.wcl>
+template_meta "win" {
+    arch = "x86_64"
+    version = "1"
+    profile = "windows-11"
+    created = "2026-11-03T00:00:00Z"
+    wscript_surface = 6
+    login "vmlab" { user = "vmlab" password = "test-secret" elevated = false default = true }
+}
+"#;
+        let meta = TemplateMeta::from_wcl(source, "<test>").unwrap();
+        assert!(meta.first_boot_script.is_none());
+        assert_eq!(meta.logins.len(), 1);
+        let again = TemplateMeta::from_wcl(&meta.to_wcl(), "<round-trip>").unwrap();
+        let login = &again.logins[0];
+        assert_eq!(login.label, "vmlab");
+        assert_eq!(login.user, "vmlab");
+        assert_eq!(login.password.as_deref(), Some("test-secret"));
+        assert_eq!(login.elevated, Some(false));
+        assert_eq!(login.default, Some(true));
+        for stamp in ["", "wscript_surface = 5", "wscript_surface = 7"] {
+            let old = source.replace("wscript_surface = 6", stamp);
+            let error = TemplateMeta::from_wcl(&old, "<bad-surface>").unwrap_err();
+            assert!(error.to_string().contains("surface"), "{error:#}");
+            assert!(!error.to_string().contains("test-secret"));
+        }
+    }
+
+    #[test]
+    fn a_variants_older_script_surface_does_not_erase_template_login_support() {
+        let mut meta = minimal_meta();
+        meta.wscript_surface = Some(6.into());
+        meta.logins = crate::config::load_template_source(
+            r#"import <vmlab.wcl>
+template "t" { arch = "x86_64" version = "1" source "scratch" {}
+login "dev" { user = "dev" }
+}"#,
+            "<test>",
+            Path::new("/tmp"),
+        )
+        .unwrap()
+        .templates
+        .remove(0)
+        .logins;
+        let mut variant = variant("standard");
+        variant.wscript_surface = Some(5.into());
+        let effective = meta.effective(Some(&variant));
+        assert_eq!(effective.logins.len(), 1);
+        assert_eq!(effective.wscript_surface, Some(6.into()));
+        effective.ensure_login_surface().unwrap();
+    }
+
     fn full_meta() -> TemplateMeta {
         TemplateMeta {
             name: "win11".into(),
@@ -824,6 +932,7 @@ mod tests {
             agent_version: Some("agent=abc123".into()),
             wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         }
     }
@@ -856,6 +965,7 @@ mod tests {
             agent_version: None,
             wscript_surface: None,
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         }
     }

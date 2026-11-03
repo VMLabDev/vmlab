@@ -386,7 +386,7 @@ fn logon_for(
     user: Option<&str>,
     password: Option<&str>,
 ) -> Result<Option<vm_agent::Logon>, CommandError> {
-    identity::resolve(m.name(), m.logins(), m.guest_os(), user, password)
+    identity::resolve(m.name(), &m.logins(), m.guest_os(), user, password)
         .map_err(|e| CommandError::failed(format!("{e:#}")))
 }
 
@@ -862,16 +862,25 @@ impl Handler<LabRequest> for LabdHandler {
                 let target = app_share::Target {
                     name: machine.clone(),
                     guest_os: m.guest_os(),
+                    has_logins: !m.logins().is_empty(),
                     run_dir: m.run_dir().to_path_buf(),
                 };
                 let req = app_share::AppRequest {
-                    mode,
+                    mode: mode.clone(),
                     argv,
                     cwd,
                     cookie,
                 };
                 app_share::open(&target, &agent, req, || {
-                    logon_for(m.as_ref(), user.as_deref(), password.as_deref())
+                    identity::resolve_app(
+                        m.name(),
+                        &m.logins(),
+                        m.guest_os(),
+                        user.as_deref(),
+                        password.as_deref(),
+                        mode == "rdp",
+                    )
+                    .map_err(|e| CommandError::failed(format!("{e:#}")))
                 })
                 .await
             }

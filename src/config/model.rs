@@ -965,15 +965,15 @@ impl std::fmt::Display for ImageRef {
     }
 }
 
-/// A labelled identity declared on a machine (PRD §19.2): the account a
+/// A labelled identity declared on a machine or template (PRD §19.2): the account a
 /// surface attaches *as*, its secret, and whether the session is elevated.
 ///
-/// Declared on the machine and not on `@dev`, because `exec`, `shell` and
+/// Declared on a machine or template, and not on `@dev`, because `exec`, `shell` and
 /// `cp` reach every machine — an unmarked machine needs an identity too. The secret
 /// is plaintext by decision, not by omission: the account exists because the
-/// lab's own provisioning created it, so the string already sits in the
-/// provision script beside it (§19.2, §1.2).
-#[derive(Debug, Clone)]
+/// lab's provisioning or template build created it, so the string already sits
+/// in the provision script or unattend file (§19.2, §1.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Login {
     /// What `--user` and `as_login` select this identity by. Carrying the
     /// *label* rather than the account is what lets one account be declared
@@ -992,21 +992,50 @@ pub struct Login {
     /// Whether this is the machine's default identity. `None` is "not
     /// declared"; [`default_login`] folds in the lone-login case.
     pub default: Option<bool>,
+    /// Where this identity came from. Template identities are selectable,
+    /// but never become the machine's default.
+    #[serde(skip)]
+    pub origin: LoginOrigin,
+    #[serde(skip)]
     pub span: Span,
 }
 
-/// A machine's default identity: the login marked `default = true`, or — where
-/// none is — the only login it declares.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginOrigin {
+    #[default]
+    Machine,
+    Template,
+}
+
+/// A machine's declarations replace the template's entire login list.
+pub fn effective_logins(declared: &[Login], template: &[Login]) -> Vec<Login> {
+    if !declared.is_empty() {
+        return declared.to_vec();
+    }
+    template
+        .iter()
+        .cloned()
+        .map(|mut login| {
+            login.origin = LoginOrigin::Template;
+            login
+        })
+        .collect()
+}
+
+/// A machine's default identity: the machine-declared login marked
+/// `default = true`, else its lone declaration. Template logins never qualify.
 ///
 /// The implicit case matches `@dev`'s shape (§19.1/§19.2): a lone declaration
 /// never has to meet the concept. More than one `default = true` is a §5.1
 /// error, so the first is taken here rather than the ambiguity being repeated.
 pub fn default_login(logins: &[Login]) -> Option<&Login> {
-    logins
-        .iter()
+    let mut declared = logins.iter().filter(|l| l.origin == LoginOrigin::Machine);
+    declared
+        .clone()
         .find(|l| l.default == Some(true))
-        .or(match logins {
-            [only] => Some(only),
+        .or_else(|| match (declared.next(), declared.next()) {
+            (Some(only), None) => Some(only),
             _ => None,
         })
 }
@@ -1132,6 +1161,7 @@ pub struct TemplateDef {
     /// hatch for guests where the install step misbehaves).
     pub agent: bool,
     pub source: TemplateSource,
+    pub logins: Vec<Login>,
     pub media: Vec<Media>,
     pub provisions: Vec<Provision>,
     /// config-weave playbooks applied to the build VM, interleaved with

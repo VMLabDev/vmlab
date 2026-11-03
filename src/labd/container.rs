@@ -1252,8 +1252,8 @@ impl super::machine::Machine for ContainerInstance {
         &self.macs
     }
 
-    fn logins(&self) -> &[model::Login] {
-        &self.cfg.logins
+    fn logins(&self) -> Vec<model::Login> {
+        self.cfg.logins.clone()
     }
 
     fn term_session_sock(&self, id: u32) -> PathBuf {

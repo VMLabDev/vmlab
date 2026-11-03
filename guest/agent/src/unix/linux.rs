@@ -26,6 +26,7 @@ pub(super) const FEATURES: &[&str] = &[
     // Whether `waypipe` is installed is the login's business, and the host
     // learns it from the open failing; X11 needs nothing.
     features::APP_WAYPIPE,
+    features::APP_LOG_SPLIT,
     features::APP_X11,
 ];
 

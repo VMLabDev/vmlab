@@ -10,12 +10,14 @@
 //! argument — and reads every argument from stdin, one per line, up to an
 //! empty line.
 
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::{HostEvent, Request};
@@ -302,15 +304,17 @@ fn next_comma(buf: &[u8], start: usize) -> Option<usize> {
 
 /// The CLI's side of an RDP session: the private socket FreeRDP dials, and
 /// FreeRDP itself once launched. Dropping it kills FreeRDP and removes the
-/// directory.
+/// directory unless a failed client's log was retained.
 pub struct Server {
     listener: UnixListener,
     socket: PathBuf,
     /// FreeRDP and its stdin, made ready by [`Self::prepare`] and started by
     /// [`Self::start`].
-    pending: Option<(PathBuf, String)>,
+    pending: Option<(PathBuf, String, bool)>,
     child: Option<tokio::process::Child>,
-    _dir: tempfile::TempDir,
+    stderr: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    log: PathBuf,
+    dir: Option<tempfile::TempDir>,
 }
 
 impl Server {
@@ -325,7 +329,9 @@ impl Server {
             socket,
             pending: None,
             child: None,
-            _dir: dir,
+            stderr: None,
+            log: dir.path().join("freerdp.log"),
+            dir: Some(dir),
         })
     }
 
@@ -345,7 +351,7 @@ impl Server {
             req.cwd.as_deref(),
             creds,
         )?;
-        self.pending = Some((bin.to_path_buf(), stdin_payload(&args)?));
+        self.pending = Some((bin.to_path_buf(), stdin_payload(&args)?, req.verbose));
         Ok(())
     }
 
@@ -354,15 +360,31 @@ impl Server {
     /// agent says the guest's RDP listener accepts, a connection would be
     /// refused. Starts nothing the second time.
     pub fn start(&mut self) -> Result<()> {
-        let Some((bin, payload)) = self.pending.take() else {
+        let Some((bin, payload, verbose)) = self.pending.take() else {
             return Ok(());
+        };
+        let log = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.log)
+            .with_context(|| format!("opening {}", self.log.display()))?;
+        let (stderr, tee) = if verbose {
+            (Stdio::piped(), Some(log))
+        } else {
+            (Stdio::from(log), None)
         };
         let mut child = tokio::process::Command::new(&bin)
             .args(ARGV)
             .stdin(Stdio::piped())
+            .stderr(stderr)
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting `{}`", bin.display()))?;
+        if let Some(log) = tee {
+            let stderr = child.stderr.take().expect("stderr is piped");
+            self.stderr = Some(tokio::spawn(tee_stderr(stderr, log, tokio::io::stderr())));
+        }
         let mut stdin = child.stdin.take().expect("stdin is piped");
         tokio::spawn(async move {
             // FreeRDP stops reading at the empty line; closing stdin after it
@@ -386,14 +408,287 @@ impl Server {
                     Some(child) => child.wait().await,
                     None => std::future::pending().await,
                 }
-            } => Ok(HostEvent::Exited(status?.code().unwrap_or(-1))),
+            } => {
+                let code = status?.code().unwrap_or(-1);
+                if let Some(stderr) = self.stderr.as_mut() {
+                    stderr.await.context("joining FreeRDP's stderr relay")?
+                        .context("relaying FreeRDP's stderr")?;
+                    self.stderr = None;
+                }
+                Ok(HostEvent::Exited(code))
+            },
         }
     }
+
+    /// Retain a failed client's log before the session directory is dropped.
+    pub(super) fn finish(&mut self, code: i32) -> Result<i32> {
+        if !is_failure(code) {
+            return Ok(0);
+        }
+        if let Some(dir) = self.dir.take() {
+            let _ = dir.keep();
+        }
+        std::fs::remove_file(&self.socket)
+            .with_context(|| format!("removing {}", self.socket.display()))?;
+        eprintln!(
+            "FreeRDP exited with code {code}; log: {}",
+            self.log.display()
+        );
+        match log_tail(&self.log) {
+            Ok(tail) if !tail.is_empty() => eprintln!("{tail}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("could not read FreeRDP's log: {e:#}"),
+        }
+        Ok(code)
+    }
+}
+
+async fn tee_stderr(
+    mut source: impl tokio::io::AsyncRead + Unpin,
+    log: std::fs::File,
+    mut terminal: impl tokio::io::AsyncWrite + Unpin,
+) -> std::io::Result<()> {
+    let mut log = tokio::fs::File::from_std(log);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = source.read(&mut buf).await?;
+        if n == 0 {
+            return log.flush().await;
+        }
+        log.write_all(&buf[..n]).await?;
+        terminal.write_all(&buf[..n]).await?;
+        terminal.flush().await?;
+    }
+}
+
+/// FreeRDP's protocol-independent disconnect/logoff codes (including raw
+/// ERRINFO_LOGOFF_BY_USER = 12) are normal session endings.
+fn is_failure(code: i32) -> bool {
+    !matches!(code, 0 | 1 | 2 | 11 | 12)
+}
+
+fn is_backtrace(line: &str) -> bool {
+    let Some((_, message)) = line.split_once(" - ") else {
+        return false;
+    };
+    if let Some(rest) = message.strip_prefix("[winpr_log_backtrace_ex]") {
+        return rest.starts_with(':') || rest.starts_with('[');
+    }
+    message.starts_with("winpr_log_backtrace_ex:") || message.starts_with("winpr_log_backtrace_ex ")
+}
+
+/// Bound diagnostic memory even when the client writes a very large log or
+/// a line without a newline.
+fn log_tail(path: &Path) -> Result<String> {
+    const MAX_BYTES: u64 = 64 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let start = size.saturating_sub(MAX_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if start > 0 {
+        text.split_once('\n').map_or("", |(_, text)| text)
+    } else {
+        &text
+    };
+    let mut lines: Vec<_> = text
+        .lines()
+        .rev()
+        .filter(|line| !is_backtrace(line))
+        .take(20)
+        .collect();
+    lines.reverse();
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn freerdp_stderr_is_logged_in_the_session_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = scratch.path().join("freerdp");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ncat >/dev/null\necho client-diagnostic >&2\nexit 147\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut server = Server::bind().unwrap();
+        let log = server.socket.with_file_name("freerdp.log");
+        let req = Request {
+            machine: "win".into(),
+            argv: vec!["notepad.exe".into()],
+            cwd: None,
+            user: None,
+            password: None,
+            verbose: false,
+        };
+        server.prepare(Some(&bin), &req, &creds()).unwrap();
+        server.start().unwrap();
+        assert!(matches!(
+            server.event().await.unwrap(),
+            HostEvent::Exited(147)
+        ));
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "client-diagnostic\n");
+    }
+
+    #[test]
+    fn disconnect_and_logoff_are_not_failures() {
+        for code in [0, 1, 2, 11, 12] {
+            assert!(!is_failure(code), "{code}");
+        }
+        for code in [-1, 3, 4, 5, 6, 7, 10, 16, 32, 128, 134, 147, 255] {
+            assert!(is_failure(code), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_logs_survive_drop_and_normal_endings_remove_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = scratch.path().join("freerdp");
+        for code in [0, 1, 2, 11, 12, 147] {
+            std::fs::write(
+                &bin,
+                format!("#!/bin/sh\ncat >/dev/null\necho diagnostic >&2\nexit {code}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut server = Server::bind().unwrap();
+            let dir = server.socket.parent().unwrap().to_path_buf();
+            let log = server.log.clone();
+            let req = Request {
+                machine: "win".into(),
+                argv: vec!["notepad.exe".into()],
+                cwd: None,
+                user: None,
+                password: None,
+                verbose: false,
+            };
+            server.prepare(Some(&bin), &req, &creds()).unwrap();
+            server.start().unwrap();
+            assert!(matches!(server.event().await.unwrap(), HostEvent::Exited(got) if got == code));
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                server.finish(code).unwrap(),
+                if code == 147 { 147 } else { 0 }
+            );
+            drop(server);
+            if code == 147 {
+                assert_eq!(std::fs::read_to_string(&log).unwrap(), "diagnostic\n");
+                assert!(!dir.join("rdp.sock").exists());
+                std::fs::remove_file(log).unwrap();
+                std::fs::remove_dir(dir).unwrap();
+            } else {
+                assert!(!dir.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verbose_stderr_is_copied_to_the_log_and_terminal() {
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("log");
+        let log = std::fs::File::create(&path).unwrap();
+        let (terminal, mut output) = tokio::io::duplex(1024);
+        tee_stderr(&b"first\nsecond\n"[..], log, terminal)
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"first\nsecond\n");
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_exit_event_keeps_the_stderr_drain_attached() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = scratch.path().join("freerdp");
+        std::fs::write(&bin, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let req = Request {
+            machine: "win".into(),
+            argv: vec!["notepad.exe".into()],
+            cwd: None,
+            user: None,
+            password: None,
+            verbose: false,
+        };
+        let mut server = Server::bind().unwrap();
+        server.prepare(Some(&bin), &req, &creds()).unwrap();
+        server.start().unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        server.stderr = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            Ok(())
+        }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), server.event())
+                .await
+                .is_err()
+        );
+        assert!(
+            server.stderr.is_some(),
+            "cancelled event detached the stderr drain"
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            server.event().await.unwrap(),
+            HostEvent::Exited(0)
+        ));
+        assert!(server.stderr.is_none());
+    }
+
+    #[test]
+    fn tail_keeps_twenty_diagnostics_and_excludes_backtrace_records() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log = scratch.path().join("freerdp.log");
+        let mut text = String::new();
+        for n in 0..25 {
+            text.push_str(&format!("diagnostic {n}\n"));
+            text.push_str(
+                "[12:00] [1:2] [ERROR][com.freerdp] - [winpr_log_backtrace_ex]: 0: frame\n",
+            );
+            text.push_str(
+                "[12:00] [1:2] [ERROR][com.freerdp] - [winpr_log_backtrace_ex][0x1]: 1: frame\n",
+            );
+        }
+        std::fs::write(&log, text).unwrap();
+        assert_eq!(
+            log_tail(&log).unwrap(),
+            (5..25)
+                .map(|n| format!("diagnostic {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(!is_backtrace("program mentions winpr_log_backtrace_ex"));
+        assert!(!is_backtrace(
+            "[ERROR] - [other]: winpr_log_backtrace_ex failed"
+        ));
+        assert!(is_backtrace("[ERROR] - winpr_log_backtrace_ex: 0: frame"));
+    }
+
+    #[test]
+    fn tail_bounds_a_large_log_and_tolerates_non_utf8() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log = scratch.path().join("freerdp.log");
+        let mut bytes = vec![b'x'; 128 * 1024];
+        bytes.extend_from_slice(b"\nfinal \xff\n");
+        std::fs::write(&log, bytes).unwrap();
+        assert_eq!(log_tail(&log).unwrap(), "final \u{fffd}");
+    }
 
     fn creds() -> Credentials {
         Credentials {
