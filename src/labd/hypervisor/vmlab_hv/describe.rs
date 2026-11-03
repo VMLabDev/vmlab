@@ -154,8 +154,9 @@ pub(crate) fn container(
                 pci: None,
                 mac: mac.to_string(),
                 mtu: *mtu,
-                attachment: NicAttachment::Stream {
+                attachment: NicAttachment::StreamVnet {
                     socket: socket.clone(),
+                    queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
                 },
             })
             .collect(),
@@ -507,8 +508,9 @@ pub(crate) fn vm(
             pci: Some(pci),
             mac: nic.mac.to_string(),
             mtu: nic.mtu.filter(|m| *m != 1500),
-            attachment: NicAttachment::Stream {
+            attachment: NicAttachment::StreamVnet {
                 socket: sock.clone(),
+                queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
             },
         });
     }
@@ -711,8 +713,9 @@ mod tests {
         assert_eq!(d.nics[1].mtu, Some(9000));
         assert_eq!(
             d.nics[1].attachment,
-            NicAttachment::Stream {
-                socket: "/run/l/web/nic1.sock".into()
+            NicAttachment::StreamVnet {
+                socket: "/run/l/web/nic1.sock".into(),
+                queue_pairs: 2,
             }
         );
 

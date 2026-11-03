@@ -169,6 +169,7 @@ impl LabServices for TestLab {
         _mac: crate::config::model::MacAddr,
         _isolated: bool,
         _tap_ok: bool,
+        _framing: crate::net::framing::FramingMode,
     ) -> anyhow::Result<crate::net::fastpath::NicAttachment> {
         Ok(crate::net::fastpath::NicAttachment::Stream {
             sock: sock.to_path_buf(),
@@ -539,6 +540,31 @@ async fn usb_attaches_only_to_a_running_vm_with_the_controller() {
 }
 
 // ---- the VM start ladder ----------------------------------------------------
+
+#[tokio::test]
+async fn machines_choose_vnet_framing_only_for_vmlab_virtio_nics() {
+    use crate::net::framing::FramingMode;
+    let dirs = Dirs::new();
+    let (qemu, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    assert_eq!(qemu.net_framing(), FramingMode::Raw);
+    let mut script = Script::healthy();
+    script.vmlab_hv = true;
+    let (native, _) = vm(&dirs, LINUX_VM, script.clone());
+    let count = crate::net::framing::queue_pairs(native.template().resolved.cpus);
+    assert_eq!(
+        native.net_framing(),
+        FramingMode::Vnet { queue_pairs: count }
+    );
+    let (container, _) = container(
+        &dirs,
+        r#"container "web" { image = "alpine" cpus = 3 memory = 256MiB }"#,
+        script,
+    );
+    assert_eq!(
+        container.net_framing(),
+        FramingMode::Vnet { queue_pairs: 3 }
+    );
+}
 
 /// The whole point of the seam: a VM's start ladder runs to completion with
 /// no KVM, no template and no disk image, and the machine reports itself

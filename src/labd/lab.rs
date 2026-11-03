@@ -3543,12 +3543,13 @@ impl crate::labd::machine::LabServices for LabRuntime {
         mac: crate::config::model::MacAddr,
         isolated: bool,
         tap_ok: bool,
+        framing: crate::net::framing::FramingMode,
     ) -> Result<crate::net::fastpath::NicAttachment> {
         let mut net = self.network.lock().await;
         let seg = net
             .segment_mut(segment)
             .ok_or_else(|| anyhow!("unknown segment \"{segment}\""))?;
-        seg.attach_nic(sock, mac, isolated, tap_ok).await
+        seg.attach_nic(sock, mac, isolated, tap_ok, framing).await
     }
 
     async fn before_resume(&self, machine: &str) -> Result<()> {

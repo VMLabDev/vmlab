@@ -2600,7 +2600,7 @@ dependencies = [
 [[package]]
 name = "vmlab-hv-display"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=450de8c37bfc1235f9404308de1429e9bb037f5c#450de8c37bfc1235f9404308de1429e9bb037f5c"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=3adc20973c6fa1fd18700415d715a6b3d77c2d4a#3adc20973c6fa1fd18700415d715a6b3d77c2d4a"
 dependencies = [
  "libc",
  "log",
@@ -2609,7 +2609,7 @@ dependencies = [
 [[package]]
 name = "vmlab-hv-proto"
 version = "0.1.0"
-source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=450de8c37bfc1235f9404308de1429e9bb037f5c#450de8c37bfc1235f9404308de1429e9bb037f5c"
+source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=3adc20973c6fa1fd18700415d715a6b3d77c2d4a#3adc20973c6fa1fd18700415d715a6b3d77c2d4a"
 dependencies = [
  "gdbstub",
  "gdbstub_arch",

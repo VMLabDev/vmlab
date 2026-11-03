@@ -1948,6 +1948,18 @@ impl super::machine::Machine for VmInstance {
         self.hypervisor == HypervisorKind::Qemu
     }
 
+    fn net_framing(&self) -> crate::net::framing::FramingMode {
+        let resolved = &self.template().resolved;
+        if self.hypervisor == HypervisorKind::Vmlab && resolved.nic_model.starts_with("virtio-net")
+        {
+            crate::net::framing::FramingMode::Vnet {
+                queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
+            }
+        } else {
+            crate::net::framing::FramingMode::Raw
+        }
+    }
+
     fn hypervisor(&self) -> HypervisorKind {
         self.hypervisor
     }

@@ -43,8 +43,10 @@ const TAG_LEN: usize = 4;
 /// Devmap capacity (must match the BPF `PORTS` definition).
 const MAX_PORTS: u32 = 256;
 
-/// Extra host-tap MTU headroom for the 4-byte punt tag (rounded up).
-const HOST_TAP_SLACK: u32 = 64;
+/// Linux tun caps the MTU at 65535 minus the Ethernet header.
+const MAX_TAP_MTU: u32 = u16::MAX as u32 - 14;
+/// A punt must never truncate a maximal switch packet or its tag.
+const PUNT_BUFFER_LEN: usize = vmlab_hv_proto::net::MAX_FRAME_LEN + TAG_LEN;
 
 /// Async I/O over a nonblocking tap queue fd.
 pub(super) struct TapIo(AsyncFd<OwnedFd>);
@@ -207,13 +209,12 @@ impl SegmentXdp {
     /// XDP program, spawn the bridge tasks. Must run inside the daemon's
     /// tokio runtime. Needs CAP_NET_ADMIN + CAP_BPF.
     pub fn new(segment: &str, mtu: u16) -> Result<Arc<SegmentXdp>> {
-        let tap =
-            vmlab_tap::create("vmfp%d", u32::from(mtu) + HOST_TAP_SLACK).map_err(|error| {
-                anyhow!(
-                    "creating host tap: {error} — {}",
-                    diagnose_tap_failure(error.raw_os_error(), &TapEnv::probe())
-                )
-            })?;
+        let tap = vmlab_tap::create("vmfp%d", MAX_TAP_MTU).map_err(|error| {
+            anyhow!(
+                "creating host tap: {error} — {}",
+                diagnose_tap_failure(error.raw_os_error(), &TapEnv::probe())
+            )
+        })?;
         let engine = XdpEngine::load()?;
         let ifindex = ifindex(&tap.name)?;
         engine.attach(&tap.name)?;
@@ -235,7 +236,7 @@ impl SegmentXdp {
         // Reader: host tap → (tag-routed) switch ingress.
         let reader = me.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; usize::from(reader.mtu) + 14 + HOST_TAP_SLACK as usize];
+            let mut buf = vec![0u8; PUNT_BUFFER_LEN];
             loop {
                 let n = match reader.host_tap.recv(&mut buf).await {
                     Ok(n) => n,
@@ -292,7 +293,7 @@ impl SegmentXdp {
         isolated: bool,
     ) -> Result<TapNic> {
         let tag = self.alloc_tag()?;
-        let tap = match vmlab_tap::create("vmfp%d", u32::from(self.mtu)) {
+        let tap = match vmlab_tap::create("vmfp%d", MAX_TAP_MTU) {
             Ok(t) => t,
             Err(e) => {
                 self.free_tags.lock_recover().push(tag);
@@ -308,7 +309,9 @@ impl SegmentXdp {
                 self.engine.insert_mac(mac.0, tag)?;
             }
 
-            let port = switch.add_channel_port(PortClass::Guest { isolated });
+            // TAP/XDP carries raw Ethernet. The switch completes offloads and
+            // segments to the guest's advertised MTU before entering this path.
+            let port = switch.add_channel_port_with_mtu(PortClass::Guest { isolated }, self.mtu);
             let mut egress_rx = port.rx;
             self.nics.lock_recover().insert(
                 tag,
@@ -473,6 +476,14 @@ fn diagnose_tap_failure(errno: Option<i32>, env: &TapEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn punt_capacity_includes_a_maximal_frame_and_tag() {
+        let mut frame = vec![0xa5; vmlab_hv_proto::net::MAX_FRAME_LEN];
+        frame.splice(..0, 7u32.to_be_bytes());
+        assert_eq!(frame.len(), PUNT_BUFFER_LEN);
+        assert_eq!(MAX_TAP_MTU + 14, u32::from(u16::MAX));
+    }
 
     fn env(node: bool, kernel: Option<(&str, bool)>) -> TapEnv {
         TapEnv {

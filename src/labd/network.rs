@@ -14,9 +14,10 @@ use crate::config::model::{Lab, MacAddr, Segment};
 use crate::net::dhcp::DhcpConfig;
 use crate::net::dns::DnsZone;
 use crate::net::fastpath::{self, FastpathTier, NicAttachment, SegmentXdp};
+use crate::net::framing::FramingMode;
 use crate::net::gateway::{Gateway, GatewayConfig, gateway_mac};
 use crate::net::router::{Leg, Router};
-use crate::net::switch::{PortClass, Switch};
+use crate::net::switch::{PortClass, PortConfig, Switch};
 use crate::proto::vocab::GlobalMember;
 
 /// Name of the built-in per-lab NAT segment (`nic { nat = true }`, §9.7).
@@ -85,10 +86,22 @@ impl SegmentNet {
     }
 
     /// Listen on a unix socket for one VM NIC; QEMU connects to it.
-    pub async fn listen_nic(&mut self, sock: &Path, isolated: bool) -> Result<()> {
+    pub async fn listen_nic(
+        &mut self,
+        sock: &Path,
+        isolated: bool,
+        framing: FramingMode,
+    ) -> Result<()> {
         let handle = self
             .switch
-            .listen_unix(sock, PortClass::Guest { isolated })
+            .listen_unix_with_config(
+                sock,
+                PortClass::Guest { isolated },
+                PortConfig {
+                    framing,
+                    mtu: self.effective_mtu(),
+                },
+            )
             .await
             .with_context(|| format!("listening on {}", sock.display()))?;
         self.listeners.push(handle);
@@ -108,6 +121,7 @@ impl SegmentNet {
         mac: MacAddr,
         isolated: bool,
         tap_ok: bool,
+        framing: FramingMode,
     ) -> Result<NicAttachment> {
         if tap_ok && fastpath::tier() == FastpathTier::AfXdp {
             match self.attach_tap(mac, isolated) {
@@ -118,7 +132,7 @@ impl SegmentNet {
                 ),
             }
         }
-        self.listen_nic(sock, isolated).await?;
+        self.listen_nic(sock, isolated, framing).await?;
         Ok(NicAttachment::Stream {
             sock: sock.to_path_buf(),
         })
@@ -691,6 +705,52 @@ mod tests {
 
     fn lab(src: &str) -> Lab {
         load_lab_source(src, "<t>", Path::new("/tmp")).unwrap().lab
+    }
+
+    #[tokio::test]
+    async fn nic_framing_is_selected_before_the_client_connects() {
+        use crate::net::framing::{self, Packet};
+        use bytes::Bytes;
+        use std::time::Duration;
+        let mut network = LabNetwork::build(&lab(r#"import <vmlab.wcl>
+lab "framing" { segment "lan" { mtu = 1500 } }"#))
+        .unwrap();
+        let segment = network.segment_mut("lan").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("nic.sock");
+        let mode = FramingMode::Vnet { queue_pairs: 3 };
+        let attachment = segment
+            .attach_nic(&socket, MacAddr([2, 0, 0, 0, 0, 1]), false, false, mode)
+            .await
+            .unwrap();
+        assert!(matches!(attachment, NicAttachment::Stream { .. }));
+        let mut service = segment.switch.add_channel_port(PortClass::Service);
+        let mut peer = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let packet = Packet::raw(Bytes::from_static(&[
+            255, 255, 255, 255, 255, 255, 2, 0, 0, 0, 0, 1, 8, 6,
+        ]));
+        framing::write_packet(&mut peer, &packet, mode)
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), service.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, packet.frame);
+        service.tx.send(packet.frame.clone()).await.unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            framing::read_packet(&mut peer, mode),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.frame, packet.frame);
+        assert!(reply.queue < 3);
+        for listener in segment.listeners.drain(..) {
+            listener.abort();
+        }
     }
 
     #[test]
