@@ -56,8 +56,28 @@ DOC
     li "A `login` with no `password` on a Windows-family profile is an error. The agent is SYSTEM and every credential-free logon route is one Windows disqualifies."
     li "`elevated` on a Linux-family or macOS-family profile is an error. Root is root, and a non-root user cannot be elevated without sudo. The macOS agent is root too, so a macOS `login` needs no `password`."
     li "More than one `login` with `default = true` on a machine is an error naming both."
-    li "A machine with exactly one `login` has it as the default implicitly."
+    li "A machine with exactly one machine-declared `login` has it as the default implicitly. Inherited logins are never defaults."
   }
+
+  h2 "Logins from a template"
+
+  p <<'DOC'
+A template may declare the same `login` blocks for accounts its build creates.
+The build stores them, including their plaintext passwords, in `template.wcl`.
+A machine that declares no logins inherits the template's logins in declaration
+order. If the machine declares any logins, it inherits none: the two lists are
+never merged. Machine information marks an inherited login's origin as `template`.
+DOC
+
+  p <<'DOC'
+Select an inherited login with `--user <label>` or `as_login(label)`.
+An inherited login is never the machine's default, even if it is the only
+login or the template marks it `default = true`. Commands without an identity
+override, provisions, and the workspace syncer retain the agent identity.
+RDP alone falls back to the first inherited login when no machine default
+exists. Templates with login blocks require wscript surface 6; older vmlab
+versions reject their metadata.
+DOC
 
   h2 "Who runs as whom"
 

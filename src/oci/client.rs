@@ -1777,6 +1777,7 @@ mod tests {
             agent_version: None,
             wscript_surface: None,
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         }
     }
@@ -2375,6 +2376,7 @@ mod tests {
             agent_version: None,
             wscript_surface: None,
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         };
         std::fs::create_dir_all(store.root()).unwrap();

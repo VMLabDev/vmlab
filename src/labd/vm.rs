@@ -268,6 +268,7 @@ pub struct TemplateParts {
     /// vmlab-agent stamp the template build baked in (`None` = the template
     /// predates agent support — no terminal, exec, copy or readiness).
     pub agent_version: Option<String>,
+    pub logins: Vec<model::Login>,
     /// The template variant the backing disk is (§6.6); `None` for the base
     /// of a base-only template, scratch, or a pull not yet bound.
     pub variant: Option<String>,
@@ -1928,8 +1929,8 @@ impl super::machine::Machine for VmInstance {
         &self.macs
     }
 
-    fn logins(&self) -> &[model::Login] {
-        &self.cfg.logins
+    fn logins(&self) -> Vec<model::Login> {
+        model::effective_logins(&self.cfg.logins, &self.template().logins)
     }
 
     fn term_session_sock(&self, id: u32) -> PathBuf {

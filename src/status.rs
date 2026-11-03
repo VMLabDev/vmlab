@@ -447,6 +447,9 @@ pub struct MachineStatus {
     /// First live address, across all NICs.
     pub ip: Option<String>,
     pub nics: Vec<NicStatus>,
+    /// Selectable identities, excluding passwords.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logins: Vec<LoginStatus>,
     /// Whether this machine's template or image is already local. False while a
     /// registry download is still pending — lab-level knowledge, filled in by
     /// the lab runtime rather than by the machine itself.
@@ -477,6 +480,29 @@ pub struct MachineStatus {
     pub hypervisor: crate::config::hypervisor::HypervisorKind,
     #[serde(flatten)]
     pub detail: MachineDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginStatus {
+    pub label: String,
+    pub user: String,
+    pub origin: crate::config::model::LoginOrigin,
+    pub default: bool,
+}
+
+impl LoginStatus {
+    pub fn from_logins(logins: &[crate::config::model::Login]) -> Vec<Self> {
+        let default = crate::config::model::default_login(logins);
+        logins
+            .iter()
+            .map(|login| Self {
+                label: login.label.clone(),
+                user: login.user.clone(),
+                origin: login.origin,
+                default: default.is_some_and(|d| std::ptr::eq(d, login)),
+            })
+            .collect()
+    }
 }
 
 impl MachineStatus {
@@ -870,6 +896,7 @@ pub(crate) mod fixtures {
             ready,
             ip: None,
             nics: Vec::new(),
+            logins: Vec::new(),
             cached: true,
             dev: None,
             agent_diverged: false,

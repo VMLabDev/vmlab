@@ -103,6 +103,9 @@ pub mod features {
     /// [`crate::app::AppMode::Waypipe`]. Advertised by every Linux agent;
     /// whether the guest has a `waypipe` binary is the host's to probe.
     pub const APP_WAYPIPE: &str = "app_waypipe";
+    /// Shared apps can separate waypipe's diagnostics from program output.
+    /// Hosts opt in through `split_logs` on [`HostMsg::OpenApp`].
+    pub const APP_LOG_SPLIT: &str = "app_log_split";
     /// Shared apps over X11 (PRD §20): [`HostMsg::OpenApp`] with
     /// [`crate::app::AppMode::X11`]. Needs nothing installed in the guest.
     pub const APP_X11: &str = "app_x11";
@@ -572,6 +575,10 @@ pub enum HostMsg {
         cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         logon: Option<Logon>,
+        /// Request [`app::AppRecord::Diagnostic`] for waypipe's own stderr.
+        /// Only sent when the agent advertises [`features::APP_LOG_SPLIT`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        split_logs: bool,
     },
     /// Open one transport connection of the app session `app` as a raw byte
     /// channel `id`. For waypipe and X11 it adopts the oldest guest-side
@@ -752,6 +759,7 @@ mod tests {
             env: vec![],
             cwd: None,
             logon: None,
+            split_logs: false,
         };
         let json = serde_json::to_string(&open).unwrap();
         assert_eq!(
@@ -762,6 +770,19 @@ mod tests {
             )
         );
         assert_eq!(serde_json::from_str::<HostMsg>(&json).unwrap(), open);
+        assert!(
+            !json.contains("split_logs"),
+            "older agents see the original open"
+        );
+        let mut split = serde_json::to_value(&open).unwrap();
+        split["split_logs"] = true.into();
+        assert!(matches!(
+            serde_json::from_value::<HostMsg>(split).unwrap(),
+            HostMsg::OpenApp {
+                split_logs: true,
+                ..
+            }
+        ));
         let rdp: HostMsg =
             serde_json::from_str(r#"{"cmd":"open_app","id":1,"mode":"rdp"}"#).unwrap();
         assert!(matches!(

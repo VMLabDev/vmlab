@@ -172,7 +172,7 @@ impl WorkspaceSessions {
     fn logon(&self) -> Result<Option<vmlab_agent_proto::Logon>> {
         crate::labd::identity::resolve(
             self.machine.name(),
-            self.machine.logins(),
+            &self.machine.logins(),
             self.machine.guest_os(),
             None,
             None,
@@ -858,6 +858,7 @@ impl LabRuntime {
                 disk_size: None,
                 first_boot: resolved.meta.first_boot(),
                 agent_version: resolved.meta.agent_version.clone(),
+                logins: resolved.meta.logins.clone(),
                 variant: resolved.variant.clone(),
                 template_vars: crate::template::store::template_vars(&resolved.dir, &resolved.meta),
             });
@@ -2815,7 +2816,7 @@ impl LabRuntime {
             // only run as the agent identity, and the whole tree lands owned
             // by `root` or `SYSTEM` — which surfaces hours later as
             // permission errors nobody can place, unless it is said here.
-            if crate::config::model::default_login(machine.logins()).is_none() {
+            if crate::config::model::default_login(&machine.logins()).is_none() {
                 self.events.emit(
                     "workspace.identity",
                     json!({
@@ -2889,7 +2890,7 @@ impl LabRuntime {
             max_file_bytes: self.host_cfg.workspace_max_file,
             preconditions: crate::labd::workspace::preconditions(
                 handle.guest_os(),
-                handle.logins(),
+                &handle.logins(),
             ),
         })
     }
@@ -3945,8 +3946,8 @@ mod tests {
         fn macs(&self) -> &[crate::config::model::MacAddr] {
             &[]
         }
-        fn logins(&self) -> &[crate::config::model::Login] {
-            &[]
+        fn logins(&self) -> Vec<crate::config::model::Login> {
+            Vec::new()
         }
         fn term_session_sock(&self, _id: u32) -> PathBuf {
             self.dir.join("term.sock")

@@ -1104,15 +1104,17 @@ SRC
   }
 
   h2 "Machine.logins"
-  p "The logins the lab file declares for this machine."
+  p "The machine's declared logins, or its template's logins when the machine declares none."
   code wscript { source = "fn logins(self) -> List[Login]" }
   p <<DOC
     Returns one [Login](ref_ws_types) per `login {}` block, with the two
-    implicit rules applied: a lone login is the default, and an undeclared
+    implicit rules applied: a lone machine-declared login is the default, and an undeclared
     `elevated` is true on Windows and false on Linux. The password crosses
     exactly as written, `None` where none was declared, so a provision
     creates the account the lab declares rather than a copy of it. It never
-    fails; a machine with no logins returns an empty list. See
+    fails; a machine with neither declared nor inherited logins returns an empty list.
+    The `origin` field distinguishes `machine` from `template` (surface 6).
+    An inherited login always reports `default = false`. See
     [Logins](guide_logins).
   DOC
   code wscript { source = <<'SRC'

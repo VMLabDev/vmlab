@@ -49,6 +49,7 @@ pub struct AppSpec {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<String>,
+    pub split_logs: bool,
 }
 
 /// The knobs a test turns. Production runs on the contract's own values.
@@ -726,8 +727,9 @@ mod parking {
         let tag = format!("{name}-{}", NEXT_TAG.fetch_add(1, Ordering::Relaxed));
         let mut env = spec.env;
         env.push((SESSION_VAR.into(), tag.clone()));
+        let split_logs = spec.split_logs && matches!(&protocol, Protocol::Waypipe);
         let (argv, env, display) = match &protocol {
-            Protocol::Waypipe => (waypipe_argv(&home.seen, spec.argv), env, None),
+            Protocol::Waypipe => (waypipe_argv(&home.seen, spec.argv, split_logs), env, None),
             Protocol::X11 { .. } => {
                 let display = endpoint.display.expect("an X11 endpoint has a display");
                 let mut env = env;
@@ -807,11 +809,11 @@ mod parking {
             let grace = mux.apps().tuning().grace;
             thread::spawn(move || accept_loop(&endpoint, &records, grace));
         }
-        let pumps: Vec<_> = std::iter::once(output)
-            .chain(errors)
-            .map(|src| {
+        let pumps: Vec<_> = std::iter::once((output, false))
+            .chain(errors.map(|src| (src, split_logs)))
+            .map(|(src, diagnostic)| {
                 let records = records.clone();
-                thread::spawn(move || pump_log(&records, src))
+                thread::spawn(move || pump_log(&records, src, diagnostic))
             })
             .collect();
 
@@ -917,7 +919,7 @@ mod parking {
     /// own environment has none — the login decides that, and the agent
     /// cannot see what `su -l` gives it. The absolute `--display` means
     /// waypipe itself needs none.
-    pub(crate) fn waypipe_argv(seen: &str, argv: Vec<String>) -> Vec<String> {
+    pub(crate) fn waypipe_argv(seen: &str, argv: Vec<String>, split_logs: bool) -> Vec<String> {
         let mut out: Vec<String> = [
             "/bin/sh",
             "-c",
@@ -937,6 +939,11 @@ mod parking {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        if split_logs {
+            // Keep program output on stdout, leaving waypipe's stderr on
+            // its own pipe. Positional arguments preserve the original argv.
+            out.extend(["/bin/sh", "-c", "exec \"$@\" 2>&1", "sh"].map(String::from));
+        }
         out.extend(argv);
         out
     }
@@ -975,7 +982,7 @@ mod parking {
     /// The program's output, a record per line. Once the channel has gone
     /// the lines are still read, so a chatty program never blocks on a full
     /// pipe.
-    fn pump_log(records: &Records, src: Box<dyn Read + Send>) {
+    fn pump_log(records: &Records, src: Box<dyn Read + Send>, diagnostic: bool) {
         let mut src = BufReader::new(src);
         let mut line = Vec::new();
         loop {
@@ -990,8 +997,11 @@ mod parking {
                     line.pop();
                 }
             }
-            records.send(&AppRecord::Log {
-                text: String::from_utf8_lossy(&line).into_owned(),
+            let text = String::from_utf8_lossy(&line).into_owned();
+            records.send(&if diagnostic {
+                AppRecord::Diagnostic { text }
+            } else {
+                AppRecord::Log { text }
             });
         }
     }

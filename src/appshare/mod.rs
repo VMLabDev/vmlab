@@ -258,11 +258,12 @@ pub struct Request {
     pub cwd: Option<String>,
     pub user: Option<String>,
     pub password: Option<String>,
+    pub verbose: bool,
 }
 
 /// Run one shared-app session to its end and return the exit code `app run`
-/// exits with: the program's, FreeRDP's for `rdp`, or 130/143 when it was
-/// interrupted.
+/// exits with: the program's, FreeRDP's on failure for `rdp`, or 130/143 when
+/// interrupted. An RDP disconnect or logoff returns zero.
 ///
 /// `selected` is [`select_mode`]'s answer. A waypipe session the daemon
 /// refuses because the guest has no waypipe is reopened as X11 when
@@ -304,7 +305,7 @@ async fn attempt(client: &LabClient, req: &Request, mode: Mode, host: &HostEnv) 
                 .waypipe
                 .as_deref()
                 .ok_or_else(|| anyhow!(NO_HOST_WAYPIPE))?;
-            HostEnd::Waypipe(waypipe::Client::start(bin).await?)
+            HostEnd::Waypipe(waypipe::Client::start(bin, req.verbose).await?)
         }
         Mode::X11 => {
             let (cookie, adopt) = x11_end()?;
@@ -346,7 +347,7 @@ async fn attempt(client: &LabClient, req: &Request, mode: Mode, host: &HostEnv) 
         let creds = rdp::Credentials::from_reply(&reply["rdp"])?;
         server.prepare(host.freerdp.as_deref(), req, &creds)?;
     }
-    drive(&req.machine, &control, &conns, &mut end)
+    drive(&req.machine, &control, &conns, &mut end, req.verbose)
         .await
         .map(Attempt::Ran)
 }
@@ -399,7 +400,13 @@ fn x11_end() -> Result<(String, Adopt)> {
 
 /// Drive an opened session: relay its records and adopt its connections until
 /// it ends, returning the exit code `app run` exits with.
-async fn drive(machine: &str, control: &Path, conns: &Path, end: &mut HostEnd) -> Result<i32> {
+async fn drive(
+    machine: &str,
+    control: &Path,
+    conns: &Path,
+    end: &mut HostEnd,
+    verbose: bool,
+) -> Result<i32> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut control = UnixStream::connect(control)
@@ -432,7 +439,11 @@ async fn drive(machine: &str, control: &Path, conns: &Path, end: &mut HostEnd) -
                             Some(adopt) => splice_pending(machine, conns, adopt.clone()),
                             None => bail!("the agent announced a connection an RDP session never makes"),
                         },
-                        AppRecord::Log { text } => eprintln!("[{machine}] {text}"),
+                        record @ (AppRecord::Log { .. } | AppRecord::Diagnostic { .. }) => {
+                            if let Some(text) = log_text(&record, verbose) {
+                                eprintln!("[{machine}] {text}");
+                            }
+                        }
                         AppRecord::Exited { code } => return Ok(code),
                         AppRecord::Failed { msg } => bail!(msg),
                     }
@@ -441,13 +452,21 @@ async fn drive(machine: &str, control: &Path, conns: &Path, end: &mut HostEnd) -
             event = end.event() => match event? {
                 HostEvent::Accepted(stream) => splice_accepted(machine, conns, stream),
                 HostEvent::Exited(code) => return match end {
-                    HostEnd::Rdp(_) => Ok(code),
+                    HostEnd::Rdp(server) => server.finish(code),
                     _ => Err(anyhow!("the host's waypipe client exited with code {code}")),
                 },
             },
             _ = tokio::signal::ctrl_c() => return Ok(130),
             _ = sigterm.recv() => return Ok(143),
         }
+    }
+}
+
+fn log_text(record: &AppRecord, verbose: bool) -> Option<&str> {
+    match record {
+        AppRecord::Log { text } => Some(text),
+        AppRecord::Diagnostic { text } if verbose => Some(text),
+        _ => None,
     }
 }
 
@@ -502,6 +521,23 @@ fn private_dir() -> Result<tempfile::TempDir> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_logs_are_always_visible_and_diagnostics_need_verbose() {
+        let program = AppRecord::Log {
+            text: "waypipe diagnostic".into(),
+        };
+        let diagnostic = AppRecord::Diagnostic {
+            text: "waypipe diagnostic".into(),
+        };
+        for verbose in [false, true] {
+            assert_eq!(log_text(&program, verbose), Some("waypipe diagnostic"));
+            assert_eq!(
+                log_text(&diagnostic, verbose),
+                verbose.then_some("waypipe diagnostic")
+            );
+        }
+    }
 
     fn host(wayland: bool, x11: bool, waypipe: bool, freerdp: bool) -> HostEnv {
         HostEnv {
@@ -745,7 +781,7 @@ mod tests {
             adopt,
         };
         {
-            let driving = drive("web", &control, &conns, &mut end);
+            let driving = drive("web", &control, &conns, &mut end, false);
             tokio::pin!(driving);
             // The fake daemon never sends `exited`, so the adoption is what
             // finishes first.
@@ -757,13 +793,18 @@ mod tests {
         }
 
         let (_dir, control, conns) = fake_daemon(vec![AppRecord::Exited { code: 3 }]).await;
-        assert_eq!(drive("web", &control, &conns, &mut end).await.unwrap(), 3);
+        assert_eq!(
+            drive("web", &control, &conns, &mut end, false)
+                .await
+                .unwrap(),
+            3
+        );
     }
 
     /// FreeRDP starts on the agent's `ready`, which waits for the guest's RDP
     /// listener, and not on the daemon's reply: started sooner, its
-    /// connection is refused and it gives up. Its exit code is the
-    /// session's.
+    /// connection is refused and it gives up. A user logoff ends the session
+    /// successfully.
     #[tokio::test]
     async fn freerdp_starts_on_ready_and_its_exit_ends_the_session() {
         use std::os::unix::fs::PermissionsExt;
@@ -775,7 +816,7 @@ mod tests {
         );
         std::fs::write(
             &bin,
-            format!("#!/bin/sh\ncat > '{}'\nexit 7\n", started.display()),
+            format!("#!/bin/sh\ncat > '{}'\nexit 12\n", started.display()),
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -785,6 +826,7 @@ mod tests {
             cwd: None,
             user: None,
             password: None,
+            verbose: false,
         };
         let creds = rdp::Credentials {
             user: "dev".into(),
@@ -807,12 +849,21 @@ mod tests {
         ])
         .await;
         let mut end = rdp_end();
-        assert!(drive("win", &control, &conns, &mut end).await.is_err());
+        assert!(
+            drive("win", &control, &conns, &mut end, false)
+                .await
+                .is_err()
+        );
         assert!(!started.exists(), "FreeRDP started before `ready`");
 
         let (_dir, control, conns) = fake_daemon(vec![AppRecord::Ready { display: None }]).await;
         let mut end = rdp_end();
-        assert_eq!(drive("win", &control, &conns, &mut end).await.unwrap(), 7);
+        assert_eq!(
+            drive("win", &control, &conns, &mut end, false)
+                .await
+                .unwrap(),
+            0
+        );
         let stdin = std::fs::read_to_string(&started).unwrap();
         assert!(stdin.contains("/app:program:notepad.exe\n"), "{stdin}");
     }
@@ -828,7 +879,9 @@ mod tests {
             cookie: String::new(),
             adopt: Arc::new(|_| Box::pin(async { Ok(()) })),
         };
-        let err = drive("web", &control, &conns, &mut end).await.unwrap_err();
+        let err = drive("web", &control, &conns, &mut end, false)
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "the agent went away");
     }
 }
