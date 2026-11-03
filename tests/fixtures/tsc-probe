@@ -1,0 +1,3 @@
+#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = --probe ] || exit 3
+printf '%s\n' '{"kvm":true,"tsc_khz":4291956,"invariant_tsc":true,"stable_tsc":true}'

@@ -718,6 +718,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ),
             ));
         }
+        let mut source_meta = None;
         match &t.source {
             TemplateSource::Template {
                 from:
@@ -731,8 +732,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             } => {
                 if let Some(meta) = ctx.template_meta(arch, name, version.as_deref()) {
                     // A layered `from` is a build context, so `#base` passes.
-                    if let Err(why) = meta.select_variant(variant.as_ref(), Purpose::Build) {
-                        issues.push(Issue::at(*span, format!("layered build source: {why}")));
+                    match meta.select_variant(variant.as_ref(), Purpose::Build) {
+                        Ok(chosen) => source_meta = Some(meta.effective(chosen)),
+                        Err(why) => {
+                            issues.push(Issue::at(*span, format!("layered build source: {why}")));
+                        }
                     }
                 } else {
                     issues.push(Issue::at(
@@ -798,7 +802,13 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         }
         // Build playbooks run on the synthetic "build" VM, and config-weave
         // is x86_64-only (§10.4).
-        let base_family = login_family(t.profile.as_deref());
+        let base_profile = t.profile.as_deref().or_else(|| {
+            source_meta
+                .as_ref()
+                .and_then(|meta| meta.profile.as_deref())
+        });
+        let base_family = login_family(base_profile);
+        check_logins("template", &t.name, &t.logins, base_family, &mut issues);
         let variant_playbooks = t.variants.iter().flat_map(|v| {
             let family = match &v.profile {
                 Some(p) => login_family(Some(p)),
@@ -2030,6 +2040,7 @@ pub(crate) mod tests {
             agent_version: None,
             wscript_surface: None,
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         }
     }
@@ -3565,6 +3576,75 @@ lab "l" { vm "a" { template = "x86_64/t" profile = "linux-modern"
         );
     }
 
+    #[test]
+    fn template_logins_use_the_same_validation_as_machine_logins() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {}
+template "t" { arch = "x86_64" version = "1" profile = "windows-11" source "scratch" {}
+  login "dev" { user = "dev" }
+}"#,
+            "login \"dev\" has no `password`",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {}
+template "t" { arch = "x86_64" version = "1" profile = "linux-modern" source "scratch" {}
+  login "dev" { user = "dev" elevated = false }
+}"#,
+            "login \"dev\" declares `elevated`",
+        );
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {}
+template "t" { arch = "x86_64" version = "1" profile = "linux-modern" source "scratch" {}
+  login "dev" { user = "dev" }
+  login "dev" { user = "other" }
+}"#,
+            "duplicate login \"dev\"",
+        );
+    }
+
+    #[test]
+    fn layered_template_login_validation_uses_the_effective_source_profile() {
+        let mut meta = blank_meta("x86_64", "t", None);
+        meta.profile = Some("windows-11".into());
+        let ctx = Hardware::with_meta(meta);
+        let source = r#"import <vmlab.wcl>
+lab "l" {}
+template "child" { arch = "x86_64" version = "1"
+  source "template" { from = "x86_64/t" }
+  login "dev" { user = "dev" }
+}"#;
+        let errors = validate(&lab(source), &ctx);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("login \"dev\" has no `password`")),
+            "{errors:#?}"
+        );
+        let linux = source.replace(
+            "version = \"1\"",
+            "version = \"1\" profile = \"linux-modern\"",
+        );
+        assert!(validate(&lab(&linux), &ctx).is_empty());
+
+        let mut meta = variant_meta();
+        meta.profile = Some("windows-11".into());
+        meta.variants[0].profile = Some("linux-modern".into());
+        let ctx = Hardware::with_meta(meta);
+        let variant = source.replace("x86_64/t\"", "x86_64/t#standard\"");
+        assert!(validate(&lab(&variant), &ctx).is_empty());
+        let elevated = variant.replace("user = \"dev\"", "user = \"dev\" elevated = false");
+        let errors = validate(&lab(&elevated), &ctx);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("declares `elevated`")),
+            "{errors:#?}"
+        );
+    }
+
     /// The label is what `--user` and `as_login` select a login by, so two
     /// of them on one machine name an identity nothing can address.
     #[test]
@@ -4405,16 +4485,11 @@ lab "l" {
             r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-11" hypervisor = "vmlab" usb = true audio = true microphone = true }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
-        // A pinned TSC waits for vmlab-hv's host probe.
         let es = hv_errs(
             &HvHost::kvm(),
             r#"vm "v" { template = "scratch" arch = "x86_64" disk = 10GiB profile = "linux-modern" hypervisor = "vmlab" tsc = "host" }"#,
         );
-        assert!(
-            es.iter()
-                .any(|e| e.contains("vm \"v\"") && e.contains("D10")),
-            "{es:#?}"
-        );
+        assert!(es.is_empty(), "{es:#?}");
     }
 
     /// Audio is vmlab-hv's (hv-audio D7): on QEMU — named or the host's

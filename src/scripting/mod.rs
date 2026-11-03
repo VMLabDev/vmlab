@@ -244,7 +244,7 @@ impl From<vision::Match> for ScriptMatch {
     }
 }
 
-/// One identity the machine declares (`m.logins()`, PRD §19.2).
+/// One declared or inherited identity (`m.logins()`, PRD §19.2).
 ///
 /// The wscript rung of §19.2's precedence ladder is *reading* as well as
 /// overriding: a provision script creates exactly the account the lab file
@@ -254,7 +254,8 @@ impl From<vision::Match> for ScriptMatch {
 ///
 /// `elevated` and `default` cross **resolved**, because a script asking "is
 /// this the default identity" wants the answer vmlab will act on, and a lone
-/// login is the default without saying so.
+/// machine-declared login is the default without saying so. An inherited
+/// login is never the default.
 #[derive(Script, Clone)]
 #[script(name = "Login")]
 pub struct ScriptLogin {
@@ -272,6 +273,8 @@ pub struct ScriptLogin {
     /// Whether this is the machine's default identity, with the lone-login
     /// rule applied.
     pub default: bool,
+    /// `machine` or `template`, without exposing a template login as default.
+    pub origin: String,
 }
 
 /// Every declared login of one machine, with §19.2's two implicit rules
@@ -292,6 +295,11 @@ fn script_logins(logins: &[crate::config::model::Login], os: GuestOs) -> Vec<Scr
             password: l.password.clone(),
             elevated: l.elevated.unwrap_or(os == GuestOs::Windows),
             default: default.is_some_and(|d| std::ptr::eq(d, l)),
+            origin: match l.origin {
+                crate::config::model::LoginOrigin::Machine => "machine",
+                crate::config::model::LoginOrigin::Template => "template",
+            }
+            .to_string(),
         })
         .collect()
 }
@@ -359,7 +367,7 @@ impl MachineHandle {
     fn as_identity(&self, selector: &str, password: Option<&str>) -> Result<MachineHandle, String> {
         let logon = crate::labd::identity::resolve(
             self.name(),
-            self.machine.logins(),
+            &self.machine.logins(),
             self.machine.guest_os(),
             Some(selector),
             password,
@@ -1279,7 +1287,7 @@ pub fn lab_module() -> Module {
             },
         )
         .method("logins", |h: &MachineHandle| -> Vec<ScriptLogin> {
-            script_logins(h.machine.logins(), h.machine.guest_os())
+            script_logins(&h.machine.logins(), h.machine.guest_os())
         })
         // Identity (§19.2's wscript rung). Both return a second handle onto
         // the same machine rather than switching this one, so the identity is
@@ -1593,6 +1601,7 @@ fn main(lab: Lab) {
         use crate::config::model::Login;
         let login = |label: &str, password: Option<&str>, elevated, default| Login {
             label: label.into(),
+            origin: Default::default(),
             user: format!("PROBE\\{label}"),
             password: password.map(str::to_string),
             elevated,
@@ -1638,6 +1647,33 @@ fn main(lab: Lab) {
         assert!(written[0].elevated);
 
         assert!(script_logins(&[], GuestOs::Windows).is_empty());
+    }
+
+    #[test]
+    fn inherited_logins_report_their_origin_without_becoming_default() {
+        let mut file = crate::config::load_template_source(
+            r#"import <vmlab.wcl>
+template "t" { arch = "x86_64" version = "1" source "scratch" {}
+login "dev" { user = "dev" default = true }
+}"#,
+            "<test>",
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+        let template = file.templates.remove(0);
+        let inherited = crate::config::model::effective_logins(&[], &template.logins);
+        let exposed = script_logins(&inherited, GuestOs::Linux);
+        assert_eq!(exposed.len(), 1);
+        assert_eq!(exposed[0].origin, "template");
+        assert!(!exposed[0].default);
+        let source = r#"use vmlab
+fn main(lab: Lab) {
+    let vm = lab.this_vm().expect("no target")
+    for login in vm.logins() { lab.log(login.origin) }
+    let dev = vm.as_login("dev")
+}
+"#;
+        check_script_source(source).unwrap();
     }
 
     /// The console recording surface (surface 4): `record` with and without
@@ -1798,10 +1834,10 @@ fn main(lab: Lab) {
     #[test]
     fn a_template_above_the_surface_ceiling_asks_for_a_newer_vmlab() {
         let err =
-            ensure_wscript_surface_supported("x86_64/win11@newer", Some(6.into())).unwrap_err();
+            ensure_wscript_surface_supported("x86_64/win11@newer", Some(7.into())).unwrap_err();
         assert_eq!(
             err,
-            "template `x86_64/win11@newer` records wscript surface 6, newer than this host's 5; \
+            "template `x86_64/win11@newer` records wscript surface 7, newer than this host's 6; \
              upgrade vmlab to use it"
         );
     }

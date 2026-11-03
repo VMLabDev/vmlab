@@ -153,6 +153,7 @@ pub trait LabServices: Send + Sync + 'static {
         mac: MacAddr,
         isolated: bool,
         tap_ok: bool,
+        framing: crate::net::framing::FramingMode,
     ) -> Result<NicAttachment>;
 
     /// This machine's agent has answered and it is about to be reported
@@ -231,10 +232,10 @@ pub trait Machine: Send + Sync + 'static {
     }
     fn nics(&self) -> &[model::Nic];
     fn macs(&self) -> &[MacAddr];
-    /// The identities this machine declares (§19.2), in declaration order.
+    /// The machine's declared identities, else its template's (§19.2), in order.
     /// Reported by the machine and not looked up in the lab file: a caller
     /// holding a machine has everything about it.
-    fn logins(&self) -> &[model::Login];
+    fn logins(&self) -> Vec<model::Login>;
     /// Host socket re-exposing one agent terminal session as a raw byte pipe.
     fn term_session_sock(&self, id: u32) -> PathBuf;
 
@@ -263,6 +264,11 @@ pub trait Machine: Send + Sync + 'static {
     /// line is built, not a preference.
     fn takes_tap_fds(&self) -> bool {
         false
+    }
+
+    /// Wire format selected before attachment, without an in-band handshake.
+    fn net_framing(&self) -> crate::net::framing::FramingMode {
+        crate::net::framing::FramingMode::Raw
     }
 
     /// The word this machine's events name it under (`vm.stopped` vs
@@ -817,6 +823,7 @@ impl dyn Machine {
             ready,
             ip: assigned.iter().flatten().next().cloned(),
             nics,
+            logins: crate::status::LoginStatus::from_logins(&self.logins()),
             cached: true,
             // Lab-level, like `cached`: `@dev` is per-machine but *the*
             // default dev machine depends on what the rest of the lab
@@ -863,6 +870,7 @@ pub(super) async fn attach_all_nics(
                 mac,
                 nic.isolated,
                 tap_ok,
+                m.net_framing(),
             )
             .await?,
         );

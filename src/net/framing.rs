@@ -8,15 +8,126 @@ use std::io;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use vmlab_hv_proto::net::{Header, METADATA_LEN, flow_hash};
+
+/// Selected by the daemon before a NIC connects. No bytes negotiate the mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FramingMode {
+    #[default]
+    Raw,
+    Vnet {
+        queue_pairs: u16,
+    },
+}
+
+/// The PCI transport has 64 queue slots, including virtio-net's control queue.
+pub fn queue_pairs(vcpus: u32) -> u16 {
+    vcpus.clamp(1, 31) as u16
+}
+
+/// Ethernet bytes and the offload state needed by another capable port.
+#[derive(Clone, Debug)]
+pub(crate) struct Packet {
+    pub frame: Bytes,
+    pub header: Header,
+    pub queue: u16,
+}
+
+impl Packet {
+    pub fn raw(frame: Bytes) -> Self {
+        Self {
+            frame,
+            header: Header::default(),
+            queue: 0,
+        }
+    }
+
+    pub fn for_port(&self, mode: FramingMode, mtu: u16) -> io::Result<Vec<Self>> {
+        match mode {
+            FramingMode::Vnet { queue_pairs } if queue_pairs != 0 => {
+                let mut packet = self.clone();
+                packet.queue = (flow_hash(&packet.frame) % u32::from(queue_pairs)) as u16;
+                Ok(vec![packet])
+            }
+            FramingMode::Vnet { .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vnet port needs at least one queue pair",
+            )),
+            FramingMode::Raw if self.header == Header::default() => Ok(vec![self.clone()]),
+            FramingMode::Raw => Ok(self
+                .header
+                .segments(&self.frame, mtu)?
+                .into_iter()
+                .map(|frame| Self::raw(Bytes::from(frame)))
+                .collect()),
+        }
+    }
+}
 
 /// Sanity cap on a single frame: 64 KiB of L3 payload + ethernet header +
 /// slack for the length prefix. Anything larger is a corrupt stream.
 pub const MAX_FRAME_LEN: usize = 65536 + 14 + 4;
 
+/// Read a packet using the mode fixed for this port at attachment.
+pub(crate) async fn read_packet<R: AsyncRead + Unpin>(
+    r: &mut R,
+    mode: FramingMode,
+) -> io::Result<Option<Packet>> {
+    if mode == FramingMode::Raw {
+        return read_frame(r).await.map(|frame| frame.map(Packet::raw));
+    }
+    let Some(body) = read_body(r, vmlab_hv_proto::net::MAX_FRAME_LEN + METADATA_LEN).await? else {
+        return Ok(None);
+    };
+    let (header, queue, frame) = Header::from_metadata(&body)?;
+    if let FramingMode::Vnet { queue_pairs } = mode
+        && queue >= queue_pairs
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid vnet queue id",
+        ));
+    }
+    let offset = body.len() - frame.len();
+    Ok(Some(Packet {
+        frame: body.slice(offset..),
+        header,
+        queue,
+    }))
+}
+
+pub(crate) async fn write_packet<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    packet: &Packet,
+    mode: FramingMode,
+) -> io::Result<()> {
+    match mode {
+        FramingMode::Raw => write_frame(w, &packet.frame).await,
+        FramingMode::Vnet { queue_pairs } => {
+            packet.header.validate(&packet.frame)?;
+            if packet.queue >= queue_pairs {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid vnet queue id",
+                ));
+            }
+            let len = (METADATA_LEN + packet.frame.len()) as u32;
+            w.write_all(&len.to_be_bytes()).await?;
+            w.write_all(&packet.header.metadata(packet.queue)).await?;
+            w.write_all(&packet.frame).await?;
+            w.flush().await
+        }
+    }
+}
+
 /// Read one length-prefixed frame. Returns `Ok(None)` on clean EOF (stream
 /// closed exactly on a frame boundary); EOF mid-prefix or mid-body is an
 /// `UnexpectedEof` error; a length above [`MAX_FRAME_LEN`] is `InvalidData`.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Bytes>> {
+    read_body(r, MAX_FRAME_LEN).await
+}
+
+async fn read_body<R: AsyncRead + Unpin>(r: &mut R, limit: usize) -> io::Result<Option<Bytes>> {
     let mut len_buf = [0u8; 4];
     let mut filled = 0;
     while filled < len_buf.len() {
@@ -33,10 +144,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<By
         filled += n;
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
+    if len > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame length {len} exceeds cap {MAX_FRAME_LEN}"),
+            format!("frame length {len} exceeds cap {limit}"),
         ));
     }
     let mut frame = vec![0u8; len];
@@ -151,5 +262,62 @@ mod tests {
         let got = read_frame(&mut b).await.unwrap().unwrap();
         assert_eq!(got.len(), MAX_FRAME_LEN);
         assert!(got.iter().all(|&x| x == 0xA5));
+    }
+
+    #[tokio::test]
+    async fn vnet_maximum_packet_and_metadata_roundtrip() {
+        let mode = FramingMode::Vnet { queue_pairs: 4 };
+        let frame = Bytes::from(vec![0xa5; vmlab_hv_proto::net::MAX_FRAME_LEN]);
+        let packet = Packet {
+            frame: frame.clone(),
+            header: Header::default(),
+            queue: 3,
+        };
+        let (mut a, mut b) = tokio::io::duplex(frame.len() + METADATA_LEN + 4);
+        write_packet(&mut a, &packet, mode).await.unwrap();
+        let decoded = read_packet(&mut b, mode).await.unwrap().unwrap();
+        assert_eq!(decoded.frame, frame);
+        assert_eq!(decoded.header, packet.header);
+        assert_eq!(decoded.queue, 3);
+    }
+
+    #[tokio::test]
+    async fn vnet_rejects_unknown_version_queue_and_truncated_metadata() {
+        let mode = FramingMode::Vnet { queue_pairs: 2 };
+        let mut valid = Header::default().metadata(1).to_vec();
+        valid.extend_from_slice(&[0; 14]);
+        let mut version = valid.clone();
+        version[1] = 2;
+        let mut queue = valid.clone();
+        queue[3] = 2;
+        for body in [version, queue, valid[..METADATA_LEN - 1].to_vec()] {
+            let (mut a, mut b) = tokio::io::duplex(128);
+            a.write_all(&(body.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            a.write_all(&body).await.unwrap();
+            assert_eq!(
+                read_packet(&mut b, mode).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vnet_record_fragmented_across_every_byte() {
+        let mode = FramingMode::Vnet { queue_pairs: 1 };
+        let mut body = Header::default().metadata(0).to_vec();
+        body.extend_from_slice(&[0x55; 14]);
+        let mut encoded = (body.len() as u32).to_be_bytes().to_vec();
+        encoded.extend_from_slice(&body);
+        let (mut a, mut b) = tokio::io::duplex(1);
+        let writer = tokio::spawn(async move {
+            for byte in encoded {
+                a.write_all(&[byte]).await.unwrap();
+            }
+        });
+        let packet = read_packet(&mut b, mode).await.unwrap().unwrap();
+        assert_eq!(&packet.frame[..], &[0x55; 14]);
+        writer.await.unwrap();
     }
 }

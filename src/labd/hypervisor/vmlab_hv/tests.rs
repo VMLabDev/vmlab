@@ -3,6 +3,7 @@
 //! own `Server` standing in for its control socket: what is spawned, with
 //! what, and how its control socket is reached.
 
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,158 @@ fn spec(run: &Path, machine: Launch) -> LaunchSpec {
             ctl: Some(run.join("ctl.sock")),
         },
     }
+}
+
+fn tap_spec(mac: u8, taps: Vec<i32>, vhost: Vec<i32>) -> crate::qemu::NicSpec {
+    crate::qemu::NicSpec {
+        mac: crate::config::model::MacAddr([0x52, 0x54, 0, 0, 0, mac]),
+        mtu: Some(1500),
+        backend: crate::qemu::NicBackend::TapQueues {
+            tap_fds: taps,
+            vhost_fds: vhost,
+        },
+    }
+}
+
+fn mapped_fd(child: i32) -> crate::qemu::process::ChildFd {
+    let (fd, _) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    crate::qemu::process::ChildFd {
+        parent: OwnedFd::from(fd),
+        child,
+    }
+}
+
+#[test]
+fn tap_descriptor_mappings_are_explicit_and_consumed_exactly_once() {
+    let nics = [tap_spec(1, vec![17, 11], vec![31, 29])];
+    let mut mappings = Vec::new();
+    let mut peers = Vec::new();
+    for child in [11, 17, 29, 31] {
+        let (fd, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        peer.send(&[child as u8]).unwrap();
+        peers.push(peer);
+        mappings.push(crate::qemu::process::ChildFd {
+            parent: fd.into(),
+            child,
+        });
+    }
+    let mut attachments = net_attachments(&nics, mappings).unwrap();
+    let attachment = attachments.pop().unwrap();
+    assert_eq!(attachment.queue_pairs, 2);
+    assert!(attachment.vhost);
+    let mut markers = Vec::new();
+    for fd in &attachment.fds {
+        let mut marker = [0];
+        assert_eq!(rustix::io::read(fd, &mut marker).unwrap(), 1);
+        markers.push(marker[0]);
+    }
+    assert_eq!(markers, [17, 11, 31, 29]);
+    assert!(net_attachments(&nics, vec![mapped_fd(17), mapped_fd(17)]).is_err());
+    assert!(net_attachments(&nics, vec![mapped_fd(17)]).is_err());
+    assert!(net_attachments(&[], vec![mapped_fd(11)]).is_err());
+    assert!(net_attachments(&[tap_spec(1, vec![11, 11], vec![])], vec![mapped_fd(11)]).is_err());
+    assert!(
+        net_attachments(
+            &[tap_spec(1, vec![11, 12], vec![13])],
+            vec![mapped_fd(11), mapped_fd(12), mapped_fd(13)]
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tap_descriptors_are_not_inherited_and_attach_precedes_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path();
+    let argv = run.join("argv");
+    let bin = fake_binary(
+        run,
+        &format!(
+            "test ! -e /proc/self/fd/117 || exit 3\necho started > {}\nexec sleep 30",
+            argv.display()
+        ),
+    );
+    let firmware = run.join("firmware/x86_64");
+    std::fs::create_dir_all(&firmware).unwrap();
+    std::fs::write(firmware.join("bios-vmlab-q35.bin"), b"").unwrap();
+    std::fs::write(firmware.join("vgabios-stdvga.bin"), b"").unwrap();
+    let cfg = crate::qemu::resolve::testing::vm(
+        r#"vm "web" { template = "scratch" arch = "x86_64" profile = "linux-modern" firmware = "seabios" cpus = 1 memory = 512MiB disk = 1GiB }"#,
+    );
+    let resolved =
+        crate::qemu::resolve_vm(&cfg, None, &crate::profiles::ProfileSet::shipped().unwrap())
+            .unwrap();
+    let launch = Launch::Vm {
+        lab: "lab1".into(),
+        resolved: Box::new(resolved),
+        paths: Box::new(crate::qemu::VmPaths {
+            nics: vec![tap_spec(1, vec![117], vec![])],
+            primary_disk: run.join("disk.qcow2"),
+            agent_sock: run.join("agent.sock"),
+            qmp_sock: run.join("control.sock"),
+            display_sock: run.join("display.sock"),
+            vnc_sock: run.join("vnc.sock"),
+            serial_log: Some(run.join("serial.log")),
+            ..Default::default()
+        }),
+        accel: crate::qemu::Accel::Kvm,
+        emulator: None,
+    };
+    let socket = run.join("control.sock");
+    let marker = argv.clone();
+    let (tx, seen) = mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..500 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let server = Server::with_fds("fake-hv", vec![Capability::NetFds], move |command, fds| {
+            if matches!(command, Command::NetAttach { .. }) {
+                assert_eq!(fds.len(), 1);
+                let mut packet = [0; 4];
+                assert_eq!(rustix::io::read(&fds[0], &mut packet).unwrap(), 4);
+                assert_eq!(&packet, b"TAP0");
+            } else {
+                assert!(fds.is_empty());
+            }
+            tx.send(command).unwrap();
+            Outcome::Ok { status: None }
+        });
+        let listener = UnixListener::bind(socket).unwrap();
+        let _ = server.serve(listener);
+    });
+    let mut launch_spec = spec(run, launch);
+    let (fd, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    peer.send(b"TAP0").unwrap();
+    launch_spec.fds.push(crate::qemu::process::ChildFd {
+        parent: fd.into(),
+        child: 117,
+    });
+    let running = VmlabHv::for_vm(Some(bin), Some(run.join("firmware")))
+        .start_emulator(launch_spec)
+        .await
+        .unwrap();
+    assert!(matches!(
+        seen.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Command::NetAttach {
+            queue_pairs: 1,
+            vhost: false,
+            ..
+        }
+    ));
+    running.control.resume().await.unwrap();
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Command::Resume
+    );
+    running.proc.kill().await;
+    running
+        .proc
+        .wait_exit(Duration::from_secs(5))
+        .await
+        .unwrap();
 }
 
 /// The real binary binds its control socket itself, after it starts; here

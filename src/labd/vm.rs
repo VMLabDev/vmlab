@@ -270,6 +270,7 @@ pub struct TemplateParts {
     /// vmlab-agent stamp the template build baked in (`None` = the template
     /// predates agent support — no terminal, exec, copy or readiness).
     pub agent_version: Option<String>,
+    pub logins: Vec<model::Login>,
     /// The template variant the backing disk is (§6.6); `None` for the base
     /// of a base-only template, scratch, or a pull not yet bound.
     pub variant: Option<String>,
@@ -971,9 +972,13 @@ impl VmInstance {
         if let Some(hz) = qemu::tsc::read_pin(&pin)? {
             return Ok(Some(hz));
         }
-        let hz = qemu::tsc::probe_host_hz(emulator)
-            .await
-            .with_context(|| format!("{}: tsc = \"host\"", self.cfg.name))?;
+        let hz = match self.hypervisor {
+            HypervisorKind::Qemu => qemu::tsc::probe_host_hz(emulator).await,
+            HypervisorKind::Vmlab => {
+                super::hypervisor::vmlab_hv::tsc::probe_host_hz(Path::new(emulator)).await
+            }
+        }
+        .with_context(|| format!("{}: tsc = \"host\"", self.cfg.name))?;
         std::fs::create_dir_all(&self.dirs.local)?;
         qemu::tsc::write_pin(&pin, hz)?;
         Ok(Some(hz))
@@ -1133,18 +1138,37 @@ impl VmInstance {
         }
         let mut specs = Vec::with_capacity(attachments.len());
         let mut fds = Vec::new();
+        let mut next_fd = 10;
         for (i, (mac, att)) in self.macs.iter().zip(attachments.iter()).enumerate() {
             let mtu = self.nic_mtus.get(i).copied();
             let backend = match att {
                 NicAttachment::Stream { sock } => qemu::NicBackend::Stream { sock: sock.clone() },
                 NicAttachment::Tap(tap) => {
-                    // Fixed, collision-free child numbers past stdio.
-                    let child_fd = 10 + i as i32;
-                    fds.push(qemu::process::ChildFd {
-                        parent: tap.qemu_fd().context("cloning tap fd for qemu")?,
-                        child: child_fd,
-                    });
-                    qemu::NicBackend::Tap { child_fd }
+                    if self.hypervisor == HypervisorKind::Qemu {
+                        let child_fd = next_fd;
+                        next_fd += 1;
+                        fds.push(qemu::process::ChildFd {
+                            parent: tap.qemu_fd().context("cloning tap fd for qemu")?,
+                            child: child_fd,
+                        });
+                        qemu::NicBackend::Tap { child_fd }
+                    } else {
+                        let mut map = |queues: Vec<std::os::fd::OwnedFd>| {
+                            queues
+                                .into_iter()
+                                .map(|parent| {
+                                    let child = next_fd;
+                                    next_fd += 1;
+                                    fds.push(qemu::process::ChildFd { parent, child });
+                                    child
+                                })
+                                .collect()
+                        };
+                        qemu::NicBackend::TapQueues {
+                            tap_fds: map(tap.queue_fds().context("cloning TAP queues")?),
+                            vhost_fds: map(tap.vhost_fds().context("cloning vhost-net queues")?),
+                        }
+                    }
                 }
             };
             specs.push(qemu::NicSpec {
@@ -1313,13 +1337,15 @@ impl VmInstance {
                     format!("{}: installing the Vulkan PCI-filter layer", self.cfg.name)
                 })?;
             }
-            // The probe reads the TSC through the emulator the VM will run:
-            // a host GPU's own build where one is set, else the stock one.
-            let emulator = render
-                .qemu_binary
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| qemu::emulator_binary(&t.resolved.arch));
+            // Use the selected hypervisor, including its configured binary.
+            let emulator = match self.hypervisor {
+                HypervisorKind::Vmlab => self.hv.emulator_binary(&t.resolved.arch),
+                HypervisorKind::Qemu => render
+                    .qemu_binary
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| qemu::emulator_binary(&t.resolved.arch)),
+            };
             let tsc_hz = self.pinned_tsc_hz(&t, accel, &emulator).await?;
             let machine = super::hypervisor::Launch::Vm {
                 lab: self.lab.clone(),
@@ -1987,8 +2013,8 @@ impl super::machine::Machine for VmInstance {
         &self.macs
     }
 
-    fn logins(&self) -> &[model::Login] {
-        &self.cfg.logins
+    fn logins(&self) -> Vec<model::Login> {
+        model::effective_logins(&self.cfg.logins, &self.template().logins)
     }
 
     fn term_session_sock(&self, id: u32) -> PathBuf {
@@ -2001,10 +2027,23 @@ impl super::machine::Machine for VmInstance {
 
     /// A VM's argv carries pre-opened descriptors, so its NICs can ride the
     /// afxdp tap fast path.
-    /// QEMU inherits a tap descriptor; vmlab-hv's NICs are stream sockets
-    /// (HV-D9 leaves its fast path unfixed).
+    /// QEMU inherits a descriptor. vmlab-hv receives its queue descriptors
+    /// over the control socket while the VM remains paused.
     fn takes_tap_fds(&self) -> bool {
-        self.hypervisor() == HypervisorKind::Qemu
+        true
+    }
+
+    fn net_framing(&self) -> crate::net::framing::FramingMode {
+        let resolved = &self.template().resolved;
+        if self.hypervisor() == HypervisorKind::Vmlab
+            && resolved.nic_model.starts_with("virtio-net")
+        {
+            crate::net::framing::FramingMode::Vnet {
+                queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
+            }
+        } else {
+            crate::net::framing::FramingMode::Raw
+        }
     }
 
     fn hypervisor(&self) -> HypervisorKind {

@@ -1252,8 +1252,8 @@ impl super::machine::Machine for ContainerInstance {
         &self.macs
     }
 
-    fn logins(&self) -> &[model::Login] {
-        &self.cfg.logins
+    fn logins(&self) -> Vec<model::Login> {
+        self.cfg.logins.clone()
     }
 
     fn term_session_sock(&self, id: u32) -> PathBuf {
@@ -1262,6 +1262,16 @@ impl super::machine::Machine for ContainerInstance {
 
     fn nic_sock(&self, i: usize) -> PathBuf {
         self.dirs.nic_sock(i)
+    }
+
+    fn net_framing(&self) -> crate::net::framing::FramingMode {
+        if self.hypervisor == HypervisorKind::Vmlab {
+            crate::net::framing::FramingMode::Vnet {
+                queue_pairs: crate::net::framing::queue_pairs(self.resolved.cpus),
+            }
+        } else {
+            crate::net::framing::FramingMode::Raw
+        }
     }
 
     fn event_subject(&self) -> &'static str {

@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::fastpath;
-use super::framing;
+use super::framing::{self, FramingMode, Packet};
 use crate::config::model::MacAddr;
 
 /// Per-port egress queue depth. It's ethernet: a full queue drops the frame.
@@ -106,7 +106,29 @@ pub struct SwitchStats {
 
 struct PortEntry {
     class: PortClass,
-    tx: mpsc::Sender<Bytes>,
+    tx: PortTx,
+    config: PortConfig,
+}
+
+enum PortTx {
+    Packets(mpsc::Sender<Packet>),
+    Frames(mpsc::Sender<Bytes>),
+}
+
+/// Out-of-band port contract: the peer's framing and network-layer MTU.
+#[derive(Clone, Copy, Debug)]
+pub struct PortConfig {
+    pub framing: FramingMode,
+    pub mtu: u16,
+}
+
+impl Default for PortConfig {
+    fn default() -> Self {
+        Self {
+            framing: FramingMode::Raw,
+            mtu: 1500,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -193,22 +215,34 @@ impl Switch {
     /// task (deframe → ingress) and a writer task (egress queue → frame).
     /// The port is removed automatically on EOF or stream error.
     pub async fn add_stream_port(self: &Arc<Self>, stream: UnixStream, class: PortClass) -> PortId {
+        self.add_stream_port_with_config(stream, class, PortConfig::default())
+            .await
+    }
+
+    pub async fn add_stream_port_with_config(
+        self: &Arc<Self>,
+        stream: UnixStream,
+        class: PortClass,
+        config: PortConfig,
+    ) -> PortId {
         let id = self.alloc_port(class);
-        let mut rx = self.attach(id, class);
+        let mut rx = self.attach(id, class, config);
 
         // Kernel fast path: register eligible QEMU sockets before any bytes
         // flow (VMs start paused until their ports attach, so the socket is
         // still silent and the BPF framing state machine starts on a true
         // boundary). Any failure just leaves this port on the plain path.
-        let offload_tx = match (&self.offload, class) {
-            (Some(off), PortClass::Guest { isolated: false }) => match off.add_port(id, &stream) {
-                Ok(tx) => Some(tx),
-                Err(error) => {
-                    debug!(switch = %self.name, %id, %error,
+        let offload_tx = match (&self.offload, class, config.framing) {
+            (Some(off), PortClass::Guest { isolated: false }, FramingMode::Raw) => {
+                match off.add_port(id, &stream) {
+                    Ok(tx) => Some(tx),
+                    Err(error) => {
+                        debug!(switch = %self.name, %id, %error,
                         "fast-path registration failed; port stays userspace");
-                    None
+                        None
+                    }
                 }
-            },
+            }
             _ => None,
         };
 
@@ -224,8 +258,8 @@ impl Switch {
                     off.adopt_write_half(id, write_half);
                 }
                 tokio::spawn(async move {
-                    while let Some(frame) = rx.recv().await {
-                        if let Err(error) = tx.send_frame(&frame).await {
+                    while let Some(packet) = rx.recv().await {
+                        if let Err(error) = tx.send_frame(&packet.frame).await {
                             debug!(switch = %name, %id, %error, "offloaded port egress failed");
                             break;
                         }
@@ -234,8 +268,10 @@ impl Switch {
             }
             None => {
                 tokio::spawn(async move {
-                    while let Some(frame) = rx.recv().await {
-                        if let Err(error) = framing::write_frame(&mut write_half, &frame).await {
+                    while let Some(packet) = rx.recv().await {
+                        if let Err(error) =
+                            framing::write_packet(&mut write_half, &packet, config.framing).await
+                        {
                             debug!(switch = %name, %id, %error, "stream port write failed");
                             break;
                         }
@@ -247,8 +283,8 @@ impl Switch {
         let switch = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                match framing::read_frame(&mut read_half).await {
-                    Ok(Some(frame)) => switch.ingress(id, frame),
+                match framing::read_packet(&mut read_half, config.framing).await {
+                    Ok(Some(packet)) => switch.ingress_packet(id, packet),
                     Ok(None) => {
                         debug!(switch = %switch.name, %id, "stream port EOF");
                         break;
@@ -269,9 +305,25 @@ impl Switch {
     /// port. The port is removed automatically when the returned `tx` is
     /// dropped.
     pub fn add_channel_port(self: &Arc<Self>, class: PortClass) -> ChannelPort {
+        self.add_channel_port_with_mtu(class, 1500)
+    }
+
+    /// Raw participants receive complete, checksummed packets at their MTU.
+    pub fn add_channel_port_with_mtu(self: &Arc<Self>, class: PortClass, mtu: u16) -> ChannelPort {
         let id = self.alloc_port(class);
-        let egress_rx = self.attach(id, class);
+        let (egress_tx, egress_rx) = mpsc::channel(PORT_QUEUE_CAPACITY);
         let (ingress_tx, mut ingress_rx) = mpsc::channel::<Bytes>(PORT_QUEUE_CAPACITY);
+        self.inner.lock_recover().ports.insert(
+            id,
+            PortEntry {
+                class,
+                tx: PortTx::Frames(egress_tx),
+                config: PortConfig {
+                    framing: FramingMode::Raw,
+                    mtu,
+                },
+            },
+        );
 
         let switch = Arc::clone(self);
         tokio::spawn(async move {
@@ -319,6 +371,16 @@ impl Switch {
         socket_path: &Path,
         class: PortClass,
     ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+        self.listen_unix_with_config(socket_path, class, PortConfig::default())
+            .await
+    }
+
+    pub async fn listen_unix_with_config(
+        self: &Arc<Self>,
+        socket_path: &Path,
+        class: PortClass,
+        config: PortConfig,
+    ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
         match std::fs::remove_file(socket_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -334,7 +396,9 @@ impl Switch {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let id = switch.add_stream_port(stream, class).await;
+                        let id = switch
+                            .add_stream_port_with_config(stream, class, config)
+                            .await;
                         debug!(switch = %switch.name, %id, "accepted stream port");
                     }
                     Err(error) => {
@@ -355,21 +419,29 @@ impl Switch {
     }
 
     /// Register the port in the table and return its egress receiver.
-    fn attach(&self, id: PortId, class: PortClass) -> mpsc::Receiver<Bytes> {
+    fn attach(&self, id: PortId, class: PortClass, config: PortConfig) -> mpsc::Receiver<Packet> {
         let (tx, rx) = mpsc::channel(PORT_QUEUE_CAPACITY);
-        self.inner
-            .lock_recover()
-            .ports
-            .insert(id, PortEntry { class, tx });
+        self.inner.lock_recover().ports.insert(
+            id,
+            PortEntry {
+                class,
+                tx: PortTx::Packets(tx),
+                config,
+            },
+        );
         rx
     }
 
     /// Process one frame received on `port`: hook, learn, forward.
     fn ingress(&self, port: PortId, frame: Bytes) {
-        let ingress_class = {
+        self.ingress_packet(port, Packet::raw(frame));
+    }
+
+    fn ingress_packet(&self, port: PortId, packet: Packet) {
+        let (ingress_class, mtu) = {
             let inner = self.inner.lock_recover();
             match inner.ports.get(&port) {
-                Some(p) => p.class,
+                Some(p) => (p.class, p.config.mtu),
                 None => return, // port already gone
             }
         };
@@ -378,33 +450,76 @@ impl Switch {
         let action = {
             let hook = self.hook.lock_recover();
             match hook.as_ref() {
-                Some(h) => h(port, &ingress_class, &frame),
+                Some(h) => h(port, &ingress_class, &packet.frame),
                 None => HookAction::Pass,
             }
         };
         let forward = match action {
-            HookAction::Pass => Some(frame),
+            HookAction::Pass => vec![packet],
             HookAction::Drop => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
-                None
+                Vec::new()
             }
-            HookAction::Replace(f) => Some(Bytes::from(f)),
+            HookAction::Replace(f) => self.rewritten(&packet, f, mtu),
             HookAction::Inject { forward, reply } => {
                 if !reply.is_empty() {
                     let inner = self.inner.lock_recover();
                     if let Some(p) = inner.ports.get(&port) {
                         for r in reply {
-                            if p.tx.try_send(r).is_err() {
-                                self.dropped.fetch_add(1, Ordering::Relaxed);
-                                debug!(switch = %self.name, %port, "reply queue full, frame dropped");
-                            }
+                            self.deliver(p, &Packet::raw(r));
                         }
                     }
                 }
-                forward.map(Bytes::from)
+                forward
+                    .map(|frame| self.rewritten(&packet, frame, mtu))
+                    .unwrap_or_default()
             }
         };
-        let Some(frame) = forward else { return };
+
+        for packet in forward {
+            self.forward_packet(port, ingress_class, packet);
+        }
+    }
+
+    fn rewritten(&self, original: &Packet, frame: Vec<u8>, mtu: u16) -> Vec<Packet> {
+        if original.header.gso_type == vmlab_hv_proto::net::GSO_NONE {
+            // Raw hooks calculate complete transport checksums on replacement.
+            return vec![Packet::raw(Bytes::from(frame))];
+        }
+        match original.header.segments(&frame, mtu) {
+            Ok(frames) => frames
+                .into_iter()
+                .map(|frame| Packet::raw(Bytes::from(frame)))
+                .collect(),
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+        }
+    }
+
+    fn deliver(&self, entry: &PortEntry, packet: &Packet) -> bool {
+        let Ok(packets) = packet.for_port(entry.config.framing, entry.config.mtu) else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let mut delivered = false;
+        for packet in packets {
+            let sent = match &entry.tx {
+                PortTx::Packets(tx) => tx.try_send(packet).is_ok(),
+                PortTx::Frames(tx) => tx.try_send(packet.frame).is_ok(),
+            };
+            if sent {
+                delivered = true;
+            } else {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        delivered
+    }
+
+    fn forward_packet(&self, port: PortId, ingress_class: PortClass, packet: Packet) {
+        let frame = &packet.frame;
 
         if frame.len() < super::frame::ETH_HEADER_LEN {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -451,10 +566,9 @@ impl Switch {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                if entry.tx.try_send(frame).is_ok() {
+                if self.deliver(entry, &packet) {
                     self.forwarded.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
                     debug!(switch = %self.name, egress = %target, "egress queue full, frame dropped");
                 }
             }
@@ -469,10 +583,9 @@ impl Switch {
                     if *id == port || !delivery_allowed(&ingress_class, &entry.class) {
                         continue;
                     }
-                    if entry.tx.try_send(frame.clone()).is_ok() {
+                    if self.deliver(entry, &packet) {
                         delivered += 1;
                     } else {
-                        self.dropped.fetch_add(1, Ordering::Relaxed);
                         debug!(switch = %self.name, egress = %id, "egress queue full, frame dropped");
                     }
                 }
@@ -872,5 +985,217 @@ mod tests {
         a.tx.send(f.clone()).await.unwrap();
         assert_eq!(recv(&mut c.rx).await, f);
         assert_no_frame(&mut b.rx).await;
+    }
+
+    fn gso_packet(udp: bool) -> Packet {
+        use vmlab_hv_proto::net::{GSO_TCPV4, GSO_UDP, Header, NEEDS_CSUM};
+        let transport_len = if udp { 8 } else { 20 };
+        let mut frame = vec![0; 34 + transport_len + 4097];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&mac(1).0);
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        frame[14] = 0x45;
+        let ip_len = (frame.len() - 14) as u16;
+        frame[16..18].copy_from_slice(&ip_len.to_be_bytes());
+        frame[22] = 64;
+        frame[23] = if udp { 17 } else { 6 };
+        frame[26..34].copy_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+        frame[34..38].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        if udp {
+            frame[38..40].copy_from_slice(&((transport_len + 4097) as u16).to_be_bytes());
+        } else {
+            frame[46] = 0x50;
+            frame[47] = 0x18;
+        }
+        for (index, byte) in frame[34 + transport_len..].iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        Packet {
+            frame: Bytes::from(frame),
+            header: Header {
+                flags: NEEDS_CSUM,
+                gso_type: if udp { GSO_UDP } else { GSO_TCPV4 },
+                hdr_len: (34 + transport_len) as u16,
+                gso_size: if udp { 1100 } else { 1460 },
+                csum_start: 34,
+                csum_offset: if udp { 6 } else { 16 },
+            },
+            queue: 1,
+        }
+    }
+
+    fn assert_segment(frame: &[u8], udp: bool, mtu: usize) -> &[u8] {
+        use crate::net::frame::{Ipv4View, TcpView, UdpView};
+        assert!(frame.len() - 14 <= mtu);
+        let ip = Ipv4View::parse(&frame[14..]).unwrap();
+        assert!(ip.checksum_valid());
+        if udp {
+            let udp = UdpView::parse(ip.payload()).unwrap();
+            assert!(udp.checksum_valid(ip.src(), ip.dst()));
+            &frame[42..]
+        } else {
+            let tcp = TcpView::parse(ip.payload()).unwrap();
+            assert!(tcp.checksum_valid(ip.src(), ip.dst()));
+            &frame[54..]
+        }
+    }
+
+    #[tokio::test]
+    async fn vnet_passthrough_and_raw_segmentation_at_stream_seam() {
+        for udp in [false, true] {
+            let switch = Switch::new("offload".into());
+            let source_mode = FramingMode::Vnet { queue_pairs: 2 };
+            let target_mode = FramingMode::Vnet { queue_pairs: 4 };
+            let (source, mut guest) = UnixStream::pair().unwrap();
+            switch
+                .add_stream_port_with_config(
+                    source,
+                    GUEST,
+                    PortConfig {
+                        framing: source_mode,
+                        mtu: 1500,
+                    },
+                )
+                .await;
+            let (target, mut peer) = UnixStream::pair().unwrap();
+            switch
+                .add_stream_port_with_config(
+                    target,
+                    GUEST,
+                    PortConfig {
+                        framing: target_mode,
+                        mtu: 1500,
+                    },
+                )
+                .await;
+            let (raw, mut qemu) = UnixStream::pair().unwrap();
+            switch
+                .add_stream_port_with_config(
+                    raw,
+                    GUEST,
+                    PortConfig {
+                        framing: FramingMode::Raw,
+                        mtu: 1200,
+                    },
+                )
+                .await;
+            let mut service = switch.add_channel_port(PortClass::Service);
+            let packet = gso_packet(udp);
+            framing::write_packet(&mut guest, &packet, source_mode)
+                .await
+                .unwrap();
+            let forwarded = timeout(
+                Duration::from_secs(2),
+                framing::read_packet(&mut peer, target_mode),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(forwarded.frame, packet.frame);
+            assert_eq!(forwarded.header, packet.header);
+            assert_eq!(
+                forwarded.queue,
+                (vmlab_hv_proto::net::flow_hash(&packet.frame) % 4) as u16
+            );
+            let mut raw_payload = Vec::new();
+            let mut service_payload = Vec::new();
+            while raw_payload.len() < 4097 {
+                let frame = timeout(Duration::from_secs(2), framing::read_frame(&mut qemu))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                raw_payload.extend_from_slice(assert_segment(&frame, udp, 1200));
+            }
+            while service_payload.len() < 4097 {
+                let frame = recv(&mut service.rx).await;
+                service_payload.extend_from_slice(assert_segment(&frame, udp, 1500));
+            }
+            let offset = if udp { 42 } else { 54 };
+            assert_eq!(raw_payload, packet.frame[offset..]);
+            assert_eq!(service_payload, packet.frame[offset..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn rewritten_gso_packet_gets_complete_checksums() {
+        let switch = Switch::new("rewrite".into());
+        let mode = FramingMode::Vnet { queue_pairs: 2 };
+        let (source, mut guest) = UnixStream::pair().unwrap();
+        switch
+            .add_stream_port_with_config(
+                source,
+                GUEST,
+                PortConfig {
+                    framing: mode,
+                    mtu: 1500,
+                },
+            )
+            .await;
+        let (target, mut peer) = UnixStream::pair().unwrap();
+        switch
+            .add_stream_port_with_config(
+                target,
+                GUEST,
+                PortConfig {
+                    framing: mode,
+                    mtu: 1500,
+                },
+            )
+            .await;
+        switch.set_ingress_hook(Box::new(|_, _, frame| {
+            let mut replacement = frame.to_vec();
+            replacement[33] = 9;
+            HookAction::Replace(replacement)
+        }));
+        let packet = gso_packet(false);
+        framing::write_packet(&mut guest, &packet, mode)
+            .await
+            .unwrap();
+        let mut payload = Vec::new();
+        while payload.len() < 4097 {
+            let received = timeout(
+                Duration::from_secs(2),
+                framing::read_packet(&mut peer, mode),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(received.header, vmlab_hv_proto::net::Header::default());
+            assert_eq!(received.frame[33], 9);
+            payload.extend_from_slice(assert_segment(&received.frame, false, 1500));
+        }
+        assert_eq!(payload, packet.frame[54..]);
+    }
+
+    #[tokio::test]
+    async fn uso_datagrams_that_exceed_a_raw_ports_mtu_are_dropped() {
+        let switch = Switch::new("uso-mtu".into());
+        let mode = FramingMode::Vnet { queue_pairs: 2 };
+        let (source, mut guest) = UnixStream::pair().unwrap();
+        switch
+            .add_stream_port_with_config(
+                source,
+                GUEST,
+                PortConfig {
+                    framing: mode,
+                    mtu: 1500,
+                },
+            )
+            .await;
+        let mut raw = switch.add_channel_port_with_mtu(GUEST, 1200);
+        let mut packet = gso_packet(true);
+        packet.header.gso_size = 1460;
+        framing::write_packet(&mut guest, &packet, mode)
+            .await
+            .unwrap();
+        wait_for(
+            || switch.stats().frames_dropped != 0,
+            "incompatible USO counted",
+        )
+        .await;
+        assert_no_frame(&mut raw.rx).await;
     }
 }

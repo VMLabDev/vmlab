@@ -464,13 +464,13 @@ VMs on the q35 machine: SeaBIOS or OVMF with secure boot, a TPM and the
 Hyper-V enlightenments, std VGA or virtio-vga, virtio or SATA disks, CD-ROMs,
 virtio-net NICs and the USB tablet — the Linux profiles and the Windows 10, 11
 and Server templates as they are — plus a `gpu {}` of any mode, virtio-fs
-shares, `usb = true` and [guest audio](guide_audio). A guest that reboots
+shares, `usb = true`, a pinned `tsc`, and [guest audio](guide_audio). A guest that reboots
 itself is reset in place, as on QEMU; the VM reads as not ready until its
 agent answers again. A machine can force `hypervisor = "vmlab"`, and `host {
 hypervisor { container = "vmlab" vm = "vmlab" } }` moves every machine of that
 kind that names none. For explicit vmlab settings, validation refuses what it cannot run yet,
 naming the machine, the reason and the phase that brings it: macOS, the i440fx
-machine and floppies, `accel = "tcg"`, a pinned `tsc`, `input = "usb"`, and
+machine and floppies, `accel = "tcg"`, `input = "usb"`, and
 `qemu_args` in every phase.
 
 A `virgl` or `vulkan` GPU renders on the render node of the host GPU your host
@@ -560,9 +560,14 @@ DOC
 The profile also sets `tsc = "host"`: macOS reads its clock frequency from a
 CPUID leaf QEMU fills only for an invariant TSC at a known frequency. vmlab
 reads the host's TSC frequency from KVM at the VM's first KVM start and pins it
-in `.vmlab/vms/<vm>/tsc-hz`, and every later start reuses that value. Reading
+in `.vmlab/vms/<vm>/tsc-hz`, and every later start reuses that value. QEMU
+probes through a paused emulator. On a q35 VM with `hypervisor = "vmlab"`,
+`vmlab-hv --probe` reads an unstarted scratch vCPU instead and requires an
+invariant, stable host TSC. vmlab-hv receives the pin as `tsc_khz` and applies
+it to every vCPU, with `invtsc` enabled. Reading
 it afresh would break restores: the host kernel recalibrates its TSC at each
-boot, and QEMU refuses to load an online snapshot taken at another frequency.
+boot, and both hypervisors refuse to load an online snapshot taken at another
+guest frequency. On a different host, KVM must support the original pin.
 KVM runs a pinned frequency within its tolerance of the host's without
 scaling, so an old pin costs nothing. Under TCG there is no KVM to read the
 frequency from, and `up` warns that the VM boots without the pin; macOS does

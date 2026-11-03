@@ -88,6 +88,8 @@ pub struct TemplateConfig {
     /// Host wscript surface used by embedded scripts.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wscript_surface: Option<crate::scripting::WscriptSurfaceVersion>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub logins: Vec<crate::config::model::Login>,
     /// A base built from a definition with variants (§6.6): with no default
     /// variant installed, a lab never clones it. A client that predates the
     /// marker ignores it and pulls a base-only template.
@@ -143,6 +145,7 @@ impl TemplateConfig {
             first_boot_script: meta.first_boot_script.clone(),
             agent_version: meta.agent_version.clone(),
             wscript_surface: meta.wscript_surface,
+            logins: meta.logins.clone(),
             variants_expected: meta.variants_expected,
             variant: None,
         }
@@ -213,7 +216,7 @@ impl TemplateConfig {
         let created = chrono::DateTime::parse_from_rfc3339(&self.created)
             .map_err(|e| anyhow::anyhow!("malformed `created` timestamp `{}`: {e}", self.created))?
             .with_timezone(&chrono::Utc);
-        Ok(TemplateMeta {
+        let meta = TemplateMeta {
             name: self.name,
             arch: self.arch,
             version: self.version,
@@ -251,11 +254,14 @@ impl TemplateConfig {
             first_boot_script: self.first_boot_script,
             agent_version: self.agent_version,
             wscript_surface: self.wscript_surface,
+            logins: self.logins,
             variants_expected: self.variants_expected,
             // Variants travel as their own manifests (§6.6), not in the
             // base's config blob.
             variants: Vec::new(),
-        })
+        };
+        meta.ensure_login_surface()?;
+        Ok(meta)
     }
 
     /// Carry `vars` — the template's pre-enrolled VARS file — in this blob.
@@ -324,6 +330,7 @@ mod tests {
             agent_version: Some("agent=abc123".into()),
             wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         }
     }
@@ -337,6 +344,36 @@ mod tests {
         assert_eq!(cfg, back);
         let m2 = back.into_meta(None).unwrap();
         assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn template_logins_survive_registry_config_round_trips() {
+        let mut m = meta();
+        m.first_boot_script = None;
+        m.logins = vec![crate::config::model::Login {
+            label: "stock".into(),
+            user: "vmlab".into(),
+            password: Some("template-secret".into()),
+            elevated: Some(false),
+            default: Some(true),
+            origin: Default::default(),
+            span: (0, 0),
+        }];
+        let config = TemplateConfig::from_meta(&m);
+        let json = config.to_json().unwrap();
+        let back = TemplateConfig::from_json(&json)
+            .unwrap()
+            .into_meta(None)
+            .unwrap();
+        assert_eq!(back, m);
+        assert!(!String::from_utf8_lossy(&json).contains("span"));
+        let mut old = config.clone();
+        old.wscript_surface = Some(5.into());
+        assert!(old.into_meta(None).is_err());
+        let mut legacy = serde_json::to_value(TemplateConfig::from_meta(&meta())).unwrap();
+        legacy.as_object_mut().unwrap().remove("logins");
+        let legacy: TemplateConfig = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.into_meta(None).unwrap().logins.is_empty());
     }
 
     /// A template's pre-enrolled VARS file rides the base's config blob,

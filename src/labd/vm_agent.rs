@@ -616,6 +616,7 @@ impl AgentHandle {
             env,
             cwd,
             logon,
+            split_logs: self.has_feature(features::APP_LOG_SPLIT),
         })
         .await
     }

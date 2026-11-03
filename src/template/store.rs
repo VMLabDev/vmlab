@@ -1030,6 +1030,7 @@ mod tests {
             agent_version: None,
             wscript_surface: None,
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         }
     }

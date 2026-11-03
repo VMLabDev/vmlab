@@ -270,6 +270,7 @@ pub(super) async fn build_vm(
             disk_size,
             first_boot,
             agent_version,
+            logins: meta.as_ref().map(|m| m.logins.clone()).unwrap_or_default(),
             variant,
             template_vars,
         },

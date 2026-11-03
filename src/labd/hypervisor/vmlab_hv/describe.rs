@@ -154,8 +154,9 @@ pub(crate) fn container(
                 pci: None,
                 mac: mac.to_string(),
                 mtu: *mtu,
-                attachment: NicAttachment::Stream {
+                attachment: NicAttachment::StreamVnet {
                     socket: socket.clone(),
+                    queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
                 },
             })
             .collect(),
@@ -287,7 +288,7 @@ fn hyperv_list(resolved: &ResolvedVm, apic_virtualization: bool) -> Result<Vec<H
 /// The machine description for one VM: q35 on SeaBIOS or OVMF, as QEMU runs
 /// the same resolved machine (§22, phases 2a to 2c). Refuses whatever
 /// validation refuses too, as the last word before a spawn, and what only the
-/// launch knows — a tap NIC, a host without its firmware.
+/// launch knows, including a host without its firmware or invalid TAP queues.
 pub(crate) fn vm(
     lab: &str,
     resolved: &ResolvedVm,
@@ -488,10 +489,27 @@ pub(crate) fn vm(
     }
     let mut nics = Vec::new();
     for (index, nic) in paths.nics.iter().enumerate() {
-        let NicBackend::Stream { sock } = &nic.backend else {
-            bail!(
-                "vm \"{name}\": vmlab-hv attaches NICs by stream socket only, not a tap descriptor"
-            );
+        let attachment = match &nic.backend {
+            NicBackend::Stream { sock } => NicAttachment::StreamVnet {
+                socket: sock.clone(),
+                queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
+            },
+            NicBackend::TapQueues { tap_fds, vhost_fds } => {
+                let pairs = crate::net::framing::queue_pairs(resolved.cpus);
+                if tap_fds.len() != usize::from(pairs)
+                    || (!vhost_fds.is_empty() && vhost_fds.len() != tap_fds.len())
+                {
+                    bail!(
+                        "vm \"{name}\": TAP and vhost-net queue counts do not match its {pairs} virtio queue pairs"
+                    );
+                }
+                // The AF_XDP redirect and host punt carry raw Ethernet,
+                // without the checksum/GSO metadata a capable TAP can carry.
+                NicAttachment::TapRaw { queue_pairs: pairs }
+            }
+            NicBackend::Tap { .. } => {
+                bail!("vm \"{name}\": vmlab-hv requires typed TAP queue descriptors")
+            }
         };
         let pci = slots.next();
         if ovmf && paths.firmware_boot_hints {
@@ -507,9 +525,7 @@ pub(crate) fn vm(
             pci: Some(pci),
             mac: nic.mac.to_string(),
             mtu: nic.mtu.filter(|m| *m != 1500),
-            attachment: NicAttachment::Stream {
-                socket: sock.clone(),
-            },
+            attachment,
         });
     }
     boot.sort_by_key(|(index, _)| *index);
@@ -561,6 +577,21 @@ pub(crate) fn vm(
         bail!("vm \"{name}\": more PCI devices than q35's bus 0 has slots for under vmlab-hv");
     }
 
+    let tsc_khz = if resolved.tsc.is_some() {
+        let hz = paths.tsc_hz.ok_or_else(|| {
+            anyhow::anyhow!(
+                "vm \"{name}\": tsc = \"host\" needs the pinned TSC frequency (PRD §5.2)"
+            )
+        })?;
+        if hz == 0 || !hz.is_multiple_of(1000) {
+            bail!("vm \"{name}\": pinned TSC frequency {hz} Hz must be positive and a whole kHz");
+        }
+        Some(u32::try_from(hz / 1000).map_err(|_| {
+            anyhow::anyhow!("vm \"{name}\": pinned TSC frequency {hz} Hz exceeds KVM's range")
+        })?)
+    } else {
+        None
+    };
     Ok(MachineDescription {
         fw_cfg,
         // A guest reset happens in place, as under QEMU: the process, its
@@ -568,8 +599,8 @@ pub(crate) fn vm(
         exit_on_reset: false,
         machine: Machine::Q35,
         cpu_model: None,
-        invtsc: false,
-        tsc_khz: None,
+        invtsc: tsc_khz.is_some(),
+        tsc_khz,
         vmware_cpuid_freq: false,
         msr_policy: Default::default(),
         applesmc: None,
@@ -711,8 +742,9 @@ mod tests {
         assert_eq!(d.nics[1].mtu, Some(9000));
         assert_eq!(
             d.nics[1].attachment,
-            NicAttachment::Stream {
-                socket: "/run/l/web/nic1.sock".into()
+            NicAttachment::StreamVnet {
+                socket: "/run/l/web/nic1.sock".into(),
+                queue_pairs: 2,
             }
         );
 
@@ -1062,8 +1094,11 @@ mod tests {
         };
         assert!(refused(&ok, &vm_paths(), QemuAccel::Kvm, &no_bios).contains("bios-256k.bin"));
         let mut tap = vm_paths();
-        tap.nics[0].backend = NicBackend::Tap { child_fd: 10 };
-        assert!(refused(&ok, &tap, QemuAccel::Kvm, &roms()).contains("tap"));
+        tap.nics[0].backend = NicBackend::TapQueues {
+            tap_fds: vec![10],
+            vhost_fds: vec![],
+        };
+        assert!(refused(&ok, &tap, QemuAccel::Kvm, &roms()).contains("queue counts"));
         let legacy = resolved_vm("windows-legacy", "x86_64");
         assert!(refused(&legacy, &vm_paths(), QemuAccel::Kvm, &roms()).contains("q35"));
         let qxl = declared(
@@ -1083,7 +1118,77 @@ mod tests {
         assert!(json.contains(r#""machine":"q35""#), "{json}");
     }
 
+    #[test]
+    fn tap_description_defers_descriptor_installation_until_control_connects() {
+        let resolved = seabios_modern();
+        let mut paths = vm_paths();
+        paths.nics[0].backend = NicBackend::TapQueues {
+            tap_fds: vec![10, 11],
+            vhost_fds: vec![12, 13],
+        };
+        let description = vm("l", &resolved, &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(
+            description.nics[0].attachment,
+            NicAttachment::TapRaw { queue_pairs: 2 }
+        );
+        let json = serde_json::to_string(&description).unwrap();
+        assert!(!json.contains("tap_fds"));
+        let attachment =
+            serde_json::to_value(&description).unwrap()["nics"][0]["attachment"].clone();
+        assert_eq!(attachment["kind"], "tap_raw");
+        assert_eq!(attachment["queue_pairs"], 2);
+        assert_eq!(
+            serde_json::from_str::<MachineDescription>(&json).unwrap(),
+            description
+        );
+    }
+
     // -- OVMF, secure boot, TPM, Hyper-V (phase 2c) -----------------------
+
+    #[test]
+    fn pinned_tsc_description_is_invariant_and_round_trips() {
+        for profile in ["linux-modern", "windows-11"] {
+            let resolved = declared(&format!(r#"profile = "{profile}" tsc = "host""#), None);
+            let mut paths = ovmf_paths(profile == "windows-11");
+            paths.tsc_hz = Some(4_291_956_000);
+            let desc = vm("l", &resolved, &paths, QemuAccel::Kvm, &roms()).unwrap();
+            assert!(desc.invtsc);
+            assert_eq!(desc.tsc_khz, Some(4_291_956));
+            assert!(!desc.vmware_cpuid_freq);
+            assert_eq!(
+                serde_json::from_str::<MachineDescription>(&serde_json::to_string(&desc).unwrap())
+                    .unwrap(),
+                desc
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_tsc_description_requires_an_exact_nonzero_khz_pin() {
+        let resolved = declared(
+            r#"profile = "linux-modern" firmware = "seabios" tsc = "host""#,
+            None,
+        );
+        for hz in [
+            None,
+            Some(0),
+            Some(4_291_956_001),
+            Some(u64::from(u32::MAX) * 1000 + 1000),
+        ] {
+            let mut paths = vm_paths();
+            paths.tsc_hz = hz;
+            let error = vm("l", &resolved, &paths, QemuAccel::Kvm, &roms()).unwrap_err();
+            assert!(
+                error.to_string().contains("TSC frequency"),
+                "{hz:?}: {error}"
+            );
+        }
+        let mut paths = vm_paths();
+        paths.tsc_hz = Some(4_291_956_000);
+        let desc = vm("l", &seabios_modern(), &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert!(!desc.invtsc);
+        assert_eq!(desc.tsc_khz, None);
+    }
 
     /// The paths the lab daemon assembles for an OVMF VM: the CODE image its
     /// firmware lookup chose, the VM's own VARS copy, and swtpm's socket.

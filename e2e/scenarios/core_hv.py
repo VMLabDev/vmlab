@@ -55,6 +55,7 @@ def scratch(h):
 
 
 def hardware(h, lab):
+    core.pinned_tsc(h, lab)
     p = core.kv(core.sh(h, lab, "vm01", core.PROBE_VM01).out)
     memory = int(p.get("memkb", "0") or 0)
     h.ok("vm.hw.cpus-memory", p.get("nproc") == "2" and 600_000 < memory <= 768 * 1024,

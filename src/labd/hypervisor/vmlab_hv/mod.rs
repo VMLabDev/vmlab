@@ -17,6 +17,8 @@
 //! guest cannot mount, by the share plan's rules. A VM's TPM is the host's
 //! swtpm, started as for QEMU.
 
+use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,8 +31,59 @@ use crate::qemu::Proc;
 pub(crate) mod control;
 pub(crate) mod describe;
 pub(crate) mod display;
+pub(crate) mod tsc;
 
 use control::{HvControl, HvProcess};
+
+/// One paused NIC installation. Descriptor order is TAP queues, then vhost files.
+pub(crate) struct NetAttachment {
+    pub mac: String,
+    pub queue_pairs: u16,
+    pub vhost: bool,
+    pub fds: Vec<OwnedFd>,
+}
+
+fn net_attachments(
+    nics: &[crate::qemu::NicSpec],
+    fds: Vec<crate::qemu::process::ChildFd>,
+) -> Result<Vec<NetAttachment>> {
+    let mut pending = HashMap::new();
+    for fd in fds {
+        if pending.insert(fd.child, fd.parent).is_some() {
+            bail!("duplicate netdev fd mapping {}", fd.child);
+        }
+    }
+    let mut attachments = Vec::new();
+    for nic in nics {
+        let crate::qemu::NicBackend::TapQueues { tap_fds, vhost_fds } = &nic.backend else {
+            continue;
+        };
+        if !(1..=31).contains(&tap_fds.len())
+            || (!vhost_fds.is_empty() && vhost_fds.len() != tap_fds.len())
+        {
+            bail!("NIC {} has incompatible TAP/vhost queue counts", nic.mac);
+        }
+        let mut fds = Vec::with_capacity(tap_fds.len() + vhost_fds.len());
+        for number in tap_fds.iter().chain(vhost_fds) {
+            fds.push(pending.remove(number).with_context(|| {
+                format!(
+                    "NIC {} has no unique netdev mapping for fd {number}",
+                    nic.mac
+                )
+            })?);
+        }
+        attachments.push(NetAttachment {
+            mac: nic.mac.to_string(),
+            queue_pairs: tap_fds.len() as u16,
+            vhost: !vhost_fds.is_empty(),
+            fds,
+        });
+    }
+    if !pending.is_empty() {
+        bail!("unreferenced netdev fd mappings in vmlab-hv launch");
+    }
+    Ok(attachments)
+}
 
 /// The binary's name, which is also what a host config without `vmlab_hv`
 /// finds on `PATH`.
@@ -227,14 +280,24 @@ impl Hypervisor for VmlabHv {
         }
 
         let binary = self.binary.display().to_string();
+        let nics = match &spec.machine {
+            Launch::Vm { paths, .. } => paths.nics.as_slice(),
+            Launch::Container { .. } => &[],
+        };
+        let attachments = net_attachments(nics, spec.fds)?;
         let args = args(&machine, control_sock);
         crate::qemu::process::write_launch_header(&spec.log, &binary, &args, &spec.env)?;
         let log_from = crate::qemu::process::log_offset(&spec.log);
-        let proc =
-            Proc::spawn_with_fds(&spec.label, &binary, &args, &spec.env, &spec.log, spec.fds)
-                .await?;
+        let proc = Proc::spawn(&spec.label, &binary, &args, &spec.env, &spec.log).await?;
         let proc: Arc<dyn Process> = super::qemu::host_process(proc);
         let mut control = connect_retry(control_sock, &proc, &spec.log, log_from).await?;
+        for attachment in attachments {
+            if let Err(error) = control.attach_net(attachment).await {
+                proc.kill().await;
+                let _ = proc.wait_exit(Duration::from_secs(5)).await;
+                return Err(error).context("installing passed TAP queues before VM resume");
+            }
+        }
         if let Some([native, _]) = display_socks {
             control.set_display(native);
         }

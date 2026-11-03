@@ -169,6 +169,7 @@ impl LabServices for TestLab {
         _mac: crate::config::model::MacAddr,
         _isolated: bool,
         _tap_ok: bool,
+        _framing: crate::net::framing::FramingMode,
     ) -> anyhow::Result<crate::net::fastpath::NicAttachment> {
         Ok(crate::net::fastpath::NicAttachment::Stream {
             sock: sock.to_path_buf(),
@@ -279,6 +280,7 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
             disk_size: Some(10 << 30),
             first_boot: None,
             agent_version: Some("0.1.0".into()),
+            logins: Vec::new(),
             variant: None,
             template_vars: None,
         },
@@ -483,6 +485,58 @@ async fn ejecting_a_cdrom_that_is_not_there_says_so() {
     }
 }
 
+#[tokio::test]
+async fn deferred_template_logins_reach_selectors_and_status_without_a_default() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB }"#,
+        Script::healthy(),
+    );
+    let m: Arc<dyn Machine> = vm.clone();
+    assert!(m.logins().is_empty());
+    let mut template = crate::config::load_template_source(
+        r#"import <vmlab.wcl>
+template "t" { arch = "x86_64" version = "1" source "scratch" {}
+login "stock" { user = "dev" password = "never-in-status" default = true }
+}"#,
+        "<test>",
+        std::path::Path::new("/tmp"),
+    )
+    .unwrap();
+    let parts = vm.template();
+    vm.set_template(TemplateParts {
+        resolved: parts.resolved.clone(),
+        backing: parts.backing.clone(),
+        disk_size: parts.disk_size,
+        first_boot: parts.first_boot.clone(),
+        agent_version: parts.agent_version.clone(),
+        logins: template.templates.remove(0).logins,
+        variant: parts.variant.clone(),
+        template_vars: parts.template_vars.clone(),
+    });
+    let logins = m.logins();
+    assert!(crate::config::model::default_login(&logins).is_none());
+    assert!(
+        super::identity::resolve(m.name(), &logins, m.guest_os(), None, None)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        super::identity::resolve(m.name(), &logins, m.guest_os(), Some("stock"), None)
+            .unwrap()
+            .unwrap()
+            .user,
+        "dev"
+    );
+    let status = serde_json::to_value(m.status().await).unwrap();
+    assert_eq!(status["logins"][0]["label"], "stock");
+    assert_eq!(status["logins"][0]["origin"], "template");
+    assert_eq!(status["logins"][0]["default"], false);
+    assert!(!status.to_string().contains("never-in-status"));
+    assert!(status["logins"][0].get("password").is_none());
+}
+
 /// A VM reports the hardware it resolved to (VM > template > profile), not
 /// what it declared: one that leaves its arch or size to its template must
 /// not show a dash for each.
@@ -505,6 +559,7 @@ async fn a_vms_status_reports_its_resolved_hardware() {
         disk_size: parts.disk_size,
         first_boot: None,
         agent_version: parts.agent_version.clone(),
+        logins: parts.logins.clone(),
         variant: None,
         template_vars: None,
     });
@@ -554,6 +609,33 @@ async fn usb_attaches_only_to_a_running_vm_with_the_controller() {
 }
 
 // ---- the VM start ladder ----------------------------------------------------
+
+#[tokio::test]
+async fn machines_choose_vnet_framing_only_for_vmlab_virtio_nics() {
+    use crate::net::framing::FramingMode;
+    let dirs = Dirs::new();
+    let (qemu, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    assert_eq!(qemu.net_framing(), FramingMode::Raw);
+    let mut script = Script::healthy();
+    script.vmlab_hv = true;
+    let (native, _) = vm(&dirs, LINUX_VM, script.clone());
+    assert!(native.takes_tap_fds());
+    let count = crate::net::framing::queue_pairs(native.template().resolved.cpus);
+    assert_eq!(
+        native.net_framing(),
+        FramingMode::Vnet { queue_pairs: count }
+    );
+    let (container, _) = container(
+        &dirs,
+        r#"container "web" { image = "alpine" cpus = 3 memory = 256MiB }"#,
+        script,
+    );
+    assert_eq!(
+        container.net_framing(),
+        FramingMode::Vnet { queue_pairs: 3 }
+    );
+    assert!(!container.takes_tap_fds());
+}
 
 /// The whole point of the seam: a VM's start ladder runs to completion with
 /// no KVM, no template and no disk image, and the machine reports itself
@@ -1695,6 +1777,7 @@ async fn an_agentless_clone_is_ready_once_it_is_running() {
         agent_version: None,
         variant: None,
         template_vars: None,
+        logins: parts.logins.clone(),
     });
 
     let m: Arc<dyn Machine> = vm.clone();
@@ -1729,6 +1812,7 @@ async fn a_clone_with_an_agent_still_waits_for_the_handshake() {
         disk_size: parts.disk_size,
         first_boot: parts.first_boot.clone(),
         agent_version: parts.agent_version.clone(), // an agent IS baked in
+        logins: parts.logins.clone(),
         variant: None,
         template_vars: None,
     });

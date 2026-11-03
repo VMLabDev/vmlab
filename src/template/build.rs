@@ -926,6 +926,10 @@ async fn run_build(
     // the block restates (ADR-0009), so the source's metadata has to be in
     // hand before anything asks what this build boots on.
     let mut layered = resolve_layered_source(def, store)?;
+    let inherited_logins = layered
+        .as_ref()
+        .map(|resolved| resolved.meta.logins.clone())
+        .unwrap_or_default();
     let hw = EffectiveHardware::resolve(def, layered.as_ref().map(|r| &r.meta))
         .locate_vars(layered.as_ref().map(|r| r.dir.as_path()));
 
@@ -1082,18 +1086,20 @@ async fn run_build(
         None
     };
 
-    // Carry the layered source's first-boot provision onto the build VM.
+    // Carry the layered source's first-boot provision and selectable accounts
+    // onto the build VM. Inherited accounts never change its default identity.
     // The build seeds the working disk directly (below) instead of cloning
     // through the store, so the script would otherwise be lost — and `up()`
     // runs it before the agent bake and any build provisions.
-    if let Some(first_boot) = source_first_boot {
+    if source_first_boot.is_some() || !inherited_logins.is_empty() {
         let parts = vm.template();
         vm.set_template(crate::labd::vm::TemplateParts {
             resolved: parts.resolved.clone(),
             backing: parts.backing.clone(),
             disk_size: parts.disk_size,
-            first_boot: Some(first_boot),
+            first_boot: source_first_boot,
             agent_version: parts.agent_version.clone(),
+            logins: inherited_logins.clone(),
             variant: parts.variant.clone(),
             template_vars: parts.template_vars.clone(),
         });
@@ -1288,7 +1294,7 @@ async fn run_build(
         }
         None => None,
     };
-    let meta = seal_meta(
+    let mut meta = seal_meta(
         def,
         &hw,
         version,
@@ -1299,6 +1305,9 @@ async fn run_build(
             agent_version: agent_version.lock().expect("agent_version lock").clone(),
         },
     );
+    if meta.logins.is_empty() {
+        meta.logins = inherited_logins;
+    }
 
     // A pre-enrolled key store is sealed beside the disk, so every clone's
     // variable store starts from it (§5.2) — the file the build booted with,
@@ -1845,6 +1854,7 @@ fn seal_meta(
         agent_version: image.agent_version,
         wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
         variants_expected: !def.variants.is_empty(),
+        logins: def.logins.clone(),
         variants: Vec::new(),
     }
 }
@@ -2348,6 +2358,7 @@ mod tests {
             agent_version: None,
             wscript_surface: None,
             variants_expected: false,
+            logins: Vec::new(),
             variants: Vec::new(),
         }
     }
@@ -3156,6 +3167,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn template_logins_seal_for_clones_but_not_the_build_machines_default() {
+        let d = def(r#"import <vmlab.wcl>
+template "t" { arch = "x86_64" version = "1" disk = 10GiB source "scratch" {}
+    login "dev" { user = "dev" default = true }
+    variant "standard" {}
+}"#);
+        assert_eq!(d.logins.len(), 1);
+        let sealed = seal_meta(&d, &hw(&d), "1", sealed_image());
+        assert_eq!(sealed.logins[0].label, "dev");
+        assert_eq!(sealed.wscript_surface, Some(6.into()));
+        let rendered = render(&d);
+        let lab = crate::config::load_lab_source(&rendered, "<build>", Path::new("/root")).unwrap();
+        assert!(lab.lab.vms[0].logins.is_empty());
+        let inherited = crate::config::model::effective_logins(&[], &sealed.logins);
+        assert!(crate::config::model::default_login(&inherited).is_none());
+        let variant = super::variant_meta(
+            &d.variants[0],
+            super::VariantImage {
+                sha256: "cd".repeat(32),
+                base_sha256: "ab".repeat(32),
+                first_boot_script: None,
+                agent_version: None,
+            },
+        );
+        assert_eq!(sealed.effective(Some(&variant)).logins[0].label, "dev");
+    }
+
     /// A block's key store reaches the build VM and the sealed metadata:
     /// `setup` as itself, a `secure_boot_vars` file rendered rooted and
     /// recorded as `vars` (the file is sealed beside the disk).
@@ -3334,14 +3373,14 @@ mod tests {
         std::fs::write(staging.path().join(DISK_FILE), b"").unwrap();
         let mut meta = source_meta();
         meta.first_boot_script = Some("use vmlab\nfn main(lab: Lab) {}\n".into());
-        meta.wscript_surface = Some(6.into());
+        meta.wscript_surface = Some(7.into());
         store.install(&staging.keep(), &meta, false).unwrap();
 
         let err = super::resolve_layered_source(&layered(""), &store).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "template `x86_64/win11@26100.1` records wscript surface 6, newer than this host's \
-             5; upgrade vmlab to use it"
+            "template `x86_64/win11@26100.1` records wscript surface 7, newer than this host's \
+             6; upgrade vmlab to use it"
         );
 
         meta.wscript_surface = Some(crate::scripting::WSCRIPT_SURFACE_VERSION);
