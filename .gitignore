@@ -24,3 +24,4 @@ __pycache__/
 
 # Session scratch (plans, handoffs, prototypes); never part of the tree.
 .scratch/
+/.ci-cache/

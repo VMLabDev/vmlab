@@ -84,3 +84,23 @@ guest-cross-build: require-cargo
 [group('ci')]
 ebpf-verify: ebpf-build
 	git diff --exit-code src/net/fastpath/bpf/
+
+# Install the hypervisor's native build dependencies on Ubuntu
+[group('ci')]
+hv-native-deps-install: require-uv
+	uv run --no-project python build/hv.py native-deps-install
+
+# Emit the pinned virglrenderer cache identity
+[group('ci')]
+hv-cache-key: require-uv
+	uv run --no-project python build/hv.py cache-key
+
+# Build virglrenderer with Venus and its render server outside target/
+[group('ci')]
+hv-virgl-build: require-uv
+	uv run --no-project python build/hv.py virgl-build
+
+# Build and check the lockfile-pinned hypervisor release bundle in target/dist/
+[group('ci')]
+hv-package version='': require-cargo hv-virgl-build
+	uv run --no-project python build/hv.py package {{quote(version)}}

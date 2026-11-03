@@ -10,6 +10,10 @@ require-cargo:
 	@command -v cargo > /dev/null 2>&1 || (echo 'cargo is required: install the Rust toolchain from https://rustup.rs' && exit 1)
 
 [private]
+require-uv:
+	@command -v uv > /dev/null 2>&1 || (echo 'uv is required: run scripts/guest-toolchains.sh uv' && exit 1)
+
+[private]
 require-bwrap:
 	@command -v bwrap > /dev/null 2>&1 || (echo 'bubblewrap is required for isolated host-process agent conformance' && exit 1)
 

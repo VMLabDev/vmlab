@@ -282,12 +282,49 @@ jobs:
             target/guest-package/vmlab-guest-${{ needs.version.outputs.version }}.tar.gz.sha256
           retention-days: 1
 
+  # The hypervisor and viewer speak the protocol pinned in Cargo.lock.
+  hv-build:
+    name: Build hypervisor bundle
+    needs: [version, check, guest-crates, ebpf-verify]
+    if: needs.version.outputs.do_release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@uv
+      - name: Install native dependencies
+        run: just ci::hv-native-deps-install
+      - name: Resolve virglrenderer cache identity
+        id: virgl
+        run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
+      # Outside target/: rust-cache restores that directory separately.
+      - uses: actions/cache@v6
+        with:
+          path: .ci-cache/virglrenderer-*
+          key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hv-build
+          workspaces: . -> target/hv
+      - name: Build and check hypervisor bundle
+        run: just ci::hv-package "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hv-assets
+          path: |
+            target/dist/vmlab-hv-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz
+            target/dist/vmlab-hv-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz.sha256
+          retention-days: 1
+
   # ── Release ───────────────────────────────────────────────────────────────
   # Tag the commit and cut a GitHub (pre-)release with the binary and the
-  # guest-asset bundle (and its checksum) attached.
+  # guest and hypervisor bundles (and their checksums) attached.
   release:
     name: Create GitHub release
-    needs: [version, build, guest-assets]
+    needs: [version, build, guest-assets, hv-build]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -304,6 +341,10 @@ jobs:
         with:
           path: dist
           name: guest-assets
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          name: hv-assets
       - name: Tag
         run: |
           V="${{ needs.version.outputs.version }}"
