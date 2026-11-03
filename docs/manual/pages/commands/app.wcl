@@ -87,8 +87,8 @@ page cmd_app {
   DOC
 
   p <<DOC
-    FreeRDP stderr is logged to `freerdp.log` in the session's private
-    runtime directory. On failure, the command retains the log and prints
+    By default, FreeRDP stdout and stderr are logged to `freerdp.log` in the
+    session's private runtime directory. On failure, the command retains the log and prints
     its path and up to 20 trailing non-backtrace lines. Waypipe's own
     diagnostics are hidden; the guest program's stderr still comes through.
     `--verbose` shows protocol diagnostics in the foreground. A detached

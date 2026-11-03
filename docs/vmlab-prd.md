@@ -2362,8 +2362,9 @@ connection (`guest/agent-proto/src/app.rs`):
 Waypipe runs with `--compress lz4` on both ends, because a client and server
 that disagree on compression refuse each other.
 
-Protocol diagnostics stay separate from application output. FreeRDP's stderr
-goes to `freerdp.log` in the private session runtime directory. A real failure
+Protocol diagnostics stay separate from application output. By default,
+FreeRDP's stdout and stderr go to `freerdp.log` in the private session runtime
+directory. A real failure
 prints that path and up to 20 trailing non-backtrace lines, and retains the
 log for inspection. Success, normal disconnect, and user logoff are not
 failures (FreeRDP codes 0, 1, 2, 11, and 12).

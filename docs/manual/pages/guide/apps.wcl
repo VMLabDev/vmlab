@@ -130,8 +130,9 @@ DOC
   h2 "Protocol diagnostics"
 
   p <<'DOC'
-The program's output, including stderr, stays visible. FreeRDP's stderr goes
-to `freerdp.log` in the private session runtime directory. A failed session
+The program's output, including stderr, stays visible. By default, FreeRDP's
+stdout and stderr go to `freerdp.log` in the private session runtime directory.
+A failed session
 prints the retained log's path and up to 20 trailing lines, excluding
 backtraces. Normal disconnect and user logoff are successful endings and
 print no failure report. Waypipe's own logs are hidden on both ends.

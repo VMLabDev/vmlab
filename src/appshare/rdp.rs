@@ -369,6 +369,12 @@ impl Server {
             .mode(0o600)
             .open(&self.log)
             .with_context(|| format!("opening {}", self.log.display()))?;
+        // FreeRDP can buffer INFO diagnostics on stdout until it exits.
+        let stdout = if verbose {
+            Stdio::inherit()
+        } else {
+            Stdio::from(log.try_clone().context("duplicating FreeRDP's log file")?)
+        };
         let (stderr, tee) = if verbose {
             (Stdio::piped(), Some(log))
         } else {
@@ -377,6 +383,7 @@ impl Server {
         let mut child = tokio::process::Command::new(&bin)
             .args(ARGV)
             .stdin(Stdio::piped())
+            .stdout(stdout)
             .stderr(stderr)
             .kill_on_drop(true)
             .spawn()
@@ -508,14 +515,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn freerdp_stderr_is_logged_in_the_session_directory() {
+    async fn freerdp_output_is_logged_in_the_session_directory() {
         use std::os::unix::fs::PermissionsExt;
 
         let scratch = tempfile::tempdir().unwrap();
         let bin = scratch.path().join("freerdp");
         std::fs::write(
             &bin,
-            "#!/bin/sh\ncat >/dev/null\necho client-diagnostic >&2\nexit 147\n",
+            "#!/bin/sh\ncat >/dev/null\necho client-info\necho client-diagnostic >&2\nexit 147\n",
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -535,7 +542,10 @@ mod tests {
             server.event().await.unwrap(),
             HostEvent::Exited(147)
         ));
-        assert_eq!(std::fs::read_to_string(log).unwrap(), "client-diagnostic\n");
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "client-info\nclient-diagnostic\n"
+        );
     }
 
     #[test]
