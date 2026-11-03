@@ -61,7 +61,7 @@ RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
     [ -d /hv/.git ] || git init -q /hv; \
     git -C /hv fetch -q --depth 1 https://github.com/VMLabDev/vmlab-hypervisor.git "$rev"; \
     git -C /hv checkout -q --force FETCH_HEAD; \
-    cargo build --release --locked --manifest-path /hv/Cargo.toml --bin vmlab-hv; \
+    cargo build --release --locked --no-default-features --manifest-path /hv/Cargo.toml --bin vmlab-hv; \
     install -D /hv/target/release/vmlab-hv /out/vmlab-hv
 
 FROM registry:2 AS registry
@@ -97,6 +97,9 @@ COPY --from=build /out/guest /usr/share/vmlab/guest
 # A second Linux agent with a different stamp, for the agent-refresh check.
 COPY --from=build /out/stale-agent /usr/share/vmlab/e2e/stale-agent
 COPY e2e /e2e
+# Catch missing runtime libraries before a suite waits for guests that cannot
+# start. The hypervisor has no host audio session and uses its null backend.
+RUN vmlab --version && vmlab-hv --help > /dev/null
 ENV XDG_RUNTIME_DIR=/run/user/0 \
     PYTHONUNBUFFERED=1
 WORKDIR /work
