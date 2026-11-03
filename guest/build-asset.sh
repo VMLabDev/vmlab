@@ -23,6 +23,9 @@
 # the guest asset installs the firmware with it.
 #
 # Usage: guest/build-asset.sh [arch...]      (default: x86_64 aarch64)
+# VMLAB_SKIP_FIRMWARE=1 omits the firmware step when it is built separately.
+# The e2e image uses this for its cached firmware stage. Unset by default,
+# so guest-install, release bundles and CI still include firmware.
 
 set -euo pipefail
 
@@ -341,7 +344,11 @@ main() {
     log "building guest asset for $arch"
     build_arch "$arch"
   done
-  bash "$SCRIPT_DIR/build-firmware.sh" "${arches[@]}"
+  if [[ "${VMLAB_SKIP_FIRMWARE:-}" == 1 ]]; then
+    log "skipping firmware build (VMLAB_SKIP_FIRMWARE=1)"
+  else
+    bash "$SCRIPT_DIR/build-firmware.sh" "${arches[@]}"
+  fi
   log "done"
 }
 

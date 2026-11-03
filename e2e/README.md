@@ -12,7 +12,9 @@ just e2e::run --hypervisor qemu      # explicit QEMU coverage
 
 The host needs Docker and a usable `/dev/kvm`. The container runs privileged, with a 24 GiB memory limit and no swap. If `~/.local/share/config-weave/bin` exists, the playbook scenario mounts it into the container. GPU rendering is skipped unless `VMLAB_E2E_RENDER_NODE` names a host render device designated for testing, such as `/dev/dri/renderD128`. The suite never selects a host GPU automatically.
 
-The image recipe first builds the release toolchain image from `build/Dockerfile`, using `VMLAB_BUILD_IMAGE` or `vmlab-build`. The e2e build stage inherits those toolchains and `VMLAB_BUILD_ENV=1`, so `build-asset.sh` builds firmware in place. The runtime carries the same branded OVMF variants, Secure Boot VARS, SeaBIOS and iPXE ROMs as `just guest-install`, plus AAVMF for the QEMU administration checks.
+The image recipe first builds the release toolchain image from `build/Dockerfile`, using `VMLAB_BUILD_IMAGE` or `vmlab-build`. The firmware stage inherits those toolchains and `VMLAB_BUILD_ENV=1`. It copies only the firmware scripts, patches, regression check, Secure Boot manifest and lockfile, iPXE pins and configuration, SeaBIOS inputs, and OVMF bitmap. Docker reuses that stage when unrelated source files change. Verified downloads and Python dependencies use BuildKit caches. The iPXE checkout stays in the firmware layer so a changed pin gets a fresh checkout.
+
+The main build sets `VMLAB_SKIP_FIRMWARE=1` for `build-asset.sh` and builds only the kernel/initramfs and agent. The final image copies firmware directly from the firmware stage. The skip is opt-in; `guest-install`, release bundles and CI retain their normal firmware build. The runtime carries the same branded OVMF variants, Secure Boot VARS, SeaBIOS and iPXE ROMs as `just guest-install`, plus AAVMF for the QEMU administration checks.
 
 ## How a run works
 

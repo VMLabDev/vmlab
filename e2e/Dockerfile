@@ -6,9 +6,30 @@
 # privileged with /dev/kvm passed through (`just e2e::run`).
 
 ARG VMLAB_BUILD_IMAGE=vmlab-build
-# The release toolchains include OVMF, Secure Boot VARS, SeaBIOS and iPXE's
-# build dependencies. VMLAB_BUILD_ENV=1 is inherited, so build-asset.sh builds
-# firmware here instead of trying to launch Docker inside this build.
+# Only firmware inputs invalidate this stage. VMLAB_BUILD_ENV=1 is inherited
+# from the release toolchains, so no nested Docker invocation is needed.
+FROM ${VMLAB_BUILD_IMAGE} AS firmware
+WORKDIR /src
+COPY guest/build-firmware.sh guest/build-ovmf.sh guest/build-secureboot.sh \
+     guest/fetch-firmware.sh guest/build-seabios.sh \
+     guest/enroll-secureboot.py guest/enroll-secureboot.py.lock guest/
+COPY guest/ovmf/boot-without-waits.patch guest/ovmf/host-resolution.patch \
+     guest/ovmf/reproducible-iscsi-pcd.patch guest/ovmf/reproducible-debug-path.patch \
+     guest/ovmf/reproducible-source-path.patch guest/ovmf/test-genfw-reproducible.py guest/ovmf/
+COPY guest/secureboot/microsoft-2023.json guest/secureboot/
+COPY guest/logo/Logo.bmp guest/logo/
+COPY guest/seabios/* guest/seabios/
+COPY guest/ipxe/build.py guest/ipxe/upstream.json guest/ipxe/
+COPY guest/ipxe/config/*.h guest/ipxe/config/
+# Cache verified downloads. Keep iPXE's checkout in the layer itself so a
+# changed upstream pin starts with a fresh checkout rather than a stale cache.
+RUN --mount=type=cache,id=vmlab-e2e-firmware-deb,target=/src/guest/.cache/deb,sharing=locked \
+    --mount=type=cache,id=vmlab-e2e-firmware-edk2,target=/src/guest/.cache/edk2,sharing=locked \
+    --mount=type=cache,id=vmlab-e2e-firmware-seabios,target=/src/guest/.cache/seabios,sharing=locked \
+    --mount=type=cache,id=vmlab-e2e-firmware-secureboot,target=/src/guest/.cache/secureboot,sharing=locked \
+    --mount=type=cache,id=vmlab-e2e-firmware-uv,target=/src/guest/.cache/uv,sharing=locked \
+    UV_CACHE_DIR=/src/guest/.cache/uv bash guest/build-firmware.sh x86_64 aarch64
+
 FROM ${VMLAB_BUILD_IMAGE} AS build
 WORKDIR /src
 COPY . .
@@ -23,16 +44,13 @@ RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
     find src guest -type f -exec touch {} +; \
     cargo build --release --locked --bin vmlab; \
     install -D target/release/vmlab /out/vmlab; \
-    ./guest/build-asset.sh x86_64; \
-    # vmlab's own UEFI firmware for the aarch64 admin VM too: the runtime
-    # image carries no OVMF/AAVMF package, so every UEFI boot proves the
-    # bundled set is all a host needs.
-    ./guest/fetch-firmware.sh aarch64; \
+    VMLAB_SKIP_FIRMWARE=1 ./guest/build-asset.sh x86_64; \
+    test ! -e guest/dist/firmware; \
     ./guest/build-agent.sh linux-x86_64; \
     VMLAB_AGENT_STAMP=agent=e2e-stale VMLAB_AGENT_DIST_DIR=/out/stale-agent \
       ./guest/build-agent.sh linux-x86_64; \
     mkdir -p /out/guest; \
-    cp -r --sparse=always guest/dist/x86_64 guest/dist/agent guest/dist/firmware /out/guest/
+    cp -r --sparse=always guest/dist/x86_64 guest/dist/agent /out/guest/
 # virglrenderer 1.3.0, which vmlab-hv's virtio-gpu builds against (phase 2d)
 # and trixie does not ship (1.1.0). Installed under /opt/virgl, apart from the
 # distro's: vmlab-hv finds it by rpath, and QEMU keeps trixie's.
@@ -94,6 +112,7 @@ COPY --from=build /out/vmlab /usr/local/bin/vmlab
 COPY --from=build /out/vmlab-hv /usr/local/bin/vmlab-hv
 COPY --from=build /opt/virgl /opt/virgl
 COPY --from=build /out/guest /usr/share/vmlab/guest
+COPY --from=firmware /src/guest/dist/firmware /usr/share/vmlab/guest/firmware
 # A second Linux agent with a different stamp, for the agent-refresh check.
 COPY --from=build /out/stale-agent /usr/share/vmlab/e2e/stale-agent
 COPY e2e /e2e

@@ -24,9 +24,10 @@ require-docker:
 	@test -c /dev/kvm || (echo '/dev/kvm is required for the e2e suite' && exit 1)
 
 # Build the e2e image from this checkout
+# Local toolchain attestations change its image ID and invalidate firmware caches.
 [group('e2e')]
 image-build: require-docker
-	DOCKER_BUILDKIT=1 docker build -f build/Dockerfile -t {{build_image}} .
+	DOCKER_BUILDKIT=1 docker build --provenance=false -f build/Dockerfile -t {{build_image}} .
 	DOCKER_BUILDKIT=1 docker build --build-arg VMLAB_BUILD_IMAGE={{build_image}} -f e2e/Dockerfile -t {{image}} .
 
 # Run the suite (arguments go to e2e/run.py: `--only core dev`, `--keep`, `--list`, `--hypervisor vmlab`)
