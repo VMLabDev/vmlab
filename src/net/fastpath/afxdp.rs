@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::config::model::MacAddr;
+use crate::net::framing::FramingMode;
 use crate::net::switch::{PortClass, Switch};
 use crate::sync::LockRecover;
 
@@ -292,8 +293,28 @@ impl SegmentXdp {
         mac: MacAddr,
         isolated: bool,
     ) -> Result<TapNic> {
+        self.add_nic_with_framing(switch, mac, isolated, FramingMode::Raw)
+    }
+
+    /// Create raw QEMU queues or vnet multiqueue descriptors for vmlab-hv.
+    pub fn add_nic_with_framing(
+        self: &Arc<Self>,
+        switch: &Arc<Switch>,
+        mac: MacAddr,
+        isolated: bool,
+        framing: FramingMode,
+    ) -> Result<TapNic> {
         let tag = self.alloc_tag()?;
-        let tap = match vmlab_tap::create("vmfp%d", MAX_TAP_MTU) {
+        let opened = match framing {
+            FramingMode::Raw => {
+                vmlab_tap::create("vmfp%d", MAX_TAP_MTU).map(|tap| (tap.name, vec![tap.fd]))
+            }
+            FramingMode::Vnet { queue_pairs } => {
+                vmlab_tap::create_vnet("vmfp%d", MAX_TAP_MTU, queue_pairs)
+                    .map(|tap| (tap.name, tap.queues))
+            }
+        };
+        let (name, queues) = match opened {
             Ok(t) => t,
             Err(e) => {
                 self.free_tags.lock_recover().push(tag);
@@ -301,8 +322,8 @@ impl SegmentXdp {
             }
         };
         let result = (|| -> Result<()> {
-            let ifindex = ifindex(&tap.name)?;
-            self.engine.attach(&tap.name)?;
+            let ifindex = ifindex(&name)?;
+            self.engine.attach(&name)?;
             let flags = if isolated { XDP_FLAG_ISOLATED } else { 0 };
             self.engine.set_port(tag, ifindex, flags)?;
             if !isolated {
@@ -338,12 +359,24 @@ impl SegmentXdp {
             return Err(e);
         }
 
-        debug!(segment = %self.name, tag, tap = %tap.name, %mac, "nic on afxdp fast path");
+        let vhost = if matches!(framing, FramingMode::Vnet { .. }) {
+            open_vhost_queues(queues.len(), || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/vhost-net")
+                    .map(OwnedFd::from)
+            })
+        } else {
+            Vec::new()
+        };
+        debug!(segment = %self.name, tag, tap = %name, %mac, queue_pairs = queues.len(), vhost = !vhost.is_empty(), "nic on afxdp fast path");
         Ok(TapNic {
             segment: self.clone(),
             tag,
-            name: tap.name,
-            fd: tap.fd,
+            name,
+            queues,
+            vhost,
         })
     }
 
@@ -373,6 +406,23 @@ impl SegmentXdp {
     }
 }
 
+fn open_vhost_queues(
+    count: usize,
+    mut open: impl FnMut() -> std::io::Result<OwnedFd>,
+) -> Vec<OwnedFd> {
+    let mut fds = Vec::with_capacity(count);
+    for _ in 0..count {
+        match open() {
+            Ok(fd) => fds.push(fd),
+            Err(error) => {
+                debug!(%error, "vhost-net unavailable; TAP queues use the userspace backend");
+                return Vec::new();
+            }
+        }
+    }
+    fds
+}
+
 /// One VM NIC attached to the afxdp fast path. RAII: dropping detaches the
 /// switch port + XDP maps and closes the daemon's queue fd — once QEMU's dup
 /// is gone too, the kernel destroys the tap.
@@ -380,18 +430,33 @@ pub struct TapNic {
     segment: Arc<SegmentXdp>,
     tag: u32,
     name: String,
-    fd: OwnedFd,
+    queues: Vec<OwnedFd>,
+    vhost: Vec<OwnedFd>,
 }
 
 impl TapNic {
     /// A fresh dup of the queue fd for a QEMU child to inherit.
     pub fn qemu_fd(&self) -> std::io::Result<OwnedFd> {
-        self.fd.as_fd().try_clone_to_owned()
+        self.queues[0].as_fd().try_clone_to_owned()
+    }
+
+    pub fn queue_fds(&self) -> std::io::Result<Vec<OwnedFd>> {
+        self.queues
+            .iter()
+            .map(|fd| fd.as_fd().try_clone_to_owned())
+            .collect()
+    }
+
+    pub fn vhost_fds(&self) -> std::io::Result<Vec<OwnedFd>> {
+        self.vhost
+            .iter()
+            .map(|fd| fd.as_fd().try_clone_to_owned())
+            .collect()
     }
 
     /// The tap's queue fd (probe use).
     pub(super) fn io(&self) -> Result<TapIo> {
-        TapIo::new(self.fd.as_fd().try_clone_to_owned()?)
+        TapIo::new(self.queues[0].as_fd().try_clone_to_owned()?)
     }
 }
 
@@ -476,6 +541,26 @@ fn diagnose_tap_failure(errno: Option<i32>, env: &TapEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vhost_open_is_all_or_none() {
+        let mut calls = 0;
+        let fds = open_vhost_queues(3, || {
+            calls += 1;
+            if calls == 2 {
+                return Err(std::io::Error::from_raw_os_error(nix::libc::EACCES));
+            }
+            let (fd, _) = std::os::unix::net::UnixDatagram::pair()?;
+            Ok(fd.into())
+        });
+        assert!(fds.is_empty());
+        assert_eq!(calls, 2);
+        let fds = open_vhost_queues(3, || {
+            let (fd, _) = std::os::unix::net::UnixDatagram::pair()?;
+            Ok(fd.into())
+        });
+        assert_eq!(fds.len(), 3);
+    }
 
     #[test]
     fn punt_capacity_includes_a_maximal_frame_and_tag() {

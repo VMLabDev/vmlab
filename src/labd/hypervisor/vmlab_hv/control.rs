@@ -14,6 +14,7 @@
 //! `vmlab_hv_proto::server::Server` — no hypervisor binary, no KVM.
 
 use std::collections::BTreeSet;
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -130,6 +131,30 @@ impl HvControl {
     /// which is after it exits.
     pub(crate) fn drained(&self) -> watch::Receiver<bool> {
         self.events_closed.clone()
+    }
+
+    pub(crate) async fn attach_net(&self, attachment: super::NetAttachment) -> Result<()> {
+        if !self.capabilities.contains(&Capability::NetFds) {
+            return Err(anyhow!(
+                "vmlab-hv does not advertise passed TAP descriptors (net_fds)"
+            ));
+        }
+        let command = Command::NetAttach {
+            mac: attachment.mac,
+            queue_pairs: attachment.queue_pairs,
+            vhost: attachment.vhost,
+        };
+        let commands = self.commands.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut client = commands.lock().unwrap_or_else(|p| p.into_inner());
+            let borrowed: Vec<_> = attachment.fds.iter().map(AsFd::as_fd).collect();
+            let outcome = client.call_with_fds(command, &borrowed);
+            client.take_events();
+            outcome
+        })
+        .await
+        .context("vmlab-hv TAP attach task")??;
+        refused("net_attach", outcome).map(drop)
     }
 
     async fn call(&self, command: Command) -> Result<Option<RunState>> {
@@ -512,6 +537,84 @@ mod tests {
 
     fn ok(_: &Command) -> Outcome {
         Outcome::Ok { status: None }
+    }
+
+    #[tokio::test]
+    async fn tap_attachment_transfers_owned_descriptors_in_pair_order() {
+        use std::os::unix::net::UnixDatagram;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (tx, seen) = mpsc::channel();
+        let server = Server::with_fds("fake-hv", vec![Capability::NetFds], move |command, fds| {
+            let mut markers = Vec::new();
+            for fd in fds {
+                let mut marker = [0; 4];
+                let count = rustix::io::read(&fd, &mut marker).unwrap();
+                markers.push(marker[..count].to_vec());
+            }
+            tx.send((command, markers)).unwrap();
+            Outcome::Ok { status: None }
+        });
+        std::thread::spawn(move || server.serve(listener));
+        let mut fds = Vec::new();
+        let mut peers = Vec::new();
+        for marker in [b"tap0", b"tap1", b"vho0", b"vho1"] {
+            let (fd, peer) = UnixDatagram::pair().unwrap();
+            peer.send(marker).unwrap();
+            fds.push(fd.into());
+            peers.push(peer);
+        }
+        let control = HvControl::connect(&socket).await.unwrap();
+        control
+            .attach_net(super::super::NetAttachment {
+                mac: "52:54:00:00:00:01".into(),
+                queue_pairs: 2,
+                vhost: true,
+                fds,
+            })
+            .await
+            .unwrap();
+        let (command, markers) = seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            command,
+            Command::NetAttach {
+                mac: "52:54:00:00:00:01".into(),
+                queue_pairs: 2,
+                vhost: true
+            }
+        );
+        assert_eq!(
+            markers,
+            [
+                b"tap0".to_vec(),
+                b"tap1".to_vec(),
+                b"vho0".to_vec(),
+                b"vho1".to_vec()
+            ]
+        );
+        for peer in peers {
+            assert!(peer.send(b"closed").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn tap_attachment_requires_the_advertised_capability() {
+        let hv = fake_hv(vec![], ok);
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        let (fd, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let error = control
+            .attach_net(super::super::NetAttachment {
+                mac: "52:54:00:00:00:01".into(),
+                queue_pairs: 1,
+                vhost: false,
+                fds: vec![fd.into()],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("net_fds"));
+        assert!(peer.send(b"closed").is_err());
+        assert!(hv.seen.try_recv().is_err());
     }
 
     #[tokio::test]

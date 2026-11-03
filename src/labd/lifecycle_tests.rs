@@ -550,6 +550,7 @@ async fn machines_choose_vnet_framing_only_for_vmlab_virtio_nics() {
     let mut script = Script::healthy();
     script.vmlab_hv = true;
     let (native, _) = vm(&dirs, LINUX_VM, script.clone());
+    assert!(native.takes_tap_fds());
     let count = crate::net::framing::queue_pairs(native.template().resolved.cpus);
     assert_eq!(
         native.net_framing(),
@@ -564,6 +565,7 @@ async fn machines_choose_vnet_framing_only_for_vmlab_virtio_nics() {
         container.net_framing(),
         FramingMode::Vnet { queue_pairs: 3 }
     );
+    assert!(!container.takes_tap_fds());
 }
 
 /// The whole point of the seam: a VM's start ladder runs to completion with

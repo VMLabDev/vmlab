@@ -124,7 +124,7 @@ impl SegmentNet {
         framing: FramingMode,
     ) -> Result<NicAttachment> {
         if tap_ok && fastpath::tier() == FastpathTier::AfXdp {
-            match self.attach_tap(mac, isolated) {
+            match self.attach_tap(mac, isolated, framing) {
                 Ok(att) => return Ok(att),
                 Err(error) => tracing::warn!(
                     segment = %self.name,
@@ -138,7 +138,12 @@ impl SegmentNet {
         })
     }
 
-    fn attach_tap(&mut self, mac: MacAddr, isolated: bool) -> Result<NicAttachment> {
+    fn attach_tap(
+        &mut self,
+        mac: MacAddr,
+        isolated: bool,
+        framing: FramingMode,
+    ) -> Result<NicAttachment> {
         let xdp = match &self.xdp {
             Some(x) => x.clone(),
             None => {
@@ -147,10 +152,11 @@ impl SegmentNet {
                 x
             }
         };
-        Ok(NicAttachment::Tap(xdp.add_nic(
+        Ok(NicAttachment::Tap(xdp.add_nic_with_framing(
             &self.switch,
             mac,
             isolated,
+            framing,
         )?))
     }
 }

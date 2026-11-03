@@ -807,6 +807,10 @@ fn serve_vmlab_hv(
                 code: ErrorCode::Unsupported,
                 message: "debug feature is not advertised by this fake".into(),
             },
+            Command::NetAttach { .. } => Outcome::Error {
+                code: ErrorCode::Unsupported,
+                message: "passed TAP queues are not advertised by this fake".into(),
+            },
             Command::SetLogFilter { .. } | Command::DumpDiagnostics => Outcome::Error {
                 code: ErrorCode::Unsupported,
                 message: "diagnostics are not advertised by this fake".into(),

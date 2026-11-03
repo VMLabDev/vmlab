@@ -1080,18 +1080,37 @@ impl VmInstance {
         }
         let mut specs = Vec::with_capacity(attachments.len());
         let mut fds = Vec::new();
+        let mut next_fd = 10;
         for (i, (mac, att)) in self.macs.iter().zip(attachments.iter()).enumerate() {
             let mtu = self.nic_mtus.get(i).copied();
             let backend = match att {
                 NicAttachment::Stream { sock } => qemu::NicBackend::Stream { sock: sock.clone() },
                 NicAttachment::Tap(tap) => {
-                    // Fixed, collision-free child numbers past stdio.
-                    let child_fd = 10 + i as i32;
-                    fds.push(qemu::process::ChildFd {
-                        parent: tap.qemu_fd().context("cloning tap fd for qemu")?,
-                        child: child_fd,
-                    });
-                    qemu::NicBackend::Tap { child_fd }
+                    if self.hypervisor == HypervisorKind::Qemu {
+                        let child_fd = next_fd;
+                        next_fd += 1;
+                        fds.push(qemu::process::ChildFd {
+                            parent: tap.qemu_fd().context("cloning tap fd for qemu")?,
+                            child: child_fd,
+                        });
+                        qemu::NicBackend::Tap { child_fd }
+                    } else {
+                        let mut map = |queues: Vec<std::os::fd::OwnedFd>| {
+                            queues
+                                .into_iter()
+                                .map(|parent| {
+                                    let child = next_fd;
+                                    next_fd += 1;
+                                    fds.push(qemu::process::ChildFd { parent, child });
+                                    child
+                                })
+                                .collect()
+                        };
+                        qemu::NicBackend::TapQueues {
+                            tap_fds: map(tap.queue_fds().context("cloning TAP queues")?),
+                            vhost_fds: map(tap.vhost_fds().context("cloning vhost-net queues")?),
+                        }
+                    }
                 }
             };
             specs.push(qemu::NicSpec {
@@ -1942,10 +1961,10 @@ impl super::machine::Machine for VmInstance {
 
     /// A VM's argv carries pre-opened descriptors, so its NICs can ride the
     /// afxdp tap fast path.
-    /// QEMU inherits a tap descriptor; vmlab-hv's NICs are stream sockets
-    /// (HV-D9 leaves its fast path unfixed).
+    /// QEMU inherits a descriptor. vmlab-hv receives its queue descriptors
+    /// over the control socket while the VM remains paused.
     fn takes_tap_fds(&self) -> bool {
-        self.hypervisor == HypervisorKind::Qemu
+        true
     }
 
     fn net_framing(&self) -> crate::net::framing::FramingMode {
