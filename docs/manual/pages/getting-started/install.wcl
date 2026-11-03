@@ -71,6 +71,53 @@ page gs_install {
     they started with: run `vmlab daemon stop` before `vmlab fastpath`.
   DOC
 
+  h3 "Install vmlab-hv"
+
+  p <<DOC
+    New modern x86_64 KVM VMs use vmlab-hv. The CLI installer does not
+    install it. Download `vmlab-hv-<version>-linux-x86_64.tar.gz` and its
+    `.sha256` from the same release as your CLI. Set `VERSION` below to
+    that version without the leading `v`.
+  DOC
+
+  code sh { source = <<'SRC'
+VERSION=0.9.0-alpha
+ASSET="vmlab-hv-$VERSION-linux-x86_64.tar.gz"
+curl -fLO "https://github.com/VMLabDev/vmlab/releases/download/v$VERSION/$ASSET"
+curl -fLO "https://github.com/VMLabDev/vmlab/releases/download/v$VERSION/$ASSET.sha256"
+sha256sum -c "$ASSET.sha256"
+mkdir -p "$HOME/.local/opt"
+tar -xzf "$ASSET" -C "$HOME/.local/opt"
+export PATH="$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/bin:$PATH"
+SRC
+  }
+
+  p <<DOC
+    Keep the extracted `bin/`, `lib/` and `libexec/` directories together.
+    The bundle includes `vmlab-hv-viewer`, virglrenderer 1.3.0 and its Venus
+    render server. Relative RUNPATHs find the bundled libraries without
+    `LD_LIBRARY_PATH`. The `vmlab-hv` launcher sets `RENDER_SERVER_EXEC_PATH`
+    to the bundled server unless you already set it.
+    The bundle's `README` records the hypervisor commit and lists the host
+    libraries it still needs, including EGL, GBM, the Vulkan loader, PipeWire,
+    PulseAudio and the viewer's Wayland or X11 client libraries. Install your
+    GPU driver separately. Firmware comes from the existing guest assets.
+  DOC
+
+  p <<DOC
+    Instead of adding the bundle to `PATH`, set its launcher path in your
+    host config. vmlab finds the viewer beside it. If the supervisor is
+    already running, stop your labs and restart it to load the new config.
+  DOC
+
+  code wcl { filename = "~/.config/vmlab/config.wcl" source = <<'SRC'
+import <vmlab-host.wcl>
+host {
+  vmlab_hv = "/absolute/path/to/vmlab-hv-0.9.0-alpha-linux-x86_64/bin/vmlab-hv"
+}
+SRC
+  }
+
   h3 "Build from source instead"
 
   p <<DOC
@@ -107,7 +154,8 @@ SRC
   p <<DOC
     `target/dist/` then holds the release binary
     `vmlab-<version>-linux-x86_64`, the guest bundle
-    `vmlab-guest-<version>.tar.gz` with its `.sha256`, and the BPF objects
+    `vmlab-guest-<version>.tar.gz` and
+    `vmlab-hv-<version>-linux-x86_64.tar.gz` with their `.sha256` files, and the BPF objects
     rebuilt under `bpf/`. The first run builds the image and every target
     from cold. Later runs are incremental, because cargo's caches and target
     directories persist in Docker volumes. `just buildbox::shell` opens a

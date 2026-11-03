@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
 # vmlab-build: every toolchain the release artefacts need — the host `vmlab`
-# binary, the strict guest bundle (`just guest-package`) and the BPF objects
-# (`just ebpf-build`) — plus what the merge bar (`just ci::check`) needs, on
+# binary, the strict guest bundle (`just guest-package`), the hypervisor bundle
+# (`just ci::hv-package`) and the BPF objects (`just ebpf-build`) — plus what
+# the merge bar (`just ci::check`) needs, on
 # the Ubuntu CI runs on. The checkout is never in the image: `just buildbox::dist`
 # and `just buildbox::shell` bind-mount it and run as the host uid:gid.
 #
@@ -69,6 +70,11 @@ RUN VMLAB_BIN_DIR=/usr/local/bin ./scripts/guest-toolchains.sh just
 
 COPY guest/build-mingw-msvcrt.sh guest/
 RUN ./scripts/guest-toolchains.sh msvcrt
+
+# Same native dependencies as the hypervisor release job. virglrenderer itself
+# is built at run time and cached outside target/ in the mounted checkout.
+COPY build/hv.py build/
+RUN python3 build/hv.py native-deps-install && rm -rf /var/lib/apt/lists/*
 
 # Runtime: any uid. HOME and CARGO_HOME are world-writable cache paths, and
 # build/run.sh mounts named volumes over CARGO_HOME and the checkout's target

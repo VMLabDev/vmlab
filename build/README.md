@@ -25,6 +25,7 @@ to the one in `Cargo.toml`.
 | --- | --- |
 | `vmlab-<version>-linux-x86_64` | `cargo build --release --bin vmlab`, named as CI names the release asset |
 | `vmlab-guest-<version>.tar.gz` and `.sha256` | `just guest-package`, which fails if any target is missing |
+| `vmlab-hv-<version>-linux-x86_64.tar.gz` and `.sha256` | `just ci::hv-package`, using the hypervisor commit pinned by `vmlab-hv-proto` in `Cargo.lock` |
 | `bpf/fastpath_sockmap.bpf.o`, `bpf/xdp_switch.bpf.o` | `just ebpf-build` |
 
 The run leaves tracked files as it found them. If you pass a version other than
@@ -35,6 +36,31 @@ way `just ci::ebpf-verify` would, and `src/net/fastpath/bpf/` is left as it
 was.
 
 ## How it runs
+
+To build only the hypervisor bundle, rebuild the image after native dependency
+changes, then use the same recipe as release CI:
+
+```sh
+just buildbox::image
+./build/run.sh just ci::hv-package
+```
+
+The bundle contains both hypervisor and viewer, virglrenderer 1.3.0 and its
+Venus render server. The build verifies the source tarball's SHA256 before
+compiling. `.ci-cache/virglrenderer-<version>-<sha256>/` holds the installed
+native library outside `target/`, so Rust cache restores cannot overwrite it.
+CI keys that cache on the version, SHA256 and build script. Rust output lives
+under `target/hv/`. `readelf -d` checks relative RUNPATHs and `ldd` checks that
+the hypervisor and server resolve the bundled library before packaging.
+The archive has normalized ownership and timestamps, using `SOURCE_DATE_EPOCH`
+or the checkout commit's timestamp.
+
+The extracted `bin/vmlab-hv` launcher selects `libexec/virgl_render_server`
+through virglrenderer's `RENDER_SERVER_EXEC_PATH` override. Without it, Venus
+would use the absolute server path compiled into the library. The ELF binaries
+use `$ORIGIN/../lib`; the library uses `$ORIGIN`. Firmware remains in the
+existing guest bundle. The archive's `README` lists the remaining host runtime
+libraries. glibc, Mesa and GPU drivers stay on the host.
 
 `build/run.sh` starts the container and builds the image first if its tag is
 missing. Set `VMLAB_BUILD_IMAGE` to use another tag. An existing image is not
@@ -63,7 +89,7 @@ The container setup:
 - It keeps build state in named volumes. `vmlab-build-cargo` holds the cargo
   registry and git cache and is shared by every checkout. Each checkout gets its
   own `vmlab-build-<hash>-*` volumes, mounted over `target/debug`,
-  `target/release`, `guest/*/target` and `ebpf/target`. These volumes shadow
+  `target/release`, `target/hv`, `guest/*/target` and `ebpf/target`. These volumes shadow
   your host build directories without touching them, so a host build and a
   container build never invalidate each other. Remove the volumes with
   `docker volume rm` to start from cold.

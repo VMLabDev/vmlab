@@ -7,6 +7,8 @@
 #                                             the release asset
 #   vmlab-guest-<version>.tar.gz (+ .sha256)  the strict guest bundle, from
 #                                             `just guest-package`
+#   vmlab-hv-<version>-linux-x86_64.tar.gz    hypervisor, viewer and virglrenderer
+#     (+ .sha256)                             from `just ci::hv-package`
 #   bpf/{fastpath_sockmap,xdp_switch}.bpf.o   the BPF objects rebuilt from
 #                                             ebpf/ by `just ebpf-build`
 #
@@ -105,6 +107,7 @@ main() {
   mkdir -p "$OUT"
   build_binary "$version"
   build_bundle "$version"
+  just ci::hv-package "$version"
   local bpf_ok=0
   build_bpf || bpf_ok=1
 

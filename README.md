@@ -8,7 +8,7 @@ state, snapshots, keystrokes and mouse input, screenshot capture with image
 matching and OCR, and command execution and file transfer over vmlab's own
 in-guest agent.
 
-vmlab targets QEMU/KVM exclusively, driven directly over QMP — no libvirt.
+vmlab runs VMs on vmlab-hv or QEMU/KVM, without libvirt.
 Hosts are Linux, with **WSL2 supported as a first-class host environment**.
 Guests can be x86_64, aarch64 or riscv64, natively accelerated or emulated.
 
@@ -26,6 +26,28 @@ micro-VM kernel/initramfs and every in-guest agent build, from the same
 release, checksum-verified — into `~/.local/share/vmlab/guest`. `--no-guest`
 skips the guest assets and `--guest-dir <dir>` puts them elsewhere; `--help`
 lists the rest. Or build from source (see [Building](#building)).
+
+New modern x86_64 KVM VMs use vmlab-hv. Install its bundle from the same
+release as the CLI. Set `VERSION` to that release's version without the `v`:
+
+```sh
+VERSION=0.9.0-alpha
+ASSET="vmlab-hv-$VERSION-linux-x86_64.tar.gz"
+curl -fLO "https://github.com/VMLabDev/vmlab/releases/download/v$VERSION/$ASSET"
+curl -fLO "https://github.com/VMLabDev/vmlab/releases/download/v$VERSION/$ASSET.sha256"
+sha256sum -c "$ASSET.sha256"
+mkdir -p "$HOME/.local/opt"
+tar -xzf "$ASSET" -C "$HOME/.local/opt"
+export PATH="$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/bin:$PATH"
+```
+
+Keep the extracted directory together: it includes the native console viewer,
+virglrenderer 1.3.0 and its Venus render server, with relative library paths.
+Its `README` lists the host graphics and audio libraries still required.
+Alternatively, set `host { vmlab_hv = "/absolute/path/to/bin/vmlab-hv" }`
+in `~/.config/vmlab/config.wcl`, after `import <vmlab-host.wcl>`.
+The viewer is discovered beside that launcher. The installer above installs
+the CLI and guest assets only; download this hypervisor bundle separately.
 
 ## Architecture
 

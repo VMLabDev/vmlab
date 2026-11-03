@@ -57,7 +57,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     set -eux; \
     export PKG_CONFIG_PATH=/opt/virgl/lib/pkgconfig \
       RUSTFLAGS="-C link-arg=-Wl,-rpath,/opt/virgl/lib"; \
-    rev=$(sed -n 's|^source = "git+https://github.com/VMLabDev/vmlab-hypervisor.git?rev=[0-9a-f]*#\([0-9a-f]*\)"$|\1|p' Cargo.lock | head -n1); \
+    rev=$(python3 build/hv.py revision); \
     test -n "$rev"; \
     [ -d /hv/.git ] || git init -q /hv; \
     git -C /hv fetch -q --depth 1 https://github.com/VMLabDev/vmlab-hypervisor.git "$rev"; \

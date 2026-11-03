@@ -1247,10 +1247,25 @@ impl LabRuntime {
             .filter(|b| !crate::qemu::process::binary_on_path(b))
             .collect();
         if !missing.is_empty() {
+            let hv_binary = self
+                .host_cfg
+                .vmlab_hv
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(super::hypervisor::vmlab_hv::BINARY));
+            let install_hint = if missing
+                .iter()
+                .any(|binary| std::path::Path::new(binary) == hv_binary)
+            {
+                "Install vmlab-hv-<version>-linux-x86_64.tar.gz from the same vmlab \
+                 GitHub release; keep its directories together and add bin/ to PATH, \
+                 or set host.vmlab_hv in ~/.config/vmlab/config.wcl to bin/vmlab-hv."
+            } else {
+                "Install the QEMU/swtpm packages (PRD §14 lists the runtime dependencies)."
+            };
             bail!(
-                "missing required binaries on PATH: {} — install the QEMU/swtpm \
-                 packages (PRD §14 lists the runtime dependencies)",
-                missing.join(", ")
+                "missing required binaries on PATH: {}. {}",
+                missing.join(", "),
+                install_hint
             );
         }
         self.preflight_playbooks(targets)
@@ -3776,6 +3791,7 @@ mod tests {
     /// hypervisor, a template or a network.
     struct FakeMachine {
         name: String,
+        binaries: Vec<String>,
         kind: MachineKind,
         ready_timeout: Duration,
         /// How long `start` takes, so a wave's overlap is observable.
@@ -3870,6 +3886,7 @@ mod tests {
         fn new(name: &str, kind: MachineKind, shared: &Shared) -> Arc<Self> {
             Arc::new(Self {
                 name: name.to_string(),
+                binaries: vec!["sh".to_string()],
                 kind,
                 ready_timeout: Duration::from_secs(300),
                 boot: Duration::from_millis(0),
@@ -4012,7 +4029,7 @@ mod tests {
         fn required_binaries(&self) -> Vec<String> {
             // Something every host running the test suite has, so preflight is
             // exercised rather than skipped.
-            vec!["sh".to_string()]
+            self.binaries.clone()
         }
         fn ready_timeout(&self) -> Duration {
             self.ready_timeout
@@ -4213,6 +4230,43 @@ mod tests {
 
     fn quiet() -> crate::scripting::OutputSink {
         Arc::new(|_| {})
+    }
+
+    #[test]
+    fn missing_hypervisor_preflight_names_the_release_bundle_and_host_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = shared(tmp.path());
+        let mut machine =
+            Arc::into_inner(FakeMachine::new("web", MachineKind::Vm, &shared)).expect("sole owner");
+        let binary = tmp.path().join("missing/vmlab-hv");
+        machine.binaries = vec![binary.display().to_string()];
+        let mut lab = Arc::into_inner(lab_of(
+            tmp.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "web" { template = "scratch" arch = "x86_64" } }"#,
+            vec![Arc::new(machine)],
+        ))
+        .expect("sole owner");
+        lab.host_cfg.vmlab_hv = Some(binary.clone());
+        let error = lab
+            .preflight_binaries(&["web".into()])
+            .unwrap_err()
+            .to_string();
+        for expected in [
+            binary.to_str().unwrap(),
+            "vmlab-hv-<version>-linux-x86_64.tar.gz",
+            "host.vmlab_hv",
+            "keep its directories together",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+
+        lab.host_cfg.vmlab_hv = None;
+        let error = lab
+            .preflight_binaries(&["web".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("host.vmlab_hv"), "{error}");
     }
 
     /// A main checkout at `<tmp>/main` frozen at generation 1, and a linked

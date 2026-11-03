@@ -24,7 +24,7 @@ require-docker:
 image: require-docker
 	DOCKER_BUILDKIT=1 docker build -f build/Dockerfile -t {{image}} .
 
-# Build the release binary, the guest bundle and the BPF objects into target/dist/ (version defaults to Cargo.toml's)
+# Build the release binary, guest and hypervisor bundles, and BPF objects into target/dist/
 [group('build')]
 dist version='': image
 	./build/run.sh ./build/dist.sh {{version}}

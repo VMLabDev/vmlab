@@ -7,7 +7,8 @@
 #     so git works inside: package.sh and the version stamps read it.
 #   - Named volumes hold the cargo home (shared by every checkout: registry and
 #     git cache) and, per checkout, every target dir the build writes — the host
-#     crate's target/debug and target/release, the guest crates' and ebpf's
+#     crate's target/debug and target/release, the hypervisor's target/hv,
+#     the guest crates' and ebpf's
 #     target/ — so rebuilds are incremental. They shadow the host's own build
 #     dirs rather than share them: a host build and a container build never
 #     invalidate each other. target/dist, target/guest-package and guest/dist
@@ -47,6 +48,7 @@ key="$(printf '%s' "$ROOT" | sha256sum | cut -c1-12)"
 TARGETS=(
   host-debug:target/debug
   host-release:target/release
+  hv:target/hv
   cinit:guest/cinit/target
   cinit-proto:guest/cinit-proto/target
   agent:guest/agent/target
