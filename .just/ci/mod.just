@@ -90,6 +90,11 @@ ebpf-verify: ebpf-build
 hv-native-deps-install: require-uv
 	uv run --no-project python build/hv.py native-deps-install
 
+# Install the imported hypervisor test dependencies on Ubuntu
+[group('ci')]
+hv-test-native-deps-install: require-uv
+	uv run --no-project python build/hv.py test-native-deps-install
+
 # Test the viewer's release payload and per-user icon installer
 [group('ci')]
 hv-desktop-test: require-uv

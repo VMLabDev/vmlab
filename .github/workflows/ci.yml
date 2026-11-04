@@ -53,7 +53,7 @@ jobs:
       - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@uv
       - name: Install native dependencies
-        run: just ci::hv-native-deps-install
+        run: just ci::hv-test-native-deps-install
       - name: Resolve virglrenderer cache identity
         id: virgl
         run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"

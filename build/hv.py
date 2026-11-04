@@ -42,9 +42,23 @@ def native_deps_install():
         "libpipewire-0.3-dev", "libpulse-dev", "clang", "libclang-dev",
         "liblzma-dev", "libwayland-dev", "libxkbcommon-dev", "libxkbcommon-x11-0",
         "libx11-6", "libxcursor1", "libxrandr2", "libxi6", "libxfixes3",
-        "libxtst6", "patchelf", "binutils", "gcc-multilib", "nasm",
-        "acpica-tools", "imagemagick", "cpio", "xvfb", "mesa-vulkan-drivers",
-        "seabios", "xorriso", "edid-decode", "pipewire-bin")
+        "libxtst6", "patchelf", "binutils")
+
+
+def test_native_deps_install():
+    # Keep the imported test dependency list separate until D12's follow-up.
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    run(*prefix, "apt-get", "update")
+    run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
+        "build-essential", "gcc-multilib", "liblzma-dev", "curl", "pkg-config",
+        "meson", "ninja-build", "python3-yaml", "libepoxy-dev", "libdrm-dev",
+        "libgbm-dev", "libegl-dev", "libvulkan-dev", "glslang-tools",
+        "libpipewire-0.3-dev", "libpulse-dev", "clang", "libclang-dev",
+        "qemu-utils", "nasm", "acpica-tools", "imagemagick", "cpio", "xvfb",
+        "libvulkan1", "mesa-vulkan-drivers", "seabios", "xorriso", "edid-decode",
+        "pipewire-bin", "libxkbcommon-x11-0", "libxkbcommon0",
+        "libwayland-client0", "libx11-6", "libxcursor1", "libxrandr2",
+        "libxi6", "libxfixes3", "libxtst6")
     run(*prefix, "install", "-d", "/usr/share/qemu")
     for name in ("vgabios-stdvga.bin", "vgabios-virtio.bin"):
         target = Path("/usr/share/qemu") / name
@@ -228,7 +242,7 @@ No host PCI or USB device is required except explicitly configured passthrough.
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("revision", "cache-key", "native-deps-install", "virgl-build", "package"))
+    parser.add_argument("command", choices=("revision", "cache-key", "native-deps-install", "test-native-deps-install", "virgl-build", "package"))
     parser.add_argument("version", nargs="?", default="")
     args = parser.parse_args()
     if args.command == "revision":
@@ -237,6 +251,8 @@ def main():
         print(f"key={CACHE_KEY}")
     elif args.command == "native-deps-install":
         native_deps_install()
+    elif args.command == "test-native-deps-install":
+        test_native_deps_install()
     elif args.command == "virgl-build":
         virgl_build()
     else:
