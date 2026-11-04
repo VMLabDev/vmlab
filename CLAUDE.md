@@ -88,8 +88,7 @@ identity, selects its hypervisor. New supported x86_64 KVM VMs default to
 vmlab-hv; refused declarations fall back to QEMU with a status and `up` reason.
 Containers still default to QEMU. VM identity sticks until destroy or an explicit
 setting; old disks without an identity stay on QEMU. The selection puts it
-on QEMU or on vmlab-hv (github.com/VMLabDev/vmlab-hypervisor, protocol crate
-pinned by git rev). Phase 1 runs container micro-VMs; phases 2a to 2f a
+on QEMU or on vmlab-hv (`hv/`, with in-tree protocol crates). Phase 1 runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
 or Windows (`vmlab_hv/describe.rs` places every device where QEMU's q35 would;
 a guest reset happens in place, readiness dropping until the rebooted

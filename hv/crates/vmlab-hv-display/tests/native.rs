@@ -1,0 +1,963 @@
+mod common;
+use common::*;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
+use std::sync::Arc;
+use vmlab_hv_display::{
+    Capabilities as C, Cursor, Message as M, Pixels, Rect, SurfaceKind, receive, send,
+};
+
+#[test]
+fn frame_flags_are_negotiated_and_flag_changes_publish() {
+    use vmlab_hv_display::FrameFlags;
+    let (server, source, _) = server();
+    let (modern, modern_worker) = client(&server, C::FRAMES | C::FRAME_FLAGS);
+    configure(&modern);
+    let (surface, buffer, seq, _) = ready(&modern);
+    modern.release(surface, buffer, seq).unwrap();
+    {
+        let mut frame = source.0.lock().unwrap();
+        frame.flags = FrameFlags(FrameFlags::PLACEHOLDER);
+        frame.damage.clear();
+    }
+    server.publish().unwrap();
+    let M::FrameReady {
+        flags,
+        surface_id,
+        buffer,
+        seq,
+        ..
+    } = modern.receive().unwrap().message
+    else {
+        panic!("expected flag update")
+    };
+    assert!(flags.has(FrameFlags::PLACEHOLDER));
+    modern.release(surface_id, buffer, seq).unwrap();
+    let (legacy, legacy_worker) = client(&server, C::FRAMES);
+    configure(&legacy);
+    let M::FrameReady { flags, .. } = legacy.receive().unwrap().message else {
+        panic!("expected legacy frame")
+    };
+    assert_eq!(flags, FrameFlags::default());
+    drop(modern);
+    drop(legacy);
+    server.shutdown();
+    let _ = modern_worker.join().unwrap();
+    let _ = legacy_worker.join().unwrap();
+}
+
+fn ready(c: &vmlab_hv_display::Client) -> (u64, u32, u64, Vec<Rect>) {
+    let M::FrameReady {
+        surface_id,
+        buffer,
+        seq,
+        damage,
+        ..
+    } = c.receive().unwrap().message
+    else {
+        panic!("expected FrameReady")
+    };
+    (surface_id, buffer, seq, damage)
+}
+fn configure(c: &vmlab_hv_display::Client) -> (u64, Vec<OwnedFd>) {
+    let p = c.receive().unwrap();
+    let M::SurfaceConfigure {
+        surface_id,
+        kind: SurfaceKind::Shm,
+        buffers: 3,
+        ..
+    } = p.message
+    else {
+        panic!("expected shm configure")
+    };
+    assert_eq!(p.fds.len(), 3);
+    (surface_id, p.fds)
+}
+fn pixels(fd: &OwnedFd, n: usize) -> Vec<u8> {
+    let file = File::from(fd.try_clone().unwrap());
+    let mut b = vec![0; n];
+    file.read_exact_at(&mut b, 0).unwrap();
+    b
+}
+
+#[test]
+fn idle_publications_send_no_frames_but_reconfigure_and_cpu_copy_still_work() {
+    let (server, source, _) = server();
+    let (client, worker) = client(&server, C::FRAMES | C::CPU_COPY);
+    let (surface, _) = configure(&client);
+    let (_, buffer, seq, _) = ready(&client);
+    client.release(surface, buffer, seq).unwrap();
+    source.0.lock().unwrap().damage.clear();
+    for _ in 0..100 {
+        server.publish().unwrap();
+    }
+    client
+        .stream()
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    let error = client.receive().unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    client
+        .stream()
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    client
+        .send(&M::CpuCopy {
+            surface_id: surface,
+        })
+        .unwrap();
+    let (_, buffer, next_seq, damage) = ready(&client);
+    assert!(next_seq > seq);
+    assert_eq!(damage, vec![source.0.lock().unwrap().full()]);
+    client.release(surface, buffer, next_seq).unwrap();
+    source.0.lock().unwrap().generation += 1;
+    server.publish().unwrap();
+    let (next_surface, _) = configure(&client);
+    assert_ne!(surface, next_surface);
+    ready(&client);
+    drop(client);
+    worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn first_frame_captures_guest_changes_without_connected_clients() {
+    let (server, source, _) = server();
+    for value in [7, 9] {
+        // No producer publication or client is needed to refresh a screenshot.
+        *source.0.lock().unwrap() = frame(value, 2, 2);
+        let (c, h) = client(&server, C::FRAMES);
+        let (_, fds) = configure(&c);
+        let (_, buffer, _, damage) = ready(&c);
+        assert_eq!(damage, vec![frame(value, 2, 2).full()]);
+        assert_eq!(pixels(&fds[buffer as usize], 16), vec![value; 16]);
+        drop(c);
+        h.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn shutdown_interrupts_unfinished_handshakes_and_idle_sessions() {
+    for rfb in [false, true] {
+        let (server, _, _) = server();
+        let (a, b) = socket();
+        let worker_server = server.clone();
+        let worker = std::thread::spawn(move || {
+            if rfb {
+                worker_server.serve_rfb(a)
+            } else {
+                worker_server.serve_native(a)
+            }
+        });
+        server.shutdown();
+        assert!(worker.join().unwrap().is_err());
+        drop(b);
+    }
+    let (server, _, _) = server();
+    let (client, worker) = client(&server, C::FRAMES);
+    configure(&client);
+    ready(&client);
+    server.shutdown();
+    worker.join().unwrap().unwrap();
+    drop(client);
+}
+
+#[test]
+fn cpu_copy_captures_current_source_without_producer_publication() {
+    let (server, source, _) = server();
+    let (c, h) = client(&server, C::FRAMES | C::CPU_COPY);
+    let (sid, _) = configure(&c);
+    let held = ready(&c);
+    *source.0.lock().unwrap() = frame(8, 2, 2);
+    c.cpu_copy(sid).unwrap();
+    let (_, fds) = configure(&c);
+    let (_, buffer, _, damage) = ready(&c);
+    assert_eq!(damage, vec![frame(8, 2, 2).full()]);
+    assert_eq!(pixels(&fds[buffer as usize], 16), vec![8; 16]);
+    c.release(held.0, held.1, held.2).unwrap();
+    drop(c);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn damage_resize_reconnect_and_real_memfds() {
+    let (server, source, _) = server();
+    let (c, h) = client(&server, C::FRAMES);
+    let (sid, fds) = configure(&c);
+    let (s, b, q, damage) = ready(&c);
+    assert_eq!(sid, s);
+    assert_eq!(damage, vec![frame(1, 4, 3).full()]);
+    assert_eq!(pixels(&fds[b as usize], 48), vec![1; 48]);
+    // Linux marks every received descriptor close-on-exec.
+    // SAFETY: fcntl queries a live descriptor without changing it.
+    let fd_flags = unsafe { libc::fcntl(fds[0].as_raw_fd(), libc::F_GETFD) };
+    assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+    c.release(s, b, q).unwrap();
+    *source.0.lock().unwrap() = frame(2, 4, 3);
+    server.publish().unwrap();
+    let (s, b, q, damage) = ready(&c);
+    assert_eq!(damage, frame(2, 4, 3).damage);
+    assert_eq!(pixels(&fds[b as usize], 48), vec![2; 48]);
+    c.release(s, b, q).unwrap();
+    *source.0.lock().unwrap() = frame(3, 2, 2);
+    server.publish().unwrap();
+    let (new_sid, new_fds) = configure(&c);
+    assert_ne!(new_sid, sid);
+    let (_, b, _, damage) = ready(&c);
+    assert_eq!(damage, vec![frame(3, 2, 2).full()]);
+    assert_eq!(pixels(&new_fds[b as usize], 16), vec![3; 16]);
+    drop(c);
+    h.join().unwrap().unwrap();
+    let (c, h) = client(&server, C::FRAMES);
+    configure(&c);
+    assert_eq!(ready(&c).3, vec![frame(3, 2, 2).full()]);
+    drop(c);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn held_buffers_are_immutable_and_slow_clients_skip_independently() {
+    let (server, source, _) = server();
+    let (slow, sh) = client(&server, C::FRAMES);
+    let (_, fds) = configure(&slow);
+    let first = ready(&slow);
+    let mut held = vec![first.clone()];
+    for value in 2..=3 {
+        *source.0.lock().unwrap() = frame(value, 4, 3);
+        server.publish().unwrap();
+        held.push(ready(&slow));
+    }
+    let (fast, fh) = client(&server, C::FRAMES);
+    configure(&fast);
+    let f = ready(&fast);
+    let mut last_seq = f.2;
+    fast.release(f.0, f.1, f.2).unwrap();
+    for value in 4..=30 {
+        *source.0.lock().unwrap() = frame(value, 4, 3);
+        server.publish().unwrap();
+        let f = ready(&fast);
+        assert_eq!(f.2, last_seq + 1);
+        last_seq = f.2;
+        fast.release(f.0, f.1, f.2).unwrap();
+    }
+    for (i, (_, buffer, _, _)) in held.iter().enumerate() {
+        assert_eq!(pixels(&fds[*buffer as usize], 48), vec![(i + 1) as u8; 48]);
+    }
+    slow.release(first.0, first.1, first.2).unwrap();
+    let latest = ready(&slow);
+    assert_eq!(latest.2, last_seq);
+    assert_eq!(latest.3, vec![frame(30, 4, 3).full()]);
+    assert_eq!(pixels(&fds[latest.1 as usize], 48), vec![30; 48]);
+    drop(slow);
+    drop(fast);
+    sh.join().unwrap().unwrap();
+    fh.join().unwrap().unwrap();
+}
+
+#[test]
+fn frame_allocations_plateau_without_clients_and_with_unreleased_buffers() {
+    let (server, source, _) = server();
+    let mut allocations = Vec::new();
+    let mut publish = |value| {
+        let next = frame(value, 256, 256);
+        let Pixels::Shm(pixels) = &next.pixels else {
+            unreachable!()
+        };
+        allocations.push(Arc::downgrade(pixels));
+        *source.0.lock().unwrap() = next;
+        server.publish().unwrap();
+        let live = allocations
+            .iter()
+            .filter(|frame| frame.strong_count() != 0)
+            .count();
+        assert!(live <= 4, "{live} pixel allocations remain live");
+    };
+    for value in (0..2000).map(|value| value as u8) {
+        publish(value);
+    }
+    let (slow, handle) = client(&server, C::FRAMES);
+    configure(&slow);
+    ready(&slow);
+    for value in [1, 2] {
+        publish(value);
+        ready(&slow);
+    }
+    for value in (0..2000).map(|value| value as u8) {
+        publish(value);
+    }
+    drop(slow);
+    handle.join().unwrap().unwrap();
+    assert_eq!(
+        allocations
+            .iter()
+            .filter(|frame| frame.strong_count() != 0)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn preferred_size_requires_input_and_valid_dimensions() {
+    for (caps, width, height) in [(0, 800, 600), (C::INPUT, 0, 600), (C::INPUT, 800, 16385)] {
+        let (server, _, sink) = server();
+        let (c, h) = client(&server, caps);
+        if caps == C::INPUT {
+            assert!(matches!(c.receive().unwrap().message, M::LedState { .. }));
+        }
+        c.send(&M::RequestSize { width, height }).unwrap();
+        assert!(c.receive().is_err());
+        assert!(sink.0.lock().unwrap().is_empty());
+        drop(c);
+        assert_eq!(
+            h.join().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[test]
+fn cursor_leds_and_all_input_messages() {
+    let (server, _, sink) = server();
+    server
+        .set_cursor(Cursor {
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb: vec![1, 2, 3, 255],
+            x: -1,
+            y: 3,
+            visible: true,
+        })
+        .unwrap();
+    server.set_leds(5);
+    let (c, h) = client(&server, C::CURSOR | C::INPUT);
+    assert!(
+        matches!(c.receive().unwrap().message,M::CursorShape { argb,.. } if argb == vec![1,2,3,255])
+    );
+    assert_eq!(
+        c.receive().unwrap().message,
+        M::CursorState {
+            x: -1,
+            y: 3,
+            visible: true
+        }
+    );
+    assert_eq!(c.receive().unwrap().message, M::LedState { mask: 5 });
+    let messages = vec![
+        M::Key {
+            qcode: "ctrl_r".into(),
+            down: true,
+        },
+        M::PointerAbs {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        },
+        M::Buttons { mask: 1 },
+        M::Scroll { dx: -1, dy: 1 },
+        M::RequestSize {
+            width: 800,
+            height: 600,
+        },
+    ];
+    for m in &messages {
+        c.send(m).unwrap();
+    }
+    until(|| (sink.0.lock().unwrap().len() == messages.len()).then_some(()));
+    assert_eq!(*sink.0.lock().unwrap(), messages);
+    server.set_leds(2);
+    assert_eq!(c.receive().unwrap().message, M::LedState { mask: 2 });
+    drop(c);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn dmabuf_acquire_fd_and_cpu_copy_reconfigure() {
+    let (server, source, _) = server();
+    let fd: OwnedFd = File::open("/dev/zero").unwrap().into();
+    let sync: OwnedFd = File::open("/dev/null").unwrap().into();
+    let mut f = frame(9, 4, 3);
+    f.pixels = Pixels::Dmabuf {
+        fd: Arc::new(fd),
+        acquire: Some(Arc::new(sync)),
+    };
+    f.modifier = 123;
+    *source.0.lock().unwrap() = f;
+    server.publish().unwrap();
+    let (c, h) = client(&server, C::FRAMES | C::DMABUF_OK | C::CPU_COPY);
+    let p = c.receive().unwrap();
+    assert!(matches!(
+        p.message,
+        M::SurfaceConfigure {
+            kind: SurfaceKind::Dmabuf,
+            buffers: 1,
+            modifier: 123,
+            ..
+        }
+    ));
+    assert_eq!(p.fds.len(), 1);
+    let p = c.receive().unwrap();
+    let M::FrameReady {
+        surface_id,
+        buffer,
+        seq,
+        ..
+    } = p.message
+    else {
+        panic!()
+    };
+    assert_eq!(p.fds.len(), 1);
+    c.cpu_copy(surface_id).unwrap();
+    let (shm, fds) = configure(&c);
+    let f = ready(&c);
+    assert_ne!(shm, surface_id);
+    assert_eq!(pixels(&fds[f.1 as usize], 48), vec![42; 48]);
+    c.release(surface_id, buffer, seq).unwrap();
+    c.release(f.0, f.1, f.2).unwrap();
+    // A later dma-buf frame stays in CPU mode for this connection.
+    server.publish().unwrap();
+    let f = ready(&c);
+    assert_eq!(f.0, shm);
+    drop(c);
+    h.join().unwrap().unwrap();
+    let (c, h) = client(&server, C::FRAMES);
+    let (_, fds) = configure(&c);
+    let f = ready(&c);
+    assert_eq!(pixels(&fds[f.1 as usize], 48), vec![42; 48]);
+    drop(c);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn stable_dma_pool_keeps_imports_damage_and_release_tokens() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use vmlab_hv_display::BufferLease;
+
+    let (server, source, _) = server();
+    let buffers: Arc<Vec<Arc<OwnedFd>>> = Arc::new(
+        (0..3)
+            .map(|_| Arc::new(File::open("/dev/zero").unwrap().into()))
+            .collect(),
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let lease = BufferLease::new();
+    let make = |buffer, lease: Arc<BufferLease>| {
+        let mut f = frame(9, 4, 3);
+        let reads = reads.clone();
+        f.pixels = Pixels::Leased {
+            buffers: buffers.clone(),
+            buffer,
+            acquire: None,
+            lease,
+            cpu: None,
+            readback: Arc::new(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![42; 48])
+            }),
+        };
+        f
+    };
+    *source.0.lock().unwrap() = make(0, lease.clone());
+    let (c, h) = client(&server, C::FRAMES | C::DMABUF_OK | C::STABLE_BUFFERS);
+    let configured = c.receive().unwrap();
+    assert!(matches!(
+        configured.message,
+        M::SurfaceConfigure {
+            kind: SurfaceKind::Dmabuf,
+            buffers: 3,
+            ..
+        }
+    ));
+    assert_eq!(configured.fds.len(), 3);
+    let first = ready(&c);
+    assert!(!lease.try_retire(), "a client still holds buffer zero");
+    let second_lease = BufferLease::new();
+    *source.0.lock().unwrap() = make(1, second_lease.clone());
+    server.publish().unwrap();
+    let second = ready(&c);
+    assert_eq!(first.0, second.0, "same surface without another configure");
+    assert_eq!(second.1, 1);
+    assert_eq!(
+        second.3,
+        vec![Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1
+        }]
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "dma-only clients never read back"
+    );
+    c.release(first.0, first.1, first.2).unwrap();
+    until(|| lease.try_retire().then_some(()));
+
+    let (cpu, cpu_worker) = client(&server, C::FRAMES);
+    let (_, fds) = configure(&cpu);
+    let cpu_frame = ready(&cpu);
+    assert_eq!(pixels(&fds[cpu_frame.1 as usize], 48), vec![42; 48]);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert!(
+        !second_lease.try_retire(),
+        "the dma client still samples buffer one"
+    );
+    drop(c);
+    h.join().unwrap().unwrap();
+    until(|| second_lease.try_retire().then_some(()));
+    drop(cpu);
+    cpu_worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn scanout_flips_keep_the_announced_dma_pool_despite_source_generations() {
+    let (server, source, _) = server();
+    let buffers: Arc<Vec<Arc<OwnedFd>>> = Arc::new(
+        (0..3)
+            .map(|_| Arc::new(File::open("/dev/zero").unwrap().into()))
+            .collect(),
+    );
+    let make = |generation, buffer| {
+        let mut f = frame(9, 4, 3);
+        f.generation = generation;
+        f.pixels = Pixels::Leased {
+            // Capture builds a fresh Vec, but keeps each allocation's Arc.
+            buffers: Arc::new(buffers.as_ref().clone()),
+            buffer,
+            acquire: None,
+            lease: vmlab_hv_display::BufferLease::new(),
+            cpu: None,
+            readback: Arc::new(|| Ok(vec![42; 48])),
+        };
+        f
+    };
+    *source.0.lock().unwrap() = make(1, 0);
+    let (c, h) = client(&server, C::FRAMES | C::DMABUF_OK | C::STABLE_BUFFERS);
+    let configured = c.receive().unwrap();
+    assert!(matches!(
+        configured.message,
+        M::SurfaceConfigure { buffers: 3, .. }
+    ));
+    let first = ready(&c);
+    c.release(first.0, first.1, first.2).unwrap();
+    for generation in 2..30 {
+        *source.0.lock().unwrap() = make(generation, generation as u32 % 3);
+        server.publish().unwrap();
+        let next = ready(&c);
+        assert_eq!(next.0, first.0, "a flip is not a new presentation surface");
+        assert_eq!(next.1, generation as u32 % 3);
+        c.release(next.0, next.1, next.2).unwrap();
+    }
+    // An actual layout change still replaces the configure.
+    let mut resized = make(30, 0);
+    resized.width = 3;
+    *source.0.lock().unwrap() = resized;
+    server.publish().unwrap();
+    assert!(matches!(
+        c.receive().unwrap().message,
+        M::SurfaceConfigure { width: 3, .. }
+    ));
+    let next = ready(&c);
+    c.release(next.0, next.1, next.2).unwrap();
+    for (fourcc, modifier) in [
+        (vmlab_hv_display::protocol::ARGB8888, 0),
+        (vmlab_hv_display::protocol::ARGB8888, 7),
+    ] {
+        let mut changed = make(30, 0);
+        changed.width = 3;
+        changed.drm_fourcc = fourcc;
+        changed.modifier = modifier;
+        *source.0.lock().unwrap() = changed;
+        server.publish().unwrap();
+        assert!(
+            matches!(c.receive().unwrap().message, M::SurfaceConfigure { drm_fourcc, modifier: actual_modifier, .. } if drm_fourcc == fourcc && actual_modifier == modifier)
+        );
+        let next = ready(&c);
+        c.release(next.0, next.1, next.2).unwrap();
+    }
+    drop(c);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn stable_dma_flip_chain_learns_buffers_and_remaps_reordered_slots() {
+    let (server, source, _) = server();
+    let buffers: Vec<Arc<OwnedFd>> = (0..17)
+        .map(|_| Arc::new(File::open("/dev/zero").unwrap().into()))
+        .collect();
+    let make = |indices: &[usize], buffer| {
+        let mut f = frame(9, 4, 3);
+        f.pixels = Pixels::Leased {
+            buffers: Arc::new(indices.iter().map(|i| buffers[*i].clone()).collect()),
+            buffer,
+            acquire: None,
+            lease: vmlab_hv_display::BufferLease::new(),
+            cpu: None,
+            readback: Arc::new(|| Ok(vec![42; 48])),
+        };
+        f
+    };
+    *source.0.lock().unwrap() = make(&[0], 0);
+    let (c, h) = client(&server, C::FRAMES | C::DMABUF_OK | C::STABLE_BUFFERS);
+    assert!(matches!(
+        c.receive().unwrap().message,
+        M::SurfaceConfigure { buffers: 1, .. }
+    ));
+    let held = ready(&c);
+    *source.0.lock().unwrap() = make(&[1, 0], 0);
+    server.publish().unwrap();
+    assert!(matches!(
+        c.receive().unwrap().message,
+        M::SurfaceConfigure { buffers: 2, .. }
+    ));
+    let second = ready(&c);
+    assert_eq!(second.1, 1);
+    c.release(second.0, second.1, second.2).unwrap();
+    // Releasing an old configure's frame must still work after learning a buffer.
+    c.release(held.0, held.1, held.2).unwrap();
+    for i in 0..20 {
+        *source.0.lock().unwrap() = make(&[i % 2], 0);
+        server.publish().unwrap();
+        let next = ready(&c);
+        assert_eq!(next.0, second.0);
+        assert_eq!(next.1, (i % 2) as u32);
+        c.release(next.0, next.1, next.2).unwrap();
+    }
+    // Bound descriptor retention when applications keep creating new swap chains.
+    *source.0.lock().unwrap() = make(&(0..16).collect::<Vec<_>>(), 15);
+    server.publish().unwrap();
+    assert!(matches!(
+        c.receive().unwrap().message,
+        M::SurfaceConfigure { buffers: 16, .. }
+    ));
+    let next = ready(&c);
+    assert_eq!(next.1, 15);
+    c.release(next.0, next.1, next.2).unwrap();
+    *source.0.lock().unwrap() = make(&[16], 0);
+    server.publish().unwrap();
+    assert!(matches!(
+        c.receive().unwrap().message,
+        M::SurfaceConfigure { buffers: 1, .. }
+    ));
+    let next = ready(&c);
+    assert_eq!(next.1, 0);
+    c.release(next.0, next.1, next.2).unwrap();
+    drop(c);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn a_blocked_resize_cannot_prevent_buffer_release() {
+    use std::sync::mpsc;
+    use vmlab_hv_display::{BufferLease, DisplayServer, InputSink};
+    struct Resize {
+        lease: Arc<BufferLease>,
+        entered: mpsc::Sender<()>,
+        finished: mpsc::Sender<()>,
+    }
+    impl InputSink for Resize {
+        fn input(&self, _: M) {
+            self.entered.send(()).unwrap();
+            self.lease.retire();
+            self.finished.send(()).unwrap();
+        }
+    }
+    let source = Arc::new(Source(std::sync::Mutex::new(frame(1, 4, 3))));
+    let lease = BufferLease::new();
+    source.0.lock().unwrap().pixels = Pixels::Leased {
+        buffers: Arc::new(vec![Arc::new(File::open("/dev/zero").unwrap().into())]),
+        buffer: 0,
+        acquire: None,
+        lease: lease.clone(),
+        cpu: None,
+        readback: Arc::new(|| Ok(vec![0; 48])),
+    };
+    let (entered, entry) = mpsc::channel();
+    let (finished, completion) = mpsc::channel();
+    let server = DisplayServer::new(
+        source,
+        Arc::new(Resize {
+            lease,
+            entered,
+            finished,
+        }),
+    )
+    .unwrap();
+    let (c, worker) = client(
+        &server,
+        C::FRAMES | C::DMABUF_OK | C::STABLE_BUFFERS | C::INPUT,
+    );
+    assert!(matches!(c.receive().unwrap().message, M::LedState { .. }));
+    assert!(matches!(
+        c.receive().unwrap().message,
+        M::SurfaceConfigure { .. }
+    ));
+    let frame = ready(&c);
+    c.send(&M::RequestSize {
+        width: 640,
+        height: 480,
+    })
+    .unwrap();
+    entry
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    c.release(frame.0, frame.1, frame.2).unwrap();
+    completion
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("Release was blocked behind RequestSize");
+    drop(c);
+    worker.join().unwrap().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn fragmented_streams_and_fd_validation() {
+    let (a, mut b) = socket();
+    let bytes = M::Hello {
+        version: 1,
+        capabilities: C(1),
+    }
+    .encode()
+    .unwrap();
+    let h = std::thread::spawn(move || {
+        for byte in bytes {
+            b.write_all(&[byte]).unwrap();
+        }
+    });
+    assert_eq!(
+        receive(&a).unwrap().message,
+        M::Hello {
+            version: 1,
+            capabilities: C(1)
+        }
+    );
+    h.join().unwrap();
+    let fd = File::open("/dev/null").unwrap();
+    assert!(send(&a, &M::LedState { mask: 1 }, &[fd.as_raw_fd()]).is_err());
+    let (a, mut b) = socket();
+    let mut bytes = M::Hello {
+        version: 1,
+        capabilities: C(1),
+    }
+    .encode()
+    .unwrap();
+    bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    b.write_all(&bytes).unwrap();
+    assert!(receive(&a).is_err());
+}
+
+#[test]
+fn wrong_version_and_unnegotiated_input_disconnect() {
+    let (server, _, sink) = server();
+    let (a, b) = socket();
+    let s = server.clone();
+    let h = std::thread::spawn(move || s.serve_native(a));
+    send(
+        &b,
+        &M::Hello {
+            version: 2,
+            capabilities: C::ALL,
+        },
+        &[],
+    )
+    .unwrap();
+    assert!(receive(&b).is_err());
+    assert!(h.join().unwrap().is_err());
+    let (c, h) = client(&server, 0);
+    c.send(&M::Key {
+        qcode: "a".into(),
+        down: true,
+    })
+    .unwrap();
+    assert!(c.receive().is_err());
+    assert_eq!(
+        h.join().unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn pointer_burst_with_clicks_does_not_disconnect_a_slow_input_sink() {
+    struct SlowSink(std::sync::Mutex<Vec<M>>);
+    impl vmlab_hv_display::InputSink for SlowSink {
+        fn input(&self, message: M) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.0.lock().unwrap().push(message);
+        }
+    }
+    let source = Arc::new(Source(std::sync::Mutex::new(frame(1, 4, 3))));
+    let sink = Arc::new(SlowSink(std::sync::Mutex::new(Vec::new())));
+    let server = vmlab_hv_display::DisplayServer::new(source, sink.clone()).unwrap();
+    let (client, worker) = client(&server, C::INPUT);
+    assert!(matches!(
+        client.receive().unwrap().message,
+        M::LedState { .. }
+    ));
+    for index in 0..10_000 {
+        client
+            .send(&M::PointerAbs {
+                x: index % 1024,
+                y: index % 768,
+                width: 1024,
+                height: 768,
+            })
+            .unwrap();
+        if index % 100 == 99 {
+            for mask in [1, 0] {
+                client.send(&M::Buttons { mask }).unwrap();
+            }
+            client.send(&M::Scroll { dx: 0, dy: 1 }).unwrap();
+        }
+    }
+    client
+        .send(&M::PointerAbs {
+            x: 1023,
+            y: 767,
+            width: 1024,
+            height: 768,
+        })
+        .unwrap();
+    until(|| {
+        matches!(
+            sink.0.lock().unwrap().last(),
+            Some(M::PointerAbs {
+                x: 1023,
+                y: 767,
+                ..
+            })
+        )
+        .then_some(())
+    });
+    let input = sink.0.lock().unwrap();
+    let buttons: Vec<_> = input
+        .iter()
+        .filter_map(|m| {
+            if let M::Buttons { mask } = m {
+                Some(*mask)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(buttons, [1, 0].repeat(100));
+    assert_eq!(
+        input
+            .iter()
+            .filter(|m| matches!(m, M::Scroll { dy: 1, .. }))
+            .count(),
+        100
+    );
+    drop(input);
+    server.set_leds(4);
+    assert_eq!(client.receive().unwrap().message, M::LedState { mask: 4 });
+    drop(client);
+    worker.join().unwrap().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn same_size_reset_reconfigures_without_overwriting_old_held_buffers() {
+    let (server, source, _) = server();
+    let (c, h) = client(&server, C::FRAMES);
+    let (old_id, old_fds) = configure(&c);
+    let old = ready(&c);
+    let mut reset = frame(9, 4, 3);
+    reset.generation = 1;
+    *source.0.lock().unwrap() = reset;
+    server.publish().unwrap();
+    let (new_id, fds) = configure(&c);
+    let new = ready(&c);
+    assert_ne!(old_id, new_id);
+    assert_eq!(new.3, vec![frame(9, 4, 3).full()]);
+    assert_eq!(pixels(&old_fds[old.1 as usize], 48), vec![1; 48]);
+    assert_eq!(pixels(&fds[new.1 as usize], 48), vec![9; 48]);
+    let file = File::from(fds[0].try_clone().unwrap());
+    assert!(file.set_len(1).is_err());
+    c.release(old.0, old.1, old.2).unwrap();
+    c.release(new.0, new.1, new.2).unwrap();
+    drop(c);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn reset_during_obsolete_gpu_readback_keeps_the_native_client() {
+    use std::sync::Barrier;
+    use vmlab_hv_display::BufferLease;
+
+    let (server, source, _) = server();
+    let barrier = Arc::new(Barrier::new(2));
+    let callback = barrier.clone();
+    let mut old = frame(1, 4, 3);
+    old.pixels = Pixels::Leased {
+        buffers: Arc::new(vec![Arc::new(File::open("/dev/zero").unwrap().into())]),
+        buffer: 0,
+        acquire: None,
+        lease: BufferLease::new(),
+        cpu: None,
+        readback: Arc::new(move || {
+            callback.wait();
+            callback.wait();
+            Err(std::io::Error::other("GPU resource destroyed by reset"))
+        }),
+    };
+    *source.0.lock().unwrap() = old;
+    let (client, worker) = client(&server, C::FRAMES);
+    let (old_surface, _) = configure(&client);
+    barrier.wait();
+    let mut reset = frame(9, 4, 3);
+    reset.generation = 1;
+    *source.0.lock().unwrap() = reset;
+    server.publish().unwrap();
+    barrier.wait();
+    let (new_surface, fds) = configure(&client);
+    assert!(new_surface > old_surface);
+    let next = ready(&client);
+    assert_eq!(pixels(&fds[next.1 as usize], 48), vec![9; 48]);
+    client.release(next.0, next.1, next.2).unwrap();
+    drop(client);
+    worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn current_gpu_readback_failure_is_still_reported() {
+    use vmlab_hv_display::BufferLease;
+    let (server, source, _) = server();
+    source.0.lock().unwrap().pixels = Pixels::Leased {
+        buffers: Arc::new(vec![Arc::new(File::open("/dev/zero").unwrap().into())]),
+        buffer: 0,
+        acquire: None,
+        lease: BufferLease::new(),
+        cpu: None,
+        readback: Arc::new(|| Err(std::io::Error::other("current GPU readback failed"))),
+    };
+    let (client, worker) = client(&server, C::FRAMES);
+    configure(&client);
+    assert!(client.receive().is_err());
+    assert_eq!(
+        worker.join().unwrap().unwrap_err().to_string(),
+        "current GPU readback failed"
+    );
+}
+
+#[test]
+fn client_connects_to_a_named_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("display.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let (server, _, _) = server();
+    let h = std::thread::spawn(move || server.serve_native(listener.accept().unwrap().0));
+    let c = vmlab_hv_display::Client::connect(&path, C(C::FRAMES)).unwrap();
+    configure(&c);
+    assert_eq!(ready(&c).3, vec![frame(1, 4, 3).full()]);
+    drop(c);
+    h.join().unwrap().unwrap();
+    std::fs::remove_file(path).unwrap();
+}

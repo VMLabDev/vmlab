@@ -1,0 +1,34 @@
+[package]
+name = "vmlab-hv"
+description = "The vmlab hypervisor: one process per machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+log = "0.4"
+vmlab-hv-proto.workspace = true
+vmlab-hv-vmm.workspace = true
+vmlab-hv-devices.workspace = true
+vmlab-disk.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[features]
+default = ["pipewire", "pulse"]
+pipewire = ["vmlab-hv-devices/pipewire"]
+pulse = ["vmlab-hv-devices/pulse"]
+testing = ["vmlab-hv-vmm/testing"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+vmlab-hv-firmware.workspace = true
+vmlab-hv-display = { path = "../vmlab-hv-display" }
+tempfile = "3"
+vmlab-hv-proto = { workspace = true, features = ["gdb"] }
+vmlab-hv-tests = { path = "../vmlab-hv-tests" }

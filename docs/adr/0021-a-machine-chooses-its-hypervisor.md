@@ -12,7 +12,7 @@
 ## Context
 
 PRD §1.2 listed hypervisors other than QEMU/KVM as a non-goal. `vmlab-hv`
-(github.com/VMLabDev/vmlab-hypervisor) is vmlab's own hypervisor: a clean-room,
+in `hv/` is vmlab's own hypervisor: a clean-room,
 MIT-licensed Rust VMM that vmlab runs one process per machine, in place of
 QEMU. It grows in phases — container micro-VMs on x86_64 under KVM first, then
 modern x86_64 VMs, then emulation, then legacy PCs — and QEMU stays the
@@ -49,7 +49,7 @@ default for its kind, which starts at QEMU (D11, D27, D29).**
   machine's runtime directory, runs `vmlab-hv --machine <file> --control
   <socket> --paused`, and drives the control socket through the protocol
   crate's client. Its capabilities are what the handshake advertised. The
-  protocol crate is a git dependency pinned by revision.
+  protocol crate is an in-tree path dependency, as recorded in ADR-0022.
 - Snapshots record the hypervisor that took them. An online snapshot's RAM and
   device state are that hypervisor's own format, so restoring one on a machine
   that now runs on the other is refused, naming the one that took it; offline
@@ -83,9 +83,8 @@ default for its kind, which starts at QEMU (D11, D27, D29).**
 - The refusal list drifting from what the binary actually does. The daemon
   re-checks it, but a capability the hypervisor stops advertising is the
   handshake's word, not the list's.
-- The protocol pin. The crate is a git revision; a protocol version bump on
-  the hypervisor side fails the handshake with both versions named, which is
-  the cue to move the pin.
+- Protocol compatibility. The crate is shared in-tree. A protocol version
+  mismatch still fails the handshake with both versions named.
 
 ## Amendment: modern VMs select vmlab-hv automatically (2026-11-03)
 

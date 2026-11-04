@@ -1,0 +1,1701 @@
+//! KVM integration tests for snapshot save, load and delete.
+
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::Mutex as PlMutex;
+use vm_memory::{Bytes, GuestAddress};
+use vmlab_hv_devices::IrqLine;
+use vmlab_hv_devices::serial::{Serial, SerialOut};
+
+use crate::kvm::KvmVm;
+use crate::layout::MemLayout;
+use crate::memory::{GuestRam, register_memslots};
+use crate::pci::PciRoot;
+use crate::pm::{PM_BLOCK_LEN, PM1A_EVT_BASE, PmDevice, SleepSignal};
+use crate::snapshot::{self, DeviceNode, DiskNode, SnapshotRegistry};
+use crate::vm::{Vm, VmHandle, VmShared};
+
+/// How long to let the guest run between observations.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// A serial-log sink the test can read.
+#[derive(Clone, Default)]
+struct Log(Arc<PlMutex<Vec<u8>>>);
+
+struct LogWriter(Log);
+
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct NullIrq;
+
+impl IrqLine for NullIrq {
+    fn set_level(&self, _high: bool) {}
+}
+
+/// The counter/scratch payload: sets the UART scratch register to 0x42,
+/// then forever increments the word at 0x9000, prints its low byte to
+/// COM1, prints the scratch register's readback, and switches the scratch
+/// to 0x99 once the counter passes 0x4000. A snapshot restored after the
+/// switch must roll both back.
+fn counter_payload() -> Vec<u8> {
+    let mut code = Vec::new();
+    // SCRATCH = 0x42
+    code.extend_from_slice(&[0xBA, 0xFF, 0x03]); // mov dx, 0x3FF
+    code.extend_from_slice(&[0xB0, 0x42]); // mov al, 0x42
+    code.extend_from_slice(&[0xEE]); // out dx, al
+    let loop_at = code.len();
+    code.extend_from_slice(&[0xFF, 0x06, 0x00, 0x90]); // inc word [0x9000]
+    code.extend_from_slice(&[0x81, 0x3E, 0x00, 0x90, 0x00, 0x40]); // cmp word [0x9000], 0x4000
+    let jb_at = code.len();
+    code.extend_from_slice(&[0x72, 0x00]); // jb .keep (patched below)
+    code.extend_from_slice(&[0xBA, 0xFF, 0x03]); // mov dx, 0x3FF
+    code.extend_from_slice(&[0xB0, 0x99]); // mov al, 0x99
+    code.extend_from_slice(&[0xEE]); // out dx, al
+    let keep_at = code.len();
+    // Print the scratch register's readback; that is all the log carries.
+    code.extend_from_slice(&[0xBA, 0xFF, 0x03]); // mov dx, 0x3FF
+    code.extend_from_slice(&[0xEC]); // in al, dx (SCRATCH)
+    code.extend_from_slice(&[0xBA, 0xF8, 0x03]); // mov dx, 0x3F8
+    code.extend_from_slice(&[0xEE]); // out dx, al
+    let jmp_at = code.len();
+    code.extend_from_slice(&[0xEB, 0x00]); // jmp .loop (patched below)
+    code[jb_at + 1] = (keep_at as i32 - (jb_at as i32 + 2)) as i8 as u8;
+    code[jmp_at + 1] = (loop_at as i32 - (jmp_at as i32 + 2)) as i8 as u8;
+    code.resize(0x8000, 0);
+    code
+}
+
+/// One snapshot test machine: real 16550A into a readable log, one qcow2
+/// scratch disk marked vmstate, payload at 0x8000 in real mode.
+struct Machine {
+    vm: Vm,
+    handle: VmHandle,
+    log: Log,
+    disk_path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+    _pause_target: Arc<PlMutex<Option<VmHandle>>>,
+}
+
+struct PauseOnIo(std::sync::Weak<PlMutex<Option<VmHandle>>>, u8);
+
+impl vmlab_hv_devices::BusDevice for PauseOnIo {
+    fn read(&mut self, _: u64, data: &mut [u8]) {
+        data.fill(self.1);
+        self.1 = self.1.wrapping_add(1);
+        if let Some(target) = self.0.upgrade()
+            && let Some(handle) = target.lock().as_ref()
+        {
+            handle.pause().unwrap();
+        }
+    }
+
+    fn write(&mut self, _: u64, _: &[u8]) {
+        if let Some(target) = self.0.upgrade()
+            && let Some(handle) = target.lock().as_ref()
+        {
+            handle.pause().unwrap();
+        }
+    }
+}
+
+fn kvm_or_skip() -> Option<KvmVm> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping: /dev/kvm is not available");
+        return None;
+    }
+    match KvmVm::new() {
+        Ok(vm) => Some(vm),
+        Err(e) => {
+            eprintln!("skipping: cannot create KVM VM: {e}");
+            None
+        }
+    }
+}
+
+fn machine(payload: &[u8], disk_mib: u64) -> Option<Machine> {
+    machine_with_setup(payload, disk_mib, false, |_, _| {})
+}
+
+fn machine_with_setup(
+    payload: &[u8],
+    disk_mib: u64,
+    paused: bool,
+    setup: impl FnOnce(&KvmVm, &mut kvm_ioctls::VcpuFd),
+) -> Option<Machine> {
+    machine_with_ram_setup(payload, disk_mib, paused, setup, |_, _| {})
+}
+
+fn machine_with_ram_setup(
+    payload: &[u8],
+    disk_mib: u64,
+    paused: bool,
+    setup: impl FnOnce(&KvmVm, &mut kvm_ioctls::VcpuFd),
+    setup_ram: impl FnOnce(&KvmVm, &mut GuestRam),
+) -> Option<Machine> {
+    let kvm = kvm_or_skip()?;
+    let dir = tempfile::tempdir().ok()?;
+    let disk_path = dir.path().join("scratch.qcow2");
+    vmlab_disk::ops::create_qcow2(&disk_path, disk_mib * 1024 * 1024, None, None).ok()?;
+    let image: crate::factory::SharedImage = Arc::new(PlMutex::new(
+        vmlab_disk::open(&disk_path, vmlab_disk::Format::Qcow2, false).ok()?,
+    ));
+
+    let layout = MemLayout::new(16).ok()?;
+    let mut ram = GuestRam::anonymous(layout.clone()).ok()?;
+    register_memslots(&kvm.vm, &ram).ok()?;
+    setup_ram(&kvm, &mut ram);
+    ram.mem.write_slice(payload, GuestAddress(0x8000)).ok()?;
+
+    let log = Log::default();
+    let serial = Serial::new(
+        "serial0",
+        SerialOut::new(Box::new(LogWriter(log.clone()))),
+        Arc::new(NullIrq),
+    );
+    let serial: Arc<PlMutex<Serial>> = Arc::new(PlMutex::new(serial));
+    let bus_serial: Arc<PlMutex<dyn vmlab_hv_devices::BusDevice>> = serial.clone();
+    let snap_serial: Arc<PlMutex<dyn vmlab_hv_devices::Snapshot>> = serial.clone();
+
+    let mut io_bus = crate::bus::IoBus::new();
+    let mut mmio_bus = crate::bus::MmioBus::new();
+    let pause_target = Arc::new(PlMutex::new(None));
+    io_bus
+        .register(
+            0x80,
+            1,
+            Arc::new(PlMutex::new(PauseOnIo(Arc::downgrade(&pause_target), 0x42))),
+        )
+        .ok()?;
+    mmio_bus
+        .register(
+            0x1000_0000,
+            4096,
+            Arc::new(PlMutex::new(PauseOnIo(Arc::downgrade(&pause_target), 0x42))),
+        )
+        .ok()?;
+    let pci_root = Arc::new(PlMutex::new(PciRoot::new(layout.mmio64_base)));
+    io_bus.register(0x3F8, 8, bus_serial).ok()?;
+
+    let sleep_signal = Arc::new(SleepSignal::default());
+    let pm = Arc::new(PlMutex::new(PmDevice::new(
+        Arc::new(NullIrq),
+        sleep_signal.sink(),
+    )));
+    io_bus
+        .register(PM1A_EVT_BASE, PM_BLOCK_LEN, pm.clone())
+        .ok()?;
+
+    let shared = VmShared::new(
+        kvm,
+        io_bus,
+        mmio_bus,
+        pci_root,
+        pm,
+        sleep_signal,
+        layout.mmio64_base,
+    );
+    shared.set_snapshot_registry(Arc::new(SnapshotRegistry {
+        digest: [9u8; 32],
+        disks: vec![DiskNode {
+            id: "scratch".into(),
+            writable: true,
+            vmstate: true,
+            image,
+        }],
+        nodes: vec![DeviceNode::Plain(snap_serial)],
+    }));
+    shared.serials.lock().push(serial);
+    let mut vcpu = shared.kvm.create_vcpu(0).ok()?;
+    crate::loader::init_real_mode(&mut vcpu, 0x8000).ok()?;
+    let mut sregs = vcpu.get_sregs().ok()?;
+    sregs.ds.limit = u32::MAX;
+    vcpu.set_sregs(&sregs).ok()?;
+    setup(&shared.kvm, &mut vcpu);
+    let mut vm = Vm::from_parts(shared, vec![(0, vcpu)], ram).ok()?;
+    *pause_target.lock() = Some(vm.handle());
+    if !paused {
+        vm.start();
+    }
+    let handle = vm.handle();
+    Some(Machine {
+        vm,
+        handle,
+        log,
+        disk_path,
+        _dir: dir,
+        _pause_target: pause_target,
+    })
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn dropping_vm_joins_vcpus_and_releases_ram() {
+    for paused in [false, true] {
+        for _ in 0..8 {
+            let Some(machine) = machine(&counter_payload(), 32) else {
+                return;
+            };
+            std::thread::sleep(SETTLE);
+            if paused {
+                machine.handle.pause().unwrap();
+            }
+            let shared = Arc::downgrade(machine.handle.shared());
+            let ram = Arc::downgrade(&machine.vm.ram);
+            let log = machine.log.clone();
+            drop(machine);
+            let before = log.0.lock().len();
+            std::thread::sleep(SETTLE);
+            let after = log.0.lock().len();
+            eprintln!(
+                "after VM drop: shared={}, RAM={}, serial bytes {before} -> {after}",
+                shared.strong_count(),
+                ram.strong_count()
+            );
+            assert!(
+                shared.upgrade().is_none(),
+                "dropped VM retained shared state"
+            );
+            assert!(ram.upgrade().is_none(), "dropped VM retained guest RAM");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn control_server_releases_exited_vm() {
+    use vmlab_hv_proto::{client::Client, control::Command};
+    let Some(machine) = machine(&counter_payload(), 32) else {
+        return;
+    };
+    let path = machine._dir.path().join("control.sock");
+    let shared = Arc::downgrade(machine.handle.shared());
+    let ram = Arc::downgrade(&machine.vm.ram);
+    let server = crate::control::serve(&path, &machine.handle).unwrap();
+    let mut client = Client::connect(&path).unwrap();
+    client.call(Command::Quit).unwrap();
+    drop(client);
+    machine.vm.wait();
+    drop(machine.handle);
+    drop(machine._pause_target);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !server.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.is_finished(), "control listener outlived its VM");
+    server.join().unwrap();
+    assert!(
+        shared.upgrade().is_none(),
+        "control server retained VM state"
+    );
+    assert!(ram.upgrade().is_none(), "control server retained guest RAM");
+}
+
+impl Machine {
+    /// Pairs of (counter, scratch) the guest has printed so far.
+    fn observed(&self) -> Vec<u8> {
+        self.log.0.lock().clone()
+    }
+
+    /// The guest's counter word at 0x9000.
+    fn counter(&self) -> u16 {
+        let mut word = [0u8; 2];
+        self.vm
+            .ram
+            .mem
+            .read_slice(&mut word, GuestAddress(0x9000))
+            .expect("counter page mapped");
+        u16::from_le_bytes(word)
+    }
+}
+
+/// Run the machine for a while and return the observations after.
+fn settle(m: &Machine) -> Vec<u8> {
+    std::thread::sleep(SETTLE);
+    m.observed()
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_preserves_a_broadcast_smi_waiting_for_its_vcpu() {
+    let Some(m) = machine(&counter_payload(), 16) else {
+        return;
+    };
+    m.handle.pause().unwrap();
+    let shared = m.handle.shared();
+    assert!(!shared.dispatch_smi(1));
+    snapshot::save(&m.handle, "pending-smi").unwrap();
+    assert!(shared.take_pending_smi(0));
+    snapshot::load(&m.handle, "pending-smi").unwrap();
+    assert!(shared.take_pending_smi(0), "snapshot lost the queued SMI");
+    assert!(!shared.take_pending_smi(0));
+    snapshot::save(&m.handle, "no-smi").unwrap();
+    shared.dispatch_smi(1);
+    snapshot::load(&m.handle, "no-smi").unwrap();
+    assert!(!shared.take_pending_smi(0), "restore retained a future SMI");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn save_load_rolls_back_counter_and_scratch() {
+    let Some(m) = machine(&counter_payload(), 16) else {
+        return;
+    };
+    // Let it run; the scratch starts at 0x42 and the counter climbs.
+    settle(&m);
+    let counter_at_save = m.counter();
+    assert!(counter_at_save > 0, "guest did not run");
+    snapshot::save(&m.handle, "snap").expect("save");
+
+    // Past the 0x4000 threshold the guest switches the scratch to 0x99;
+    // watch the counter word directly, the log only carries scratch bytes.
+    let mut switched = false;
+    for _ in 0..100 {
+        settle(&m);
+        switched = m.counter() >= 0x4000;
+        if switched {
+            break;
+        }
+        assert!(
+            !matches!(
+                m.vm.handle().status(),
+                vmlab_hv_proto::control::RunState::ShuttingDown
+            ),
+            "machine exited; log so far: {:?}",
+            &m.observed()[m.observed().len().saturating_sub(20)..]
+        );
+    }
+    assert!(switched, "counter never reached the threshold");
+    let counter_pre_load = m.counter();
+    assert!(
+        counter_pre_load >= 0x4000,
+        "counter past the threshold before load: {counter_pre_load:#x}"
+    );
+
+    let load_at = m.observed().len();
+    snapshot::load(&m.handle, "snap").expect("load");
+    // Read before settling: the snapshot recorded a running machine, so the
+    // counter starts climbing again the moment the load resumes it.
+    let counter_post = m.counter();
+    assert!(
+        counter_post >= counter_at_save && counter_post < counter_pre_load,
+        "counter rolled back: post {counter_post:#x}, at save {counter_at_save:#x}, \
+         pre-load {counter_pre_load:#x}"
+    );
+    settle(&m);
+    // The scratch survived: 0x42 readbacks resume after the load even
+    // though the guest had switched it to 0x99.
+    // The first readbacks after the load are 0x42 again: the restored
+    // scratch, even though the guest had switched it to 0x99. It switches
+    // back to 0x99 later, once the rolled-back counter re-crosses the
+    // threshold.
+    // The guest ran until the load paused it, so a few pre-load 0x99
+    // readbacks can trail into the slice; skip them.
+    let tail = &m.observed()[load_at..];
+    let restored_at = tail
+        .iter()
+        .position(|&b| b != 0x99)
+        .expect("no readbacks after load");
+    let head = &tail[restored_at..restored_at + 16.min(tail.len() - restored_at)];
+    assert!(
+        head.iter().all(|&b| b == 0x42),
+        "scratch did not survive: first readbacks after load: {head:?}"
+    );
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn load_clears_pages_that_were_zero_at_save() {
+    let Some(m) = machine(&counter_payload(), 16) else {
+        return;
+    };
+    m.handle.pause().expect("pause");
+    let ram = m.handle.shared().ram().unwrap();
+    let address = GuestAddress(0x20000);
+    let mut bytes = [0u8; 4096];
+    ram.mem.read_slice(&mut bytes, address).unwrap();
+    assert_eq!(bytes, [0; 4096]);
+    snapshot::save(&m.handle, "zeros").expect("save");
+    ram.mem.write_slice(&[0xa5; 4096], address).unwrap();
+    snapshot::load(&m.handle, "zeros").expect("load");
+    ram.mem.read_slice(&mut bytes, address).unwrap();
+    assert_eq!(bytes, [0; 4096]);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_is_visible_to_qemu_img_with_vm_state() {
+    let Some(m) = machine(&counter_payload(), 16) else {
+        return;
+    };
+    settle(&m);
+    snapshot::save(&m.handle, "snapq").expect("save");
+
+    let out = std::process::Command::new("qemu-img")
+        .args(["snapshot", "-l", &m.disk_path.to_string_lossy()])
+        .output()
+        .expect("qemu-img runs");
+    assert!(out.status.success(), "qemu-img snapshot -l failed");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("snapq"))
+        .unwrap_or_else(|| panic!("snapshot row missing:\n{text}"));
+    // ID TAG VM SIZE DATE ... — the size must not be 0 B.
+    let size = row.split_whitespace().nth(2).unwrap();
+    let unit = row.split_whitespace().nth(3).unwrap();
+    assert!(!(size == "0" && unit == "B"), "VM SIZE is zero: {row}");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn delete_removes_and_missing_snapshots_error() {
+    let Some(m) = machine(&counter_payload(), 8) else {
+        return;
+    };
+    settle(&m);
+    snapshot::save(&m.handle, "gone").expect("save");
+    snapshot::delete(&m.handle, "gone").expect("delete");
+    let err = snapshot::delete(&m.handle, "gone").expect_err("already deleted");
+    assert!(err.is_not_found(), "{err}");
+    let err = snapshot::load(&m.handle, "never").expect_err("absent");
+    assert!(err.is_not_found(), "{err}");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn failed_smi_restore_rolls_back_disks_ram_cpu_devices_and_run_state() {
+    use snapshot::format;
+    use vmlab_hv_devices::{BusDevice, Snapshot};
+    use vmlab_hv_proto::{
+        client::Client,
+        control::{Command, Outcome, RunState},
+    };
+
+    let _permit = vmlab_hv_tests::process::VmPermit::acquire().unwrap();
+    for running in [false, true] {
+        let Some(m) = machine(&[0xeb, 0xfe], 8) else {
+            return;
+        };
+        m.handle.pause().unwrap();
+        let shared = m.handle.shared();
+        shared.wait_quiesced(Duration::from_secs(5)).unwrap();
+        let fw = Arc::new(PlMutex::new(
+            crate::smm::SmiFwCfg::new(
+                vmlab_hv_firmware::FwCfg::new(m.vm.ram.mem.clone()),
+                m.vm.ram.mem.clone(),
+            )
+            .unwrap(),
+        ));
+        let original = shared.snapshot_registry().unwrap();
+        let second = m._dir.path().join("second.qcow2");
+        vmlab_disk::ops::create_qcow2(&second, 8 << 20, None, None).unwrap();
+        let reg = Arc::new(SnapshotRegistry {
+            digest: original.digest,
+            disks: vec![
+                DiskNode {
+                    id: "scratch".into(),
+                    writable: true,
+                    vmstate: true,
+                    image: original.disks[0].image.clone(),
+                },
+                DiskNode {
+                    id: "second".into(),
+                    writable: true,
+                    vmstate: false,
+                    image: Arc::new(PlMutex::new(
+                        vmlab_disk::open(&second, vmlab_disk::Format::Qcow2, false).unwrap(),
+                    )),
+                },
+            ],
+            nodes: vec![
+                DeviceNode::Plain(shared.serials.lock()[0].clone()),
+                DeviceNode::Plain(fw.clone()),
+            ],
+        });
+        shared.set_snapshot_registry(reg.clone());
+        for disk in &reg.disks {
+            disk.image.lock().write_at(0, &[0x11]).unwrap();
+        }
+        snapshot::save(&m.handle, "source").unwrap();
+
+        // Corrupt only the SMI section, so rejection happens after RAM, CPU
+        // and the preceding UART have already been restored.
+        let mut image = reg.disks[0].image.lock();
+        let info = image.snapshot_apply("source").unwrap();
+        let mut bytes = vec![0; info.vm_state_size as usize];
+        image.read_vmstate(0, &mut bytes).unwrap();
+        let (header, mut reader) = format::decode_header(&bytes).unwrap();
+        let mut sections = Vec::new();
+        for _ in 0..header.section_count {
+            let (id, mut body) = format::read_section(&mut reader).unwrap();
+            if id == "smm-fw-cfg" {
+                let mut value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                value[1]["locked"] = 8.into();
+                body = serde_json::to_vec(&value).unwrap();
+            }
+            sections.push((id, body));
+        }
+        let mut corrupt = format::encode_header_sections(
+            header.run_state,
+            env!("CARGO_PKG_VERSION"),
+            &reg.digest,
+            &sections,
+        );
+        corrupt.extend_from_slice(reader.remaining());
+        image.write_vmstate(0, &corrupt).unwrap();
+        image
+            .snapshot_create("bad", corrupt.len() as u64, 0)
+            .unwrap();
+        drop(image);
+        reg.disks[1]
+            .image
+            .lock()
+            .snapshot_create("bad", 0, 0)
+            .unwrap();
+
+        for disk in &reg.disks {
+            disk.image.lock().write_at(0, &[0x42]).unwrap();
+        }
+        m.vm.ram
+            .mem
+            .write_slice(&[0x42], GuestAddress(0x9000))
+            .unwrap();
+        shared.serials.lock()[0].lock().write(7, &[0x42]);
+        let cpus = shared.vcpus.lock().clone();
+        let mut regs = cpus[0].1.lock().get_regs().unwrap();
+        regs.rax = 0x42;
+        cpus[0].1.lock().set_regs(&regs).unwrap();
+        let fw_before = fw.lock().save_state().unwrap();
+        let socket = m._dir.path().join("control.sock");
+        crate::control::serve(&socket, &m.handle).unwrap();
+        let mut client = Client::connect(socket).unwrap();
+        if running {
+            m.handle.resume().unwrap();
+        }
+        let expected = if running {
+            RunState::Running
+        } else {
+            RunState::Paused
+        };
+        let outcome = client
+            .call(Command::SnapshotLoad { name: "bad".into() })
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Error { ref message, .. } if message.contains("unsupported SMI features")),
+            "{outcome:?}"
+        );
+        assert_eq!(m.handle.status(), expected, "failed load changed run state");
+        m.handle.pause().unwrap();
+        shared.wait_quiesced(Duration::from_secs(5)).unwrap();
+        let mut byte = [0];
+        m.vm.ram
+            .mem
+            .read_slice(&mut byte, GuestAddress(0x9000))
+            .unwrap();
+        assert_eq!(byte, [0x42], "failed load changed RAM");
+        assert_eq!(cpus[0].1.lock().get_regs().unwrap().rax, 0x42);
+        shared.serials.lock()[0].lock().read(7, &mut byte);
+        assert_eq!(byte, [0x42], "failed load changed UART");
+        assert_eq!(fw.lock().save_state().unwrap(), fw_before);
+        for disk in &reg.disks {
+            let mut image = disk.image.lock();
+            image.read_at(0, &mut byte).unwrap();
+            assert_eq!(byte, [0x42], "failed load changed disk {}", disk.id);
+            assert_eq!(
+                image.snapshots().unwrap().len(),
+                2,
+                "rollback checkpoint leaked"
+            );
+        }
+        assert!(matches!(
+            client
+                .call(Command::SnapshotLoad {
+                    name: "missing".into()
+                })
+                .unwrap(),
+            Outcome::Error { .. }
+        ));
+        assert_eq!(m.handle.status(), RunState::Paused);
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn paused_snapshots_stay_paused() {
+    let Some(m) = machine(&counter_payload(), 8) else {
+        return;
+    };
+    settle(&m);
+    m.handle.pause().expect("pause");
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
+    snapshot::save(&m.handle, "paused-snap").expect("save while paused");
+    // Saving a paused machine must not resume it.
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
+    snapshot::load(&m.handle, "paused-snap").expect("load while paused");
+    assert_eq!(
+        m.handle.status(),
+        vmlab_hv_proto::control::RunState::Paused,
+        "a paused snapshot leaves the machine paused"
+    );
+    // And it still runs afterwards.
+    m.handle.resume().expect("resume");
+    let before = m.observed().len();
+    settle(&m);
+    assert!(m.observed().len() > before, "machine runs after resume");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn control_snapshot_restores_extended_cpu_state() {
+    use kvm_bindings::{Msrs, kvm_msr_entry};
+    use vmlab_hv_proto::{client::Client, control::Command};
+
+    let Some(m) = machine(&[0xeb, 0xfe], 8) else {
+        return;
+    };
+    m.handle.pause().unwrap();
+    m.handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(5))
+        .unwrap();
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = Client::connect(socket).unwrap();
+    let call = |client: &mut Client, command| {
+        assert!(matches!(
+            client.call(command).unwrap(),
+            vmlab_hv_proto::control::Outcome::Ok { .. }
+        ));
+    };
+    let cpus = m.handle.shared().vcpus.lock().clone();
+    let cpu = &cpus[0].1;
+    let set = |saved: bool| {
+        let fd = cpu.lock();
+        let mut debug = fd.get_debug_regs().unwrap();
+        debug.db[0] = if saved { 0x1234 } else { 0x5678 };
+        fd.set_debug_regs(&debug).unwrap();
+        let mut xcrs = fd.get_xcrs().unwrap();
+        assert_eq!(xcrs.nr_xcrs, 1);
+        xcrs.xcrs[0].value = if saved { 3 } else { 1 };
+        fd.set_xcrs(&xcrs).unwrap();
+        let msrs = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: 0x277,
+                data: if saved {
+                    0x0007_0406_0007_0406
+                } else {
+                    0x0606_0606_0606_0606
+                },
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: 0x174,
+                data: if saved { 0x10 } else { 0x20 },
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(fd.set_msrs(&msrs).unwrap(), 2);
+    };
+    let read = || {
+        let fd = cpu.lock();
+        let mut msrs = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: 0x277,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: 0x174,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(fd.get_msrs(&mut msrs).unwrap(), 2);
+        (
+            fd.get_debug_regs().unwrap().db[0],
+            fd.get_xcrs().unwrap().xcrs[0].value,
+            msrs.as_slice()[0].data,
+            msrs.as_slice()[1].data,
+        )
+    };
+    set(true);
+    let expected = read();
+    call(&mut client, Command::SnapshotSave { name: "cpu".into() });
+    set(false);
+    call(&mut client, Command::SnapshotLoad { name: "cpu".into() });
+    assert_eq!(
+        read(),
+        expected,
+        "DR0, XCR0, IA32_PAT, IA32_SYSENTER_CS must roll back"
+    );
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn control_snapshot_restores_cet_user_shadow_stack() {
+    use kvm_bindings::{Msrs, kvm_msr_entry};
+    use vmlab_hv_proto::{
+        client::Client,
+        control::{Command, Outcome},
+    };
+
+    let payload = [
+        0xe4, 0x80, // pause before reading the saved context's CET state
+        0x66, 0xb9, 0xa0, 0x06, 0, 0, 0x0f, 0x32, // rdmsr IA32_U_CET
+        0x66, 0xa3, 0, 0x90, // mov [0x9000], eax
+        0x66, 0xb9, 0xa7, 0x06, 0, 0, 0x0f, 0x32, // rdmsr IA32_PL3_SSP
+        0x66, 0xa3, 4, 0x90, // mov [0x9004], eax
+        0xeb, 0xe4, // repeat and pause
+    ];
+    let Some(m) = machine(&payload, 8) else {
+        return;
+    };
+    let indices = m.handle.shared().kvm.kvm.get_msr_index_list().unwrap();
+    if ![0x6a0, 0x6a7]
+        .iter()
+        .all(|index| indices.as_slice().contains(index))
+    {
+        eprintln!("skipping CET snapshot regression: KVM does not expose user CET MSRs");
+        return;
+    }
+    let wait = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while m.handle.status() != vmlab_hv_proto::control::RunState::Paused {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "CET payload did not pause"
+            );
+            std::thread::yield_now();
+        }
+        m.handle
+            .shared()
+            .wait_quiesced(Duration::from_secs(5))
+            .unwrap();
+    };
+    wait();
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = Client::connect(socket).unwrap();
+    let cpus = m.handle.shared().vcpus.lock().clone();
+    let set = |control, pointer| {
+        let state = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: 0x6a0,
+                data: control,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: 0x6a7,
+                data: pointer,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(cpus[0].1.lock().set_msrs(&state).unwrap(), 2);
+    };
+    // Restoring a user context with its later, zero SSP makes the next
+    // shadow-stack push access -8. Both CET control and PL3_SSP are MSR
+    // migration state; KVM_GET_XSAVE does not capture them.
+    for (control, pointer) in [(1, 0xa000), (0, 0)] {
+        set(control, pointer);
+        assert!(matches!(
+            client
+                .call(Command::SnapshotSave { name: "cet".into() })
+                .unwrap(),
+            Outcome::Ok { .. }
+        ));
+        set(control ^ 1, pointer ^ 0xa000);
+        assert!(matches!(
+            client
+                .call(Command::SnapshotLoad { name: "cet".into() })
+                .unwrap(),
+            Outcome::Ok { .. }
+        ));
+        let mut actual = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: 0x6a0,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: 0x6a7,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(cpus[0].1.lock().get_msrs(&mut actual).unwrap(), 2);
+        assert_eq!(
+            (actual.as_slice()[0].data, actual.as_slice()[1].data),
+            (control, pointer),
+            "snapshot lost user CET control or the ring-3 shadow-stack pointer"
+        );
+        assert!(matches!(
+            client.call(Command::Resume).unwrap(),
+            Outcome::Ok { .. }
+        ));
+        wait();
+        let mut observed = [0; 8];
+        m.vm.ram
+            .mem
+            .read_slice(&mut observed, GuestAddress(0x9000))
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(observed[..4].try_into().unwrap()),
+            control as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(observed[4..].try_into().unwrap()),
+            pointer as u32
+        );
+        assert!(matches!(
+            client
+                .call(Command::SnapshotDelete { name: "cet".into() })
+                .unwrap(),
+            Outcome::Ok { .. }
+        ));
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn control_snapshot_restores_ram_outside_the_boot_layout() {
+    use vmlab_hv_proto::{
+        client::Client,
+        control::{Command, Outcome},
+    };
+    let base = GuestAddress(0x2000_0000);
+    let Some(m) = machine_with_ram_setup(
+        &[0xeb, 0xfe],
+        8,
+        false,
+        |_, _| {},
+        |kvm, ram| {
+            let region =
+                Arc::new(vm_memory::GuestRegionMmap::from_range(base, 4096, None).unwrap());
+            let slot = kvm_bindings::kvm_userspace_memory_region {
+                slot: 128,
+                guest_phys_addr: base.0,
+                memory_size: 4096,
+                userspace_addr: region.as_ptr() as u64,
+                flags: 0,
+            };
+            // SAFETY: the device region remains owned by GuestRam until VM drop.
+            unsafe { kvm.vm.set_user_memory_region(slot) }.unwrap();
+            ram.mem = ram.mem.insert_region(region).unwrap();
+        },
+    ) else {
+        return;
+    };
+    m.handle.pause().unwrap();
+    m.handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(5))
+        .unwrap();
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = Client::connect(socket).unwrap();
+    m.vm.ram.mem.write_slice(b"before", base).unwrap();
+    assert!(matches!(
+        client
+            .call(Command::SnapshotSave {
+                name: "device-ram".into()
+            })
+            .unwrap(),
+        Outcome::Ok { .. }
+    ));
+    m.vm.ram.mem.write_slice(b"after!", base).unwrap();
+    assert!(matches!(
+        client
+            .call(Command::SnapshotLoad {
+                name: "device-ram".into()
+            })
+            .unwrap(),
+        Outcome::Ok { .. }
+    ));
+    let mut value = [0; 6];
+    m.vm.ram.mem.read_slice(&mut value, base).unwrap();
+    assert_eq!(
+        &value, b"before",
+        "snapshot omitted a firmware/device RAM memslot"
+    );
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn io_instruction_completed_before_snapshot() {
+    snapshot_at_io(&[0xec], 0x42);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn mmio_instruction_completed_before_snapshot() {
+    snapshot_at_io(&[0x67, 0xa0, 0, 0, 0, 0x10], 0x42);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn output_instruction_completed_before_snapshot() {
+    snapshot_at_io(&[0xee], 0x11);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn mmio_write_instruction_completed_before_snapshot() {
+    snapshot_at_io(&[0x67, 0xa2, 0, 0, 0, 0x10], 0x11);
+}
+
+fn snapshot_at_io(instruction: &[u8], expected: u16) {
+    // Pause in the device callback, before KVM completes the instruction.
+    let mut payload = vec![
+        0xba, 0x80, 0x00, // mov dx, 0x80
+        0xb0, 0x11, // mov al, 0x11
+    ];
+    payload.extend_from_slice(instruction);
+    payload.extend_from_slice(&[
+        0xa2,
+        0x00,
+        0x90, // mov [0x9000], al
+        0xeb,
+        (-(instruction.len() as i8 + 5)) as u8, // repeat
+    ]);
+    let Some(m) = machine(&payload, 8) else {
+        return;
+    };
+    let wait = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while m.handle.status() != vmlab_hv_proto::control::RunState::Paused {
+            assert!(std::time::Instant::now() < deadline, "I/O did not pause");
+            std::thread::yield_now();
+        }
+        m.handle
+            .shared()
+            .wait_quiesced(Duration::from_secs(5))
+            .unwrap();
+    };
+    wait();
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = vmlab_hv_proto::client::Client::connect(&socket).unwrap();
+    let call = |client: &mut vmlab_hv_proto::client::Client, command| {
+        assert!(matches!(
+            client.call(command).unwrap(),
+            vmlab_hv_proto::control::Outcome::Ok { .. }
+        ));
+    };
+    call(
+        &mut client,
+        vmlab_hv_proto::control::Command::SnapshotSave { name: "io".into() },
+    );
+    let regs = m.handle.shared().vcpus.lock()[0]
+        .1
+        .lock()
+        .get_regs()
+        .unwrap();
+    assert_eq!(
+        regs.rax & 0xff,
+        expected as u64,
+        "snapshot captured incomplete I/O"
+    );
+    assert_eq!(
+        regs.rip,
+        0x8005 + instruction.len() as u64,
+        "snapshot captured I/O before completion"
+    );
+    call(&mut client, vmlab_hv_proto::control::Command::Resume);
+    wait();
+    call(
+        &mut client,
+        vmlab_hv_proto::control::Command::SnapshotLoad { name: "io".into() },
+    );
+    call(&mut client, vmlab_hv_proto::control::Command::Resume);
+    wait();
+    assert_eq!(
+        m.counter() & 0xff,
+        expected,
+        "post-save I/O leaked into restored CPU"
+    );
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_load_completes_deferred_hyperv_hypercalls() {
+    // Save just before the marker store, then load while PostMessage exits
+    // repeatedly. A stale completion overwrites restored registers and uses
+    // KVM's cached next RIP inside the old hypercall page.
+    let mut payload = vec![0xe4, 0x80, 0xb8, 0xcd, 0xab, 0xa3, 0x00, 0x90];
+    let loop_at = payload.len();
+    // Hyper-V's x86 convention: EDX:EAX control, EBX:ECX input GPA.
+    for (register, value) in [(0xb8, 0x5cu32), (0xba, 0), (0xbb, 0), (0xb9, 0xc000)] {
+        payload.extend([0x66, register]);
+        payload.extend(value.to_le_bytes());
+    }
+    payload.push(0xe8);
+    let displacement = 0xb000u16.wrapping_sub(0x8000 + payload.len() as u16 + 2);
+    payload.extend(displacement.to_le_bytes());
+    payload.push(0xe9);
+    let displacement = (loop_at as u16).wrapping_sub(payload.len() as u16 + 2);
+    payload.extend(displacement.to_le_bytes());
+    let Some(m) = machine_with_setup(&payload, 8, false, |kvm, cpu| {
+        crate::hyperv::configure_vcpu(&kvm.kvm, cpu, crate::hyperv::WINDOWS_FEATURES).unwrap();
+        crate::loader::init_protected_16(cpu, 0x8000).unwrap();
+        let msrs = kvm_bindings::Msrs::from_entries(&[
+            kvm_bindings::kvm_msr_entry {
+                index: 0x40000000,
+                data: 42,
+                ..Default::default()
+            },
+            kvm_bindings::kvm_msr_entry {
+                index: 0x40000001,
+                data: 0xb001,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(cpu.set_msrs(&msrs).unwrap(), 2);
+    }) else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while m.handle.status() != vmlab_hv_proto::control::RunState::Paused
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
+    m.handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(5))
+        .unwrap();
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = vmlab_hv_proto::client::Client::connect(socket).unwrap();
+    let call = |client: &mut vmlab_hv_proto::client::Client, command| {
+        assert!(matches!(
+            client.call(command).unwrap(),
+            vmlab_hv_proto::control::Outcome::Ok { .. }
+        ));
+    };
+    call(
+        &mut client,
+        vmlab_hv_proto::control::Command::SnapshotSave {
+            name: "hcall".into(),
+        },
+    );
+    for cycle in 0..20 {
+        call(&mut client, vmlab_hv_proto::control::Command::Resume);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            m.counter(),
+            0xabcd,
+            "guest did not reach the hypercall loop"
+        );
+        call(
+            &mut client,
+            vmlab_hv_proto::control::Command::SnapshotLoad {
+                name: "hcall".into(),
+            },
+        );
+        call(&mut client, vmlab_hv_proto::control::Command::Resume);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while m.counter() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            m.counter(),
+            0xabcd,
+            "load {cycle} completed a stale hypercall over restored registers"
+        );
+        call(&mut client, vmlab_hv_proto::control::Command::Pause);
+        m.handle
+            .shared()
+            .wait_quiesced(Duration::from_secs(5))
+            .unwrap();
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_stops_console_dma_before_saving_ram() {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use virtio_queue::QueueT;
+    use vmlab_hv_devices::virtio::console::{Console, PortConfig};
+    use vmlab_hv_devices::{DeviceError, Snapshot, VirtioDevice, VirtioInterrupt};
+
+    struct Interrupt;
+    impl VirtioInterrupt for Interrupt {
+        fn notify_queue(&self, _: u16) {}
+        fn notify_config(&self) {}
+    }
+    struct ConnectDuringSave {
+        path: std::path::PathBuf,
+        mem: vmlab_hv_devices::GuestMemory,
+        client: PlMutex<Option<UnixStream>>,
+        wrote: Arc<AtomicBool>,
+    }
+    impl ConnectDuringSave {
+        fn connect_and_observe(&self, restoring: bool) -> Result<(), DeviceError> {
+            // A rollback capture can start with an earlier DMA result in RAM.
+            // Detect new writes, including another completion of the same data.
+            // Restore must retain the saved empty buffer and used ring, even
+            // if a broken device resumes DMA before this callback begins.
+            let before = if restoring {
+                (0, 0)
+            } else {
+                (
+                    self.mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap(),
+                    self.mem.read_obj::<u16>(GuestAddress(0x32002)).unwrap(),
+                )
+            };
+            self.client.lock().take();
+            *self.client.lock() = Some(UnixStream::connect(&self.path)?);
+            // A host connection queues PORT_OPEN after the console state has
+            // been captured, but before the VMM captures RAM. No guest runs.
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            while std::time::Instant::now() < deadline {
+                let current = (
+                    self.mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap(),
+                    self.mem.read_obj::<u16>(GuestAddress(0x32002)).unwrap(),
+                );
+                if current != before {
+                    self.wrote.store(true, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        }
+    }
+    impl Snapshot for ConnectDuringSave {
+        fn state_id(&self) -> String {
+            "connect-during-save".into()
+        }
+        fn save_state(&self) -> Result<Vec<u8>, DeviceError> {
+            self.connect_and_observe(false)?;
+            Ok(Vec::new())
+        }
+        fn restore_state(&mut self, _: &[u8]) -> Result<(), DeviceError> {
+            self.connect_and_observe(true)
+        }
+    }
+    let Some(m) = machine(&[0xe4, 0x80, 0xeb, 0xfc], 8) else {
+        return;
+    };
+    m.handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(5))
+        .unwrap();
+    let path = m._dir.path().join("console.sock");
+    let mut console = Console::new(
+        "console",
+        vec![PortConfig {
+            name: "test".into(),
+            path: path.clone(),
+        }],
+    )
+    .unwrap();
+    let queues = console
+        .queue_max_sizes()
+        .iter()
+        .enumerate()
+        .map(|(i, &size)| {
+            let mut queue = virtio_queue::Queue::new(size).unwrap();
+            queue.set_size(size);
+            queue.set_desc_table_address(Some(0x10000 + i as u32 * 0x10000), Some(0));
+            queue.set_avail_ring_address(Some(0x11000 + i as u32 * 0x10000), Some(0));
+            queue.set_used_ring_address(Some(0x12000 + i as u32 * 0x10000), Some(0));
+            queue.set_ready(true);
+            queue
+        })
+        .collect();
+    let mem = m.vm.ram.mem.clone();
+    mem.write_obj(0x9000u64, GuestAddress(0x30000)).unwrap();
+    mem.write_obj(64u32, GuestAddress(0x30008)).unwrap();
+    mem.write_obj(2u16, GuestAddress(0x3000c)).unwrap();
+    mem.write_obj(1u16, GuestAddress(0x31002)).unwrap();
+    console
+        .activate(mem.clone(), Arc::new(Interrupt), queues)
+        .unwrap();
+    let wrote = Arc::new(AtomicBool::new(false));
+    let original = m.handle.shared().snapshot_registry().unwrap();
+    m.handle
+        .shared()
+        .set_snapshot_registry(Arc::new(SnapshotRegistry {
+            digest: original.digest,
+            disks: original
+                .disks
+                .iter()
+                .map(|disk| DiskNode {
+                    id: disk.id.clone(),
+                    writable: disk.writable,
+                    vmstate: disk.vmstate,
+                    image: disk.image.clone(),
+                })
+                .collect(),
+            nodes: vec![
+                DeviceNode::Plain(Arc::new(PlMutex::new(console))),
+                DeviceNode::Plain(Arc::new(PlMutex::new(ConnectDuringSave {
+                    path,
+                    mem,
+                    client: PlMutex::new(None),
+                    wrote: wrote.clone(),
+                }))),
+            ],
+        }));
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = vmlab_hv_proto::client::Client::connect(socket).unwrap();
+    assert!(matches!(
+        client
+            .call(vmlab_hv_proto::control::Command::SnapshotSave { name: "dma".into() })
+            .unwrap(),
+        vmlab_hv_proto::control::Outcome::Ok { .. }
+    ));
+    assert!(
+        !wrote.load(Ordering::SeqCst),
+        "console DMA changed RAM after its queue indices were captured"
+    );
+    let wait_for_dma = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while m.vm.ram.mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "console did not resume DMA"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    wait_for_dma();
+    wrote.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .call(vmlab_hv_proto::control::Command::SnapshotLoad { name: "dma".into() })
+            .unwrap(),
+        vmlab_hv_proto::control::Outcome::Ok { .. }
+    ));
+    assert!(
+        !wrote.load(Ordering::SeqCst),
+        "console DMA resumed before every device was restored"
+    );
+    wait_for_dma();
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn rapid_snapshot_loads_roll_back_guest_tsc() {
+    snapshot_tsc_roundtrip(Duration::ZERO, Duration::ZERO);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_load_excludes_device_restore_time_from_guest_clock() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use vmlab_hv_devices::{DeviceError, Snapshot};
+
+    struct SlowRestore {
+        vm: Arc<kvm_ioctls::VmFd>,
+        khz: u64,
+        before: Arc<AtomicU64>,
+        resumed: Arc<AtomicU64>,
+    }
+    impl SlowRestore {
+        fn origin(&self) -> u64 {
+            let clock = self.vm.get_clock().unwrap();
+            assert_ne!(clock.flags & kvm_bindings::KVM_CLOCK_HOST_TSC, 0);
+            let cycles = (u128::from(clock.clock) * u128::from(self.khz) / 1_000_000) as u64;
+            clock.host_tsc.wrapping_sub(cycles)
+        }
+    }
+    impl Snapshot for SlowRestore {
+        fn state_id(&self) -> String {
+            "slow-clock-restore".into()
+        }
+        fn save_state(&self) -> Result<Vec<u8>, DeviceError> {
+            Ok(vec![])
+        }
+        fn restore_state(&mut self, _: &[u8]) -> Result<(), DeviceError> {
+            self.before.store(self.origin(), Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(())
+        }
+        fn resume_snapshot(&mut self) {
+            self.resumed.store(self.origin(), Ordering::SeqCst);
+        }
+    }
+
+    let Some(m) = machine(&[0xe4, 0x80, 0xeb, 0xfc], 8) else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while m.handle.status() != vmlab_hv_proto::control::RunState::Paused {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    m.handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(5))
+        .unwrap();
+    let shared = m.handle.shared();
+    let original = shared.snapshot_registry().unwrap();
+    let khz = shared.vcpus.lock()[0].1.lock().get_tsc_khz().unwrap() as u64;
+    let before = Arc::new(AtomicU64::new(0));
+    let resumed = Arc::new(AtomicU64::new(0));
+    let DeviceNode::Plain(serial) = &original.nodes[0] else {
+        panic!("test machine has a plain serial snapshot node");
+    };
+    shared.set_snapshot_registry(Arc::new(SnapshotRegistry {
+        digest: original.digest,
+        disks: original
+            .disks
+            .iter()
+            .map(|disk| DiskNode {
+                id: disk.id.clone(),
+                writable: disk.writable,
+                vmstate: disk.vmstate,
+                image: disk.image.clone(),
+            })
+            .collect(),
+        nodes: vec![
+            DeviceNode::Plain(serial.clone()),
+            DeviceNode::Plain(Arc::new(PlMutex::new(SlowRestore {
+                vm: shared.kvm.vm.clone(),
+                khz,
+                before: before.clone(),
+                resumed: resumed.clone(),
+            }))),
+        ],
+    }));
+    snapshot::save(&m.handle, "clock").unwrap();
+    snapshot::load(&m.handle, "clock").unwrap();
+    // Paired KVM samples cancel host scheduling delays after the rebase.
+    let excluded = resumed
+        .load(Ordering::SeqCst)
+        .wrapping_sub(before.load(Ordering::SeqCst));
+    assert!(
+        excluded >= khz * 500,
+        "device restore time advanced the guest clock"
+    );
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_tsc_rollback_allows_delayed_save_observation() {
+    snapshot_tsc_roundtrip(Duration::from_millis(150), Duration::ZERO);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_tsc_rollback_allows_delayed_guest_execution() {
+    snapshot_tsc_roundtrip(Duration::ZERO, Duration::from_millis(150));
+}
+
+fn snapshot_tsc_roundtrip(save_delay: Duration, load_delay: Duration) {
+    // IN pauses before RDTSC; each resume stores EDX:EAX and pauses again.
+    let payload = [
+        0xe4, 0x80, 0x0f, 0x31, 0x66, 0xa3, 0x00, 0x90, 0x66, 0x89, 0x16, 0x04, 0x90, 0xeb, 0xf1,
+    ];
+    let Some(m) = machine(&payload, 8) else {
+        return;
+    };
+    let wait = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while m.handle.status() != vmlab_hv_proto::control::RunState::Paused {
+            assert!(std::time::Instant::now() < deadline, "guest did not pause");
+            std::thread::yield_now();
+        }
+        m.handle
+            .shared()
+            .wait_quiesced(Duration::from_secs(5))
+            .unwrap();
+    };
+    wait();
+    let cpus = m.handle.shared().vcpus.lock().clone();
+    let khz = cpus[0].1.lock().get_tsc_khz().unwrap() as u64;
+    let vm = &m.handle.shared().kvm.vm;
+    let cycles = |ns: u64| (u128::from(ns) * u128::from(khz) / 1_000_000) as u64;
+    let timebase = || {
+        let clock = vm.get_clock().unwrap();
+        assert_ne!(clock.flags & kvm_bindings::KVM_CLOCK_HOST_TSC, 0);
+        let mut offset = 0;
+        snapshot::tsc_offset(&cpus[0].1.lock(), &mut offset, false).unwrap();
+        // The offset is stable while paused, but IA32_TSC keeps advancing.
+        // Compare the guest TSC at kvmclock zero using KVM's paired sample.
+        let origin = clock
+            .host_tsc
+            .wrapping_add(offset)
+            .wrapping_sub(cycles(clock.clock));
+        (clock.clock, origin)
+    };
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = vmlab_hv_proto::client::Client::connect(socket).unwrap();
+    let call = |client: &mut vmlab_hv_proto::client::Client, command| {
+        assert!(matches!(
+            client.call(command).unwrap(),
+            vmlab_hv_proto::control::Outcome::Ok { .. }
+        ));
+    };
+    call(
+        &mut client,
+        vmlab_hv_proto::control::Command::SnapshotSave { name: "tsc".into() },
+    );
+    // Exceed the old timing tolerance without changing any guest state.
+    std::thread::sleep(save_delay);
+    let (_, saved) = timebase();
+    let tolerance = khz * 50;
+    for cycle in 0..3 {
+        std::thread::sleep(Duration::from_millis(100));
+        call(
+            &mut client,
+            vmlab_hv_proto::control::Command::SnapshotLoad { name: "tsc".into() },
+        );
+        std::thread::sleep(load_delay);
+        let (before, restored) = timebase();
+        let drift = (restored.wrapping_sub(saved) as i64).unsigned_abs();
+        assert!(
+            drift < tolerance,
+            "load {cycle}: guest TSC drifted {} ms relative to kvmclock",
+            drift / khz
+        );
+        call(&mut client, vmlab_hv_proto::control::Command::Resume);
+        wait();
+        let after = vm.get_clock().unwrap().clock;
+        let mut bytes = [0; 8];
+        m.vm.ram
+            .mem
+            .read_slice(&mut bytes, GuestAddress(0x9000))
+            .unwrap();
+        let observed = u64::from_le_bytes(bytes);
+        // RDTSC executes between these clock samples, even if the host delays
+        // the control reply or deschedules the vCPU before it can run.
+        let observed_clock = observed.wrapping_sub(saved);
+        assert!(
+            observed_clock >= cycles(before).saturating_sub(tolerance)
+                && observed_clock <= cycles(after).saturating_add(tolerance),
+            "load {cycle}: guest RDTSC {observed_clock} is outside kvmclock interval {}..{}",
+            cycles(before),
+            cycles(after)
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn macos_snapshot_preserves_cpuid_msr_log_and_refuses_changed_tsc_frequency() {
+    use vmlab_hv_proto::{
+        client::Client,
+        control::{Command, ErrorCode, Outcome},
+    };
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping macOS snapshot: /dev/kvm unavailable");
+        return;
+    }
+    let _permit = vmlab_hv_tests::process::VmPermit::acquire().unwrap();
+    let m = machine_with_setup(&[0xeb, 0xfe], 8, true, |_, cpu| {
+        cpu.set_cpuid2(&crate::macos::skylake_cpuid(0, 1).unwrap())
+            .unwrap();
+        let desc = serde_json::from_value(serde_json::json!({
+            "name":"macos-snapshot", "arch":"x86_64", "accel":"kvm", "vcpus":1, "memory_mib":16,
+            "boot":{"kind":"kernel","kernel":"unused","cmdline":""},
+            "disks":[],"nics":[],"ports":[],"serial_log":"unused",
+            "cpu_model":"Skylake-Client-v4","invtsc":true,"vmware_cpuid_freq":true,
+            "tsc_khz":cpu.get_tsc_khz().unwrap()
+        }))
+        .unwrap();
+        crate::macos::configure_tsc(cpu, &desc, false).unwrap();
+    })
+    .expect("create snapshot test VM");
+    // CPUID changes must precede the first KVM_RUN. Let the vCPU thread
+    // be scheduled before checking that the fixture stayed paused.
+    std::thread::sleep(SETTLE);
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
+    m.handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(5))
+        .unwrap();
+    let shared = m.handle.shared();
+    shared.ignored_msrs.lock().insert(0x60d);
+    let cpus = shared.vcpus.lock().clone();
+    let frequency = cpus[0].1.lock().get_tsc_khz().unwrap();
+    let initial = cpus[0]
+        .1
+        .lock()
+        .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .unwrap();
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = Client::connect(socket).unwrap();
+    assert!(matches!(
+        client
+            .call(Command::SnapshotSave {
+                name: "cpu-policy".into()
+            })
+            .unwrap(),
+        Outcome::Ok { .. }
+    ));
+    shared.ignored_msrs.lock().insert(0x3f8);
+    let mut changed_cpuid = initial.clone();
+    changed_cpuid
+        .as_mut_slice()
+        .iter_mut()
+        .find(|entry| entry.function == 0x40000010)
+        .unwrap()
+        .eax = 1;
+    cpus[0].1.lock().set_cpuid2(&changed_cpuid).unwrap();
+    cpus[0].1.lock().set_tsc_khz(frequency - 1000).unwrap();
+    m.vm.ram
+        .mem
+        .write_slice(&[42], GuestAddress(0x9000))
+        .unwrap();
+    let outcome = client
+        .call(Command::SnapshotLoad {
+            name: "cpu-policy".into(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Error {
+                code: ErrorCode::SnapshotIncompatible,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let mut byte = [0];
+    m.vm.ram
+        .mem
+        .read_slice(&mut byte, GuestAddress(0x9000))
+        .unwrap();
+    assert_eq!(byte, [42], "frequency rejection changed guest RAM");
+    cpus[0].1.lock().set_tsc_khz(frequency).unwrap();
+    let changed_tsc = kvm_bindings::Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+        index: 0x10,
+        data: 1u64 << 60,
+        ..Default::default()
+    }])
+    .unwrap();
+    assert_eq!(cpus[0].1.lock().set_msrs(&changed_tsc).unwrap(), 1);
+    assert!(matches!(
+        client
+            .call(Command::SnapshotLoad {
+                name: "cpu-policy".into()
+            })
+            .unwrap(),
+        Outcome::Ok { .. }
+    ));
+    assert_eq!(
+        *shared.ignored_msrs.lock(),
+        std::collections::BTreeSet::from([0x60d, 0x3f8])
+    );
+    assert_eq!(cpus[0].1.lock().get_tsc_khz().unwrap(), frequency);
+    let mut observed = kvm_bindings::Msrs::from_entries(changed_tsc.as_slice()).unwrap();
+    assert_eq!(cpus[0].1.lock().get_msrs(&mut observed).unwrap(), 1);
+    assert!(
+        observed.as_slice()[0].data < 1u64 << 59,
+        "snapshot did not roll back the synthetic large TSC jump"
+    );
+    assert_eq!(
+        cpus[0]
+            .1
+            .lock()
+            .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap()
+            .as_slice(),
+        initial.as_slice()
+    );
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_restores_tsc_deadline_after_lapic() {
+    use kvm_bindings::{Msrs, kvm_msr_entry};
+    let Some(m) = machine(&counter_payload(), 8) else {
+        return;
+    };
+    m.handle.pause().unwrap();
+    m.handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(5))
+        .unwrap();
+    let fds = m.handle.shared().vcpus.lock().clone();
+    let fd = fds[0].1.lock();
+    let cpuid = fd.get_cpuid2(256).unwrap();
+    if !cpuid
+        .as_slice()
+        .iter()
+        .any(|entry| entry.function == 1 && entry.ecx & (1 << 24) != 0)
+    {
+        eprintln!("SKIP: KVM does not expose TSC-deadline mode");
+        return;
+    }
+    let mut lapic = fd.get_lapic().unwrap();
+    for (offset, value) in [(0xf0, 0x1ffu32), (0x320, (2 << 17) | 0x40)] {
+        for (byte, value) in lapic.regs[offset..offset + 4]
+            .iter_mut()
+            .zip(value.to_le_bytes())
+        {
+            *byte = value as i8;
+        }
+    }
+    fd.set_lapic(&lapic).unwrap();
+    let deadline = u64::MAX / 2;
+    let msrs = Msrs::from_entries(&[kvm_msr_entry {
+        index: 0x6e0,
+        data: deadline,
+        ..Default::default()
+    }])
+    .unwrap();
+    assert_eq!(fd.set_msrs(&msrs).unwrap(), 1);
+    drop(fd);
+    let socket = m._dir.path().join("control.sock");
+    crate::control::serve(&socket, &m.handle).unwrap();
+    let mut client = vmlab_hv_proto::client::Client::connect(socket).unwrap();
+    for (index, command) in [
+        vmlab_hv_proto::control::Command::SnapshotSave {
+            name: "deadline".into(),
+        },
+        vmlab_hv_proto::control::Command::SnapshotLoad {
+            name: "deadline".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(matches!(
+            client.call(command).unwrap(),
+            vmlab_hv_proto::control::Outcome::Ok { .. }
+        ));
+        if index == 0 {
+            let changed = Msrs::from_entries(&[kvm_msr_entry {
+                index: 0x6e0,
+                data: 0,
+                ..Default::default()
+            }])
+            .unwrap();
+            assert_eq!(fds[0].1.lock().set_msrs(&changed).unwrap(), 1);
+        }
+    }
+    let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+        index: 0x6e0,
+        ..Default::default()
+    }])
+    .unwrap();
+    assert_eq!(fds[0].1.lock().get_msrs(&mut msrs).unwrap(), 1);
+    assert_eq!(
+        msrs.as_slice()[0].data,
+        deadline,
+        "restore disarmed the guest timer"
+    );
+}

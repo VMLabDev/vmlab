@@ -1,0 +1,619 @@
+//! The S1 integration harness (spec, "Testing decisions"): spawn the built
+//! `vmlab-hv` binary with a generated machine description, connect the
+//! control client, and speak the guest protocols — the cinit ctl channel
+//! (`vmlab.ctl.0`) and the vmlab-agent port (`vmlab.agent.0`) — against
+//! vmlab's own wire crates.
+//!
+//! Guest assets: vmlab's pinned container kernel and initramfs from its
+//! checkout, and a squashfs rootfs resolved by [`probe_assets`]. Tests skip
+//! with a printed reason when `/dev/kvm` or a rootfs is unavailable.
+
+pub mod agent;
+pub mod ctl;
+pub mod host_key;
+pub mod process;
+pub mod switch;
+
+use process::ManagedChild;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use vmlab_hv_proto::client::Client;
+use vmlab_hv_proto::control::Command as CtrlCommand;
+use vmlab_hv_proto::machine::{
+    Accel, Arch, Boot, Disk, DiskFormat, MachineDescription, Nic, NicAttachment, SerialPort,
+};
+
+/// The container kernel and initramfs vmlab's guest ships.
+const VMLAB_GUEST_DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../guest/dist/x86_64");
+
+/// Kernel cmdline exactly as the spec's phase 1 section gives it (what vmlab
+/// passes QEMU today): serial console, quiet, panic=reboot, and the two
+/// virtio-blk devices cinit expects.
+pub const CMDLINE: &str = "console=ttyS0 quiet loglevel=3 panic=-1 reboot=t \
+                           vmlab.root=/dev/vda vmlab.scratch=/dev/vdb";
+
+/// Scratch (overlay upper layer) virtual size: vmlab's own container size.
+const SCRATCH_SIZE: u64 = 2 << 30;
+
+/// Guest memory. Generous on purpose: these tests measure boot, not footprint.
+const MEMORY_MIB: u64 = 512;
+
+/// The MAC a one-NIC machine uses (QEMU's locally-administered range).
+pub const TEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+pub fn mac_string(mac: [u8; 6]) -> String {
+    mac.map(|b| format!("{b:02x}")).join(":")
+}
+
+// ---- assets -----------------------------------------------------------------
+
+/// The guest assets a test needs, plus why they may be missing.
+#[derive(Debug)]
+pub struct Assets {
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
+    pub rootfs: Option<PathBuf>,
+    pub kvm: bool,
+}
+
+impl Assets {
+    /// `None` when the tests can run; otherwise the reason to skip with.
+    pub fn skip_reason(&self) -> Option<String> {
+        if !self.kvm {
+            return Some("/dev/kvm is not present".to_string());
+        }
+        if !self.kernel.is_file() {
+            return Some(format!(
+                "container kernel {} is not present (vmlab checkout?)",
+                self.kernel.display()
+            ));
+        }
+        if self.rootfs.is_none() {
+            return Some(
+                "no rootfs: set VMLAB_HV_TEST_ROOTFS, run `just s1-rootfs-build`, or pull an \
+                 image with vmlab"
+                    .to_string(),
+            );
+        }
+        None
+    }
+}
+
+/// Resolve every asset the S1 tests need.
+///
+/// Rootfs order (the work package's contract): the `VMLAB_HV_TEST_ROOTFS`
+/// env var; then the reproducible Alpine image the just recipe caches under
+/// the workspace target dir; then any `rootfs.sqfs` vmlab has pulled under
+/// `~/.local/share/vmlab/oci/images/`.
+pub fn probe_assets() -> Assets {
+    let dist = Path::new(VMLAB_GUEST_DIST);
+    let rootfs = rootfs_from_env()
+        .or_else(rootfs_from_target)
+        .or_else(rootfs_from_vmlab_store);
+    Assets {
+        kernel: dist.join("vmlinuz"),
+        initrd: dist.join("initramfs.img"),
+        rootfs,
+        kvm: Path::new("/dev/kvm").exists(),
+    }
+}
+
+fn rootfs_from_env() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var("VMLAB_HV_TEST_ROOTFS").ok()?);
+    if path.is_file() {
+        Some(path)
+    } else {
+        panic!("VMLAB_HV_TEST_ROOTFS={path:?} does not exist");
+    }
+}
+
+fn rootfs_from_target() -> Option<PathBuf> {
+    [
+        target_dir().join("s1/rootfs.sqfs"),
+        workspace_root().join("hv/target/s1/rootfs.sqfs"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+fn rootfs_from_vmlab_store() -> Option<PathBuf> {
+    let images = home_dir()?.join(".local/share/vmlab/oci/images/sha256");
+    let mut found: Vec<PathBuf> = std::fs::read_dir(images)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("rootfs.sqfs").is_file())
+        .map(|e| e.path().join("rootfs.sqfs"))
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The workspace target dir (honours `CARGO_TARGET_DIR`).
+pub fn target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"))
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
+/// Use an explicit binary override, or ask Cargo for a current debug build
+/// once per test process. An existing executable may predate a merge.
+pub fn hv_binary() -> PathBuf {
+    hv_binary_with(&[])
+}
+
+/// [`hv_binary`] with cargo features enabled on the binary (for example
+/// `testing`, which compiles the recording host seam A3 observes). The
+/// built executable is copied once to a per-feature-set path: tests asking
+/// for different feature sets must not hand each other a binary built with
+/// the wrong ones.
+pub fn hv_binary_with(features: &[&str]) -> PathBuf {
+    if features.is_empty()
+        && let Some(path) = std::env::var_os("VMLAB_HV_BIN")
+    {
+        let path = PathBuf::from(path);
+        assert!(path.is_file(), "VMLAB_HV_BIN={path:?} does not exist");
+        return path;
+    }
+    static BINARIES: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, PathBuf>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let key = features.join("+");
+    let mut binaries = BINARIES.lock();
+    if let Some(path) = binaries.get(&key) {
+        return path.clone();
+    }
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut command = Command::new(&cargo);
+    command
+        .args(["build", "-p", "vmlab-hv"])
+        .current_dir(workspace_root());
+    if !features.is_empty() {
+        command.arg("--features").arg(&key);
+    }
+    // Holding the cache lock across the build also serialises the copy:
+    // two tests racing would hand each other a half-written binary.
+    let status = command.status().expect("spawn cargo to build vmlab-hv");
+    assert!(status.success(), "cargo build -p vmlab-hv ({key}) failed");
+    let debug = target_dir().join("debug/vmlab-hv");
+    assert!(debug.is_file(), "cargo did not produce {}", debug.display());
+    let snapshot = target_dir().join(format!(
+        "debug/vmlab-hv-test-{}",
+        if key.is_empty() {
+            "plain".into()
+        } else {
+            key.clone()
+        }
+    ));
+    let staging = snapshot.with_extension("staging");
+    std::fs::copy(&debug, &staging)
+        .unwrap_or_else(|e| panic!("copying {debug:?} to {staging:?}: {e}"));
+    std::fs::rename(&staging, &snapshot)
+        .unwrap_or_else(|e| panic!("publishing {staging:?} as {snapshot:?}: {e}"));
+    binaries.insert(key, snapshot.clone());
+    snapshot
+}
+
+// ---- the machine ------------------------------------------------------------
+
+/// What kind of container a test boots.
+#[derive(Debug, Clone)]
+pub enum Mode {
+    /// Exec-driven idle mode: cinit prepares rootfs and networking, emits
+    /// `idle`, and never starts a workload process.
+    Idle,
+    /// Workload mode: `cmd` runs as the container process; cinit powers the
+    /// machine off once it exits.
+    Workload { cmd: Vec<String>, expect_code: i32 },
+}
+
+/// A machine to launch.
+#[derive(Debug, Clone)]
+pub struct MachineSpec {
+    pub name: String,
+    pub mode: Mode,
+    /// NIC count (each attached to a switch socket the test hosts).
+    pub nics: u32,
+    /// Offload framing and maximum queue pairs; absent keeps raw framing.
+    pub vnet_pairs: Option<u16>,
+    /// Wait for TAP descriptors over the control socket instead of a stream.
+    pub tap: bool,
+    /// Disable offloads for a raw kernel fabric such as AF_XDP.
+    pub tap_raw: bool,
+    pub memory_mib: u64,
+    pub vcpus: u32,
+    pub paused: bool,
+    pub rtc_base: Option<String>,
+    pub extra_ports: Vec<String>,
+}
+
+impl MachineSpec {
+    pub fn idle(name: &str) -> Self {
+        MachineSpec {
+            name: name.to_string(),
+            mode: Mode::Idle,
+            nics: 0,
+            vnet_pairs: None,
+            tap: false,
+            tap_raw: false,
+            memory_mib: MEMORY_MIB,
+            vcpus: 1,
+            paused: false,
+            rtc_base: None,
+            extra_ports: Vec::new(),
+        }
+    }
+
+    pub fn workload(name: &str, cmd: Vec<String>, expect_code: i32) -> Self {
+        MachineSpec {
+            mode: Mode::Workload { cmd, expect_code },
+            ..MachineSpec::idle(name)
+        }
+    }
+
+    pub fn with_nics(mut self, nics: u32) -> Self {
+        self.nics = nics;
+        self
+    }
+
+    pub fn with_vnet_pairs(mut self, pairs: u16) -> Self {
+        assert!((1..=31).contains(&pairs), "vnet needs 1..31 queue pairs");
+        self.nics = 1;
+        self.vnet_pairs = Some(pairs);
+        self
+    }
+
+    /// The spec cinit receives, matching the mode.
+    pub fn container_spec(&self) -> vmlab_cinit_proto::ContainerSpec {
+        let (mode, cmd) = match &self.mode {
+            Mode::Idle => (vmlab_cinit_proto::RuntimeMode::Idle, Vec::new()),
+            Mode::Workload { cmd, .. } => (vmlab_cinit_proto::RuntimeMode::Workload, cmd.clone()),
+        };
+        vmlab_cinit_proto::ContainerSpec {
+            hostname: self.name.clone(),
+            mode,
+            entrypoint: Vec::new(),
+            cmd,
+            env: Vec::new(),
+            workdir: None,
+            user: None,
+            stop_signal: None,
+            stop_grace_secs: 1,
+            volumes: Vec::new(),
+            smb: None,
+            nics: self.nics,
+            healthcheck: None,
+        }
+    }
+}
+
+/// A launched machine: the process, the control client and the paths its
+/// sockets live at. Dropping it stops the process and removes the directory.
+pub struct Guest {
+    dir: Option<tempfile::TempDir>,
+    pub child: ManagedChild,
+    pub control: Client,
+    pub ctl_sock: PathBuf,
+    pub agent_sock: PathBuf,
+    pub switch_sock: Option<PathBuf>,
+    pub switch: Option<switch::MiniSwitch>,
+    pub hv_log: PathBuf,
+    pub serial_log: PathBuf,
+    /// When the process was spawned — the boot-clock zero.
+    pub launched: Instant,
+}
+
+impl std::fmt::Debug for Guest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guest")
+            .field("dir", &self.dir)
+            .field("hv_log", &self.hv_log)
+            .field("serial_log", &self.serial_log)
+            .finish()
+    }
+}
+
+impl Guest {
+    pub fn dir(&self) -> &Path {
+        self.dir.as_ref().expect("dir is only taken on drop").path()
+    }
+
+    /// The serial log so far, for failure messages.
+    pub fn serial_text(&self) -> String {
+        std::fs::read_to_string(&self.serial_log).unwrap_or_default()
+    }
+
+    /// The hypervisor's own stderr, for failure messages.
+    pub fn hv_log_text(&self) -> String {
+        std::fs::read_to_string(&self.hv_log).unwrap_or_default()
+    }
+
+    /// Everything the tests need when a guest did not behave: both logs.
+    pub fn diagnostics(&self, what: &str) -> String {
+        format!(
+            "--- {what} ---\n== serial ==\n{}\n== vmlab-hv ==\n{}",
+            self.serial_text(),
+            self.hv_log_text()
+        )
+    }
+
+    /// Wait for the process to exit; kill it at the deadline.
+    pub fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait().expect("try_wait vmlab-hv") {
+                Some(status) => return status,
+                None if Instant::now() > deadline => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!(
+                        "vmlab-hv did not exit within {timeout:?}: {}",
+                        self.diagnostics("timeout")
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// Stop the machine with `quit` and require exit 0.
+    pub fn quit_and_exit_zero(&mut self) {
+        let outcome = self.control.call(CtrlCommand::Quit).expect("quit command");
+        assert!(
+            matches!(outcome, vmlab_hv_proto::control::Outcome::Ok { .. }),
+            "quit must be accepted: {outcome:?}"
+        );
+        let status = self.wait_exit(Duration::from_secs(30));
+        assert!(status.success(), "quit must exit 0: {status}");
+    }
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        drop(self.dir.take());
+    }
+}
+
+/// Launch one machine against a rootfs. Binds the switch socket first (the
+/// NIC connects while the machine is built), writes the scratch qcow2 with
+/// `vmlab-disk`, spawns the hypervisor, and connects the control client.
+pub fn launch(spec: &MachineSpec, assets: &Assets) -> Guest {
+    let launched = Instant::now();
+    let temp = temp_dir(&spec.name);
+    let dir = temp.path();
+
+    let scratch = dir.join("scratch.qcow2");
+    vmlab_disk::ops::create_qcow2(&scratch, SCRATCH_SIZE, None, None)
+        .expect("create scratch qcow2");
+    let rootfs = assets.rootfs.clone().expect("caller checked rootfs");
+
+    let (switch_sock, mini) = if spec.nics > 0 && !spec.tap {
+        let sock = dir.join("switch.sock");
+        let mini = if spec.vnet_pairs.is_some() {
+            switch::MiniSwitch::bind_vnet(&sock)
+        } else {
+            switch::MiniSwitch::bind(&sock)
+        }
+        .expect("bind test switch");
+        (Some(sock), Some(mini))
+    } else {
+        (None, None)
+    };
+
+    let mut desc = MachineDescription {
+        virtual_display: None,
+        fw_cfg: vec![],
+        exit_on_reset: false,
+        vfio: vec![],
+        machine: Default::default(),
+        cpu: Default::default(),
+        cpu_model: None,
+        invtsc: false,
+        tsc_khz: None,
+        vmware_cpuid_freq: false,
+        msr_policy: Default::default(),
+        applesmc: None,
+        usb_keyboard: false,
+        smbios_type2: false,
+        floppy: None,
+        serial_log_port: Default::default(),
+        hyperv: vec![],
+        display: None,
+        tablet: None,
+        usb: None,
+        tpm: None,
+        console_pci: None,
+        ahci_pci: None,
+        name: spec.name.clone(),
+        arch: Arch::X86_64,
+        accel: Accel::Kvm,
+        vcpus: spec.vcpus,
+        memory_mib: spec.memory_mib,
+        boot: Boot::Kernel {
+            kernel: assets.kernel.clone(),
+            initrd: Some(assets.initrd.clone()),
+            cmdline: CMDLINE.to_string(),
+        },
+        disks: vec![
+            Disk {
+                channel: None,
+                unit: None,
+                pci: None,
+                bus: Default::default(),
+                port: None,
+                cdrom: false,
+                id: "rootfs".to_string(),
+                path: Some(rootfs),
+                format: DiskFormat::Raw,
+                read_only: true,
+                vmstate: false,
+            },
+            Disk {
+                channel: None,
+                unit: None,
+                pci: None,
+                bus: Default::default(),
+                port: None,
+                cdrom: false,
+                id: "scratch".to_string(),
+                path: Some(scratch),
+                format: DiskFormat::Qcow2,
+                read_only: false,
+                vmstate: true,
+            },
+        ],
+        nics: if spec.nics > 0 {
+            vec![Nic {
+                model: Default::default(),
+                rom: None,
+                pci: None,
+                mac: mac_string(TEST_MAC),
+                mtu: None,
+                attachment: match spec.vnet_pairs {
+                    Some(queue_pairs) if spec.tap_raw => NicAttachment::TapRaw { queue_pairs },
+                    Some(queue_pairs) if spec.tap => NicAttachment::Tap { queue_pairs },
+                    Some(queue_pairs) => NicAttachment::StreamVnet {
+                        socket: switch_sock.clone().expect("bound above"),
+                        queue_pairs,
+                    },
+                    None => NicAttachment::Stream {
+                        socket: switch_sock.clone().expect("bound above"),
+                    },
+                },
+            }]
+        } else {
+            Vec::new()
+        },
+        serial_log: dir.join("serial.log"),
+        ports: vec![
+            SerialPort {
+                transport: Default::default(),
+                name: "vmlab.ctl.0".to_string(),
+                socket: dir.join("ctl.sock"),
+            },
+            SerialPort {
+                transport: Default::default(),
+                name: "vmlab.agent.0".to_string(),
+                socket: dir.join("agent.sock"),
+            },
+        ],
+        shares: Vec::new(),
+        audio: None,
+        rtc_base: spec.rtc_base.clone(),
+    };
+    for (index, name) in spec.extra_ports.iter().enumerate() {
+        desc.ports.push(SerialPort {
+            transport: Default::default(),
+            name: name.clone(),
+            socket: dir.join(format!("extra-{index}.sock")),
+        });
+    }
+    let machine_path = dir.join("machine.json");
+    std::fs::write(
+        &machine_path,
+        serde_json::to_vec_pretty(&desc).expect("serialize machine"),
+    )
+    .expect("write machine.json");
+
+    let hv_log_path = dir.join("hv.log");
+    let hv_log = std::fs::File::create(&hv_log_path).expect("create hv log");
+    let control_path = dir.join("control.sock");
+    let mut child = ManagedChild::spawn(
+        Command::new(hv_binary())
+            .arg("--machine")
+            .arg(&machine_path)
+            .arg("--control")
+            .arg(&control_path)
+            .args(spec.paused.then_some("--paused"))
+            .stdout(Stdio::from(hv_log.try_clone().expect("clone hv log")))
+            .stderr(Stdio::from(hv_log)),
+    )
+    .expect("spawn vmlab-hv");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let control = loop {
+        match Client::connect(&control_path) {
+            Ok(client) => break client,
+            Err(e) if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "vmlab-hv never served {}: {e}\n== vmlab-hv ==\n{}",
+                    control_path.display(),
+                    std::fs::read_to_string(&hv_log_path).unwrap_or_default()
+                );
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    Guest {
+        dir: Some(temp),
+        child,
+        control,
+        ctl_sock: machine_path.parent().unwrap().join("ctl.sock"),
+        agent_sock: machine_path.parent().unwrap().join("agent.sock"),
+        switch_sock,
+        switch: mini,
+        hv_log: hv_log_path,
+        serial_log: desc.serial_log,
+        launched,
+    }
+}
+
+fn temp_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("hv-s1-{name}-"))
+        .tempdir()
+        .expect("create test dir")
+}
+
+pub(crate) fn connect_with_retry(
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(e) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+                let _ = e;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn guest_assets_belong_to_the_shared_workspace() {
+        let root = workspace_root().canonicalize().unwrap();
+        assert!(root.join("Cargo.toml").is_file());
+        assert!(root.join("hv/crates/vmlab-hv/Cargo.toml").is_file());
+        assert!(root.join("guest/cinit/Cargo.toml").is_file());
+        let guest = Path::new(VMLAB_GUEST_DIST)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert_eq!(
+            guest.canonicalize().unwrap(),
+            root.join("guest").canonicalize().unwrap()
+        );
+    }
+}

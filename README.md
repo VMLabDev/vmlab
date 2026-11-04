@@ -1,5 +1,8 @@
 # vmlab
 
+`hv/` contains the hypervisor crates in the root Cargo workspace. Protocol
+crates are path dependencies, so a protocol change builds both sides together.
+`just ci::hv-package` builds the hypervisor and viewer bundle from this checkout.
 A single-host virtual machine lab orchestrator. Define **labs** — named
 groups of VMs, containers and virtual networks — declaratively in [WCL][wcl],
 build and manage reusable **templates**, and drive automation through
@@ -229,7 +232,9 @@ Ubuntu 24.04).
 `just ci::check` is self-sufficient from a clean checkout and reports a missing
 tool as a missing tool. It covers clippy, `cargo fmt --check`, the test suite,
 the standalone guest crates, and the committed BPF objects — the last of which
-needs a one-time `just ebpf-tools`.
+needs a one-time `just ebpf-tools`. It also checks hypervisor formatting,
+clippy and tests with KVM and host-asset acceptance tests marked ignored.
+The guest-booting `just ci::hv-gate` runs locally once per orchestrator batch.
 
 Runtime tools expected on the host: `qemu-system-<arch>`, `qemu-img`, `swtpm`,
 `tesseract` (OCR), an ISO tool (`xorriso`/`genisoimage`), `mtools` +

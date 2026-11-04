@@ -1,0 +1,52 @@
+[package]
+name = "vmlab-hv-devices"
+description = "Device models for vmlab-hv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+pipewire = { version = "=0.10.1", optional = true, features = ["v0_3_50"] }
+libpulse-binding = { version = "2.30.1", optional = true }
+arc-swap = "1"
+bitflags = "2"
+libc = "0.2"
+log = "0.4"
+parking_lot = "0.12"
+zerocopy.workspace = true
+vhost = { version = "0.18.0", features = ["vhost-user-frontend", "vhost-net"] }
+virtio-queue = "0.18"
+vm-memory.workspace = true
+vm-superio = "0.8"
+vmm-sys-util = "0.15"
+vmlab-disk.workspace = true
+vmlab-hv-proto.workspace = true
+rutabaga_gfx = { version = "=0.1.80", features = ["virgl_renderer"] }
+# rutabaga 0.1.80 requires the MesaMapping API removed by magma-gpu 0.1.85.
+magma-gpu = "=0.1.80"
+glow = "0.16"
+ash = "0.38"
+vmlab-hv-display = { path = "../vmlab-hv-display" }
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+pipewire = ["dep:pipewire"]
+pulse = ["dep:libpulse-binding"]
+testing = []
+
+[[example]]
+name = "monitor_tap"
+required-features = ["pipewire"]

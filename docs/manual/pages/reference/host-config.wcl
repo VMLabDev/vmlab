@@ -128,7 +128,7 @@ SRC
     An explicit `--tcp` uses VNC on either hypervisor. The native viewer
     handles socket readiness, reconnection, and shared-memory selection
     under WSLg itself. If it is missing, install `vmlab-hv-viewer` from
-    `VMLabDev/vmlab-hypervisor` beside `vmlab-hv`, on `PATH`, or at this
+    the vmlab-hv release bundle built from `hv/` beside `vmlab-hv`, on `PATH`, or at this
     override. See [vmlab console](cmd_console) for VNC fallback behavior.
   DOC
   p <<DOC

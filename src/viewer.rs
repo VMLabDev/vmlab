@@ -68,7 +68,7 @@ pub enum ConsoleViewer {
 }
 
 const NATIVE_VIEWER_MISSING: &str = "vmlab-hv-viewer not found; install it from \
-    VMLabDev/vmlab-hypervisor beside vmlab-hv or on PATH, or set host.vmlab_hv_viewer; using VNC";
+    the vmlab-hv release bundle beside vmlab-hv or on PATH, or set host.vmlab_hv_viewer; using VNC";
 
 /// Select a machine's viewer. `tcp` explicitly requests the VNC bridge.
 pub fn detect_for(hypervisor: HypervisorKind, tcp: bool) -> ConsoleViewer {

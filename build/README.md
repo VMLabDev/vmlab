@@ -42,7 +42,7 @@ to the one in `Cargo.toml`.
 | --- | --- |
 | `vmlab-<version>-linux-x86_64` | `cargo build --release --bin vmlab`, named as CI names the release asset |
 | `vmlab-guest-<version>.tar.gz` and `.sha256` | `just guest-package`, which fails if any target is missing |
-| `vmlab-hv-<version>-linux-x86_64.tar.gz` and `.sha256` | `just ci::hv-package`, using the hypervisor commit pinned by `vmlab-hv-proto` in `Cargo.lock` |
+| `vmlab-hv-<version>-linux-x86_64.tar.gz` and `.sha256` | `just ci::hv-package`, using the in-tree `hv/` crates and root `Cargo.lock` |
 | `bpf/fastpath_sockmap.bpf.o`, `bpf/xdp_switch.bpf.o` | `just ebpf-build` |
 
 The run leaves tracked files as it found them. If you pass a version other than

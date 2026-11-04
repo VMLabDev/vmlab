@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 #
 # The end-to-end test image: vmlab, its container guest asset and the Linux
-# agent built from this checkout, and vmlab-hv at the revision Cargo.lock pins
-# its protocol crate to, beside every host tool vmlab drives. Run it
+# agent and vmlab-hv built from this checkout, beside every host tool
+# vmlab drives. Run it
 # privileged with /dev/kvm passed through (`just e2e::run`).
 
 ARG VMLAB_BUILD_IMAGE=vmlab-build
@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
     # The target caches are shared by every checkout's image build, and cargo
     # judges freshness by mtime: stamp this checkout's sources as newest so a
     # build never ships another checkout's binary.
-    find src guest -type f -exec touch {} +; \
+    find src guest hv -type f -exec touch {} +; \
     cargo build --release --locked --bin vmlab; \
     install -D target/release/vmlab /out/vmlab; \
     VMLAB_SKIP_FIRMWARE=1 ./guest/build-asset.sh x86_64; \
@@ -67,20 +67,14 @@ RUN set -eux; \
       --buildtype=release -Dvenus=true -Dtests=false; \
     ninja -C /tmp/virgl-build install; \
     rm -rf /tmp/virgl.tar.gz /tmp/virglrenderer-1.3.0 /tmp/virgl-build
-# vmlab-hv (PRD §22) from the commit vmlab-hv-proto is locked to, so the
-# binary speaks exactly the protocol this vmlab was built against.
+# vmlab-hv (PRD §22) shares this checkout's workspace and protocol.
 RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
-    --mount=type=cache,target=/hv/target \
+    --mount=type=cache,target=/src/target \
     set -eux; \
     export PKG_CONFIG_PATH=/opt/virgl/lib/pkgconfig \
       RUSTFLAGS="-C link-arg=-Wl,-rpath,/opt/virgl/lib"; \
-    rev=$(python3 build/hv.py revision); \
-    test -n "$rev"; \
-    [ -d /hv/.git ] || git init -q /hv; \
-    git -C /hv fetch -q --depth 1 https://github.com/VMLabDev/vmlab-hypervisor.git "$rev"; \
-    git -C /hv checkout -q --force FETCH_HEAD; \
-    cargo build --release --locked --no-default-features --manifest-path /hv/Cargo.toml --bin vmlab-hv; \
-    install -D /hv/target/release/vmlab-hv /out/vmlab-hv
+    cargo build --release --locked --no-default-features -p vmlab-hv; \
+    install -D target/release/vmlab-hv /out/vmlab-hv
 
 FROM registry:2 AS registry
 

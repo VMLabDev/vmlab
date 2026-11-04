@@ -31,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test
+check: lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test
 
 # Run clippy with warnings as errors
 [group('ci')]
@@ -90,6 +90,11 @@ ebpf-verify: ebpf-build
 hv-native-deps-install: require-uv
 	uv run --no-project python build/hv.py native-deps-install
 
+# Install the imported hypervisor test dependencies on Ubuntu
+[group('ci')]
+hv-test-native-deps-install: require-uv
+	uv run --no-project python build/hv.py test-native-deps-install
+
 # Test the viewer's release payload and per-user icon installer
 [group('ci')]
 hv-desktop-test: require-uv
@@ -103,9 +108,36 @@ hv-cache-key: require-uv
 # Build virglrenderer with Venus and its render server outside target/
 [group('ci')]
 hv-virgl-build: require-uv
-	uv run --no-project python build/hv.py virgl-build
+	uv run --no-project --with meson --with PyYAML python build/hv.py virgl-build
 
-# Build and check the lockfile-pinned hypervisor release bundle in target/dist/
+# Build and check the in-tree hypervisor release bundle in target/dist/
 [group('ci')]
 hv-package version='': require-cargo hv-virgl-build
 	uv run --no-project python build/hv.py package {{quote(version)}}
+
+# Check hypervisor formatting with the root toolchain
+[group('ci')]
+hv-fmt-check: require-cargo
+	cargo fmt --all --check
+
+# Lint every hypervisor crate without enabling guest-boot tests
+[group('ci')]
+hv-lint: require-cargo hv-virgl-build
+	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" cargo clippy --workspace --exclude vmlab --all-targets -- -D warnings
+
+# Run hypervisor tests, ignoring KVM guests and host-asset acceptance cases
+[group('ci')]
+hv-test: require-cargo hv-virgl-build hv-ipxe-build
+	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
+
+# Build the hypervisor's pinned iPXE option ROMs for non-guest tests
+[group('ci')]
+hv-ipxe-build: require-uv
+	uv run --no-project python hv/firmware/ipxe/build.py
+
+# Run the guest-booting hypervisor gate locally, once per orchestrator batch
+[group('ci')]
+hv-gate: require-cargo hv-virgl-build hv-ipxe-build
+	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
+
+hv_virgl_key := `python3 build/hv.py cache-key | cut -d= -f2`

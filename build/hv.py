@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the lockfile-pinned hypervisor and its relocatable release bundle."""
+"""Build the in-tree hypervisor and its relocatable release bundle."""
 
 import argparse
 import gzip
@@ -14,7 +14,7 @@ import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
-REPOSITORY = "https://github.com/VMLabDev/vmlab-hypervisor.git"
+REPOSITORY = "https://github.com/VMLabDev/vmlab.git"
 VIRGL_VERSION = "1.3.0"
 VIRGL_SHA256 = "065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3"
 CACHE_KEY = f"virglrenderer-{VIRGL_VERSION}-{VIRGL_SHA256}"
@@ -27,13 +27,8 @@ def run(*args, **kwargs):
 
 
 def revision():
-    # As in e2e/Dockerfile: use Cargo.lock's resolved commit, not the rev query.
-    lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
-    source = next(p["source"] for p in lock["package"] if p["name"] == "vmlab-hv-proto")
-    repository, commit = source.removeprefix("git+").split("#")
-    if repository.split("?")[0] != REPOSITORY or not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise ValueError(f"unexpected vmlab-hv-proto source: {source}")
-    return commit
+    return subprocess.check_output(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
 
 
 def native_deps_install():
@@ -48,6 +43,29 @@ def native_deps_install():
         "liblzma-dev", "libwayland-dev", "libxkbcommon-dev", "libxkbcommon-x11-0",
         "libx11-6", "libxcursor1", "libxrandr2", "libxi6", "libxfixes3",
         "libxtst6", "patchelf", "binutils")
+
+
+def test_native_deps_install():
+    # Keep the imported test dependency list separate until D12's follow-up.
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    run(*prefix, "apt-get", "update")
+    run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
+        "build-essential", "gcc-multilib", "liblzma-dev", "curl", "pkg-config",
+        "meson", "ninja-build", "python3-yaml", "libepoxy-dev", "libdrm-dev",
+        "libgbm-dev", "libegl-dev", "libvulkan-dev", "glslang-tools",
+        "libpipewire-0.3-dev", "libpulse-dev", "clang", "libclang-dev",
+        "qemu-utils", "nasm", "acpica-tools", "imagemagick", "cpio", "xvfb",
+        "libvulkan1", "mesa-vulkan-drivers", "seabios", "xorriso", "edid-decode",
+        "pipewire-bin", "libxkbcommon-x11-0", "libxkbcommon0",
+        "libwayland-client0", "libx11-6", "libxcursor1", "libxrandr2",
+        "libxi6", "libxfixes3", "libxtst6")
+    run(*prefix, "install", "-d", "/usr/share/qemu")
+    for name in ("vgabios-stdvga.bin", "vgabios-virtio.bin"):
+        target = Path("/usr/share/qemu") / name
+        if not target.exists():
+            run(*prefix, "ln", "-s", Path("/usr/share/seabios") / name, target)
+    if not shutil.which("magick"):
+        run(*prefix, "ln", "-s", "/usr/bin/convert", "/usr/local/bin/magick")
 
 
 def virgl_build():
@@ -75,19 +93,6 @@ def virgl_build():
         shutil.copy2(source / "COPYING", VIRGL / "COPYING")
         (VIRGL / ".complete").touch()
 
-
-def source_checkout(commit):
-    source = CACHE / "hv-source" / commit
-    if not (source / ".git").is_dir():
-        source.mkdir(parents=True, exist_ok=True)
-        run("git", "init", "-q", source)
-        run("git", "-C", source, "fetch", "-q", "--depth", "1", REPOSITORY, commit)
-        run("git", "-C", source, "checkout", "-q", "--detach", "FETCH_HEAD")
-    actual = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-    if actual != commit:
-        raise RuntimeError(f"cached hypervisor checkout is {actual}, expected {commit}")
-    run("git", "-C", source, "diff", "--exit-code", "HEAD")
-    return source
 
 
 def check_elf(path, rpath):
@@ -137,13 +142,12 @@ def package(version):
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", version):
         raise ValueError(f"invalid release version: {version}")
     commit = revision()
-    source = source_checkout(commit)
     target = ROOT / "target/hv"
     env = os.environ.copy()
     env["PKG_CONFIG_PATH"] = f"{VIRGL}/lib/pkgconfig"
     env["CARGO_TARGET_DIR"] = str(target)
-    run("cargo", "build", "--release", "--locked", "--bin", "vmlab-hv",
-        "--bin", "vmlab-hv-viewer", cwd=source, env=env)
+    run("cargo", "build", "--release", "--locked", "-p", "vmlab-hv", "-p", "vmlab-hv-viewer", "--bin", "vmlab-hv",
+        "--bin", "vmlab-hv-viewer", cwd=ROOT, env=env)
     out = ROOT / "target/dist"
     out.mkdir(parents=True, exist_ok=True)
     name = f"vmlab-hv-{version}-linux-x86_64"
@@ -167,9 +171,10 @@ exec "$root/libexec/vmlab-hv" "$@"
         launcher.chmod(0o755)
         shutil.copy2(VIRGL / "COPYING", stage / "licenses/virglrenderer-COPYING")
         for notice in ("LICENSE", "LICENSE.crosvm", "THIRD_PARTY_NOTICES"):
-            shutil.copy2(source / notice, stage / "licenses" / notice)
+            origin = ROOT / notice if notice != "LICENSE.crosvm" else ROOT / "hv" / notice
+            shutil.copy2(origin, stage / "licenses" / notice)
         (stage / "README").write_text(f'''vmlab-hv {version} (Linux x86_64)
-Hypervisor commit: {commit}
+vmlab commit: {commit}
 Source: {REPOSITORY}
 virglrenderer: {VIRGL_VERSION}
 Source SHA256: {VIRGL_SHA256}
@@ -232,12 +237,12 @@ No host PCI or USB device is required except explicitly configured passthrough.
                 tar.add(stage, arcname=name, filter=normalize)
         checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
         archive.with_suffix(".gz.sha256").write_text(f"{checksum}  {archive.name}\n")
-        print(f"Built {archive}\nHypervisor commit: {commit}\nSHA256: {checksum}")
+        print(f"Built {archive}\nvmlab commit: {commit}\nSHA256: {checksum}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("revision", "cache-key", "native-deps-install", "virgl-build", "package"))
+    parser.add_argument("command", choices=("revision", "cache-key", "native-deps-install", "test-native-deps-install", "virgl-build", "package"))
     parser.add_argument("version", nargs="?", default="")
     args = parser.parse_args()
     if args.command == "revision":
@@ -246,6 +251,8 @@ def main():
         print(f"key={CACHE_KEY}")
     elif args.command == "native-deps-install":
         native_deps_install()
+    elif args.command == "test-native-deps-install":
+        test_native_deps_install()
     elif args.command == "virgl-build":
         virgl_build()
     else:

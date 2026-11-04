@@ -1,0 +1,125 @@
+"""Render a virgl clear and install its scanout through the public DRM UAPI."""
+
+import array
+import ctypes as c
+import fcntl
+import glob
+import json
+from pathlib import Path
+import os
+import select
+import struct
+import time
+import sys
+
+
+fd = os.open(sorted(glob.glob('/dev/dri/card*'))[0], os.O_RDWR)
+width, height = 1024, 768
+
+
+def ioctl(number, data):
+    fcntl.ioctl(fd, 0xc0006400 | (len(data) << 16) | number, data, True)
+    return data
+
+
+# DRM_VIRTGPU_RESOURCE_CREATE creates a 3D render target and its context.
+pitch = width * 4
+bind = 2 | (1 << 22) if sys.argv[1:] == ['implicit'] else 2 | (1 << 18)
+def target(surface):
+    created = ioctl(0x44, bytearray(struct.pack('14I', 2, 2, bind,
+                    width, height, 1, 1, 0, 0, 1, 0, 0, pitch * height, pitch)))
+    handle, resource = struct.unpack_from('II', created, 40)
+    assert handle and resource
+    # Virgl protocol: CREATE_OBJECT(SURFACE), SET_FRAMEBUFFER_STATE, CLEAR.
+    commands = array.array('I', [
+        (5 << 16) | (8 << 8) | 1, surface, resource, 2, 0, 0,
+        (3 << 16) | 5, 1, 0, surface,
+        (8 << 16) | 7, 4,
+        *struct.unpack('4I', struct.pack('4f', .7, .2, .1, 1.)), 0, 0, 0,
+    ])
+    handles = array.array('I', [handle])
+    execution = bytearray(64)
+    struct.pack_into('IIQQIi', execution, 0, 2, len(commands) * 4,
+                     commands.buffer_info()[0], handles.buffer_info()[0], 1, -1)
+    ioctl(0x42, execution)
+    fence = struct.unpack_from('i', execution, 28)[0]
+    assert fence >= 0
+    poll = select.poll()
+    poll.register(fence, select.POLLIN)
+    assert poll.poll(10000), 'virgl clear fence timed out'
+    os.close(fence)
+    return handle, resource
+
+
+handle, resource = target(1)
+handles = array.array('I', [handle])
+renderer = 'virgl DRM 3D color-buffer clear'
+
+resources = ioctl(0xa0, bytearray(64))
+ids = [array.array('I', [0] * count) for count in struct.unpack_from('4I', resources, 32)]
+struct.pack_into('4Q', resources, 0, *(values.buffer_info()[0] for values in ids))
+ioctl(0xa0, resources)
+crtc, connector = ids[1][0], ids[2][0]
+selected = None
+for _ in range(100):
+    info = bytearray(80)
+    struct.pack_into('I', info, 48, connector)
+    ioctl(0xa7, info)
+    count = struct.unpack_from('I', info, 32)[0]
+    modes = bytearray(count * 68)
+    if count:
+        struct.pack_into('II', info, 36, 0, 0)
+        struct.pack_into('Q', info, 8, c.addressof(c.c_char.from_buffer(modes)))
+        ioctl(0xa7, info)
+        for offset in range(0, len(modes), 68):
+            mode = modes[offset:offset + 68]
+            if struct.unpack_from('H', mode, 4)[0] == width and struct.unpack_from('H', mode, 14)[0] == height:
+                selected = mode
+                break
+    if selected:
+        break
+    time.sleep(.05)
+assert selected, 'preferred size is absent from DRM connector modes'
+fb = ioctl(0xae, bytearray(struct.pack('7I', 0, width, height, pitch, 32, 24, handle)))
+fb_id = struct.unpack_from('I', fb)[0]
+connectors = array.array('I', [connector])
+mode = bytearray(struct.pack('Q7I', connectors.buffer_info()[0], 1, crtc, fb_id, 0, 0, 0, 1)) + selected
+ioctl(0xa2, mode)
+Path('/run/gpu-scanout.json').write_text(json.dumps({'renderer': renderer, 'width': width, 'height': height}))
+request_path = Path('/run/gpu-request.json')
+last_request = None
+flip_buffers = [fb_id]
+deadline = time.monotonic() + 180
+while time.monotonic() < deadline:
+    if not request_path.exists():
+        time.sleep(.002)
+        continue
+    request = json.loads(request_path.read_text())
+    if request['id'] == last_request:
+        time.sleep(.002)
+        continue
+    last_request = request['id']
+    if 'flip' in request:
+        if len(flip_buffers) == 1:
+            second_handle, _ = target(2)
+            second_fb = ioctl(0xae, bytearray(struct.pack('7I', 0, width, height, pitch, 32, 24, second_handle)))
+            flip_buffers.append(struct.unpack_from('I', second_fb)[0])
+        fb_id = flip_buffers[request['flip']]
+        struct.pack_into('I', mode, 16, fb_id)
+        ioctl(0xa2, mode)
+    if 'colour' in request:
+        clear = array.array('I', [(8 << 16) | 7, 4,
+            *struct.unpack('4I', struct.pack('4f', *request['colour'], 1.)), 0, 0, 0])
+        execution = bytearray(64)
+        struct.pack_into('IIQQIi', execution, 0, 2, len(clear) * 4,
+            clear.buffer_info()[0], handles.buffer_info()[0], 1, -1)
+        ioctl(0x42, execution)
+        fence = struct.unpack_from('i', execution, 28)[0]
+        wait = select.poll()
+        wait.register(fence, select.POLLIN)
+        assert wait.poll(10000), 'update fence timed out'
+        os.close(fence)
+    x, y, w, h = request.get('damage', [16, 24, 32, 40])
+    clips = array.array('H', [x, y, x + w, y + h])
+    ioctl(0xb1, bytearray(struct.pack('4IQ', fb_id, 0, 0, 1, clips.buffer_info()[0])))
+    Path('/run/gpu-reply.json').write_text(json.dumps({'id': last_request}))

@@ -213,7 +213,7 @@ async fn qemu_keeps_vnc_and_missing_native_falls_back_with_one_notice() {
         if hypervisor == "vmlab" {
             assert_eq!(stderr.lines().count(), 1, "{stderr}");
             assert!(
-                stderr.contains("install it from VMLabDev/vmlab-hypervisor"),
+                stderr.contains("install it from the vmlab-hv release bundle"),
                 "{stderr}"
             );
             assert!(

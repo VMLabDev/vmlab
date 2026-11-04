@@ -1,5 +1,6 @@
 # Build context for e2e/Dockerfile: the source tree, never build output.
 **/target
+**/.ci-cache
 guest/dist
 guest/.cache
 e2e/results

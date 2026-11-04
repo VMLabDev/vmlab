@@ -2605,7 +2605,7 @@ declaring one fixed port still collide (§3.2).
 ## 22. Hypervisors
 
 Every machine runs on exactly one hypervisor: **QEMU**, driven over QMP, or
-**vmlab-hv**, vmlab's own hypervisor (github.com/VMLabDev/vmlab-hypervisor),
+**vmlab-hv**, vmlab's own hypervisor under `hv/`,
 driven over its own control protocol. ADR-0021 records the decision; the
 Hypervisor seam (ADR-0001, ADR-0020) is what lets both run behind one
 lifecycle.
