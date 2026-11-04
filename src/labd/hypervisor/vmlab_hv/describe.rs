@@ -619,6 +619,12 @@ pub(crate) fn vm(
         display: Some(Display {
             device: display_device,
             gpu: accelerated,
+            vram_bytes: resolved
+                .gpu
+                .as_ref()
+                .map_or_else(vmlab_hv_proto::machine::default_gpu_vram_bytes, |gpu| {
+                    gpu.vram_bytes()
+                }),
             render_node,
             pci: display_pci,
             rom,
@@ -1437,6 +1443,7 @@ mod tests {
             let display = d.display.unwrap();
             assert_eq!(display.device, DisplayDevice::VirtioVga, "{mode}");
             assert_eq!(display.gpu, Some(want), "{mode}");
+            assert_eq!(display.vram_bytes, 4 << 30);
             assert_eq!(
                 display.render_node.as_deref(),
                 Some(Path::new("/dev/dri/renderD129"))
@@ -1471,6 +1478,25 @@ mod tests {
         );
         let err = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap_err();
         assert!(err.to_string().contains("render node"), "{err}");
+    }
+
+    #[test]
+    fn gpu_vram_reaches_the_machine_description() {
+        for mode in ["virgl", "vulkan"] {
+            let r = declared(
+                &format!(
+                    "profile = \"linux-modern\" firmware = \"seabios\" gpu {{ mode = \"{mode}\" vram = 16GiB }}"
+                ),
+                None,
+            );
+            let d = vm("l", &r, &gpu_paths(), QemuAccel::Kvm, &roms()).unwrap();
+            let display = d.display.unwrap();
+            assert_eq!(display.vram_bytes, 16 << 30);
+            assert_eq!(
+                serde_json::to_value(&display).unwrap()["vram_bytes"],
+                16u64 << 30
+            );
+        }
     }
 
     /// `passthrough` hands the declared host GPU over as a vfio device in
