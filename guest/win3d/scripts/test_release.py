@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,6 +17,13 @@ SPEC.loader.exec_module(assemble)
 
 
 class ReleaseTest(unittest.TestCase):
+    def test_signing_openssl_pin_matches_the_documented_input(self):
+        dockerfile = (ROOT / "build/signing/Dockerfile").read_text()
+        pins = (ROOT / "build/signing/PINS").read_text()
+        version = re.search(r"openssl=([^\s\\]+)", dockerfile).group(1)
+        self.assertIn(f"openssl {version},", pins)
+        self.assertNotEqual(version, "3.0.22-1~deb12u1")
+
     def test_patch_table_ignores_empty_directories(self):
         spec = importlib.util.spec_from_file_location("pins", ROOT / "scripts/pins-table.py")
         pins = importlib.util.module_from_spec(spec)
