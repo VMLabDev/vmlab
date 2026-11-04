@@ -3761,7 +3761,6 @@ mod tests {
         }
         let before = b"before restore";
         f.queue_tx(before);
-        process_tx(&f.dev.shared, &mut None, 12, false);
         f.dev.resume_snapshot();
         let mut prefix = [0; 4];
         switch.read_exact(&mut prefix).unwrap();
