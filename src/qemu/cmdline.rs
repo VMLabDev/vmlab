@@ -907,10 +907,18 @@ pub fn build_args(
                 };
                 // QEMU refuses Venus without blob resources and a hostmem
                 // window.
-                let opts = if gpu.mode == GpuMode::Vulkan {
-                    ",venus=true,blob=true,hostmem=4G"
+                let size = gpu.vram_bytes();
+                let hostmem = if size >= 1 << 30 {
+                    format!("{}G", size >> 30)
                 } else {
-                    ""
+                    format!("{}M", size >> 20)
+                };
+                let opts = if gpu.mode == GpuMode::Vulkan {
+                    format!(",venus=true,blob=true,hostmem={hostmem}")
+                } else if gpu.vram.is_some() {
+                    format!(",blob=true,hostmem={hostmem}")
+                } else {
+                    String::new()
                 };
                 arg(&mut a, "device", format!("{dev}{opts}"));
                 if matches!(machine_kind, MachineKind::Virt) {
@@ -1792,6 +1800,19 @@ mod tests {
         assert!(!s.contains("virtio-gpu-gl"), "{s}");
         assert!(!s.contains("-vga none"), "{s}");
         assert!(s.contains("-display egl-headless"), "{s}");
+    }
+
+    #[test]
+    fn gpu_vram_reaches_qemu_hostmem() {
+        for mode in ["virgl", "vulkan"] {
+            for (size, expected) in [(256 << 20, "256M"), (16 << 30, "16G"), (256 << 30, "256G")] {
+                let mut vm = resolved_gpu(mode, "x86_64");
+                vm.gpu.as_mut().unwrap().vram = Some(size);
+                let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
+                assert!(s.contains(&format!("blob=true,hostmem={expected}")), "{s}");
+                assert_eq!(s.contains("venus=true"), mode == "vulkan");
+            }
+        }
     }
 
     /// `vulkan` on `virt` has no VGA form: the pure device and `-vga none`.

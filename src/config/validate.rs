@@ -1838,6 +1838,16 @@ fn check_gpu(
     ctx: &dyn ValidationContext,
     issues: &mut IssueList,
 ) {
+    if let Some(size) = gpu.vram {
+        let error = if gpu.mode == super::model::GpuMode::Passthrough {
+            Some("`vram` is meaningless for GPU passthrough".to_string())
+        } else {
+            vmlab_hv_proto::machine::validate_gpu_vram_bytes(size).err()
+        };
+        if let Some(error) = error {
+            issues.push(Issue::at(gpu.span, format!("{who}: {error}")));
+        }
+    }
     if gpu.host_gpu.as_deref().is_some_and(|n| n.trim().is_empty()) {
         issues.push(Issue::at(
             gpu.span,
@@ -3357,6 +3367,30 @@ lab "l" {{ vm "a" {{ template = "x86_64/t" gpu {{ {gpu} }} }} }}"#
         .into_iter()
         .map(|i| i.message)
         .collect()
+    }
+
+    #[test]
+    fn gpu_vram_validates_size_and_mode() {
+        for size in ["256MiB", "4GiB", "16GiB", "256GiB"] {
+            for mode in ["virgl", "vulkan"] {
+                assert!(gpu_errs(&format!("mode = \"{mode}\" vram = {size}")).is_empty());
+            }
+        }
+        for size in ["0MiB", "128MiB", "3GiB", "512GiB"] {
+            let errors = gpu_errs(&format!("mode = \"vulkan\" vram = {size}"));
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("power of two") && e.contains("256 GiB")),
+                "{errors:?}"
+            );
+        }
+        let errors = gpu_errs("mode = \"passthrough\" host_gpu = \"Vfio1\" vram = 16GiB");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("meaningless for GPU passthrough"))
+        );
     }
 
     /// A declared host GPU passes, and so does a paravirtual name this host

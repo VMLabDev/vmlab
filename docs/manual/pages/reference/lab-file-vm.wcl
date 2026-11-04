@@ -368,6 +368,7 @@ SRC
   code wcl { source = <<'SRC'
 gpu { mode = "vulkan" }                    // the host's default GPU
 gpu { mode = "vulkan" host_gpu = "AMD1" }  // a named one
+gpu { mode = "vulkan" vram = 16GiB }
 SRC
   }
   table {
@@ -375,6 +376,7 @@ SRC
       | "Field" | "Type" | "Default" | "Meaning" |
       | "`mode`" | "utf8" | "required" | "`passthrough`, `virgl` or `vulkan`." |
       | "`host_gpu`" | "utf8" | "the host's default GPU" | "Name of a host GPU declared in the host config, matched case-insensitively. Under `passthrough` the device handed to the VM; under `virgl` and `vulkan` the GPU that renders." |
+      | "`vram`" | "std.ByteSize" | "`4GiB`" | "Host-visible memory window for `virgl` and `vulkan`, on QEMU and vmlab-hv. A power of two from `256MiB` through `256GiB`. Refused for `passthrough`. Takes effect at the next VM start." |
   }
   p <<DOC
     The lab daemon picks the host GPU when the VM starts. A `host_gpu` this
@@ -389,7 +391,20 @@ SRC
   p <<DOC
     A paravirtual GPU is the guest's only display adapter: `virtio-vga-gl` on
     x86 machines, `virtio-gpu-gl` with `-vga none` on `virt`. `vulkan` adds
-    `venus=true,blob=true,hostmem=4G`.
+    `venus=true,blob=true,hostmem=<vram>` on QEMU, defaulting to `4G`.
+    An explicit `vram` on `virgl` adds `blob=true,hostmem=<vram>`.
+    On vmlab-hv, `vram` sizes the shared-memory BAR and capability.
+  DOC
+  p <<DOC
+    `vram` does not reserve physical host VRAM or increase the host GPU's
+    capacity. Guest reporting depends on the driver. The current vmlab-win3d
+    kernel driver reads this window's size but limits its blob allocator to
+    16 GiB. Linux Venus exposes the host Vulkan memory heaps; those heap sizes
+    need not match this window. Linux virgl gets its reported video-memory
+    capacity from the renderer's capset, not the shared-memory BAR.
+    Online snapshots with an accelerated GPU on
+    vmlab-hv remain unavailable. A different `vram` changes its snapshot
+    machine identity and cannot restore an online snapshot with another size.
   DOC
   p <<DOC
     vmlab reads the picked GPU's render node and kernel driver from

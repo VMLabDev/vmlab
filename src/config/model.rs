@@ -837,12 +837,20 @@ impl GpuMode {
 #[derive(Debug, Clone)]
 pub struct Gpu {
     pub mode: GpuMode,
+    pub vram: Option<u64>,
     /// The host GPU by name (§5.2), declared in the host config rather than
     /// here because a PCI address is a fact about one machine: the device
     /// itself under `passthrough`, the GPU that renders under
     /// `virgl`/`vulkan`. `None` takes the host's default.
     pub host_gpu: Option<String>,
     pub span: Span,
+}
+
+impl Gpu {
+    pub fn vram_bytes(&self) -> u64 {
+        self.vram
+            .unwrap_or_else(vmlab_hv_proto::machine::default_gpu_vram_bytes)
+    }
 }
 
 /// An OCI container declared in the lab, run in a micro-VM (PRD §18).

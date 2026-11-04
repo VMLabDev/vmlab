@@ -2101,6 +2101,9 @@ fn synth_spec_lab(
         if let Some(name) = &gpu.host_gpu {
             write!(attrs, " host_gpu = {}", wcl_str(name)).unwrap();
         }
+        if let Some(size) = gpu.vram {
+            write!(attrs, " vram = {}MiB", size >> 20).unwrap();
+        }
         writeln!(s, "    gpu {{ {attrs} }}").unwrap();
     }
     // Template-declared NICs carry over. The synthetic lab declares no
@@ -3742,7 +3745,7 @@ template "t" { arch = "x86_64" version = "1" disk = 10GiB source "scratch" {}
                  gpu { mode = "virgl" }
                  source "iso" { path = "/i.iso" }
                  variant "plain" { default = true }
-                 variant "win3d" { gpu { mode = "vulkan" host_gpu = "AMD1" } }
+                 variant "win3d" { gpu { mode = "vulkan" host_gpu = "AMD1" vram = 16GiB } }
                }"#);
         let base = render(&d);
         assert!(base.contains("    gpu { mode = \"virgl\" }\n"), "{base}");
@@ -3771,7 +3774,7 @@ template "t" { arch = "x86_64" version = "1" disk = 10GiB source "scratch" {}
         )
         .unwrap();
         assert!(
-            wcl.contains("    gpu { mode = \"vulkan\" host_gpu = \"AMD1\" }\n"),
+            wcl.contains("    gpu { mode = \"vulkan\" host_gpu = \"AMD1\" vram = 16384MiB }\n"),
             "{wcl}"
         );
         assert!(!wcl.contains("virgl"), "{wcl}");
@@ -3779,6 +3782,7 @@ template "t" { arch = "x86_64" version = "1" disk = 10GiB source "scratch" {}
         let gpu = lf.lab.vms[0].gpu.as_ref().expect("the build VM's gpu");
         assert_eq!(gpu.mode, crate::config::model::GpuMode::Vulkan);
         assert_eq!(gpu.host_gpu.as_deref(), Some("AMD1"));
+        assert_eq!(gpu.vram, Some(16 << 30));
         // The profile's own display stays: the GL device line is the `gpu`'s
         // to emit at the start, not a `display` the metadata would record.
         assert!(!wcl.contains("display"), "{wcl}");
