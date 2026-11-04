@@ -145,28 +145,6 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
-#[cfg(test)]
-mod workspace_tests {
-    use super::*;
-
-    #[test]
-    fn guest_assets_belong_to_the_shared_workspace() {
-        let root = workspace_root().canonicalize().unwrap();
-        assert!(root.join("Cargo.toml").is_file());
-        assert!(root.join("hv/crates/vmlab-hv/Cargo.toml").is_file());
-        assert!(root.join("guest/cinit/Cargo.toml").is_file());
-        let guest = Path::new(VMLAB_GUEST_DIST)
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        assert_eq!(
-            guest.canonicalize().unwrap(),
-            root.join("guest").canonicalize().unwrap()
-        );
-    }
-}
-
 /// Use an explicit binary override, or ask Cargo for a current debug build
 /// once per test process. An existing executable may predate a merge.
 pub fn hv_binary() -> PathBuf {
@@ -615,5 +593,27 @@ pub(crate) fn connect_with_retry(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn guest_assets_belong_to_the_shared_workspace() {
+        let root = workspace_root().canonicalize().unwrap();
+        assert!(root.join("Cargo.toml").is_file());
+        assert!(root.join("hv/crates/vmlab-hv/Cargo.toml").is_file());
+        assert!(root.join("guest/cinit/Cargo.toml").is_file());
+        let guest = Path::new(VMLAB_GUEST_DIST)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert_eq!(
+            guest.canonicalize().unwrap(),
+            root.join("guest").canonicalize().unwrap()
+        );
     }
 }
