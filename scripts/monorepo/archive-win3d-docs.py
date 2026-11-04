@@ -77,6 +77,8 @@ def main():
             continue
         old = doc.read_text()
         text = re.sub(r"\[\[([^\]]+)\]\(([^)]+)\)\]\(([^)]+)\)", r"[\1](\3)", old)
+        previous_base = f"https://github.com/VMLabDev/vmlab-win3d/blob/{cached.get('source_commit', revision)}/"
+        text = text.replace(previous_base, base + "/")
 
         def link(match):
             target = match.group(2)
@@ -88,7 +90,7 @@ def main():
             if "://" in target or target.startswith("#"):
                 return match.group(0)
             path = posixpath.normpath(posixpath.join(doc.parent.relative_to(GUEST).as_posix(), target))
-            if path == "docs/evidence" or path.startswith(("docs/evidence/", "patches/host/")):
+            if path in ("docs/evidence", "patches/host") or path.startswith(("docs/evidence/", "patches/host/")):
                 return f"{match.group(1)}({archive_target(path)})"
             return match.group(0)
 
@@ -102,7 +104,7 @@ def main():
                 found = [commit for commit in commits if commit.startswith(value)]
                 if len(found) == 1:
                     return f"[{value}](https://github.com/VMLabDev/vmlab-win3d/commit/{found[0]})"
-            if value.startswith(("docs/evidence/", "patches/host/")):
+            if value in ("docs/evidence", "patches/host") or value.startswith(("docs/evidence/", "patches/host/")):
                 return f"[{value}]({archive_target(value)})"
             return match.group(0)
 
