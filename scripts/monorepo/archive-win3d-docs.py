@@ -62,7 +62,7 @@ def main():
             if len(matches) == 1:
                 path = matches[0]
             elif not matches:
-                parents = git("log", "--full-history", "-1", "--format=%P", "--", path).split()
+                parents = git("log", "--full-history", "-1", "--format=%P", "--", f":(glob){path}*").split()
                 if parents:
                     historical = git("ls-tree", "-r", "--name-only", parents[0], "--", path.rsplit("/", 1)[0]).splitlines()
                     matches = [item for item in historical if item.startswith(path)]
