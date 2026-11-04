@@ -460,6 +460,16 @@ pub fn build_args(
     paths: &VmPaths,
     accel: Accel,
 ) -> Result<Vec<String>> {
+    if vm
+        .gpu
+        .as_ref()
+        .is_some_and(|gpu| gpu.virtual_display || gpu.virtual_display_memory.is_some())
+    {
+        anyhow::bail!(
+            "vm \"{}\": gpu virtual_display requires hypervisor = \"vmlab\"; QEMU does not support it",
+            vm.name
+        );
+    }
     fn arg(a: &mut Vec<String>, s: &str, v: String) {
         a.push(format!("-{s}"));
         a.push(v);

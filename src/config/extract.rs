@@ -436,6 +436,8 @@ fn extract_gpu(b: &Block, issues: &mut IssueList) -> Option<Gpu> {
     Some(Gpu {
         mode: mode.value,
         vram: r.size("vram").unspan(),
+        virtual_display: r.bool("virtual_display").unspan().unwrap_or(false),
+        virtual_display_memory: r.size("virtual_display_memory").unspan(),
         host_gpu: r.string("host_gpu").unspan(),
         span: r.span(),
     })

@@ -512,6 +512,10 @@ type Media {
 // GPU acceleration.
 @block("gpu")
 type Gpu {
+  @doc("Shared-memory virtual monitor for Windows guests on vmlab-hv; passthrough only, default false")
+  virtual_display: bool?
+  @doc("BAR2 size in bytes; power of two sufficient for three 3840x2160 XRGB frames and the cursor, default 128MiB; requires virtual_display")
+  virtual_display_memory: std.ByteSize?
   @doc("Mode: `passthrough` | `virgl` | `vulkan` (required)")
   @options(["passthrough", "virgl", "vulkan"]) mode: utf8
   @doc("Name of a host GPU declared in the host config (`gpu \"<name>\" {}`), matched case-insensitively: the device for `passthrough`, the GPU that renders for `virgl`/`vulkan`; default: the host's default GPU")

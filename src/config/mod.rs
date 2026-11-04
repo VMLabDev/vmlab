@@ -304,6 +304,29 @@ lab "ad-lab" {
 "#;
 
     #[test]
+    fn virtual_display_fields_extract_and_default_off() {
+        for (fields, enabled, memory) in [
+            ("", false, None),
+            ("virtual_display = true", true, None),
+            (
+                "virtual_display = true virtual_display_memory = 256MiB",
+                true,
+                Some(256 << 20),
+            ),
+        ] {
+            let source = format!(
+                r#"import <vmlab.wcl> lab "l" {{ vm "w" {{ template = "x86_64/w" gpu {{ mode = "passthrough" {fields} }} }} }}"#
+            );
+            let file = load_lab_source(&source, "<test>", Path::new("/tmp")).unwrap();
+            let gpu = file.lab.vms[0].gpu.as_ref().unwrap();
+            assert_eq!(
+                (gpu.virtual_display, gpu.virtual_display_memory),
+                (enabled, memory)
+            );
+        }
+    }
+
+    #[test]
     fn parses_the_prd_example() {
         let lf = load_lab_source(SAMPLE, "<test>", Path::new("/tmp")).unwrap();
         let lab = &lf.lab;
