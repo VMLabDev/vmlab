@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>vmlab</title>
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#242933"/>
+  <path fill="#f5f5f5" d="M48 64h47l33 108 33-108h47l-57 144h-46z"/>
+</svg>
