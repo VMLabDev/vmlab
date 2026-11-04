@@ -76,6 +76,11 @@ RUN ./scripts/guest-toolchains.sh msvcrt
 COPY build/hv.py build/
 RUN python3 build/hv.py native-deps-install && rm -rf /var/lib/apt/lists/*
 
+# Cross-compile the UMDF indirect display driver against hash-locked SDK/WDK packages.
+RUN apt-get update -q \
+ && apt-get install -y -q --no-install-recommends clang lld \
+ && rm -rf /var/lib/apt/lists/*
+
 # Runtime: any uid. HOME and CARGO_HOME are world-writable cache paths, and
 # build/run.sh mounts named volumes over CARGO_HOME and the checkout's target
 # dirs so rebuilds stay incremental. git refuses a repository owned by another uid;

@@ -1,0 +1,31 @@
+{
+  "visual_studio": {
+    "version": "17.14.37827.9",
+    "channel": {
+      "url": "https://download.visualstudio.microsoft.com/download/pr/6bd63d7f-1818-4e03-a552-9feb11496c19/8d9e516e27b5de40b0b3c5f042ea975a63c1744999a72125df4fbfc136b4ae9d/VisualStudio.17.Release.chman",
+      "sha256": "b300b5af6b2056b64861c3bb0329fe3356e24cd2c4b45e9d78a9a7ec123b1ed6"
+    },
+    "bootstrapper": {
+      "url": "https://download.visualstudio.microsoft.com/download/pr/6bd63d7f-1818-4e03-a552-9feb11496c19/a473a3048f5c18e0d76428931305228e9118591f989f751492d56ba6eced4ab2/vs_Setup.exe",
+      "sha256": "a473a3048f5c18e0d76428931305228e9118591f989f751492d56ba6eced4ab2"
+    },
+    "catalog": {
+      "url": "https://download.visualstudio.microsoft.com/download/pr/6bd63d7f-1818-4e03-a552-9feb11496c19/4cc372d79f02e331c999a926b833a49eb74b30357d30f41ba9cffa1dc0369379/VisualStudio.vsman",
+      "sha256": "963760b01f621ed4fa40d1cf97aeb042f7bc6e04e3176c13c38abb19d265f789"
+    }
+  },
+  "packages": {
+    "wdk": {
+      "url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/10.0.26100.1/microsoft.windows.wdk.x64.10.0.26100.1.nupkg",
+      "sha256": "247b2919ae451f65ba5f1cd51c7c39730fb0fc383d607f3e8ab317fddc8a8239"
+    },
+    "sdk": {
+      "url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.26100.1/microsoft.windows.sdk.cpp.10.0.26100.1.nupkg",
+      "sha256": "b4730a467a8f29145fc0136b2b3f626767e985f6aa6e32f1352953c38d6ff5d2"
+    },
+    "sdk-libs": {
+      "url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp.x64/10.0.26100.1/microsoft.windows.sdk.cpp.x64.10.0.26100.1.nupkg",
+      "sha256": "7670843ddee568ca1e89b0feb36046ede6a3df5dbf5fa0106ec2eee9e8224e38"
+    }
+  }
+}

@@ -518,6 +518,8 @@ type Gpu {
   virtual_display_memory: std.ByteSize?
   @doc("Mode: `passthrough` | `virgl` | `vulkan` (required)")
   @options(["passthrough", "virgl", "vulkan"]) mode: utf8
+  @doc("Enable the Windows shared-memory indirect display driver; default: false")
+  virtual_display: bool?
   @doc("Name of a host GPU declared in the host config (`gpu \"<name>\" {}`), matched case-insensitively: the device for `passthrough`, the GPU that renders for `virgl`/`vulkan`; default: the host's default GPU")
   host_gpu: utf8?
   @doc("Host-visible GPU memory window for virgl/vulkan; power of two from 256MiB to 256GiB, default 4GiB. Does not reserve physical VRAM; refused for passthrough")

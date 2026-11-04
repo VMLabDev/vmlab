@@ -917,6 +917,7 @@ mod tests {
             virtual_display: false,
             virtual_display_memory: None,
             mode,
+            virtual_display: false,
             host_gpu: host_gpu.map(Into::into),
             span: Default::default(),
         }
