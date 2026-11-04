@@ -1,0 +1,1122 @@
+//! KVM integration tests.
+//!
+//! These boot tiny real-mode payloads (hand-assembled machine code, no
+//! kernel) that write to COM1 and then either acknowledge an ACPI power
+//! button press with S5 or triple-fault, plus one black-box test that boots
+//! vmlab's real container kernel through the full builder path. Every test
+//! skips with a printed reason when `/dev/kvm` is missing.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::Mutex as PlMutex;
+use vm_memory::{Bytes, GuestAddress};
+use vmlab_hv_devices::{BusDevice, IrqLine};
+use vmlab_hv_proto::control::{Command, Event, Outcome, ShutdownReason};
+use vmlab_hv_proto::machine::{Accel, Arch, Boot, MachineDescription};
+
+use crate::builder;
+use crate::bus::{IoBus, MmioBus};
+use crate::error::DeviceUnavailable;
+use crate::factory::DeviceFactory;
+use crate::kvm::KvmVm;
+use crate::layout::MemLayout;
+use crate::memory::{GuestRam, register_memslots};
+use crate::pci::PciRoot;
+use crate::pm::{PM_BLOCK_LEN, PM1A_EVT_BASE, PmDevice, SleepSignal};
+use crate::vm::{ExitReason, Vm, VmHandle, VmShared};
+
+/// How long a payload test waits for the guest before forcing a host exit.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Where the payload lives; the vCPU enters it in flat real mode.
+const PAYLOAD_ADDR: u64 = 0x8000;
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn repeated_byte_io_preserves_fw_cfg_stream_access_width() {
+    let code = [
+        0xba, 0x10, 0x05, 0x31, 0xc0, 0xef, 0xba, 0x11, 0x05, 0xbf, 0x00, 0x81, 0xb9, 4, 0, 0xf3,
+        0x6c, 0xbe, 0x00, 0x81, 0xb9, 4, 0, 0xba, 0xf8, 0x03, 0xf3, 0x6e, 0xba, 0x04, 0x06, 0xb8,
+        0x00, 0x34, 0xef, 0xf4,
+    ];
+    let Some((vm, handle, serial)) = payload_vm(&code, false, false) else {
+        return;
+    };
+    watchdog(&handle);
+    assert_eq!(
+        vm.wait(),
+        ExitReason::Shutdown(ShutdownReason::GuestShutdown)
+    );
+    assert_eq!(&*serial.lock(), b"QEMU");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn q35_seabios_banner_through_control_socket() {
+    const BIOS: &str = "/usr/share/qemu/bios-256k.bin";
+    if !Path::new(BIOS).exists() {
+        eprintln!("skipping: SeaBIOS firmware {BIOS} is not installed");
+        return;
+    }
+    let Some(kvm) = kvm_or_skip() else { return };
+    drop(kvm);
+    let dir = tempfile::tempdir().unwrap();
+    let desc: MachineDescription = serde_json::from_value(serde_json::json!({
+        "machine": "q35", "name": "seabios-test", "arch": "x86_64", "accel": "kvm",
+        "vcpus": 2, "memory_mib": 256,
+        "boot": { "kind": "firmware", "firmware": "seabios", "code": BIOS },
+        "disks": [], "nics": [], "ports": [], "serial_log": dir.path().join("serial.log"),
+        "display": { "device": "std-vga", "pci": {"bus":0,"device":4,"function":0}, "rom": null }
+    }))
+    .unwrap();
+    let (factory, serial) = TestFactory::new();
+    let vm = builder::build(&desc, &factory, true).unwrap();
+    let handle = vm.handle();
+    let socket = dir.path().join("control.sock");
+    crate::control::serve(&socket, &handle).unwrap();
+    let duplicate = dir.path().join("duplicate.sock");
+    assert!(crate::display::serve(handle.shared(), &duplicate, &duplicate).is_err());
+    assert!(!duplicate.exists());
+    crate::display::serve(
+        handle.shared(),
+        &dir.path().join("display.sock"),
+        &dir.path().join("vnc.sock"),
+    )
+    .unwrap();
+    let mut client = vmlab_hv_proto::client::Client::connect(&socket).unwrap();
+    assert!(
+        client
+            .capabilities()
+            .contains(&vmlab_hv_proto::control::Capability::Display)
+    );
+    assert!(
+        client
+            .capabilities()
+            .contains(&vmlab_hv_proto::control::Capability::Input)
+    );
+    check_native_placeholder(dir.path());
+    assert!(matches!(
+        client.call(Command::Resume).unwrap(),
+        Outcome::Ok { .. }
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut log = String::new();
+    while std::time::Instant::now() < deadline {
+        log = std::fs::read_to_string(&desc.serial_log).unwrap_or_default();
+        log.push_str(&String::from_utf8_lossy(&serial.lock()));
+        if let Some(vga) = handle.shared().vga.lock().as_ref() {
+            let mut text = [0; 4000];
+            vga.legacy_read(0x18000, &mut text);
+            log.push_str(&String::from_utf8_lossy(
+                &text.iter().step_by(2).copied().collect::<Vec<_>>(),
+            ));
+        }
+        if log.contains("SeaBIOS")
+            || handle.status() == vmlab_hv_proto::control::RunState::ShuttingDown
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = client.call(Command::Pause);
+    handle
+        .shared()
+        .wait_quiesced(Duration::from_secs(2))
+        .unwrap();
+    check_native_display_and_keyboard(&handle, dir.path());
+    handle.shared().request_reset();
+    loop {
+        if client.wait_event().unwrap() == Some(vmlab_hv_proto::control::Event::Reset) {
+            break;
+        }
+    }
+    assert_eq!(handle.status(), vmlab_hv_proto::control::RunState::Paused);
+    check_native_placeholder(dir.path());
+    for (id, fd) in handle.shared().vcpus.lock().iter() {
+        let fd = fd.lock();
+        let regs = fd.get_regs().unwrap();
+        let sregs = fd.get_sregs().unwrap();
+        eprintln!(
+            "firmware vcpu {id}: cs={:#x} rip={:#x} ax={:#x} dx={:#x} cr0={:#x}",
+            sregs.cs.base, regs.rip, regs.rax, regs.rdx, sregs.cr0
+        );
+    }
+    let mut unfinished_native =
+        std::os::unix::net::UnixStream::connect(dir.path().join("display.sock")).unwrap();
+    let mut unfinished_rfb =
+        std::os::unix::net::UnixStream::connect(dir.path().join("vnc.sock")).unwrap();
+    let shared = Arc::downgrade(handle.shared());
+    let ram = Arc::downgrade(&vm.ram);
+    let _ = client.call(Command::Quit);
+    let reason = vm.wait();
+    drop(client);
+    drop(handle);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while shared.strong_count() != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(shared.strong_count(), 0, "control server retained the VM");
+    assert_eq!(ram.strong_count(), 0, "exited VM retained RAM");
+    use std::io::Read;
+    for stream in [&mut unfinished_native, &mut unfinished_rfb] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buffer = [0; 64];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                result => panic!("display session outlived VM: {result:?}"),
+            }
+        }
+    }
+    eprintln!("SeaBIOS observation: {log}");
+    assert!(
+        log.contains("SeaBIOS"),
+        "reset-vector boot did not print its banner; exit={reason:?}; log={log}"
+    );
+}
+
+/// A virtio-snd audio section builds into a PCI function at its own
+/// address, and the machine's running-time clock can pace it (hv-audio
+/// D2's second device).
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn audio_virtio_snd_builds_and_joins_the_machine_clock() {
+    const BIOS: &str = "/usr/share/qemu/bios-256k.bin";
+    if !Path::new(BIOS).exists() {
+        eprintln!("skipping: SeaBIOS firmware {BIOS} is not installed");
+        return;
+    }
+    let Some(kvm) = kvm_or_skip() else { return };
+    drop(kvm);
+    let dir = tempfile::tempdir().unwrap();
+    let desc: MachineDescription = serde_json::from_value(serde_json::json!({
+        "machine": "q35", "name": "virtio-snd-test", "arch": "x86_64", "accel": "kvm",
+        "vcpus": 1, "memory_mib": 256,
+        "boot": { "kind": "firmware", "firmware": "seabios", "code": BIOS },
+        "disks": [], "nics": [], "ports": [], "serial_log": dir.path().join("serial.log"),
+        "audio": { "device": "virtio_snd", "microphone": true,
+            "node_name": "vmlab.test.snd", "node_description": "virtio-snd build test",
+            "pci": {"bus": 0, "device": 5, "function": 0} }
+    }))
+    .unwrap();
+    let (factory, _serial) = TestFactory::new();
+    let vm = builder::build(&desc, &factory, true).unwrap();
+    let handle = vm.handle();
+    let guard = handle.shared().chipset.lock();
+    let chipset = guard.as_ref().unwrap();
+    {
+        let audio = chipset.audio.lock();
+        let device = audio.as_ref().expect("virtio-snd joins the chipset clock");
+        // Pacing and pausing an unactivated device is a no-op, not an
+        // error. The guard must not outlive the machine's timer thread,
+        // which takes this same lock every tick.
+        device.lock().set_paused(true);
+        device.lock().advance(Duration::from_millis(5)).unwrap();
+        device.lock().set_paused(false);
+    }
+    drop(guard);
+    handle.quit();
+    drop(handle);
+    let _ = vm.wait();
+}
+
+fn check_native_placeholder(directory: &Path) {
+    use std::os::unix::fs::FileExt;
+    use vmlab_hv_display::{Capabilities, Client, FrameFlags, Message};
+    let client = Client::connect(
+        directory.join("display.sock"),
+        Capabilities(Capabilities::FRAMES | Capabilities::FRAME_FLAGS),
+    )
+    .unwrap();
+    client
+        .stream()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let configure = client.receive().unwrap();
+    let Message::SurfaceConfigure {
+        width,
+        height,
+        stride,
+        ..
+    } = configure.message
+    else {
+        panic!("expected placeholder surface")
+    };
+    assert_eq!((width, height), (640, 480));
+    let Message::FrameReady {
+        flags,
+        surface_id,
+        buffer,
+        seq,
+        ..
+    } = client.receive().unwrap().message
+    else {
+        panic!("expected placeholder frame")
+    };
+    assert!(flags.has(FrameFlags::PLACEHOLDER));
+    let mut pixels = vec![0; (stride * height) as usize];
+    std::fs::File::from(configure.fds[buffer as usize].try_clone().unwrap())
+        .read_exact_at(&mut pixels, 0)
+        .unwrap();
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[..3] != [0; 3])
+    );
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[..3] == [0xb0; 3]),
+        "placeholder text is absent"
+    );
+    client.release(surface_id, buffer, seq).unwrap();
+}
+
+fn check_native_display_and_keyboard(handle: &VmHandle, directory: &Path) {
+    use std::os::unix::fs::FileExt;
+    use vmlab_hv_display::{Capabilities, Client, Message};
+    let display = Client::connect(
+        directory.join("display.sock"),
+        Capabilities(Capabilities::FRAMES | Capabilities::INPUT | Capabilities::FRAME_FLAGS),
+    )
+    .unwrap();
+    display
+        .stream()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut buffers: Vec<std::fs::File> = vec![];
+    let mut size = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "VGA scanout stayed blank"
+        );
+        let packet = display.receive().unwrap();
+        match packet.message {
+            Message::SurfaceConfigure {
+                width,
+                height,
+                stride,
+                ..
+            } => {
+                assert!(width > 0 && height > 0);
+                size = stride as usize * height as usize;
+                buffers = packet.fds.into_iter().map(std::fs::File::from).collect();
+            }
+            Message::FrameReady {
+                flags,
+                surface_id,
+                buffer,
+                seq,
+                ..
+            } => {
+                let mut pixels = vec![0; size];
+                buffers[buffer as usize]
+                    .read_exact_at(&mut pixels, 0)
+                    .unwrap();
+                display.release(surface_id, buffer, seq).unwrap();
+                if !flags.has(vmlab_hv_display::FrameFlags::PLACEHOLDER)
+                    && pixels.iter().any(|pixel| *pixel != 0)
+                {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let shared = handle.shared();
+    shared.io_write(0x64, &[0x60]);
+    shared.io_write(0x60, &[1]);
+    shared.io_write(0x64, &[0xae]);
+    shared.io_write(0x60, &[0xf0]);
+    shared.io_write(0x60, &[2]);
+    shared.io_write(0x60, &[0xf4]);
+    let mut byte = [0];
+    for _ in 0..64 {
+        shared.io_read(0x64, &mut byte);
+        if byte[0] & 1 == 0 {
+            break;
+        }
+        shared.io_read(0x60, &mut byte);
+    }
+    display
+        .send(&Message::Key {
+            qcode: "a".into(),
+            down: true,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        shared.io_read(0x64, &mut byte);
+        if byte[0] & 1 != 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native key did not reach i8042"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    shared.io_read(0x60, &mut byte);
+    assert_eq!(byte[0], 0x1c);
+}
+
+/// A fake 16550A: records every byte written to the port range.
+struct FakeSerial {
+    out: Arc<PlMutex<Vec<u8>>>,
+}
+
+impl BusDevice for FakeSerial {
+    fn read(&mut self, offset: u64, data: &mut [u8]) {
+        // Line status: transmitter empty and ready, no received data.
+        if offset == 5 {
+            data.fill(0x60);
+        } else {
+            data.fill(0);
+        }
+    }
+
+    fn write(&mut self, _offset: u64, data: &[u8]) {
+        self.out.lock().extend_from_slice(data);
+    }
+}
+
+/// A factory whose serial is a [`FakeSerial`]; everything else reports the
+/// model as not landed, exactly like the binary's factory until the device
+/// crates' work packages arrive.
+struct TestFactory {
+    out: Arc<PlMutex<Vec<u8>>>,
+}
+
+impl TestFactory {
+    fn new() -> (Self, Arc<PlMutex<Vec<u8>>>) {
+        let out = Arc::new(PlMutex::new(Vec::new()));
+        (TestFactory { out: out.clone() }, out)
+    }
+}
+
+impl DeviceFactory for TestFactory {
+    fn serial(
+        &self,
+        _log_path: &Path,
+        _irq: Arc<dyn IrqLine>,
+    ) -> Result<crate::factory::BuiltSerial, DeviceUnavailable> {
+        Ok(crate::factory::BuiltSerial {
+            clock: None,
+            device: Arc::new(parking_lot::Mutex::new(FakeSerial {
+                out: self.out.clone(),
+            })),
+            snapshot: None, // these machines do not snapshot
+        })
+    }
+
+    fn virtio_blk(
+        &self,
+        disk: &vmlab_hv_proto::machine::Disk,
+        _mem: &vmlab_hv_devices::GuestMemory,
+        _msi: crate::factory::PciWiring,
+    ) -> Result<crate::factory::BuiltBlk, DeviceUnavailable> {
+        Err(DeviceUnavailable::new(
+            "virtio-blk",
+            format!("no block device in this test (disk `{}`)", disk.id),
+        ))
+    }
+
+    fn virtio_console(
+        &self,
+        _ports: &[vmlab_hv_proto::machine::SerialPort],
+        _mem: &vmlab_hv_devices::GuestMemory,
+        _msi: crate::factory::PciWiring,
+    ) -> Result<crate::factory::BuiltPci, DeviceUnavailable> {
+        Err(DeviceUnavailable::new(
+            "virtio-console",
+            "no console device in this test",
+        ))
+    }
+
+    fn virtio_net(
+        &self,
+        nic: &vmlab_hv_proto::machine::Nic,
+        _mem: &vmlab_hv_devices::GuestMemory,
+        _msi: crate::factory::PciWiring,
+    ) -> Result<crate::factory::BuiltPci, DeviceUnavailable> {
+        Err(DeviceUnavailable::new(
+            "virtio-net",
+            format!("no net device in this test (nic {})", nic.mac),
+        ))
+    }
+
+    fn fs_share(
+        &self,
+        share: &vmlab_hv_proto::machine::FsShare,
+        _mem: &vmlab_hv_devices::GuestMemory,
+        _msi: crate::factory::PciWiring,
+    ) -> Result<crate::factory::BuiltPci, DeviceUnavailable> {
+        Err(DeviceUnavailable::new(
+            "vhost-user-fs",
+            format!("no fs device in this test (share `{}`)", share.tag),
+        ))
+    }
+}
+
+fn kvm_or_skip() -> Option<KvmVm> {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping: /dev/kvm is not available");
+        return None;
+    }
+    match KvmVm::new() {
+        Ok(vm) => Some(vm),
+        Err(e) => {
+            eprintln!("skipping: cannot create KVM VM: {e}");
+            None
+        }
+    }
+}
+
+/// A real-mode payload: writes the message to COM1, then polls PM1a_STS for
+/// the power button and answers S5.
+fn s5_payload() -> Vec<u8> {
+    let mut code = vec![
+        0xBE, 0x40, 0x80, // mov si, 0x8040
+        0xAC, // .next: lodsb
+        0x84, 0xC0, // test al, al
+        0x74, 0x06, // jz .poll
+        0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+        0xEE, // out dx, al
+        0xEB, 0xF5, // jmp .next
+        0xBA, 0x00, 0x06, // .poll: mov dx, 0x600
+        0xED, // in ax, dx
+        0xA9, 0x00, 0x01, // test ax, 0x0100 (PWRBTN_STS)
+        0x74, 0xF7, // jz .poll
+        0xB8, 0x00, 0x01, // mov ax, 0x0100 (W1C)
+        0xEF, // out dx, ax
+        0xBA, 0x04, 0x06, // mov dx, 0x604
+        0xB8, 0x00, 0x34, // mov ax, 0x3400 (SLP_TYP=5 | SLP_EN)
+        0xEF, // out dx, ax
+        0xF4, // .halt: hlt
+        0xEB, 0xFD, // jmp .halt
+    ];
+    code.extend_from_slice(&[0u8; 0x40 - 0x25]);
+    code.extend_from_slice(b"hello-s5\n\0");
+    code
+}
+
+/// A real-mode payload: writes the message to COM1, loads a null IDT (limit
+/// 0) and executes `int3`; delivering any exception through that IDT faults
+/// recursively into a triple fault, which KVM reports as a shutdown.
+fn triple_fault_payload() -> Vec<u8> {
+    let mut code = vec![
+        0xBE, 0x40, 0x80, // mov si, 0x8040
+        0xAC, // .next: lodsb
+        0x84, 0xC0, // test al, al
+        0x74, 0x08, // jz .boom
+        0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+        0xEE, // out dx, al
+        0xEB, 0xF5, // jmp .next
+        0xBF, 0x46, 0x80, // .boom: mov di, 0x8046
+        0x0F, 0x01, 0x1F, // lidt [di] (limit 0)
+        0xCC, // int3 -> #GP -> #DF -> triple fault
+    ];
+    code.extend_from_slice(&vec![0u8; 0x40 - code.len()]);
+    code.extend_from_slice(b"triple\0");
+    code.extend_from_slice(&[0u8; 6]); // null IDT descriptor at 0x8046
+    code
+}
+
+/// Assemble a machine that boots `payload` in real mode: no kernel, no ACPI
+/// tables, one vCPU entering flat real mode at 0x8000.
+/// A built payload machine: the machine, its handle, and the serial log.
+type PayloadVm = (Vm, VmHandle, Arc<PlMutex<Vec<u8>>>);
+
+fn payload_vm(payload: &[u8], paused: bool, protected: bool) -> Option<PayloadVm> {
+    let kvm = kvm_or_skip()?;
+    let layout = MemLayout::new(16).ok()?;
+    let ram = GuestRam::anonymous(layout.clone()).ok()?;
+    register_memslots(&kvm.vm, &ram).ok()?;
+
+    ram.mem
+        .write_slice(payload, GuestAddress(PAYLOAD_ADDR))
+        .ok()?;
+
+    let (factory, out) = TestFactory::new();
+    let mut io_bus = IoBus::new();
+    io_bus
+        .register(
+            0x510,
+            12,
+            Arc::new(PlMutex::new(vmlab_hv_firmware::FwCfg::new(ram.mem.clone()))),
+        )
+        .ok()?;
+    let mmio_bus = MmioBus::new();
+    let pci_root = Arc::new(PlMutex::new(PciRoot::new(layout.mmio64_base)));
+
+    let serial = factory
+        .serial(Path::new("/dev/null"), Arc::new(NullIrq))
+        .ok()?;
+    io_bus.register(0x3F8, 8, serial.device).ok()?;
+
+    let sleep_signal = Arc::new(SleepSignal::default());
+    let pm = Arc::new(PlMutex::new(PmDevice::new(
+        Arc::new(NullIrq),
+        sleep_signal.sink(),
+    )));
+    io_bus
+        .register(PM1A_EVT_BASE, PM_BLOCK_LEN, pm.clone())
+        .ok()?;
+    let shared = VmShared::new(
+        kvm,
+        io_bus,
+        mmio_bus,
+        pci_root,
+        pm,
+        sleep_signal,
+        layout.mmio64_base,
+    );
+    // No disks, no snapshot handles: snapshot commands must refuse with
+    // Unsupported, not panic.
+    shared.set_snapshot_registry(Arc::new(crate::snapshot::SnapshotRegistry {
+        digest: [0; 32],
+        disks: Vec::new(),
+        nodes: Vec::new(),
+    }));
+    let mut vcpu = shared.kvm.create_vcpu(0).ok()?;
+    // Flat mode at the payload: the architecture's reset vector is at
+    // physical 0xFFFF_FFF0, which this 16 MiB machine does not back.
+    if protected {
+        crate::loader::init_protected_16(&mut vcpu, PAYLOAD_ADDR).ok()?;
+    } else {
+        crate::loader::init_real_mode(&mut vcpu, PAYLOAD_ADDR).ok()?;
+    }
+    let mut vm = Vm::from_parts(shared, vec![(0, vcpu)], ram).ok()?;
+    if !paused {
+        vm.start();
+    }
+    let handle = vm.handle();
+    Some((vm, handle, out))
+}
+
+/// An IrqLine that records nothing; the payloads never take interrupts.
+struct NullIrq;
+
+impl IrqLine for NullIrq {
+    fn set_level(&self, _high: bool) {}
+}
+
+/// Force the machine to a host-request exit if the guest never finishes, so
+/// a broken payload fails the test instead of hanging it.
+fn watchdog(handle: &VmHandle) {
+    let handle = handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(TEST_TIMEOUT);
+        handle.quit();
+    });
+}
+
+fn temp_socket(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("hv-kvm-{name}-"))
+        .tempdir()
+        .unwrap();
+    let socket = dir.path().join("control.sock");
+    (dir, socket)
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn guest_s5_after_powerdown_is_guest_shutdown() {
+    let Some((vm, handle, serial)) = payload_vm(&s5_payload(), false, false) else {
+        return;
+    };
+    watchdog(&handle);
+    handle.powerdown().expect("powerdown");
+
+    let reason = vm.wait();
+    assert_eq!(
+        reason,
+        ExitReason::Shutdown(ShutdownReason::GuestShutdown),
+        "S5 must end the run as guest_shutdown"
+    );
+    assert_eq!(*serial.lock(), b"hello-s5\n");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn triple_fault_is_guest_reset() {
+    // Exception delivery in flat real mode goes through KVM's emulator,
+    // which does not turn a null-IDT int3 into a shutdown; in protected
+    // mode the hardware path triple-faults as the protocol expects.
+    let Some((vm, _handle, serial)) = payload_vm(&triple_fault_payload(), false, true) else {
+        return;
+    };
+    watchdog(&_handle);
+
+    let reason = vm.wait();
+    assert_eq!(
+        reason,
+        ExitReason::Shutdown(ShutdownReason::GuestReset),
+        "a triple fault (reboot=t, panic=-1) must end as guest_reset"
+    );
+    assert_eq!(*serial.lock(), b"triple");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn q35_reset_sources_restart_firmware_and_keep_control_connected() {
+    let Some(kvm) = kvm_or_skip() else { return };
+    drop(kvm);
+    // ACPI's FADT RESET_REG names CF9; test both the full-reset value and
+    // the legacy reset-control edge as well as the i8042 and triple fault.
+    for (name, reset) in [
+        ("cf9", vec![0xba, 0xf9, 0x0c, 0xb0, 2, 0xee, 0xb0, 6, 0xee]),
+        ("acpi", vec![0xba, 0xf9, 0x0c, 0xb0, 0x0e, 0xee]),
+        ("i8042", vec![0xba, 0x64, 0, 0xb0, 0xfe, 0xee]),
+        (
+            "triple-fault",
+            vec![
+                0x0f, 0x01, 0x1e, 0x10, 0x70, 0x0f, 0x20, 0xc0, 0x0c, 1, 0x0f, 0x22, 0xc0, 0xcc,
+            ],
+        ),
+        (
+            "hyperv",
+            vec![
+                0x66, 0xb9, 3, 0, 0, 0x40, 0x66, 0x31, 0xd2, 0x66, 0xb8, 1, 0, 0, 0, 0x0f, 0x30,
+            ],
+        ),
+        ("smm", vec![]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let bios = dir.path().join("bios.bin");
+        let mut image = vec![0; 65536];
+        // Keep a RAM boot counter across reset. The second boot halts so
+        // that a duplicate reset is observable as a third serial byte.
+        let mut code = vec![
+            0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x80, 0x3e, 0, 0x70, 0, 0x75, 0, 0xc6, 0x06, 0, 0x70, 1,
+            0xba, 0xf8, 3, 0xb0, b'1', 0xee,
+        ];
+        // SYSENTER_CS is outside the small online-snapshot MSR list. Reset
+        // must also clear this and hardware breakpoint addresses.
+        code.extend([
+            0x66, 0xb9, 0x74, 1, 0, 0, 0x66, 0x31, 0xd2, 0x66, 0xb8, 0x42, 0, 0, 0, 0x0f, 0x30,
+            0x0f, 0x23, 0xc0,
+        ]);
+        code.extend(reset);
+        code.extend([0xf4, 0xeb, 0xfd]);
+        let second = code.len();
+        code[11] = (second - 12) as u8;
+        code.extend([0xba, 0xf8, 3, 0xb0, b'2', 0xee, 0xf4, 0xeb, 0xfd]);
+        image[..code.len()].copy_from_slice(&code);
+        image[0xfff0..0xfff5].copy_from_slice(&[0xea, 0, 0, 0, 0xf0]);
+        std::fs::write(&bios, image).unwrap();
+        let desc: MachineDescription = serde_json::from_value(serde_json::json!({
+            "machine":"q35", "name":name, "arch":"x86_64", "accel":"kvm",
+            "vcpus":2, "memory_mib":64, "hyperv":["reset"],
+            "boot":{"kind":"firmware", "firmware":"seabios", "code":bios},
+            "disks":[], "nics":[], "ports":[], "serial_log":dir.path().join("serial.log")
+        }))
+        .unwrap();
+        let (factory, serial) = TestFactory::new();
+        let vm = builder::build(&desc, &factory, true).unwrap();
+        let handle = vm.handle();
+        if name == "smm" {
+            let handler = [
+                0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0xc6, 0x06, 0, 0x70, 1, 0xba, 0xf8, 3, 0xb0, b'1',
+                0xee, 0xba, 0xf9, 0x0c, 0xb0, 6, 0xee, 0xf4, 0xeb, 0xfd,
+            ];
+            vm.ram
+                .mem
+                .write_slice(&handler, GuestAddress(0x38000))
+                .unwrap();
+            handle.shared().vcpus.lock()[0].1.lock().smi().unwrap();
+        }
+        watchdog(&handle);
+        let socket = dir.path().join("control.sock");
+        crate::control::serve(&socket, &handle).unwrap();
+        let mut client = vmlab_hv_proto::client::Client::connect(&socket).unwrap();
+        client.call(Command::Resume).unwrap();
+        loop {
+            match client
+                .wait_event()
+                .unwrap()
+                .expect("reset must keep control open")
+            {
+                Event::Reset => break,
+                Event::Stopped | Event::Resumed => {}
+                event => panic!("{name}: unexpected event {event:?}"),
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while serial.lock().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        client.call(Command::Pause).unwrap();
+        handle
+            .shared()
+            .wait_quiesced(Duration::from_secs(3))
+            .unwrap();
+        let diagnostics = {
+            let cpus = handle.shared().vcpus.lock();
+            let fd = cpus[0].1.lock();
+            (
+                fd.get_regs(),
+                fd.get_sregs(),
+                fd.get_vcpu_events(),
+                fd.get_mp_state(),
+            )
+        };
+        assert_eq!(
+            &*serial.lock(),
+            b"12",
+            "{name}: firmware did not restart once: {diagnostics:?}; events={:?}",
+            client.take_events()
+        );
+        let cpus = handle.shared().vcpus.lock();
+        let bsp = cpus[0].1.lock();
+        let mut sysenter = kvm_bindings::Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+            index: 0x174,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(bsp.get_msrs(&mut sysenter).unwrap(), 1);
+        assert_eq!(
+            sysenter.as_slice()[0].data,
+            0,
+            "{name}: SYSENTER_CS survived reset"
+        );
+        assert_eq!(
+            bsp.get_debug_regs().unwrap().db[0],
+            0,
+            "{name}: DR0 survived reset"
+        );
+        drop(bsp);
+        let tsc = |fd: &kvm_ioctls::VcpuFd| {
+            let mut value = kvm_bindings::Msrs::from_entries(&[kvm_bindings::kvm_msr_entry {
+                index: 0x10,
+                ..Default::default()
+            }])
+            .unwrap();
+            assert_eq!(fd.get_msrs(&mut value).unwrap(), 1);
+            value.as_slice()[0].data
+        };
+        let before = tsc(&cpus[0].1.lock());
+        let ap_tsc = tsc(&cpus[1].1.lock());
+        let after = tsc(&cpus[0].1.lock());
+        assert!(
+            (before..=after).contains(&ap_tsc),
+            "{name}: reset left unsynchronized TSCs: BSP {before}..{after}, AP {ap_tsc}"
+        );
+        assert_eq!(
+            cpus[1].1.lock().get_mp_state().unwrap().mp_state,
+            kvm_bindings::KVM_MP_STATE_UNINITIALIZED,
+            "{name}: AP must wait for SIPI"
+        );
+        drop(cpus);
+        client.call(Command::Quit).unwrap();
+        assert_eq!(vm.wait(), ExitReason::Shutdown(ShutdownReason::HostRequest));
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn paused_machine_resumes_and_reports_events() {
+    let Some((mut vm, handle, serial)) = payload_vm(&s5_payload(), true, false) else {
+        return;
+    };
+    assert_eq!(handle.status(), vmlab_hv_proto::control::RunState::Paused);
+    // A paused vCPU executes nothing: the serial log stays empty.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(serial.lock().is_empty());
+
+    vm.start();
+    assert_eq!(handle.status(), vmlab_hv_proto::control::RunState::Running);
+    handle.powerdown().expect("powerdown");
+    watchdog(&handle);
+
+    assert_eq!(
+        vm.wait(),
+        ExitReason::Shutdown(ShutdownReason::GuestShutdown)
+    );
+    assert_eq!(*serial.lock(), b"hello-s5\n");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn q35_reset_allows_three_application_processors_to_start_again() {
+    let Some(kvm) = kvm_or_skip() else { return };
+    drop(kvm);
+    let dir = tempfile::tempdir().unwrap();
+    let mut code = vec![
+        0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0xc7, 0x06, 1, 0x71, 0, 0, 0xc6, 0x06, 3, 0x71, 0,
+    ];
+    // x2APIC MSRs avoid real-mode segment limits on the high MMIO aperture.
+    code.extend([
+        0x66, 0xb9, 0x1b, 0, 0, 0, 0x0f, 0x32, 0x66, 0x0d, 0, 4, 0, 0, 0x0f, 0x30,
+    ]);
+    let mut messages = vec![(0x80fu32, 0x1ffu32, 0u32)];
+    for destination in 1..4 {
+        messages.extend([
+            (0x830, 0x4500, destination),
+            (0x830, 0x4608, destination),
+            (0x830, 0x4608, destination),
+        ]);
+    }
+    for (index, value, destination) in messages {
+        code.extend([0x66, 0xb9]);
+        code.extend(index.to_le_bytes());
+        code.extend([0x66, 0xba]);
+        code.extend(destination.to_le_bytes());
+        code.extend([0x66, 0xb8]);
+        code.extend(value.to_le_bytes());
+        code.extend([0x0f, 0x30]);
+    }
+    let poll = code.len();
+    code.extend([0x81, 0x3e, 1, 0x71, 1, 1, 0x75, 0]);
+    let first = code.len() - 1;
+    code[first] = (poll as isize - code.len() as isize) as i8 as u8;
+    code.extend([0x80, 0x3e, 3, 0x71, 1, 0x75, 0]);
+    let second = code.len() - 1;
+    code[second] = (poll as isize - code.len() as isize) as i8 as u8;
+    code.extend([
+        0xfe, 0x06, 0, 0x70, 0xa0, 0, 0x70, 0x04, b'0', 0xba, 0xf8, 3, 0xee, 0x3c, b'1', 0x74, 3,
+        0xf4, 0xeb, 0xfd, 0xba, 0xf9, 0x0c, 0xb0, 6, 0xee, 0xf4, 0xeb, 0xfd,
+    ]);
+    let mut image = vec![0; 65536];
+    image[..code.len()].copy_from_slice(&code);
+    image[0xfff0..0xfff5].copy_from_slice(&[0xea, 0, 0, 0, 0xf0]);
+    let bios = dir.path().join("bios.bin");
+    std::fs::write(&bios, image).unwrap();
+    let mut features = crate::hyperv::WINDOWS_FEATURES.to_vec();
+    if crate::hyperv::host_apic_virtualization() {
+        features.push(vmlab_hv_proto::machine::HyperV::Avic);
+    }
+    let desc: MachineDescription = serde_json::from_value(serde_json::json!({
+        "machine":"q35", "name":"smp-reset", "arch":"x86_64", "accel":"kvm",
+        "vcpus":4, "memory_mib":64, "hyperv":features,
+        "boot":{"kind":"firmware", "firmware":"seabios", "code":bios},
+        "disks":[], "nics":[], "ports":[], "serial_log":dir.path().join("serial.log")
+    }))
+    .unwrap();
+    let (factory, serial) = TestFactory::new();
+    let vm = builder::build(&desc, &factory, true).unwrap();
+    vm.ram
+        .mem
+        .write_slice(
+            &[
+                0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x66, 0xb8, 1, 0, 0, 0, 0x0f, 0xa2, 0x66, 0xc1, 0xeb,
+                24, 0xc6, 0x87, 0, 0x71, 1, 0xf4, 0xeb, 0xfd,
+            ],
+            GuestAddress(0x8000),
+        )
+        .unwrap();
+    let handle = vm.handle();
+    watchdog(&handle);
+    let socket = dir.path().join("control.sock");
+    crate::control::serve(&socket, &handle).unwrap();
+    let mut client = vmlab_hv_proto::client::Client::connect(&socket).unwrap();
+    client.call(Command::Resume).unwrap();
+    loop {
+        match client.wait_event().unwrap().expect("control remains open") {
+            Event::Reset => break,
+            Event::Stopped | Event::Resumed => {}
+            event => panic!("SMP reset: {event:?}; serial={:?}", serial.lock()),
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while serial.lock().len() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    client.call(Command::Quit).unwrap();
+    assert_eq!(vm.wait(), ExitReason::Shutdown(ShutdownReason::HostRequest));
+    assert_eq!(&*serial.lock(), b"12");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn control_socket_end_to_end() {
+    let Some((vm, handle, serial)) = payload_vm(&s5_payload(), false, false) else {
+        return;
+    };
+    watchdog(&handle);
+
+    let (_dir, socket) = temp_socket("e2e");
+    crate::control::serve(&socket, &handle).expect("serve control socket");
+
+    let mut client = vmlab_hv_proto::client::Client::connect(&socket).expect("handshake");
+    assert!(
+        client
+            .capabilities()
+            .contains(&vmlab_hv_proto::control::Capability::Snapshots)
+    );
+
+    match client.call(Command::Status).expect("status reply") {
+        Outcome::Ok {
+            status: Some(vmlab_hv_proto::control::RunState::Running),
+        } => {}
+        other => panic!("expected running status, got {other:?}"),
+    }
+
+    match client
+        .call(Command::SnapshotSave {
+            name: "nope".into(),
+        })
+        .expect("snapshot reply")
+    {
+        Outcome::Error {
+            code: vmlab_hv_proto::control::ErrorCode::Unsupported,
+            ..
+        } => {}
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+
+    match client.call(Command::Powerdown).expect("powerdown reply") {
+        Outcome::Ok { .. } => {}
+        other => panic!("expected ok, got {other:?}"),
+    }
+
+    // The shutdown event arrives unsolicited on the same connection.
+    match client.wait_event().expect("shutdown event") {
+        Some(Event::Shutdown {
+            reason: ShutdownReason::GuestShutdown,
+        }) => {}
+        other => panic!("expected shutdown event, got {other:?}"),
+    }
+
+    assert_eq!(
+        vm.wait(),
+        ExitReason::Shutdown(ShutdownReason::GuestShutdown)
+    );
+    assert_eq!(*serial.lock(), b"hello-s5\n");
+}
+
+/// Black-box check of the whole builder path with vmlab's real container
+/// kernel: boots, prints to the serial log, finds no rootfs, and the
+/// `panic=-1 reboot=t` cmdline turns the panic into the triple-fault reset
+/// this VMM reports as `guest_reset`.
+///
+/// Skips when the kernel asset is not on this host.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn real_kernel_boots_and_resets() {
+    const KERNEL: &str = "/home/wil/dev/vmlab/guest/dist/x86_64/vmlinuz";
+    if !Path::new(KERNEL).exists() {
+        eprintln!("skipping: container kernel {KERNEL} is not present");
+        return;
+    }
+    let Some(kvm) = kvm_or_skip() else {
+        return;
+    };
+    drop(kvm); // builder opens its own; this only gates on availability.
+
+    let (factory, serial) = TestFactory::new();
+    let dir = tempfile::tempdir().unwrap();
+    let desc = MachineDescription {
+        virtual_display: None,
+        fw_cfg: vec![],
+        exit_on_reset: true,
+        vfio: vec![],
+        machine: Default::default(),
+        cpu: Default::default(),
+        cpu_model: None,
+        invtsc: false,
+        tsc_khz: None,
+        vmware_cpuid_freq: false,
+        msr_policy: Default::default(),
+        applesmc: None,
+        usb_keyboard: false,
+        smbios_type2: false,
+        floppy: None,
+        serial_log_port: Default::default(),
+        hyperv: vec![],
+        display: None,
+        tablet: None,
+        usb: None,
+        tpm: None,
+        console_pci: None,
+        ahci_pci: None,
+        name: "kernel-test".into(),
+        arch: Arch::X86_64,
+        accel: Accel::Kvm,
+        vcpus: 1,
+        memory_mib: 512,
+        boot: Boot::Kernel {
+            kernel: KERNEL.into(),
+            initrd: None,
+            cmdline: "console=ttyS0 panic=-1 reboot=t".into(),
+        },
+        disks: vec![],
+        nics: vec![],
+        serial_log: dir.path().join("serial.log"),
+        ports: vec![],
+        shares: vec![],
+        audio: None,
+        rtc_base: None,
+    };
+
+    let vm = builder::build(&desc, &factory, false).expect("build the machine");
+    let handle = vm.handle();
+    watchdog(&handle);
+
+    let reason = vm.wait();
+    let log = String::from_utf8_lossy(&serial.lock()).to_string();
+    assert!(
+        log.contains("Linux version"),
+        "the kernel must reach early boot; serial log: {log}"
+    );
+    assert_eq!(
+        reason,
+        ExitReason::Shutdown(ShutdownReason::GuestReset),
+        "panic=-1 + reboot=t must end as guest_reset; serial log: {log}"
+    );
+}
+
+/// S3 through the PM block suspends the machine without ending the run.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn guest_s3_suspends() {
+    let mut code = Vec::new();
+    // Wait for SCI-less S3: write SLP_TYP=3 | SLP_EN to PM1a_CNT directly.
+    code.extend_from_slice(&[
+        0xBA, 0x04, 0x06, // mov dx, 0x604
+        0xB8, 0x00, 0x2C, // mov ax, 0x2C00 (SLP_TYP=3 | SLP_EN)
+        0xEF, // out dx, ax
+        0xF4, // hlt
+        0xEB, 0xFD, // jmp
+    ]);
+    let Some((vm, handle, _serial)) = payload_vm(&code, false, false) else {
+        return;
+    };
+    watchdog(&handle);
+
+    // Poll for Suspended rather than blocking on wait_exit, which never
+    // fires: a suspend is not an exit.
+    let mut suspended = false;
+    // Generous window: the first run of the suite pays compile-time load.
+    for _ in 0..400 {
+        if handle.status() == vmlab_hv_proto::control::RunState::Suspended {
+            suspended = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(suspended, "guest S3 must report Suspended");
+    // Resume from suspend is a wakeup, and the run continues.
+    assert_eq!(
+        handle
+            .resume()
+            .map(|s| s == vmlab_hv_proto::control::RunState::Running),
+        Ok(true)
+    );
+    // Stop the machine so the test ends.
+    handle.quit();
+    assert_eq!(vm.wait(), ExitReason::Shutdown(ShutdownReason::HostRequest));
+}

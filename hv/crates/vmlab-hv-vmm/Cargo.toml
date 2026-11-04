@@ -1,0 +1,44 @@
+[package]
+name = "vmlab-hv-vmm"
+description = "KVM virtual machine, vCPUs, machine models and snapshot orchestration for vmlab-hv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+log = "0.4"
+env_filter = "0.1"
+vmlab-hv-proto.workspace = true
+vmlab-hv-devices.workspace = true
+vmlab-hv-firmware.workspace = true
+vmlab-hv-display = { path = "../vmlab-hv-display" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+vmlab-disk.workspace = true
+vm-memory.workspace = true
+thiserror.workspace = true
+kvm-ioctls.workspace = true
+kvm-bindings = { workspace = true, features = ["serde", "fam-wrappers"] }
+linux-loader.workspace = true
+acpi_tables.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+zerocopy.workspace = true
+sha2.workspace = true
+parking_lot.workspace = true
+vfio-ioctls = "0.10"
+vfio-bindings = "0.7"
+vmm-sys-util = "0.15"
+
+[features]
+# The file-backed recording host for seam A3: test binaries only.
+testing = ["vmlab-hv-devices/testing"]
+
+[dev-dependencies]
+vmlab-hv-tests = { path = "../vmlab-hv-tests" }
+tempfile = "3"
+virtio-queue = "0.18"
+
+[lints]
+workspace = true

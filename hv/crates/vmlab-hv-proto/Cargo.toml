@@ -1,0 +1,24 @@
+[package]
+name = "vmlab-hv-proto"
+description = "Control protocol and machine description shared by vmlab and vmlab-hv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rustix = { version = "1", features = ["net"] }
+gdbstub = { version = "0.7", optional = true }
+gdbstub_arch = { version = "0.3", optional = true }
+
+[features]
+gdb = ["dep:gdbstub", "dep:gdbstub_arch"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

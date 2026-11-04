@@ -1,0 +1,630 @@
+//! KVM tests for the vhost-user-fs front-end against a real virtiofsd.
+//!
+//! These boot vmlab's container kernel and initramfs on a machine with one
+//! share, watch the guest's virtio-fs driver probe it through the serial log,
+//! and prove the backend session is real by saving and restoring the device
+//! through the vhost-user device-state transfer: machine A's section loads
+//! into a fresh virtiofsd behind machine B, and B's guest probes the share
+//! again. The unit tests in `vmlab-hv-devices::virtio::fs` observe the exact
+//! vhost-user messages (SET_MEM_TABLE, vring setup, state transfer) against a
+//! fake backend; these tests prove the whole thing against the real daemon.
+//!
+//! Every test skips with a printed reason when `/dev/kvm`, the kernel and
+//! initramfs assets, or `/usr/lib/virtiofsd` are missing.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use vmlab_hv_tests::process::ManagedChild;
+
+use parking_lot::Mutex;
+use vmlab_hv_devices::serial::{Serial, SerialOut};
+use vmlab_hv_devices::virtio::fs::{Fs, FsConfig};
+use vmlab_hv_devices::virtio::pci::VirtioPciDevice;
+use vmlab_hv_devices::{GuestMemory, IrqLine, PciSnapshot};
+use vmlab_hv_proto::machine::{Accel, Arch, Boot, FsShare, MachineDescription};
+use vmlab_hv_vmm::error::DeviceUnavailable;
+use vmlab_hv_vmm::factory::{BuiltPci, BuiltSerial};
+use vmlab_hv_vmm::{DeviceFactory, Vm, builder};
+
+const KERNEL: &str = "/home/wil/dev/vmlab/guest/dist/x86_64/vmlinuz";
+const INITRD: &str = "/home/wil/dev/vmlab/guest/dist/x86_64/initramfs.img";
+const VIRTIOFSD: &str = "/usr/lib/virtiofsd";
+const TAG: &str = "scratch";
+/// How long a boot has to reach the virtio-fs probe.
+const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn available() -> bool {
+    [
+        Path::new("/dev/kvm").exists(),
+        Path::new(KERNEL).exists(),
+        Path::new(INITRD).exists(),
+        Path::new(VIRTIOFSD).exists(),
+    ]
+    .into_iter()
+    .all(|yes| yes)
+}
+
+fn or_skip() -> Option<()> {
+    if available() {
+        Some(())
+    } else {
+        eprintln!("skipping: needs /dev/kvm, {KERNEL}, {INITRD} and {VIRTIOFSD} on this host");
+        None
+    }
+}
+
+/// A scratch directory removed on drop.
+struct Dir {
+    path: PathBuf,
+    dir: Option<tempfile::TempDir>,
+}
+
+impl Dir {
+    fn new(tag: &str) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("hv-vhost-{tag}-"))
+            .tempdir()
+            .unwrap();
+        Self {
+            path: dir.path().to_path_buf(),
+            dir: Some(dir),
+        }
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        if std::env::var_os("VHOST_FS_TEST_KEEP").is_some() {
+            let _ = self.dir.take().unwrap().keep();
+        }
+    }
+}
+
+/// A running virtiofsd serving one directory over one socket.
+struct Virtiofsd {
+    child: ManagedChild,
+    socket: PathBuf,
+}
+
+impl Virtiofsd {
+    /// Start virtiofsd the way vmlab does, with migration enabled when the
+    /// binary has the flags (`find-paths`, handle verification).
+    fn start(dir: &Dir, tag: &str, shared_dir: &Path) -> Self {
+        let socket = dir.path.join(format!("{tag}.sock"));
+        let log = File::create(dir.path.join(format!("{tag}.log"))).unwrap();
+        let mut args = vec![
+            "--socket-path".to_string(),
+            socket.display().to_string(),
+            "--shared-dir".to_string(),
+            shared_dir.display().to_string(),
+            "--cache".to_string(),
+            "auto".to_string(),
+            "--log-level".to_string(),
+            "warn".to_string(),
+        ];
+        let help = Command::new(VIRTIOFSD)
+            .arg("--help")
+            .stderr(Stdio::piped())
+            .output()
+            .expect("probe virtiofsd");
+        let help = String::from_utf8_lossy(&help.stderr).to_string();
+        if help.contains("--migration-mode") && help.contains("--migration-verify-handles") {
+            args.extend(
+                [
+                    "--migration-mode",
+                    "find-paths",
+                    "--migration-verify-handles",
+                    "--migration-on-error",
+                    "guest-error",
+                ]
+                .map(String::from),
+            );
+        }
+        let mut child = ManagedChild::helper(
+            Command::new(VIRTIOFSD)
+                .args(&args)
+                .stdout(log.try_clone().unwrap())
+                .stderr(Stdio::from(log)),
+        )
+        .expect("spawn virtiofsd");
+        // The socket appears once the daemon is ready; a bad flag shows up as
+        // an early exit instead.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    panic!("virtiofsd exited at startup with {status}");
+                }
+                Ok(None) => {}
+                Err(e) => panic!("waiting for virtiofsd: {e}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "virtiofsd never bound {socket:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Self { child, socket }
+    }
+
+    /// virtiofsd outlives its front-end (it keeps serving the socket), so
+    /// the daemon is killed on drop, the way vmlab's process manager does.
+    fn stop(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Virtiofsd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+/// A factory whose serial is the real 16550A into a log file and whose only
+/// PCI device is the real vhost-user-fs front-end; it records the function's
+/// snapshot handle so the tests can drive the device-state seam.
+struct TestFactory {
+    log_dir: PathBuf,
+    fs_snapshot: Mutex<Option<Arc<Mutex<dyn PciSnapshot>>>>,
+}
+
+impl TestFactory {
+    fn new(log_dir: &Path) -> Self {
+        Self {
+            log_dir: log_dir.to_path_buf(),
+            fs_snapshot: Mutex::new(None),
+        }
+    }
+
+    fn serial_log(&self) -> PathBuf {
+        self.log_dir.join("serial.log")
+    }
+
+    fn fs_snapshot(&self) -> Arc<Mutex<dyn PciSnapshot>> {
+        self.fs_snapshot.lock().clone().expect("share built")
+    }
+}
+
+impl DeviceFactory for TestFactory {
+    fn serial(
+        &self,
+        log_path: &Path,
+        irq: Arc<dyn IrqLine>,
+    ) -> Result<BuiltSerial, DeviceUnavailable> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .map_err(|e| {
+                DeviceUnavailable::new(
+                    "serial-16550a",
+                    format!("cannot open serial log {}: {e}", log_path.display()),
+                )
+            })?;
+        let dev = Arc::new(Mutex::new(Serial::new(
+            "serial0",
+            SerialOut::new(Box::new(file)),
+            irq,
+        )));
+        Ok(BuiltSerial {
+            clock: Some(dev.clone()),
+            device: dev.clone(),
+            snapshot: Some(dev),
+        })
+    }
+
+    fn virtio_blk(
+        &self,
+        _disk: &vmlab_hv_proto::machine::Disk,
+        _mem: &GuestMemory,
+        _msi: vmlab_hv_vmm::factory::PciWiring,
+    ) -> Result<vmlab_hv_vmm::factory::BuiltBlk, DeviceUnavailable> {
+        Err(DeviceUnavailable::new(
+            "virtio-blk",
+            "no block device in this test",
+        ))
+    }
+
+    fn virtio_console(
+        &self,
+        _ports: &[vmlab_hv_proto::machine::SerialPort],
+        _mem: &GuestMemory,
+        _msi: vmlab_hv_vmm::factory::PciWiring,
+    ) -> Result<BuiltPci, DeviceUnavailable> {
+        Err(DeviceUnavailable::new(
+            "virtio-console",
+            "no console device in this test",
+        ))
+    }
+
+    fn virtio_net(
+        &self,
+        _nic: &vmlab_hv_proto::machine::Nic,
+        _mem: &GuestMemory,
+        _msi: vmlab_hv_vmm::factory::PciWiring,
+    ) -> Result<BuiltPci, DeviceUnavailable> {
+        Err(DeviceUnavailable::new(
+            "virtio-net",
+            "no net device in this test",
+        ))
+    }
+
+    fn fs_share(
+        &self,
+        share: &FsShare,
+        mem: &GuestMemory,
+        msi: vmlab_hv_vmm::factory::PciWiring,
+    ) -> Result<BuiltPci, DeviceUnavailable> {
+        let id = format!("fs-{}", share.tag);
+        let Some(socket) = share.socket.clone() else {
+            return Err(DeviceUnavailable::new(
+                "vhost-user-fs",
+                format!("share `{}` is not a vhost-user socket", share.tag),
+            ));
+        };
+        let fs = Fs::new(
+            id.clone(),
+            FsConfig {
+                tag: share.tag.clone(),
+                socket,
+            },
+        )
+        .map_err(|e| {
+            DeviceUnavailable::new("vhost-user-fs", format!("share `{}`: {e}", share.tag))
+        })?;
+        let pci = Arc::new(Mutex::new(VirtioPciDevice::new(
+            id,
+            Box::new(fs),
+            mem.clone(),
+            Some(msi.msi),
+            None,
+        )));
+        *self.fs_snapshot.lock() = Some(pci.clone() as Arc<Mutex<dyn PciSnapshot>>);
+        Ok(BuiltPci {
+            function: pci,
+            snapshot: None,
+        })
+    }
+}
+
+/// The stock initramfs's cinit dies without `vmlab.root=` before it ever
+/// loads virtiofs, so append a cpio overlay whose `/init` does the share
+/// mount by hand: modprobe virtiofs, mount the share, read the shared file
+/// back to the serial log, then idle so the machine survives to be
+/// snapshotted. The kernel unpacks concatenated archives, later files
+/// winning, so the overlay's `/init` replaces cinit's.
+fn initrd_with_init_script(dir: &Dir) -> PathBuf {
+    let overlay = dir.path.join("overlay");
+    let init_dir = overlay.join("etc"); // keep /etc/vmlab-modules from the base
+    std::fs::create_dir_all(&overlay).unwrap();
+    let _ = init_dir;
+    // The initramfs ships busybox without applet symlinks, so every tool is
+    // called through the busybox binary itself.
+    let script = format!(
+        "#!/bin/sh\necho VMLAB-FS-BOOT\n/bin/busybox modprobe virtiofs\n\
+         /bin/busybox mkdir -p /mnt\n/bin/busybox mount -t virtiofs {TAG} /mnt\n\
+         /bin/busybox cat /mnt/hello.txt\necho VMLAB-FS-OK\n/bin/busybox sleep 3600\n"
+    );
+    let init = overlay.join("init");
+    fs::write(&init, script).unwrap();
+    make_executable(&init);
+    let archive = dir.path.join("overlay.cpio");
+    let mut child = Command::new("cpio")
+        .current_dir(&overlay)
+        .args(["-o", "-H", "newc", "--owner", "0:0", "-F"])
+        .arg(&archive)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn cpio");
+    // Close stdin before waiting so cpio sees the end of the file list.
+    {
+        let mut stdin = child.stdin.take().expect("cpio stdin");
+        stdin
+            .write_all(b".\n./init\n")
+            .expect("feed cpio the file list");
+    }
+    let status = child.wait().expect("wait for cpio to finish the archive");
+    assert!(
+        status.success(),
+        "cpio failed to build {archive:?}: {status}"
+    );
+    let combined = dir.path.join("initrd.img");
+    append_cpio_archive(Path::new(INITRD), &archive, &combined);
+    combined
+}
+
+fn append_cpio_archive(base: &Path, archive: &Path, combined: &Path) {
+    let mut out = File::create(combined).unwrap();
+    let mut base = File::open(base).unwrap();
+    let base_length = std::io::copy(&mut base, &mut out).unwrap();
+    // Raw newc headers stay four-byte aligned across compressed members.
+    let padding = (4 - base_length % 4) % 4;
+    out.write_all(&[0; 3][..padding as usize]).unwrap();
+    let mut extra = File::open(archive).unwrap();
+    std::io::copy(&mut extra, &mut out).unwrap();
+    std::io::Write::flush(&mut out).unwrap();
+}
+
+#[test]
+fn appended_cpio_is_aligned_after_every_compressed_image_length() {
+    let dir = Dir::new("alignment");
+    let archive = Command::new("cpio")
+        .args(["-o", "-H", "newc", "--quiet"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("build an empty cpio archive");
+    assert!(archive.status.success());
+    assert!(archive.stdout.starts_with(b"070701"));
+    let archive_path = dir.path.join("extra.cpio");
+    fs::write(&archive_path, &archive.stdout).unwrap();
+    let base = dir.path.join("base");
+    let combined = dir.path.join("combined");
+    for length in 1usize..=8 {
+        fs::write(&base, vec![0x55; length]).unwrap();
+        append_cpio_archive(&base, &archive_path, &combined);
+        let bytes = fs::read(&combined).unwrap();
+        let offset = length.next_multiple_of(4);
+        assert_eq!(&bytes[..length], vec![0x55; length]);
+        assert!(bytes[length..offset].iter().all(|byte| *byte == 0));
+        assert_eq!(&bytes[offset..], archive.stdout);
+    }
+}
+
+/// chmod 0o755 on a path (cpio -o cannot take the mode from the fs when we
+/// list files by hand).
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+#[test]
+#[cfg_attr(
+    vmlab_ci_no_host_assets,
+    ignore = "requires the vmlab container initrd"
+)]
+fn initrd_overlay_is_complete_before_returning() {
+    if !Path::new(INITRD).exists() {
+        eprintln!("skipping: needs {INITRD}");
+        return;
+    }
+    std::thread::scope(|scope| {
+        let builds: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    use std::io::{Seek, SeekFrom};
+
+                    let dir = Dir::new("archive");
+                    let combined = initrd_with_init_script(&dir);
+                    let mut archive = File::open(combined).unwrap();
+                    archive
+                        .seek(SeekFrom::Start(
+                            fs::metadata(INITRD).unwrap().len().next_multiple_of(4),
+                        ))
+                        .unwrap();
+                    let output = Command::new("cpio")
+                        .args(["-i", "--quiet", "--to-stdout"])
+                        .stdin(archive)
+                        .output()
+                        .expect("read the appended cpio archive");
+                    assert!(
+                        output.status.success(),
+                        "invalid appended archive: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(
+                        output.stdout,
+                        fs::read(dir.path.join("overlay/init")).unwrap()
+                    );
+                })
+            })
+            .collect();
+        for build in builds {
+            build.join().unwrap();
+        }
+    });
+}
+
+/// One machine description with a single share on `socket`.
+fn machine(dir: &Dir, socket: &Path, initrd: &Path) -> MachineDescription {
+    MachineDescription {
+        virtual_display: None,
+        fw_cfg: vec![],
+        exit_on_reset: false,
+        vfio: vec![],
+        machine: Default::default(),
+        cpu: Default::default(),
+        cpu_model: None,
+        invtsc: false,
+        tsc_khz: None,
+        vmware_cpuid_freq: false,
+        msr_policy: Default::default(),
+        applesmc: None,
+        usb_keyboard: false,
+        smbios_type2: false,
+        floppy: None,
+        serial_log_port: Default::default(),
+        hyperv: vec![],
+        display: None,
+        tablet: None,
+        usb: None,
+        tpm: None,
+        console_pci: None,
+        ahci_pci: None,
+        name: "vhost-fs-test".into(),
+        arch: Arch::X86_64,
+        accel: Accel::Kvm,
+        vcpus: 1,
+        memory_mib: 256,
+        boot: Boot::Kernel {
+            kernel: KERNEL.into(),
+            initrd: Some(initrd.to_path_buf()),
+            // Loud enough for the virtio-fs probe to reach the log.
+            cmdline: "console=ttyS0 loglevel=7 panic=-1 reboot=t".into(),
+        },
+        disks: vec![],
+        nics: vec![],
+        serial_log: dir.path.join("serial.log"),
+        ports: vec![],
+        shares: vec![FsShare {
+            pci: None,
+            tag: TAG.into(),
+            socket: Some(socket.to_path_buf()),
+            path: None,
+            read_only: false,
+        }],
+        audio: None,
+        rtc_base: None,
+    }
+}
+
+/// Poll the serial log until it contains `needle`, then return it.
+fn wait_for_serial(log: &Path, needle: &str) -> String {
+    let deadline = Instant::now() + BOOT_TIMEOUT;
+    loop {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serial log never contained {needle:?}; log so far:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Stop a machine at the end of a test and hand back nothing.
+fn teardown(vm: Vm) {
+    vm.handle().quit();
+    vm.wait();
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn guest_mounts_the_share_and_the_session_is_real() {
+    let Some(()) = or_skip() else {
+        return;
+    };
+    let _permit = vmlab_hv_tests::process::VmPermit::acquire().unwrap();
+    let dir = Dir::new("probe");
+    let shared = dir.path.join("share");
+    fs::create_dir(&shared).unwrap();
+    fs::write(shared.join("hello.txt"), b"from virtiofsd\n").unwrap();
+    let virtiofsd = Virtiofsd::start(&dir, "a", &shared);
+    let initrd = initrd_with_init_script(&dir);
+
+    let factory = TestFactory::new(&dir.path);
+    let vm = builder::build(&machine(&dir, &virtiofsd.socket, &initrd), &factory, false)
+        .expect("build the machine");
+
+    // The guest's own virtio-fs driver binds the device (DRIVER_OK runs the
+    // front-end's full vhost-user setup), mounts the share and reads the
+    // file virtiofsd serves: the whole path both ways.
+    let log = wait_for_serial(&factory.serial_log(), "VMLAB-FS-OK");
+    assert!(
+        log.contains("from virtiofsd"),
+        "the guest must read the shared file; log:\n{log}"
+    );
+
+    // Pause and save: virtiofsd answers GET_VRING_BASE, serialises its state
+    // through the device-state pipe and passes CHECK_DEVICE_STATE — proof the
+    // backend holds the mem table and both live vrings.
+    vm.handle().pause().expect("pause");
+    let fs = factory.fs_snapshot();
+    let section = fs.lock().save_wrapped_state().expect("save device state");
+    // magic(4) + version(1) + active(1) + features(8) + count(2) + 2*base(8)
+    // + len(4) leaves the state bytes themselves, which must be non-empty.
+    assert!(
+        section.len() > 28,
+        "the device-state section must carry virtiofsd's state, got {} bytes",
+        section.len()
+    );
+    vm.handle().resume().expect("resume");
+    teardown(vm);
+    // The daemon exits with its front-end: the session was live end to end.
+    virtiofsd.stop();
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn device_state_round_trips_through_virtiofsd() {
+    let Some(()) = or_skip() else {
+        return;
+    };
+    let _permit = vmlab_hv_tests::process::VmPermit::acquire().unwrap();
+    let dir = Dir::new("roundtrip");
+    let shared = dir.path.join("share");
+    fs::create_dir(&shared).unwrap();
+    fs::write(shared.join("hello.txt"), b"from virtiofsd\n").unwrap();
+    let initrd = initrd_with_init_script(&dir);
+
+    // Machine A: boot, mount the share, save both sections.
+    let virtiofsd_a = Virtiofsd::start(&dir, "a", &shared);
+    let factory_a = TestFactory::new(&dir.path);
+    let vm_a = builder::build(
+        &machine(&dir, &virtiofsd_a.socket, &initrd),
+        &factory_a,
+        false,
+    )
+    .expect("build machine A");
+    wait_for_serial(&factory_a.serial_log(), "VMLAB-FS-OK");
+    vm_a.handle().pause().expect("pause A");
+    let fs_a = factory_a.fs_snapshot();
+    let (transport_state, device_state) = {
+        let fs = fs_a.lock();
+        let transport = fs.save_function_state().expect("save transport state");
+        let device = fs.save_wrapped_state().expect("save device state");
+        (transport, device)
+    };
+    assert!(
+        device_state.len() > 28,
+        "the device-state section must carry virtiofsd's state, got {} bytes",
+        device_state.len()
+    );
+    teardown(vm_a);
+    virtiofsd_a.stop();
+
+    // Machine B: a fresh virtiofsd on the same shared dir, a paused machine,
+    // and the sections restored in snapshot order: transport first, then
+    // device state. Activation applies the saved ring bases and pushes the
+    // state blob through SET_DEVICE_STATE_FD into the new daemon.
+    let virtiofsd_b = Virtiofsd::start(&dir, "b", &shared);
+    let dir_b = Dir::new("roundtrip-b");
+    let initrd_b = initrd_with_init_script(&dir_b);
+    let factory_b = TestFactory::new(&dir_b.path);
+    let mut vm_b = builder::build(
+        &machine(&dir_b, &virtiofsd_b.socket, &initrd_b),
+        &factory_b,
+        true,
+    )
+    .expect("build machine B");
+    let fs_b = factory_b.fs_snapshot();
+    fs_b.lock()
+        .restore_function_state(&transport_state)
+        .expect("restore transport");
+    fs_b.lock()
+        .restore_wrapped_state(&device_state)
+        .expect("restore device state");
+
+    // Resume: the guest boots fresh, and mounts and reads the share through
+    // the restored backend session.
+    vm_b.start();
+    let log_b = wait_for_serial(&factory_b.serial_log(), "VMLAB-FS-OK");
+    assert!(
+        log_b.contains("from virtiofsd"),
+        "the restored session must serve the share; log:\n{log_b}"
+    );
+    teardown(vm_b);
+    virtiofsd_b.stop();
+}
