@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=vmlab viewer
+Comment=Console for a vmlab virtual machine
+Exec=vmlab-hv-viewer
+Icon=dev.vmlab.viewer
+StartupWMClass=dev.vmlab.viewer
+NoDisplay=true
+Terminal=false
+Categories=System;

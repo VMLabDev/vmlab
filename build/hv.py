@@ -110,6 +110,24 @@ def check_elf(path, rpath):
             raise RuntimeError(f"{path} did not resolve bundled virglrenderer")
 
 
+def stage_viewer_desktop(stage):
+    app = "dev.vmlab.viewer"
+    applications = stage / "share/applications"
+    applications.mkdir(parents=True)
+    shutil.copy2(ROOT / "build" / f"{app}.desktop",
+                 applications / f"{app}.desktop")
+    for size in (16, 24, 32, 48, 64, 128, 256, "scalable"):
+        directory = str(size) if size == "scalable" else f"{size}x{size}"
+        icons = stage / "share/icons/hicolor" / directory / "apps"
+        icons.mkdir(parents=True)
+        original = "icon.svg" if size == "scalable" else f"icon-{size}.png"
+        suffix = Path(original).suffix
+        shutil.copy2(ROOT / "guest/logo" / original, icons / f"{app}{suffix}")
+    installer = stage / "install-viewer-icons.sh"
+    shutil.copy2(ROOT / "build/install-viewer-icons.sh", installer)
+    installer.chmod(0o755)
+
+
 def package(version):
     if os.uname().machine != "x86_64":
         raise RuntimeError("the hypervisor release bundle requires Linux x86_64")
@@ -133,6 +151,7 @@ def package(version):
         stage = Path(temporary) / name
         for directory in ("bin", "lib", "libexec", "licenses"):
             (stage / directory).mkdir(parents=True)
+        stage_viewer_desktop(stage)
         shutil.copy2(target / "release/vmlab-hv", stage / "libexec/vmlab-hv")
         shutil.copy2(target / "release/vmlab-hv-viewer", stage / "bin/vmlab-hv-viewer")
         shutil.copy2(VIRGL / "libexec/virgl_render_server", stage / "libexec/virgl_render_server")
@@ -159,6 +178,15 @@ Keep bin/, lib/ and libexec/ together. Add this bundle's bin/ to PATH,
 or set host {{ vmlab_hv = "/absolute/path/to/bin/vmlab-hv" }} in
 ~/.config/vmlab/config.wcl, following import <vmlab-host.wcl>.
 The viewer is beside that launcher and is discovered automatically.
+
+Run ./install-viewer-icons.sh once as your desktop user to install the viewer's
+hidden desktop entry and hicolor icons. It uses $XDG_DATA_HOME, defaulting to
+~/.local/share: applications/dev.vmlab.viewer.desktop and
+icons/hicolor/<size>x<size>/apps/dev.vmlab.viewer.png (16, 24, 32, 48, 64, 128, 256),
+plus icons/hicolor/scalable/apps/dev.vmlab.viewer.svg.
+Wayland matches the viewer's dev.vmlab.viewer app ID to this entry; X11 also
+receives an embedded icon. No menu entry is added. Keep share/ with the bundle
+until you have run the helper. Run it again after updating the bundle's icons.
 
 bin/vmlab-hv is a launcher for libexec/vmlab-hv. It sets the supported
 RENDER_SERVER_EXEC_PATH override to this bundle's libexec/virgl_render_server

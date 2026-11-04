@@ -89,8 +89,19 @@ sha256sum -c "$ASSET.sha256"
 mkdir -p "$HOME/.local/opt"
 tar -xzf "$ASSET" -C "$HOME/.local/opt"
 export PATH="$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/bin:$PATH"
+"$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/install-viewer-icons.sh"
 SRC
   }
+
+  p <<DOC
+    Run the icon installer as your desktop user. It installs a hidden
+    `dev.vmlab.viewer.desktop` into `~/.local/share/applications` and the
+    matching PNG and SVG icons into `~/.local/share/icons/hicolor`.
+    If you set `XDG_DATA_HOME`, it uses that directory instead.
+    Wayland uses the viewer's app ID to find this icon; X11 also receives
+    an embedded icon. The desktop entry adds no application-menu item.
+    Run the helper again when the bundle's icons change.
+  DOC
 
   p <<DOC
     Keep the extracted `bin/`, `lib/` and `libexec/` directories together.

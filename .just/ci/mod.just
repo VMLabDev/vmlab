@@ -31,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance
+check: lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test
 
 # Run clippy with warnings as errors
 [group('ci')]
@@ -89,6 +89,11 @@ ebpf-verify: ebpf-build
 [group('ci')]
 hv-native-deps-install: require-uv
 	uv run --no-project python build/hv.py native-deps-install
+
+# Test the viewer's release payload and per-user icon installer
+[group('ci')]
+hv-desktop-test: require-uv
+	uv run --no-project python -m unittest discover -s build -p 'test_*.py'
 
 # Emit the pinned virglrenderer cache identity
 [group('ci')]

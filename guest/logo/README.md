@@ -1,4 +1,4 @@
-# Boot wordmark
+# vmlab logos
 
 `wordmark.svg` is the editable source. It contains paths, so rendering does not
 depend on an installed font. The light, bold sans-serif wordmark has a transparent
@@ -18,3 +18,23 @@ changing the SVG. Commit both generated assets with the source:
 OVMF publishes its logo through BGRT. Windows can reuse it during boot.
 The pinned vmlab-hv protocol has no extra fw_cfg file field, so its SeaBIOS
 guests do not receive the splash. Its OVMF guests use the branded CODE normally.
+
+## App icon
+
+`icon.svg` is the editable, path-only app icon: a light, bold `v` on a dark
+rounded tile. It uses the wordmark's colour and letter shape, with wider strokes
+for small sizes. The transparent outer margin separates it from light and dark
+desktop panels.
+
+Run `guest/logo/render-icon.sh` after changing the SVG. Commit the source and
+all seven generated PNGs (16, 24, 32, 48, 64, 128, and 256 pixels).
+To refresh the hypervisor viewer's embedded 64-pixel RGBA copy as well, pass its
+output path:
+
+```sh
+guest/logo/render-icon.sh /path/to/vmlab-hypervisor/crates/vmlab-hv-viewer/assets/icon.rgba
+```
+
+The hypervisor bundle ships these icons under the hicolor name
+`dev.vmlab.viewer`. Its `install-viewer-icons.sh` installs them and the hidden
+desktop entry for Wayland app-ID matching.
