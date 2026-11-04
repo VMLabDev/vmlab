@@ -1,0 +1,19 @@
+playbook "VMLab Windows driver build tools" {
+  description = "Pinned Visual Studio Build Tools, Windows SDK, and WDK"
+  version = "1.0.0"
+  play "toolchain" {
+    description = "Converge the Windows driver build machine"
+    step "toolchain" {
+      description = "Install the pinned C++ workload and hash-verified SDK and WDK packages"
+      resource = "weave.execute"
+      properties {
+        shell = :powershell
+        cwd = "C:/weave/playbooks/toolchain"
+        timeout = 110min
+        check = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./install-tools.ps1 -Check; exit $LASTEXITCODE"
+        run = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./install-tools.ps1; exit $LASTEXITCODE"
+        reboot_on = [3010, 1641]
+      }
+    }
+  }
+}

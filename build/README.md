@@ -12,6 +12,21 @@ the tests probe for. It holds none of the checkout. The toolchains come from
 `scripts/guest-toolchains.sh`, one stage per layer, so editing the source never
 rebuilds a toolchain.
 
+The Windows indirect display driver uses Clang and lld in this container with
+hash-locked SDK, WDK, and CRT packages. Catalog generation and test-signing run
+in the pinned Windows build lab. Before `buildbox::dist` or `guest-package`,
+stage its signed package from the host:
+
+```sh
+cargo build --bin vmlab
+python3 guest/vdisplay-windows/rebuild.py --route container
+```
+
+This requires Docker, the local Windows 11 `standard` template, and config-weave's
+Windows executable. See `guest/vdisplay-windows/README.md` for the pinned build
+lab and the MSVC alternative. Guest packaging refuses a missing or stale signed
+package. `VMLAB_VDISPLAY_PACKAGE_DIR` selects a separately built package.
+
 ```sh
 just buildbox::image          # build the image (tag: $VMLAB_BUILD_IMAGE, default vmlab-build)
 just buildbox::dist [version] # build every release artefact into target/dist/

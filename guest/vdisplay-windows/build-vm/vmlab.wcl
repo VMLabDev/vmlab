@@ -1,0 +1,19 @@
+import <vmlab.wcl>
+
+lab "vdisplay-build" {
+  gui = false
+  agent_update = false
+  segment "build" { nat = true }
+  vm "build" {
+    template = "x86_64/windows-11#standard"
+    hypervisor = "qemu"
+    secure_boot = false
+    cpus = 4
+    memory = 8GiB
+    nic { segment = "build" }
+    playbook "toolchain" {
+      play = "toolchain"
+      timeout = 2h
+    }
+  }
+}
