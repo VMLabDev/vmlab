@@ -375,6 +375,23 @@ SRC
       | "Field" | "Type" | "Default" | "Meaning" |
       | "`mode`" | "utf8" | "required" | "`passthrough`, `virgl` or `vulkan`." |
       | "`host_gpu`" | "utf8" | "the host's default GPU" | "Name of a host GPU declared in the host config, matched case-insensitively. Under `passthrough` the device handed to the VM; under `virgl` and `vulkan` the GPU that renders." |
+      | "`virtual_display`" | "bool" | "false" | "Shared-memory virtual monitor for a Windows guest on vmlab-hv. Requires `mode = \"passthrough\"` and `hypervisor = \"vmlab\"`. Refused for virgl, vulkan, and QEMU." |
+      | "`virtual_display_memory`" | "std.ByteSize" | "128MiB" | "Shared PCI BAR2 size. Requires `virtual_display = true`. Must be a power of two large enough for three 3840x2160 XRGB8888 buffers, the 4KiB header, and a 256x256 cursor. The smallest accepted power of two is 128MiB." |
+  }
+  p <<DOC
+    With `virtual_display = true`, the Windows indirect display driver publishes
+    frames through an ivshmem-compatible PCI device. The guest needs that driver
+    and the virtio-win IVSHMEM driver. Firmware and boot use the emulated display.
+    Once the guest publishes a frame, the native viewer, VNC, recording, and vision
+    commands show the virtual monitor. If the driver blanks the monitor or its
+    heartbeat stops for three seconds, output returns to the emulated display.
+    Viewer resize hints request a guest mode, limited to 3840x2160.
+    These GPU settings apply at VM start and are not inherited from a template.
+  DOC
+  code wcl { source = <<'SRC'
+hypervisor = "vmlab"
+gpu { mode = "passthrough" virtual_display = true virtual_display_memory = 128MiB }
+SRC
   }
   p <<DOC
     The lab daemon picks the host GPU when the VM starts. A `host_gpu` this

@@ -18,7 +18,7 @@ use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
     Accel, Arch, Audio, AudioDevice, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
     DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV, Machine, Nic,
-    NicAttachment, PciAddress, SerialPort, Tpm, VfioDevice,
+    NicAttachment, PciAddress, SerialPort, Tpm, VfioDevice, VirtualDisplay,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -101,6 +101,7 @@ pub(crate) fn container(
         vmstate,
     };
     Ok(MachineDescription {
+        virtual_display: None,
         fw_cfg: Vec::new(),
         // A guest reset happens in place, as under QEMU.
         exit_on_reset: false,
@@ -573,6 +574,16 @@ pub(crate) fn vm(
             read_only: share.readonly,
         })
         .collect();
+    let virtual_display = resolved.gpu.as_ref().filter(|gpu| gpu.virtual_display).map(|gpu| {
+        if gpu.mode != VmGpuMode::Passthrough {
+            bail!("vm \"{name}\": virtual_display requires gpu mode = \"passthrough\"");
+        }
+        let memory_bytes = gpu.virtual_display_memory.unwrap_or_else(VirtualDisplay::default_memory_bytes);
+        if !VirtualDisplay::valid_memory_bytes(memory_bytes) {
+            bail!("vm \"{name}\": invalid virtual_display_memory; use a power of two of at least 128MiB");
+        }
+        Ok(VirtualDisplay { pci: slots.next(), memory_bytes })
+    }).transpose()?;
     if slots.0 >= 0x1b {
         bail!("vm \"{name}\": more PCI devices than q35's bus 0 has slots for under vmlab-hv");
     }
@@ -593,6 +604,7 @@ pub(crate) fn vm(
         None
     };
     Ok(MachineDescription {
+        virtual_display,
         fw_cfg,
         // A guest reset happens in place, as under QEMU: the process, its
         // sockets and every connection to them stay (PRD §22).
@@ -1502,6 +1514,53 @@ mod tests {
         assert_eq!(d.tablet, at(6));
         let err = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap_err();
         assert!(err.to_string().contains("needs a host GPU"), "{err}");
+    }
+
+    #[test]
+    fn virtual_display_is_opt_in_and_has_a_distinct_pci_slot() {
+        let paths = VmPaths {
+            gpu_passthrough: Some("0000:05:00.0".into()),
+            ..vm_paths()
+        };
+        let plain = declared(
+            r#"profile = "windows-10" firmware = "seabios" gpu { mode = "passthrough" }"#,
+            None,
+        );
+        assert!(
+            vm("l", &plain, &paths, QemuAccel::Kvm, &roms())
+                .unwrap()
+                .virtual_display
+                .is_none()
+        );
+        for (memory, want) in [
+            ("", 128 << 20),
+            ("virtual_display_memory = 256MiB", 256 << 20),
+        ] {
+            let resolved = declared(
+                &format!(
+                    r#"profile = "windows-10" firmware = "seabios" gpu {{ mode = "passthrough" virtual_display = true {memory} }}"#
+                ),
+                None,
+            );
+            let description = vm("l", &resolved, &paths, QemuAccel::Kvm, &roms()).unwrap();
+            let virtual_display = description.virtual_display.as_ref().unwrap();
+            assert_eq!(virtual_display.memory_bytes, want);
+            assert_ne!(virtual_display.pci, description.vfio[0].pci);
+            assert_ne!(
+                virtual_display.pci,
+                description.display.as_ref().unwrap().pci
+            );
+            assert_ne!(Some(virtual_display.pci), description.tablet);
+            let back: MachineDescription =
+                serde_json::from_value(serde_json::to_value(&description).unwrap()).unwrap();
+            assert_eq!(back, description);
+            assert!(
+                crate::qemu::build_args("l", &resolved, &paths, QemuAccel::Kvm)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("virtual_display")
+            );
+        }
     }
 
     /// `usb = true`: the tablet's xHCI is also `usbx`, the controller host

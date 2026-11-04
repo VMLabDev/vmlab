@@ -2101,6 +2101,12 @@ fn synth_spec_lab(
         if let Some(name) = &gpu.host_gpu {
             write!(attrs, " host_gpu = {}", wcl_str(name)).unwrap();
         }
+        if gpu.virtual_display {
+            attrs.push_str(" virtual_display = true");
+        }
+        if let Some(memory) = gpu.virtual_display_memory {
+            write!(attrs, " virtual_display_memory = {memory}").unwrap();
+        }
         writeln!(s, "    gpu {{ {attrs} }}").unwrap();
     }
     // Template-declared NICs carry over. The synthetic lab declares no
@@ -3787,6 +3793,20 @@ template "t" { arch = "x86_64" version = "1" disk = 10GiB source "scratch" {}
     /// A build's `gpu {}` is never sealed into the metadata — not the base's
     /// block, not a variant's — because a clone's GPU is the lab's choice
     /// (§6.1); and so a clone of the variant gets the profile's plain display.
+    #[test]
+    fn virtual_display_build_settings_survive_synthetic_lab_rendering() {
+        let definition = def(r#"import <vmlab.wcl>
+template "win" { arch = "x86_64" version = "1" profile = "windows-10"
+    gpu { mode = "passthrough" virtual_display = true virtual_display_memory = 256MiB }
+    source "iso" { path = "/i.iso" }
+}"#);
+        let source = render(&definition);
+        let parsed = crate::config::load_lab_source(&source, "<test>", Path::new("/root")).unwrap();
+        let gpu = parsed.lab.vms[0].gpu.as_ref().unwrap();
+        assert!(gpu.virtual_display);
+        assert_eq!(gpu.virtual_display_memory, Some(256 << 20));
+    }
+
     #[test]
     fn a_build_gpu_is_not_recorded_for_clones() {
         let d = def(r#"import <vmlab.wcl>

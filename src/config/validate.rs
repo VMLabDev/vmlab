@@ -348,6 +348,13 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             check_disk_block(&file.root, d, &mut issues);
         }
         if let Some(gpu) = &vm.gpu {
+            check_virtual_display_family(
+                gpu,
+                login_family(
+                    effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref(),
+                ),
+                &mut issues,
+            );
             check_gpu(
                 &format!("vm \"{}\"", vm.name),
                 gpu,
@@ -808,6 +815,18 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 .and_then(|meta| meta.profile.as_deref())
         });
         let base_family = login_family(base_profile);
+        if let Some(gpu) = &t.gpu {
+            check_virtual_display_family(gpu, base_family, &mut issues);
+        }
+        for variant in &t.variants {
+            if let Some(gpu) = variant.gpu.as_ref().or(t.gpu.as_ref()) {
+                let family = variant
+                    .profile
+                    .as_deref()
+                    .map_or(base_family, |p| login_family(Some(p)));
+                check_virtual_display_family(gpu, family, &mut issues);
+            }
+        }
         check_logins("template", &t.name, &t.logins, base_family, &mut issues);
         let variant_playbooks = t.variants.iter().flat_map(|v| {
             let family = match &v.profile {
@@ -1826,6 +1845,13 @@ fn check_dependency_cycles(
     }
 }
 
+/// The version-one driver supports Windows guests.
+fn check_virtual_display_family(gpu: &Gpu, family: LoginFamily, issues: &mut IssueList) {
+    if gpu.virtual_display && matches!(family, LoginFamily::Linux | LoginFamily::Macos) {
+        issues.push(Issue::at(gpu.span, "virtual_display requires a Windows guest driver in version 1; this guest profile is not Windows"));
+    }
+}
+
 /// A `gpu {}` (PRD §5.2) — a VM's, or the build VM's a template or variant
 /// declares (§6.1): `host_gpu`, when written, names something, and this host
 /// can give the block its host GPU. `who` is the block it sits in, as the
@@ -1838,6 +1864,28 @@ fn check_gpu(
     ctx: &dyn ValidationContext,
     issues: &mut IssueList,
 ) {
+    if gpu.virtual_display && gpu.mode != GpuMode::Passthrough {
+        issues.push(Issue::at(gpu.span, format!("{who}: virtual_display requires gpu mode = \"passthrough\"; virgl and vulkan are not supported")));
+    }
+    if gpu.virtual_display && hypervisor != HypervisorKind::Vmlab {
+        issues.push(Issue::at(
+            gpu.span,
+            format!(
+                "{who}: virtual_display requires hypervisor = \"vmlab\"; QEMU does not support it"
+            ),
+        ));
+    }
+    if let Some(size) = gpu.virtual_display_memory {
+        if !gpu.virtual_display {
+            issues.push(Issue::at(
+                gpu.span,
+                format!("{who}: virtual_display_memory requires virtual_display = true"),
+            ));
+        }
+        if !vmlab_hv_proto::machine::VirtualDisplay::valid_memory_bytes(size) {
+            issues.push(Issue::at(gpu.span, format!("{who}: virtual_display_memory must be a power of two large enough for three 3840x2160 XRGB frames and the cursor; use at least 128MiB")));
+        }
+    }
     if gpu.host_gpu.as_deref().is_some_and(|n| n.trim().is_empty()) {
         issues.push(Issue::at(
             gpu.span,
@@ -3383,6 +3431,76 @@ lab "l" {{ vm "a" {{ template = "x86_64/t" gpu {{ {gpu} }} }} }}"#
         assert!(gpu_errs(r#"mode = "passthrough" host_gpu = "Vfio1""#).is_empty());
         let es = gpu_errs(r#"mode = "vulkan" host_gpu = """#);
         assert!(es.len() == 1 && es[0].contains("empty string"), "{es:#?}");
+    }
+
+    #[test]
+    fn virtual_display_validates_memory_mode_and_hypervisor() {
+        for (body, kind, expected) in [
+            (
+                r#"mode = "virgl" virtual_display = true"#,
+                HypervisorKind::Vmlab,
+                "passthrough",
+            ),
+            (
+                r#"mode = "vulkan" virtual_display = true"#,
+                HypervisorKind::Vmlab,
+                "passthrough",
+            ),
+            (
+                r#"mode = "passthrough" virtual_display = true"#,
+                HypervisorKind::Qemu,
+                "QEMU",
+            ),
+            (
+                r#"mode = "passthrough" virtual_display_memory = 128MiB"#,
+                HypervisorKind::Vmlab,
+                "requires virtual_display",
+            ),
+            (
+                r#"mode = "passthrough" virtual_display = true virtual_display_memory = 64MiB"#,
+                HypervisorKind::Vmlab,
+                "power of two",
+            ),
+            (
+                r#"mode = "passthrough" virtual_display = true virtual_display_memory = 192MiB"#,
+                HypervisorKind::Vmlab,
+                "power of two",
+            ),
+        ] {
+            let file = lab(&format!(
+                r#"import <vmlab.wcl> lab "l" {{ vm "a" {{ template = "x86_64/t" gpu {{ {body} }} }} }}"#
+            ));
+            let mut issues = Vec::new();
+            check_gpu(
+                "test VM",
+                file.lab.vms[0].gpu.as_ref().unwrap(),
+                Some("x86_64"),
+                kind,
+                &Permissive,
+                &mut issues,
+            );
+            assert!(
+                issues.iter().any(|issue| issue.message.contains(expected)),
+                "{body}: {issues:?}"
+            );
+        }
+        let file = lab(
+            r#"import <vmlab.wcl> lab "l" { vm "a" { template = "x86_64/t" gpu { mode = "passthrough" virtual_display = true virtual_display_memory = 256MiB } } }"#,
+        );
+        let gpu = file.lab.vms[0].gpu.as_ref().unwrap();
+        let mut issues = Vec::new();
+        check_gpu(
+            "test VM",
+            gpu,
+            Some("x86_64"),
+            HypervisorKind::Vmlab,
+            &Permissive,
+            &mut issues,
+        );
+        check_virtual_display_family(gpu, LoginFamily::Windows, &mut issues);
+        assert!(issues.is_empty(), "{issues:?}");
+        check_virtual_display_family(gpu, LoginFamily::Linux, &mut issues);
+        assert!(issues.iter().any(|i| i.message.contains("Windows")));
     }
 
     /// A template's build-VM `gpu {}` and a variant's are checked against

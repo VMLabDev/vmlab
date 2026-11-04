@@ -247,6 +247,9 @@ fn hardware_refusals(name: &str, h: &ResolvedVm, why: &mut Vec<String>) {
 pub fn qemu_refusals(vm: &Vm) -> Vec<String> {
     let name = &vm.name;
     let mut why = Vec::new();
+    if vm.gpu.as_ref().is_some_and(|gpu| gpu.virtual_display) {
+        why.push(format!("vm \"{name}\": gpu virtual_display needs hypervisor = \"vmlab\"; QEMU does not support the shared-memory virtual monitor"));
+    }
     // vmlab gives QEMU no audio device (hv-audio D7): audio is vmlab-hv's.
     for (key, on) in [("audio", vm.audio), ("microphone", vm.microphone)] {
         if on {
