@@ -220,6 +220,45 @@ jobs:
           path: vmlab-${{ needs.version.outputs.version }}-${{ matrix.suffix }}
           retention-days: 1
 
+  vdisplay-build:
+    name: Compile Windows display driver
+    needs: [version, check, guest-crates, ebpf-verify]
+    if: needs.version.outputs.do_release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Windows cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18
+      - name: Compile against pinned kits
+        run: python3 guest/vdisplay-windows/build.py --output target/vdisplay-unsigned
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vdisplay-unsigned
+          path: target/vdisplay-unsigned
+          retention-days: 1
+
+  vdisplay-sign:
+    name: Catalog and test-sign Windows display driver
+    needs: [version, vdisplay-build]
+    if: needs.version.outputs.do_release == 'true'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: vdisplay-unsigned
+          path: target/vdisplay-package
+      - name: Sign with pinned SDK and WDK tools
+        shell: powershell
+        run: ./guest/vdisplay-windows/build.ps1 -Mode sign-only -Package "$PWD/target/vdisplay-package"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vdisplay-signed
+          path: target/vdisplay-package
+          retention-days: 1
+
   # ── Guest assets ──────────────────────────────────────────────────────────
   # Every guest asset the binary looks up on the host — the container micro-VM
   # kernel/initramfs for x86_64 and aarch64, every Rust agent target, every
@@ -232,7 +271,7 @@ jobs:
     # This job installs the build container's toolchains directly on the runner.
     env:
       VMLAB_BUILD_ENV: '1'
-    needs: [version, check, guest-crates, ebpf-verify]
+    needs: [version, check, guest-crates, ebpf-verify, vdisplay-sign]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -272,6 +311,10 @@ jobs:
           workspaces: |
             guest/cinit
             guest/agent
+      - uses: actions/download-artifact@v8
+        with:
+          name: vdisplay-signed
+          path: guest/vdisplay-windows/target/signed-package
       - name: Build and package
         run: just guest-package "${{ needs.version.outputs.version }}"
       - uses: actions/upload-artifact@v7

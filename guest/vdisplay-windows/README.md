@@ -55,6 +55,10 @@ guest bundle. Set `VMLAB_VDISPLAY_PACKAGE_DIR` to use another signed package.
 Source-derived INF versions prevent Windows from reusing an older Driver Store
 copy when testing a rebuilt DLL.
 
+Release CI uses the same split. Its `vdisplay-build` job compiles on Ubuntu,
+`vdisplay-sign` catalogs and signs on Windows, and `guest-assets` downloads the
+signed package before building the bundle. Those jobs run only for a release.
+
 ## Install on an opted-in guest
 
 The companion host-device change supplies `gpu.virtual_display`. Enable it on a

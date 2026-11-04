@@ -54,6 +54,7 @@ restored publication and the console service before login, at the default
 - `cargo test --lib cli::display_install::tests`: both opt-in and incomplete-package tests passed.
 - `python3 -m py_compile guest/vdisplay-windows/*.py` and `bash -n guest/package.sh`: passed.
 - `package.py` staged the verified package into a guest-bundle directory; a tar round trip preserved its members.
+- `actionlint` 1.7.12 with ShellCheck disabled accepted `.github/workflows/ci.yml`; a YAML parse checked the new artifact-job dependencies and release gating.
 - `just ci::check`: passed once, including fmt, clippy, host and guest checks, BPF verification, and agent conformance. Host library tests reported 2121 passed and 11 ignored; conformance reported 22 passed and no skips.
 
 The actual `machine install-display` command refused the non-opted-in test VM
@@ -67,3 +68,5 @@ No real passthrough-GPU check ran because no test PCI device was designated.
 The full hypervisor gate was not run, per the owner's merge-batch policy. No
 hypervisor source changed. The full multi-architecture guest release bundle was
 not rebuilt; its changed Windows staging and archive path were exercised alone.
+The new release-only GitHub Actions jobs were validated locally, but no release
+was triggered to run them on GitHub-hosted runners.

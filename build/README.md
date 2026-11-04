@@ -26,6 +26,8 @@ This requires Docker, the local Windows 11 `standard` template, and config-weave
 Windows executable. See `guest/vdisplay-windows/README.md` for the pinned build
 lab and the MSVC alternative. Guest packaging refuses a missing or stale signed
 package. `VMLAB_VDISPLAY_PACKAGE_DIR` selects a separately built package.
+Release CI supplies that package through its Ubuntu compile and Windows signing
+jobs before running `guest-package`.
 
 ```sh
 just buildbox::image          # build the image (tag: $VMLAB_BUILD_IMAGE, default vmlab-build)
