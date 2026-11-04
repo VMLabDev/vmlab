@@ -399,7 +399,9 @@ SRC
     `vram` does not reserve physical host VRAM or increase the host GPU's
     capacity. Guest reporting depends on the driver. The current vmlab-win3d
     kernel driver reads this window's size but limits its blob allocator to
-    16 GiB. Linux Venus exposes the host Vulkan memory heaps; those heap sizes
+    16 GiB. It exposes an aperture segment, so increasing `vram` does not set
+    Windows's reported dedicated video memory or its shared-system-memory
+    budget. Linux Venus exposes the host Vulkan memory heaps; those heap sizes
     need not match this window. Linux virgl gets its reported video-memory
     capacity from the renderer's capset, not the shared-memory BAR.
     Online snapshots with an accelerated GPU on

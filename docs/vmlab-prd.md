@@ -245,6 +245,8 @@ Each VM block can express:
 
   `gpu.vram: std.ByteSize?` selects the host-visible shared-memory window per VM, default `4GiB`. Both hypervisors accept powers of two from `256MiB` through `256GiB`; validation refuses other sizes and any `vram` under `passthrough`. On QEMU it sets `hostmem=`; an explicit value on `virgl` also enables blob resources. On vmlab-hv it sizes the 64-bit BAR, shared-memory capability, and blob mapping bounds, with a PCI window above RAM large enough for alignment and the other BARs. KVM slots are consumed per mapped blob, not per aperture page. A guest address width too small for RAM and that window is refused. The setting takes effect on the next start, does not reserve physical host VRAM, and does not change the host Vulkan heap sizes Linux Venus reports. The current vmlab-win3d driver reads the capability length but clamps its blob allocator to 16 GiB. Accelerated-GPU online snapshots on vmlab-hv remain refused; the selected size is part of the machine-description digest checked at restore.
 
+  The current vmlab-win3d KMD describes that window as a WDDM aperture segment. Its size does not directly set DXGI dedicated video memory or Windows's shared-system-memory budget. Reporting dedicated video memory requires a driver memory-segment implementation, including its backing and paging operations, rather than a larger BAR alone.
+
   **Host GPUs.** Which GPU is a fact about one machine, and a lab file travels between machines, so a lab never carries a PCI address. The user's host config declares each host GPU by name, beside `host {}`:
 
   ```wcl
