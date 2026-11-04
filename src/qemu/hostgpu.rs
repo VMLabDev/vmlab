@@ -914,6 +914,7 @@ mod tests {
     fn gpu(mode: GpuMode, host_gpu: Option<&str>) -> Gpu {
         Gpu {
             mode,
+            virtual_display: false,
             host_gpu: host_gpu.map(Into::into),
             span: Default::default(),
         }

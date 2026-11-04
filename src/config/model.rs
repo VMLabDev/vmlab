@@ -837,6 +837,8 @@ impl GpuMode {
 #[derive(Debug, Clone)]
 pub struct Gpu {
     pub mode: GpuMode,
+    /// Opt in to the Windows shared-memory indirect display driver.
+    pub virtual_display: bool,
     /// The host GPU by name (§5.2), declared in the host config rather than
     /// here because a PCI address is a fact about one machine: the device
     /// itself under `passthrough`, the GPU that renders under

@@ -7,6 +7,7 @@ pub mod console;
 pub mod daemon;
 pub mod debug;
 pub mod dev;
+mod display_install;
 pub mod lab;
 mod lab_move;
 pub mod machine;
@@ -541,6 +542,13 @@ pub enum ContainerCmd {
 /// Kind-neutral machine queries: a VM and a container answer both (PRD §18).
 #[derive(Subcommand)]
 pub enum MachineCmd {
+    /// Install the bundled Windows display drivers on a VM with gpu.virtual_display enabled
+    InstallDisplay {
+        machine: String,
+        /// Signed package directory; defaults to the installed guest bundle
+        #[arg(long)]
+        package: Option<std::path::PathBuf>,
+    },
     /// What a machine can do beyond the universal commands, probed live: a
     /// display, a console log, in-place reboot, a healthcheck, and whichever
     /// features its agent negotiated
@@ -788,6 +796,9 @@ pub fn run() -> ExitCode {
             }
         },
         Command::Machine { cmd } => match cmd {
+            MachineCmd::InstallDisplay { machine, package } => {
+                display_install::install(&machine, package.as_deref())
+            }
             MachineCmd::Capabilities { machine, json } => machine::cmd_capabilities(&machine, json),
             MachineCmd::Stats { machine, json } => machine::cmd_stats(&machine, json),
             MachineCmd::RepairAgent { machine, json } => machine::cmd_repair_agent(&machine, json),

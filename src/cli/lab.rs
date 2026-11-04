@@ -2030,7 +2030,7 @@ fn cp_push(src: &str, vm_part: &str, guest_dest: &str) -> Result<()> {
 
 /// Push one file or a tree over the agent channel (parent directories are
 /// created by the agent; digests verified end-to-end by the daemon).
-async fn push_via_agent(
+pub(super) async fn push_via_agent(
     client: &LabClient,
     vm: &str,
     src: &std::path::Path,

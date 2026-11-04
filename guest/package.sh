@@ -53,6 +53,15 @@ EXPECTED=(
   agent/dos-i386/VMLABAGT.EXE agent/dos-i386/VERSION
   agent/linux-x86/vmlab-agent-legacy agent/linux-x86/VERSION-legacy
   agent/templeos/VmlabAgt.HC agent/templeos/VERSION
+  vdisplay-windows/x86_64/vmlab-display.inf
+  vdisplay-windows/x86_64/vmlab-display.cat
+  vdisplay-windows/x86_64/vmlab-display.dll
+  vdisplay-windows/x86_64/vmlab-display.cer
+  vdisplay-windows/x86_64/install.exe
+  vdisplay-windows/x86_64/install.ps1
+  vdisplay-windows/x86_64/ivshmem/ivshmem.inf
+  vdisplay-windows/x86_64/ivshmem/ivshmem.cat
+  vdisplay-windows/x86_64/ivshmem/ivshmem.sys
   firmware/VERSION
   firmware/x86_64/OVMF_CODE_4M.fd firmware/x86_64/OVMF_VARS_4M.fd
   firmware/x86_64/OVMF_CODE_4M.secboot.fd firmware/x86_64/OVMF_VARS_4M.ms.fd
@@ -93,6 +102,9 @@ main() {
   "$SCRIPT_DIR/build-agent.sh"
   # After build-agent.sh: the legacy linux-x86 build shares that directory.
   "$SCRIPT_DIR/build-agent-legacy.sh"
+  python3 "$SCRIPT_DIR/vdisplay-windows/package.py" \
+    "${VMLAB_VDISPLAY_PACKAGE_DIR:-$SCRIPT_DIR/vdisplay-windows/target/signed-package}" \
+    "$DIST_DIR/vdisplay-windows/x86_64"
 
   local f missing=()
   for f in "${EXPECTED[@]}"; do
@@ -107,7 +119,7 @@ main() {
   # keeps the holes.
   tar -C "$DIST_DIR" --sort=name --owner=0 --group=0 --numeric-owner --sparse \
     --mtime="@${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)}" \
-    -cf - x86_64 aarch64 agent firmware | gzip -9n >"$out/$name"
+    -cf - x86_64 aarch64 agent firmware vdisplay-windows | gzip -9n >"$out/$name"
   (cd "$out" && sha256sum "$name" >"$name.sha256")
   log "$(du -h "$out/$name" | cut -f1) → $out/$name"
   log "$(cat "$out/$name.sha256")"
