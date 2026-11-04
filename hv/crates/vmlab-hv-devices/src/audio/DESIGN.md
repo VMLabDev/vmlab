@@ -13,6 +13,14 @@ Each direction creates its connection, mainloop, and stream on its worker.
 Capture starts only through `open_capture`; creating a host never opens a
 microphone. The device caller enforces the machine's microphone opt-in.
 
+PipeWire playback initially retains PCM until 512 frames are buffered. This
+preserves a 256-frame reserve when the default host callback consumes its
+first quantum. Without prefill, startup phase can leave too little PCM to cover
+timer jitter later in the stream. Prefill waits for at most two callbacks after
+the first PCM arrives, so a short one-shot sound still drains. Priming supplies
+silence without consuming or discarding PCM and appears as `priming=true` in
+pull diagnostics. Playback never primes again after starting.
+
 PipeWire process callbacks run on the owning mainloop thread. `RT_PROCESS` is
 deliberately absent: the local listener's Rust state and all stream access stay
 on one thread. The loop waits up to 5 ms for events, but wakes immediately when

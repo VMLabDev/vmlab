@@ -106,6 +106,29 @@ struct Endpoint {
     join: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct Playback {
+    primed: bool,
+    startup_pulls: u8,
+}
+
+impl Playback {
+    fn pull(&mut self, ring: &SpscRing, out: &mut [u8], stride: usize) -> usize {
+        let available = ring.used_bytes();
+        if !self.primed && available != 0 {
+            // Begin with two quanta of PCM so timer/callback phase does not
+            // consume the jitter reserve. Short one-shot sounds still drain.
+            self.primed = available >= 2 * 256 * stride || self.startup_pulls == 2;
+            if !self.primed {
+                self.startup_pulls += 1;
+            }
+        }
+        let n = if self.primed { ring.pop_max(out) } else { 0 };
+        out[n..].fill(0);
+        n
+    }
+}
+
 // pipewire 0.10's safe Buffer cannot set pw_buffer.size. Keep raw access here
 // so queued timing uses the frame units recommended by pipewire/stream.h.
 struct ProcessBuffer<'a> {
@@ -252,10 +275,10 @@ fn run(
     )
     .map_err(error)?;
     let stride = format.frame_bytes();
-    let worker = shared.clone();
+    let worker = (shared.clone(), Playback::default());
     let _listener = stream
         .add_local_listener_with_user_data(worker)
-        .process(move |stream, shared| {
+        .process(move |stream, (shared, playback)| {
             let Some(mut buffer) = ProcessBuffer::dequeue(stream) else {
                 return;
             };
@@ -284,17 +307,17 @@ fn run(
                     };
                     let size = frames * stride;
                     let available = shared.ring.used_bytes();
-                    let n = shared.ring.pop_max(&mut bytes[..size]);
+                    let n = playback.pull(&shared.ring, &mut bytes[..size], stride);
                     let offset = shared.transferred.fetch_add(n, Ordering::Relaxed);
                     log::debug!(target: "vmlab_hv_devices::audio::pipewire::pull",
-                        "PipeWire pull requested_frames={frames} available_frames={} delivered_frames={} pcm_offset={offset} dma_submitted={} queued_bytes={} silence_frames={}",
+                        "PipeWire pull requested_frames={frames} available_frames={} delivered_frames={} pcm_offset={offset} dma_submitted={} queued_bytes={} silence_frames={} priming={}",
                         available / stride,
                         n / stride,
                         shared.submitted.load(Ordering::Relaxed),
                         shared.ring.used_bytes(),
                         (size - n) / stride,
+                        !playback.primed,
                     );
-                    bytes[n..size].fill(0);
                     size
                 } else {
                     0
@@ -394,6 +417,52 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_prefill_preserves_pcm_and_a_quantum_of_timer_jitter() {
+        for stride in [2, 4, 8] {
+            let quantum = 256 * stride;
+            let ring = SpscRing::with_capacity_bytes(4 * quantum);
+            let mut playback = Playback::default();
+            let mut out = vec![9; quantum];
+            ring.push_drop_oldest(&vec![1; quantum]);
+            assert_eq!(playback.pull(&ring, &mut out, stride), 0);
+            assert_eq!(ring.used_bytes(), quantum);
+            assert_eq!(out, vec![0; quantum]);
+            ring.push_drop_oldest(&vec![2; quantum]);
+            assert_eq!(playback.pull(&ring, &mut out, stride), quantum);
+            assert_eq!(out, vec![1; quantum]);
+            // The next pull arrives before the delayed producer runs.
+            assert_eq!(playback.pull(&ring, &mut out, stride), quantum);
+            assert_eq!(out, vec![2; quantum]);
+            ring.push_drop_oldest(&vec![3; 2 * quantum]);
+            assert_eq!(playback.pull(&ring, &mut out, stride), quantum);
+            assert_eq!(out, vec![3; quantum]);
+            assert_eq!(ring.used_bytes(), quantum);
+        }
+    }
+
+    #[test]
+    fn playback_prefill_drains_short_sounds_after_two_pulls() {
+        let ring = SpscRing::with_capacity_bytes(4096);
+        let mut playback = Playback::default();
+        let mut out = [9; 1024];
+        for _ in 0..4 {
+            assert_eq!(playback.pull(&ring, &mut out, 4), 0);
+        }
+        ring.push_drop_oldest(&[1; 96 * 4]);
+        for _ in 0..2 {
+            assert_eq!(playback.pull(&ring, &mut out, 4), 0);
+            assert_eq!(ring.used_bytes(), 96 * 4);
+        }
+        assert_eq!(playback.pull(&ring, &mut out, 4), 96 * 4);
+        assert_eq!(&out[..96 * 4], &[1; 96 * 4]);
+        assert!(out[96 * 4..].iter().all(|byte| *byte == 0));
+        assert_eq!(playback.pull(&ring, &mut out, 4), 0);
+        ring.push_drop_oldest(&[2; 32 * 4]);
+        assert_eq!(playback.pull(&ring, &mut out, 4), 32 * 4);
+        assert_eq!(&out[..32 * 4], &[2; 32 * 4]);
+    }
 
     #[test]
     fn graph_latency_does_not_count_as_queued_pcm() {
