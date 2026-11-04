@@ -3759,8 +3759,16 @@ mod tests {
                 queue.set_event_idx(true);
             }
         }
-        f.queue_tx(b"before restore");
+        let before = b"before restore";
+        f.queue_tx(before);
         process_tx(&f.dev.shared, &mut None, 12, false);
+        f.dev.resume_snapshot();
+        let mut prefix = [0; 4];
+        switch.read_exact(&mut prefix).unwrap();
+        assert_eq!(u32::from_be_bytes(prefix), before.len() as u32);
+        let mut received = vec![0; before.len()];
+        switch.read_exact(&mut received).unwrap();
+        assert_eq!(received, before);
         f.dev.quiesce();
         let state = f.dev.save_state().unwrap();
         f.dev.reset();
@@ -3982,7 +3990,9 @@ mod tests {
     fn link_drops_and_reconnects_with_frames_discarded_while_down() {
         let mut f = Fixture::new();
         let switch = f.take_switch_side();
-        drop(switch);
+        // Keep the connection alive until switch_down closes it, so the
+        // disconnect cannot precede the interrupt-count baseline.
+        f.accepted = Some(switch);
         wait_for("link up", || f.status() & S_LINK_UP != 0);
 
         // The switch process dies: the connection drops and nothing accepts
