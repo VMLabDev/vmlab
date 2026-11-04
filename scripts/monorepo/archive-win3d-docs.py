@@ -62,12 +62,12 @@ def main():
             if len(matches) == 1:
                 path = matches[0]
             elif not matches:
-                parents = git("log", "--full-history", "-1", "--format=%P", "--", f":(glob){path}*").split()
-                if parents:
-                    historical = git("ls-tree", "-r", "--name-only", parents[0], "--", path.rsplit("/", 1)[0]).splitlines()
+                revisions = git("log", "--full-history", "--no-merges", "--format=%H", "--", f":(glob){path}*").splitlines()
+                for historical_revision in revisions:
+                    historical = git("ls-tree", "-r", "--name-only", historical_revision, "--", path.rsplit("/", 1)[0]).splitlines()
                     matches = [item for item in historical if item.startswith(path)]
                     if len(matches) == 1:
-                        return f"https://github.com/VMLabDev/vmlab-win3d/blob/{parents[0]}/{matches[0]}{separator}{anchor}"
+                        return f"https://github.com/VMLabDev/vmlab-win3d/blob/{historical_revision}/{matches[0]}{separator}{anchor}"
         return f"{base}/{path}{separator}{anchor}"
     changes = []
     for doc in sorted(GUEST.rglob("*.md")):

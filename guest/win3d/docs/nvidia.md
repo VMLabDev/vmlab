@@ -260,7 +260,7 @@ enabled. Before master, the series sat on tag `v11.1.1` (`78bc99a513`, the
 source of 0.1.0-alpha, kept as tag `vmlab-win3d-0.1.0-alpha` on the fork),
 then briefly on v11.1.2 with a backport of `baca2517` (`672843fce5`).
 
-Until 2026-10-18 the fix was one patch, [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/qemu/0001) (fork
+Until 2026-10-18 the fix was one patch, [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/bea2a93d3ccbfff8b94e321541d573291bc8b4d1/patches/host/qemu/0001-ui-egl-headless-external-only-dmabuf-scanouts.patch) (fork
 commit `f5832b34dd`), which only changed egl-headless; the series replaced
 it and also covers the GTK and SDL displays. The evidence in this page and in
 [`acceptance.md`](acceptance.md) before that date used the single patch. As of

@@ -34,7 +34,7 @@ Newest first. The package rows name the commit in the bundle's
 | OS | CachyOS (x86-64-v3 repositories), kernel 7.2.4-3-cachyos |
 | GPUs | Intel Iris Xe (Raptor Lake-P) `0000:00:02.0`; NVIDIA RTX 4060 Max-Q / Laptop (AD107M) `0000:01:00.0`, driver 615.71.09 (open kernel module), runtime D3 fine-grained (`DynamicPowerManagement=2`) |
 | Host stack | QEMU 11.1.1, virglrenderer 1.3.0, Mesa 26.2.2 (`vulkan-intel`), the same as helios |
-| Venus QEMU on `Nvidia1` | 2026-10-19: VMLabDev/qemu `d8a6048aae` (upstream master + our egl-headless series, [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS)), built on Zeus, in `~/.local/opt/qemu-vmlab-egl` ([docs/evidence/zeus/qemu/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/qemu/)). 2026-10-17: QEMU 11.1.1 + [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/qemu/0001) through `labs/zeus/vmlab-iso.sh` |
+| Venus QEMU on `Nvidia1` | 2026-10-19: VMLabDev/qemu `d8a6048aae` (upstream master + our egl-headless series, [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS)), built on Zeus, in `~/.local/opt/qemu-vmlab-egl` ([docs/evidence/zeus/qemu/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/qemu/)). 2026-10-17: QEMU 11.1.1 + [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/bea2a93d3ccbfff8b94e321541d573291bc8b4d1/patches/host/qemu/0001-ui-egl-headless-external-only-dmabuf-scanouts.patch) through `labs/zeus/vmlab-iso.sh` |
 | vmlab | 2026-10-19: 0.28.0-alpha, with the host config below. 2026-10-17: 0.24.0-alpha, no host config |
 | Template | `x86_64/windows-11@26100.1742.5` |
 
@@ -477,7 +477,7 @@ echo 'options nvidia NVreg_DynamicPowerManagement=0x00' | sudo tee /etc/modprobe
 ### 2026-10-17: the GPU fell off the bus
 
 The run used `main`'s package, which includes `patches/mesa/0020`, and
-QEMU 11.1.1 with [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/qemu/0001). That QEMU was built natively on
+QEMU 11.1.1 with [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/bea2a93d3ccbfff8b94e321541d573291bc8b4d1/patches/host/qemu/0001-ui-egl-headless-external-only-dmabuf-scanouts.patch). That QEMU was built natively on
 Zeus with [patches/host/build-qemu.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/build-qemu.sh) into `~/win3d-zeus/repo/out/host/qemu`
 and run through `labs/zeus/vmlab-iso.sh` (`nvidia/host.txt`).
 
