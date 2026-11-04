@@ -1,6 +1,9 @@
 # Build context for e2e/Dockerfile: the source tree, never build output.
 **/target
 guest/dist
+guest/.cache
+e2e/results
+**/__pycache__
 docs/_site
 .scratch
 .vmlab

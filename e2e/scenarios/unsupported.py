@@ -56,17 +56,21 @@ def gpu(h):
         return
     untested = ("passthrough (needs a VFIO-bound physical GPU) and vulkan are not exercised; validate rejects "
                 "passthrough with no host GPU to pick")
-    nodes = sorted(pathlib.Path("/dev/dri").glob("renderD*"))
-    if not nodes:
-        h.skip("vm.hw.gpu", f"no /dev/dri render node in the container for virgl to render on; {untested}")
+    selected = os.environ.get("VMLAB_E2E_RENDER_NODE")
+    if not selected:
+        h.skip("vm.hw.gpu", f"VMLAB_E2E_RENDER_NODE is unset; no host GPU is designated for testing; {untested}")
         return
-    # The image's EGL is Mesa's, which cannot drive an NVIDIA node: declare
-    # the first node a Mesa driver owns as the host's default GPU, so both
-    # hypervisors render there rather than on whichever node sorts first.
-    mesa = next((n for n in nodes if render_driver(n) in MESA_DRIVERS), None)
-    restore = declare_host_gpu(h, mesa) if mesa else None
+    node = pathlib.Path(selected)
+    if node.parent != pathlib.Path("/dev/dri") or not node.name.startswith("renderD") or not node.is_char_device():
+        h.ok("vm.hw.gpu", False, f"VMLAB_E2E_RENDER_NODE is not a DRM render device: {selected}")
+        return
+    driver = render_driver(node)
+    if driver not in MESA_DRIVERS:
+        h.skip("vm.hw.gpu", f"the image's Mesa EGL cannot drive the selected {node} ({driver}); {untested}")
+        return
+    restore = declare_host_gpu(h, node)
     try:
-        gpu_boot(h, nodes, mesa, untested)
+        gpu_boot(h, [node], node, untested)
     finally:
         if restore:
             restore()
