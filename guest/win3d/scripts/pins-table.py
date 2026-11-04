@@ -264,7 +264,9 @@ def doc_link(doc):
 def patches_table():
     out = ["| Upstream | Patches | Patch | What it does | Explained in |", "| --- | --- | --- | --- | --- |"]
     root = REPO / "patches"
-    dirs = sorted({p.parent for p in root.rglob("*.patch")} | {p for p in root.iterdir() if p.is_dir()})
+    dirs = sorted({p.parent for p in root.rglob("*.patch")} |
+                  {p for p in root.iterdir() if p.is_dir() and
+                   any(child.is_file() for child in p.rglob("*"))})
     for d in dirs:
         rel = d.relative_to(root).as_posix()
         patches = sorted(d.glob("*.patch"))

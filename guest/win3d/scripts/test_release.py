@@ -16,6 +16,20 @@ SPEC.loader.exec_module(assemble)
 
 
 class ReleaseTest(unittest.TestCase):
+    def test_patch_table_ignores_empty_directories(self):
+        spec = importlib.util.spec_from_file_location("pins", ROOT / "scripts/pins-table.py")
+        pins = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pins)
+        with tempfile.TemporaryDirectory() as temporary:
+            pins.REPO = Path(temporary)
+            (pins.REPO / "patches/dxil-spirv").mkdir(parents=True)
+            (pins.REPO / "patches/dxil-spirv/README.md").write_text("No local patches.\n")
+            original = pins.patches_table()
+            (pins.REPO / "patches/host/virglrenderer/diagnostic").mkdir(parents=True)
+            self.assertEqual(pins.patches_table(), original)
+            self.assertTrue(any("dxil-spirv" in row for row in original))
+            self.assertFalse(any("host" in row for row in original))
+
     def test_dry_run_cannot_publish(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/release.sh"),
                                  "--dry-run", "--publish"], capture_output=True, text=True)

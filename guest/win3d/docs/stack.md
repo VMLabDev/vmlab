@@ -307,7 +307,6 @@ committed.
 | --- | --- | --- | --- | --- |
 | dxil-spirv | 0 | — | None; see [`patches/dxil-spirv/`](../patches/dxil-spirv/) | — |
 | dxvk | 1 | [`0001`](../patches/dxvk/0001-dxgi-Keep-the-swap-chain-description-when-a-resize-fails.patch) | dxgi: Keep the swap-chain description when a resize fails. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| host | 0 | — | None; see [`patches/host/`](../patches/host/) | — |
 | kmd | 4 | [`0001`](../patches/kmd/0001-kmd-r10-copy.patch) | Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD) | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0002`](../patches/kmd/0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch) | viogpu3d: map GDI shadow and staging surfaces cached | [`docs/present.md`](present.md) |
 | | | [`0003`](../patches/kmd/0003-kmd-create-context-for-gdi-devices.patch) | viogpu3d: create a legacy context before opening GDI allocations | [`build/kmd/README.md`](../build/kmd/README.md) |
