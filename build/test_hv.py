@@ -5,12 +5,22 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 import hv
 
 
 class ViewerDesktopTest(unittest.TestCase):
+    def test_release_stamp_updates_the_root_package(self):
+        manifest = hv.ROOT / "Cargo.toml"
+        original = tomllib.loads(manifest.read_text())
+        stamped = subprocess.check_output(
+            ["sed", '0,/^version = ".*"$/s//version = "9.9.9"/', str(manifest)], text=True)
+        parsed = tomllib.loads(stamped)
+        self.assertEqual(parsed["package"]["version"], "9.9.9")
+        self.assertEqual(parsed["workspace"]["package"], original["workspace"]["package"])
+
     def test_revision_is_the_monorepo_commit(self):
         expected = subprocess.check_output(
             ["git", "-C", str(hv.ROOT), "rev-parse", "HEAD"], text=True).strip()
