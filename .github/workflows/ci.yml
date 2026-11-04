@@ -64,6 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: hv-check
+      - run: just ci::hv-desktop-test
       - run: just ci::hv-fmt-check
       - run: just ci::hv-lint
       - run: just ci::hv-test
