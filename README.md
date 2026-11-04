@@ -45,7 +45,8 @@ export PATH="$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/bin:$PATH"
 ```
 
 Keep the extracted directory together: it includes the native console viewer,
-virglrenderer 1.3.0 and its Venus render server, with relative library paths.
+virglrenderer 1.3.0 and its patched Venus render server, with relative library paths.
+The Windows 3D driver lives under guest/win3d/ and has separate win3d-v* releases.
 Its `README` lists the host graphics and audio libraries still required.
 Alternatively, set `host { vmlab_hv = "/absolute/path/to/bin/vmlab-hv" }`
 in `~/.config/vmlab/config.wcl`, after `import <vmlab-host.wcl>`.

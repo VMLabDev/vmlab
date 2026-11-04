@@ -415,7 +415,7 @@ SRC
   DOC
   p <<DOC
     `vram` does not reserve physical host VRAM or increase the host GPU's
-    capacity. Guest reporting depends on the driver. The current vmlab-win3d
+    capacity. Guest reporting depends on the driver. The current guest/win3d
     kernel driver reads this window's size but limits its blob allocator to
     16 GiB. It exposes an aperture segment, so increasing `vram` does not set
     Windows's reported dedicated video memory or its shared-system-memory

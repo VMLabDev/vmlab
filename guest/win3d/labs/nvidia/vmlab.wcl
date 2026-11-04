@@ -1,0 +1,15 @@
+import <vmlab.wcl>
+
+// Windows 11 with Venus on the first RTX 5090 (host GPU Nvidia1, 0000:01:00.0).
+// Uses the vmlab-hv bundle and the Nvidia1 host GPU declaration.
+lab "win3d-nvidia-a" {
+  vm "win11" {
+    hypervisor = "vmlab"
+    template = "x86_64/windows-11@26100.1742.5"
+    secure_boot = false
+    gpu {
+      mode     = "vulkan"
+      host_gpu = "Nvidia1"
+    }
+  }
+}

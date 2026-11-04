@@ -1,0 +1,34 @@
+[
+  {
+    "name": "KMD-BSD-3-Clause.txt",
+    "url": "https://raw.githubusercontent.com/arehnman/yttrium-virtio-gpu/b99d951a1c97f6fb3a1adbc08a4d2ab9ce9f5a15/viogpu/LICENSE"
+  },
+  {
+    "name": "Mesa-MIT.txt",
+    "url": "https://raw.githubusercontent.com/arehnman/virtio-win-mesa/374c30222e0c08b04783c173c127abb3e465d028/licenses/MIT"
+  },
+  {
+    "name": "MPL-2.0.txt",
+    "url": "https://www.mozilla.org/media/MPL/2.0/index.txt"
+  },
+  {
+    "name": "vkd3d-proton-COPYING.txt",
+    "url": "https://raw.githubusercontent.com/HansKristian-Work/vkd3d-proton/3b10bd7a7ec6a7347e616cf8bea59333afec2255/COPYING"
+  },
+  {
+    "name": "vkd3d-proton-LGPL-2.1.txt",
+    "url": "https://raw.githubusercontent.com/HansKristian-Work/vkd3d-proton/3b10bd7a7ec6a7347e616cf8bea59333afec2255/LICENSE"
+  },
+  {
+    "name": "DXVK-zlib.txt",
+    "url": "https://raw.githubusercontent.com/doitsujin/dxvk/b1a1c99ab52b687cf950d62c88bc2fa316b41663/LICENSE"
+  },
+  {
+    "name": "Vulkan-Loader-Apache-2.0.txt",
+    "url": "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/fa218055ff4948b159f31d43f800c808a13d51df/LICENSE.txt"
+  },
+  {
+    "name": "dxil-spirv-MIT.txt",
+    "url": "https://raw.githubusercontent.com/HansKristian-Work/dxil-spirv/8434b0639fb2a48ce13aac08a420ecce5d23df0e/LICENSE.MIT"
+  }
+]

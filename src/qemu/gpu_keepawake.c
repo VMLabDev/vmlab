@@ -11,7 +11,7 @@
  * an open context alone does not keep the GPU awake: the driver suspends it
  * once it has been idle for a few seconds, whoever holds it open. Small
  * regular work does. That was measured with the same loop before it was
- * shipped (vmlab-win3d, docs/zeus.md, "Runtime power management").
+ * shipped (guest/win3d/docs/zeus.md, "Runtime power management").
  *
  * It prints `ready <renderer>` once the context is current, so the
  * supervisor that spawned it knows the hold took, and runs until SIGINT or

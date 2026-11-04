@@ -3,6 +3,8 @@
 **/.ci-cache
 guest/dist
 guest/.cache
+guest/win3d/out
+guest/win3d/.signing
 e2e/results
 **/__pycache__
 docs/_site
