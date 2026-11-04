@@ -195,7 +195,7 @@ impl AgentClient {
     }
 
     fn write_ctrl(&mut self, msg: &HostMsg) -> Result<(), Error> {
-        let bytes = encode_ctrl(msg);
+        let bytes = encode_ctrl(msg).map_err(|e| format!("encode control frame: {e}"))?;
         self.write_all(&bytes)
     }
 
@@ -382,14 +382,17 @@ mod tests {
 
     fn hello(stream: &mut UnixStream, token: String, version: &str) {
         stream
-            .write_all(&encode_ctrl(&AgentMsg::Hello {
-                proto_version: PROTO_VERSION,
-                agent_version: version.into(),
-                os: "test".into(),
-                features: vec!["exec".into()],
-                token,
-                instance: None,
-            }))
+            .write_all(
+                &encode_ctrl(&AgentMsg::Hello {
+                    proto_version: PROTO_VERSION,
+                    agent_version: version.into(),
+                    os: "test".into(),
+                    features: vec!["exec".into()],
+                    token,
+                    instance: None,
+                })
+                .unwrap(),
+            )
             .unwrap();
     }
 
@@ -439,7 +442,7 @@ mod tests {
                     assert_eq!(received, expected);
                 }
                 stream
-                    .write_all(&encode_ctrl(&AgentMsg::Exited { id, code: 0 }))
+                    .write_all(&encode_ctrl(&AgentMsg::Exited { id, code: 0 }).unwrap())
                     .unwrap();
                 assert!(matches!(receive(&mut stream, &mut decoder),
                     HostMsg::Close { id: actual } if actual == id));
@@ -488,7 +491,7 @@ mod tests {
             };
             assert_eq!(mode, ShutdownMode::Reboot);
             stream
-                .write_all(&encode_ctrl(&AgentMsg::ShuttingDown { mode }))
+                .write_all(&encode_ctrl(&AgentMsg::ShuttingDown { mode }).unwrap())
                 .unwrap();
         });
         let mut client = AgentClient::connect(&path, Duration::from_secs(3)).unwrap();
@@ -521,10 +524,13 @@ mod tests {
                 }
             ));
             stream
-                .write_all(&encode_ctrl(&AgentMsg::Error {
-                    id: None,
-                    msg: "not supported".into(),
-                }))
+                .write_all(
+                    &encode_ctrl(&AgentMsg::Error {
+                        id: None,
+                        msg: "not supported".into(),
+                    })
+                    .unwrap(),
+                )
                 .unwrap();
         });
         let mut client = AgentClient::connect(&path, Duration::from_secs(3)).unwrap();
@@ -535,6 +541,33 @@ mod tests {
                 .unwrap_err()
                 .contains("not supported")
         );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_exec_is_rejected_before_writing_a_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut decoder = FrameDecoder::new();
+            let HostMsg::Hello { token, .. } = receive(&mut stream, &mut decoder) else {
+                panic!("expected handshake");
+            };
+            hello(&mut stream, token, "test");
+            assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+        });
+        let mut client = AgentClient::connect(&path, Duration::from_secs(3)).unwrap();
+        let oversized = "x".repeat(MAX_PAYLOAD);
+        let error = client
+            .exec(&[&oversized], Duration::from_secs(3))
+            .unwrap_err();
+        assert!(error.contains("encode control frame"), "{error}");
+        drop(client);
         peer.join().unwrap();
     }
 }

@@ -29,8 +29,14 @@ use vmlab_hv_vmm::error::DeviceUnavailable;
 use vmlab_hv_vmm::factory::{BuiltPci, PciWiring};
 use vmlab_hv_vmm::{DeviceFactory, Vm, builder};
 
-const KERNEL: &str = "/home/wil/dev/vmlab/guest/dist/x86_64/vmlinuz";
-const INITRD: &str = "/home/wil/dev/vmlab/guest/dist/x86_64/initramfs.img";
+const KERNEL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../guest/dist/x86_64/vmlinuz"
+);
+const INITRD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../guest/dist/x86_64/initramfs.img"
+);
 const TAG: &str = "scratch";
 /// How long a boot has to reach the virtio-fs probe.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(60);

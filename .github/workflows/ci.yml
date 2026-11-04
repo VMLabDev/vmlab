@@ -41,6 +41,33 @@ jobs:
       - run: just ci::test
       - run: just ci::agent-conformance
 
+  hv-check:
+    name: hypervisor fmt + lint + test (no guests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@uv
+      - name: Install native dependencies
+        run: just ci::hv-native-deps-install
+      - name: Resolve virglrenderer cache identity
+        id: virgl
+        run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: .ci-cache/virglrenderer-*
+          key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hv-check
+      - run: just ci::hv-fmt-check
+      - run: just ci::hv-lint
+      - run: just ci::hv-test
+
   # The guest-side crates (cinit, agent, and their proto contracts) are
   # standalone — never swept into the host build — so lint/test them and the
   # agent's cross targets (musl, windows-gnu, apple-darwin) explicitly. clippy
@@ -184,7 +211,7 @@ jobs:
     name: Build vmlab (${{ matrix.target }})
     # The whole merge bar, not only the host job: a release is never cut from
     # a commit any part of `ci::check` rejected.
-    needs: [version, check, guest-crates, ebpf-verify]
+    needs: [version, check, hv-check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -222,7 +249,7 @@ jobs:
 
   vdisplay-build:
     name: Compile Windows display driver
-    needs: [version, check, guest-crates, ebpf-verify]
+    needs: [version, check, hv-check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-24.04
     steps:
@@ -271,7 +298,7 @@ jobs:
     # This job installs the build container's toolchains directly on the runner.
     env:
       VMLAB_BUILD_ENV: '1'
-    needs: [version, check, guest-crates, ebpf-verify, vdisplay-sign]
+    needs: [version, check, hv-check, guest-crates, ebpf-verify, vdisplay-sign]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -325,10 +352,10 @@ jobs:
             target/guest-package/vmlab-guest-${{ needs.version.outputs.version }}.tar.gz.sha256
           retention-days: 1
 
-  # The hypervisor and viewer speak the protocol pinned in Cargo.lock.
+  # The hypervisor and viewer share the in-tree protocol crates.
   hv-build:
     name: Build hypervisor bundle
-    needs: [version, check, guest-crates, ebpf-verify]
+    needs: [version, check, hv-check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-24.04
     steps:

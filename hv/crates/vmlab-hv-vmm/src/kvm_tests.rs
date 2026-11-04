@@ -1007,7 +1007,10 @@ fn control_socket_end_to_end() {
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn real_kernel_boots_and_resets() {
-    const KERNEL: &str = "/home/wil/dev/vmlab/guest/dist/x86_64/vmlinuz";
+    const KERNEL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../guest/dist/x86_64/vmlinuz"
+    );
     if !Path::new(KERNEL).exists() {
         eprintln!("skipping: container kernel {KERNEL} is not present");
         return;

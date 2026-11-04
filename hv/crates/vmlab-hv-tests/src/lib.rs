@@ -26,7 +26,7 @@ use vmlab_hv_proto::machine::{
 };
 
 /// The container kernel and initramfs vmlab's guest ships.
-const VMLAB_GUEST_DIST: &str = "/home/wil/dev/vmlab/guest/dist/x86_64";
+const VMLAB_GUEST_DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../guest/dist/x86_64");
 
 /// Kernel cmdline exactly as the spec's phase 1 section gives it (what vmlab
 /// passes QEMU today): serial console, quiet, panic=reboot, and the two
@@ -110,8 +110,12 @@ fn rootfs_from_env() -> Option<PathBuf> {
 }
 
 fn rootfs_from_target() -> Option<PathBuf> {
-    let path = target_dir().join("s1").join("rootfs.sqfs");
-    path.is_file().then_some(path)
+    [
+        target_dir().join("s1/rootfs.sqfs"),
+        workspace_root().join("hv/target/s1/rootfs.sqfs"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
 }
 
 fn rootfs_from_vmlab_store() -> Option<PathBuf> {
@@ -138,7 +142,29 @@ pub fn target_dir() -> PathBuf {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn guest_assets_belong_to_the_shared_workspace() {
+        let root = workspace_root().canonicalize().unwrap();
+        assert!(root.join("Cargo.toml").is_file());
+        assert!(root.join("hv/crates/vmlab-hv/Cargo.toml").is_file());
+        assert!(root.join("guest/cinit/Cargo.toml").is_file());
+        let guest = Path::new(VMLAB_GUEST_DIST)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert_eq!(
+            guest.canonicalize().unwrap(),
+            root.join("guest").canonicalize().unwrap()
+        );
+    }
 }
 
 /// Use an explicit binary override, or ask Cargo for a current debug build

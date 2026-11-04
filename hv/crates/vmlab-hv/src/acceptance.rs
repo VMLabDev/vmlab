@@ -100,7 +100,9 @@ fn boot_template_with_tsc(
     );
     let firmware_root = std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/home/wil/dev/vmlab/guest/dist/firmware/x86_64".into());
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../guest/dist/firmware/x86_64")
+        });
     let secure = firmware == Firmware::SecureOvmf;
     let rom = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ipxe/virtio-net.rom");
     if firmware != Firmware::SeaBios {

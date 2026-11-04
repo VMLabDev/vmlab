@@ -9,7 +9,7 @@
 #                                             `just guest-package`
 #   vmlab-hv-<version>-linux-x86_64.tar.gz    hypervisor, viewer, desktop icons,
 #                                             icon installer and virglrenderer
-#     (+ .sha256)                             from `just ci::hv-package`
+#     (+ .sha256)                             from in-tree hv/ via `just ci::hv-package`
 #   bpf/{fastpath_sockmap,xdp_switch}.bpf.o   the BPF objects rebuilt from
 #                                             ebpf/ by `just ebpf-build`
 #

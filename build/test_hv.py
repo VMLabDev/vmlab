@@ -11,6 +11,11 @@ import hv
 
 
 class ViewerDesktopTest(unittest.TestCase):
+    def test_revision_is_the_monorepo_commit(self):
+        expected = subprocess.check_output(
+            ["git", "-C", str(hv.ROOT), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(hv.revision(), expected)
+
     def test_payload_and_installer(self):
         with tempfile.TemporaryDirectory(prefix="viewer icons ") as temporary:
             root = Path(temporary)

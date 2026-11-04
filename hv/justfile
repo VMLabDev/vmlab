@@ -1,7 +1,6 @@
 # vmlab-hypervisor task runner
 
-# Verification gate
-mod ci '.just/ci'
+# Run repository-wide verification from the root with just ci::check.
 
 [default, private]
 main:

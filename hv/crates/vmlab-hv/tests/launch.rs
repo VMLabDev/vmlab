@@ -12,7 +12,10 @@ use vmlab_hv_tests::process::ManagedChild;
 use vmlab_hv_proto::client::Client;
 use vmlab_hv_proto::control::{Command as Ctrl, Event, Outcome, RunState, ShutdownReason};
 
-const KERNEL: &str = "/home/wil/dev/vmlab/guest/dist/x86_64/vmlinuz";
+const KERNEL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../guest/dist/x86_64/vmlinuz"
+);
 
 fn kernel_available() -> bool {
     Path::new("/dev/kvm").exists() && Path::new(KERNEL).exists()

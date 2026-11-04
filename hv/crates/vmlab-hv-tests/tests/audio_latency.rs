@@ -57,7 +57,7 @@ fn target_dir() -> PathBuf {
         dir
     } else {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
+            .join("../../..")
             .join(dir)
     }
 }
