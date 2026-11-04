@@ -13,6 +13,14 @@ Each direction creates its connection, mainloop, and stream on its worker.
 Capture starts only through `open_capture`; creating a host never opens a
 microphone. The device caller enforces the machine's microphone opt-in.
 
+PipeWire playback initially retains PCM until 512 frames are buffered. This
+preserves a 256-frame reserve when the default host callback consumes its
+first quantum. Without prefill, startup phase can leave too little PCM to cover
+timer jitter later in the stream. Prefill waits for at most two callbacks after
+the first PCM arrives, so a short one-shot sound still drains. Priming supplies
+silence without consuming or discarding PCM and appears as `priming=true` in
+pull diagnostics. Playback never primes again after starting.
+
 PipeWire process callbacks run on the owning mainloop thread. `RT_PROCESS` is
 deliberately absent: the local listener's Rust state and all stream access stay
 on one thread. The loop waits up to 5 ms for events, but wakes immediately when
@@ -58,14 +66,14 @@ bytes. PulseAudio converts its positive stream latency from microseconds to
 PCM bytes and adds playback ring occupancy.
 
 `PlaybackSink::queued_bytes()` reports only ring occupancy. HDA uses it to
-limit DMA submission, while position uses `latency_bytes()`. Graph latency can
+limit DMA submission. HDA link position excludes at most the advertised
+controller FIFO depth from that queue, independently of downstream graph
+latency. IOC reports when DMA has fetched the descriptor. Graph latency can
 remain nonzero with an empty ring, so using it to throttle submission would
 stall playback.
 
-`queued_bytes()` reports only playback ring occupancy, or zero after the worker
-exits. Device submission throttling uses this count rather than total latency.
-Graph latency can exceed one period even with an empty ring. Tests pin this
-distinction for both backends.
+After the worker exits, `queued_bytes()` returns zero. Tests pin the distinction
+between ring occupancy and graph latency for both backends.
 
 ## Startup, failure, and teardown
 

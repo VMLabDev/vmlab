@@ -1,8 +1,8 @@
 //! Intel HDA 1.0a controller (chapters 3-4) and duplex codec (chapter 7).
 //!
 //! The machine timer calls [`Hda::advance`] with unpaused virtual time.
-//! DMA is bounded to 256-frame periods; playback position follows bytes no
-//! longer buffered by the host. No host audio calls block the vCPU.
+//! DMA is bounded to 256-frame periods. Playback position follows the local
+//! FIFO consumer, excluding downstream graph delay. Host audio calls never block.
 
 mod codec;
 #[cfg(test)]
@@ -239,11 +239,25 @@ impl Hda {
             self.streams[index].fraction = frames
                 .min(u128::from(MAX_PENDING_FRAMES) * 1_000_000_000 + frames % 1_000_000_000)
                 as u64;
+            log::trace!(
+                "HDA tick stream={index} elapsed_ns={} submitted={} consumed={} deferred_frames={} queued={} latency={} descriptor={} offset={}",
+                elapsed.as_nanos(),
+                self.streams[index].submitted,
+                self.streams[index].consumed,
+                self.streams[index].fraction / 1_000_000_000,
+                self.playback.as_ref().map_or(0, |sink| sink.queued_bytes()),
+                self.playback
+                    .as_ref()
+                    .map_or(0, |sink| sink.latency_bytes()),
+                self.streams[index].descriptor,
+                self.streams[index].offset,
+            );
             let mut bytes =
                 (self.streams[index].fraction / 1_000_000_000) as usize * format.frame_bytes();
             while bytes != 0 {
                 let latency = self.playback.as_ref().map_or(0, |sink| sink.queued_bytes());
                 if index == 1 && latency >= PLAYBACK_QUEUE_FRAMES * format.frame_bytes() {
+                    log::trace!("HDA defer queued={latency} remaining_bytes={bytes}");
                     break;
                 }
                 let mut count = bytes.min(PERIOD_FRAMES * format.frame_bytes());
@@ -347,11 +361,25 @@ impl Hda {
                     .map_err(|e| DeviceError::Memory(e.to_string()))?;
             }
             let stream = &mut self.streams[index];
+            if index == 1 {
+                log::debug!(target: "vmlab_hv_devices::hda::dma",
+                    "HDA DMA submitted={} position={} cbl={cbl} descriptor={} offset={} length={length} flags={flags} buffer={buffer:x} bytes={n} first={:02x?} last={:02x?} wall_ticks={}",
+                    stream.submitted, stream.submitted % u64::from(cbl), stream.descriptor, stream.offset,
+                    &pcm[done..done + 4], &pcm[done+n-4..done+n], self.wall_ticks);
+            }
             stream.offset += n as u32;
             stream.submitted = stream.submitted.saturating_add(n as u64);
             if stream.offset == length {
                 if flags & 1 != 0 {
                     stream.completions.push_back(stream.submitted);
+                    log::debug!(target: "vmlab_hv_devices::hda::period",
+                        "HDA IOC DMA stream={index} descriptor={} submitted={} consumed={} cbl={cbl} position={} wall_ticks={}",
+                        stream.descriptor,
+                        stream.submitted,
+                        stream.consumed,
+                        stream.submitted % u64::from(cbl),
+                        self.wall_ticks,
+                    );
                 }
                 stream.offset = 0;
                 stream.descriptor = if stream.descriptor == lvi {
@@ -378,23 +406,33 @@ impl Hda {
     }
 
     fn update_position(&mut self, index: usize) {
-        let latency = if index == 1 {
-            self.playback.as_ref().map_or(0, |s| s.latency_bytes())
+        let queued = if index == 1 {
+            self.playback
+                .as_ref()
+                .map_or(0, |sink| sink.queued_bytes())
+                .min(usize::from(self.get16(STREAM_BASE + index * 32 + 0x10)) + 1)
         } else {
             0
         };
         let stream = &mut self.streams[index];
+        // DMA fills the local FIFO before samples cross the link. LPIB
+        // follows that FIFO's consumer, bounded by SDFIFOS. Extra backend
+        // staging and downstream graph delay do not belong to the link.
+        // Reporting the fetch cursor makes Windows refill the active period.
         stream.consumed = stream
             .consumed
-            .max(stream.submitted.saturating_sub(latency as u64));
+            .max(stream.submitted.saturating_sub(queued as u64));
         let mut completed = false;
         while stream
             .completions
             .front()
-            .is_some_and(|end| *end <= stream.consumed)
+            // HDA 1.0a, SDnSTS.BCIS: playback completes when the last
+            // byte has been fetched into the FIFO, not when it is audible.
+            .is_some_and(|end| *end <= stream.submitted)
         {
             stream.completions.pop_front();
             completed = true;
+            log::debug!(target: "vmlab_hv_devices::hda::period", "HDA IOC retire stream={index} consumed={}", stream.consumed);
         }
         let consumed = stream.consumed;
         let base = STREAM_BASE + index * 32;
@@ -619,7 +657,14 @@ impl BusDevice for Hda {
                     match address - base {
                         0 => self.regs[address] = byte & 0x1f,
                         2 => self.regs[address] = byte & 0xf0,
-                        3 => self.regs[address] &= !(byte & 0x1c),
+                        3 => {
+                            log::debug!(target: "vmlab_hv_devices::hda::period",
+                                "HDA ACK stream={} value={byte} status={} submitted={} position={} wall_ticks={} msi={}",
+                                (address-STREAM_BASE)/32, self.regs[address],
+                                self.streams[(address-STREAM_BASE)/32].submitted,
+                                self.get32(base+4), self.wall_ticks, self.config[0x62]&1);
+                            self.regs[address] &= !(byte & 0x1c);
+                        }
                         8..=0xc | 0x12..=0x13 | 0x18..=0x1f => self.regs[address] = byte,
                         _ => {}
                     }

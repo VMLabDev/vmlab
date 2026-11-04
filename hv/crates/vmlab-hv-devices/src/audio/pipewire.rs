@@ -48,6 +48,7 @@ impl PipeWireHost {
             alive: AtomicBool::new(true),
             host_latency: AtomicUsize::new(0),
             transferred: AtomicUsize::new(0),
+            submitted: AtomicUsize::new(0),
         });
         let (tx, rx) = mpsc::channel();
         let name = self.node_name.clone();
@@ -97,11 +98,35 @@ struct Shared {
     alive: AtomicBool,
     host_latency: AtomicUsize,
     transferred: AtomicUsize,
+    submitted: AtomicUsize,
 }
 
 struct Endpoint {
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct Playback {
+    primed: bool,
+    startup_pulls: u8,
+}
+
+impl Playback {
+    fn pull(&mut self, ring: &SpscRing, out: &mut [u8], stride: usize) -> usize {
+        let available = ring.used_bytes();
+        if !self.primed && available != 0 {
+            // Begin with two quanta of PCM so timer/callback phase does not
+            // consume the jitter reserve. Short one-shot sounds still drain.
+            self.primed = available >= 2 * 256 * stride || self.startup_pulls == 2;
+            if !self.primed {
+                self.startup_pulls += 1;
+            }
+        }
+        let n = if self.primed { ring.pop_max(out) } else { 0 };
+        out[n..].fill(0);
+        n
+    }
 }
 
 // pipewire 0.10's safe Buffer cannot set pw_buffer.size. Keep raw access here
@@ -176,7 +201,20 @@ impl PlaybackSink for Endpoint {
 
     fn write_period(&mut self, pcm: &[u8]) {
         if self.shared.alive.load(Ordering::Acquire) {
-            self.shared.ring.push_drop_oldest(pcm);
+            let available = self.shared.ring.used_bytes();
+            let offset = self
+                .shared
+                .submitted
+                .fetch_add(pcm.len(), Ordering::Relaxed);
+            let dropped = self.shared.ring.push_drop_oldest(pcm);
+            if dropped != 0 {
+                log::warn!("PipeWire overrun dma_offset={offset} dropped_bytes={dropped}");
+            }
+            log::debug!(target: "vmlab_hv_devices::audio::pipewire::dma",
+                "PipeWire write dma_offset={offset} bytes={} available_bytes={available} dropped_bytes={dropped}", pcm.len());
+        } else {
+            log::debug!(target: "vmlab_hv_devices::audio::pipewire::dma",
+                "PipeWire discard bytes={} reason=worker_stopped", pcm.len());
         }
     }
 
@@ -237,10 +275,10 @@ fn run(
     )
     .map_err(error)?;
     let stride = format.frame_bytes();
-    let worker = shared.clone();
+    let worker = (shared.clone(), Playback::default());
     let _listener = stream
         .add_local_listener_with_user_data(worker)
-        .process(move |stream, shared| {
+        .process(move |stream, (shared, playback)| {
             let Some(mut buffer) = ProcessBuffer::dequeue(stream) else {
                 return;
             };
@@ -268,9 +306,18 @@ fn run(
                         frames.min(requested)
                     };
                     let size = frames * stride;
-                    let n = shared.ring.pop_max(&mut bytes[..size]);
-                    bytes[n..size].fill(0);
-                    shared.transferred.fetch_add(n, Ordering::Relaxed);
+                    let available = shared.ring.used_bytes();
+                    let n = playback.pull(&shared.ring, &mut bytes[..size], stride);
+                    let offset = shared.transferred.fetch_add(n, Ordering::Relaxed);
+                    log::debug!(target: "vmlab_hv_devices::audio::pipewire::pull",
+                        "PipeWire pull requested_frames={frames} available_frames={} delivered_frames={} pcm_offset={offset} dma_submitted={} queued_bytes={} silence_frames={} priming={}",
+                        available / stride,
+                        n / stride,
+                        shared.submitted.load(Ordering::Relaxed),
+                        shared.ring.used_bytes(),
+                        (size - n) / stride,
+                        !playback.primed,
+                    );
                     size
                 } else {
                     0
@@ -372,6 +419,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn playback_prefill_preserves_pcm_and_a_quantum_of_timer_jitter() {
+        for stride in [2, 4, 8] {
+            let quantum = 256 * stride;
+            let ring = SpscRing::with_capacity_bytes(4 * quantum);
+            let mut playback = Playback::default();
+            let mut out = vec![9; quantum];
+            ring.push_drop_oldest(&vec![1; quantum]);
+            assert_eq!(playback.pull(&ring, &mut out, stride), 0);
+            assert_eq!(ring.used_bytes(), quantum);
+            assert_eq!(out, vec![0; quantum]);
+            ring.push_drop_oldest(&vec![2; quantum]);
+            assert_eq!(playback.pull(&ring, &mut out, stride), quantum);
+            assert_eq!(out, vec![1; quantum]);
+            // The next pull arrives before the delayed producer runs.
+            assert_eq!(playback.pull(&ring, &mut out, stride), quantum);
+            assert_eq!(out, vec![2; quantum]);
+            ring.push_drop_oldest(&vec![3; 2 * quantum]);
+            assert_eq!(playback.pull(&ring, &mut out, stride), quantum);
+            assert_eq!(out, vec![3; quantum]);
+            assert_eq!(ring.used_bytes(), quantum);
+        }
+    }
+
+    #[test]
+    fn playback_prefill_drains_short_sounds_after_two_pulls() {
+        let ring = SpscRing::with_capacity_bytes(4096);
+        let mut playback = Playback::default();
+        let mut out = [9; 1024];
+        for _ in 0..4 {
+            assert_eq!(playback.pull(&ring, &mut out, 4), 0);
+        }
+        ring.push_drop_oldest(&[1; 96 * 4]);
+        for _ in 0..2 {
+            assert_eq!(playback.pull(&ring, &mut out, 4), 0);
+            assert_eq!(ring.used_bytes(), 96 * 4);
+        }
+        assert_eq!(playback.pull(&ring, &mut out, 4), 96 * 4);
+        assert_eq!(&out[..96 * 4], &[1; 96 * 4]);
+        assert!(out[96 * 4..].iter().all(|byte| *byte == 0));
+        assert_eq!(playback.pull(&ring, &mut out, 4), 0);
+        ring.push_drop_oldest(&[2; 32 * 4]);
+        assert_eq!(playback.pull(&ring, &mut out, 4), 32 * 4);
+        assert_eq!(&out[..32 * 4], &[2; 32 * 4]);
+    }
+
+    #[test]
     fn graph_latency_does_not_count_as_queued_pcm() {
         let mut sink = Endpoint {
             shared: Arc::new(Shared {
@@ -380,6 +473,7 @@ mod tests {
                 alive: AtomicBool::new(true),
                 host_latency: AtomicUsize::new(8192),
                 transferred: AtomicUsize::new(0),
+                submitted: AtomicUsize::new(0),
             }),
             join: None,
         };
