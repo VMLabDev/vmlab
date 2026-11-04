@@ -236,6 +236,9 @@ No host PCI or USB device is required except explicitly configured passthrough.
         for elf in (stage / "lib").iterdir():
             if not elf.is_symlink():
                 check_elf(elf, "$ORIGIN")
+        with (stage / "virglrenderer-BUILDINFO").open("a") as info:
+            digest = hashlib.sha256((stage / "libexec/virgl_render_server").read_bytes()).hexdigest()
+            info.write(f"bundled-server-sha256: {digest}\n")
         epoch = int(os.environ.get("SOURCE_DATE_EPOCH", subprocess.check_output(
             ["git", "-C", str(ROOT), "show", "-s", "--format=%ct", "HEAD"], text=True).strip()))
 
