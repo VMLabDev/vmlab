@@ -2,7 +2,6 @@
 """Import component main into a clean branch, then replay rewiring commits."""
 
 import argparse
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -55,7 +54,7 @@ def main():
         if args.component == "win3d":
             filters = ["--invert-paths", "--path", "docs/evidence/",
                        "--path-glob", "*.pyc"]
-            retained = git("rev-list", "HEAD", "--", ".", ":(exclude)docs/evidence/**",
+            retained = git("rev-list", "--full-history", "HEAD", "--", ".", ":(exclude)docs/evidence/**",
                            ":(exclude)*.pyc", cwd=source).splitlines()
             expected = len(retained)
         else:
