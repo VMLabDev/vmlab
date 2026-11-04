@@ -57,8 +57,8 @@ Vulkan-Tools tree, with `patch --strip=1 --forward --batch`.
 | `0001-vulkaninfo-Load-user32-on-every-Windows-compiler.patch` | Upstream `main()` loads user32 only under `#if defined(_MSC_VER)`. In an llvm-mingw build, `user32_handles` therefore stays null, and `vulkaninfo` crashes with 0xC0000005 in `AppCreateWin32Window` (`pfnLoadIconA`) as soon as a device enumerates. The patch puts the Windows setup under `_WIN32` and keeps only the MSVC CRT debug calls under `_MSC_VER`. The bug is still on Vulkan-Tools `main`, so the patch can go upstream. |
 
 The e2e run found the crash
-(`docs/evidence/acceptance/windows-11/vulkaninfo/` on branch `work/e2e`).
-`docs/evidence/vulkaninfo/` shows the patched build passing.
+([docs/evidence/acceptance/windows-11/vulkaninfo/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11/vulkaninfo/) on branch `work/e2e`).
+[docs/evidence/vulkaninfo/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/vulkaninfo/) shows the patched build passing.
 
 ## Version resource
 

@@ -182,7 +182,7 @@ start would not be. The installer must therefore run
 
 ## Evidence
 
-`docs/evidence/kmd/README.md` indexes the load test on a fresh `windows-11`
+[docs/evidence/kmd/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/README.md) indexes the load test on a fresh `windows-11`
 lab (`build/signing/load-test.sh`). In short: `pnputil /add-driver
 /install` accepted the Linux-made catalog as an Authenticode catalog from a
 trusted publisher, installed it on the virtio-gpu device, the kernel loaded

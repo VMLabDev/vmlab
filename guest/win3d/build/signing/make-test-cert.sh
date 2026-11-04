@@ -3,16 +3,14 @@
 #
 #   build/signing/make-test-cert.sh
 #
-# Writes .signing/ at the repo root (never committed; the directory carries
-# its own .gitignore):
+# Writes WIN3D_SIGNING_DIR or ~/.config/vmlab/signing/win3d/:
 #   test-signing.key   RSA 3072 private key, mode 0600
 #   test-signing.crt   self-signed certificate, PEM
 #   test-signing.cer   the same certificate, DER, for certutil on the guest
 #   SIGN_TIME          the fixed signing time sign-driver.sh stamps (epoch)
 #   CERT-INFO.txt      subject, validity and thumbprints
 #
-# Running it again with the files present changes nothing. Delete .signing/
-# to start over; every package signed with the old key must then be re-signed.
+# Running it again with the files present changes nothing.
 set -euo pipefail
 source "$(dirname "$0")/tools.sh"
 

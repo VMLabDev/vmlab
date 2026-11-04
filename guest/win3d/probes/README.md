@@ -174,7 +174,7 @@ Vulkan-Headers, pinned with a sha256 in `build/probes/PINS`. `build.sh` fetches
 it into `out/probes/deps/` once and checks the hash. `make` rebuilds only what
 changed. Binaries are stripped and linked without a timestamp, so a clean
 rebuild gives the same bytes; this was checked on 2026-10-17 (hashes in
-`docs/evidence/probes/README.md`). After every build, `check-imports.sh` fails
+[docs/evidence/probes/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/probes/README.md)). After every build, `check-imports.sh` fails
 the build if a probe imports a DLL that is not a Windows system DLL.
 
 ## Running in a guest

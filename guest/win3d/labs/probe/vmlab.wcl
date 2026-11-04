@@ -9,6 +9,7 @@ import <vmlab.wcl>
 // See docs/host.md and vmlab handoffs 20261017-142905 and 20261017-210821.
 lab "win3d-host-probe" {
   vm "win11" {
+    hypervisor = "vmlab"
     template = "x86_64/windows-11@26100.1742.5"
     // The template's windows-11 profile turns Secure Boot on; the test-signed
     // driver package needs it off (docs/decisions/0001-signing.md).

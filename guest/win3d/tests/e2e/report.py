@@ -43,9 +43,8 @@ for t in dirs:
     out.append(f'### {t}\n')
     gpu = host.get('venus gpu', '')
     if gpu.startswith('host_gpu '):
-        qemu = next((f'{v} (the {k[6:-1]})' for k, v in host.items() if k.startswith('qemu (') and 'qemu_binary' in k), None)
-        out.append(f"Host GPU: {gpu.removeprefix('host_gpu ')}. QEMU: "
-                   f"{qemu or host.get('qemu (PATH)', '?') + ' (from PATH)'}.\n")
+        out.append(f"Host GPU: {gpu.removeprefix('host_gpu ')}. Hypervisor: "
+                   f"{host.get('hypervisor', host.get('qemu (PATH)', '?'))}.\n")
     out.append(f"Run {host.get('date', '?')} at commit `{host.get('commit', '?')[:12]}`, template "
                f"`{host.get('template', '?')}`. **{'PASS' if res['passed'] else 'FAIL'}: {passed} of "
                f"{len(counted)} Done checks pass** (run stage: {stage or '?'}). Evidence: "

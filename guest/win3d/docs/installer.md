@@ -8,7 +8,7 @@ picks another driver, and a device installation policy pins the one device
 instance so that Windows installs no other driver on it. Uninstall removes
 the pin. Investigated on 2026-10-18 on helios with vmlab 0.28.0-alpha, the
 `windows-11@26100.1742.5` template and bundle 0.1.0. Evidence is in
-`docs/evidence/installer/`.
+[docs/evidence/installer/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/installer/).
 
 ## Result
 
@@ -33,7 +33,7 @@ with the lowest rank:
 | `HHH` | Position of the matched ID in the device's list; `000` is its first and most specific hardware ID | `000` | `000` |
 
 When ranks tie, PnP takes the newer DriverVer date, then the higher
-version. `docs/evidence/kmd/06-setupapi-dev-log.txt` shows the tie before the
+version. [docs/evidence/kmd/06-setupapi-dev-log.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/06-setupapi-dev-log.txt) shows the tie before the
 fix: `Driver Rank - 00F90000` for this package, signed with
 `Signer Score - Authenticode (0F000000)`, and for `viogpudo`, signed with
 `Signer Score - WHQL (0D000005)`. The signer score is recorded but does
@@ -92,7 +92,7 @@ It changes nothing for other devices, and `Uninstall.cmd` removes it.
 
 ## Evidence
 
-`docs/evidence/installer/src/` holds the repro:
+[docs/evidence/installer/src/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/installer/src/) holds the repro:
 
 | File | Role |
 | --- | --- |
@@ -110,7 +110,7 @@ signatures, PnP sees what it would see for a WHQL `viogpudo` released after
 this package. A second copy, "hostile", also has `FeatureScore=00`, so it
 outranks even the fixed INF and only the forced install and the pin hold it
 off. The control bundle is this checkout's bundle with the installer and
-INF of commit `b4b8c3f`, from before the fix.
+INF of commit [b4b8c3f](https://github.com/VMLabDev/vmlab-win3d/commit/b4b8c3fada1c47d2079ce9ab4699fa8c544a8717), from before the fix.
 
 The steps (`repro.sh`):
 
@@ -159,7 +159,7 @@ full-ID match at `00F90000` and `00000000`, and Microsoft Basic Display at
 `00FB2006`.
 
 The full acceptance run (`tests/e2e/run.sh --template windows-11`) passes
-with the fixed bundle, built at `43a4b1e`: 12 of 12 on Nvidia1
+with the fixed bundle, built at [43a4b1e](https://github.com/VMLabDev/vmlab-win3d/commit/43a4b1e0b07409b818f9efccc68f9356fd313ad9): 12 of 12 on Nvidia1
 (`e2e/windows-11-nvidia1/`) and 12 of 12 on AMD1 (`e2e/windows-11/`). Both
 runs install, verify and destroy their own lab.
 
@@ -172,7 +172,7 @@ fixed and run again on the same reports; `checks.txt` is that second run.
 
 The repro above could not run a real Windows Update scan: the template
 disables the service, and the lab had no network. With the lab NIC
-(`docs/wu.md`), `docs/evidence/wu/src/repro.sh` turns Windows Update on in
+(`docs/wu.md`), [docs/evidence/wu/src/repro.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/src/repro.sh) turns Windows Update on in
 a test VM and scans with the Windows Update Agent COM API
 (`Microsoft.Update.Session`, against Windows Update itself, driver updates
 included). It downloads and installs every driver update offered, runs
@@ -192,8 +192,8 @@ are older than the template's `viogpudo` (`docs/wu.md`). `UsoClient` on build
 26100 accepts only its scan verbs. `StartDownload` and `StartInstall` exit
 `0x80070057`, as a made-up verb does, so the COM API does the install.
 
-Results: `docs/evidence/wu/windows-11-nvidia1/checks.txt` and
-`docs/evidence/wu/windows-11-amd1/checks.txt`: 16 of 16 on Nvidia1, and
+Results: [docs/evidence/wu/windows-11-nvidia1/checks.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/windows-11-nvidia1/checks.txt) and
+[docs/evidence/wu/windows-11-amd1/checks.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/windows-11-amd1/checks.txt): 16 of 16 on Nvidia1, and
 15 of 16 on AMD1, where the first search did not finish within an hour on a
 degraded internet link (`docs/wu.md`).
 

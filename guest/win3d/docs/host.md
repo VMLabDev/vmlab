@@ -1,9 +1,20 @@
 # Host probe: Venus for a Windows 11 guest on this host
 
+## Current host setup
+
+Use `hypervisor = "vmlab"` and the vmlab-hv bundle built from the repository
+root with `just ci::hv-package`. Its library and Venus render server both
+include ../../patches/virglrenderer/0002 and 0003. The launcher selects the
+bundled server. No patched QEMU or per-GPU server override is needed.
+The host still supplies Vulkan, EGL and the GPU driver.
+
+The sections below record the earlier QEMU investigation. Their versions,
+commands and results are historical; they do not describe current setup.
+
 This page records what this host (helios) and vmlab v0.23.0-alpha need before a
 Windows 11 guest from the local `windows-11` template gets a working Venus
 device and a visible console. Every claim cites a file under
-`docs/evidence/host/`. Probe date: 2026-10-17.
+[docs/evidence/host/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host/). Probe date: 2026-10-17.
 
 The NVIDIA failures this probe recorded have since been explained and fixed
 in `docs/nvidia.md` (`patches/mesa/0020` and the patched QEMU). Read
@@ -19,32 +30,6 @@ Two more host-config features remove the last NVIDIA workarounds
 | An isolated supervisor with the patched QEMU first on `PATH` (`labs/nvidia/vmlab-nv.sh`, now deleted) | 0.26: `qemu_binary = "<abs path>"` on the host GPU block; vmlab runs it for every VM on that GPU and adds `-L /usr/share/qemu` (vmlab handoff `20261018-014452`) |
 | Debug variables and `RENDER_SERVER_EXEC_PATH` set in that supervisor's environment | 0.26: `qemu_env = { NAME: "value" }` on the host GPU block |
 | Both RTX 5090s visible to the guest, since `*nvidia*` matches both | 0.27: the implicit layer `VK_LAYER_VMLAB_pci_filter` keeps only the host GPU's device; no setting (vmlab handoff `20261018-092228`) |
-
-Helios's host config gives `Nvidia1` a `qemu_binary`. The path below is the
-current one: since 2026-10-18 it is the version-free
-`~/.local/opt/qemu-vmlab-egl`, built from QEMU master plus our series
-(`patches/host/PINS`); before that it was `~/.local/opt/qemu-11.1.1-vmlab-egl`.
-Since 2026-10-21 the release tarball that installs there is built in a
-Debian 12 container with a minimal feature set and bundles its
-virglrenderer, so the same tarball runs on any distribution with glibc 2.36
-or newer, not only on hosts with helios's library versions
-(`docs/release.md`, "Supported hosts of the host assets";
-`docs/evidence/portable/`). It is paired with the render server through
-`qemu_env` on the same block.
-
-```wcl
-gpu "Nvidia1" {
-  address     = "0000:01:00.0"
-  default     = true
-  qemu_binary = "/home/wil/.local/opt/qemu-vmlab-egl/bin/qemu-system-x86_64"
-}
-```
-
-`vmlab status -v` then shows `host_gpu=Nvidia1 qemu=<path>`, and
-`qemu.log` starts with that binary in its `vmlab: argv:` line. The AMD1
-labs are unchanged: no `qemu_binary`, so they run `qemu-system-x86_64` from `PATH` (`/usr/bin`)
-with no `-L`. The NVIDIA acceptance runs on 0.27 are in
-`docs/acceptance.md`, "NVIDIA RTX 5090".
 
 ## Update: vmlab 0.25 (2026-10-17)
 
@@ -301,7 +286,7 @@ backend, `-display egl-headless,rendernode=/dev/dri/renderD129`, and
 removed one item. "Venus" means vulkaninfo, as the interactive user, lists
 "Virtio-GPU Venus (AMD Ryzen 9 9950X … (RADV RAPHAEL_MENDOCINO))".
 
-| Variant (`docs/evidence/host/<dir>`) | Change from known-good | QEMU | Venus in guest | Console (VNC) | Verdict |
+| Variant ([docs/evidence/host/<dir>](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host/)) | Change from known-good | QEMU | Venus in guest | Console (VNC) | Verdict |
 | --- | --- | --- | --- | --- | --- |
 | `good-amd` | none | runs | yes, AMD | desktop + vkcube | works |
 | `no-blob-amd` (no dir; QEMU never ran) | `blob` removed | **refuses**: "venus requires enabled blob and hostmem options" | — | — | **blob required** |

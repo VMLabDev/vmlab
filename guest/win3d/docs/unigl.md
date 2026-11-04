@@ -15,7 +15,7 @@ benchmarks run the full time and exit cleanly on `Nvidia1` and `AMD1`.
 The work was done on 2026-10-19 on helios: NVIDIA 610.57.04 on `Nvidia1`,
 RADV (Mesa 26.2.2) on `AMD1`, QEMU 11.1.1 (the patched QEMU for NVIDIA),
 virglrenderer 1.3.0 and vmlab 0.28.0-alpha. The evidence is in
-`docs/evidence/unigl/`.
+[docs/evidence/unigl/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unigl/).
 
 ## Cause
 
@@ -59,7 +59,7 @@ wrong, one after another.
    mapping`. No guest-side check can see this one coming. nvva's `0070`
    removes it by keeping guest allocations out of the visible heap.
 
-The guest-side Venus log in `docs/evidence/unigl/3-instrumented/` shows
+The guest-side Venus log in [docs/evidence/unigl/3-instrumented/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unigl/3-instrumented/) shows
 fault 2 directly. With every allocation made synchronously (instrumentation
 `src/venus-alloc-log.diff`), all of Heaven's allocations succeed. The one
 failure is the map of a 2 MiB buffer in memory type 1, which is
@@ -73,7 +73,7 @@ device-local only (`venus-alloc-0070-heaven.txt`).
 | `patches/mesa/0085` | unigl | `vkAllocateMemory` from a device-local heap smaller than the largest device-local heap is synchronous, so the caller sees the host's result and Zink's fallback runs (fault 1) |
 | `patches/mesa/0086` | unigl | Zink keeps those buffers mappable. A missing visible-VRAM heap is filled with the `HOST_VISIBLE_COHERENT` types, and a failed visible-VRAM allocation is retried there whenever the resource's `memoryTypeBits` allow it. Images that cannot use those types still go to `DEVICE_LOCAL` (fault 2) |
 
-`0070` is nvva's patch, carried here byte for byte (nvva `e24e356`) so that
+`0070` is nvva's patch, carried here byte for byte (nvva [e24e356](https://github.com/VMLabDev/vmlab-win3d/commit/e24e35690c914d3bf68cda5cf8d381731c5c76a0)) so that
 the proof package is the series that merges. nvva carries `0086` the same way,
 so `0070` never lands without it. nvva's draft `0071` (Yttrium display images
 in system memory) is not part of the series. In this worker's runs it made
@@ -89,7 +89,7 @@ until an allocation from it fails.
 
 ## Evidence
 
-Each run is `docs/evidence/unigl/src/run-compat.sh` (the compat sweep's
+Each run is [docs/evidence/unigl/src/run-compat.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unigl/src/run-compat.sh) (the compat sweep's
 `tests/apps/compat/run.sh` under this worker's lab and evidence names), with
 `--only heaven-opengl,valley-opengl` and the default 150 s. The runs are in
 order, and later runs reused the same lab. `bar1.txt` is the host's BAR1 use
@@ -98,7 +98,7 @@ the Mesa patches in the package.
 
 | Run | Package | GPU | Heaven | Valley |
 | --- | --- | --- | --- | --- |
-| `1-stock` | main at `5781598` | `Nvidia1`, BAR1 246 to 250 MiB of 256 | `0xC0000409` at 122 s | `0xC0000409` at 48 s |
+| `1-stock` | main at [5781598](https://github.com/VMLabDev/vmlab-win3d/commit/5781598ec9760828bb391306df23170832f31572) | `Nvidia1`, BAR1 246 to 250 MiB of 256 | `0xC0000409` at 122 s | `0xC0000409` at 48 s |
 | `2-nvva-0070-0071-0085` | + nvva drafts, first `0085` | `Nvidia1` | `0xC0000005` in `viogpu_wgl.dll` at 82 s (`mem is not exportable`) | the same at 38 s |
 | `3-instrumented` | + allocation log, first `0086` | `Nvidia1` | runs; dwm dead (`0071`), close times out | the same |
 | `4-nvva-0070-0071-0085-0086v1` | nvva drafts, `0085`, first `0086` | `AMD1` | clean, 23.9 fps | clean, 18.2 fps |
@@ -106,7 +106,7 @@ the Mesa patches in the package.
 | `5-0085-only` | `0085` | `Nvidia1` | `0xC0000005` at 36 s (`mem is not exportable`: fault 2 through Zink's fallback) | clean, 61.2 fps |
 | `6-0085-0086` | `0085`, `0086` | `Nvidia1` | `0xC0000005` at 31 s (`ctrl 0x208`: fault 3) | clean, 34.1 fps |
 | `7-final` | `0070`, `0085`, `0086` | `Nvidia1` | clean, 71.9 fps | clean, 63.9 fps |
-| `7-final` | the same, built at `3bf3241` | `AMD1`, fresh lab | clean, 17.2 fps | clean, 20.7 fps |
+| `7-final` | the same, built at [3bf3241](https://github.com/VMLabDev/vmlab-win3d/commit/3bf324184f5ceb342e51a540c25305f22b637aa1) | `AMD1`, fresh lab | clean, 17.2 fps | clean, 20.7 fps |
 
 The frame rates are the means of the on-screen counter, read with OCR from
 the console frames (`fps.txt`; [compat.md](compat.md) explains the method).
@@ -121,18 +121,18 @@ no lost Venus contexts in the five minutes after boot.
 
 The `7-final` runs on `Nvidia1` used a package built before `0070` was
 committed here. Its Mesa DLLs are byte-identical to those of the package
-built at `3bf3241`, which the `AMD1` run and the acceptance runs used.
+built at [3bf3241](https://github.com/VMLabDev/vmlab-win3d/commit/3bf324184f5ceb342e51a540c25305f22b637aa1), which the `AMD1` run and the acceptance runs used.
 
 `tests/e2e/run.sh --template windows-11` with the package built at
-`3bf3241` (nvva's `0070`, `0085`, `0086` on top of main's series) passed 12
+[3bf3241](https://github.com/VMLabDev/vmlab-win3d/commit/3bf324184f5ceb342e51a540c25305f22b637aa1) (nvva's `0070`, `0085`, `0086` on top of main's series) passed 12
 of 12 on both GPUs, with no NVIDIA Xid during the `Nvidia1` run. The
-evidence is copied to `docs/evidence/unigl/e2e/amd1/` and
-`docs/evidence/unigl/e2e/nvidia1/` (`results.txt`).
+evidence is copied to [docs/evidence/unigl/e2e/amd1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unigl/e2e/amd1/) and
+[docs/evidence/unigl/e2e/nvidia1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unigl/e2e/nvidia1/) (`results.txt`).
 
 ### After merging main
 
-nvva's `0070` and `0086` merged to main (`b74ea3c`), followed by unid3d's
-`0090`. This branch merged main, and the package built at `d3ecec3` (main's
+nvva's `0070` and `0086` merged to main ([b74ea3c](https://github.com/VMLabDev/vmlab-win3d/commit/b74ea3c22396862ab54d5ef119a774942b938780)), followed by unid3d's
+`0090`. This branch merged main, and the package built at [d3ecec3](https://github.com/VMLabDev/vmlab-win3d/commit/d3ecec33b207a2ca45e3668afcf40da979173f73) (main's
 series plus `0085`) was checked again:
 
 | Check | `AMD1` | NVIDIA |

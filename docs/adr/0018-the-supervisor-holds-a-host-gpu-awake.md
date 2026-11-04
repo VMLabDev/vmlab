@@ -21,7 +21,7 @@ vmlab cannot stop the driver from suspending without root: `power/control` and
 the `nvidia` module options are root-owned. It can make sure the GPU never has
 an idle gap between labs, by keeping a client on it.
 
-The prior art is `labs/zeus/keepawake/` in vmlab-win3d, measured on an RTX
+The prior art is `guest/win3d/labs/zeus/keepawake/`, measured on an RTX
 4060 with fine-grained runtime D3. An EGL context with no work did not hold the
 GPU: the driver suspended it after about 21 s with the context still open. The
 same context clearing a 16x16 renderbuffer every 100 ms held it `active`
@@ -33,7 +33,7 @@ throughout, for a whole acceptance run.
 first time a `virgl`/`vulkan` VM starts on that GPU, and kept until the
 supervisor stops.**
 
-- The helper is `src/qemu/gpu_keepawake.c`: the vmlab-win3d loop (an OpenGL ES
+- The helper is `src/qemu/gpu_keepawake.c`: the guest/win3d loop (an OpenGL ES
   context on the GPU through EGL's device platform, a 16x16 clear and
   `glFinish` every 100 ms). It is C because it `dlopen`s libEGL, which the
   crate's `unsafe_code = "deny"` rules out in Rust. `build.rs` compiles it the

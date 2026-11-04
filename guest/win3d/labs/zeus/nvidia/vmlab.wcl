@@ -5,12 +5,11 @@ import <vmlab.wcl>
 // resolves gpu.host_gpu through Zeus's ~/.config/vmlab/config.wcl, which must
 // declare gpu "Nvidia1" { address = "0000:01:00.0" default = true }, to its
 // render node for egl-headless and sets VK_LOADER_DRIVERS_SELECT=*nvidia* in
-// QEMU's environment. The evidence in docs/evidence/zeus/nvidia/ was taken on
-// vmlab 0.24 with gpu.address. The host config's qemu_binary for Nvidia1 gives
-// it the patched QEMU (patches/host/build-qemu.sh, vmlab >= 0.26). See
+// the hypervisor's environment. Historical QEMU evidence is linked from
 // labs/zeus/README.md and docs/zeus.md.
 lab "win3d-zeus-nvidia" {
   vm "win" {
+    hypervisor = "vmlab"
     template = "x86_64/windows-11@26100.1742.5"
     // The package is test-signed (decision 0001); Secure Boot must be off.
     secure_boot = false

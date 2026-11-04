@@ -1,6 +1,7 @@
 """Exercise the release desktop payload and the real per-user installer."""
 
 import configparser
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +13,14 @@ import hv
 
 
 class ViewerDesktopTest(unittest.TestCase):
+    def test_virgl_cache_key_covers_applied_patches(self):
+        self.assertEqual(len(hv.PATCHES), 3)
+        expected = hashlib.sha256(b"".join(
+            patch.name.encode() + b"\0" + patch.read_bytes() for patch in hv.PATCHES)).hexdigest()
+        self.assertIn(expected, hv.CACHE_KEY)
+        self.assertTrue(any(patch.name.startswith("0002-") for patch in hv.PATCHES))
+        self.assertTrue(any(patch.name.startswith("0003-") for patch in hv.PATCHES))
+
     def test_release_stamp_updates_the_root_package(self):
         manifest = hv.ROOT / "Cargo.toml"
         original = tomllib.loads(manifest.read_text())

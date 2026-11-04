@@ -1,26 +1,30 @@
 # Zeus: the package on an Intel iGPU and a laptop RTX 4060
 
+The recorded QEMU runs and host assets are historical. Current win3d labs
+use the in-tree vmlab-hv bundle and its patched Venus render server.
+See [host.md](host.md) and [release.md](release.md) for current setup.
+
 This page records how the package behaves on Zeus, the user's laptop, on
 its two GPUs. It gives the host, the lab files, the exact commands, a
 pass/fail table per GPU, and the cause of each failure. Every claim cites a
-file under `docs/evidence/zeus/`. The first runs are from 2026-10-17; the
+file under [docs/evidence/zeus/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/). The first runs are from 2026-10-17; the
 second round, on vmlab 0.28 and the package from `main`, is from 2026-10-19.
 
 ## Result
 
 Newest first. The package rows name the commit in the bundle's
-`manifest.json`; `82d8e51` and `2c3d8cd` differ only in `installer/VERSION`
+`manifest.json`; [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75) and [2c3d8cd](https://github.com/VMLabDev/vmlab-win3d/commit/2c3d8cd854f40281d5892ee56d7a180fce684ab2) differ only in `installer/VERSION`
 (0.1.0 and 0.1.1).
 
 | Date | GPU | Package, host | Result |
 | --- | --- | --- | --- |
-| 2026-10-19 | Intel Iris Xe (Raptor Lake-P), ANV | `main` (`82d8e51`, patches 0001 to 0042), vmlab 0.28 | **Passes**, 12 of 12 Done checks; uavtest passes (`intel/06-main-82d8e51/`) |
-| 2026-10-19 | NVIDIA RTX 4060 Laptop, 615.71.09 | `main` (`82d8e51`) + the patched QEMU `d8a6048aae`, vmlab 0.28 | **Fails, 7 of 12.** The install, vulkaninfo, D3D9 and D3D11 pass. Every client that drives Venus through the Vulkan API (the Vulkan probes, D3D12 through vkd3d-proton, OpenGL through Zink) never sees its first fence signal, and dxdiag, run after them, returns nothing. The GPU stays healthy: no Xid in any run, with or without the keep-awake helper. Cause below |
+| 2026-10-19 | Intel Iris Xe (Raptor Lake-P), ANV | `main` ([82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75), patches 0001 to 0042), vmlab 0.28 | **Passes**, 12 of 12 Done checks; uavtest passes (`intel/06-main-82d8e51/`) |
+| 2026-10-19 | NVIDIA RTX 4060 Laptop, 615.71.09 | `main` ([82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75)) + the patched QEMU `d8a6048aae`, vmlab 0.28 | **Fails, 7 of 12.** The install, vulkaninfo, D3D9 and D3D11 pass. Every client that drives Venus through the Vulkan API (the Vulkan probes, D3D12 through vkd3d-proton, OpenGL through Zink) never sees its first fence signal, and dxdiag, run after them, returns nothing. The GPU stays healthy: no Xid in any run, with or without the keep-awake helper. Cause below |
 | 2026-10-19 | NVIDIA RTX 4060 Laptop | the same, with Venus feedback turned off in the guest (`VN_PERF`) | **11 of 12, twice.** Everything passes except one OpenGL probe per run, whose final readback is black although it rendered and showed on the console |
-| 2026-10-17 | Intel Iris Xe (Raptor Lake-P), ANV | `main` (`db07da3`), vmlab 0.24 | **Fails.** dwm crash-loops after the install, the console is black, and no probe shows. Cause below |
+| 2026-10-17 | Intel Iris Xe (Raptor Lake-P), ANV | `main` ([db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91)), vmlab 0.24 | **Fails.** dwm crash-loops after the install, the console is black, and no probe shows. Cause below |
 | 2026-10-17 | Intel Iris Xe (Raptor Lake-P), ANV | with `patches/mesa/0021` | **Passes**, 12 of 12 Done checks: vulkaninfo, all 10 probes on the console, dxdiag. R32 typed UAV loads work (uavtest). Fix below |
 | 2026-10-17 | AMD iGPU on helios, RADV (regression) | with `patches/mesa/0021` | **Passes**, 12 of 12 Done checks, 10 of 10 probes |
-| 2026-10-17 | NVIDIA RTX 4060 Max-Q, 615.71.09 | `main` (`db07da3`) + patched QEMU 11.1.1 | **Stopped.** Install, desktop and console work. One minute later the GPU **fell off the bus** (Xid 79), and QEMU aborted. The GPU stayed unusable until Zeus rebooted |
+| 2026-10-17 | NVIDIA RTX 4060 Max-Q, 615.71.09 | `main` ([db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91)) + patched QEMU 11.1.1 | **Stopped.** Install, desktop and console work. One minute later the GPU **fell off the bus** (Xid 79), and QEMU aborted. The GPU stayed unusable until Zeus rebooted |
 
 ## Host
 
@@ -30,14 +34,14 @@ Newest first. The package rows name the commit in the bundle's
 | OS | CachyOS (x86-64-v3 repositories), kernel 7.2.4-3-cachyos |
 | GPUs | Intel Iris Xe (Raptor Lake-P) `0000:00:02.0`; NVIDIA RTX 4060 Max-Q / Laptop (AD107M) `0000:01:00.0`, driver 615.71.09 (open kernel module), runtime D3 fine-grained (`DynamicPowerManagement=2`) |
 | Host stack | QEMU 11.1.1, virglrenderer 1.3.0, Mesa 26.2.2 (`vulkan-intel`), the same as helios |
-| Venus QEMU on `Nvidia1` | 2026-10-19: VMLabDev/qemu `d8a6048aae` (upstream master + our egl-headless series, `patches/host/PINS`), built on Zeus, in `~/.local/opt/qemu-vmlab-egl` (`docs/evidence/zeus/qemu/`). 2026-10-17: QEMU 11.1.1 + `patches/host/qemu/0001` through `labs/zeus/vmlab-iso.sh` |
+| Venus QEMU on `Nvidia1` | 2026-10-19: VMLabDev/qemu `d8a6048aae` (upstream master + our egl-headless series, [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS)), built on Zeus, in `~/.local/opt/qemu-vmlab-egl` ([docs/evidence/zeus/qemu/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/qemu/)). 2026-10-17: QEMU 11.1.1 + [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/qemu/0001) through `labs/zeus/vmlab-iso.sh` |
 | vmlab | 2026-10-19: 0.28.0-alpha, with the host config below. 2026-10-17: 0.24.0-alpha, no host config |
 | Template | `x86_64/windows-11@26100.1742.5` |
 
 `host.txt` in each evidence directory records these per run.
 
 Zeus's host config, `~/.config/vmlab/config.wcl` (copy in
-`docs/evidence/zeus/qemu/zeus-config.wcl`):
+[docs/evidence/zeus/qemu/zeus-config.wcl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/qemu/zeus-config.wcl)):
 
 ```wcl
 import <vmlab-host.wcl>
@@ -72,8 +76,8 @@ On 2026-10-19:
 - The host config above is new; Zeus had none.
 - The patched QEMU is installed in `~/.local/opt/qemu-vmlab-egl`, from a
   tarball laid out as `scripts/release.sh` lays it out, with its
-  `install.sh --check` and `install.sh` (`docs/evidence/zeus/qemu/install-zeus-native.txt`).
-  The binary was built on Zeus with `patches/host/build-qemu.sh`, because
+  `install.sh --check` and `install.sh` ([docs/evidence/zeus/qemu/install-zeus-native.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/qemu/install-zeus-native.txt)).
+  The binary was built on Zeus with [patches/host/build-qemu.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/build-qemu.sh), because
   the one built on helios does not run on Zeus (next section).
 
 On 2026-10-17:
@@ -94,9 +98,9 @@ marked `x86 ISA needed: ... x86-64-v4`. Zeus's i7-13700H has no AVX-512
 (x86-64-v3), so the dynamic loader refuses the binary with `CPU ISA level is
 lower than required`. `install.sh --check` passed anyway, because it checks
 only the shared libraries with `ldd`
-(`docs/evidence/zeus/qemu/helios-binary-on-zeus.txt`). The same commit built
+([docs/evidence/zeus/qemu/helios-binary-on-zeus.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/qemu/helios-binary-on-zeus.txt)). The same commit built
 on Zeus is marked x86-64-v3 and runs
-(`docs/evidence/zeus/qemu/BUILDINFO-zeus-native.txt`). A release tarball built
+([docs/evidence/zeus/qemu/BUILDINFO-zeus-native.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/qemu/BUILDINFO-zeus-native.txt)). A release tarball built
 on helios therefore needs an AVX-512 host. This is reported to the release
 tooling's owner; `scripts/release` is not part of this page's slice.
 
@@ -146,7 +150,7 @@ labs/zeus/keepawake/build.sh && labs/zeus/keepawake/pm-check.sh
 ```
 
 Each run took `WIN3D_TAG=<name>`, so its evidence went to
-`docs/evidence/zeus/<gpu>/<name>/`, fetched with
+[docs/evidence/zeus/<gpu>/<name>/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/), fetched with
 `labs/zeus/stage.sh --fetch <gpu>/<name>`.
 
 The patched QEMU was built on Zeus and installed through the release
@@ -159,7 +163,7 @@ patches/host/build-qemu.sh                  # out/host/qemu, the PINS commit
 ```
 
 The Intel diagnostic run used the isolated supervisor with the host QEMU and
-the diagnostic render server (`patches/host/build-virglrenderer.sh`, built
+the diagnostic render server ([patches/host/build-virglrenderer.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/build-virglrenderer.sh), built
 on helios):
 
 ```sh
@@ -178,13 +182,13 @@ WIN3D_WORK=$PWD/.scratch/work WIN3D_E2E=$PWD/.scratch/e2e-main/tests/e2e \
 
 `run.sh` also takes `WIN3D_BUNDLE=<dir>`, which installs another bundle, and
 `WIN3D_TAG=<name>`, which writes the evidence to
-`docs/evidence/zeus/<gpu>/<name>/`.
+[docs/evidence/zeus/<gpu>/<name>/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/).
 
 ## Intel Iris Xe
 
 ### Regression on `main` (2026-10-19)
 
-The package from `main` at `82d8e51`, which carries `patches/mesa/0021` and
+The package from `main` at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75), which carries `patches/mesa/0021` and
 every later patch up to `0042`, passes 12 of 12 Done checks on vmlab 0.28
 (`intel/06-main-82d8e51/results.txt`). All 10 probes render, read back
 correctly and animate on the console at 55 to 63 fps; vulkaninfo lists
@@ -194,8 +198,8 @@ D3D, DDraw and AGP acceleration. uavtest passes with
 
 ### Pass/fail (2026-10-17)
 
-`main` = the package at `db07da3`. `0021` = this branch's package with
-`patches/mesa/0021` (manifest commit `1bbbfe8`, the final version of the
+`main` = the package at [db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91). `0021` = this branch's package with
+`patches/mesa/0021` (manifest commit [1bbbfe8](https://github.com/VMLabDev/vmlab-win3d/commit/1bbbfe887760c63c24fd423cd04f8fc18319018e), the final version of the
 patch).
 
 The `main` column comes from the diagnostic run: the isolated supervisor
@@ -473,8 +477,8 @@ echo 'options nvidia NVreg_DynamicPowerManagement=0x00' | sudo tee /etc/modprobe
 ### 2026-10-17: the GPU fell off the bus
 
 The run used `main`'s package, which includes `patches/mesa/0020`, and
-QEMU 11.1.1 with `patches/host/qemu/0001`. That QEMU was built natively on
-Zeus with `patches/host/build-qemu.sh` into `~/win3d-zeus/repo/out/host/qemu`
+QEMU 11.1.1 with [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/qemu/0001). That QEMU was built natively on
+Zeus with [patches/host/build-qemu.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/build-qemu.sh) into `~/win3d-zeus/repo/out/host/qemu`
 and run through `labs/zeus/vmlab-iso.sh` (`nvidia/host.txt`).
 
 | Check | Result (`nvidia/`) |
@@ -517,7 +521,7 @@ On Zeus, both labs I created (`win3d-zeus-intel`, `win3d-zeus-nvidia`) are
 destroyed, their state directories under `~/.local/state/vmlab/labs/` and
 `/run/user/1000/vmlab/labs/` are removed, and so is `~/win3d-zeus/` (the
 staging tree, the QEMU build tree, the keepawake build and the experiment
-outputs, all copied into `docs/evidence/zeus/` first). No `keepawake` or
+outputs, all copied into [docs/evidence/zeus/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/) first). No `keepawake` or
 monitor process is left. The 4060 ended healthy: `nvidia-smi -L` lists it,
 and the boot's kernel log has no Xid.
 

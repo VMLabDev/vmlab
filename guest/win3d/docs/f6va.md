@@ -10,7 +10,7 @@ avoided it, at about a third of the frame rate.
 This page gives the cause, the fix (`patches/mesa/0091` and `0092`) and the
 evidence. The work was done on 2026-10-19 on helios: NVIDIA 610.57.04 on
 `Nvidia1`, RADV (Mesa 26.2.2) on `AMD1`, QEMU 11.1.1, virglrenderer 1.3.0 and
-vmlab 0.28.0-alpha. The evidence is in `docs/evidence/f6va/`.
+vmlab 0.28.0-alpha. The evidence is in [docs/evidence/f6va/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/).
 
 ## Result
 
@@ -34,7 +34,7 @@ vertex buffer, the frontend copied the locked range into the stream uploader
 read the copy.
 
 A trace of Valley's D3D9 locks (`D3D10UMD_D3D9_TRACE=1`;
-[lock-flags.txt](evidence/f6va/nvidia1/diag/lock-flags.txt)) shows what that
+[lock-flags.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/nvidia1/diag/lock-flags.txt)) shows what that
 cost. Valley locks one 4 MiB vertex buffer whole, with
 `D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE` and no range, about 100 times a
 second: 4,052 of its 7,354 buffer locks in a 40 s run, 17 GB of locked
@@ -52,10 +52,10 @@ they narrow the cause:
 - Packing the snapshots tightly, and releasing a snapshot two presents after
   its lock, cut the wasted space but not the volume. Valley still hung at
   3.97 GiB on `Nvidia1`
-  ([valley-d3d9-0091v1](evidence/f6va/nvidia1/valley-d3d9-0091v1/); three
+  ([valley-d3d9-0091v1](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/nvidia1/valley-d3d9-0091v1); three
   of our VMs shared the card at the time). Its upload statistics show 41 GB
   of upload buffers in the first 80 s of rendering
-  ([upload-stats.txt](evidence/f6va/nvidia1/valley-d3d9-0091v1/upload-stats.txt)).
+  ([upload-stats.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/nvidia1/valley-d3d9-0091v1/upload-stats.txt)).
 - Copying, at each draw, only the vertex range that the draw reads still
   created about 1 GB/s of upload buffers in a 2-minute diagnosis run (its
   log was not kept), because Valley's draws from that buffer read large
@@ -108,7 +108,7 @@ by default.
 
 ## Evidence
 
-`docs/evidence/f6va/src/vasample.cpp` (built by `build.sh`) samples a
+[docs/evidence/f6va/src/vasample.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/src/vasample.cpp) (built by `build.sh`) samples a
 process's address space with `VirtualQueryEx` and `GetProcessMemoryInfo`:
 used and free address space below 4 GiB, the largest free block, the
 4 MiB regions grouped by page protection, the commit charge and the working
@@ -120,23 +120,23 @@ blobs with.
 ### Valley D3D9, 10 minutes
 
 `tests/apps/compat/run.sh --only valley-d3d9 --seconds 600` in the worker's
-own labs (`COMPAT_LAB`, `COMPAT_EV`), with the package built at `d5fa281`
+own labs (`COMPAT_LAB`, `COMPAT_EV`), with the package built at [d5fa281](https://github.com/VMLabDev/vmlab-win3d/commit/d5fa281d466bf08b6f3c19d0e681e4929b0896c2)
 (`0001` to `0092`):
 
 | GPU | Address space, peak | Largest free block, lowest | Exit | Frame rate (OCR) | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| `Nvidia1` | 2.07 GiB | 1.79 GiB | Clean | 7.9 | [nvidia1/valley-d3d9](evidence/f6va/nvidia1/valley-d3d9/) |
-| `AMD1` | 2.03 GiB | 1.84 GiB | Clean | 9.8 | [amd1/valley-d3d9](evidence/f6va/amd1/valley-d3d9/) |
+| `Nvidia1` | 2.07 GiB | 1.79 GiB | Clean | 7.9 | [nvidia1/valley-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/nvidia1/valley-d3d9) |
+| `AMD1` | 2.03 GiB | 1.84 GiB | Clean | 9.8 | [amd1/valley-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/amd1/valley-d3d9) |
 
 `va.txt` in each directory has the samples. The frames render the scene
 correctly (`console-*.png`).
 
 The upload statistics of a 2-minute run on `AMD1` with the same package
-([upload-stats-120s.txt](evidence/f6va/amd1/upload-stats-120s.txt)) show
+([upload-stats-120s.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/amd1/upload-stats-120s.txt)) show
 7.8 GB of upload buffers created in 150 s, at most 36 MiB of them alive, and
 at most 413 MiB of blob maps. With the first attempt, Valley created 41 GB
 in about 80 s
-([upload-stats.txt](evidence/f6va/nvidia1/valley-d3d9-0091v1/upload-stats.txt)).
+([upload-stats.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/nvidia1/valley-d3d9-0091v1/upload-stats.txt)).
 
 ### Frame rate
 
@@ -166,8 +166,8 @@ package. Heaven is 32-bit and not large-address-aware.
 
 | GPU | Exit | Frame rate (OCR) | Evidence |
 | --- | --- | --- | --- |
-| `Nvidia1` | Clean, code 0 | 15.8 | [nvidia1/heaven-d3d9](evidence/f6va/nvidia1/heaven-d3d9/) |
-| `AMD1` | Clean, code 0 | 17.4 | [amd1/heaven-d3d9](evidence/f6va/amd1/heaven-d3d9/) |
+| `Nvidia1` | Clean, code 0 | 15.8 | [nvidia1/heaven-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/nvidia1/heaven-d3d9) |
+| `AMD1` | Clean, code 0 | 17.4 | [amd1/heaven-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/amd1/heaven-d3d9) |
 
 Before, on `Nvidia1`, Heaven D3D9 rendered at 10.5 fps, then exited with
 code 1653 after a crash in `textinputframework.dll`, and the render server
@@ -175,7 +175,7 @@ logged a `vkCmdPipelineBarrier` CS error ([unid3d.md](unid3d.md)).
 
 ### Diagnosis runs
 
-[nvidia1/diag/](evidence/f6va/nvidia1/diag/) holds the address-space
+[nvidia1/diag/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/nvidia1/diag) holds the address-space
 samples that located the cause, all on `Nvidia1`:
 
 - `va-worker-off.txt`: worker off, 1.65 GiB at 120 s, seven 4 MiB regions.
@@ -186,14 +186,14 @@ samples that located the cause, all on `Nvidia1`:
 ### End-to-end and probes
 
 `tests/e2e/run.sh --template windows-11` in the worker's own labs (`--lab`),
-with the package of `d5fa281` (`patches/mesa` `0001` to `0092`; the e2e
+with the package of [d5fa281](https://github.com/VMLabDev/vmlab-win3d/commit/d5fa281d466bf08b6f3c19d0e681e4929b0896c2) (`patches/mesa` `0001` to `0092`; the e2e
 script rebuilt it because `build/mesa/README.md` had uncommitted
 documentation changes):
 
 | GPU | Result | Evidence |
 | --- | --- | --- |
-| `Nvidia1` | 12 of 12 | [e2e/windows-11-nvidia1](evidence/f6va/e2e/windows-11-nvidia1/) |
-| `AMD1` | 12 of 12 | [e2e/windows-11](evidence/f6va/e2e/windows-11/) |
+| `Nvidia1` | 12 of 12 | [e2e/windows-11-nvidia1](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/e2e/windows-11-nvidia1) |
+| `AMD1` | 12 of 12 | [e2e/windows-11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/e2e/windows-11) |
 
 The e2e run includes the x86 (32-bit) D3D9, D3D11, D3D12, OpenGL and
 Vulkan probes, each rendering on the GPU in the console capture. No NVIDIA

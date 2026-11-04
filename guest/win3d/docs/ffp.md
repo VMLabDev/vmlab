@@ -10,7 +10,7 @@ results are compared with Microsoft's reference rasterizer. The page names
 the four faults found, the fixes (`patches/mesa/0040` to `0042`) and the
 evidence. The work was done on 2026-10-18 on helios: NVIDIA 610.57.04 on
 `Nvidia2` and RADV (Mesa 26.2.2) on `AMD1`, vmlab 0.28.0-alpha,
-virglrenderer 1.3.0. Evidence is in `docs/evidence/ffp/`.
+virglrenderer 1.3.0. Evidence is in [docs/evidence/ffp/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp/).
 
 ## Result
 
@@ -24,8 +24,8 @@ virglrenderer 1.3.0. Evidence is in `docs/evidence/ffp/`.
 
 These are the probe's totals: x64 hardware runs against the reference
 rasterizer, packages built by `tests/e2e/run.sh`. Before is the package at
-`72ba143` (`patches/mesa` 0001 to 0025 and 0030). After is the package at
-`1115df0` (adds 0040 to 0042):
+[72ba143](https://github.com/VMLabDev/vmlab-win3d/commit/72ba143eec977c600532233e8f1bfdc2d6e91b96) (`patches/mesa` 0001 to 0025 and 0030). After is the package at
+[1115df0](https://github.com/VMLabDev/vmlab-win3d/commit/1115df07ee46e720dfe2976763c81ace58bc5497) (adds 0040 to 0042):
 
 | Run | Nvidia2 before | Nvidia2 after | AMD1 before | AMD1 after |
 | --- | --- | --- | --- | --- |
@@ -53,7 +53,7 @@ Proof, from fresh `x86_64/windows-11@26100.1742.5` labs:
 | Host Xid during the SDK sample runs | none (`after/nvidia2/kernel-nvrm.txt` is empty) | not applicable |
 | QEMU | `qemu-vmlab-egl`, QEMU 11.1.50 with the vmlab series (`e2e-host.txt`); the before runs used `qemu-11.1.1-vmlab-egl` | QEMU 11.1.1 (Arch) |
 
-The two e2e runs built their package from commit `1115df0` while
+The two e2e runs built their package from commit [1115df0](https://github.com/VMLabDev/vmlab-win3d/commit/1115df07ee46e720dfe2976763c81ace58bc5497) while
 `build/mesa/README.md` had an uncommitted edit. That is why the manifest
 says `1115df0-dirty`. A later `scripts/build.sh` on a clean tree, at the
 docs commit, gave the same sha256 for all 28 package files
@@ -61,7 +61,7 @@ docs commit, gave the same sha256 for all 28 package files
 
 ## The probe
 
-`docs/evidence/ffp/src/d3d9_ffp.cpp` runs 168 cases. Each case gets its own
+[docs/evidence/ffp/src/d3d9_ffp.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp/src/d3d9_ffp.cpp) runs 168 cases. Each case gets its own
 device and renders into a 64×64 `A8R8G8B8` render target cleared to
 `0x80406080`. The probe reads the target back with `GetRenderTargetData`
 and logs an 8×8 grid of pixels, sampled at 4 + 8i. Geometry edges sit on
@@ -82,7 +82,7 @@ the case's tolerance, which is 2 to 5 steps in 8 bits.
 | `pt_*` points | 11 | `POINTSIZE`, `POINTSPRITEENABLE`, `PSIZE` in `XYZRHW` and `XYZ` vertices, `POINTSIZE_MIN`/`MAX`, `POINTSCALEENABLE` with `POINTSCALE_A/B/C` under perspective |
 | `xf_*` untransformed geometry | 12 | World, view and projection transforms, perspective-correct texturing, near-plane clipping, culling, a viewport, an indexed vertex buffer, a user clip plane, `VERTEXBLEND` with one weight, depth test, flat shading, lines |
 
-`docs/evidence/ffp/table.md` has every case, before and after, on both
+[docs/evidence/ffp/table.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp/table.md) has every case, before and after, on both
 GPUs, with hardware and with software vertex processing. Before the fix,
 the hardware-vertex-processing failures were the same on both GPUs except
 one: `fog_rhw_nospec` passed on NVIDIA by chance, because an unwritten input
@@ -210,14 +210,14 @@ shader's fog saturate came with the Gallium Nine translator that
 `D3D9NineShader.c` is derived from. Whether upstream Nine has the same
 fault was not checked.
 
-## Evidence index (`docs/evidence/ffp/`)
+## Evidence index ([docs/evidence/ffp/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp/))
 
 | Path | What it shows |
 | --- | --- |
 | `src/d3d9_ffp.cpp`, `src/build.sh` | The probe and its build in the project toolchain image |
 | `src/run-repro.sh`, `src/compare.py`, `src/make-table.py` | The guest runner, the per-sample comparison and the table |
 | `table.md` | Every case, before and after, both GPUs, hardware and software vertex processing |
-| `before/<gpu>/` | The six runs and four comparisons with the package at `72ba143` (0001 to 0025, 0030), in the e2e labs of that commit. In the `Nvidia2` lab a development UMD had been tried and was put back first; the restored DLLs match the package's sha256 |
+| `before/<gpu>/` | The six runs and four comparisons with the package at [72ba143](https://github.com/VMLabDev/vmlab-win3d/commit/72ba143eec977c600532233e8f1bfdc2d6e91b96) (0001 to 0025, 0030), in the e2e labs of that commit. In the `Nvidia2` lab a development UMD had been tried and was put back first; the restored DLLs match the package's sha256 |
 | `after/<gpu>/d3d9_ffp-*.txt`, `compare-*.txt` | The same with 0040 to 0042, from a clean install by `tests/e2e/run.sh` |
 | `after/<gpu>/e2e-results.txt`, `e2e-build.txt`, `e2e-host.txt`, `qemu-argv-env.txt`, `status-v.txt` | The e2e Done checks, the bundle, the host stack and the QEMU binary and command line |
 | `after/clean-rebuild.txt` | A clean-tree rebuild with the same file hashes as the e2e bundles |

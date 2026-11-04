@@ -31,7 +31,7 @@ out/d3d12-samples/.work/          downloads, the samples checkout, xwin's cache,
 ```
 
 Two runs from the same pins give the same files byte for byte
-(`docs/evidence/d3d12app/build/`).
+([docs/evidence/d3d12app/build/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d12app/build/)).
 
 ## How the samples are built
 

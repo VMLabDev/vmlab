@@ -1,5 +1,9 @@
 # Prior art: the `/home/wil/dev/virtio` Windows 3D experiments
 
+The recorded QEMU runs and host assets are historical. Current win3d labs
+use the in-tree vmlab-hv bundle and its patched Venus render server.
+See [host.md](host.md) and [release.md](release.md) for current setup.
+
 This review covers the codex session's work in `/home/wil/dev/virtio` between
 2026-10-15 and 2026-10-17. It is written for vmlab-win3d. It records what that
 work proved, what it got wrong, and what can be reused. It does not continue

@@ -7,7 +7,7 @@ failed its draw with `E_FAIL`, on NVIDIA and AMD alike. This page names the
 cause of each, the fix, and the evidence. Investigated on 2026-10-18 on
 helios: NVIDIA 610.57.04, RADV (Mesa 26.2.2), vmlab 0.28.0-alpha, QEMU 11.1.1
 with the egl-headless patch, virglrenderer 1.3.0. Evidence is in
-`docs/evidence/nvtex/`.
+[docs/evidence/nvtex/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvtex/).
 
 ## Result
 
@@ -18,7 +18,7 @@ with the egl-headless patch, virglrenderer 1.3.0. Evidence is in
 | R5G6B5 textures black on NVIDIA, red and blue swapped on AMD | D3D `R5G6B5` and `A1R5G5B5` mapped to the wrong Vulkan `PACK16` formats. NVIDIA does not support the format chosen for R5G6B5 at all | `patches/mesa/0025`: map them to `R5G6B5_UNORM_PACK16` and `A1R5G5B5_UNORM_PACK16` | NVIDIA (black), AMD (swapped) |
 
 All three are proven on `Nvidia1` and `AMD1` with a package built at commit
-`e428846` (`patches/mesa` 0001 to 0025):
+[e428846](https://github.com/VMLabDev/vmlab-win3d/commit/e428846ccddaf01dba7efed9d057518f45c522fc) (`patches/mesa` 0001 to 0025):
 
 | Check | Nvidia1 (RTX 5090) | AMD1 (RADV) |
 | --- | --- | --- |
@@ -31,7 +31,7 @@ All three are proven on `Nvidia1` and `AMD1` with a package built at commit
 
 ## The repro
 
-`docs/evidence/nvtex/src/d3d9_tex.cpp` draws one quad with a 256×256
+[docs/evidence/nvtex/src/d3d9_tex.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvtex/src/d3d9_tex.cpp) draws one quad with a 256×256
 texture. Each mip level is a solid colour: level 0 red, 1 green, 2 blue, 3
 yellow, and so on. The probe reads back the centre pixel with
 `GetRenderTargetData`, so the colour names the level that was sampled.
@@ -49,7 +49,7 @@ time:
 - a D24X8 depth buffer, which routes the draw through the 0022 shadow pass.
 
 `matrix` runs a fixed list of 27 cases, each on its own device. Build it with
-`docs/evidence/nvtex/src/build.sh`.
+[docs/evidence/nvtex/src/build.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvtex/src/build.sh).
 
 Before the fix, the matrix gave a clear pattern
 (`before/*/d3d9_tex-x64.txt`):
@@ -80,7 +80,7 @@ images with `VK_IMAGE_TILING_LINEAR`, so that importers can reproduce their
 layout (`yttrium_venus2_create_texture_image_for_bind`).
 
 Vulkan guarantees LINEAR images only with one mip level and one array layer.
-`docs/evidence/nvtex/host-tests/linearmips.c` asks
+[docs/evidence/nvtex/host-tests/linearmips.c](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvtex/host-tests/linearmips.c) asks
 `vkGetPhysicalDeviceImageFormatProperties2` about the winsys's exact
 create-info: 2D, `TRANSFER_SRC | TRANSFER_DST | SAMPLED | COLOR_ATTACHMENT`,
 `MUTABLE_FORMAT | ALIAS` (`host-tests/out/`):
@@ -191,13 +191,13 @@ run.
 
 Both labs were fresh `x86_64/windows-11@26100.1742.5` labs. Each run did
 `tests/e2e/run.sh --host-gpu <gpu> --lab win3d-nvtex-<gpu> --keep` with the
-bundle built at `e428846` (`after/*/e2e-build.txt`). Then, in the same lab,
+bundle built at [e428846](https://github.com/VMLabDev/vmlab-win3d/commit/e428846ccddaf01dba7efed9d057518f45c522fc) (`after/*/e2e-build.txt`). Then, in the same lab,
 it ran `Run-AllProbes.ps1`, the `d3d9_tex` matrix for x64 and x86, and the
-samples through `docs/evidence/xid69/run-sample.sh`. The host config was
+samples through [docs/evidence/xid69/run-sample.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/xid69/run-sample.sh). The host config was
 helios's: `Nvidia1` with the patched QEMU as `qemu_binary`, and no debug
 variables. During development the fixed UMD was copied over the installed
 one in kept labs. The results in this page are all from clean installs.
-After `e428846`, only the wording of the 0023 header changed, not its code.
+After [e428846](https://github.com/VMLabDev/vmlab-win3d/commit/e428846ccddaf01dba7efed9d057518f45c522fc), only the wording of the 0023 header changed, not its code.
 
 ## Upstream
 
@@ -205,7 +205,7 @@ After `e428846`, only the wording of the 0023 header changed, not its code.
 is a plain mapping bug that affects every host. 0023 follows the Vulkan
 specification's limits for LINEAR images, which any driver may apply.
 
-## Evidence index (`docs/evidence/nvtex/`)
+## Evidence index ([docs/evidence/nvtex/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvtex/))
 
 | Path | What it shows |
 | --- | --- |

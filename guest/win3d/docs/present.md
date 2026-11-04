@@ -9,7 +9,7 @@ This page explains three presentation bugs from
 3. Blender's window was translucent on Windows 10.
 
 The fixes are `patches/kmd/0002`, `patches/mesa/0026` and
-`patches/mesa/0027`. All three are in the package from commit `12be6fd`.
+`patches/mesa/0027`. All three are in the package from commit [12be6fd](https://github.com/VMLabDev/vmlab-win3d/commit/12be6fd7969a64a93a0ce60207edd9522a6a3049).
 
 helios: QEMU 11.1.1, virglrenderer 1.3.0, RADV (Mesa 26.2.2), NVIDIA
 610.57.04, vmlab 0.28.0-alpha. The AMD runs used the system QEMU. The
@@ -19,15 +19,15 @@ evidence directory).
 
 ## Results
 
-| Run (package `12be6fd`) | `tests/e2e/run.sh` | D3D9 probe x64 / x86, before | after | Repro (`pace`, `gl_alpha`) |
+| Run (package [12be6fd](https://github.com/VMLabDev/vmlab-win3d/commit/12be6fd7969a64a93a0ce60207edd9522a6a3049)) | `tests/e2e/run.sh` | D3D9 probe x64 / x86, before | after | Repro (`pace`, `gl_alpha`) |
 | --- | --- | --- | --- | --- |
 | Windows 11, `AMD1` | 12 of 12 | 31.5 / 31.1 fps | 59.4 / 58.2 fps | 14 of 14 cases pass (x64 and x86, plus 1280×720) |
-| Windows 11, `Nvidia1` | 12 of 12 | 22.3 / 21.8 fps ([acceptance run](evidence/acceptance/windows-11-nvidia1/results.txt)) | 39.2 / 38.2 fps | 11 of 14 pass: x64 D3D9 and D3D9Ex at interval one reach 47.6 and 48.2 per second, under the repro's 50, and 37.9 at 1280×720 |
-| Windows 10, `Nvidia2`, with `--apps` | 12 of 12 | 18.98 / 22.94 fps (`Nvidia1`, [acceptance run](evidence/acceptance/windows-10-nvidia1/results.txt)) | 49.5 / 50.1 fps | D3D9 52.6 and 51.0, DirectDraw 56.6 and 56.9 per second (x64, x86); Blender opaque |
+| Windows 11, `Nvidia1` | 12 of 12 | 22.3 / 21.8 fps ([acceptance run](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11-nvidia1/results.txt)) | 39.2 / 38.2 fps | 11 of 14 pass: x64 D3D9 and D3D9Ex at interval one reach 47.6 and 48.2 per second, under the repro's 50, and 37.9 at 1280×720 |
+| Windows 10, `Nvidia2`, with `--apps` | 12 of 12 | 18.98 / 22.94 fps (`Nvidia1`, [acceptance run](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10-nvidia1/results.txt)) | 49.5 / 50.1 fps | D3D9 52.6 and 51.0, DirectDraw 56.6 and 56.9 per second (x64, x86); Blender opaque |
 
 The "before" AMD numbers are from the same e2e run on the parent commit
-`b4b8c3f` (`docs/evidence/present/before/amd1/`). The repro reports
-for each case are in `docs/evidence/present/after/<gpu>/`.
+[b4b8c3f](https://github.com/VMLabDev/vmlab-win3d/commit/b4b8c3fada1c47d2079ce9ab4699fa8c544a8717) ([docs/evidence/present/before/amd1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/present/before/amd1/)). The repro reports
+for each case are in [docs/evidence/present/after/<gpu>/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/present/after/).
 
 | Case, `AMD1`, x64, 640×480 | Before: per second, ms in each call | After |
 | --- | --- | --- |
@@ -74,7 +74,7 @@ same guest code was fast on Zeus (Intel, 59 fps) and slow on helios
 (AMD Ryzen 9 9950X), whichever GPU helios used: the D3D9 probe ran at about
 30 fps on the AMD iGPU and about 20 fps on the RTX 5090.
 
-**How the cause was found** (`docs/evidence/present/before/`,
+**How the cause was found** ([docs/evidence/present/before/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/present/before/),
 `isolation/`):
 
 1. The KMD's vblank timer was steady at 16.67 ms in every run, so the
@@ -152,14 +152,14 @@ application in the test set does this.
 
 The Windows 10 run was `tests/e2e/run.sh --template windows-10 --host-gpu
 Nvidia2 --keep --apps` on the package from `12be6fd`
-(`docs/evidence/present/after/windows-10-nvidia2/`). It passed 12 of 12,
+([docs/evidence/present/after/windows-10-nvidia2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/present/after/windows-10-nvidia2/)). It passed 12 of 12,
 and Blender 4.2.3 was opaque (`console-blender.png`).
 
 The earlier translucent capture was on `AMD1`. To separate the fix from the
 host GPU, Blender ran again in the same lab with each WGL DLL, through
 `swap-umd.sh`:
 
-- with the DLL from before 0027 (`b4b8c3f`), the wallpaper shows through
+- with the DLL from before 0027 ([b4b8c3f](https://github.com/VMLabDev/vmlab-win3d/commit/b4b8c3fada1c47d2079ce9ab4699fa8c544a8717)), the wallpaper shows through
   the viewport and panels (`before-0027/console-blender.png`);
 - with the packaged DLL, the window is opaque
   (`console-blender-same-lab.png`).
@@ -171,7 +171,7 @@ captures). What Blender does differently was not found. `gl_alpha` stays in
 the repro as a check that an alpha-0 GL window is opaque, and the Blender
 A/B above is the reproduction of bug 3.
 
-A second attempt (`docs/evidence/hostvirgl/gl_alpha/`) had GDI paint the
+A second attempt ([docs/evidence/hostvirgl/gl_alpha/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/hostvirgl/gl_alpha/)) had GDI paint the
 GL window's own redirection surface magenta as well, and judged by
 console captures every 3 s instead of `GetPixel` alone. With a WGL built
 without 0027, the window was still opaque on Windows 10 (`AMD1`) and
@@ -181,7 +181,7 @@ this display stack.
 
 ## The repro
 
-`docs/evidence/present/src/` has two probes, built for x64 and x86 by
+[docs/evidence/present/src/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/present/src/) has two probes, built for x64 and x86 by
 `src/build.sh` in the project toolchain image:
 
 - `pace.exe <mode> <seconds> <out> [width height]` runs one present
@@ -201,7 +201,7 @@ this display stack.
 
 `docs/evidence/present/run-pace.sh <lab-dir> <out-dir> <arch> <case>
 [seconds [width height]]` runs one case in the autologon desktop of a lab
-kept by `tests/e2e/run.sh --keep`. `docs/evidence/present/swap-umd.sh`
+kept by `tests/e2e/run.sh --keep`. [docs/evidence/present/swap-umd.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/present/swap-umd.sh)
 replaces the installed UMD and WGL DLLs in such a lab for development. The
 isolation runs used it. The proof runs in the results table are clean
 installs.

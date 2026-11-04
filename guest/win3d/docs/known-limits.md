@@ -1,5 +1,9 @@
 # Known limits
 
+The recorded QEMU runs and host assets are historical. Current win3d labs
+use the in-tree vmlab-hv bundle and its patched Venus render server.
+See [host.md](host.md) and [release.md](release.md) for current setup.
+
 What the package does not do, does badly, or has not been tested on. Each
 entry names its evidence. "Prior art" means `docs/prior-art.md`, a review of
 an earlier attempt whose findings were not repeated here unless this page
@@ -35,17 +39,17 @@ result depends on the host GPU. Four were tried:
 | Host GPU, driver | Host | Result | Needs | Evidence |
 | --- | --- | --- | --- | --- |
 | AMD Radeon iGPU (Granite Ridge), RADV, Mesa 26.2.2 | helios | **Full pass**: every Done check in `docs/brief.md` item 2, on `windows-11` and `windows-10`, and every stretch application renders, and the compatibility sweep passes 12 of 12 (package 0.1.1-alpha-rc2, vmlab 0.28.0-alpha) | A plain vmlab lab that names the AMD GPU (`host_gpu = "AMD1"`) | [`acceptance.md`](acceptance.md) |
-| NVIDIA RTX 5090, 610.57.04 | helios | **Full pass**, 12 of 12 Done checks, through `tests/e2e/run.sh` with package 0.1.1-alpha-rc3 and vmlab 0.30.0-alpha, with Resizable BAR on (BAR1 32 GiB): `windows-11` and `windows-10` on `Nvidia1` and `windows-11` on `Nvidia2`; the guest lists exactly one Venus device, every stretch application renders (on `Nvidia2` Blender's kept capture caught its window before it had drawn, and a rerun rendered), and the host logged no Xid. The compatibility sweep passes 12 of 12 on `Nvidia2`, and three VMs on one card logged no `can't alloc VA space` line. rc1 passed the same checks with BAR1 at 256 MiB. Depth draws into the back buffer need `patches/mesa/0022`, and mipmapped and R5G6B5 D3D9 textures need `0023` and `0025` (below). Without Resizable BAR, applications that fill the 256 MiB BAR1 need `0070` and `0086`, and Vulkan applications with shading-rate state need `0075` (below) | `patches/mesa/0020`, `0022`, `0023` and `0025` (in the package) **and** the patched QEMU (the VMLabDev/qemu commit in `patches/host/PINS`) as the GPU's `qemu_binary` in the host config. Helios's host config gives both `Nvidia1` and `Nvidia2` one; without it the probes render but the console is black. The vmlab render server, selected with `qemu_env`, removes a 10 ms floor from every Venus fence ("Presentation pacing" below) | [`acceptance.md`](acceptance.md#nvidia-rtx-5090), [`nvidia.md`](nvidia.md) |
+| NVIDIA RTX 5090, 610.57.04 | helios | **Full pass**, 12 of 12 Done checks, through `tests/e2e/run.sh` with package 0.1.1-alpha-rc3 and vmlab 0.30.0-alpha, with Resizable BAR on (BAR1 32 GiB): `windows-11` and `windows-10` on `Nvidia1` and `windows-11` on `Nvidia2`; the guest lists exactly one Venus device, every stretch application renders (on `Nvidia2` Blender's kept capture caught its window before it had drawn, and a rerun rendered), and the host logged no Xid. The compatibility sweep passes 12 of 12 on `Nvidia2`, and three VMs on one card logged no `can't alloc VA space` line. rc1 passed the same checks with BAR1 at 256 MiB. Depth draws into the back buffer need `patches/mesa/0022`, and mipmapped and R5G6B5 D3D9 textures need `0023` and `0025` (below). Without Resizable BAR, applications that fill the 256 MiB BAR1 need `0070` and `0086`, and Vulkan applications with shading-rate state need `0075` (below) | `patches/mesa/0020`, `0022`, `0023` and `0025` (in the package) **and** the patched QEMU (the VMLabDev/qemu commit in [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS)) as the GPU's `qemu_binary` in the host config. Helios's host config gives both `Nvidia1` and `Nvidia2` one; without it the probes render but the console is black. The vmlab render server, selected with `qemu_env`, removes a 10 ms floor from every Venus fence ("Presentation pacing" below) | [`acceptance.md`](acceptance.md#nvidia-rtx-5090), [`nvidia.md`](nvidia.md) |
 | Intel Iris Xe (Raptor Lake-P), ANV, Mesa 26.2.2 | Zeus | **Full pass** on `windows-11`, 12 of 12 Done checks. Without `patches/mesa/0021`, dwm crash-loops and the console is black | `patches/mesa/0021` (in the package) | [`zeus.md`](zeus.md) |
-| NVIDIA RTX 4060 Max-Q (laptop), 615.71.09 | Zeus | **Full pass**, 12 of 12 twice (2026-10-19, `bf4d948` of branch `work/nvfb`, package defaults, the patched QEMU, vmlab 0.28). On this host the guest does not see the GPU's writes to uncached host-visible memory (type 2) and the GPU does not see the guest's; without the fixes every Vulkan, D3D12 and OpenGL client hung on its first fence (Venus feedback lived there), and with only the feedback fix about one OpenGL readback in three came back black (Zink's upload buffers live there). In a fresh lab the first D3D12 probe could present only one frame in its 20 seconds (not caused by the fixes, cause not investigated); the probes now count `--seconds` from their first frame ([`x86d3d12.md`](x86d3d12.md)) | `patches/mesa/0065` to `0067` (in the package) and the patched QEMU as `qemu_binary` | [`nvfb.md`](nvfb.md), [`zeus.md`](zeus.md#nvidia-rtx-4060) |
+| NVIDIA RTX 4060 Max-Q (laptop), 615.71.09 | Zeus | **Full pass**, 12 of 12 twice (2026-10-19, [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) of branch `work/nvfb`, package defaults, the patched QEMU, vmlab 0.28). On this host the guest does not see the GPU's writes to uncached host-visible memory (type 2) and the GPU does not see the guest's; without the fixes every Vulkan, D3D12 and OpenGL client hung on its first fence (Venus feedback lived there), and with only the feedback fix about one OpenGL readback in three came back black (Zink's upload buffers live there). In a fresh lab the first D3D12 probe could present only one frame in its 20 seconds (not caused by the fixes, cause not investigated); the probes now count `--seconds` from their first frame ([`x86d3d12.md`](x86d3d12.md)) | `patches/mesa/0065` to `0067` (in the package) and the patched QEMU as `qemu_binary` | [`nvfb.md`](nvfb.md), [`zeus.md`](zeus.md#nvidia-rtx-4060) |
 
 All four hosts ran QEMU 11.1.1 (on NVIDIA, the vmlab QEMU built on it) and
 virglrenderer 1.3.0. No other GPU or driver version was tried. On
 2026-10-18 the vmlab QEMU moved to upstream master (`d8a6048aae`), and
 `windows-11` passed 12 of 12 with it on `Nvidia1`, `Nvidia2` and `AMD1`
-(`docs/evidence/qemu-master/`). Since 2026-10-19 helios's host config also
+([docs/evidence/qemu-master/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/qemu-master/)). Since 2026-10-19 helios's host config also
 gives `Nvidia1` and `Nvidia2` the vmlab render server: virglrenderer 1.3.0's
-`virgl_render_server` with `patches/host/virglrenderer/0001` and `0002`
+`virgl_render_server` with [patches/host/virglrenderer/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/virglrenderer/0001-vkr-log-image-creation.patch) and `0002`
 (`0003` since 2026-10-26, [`nvidia.md`](nvidia.md#imports-that-carry-export-info)).
 QEMU keeps the host's own `libvirglrenderer` 1.3.0
 ([`nvidia.md`](nvidia.md#the-patched-render-server-on-the-gpus-profile)).
@@ -89,12 +93,12 @@ on NVIDIA. In the 0.1.1-alpha-rc1 acceptance runs every stretch application
 (the D3D9 and D3D11 SDK samples and Blender) renders on `Nvidia1` and
 `Nvidia2`, and the host logged no Xid
 ([`acceptance.md`](acceptance.md#nvidia-rtx-5090)). The 0.1.0-alpha
-evidence that shows the hang is in git history at `82d8e51`.
+evidence that shows the hang is in git history at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75).
 
 > **The RTX 4060 once needed a host reboot.** On 2026-10-17 the NVIDIA GSP
 > failed to boot during a Venus run on Zeus (Xid 119, then Xid 79 "GPU has
 > fallen off the bus"), and only a reboot recovered it
-> (`docs/evidence/zeus/nvidia/kernel-nvrm.txt`). It did not recur on
+> ([docs/evidence/zeus/nvidia/kernel-nvrm.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus/nvidia/kernel-nvrm.txt)). It did not recur on
 > 2026-10-19 across 52 runtime-power resumes under Venus, with or without a
 > keep-awake helper. The 4060's other failure was a different one: Venus
 > feedback writes from the host GPU never reached the guest, so Vulkan, D3D12
@@ -110,7 +114,7 @@ helios the default is `Nvidia1`, an RTX 5090 with the patched QEMU as its
 
 The `docs/host.md` probe, on vmlab 0.23 with workarounds, first found the
 NVIDIA failure (`vkGetImageMemoryRequirements resulted in CS error` and a
-black console; `docs/evidence/host/good-none/`, `min-none/`). It is
+black console; [docs/evidence/host/good-none/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host/good-none/), `min-none/`). It is
 historical: `docs/nvidia.md` names the cause.
 
 ### Two Windows VMs per RTX 5090 without resizable BAR
@@ -125,7 +129,7 @@ historical: `docs/nvidia.md` names the cause.
 > passed). BAR1 peaked at **764 MiB
 > of 32 GiB** (321 to 485 MiB in the probe-loop stage). The host logged
 > **no** `can't alloc VA space` line and no Xid, and no render server
-> logged a lost object ([rc3](evidence/rc3/README.md#rebar-load-check)).
+> logged a lost object ([rc3](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#rebar-load-check)).
 > Each QEMU had 1.2 to 1.7 GiB of dma-buf mapped, far more than the
 > 256 MiB aperture could hold for even one VM. With Resizable BAR there is
 > no BAR1 limit at three VMs per card; more were not tried. The two-VM limit
@@ -141,13 +145,13 @@ can't alloc VA space for mapping`, and guest Venus contexts die (dwm or
 applications report ring timeouts, often in `vkGetImageSubresourceLayout`).
 `patches/mesa/0070` (with `0086`) keeps Vulkan, DXVK, vkd3d-proton and Zink
 memory out of BAR1, but not the UMD's images. With `0070` and `0086` (package from
-`b74ea3c`), a `windows-11` e2e run on a shared `Nvidia2` still lost the
+[b74ea3c](https://github.com/VMLabDev/vmlab-win3d/commit/b74ea3c22396862ab54d5ef119a774942b938780)), a `windows-11` e2e run on a shared `Nvidia2` still lost the
 D3D11 x86 and D3D12 x64 probes: the render server logged
 `vkAllocateMemory failed: ret -2` for 2,621,440 bytes, a 1024×640
 swapchain image, on memory type 4 (device-local, host-visible, coherent:
 the BAR1 heap) with dma-buf export (`0x200`). So exportable swapchain
 images still come from BAR1. Alone on the card, the same run passed 12 of
-12 (`docs/evidence/hostvirgl/README.md`).
+12 ([docs/evidence/hostvirgl/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/hostvirgl/README.md)).
 
 On such a host, run at most two Windows VMs per card, counting the host
 desktop as part of the load, or turn on resizable BAR in the host's
@@ -172,7 +176,7 @@ needs only `secure_boot = false` and
 `gpu { mode = "vulkan" host_gpu = "<name of an AMD or Intel GPU>" }`, as in
 `labs/probe/vmlab.wcl`, and the host config must declare that name:
 `gpu "AMD1" { address = "0000:72:00.0" }` on helios. On vmlab 0.23, QEMU
-refuses to start that VM (`docs/evidence/host/up-plain.txt`).
+refuses to start that VM ([docs/evidence/host/up-plain.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host/up-plain.txt)).
 
 vmlab 0.26.0-alpha added `qemu_binary` and `qemu_env` to a host GPU block,
 which NVIDIA needs for its console, and 0.27.0-alpha added the PCI-filter
@@ -181,9 +185,9 @@ Vulkan layer that leaves the guest only the named GPU (`docs/host.md`,
 but a guest on a host with two GPUs of the same driver sees both before
 0.27. The current acceptance runs, on AMD and NVIDIA, used 0.28.0-alpha.
 
-The evidence in `docs/evidence/host/` and `docs/evidence/package/` was taken
-on vmlab 0.23 with the workarounds (`docs/evidence/package/lab-vmlab.wcl`).
-The NVIDIA diagnosis (`docs/evidence/nvidia/`) and the first Zeus round
+The evidence in [docs/evidence/host/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host/) and [docs/evidence/package/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/) was taken
+on vmlab 0.23 with the workarounds ([docs/evidence/package/lab-vmlab.wcl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/lab-vmlab.wcl)).
+The NVIDIA diagnosis ([docs/evidence/nvidia/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvidia/)) and the first Zeus round
 were taken on vmlab 0.24, with the GPU named by `gpu.address` in the lab
 file. The acceptance evidence and the second Zeus round are from vmlab
 0.28.0-alpha ([`acceptance.md`](acceptance.md#evidence-index),
@@ -258,9 +262,9 @@ Update on. The rearm count is 1, so `slmgr /rearm` is not a lasting
 alternative. Tried on `windows-11@26100.1742.5` and, for `slmgr /ato`
 only, `windows-10@19045.2006.8`.
 
-Evidence: `docs/evidence/wu/activation/` (`no-ato-shutdown.txt`, the
+Evidence: [docs/evidence/wu/activation/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/activation/) (`no-ato-shutdown.txt`, the
 unactivated clone's shutdown events; `ato.txt`, activation and the
-reboot; `windows-10-ato.txt`), and the `activation` report of each run in `docs/evidence/wu/`.
+reboot; `windows-10-ato.txt`), and the `activation` report of each run in [docs/evidence/wu/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/).
 
 ### QEMU crashes on shutdown
 
@@ -276,18 +280,18 @@ The fix is upstream QEMU commit `baca25172d8c195b9abbe6f8a3ab5915dba09a91`.
 Decision D3 keeps the host's own QEMU on 11.1.1, so labs that run the stock
 QEMU, which by default is every AMD and Intel lab, can still crash this way.
 
-**The vmlab QEMU fixes it.** Since `patches/host/PINS` moved to
+**The vmlab QEMU fixes it.** Since [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS) moved to
 `d8a6048aae` (2026-10-18), the vmlab QEMU is the series on upstream QEMU
 master, which already has `baca25172d`. A host GPU whose host config block
 names it as `qemu_binary` no longer crashes on shutdown. With that build,
 10 stop and start cycles on `AMD1` (where every stock-QEMU core on helios
 came from) and 10 on `Nvidia2` all ended in `exit status: 0`, with no core
 dump, each after the D3D12 and D3D11 probes had run
-(`docs/evidence/qemu-master/`).
+([docs/evidence/qemu-master/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/qemu-master/)).
 
-Evidence: `docs/host.md` Q6, `docs/evidence/host/q6-shutdown-crashes.txt`,
-`docs/evidence/qemu-master/stock-qemu-shutdown-cores.txt`, and for the fix
-`docs/evidence/qemu-master/cycles-amd1/cycles.log`.
+Evidence: `docs/host.md` Q6, [docs/evidence/host/q6-shutdown-crashes.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host/q6-shutdown-crashes.txt),
+[docs/evidence/qemu-master/stock-qemu-shutdown-cores.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/qemu-master/stock-qemu-shutdown-cores.txt), and for the fix
+[docs/evidence/qemu-master/cycles-amd1/cycles.log](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/qemu-master/cycles-amd1/cycles.log).
 
 ### The host assets need glibc 2.36; 0.1.0-alpha's QEMU needs AVX-512
 
@@ -298,13 +302,13 @@ runtime libraries: Debian 12, Ubuntu 24.04, Fedora 37, RHEL 10, Arch and
 CachyOS, openSUSE Tumbleweed, and later. Ubuntu 22.04 (glibc 2.35) and
 RHEL 9 (2.34) are below the floor, and `install.sh --check` refuses them
 with the reason; build the assets on such a host with
-`patches/host/build-qemu.sh` and `patches/host/build-virglrenderer.sh`
+[patches/host/build-qemu.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/build-qemu.sh) and [patches/host/build-virglrenderer.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/build-virglrenderer.sh)
 (Docker, no root), or try the binary with `WIN3D_ALLOW_OLDER_GLIBC=1`,
 unsupported. The QEMU tarball bundles its own virglrenderer 1.3.0
 (`lib/libvirglrenderer.so.1`) and must be paired with the render-server
 tarball through `qemu_env`; the host's own virglrenderer is not used
 ([`release.md`](release.md#supported-hosts-of-the-host-assets),
-`docs/evidence/portable/`).
+[docs/evidence/portable/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/portable/)).
 
 Before that, both tarballs linked helios's libraries and needed a current
 Arch Linux or CachyOS with glibc 2.43 (0.1.1-alpha's QEMU) or 2.38 (its
@@ -357,7 +361,7 @@ new native file as `d3d12-native.dll`, and puts the bridge back. Between the
 update and that boot, D3D12 applications get Microsoft's runtime, which
 finds no D3D12 driver for this adapter. The repair was
 checked once, in the package slice's earlier lab, and that evidence was not
-kept (`docs/evidence/package/README.md`, "Earlier iteration").
+kept ([docs/evidence/package/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md), "Earlier iteration").
 
 The bridge also has functional limits (`build/d3d12/README.md`):
 
@@ -382,7 +386,7 @@ ACPI power-off, which Windows treats as such a shutdown. The installer runs
 `powercfg /hibernate off`, which turns off both, and uninstall restores the
 earlier setting. Do not turn hibernation back on while the package is
 installed. Evidence: decision 0001, "Fast Startup and hibernation hazard";
-`docs/evidence/package/00-baseline-installer-state.txt` (the template already
+[docs/evidence/package/00-baseline-installer-state.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/00-baseline-installer-state.txt) (the template already
 had hibernation off).
 
 ### Presentation pacing is unmeasured; D3D9 on NVIDIA needs the vmlab render server
@@ -422,7 +426,7 @@ vmlab render server carries it, and an NVIDIA GPU's host config block
 selects it with `qemu_env` ([`nvidia.md`](nvidia.md#the-patched-render-server-on-the-gpus-profile));
 with it the D3D9 repro runs vblank-paced at about 55 per second on
 `Nvidia1`, against 22 with the stock server in the same lab
-(`docs/evidence/hostvirgl/README.md`). Helios's `Nvidia1` and `Nvidia2`
+([docs/evidence/hostvirgl/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/hostvirgl/README.md)). Helios's `Nvidia1` and `Nvidia2`
 have used it since 2026-10-19. An NVIDIA host without it keeps the 10 ms
 floor. `AMD1` gains nothing from it. Presentation only has
 to make a game watchable on the console (`docs/brief.md`); deeper
@@ -450,8 +454,8 @@ Windows 10 passes. On fresh labs from the local `windows-10` template
 item 2 passed, 12 of 12, on `AMD1` and on `Nvidia1`, with package
 0.1.1-alpha-rc1, the same package as the Windows 11 runs, and again on
 `AMD1` with 0.1.1-alpha-rc2
-(`docs/acceptance.md`; `docs/evidence/acceptance/windows-10/`,
-`docs/evidence/acceptance/windows-10-nvidia1/`). The DirectX SDK D3D9 and
+(`docs/acceptance.md`; [docs/evidence/acceptance/windows-10/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10/),
+[docs/evidence/acceptance/windows-10-nvidia1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10-nvidia1/)). The DirectX SDK D3D9 and
 D3D11 samples and Blender rendered on both. The D3D9 fixed-function probes
 also ran on Windows 10, on `Nvidia2` ([`ffp2.md`](ffp2.md)).
 
@@ -461,14 +465,14 @@ premultiplied-alpha swapchain for every window, so the compositor blended
 the alpha Blender leaves in its framebuffer. `patches/mesa/0027` presents
 WGL windows opaque ([`present.md`](present.md)), and the rc1 runs show
 Blender opaque on `AMD1` and `Nvidia1`
-(`docs/evidence/acceptance/windows-10/apps/console-opengl-x64-Blender.png`).
+([docs/evidence/acceptance/windows-10/apps/console-opengl-x64-Blender.png](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10/apps/console-opengl-x64-Blender.png)).
 
 What was not run on Windows 10:
 
 - the acceptance run on `Nvidia2` and on the Zeus hosts (Intel Iris Xe and
   RTX 4060);
 - the uninstall and reinstall cycle, which ran on Windows 11 only
-  (`docs/evidence/package/README.md`).
+  ([docs/evidence/package/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md)).
 
 ### Application compatibility is barely tested
 
@@ -581,7 +585,7 @@ when BAR1 runs out ("Two Windows VMs per RTX 5090" above).
 
 ### D3D9 fixed function: what is and is not covered
 
-`docs/evidence/ffp/src/d3d9_ffp.cpp` checks 168 fixed-function cases
+[docs/evidence/ffp/src/d3d9_ffp.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp/src/d3d9_ffp.cpp) checks 168 fixed-function cases
 against Microsoft's reference rasterizer: texture-stage blending with up to
 four stages, texture transforms and coordinate generation, vertex and table
 fog, lighting, alpha test and blending, point sprites, and transformed and
@@ -593,7 +597,7 @@ to 12/255 on a few pixels; the reference fed by the runtime's software
 vertex processing matches the driver exactly. Not tested: `PREMODULATE`,
 W-buffering, multisampling and wide lines.
 
-`docs/evidence/ffp2/src/d3d9_ffp2.cpp` adds 49 cases ([`ffp2.md`](ffp2.md)):
+[docs/evidence/ffp2/src/d3d9_ffp2.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp2/src/d3d9_ffp2.cpp) adds 49 cases ([`ffp2.md`](ffp2.md)):
 vertex blending with up to three weights, indexed blending and tweening,
 bump environment mapping, cube and volume texture coordinates, and mixed
 devices that switch between hardware and software vertex processing. Both

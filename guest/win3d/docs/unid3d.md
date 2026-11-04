@@ -12,14 +12,14 @@ findings in the Direct3D 9 and 11 path:
 This page gives the cause, the fix and the evidence for each one. The work
 was done on 2026-10-19 on helios: NVIDIA 610.57.04 on `Nvidia1` and
 `Nvidia2`, RADV (Mesa 26.2.2) on `AMD1`, QEMU 11.1.1, virglrenderer 1.3.0
-and vmlab 0.28.0-alpha. The evidence is in `docs/evidence/unid3d/`.
+and vmlab 0.28.0-alpha. The evidence is in [docs/evidence/unid3d/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/).
 
 ## Result
 
 | Finding | Cause | Change | Status |
 | --- | --- | --- | --- |
 | F5 | The UMD passed the D3D9 depth bias only in Vulkan's float representation, which NVIDIA does not offer. NVIDIA also doubles an inexact integer bias on D16 and D24 | `patches/mesa/0090` | Fixed |
-| F6 | Valley, a 32-bit process, runs out of address space (3.75 of 4 GiB in 90 s). The UMD's ordered-context-worker upload path creates and maps about 340 MB/s of 4 MiB upload buffers and keeps hundreds of them alive | none shipped; an experiment is in `docs/evidence/unid3d/src/` | Cause found, not fixed; workaround `ORDERED_CONTEXT_WORKER=0` |
+| F6 | Valley, a 32-bit process, runs out of address space (3.75 of 4 GiB in 90 s). The UMD's ordered-context-worker upload path creates and maps about 340 MB/s of 4 MiB upload buffers and keeps hundreds of them alive | none shipped; an experiment is in [docs/evidence/unid3d/src/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/src/) | Cause found, not fixed; workaround `ORDERED_CONTEXT_WORKER=0` |
 | F7 | A use-after-free in the UMD: the threaded context's worker runs a queued flush-label callback whose payload is already freed | none | Reproduced under PageHeap (2 of 5 runs); cause located, not fixed |
 
 ## F5: D3D9 depth bias on NVIDIA
@@ -38,7 +38,7 @@ device lacks that representation. NVIDIA's driver reports
 reports all four. So on NVIDIA every pipeline with a D3D9 depth bias failed,
 and the draws using it were skipped. That is 69,686 skipped draws in
 Heaven's sweep run
-(`docs/evidence/compat/nvidia2/heaven-d3d9/yttrium-log.txt`). Heaven drew
+([docs/evidence/compat/nvidia2/heaven-d3d9/yttrium-log.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/heaven-d3d9/yttrium-log.txt)). Heaven drew
 dark frames at about 1 fps, and Valley crashed.
 
 ### Fix
@@ -63,7 +63,7 @@ report it.
 
 ### Evidence
 
-`docs/evidence/unid3d/src/d3d9_depthbias.cpp` (built by `build.sh`, run by
+[docs/evidence/unid3d/src/d3d9_depthbias.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/src/d3d9_depthbias.cpp) (built by `build.sh`, run by
 `run-depthbias.sh`) draws a red quad at depth 0.5, then a green one 0.004
 behind or in front of it with a depth bias, on every depth format the device
 offers. It checks which quad wins. It then bisects for the smallest bias that
@@ -76,14 +76,14 @@ rasterizer.
 | `Nvidia2`, `0090` without `depthBiasExact` | 17 of 20 | 2.000 | 2.000 | 2.000 | 1.000 |
 | `Nvidia2`, `0090` (x64 and x86) | 20 of 20 each | 1.000 | 1.000 | 1.000 | 1.000 |
 
-Logs: `docs/evidence/unid3d/depthbias/`. The first `0090` build had no
+Logs: [docs/evidence/unid3d/depthbias/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/depthbias/). The first `0090` build had no
 `depthBiasExact`. The x86 probe matches the x64 one. Unigine is 32-bit.
 
 Unigine with `0090`:
 
 - Heaven D3D9 on `Nvidia2` rendered the scene correctly
   (`nvidia2-0090-without-exact-busy-card/heaven-d3d9/console-2.png`; before
-  the fix the same frame was dark, `docs/evidence/compat/nvidia2/heaven-d3d9/console-2.png`)
+  the fix the same frame was dark, [docs/evidence/compat/nvidia2/heaven-d3d9/console-2.png](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/heaven-d3d9/console-2.png))
   and exited cleanly. The UMD logged no depth-bias line. This run used the
   first `0090` build.
 - The card had four VMs on it at the time, and the run hit BAR1 exhaustion
@@ -93,7 +93,7 @@ Unigine with `0090`:
   The rerun on a quiet card is below.
 
 The quiet-card rerun on `Nvidia1` (two of our VMs on the card;
-`docs/evidence/unid3d/nvidia1/`) used the final `0090` build plus a
+[docs/evidence/unid3d/nvidia1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/nvidia1/)) used the final `0090` build plus a
 diagnostic log line that is off by default:
 
 - **Heaven D3D9** rendered every frame correctly at 10.5 fps (before: 1.1
@@ -111,7 +111,7 @@ large-address-aware, so it has only 2 GiB.
 ### What happens
 
 The fresh repro on AMD1 matched the sweep exactly
-(`docs/evidence/unid3d/amd1-run2/valley-d3d9/`). The frame froze, and the
+([docs/evidence/unid3d/amd1-run2/valley-d3d9/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/amd1-run2/valley-d3d9/)). The frame froze, and the
 render server logged `vkCmdBeginRenderPass resulted in CS error`. Valley did
 not exit on WM_CLOSE. Another run crashed with `0xC0000005` at
 `Unigine_x86.dll+0x3cc176`, the offset of the sweep's Nvidia2 Valley crash
@@ -120,7 +120,7 @@ crash.
 
 ### Cause
 
-`docs/evidence/unid3d/src/sample-mem.sh` samples the guest process and the
+[docs/evidence/unid3d/src/sample-mem.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/src/sample-mem.sh) samples the guest process and the
 lab's render server every few seconds (`amd1-mem/`):
 
 | Valley | Virtual size at 25 s | at 60 s | at 90 s | Result |
@@ -128,7 +128,7 @@ lab's render server every few seconds (`amd1-mem/`):
 | D3D9 | 1.3 GiB | 3.3 GiB | 3.7 GiB (of 4 GiB, large-address-aware) | Hang |
 | D3D11 | 0.4 GiB | 1.3 GiB | 1.7 GiB (3.1 GiB at 175 s) | Clean |
 
-`docs/evidence/unid3d/src/vaquery.cpp` walks the process's address space
+[docs/evidence/unid3d/src/vaquery.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/src/vaquery.cpp) walks the process's address space
 (`amd1-va/vaquery-45.txt`). Only 121 MiB were free, and the largest free
 block was 2.6 MiB. 430 committed regions of exactly 4 MiB held 1.7 GiB.
 
@@ -180,7 +180,7 @@ in-flight upload memory bounded for 32-bit processes.
 Heaven D3D11 ran five times on AMD1 with full PageHeap and WER local
 dumps enabled for `Heaven.exe` (`src/pageheap.sh`; the IFEO values that
 `gflags /p /enable /full` writes). The runs are in
-`docs/evidence/unid3d/f7-pageheap/try1` to `try5`:
+[docs/evidence/unid3d/f7-pageheap/try1](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/f7-pageheap/try1) to `try5`:
 
 | Try | Result |
 | --- | --- |
@@ -211,14 +211,14 @@ problem.
 ## Proof runs
 
 The e2e runs, the depth-bias probe and the F7 runs used the package built
-at `98444b5` (`patches/mesa` up to `0044` plus `0090`). The `Nvidia1`
+at [98444b5](https://github.com/VMLabDev/vmlab-win3d/commit/98444b53d0617554e092e5c27a200f7311d578cd) (`patches/mesa` up to `0044` plus `0090`). The `Nvidia1`
 Unigine run used the same series plus the diagnostic log line, which is
 off by default:
 
 | Run | Result | Evidence |
 | --- | --- | --- |
-| `tests/e2e/run.sh --template windows-11 --host-gpu Nvidia1` | 12 of 12 | `docs/evidence/unid3d/e2e/windows-11-nvidia1/` |
-| `tests/e2e/run.sh --template windows-11 --host-gpu AMD1` | 12 of 12 | `docs/evidence/unid3d/e2e/windows-11/` |
+| `tests/e2e/run.sh --template windows-11 --host-gpu Nvidia1` | 12 of 12 | [docs/evidence/unid3d/e2e/windows-11-nvidia1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/e2e/windows-11-nvidia1/) |
+| `tests/e2e/run.sh --template windows-11 --host-gpu AMD1` | 12 of 12 | [docs/evidence/unid3d/e2e/windows-11/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/e2e/windows-11/) |
 | `d3d9_depthbias`, `Nvidia2`, x64 and x86 | 20 of 20 each, scale 1.0 | `depthbias/nvidia2-0090/` |
 | Unigine D3D9 through `tests/apps/compat/run.sh`, `Nvidia1` | Heaven renders correctly; both runs end in F6 failures | `nvidia1/` |
 

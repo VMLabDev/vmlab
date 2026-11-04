@@ -9,6 +9,7 @@ import <vmlab.wcl>
 // 0.24 with gpu.address. See labs/zeus/README.md and docs/zeus.md.
 lab "win3d-zeus-intel" {
   vm "win" {
+    hypervisor = "vmlab"
     template = "x86_64/windows-11@26100.1742.5"
     // The package is test-signed (decision 0001); Secure Boot must be off.
     secure_boot = false

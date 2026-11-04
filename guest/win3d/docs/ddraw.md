@@ -7,7 +7,7 @@ to the CPU. This page covers both: the cause, the fix, the evidence and
 what is still missing. The work ran on 2026-10-18 on helios: NVIDIA
 610.57.04, RADV (Mesa 26.2.2), vmlab 0.28.0-alpha, QEMU 11.1.1 with the
 egl-headless patch, and virglrenderer 1.3.0. The evidence is in
-`docs/evidence/ddraw/`.
+[docs/evidence/ddraw/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ddraw/).
 
 ## Result
 
@@ -24,10 +24,10 @@ egl-headless patch, and virglrenderer 1.3.0. The evidence is in
 
 ## The repros
 
-The sources are in `docs/evidence/ddraw/src/`, and
-`docs/evidence/ddraw/src/build.sh` builds them for x64 and x86 into
+The sources are in [docs/evidence/ddraw/src/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ddraw/src/), and
+[docs/evidence/ddraw/src/build.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ddraw/src/build.sh) builds them for x64 and x86 into
 `out/ddraw/`. The same script also rebuilds `ddcaps`, which is unchanged
-from `docs/evidence/dxdiag/ddcaps/`.
+from [docs/evidence/dxdiag/ddcaps/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/ddcaps/).
 
 `ddfull.exe [--modes 800x600x32,640x480x16] [--frames N] [--check-every K]`
 first lists the modes that DirectDraw (`EnumDisplayModes`) and
@@ -68,7 +68,7 @@ alpha. `DDCREATE_EMULATIONONLY` returns `E_FAIL` on Windows 11, so it
 cannot supply the HEL reference. `--map` prints which source row and column
 each destination pixel took, for the odd ratio, on both paths.
 
-`docs/evidence/ddraw/run-guest.sh` runs one repro in the autologon desktop
+[docs/evidence/ddraw/run-guest.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ddraw/run-guest.sh) runs one repro in the autologon desktop
 of a lab kept by `tests/e2e/run.sh --keep`. It takes a console screenshot
 every 2 s. `WIN3D_TRACE=1` turns on the D3D9 UMD trace for the run.
 
@@ -178,7 +178,7 @@ present sources in host-cached memory ([`present.md`](present.md)). The
 rates above were measured without them.
 
 **With the present fixes**, the release candidate 0.1.1-alpha-rc1
-(`docs/evidence/rc/`) ran the same `ddfull` runs on fresh
+([docs/evidence/rc/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/)) ran the same `ddfull` runs on fresh
 `windows-11` labs on 2026-10-19:
 
 | Run (x64 unless noted) | Nvidia1 | AMD1 |
@@ -189,7 +189,7 @@ rates above were measured without them.
 | x86 640×480×16 and 800×600×16, 300 frames each, every frame checked | 18.0 and 16.9 | 42.0 and 33.6 |
 
 Every pixel check matched, and the desktop mode was restored after each
-run (`docs/evidence/rc/ddraw/<gpu>/<run>/ddfull-*.json`). On AMD1, 32 bpp
+run ([docs/evidence/rc/ddraw/<gpu>/<run>/ddfull-*.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/ddraw/)). On AMD1, 32 bpp
 now flips at the refresh rate. On Nvidia1 it is 5 to 20 times faster than
 before but stays below it, like windowed D3D9 there
 ([`present.md`](present.md#what-remains)). 16 bpp is slower than 32 bpp,
@@ -251,7 +251,7 @@ and we know of no such program.
 
 ## Proof
 
-The package was built at `cbbc481` with `patches/mesa` 0001 to 0025 and
+The package was built at [cbbc481](https://github.com/VMLabDev/vmlab-win3d/commit/cbbc481d7416a622556a4563252386eb8ee69420) with `patches/mesa` 0001 to 0025 and
 0035 (`after/<gpu>/e2e-build.txt`). Each GPU got a fresh
 `x86_64/windows-11@26100.1742.5` lab through `tests/e2e/run.sh --host-gpu
 <gpu> --keep`. The repros then ran in the same lab, with the installed UMD
@@ -272,13 +272,13 @@ The package was built at `cbbc481` with `patches/mesa` 0001 to 0025 and
 only the D3D9 UMD's DirectDraw paths: `D3D9Blt` with the colour-key or
 mirror flags, which only DirectDraw sends, and `GetCaps(DDRAW)`.
 
-## Evidence index (`docs/evidence/ddraw/`)
+## Evidence index ([docs/evidence/ddraw/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ddraw/))
 
 | Path | What it shows |
 | --- | --- |
 | `src/ddfull.c`, `src/ddblit.c`, `src/build.sh` | The repros and their build in the project toolchain image |
 | `run-guest.sh` | Runs a repro in a kept e2e lab's desktop, with console captures and an optional UMD trace |
-| `before/nvidia1/ddfull-x64.json` | Package `b4b8c3f`: the mode lists (32 bpp only), 640×480, 800×600 and 1024×768 at 3.6, 4.4 and 2.2 flips per second with every pixel check matching, and 640×480×16 failing with `0x80004001` |
+| `before/nvidia1/ddfull-x64.json` | Package [b4b8c3f](https://github.com/VMLabDev/vmlab-win3d/commit/b4b8c3fada1c47d2079ce9ab4699fa8c544a8717): the mode lists (32 bpp only), 640×480, 800×600 and 1024×768 at 3.6, 4.4 and 2.2 flips per second with every pixel check matching, and 640×480×16 failing with `0x80004001` |
 | `before/nvidia1/ddfull-x64-16bitcolor-layer.json` | The same with the `16BITCOLOR` compatibility layer: still no 16-bit mode |
 | `before/nvidia1/console-ddfull-*.png` | The console in each fullscreen mode |
 | `before/nvidia1/trace-ddfull-800x600-one-frame.txt` | One frame of the 800×600 run: the emulated colour key's back-buffer readback and the 265 ms Blt-model present |

@@ -32,7 +32,7 @@ the evidence, and lists what is still unproven.
 ## The crash
 
 `repro-nvidia1/` is the reproduction, in lab `win3d-dwmheap-nv1a` on
-`Nvidia1`, from a bundle built at `b198918` (before the fix):
+`Nvidia1`, from a bundle built at [b198918](https://github.com/VMLabDev/vmlab-win3d/commit/b198918dd391a86c7ad971f4cc31944330121b36) (before the fix):
 
 1. The lab was set up by `src/lab-prep.sh`: WER `LocalDumps` (full) for
    `dwm.exe`, then the autologon desktop.
@@ -41,7 +41,7 @@ the evidence, and lists what is still unproven.
    was the first program run. It failed: its first GPU fence did not signal
    within 10 s (`app-errors-and-probe.txt`).
 4. dwm crashed at 11:38:21 guest time with `0xc0000374` at `ntdll.dll` +
-   `0x117eb5`, the same offset as in `docs/evidence/d3d12app/nvidia1-first-boot/app-errors.txt`.
+   `0x117eb5`, the same offset as in [docs/evidence/d3d12app/nvidia1-first-boot/app-errors.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d12app/nvidia1-first-boot/app-errors.txt).
 
 cdb (WinDbg 1.2610.1001.0, Microsoft's public symbols) on the dump
 (`cdb-dwm-stacks.txt`, `cdb-heap-and-trim.txt`):
@@ -151,7 +151,7 @@ Other fixes were considered and not taken:
 
 ## Evidence
 
-All under `docs/evidence/dwmheap/`:
+All under [docs/evidence/dwmheap/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dwmheap/):
 
 | Path | What |
 | --- | --- |
@@ -170,8 +170,8 @@ committed.
 
 Each run is `src/first-boot-run.sh` on a fresh lab from
 `x86_64/windows-11@26100.1742.5`, with package 0.1.1. The bundle was built
-from `b198918` with `0060` applied before it was committed (its manifest
-names `b198918`); `f7c73b6` committed the same patch unchanged. The x64
+from [b198918](https://github.com/VMLabDev/vmlab-win3d/commit/b198918dd391a86c7ad971f4cc31944330121b36) with `0060` applied before it was committed (its manifest
+names [b198918](https://github.com/VMLabDev/vmlab-win3d/commit/b198918dd391a86c7ad971f4cc31944330121b36)); [f7c73b6](https://github.com/VMLabDev/vmlab-win3d/commit/f7c73b6e23870d61d8883d6ffd23cbaa34db70a8) committed the same patch unchanged. The x64
 `viogpu_d3d10.dll` in it has sha256 `8f979e3c6d97ea81ab585b7a4e1551b3c04e5395bb70c2e6d16207d1757671f1`. Every program ran in the first boot after the
 install's final reboot. Nothing else ran before it.
 
@@ -184,7 +184,7 @@ install's final reboot. Nothing else ran before it.
 
 Runs a, b and the AMD1 run used the bundle described above. The Nvidia2
 run, the e2e runs and the F7 runs used the bundle built by
-`scripts/build.sh` at `35fa4e9`: main at `b74ea3c` (with nvva's `0070` and
+`scripts/build.sh` at [35fa4e9](https://github.com/VMLabDev/vmlab-win3d/commit/35fa4e9b221d51ab2d290e450cc0a1f787a839e0): main at [b74ea3c](https://github.com/VMLabDev/vmlab-win3d/commit/b74ea3c22396862ab54d5ef119a774942b938780) (with nvva's `0070` and
 `0086`) merged with this branch.
 
 `D3D12ExecuteIndirect` still shows only its clear colour, as
@@ -200,7 +200,7 @@ among the dead ones.
 
 ### End-to-end runs
 
-`tests/e2e/run.sh --template windows-11` at `35fa4e9`:
+`tests/e2e/run.sh --template windows-11` at [35fa4e9](https://github.com/VMLabDev/vmlab-win3d/commit/35fa4e9b221d51ab2d290e450cc0a1f787a839e0):
 
 | Run | Result | Notes |
 | --- | --- | --- |
@@ -215,7 +215,7 @@ Worker unid3d reproduced compat finding F7, intermittent heap corruption in
 Unigine Heaven's D3D11 renderer on AMD1, under full PageHeap in 2 of 5 runs.
 Both crashes are a use-after-free of a `yttrium_threaded_flush_label`
 record. `tc_batch_execute` ran it on the threaded context's worker thread
-after the record had been freed (`docs/evidence/unid3d/f7-pageheap/`). That
+after the record had been freed ([docs/evidence/unid3d/f7-pageheap/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unid3d/f7-pageheap/)). That
 is the same callback record as in the dwm crash. A batch that a foreign
 thread's trim flush ran inline, and that the owner thread then submitted to
 the worker, would run its callbacks twice: the first run frees the record,

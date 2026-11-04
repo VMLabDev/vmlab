@@ -8,7 +8,7 @@ cause, the fix (`patches/mesa/0030`), what the repro checks for domain,
 geometry and pixel shaders, and what remains. Investigated on 2026-10-18 on
 helios: RADV (Mesa 26.2.2) on `AMD1`, NVIDIA 610.57.04 on `Nvidia2`, vmlab
 0.28.0-alpha, QEMU 11.1.1 (the egl-headless patched build for NVIDIA),
-virglrenderer 1.3.0. Evidence is in `docs/evidence/ds/`.
+virglrenderer 1.3.0. Evidence is in [docs/evidence/ds/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ds/).
 
 ## Result
 
@@ -24,7 +24,7 @@ first through `0015`'s per-vertex range code, the other two through the
 original one-dimensional input range code. Only patch-constant ranges were
 missing.
 
-Proof, with a package built by `tests/e2e/run.sh` at commit `e690c53`
+Proof, with a package built by `tests/e2e/run.sh` at commit [e690c53](https://github.com/VMLabDev/vmlab-win3d/commit/e690c53f1541c9a58d4acb2ce2c3d87bdbe83286)
 (`patches/mesa` 0001 to 0025 and 0030):
 
 | Check | AMD1 (RADV) | Nvidia2 (RTX 5090) |
@@ -36,7 +36,7 @@ Proof, with a package built by `tests/e2e/run.sh` at commit `e690c53`
 
 ## The repro
 
-`docs/evidence/ds/src/d3d11_index.cpp` compiles its shaders at run time with
+[docs/evidence/ds/src/d3d11_index.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ds/src/d3d11_index.cpp) compiles its shaders at run time with
 the system's `d3dcompiler_47.dll` and draws one patch or quad into each
 quadrant of a 64×64 `R32G32B32A32_FLOAT` target. Each shader reads an array
 element at index `(quadrant + sel) & 3`, where `sel` comes from a constant
@@ -55,8 +55,8 @@ does not hide the other cases.
 | `gs-in` | No tessellation. The geometry shader reads `t[vertex].a[idx]` from its input triangle, both indices registers |
 | `ps-in` | The pixel shader returns its `nointerpolation float4 a[4]` input at `idx` |
 
-`docs/evidence/ds/src/build.sh` builds x64 and x86 in the toolchain image.
-`docs/evidence/ds/src/run-repro.sh <lab-dir> <vm> <out-dir>` runs both on the
+[docs/evidence/ds/src/build.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ds/src/build.sh) builds x64 and x86 in the toolchain image.
+[docs/evidence/ds/src/run-repro.sh <lab-dir> <vm> <out-dir>](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ds/src/run-repro.sh <lab-dir> <vm> <out-dir>) runs both on the
 hardware device and on WARP in the autologon user's session
 (`tests/guest/Run-Probe.ps1`), copies the logs back, diffs every read-back
 line of hardware against WARP, and collects the UMD's warning log. It exits 0
@@ -136,12 +136,12 @@ tested.
 
 ## Evidence
 
-All under `docs/evidence/ds/`:
+All under [docs/evidence/ds/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ds/):
 
 | Path | What it is |
 | --- | --- |
 | `src/d3d11_index.cpp`, `src/build.sh`, `src/run-repro.sh` | The repro, its build and its runner |
-| `before/{amd1,nvidia2}/` | Runs with the package at `b4b8c3f` (0001 to 0025): logs per architecture and device, the hardware-against-WARP diffs, `yttrium-errors.txt` |
+| `before/{amd1,nvidia2}/` | Runs with the package at [b4b8c3f](https://github.com/VMLabDev/vmlab-win3d/commit/b4b8c3fada1c47d2079ce9ab4699fa8c544a8717) (0001 to 0025): logs per architecture and device, the hardware-against-WARP diffs, `yttrium-errors.txt` |
 | `after/{amd1,nvidia2}/` | The same with 0030, run in the e2e labs after the e2e run (kept with `--keep`, then destroyed); `asm/` holds the full disassembly of each case's indexed shader |
-| `after/{amd1,nvidia2}/e2e-*.txt`, `qemu-argv-env.txt` | The e2e run's host stack, build and results, and QEMU's command line (copied from `docs/evidence/acceptance/`, which was restored to its committed state) |
+| `after/{amd1,nvidia2}/e2e-*.txt`, `qemu-argv-env.txt` | The e2e run's host stack, build and results, and QEMU's command line (copied from [docs/evidence/acceptance/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/), which was restored to its committed state) |
 | `after/nvidia2/kernel-nvrm.txt` | Host kernel `NVRM`/Xid lines during the runs: none |

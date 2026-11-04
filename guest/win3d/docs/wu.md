@@ -7,7 +7,7 @@ install leaves this package bound to the display device. It also shows
 which driver Windows Update offers for the device. Investigated on
 2026-10-19 on helios with vmlab 0.28.0-alpha, the
 `windows-11@26100.1742.5` and `windows-10@19045.2006.8` templates, and
-bundles 0.1.0 and 0.1.1. Evidence is in `docs/evidence/wu/`.
+bundles 0.1.0 and 0.1.1. Evidence is in [docs/evidence/wu/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/).
 
 ## Result
 
@@ -25,7 +25,7 @@ bundles 0.1.0 and 0.1.1. Evidence is in `docs/evidence/wu/`.
 `docs/known-limits.md` ("Evaluation templates need the lab NIC and
 `slmgr /ato`") has the user-facing entry. The evidence:
 
-| File (`docs/evidence/wu/activation/`) | What it shows |
+| File ([docs/evidence/wu/activation/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/activation/)) | What it shows |
 | --- | --- |
 | `lab-vmlab.wcl` | The clone: `windows-11`, NAT NIC, no GPU, nothing run in it after `vmlab up` |
 | `no-ato-shutdown.txt` | That clone was not activated by Windows. It was still in notification mode 63 minutes after it was reported ready, and then stopped. Its event log has `wlms.exe` starting the shutdown 60 minutes after the last boot: "The license period for this installation of Windows has expired. The operating system is shutting down." |
@@ -77,7 +77,7 @@ install, and the device installation policy applies to every such install.
 
 ## Evidence
 
-`docs/evidence/wu/src/` holds the repro:
+[docs/evidence/wu/src/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/src/) holds the repro:
 
 | File | Role |
 | --- | --- |
@@ -126,11 +126,11 @@ same offer.
 
 The full acceptance run, `tests/e2e/run.sh --template windows-11`, with
 the NIC and the activation step, passes 12 of 12 on Nvidia2
-(`docs/evidence/wu/e2e/windows-11-nvidia2/`, bundle 0.1.0 at `54355df`)
-and on AMD1 (`docs/evidence/wu/e2e/windows-11-amd1/`, bundle 0.1.1 built
-at `1c73461`). Each run's `activation.txt` shows `License Status: Licensed`.
+([docs/evidence/wu/e2e/windows-11-nvidia2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/e2e/windows-11-nvidia2/), bundle 0.1.0 at [54355df](https://github.com/VMLabDev/vmlab-win3d/commit/54355df5720c4def959c12c3a053266a5ecc92e5))
+and on AMD1 ([docs/evidence/wu/e2e/windows-11-amd1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/e2e/windows-11-amd1/), bundle 0.1.1 built
+at [1c73461](https://github.com/VMLabDev/vmlab-win3d/commit/1c734617ca30e4c161f1a5e73e7226d8e4b8ea58)). Each run's `activation.txt` shows `License Status: Licensed`.
 The first AMD1 run passed 11 of 12
-(`docs/evidence/wu/e2e/windows-11-amd1-run1/`). Its x86 D3D12 probe passed
+([docs/evidence/wu/e2e/windows-11-amd1-run1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/wu/e2e/windows-11-amd1-run1/)). Its x86 D3D12 probe passed
 its own readback but presented one frame in 40 seconds, so its window never
 reached a console capture. The x64 D3D12 probe in the same run ran at 49
 fps, the host's load average was about 28, and worker `dd16` saw the same

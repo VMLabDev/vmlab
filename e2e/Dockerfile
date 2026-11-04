@@ -55,7 +55,7 @@ RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
 # and trixie does not ship (1.1.0). Installed under /opt/virgl, apart from the
 # distro's: vmlab-hv finds it by rpath, and QEMU keeps trixie's.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends meson ninja-build pkg-config python3-yaml \
+ && apt-get install -y --no-install-recommends meson ninja-build patch pkg-config python3-yaml \
       libepoxy-dev libdrm-dev libgbm-dev libegl-dev libvulkan-dev glslang-tools \
  && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
@@ -63,6 +63,10 @@ RUN set -eux; \
       https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/1.3.0/virglrenderer-1.3.0.tar.gz; \
     echo "065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3  /tmp/virgl.tar.gz" | sha256sum -c -; \
     tar -C /tmp -xzf /tmp/virgl.tar.gz; \
+    for patch in /src/patches/virglrenderer/*.patch; do \
+      echo "Applying $patch"; \
+      patch --batch --forward -d /tmp/virglrenderer-1.3.0 -p1 -i "$patch"; \
+    done; \
     meson setup /tmp/virgl-build /tmp/virglrenderer-1.3.0 --prefix=/opt/virgl --libdir=lib \
       --buildtype=release -Dvenus=true -Dtests=false; \
     ninja -C /tmp/virgl-build install; \

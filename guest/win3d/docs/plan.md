@@ -93,6 +93,6 @@ then `e2e` (fresh win11 lab, install, evidence for every Done item), then
   32 GiB on both RTX 5090s, rerun the NVIDIA acceptance, and raise the slot
   limit to three VMs per card.
 - D6 (2026-10-19): helios has Resizable BAR (D5 done; BAR1 32 GiB). Release
-  `v0.1.1-alpha` published (pre-release) from `d6682d0` after rc2 (AMD) and
+  `v0.1.1-alpha` published (pre-release) from [d6682d0](https://github.com/VMLabDev/vmlab-win3d/commit/d6682d00dcf31ddb28ec4113608d1cabc54bdd38) after rc2 (AMD) and
   rc3 (NVIDIA with ReBAR) passed: e2e 12/12 on every target, compat 12/12 on
   AMD1 and Nvidia2.

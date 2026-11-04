@@ -5,7 +5,7 @@ a Windows 10 or 11 guest, and unmodified Direct3D 9, 10, 11 and 12, OpenGL
 and Vulkan applications render on the host's GPU. No application needs local
 DLLs, overrides or settings.
 
-The rendering runs on the Vulkan driver of the host running QEMU. The guest
+The rendering runs on the Vulkan driver of the host running vmlab-hv. The guest
 reaches it through virtio-gpu Venus, vmlab's `gpu { mode = "vulkan" }`:
 
 - a WDDM kernel driver with Venus support (Yttrium viogpu3d);
@@ -13,7 +13,9 @@ reaches it through virtio-gpu Venus, vmlab's `gpu { mode = "vulkan" }`:
 - Direct3D 9 to 11 through the Yttrium Mesa UMD, OpenGL through Mesa Zink,
   and Direct3D 12 through vkd3d-proton behind a system `d3d12.dll` bridge.
 
-The host side is the host's own QEMU, virglrenderer and Vulkan driver.
+This component lives under guest/win3d/ in the vmlab monorepo. Run its
+scripts from this directory. vmlab-hv and its patched virglrenderer are built
+from the repository root; the host supplies its Vulkan driver.
 
 The guest package is built from pinned upstream sources by scripts in this
 repository, in Docker on Linux. [docs/stack.md](docs/stack.md) follows a
@@ -33,25 +35,23 @@ off.
 - **Also verified on Intel.** The same checks pass on an Intel Iris Xe host
   (ANV) with `patches/mesa/0021` ([zeus](docs/zeus.md)).
 - **Also verified on NVIDIA.** On an RTX 5090 the same checks pass on
-  `windows-11` and `windows-10` with vmlab 0.27, when the host config names a patched QEMU
-  as the GPU's `qemu_binary` ([nvidia](docs/nvidia.md),
+  `windows-11` and `windows-10` in the historical QEMU acceptance runs ([nvidia](docs/nvidia.md),
   [acceptance](docs/acceptance.md#nvidia-rtx-5090)), on both cards. The
   DirectX SDK D3D9 samples render there too after `patches/mesa/0022` to
   `0025` ([xid69](docs/xid69.md), [nvtex](docs/nvtex.md)). On a laptop RTX 4060 (driver 615.71) Vulkan,
   D3D12 and OpenGL clients hang because Venus feedback writes never reach the
   guest; D3D9 and D3D11 work ([zeus](docs/zeus.md)).
 - Uninstall returns the guest to its state before the install
-  ([evidence](docs/evidence/package/README.md)).
+  ([evidence](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md)).
 
 [docs/known-limits.md](docs/known-limits.md) lists everything else,
 including the full host GPU matrix.
 
 ## Quick start
 
-You need Docker without sudo, vmlab 0.27.0-alpha or later, the local
+You need Docker without sudo, the in-tree vmlab and vmlab-hv bundle, the local
 `windows-11` template, and an AMD, Intel or NVIDIA RTX 5090 GPU on the
-host. NVIDIA also needs a patched QEMU as `qemu_binary` on its host config
-block ([docs/nvidia.md](docs/nvidia.md)).
+host. The bundle includes NVIDIA's Venus fixes ([docs/nvidia.md](docs/nvidia.md)).
 
 ```sh
 scripts/build.sh                               # writes out/package/
@@ -59,7 +59,7 @@ vmlab up                                       # in a lab dir like labs/probe/
 scripts/install-into-vm.sh <lab-dir> <vm>      # install, with the reboots
 ```
 
-The lab needs `secure_boot = false`, `nic { nat = true }` (then run
+The lab needs `hypervisor = "vmlab"`, `secure_boot = false`, `nic { nat = true }` (then run
 `slmgr /ato` in the guest, or the evaluation template shuts down after an
 hour), and `gpu { mode = "vulkan" host_gpu = "<name>" }`, where `<name>` is the
 GPU as declared in the host config, `~/.config/vmlab/config.wcl`
@@ -72,21 +72,13 @@ lab and destroys it afterwards.
 
 ## Install
 
-A release has three assets, built by `scripts/release.sh`
-([docs/release.md](docs/release.md)):
+Guest releases use `win3d-v<version>` tags on VMLabDev/vmlab.
+The release zip contains the signed guest package, licence texts and notices.
+Extract it inside a Windows 10 or 11 guest and run Install.cmd as Administrator.
 
-- `vmlab-win3d-<version>-windows-x64.zip`, the signed guest package. Unzip
-  it in a Windows 10 or 11 guest with Secure Boot off and a Venus GPU, and
-  run `Install.cmd` as Administrator. Its `README.txt` has the steps.
-- `qemu-vmlab-egl-<version>-x86_64-linux.tar.zst`, the patched QEMU
-  that NVIDIA hosts need. Extract it, run `install.sh`, and paste the
-  `qemu_binary` line it prints into the host config's GPU block.
-- `virglrenderer-vmlab-<version>-x86_64-linux.tar.zst`, the patched
-  render server that NVIDIA hosts need. Extract it, run `install.sh`, and
-  paste the `qemu_env` line it prints into the same GPU block.
-
-[docs/release.md](docs/release.md) covers all three, and how to cut a release.
-To build from source instead, see [Quick start](#quick-start).
+Host binaries come from the vmlab-hv bundle released with vmlab.
+No QEMU or standalone render-server tarball is released by win3d.
+[docs/release.md](docs/release.md) covers packaging and the dry run.
 
 ## Documentation
 
@@ -139,7 +131,7 @@ to it are in `patches/` (see [docs/stack.md](docs/stack.md)).
 
 | Project | Use |
 | --- | --- |
-| [QEMU](https://www.qemu.org/) and [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer) | The virtio-gpu device and the host side of Venus. Our egl-headless fix for NVIDIA is the branch [`vmlab/egl-headless-external-dmabuf`](https://github.com/VMLabDev/qemu/tree/vmlab/egl-headless-external-dmabuf) on VMLabDev/qemu, a series on upstream QEMU master, built at the commit `patches/host/PINS` pins (`d8a6048aae`) and shipped as a release asset. |
+| vmlab-hv and virglrenderer | The in-tree virtio-gpu device and the host side of Venus. The shared build applies patches in ../../patches/virglrenderer/. |
 | [vmlab](https://github.com/VMLabDev/vmlab) | The labs every test runs in |
 | Microsoft DirectX SDK (June 2010) samples, [Blender](https://www.blender.org/), the LunarG Vulkan Runtime and the Visual C++ 2010 runtime | Unmodified third-party applications for the acceptance tests. They are downloaded at test time from their official sources and are not redistributed. |
 
@@ -152,8 +144,8 @@ contributors.
 That licence does not cover other people's code. Everything under
 `patches/` modifies an upstream project and is under that project's
 licence. Every component the scripts build or download, and so every file
-in the guest package and the QEMU release asset, keeps its upstream
+in the guest package, keeps its upstream
 licence: BSD-3-Clause and MPL-2.0 (the KMD), MIT and MPL-2.0 (Mesa),
 LGPL-2.1-or-later (vkd3d-proton), MIT (dxil-spirv), zlib (DXVK),
-Apache-2.0 (the Vulkan loader) and GPL-2.0 (QEMU). See
+and Apache-2.0 (the Vulkan loader). See
 [Credits](#credits) and [docs/stack.md](docs/stack.md).

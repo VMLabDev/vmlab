@@ -205,7 +205,7 @@ install. A user who hits this can reboot once more.
 
 ## Evidence
 
-All under `docs/evidence/d3d12app/`:
+All under [docs/evidence/d3d12app/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d12app/):
 
 | Path | What |
 | --- | --- |
@@ -216,7 +216,7 @@ All under `docs/evidence/d3d12app/`:
 | `nvidia1-dwm/dwm-Report.wer` | WER report of that dwm crash, with its loaded modules |
 | `executeindirect/` | vkd3d-proton log of `D3D12ExecuteIndirect` on AMD1, guest `vulkaninfo` (Nvidia1), host `vulkaninfo` lines for both drivers |
 
-These runs used the bundle built from `82d8e51` (package 0.1.0) plus this
+These runs used the bundle built from [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75) (package 0.1.0) plus this
 branch. The labs were `win3d-d3d12app-amd1` and `win3d-d3d12app-nv1`, on
 template `x86_64/windows-11@26100.1742.5`. The NVIDIA card was Nvidia1,
 because Nvidia2 already had three labs.

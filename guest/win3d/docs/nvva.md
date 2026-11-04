@@ -7,8 +7,8 @@ in `vkGetImageSubresourceLayout`, and one acceptance run failed 10 of 12
 (shaders2's `after/nvidia1-attempt1`). This page names the cause, gives the
 numbers and records what is fixed and what is not. Investigated on
 2026-10-19 on helios with NVIDIA 610.57.04, vmlab 0.28.0-alpha, the patched
-QEMU from `patches/host/PINS` and virglrenderer 1.3.0. The evidence is in
-`docs/evidence/nvva/`.
+QEMU from [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS) and virglrenderer 1.3.0. The evidence is in
+[docs/evidence/nvva/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvva/).
 
 > **Since 2026-10-19 helios has Resizable BAR, and the limit on this page no
 > longer applies there.** BAR1 is 32 GiB on both RTX 5090s. NVIDIA's Vulkan
@@ -19,7 +19,7 @@ QEMU from `patches/host/PINS` and virglrenderer 1.3.0. The evidence is in
 > three probe loops (116 of 116 passed). BAR1 peaked at 764 MiB, and the
 > host logged **no** `can't alloc VA space` line, no Xid and no
 > `failed to look up object` (the controlled stage: 321 to 485 MiB). Each QEMU had 1.2 to 1.7 GiB
-> of dma-buf mapped ([rc3](evidence/rc3/README.md#rebar-load-check)). The
+> of dma-buf mapped ([rc3](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#rebar-load-check)). The
 > rest of this page describes helios before the change, and NVIDIA hosts
 > without Resizable BAR.
 
@@ -150,10 +150,10 @@ images.
 `tests/e2e/run.sh --template windows-11 --host-gpu Nvidia2 --lab win3d-nvva-e2e`
 with the 0070 and 0086 package, while labs `a` and `b` (same package) ran
 the probe loops (`07-0070/load-during-e2e/`), 2026-10-19, package built at
-`a9579f1`:
+[a9579f1](https://github.com/VMLabDev/vmlab-win3d/commit/a9579f13c64cb2fea28114541480fc6e64fae7df):
 
 - **12 of 12 Done checks pass**
-  (`docs/evidence/acceptance/windows-11-nvidia2/results.txt`): the install,
+  ([docs/evidence/acceptance/windows-11-nvidia2/results.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11-nvidia2/results.txt)): the install,
   `vulkaninfo`, dxdiag, and all ten probes on the console. OpenGL runs
   through Zink at 57 fps, so 0086 works without a host-visible VRAM type.
 - The two loaded labs ran 68 probe runs and all 68 passed.
@@ -167,7 +167,7 @@ per card.
 
 ## Evidence
 
-| Path under `docs/evidence/nvva/` | What |
+| Path under [docs/evidence/nvva/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvva/) | What |
 | --- | --- |
 | `src/bar1probe.c` | Host BAR1 probe: allocate, map, dma-buf, export, import |
 | `src/importtest.c` | Cross-process dma-buf import into a LINEAR image |

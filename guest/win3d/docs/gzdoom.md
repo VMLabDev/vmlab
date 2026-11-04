@@ -15,7 +15,7 @@ F3 was a bug in the WGL ICD, `viogpu_wgl.dll`, and is fixed by
 `0086` fix it, and GZDoom Vulkan now runs on NVIDIA. The work was done on
 2026-10-19 on helios: RADV (Mesa 26.2.2) on `AMD1`, NVIDIA 610.57.04,
 vmlab 0.28.0-alpha and virglrenderer 1.3.0. The evidence is in
-`docs/evidence/gzdoom/`.
+[docs/evidence/gzdoom/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/gzdoom/).
 
 ## Result
 
@@ -109,17 +109,17 @@ loads both anyway.
 ## Evidence
 
 Three packages were used, all built by `scripts/build.sh` from this branch.
-"Base" is `main` at `5781598` plus `0080` (manifest commit `4d879bb`).
-"Merged" adds `main` at `b74ea3c`, which brought `nvva`'s `0070` and `0086`
-(manifest commit `d0c6c3e`). "Head" adds `main` at `1c3ce87`, which brought
-`0090` (D3D9 only; manifest commits `85858fe` and `672bbf6`, the same
+"Base" is `main` at [5781598](https://github.com/VMLabDev/vmlab-win3d/commit/5781598ec9760828bb391306df23170832f31572) plus `0080` (manifest commit [4d879bb](https://github.com/VMLabDev/vmlab-win3d/commit/4d879bbf2ef455d8b65ea1161b6f96aa8fdc2b7c)).
+"Merged" adds `main` at [b74ea3c](https://github.com/VMLabDev/vmlab-win3d/commit/b74ea3c22396862ab54d5ef119a774942b938780), which brought `nvva`'s `0070` and `0086`
+(manifest commit [d0c6c3e](https://github.com/VMLabDev/vmlab-win3d/commit/d0c6c3e0a8fdf7d4022e9baf1fa39ccf88624b6c)). "Head" adds `main` at [1c3ce87](https://github.com/VMLabDev/vmlab-win3d/commit/1c3ce87c3053fffeb6179d8f32a52d3f06828310), which brought
+`0090` (D3D9 only; manifest commits [85858fe](https://github.com/VMLabDev/vmlab-win3d/commit/85858fea03207bafbad6ffcbec42bb111e3640de) and [672bbf6](https://github.com/VMLabDev/vmlab-win3d/commit/672bbf683acadd5e10365de928c4c6048a898106), the same
 sources). None of them has `nvva`'s
 dropped `0071`.
 
 | What | Where |
 | --- | --- |
-| Repro: GZDoom's start-up, call for call, with `opengl32.dll` loaded late as GZDoom loads it | `docs/evidence/gzdoom/src/gzgl.c`, built by `src/build.sh`, run by `src/run-repro.sh` (x64 and x86, through `tests/guest/Run-Probe.ps1`) |
-| Repro on the 0.1.1 package at `5781598`: fails at step 1 (x64 and x86) | `repro/amd1-before/` |
+| Repro: GZDoom's start-up, call for call, with `opengl32.dll` loaded late as GZDoom loads it | [docs/evidence/gzdoom/src/gzgl.c](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/gzdoom/src/gzgl.c), built by `src/build.sh`, run by `src/run-repro.sh` (x64 and x86, through `tests/guest/Run-Probe.ps1`) |
+| Repro on the 0.1.1 package at [5781598](https://github.com/VMLabDev/vmlab-win3d/commit/5781598ec9760828bb391306df23170832f31572): fails at step 1 (x64 and x86) | `repro/amd1-before/` |
 | Repro with `0080` (its `viogpu_wgl.dll` copied over the installed one): passes all four steps, a 4.6 core context and the cleared frame read back (x64 and x86) | `repro/amd1-after/` |
 | The WGL call trace of a GZDoom run with the logging `opengl32.dll` | `repro/gltrace-gzdoom-amd1.txt`, from `src/gltrace/` |
 | GZDoom OpenGL and Vulkan through `tests/apps/compat/run.sh` on `AMD1`, fresh lab, base package: both clean at 35 fps | `amd1/` (`results.json`, `gzdoom-opengl/console-2.png`) |
@@ -140,7 +140,7 @@ COMPAT_LAB=win3d-gzdoom-amd1 COMPAT_EV=$PWD/docs/evidence/gzdoom/amd1 \
 
 ## F2: GZDoom Vulkan on NVIDIA
 
-The F2 render-server lines (`docs/evidence/compat/nvidia2/gzdoom-vulkan/qemu-log.txt`):
+The F2 render-server lines ([docs/evidence/compat/nvidia2/gzdoom-vulkan/qemu-log.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/gzdoom-vulkan/qemu-log.txt)):
 
 ```
 virtio_gpu_virgl_process_cmd: ctrl 0x10c, error 0x1200

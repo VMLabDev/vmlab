@@ -6,7 +6,7 @@ names the trigger, gives the evidence and records the fix,
 `patches/mesa/0022-yttrium-render-shadow-for-linear-colour-with-depth.patch`.
 Investigated on 2026-10-18 on helios: NVIDIA 610.57.04, vmlab 0.28.0-alpha,
 QEMU 11.1.1 with the egl-headless patch, virglrenderer 1.3.0. Evidence is in
-`docs/evidence/xid69/`.
+[docs/evidence/xid69/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/xid69/).
 
 ## Result
 
@@ -127,7 +127,7 @@ pass. Revisit that if a future driver refuses it.
 ## Proof
 
 Both runs used fresh labs from `x86_64/windows-11@26100.1742.5`. The bundle
-was built at commit `025a680`, which is `patches/mesa` 0001 to 0022
+was built at commit [025a680](https://github.com/VMLabDev/vmlab-win3d/commit/025a68063f86050c8bc0a15af3f91e1506167f7f), which is `patches/mesa` 0001 to 0022
 (`after/*/e2e-build.txt`). Each run did `tests/e2e/run.sh --host-gpu <gpu>
 --keep`, then `Run-AllProbes.ps1`, then the samples through `run-sample.sh`
 for 30 s each (25 s for POM). The host config matched helios's: `Nvidia1`
@@ -175,7 +175,7 @@ to it. The small drop on Nvidia1 was not investigated.
 - `build/mesa/README.md` lists the patch series. It has the 0022 row now,
   and rows for 0023 to 0025.
 
-## Evidence index (`docs/evidence/xid69/`)
+## Evidence index ([docs/evidence/xid69/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/xid69/))
 
 | Path | What it shows |
 | --- | --- |

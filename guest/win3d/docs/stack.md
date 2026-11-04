@@ -75,10 +75,10 @@ Read the diagram with these points in mind:
 - **The host side is not built here.** QEMU, virglrenderer and RADV are the
   host's Arch packages (`docs/host.md`). Decision D3 in `docs/plan.md` keeps
   them at the versions shown. The exception is NVIDIA hosts, which need a
-  patched QEMU (`patches/host/`, [Host patches](#host-patches)).
+  patched QEMU ([patches/host/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/), [Host patches](#host-patches)).
 
 The probes confirm which modules each API loads in the guest:
-`docs/evidence/package/03-probes-summary.json`, `graphics_modules`.
+[docs/evidence/package/03-probes-summary.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/03-probes-summary.json), `graphics_modules`.
 
 ## Layers
 
@@ -192,24 +192,19 @@ The device appears as "Hardsoft VirtIO GPU 3D controller", driver version
 resource support and a 60 Hz VidPN timer. It needs the
 `VIRTIO_GPU_F_VIRGL` feature, so it fails to start on a plain `virtio-vga`.
 
-### Device: virtio-gpu Venus in QEMU
+### Device: virtio-gpu Venus in vmlab-hv
 
-| | |
-| --- | --- |
-| What | `virtio-vga-gl,venus=true,blob=true,hostmem=4G`, the only display adapter; `-display egl-headless` on the render node of the host GPU |
-| Set by | vmlab 0.25 or later: `gpu { mode = "vulkan" host_gpu = "AMD1" }` (`labs/probe/vmlab.wcl`), with `AMD1` declared in the host config `~/.config/vmlab/config.wcl` as `gpu "AMD1" { address = "0000:72:00.0" }`. vmlab 0.24 took the address in the lab file, as `gpu.address`; the evidence from before 0.25 used that form |
-| Upstream | QEMU 11.1.1 (Arch `qemu-full 11.1.1-1`), not built here |
+vmlab-hv's in-tree virtio-gpu implements the device; its renderer uses
+rutabaga and the shared virglrenderer build. A lab selects it with
+`hypervisor = "vmlab"` and `gpu { mode = "vulkan" host_gpu = "AMD1" }`.
 
-`docs/host.md` shows why each of these settings is required. It measured
-them on vmlab 0.23, with `qemu_args`, before vmlab emitted them itself.
+### Host: virglrenderer and the Vulkan driver
 
-### Host: virglrenderer and RADV
-
-| | |
-| --- | --- |
-| What | `/usr/lib/virgl_render_server` forks one `virgl-N-gpu_render` process per guest Venus context; each replays the commands on the host Vulkan driver |
-| Selected by | vmlab sets `VK_LOADER_DRIVERS_SELECT` in QEMU's environment from the kernel driver of the host GPU that `gpu.host_gpu` names (`*radeon*` for `AMD1`), so the render workers open only that GPU's render node (resolved from its address at run time). `vulkan_icd` on that GPU's host config block sets `VK_DRIVER_FILES` instead. |
-| Upstream | virglrenderer 1.3.0 (Arch `1.3.0-2.1`), Mesa RADV 26.2.2 (Arch `vulkan-radeon 3:26.2.2-2`), not built here |
+The vmlab-hv bundle ships matching patched copies of libvirglrenderer and
+virgl_render_server. Its launcher selects that server, which forks render
+workers to replay Venus commands on the host Vulkan driver.
+vmlab applies its GPU PCI filter and ICD selection to the hypervisor's
+environment. The host still supplies RADV, ANV or the NVIDIA Vulkan driver.
 
 ### Tested hosts
 
@@ -221,17 +216,15 @@ evidence for each row, is in
 
 ### Host patches
 
-`patches/host/` is **not part of the guest package**. `scripts/build.sh`
-does not build it, and the installer does not use it. It holds patches to
-two host components and the scripts that build them into `out/host/`, for
-labs that select them explicitly. Nothing is installed on the host
-(decision D3). Its pins are the `host` rows of the pin table below.
+The repository-root patches/virglrenderer/ directory carries 0001
+image-allocation logging, 0002 NVIDIA queue-sync fence timing and 0003
+memory-import export-info removal. The root build/hv.py and e2e image
+apply all three; hypervisor tests use that build. diagnostic/0040 remains
+unapplied. The obsolete feedback-loop workaround is removed because guest
+Mesa patch 0020 handles it.
 
-| Path | What it is for |
-| --- | --- |
-| `patches/host/build-qemu.sh`, `patches/host/bump-qemu.sh` and the `qemu` pin in `patches/host/PINS` | The vmlab QEMU: QEMU 11.1.1 plus the series on the [VMLabDev/qemu](https://github.com/VMLabDev/qemu/tree/vmlab/egl-headless-external-dmabuf) branch `vmlab/egl-headless-external-dmabuf`, at the pinned commit. Its egl-headless display shows LINEAR scanout dma-bufs that the host's EGL imports as external only. NVIDIA needs it for a visible console; AMD and Intel do not. Built in the Debian 12 container of `patches/host/Dockerfile` with `--without-default-features` and only vmlab's features, so it runs on any distribution with glibc 2.36 or newer; it bundles the render server build's `libvirglrenderer.so.1` ([`release.md`](release.md#supported-hosts-of-the-host-assets)). On vmlab 0.26 or later the host config names it as the NVIDIA GPU's `qemu_binary` ([`nvidia.md`](nvidia.md)); the Zeus runs, on 0.24, used an isolated supervisor (`labs/zeus/vmlab-iso.sh`) |
-| `patches/host/virglrenderer/0001` to `0003`, `patches/host/build-virglrenderer.sh`, `patches/host/Dockerfile` and `patches/host/container.sh` | The vmlab render server: virglrenderer 1.3.0 with `0002` (queue-sync fences not exportable, so NVIDIA fences no longer wake about 10 ms late, [`n5.md`](n5.md)), `0003` (an import never carries export info, which NVIDIA turns into a fresh allocation, [`nvidia.md`](nvidia.md#imports-that-carry-export-info)) and `0001` (logs failed image creation), built once in the Debian 12 container for both host assets (the QEMU asset bundles its library). NVIDIA host GPU profiles select it with `qemu_env = { RENDER_SERVER_EXEC_PATH: ... }`; it ships as a release asset ([`release.md`](release.md)) |
-| `patches/host/virglrenderer/workaround/0003` | The host-side workaround for the NVIDIA feedback-loop fault, kept as documentation. `patches/mesa/0020` replaced it; `build-virglrenderer.sh` applies it only with `WITH_WORKAROUND=1` |
+The vmlab-hv release bundle ships the patched library and render server.
+win3d no longer builds or ships a QEMU fork or a separate host asset.
 
 ### Build-only inputs
 
@@ -246,7 +239,7 @@ These produce the binaries but are not installed in the guest:
 
 ## Pins
 
-Generated from every `build/<component>/PINS` and `patches/host/PINS` by `scripts/pins-table.py
+Generated from every `build/<component>/PINS` and [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS) by `scripts/pins-table.py
 --write`; `scripts/pins-table.py --check` fails when this table is stale. Git
 sources are pinned by commit, so they have no download hash. Each `PINS` file
 also records the `SOURCE_DATE_EPOCH` its build uses, and the KMD and signing
@@ -296,12 +289,6 @@ Dockerfiles pin their Debian packages by version.
 | [`vulkan-sdk`](../build/vulkan-sdk/PINS) | Vulkan-Headers | `vulkan-sdk-1.4.363.0` | `6802bb4733b63ed5efd3adb308a6c885ef180ea1` | `4a078be12bef21cfebc09d878b77a63cff9d68f899254a0b00d0e37ef73e7f7e` | https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz |
 | [`vulkan-sdk`](../build/vulkan-sdk/PINS) | Vulkan-Loader | `vulkan-sdk-1.4.363.0` | `fa218055ff4948b159f31d43f800c808a13d51df` | `941eff558fc74f248745fb7df367640cf89a8457f216dae498a74ae14b6ba6f7` | https://github.com/KhronosGroup/Vulkan-Loader/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz |
 | [`vulkan-sdk`](../build/vulkan-sdk/PINS) | Vulkan-Tools | `vulkan-sdk-1.4.363.0` | `6fe2055cf2fa921d52a4c6a31528cfc279a6977f` | `6cbeb83294434e636a0c78760f1a6dfe3e50c1bab0cffa154603ce73e70508f1` | https://github.com/KhronosGroup/Vulkan-Tools/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz |
-| [`host`](../patches/host/PINS) | debian-bookworm | — | `sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858` | — | docker.io/library/debian |
-| [`host`](../patches/host/PINS) | python | `3.12.15` | — | `075054df18953f605a96bbf3942b3daad57ea37d3143a7db36dbde44cfdfdb48` | https://github.com/astral-sh/python-build-standalone/releases/download/20261020/cpython-3.12.15%2B20261020-x86_64-unknown-linux-gnu-install_only.tar.gz |
-| [`host`](../patches/host/PINS) | virglrenderer | `1.3.0` | — | `065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3` | https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/1.3.0/virglrenderer-1.3.0.tar.gz |
-| [`host`](../patches/host/PINS) | meson | `1.12.1` | — | `930bc7542cbd9f57009e182fd014eba48cf1a0180a7b9006d2d32d8f168d8b02` | https://files.pythonhosted.org/packages/57/99/36cd25f9598eef70db97577440a70a360af505f6f01c2338a18d1556079c/meson-1.12.1-py3-none-any.whl |
-| [`host`](../patches/host/PINS) | pyyaml | `6.0.3` | — | `d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f` | https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/pyyaml-6.0.3.tar.gz |
-| [`host`](../patches/host/PINS) | qemu | `branch vmlab/egl-headless-external-dmabuf` | `d8a6048aae11c5e26168e173a7c1b1a4335d6a23` | — | https://github.com/VMLabDev/qemu |
 <!-- END generated pins table -->
 
 ## Patches
@@ -320,11 +307,7 @@ committed.
 | --- | --- | --- | --- | --- |
 | dxil-spirv | 0 | — | None; see [`patches/dxil-spirv/`](../patches/dxil-spirv/) | — |
 | dxvk | 1 | [`0001`](../patches/dxvk/0001-dxgi-Keep-the-swap-chain-description-when-a-resize-fails.patch) | dxgi: Keep the swap-chain description when a resize fails. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| host/virglrenderer | 3 | [`0001`](../patches/host/virglrenderer/0001-vkr-log-image-creation.patch) | vkr: log failed image creation and memory allocation, with the create-info (diagnostic render server) | [`docs/nvidia.md`](nvidia.md) |
-| | | [`0002`](../patches/host/virglrenderer/0002-vkr-do-not-create-queue-sync-fences-exportable.patch) | vkr: do not create queue-sync fences exportable | [`docs/n5.md`](n5.md) |
-| | | [`0003`](../patches/host/virglrenderer/0003-vkr-drop-export-info-when-importing-a-resource.patch) | vkr: drop export info when importing a resource | [`docs/nvidia.md`](nvidia.md) |
-| host/virglrenderer/diagnostic | 1 | [`0040`](../patches/host/virglrenderer/diagnostic/0040-vkr-trace-venus-commands-and-sync-submit.patch) | vkr: record the Venus command stream and wait on every submission (diagnostics) | [`docs/godot.md`](godot.md) |
-| host/virglrenderer/workaround | 1 | [`0003`](../patches/host/virglrenderer/workaround/0003-vkr-drop-unsupported-feedback-loop-usage.patch) | vkr: retry vkCreateImage and the image-format queries without feedback-loop usage (superseded by mesa/0020; built only with WITH_WORKAROUND=1) | [`docs/nvidia.md`](nvidia.md) |
+| host | 0 | — | None; see [`patches/host/`](../patches/host/) | — |
 | kmd | 4 | [`0001`](../patches/kmd/0001-kmd-r10-copy.patch) | Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD) | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0002`](../patches/kmd/0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch) | viogpu3d: map GDI shadow and staging surfaces cached | [`docs/present.md`](present.md) |
 | | | [`0003`](../patches/kmd/0003-kmd-create-context-for-gdi-devices.patch) | viogpu3d: create a legacy context before opening GDI allocations | [`build/kmd/README.md`](../build/kmd/README.md) |

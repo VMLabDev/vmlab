@@ -1,5 +1,9 @@
 # Acceptance
 
+The recorded QEMU runs and host assets are historical. Current win3d labs
+use the in-tree vmlab-hv bundle and its patched Venus render server.
+See [host.md](host.md) and [release.md](release.md) for current setup.
+
 This page checks the "Done" criteria in `docs/brief.md` one by one, on fresh
 vmlab labs from the local `windows-11` and `windows-10` templates. One script
 produces all of the evidence, and anyone can run it again:
@@ -68,7 +72,7 @@ From nothing, with no manual step:
      `console-<arch>-<api>_probe.png`, at half size.
    - `tests/guest/Get-Dxdiag.ps1 -AsUser` (`dxdiag/dxdiag.json`).
 6. **Collect.** Copies the results out of the guest into
-   `docs/evidence/acceptance/<template>/`, and `tests/e2e/check.py` judges
+   [docs/evidence/acceptance/<template>/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/), and `tests/e2e/check.py` judges
    them (`results.json`, `results.txt`). With `--apps`, the stretch
    applications run after this, so one that hangs the guest cannot cost
    the Done evidence.
@@ -93,7 +97,7 @@ install, and dxdiag's Direct3D status on its own.
 
 ## Host stack
 
-Each run records the host in `docs/evidence/acceptance/<template>/host.txt`.
+Each run records the host in [docs/evidence/acceptance/<template>/host.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/).
 For the 0.1.1-alpha-rc3 runs (2026-10-19), which made every current table
 below except windows-10 on AMD1 (rc2, vmlab 0.28.0-alpha, Resizable BAR
 off):
@@ -101,12 +105,12 @@ off):
 | Item | Value |
 | --- | --- |
 | Host GPUs used for Venus | `AMD1`: AMD Granite Ridge iGPU, PCI `0000:72:00.0`, RADV. `Nvidia1`: RTX 5090, `0000:01:00.0`. `Nvidia2`: RTX 5090, `0000:05:00.0`. vmlab resolves each GPU's render node from its address at run time (`/sys/class/drm/renderD*/device`; the numbers change between boots), and each run's "Host GPU:" line below records the node it had |
-| QEMU | AMD1: 11.1.1 (`qemu-full 11.1.1-1`) from `PATH`. Nvidia1 and Nvidia2: the host config's `qemu_binary`, `~/.local/opt/qemu-vmlab-egl`, QEMU 11.1.50 (VMLabDev/qemu `d8a6048aae11`, the commit `patches/host/PINS` pins) |
+| QEMU | AMD1: 11.1.1 (`qemu-full 11.1.1-1`) from `PATH`. Nvidia1 and Nvidia2: the host config's `qemu_binary`, `~/.local/opt/qemu-vmlab-egl`, QEMU 11.1.50 (VMLabDev/qemu `d8a6048aae11`, the commit [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS) pins) |
 | virglrenderer | 1.3.0 (`1.3.0-2.1`) |
 | Mesa / RADV | 26.2.2 (`mesa 3:26.2.2-2`, `vulkan-radeon 3:26.2.2-2`) |
 | NVIDIA driver | 610.57.04 (`nvidia-utils 610.57.04-1`) |
-| RTX 5090 BAR1 | 32 GiB on both cards: Resizable BAR on since 2026-10-19 (`docs/evidence/rc3/rebar/nvidia-smi-memory.txt`). Earlier NVIDIA runs had 256 MiB |
-| NVIDIA render server | Nvidia1 and Nvidia2: the host config's `qemu_env` `RENDER_SERVER_EXEC_PATH`, `~/.local/opt/virglrenderer-vmlab` (virglrenderer 1.3.0 with `patches/host/virglrenderer/0001` and `0002`) |
+| RTX 5090 BAR1 | 32 GiB on both cards: Resizable BAR on since 2026-10-19 ([docs/evidence/rc3/rebar/nvidia-smi-memory.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/rebar/nvidia-smi-memory.txt)). Earlier NVIDIA runs had 256 MiB |
+| NVIDIA render server | Nvidia1 and Nvidia2: the host config's `qemu_env` `RENDER_SERVER_EXEC_PATH`, `~/.local/opt/virglrenderer-vmlab` (virglrenderer 1.3.0 with [patches/host/virglrenderer/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/virglrenderer/0001-vkr-log-image-creation.patch) and `0002`) |
 | vmlab | 0.30.0-alpha |
 | Kernel | 7.2.3-1-cachyos |
 
@@ -128,16 +132,16 @@ runs, 12 of 12 each.** BAR1 is now 32 GiB on both cards. NVIDIA's Vulkan
 driver offers the device-local, host-visible type on the VRAM heap, so
 `patches/mesa/0070` no longer hides it, and Venus guests on NVIDIA now use
 VRAM-mapped memory. These are the first NVIDIA runs with that behaviour.
-[`docs/evidence/rc3/`](evidence/rc3/README.md) has the release record and
+[docs/evidence/rc3/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md) has the release record and
 every result below in more detail.
 
 - `scripts/release.sh 0.1.1-alpha-rc3` built the package from a fresh clone
-  of `work/rc3` at `ee9ce49`, with the shared test certificate
+  of `work/rc3` at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d), with the shared test certificate
   (`WIN3D_SIGNING_DIR`), on the first attempt. The guest package has the
-  same sources as rc2 (`0d3eb68`); only `patches/host/build-virglrenderer.sh`
+  same sources as rc2 ([0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4)); only [patches/host/build-virglrenderer.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/build-virglrenderer.sh)
   and documentation have changed since. QEMU is the same pinned commit,
   `d8a6048aae11`.
-- Assets (`docs/evidence/rc3/release/SHA256SUMS`):
+- Assets ([docs/evidence/rc3/release/SHA256SUMS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/release/SHA256SUMS)):
   `vmlab-win3d-0.1.1-alpha-rc3-windows-x64.zip`
   `e39728c8d0ee24c81c91e86033b90349b3dc995d8a0ea55d806ba389df59917c`;
   `qemu-vmlab-egl-0.1.1-alpha-rc3-x86_64-linux.tar.zst`
@@ -150,8 +154,8 @@ every result below in more detail.
   `98f1bb9e1ef4b3c4e9140d8dc5c780ca0c605d4d3b273a62f622b3143ce1475b`.
   The zip holds the same `manifest.json`
   (`b36cbda671e192ad27659157d6d19707407d43cf872cc2d3a6f79d61ac770ef0`,
-  commit `ee9ce49`) as the bundle every run installed (`build.txt`, mode
-  `reused`, built at `ee9ce49`).
+  commit [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d)) as the bundle every run installed (`build.txt`, mode
+  `reused`, built at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d)).
 - The NVIDIA runs used helios's host config: the patched QEMU
   (`qemu=/home/wil/.local/opt/qemu-vmlab-egl/bin/qemu-system-x86_64`, the
   pinned commit) and the vmlab render server
@@ -170,12 +174,12 @@ every result below in more detail.
   Rerun in the kept Nvidia2 lab, Blender showed the splash and then the full
   UI in every capture after the second, so it renders. The first launch in
   a fresh guest was most likely still starting
-  ([rc3 README](evidence/rc3/README.md#blenders-kept-capture-is-black-on-windows-11-nvidia2-and-amd1)).
+  ([rc3 README](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#blenders-kept-capture-is-black-on-windows-11-nvidia2-and-amd1)).
 - **The first windows-10 Nvidia1 attempt hung in `vmlab cp`** during the
   install: 16 of 29 files copied, with no progress for 20 minutes. It was
   stopped and rerun in a fresh lab, which passed. That is a vmlab problem; the
   evidence for a vmlab report is in
-  [`docs/evidence/rc3/vmlab-cp-hang/`](evidence/rc3/vmlab-cp-hang/README.md).
+  [docs/evidence/rc3/vmlab-cp-hang/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/vmlab-cp-hang/README.md).
 - **Start-up was slow on windows-11**, on AMD1 as well as NVIDIA: the four
   windows-11 runs, the compatibility sweep and a load lab booted together,
   and some first probe launches waited 8 to 53 s for Defender's cloud check
@@ -186,7 +190,7 @@ every result below in more detail.
   cards, OpenGL at 65 to 68 and D3D12 at 46 to 56. In rc1 the windows-11
   D3D9 probe ran at 43 to 52 fps on NVIDIA. On windows-10 Nvidia1, D3D9
   now runs at 51 to 52 fps, up from 27 and 46
-  ([rc3 README](evidence/rc3/README.md#e2e-runs)).
+  ([rc3 README](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#e2e-runs)).
 
 The DirectDraw fullscreen and fixed-function suites ran on Nvidia1, with
 44 to 57 flips per second at 32 bpp (26 to 44 in rc1) and the known
@@ -197,11 +201,11 @@ Nvidia2**, up from 5 of 12
 run, the sweep and a probe loop, then a 15-minute stage with three probe
 loops. The host logged **no `can't alloc VA space` line and no Xid**.
 BAR1 peaked at 764 MiB of 32 GiB, and all 116 probe runs of the final
-stage passed ([rc3 README](evidence/rc3/README.md#rebar-load-check)).
+stage passed ([rc3 README](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#rebar-load-check)).
 
 The rc3 runs replaced the evidence in `windows-11-nvidia1/`,
 `windows-11-nvidia2/`, `windows-10-nvidia1/` and `windows-11/` (AMD1). The
-earlier runs are in git history at `ee9ce49`: rc1 on Nvidia1, the nvva
+earlier runs are in git history at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d): rc1 on Nvidia1, the nvva
 proof run on Nvidia2 and rc2 on AMD1.
 
 ### Release candidate 0.1.1-alpha-rc2 (AMD1)
@@ -214,13 +218,13 @@ Resizable BAR change (`docs/plan.md`, D5), as release candidate rc3
 evidence; rc2's `windows-10/` evidence stands.
 
 - `scripts/release.sh 0.1.1-alpha-rc2` built the package from a fresh clone
-  of `main` at `0d3eb68`, with the shared test certificate
+  of `main` at [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4), with the shared test certificate
   (`WIN3D_SIGNING_DIR`). Since rc1 it adds Mesa patches 0031, 0032, 0043,
   0044, 0060, 0065 to 0067, 0070, 0075, 0080, 0085, 0086 and 0090 to 0092,
   vkd3d-proton 0006, and the render-server asset (virglrenderer 1.3.0 with
-  `patches/host/virglrenderer/0001` and `0002`). QEMU is the same pinned
-  commit, `d8a6048aae11`. `docs/evidence/rc2/` has the release record.
-- Assets (`docs/evidence/rc2/release/SHA256SUMS`):
+  [patches/host/virglrenderer/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/virglrenderer/0001-vkr-log-image-creation.patch) and `0002`). QEMU is the same pinned
+  commit, `d8a6048aae11`. [docs/evidence/rc2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc2/) has the release record.
+- Assets ([docs/evidence/rc2/release/SHA256SUMS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc2/release/SHA256SUMS)):
   `vmlab-win3d-0.1.1-alpha-rc2-windows-x64.zip`
   `16450f1959179df0957f088b4dabe845b4387e0cb17e837e2f70e80822a1bee0`;
   `qemu-vmlab-egl-0.1.1-alpha-rc2-x86_64-linux.tar.zst`
@@ -231,9 +235,9 @@ evidence; rc2's `windows-10/` evidence stands.
   `0ea1aad50a2b3dc8c8d81d64e1f9a3bc3836f5ba8b753265ee5ab4182dbac6e0`.
   The zip holds the same `manifest.json`
   (`7de55b27748d335e0cd47d4b0d52c0a8faeb5a3295ac8de87495b5d0fac658f2`,
-  commit `0d3eb68`) as the bundle both runs installed.
+  commit [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4)) as the bundle both runs installed.
 - Both runs reused that bundle (`build.txt`, mode `reused`, built at
-  `0d3eb68`). They record commit `66809ce`, which adds only documentation.
+  [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4)). They record commit [66809ce](https://github.com/VMLabDev/vmlab-win3d/commit/66809ce4ec3ff77158503fd64cd252c2c5d80e19), which adds only documentation.
 - The two runs shared AMD1: they started 20 s apart, so their probes ran
   with two VMs on the iGPU. The windows-11 D3D12 and x86 D3D9 rates are
   lower than rc1's for that reason (table below); the probes still pass.
@@ -264,7 +268,7 @@ same step. On windows-10 every probe started in under 0.5 s.
 The DirectDraw fullscreen and both D3D9 fixed-function suites ran in the
 kept windows-11 lab with the results of rc1 or better, and the
 compatibility sweep, in its own lab, passed 12 of 12 on AMD1, up from 10
-of 12 ([`docs/evidence/rc2/`](evidence/rc2/README.md),
+of 12 ([docs/evidence/rc2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc2/README.md),
 [`compat.md`](compat.md#release-candidate-011-alpha-rc2-on-amd1)).
 
 ### Release candidate 0.1.1-alpha-rc1
@@ -274,13 +278,13 @@ of 12 ([`docs/evidence/rc2/`](evidence/rc2/README.md),
 All five ran one package:
 
 - `scripts/release.sh 0.1.1-alpha-rc1` built it from a fresh clone of commit
-  `0ee5ba1` (main at `82d8e51`, plus `installer/VERSION` 0.1.1 and a
+  [0ee5ba1](https://github.com/VMLabDev/vmlab-win3d/commit/0ee5ba149e10b7671aef8ab3db71f187c53d895c) (main at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75), plus `installer/VERSION` 0.1.1 and a
   `release.sh` version pattern that accepts `-rc1`), with the shared test
   certificate (`WIN3D_SIGNING_DIR`). Mesa patches 0001 to 0017, 0020 to
   0027, 0030, 0035 and 0040 to 0042; KMD patches 0001 and 0002; the
   installer's FeatureScore and device pin; QEMU at the pinned master-based
-  commit. `docs/evidence/rc/` has the release record.
-- Assets (`docs/evidence/rc/release/SHA256SUMS`):
+  commit. [docs/evidence/rc/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/) has the release record.
+- Assets ([docs/evidence/rc/release/SHA256SUMS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/release/SHA256SUMS)):
   `vmlab-win3d-0.1.1-alpha-rc1-windows-x64.zip`
   `150406672d6e43373c643e940acf97337e058e094f45ea2c4eed2660e85205f0`;
   `qemu-vmlab-egl-0.1.1-alpha-rc1-x86_64-linux.tar.zst`
@@ -291,7 +295,7 @@ All five ran one package:
   (`b9523c1b4c1127300288530ef684434fa56d947057b780b01ac2ce2d6c097339`) as
   the bundle the runs installed.
 - Every run reused that bundle (`build.txt`, mode `reused`, built at
-  `0ee5ba1`). Runs that started after `0c0788c` record that commit; it
+  [0ee5ba1](https://github.com/VMLabDev/vmlab-win3d/commit/0ee5ba149e10b7671aef8ab3db71f187c53d895c)). Runs that started after [0c0788c](https://github.com/VMLabDev/vmlab-win3d/commit/0c0788ccbae9964f95a13702af90aacebdc8f52a) record that commit; it
   changes only `tests/e2e/` (below).
 
 | Template | AMD1 | Nvidia1 | Nvidia2 |
@@ -300,9 +304,9 @@ All five ran one package:
 | windows-10 | **12 of 12**; apps render | **12 of 12**; apps render | not run |
 
 The rc2 and rc3 runs replaced rc1's evidence. rc1's AMD1 evidence is in
-git history at `0d3eb68`, and its Nvidia1 evidence at `ee9ce49`. The rc1
-Nvidia2 run, with its apps, is in git history at `f1c5219`. The nvva
-worker's proof run on Nvidia2 (package built at `a9579f1`, Mesa 0070 and
+git history at [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4), and its Nvidia1 evidence at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d). The rc1
+Nvidia2 run, with its apps, is in git history at [f1c5219](https://github.com/VMLabDev/vmlab-win3d/commit/f1c5219217a4d4c9317fb2d48a423dce0b6a9fe0). The nvva
+worker's proof run on Nvidia2 (package built at [a9579f1](https://github.com/VMLabDev/vmlab-win3d/commit/a9579f13c64cb2fea28114541480fc6e64fae7df), Mesa 0070 and
 0086, no apps step; [`nvva.md`](nvva.md)) replaced it, and rc3 then
 replaced that run.
 
@@ -312,7 +316,7 @@ the AMD1 and Nvidia2 runs were restarted once:
 - Run in parallel, the first windows-11 runs on AMD1 and Nvidia2 wrote the
   same download file, and the LunarG runtime failed its sha256 check. They
   were stopped before the install, their labs destroyed, and both rerun
-  from a fresh lab. `0c0788c` gives each run its own download file and its
+  from a fresh lab. [0c0788c](https://github.com/VMLabDev/vmlab-win3d/commit/0c0788ccbae9964f95a13702af90aacebdc8f52a) gives each run its own download file and its
   own apps staging directory.
 - Helios's direct downloads from Microsoft and blender.org ran at about
   1 KB/s that night. The three windows-11 runs reached `--apps` before the
@@ -328,7 +332,7 @@ the AMD1 and Nvidia2 runs were restarted once:
 
 Host GPU: AMD1, /dev/dri/renderD129 0000:72:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Granite Ridge [Radeon Graphics] (rev c1). QEMU: QEMU emulator version 11.1.1 (from PATH).
 
-Run 2026-10-19T17:54:59+10:00 at commit `ee9ce49fefc7`, template `x86_64/windows-11@26100.1742.5`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: `docs/evidence/acceptance/windows-11/`; `results.txt` is the script's own table.
+Run 2026-10-19T17:54:59+10:00 at commit [ee9ce49fefc7](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d), template `x86_64/windows-11@26100.1742.5`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: [docs/evidence/acceptance/windows-11/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11/); `results.txt` is the script's own table.
 
 | Done item | Check | Result | Evidence | Note |
 | --- | --- | --- | --- | --- |
@@ -357,7 +361,7 @@ Run 2026-10-19T17:54:59+10:00 at commit `ee9ce49fefc7`, template `x86_64/windows
 
 Host GPU: AMD1, /dev/dri/renderD129 0000:72:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Granite Ridge [Radeon Graphics] (rev c1). QEMU: QEMU emulator version 11.1.1 (from PATH).
 
-Run 2026-10-19T13:06:39+10:00 at commit `66809ce4ec3f`, template `x86_64/windows-10@19045.2006.8`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: `docs/evidence/acceptance/windows-10/`; `results.txt` is the script's own table.
+Run 2026-10-19T13:06:39+10:00 at commit [66809ce4ec3f](https://github.com/VMLabDev/vmlab-win3d/commit/66809ce4ec3ff77158503fd64cd252c2c5d80e19), template `x86_64/windows-10@19045.2006.8`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: [docs/evidence/acceptance/windows-10/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10/); `results.txt` is the script's own table.
 
 | Done item | Check | Result | Evidence | Note |
 | --- | --- | --- | --- | --- |
@@ -386,7 +390,7 @@ Run 2026-10-19T13:06:39+10:00 at commit `66809ce4ec3f`, template `x86_64/windows
 
 Host GPU: Nvidia1, /dev/dri/renderD128 0000:01:00.0 VGA compatible controller: NVIDIA Corporation GB202 [GeForce RTX 5090] (rev a1). QEMU: /home/wil/.local/opt/qemu-vmlab-egl/bin/qemu-system-x86_64, QEMU emulator version 11.1.50 (vmlab d8a6048aae11) (the Nvidia1 qemu_binary).
 
-Run 2026-10-19T18:34:28+10:00 at commit `ee9ce49fefc7`, template `x86_64/windows-10@19045.2006.8`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: `docs/evidence/acceptance/windows-10-nvidia1/`; `results.txt` is the script's own table.
+Run 2026-10-19T18:34:28+10:00 at commit [ee9ce49fefc7](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d), template `x86_64/windows-10@19045.2006.8`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: [docs/evidence/acceptance/windows-10-nvidia1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10-nvidia1/); `results.txt` is the script's own table.
 
 | Done item | Check | Result | Evidence | Note |
 | --- | --- | --- | --- | --- |
@@ -415,7 +419,7 @@ Run 2026-10-19T18:34:28+10:00 at commit `ee9ce49fefc7`, template `x86_64/windows
 
 Host GPU: Nvidia1, /dev/dri/renderD128 0000:01:00.0 VGA compatible controller: NVIDIA Corporation GB202 [GeForce RTX 5090] (rev a1). QEMU: /home/wil/.local/opt/qemu-vmlab-egl/bin/qemu-system-x86_64, QEMU emulator version 11.1.50 (vmlab d8a6048aae11) (the Nvidia1 qemu_binary).
 
-Run 2026-10-19T17:54:47+10:00 at commit `ee9ce49fefc7`, template `x86_64/windows-11@26100.1742.5`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: `docs/evidence/acceptance/windows-11-nvidia1/`; `results.txt` is the script's own table.
+Run 2026-10-19T17:54:47+10:00 at commit [ee9ce49fefc7](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d), template `x86_64/windows-11@26100.1742.5`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: [docs/evidence/acceptance/windows-11-nvidia1/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11-nvidia1/); `results.txt` is the script's own table.
 
 | Done item | Check | Result | Evidence | Note |
 | --- | --- | --- | --- | --- |
@@ -444,7 +448,7 @@ Run 2026-10-19T17:54:47+10:00 at commit `ee9ce49fefc7`, template `x86_64/windows
 
 Host GPU: Nvidia2, /dev/dri/renderD130 0000:05:00.0 VGA compatible controller: NVIDIA Corporation GB202 [GeForce RTX 5090] (rev a1). QEMU: /home/wil/.local/opt/qemu-vmlab-egl/bin/qemu-system-x86_64, QEMU emulator version 11.1.50 (vmlab d8a6048aae11) (the Nvidia2 qemu_binary).
 
-Run 2026-10-19T17:54:47+10:00 at commit `ee9ce49fefc7`, template `x86_64/windows-11@26100.1742.5`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: `docs/evidence/acceptance/windows-11-nvidia2/`; `results.txt` is the script's own table.
+Run 2026-10-19T17:54:47+10:00 at commit [ee9ce49fefc7](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d), template `x86_64/windows-11@26100.1742.5`. **PASS: 12 of 12 Done checks pass** (run stage: ok). Evidence: [docs/evidence/acceptance/windows-11-nvidia2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11-nvidia2/); `results.txt` is the script's own table.
 
 | Done item | Check | Result | Evidence | Note |
 | --- | --- | --- | --- | --- |
@@ -478,7 +482,7 @@ applications, unmodified, from official downloads pinned by URL and sha256 in
 (`-Raw`) for 30 to 90 s and is then closed. `vmlab vm screenshot` captures
 the console every 4 s, and the capture from two thirds of the way through is
 kept. These results do not count towards the exit status. Evidence:
-`docs/evidence/acceptance/<template>/apps/`.
+[docs/evidence/acceptance/<template>/apps/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/).
 
 The prerequisites are installed system-wide, as a game installer would do
 it: the DirectX End-User Runtime from the SDK's own `Redist\DXSETUP.exe
@@ -486,14 +490,14 @@ it: the DirectX End-User Runtime from the SDK's own `Redist\DXSETUP.exe
 runtime (`MSVCR100.dll`) that the SDK samples import (`apps/dxsetup.txt`).
 
 The 0.1.1-alpha-rc1 runs, on five labs. Each cell names the capture in
-`docs/evidence/acceptance/<run>/apps/`. The rc2 runs on AMD1 repeated the
+[docs/evidence/acceptance/<run>/apps/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/). The rc2 runs on AMD1 repeated the
 AMD1 cells on both templates with the same result: every application
 renders, ran until it was closed, and loaded no app-local graphics DLL.
 The rc3 runs repeated the NVIDIA cells and windows-11 on AMD1 with
 Resizable BAR on. Every application rendered and loaded no app-local graphics DLL. On
 windows-11 Nvidia2 and AMD1, Blender's kept capture shows its window
 before it had drawn, and a rerun in the Nvidia2 lab rendered the full UI
-([rc3](evidence/rc3/README.md#blenders-kept-capture-is-black-on-windows-11-nvidia2-and-amd1)).
+([rc3](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#blenders-kept-capture-is-black-on-windows-11-nvidia2-and-amd1)).
 The captures in `windows-11/apps/` and the `*-nvidia*` directories are
 now rc3's, and `windows-10/apps/` is rc2's.
 
@@ -508,7 +512,7 @@ now rc3's, and `windows-10/apps/` is rc2's.
 
 On NVIDIA every application ran to its time limit. The host kernel logged
 no Xid during any rc run on Nvidia1 or Nvidia2
-(`docs/evidence/rc/host-kernel-nvrm.txt`). Before 0.1.1, `BasicHLSL` hung
+([docs/evidence/rc/host-kernel-nvrm.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/host-kernel-nvrm.txt)). Before 0.1.1, `BasicHLSL` hung
 the guest with Xid 69 on both cards ([`xid69.md`](xid69.md)), so the NVIDIA
 runs had no application results.
 
@@ -517,7 +521,7 @@ running when it was closed (`timed_out: true` in `<app>.run.json`). The
 module lists are in `<app>.modules.txt`.
 
 **Both D3D11 samples now render in the e2e run on both templates.** The
-earlier acceptance runs (`b3e1798`, `cb4d53c`) recorded both as failures.
+earlier acceptance runs ([b3e1798](https://github.com/VMLabDev/vmlab-win3d/commit/b3e179837e76ff7ebf013ce90e60a586af5138a2), [cb4d53c](https://github.com/VMLabDev/vmlab-win3d/commit/cb4d53c67556805416790be6cf6246781a003d29)) recorded both as failures.
 `docs/d3d11-apps.md` found two causes:
 
 - SubD11 hit three UMD bugs, fixed by `patches/mesa/0015` to `0017`.
@@ -600,7 +604,7 @@ Fixed after the earlier runs; the final runs exercise part of the fix:
 - **`tests/guest/Run-Probe.ps1`** failed on `-Raw` with no `-ArgumentList`,
   because `New-ScheduledTaskAction` rejects an empty `-Argument`. An exit
   code of 0x80000000 or above, such as 0xC0000135 for a missing DLL, threw an
-  Int32 conversion error instead of being reported. Commit `cca767b` passes
+  Int32 conversion error instead of being reported. Commit [cca767b](https://github.com/VMLabDev/vmlab-win3d/commit/cca767b99eb31340488928a85fa25f6b479ff6cb) passes
   `-Argument` only when there is one, and reinterprets the unsigned task
   result as the signed exit code (run.json also gets `exit_code_hex`). Both
   were checked without a guest, in PowerShell 7.4.2 in Docker: all guest
@@ -652,38 +656,38 @@ fixed in this package:
 - The D3D9 probe ran at about 20 fps ([`present.md`](present.md)).
 
 The 0.1.0-alpha NVIDIA evidence (vmlab 0.27 and 0.28, package built at
-`08ff884` and `99ad0c1`, the stock-QEMU Nvidia2 run with its black
-console) is in git history at `82d8e51`.
+[08ff884](https://github.com/VMLabDev/vmlab-win3d/commit/08ff8848dea6defa961a994cbfc7fed8a6d70656) and [99ad0c1](https://github.com/VMLabDev/vmlab-win3d/commit/99ad0c1faee68358bd423fa06548596989f1623c), the stock-QEMU Nvidia2 run with its black
+console) is in git history at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75).
 
 ## Evidence index
 
-Every directory under `docs/evidence/`. "Historical" marks evidence from the
+Every directory under [docs/evidence/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/). "Historical" marks evidence from the
 vmlab 0.23 era, when labs needed `qemu_args` workarounds (`docs/host.md`). It
 is still valid for what it shows, but the package and the lab setup have
 changed since.
 
 | Directory | What it proves | vmlab | Package or commit | Status |
 | --- | --- | --- | --- | --- |
-| [`acceptance/windows-11/`](evidence/acceptance/windows-11/) | Done items 1 and 2 on a fresh `windows-11` lab on AMD1: install, vulkaninfo, the D3D9, D3D11, D3D12, OpenGL and Vulkan probes on the console, dxdiag, 12 of 12; the stretch apps in `apps/` (Blender's kept capture black, see rc3) | 0.30.0-alpha, `host_gpu = "AMD1"` | 0.1.1-alpha-rc3, the bundle `scripts/release.sh` built at `ee9ce49`; rc2's run is in git history at `ee9ce49` | Current |
-| [`acceptance/windows-10/`](evidence/acceptance/windows-10/) | The same on a fresh `windows-10` lab on AMD1: 12 of 12; apps, Blender opaque | 0.28.0-alpha, `host_gpu = "AMD1"` | 0.1.1-alpha-rc2 (`0d3eb68`), run at `66809ce` | Current |
-| [`acceptance/windows-11-nvidia1/`](evidence/acceptance/windows-11-nvidia1/) | The same on the first RTX 5090 with Resizable BAR, driver 615.78, the 0.1.2-alpha QEMU and render server installed from their release tarballs: 12 of 12, one Venus device; every app renders, no Xid | 0.31.0-alpha, `host_gpu = "Nvidia1"` | 0.1.2-alpha (`45ec46c`), the release build; rc3's run is in git history at `45ec46c` | Current |
-| [`acceptance/windows-10-nvidia1/`](evidence/acceptance/windows-10-nvidia1/) | The same on a fresh `windows-10` lab on the first RTX 5090 with Resizable BAR: 12 of 12, one Venus device; every app renders, Blender opaque | 0.30.0-alpha, `host_gpu = "Nvidia1"` | 0.1.1-alpha-rc3 (`ee9ce49`), lab `win3d-rc3-w10-nvidia1b` | Current |
-| [`acceptance/windows-11-nvidia2/`](evidence/acceptance/windows-11-nvidia2/) | The same on the second RTX 5090 with Resizable BAR: 12 of 12, one Venus device, the PCI filter on `0000:05:00.0`, with two other loaded VMs on the card (the ReBAR load check); apps render, Blender's kept capture black (see rc3) | 0.30.0-alpha, `host_gpu = "Nvidia2"` | 0.1.1-alpha-rc3 (`ee9ce49`); the nvva proof run is in git history at `ee9ce49` | Current |
-| [`rc3/`](evidence/rc3/README.md) | Release candidate 0.1.1-alpha-rc3 on NVIDIA with Resizable BAR: the release record (five asset hashes, notes, `BUILDINFO`, the host assets' install check), DirectDraw fullscreen and both D3D9 fixed-function suites on Nvidia1, the ReBAR load check (three VMs on Nvidia2, BAR1 and NVRM monitor), the Blender rerun and the `vmlab cp` hang | 0.30.0-alpha | `ee9ce49` | Current |
-| [`portable/`](evidence/portable/README.md) | The host assets built in a Debian 12 container with a minimal QEMU feature set: highest symbol `GLIBC_2.34`, 10 `NEEDED` libraries with virglrenderer 1.3.0 bundled; `install.sh --check`, `--version` and QMP pass on Debian 12 and 13, Ubuntu 24.04, Fedora 44, Arch and Tumbleweed, and Ubuntu 22.04 is refused; windows-11 e2e 12 of 12 on Nvidia1 with both tarballs; Zeus not checked | 0.31.0-alpha, `host_gpu = "Nvidia1"` | 0.1.1-alpha-portable1, built at `53b8044`, unpublished | Current |
-| [`compat/rc3-nvidia2/`](evidence/compat/rc3-nvidia2/) | The compatibility sweep on Nvidia2 with the rc3 package, 12 of 12 ([`compat.md`](compat.md#release-candidate-011-alpha-rc3-on-nvidia2)) | 0.30.0-alpha, `host_gpu = "Nvidia2"` | `ee9ce49` | Current |
-| [`rc2/`](evidence/rc2/README.md) | Release candidate 0.1.1-alpha-rc2 on AMD1: the release record (five asset hashes, notes, QEMU and render-server `BUILDINFO`, the host assets' install check), DirectDraw fullscreen rates and both D3D9 fixed-function suites with that package | 0.28.0-alpha | `0d3eb68` | Current |
-| [`compat/rc2-amd1/`](evidence/compat/rc2-amd1/) | The compatibility sweep on AMD1 with the rc2 package ([`compat.md`](compat.md)) | 0.28.0-alpha, `host_gpu = "AMD1"` | `0d3eb68` | Current |
-| [`rc/`](evidence/rc/README.md) | Release candidate 0.1.1-alpha-rc1: the release record (asset hashes, notes, QEMU `BUILDINFO`), DirectDraw fullscreen rates and the D3D9 fixed-function coverage with that package on AMD1 and Nvidia1, and the host kernel's NVRM lines during the runs | 0.28.0-alpha | `0ee5ba1` | Current |
-| [`vulkaninfo/`](evidence/vulkaninfo/README.md) | The package's patched `vulkaninfo.exe` (`patches/vulkan-tools/0001`) lists Venus and exits 0, x64 and x86 | 0.24.0-alpha | `78fc688` (`work/fix-vulkaninfo`) | Current |
-| [`dxdiag/`](evidence/dxdiag/) | dxdiag's DDraw and AGP status before and after `patches/mesa/0012` to `0014`, with `ddcaps` DirectDraw checks ([`dxdiag.md`](dxdiag.md)) | 0.24.0-alpha | before: `main` at `be2ef9b`; after: `deb2585` | Current |
-| [`d3d11-apps/`](evidence/d3d11-apps/) | SubD11 and BasicHLSL11: the causes, `patches/mesa/0015` to `0017`, the DXUT window bug and the `D3D11Ref.dll` workaround ([`d3d11-apps.md`](d3d11-apps.md)) | 0.24.0-alpha | `5fd206d` | Current |
-| [`nvidia/`](evidence/nvidia/) | The two RTX 5090 faults and their fixes, `patches/mesa/0020` and `patches/host/qemu/0001`; `05-amd-regression/` shows no AMD regression ([`nvidia.md`](nvidia.md)) | 0.24.0-alpha, isolated supervisor | `bea2a93` | Current for the diagnosis; `01-` to `03-` are diagnostic steps. The acceptance runs above replace `04-guest-fix/` as the proof that NVIDIA works |
-| [`zeus/`](evidence/zeus/) | Intel Iris Xe fails on `main` and passes with `patches/mesa/0021`; the AMD regression run with 0021; the RTX 4060 failure ([`zeus.md`](zeus.md)) | 0.24.0-alpha | `main` at `db07da3`; 0021 at `1bbbfe8` | Current |
-| [`package/`](evidence/package/README.md) | A fresh-clone build, then install, probes, rerun, uninstall back to the baseline and reinstall, on a fresh `windows-11` lab | 0.23, with workarounds (`lab-vmlab.wcl`) | `f7fa236` (`work/package`) | **Historical.** The bundle predates `patches/vulkan-tools/0001` and Mesa 0012 on, so the file hashes it quotes are not today's. The uninstall evidence is still the only uninstall run |
-| [`kmd/`](evidence/kmd/README.md) | The KMD's test signature is accepted and the driver loads, with no Code Integrity events | 0.23 (`display = "virtio-vga-gl"`) | `e166465` | **Historical**: a kernel-only install with no UMDs, so the device showed problem code 43; the full package's device has problem code 0 (`acceptance/*/installed-gpu-state.json`). Signing is unchanged since |
-| [`probes/`](evidence/probes/README.md) | The probes and guest scripts work on Microsoft's software renderers, before any driver from this repository | 0.23, no GPU | `26ca683` | **Historical** |
-| [`host/`](evidence/host/) | The host-probe captures `host.md` cites: which QEMU, display and loader settings Venus needs | 0.23, with `qemu_args` variants | `d1bad91` | **Historical**: vmlab 0.24 emits these settings itself |
+| [`acceptance/windows-11/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11) | Done items 1 and 2 on a fresh `windows-11` lab on AMD1: install, vulkaninfo, the D3D9, D3D11, D3D12, OpenGL and Vulkan probes on the console, dxdiag, 12 of 12; the stretch apps in `apps/` (Blender's kept capture black, see rc3) | 0.30.0-alpha, `host_gpu = "AMD1"` | 0.1.1-alpha-rc3, the bundle `scripts/release.sh` built at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d); rc2's run is in git history at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d) | Current |
+| [`acceptance/windows-10/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10) | The same on a fresh `windows-10` lab on AMD1: 12 of 12; apps, Blender opaque | 0.28.0-alpha, `host_gpu = "AMD1"` | 0.1.1-alpha-rc2 ([0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4)), run at [66809ce](https://github.com/VMLabDev/vmlab-win3d/commit/66809ce4ec3ff77158503fd64cd252c2c5d80e19) | Current |
+| [`acceptance/windows-11-nvidia1/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11-nvidia1) | The same on the first RTX 5090 with Resizable BAR, driver 615.78, the 0.1.2-alpha QEMU and render server installed from their release tarballs: 12 of 12, one Venus device; every app renders, no Xid | 0.31.0-alpha, `host_gpu = "Nvidia1"` | 0.1.2-alpha ([45ec46c](https://github.com/VMLabDev/vmlab-win3d/commit/45ec46ca73a5d64b8e0cd956fe7748da2d0c0e17)), the release build; rc3's run is in git history at [45ec46c](https://github.com/VMLabDev/vmlab-win3d/commit/45ec46ca73a5d64b8e0cd956fe7748da2d0c0e17) | Current |
+| [`acceptance/windows-10-nvidia1/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10-nvidia1) | The same on a fresh `windows-10` lab on the first RTX 5090 with Resizable BAR: 12 of 12, one Venus device; every app renders, Blender opaque | 0.30.0-alpha, `host_gpu = "Nvidia1"` | 0.1.1-alpha-rc3 ([ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d)), lab `win3d-rc3-w10-nvidia1b` | Current |
+| [`acceptance/windows-11-nvidia2/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11-nvidia2) | The same on the second RTX 5090 with Resizable BAR: 12 of 12, one Venus device, the PCI filter on `0000:05:00.0`, with two other loaded VMs on the card (the ReBAR load check); apps render, Blender's kept capture black (see rc3) | 0.30.0-alpha, `host_gpu = "Nvidia2"` | 0.1.1-alpha-rc3 ([ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d)); the nvva proof run is in git history at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d) | Current |
+| [`rc3/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md) | Release candidate 0.1.1-alpha-rc3 on NVIDIA with Resizable BAR: the release record (five asset hashes, notes, `BUILDINFO`, the host assets' install check), DirectDraw fullscreen and both D3D9 fixed-function suites on Nvidia1, the ReBAR load check (three VMs on Nvidia2, BAR1 and NVRM monitor), the Blender rerun and the `vmlab cp` hang | 0.30.0-alpha | [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d) | Current |
+| [`portable/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/portable/README.md) | The host assets built in a Debian 12 container with a minimal QEMU feature set: highest symbol `GLIBC_2.34`, 10 `NEEDED` libraries with virglrenderer 1.3.0 bundled; `install.sh --check`, `--version` and QMP pass on Debian 12 and 13, Ubuntu 24.04, Fedora 44, Arch and Tumbleweed, and Ubuntu 22.04 is refused; windows-11 e2e 12 of 12 on Nvidia1 with both tarballs; Zeus not checked | 0.31.0-alpha, `host_gpu = "Nvidia1"` | 0.1.1-alpha-portable1, built at [53b8044](https://github.com/VMLabDev/vmlab-win3d/commit/53b804494f99ce52ff1f2acb06856b30e4aa862a), unpublished | Current |
+| [`compat/rc3-nvidia2/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2) | The compatibility sweep on Nvidia2 with the rc3 package, 12 of 12 ([`compat.md`](compat.md#release-candidate-011-alpha-rc3-on-nvidia2)) | 0.30.0-alpha, `host_gpu = "Nvidia2"` | [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d) | Current |
+| [`rc2/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc2/README.md) | Release candidate 0.1.1-alpha-rc2 on AMD1: the release record (five asset hashes, notes, QEMU and render-server `BUILDINFO`, the host assets' install check), DirectDraw fullscreen rates and both D3D9 fixed-function suites with that package | 0.28.0-alpha | [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4) | Current |
+| [`compat/rc2-amd1/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1) | The compatibility sweep on AMD1 with the rc2 package ([`compat.md`](compat.md)) | 0.28.0-alpha, `host_gpu = "AMD1"` | [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4) | Current |
+| [`rc/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/README.md) | Release candidate 0.1.1-alpha-rc1: the release record (asset hashes, notes, QEMU `BUILDINFO`), DirectDraw fullscreen rates and the D3D9 fixed-function coverage with that package on AMD1 and Nvidia1, and the host kernel's NVRM lines during the runs | 0.28.0-alpha | [0ee5ba1](https://github.com/VMLabDev/vmlab-win3d/commit/0ee5ba149e10b7671aef8ab3db71f187c53d895c) | Current |
+| [`vulkaninfo/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/vulkaninfo/README.md) | The package's patched `vulkaninfo.exe` (`patches/vulkan-tools/0001`) lists Venus and exits 0, x64 and x86 | 0.24.0-alpha | [78fc688](https://github.com/VMLabDev/vmlab-win3d/commit/78fc688ec4ae7998d7fab978cd4de3cefed55603) (`work/fix-vulkaninfo`) | Current |
+| [`dxdiag/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag) | dxdiag's DDraw and AGP status before and after `patches/mesa/0012` to `0014`, with `ddcaps` DirectDraw checks ([`dxdiag.md`](dxdiag.md)) | 0.24.0-alpha | before: `main` at [be2ef9b](https://github.com/VMLabDev/vmlab-win3d/commit/be2ef9b0ece9d98a33a01ce049dc8fbe846fb6b8); after: [deb2585](https://github.com/VMLabDev/vmlab-win3d/commit/deb258516ab8cdb2c1b48623c01dcb0317ee2ef2) | Current |
+| [`d3d11-apps/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d11-apps) | SubD11 and BasicHLSL11: the causes, `patches/mesa/0015` to `0017`, the DXUT window bug and the `D3D11Ref.dll` workaround ([`d3d11-apps.md`](d3d11-apps.md)) | 0.24.0-alpha | [5fd206d](https://github.com/VMLabDev/vmlab-win3d/commit/5fd206d3c2fd259ad4a2a7e68394771ab9e1cf57) | Current |
+| [`nvidia/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvidia) | The two RTX 5090 faults and their fixes, `patches/mesa/0020` and [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/qemu/0001); `05-amd-regression/` shows no AMD regression ([`nvidia.md`](nvidia.md)) | 0.24.0-alpha, isolated supervisor | [bea2a93](https://github.com/VMLabDev/vmlab-win3d/commit/bea2a93d3ccbfff8b94e321541d573291bc8b4d1) | Current for the diagnosis; `01-` to `03-` are diagnostic steps. The acceptance runs above replace `04-guest-fix/` as the proof that NVIDIA works |
+| [`zeus/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus) | Intel Iris Xe fails on `main` and passes with `patches/mesa/0021`; the AMD regression run with 0021; the RTX 4060 failure ([`zeus.md`](zeus.md)) | 0.24.0-alpha | `main` at [db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91); 0021 at [1bbbfe8](https://github.com/VMLabDev/vmlab-win3d/commit/1bbbfe887760c63c24fd423cd04f8fc18319018e) | Current |
+| [`package/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md) | A fresh-clone build, then install, probes, rerun, uninstall back to the baseline and reinstall, on a fresh `windows-11` lab | 0.23, with workarounds (`lab-vmlab.wcl`) | [f7fa236](https://github.com/VMLabDev/vmlab-win3d/commit/f7fa236b421a5467531c19da348738774f252698) (`work/package`) | **Historical.** The bundle predates `patches/vulkan-tools/0001` and Mesa 0012 on, so the file hashes it quotes are not today's. The uninstall evidence is still the only uninstall run |
+| [`kmd/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/README.md) | The KMD's test signature is accepted and the driver loads, with no Code Integrity events | 0.23 (`display = "virtio-vga-gl"`) | [e166465](https://github.com/VMLabDev/vmlab-win3d/commit/e1664656b92d809c9f771b853e94128b4f89316f) | **Historical**: a kernel-only install with no UMDs, so the device showed problem code 43; the full package's device has problem code 0 ([acceptance/*/installed-gpu-state.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10-nvidia1/installed-gpu-state.json)). Signing is unchanged since |
+| [`probes/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/probes/README.md) | The probes and guest scripts work on Microsoft's software renderers, before any driver from this repository | 0.23, no GPU | [26ca683](https://github.com/VMLabDev/vmlab-win3d/commit/26ca683dcf14e1f3688d346579ad18b6ec7433dc) | **Historical** |
+| [`host/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host) | The host-probe captures `host.md` cites: which QEMU, display and loader settings Venus needs | 0.23, with `qemu_args` variants | [d1bad91](https://github.com/VMLabDev/vmlab-win3d/commit/d1bad91ba6285100b391080e9ab424da8435300e) | **Historical**: vmlab 0.24 emits these settings itself |
 
 ## Done item 3
 
@@ -692,8 +696,8 @@ The script does not check item 3. These are the documents that answer it:
 | Topic | Document |
 | --- | --- |
 | Install | `docs/install.md` |
-| Uninstall | `docs/uninstall.md` (the run that proves it: `docs/evidence/package/`) |
-| Component stack and upstream pins | `docs/stack.md` (pin and patch tables generated from `build/*/PINS`, `patches/host/PINS` and `patches/`; `scripts/pins-table.py --check`) and `build/*/README.md` |
+| Uninstall | `docs/uninstall.md` (the run that proves it: [docs/evidence/package/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/)) |
+| Component stack and upstream pins | `docs/stack.md` (pin and patch tables generated from `build/*/PINS`, [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS) and `patches/`; `scripts/pins-table.py --check`) and `build/*/README.md` |
 | Signing decision | `docs/decisions/0001-signing.md` |
 | Known limits | `docs/known-limits.md`, including the host GPU matrix |
 | Evidence for item 2 | This page, the evidence index above, and the investigations it links: `docs/dxdiag.md`, `docs/d3d11-apps.md`, `docs/nvidia.md`, `docs/zeus.md` |

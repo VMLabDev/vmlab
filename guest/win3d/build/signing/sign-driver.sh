@@ -12,7 +12,7 @@
 #      and OS attribute 2:10.0 (_v100_X64);
 #   3. signs the catalog;
 #   4. verifies every signature against the test certificate.
-# The key and certificate come from .signing/ (build/signing/make-test-cert.sh).
+# The key and certificate come from WIN3D_SIGNING_DIR or ~/.config/vmlab/signing/win3d/ (build/signing/make-test-cert.sh).
 # Signing time and catalog GUID are derived from fixed inputs, so running it
 # twice on the same directory leaves the bytes unchanged.
 set -euo pipefail

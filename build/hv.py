@@ -17,7 +17,10 @@ ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "https://github.com/VMLabDev/vmlab.git"
 VIRGL_VERSION = "1.3.0"
 VIRGL_SHA256 = "065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3"
-CACHE_KEY = f"virglrenderer-{VIRGL_VERSION}-{VIRGL_SHA256}"
+PATCHES = sorted((ROOT / "patches/virglrenderer").glob("*.patch"))
+PATCH_SHA256 = hashlib.sha256(b"".join(
+    patch.name.encode() + b"\0" + patch.read_bytes() for patch in PATCHES)).hexdigest()
+CACHE_KEY = f"virglrenderer-{VIRGL_VERSION}-{VIRGL_SHA256}-{PATCH_SHA256}"
 CACHE = ROOT / ".ci-cache"
 VIRGL = CACHE / CACHE_KEY
 
@@ -37,7 +40,7 @@ def native_deps_install():
     run(*prefix, "apt-get", "update")
     run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
         "build-essential", "curl", "ca-certificates", "git", "pkg-config",
-        "meson", "ninja-build", "python3-yaml", "libepoxy-dev", "libdrm-dev",
+        "meson", "ninja-build", "patch", "python3-yaml", "libepoxy-dev", "libdrm-dev",
         "libgbm-dev", "libegl-dev", "libvulkan-dev", "glslang-tools",
         "libpipewire-0.3-dev", "libpulse-dev", "clang", "libclang-dev",
         "liblzma-dev", "libwayland-dev", "libxkbcommon-dev", "libxkbcommon-x11-0",
@@ -51,7 +54,7 @@ def test_native_deps_install():
     run(*prefix, "apt-get", "update")
     run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
         "build-essential", "gcc-multilib", "liblzma-dev", "curl", "pkg-config",
-        "meson", "ninja-build", "python3-yaml", "libepoxy-dev", "libdrm-dev",
+        "meson", "ninja-build", "patch", "python3-yaml", "libepoxy-dev", "libdrm-dev",
         "libgbm-dev", "libegl-dev", "libvulkan-dev", "glslang-tools",
         "libpipewire-0.3-dev", "libpulse-dev", "clang", "libclang-dev",
         "qemu-utils", "nasm", "acpica-tools", "imagemagick", "cpio", "xvfb",
@@ -87,10 +90,18 @@ def virgl_build():
         with tarfile.open(archive) as tar:
             tar.extractall(work, filter="data")
         source = work / f"virglrenderer-{VIRGL_VERSION}"
+        for patch in PATCHES:
+            print(f"Applying {patch.name}", flush=True)
+            run("patch", "--batch", "--forward", "-p1", "-i", patch, cwd=source)
         run("meson", "setup", work / "build", source, f"--prefix={VIRGL}",
             "--libdir=lib", "--buildtype=release", "-Dvenus=true", "-Dtests=false")
         run("ninja", "-C", work / "build", "install")
         shutil.copy2(source / "COPYING", VIRGL / "COPYING")
+        (VIRGL / "BUILDINFO").write_text(
+            f"virglrenderer: {VIRGL_VERSION}\nsource-sha256: {VIRGL_SHA256}\n"
+            f"patch-sha256: {PATCH_SHA256}\n" + "".join(
+                f"patch: {patch.name}\n" for patch in PATCHES)
+            + f"server-sha256: {hashlib.sha256((VIRGL / 'libexec/virgl_render_server').read_bytes()).hexdigest()}\n")
         (VIRGL / ".complete").touch()
 
 
@@ -159,6 +170,7 @@ def package(version):
         shutil.copy2(target / "release/vmlab-hv", stage / "libexec/vmlab-hv")
         shutil.copy2(target / "release/vmlab-hv-viewer", stage / "bin/vmlab-hv-viewer")
         shutil.copy2(VIRGL / "libexec/virgl_render_server", stage / "libexec/virgl_render_server")
+        shutil.copy2(VIRGL / "BUILDINFO", stage / "virglrenderer-BUILDINFO")
         for library in (VIRGL / "lib").glob("libvirglrenderer.so*"):
             shutil.copy2(library, stage / "lib" / library.name, follow_symlinks=False)
         launcher = stage / "bin/vmlab-hv"
@@ -178,6 +190,8 @@ vmlab commit: {commit}
 Source: {REPOSITORY}
 virglrenderer: {VIRGL_VERSION}
 Source SHA256: {VIRGL_SHA256}
+Patch set SHA256: {PATCH_SHA256}
+Applied patches: {', '.join(patch.name for patch in PATCHES)}
 
 Keep bin/, lib/ and libexec/ together. Add this bundle's bin/ to PATH,
 or set host {{ vmlab_hv = "/absolute/path/to/bin/vmlab-hv" }} in

@@ -1,5 +1,9 @@
 # Documentation map
 
+Run scripts from guest/win3d/. Use the in-tree vmlab-hv bundle for current
+host setup. QEMU acceptance results below are historical; win3d releases
+contain only the guest zip. See [release.md](release.md).
+
 vmlab-win3d is a driver package for Windows 10 and 11 guests under vmlab. It
 makes unmodified Direct3D 9 to 12, OpenGL and Vulkan applications render on
 the host's GPU through virtio-gpu Venus.
@@ -78,7 +82,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [ddraw.md](ddraw.md) | See DirectDraw fullscreen exclusive mode, 16 bpp modes, and the hardware colour-key and mirror blits of `patches/mesa/0035` |
 | [dd16.md](dd16.md) | See why 64-bit DirectDraw programs get no 16 bpp modes: the trace through `ddraw.dll`, win32k, CDD and `dxgkrnl.sys`, and the R5G6B5 KMD run |
 | [present.md](present.md) | See why presents were slow (CPU reads of write-combined memory) and why Blender was translucent on Windows 10, and the fixes `patches/kmd/0002` and `patches/mesa/0026`, `0027` |
-| [n5.md](n5.md) | See why D3D9 presents run below the refresh rate on NVIDIA hosts (slow wake-ups on virglrenderer's exportable fences) and the host-side fix: the vmlab render server, its deployment and A/B ([evidence](evidence/hostvirgl/README.md)) |
+| [n5.md](n5.md) | See why D3D9 presents run below the refresh rate on NVIDIA hosts (slow wake-ups on virglrenderer's exportable fences) and the host-side fix: the vmlab render server, its deployment and A/B ([evidence](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/hostvirgl/README.md)) |
 | [ffp.md](ffp.md) | See how D3D9 fixed function was tested against the reference rasterizer, and the software-vertex-processing, fog and point fixes `patches/mesa/0040` to `0042` |
 | [compat.md](compat.md) | See which unmodified free applications (Unigine Heaven and Valley, Godot, GZDoom, Crispy Doom) run on AMD1 and Nvidia2 under each API, and each failure in detail, including the Godot Vulkan Xid 69 |
 | [ffp2.md](ffp2.md) | See D3D9 vertex blending, bump mapping, cube texgen, mixed devices and Windows 10 tested against the reference, and the bump-format and blend-palette changes `patches/mesa/0043` and `0044` |
@@ -103,12 +107,12 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 `scripts/build.sh` builds everything. `scripts/pins-table.py --write`
 regenerates the pin and patch tables in `stack.md`, and `--check` fails when
 they are stale. `scripts/check-docs.py` checks that every repository path
-named in the documents exists. `patches/host/` holds host-side QEMU and
-virglrenderer patches; they are not part of the guest package
-([stack](stack.md#host-patches)).
+named in the documents exists. Shared virglrenderer patches live at the
+repository root in patches/virglrenderer/. The vmlab-hv bundle builds them;
+they are not part of the guest package ([stack](stack.md#host-patches)).
 
 ## Evidence
 
-Every directory under [`evidence/`](evidence/) is listed, with what it proves
+Every directory under [`evidence/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence) is listed, with what it proves
 and the vmlab version and commit behind it, in
 [acceptance.md, "Evidence index"](acceptance.md#evidence-index).

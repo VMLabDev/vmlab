@@ -12,7 +12,7 @@ device as follows:
 
 Three Mesa patches against the D3D9 user-mode driver (UMD) fix it:
 `patches/mesa/0012` to `0014`. No KMD change was needed. The evidence is in
-`docs/evidence/dxdiag/`.
+[docs/evidence/dxdiag/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/).
 
 ## How DirectDraw finds the driver
 
@@ -21,7 +21,7 @@ named in the display key's `UserModeDriverName` (`viogpu_d3d10.dll`, which
 exports `OpenAdapter`), opens it with runtime interface 7 and builds its HAL
 from `pfnGetCaps` answers. The D3D9 runtime uses interface 9. dxdiag does the
 same thing in its own process. The UMD trace shows the sequence for both
-`ddcaps.exe` and `dxdiag.exe` (`docs/evidence/dxdiag/before/getcaps-trace.log`):
+`ddcaps.exe` and `dxdiag.exe` ([docs/evidence/dxdiag/before/getcaps-trace.log](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/getcaps-trace.log)):
 
 | Order | `D3DDDICAPS_*` | Type | Answer before 0012 |
 | --- | --- | --- | --- |
@@ -42,7 +42,7 @@ still gets a DirectDraw object, but it runs on the software emulation layer
   (`0x88760233`).
 - `IDirect3D7::EnumDevices` lists only "RGB Emulation".
 
-Evidence: `docs/evidence/dxdiag/before/ddcaps-x86.json`.
+Evidence: [docs/evidence/dxdiag/before/ddcaps-x86.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/ddcaps-x86.json).
 
 dxdiag shows that state as "DDraw Status: Not Available". D3D Status was
 already Enabled, because the D3D9 runtime never asks for the D3D7 caps.
@@ -60,7 +60,7 @@ shows AGP as Not Available.
 This dependence is inferred from the before and after data. Microsoft does
 not document dxdiag's exact rule. The Microsoft Basic Render Driver shows
 the same pattern, with DDraw and AGP both Enabled
-(`docs/evidence/probes/dxdiag.json`).
+([docs/evidence/probes/dxdiag.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/probes/dxdiag.json)).
 
 ## The fixes
 
@@ -95,7 +95,7 @@ the blitted rectangle. The UMD mapped the GPU texture write-only and uploaded
 the whole box from a staging copy that never held the surface contents, so
 everything outside the rectangle became black. In the ddcaps blit test,
 every hardware copy and stretch result was lost and only the emulated mirror
-blit survived (`docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json`).
+blit survived ([docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json)).
 
 `patches/mesa/0013-d3d9-write-only-lock-keeps-contents.patch` sends locks
 that are write-only without `Discard` through the existing readback path,
@@ -111,7 +111,7 @@ clipper. On WDDM that blit reaches the UMD as `pfnPresent`
 plain surface, created with no `RenderTarget` or `Texture` flag. Without
 `PIPE_BIND_DISPLAY_TARGET`, that surface was a tiled device-local image that
 the KMD present could not read. Every call returned `S_OK`, but the window
-stayed empty (`docs/evidence/dxdiag/before/console-ddraw-window-0012-only.png`).
+stayed empty ([docs/evidence/dxdiag/before/console-ddraw-window-0012-only.png](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/console-ddraw-window-0012-only.png)).
 A D3D9 swapchain back buffer gets `PIPE_BIND_DISPLAY_TARGET`; the trace
 shows bind `0x100082` for a D3D9 back buffer and `0x100002` for a DirectDraw
 surface.
@@ -127,7 +127,7 @@ All runs used one throwaway lab, `win3d-fix-dxdiag-1`, built from
 `labs/probe/vmlab.wcl` (Windows 11 26100.1742.5 template, AMD iGPU Venus,
 vmlab 0.24.0-alpha). The lab was destroyed after the runs. The package was
 installed with `scripts/install-into-vm.sh`. Before the fix, the bundle was
-the e2e worker's build of `main` at `be2ef9b`. After the fix, it was
+the e2e worker's build of `main` at [be2ef9b](https://github.com/VMLabDev/vmlab-win3d/commit/be2ef9b0ece9d98a33a01ce049dc8fbe846fb6b8). After the fix, it was
 `scripts/build.sh --package-only` over `build/mesa/build.sh` with patches
 0001 to 0014. Installed UMD hashes after the fix (signed copies from the
 bundle):
@@ -139,27 +139,27 @@ a028267940944a4554cbb10af303e705d342b695bbba9a5f452509d9246f0a5a  driver/x86/vio
 
 | Path | What it shows |
 | --- | --- |
-| `docs/evidence/dxdiag/before/dxdiag.json`, `dxdiag.txt` | dxdiag before: DDraw and AGP Not Available, `hardware_acceleration: false` |
-| `docs/evidence/dxdiag/before/ddcaps-x64.json`, `ddcaps-x86.json` | HAL caps `DDCAPS_NOHARDWARE`, video-memory surfaces fail `DDERR_NODIRECTDRAWHW`, D3D7 offers RGB Emulation only |
-| `docs/evidence/dxdiag/before/getcaps-trace.log` | Every `GetCaps` call from ddcaps and dxdiag; type 11 answered `unsupported` |
-| `docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json` | With 0012 only: HAL present, but blit results lost after an emulated blit (the 0013 bug) |
-| `docs/evidence/dxdiag/before/console-ddraw-window-0012-only.png` | With 0012 only: the DirectDraw window shows nothing (the 0014 bug) |
-| `docs/evidence/dxdiag/after/dxdiag.json`, `dxdiag.txt` | dxdiag after: DDraw, D3D and AGP Enabled, `hardware_acceleration: true`, "No problems found" |
-| `docs/evidence/dxdiag/after/ddcaps-x64.json`, `ddcaps-x86.json` | HAL present (`DDCAPS_BLT`, `BLTSTRETCH`, `BLTCOLORFILL`, `3D`, `DDCAPS2_NONLOCALVIDMEM`, ...), surfaces in `DDSCAPS_VIDEOMEMORY \| DDSCAPS_LOCALVIDMEM`, every blit check passes, 130 to 170 windowed blits to the primary without a failure; x86 lists the Direct3D HAL and T&L HAL devices |
-| `docs/evidence/dxdiag/after/ddcaps-*.run.json`, `ddcaps-*.modules.json` | ddcaps ran in the user's session 1, and `ddraw.dll` loaded `viogpu_d3d10.dll` |
-| `docs/evidence/dxdiag/after/getcaps-trace.log` | Type 11 now answered (`GetCaps D3D7 size=116`). dxdiag also asks for type 14 (`GETDECODEGUIDCOUNT`, DXVA), which stays unsupported and does not affect the result |
-| `docs/evidence/dxdiag/after/console-ddraw-window-1.png`, `-2.png` | Console screenshots 6 s apart: the DirectDraw window shows the blitted pattern, moving |
-| `docs/evidence/dxdiag/after/probes/` | `Run-AllProbes.ps1` after the fix: all 10 probes (D3D9, D3D11, D3D12, OpenGL, Vulkan; x64 and x86) pass on the VirtIO GPU or Venus with readback OK |
+| [docs/evidence/dxdiag/before/dxdiag.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/dxdiag.json), `dxdiag.txt` | dxdiag before: DDraw and AGP Not Available, `hardware_acceleration: false` |
+| [docs/evidence/dxdiag/before/ddcaps-x64.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/ddcaps-x64.json), `ddcaps-x86.json` | HAL caps `DDCAPS_NOHARDWARE`, video-memory surfaces fail `DDERR_NODIRECTDRAWHW`, D3D7 offers RGB Emulation only |
+| [docs/evidence/dxdiag/before/getcaps-trace.log](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/getcaps-trace.log) | Every `GetCaps` call from ddcaps and dxdiag; type 11 answered `unsupported` |
+| [docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json) | With 0012 only: HAL present, but blit results lost after an emulated blit (the 0013 bug) |
+| [docs/evidence/dxdiag/before/console-ddraw-window-0012-only.png](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/console-ddraw-window-0012-only.png) | With 0012 only: the DirectDraw window shows nothing (the 0014 bug) |
+| [docs/evidence/dxdiag/after/dxdiag.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/after/dxdiag.json), `dxdiag.txt` | dxdiag after: DDraw, D3D and AGP Enabled, `hardware_acceleration: true`, "No problems found" |
+| [docs/evidence/dxdiag/after/ddcaps-x64.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/after/ddcaps-x64.json), `ddcaps-x86.json` | HAL present (`DDCAPS_BLT`, `BLTSTRETCH`, `BLTCOLORFILL`, `3D`, `DDCAPS2_NONLOCALVIDMEM`, ...), surfaces in `DDSCAPS_VIDEOMEMORY \| DDSCAPS_LOCALVIDMEM`, every blit check passes, 130 to 170 windowed blits to the primary without a failure; x86 lists the Direct3D HAL and T&L HAL devices |
+| [docs/evidence/dxdiag/after/ddcaps-*.run.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/after/), `ddcaps-*.modules.json` | ddcaps ran in the user's session 1, and `ddraw.dll` loaded `viogpu_d3d10.dll` |
+| [docs/evidence/dxdiag/after/getcaps-trace.log](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/after/getcaps-trace.log) | Type 11 now answered (`GetCaps D3D7 size=116`). dxdiag also asks for type 14 (`GETDECODEGUIDCOUNT`, DXVA), which stays unsupported and does not affect the result |
+| [docs/evidence/dxdiag/after/console-ddraw-window-1.png](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/after/console-ddraw-window-1.png), `-2.png` | Console screenshots 6 s apart: the DirectDraw window shows the blitted pattern, moving |
+| [docs/evidence/dxdiag/after/probes/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/after/probes/) | `Run-AllProbes.ps1` after the fix: all 10 probes (D3D9, D3D11, D3D12, OpenGL, Vulkan; x64 and x86) pass on the VirtIO GPU or Venus with readback OK |
 
 The D3D9 probe ran at 28.7 fps (x64) and 25.7 fps (x86). The e2e worker's
 Windows 10 run of the unpatched package measured 29.6 and 29.7 fps
-(`docs/evidence/acceptance/windows-10/probes/` on branch `work/e2e`), so the
+([docs/evidence/acceptance/windows-10/probes/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10/probes/) on branch `work/e2e`), so the
 patches do not slow the D3D9 path.
 
 ## Reproduce
 
-The test program is `docs/evidence/dxdiag/ddcaps/ddcaps.c`.
-`docs/evidence/dxdiag/ddcaps/build.sh` builds it for x64 and x86 into
+The test program is [docs/evidence/dxdiag/ddcaps/ddcaps.c](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/ddcaps/ddcaps.c).
+[docs/evidence/dxdiag/ddcaps/build.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/ddcaps/build.sh) builds it for x64 and x86 into
 `out/ddcaps/` in the shared toolchain image; the build is reproducible:
 
 ```
@@ -189,7 +189,7 @@ and ddcaps in `C:\win3d\ddcaps\{x64,x86}`, run this as an administrator:
 C:\win3d\Test-DirectDraw.ps1 -OutDir C:\win3d\results\dxdiag -Seconds 10 [-Trace]
 ```
 
-`docs/evidence/dxdiag/Test-DirectDraw.ps1` runs both ddcaps builds and
+[docs/evidence/dxdiag/Test-DirectDraw.ps1](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/Test-DirectDraw.ps1) runs both ddcaps builds and
 dxdiag in the interactive session through `Run-Probe.ps1` and
 `Get-Dxdiag.ps1`, then prints a summary. `-Trace` turns on the UMD's D3D9
 trace (`D3D10UMD_D3D9_TRACE=1` in `C:\ProgramData\Yttrium\yttrium.ini`) for

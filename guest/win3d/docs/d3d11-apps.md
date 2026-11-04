@@ -1,6 +1,6 @@
 # D3D11 applications: the DirectX SDK samples
 
-In the e2e stretch run (`docs/evidence/acceptance/windows-11/apps/`), two
+In the e2e stretch run ([docs/evidence/acceptance/windows-11/apps/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-11/apps/)), two
 unmodified DirectX SDK (June 2010) D3D11 samples loaded `d3d11.dll`,
 `dxgi.dll` and `viogpu_d3d10.dll` but never showed a rendering window:
 
@@ -18,7 +18,7 @@ There were two separate causes:
 | BasicHLSL11 | DXUT (June 2010) moves its window to (32758, −32768), off the screen, on any Windows 8 or later system without the SDK's `D3D11Ref.dll`. | The application (DXUT) | Not fixable in the UMD or KMD; see [BasicHLSL11](#basichlsl11-a-dxut-bug-on-windows-8-and-later) |
 
 With the fixes, the package was rebuilt (`scripts/build.sh`, commit
-`5fd206d`) and installed in a fresh Windows 11 lab with
+[5fd206d](https://github.com/VMLabDev/vmlab-win3d/commit/5fd206d3c2fd259ad4a2a7e68394771ab9e1cf57)) and installed in a fresh Windows 11 lab with
 `scripts/install-into-vm.sh`. Results in that lab:
 
 - SubD11 renders on the hardware device at about 50 fps, and the output
@@ -29,7 +29,7 @@ With the fixes, the package was rebuilt (`scripts/build.sh`, commit
 - `Run-AllProbes.ps1` passes 10 of 10, plus the 4 WARP runs.
 - dxdiag reports hardware acceleration.
 
-The evidence is in `docs/evidence/d3d11-apps/`, listed in
+The evidence is in [docs/evidence/d3d11-apps/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d11-apps/), listed in
 [Evidence](#evidence).
 
 ## SubD11: three UMD bugs
@@ -202,7 +202,7 @@ To see these samples on the console, `tests/e2e/apps.sh` has two options:
 - move the window after start-up.
 
 `tests/e2e/apps.sh` now takes the first option and installs `D3D11Ref.dll`
-from the pinned SDK (commit `3bf8e4c`). It has not been re-run since.
+from the pinned SDK (commit [3bf8e4c](https://github.com/VMLabDev/vmlab-win3d/commit/3bf8e4cfe00b8970e9e5ef080675c784b6708203)). It has not been re-run since.
 
 ## Not covered
 
@@ -219,8 +219,8 @@ from the pinned SDK (commit `3bf8e4c`). It has not been re-run since.
 
 ## Evidence
 
-`docs/evidence/d3d11-apps/`, from the fresh lab with the package built at
-`5fd206d` (`environment.txt` has the pins and hashes):
+[docs/evidence/d3d11-apps/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d11-apps/), from the fresh lab with the package built at
+[5fd206d](https://github.com/VMLabDev/vmlab-win3d/commit/5fd206d3c2fd259ad4a2a7e68394771ab9e1cf57) (`environment.txt` has the pins and hashes):
 
 | File | What it shows |
 | --- | --- |

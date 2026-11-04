@@ -3,7 +3,7 @@ vmlab-win3d @VERSION@ for Windows 10 and 11 (x64)
 
 What this is
 ------------
-A driver package for Windows guests running under vmlab (QEMU). After one
+A driver package for Windows guests running under vmlab-hv. After one
 install, unmodified Direct3D 9, 10, 11 and 12, OpenGL and Vulkan
 applications render on the host's GPU. The guest reaches the host's Vulkan
 driver through virtio-gpu Venus. The package contains:
@@ -16,17 +16,19 @@ driver through virtio-gpu Venus. The package contains:
 
 This is an alpha release, for test VMs only.
 
-Built from https://github.com/VMLabDev/vmlab-win3d at commit
+Release packaging source: https://github.com/VMLabDev/vmlab/tree/@COMMIT@/guest/win3d at commit
 @COMMIT@.
+manifest.json retains the signed input's original build commit separately
+from release_commit, including when a dry run reuses an older signed bundle.
 
 Prerequisites
 -------------
   - Windows 10 or 11, x64.
   - Secure Boot off. In vmlab: secure_boot = false on the VM.
   - A virtio-gpu GPU with Venus. In vmlab: gpu { mode = "vulkan" }, with
-    host_gpu naming an AMD, Intel or NVIDIA GPU from the host config. An
-    NVIDIA host GPU also needs the patched QEMU (the qemu-vmlab-egl
-    release asset) as that GPU's qemu_binary, or the console stays black.
+    host_gpu naming an AMD, Intel or NVIDIA GPU from the host config. Use
+    hypervisor = "vmlab" and the vmlab-hv bundle, which includes the patched
+    Venus render server for NVIDIA. No separate QEMU asset is shipped.
   - Administrator rights in the guest.
 
 WARNING: test signing
@@ -66,7 +68,7 @@ certificate and sets test signing back to how it was.
 
 More information
 ----------------
-  Install and what it changes: https://github.com/VMLabDev/vmlab-win3d/blob/@COMMIT@/docs/install.md
+  Install and what it changes: https://github.com/VMLabDev/vmlab/blob/@COMMIT@/guest/win3d/docs/install.md
   Uninstall:                   https://github.com/VMLabDev/vmlab-win3d/blob/@COMMIT@/docs/uninstall.md
   Known limits and host GPUs:  https://github.com/VMLabDev/vmlab-win3d/blob/@COMMIT@/docs/known-limits.md
   Signing decision:            https://github.com/VMLabDev/vmlab-win3d/blob/@COMMIT@/docs/decisions/0001-signing.md

@@ -11,24 +11,9 @@ virtio-gpu Venus, with no per-application files or settings.
 On the host:
 
 - Docker, usable without sudo, and network access for the pinned downloads.
-- vmlab 0.27.0-alpha or later, and the local `windows-11` (or `windows-10`)
-  template. vmlab before 0.24 does not give the guest a working Venus
-  device (`docs/host.md` records why), 0.24 lab files name the GPU by PCI
-  address, which 0.25 rejects, 0.26 added the host GPU's `qemu_binary` that
-  NVIDIA needs, and 0.27 hides the host's other GPUs from the guest.
-- A host GPU whose Vulkan driver Venus works on: AMD with RADV (the
-  reference; on helios the iGPU at PCI address `0000:72:00.0`), Intel with
-  ANV, or an NVIDIA RTX 5090. A laptop RTX 4060 failed outright
-  ([known limits](known-limits.md#host-gpu-support)).
-- **For an NVIDIA GPU, a patched QEMU named as `qemu_binary` on that GPU's
-  host config block, and the vmlab render server as its `qemu_env`.** Stock
-  QEMU 11.1.1 shows a black console for a Venus guest on NVIDIA. The release
-  tarballs (`docs/release.md`, "Install the QEMU for NVIDIA hosts") run on
-  any x86-64 distribution with glibc 2.36 or newer and need the
-  distribution's own QEMU package for the firmware in `/usr/share/qemu`
-  (the QEMU tarball's `install.sh` links `<prefix>/share/qemu` there);
-  their `install.sh --check` says whether this host is one. `docs/nvidia.md`, "Host setup", says how
-  to build them instead (`patches/host/build-qemu.sh`) and where to point.
+- The in-tree vmlab and vmlab-hv release bundle, and a local Windows template.
+- A host Vulkan GPU supported by Venus. See [known limits](known-limits.md).
+- The vmlab-hv bundle's patched render server. No QEMU host asset is needed.
 - That GPU declared by name in the host config,
   `~/.config/vmlab/config.wcl`. Find its address with
   `lspci -D | grep -Ei 'vga|3d|display'`, or from
@@ -41,11 +26,9 @@ On the host:
   gpu "Nvidia1" {                                             // RTX 5090
     address     = "0000:01:00.0"
     default     = true
-    qemu_binary = "/home/wil/.local/opt/qemu-vmlab-egl/bin/qemu-system-x86_64"
   }
   gpu "Nvidia2" {                                             // RTX 5090
     address     = "0000:05:00.0"
-    qemu_binary = "/home/wil/.local/opt/qemu-vmlab-egl/bin/qemu-system-x86_64"
   }
   ```
 
@@ -54,12 +37,13 @@ On the host:
   helios that is `Nvidia1`, an RTX 5090; the labs here name their GPU
   explicitly.
 
+Set `hypervisor = "vmlab"` on the VM.
 The VM needs these settings, as in `labs/probe/vmlab.wcl`:
 
 | Setting | Why |
 | --- | --- |
 | `secure_boot = false` | The package is test-signed (decision 0001). Windows ignores `testsigning` while Secure Boot is on, so `Install.cmd` refuses to run. This cannot be changed from inside the guest. |
-| `gpu { mode = "vulkan" host_gpu = "AMD1" }` | vmlab's Venus mode. vmlab emits one `virtio-vga-gl,venus=true,blob=true,hostmem=4G` adapter. `host_gpu` names a host GPU from the host config: vmlab puts egl-headless on its render node and sets `VK_LOADER_DRIVERS_SELECT` in QEMU's environment from its kernel driver, so virglrenderer uses that GPU's driver (RADV for `AMD1`). vmlab 0.27 also loads a Vulkan layer that hides every other host GPU, so the guest sees one Venus device. The KMD needs the device's `VIRTIO_GPU_F_VIRGL` feature; the INF matches its hardware ID, `PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01`. |
+| `gpu { mode = "vulkan" host_gpu = "AMD1" }` | vmlab-hv provides the virtio-gpu Venus device and renders on the named host GPU. The KMD requires VIRTIO_GPU_F_VIRGL. |
 | `nic { nat = true }`, then `slmgr /ato` in the guest | The Windows templates are evaluation editions. Without an online activation the licensing monitor (`wlms.exe`) shuts the VM down about an hour after boot. `tests/e2e/run.sh` runs `cscript //nologo C:\Windows\System32\slmgr.vbs /ato` after bring-up. Activation needs outbound internet ([wu.md](wu.md)). |
 
 `vulkan_icd = "<path to ICD JSON>"` on the host config's `gpu "<name>" {}`
@@ -75,6 +59,7 @@ import <vmlab.wcl>
 lab "win3d-package" {
   vm "win11" {
     template = "x86_64/windows-11@26100.1742.5"
+    hypervisor = "vmlab"
     secure_boot = false
     nic { nat = true }
     gpu {
@@ -85,18 +70,14 @@ lab "win3d-package" {
 }
 ```
 
-Bring it up with plain `vmlab up`. QEMU's log, `qemu.log` in the VM's state
-directory, starts with `vmlab: argv:` and `vmlab: env:` lines, so you can
-check the device line, the ICD filter and, for a GPU with `qemu_binary`,
-the QEMU binary there. On vmlab 0.27 a later
-`vmlab-pci-filter: <address>: kept <device>, hid <n>` line names the one
-host device the guest sees. `vmlab status -v` shows `host_gpu=<name>`, and
-`qemu=<path>` when the GPU has a `qemu_binary`.
+Bring it up with `vmlab up`. The VM's qemu.log retains the hypervisor
+argv and environment for either backend. `vmlab status -v` names the selected
+hypervisor and host GPU.
 
-The evidence in `docs/evidence/package/` predates vmlab 0.24 and 0.25. It used vmlab
+The evidence in [docs/evidence/package/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/) predates vmlab 0.24 and 0.25. It used vmlab
 0.23 with `qemu_args` and an isolated supervisor that had
 `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json` in its environment
-(`docs/evidence/package/lab-vmlab.wcl`, `docs/host.md`). The guest sees the
+([docs/evidence/package/lab-vmlab.wcl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/lab-vmlab.wcl), `docs/host.md`). The guest sees the
 same device either way: `virtio-vga-gl` and `virtio-gpu-gl` present the same
 PCI ID.
 
@@ -258,5 +239,5 @@ the newest backup, and the bridge goes back in place. The journal records it.
 
 ## Evidence
 
-`docs/evidence/package/README.md`: a fresh-clone build, then install,
+[docs/evidence/package/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md): a fresh-clone build, then install,
 probes, rerun, uninstall and reinstall on a fresh `windows-11` lab.

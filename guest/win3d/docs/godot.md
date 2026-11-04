@@ -6,7 +6,7 @@ start, and then crashed (`docs/compat.md`, F1). This page names the trigger,
 gives the evidence and records the fix,
 `patches/mesa/0075-wsi-win32-blit-shared-swapchain-when-linear-cannot-render.patch`.
 Investigated on 2026-10-19 on helios: NVIDIA 610.57.04, vmlab 0.28.0-alpha,
-the patched QEMU, virglrenderer 1.3.0. Evidence is in `docs/evidence/godot/`.
+the patched QEMU, virglrenderer 1.3.0. Evidence is in [docs/evidence/godot/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/godot/).
 
 ## Result
 
@@ -44,7 +44,7 @@ NVRM: Xid (PCI:0000:01:00): 69, pid=4094771, name=vkr-ring-40, Class Error: chan
 2. **Which submission.** The lab ran on an isolated vmlab supervisor whose
    host config (`diag-nvidia1/host-config.wcl`) set `qemu_env` for Nvidia1.
    The render server was a diagnostic build
-   (`patches/host/virglrenderer/diagnostic/0040`). That build records every Venus
+   ([patches/host/virglrenderer/diagnostic/0040](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/virglrenderer/diagnostic/0040-vkr-trace-venus-commands-and-sync-submit.patch)). That build records every Venus
    command of the Godot context (`VKR_TRACE`, `VKR_TRACE_APP`) and waits for
    every queue submission (`VKR_SYNC_SUBMIT`). The validation layer
    (`VKR_DEBUG=validate`, Khronos 1.4.363) was also loaded. Submission 6, with
@@ -109,7 +109,7 @@ Yttrium guest the WSI presents through the DXGI_SHARED path
 
 The application renders straight into that LINEAR image. NVIDIA's
 `linearTilingFeatures` lack `COLOR_ATTACHMENT` for every format
-(`docs/evidence/xid69/host-tests/out/formatfeatures-nvidia1.txt`), yet
+([docs/evidence/xid69/host-tests/out/formatfeatures-nvidia1.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/xid69/host-tests/out/formatfeatures-nvidia1.txt)), yet
 plain draws work (dwm and the repo's Vulkan probe). The
 hardware rejects the render-target setup only when more state is latched:
 depth (0x9c, [`xid69.md`](xid69.md)) or a shading-rate state (0x13d, here).
@@ -158,13 +158,13 @@ NVIDIA rejects on pitch-linear targets.
 
 All runs used fresh labs from `x86_64/windows-11@26100.1742.5`, on the
 host config with no debug variables. The bundle was built from this branch
-at `d58167a` (AMD1 Godot runs) or `d15ccaa` (the rest). The two differ only
+at [d58167a](https://github.com/VMLabDev/vmlab-win3d/commit/d58167ab43da5ecd754c30e4e89d96a51afb4e3e) (AMD1 Godot runs) or [d15ccaa](https://github.com/VMLabDev/vmlab-win3d/commit/d15ccaac72f295d85b0e3db595e1eb7c3ad7b7af) (the rest). The two differ only
 in a comment line of the diagnostic render-server patch, which no build
 applies. The patch series was main's (0001 to 0044) plus 0075. The Godot runs
 are `tests/apps/compat/run.sh --only godot-d3d12,godot-vulkan,godot-opengl`
 (150 s each, then closed with WM_CLOSE). The acceptance runs are
 `tests/e2e/run.sh --template windows-11`. Evidence is under
-`docs/evidence/godot/proof/<gpu>/`, with the driver log in `proof.log`.
+[docs/evidence/godot/proof/<gpu>/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/godot/proof/), with the driver log in `proof.log`.
 
 | Check | Nvidia1 (RTX 5090) | AMD1 (RADV) |
 | --- | --- | --- |
@@ -183,10 +183,10 @@ FPS figures come from Godot's own log.
 
 ### After merging main (nvva's 0070, 0086; unid3d's 0090)
 
-The branch was then merged with main and the bundle rebuilt at `4d826df`
+The branch was then merged with main and the bundle rebuilt at [4d826df](https://github.com/VMLabDev/vmlab-win3d/commit/4d826dff6f54c59cb682f2418767671de250662c)
 (0001 to 0044, 0070, 0075, 0086 and 0090). The same runs were repeated on
 Nvidia2 and AMD1. Each lab held its `gpuslot.sh` slot, so no card was over
-its VM limit (`docs/evidence/godot/proof-merged/<gpu>/`):
+its VM limit ([docs/evidence/godot/proof-merged/<gpu>/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/godot/proof-merged/)):
 
 | Check | Nvidia2 (RTX 5090) | AMD1 (RADV) |
 | --- | --- | --- |
@@ -217,11 +217,11 @@ were discarded and repeated as above.
   there. D3D11 has no shading rates, and vkd3d-proton renders D3D12 into its
   own images, so no such case is known.
 
-## Evidence index (`docs/evidence/godot/`)
+## Evidence index ([docs/evidence/godot/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/godot/))
 
 | Path | What it shows |
 | --- | --- |
 | `diag-nvidia1/` | The diagnostic run: host config with `qemu_env`, the kernel Xid, the render-server log of the Godot context (sync-submit results, validation), the decoded command trace of that context (`trace-godot-context.txt`; argument bytes truncated to 64), the full hex of the records named above, Godot's log, the UMD log and a console frame |
 | `host-tests/` | `linblend.c` and its shaders, `build.sh`, and the outputs on Nvidia1 and RADV (`out/`) |
 | `tools/vkr-trace-dump.py` | Prints a `VKR_TRACE` file |
-| `tools/build-diag-render-server.sh` | Builds the diagnostic render server (1.3.0 + `patches/host/virglrenderer/*.patch` + `diagnostic/0040`) in Docker |
+| `tools/build-diag-render-server.sh` | Builds the diagnostic render server (1.3.0 + [patches/host/virglrenderer/*.patch](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/virglrenderer/) + `diagnostic/0040`) in Docker |

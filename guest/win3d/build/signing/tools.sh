@@ -3,7 +3,7 @@
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
-SIGNING_DIR=$REPO/.signing
+SIGNING_DIR=${WIN3D_SIGNING_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/vmlab/signing/win3d}
 IMAGE=vmlab-win3d/signing:1
 
 _pin() { awk -v n="$1" '$1 == n { print $'"$2"' }' "$HERE/PINS"; }

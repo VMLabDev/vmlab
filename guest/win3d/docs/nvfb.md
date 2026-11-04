@@ -5,7 +5,7 @@ Vulkan API hung on its first fence: the Vulkan probes, D3D12 through
 vkd3d-proton, and OpenGL through Zink. The acceptance run passed 7 of 12
 ([`zeus.md`](zeus.md#nvidia-rtx-4060)). This page gives the cause, the
 two guest fixes `patches/mesa/0065` and `0066`, the evidence, and what
-remains. Evidence is in `docs/evidence/nvfb/`. Investigated on 2026-10-19.
+remains. Evidence is in [docs/evidence/nvfb/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvfb/). Investigated on 2026-10-19.
 
 ## Result
 
@@ -14,7 +14,7 @@ remains. Evidence is in `docs/evidence/nvfb/`. Investigated on 2026-10-19.
 | Cause | In the guest, the host GPU's writes to NVIDIA memory type 2 (`HOST_VISIBLE` and `HOST_COHERENT`, uncached system memory) are not visible to the guest CPU. The guest reads a stale line from the CPU cache, and the GPU's write never invalidates that line. Venus put its feedback buffer (fence, semaphore, event and query status) in that type. The host itself sees the same writes |
 | Owner | The guest Venus driver chose the memory type. The underlying behaviour belongs to the host platform, an Intel CPU host with this NVIDIA GPU. On helios (an AMD CPU) a guest on an RTX 5090 sees every GPU write in type 2 (`helios/nv1-fbguest-0b26b36/`), so 0067 changes nothing there |
 | Fix | `patches/mesa/0065`: Venus feedback buffers use a `HOST_COHERENT` and `HOST_CACHED` type (NVIDIA type 3), where the GPU's writes reach the guest. `patches/mesa/0066`: at device creation Venus checks that one fence feedback write lands, and disables feedback for that device if it does not. `patches/mesa/0067`: the same check tests the uncached type, and where the GPU's writes do not arrive, Venus backs that type with the cached one for every application (this also fixes the black OpenGL readback) |
-| Zeus Nvidia1, `tests/e2e/run.sh --template windows-11`, package defaults | With 0065 and 0066 (`6dabb22`): runs 1 and 3 **12 of 12**, run 2 **11 of 12**, a black OpenGL readback. With 0067 as well and `main` merged: `0b26b36` 12 of 12, and the committed `bf4d948` **12 of 12 twice**. helios: AMD1 12 of 12 (`6dabb22`), RTX 5090 on Nvidia2 12 of 12 (`bf4d948`), Zeus Intel1 12 of 12 (`6dabb22`) |
+| Zeus Nvidia1, `tests/e2e/run.sh --template windows-11`, package defaults | With 0065 and 0066 ([6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e)): runs 1 and 3 **12 of 12**, run 2 **11 of 12**, a black OpenGL readback. With 0067 as well and `main` merged: [0b26b36](https://github.com/VMLabDev/vmlab-win3d/commit/0b26b364b393f940e9a8be2cb41c3723140bcff8) 12 of 12, and the committed [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) **12 of 12 twice**. helios: AMD1 12 of 12 ([6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e)), RTX 5090 on Nvidia2 12 of 12 ([bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf)), Zeus Intel1 12 of 12 ([6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e)) |
 | Regressions | See [Proof](#proof) |
 
 ## The symptom
@@ -120,22 +120,22 @@ the package uses the host's own virglrenderer (decision D3).
 
 ## Proof
 
-| Run | Evidence (`docs/evidence/nvfb/`) | Result |
+| Run | Evidence ([docs/evidence/nvfb/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvfb/)) | Result |
 | --- | --- | --- |
-| Zeus Nvidia1, e2e run 1, `6dabb22` (0065 + 0066), package defaults | `zeus/11-e2e-run1/` | **12 of 12**. D3D12 55 fps, Vulkan 58.5 fps, OpenGL 60 to 62 fps |
+| Zeus Nvidia1, e2e run 1, [6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e) (0065 + 0066), package defaults | `zeus/11-e2e-run1/` | **12 of 12**. D3D12 55 fps, Vulkan 58.5 fps, OpenGL 60 to 62 fps |
 | Zeus Nvidia1, e2e run 2, the same | `zeus/13-e2e-run2/` | **11 of 12**: x86 OpenGL readback black ([below](#the-black-opengl-readback)) |
 | Zeus Nvidia1, e2e run 3, the same | `zeus/16-e2e-run3/` | **12 of 12** |
-| Zeus Nvidia1, fbguest with feedback on, `6dabb22` | `zeus/12-fixed-feedback-on/` | Fence waits work (Venus feedback now in type 3). Type 2 still misses for the test's own reads; 0067 later fixed that |
+| Zeus Nvidia1, fbguest with feedback on, [6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e) | `zeus/12-fixed-feedback-on/` | Fence waits work (Venus feedback now in type 3). Type 2 still misses for the test's own reads; 0067 later fixed that |
 | Zeus Nvidia1, 0066 without 0065 (an experimental bundle), feedback on | `zeus/14-selftest-only-feedback-on/` | The self-test fallback works. fbguest's fence waits all complete, where `main`'s timed out (`01-main-feedback-on/`). Vulkan passes (56 fps), D3D12 passes at 51 fps, as fast as with `VN_PERF` set |
-| Zeus Intel1, e2e, `6dabb22` | `zeus/15-e2e-intel1/` | **12 of 12** |
-| helios AMD1, e2e, `6dabb22` | `helios/amd1-e2e/` | **12 of 12** |
-| Zeus Nvidia1, e2e, `0b26b36` (`main` merged, 0065 to 0067 with the three-round check) | `zeus/40-e2e-0b26b36-a/` | **12 of 12** |
-| helios Nvidia1 (RTX 5090), e2e, `0b26b36` | `helios/nv1-e2e-0b26b36/` | **11 of 12**: x64 D3D12 drew 1 frame in 20 s (readback correct, nothing on the console). Rerun in the same lab: 14 fps, then on a quieter card 41 to 46 fps. See [the D3D12 first run](#a-slow-first-d3d12-run) |
-| helios Nvidia2 (RTX 5090), e2e, `bf4d948` (the committed 0067) | `helios/nv2-e2e-bf4d948/` | **12 of 12**. D3D12 3.7 and 9.4 fps and OpenGL 8.7 and 11.8 fps while another worker's benchmark VM shared the card |
+| Zeus Intel1, e2e, [6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e) | `zeus/15-e2e-intel1/` | **12 of 12** |
+| helios AMD1, e2e, [6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e) | `helios/amd1-e2e/` | **12 of 12** |
+| Zeus Nvidia1, e2e, [0b26b36](https://github.com/VMLabDev/vmlab-win3d/commit/0b26b364b393f940e9a8be2cb41c3723140bcff8) (`main` merged, 0065 to 0067 with the three-round check) | `zeus/40-e2e-0b26b36-a/` | **12 of 12** |
+| helios Nvidia1 (RTX 5090), e2e, [0b26b36](https://github.com/VMLabDev/vmlab-win3d/commit/0b26b364b393f940e9a8be2cb41c3723140bcff8) | `helios/nv1-e2e-0b26b36/` | **11 of 12**: x64 D3D12 drew 1 frame in 20 s (readback correct, nothing on the console). Rerun in the same lab: 14 fps, then on a quieter card 41 to 46 fps. See [the D3D12 first run](#a-slow-first-d3d12-run) |
+| helios Nvidia2 (RTX 5090), e2e, [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) (the committed 0067) | `helios/nv2-e2e-bf4d948/` | **12 of 12**. D3D12 3.7 and 9.4 fps and OpenGL 8.7 and 11.8 fps while another worker's benchmark VM shared the card |
 | helios Nvidia1, e2e, the same tree without 0065 to 0067 (`src/diag/build.sh mainonly -0065 -0066 -0067`) | `helios/ab-mainonly-nv1-e2e/` | **12 of 12** (D3D12 42.5 and 21.4 fps, OpenGL 8.4 and 9.3 fps, so the slow OpenGL is not ours) |
 | Both 5090 labs above, warm repeats back to back | `helios/ab-repeat/repeat.txt` | D3D12 x64 43.5 to 45.6 fps without 0065 to 0067, 44.2 to 45.7 with; x86 41.1 to 42.1 and 44.7 to 46.3; OpenGL 59.1 to 59.4 and 59.1 to 60.8. No difference |
-| Zeus Nvidia1, e2e run 1, `bf4d948` | `zeus/43-e2e-bf4d948-1/` | **12 of 12**. D3D12 51.5 and 45.5 fps, OpenGL 53.3 and 51.4 fps |
-| Zeus Nvidia1, e2e run 2, `bf4d948` | `zeus/45-e2e-bf4d948-2/` | **12 of 12**. D3D12 51.4 and 46.3 fps, OpenGL 58.1 and 57.2 fps |
+| Zeus Nvidia1, e2e run 1, [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) | `zeus/43-e2e-bf4d948-1/` | **12 of 12**. D3D12 51.5 and 45.5 fps, OpenGL 53.3 and 51.4 fps |
+| Zeus Nvidia1, e2e run 2, [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) | `zeus/45-e2e-bf4d948-2/` | **12 of 12**. D3D12 51.4 and 46.3 fps, OpenGL 58.1 and 57.2 fps |
 | Zeus Nvidia1, fresh lab, `main` without 0065 to 0067 | `zeus/42-mainonly/` | The original bug: fbguest's first fence wait times out, D3D12 fails 3 of 3 (`api_failure`), OpenGL hangs |
 | Zeus Nvidia1, fresh lab, merged `main` with 0065 + 0066, without 0067 | `zeus/44-no67/` | x64 OpenGL black readback **5 of 6**; with 0067, 0 of 24 (`zeus/41-memlog2/`) |
 
@@ -263,7 +263,7 @@ timing on helios could not be isolated: with ten VMs on the host,
 
 | Path | What it is |
 | --- | --- |
-| `src/host-fbtest/fbtest.c`, `build.sh` | The native host test (built in the Arch image pinned in `patches/host/PINS`, for generic x86-64) |
+| `src/host-fbtest/fbtest.c`, `build.sh` | The native host test (built in the Arch image pinned in [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS), for generic x86-64) |
 | `src/guest-fbtest/fbguest.c`, `build.sh` | The guest test (shared llvm-mingw toolchain), with the `primed`, `flushed` and `clflush` variants and a median of 11 `vkCreateDevice` calls |
 | `src/fbguest-lab.sh` | Brings up `win3d-nvfb-<gpu>`, installs a bundle, runs fbguest x64 and x86 in the autologon session with `VN_PERF` set for the test only |
 | `src/repeat-probe.sh` | Runs one probe N times in a kept lab with extra environment variables |

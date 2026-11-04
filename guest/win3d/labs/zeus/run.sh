@@ -23,11 +23,8 @@
 # machine-wide environment variables in the guest before the install. WIN3D_SMOKE=1 runs only vulkaninfo and
 # the x64 D3D11 probe after the install (a short first test of a new GPU).
 #
-# Both GPUs use the user's supervisor. On vmlab >= 0.26 the host config's
-# qemu_binary gives Nvidia1 the patched QEMU (patches/host/build-qemu.sh or
-# the release tarball, installed in ~/.local/opt/qemu-vmlab-egl). WIN3D_ISO=1
-# runs vmlab through labs/zeus/vmlab-iso.sh instead: an isolated supervisor
-# whose WIN3D_* variables pick the QEMU and render server (the 0.24 runs).
+# Both GPUs use the installed vmlab-hv bundle and the user supervisor.
+# WIN3D_ISO=1 selects the isolated supervisor for diagnostics.
 #
 # For --gpu nvidia a monitor records the kernel's NVRM lines
 # (kernel-nvrm.txt) and every change of the GPU's runtime power state
@@ -110,8 +107,7 @@ host_stack() {
         echo "staging: $(cat "$REPO/STAGED" 2>/dev/null)"
         echo "template: $TEMPLATE"
         echo "qemu: $(command -v qemu-system-x86_64) $(qemu-system-x86_64 --version | head -1)"
-        local qb; qb=$(awk -v g="$HOST_GPU" '$1 == "gpu" && $2 == "\""g"\"" { f = 1 } f && /qemu_binary/ { gsub(/[" ]/, "", $3); print $3; exit } f && /^}/ { f = 0 }' "$HOME/.config/vmlab/config.wcl" 2>/dev/null)
-        [ -n "$qb" ] && echo "qemu_binary ($HOST_GPU): $qb $("$qb" --version | head -1)"
+        echo "hypervisor: $(command -v vmlab-hv)"
         [ "$ISO" = 1 ] && echo "isolated supervisor: qemu $("$VMLAB" --which-qemu); render server ${WIN3D_RENDER_SERVER:-host}; extra env ${WIN3D_QEMU_ENV:-none}"
         echo "packages: $(pacman -Q qemu-full qemu-base virglrenderer mesa vulkan-intel vulkan-radeon nvidia-utils 2>/dev/null | tr '\n' ' ')"
         echo "vmlab: $(vmlab --version)"

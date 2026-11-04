@@ -53,7 +53,6 @@ gpu_attr() { # gpu_attr ATTR: a string attribute of the host config's gpu "$HOST
 }
 GPU_ADDR=$(gpu_attr address)
 [ -n "$GPU_ADDR" ] || { echo "no gpu \"$HOST_GPU\" with an address in $HOSTCFG" >&2; exit 2; }
-GPU_QEMU=$(gpu_attr qemu_binary)
 
 TDIR=$HOME/.local/share/vmlab/templates/x86_64/$TEMPLATE
 VER=$(ls "$TDIR" 2>/dev/null | sort -V | tail -1)
@@ -99,7 +98,7 @@ host_stack() {
         echo "template: x86_64/$TEMPLATE@$VER"
         echo "kernel: $(uname -r)"
         echo "qemu (PATH): $(qemu-system-x86_64 --version | head -1)"
-        [ -z "$GPU_QEMU" ] || echo "qemu ($HOST_GPU qemu_binary): $GPU_QEMU, $("$GPU_QEMU" --version | head -1)"
+        echo "hypervisor: $(command -v vmlab-hv)"
         echo "packages: $(pacman -Q qemu-full virglrenderer mesa vulkan-radeon nvidia-utils 2>/dev/null | tr '\n' ' ')"
         echo "vmlab: $(vmlab --version)"
         local n node=
@@ -161,8 +160,7 @@ lab_up() {
     in_lab vmlab validate || return 1
     in_lab vmlab up || return 1
     grep -q "host_gpu = \"$HOST_GPU\"" "$LABDIR/vmlab.wcl" || { note "lab file does not name host_gpu $HOST_GPU"; return 1; }
-    # The host GPU the lab daemon picked (host_gpu=...) and, for a GPU with
-    # qemu_binary (vmlab >= 0.26), qemu=<path>.
+    # Record the selected host GPU and hypervisor.
     in_lab vmlab status -v >"$EV/status-v.txt" 2>&1 || true
     qemu_log_lines
     wait_agent || return 1

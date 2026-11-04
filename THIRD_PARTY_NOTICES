@@ -364,3 +364,23 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Windows 3D guest package (guest/win3d/)
+  Yttrium viogpu3d / virtio-win: BSD-3-Clause and MPL-2.0.
+  Mesa / Yttrium: MIT and MPL-2.0.
+  vkd3d-proton: LGPL-2.1-or-later.
+  dxil-spirv: MIT; embedded notices are in dxil-spirv-MIT.txt.
+  DXVK: zlib.
+  Khronos Vulkan loader, tools and headers: Apache-2.0; headers also offer MIT.
+  Exact upstream revisions are in guest/win3d/build/*/PINS.
+  Local changes are the corresponding guest/win3d/patches/ series.
+  Full licence texts and their source URLs are in guest/win3d/licenses/ and
+  shipped in the guest zip alongside this notice. The KMD and Mesa MPL
+  source, vkd3d-proton source and local changes are available through those
+  pins and patches. Rebuild instructions are in each build component's README.
+  This package no longer ships QEMU or a standalone host render server.
+
+Shared virglrenderer patches (patches/virglrenderer/)
+  Derived from the win3d host patch set, now applied by build/hv.py and
+  e2e/Dockerfile. virglrenderer is MIT-licensed; the hypervisor bundle
+  includes its COPYING text and a BUILDINFO identifying the applied patches.

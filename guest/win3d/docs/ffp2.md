@@ -17,7 +17,7 @@ driver reported too low. Mixed devices, blending, cube and volume texgen and
 Windows 10 already matched the reference. The work was done on 2026-10-19
 on helios: NVIDIA 610.57.04 on `Nvidia2` and RADV (Mesa 26.2.2) on `AMD1`,
 with vmlab 0.28.0-alpha and virglrenderer 1.3.0. The evidence is in
-`docs/evidence/ffp2/`.
+[docs/evidence/ffp2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp2/).
 
 ## Result
 
@@ -32,8 +32,8 @@ with vmlab 0.28.0-alpha and virglrenderer 1.3.0. The evidence is in
 | Windows 10 (19045) | The same results as Windows 11 for both probes | none | `Nvidia2` |
 
 Totals, x64 hardware runs against the reference, from the packages built by
-`tests/e2e/run.sh`. Before is the package at `82d8e51` (`patches/mesa` up
-to `0042`). After is the package at `c51dec0` (adds `0043` and `0044`).
+`tests/e2e/run.sh`. Before is the package at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75) (`patches/mesa` up
+to `0042`). After is the package at [c51dec0](https://github.com/VMLabDev/vmlab-win3d/commit/c51dec009c769c819a343ae9963b7e67b27e2fd0) (adds `0043` and `0044`).
 
 | `d3d9_ffp2` (49 cases) | W11 `Nvidia2` before | W11 `Nvidia2` after | W11 `AMD1` before | W11 `AMD1` after | W10 `Nvidia2` before | W10 `Nvidia2` after |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -85,11 +85,11 @@ Proof, from fresh labs on the `windows-11` (26100.1742.5) and `windows-10`
 
 ## The probe
 
-`docs/evidence/ffp2/src/d3d9_ffp2.cpp` uses the same method as `d3d9_ffp`.
+[docs/evidence/ffp2/src/d3d9_ffp2.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp2/src/d3d9_ffp2.cpp) uses the same method as `d3d9_ffp`.
 Each case gets its own device and renders into a 64×64 `A8R8G8B8` target.
 The probe reads back an 8×8 grid of samples and compares them with the
 reference rasterizer (`d3dref9.dll` from the pinned DirectX SDK), using
-`docs/evidence/ffp/src/compare.py`. New options:
+[docs/evidence/ffp/src/compare.py](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp/src/compare.py). New options:
 
 - `--mixed` creates the device with `D3DCREATE_MIXED_VERTEXPROCESSING`.
   It selects hardware processing, or with `--swvp` software processing.
@@ -206,15 +206,15 @@ of indices 0 to 8 was already right before the change.
 
 `0043` and `0044` belong in `arehnman/virtio-win-mesa` with `0040` to `0042`.
 
-## Evidence index (`docs/evidence/ffp2/`)
+## Evidence index ([docs/evidence/ffp2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp2/))
 
 | Path | What it shows |
 | --- | --- |
 | `src/d3d9_ffp2.cpp`, `src/build.sh` | The probe, and the build of it and of `d3d9_ffp` |
 | `src/run-repro.sh`, `src/make-table.py` | The guest runner and the case table |
 | `table.md` | Every case, before and after, per lab and mode, and the totals of both probes |
-| `before/<lab>/` | Runs with the package at `82d8e51`. On `Nvidia2`, a lab with that package installed. On `AMD1`, the after lab with the package's own `viogpu_d3d10.dll` and `viogpu_wgl.dll` from `82d8e51` put back (sha256 `03aaab62…` x64, `bd836c21…` x86), compared with that lab's after reference runs. In the Windows 10 lab the guest stopped during the last two `d3d9_ffp` reference runs, so those comparisons use the after lab's reference runs |
-| `after/<lab>/` | Runs with the package at `c51dec0`, in the lab `tests/e2e/run.sh --keep` built, after its Done checks |
+| `before/<lab>/` | Runs with the package at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75). On `Nvidia2`, a lab with that package installed. On `AMD1`, the after lab with the package's own `viogpu_d3d10.dll` and `viogpu_wgl.dll` from [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75) put back (sha256 `03aaab62…` x64, `bd836c21…` x86), compared with that lab's after reference runs. In the Windows 10 lab the guest stopped during the last two `d3d9_ffp` reference runs, so those comparisons use the after lab's reference runs |
+| `after/<lab>/` | Runs with the package at [c51dec0](https://github.com/VMLabDev/vmlab-win3d/commit/c51dec009c769c819a343ae9963b7e67b27e2fd0), in the lab `tests/e2e/run.sh --keep` built, after its Done checks |
 | `after/<lab>/e2e/` | That e2e run: `results.txt` (12 of 12), `host.txt`, `build.txt`, console captures |
 | `after/<lab>/rerun/` | The one-off failures run again |
 | `*/yttrium-errors-*.txt` | The UMD's warnings during each probe, without dwm's |

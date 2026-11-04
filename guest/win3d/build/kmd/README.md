@@ -154,7 +154,7 @@ records each patch's sha256 and origin.
 
 The build is bit-reproducible on this host. A run on 2026-10-17 from the
 `docs` worktree gave the same sha256 for all six outputs, including the PDB,
-as the run recorded in `docs/evidence/kmd/00-signing-host.txt` from the `kmd`
+as the run recorded in [docs/evidence/kmd/00-signing-host.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/00-signing-host.txt) from the `kmd`
 worktree:
 
 ```
@@ -180,13 +180,13 @@ timestamps from objects and the PE, and the helpers use
 - **lld-link `/SECTION` replaces attributes.** `INIT,d` alone left
   `DriverEntry` in a non-executable section, and the guest bugchecked 0x1A on
   load. The link uses `/SECTION:INIT,ERD`. See
-  `docs/evidence/kmd/README.md`, "Earlier runs".
+  [docs/evidence/kmd/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/README.md), "Earlier runs".
 - **INF decoration.** `NTamd64...16299`, without `.10.0`, puts 16299 in the
   ProductType field, and the INF then matches no device. `stampinf.py`
   writes `amd64.10.0`, as upstream does.
 - **Code 43 with the kernel-only INF.** Installed alone, the KMD loads and
   starts, then reports Code 43, because there is no UMD. The full package
-  reports problem code 0 (`docs/evidence/package/README.md`).
+  reports problem code 0 ([docs/evidence/package/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md)).
 - **Needs a 3D device.** The KMD requires `VIRTIO_GPU_F_VIRGL`, so it fails
   to start on a plain `virtio-vga`. Use vmlab's `gpu { mode = "vulkan" }`.
 - **No static analysis.** Upstream's tree has Static Driver Verifier scripts

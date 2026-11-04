@@ -1,163 +1,64 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Build the release assets for one version from a clean checkout.
-#
-#   scripts/release.sh <version>          for example 0.1.0-alpha
-#
-# Refuses a dirty tree. Runs scripts/build.sh (every component, then the
-# signed package), patches/host/build-virglrenderer.sh (the render server and
-# the libvirglrenderer the QEMU bundles, in the Debian 12 container of
-# patches/host/Dockerfile) and patches/host/build-qemu.sh (the QEMU commit
-# pinned in patches/host/PINS, in the same container), then writes
-# out/release/<version>/:
-#   vmlab-win3d-<version>-windows-x64.zip                  guest package + README.txt
-#   qemu-vmlab-egl-<version>-x86_64-linux.tar.zst          vmlab QEMU (bin/, lib/) + install.sh
-#   virglrenderer-vmlab-<version>-x86_64-linux.tar.zst     vmlab render server + install.sh
-#   RELEASE-NOTES.md
-#   SHA256SUMS
-#
-# <version> must start with installer/VERSION (0.1.0 for 0.1.0-alpha).
-#
-# Releases should share one test certificate. Set WIN3D_SIGNING_DIR to the
-# directory that holds it (test-signing.key, .crt, .cer, SIGN_TIME,
-# CERT-INFO.txt; build/signing/make-test-cert.sh). For the build the script
-# links <repo>/.signing to it (the build scripts read .signing/), and removes
-# the link when it exits; the key is never copied. Without WIN3D_SIGNING_DIR
-# the checkout's own .signing/ is used, and created if it is missing.
-# WIN3D_CACHE is passed through to the builds that read it. docs/release.md
-# has the whole procedure.
+# Build guest release assets; --dry-run packages existing signed output only.
+# --publish explicitly tags and publishes after building. Never combine it with --dry-run.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=$(git -C "$REPO" rev-parse --show-toplevel)
 cd "$REPO"
-HERE=$REPO/scripts/release
-
-usage() { sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'; }
-[ $# -eq 1 ] && [ "$1" != -h ] && [ "$1" != --help ] || { usage >&2; exit 2; }
-VERSION=$1
-[[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "error: version '$VERSION' is not like 0.1.0-alpha" >&2; exit 2; }
+DRY_RUN=0
+PUBLISH=0
+VERSION=
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --publish) PUBLISH=1 ;;
+        -h|--help) echo "usage: $0 [version] [--dry-run | --publish]"; exit 0 ;;
+        -*) echo "unknown option: $arg" >&2; exit 2 ;;
+        *) [ -z "$VERSION" ] || exit 2; VERSION=$arg ;;
+    esac
+done
+[ "$DRY_RUN:$PUBLISH" != 1:1 ] || { echo "--dry-run cannot publish" >&2; exit 2; }
 PKG_VERSION=$(cat installer/VERSION)
-[ "${VERSION%%-*}" = "$PKG_VERSION" ] || { echo "error: version $VERSION does not match installer/VERSION ($PKG_VERSION)" >&2; exit 2; }
-
-stage() { printf '\n==== release: %s (%s)\n' "$1" "$(date -Is)"; }
-clean_or_die() {
-    local dirty
-    dirty=$(git status --porcelain --untracked-files=all)
-    [ -z "$dirty" ] || { echo "error: the tree is dirty $1:" >&2; echo "$dirty" >&2; exit 1; }
-}
-
-stage "check the tree"
-clean_or_die "(commit or remove these first)"
-COMMIT=$(git rev-parse HEAD)
-EPOCH=$(git log -1 --format=%ct)
-# The QEMU source is one pin: the "qemu" line of patches/host/PINS, a commit
-# on the VMLabDev/qemu fork branch (patches/host/bump-qemu.sh moves it).
-read -r QEMU_URL QEMU_BRANCH QEMU_COMMIT < <(awk '$1 == "qemu" && $3 == "branch" && $5 == "commit" { print $2, $4, $6 }' patches/host/PINS)
-echo "QEMU: $QEMU_URL $QEMU_BRANCH $QEMU_COMMIT"
-
-LINKED=
-cleanup() { [ -z "$LINKED" ] || rm -f "$REPO/.signing"; }
-trap cleanup EXIT
-if [ -n "${WIN3D_SIGNING_DIR:-}" ]; then
-    SIGNING=$(cd "$WIN3D_SIGNING_DIR" && pwd)
-    for f in test-signing.key test-signing.crt test-signing.cer SIGN_TIME CERT-INFO.txt; do
-        [ -f "$SIGNING/$f" ] || { echo "error: $SIGNING/$f is missing" >&2; exit 1; }
-    done
-    if [ -L .signing ]; then
-        [ "$(readlink -f .signing)" = "$SIGNING" ] || { echo "error: .signing links to $(readlink -f .signing), not $SIGNING" >&2; exit 1; }
-    elif [ -e .signing ]; then
-        echo "error: .signing exists in $REPO; remove it or unset WIN3D_SIGNING_DIR" >&2; exit 1
-    else
-        ln -s "$SIGNING" .signing; LINKED=1
-    fi
-    echo "signing with $SIGNING"
-else
-    SIGNING=$REPO/.signing
-    echo "WIN3D_SIGNING_DIR is not set: signing with $SIGNING (a new key if it is missing)"
-fi
-
-stage "build the package (scripts/build.sh)"
-scripts/build.sh
-# The render server first: build-qemu.sh bundles its libvirglrenderer.
-stage "build the render server (patches/host/build-virglrenderer.sh)"
-WITH_WORKAROUND=0 patches/host/build-virglrenderer.sh
-stage "build QEMU (patches/host/build-qemu.sh)"
-patches/host/build-qemu.sh
-clean_or_die "after the build (a build script wrote into the tree)"
-
-OUT=$REPO/out/release/$VERSION
-STAGE=$REPO/out/release/.stage-$VERSION
-rm -rf "$OUT" "$STAGE"
-mkdir -p "$OUT" "$STAGE"
+VERSION=${VERSION:-$PKG_VERSION}
+[[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 2
+[ "${VERSION%%-*}" = "$PKG_VERSION" ] || { echo "version does not match installer/VERSION" >&2; exit 2; }
+dirty=$(git -C "$ROOT" status --porcelain --untracked-files=all -- guest/win3d)
+[ -z "$dirty" ] || { echo "guest/win3d is dirty:" >&2; echo "$dirty" >&2; exit 1; }
+COMMIT=$(git -C "$ROOT" log -1 --format=%H -- guest/win3d)
+EPOCH=$(git -C "$ROOT" log -1 --format=%ct -- guest/win3d)
+TAG=win3d-v$VERSION
+SIGNING=${WIN3D_SIGNING_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/vmlab/signing/win3d}
+export WIN3D_SIGNING_DIR=$SIGNING
+for f in test-signing.key test-signing.crt test-signing.cer SIGN_TIME CERT-INFO.txt; do
+    [ -f "$SIGNING/$f" ] || { echo "missing signing file: $SIGNING/$f" >&2; exit 1; }
+done
+echo "tag: $TAG"
+echo "guest commit: $COMMIT"
+echo "signing directory: $SIGNING"
+if [ "$DRY_RUN" = 0 ]; then scripts/build.sh; fi
 BUNDLE=vmlab-win3d-$PKG_VERSION
+PACKAGE=${WIN3D_PACKAGE_DIR:-$REPO/out/package/$BUNDLE}
+OUT=$REPO/out/release/$VERSION
+mkdir -p "$OUT"
+STAGE=$(mktemp -d "$OUT/.stage.XXXXXXXX")
+trap 'rm -rf "$STAGE"' EXIT
+python3 scripts/release/assemble.py guest "$PACKAGE" "$STAGE/$BUNDLE" "$PKG_VERSION" "$COMMIT" "$SIGNING/test-signing.cer"
 CERT_SUBJECT=$(sed -n 's/^subject: *//p' "$SIGNING/CERT-INFO.txt")
 CERT_SHA1=$(sed -n 's/^sha1 thumbprint: *//p' "$SIGNING/CERT-INFO.txt")
-grep -q "\"$CERT_SHA1\"" "out/package/$BUNDLE/manifest.json" \
-    || { echo "error: out/package/$BUNDLE/manifest.json does not name the certificate $CERT_SHA1" >&2; exit 1; }
-
-stage "driver zip"
-ZIP=$OUT/vmlab-win3d-$VERSION-windows-x64.zip
-mkdir -p "$STAGE/zip"
-cp -r "out/package/$BUNDLE" "$STAGE/zip/"
-python3 "$HERE/assemble.py" fill "$HERE/windows-README.txt" "$STAGE/zip/README.txt" --crlf \
+python3 scripts/release/assemble.py fill scripts/release/windows-README.txt "$STAGE/README.txt" --crlf \
     VERSION="$VERSION" COMMIT="$COMMIT" BUNDLE="$BUNDLE" CERT_SUBJECT="$CERT_SUBJECT" CERT_SHA1="$CERT_SHA1"
-python3 "$HERE/assemble.py" zip "$STAGE/zip" "$ZIP" "$EPOCH"
-
-stage "QEMU tarball"
-QNAME=qemu-vmlab-egl-$VERSION
-Q=$STAGE/$QNAME
-TARBALL=$OUT/$QNAME-x86_64-linux.tar.zst
-mkdir -p "$Q/bin" "$Q/lib"
-cp out/host/qemu/bin/qemu-system-x86_64 "$Q/bin/"
-# The bundled virglrenderer, which RUNPATH=$ORIGIN/../lib makes the binary load.
-cp out/host/qemu/lib/libvirglrenderer.so.1 "$Q/lib/"
-cp out/host/qemu/BUILDINFO "$Q/"
-cp -r out/host/qemu/licenses "$Q/"
-cp "$HERE/qemu-install.sh" "$Q/install.sh"
-chmod 755 "$Q/install.sh" "$Q/bin/qemu-system-x86_64" "$Q/lib/libvirglrenderer.so.1"
-binfo() { sed -n "s/^$1: *//p" out/host/qemu/BUILDINFO; }
-[ "$(binfo commit)" = "$QEMU_COMMIT" ] || { echo "error: out/host/qemu is commit $(binfo commit), PINS says $QEMU_COMMIT" >&2; exit 1; }
-python3 "$HERE/assemble.py" fill "$HERE/qemu-README.txt" "$Q/README.txt" \
-    VERSION="$VERSION" COMMIT="$COMMIT" \
-    QEMU_URL="$QEMU_URL" QEMU_BRANCH="$QEMU_BRANCH" QEMU_COMMIT="$QEMU_COMMIT" \
-    QEMU_VERSION="$(binfo qemu | awk '{ print $4 }')" QEMU_BASE="$(binfo base | awk '{ print $1 }')" \
-    QEMU_SERIES="$(binfo series | sed 's/^/  /')" \
-    BUILD_HOST="$(binfo 'build host')" \
-    BUILDINFO="$(grep -E '^(build image|compiler|needs ISA|glibc|needs GLIBC|lib |RUNPATH|NEEDED)' out/host/qemu/BUILDINFO | sed 's/^/  /')"
-find "$Q" -exec touch -h -d "@$EPOCH" {} +
-tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
-    -C "$STAGE" -cf - "$QNAME" | zstd -19 -T0 -q -o "$TARBALL"
-
-stage "render server tarball"
-VNAME=virglrenderer-vmlab-$VERSION
-V=$STAGE/$VNAME
-VTARBALL=$OUT/$VNAME-x86_64-linux.tar.zst
-VB=out/host/virglrenderer
-read -r VIRGL_URL VIRGL_VERSION VIRGL_SHA < <(awk '$1 == "virglrenderer" { print $2, $4, $6 }' patches/host/PINS)
-grep -q "^sha256: *$VIRGL_SHA\$" "$VB/BUILDINFO" || { echo "error: $VB/BUILDINFO is not from the pinned virglrenderer $VIRGL_SHA" >&2; exit 1; }
-! grep -q '^patch: *workaround/' "$VB/BUILDINFO" || { echo "error: $VB was built WITH_WORKAROUND=1" >&2; exit 1; }
-mkdir -p "$V/libexec"
-cp "$VB/libexec/virgl_render_server" "$V/libexec/"
-cp "$VB/BUILDINFO" "$V/"
-cp -r "$VB/licenses" "$V/"
-cp "$HERE/virgl-install.sh" "$V/install.sh"
-chmod 755 "$V/install.sh" "$V/libexec/virgl_render_server"
-python3 "$HERE/assemble.py" fill "$HERE/virgl-README.txt" "$V/README.txt" \
-    VERSION="$VERSION" COMMIT="$COMMIT" \
-    VIRGL_VERSION="$VIRGL_VERSION" VIRGL_URL="$VIRGL_URL" VIRGL_SHA="$VIRGL_SHA" \
-    PATCHES="$(sed -n 's/^patch: *\([^ ]*\).*/  \1/p' "$VB/BUILDINFO")" \
-    BUILD_HOST="$(sed -n 's/^build host: *//p' "$VB/BUILDINFO")" \
-    BUILDINFO="$(grep -E '^(build image|compiler|needs ISA|glibc|needs GLIBC|lib |NEEDED)' "$VB/BUILDINFO" | sed 's/^/  /')"
-find "$V" -exec touch -h -d "@$EPOCH" {} +
-tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
-    -C "$STAGE" -cf - "$VNAME" | zstd -19 -T0 -q -o "$VTARBALL"
-
-stage "release notes and checksums"
-python3 "$HERE/assemble.py" notes "$OUT/RELEASE-NOTES.md" "$VERSION" "$COMMIT" "$EPOCH" \
-    "$SIGNING/CERT-INFO.txt" out/host/qemu/BUILDINFO "$ZIP" "$TARBALL" "$VTARBALL"
-(cd "$OUT" && sha256sum "$(basename "$ZIP")" "$(basename "$TARBALL")" "$(basename "$VTARBALL")" RELEASE-NOTES.md >SHA256SUMS)
-rm -rf "$STAGE"
-clean_or_die "after the release (the release wrote into the tree)"
-
-stage done
-ls -l "$OUT"
+ZIP=$OUT/vmlab-win3d-$VERSION-windows-x64.zip
+python3 scripts/release/assemble.py zip "$STAGE" "$ZIP" "$EPOCH"
+python3 scripts/release/assemble.py notes "$OUT/RELEASE-NOTES.md" "$VERSION" "$COMMIT" "$EPOCH" "$SIGNING/CERT-INFO.txt" "$ZIP"
+(cd "$OUT" && sha256sum "$(basename "$ZIP")" RELEASE-NOTES.md >SHA256SUMS)
+if [ "$PUBLISH" = 1 ]; then
+    git -C "$ROOT" tag -a "$TAG" "$COMMIT" -m "win3d $VERSION"
+    git -C "$ROOT" push https://github.com/VMLabDev/vmlab.git "refs/tags/$TAG"
+    flags=()
+    [[ $VERSION != *-* ]] || flags+=(--prerelease)
+    gh release create "$TAG" --repo VMLabDev/vmlab --verify-tag --title "win3d $VERSION" \
+        --notes-file "$OUT/RELEASE-NOTES.md" "${flags[@]}" "$ZIP" "$OUT/SHA256SUMS"
+fi
+echo "release assets: $OUT (dry-run=$DRY_RUN, published=$PUBLISH)"
 cat "$OUT/SHA256SUMS"

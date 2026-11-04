@@ -1,5 +1,9 @@
 # Application compatibility sweep
 
+The recorded QEMU runs and host assets are historical. Current win3d labs
+use the in-tree vmlab-hv bundle and its patched Venus render server.
+See [host.md](host.md) and [release.md](release.md) for current setup.
+
 Before this sweep, the only third-party programs the package had run were
 the DirectX SDK samples and Blender (`docs/acceptance.md`, "Stretch"). This
 sweep runs six unmodified, freely downloadable Windows programs, 12 runs that
@@ -16,9 +20,9 @@ failure below is recorded in enough detail for a later worker to pick it up.
 
 The failures were then fixed one by one (each failure's status below). The
 whole sweep ran again on AMD1 with release candidate 0.1.1-alpha-rc2
-(package built at `0d3eb68`), and **all 12 runs pass**
+(package built at [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4)), and **all 12 runs pass**
 ([rc2 on AMD1](#release-candidate-011-alpha-rc2-on-amd1)). With release
-candidate 0.1.1-alpha-rc3 (built at `ee9ce49`, the same guest package)
+candidate 0.1.1-alpha-rc3 (built at [ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d), the same guest package)
 it ran again on Nvidia2, after helios got Resizable BAR, and **all 12 runs
 pass** there too ([rc3 on Nvidia2](#release-candidate-011-alpha-rc3-on-nvidia2)).
 
@@ -55,7 +59,7 @@ did not time out.
 
 ### What each run records
 
-Each run writes its evidence to `docs/evidence/compat/<gpu>/<run>/`:
+Each run writes its evidence to [docs/evidence/compat/<gpu>/<run>/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/):
 
 - `console-1.png`, `console-2.png` and `console-3.png`: console frames at
   about 20 s, at mid-run and just before the close.
@@ -92,7 +96,7 @@ are paid features), so the sweep does not use their F9 benchmark.
 
 | Item | Value |
 | --- | --- |
-| Package | `vmlab-win3d-0.1.1`, the rc bundle built at `0ee5ba1` (`82d8e51` plus the version bump). The zip's sha256 is `414117aa...`, the same as `docs/evidence/rc/` |
+| Package | `vmlab-win3d-0.1.1`, the rc bundle built at [0ee5ba1](https://github.com/VMLabDev/vmlab-win3d/commit/0ee5ba149e10b7671aef8ab3db71f187c53d895c) ([82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75) plus the version bump). The zip's sha256 is `414117aa...`, the same as [docs/evidence/rc/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/) |
 | Host | QEMU 11.1.1 (the patched QEMU for Nvidia2), virglrenderer 1.3.0, Mesa 26.2.2, NVIDIA 610.57.04, vmlab 0.28.0-alpha (`<gpu>/host.txt`) |
 | Guest | `windows-11@26100.1742.5`, activated (`<gpu>/activation.txt`) |
 | Date | 2026-10-19 |
@@ -117,30 +121,30 @@ full time, and exited cleanly on WM_CLOSE.
 
 | Application | API | GPU | Result | FPS | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| Unigine Heaven 4.0 | D3D11 | AMD1 | Pass on the rerun; the first run crashed at 65 s (heap corruption, [F7](#f7-heaven-d3d11-on-amd1-crashed-once)) | 15.7 (OCR) | [amd1/heaven-d3d11](evidence/compat/amd1/heaven-d3d11/), [run1](evidence/compat/amd1/heaven-d3d11-run1/) |
-| Unigine Heaven 4.0 | D3D11 | Nvidia2 | Pass | 26.6 (OCR) | [nvidia2/heaven-d3d11](evidence/compat/nvidia2/heaven-d3d11/) |
-| Unigine Heaven 4.0 | D3D9 | AMD1 | Pass | 13.0 (OCR) | [amd1/heaven-d3d9](evidence/compat/amd1/heaven-d3d9/) |
-| Unigine Heaven 4.0 | D3D9 | Nvidia2 | **Renders wrong**: dark frames and skipped draws ([F5](#f5-d3d9-depth-bias-on-nvidia)); exits cleanly | 1.1 (OCR) | [nvidia2/heaven-d3d9](evidence/compat/nvidia2/heaven-d3d9/) |
-| Unigine Heaven 4.0 | OpenGL | AMD1 | Pass | 17.5 (OCR) | [amd1/heaven-opengl](evidence/compat/amd1/heaven-opengl/) |
-| Unigine Heaven 4.0 | OpenGL | Nvidia2 | **Crash** at 26 s, `0xC0000005` in `viogpu_wgl.dll` ([F4](#f4-unigine-opengl-on-nvidia2)) | - | [nvidia2/heaven-opengl](evidence/compat/nvidia2/heaven-opengl/) |
-| Unigine Valley 1.0 | D3D11 | AMD1 | Pass | 14.8 (OCR) | [amd1/valley-d3d11](evidence/compat/amd1/valley-d3d11/) |
-| Unigine Valley 1.0 | D3D11 | Nvidia2 | Pass | 9.8 (OCR) | [nvidia2/valley-d3d11](evidence/compat/nvidia2/valley-d3d11/) |
-| Unigine Valley 1.0 | D3D9 | AMD1 | **Hang**: the frame freezes mid-run, and the program does not exit on WM_CLOSE ([F6](#f6-valley-d3d9-on-amd1-hangs)) | 2.7 (OCR) | [amd1/valley-d3d9](evidence/compat/amd1/valley-d3d9/) |
-| Unigine Valley 1.0 | D3D9 | Nvidia2 | **Crash** at 111 s, `0xC0000005` in `Unigine_x86.dll`, after skipped draws ([F5](#f5-d3d9-depth-bias-on-nvidia)) | 3.9 (OCR) | [nvidia2/valley-d3d9](evidence/compat/nvidia2/valley-d3d9/) |
-| Unigine Valley 1.0 | OpenGL | AMD1 | Pass | 20.8 (OCR) | [amd1/valley-opengl](evidence/compat/amd1/valley-opengl/) |
-| Unigine Valley 1.0 | OpenGL | Nvidia2 | **Crash** at 17 s, `0xC0000409`, with no frame ([F4](#f4-unigine-opengl-on-nvidia2)) | - | [nvidia2/valley-opengl](evidence/compat/nvidia2/valley-opengl/) |
-| Godot 4.7.2, 3D Particles demo | D3D12 | AMD1 | Pass | 59.2 | [amd1/godot-d3d12](evidence/compat/amd1/godot-d3d12/) |
-| Godot 4.7.2, 3D Particles demo | D3D12 | Nvidia2 | Pass | 59.8 | [nvidia2/godot-d3d12](evidence/compat/nvidia2/godot-d3d12/) |
-| Godot 4.7.2, 3D Particles demo | Vulkan | AMD1 | Pass | 60.1 | [amd1/godot-vulkan](evidence/compat/amd1/godot-vulkan/) |
-| Godot 4.7.2, 3D Particles demo | Vulkan | Nvidia2 | **Xid 69** on the host about 9 s in, no frame drawn, then a crash with `0xC0000409` ([F1](#f1-godot-vulkan-on-nvidia2-xid-69)) | - | [nvidia2/godot-vulkan](evidence/compat/nvidia2/godot-vulkan/) |
-| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | AMD1 | Pass ([note](#godot-compatibility-renderer-looks-lighter)) | 62.8 | [amd1/godot-opengl](evidence/compat/amd1/godot-opengl/) |
-| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | Nvidia2 | Pass ([note](#godot-compatibility-renderer-looks-lighter)) | 59.0 | [nvidia2/godot-opengl](evidence/compat/nvidia2/godot-opengl/) |
-| GZDoom 4.14.2, Freedoom 2 | Vulkan | AMD1 | Pass | 35.0 (OCR) | [amd1/gzdoom-vulkan](evidence/compat/amd1/gzdoom-vulkan/) |
-| GZDoom 4.14.2, Freedoom 2 | Vulkan | Nvidia2 | **Crash** at 6 to 26 s, `0xC0000409`, with a black window; 2 of 2 runs ([F2](#f2-gzdoom-vulkan-on-nvidia2)) | - | [nvidia2/gzdoom-vulkan](evidence/compat/nvidia2/gzdoom-vulkan/) |
-| GZDoom 4.14.2, Freedoom 2 | OpenGL | AMD1 | **Fails to start**: "Unable to create an OpenGL render context" ([F3](#f3-gzdoom-cannot-create-an-opengl-context)) | - | [amd1/gzdoom-opengl](evidence/compat/amd1/gzdoom-opengl/) |
-| GZDoom 4.14.2, Freedoom 2 | OpenGL | Nvidia2 | **Fails to start**: the same as AMD1 | - | [nvidia2/gzdoom-opengl](evidence/compat/nvidia2/gzdoom-opengl/) |
-| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | AMD1 | Pass; on WM_CLOSE it asks "press y to quit", by design ([note](#crispy-doom-asks-before-it-quits)) | - | [amd1/crispy-doom-d3d9](evidence/compat/amd1/crispy-doom-d3d9/) |
-| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | Nvidia2 | Pass; the same quit prompt | - | [nvidia2/crispy-doom-d3d9](evidence/compat/nvidia2/crispy-doom-d3d9/) |
+| Unigine Heaven 4.0 | D3D11 | AMD1 | Pass on the rerun; the first run crashed at 65 s (heap corruption, [F7](#f7-heaven-d3d11-on-amd1-crashed-once)) | 15.7 (OCR) | [amd1/heaven-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/heaven-d3d11), [run1](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/heaven-d3d11-run1) |
+| Unigine Heaven 4.0 | D3D11 | Nvidia2 | Pass | 26.6 (OCR) | [nvidia2/heaven-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/heaven-d3d11) |
+| Unigine Heaven 4.0 | D3D9 | AMD1 | Pass | 13.0 (OCR) | [amd1/heaven-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/heaven-d3d9) |
+| Unigine Heaven 4.0 | D3D9 | Nvidia2 | **Renders wrong**: dark frames and skipped draws ([F5](#f5-d3d9-depth-bias-on-nvidia)); exits cleanly | 1.1 (OCR) | [nvidia2/heaven-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/heaven-d3d9) |
+| Unigine Heaven 4.0 | OpenGL | AMD1 | Pass | 17.5 (OCR) | [amd1/heaven-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/heaven-opengl) |
+| Unigine Heaven 4.0 | OpenGL | Nvidia2 | **Crash** at 26 s, `0xC0000005` in `viogpu_wgl.dll` ([F4](#f4-unigine-opengl-on-nvidia2)) | - | [nvidia2/heaven-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/heaven-opengl) |
+| Unigine Valley 1.0 | D3D11 | AMD1 | Pass | 14.8 (OCR) | [amd1/valley-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/valley-d3d11) |
+| Unigine Valley 1.0 | D3D11 | Nvidia2 | Pass | 9.8 (OCR) | [nvidia2/valley-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/valley-d3d11) |
+| Unigine Valley 1.0 | D3D9 | AMD1 | **Hang**: the frame freezes mid-run, and the program does not exit on WM_CLOSE ([F6](#f6-valley-d3d9-on-amd1-hangs)) | 2.7 (OCR) | [amd1/valley-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/valley-d3d9) |
+| Unigine Valley 1.0 | D3D9 | Nvidia2 | **Crash** at 111 s, `0xC0000005` in `Unigine_x86.dll`, after skipped draws ([F5](#f5-d3d9-depth-bias-on-nvidia)) | 3.9 (OCR) | [nvidia2/valley-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/valley-d3d9) |
+| Unigine Valley 1.0 | OpenGL | AMD1 | Pass | 20.8 (OCR) | [amd1/valley-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/valley-opengl) |
+| Unigine Valley 1.0 | OpenGL | Nvidia2 | **Crash** at 17 s, `0xC0000409`, with no frame ([F4](#f4-unigine-opengl-on-nvidia2)) | - | [nvidia2/valley-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/valley-opengl) |
+| Godot 4.7.2, 3D Particles demo | D3D12 | AMD1 | Pass | 59.2 | [amd1/godot-d3d12](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/godot-d3d12) |
+| Godot 4.7.2, 3D Particles demo | D3D12 | Nvidia2 | Pass | 59.8 | [nvidia2/godot-d3d12](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/godot-d3d12) |
+| Godot 4.7.2, 3D Particles demo | Vulkan | AMD1 | Pass | 60.1 | [amd1/godot-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/godot-vulkan) |
+| Godot 4.7.2, 3D Particles demo | Vulkan | Nvidia2 | **Xid 69** on the host about 9 s in, no frame drawn, then a crash with `0xC0000409` ([F1](#f1-godot-vulkan-on-nvidia2-xid-69)) | - | [nvidia2/godot-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/godot-vulkan) |
+| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | AMD1 | Pass ([note](#godot-compatibility-renderer-looks-lighter)) | 62.8 | [amd1/godot-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/godot-opengl) |
+| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | Nvidia2 | Pass ([note](#godot-compatibility-renderer-looks-lighter)) | 59.0 | [nvidia2/godot-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/godot-opengl) |
+| GZDoom 4.14.2, Freedoom 2 | Vulkan | AMD1 | Pass | 35.0 (OCR) | [amd1/gzdoom-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/gzdoom-vulkan) |
+| GZDoom 4.14.2, Freedoom 2 | Vulkan | Nvidia2 | **Crash** at 6 to 26 s, `0xC0000409`, with a black window; 2 of 2 runs ([F2](#f2-gzdoom-vulkan-on-nvidia2)) | - | [nvidia2/gzdoom-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/gzdoom-vulkan) |
+| GZDoom 4.14.2, Freedoom 2 | OpenGL | AMD1 | **Fails to start**: "Unable to create an OpenGL render context" ([F3](#f3-gzdoom-cannot-create-an-opengl-context)) | - | [amd1/gzdoom-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/gzdoom-opengl) |
+| GZDoom 4.14.2, Freedoom 2 | OpenGL | Nvidia2 | **Fails to start**: the same as AMD1 | - | [nvidia2/gzdoom-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/gzdoom-opengl) |
+| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | AMD1 | Pass; on WM_CLOSE it asks "press y to quit", by design ([note](#crispy-doom-asks-before-it-quits)) | - | [amd1/crispy-doom-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/amd1/crispy-doom-d3d9) |
+| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | Nvidia2 | Pass; the same quit prompt | - | [nvidia2/crispy-doom-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2/crispy-doom-d3d9) |
 
 By API:
 
@@ -157,7 +161,7 @@ By API:
 
 The same sweep, one pass, on 2026-10-19 with the rc2 package
 (`vmlab-win3d-0.1.1`, built by `scripts/release.sh 0.1.1-alpha-rc2` at
-`0d3eb68`; [`docs/evidence/rc2/`](evidence/rc2/README.md)), in its own lab
+[0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4); [docs/evidence/rc2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc2/README.md)), in its own lab
 (`win3d-rc2-compat-amd1`). The host and guest are the same as above
 (`rc2-amd1/host.txt`). The release candidate's DirectDraw and
 fixed-function runs used another AMD1 lab until 13:37, the first minute of
@@ -170,18 +174,18 @@ COMPAT_LAB=win3d-rc2-compat-amd1 COMPAT_EV=$PWD/docs/evidence/compat/rc2-amd1 \
 
 | Application | API | AMD1, first sweep | AMD1, rc2 | FPS, rc2 | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| Unigine Heaven 4.0 | D3D11 | Pass on the rerun; crashed once (F7) | Pass | 21.4 (OCR) | [rc2-amd1/heaven-d3d11](evidence/compat/rc2-amd1/heaven-d3d11/) |
-| Unigine Heaven 4.0 | D3D9 | Pass | Pass | 16.8 (OCR) | [rc2-amd1/heaven-d3d9](evidence/compat/rc2-amd1/heaven-d3d9/) |
-| Unigine Heaven 4.0 | OpenGL | Pass | Pass | 24.5 (OCR) | [rc2-amd1/heaven-opengl](evidence/compat/rc2-amd1/heaven-opengl/) |
-| Unigine Valley 1.0 | D3D11 | Pass | Pass | 24.4 (OCR) | [rc2-amd1/valley-d3d11](evidence/compat/rc2-amd1/valley-d3d11/) |
-| Unigine Valley 1.0 | D3D9 | **Hang** (F6) | **Pass**: renders to the end and exits cleanly | 13.5 (OCR) | [rc2-amd1/valley-d3d9](evidence/compat/rc2-amd1/valley-d3d9/) |
-| Unigine Valley 1.0 | OpenGL | Pass | Pass | 33.3 (OCR) | [rc2-amd1/valley-opengl](evidence/compat/rc2-amd1/valley-opengl/) |
-| Godot 4.7.2, 3D Particles demo | D3D12 | Pass | Pass | 60.0 | [rc2-amd1/godot-d3d12](evidence/compat/rc2-amd1/godot-d3d12/) |
-| Godot 4.7.2, 3D Particles demo | Vulkan | Pass | Pass | 60.0 | [rc2-amd1/godot-vulkan](evidence/compat/rc2-amd1/godot-vulkan/) |
-| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | Pass | Pass | 66.2 | [rc2-amd1/godot-opengl](evidence/compat/rc2-amd1/godot-opengl/) |
-| GZDoom 4.14.2, Freedoom 2 | Vulkan | Pass | Pass | 35.0 (OCR) | [rc2-amd1/gzdoom-vulkan](evidence/compat/rc2-amd1/gzdoom-vulkan/) |
-| GZDoom 4.14.2, Freedoom 2 | OpenGL | **Fails to start** (F3) | **Pass**: renders its title loop and exits cleanly | 35.0 (OCR) | [rc2-amd1/gzdoom-opengl](evidence/compat/rc2-amd1/gzdoom-opengl/) |
-| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | Pass; quit prompt | Pass; the same quit prompt | - | [rc2-amd1/crispy-doom-d3d9](evidence/compat/rc2-amd1/crispy-doom-d3d9/) |
+| Unigine Heaven 4.0 | D3D11 | Pass on the rerun; crashed once (F7) | Pass | 21.4 (OCR) | [rc2-amd1/heaven-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/heaven-d3d11) |
+| Unigine Heaven 4.0 | D3D9 | Pass | Pass | 16.8 (OCR) | [rc2-amd1/heaven-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/heaven-d3d9) |
+| Unigine Heaven 4.0 | OpenGL | Pass | Pass | 24.5 (OCR) | [rc2-amd1/heaven-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/heaven-opengl) |
+| Unigine Valley 1.0 | D3D11 | Pass | Pass | 24.4 (OCR) | [rc2-amd1/valley-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/valley-d3d11) |
+| Unigine Valley 1.0 | D3D9 | **Hang** (F6) | **Pass**: renders to the end and exits cleanly | 13.5 (OCR) | [rc2-amd1/valley-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/valley-d3d9) |
+| Unigine Valley 1.0 | OpenGL | Pass | Pass | 33.3 (OCR) | [rc2-amd1/valley-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/valley-opengl) |
+| Godot 4.7.2, 3D Particles demo | D3D12 | Pass | Pass | 60.0 | [rc2-amd1/godot-d3d12](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/godot-d3d12) |
+| Godot 4.7.2, 3D Particles demo | Vulkan | Pass | Pass | 60.0 | [rc2-amd1/godot-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/godot-vulkan) |
+| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | Pass | Pass | 66.2 | [rc2-amd1/godot-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/godot-opengl) |
+| GZDoom 4.14.2, Freedoom 2 | Vulkan | Pass | Pass | 35.0 (OCR) | [rc2-amd1/gzdoom-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/gzdoom-vulkan) |
+| GZDoom 4.14.2, Freedoom 2 | OpenGL | **Fails to start** (F3) | **Pass**: renders its title loop and exits cleanly | 35.0 (OCR) | [rc2-amd1/gzdoom-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/gzdoom-opengl) |
+| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | Pass; quit prompt | Pass; the same quit prompt | - | [rc2-amd1/crispy-doom-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1/crispy-doom-d3d9) |
 
 Every run except Crispy Doom exited with code 0 within 60 s of WM_CLOSE;
 Crispy Doom waits at its quit prompt, as before. No run loaded an
@@ -195,7 +199,7 @@ measurement of the fixes.
 
 The same sweep, one pass, on 2026-10-19 with the rc3 package
 (`vmlab-win3d-0.1.1`, built by `scripts/release.sh 0.1.1-alpha-rc3` at
-`ee9ce49`; [`docs/evidence/rc3/`](evidence/rc3/README.md)), in its own lab
+[ee9ce49](https://github.com/VMLabDev/vmlab-win3d/commit/ee9ce49fefc7d6820653b6014d44d876fc12965d); [docs/evidence/rc3/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md)), in its own lab
 (`win3d-rc3-compat-nvidia2`). Since the first sweep, helios has Resizable
 BAR: BAR1 is 32 GiB, and Venus guests on NVIDIA now get host-visible VRAM
 ([`nvva.md`](nvva.md)). The host has vmlab 0.30.0-alpha, the patched QEMU
@@ -203,7 +207,7 @@ and the vmlab render server as Nvidia2's `qemu_binary` and `qemu_env`
 (`rc3-nvidia2/host.txt`). The guest was activated
 (`rc3-nvidia2/activation.txt`). Nvidia2 was not quiet: for the whole sweep
 it also ran the rc3 windows-11 e2e lab and a probe-loop lab, the ReBAR load
-check in [`docs/evidence/rc3/`](evidence/rc3/README.md#rebar-load-check).
+check in [docs/evidence/rc3/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#rebar-load-check).
 
 ```sh
 COMPAT_LAB=win3d-rc3-compat-nvidia2 COMPAT_EV=$PWD/docs/evidence/compat/rc3-nvidia2 \
@@ -212,24 +216,24 @@ COMPAT_LAB=win3d-rc3-compat-nvidia2 COMPAT_EV=$PWD/docs/evidence/compat/rc3-nvid
 
 | Application | API | Nvidia2, first sweep | Nvidia2, rc3 | FPS, rc3 | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| Unigine Heaven 4.0 | D3D11 | Pass | Pass | 53.9 (OCR) | [rc3-nvidia2/heaven-d3d11](evidence/compat/rc3-nvidia2/heaven-d3d11/) |
-| Unigine Heaven 4.0 | D3D9 | **Renders wrong** (F5) | **Pass**: the airship scene fully lit, no skipped draws | 24.6 (OCR) | [rc3-nvidia2/heaven-d3d9](evidence/compat/rc3-nvidia2/heaven-d3d9/) |
-| Unigine Heaven 4.0 | OpenGL | **Crash** at 26 s (F4) | **Pass** | 110.2 (OCR) | [rc3-nvidia2/heaven-opengl](evidence/compat/rc3-nvidia2/heaven-opengl/) |
-| Unigine Valley 1.0 | D3D11 | Pass | Pass | 17.6 (OCR) | [rc3-nvidia2/valley-d3d11](evidence/compat/rc3-nvidia2/valley-d3d11/) |
-| Unigine Valley 1.0 | D3D9 | **Crash** at 111 s (F5) | **Pass**: renders to the end and exits cleanly | 9.9 (OCR) | [rc3-nvidia2/valley-d3d9](evidence/compat/rc3-nvidia2/valley-d3d9/) |
-| Unigine Valley 1.0 | OpenGL | **Crash** at 17 s (F4) | **Pass** | 61.2 (OCR) | [rc3-nvidia2/valley-opengl](evidence/compat/rc3-nvidia2/valley-opengl/) |
-| Godot 4.7.2, 3D Particles demo | D3D12 | Pass | Pass | 60.0 | [rc3-nvidia2/godot-d3d12](evidence/compat/rc3-nvidia2/godot-d3d12/) |
-| Godot 4.7.2, 3D Particles demo | Vulkan | **Xid 69** (F1) | **Pass**, no Xid | 59.2 | [rc3-nvidia2/godot-vulkan](evidence/compat/rc3-nvidia2/godot-vulkan/) |
-| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | Pass | Pass | 56.9 | [rc3-nvidia2/godot-opengl](evidence/compat/rc3-nvidia2/godot-opengl/) |
-| GZDoom 4.14.2, Freedoom 2 | Vulkan | **Crash** (F2) | **Pass**: renders its title loop and exits cleanly | 34.8 (OCR) | [rc3-nvidia2/gzdoom-vulkan](evidence/compat/rc3-nvidia2/gzdoom-vulkan/) |
-| GZDoom 4.14.2, Freedoom 2 | OpenGL | **Fails to start** (F3) | **Pass** | 34.9 (OCR) | [rc3-nvidia2/gzdoom-opengl](evidence/compat/rc3-nvidia2/gzdoom-opengl/) |
-| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | Pass; quit prompt | Pass; the same quit prompt | - | [rc3-nvidia2/crispy-doom-d3d9](evidence/compat/rc3-nvidia2/crispy-doom-d3d9/) |
+| Unigine Heaven 4.0 | D3D11 | Pass | Pass | 53.9 (OCR) | [rc3-nvidia2/heaven-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/heaven-d3d11) |
+| Unigine Heaven 4.0 | D3D9 | **Renders wrong** (F5) | **Pass**: the airship scene fully lit, no skipped draws | 24.6 (OCR) | [rc3-nvidia2/heaven-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/heaven-d3d9) |
+| Unigine Heaven 4.0 | OpenGL | **Crash** at 26 s (F4) | **Pass** | 110.2 (OCR) | [rc3-nvidia2/heaven-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/heaven-opengl) |
+| Unigine Valley 1.0 | D3D11 | Pass | Pass | 17.6 (OCR) | [rc3-nvidia2/valley-d3d11](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/valley-d3d11) |
+| Unigine Valley 1.0 | D3D9 | **Crash** at 111 s (F5) | **Pass**: renders to the end and exits cleanly | 9.9 (OCR) | [rc3-nvidia2/valley-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/valley-d3d9) |
+| Unigine Valley 1.0 | OpenGL | **Crash** at 17 s (F4) | **Pass** | 61.2 (OCR) | [rc3-nvidia2/valley-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/valley-opengl) |
+| Godot 4.7.2, 3D Particles demo | D3D12 | Pass | Pass | 60.0 | [rc3-nvidia2/godot-d3d12](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/godot-d3d12) |
+| Godot 4.7.2, 3D Particles demo | Vulkan | **Xid 69** (F1) | **Pass**, no Xid | 59.2 | [rc3-nvidia2/godot-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/godot-vulkan) |
+| Godot 4.7.2, 3D Particles demo | OpenGL 3.3 (Compatibility) | Pass | Pass | 56.9 | [rc3-nvidia2/godot-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/godot-opengl) |
+| GZDoom 4.14.2, Freedoom 2 | Vulkan | **Crash** (F2) | **Pass**: renders its title loop and exits cleanly | 34.8 (OCR) | [rc3-nvidia2/gzdoom-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/gzdoom-vulkan) |
+| GZDoom 4.14.2, Freedoom 2 | OpenGL | **Fails to start** (F3) | **Pass** | 34.9 (OCR) | [rc3-nvidia2/gzdoom-opengl](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/gzdoom-opengl) |
+| Crispy Doom 7.2.0, Freedoom 2 | D3D9 (SDL renderer) | Pass; quit prompt | Pass; the same quit prompt | - | [rc3-nvidia2/crispy-doom-d3d9](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc3-nvidia2/crispy-doom-d3d9) |
 
 Every run except Crispy Doom exited with code 0 within 60 s of WM_CLOSE.
 Crispy Doom waits at its quit prompt, as before. No run wrote a Windows
 Error Reporting report or a host kernel line. The host logged no Xid and no
 `can't alloc VA space` line during the sweep
-([ReBAR load check](evidence/rc3/README.md#rebar-load-check)). The only
+([ReBAR load check](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md#rebar-load-check)). The only
 app-local graphics modules are the D3DX 9 and D3DCompiler 42 DLLs that
 Unigine ships in its own `bin\` (Heaven and Valley, D3D9 and D3D11), as in
 `rc2-amd1/results.json`. The UMD logged its usual warnings (feedback-loop
@@ -267,12 +271,12 @@ render-server lines are virglrenderer's, from QEMU's log.
 
   | NVRM line (verbatim) | Run | Run started | Seconds in |
   | --- | --- | --- | --- |
-  | `NVRM: Xid (PCI:0000:05:00): 69, pid=2238723, name=vkr-ring-37, Class Error: channel 0x00000038, Class 0000ce97, Offset 0000026c, Data 00000006, ErrorCode 0000013d` at 01:50:44 | `godot-vulkan`, first trial run (`--seconds 30`, in a lab later recreated after the evaluation shutdown; [nvidia2-trial-godot-vulkan](evidence/compat/nvidia2-trial-godot-vulkan/)) | 01:50:35 | 9 |
+  | `NVRM: Xid (PCI:0000:05:00): 69, pid=2238723, name=vkr-ring-37, Class Error: channel 0x00000038, Class 0000ce97, Offset 0000026c, Data 00000006, ErrorCode 0000013d` at 01:50:44 | `godot-vulkan`, first trial run (`--seconds 30`, in a lab later recreated after the evaluation shutdown; [nvidia2-trial-godot-vulkan](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/nvidia2-trial-godot-vulkan)) | 01:50:35 | 9 |
   | `NVRM: Xid (PCI:0000:05:00): 69, pid=3048572, name=vkr-ring-70, Class Error: channel 0x00000052, Class 0000ce97, Offset 0000026c, Data 00000006, ErrorCode 0000013d` at 03:04:13 | `godot-vulkan`, the sweep (`nvidia2/godot-vulkan/host-kernel.txt`) | 03:04:04 | 9 |
 
   In both runs, the pid is the run's `virgl_render_server` process, the one
   that logs the CS errors below. ffp2 traced the same two lines to this lab
-  (`docs/evidence/ffp2/host-nvrm.txt` on main).
+  ([docs/evidence/ffp2/host-nvrm.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp2/host-nvrm.txt) on main).
 - **Render server:** `vkQueueSubmit resulted in CS error`, then
   `vkCreateGraphicsPipelines resulted in CS error` twice.
 - **Reproducibility:** 2 of 2 runs, both about 9 s after start.
@@ -345,7 +349,7 @@ Both Unigine OpenGL runs crash on Nvidia2. Both pass on AMD1.
 VRAM heap (its BAR1): Venus's asynchronous allocation hid the host's
 out-of-memory error from Zink, and Zink then mapped buffers that were not
 host-visible. Both benchmarks now run cleanly on `Nvidia1` and `AMD1`
-(`docs/evidence/unigl/7-final/`).
+([docs/evidence/unigl/7-final/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/unigl/7-final/)).
 
 Heaven:
 

@@ -7,10 +7,14 @@ usage: assemble.py fill TEMPLATE OUT [--crlf] KEY=VALUE...
        assemble.py zip SRC_DIR OUT.zip EPOCH
            Zip the contents of SRC_DIR with sorted entries and every
            timestamp set to EPOCH, so the same files give the same zip.
-       assemble.py notes OUT.md VERSION COMMIT EPOCH CERT_INFO BUILDINFO ASSET...
+       assemble.py guest PACKAGE DEST VERSION COMMIT CERTIFICATE
+           Verify existing signed output, add licences and retain build provenance.
+       assemble.py notes OUT.md VERSION COMMIT EPOCH CERT_INFO ASSET...
            Write RELEASE-NOTES.md.
 """
 import hashlib
+import json
+import shutil
 import os
 import posixpath
 import re
@@ -21,7 +25,7 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-REPO_URL = "https://github.com/VMLabDev/vmlab-win3d"
+REPO_URL = "https://github.com/VMLabDev/vmlab"
 
 
 def fill(template, out, *args):
@@ -78,116 +82,66 @@ def section(md, heading):
     return "\n".join(lines[start:end]).strip()
 
 
-def notes(out, version, commit, epoch, cert_info, buildinfo, *assets):
-    base = f"{REPO_URL}/blob/{commit}"
-    cert = dict(
-        (k.strip(), v.strip())
-        for k, _, v in (l.partition(":") for l in Path(cert_info).read_text().splitlines()) if v
-    )
-    limits = (REPO / "docs/known-limits.md").read_text()
-    host_gpu = section(limits, "### Host GPU support")
-    matrix = "\n".join(l for l in host_gpu.splitlines() if l.startswith("|"))
-    headings = []
-    part = None
-    for l in limits.splitlines():
-        if l.startswith("## "):
-            part = l[3:].strip()
-        elif l.startswith("### ") and l[4:].strip() != "Host GPU support":
-            title = l[4:].strip()
-            anchor = re.sub(r"[^a-z0-9 -]", "", title.lower()).replace(" ", "-")
-            headings.append(f"- {part}: [{title}]({base}/docs/known-limits.md#{anchor})")
-    pins = subprocess.run([sys.executable, str(REPO / "scripts/pins-table.py")],
-                          check=True, capture_output=True, text=True).stdout.strip()
-    date = time.strftime("%Y-%m-%d", time.gmtime(int(epoch)))
-    rows = []
-    for a in assets:
-        p = Path(a)
-        what = "Guest driver package for Windows 10 and 11 x64" if p.suffix == ".zip" else \
-            "Patched virglrenderer render server for NVIDIA hosts (x86_64 Linux)" \
-            if p.name.startswith("virglrenderer-") else "Patched QEMU for NVIDIA hosts (x86_64 Linux)"
-        rows.append(f"| `{p.name}` | {what} | {p.stat().st_size} | `{sha256(p)}` |")
+def guest(package, destination, version, commit, certificate):
+    package, destination = Path(package), Path(destination)
+    manifest = json.loads((package / "manifest.json").read_text())
+    if manifest["version"] != version:
+        raise ValueError("prebuilt package version does not match installer/VERSION")
+    if (package / "vmlab-win3d-test.cer").read_bytes() != Path(certificate).read_bytes():
+        raise ValueError("prebuilt package uses a different signing certificate")
+    for entry in manifest["files"]:
+        path = package / entry["path"]
+        if not path.resolve().is_relative_to(package.resolve()):
+            raise ValueError("manifest path escapes package")
+        if path.stat().st_size != entry["size"] or sha256(path) != entry["sha256"]:
+            raise ValueError(f"prebuilt package hash mismatch: {entry['path']}")
+    shutil.copytree(package, destination)
+    shutil.copytree(REPO / "licenses", destination / "licenses", dirs_exist_ok=True)
+    shutil.copy2(REPO.parents[1] / "THIRD_PARTY_NOTICES", destination / "THIRD_PARTY_NOTICES")
+    subprocess.run([sys.executable, str(REPO / "build/package/manifest.py"),
+                    str(destination), version, commit, str(destination.parent / "bundle.zip")], check=True)
+    (destination.parent / "bundle.zip").unlink()
+    packaged = json.loads((destination / "manifest.json").read_text())
+    packaged["commit"] = manifest["commit"]
+    packaged["release_commit"] = commit
+    (destination / "manifest.json").write_text(json.dumps(packaged, indent=2) + "\n")
 
-    text = f"""# vmlab-win3d {version}
 
-Alpha, for test VMs only. Built from [`{commit[:12]}`]({REPO_URL}/commit/{commit})
-(commit date {date}) by `scripts/release.sh {version}`.
+def notes(out, version, commit, epoch, cert_info, *assets):
+    cert = dict((key.strip(), value.strip()) for key, _, value in
+                (line.partition(":") for line in Path(cert_info).read_text().splitlines()) if value)
+    rows = "\n".join(f"| `{Path(asset).name}` | `{sha256(asset)}` |" for asset in assets)
+    Path(out).write_text(f"""# win3d {version}
 
-## Assets
+Tag: win3d-v{version}
+Guest release-packaging commit: {commit}
+Source: {REPO_URL}/tree/{commit}/guest/win3d
+Commit date: {time.strftime('%Y-%m-%d', time.gmtime(int(epoch)))}
 
-| File | What | Bytes | sha256 |
-| --- | --- | --- | --- |
-{chr(10).join(rows)}
+Alpha, for test VMs with Secure Boot off. Extract the zip and run Install.cmd
+as Administrator inside the vmlab-win3d folder. The package enables test signing
+and trusts its certificate machine-wide.
 
-`SHA256SUMS` lists the same hashes. [docs/release.md]({base}/docs/release.md)
-explains how to install each asset.
+Certificate subject: {cert['subject']}
+SHA-1 thumbprint: {cert['sha1 thumbprint']}
 
-- **Driver package.** Unzip in the guest, then run `Install.cmd` as
-  Administrator from the `vmlab-win3d-*` folder; the zip's `README.txt` has
-  the steps. Needs Secure Boot off and a Venus GPU (vmlab
-  `gpu {{ mode = "vulkan" }}`).
-- **QEMU.** Only NVIDIA host GPUs need it. Extract the tarball and run
-  `./install.sh`, then put the `qemu_binary` line it prints into the GPU's
-  block in the vmlab host config (vmlab 0.26.0-alpha or later).
-- **Render server.** Only NVIDIA host GPUs need it: it removes a 10 ms
-  floor from every Venus fence there, which held windowed D3D9 to about
-  40 frames per second. Extract the tarball and run `./install.sh`, then
-  put the `qemu_env` line it prints into the same GPU block.
+The zip includes licenses/ and THIRD_PARTY_NOTICES. Host binaries are released
+with vmlab. Its hypervisor bundle carries the patched Venus render server.
+No QEMU or standalone render-server asset is part of this release.
+The bundle manifest retains the signed input's original build commit.
+Known limits: {REPO_URL}/blob/{commit}/guest/win3d/docs/known-limits.md
 
-## Test-signing certificate
-
-The kernel driver is test-signed. `Install.cmd` turns on Windows test
-signing and trusts this certificate machine-wide (Trusted Root and Trusted
-Publisher), so install the package only in throwaway test VMs.
-
-| Field | Value |
+| Asset | SHA256 |
 | --- | --- |
-| Subject | `{cert['subject']}` |
-| SHA-1 thumbprint | `{cert['sha1 thumbprint']}` |
-| SHA-256 | `{cert['sha256']}` |
-| Valid | {cert['notBefore']} to {cert['notAfter']} |
-
-## Host GPUs
-
-From [docs/known-limits.md]({base}/docs/known-limits.md#host-gpu-support):
-
-{relink(matrix, base)}
-
-## Known limits in brief
-
-Each item is a section of [docs/known-limits.md]({base}/docs/known-limits.md).
-
-{chr(10).join(headings)}
-
-## Upstream pins
-
-Every upstream input, from the `PINS` files (`scripts/pins-table.py`), and
-every patch this repository applies.
-
-{relink(pins, base)}
-
-## QEMU build
-
-```
-{Path(buildinfo).read_text().strip()}
-```
-"""
-    virgl = REPO / "out/host/virglrenderer/BUILDINFO"
-    if any(Path(a).name.startswith("virglrenderer-") for a in assets):
-        text += f"""
-## Render server build
-
-```
-{virgl.read_text().strip()}
-```
-"""
-    Path(out).write_text(text)
+{rows}
+""")
 
 
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     cmd, args = sys.argv[1], sys.argv[2:]
-    {"fill": fill, "zip": make_zip, "notes": notes}[cmd](*args)
+    {"fill": fill, "zip": make_zip, "notes": notes, "guest": guest}[cmd](*args)
 
 
 if __name__ == "__main__":

@@ -7,8 +7,8 @@ vkd3d-proton now emulates `ExecuteIndirect` for command signatures that
 change root constants or root descriptors. The fix changes nothing on the
 host and nothing in Venus. The work was done on 2026-10-19 on helios: RADV
 (Mesa 26.2.2) on `AMD1`, NVIDIA 610.57.04 on `Nvidia1` and `Nvidia2`,
-virglrenderer 1.3.0, the package built from `d6f52e4`. The evidence is in
-`docs/evidence/ei/`.
+virglrenderer 1.3.0, the package built from [d6f52e4](https://github.com/VMLabDev/vmlab-win3d/commit/d6f52e40fe0acedb89eddf0456a3b0ba69541b79). The evidence is in
+[docs/evidence/ei/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ei/).
 
 ## Result
 
@@ -116,7 +116,7 @@ info:d3d12_command_signature_init_state_template_emulated: Emulating ExecuteIndi
 
 ## Evidence
 
-All under `docs/evidence/ei/`:
+All under [docs/evidence/ei/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ei/):
 
 | Path | What |
 | --- | --- |
@@ -125,7 +125,7 @@ All under `docs/evidence/ei/`:
 | `src/sample-warp.sh`, `src/compare-sample.py` | Runs the unmodified sample on WARP and compares its console capture with the GPU run's |
 | `amd1-repro/`, `nvidia1-repro/`, `nvidia2-repro/` | `repro.txt` (the three outputs), `ei_gpu.png`, `ei_warp.png`, and the vkd3d-proton log with the emulation lines |
 | `samples-amd1/`, `samples-nvidia1/` | The five samples (`samples.json`, captures, run and module lists, DXVK logs, `app-errors.txt`), and the WARP run of `D3D12ExecuteIndirect`: `console-D3D12ExecuteIndirect-warp.png`, `sample-compare.txt` |
-| `e2e/amd1/`, `e2e/nvidia1/` | `tests/e2e/run.sh` evidence; `results.txt` ends `PASS: 12 of 12`, and `build.txt` shows the package reused from `d6f52e4` |
+| `e2e/amd1/`, `e2e/nvidia1/` | `tests/e2e/run.sh` evidence; `results.txt` ends `PASS: 12 of 12`, and `build.txt` shows the package reused from [d6f52e4](https://github.com/VMLabDev/vmlab-win3d/commit/d6f52e40fe0acedb89eddf0456a3b0ba69541b79) |
 
 ### The repro
 
@@ -167,7 +167,7 @@ Agility SDK core there, so `sample-warp.sh` deploys `D3D12Core.dll` from the
 pinned `Microsoft.Direct3D.D3D12` 1.618.3 package that
 `build/d3d12-samples/` downloads. Without it, every sample on WARP fails with
 `0xC0000409`. The before capture
-(`docs/evidence/d3d12app/amd1/console-D3D12ExecuteIndirect.png`) scores a
+([docs/evidence/d3d12app/amd1/console-D3D12ExecuteIndirect.png](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d12app/amd1/console-D3D12ExecuteIndirect.png)) scores a
 coverage of 0.000. After the fix, the GPU covers 0.202 on AMD1 and 0.206 on
 Nvidia1, and WARP covers 0.178 and 0.183.
 

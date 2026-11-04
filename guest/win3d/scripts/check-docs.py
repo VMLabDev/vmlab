@@ -24,6 +24,7 @@ Exit 1 and one line per problem when anything is missing.
 """
 import argparse
 import itertools
+import json
 import re
 import subprocess
 import sys
@@ -33,9 +34,11 @@ REPO = Path(__file__).resolve().parent.parent
 TOP = sorted(p.name for p in REPO.iterdir()
              if p.is_dir() and not p.name.startswith(".") and p.name not in ("out",))
 SKIP_PREFIXES = ("out/", ".scratch/")
+ARCHIVED_EVIDENCE = json.loads((REPO / "docs/archived-evidence.json").read_text())
 
 # Commits of other repositories that the documents cite and no PINS file pins.
 EXTERNAL_COMMITS = {
+    "d8a6048aae11c5e26168e173a7c1b1a4335d6a23": "historical QEMU fork pin; no longer built or shipped",
     "baca25172d8c195b9abbe6f8a3ab5915dba09a91": "QEMU: egl-headless teardown fix (known-limits.md, prior-art.md)",
     "c3d48b7d1e89604920e5b81b91140c2ad39a1943": "QEMU: the prior art's patch base (prior-art.md)",
     "1d3e6800b84b7f827654bfdedd95c9d582d07e8b": "yttrium-virtio-gpu: the prior art's newer checkout (prior-art.md)",
@@ -101,6 +104,9 @@ def path_exists(span):
     span = span.rstrip(".,;:)")
     span = re.sub(r":\d+(-\d+)?$", "", span)            # file.c:123
     span = re.sub(r"<[^>]*>", "*", span)                 # <component>
+    if any(re.sub(r"<[^>]*>", "*", archived) == span.rstrip("/")
+           for archived in ARCHIVED_EVIDENCE["references"]):
+        return True
     for candidate in expand_braces(span):
         candidate = candidate.rstrip("/")
         pattern = candidate if any(c in candidate for c in "*?[") else candidate + "*"
@@ -109,7 +115,7 @@ def path_exists(span):
         if any((REPO / "docs" / "evidence").glob("**/" + pattern)):
             return True
         if candidate in HISTORICAL_PATHS:
-            return subprocess.run(["git", "-C", str(REPO), "log", "--all", "-1", "--format=%h", "--", f":(glob){candidate}*"],
+            return subprocess.run(["git", "-C", str(REPO.parents[1]), "log", "--all", "--full-history", "-1", "--format=%h", "--", f":(glob)guest/win3d/{candidate}*"],
                                   capture_output=True, text=True).stdout.strip() != ""
     return False
 
@@ -157,7 +163,7 @@ def main():
     for doc in documents():
         rel = doc.relative_to(REPO)
         for n, line in prose_lines(doc):
-            for m in BACKTICK.finditer(line):
+            for m in BACKTICK.finditer(LINK.sub("", line)):
                 span = m.group(1)
                 for p in path_spans(span):
                     checked += 1

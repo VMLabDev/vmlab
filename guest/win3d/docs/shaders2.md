@@ -9,7 +9,7 @@ fork phases wrote removed the device, even with immediate indices. The fixes
 are `patches/mesa/0031` and `0032`. Investigated on 2026-10-18 and
 2026-10-19 on helios: NVIDIA 610.57.04 on `Nvidia1`, RADV (Mesa 26.2.2) on
 `AMD1`, vmlab 0.28.0-alpha, QEMU 11.1.1 on AMD1 and the egl-headless patched QEMU 11.1.50 on
-NVIDIA, virglrenderer 1.3.0. Evidence is in `docs/evidence/shaders2/`.
+NVIDIA, virglrenderer 1.3.0. Evidence is in [docs/evidence/shaders2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/shaders2/).
 
 ## Result
 
@@ -49,12 +49,12 @@ So the three open questions come out as follows:
 
 Proof, with a package built by `scripts/build.sh` from this branch
 (`patches/mesa` up to `0032`, `0035`, `0040` to `0042`; e2e reused it at
-`c5757d0` on AMD1 and at `0b355a7` on Nvidia1, which differ only in
+[c5757d0](https://github.com/VMLabDev/vmlab-win3d/commit/c5757d041c8cc8e9337df33863b1ee3fe4bc26f8) on AMD1 and at [0b355a7](https://github.com/VMLabDev/vmlab-win3d/commit/0b355a7affedda587e354368dffc2cb86390bb25) on Nvidia1, which differ only in
 documentation):
 
 | Check | AMD1 (RADV) | Nvidia1 (RTX 5090) |
 | --- | --- | --- |
-| `d3d11_index2.exe`, 10 cases × 4 `sel` values × 4 quadrants, x64 and x86, before (package at `82d8e51`: up to `0030`, `0035`, `0040` to `0042`) | not run | 3 of 10 (`before/nvidia1/`) |
+| `d3d11_index2.exe`, 10 cases × 4 `sel` values × 4 quadrants, x64 and x86, before (package at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75): up to `0030`, `0035`, `0040` to `0042`) | not run | 3 of 10 (`before/nvidia1/`) |
 | The same with `0031` and `0032` | 10 of 10, hardware equals WARP (`after/amd1/`) | 10 of 10, hardware equals WARP (`after/nvidia1/`) |
 | `tests/e2e/run.sh --template windows-11` | 12 of 12 (`after/amd1/e2e-results.txt`) | 12 of 12 (`after/nvidia1/e2e-results.txt`), on the second attempt |
 | Host `NVRM` lines during the runs | not applicable | none (`after/nvidia1/kernel-nvrm.txt` is empty) |
@@ -76,7 +76,7 @@ then passed everything.
 
 ## The repro
 
-`docs/evidence/shaders2/src/d3d11_index2.cpp` follows the ds repro. It draws
+[docs/evidence/shaders2/src/d3d11_index2.cpp](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/shaders2/src/d3d11_index2.cpp) follows the ds repro. It draws
 one quad or patch into each quadrant of a 64×64 `R32G32B32A32_FLOAT` target
 (four targets for `ps-out`). Each shader indexes its array with
 `(quadrant + sel) & 3`, or a value derived from it. `sel` comes from a
@@ -127,8 +127,8 @@ mov o[r0.x + 1].xyzw, r1.xyzw
 The assembler was developed that way under Wine, with the guest's own
 `d3dcompiler_47.dll`.
 
-`docs/evidence/shaders2/src/build.sh` builds x64 and x86 in the toolchain
-image. `docs/evidence/shaders2/src/run-repro.sh <lab-dir> <vm> <out-dir>`
+[docs/evidence/shaders2/src/build.sh](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/shaders2/src/build.sh) builds x64 and x86 in the toolchain
+image. [docs/evidence/shaders2/src/run-repro.sh <lab-dir> <vm> <out-dir>](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/shaders2/src/run-repro.sh <lab-dir> <vm> <out-dir>)
 runs both architectures, first on the hardware device and then on WARP, in
 the autologon user's session. It copies the logs back and diffs every
 read-back line of hardware against WARP. It also collects the UMD's warning
@@ -229,13 +229,13 @@ match rather than return factor 0 for every element.
 
 ## Evidence
 
-All under `docs/evidence/shaders2/`:
+All under [docs/evidence/shaders2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/shaders2/):
 
 | Path | What it is |
 | --- | --- |
 | `src/d3d11_index2.cpp`, `src/build.sh`, `src/run-repro.sh` | The repro, its build and its runner |
-| `before/nvidia1/` | Run with the package built at `82d8e51` (`patches/mesa` up to `0030`, `0035`, `0040` to `0042`): logs per architecture and device, hardware-against-WARP diffs, `yttrium-errors.txt`, `asm/` |
+| `before/nvidia1/` | Run with the package built at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75) (`patches/mesa` up to `0030`, `0035`, `0040` to `0042`): logs per architecture and device, hardware-against-WARP diffs, `yttrium-errors.txt`, `asm/` |
 | `after/{amd1,nvidia1}/` | The same with `0031` and `0032`, run in the e2e labs after the e2e run (kept with `--keep`, then destroyed); `asm/` holds the disassembly of each case's indexed or assembled shader |
-| `after/{amd1,nvidia1}/e2e-*.txt`, `qemu-argv-env.txt` | The e2e run's host stack, build and results, and QEMU's command line (copied from `docs/evidence/acceptance/`, which was restored to its committed state) |
+| `after/{amd1,nvidia1}/e2e-*.txt`, `qemu-argv-env.txt` | The e2e run's host stack, build and results, and QEMU's command line (copied from [docs/evidence/acceptance/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/), which was restored to its committed state) |
 | `after/nvidia1/kernel-nvrm.txt` | Host kernel `NVRM`/Xid lines from the start of the e2e run to the end of the repro: none |
 | `after/nvidia1-attempt1/` | The first Nvidia1 attempt: e2e results (10 of 12), the D3D11 probe's UMD log, the host's `NVRM` lines, and the repro run in that lab (two of four runs hung) |

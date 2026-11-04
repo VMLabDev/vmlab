@@ -182,7 +182,7 @@ Which patches have run in a guest, and where:
 | gzdoom proof, Windows 11 on `AMD1` and `Nvidia1` (e2e, `gzgl`, GZDoom OpenGL and Vulkan) | 0001 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0080; the `Nvidia1` runs add 0070 and 0086, the last e2e on each GPU adds 0070, 0086 and 0090 | `docs/gzdoom.md` |
 
 The nvtex proof run (2026-10-18) has the full series, 0001 to 0025, built by
-`scripts/build.sh` at commit `e428846`. Before it, no recorded run had 0015
+`scripts/build.sh` at commit [e428846](https://github.com/VMLabDev/vmlab-win3d/commit/e428846ccddaf01dba7efed9d057518f45c522fc). Before it, no recorded run had 0015
 to 0017 together with 0021. The runs cover the code paths that the probes,
 dxdiag and the samples reach, not every fix in 0001 to 0011; for the rest,
 the evidence is the codex session's own finding, cited in the patch header.

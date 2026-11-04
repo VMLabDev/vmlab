@@ -49,7 +49,7 @@ DISPLAY_DEV=${KMD_LOAD_DISPLAY:-virtio-vga-gl}
 LAB=win3d-kmd-build-load
 LABDIR=$REPO/.scratch/labs/$LAB
 VM=$LAB/win11
-CER=$REPO/.signing/test-signing.cer
+CER=${WIN3D_SIGNING_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/vmlab/signing/win3d}/test-signing.cer
 
 [ -f "$CER" ] || { echo "missing $CER" >&2; exit 1; }
 mkdir -p "$LABDIR"

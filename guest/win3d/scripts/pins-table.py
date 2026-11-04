@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the pin and patch tables in docs/stack.md from build/*/PINS, patches/host/PINS and patches/.
+"""Generate the pin and patch tables in docs/stack.md from build/*/PINS and guest patches/.
 
 usage: scripts/pins-table.py           print both tables
        scripts/pins-table.py --write   rewrite the generated blocks in docs/stack.md
@@ -216,7 +216,7 @@ def pins_table():
     out = ["| Build | Input | Version or tag | Commit or digest | sha256 of the download | Source |",
            "| --- | --- | --- | --- | --- | --- |"]
     sources = [(c, f"build/{c}/PINS", None) for c in components]
-    sources.append(("host", "patches/host/PINS", REPO / "patches" / "host" / "PINS"))
+    
     for c, rel, path in sources:
         for r in read_pins(c, path):
             out.append(f"| [`{c}`](../{rel}) | {r['name']} | {code(r['version'])} | "
