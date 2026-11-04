@@ -5,6 +5,11 @@ in this repository runs one process per machine, in place of QEMU.
 
 ## Before you change anything
 
+For repository layout, workspace dependencies, builds and gates, read
+`docs/adr/0022-import-the-hypervisor-into-the-vmlab-workspace.md` from the
+repository root. It supersedes the older plans' separate-repository layout
+and git dependency decisions.
+
 Read the specification at
 `hv/docs/plans/vmlab-hypervisor/SPEC.md` (from the repository root). It is
 the contract. A `Dn` reference points at a decision row in `MAP.md`, in the same
