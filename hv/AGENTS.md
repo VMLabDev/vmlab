@@ -1,12 +1,12 @@
 # AGENTS.md
 
 `vmlab-hv` is an MIT-licensed Rust hypervisor that vmlab
-(`/home/wil/dev/vmlab`) will run one process per machine, in place of QEMU.
+in this repository runs one process per machine, in place of QEMU.
 
 ## Before you change anything
 
 Read the specification at
-`/home/wil/dev/vmlab-hypervisor/.scratch/plans/vmlab-hypervisor/SPEC.md`. It is
+`hv/docs/plans/vmlab-hypervisor/SPEC.md` (from the repository root). It is
 the contract. A `Dn` reference points at a decision row in `MAP.md`, in the same
 directory. Its reasoning is in `notes/`, which you open only when the outcome
 alone is not enough. When the spec and your task brief disagree, follow the spec
@@ -36,13 +36,13 @@ or translate it line by line. QEMU is GPLv2 and this project is MIT, so copied
 or mechanically translated code would change the project's licence.
 
 Code lifted from crosvm keeps its BSD-3 header and gets a line in
-`THIRD_PARTY_NOTICES`. Apache-2.0 crates are used as dependencies only.
+the repository-root `THIRD_PARTY_NOTICES`. Apache-2.0 crates are used as dependencies only.
 
 ## Finishing a task
 
 A task is done when all three hold:
 
-1. `just ci::check` passes: fmt, clippy with `-D warnings`, and the tests.
+1. From the repository root, `just ci::check` passes the light merge bar. The guest-booting `just ci::hv-gate` is run once per batch by the orchestrator, not by individual agents.
 2. Every `unimplemented!()` or `todo!()` inside your task's scope has been replaced by working code with tests.
 3. The behaviour your task owns is proven by a test at the seam the spec names for it: S1 (the `vmlab-hv` control socket) or S2 (`vmlab-disk` against `qemu-img`). Device unit tests sit below those seams and do not replace them.
 

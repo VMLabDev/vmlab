@@ -53,7 +53,7 @@ page cmd_console {
     vmlab looks for `vmlab-hv-viewer` beside the configured `host.vmlab_hv`,
     then on `PATH`. A missing native viewer prints a one-line installation
     notice and falls back to VNC. Install the viewer from
-    `VMLabDev/vmlab-hypervisor`; it is a separate binary. The optional
+    the vmlab-hv release bundle built from `hv/`; it is a separate binary. The optional
     `host.viewer_release_chord` is passed as `--release-chord`, for example
     `ctrl_r+alt_r`. Without it, the viewer uses left Ctrl+Alt.
   DOC

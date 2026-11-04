@@ -17,7 +17,8 @@ The optional machine field `tsc_khz` pins every vCPU to that frequency;
 and refuse a destination configured at a different frequency.
 
 The machine description and control protocol live in `vmlab-hv-proto`, and the
-disk image code in `vmlab-disk`; vmlab consumes both as git dependencies.
+disk image code in `vmlab-disk`. The crates are members of vmlab's root
+Cargo workspace, and vmlab uses in-tree protocol path dependencies.
 Snapshots are the hypervisor's own versioned device-state format stored in qcow2
 internal snapshots. Offline (disk-only) snapshots stay plain qcow2 and remain
 portable to QEMU. Guest-visible hardware on the q35 machine matches QEMU's, so
@@ -93,8 +94,10 @@ cargo features are enabled by default in debug and release builds. Builds with
 ## Build and test
 
 ```sh
-just workspace-build   # cargo build --workspace
-just ci::check         # cargo fmt --check, clippy -D warnings, cargo test
+cd ..                 # repository root
+cargo build --workspace
+just ci::check        # light merge bar; no guest boots
+just ci::hv-gate      # guest-booting gate, once per orchestrator batch
 ```
 
 The S2 disk tests and the unit tests run anywhere. The S1 integration tests
@@ -105,10 +108,10 @@ a prerequisite is missing.
 
 GitHub CI builds virglrenderer 1.3.0 from the same SHA-256-pinned source and
 Meson options as vmlab's e2e image, then caches the install. Run
-`just ci::native-deps-install` and `just ci::virgl-build` to reproduce that
-setup on Ubuntu 24.04. The install defaults to `.ci-cache/virgl`; builds need
-`PKG_CONFIG_PATH=$PWD/.ci-cache/virgl/lib/pkgconfig` and executables need
-`LD_LIBRARY_PATH=$PWD/.ci-cache/virgl/lib`.
+`just ci::hv-native-deps-install` and `just ci::hv-virgl-build` to reproduce that
+setup on Ubuntu 24.04. The install lives under the root
+`.ci-cache/virglrenderer-<version>-<sha256>/`, outside `target/`. The recipes
+set the build and runtime library paths.
 
 The workflow sets `--cfg vmlab_ci_no_kvm` in `RUSTFLAGS` because hosted runners
 have no guest images or guaranteed KVM access. It also sets
@@ -117,13 +120,13 @@ node, live audio session, virtual USB gadget, container initrd, or probe dump.
 Those tests still compile and
 appear as `ignored` with a reason, rather than passed. Pure launch validation,
 protocol, device, disk and private-display tests still run. CI also builds the
-pinned iPXE ROMs so their guest-free checks run. The local
-`just ci::check` does not set this flag and keeps its existing behaviour.
+pinned iPXE ROMs so their guest-free checks run. The root `just ci::check` uses these flags too. The separate
+`just ci::hv-gate` leaves them unset for the orchestrator's guest tests.
 
 The convention for a full suite run on the development host is a systemd-run
 scope with a memory cap and one test thread, for example
 `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 -- env
-RUST_TEST_THREADS=1 just ci::check`. The verification records in
+RUST_TEST_THREADS=1 just ci::hv-gate`. The verification records in
 `docs/memory-leak.md` and `crates/vmlab-hv-tcg-riscv64/VERIFICATION.md` use
 this shape.
 

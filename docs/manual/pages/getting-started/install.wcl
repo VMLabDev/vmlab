@@ -109,7 +109,7 @@ SRC
     render server. Relative RUNPATHs find the bundled libraries without
     `LD_LIBRARY_PATH`. The `vmlab-hv` launcher sets `RENDER_SERVER_EXEC_PATH`
     to the bundled server unless you already set it.
-    The bundle's `README` records the hypervisor commit and lists the host
+    The bundle's `README` records the vmlab commit and lists the host
     libraries it still needs, including EGL, GBM, the Vulkan loader, PipeWire,
     PulseAudio and the viewer's Wayland or X11 client libraries. Install your
     GPU driver separately. Firmware comes from the existing guest assets.
@@ -143,7 +143,9 @@ SRC
   p <<DOC
     From a checkout, `just build` runs `cargo build` and `just install` runs
     `cargo install --path . --locked`, which places the binary in
-    `~/.cargo/bin`. A source build installs no guest assets; the section on guest
+    `~/.cargo/bin`. The hypervisor lives in `hv/` in the same Cargo workspace. Run
+    `just ci::hv-package` to build its release bundle from this checkout.
+    A source build installs no guest assets; the section on guest
     assets below says how to build them.
   DOC
 
