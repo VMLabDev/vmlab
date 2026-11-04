@@ -61,6 +61,13 @@ def main():
             matches = [item for item in archived if item.startswith(path)]
             if len(matches) == 1:
                 path = matches[0]
+            elif not matches:
+                parents = git("log", "--full-history", "-1", "--format=%P", "--", path).split()
+                if parents:
+                    historical = git("ls-tree", "-r", "--name-only", parents[0], "--", path.rsplit("/", 1)[0]).splitlines()
+                    matches = [item for item in historical if item.startswith(path)]
+                    if len(matches) == 1:
+                        return f"https://github.com/VMLabDev/vmlab-win3d/blob/{parents[0]}/{matches[0]}{separator}{anchor}"
         return f"{base}/{path}{separator}{anchor}"
     changes = []
     for doc in sorted(GUEST.rglob("*.md")):
