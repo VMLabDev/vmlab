@@ -393,6 +393,7 @@ SRC
     x86 machines, `virtio-gpu-gl` with `-vga none` on `virt`. `vulkan` adds
     `venus=true,blob=true,hostmem=<vram>` on QEMU, defaulting to `4G`.
     An explicit `vram` on `virgl` adds `blob=true,hostmem=<vram>`.
+    With no `vram`, QEMU's existing virgl device keeps blob resources disabled.
     On vmlab-hv, `vram` sizes the shared-memory BAR and capability.
   DOC
   p <<DOC
