@@ -999,10 +999,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let me = nix::unistd::Uid::effective().as_raw();
+        // The runtime directory is chowned to the account's gid, which an
+        // unprivileged test user may only give a group it is in: its own.
+        let my_gid = nix::unistd::Gid::effective().as_raw();
         std::fs::create_dir_all(root.join("etc")).unwrap();
         std::fs::write(
             root.join("etc/passwd"),
-            format!("dev:x:{me}:{me}:Dev:/home/dev:/bin/sh\n"),
+            format!("dev:x:{me}:{my_gid}:Dev:/home/dev:/bin/sh\n"),
         )
         .unwrap();
         std::fs::write(root.join("etc/group"), "docker:x:990:dev\n").unwrap();
@@ -1015,7 +1018,7 @@ mod tests {
         };
         let session = logins.log_in("dev", true).unwrap();
         assert_eq!(session.mechanism, Mechanism::Setuid);
-        assert_eq!(session.account.groups, vec![me, 990]);
+        assert_eq!(session.account.groups, vec![my_gid, 990]);
         assert_eq!(session.runtime_dir, Some(format!("/run/user/{me}")));
 
         // And an account the guest does not have never becomes a session.
