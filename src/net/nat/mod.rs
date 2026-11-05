@@ -106,6 +106,10 @@ impl NatConfig {
 /// (guest_ip, guest_port, gw_port) identifying an engine-bound UDP flow.
 type GuestUdpKey = (Ipv4Addr, u16, u16);
 
+/// The two ends of an engine-bound UDP flow: payloads toward the guest, and
+/// the guest's replies.
+pub type GuestUdpFlow = (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>);
+
 /// The userspace NAT engine. Always `Arc`-shared; flow tasks hold clones.
 pub struct NatEngine {
     cfg: NatConfig,
@@ -340,7 +344,7 @@ impl NatEngine {
         self: &Arc<Self>,
         guest_ip: Ipv4Addr,
         guest_port: u16,
-    ) -> Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)> {
+    ) -> Result<GuestUdpFlow> {
         use std::collections::hash_map::Entry;
         let (to_guest_tx, mut to_guest_rx) = mpsc::channel::<Vec<u8>>(64);
         let (from_guest_tx, from_guest_rx) = mpsc::channel::<Vec<u8>>(64);
