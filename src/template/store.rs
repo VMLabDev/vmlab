@@ -162,7 +162,8 @@ impl TemplateStore {
     // templates it reads ([`Self::recover_swaps`]), so a version an
     // overwrite had set aside is never missing from what a reader sees.
     // That takes the lock only when a leftover is there, so no mutation
-    // holding the lock may call a read.
+    // holding the lock may call a read: one that needs a version uses
+    // `installed_locked`, which recovers under the lock it already holds.
 
     /// All templates in the store, sorted by arch, name, then version
     /// (natural order), each with the variants whose disks are installed.
@@ -263,6 +264,30 @@ impl TemplateStore {
         version: &str,
     ) -> Result<Option<TemplateVersion>> {
         self.recover_swaps(&[self.root.join(arch).join(name)]);
+        self.installed_as_is(arch, name, version)
+    }
+
+    /// [`Self::installed`] for a caller that holds the store lock: it
+    /// recovers this version's interrupted swap itself, under the lock it
+    /// already has, since [`Self::recover_swaps`] would take it again and a
+    /// second flock from the same process waits forever.
+    fn installed_locked(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<TemplateVersion>> {
+        recover_swap(&self.version_dir(arch, name, version))?;
+        self.installed_as_is(arch, name, version)
+    }
+
+    /// The version as the disk has it now, recovering nothing.
+    fn installed_as_is(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<TemplateVersion>> {
         let dir = self.version_dir(arch, name, version);
         if !dir.join(META_FILE).is_file() {
             return Ok(None);
@@ -524,7 +549,7 @@ impl TemplateStore {
         in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<()> {
         let found = self
-            .installed(arch, name, version)?
+            .installed_locked(arch, name, version)?
             .ok_or_else(|| anyhow!("template {arch}/{name}@{version} not found in the store"))?;
         let reference = format!("{arch}/{name}@{version}#{variant}");
         if variant == BASE_VARIANT {
@@ -702,7 +727,7 @@ impl TemplateStore {
     ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let found = self
-            .installed(arch, name, version)?
+            .installed_locked(arch, name, version)?
             .ok_or_else(|| anyhow!("template {arch}/{name}@{version} not found in the store"))?;
         let mut incoming = found.meta.clone();
         incoming.variants = variants.to_vec();
@@ -1812,6 +1837,47 @@ mod tests {
         assert_eq!(store.list().unwrap().len(), 1);
         assert_eq!(version_entries(&store), ["1"]);
         assert_eq!(version_files(&store).0, b"one");
+    }
+
+    /// Run `f` on another thread and wait at most 10 s for it: a mutation
+    /// that took the store lock a second time would never return.
+    fn returns_within_10s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("blocked on the store lock it already holds")
+    }
+
+    /// The mutations that look a version up while they hold the lock do
+    /// not take it again to recover a leftover (lead review F1): they
+    /// return, and recover the version themselves.
+    #[test]
+    fn locked_lookups_recover_without_taking_the_lock_again() {
+        let (_tmp, store, _staging) = store_with_old_version();
+        let before = version_files(&store);
+        crash_mid_swap(&store);
+        let removing = store.clone();
+        let err = returns_within_10s(move || {
+            removing
+                .remove("x86_64", "t", "1", Some("ghost"), false, &|_| None)
+                .unwrap_err()
+                .to_string()
+        });
+        // It found the version it recovered, and refused only the variant.
+        assert!(err.contains("has no variants"), "{err}");
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store), before);
+
+        crash_mid_swap(&store);
+        let adding = store.clone();
+        let staging = tempfile::tempdir_in(store.root()).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let added = returns_within_10s(move || adding.add_variants("x86_64", "t", "1", &staging_path, &[]));
+        assert!(added.is_ok(), "{added:?}");
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store).0, before.0);
     }
 
     /// A store with nothing to recover is read without taking the lock,
