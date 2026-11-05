@@ -341,7 +341,7 @@ impl Case {
         staged.pci_devices.clear();
         for (device, description) in devices.iter().zip(&full.pci_devices) {
             let class = device["class_info"]["class"].as_u64().unwrap();
-            if class == 0x200 || (description.device, description.function) == (1, 2) {
+            if (description.device, description.function) == (1, 2) {
                 continue;
             }
             let mut kept = description.clone();
@@ -399,6 +399,16 @@ impl Case {
             "display":{"device":"std-vga","pci":{"bus":0,"device":display.device,"function":display.function},"rom":vga},
             "nics":[],"serial_log":path.join("probe.log"),"ports":[]
         });
+        // The captured NIC at its captured address, on a switch socket that
+        // never answers: the probe reads its identity, not its traffic.
+        for (index, nic) in self.nics().into_iter().enumerate() {
+            description["nics"].as_array_mut().unwrap().push(serde_json::json!({
+                "model": nic.model,
+                "pci": {"bus":0,"device":nic.device,"function":nic.function},
+                "mac": format!("52:54:00:00:00:{:02x}", index + 1),
+                "attachment": {"kind":"stream","socket":path.join(format!("unused-nic{index}.sock"))}
+            }));
+        }
         if self.cdrom {
             description["disks"]
                 .as_array_mut()
@@ -419,6 +429,83 @@ impl Case {
         }
         description
     }
+}
+
+/// A captured Ethernet function and the baseline capture's config bytes for
+/// its model.
+struct CapturedNic {
+    model: &'static str,
+    device: u8,
+    function: u8,
+    baseline_bdf: u16,
+}
+
+impl Case {
+    fn nics(&self) -> Vec<CapturedNic> {
+        let pci: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture(self.name).join("query-pci.json")).unwrap(),
+        )
+        .unwrap();
+        pci[0]["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|device| device["class_info"]["class"].as_u64() == Some(0x200))
+            .map(|device| {
+                let e1000 = device["id"]["vendor"].as_u64() == Some(0x8086);
+                CapturedNic {
+                    model: if e1000 { "e1000" } else { "pcnet" },
+                    device: device["slot"].as_u64().unwrap() as u8,
+                    function: device["function"].as_u64().unwrap() as u8,
+                    // pc-seabios-legacy: e1000 at 02.0, PCnet at 03.0.
+                    baseline_bdf: if e1000 { 0x10 } else { 0x18 },
+                }
+            })
+            .collect()
+    }
+}
+
+/// Compare a NIC function's config space with the baseline capture of the
+/// same model, byte by byte. Placement and driver state are the only bounded
+/// differences.
+fn compare_nic(
+    case: &Case,
+    nic: &CapturedNic,
+    actual: &[u8],
+    baseline: &[u8],
+    problems: &mut Vec<String>,
+    differences: &mut Vec<String>,
+) {
+    let mut reasons = BTreeSet::new();
+    for offset in 0..256 {
+        if actual[offset] == baseline[offset] {
+            continue;
+        }
+        let reason = match offset {
+            4 if (actual[4] ^ baseline[4]) & !0x04 == 0 => Some(
+                "command bus-master bit: the capture's driver enabled DMA; the probe runs before any driver",
+            ),
+            0x10..=0x27 => Some("BAR addresses follow the slot's allocation"),
+            0x30..=0x33 => Some("no option ROM is attached (D14: no QEMU ROMs)"),
+            0x3c => Some("interrupt line follows the slot's PIRQ routing"),
+            _ => None,
+        };
+        match reason {
+            Some(reason) => {
+                reasons.insert(reason);
+            }
+            None => problems.push(format!(
+                "{} {} {:02x}.{} config[{offset:#x}]={:#04x}, captured {:#04x}",
+                case.name, nic.model, nic.device, nic.function, actual[offset], baseline[offset]
+            )),
+        }
+    }
+    differences.extend(reasons.into_iter().map(|reason| {
+        format!(
+            "{:02x}.{} {}: {reason}",
+            nic.device, nic.function, nic.model
+        )
+    }));
 }
 
 fn normalize_acpi(bytes: &[u8]) -> Vec<u8> {
@@ -618,7 +705,7 @@ fn pci_exception(
                     || matches!(actual[offset]&15,3..=7|9..=12|14..=15)) =>
         {
             Some(
-                "PIRQ selections/disable bits reflect the deferred NIC/UHCI functions and BIOS-only probe, rather than a running Linux PCI/ACPI stack",
+                "PIRQ selections/disable bits reflect the deferred UHCI function and BIOS-only probe, rather than a running Linux PCI/ACPI stack",
             )
         }
         (9, 4) if (actual[offset] ^ expected[offset]) & !4 == 0 => Some(
@@ -628,7 +715,7 @@ fn pci_exception(
             if le32(actual, 0x20) & 15 == 1
                 && (0x1000..=0xfff0).contains(&(le32(actual, 0x20) & !15)) =>
         {
-            Some("IDE BAR4 allocation moves when NIC/UHCI BAR consumers are absent")
+            Some("IDE BAR4 allocation moves when the UHCI BAR consumer (4c) is absent")
         }
         (9, 0x40..=0x44)
             if (actual[offset] ^ expected[offset])
@@ -655,9 +742,6 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
         "D3: genroms/kvmvapic.bin is absent".into(),
         "the original boot disk has fixture contents/capacity; CMOS disk geometry describes that disk".into(),
     ];
-    if case.name != "pc-templeos" {
-        differences.push("4b: captured e1000/PCnet function and its AML are absent".into());
-    }
     if matches!(case.name, "pc-freedos-1.3" | "pc-windows-98-se") {
         differences.push("4d: captured Cirrus is replaced at the same BDF by std-VGA, including its three ACPI sleep methods".into());
     }
@@ -752,6 +836,17 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
             reasons
                 .into_iter()
                 .map(|reason| format!("{:02x}.{}: {reason}", bdf / 8, bdf % 8)),
+        );
+    }
+    for nic in case.nics() {
+        let bdf = u16::from(nic.device) * 8 + u16::from(nic.function);
+        compare_nic(
+            case,
+            &nic,
+            &dump.pci[&bdf],
+            &baseline[&nic.baseline_bdf],
+            &mut problems,
+            &mut differences,
         );
     }
     let cpuid = &dump.records[&9];
