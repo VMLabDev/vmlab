@@ -310,9 +310,9 @@ impl TemplateStore {
         if leftovers.is_empty() {
             return;
         }
-        let recovered = self.lock().and_then(|_lock| {
-            leftovers.iter().try_for_each(|dest| recover_swap(dest))
-        });
+        let recovered = self
+            .lock()
+            .and_then(|_lock| leftovers.iter().try_for_each(|dest| recover_swap(dest)));
         if let Err(e) = recovered {
             tracing::warn!("cannot recover an interrupted template swap: {e:#}");
         }
