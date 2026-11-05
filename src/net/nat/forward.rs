@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
@@ -15,6 +16,11 @@ use super::NatEngine;
 
 /// Spawners tying host sockets to guest endpoints via a [`NatEngine`].
 pub struct PortForwarder;
+
+/// A UDP forward's remote peer that sends nothing and gets nothing back for
+/// this long is dropped, with its engine flow and gateway port. The same
+/// expiry as an outbound UDP flow.
+const UDP_PEER_IDLE: Duration = Duration::from_secs(60);
 
 /// A non-blocking TCP listener on `listen`, bound the way
 /// [`TcpListener::bind`] binds one (`SO_REUSEADDR`, so a port whose last
@@ -110,6 +116,23 @@ impl PortForwarder {
         guest_ip: Ipv4Addr,
         guest_port: u16,
     ) {
+        Self::serve_udp_with_idle(sock, engine, guest_ip, guest_port, UDP_PEER_IDLE).await
+    }
+
+    /// [`Self::serve_udp`] with the peer idle expiry given, so a test need
+    /// not wait a minute.
+    ///
+    /// Each remote peer gets one task that carries both directions over its
+    /// own engine flow and ends after `idle` without traffic either way.
+    /// Ending drops the flow, which frees its gateway port, so peers that
+    /// come and go do not exhaust the ephemeral range.
+    pub(super) async fn serve_udp_with_idle(
+        sock: UdpSocket,
+        engine: Arc<NatEngine>,
+        guest_ip: Ipv4Addr,
+        guest_port: u16,
+        idle: Duration,
+    ) {
         info!(addr = ?sock.local_addr().ok(), %guest_ip, guest_port, "udp forward up");
         let sock = Arc::new(sock);
         let mut remotes: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
@@ -125,19 +148,64 @@ impl PortForwarder {
             let tx = match remotes.get(&from) {
                 Some(tx) if !tx.is_closed() => tx.clone(),
                 _ => {
-                    let (to_guest, mut from_guest) =
-                        engine.udp_bind_guest_flow(guest_ip, guest_port);
-                    let sock = sock.clone();
-                    tokio::spawn(async move {
-                        while let Some(payload) = from_guest.recv().await {
-                            let _ = sock.send_to(&payload, from).await;
-                        }
-                    });
-                    remotes.insert(from, to_guest.clone());
-                    to_guest
+                    // Forget the peers whose task has ended before adding one.
+                    remotes.retain(|_, tx| !tx.is_closed());
+                    let (to_guest, from_guest) =
+                        match engine.udp_bind_guest_flow(guest_ip, guest_port) {
+                            Ok(flow) => flow,
+                            Err(e) => {
+                                warn!(%from, error = %e, "udp forward: datagram dropped");
+                                continue;
+                            }
+                        };
+                    let (to_peer, from_peer) = mpsc::channel(64);
+                    tokio::spawn(Self::udp_peer(
+                        sock.clone(),
+                        from,
+                        from_peer,
+                        to_guest,
+                        from_guest,
+                        idle,
+                    ));
+                    remotes.insert(from, to_peer.clone());
+                    to_peer
                 }
             };
             let _ = tx.send(buf[..n].to_vec()).await;
+        }
+    }
+
+    /// One remote peer of a UDP forward: its datagrams to the guest, the
+    /// guest's replies back to it, until `idle` passes with neither.
+    async fn udp_peer(
+        sock: Arc<UdpSocket>,
+        peer: SocketAddr,
+        mut from_peer: mpsc::Receiver<Vec<u8>>,
+        to_guest: mpsc::Sender<Vec<u8>>,
+        mut from_guest: mpsc::Receiver<Vec<u8>>,
+        idle: Duration,
+    ) {
+        loop {
+            tokio::select! {
+                got = from_peer.recv() => match got {
+                    Some(payload) => {
+                        if to_guest.send(payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                got = from_guest.recv() => match got {
+                    Some(payload) => {
+                        let _ = sock.send_to(&payload, peer).await;
+                    }
+                    None => break,
+                },
+                () = tokio::time::sleep(idle) => {
+                    debug!(%peer, "udp forward: peer idle, expiring");
+                    break;
+                }
+            }
         }
     }
 }
