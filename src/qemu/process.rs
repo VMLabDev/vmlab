@@ -395,8 +395,9 @@ enum LabExecutable {
 }
 
 impl LabExecutable {
-    /// `qemu-system-<arch>` (also a host GPU's `qemu_binary`, which keeps
-    /// that name) and `qemu-kvm`, `vmlab-hv`, `swtpm`, `virtiofsd`, `smbd`.
+    /// `qemu-system-<arch>` and `qemu-kvm`, `vmlab-hv`, `swtpm`, `virtiofsd`,
+    /// `smbd`. A host GPU's `qemu_binary` can have any other name; see
+    /// [`LabIdentity::started`] for how its QEMU is still known.
     fn of(argv0: &[u8]) -> Option<Self> {
         let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
         match base {
@@ -463,7 +464,14 @@ impl LabIdentity {
                     .chain(option_values(args, "--configfile"))
                     .any(|v| under(smb, v))
             }),
-            None => false,
+            // A host GPU's `qemu_binary` under another name: our QEMU argv
+            // starts `-name vmlab:<lab>/<machine>` (cmdline.rs, container.rs)
+            // and always has a `-machine`.
+            None => {
+                args.first() == Some(&&b"-name"[..])
+                    && args.get(1).is_some_and(|v| under(&self.name, v))
+                    && !option_values(args, "-machine").is_empty()
+            }
         }
     }
 }
@@ -799,6 +807,23 @@ mod tests {
         // The marker outside `-name` is not ours.
         assert!(!lab.started(b"qemu-system-x86_64\0-name\0other\0-L\0vmlab:mylab/web\0"));
         assert!(!lab.started(b""));
+    }
+
+    /// A host GPU's `qemu_binary` may have any name: its QEMU is known by
+    /// `-name vmlab:<lab>/…` as the first option plus a `-machine`.
+    #[test]
+    fn a_renamed_qemu_binary_is_matched_by_its_argv_form() {
+        let lab = LabIdentity::new("mylab", None);
+        let gpu_qemu = b"/opt/gpu/bin/qemu-nv\0-name\0vmlab:mylab/web\0-machine\0q35\0";
+        assert!(lab.started(gpu_qemu));
+        assert!(!LabIdentity::new("other", None).started(gpu_qemu));
+        assert!(!LabIdentity::new("my", None).started(gpu_qemu));
+        // No `-machine`: not our QEMU.
+        assert!(!lab.started(b"qemu-nv\0-name\0vmlab:mylab/web\0"));
+        // `-name` not first: not our argv.
+        assert!(!lab.started(b"tool\0-v\0-name\0vmlab:mylab/web\0-machine\0q35\0"));
+        // The marker as a free argument, not `-name`'s value.
+        assert!(!lab.started(b"tool\0vmlab:mylab/web\0-machine\0q35\0"));
     }
 
     /// The argvs vmlab composes for one lab's machines, with the lab's root.
