@@ -216,7 +216,9 @@ async fn read_loop(read_half: tokio::net::unix::OwnedReadHalf, routes: Arc<Route
                         // A daemon older than ADR-0007 sends prose and
                         // no code; `Failed` is what its errors always
                         // meant to the surfaces above.
-                        (_, Some(e)) => Err(CommandError::new(code.unwrap_or(ErrorCode::Failed), e)),
+                        (_, Some(e)) => {
+                            Err(CommandError::new(code.unwrap_or(ErrorCode::Failed), e))
+                        }
                         (Some(v), None) => Ok(v),
                         (None, None) => Ok(Value::Null),
                     };
@@ -457,7 +459,9 @@ mod tests {
         let other = client.clone();
         drop(client);
         assert!(
-            tokio::time::timeout(SHORT, lines.next_line()).await.is_err(),
+            tokio::time::timeout(SHORT, lines.next_line())
+                .await
+                .is_err(),
             "the connection closed while a clone still holds it"
         );
 
@@ -503,10 +507,7 @@ mod tests {
         let (_server, _) = listener.accept().await.unwrap();
         let (tx, mut events) = mpsc::channel(1);
         *client.inner.routes.events() = Some(tx);
-        let answer = client
-            .send_req("ping", Value::Null, None)
-            .await
-            .unwrap();
+        let answer = client.send_req("ping", Value::Null, None).await.unwrap();
         drop(client);
         let answer = tokio::time::timeout(LONG, answer)
             .await
