@@ -292,6 +292,8 @@ struct Case {
     full: pc::Platform,
     staged: pc::Platform,
     cdrom: bool,
+    /// The capture's display is Cirrus CL-GD5446 rather than std-VGA.
+    cirrus: bool,
     processor_id: [u8; 8],
 }
 
@@ -344,11 +346,7 @@ impl Case {
             if class == 0x200 || (description.device, description.function) == (1, 2) {
                 continue;
             }
-            let mut kept = description.clone();
-            if class == 0x300 {
-                kept.vga = true;
-            }
-            staged.pci_devices.push(kept);
+            staged.pci_devices.push(description.clone());
         }
         let mut processor_id = smbios::SmbiosConfig::default().processor_id;
         if name == "pc-freedos-1.3" {
@@ -357,11 +355,17 @@ impl Case {
         if name == "pc-windows-98-se" {
             processor_id = [0x73, 6, 0, 0, 0xff, 0xfb, 0x83, 3];
         }
+        let cirrus = devices.iter().any(|device| {
+            device["class_info"]["class"].as_u64() == Some(0x300)
+                && device["id"]["vendor"].as_u64() == Some(0x1013)
+                && device["id"]["device"].as_u64() == Some(0xb8)
+        });
         Self {
             name,
             full,
             staged,
             cdrom: name != "pc-templeos",
+            cirrus,
             processor_id,
         }
     }
@@ -387,8 +391,13 @@ impl Case {
             .staged
             .pci_devices
             .iter()
-            .find(|device| device.vga)
+            .find(|device| device.device > 1 && device.function == 0 && !device.hotplug)
             .unwrap();
+        let device = if self.cirrus {
+            "cirrus-vga"
+        } else {
+            "std-vga"
+        };
         let mut description = serde_json::json!({
             "name":self.name,"machine":"pc","arch":"x86_64","accel":"kvm",
             "vcpus":self.staged.vcpus,
@@ -396,7 +405,7 @@ impl Case {
             "boot":{"kind":"firmware","firmware":"seabios","code":bios},
             "disks":[{"id":"probe","bus":"ide","channel":0,"unit":0,
                 "path":path.join("probe.raw"),"format":"raw","read_only":true}],
-            "display":{"device":"std-vga","pci":{"bus":0,"device":display.device,"function":display.function},"rom":vga},
+            "display":{"device":device,"pci":{"bus":0,"device":display.device,"function":display.function},"rom":vga},
             "nics":[],"serial_log":path.join("probe.log"),"ports":[]
         });
         if self.cdrom {
@@ -658,9 +667,6 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
     if case.name != "pc-templeos" {
         differences.push("4b: captured e1000/PCnet function and its AML are absent".into());
     }
-    if matches!(case.name, "pc-freedos-1.3" | "pc-windows-98-se") {
-        differences.push("4d: captured Cirrus is replaced at the same BDF by std-VGA, including its three ACPI sleep methods".into());
-    }
     let expected_bdfs: BTreeSet<_> = case
         .staged
         .pci_devices
@@ -686,17 +692,13 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
             continue;
         };
         let class = device["class_info"]["class"].as_u64().unwrap() as u16;
-        let (identity, subsystem, pin) = if class == 0x300 {
-            (0x1111_1234u32, 0x1100_1af4u32, 0u8)
-        } else {
-            (
-                (device["id"]["device"].as_u64().unwrap() as u32) << 16
-                    | device["id"]["vendor"].as_u64().unwrap() as u32,
-                (device["id"]["subsystem"].as_u64().unwrap_or(0) as u32) << 16
-                    | device["id"]["subsystem-vendor"].as_u64().unwrap_or(0) as u32,
-                device["irq_pin"].as_u64().unwrap() as u8,
-            )
-        };
+        let (identity, subsystem, pin) = (
+            (device["id"]["device"].as_u64().unwrap() as u32) << 16
+                | device["id"]["vendor"].as_u64().unwrap() as u32,
+            (device["id"]["subsystem"].as_u64().unwrap_or(0) as u32) << 16
+                | device["id"]["subsystem-vendor"].as_u64().unwrap_or(0) as u32,
+            device["irq_pin"].as_u64().unwrap() as u8,
+        );
         if le32(actual, 0) != identity
             || le32(actual, 0x2c) != subsystem
             || le16(actual, 0xa) != class
@@ -1273,7 +1275,10 @@ fn pc_hwref_differential_all_four_captures() {
     let vga = std::env::var_os("VMLAB_HV_STDVGABIOS")
         .map(PathBuf::from)
         .unwrap_or_else(|| "/usr/share/qemu/vgabios-stdvga.bin".into());
-    for path in [&bios, &vga] {
+    let cirrus = std::env::var_os("VMLAB_HV_CIRRUSBIOS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/usr/share/qemu/vgabios-cirrus.bin".into());
+    for path in [&bios, &vga, &cirrus] {
         if !path.is_file() {
             eprintln!(
                 "SKIP P2 pc differential: firmware {} is unavailable",
@@ -1284,7 +1289,8 @@ fn pc_hwref_differential_all_four_captures() {
     }
     for name in CAPTURES {
         let case = Case::new(name);
-        let mut vm = ProbeVm::boot(&case, &bios, &vga);
+        let rom = if case.cirrus { &cirrus } else { &vga };
+        let mut vm = ProbeVm::boot(&case, &bios, rom);
         let dump = vm.collect();
         let allowed = compare(&case, &dump).unwrap_or_else(|message| {
             panic!("{message}; artifacts {}", vm.directory.path().display())

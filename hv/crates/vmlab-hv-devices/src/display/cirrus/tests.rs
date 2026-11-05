@@ -29,6 +29,12 @@ fn indexed_read(dev: &mut CirrusVga, port: u16, index: u8) -> u8 {
     read(dev, port + 1)
 }
 
+fn dac(dev: &mut CirrusVga, rgb: [u8; 3]) {
+    for component in rgb {
+        dev.io_write(0x3c9, &[component]);
+    }
+}
+
 fn vram(dev: &CirrusVga, addr: usize, len: usize) -> Vec<u8> {
     let mut bytes = vec![0; len];
     dev.vga
@@ -247,7 +253,7 @@ fn packed_pixel_scanout_depths_pitch_and_start_address() {
     mode(&mut dev, 640, 480, 0, 1);
     assert_eq!((dev.mode().width, dev.mode().height), (640, 480));
     dev.io_write(0x3c8, &[7]);
-    dev.io_write(0x3c9, &[63, 0, 32]);
+    dac(&mut dev, [63, 0, 32]);
     fill_vram(&dev, 0, &[7]);
     assert_eq!(&dev.frame().pixels[..4], &[0x82, 0, 0xff, 0]);
     // 800x600x16, 5:6:5 from the hidden DAC register, as the capture's 0xe1.
@@ -294,12 +300,11 @@ fn hardware_cursor_is_composited_with_its_dac_colours() {
     fill_vram(&dev, 0, &[0x40; 640 * 4]);
     sr(&mut dev, 0x12, 2);
     dev.io_write(0x3c8, &[0x00]);
-    dev.io_write(0x3c9, &[63, 0, 0]);
+    dac(&mut dev, [63, 0, 0]);
     dev.io_write(0x3c8, &[0x0f]);
-    dev.io_write(0x3c9, &[0, 0, 63]);
+    dac(&mut dev, [0, 0, 63]);
     dev.io_write(0x3c7, &[0x0f]);
-    let mut back = [0; 3];
-    dev.io_read(0x3c9, &mut back);
+    let back: Vec<u8> = (0..3).map(|_| read(&mut dev, 0x3c9)).collect();
     assert_eq!(back, [0, 0, 63]);
     // Cursor 1 of the 32x32 set, row 0: invert, background, foreground.
     let base = VRAM_SIZE - 16384 + 256;

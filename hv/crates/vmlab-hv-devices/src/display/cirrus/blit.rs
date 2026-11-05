@@ -43,7 +43,8 @@ pub(super) fn rop(code: u8, s: u8, d: u8) -> u8 {
     }
 }
 
-/// The defined GR32 codes, for tests and validation.
+/// The defined GR32 codes.
+#[cfg(test)]
 pub(super) const ROPS: [u8; 16] = [
     0x00, 0x05, 0x06, 0x09, 0x0b, 0x0d, 0x0e, 0x50, 0x59, 0x6d, 0x90, 0x95, 0xad, 0xd0, 0xd6, 0xda,
 ];
