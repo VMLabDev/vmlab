@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat, Display, DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV, Machine, Nic, NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm, VfioDevice, VirtualDisplay,
+    Accel, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
+    DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV, Machine, Nic,
+    NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm, VfioDevice,
+    VirtualDisplay,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -607,7 +610,9 @@ pub(crate) fn vm(
         DisplayDevice::VirtioVga => roms.vgabios_virtio.clone(),
         DisplayDevice::CirrusVga => roms.vgabios_cirrus.clone(),
         DisplayDevice::VmwareSvga => {
-            bail!("vm \"{name}\": vmlab-hv adapter supports std VGA, virtio VGA and Cirrus (pc) only")
+            bail!(
+                "vm \"{name}\": vmlab-hv adapter supports std VGA, virtio VGA and Cirrus (pc) only"
+            )
         }
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
