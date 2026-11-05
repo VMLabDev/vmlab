@@ -892,7 +892,7 @@ mod tests {
             format!("tail\0-F\0{run}/vms/web/qemu.log\0"),
             format!("less\0{smb}/log.smbd\0"),
             format!("grep\0-r\0vmlab:mylab/\0{run}/\0"),
-            format!("grep\0-name\0vmlab:mylab/web\0"),
+            "grep\0-name\0vmlab:mylab/web\0".to_string(),
             format!("find\0{run}\0-name\0vmlab:mylab/web\0"),
             format!("bash\0-c\0cat {run}/vms/web/swtpm.sock\0"),
             format!("socat\0-\0UNIX-CONNECT:{run}/vms/web/control.sock\0"),
