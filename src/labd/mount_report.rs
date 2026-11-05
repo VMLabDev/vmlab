@@ -49,8 +49,8 @@ impl Drop for SettleOnDrop {
 struct Inner {
     /// Whether the guest has become ready, which is when mounting starts.
     ready: bool,
-    /// The retry policy's attempt count, for "attempt 3 of 30".
-    attempts: u32,
+    /// The retry policy's per-step deadline, for "1m20s of up to 5 min".
+    window: Duration,
     shares: BTreeMap<String, ShareState>,
     /// Refusals that name no share of their own: a plan note, or a step
     /// shared by every share (the WinFsp registration).
@@ -62,6 +62,8 @@ enum ShareState {
     /// Not mounted yet; `last` is the most recent failure, if any.
     Mounting {
         attempt: u32,
+        /// How long the failing step has been retried.
+        elapsed: Duration,
         last: Option<String>,
     },
     Mounted,
@@ -81,10 +83,10 @@ impl MountReport {
         &self,
         shares: impl IntoIterator<Item = &'a str>,
         unsupported: &[String],
-        attempts: u32,
+        window: Duration,
     ) {
         let mut inner = self.lock();
-        inner.attempts = attempts;
+        inner.window = window;
         inner.shares = shares
             .into_iter()
             .map(|share| {
@@ -92,6 +94,7 @@ impl MountReport {
                     share.to_string(),
                     ShareState::Mounting {
                         attempt: 0,
+                        elapsed: Duration::ZERO,
                         last: None,
                     },
                 )
@@ -105,11 +108,18 @@ impl MountReport {
         self.lock().ready = true;
     }
 
-    /// An attempt at one of `share`'s steps failed and will be retried.
-    pub fn attempt_failed(&self, share: Option<&str>, attempt: u32, err: &str) {
+    /// Attempt `attempt` (0 for the first) at one of `share`'s steps
+    /// failed, `elapsed` after the step's first attempt started.
+    pub fn attempt_failed(&self, share: Option<&str>, attempt: u32, elapsed: Duration, err: &str) {
         let Some(share) = share else { return };
-        if let Some(ShareState::Mounting { attempt: a, last }) = self.lock().shares.get_mut(share) {
+        if let Some(ShareState::Mounting {
+            attempt: a,
+            elapsed: e,
+            last,
+        }) = self.lock().shares.get_mut(share)
+        {
             *a = attempt + 1;
+            *e = elapsed;
             *last = Some(err.trim().to_string());
         }
     }
@@ -188,7 +198,11 @@ impl MountReport {
                 ShareState::Mounting { .. } if finished => out.push(format!(
                     "WARNING: \"{machine}\": share \"{share}\" was not mounted; see `vmlab logs`\n"
                 )),
-                ShareState::Mounting { attempt, last } => out.push(match (inner.ready, last) {
+                ShareState::Mounting {
+                    attempt,
+                    elapsed,
+                    last,
+                } => out.push(match (inner.ready, last) {
                     (false, _) => format!(
                         "\"{machine}\": share \"{share}\" not mounted yet: the guest is not \
                          ready; it mounts once it is, and a share that cannot is reported \
@@ -206,13 +220,33 @@ impl MountReport {
                     ),
                     (true, Some(err)) => format!(
                         "WARNING: \"{machine}\": share \"{share}\" not mounted yet, still \
-                         retrying (attempt {attempt} of {}): {err}\n",
-                        inner.attempts
+                         retrying (attempt {attempt}, {} of up to {}): {err}\n",
+                        elapsed_text(*elapsed),
+                        window_text(inner.window)
                     ),
                 }),
             }
         }
         out
+    }
+}
+
+/// How long a step has been retried, to the second: `45s`, `1m20s`.
+pub fn elapsed_text(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs {
+        0..60 => format!("{secs}s"),
+        _ => format!("{}m{:02}s", secs / 60, secs % 60),
+    }
+}
+
+/// The retry window: `5 min`, or seconds when it is not whole minutes.
+pub fn window_text(window: Duration) -> String {
+    let secs = window.as_secs();
+    if secs >= 60 && secs % 60 == 0 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -234,7 +268,11 @@ mod tests {
 
     fn report(shares: &[&str]) -> MountReport {
         let r = MountReport::default();
-        r.planned(shares.iter().copied(), &[], 30);
+        r.planned(
+            shares.iter().copied(),
+            &[],
+            crate::smb::steps::RetryPolicy::MOUNT.deadline,
+        );
         r
     }
 
@@ -269,7 +307,12 @@ mod tests {
     fn a_share_still_retrying_at_the_bound_is_reported_with_its_last_error() {
         let r = report(&["src"]);
         r.ready();
-        r.attempt_failed(Some("src"), 2, "exited 1: mkdir: can't create directory\n");
+        r.attempt_failed(
+            Some("src"),
+            2,
+            Duration::from_secs(80),
+            "exited 1: mkdir: can't create directory\n",
+        );
         let lines = r.lines("lin01", false);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
@@ -277,7 +320,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines[0].contains("still retrying (attempt 3 of 30)"),
+            lines[0].contains("still retrying (attempt 3, 1m20s of up to 5 min)"),
             "{lines:?}"
         );
         assert!(lines[0].contains("can't create directory\n"), "{lines:?}");
@@ -293,11 +336,13 @@ mod tests {
         r.attempt_failed(
             Some("c_repo"),
             4,
+            Duration::from_secs(20),
             "exited 2: System error 67 has occurred.\r\n\r\nThe network name cannot be found.\r\n",
         );
         r.attempt_failed(
             Some("c_media"),
             4,
+            Duration::from_secs(20),
             "exited 2: System error 53 has occurred.\r\n\r\nThe network path was not found.\r\n",
         );
         let lines = r.lines("win", false);
@@ -350,8 +395,15 @@ mod tests {
     #[test]
     fn notes_and_shareless_failures_are_warnings() {
         let r = MountReport::default();
-        r.planned(["v"], &["virtiofs share \"v\": no WinFsp".to_string()], 30);
-        r.gave_up(None, "`reg` still failing after 30 attempts: denied");
+        r.planned(
+            ["v"],
+            &["virtiofs share \"v\": no WinFsp".to_string()],
+            crate::smb::steps::RetryPolicy::MOUNT.deadline,
+        );
+        r.gave_up(
+            None,
+            "`reg` still failing after 5m02s of retries (31 attempts): denied",
+        );
         r.abandoned("no agent to mount through");
         let lines = r.lines("xp", true);
         assert_eq!(lines.len(), 3, "{lines:?}");

@@ -35,18 +35,49 @@ pub struct VirtiofsMount {
 /// service is up — observed at three to four minutes on Server 2025. The
 /// window has to cover that, and being a value means a test can assert it
 /// without living through it.
+///
+/// The bound is `deadline`, measured per step from its first attempt: an
+/// attempt starts only while the deadline has not passed, and its `exec` is
+/// cut to the time left (see [`RetryPolicy::exec_timeout`]), so a step gives
+/// up at most one exec timeout after the deadline. Between attempts the
+/// delay starts short, for the early blips, and doubles up to `max_delay`,
+/// which keeps the reaction time once the guest's client is up. No jitter:
+/// one guest's steps run one at a time, so there is no herd to spread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
-    pub attempts: u32,
-    pub delay: Duration,
+    pub first_delay: Duration,
+    pub factor: u32,
+    pub max_delay: Duration,
+    pub deadline: Duration,
 }
 
 impl RetryPolicy {
-    /// The policy every guest mount runs under: five minutes of patience.
+    /// The policy every guest mount runs under: five minutes of patience. A
+    /// constant by design, not a host setting.
     pub const MOUNT: RetryPolicy = RetryPolicy {
-        attempts: 30,
-        delay: Duration::from_secs(10),
+        first_delay: Duration::from_secs(1),
+        factor: 2,
+        max_delay: Duration::from_secs(10),
+        deadline: Duration::from_secs(300),
     };
+
+    /// The longest one attempt's `exec` may run.
+    pub const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The wait after failed attempt `attempt` (0 for the first):
+    /// `first_delay * factor^attempt`, never more than `max_delay`.
+    pub fn delay(&self, attempt: u32) -> Duration {
+        let factor = self.factor.checked_pow(attempt).unwrap_or(u32::MAX);
+        self.first_delay
+            .checked_mul(factor)
+            .map_or(self.max_delay, |d| d.min(self.max_delay))
+    }
+
+    /// The `exec` timeout for an attempt starting with `left` of the deadline
+    /// to go: [`Self::EXEC_TIMEOUT`], or less once the deadline is nearer.
+    pub fn exec_timeout(&self, left: Duration) -> Duration {
+        Self::EXEC_TIMEOUT.min(left)
+    }
 }
 
 /// Everything to run in one guest to mount its shares.
@@ -391,12 +422,37 @@ mod tests {
     fn the_retry_policy_rides_in_the_plan() {
         let plan = mount_plan(OsHint::Linux, &[], Vec::new());
         assert_eq!(plan.retry, RetryPolicy::MOUNT);
-        assert_eq!(plan.retry.attempts, 30);
-        assert_eq!(plan.retry.delay, Duration::from_secs(10));
-        assert_eq!(
-            plan.retry.attempts * plan.retry.delay.as_secs() as u32,
-            300,
-            "five minutes: Server 2025 takes three to four to bring its smb client up"
+    }
+
+    /// The mount policy covers Windows' SMB warm-up: the delays slept before
+    /// the deadline add up to at least four minutes, the deadline is at
+    /// least five, no delay is longer than the cap, and the first retry is
+    /// quick.
+    #[test]
+    fn the_mount_policy_covers_a_four_minute_warm_up() {
+        let policy = RetryPolicy::MOUNT;
+        assert!(policy.deadline >= Duration::from_secs(300));
+        assert!(policy.delay(0) < Duration::from_secs(10));
+        let mut slept = Duration::ZERO;
+        let mut attempt = 0;
+        while slept + policy.delay(attempt) < policy.deadline {
+            assert!(policy.delay(attempt) <= policy.max_delay, "{attempt}");
+            slept += policy.delay(attempt);
+            attempt += 1;
+        }
+        assert!(
+            slept >= Duration::from_secs(240),
+            "{slept:?}: Server 2025 takes three to four minutes to bring its smb client up"
         );
+    }
+
+    #[test]
+    fn the_delay_doubles_to_its_cap() {
+        let policy = RetryPolicy::MOUNT;
+        let delays: Vec<u64> = (0..7).map(|a| policy.delay(a).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 10, 10, 10]);
+        assert_eq!(policy.delay(u32::MAX), policy.max_delay, "no overflow");
+        assert_eq!(policy.exec_timeout(Duration::from_secs(300)), Duration::from_secs(30));
+        assert_eq!(policy.exec_timeout(Duration::from_secs(4)), Duration::from_secs(4));
     }
 }
