@@ -832,8 +832,10 @@ mod tests {
     /// still falls back to QEMU until 4c, naming 4c and nothing earlier.
     #[test]
     fn the_delivered_sub_phases_are_4a_and_4b() {
-        assert!(LEGACY_PC_DELIVERED.machine_core && LEGACY_PC_DELIVERED.networking);
-        assert!(!LEGACY_PC_DELIVERED.floppy_uhci && !LEGACY_PC_DELIVERED.cirrus);
+        const {
+            assert!(LEGACY_PC_DELIVERED.machine_core && LEGACY_PC_DELIVERED.networking);
+            assert!(!LEGACY_PC_DELIVERED.floppy_uhci && !LEGACY_PC_DELIVERED.cirrus);
+        }
         let why = refused(
             r#"template = "scratch" arch = "x86_64" disk = 2GiB
                 profile = "windows-legacy" nic { nat = true }"#,
