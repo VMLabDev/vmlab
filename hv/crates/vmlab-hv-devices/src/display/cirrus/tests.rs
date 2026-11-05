@@ -59,7 +59,11 @@ fn mode(dev: &mut CirrusVga, width: u32, height: u32, depth: u8, bytes: u32) {
     cr(dev, 1, (width / 8 - 1) as u8);
     let lines = height - 1;
     cr(dev, 0x12, lines as u8);
-    cr(dev, 7, (((lines >> 8) & 1) << 1 | ((lines >> 9) & 1) << 6) as u8);
+    cr(
+        dev,
+        7,
+        (((lines >> 8) & 1) << 1 | ((lines >> 9) & 1) << 6) as u8,
+    );
     let pitch = width * bytes / 8;
     cr(dev, 0x13, pitch as u8);
     cr(dev, 0x1b, ((pitch >> 8) as u8 & 1) << 4);
@@ -146,14 +150,22 @@ fn unlock_identity_memory_size_and_read_only_registers() {
     sr(&mut dev, 6, 0x12);
     assert_eq!(indexed_read(&mut dev, 0x3c4, 0x0f), 0x98);
     sr(&mut dev, 0x0f, 0);
-    assert_eq!(indexed_read(&mut dev, 0x3c4, 0x0f), 0x98, "memory size fixed");
+    assert_eq!(
+        indexed_read(&mut dev, 0x3c4, 0x0f),
+        0x98,
+        "memory size fixed"
+    );
     sr(&mut dev, 0x17, 0xff);
     assert_eq!(indexed_read(&mut dev, 0x3c4, 0x17), 0xe7, "bus type fixed");
     assert_eq!(indexed_read(&mut dev, 0x3d4, 0x27), 0xb8);
     cr(&mut dev, 0x27, 0);
     assert_eq!(indexed_read(&mut dev, 0x3d4, 0x27), 0xb8);
     dev.io_write(0x3c0, &[0x14]);
-    assert_eq!(indexed_read(&mut dev, 0x3d4, 0x24), 0x80, "attribute flip-flop");
+    assert_eq!(
+        indexed_read(&mut dev, 0x3d4, 0x24),
+        0x80,
+        "attribute flip-flop"
+    );
     assert_eq!(indexed_read(&mut dev, 0x3d4, 0x26), 0x14);
     gr(&mut dev, 0x0b, 0x2e);
     assert_eq!(indexed_read(&mut dev, 0x3ce, 0x0b), 0x2e);
@@ -167,7 +179,11 @@ fn hidden_dac_register_needs_four_reads_of_the_pixel_mask() {
     }
     dev.io_write(0x3c6, &[0xe1]);
     assert_eq!(dev.hdr, 0xe1);
-    assert_eq!(read(&mut dev, 0x3c6), 0xff, "the HDR write restarts the count");
+    assert_eq!(
+        read(&mut dev, 0x3c6),
+        0xff,
+        "the HDR write restarts the count"
+    );
     for _ in 0..3 {
         read(&mut dev, 0x3c6);
     }
@@ -192,11 +208,19 @@ fn banks_granularity_dual_banks_and_scaled_addressing() {
     assert_eq!(vram(&dev, 3 * 4096 + 0x10, 1), [0xa1], "4 KiB granularity");
     gr(&mut dev, 0x0b, 0x20);
     dev.legacy_write(0x10, &[0xa2]);
-    assert_eq!(vram(&dev, 3 * 16384 + 0x10, 1), [0xa2], "16 KiB granularity");
+    assert_eq!(
+        vram(&dev, 3 * 16384 + 0x10, 1),
+        [0xa2],
+        "16 KiB granularity"
+    );
     gr(&mut dev, 0x0b, 0x21);
     gr(&mut dev, 0x0a, 8);
     dev.legacy_write(0x8004, &[0xa3]);
-    assert_eq!(vram(&dev, 8 * 16384 + 4, 1), [0xa3], "GRA maps the upper half");
+    assert_eq!(
+        vram(&dev, 8 * 16384 + 4, 1),
+        [0xa3],
+        "GRA maps the upper half"
+    );
     let mut back = [0];
     dev.legacy_read(0x8004, &mut back);
     assert_eq!(back, [0xa3]);
@@ -204,10 +228,18 @@ fn banks_granularity_dual_banks_and_scaled_addressing() {
     assert_eq!(vram(&dev, 3 * 16384 + 0x7fff, 1), [0xa4]);
     gr(&mut dev, 0x0b, 0x20);
     dev.legacy_write(0x8004, &[0xa5]);
-    assert_eq!(vram(&dev, 3 * 16384 + 0x8004, 1), [0xa5], "single bank spans 64 KiB");
+    assert_eq!(
+        vram(&dev, 3 * 16384 + 0x8004, 1),
+        [0xa5],
+        "single bank spans 64 KiB"
+    );
     gr(&mut dev, 6, 0x0d);
     dev.legacy_write(0x8004, &[0xa6]);
-    assert_eq!(vram(&dev, 3 * 16384 + 0x8004, 1), [0xa5], "outside the B0000 map");
+    assert_eq!(
+        vram(&dev, 3 * 16384 + 0x8004, 1),
+        [0xa5],
+        "outside the B0000 map"
+    );
 }
 
 #[test]
@@ -223,13 +255,19 @@ fn extended_write_modes_expand_bits_through_the_pixel_mask() {
     gr(&mut dev, 1, 0x33);
     sr(&mut dev, 2, 0xff);
     dev.legacy_write(1, &[0b1010_0001]);
-    assert_eq!(vram(&dev, 8, 8), [0x33, 0x22, 0x33, 0x22, 0x22, 0x22, 0x22, 0x33]);
+    assert_eq!(
+        vram(&dev, 8, 8),
+        [0x33, 0x22, 0x33, 0x22, 0x22, 0x22, 0x22, 0x33]
+    );
     // Write mode 4 leaves clear bits; SR2 masks pixels, bit 7 first.
     gr(&mut dev, 5, 0x44);
     sr(&mut dev, 2, 0x7f);
     gr(&mut dev, 1, 0x44);
     dev.legacy_write(2, &[0xff]);
-    assert_eq!(vram(&dev, 16, 8), [0x11, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44]);
+    assert_eq!(
+        vram(&dev, 16, 8),
+        [0x11, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44]
+    );
     // BY16: sixteen-bit colours from GR0/GR10 and GR1/GR11.
     sr(&mut dev, 2, 0xff);
     gr(&mut dev, 0x0b, 0x3c);
@@ -293,6 +331,30 @@ fn packed_pixel_scanout_depths_pitch_and_start_address() {
     assert_eq!(dev.mode(), dev.vga.mode());
 }
 
+/// The Windows 98 SE driver leaves SR1 = 0x21 at its 640x480 desktop.
+#[test]
+fn screen_off_does_not_blank_packed_pixel_modes() {
+    let mut dev = device();
+    mode(&mut dev, 640, 480, 0, 1);
+    dac(&mut dev, [63, 63, 63]);
+    fill_vram(&dev, 0, &[0]);
+    sr(&mut dev, 1, 0x21);
+    assert!(dev.scanout_active());
+    dev.io_write(0x3c8, &[0]);
+    dac(&mut dev, [63, 63, 63]);
+    assert_eq!(&dev.frame().pixels[..4], &[0xff, 0xff, 0xff, 0]);
+    // The attribute index's palette bit still blanks.
+    read(&mut dev, 0x3da);
+    dev.io_write(0x3c0, &[0x00]);
+    assert!(!dev.scanout_active());
+    assert_eq!(&dev.frame().pixels[..4], &[0; 4]);
+    // VGA modes keep the core's rule.
+    read(&mut dev, 0x3da);
+    dev.io_write(0x3c0, &[0x20]);
+    sr(&mut dev, 7, 0);
+    assert!(!dev.scanout_active());
+}
+
 #[test]
 fn hardware_cursor_is_composited_with_its_dac_colours() {
     let mut dev = device();
@@ -347,7 +409,11 @@ fn rop_table_covers_the_sixteen_codes() {
 fn capture_pattern_fill_with_colour_expansion() {
     let mut dev = device();
     mode(&mut dev, 640, 480, 0, 1);
-    fill_vram(&dev, 0x60c08, &[0xff, 0x00, 0xaa, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    fill_vram(
+        &dev,
+        0x60c08,
+        &[0xff, 0x00, 0xaa, 0xff, 0xff, 0xff, 0xff, 0xff],
+    );
     gr(&mut dev, 1, 0x07);
     gr(&mut dev, 0, 0x01);
     blit(&mut dev, 0xc0, 0x0d, 640, 480, 640, 0, 0, 0x60c08);
@@ -374,7 +440,10 @@ fn capture_pattern_fill_at_sixteen_bits() {
     blit(&mut dev, 0xd0, 0x0d, 16, 2, 1280, 0, 0x100, 0x60c08);
     assert_eq!(
         vram(&dev, 0x100, 16),
-        [0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x78, 0x56, 0x78, 0x56, 0x78, 0x56, 0x78, 0x56]
+        [
+            0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x78, 0x56, 0x78, 0x56, 0x78, 0x56,
+            0x78, 0x56
+        ]
     );
     assert_eq!(vram(&dev, 0x100 + 1280, 2), [0x34, 0x12]);
 }
@@ -384,7 +453,9 @@ fn capture_pattern_fill_at_sixteen_bits() {
 #[test]
 fn capture_colour_expansion_from_video_memory_uses_packed_rows() {
     let mut dev = device();
-    let source: Vec<u8> = (0..32).map(|i| if i % 2 == 0 { 0xff } else { 0x00 }).collect();
+    let source: Vec<u8> = (0..32)
+        .map(|i| if i % 2 == 0 { 0xff } else { 0x00 })
+        .collect();
     fill_vram(&dev, 0x60c08, &source);
     fill_vram(&dev, 0x47bc8, &[0x0f; 16]);
     fill_vram(&dev, 0x47bc8 + 640 * 15, &[0x0f; 16]);
@@ -432,7 +503,11 @@ fn every_capture_rop_combines_source_and_destination() {
         fill_vram(&dev, 0x2000, &[0b1100]);
         fill_vram(&dev, 0x3000, &[0b1010]);
         blit(&mut dev, 0x00, code, 1, 1, 0, 0, 0x3000, 0x2000);
-        assert_eq!(vram(&dev, 0x3000, 1), [rop(code, 0b1100, 0b1010)], "{code:#x}");
+        assert_eq!(
+            vram(&dev, 0x3000, 1),
+            [rop(code, 0b1100, 0b1010)],
+            "{code:#x}"
+        );
     }
 }
 
@@ -488,7 +563,11 @@ fn pattern_copy_repeats_an_eight_by_eight_colour_tile() {
     fill_vram(&dev, 0x1000, &tile);
     blit(&mut dev, 0x40, 0x0d, 10, 9, 16, 0, 0x2000, 0x1000);
     assert_eq!(vram(&dev, 0x2000, 10), [0, 1, 2, 3, 4, 5, 6, 7, 0, 1]);
-    assert_eq!(vram(&dev, 0x2000 + 16 * 8, 2), [0, 1], "row 8 wraps to row 0");
+    assert_eq!(
+        vram(&dev, 0x2000 + 16 * 8, 2),
+        [0, 1],
+        "row 8 wraps to row 0"
+    );
     assert_eq!(vram(&dev, 0x2000 + 16 * 3, 1), [24]);
     let tile16: Vec<u8> = (0..128).collect();
     fill_vram(&dev, 0x4000, &tile16);
@@ -508,7 +587,9 @@ fn system_source_rows_come_from_the_aperture_and_the_bar0_port() {
     dev.legacy_write(0x1234, &[0xf0, 0x0f, 0xde, 0xad]);
     assert_eq!(
         vram(&dev, 0x100, 12),
-        [0xaa, 0xaa, 0xaa, 0xaa, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55]
+        [
+            0xaa, 0xaa, 0xaa, 0xaa, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55
+        ]
     );
     let mut ignored = [0];
     dev.legacy_read(0, &mut ignored);

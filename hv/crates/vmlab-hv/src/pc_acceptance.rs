@@ -776,7 +776,7 @@ fn windows_98_desktop_frame_under_cirrus() {
     let deadline = Instant::now() + Duration::from_secs(120);
     let (width, height, colours) = loop {
         let (width, height, pixels) = screenshot(&directory, "desktop.ppm");
-        let colours: std::collections::BTreeSet<_> = pixels.chunks_exact(3).collect();
+        let colours: std::collections::BTreeSet<_> = pixels.as_chunks::<3>().0.iter().collect();
         if width >= 640 && height >= 480 && width != 720 && colours.len() >= 16 {
             break (width, height, colours.len());
         }

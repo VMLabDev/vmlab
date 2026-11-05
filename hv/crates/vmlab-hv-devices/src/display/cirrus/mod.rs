@@ -139,8 +139,15 @@ impl CirrusVga {
         self.sr(7) & 1 != 0
     }
 
+    /// In packed-pixel modes SR1 bit 5 (screen off) does not blank: the
+    /// Windows 98 SE driver leaves it set at its desktop, which the capture's
+    /// desktop.png shows. The attribute index's palette bit still blanks.
     pub fn scanout_active(&self) -> bool {
-        self.vga.scanout_active()
+        if self.extended() {
+            self.vga.scanout_programmed && self.vga.attr_index & 0x20 != 0
+        } else {
+            self.vga.scanout_active()
+        }
     }
 
     pub fn pci_identity(&self) -> u32 {
@@ -440,7 +447,10 @@ impl CirrusVga {
     }
 
     fn byte(&self, addr: usize) -> u8 {
-        self.vga.vram.read_obj(GuestAddress(addr as u64)).unwrap_or(0)
+        self.vga
+            .vram
+            .read_obj(GuestAddress(addr as u64))
+            .unwrap_or(0)
     }
 
     fn set_byte(&self, addr: usize, value: u8) {
@@ -607,7 +617,7 @@ impl CirrusVga {
             return frame.unchanged();
         }
         let mut pixels = vec![0; mode.stride as usize * mode.height as usize];
-        let blank = self.sr(1) & 0x20 != 0 || self.vga.attr_index & 0x20 == 0;
+        let blank = self.vga.attr_index & 0x20 == 0;
         if !blank {
             let mut vram = vec![0; VRAM_SIZE];
             self.vga

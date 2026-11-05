@@ -393,11 +393,7 @@ impl Case {
             .iter()
             .find(|device| device.device > 1 && device.function == 0 && !device.hotplug)
             .unwrap();
-        let device = if self.cirrus {
-            "cirrus-vga"
-        } else {
-            "std-vga"
-        };
+        let device = if self.cirrus { "cirrus-vga" } else { "std-vga" };
         let mut description = serde_json::json!({
             "name":self.name,"machine":"pc","arch":"x86_64","accel":"kvm",
             "vcpus":self.staged.vcpus,

@@ -431,16 +431,12 @@ fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
         if desc.ahci_pci.is_some() || desc.disks.iter().any(|disk| disk.bus == DiskBus::Ahci) {
             return invalid("pc uses PIIX IDE, not q35 AHCI");
         }
-        if desc
-            .display
-            .as_ref()
-            .is_some_and(|display| {
-                !matches!(
-                    display.device,
-                    DisplayDevice::StdVga | DisplayDevice::CirrusVga
-                )
-            })
-        {
+        if desc.display.as_ref().is_some_and(|display| {
+            !matches!(
+                display.device,
+                DisplayDevice::StdVga | DisplayDevice::CirrusVga
+            )
+        }) {
             return invalid("pc requires std-vga or cirrus-vga");
         }
         if desc.audio.is_some() || desc.tpm.is_some() || !desc.vfio.is_empty() {
@@ -1449,7 +1445,22 @@ pub fn build(
                 vcpus: platform.vcpus,
                 max_cpus: platform.max_cpus,
                 ram_regions: platform.ram_regions,
-                pci_devices: platform.pci_devices.into_iter().map(Into::into).collect(),
+                pci_devices: platform
+                    .pci_devices
+                    .into_iter()
+                    .map(|device| {
+                        let mut device = vmlab_hv_firmware::pc::PciDevice::from(device);
+                        // The display is never hotpluggable: std-VGA carries
+                        // that through its `vga` flag, Cirrus has no flag.
+                        if desc.display.as_ref().is_some_and(|display| {
+                            (display.pci.device, display.pci.function)
+                                == (device.device, device.function)
+                        }) {
+                            device.hotplug = false;
+                        }
+                        device
+                    })
+                    .collect(),
                 pci64_base: if layout.ram_top() > 1 << 32 {
                     platform.pci64_base
                 } else {
