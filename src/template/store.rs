@@ -371,9 +371,8 @@ impl TemplateStore {
             let restored = (ops.rename)(&old, dest);
             let _ = fs::remove_dir_all(&next);
             return match restored {
-                Ok(()) => {
-                    Err(e).with_context(|| format!("cannot move new version into {}", dest.display()))
-                }
+                Ok(()) => Err(e)
+                    .with_context(|| format!("cannot move new version into {}", dest.display())),
                 Err(back) => Err(e).with_context(|| {
                     format!(
                         "cannot move new version into {}, and cannot restore the old version \
@@ -1040,10 +1039,7 @@ struct InstallOps {
 }
 
 impl InstallOps {
-    const REAL: Self = Self {
-        write_meta,
-        rename,
-    };
+    const REAL: Self = Self { write_meta, rename };
 }
 
 fn write_meta(meta: &TemplateMeta, path: &Path) -> Result<()> {
@@ -1590,7 +1586,11 @@ mod tests {
         let err = store
             .install_with(&staging, &new_meta(), true, ops)
             .unwrap_err();
-        assert_eq!(version_files(&store), before, "old version changed: {err:#}");
+        assert_eq!(
+            version_files(&store),
+            before,
+            "old version changed: {err:#}"
+        );
         assert_eq!(version_entries(&store), ["1"], "{err:#}");
         let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
         assert_eq!(r.meta.cpus, Some(2));
@@ -1647,7 +1647,10 @@ mod tests {
             },
             ..InstallOps::REAL
         });
-        assert!(format!("{err:#}").contains("cannot move new version"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("cannot move new version"),
+            "{err:#}"
+        );
     }
 
     /// The last rename and the rename back both fail, as after a crash
