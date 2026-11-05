@@ -726,7 +726,8 @@ mod tests {
 
         // The second pull downloads and holds the shared base layer, then
         // stops at the barrier (its own top layer) before any flatten.
-        let second = pull_with_transport(&second_ref, "x86_64", &cache, &hub, &mut |_| {});
+        let mut no_progress = |_: ImagePullProgress| {};
+        let second = pull_with_transport(&second_ref, "x86_64", &cache, &hub, &mut no_progress);
         let first = async {
             gate.reached.notified().await;
             assert!(
