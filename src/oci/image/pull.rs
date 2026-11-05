@@ -206,9 +206,14 @@ pub(crate) async fn pull_with_transport(
         config.rootfs.diff_ids.len()
     );
 
-    // 4. Download the layer blobs (skipping any kept from a failed earlier
-    // attempt), verifying each compressed digest as it streams.
+    // 4. Hold each layer blob by a hard link in this pull's staging dir,
+    // downloading the ones the cache does not have (a failed earlier attempt
+    // keeps its blobs), verifying each compressed digest as it streams. The
+    // flatten reads only these links, so another pull removing a shared
+    // blob from the cache cannot take it away (F14). The links get a staging
+    // dir of their own: `staging` becomes the image directory.
     let staging = cache.staging_dir()?;
+    let holds = cache.staging_dir()?;
     let layers_total = manifest.layers.len();
     let bytes_total: u64 = manifest.layers.iter().map(|d| d.size).sum();
     let mut bytes_done: u64 = 0;
@@ -220,9 +225,8 @@ pub(crate) async fn pull_with_transport(
     });
     let mut layer_files: Vec<(PathBuf, String)> = Vec::new();
     for (i, layer) in manifest.layers.iter().enumerate() {
-        let blob = cache.blob_path(&layer.digest)?;
-        if !blob.is_file() {
-            let tmp = staging.path().join(format!("layer-{i:04}"));
+        let hold = holds.path().join(format!("layer-{i:04}"));
+        if !cache.hold_blob(&layer.digest, &hold)? {
             let base = bytes_done;
             let mut on_bytes = |n: u64| {
                 progress(ImagePullProgress {
@@ -233,12 +237,12 @@ pub(crate) async fn pull_with_transport(
                 });
             };
             transport
-                .get_blob_to_file(repo, &layer.digest, &tmp, &mut on_bytes)
+                .get_blob_to_file(repo, &layer.digest, &hold, &mut on_bytes)
                 .await
                 .with_context(|| format!("downloading layer {i} of {reference}"))?;
-            cache.install_blob(&tmp, &layer.digest)?;
+            cache.install_blob(&hold, &layer.digest)?;
         }
-        layer_files.push((blob, layer.media_type.clone()));
+        layer_files.push((hold, layer.media_type.clone()));
         bytes_done += layer.size;
         progress(ImagePullProgress {
             layer: i + 1,
@@ -260,9 +264,11 @@ pub(crate) async fn pull_with_transport(
             .context("flatten task panicked")?
             .with_context(|| format!("flattening {reference}"))?;
     }
+    drop(holds);
 
     // 6. Install the image atomically, then drop the now-redundant blobs
-    // and record the tag resolution.
+    // from the cache and record the tag resolution. A pull still flattening
+    // a shared blob holds its own link; this pull's went with `holds`.
     std::fs::write(staging.path().join(MANIFEST_FILE), &manifest_bytes)
         .context("cannot stage manifest.json")?;
     std::fs::write(staging.path().join(CONFIG_FILE), &config_bytes)
@@ -340,6 +346,16 @@ mod tests {
         manifests: Mutex<HashMap<String, (String, Vec<u8>)>>,
         offline: AtomicBool,
         blob_gets: AtomicUsize,
+        /// A blob whose fetch waits: `reached` is signalled when the fetch
+        /// starts, and it returns once `release` is.
+        gate: Mutex<Option<Gate>>,
+    }
+
+    #[derive(Clone)]
+    struct Gate {
+        digest: String,
+        reached: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
     }
 
     fn key(repo: &str, id: &str) -> String {
@@ -377,6 +393,11 @@ mod tests {
         async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
             self.check_online()?;
             self.blob_gets.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate.filter(|g| g.digest == digest) {
+                gate.reached.notify_one();
+                gate.release.notified().await;
+            }
             self.blobs
                 .lock()
                 .unwrap()
@@ -617,6 +638,155 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Seed `hub` with a plain manifest under `repo:tag` whose layers are
+    /// `layers` (gz bytes, diff_id), bottom first. Returns the digests of
+    /// the manifest and of each layer.
+    fn seed_layers(
+        hub: &FakeHub,
+        repo: &str,
+        tag: &str,
+        layers: &[(Vec<u8>, String)],
+    ) -> (String, Vec<String>) {
+        let layer_media = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+        let mut descriptors = Vec::new();
+        let mut digests = Vec::new();
+        for (gz, _) in layers {
+            let size = gz.len() as u64;
+            let digest = hub.put_blob(repo, gz.clone());
+            descriptors.push(serde_json::json!({
+                "mediaType": layer_media, "digest": digest, "size": size
+            }));
+            digests.push(digest);
+        }
+        let diff_ids: Vec<&String> = layers.iter().map(|(_, d)| d).collect();
+        let config = serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": { "Cmd": ["/bin/sh"] },
+            "rootfs": { "type": "layers", "diff_ids": diff_ids }
+        });
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        let config_size = config_bytes.len() as u64;
+        let config_digest = hub.put_blob(repo, config_bytes);
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media_types::DOCKER_MANIFEST,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config_size
+            },
+            "layers": descriptors
+        });
+        let body = serde_json::to_vec(&manifest).unwrap();
+        let digest = digest_of(&body);
+        hub.put_manifest(repo, tag, media_types::DOCKER_MANIFEST, body);
+        (digest, digests)
+    }
+
+    /// F14: two pulls of different images share a base layer. The second
+    /// pull holds the shared blob, then waits on a barrier before it opens
+    /// it to flatten; meanwhile the first pull finishes and removes the
+    /// shared blob from the cache. Both pulls still succeed, and no blob or
+    /// staging dir is left behind once both are done.
+    #[tokio::test]
+    async fn concurrent_pulls_keep_a_shared_layer_until_both_flatten() {
+        if !have("sqfstar") {
+            return;
+        }
+        let hub = FakeHub::default();
+        let base = gz_layer("etc/base", "shared");
+        let (first_md, first_layers) = seed_layers(
+            &hub,
+            "owner/app",
+            "first",
+            &[base.clone(), gz_layer("etc/marker", "first")],
+        );
+        let (second_md, second_layers) = seed_layers(
+            &hub,
+            "owner/app",
+            "second",
+            &[base, gz_layer("etc/marker", "second")],
+        );
+        assert_eq!(
+            first_layers[0], second_layers[0],
+            "the base layer is shared"
+        );
+        let gate = Gate {
+            digest: second_layers[1].clone(),
+            reached: Default::default(),
+            release: Default::default(),
+        };
+        *hub.gate.lock().unwrap() = Some(gate.clone());
+        let (_tmp, cache) = new_cache();
+        let first_ref = parse_image_reference("owner/app:first").unwrap();
+        let second_ref = parse_image_reference("owner/app:second").unwrap();
+
+        // The second pull downloads and holds the shared base layer, then
+        // stops at the barrier (its own top layer) before any flatten.
+        let mut no_progress = |_: ImagePullProgress| {};
+        let second = pull_with_transport(&second_ref, "x86_64", &cache, &hub, &mut no_progress);
+        let first = async {
+            gate.reached.notified().await;
+            assert!(
+                cache.blob_path(&first_layers[0]).unwrap().is_file(),
+                "the second pull cached the shared layer"
+            );
+            let image = pull_with_transport(&first_ref, "x86_64", &cache, &hub, &mut |_| {})
+                .await
+                .expect("first pull");
+            // The first pull cleaned up the shared blob while the second
+            // still needs it.
+            assert!(!cache.blob_path(&first_layers[0]).unwrap().exists());
+            gate.release.notify_one();
+            image
+        };
+        let (second, first) = tokio::join!(second, first);
+        let second = second.expect("second pull after the first cleaned up");
+        assert_eq!(first.manifest_digest, first_md);
+        assert_eq!(second.manifest_digest, second_md);
+        assert!(first.rootfs_image.is_file() && second.rootfs_image.is_file());
+
+        if have("unsquashfs") {
+            let cat = |image: &PulledImage, path: &str| {
+                let out = std::process::Command::new("unsquashfs")
+                    .args(["-cat", image.rootfs_image.to_str().unwrap(), path])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{path}");
+                out.stdout
+            };
+            assert_eq!(cat(&second, "etc/base"), b"shared");
+            assert_eq!(cat(&second, "etc/marker"), b"second");
+            assert_eq!(cat(&first, "etc/marker"), b"first");
+        }
+
+        // Nothing either pull needed is left: no blobs, no staging dirs, and
+        // each image directory holds only its three files.
+        let blobs = cache.root().join("blobs/sha256");
+        assert!(
+            std::fs::read_dir(&blobs)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "blobs left in the cache"
+        );
+        let staging: Vec<_> = std::fs::read_dir(cache.root())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-"))
+            .collect();
+        assert!(staging.is_empty(), "staging dirs left: {staging:?}");
+        for image in [&first, &second] {
+            let dir = image.rootfs_image.parent().unwrap();
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            assert_eq!(names, [CONFIG_FILE, MANIFEST_FILE, ROOTFS_FILE]);
+        }
     }
 
     #[tokio::test]
