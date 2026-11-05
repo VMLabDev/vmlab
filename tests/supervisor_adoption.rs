@@ -51,17 +51,39 @@ fn start_time(pid: u32) -> u64 {
     rest.split_whitespace().nth(19).unwrap().parse().unwrap()
 }
 
-/// The control socket of a fake lab: answers `ping`, and on `shutdown` ends
-/// its daemon the way a real one ends after its teardown.
-struct FakeLab(Arc<Mutex<Process>>);
+/// The control socket of a fake lab: answers `ping`, and on `shutdown` and
+/// `destroy` ends its daemon the way a real one does — announcing the exit
+/// to the supervisor first, as `labd::announce_exit` does.
+struct FakeLab {
+    name: &'static str,
+    daemon: Arc<Mutex<Process>>,
+    supervisor: PathBuf,
+}
+
+impl FakeLab {
+    async fn exit(&self) {
+        let pid = self.daemon.lock().unwrap().0.id();
+        let client = Client::<SupRequest>::connect(&self.supervisor)
+            .await
+            .unwrap();
+        client
+            .send(SupRequest::LabExiting {
+                name: self.name.into(),
+                pid,
+            })
+            .await
+            .unwrap();
+        self.daemon.lock().unwrap().kill();
+    }
+}
 
 #[async_trait::async_trait]
 impl Handler<LabRequest> for FakeLab {
     async fn handle(&self, request: LabRequest, _: &Streamer) -> Result<Value, CommandError> {
         match request {
             LabRequest::Ping {} => Ok(json!(true)),
-            LabRequest::Shutdown {} => {
-                self.0.lock().unwrap().kill();
+            LabRequest::Shutdown {} | LabRequest::Destroy {} => {
+                self.exit().await;
                 Ok(json!(true))
             }
             _ => Err(CommandError::unsupported("fake lab daemon")),
@@ -193,29 +215,34 @@ async fn wait_event(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_adopted_daemon_is_watched_across_restart_shutdown_and_crash() {
+async fn an_adopted_daemon_is_watched_across_restart_shutdown_destroy_and_crash() {
     let host = Host::new();
 
-    // `stops` is released, `crashes` dies on its own, and `reused` names a
-    // live pid whose process is not the one the registry recorded.
+    // `stops` is released, `destroyed` is destroyed and exits by itself,
+    // `crashes` dies unannounced, and `reused` names a live pid whose
+    // process is not the one the registry recorded.
     let stops = fake_daemon();
+    let destroyed = fake_daemon();
     let crashes = fake_daemon();
     let stops_pid = stops.lock().unwrap().0.id();
+    let destroyed_pid = destroyed.lock().unwrap().0.id();
     let crashes_pid = crashes.lock().unwrap().0.id();
     let me = std::process::id();
     let mut servers = Vec::new();
-    for (lab, daemon) in [
+    for (name, daemon) in [
         ("stops", stops.clone()),
+        ("destroyed", destroyed.clone()),
         ("crashes", crashes.clone()),
         ("reused", fake_daemon()),
     ] {
-        let sock = host.lab_socket(lab);
+        let sock = host.lab_socket(name);
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
-        servers.push(
-            Server::bind(&sock, Arc::new(FakeLab(daemon)))
-                .await
-                .unwrap(),
-        );
+        let lab = FakeLab {
+            name,
+            daemon,
+            supervisor: host.runtime().join("vmlabd.sock"),
+        };
+        servers.push(Server::bind(&sock, Arc::new(lab)).await.unwrap());
     }
     let lab_root = host.path().join("lab");
     std::fs::create_dir_all(&lab_root).unwrap();
@@ -226,6 +253,8 @@ async fn an_adopted_daemon_is_watched_across_restart_shutdown_and_crash() {
         serde_json::to_string_pretty(&json!({"labs": [
             // Written before start times were recorded: adopted on its pid.
             {"name": "stops", "root": lab_root, "pid": stops_pid, "state": "running"},
+            {"name": "destroyed", "root": lab_root, "pid": destroyed_pid,
+             "started": start_time(destroyed_pid), "state": "running"},
             {"name": "crashes", "root": lab_root, "pid": crashes_pid,
              "started": start_time(crashes_pid), "state": "running"},
             {"name": "reused", "root": lab_root, "pid": me,
@@ -247,8 +276,9 @@ async fn an_adopted_daemon_is_watched_across_restart_shutdown_and_crash() {
         e.is_some_and(|e| e["started"] == json!(start_time(stops_pid)))
     })
     .await;
-    assert_eq!(state(host.entry("stops").as_ref()), Some("running"));
-    assert_eq!(state(host.entry("crashes").as_ref()), Some("running"));
+    for lab in ["stops", "destroyed", "crashes"] {
+        assert_eq!(state(host.entry(lab).as_ref()), Some("running"), "{lab}");
+    }
 
     // Restart: a supervisor that dies leaves its labs to the next one.
     first.kill();
@@ -260,17 +290,33 @@ async fn an_adopted_daemon_is_watched_across_restart_shutdown_and_crash() {
     })
     .await;
 
-    // Unexpected exit: nobody asked `crashes` to stop.
+    // Unexpected exit: nobody asked `crashes` to stop, and it said nothing.
     crashes.lock().unwrap().kill();
-    wait_event(&mut events, "lab.daemon_crashed", "crashes", &["stops"]).await;
+    wait_event(
+        &mut events,
+        "lab.daemon_crashed",
+        "crashes",
+        &["stops", "destroyed"],
+    )
+    .await;
     host.wait_entry("crashes", "an unexpected exit is a crash", |e| {
         state(e) == Some("failed")
     })
     .await;
 
+    // Destroy: the daemon exits by itself, cleanly, after announcing it;
+    // the supervisor never asked, and the exit is still not a crash.
+    let lab = Client::<LabRequest>::connect(&host.lab_socket("destroyed"))
+        .await
+        .unwrap();
+    lab.send(LabRequest::Destroy {}).await.unwrap();
+    host.wait_entry("destroyed", "a destroyed lab keeps no entry", |e| {
+        e.is_none()
+    })
+    .await;
+
     // Shutdown: a release asks the daemon to stop; its exit is expected,
-    // so the entry goes and no crash is reported, also after the monitor's
-    // next poll has seen the process gone.
+    // so the entry goes.
     supervisor
         .send(SupRequest::LabRelease {
             name: "stops".into(),
@@ -281,11 +327,15 @@ async fn an_adopted_daemon_is_watched_across_restart_shutdown_and_crash() {
         host.entry("stops").is_none(),
         "a released lab keeps no entry"
     );
+
+    // Neither is reported crashed, also after the monitors' next polls have
+    // seen both processes gone.
     let quiet = tokio::time::timeout(Duration::from_secs(3), async {
-        wait_event(&mut events, "never", "stops", &["stops"]).await
+        wait_event(&mut events, "never", "", &["stops", "destroyed"]).await
     })
     .await;
     assert!(quiet.is_err());
     assert!(host.entry("stops").is_none());
+    assert!(host.entry("destroyed").is_none());
     drop(servers);
 }

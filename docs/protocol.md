@@ -34,6 +34,7 @@ the code is the contract.
 | `lab.ensure` | `name: String`, `root: std::path::PathBuf` | `cli` | Spawn (or find) a lab's daemon; answers with its socket path. |
 | `lab.release` | `name: String` | `cli` | Stop a lab's daemon, after `down` or `destroy`. |
 | `lab.restart` | `name: String`, `root: std::path::PathBuf` | `cli` | Restart a lab's daemon so it re-reads its config; answers with the new socket path. |
+| `lab.exiting` | `name: String`, `pid: u32` | `daemon` | A lab daemon is about to exit by itself (`destroy`, `shutdown`, a termination signal), so its exit is expected rather than a crash. |
 | `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>`, `lab: Option<String>`, `members: Vec<GlobalMember>`, `mtu: Option<u16>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
 | `global.detach` | `name: String`, `lab: Option<String>` | `daemon` | Leave a global segment. |
 | `global.list` | — | `daemon` | Every global segment this host knows. |
@@ -227,6 +228,7 @@ Neither, which the build rejects:
 Deliberate, with the reason recorded beside the declaration:
 
 - `machine.usb_attached` — The supervisor asks every lab to fold holders into `usb.list`, which is the listing the CLI shows; a per-machine view of the same rows would be a second way to read one fact.
+- `lab.exiting` — Daemon-internal: a lab daemon says it is going before it goes, because a supervisor that adopted it is not its parent and cannot read its exit status. Nothing for a person to ask for.
 - `global.attach` — Daemon-internal: a lab daemon joins a global segment because a lab declared one, so there is nothing for a person to ask for.
 - `global.detach` — The other half of `global.attach`, and daemon-internal for the same reason.
 - `global.list` — A lab daemon reads it to fold each segment's peer state into the lab status projection, which is how both other surfaces already see it.

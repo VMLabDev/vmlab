@@ -322,9 +322,9 @@ impl Supervisor {
 
     /// Notice the exit of a daemon adopted from an earlier supervisor and
     /// judge it as the reaper judges a spawned one's. A process that is not
-    /// this supervisor's child gives no exit status, so only an exit a
-    /// release asked for (`Stopping`) is expected: a daemon that ends on its
-    /// own, even cleanly, is reported as a crash.
+    /// this supervisor's child gives no exit status, so an exit is expected
+    /// only when it was asked for or announced (`Stopping`): a daemon that
+    /// ends by itself announces it first ([`SupRequest::LabExiting`]).
     fn watch_adopted_exit(self: &Arc<Self>, lab: String, pid: u32, started: Option<u64>) {
         let sup = self.clone();
         tokio::spawn(async move {
@@ -334,6 +334,21 @@ impl Supervisor {
             sup.daemon_exited(&lab, pid, false, "its process is gone")
                 .await;
         });
+    }
+
+    /// Lab daemon `pid` says it is about to exit by itself: `destroy`, a
+    /// `shutdown` nobody here asked for, a termination signal. Its exit is
+    /// then expected, which an adopted daemon's monitor could not tell
+    /// otherwise. Only a running entry of that very daemon changes.
+    async fn daemon_exiting(&self, lab: &str, pid: u32) {
+        let mut reg = self.registry.lock().await;
+        if reg
+            .get(lab)
+            .is_some_and(|e| e.pid == pid && e.state == LabState::Running)
+        {
+            reg.set_state(lab, LabState::Stopping);
+            reg.save();
+        }
     }
 
     /// The exit of lab daemon `pid` for `lab`, as the reaper or the adopted
@@ -707,6 +722,11 @@ impl Handler<SupRequest> for SupervisorHandler {
             SupRequest::LabRestart { name, root } => {
                 let sock = sup.restart_lab(&name, root).await?;
                 Ok(json!({"socket": sock}))
+            }
+            // A lab daemon about to exit by itself.
+            SupRequest::LabExiting { name, pid } => {
+                sup.daemon_exiting(&name, pid).await;
+                Ok(json!(true))
             }
             // Global segments (PRD §9.2): attach returns the trunk socket.
             SupRequest::GlobalAttach {
