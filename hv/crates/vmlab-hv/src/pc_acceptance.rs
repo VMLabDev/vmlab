@@ -774,16 +774,27 @@ fn windows_98_desktop_frame_under_cirrus() {
     let _agent = running.ready();
     let directory = running.directory.path().to_path_buf();
     let deadline = Instant::now() + Duration::from_secs(120);
+    // The logon or desktop screen at 640x480x8: Windows 98's teal desktop
+    // (DAC 0, 32, 32) is the most common colour, beside the window colours.
+    // The VMM's inactive-output placeholder has two colours.
     let (width, height, colours) = loop {
         let (width, height, pixels) = screenshot(&directory, "desktop.ppm");
-        let colours: std::collections::BTreeSet<_> = pixels.as_chunks::<3>().0.iter().collect();
-        if width >= 640 && height >= 480 && width != 720 && colours.len() >= 16 {
-            break (width, height, colours.len());
+        let mut counts = std::collections::BTreeMap::new();
+        for pixel in pixels.as_chunks::<3>().0 {
+            *counts.entry(*pixel).or_insert(0usize) += 1;
+        }
+        let dominant = counts
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(pixel, _)| *pixel);
+        if width == 640 && height == 480 && counts.len() >= 8 && dominant == Some([0, 130, 130])
+        {
+            break (width, height, counts.len());
         }
         assert!(
             Instant::now() < deadline,
-            "no Cirrus desktop frame: {width}x{height}, {} colours; see {}",
-            colours.len(),
+            "no Cirrus desktop frame: {width}x{height}, {} colours, dominant {dominant:?}; see {}",
+            counts.len(),
             directory.join("desktop.ppm").display()
         );
         std::thread::sleep(Duration::from_secs(2));
