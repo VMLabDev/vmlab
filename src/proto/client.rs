@@ -31,15 +31,56 @@ struct Pending {
     chunks: Option<mpsc::Sender<String>>,
 }
 
-struct Inner {
-    write: Mutex<tokio::net::unix::OwnedWriteHalf>,
-    pending: Mutex<HashMap<u64, Pending>>,
-    events: Mutex<Option<mpsc::Sender<Event>>>,
-    next_id: AtomicU64,
-    reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
+/// Where the reader task routes what the daemon sends: the answer each
+/// request waits for, and the event subscription. This is all the reader
+/// holds — no write half and no [`Inner`] — so the connection lives exactly
+/// as long as the [`Client`] clones do.
+#[derive(Default)]
+struct Routes {
+    pending: std::sync::Mutex<HashMap<u64, Pending>>,
+    events: std::sync::Mutex<Option<mpsc::Sender<Event>>>,
 }
 
-/// Cloneable async client for one daemon socket.
+impl Routes {
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Pending>> {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn events(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<Event>>> {
+        self.events.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Answer every request still waiting with `why`.
+    fn fail_pending(&self, why: &str) {
+        for (_, p) in self.pending().drain() {
+            let _ = p.resp.send(Err(CommandError::failed(why)));
+        }
+    }
+}
+
+/// The connection the [`Client`] clones share. Dropped with the last clone,
+/// and that closes it: the write half shuts down, which the daemon reads as
+/// EOF, and the reader task, which owns the read half, is aborted.
+struct Inner {
+    write: Mutex<tokio::net::unix::OwnedWriteHalf>,
+    routes: Arc<Routes>,
+    next_id: AtomicU64,
+    reader: tokio::task::AbortHandle,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.reader.abort();
+        // A request is only still pending here if the future awaiting it was
+        // dropped; its receiver, if anything kept it, gets an answer. The
+        // event subscription ends with the client.
+        self.routes.fail_pending("client dropped");
+        self.routes.events().take();
+    }
+}
+
+/// Cloneable async client for one daemon socket. The connection closes
+/// when the last clone drops.
 pub struct Client<R: WireRequest> {
     inner: Arc<Inner>,
     _vocabulary: PhantomData<fn(R)>,
@@ -60,65 +101,15 @@ impl<R: WireRequest> Client<R> {
     pub async fn connect(path: &Path) -> Result<Client<R>, ProtoError> {
         let stream = UnixStream::connect(path).await?;
         let (read_half, write_half) = stream.into_split();
-        let inner = Arc::new(Inner {
-            write: Mutex::new(write_half),
-            pending: Mutex::new(HashMap::new()),
-            events: Mutex::new(None),
-            next_id: AtomicU64::new(1),
-            reader: Mutex::new(None),
-        });
-        let reader_inner = inner.clone();
-        let handle = tokio::spawn(async move {
-            let mut lines = BufReader::new(read_half).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<Message>(&line) else {
-                    continue;
-                };
-                match msg {
-                    Message::Resp { id, ok, err, code } => {
-                        if let Some(p) = reader_inner.pending.lock().await.remove(&id) {
-                            let result = match (ok, err) {
-                                // A daemon older than ADR-0007 sends prose and
-                                // no code; `Failed` is what its errors always
-                                // meant to the surfaces above.
-                                (_, Some(e)) => {
-                                    Err(CommandError::new(code.unwrap_or(ErrorCode::Failed), e))
-                                }
-                                (Some(v), None) => Ok(v),
-                                (None, None) => Ok(Value::Null),
-                            };
-                            let _ = p.resp.send(result);
-                        }
-                    }
-                    Message::Stream { id, chunk } => {
-                        let pending = reader_inner.pending.lock().await;
-                        if let Some(Pending {
-                            chunks: Some(tx), ..
-                        }) = pending.get(&id)
-                        {
-                            let _ = tx.try_send(chunk);
-                        }
-                    }
-                    Message::Event { data, .. } => {
-                        let guard = reader_inner.events.lock().await;
-                        if let Some(tx) = guard.as_ref()
-                            && let Ok(ev) = serde_json::from_value::<Event>(data)
-                        {
-                            let _ = tx.try_send(ev);
-                        }
-                    }
-                    Message::Req { .. } => {}
-                }
-            }
-            // Connection died: fail everything pending.
-            let mut pending = reader_inner.pending.lock().await;
-            for (_, p) in pending.drain() {
-                let _ = p.resp.send(Err(CommandError::failed("connection closed")));
-            }
-        });
-        *inner.reader.lock().await = Some(handle);
+        let routes = Arc::new(Routes::default());
+        let reader = tokio::spawn(read_loop(read_half, Arc::clone(&routes)));
         Ok(Client {
-            inner,
+            inner: Arc::new(Inner {
+                write: Mutex::new(write_half),
+                routes,
+                next_id: AtomicU64::new(1),
+                reader: reader.abort_handle(),
+            }),
             _vocabulary: PhantomData,
         })
     }
@@ -132,9 +123,8 @@ impl<R: WireRequest> Client<R> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.inner
-            .pending
-            .lock()
-            .await
+            .routes
+            .pending()
             .insert(id, Pending { resp: tx, chunks });
         let msg = Message::Req {
             id,
@@ -200,7 +190,7 @@ impl<R: WireRequest> Client<R> {
     /// it never reaches a command handler.
     pub async fn subscribe(&self) -> Result<mpsc::Receiver<Event>, ProtoError> {
         let (tx, rx) = mpsc::channel(256);
-        *self.inner.events.lock().await = Some(tx);
+        *self.inner.routes.events() = Some(tx);
         let resp = self.send_req("subscribe", Value::Null, None).await?;
         match resp.await {
             Ok(Ok(_)) => Ok(rx),
@@ -208,6 +198,51 @@ impl<R: WireRequest> Client<R> {
             Err(_) => Err(ProtoError::Closed),
         }
     }
+}
+
+/// Route every message the daemon sends until the connection ends, then
+/// fail whatever still waits. Holds only `routes`, never the client.
+async fn read_loop(read_half: tokio::net::unix::OwnedReadHalf, routes: Arc<Routes>) {
+    let mut lines = BufReader::new(read_half).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(msg) = serde_json::from_str::<Message>(&line) else {
+            continue;
+        };
+        match msg {
+            Message::Resp { id, ok, err, code } => {
+                let waiting = routes.pending().remove(&id);
+                if let Some(p) = waiting {
+                    let result = match (ok, err) {
+                        // A daemon older than ADR-0007 sends prose and
+                        // no code; `Failed` is what its errors always
+                        // meant to the surfaces above.
+                        (_, Some(e)) => Err(CommandError::new(code.unwrap_or(ErrorCode::Failed), e)),
+                        (Some(v), None) => Ok(v),
+                        (None, None) => Ok(Value::Null),
+                    };
+                    let _ = p.resp.send(result);
+                }
+            }
+            Message::Stream { id, chunk } => {
+                if let Some(Pending {
+                    chunks: Some(tx), ..
+                }) = routes.pending().get(&id)
+                {
+                    let _ = tx.try_send(chunk);
+                }
+            }
+            Message::Event { data, .. } => {
+                if let Some(tx) = routes.events().as_ref()
+                    && let Ok(ev) = serde_json::from_value::<Event>(data)
+                {
+                    let _ = tx.try_send(ev);
+                }
+            }
+            Message::Req { .. } => {}
+        }
+    }
+    // Connection died: fail everything pending.
+    routes.fail_pending("connection closed");
 }
 
 #[cfg(test)]
@@ -391,6 +426,116 @@ mod tests {
         assert_eq!(ev.event, "vm.ready");
         assert_eq!(ev.lab, "lab1");
         assert_eq!(ev.data["vm"], "dc01");
+    }
+
+    /// A bare listener standing in for a daemon, so a test sees what the
+    /// client does to the socket: the accepted stream, line by line.
+    async fn bare_daemon() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::net::UnixListener,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bare.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        (dir, sock, listener)
+    }
+
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(200);
+    const LONG: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// F10: dropping a clone leaves the connection usable; dropping the
+    /// last one closes it, and the daemon reads EOF.
+    #[tokio::test]
+    async fn the_daemon_reads_eof_once_the_last_clone_drops() {
+        let (_dir, sock, listener) = bare_daemon().await;
+        let client = LabClient::connect(&sock).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (read, mut write) = server.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        let other = client.clone();
+        drop(client);
+        assert!(
+            tokio::time::timeout(SHORT, lines.next_line()).await.is_err(),
+            "the connection closed while a clone still holds it"
+        );
+
+        // The remaining clone still asks and is answered.
+        let asking = tokio::spawn({
+            let other = other.clone();
+            async move { other.send(LabRequest::Ping {}).await }
+        });
+        let line = tokio::time::timeout(LONG, lines.next_line())
+            .await
+            .expect("the request arrives")
+            .unwrap()
+            .expect("a line, not EOF");
+        let Message::Req { id, cmd, .. } = serde_json::from_str(&line).unwrap() else {
+            panic!("{line}");
+        };
+        assert_eq!(cmd, "ping");
+        let mut resp = serde_json::to_string(&Message::Resp {
+            id,
+            ok: Some(Value::String("pong".into())),
+            err: None,
+            code: None,
+        })
+        .unwrap();
+        resp.push('\n');
+        write.write_all(resp.as_bytes()).await.unwrap();
+        let answer = tokio::time::timeout(LONG, asking).await.unwrap().unwrap();
+        assert_eq!(answer.unwrap(), Value::String("pong".into()));
+
+        drop(other);
+        let end = tokio::time::timeout(LONG, lines.next_line())
+            .await
+            .expect("the daemon reads EOF, not silence");
+        assert!(matches!(end, Ok(None)), "{end:?}");
+    }
+
+    /// A request still pending when the client goes is answered with an
+    /// error rather than left to hang, and a subscription ends.
+    #[tokio::test]
+    async fn what_waits_on_a_dropped_client_ends() {
+        let (_dir, sock, listener) = bare_daemon().await;
+        let client = LabClient::connect(&sock).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+        let (tx, mut events) = mpsc::channel(1);
+        *client.inner.routes.events() = Some(tx);
+        let answer = client
+            .send_req("ping", Value::Null, None)
+            .await
+            .unwrap();
+        drop(client);
+        let answer = tokio::time::timeout(LONG, answer)
+            .await
+            .expect("the pending request hangs");
+        let err = answer.unwrap().unwrap_err();
+        assert!(err.message.contains("client dropped"), "{err:?}");
+        let ended = tokio::time::timeout(LONG, events.recv()).await;
+        assert!(matches!(ended, Ok(None)), "the subscription hangs");
+    }
+
+    /// A daemon that closes still fails what was waiting on it, as before.
+    #[tokio::test]
+    async fn a_closed_connection_fails_pending_requests() {
+        let (_dir, sock, listener) = bare_daemon().await;
+        let client = LabClient::connect(&sock).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let asking = tokio::spawn({
+            let client = client.clone();
+            async move { client.send(LabRequest::Ping {}).await }
+        });
+        // Read the request so it is in flight, then hang up.
+        let mut lines = BufReader::new(server).lines();
+        tokio::time::timeout(LONG, lines.next_line())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lines);
+        let answer = tokio::time::timeout(LONG, asking).await.unwrap().unwrap();
+        assert!(answer.is_err(), "{answer:?}");
     }
 
     /// The region argument reaches the daemon as a rectangle, not as a raw
