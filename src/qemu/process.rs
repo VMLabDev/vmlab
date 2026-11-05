@@ -868,7 +868,10 @@ mod tests {
 
         // `--option=value` is the same option.
         let run = crate::paths::lab_runtime_dir("mylab");
-        let vfsd = format!("virtiofsd\0--socket-path={}/vms/web/v.sock\0", run.display());
+        let vfsd = format!(
+            "virtiofsd\0--socket-path={}/vms/web/v.sock\0",
+            run.display()
+        );
         assert!(lab.started(vfsd.as_bytes()));
     }
 
@@ -923,8 +926,14 @@ mod tests {
                 .zip(200..)
                 .map(|((_, argv), pid)| (pid, argv.into_bytes())),
         );
-        table.push((300, format!("vim\0{run}/vms/web/machine.json\0").into_bytes()));
-        table.push((301, format!("tail\0-f\0{run}/vms/web/qemu.log\0").into_bytes()));
+        table.push((
+            300,
+            format!("vim\0{run}/vms/web/machine.json\0").into_bytes(),
+        ));
+        table.push((
+            301,
+            format!("tail\0-f\0{run}/vms/web/qemu.log\0").into_bytes(),
+        ));
         table.push((302, Vec::new())); // a kernel thread's empty cmdline
 
         let picked = lab_orphans(&table, &LabIdentity::new("mylab", Some(root)));
@@ -937,8 +946,14 @@ mod tests {
     #[test]
     fn lab_move_counts_any_mention() {
         let markers = ["/labs/mylab/.vmlab/".to_string()];
-        assert!(cmdline_mentions(b"vim\0/labs/mylab/.vmlab/disk.qcow2\0", &markers));
-        assert!(cmdline_mentions(b"qemu\0-drive\0file=/labs/mylab/.vmlab/d\0", &markers));
+        assert!(cmdline_mentions(
+            b"vim\0/labs/mylab/.vmlab/disk.qcow2\0",
+            &markers
+        ));
+        assert!(cmdline_mentions(
+            b"qemu\0-drive\0file=/labs/mylab/.vmlab/d\0",
+            &markers
+        ));
         assert!(!cmdline_mentions(b"vim\0/labs/other/.vmlab/d\0", &markers));
     }
 }
