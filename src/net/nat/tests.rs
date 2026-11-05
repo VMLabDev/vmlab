@@ -1016,7 +1016,7 @@ async fn udp_bind_guest_flow_roundtrip() {
     let (engine, mut rx) = engine();
     engine.learn_mac(GUEST_IP, GUEST_MAC);
 
-    let (to_guest, mut from_guest) = engine.udp_bind_guest_flow(GUEST_IP, 9999);
+    let (to_guest, mut from_guest) = engine.udp_bind_guest_flow(GUEST_IP, 9999).unwrap();
     to_guest.send(b"hi guest".to_vec()).await.unwrap();
     let u = recv_udp(&mut rx).await;
     assert_eq!(u.src.0, GW_IP);
@@ -1027,6 +1027,100 @@ async fn udp_bind_guest_flow_roundtrip() {
     guest_udp(&engine, 9999, u.src, b"hi engine").await;
     let got = timeout(WAIT, from_guest.recv()).await.unwrap().unwrap();
     assert_eq!(got, b"hi engine");
+}
+
+/// Code review F8: with every gateway port taken for one guest port, the
+/// next bind spun forever holding the table lock. It must fail after one
+/// pass, and a flow that ends must give its port back.
+#[tokio::test]
+async fn udp_bind_guest_flow_fails_when_the_range_is_exhausted_and_reuses_a_freed_port() {
+    let (engine, mut rx) = engine();
+    engine.learn_mac(GUEST_IP, GUEST_MAC);
+    engine.limit_ephemeral_ports(2);
+
+    let (first, _first_rx) = engine.udp_bind_guest_flow(GUEST_IP, 9999).unwrap();
+    let (_second, _second_rx) = engine.udp_bind_guest_flow(GUEST_IP, 9999).unwrap();
+    first.send(b"one".to_vec()).await.unwrap();
+    let first_port = recv_udp(&mut rx).await.src.1;
+
+    // On a blocking thread with a deadline, so a spin fails the test
+    // instead of hanging it.
+    let bind = {
+        let engine = engine.clone();
+        tokio::task::spawn_blocking(move || engine.udp_bind_guest_flow(GUEST_IP, 9999).is_err())
+    };
+    let refused = timeout(WAIT, bind)
+        .await
+        .expect("allocation must not spin on an exhausted range")
+        .unwrap();
+    assert!(refused, "a third flow on a two-port range must be refused");
+
+    // A different guest port has the whole range to itself.
+    assert!(engine.udp_bind_guest_flow(GUEST_IP, 9998).is_ok());
+
+    // Dropping a flow's sender frees its port, once its task has noticed.
+    drop(first);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (reused, _reused_rx) = loop {
+        if let Ok(flow) = engine.udp_bind_guest_flow(GUEST_IP, 9999) {
+            break flow;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the freed port never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    reused.send(b"again".to_vec()).await.unwrap();
+    assert_eq!(recv_udp(&mut rx).await.src.1, first_port);
+}
+
+/// A UDP forward maps each remote peer to its own gateway port. Peers that
+/// go quiet must expire and give the port back, or enough distinct peers
+/// would exhaust the range for good.
+#[tokio::test]
+async fn udp_port_forward_expires_idle_peers_and_reuses_their_port() {
+    let (engine, mut rx) = engine();
+    engine.learn_mac(GUEST_IP, GUEST_MAC);
+    engine.limit_ephemeral_ports(1);
+    let idle = Duration::from_millis(200);
+
+    let fwd_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let fwd_addr = fwd_sock.local_addr().unwrap();
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            PortForwarder::serve_udp_with_idle(fwd_sock, engine, GUEST_IP, 53, idle).await;
+        });
+    }
+
+    let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    a.connect(fwd_addr).await.unwrap();
+    let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    b.connect(fwd_addr).await.unwrap();
+
+    a.send(b"from a").await.unwrap();
+    let u = recv_udp(&mut rx).await;
+    assert_eq!(u.payload, b"from a");
+    let port = u.src.1;
+
+    // The only port is A's: B's datagram is dropped, and the forward lives on.
+    b.send(b"too early").await.unwrap();
+    assert!(
+        timeout(idle / 2, rx.recv()).await.is_err(),
+        "a peer without a port must not reach the guest"
+    );
+
+    // A goes quiet past the expiry; its port is B's now, both ways.
+    tokio::time::sleep(idle * 3).await;
+    b.send(b"from b").await.unwrap();
+    let u = recv_udp(&mut rx).await;
+    assert_eq!(u.payload, b"from b");
+    assert_eq!(u.src.1, port);
+    guest_udp(&engine, 53, u.src, b"to b").await;
+    let mut buf = [0u8; 16];
+    let n = timeout(WAIT, b.recv(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..n], b"to b");
 }
 
 #[tokio::test]

@@ -127,7 +127,14 @@ pub struct NatEngine {
     guard: std::sync::OnceLock<Arc<HostGuard>>,
     ip_id: AtomicU16,
     eph_counter: AtomicU32,
+    /// How many ports of the ephemeral range are handed out: all of it,
+    /// except in tests that need to exhaust it.
+    eph_span: AtomicU32,
 }
+
+/// The ephemeral range 49152..=65535.
+const EPHEMERAL_BASE: u16 = 49152;
+const EPHEMERAL_PORTS: u32 = 16384;
 
 impl NatEngine {
     /// New engine using the subprocess `ping` reachability probe.
@@ -153,6 +160,7 @@ impl NatEngine {
             guard: std::sync::OnceLock::new(),
             ip_id: AtomicU16::new(1),
             eph_counter: AtomicU32::new(0),
+            eph_span: AtomicU32::new(EPHEMERAL_PORTS),
         })
     }
 
@@ -323,24 +331,34 @@ impl NatEngine {
     /// Bind a bidirectional UDP exchange with a guest port: payloads sent to
     /// the returned `Sender` become datagrams `gw_ip:eph → guest:port`;
     /// datagrams the guest sends back to `gw_ip:eph` arrive on the returned
-    /// `Receiver`. Dropping the `Sender` tears the flow down.
+    /// `Receiver`. Dropping the `Sender` tears the flow down and frees its
+    /// gateway port.
+    ///
+    /// Fails when every ephemeral port already carries a flow to this guest
+    /// port: one pass over the range, never a spin under the table lock.
     pub fn udp_bind_guest_flow(
         self: &Arc<Self>,
         guest_ip: Ipv4Addr,
         guest_port: u16,
-    ) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    ) -> Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)> {
+        use std::collections::hash_map::Entry;
         let (to_guest_tx, mut to_guest_rx) = mpsc::channel::<Vec<u8>>(64);
         let (from_guest_tx, from_guest_rx) = mpsc::channel::<Vec<u8>>(64);
         let gw_port = {
             let mut table = self.guest_udp.lock_recover();
-            let port = loop {
+            let mut free = None;
+            for _ in 0..self.eph_span.load(Ordering::Relaxed) {
                 let p = self.next_ephemeral();
-                if !table.contains_key(&(guest_ip, guest_port, p)) {
-                    break p;
+                if let Entry::Vacant(slot) = table.entry((guest_ip, guest_port, p)) {
+                    slot.insert(from_guest_tx);
+                    free = Some(p);
+                    break;
                 }
-            };
-            table.insert((guest_ip, guest_port, port), from_guest_tx);
-            port
+            }
+            match free {
+                Some(p) => p,
+                None => bail!("no free ephemeral port for a UDP flow to {guest_ip}:{guest_port}"),
+            }
         };
         let engine = self.clone();
         tokio::spawn(async move {
@@ -360,7 +378,7 @@ impl NatEngine {
                 .lock_recover()
                 .remove(&(guest_ip, guest_port, gw_port));
         });
-        (to_guest_tx, from_guest_rx)
+        Ok((to_guest_tx, from_guest_rx))
     }
 
     // -- internals shared with submodules -------------------------------------
@@ -380,7 +398,15 @@ impl NatEngine {
     /// Next port from the 49152..=65535 ephemeral range (round-robin).
     fn next_ephemeral(&self) -> u16 {
         let n = self.eph_counter.fetch_add(1, Ordering::Relaxed);
-        49152 + (n % 16384) as u16
+        EPHEMERAL_BASE + (n % self.eph_span.load(Ordering::Relaxed)) as u16
+    }
+
+    /// Hand out only the first `ports` ports of the ephemeral range, so a
+    /// test can exhaust it.
+    #[cfg(test)]
+    fn limit_ephemeral_ports(&self, ports: u32) {
+        assert!((1..=EPHEMERAL_PORTS).contains(&ports));
+        self.eph_span.store(ports, Ordering::Relaxed);
     }
 
     /// Reserve an ephemeral gateway port + flow-table slot for an active
@@ -393,7 +419,7 @@ impl NatEngine {
     ) -> Result<FlowKey> {
         use std::collections::hash_map::Entry;
         let mut table = self.tcp_flows.lock_recover();
-        for _ in 0..16384 {
+        for _ in 0..self.eph_span.load(Ordering::Relaxed) {
             let key = FlowKey {
                 guest_ip,
                 guest_port,
