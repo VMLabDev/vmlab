@@ -51,26 +51,13 @@ RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
       ./guest/build-agent.sh linux-x86_64; \
     mkdir -p /out/guest; \
     cp -r --sparse=always guest/dist/x86_64 guest/dist/agent /out/guest/
-# virglrenderer 1.3.0, which vmlab-hv's virtio-gpu builds against (phase 2d)
-# and trixie does not ship (1.1.0). Installed under /opt/virgl, apart from the
-# distro's: vmlab-hv finds it by rpath, and QEMU keeps trixie's.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends meson ninja-build patch pkg-config python3-yaml \
-      libepoxy-dev libdrm-dev libgbm-dev libegl-dev libvulkan-dev glslang-tools \
- && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    curl -fsSL -o /tmp/virgl.tar.gz \
-      https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/1.3.0/virglrenderer-1.3.0.tar.gz; \
-    echo "065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3  /tmp/virgl.tar.gz" | sha256sum -c -; \
-    tar -C /tmp -xzf /tmp/virgl.tar.gz; \
-    for patch in /src/patches/virglrenderer/*.patch; do \
-      echo "Applying $patch"; \
-      patch --batch --forward -d /tmp/virglrenderer-1.3.0 -p1 -i "$patch"; \
-    done; \
-    meson setup /tmp/virgl-build /tmp/virglrenderer-1.3.0 --prefix=/opt/virgl --libdir=lib \
-      --buildtype=release -Dvenus=true -Dtests=false; \
-    ninja -C /tmp/virgl-build install; \
-    rm -rf /tmp/virgl.tar.gz /tmp/virglrenderer-1.3.0 /tmp/virgl-build
+# virglrenderer, which vmlab-hv's virtio-gpu builds against (phase 2d) and
+# trixie does not ship at the pinned version. The pin, its patches and its
+# Meson options are build/hv-pins.toml's, built by build/hv.py as CI builds
+# them. Installed under /opt/virgl, apart from the distro's: vmlab-hv finds it
+# by rpath, and QEMU keeps trixie's.
+RUN python3 build/hv.py virgl-deps-install && rm -rf /var/lib/apt/lists/*
+RUN python3 build/hv.py virgl-build --prefix /opt/virgl
 # vmlab-hv (PRD §22) shares this checkout's workspace and protocol.
 RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
     --mount=type=cache,target=/src/target \

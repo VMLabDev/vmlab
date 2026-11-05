@@ -1,0 +1,46 @@
+# The hypervisor's build pins: the one definition of each (decision D12).
+#
+# build/hv.py reads this file, and everything else goes through it: the
+# ci::hv-* recipes, ci.yml (which also keys its virglrenderer cache on this
+# file), build/Dockerfile and e2e/Dockerfile.
+
+[virglrenderer]
+version = "1.3.0"
+# `{version}` is filled in from above.
+url = "https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/{version}/virglrenderer-{version}.tar.gz"
+sha256 = "065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3"
+# Applied after patches/virglrenderer/*.patch (D15), in name order. The
+# version, the sha256 and the patch set make up the cache key.
+meson-options = ["--libdir=lib", "--buildtype=release", "-Dvenus=true", "-Dtests=false"]
+
+# Ubuntu 24.04 and Debian trixie packages, in groups. Each install takes
+# the groups it needs:
+#   virgl-deps-install        virgl
+#   native-deps-install       virgl + hypervisor + release
+#   test-native-deps-install  virgl + hypervisor + test
+[native-deps]
+# Building virglrenderer with Venus.
+virgl = [
+  "meson", "ninja-build", "patch", "pkg-config", "python3-yaml",
+  "libepoxy-dev", "libdrm-dev", "libgbm-dev", "libegl-dev", "libvulkan-dev",
+  "glslang-tools",
+]
+# Building the hypervisor and running its viewer.
+hypervisor = [
+  "build-essential", "curl", "clang", "libclang-dev", "liblzma-dev",
+  "libpipewire-0.3-dev", "libpulse-dev",
+  "libxkbcommon-x11-0", "libx11-6", "libxcursor1", "libxrandr2", "libxi6",
+  "libxfixes3", "libxtst6",
+]
+# The release bundle: its viewer build, `git` for the revision stamp, and
+# patchelf and binutils to make it relocatable.
+release = [
+  "ca-certificates", "git", "libwayland-dev", "libxkbcommon-dev",
+  "patchelf", "binutils",
+]
+# The hypervisor's test suite: firmware, image and display tools.
+test = [
+  "gcc-multilib", "qemu-utils", "nasm", "acpica-tools", "imagemagick", "cpio",
+  "xvfb", "libvulkan1", "mesa-vulkan-drivers", "seabios", "xorriso",
+  "edid-decode", "pipewire-bin", "libxkbcommon0", "libwayland-client0",
+]

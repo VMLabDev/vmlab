@@ -21,6 +21,33 @@ class ViewerDesktopTest(unittest.TestCase):
         self.assertTrue(any(patch.name.startswith("0002-") for patch in hv.PATCHES))
         self.assertTrue(any(patch.name.startswith("0003-") for patch in hv.PATCHES))
 
+    def test_virgl_cache_key_changes_with_the_pin_and_the_patch_set(self):
+        key = hv.cache_key(hv.VIRGL_VERSION, hv.VIRGL_SHA256, hv.PATCHES)
+        self.assertEqual(key, hv.CACHE_KEY)
+        self.assertNotEqual(hv.cache_key("9.9.9", hv.VIRGL_SHA256, hv.PATCHES), key)
+        self.assertNotEqual(hv.cache_key(hv.VIRGL_VERSION, "0" * 64, hv.PATCHES), key)
+        self.assertNotEqual(hv.cache_key(hv.VIRGL_VERSION, hv.VIRGL_SHA256, hv.PATCHES[:-1]), key)
+        with tempfile.TemporaryDirectory() as temporary:
+            edited = Path(temporary) / hv.PATCHES[-1].name
+            edited.write_bytes(hv.PATCHES[-1].read_bytes() + b"\n")
+            self.assertNotEqual(
+                hv.cache_key(hv.VIRGL_VERSION, hv.VIRGL_SHA256, [*hv.PATCHES[:-1], edited]), key)
+
+    def test_the_pin_file_is_the_one_definition(self):
+        pins = tomllib.loads((hv.ROOT / "build/hv-pins.toml").read_text())
+        self.assertEqual(hv.VIRGL_VERSION, pins["virglrenderer"]["version"])
+        self.assertEqual(hv.VIRGL_SHA256, pins["virglrenderer"]["sha256"])
+        # Nothing else carries the pin.
+        for consumer in ("e2e/Dockerfile", "build/Dockerfile", ".github/workflows/ci.yml"):
+            text = (hv.ROOT / consumer).read_text()
+            self.assertNotIn(hv.VIRGL_SHA256, text, consumer)
+            self.assertNotIn(f"virglrenderer-{hv.VIRGL_VERSION}", text, consumer)
+        # Each install names a package once, and both share the virgl group.
+        for groups in (("virgl", "hypervisor", "release"), ("virgl", "hypervisor", "test")):
+            packages = hv.native_packages(*groups)
+            self.assertEqual(len(packages), len(set(packages)), groups)
+            self.assertTrue(set(hv.native_packages("virgl")) <= set(packages), groups)
+
     def test_release_stamp_updates_the_root_package(self):
         manifest = hv.ROOT / "Cargo.toml"
         original = tomllib.loads(manifest.read_text())

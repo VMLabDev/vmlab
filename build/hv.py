@@ -15,12 +15,27 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "https://github.com/VMLabDev/vmlab.git"
-VIRGL_VERSION = "1.3.0"
-VIRGL_SHA256 = "065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3"
+# The one definition of the virglrenderer pin and the native packages (D12).
+PINS = tomllib.loads((ROOT / "build/hv-pins.toml").read_text())
+VIRGL_VERSION = PINS["virglrenderer"]["version"]
+VIRGL_SHA256 = PINS["virglrenderer"]["sha256"]
+VIRGL_URL = PINS["virglrenderer"]["url"].format(version=VIRGL_VERSION)
+VIRGL_MESON_OPTIONS = PINS["virglrenderer"]["meson-options"]
 PATCHES = sorted((ROOT / "patches/virglrenderer").glob("*.patch"))
-PATCH_SHA256 = hashlib.sha256(b"".join(
-    patch.name.encode() + b"\0" + patch.read_bytes() for patch in PATCHES)).hexdigest()
-CACHE_KEY = f"virglrenderer-{VIRGL_VERSION}-{VIRGL_SHA256}-{PATCH_SHA256}"
+
+
+def patch_digest(patches):
+    return hashlib.sha256(b"".join(
+        patch.name.encode() + b"\0" + patch.read_bytes() for patch in patches)).hexdigest()
+
+
+def cache_key(version, sha256, patches):
+    """The virglrenderer build's identity: a new pin or patch set is a new key."""
+    return f"virglrenderer-{version}-{sha256}-{patch_digest(patches)}"
+
+
+PATCH_SHA256 = patch_digest(PATCHES)
+CACHE_KEY = cache_key(VIRGL_VERSION, VIRGL_SHA256, PATCHES)
 CACHE = ROOT / ".ci-cache"
 VIRGL = CACHE / CACHE_KEY
 
@@ -34,34 +49,28 @@ def revision():
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
 
 
-def native_deps_install():
-    # The hypervisor's ci::native-deps-install, without its test-only tools.
+def native_packages(*groups):
+    """The packages of `groups` in build/hv-pins.toml, each named once."""
+    packages = []
+    for group in groups:
+        packages += [p for p in PINS["native-deps"][group] if p not in packages]
+    return packages
+
+
+def apt_install(*groups):
     prefix = [] if os.geteuid() == 0 else ["sudo"]
     run(*prefix, "apt-get", "update")
     run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
-        "build-essential", "curl", "ca-certificates", "git", "pkg-config",
-        "meson", "ninja-build", "patch", "python3-yaml", "libepoxy-dev", "libdrm-dev",
-        "libgbm-dev", "libegl-dev", "libvulkan-dev", "glslang-tools",
-        "libpipewire-0.3-dev", "libpulse-dev", "clang", "libclang-dev",
-        "liblzma-dev", "libwayland-dev", "libxkbcommon-dev", "libxkbcommon-x11-0",
-        "libx11-6", "libxcursor1", "libxrandr2", "libxi6", "libxfixes3",
-        "libxtst6", "patchelf", "binutils")
+        *native_packages(*groups))
+
+
+def native_deps_install():
+    # The hypervisor's build and release dependencies, without test-only tools.
+    apt_install("virgl", "hypervisor", "release")
 
 
 def test_native_deps_install():
-    # Keep the imported test dependency list separate until D12's follow-up.
-    prefix = [] if os.geteuid() == 0 else ["sudo"]
-    run(*prefix, "apt-get", "update")
-    run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
-        "build-essential", "gcc-multilib", "liblzma-dev", "curl", "pkg-config",
-        "meson", "ninja-build", "patch", "python3-yaml", "libepoxy-dev", "libdrm-dev",
-        "libgbm-dev", "libegl-dev", "libvulkan-dev", "glslang-tools",
-        "libpipewire-0.3-dev", "libpulse-dev", "clang", "libclang-dev",
-        "qemu-utils", "nasm", "acpica-tools", "imagemagick", "cpio", "xvfb",
-        "libvulkan1", "mesa-vulkan-drivers", "seabios", "xorriso", "edid-decode",
-        "pipewire-bin", "libxkbcommon-x11-0", "libxkbcommon0",
-        "libwayland-client0", "libx11-6", "libxcursor1", "libxrandr2",
-        "libxi6", "libxfixes3", "libxtst6")
+    apt_install("virgl", "hypervisor", "test")
     run(*prefix, "install", "-d", "/usr/share/qemu")
     for name in ("vgabios-stdvga.bin", "vgabios-virtio.bin"):
         target = Path("/usr/share/qemu") / name
@@ -71,7 +80,13 @@ def test_native_deps_install():
         run(*prefix, "ln", "-s", "/usr/bin/convert", "/usr/local/bin/magick")
 
 
-def virgl_build():
+def virgl_build(prefix=None):
+    """Build the pinned, patched virglrenderer into `prefix`, by default the
+    cache directory named by its key, which is reused while it is complete."""
+    if prefix is not None:
+        CACHE.mkdir(exist_ok=True)
+        virgl_install(Path(prefix))
+        return
     if (VIRGL / ".complete").is_file():
         run("pkg-config", f"--with-path={VIRGL}/lib/pkgconfig",
             f"--exact-version={VIRGL_VERSION}", "virglrenderer")
@@ -79,12 +94,15 @@ def virgl_build():
             raise RuntimeError("cached virglrenderer has no render server")
         return
     CACHE.mkdir(exist_ok=True)
+    virgl_install(VIRGL)
+    (VIRGL / ".complete").touch()
+
+
+def virgl_install(prefix):
     with tempfile.TemporaryDirectory(prefix="virgl-", dir=CACHE) as temporary:
         work = Path(temporary)
         archive = work / "virgl.tar.gz"
-        run("curl", "-fsSL", "--retry", "3", "-o", archive,
-            f"https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/"
-            f"{VIRGL_VERSION}/virglrenderer-{VIRGL_VERSION}.tar.gz")
+        run("curl", "-fsSL", "--retry", "3", "-o", archive, VIRGL_URL)
         if hashlib.sha256(archive.read_bytes()).hexdigest() != VIRGL_SHA256:
             raise RuntimeError("virglrenderer tarball checksum mismatch")
         with tarfile.open(archive) as tar:
@@ -93,16 +111,15 @@ def virgl_build():
         for patch in PATCHES:
             print(f"Applying {patch.name}", flush=True)
             run("patch", "--batch", "--forward", "-p1", "-i", patch, cwd=source)
-        run("meson", "setup", work / "build", source, f"--prefix={VIRGL}",
-            "--libdir=lib", "--buildtype=release", "-Dvenus=true", "-Dtests=false")
+        run("meson", "setup", work / "build", source, f"--prefix={prefix}",
+            *VIRGL_MESON_OPTIONS)
         run("ninja", "-C", work / "build", "install")
-        shutil.copy2(source / "COPYING", VIRGL / "COPYING")
-        (VIRGL / "BUILDINFO").write_text(
+        shutil.copy2(source / "COPYING", prefix / "COPYING")
+        (prefix / "BUILDINFO").write_text(
             f"virglrenderer: {VIRGL_VERSION}\nsource-sha256: {VIRGL_SHA256}\n"
             f"patch-sha256: {PATCH_SHA256}\n" + "".join(
                 f"patch: {patch.name}\n" for patch in PATCHES)
-            + f"server-sha256: {hashlib.sha256((VIRGL / 'libexec/virgl_render_server').read_bytes()).hexdigest()}\n")
-        (VIRGL / ".complete").touch()
+            + f"server-sha256: {hashlib.sha256((prefix / 'libexec/virgl_render_server').read_bytes()).hexdigest()}\n")
 
 
 
@@ -259,8 +276,9 @@ No host PCI or USB device is required except explicitly configured passthrough.
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("revision", "cache-key", "native-deps-install", "test-native-deps-install", "virgl-build", "package"))
+    parser.add_argument("command", choices=("revision", "cache-key", "native-deps-install", "test-native-deps-install", "virgl-deps-install", "virgl-build", "package"))
     parser.add_argument("version", nargs="?", default="")
+    parser.add_argument("--prefix", help="virgl-build: install here instead of the cache")
     args = parser.parse_args()
     if args.command == "revision":
         print(revision())
@@ -270,8 +288,10 @@ def main():
         native_deps_install()
     elif args.command == "test-native-deps-install":
         test_native_deps_install()
+    elif args.command == "virgl-deps-install":
+        apt_install("virgl")
     elif args.command == "virgl-build":
-        virgl_build()
+        virgl_build(args.prefix)
     else:
         package(args.version)
 
