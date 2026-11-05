@@ -133,7 +133,7 @@ hv-test: require-cargo hv-virgl-build hv-ipxe-build
 # Build the hypervisor's pinned iPXE option ROMs for non-guest tests
 [group('ci')]
 hv-ipxe-build: require-uv
-	uv run --no-project python hv/firmware/ipxe/build.py
+	uv run --no-project python guest/ipxe/build.py --profile hv
 
 # Run the guest-booting hypervisor gate locally, once per orchestrator batch (env: RUST_TEST_THREADS, default 2; VMLAB_HV_TEST_VM_LIMIT, default 4)
 [group('ci')]

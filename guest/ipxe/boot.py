@@ -23,7 +23,7 @@ def request(stream, message):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--rom", type=Path, default=Path(__file__).resolve().parents[2] / "target/ipxe/virtio-net.rom")
+    parser.add_argument("--rom", type=Path, default=Path(__file__).resolve().parents[2] / "hv/target/ipxe/virtio-net.rom")
     args = parser.parse_args()
     bios = Path("/usr/share/qemu/bios-256k.bin")
     vga = Path("/usr/share/qemu/vgabios-virtio.bin")

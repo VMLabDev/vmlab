@@ -78,8 +78,11 @@ cargo features are enabled by default in debug and release builds. Builds with
   for x86_64 guests yet.
 - A stable Rust toolchain (the workspace sets `rust-version = "1.99"`,
   edition 2024) and `just`.
-- pkg-config plus virglrenderer >= 1.3.0, EGL, and GBM development libraries.
-  `vmlab-hv-devices` probes all three at build time.
+- pkg-config plus virglrenderer at the version pinned in
+  `build/hv-pins.toml`, EGL, and GBM development libraries.
+  `vmlab-hv-devices` probes all three at build time. The Ubuntu and Debian
+  package names for everything here are the `[native-deps]` groups in
+  `build/hv-pins.toml`.
 - For zero-copy GPU export, the Vulkan loader and a Vulkan ICD for the selected
   render node. Modifier queries use `ash` and need no Vulkan build headers.
 - The libpipewire and libpulse development files for the default audio backends
@@ -106,8 +109,9 @@ squashfs rootfs; `just s1-tests-run` builds the rootfs from the pinned Alpine
 minirootfs and runs the suite. Every S1 test skips with a printed reason when
 a prerequisite is missing.
 
-GitHub CI builds virglrenderer 1.3.0 from the same SHA-256-pinned source and
-Meson options as vmlab's e2e image, then caches the install. Run
+GitHub CI builds virglrenderer from the SHA-256-pinned source, patches and
+Meson options in `build/hv-pins.toml`, as vmlab's e2e image does, then caches
+the install. Run
 `just ci::hv-native-deps-install` and `just ci::hv-virgl-build` to reproduce that
 setup on Ubuntu 24.04. The install lives under the root
 `.ci-cache/virglrenderer-<version>-<sha256>/`, outside `target/`. The recipes

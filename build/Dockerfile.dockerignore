@@ -7,3 +7,4 @@
 !ebpf/rust-toolchain.toml
 !guest/build-mingw-msvcrt.sh
 !build/hv.py
+!build/hv-pins.toml
