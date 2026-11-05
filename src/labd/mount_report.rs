@@ -243,7 +243,7 @@ pub fn elapsed_text(elapsed: Duration) -> String {
 /// The retry window: `5 min`, or seconds when it is not whole minutes.
 pub fn window_text(window: Duration) -> String {
     let secs = window.as_secs();
-    if secs >= 60 && secs % 60 == 0 {
+    if secs >= 60 && secs.is_multiple_of(60) {
         format!("{} min", secs / 60)
     } else {
         format!("{secs}s")
