@@ -710,7 +710,10 @@ mod tests {
             "second",
             &[base, gz_layer("etc/marker", "second")],
         );
-        assert_eq!(first_layers[0], second_layers[0], "the base layer is shared");
+        assert_eq!(
+            first_layers[0], second_layers[0],
+            "the base layer is shared"
+        );
         let gate = Gate {
             digest: second_layers[1].clone(),
             reached: Default::default(),
