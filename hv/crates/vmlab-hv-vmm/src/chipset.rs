@@ -117,6 +117,11 @@ pub struct Chipset {
     /// position never runs ahead of real playback and freezes on pause.
     /// HDA and virtio-snd both sit here.
     pub audio: Mutex<Option<Arc<Mutex<dyn vmlab_hv_devices::audio::AudioClock>>>>,
+    /// pc's floppy controller: advanced by the running-time clock (READ
+    /// ID) and resumed when the guest unmasks its DMA channel.
+    pub floppy: Mutex<Option<Arc<Mutex<vmlab_hv_devices::floppy::Floppy>>>>,
+    /// pc's PIIX3 UHCI: runs one frame per millisecond of running time.
+    pub uhci: Mutex<Option<Arc<Mutex<vmlab_hv_devices::usb::UhciController>>>>,
     secure_smm: bool,
     clock: Mutex<(Instant, bool)>,
     vm: Arc<VmFd>,
@@ -301,6 +306,8 @@ impl Chipset {
             power,
             error,
             audio: Mutex::new(None),
+            floppy: Mutex::new(None),
+            uhci: Mutex::new(None),
             secure_smm,
             clock: Mutex::new((Instant::now(), false)),
             vm,
@@ -333,6 +340,14 @@ impl Chipset {
             self.rtc.lock().advance(ns);
             self.hpet.lock().advance(ns);
             self.isa.lock().advance(ns);
+            let floppy = self.floppy.lock().clone();
+            if let Some(floppy) = floppy {
+                floppy.lock().advance(ns);
+            }
+            let uhci = self.uhci.lock().clone();
+            if let Some(uhci) = uhci {
+                uhci.lock().advance(ns);
+            }
             let audio = self.audio.lock().clone();
             if let Some(device) = audio.as_ref() {
                 // A host-stream failure stops that stream (the device
@@ -493,6 +508,11 @@ impl Chipset {
                 for (i, byte) in data.iter().enumerate() {
                     isa.io_write(port.wrapping_add(i as u16), *byte);
                 }
+                // A floppy command waiting on DMA continues once channel 2
+                // is ready; take the controller only after releasing ISA.
+                let waiting = isa.pending_requests()
+                    & (1 << vmlab_hv_devices::floppy::DMA_CHANNEL)
+                    != 0;
                 if port == 0x61 {
                     match self.vm.get_pit2().and_then(|mut pit| {
                         pit.channels[2].gate = u8::from(isa.pit2_gate());
@@ -501,6 +521,11 @@ impl Chipset {
                         Ok(()) => {}
                         Err(e) => *self.error.lock() = Some(format!("PIT channel 2 gate: {e}")),
                     }
+                }
+                drop(isa);
+                let floppy = self.floppy.lock().clone();
+                if waiting && let Some(floppy) = floppy {
+                    floppy.lock().dma_ready();
                 }
             }
             _ => return false,

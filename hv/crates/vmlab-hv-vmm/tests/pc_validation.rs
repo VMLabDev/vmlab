@@ -44,11 +44,11 @@ fn phase_boundaries_refuse_undelivered_devices_and_invalid_machine_combinations(
             serde_json::json!("com2"),
             "requires a COM1 agent",
         ),
-        ("floppy", serde_json::json!("/floppy.img"), "phase 4c"),
+        ("floppy", serde_json::json!("/floppy.img"), "1.44 MB"),
         (
             "tablet",
-            serde_json::json!({"bus":0,"device":1,"function":2}),
-            "phase 4c",
+            serde_json::json!({"bus":0,"device":3,"function":0}),
+            "00:01.2",
         ),
         (
             "nics",
@@ -111,4 +111,31 @@ fn ide_addressing_is_unique_bounded_and_independent_of_pci_and_ahci_ports() {
             .unwrap_err()
             .contains("CD-ROM must be read_only")
     );
+}
+
+#[test]
+fn pc_accepts_a_floppy_medium_and_the_uhci_tablet() {
+    let bios = tempfile::NamedTempFile::new().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut desc = machine(bios.path());
+    desc["tablet"] = serde_json::json!({"bus":0,"device":1,"function":2});
+    validation(desc.clone()).unwrap();
+    for (size, accepted) in [
+        (1_474_560u64, true),
+        (2_949_120, true),
+        (737_280, false),
+        (0, false),
+    ] {
+        let path = directory.path().join(format!("{size}.img"));
+        std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+        desc["floppy"] = path.to_str().unwrap().into();
+        let result = validation(desc.clone());
+        assert_eq!(result.is_ok(), accepted, "{size}: {result:?}");
+        if !accepted {
+            assert!(result.unwrap_err().contains(&format!("not {size} bytes")));
+        }
+    }
+    let mut usb = machine(bios.path());
+    usb["usb"] = serde_json::json!({"bus":0,"device":1,"function":2});
+    assert!(validation(usb).unwrap_err().contains("q35 xHCI"));
 }

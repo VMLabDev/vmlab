@@ -324,7 +324,9 @@ fn validate_q35_devices(desc: &MachineDescription) -> Result<(), VmmError> {
     if let Some(display) = &desc.virtual_display {
         add(Some(display.pci), "virtual_display")?;
     }
-    if let Some(tablet) = desc.tablet {
+    if let Some(tablet) = desc.tablet
+        && desc.machine != Machine::Pc
+    {
         add(Some(tablet), "tablet")?;
     }
     // The tablet and the passthrough controller are one xHCI function.
@@ -405,12 +407,21 @@ fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
     if desc.vmware_cpuid_freq && !desc.hyperv.is_empty() {
         return invalid("vmware_cpuid_freq cannot share the Hyper-V CPUID range");
     }
-    if desc.floppy.is_some() {
-        return invalid(if pc {
-            "pc floppy requires phase 4c"
-        } else {
-            "floppy requires machine=pc"
-        });
+    if let Some(floppy) = &desc.floppy {
+        if !pc {
+            return invalid("floppy requires machine=pc");
+        }
+        let size = std::fs::metadata(floppy).map(|metadata| metadata.len());
+        if !size
+            .as_ref()
+            .is_ok_and(|size| vmlab_hv_devices::floppy::MediaKind::for_size(*size).is_some())
+        {
+            return Err(VmmError::InvalidMachine(format!(
+                "floppy {} must be a raw 1.44 MB (1474560-byte) or 2.88 MB (2949120-byte) image{}",
+                floppy.display(),
+                size.map_or_else(|e| format!(": {e}"), |size| format!(", not {size} bytes"))
+            )));
+        }
     }
     if pc {
         if !matches!(
@@ -422,8 +433,14 @@ fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
         ) {
             return invalid("pc requires SeaBIOS firmware boot");
         }
-        if desc.tablet.is_some() || desc.usb.is_some() {
-            return invalid("pc UHCI tablet and USB require phase 4c");
+        if desc
+            .tablet
+            .is_some_and(|tablet| (tablet.bus, tablet.device, tablet.function) != (0, 1, 2))
+        {
+            return invalid("the pc tablet sits on the PIIX3 UHCI at 00:01.2");
+        }
+        if desc.usb.is_some() {
+            return invalid("host USB passthrough requires the q35 xHCI");
         }
         if !desc.nics.is_empty() {
             return invalid("pc networking requires phase 4b");
@@ -1077,6 +1094,50 @@ pub fn build(
     } else {
         None
     };
+    // The 82078-style floppy controller on ISA DMA channel 2 and IRQ 6.
+    // pc always has it, as QEMU's does: drive A is empty unless the
+    // description inserts a medium. The medium is not a snapshot disk:
+    // like a physical floppy, its contents stay as they are when a
+    // snapshot loads (raw images have no internal snapshots).
+    let floppy = if pc {
+        let chipset = chipset.as_ref().unwrap();
+        chipset.isa.lock().set_memory(ram.mem.clone());
+        let mut controller = vmlab_hv_devices::floppy::Floppy::new(
+            "floppy",
+            chipset.isa.clone(),
+            isa_irq(10, 6),
+        );
+        if let Some(path) = &desc.floppy {
+            let image = vmlab_disk::open(path, vmlab_disk::Format::Raw, false).map_err(|e| {
+                VmmError::DeviceUnavailable {
+                    device: "floppy",
+                    reason: format!("floppy {}: {e}", path.display()),
+                }
+            })?;
+            controller
+                .insert(0, image)
+                .map_err(|e| VmmError::InvalidMachine(e.to_string()))?;
+        }
+        let floppy = Arc::new(Mutex::new(controller));
+        // 0x3f6 between the two windows belongs to the primary IDE channel.
+        for (base, length, offset) in [(0x3f0, 6, 0), (0x3f7, 1, 7)] {
+            io_bus
+                .register(
+                    base,
+                    length,
+                    Arc::new(Mutex::new(vmlab_hv_devices::floppy::FloppyPorts::new(
+                        floppy.clone(),
+                        offset,
+                    ))),
+                )
+                .map_err(VmmError::Other)?;
+        }
+        *chipset.floppy.lock() = Some(floppy.clone());
+        snap_nodes.push(DeviceNode::Resettable(floppy.clone()));
+        Some(floppy)
+    } else {
+        None
+    };
     let ahci = if let Some(address) = desc.ahci_pci {
         let transport = wiring(Some(address), 1, false)?;
         let ahci = Arc::new(Mutex::new(vmlab_hv_devices::ahci::Ahci::new(
@@ -1246,10 +1307,33 @@ pub fn build(
             .register(PM1A_EVT_BASE, PM_BLOCK_LEN, pm.clone())
             .map_err(VmmError::Other)?;
     }
+    // pc's tablet rides the PIIX3 UHCI at 00:01.2 (D6), on PIRQD as its
+    // interrupt pin D swizzles.
+    if pc && let Some(address) = desc.tablet {
+        let intx = crate::q35::PirqRouter::line(&pirqs, address, 4).map_err(VmmError::Other)?;
+        let mut controller =
+            vmlab_hv_devices::usb::UhciController::new("uhci", ram.mem.clone(), intx);
+        controller
+            .attach(
+                1,
+                Box::new(vmlab_hv_devices::usb::Tablet::full_speed(hid_serial(
+                    address, 28754, 1,
+                ))),
+            )
+            .map_err(|e| VmmError::Other(e.to_string()))?;
+        let uhci = Arc::new(Mutex::new(controller));
+        pci_root
+            .lock()
+            .add_device_at(1, 2, uhci.clone())
+            .map_err(VmmError::Other)?;
+        snap_nodes.push(DeviceNode::Virtio(uhci.clone()));
+        *chipset.as_ref().unwrap().uhci.lock() = Some(uhci);
+    }
     // One xHCI carries the absolute tablet and the host passthrough ports:
     // `tablet` places it for input, `usb` (vmlab's `usb = true`, the
     // controller it names `usbx`) additionally enables hot-plug.
     let xhci_address = match (desc.tablet, desc.usb) {
+        _ if pc => None,
         (Some(tablet), Some(usb)) if tablet != usb => {
             return Err(VmmError::DeviceUnavailable {
                 device: "usb controller",
@@ -1477,7 +1561,14 @@ pub fn build(
             .unwrap()
             .rtc
             .lock()
-            .configure_pc(disks, cd_first, desc.vcpus as u8);
+            .configure_pc(
+                disks,
+                cd_first,
+                desc.vcpus as u8,
+                floppy
+                    .as_ref()
+                    .map_or(0, |floppy| floppy.lock().cmos_drive_types()),
+            );
     }
     if let Some(a20) = &ram.a20 {
         snap_nodes.push(DeviceNode::Plain(a20.clone()));
