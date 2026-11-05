@@ -157,12 +157,23 @@ impl TemplateStore {
     }
 
     // ---- reads (lock-free) -------------------------------------------------
+    //
+    // Each read first finishes any swap a crash interrupted in the
+    // templates it reads ([`Self::recover_swaps`]), so a version an
+    // overwrite had set aside is never missing from what a reader sees.
+    // That takes the lock only when a leftover is there, so no mutation
+    // holding the lock may call a read.
 
     /// All templates in the store, sorted by arch, name, then version
     /// (natural order), each with the variants whose disks are installed.
     /// Entries with unreadable metadata — invalid variant blocks included —
     /// are skipped with a warning rather than failing the whole listing.
     pub fn list(&self) -> Result<Vec<TemplateMeta>> {
+        let mut names = Vec::new();
+        for arch in subdirs(&self.root)? {
+            names.extend(subdirs(&arch)?);
+        }
+        self.recover_swaps(&names);
         let mut out = Vec::new();
         for arch in subdirs(&self.root)? {
             for name in subdirs(&arch)? {
@@ -194,7 +205,10 @@ impl TemplateStore {
     /// version otherwise.
     pub fn exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool {
         match version {
-            Some(v) => self.version_dir(arch, name, v).join(META_FILE).is_file(),
+            Some(v) => {
+                self.recover_swaps(&[self.root.join(arch).join(name)]);
+                self.version_dir(arch, name, v).join(META_FILE).is_file()
+            }
             None => !self.versions_of(arch, name).unwrap_or_default().is_empty(),
         }
     }
@@ -248,6 +262,7 @@ impl TemplateStore {
         name: &str,
         version: &str,
     ) -> Result<Option<TemplateVersion>> {
+        self.recover_swaps(&[self.root.join(arch).join(name)]);
         let dir = self.version_dir(arch, name, version);
         if !dir.join(META_FILE).is_file() {
             return Ok(None);
@@ -268,8 +283,10 @@ impl TemplateStore {
     /// Version directory names present for `<arch>/<name>` (those with
     /// metadata), unsorted.
     pub(crate) fn versions_of(&self, arch: &str, name: &str) -> Result<Vec<String>> {
+        let name_dir = self.root.join(arch).join(name);
+        self.recover_swaps(std::slice::from_ref(&name_dir));
         let mut versions = Vec::new();
-        for dir in subdirs(&self.root.join(arch).join(name))? {
+        for dir in subdirs(&name_dir)? {
             if dir.join(META_FILE).is_file()
                 && let Some(v) = dir.file_name().and_then(|n| n.to_str())
             {
@@ -277,6 +294,28 @@ impl TemplateStore {
             }
         }
         Ok(versions)
+    }
+
+    /// Finish every swap a crash interrupted in the `<arch>/<name>`
+    /// directories `name_dirs` (see [`recover_swap`]): the old version set
+    /// aside with nothing in its place goes back, and leftover `.next-` and
+    /// `.old-` directories go. Looks without the lock and takes it only when
+    /// something is left, then [`recover_swap`] looks again under it, so a
+    /// swap another process is still running is waited for, not undone.
+    ///
+    /// A read must not fail because of it: what cannot be recovered is
+    /// logged, and the read sees the store as it is.
+    fn recover_swaps(&self, name_dirs: &[PathBuf]) {
+        let leftovers: Vec<PathBuf> = name_dirs.iter().flat_map(|d| swap_leftovers(d)).collect();
+        if leftovers.is_empty() {
+            return;
+        }
+        let recovered = self.lock().and_then(|_lock| {
+            leftovers.iter().try_for_each(|dest| recover_swap(dest))
+        });
+        if let Err(e) = recovered {
+            tracing::warn!("cannot recover an interrupted template swap: {e:#}");
+        }
     }
 
     // ---- mutations (exclusive flock) ----------------------------------------
@@ -1086,6 +1125,28 @@ fn recover_swap(dest: &Path) -> Result<()> {
     remove_if_present(&next)
 }
 
+/// The version dirs under `name_dir` that an interrupted swap left a
+/// `.next-<version>` or `.old-<version>` beside, once each.
+fn swap_leftovers(name_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(name_dir) else {
+        return Vec::new();
+    };
+    let mut dests: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let version = name
+                .strip_prefix(".next-")
+                .or_else(|| name.strip_prefix(".old-"))?;
+            (!version.is_empty()).then(|| name_dir.join(version))
+        })
+        .collect();
+    dests.sort();
+    dests.dedup();
+    dests
+}
+
 fn remove_if_present(dir: &Path) -> Result<()> {
     match fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
@@ -1687,6 +1748,82 @@ mod tests {
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(version_files(&store), before);
         assert_eq!(version_entries(&store), ["1"]);
+    }
+
+    /// The state a crash between setting `x86_64/t@1` aside and the final
+    /// rename leaves: no version dir, the old one at `.old-1`, and a
+    /// half-staged replacement at `.next-1`.
+    fn crash_mid_swap(store: &TemplateStore) {
+        let dir = store.version_dir("x86_64", "t", "1");
+        let (next, old) = swap_paths(&dir);
+        fs::rename(&dir, &old).unwrap();
+        fs::create_dir_all(&next).unwrap();
+        fs::write(next.join(DISK_FILE), b"half").unwrap();
+        assert_eq!(version_entries(store), [".next-1", ".old-1"]);
+    }
+
+    /// VML-33: the next listing shows the version an interrupted swap set
+    /// aside, not only the next install of that version.
+    #[test]
+    fn a_listing_restores_a_version_an_interrupted_swap_set_aside() {
+        let (_tmp, store, _staging) = store_with_old_version();
+        let before = version_files(&store);
+        crash_mid_swap(&store);
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!((listed[0].version.as_str(), listed[0].cpus), ("1", Some(2)));
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store), before);
+    }
+
+    /// The same for a resolve, pinned or not, and for `exists`.
+    #[test]
+    fn a_resolve_or_exists_restores_it_too() {
+        for ask in ["pinned", "latest", "exists"] {
+            let (_tmp, store, _staging) = store_with_old_version();
+            let before = version_files(&store);
+            crash_mid_swap(&store);
+            match ask {
+                "pinned" => {
+                    let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
+                    assert_eq!(fs::read(&r.disk_path).unwrap(), b"one");
+                }
+                "latest" => {
+                    let r = store.resolve_version("x86_64", "t", None).unwrap();
+                    assert_eq!(r.meta.version, "1");
+                }
+                _ => assert!(store.exists("x86_64", "t", Some("1"))),
+            }
+            assert_eq!(version_entries(&store), ["1"], "{ask}");
+            assert_eq!(version_files(&store), before, "{ask}");
+        }
+    }
+
+    /// A listing also clears a `.next-1` or `.old-1` left beside an intact
+    /// version.
+    #[test]
+    fn a_listing_clears_leftovers_beside_an_intact_version() {
+        let (_tmp, store, _staging) = store_with_old_version();
+        let dir = store.version_dir("x86_64", "t", "1");
+        let (next, old) = swap_paths(&dir);
+        fs::create_dir_all(&next).unwrap();
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(DISK_FILE), b"older").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store).0, b"one");
+    }
+
+    /// A store with nothing to recover is read without taking the lock,
+    /// so reading creates no lock file.
+    #[test]
+    fn a_clean_store_is_read_without_the_lock() {
+        let (_tmp, store) = new_store();
+        install(&store, &meta("x86_64", "t", "1"), b"one").unwrap();
+        fs::remove_file(store.root().join(LOCK_FILE)).unwrap();
+        store.list().unwrap();
+        store.resolve_version("x86_64", "t", None).unwrap();
+        assert!(!store.root().join(LOCK_FILE).exists());
     }
 
     /// A crash after the final rename leaves `.old-1` beside the new
