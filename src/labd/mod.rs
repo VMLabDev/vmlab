@@ -225,9 +225,30 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     // stopping them would orphan QEMU, swtpm, virtiofsd and smbd.
     crate::lifecycle::termination_signal().await;
     tracing::info!("lab daemon for {lab} caught a termination signal; stopping the lab");
+    announce_exit(&lab).await;
     teardown(&runtime, &tasks).await;
     drop(server);
     Ok(())
+}
+
+/// Tell the supervisor this daemon is about to exit by itself, so the exit
+/// it notices next is not taken for a crash: a supervisor that adopted this
+/// daemon after a restart is not its parent and cannot read its exit status.
+/// Best effort — with no supervisor answering, the exit goes ahead anyway.
+async fn announce_exit(lab: &str) {
+    let tell = async {
+        let client = crate::proto::client::SupClient::connect(&crate::paths::supervisor_socket())
+            .await
+            .ok()?;
+        client
+            .send(crate::proto::SupRequest::LabExiting {
+                name: lab.to_string(),
+                pid: std::process::id(),
+            })
+            .await
+            .ok()
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tell).await;
 }
 
 /// Everything a lab daemon must do before its process goes away: stop the
@@ -561,6 +582,7 @@ impl Handler<LabRequest> for LabdHandler {
                 let tasks = self.tasks.clone();
                 let lab = lab.clone();
                 tokio::spawn(async move {
+                    announce_exit(&lab.config().lab.name).await;
                     teardown(&lab, &tasks).await;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);
@@ -1246,6 +1268,7 @@ impl Handler<LabRequest> for LabdHandler {
                 // Spawned so this command's response reaches the caller before
                 // the process goes away.
                 tokio::spawn(async move {
+                    announce_exit(&lab.config().lab.name).await;
                     teardown(&lab, &tasks).await;
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);

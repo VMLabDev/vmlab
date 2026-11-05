@@ -47,17 +47,41 @@ pub struct Supervisor {
 /// a guest shutdown per machine.
 const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How often an adopted lab daemon's process is checked. It is not this
+/// supervisor's child, so there is no exit to wait on.
+const ADOPTED_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Whether `pid` is a live process, as opposed to gone or a zombie nobody has
 /// reaped yet — an exited daemon this supervisor did not spawn can linger as
 /// one where PID 1 does not reap.
 pub(crate) fn process_running(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| {
-            stat.rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().next().map(|s| s != "Z"))
-        })
-        .unwrap_or(false)
+    process_start_time(pid).is_some()
+}
+
+/// When the live process `pid` started, in clock ticks since boot
+/// (`/proc/<pid>/stat` field 22), or `None` when it is gone or a zombie.
+///
+/// With the pid it names one process for its whole life: a pid is reused
+/// once its process is gone, a (pid, start time) pair is not.
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is in parentheses and may hold spaces; the fields
+    // after the last `)` start at field 3, the state.
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    if fields.next()? == "Z" {
+        return None;
+    }
+    fields.nth(18)?.parse().ok()
+}
+
+/// Whether the lab daemon recorded as `pid`, started at `started`, still runs.
+///
+/// The start time is what keeps an unrelated process that was given the
+/// daemon's pid from being taken for it. An entry written before start times
+/// were recorded has none and falls back to the pid.
+pub(crate) fn daemon_running(pid: u32, started: Option<u64>) -> bool {
+    process_start_time(pid).is_some_and(|now| started.is_none_or(|s| s == now))
 }
 
 /// Entry point for `vmlab __supervisord`.
@@ -263,16 +287,92 @@ impl Supervisor {
                 continue;
             }
             let sock = crate::paths::lab_socket(&entry.name);
-            match LabClient::connect(&sock).await {
-                Ok(client) => {
-                    if client.send(LabRequest::Ping {}).await.is_ok() {
-                        self.watch_lab_events(entry.name.clone()).await;
-                        continue;
-                    }
-                    self.mark_crashed(&entry.name).await;
-                }
-                Err(_) => self.mark_crashed(&entry.name).await,
+            let answers = match LabClient::connect(&sock).await {
+                Ok(client) => client.send(LabRequest::Ping {}).await.is_ok(),
+                Err(_) => false,
+            };
+            if !answers {
+                self.mark_crashed(&entry.name).await;
+                continue;
             }
+            if !daemon_running(entry.pid, entry.started) {
+                tracing::warn!(
+                    "lab {} answers, but its daemon {} is gone or its pid now names another \
+                     process",
+                    entry.name,
+                    entry.pid
+                );
+                self.mark_crashed(&entry.name).await;
+                continue;
+            }
+            // An entry from before start times were recorded gets the one
+            // its pid has now, so the monitor below tells it from a reuse.
+            let started = entry.started.or_else(|| process_start_time(entry.pid));
+            if entry.started.is_none()
+                && let Some(started) = started
+            {
+                let mut reg = self.registry.lock().await;
+                reg.record_start(&entry.name, entry.pid, started);
+                reg.save();
+            }
+            self.watch_lab_events(entry.name.clone()).await;
+            self.watch_adopted_exit(entry.name.clone(), entry.pid, started);
+        }
+    }
+
+    /// Notice the exit of a daemon adopted from an earlier supervisor and
+    /// judge it as the reaper judges a spawned one's. A process that is not
+    /// this supervisor's child gives no exit status, so an exit is expected
+    /// only when it was asked for or announced (`Stopping`): a daemon that
+    /// ends by itself announces it first ([`SupRequest::LabExiting`]).
+    fn watch_adopted_exit(self: &Arc<Self>, lab: String, pid: u32, started: Option<u64>) {
+        let sup = self.clone();
+        tokio::spawn(async move {
+            while daemon_running(pid, started) {
+                tokio::time::sleep(ADOPTED_POLL).await;
+            }
+            sup.daemon_exited(&lab, pid, false, "its process is gone")
+                .await;
+        });
+    }
+
+    /// Lab daemon `pid` says it is about to exit by itself: `destroy`, a
+    /// `shutdown` nobody here asked for, a termination signal. Its exit is
+    /// then expected, which an adopted daemon's monitor could not tell
+    /// otherwise. Only a running entry of that very daemon changes.
+    async fn daemon_exiting(&self, lab: &str, pid: u32) {
+        let mut reg = self.registry.lock().await;
+        if reg
+            .get(lab)
+            .is_some_and(|e| e.pid == pid && e.state == LabState::Running)
+        {
+            reg.set_state(lab, LabState::Stopping);
+            reg.save();
+        }
+    }
+
+    /// The exit of lab daemon `pid` for `lab`, as the reaper or the adopted
+    /// daemon's monitor saw it. A clean exit is the daemon's own completed
+    /// teardown; any other is expected only when a release asked for it.
+    /// An exit nobody asked for is a crash (PRD §3 — no silent restart; mark
+    /// failed + event).
+    async fn daemon_exited(&self, lab: &str, pid: u32, clean: bool, how: &str) {
+        let expected = clean || {
+            let reg = self.registry.lock().await;
+            // Only this daemon's own entry says whether its exit was asked
+            // for: the name may already belong to a successor.
+            reg.get(lab)
+                .filter(|e| e.pid == pid)
+                .map(|e| e.state == LabState::Stopping)
+                .unwrap_or(true)
+        };
+        if expected {
+            let mut reg = self.registry.lock().await;
+            reg.remove_daemon(lab, pid);
+            reg.save();
+        } else {
+            tracing::warn!("lab daemon {lab} exited unexpectedly: {how}");
+            self.mark_crashed(lab).await;
         }
     }
 
@@ -383,6 +483,7 @@ impl Supervisor {
                 name: name.to_string(),
                 root: root.clone(),
                 pid,
+                started: process_start_time(pid),
                 state: LabState::Running,
             })?;
             reg.save();
@@ -399,23 +500,8 @@ impl Supervisor {
             // we asked for it (`Stopping`) or a signal did. Only a non-zero or
             // signalled exit is a crash.
             let exited_cleanly = status.as_ref().is_ok_and(|s| s.success());
-            let expected = exited_cleanly || {
-                let reg = sup.registry.lock().await;
-                // Only this daemon's own entry says whether its exit was
-                // asked for: the name may already belong to a successor.
-                reg.get(&lab_name)
-                    .filter(|e| e.pid == pid)
-                    .map(|e| e.state == LabState::Stopping)
-                    .unwrap_or(true)
-            };
-            if expected {
-                let mut reg = sup.registry.lock().await;
-                reg.remove_daemon(&lab_name, pid);
-                reg.save();
-            } else {
-                tracing::warn!("lab daemon {lab_name} exited unexpectedly: {status:?}");
-                sup.mark_crashed(&lab_name).await;
-            }
+            sup.daemon_exited(&lab_name, pid, exited_cleanly, &format!("{status:?}"))
+                .await;
         });
 
         // Wait for the control socket to come up. Build is fully offline now
@@ -478,7 +564,7 @@ impl Supervisor {
         let sock = crate::paths::lab_socket(name);
         // Captured before the entry can be removed — the orphan reaper needs it
         // to recognise this lab's smbd.
-        let (root, pid);
+        let (root, pid, started);
         {
             let mut reg = self.registry.lock().await;
             let Some(entry) = reg.get(name) else {
@@ -486,6 +572,7 @@ impl Supervisor {
             };
             root = entry.root.clone();
             pid = entry.pid;
+            started = entry.started;
             reg.set_state(name, LabState::Stopping);
             reg.save();
         }
@@ -504,10 +591,14 @@ impl Supervisor {
                     "lab daemon for {name} did not stop within {}s; killing it",
                     RELEASE_DEADLINE.as_secs()
                 );
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
+                // Only the daemon itself: its pid may name another process
+                // by now.
+                if daemon_running(pid, started) {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
                 crate::qemu::process::kill_lab_orphans(name, Some(&root));
                 let mut reg = self.registry.lock().await;
                 reg.remove_daemon(name, pid);
@@ -541,10 +632,11 @@ impl Supervisor {
         loop {
             {
                 let mut reg = self.registry.lock().await;
-                if reg.get(name).is_none_or(|e| e.pid != pid) {
+                let Some(started) = reg.get(name).filter(|e| e.pid == pid).map(|e| e.started)
+                else {
                     return true;
-                }
-                if !process_running(pid) {
+                };
+                if !daemon_running(pid, started) {
                     reg.remove_daemon(name, pid);
                     reg.save();
                     return true;
@@ -630,6 +722,11 @@ impl Handler<SupRequest> for SupervisorHandler {
             SupRequest::LabRestart { name, root } => {
                 let sock = sup.restart_lab(&name, root).await?;
                 Ok(json!({"socket": sock}))
+            }
+            // A lab daemon about to exit by itself.
+            SupRequest::LabExiting { name, pid } => {
+                sup.daemon_exiting(&name, pid).await;
+                Ok(json!(true))
             }
             // Global segments (PRD §9.2): attach returns the trunk socket.
             SupRequest::GlobalAttach {
@@ -755,7 +852,31 @@ impl Handler<SupRequest> for SupervisorHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::process_running;
+    use super::{daemon_running, process_running, process_start_time};
+
+    /// A pid is reused once its process is gone; the start time is what
+    /// tells the daemon from whatever runs at its pid now.
+    #[test]
+    fn a_daemon_runs_only_while_its_pid_has_the_recorded_start_time() {
+        let me = std::process::id();
+        let started = process_start_time(me).expect("this process runs");
+        assert_eq!(process_start_time(me), Some(started), "stable for a life");
+        assert!(daemon_running(me, Some(started)));
+        assert!(
+            !daemon_running(me, Some(started + 1)),
+            "another life at this pid"
+        );
+        assert!(
+            daemon_running(me, None),
+            "an entry without one falls back to the pid"
+        );
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_start_time(pid), None);
+        assert!(!daemon_running(pid, None));
+    }
 
     #[test]
     fn an_exited_child_is_not_running_before_it_is_reaped() {

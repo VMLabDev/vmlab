@@ -30,6 +30,11 @@ pub struct LabEntry {
     pub name: String,
     pub root: PathBuf,
     pub pid: u32,
+    /// When the daemon `pid` started (`supervisor::process_start_time`), so
+    /// a later process given the same pid is not taken for it. Absent in
+    /// entries written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<u64>,
     pub state: LabState,
 }
 
@@ -127,6 +132,18 @@ impl Registry {
         }
     }
 
+    /// Record when the daemon `pid` of `name` started, for an entry that
+    /// has no start time yet.
+    pub fn record_start(&mut self, name: &str, pid: u32, started: u64) {
+        if let Some(l) = self
+            .labs
+            .iter_mut()
+            .find(|l| l.name == name && l.pid == pid)
+        {
+            l.started = Some(started);
+        }
+    }
+
     pub fn remove(&mut self, name: &str) {
         self.labs.retain(|l| l.name != name);
     }
@@ -155,6 +172,7 @@ mod tests {
                     name: "mylab".into(),
                     root: PathBuf::from("/labs/first"),
                     pid: 42,
+                    started: None,
                     state,
                 }],
             };
@@ -178,6 +196,7 @@ mod tests {
                 name: "mylab".into(),
                 root: PathBuf::from("/labs/mylab"),
                 pid: 42,
+                started: None,
                 state: LabState::Running,
             }],
         };
@@ -193,6 +212,7 @@ mod tests {
             name: "mylab".into(),
             root: PathBuf::from("/labs/mylab"),
             pid,
+            started: None,
             state: LabState::Running,
         };
         let mut registry = Registry {
@@ -212,6 +232,7 @@ mod tests {
                 name: "mylab".into(),
                 root: PathBuf::from("/labs/first"),
                 pid: 42,
+                started: None,
                 state: LabState::Failed,
             }],
         };
@@ -221,6 +242,7 @@ mod tests {
                 name: "mylab".into(),
                 root: PathBuf::from("/labs/second"),
                 pid: 84,
+                started: None,
                 state: LabState::Running,
             })
             .unwrap_err();
