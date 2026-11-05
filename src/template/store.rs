@@ -1874,7 +1874,8 @@ mod tests {
         let adding = store.clone();
         let staging = tempfile::tempdir_in(store.root()).unwrap();
         let staging_path = staging.path().to_path_buf();
-        let added = returns_within_10s(move || adding.add_variants("x86_64", "t", "1", &staging_path, &[]));
+        let added =
+            returns_within_10s(move || adding.add_variants("x86_64", "t", "1", &staging_path, &[]));
         assert!(added.is_ok(), "{added:?}");
         assert_eq!(version_entries(&store), ["1"]);
         assert_eq!(version_files(&store).0, before.0);
