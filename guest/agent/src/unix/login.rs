@@ -671,7 +671,7 @@ impl Adopted for AsSession {}
 pub fn adopter_as(account: Account, held: Option<Arc<Held<Session>>>) -> Adopter {
     Box::new(move || {
         Ok(Box::new(AsSession {
-            _ids: ThreadIds::assume(account.uid, account.gid)?,
+            _ids: ThreadIds::assume(account.uid, account.gid, &account.groups)?,
             _held: held.clone(),
         }) as Box<dyn Adopted>)
     })

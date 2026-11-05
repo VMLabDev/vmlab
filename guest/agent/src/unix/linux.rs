@@ -395,27 +395,53 @@ pub(super) fn runtime_dir(root: &Path, account: &Account) -> Option<String> {
     Some(inside)
 }
 
-/// This thread's filesystem identity, worn until the value is dropped.
+/// This thread's filesystem identity, worn until the value is dropped: the
+/// account's uid, gid and supplementary groups, as exec gives a session.
 ///
-/// `setfsuid`/`setfsgid` are Linux's per-thread filesystem identity.
-/// Supplementary groups stay root's: they are not per-thread, so a file
-/// reachable only through one is the one read this cannot mirror.
+/// Linux keeps credentials per thread. `setfsuid`/`setfsgid` change only the
+/// calling thread's filesystem ids, and so does the raw `setgroups` syscall —
+/// it is libc's wrapper that copies a group change to every thread of the
+/// process, which the multithreaded agent must never do. So the groups are
+/// the account's for this thread alone: a file reachable only through one of
+/// its groups opens, and one reachable only through a group the agent holds
+/// does not.
 ///
 /// Raw syscalls because musl does not expose `setfsuid`/`setfsgid` at all,
 /// and the agent is built against it.
 pub(super) struct ThreadIds {
     previous_uid: u32,
     previous_gid: u32,
+    /// The thread's own groups, put back on drop; `None` when it never
+    /// changed them.
+    previous_groups: Option<Vec<u32>>,
 }
 
 impl ThreadIds {
-    /// Read as `uid`/`gid` on this thread. Neither call reports failure —
-    /// both answer with the *previous* value — so this cannot fail either.
-    pub(super) fn assume(uid: u32, gid: u32) -> std::io::Result<ThreadIds> {
+    /// Read as `uid`/`gid` with `groups` on this thread.
+    ///
+    /// A thread that already runs as the account (a container agent started
+    /// as its user) changes nothing: its groups are already the account's.
+    /// Otherwise it fails when it cannot take the account's groups, rather
+    /// than read with the agent's — the agent's groups may reach what the
+    /// account cannot.
+    pub(super) fn assume(uid: u32, gid: u32, groups: &[u32]) -> std::io::Result<ThreadIds> {
+        let previous_groups = if already_running_as(uid, gid) {
+            None
+        } else {
+            let previous = thread_groups()?;
+            set_thread_groups(groups).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("cannot read as uid {uid}: cannot take its groups: {e}"),
+                )
+            })?;
+            Some(previous)
+        };
         let (previous_uid, previous_gid) = set_fs_ids(uid, gid);
         Ok(ThreadIds {
             previous_uid,
             previous_gid,
+            previous_groups,
         })
     }
 }
@@ -423,7 +449,44 @@ impl ThreadIds {
 impl Drop for ThreadIds {
     fn drop(&mut self) {
         set_fs_ids(self.previous_uid, self.previous_gid);
+        if let Some(groups) = &self.previous_groups {
+            let _ = set_thread_groups(groups);
+        }
     }
+}
+
+/// Whether this thread already runs as `uid`/`gid`.
+fn already_running_as(uid: u32, gid: u32) -> bool {
+    nix::unistd::geteuid().as_raw() == uid && nix::unistd::getegid().as_raw() == gid
+}
+
+/// This thread's supplementary groups.
+fn thread_groups() -> std::io::Result<Vec<u32>> {
+    // SAFETY: with a size of 0 the call only counts, and writes nothing.
+    let count = unsafe { libc::syscall(libc::SYS_getgroups, 0, std::ptr::null_mut::<u32>()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut groups = vec![0u32; count as usize];
+    // SAFETY: `groups` holds `count` gids for the kernel to fill.
+    let got = unsafe { libc::syscall(libc::SYS_getgroups, count, groups.as_mut_ptr()) };
+    if got < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    groups.truncate(got as usize);
+    Ok(groups)
+}
+
+/// Set this thread's supplementary groups, and only this thread's.
+fn set_thread_groups(groups: &[u32]) -> std::io::Result<()> {
+    // SAFETY: the raw syscall reads `groups.len()` gids and changes only the
+    // calling thread's credentials (libc's wrapper would change every
+    // thread's).
+    let rc = unsafe { libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Set this thread's filesystem uid/gid, returning the previous pair.
@@ -434,5 +497,75 @@ fn set_fs_ids(uid: u32, gid: u32) -> (u32, u32) {
         let previous_gid = libc::syscall(libc::SYS_setfsgid, gid) as u32;
         let previous_uid = libc::syscall(libc::SYS_setfsuid, uid) as u32;
         (previous_uid, previous_gid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThreadIds, set_thread_groups, thread_groups};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Without the privilege to change groups the agent must not read as an
+    /// account with its own groups instead: that is the read the account
+    /// could not do itself.
+    #[test]
+    fn an_agent_that_cannot_take_the_groups_refuses_rather_than_reads_with_its_own() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root can take them; the next test covers that.
+        }
+        let me = nix::unistd::geteuid().as_raw();
+        let before = thread_groups().unwrap();
+        let other = me + 1;
+        assert!(ThreadIds::assume(other, other, &[other]).is_err());
+        assert_eq!(thread_groups().unwrap(), before, "nothing changed");
+        // As itself it has nothing to take, and reads as before.
+        let gid = nix::unistd::getegid().as_raw();
+        drop(ThreadIds::assume(me, gid, &[gid]).unwrap());
+    }
+
+    /// Code review F13: a file reachable only through one of the account's
+    /// supplementary groups is readable as the account, and one reachable
+    /// only through a group the agent holds is not.
+    ///
+    /// Needs root, or root in a user namespace with groups mapped:
+    /// `unshare --user --map-root-user --map-auto <test binary> --ignored`.
+    #[test]
+    #[ignore = "needs root or a user namespace with mapped groups"]
+    fn a_thread_reads_with_the_accounts_groups_and_not_the_agents() {
+        assert!(nix::unistd::geteuid().is_root(), "run as root");
+        let (account, account_group, agent_group) = (1000, 2001, 2002);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let only_for = |name: &str, gid: u32| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            std::os::unix::fs::chown(&path, Some(0), Some(gid)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o040)).unwrap();
+            path
+        };
+        let theirs = only_for("theirs", account_group);
+        let agents = only_for("agents", agent_group);
+
+        // A thread of its own: these are per-thread credentials, and the
+        // harness's other threads must not see them.
+        std::thread::spawn(move || {
+            set_thread_groups(&[agent_group]).unwrap();
+
+            let ids = ThreadIds::assume(account, account, &[account, account_group]).unwrap();
+            assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
+            assert_eq!(
+                std::fs::read(&agents).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the agent's group must not reach the account's read"
+            );
+            drop(ids);
+            assert_eq!(thread_groups().unwrap(), vec![agent_group], "groups back");
+
+            let ids = ThreadIds::assume(account, account, &[account]).unwrap();
+            assert!(std::fs::read(&theirs).is_err(), "not a member, no read");
+            drop(ids);
+        })
+        .join()
+        .unwrap();
     }
 }

@@ -390,7 +390,9 @@ fn entry(user: nix::unistd::User) -> PasswdEntry {
 pub(super) struct ThreadIds(());
 
 impl ThreadIds {
-    pub(super) fn assume(uid: u32, gid: u32) -> std::io::Result<ThreadIds> {
+    /// The kernel resolves the groups for `uid` itself, so the account's
+    /// list is not needed here.
+    pub(super) fn assume(uid: u32, gid: u32, _groups: &[u32]) -> std::io::Result<ThreadIds> {
         // SAFETY: affects only the calling thread's credential.
         match unsafe { ffi::pthread_setugid_np(uid, gid) } {
             0 => Ok(ThreadIds(())),
