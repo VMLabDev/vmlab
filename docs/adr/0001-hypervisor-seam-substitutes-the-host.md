@@ -1,6 +1,6 @@
 # ADR-0001: The Hypervisor seam substitutes the host, and Machine is the test surface
 
-- **Status**: Accepted, amended 2026-10-30
+- **Status**: Accepted, amended 2026-10-30 and 2026-11-05
 - **Date**: 2026-07-31
 - **Supersedes**: nothing
 - **Related**: [ADR-0002](0002-machine-is-the-only-route-to-a-machine.md)
@@ -9,8 +9,8 @@
 
 `vmlab` boots real QEMU. Everything that decides *when* a machine is running —
 the start ladder, the power-state machine, the exit monitor, the readiness gate,
-the stop ladder, teardown ordering, the container restart policy and its backoff
-— sits above that, and none of it needs a hypervisor to be correct.
+the stop ladder, teardown ordering — sits above that, and none of it needs a
+hypervisor to be correct.
 
 Commit `cc37a1d` introduced `trait Hypervisor` to make exactly that code
 testable, along with a `FakeHypervisor` driven by a failure `Script` and a
@@ -19,9 +19,10 @@ testable, along with a `FakeHypervisor` driven by a failure `Script` and a
 The seam was never consumed. `set_hypervisor` has one occurrence in `src/` — its
 own definition. `FakeHypervisor` never leaves `hypervisor.rs`, where five tests
 exercise the fake itself. The VM lifecycle module remains at ~1100 lines with no
-tests, and the container lifecycle module — which carries the harder logic
-(restart policy, rapid-failure accounting, stop-during-backoff cancellation) —
-has no injection point at all.
+tests, and the container lifecycle module has no injection point at all. (At
+the time it also carried a restart policy with rapid-failure accounting and
+stop-during-backoff cancellation, since removed; see the amendment of
+2026-11-05.)
 
 Two properties of the seam explain why it stalled:
 
@@ -68,9 +69,9 @@ Concretely:
   *together with* its caller — so "we clear the ready flag and tear down in the
   right order before firing the exit callback" becomes a provable claim rather
   than an assumed one.
-- The container restart ladder — rapid-failure accounting, backoff, cancellation
-  during backoff, the re-entrancy guard on restart — becomes testable, which is
-  the single riskiest untested region in the lab daemon.
+- The container lifecycle becomes testable through the same seam as the VM's.
+  (This item first named the container restart ladder; that ladder is gone, see
+  the amendment of 2026-11-05.)
 - CI stops depending on host QEMU layout for this class of behaviour.
 
 **Given up**
@@ -105,3 +106,14 @@ below it.
   means what that behaviour does to a guest. The caller's side of it — the
   ordering around a restore, the refusal when a capability is absent — is
   tested against the fake.
+
+## Amendment (2026-11-05): the container restart policy is gone
+
+The container restart policy this ADR cited as the harder, untested container
+logic — the restart ladder with rapid-failure accounting, backoff and
+cancellation of a stop during backoff — was removed in `d665132` (#76, closing
+#63). A container that exits stays exited: the lab daemon emits
+`container.stopped` (and `container.crashed` for a crash), which an `on {}`
+binding may act on, and restarts nothing by itself. The Context and Gained
+sections above no longer describe it as current behaviour. The decision is unchanged: the container lifecycle still goes
+through the same seam and is tested through `Machine`.
