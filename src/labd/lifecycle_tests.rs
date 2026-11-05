@@ -331,7 +331,9 @@ fn automatic_hypervisor_selection_follows_a_deferred_templates_hardware() {
     assert_eq!(machine.hypervisor(), HypervisorKind::Qemu);
     assert!(machine.takes_tap_fds());
     assert_eq!(machine.net_framing(), FramingMode::Raw);
-    assert!(machine.hypervisor_fallback().unwrap().contains("i440fx"));
+    // 4a and 4b are admitted; the pc UHCI tablet (4c) still sends it to QEMU.
+    let why = machine.hypervisor_fallback().unwrap();
+    assert!(why.contains("4c") && why.contains("UHCI"), "{why}");
 }
 
 /// A container on a fake hypervisor, image already bound. `decl` is the
