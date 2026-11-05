@@ -114,6 +114,11 @@ pub struct LabRuntime {
     /// starter, or a first-boot script restarting its own guest, finds it
     /// claimed and leaves it to the run that holds it.
     first_boots: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Each machine's share-mount task (§7.5), so a stop can end it. `up`
+    /// keeps its handle only for its report hold; after that the task would
+    /// otherwise retry against a guest that has gone until its window ends.
+    /// Only ever aborted, never joined: a stop must not wait on it.
+    mount_tasks: std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
     /// Host USB passthrough's lab-wide half (§5.2.1): where the host's
     /// devices are read from, the lock serialising attaches, and the
     /// unplug watch.
@@ -566,6 +571,7 @@ impl LabRuntime {
             agent_updates: std::sync::atomic::AtomicBool::new(true),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             first_boots: std::sync::Mutex::default(),
+            mount_tasks: std::sync::Mutex::default(),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -641,6 +647,7 @@ impl LabRuntime {
             agent_updates: std::sync::atomic::AtomicBool::new(false),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             first_boots: std::sync::Mutex::default(),
+            mount_tasks: std::sync::Mutex::default(),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
@@ -1453,8 +1460,20 @@ impl LabRuntime {
     /// workspace syncer, a recording ends with the machine it shows).
     pub async fn stop_machine(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
         let m = self.machine(name)?;
+        self.stop_mounting(name);
         self.record_finalise_machine(name, "machine stopped").await;
         m.stop(force).await
+    }
+
+    /// End `name`'s share-mount task, if one is still running (§7.5). The
+    /// abort drops the task's future mid-attempt or mid-sleep, and its
+    /// `SettleOnDrop` settles the report, so nothing waiting on the mounts
+    /// is left waiting. Called before the machine stops: a mount retried
+    /// against a guest that is going away only logs failures for it.
+    fn stop_mounting(&self, name: &str) {
+        if let Some(task) = self.mount_tasks.lock_recover().remove(name) {
+            task.abort();
+        }
     }
 
     /// Stop one machine and delete everything it materialised, leaving the
@@ -1462,6 +1481,7 @@ impl LabRuntime {
     /// `up <name>` re-materialises it (per-machine analogue of [`destroy`]).
     pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
         let m = self.machine(name)?;
+        self.stop_mounting(name);
         self.workspaces.stop(name).await;
         self.record_finalise_machine(name, "machine destroyed")
             .await;
@@ -2166,6 +2186,15 @@ impl LabRuntime {
                             m.mount_shares(services, report).await;
                         }
                     });
+                    // A task from an earlier `up` still retrying would race
+                    // this one on the same guest: this one replaces it.
+                    if let Some(earlier) = me
+                        .mount_tasks
+                        .lock_recover()
+                        .insert(n.clone(), task.abort_handle())
+                    {
+                        earlier.abort();
+                    }
                     mounts.lock_recover().push(ShareMounts {
                         machine: n.clone(),
                         report,
@@ -2736,6 +2765,7 @@ impl LabRuntime {
             tracing::info!("{}: {}", skip.what, skip.why);
         }
         for name in &dropped {
+            self.stop_mounting(name);
             self.workspaces.stop(name).await;
             self.record_finalise_machine(name, "machine stopped").await;
             self.machine(name)?.stop(force).await?;
@@ -2745,6 +2775,7 @@ impl LabRuntime {
         // its retry window failing to reach one, and a recording is
         // finalised while its last frame is still the machine's (D6).
         for name in plan.machines() {
+            self.stop_mounting(name);
             self.workspaces.stop(name).await;
             self.record_finalise_machine(name, "machine stopped").await;
         }
@@ -3819,6 +3850,9 @@ mod tests {
         /// A share "data" that takes this long to mount once the machine is
         /// ready, under the same wait for readiness a VM's mount task makes.
         mount: Option<Duration>,
+        /// A share "data" whose mount step fails on every attempt, run by
+        /// the real retry loop; counts the attempts.
+        failing_mount: Option<Arc<AtomicU32>>,
         /// Snapshots it takes are online ones (RAM included).
         online_snapshots: bool,
         clock: crate::config::model::Clock,
@@ -3902,6 +3936,7 @@ mod tests {
                 agent: None,
                 first_boot: std::sync::Mutex::new(None),
                 mount: None,
+                failing_mount: None,
                 online_snapshots: false,
                 clock: crate::config::model::Clock::Host,
                 boot_ids: std::sync::Mutex::new(Vec::new()),
@@ -3942,6 +3977,15 @@ mod tests {
             m.mount = Some(mount);
             m.ready_timeout = ready_timeout;
             m.first_boot = std::sync::Mutex::new(first_boot.map(str::to_string));
+            Arc::new(m)
+        }
+
+        /// A double whose share "data" never mounts: every attempt of its
+        /// step fails, under the real retry loop, and is counted in `calls`.
+        fn failing_mount(name: &str, shared: &Shared, calls: Arc<AtomicU32>) -> Arc<Self> {
+            let mut m =
+                Arc::into_inner(Self::new(name, MachineKind::Vm, shared)).expect("sole owner");
+            m.failing_mount = Some(calls);
             Arc::new(m)
         }
 
@@ -4060,6 +4104,43 @@ mod tests {
             _lab: Arc<dyn LabServices>,
             report: Arc<MountReport>,
         ) {
+            if let Some(calls) = self.failing_mount.clone() {
+                let retry = crate::smb::steps::RetryPolicy::MOUNT;
+                report.planned(["data"], &[], retry.deadline);
+                if self.wait_ready(self.ready_timeout).await.is_err() {
+                    report.abandoned("the guest never became ready");
+                    return;
+                }
+                report.ready();
+                let plan = crate::smb::steps::MountPlan {
+                    steps: vec![crate::smb::MountStep {
+                        os_hint: crate::smb::OsHint::Linux,
+                        command: "mount".into(),
+                        args: vec!["-t".into(), "cifs".into()],
+                        share: Some("data".into()),
+                        refused_exit: None,
+                    }],
+                    retry,
+                    unsupported: Vec::new(),
+                };
+                super::super::mount_retry::run_plan(
+                    &self.name,
+                    &plan,
+                    &report,
+                    |_argv, _timeout| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            Ok(super::super::mount_retry::Exited {
+                                exit_code: 32,
+                                stderr: "mount error(112): Host is down\n".into(),
+                            })
+                        }
+                    },
+                    |_| {},
+                )
+                .await;
+                return;
+            }
             let Some(mount) = self.mount else { return };
             report.planned(
                 ["data"],
@@ -5635,6 +5716,79 @@ lab "t" {
             lines[1].contains("\"lin\": share \"src\" not mounted yet, still retrying"),
             "{lines:?}"
         );
+    }
+
+    /// A lab of one VM, "lin", whose share never mounts, brought up: `up`
+    /// returns after its report hold with the mount task still retrying.
+    async fn up_with_a_mount_that_never_succeeds(
+        dir: &std::path::Path,
+    ) -> (Arc<LabRuntime>, Arc<AtomicU32>) {
+        let sh = shared(dir);
+        let calls = Arc::new(AtomicU32::new(0));
+        let lab = lab_of(
+            dir,
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "lin" { template = "x86_64/t" }
+}"#,
+            vec![FakeMachine::failing_mount("lin", &sh, Arc::clone(&calls))],
+        );
+        let (sink, _said) = numbered(&sh);
+        lab.up(&[], sink).await.expect("up");
+        assert!(calls.load(Ordering::SeqCst) > 1, "the mount is retrying");
+        let task = lab.mount_tasks.lock_recover().get("lin").cloned();
+        assert!(task.is_some_and(|t| !t.is_finished()), "still mounting after up");
+        (lab, calls)
+    }
+
+    /// The mount task stops with its machine (VML-32): within one tick of
+    /// the stop it has ended, and no attempt runs after it.
+    async fn assert_mounting_ended(lab: &LabRuntime, calls: &AtomicU32) {
+        assert!(lab.mount_tasks.lock_recover().get("lin").is_none());
+        tokio::task::yield_now().await;
+        let seen = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(crate::smb::steps::RetryPolicy::MOUNT.deadline).await;
+        assert_eq!(calls.load(Ordering::SeqCst), seen, "an attempt ran after the stop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_machine_stop_ends_its_mount_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, calls) = up_with_a_mount_that_never_succeeds(dir.path()).await;
+        let handle = lab.mount_tasks.lock_recover().get("lin").cloned().unwrap();
+        lab.stop_machine("lin", false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(handle.is_finished(), "the task outlived its machine's stop by a tick");
+        assert_mounting_ended(&lab, &calls).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn down_ends_every_mount_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, calls) = up_with_a_mount_that_never_succeeds(dir.path()).await;
+        let handle = lab.mount_tasks.lock_recover().get("lin").cloned().unwrap();
+        lab.down(&[], false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(handle.is_finished(), "the task outlived down by a tick");
+        assert_mounting_ended(&lab, &calls).await;
+    }
+
+    /// A mount task an earlier `up` left running is replaced by the next
+    /// one rather than left beside it on the same guest.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_up_replaces_a_mount_task_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, calls) = up_with_a_mount_that_never_succeeds(dir.path()).await;
+        let earlier = tokio::spawn(std::future::pending::<()>());
+        lab.mount_tasks
+            .lock_recover()
+            .insert("lin".into(), earlier.abort_handle());
+        let (sink, _said) = numbered(&shared(dir.path()));
+        lab.up(&[], sink).await.expect("second up");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(earlier.is_finished(), "the earlier task still runs");
+        lab.down(&[], false).await.unwrap();
+        assert_mounting_ended(&lab, &calls).await;
     }
 
     /// When every mount finishes, `up` does not wait out the hold.
