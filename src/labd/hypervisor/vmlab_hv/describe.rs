@@ -1193,8 +1193,16 @@ mod tests {
             vhost_fds: vec![],
         };
         assert!(refused(&ok, &tap, QemuAccel::Kvm, &roms()).contains("queue counts"));
+        // An emulated pc NIC takes the plain stream only.
         let legacy = resolved_vm("windows-legacy", "x86_64");
-        assert!(refused(&legacy, &vm_paths(), QemuAccel::Kvm, &roms()).contains("q35"));
+        let mut legacy_tap = vm_paths();
+        legacy_tap.nics[0].backend = NicBackend::TapQueues {
+            tap_fds: vec![10],
+            vhost_fds: vec![],
+        };
+        assert!(
+            refused(&legacy, &legacy_tap, QemuAccel::Kvm, &roms()).contains("stream socket only")
+        );
         let qxl = declared(
             r#"profile = "linux-modern" firmware = "seabios" display = "qxl""#,
             None,
@@ -1875,6 +1883,13 @@ mod tests {
         }
         if profile != "templeos" {
             assert_eq!(d.nics[0].model, model);
+            // One queue and no virtio-net header: the plain stream, no ROM.
+            assert!(
+                matches!(d.nics[0].attachment, NicAttachment::Stream { .. }),
+                "{:?}",
+                d.nics[0].attachment
+            );
+            assert_eq!(d.nics[0].rom, None);
             assert_eq!(d.nics[0].pci, at(if serial { 2 } else { 3 }));
             assert!(
                 devices.contains(

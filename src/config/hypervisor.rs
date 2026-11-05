@@ -116,9 +116,10 @@ impl HostFacts {
 /// The one architecture `vmlab-hv` runs today.
 const VMLAB_ARCH: &str = "x86_64";
 
-// Flip each flag only after the pinned hypervisor passes that sub-phase's gate.
-const PC_MACHINE_CORE_DELIVERED: bool = false; // 4a
-const PC_NETWORKING_DELIVERED: bool = false; // 4b
+// Flip each flag only once `hv/` delivers that sub-phase (its acceptance and
+// hwref tests pass in-tree), one edit per sub-phase.
+const PC_MACHINE_CORE_DELIVERED: bool = true; // 4a
+const PC_NETWORKING_DELIVERED: bool = true; // 4b
 const PC_FLOPPY_UHCI_DELIVERED: bool = false; // 4c
 const PC_CIRRUS_DELIVERED: bool = false; // 4d
 
@@ -356,6 +357,14 @@ fn hardware_refusals(
                  on q35 (PRD §22); remove it, or use hypervisor = \"qemu\""
             ));
         }
+    }
+    // vmlab-hv pins the TSC (invtsc and tsc_khz) on q35 only; its pc
+    // machine refuses both, as it does the other macOS-era CPU features.
+    if pc && h.tsc.is_some() {
+        why.push(format!(
+            "vm \"{name}\": a pinned TSC (`tsc = \"host\"`) on the pc machine — vmlab-hv \
+             pins the TSC on q35 only (PRD §22); remove `tsc`, or use hypervisor = \"qemu\""
+        ));
     }
 }
 
@@ -809,13 +818,28 @@ mod tests {
         assert!(bare.iter().any(|why| why.contains("UHCI")), "{bare:?}");
         let attached = vmlab_vm_launch_refusals(&hw, true, true);
         assert!(
-            attached.iter().any(|why| why.contains("4b")),
-            "{attached:?}"
+            !attached.iter().any(|why| why.contains("4b")),
+            "4b is delivered: {attached:?}"
         );
         assert!(
             attached.iter().any(|why| why.contains("a floppy drive")),
             "{attached:?}"
         );
+    }
+
+    /// 4a and 4b are in `hv/`, 4c and 4d are not: a networked legacy VM is
+    /// refused for nothing but the UHCI tablet QEMU gives every pc, so it
+    /// still falls back to QEMU until 4c, naming 4c and nothing earlier.
+    #[test]
+    fn the_delivered_sub_phases_are_4a_and_4b() {
+        assert!(LEGACY_PC_DELIVERED.machine_core && LEGACY_PC_DELIVERED.networking);
+        assert!(!LEGACY_PC_DELIVERED.floppy_uhci && !LEGACY_PC_DELIVERED.cirrus);
+        let why = refused(
+            r#"template = "scratch" arch = "x86_64" disk = 2GiB
+                profile = "windows-legacy" nic { nat = true }"#,
+        );
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains("4c") && why[0].contains("UHCI"), "{why:?}");
     }
 
     fn all_legacy_pc_delivered() -> LegacyPcDelivery {

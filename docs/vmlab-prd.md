@@ -2667,10 +2667,12 @@ a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
 (2d, 2f), virtio-fs shares and a sound card (2e), `usb = true` (2f), and
 a pinned `tsc` (§5.2) — the
 Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
-macOS guest (its own phase); the i440fx machine, IDE, a named CPU or
-`agent_transport = "isa-serial"` on pc (4a); e1000 or PCnet on pc (4b);
-a floppy or pc's UHCI tablet (4c); Cirrus on pc (4d); `accel = "tcg"` (3); another display
-device, NIC model or `cpu_model`; `input = "usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
+macOS guest (its own phase); on the pc machine, a floppy or the UHCI tablet
+QEMU gives every pc (4c) and Cirrus (4d), while the pc machine core with IDE, a
+named CPU and `agent_transport = "isa-serial"` (4a) and e1000 and PCnet (4b) are
+delivered, so every pc VM falls back to QEMU until 4c; a pinned `tsc` on pc;
+`accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
+"usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
 container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
 no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
