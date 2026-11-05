@@ -44,7 +44,7 @@ use std::time::Instant;
 use vmlab_agent_proto::Logon;
 
 use super::os::{self, ThreadIds};
-use crate::logon::{Held, LogonCache, LogonKey};
+use crate::logon::{Held, LogonCache};
 use crate::spawn::{Adopted, Adopter, Identity};
 
 /// A resolved guest account — everything a login needs from the guest's own
@@ -506,15 +506,8 @@ impl Logins {
     /// The live session for `identity`, resolved if the cache has none.
     /// `Identity::Agent` has no session at all — that is §19.2's floor.
     pub fn resolve(&self, identity: &Identity) -> std::io::Result<Option<Arc<Held<Session>>>> {
-        let Identity::Declared(logon) = identity else {
-            return Ok(None);
-        };
-        let held = self.cache.get_or_mint(
-            LogonKey::new(&logon.user, &logon.secret),
-            Instant::now(),
-            || self.mint(logon),
-        )?;
-        Ok(Some(held))
+        self.cache
+            .resolve(identity, Instant::now(), |logon| self.mint(logon))
     }
 
     fn mint(&self, logon: &Logon) -> std::io::Result<Session> {

@@ -159,6 +159,90 @@ fn an_open_that_carries_a_logon_reaches_the_seam_as_that_account() {
     );
 }
 
+/// Code review F5: the logon cache once keyed on (account, secret) alone,
+/// while Windows bakes `elevated` into the token it mints — so whichever
+/// elevation one account asked for first was what every later channel got.
+/// Each kind of channel that runs as an account, opened elevated then
+/// filtered and the other way round, resolves through the cache the
+/// platforms share and must get a logon minted for its own elevation.
+#[test]
+fn each_channel_gets_the_elevation_it_asked_for_in_either_order() {
+    use std::time::Instant;
+
+    use crate::logon::LogonCache;
+
+    for first in [true, false] {
+        let (mux, mut cap) = capture_mux();
+        let p = TestPlatform::new();
+        let mut id = 0;
+        for elevated in [first, !first] {
+            let dev = Logon {
+                user: r"PROBE\dev".into(),
+                secret: "vmlab123!".into(),
+                elevated,
+            };
+            for msg in [
+                HostMsg::OpenTerminal {
+                    id: id + 1,
+                    cols: 80,
+                    rows: 24,
+                    command: None,
+                    env: vec![],
+                    logon: Some(dev.clone()),
+                },
+                HostMsg::OpenExec {
+                    id: id + 2,
+                    argv: vec!["whoami".into()],
+                    env: vec![],
+                    cwd: None,
+                    logon: Some(dev.clone()),
+                    tree: None,
+                },
+                HostMsg::OpenFileOps {
+                    id: id + 3,
+                    logon: Some(dev.clone()),
+                },
+            ] {
+                id += 1;
+                open(&mux, &p, msg);
+                assert_eq!(cap.ctrl(), AgentMsg::Opened { id });
+            }
+        }
+
+        // A minted logon here is the elevation it was minted for, as the
+        // Windows token is.
+        let cache = LogonCache::new();
+        let now = Instant::now();
+        let mut minted = 0;
+        let calls = p.spawner.calls();
+        assert_eq!(calls.len(), 6);
+        for (i, call) in calls.into_iter().enumerate() {
+            let (kind, identity) = match call {
+                Call::Terminal { identity, .. } => ("terminal", identity),
+                Call::Exec { identity, .. } => ("exec", identity),
+                Call::Adopt { identity } => ("fileops", identity),
+            };
+            let Identity::Declared(asked) = &identity else {
+                panic!("{kind} reached the seam as the agent");
+            };
+            let held = cache
+                .resolve(&identity, now, |logon| {
+                    minted += 1;
+                    Ok(logon.elevated)
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                held.value, asked.elevated,
+                "{kind} (call {i}, first elevation {first}) got the other elevation's logon"
+            );
+        }
+        // One logon per elevation, shared by the three channels that asked
+        // for it.
+        assert_eq!(minted, 2, "first elevation {first}");
+    }
+}
+
 /// A `tail` is person-invoked too, but it opens rather than creates — so it
 /// takes the identity from the seam and reads through it (§19.2), while
 /// `watch` beside it produces none of the developer's files and stays on
