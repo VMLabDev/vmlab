@@ -29,7 +29,7 @@ tcg-generate-check $ir='target/tcg/riscv64.ir': tcg-ir-generate
 # Build the pinned legacy and EFI virtio-net option ROMs
 [group('dev')]
 firmware-ipxe-build:
-	uv run python firmware/ipxe/build.py
+	uv run python ../guest/ipxe/build.py --profile hv
 
 # Pin the Alpine minirootfs the S1 rootfs builds from
 alpine_url := "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.1-x86_64.tar.gz"
@@ -148,4 +148,4 @@ bench-hv-binary backend:
 # Build the iPXE ROM the vmlab-hv x86_64 NIC carries (no-op for qemu)
 [private]
 bench-ipxe-rom backend:
-	@if [ "{{backend}}" = "vmlab-hv" ] && [ ! -f target/ipxe/virtio-net.rom ]; then uv run python firmware/ipxe/build.py; fi
+	@if [ "{{backend}}" = "vmlab-hv" ] && [ ! -f target/ipxe/virtio-net.rom ]; then uv run python ../guest/ipxe/build.py --profile hv; fi

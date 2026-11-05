@@ -20,7 +20,7 @@ COPY guest/secureboot/microsoft-2023.json guest/secureboot/
 COPY guest/logo/Logo.bmp guest/logo/
 COPY guest/seabios/* guest/seabios/
 COPY guest/ipxe/build.py guest/ipxe/upstream.json guest/ipxe/
-COPY guest/ipxe/config/*.h guest/ipxe/config/
+COPY guest/ipxe/config/ guest/ipxe/config/
 # Cache verified downloads. Keep iPXE's checkout in the layer itself so a
 # changed upstream pin starts with a fresh checkout rather than a stale cache.
 RUN --mount=type=cache,id=vmlab-e2e-firmware-deb,target=/src/guest/.cache/deb,sharing=locked \
