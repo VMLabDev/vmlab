@@ -287,13 +287,26 @@ impl TemplateStore {
     /// anywhere leaves the store untouched (PRD §6.1). A staging dir on
     /// another filesystem is first copied into one inside the store, so the
     /// final step is still a rename. Refuses to replace an existing version
-    /// unless `overwrite` is set.
+    /// unless `overwrite` is set; a replaced version stays in place until
+    /// its replacement is complete (see `swap_in`).
     pub fn install(&self, staging_dir: &Path, meta: &TemplateMeta, overwrite: bool) -> Result<()> {
         let _lock = self.lock()?;
         self.install_locked(staging_dir, meta, overwrite)
     }
 
     fn install_locked(&self, staging: &Path, meta: &TemplateMeta, overwrite: bool) -> Result<()> {
+        self.install_with(staging, meta, overwrite, &InstallOps::REAL)
+    }
+
+    /// [`Self::install_locked`] with its filesystem steps in `ops`, so tests
+    /// can fail each one.
+    fn install_with(
+        &self,
+        staging: &Path,
+        meta: &TemplateMeta,
+        overwrite: bool,
+        ops: &InstallOps,
+    ) -> Result<()> {
         ensure!(
             staging.join(DISK_FILE).is_file(),
             "staging directory {} contains no {DISK_FILE}",
@@ -309,23 +322,69 @@ impl TemplateStore {
             staging.display()
         );
         let dest = self.version_dir(&meta.arch, &meta.name, &meta.version);
-        if dest.exists() {
-            if !overwrite {
-                bail!(
-                    "template {}/{}@{} already exists in the store (pass overwrite to replace)",
-                    meta.arch,
-                    meta.name,
-                    meta.version
-                );
-            }
-            fs::remove_dir_all(&dest)
-                .with_context(|| format!("cannot replace {}", dest.display()))?;
+        // An install interrupted mid-swap left the old version beside `dest`.
+        recover_swap(&dest)?;
+        if dest.exists() && !overwrite {
+            bail!(
+                "template {}/{}@{} already exists in the store (pass overwrite to replace)",
+                meta.arch,
+                meta.name,
+                meta.version
+            );
         }
-        meta.write_to(&staging.join(META_FILE))?;
+        (ops.write_meta)(meta, &staging.join(META_FILE))?;
         let parent = dest.parent().expect("version dir always has a parent");
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
-        self.move_in(staging, &dest, &|from, to| fs::rename(from, to))
+        if dest.exists() {
+            self.swap_in(staging, &dest, ops)
+        } else {
+            self.move_in(staging, &dest, &ops.rename)
+        }
+    }
+
+    /// Replace the version at `dest` with `staging`, keeping the old version
+    /// until the new one is in place:
+    ///
+    /// 1. `staging` moves to `.next-<version>` beside `dest` (copied first
+    ///    when on another filesystem); the old version is not touched yet,
+    /// 2. the old version is renamed to `.old-<version>`,
+    /// 3. `.next-<version>` is renamed to `dest`; on failure the old
+    ///    version is renamed back,
+    /// 4. `.old-<version>` is removed.
+    ///
+    /// The dot names keep both out of version listings. An interruption
+    /// between 2 and 3 leaves `dest` missing and the old version at
+    /// `.old-<version>`; [`recover_swap`] puts it back on the next install.
+    fn swap_in(&self, staging: &Path, dest: &Path, ops: &InstallOps) -> Result<()> {
+        let (next, old) = swap_paths(dest);
+        remove_if_present(&next)?;
+        if let Err(e) = self.move_in(staging, &next, &ops.rename) {
+            let _ = fs::remove_dir_all(&next);
+            return Err(e);
+        }
+        if let Err(e) = (ops.rename)(dest, &old) {
+            let _ = fs::remove_dir_all(&next);
+            return Err(e).with_context(|| format!("cannot set aside {}", dest.display()));
+        }
+        if let Err(e) = (ops.rename)(&next, dest) {
+            let restored = (ops.rename)(&old, dest);
+            let _ = fs::remove_dir_all(&next);
+            return match restored {
+                Ok(()) => Err(e)
+                    .with_context(|| format!("cannot move new version into {}", dest.display())),
+                Err(back) => Err(e).with_context(|| {
+                    format!(
+                        "cannot move new version into {}, and cannot restore the old version \
+                         from {}: {back}; the next install of this version restores it",
+                        dest.display(),
+                        old.display()
+                    )
+                }),
+            };
+        }
+        let _ = fs::remove_dir_all(&old);
+        Ok(())
     }
 
     /// Rename `staging` to `dest`. When `staging` is on another filesystem
@@ -973,6 +1032,68 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The filesystem steps of an install. [`InstallOps::REAL`] outside tests.
+struct InstallOps {
+    write_meta: fn(&TemplateMeta, &Path) -> Result<()>,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+}
+
+impl InstallOps {
+    const REAL: Self = Self { write_meta, rename };
+}
+
+fn write_meta(meta: &TemplateMeta, path: &Path) -> Result<()> {
+    meta.write_to(path)
+}
+
+fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// `.next-<version>` and `.old-<version>` beside the version dir `dest`:
+/// where [`TemplateStore::swap_in`] stages the new version and sets the old
+/// one aside.
+fn swap_paths(dest: &Path) -> (PathBuf, PathBuf) {
+    let version = dest
+        .file_name()
+        .expect("version dir always has a name")
+        .to_string_lossy();
+    (
+        dest.with_file_name(format!(".next-{version}")),
+        dest.with_file_name(format!(".old-{version}")),
+    )
+}
+
+/// Finish what an interrupted [`TemplateStore::swap_in`] left: an old
+/// version set aside with nothing in its place goes back to `dest`; one
+/// whose replacement is in place is removed. A half-staged new version is
+/// discarded either way.
+fn recover_swap(dest: &Path) -> Result<()> {
+    let (next, old) = swap_paths(dest);
+    if old.exists() {
+        if dest.exists() {
+            remove_if_present(&old)?;
+        } else {
+            fs::rename(&old, dest).with_context(|| {
+                format!(
+                    "cannot restore template {} from {}",
+                    dest.display(),
+                    old.display()
+                )
+            })?;
+        }
+    }
+    remove_if_present(&next)
+}
+
+fn remove_if_present(dir: &Path) -> Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("cannot remove {}", dir.display())),
+    }
+}
+
 struct StagingDir {
     path: PathBuf,
 }
@@ -1411,6 +1532,187 @@ mod tests {
         assert!(err.to_string().contains(DISK_FILE), "{err}");
         assert!(store.list().unwrap().is_empty());
         assert!(!store.root().join("x86_64").exists(), "no partial dirs");
+    }
+
+    // ---- overwrite keeps the old version until the new one is in place (F6) --
+
+    /// A store holding `x86_64/t@1` with disk `one`, and a staging dir with
+    /// disk `two` to replace it.
+    fn store_with_old_version() -> (tempfile::TempDir, TemplateStore, PathBuf) {
+        let (tmp, store) = new_store();
+        install(&store, &meta("x86_64", "t", "1"), b"one").unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap().keep();
+        fs::write(staging.join(DISK_FILE), b"two").unwrap();
+        (tmp, store, staging)
+    }
+
+    /// The replacement's metadata, which differs from the old version's.
+    fn new_meta() -> TemplateMeta {
+        TemplateMeta {
+            cpus: Some(4),
+            ..meta("x86_64", "t", "1")
+        }
+    }
+
+    /// The version's disk and metadata bytes.
+    fn version_files(store: &TemplateStore) -> (Vec<u8>, Vec<u8>) {
+        let dir = store.version_dir("x86_64", "t", "1");
+        (
+            fs::read(dir.join(DISK_FILE)).unwrap(),
+            fs::read(dir.join(META_FILE)).unwrap(),
+        )
+    }
+
+    /// The entries of `x86_64/t/`: only version dirs, no `.next-`/`.old-`.
+    fn version_entries(store: &TemplateStore) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(store.root().join("x86_64").join("t"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn name_starts(path: &Path, prefix: &str) -> bool {
+        path.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+    }
+
+    /// Install the replacement with `ops`, expecting it to fail, and show the
+    /// old version's disk and metadata are as they were.
+    fn overwrite_fails_and_keeps_old(ops: &InstallOps) -> anyhow::Error {
+        let (_tmp, store, staging) = store_with_old_version();
+        let before = version_files(&store);
+        let err = store
+            .install_with(&staging, &new_meta(), true, ops)
+            .unwrap_err();
+        assert_eq!(
+            version_files(&store),
+            before,
+            "old version changed: {err:#}"
+        );
+        assert_eq!(version_entries(&store), ["1"], "{err:#}");
+        let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
+        assert_eq!(r.meta.cpus, Some(2));
+        err
+    }
+
+    #[test]
+    fn a_failed_metadata_write_keeps_the_old_version() {
+        let err = overwrite_fails_and_keeps_old(&InstallOps {
+            write_meta: |_, _| bail!("injected metadata write failure"),
+            ..InstallOps::REAL
+        });
+        assert!(format!("{err:#}").contains("injected"), "{err:#}");
+    }
+
+    #[test]
+    fn a_failed_staging_move_keeps_the_old_version() {
+        overwrite_fails_and_keeps_old(&InstallOps {
+            rename: |from, to| {
+                if name_starts(to, ".next-") {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+            ..InstallOps::REAL
+        });
+    }
+
+    #[test]
+    fn a_failed_set_aside_keeps_the_old_version() {
+        overwrite_fails_and_keeps_old(&InstallOps {
+            rename: |from, to| {
+                if name_starts(to, ".old-") {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+            ..InstallOps::REAL
+        });
+    }
+
+    /// The last rename fails: the old version is renamed back.
+    #[test]
+    fn a_failed_final_rename_restores_the_old_version() {
+        let err = overwrite_fails_and_keeps_old(&InstallOps {
+            rename: |from, to| {
+                if name_starts(from, ".next-") {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+            ..InstallOps::REAL
+        });
+        assert!(
+            format!("{err:#}").contains("cannot move new version"),
+            "{err:#}"
+        );
+    }
+
+    /// The last rename and the rename back both fail, as after a crash
+    /// between them: the old version waits at `.old-1` and the next install
+    /// of that version puts it back.
+    #[test]
+    fn an_interrupted_swap_is_recovered_by_the_next_install() {
+        let (_tmp, store, staging) = store_with_old_version();
+        let before = version_files(&store);
+        let err = store
+            .install_with(
+                &staging,
+                &new_meta(),
+                true,
+                &InstallOps {
+                    rename: |from, to| {
+                        if to.file_name().is_some_and(|n| n == "1") {
+                            Err(std::io::Error::other("injected"))
+                        } else {
+                            fs::rename(from, to)
+                        }
+                    },
+                    ..InstallOps::REAL
+                },
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("cannot restore"), "{err:#}");
+        assert_eq!(version_entries(&store), [".old-1"]);
+
+        // The next install restores the old version before it decides.
+        let again = tempfile::tempdir_in(store.root()).unwrap().keep();
+        fs::write(again.join(DISK_FILE), b"three").unwrap();
+        let err = store.install(&again, &new_meta(), false).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(version_files(&store), before);
+        assert_eq!(version_entries(&store), ["1"]);
+    }
+
+    /// A crash after the final rename leaves `.old-1` beside the new
+    /// version, and one during staging a `.next-1`; both are cleared.
+    #[test]
+    fn leftovers_of_a_finished_swap_are_removed() {
+        let (_tmp, store, staging) = store_with_old_version();
+        let dir = store.version_dir("x86_64", "t", "1");
+        let (next, old) = swap_paths(&dir);
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(DISK_FILE), b"older").unwrap();
+        fs::create_dir_all(&next).unwrap();
+        store.install(&staging, &new_meta(), true).unwrap();
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store).0, b"two");
+    }
+
+    #[test]
+    fn an_overwrite_replaces_disk_and_metadata() {
+        let (_tmp, store, staging) = store_with_old_version();
+        store.install(&staging, &new_meta(), true).unwrap();
+        let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
+        assert_eq!(fs::read(&r.disk_path).unwrap(), b"two");
+        assert_eq!(r.meta.cpus, Some(4));
+        assert_eq!(version_entries(&store), ["1"]);
+        assert!(!staging.exists());
     }
 
     // ---- remove ---------------------------------------------------------------

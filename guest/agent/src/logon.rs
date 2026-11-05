@@ -10,16 +10,23 @@
 //! *is* stays with the platform that mints it (`windows/logon.rs`), and the
 //! cache only promises to drop it — which is where the profile is unloaded.
 //!
-//! **Keyed on (account, secret, machine).** The machine is the cache itself:
-//! it lives in the agent, which lives and dies with the machine, so a stopped
-//! machine cannot leave a logon behind. The other two are the key's whole
-//! content, and what is *not* in it matters as much — no label, so two labels
-//! naming one account share a session; and the secret, so a changed password
-//! mints a fresh logon rather than failing against a stale one.
+//! **Keyed on (account, secret, elevation, machine).** The machine is the
+//! cache itself: it lives in the agent, which lives and dies with the
+//! machine, so a stopped machine cannot leave a logon behind. The other three
+//! are the key's whole content, and what is *not* in it matters as much — no
+//! label, so two labels naming one account share a session; the secret, so a
+//! changed password mints a fresh logon rather than failing against a stale
+//! one; and the elevation, because Windows bakes it into the token at mint
+//! time (the linked token), so an elevated and a filtered request for one
+//! account are two logons, and neither may be handed the other's token.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use vmlab_agent_proto::Logon;
+
+use crate::spawn::Identity;
 
 /// How long an unused logon survives before the sweeper drops it: a
 /// developer who opens another channel inside the window keeps the same
@@ -43,13 +50,15 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 pub struct LogonKey {
     account: String,
     secret: String,
+    elevated: bool,
 }
 
 impl LogonKey {
-    pub fn new(account: &str, secret: &str) -> LogonKey {
+    pub fn new(account: &str, secret: &str, elevated: bool) -> LogonKey {
         LogonKey {
             account: account.to_string(),
             secret: secret.to_string(),
+            elevated,
         }
     }
 }
@@ -135,6 +144,25 @@ impl<T> LogonCache<T> {
             },
         );
         Ok(held)
+    }
+
+    /// The live logon for `identity`, minted if the cache has none.
+    /// `Identity::Agent` has no logon at all — that is §19.2's floor.
+    ///
+    /// Every channel that runs as a declared account — terminal, exec, file
+    /// session, tail — resolves here on every platform, so the key is
+    /// derived from the wire's triple in this one place.
+    pub fn resolve(
+        &self,
+        identity: &Identity,
+        now: Instant,
+        mint: impl FnOnce(&Logon) -> std::io::Result<T>,
+    ) -> std::io::Result<Option<Arc<Held<T>>>> {
+        let Identity::Declared(logon) = identity else {
+            return Ok(None);
+        };
+        let key = LogonKey::new(&logon.user, &logon.secret, logon.elevated);
+        self.get_or_mint(key, now, || mint(logon)).map(Some)
     }
 
     /// Drop every logon no channel holds and nothing has taken for the idle
@@ -257,10 +285,14 @@ mod tests {
         let m = Minter::new();
         let now = Instant::now();
         let a = cache
-            .get_or_mint(LogonKey::new(r"PROBE\dev", "s3cret"), now, || m.mint())
+            .get_or_mint(LogonKey::new(r"PROBE\dev", "s3cret", false), now, || {
+                m.mint()
+            })
             .unwrap();
         let b = cache
-            .get_or_mint(LogonKey::new(r"PROBE\dev", "s3cret"), now, || m.mint())
+            .get_or_mint(LogonKey::new(r"PROBE\dev", "s3cret", false), now, || {
+                m.mint()
+            })
             .unwrap();
         assert_eq!(m.minted(), 1);
         assert_eq!(a.id, b.id);
@@ -275,10 +307,10 @@ mod tests {
         let m = Minter::new();
         let now = Instant::now();
         let old = cache
-            .get_or_mint(LogonKey::new(r"PROBE\dev", "old"), now, || m.mint())
+            .get_or_mint(LogonKey::new(r"PROBE\dev", "old", false), now, || m.mint())
             .unwrap();
         let new = cache
-            .get_or_mint(LogonKey::new(r"PROBE\dev", "new"), now, || m.mint())
+            .get_or_mint(LogonKey::new(r"PROBE\dev", "new", false), now, || m.mint())
             .unwrap();
         assert_eq!(m.minted(), 2);
         assert_ne!(old.id, new.id);
@@ -292,7 +324,7 @@ mod tests {
         let m = Minter::new();
         let t0 = Instant::now();
         let held = cache
-            .get_or_mint(LogonKey::new("dev", "s"), t0, || m.mint())
+            .get_or_mint(LogonKey::new("dev", "s", false), t0, || m.mint())
             .unwrap();
 
         // A channel still holds it: age alone does not drop it.
@@ -318,13 +350,13 @@ mod tests {
         let t0 = Instant::now();
         drop(
             cache
-                .get_or_mint(LogonKey::new("dev", "s"), t0, || m.mint())
+                .get_or_mint(LogonKey::new("dev", "s", false), t0, || m.mint())
                 .unwrap(),
         );
         let later = t0 + Duration::from_secs(500);
         drop(
             cache
-                .get_or_mint(LogonKey::new("dev", "s"), later, || m.mint())
+                .get_or_mint(LogonKey::new("dev", "s", false), later, || m.mint())
                 .unwrap(),
         );
         assert_eq!(m.minted(), 1);
@@ -341,14 +373,14 @@ mod tests {
         let m = Minter::new();
         let t0 = Instant::now();
         let first = cache
-            .get_or_mint(LogonKey::new("dev", "s"), t0, || m.mint())
+            .get_or_mint(LogonKey::new("dev", "s", false), t0, || m.mint())
             .unwrap();
         let weekend = t0 + Duration::from_secs(3 * 24 * 3600);
 
         // While a channel holds it, the aging logon is kept: ending a live
         // shell for an invisible reason is worse than an aging ticket.
         let same = cache
-            .get_or_mint(LogonKey::new("dev", "s"), weekend, || m.mint())
+            .get_or_mint(LogonKey::new("dev", "s", false), weekend, || m.mint())
             .unwrap();
         assert_eq!(m.minted(), 1);
         assert_eq!(same.id, first.id);
@@ -356,7 +388,7 @@ mod tests {
         drop(first);
         drop(same);
         let fresh = cache
-            .get_or_mint(LogonKey::new("dev", "s"), weekend, || m.mint())
+            .get_or_mint(LogonKey::new("dev", "s", false), weekend, || m.mint())
             .unwrap();
         assert_eq!(m.minted(), 2);
         assert_ne!(fresh.id, 0);
@@ -370,7 +402,7 @@ mod tests {
     fn a_failed_mint_caches_nothing() {
         let cache: LogonCache<FakeToken> = LogonCache::new();
         let now = Instant::now();
-        let Err(err) = cache.get_or_mint(LogonKey::new(r"PROBE\dev", "wrong"), now, || {
+        let Err(err) = cache.get_or_mint(LogonKey::new(r"PROBE\dev", "wrong", false), now, || {
             Err(std::io::Error::other(
                 "the user name or password is incorrect",
             ))

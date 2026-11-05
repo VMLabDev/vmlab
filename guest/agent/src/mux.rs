@@ -28,8 +28,20 @@ use crate::spawn::{ProcessSpec, Spawner, TerminalSpec};
 
 /// How a platform maps a host-supplied guest path. Shared rather than called
 /// through `&dyn Platform` because a file session keeps resolving paths long
-/// after the open returned.
-pub type PathResolver = Arc<dyn Fn(String) -> String + Send + Sync>;
+/// after the open returned. Fails where the path cannot be resolved at all,
+/// a symlink loop inside a container.
+pub type PathResolver = Arc<dyn Fn(String, Last) -> std::io::Result<String> + Send + Sync>;
+
+/// Whether a path's last component is followed when it is a symlink.
+///
+/// It matters where paths are resolved by the agent rather than the kernel,
+/// in a container: an `open` or a `stat` goes through a link, while a
+/// `remove`, `rename`, `lstat` or `readlink` acts on the link itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Last {
+    Follow,
+    Keep,
+}
 
 /// Host→guest bytes for one session, fed by the reader dispatch and drained
 /// by the session's input pump.
@@ -577,17 +589,17 @@ impl Mux {
                 id,
                 platform.path_resolver(),
             ),
-            HostMsg::OpenTail { id, path, logon } => crate::tail::open(
-                self,
-                platform.spawner(),
-                &logon.into(),
-                id,
-                platform.resolve_path(path),
-            ),
+            HostMsg::OpenTail { id, path, logon } => match platform.resolve_path(path.clone()) {
+                Ok(resolved) => {
+                    crate::tail::open(self, platform.spawner(), &logon.into(), id, resolved)
+                }
+                Err(e) => self.send_error(Some(id), format!("tail {path}: {e}")),
+            },
             #[cfg(any(target_os = "linux", windows))]
-            HostMsg::OpenWatch { id, path, prune } => {
-                crate::watch::open(self, id, platform.resolve_path(path), prune)
-            }
+            HostMsg::OpenWatch { id, path, prune } => match platform.resolve_path(path.clone()) {
+                Ok(resolved) => crate::watch::open(self, id, resolved, prune),
+                Err(e) => self.send_error(Some(id), format!("watch {path}: {e}")),
+            },
             // No recursive watch backend here, and `features::WATCH` is not
             // advertised: a host that opens one anyway is told why.
             #[cfg(not(any(target_os = "linux", windows)))]
@@ -681,11 +693,11 @@ pub trait Platform: Sync {
     /// file session outlives the call that opened it and resolves a path per
     /// request, not once.
     fn path_resolver(&self) -> PathResolver {
-        Arc::new(|path| path)
+        Arc::new(|path, _| Ok(path))
     }
-    /// Map one host-supplied guest path (tail, watch).
-    fn resolve_path(&self, path: String) -> String {
-        (self.path_resolver())(path)
+    /// Map one host-supplied guest path (tail, watch), which is followed.
+    fn resolve_path(&self, path: String) -> std::io::Result<String> {
+        (self.path_resolver())(path, Last::Follow)
     }
     fn open_eventlog(&self, mux: &Mux, id: u32, filter: Option<String>);
     fn set_clipboard(&self, mux: &Mux, text: String);

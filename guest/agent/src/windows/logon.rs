@@ -46,7 +46,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 
 use super::port::wide;
-use crate::logon::{Held, LogonCache, LogonKey, share_session_command};
+use crate::logon::{Held, LogonCache, share_session_command};
 use crate::spawn::{Adopted, Adopter, Identity};
 
 /// `TokenElevationType` values: the account has no split token, this token
@@ -109,15 +109,8 @@ impl Logons {
         &self,
         identity: &Identity,
     ) -> std::io::Result<Option<std::sync::Arc<Held<MintedLogon>>>> {
-        let Identity::Declared(logon) = identity else {
-            return Ok(None);
-        };
-        let held = self.cache.get_or_mint(
-            LogonKey::new(&logon.user, &logon.secret),
-            Instant::now(),
-            || mint(logon),
-        )?;
-        Ok(Some(held))
+        // Elevation is in the cache key: `mint` bakes it into the token.
+        self.cache.resolve(identity, Instant::now(), mint)
     }
 
     /// Drop logons nothing holds and nothing has taken lately. Run on a
@@ -139,7 +132,7 @@ pub fn start_sweeper(logons: std::sync::Arc<Logons>) {
 }
 
 /// Log `logon` on, load its profile, and hand it the lab's share
-/// credential. Roughly 97 ms, paid once per (account, secret).
+/// credential. Roughly 97 ms, paid once per (account, secret, elevation).
 fn mint(logon: &Logon) -> std::io::Result<MintedLogon> {
     enable_spawn_privileges()?;
 

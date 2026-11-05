@@ -133,12 +133,12 @@ hv-test: require-cargo hv-virgl-build hv-ipxe-build
 # Build the hypervisor's pinned iPXE option ROMs for non-guest tests
 [group('ci')]
 hv-ipxe-build: require-uv
-	uv run --no-project python hv/firmware/ipxe/build.py
+	uv run --no-project python guest/ipxe/build.py --profile hv
 
-# Run the guest-booting hypervisor gate locally, once per orchestrator batch
+# Run the guest-booting hypervisor gate locally, once per orchestrator batch (env: RUST_TEST_THREADS, default 2; VMLAB_HV_TEST_VM_LIMIT, default 4)
 [group('ci')]
 hv-gate: require-cargo hv-virgl-build hv-ipxe-build
-	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
+	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
 
 # Check guest pins, documentation, Python packaging and shell scripts without building drivers
 [group('ci')]
@@ -149,3 +149,7 @@ win3d-check: require-uv
 	uv run --no-project --with shellcheck-py==0.11.0.1 python guest/win3d/scripts/check-shell.py
 
 hv_virgl_key := `python3 build/hv.py cache-key | cut -d= -f2`
+
+# Test threads for hv-gate: the caller's RUST_TEST_THREADS, else 2. VMLAB_HV_TEST_VM_LIMIT
+# passes through to vmlab-hv-tests, which defaults it to 4.
+hv_gate_test_threads := env('RUST_TEST_THREADS', '2')

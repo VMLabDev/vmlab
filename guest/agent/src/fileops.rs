@@ -39,7 +39,7 @@ use vmlab_agent_proto::fileops::{
 use vmlab_agent_proto::watch::EntryKind;
 use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 
-use crate::mux::{Credit, Input, Mux, PathResolver};
+use crate::mux::{Credit, Input, Last, Mux, PathResolver};
 use crate::spawn::{Adopter, Identity, Spawner};
 
 /// How many requests are served at once. Enough that a slow operation does
@@ -210,8 +210,10 @@ impl Session {
         }
     }
 
-    fn path(&self, path: &str) -> String {
-        (self.resolve)(path.to_string())
+    /// The request's path as this session reaches it; `last` says whether
+    /// the operation goes through a symlink it names or acts on the link.
+    fn path(&self, path: &str, last: Last) -> Result<String, OpError> {
+        (self.resolve)(path.to_string(), last).context(path)
     }
 
     fn take_handle(&self, handle: u64) -> Option<Arc<Handle>> {
@@ -254,7 +256,7 @@ impl Session {
         let ok = |reply| Ok((reply, Vec::new()));
         match op {
             Op::Open { path, flags, mode } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Follow)?;
                 let file = open_file(&path, flags, mode).context(&path)?;
                 ok(Reply::Handle {
                     handle: self.insert_handle(Handle::File {
@@ -319,13 +321,13 @@ impl Session {
                 ok(Reply::Ok)
             }
             Op::Stat { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Follow)?;
                 ok(Reply::Attrs {
                     attrs: attrs_of(&std::fs::metadata(&path).context(&path)?),
                 })
             }
             Op::Lstat { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Keep)?;
                 ok(Reply::Attrs {
                     attrs: attrs_of(&std::fs::symlink_metadata(&path).context(&path)?),
                 })
@@ -334,7 +336,7 @@ impl Session {
             // handle: a mode-only setstat must not demand write access to
             // something the caller only owns.
             Op::Setstat { path, attrs } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Follow)?;
                 if let Some(mode) = attrs.mode {
                     set_mode(&path, mode).context(&path)?;
                 }
@@ -350,7 +352,7 @@ impl Session {
                 ok(Reply::Ok)
             }
             Op::OpenDir { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Follow)?;
                 let iter = std::fs::read_dir(&path).context(&path)?;
                 ok(Reply::Handle {
                     handle: self.insert_handle(Handle::Dir(Box::new(Mutex::new(DirCursor {
@@ -395,7 +397,7 @@ impl Session {
                 mode,
                 case_sensitive,
             } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Keep)?;
                 std::fs::create_dir(&path).context(&path)?;
                 if let Some(mode) = mode {
                     set_mode(&path, mode)?;
@@ -408,33 +410,34 @@ impl Session {
                 ok(Reply::Ok)
             }
             Op::Rmdir { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Keep)?;
                 std::fs::remove_dir(&path).context(&path)?;
                 ok(Reply::Ok)
             }
             Op::Remove { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Keep)?;
                 std::fs::remove_file(&path).context(&path)?;
                 ok(Reply::Ok)
             }
             Op::Rename { from, to } => {
-                let (from, to) = (self.path(&from), self.path(&to));
+                // A rename moves the link it names, not what the link names.
+                let (from, to) = (self.path(&from, Last::Keep)?, self.path(&to, Last::Keep)?);
                 std::fs::rename(&from, &to).context(&from)?;
                 ok(Reply::Ok)
             }
             Op::Realpath { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Follow)?;
                 ok(Reply::Name {
                     path: realpath(&path),
                 })
             }
             Op::Symlink { target, link, kind } => {
-                let link = self.path(&link);
+                let link = self.path(&link, Last::Keep)?;
                 symlink(&target, &link, kind).context(&link)?;
                 ok(Reply::Ok)
             }
             Op::Readlink { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Keep)?;
                 ok(Reply::Name {
                     path: std::fs::read_link(&path)
                         .context(&path)?
@@ -445,7 +448,7 @@ impl Session {
             // The guest's own digest of what is on its disk: the strongest
             // thing the whole-file transfer offered, kept when it retired.
             Op::Digest { path } => {
-                let path = self.path(&path);
+                let path = self.path(&path, Last::Follow)?;
                 let (sha256, len) = digest_file(&path).context(&path)?;
                 ok(Reply::Digest { sha256, len })
             }

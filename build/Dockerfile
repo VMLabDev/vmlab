@@ -71,9 +71,10 @@ RUN VMLAB_BIN_DIR=/usr/local/bin ./scripts/guest-toolchains.sh just
 COPY guest/build-mingw-msvcrt.sh guest/
 RUN ./scripts/guest-toolchains.sh msvcrt
 
-# Same native dependencies as the hypervisor release job. virglrenderer itself
-# is built at run time and cached outside target/ in the mounted checkout.
-COPY build/hv.py build/
+# Same native dependencies as the hypervisor release job, from
+# build/hv-pins.toml. virglrenderer itself is built at run time and cached
+# outside target/ in the mounted checkout.
+COPY build/hv.py build/hv-pins.toml build/
 RUN python3 build/hv.py native-deps-install && rm -rf /var/lib/apt/lists/*
 
 # Cross-compile the UMDF indirect display driver against hash-locked SDK/WDK packages.

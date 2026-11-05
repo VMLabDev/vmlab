@@ -44,7 +44,7 @@ use std::time::Instant;
 use vmlab_agent_proto::Logon;
 
 use super::os::{self, ThreadIds};
-use crate::logon::{Held, LogonCache, LogonKey};
+use crate::logon::{Held, LogonCache};
 use crate::spawn::{Adopted, Adopter, Identity};
 
 /// A resolved guest account — everything a login needs from the guest's own
@@ -506,15 +506,8 @@ impl Logins {
     /// The live session for `identity`, resolved if the cache has none.
     /// `Identity::Agent` has no session at all — that is §19.2's floor.
     pub fn resolve(&self, identity: &Identity) -> std::io::Result<Option<Arc<Held<Session>>>> {
-        let Identity::Declared(logon) = identity else {
-            return Ok(None);
-        };
-        let held = self.cache.get_or_mint(
-            LogonKey::new(&logon.user, &logon.secret),
-            Instant::now(),
-            || self.mint(logon),
-        )?;
-        Ok(Some(held))
+        self.cache
+            .resolve(identity, Instant::now(), |logon| self.mint(logon))
     }
 
     fn mint(&self, logon: &Logon) -> std::io::Result<Session> {
@@ -671,7 +664,7 @@ impl Adopted for AsSession {}
 pub fn adopter_as(account: Account, held: Option<Arc<Held<Session>>>) -> Adopter {
     Box::new(move || {
         Ok(Box::new(AsSession {
-            _ids: ThreadIds::assume(account.uid, account.gid)?,
+            _ids: ThreadIds::assume(account.uid, account.gid, &account.groups)?,
             _held: held.clone(),
         }) as Box<dyn Adopted>)
     })
@@ -999,10 +992,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let me = nix::unistd::Uid::effective().as_raw();
+        // The runtime directory is chowned to the account's gid, which an
+        // unprivileged test user may only give a group it is in: its own.
+        let my_gid = nix::unistd::Gid::effective().as_raw();
         std::fs::create_dir_all(root.join("etc")).unwrap();
         std::fs::write(
             root.join("etc/passwd"),
-            format!("dev:x:{me}:{me}:Dev:/home/dev:/bin/sh\n"),
+            format!("dev:x:{me}:{my_gid}:Dev:/home/dev:/bin/sh\n"),
         )
         .unwrap();
         std::fs::write(root.join("etc/group"), "docker:x:990:dev\n").unwrap();
@@ -1015,7 +1011,7 @@ mod tests {
         };
         let session = logins.log_in("dev", true).unwrap();
         assert_eq!(session.mechanism, Mechanism::Setuid);
-        assert_eq!(session.account.groups, vec![me, 990]);
+        assert_eq!(session.account.groups, vec![my_gid, 990]);
         assert_eq!(session.runtime_dir, Some(format!("/run/user/{me}")));
 
         // And an account the guest does not have never becomes a session.

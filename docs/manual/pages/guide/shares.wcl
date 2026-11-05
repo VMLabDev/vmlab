@@ -169,10 +169,14 @@ SRC
     Once a VM is ready, after its first-boot script if it carries one, the
     lab daemon runs the share plan's **mount steps** through the agent. The steps are a value computed per guest OS before
     anything runs, so what a Windows guest will be told to do can be read
-    without booting one. Each step is retried for five minutes, because a
-    freshly booted Windows guest cannot run `net use` for its first few. A
-    step still failing after that emits `share.unmountable` naming the share
-    and the last error, and that share's remaining steps are skipped.
+    without booting one. Each step is retried for five minutes from its
+    first attempt, because a freshly booted Windows guest cannot run `net
+    use` for its first few: after 1 second, then 2, 4 and 8, then every 10
+    seconds. An attempt that would start after the five minutes is not made,
+    and one that starts near the end gets only the time left, so a step gives
+    up at most one 30-second attempt past the five minutes. A step still
+    failing then emits `share.unmountable` naming the share, how long it was
+    tried and the last error, and that share's remaining steps are skipped.
   DOC
 
   p <<DOC

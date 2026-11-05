@@ -20,6 +20,8 @@ pub mod login;
 #[cfg(target_os = "linux")]
 pub mod container;
 #[cfg(target_os = "linux")]
+mod in_root;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub mod shepherd;
@@ -325,12 +327,13 @@ impl crate::mux::Platform for UnixPlatform {
     fn path_resolver(&self) -> crate::mux::PathResolver {
         #[cfg(target_os = "linux")]
         if let Some(ctx) = &self.container {
-            let rootfs = ctx.rootfs.clone();
-            return Arc::new(move |path: String| {
-                format!("{rootfs}/{}", path.trim_start_matches('/'))
+            // Inside the container's root, as a chrooted exec sees it.
+            let rootfs = PathBuf::from(&ctx.rootfs);
+            return Arc::new(move |path: String, last| {
+                in_root::resolve(&rootfs, &path, last).map(|p| p.to_string_lossy().into_owned())
             });
         }
-        Arc::new(|path| path)
+        Arc::new(|path, _| Ok(path))
     }
 
     fn open_eventlog(&self, mux: &Mux, id: u32, _filter: Option<String>) {
@@ -389,19 +392,19 @@ impl crate::mux::Platform for UnixPlatform {
             .resolve(identity)
             .map_err(|e| e.to_string())?;
         let owner = owner(&self.spawner.route(&held)).map(|a| (a.uid, a.gid));
-        let resolve = self.path_resolver();
+        let resolve = |path: String| {
+            (self.path_resolver())(path.clone(), crate::mux::Last::Follow)
+                .map(PathBuf::from)
+                .map_err(|e| format!("{path}: {e}"))
+        };
         let seen = format!("{}/{name}", self.app_paths.run);
-        let dir = PathBuf::from(resolve(seen.clone()));
-        linux::make_app_dir(
-            &PathBuf::from(resolve(self.app_paths.run.clone())),
-            &dir,
-            owner,
-        )
-        .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        let dir = resolve(seen.clone())?;
+        linux::make_app_dir(&resolve(self.app_paths.run.clone())?, &dir, owner)
+            .map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
         Ok(AppHome {
             dir,
             seen,
-            x11_unix: PathBuf::from(resolve(self.app_paths.x11_unix.clone())),
+            x11_unix: resolve(self.app_paths.x11_unix.clone())?,
             owner,
             hostname: uname().2,
         })
@@ -1303,11 +1306,45 @@ mod tests {
         use crate::mux::Platform as _;
         let p = container_platform(test_ctx("/rootfs", vec![]));
         assert_eq!(
-            p.resolve_path("/var/log/app.log".into()),
+            p.resolve_path("/var/log/app.log".into()).unwrap(),
             "/rootfs/var/log/app.log"
         );
         let host = new_platform();
-        assert_eq!(host.resolve_path("/etc/passwd".into()), "/etc/passwd");
+        assert_eq!(
+            host.resolve_path("/etc/passwd".into()).unwrap(),
+            "/etc/passwd"
+        );
+    }
+
+    /// Code review F15: what a file session, a tail or a watch is given
+    /// for a container path is the file a chrooted `exec cat` would read,
+    /// not the micro-VM's file of the same name.
+    #[test]
+    fn container_paths_resolve_links_and_dotdot_inside_the_rootfs() {
+        use crate::mux::{Last, Platform as _};
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::fs::create_dir_all(rootfs.join("srv")).unwrap();
+        std::fs::write(rootfs.join("etc/sentinel"), "inner").unwrap();
+        std::os::unix::fs::symlink("/etc/sentinel", rootfs.join("srv/link")).unwrap();
+        let p = container_platform(test_ctx(rootfs.to_str().unwrap(), vec![]));
+        let resolve = p.path_resolver();
+
+        let read = |path: &str| {
+            std::fs::read_to_string(resolve(path.into(), Last::Follow).unwrap()).unwrap()
+        };
+        assert_eq!(read("/srv/link"), "inner");
+        assert_eq!(read("/../../etc/sentinel"), "inner");
+        assert_eq!(
+            p.resolve_path("/srv/link".into()).unwrap(),
+            rootfs.join("etc/sentinel").to_str().unwrap()
+        );
+        // A remove or a readlink acts on the link the container named.
+        assert_eq!(
+            resolve("/srv/link".into(), Last::Keep).unwrap(),
+            rootfs.join("srv/link").to_str().unwrap()
+        );
     }
 
     /// A container's shared-app session lives inside its root filesystem,

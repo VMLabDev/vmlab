@@ -1046,6 +1046,19 @@ vocabulary! {
             name: String,
             root: std::path::PathBuf,
         },
+        /// A lab daemon is about to exit by itself (`destroy`, `shutdown`, a
+        /// termination signal), so its exit is expected rather than a crash.
+        #[one_way(
+            "daemon",
+            "Daemon-internal: a lab daemon says it is going before it goes, \
+             because a supervisor that adopted it is not its parent and \
+             cannot read its exit status. Nothing for a person to ask for."
+        )]
+        LabExiting = "lab.exiting" {
+            name: String,
+            /// The exiting daemon's pid, so a successor's entry is left alone.
+            pid: u32,
+        },
 
         /// Join a global segment (PRD §9.2), creating it on first use;
         /// answers with the trunk socket to bridge to.

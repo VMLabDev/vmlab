@@ -60,7 +60,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: .ci-cache/virglrenderer-*
-          key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py') }}
+          key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: hv-check
@@ -375,7 +375,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: .ci-cache/virglrenderer-*
-          key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py') }}
+          key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: hv-build
