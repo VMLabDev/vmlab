@@ -334,6 +334,54 @@ fn extended_descriptors_offload_ip_and_udp_checksums() {
     assert_eq!(nic.dev.link().take_sent(), vec![frame]);
 }
 
+/// Review F1: TSO offsets are the guest's. A context whose IP checksum
+/// field and TCP header start lie past every segment must still send the
+/// segments, untouched there, and never index or subtract past them.
+#[test]
+fn segmentation_with_offsets_past_the_segment_sends_without_panicking() {
+    let mut nic = Nic::new();
+    nic.tx_ring(8);
+    let header = 20usize;
+    let mut frame = MAC.to_vec();
+    frame.extend_from_slice(&[0x52, 0x54, 0, 0, 0, 1, 0x08, 0x00]);
+    frame.resize(header, 0xaa);
+    frame.extend((0..30).map(|i| i as u8));
+    nic.mem.write_slice(&frame, GuestAddress(BUFFERS)).unwrap();
+    // IPCSO 250, TUCSS 255, TUCSO 254, header 20 bytes, MSS 10.
+    nic.put_tx(
+        0,
+        context(
+            14,
+            250,
+            255,
+            254,
+            TUCMD_IP | TUCMD_TCP | TXD_TSE,
+            header as u8,
+            10,
+        ),
+    );
+    nic.put_tx(
+        1,
+        data(
+            BUFFERS,
+            frame.len() as u32,
+            TXD_EOP | TXD_RS | TXD_TSE,
+            POPTS_IXSM | POPTS_TXSM,
+        ),
+    );
+    nic.write(TDT, 2);
+    let sent = nic.dev.link().take_sent();
+    assert_eq!(sent.len(), 3);
+    for (i, segment) in sent.iter().enumerate() {
+        assert_eq!(&segment[..header], &frame[..header], "header untouched");
+        assert_eq!(
+            &segment[header..],
+            &frame[header + 10 * i..header + 10 * (i + 1)]
+        );
+    }
+    assert_eq!(nic.read(TDH), 2);
+}
+
 #[test]
 fn tcp_segmentation_splits_payload_and_fixes_headers() {
     let mut nic = Nic::new();

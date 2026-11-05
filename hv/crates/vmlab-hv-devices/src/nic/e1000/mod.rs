@@ -1221,7 +1221,9 @@ fn segment(data: &[u8], ctx: &TxContext, popts: u8) -> Vec<Vec<u8>> {
             let length = (segment.len() - ipcss - 40) as u16;
             segment[ipcss + 4..ipcss + 6].copy_from_slice(&length.to_be_bytes());
         }
-        let l4_length = (segment.len() - tucss) as u32;
+        // Every offset here is the guest's: one past the segment leaves the
+        // segment as it is rather than underflowing or indexing past it.
+        let l4_length = segment.len().saturating_sub(tucss) as u32;
         if tcp && tucss + 20 <= header {
             let sequence = u32::from_be_bytes(segment[tucss + 4..tucss + 8].try_into().unwrap())
                 .wrapping_add(offset);
@@ -1233,7 +1235,10 @@ fn segment(data: &[u8], ctx: &TxContext, popts: u8) -> Vec<Vec<u8>> {
             segment[tucss + 4..tucss + 6].copy_from_slice(&(l4_length as u16).to_be_bytes());
         }
         if popts & POPTS_IXSM != 0 && ipv4 {
-            segment[usize::from(ctx.ipcso)..usize::from(ctx.ipcso) + 2].fill(0);
+            let ipcso = usize::from(ctx.ipcso);
+            if let Some(field) = segment.get_mut(ipcso..ipcso + 2) {
+                field.fill(0);
+            }
             insert_checksum(
                 &mut segment,
                 ipcss,
