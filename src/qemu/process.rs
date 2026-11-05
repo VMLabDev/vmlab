@@ -366,59 +366,165 @@ pub async fn spawn_swtpm(
     .await
 }
 
-/// The argv fragments that identify a process as belonging to `lab`:
+/// What marks one lab's processes in an argv. Each prefix ends in `/`, so
+/// lab `foo` never matches `foobar`'s processes:
 ///
-/// - our QEMU/micro-VM `-name vmlab:<lab>/<machine>` marker (see cmdline.rs);
-///   the trailing `/` keeps `foo` from matching `foobar`'s VMs,
-/// - the lab's runtime directory, which appears in every helper's argv as a
-///   socket or state path (`swtpm --ctrl …/swtpm.sock`, `virtiofsd
-///   --socket-path …/virtiofs0.sock`) and in vmlab-hv's (`--machine
-///   …/machine.json --control …/control.sock`, PRD §22),
-/// - the lab's SMB state directory, which is how `smbd -s <…>/smb/smb.conf`
-///   is recognised — it carries no runtime-dir path (needs `root`).
-///
-/// All three are unique to one lab, so a match can't hit an unrelated process.
-fn lab_process_markers(lab: &str, root: Option<&Path>) -> Vec<String> {
-    let mut markers = vec![
-        format!("vmlab:{lab}/"),
-        format!("{}/", crate::paths::lab_runtime_dir(lab).display()),
-    ];
-    if let Some(root) = root {
-        let smb = crate::paths::lab_local_dir(root).join("smb");
-        markers.push(smb.display().to_string());
+/// - `name`: our QEMU/micro-VM `-name vmlab:<lab>/<machine>` value (see
+///   cmdline.rs),
+/// - `runtime`: the lab's runtime directory, where every helper's socket
+///   lives (`swtpm --ctrl type=unixio,path=…/swtpm.sock`, `virtiofsd
+///   --socket-path …/virtiofs0.sock`) and vmlab-hv's machine file and control
+///   socket (`--machine …/machine.json --control …/control.sock`, PRD §22),
+/// - `smb`: the lab's SMB state directory, which is how `smbd -s
+///   <…>/smb/smb.conf` is recognised. It carries no runtime-dir path, and it
+///   needs the lab's `root`.
+struct LabIdentity {
+    name: String,
+    runtime: String,
+    smb: Option<String>,
+}
+
+/// The programs vmlab starts for a lab, known by the basename of `argv[0]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabExecutable {
+    Qemu,
+    VmlabHv,
+    Swtpm,
+    Virtiofsd,
+    Smbd,
+}
+
+impl LabExecutable {
+    /// `qemu-system-<arch>` (also a host GPU's `qemu_binary`, which keeps
+    /// that name) and `qemu-kvm`, `vmlab-hv`, `swtpm`, `virtiofsd`, `smbd`.
+    fn of(argv0: &[u8]) -> Option<Self> {
+        let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
+        match base {
+            b"vmlab-hv" => Some(Self::VmlabHv),
+            b"swtpm" => Some(Self::Swtpm),
+            b"virtiofsd" => Some(Self::Virtiofsd),
+            b"smbd" => Some(Self::Smbd),
+            b"qemu-kvm" => Some(Self::Qemu),
+            b if b.starts_with(b"qemu-system-") => Some(Self::Qemu),
+            _ => None,
+        }
     }
-    markers
+}
+
+impl LabIdentity {
+    fn new(lab: &str, root: Option<&Path>) -> Self {
+        Self {
+            name: format!("vmlab:{lab}/"),
+            runtime: format!("{}/", crate::paths::lab_runtime_dir(lab).display()),
+            smb: root.map(|root| {
+                format!(
+                    "{}/",
+                    crate::paths::lab_local_dir(root).join("smb").display()
+                )
+            }),
+        }
+    }
+
+    /// Whether a raw `/proc/<pid>/cmdline` (NUL-separated argv) is a process
+    /// vmlab starts for this lab: a known executable carrying the lab's
+    /// marker in the option vmlab passes it in. A path that merely appears in
+    /// an argument (an editor, `tail`, `grep` on a file under the lab's
+    /// directories) does not match.
+    fn started(&self, cmdline: &[u8]) -> bool {
+        let argv = split_cmdline(cmdline);
+        let Some((argv0, args)) = argv.split_first() else {
+            return false;
+        };
+        let under = |prefix: &str, value: &[u8]| value.starts_with(prefix.as_bytes());
+        match LabExecutable::of(argv0) {
+            Some(LabExecutable::Qemu) => option_values(args, "-name")
+                .into_iter()
+                .any(|v| under(&self.name, v)),
+            Some(LabExecutable::VmlabHv) => option_values(args, "--machine")
+                .into_iter()
+                .chain(option_values(args, "--control"))
+                .any(|v| under(&self.runtime, v)),
+            Some(LabExecutable::Swtpm) => {
+                args.first() == Some(&&b"socket"[..])
+                    && option_values(args, "--ctrl").into_iter().any(|v| {
+                        v.split(|b| *b == b',').any(|field| {
+                            field
+                                .strip_prefix(b"path=")
+                                .is_some_and(|path| under(&self.runtime, path))
+                        })
+                    })
+            }
+            Some(LabExecutable::Virtiofsd) => option_values(args, "--socket-path")
+                .into_iter()
+                .any(|v| under(&self.runtime, v)),
+            Some(LabExecutable::Smbd) => self.smb.as_deref().is_some_and(|smb| {
+                option_values(args, "-s")
+                    .into_iter()
+                    .chain(option_values(args, "--configfile"))
+                    .any(|v| under(smb, v))
+            }),
+            None => false,
+        }
+    }
+}
+
+/// The argv of a raw `/proc/<pid>/cmdline`, without the empty element after
+/// the final NUL.
+fn split_cmdline(cmdline: &[u8]) -> Vec<&[u8]> {
+    let cmdline = cmdline.strip_suffix(b"\0").unwrap_or(cmdline);
+    if cmdline.is_empty() {
+        return Vec::new();
+    }
+    cmdline.split(|b| *b == 0).collect()
+}
+
+/// Every value `args` gives `option`, as `option value` or `option=value`.
+fn option_values<'a>(args: &[&'a [u8]], option: &str) -> Vec<&'a [u8]> {
+    let option = option.as_bytes();
+    let mut values = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        if *arg == option {
+            if let Some(value) = args.get(i + 1) {
+                values.push(*value);
+            }
+        } else if let Some(value) = arg
+            .strip_prefix(option)
+            .and_then(|rest| rest.strip_prefix(b"="))
+        {
+            values.push(value);
+        }
+    }
+    values
 }
 
 /// Whether a raw `/proc/<pid>/cmdline` is one [`kill_lab_orphans`] would
 /// reap for `lab` — for the tests of argvs composed elsewhere (vmlab-hv's).
 #[cfg(test)]
 pub(crate) fn cmdline_belongs_to(cmdline: &[u8], lab: &str) -> bool {
-    cmdline_matches(cmdline, &lab_process_markers(lab, None))
+    LabIdentity::new(lab, None).started(cmdline)
 }
 
-/// Does this raw `/proc/<pid>/cmdline` (NUL-separated argv) belong to `lab`?
-fn cmdline_matches(cmdline: &[u8], markers: &[String]) -> bool {
+/// Does this raw `/proc/<pid>/cmdline` carry one of `markers` anywhere in any
+/// argument? Broad on purpose, and only for refusing (see [`lab_processes`]):
+/// it also matches an editor or `tail` holding a file under a marker path.
+fn cmdline_mentions(cmdline: &[u8], markers: &[String]) -> bool {
     cmdline.split(|b| *b == 0).any(|arg| {
-        markers.iter().any(|m| {
-            arg.starts_with(m.as_bytes())
-                // Helpers carry the path mid-argument (`dir=…`, `type=unixio,path=…`).
-                || arg
-                    .windows(m.len())
-                    .any(|w| w == m.as_bytes())
-        })
+        markers
+            .iter()
+            .any(|m| arg.windows(m.len()).any(|w| w == m.as_bytes()))
     })
 }
 
-/// SIGKILL every process belonging to `lab` — QEMU or vmlab-hv **and** their
-/// helpers (swtpm, virtiofsd, smbd). Returns how many were signalled.
+/// SIGKILL every process vmlab started for `lab` — QEMU or vmlab-hv **and**
+/// their helpers (swtpm, virtiofsd, smbd). Returns how many were signalled.
 ///
 /// Used to reap what a lab daemon orphaned by dying without stopping anything:
-/// there is no `Proc` handle left, so we scan `/proc` for the lab's markers.
-/// Pass the lab's `root` when known so the lab's `smbd` is covered too — an
-/// orphaned smbd holds its port against the next `up`.
+/// there is no `Proc` handle left, so we scan `/proc` for argvs
+/// `LabIdentity::started` recognises. Pass the lab's `root` when known so
+/// the lab's `smbd` is covered too — an orphaned smbd holds its port against
+/// the next `up`.
 pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
-    let pids = matching_pids(&lab_process_markers(lab, root));
+    let pids = lab_orphans(&process_table(), &LabIdentity::new(lab, root));
     for pid in &pids {
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(*pid),
@@ -428,26 +534,44 @@ pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
     pids.len()
 }
 
-/// Every process still running for `lab` — QEMU and its helpers, found by
-/// the same markers [`kill_lab_orphans`] uses — or holding a path under its
-/// working data `lab_local` in its argv.
+/// The pids in `table` that vmlab started for the lab `identity` names.
+fn lab_orphans(table: &[(i32, Vec<u8>)], identity: &LabIdentity) -> Vec<i32> {
+    table
+        .iter()
+        .filter(|(_, cmdline)| identity.started(cmdline))
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Every process still running for `lab` — QEMU and its helpers — or with
+/// the lab's `-name` marker, runtime directory or working data `lab_local`
+/// anywhere in its argv.
 ///
 /// For `vmlab lab move`, which must not move a disk out from under a process
 /// that has it open, and has no daemon left to ask once the name is released.
+/// It only refuses, so it matches broadly: an editor on a lab file counts.
 pub fn lab_processes(lab: &str, lab_local: &Path) -> Vec<i32> {
-    let mut markers = lab_process_markers(lab, None);
-    markers.push(format!("{}/", lab_local.display()));
-    matching_pids(&markers)
+    let identity = LabIdentity::new(lab, None);
+    let markers = [
+        identity.name.clone(),
+        identity.runtime.clone(),
+        format!("{}/", lab_local.display()),
+    ];
+    process_table()
+        .into_iter()
+        .filter(|(_, cmdline)| cmdline_mentions(cmdline, &markers))
+        .map(|(pid, _)| pid)
+        .collect()
 }
 
-/// The pids, other than this process, whose `/proc/<pid>/cmdline` carries one
-/// of `markers`.
-fn matching_pids(markers: &[String]) -> Vec<i32> {
+/// `(pid, raw cmdline)` of every process in `/proc` other than this one —
+/// our own argv can name the lab (`vmlab __labd --lab …`).
+fn process_table() -> Vec<(i32, Vec<u8>)> {
     let us = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
-    let mut pids = Vec::new();
+    let mut table = Vec::new();
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -457,16 +581,14 @@ fn matching_pids(markers: &[String]) -> Vec<i32> {
             continue;
         };
         if pid as u32 == us {
-            continue; // our own argv can name the lab (`vmlab __labd --lab …`)
+            continue;
         }
         let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
             continue;
         };
-        if cmdline_matches(&cmdline, markers) {
-            pids.push(pid);
-        }
+        table.push((pid, cmdline));
     }
-    pids
+    table
 }
 
 #[cfg(test)]
@@ -662,86 +784,161 @@ mod tests {
 
     #[test]
     fn lab_qemu_cmdline_matching() {
-        let markers = lab_process_markers("mylab", None);
+        let lab = LabIdentity::new("mylab", None);
         // Real-ish argv: NUL-separated, with the -name marker.
         let cmd = b"qemu-system-x86_64\0-name\0vmlab:mylab/web\0-machine\0q35\0";
-        assert!(cmdline_matches(cmd, &markers));
+        assert!(lab.started(cmd));
+        // A host GPU's `qemu_binary` is an absolute path to the same name.
+        assert!(lab.started(b"/opt/qemu-vmlab/bin/qemu-system-x86_64\0-name\0vmlab:mylab/web\0"));
         // A different lab must not match.
-        assert!(!cmdline_matches(cmd, &lab_process_markers("other", None)));
+        assert!(!LabIdentity::new("other", None).started(cmd));
         // Prefix collision: `my` must not match `mylab`'s VMs.
-        assert!(!cmdline_matches(cmd, &lab_process_markers("my", None)));
+        assert!(!LabIdentity::new("my", None).started(cmd));
         // No marker at all.
-        assert!(!cmdline_matches(b"sleep\x0030\x00", &markers));
+        assert!(!lab.started(b"sleep\x0030\x00"));
+        // The marker outside `-name` is not ours.
+        assert!(!lab.started(b"qemu-system-x86_64\0-name\0other\0-L\0vmlab:mylab/web\0"));
+        assert!(!lab.started(b""));
     }
 
-    /// The helpers a crashed daemon orphans carry the lab's paths mid-argument,
-    /// not as an argv prefix — that is how they are recognised.
+    /// The argvs vmlab composes for one lab's machines, with the lab's root.
+    fn lab_argvs(lab: &str, root: &Path) -> Vec<(&'static str, String)> {
+        let run = crate::paths::lab_runtime_dir(lab);
+        let smb = crate::paths::lab_local_dir(root).join("smb");
+        vec![
+            (
+                "qemu",
+                format!("qemu-system-x86_64\0-name\0vmlab:{lab}/web\0-machine\0q35\0"),
+            ),
+            (
+                "vmlab-hv",
+                format!(
+                    "/opt/vmlab-hv/bin/vmlab-hv\0--machine\0{0}/vms/web/machine.json\0\
+                     --control\0{0}/vms/web/control.sock\0--paused\0",
+                    run.display()
+                ),
+            ),
+            (
+                "swtpm",
+                format!(
+                    "swtpm\0socket\0--tpm2\0--tpmstate\0dir=/labs/state/tpm\0\
+                     --ctrl\0type=unixio,path={}/vms/web/swtpm.sock\0--terminate\0",
+                    run.display()
+                ),
+            ),
+            (
+                "virtiofsd",
+                format!(
+                    "/usr/libexec/virtiofsd\0--socket-path\0{}/vms/web/virtiofs0.sock\0\
+                     --shared-dir\0/srv\0--cache\0auto\0",
+                    run.display()
+                ),
+            ),
+            (
+                "smbd",
+                format!(
+                    "smbd\0-F\0--no-process-group\0-s\0{0}/smb.conf\0-l\0{0}\0",
+                    smb.display()
+                ),
+            ),
+        ]
+    }
+
+    /// QEMU, vmlab-hv and the helpers a crashed daemon orphans are known by
+    /// their executable and the option vmlab passes the lab's path in.
     #[test]
     fn helper_cmdline_matching() {
-        let root = std::path::Path::new("/labs/mylab");
-        let markers = lab_process_markers("mylab", Some(root));
+        let root = Path::new("/labs/mylab");
+        let lab = LabIdentity::new("mylab", Some(root));
+        for (what, argv) in lab_argvs("mylab", root) {
+            assert!(lab.started(argv.as_bytes()), "{what}: {argv:?}");
+        }
+
+        // Another lab's processes are untouched.
+        let other = LabIdentity::new("otherlab", Some(Path::new("/labs/otherlab")));
+        for (what, argv) in lab_argvs("mylab", root) {
+            assert!(!other.started(argv.as_bytes()), "{what}: {argv:?}");
+        }
+
+        // Without the lab's root its smbd is not known, the rest still are.
+        let rootless = LabIdentity::new("mylab", None);
+        for (what, argv) in lab_argvs("mylab", root) {
+            assert_eq!(rootless.started(argv.as_bytes()), what != "smbd", "{what}");
+        }
+
+        // `--option=value` is the same option.
         let run = crate::paths::lab_runtime_dir("mylab");
-        let smb = crate::paths::lab_local_dir(root).join("smb");
+        let vfsd = format!("virtiofsd\0--socket-path={}/vms/web/v.sock\0", run.display());
+        assert!(lab.started(vfsd.as_bytes()));
+    }
 
-        let swtpm = format!(
-            "swtpm\0socket\0--tpm2\0--ctrl\0type=unixio,path={}/vms/web/swtpm.sock\0",
-            run.display()
-        );
-        assert!(cmdline_matches(swtpm.as_bytes(), &markers), "swtpm");
-
-        let vfsd = format!(
-            "virtiofsd\0--socket-path\0{}/vms/web/virtiofs0.sock\0--shared-dir\0/srv\0",
-            run.display()
-        );
-        assert!(cmdline_matches(vfsd.as_bytes(), &markers), "virtiofsd");
-
-        let smbd = format!("smbd\0-F\0-s\0{}/smb.conf\0", smb.display());
-        assert!(cmdline_matches(smbd.as_bytes(), &markers), "smbd");
-
-        // Another lab's helpers are untouched.
-        let other = lab_process_markers("otherlab", Some(std::path::Path::new("/labs/otherlab")));
-        for argv in [&swtpm, &vfsd, &smbd] {
-            assert!(!cmdline_matches(argv.as_bytes(), &other), "{argv}");
+    /// F7: a process that only mentions a lab path in an argument — an
+    /// editor, a pager, `tail`, `grep` — is not one vmlab started.
+    #[test]
+    fn processes_that_only_mention_a_lab_path_are_not_matched() {
+        let root = Path::new("/labs/mylab");
+        let lab = LabIdentity::new("mylab", Some(root));
+        let run = crate::paths::lab_runtime_dir("mylab").display().to_string();
+        let smb = crate::paths::lab_local_dir(root)
+            .join("smb")
+            .display()
+            .to_string();
+        let argvs = [
+            format!("vim\0{smb}/smb.conf\0"),
+            format!("/usr/bin/nvim\0{run}/vms/web/machine.json\0"),
+            format!("tail\0-F\0{run}/vms/web/qemu.log\0"),
+            format!("less\0{smb}/log.smbd\0"),
+            format!("grep\0-r\0vmlab:mylab/\0{run}/\0"),
+            format!("grep\0-name\0vmlab:mylab/web\0"),
+            format!("find\0{run}\0-name\0vmlab:mylab/web\0"),
+            format!("bash\0-c\0cat {run}/vms/web/swtpm.sock\0"),
+            format!("socat\0-\0UNIX-CONNECT:{run}/vms/web/control.sock\0"),
+            // Our helper names with the path in an option vmlab never uses.
+            format!("swtpm\0socket\0--tpmstate\0dir={run}/tpm\0"),
+            format!("swtpm\0ioctl\0--unix\0{run}/vms/web/swtpm.sock\0"),
+            format!("virtiofsd\0--shared-dir\0{run}/share\0"),
+            format!("smbd\0-l\0{smb}/\0"),
+            format!("vmlab-hv\0--probe\0{run}/\0"),
+            format!("qemu-img\0info\0{run}/vms/web/disk.qcow2\0"),
+        ];
+        for argv in &argvs {
+            assert!(!lab.started(argv.as_bytes()), "{argv:?}");
         }
     }
 
+    /// The reap picks its pids from a process table, so the selection is
+    /// tested on a fake one; no test signals a real process.
     #[test]
-    fn kill_lab_orphans_reaps_qemu_and_helpers() {
-        use std::os::unix::process::CommandExt;
-        // Two real processes: one carrying the QEMU `-name` marker as argv[0],
-        // one carrying the lab's runtime path the way a helper does (the binary
-        // is `sleep` either way, so both just block).
-        let lab = "orphan-reap-test";
-        let run = crate::paths::lab_runtime_dir(lab);
-        // Both block on an unread stdin pipe the test holds — no nested child,
-        // so a reaped process leaves nothing behind. `; :` keeps the shell from
-        // exec'ing the builtin away and losing our argv markers.
-        let blocker = |arg0: String, marker: String| {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg("read line; :")
-                .arg(marker)
-                .arg0(arg0)
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap()
-        };
-        let mut qemu = blocker(format!("vmlab:{lab}/vm0"), "-name".into());
-        let mut helper = blocker(
-            "swtpm".into(),
-            format!("type=unixio,path={}/vms/vm0/swtpm.sock", run.display()),
+    fn lab_orphans_picks_only_the_labs_vmlab_processes() {
+        let root = Path::new("/labs/mylab");
+        let run = crate::paths::lab_runtime_dir("mylab").display().to_string();
+        let mut table: Vec<(i32, Vec<u8>)> = lab_argvs("mylab", root)
+            .into_iter()
+            .zip(100..)
+            .map(|((_, argv), pid)| (pid, argv.into_bytes()))
+            .collect();
+        table.extend(
+            lab_argvs("otherlab", Path::new("/labs/otherlab"))
+                .into_iter()
+                .zip(200..)
+                .map(|((_, argv), pid)| (pid, argv.into_bytes())),
         );
-        // Let /proc settle, then reap both by lab name.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let killed = kill_lab_orphans(lab, None);
-        let (qemu_status, helper_status) = (qemu.wait().unwrap(), helper.wait().unwrap());
-        assert_eq!(killed, 2, "expected the VM and its helper reaped");
-        assert!(!qemu_status.success(), "qemu should have been signalled");
-        assert!(
-            !helper_status.success(),
-            "helper should have been signalled"
-        );
-        // A different lab name reaps nothing.
-        assert_eq!(kill_lab_orphans("some-other-lab", None), 0);
+        table.push((300, format!("vim\0{run}/vms/web/machine.json\0").into_bytes()));
+        table.push((301, format!("tail\0-f\0{run}/vms/web/qemu.log\0").into_bytes()));
+        table.push((302, Vec::new())); // a kernel thread's empty cmdline
+
+        let picked = lab_orphans(&table, &LabIdentity::new("mylab", Some(root)));
+        assert_eq!(picked, vec![100, 101, 102, 103, 104]);
+        assert!(lab_orphans(&table, &LabIdentity::new("some-other-lab", None)).is_empty());
+    }
+
+    /// `lab move` only refuses, so it still counts a process that mentions
+    /// the lab's paths.
+    #[test]
+    fn lab_move_counts_any_mention() {
+        let markers = ["/labs/mylab/.vmlab/".to_string()];
+        assert!(cmdline_mentions(b"vim\0/labs/mylab/.vmlab/disk.qcow2\0", &markers));
+        assert!(cmdline_mentions(b"qemu\0-drive\0file=/labs/mylab/.vmlab/d\0", &markers));
+        assert!(!cmdline_mentions(b"vim\0/labs/other/.vmlab/d\0", &markers));
     }
 }
