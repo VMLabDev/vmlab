@@ -1043,16 +1043,18 @@ async fn udp_bind_guest_flow_fails_when_the_range_is_exhausted_and_reuses_a_free
     first.send(b"one".to_vec()).await.unwrap();
     let first_port = recv_udp(&mut rx).await.src.1;
 
-    // On a blocking thread with a deadline, so a spin fails the test
-    // instead of hanging it.
-    let bind = {
+    // On a detached thread with a deadline, so a spin fails the test
+    // instead of hanging it (the runtime would wait for a blocking task).
+    let (done, refused) = std::sync::mpsc::channel();
+    {
         let engine = engine.clone();
-        tokio::task::spawn_blocking(move || engine.udp_bind_guest_flow(GUEST_IP, 9999).is_err())
-    };
-    let refused = timeout(WAIT, bind)
-        .await
-        .expect("allocation must not spin on an exhausted range")
-        .unwrap();
+        std::thread::spawn(move || {
+            let _ = done.send(engine.udp_bind_guest_flow(GUEST_IP, 9999).is_err());
+        });
+    }
+    let refused = refused
+        .recv_timeout(WAIT)
+        .expect("allocation must not spin on an exhausted range");
     assert!(refused, "a third flow on a two-port range must be refused");
 
     // A different guest port has the whole range to itself.
