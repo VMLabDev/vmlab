@@ -4061,7 +4061,11 @@ mod tests {
             report: Arc<MountReport>,
         ) {
             let Some(mount) = self.mount else { return };
-            report.planned(["data"], &[], crate::smb::steps::RetryPolicy::MOUNT.deadline);
+            report.planned(
+                ["data"],
+                &[],
+                crate::smb::steps::RetryPolicy::MOUNT.deadline,
+            );
             if self.wait_ready(self.ready_timeout).await.is_err() {
                 report.abandoned("the guest never became ready");
                 return;
@@ -5581,13 +5585,22 @@ lab "t" {
     #[tokio::test(start_paused = true)]
     async fn up_reports_unmountable_and_still_retrying_shares_within_its_hold() {
         let gave_up = Arc::new(MountReport::default());
-        gave_up.planned(["data"], &[], crate::smb::steps::RetryPolicy::MOUNT.deadline);
+        gave_up.planned(
+            ["data"],
+            &[],
+            crate::smb::steps::RetryPolicy::MOUNT.deadline,
+        );
         gave_up.ready();
         gave_up.gave_up(Some("data"), "`mount` refused: exited 64: not empty");
         let retrying = Arc::new(MountReport::default());
         retrying.planned(["src"], &[], crate::smb::steps::RetryPolicy::MOUNT.deadline);
         retrying.ready();
-        retrying.attempt_failed(Some("src"), 0, Duration::from_secs(1), "exited 1: no such device");
+        retrying.attempt_failed(
+            Some("src"),
+            0,
+            Duration::from_secs(1),
+            "exited 1: no such device",
+        );
         let mounts = vec![
             ShareMounts {
                 machine: "win".into(),

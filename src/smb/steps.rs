@@ -452,7 +452,13 @@ mod tests {
         let delays: Vec<u64> = (0..7).map(|a| policy.delay(a).as_secs()).collect();
         assert_eq!(delays, [1, 2, 4, 8, 10, 10, 10]);
         assert_eq!(policy.delay(u32::MAX), policy.max_delay, "no overflow");
-        assert_eq!(policy.exec_timeout(Duration::from_secs(300)), Duration::from_secs(30));
-        assert_eq!(policy.exec_timeout(Duration::from_secs(4)), Duration::from_secs(4));
+        assert_eq!(
+            policy.exec_timeout(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            policy.exec_timeout(Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
     }
 }

@@ -183,7 +183,8 @@ mod tests {
     use crate::smb::{MountStep, OsHint};
     use std::sync::Mutex;
 
-    const ERROR_67: &str = "System error 67 has occurred.\r\n\r\nThe network name cannot be found.\r\n";
+    const ERROR_67: &str =
+        "System error 67 has occurred.\r\n\r\nThe network name cannot be found.\r\n";
 
     fn net_use(share: &str, refused_exit: Option<i32>) -> MountStep {
         MountStep {
@@ -249,7 +250,10 @@ mod tests {
         let took = boot.elapsed();
         assert!(events.lock().unwrap().is_empty(), "{events:?}");
         assert!(report.lines("win", true).is_empty(), "the share is mounted");
-        assert!(took >= warm_up && took < warm_up + Duration::from_secs(11), "{took:?}");
+        assert!(
+            took >= warm_up && took < warm_up + Duration::from_secs(11),
+            "{took:?}"
+        );
         // The curve: 1, 2, 4 and 8 s, then every 10 s.
         assert!(*calls.lock().unwrap() > 20, "{calls:?}");
     }
@@ -280,7 +284,10 @@ mod tests {
         let took = started.elapsed();
         let policy = RetryPolicy::MOUNT;
         assert!(took >= policy.deadline - policy.max_delay, "{took:?}");
-        assert!(took <= policy.deadline + RetryPolicy::EXEC_TIMEOUT, "{took:?}");
+        assert!(
+            took <= policy.deadline + RetryPolicy::EXEC_TIMEOUT,
+            "{took:?}"
+        );
         let timeouts = timeouts.lock().unwrap();
         assert_eq!(timeouts[0], RetryPolicy::EXEC_TIMEOUT);
         assert!(timeouts.iter().all(|t| *t <= RetryPolicy::EXEC_TIMEOUT));
@@ -346,7 +353,10 @@ mod tests {
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         let reason = events[0]["reason"].as_str().unwrap();
-        assert_eq!(reason, "`net` refused: exited 85: a directory is in the way");
+        assert_eq!(
+            reason,
+            "`net` refused: exited 85: a directory is in the way"
+        );
     }
 
     /// Dropping the loop stops it: no attempt runs after the drop.
