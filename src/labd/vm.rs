@@ -2458,7 +2458,7 @@ impl super::machine::Machine for VmInstance {
         report.planned(
             self.cfg.shares.iter().map(|s| s.name.as_str()),
             &[],
-            crate::smb::steps::RetryPolicy::MOUNT.attempts,
+            crate::smb::steps::RetryPolicy::MOUNT.deadline,
         );
         if self.wait_ready(self.ready_timeout()).await.is_err() {
             report.abandoned("the guest never became ready");
@@ -2471,7 +2471,7 @@ impl super::machine::Machine for VmInstance {
         report.planned(
             plan.steps.iter().filter_map(|s| s.share.as_deref()),
             &plan.unsupported,
-            plan.retry.attempts,
+            plan.retry.deadline,
         );
         // A share the guest cannot mount is the author's to fix, so it goes
         // on the event feed the console watches, not only into the log.
@@ -2491,104 +2491,23 @@ impl super::machine::Machine for VmInstance {
             report.abandoned("no guest agent to mount it through");
             return;
         };
-        // A share whose step gave up is not retried again by its next step:
-        // a mount after a failed `mkdir` only fails the same way, five
-        // minutes later, and holds every share behind it up for as long.
-        let mut given_up: Vec<&str> = Vec::new();
-        for (i, step) in plan.steps.iter().enumerate() {
-            if step.share.as_deref().is_some_and(|s| given_up.contains(&s)) {
-                continue;
-            }
-            let mut argv = vec![step.command.clone()];
-            argv.extend(step.args.iter().cloned());
-            let mut last: Option<String> = None;
-            let mut refused = false;
-            for attempt in 0..plan.retry.attempts {
-                if attempt > 0 {
-                    tokio::time::sleep(plan.retry.delay).await;
-                }
-                let started = std::time::Instant::now();
-                match agent
-                    .exec(
-                        argv.clone(),
-                        vec![],
-                        None,
-                        None,
-                        Duration::from_secs(30),
-                        None,
-                    )
+        let agent = &agent;
+        super::mount_retry::run_plan(
+            vm_name,
+            &plan,
+            &report,
+            |argv, timeout| async move {
+                agent
+                    .exec(argv, vec![], None, None, timeout, None)
                     .await
-                {
-                    Ok(r) if r.exit_code == 0 => {
-                        tracing::info!(
-                            "{vm_name}: mount step `{}` ok (attempt {attempt}, {:?})",
-                            step.command,
-                            started.elapsed()
-                        );
-                        last = None;
-                        break;
-                    }
-                    Ok(r) => {
-                        let err = format!(
-                            "exited {}: {}",
-                            r.exit_code,
-                            String::from_utf8_lossy(&r.stderr)
-                        );
-                        tracing::debug!(
-                            "{vm_name}: mount attempt {attempt} ({:?}): {err}",
-                            started.elapsed()
-                        );
-                        report.attempt_failed(step.share.as_deref(), attempt, &err);
-                        last = Some(err);
-                        // The guest said no in a way another attempt will
-                        // not change; waiting five minutes only delays
-                        // saying so.
-                        if step.refused_exit == Some(r.exit_code) {
-                            refused = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "{vm_name}: mount attempt {attempt} ({:?}): {e}",
-                            started.elapsed()
-                        );
-                        report.attempt_failed(step.share.as_deref(), attempt, &e.to_string());
-                        last = Some(e.to_string());
-                    }
-                }
-            }
-            if let Some(err) = last {
-                tracing::warn!("{vm_name}: mount step `{}` failed: {err}", step.command);
-                // A share that never appears is the author's to see, on the
-                // feed, not only in the daemon's log.
-                let reason = if refused {
-                    format!("`{}` refused: {}", step.command, err.trim())
-                } else {
-                    format!(
-                        "`{}` still failing after {} attempts: {}",
-                        step.command,
-                        plan.retry.attempts,
-                        err.trim()
-                    )
-                };
-                lab.events().emit(
-                    "share.unmountable",
-                    serde_json::json!({"vm": vm_name, "share": step.share, "reason": reason}),
-                );
-                report.gave_up(step.share.as_deref(), &reason);
-                if let Some(share) = step.share.as_deref() {
-                    given_up.push(share);
-                }
-            } else if let Some(share) = step.share.as_deref()
-                && plan.steps[i + 1..]
-                    .iter()
-                    .all(|s| s.share.as_deref() != Some(share))
-            {
-                // The share's last step: it is mounted.
-                report.mounted(share);
-            }
-        }
+                    .map(|r| super::mount_retry::Exited {
+                        exit_code: r.exit_code,
+                        stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+                    })
+            },
+            |payload| lab.events().emit("share.unmountable", payload),
+        )
+        .await;
     }
 
     /// QEMU's serial file, which is where a VM's guest console output lands.

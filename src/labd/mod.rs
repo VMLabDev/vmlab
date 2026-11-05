@@ -27,6 +27,7 @@ mod lifecycle_tests;
 pub mod machine;
 mod machine_build;
 pub mod mount_report;
+pub mod mount_retry;
 pub mod netservices;
 pub mod network;
 pub mod one_shot;

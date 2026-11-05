@@ -72,7 +72,8 @@ page cmd_up {
 
   p <<DOC
     Shared folders are mounted once each VM is ready, after its first-boot
-    script, and a mount step may retry for five minutes. A VM's provisions
+    script, and a mount step may retry for five minutes, quickly at first
+    and then every 10 seconds. A VM's provisions
     and playbooks wait for its mounts to finish, and `up` prints its mount
     report before the first of them runs. So that a share that cannot mount
     is not left for you to find by using it, `up` also waits for the mounts
@@ -87,13 +88,15 @@ page cmd_up {
   code text {
     source = <<TXT
 WARNING: "lin01": share "data" will not mount: `mount` refused: exited 64: ...
-WARNING: "lin01": share "blocked" not mounted yet, still retrying (attempt 1 of 30): exited 1: mkdir: can't create directory '/etc/hostname/': Not a directory
+WARNING: "lin01": share "blocked" not mounted yet, still retrying (attempt 7, 25s of up to 5 min): exited 1: mkdir: can't create directory '/etc/hostname/': Not a directory
 TXT
   }
 
   p <<DOC
-    A share still retrying when the wait runs out keeps retrying, and its
-    `share.unmountable` event reaches [vmlab logs](cmd_logs) if it gives up.
+    A share still retrying when the wait runs out keeps retrying, for up to
+    five minutes from its first attempt, and its `share.unmountable` event
+    reaches [vmlab logs](cmd_logs) if it gives up, saying how long it was
+    tried.
     On Windows, a share whose `net use` still fails with system error 67 gets
     a plain line instead of a warning: the SMB client takes a few minutes
     after boot to start, so the share is expected to mount moments later.
