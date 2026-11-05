@@ -7,6 +7,8 @@
 //! blobs/sha256/<hex>                      compressed layer blobs (transient:
 //!                                         deleted after a successful flatten,
 //!                                         kept on failure so retries resume)
+//! .staging-<rand>/layer-<n>               one pull's hard link to each blob
+//!                                         it flattens, removed after it
 //! images/sha256/<manifest-hex>/           one flattened image per manifest
 //!     manifest.json                       the raw platform manifest
 //!     config.json                         the raw image config blob
@@ -18,7 +20,14 @@
 //! The mutation discipline mirrors the template store
 //! ([`crate::template::store`]): reads are lock-free, every mutation holds
 //! the flock, and content only ever enters the cache by an atomic
-//! `rename(2)` of a fully staged file or directory.
+//! `rename(2)` of a fully staged file or directory, or a `link(2)` of a
+//! fully staged blob.
+//!
+//! A pull never reads a blob through its `blobs/` name: it reads its own
+//! hard link in its staging dir ([`ImageCache::hold_blob`],
+//! [`ImageCache::install_blob`]). Removing the `blobs/` name after a
+//! successful flatten then cannot take a blob from under another pull; the
+//! data goes when the last pull holding it drops its staging dir.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -91,26 +100,47 @@ impl ImageCache {
 
     // ---- mutations (exclusive flock) ----------------------------------------
 
-    /// Move a fully downloaded, digest-verified blob file into the cache.
-    /// `staged` must live on the same filesystem (use [`Self::staging_dir`]).
+    /// Publish a fully downloaded, digest-verified blob file in the cache
+    /// by hard-linking it. `staged` stays where it is as the caller's hold
+    /// on the blob (see [`Self::hold_blob`]), so it must live in one of this
+    /// cache's staging dirs ([`Self::staging_dir`]): same filesystem.
     pub fn install_blob(&self, staged: &Path, digest: &str) -> Result<PathBuf> {
         let dest = self.blob_path(digest)?;
         let _lock = self.lock()?;
         if dest.is_file() {
-            // Someone else won the race; the staged copy is redundant.
-            let _ = fs::remove_file(staged);
+            // Someone else won the race; the content is identical, and the
+            // staged copy remains the caller's hold.
             return Ok(dest);
         }
         let parent = dest.parent().expect("blob path always has a parent");
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
-        fs::rename(staged, &dest)
-            .with_context(|| format!("cannot move staged blob into {}", dest.display()))?;
+        fs::hard_link(staged, &dest)
+            .with_context(|| format!("cannot link staged blob into {}", dest.display()))?;
         Ok(dest)
     }
 
-    /// Remove the blob for `digest` (after a successful flatten). Missing
-    /// blobs are fine — another pull may have consumed them already.
+    /// Hard-link the cached blob for `digest` to `hold`, a path in the
+    /// caller's staging dir, so the blob stays readable there however soon
+    /// another pull removes it from the cache. `false` when the cache has no
+    /// such blob (never downloaded, or already removed): download it.
+    ///
+    /// Needs no lock: `link(2)` either finds the blob or fails with ENOENT,
+    /// whatever [`Self::remove_blob`] does at the same time.
+    pub fn hold_blob(&self, digest: &str, hold: &Path) -> Result<bool> {
+        let path = self.blob_path(digest)?;
+        match fs::hard_link(&path, hold) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| {
+                format!("cannot link blob {} to {}", path.display(), hold.display())
+            }),
+        }
+    }
+
+    /// Remove the blob for `digest` from the cache (after a successful
+    /// flatten). Missing blobs are fine — another pull may have consumed
+    /// them already. A pull still flattening it reads its own hard link.
     pub fn remove_blob(&self, digest: &str) -> Result<()> {
         let path = self.blob_path(digest)?;
         let _lock = self.lock()?;
@@ -301,6 +331,31 @@ mod tests {
         assert!(!installed.is_file());
         // removing an already-gone blob is fine
         cache.remove_blob(&digest).unwrap();
+    }
+
+    /// A hold is a hard link: it keeps the blob readable after the cache's
+    /// name for it is removed, and a missing blob is reported, not an error.
+    #[test]
+    fn a_held_blob_survives_its_removal_from_the_cache() {
+        let (_tmp, cache) = new_cache();
+        let digest = digest_of(b"layer");
+        let staging = cache.staging_dir().unwrap();
+        let hold = staging.path().join("layer-0000");
+        assert!(!cache.hold_blob(&digest, &hold).unwrap(), "nothing cached");
+
+        let first = cache.staging_dir().unwrap();
+        let staged = first.path().join("layer-0000");
+        fs::write(&staged, b"layer").unwrap();
+        cache.install_blob(&staged, &digest).unwrap();
+        assert!(staged.is_file(), "the installer keeps its own hold");
+        assert!(cache.hold_blob(&digest, &hold).unwrap());
+
+        cache.remove_blob(&digest).unwrap();
+        drop(first);
+        assert!(!cache.blob_path(&digest).unwrap().exists());
+        assert_eq!(fs::read(&hold).unwrap(), b"layer");
+        drop(staging);
+        assert!(!hold.exists(), "the hold goes with its staging dir");
     }
 
     #[test]
