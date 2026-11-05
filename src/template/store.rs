@@ -1573,7 +1573,7 @@ mod tests {
         names
     }
 
-    fn named(path: &Path, prefix: &str) -> bool {
+    fn name_starts(path: &Path, prefix: &str) -> bool {
         path.file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
     }
@@ -1610,7 +1610,7 @@ mod tests {
     fn a_failed_staging_move_keeps_the_old_version() {
         overwrite_fails_and_keeps_old(&InstallOps {
             rename: |from, to| {
-                if named(to, ".next-") {
+                if name_starts(to, ".next-") {
                     Err(std::io::Error::other("injected"))
                 } else {
                     fs::rename(from, to)
@@ -1624,7 +1624,7 @@ mod tests {
     fn a_failed_set_aside_keeps_the_old_version() {
         overwrite_fails_and_keeps_old(&InstallOps {
             rename: |from, to| {
-                if named(to, ".old-") {
+                if name_starts(to, ".old-") {
                     Err(std::io::Error::other("injected"))
                 } else {
                     fs::rename(from, to)
@@ -1639,7 +1639,7 @@ mod tests {
     fn a_failed_final_rename_restores_the_old_version() {
         let err = overwrite_fails_and_keeps_old(&InstallOps {
             rename: |from, to| {
-                if named(from, ".next-") {
+                if name_starts(from, ".next-") {
                     Err(std::io::Error::other("injected"))
                 } else {
                     fs::rename(from, to)
