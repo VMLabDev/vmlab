@@ -5789,10 +5789,16 @@ lab "t" {
     async fn the_next_up_replaces_a_mount_task_still_running() {
         let dir = tempfile::tempdir().unwrap();
         let (lab, calls) = up_with_a_mount_that_never_succeeds(dir.path()).await;
+        // Stand in a task of our own for the first `up`'s, so its end is
+        // the replacement's doing and not a stop's. The real one is ended
+        // here, since the registry no longer reaches it.
         let earlier = tokio::spawn(std::future::pending::<()>());
-        lab.mount_tasks
+        let first = lab
+            .mount_tasks
             .lock_recover()
-            .insert("lin".into(), earlier.abort_handle());
+            .insert("lin".into(), earlier.abort_handle())
+            .expect("the first up's task");
+        first.abort();
         let (sink, _said) = numbered(&shared(dir.path()));
         lab.up(&[], sink).await.expect("second up");
         tokio::time::sleep(Duration::from_millis(1)).await;
