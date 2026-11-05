@@ -5737,7 +5737,10 @@ lab "t" {
         lab.up(&[], sink).await.expect("up");
         assert!(calls.load(Ordering::SeqCst) > 1, "the mount is retrying");
         let task = lab.mount_tasks.lock_recover().get("lin").cloned();
-        assert!(task.is_some_and(|t| !t.is_finished()), "still mounting after up");
+        assert!(
+            task.is_some_and(|t| !t.is_finished()),
+            "still mounting after up"
+        );
         (lab, calls)
     }
 
@@ -5748,7 +5751,11 @@ lab "t" {
         tokio::task::yield_now().await;
         let seen = calls.load(Ordering::SeqCst);
         tokio::time::sleep(crate::smb::steps::RetryPolicy::MOUNT.deadline).await;
-        assert_eq!(calls.load(Ordering::SeqCst), seen, "an attempt ran after the stop");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            seen,
+            "an attempt ran after the stop"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -5758,7 +5765,10 @@ lab "t" {
         let handle = lab.mount_tasks.lock_recover().get("lin").cloned().unwrap();
         lab.stop_machine("lin", false).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1)).await;
-        assert!(handle.is_finished(), "the task outlived its machine's stop by a tick");
+        assert!(
+            handle.is_finished(),
+            "the task outlived its machine's stop by a tick"
+        );
         assert_mounting_ended(&lab, &calls).await;
     }
 
