@@ -2,10 +2,14 @@
 `script`, `m.record` from wscript, and what the files hold — probed with
 ffprobe, frames pulled with ffmpeg, text read with tesseract."""
 
+import collections
+import contextlib
 import json
 import pathlib
+import queue
 import re
 import subprocess
+import threading
 import time
 import zlib
 
@@ -44,8 +48,10 @@ def frame_at(video: pathlib.Path, at: float, out: pathlib.Path) -> pathlib.Path:
     return out
 
 
-def png_read(path: pathlib.Path):
-    """Decode an 8-bit RGB/RGBA PNG with the standard library: (w, h, rows)."""
+def png_read(path: pathlib.Path, step: int = 1):
+    """Decode an 8-bit RGB/RGBA PNG with the standard library: (w, h, rows).
+
+    With `step`, rows holds only every step-th row and pixel."""
     data = path.read_bytes()
     assert data[:8] == b"\x89PNG\r\n\x1a\n", f"{path} is not a PNG"
     pos, idat, w, h, ctype = 8, b"", 0, 0, 0
@@ -67,7 +73,9 @@ def png_read(path: pathlib.Path):
     for y in range(h):
         f = raw[y * (stride + 1)]
         line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
-        for i in range(stride):
+        # An unfiltered row is already the pixels. early_frames asks ffmpeg
+        # for those, as the per-byte loop costs about a second a frame.
+        for i in range(stride if f else 0):
             a = line[i - bpp] if i >= bpp else 0
             b = prev[i]
             c = prev[i - bpp] if i >= bpp else 0
@@ -84,7 +92,7 @@ def png_read(path: pathlib.Path):
                 line[i] = (line[i] + pred) & 255
         rows.append(bytes(line))
         prev = line
-    return w, h, [[tuple(r[x * bpp:x * bpp + 3]) for x in range(w)] for r in rows]
+    return w, h, [[tuple(r[x * bpp:x * bpp + 3]) for x in range(0, w, step)] for r in rows[::step]]
 
 
 def ocr(png: pathlib.Path) -> str:
@@ -140,35 +148,99 @@ def firmware_kind(upper: str):
     return None
 
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# One line of ffmpeg's showinfo filter per decoded frame, in output order.
+SHOWINFO = re.compile(rb"\[Parsed_showinfo_\d+ @ [^]]*\] n:\s*(\d+)\s+pts:\s*\S+\s+pts_time:(\S+)")
+_END = object()
+
+
+def png_stream(stream):
+    """Split a stream of PNG files written back to back (ffmpeg's
+    image2pipe) into one bytes object per file."""
+    def read(n):
+        data = stream.read(n)
+        if len(data) != n:
+            raise ValueError(f"PNG stream cut short: wanted {n} bytes, got {len(data)}")
+        return data
+
+    while True:
+        signature = stream.read(8)
+        if not signature:
+            return
+        if signature != PNG_SIGNATURE:
+            raise ValueError(f"not a PNG in the frame stream: {signature!r}")
+        parts = [signature]
+        while True:
+            head = read(8)
+            parts.append(head)
+            parts.append(read(int.from_bytes(head[:4], "big") + 4))
+            if head[4:8] == b"IEND":
+                break
+        yield b"".join(parts)
+
+
 def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
     """Every distinct frame of the first `seconds`: (time, png), in order.
 
-    The time is the frame's own timestamp from the start of the stream, so
-    it is right for a variable frame rate recording too."""
+    One ffmpeg process decodes the window and pipes each frame as a PNG.
+    Its showinfo filter logs each decoded frame's own timestamp, so a time
+    always belongs to its frame, also for a variable frame rate and when
+    a packet does not give one frame (packets before the first keyframe
+    decode to nothing). ffmpeg counts the time from the start of the
+    stream, as `-t` does. Frames are decoded only as far as the caller
+    reads: when it stops (a match), ffmpeg is stopped."""
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob("f*.png"):
         old.unlink()
-    pts = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-read_intervals", f"%+{seconds + 1:.3f}",
-         "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video)],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    times = sorted(float(t.strip(",")) for t in pts.split() if t.strip(",") not in ("", "N/A"))
-    if not times:
-        return
-    times = [t - times[0] for t in times]
-    subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(video), "-t", f"{seconds:.3f}",
-         "-fps_mode", "passthrough", str(out / "f%05d.png")],
-        check=True, capture_output=True,
+    proc = subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info",
+         "-i", str(video), "-t", f"{seconds:.3f}", "-vf", "showinfo",
+         "-fps_mode", "passthrough", "-pix_fmt", "rgb24",
+         "-f", "image2pipe", "-c:v", "png", "-pred", "none", "-"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    previous = None
-    for at, png in zip(times, sorted(out.glob("f*.png"))):
-        digest = zlib.crc32(png.read_bytes())
-        if digest != previous:
+    times = queue.Queue()
+    log = collections.deque(maxlen=20)
+
+    def read_log():
+        for line in proc.stderr:
+            m = SHOWINFO.search(line)
+            if m:
+                times.put(m.group(2).decode())
+            else:
+                log.append(line.decode(errors="replace").rstrip())
+        times.put(_END)
+
+    reader = threading.Thread(target=read_log, daemon=True)
+    reader.start()
+    try:
+        previous = None
+        for n, data in enumerate(png_stream(proc.stdout)):
+            # showinfo runs before the PNG encoder, so frame n's line is
+            # written before frame n reaches the pipe.
+            pts_time = times.get(timeout=60)
+            if pts_time is _END:
+                raise RuntimeError(f"ffmpeg piped frame {n} of {video} but logged no time for it")
+            try:
+                at = float(pts_time)
+            except ValueError:
+                raise RuntimeError(f"frame {n} of {video} has no timestamp ({pts_time})") from None
+            digest = zlib.crc32(data)
+            if digest == previous:
+                continue
             previous = digest
+            png = out / f"f{n + 1:05d}.png"
+            png.write_bytes(data)
             yield at, png
+        if proc.wait() != 0:
+            raise subprocess.CalledProcessError(proc.returncode, "ffmpeg", stderr="\n".join(log))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        reader.join(timeout=10)
+        proc.stderr.close()
 
 
 def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRMWARE_WITHIN):
@@ -178,6 +250,8 @@ def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRM
     line can be drawn and cleared again between two framebuffer reads, so a
     boot may never record it (VML-36). The vmlab logo OVMF shows before it
     is firmware output too and stays on screen for a fraction of a second.
+    Decoding stops at the first match. A coarse sample first would miss
+    those short frames, so a failing run still reads the whole window.
 
     Two rules. The first lit frame must be firmware, or QEMU's no-display
     text by START_BY, else the recording started late. Then a
@@ -189,28 +263,29 @@ def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRM
     """
     seen = []
     lit_at = None
-    for at, png in early_frames(video, seconds, out.with_suffix(".frames")):
-        _, _, rows = png_read(png)
-        lit = sum(1 for row in rows[::8] for px in row[::8] if max(px) > 60)
-        if lit <= 20:
-            continue
-        text = ocr(png)
-        upper = text.upper()
-        first = " | ".join(line for line in text.splitlines() if line.strip())[:100]
-        seen.append(f"{at:.2f}s {first}")
-        kind = firmware_kind(upper)
-        if lit_at is None:
-            lit_at = at
-            if kind is None and (at > START_BY or not NO_DISPLAY.search(upper)):
-                raise AssertionError(
-                    f"not recorded from power-on: the first lit frame, at {at:.2f} s, "
-                    f"is not firmware or QEMU's no-display text by {START_BY:g} s: {first!r}"
-                )
-        elif kind is None and GRUB.search(upper):
-            kind = "no-display+GRUB"
-        if kind is not None:
-            out.write_bytes(png.read_bytes())
-            return at, text, kind
+    with contextlib.closing(early_frames(video, seconds, out.with_suffix(".frames"))) as frames:
+        for at, png in frames:
+            _, _, rows = png_read(png, step=8)
+            lit = sum(1 for row in rows for px in row if max(px) > 60)
+            if lit <= 20:
+                continue
+            text = ocr(png)
+            upper = text.upper()
+            first = " | ".join(line for line in text.splitlines() if line.strip())[:100]
+            seen.append(f"{at:.2f}s {first}")
+            kind = firmware_kind(upper)
+            if lit_at is None:
+                lit_at = at
+                if kind is None and (at > START_BY or not NO_DISPLAY.search(upper)):
+                    raise AssertionError(
+                        f"not recorded from power-on: the first lit frame, at {at:.2f} s, "
+                        f"is not firmware or QEMU's no-display text by {START_BY:g} s: {first!r}"
+                    )
+            elif kind is None and GRUB.search(upper):
+                kind = "no-display+GRUB"
+            if kind is not None:
+                out.write_bytes(png.read_bytes())
+                return at, text, kind
     raise AssertionError(
         f"no firmware output in the first {seconds:g} s (first lit at {lit_at} s); "
         f"distinct lit frames read: {seen}"

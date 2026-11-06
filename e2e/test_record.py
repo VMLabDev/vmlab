@@ -1,6 +1,9 @@
 """Boot recordings must start at power-on and contain firmware, including
 when it paints late."""
 
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,10 +24,10 @@ class FirmwareFrameTests(unittest.TestCase):
                 if at < seconds:
                     yield at, Path(f"{at}:{text}")
 
-        def pixels(path):
+        def pixels(path, step=1):
             text = str(path).split(":", 1)[1]
             level = 255 if text else 0
-            return 80, 80, [[(level, level, level)] * 80] * 80
+            return 80, 80, [[(level, level, level)] * (80 // step)] * (80 // step)
 
         def ocr(path):
             return str(path).split(":", 1)[1]
@@ -145,6 +148,126 @@ class FirmwareFrameTests(unittest.TestCase):
     def test_an_empty_recording_fails(self):
         with self.assertRaisesRegex(AssertionError, "first lit at None"):
             self.scan([(0.0, ""), (6.0, "")])
+
+
+def make_video(path: Path, frames: int, options=()):
+    """A gray video whose frame n is at n*n/10 s (a variable frame rate)
+    and has brightness 40*(n//2): every frame shows twice."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"color=c=black:s=64x48:r=10:d={frames / 10}",
+         "-vf", "format=yuv444p,geq=lum='40*floor(N/2)':cb=128:cr=128,setpts='N*N/10/TB'",
+         "-fps_mode", "passthrough", *options, str(path)],
+        check=True, capture_output=True,
+    )
+    return path
+
+
+H264 = ("-c:v", "libx264", "-qp", "0", "-bf", "2", "-pix_fmt", "yuv444p")
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+class EarlyFramesTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def frames(self, video, seconds):
+        return [(round(at, 3), record.png_read(png)[2][0][0][0])
+                for at, png in record.early_frames(video, seconds, self.dir / "frames")]
+
+    def test_each_time_belongs_to_its_frame(self):
+        # Frames at 0, .1, .4, .9, 1.6, 2.5, 3.6 s; pairs repeat, so the
+        # distinct ones are frames 0, 2, 4, 6 at 0, .4, 1.6, 3.6 s.
+        # H.264 with B-frames stores packets out of display order.
+        for name, options in (("h264.mp4", H264), ("ffv1.mkv", ("-c:v", "ffv1"))):
+            with self.subTest(name=name):
+                got = self.frames(make_video(self.dir / name, 7, options), 10.0)
+                self.assertEqual([at for at, _ in got], [0.0, 0.4, 1.6, 3.6])
+                levels = [level for _, level in got]
+                self.assertEqual(levels, sorted(set(levels)), got)
+
+    def test_the_window_ends_before_seconds(self):
+        got = self.frames(make_video(self.dir / "v.mkv", 7, ("-c:v", "ffv1")), 2.0)
+        self.assertEqual([at for at, _ in got], [0.0, 0.4, 1.6])
+
+    def test_time_counts_from_the_start_of_the_stream(self):
+        video = make_video(self.dir / "late.mkv", 7, ("-c:v", "ffv1", "-output_ts_offset", "5"))
+        self.assertEqual([at for at, _ in self.frames(video, 10.0)], [0.0, 0.4, 1.6, 3.6])
+
+    def test_packets_that_decode_to_no_frame_take_no_frame_time(self):
+        # A stream cut between keyframes: its first 7 packets, from 0.05 s,
+        # decode to nothing, and the first frame is the keyframe at 0.75 s,
+        # 0.7 s into the stream. One time per packet gave it 0.0 s.
+        full = self.dir / "full.mp4"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x48:r=10:d=3",
+             "-vf", "format=yuv444p,geq=lum='8*N':cb=128:cr=128", "-c:v", "libx264", "-qp", "0",
+             "-pix_fmt", "yuv444p", "-g", "10", "-bf", "0", str(full)],
+            check=True, capture_output=True,
+        )
+        cut = self.dir / "cut.mp4"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(full), "-ss", "1.25", "-c", "copy",
+             "-copyinkf", str(cut)],
+            check=True, capture_output=True,
+        )
+        got = self.frames(cut, 10.0)
+        self.assertEqual([at for at, _ in got], [round(0.7 + n / 10, 3) for n in range(10)])
+
+    def test_closing_early_stops_ffmpeg(self):
+        video = make_video(self.dir / "long.mkv", 60, ("-c:v", "ffv1"))
+        started = []
+        popen = subprocess.Popen
+
+        def spy(*args, **kwargs):
+            started.append(popen(*args, **kwargs))
+            return started[-1]
+
+        with patch.object(record.subprocess, "Popen", side_effect=spy):
+            frames = record.early_frames(video, 400.0, self.dir / "frames")
+            next(frames)
+            frames.close()
+        self.assertIsNotNone(started[0].poll())
+        self.assertLess(len(list((self.dir / "frames").glob("f*.png"))), 3)
+
+    def test_firmware_frame_stops_decoding_at_the_match(self):
+        video = make_video(self.dir / "boot.mkv", 60, ("-c:v", "ffv1"))
+        read = []
+
+        def ocr(png):
+            read.append(png)
+            return "BdsDxe: loading Boot0002"
+
+        with patch.object(record, "ocr", side_effect=ocr):
+            at, _, kind = record.firmware_frame(video, self.dir / "boot.png", seconds=400.0)
+        # Frames 0 and 2 are below the lit level; frame 4 at 1.6 s matches.
+        self.assertEqual((at, kind, len(read)), (1.6, "BdsDxe", 1))
+        self.assertLess(len(list((self.dir / "boot.frames").glob("f*.png"))), 5)
+
+    def test_png_read_decodes_unfiltered_and_filtered_rows_alike(self):
+        pixels = {}
+        for pred in ("none", "paeth", "mixed"):
+            png = self.dir / f"{pred}.png"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=96x64",
+                 "-frames:v", "1", "-pix_fmt", "rgb24", "-pred", pred, str(png)],
+                check=True, capture_output=True,
+            )
+            pixels[pred] = record.png_read(png)
+        self.assertEqual(pixels["none"], pixels["paeth"])
+        self.assertEqual(pixels["none"], pixels["mixed"])
+        self.assertGreater(len({px for row in pixels["none"][2] for px in row}), 50)
+        w, h, sampled = record.png_read(self.dir / "none.png", step=8)
+        self.assertEqual((w, h), (96, 64))
+        self.assertEqual(sampled, [row[::8] for row in pixels["none"][2][::8]])
+
+    def test_a_broken_video_fails(self):
+        bad = self.dir / "bad.mp4"
+        bad.write_bytes(b"not a video")
+        with self.assertRaises(subprocess.CalledProcessError):
+            list(record.early_frames(bad, 1.0, self.dir / "frames"))
 
 
 if __name__ == "__main__":
