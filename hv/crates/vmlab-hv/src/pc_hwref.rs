@@ -339,25 +339,9 @@ impl Case {
             com2: name != "pc-windows-7",
             physical_address_bits: if name == "pc-windows-98-se" { 32 } else { 48 },
         };
-        let mut staged = full.clone();
-        staged.pci_devices.clear();
-        for (device, description) in devices.iter().zip(&full.pci_devices) {
-            let class = device["class_info"]["class"].as_u64().unwrap();
-            if (description.device, description.function) == (1, 2) {
-                continue;
-            }
-            staged.pci_devices.push(description.clone());
-        }
-        // 4c: the PIIX3 UHCI carrying the tablet sits at its captured 00:01.2.
-        staged.pci_devices.extend(
-            full.pci_devices
-                .iter()
-                .filter(|device| (device.device, device.function) == (1, 2))
-                .cloned(),
-        );
-        staged
-            .pci_devices
-            .sort_by_key(|device| (device.device, device.function));
+        // 4a to 4d are delivered: the probe machine stages every captured
+        // function at its captured address (NICs, UHCI, Cirrus).
+        let staged = full.clone();
         let mut processor_id = smbios::SmbiosConfig::default().processor_id;
         if name == "pc-freedos-1.3" {
             processor_id[7] = 7;

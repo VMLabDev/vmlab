@@ -574,7 +574,6 @@ mod tests {
     fn automatic_selection_uses_the_resolved_refusal_list() {
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
         for setting in [
-            r#"profile = "windows-legacy""#,
             r#"profile = "macos""#,
             r#"profile = "linux-modern" accel = "tcg""#,
         ] {
@@ -714,7 +713,7 @@ mod tests {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
         let cases = [
             (r#"profile = "macos""#, "phase macOS"),
-            (r#"profile = "windows-legacy""#, "phase 4"),
+            (r#"profile = "linux-modern" accel = "tcg""#, "phase 3"),
         ];
         for (body, phase) in cases {
             let why = refused(&format!("{base} {body}"));
@@ -792,12 +791,13 @@ mod tests {
             let cfg = vmlab_refusals(machine, &kvm_host(), Some(&hw));
             let launch = vmlab_vm_launch_refusals(&hw, true, true);
             assert_eq!(launch, cfg, "{profile}");
+            // 4c is delivered: only a floppy off the pc machine is refused.
             assert_eq!(
                 launch
                     .iter()
                     .filter(|why| why.contains("a floppy drive"))
                     .count(),
-                1,
+                usize::from(profile == "linux-generic"),
                 "{profile}: {launch:?}"
             );
         }
@@ -805,31 +805,31 @@ mod tests {
 
     #[test]
     fn adapter_launch_refusals_use_the_actual_attachment_presence() {
-        let file = lab(r#"lab "l" {
-            vm "v" { template = "scratch" arch = "x86_64" disk = 2GiB
-                profile = "windows-legacy" }
-        }"#);
-        let MachineCfg::Vm(vm) = file.lab.machine("v").unwrap() else {
-            unreachable!()
-        };
-        let hw =
+        let resolve = |profile: &str| {
+            let file = lab(&format!(
+                r#"lab "l" {{
+                    vm "v" {{ template = "scratch" arch = "x86_64" disk = 2GiB
+                        profile = "{profile}" }}
+                }}"#
+            ));
+            let MachineCfg::Vm(vm) = file.lab.machine("v").unwrap() else {
+                unreachable!()
+            };
             crate::qemu::resolve_vm(vm, None, &crate::profiles::ProfileSet::shipped().unwrap())
-                .unwrap();
-        let bare = vmlab_vm_launch_refusals(&hw, false, false);
-        assert!(!bare.iter().any(|why| why.contains("4b")), "{bare:?}");
+                .unwrap()
+        };
+        // On pc, NICs (4b) and a floppy (4c) are delivered either way.
+        let pc = resolve("windows-legacy");
+        assert!(vmlab_vm_launch_refusals(&pc, false, false).is_empty());
+        let attached = vmlab_vm_launch_refusals(&pc, true, true);
+        assert!(attached.is_empty(), "{attached:?}");
+        // On q35 the floppy is refused only when one is attached.
+        let q35 = resolve("linux-generic");
+        assert!(vmlab_vm_launch_refusals(&q35, true, false).is_empty());
+        let floppy = vmlab_vm_launch_refusals(&q35, true, true);
         assert!(
-            !bare.iter().any(|why| why.contains("a floppy drive")),
-            "{bare:?}"
-        );
-        assert!(bare.iter().any(|why| why.contains("UHCI")), "{bare:?}");
-        let attached = vmlab_vm_launch_refusals(&hw, true, true);
-        assert!(
-            !attached.iter().any(|why| why.contains("4b")),
-            "4b is delivered: {attached:?}"
-        );
-        assert!(
-            attached.iter().any(|why| why.contains("a floppy drive")),
-            "{attached:?}"
+            floppy.len() == 1 && floppy[0].contains("a floppy drive"),
+            "{floppy:?}"
         );
     }
 
@@ -976,10 +976,14 @@ mod tests {
     /// refused only what its declaration says; the daemon checks the rest.
     #[test]
     fn without_hardware_only_the_declaration_is_checked() {
-        let file = lab(r#"lab "l" { vm "v" { template = "x86_64/t" floppy = "./f" } }"#);
+        let file = lab(r#"lab "l" { vm "v" { template = "x86_64/t" accel = "tcg" } }"#);
         let why = vmlab_refusals(file.lab.machine("v").unwrap(), &kvm_host(), None);
         assert_eq!(why.len(), 1, "{why:?}");
-        assert!(why[0].contains("phase 4"), "{}", why[0]);
+        assert!(why[0].contains("phase 3"), "{}", why[0]);
+        // A floppy is delivered (4c); only its machine, which the
+        // template decides, can still refuse it.
+        let floppy = lab(r#"lab "l" { vm "v" { template = "x86_64/t" floppy = "./f" } }"#);
+        assert!(vmlab_refusals(floppy.lab.machine("v").unwrap(), &kvm_host(), None).is_empty());
 
         let plain = lab(r#"lab "l" { vm "v" { template = "x86_64/t" } }"#);
         assert!(vmlab_refusals(plain.lab.machine("v").unwrap(), &kvm_host(), None).is_empty());

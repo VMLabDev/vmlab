@@ -326,18 +326,14 @@ fn automatic_hypervisor_selection_follows_a_deferred_templates_hardware() {
         }
     );
     let mut parts = (*machine.template()).clone();
-    parts.resolved.machine = "pc".into();
+    parts.resolved.display_device = Some("qxl-vga".into());
     machine.set_template(parts);
     assert_eq!(machine.hypervisor(), HypervisorKind::Qemu);
     assert!(machine.takes_tap_fds());
     assert_eq!(machine.net_framing(), FramingMode::Raw);
-    // 4a to 4d are admitted; vmlab-hv's pc has no virtio-net, so this
-    // Linux VM's NIC still sends it to QEMU.
+    // vmlab-hv presents no QXL, so the template's display sends it to QEMU.
     let why = machine.hypervisor_fallback().unwrap();
-    assert!(
-        why.contains("virtio-net") && why.contains("pc machine"),
-        "{why}"
-    );
+    assert!(why.contains("qxl-vga"), "{why}");
 }
 
 /// A container on a fake hypervisor, image already bound. `decl` is the
