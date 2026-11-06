@@ -67,6 +67,11 @@ impl Guest {
         }
     }
 
+    /// Windows 98 SE runs on the captured Cirrus CL-GD5446 at 00:03.0.
+    fn cirrus(self) -> bool {
+        self == Self::Windows98
+    }
+
     fn windows_nt(self) -> bool {
         matches!(self, Self::Windows7 | Self::Server2008R2Core)
     }
@@ -127,6 +132,10 @@ impl Guest {
         if self == Self::Windows98 {
             machine["cpu_model"] = "pentium3".into();
         }
+        if self.cirrus() {
+            machine["display"]["device"] = "cirrus-vga".into();
+            machine["display"]["pci"]["device"] = 3.into();
+        }
         if let Some(edit) = NEXT_DESCRIPTION.with(|next| next.borrow_mut().take()) {
             edit(&mut machine, directory);
         }
@@ -180,11 +189,16 @@ struct Running {
 
 impl Running {
     fn boot(guest: Guest) -> Option<Self> {
-        Self::boot_with(guest, None)
+        Self::boot_with(guest, None, guest.cirrus())
     }
 
-    /// Boot `guest`, with a phase-4b NIC of `nic` model on the test switch.
-    fn boot_with(guest: Guest, nic: Option<&str>) -> Option<Self> {
+    fn boot_display(guest: Guest, cirrus: bool) -> Option<Self> {
+        Self::boot_with(guest, None, cirrus)
+    }
+
+    /// Boot `guest` with its 4d display choice, and with a phase-4b NIC of
+    /// `nic` model on the test switch.
+    fn boot_with(guest: Guest, nic: Option<&str>, cirrus: bool) -> Option<Self> {
         let (arch, name, version, variable) = guest.template();
         if !Path::new("/dev/kvm").exists() {
             eprintln!("skipping pc {name}: /dev/kvm is unavailable");
@@ -218,9 +232,15 @@ impl Running {
         let bios = std::env::var_os("VMLAB_HV_SEABIOS")
             .map(PathBuf::from)
             .unwrap_or_else(|| "/usr/share/qemu/bios-256k.bin".into());
-        let vga = std::env::var_os("VMLAB_HV_STDVGABIOS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/usr/share/qemu/vgabios-stdvga.bin".into());
+        let vga = if cirrus {
+            std::env::var_os("VMLAB_HV_CIRRUSBIOS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "/usr/share/qemu/vgabios-cirrus.bin".into())
+        } else {
+            std::env::var_os("VMLAB_HV_STDVGABIOS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "/usr/share/qemu/vgabios-stdvga.bin".into())
+        };
         for path in [&bios, &vga] {
             if !path.is_file() {
                 eprintln!("skipping pc {name}: firmware {} is missing", path.display());
@@ -238,6 +258,9 @@ impl Running {
         vmlab_disk::ops::create_linked_clone(&template, &directory.path().join("disk.qcow2"))
             .unwrap();
         let mut description = guest.description(directory.path(), &bios, &vga);
+        if !cirrus {
+            description["display"]["device"] = "std-vga".into();
+        }
         let switch = nic.map(|model| {
             let socket = directory.path().join("switch.sock");
             let switch = vmlab_hv_tests::switch::MiniSwitch::bind(&socket).unwrap();
@@ -733,7 +756,7 @@ fn exercise(guest: Guest) {
 /// from the test switch and pings it; the NIC keeps working across a
 /// snapshot round trip.
 fn network(guest: Guest, model: &str) {
-    let Some(mut running) = Running::boot_with(guest, Some(model)) else {
+    let Some(mut running) = Running::boot_with(guest, Some(model), guest.cirrus()) else {
         return;
     };
     let mut agent = running.ready();
@@ -856,10 +879,67 @@ fn windows_server_2008_r2_core_agent_snapshot_reset() {
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn windows_98_a20_boot_cost_with_standard_vga() {
+    let Some(mut running) = Running::boot_display(Guest::Windows98, false) else {
+        return;
+    };
+    let _agent = running.ready();
+    running.call(Control::Quit);
+    assert!(running.process.wait().unwrap().success());
+}
+
+/// A screenshot from the native display socket, as packed RGB.
+fn screenshot(directory: &Path, name: &str) -> (u32, u32, Vec<u8>) {
+    let path = directory.join(name);
+    crate::display_acceptance::diagnostic_screenshot(&directory.join("display.sock"), &path);
+    let bytes = std::fs::read(&path).unwrap();
+    let header: Vec<_> = bytes.splitn(4, |byte| *byte == b'\n').collect();
+    let size: Vec<u32> = std::str::from_utf8(header[1])
+        .unwrap()
+        .split(' ')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    (size[0], size[1], header[3].to_vec())
+}
+
+/// 4d S1: Windows 98 SE reaches its desktop and agent under Cirrus, and the
+/// display socket delivers the packed-pixel desktop rather than VGA text.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn windows_98_desktop_frame_under_cirrus() {
     let Some(mut running) = Running::boot(Guest::Windows98) else {
         return;
     };
     let _agent = running.ready();
+    let directory = running.directory.path().to_path_buf();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    // The logon or desktop screen at 640x480x8: Windows 98's teal desktop
+    // (DAC 0, 32, 32) is the most common colour, beside the window colours.
+    // The VMM's inactive-output placeholder has two colours.
+    let (width, height, colours) = loop {
+        let (width, height, pixels) = screenshot(&directory, "desktop.ppm");
+        let mut counts = std::collections::BTreeMap::new();
+        for pixel in pixels.as_chunks::<3>().0 {
+            *counts.entry(*pixel).or_insert(0usize) += 1;
+        }
+        let dominant = counts
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(pixel, _)| *pixel);
+        if width == 640 && height == 480 && counts.len() >= 8 && dominant == Some([0, 130, 130]) {
+            break (width, height, counts.len());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Cirrus desktop frame: {width}x{height}, {} colours, dominant {dominant:?}; see {}",
+            counts.len(),
+            directory.join("desktop.ppm").display()
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    eprintln!(
+        "Windows 98 SE Cirrus desktop {width}x{height} with {colours} colours: {}",
+        directory.join("desktop.ppm").display()
+    );
     running.call(Control::Quit);
     assert!(running.process.wait().unwrap().success());
 }
@@ -896,6 +976,13 @@ fn pc_descriptions_use_explicit_ide_slots_and_the_gate_agent_transport() {
         if guest.windows_nt() {
             assert_eq!(description.console_pci.unwrap().device, 2);
             assert_eq!(description.display.unwrap().pci.device, 4);
+        } else if guest.cirrus() {
+            let display = description.display.unwrap();
+            assert_eq!(
+                display.device,
+                vmlab_hv_proto::machine::DisplayDevice::CirrusVga
+            );
+            assert_eq!(display.pci.device, 3, "the capture's 00:03.0");
         }
     }
 }
