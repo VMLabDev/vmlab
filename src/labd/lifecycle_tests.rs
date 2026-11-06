@@ -347,13 +347,16 @@ fn a_pc_nic_on_vmlab_hv_takes_a_stream_not_a_tap() {
         ("vmlab", HypervisorKind::Vmlab, false),
         ("qemu", HypervisorKind::Qemu, true),
     ] {
-        let (machine, _) = vm(
+        let (mut machine, _) = vm(
             &dirs,
             &format!(
                 r#"vm "w7" {{ template = "scratch" arch = "x86_64" profile = "windows-legacy" disk = 10GiB hypervisor = "{hypervisor}" }}"#
             ),
             Script::healthy(),
         );
+        machine.set_host_facts(kvm_host());
+        // Selection reads the declaration only on the automatic path.
+        let machine = machine.with_automatic_hypervisor(Some(Default::default()));
         assert_eq!(machine.template().resolved.nic_model, "e1000");
         assert_eq!(machine.hypervisor(), kind);
         assert_eq!(machine.takes_tap_fds(), tap, "{hypervisor}");
