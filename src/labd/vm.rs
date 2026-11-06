@@ -2035,8 +2035,11 @@ impl super::machine::Machine for VmInstance {
 
     fn net_framing(&self) -> crate::net::framing::FramingMode {
         let resolved = &self.template().resolved;
+        // A macOS guest's virtio-net is transitional and single-queue on
+        // vmlab-hv (describe.rs): its port carries plain frames.
         if self.hypervisor() == HypervisorKind::Vmlab
             && resolved.nic_model.starts_with("virtio-net")
+            && !crate::config::hypervisor::is_macos(resolved)
         {
             crate::net::framing::FramingMode::Vnet {
                 queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
@@ -2265,9 +2268,9 @@ impl super::machine::Machine for VmInstance {
     /// TCG, a named `cpu_model` (§5.2). The accelerator is decided the way
     /// [`Self::start`] decides it; one `start` would refuse is its to report.
     ///
-    /// And for a macOS guest (§5.2), what the host lacks for it: KVM's
-    /// `ignore_msrs`, without which the guest faults on the Intel MSRs it
-    /// reads, and a pinned TSC, which TCG cannot give it.
+    /// And for a macOS guest on QEMU (§5.2), what the host lacks for it:
+    /// KVM's `ignore_msrs`, without which the guest faults on the Intel MSRs
+    /// it reads, and a pinned TSC, which TCG cannot give it.
     fn launch_warnings(&self) -> Vec<String> {
         let t = self.template();
         let kvm = qemu::kvm_usable(&t.resolved.arch);
@@ -2282,7 +2285,10 @@ impl super::machine::Machine for VmInstance {
         .flatten()
         .collect();
         let macos = t.resolved.apple_smc || self.guest_os() == super::guest_os::GuestOs::Macos;
+        // vmlab-hv answers unknown MSRs itself (its `ignore` policy); only
+        // QEMU needs the host's kvm.ignore_msrs.
         if macos
+            && self.hypervisor() == HypervisorKind::Qemu
             && plan.accel() == qemu::Accel::Kvm
             && let Some(problem) = qemu::host_msrs_problem()
         {

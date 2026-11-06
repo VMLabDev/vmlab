@@ -392,3 +392,49 @@ fn an_orphaned_vmlab_hv_matches_its_labs_markers() {
     assert!(crate::qemu::process::cmdline_belongs_to(&cmdline, "lab1"));
     assert!(!crate::qemu::process::cmdline_belongs_to(&cmdline, "lab"));
 }
+
+/// A description holding the Apple SMC key reaches vmlab-hv through a pipe
+/// and never a file: the reader gets every byte, and afterwards the path
+/// holds the redacted description, a regular file, for every later reader.
+#[tokio::test]
+async fn a_secret_description_is_piped_and_then_left_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("machine.json");
+    std::fs::write(&path, b"stale").unwrap();
+    let secret = br#"{"applesmc":{"osk":"FAKEFAKEFAKE"}}"#.to_vec();
+    let redacted = br#"{"applesmc":{"osk":"[redacted]"}}"#.to_vec();
+    let handover = SecretHandover::prepare(&path, secret.clone(), redacted.clone()).unwrap();
+    let file_type = std::fs::metadata(&path).unwrap().file_type();
+    use std::os::unix::fs::FileTypeExt;
+    assert!(file_type.is_fifo(), "the key never lands in a regular file");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let reader = {
+        let path = path.clone();
+        std::thread::spawn(move || std::fs::read(&path).unwrap())
+    };
+    let handing = handover.start();
+    let read = reader.join().unwrap();
+    assert_eq!(read, secret);
+    handing.finish(true).await.unwrap();
+    assert!(std::fs::metadata(&path).unwrap().is_file());
+    assert_eq!(std::fs::read(&path).unwrap(), redacted);
+}
+
+/// A vmlab-hv that dies before reading leaves no writer blocked: the
+/// handover stops, reports why, and still leaves the redacted file.
+#[tokio::test]
+async fn a_secret_handover_stops_when_the_launch_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("machine.json");
+    let handover =
+        SecretHandover::prepare(&path, b"secret".to_vec(), b"redacted".to_vec()).unwrap();
+    let handing = handover.start();
+    let started = std::time::Instant::now();
+    let error = handing.finish(false).await.unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(error.to_string().contains("exited before reading"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"redacted");
+}

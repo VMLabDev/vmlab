@@ -171,6 +171,115 @@ fn machine_file(control_sock: &Path) -> PathBuf {
     control_sock.with_file_name("machine.json")
 }
 
+/// A description that holds a secret, handed to vmlab-hv through a pipe at
+/// the machine file's path, then replaced there by its redacted form, which
+/// is what every later reader (and `kill_lab_orphans`' argv match) sees.
+struct SecretHandover {
+    path: PathBuf,
+    secret: Vec<u8>,
+    redacted: Vec<u8>,
+}
+
+/// How long vmlab-hv may take to open its description.
+const HANDOVER_DEADLINE: Duration = Duration::from_secs(30);
+
+struct Handing {
+    task: tokio::task::JoinHandle<Result<()>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    path: PathBuf,
+    redacted: Vec<u8>,
+}
+
+impl SecretHandover {
+    fn prepare(path: &Path, secret: Vec<u8>, redacted: Vec<u8>) -> Result<Self> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            secret,
+            redacted,
+        })
+    }
+
+    /// Write the description once a reader opens the pipe.
+    fn start(self) -> Handing {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (path, secret, flag) = (self.path.clone(), self.secret, stop.clone());
+        let task = tokio::task::spawn_blocking(move || write_to_reader(&path, &secret, &flag));
+        Handing {
+            task,
+            stop,
+            path: self.path,
+            redacted: self.redacted,
+        }
+    }
+}
+
+impl Handing {
+    /// Wait for the write (or stop it when the launch already failed), then
+    /// leave the redacted description at the path.
+    async fn finish(self, launched: bool) -> Result<()> {
+        if !launched {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let written = self
+            .task
+            .await
+            .map_err(|e| anyhow::anyhow!("description handover task: {e}"))
+            .and_then(|r| r);
+        let _ = std::fs::remove_file(&self.path);
+        std::fs::write(&self.path, &self.redacted)
+            .with_context(|| format!("writing {}", self.path.display()))?;
+        written
+    }
+}
+
+/// Open `path` (a pipe) for writing as soon as a reader has it open, write
+/// `bytes` and close, so the reader sees end of file.
+fn write_to_reader(
+    path: &Path,
+    bytes: &[u8],
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let deadline = std::time::Instant::now() + HANDOVER_DEADLINE;
+    let mut pipe = loop {
+        // Non-blocking: ENXIO until the reader opens its end.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(pipe) => break pipe,
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {}
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        }
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("vmlab-hv exited before reading its description");
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "vmlab-hv did not read its description within {}s",
+                HANDOVER_DEADLINE.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Blocking from here: the reader is draining it.
+    let flags = nix::fcntl::fcntl(&pipe, nix::fcntl::FcntlArg::F_GETFL)?;
+    let flags = nix::fcntl::OFlag::from_bits_truncate(flags) & !nix::fcntl::OFlag::O_NONBLOCK;
+    nix::fcntl::fcntl(&pipe, nix::fcntl::FcntlArg::F_SETFL(flags))?;
+    pipe.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// The argv after the binary.
 fn args(machine: &Path, control_sock: &Path) -> Vec<String> {
     vec![
@@ -246,8 +355,19 @@ impl Hypervisor for VmlabHv {
         if let Some(dir) = machine.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&machine, serde_json::to_vec_pretty(&description)?)
-            .with_context(|| format!("writing {}", machine.display()))?;
+        // A description carrying the Apple SMC key goes through a pipe at the
+        // usual path, never a file (HV macOS phase: no file ever holds it).
+        let handover = if description.applesmc.is_some() {
+            Some(SecretHandover::prepare(
+                &machine,
+                serde_json::to_vec(&description)?,
+                serde_json::to_vec_pretty(&description.redacted())?,
+            )?)
+        } else {
+            std::fs::write(&machine, serde_json::to_vec_pretty(&description)?)
+                .with_context(|| format!("writing {}", machine.display()))?;
+            None
+        };
         // vmlab-hv binds every socket it serves and refuses a path that is
         // already there; QEMU unlinks a stale one itself. A previous run that
         // was killed leaves them behind.
@@ -290,7 +410,21 @@ impl Hypervisor for VmlabHv {
         let log_from = crate::qemu::process::log_offset(&spec.log);
         let proc = Proc::spawn(&spec.label, &binary, &args, &spec.env, &spec.log).await?;
         let proc: Arc<dyn Process> = super::qemu::host_process(proc);
-        let mut control = connect_retry(control_sock, &proc, &spec.log, log_from).await?;
+        let handing = handover.map(SecretHandover::start);
+        let connected = connect_retry(control_sock, &proc, &spec.log, log_from).await;
+        if let Some(handing) = handing {
+            // vmlab-hv reads its description before it binds the control
+            // socket, so a connection means the pipe was read.
+            let delivered = handing.finish(connected.is_ok()).await;
+            if let Err(error) = delivered
+                && connected.is_ok()
+            {
+                proc.kill().await;
+                let _ = proc.wait_exit(Duration::from_secs(5)).await;
+                return Err(error).context("handing the machine description to vmlab-hv");
+            }
+        }
+        let mut control = connected?;
         for attachment in attachments {
             if let Err(error) = control.attach_net(attachment).await {
                 proc.kill().await;
