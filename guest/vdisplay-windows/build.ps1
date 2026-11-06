@@ -31,7 +31,10 @@ function Get-DownloadSummary([string]$Path) {
 }
 
 $attempts = 5
-foreach ($entry in @($dependencies.PSObject.Properties) + @($toolchain.packages.PSObject.Properties)) {
+$entries = @($dependencies.PSObject.Properties) + @($toolchain.packages.PSObject.Properties)
+# sign-only runs only sign.ps1 from the WDK and SDK; ivshmem already comes inside the package that build.py made.
+if ($Mode -eq 'sign-only') { $entries = @($entries | Where-Object { $_.Name -in @('wdk', 'sdk') }) }
+foreach ($entry in $entries) {
     $name = $entry.Name
     $url = $entry.Value.url
     $expected = $entry.Value.sha256
