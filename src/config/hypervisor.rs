@@ -120,8 +120,8 @@ const VMLAB_ARCH: &str = "x86_64";
 // hwref tests pass in-tree), one edit per sub-phase.
 const PC_MACHINE_CORE_DELIVERED: bool = true; // 4a
 const PC_NETWORKING_DELIVERED: bool = true; // 4b
-const PC_FLOPPY_UHCI_DELIVERED: bool = false; // 4c
-const PC_CIRRUS_DELIVERED: bool = false; // 4d
+const PC_FLOPPY_UHCI_DELIVERED: bool = true; // 4c
+const PC_CIRRUS_DELIVERED: bool = true; // 4d
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LegacyPcDelivery {
@@ -313,6 +313,12 @@ fn hardware_refusals(
         )),
     }
     match h.nic_model.as_str() {
+        // vmlab-hv's pc presents the NICs its captures show, e1000 and PCnet.
+        model if model.starts_with("virtio-net") && pc && has_nics => why.push(format!(
+            "vm \"{name}\": nic_model `{model}` on the pc machine — vmlab-hv's pc presents \
+             e1000 and PCnet NICs only (PRD §22); set nic_model = \"e1000\" or \"pcnet\", or \
+             use hypervisor = \"qemu\""
+        )),
         model if model.starts_with("virtio-net") => {}
         "e1000" | "pcnet" if pc => {
             if has_nics && !delivered.networking {
@@ -827,21 +833,21 @@ mod tests {
         );
     }
 
-    /// 4a and 4b are in `hv/`, 4c and 4d are not: a networked legacy VM is
-    /// refused for nothing but the UHCI tablet QEMU gives every pc, so it
-    /// still falls back to QEMU until 4c, naming 4c and nothing earlier.
+    /// 4a to 4d are in `hv/`: a networked legacy VM, Cirrus and floppy
+    /// included, is refused nothing and runs on vmlab-hv.
     #[test]
-    fn the_delivered_sub_phases_are_4a_and_4b() {
+    fn the_delivered_sub_phases_are_4a_to_4d() {
         const {
             assert!(LEGACY_PC_DELIVERED.machine_core && LEGACY_PC_DELIVERED.networking);
-            assert!(!LEGACY_PC_DELIVERED.floppy_uhci && !LEGACY_PC_DELIVERED.cirrus);
+            assert!(LEGACY_PC_DELIVERED.floppy_uhci && LEGACY_PC_DELIVERED.cirrus);
         }
-        let why = refused(
-            r#"template = "scratch" arch = "x86_64" disk = 2GiB
-                profile = "windows-legacy" nic { nat = true }"#,
-        );
-        assert_eq!(why.len(), 1, "{why:?}");
-        assert!(why[0].contains("4c") && why[0].contains("UHCI"), "{why:?}");
+        for profile in ["windows-9x", "windows-legacy"] {
+            let why = refused(&format!(
+                r#"template = "scratch" arch = "x86_64" disk = 2GiB
+                    profile = "{profile}" floppy = "answer.img" nic {{ nat = true }}"#
+            ));
+            assert!(why.is_empty(), "{profile}: {why:?}");
+        }
     }
 
     fn all_legacy_pc_delivered() -> LegacyPcDelivery {

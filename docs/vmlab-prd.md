@@ -2643,18 +2643,17 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 2e | virtio-fs shares, served in process, and audio (HDA) | Selectable |
 | 2f | Host USB (`usb = true`) and vfio (`gpu { mode = "passthrough" }`) | Selectable |
 | 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
-| 4 | Legacy PCs: i440fx, IDE, ISA serial, e1000, PCnet, floppy, UHCI and Cirrus | In progress; gated by sub-phase |
+| 4 | Legacy PCs: i440fx, IDE, ISA serial, e1000, PCnet, floppy, UHCI and Cirrus | Selectable (4a to 4d); 4e in progress |
 
 macOS guests are a phase of their own after 2.
 
 Phase 4 lands as 4a, the pc machine core with IDE, std VGA, COM1 agent and
 COM2 log, named CPUs and local-time RTCs; 4b, e1000 and PCnet; 4c, floppy
 and the PIIX3 UHCI tablet; 4d, Cirrus; and 4e, vmlab integration and the
-legacy e2e lab. The four hypervisor delivery gates remain closed until the
-pinned revision passes their acceptance checks. Each sub-phase has one
-delivery flag in `src/config/hypervisor.rs`. A pc VM still needs 4c without
-a floppy, because the QEMU hardware it mirrors always includes the UHCI
-tablet. The gate guests are FreeDOS 1.3, Windows 98 SE, Windows 7 7600.0.1
+legacy e2e lab. Each of 4a to 4d has one delivery flag in
+`src/config/hypervisor.rs`, opened once its acceptance and hwref tests passed
+in-tree; all four are open. A pc VM needs 4c even without a floppy, because the
+QEMU hardware it mirrors always includes the UHCI tablet. The gate guests are FreeDOS 1.3, Windows 98 SE, Windows 7 7600.0.1
 and TempleOS.
 
 **Refusals.** Validation (§5.1), and the lab daemon again before it builds a
@@ -2667,10 +2666,10 @@ a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
 (2d, 2f), virtio-fs shares and a sound card (2e), `usb = true` (2f), and
 a pinned `tsc` (§5.2) — the
 Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
-macOS guest (its own phase); on the pc machine, a floppy or the UHCI tablet
-QEMU gives every pc (4c) and Cirrus (4d), while the pc machine core with IDE, a
-named CPU and `agent_transport = "isa-serial"` (4a) and e1000 and PCnet (4b) are
-delivered, so every pc VM falls back to QEMU until 4c; a pinned `tsc` on pc;
+macOS guest (its own phase); on the pc machine, a virtio-net NIC and a pinned `tsc` (the pc machine
+core with IDE, a named CPU and `agent_transport = "isa-serial"` (4a), e1000 and
+PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); a
+floppy on a machine other than pc;
 `accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
 "usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
 container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
