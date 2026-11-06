@@ -408,20 +408,22 @@ async fn a_hypervisor_that_exits_during_startup_is_reported() {
     assert!(err.contains("/dev/kvm: permission denied"), "{err}");
 }
 
-/// A VM the delivered phases cannot run — the i440fx legacy PC, phase 4 —
-/// is refused before anything spawns.
+/// A VM the delivered phases cannot run — here a floppy on q35, which
+/// vmlab-hv attaches only on pc — is refused before anything spawns.
 #[tokio::test]
-async fn a_legacy_pc_vm_is_refused_before_anything_spawns() {
+async fn an_unsupported_vm_is_refused_before_anything_spawns() {
     let dir = tempfile::tempdir().unwrap();
     let run = dir.path();
     let bin = fake_binary(run, &format!("touch {}/spawned", run.display()));
+    let mut paths: Box<crate::qemu::cmdline::VmPaths> = Box::default();
+    paths.floppy = Some("/answer.img".into());
     let launch = Launch::Vm {
         lab: "lab1".into(),
         resolved: Box::new(crate::qemu::resolve::testing::resolved_vm(
-            "windows-legacy",
+            "linux-generic",
             "x86_64",
         )),
-        paths: Box::default(),
+        paths,
         accel: crate::qemu::Accel::Kvm,
         emulator: None,
     };
@@ -430,7 +432,7 @@ async fn a_legacy_pc_vm_is_refused_before_anything_spawns() {
         .await
         .err()
         .expect("refused");
-    assert!(err.to_string().contains("q35"), "{err}");
+    assert!(err.to_string().contains("a floppy drive"), "{err}");
     assert!(!run.join("spawned").exists());
     assert!(!run.join("machine.json").exists());
 }
