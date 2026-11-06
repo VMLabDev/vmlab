@@ -615,7 +615,10 @@ fn forced_eject_overrides_the_guest_lock_and_closes_the_tray() {
     let mut d = Driver::cdrom();
     assert_eq!(d.packet(&[0x1e, 0, 0, 0, 1]).0, 0x50);
     assert!(d.hba.eject_media(0).is_err());
-    assert_eq!(d.hba.force_eject_media(0).unwrap().unwrap().size(), 64 * 2048);
+    assert_eq!(
+        d.hba.force_eject_media(0).unwrap().unwrap().size(),
+        64 * 2048
+    );
     assert_eq!(
         d.hba.media_state(0).unwrap(),
         MediaState {

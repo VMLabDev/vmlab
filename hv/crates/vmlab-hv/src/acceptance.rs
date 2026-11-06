@@ -308,7 +308,11 @@ fn boot_template_with(
         let mut permissions = std::fs::metadata(&iso).unwrap().permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&iso, permissions).unwrap();
-        let cdrom = description["disks"].as_array_mut().unwrap().last_mut().unwrap();
+        let cdrom = description["disks"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap();
         cdrom["path"] = serde_json::to_value(&iso).unwrap();
     }
     let machine = dir.path().join("machine.json");
@@ -881,7 +885,10 @@ print(fcntl.ioctl(fd, 0x5326, 0x7fffffff))'";
         guest,
         "pid=$(cat /run/vmlab-hv-cd-held) && kill -0 \"$pid\" && kill \"$pid\"",
     );
-    assert_eq!(holder.exit_code, 0, "the holder survived the eject: {holder:?}");
+    assert_eq!(
+        holder.exit_code, 0,
+        "the holder survived the eject: {holder:?}"
+    );
     let missing = client
         .call(Control::EjectMedia { id: "nope".into() })
         .unwrap();

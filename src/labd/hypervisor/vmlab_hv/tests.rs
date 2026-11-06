@@ -370,7 +370,10 @@ async fn a_vms_install_cdrom_is_ejected_through_the_media_capability() {
         .iter()
         .find(|d| d.id == "cd0")
         .expect("the install CD-ROM");
-    assert!(cd.cdrom && cd.path.as_deref() == Some(install.as_path()), "{cd:?}");
+    assert!(
+        cd.cdrom && cd.path.as_deref() == Some(install.as_path()),
+        "{cd:?}"
+    );
 
     let media = running.control.media().expect("advertised");
     media.eject_install_cdrom().await.unwrap();

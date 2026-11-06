@@ -1047,7 +1047,10 @@ mod tests {
         assert!(d.disks[2].read_only && d.disks[2].format == DiskFormat::Raw);
         // `eject_cdrom()` addresses the install CD-ROM, `cdroms[0]`, by id.
         let install = d.disks.iter().find(|d| d.id == INSTALL_CDROM_ID).unwrap();
-        assert_eq!(install.path.as_deref(), Some(std::path::Path::new("/lab/install.iso")));
+        assert_eq!(
+            install.path.as_deref(),
+            Some(std::path::Path::new("/lab/install.iso"))
+        );
         // With no virtio disks the NIC moves up a slot.
         assert_eq!(d.nics[0].pci, at(2));
         let Boot::Firmware { bootorder, .. } = &d.boot else {

@@ -471,9 +471,7 @@ impl VmShared {
             ));
         };
         let ejected = match slot {
-            OpticalSlot::Ahci { controller, port } => {
-                controller.lock().force_eject_media(*port)
-            }
+            OpticalSlot::Ahci { controller, port } => controller.lock().force_eject_media(*port),
             OpticalSlot::Ide {
                 controller,
                 channel,
