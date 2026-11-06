@@ -53,7 +53,17 @@ fn phase_boundaries_refuse_undelivered_devices_and_invalid_machine_combinations(
         (
             "nics",
             serde_json::json!([{"model":"e1000","mac":"52:54:00:00:00:01","attachment":{"kind":"stream","socket":"/net"}}]),
-            "phase 4b",
+            "requires a PCI address",
+        ),
+        (
+            "nics",
+            serde_json::json!([{"mac":"52:54:00:00:00:01","pci":{"bus":0,"device":3,"function":0},"attachment":{"kind":"stream","socket":"/net"}}]),
+            "virtio-net is a q35 device",
+        ),
+        (
+            "nics",
+            serde_json::json!([{"model":"pcnet","mac":"52:54:00:00:00:01","pci":{"bus":0,"device":3,"function":0},"attachment":{"kind":"tap","queue_pairs":1}}]),
+            "stream attachment",
         ),
         (
             "cpu_model",
@@ -78,6 +88,11 @@ fn phase_boundaries_refuse_undelivered_devices_and_invalid_machine_combinations(
             .unwrap_err()
             .contains("floppy requires machine=pc")
     );
+    let mut nic = base.clone();
+    nic["nics"] = serde_json::json!([{"model":"e1000","mac":"52:54:00:00:00:01","pci":{"bus":0,"device":3,"function":0},"attachment":{"kind":"stream","socket":"/net"}}]);
+    validation(nic.clone()).unwrap();
+    nic["machine"] = "q35".into();
+    assert!(validation(nic).unwrap_err().contains("require machine=pc"));
     let mut q35 = base;
     q35["machine"] = "q35".into();
     q35["disks"] = serde_json::json!([{"id":"disk","bus":"ide","channel":0,"unit":0,"format":"raw","path":"/disk","read_only":false}]);

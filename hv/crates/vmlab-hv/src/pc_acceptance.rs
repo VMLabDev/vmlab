@@ -161,10 +161,17 @@ struct Running {
     directory: tempfile::TempDir,
     guest: Guest,
     resumed: Instant,
+    /// The test's switch for a 4b NIC: DHCP, ARP and ICMP echo.
+    switch: Option<vmlab_hv_tests::switch::MiniSwitch>,
 }
 
 impl Running {
     fn boot(guest: Guest) -> Option<Self> {
+        Self::boot_with(guest, None)
+    }
+
+    /// Boot `guest`, with a phase-4b NIC of `nic` model on the test switch.
+    fn boot_with(guest: Guest, nic: Option<&str>) -> Option<Self> {
         let (arch, name, version, variable) = guest.template();
         if !Path::new("/dev/kvm").exists() {
             eprintln!("skipping pc {name}: /dev/kvm is unavailable");
@@ -217,7 +224,23 @@ impl Running {
         eprintln!("pc {name} artifacts: {}", directory.path().display());
         vmlab_disk::ops::create_linked_clone(&template, &directory.path().join("disk.qcow2"))
             .unwrap();
-        let description = guest.description(directory.path(), &bios, &vga);
+        let mut description = guest.description(directory.path(), &bios, &vga);
+        let switch = nic.map(|model| {
+            let socket = directory.path().join("switch.sock");
+            let switch = vmlab_hv_tests::switch::MiniSwitch::bind(&socket).unwrap();
+            let mac = vmlab_hv_tests::TEST_MAC
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            // 00:03.0, as the captures place the legacy NIC.
+            description["nics"] = serde_json::json!([{
+                "model": model, "mac": mac,
+                "pci": {"bus":0,"device":3,"function":0},
+                "attachment": {"kind":"stream","socket":socket}
+            }]);
+            switch
+        });
         let machine = directory.path().join("machine.json");
         std::fs::write(&machine, serde_json::to_vec_pretty(&description).unwrap()).unwrap();
         let binary = std::env::var_os("VMLAB_HV_BINARY")
@@ -277,6 +300,7 @@ impl Running {
             directory,
             guest,
             resumed: Instant::now(),
+            switch,
         };
         assert!(
             running.directory.path().join("agent.sock").exists(),
@@ -690,6 +714,106 @@ fn exercise(guest: Guest) {
         running.reset(&mut agent);
     }
     running.poweroff(&mut agent);
+}
+
+/// Phase 4b: the guest's own driver brings the NIC up, takes a DHCP lease
+/// from the test switch and pings it; the NIC keeps working across a
+/// snapshot round trip.
+fn network(guest: Guest, model: &str) {
+    let Some(mut running) = Running::boot_with(guest, Some(model)) else {
+        return;
+    };
+    let mut agent = running.ready();
+    let gateway = vmlab_hv_tests::switch::SERVER_IP.to_string();
+    let lease = vmlab_hv_tests::switch::LEASE_IP.to_string();
+    let ping = |agent: &mut AgentClient| -> String {
+        match guest {
+            Guest::Dos => clean(&shell(agent, guest, "C:\\VMLAB\\PING.BAT").stdout),
+            _ => clean(&shell(agent, guest, &format!("ping.exe -n 2 {gateway}")).stdout),
+        }
+    };
+    let ok = |output: &str| match guest {
+        Guest::Dos => output.contains("Replies received: 2"),
+        _ => output.contains("Received = 2"),
+    };
+    if guest == Guest::Dos {
+        // The template's automatic networking does not load the packet
+        // driver (the capture loaded it by hand, E4).
+        // A packet driver stays resident: the agent reports DOS's
+        // termination type in AH (3 = TSR) above the exit code in AL.
+        let load = agent
+            .exec(
+                &["C:\\NET\\FDNET\\PCNTPK.COM", "INT=0x60"],
+                Duration::from_secs(60),
+            )
+            .expect("load the packet driver");
+        assert_eq!(load.exit_code & 0xff, 0, "packet driver load: {load:?}");
+        let driver = clean(&load.stdout);
+        assert!(
+            driver.contains("My Ethernet address is 52:54:00:12:34:56"),
+            "{driver}"
+        );
+        for line in [
+            "echo SET MTCPCFG=C:\\NET\\FDNET\\MTCP.CFG > C:\\VMLAB\\NET.BAT",
+            "echo C:\\NET\\FDNET\\DHCP.EXE >> C:\\VMLAB\\NET.BAT",
+        ] {
+            shell(&mut agent, guest, line);
+        }
+        let dhcp = clean(&shell(&mut agent, guest, "C:\\VMLAB\\NET.BAT").stdout);
+        assert!(dhcp.contains(&format!("IPADDR {lease}")), "{dhcp}");
+        // mTCP's ping refuses a lease of an hour or less, so it pings from
+        // a static configuration of the leased address, as the capture did.
+        for line in [
+            "echo PACKETINT 0x60 > C:\\VMLAB\\STATIC.CFG".to_string(),
+            format!("echo IPADDR {lease} >> C:\\VMLAB\\STATIC.CFG"),
+            "echo NETMASK 255.255.255.0 >> C:\\VMLAB\\STATIC.CFG".to_string(),
+            format!("echo GATEWAY {gateway} >> C:\\VMLAB\\STATIC.CFG"),
+            "echo SET MTCPCFG=C:\\VMLAB\\STATIC.CFG > C:\\VMLAB\\PING.BAT".to_string(),
+            format!("echo C:\\NET\\MTCP\\PING.EXE -count 2 {gateway} >> C:\\VMLAB\\PING.BAT"),
+        ] {
+            shell(&mut agent, guest, &line);
+        }
+    } else {
+        // Windows brings the adapter up and asks for a lease by itself.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let config = clean(&shell(&mut agent, guest, "ipconfig").stdout);
+            if config.contains(&lease) {
+                eprintln!("{guest:?} {model} ipconfig:\n{config}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no DHCP lease: {config}");
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+    let stats = running.switch.as_ref().unwrap().stats();
+    assert!(
+        stats.dhcp_acked,
+        "the DHCP exchange did not complete: {stats:?}"
+    );
+    let before = ping(&mut agent);
+    assert!(ok(&before), "ping {gateway} before the snapshot: {before}");
+    snapshot(&mut running, &mut agent);
+    let after = ping(&mut agent);
+    assert!(
+        ok(&after),
+        "ping {gateway} after the snapshot load: {after}"
+    );
+    eprintln!("{guest:?} {model}: DHCP {lease}, ping {gateway} before and after snapshot load");
+    running.reset(&mut agent);
+    running.poweroff(&mut agent);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn windows_7_e1000_dhcp_ping_snapshot() {
+    network(Guest::Windows7, "e1000");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn freedos_pcnet_dhcp_ping_snapshot() {
+    network(Guest::Dos, "pcnet");
 }
 
 #[test]

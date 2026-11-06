@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use vmlab_hv_devices::{IrqLine, MsiSink};
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, DiskBus, FirmwareKind, Machine, MachineDescription, PciAddress,
+    Accel, Arch, Boot, DiskBus, FirmwareKind, Machine, MachineDescription, NicModel, PciAddress,
 };
 
 use crate::acpi::{self, AcpiConfig};
@@ -368,7 +368,7 @@ fn validate_q35_devices(desc: &MachineDescription) -> Result<(), VmmError> {
 }
 
 fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
-    use vmlab_hv_proto::machine::{DisplayDevice, NicModel};
+    use vmlab_hv_proto::machine::DisplayDevice;
     let invalid = |reason: &str| Err(VmmError::InvalidMachine(reason.into()));
     let pc = desc.machine == Machine::Pc;
     if let Some(model) = desc.cpu_model.as_deref()
@@ -425,8 +425,19 @@ fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
         if desc.tablet.is_some() || desc.usb.is_some() {
             return invalid("pc UHCI tablet and USB require phase 4c");
         }
-        if !desc.nics.is_empty() {
-            return invalid("pc networking requires phase 4b");
+        for nic in &desc.nics {
+            if nic.model == NicModel::Virtio {
+                return invalid("pc NICs are e1000 or pcnet; virtio-net is a q35 device");
+            }
+            if !matches!(
+                nic.attachment,
+                vmlab_hv_proto::machine::NicAttachment::Stream { .. }
+            ) {
+                return invalid("e1000 and pcnet use the stream attachment");
+            }
+            if nic.pci.is_none() {
+                return invalid("a pc NIC requires a PCI address");
+            }
         }
         if desc.ahci_pci.is_some() || desc.disks.iter().any(|disk| disk.bus == DiskBus::Ahci) {
             return invalid("pc uses PIIX IDE, not q35 AHCI");
@@ -442,7 +453,7 @@ fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
             return invalid("audio, TPM and VFIO require machine=q35");
         }
     } else if desc.nics.iter().any(|nic| nic.model != NicModel::Virtio) {
-        return invalid("e1000 and pcnet require machine=pc and phase 4b");
+        return invalid("e1000 and pcnet require machine=pc");
     }
     if desc
         .display
@@ -1208,8 +1219,58 @@ pub fn build(
             snap_nodes.push(DeviceNode::Virtio(node));
         }
     }
-    // One NIC per interface.
-    for nic in &desc.nics {
+    // One NIC per interface. e1000 and PCnet are pc's emulated models; the
+    // rest is virtio-net.
+    for nic in desc.nics.iter().filter(|nic| nic.model != NicModel::Virtio) {
+        let address = nic
+            .pci
+            .ok_or_else(|| VmmError::InvalidMachine("a pc NIC requires a PCI address".into()))?;
+        let mac = parse_nic_mac(&nic.mac)?;
+        let vmlab_hv_proto::machine::NicAttachment::Stream { socket } = &nic.attachment else {
+            return Err(VmmError::InvalidMachine(
+                "e1000 and pcnet use the stream attachment".into(),
+            ));
+        };
+        let intx = wiring(Some(address), 1, false)?
+            .intx
+            .ok_or_else(|| VmmError::InvalidMachine("pc NIC without an INTx line".into()))?;
+        let id = format!("nic-{}", nic.mac);
+        let unavailable = |e: std::io::Error| VmmError::DeviceUnavailable {
+            device: "nic",
+            reason: format!("nic {}: {e}", nic.mac),
+        };
+        let (function, node): (SharedFunction, SharedSnapshot) = match nic.model {
+            NicModel::E1000 => {
+                let dev = Arc::new(Mutex::new(
+                    vmlab_hv_devices::nic::e1000::E1000::new(id, mac, ram.mem.clone(), intx)
+                        .map_err(unavailable)?,
+                ));
+                vmlab_hv_devices::nic::e1000::E1000::start(&dev, socket.clone());
+                (dev.clone(), dev)
+            }
+            _ => {
+                let dev = Arc::new(Mutex::new(
+                    vmlab_hv_devices::nic::pcnet::Pcnet::new(id, mac, ram.mem.clone(), intx)
+                        .map_err(unavailable)?,
+                ));
+                vmlab_hv_devices::nic::pcnet::Pcnet::start(&dev, socket.clone());
+                (dev.clone(), dev)
+            }
+        };
+        place(function, Some(address))?;
+        if let Some(rom) = &nic.rom {
+            let image = std::fs::read(rom).map_err(|e| VmmError::DeviceUnavailable {
+                device: "nic",
+                reason: format!("option ROM {}: {e}", rom.display()),
+            })?;
+            pci_root
+                .lock()
+                .attach_option_rom(address.device, address.function, &image)
+                .map_err(VmmError::Other)?;
+        }
+        snap_nodes.push(DeviceNode::Virtio(node));
+    }
+    for nic in desc.nics.iter().filter(|nic| nic.model == NicModel::Virtio) {
         let built = add_pci(
             &pci_root,
             factory.virtio_net(
@@ -1557,6 +1618,21 @@ fn machine_digest(desc: &MachineDescription) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(&desc.redacted()).unwrap_or_default();
     Sha256::digest(&bytes).into()
+}
+
+/// A PCI function and its snapshot view, the same device behind both.
+type SharedFunction = Arc<Mutex<dyn vmlab_hv_devices::PciDevice>>;
+type SharedSnapshot = Arc<Mutex<dyn vmlab_hv_devices::PciSnapshot>>;
+/// `aa:bb:cc:dd:ee:ff` as six bytes.
+fn parse_nic_mac(text: &str) -> Result<[u8; 6], VmmError> {
+    let parts: Vec<u8> = text
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| VmmError::InvalidMachine(format!("invalid NIC MAC `{text}`")))?;
+    parts
+        .try_into()
+        .map_err(|_| VmmError::InvalidMachine(format!("invalid NIC MAC `{text}`")))
 }
 
 #[cfg(test)]
