@@ -13,6 +13,46 @@ GUESTS = [
     ("temple", "vm.legacy.templeos", "x86_64/templeos/5.03.2"),
 ]
 
+# Text each guest shows on its usual screen once it has finished starting, as
+# OCR reads it (lower case, any one of them). A screenshot alone proves only
+# that a frame was captured: in the VML-50 run Windows 7 answered exec while
+# its setup still showed "Setup is installing devices".
+SCREEN_MARKERS = {
+    "freedos": ("welcome to the freedos", "agent-legacy"),
+    "win98": ("windows password", "identify yourself"),
+    "win7": ("recycle bin",),
+    "temple": ("templeos",),
+}
+# Text that means the guest has not reached its usual screen yet.
+SCREEN_NOT_YET = {
+    "win7": ("setup is", "preparing your computer", "starting windows"),
+}
+SCREEN_TIMEOUT = {"win7": 900}
+
+
+def screen_marker(machine: str, text: str) -> str | None:
+    """The marker of `machine` that the OCR `text` holds, or None."""
+    lowered = " ".join(text.lower().split())
+    if any(word in lowered for word in SCREEN_NOT_YET.get(machine, ())):
+        return None
+    return next((m for m in SCREEN_MARKERS[machine] if m in lowered), None)
+
+
+def wait_for_screen(h, lab, machine) -> str:
+    """Wait until the guest's screen shows its marker, and return the marker."""
+    seen = {"text": ""}
+
+    def look():
+        seen["text"] = h.vmlab("vm", "ocr", machine, cwd=lab, check=False).out
+        return screen_marker(machine, seen["text"])
+
+    try:
+        return h.wait_until(look, timeout=SCREEN_TIMEOUT.get(machine, 180), interval=5,
+                            what=f"{machine}'s screen to show one of {SCREEN_MARKERS[machine]}")
+    except ScenarioFailed as error:
+        last = " ".join(seen["text"].split())[:200]
+        raise ScenarioFailed(f"{machine}: {error}; last OCR: {last!r}") from None
+
 
 def project_vms(proc_root=pathlib.Path("/proc")) -> list[int]:
     """Count emulator executables, excluding the owner's Android emulator.
@@ -74,6 +114,14 @@ def exercise(h, lab, machine):
     h.vmlab("up", machine, cwd=lab)
     try:
         h.wait_ready(lab, machine, timeout=300)
+        # The agent can answer before the guest has finished starting, so the
+        # screen check comes first and the guest operations run on the settled guest.
+        marker = wait_for_screen(h, lab, machine)
+        h.log.write(f"[legacy] {machine} screen shows {marker!r}\n")
+        screen = RESULTS / f"legacy-{machine}.png"
+        h.vmlab("vm", "screenshot", machine, str(screen), cwd=lab)
+        if not screen.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ScenarioFailed(f"{machine}: screenshot is not a PNG")
         if machine == "temple":
             command = 'FileWrite("~/P4CHECK.TXT","PHASE4_DISK_OK",14); U8 *d=FileRead("~/P4CHECK.TXT"); "%s\\n",d; Free(d); Del("~/P4CHECK.TXT");'
         # DOS COMMAND.COM has no '&' command chaining. Separate execs also
@@ -87,10 +135,6 @@ def exercise(h, lab, machine):
             h.vmlab("exec", machine, "--", shell, "/c", "del", "C:\\P4CHECK.TXT", cwd=lab)
         if "PHASE4_DISK_OK" not in result.out:
             raise ScenarioFailed(f"{machine}: disk read did not return the written marker: {result.text}")
-        screen = RESULTS / f"legacy-{machine}.png"
-        h.vmlab("vm", "screenshot", machine, str(screen), cwd=lab)
-        if not screen.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
-            raise ScenarioFailed(f"{machine}: screenshot is not a PNG")
         h.vmlab("vm", "stop", machine, cwd=lab, timeout=300)
         if "state=stopped" not in h.machine_line(lab, machine):
             raise ScenarioFailed(f"{machine}: stop did not settle")
@@ -116,4 +160,4 @@ def run(h):
     with h.lab("legacy") as lab:
         for machine, feature, _ in GUESTS:
             h.check(feature, lambda m=machine: exercise(h, lab, m),
-                    "agent readiness, exec, disk write/read, PNG capture and stop")
+                    "agent readiness, the usual screen by OCR, PNG capture, exec, disk write/read and stop")
