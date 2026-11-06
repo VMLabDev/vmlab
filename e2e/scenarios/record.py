@@ -100,22 +100,63 @@ def placement(fb_w: int, fb_h: int, out_w: int = 1920, out_h: int = 1080):
     return scale, (out_w - pw) // 2, (out_h - ph) // 2
 
 
-def firmware_frame(video: pathlib.Path, out: pathlib.Path):
-    """Find firmware text in the first five seconds of a boot recording."""
+# Firmware text, or the vmlab logo vmlab's own OVMF draws at boot
+# (guest/build-ovmf.sh puts guest/logo/Logo.bmp in place of edk2's).
+FIRMWARE_MARKERS = ("BDSDXE", "SEABIOS", "IPXE", "VMLAB")
+
+
+def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
+    """Every distinct frame of the first `seconds`: (time, png), in order."""
+    out.mkdir(parents=True, exist_ok=True)
+    for old in out.glob("f*.png"):
+        old.unlink()
+    rate = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=r_frame_rate", "-of", "json", str(video)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    num, den = json.loads(rate)["streams"][0]["r_frame_rate"].split("/")
+    fps = int(num) / int(den)
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(video), "-t", f"{seconds:.3f}",
+         "-fps_mode", "passthrough", str(out / "f%05d.png")],
+        check=True, capture_output=True,
+    )
+    previous = None
+    for index, png in enumerate(sorted(out.glob("f*.png"))):
+        digest = zlib.crc32(png.read_bytes())
+        if digest != previous:
+            previous = digest
+            yield index / fps, png
+
+
+def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = 8.0):
+    """Find the firmware's own output in the first seconds of a recording.
+
+    Every distinct frame is read, not a sample: OVMF's "BdsDxe: loading"
+    line can be drawn and cleared again between two framebuffer reads, so a
+    boot may never record it (VML-36). The vmlab logo OVMF shows before it
+    is firmware output too and stays on screen for a fraction of a second.
+    """
+    seen = []
     lit_at = None
-    for tenth in range(1, 51):
-        at = tenth / 10
-        _, _, rows = png_read(frame_at(video, at, out))
+    for at, png in early_frames(video, seconds, out.with_suffix(".frames")):
+        _, _, rows = png_read(png)
         lit = sum(1 for row in rows[::8] for px in row[::8] if max(px) > 60)
         if lit <= 20:
             continue
         if lit_at is None:
             lit_at = at
-        text = ocr(out)
-        if any(marker in text.upper() for marker in ("BDSDXE", "SEABIOS", "IPXE")):
+        text = ocr(png)
+        first = " | ".join(line for line in text.splitlines() if line.strip())[:100]
+        seen.append(f"{at:.2f}s {first}")
+        if any(marker in text.upper() for marker in FIRMWARE_MARKERS):
+            out.write_bytes(png.read_bytes())
             return at, text
-    raise AssertionError(f"no firmware text in the first 5 s (first lit at {lit_at} s)")
-
+    raise AssertionError(
+        f"no firmware output in the first {seconds:g} s (first lit at {lit_at} s); "
+        f"distinct lit frames read: {seen}"
+    )
 
 def run(h):
     with h.lab("record-lab") as lab:
