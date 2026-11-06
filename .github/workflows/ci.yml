@@ -291,12 +291,24 @@ jobs:
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - name: Install Windows cross compiler
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-18 lld-18
+      # fedorapeople can answer runners with a bot-challenge page, so ivshmem comes from the release asset
+      # (tag deps-ivshmem-0.1-161). build.py finds it at its cache path and still checks the sha256 pin.
+      - name: Fetch vendored ivshmem archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(jq -r .ivshmem.sha256 guest/vdisplay-windows/dependencies.json)
+          mkdir -p .ci-cache/vdisplay-windows
+          gh release download deps-ivshmem-0.1-161 --repo "$GITHUB_REPOSITORY" \
+            -p virtio-win10-prewhql-0.1-161.zip -O ".ci-cache/vdisplay-windows/ivshmem-$sha.zip"
       - name: Compile against pinned kits
         run: python3 guest/vdisplay-windows/build.py --output target/vdisplay-unsigned
       - uses: actions/upload-artifact@v7

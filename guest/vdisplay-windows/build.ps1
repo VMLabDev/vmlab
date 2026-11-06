@@ -49,7 +49,8 @@ foreach ($entry in $entries) {
         for ($attempt = 1; $attempt -le $attempts; $attempt++) {
             $partial = $archive + '.partial-' + [Guid]::NewGuid().ToString('N')
             try {
-                Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $partial
+                # The default PowerShell User-Agent contains "Mozilla", and fedorapeople answers that with a bot-challenge page.
+                Invoke-WebRequest -UseBasicParsing -UserAgent 'vmlab-build' -Uri $url -OutFile $partial
                 # A server can answer 200 with an error page, so verify before the archive takes its final name.
                 $actual = Get-Sha256 $partial
                 if ($actual -ne $expected) {
@@ -64,6 +65,8 @@ foreach ($entry in $entries) {
                 Start-Sleep -Seconds (5 * $attempt)
             }
         }
+    } else {
+        Write-Output "Using cached $name $archive (no download)"
     }
     $destination = Join-Path "$ToolsRoot\packages" $name
     # Re-expand verified inputs so a previous interrupted build cannot leave damaged headers or libraries.
