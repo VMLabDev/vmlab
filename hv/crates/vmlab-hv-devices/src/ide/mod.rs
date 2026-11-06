@@ -213,6 +213,16 @@ impl Ide {
         self.optical(channel, unit)?.eject_media()
     }
 
+    /// Remove the host image whatever the guest locked, leaving the tray
+    /// closed and the drive empty.
+    pub fn force_eject_media(
+        &mut self,
+        channel: usize,
+        unit: usize,
+    ) -> Result<Option<Box<dyn DiskImage>>, DeviceError> {
+        Ok(self.optical(channel, unit)?.force_eject())
+    }
+
     pub fn media_state(
         &self,
         channel: usize,

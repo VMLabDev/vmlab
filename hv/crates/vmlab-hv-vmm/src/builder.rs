@@ -1091,6 +1091,7 @@ pub fn build(
     } else {
         None
     };
+    let mut optical = Vec::new();
     for disk in &desc.disks {
         if disk.bus == DiskBus::Ide {
             let image = disk
@@ -1119,6 +1120,16 @@ pub fn build(
                 )
             }
             .map_err(|error| VmmError::Other(format!("IDE {}: {error}", disk.id)))?;
+            if disk.cdrom {
+                optical.push((
+                    disk.id.clone(),
+                    crate::vm::OpticalSlot::Ide {
+                        controller: ide.clone().unwrap(),
+                        channel,
+                        unit,
+                    },
+                ));
+            }
             if let Some(image) = image {
                 snap_disks.push(DiskNode {
                     id: disk.id.clone(),
@@ -1130,6 +1141,15 @@ pub fn build(
             continue;
         }
         if disk.bus == DiskBus::Ahci {
+            if disk.cdrom {
+                optical.push((
+                    disk.id.clone(),
+                    crate::vm::OpticalSlot::Ahci {
+                        controller: ahci.clone().unwrap(),
+                        port: disk.port.unwrap() as usize,
+                    },
+                ));
+            }
             if disk.cdrom && disk.path.is_none() {
                 ahci.as_ref()
                     .unwrap()
@@ -1499,6 +1519,7 @@ pub fn build(
     *shared.vga.lock() = vga;
     *shared.virtual_display.lock() = virtual_display;
     *shared.xhci.lock() = xhci;
+    *shared.optical.lock() = optical;
     shared
         .usb_hotplug
         .store(desc.usb.is_some(), std::sync::atomic::Ordering::SeqCst);

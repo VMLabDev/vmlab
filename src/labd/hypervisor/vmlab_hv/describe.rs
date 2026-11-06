@@ -35,6 +35,11 @@ pub(crate) const VMSTATE_DISK: &str = "scratch";
 /// as QMP `snapshot-save` is asked to under QEMU (§7.3).
 pub(crate) const VM_VMSTATE_DISK: &str = "disk0";
 
+/// The disk id of a VM's first CD-ROM, `cdroms[0]`, which is its install
+/// CD-ROM when it has one: the drive `eject_cdrom()` empties through the
+/// control protocol's `eject_media`.
+pub(crate) const INSTALL_CDROM_ID: &str = "cd0";
+
 /// The host files a VM's description names beyond its own disks: firmware
 /// and option ROMs, found by [`super::HostRoms::probe`] — a host probe, so
 /// [`vm`] stays a function of what it is handed.
@@ -1040,6 +1045,12 @@ mod tests {
             ]
         );
         assert!(d.disks[2].read_only && d.disks[2].format == DiskFormat::Raw);
+        // `eject_cdrom()` addresses the install CD-ROM, `cdroms[0]`, by id.
+        let install = d.disks.iter().find(|d| d.id == INSTALL_CDROM_ID).unwrap();
+        assert_eq!(
+            install.path.as_deref(),
+            Some(std::path::Path::new("/lab/install.iso"))
+        );
         // With no virtio disks the NIC moves up a slot.
         assert_eq!(d.nics[0].pci, at(2));
         let Boot::Firmware { bootorder, .. } = &d.boot else {

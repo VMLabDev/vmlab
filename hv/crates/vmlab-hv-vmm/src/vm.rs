@@ -29,6 +29,19 @@ pub struct UsbAttachment {
     pub hostport: String,
 }
 
+/// Where a CD-ROM the description named sits, for `eject_media`.
+pub(crate) enum OpticalSlot {
+    Ahci {
+        controller: Arc<Mutex<vmlab_hv_devices::ahci::Ahci>>,
+        port: usize,
+    },
+    Ide {
+        controller: Arc<Mutex<vmlab_hv_devices::ide::Ide>>,
+        channel: usize,
+        unit: usize,
+    },
+}
+
 /// Why the machine stopped for good.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitReason {
@@ -167,6 +180,8 @@ pub struct VmShared {
     pub(crate) usb_hotplug: std::sync::atomic::AtomicBool,
     /// Host USB devices attached through the control protocol.
     pub(crate) usb_attachments: Mutex<Vec<UsbAttachment>>,
+    /// The machine's CD-ROM drives, by disk id.
+    pub(crate) optical: Mutex<Vec<(String, OpticalSlot)>>,
     pub(crate) pflash: Mutex<Option<Arc<Mutex<vmlab_hv_devices::pflash::Pflash>>>>,
     pub(crate) tpm: Mutex<Option<Arc<Mutex<vmlab_hv_devices::tpm::TpmTis>>>>,
     pub(crate) smi_fwcfg: Mutex<Option<Arc<Mutex<crate::smm::SmiFwCfg>>>>,
@@ -237,6 +252,7 @@ impl VmShared {
             xhci: Mutex::new(None),
             usb_hotplug: std::sync::atomic::AtomicBool::new(false),
             usb_attachments: Mutex::new(Vec::new()),
+            optical: Mutex::new(Vec::new()),
             pflash: Mutex::new(None),
             tpm: Mutex::new(None),
             smi_fwcfg: Mutex::new(None),
@@ -433,6 +449,38 @@ impl VmShared {
             hostport: hostport.to_owned(),
         });
         Ok(port)
+    }
+
+    /// Whether the machine has a CD-ROM drive for `eject_media`.
+    pub(crate) fn has_optical(&self) -> bool {
+        !self.optical.lock().is_empty()
+    }
+
+    /// Empty the CD-ROM with disk id `id` whatever the guest locked, leaving
+    /// its tray closed. An already empty drive is success.
+    pub(crate) fn eject_media(
+        &self,
+        id: &str,
+    ) -> Result<(), (vmlab_hv_proto::control::ErrorCode, String)> {
+        use vmlab_hv_proto::control::ErrorCode;
+        let optical = self.optical.lock();
+        let Some((_, slot)) = optical.iter().find(|(drive, _)| drive == id) else {
+            return Err((
+                ErrorCode::DeviceNotFound,
+                format!("no CD-ROM with id {id:?}"),
+            ));
+        };
+        let ejected = match slot {
+            OpticalSlot::Ahci { controller, port } => controller.lock().force_eject_media(*port),
+            OpticalSlot::Ide {
+                controller,
+                channel,
+                unit,
+            } => controller.lock().force_eject_media(*channel, *unit),
+        };
+        ejected
+            .map(drop)
+            .map_err(|e| (ErrorCode::Internal, format!("CD-ROM {id:?}: {e}")))
     }
 
     /// Detach the device with qdev id `id`, returning it to the host: the
@@ -1703,6 +1751,15 @@ impl VmHandle {
     /// `device_del`: detach the device with qdev id `id` back to the host.
     pub fn detach_usb(&self, id: &str) -> Result<u8, vmlab_hv_proto::control::ErrorCode> {
         self.0.detach_usb(id)
+    }
+
+    /// `eject_media`: empty the CD-ROM with disk id `id`, even while the
+    /// guest locks it, and leave the tray closed.
+    pub fn eject_media(
+        &self,
+        id: &str,
+    ) -> Result<(), (vmlab_hv_proto::control::ErrorCode, String)> {
+        self.0.eject_media(id)
     }
 }
 

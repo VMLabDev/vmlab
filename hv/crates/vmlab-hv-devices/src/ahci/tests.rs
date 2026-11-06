@@ -607,6 +607,41 @@ fn p4_eject_insert_unit_attention_and_media_events() {
     assert_eq!(&event[4..6], &[2, 2]);
 }
 
+/// The host's eject goes through a guest lock and leaves the tray closed on
+/// an empty drive, which is what QEMU's forced `eject` plus
+/// `blockdev-close-tray` leave.
+#[test]
+fn forced_eject_overrides_the_guest_lock_and_closes_the_tray() {
+    let mut d = Driver::cdrom();
+    assert_eq!(d.packet(&[0x1e, 0, 0, 0, 1]).0, 0x50);
+    assert!(d.hba.eject_media(0).is_err());
+    assert_eq!(
+        d.hba.force_eject_media(0).unwrap().unwrap().size(),
+        64 * 2048
+    );
+    assert_eq!(
+        d.hba.media_state(0).unwrap(),
+        MediaState {
+            present: false,
+            tray_open: false,
+            locked: false
+        }
+    );
+    assert_eq!(d.packet(&[0]).0, 0x6451);
+    assert_eq!(d.packet(&[0]).0, 0x2451);
+    let (_, sense) = d.packet(&[3, 0, 0, 0, 18]);
+    assert_eq!(&sense[12..14], &[0x3a, 1]);
+    let (_, event) = d.packet(&[0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8]);
+    assert_eq!(&event[4..6], &[3, 0]);
+    assert_eq!(d.packet(&[0x28, 0, 0, 0, 0, 0, 0, 0, 1]).0, 0x2451);
+    assert!(d.hba.force_eject_media(0).unwrap().is_none());
+    assert!(d.hba.force_eject_media(1).is_err());
+    d.hba
+        .insert_media(0, image(vec![0xa5; 4096], true))
+        .unwrap();
+    assert!(d.hba.media_state(0).unwrap().present);
+}
+
 #[test]
 fn guest_tray_lock_eject_and_reload() {
     let mut d = Driver::cdrom();
