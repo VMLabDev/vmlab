@@ -11,6 +11,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Each job has a timeout-minutes of its usual time plus a margin, and each apt
+# step 20 minutes (VML-78): a hung apt mirror held the 0.44.0 release for 68
+# minutes, and the GitHub default is 6 hours.
 jobs:
   # The fast gate: every fmt and clippy step of the host and hypervisor
   # workspaces, so a fmt or lint failure ends the run before the long test
@@ -19,6 +22,7 @@ jobs:
   fmt-lint:
     name: fmt + lint (host + hypervisor)
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -32,8 +36,12 @@ jobs:
       # The fmt checks need no build: run them first.
       - run: just ci::fmt-check
       - run: just ci::hv-fmt-check
+      # VML-78: apt fails fast on a dead mirror and retries.
+      - name: Make apt fail fast
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
       # hv-lint builds against virglrenderer, the same way hv-check does.
       - name: Install native dependencies
+        timeout-minutes: 20
         run: just ci::hv-test-native-deps-install
       - name: Resolve virglrenderer cache identity
         id: virgl
@@ -54,13 +62,18 @@ jobs:
     name: fmt + lint + test
     needs: [fmt-lint, guest-crates, ebpf-verify]
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
+      # VML-78: apt fails fast on a dead mirror and retries.
+      - name: Make apt fail fast
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
       # vmlab's tests probe the host for the tools it drives — QEMU emulators +
       # firmware (x86 OVMF, aarch64 AAVMF, riscv EDK2), swtpm, the ISO/floppy
       # builders (xorriso/mtools), the SMB server, and tesseract for OCR — so
       # install them.
       - name: Install runtime deps
+        timeout-minutes: 20
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -84,6 +97,7 @@ jobs:
     name: hypervisor fmt + lint + test (no guests)
     needs: [fmt-lint, guest-crates, ebpf-verify]
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -92,7 +106,11 @@ jobs:
           components: rustfmt, clippy
       - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@uv
+      # VML-78: apt fails fast on a dead mirror and retries.
+      - name: Make apt fail fast
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
       - name: Install native dependencies
+        timeout-minutes: 20
         run: just ci::hv-test-native-deps-install
       - name: Resolve virglrenderer cache identity
         id: virgl
@@ -114,6 +132,7 @@ jobs:
   guest-crates:
     name: guest crates (cinit + agent)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -142,6 +161,7 @@ jobs:
   ebpf-verify:
     name: ebpf objects match source
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       # ebpf/rust-toolchain.toml selects the pinned nightly automatically;
@@ -167,6 +187,7 @@ jobs:
   version:
     name: Calculate version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     outputs:
       version: ${{ steps.calc.outputs.version }}
@@ -253,6 +274,7 @@ jobs:
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -291,11 +313,16 @@ jobs:
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v7
+      # VML-78: apt fails fast on a dead mirror and retries.
+      - name: Make apt fail fast
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
       - name: Install Windows cross compiler
+        timeout-minutes: 20
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-18 lld-18
@@ -322,6 +349,7 @@ jobs:
     needs: [version, vdisplay-build]
     if: needs.version.outputs.do_release == 'true'
     runs-on: windows-2025
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -357,10 +385,15 @@ jobs:
     needs: [version, check, hv-check, guest-crates, ebpf-verify, vdisplay-sign]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@just
+      # VML-78: apt fails fast on a dead mirror and retries.
+      - name: Make apt fail fast
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
       - name: Install host packages
+        timeout-minutes: 20
         run: |
           ./scripts/guest-toolchains.sh apt uv
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -414,6 +447,7 @@ jobs:
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -421,7 +455,11 @@ jobs:
           toolchain: 1.99.0
       - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@uv
+      # VML-78: apt fails fast on a dead mirror and retries.
+      - name: Make apt fail fast
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
       - name: Install native dependencies
+        timeout-minutes: 20
         run: just ci::hv-native-deps-install
       - name: Resolve virglrenderer cache identity
         id: virgl
@@ -453,6 +491,7 @@ jobs:
     needs: [version, build, guest-assets, hv-build]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
