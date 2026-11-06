@@ -445,7 +445,14 @@ impl UhciController {
         });
         let result = match port {
             None => None,
-            Some(port) => Some(execute(port, &self.memory, pid, endpoint, buffer, max_length)),
+            Some(port) => Some(execute(
+                port,
+                &self.memory,
+                pid,
+                endpoint,
+                buffer,
+                max_length,
+            )),
         };
         let errors = (control >> 27) & 3;
         let status = match result {
@@ -544,8 +551,7 @@ fn execute(
                         UsbTransfer::Ack(data) => Some(data),
                         UsbTransfer::Nak | UsbTransfer::Stall => None,
                     };
-                    if setup.request_type == 0 && setup.request == 5 && control.response.is_some()
-                    {
+                    if setup.request_type == 0 && setup.request == 5 && control.response.is_some() {
                         port.pending_address = Some(setup.value as u8 & 0x7f);
                     }
                 }

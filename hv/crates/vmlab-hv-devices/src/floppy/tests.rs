@@ -8,7 +8,6 @@ use crate::GuestMemory;
 use crate::chipset::rtc::Rtc;
 use crate::qtest_oracle::{self, Comparison, Line, Op};
 
-
 struct Machine {
     isa: Arc<Mutex<IsaDevices>>,
     floppy: Floppy,
@@ -33,12 +32,8 @@ impl Machine {
             floppy
                 .insert(
                     0,
-                    vmlab_disk::open(
-                        &image,
-                        vmlab_disk::Format::Raw,
-                        configuration == "readonly",
-                    )
-                    .unwrap(),
+                    vmlab_disk::open(&image, vmlab_disk::Format::Raw, configuration == "readonly")
+                        .unwrap(),
                 )
                 .unwrap();
         }
@@ -109,7 +104,9 @@ impl Machine {
                     comparison.check(&format!("in {port:#x}"), u32::from(actual), *value);
                 }
                 Op::Write { address, data } => {
-                    self.memory.write_slice(data, GuestAddress(*address)).unwrap();
+                    self.memory
+                        .write_slice(data, GuestAddress(*address))
+                        .unwrap();
                 }
                 Op::Read { address, data } => {
                     let mut actual = vec![0; data.len()];
@@ -171,13 +168,20 @@ fn qemu_oracle_floppy_with_an_empty_drive() {
 fn cmos_drive_types_follow_the_medium() {
     let isa = Arc::new(Mutex::new(IsaDevices::new()));
     let mut floppy = Floppy::new("floppy", isa, Arc::new(Line::default()));
-    assert_eq!(floppy.cmos_drive_types(), 0x50, "empty drive: 2.88 MB fallback");
+    assert_eq!(
+        floppy.cmos_drive_types(),
+        0x50,
+        "empty drive: 2.88 MB fallback"
+    );
     let directory = tempfile::tempdir().unwrap();
     for (size, cmos) in [(1_474_560usize, 0x40), (2_949_120, 0x50)] {
         let path = directory.path().join(format!("{size}.img"));
         std::fs::write(&path, vec![0; size]).unwrap();
         floppy
-            .insert(0, vmlab_disk::open(&path, vmlab_disk::Format::Raw, false).unwrap())
+            .insert(
+                0,
+                vmlab_disk::open(&path, vmlab_disk::Format::Raw, false).unwrap(),
+            )
             .unwrap();
         assert_eq!(floppy.cmos_drive_types(), cmos);
     }
@@ -185,7 +189,10 @@ fn cmos_drive_types_follow_the_medium() {
     std::fs::write(&path, vec![0; 737_280]).unwrap();
     assert!(
         floppy
-            .insert(0, vmlab_disk::open(&path, vmlab_disk::Format::Raw, false).unwrap())
+            .insert(
+                0,
+                vmlab_disk::open(&path, vmlab_disk::Format::Raw, false).unwrap()
+            )
             .is_err()
     );
 }
@@ -195,7 +202,10 @@ fn cmos_drive_types_follow_the_medium() {
 #[test]
 fn snapshot_round_trip_resumes_a_command_waiting_on_dma() {
     let mut machine = Machine::new("floppy");
-    machine.replay("floppy", Some("a masked channel holds the transfer until unmasked"));
+    machine.replay(
+        "floppy",
+        Some("a masked channel holds the transfer until unmasked"),
+    );
     // Program a masked channel and issue the read, as the oracle does.
     for (port, value) in [
         (0x0a, 0x06),
@@ -251,10 +261,22 @@ fn reset_returns_to_power_on_and_keeps_the_medium() {
     }
     assert!(!machine.irq.high());
     // The medium is still there: recalibrate and read sector 1 by PIO-free DMA.
-    for (port, value) in [(0x0a, 0x06), (0x0c, 0), (0x0b, 0x46), (0x04, 0), (0x04, 0x20)] {
+    for (port, value) in [
+        (0x0a, 0x06),
+        (0x0c, 0),
+        (0x0b, 0x46),
+        (0x04, 0),
+        (0x04, 0x20),
+    ] {
         machine.out(port, value);
     }
-    for (port, value) in [(0x81, 0), (0x0c, 0), (0x05, 0xff), (0x05, 0x01), (0x0a, 0x02)] {
+    for (port, value) in [
+        (0x81, 0),
+        (0x0c, 0),
+        (0x05, 0xff),
+        (0x05, 0x01),
+        (0x0a, 0x02),
+    ] {
         machine.out(port, value);
     }
     for byte in [0xe6, 0x00, 0, 0, 1, 2, 18, 0x1b, 0xff] {

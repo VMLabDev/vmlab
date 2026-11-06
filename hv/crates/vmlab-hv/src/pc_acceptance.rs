@@ -992,7 +992,11 @@ fn freedos_floppy_read_write_snapshot_reset() {
     };
     let mut agent = running.ready();
     dos_reads_floppy(&mut agent, "after boot");
-    shell(&mut agent, Guest::Dos, "echo written-by-dos>A:\\HVWRITE.TXT");
+    shell(
+        &mut agent,
+        Guest::Dos,
+        "echo written-by-dos>A:\\HVWRITE.TXT",
+    );
     assert_eq!(
         clean(&shell(&mut agent, Guest::Dos, "type A:\\HVWRITE.TXT").stdout),
         "written-by-dos"
@@ -1030,7 +1034,9 @@ fn region_change(
         for column in x..(x + 12).min(before.width) {
             let offset = ((row * before.width + column) * 4) as usize;
             for channel in 0..3 {
-                total += u64::from(before.pixels[offset + channel].abs_diff(after.pixels[offset + channel]));
+                total += u64::from(
+                    before.pixels[offset + channel].abs_diff(after.pixels[offset + channel]),
+                );
             }
         }
     }
@@ -1056,7 +1062,9 @@ fn windows_7_uhci_tablet_moves_the_cursor() {
                 "wmic path Win32_PnPEntity get Name,PNPDeviceID,Status /format:csv",
             )
             .stdout,
-        );
+        )
+        // wmic's CSV output escapes `&` as an XML entity.
+        .replace("&amp;", "&");
         let upper = report.to_ascii_uppercase();
         if upper.contains("PCI\\VEN_8086&DEV_7020")
             && upper.contains("USB\\VID_0627&PID_0001")
@@ -1075,7 +1083,10 @@ fn windows_7_uhci_tablet_moves_the_cursor() {
         upper.contains("DEV_7020") || upper.contains("VID_0627") || upper.contains("HID")
     }) {
         eprintln!("Windows 7 USB: {line}");
-        assert!(line.trim_end().ends_with(",OK"), "device not working: {line}");
+        assert!(
+            line.trim_end().ends_with(",OK"),
+            "device not working: {line}"
+        );
     }
     let display = running.directory.path().join("display.sock");
     let input = Client::connect(&display, Capabilities(Capabilities::INPUT)).unwrap();

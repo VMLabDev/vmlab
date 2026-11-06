@@ -6,7 +6,6 @@ use super::*;
 use crate::qtest_oracle::{self, Comparison, Line, Op};
 use crate::usb::Tablet;
 
-
 /// The PIIX3 USB function as the oracle's qtest machine addresses it:
 /// configuration through 0xcf8/0xcfc at 00:01.2, BAR4 wherever the replay
 /// places it, and IRQ 11 through PIRQD.
@@ -101,7 +100,9 @@ impl Machine {
                     comparison.check(&format!("in{width} {port:#x}"), actual, *value);
                 }
                 Op::Write { address, data } => {
-                    self.memory.write_slice(data, GuestAddress(*address)).unwrap();
+                    self.memory
+                        .write_slice(data, GuestAddress(*address))
+                        .unwrap();
                 }
                 Op::Read { address, data } => {
                     let mut actual = vec![0; data.len()];
@@ -135,8 +136,15 @@ fn snapshot_round_trip_keeps_the_schedule_and_the_device_address() {
     machine.replay(Some("request to an absent address times out"));
     let td = 0x101100u64;
     let mut control = [0; 4];
-    machine.memory.read_slice(&mut control, GuestAddress(td + 4)).unwrap();
-    assert_eq!(u32::from_le_bytes(control), 0x1988_0000, "NAKing interrupt TD");
+    machine
+        .memory
+        .read_slice(&mut control, GuestAddress(td + 4))
+        .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(control),
+        0x1988_0000,
+        "NAKing interrupt TD"
+    );
     let state = machine.uhci.save_state().unwrap();
 
     let mut restored = Machine::new();
@@ -157,7 +165,10 @@ fn snapshot_round_trip_keeps_the_schedule_and_the_device_address() {
         })
         .unwrap();
     restored.uhci.advance(2_000_000);
-    restored.memory.read_slice(&mut control, GuestAddress(td + 4)).unwrap();
+    restored
+        .memory
+        .read_slice(&mut control, GuestAddress(td + 4))
+        .unwrap();
     assert_eq!(
         u32::from_le_bytes(control) & (TD_ACTIVE | 0x7ff),
         5,

@@ -40,7 +40,10 @@ fn hex(text: &str) -> Vec<u8> {
 
 pub(crate) fn run(configuration: &str) -> Run {
     let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
-    assert!(oracle.get("error").is_none(), "the oracle recorded an error");
+    assert!(
+        oracle.get("error").is_none(),
+        "the oracle recorded an error"
+    );
     let value = oracle["runs"]
         .as_array()
         .unwrap()
@@ -80,7 +83,12 @@ pub(crate) fn run(configuration: &str) -> Run {
             let irq = step
                 .get("irq")
                 .and_then(|irq| irq.as_array())
-                .map(|lines| lines.iter().map(|line| line.as_u64().unwrap() as u32).collect())
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .map(|line| line.as_u64().unwrap() as u32)
+                        .collect()
+                })
                 .unwrap_or_default();
             Step { op, irq }
         })

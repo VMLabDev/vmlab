@@ -679,15 +679,12 @@ impl Floppy {
                 return;
             }
             let media = self.drives[drive].media.as_mut().unwrap();
-            match operation {
-                Operation::Read | Operation::Verify => {
-                    if media.image.read_at(lba, &mut buffer).is_err() {
-                        drop(isa);
-                        self.finish(0x40 | se(seeked), 0x20, at, n);
-                        return;
-                    }
-                }
-                _ => {}
+            if matches!(operation, Operation::Read | Operation::Verify)
+                && media.image.read_at(lba, &mut buffer).is_err()
+            {
+                drop(isa);
+                self.finish(0x40 | se(seeked), 0x20, at, n);
+                return;
             }
             let progress = isa.dma_transfer(DMA_CHANNEL, &mut buffer);
             drop(isa);
@@ -909,7 +906,8 @@ impl Snapshot for Floppy {
         .map_err(|e| DeviceError::State(e.to_string()))
     }
     fn restore_state(&mut self, state: &[u8]) -> Result<(), DeviceError> {
-        let invalid = || DeviceError::State("floppy snapshot version, media or phase mismatch".into());
+        let invalid =
+            || DeviceError::State("floppy snapshot version, media or phase mismatch".into());
         let saved: Saved = serde_json::from_slice(state).map_err(|_| invalid())?;
         if saved.version != 1
             || saved.drives.len() != 2
@@ -917,12 +915,20 @@ impl Snapshot for Floppy {
             || saved.rate > 3
             || saved.fifo.len() > 16
             || saved.result_position > saved.fifo.len()
-            || saved.drives.iter().any(|drive| drive.at.track > CYLINDERS || drive.at.head > 1)
+            || saved
+                .drives
+                .iter()
+                .any(|drive| drive.at.track > CYLINDERS || drive.at.head > 1)
         {
             return Err(invalid());
         }
         for (drive, state) in self.drives.iter().zip(&saved.drives) {
-            if drive.media.as_ref().map(|media| (media.kind, media.read_only)) != state.media {
+            if drive
+                .media
+                .as_ref()
+                .map(|media| (media.kind, media.read_only))
+                != state.media
+            {
                 return Err(invalid());
             }
         }

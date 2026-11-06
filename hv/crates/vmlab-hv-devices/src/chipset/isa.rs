@@ -82,10 +82,7 @@ impl DmaController {
             0..=7 => {
                 let channel = usize::from(reg / 2);
                 let (base, current) = if reg & 1 == 0 {
-                    (
-                        &mut self.base_address[channel],
-                        &mut self.address[channel],
-                    )
+                    (&mut self.base_address[channel], &mut self.address[channel])
                 } else {
                     (&mut self.base_count[channel], &mut self.count[channel])
                 };
@@ -650,7 +647,9 @@ mod tests {
         let mut head = [0; 2];
         memory.read_slice(&mut head, GuestAddress(0x10000)).unwrap();
         let mut beyond = [0; 2];
-        memory.read_slice(&mut beyond, GuestAddress(0x20000)).unwrap();
+        memory
+            .read_slice(&mut beyond, GuestAddress(0x20000))
+            .unwrap();
         assert_eq!((tail, head, beyond), ([1, 2], [0, 0], [3, 4]));
         assert_eq!(registers(&mut d, 2), (0x0002, 0xffff));
     }
@@ -664,7 +663,9 @@ mod tests {
         assert!(d.dma_transfer(3, &mut [1, 2, 3, 4]).terminal_count);
         let memory = d.memory.clone().unwrap();
         let mut stored = [0; 5];
-        memory.read_slice(&mut stored, GuestAddress(0x4000)).unwrap();
+        memory
+            .read_slice(&mut stored, GuestAddress(0x4000))
+            .unwrap();
         assert_eq!(stored, [1, 2, 3, 4, 0]);
         assert_eq!(registers(&mut d, 3), (0x4000, 0xffff));
         let mut stored = [0; 4];
@@ -679,7 +680,9 @@ mod tests {
                 terminal_count: true
             }
         );
-        memory.read_slice(&mut stored, GuestAddress(0x30000)).unwrap();
+        memory
+            .read_slice(&mut stored, GuestAddress(0x30000))
+            .unwrap();
         assert_eq!(stored, [5, 6, 7, 8]);
         assert_eq!(d.io_read(0xd0), 0x02, "controller 2 TC on channel 5");
     }

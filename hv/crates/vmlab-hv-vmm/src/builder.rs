@@ -1102,11 +1102,8 @@ pub fn build(
     let floppy = if pc {
         let chipset = chipset.as_ref().unwrap();
         chipset.isa.lock().set_memory(ram.mem.clone());
-        let mut controller = vmlab_hv_devices::floppy::Floppy::new(
-            "floppy",
-            chipset.isa.clone(),
-            isa_irq(10, 6),
-        );
+        let mut controller =
+            vmlab_hv_devices::floppy::Floppy::new("floppy", chipset.isa.clone(), isa_irq(10, 6));
         if let Some(path) = &desc.floppy {
             let image = vmlab_disk::open(path, vmlab_disk::Format::Raw, false).map_err(|e| {
                 VmmError::DeviceUnavailable {
@@ -1556,19 +1553,14 @@ pub fn build(
                 Some(image.image.lock().size() / 512);
         }
         let cd_first = desc.disks.iter().any(|disk| disk.cdrom);
-        chipset
-            .as_ref()
-            .unwrap()
-            .rtc
-            .lock()
-            .configure_pc(
-                disks,
-                cd_first,
-                desc.vcpus as u8,
-                floppy
-                    .as_ref()
-                    .map_or(0, |floppy| floppy.lock().cmos_drive_types()),
-            );
+        chipset.as_ref().unwrap().rtc.lock().configure_pc(
+            disks,
+            cd_first,
+            desc.vcpus as u8,
+            floppy
+                .as_ref()
+                .map_or(0, |floppy| floppy.lock().cmos_drive_types()),
+        );
     }
     if let Some(a20) = &ram.a20 {
         snap_nodes.push(DeviceNode::Plain(a20.clone()));

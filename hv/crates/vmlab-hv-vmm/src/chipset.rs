@@ -510,9 +510,8 @@ impl Chipset {
                 }
                 // A floppy command waiting on DMA continues once channel 2
                 // is ready; take the controller only after releasing ISA.
-                let waiting = isa.pending_requests()
-                    & (1 << vmlab_hv_devices::floppy::DMA_CHANNEL)
-                    != 0;
+                let waiting =
+                    isa.pending_requests() & (1 << vmlab_hv_devices::floppy::DMA_CHANNEL) != 0;
                 if port == 0x61 {
                     match self.vm.get_pit2().and_then(|mut pit| {
                         pit.channels[2].gate = u8::from(isa.pit2_gate());
