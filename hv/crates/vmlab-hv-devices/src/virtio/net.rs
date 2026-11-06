@@ -2874,7 +2874,9 @@ mod tests {
                 (actual_header, pair, actual_frame),
                 (header, 1, frame.as_slice())
             );
-            assert_eq!(f.vqs[3].used_idx(&f.mem), 1);
+            // The worker writes the frame to the switch before it returns the
+            // chain, so the used ring can trail the socket read.
+            wait_for("tx chain returned", || f.vqs[3].used_idx(&f.mem) == 1);
         }
     }
 
