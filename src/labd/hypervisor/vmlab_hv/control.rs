@@ -27,7 +27,7 @@ use vmlab_hv_proto::control::{
     Capability, Command, ErrorCode, Event, Outcome, RunState, ShutdownReason,
 };
 
-use super::super::{Control, Debugger, Frames, Hotplug, Input, Process, Snapshots};
+use super::super::{Control, Debugger, Frames, Hotplug, Input, Media, Process, Snapshots};
 use super::display::HvDisplay;
 
 /// One running `vmlab-hv`, through its control socket.
@@ -339,7 +339,32 @@ impl Control for HvControl {
         })
     }
 
-    // Media: no phase delivered yet has it, so the trait's `None` stands.
+    /// Removable media, on a machine launched with a CD-ROM.
+    fn media(&self) -> Option<Arc<dyn Media>> {
+        self.capabilities
+            .contains(&Capability::Media)
+            .then(|| Arc::new(HvMedia(self.commands.clone())) as Arc<dyn Media>)
+    }
+}
+
+/// The **media** capability as `eject_media` on the install CD-ROM, the
+/// drive the description names [`super::describe::INSTALL_CDROM_ID`].
+/// vmlab-hv takes the medium out whatever the guest locked and leaves the
+/// tray closed, as QEMU's forced `eject` plus `blockdev-close-tray` do.
+struct HvMedia(Arc<Mutex<Client>>);
+
+#[async_trait::async_trait]
+impl Media for HvMedia {
+    async fn eject_install_cdrom(&self) -> Result<()> {
+        call(
+            &self.0,
+            Command::EjectMedia {
+                id: super::describe::INSTALL_CDROM_ID.into(),
+            },
+        )
+        .await
+        .map(drop)
+    }
 }
 
 struct HvDebugger(Arc<Mutex<Client>>);
@@ -944,6 +969,44 @@ mod tests {
         let mut control = HvControl::connect(&without.socket).await.unwrap();
         control.set_display(display.path.clone());
         assert!(control.frames().is_none() && control.input().is_none());
+    }
+
+    /// The install CD-ROM's eject is `eject_media` on `cd0`, offered only
+    /// when the handshake advertises `media`, and a refusal names the
+    /// command and its code.
+    #[tokio::test]
+    async fn the_install_cdrom_eject_rides_eject_media() {
+        let hv = fake_hv(vec![Capability::Media], |c| match c {
+            Command::EjectMedia { id } if id == "cd0" => Outcome::Ok { status: None },
+            _ => Outcome::Error {
+                code: ErrorCode::DeviceNotFound,
+                message: "no CD-ROM with that id".into(),
+            },
+        });
+        let control = HvControl::connect(&hv.socket).await.unwrap();
+        let media = control.media().expect("advertised");
+        media.eject_install_cdrom().await.unwrap();
+        assert_eq!(
+            hv.seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Command::EjectMedia { id: "cd0".into() }
+        );
+
+        let refusing = fake_hv(vec![Capability::Media], |_| Outcome::Error {
+            code: ErrorCode::DeviceNotFound,
+            message: "no CD-ROM with id \"cd0\"".into(),
+        });
+        let control = HvControl::connect(&refusing.socket).await.unwrap();
+        let err = format!(
+            "{:#}",
+            control
+                .media()
+                .unwrap()
+                .eject_install_cdrom()
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("eject_media"), "{err}");
+        assert!(err.contains("device_not_found"), "{err}");
     }
 
     /// USB passthrough (phase 2f): an attach plan is `device_add` field for

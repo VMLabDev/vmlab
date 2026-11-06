@@ -57,6 +57,18 @@ impl Optical {
         Ok(self.image.take())
     }
 
+    /// Remove the medium on the host's word, whatever the guest locked: the
+    /// guest's prevent-removal is released, the tray stays closed and the
+    /// drive is left empty. The guest sees a media change, a unit attention
+    /// and then "medium not present, tray closed".
+    pub fn force_eject(&mut self) -> Option<Box<dyn DiskImage>> {
+        self.locked = false;
+        self.tray_open = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.changed(3);
+        self.image.take()
+    }
+
     pub fn media_state(&self) -> MediaState {
         MediaState {
             present: self.present(),

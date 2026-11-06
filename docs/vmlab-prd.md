@@ -2755,6 +2755,11 @@ too. `vmlab usb attach` and `detach` (§5.2.1) are vmlab-hv's `device_add` and
 `device_del` with QEMU's `usb-host` arguments, and a detach completes when
 vmlab-hv reports `device_deleted` for the device, as QEMU's `DEVICE_DELETED`.
 
+**Media.** `eject_cdrom()` is vmlab-hv's `eject_media` on the install CD-ROM,
+`cd0`, offered where vmlab-hv advertises `media`: it takes the medium out
+even while the guest holds the drive locked and leaves the tray closed and
+empty, as QEMU's forced `eject` and `blockdev-close-tray` do.
+
 **Audio.** `audio = true` (§11) is an HDA function at 00:1b.0 whose node
 vmlab names `vmlab.<lab>.<machine>`, with the microphone as its capture
 stream where `microphone = true`.
