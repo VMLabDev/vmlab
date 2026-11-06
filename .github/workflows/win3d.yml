@@ -1,12 +1,15 @@
 name: Windows 3D driver checks
 
+# Same branch filter as ci.yml: not on card branches or next (D12).
 on:
   push:
+    branches: [main, 'release/**']
     paths:
       - 'guest/win3d/**'
       - '.github/workflows/win3d.yml'
       - '.just/ci/**'
   pull_request:
+    branches: [main]
     paths:
       - 'guest/win3d/**'
       - '.github/workflows/win3d.yml'
