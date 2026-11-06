@@ -16,10 +16,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
-    Accel, AppleSmc, Arch, Audio, AudioDevice, Boot, CpuPolicy, Disk, DiskBus, DiskFormat,
-    Display, DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV,
-    Machine, MsrPolicy, Nic, NicAttachment, PciAddress, SerialPort, Tpm, VfioDevice,
-    VirtualDisplay,
+    Accel, AppleSmc, Arch, Audio, AudioDevice, Boot, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
+    DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV, Machine,
+    MsrPolicy, Nic, NicAttachment, PciAddress, SerialPort, Tpm, VfioDevice, VirtualDisplay,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -1315,21 +1314,20 @@ mod tests {
         let mut paths = ovmf_paths(false);
         paths.tsc_hz = Some(2_995_200_000);
         let key = "FAKE".repeat(16);
-        paths.apple_smc_osk = Some(
-            crate::config::host::HostConfig::parse(&format!(
-                "import <vmlab-host.wcl>\nhost {{ apple_smc_osk = \"{key}\" }}"
-            ))
-            .unwrap()
-            .apple_smc_osk
-            .unwrap(),
-        );
+        paths.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse(key.clone()).unwrap());
         let d = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap();
         assert_eq!(d.cpu_model.as_deref(), Some("Skylake-Client-v4"));
         assert!(d.vmware_cpuid_freq && d.invtsc && d.usb_keyboard && d.smbios_type2);
         assert_eq!(d.tsc_khz, Some(2_995_200));
         assert_eq!(d.msr_policy, MsrPolicy::Ignore);
-        assert_eq!(d.applesmc.as_ref().map(|s| s.osk.as_str()), Some(key.as_str()));
-        assert!(!format!("{d:?}").contains(&key), "Debug never shows the key");
+        assert_eq!(
+            d.applesmc.as_ref().map(|s| s.osk.as_str()),
+            Some(key.as_str())
+        );
+        assert!(
+            !format!("{d:?}").contains(&key),
+            "Debug never shows the key"
+        );
         assert!(
             !serde_json::to_string(&d.redacted()).unwrap().contains(&key),
             "the redacted dump never holds the key"

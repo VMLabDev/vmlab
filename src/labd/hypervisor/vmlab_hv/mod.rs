@@ -197,8 +197,11 @@ impl SecretHandover {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
         }
-        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR)
-            .with_context(|| format!("creating {}", path.display()))?;
+        nix::unistd::mkfifo(
+            path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .with_context(|| format!("creating {}", path.display()))?;
         Ok(Self {
             path: path.to_path_buf(),
             secret,
@@ -241,11 +244,7 @@ impl Handing {
 
 /// Open `path` (a pipe) for writing as soon as a reader has it open, write
 /// `bytes` and close, so the reader sees end of file.
-fn write_to_reader(
-    path: &Path,
-    bytes: &[u8],
-    stop: &std::sync::atomic::AtomicBool,
-) -> Result<()> {
+fn write_to_reader(path: &Path, bytes: &[u8], stop: &std::sync::atomic::AtomicBool) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let deadline = std::time::Instant::now() + HANDOVER_DEADLINE;
@@ -253,11 +252,11 @@ fn write_to_reader(
         // Non-blocking: ENXIO until the reader opens its end.
         match std::fs::OpenOptions::new()
             .write(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
             .open(path)
         {
             Ok(pipe) => break pipe,
-            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {}
+            Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => {}
             Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
         }
         if stop.load(std::sync::atomic::Ordering::SeqCst) {

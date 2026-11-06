@@ -605,7 +605,9 @@ mod tests {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
         let why = refused(&format!(r#"{base} profile = "macos""#));
         assert!(why.is_empty(), "{why:?}");
-        let why = refused(&format!(r#"{base} profile = "macos" cpu_model = "Haswell""#));
+        let why = refused(&format!(
+            r#"{base} profile = "macos" cpu_model = "Haswell""#
+        ));
         assert!(
             why.len() == 1 && why[0].contains("macos profile's cpu_model only"),
             "{why:?}"

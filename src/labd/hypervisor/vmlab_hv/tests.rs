@@ -435,6 +435,9 @@ async fn a_secret_handover_stops_when_the_launch_failed() {
     let started = std::time::Instant::now();
     let error = handing.finish(false).await.unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(error.to_string().contains("exited before reading"), "{error}");
+    assert!(
+        error.to_string().contains("exited before reading"),
+        "{error}"
+    );
     assert_eq!(std::fs::read(&path).unwrap(), b"redacted");
 }
