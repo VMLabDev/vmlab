@@ -512,12 +512,28 @@ mod tests {
         assert_ne!(reply & crate::net::frame::TCP_RST, 0, "flags {reply:#x}");
     }
 
-    /// A free loopback port, released for the test to claim.
+    /// A free loopback port below the kernel's ephemeral range, released for
+    /// the test to claim. The test frees the port on every removal, and
+    /// until the re-bind any `bind(:0)` or outgoing connect on the host can
+    /// be handed a just-freed ephemeral port: on a loaded host that window
+    /// is wide enough to lose (VML-61). The kernel never hands out a port
+    /// below the range, so only a program that names this port can take it.
     fn free_port() -> std::net::SocketAddr {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
+        const FLOOR: u16 = 1024;
+        let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse::<u16>().ok())
+            .unwrap_or(32768);
+        assert!(low > FLOOR, "the ephemeral range starts at {low}");
+        let span = low - FLOOR;
+        let start = rand::random::<u16>() % span;
+        for i in 0..span {
+            let port = FLOOR + (start + i) % span;
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                return l.local_addr().unwrap();
+            }
+        }
+        panic!("no free loopback port below {low}");
     }
 
     /// Re-installing a forward on the port it was just removed from binds

@@ -157,9 +157,8 @@ impl SmbServer {
                 }
             })?;
 
-        // Give smbd a beat; if it immediately died (e.g. port in use), report.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        if let Ok(Some(status)) = child.try_wait() {
+        // Give smbd a beat; if it died at start (e.g. port in use), report.
+        if let Some(status) = wait_for_start(&mut child, config.listen_port) {
             let reason = diagnose_start_failure(&config)
                 .or_else(|| last_log_line(&log))
                 .unwrap_or_else(|| "smbd gave no reason".to_string());
@@ -196,6 +195,38 @@ impl SmbServer {
 impl Drop for SmbServer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// The shortest wait before a live `smbd` counts as started: it covers the
+/// failures that come after the port check, such as the port in use.
+const START_MIN: std::time::Duration = std::time::Duration::from_millis(300);
+/// The longest wait for `smbd` to open its port or exit. A live `smbd` past
+/// it counts as started, as one past [`START_MIN`] always did.
+const START_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for `smbd` to start: `Some(status)` when it exited, `None` when it
+/// is up. It is up once it is alive past [`START_MIN`] with its port
+/// accepting, or alive at [`START_MAX`]. A single check at [`START_MIN`]
+/// took a slow failure for a start on a loaded host (VML-61).
+fn wait_for_start(child: &mut Child, port: u16) -> Option<std::process::ExitStatus> {
+    let started = std::time::Instant::now();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        let waited = started.elapsed();
+        if waited >= START_MAX {
+            return None;
+        }
+        if waited >= START_MIN
+            && std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+                .is_ok()
+        {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -557,7 +588,14 @@ mod tests {
             rand::random::<u64>()
         ));
         let mut config = test_config(tmp.join("smb"));
-        config.listen_port = free_high_port();
+        // Held bound but not listening for the whole test: nothing else can
+        // listen there, so the port never answers and only smbd's own exit
+        // ends the start wait (VML-61).
+        let held =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        held.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        config.listen_port = held.local_addr().unwrap().as_socket().unwrap().port();
         config.run_dir = tmp.join("r".repeat(120));
         let err = SmbServer::spawn(config.clone(), HashMap::new()).unwrap_err();
         let _ = std::fs::remove_dir_all(&tmp);

@@ -499,8 +499,13 @@ mod tests {
         })
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        assert!(rec.is_finished());
+        // Bounded, not one-shot: on a loaded host ffmpeg and the frame clock
+        // can run past 0.5 s by more than a fixed margin (VML-61).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !rec.is_finished() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(rec.is_finished(), "the recording outlived 0.5 s by 30 s");
         let done = rec.stop().await.unwrap();
         assert!(
             done.ended_by
