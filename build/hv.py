@@ -57,8 +57,13 @@ def native_packages(*groups):
     return packages
 
 
+def sudo_prefix():
+    """`sudo` unless this already runs as root (as in a container build)."""
+    return [] if os.geteuid() == 0 else ["sudo"]
+
+
 def apt_install(*groups):
-    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    prefix = sudo_prefix()
     run(*prefix, "apt-get", "update")
     run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
         *native_packages(*groups))
@@ -71,6 +76,7 @@ def native_deps_install():
 
 def test_native_deps_install():
     apt_install("virgl", "hypervisor", "test")
+    prefix = sudo_prefix()
     run(*prefix, "install", "-d", "/usr/share/qemu")
     for name in ("vgabios-stdvga.bin", "vgabios-virtio.bin"):
         target = Path("/usr/share/qemu") / name
