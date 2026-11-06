@@ -10,11 +10,13 @@ mod keyboard;
 mod ring;
 mod state;
 mod tablet;
+mod uhci;
 mod xhci;
 pub use host::HostUsbDevice;
 pub use keyboard::{KEYBOARD_PORT, KEYBOARD_REPORT_DESCRIPTOR, Keyboard};
 
 pub use tablet::{PointerEvent, TABLET_REPORT_DESCRIPTOR, Tablet};
+pub use uhci::{UHCI_BAR_SIZE, UHCI_PORTS, UhciController};
 pub use xhci::{BAR_SIZE, TABLET_PORT, XhciController};
 
 use crate::{DeviceError, Snapshot};

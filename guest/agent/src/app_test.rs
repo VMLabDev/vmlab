@@ -742,12 +742,52 @@ fn rdp_dials_the_local_listener_and_refuses_no_account() {
 /// connections for a while (about 40 s on Windows Server 2022), and the host
 /// starts its RDP client on `ready`. So `ready` waits for the listener,
 /// saying once why it waits.
+/// A loopback port held bound but not listening. A connect to it is
+/// refused, and no other socket on the host can take it, until [`listen`]
+/// turns the same socket into the listener.
+///
+/// A port probed with a listener that is then dropped stays free for anyone
+/// until the test binds it again. On a busy host another test suite can take
+/// it in that gap, and the agent's first dial then succeeds: `ready` arrives
+/// with no "waiting" line before it, or instead of the error a test waits for.
+///
+/// [`listen`]: HeldPort::listen
+struct HeldPort {
+    socket: std::os::fd::OwnedFd,
+    port: u16,
+}
+
+impl HeldPort {
+    fn new() -> HeldPort {
+        use nix::sys::socket::{
+            AddressFamily, SockFlag, SockType, SockaddrIn, bind, getsockname, socket,
+        };
+        use std::os::fd::AsRawFd;
+        let socket = socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(socket.as_raw_fd(), &SockaddrIn::new(127, 0, 0, 1, 0)).unwrap();
+        let port = getsockname::<SockaddrIn>(socket.as_raw_fd())
+            .unwrap()
+            .port();
+        HeldPort { socket, port }
+    }
+
+    fn listen(self) -> TcpListener {
+        use nix::sys::socket::{Backlog, listen};
+        listen(&self.socket, Backlog::new(8).unwrap()).unwrap();
+        TcpListener::from(self.socket)
+    }
+}
+
 #[test]
 fn rdp_is_ready_only_once_the_listener_accepts() {
-    let port = {
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    let held = HeldPort::new();
+    let port = held.port;
     let p = TestPlatform::new();
     let (mux, cap) = capture_mux();
     mux.apps().tune(Duration::from_secs(30), port);
@@ -762,7 +802,7 @@ fn rdp_is_ready_only_once_the_listener_accepts() {
         "waiting for Remote Desktop to listen on 127.0.0.1:{port}"
     ));
 
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = held.listen();
     assert_eq!(host.record(), AppRecord::Ready { display: None });
     drop(listener);
 }
@@ -771,10 +811,8 @@ fn rdp_is_ready_only_once_the_listener_accepts() {
 /// rather than leaving the host waiting on a `ready` that cannot come.
 #[test]
 fn rdp_with_no_listener_fails_the_session() {
-    let port = {
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    let held = HeldPort::new();
+    let port = held.port;
     let p = TestPlatform::new();
     let (mux, cap) = capture_mux();
     mux.apps().tune(Duration::from_secs(30), port);

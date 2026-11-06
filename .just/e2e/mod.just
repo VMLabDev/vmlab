@@ -40,6 +40,7 @@ run *args: image-build
 		-v "$PWD/e2e:/e2e:ro" \
 		-v "$PWD/e2e/results:/results" \
 		$(test -d "$HOME/.local/share/config-weave/bin" && echo "-v $HOME/.local/share/config-weave/bin:/opt/config-weave:ro -e VMLAB_CONFIG_WEAVE_DIR=/opt/config-weave") \
+		$(test -n "${VMLAB_E2E_LEGACY_STORE:-}" && echo "-v $(realpath "$VMLAB_E2E_LEGACY_STORE"):/legacy-store:ro -e VMLAB_E2E_LEGACY_STORE=/legacy-store") \
 		{{image}} {{args}}
 
 # Drop the download cache volume

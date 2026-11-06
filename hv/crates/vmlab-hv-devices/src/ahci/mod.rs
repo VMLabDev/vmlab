@@ -152,6 +152,15 @@ impl Ahci {
         self.optical_mut(port)?.eject_media()
     }
 
+    /// Remove the host image whatever the guest locked, leaving the tray
+    /// closed and the drive empty.
+    pub fn force_eject_media(
+        &mut self,
+        port: usize,
+    ) -> Result<Option<Box<dyn DiskImage>>, DeviceError> {
+        Ok(self.optical_mut(port)?.force_eject())
+    }
+
     fn optical_mut(&mut self, port: usize) -> Result<&mut Optical, DeviceError> {
         match self.drives.get_mut(port) {
             Some(Some(Drive::Cdrom(optical))) => Ok(optical),

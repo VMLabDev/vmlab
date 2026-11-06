@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use vmlab_hv_devices::{IrqLine, MsiSink};
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, DiskBus, FirmwareKind, Machine, MachineDescription, PciAddress,
+    Accel, Arch, Boot, DiskBus, FirmwareKind, Machine, MachineDescription, NicModel, PciAddress,
 };
 
 use crate::acpi::{self, AcpiConfig};
@@ -324,7 +324,9 @@ fn validate_q35_devices(desc: &MachineDescription) -> Result<(), VmmError> {
     if let Some(display) = &desc.virtual_display {
         add(Some(display.pci), "virtual_display")?;
     }
-    if let Some(tablet) = desc.tablet {
+    if let Some(tablet) = desc.tablet
+        && desc.machine != Machine::Pc
+    {
         add(Some(tablet), "tablet")?;
     }
     // The tablet and the passthrough controller are one xHCI function.
@@ -368,7 +370,7 @@ fn validate_q35_devices(desc: &MachineDescription) -> Result<(), VmmError> {
 }
 
 fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
-    use vmlab_hv_proto::machine::{DisplayDevice, NicModel};
+    use vmlab_hv_proto::machine::DisplayDevice;
     let invalid = |reason: &str| Err(VmmError::InvalidMachine(reason.into()));
     let pc = desc.machine == Machine::Pc;
     if let Some(model) = desc.cpu_model.as_deref()
@@ -405,12 +407,21 @@ fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
     if desc.vmware_cpuid_freq && !desc.hyperv.is_empty() {
         return invalid("vmware_cpuid_freq cannot share the Hyper-V CPUID range");
     }
-    if desc.floppy.is_some() {
-        return invalid(if pc {
-            "pc floppy requires phase 4c"
-        } else {
-            "floppy requires machine=pc"
-        });
+    if let Some(floppy) = &desc.floppy {
+        if !pc {
+            return invalid("floppy requires machine=pc");
+        }
+        let size = std::fs::metadata(floppy).map(|metadata| metadata.len());
+        if !size
+            .as_ref()
+            .is_ok_and(|size| vmlab_hv_devices::floppy::MediaKind::for_size(*size).is_some())
+        {
+            return Err(VmmError::InvalidMachine(format!(
+                "floppy {} must be a raw 1.44 MB (1474560-byte) or 2.88 MB (2949120-byte) image{}",
+                floppy.display(),
+                size.map_or_else(|e| format!(": {e}"), |size| format!(", not {size} bytes"))
+            )));
+        }
     }
     if pc {
         if !matches!(
@@ -422,34 +433,53 @@ fn validate_legacy_features(desc: &MachineDescription) -> Result<(), VmmError> {
         ) {
             return invalid("pc requires SeaBIOS firmware boot");
         }
-        if desc.tablet.is_some() || desc.usb.is_some() {
-            return invalid("pc UHCI tablet and USB require phase 4c");
+        if desc
+            .tablet
+            .is_some_and(|tablet| (tablet.bus, tablet.device, tablet.function) != (0, 1, 2))
+        {
+            return invalid("the pc tablet sits on the PIIX3 UHCI at 00:01.2");
         }
-        if !desc.nics.is_empty() {
-            return invalid("pc networking requires phase 4b");
+        if desc.usb.is_some() {
+            return invalid("host USB passthrough requires the q35 xHCI");
+        }
+        for nic in &desc.nics {
+            if nic.model == NicModel::Virtio {
+                return invalid("pc NICs are e1000 or pcnet; virtio-net is a q35 device");
+            }
+            if !matches!(
+                nic.attachment,
+                vmlab_hv_proto::machine::NicAttachment::Stream { .. }
+            ) {
+                return invalid("e1000 and pcnet use the stream attachment");
+            }
+            if nic.pci.is_none() {
+                return invalid("a pc NIC requires a PCI address");
+            }
         }
         if desc.ahci_pci.is_some() || desc.disks.iter().any(|disk| disk.bus == DiskBus::Ahci) {
             return invalid("pc uses PIIX IDE, not q35 AHCI");
         }
-        if desc
-            .display
-            .as_ref()
-            .is_some_and(|display| display.device != DisplayDevice::StdVga)
-        {
-            return invalid("pc requires std-vga; Cirrus requires phase 4d");
+        if desc.display.as_ref().is_some_and(|display| {
+            !matches!(
+                display.device,
+                DisplayDevice::StdVga | DisplayDevice::CirrusVga
+            )
+        }) {
+            return invalid("pc requires std-vga or cirrus-vga");
         }
         if desc.audio.is_some() || desc.tpm.is_some() || !desc.vfio.is_empty() {
             return invalid("audio, TPM and VFIO require machine=q35");
         }
     } else if desc.nics.iter().any(|nic| nic.model != NicModel::Virtio) {
-        return invalid("e1000 and pcnet require machine=pc and phase 4b");
+        return invalid("e1000 and pcnet require machine=pc");
     }
-    if desc
-        .display
-        .as_ref()
-        .is_some_and(|display| display.device == DisplayDevice::CirrusVga)
+    if !pc
+        && desc
+            .display
+            .as_ref()
+            .is_some_and(|display| display.device == DisplayDevice::CirrusVga)
     {
-        return invalid("Cirrus requires machine=pc and phase 4d");
+        return invalid("Cirrus requires machine=pc");
     }
     let mut slots = std::collections::BTreeSet::new();
     for disk in &desc.disks {
@@ -959,6 +989,8 @@ pub fn build(
         let path = display.rom.as_deref().unwrap_or(std::path::Path::new(
             if display.device == vmlab_hv_proto::machine::DisplayDevice::VmwareSvga {
                 "/usr/share/qemu/vgabios-vmware.bin"
+            } else if display.device == vmlab_hv_proto::machine::DisplayDevice::CirrusVga {
+                "/usr/share/qemu/vgabios-cirrus.bin"
             } else if virtio {
                 "/usr/share/qemu/vgabios-virtio.bin"
             } else {
@@ -1003,6 +1035,14 @@ pub fn build(
             place(vga.clone(), Some(display.pci))?;
             snap_nodes.push(DeviceNode::Resettable(vga.clone()));
             crate::display::Video::Virtio(vga)
+        } else if display.device == vmlab_hv_proto::machine::DisplayDevice::CirrusVga {
+            let vga = Arc::new(Mutex::new(
+                vmlab_hv_devices::display::cirrus::CirrusVga::new("vga", &rom)
+                    .map_err(|e| VmmError::Other(e.to_string()))?,
+            ));
+            place(vga.clone(), Some(display.pci))?;
+            snap_nodes.push(DeviceNode::Resettable(vga.clone()));
+            crate::display::Video::Cirrus(vga)
         } else {
             let mut device = vmlab_hv_devices::display::StandardVga::new("vga", &rom)
                 .map_err(|e| VmmError::Other(e.to_string()))?;
@@ -1077,6 +1117,47 @@ pub fn build(
     } else {
         None
     };
+    // The 82078-style floppy controller on ISA DMA channel 2 and IRQ 6.
+    // pc always has it, as QEMU's does: drive A is empty unless the
+    // description inserts a medium. The medium is not a snapshot disk:
+    // like a physical floppy, its contents stay as they are when a
+    // snapshot loads (raw images have no internal snapshots).
+    let floppy = if pc {
+        let chipset = chipset.as_ref().unwrap();
+        chipset.isa.lock().set_memory(ram.mem.clone());
+        let mut controller =
+            vmlab_hv_devices::floppy::Floppy::new("floppy", chipset.isa.clone(), isa_irq(10, 6));
+        if let Some(path) = &desc.floppy {
+            let image = vmlab_disk::open(path, vmlab_disk::Format::Raw, false).map_err(|e| {
+                VmmError::DeviceUnavailable {
+                    device: "floppy",
+                    reason: format!("floppy {}: {e}", path.display()),
+                }
+            })?;
+            controller
+                .insert(0, image)
+                .map_err(|e| VmmError::InvalidMachine(e.to_string()))?;
+        }
+        let floppy = Arc::new(Mutex::new(controller));
+        // 0x3f6 between the two windows belongs to the primary IDE channel.
+        for (base, length, offset) in [(0x3f0, 6, 0), (0x3f7, 1, 7)] {
+            io_bus
+                .register(
+                    base,
+                    length,
+                    Arc::new(Mutex::new(vmlab_hv_devices::floppy::FloppyPorts::new(
+                        floppy.clone(),
+                        offset,
+                    ))),
+                )
+                .map_err(VmmError::Other)?;
+        }
+        *chipset.floppy.lock() = Some(floppy.clone());
+        snap_nodes.push(DeviceNode::Resettable(floppy.clone()));
+        Some(floppy)
+    } else {
+        None
+    };
     let ahci = if let Some(address) = desc.ahci_pci {
         let transport = wiring(Some(address), 1, false)?;
         let ahci = Arc::new(Mutex::new(vmlab_hv_devices::ahci::Ahci::new(
@@ -1091,6 +1172,7 @@ pub fn build(
     } else {
         None
     };
+    let mut optical = Vec::new();
     for disk in &desc.disks {
         if disk.bus == DiskBus::Ide {
             let image = disk
@@ -1119,6 +1201,16 @@ pub fn build(
                 )
             }
             .map_err(|error| VmmError::Other(format!("IDE {}: {error}", disk.id)))?;
+            if disk.cdrom {
+                optical.push((
+                    disk.id.clone(),
+                    crate::vm::OpticalSlot::Ide {
+                        controller: ide.clone().unwrap(),
+                        channel,
+                        unit,
+                    },
+                ));
+            }
             if let Some(image) = image {
                 snap_disks.push(DiskNode {
                     id: disk.id.clone(),
@@ -1130,6 +1222,15 @@ pub fn build(
             continue;
         }
         if disk.bus == DiskBus::Ahci {
+            if disk.cdrom {
+                optical.push((
+                    disk.id.clone(),
+                    crate::vm::OpticalSlot::Ahci {
+                        controller: ahci.clone().unwrap(),
+                        port: disk.port.unwrap() as usize,
+                    },
+                ));
+            }
             if disk.cdrom && disk.path.is_none() {
                 ahci.as_ref()
                     .unwrap()
@@ -1208,8 +1309,58 @@ pub fn build(
             snap_nodes.push(DeviceNode::Virtio(node));
         }
     }
-    // One NIC per interface.
-    for nic in &desc.nics {
+    // One NIC per interface. e1000 and PCnet are pc's emulated models; the
+    // rest is virtio-net.
+    for nic in desc.nics.iter().filter(|nic| nic.model != NicModel::Virtio) {
+        let address = nic
+            .pci
+            .ok_or_else(|| VmmError::InvalidMachine("a pc NIC requires a PCI address".into()))?;
+        let mac = parse_nic_mac(&nic.mac)?;
+        let vmlab_hv_proto::machine::NicAttachment::Stream { socket } = &nic.attachment else {
+            return Err(VmmError::InvalidMachine(
+                "e1000 and pcnet use the stream attachment".into(),
+            ));
+        };
+        let intx = wiring(Some(address), 1, false)?
+            .intx
+            .ok_or_else(|| VmmError::InvalidMachine("pc NIC without an INTx line".into()))?;
+        let id = format!("nic-{}", nic.mac);
+        let unavailable = |e: std::io::Error| VmmError::DeviceUnavailable {
+            device: "nic",
+            reason: format!("nic {}: {e}", nic.mac),
+        };
+        let (function, node): (SharedFunction, SharedSnapshot) = match nic.model {
+            NicModel::E1000 => {
+                let dev = Arc::new(Mutex::new(
+                    vmlab_hv_devices::nic::e1000::E1000::new(id, mac, ram.mem.clone(), intx)
+                        .map_err(unavailable)?,
+                ));
+                vmlab_hv_devices::nic::e1000::E1000::start(&dev, socket.clone());
+                (dev.clone(), dev)
+            }
+            _ => {
+                let dev = Arc::new(Mutex::new(
+                    vmlab_hv_devices::nic::pcnet::Pcnet::new(id, mac, ram.mem.clone(), intx)
+                        .map_err(unavailable)?,
+                ));
+                vmlab_hv_devices::nic::pcnet::Pcnet::start(&dev, socket.clone());
+                (dev.clone(), dev)
+            }
+        };
+        place(function, Some(address))?;
+        if let Some(rom) = &nic.rom {
+            let image = std::fs::read(rom).map_err(|e| VmmError::DeviceUnavailable {
+                device: "nic",
+                reason: format!("option ROM {}: {e}", rom.display()),
+            })?;
+            pci_root
+                .lock()
+                .attach_option_rom(address.device, address.function, &image)
+                .map_err(VmmError::Other)?;
+        }
+        snap_nodes.push(DeviceNode::Virtio(node));
+    }
+    for nic in desc.nics.iter().filter(|nic| nic.model == NicModel::Virtio) {
         let built = add_pci(
             &pci_root,
             factory.virtio_net(
@@ -1246,10 +1397,33 @@ pub fn build(
             .register(PM1A_EVT_BASE, PM_BLOCK_LEN, pm.clone())
             .map_err(VmmError::Other)?;
     }
+    // pc's tablet rides the PIIX3 UHCI at 00:01.2 (D6), on PIRQD as its
+    // interrupt pin D swizzles.
+    if pc && let Some(address) = desc.tablet {
+        let intx = crate::q35::PirqRouter::line(&pirqs, address, 4).map_err(VmmError::Other)?;
+        let mut controller =
+            vmlab_hv_devices::usb::UhciController::new("uhci", ram.mem.clone(), intx);
+        controller
+            .attach(
+                1,
+                Box::new(vmlab_hv_devices::usb::Tablet::full_speed(hid_serial(
+                    address, 28754, 1,
+                ))),
+            )
+            .map_err(|e| VmmError::Other(e.to_string()))?;
+        let uhci = Arc::new(Mutex::new(controller));
+        pci_root
+            .lock()
+            .add_device_at(1, 2, uhci.clone())
+            .map_err(VmmError::Other)?;
+        snap_nodes.push(DeviceNode::Virtio(uhci.clone()));
+        *chipset.as_ref().unwrap().uhci.lock() = Some(uhci);
+    }
     // One xHCI carries the absolute tablet and the host passthrough ports:
     // `tablet` places it for input, `usb` (vmlab's `usb = true`, the
     // controller it names `usbx`) additionally enables hot-plug.
     let xhci_address = match (desc.tablet, desc.usb) {
+        _ if pc => None,
         (Some(tablet), Some(usb)) if tablet != usb => {
             return Err(VmmError::DeviceUnavailable {
                 device: "usb controller",
@@ -1433,7 +1607,22 @@ pub fn build(
                 vcpus: platform.vcpus,
                 max_cpus: platform.max_cpus,
                 ram_regions: platform.ram_regions,
-                pci_devices: platform.pci_devices.into_iter().map(Into::into).collect(),
+                pci_devices: platform
+                    .pci_devices
+                    .into_iter()
+                    .map(|device| {
+                        let mut device = vmlab_hv_firmware::pc::PciDevice::from(device);
+                        // The display is never hotpluggable: std-VGA carries
+                        // that through its `vga` flag, Cirrus has no flag.
+                        if desc.display.as_ref().is_some_and(|display| {
+                            (display.pci.device, display.pci.function)
+                                == (device.device, device.function)
+                        }) {
+                            device.hotplug = false;
+                        }
+                        device
+                    })
+                    .collect(),
                 pci64_base: if layout.ram_top() > 1 << 32 {
                     platform.pci64_base
                 } else {
@@ -1472,12 +1661,14 @@ pub fn build(
                 Some(image.image.lock().size() / 512);
         }
         let cd_first = desc.disks.iter().any(|disk| disk.cdrom);
-        chipset
-            .as_ref()
-            .unwrap()
-            .rtc
-            .lock()
-            .configure_pc(disks, cd_first, desc.vcpus as u8);
+        chipset.as_ref().unwrap().rtc.lock().configure_pc(
+            disks,
+            cd_first,
+            desc.vcpus as u8,
+            floppy
+                .as_ref()
+                .map_or(0, |floppy| floppy.lock().cmos_drive_types()),
+        );
     }
     if let Some(a20) = &ram.a20 {
         snap_nodes.push(DeviceNode::Plain(a20.clone()));
@@ -1499,6 +1690,7 @@ pub fn build(
     *shared.vga.lock() = vga;
     *shared.virtual_display.lock() = virtual_display;
     *shared.xhci.lock() = xhci;
+    *shared.optical.lock() = optical;
     shared
         .usb_hotplug
         .store(desc.usb.is_some(), std::sync::atomic::Ordering::SeqCst);
@@ -1557,6 +1749,21 @@ fn machine_digest(desc: &MachineDescription) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(&desc.redacted()).unwrap_or_default();
     Sha256::digest(&bytes).into()
+}
+
+/// A PCI function and its snapshot view, the same device behind both.
+type SharedFunction = Arc<Mutex<dyn vmlab_hv_devices::PciDevice>>;
+type SharedSnapshot = Arc<Mutex<dyn vmlab_hv_devices::PciSnapshot>>;
+/// `aa:bb:cc:dd:ee:ff` as six bytes.
+fn parse_nic_mac(text: &str) -> Result<[u8; 6], VmmError> {
+    let parts: Vec<u8> = text
+        .split(':')
+        .map(|part| u8::from_str_radix(part, 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| VmmError::InvalidMachine(format!("invalid NIC MAC `{text}`")))?;
+    parts
+        .try_into()
+        .map_err(|_| VmmError::InvalidMachine(format!("invalid NIC MAC `{text}`")))
 }
 
 #[cfg(test)]

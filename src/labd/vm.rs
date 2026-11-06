@@ -54,9 +54,11 @@ fn no_agent_hint(answered_before: bool, baked: Option<&str>) -> String {
             "the guest's vmlab-agent ({version}) has not answered yet — the guest is likely \
              still booting; retry once `vmlab status` shows it ready"
         ),
-        (false, None) => "the guest has no running vmlab-agent (its template records no agent: \
-             it predates agent support) — rebuild it with `vmlab template build`"
-            .to_string(),
+        (false, None) => {
+            "the guest's vmlab-agent has not answered, and its template records no agent; \
+             use an agent-enabled template for agent commands"
+                .to_string()
+        }
     }
 }
 
@@ -2029,8 +2031,12 @@ impl super::machine::Machine for VmInstance {
     /// afxdp tap fast path.
     /// QEMU inherits a descriptor. vmlab-hv receives its queue descriptors
     /// over the control socket while the VM remains paused.
+    /// QEMU takes a TAP for any NIC, and vmlab-hv takes TAP queues for
+    /// virtio-net. vmlab-hv's emulated pc NICs (e1000, PCnet) have one queue
+    /// and attach by stream socket only, so they take no TAP.
     fn takes_tap_fds(&self) -> bool {
-        true
+        self.hypervisor() != HypervisorKind::Vmlab
+            || self.template().resolved.nic_model.starts_with("virtio-net")
     }
 
     fn net_framing(&self) -> crate::net::framing::FramingMode {
@@ -2731,9 +2737,14 @@ mod tests {
         let gone = no_agent_hint(true, Some("agent=12858e1"));
         assert!(gone.contains("answered earlier"), "{gone}");
         assert!(!gone.contains("predates"), "{gone}");
+    }
 
+    #[test]
+    fn a_template_with_no_recorded_agent_is_not_assumed_to_be_old() {
         let none = no_agent_hint(false, None);
-        assert!(none.contains("predates agent support"), "{none}");
-        assert!(none.contains("vmlab template build"), "{none}");
+        assert!(none.contains("template records no agent"), "{none}");
+        assert!(!none.contains("predates"), "{none}");
+        assert!(none.contains("agent-enabled template"), "{none}");
+        assert!(!none.contains("vmlab template build"), "{none}");
     }
 }

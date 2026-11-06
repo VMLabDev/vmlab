@@ -16,12 +16,14 @@ use crate::{error::VmmError, vm::VmShared};
 pub(crate) enum Video {
     Standard(Arc<Mutex<vmlab_hv_devices::display::StandardVga>>),
     Virtio(Arc<Mutex<vmlab_hv_devices::display::virtio_vga::VirtioVga>>),
+    Cirrus(Arc<Mutex<vmlab_hv_devices::display::cirrus::CirrusVga>>),
 }
 
 impl Video {
     pub(crate) fn scanout_active(&self) -> bool {
         match self {
             Self::Standard(device) => device.lock().scanout_active(),
+            Self::Cirrus(device) => device.lock().scanout_active(),
             Self::Virtio(device) => device.lock().scanout_active(),
         }
     }
@@ -30,7 +32,7 @@ impl Video {
     }
     pub(crate) fn poll_scanout(&self) -> bool {
         match self {
-            Self::Standard(_) => true,
+            Self::Standard(_) | Self::Cirrus(_) => true,
             Self::Virtio(device) => device.lock().poll_scanout(),
         }
     }
@@ -46,30 +48,35 @@ impl Video {
     pub(crate) fn io_read(&self, port: u16, data: &mut [u8]) {
         match self {
             Self::Standard(device) => device.lock().io_read(port, data),
+            Self::Cirrus(device) => device.lock().io_read(port, data),
             Self::Virtio(device) => device.lock().io_read(port, data),
         }
     }
     pub(crate) fn io_write(&self, port: u16, data: &[u8]) {
         match self {
             Self::Standard(device) => device.lock().io_write(port, data),
+            Self::Cirrus(device) => device.lock().io_write(port, data),
             Self::Virtio(device) => device.lock().io_write(port, data),
         }
     }
     pub(crate) fn legacy_read(&self, offset: u64, data: &mut [u8]) {
         match self {
             Self::Standard(device) => device.lock().legacy_read(offset, data),
+            Self::Cirrus(device) => device.lock().legacy_read(offset, data),
             Self::Virtio(device) => device.lock().legacy_read(offset, data),
         }
     }
     pub(crate) fn legacy_write(&self, offset: u64, data: &[u8]) {
         match self {
             Self::Standard(device) => device.lock().legacy_write(offset, data),
+            Self::Cirrus(device) => device.lock().legacy_write(offset, data),
             Self::Virtio(device) => device.lock().legacy_write(offset, data),
         }
     }
     pub(crate) fn frame(&self) -> (u64, vmlab_hv_devices::display::Frame) {
         match self {
             Self::Standard(device) => (0, device.lock().frame()),
+            Self::Cirrus(device) => (0, device.lock().frame()),
             Self::Virtio(device) => {
                 let mut device = device.lock();
                 (device.scanout_generation(), device.frame())
@@ -79,37 +86,41 @@ impl Video {
     pub(crate) fn linear_framebuffer(&self) -> vmlab_hv_devices::GuestMemory {
         match self {
             Self::Standard(device) => device.lock().linear_framebuffer(),
+            Self::Cirrus(device) => device.lock().linear_framebuffer(),
             Self::Virtio(device) => device.lock().linear_framebuffer(),
         }
     }
     pub(crate) fn mark_framebuffer_dirty(&self) {
         match self {
             Self::Standard(device) => device.lock().mark_framebuffer_dirty(),
+            Self::Cirrus(device) => device.lock().mark_framebuffer_dirty(),
             Self::Virtio(device) => device.lock().mark_framebuffer_dirty(),
         }
     }
     pub(crate) fn framebuffer_size(&self) -> usize {
         match self {
             Self::Standard(_) => 16 << 20,
+            Self::Cirrus(_) => vmlab_hv_devices::display::cirrus::VRAM_SIZE,
             Self::Virtio(_) => 8 << 20,
         }
     }
     pub(crate) fn pci_id(&self) -> u32 {
         match self {
             Self::Standard(device) => device.lock().pci_identity(),
+            Self::Cirrus(device) => device.lock().pci_identity(),
             Self::Virtio(_) => 0x10501af4,
         }
     }
     pub(crate) fn framebuffer_bar(&self) -> usize {
         match self {
             Self::Standard(device) => device.lock().framebuffer_bar(),
-            Self::Virtio(_) => 0,
+            Self::Virtio(_) | Self::Cirrus(_) => 0,
         }
     }
     pub(crate) fn unsupported_fifo(&self) -> Option<String> {
         match self {
             Self::Standard(device) => device.lock().unsupported_fifo(),
-            Self::Virtio(_) => None,
+            Self::Virtio(_) | Self::Cirrus(_) => None,
         }
     }
     pub(crate) fn cursor(&self) -> vmlab_hv_display::Cursor {
@@ -530,12 +541,22 @@ impl InputSink for Input {
                 let mut pointer = self.pointer.lock();
                 pointer_message(&mut pointer, message);
                 let xhci = shared.xhci.lock().clone();
-                if let Some(xhci) = xhci {
+                // pc's tablet sits on the PIIX3 UHCI instead.
+                let uhci = shared
+                    .chipset
+                    .lock()
+                    .as_ref()
+                    .and_then(|chipset| chipset.uhci.lock().clone());
+                if xhci.is_some() || uhci.is_some() {
                     loop {
                         if shared.exited() {
                             break;
                         }
-                        let result = xhci.lock().inject_pointer(*pointer);
+                        let result = match (&xhci, &uhci) {
+                            (Some(xhci), _) => xhci.lock().inject_pointer(*pointer),
+                            (None, Some(uhci)) => uhci.lock().inject_pointer(*pointer),
+                            (None, None) => break,
+                        };
                         match result {
                             Ok(()) => break,
                             Err(error @ vmlab_hv_devices::DeviceError::Io(_)) if matches!(&error, vmlab_hv_devices::DeviceError::Io(error) if error.kind() == io::ErrorKind::WouldBlock) =>

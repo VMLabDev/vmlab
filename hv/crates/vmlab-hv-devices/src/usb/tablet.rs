@@ -56,6 +56,11 @@ impl PointerEvent {
 /// snapshots; the default matches QEMU at PCI 00:01.0, first USB connector.
 pub struct Tablet {
     serial: String,
+    /// Full-speed descriptors for a USB 1.1 root port (PIIX3 UHCI): QEMU
+    /// 11.1.2 reports maxpacket0 8, an interrupt interval of 10 ms and a
+    /// qualifier for the high-speed configuration (qtest oracle,
+    /// `docs/hwref/pc-fdc-uhci-oracle.json`).
+    full_speed: bool,
     pub(super) configuration: u8,
     address: u8,
     pub(super) idle: u8,
@@ -78,6 +83,7 @@ impl Tablet {
     pub fn new(serial: impl Into<String>) -> Self {
         Self {
             serial: serial.into(),
+            full_speed: false,
             configuration: 0,
             address: 0,
             idle: 0,
@@ -90,10 +96,28 @@ impl Tablet {
             clock: Instant::now(),
         }
     }
+    /// The tablet on a full-speed (UHCI) root port.
+    pub fn full_speed(serial: impl Into<String>) -> Self {
+        Self {
+            full_speed: true,
+            ..Self::new(serial)
+        }
+    }
     fn descriptor(&self, kind: u8, index: u8) -> Option<Vec<u8>> {
         Some(match (kind, index) {
+            (1, 0) if self.full_speed => {
+                let mut b = DEVICE.to_vec();
+                b[7] = 8;
+                b
+            }
             (1, 0) => DEVICE.to_vec(),
+            (2, 0) if self.full_speed => {
+                let mut b = CONFIG.to_vec();
+                b[33] = 10;
+                b
+            }
             (2, 0) => CONFIG.to_vec(),
+            (6, 0) if self.full_speed => vec![10, 6, 0, 2, 0, 0, 0, 64, 1, 0],
             (3, 0) => vec![4, 3, 9, 4],
             (3, 1..=11) => {
                 let s = match index {
@@ -132,7 +156,11 @@ impl Tablet {
 
 impl UsbDevice for Tablet {
     fn speed(&self) -> UsbSpeed {
-        UsbSpeed::High
+        if self.full_speed {
+            UsbSpeed::Full
+        } else {
+            UsbSpeed::High
+        }
     }
     fn reset(&mut self) {
         self.configuration = 0;
@@ -298,6 +326,7 @@ impl Snapshot for Tablet {
         r.end()?;
         *self = Self {
             serial,
+            full_speed: self.full_speed,
             configuration: b[0],
             address: b[1],
             idle: b[2],

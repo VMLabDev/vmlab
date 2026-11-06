@@ -15,6 +15,7 @@
 //! and https://www.qemu.org/docs/master/specs/standard-vga.html, a specification
 //! document. PCI identity follows docs/hwref/q35-seabios-linux-generic.
 
+pub mod cirrus;
 pub mod font;
 #[cfg(test)]
 mod tests;
@@ -142,6 +143,7 @@ impl Frame {
 pub struct StandardVga {
     svga: Option<Svga>,
     id: String,
+    vram_size: usize,
     config: [u8; 256],
     regs: [u8; REG_SIZE],
     dispi: [u16; 16],
@@ -173,16 +175,27 @@ impl StandardVga {
     /// `rom` is the host's SeaVGABIOS image, not a QEMU-built option ROM.
     /// Images must have the PCI ROM signature and fit the captured 128 KiB BAR.
     pub fn new(id: impl Into<String>, rom: &[u8]) -> Result<Self, DeviceError> {
+        Self::with_vram(id, rom, VRAM_SIZE)
+    }
+
+    /// A VGA core with `vram_size` bytes of video memory, for adapters that
+    /// reuse the VGA register and planar logic with a smaller framebuffer.
+    pub(crate) fn with_vram(
+        id: impl Into<String>,
+        rom: &[u8],
+        vram_size: usize,
+    ) -> Result<Self, DeviceError> {
         if rom.len() < 3 || rom.len() > ROM_SIZE || rom[..2] != [0x55, 0xaa] {
             return Err(DeviceError::Other("invalid VGA option ROM".into()));
         }
         let mut dev = Self {
             svga: None,
             id: id.into(),
+            vram_size,
             config: [0; 256],
             regs: [0; REG_SIZE],
             dispi: [0; 16],
-            vram: GuestMemoryMmap::from_ranges(&[(GuestAddress(0), VRAM_SIZE)])
+            vram: GuestMemoryMmap::from_ranges(&[(GuestAddress(0), vram_size)])
                 .map_err(|e| DeviceError::Memory(e.to_string()))?,
             rom: vec![0xff; ROM_SIZE],
             seq_index: 0,
@@ -256,7 +269,7 @@ impl StandardVga {
 
     fn dispi_read(&self, index: usize) -> u16 {
         if index == 10 {
-            return (VRAM_SIZE >> 16) as u16;
+            return (self.vram_size >> 16) as u16;
         }
         if self.dispi[4] & 2 != 0 {
             match index {
@@ -267,7 +280,7 @@ impl StandardVga {
             }
         }
         if index == 7 {
-            return (VRAM_SIZE / self.guest_stride().max(1)).min(u16::MAX as usize) as u16;
+            return (self.vram_size / self.guest_stride().max(1)).min(u16::MAX as usize) as u16;
         }
         self.dispi.get(index).copied().unwrap_or(0)
     }
@@ -288,7 +301,7 @@ impl StandardVga {
             2 => value > 0 && value <= 2160,
             3 => matches!(value, 4 | 8 | 15 | 16 | 24 | 32),
             4 => true,
-            5 => (value as usize) < VRAM_SIZE / 65536,
+            5 => (value as usize) < self.vram_size / 65536,
             8 | 9 => true,
             _ => false,
         };
@@ -304,7 +317,7 @@ impl StandardVga {
             self.dispi[9] = 0;
             if value & 0x80 == 0 {
                 self.vram
-                    .write_slice(&vec![0; VRAM_SIZE], GuestAddress(0))
+                    .write_slice(&vec![0; self.vram_size], GuestAddress(0))
                     .unwrap();
             }
         }
@@ -770,7 +783,11 @@ impl StandardVga {
         }
         let mut pixels = vec![0; mode.stride as usize * mode.height as usize];
         // Translate and copy guest memory once, rather than once per pixel.
-        let size = if self.enabled() { VRAM_SIZE } else { 0x40000 };
+        let size = if self.enabled() {
+            self.vram_size
+        } else {
+            0x40000
+        };
         self.render_vram.resize(size, 0);
         self.vram
             .read_slice(&mut self.render_vram, GuestAddress(0))
@@ -1049,7 +1066,7 @@ impl PciDevice for StandardVga {
                     for (i, byte) in data.iter().enumerate() {
                         if let Some(address) = (offset as usize)
                             .checked_add(i)
-                            .filter(|address| *address < VRAM_SIZE)
+                            .filter(|address| *address < self.vram_size)
                         {
                             self.set_byte(address, *byte);
                             self.dirty = true;
@@ -1078,7 +1095,7 @@ impl PciDevice for StandardVga {
                     if let Some(dest) = offset
                         .checked_add(i as u64)
                         .and_then(|v| usize::try_from(v).ok())
-                        .filter(|v| *v < VRAM_SIZE)
+                        .filter(|v| *v < self.vram_size)
                     {
                         self.set_byte(dest, *byte);
                         self.dirty = true;
@@ -1153,7 +1170,7 @@ impl Snapshot for StandardVga {
         state.extend_from_slice(&self.dispi_index.to_le_bytes());
         state.extend_from_slice(&self.latch);
         let start = state.len();
-        state.resize(start + VRAM_SIZE, 0);
+        state.resize(start + self.vram_size, 0);
         self.vram
             .read_slice(&mut state[start..], GuestAddress(0))
             .map_err(|e| DeviceError::Memory(e.to_string()))?;
@@ -1165,7 +1182,7 @@ impl Snapshot for StandardVga {
 
     fn restore_state(&mut self, state: &[u8]) -> Result<(), DeviceError> {
         let header = 8 + 256 + REG_SIZE + 32;
-        let size = header + 20 + VRAM_SIZE;
+        let size = header + 20 + self.vram_size;
         if state.len() < size
             || (self.svga.is_none() && state.len() != size)
             || !matches!(&state[..8], b"VGA\0\x01\0\0\0" | b"VGA\0\x02\0\0\0")
@@ -1196,7 +1213,7 @@ impl Snapshot for StandardVga {
             || dispi[1] > 4096
             || dispi[2] > 2160
             || dispi[6] > 4096
-            || dispi[5] >= 256
+            || dispi[5] as usize >= self.vram_size / 65536
             || !matches!(dispi[3], 0 | 4 | 8 | 15 | 16 | 24 | 32)
             || (dispi[4] & 1 != 0
                 && (dispi[1] == 0 || dispi[2] == 0 || dispi[3] == 0 || dispi[6] < dispi[1]))

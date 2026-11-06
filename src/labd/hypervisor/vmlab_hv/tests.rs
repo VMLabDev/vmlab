@@ -310,6 +310,85 @@ async fn a_container_is_launched_from_its_description_and_controlled() {
     );
 }
 
+/// A VM with an install CD-ROM launches with it as `cd0`, and its media
+/// capability, where the handshake advertises it, empties that drive with
+/// `eject_media`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vms_install_cdrom_is_ejected_through_the_media_capability() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path();
+    let argv = run.join("argv");
+    let bin = fake_binary(
+        run,
+        &format!(
+            "echo \"$@\" > {}.tmp && mv {0}.tmp {0}\nexec sleep 30",
+            argv.display()
+        ),
+    );
+    let firmware = run.join("firmware/x86_64");
+    std::fs::create_dir_all(&firmware).unwrap();
+    std::fs::write(firmware.join("bios-vmlab-q35.bin"), b"").unwrap();
+    std::fs::write(firmware.join("vgabios-stdvga.bin"), b"").unwrap();
+    let cfg = crate::qemu::resolve::testing::vm(
+        r#"vm "web" { template = "scratch" arch = "x86_64" profile = "linux-modern" firmware = "seabios" cpus = 1 memory = 512MiB disk = 1GiB }"#,
+    );
+    let resolved =
+        crate::qemu::resolve_vm(&cfg, None, &crate::profiles::ProfileSet::shipped().unwrap())
+            .unwrap();
+    let install = run.join("install.iso");
+    let launch = Launch::Vm {
+        lab: "lab1".into(),
+        resolved: Box::new(resolved),
+        paths: Box::new(crate::qemu::VmPaths {
+            primary_disk: run.join("disk.qcow2"),
+            cdroms: vec![install.clone(), run.join("media.iso")],
+            install_cdrom: true,
+            agent_sock: run.join("agent.sock"),
+            qmp_sock: run.join("control.sock"),
+            display_sock: run.join("display.sock"),
+            vnc_sock: run.join("vnc.sock"),
+            serial_log: Some(run.join("serial.log")),
+            ..Default::default()
+        }),
+        accel: crate::qemu::Accel::Kvm,
+        emulator: None,
+    };
+    let seen = serve_once_spawned(
+        argv.clone(),
+        run.join("control.sock"),
+        vec![Capability::Media],
+    );
+    let running = VmlabHv::for_vm(Some(bin), Some(run.join("firmware")))
+        .start_emulator(spec(run, launch))
+        .await
+        .unwrap();
+
+    let description: vmlab_hv_proto::MachineDescription =
+        serde_json::from_slice(&std::fs::read(run.join("machine.json")).unwrap()).unwrap();
+    let cd = description
+        .disks
+        .iter()
+        .find(|d| d.id == "cd0")
+        .expect("the install CD-ROM");
+    assert!(
+        cd.cdrom && cd.path.as_deref() == Some(install.as_path()),
+        "{cd:?}"
+    );
+
+    let media = running.control.media().expect("advertised");
+    media.eject_install_cdrom().await.unwrap();
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(2)).unwrap(),
+        Command::EjectMedia { id: "cd0".into() }
+    );
+    running.proc.kill().await;
+    running
+        .proc
+        .wait_exit(Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
 /// What the binary says on its way out is the error, not a timeout.
 #[tokio::test]
 async fn a_hypervisor_that_exits_during_startup_is_reported() {
@@ -329,20 +408,22 @@ async fn a_hypervisor_that_exits_during_startup_is_reported() {
     assert!(err.contains("/dev/kvm: permission denied"), "{err}");
 }
 
-/// A VM the delivered phases cannot run — the i440fx legacy PC, phase 4 —
-/// is refused before anything spawns.
+/// A VM the delivered phases cannot run — here a floppy on q35, which
+/// vmlab-hv attaches only on pc — is refused before anything spawns.
 #[tokio::test]
-async fn a_legacy_pc_vm_is_refused_before_anything_spawns() {
+async fn an_unsupported_vm_is_refused_before_anything_spawns() {
     let dir = tempfile::tempdir().unwrap();
     let run = dir.path();
     let bin = fake_binary(run, &format!("touch {}/spawned", run.display()));
+    let mut paths: Box<crate::qemu::cmdline::VmPaths> = Box::default();
+    paths.floppy = Some("/answer.img".into());
     let launch = Launch::Vm {
         lab: "lab1".into(),
         resolved: Box::new(crate::qemu::resolve::testing::resolved_vm(
-            "windows-legacy",
+            "linux-generic",
             "x86_64",
         )),
-        paths: Box::default(),
+        paths,
         accel: crate::qemu::Accel::Kvm,
         emulator: None,
     };
@@ -351,7 +432,7 @@ async fn a_legacy_pc_vm_is_refused_before_anything_spawns() {
         .await
         .err()
         .expect("refused");
-    assert!(err.to_string().contains("q35"), "{err}");
+    assert!(err.to_string().contains("a floppy drive"), "{err}");
     assert!(!run.join("spawned").exists());
     assert!(!run.join("machine.json").exists());
 }
