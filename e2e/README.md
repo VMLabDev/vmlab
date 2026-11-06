@@ -86,7 +86,7 @@ only its four template versions into the run's store, using sparse files and
 reflinks where available. With `just e2e::run`, set `VMLAB_E2E_LEGACY_STORE` on
 the host to the source store; the recipe mounts it read-only at `/legacy-store`
 and sets the variable to that path inside the container, so the source is never
-written. Give the e2e container a 64 GiB limit.
+written. The recipe's 24 GiB container limit applies.
 `--only legacy` does not build the unrelated Alpine base template.
 
 Before each boot, the scenario waits until fewer than two project VMs run on

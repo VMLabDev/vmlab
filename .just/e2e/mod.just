@@ -30,17 +30,22 @@ image-build: require-docker
 	DOCKER_BUILDKIT=1 docker build --provenance=false -f build/Dockerfile -t {{build_image}} .
 	DOCKER_BUILDKIT=1 docker build --build-arg VMLAB_BUILD_IMAGE={{build_image}} -f e2e/Dockerfile -t {{image}} .
 
+[private]
+require-legacy-store:
+	@if [ -n "${VMLAB_E2E_LEGACY_STORE:-}" ] && [ ! -d "$VMLAB_E2E_LEGACY_STORE" ]; then echo "VMLAB_E2E_LEGACY_STORE is not a directory: $VMLAB_E2E_LEGACY_STORE (give an absolute path; a quoted ~ does not expand)" >&2; exit 1; fi
+
 # Run the suite (arguments go to e2e/run.py: `--only core dev`, `--keep`, `--list`, `--hypervisor vmlab`)
 [group('e2e')]
-run *args: image-build
+run *args: require-legacy-store image-build
 	mkdir -p e2e/results
+	legacy="${VMLAB_E2E_LEGACY_STORE:+$(realpath "$VMLAB_E2E_LEGACY_STORE")}"; \
 	docker run --rm --init --privileged --device /dev/kvm --memory 24g --memory-swap 24g \
 		-e VMLAB_E2E_RENDER_NODE \
 		-v {{cache}}:/root/.local/share/vmlab/cache/artefacts \
 		-v "$PWD/e2e:/e2e:ro" \
 		-v "$PWD/e2e/results:/results" \
 		$(test -d "$HOME/.local/share/config-weave/bin" && echo "-v $HOME/.local/share/config-weave/bin:/opt/config-weave:ro -e VMLAB_CONFIG_WEAVE_DIR=/opt/config-weave") \
-		$(test -n "${VMLAB_E2E_LEGACY_STORE:-}" && echo "-v $(realpath "$VMLAB_E2E_LEGACY_STORE"):/legacy-store:ro -e VMLAB_E2E_LEGACY_STORE=/legacy-store") \
+		${legacy:+-v "$legacy:/legacy-store:ro" -e VMLAB_E2E_LEGACY_STORE=/legacy-store} \
 		{{image}} {{args}}
 
 # Drop the download cache volume

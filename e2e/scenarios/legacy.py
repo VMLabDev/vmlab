@@ -98,7 +98,7 @@ def exercise(h, lab, machine):
         # emulator and serial logs, not events.
         events = h.vmlab("logs", "--output", "jsonl", "--lines", "1000", cwd=lab)
         stopped = [e for e in lab_events(events.out)
-                   if e.get("event") == "vm.stopped" and e.get("data", {}).get("vm") == machine]
+                   if e.get("event") == "vm.stopped" and (e.get("data") or {}).get("vm") == machine]
         if not stopped or stopped[-1]["data"].get("status") != "exit status: 0":
             raise ScenarioFailed(f"{machine}: emulator did not exit cleanly: {stopped[-1:]}")
     finally:
