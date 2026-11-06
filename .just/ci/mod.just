@@ -42,7 +42,7 @@ path-check:
 # Run clippy with warnings as errors
 [group('ci')]
 lint: require-cargo
-	cargo clippy --all-targets --all-features -- -D warnings
+	{{host_target_env}}cargo clippy --all-targets --all-features -- -D warnings
 
 # Verify formatting without changing files
 [group('ci')]
@@ -52,20 +52,20 @@ fmt-check: require-cargo
 # Run the test suite
 [group('ci')]
 test: require-cargo require-bwrap
-	cargo test --all-features
+	{{host_target_env}}cargo test --all-features
 
 # Run the Linux agent against the required protocol contract
 [group('ci')]
 agent-conformance: require-cargo require-bwrap require-waypipe
-	cargo build --manifest-path guest/agent/Cargo.toml --target-dir guest/agent/target
-	VMLAB_CONFORMANCE_AGENT=guest/agent/target/debug/vmlab-agent VMLAB_CONFORMANCE_TIER=full cargo test --lib external_agent -- --ignored --nocapture --test-threads=1
+	cargo build --manifest-path guest/agent/Cargo.toml --target-dir {{quote(agent_target)}}
+	{{host_target_env}}VMLAB_CONFORMANCE_AGENT={{quote(agent_target / 'debug/vmlab-agent')}} VMLAB_CONFORMANCE_TIER=full cargo test --lib external_agent -- --ignored --nocapture --test-threads=1
 
 # Format check, lint and test one guest-side crate
 [group('ci')]
 guest-crate-check crate: require-cargo
 	cargo fmt --check --manifest-path guest/{{crate}}/Cargo.toml
-	cargo clippy --all-targets --manifest-path guest/{{crate}}/Cargo.toml -- -D warnings
-	cargo test --manifest-path guest/{{crate}}/Cargo.toml
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}cargo clippy --all-targets --manifest-path guest/{{crate}}/Cargo.toml -- -D warnings
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}cargo test --manifest-path guest/{{crate}}/Cargo.toml
 
 # Check every guest-side crate (standalone workspaces the host build never sweeps in)
 [group('ci')]
@@ -74,12 +74,12 @@ guest-check: (guest-crate-check 'cinit-proto') (guest-crate-check 'cinit') (gues
 # Lint the agent's Windows code (type-checks without a Windows linker)
 [group('ci')]
 guest-windows-check: require-cargo (require-rust-target 'x86_64-pc-windows-gnu')
-	cargo clippy --target x86_64-pc-windows-gnu --manifest-path guest/agent/Cargo.toml -- -D warnings
+	{{agent_target_env}}cargo clippy --target x86_64-pc-windows-gnu --manifest-path guest/agent/Cargo.toml -- -D warnings
 
 # Lint the agent's macOS code (type-checks without zig or an Apple SDK)
 [group('ci')]
 guest-macos-check: require-cargo (require-rust-target 'x86_64-apple-darwin')
-	cargo clippy --target x86_64-apple-darwin --manifest-path guest/agent/Cargo.toml -- -D warnings
+	{{agent_target_env}}cargo clippy --target x86_64-apple-darwin --manifest-path guest/agent/Cargo.toml -- -D warnings
 
 # Cross-build the Linux agent binaries (musl targets; CI only)
 [group('ci')]
@@ -129,12 +129,12 @@ hv-fmt-check: require-cargo
 # Lint every hypervisor crate without enabling guest-boot tests
 [group('ci')]
 hv-lint: require-cargo hv-virgl-build
-	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" cargo clippy --workspace --exclude vmlab --all-targets -- -D warnings
+	{{hv_target_env}}PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" cargo clippy --workspace --exclude vmlab --all-targets -- -D warnings
 
 # Run hypervisor tests, ignoring KVM guests and host-asset acceptance cases
 [group('ci')]
 hv-test: require-cargo hv-virgl-build hv-ipxe-build
-	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
+	{{hv_target_env}}PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
 
 # Build the hypervisor's pinned iPXE option ROMs for non-guest tests
 [group('ci')]
@@ -153,6 +153,16 @@ win3d-check: require-uv
 	python3 guest/win3d/scripts/check-docs.py
 	python3 -m unittest discover -s guest/win3d/scripts -p 'test_*.py'
 	uv run --no-project --with shellcheck-py==0.11.0.1 python guest/win3d/scripts/check-shell.py
+
+# Target dirs under VMLAB_TARGET_ROOT (see shared.just), one per cargo workspace
+# and RUSTFLAGS set: `host` is the root workspace with default flags, `hv` the
+# same workspace with the vmlab_ci_no_* cfgs of hv-lint and hv-test, and
+# `guest-<crate>` each standalone guest workspace. Each *_env is a
+# `CARGO_TARGET_DIR=... ` prefix, empty when VMLAB_TARGET_ROOT is unset.
+host_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'host') + ' ' }
+hv_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'hv') + ' ' }
+agent_target := if _target_root == '' { 'guest/agent/target' } else { _target_root / 'guest-agent' }
+agent_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(agent_target) + ' ' }
 
 hv_virgl_key := `python3 build/hv.py cache-key | cut -d= -f2`
 

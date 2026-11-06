@@ -33,11 +33,24 @@ require-rust-target target: require-rustup
 require-bpf-linker:
 	@command -v bpf-linker > /dev/null 2>&1 || (echo 'bpf-linker is required: run "just ebpf-tools" once to build it against the pinned nightly' && exit 1)
 
+# Persistent cargo target dirs. With VMLAB_TARGET_ROOT set (an absolute path),
+# each cargo workspace, and each RUSTFLAGS set within one, builds into its own
+# dir under it, so a validation run reuses the previous run's build without the
+# workspaces evicting each other. Unset, cargo's default target/ is used as
+# before. Only cargo output moves: files the recipes write themselves
+# (hv/target/ipxe, .ci-cache, target/dist) stay in the checkout.
+target_root := env('VMLAB_TARGET_ROOT', '')
+_target_root := if target_root == '' { '' } else if target_root =~ '^/' { target_root } else { error('VMLAB_TARGET_ROOT must be an absolute path, got: ' + target_root) }
+
+# The BPF workspace's target dir, and the env prefix that selects it for cargo.
+ebpf_target := if _target_root == '' { 'ebpf/target' } else { _target_root / 'ebpf' }
+ebpf_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(ebpf_target) + ' ' }
+
 # Rebuild the committed BPF fast-path objects from ebpf/ (pinned toolchain)
 [group('build')]
 ebpf-build: require-rustup require-bpf-linker
-	cd ebpf && cargo test -p fastpath-logic
-	cd ebpf && cargo build --release --target bpfel-unknown-none -Z build-std=core \
+	cd ebpf && {{ebpf_target_env}}cargo test -p fastpath-logic
+	cd ebpf && {{ebpf_target_env}}cargo build --release --target bpfel-unknown-none -Z build-std=core \
 		-p fastpath-sockmap -p xdp-switch
-	cp ebpf/target/bpfel-unknown-none/release/fastpath-sockmap src/net/fastpath/bpf/fastpath_sockmap.bpf.o
-	cp ebpf/target/bpfel-unknown-none/release/xdp-switch src/net/fastpath/bpf/xdp_switch.bpf.o
+	cp {{quote(ebpf_target)}}/bpfel-unknown-none/release/fastpath-sockmap src/net/fastpath/bpf/fastpath_sockmap.bpf.o
+	cp {{quote(ebpf_target)}}/bpfel-unknown-none/release/xdp-switch src/net/fastpath/bpf/xdp_switch.bpf.o
