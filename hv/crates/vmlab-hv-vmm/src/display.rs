@@ -530,12 +530,22 @@ impl InputSink for Input {
                 let mut pointer = self.pointer.lock();
                 pointer_message(&mut pointer, message);
                 let xhci = shared.xhci.lock().clone();
-                if let Some(xhci) = xhci {
+                // pc's tablet sits on the PIIX3 UHCI instead.
+                let uhci = shared
+                    .chipset
+                    .lock()
+                    .as_ref()
+                    .and_then(|chipset| chipset.uhci.lock().clone());
+                if xhci.is_some() || uhci.is_some() {
                     loop {
                         if shared.exited() {
                             break;
                         }
-                        let result = xhci.lock().inject_pointer(*pointer);
+                        let result = match (&xhci, &uhci) {
+                            (Some(xhci), _) => xhci.lock().inject_pointer(*pointer),
+                            (None, Some(uhci)) => uhci.lock().inject_pointer(*pointer),
+                            (None, None) => break,
+                        };
                         match result {
                             Ok(()) => break,
                             Err(error @ vmlab_hv_devices::DeviceError::Io(_)) if matches!(&error, vmlab_hv_devices::DeviceError::Io(error) if error.kind() == io::ErrorKind::WouldBlock) =>

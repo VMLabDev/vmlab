@@ -304,8 +304,14 @@ fn cmos_boot_fallback_matches_every_gate_capture_with_or_without_cdrom() {
         let capture: serde_json::Value = serde_json::from_str(json).unwrap();
         for cd_first in [false, true] {
             let mut rtc = Rtc::new(512 << 20, 0, Arc::new(Line::default()));
-            rtc.configure_pc([Some(1_048_576), None, None, None], cd_first, cpus);
-            for (index, key) in [(0x38, "0x38"), (0x3d, "0x3d"), (0x5f, "0x5f")] {
+            // An empty floppy drive A reports QEMU's 2.88 MB fallback.
+            rtc.configure_pc([Some(1_048_576), None, None, None], cd_first, cpus, 0x50);
+            for (index, key) in [
+                (0x10, "0x10"),
+                (0x38, "0x38"),
+                (0x3d, "0x3d"),
+                (0x5f, "0x5f"),
+            ] {
                 let expected = capture[key]["read_values"].as_array().unwrap();
                 assert_eq!(expected.len(), 1);
                 let expected =
@@ -317,7 +323,6 @@ fn cmos_boot_fallback_matches_every_gate_capture_with_or_without_cdrom() {
                     "{name} CMOS{index:#x}, CD={cd_first}"
                 );
             }
-            assert_eq!(cmos(&mut rtc, 0x10), 0);
             assert_eq!(cmos(&mut rtc, 0x14), 6);
         }
     }
@@ -331,6 +336,7 @@ fn cmos_geometry_memory_checksum_and_reset_use_indexed_io() {
         [Some(100 * 16 * 63), Some(1 << 32), Some(64 * 16 * 63), None],
         false,
         4,
+        0x40,
     );
     assert_eq!(cmos(&mut rtc, 0x12), 0xff);
     for unit in 0..2u8 {
@@ -387,7 +393,7 @@ fn cmos_geometry_memory_checksum_and_reset_use_indexed_io() {
         before
     );
     let mut secondary_only = Rtc::new(64 << 20, 0, Arc::new(Line::default()));
-    secondary_only.configure_pc([None, None, Some(1_048_576), None], false, 1);
+    secondary_only.configure_pc([None, None, Some(1_048_576), None], false, 1, 0x50);
     assert_eq!(cmos(&mut secondary_only, 0x12), 0);
     assert_eq!(cmos(&mut secondary_only, 0x19), 0);
 }

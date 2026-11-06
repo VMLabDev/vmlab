@@ -17,6 +17,16 @@ const DOS_BOOT_GUARD_COMMANDS: [&str; 4] = [
 ];
 const DOS_RESTORE_STARTUP: &str = "copy /Y C:\\HVAUTO.BAK C:\\FDAUTO.BAT";
 
+/// An edit to the next description built on this thread.
+type DescriptionEdit = Box<dyn FnOnce(&mut serde_json::Value, &Path)>;
+
+thread_local! {
+    /// Phase-4c additions (floppy medium, UHCI tablet) for the next
+    /// `Running::boot` on this thread, applied by `Guest::description`.
+    static NEXT_DESCRIPTION: std::cell::RefCell<Option<DescriptionEdit>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Guest {
     Temple,
@@ -116,6 +126,9 @@ impl Guest {
         }
         if self == Self::Windows98 {
             machine["cpu_model"] = "pentium3".into();
+        }
+        if let Some(edit) = NEXT_DESCRIPTION.with(|next| next.borrow_mut().take()) {
+            edit(&mut machine, directory);
         }
         machine
     }
@@ -1029,4 +1042,207 @@ fn windows_setup_requires_both_completed_dword_values() {
     assert!(!windows_setup_finished(
         b"ERROR: The system was unable to find the specified registry key or value."
     ));
+}
+
+/// A FAT12 1.44 MB floppy with one file, `HVFLOPPY.TXT`, holding `text`:
+/// boot sector with BPB, two 9-sector FATs, a 14-sector root directory,
+/// and the file in cluster 2 (sector 33).
+fn fat12_floppy(path: &Path, text: &[u8]) {
+    let mut image = vec![0u8; 2880 * 512];
+    let boot = &mut image[..512];
+    boot[..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
+    boot[3..11].copy_from_slice(b"VMLABHV ");
+    boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+    boot[13] = 1;
+    boot[14..16].copy_from_slice(&1u16.to_le_bytes());
+    boot[16] = 2;
+    boot[17..19].copy_from_slice(&224u16.to_le_bytes());
+    boot[19..21].copy_from_slice(&2880u16.to_le_bytes());
+    boot[21] = 0xf0;
+    boot[22..24].copy_from_slice(&9u16.to_le_bytes());
+    boot[24..26].copy_from_slice(&18u16.to_le_bytes());
+    boot[26..28].copy_from_slice(&2u16.to_le_bytes());
+    boot[38] = 0x29;
+    boot[39..43].copy_from_slice(&0x4c43_0004u32.to_le_bytes());
+    boot[43..54].copy_from_slice(b"HVFLOPPY   ");
+    boot[54..62].copy_from_slice(b"FAT12   ");
+    boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+    for fat in [1, 10] {
+        image[fat * 512..fat * 512 + 6].copy_from_slice(&[0xf0, 0xff, 0xff, 0xff, 0x0f, 0x00]);
+    }
+    let entry = &mut image[19 * 512..19 * 512 + 32];
+    entry[..11].copy_from_slice(b"HVFLOPPYTXT");
+    entry[11] = 0x20;
+    entry[24..26].copy_from_slice(&0x5b65u16.to_le_bytes());
+    entry[26..28].copy_from_slice(&2u16.to_le_bytes());
+    entry[28..32].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    image[33 * 512..33 * 512 + text.len()].copy_from_slice(text);
+    std::fs::write(path, image).unwrap();
+}
+
+/// Phase 4c: boot with a floppy medium and the PIIX3 UHCI tablet, as
+/// vmlab's legacy profiles attach them.
+fn boot_with_floppy_and_tablet(guest: Guest, floppy: bool) -> Option<Running> {
+    NEXT_DESCRIPTION.with(|next| {
+        *next.borrow_mut() = Some(Box::new(move |machine, directory| {
+            machine["tablet"] = serde_json::json!({"bus":0,"device":1,"function":2});
+            if floppy {
+                let path = directory.join("floppy.img");
+                fat12_floppy(&path, b"vmlab floppy 4c\r\n");
+                machine["floppy"] = path.to_str().unwrap().into();
+            }
+        }));
+    });
+    let running = Running::boot(guest);
+    NEXT_DESCRIPTION.with(|next| next.borrow_mut().take());
+    running
+}
+
+fn dos_reads_floppy(agent: &mut AgentClient, when: &str) {
+    let text = clean(&shell(agent, Guest::Dos, "type A:\\HVFLOPPY.TXT").stdout);
+    assert!(
+        text.contains("vmlab floppy 4c"),
+        "FreeDOS did not read the floppy {when}: {text:?}"
+    );
+}
+
+/// FreeDOS reads and writes a FAT12 floppy through the 82078 and ISA DMA,
+/// and the drive keeps working across a snapshot load and a reset.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn freedos_floppy_read_write_snapshot_reset() {
+    let Some(mut running) = boot_with_floppy_and_tablet(Guest::Dos, true) else {
+        return;
+    };
+    let mut agent = running.ready();
+    dos_reads_floppy(&mut agent, "after boot");
+    shell(
+        &mut agent,
+        Guest::Dos,
+        "echo written-by-dos>A:\\HVWRITE.TXT",
+    );
+    assert_eq!(
+        clean(&shell(&mut agent, Guest::Dos, "type A:\\HVWRITE.TXT").stdout),
+        "written-by-dos"
+    );
+    let listing = clean(&shell(&mut agent, Guest::Dos, "dir A:").stdout);
+    assert!(
+        listing.contains("HVFLOPPY") && listing.contains("HVWRITE"),
+        "{listing}"
+    );
+    eprintln!("FreeDOS A: listing:\n{listing}");
+    snapshot(&mut running, &mut agent);
+    dos_reads_floppy(&mut agent, "after the snapshot load");
+    running.reset(&mut agent);
+    dos_reads_floppy(&mut agent, "after reset");
+    running.poweroff(&mut agent);
+    let image = std::fs::read(running.directory.path().join("floppy.img")).unwrap();
+    assert!(
+        image
+            .windows(b"written-by-dos".len())
+            .any(|window| window == b"written-by-dos"),
+        "the guest's floppy write did not reach the image"
+    );
+    eprintln!("FreeDOS floppy: read, write, snapshot load and reset passed");
+}
+
+/// Sum of per-channel differences between two frames inside a box.
+fn region_change(
+    before: &crate::display_acceptance::Image,
+    after: &crate::display_acceptance::Image,
+    x: u32,
+    y: u32,
+) -> u64 {
+    let mut total = 0;
+    for row in y..(y + 20).min(before.height) {
+        for column in x..(x + 12).min(before.width) {
+            let offset = ((row * before.width + column) * 4) as usize;
+            for channel in 0..3 {
+                total += u64::from(
+                    before.pixels[offset + channel].abs_diff(after.pixels[offset + channel]),
+                );
+            }
+        }
+    }
+    total
+}
+
+/// Windows 7's inbox USB stack enumerates the PIIX3 UHCI and the tablet,
+/// and the HID driver moves the cursor where the tablet reports.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn windows_7_uhci_tablet_moves_the_cursor() {
+    use vmlab_hv_display::{Capabilities, Client, Message};
+    let Some(mut running) = boot_with_floppy_and_tablet(Guest::Windows7, false) else {
+        return;
+    };
+    let mut agent = running.ready();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let report = loop {
+        let report = clean(
+            &shell(
+                &mut agent,
+                Guest::Windows7,
+                "wmic path Win32_PnPEntity get Name,PNPDeviceID,Status /format:csv",
+            )
+            .stdout,
+        )
+        // wmic's CSV output escapes `&` as an XML entity.
+        .replace("&amp;", "&");
+        let upper = report.to_ascii_uppercase();
+        if upper.contains("PCI\\VEN_8086&DEV_7020")
+            && upper.contains("USB\\VID_0627&PID_0001")
+            && upper.contains("HID-COMPLIANT MOUSE")
+        {
+            break report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Windows 7 did not enumerate the UHCI tablet: {report}"
+        );
+        std::thread::sleep(Duration::from_secs(5));
+    };
+    for line in report.lines().filter(|line| {
+        let upper = line.to_ascii_uppercase();
+        upper.contains("DEV_7020") || upper.contains("VID_0627") || upper.contains("HID")
+    }) {
+        eprintln!("Windows 7 USB: {line}");
+        assert!(
+            line.trim_end().ends_with(",OK"),
+            "device not working: {line}"
+        );
+    }
+    let display = running.directory.path().join("display.sock");
+    let input = Client::connect(&display, Capabilities(Capabilities::INPUT)).unwrap();
+    let frame = crate::display_acceptance::screenshot(&display);
+    let (width, height) = (frame.width, frame.height);
+    let at = |x: u32, y: u32| Message::PointerAbs {
+        x,
+        y,
+        width,
+        height,
+    };
+    let (a, b) = ((width / 4, height / 4), (width * 3 / 4, height * 3 / 4));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        input.send(&at(a.0, a.1)).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let first = crate::display_acceptance::screenshot(&display);
+        input.send(&at(b.0, b.1)).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let second = crate::display_acceptance::screenshot(&display);
+        let left = region_change(&first, &second, a.0, a.1);
+        let arrived = region_change(&first, &second, b.0, b.1);
+        eprintln!("cursor move {a:?} -> {b:?}: left {left}, arrived {arrived}");
+        if left > 1000 && arrived > 1000 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest cursor did not follow the UHCI tablet"
+        );
+    }
+    eprintln!("Windows 7: UHCI tablet enumerated and moved the cursor");
+    snapshot(&mut running, &mut agent);
+    running.poweroff(&mut agent);
 }

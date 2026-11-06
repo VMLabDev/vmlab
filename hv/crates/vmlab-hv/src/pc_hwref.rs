@@ -350,6 +350,16 @@ impl Case {
             }
             staged.pci_devices.push(kept);
         }
+        // 4c: the PIIX3 UHCI carrying the tablet sits at its captured 00:01.2.
+        staged.pci_devices.extend(
+            full.pci_devices
+                .iter()
+                .filter(|device| (device.device, device.function) == (1, 2))
+                .cloned(),
+        );
+        staged
+            .pci_devices
+            .sort_by_key(|device| (device.device, device.function));
         let mut processor_id = smbios::SmbiosConfig::default().processor_id;
         if name == "pc-freedos-1.3" {
             processor_id[7] = 7;
@@ -418,6 +428,9 @@ impl Case {
                     "format":"raw","read_only":true
                 }));
         }
+        // vmlab's legacy profiles add `-usb -device usb-tablet`: the UHCI
+        // function and its tablet.
+        description["tablet"] = serde_json::json!({"bus":0,"device":1,"function":2});
         if self.full.com2 {
             description["ports"] = serde_json::json!([{"name":"hwref-com2","transport":"com2","socket":path.join("unused-com2.sock")}]);
         } else {
@@ -506,6 +519,49 @@ fn compare_nic(
             nic.device, nic.function, nic.model
         )
     }));
+}
+
+/// Compare the PIIX3 UHCI's config space with the Linux baseline's, byte by
+/// byte. The baseline's driver state and slot allocation are the only
+/// bounded differences.
+fn compare_uhci(
+    case: &Case,
+    actual: &[u8],
+    baseline: &[u8],
+    problems: &mut Vec<String>,
+    differences: &mut Vec<String>,
+) {
+    let mut reasons = BTreeSet::new();
+    for offset in 0..256 {
+        if actual[offset] == baseline[offset] {
+            continue;
+        }
+        let reason = match offset {
+            4 if (actual[4] ^ baseline[4]) & !0x07 == 0 => Some(
+                "command I/O, memory and bus-master bits: the baseline's uhci_hcd enabled them; the probe runs after SeaBIOS only",
+            ),
+            0x20..=0x23 => Some("BAR4 address follows the slot's allocation"),
+            0x3c => Some("interrupt line follows PIRQD's routing"),
+            0xc0 | 0xc1 => Some(
+                "LEGSUP: the baseline's uhci_hcd wrote USBPIRQDEN (0x2000); QEMU resets it to 0",
+            ),
+            _ => None,
+        };
+        match reason {
+            Some(reason) => {
+                reasons.insert(reason);
+            }
+            None => problems.push(format!(
+                "{} uhci 01.2 config[{offset:#x}]={:#04x}, baseline {:#04x}",
+                case.name, actual[offset], baseline[offset]
+            )),
+        }
+    }
+    differences.extend(
+        reasons
+            .into_iter()
+            .map(|reason| format!("01.2 uhci: {reason}")),
+    );
 }
 
 fn normalize_acpi(bytes: &[u8]) -> Vec<u8> {
@@ -705,7 +761,7 @@ fn pci_exception(
                     || matches!(actual[offset]&15,3..=7|9..=12|14..=15)) =>
         {
             Some(
-                "PIRQ selections/disable bits reflect the deferred UHCI function and BIOS-only probe, rather than a running Linux PCI/ACPI stack",
+                "PIRQ selections/disable bits reflect the BIOS-only probe, rather than a running Linux PCI/ACPI stack",
             )
         }
         (9, 4) if (actual[offset] ^ expected[offset]) & !4 == 0 => Some(
@@ -715,7 +771,7 @@ fn pci_exception(
             if le32(actual, 0x20) & 15 == 1
                 && (0x1000..=0xfff0).contains(&(le32(actual, 0x20) & !15)) =>
         {
-            Some("IDE BAR4 allocation moves when the UHCI BAR consumer (4c) is absent")
+            Some("IDE BAR4 allocation follows this profile's device set, not the superset baseline's")
         }
         (9, 0x40..=0x44)
             if (actual[offset] ^ expected[offset])
@@ -738,7 +794,6 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
     capture_anchor(case)?;
     let mut problems = Vec::new();
     let mut differences=vec![
-        "4c: UHCI 00:01.2 and its AML/hotplug notification are absent".into(),
         "D3: genroms/kvmvapic.bin is absent".into(),
         "the original boot disk has fixture contents/capacity; CMOS disk geometry describes that disk".into(),
     ];
@@ -849,6 +904,13 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
             &mut differences,
         );
     }
+    compare_uhci(
+        case,
+        &dump.pci[&0x0a],
+        &baseline[&0x0a],
+        &mut problems,
+        &mut differences,
+    );
     let cpuid = &dump.records[&9];
     record_check(
         &mut problems,
@@ -970,7 +1032,7 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
     )
     .map_err(|e| e.to_string())?;
     for index in [
-        0x15u8, 0x16, 0x17, 0x18, 0x30, 0x31, 0x34, 0x35, 0x5b, 0x5c, 0x5d, 0x5f,
+        0x10u8, 0x15, 0x16, 0x17, 0x18, 0x30, 0x31, 0x34, 0x35, 0x5b, 0x5c, 0x5d, 0x5f,
     ] {
         let name = format!("{index:#04x}");
         if let Some(values) = observed[&name]["read_values"].as_array() {
