@@ -90,6 +90,38 @@ class FirmwareFrameTests(unittest.TestCase):
                     self.assertRaisesRegex(AssertionError, "not recorded from power-on"):
                 self.scan(frames)
 
+    def test_the_logo_is_the_whole_text_of_a_frame(self):
+        for text in ("VMLAB", "VMLIAB", " vmlab \n", "VM1AB\x0c", "|vmlab|"):
+            with self.subTest(text=text):
+                self.assertEqual(record.firmware_kind(text.upper()), "logo")
+        for text in (
+            "VMLAB-AGENT",
+            " * STARTING VMLAB-AGENT ... [ OK ]",
+            "MOUNT LABEL=VMLAB /MEDIA/VMLAB",
+            "VMLAB BOOTSTRAP: AGENT INSTALLED (OPENRC, STARTED)",
+            "VMLAB\nE2E LOGIN:",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(record.firmware_kind(text))
+
+    def test_a_late_start_on_the_guest_console_fails(self):
+        # Review of VML-36: the console line names vmlab-agent, and it stays
+        # on tty1 up to the login prompt.
+        console = " * Starting vmlab-agent ... [ ok ]\nWelcome to Alpine Linux 3.22\ne2e login:"
+        for frames in ([(0.0, console)], [(0.0, "vmlab-agent"), (1.0, "vmlab")]):
+            with self.subTest(frames=frames), \
+                    self.assertRaisesRegex(AssertionError, "not recorded from power-on"):
+                self.scan(frames)
+
+    def test_the_guest_console_after_a_no_display_start_is_not_the_logo(self):
+        # QEMU can show its no-display text again when the kernel's DRM driver
+        # takes over, so the console can follow it with no GRUB in between.
+        frames = [(0.0, NO_DISPLAY), (8.5, NO_DISPLAY + " "),
+                  (9.0, " * Starting vmlab-agent ... [ ok ]\ne2e login:"),
+                  (10.0, "mount LABEL=VMLAB /media/vmlab")]
+        with self.assertRaisesRegex(AssertionError, "no firmware output"):
+            self.scan(frames)
+
     def test_a_linux_console_does_not_pass_for_firmware(self):
         frames = [(0.0, NO_DISPLAY), (3.0, "Linux version 6.12\nalpine login:")]
         with self.assertRaisesRegex(AssertionError, "no firmware output") as caught:

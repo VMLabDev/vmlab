@@ -103,14 +103,17 @@ def placement(fb_w: int, fb_h: int, out_w: int = 1920, out_h: int = 1080):
 
 # Firmware text, or the vmlab logo vmlab's own OVMF draws at boot
 # (guest/build-ovmf.sh puts guest/logo/Logo.bmp in place of edk2's).
-# Each is (kind, pattern over the upper-cased OCR text). tesseract reads the
-# logo as "vmlab" or "vmliab" (VML-36), so its pattern allows that.
+# The text markers are (kind, pattern) and match anywhere in the upper-cased
+# OCR text. The logo must be the whole text of the frame: the guest console
+# prints " * Starting vmlab-agent" (src/template/bootstrap/install.sh), and a
+# console frame must never pass for the logo. tesseract reads the logo as
+# "vmlab" or "vmliab" (VML-36), so the pattern allows that.
 FIRMWARE_MARKERS = (
     ("BdsDxe", re.compile(r"BDSDXE")),
     ("SeaBIOS", re.compile(r"SEABIOS")),
     ("iPXE", re.compile(r"IPXE")),
-    ("logo", re.compile(r"VM[LI1|!]{1,2}AB")),
 )
+LOGO = re.compile(r"\W*VM[LI1|!]{1,2}AB\W*")
 # QEMU's own text while the guest has not set a display mode yet.
 NO_DISPLAY = re.compile(r"DISPLAY\s+OUTPUT\s+IS\s+NOT\s+ACTIVE")
 GRUB = re.compile(r"GNU\s+GRUB")
@@ -124,29 +127,45 @@ START_BY = 0.2
 FIRMWARE_WITHIN = 30.0
 
 
+def firmware_kind(upper: str):
+    """The firmware marker in a frame's upper-cased OCR text, or None."""
+    for kind, pattern in FIRMWARE_MARKERS:
+        if pattern.search(upper):
+            return kind
+    if LOGO.fullmatch(upper.strip()):
+        return "logo"
+    return None
+
+
 def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
-    """Every distinct frame of the first `seconds`: (time, png), in order."""
+    """Every distinct frame of the first `seconds`: (time, png), in order.
+
+    The time is the frame's own timestamp from the start of the stream, so
+    it is right for a variable frame rate recording too."""
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob("f*.png"):
         old.unlink()
-    rate = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-         "stream=r_frame_rate", "-of", "json", str(video)],
+    pts = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-read_intervals", f"%+{seconds + 1:.3f}",
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True, check=True,
     ).stdout
-    num, den = json.loads(rate)["streams"][0]["r_frame_rate"].split("/")
-    fps = int(num) / int(den)
+    times = sorted(float(t.strip(",")) for t in pts.split() if t.strip(",") not in ("", "N/A"))
+    if not times:
+        return
+    times = [t - times[0] for t in times]
     subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(video), "-t", f"{seconds:.3f}",
          "-fps_mode", "passthrough", str(out / "f%05d.png")],
         check=True, capture_output=True,
     )
     previous = None
-    for index, png in enumerate(sorted(out.glob("f*.png"))):
+    for at, png in zip(times, sorted(out.glob("f*.png"))):
         digest = zlib.crc32(png.read_bytes())
         if digest != previous:
             previous = digest
-            yield index / fps, png
+            yield at, png
 
 
 def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRMWARE_WITHIN):
@@ -176,7 +195,7 @@ def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRM
         upper = text.upper()
         first = " | ".join(line for line in text.splitlines() if line.strip())[:100]
         seen.append(f"{at:.2f}s {first}")
-        kind = next((k for k, pattern in FIRMWARE_MARKERS if pattern.search(upper)), None)
+        kind = firmware_kind(upper)
         if lit_at is None:
             lit_at = at
             if at > START_BY or (kind is None and not NO_DISPLAY.search(upper)):
@@ -231,7 +250,7 @@ def run(h):
             h.log.write(f"[record] firmware frame at {at:.1f}s ({kind}): {text.strip()[:200]}\n")
             return True
 
-        h.check("record.up-from-boot", from_boot, "`up --record` captured the firmware screen; ffprobe reads 1920x1080 h264")
+        h.check("record.up-from-boot", from_boot, "`up --record` started at power-on and reached firmware or GRUB; ffprobe reads 1920x1080 h264")
 
         # -- start/stop with a timeline, inputs sent by a script in between.
         shot = h.vmlab("vm", "screenshot", "vm01", str(rec / "fb.png"), cwd=lab)
