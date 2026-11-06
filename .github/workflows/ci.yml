@@ -36,6 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # One part of the merge bar per step; `just ci::check` runs the same set
       # in one go.
+      - run: just ci::path-check
       - run: just ci::fmt-check
       - run: just ci::lint
       - run: just ci::test

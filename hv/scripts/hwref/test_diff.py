@@ -132,7 +132,7 @@ class NormalizeTests(unittest.TestCase):
         image[0x20:0x28] = b"PCIR\xf4\x1a\x00\x10"
         struct.pack_into("<H", image, 0x30, 1)
         image[0x35] = 0x80
-        name = "pci-roms/0000:00:03.0.rom"
+        name = "pci-roms/0000-00-03.0.rom"
         original = diff.normalize_artifact(name, image)
         image[100] = 42
         self.assertEqual(original, diff.normalize_artifact(name, image))
