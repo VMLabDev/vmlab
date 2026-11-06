@@ -4,7 +4,7 @@ import pathlib
 import tempfile
 import unittest
 
-from scenarios.legacy import lab_events, project_vms
+from scenarios.legacy import GUESTS, SCREEN_MARKERS, lab_events, project_vms, screen_marker
 
 
 class ProjectVmCount(unittest.TestCase):
@@ -67,6 +67,37 @@ class LabEvents(unittest.TestCase):
             lab_events(out),
             [{"event": "vm.stopped", "data": {"vm": "freedos", "status": "exit status: 0"}}],
         )
+
+
+class ScreenMarker(unittest.TestCase):
+    def test_every_guest_has_a_marker(self):
+        self.assertEqual(sorted(SCREEN_MARKERS), sorted(m for m, _, _ in GUESTS))
+
+    def test_windows_7_setup_is_not_its_usual_screen(self):
+        self.assertIsNone(screen_marker("win7", "Setup is installing devices"))
+        self.assertIsNone(screen_marker("win7", "Recycle Bin\nSetup is starting services"))
+
+    def test_windows_7_setup_screens_from_the_vml_54_run_do_not_match(self):
+        for text in ["Setup is applying system settings", "Setup will continue after restarting your computer",
+                     "Starting Windows\n(c) Microsoft Corporation", "Setup is preparing your computer for first use",
+                     "Setup is checking video performance", ""]:
+            self.assertIsNone(screen_marker("win7", text), text)
+
+    def test_windows_7_desktop_matches_across_lines_and_case(self):
+        self.assertEqual(screen_marker("win7", "RECYCLE\n  bin\n"), "recycle bin")
+
+    def test_each_vml_50_screen_matches_its_own_guest_only(self):
+        screens = {
+            "freedos": "Welcome to the FreeDOS 1.3 operating system (http://www.freedos.org)",
+            "win98": "Enter Windows Password\nType a name to identify yourself to Windows.",
+            # As OCR read the TempleOS desktop in the VML-54 run.
+            "temple": "Task.. .Unnamed Bi6D153823|\\s am empled U3. empled US. e r Public Domain Operating System",
+        }
+        for machine, text in screens.items():
+            self.assertIsNotNone(screen_marker(machine, text), machine)
+            for other in SCREEN_MARKERS:
+                if other != machine:
+                    self.assertIsNone(screen_marker(other, text), (machine, other))
 
 
 if __name__ == "__main__":
