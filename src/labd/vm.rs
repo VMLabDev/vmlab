@@ -2027,8 +2027,8 @@ impl super::machine::Machine for VmInstance {
         self.dirs.nic_sock(i)
     }
 
-    /// A VM's argv carries pre-opened descriptors, so its NICs can ride the
-    /// afxdp tap fast path.
+    /// Whether this VM's NICs take pre-opened TAP descriptors, which the
+    /// afxdp tap fast path needs.
     /// QEMU inherits a descriptor. vmlab-hv receives its queue descriptors
     /// over the control socket while the VM remains paused.
     /// QEMU takes a TAP for any NIC, and vmlab-hv takes TAP queues for
