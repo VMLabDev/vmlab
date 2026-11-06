@@ -21,7 +21,8 @@ SCREEN_MARKERS = {
     "freedos": ("welcome to the freedos", "agent-legacy"),
     "win98": ("windows password", "identify yourself"),
     "win7": ("recycle bin",),
-    "temple": ("templeos",),
+    # OCR reads TempleOS's blue title "TempleOS V5.03" as "empled US".
+    "temple": ("public domain operating system",),
 }
 # Text that means the guest has not reached its usual screen yet.
 SCREEN_NOT_YET = {

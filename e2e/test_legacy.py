@@ -77,6 +77,12 @@ class ScreenMarker(unittest.TestCase):
         self.assertIsNone(screen_marker("win7", "Setup is installing devices"))
         self.assertIsNone(screen_marker("win7", "Recycle Bin\nSetup is starting services"))
 
+    def test_windows_7_setup_screens_from_the_vml_54_run_do_not_match(self):
+        for text in ["Setup is applying system settings", "Setup will continue after restarting your computer",
+                     "Starting Windows\n(c) Microsoft Corporation", "Setup is preparing your computer for first use",
+                     "Setup is checking video performance", ""]:
+            self.assertIsNone(screen_marker("win7", text), text)
+
     def test_windows_7_desktop_matches_across_lines_and_case(self):
         self.assertEqual(screen_marker("win7", "RECYCLE\n  bin\n"), "recycle bin")
 
@@ -84,7 +90,8 @@ class ScreenMarker(unittest.TestCase):
         screens = {
             "freedos": "Welcome to the FreeDOS 1.3 operating system (http://www.freedos.org)",
             "win98": "Enter Windows Password\nType a name to identify yourself to Windows.",
-            "temple": "TempleOS V5.03 Public Domain Operating System",
+            # As OCR read the TempleOS desktop in the VML-54 run.
+            "temple": "Task.. .Unnamed Bi6D153823|\\s am empled U3. empled US. e r Public Domain Operating System",
         }
         for machine, text in screens.items():
             self.assertIsNotNone(screen_marker(machine, text), machine)
