@@ -114,12 +114,14 @@ FIRMWARE_MARKERS = (
 # QEMU's own text while the guest has not set a display mode yet.
 NO_DISPLAY = re.compile(r"DISPLAY\s+OUTPUT\s+IS\s+NOT\s+ACTIVE")
 GRUB = re.compile(r"GNU\s+GRUB")
+# A recording from power-on opens on QEMU's no-display text, or on firmware,
+# within START_BY seconds. That rule, not the window size, proves "from boot".
 # OVMF can draw and clear all of its output between two framebuffer reads,
-# so a boot may record no firmware frame at all (VML-36). GRUB then counts,
-# but only when the recording began with QEMU's no-display text, which
-# proves it started at power-on, and only within the first GRUB_BY seconds.
-NO_DISPLAY_BY = 0.2
-GRUB_BY = 5.0
+# so a boot may record no firmware frame at all (VML-36): GRUB then counts.
+# Under heavy host load OVMF painted its logo only at 11.5 s, so the search
+# window is wide (FIRMWARE_WITHIN).
+START_BY = 0.2
+FIRMWARE_WITHIN = 30.0
 
 
 def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
@@ -147,38 +149,42 @@ def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
             yield index / fps, png
 
 
-def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = 8.0):
-    """Find the firmware's own output in the first seconds of a recording.
+def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRMWARE_WITHIN):
+    """Find the firmware's own output at the start of a recording.
 
     Every distinct frame is read, not a sample: OVMF's "BdsDxe: loading"
     line can be drawn and cleared again between two framebuffer reads, so a
     boot may never record it (VML-36). The vmlab logo OVMF shows before it
     is firmware output too and stays on screen for a fraction of a second.
-    A boot with no firmware frame passes on GRUB only after QEMU's
-    no-display text in the first lit frame (see GRUB_BY).
+
+    Two rules. The first lit frame must come by START_BY and be QEMU's
+    no-display text or firmware, else the recording started late. Then a
+    firmware marker, or GRUB when no firmware frame was recorded, must come
+    within `seconds`.
 
     Returns (time, text, kind): kind is the marker that matched, one of
     BdsDxe, SeaBIOS, iPXE, logo, or no-display+GRUB.
     """
     seen = []
     lit_at = None
-    no_display_start = False
     for at, png in early_frames(video, seconds, out.with_suffix(".frames")):
         _, _, rows = png_read(png)
         lit = sum(1 for row in rows[::8] for px in row[::8] if max(px) > 60)
         if lit <= 20:
             continue
-        first_lit = lit_at is None
-        if first_lit:
-            lit_at = at
         text = ocr(png)
         upper = text.upper()
         first = " | ".join(line for line in text.splitlines() if line.strip())[:100]
         seen.append(f"{at:.2f}s {first}")
-        if first_lit and at <= NO_DISPLAY_BY and NO_DISPLAY.search(upper):
-            no_display_start = True
         kind = next((k for k, pattern in FIRMWARE_MARKERS if pattern.search(upper)), None)
-        if kind is None and no_display_start and at < GRUB_BY and GRUB.search(upper):
+        if lit_at is None:
+            lit_at = at
+            if at > START_BY or (kind is None and not NO_DISPLAY.search(upper)):
+                raise AssertionError(
+                    f"not recorded from power-on: the first lit frame, at {at:.2f} s, "
+                    f"is not QEMU's no-display text or firmware by {START_BY:g} s: {first!r}"
+                )
+        elif kind is None and GRUB.search(upper):
             kind = "no-display+GRUB"
         if kind is not None:
             out.write_bytes(png.read_bytes())
@@ -187,6 +193,7 @@ def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = 8.0)
         f"no firmware output in the first {seconds:g} s (first lit at {lit_at} s); "
         f"distinct lit frames read: {seen}"
     )
+
 
 def run(h):
     with h.lab("record-lab") as lab:
