@@ -593,6 +593,11 @@ fn execute(
                     return Status::Stall;
                 };
                 if setup.request_type & 0x80 == 0 {
+                    // The data stage holds at most wLength bytes; a packet
+                    // beyond it stalls, so a guest cannot grow the buffer.
+                    if max_length > usize::from(setup.length).saturating_sub(control.out.len()) {
+                        return Status::Stall;
+                    }
                     control.out.extend_from_slice(&read(max_length));
                     return Status::Ack(max_length);
                 }
@@ -788,6 +793,9 @@ impl Snapshot for UhciController {
             };
             let position = usize::try_from(r.u64()?).map_err(|_| invalid())?;
             let out = r.bytes(65535)?.to_vec();
+            if setup.is_none_or(|setup| out.len() > usize::from(setup.length)) && !out.is_empty() {
+                return Err(invalid());
+            }
             let id = r.bytes(256)?;
             let expected = port.device.as_ref().map(|device| device.state_id());
             if expected.as_deref().map(str::as_bytes).unwrap_or(b"") != id {

@@ -236,3 +236,45 @@ fn cyclic_schedules_and_bad_pointers_stay_bounded() {
     machine.uhci.read(6, &mut frame);
     assert!(u16::from_le_bytes(frame) > 0x10);
 }
+
+/// A host-to-device control transfer accepts at most wLength bytes in its
+/// data stage: further OUT packets stall and the buffer does not grow.
+#[test]
+fn control_out_data_is_bounded_by_the_setup_length() {
+    let memory = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+    let mut port = Port::new(Some(Box::new(Tablet::full_speed("serial"))));
+    port.status |= PORT_PE;
+    // SET_REPORT (class, interface, OUT) with wLength 8.
+    memory
+        .write_slice(&[0x21, 9, 0, 2, 0, 0, 8, 0], GuestAddress(0x1000))
+        .unwrap();
+    assert!(matches!(
+        execute(&mut port, &memory, 0x2d, 0, 0x1000, 8),
+        Status::Ack(8)
+    ));
+    assert!(matches!(
+        execute(&mut port, &memory, 0xe1, 0, 0x2000, 8),
+        Status::Ack(8)
+    ));
+    for _ in 0..1000 {
+        assert!(matches!(
+            execute(&mut port, &memory, 0xe1, 0, 0x2000, 2047),
+            Status::Stall
+        ));
+        assert!(matches!(
+            execute(&mut port, &memory, 0xe1, 0, 0x2000, 1),
+            Status::Stall
+        ));
+    }
+    assert_eq!(port.control.out.len(), 8);
+    // A data packet larger than wLength stalls on its own.
+    memory
+        .write_slice(&[0x21, 9, 0, 2, 0, 0, 4, 0], GuestAddress(0x1000))
+        .unwrap();
+    execute(&mut port, &memory, 0x2d, 0, 0x1000, 8);
+    assert!(matches!(
+        execute(&mut port, &memory, 0xe1, 0, 0x2000, 8),
+        Status::Stall
+    ));
+    assert!(port.control.out.is_empty());
+}
