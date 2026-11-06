@@ -42,6 +42,19 @@ def project_vms(proc_root=pathlib.Path("/proc")) -> list[int]:
     return found
 
 
+def lab_events(out: str) -> list[dict]:
+    """The JSON events in `vmlab logs -o jsonl` output, skipping other lines."""
+    events = []
+    for line in out.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
 def stage_templates(h):
     store = pathlib.Path(os.environ.get("XDG_DATA_HOME", pathlib.Path.home() / ".local/share")) / "vmlab/templates"
     source = os.environ.get("VMLAB_E2E_LEGACY_STORE")
@@ -81,9 +94,11 @@ def exercise(h, lab, machine):
         h.vmlab("vm", "stop", machine, cwd=lab, timeout=300)
         if "state=stopped" not in h.machine_line(lab, machine):
             raise ScenarioFailed(f"{machine}: stop did not settle")
-        events = h.vmlab("logs", machine, "--output", "jsonl", "--lines", "1000", cwd=lab)
-        stopped = [json.loads(line) for line in events.out.splitlines() if line.strip()]
-        stopped = [e for e in stopped if e["event"] == "vm.stopped" and e["data"].get("vm") == machine]
+        # The lab's event log: `vmlab logs <vm>` tails that VM's plain-text
+        # emulator and serial logs, not events.
+        events = h.vmlab("logs", "--output", "jsonl", "--lines", "1000", cwd=lab)
+        stopped = [e for e in lab_events(events.out)
+                   if e.get("event") == "vm.stopped" and e.get("data", {}).get("vm") == machine]
         if not stopped or stopped[-1]["data"].get("status") != "exit status: 0":
             raise ScenarioFailed(f"{machine}: emulator did not exit cleanly: {stopped[-1:]}")
     finally:
