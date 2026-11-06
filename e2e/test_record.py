@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from scenarios import record
 
+NO_DISPLAY = "Display output is not active."
 
 class FirmwareFrameTests(unittest.TestCase):
     def scan(self, frames):
@@ -30,9 +31,10 @@ class FirmwareFrameTests(unittest.TestCase):
             return record.firmware_frame(Path("boot.mp4"), Path("boot.png"))
 
     def test_firmware_painting_after_the_old_deadline_passes(self):
-        at, text = self.scan([(0.1, ""), (6.2, 'BdsDxe: starting Boot0002 "UEFI Misc Device"')])
+        at, text, kind = self.scan([(0.1, ""), (6.2, 'BdsDxe: starting Boot0002 "UEFI Misc Device"')])
         self.assertEqual(at, 6.2)
         self.assertIn("BdsDxe", text)
+        self.assertEqual(kind, "BdsDxe")
 
     def test_bios_firmware_text_is_recognized(self):
         for text in ("SeaBIOS version 1.17.0-vmlab", "iPXE 2.0.0"):
@@ -42,13 +44,45 @@ class FirmwareFrameTests(unittest.TestCase):
     def test_the_vmlab_logo_is_firmware_when_bdsdxe_was_never_recorded(self):
         # VML-36's failing recordings: the logo, then GRUB, no BdsDxe frame.
         frames = [(0.4, ""), (1.67, "vmlab"), (2.07, "GNU GRUB version 2.12")]
-        self.assertEqual(self.scan(frames)[0], 1.67)
+        self.assertEqual(self.scan(frames)[::2], (1.67, "logo"))
 
     def test_a_lit_bootloader_or_linux_console_does_not_pass_for_firmware(self):
         frames = [(0.1, "GNU GRUB version 2.12"), (3.0, "Linux version 6.12\nalpine login:")]
         with self.assertRaisesRegex(AssertionError, "no firmware output") as caught:
             self.scan(frames)
         self.assertIn("3.00s Linux version 6.12", str(caught.exception))
+
+    def test_an_ocr_misread_of_the_logo_still_counts(self):
+        # VML-36 runs 5 and 7: tesseract read the logo as "vmliab".
+        for text in ("vmliab", "VMLAB", "vm1ab"):
+            with self.subTest(text=text):
+                at, _, kind = self.scan([(0.0, NO_DISPLAY), (2.6, text)])
+                self.assertEqual((at, kind), (2.6, "logo"))
+
+    def test_grub_counts_after_a_no_display_start_when_no_firmware_was_recorded(self):
+        # VML-36 run 4: no logo and no BdsDxe frame, QEMU's text, then GRUB.
+        frames = [(0.0, ""), (0.03, NO_DISPLAY), (0.13, NO_DISPLAY + " "), (2.17, "GNU GRUB version 2.12")]
+        at, _, kind = self.scan(frames)
+        self.assertEqual((at, kind), (2.17, "no-display+GRUB"))
+
+    def test_firmware_wins_over_grub_and_names_its_kind(self):
+        frames = [(0.0, NO_DISPLAY), (1.9, "BdsDxe: loading Boot0002"), (2.5, "GNU GRUB version 2.12")]
+        self.assertEqual(self.scan(frames)[2], "BdsDxe")
+
+    def test_grub_without_a_no_display_first_frame_fails(self):
+        # A recording that started late: its first lit frame is not QEMU's
+        # text, or comes after NO_DISPLAY_BY.
+        for frames in (
+            [(0.0, ""), (0.5, NO_DISPLAY), (2.0, "GNU GRUB version 2.12")],
+            [(0.3, NO_DISPLAY), (2.0, "GNU GRUB version 2.12")],
+            [(0.0, "GNU GRUB version 2.12")],
+        ):
+            with self.subTest(frames=frames), self.assertRaisesRegex(AssertionError, "no firmware output"):
+                self.scan(frames)
+
+    def test_grub_after_the_deadline_fails(self):
+        with self.assertRaisesRegex(AssertionError, "no firmware output"):
+            self.scan([(0.0, NO_DISPLAY), (5.2, "GNU GRUB version 2.12")])
 
     def test_an_empty_recording_fails(self):
         with self.assertRaisesRegex(AssertionError, "first lit at None"):

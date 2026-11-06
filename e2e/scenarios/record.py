@@ -4,6 +4,7 @@ ffprobe, frames pulled with ffmpeg, text read with tesseract."""
 
 import json
 import pathlib
+import re
 import subprocess
 import time
 import zlib
@@ -102,7 +103,23 @@ def placement(fb_w: int, fb_h: int, out_w: int = 1920, out_h: int = 1080):
 
 # Firmware text, or the vmlab logo vmlab's own OVMF draws at boot
 # (guest/build-ovmf.sh puts guest/logo/Logo.bmp in place of edk2's).
-FIRMWARE_MARKERS = ("BDSDXE", "SEABIOS", "IPXE", "VMLAB")
+# Each is (kind, pattern over the upper-cased OCR text). tesseract reads the
+# logo as "vmlab" or "vmliab" (VML-36), so its pattern allows that.
+FIRMWARE_MARKERS = (
+    ("BdsDxe", re.compile(r"BDSDXE")),
+    ("SeaBIOS", re.compile(r"SEABIOS")),
+    ("iPXE", re.compile(r"IPXE")),
+    ("logo", re.compile(r"VM[LI1|!]{1,2}AB")),
+)
+# QEMU's own text while the guest has not set a display mode yet.
+NO_DISPLAY = re.compile(r"DISPLAY\s+OUTPUT\s+IS\s+NOT\s+ACTIVE")
+GRUB = re.compile(r"GNU\s+GRUB")
+# OVMF can draw and clear all of its output between two framebuffer reads,
+# so a boot may record no firmware frame at all (VML-36). GRUB then counts,
+# but only when the recording began with QEMU's no-display text, which
+# proves it started at power-on, and only within the first GRUB_BY seconds.
+NO_DISPLAY_BY = 0.2
+GRUB_BY = 5.0
 
 
 def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
@@ -137,22 +154,35 @@ def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = 8.0)
     line can be drawn and cleared again between two framebuffer reads, so a
     boot may never record it (VML-36). The vmlab logo OVMF shows before it
     is firmware output too and stays on screen for a fraction of a second.
+    A boot with no firmware frame passes on GRUB only after QEMU's
+    no-display text in the first lit frame (see GRUB_BY).
+
+    Returns (time, text, kind): kind is the marker that matched, one of
+    BdsDxe, SeaBIOS, iPXE, logo, or no-display+GRUB.
     """
     seen = []
     lit_at = None
+    no_display_start = False
     for at, png in early_frames(video, seconds, out.with_suffix(".frames")):
         _, _, rows = png_read(png)
         lit = sum(1 for row in rows[::8] for px in row[::8] if max(px) > 60)
         if lit <= 20:
             continue
-        if lit_at is None:
+        first_lit = lit_at is None
+        if first_lit:
             lit_at = at
         text = ocr(png)
+        upper = text.upper()
         first = " | ".join(line for line in text.splitlines() if line.strip())[:100]
         seen.append(f"{at:.2f}s {first}")
-        if any(marker in text.upper() for marker in FIRMWARE_MARKERS):
+        if first_lit and at <= NO_DISPLAY_BY and NO_DISPLAY.search(upper):
+            no_display_start = True
+        kind = next((k for k, pattern in FIRMWARE_MARKERS if pattern.search(upper)), None)
+        if kind is None and no_display_start and at < GRUB_BY and GRUB.search(upper):
+            kind = "no-display+GRUB"
+        if kind is not None:
             out.write_bytes(png.read_bytes())
-            return at, text
+            return at, text, kind
     raise AssertionError(
         f"no firmware output in the first {seconds:g} s (first lit at {lit_at} s); "
         f"distinct lit frames read: {seen}"
@@ -184,14 +214,14 @@ def run(h):
             # Firmware initialization time varies. Identify its text rather
             # than accepting any lit frame before a fixed subsecond deadline.
             try:
-                at, text = firmware_frame(boot, rec / "boot-early.png")
+                at, text, kind = firmware_frame(boot, rec / "boot-early.png")
             except AssertionError:
                 # Keep the recording outside the container for diagnosis.
                 kept = RESULTS / f"record-up-from-boot-{time.strftime('%Y%m%dT%H%M%S')}.mp4"
                 kept.write_bytes(boot.read_bytes())
                 h.log.write(f"[record] kept the failing boot recording as {kept}\n")
                 raise
-            h.log.write(f"[record] firmware frame at {at:.1f}s: {text.strip()[:200]}\n")
+            h.log.write(f"[record] firmware frame at {at:.1f}s ({kind}): {text.strip()[:200]}\n")
             return True
 
         h.check("record.up-from-boot", from_boot, "`up --record` captured the firmware screen; ffprobe reads 1920x1080 h264")
