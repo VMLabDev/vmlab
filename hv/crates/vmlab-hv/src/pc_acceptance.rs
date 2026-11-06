@@ -17,6 +17,16 @@ const DOS_BOOT_GUARD_COMMANDS: [&str; 4] = [
 ];
 const DOS_RESTORE_STARTUP: &str = "copy /Y C:\\HVAUTO.BAK C:\\FDAUTO.BAT";
 
+/// An edit to the next description built on this thread.
+type DescriptionEdit = Box<dyn FnOnce(&mut serde_json::Value, &Path)>;
+
+thread_local! {
+    /// Phase-4c additions (floppy medium, UHCI tablet) for the next
+    /// `Running::boot` on this thread, applied by `Guest::description`.
+    static NEXT_DESCRIPTION: std::cell::RefCell<Option<DescriptionEdit>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Guest {
     Temple,
@@ -55,6 +65,11 @@ impl Guest {
                 "VMLAB_HV_TEMPLATE_WINDOWS_SERVER_2008_R2_CORE",
             ),
         }
+    }
+
+    /// Windows 98 SE runs on the captured Cirrus CL-GD5446 at 00:03.0.
+    fn cirrus(self) -> bool {
+        self == Self::Windows98
     }
 
     fn windows_nt(self) -> bool {
@@ -117,6 +132,13 @@ impl Guest {
         if self == Self::Windows98 {
             machine["cpu_model"] = "pentium3".into();
         }
+        if self.cirrus() {
+            machine["display"]["device"] = "cirrus-vga".into();
+            machine["display"]["pci"]["device"] = 3.into();
+        }
+        if let Some(edit) = NEXT_DESCRIPTION.with(|next| next.borrow_mut().take()) {
+            edit(&mut machine, directory);
+        }
         machine
     }
 
@@ -161,10 +183,22 @@ struct Running {
     directory: tempfile::TempDir,
     guest: Guest,
     resumed: Instant,
+    /// The test's switch for a 4b NIC: DHCP, ARP and ICMP echo.
+    switch: Option<vmlab_hv_tests::switch::MiniSwitch>,
 }
 
 impl Running {
     fn boot(guest: Guest) -> Option<Self> {
+        Self::boot_with(guest, None, guest.cirrus())
+    }
+
+    fn boot_display(guest: Guest, cirrus: bool) -> Option<Self> {
+        Self::boot_with(guest, None, cirrus)
+    }
+
+    /// Boot `guest` with its 4d display choice, and with a phase-4b NIC of
+    /// `nic` model on the test switch.
+    fn boot_with(guest: Guest, nic: Option<&str>, cirrus: bool) -> Option<Self> {
         let (arch, name, version, variable) = guest.template();
         if !Path::new("/dev/kvm").exists() {
             eprintln!("skipping pc {name}: /dev/kvm is unavailable");
@@ -198,9 +232,15 @@ impl Running {
         let bios = std::env::var_os("VMLAB_HV_SEABIOS")
             .map(PathBuf::from)
             .unwrap_or_else(|| "/usr/share/qemu/bios-256k.bin".into());
-        let vga = std::env::var_os("VMLAB_HV_STDVGABIOS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/usr/share/qemu/vgabios-stdvga.bin".into());
+        let vga = if cirrus {
+            std::env::var_os("VMLAB_HV_CIRRUSBIOS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "/usr/share/qemu/vgabios-cirrus.bin".into())
+        } else {
+            std::env::var_os("VMLAB_HV_STDVGABIOS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "/usr/share/qemu/vgabios-stdvga.bin".into())
+        };
         for path in [&bios, &vga] {
             if !path.is_file() {
                 eprintln!("skipping pc {name}: firmware {} is missing", path.display());
@@ -217,7 +257,26 @@ impl Running {
         eprintln!("pc {name} artifacts: {}", directory.path().display());
         vmlab_disk::ops::create_linked_clone(&template, &directory.path().join("disk.qcow2"))
             .unwrap();
-        let description = guest.description(directory.path(), &bios, &vga);
+        let mut description = guest.description(directory.path(), &bios, &vga);
+        if !cirrus {
+            description["display"]["device"] = "std-vga".into();
+        }
+        let switch = nic.map(|model| {
+            let socket = directory.path().join("switch.sock");
+            let switch = vmlab_hv_tests::switch::MiniSwitch::bind(&socket).unwrap();
+            let mac = vmlab_hv_tests::TEST_MAC
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            // 00:03.0, as the captures place the legacy NIC.
+            description["nics"] = serde_json::json!([{
+                "model": model, "mac": mac,
+                "pci": {"bus":0,"device":3,"function":0},
+                "attachment": {"kind":"stream","socket":socket}
+            }]);
+            switch
+        });
         let machine = directory.path().join("machine.json");
         std::fs::write(&machine, serde_json::to_vec_pretty(&description).unwrap()).unwrap();
         let binary = std::env::var_os("VMLAB_HV_BINARY")
@@ -277,6 +336,7 @@ impl Running {
             directory,
             guest,
             resumed: Instant::now(),
+            switch,
         };
         assert!(
             running.directory.path().join("agent.sock").exists(),
@@ -692,6 +752,106 @@ fn exercise(guest: Guest) {
     running.poweroff(&mut agent);
 }
 
+/// Phase 4b: the guest's own driver brings the NIC up, takes a DHCP lease
+/// from the test switch and pings it; the NIC keeps working across a
+/// snapshot round trip.
+fn network(guest: Guest, model: &str) {
+    let Some(mut running) = Running::boot_with(guest, Some(model), guest.cirrus()) else {
+        return;
+    };
+    let mut agent = running.ready();
+    let gateway = vmlab_hv_tests::switch::SERVER_IP.to_string();
+    let lease = vmlab_hv_tests::switch::LEASE_IP.to_string();
+    let ping = |agent: &mut AgentClient| -> String {
+        match guest {
+            Guest::Dos => clean(&shell(agent, guest, "C:\\VMLAB\\PING.BAT").stdout),
+            _ => clean(&shell(agent, guest, &format!("ping.exe -n 2 {gateway}")).stdout),
+        }
+    };
+    let ok = |output: &str| match guest {
+        Guest::Dos => output.contains("Replies received: 2"),
+        _ => output.contains("Received = 2"),
+    };
+    if guest == Guest::Dos {
+        // The template's automatic networking does not load the packet
+        // driver (the capture loaded it by hand, E4).
+        // A packet driver stays resident: the agent reports DOS's
+        // termination type in AH (3 = TSR) above the exit code in AL.
+        let load = agent
+            .exec(
+                &["C:\\NET\\FDNET\\PCNTPK.COM", "INT=0x60"],
+                Duration::from_secs(60),
+            )
+            .expect("load the packet driver");
+        assert_eq!(load.exit_code & 0xff, 0, "packet driver load: {load:?}");
+        let driver = clean(&load.stdout);
+        assert!(
+            driver.contains("My Ethernet address is 52:54:00:12:34:56"),
+            "{driver}"
+        );
+        for line in [
+            "echo SET MTCPCFG=C:\\NET\\FDNET\\MTCP.CFG > C:\\VMLAB\\NET.BAT",
+            "echo C:\\NET\\FDNET\\DHCP.EXE >> C:\\VMLAB\\NET.BAT",
+        ] {
+            shell(&mut agent, guest, line);
+        }
+        let dhcp = clean(&shell(&mut agent, guest, "C:\\VMLAB\\NET.BAT").stdout);
+        assert!(dhcp.contains(&format!("IPADDR {lease}")), "{dhcp}");
+        // mTCP's ping refuses a lease of an hour or less, so it pings from
+        // a static configuration of the leased address, as the capture did.
+        for line in [
+            "echo PACKETINT 0x60 > C:\\VMLAB\\STATIC.CFG".to_string(),
+            format!("echo IPADDR {lease} >> C:\\VMLAB\\STATIC.CFG"),
+            "echo NETMASK 255.255.255.0 >> C:\\VMLAB\\STATIC.CFG".to_string(),
+            format!("echo GATEWAY {gateway} >> C:\\VMLAB\\STATIC.CFG"),
+            "echo SET MTCPCFG=C:\\VMLAB\\STATIC.CFG > C:\\VMLAB\\PING.BAT".to_string(),
+            format!("echo C:\\NET\\MTCP\\PING.EXE -count 2 {gateway} >> C:\\VMLAB\\PING.BAT"),
+        ] {
+            shell(&mut agent, guest, &line);
+        }
+    } else {
+        // Windows brings the adapter up and asks for a lease by itself.
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let config = clean(&shell(&mut agent, guest, "ipconfig").stdout);
+            if config.contains(&lease) {
+                eprintln!("{guest:?} {model} ipconfig:\n{config}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no DHCP lease: {config}");
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+    let stats = running.switch.as_ref().unwrap().stats();
+    assert!(
+        stats.dhcp_acked,
+        "the DHCP exchange did not complete: {stats:?}"
+    );
+    let before = ping(&mut agent);
+    assert!(ok(&before), "ping {gateway} before the snapshot: {before}");
+    snapshot(&mut running, &mut agent);
+    let after = ping(&mut agent);
+    assert!(
+        ok(&after),
+        "ping {gateway} after the snapshot load: {after}"
+    );
+    eprintln!("{guest:?} {model}: DHCP {lease}, ping {gateway} before and after snapshot load");
+    running.reset(&mut agent);
+    running.poweroff(&mut agent);
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn windows_7_e1000_dhcp_ping_snapshot() {
+    network(Guest::Windows7, "e1000");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn freedos_pcnet_dhcp_ping_snapshot() {
+    network(Guest::Dos, "pcnet");
+}
+
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn templeos_agent_snapshot_reset() {
@@ -719,10 +879,67 @@ fn windows_server_2008_r2_core_agent_snapshot_reset() {
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn windows_98_a20_boot_cost_with_standard_vga() {
+    let Some(mut running) = Running::boot_display(Guest::Windows98, false) else {
+        return;
+    };
+    let _agent = running.ready();
+    running.call(Control::Quit);
+    assert!(running.process.wait().unwrap().success());
+}
+
+/// A screenshot from the native display socket, as packed RGB.
+fn screenshot(directory: &Path, name: &str) -> (u32, u32, Vec<u8>) {
+    let path = directory.join(name);
+    crate::display_acceptance::diagnostic_screenshot(&directory.join("display.sock"), &path);
+    let bytes = std::fs::read(&path).unwrap();
+    let header: Vec<_> = bytes.splitn(4, |byte| *byte == b'\n').collect();
+    let size: Vec<u32> = std::str::from_utf8(header[1])
+        .unwrap()
+        .split(' ')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    (size[0], size[1], header[3].to_vec())
+}
+
+/// 4d S1: Windows 98 SE reaches its desktop and agent under Cirrus, and the
+/// display socket delivers the packed-pixel desktop rather than VGA text.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn windows_98_desktop_frame_under_cirrus() {
     let Some(mut running) = Running::boot(Guest::Windows98) else {
         return;
     };
     let _agent = running.ready();
+    let directory = running.directory.path().to_path_buf();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    // The logon or desktop screen at 640x480x8: Windows 98's teal desktop
+    // (DAC 0, 32, 32) is the most common colour, beside the window colours.
+    // The VMM's inactive-output placeholder has two colours.
+    let (width, height, colours) = loop {
+        let (width, height, pixels) = screenshot(&directory, "desktop.ppm");
+        let mut counts = std::collections::BTreeMap::new();
+        for pixel in pixels.as_chunks::<3>().0 {
+            *counts.entry(*pixel).or_insert(0usize) += 1;
+        }
+        let dominant = counts
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(pixel, _)| *pixel);
+        if width == 640 && height == 480 && counts.len() >= 8 && dominant == Some([0, 130, 130]) {
+            break (width, height, counts.len());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Cirrus desktop frame: {width}x{height}, {} colours, dominant {dominant:?}; see {}",
+            counts.len(),
+            directory.join("desktop.ppm").display()
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    eprintln!(
+        "Windows 98 SE Cirrus desktop {width}x{height} with {colours} colours: {}",
+        directory.join("desktop.ppm").display()
+    );
     running.call(Control::Quit);
     assert!(running.process.wait().unwrap().success());
 }
@@ -759,6 +976,13 @@ fn pc_descriptions_use_explicit_ide_slots_and_the_gate_agent_transport() {
         if guest.windows_nt() {
             assert_eq!(description.console_pci.unwrap().device, 2);
             assert_eq!(description.display.unwrap().pci.device, 4);
+        } else if guest.cirrus() {
+            let display = description.display.unwrap();
+            assert_eq!(
+                display.device,
+                vmlab_hv_proto::machine::DisplayDevice::CirrusVga
+            );
+            assert_eq!(display.pci.device, 3, "the capture's 00:03.0");
         }
     }
 }
@@ -905,4 +1129,207 @@ fn windows_setup_requires_both_completed_dword_values() {
     assert!(!windows_setup_finished(
         b"ERROR: The system was unable to find the specified registry key or value."
     ));
+}
+
+/// A FAT12 1.44 MB floppy with one file, `HVFLOPPY.TXT`, holding `text`:
+/// boot sector with BPB, two 9-sector FATs, a 14-sector root directory,
+/// and the file in cluster 2 (sector 33).
+fn fat12_floppy(path: &Path, text: &[u8]) {
+    let mut image = vec![0u8; 2880 * 512];
+    let boot = &mut image[..512];
+    boot[..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
+    boot[3..11].copy_from_slice(b"VMLABHV ");
+    boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+    boot[13] = 1;
+    boot[14..16].copy_from_slice(&1u16.to_le_bytes());
+    boot[16] = 2;
+    boot[17..19].copy_from_slice(&224u16.to_le_bytes());
+    boot[19..21].copy_from_slice(&2880u16.to_le_bytes());
+    boot[21] = 0xf0;
+    boot[22..24].copy_from_slice(&9u16.to_le_bytes());
+    boot[24..26].copy_from_slice(&18u16.to_le_bytes());
+    boot[26..28].copy_from_slice(&2u16.to_le_bytes());
+    boot[38] = 0x29;
+    boot[39..43].copy_from_slice(&0x4c43_0004u32.to_le_bytes());
+    boot[43..54].copy_from_slice(b"HVFLOPPY   ");
+    boot[54..62].copy_from_slice(b"FAT12   ");
+    boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+    for fat in [1, 10] {
+        image[fat * 512..fat * 512 + 6].copy_from_slice(&[0xf0, 0xff, 0xff, 0xff, 0x0f, 0x00]);
+    }
+    let entry = &mut image[19 * 512..19 * 512 + 32];
+    entry[..11].copy_from_slice(b"HVFLOPPYTXT");
+    entry[11] = 0x20;
+    entry[24..26].copy_from_slice(&0x5b65u16.to_le_bytes());
+    entry[26..28].copy_from_slice(&2u16.to_le_bytes());
+    entry[28..32].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    image[33 * 512..33 * 512 + text.len()].copy_from_slice(text);
+    std::fs::write(path, image).unwrap();
+}
+
+/// Phase 4c: boot with a floppy medium and the PIIX3 UHCI tablet, as
+/// vmlab's legacy profiles attach them.
+fn boot_with_floppy_and_tablet(guest: Guest, floppy: bool) -> Option<Running> {
+    NEXT_DESCRIPTION.with(|next| {
+        *next.borrow_mut() = Some(Box::new(move |machine, directory| {
+            machine["tablet"] = serde_json::json!({"bus":0,"device":1,"function":2});
+            if floppy {
+                let path = directory.join("floppy.img");
+                fat12_floppy(&path, b"vmlab floppy 4c\r\n");
+                machine["floppy"] = path.to_str().unwrap().into();
+            }
+        }));
+    });
+    let running = Running::boot(guest);
+    NEXT_DESCRIPTION.with(|next| next.borrow_mut().take());
+    running
+}
+
+fn dos_reads_floppy(agent: &mut AgentClient, when: &str) {
+    let text = clean(&shell(agent, Guest::Dos, "type A:\\HVFLOPPY.TXT").stdout);
+    assert!(
+        text.contains("vmlab floppy 4c"),
+        "FreeDOS did not read the floppy {when}: {text:?}"
+    );
+}
+
+/// FreeDOS reads and writes a FAT12 floppy through the 82078 and ISA DMA,
+/// and the drive keeps working across a snapshot load and a reset.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn freedos_floppy_read_write_snapshot_reset() {
+    let Some(mut running) = boot_with_floppy_and_tablet(Guest::Dos, true) else {
+        return;
+    };
+    let mut agent = running.ready();
+    dos_reads_floppy(&mut agent, "after boot");
+    shell(
+        &mut agent,
+        Guest::Dos,
+        "echo written-by-dos>A:\\HVWRITE.TXT",
+    );
+    assert_eq!(
+        clean(&shell(&mut agent, Guest::Dos, "type A:\\HVWRITE.TXT").stdout),
+        "written-by-dos"
+    );
+    let listing = clean(&shell(&mut agent, Guest::Dos, "dir A:").stdout);
+    assert!(
+        listing.contains("HVFLOPPY") && listing.contains("HVWRITE"),
+        "{listing}"
+    );
+    eprintln!("FreeDOS A: listing:\n{listing}");
+    snapshot(&mut running, &mut agent);
+    dos_reads_floppy(&mut agent, "after the snapshot load");
+    running.reset(&mut agent);
+    dos_reads_floppy(&mut agent, "after reset");
+    running.poweroff(&mut agent);
+    let image = std::fs::read(running.directory.path().join("floppy.img")).unwrap();
+    assert!(
+        image
+            .windows(b"written-by-dos".len())
+            .any(|window| window == b"written-by-dos"),
+        "the guest's floppy write did not reach the image"
+    );
+    eprintln!("FreeDOS floppy: read, write, snapshot load and reset passed");
+}
+
+/// Sum of per-channel differences between two frames inside a box.
+fn region_change(
+    before: &crate::display_acceptance::Image,
+    after: &crate::display_acceptance::Image,
+    x: u32,
+    y: u32,
+) -> u64 {
+    let mut total = 0;
+    for row in y..(y + 20).min(before.height) {
+        for column in x..(x + 12).min(before.width) {
+            let offset = ((row * before.width + column) * 4) as usize;
+            for channel in 0..3 {
+                total += u64::from(
+                    before.pixels[offset + channel].abs_diff(after.pixels[offset + channel]),
+                );
+            }
+        }
+    }
+    total
+}
+
+/// Windows 7's inbox USB stack enumerates the PIIX3 UHCI and the tablet,
+/// and the HID driver moves the cursor where the tablet reports.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn windows_7_uhci_tablet_moves_the_cursor() {
+    use vmlab_hv_display::{Capabilities, Client, Message};
+    let Some(mut running) = boot_with_floppy_and_tablet(Guest::Windows7, false) else {
+        return;
+    };
+    let mut agent = running.ready();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let report = loop {
+        let report = clean(
+            &shell(
+                &mut agent,
+                Guest::Windows7,
+                "wmic path Win32_PnPEntity get Name,PNPDeviceID,Status /format:csv",
+            )
+            .stdout,
+        )
+        // wmic's CSV output escapes `&` as an XML entity.
+        .replace("&amp;", "&");
+        let upper = report.to_ascii_uppercase();
+        if upper.contains("PCI\\VEN_8086&DEV_7020")
+            && upper.contains("USB\\VID_0627&PID_0001")
+            && upper.contains("HID-COMPLIANT MOUSE")
+        {
+            break report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Windows 7 did not enumerate the UHCI tablet: {report}"
+        );
+        std::thread::sleep(Duration::from_secs(5));
+    };
+    for line in report.lines().filter(|line| {
+        let upper = line.to_ascii_uppercase();
+        upper.contains("DEV_7020") || upper.contains("VID_0627") || upper.contains("HID")
+    }) {
+        eprintln!("Windows 7 USB: {line}");
+        assert!(
+            line.trim_end().ends_with(",OK"),
+            "device not working: {line}"
+        );
+    }
+    let display = running.directory.path().join("display.sock");
+    let input = Client::connect(&display, Capabilities(Capabilities::INPUT)).unwrap();
+    let frame = crate::display_acceptance::screenshot(&display);
+    let (width, height) = (frame.width, frame.height);
+    let at = |x: u32, y: u32| Message::PointerAbs {
+        x,
+        y,
+        width,
+        height,
+    };
+    let (a, b) = ((width / 4, height / 4), (width * 3 / 4, height * 3 / 4));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        input.send(&at(a.0, a.1)).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let first = crate::display_acceptance::screenshot(&display);
+        input.send(&at(b.0, b.1)).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let second = crate::display_acceptance::screenshot(&display);
+        let left = region_change(&first, &second, a.0, a.1);
+        let arrived = region_change(&first, &second, b.0, b.1);
+        eprintln!("cursor move {a:?} -> {b:?}: left {left}, arrived {arrived}");
+        if left > 1000 && arrived > 1000 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest cursor did not follow the UHCI tablet"
+        );
+    }
+    eprintln!("Windows 7: UHCI tablet enumerated and moved the cursor");
+    snapshot(&mut running, &mut agent);
+    running.poweroff(&mut agent);
 }

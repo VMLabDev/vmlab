@@ -120,8 +120,8 @@ const VMLAB_ARCH: &str = "x86_64";
 // hwref tests pass in-tree), one edit per sub-phase.
 const PC_MACHINE_CORE_DELIVERED: bool = true; // 4a
 const PC_NETWORKING_DELIVERED: bool = true; // 4b
-const PC_FLOPPY_UHCI_DELIVERED: bool = false; // 4c
-const PC_CIRRUS_DELIVERED: bool = false; // 4d
+const PC_FLOPPY_UHCI_DELIVERED: bool = true; // 4c
+const PC_CIRRUS_DELIVERED: bool = true; // 4d
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LegacyPcDelivery {
@@ -313,6 +313,12 @@ fn hardware_refusals(
         )),
     }
     match h.nic_model.as_str() {
+        // vmlab-hv's pc presents the NICs its captures show, e1000 and PCnet.
+        model if model.starts_with("virtio-net") && pc && has_nics => why.push(format!(
+            "vm \"{name}\": nic_model `{model}` on the pc machine — vmlab-hv's pc presents \
+             e1000 and PCnet NICs only (PRD §22); set nic_model = \"e1000\" or \"pcnet\", or \
+             use hypervisor = \"qemu\""
+        )),
         model if model.starts_with("virtio-net") => {}
         "e1000" | "pcnet" if pc => {
             if has_nics && !delivered.networking {
@@ -568,7 +574,6 @@ mod tests {
     fn automatic_selection_uses_the_resolved_refusal_list() {
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
         for setting in [
-            r#"profile = "windows-legacy""#,
             r#"profile = "macos""#,
             r#"profile = "linux-modern" accel = "tcg""#,
         ] {
@@ -708,7 +713,7 @@ mod tests {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
         let cases = [
             (r#"profile = "macos""#, "phase macOS"),
-            (r#"profile = "windows-legacy""#, "phase 4"),
+            (r#"profile = "linux-modern" accel = "tcg""#, "phase 3"),
         ];
         for (body, phase) in cases {
             let why = refused(&format!("{base} {body}"));
@@ -786,12 +791,13 @@ mod tests {
             let cfg = vmlab_refusals(machine, &kvm_host(), Some(&hw));
             let launch = vmlab_vm_launch_refusals(&hw, true, true);
             assert_eq!(launch, cfg, "{profile}");
+            // 4c is delivered: only a floppy off the pc machine is refused.
             assert_eq!(
                 launch
                     .iter()
                     .filter(|why| why.contains("a floppy drive"))
                     .count(),
-                1,
+                usize::from(profile == "linux-generic"),
                 "{profile}: {launch:?}"
             );
         }
@@ -799,49 +805,49 @@ mod tests {
 
     #[test]
     fn adapter_launch_refusals_use_the_actual_attachment_presence() {
-        let file = lab(r#"lab "l" {
-            vm "v" { template = "scratch" arch = "x86_64" disk = 2GiB
-                profile = "windows-legacy" }
-        }"#);
-        let MachineCfg::Vm(vm) = file.lab.machine("v").unwrap() else {
-            unreachable!()
-        };
-        let hw =
+        let resolve = |profile: &str| {
+            let file = lab(&format!(
+                r#"lab "l" {{
+                    vm "v" {{ template = "scratch" arch = "x86_64" disk = 2GiB
+                        profile = "{profile}" }}
+                }}"#
+            ));
+            let MachineCfg::Vm(vm) = file.lab.machine("v").unwrap() else {
+                unreachable!()
+            };
             crate::qemu::resolve_vm(vm, None, &crate::profiles::ProfileSet::shipped().unwrap())
-                .unwrap();
-        let bare = vmlab_vm_launch_refusals(&hw, false, false);
-        assert!(!bare.iter().any(|why| why.contains("4b")), "{bare:?}");
+                .unwrap()
+        };
+        // On pc, NICs (4b) and a floppy (4c) are delivered either way.
+        let pc = resolve("windows-legacy");
+        assert!(vmlab_vm_launch_refusals(&pc, false, false).is_empty());
+        let attached = vmlab_vm_launch_refusals(&pc, true, true);
+        assert!(attached.is_empty(), "{attached:?}");
+        // On q35 the floppy is refused only when one is attached.
+        let q35 = resolve("linux-generic");
+        assert!(vmlab_vm_launch_refusals(&q35, true, false).is_empty());
+        let floppy = vmlab_vm_launch_refusals(&q35, true, true);
         assert!(
-            !bare.iter().any(|why| why.contains("a floppy drive")),
-            "{bare:?}"
-        );
-        assert!(bare.iter().any(|why| why.contains("UHCI")), "{bare:?}");
-        let attached = vmlab_vm_launch_refusals(&hw, true, true);
-        assert!(
-            !attached.iter().any(|why| why.contains("4b")),
-            "4b is delivered: {attached:?}"
-        );
-        assert!(
-            attached.iter().any(|why| why.contains("a floppy drive")),
-            "{attached:?}"
+            floppy.len() == 1 && floppy[0].contains("a floppy drive"),
+            "{floppy:?}"
         );
     }
 
-    /// 4a and 4b are in `hv/`, 4c and 4d are not: a networked legacy VM is
-    /// refused for nothing but the UHCI tablet QEMU gives every pc, so it
-    /// still falls back to QEMU until 4c, naming 4c and nothing earlier.
+    /// 4a to 4d are in `hv/`: a networked legacy VM, Cirrus and floppy
+    /// included, is refused nothing and runs on vmlab-hv.
     #[test]
-    fn the_delivered_sub_phases_are_4a_and_4b() {
+    fn the_delivered_sub_phases_are_4a_to_4d() {
         const {
             assert!(LEGACY_PC_DELIVERED.machine_core && LEGACY_PC_DELIVERED.networking);
-            assert!(!LEGACY_PC_DELIVERED.floppy_uhci && !LEGACY_PC_DELIVERED.cirrus);
+            assert!(LEGACY_PC_DELIVERED.floppy_uhci && LEGACY_PC_DELIVERED.cirrus);
         }
-        let why = refused(
-            r#"template = "scratch" arch = "x86_64" disk = 2GiB
-                profile = "windows-legacy" nic { nat = true }"#,
-        );
-        assert_eq!(why.len(), 1, "{why:?}");
-        assert!(why[0].contains("4c") && why[0].contains("UHCI"), "{why:?}");
+        for profile in ["windows-9x", "windows-legacy"] {
+            let why = refused(&format!(
+                r#"template = "scratch" arch = "x86_64" disk = 2GiB
+                    profile = "{profile}" floppy = "answer.img" nic {{ nat = true }}"#
+            ));
+            assert!(why.is_empty(), "{profile}: {why:?}");
+        }
     }
 
     fn all_legacy_pc_delivered() -> LegacyPcDelivery {
@@ -970,10 +976,14 @@ mod tests {
     /// refused only what its declaration says; the daemon checks the rest.
     #[test]
     fn without_hardware_only_the_declaration_is_checked() {
-        let file = lab(r#"lab "l" { vm "v" { template = "x86_64/t" floppy = "./f" } }"#);
+        let file = lab(r#"lab "l" { vm "v" { template = "x86_64/t" accel = "tcg" } }"#);
         let why = vmlab_refusals(file.lab.machine("v").unwrap(), &kvm_host(), None);
         assert_eq!(why.len(), 1, "{why:?}");
-        assert!(why[0].contains("phase 4"), "{}", why[0]);
+        assert!(why[0].contains("phase 3"), "{}", why[0]);
+        // A floppy is delivered (4c); only its machine, which the
+        // template decides, can still refuse it.
+        let floppy = lab(r#"lab "l" { vm "v" { template = "x86_64/t" floppy = "./f" } }"#);
+        assert!(vmlab_refusals(floppy.lab.machine("v").unwrap(), &kvm_host(), None).is_empty());
 
         let plain = lab(r#"lab "l" { vm "v" { template = "x86_64/t" } }"#);
         assert!(vmlab_refusals(plain.lab.machine("v").unwrap(), &kvm_host(), None).is_empty());
