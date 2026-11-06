@@ -358,18 +358,34 @@ def run(h):
         h.check("record.refusals", refusals, "second start is a conflict naming the file; a container has no display; .gif refused")
 
         # -- vm restart mid-recording: one continuous file.
+        # The recorder's clock starts inside `record start` and ends inside
+        # `record stop`, so the video is bracketed: no shorter than the time
+        # between the two calls, no longer than the time across both. The
+        # latency of the calls themselves grows with host load (VML-65), so
+        # it bounds the check rather than eating a fixed tolerance.
         def restart():
             cont = rec / "restart.mp4"
             t0 = time.monotonic()
             h.vmlab("record", "start", "vm01", "-o", str(cont), cwd=lab)
+            t1 = time.monotonic()
             time.sleep(1)
             h.vmlab("vm", "restart", "vm01", cwd=lab, timeout=300)
             h.wait_ready(lab, "vm01")
             time.sleep(1)
-            h.vmlab("record", "stop", "vm01", cwd=lab)
-            wall = time.monotonic() - t0
-            info = ffprobe(cont)
-            assert abs(info["duration"] - wall) < 3.0, f"duration {info['duration']:.1f}s vs wall {wall:.1f}s across the restart"
+            t2 = time.monotonic()
+            stopped = json.loads(h.vmlab("record", "stop", "vm01", "--json", cwd=lab).out)
+            t3 = time.monotonic()
+            duration = ffprobe(cont)["duration"]
+            inner, outer = t2 - t1, t3 - t0
+            h.log.write(
+                f"[record] restart: video {duration:.2f}s, recorder {stopped['duration_secs']:.2f}s, "
+                f"between the calls {inner:.2f}s, across them {outer:.2f}s "
+                f"(start call {t1 - t0:.2f}s, stop call {t3 - t2:.2f}s)\n"
+            )
+            assert abs(duration - stopped["duration_secs"]) < 0.5, \
+                f"file {duration:.2f}s but the recorder counted {stopped['duration_secs']:.2f}s"
+            assert inner - 0.5 <= duration <= outer + 0.5, \
+                f"duration {duration:.2f}s outside {inner:.2f}s..{outer:.2f}s across the restart"
             return True
 
         h.check("record.restart", restart, "a `vm restart` mid-recording yields one continuous file spanning the gap")
