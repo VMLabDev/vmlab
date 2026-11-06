@@ -1035,6 +1035,7 @@ mod tests {
                     name: name.into(),
                     root: other.clone(),
                     pid: std::process::id(),
+                    started: super::process_start_time(std::process::id()),
                     state: super::registry::LabState::Running,
                 })
                 .unwrap();
