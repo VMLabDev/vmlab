@@ -5161,7 +5161,7 @@ lab "t" {
         let sh = shared(dir.path());
         std::fs::write(
             dir.path().join("bad.ws"),
-            "use vmlab\n\nfn main(lab: Lab) {\n    vmlab::sleep_ms(200)\n    \
+            "use vmlab\n\nfn main(lab: Lab) {\n    lab.log(\"bad-waits\")\n    \
              let _m = lab.machine(\"nope\").expect(\"bad-step-failed\")\n}\n",
         )
         .unwrap();
@@ -5186,7 +5186,33 @@ lab "t" {
                 FakeMachine::new("after", MachineKind::Container, &sh),
             ],
         );
-        let (sink, said) = numbered(&sh);
+        // "bad" fails only once "slow" has begun: a fixed sleep in bad.ws
+        // lost that race on a loaded host. The gate holds bad's script
+        // thread in its `lab.log("bad-waits")` until "slow-begin" is said,
+        // for at most 10 s, so a slow that never begins still fails the
+        // assert below rather than hanging.
+        let (numbered_sink, said) = numbered(&sh);
+        let began_slow = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let sink: crate::scripting::OutputSink = {
+            let began_slow = began_slow.clone();
+            Arc::new(move |s: String| {
+                let (flag, cv) = &*began_slow;
+                if s.contains("bad: bad-waits") {
+                    numbered_sink(s);
+                    let guard = flag.lock().unwrap();
+                    let _ = cv
+                        .wait_timeout_while(guard, Duration::from_secs(10), |b| !*b)
+                        .unwrap();
+                    return;
+                }
+                let begins = s.contains("slow: slow-begin");
+                numbered_sink(s);
+                if begins {
+                    *flag.lock().unwrap() = true;
+                    cv.notify_all();
+                }
+            })
+        };
         let began = std::time::Instant::now();
         let err = tokio::time::timeout(Duration::from_secs(20), lab.up(&[], sink))
             .await
