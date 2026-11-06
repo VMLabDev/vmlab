@@ -117,8 +117,11 @@ LOGO = re.compile(r"\W*VM[LI1|!]{1,2}AB\W*")
 # QEMU's own text while the guest has not set a display mode yet.
 NO_DISPLAY = re.compile(r"DISPLAY\s+OUTPUT\s+IS\s+NOT\s+ACTIVE")
 GRUB = re.compile(r"GNU\s+GRUB")
-# A recording from power-on opens on QEMU's no-display text, or on firmware,
+# A recording from power-on opens on firmware, or on QEMU's no-display text
 # within START_BY seconds. That rule, not the window size, proves "from boot".
+# A firmware first frame has no time limit: vmlab-hv's native recorder leaves
+# out its placeholder frames and starts at the guest's first painted frame,
+# so OVMF's logo can come first at 0.53 s (VML-74).
 # OVMF can draw and clear all of its output between two framebuffer reads,
 # so a boot may record no firmware frame at all (VML-36): GRUB then counts.
 # Under heavy host load OVMF painted its logo only at 11.5 s, so the search
@@ -176,8 +179,8 @@ def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRM
     boot may never record it (VML-36). The vmlab logo OVMF shows before it
     is firmware output too and stays on screen for a fraction of a second.
 
-    Two rules. The first lit frame must come by START_BY and be QEMU's
-    no-display text or firmware, else the recording started late. Then a
+    Two rules. The first lit frame must be firmware, or QEMU's no-display
+    text by START_BY, else the recording started late. Then a
     firmware marker, or GRUB when no firmware frame was recorded, must come
     within `seconds`.
 
@@ -198,10 +201,10 @@ def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRM
         kind = firmware_kind(upper)
         if lit_at is None:
             lit_at = at
-            if at > START_BY or (kind is None and not NO_DISPLAY.search(upper)):
+            if kind is None and (at > START_BY or not NO_DISPLAY.search(upper)):
                 raise AssertionError(
                     f"not recorded from power-on: the first lit frame, at {at:.2f} s, "
-                    f"is not QEMU's no-display text or firmware by {START_BY:g} s: {first!r}"
+                    f"is not firmware or QEMU's no-display text by {START_BY:g} s: {first!r}"
                 )
         elif kind is None and GRUB.search(upper):
             kind = "no-display+GRUB"
