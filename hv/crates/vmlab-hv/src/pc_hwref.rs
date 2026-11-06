@@ -776,7 +776,9 @@ fn pci_exception(
             if le32(actual, 0x20) & 15 == 1
                 && (0x1000..=0xfff0).contains(&(le32(actual, 0x20) & !15)) =>
         {
-            Some("IDE BAR4 allocation follows this profile's device set, not the superset baseline's")
+            Some(
+                "IDE BAR4 allocation follows this profile's device set, not the superset baseline's",
+            )
         }
         (9, 0x40..=0x44)
             if (actual[offset] ^ expected[offset])
