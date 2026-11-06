@@ -25,6 +25,7 @@ The main build sets `VMLAB_SKIP_FIRMWARE=1` for `build-asset.sh` and builds only
 - **Results.** Each scenario reports every feature it covers against the catalogue in `features.py` as pass, fail, or skip with a reason. A feature that no scenario reported counts as missing, and a missing feature fails the run.
 - **Output.** A run writes to `e2e/results/`:
   - `results.json`: one row per feature, naming the hypervisor the run used.
+  - `junit.xml`: the same rows as JUnit XML, one test case per feature, for `terrarium test push`. A failed or missing feature is a failure, a skipped one is skipped.
   - `e2e.log`: every command the run executed, with its output.
   - `registry.log`: the registry's log.
 

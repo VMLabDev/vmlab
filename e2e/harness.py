@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from features import FEATURES, HOST, PHASE_ORDER, PHASES, QEMU_SCENARIOS, VMLAB_DELIVERED, out_of_scope
@@ -31,6 +32,36 @@ RESULTS = pathlib.Path(os.environ.get("E2E_RESULTS", "/results"))
 def redact_osk(text: str) -> str:
     """Hide device options, including keys containing printable whitespace."""
     return re.sub(r"osk=[^\r\n\x00]*", "osk=[REDACTED]", text)
+
+
+# C0 control characters that XML 1.0 forbids (all but tab, newline and
+# carriage return). Command output can carry them: the ESC of an ANSI colour
+# code, a NUL from a guest console.
+_XML_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_safe(text: str) -> str:
+    return _XML_FORBIDDEN.sub("?", text)
+
+
+def junit_xml(rows: list[dict], name: str = "e2e") -> str:
+    """The rows of `results.json` as JUnit XML, one test case per feature:
+    a fail or missing feature is a failure, a skipped one is skipped."""
+    failures = sum(r["status"] in ("fail", "missing") for r in rows)
+    skipped = sum(r["status"] == "skip" for r in rows)
+    attrs = {"name": name, "tests": str(len(rows)), "failures": str(failures),
+             "errors": "0", "skipped": str(skipped)}
+    root = ET.Element("testsuites", attrs)
+    suite = ET.SubElement(root, "testsuite", attrs)
+    for r in rows:
+        case = ET.SubElement(suite, "testcase", {"classname": f"e2e.{r['hypervisor']}", "name": r["feature"]})
+        detail = _xml_safe(r["detail"])
+        if r["status"] in ("fail", "missing"):
+            ET.SubElement(case, "failure", {"type": r["status"], "message": detail}).text = detail
+        elif r["status"] == "skip":
+            ET.SubElement(case, "skipped", {"message": detail})
+    ET.indent(root)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
 
 
 class ScenarioFailed(Exception):
@@ -267,6 +298,7 @@ class Harness:
             rows.append({"feature": fid, "description": desc, "hypervisor": self.hypervisor,
                          "status": status, "detail": detail})
         (RESULTS / "results.json").write_text(json.dumps(rows, indent=2))
+        (RESULTS / "junit.xml").write_text(junit_xml(rows, f"e2e-{self.hypervisor}"))
         width = max((len(r["feature"]) for r in rows), default=0)
         counts: dict[str, int] = {}
         for r in rows:
