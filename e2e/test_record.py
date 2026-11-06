@@ -78,17 +78,26 @@ class FirmwareFrameTests(unittest.TestCase):
         self.assertEqual(self.scan(frames)[2], "BdsDxe")
 
     def test_a_late_start_fails_whatever_follows(self):
-        # The first lit frame is not QEMU's text or firmware, or comes after
+        # The first lit frame is not firmware, or is QEMU's text after
         # START_BY: the recording missed power-on.
         for frames in (
             [(0.0, GRUB), (1.0, "vmlab")],
             [(0.1, "Linux version 6.12\nalpine login:")],
             [(0.0, ""), (0.5, NO_DISPLAY), (2.0, "vmlab")],
-            [(0.3, "vmlab")],
+            [(0.0, ""), (0.53, " * Starting vmlab-agent ... [ ok ]"), (1.0, "vmlab")],
         ):
             with self.subTest(frames=frames), \
                     self.assertRaisesRegex(AssertionError, "not recorded from power-on"):
                 self.scan(frames)
+
+    def test_firmware_first_after_start_by_passes_on_vmlab_hv(self):
+        # VML-74: vmlab-hv's native recorder starts at the guest's first
+        # painted frame, OVMF's black screen, and its logo comes at 0.53 s.
+        for text in ("vmliab", "vmlab", "BdsDxe: loading Boot0002"):
+            with self.subTest(text=text):
+                at, _, kind = self.scan([(0.0, ""), (0.5, ""), (0.53, text), (2.0, GRUB)])
+                self.assertEqual(at, 0.53)
+                self.assertIn(kind, ("logo", "BdsDxe"))
 
     def test_the_logo_is_the_whole_text_of_a_frame(self):
         for text in ("VMLAB", "VMLIAB", " vmlab \n", "VM1AB\x0c", "|vmlab|"):
