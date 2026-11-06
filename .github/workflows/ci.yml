@@ -10,8 +10,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The fast gate: every fmt and clippy step of the host and hypervisor
+  # workspaces, so a fmt or lint failure ends the run before the long test
+  # jobs (`check`, `hv-check`) start. Those two jobs `need` this one and the
+  # other fast jobs (`guest-crates`, `ebpf-verify`), which run beside it.
+  fmt-lint:
+    name: fmt + lint (host + hypervisor)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0  # rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@uv
+      # The fmt checks need no build: run them first.
+      - run: just ci::fmt-check
+      - run: just ci::hv-fmt-check
+      # hv-lint builds against virglrenderer, the same way hv-check does.
+      - name: Install native dependencies
+        run: just ci::hv-test-native-deps-install
+      - name: Resolve virglrenderer cache identity
+        id: virgl
+        run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: .ci-cache/virglrenderer-*
+          key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fmt-lint
+      - run: just ci::lint
+      - run: just ci::hv-lint
+
+  # The job names of `check` and `hv-check` stay as they were, so required
+  # status checks keep their names. Their fmt and lint steps run in `fmt-lint`.
   check:
     name: fmt + lint + test
+    needs: [fmt-lint, guest-crates, ebpf-verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -36,13 +73,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # One part of the merge bar per step; `just ci::check` runs the same set
       # in one go.
-      - run: just ci::fmt-check
-      - run: just ci::lint
       - run: just ci::test
       - run: just ci::agent-conformance
 
   hv-check:
     name: hypervisor fmt + lint + test (no guests)
+    needs: [fmt-lint, guest-crates, ebpf-verify]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -65,8 +101,6 @@ jobs:
         with:
           key: hv-check
       - run: just ci::hv-desktop-test
-      - run: just ci::hv-fmt-check
-      - run: just ci::hv-lint
       - run: just ci::hv-test
 
   # The guest-side crates (cinit, agent, and their proto contracts) are
