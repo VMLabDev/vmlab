@@ -279,6 +279,11 @@ jobs:
         with:
           name: vdisplay-unsigned
           path: target/vdisplay-package
+      # build.ps1 verifies every archive against its pin, so a warm cache means no fetch at release time.
+      - uses: actions/cache@v6
+        with:
+          path: C:\vdisplay-tools\downloads
+          key: vdisplay-tools-${{ runner.os }}-${{ hashFiles('guest/vdisplay-windows/dependencies.json', 'guest/vdisplay-windows/build-vm/toolchain/toolchain.json') }}
       - name: Sign with pinned SDK and WDK tools
         shell: powershell
         run: ./guest/vdisplay-windows/build.ps1 -Mode sign-only -Package "$PWD/target/vdisplay-package"

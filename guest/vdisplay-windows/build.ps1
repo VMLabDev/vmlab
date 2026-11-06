@@ -12,26 +12,55 @@ $dependencies = Get-Content (Join-Path $PSScriptRoot 'dependencies.json') -Raw |
 $packages = @{}
 New-Item -ItemType Directory -Force -Path "$ToolsRoot\downloads", "$ToolsRoot\packages", $Package | Out-Null
 
+function Get-Sha256([string]$Path) {
+    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# Size and first bytes of a download, so a mismatch shows whether an error or interstitial page arrived.
+function Get-DownloadSummary([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $buffer = New-Object byte[] 64
+        $count = $stream.Read($buffer, 0, $buffer.Length)
+        $length = $stream.Length
+    } finally { $stream.Dispose() }
+    $head = New-Object byte[] $count
+    [Array]::Copy($buffer, $head, $count)
+    $text = [Text.Encoding]::ASCII.GetString($head) -replace '[^\x20-\x7E]', '.'
+    "$length bytes, first $count bytes: $([BitConverter]::ToString($head)) ($text)"
+}
+
+$attempts = 5
 foreach ($entry in @($dependencies.PSObject.Properties) + @($toolchain.packages.PSObject.Properties)) {
     $name = $entry.Name
+    $url = $entry.Value.url
+    $expected = $entry.Value.sha256
     $archive = Join-Path "$ToolsRoot\downloads" "$name.zip"
-    if (-not (Test-Path $archive)) {
+    # The downloads directory is restored from the CI cache, so a stale or damaged archive is fetched again.
+    if ((Test-Path -LiteralPath $archive) -and ((Get-Sha256 $archive) -ne $expected)) {
+        Write-Output "Discarding $archive`: SHA256 does not match the pin ($(Get-DownloadSummary $archive))"
+        Remove-Item -LiteralPath $archive
+    }
+    if (-not (Test-Path -LiteralPath $archive)) {
         Write-Output "Fetching $name"
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
+        for ($attempt = 1; $attempt -le $attempts; $attempt++) {
             $partial = $archive + '.partial-' + [Guid]::NewGuid().ToString('N')
             try {
-                Invoke-WebRequest -UseBasicParsing -Uri $entry.Value.url -OutFile $partial
+                Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $partial
+                # A server can answer 200 with an error page, so verify before the archive takes its final name.
+                $actual = Get-Sha256 $partial
+                if ($actual -ne $expected) {
+                    throw "SHA256 mismatch for $name from $url`: got $actual, expected $expected; $(Get-DownloadSummary $partial)"
+                }
                 Move-Item -LiteralPath $partial -Destination $archive
                 break
             } catch {
-                if (Test-Path $partial) { Remove-Item -LiteralPath $partial }
-                if ($attempt -eq 3) { throw }
-                Start-Sleep -Seconds (2 * $attempt)
+                Write-Output "Fetching $name failed (attempt $attempt of $attempts): $($_.Exception.Message)"
+                if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial }
+                if ($attempt -eq $attempts) { throw }
+                Start-Sleep -Seconds (5 * $attempt)
             }
         }
-    }
-    if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value.sha256) {
-        throw "SHA256 mismatch: $archive"
     }
     $destination = Join-Path "$ToolsRoot\packages" $name
     # Re-expand verified inputs so a previous interrupted build cannot leave damaged headers or libraries.
