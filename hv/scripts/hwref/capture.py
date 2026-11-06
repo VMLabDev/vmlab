@@ -160,10 +160,12 @@ mkdir -p pci-roms
 for dev in /sys/bus/pci/devices/*; do
   [ "$(cat "$dev/vendor")" = 0x1af4 ] || continue
   [ "$(cat "$dev/device")" = 0x1000 ] || continue
+  # Name by BDF with ':' as '-': Windows cannot check out ':' in a path.
+  rom="pci-roms/$(echo "${dev##*/}" | tr : -)"
   if echo 1 >"$dev/rom" 2>/dev/null; then
-    cat "$dev/rom" >"pci-roms/${dev##*/}.rom" 2>"pci-roms/${dev##*/}.log"
+    cat "$dev/rom" >"$rom.rom" 2>"$rom.log"
     echo 0 >"$dev/rom"
-    [ -s "pci-roms/${dev##*/}.rom" ] || rm -f "pci-roms/${dev##*/}.rom"
+    [ -s "$rom.rom" ] || rm -f "$rom.rom"
   fi
 done
 
