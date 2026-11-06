@@ -34,6 +34,16 @@ def redact_osk(text: str) -> str:
     return re.sub(r"osk=[^\r\n\x00]*", "osk=[REDACTED]", text)
 
 
+# C0 control characters that XML 1.0 forbids (all but tab, newline and
+# carriage return). Command output can carry them: the ESC of an ANSI colour
+# code, a NUL from a guest console.
+_XML_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_safe(text: str) -> str:
+    return _XML_FORBIDDEN.sub("?", text)
+
+
 def junit_xml(rows: list[dict], name: str = "e2e") -> str:
     """The rows of `results.json` as JUnit XML, one test case per feature:
     a fail or missing feature is a failure, a skipped one is skipped."""
@@ -45,10 +55,11 @@ def junit_xml(rows: list[dict], name: str = "e2e") -> str:
     suite = ET.SubElement(root, "testsuite", attrs)
     for r in rows:
         case = ET.SubElement(suite, "testcase", {"classname": f"e2e.{r['hypervisor']}", "name": r["feature"]})
+        detail = _xml_safe(r["detail"])
         if r["status"] in ("fail", "missing"):
-            ET.SubElement(case, "failure", {"type": r["status"], "message": r["detail"]}).text = r["detail"]
+            ET.SubElement(case, "failure", {"type": r["status"], "message": detail}).text = detail
         elif r["status"] == "skip":
-            ET.SubElement(case, "skipped", {"message": r["detail"]})
+            ET.SubElement(case, "skipped", {"message": detail})
     ET.indent(root)
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
 

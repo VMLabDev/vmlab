@@ -34,6 +34,14 @@ class JunitTests(unittest.TestCase):
         self.assertEqual(cases["d"].find("skipped").get("message"), "vmlab-hv phase 3")
         self.assertEqual(cases["a"].get("classname"), "e2e.qemu")
 
+    def test_control_characters_in_a_detail_keep_the_xml_valid(self):
+        rows = [row("a", "fail", "\x1b[31mred\x1b[0m\x00 end\tok"), row("b", "skip", "nul\x00")]
+        cases = {c.get("name"): c for c in ET.fromstring(harness.junit_xml(rows)).find("testsuite")}
+        failure = cases["a"].find("failure")
+        self.assertEqual(failure.get("message"), "?[31mred?[0m? end\tok")
+        self.assertEqual(failure.text, "?[31mred?[0m? end\tok")
+        self.assertEqual(cases["b"].find("skipped").get("message"), "nul?")
+
     def test_report_writes_junit_with_the_counts_of_results_json(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
