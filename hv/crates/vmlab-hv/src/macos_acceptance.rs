@@ -269,52 +269,26 @@ fn password_glyph_detector_matches_the_captured_five_key_exercise() {
     assert_eq!(password_bullets(&output.stdout), 5);
 }
 
-#[test]
-#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
-fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
-    // The live macOS boot is intermittent (OpenCore and early-boot stalls) and is
-    // parked under https://github.com/VMLabDev/vmlab/issues/200, so it runs only on
-    // request until that issue is picked up.
-    if std::env::var_os("VMLAB_HV_MACOS_ACCEPTANCE").is_none() {
-        eprintln!(
-            "skipping macOS P1: opt-in while parked under vmlab#200; set VMLAB_HV_MACOS_ACCEPTANCE=1"
-        );
-        return;
+/// A macOS VM launched as the P1 test boots the template: a fresh overlay
+/// of `template`, its own VARS copy, the test switch, and the description
+/// (with `key` as the Apple SMC key) passed through an anonymous memfd so
+/// the key never becomes an artifact. Returns once control answers.
+struct Launched {
+    process: ManagedChild,
+    client: Client,
+    agent: PathBuf,
+    stderr: PathBuf,
+    _machine: File,
+    _switch: vmlab_hv_tests::switch::MiniSwitch,
+}
+
+impl Launched {
+    fn diagnostics(&self) -> String {
+        std::fs::read_to_string(&self.stderr).unwrap_or_default()
     }
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("skipping macOS P1: /dev/kvm unavailable");
-        return;
-    }
-    let Some(template) = super::acceptance::template("macos-tahoe", "VMLAB_HV_MACOS_DISK") else {
-        eprintln!("skipping macOS P1: macos-tahoe template absent; set VMLAB_HV_MACOS_DISK");
-        return;
-    };
-    let Some(key) = vmlab_hv_tests::host_key::load_host_osk()
-        .expect("loading host key failed; contents suppressed")
-    else {
-        eprintln!(
-            "skipping macOS P1: host.apple_smc_osk absent; alternatively set VMLAB_HV_TEST_APPLE_SMC_OSK"
-        );
-        return;
-    };
-    let firmware = std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join(".local/share/vmlab/guest/firmware/x86_64")
-        });
-    for file in ["OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"] {
-        assert!(firmware.join(file).is_file(), "missing firmware {file}");
-    }
-    let mut directory = tempfile::Builder::new()
-        .prefix("hv-macos-")
-        .tempdir()
-        .unwrap();
-    if std::env::var_os("VMLAB_HV_ACCEPTANCE_KEEP").is_some() {
-        directory.disable_cleanup(true);
-        eprintln!("macOS P1 artifacts: {}", directory.path().display());
-    }
-    let path = directory.path().to_path_buf();
+}
+
+fn launch_macos(path: &Path, template: &Path, firmware: &Path, key: &str) -> Launched {
     let disk = path.join("disk.qcow2");
     vmlab_disk::ops::create_linked_clone(&template, &disk).unwrap();
     let vars = path.join("vars.fd");
@@ -391,7 +365,7 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
     .unwrap();
     let diagnostics = || std::fs::read_to_string(&stderr).unwrap_or_default();
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut client = loop {
+    let client = loop {
         if let Ok(client) = Client::connect(&socket) {
             break client;
         }
@@ -407,6 +381,71 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
+    Launched {
+        process,
+        client,
+        agent,
+        stderr,
+        _machine: machine,
+        _switch,
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
+    // The live macOS boot is intermittent (OpenCore and early-boot stalls) and is
+    // parked under https://github.com/VMLabDev/vmlab/issues/200, so it runs only on
+    // request until that issue is picked up.
+    if std::env::var_os("VMLAB_HV_MACOS_ACCEPTANCE").is_none() {
+        eprintln!(
+            "skipping macOS P1: opt-in while parked under vmlab#200; set VMLAB_HV_MACOS_ACCEPTANCE=1"
+        );
+        return;
+    }
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping macOS P1: /dev/kvm unavailable");
+        return;
+    }
+    let Some(template) = super::acceptance::template("macos-tahoe", "VMLAB_HV_MACOS_DISK") else {
+        eprintln!("skipping macOS P1: macos-tahoe template absent; set VMLAB_HV_MACOS_DISK");
+        return;
+    };
+    let Some(key) = vmlab_hv_tests::host_key::load_host_osk()
+        .expect("loading host key failed; contents suppressed")
+    else {
+        eprintln!(
+            "skipping macOS P1: host.apple_smc_osk absent; alternatively set VMLAB_HV_TEST_APPLE_SMC_OSK"
+        );
+        return;
+    };
+    let firmware = std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".local/share/vmlab/guest/firmware/x86_64")
+        });
+    for file in ["OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"] {
+        assert!(firmware.join(file).is_file(), "missing firmware {file}");
+    }
+    let mut directory = tempfile::Builder::new()
+        .prefix("hv-macos-")
+        .tempdir()
+        .unwrap();
+    if std::env::var_os("VMLAB_HV_ACCEPTANCE_KEEP").is_some() {
+        directory.disable_cleanup(true);
+        eprintln!("macOS P1 artifacts: {}", directory.path().display());
+    }
+    let path = directory.path().to_path_buf();
+    let Launched {
+        mut process,
+        mut client,
+        agent,
+        stderr,
+        _machine,
+        _switch,
+    } = launch_macos(&path, &template, &firmware, &key);
+    let diagnostics = || std::fs::read_to_string(&stderr).unwrap_or_default();
     let host_ignore_before =
         std::fs::read_to_string("/sys/module/kvm/parameters/ignore_msrs").unwrap();
     if std::env::var_os("VMLAB_HV_TEST_REQUIRE_MSR_EXITS").is_some() {
@@ -569,4 +608,149 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
             "macOS P1 independent checks passed; unknown-MSR independence remains unverified until the owner sets ignore_msrs=N"
         );
     }
+}
+
+/// Where a vCPU is: XNU runs in the kernel's high half; anything below it
+/// during boot is OVMF, OpenCore or boot.efi.
+const XNU_BASE: u64 = 0xffff_ff80_0000_0000;
+
+fn debug(
+    client: &mut Client,
+    request: vmlab_hv_proto::debug::DebugRequest,
+) -> vmlab_hv_proto::debug::DebugResponse {
+    match client.call(Control::Debug { request }).unwrap() {
+        Outcome::Debug { response } => response,
+        other => panic!("debug request answered {other:?}"),
+    }
+}
+
+/// Every vCPU's RIP, read with the guest paused for the instant it takes.
+fn sample_rips(client: &mut Client, vcpus: u8) -> Vec<u64> {
+    use vmlab_hv_proto::debug::{DebugRequest, DebugResponse};
+    debug(client, DebugRequest::Pause);
+    let rips = (0..vcpus)
+        .map(
+            |vcpu| match debug(client, DebugRequest::ReadRegisters { vcpu }) {
+                // GENERAL_REGISTERS order: rip is index 16.
+                DebugResponse::Registers { registers, .. } => registers.general[16],
+                other => panic!("read registers answered {other:?}"),
+            },
+        )
+        .collect();
+    debug(client, DebugRequest::Continue);
+    rips
+}
+
+/// vmlab#200 census: how often the macOS boot stalls before XNU.
+///
+/// The stall #200 records first (the agent never answering with both vCPUs
+/// in firmware or OpenCore) comes before macOS reads the Apple SMC, so this
+/// boots with an obviously fake key: no owner secret is involved. Each run
+/// boots a fresh overlay and samples every vCPU's RIP through the debug
+/// protocol until one reaches XNU or `VMLAB_HV_MACOS_STALL_TIMEOUT` (240 s)
+/// passes, and reports the time or the stall with its RIPs and a screenshot.
+/// Opt-in: `VMLAB_HV_MACOS_STALL_RUNS=<n>`. It measures; it asserts no rate.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn macos_boot_stall_census() {
+    let Some(runs) = std::env::var("VMLAB_HV_MACOS_STALL_RUNS").ok().map(|n| {
+        n.parse::<usize>()
+            .expect("VMLAB_HV_MACOS_STALL_RUNS must be a count")
+    }) else {
+        eprintln!("skipping macOS stall census: set VMLAB_HV_MACOS_STALL_RUNS=<n>");
+        return;
+    };
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping macOS stall census: /dev/kvm unavailable");
+        return;
+    }
+    let Some(template) = super::acceptance::template("macos-tahoe", "VMLAB_HV_MACOS_DISK") else {
+        eprintln!("skipping macOS stall census: macos-tahoe template absent");
+        return;
+    };
+    let firmware = PathBuf::from(
+        std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
+            .expect("set VMLAB_HV_FIRMWARE_DIR to vmlab's built OVMF"),
+    );
+    let timeout = Duration::from_secs(
+        std::env::var("VMLAB_HV_MACOS_STALL_TIMEOUT")
+            .ok()
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(240),
+    );
+    let interval = Duration::from_secs(3);
+    let fake_key = "FAKE".repeat(16);
+    let mut stalls = Vec::new();
+    let mut times = Vec::new();
+    for run in 1..=runs {
+        let mut directory = tempfile::Builder::new()
+            .prefix("hv-macos-census-")
+            .tempdir()
+            .unwrap();
+        let path = directory.path().to_path_buf();
+        let mut vm = launch_macos(&path, &template, &firmware, &fake_key);
+        control(&mut vm.client, Control::Resume);
+        let started = Instant::now();
+        let mut last = Vec::new();
+        let mut reached = None;
+        while started.elapsed() < timeout {
+            std::thread::sleep(interval);
+            if vm.process.try_wait().unwrap().is_some() {
+                break;
+            }
+            last = sample_rips(&mut vm.client, 4);
+            if last.iter().any(|rip| *rip >= XNU_BASE) {
+                reached = Some(started.elapsed());
+                break;
+            }
+        }
+        match reached {
+            Some(elapsed) => {
+                eprintln!(
+                    "census run {run}/{runs}: XNU after {:.1} s",
+                    elapsed.as_secs_f64()
+                );
+                times.push(elapsed.as_secs_f64());
+            }
+            None => {
+                // Keep the stall's evidence: no secret is in it.
+                directory.disable_cleanup(true);
+                let kept = directory.path().to_path_buf();
+                super::display_acceptance::diagnostic_screenshot(
+                    &kept.join("display.sock"),
+                    &kept.join("stall.ppm"),
+                );
+                eprintln!(
+                    "census run {run}/{runs}: STALL before XNU after {:.0} s, rips {:x?}, exited {}, artifacts {}",
+                    started.elapsed().as_secs_f64(),
+                    last,
+                    vm.process.try_wait().unwrap().is_some(),
+                    kept.display()
+                );
+                let diagnostics = vm.diagnostics();
+                let tail: String = diagnostics
+                    .chars()
+                    .rev()
+                    .take(2000)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                eprintln!("census run {run} diagnostics tail: {tail}");
+                stalls.push(run);
+            }
+        }
+        if vm.process.try_wait().unwrap().is_none() {
+            let _ = vm.client.call(Control::Quit);
+        }
+        let _ = vm.process.wait();
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "census: {} of {runs} runs stalled before XNU {stalls:?}; time to XNU min {:.1} median {:.1} max {:.1} s",
+        stalls.len(),
+        times.first().copied().unwrap_or(f64::NAN),
+        times.get(times.len() / 2).copied().unwrap_or(f64::NAN),
+        times.last().copied().unwrap_or(f64::NAN)
+    );
 }
