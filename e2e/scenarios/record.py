@@ -8,7 +8,7 @@ import subprocess
 import time
 import zlib
 
-from harness import ScenarioFailed
+from harness import RESULTS, ScenarioFailed
 
 LAB = "e2e-record"
 
@@ -142,7 +142,14 @@ def run(h):
             assert info["duration"] >= 10.0, f"{info}: too short to hold the boot"
             # Firmware initialization time varies. Identify its text rather
             # than accepting any lit frame before a fixed subsecond deadline.
-            at, text = firmware_frame(boot, rec / "boot-early.png")
+            try:
+                at, text = firmware_frame(boot, rec / "boot-early.png")
+            except AssertionError:
+                # Keep the recording outside the container for diagnosis.
+                kept = RESULTS / f"record-up-from-boot-{time.strftime('%Y%m%dT%H%M%S')}.mp4"
+                kept.write_bytes(boot.read_bytes())
+                h.log.write(f"[record] kept the failing boot recording as {kept}\n")
+                raise
             h.log.write(f"[record] firmware frame at {at:.1f}s: {text.strip()[:200]}\n")
             return True
 
