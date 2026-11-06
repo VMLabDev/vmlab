@@ -4,7 +4,7 @@ import pathlib
 import tempfile
 import unittest
 
-from scenarios.legacy import project_vms
+from scenarios.legacy import lab_events, project_vms
 
 
 class ProjectVmCount(unittest.TestCase):
@@ -51,6 +51,22 @@ class ProjectVmCount(unittest.TestCase):
             (root / "102/fd/4").symlink_to("anon_inode:kvm-vm")
             (root / "102/cmdline").write_bytes(b"qemu-system-x86_64\0-avd\0owner\0")
             self.assertEqual(project_vms(root), [100])
+
+
+class LabEvents(unittest.TestCase):
+    def test_keeps_json_events_and_skips_plain_log_lines(self):
+        out = "\n".join([
+            "==> /state/labs/l/vms/freedos/qemu.log <==",
+            "vmlab: argv: qemu-system-x86_64 -machine pc",
+            '{"event": "vm.stopped", "data": {"vm": "freedos", "status": "exit status: 0"}}',
+            "[exit 0]",
+            "",
+            "[1, 2]",
+        ])
+        self.assertEqual(
+            lab_events(out),
+            [{"event": "vm.stopped", "data": {"vm": "freedos", "status": "exit status: 0"}}],
+        )
 
 
 if __name__ == "__main__":

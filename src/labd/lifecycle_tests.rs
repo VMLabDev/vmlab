@@ -336,6 +336,34 @@ fn automatic_hypervisor_selection_follows_a_deferred_templates_hardware() {
     assert!(why.contains("qxl-vga"), "{why}");
 }
 
+/// A legacy pc VM on vmlab-hv gets its e1000 or PCnet on a plain stream:
+/// vmlab-hv's emulated pc NICs take no TAP, and the same VM on QEMU does.
+#[test]
+fn a_pc_nic_on_vmlab_hv_takes_a_stream_not_a_tap() {
+    use crate::config::hypervisor::HypervisorKind;
+    use crate::net::framing::FramingMode;
+    let dirs = Dirs::new();
+    for (hypervisor, kind, tap) in [
+        ("vmlab", HypervisorKind::Vmlab, false),
+        ("qemu", HypervisorKind::Qemu, true),
+    ] {
+        let (mut machine, _) = vm(
+            &dirs,
+            &format!(
+                r#"vm "w7" {{ template = "scratch" arch = "x86_64" profile = "windows-legacy" disk = 10GiB hypervisor = "{hypervisor}" }}"#
+            ),
+            Script::healthy(),
+        );
+        machine.set_host_facts(kvm_host());
+        // Selection reads the declaration only on the automatic path.
+        let machine = machine.with_automatic_hypervisor(Some(Default::default()));
+        assert_eq!(machine.template().resolved.nic_model, "e1000");
+        assert_eq!(machine.hypervisor(), kind);
+        assert_eq!(machine.takes_tap_fds(), tap, "{hypervisor}");
+        assert_eq!(machine.net_framing(), FramingMode::Raw, "{hypervisor}");
+    }
+}
+
 /// A container on a fake hypervisor, image already bound. `decl` is the
 /// `container "…" { … }` block.
 fn container(

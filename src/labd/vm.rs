@@ -2031,8 +2031,12 @@ impl super::machine::Machine for VmInstance {
     /// afxdp tap fast path.
     /// QEMU inherits a descriptor. vmlab-hv receives its queue descriptors
     /// over the control socket while the VM remains paused.
+    /// QEMU takes a TAP for any NIC, and vmlab-hv takes TAP queues for
+    /// virtio-net. vmlab-hv's emulated pc NICs (e1000, PCnet) have one queue
+    /// and attach by stream socket only, so they take no TAP.
     fn takes_tap_fds(&self) -> bool {
-        true
+        self.hypervisor() != HypervisorKind::Vmlab
+            || self.template().resolved.nic_model.starts_with("virtio-net")
     }
 
     fn net_framing(&self) -> crate::net::framing::FramingMode {
