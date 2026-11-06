@@ -1,12 +1,10 @@
 name: CI
 
-# CI runs only on main, release/** and v* tags. Card branches and next are
-# validated locally with `just ci::check` (D12), so a push to them starts no
-# workflow.
+# CI runs only on main and release/**. Card branches and next are validated
+# locally with `just ci::check` (D12), so a push to them starts no workflow.
 on:
   push:
     branches: [main, 'release/**']
-    tags: ['v*']
   pull_request:
     branches: [main]
 
