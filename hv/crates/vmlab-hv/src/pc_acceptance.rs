@@ -787,8 +787,7 @@ fn windows_98_desktop_frame_under_cirrus() {
             .iter()
             .max_by_key(|(_, count)| **count)
             .map(|(pixel, _)| *pixel);
-        if width == 640 && height == 480 && counts.len() >= 8 && dominant == Some([0, 130, 130])
-        {
+        if width == 640 && height == 480 && counts.len() >= 8 && dominant == Some([0, 130, 130]) {
             break (width, height, counts.len());
         }
         assert!(
