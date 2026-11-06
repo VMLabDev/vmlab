@@ -32,8 +32,13 @@ def get(h, lab, machine, container=False) -> str:
     return h.wait_until(read, timeout=120, interval=2, what=f"{machine} to answer exec")
 
 
-def snap(h, lab, *args, **kw):
-    return h.vmlab("snapshot", *args, cwd=lab, timeout=300, **kw)
+def snap(h, lab, *args, timeout=300, **kw):
+    return h.vmlab("snapshot", *args, cwd=lab, timeout=timeout, **kw)
+
+
+# A lab-wide snapshot takes each machine in turn (`snapshot_all`), so its bound
+# is the one-machine bound for each machine, not one bound for the lab.
+LAB_MACHINES = 4
 
 
 def drift(h, lab, machine, container=False) -> int:
@@ -92,10 +97,10 @@ def run(h):
         def lab_wide():
             put(h, lab, "vm01", "lab-before")
             put(h, lab, "c01", "lab-before", container=True)
-            c = snap(h, lab, "create", "lab1")
+            c = snap(h, lab, "create", "lab1", timeout=300 * LAB_MACHINES)
             put(h, lab, "vm01", "lab-after")
             put(h, lab, "c01", "lab-after", container=True)
-            r = snap(h, lab, "restore", "lab1")
+            r = snap(h, lab, "restore", "lab1", timeout=300 * LAB_MACHINES)
             vm = get(h, lab, "vm01")
             ct = get(h, lab, "c01", container=True)
             assert vm == "lab-before" and ct == "lab-before", f"vm01={vm!r} c01={ct!r}"
