@@ -19,7 +19,6 @@ log() {
 }
 
 finish() {
-    [ -n "$plist" ] && [ "$plist" != / ] || { echo "VML-88: plist is empty or /" >&2; exit 1; }
     rm -f "$conf" "$plist" /Library/vmlab/firstboot.sh
     exit "$1"
 }
@@ -51,6 +50,7 @@ fi
 # The per-user setup screens a first login would otherwise walk through, each
 # marked seen, so that login lands on the desktop.
 home="$(dscl . -read "/Users/$user" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')"
+[ -n "$home" ] && [ "$home" != / ] || { log "no home directory for $user"; finish 1; }
 prefs="$home/Library/Preferences/com.apple.SetupAssistant"
 mkdir -p "$home/Library/Preferences"
 for key in DidSeeCloudSetup DidSeePrivacy DidSeeSiriSetup DidSeeTouchIDSetup \
@@ -63,7 +63,6 @@ done
 defaults write "$prefs" LastSeenCloudProductVersion "$(sw_vers -productVersion)"
 defaults write "$prefs" LastSeenBuddyBuildVersion "$(sw_vers -buildVersion)"
 defaults write "$prefs" LastPrivacyBundleVersion -string 2
-[ -n "$home" ] && [ "$home" != / ] || { echo "VML-88: home is empty or /" >&2; exit 1; }
 chown -R "$user:staff" "$home/Library/Preferences"
 
 finish 0

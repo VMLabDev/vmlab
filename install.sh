@@ -286,6 +286,8 @@ install_guest() {
   mkdir -p "$gparent" || { guest_fallback "cannot create $gparent"; return 0; }
   gtmp="$(mktemp -d "$gparent/.vmlab-guest.XXXXXX")" \
     || { guest_fallback "cannot create a staging directory in $gparent"; return 0; }
+  [ -n "$gtmp" ] && [ -d "$gtmp" ] && [ "$gtmp" != / ] \
+    || { guest_fallback "the staging directory in $gparent is missing"; return 0; }
   trap 'rm -rf "$gtmp"' EXIT INT TERM
 
   if ! download_file "$gurl" "$gtmp/$gname" || ! download_file "$gurl.sha256" "$gtmp/$gname.sha256"; then
@@ -313,7 +315,6 @@ install_guest() {
   # survives in the new one), the new one renames into its place, and the old
   # one is removed. Put the old one back if the second rename fails.
   if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
-    [ -n "$gtmp" ] && [ "$gtmp" != / ] || { echo "VML-88: gtmp is empty or /" >&2; exit 1; }
     mv "$GUEST_DIR" "$gtmp/old" || { guest_fallback "cannot move the old $GUEST_DIR aside."; return 0; }
   fi
   if ! mv "$gtmp/new" "$GUEST_DIR"; then
