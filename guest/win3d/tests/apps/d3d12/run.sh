@@ -16,7 +16,7 @@
 # and a console capture, and samples.json.
 # Exit status: 0 when every sample exited 0 by itself after the close,
 # loaded no app-local module and left a console capture; 1 otherwise.
-set -uo pipefail
+set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 HERE=$REPO/tests/apps/d3d12
 SECS=30
@@ -100,6 +100,7 @@ sample() { # sample NAME
     note "  Run-Probe exit $rc"
     # A frame two thirds into the run: past start-up, before the close.
     if [ ${#frames[@]} -gt 0 ]; then
+        [ -n "$EV" ] && [ "$EV" != / ] || { echo "VML-88: EV is empty or /" >&2; exit 1; }
         cp "${frames[$(( ${#frames[@]} * 2 / 3 ))]}" "$EV/console-$name.png"
     fi
     in_lab vmlab cp "$VM:C:/win3d/results/d3d12-samples/$name.run.json" "$EV/$name.run.json" >/dev/null 2>&1

@@ -35,7 +35,7 @@
 # run, so runtime power management never suspends it (keepawake.log).
 #
 # Exit status: 0 when every Done check passes, 1 otherwise, 2 on usage.
-set -uo pipefail
+set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 # WIN3D_E2E: where tests/e2e is (the staging tree has it; this branch does not).
 HERE=${WIN3D_E2E:-$REPO/tests/e2e}
@@ -143,7 +143,10 @@ lab_up() {
         in_lab vmlab destroy || true
     fi
     mkdir -p "$LABDIR"
+    [ -n "$REPO" ] && [ "$REPO" != / ] || { echo "VML-88: REPO is empty or /" >&2; exit 1; }
+    [ -n "$LABDIR" ] && [ "$LABDIR" != / ] || { echo "VML-88: LABDIR is empty or /" >&2; exit 1; }
     cp "$REPO/labs/zeus/$GPU/vmlab.wcl" "$LABDIR/vmlab.wcl"
+    [ -n "$EV" ] && [ "$EV" != / ] || { echo "VML-88: EV is empty or /" >&2; exit 1; }
     cp "$LABDIR/vmlab.wcl" "$EV/lab-vmlab.wcl"
     in_lab vmlab validate || return 1
     in_lab vmlab up || return 1
@@ -168,6 +171,7 @@ prepare_guest() {
     in_lab vmlab cp "$REPO/out/probes/x86" "$VM:C:/win3d/probes/x86" || return 1
     # LunarG's vulkaninfo, without its loader: a cross-check of the installed loader and ICD.
     local zip; zip=$(fetch_pin lunarg-vulkanrt-components) || return 1
+    [ -n "$WORK" ] && [ "$WORK" != / ] || { echo "VML-88: WORK is empty or /" >&2; exit 1; }
     rm -rf "$WORK/raw/lunarg"; mkdir -p "$WORK/raw/lunarg/x64" "$WORK/raw/lunarg/x86"
     for a in x64 x86; do
         bsdtar -xOf "$zip" "VulkanRT-X64-1.4.363.0-Components/$a/vulkaninfo.exe" >"$WORK/raw/lunarg/$a/vulkaninfo.exe"
@@ -339,6 +343,7 @@ collect() {
     local r=$WORK/results
     (cd "$r" && bsdtar -xf "$WORK/results.zip") || return 1
     mkdir -p "$EV/probes" "$EV/vulkaninfo" "$EV/dxdiag"
+    [ -n "$r" ] && [ "$r" != / ] || { echo "VML-88: r is empty or /" >&2; exit 1; }
     cp "$r"/vulkaninfo/*vulkaninfo-*.txt "$EV/vulkaninfo/" 2>/dev/null
     cp "$r"/vulkaninfo/vulkaninfo.run.json "$r"/vulkaninfo/vulkaninfo-crashes.txt "$EV/vulkaninfo/" 2>/dev/null
     cp "$r"/dxdiag/dxdiag.json "$EV/dxdiag/" 2>/dev/null

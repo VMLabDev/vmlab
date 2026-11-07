@@ -9,7 +9,7 @@
 #
 # OUTDIR gets each probe's JSON, the QEMU log lines of this boot, the kernel's
 # NVRM lines and the runtime PM transitions.
-set -uo pipefail
+set -euo pipefail
 GPU=$1 OUT=$2; shift 2
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} PATH=$HOME/.local/bin:$PATH
 LABDIR=${WIN3D_WORK:-$HOME/win3d-zeus/work}/$GPU/lab

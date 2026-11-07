@@ -22,10 +22,12 @@ trap "rm -rf '$work'" EXIT
 tar -xzf "$archive" --strip-components=1 -C "$work"
 patch -d "$work" -p1 <"$SCRIPT_DIR/seabios/splash-during-post.patch"
 for variant in q35 legacy; do
+  [ -n "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != / ] || { echo "VML-88: SCRIPT_DIR is empty or /" >&2; exit 1; }
   cp "$SCRIPT_DIR/seabios/$variant.config" "$work/.config"
   make -C "$work" PYTHON=python3 EXTRAVERSION=-vmlab olddefconfig
   make -C "$work" -j "${VMLAB_FIRMWARE_JOBS:-8}" PYTHON=python3 EXTRAVERSION=-vmlab
   test "$(stat -c %s "$work/out/bios.bin")" = 262144
+  [ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
   install -m 0644 "$work/out/bios.bin" "$OUT/bios-vmlab-$variant.bin"
   install -m 0644 "$work/.config" "$OUT/seabios-$variant.config"
   make -C "$work" clean

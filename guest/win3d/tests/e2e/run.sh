@@ -22,7 +22,7 @@
 #
 # Exit status: 0 when every Done check passes, 1 otherwise, 2 on usage.
 # Lab state lives in .scratch/e2e/<template>[-<gpu>]/lab/.vmlab/.
-set -uo pipefail
+set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 TEMPLATE=windows-11
@@ -156,6 +156,8 @@ lab_up() {
         -e "s#\"x86_64/windows-11@[^\"]*\"#\"x86_64/$TEMPLATE@$VER\"#" \
         -e "s/host_gpu = \"AMD1\"/host_gpu = \"$HOST_GPU\"/" \
         "$REPO/labs/acceptance/vmlab.wcl" >"$LABDIR/vmlab.wcl"
+    [ -n "$EV" ] && [ "$EV" != / ] || { echo "VML-88: EV is empty or /" >&2; exit 1; }
+    [ -n "$LABDIR" ] && [ "$LABDIR" != / ] || { echo "VML-88: LABDIR is empty or /" >&2; exit 1; }
     cp "$LABDIR/vmlab.wcl" "$EV/lab-vmlab.wcl"
     in_lab vmlab validate || return 1
     in_lab vmlab up || return 1
@@ -204,6 +206,7 @@ prepare_guest() {
     in_lab vmlab cp "$REPO/out/probes/x86" "$VM:C:/win3d/probes/x86" || return 1
     # LunarG's vulkaninfo, without its loader: a cross-check of the installed loader and ICD.
     local zip; zip=$(fetch_pin lunarg-vulkanrt-components) || return 1
+    [ -n "$WORK" ] && [ "$WORK" != / ] || { echo "VML-88: WORK is empty or /" >&2; exit 1; }
     rm -rf "$WORK/raw/lunarg"; mkdir -p "$WORK/raw/lunarg/x64" "$WORK/raw/lunarg/x86"
     for a in x64 x86; do
         bsdtar -xOf "$zip" "VulkanRT-X64-1.4.363.0-Components/$a/vulkaninfo.exe" >"$WORK/raw/lunarg/$a/vulkaninfo.exe"
@@ -366,6 +369,7 @@ collect() {
     local r=$WORK/results
     (cd "$r" && bsdtar -xf "$WORK/results.zip") || return 1
     mkdir -p "$EV/probes" "$EV/vulkaninfo" "$EV/dxdiag"
+    [ -n "$r" ] && [ "$r" != / ] || { echo "VML-88: r is empty or /" >&2; exit 1; }
     cp "$r"/vulkaninfo/*vulkaninfo-*.txt "$EV/vulkaninfo/" 2>/dev/null
     cp "$r"/vulkaninfo/vulkaninfo.run.json "$r"/vulkaninfo/vulkaninfo-crashes.txt "$EV/vulkaninfo/" 2>/dev/null
     cp "$r"/dxdiag/dxdiag.json "$EV/dxdiag/" 2>/dev/null

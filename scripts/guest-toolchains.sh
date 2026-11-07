@@ -168,9 +168,11 @@ stage_watcom() {
   curl -fSL --retry 3 -o "$tmp/ow.tar.xz" "$OW_URL" || die "download failed: $OW_URL"
   echo "$OW_SHA256  $tmp/ow.tar.xz" | sha256sum -c --quiet - ||
     die "OpenWatcom snapshot digest mismatch ($OW_URL)"
+  [ -n "$WATCOM" ] && [ "$WATCOM" != / ] || { echo "VML-88: WATCOM is empty or /" >&2; exit 1; }
   rm -rf "$WATCOM"
   mkdir -p "$WATCOM"
   tar -xJf "$tmp/ow.tar.xz" -C "$WATCOM"
+  [ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
   rm -rf "$tmp"
   [[ -x "$WATCOM/binl64/wcc386" ]] || die "watcom: no binl64/wcc386 in the snapshot"
   log "watcom: unpacked into $WATCOM"
@@ -191,6 +193,7 @@ stage_zig() {
     log "zig: fetching $ZIG_VERSION"
     tmp="$(mktemp -d)"
     fetch_pinned "$ZIG_URL" "$tmp/zig.tar.xz" "$ZIG_SHA256"
+    [ -n "$ZIG_DIR" ] && [ "$ZIG_DIR" != / ] || { echo "VML-88: ZIG_DIR is empty or /" >&2; exit 1; }
     rm -rf "$ZIG_DIR"
     mkdir -p "$ZIG_DIR"
     tar -xJf "$tmp/zig.tar.xz" -C "$ZIG_DIR" --strip-components=1
@@ -211,6 +214,7 @@ stage_zig() {
     tmp="$(mktemp -d)"
     fetch_pinned "$RCODESIGN_URL" "$tmp/rcodesign.tar.gz" "$RCODESIGN_SHA256"
     tar -xzf "$tmp/rcodesign.tar.gz" -C "$tmp" --strip-components=1
+    [ -n "$bin" ] && [ "$bin" != / ] || { echo "VML-88: bin is empty or /" >&2; exit 1; }
     install -m 0755 "$tmp/rcodesign" "$bin/rcodesign"
     rm -rf "$tmp"
   fi

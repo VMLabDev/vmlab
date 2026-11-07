@@ -29,7 +29,7 @@
 # goes straight to the applications. --only runs the named runs (see
 # run_all in apps.sh). --lab-only stops after the install and keeps the lab.
 # The lab is destroyed at the end unless --keep or --lab-only.
-set -uo pipefail
+set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 HERE=$REPO/tests/apps/compat
 HOST_GPU=Nvidia2
@@ -130,6 +130,8 @@ lab_up() {
         -e 's|^\( *\)agent_update = false|&\n\1// Evaluation template: without a NIC it shuts down about an hour after boot.\n\1nic { nat = true }|' \
         "$REPO/labs/acceptance/vmlab.wcl" >"$LABDIR/vmlab.wcl"
     grep -q 'nic { nat = true }' "$LABDIR/vmlab.wcl" || { note "could not add the NIC"; return 1; }
+    [ -n "$EV" ] && [ "$EV" != / ] || { echo "VML-88: EV is empty or /" >&2; exit 1; }
+    [ -n "$LABDIR" ] && [ "$LABDIR" != / ] || { echo "VML-88: LABDIR is empty or /" >&2; exit 1; }
     cp "$LABDIR/vmlab.wcl" "$EV/lab-vmlab.wcl"
     in_lab vmlab up || return 1
     wait_agent || return 1
@@ -173,6 +175,7 @@ wer_reports() { # wer_reports DIR: Windows Error Reporting reports written durin
              Where-Object { \$_.LastWriteTime -ge \$s -and \$_.LastWriteTime -le \$e } | ForEach-Object {
                  \$w = Get-Content (Join-Path \$_.FullName Report.wer) -ErrorAction SilentlyContinue
                  if (\$w -contains 'AppPath=$3') { '-- ' + \$_.Name + ' ' + \$_.LastWriteTime.ToString('o'); \$w | Select-String '^(EventType|Sig\\[|AppPath)' | ForEach-Object Line } }" 120 >"$4/wer.txt" 2>&1
+    [ -n "$4" ] && [ "$4" != / ] || { echo "VML-88: 4 is empty or /" >&2; exit 1; }
     [ -s "$4/wer.txt" ] || rm -f "$4/wer.txt"
 }
 
@@ -198,6 +201,7 @@ run_app() { # run_app NAME EXE [ARGS...]; APP_CWD=DIR runs it in DIR (Run-Probe'
     local name=$1 exe=$2 out=${APP_CWD:-C:\\win3d\\results\\compat}; shift 2
     if [ -n "$ONLY" ] && [[ ",$ONLY," != *",$name,"* ]]; then return 0; fi
     local d=$EV/$name n=0 pid rc since t0 closed=
+    [ -n "$d" ] && [ "$d" != / ] || { echo "VML-88: d is empty or /" >&2; exit 1; }
     rm -rf "$d"; mkdir -p "$d"
     find "$WORK/shots" -name "$name-*" -delete
     local arglist=

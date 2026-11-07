@@ -7,7 +7,7 @@
 #
 # Prints one line per phase: the samples, then the counts per state. Build
 # keepawake first (build.sh next to this script).
-set -uo pipefail
+set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 PCI=${1:-0000:01:00.0}
 N=${2:-40}

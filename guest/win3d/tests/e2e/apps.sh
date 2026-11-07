@@ -15,7 +15,7 @@
 # while it runs. Writes <evidence-dir>/apps/: per app the run summary and
 # module list, the last console capture, and apps.json. Whether an app
 # rendered is judged from the captures; see docs/acceptance.md.
-set -uo pipefail
+set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 LABDIR=$(cd "$1" && pwd)
@@ -49,6 +49,7 @@ stage() {
     # dxsdk-2.zip: the first version (dxsdk.zip) had no Developer Runtime.
     if [ ! -f "$STAGE/dxsdk-2.zip" ]; then
         note "unpacking the DirectX SDK's samples, media, redistributable and developer runtime"
+        [ -n "$STAGE" ] && [ "$STAGE" != / ] || { echo "VML-88: STAGE is empty or /" >&2; exit 1; }
         rm -rf "$STAGE/dxsdk"
         7z x -y -o"$STAGE/dxsdk" "$sdk" "DXSDK/Redist/*" "DXSDK/Samples/Media/*" \
             "DXSDK/Samples/C++/Direct3D/*" "DXSDK/Samples/C++/Direct3D11/*" \

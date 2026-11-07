@@ -6,7 +6,7 @@
 #
 #   labs/zeus/envprobe.sh OUT TAG VN_PERF ARCH-API...
 #   e.g. labs/zeus/envprobe.sh ~/win3d-zeus/env nofb no_fence_feedback,no_semaphore_feedback x64-vulkan x64-d3d12
-set -uo pipefail
+set -euo pipefail
 OUT=$1 TAG=$2 PERF=$3; shift 3
 export XDG_RUNTIME_DIR=/run/user/$(id -u) PATH=$HOME/.local/bin:$PATH
 cd ~/win3d-zeus/work/nvidia/lab

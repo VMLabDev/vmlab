@@ -151,6 +151,7 @@ trap 'rm -f "$tmp"' EXIT INT TERM
 download_file "$url" "$tmp" || err "download failed: $url
 The release may not exist or may lack a $suffix asset. See https://github.com/$REPO/releases"
 
+[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
 chmod +x "$tmp"
 mkdir -p "$BIN_DIR"
 # Whether the binary being replaced had the fast path's capabilities: the new
@@ -161,6 +162,8 @@ if have getcap && [ -f "$BIN_DIR/vmlab" ]; then
     *cap_bpf*) HAD_CAPS=1 ;;
   esac
 fi
+[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || { echo "VML-88: BIN_DIR is empty or /" >&2; exit 1; }
+[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
 mv "$tmp" "$BIN_DIR/vmlab"
 trap - EXIT INT TERM
 
@@ -310,6 +313,7 @@ install_guest() {
   # survives in the new one), the new one renames into its place, and the old
   # one is removed. Put the old one back if the second rename fails.
   if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
+    [ -n "$gtmp" ] && [ "$gtmp" != / ] || { echo "VML-88: gtmp is empty or /" >&2; exit 1; }
     mv "$GUEST_DIR" "$gtmp/old" || { guest_fallback "cannot move the old $GUEST_DIR aside."; return 0; }
   fi
   if ! mv "$gtmp/new" "$GUEST_DIR"; then

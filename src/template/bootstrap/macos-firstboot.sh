@@ -8,6 +8,9 @@
 # by install.sh from the Recovery Terminal. Logs to
 # /var/log/vmlab-firstboot.log, never the password.
 
+# check-shell-paths: no-errexit finish must run on every path, or the password file survives a failed defaults or chown.
+set -u
+
 conf=/Library/vmlab/firstboot.conf
 plist=/Library/LaunchDaemons/dev.vmlab.firstboot.plist
 
@@ -16,6 +19,7 @@ log() {
 }
 
 finish() {
+    [ -n "$plist" ] && [ "$plist" != / ] || { echo "VML-88: plist is empty or /" >&2; exit 1; }
     rm -f "$conf" "$plist" /Library/vmlab/firstboot.sh
     exit "$1"
 }
@@ -59,6 +63,7 @@ done
 defaults write "$prefs" LastSeenCloudProductVersion "$(sw_vers -productVersion)"
 defaults write "$prefs" LastSeenBuddyBuildVersion "$(sw_vers -buildVersion)"
 defaults write "$prefs" LastPrivacyBundleVersion -string 2
+[ -n "$home" ] && [ "$home" != / ] || { echo "VML-88: home is empty or /" >&2; exit 1; }
 chown -R "$user:staff" "$home/Library/Preferences"
 
 finish 0

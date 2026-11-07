@@ -16,6 +16,7 @@ repo="$(cd "$here/../.." && pwd)"
 out="$repo/out/d3d12-samples"
 
 if [[ "${1:-}" == "--clean" ]]; then
+  [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
   rm -rf "$out"
 fi
 mkdir -p "$out"

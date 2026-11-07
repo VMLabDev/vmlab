@@ -97,6 +97,7 @@ watcom_build() {
   WATCOM="$WATCOM" PATH="$WATCOM/binl64:$WATCOM/binw:$PATH" \
     "$WATCOM/binl64/wlink" system "$system" option quiet name "$out/$binary" file "$files" \
     || die "wlink failed for $key"
+  [ -n "$work" ] && [ "$work" != / ] || { echo "VML-88: work is empty or /" >&2; exit 1; }
   rm -rf "$work"
   echo "$stamp" >"$out/VERSION"
   log "$key: $(du -h "$out/$binary" | cut -f1) → $out/$binary"
@@ -163,6 +164,7 @@ build_one() {
       probe="$(mktemp -d)"
       if ! printf 'int main(void){return 0;}\n' >"$probe/p.c" ||
         ! cc -m32 -static -o "$probe/p" "$probe/p.c" >/dev/null 2>&1; then
+        [ -n "$probe" ] && [ "$probe" != / ] || { echo "VML-88: probe is empty or /" >&2; exit 1; }
         rm -rf "$probe"
         skip "$key: cc cannot link -m32 -static (install gcc-multilib)"
         return 0

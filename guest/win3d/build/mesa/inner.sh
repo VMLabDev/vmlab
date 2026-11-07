@@ -33,6 +33,7 @@ done < "$pins"
 
 # Fresh source tree: pinned tarball, then the local patch series in order.
 src=$work/src
+[ -n "$src" ] && [ "$src" != / ] || { echo "VML-88: src is empty or /" >&2; exit 1; }
 rm -rf "$src"
 mkdir -p "$src"
 tar -C "$src" --strip-components=1 -xzf "${file[mesa]}"
@@ -54,6 +55,9 @@ ldflags="-static -Wl,--no-insert-timestamp"
 build_arch() {
   local triple=$1 dir=$2 icdarch=$3 bits=$4
   local b=$work/build-$dir p=$work/prefix-$dir
+  [ -n "$b" ] && [ "$b" != / ] || { echo "VML-88: b is empty or /" >&2; exit 1; }
+  [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
+  [ -n "$p" ] && [ "$p" != / ] || { echo "VML-88: p is empty or /" >&2; exit 1; }
   rm -rf "$b" "$p" "$out/$dir"
   meson setup "$b" "$src" --cross-file "/opt/cross/meson-$triple.ini" \
     --buildtype=release --prefix="$p" --wrap-mode=nodownload \
