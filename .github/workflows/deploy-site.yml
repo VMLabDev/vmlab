@@ -38,19 +38,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Cache the built wcl CLI binary, keyed on the pinned rev, to skip the
-      # (slow) cargo install on subsequent deploys.
+      # (slow) cargo install on subsequent deploys. It lives in ~/.wcl, not
+      # ~/.cargo/bin: Swatinem/rust-cache restores ~/.cargo/bin with a key that
+      # ignores WCL_REV, so a wcl of an older rev could sit there.
       - name: Cache wcl CLI
         id: wcl-cache
         uses: actions/cache@v6
         with:
-          path: ~/.cargo/bin/wcl
+          path: ~/.wcl
           key: wcl-${{ env.WCL_REV }}
+
+      - name: Add wcl CLI to PATH
+        run: echo "$HOME/.wcl/bin" >> "$GITHUB_PATH"
 
       - name: Install wcl CLI
         if: steps.wcl-cache.outputs.cache-hit != 'true'
         # The site render only needs `wcl wdoc`; skip the `wcl editor`
         # frontend build so the runner doesn't need pnpm.
-        run: WCL_EDITOR_UI_SKIP=1 cargo install --git https://github.com/wiltaylor/wcl.git --rev ${{ env.WCL_REV }} --locked wcl
+        run: WCL_EDITOR_UI_SKIP=1 cargo install --root "$HOME/.wcl" --git https://github.com/wiltaylor/wcl.git --rev ${{ env.WCL_REV }} --locked wcl
 
       # Runs on a cache hit and a miss: a stale or broken restored binary
       # fails here with a clear message instead of later in the docs build.
