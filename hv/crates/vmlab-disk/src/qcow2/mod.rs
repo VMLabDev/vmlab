@@ -1568,7 +1568,8 @@ mod tests {
         // One L2 table fits. Map a new cluster in the first table, so it is
         // dirty, then load the second one with writes failing: the dirty
         // table is evicted and its write fails.
-        img.l2_cache.cap = 1;
+        // Every table is clean after the flush, so a new cache loses nothing.
+        img.l2_cache = TableCache::new(1);
         let second = 4 * cluster as u64;
         img.write_at(second, &vec![0x33; cluster]).unwrap();
         fail_writes(&mut img);
