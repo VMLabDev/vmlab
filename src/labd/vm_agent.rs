@@ -159,6 +159,10 @@ struct Inner {
     /// reconnect would queue in the listen backlog forever).
     reader: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     writer: Mutex<OwnedWriteHalf>,
+    /// When the reader last got bytes from the agent: how long a connection
+    /// that misses a ping had been silent says whether the guest stalled or
+    /// the pong was only late.
+    last_rx: std::sync::Mutex<std::time::Instant>,
     sessions: Mutex<HashMap<u32, SessionEntry>>,
     /// Waiters for `opened`/error replies to an `open_*` message, keyed by
     /// channel id (std mutex: never held across await).
@@ -266,6 +270,7 @@ impl AgentHandle {
             rt: tokio::runtime::Handle::current(),
             reader: std::sync::Mutex::new(None),
             writer: Mutex::new(write_half),
+            last_rx: std::sync::Mutex::new(std::time::Instant::now()),
             sessions: Mutex::new(HashMap::new()),
             open_waiters: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
@@ -369,6 +374,11 @@ impl AgentHandle {
             entry.credit.close();
         }
         self.inner.open_waiters.lock_recover().clear();
+    }
+
+    /// How long since the agent last sent anything on this connection.
+    pub fn silent_for(&self) -> Duration {
+        self.inner.last_rx.lock_recover().elapsed()
     }
 
     /// How many sessions are open on this connection right now — every exec,
@@ -2164,6 +2174,7 @@ async fn reader_task(weak: Weak<Inner>, mut read_half: tokio::net::unix::OwnedRe
             Ok(n) => n,
         };
         let Some(inner) = weak.upgrade() else { break };
+        *inner.last_rx.lock_recover() = std::time::Instant::now();
         decoder.push(&buf[..n]);
         while let Some(frame) = decoder.next_frame() {
             match frame.kind {

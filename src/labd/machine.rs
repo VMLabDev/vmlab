@@ -1198,6 +1198,8 @@ impl AgentSlot {
             tracing::warn!(
                 machine = name,
                 waited_ms = asked.elapsed().as_millis() as u64,
+                silent_ms = handle.silent_for().as_millis() as u64,
+                sessions = handle.open_sessions().await,
                 "agent: the cached connection missed a ping; reconnecting"
             );
             if let Some(dead) = agent.take() {
@@ -1255,6 +1257,8 @@ impl AgentSlot {
             tracing::warn!(
                 sock = %sock.display(),
                 waited_ms = asked.elapsed().as_millis() as u64,
+                silent_ms = handle.silent_for().as_millis() as u64,
+                sessions = handle.open_sessions().await,
                 "agent: the cached connection missed a probe ping; reconnecting"
             );
             if let Some(dead) = agent.take() {
