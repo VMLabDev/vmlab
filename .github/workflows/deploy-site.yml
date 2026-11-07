@@ -52,6 +52,11 @@ jobs:
         # frontend build so the runner doesn't need pnpm.
         run: WCL_EDITOR_UI_SKIP=1 cargo install --git https://github.com/wiltaylor/wcl.git --rev ${{ env.WCL_REV }} --locked wcl
 
+      # Runs on a cache hit and a miss: a stale or broken restored binary
+      # fails here with a clear message instead of later in the docs build.
+      - name: Check wcl CLI
+        run: wcl --version
+
       - uses: taiki-e/install-action@just
 
       - name: Build docs site
