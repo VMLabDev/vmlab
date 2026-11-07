@@ -31,13 +31,20 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: path-check lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+check: path-check shell-paths lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
 
 # Refuse tracked paths that Windows cannot check out (: * ? " < > | \, trailing dot or space)
 [group('ci')]
 path-check:
 	python3 -m unittest discover -s scripts -p 'test_check_paths.py'
 	python3 scripts/check_paths.py
+
+# Refuse shell scripts and just recipes that copy, move or remove a variable path
+# that is not guarded, or that run without errexit (VML-88; the check's own tests come first)
+[group('ci')]
+shell-paths:
+	python3 -m unittest discover -s scripts -p 'test_check_shell_paths.py'
+	python3 scripts/check_shell_paths.py
 
 # Run clippy with warnings as errors
 [group('ci')]

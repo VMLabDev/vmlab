@@ -33,6 +33,8 @@ jobs:
       - uses: taiki-e/install-action@uv
       # Paths Windows cannot check out (VML-60): no build needed.
       - run: just ci::path-check
+      # VML-88: unguarded variable paths in shell scripts and just recipes (no build needed).
+      - run: just ci::shell-paths
       # The fmt checks need no build: run them first.
       - run: just ci::fmt-check
       - run: just ci::hv-fmt-check

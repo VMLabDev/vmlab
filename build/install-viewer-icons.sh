@@ -12,6 +12,8 @@ for size in 16 24 32 48 64 128 256; do
   test -f "$root/share/icons/hicolor/${size}x${size}/apps/$app.png"
 done
 
+[ -n "$data" ] && [ "$data" != / ] || { echo "VML-88: data is empty or /" >&2; exit 1; }
+[ -n "$root" ] && [ "$root" != / ] || { echo "VML-88: root is empty or /" >&2; exit 1; }
 install -Dm644 "$root/share/applications/$app.desktop" "$data/applications/$app.desktop"
 install -Dm644 "$root/share/icons/hicolor/scalable/apps/$app.svg" \
   "$data/icons/hicolor/scalable/apps/$app.svg"

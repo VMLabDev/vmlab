@@ -129,6 +129,8 @@ fetch_arch() {
       dest="${line%%|*}"
       src="${line#*|}"
       [[ -f "$work/$src" ]] || die "$pkg $ver has no $src"
+      [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
+      [ -n "$work" ] && [ "$work" != / ] || { echo "VML-88: work is empty or /" >&2; exit 1; }
       cp --sparse=always --dereference "$work/$src" "$out/$dest"
       chmod 0644 "$out/$dest"
     done < <(files_for "$arch")

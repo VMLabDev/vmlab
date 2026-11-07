@@ -6,6 +6,7 @@ set -euo pipefail
 unpack() { # unpack ARCHIVE KIND -> prints dir; cached by archive name
     local a=$1 kind=$2 d=/unpacked/$(basename "$1")
     if [ ! -f "$d/.done" ]; then
+        [ -n "$d" ] && [ "$d" != / ] || { echo "VML-88: d is empty or /" >&2; exit 1; }
         rm -rf "$d"; mkdir -p "$d"
         case $kind in
             tar) tar -xJf "$a" -C "$d" --strip-components=1 ;;
@@ -23,9 +24,11 @@ SDK=$(unpack "$SDK_PKG" zip)
 
 # A fixed work path keeps object and PDB paths identical between builds.
 W=/tmp/kmd-work
+[ -n "$W" ] && [ "$W" != / ] || { echo "VML-88: W is empty or /" >&2; exit 1; }
 rm -rf "$W"
 export SRC=$W/src OBJ=$W/obj
 mkdir -p "$SRC"
+[ -n "$SRC" ] && [ "$SRC" != / ] || { echo "VML-88: SRC is empty or /" >&2; exit 1; }
 cp -a /src/VirtIO /src/viogpu /src/build "$SRC/"
 chmod -R u+w "$SRC"
 for p in /patches/*.patch; do

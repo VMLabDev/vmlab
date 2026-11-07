@@ -28,6 +28,7 @@ while read -r kind name tag commit sha url; do
   fi
   srcdir[$name]="$work/src/$name"
   srctag[$name]="$tag"
+  [ -n "${srcdir[$name]}" ] && [ "${srcdir[$name]}" != / ] || { echo "VML-88: srcdir[$name] is empty or /" >&2; exit 1; }
   rm -rf "${srcdir[$name]}"
   mkdir -p "${srcdir[$name]}"
   tar -C "${srcdir[$name]}" --strip-components=1 -xzf "$file"
@@ -42,6 +43,8 @@ done
 # Vulkan-Headers: header-only, installed once and shared by both arches.
 # Its project() still probes a compiler, so give it the x86_64 cross one.
 hdr=$work/headers
+[ -n "$hdr" ] && [ "$hdr" != / ] || { echo "VML-88: hdr is empty or /" >&2; exit 1; }
+[ -n "$work" ] && [ "$work" != / ] || { echo "VML-88: work is empty or /" >&2; exit 1; }
 rm -rf "$work/build-headers" "$hdr"
 cmake -S "${srcdir[Vulkan-Headers]}" -B "$work/build-headers" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=/opt/cross/cmake-x86_64.cmake \
@@ -72,6 +75,9 @@ build_arch() {
   local triple=$1 dir=$2
   local tc=/opt/cross/cmake-$triple.cmake
   local bl=$work/build-$dir-loader bt=$work/build-$dir-tools
+  [ -n "$bl" ] && [ "$bl" != / ] || { echo "VML-88: bl is empty or /" >&2; exit 1; }
+  [ -n "$bt" ] && [ "$bt" != / ] || { echo "VML-88: bt is empty or /" >&2; exit 1; }
+  [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
   rm -rf "$bl" "$bt" "$out/$dir"
   local common=(
     -G Ninja

@@ -51,6 +51,7 @@ for A in $(find "$BUILD" -name '*.a'); do
     (cd "$D" && ar x "$A")
     for O in "$D"/*.o; do
         [ -e "$O" ] || continue
+        [ -n "$OBJDIR" ] && [ "$OBJDIR" != / ] || { echo "VML-88: OBJDIR is empty or /" >&2; exit 1; }
         mv "$O" "$OBJDIR/${NAME}_$(basename "$O")"
     done
 done
@@ -58,7 +59,9 @@ done
 ar rcs "$OUT/liboracle.a" "$OBJDIR"/*.o
 ranlib "$OUT/liboracle.a"
 
+[ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
 cp /opt/oracle/oracle.h "$OUT/oracle.h"
+[ -n "$CFG" ] && [ "$CFG" != / ] || { echo "VML-88: CFG is empty or /" >&2; exit 1; }
 cp "$CFG" "$OUT/riscv64-config.json"
 
 {

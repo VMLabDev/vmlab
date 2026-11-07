@@ -205,6 +205,8 @@ build_one() {
 
   local out="$DIST_DIR/$key"
   mkdir -p "$out"
+  [ -n "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != / ] || { echo "VML-88: SCRIPT_DIR is empty or /" >&2; exit 1; }
+  [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
   install -m 0755 "$SCRIPT_DIR/agent/target/$target/release/$binary" "$out/$binary"
   if [[ "$target" == *-apple-darwin ]]; then
     sign_apple "$key" "$out/$binary"

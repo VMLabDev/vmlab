@@ -97,6 +97,7 @@ main() {
   version="${version#v}"
   export VMLAB_REQUIRE_ALL_TARGETS="${VMLAB_REQUIRE_ALL_TARGETS:-1}"
 
+  [ -n "$DIST_DIR" ] && [ "$DIST_DIR" != / ] || { echo "VML-88: DIST_DIR is empty or /" >&2; exit 1; }
   rm -rf "$DIST_DIR"
   "$SCRIPT_DIR/build-asset.sh" x86_64 aarch64
   "$SCRIPT_DIR/build-agent.sh"
