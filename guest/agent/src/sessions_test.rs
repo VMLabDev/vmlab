@@ -109,7 +109,11 @@ fn terminal_close_kills_the_shell() {
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
-    let (out, _) = cap.data_until(3, b"END_PID");
+    // Wait for the whole line, with the "\r\n" that the pty's ONLCR makes of
+    // the "\n". The pty can hand the line end over in a later read, and the
+    // frame of that read could still reach the port after the close below.
+    // The shell writes nothing more after this line.
+    let (out, _) = cap.data_until(3, b"END_PID\r\n");
     let pid = process_id(&out);
     open(&mux, &p, HostMsg::Close { id: 3 });
     assert_process_gone(pid);
@@ -166,7 +170,8 @@ fn exec_close_kills_the_process_and_stays_silent() {
         },
     );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
-    let (out, _) = cap.data_until(3, b"END_PID");
+    // The whole line, so that no read of it is left to arrive after the close.
+    let (out, _) = cap.data_until(3, b"END_PID\n");
     let pid = process_id(&out);
     open(&mux, &p, HostMsg::Close { id: 3 });
     assert_process_gone(pid);
