@@ -1356,7 +1356,13 @@ async fn cached_verdict(handle: &AgentHandle, who: &str, grace: Duration) -> Cac
     let sessions = handle.open_sessions().await;
     let waited_ms = asked.elapsed().as_millis() as u64;
     if verdict == Cached::Slow {
-        tracing::debug!(agent = who, waited_ms, silent_ms, sessions, "agent: not answering yet; kept the connection");
+        tracing::debug!(
+            agent = who,
+            waited_ms,
+            silent_ms,
+            sessions,
+            "agent: not answering yet; kept the connection"
+        );
     } else {
         tracing::warn!(
             agent = who,
@@ -1382,7 +1388,11 @@ mod tests {
         late: usize,
         delay: Duration,
         restarted: Arc<std::sync::atomic::AtomicBool>,
-    ) -> (tempfile::TempDir, PathBuf, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use vmlab_agent_proto::{AgentMsg, FrameDecoder, HostMsg, PROTO_VERSION, encode_ctrl};
@@ -1407,8 +1417,16 @@ mod tests {
                         }
                         dec.push(&buf[..n]);
                         while let Some(f) = dec.next_frame() {
-                            let instance = Some(if restarted.load(Ordering::SeqCst) { "i2" } else { "i1" }.to_string());
-                            let (reply, wait) = match serde_json::from_slice::<HostMsg>(&f.payload) {
+                            let instance = Some(
+                                if restarted.load(Ordering::SeqCst) {
+                                    "i2"
+                                } else {
+                                    "i1"
+                                }
+                                .to_string(),
+                            );
+                            let (reply, wait) = match serde_json::from_slice::<HostMsg>(&f.payload)
+                            {
                                 Ok(HostMsg::Hello { token, .. }) => (
                                     AgentMsg::Hello {
                                         proto_version: PROTO_VERSION,
@@ -1422,14 +1440,21 @@ mod tests {
                                 ),
                                 Ok(HostMsg::Ping) => {
                                     let nth = pings.fetch_add(1, Ordering::SeqCst);
-                                    (AgentMsg::Pong { instance }, if nth < late { delay } else { Duration::ZERO })
+                                    (
+                                        AgentMsg::Pong { instance },
+                                        if nth < late { delay } else { Duration::ZERO },
+                                    )
                                 }
                                 _ => continue,
                             };
                             let wr = Arc::clone(&wr);
                             tokio::spawn(async move {
                                 tokio::time::sleep(wait).await;
-                                let _ = wr.lock().await.write_all(&encode_ctrl(&reply).unwrap()).await;
+                                let _ = wr
+                                    .lock()
+                                    .await
+                                    .write_all(&encode_ctrl(&reply).unwrap())
+                                    .await;
                             });
                         }
                     }
@@ -1446,13 +1471,26 @@ mod tests {
     #[tokio::test]
     async fn a_connect_keeps_a_slow_agents_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let (_dir, sock, accepted) = slow_agent(1, Duration::from_secs(3), Arc::new(AtomicBool::new(false))).await;
+        let (_dir, sock, accepted) =
+            slow_agent(1, Duration::from_secs(3), Arc::new(AtomicBool::new(false))).await;
         let slot = AgentSlot::default();
-        let first = slot.connect("m1", &sock, "hint").await.expect("first connect");
+        let first = slot
+            .connect("m1", &sock, "hint")
+            .await
+            .expect("first connect");
         let started = std::time::Instant::now();
-        slot.connect("m1", &sock, "hint").await.expect("the slow agent answered within the grace");
-        assert!(started.elapsed() >= Duration::from_secs(2), "the first ping was not the late one");
-        assert_eq!(accepted.load(Ordering::SeqCst), 1, "a slow agent's connection was replaced");
+        slot.connect("m1", &sock, "hint")
+            .await
+            .expect("the slow agent answered within the grace");
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the first ping was not the late one"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a slow agent's connection was replaced"
+        );
         assert!(first.is_open(), "a slow agent's connection was shut down");
     }
 
@@ -1461,13 +1499,24 @@ mod tests {
     #[tokio::test]
     async fn a_probe_leaves_a_slow_agents_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let (_dir, sock, accepted) = slow_agent(1, Duration::from_secs(3), Arc::new(AtomicBool::new(false))).await;
+        let (_dir, sock, accepted) =
+            slow_agent(1, Duration::from_secs(3), Arc::new(AtomicBool::new(false))).await;
         let slot = AgentSlot::default();
-        let first = slot.connect("m1", &sock, "hint").await.expect("first connect");
-        assert!(!slot.probe(&sock).await, "the first ping is 3 s late: not answering right now");
+        let first = slot
+            .connect("m1", &sock, "hint")
+            .await
+            .expect("first connect");
+        assert!(
+            !slot.probe(&sock).await,
+            "the first ping is 3 s late: not answering right now"
+        );
         assert!(first.is_open(), "a probe cut a slow agent's connection");
         assert!(slot.probe(&sock).await, "answers promptly again");
-        assert_eq!(accepted.load(Ordering::SeqCst), 1, "a slow agent's connection was replaced");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a slow agent's connection was replaced"
+        );
     }
 
     /// An agent that restarted answers on the same connection as another
@@ -1478,12 +1527,22 @@ mod tests {
         let restarted = Arc::new(AtomicBool::new(false));
         let (_dir, sock, accepted) = slow_agent(0, Duration::ZERO, Arc::clone(&restarted)).await;
         let slot = AgentSlot::default();
-        let first = slot.connect("m1", &sock, "hint").await.expect("first connect");
+        let first = slot
+            .connect("m1", &sock, "hint")
+            .await
+            .expect("first connect");
         restarted.store(true, Ordering::SeqCst);
         let started = std::time::Instant::now();
         let second = slot.connect("m1", &sock, "hint").await.expect("reconnect");
-        assert!(started.elapsed() < Duration::from_secs(2), "waited out a grace for a restarted agent");
-        assert_eq!(accepted.load(Ordering::SeqCst), 2, "the stale connection was kept");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited out a grace for a restarted agent"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "the stale connection was kept"
+        );
         assert!(!first.is_open(), "the stale connection was not shut down");
         assert_eq!(second.info().instance.as_deref(), Some("i2"));
     }

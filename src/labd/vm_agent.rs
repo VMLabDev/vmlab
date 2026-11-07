@@ -3334,7 +3334,9 @@ mod tests {
                 assert!(n > 0, "the host hung up before its hello");
                 dec.push(&buf[..n]);
                 while let Some(f) = dec.next_frame() {
-                    if let Ok(HostMsg::Hello { token, .. }) = serde_json::from_slice::<HostMsg>(&f.payload) {
+                    if let Ok(HostMsg::Hello { token, .. }) =
+                        serde_json::from_slice::<HostMsg>(&f.payload)
+                    {
                         let reply = encode_ctrl(&AgentMsg::Hello {
                             proto_version: PROTO_VERSION,
                             agent_version: "deaf-mock".into(),
