@@ -12,6 +12,16 @@ pub struct MediaState {
     pub locked: bool,
 }
 
+/// A logical block as minute, second and frame (75 frames a second, 150
+/// frames of pre-gap), saturated at the largest value the fields hold.
+fn lba_to_msf(lba: u32) -> [u8; 3] {
+    let frames = u64::from(lba) + 150;
+    if frames >= 256 * 4500 {
+        return [0xff, 59, 74];
+    }
+    [(frames / 4500) as u8, (frames / 75 % 60) as u8, (frames % 75) as u8]
+}
+
 pub(crate) struct Optical {
     pub image: Option<Box<dyn DiskImage>>,
     pub tray_open: bool,
@@ -112,6 +122,36 @@ impl Optical {
     }
 
     pub fn packet(&mut self, cdb: &[u8; 16]) -> Result<Payload, u8> {
+        let result = self.packet_inner(cdb);
+        if log::log_enabled!(target: "vmlab_hv_devices::ata::trace", log::Level::Debug)
+            && (result.is_err() || !matches!(cdb[0], 0x28 | 0xa8))
+        {
+            let size = self.image.as_ref().map_or(0, |image| image.size());
+            match &result {
+                Ok(Payload::Bytes(data)) => log::debug!(
+                    target: "vmlab_hv_devices::ata::trace",
+                    "atapi cdb={:02x?} size={size} -> ok {} bytes {:02x?}",
+                    cdb,
+                    data.len(),
+                    &data[..data.len().min(48)]
+                ),
+                Ok(_) => log::debug!(
+                    target: "vmlab_hv_devices::ata::trace",
+                    "atapi cdb={:02x?} size={size} -> ok",
+                    cdb
+                ),
+                Err(status) => log::debug!(
+                    target: "vmlab_hv_devices::ata::trace",
+                    "atapi cdb={:02x?} size={size} -> err {status:#x} sense={:02x?}",
+                    cdb,
+                    self.sense
+                ),
+            }
+        }
+        result
+    }
+
+    fn packet_inner(&mut self, cdb: &[u8; 16]) -> Result<Payload, u8> {
         if self.attention && !matches!(cdb[0], 0x03 | 0x12 | 0x4a) {
             self.attention = false;
             return self.fail(6, 0x28, 0);
@@ -286,31 +326,85 @@ impl Optical {
             }
             0x43 => {
                 self.ready()?;
-                if cdb[2] & 0xf != 0 || !matches!(cdb[6], 0 | 1 | 0xaa) {
-                    return self.fail(5, 0x24, 0);
-                }
+                // The format sits in byte 2; older initiators put it in the top
+                // bits of byte 9 instead (MMC READ TOC/PMA/ATIP).
+                let format = match cdb[2] & 0xf {
+                    0 => cdb[9] >> 6,
+                    format => format,
+                };
                 let blocks =
                     (self.image.as_ref().unwrap().size() / 2048).min(u32::MAX as u64) as u32;
-                let mut data = vec![0, 0, 1, 1];
-                for (track, lba) in [(1, 0), (0xaa, blocks)] {
-                    if cdb[6] == 0xaa && track == 1 {
-                        continue;
-                    }
-                    data.extend([0, 0x14, track, 0]);
-                    if cdb[1] & 2 != 0 {
-                        let frames = lba + 150;
-                        data.extend([
-                            0,
-                            (frames / 4500) as u8,
-                            (frames / 75 % 60) as u8,
-                            (frames % 75) as u8,
-                        ]);
+                let msf = cdb[1] & 2 != 0;
+                let address = |lba: u32| {
+                    if msf {
+                        let [m, s, f] = lba_to_msf(lba);
+                        [0, m, s, f]
                     } else {
-                        data.extend(lba.to_be_bytes());
+                        lba.to_be_bytes()
                     }
+                };
+                let mut data = vec![0, 0, 1, 1];
+                match format {
+                    // Formatted TOC: track 1 and the lead-out.
+                    0 => {
+                        if !matches!(cdb[6], 0 | 1 | 0xaa) {
+                            return self.fail(5, 0x24, 0);
+                        }
+                        for (track, lba) in [(1, 0), (0xaa, blocks)] {
+                            if cdb[6] == 0xaa && track == 1 {
+                                continue;
+                            }
+                            data.extend([0, 0x14, track, 0]);
+                            data.extend(address(lba));
+                        }
+                    }
+                    // Multi-session information: one complete session whose
+                    // first track starts at LBA 0. Windows asks for this
+                    // before it looks for a UDF volume.
+                    1 => {
+                        data.extend([0, 0x14, 1, 0]);
+                        data.extend(address(0));
+                    }
+                    // Raw TOC of session 1: points A0, A1, A2 and track 1.
+                    2 => {
+                        if cdb[6] > 1 {
+                            return self.fail(5, 0x24, 0);
+                        }
+                        let lead_out = lba_to_msf(blocks);
+                        let track = lba_to_msf(0);
+                        for (point, pmsf) in [
+                            (0xa0, [1, 0, 0]),
+                            (0xa1, [1, 0, 0]),
+                            (0xa2, lead_out),
+                            (1, track),
+                        ] {
+                            data.extend([1, 0x14, 0, point, 0, 0, 0, 0]);
+                            data.extend(pmsf);
+                        }
+                    }
+                    _ => return self.fail(5, 0x24, 0),
                 }
                 let len = (data.len() - 2) as u16;
                 data[..2].copy_from_slice(&len.to_be_bytes());
+                data.truncate(u16::from_be_bytes([cdb[7], cdb[8]]) as usize);
+                data
+            }
+            0x51 => {
+                self.ready()?;
+                // Standard disc information only: a finalized, single-session,
+                // single-track read-only disc.
+                if cdb[1] & 7 != 0 {
+                    return self.fail(5, 0x24, 0);
+                }
+                let mut data = vec![0; 34];
+                data[1] = 32;
+                data[2] = 0x0e; // Last session complete, disc complete.
+                data[3] = 1; // First track on the disc.
+                data[4] = 1; // Sessions.
+                data[5] = 1; // First track in the last session.
+                data[6] = 1; // Last track in the last session.
+                data[7] = 0x20; // Unrestricted use.
+                data[16..24].fill(0xff); // No next lead-in, no last lead-out.
                 data.truncate(u16::from_be_bytes([cdb[7], cdb[8]]) as usize);
                 data
             }

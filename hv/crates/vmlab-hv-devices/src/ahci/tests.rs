@@ -834,6 +834,64 @@ fn atapi_range_zero_count_readonly_and_toc() {
     assert_eq!(u32::from_be_bytes(toc[16..20].try_into().unwrap()), 64);
 }
 
+/// The CD-ROM probe Windows Setup (WinPE 26100) sends before it mounts a
+/// disc, in order, with its exact CDBs. READ TOC session information and READ
+/// DISC INFORMATION must succeed: when they fail, Windows does not mount the
+/// UDF file system of the install DVD, sees only its ISO 9660 stub and Setup
+/// finds no install image ("a media driver your computer needs is missing").
+#[test]
+fn winpe_disc_probe_sequence_reports_one_complete_session() {
+    let mut d = Driver::cdrom();
+    let ok = |d: &mut Driver, cdb: &[u8]| {
+        let (status, data) = d.packet(cdb);
+        assert_eq!(status, 0x50, "CDB {cdb:02x?}");
+        data
+    };
+    ok(&mut d, &[0]);
+    ok(&mut d, &[0x25]);
+    let config = ok(&mut d, &[0x46, 0, 0, 0, 0, 0, 0, 0, 8]);
+    assert_eq!(&config[6..8], &[0, 8]);
+    ok(&mut d, &[0x5a, 8, 0x2a, 0, 0, 0, 0, 0, 0x28]);
+
+    // READ TOC, format 1 (multi-session information), allocation 12.
+    let session = ok(&mut d, &[0x43, 0, 1, 0, 0, 0, 0, 0, 0x0c]);
+    assert_eq!(session, [0, 10, 1, 1, 0, 0x14, 1, 0, 0, 0, 0, 0]);
+    // The same in MSF form: track 1 starts at 00:02:00.
+    let session = ok(&mut d, &[0x43, 2, 1, 0, 0, 0, 0, 0, 0x0c]);
+    assert_eq!(&session[8..12], &[0, 0, 2, 0]);
+
+    // READ DISC INFORMATION, standard disc information, allocation 256.
+    let disc = ok(&mut d, &[0x51, 0, 0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(disc.len(), 34);
+    assert_eq!(&disc[..8], &[0, 32, 0x0e, 1, 1, 1, 1, 0x20]);
+    assert_eq!(&disc[16..24], &[0xff; 8]);
+    assert_eq!(d.packet(&[0x51, 1, 0, 0, 0, 0, 0, 1, 0]).0, 0x5451);
+    let (_, sense) = d.packet(&[3, 0, 0, 0, 18]);
+    assert_eq!(&sense[12..14], &[0x24, 0]);
+
+    // READ TOC, format 0, allocation 0x554: unchanged, track 1 and lead-out.
+    let toc = ok(&mut d, &[0x43, 0, 0, 0, 0, 0, 0, 5, 0x54]);
+    assert_eq!(&toc[..4], &[0, 18, 1, 1]);
+    assert_eq!(u32::from_be_bytes(toc[16..20].try_into().unwrap()), 64);
+
+    // READ TOC, format 2 (raw TOC): A0, A1, A2 and track 1 of session 1.
+    let raw = ok(&mut d, &[0x43, 2, 2, 0, 0, 0, 1, 0, 0x40]);
+    assert_eq!(&raw[..4], &[0, 46, 1, 1]);
+    let points: Vec<_> = raw[4..].chunks(11).map(|e| (e[0], e[1], e[3])).collect();
+    assert_eq!(
+        points,
+        [(1, 0x14, 0xa0), (1, 0x14, 0xa1), (1, 0x14, 0xa2), (1, 0x14, 1)]
+    );
+    // Lead-out at LBA 64: 64 + 150 frames = 00:02:64.
+    assert_eq!(&raw[4 + 2 * 11 + 8..4 + 2 * 11 + 11], &[0, 2, 64]);
+    assert_eq!(d.packet(&[0x43, 2, 2, 0, 0, 0, 2, 0, 0x40]).0, 0x5451);
+    // Formats 3 and up (PMA, ATIP, CD-TEXT) stay unsupported.
+    assert_eq!(d.packet(&[0x43, 0, 3, 0, 0, 0, 0, 0, 0x40]).0, 0x5451);
+    // The format in the old position, the top bits of byte 9.
+    let session = ok(&mut d, &[0x43, 0, 0, 0, 0, 0, 0, 0, 0x0c, 0x40]);
+    assert_eq!(&session[..4], &[0, 10, 1, 1]);
+}
+
 struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new() -> Self {
