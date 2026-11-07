@@ -542,7 +542,7 @@ fn boots_to_idle_exec_and_scratch_roundtrip() {
 }
 
 /// VML-107: virtio-blk writes the guest never flushed survive a SIGTERM stop.
-/// The guest writes the last MiB of the 2 GiB scratch disk (its ext4 does not
+/// The guest writes the last 256 KiB of the 2 GiB scratch disk (its ext4 does not
 /// use it yet) with O_DIRECT and no fsync, so the device gets the writes and
 /// no FLUSH. After SIGTERM, `qemu-img check` must be clean and the bytes must
 /// be mapped.
@@ -550,7 +550,8 @@ fn boots_to_idle_exec_and_scratch_roundtrip() {
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn sigterm_keeps_unflushed_virtio_blk_writes() {
     const SCRATCH_SIZE: u64 = 2 << 30;
-    const LEN: usize = 1 << 20;
+    // Exec stdin must fit the agent's initial credit window (256 KiB).
+    const LEN: usize = 256 << 10;
     const LINE: &[u8] = b"VML107-sigterm-keeps-this\n";
     let Some(assets) = check() else { return };
     let spec = MachineSpec::idle("s1-sigterm-disk");
@@ -561,13 +562,17 @@ fn sigterm_keeps_unflushed_virtio_blk_writes() {
 
     let block = 65536u64;
     let seek = (SCRATCH_SIZE - LEN as u64) / block;
+    let pattern: Vec<u8> = LINE.iter().copied().cycle().take(LEN).collect();
     let script = format!(
-        "set -e; B={BUSYBOX}; $B yes {} | $B head -c {LEN} | \
-         $B dd of=/dev/vdb bs={block} seek={seek} iflag=fullblock oflag=direct",
-        std::str::from_utf8(&LINE[..LINE.len() - 1]).unwrap()
+        "{BUSYBOX} dd of=/dev/vdb bs={block} count={} seek={seek} iflag=fullblock oflag=direct",
+        LEN as u64 / block
     );
     let write = agent
-        .exec(&[BUSYBOX, "sh", "-c", &script], Duration::from_secs(30))
+        .exec_with_stdin(
+            &[BUSYBOX, "sh", "-c", &script],
+            &pattern,
+            Duration::from_secs(30),
+        )
         .expect("guest dd");
     assert_eq!(
         write.exit_code,
@@ -611,9 +616,8 @@ fn sigterm_keeps_unflushed_virtio_blk_writes() {
         SCRATCH_SIZE - LEN as u64,
     )
     .unwrap();
-    let expected: Vec<u8> = LINE.iter().copied().cycle().take(LEN).collect();
     assert!(
-        actual == expected,
+        actual == pattern,
         "the guest's unflushed write is not in the image after SIGTERM \
          (first bytes {:02x?})\n{report}",
         &actual[..16]
