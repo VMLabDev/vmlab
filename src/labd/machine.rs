@@ -1191,9 +1191,15 @@ impl AgentSlot {
     ) -> Result<AgentHandle> {
         let mut agent = self.handle.lock().await;
         if let Some(handle) = agent.as_ref() {
+            let asked = std::time::Instant::now();
             if handle.ping(Duration::from_secs(2)).await {
                 return Ok(handle.clone());
             }
+            tracing::warn!(
+                machine = name,
+                waited_ms = asked.elapsed().as_millis() as u64,
+                "agent: the cached connection missed a ping; reconnecting"
+            );
             if let Some(dead) = agent.take() {
                 dead.shutdown().await;
             }
@@ -1219,6 +1225,7 @@ impl AgentSlot {
                 Ok(handle)
             }
             Err(e) => {
+                tracing::warn!(machine = name, "agent: handshake failed: {e:#}");
                 *self.failed_at.lock().await = Some(std::time::Instant::now());
                 Err(AgentUnavailable::Handshake {
                     machine: name.to_string(),
@@ -1241,9 +1248,15 @@ impl AgentSlot {
         }
         let mut agent = self.handle.lock().await;
         if let Some(handle) = agent.as_ref() {
+            let asked = std::time::Instant::now();
             if handle.ping(Duration::from_secs(2)).await {
                 return true;
             }
+            tracing::warn!(
+                sock = %sock.display(),
+                waited_ms = asked.elapsed().as_millis() as u64,
+                "agent: the cached connection missed a probe ping; reconnecting"
+            );
             if let Some(dead) = agent.take() {
                 dead.shutdown().await;
             }
@@ -1256,7 +1269,10 @@ impl AgentSlot {
                 self.handshook(&handle).await;
                 true
             }
-            Err(_) => false,
+            Err(e) => {
+                tracing::debug!(sock = %sock.display(), "agent: probe handshake failed: {e:#}");
+                false
+            }
         }
     }
 
