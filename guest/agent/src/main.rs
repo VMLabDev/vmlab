@@ -10,6 +10,7 @@
 //! installed by the template build) or in the foreground for debugging.
 
 mod app;
+mod diag;
 mod clipboard;
 // What a macOS guest's own answers mean: portable like `rdp`, so the build
 // host's tests reach it.
@@ -193,13 +194,25 @@ fn run_with(platform: PlatformImpl) -> ! {
         platform.features().join(",")
     );
 
+    diag::spawn_heartbeat("vmlab-agent");
     let mut decoder = FrameDecoder::new();
     let mut buf = [0u8; 32 * 1024];
+    let mut detached = false;
     loop {
         match port_r.read(&mut buf) {
             // EOF: host side detached; it may reconnect.
-            Ok(0) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Ok(0) => {
+                if !detached {
+                    eprintln!("vmlab-agent: diag port EOF (host detached) {}", diag::now());
+                    detached = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200))
+            }
             Ok(n) => {
+                if detached {
+                    eprintln!("vmlab-agent: diag port data again {}", diag::now());
+                    detached = false;
+                }
                 decoder.push(&buf[..n]);
                 while let Some(frame) = decoder.next_frame() {
                     mux.handle_frame(frame, &platform);

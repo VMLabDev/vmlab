@@ -241,7 +241,18 @@ impl Mux {
                 // deliver itself.
                 let mut told = false;
                 while !frame.cancelled() {
-                    let Err(e) = port_w.write_all(&frame.bytes) else {
+                    let started = std::time::Instant::now();
+                    let wrote = port_w.write_all(&frame.bytes);
+                    let took = started.elapsed();
+                    if took > std::time::Duration::from_millis(500) {
+                        eprintln!(
+                            "vmlab-agent: diag port write of {} bytes took {} ms {}",
+                            frame.bytes.len(),
+                            took.as_millis(),
+                            crate::diag::now()
+                        );
+                    }
+                    let Err(e) = wrote else {
                         break;
                     };
                     if write_was_abandoned(&e) {
@@ -282,7 +293,19 @@ impl Mux {
             cancelled: self.channel.as_ref().map(|c| c.cancelled.clone()),
         };
         if !frame.cancelled() {
-            let _ = self.inner.out.send(frame);
+            match self.inner.out.try_send(frame) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(frame)) => {
+                    let started = std::time::Instant::now();
+                    let _ = self.inner.out.send(frame);
+                    eprintln!(
+                        "vmlab-agent: diag out queue was full; waited {} ms {}",
+                        started.elapsed().as_millis(),
+                        crate::diag::now()
+                    );
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+            }
         }
     }
 
@@ -513,6 +536,12 @@ impl Mux {
             } => {
                 // Fresh host handshake: whatever the previous host connection
                 // had open is gone.
+                eprintln!(
+                    "vmlab-agent: diag hello token {} sessions {} {}",
+                    token,
+                    self.inner.sessions.lock().unwrap().len(),
+                    crate::diag::now()
+                );
                 self.remove_all();
                 if proto_version != PROTO_VERSION {
                     self.send_error(

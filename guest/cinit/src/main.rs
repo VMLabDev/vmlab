@@ -175,6 +175,25 @@ fn run() -> Result<()> {
         let idle_env = container::build_env(&spec, None);
         let mut agent_pid = spawn_agent(&spec, &idle_env, None);
         ctl.emit(&CtlEvent::Idle);
+        // VML-106 diagnostics only: a heartbeat apart from the agent.
+        thread::spawn(|| {
+            let mut last = std::time::Instant::now();
+            let mut n: u64 = 0;
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let gap = last.elapsed();
+                last = std::time::Instant::now();
+                n += 1;
+                let up = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+                let up = up.split_whitespace().next().unwrap_or("");
+                if gap > Duration::from_millis(2000) {
+                    println!("vmlab-cinit: diag GAP {} ms up={up}", gap.as_millis());
+                }
+                if n % 5 == 0 {
+                    println!("vmlab-cinit: diag hb up={up}");
+                }
+            }
+        });
         let ctl_replay = ctl.clone();
         ctl.spawn_dispatcher(move |cmd| match cmd {
             CtlCommand::Stop { .. } => {
@@ -182,7 +201,8 @@ fn run() -> Result<()> {
                 power_off();
             }
             CtlCommand::Resync => {
-                println!("vmlab-cinit: resync requested");
+                let up = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+                println!("vmlab-cinit: resync requested up={}", up.split_whitespace().next().unwrap_or(""));
                 ctl_replay.resync();
             }
             CtlCommand::Spec { .. } => {
