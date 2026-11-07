@@ -58,6 +58,18 @@ pub struct AgentInfo {
     pub instance: Option<String>,
 }
 
+/// What a ping found ([`AgentHandle::ping_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pong {
+    /// The agent this handle handshook answered.
+    Same,
+    /// Another agent instance answered: the agent restarted, and the handle's
+    /// handshake is stale.
+    Other,
+    /// No answer in time, or the connection is gone.
+    Silent,
+}
+
 /// One metrics sample.
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
@@ -413,6 +425,11 @@ impl AgentHandle {
     /// knows are a former agent's, and the handle is as spent as a silent
     /// one. Agents that name no instance are taken at their word.
     pub async fn ping(&self, timeout: Duration) -> bool {
+        self.ping_outcome(timeout).await == Pong::Same
+    }
+
+    /// [`ping`](Self::ping), telling a silent agent from a different one.
+    pub async fn ping_outcome(&self, timeout: Duration) -> Pong {
         let mut rx = self.inner.pong.subscribe();
         rx.mark_unchanged();
         // The whole ping is bounded, the send too: a guest that stopped
@@ -424,7 +441,7 @@ impl AgentHandle {
         .await
         .unwrap_or(false);
         if !answered {
-            return false;
+            return Pong::Silent;
         }
         let pong = rx.borrow().1.clone();
         let handshook = self
@@ -439,9 +456,19 @@ impl AgentHandle {
                 ?pong,
                 "agent: a different agent instance answered; its handshake is stale"
             );
-            return false;
+            return Pong::Other;
         }
-        true
+        Pong::Same
+    }
+
+    /// Whether the connection is still open: its reader has not seen the
+    /// socket end, and nobody has shut it down.
+    pub fn is_open(&self) -> bool {
+        self.inner
+            .reader
+            .lock_recover()
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     /// Open a channel and wait for the agent's `opened` (or error).

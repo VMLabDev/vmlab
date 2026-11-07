@@ -1191,18 +1191,9 @@ impl AgentSlot {
     ) -> Result<AgentHandle> {
         let mut agent = self.handle.lock().await;
         if let Some(handle) = agent.as_ref() {
-            let asked = std::time::Instant::now();
-            if handle.ping(Duration::from_secs(2)).await {
+            if cached_verdict(handle, name, PING_GRACE).await == Cached::Answers {
                 return Ok(handle.clone());
             }
-            let sessions = handle.open_sessions().await;
-            tracing::warn!(
-                machine = name,
-                waited_ms = asked.elapsed().as_millis() as u64,
-                silent_ms = handle.silent_for().as_millis() as u64,
-                sessions,
-                "agent: the cached connection missed a ping; reconnecting"
-            );
             if let Some(dead) = agent.take() {
                 dead.shutdown().await;
             }
@@ -1251,18 +1242,13 @@ impl AgentSlot {
         }
         let mut agent = self.handle.lock().await;
         if let Some(handle) = agent.as_ref() {
-            let asked = std::time::Instant::now();
-            if handle.ping(Duration::from_secs(2)).await {
-                return true;
+            match cached_verdict(handle, &sock.display().to_string(), Duration::ZERO).await {
+                Cached::Answers => return true,
+                // Not now, but nothing a new connection would do better: keep
+                // its sessions for when the agent catches up.
+                Cached::Slow => return false,
+                Cached::Gone => {}
             }
-            let sessions = handle.open_sessions().await;
-            tracing::warn!(
-                sock = %sock.display(),
-                waited_ms = asked.elapsed().as_millis() as u64,
-                silent_ms = handle.silent_for().as_millis() as u64,
-                sessions,
-                "agent: the cached connection missed a probe ping; reconnecting"
-            );
             if let Some(dead) = agent.take() {
                 dead.shutdown().await;
             }
@@ -1319,9 +1305,188 @@ impl AgentSlot {
     }
 }
 
+/// How long a cached connection that missed its first ping still gets to
+/// answer, while it stays open, before a connect replaces it.
+pub const PING_GRACE: Duration = Duration::from_secs(20);
+
+/// What a ping says about a cached agent connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cached {
+    /// Its agent answered: hand it out.
+    Answers,
+    /// Its agent has not answered yet, but the connection is open and no other
+    /// agent instance answered on it, so a new one would do no better: keep it.
+    Slow,
+    /// The socket ended, or another agent instance answered: replace it.
+    Gone,
+}
+
+/// Ping a cached agent connection: 2 s, then up to `grace` more while it
+/// stays open.
+///
+/// A connection the agent stopped answering on is only worth replacing when
+/// that can help: when its socket has ended, or when another agent instance
+/// answers (the agent restarted). An open connection whose agent is merely
+/// slow — a loaded host, a micro-VM still catching up after an online restore
+/// — carries sessions (a running `exec`, the workspace watch), and replacing
+/// it gains nothing, because a fresh handshake needs the same agent to answer.
+/// Replacing it after one ping missed in 2 s cut every such session each time
+/// the guest paused for that long (VML-106).
+async fn cached_verdict(handle: &AgentHandle, who: &str, grace: Duration) -> Cached {
+    use super::vm_agent::Pong;
+    let asked = std::time::Instant::now();
+    let mut outcome = handle.ping_outcome(Duration::from_secs(2)).await;
+    let silent_ms = handle.silent_for().as_millis() as u64;
+    if outcome == Pong::Silent && handle.is_open() && !grace.is_zero() {
+        outcome = handle.ping_outcome(grace).await;
+        if outcome == Pong::Same {
+            tracing::info!(
+                agent = who,
+                waited_ms = asked.elapsed().as_millis() as u64,
+                silent_ms,
+                "agent: answered late; kept the connection and its sessions"
+            );
+        }
+    }
+    let verdict = match outcome {
+        Pong::Same => return Cached::Answers,
+        Pong::Silent if handle.is_open() && grace.is_zero() => Cached::Slow,
+        _ => Cached::Gone,
+    };
+    let sessions = handle.open_sessions().await;
+    let waited_ms = asked.elapsed().as_millis() as u64;
+    if verdict == Cached::Slow {
+        tracing::debug!(agent = who, waited_ms, silent_ms, sessions, "agent: not answering yet; kept the connection");
+    } else {
+        tracing::warn!(
+            agent = who,
+            ?outcome,
+            open = handle.is_open(),
+            waited_ms,
+            silent_ms,
+            sessions,
+            "agent: the cached connection does not answer; reconnecting"
+        );
+    }
+    verdict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mock agent socket for the slot: answers the hello as instance `i1`,
+    /// or `i2` once `restarted` is set, holds back the pongs to the first
+    /// `late` pings for `delay`, and counts the connections it accepted.
+    async fn slow_agent(
+        late: usize,
+        delay: Duration,
+        restarted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (tempfile::TempDir, PathBuf, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use vmlab_agent_proto::{AgentMsg, FrameDecoder, HostMsg, PROTO_VERSION, encode_ctrl};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let pings = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let (pings, restarted) = (Arc::clone(&pings), Arc::clone(&restarted));
+                tokio::spawn(async move {
+                    let (mut rd, wr) = stream.into_split();
+                    let wr = Arc::new(tokio::sync::Mutex::new(wr));
+                    let mut dec = FrameDecoder::new();
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = rd.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        dec.push(&buf[..n]);
+                        while let Some(f) = dec.next_frame() {
+                            let instance = Some(if restarted.load(Ordering::SeqCst) { "i2" } else { "i1" }.to_string());
+                            let (reply, wait) = match serde_json::from_slice::<HostMsg>(&f.payload) {
+                                Ok(HostMsg::Hello { token, .. }) => (
+                                    AgentMsg::Hello {
+                                        proto_version: PROTO_VERSION,
+                                        agent_version: "slow-mock".into(),
+                                        os: "linux".into(),
+                                        features: vec![],
+                                        token,
+                                        instance,
+                                    },
+                                    Duration::ZERO,
+                                ),
+                                Ok(HostMsg::Ping) => {
+                                    let nth = pings.fetch_add(1, Ordering::SeqCst);
+                                    (AgentMsg::Pong { instance }, if nth < late { delay } else { Duration::ZERO })
+                                }
+                                _ => continue,
+                            };
+                            let wr = Arc::clone(&wr);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(wait).await;
+                                let _ = wr.lock().await.write_all(&encode_ctrl(&reply).unwrap()).await;
+                            });
+                        }
+                    }
+                });
+            }
+        });
+        (dir, path, accepted)
+    }
+
+    /// **A slow agent keeps its connection** (VML-106). A connect whose
+    /// cached connection's agent answers its ping only after 3 s hands out
+    /// that same connection — its sessions intact — instead of replacing it
+    /// at the 2 s mark.
+    #[tokio::test]
+    async fn a_connect_keeps_a_slow_agents_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_dir, sock, accepted) = slow_agent(1, Duration::from_secs(3), Arc::new(AtomicBool::new(false))).await;
+        let slot = AgentSlot::default();
+        let first = slot.connect("m1", &sock, "hint").await.expect("first connect");
+        let started = std::time::Instant::now();
+        slot.connect("m1", &sock, "hint").await.expect("the slow agent answered within the grace");
+        assert!(started.elapsed() >= Duration::from_secs(2), "the first ping was not the late one");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "a slow agent's connection was replaced");
+        assert!(first.is_open(), "a slow agent's connection was shut down");
+    }
+
+    /// A probe of a slow agent says "not now" and leaves the connection,
+    /// and its sessions, for when the agent catches up.
+    #[tokio::test]
+    async fn a_probe_leaves_a_slow_agents_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_dir, sock, accepted) = slow_agent(1, Duration::from_secs(3), Arc::new(AtomicBool::new(false))).await;
+        let slot = AgentSlot::default();
+        let first = slot.connect("m1", &sock, "hint").await.expect("first connect");
+        assert!(!slot.probe(&sock).await, "the first ping is 3 s late: not answering right now");
+        assert!(first.is_open(), "a probe cut a slow agent's connection");
+        assert!(slot.probe(&sock).await, "answers promptly again");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "a slow agent's connection was replaced");
+    }
+
+    /// An agent that restarted answers on the same connection as another
+    /// instance: that connection is replaced at once, grace or not.
+    #[tokio::test]
+    async fn a_restarted_agent_is_still_replaced() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let restarted = Arc::new(AtomicBool::new(false));
+        let (_dir, sock, accepted) = slow_agent(0, Duration::ZERO, Arc::clone(&restarted)).await;
+        let slot = AgentSlot::default();
+        let first = slot.connect("m1", &sock, "hint").await.expect("first connect");
+        restarted.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let second = slot.connect("m1", &sock, "hint").await.expect("reconnect");
+        assert!(started.elapsed() < Duration::from_secs(2), "waited out a grace for a restarted agent");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2, "the stale connection was kept");
+        assert!(!first.is_open(), "the stale connection was not shut down");
+        assert_eq!(second.info().instance.as_deref(), Some("i2"));
+    }
 
     /// **The failed-handshake backoff spares ordinary callers, never a
     /// replacement.** After a failed handshake, a plain connect inside the
