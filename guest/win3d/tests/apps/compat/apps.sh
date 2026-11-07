@@ -125,6 +125,7 @@ app_collect() { # app_collect NAME DIR: the application's own log, and its FPS w
             # --print-fps: "Project FPS: 60 (16.66 mspf)" once a second; skip the first 10 s.
             awk '/Project FPS:/ { n++; if (n > 10) { s += $3; k++ } } END { if (k) printf "%.1f average over %d s (Godot --print-fps)\n", s / k, k }' \
                 "$d/godot.log" >"$d/fps.txt"
+            [ -n "$d" ] && [ "$d" != / ] || { echo "VML-88: d is empty or /" >&2; exit 1; }
             [ -s "$d/fps.txt" ] || rm -f "$d/fps.txt" ;;
         gzdoom-*)
             in_lab vmlab cp "$VM:C:/apps/gzdoom/$name.log" "$d/gzdoom.log" >/dev/null 2>&1

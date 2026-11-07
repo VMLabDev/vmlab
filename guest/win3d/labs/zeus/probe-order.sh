@@ -9,6 +9,7 @@
 #
 # OUTDIR gets each probe's JSON, the QEMU log lines of this boot, the kernel's
 # NVRM lines and the runtime PM transitions.
+# check-shell-paths: no-errexit a failed probe is recorded and the next probe must run (VML-88).
 set -uo pipefail
 GPU=$1 OUT=$2; shift 2
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} PATH=$HOME/.local/bin:$PATH

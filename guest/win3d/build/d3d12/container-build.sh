@@ -56,6 +56,7 @@ apply() {
 
 prepare_sources() {
   echo "== preparing sources (stamp $stamp)"
+  [ -n "$work" ] && [ "$work" != / ] || { echo "VML-88: work is empty or /" >&2; exit 1; }
   rm -rf "$work/build"
 
   fetch "$work/vkd3d-proton" "$vkd3d_url" "$vkd3d_commit"
@@ -109,6 +110,7 @@ for arch in x86_64 i686; do
   ninja -C "$b" -j "$jobs"
 
   mkdir -p "$out/$dir"
+  [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
   install -m 0644 "$work/build/vkd3d-$arch/libs/d3d12/d3d12.dll" "$out/$dir/d3d12.dll"
   install -m 0644 "$work/build/vkd3d-$arch/libs/d3d12core/d3d12core.dll" "$out/$dir/vkd3dcore.dll"
   install -m 0644 "$work/build/dxvk-$arch/src/dxgi/dxgi.dll" "$out/$dir/dxgi-vulkan.dll"

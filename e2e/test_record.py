@@ -1,14 +1,20 @@
 """Boot recordings must start at power-on and contain firmware, including
 when it paints late."""
 
+import contextlib
+import io
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
 from scenarios import record
+from scenarios.record import PNG_SIGNATURE
 
 NO_DISPLAY = "Display output is not active."
 GRUB = "GNU GRUB version 2.12"
@@ -266,8 +272,114 @@ class EarlyFramesTests(unittest.TestCase):
     def test_a_broken_video_fails(self):
         bad = self.dir / "bad.mp4"
         bad.write_bytes(b"not a video")
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
             list(record.early_frames(bad, 1.0, self.dir / "frames"))
+        # The log is read to its end before the error is built.
+        self.assertIn("Invalid data", caught.exception.stderr)
+
+    def test_ffmpeg_killed_mid_stream_raises_its_status(self):
+        video = busy_video(self.dir / "busy.mkv")
+        started = []
+        popen = subprocess.Popen
+
+        def spy(*args, **kwargs):
+            started.append(popen(*args, **kwargs))
+            return started[-1]
+
+        with patch.object(record.subprocess, "Popen", side_effect=spy):
+            with contextlib.closing(record.early_frames(video, 8.0, self.dir / "frames")) as frames:
+                next(frames)
+                started[0].kill()
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    for _ in frames:
+                        pass
+        self.assertEqual(caught.exception.returncode, -signal.SIGKILL)
+        self.assertIn("Stream mapping", caught.exception.stderr)
+
+    def test_a_desynced_stream_fails_and_names_the_frame(self):
+        # A showinfo line lost on the way: the reader sees frame 1 first, so
+        # pipe frame 0 is paired with showinfo's frame 1.
+        video = make_video(self.dir / "d.mkv", 7, ("-c:v", "ffv1"))
+        lines_from_one = re.compile(rb"\[Parsed_showinfo_\d+ @ [^]]*\] n:\s*([1-9]\d*)\s+pts:\s*\S+\s+pts_time:(\S+)")
+        with patch.object(record, "SHOWINFO", lines_from_one), \
+                self.assertRaisesRegex(RuntimeError, "frame 0 of .* out of step .* logged frame 1") as caught:
+            list(record.early_frames(video, 10.0, self.dir / "frames"))
+        self.assertIn("ffmpeg's last log lines", "\n".join(caught.exception.__notes__))
+
+    def test_a_missing_showinfo_line_names_the_frame(self):
+        # The video is big enough that ffmpeg waits on the pipe after frame 0,
+        # so its showinfo lines never reach the reader in time.
+        video = busy_video(self.dir / "busy.mkv")
+        with patch.object(record, "SHOWINFO", re.compile(rb"(?!)")), \
+                patch.object(record, "SHOWINFO_WAIT", 0.5), \
+                self.assertRaisesRegex(RuntimeError, "frame 0 of .* was piped but ffmpeg logged no showinfo line"):
+            list(record.early_frames(video, 8.0, self.dir / "frames"))
+
+    def test_a_caller_exception_stops_ffmpeg_and_propagates(self):
+        video = busy_video(self.dir / "busy.mkv")
+        started = []
+        popen = subprocess.Popen
+
+        def spy(*args, **kwargs):
+            started.append(popen(*args, **kwargs))
+            return started[-1]
+
+        with patch.object(record.subprocess, "Popen", side_effect=spy), \
+                self.assertRaises(Boom):
+            with contextlib.closing(record.early_frames(video, 8.0, self.dir / "frames")) as frames:
+                for _ in frames:
+                    raise Boom()
+        self.assertIsNotNone(started[0].poll())
+
+
+class Boom(Exception):
+    """A caller's own failure, raised inside the frame loop."""
+
+
+def busy_video(path: Path, seconds: float = 8.0) -> Path:
+    """A 320x240 test pattern in FFV1: its frames are too big for the pipe
+    to hold them all, so ffmpeg blocks on a reader that stops."""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"testsrc2=s=320x240:r=10:d={seconds}", "-c:v", "ffv1", str(path)],
+        check=True, capture_output=True,
+    )
+    return path
+
+
+def chunk(kind: bytes, body: bytes) -> bytes:
+    return len(body).to_bytes(4, "big") + kind + body + zlib.crc32(kind + body).to_bytes(4, "big")
+
+
+def tiny_png(payload: bytes) -> bytes:
+    """A PNG with the three chunks png_stream reads; the pixels are not
+    decoded, so the payload need not be a real image."""
+    return PNG_SIGNATURE + chunk(b"IHDR", b"\0" * 13) + chunk(b"IDAT", payload) + chunk(b"IEND", b"")
+
+
+class PngStreamTests(unittest.TestCase):
+    def test_files_written_back_to_back_are_split(self):
+        a, b = tiny_png(b"first" * 9), tiny_png(b"second" * 40)
+        self.assertEqual(list(record.png_stream(io.BytesIO(a + b))), [a, b])
+
+    def test_a_stream_that_ends_at_a_file_boundary_is_complete(self):
+        a = tiny_png(b"first")
+        self.assertEqual(list(record.png_stream(io.BytesIO(a))), [a])
+
+    def test_a_stream_cut_inside_a_file_raises(self):
+        a, b = tiny_png(b"first"), tiny_png(b"second")
+        for cut in range(1, len(b)):
+            with self.subTest(cut=cut), self.assertRaises(ValueError):
+                list(record.png_stream(io.BytesIO(a + b[:cut])))
+
+    def test_a_cut_stream_is_reported_as_cut_short(self):
+        b = tiny_png(b"second")
+        with self.assertRaisesRegex(ValueError, "PNG stream cut short"):
+            list(record.png_stream(io.BytesIO(b[:-5])))
+
+    def test_bytes_that_are_not_a_png_raise(self):
+        with self.assertRaisesRegex(ValueError, "not a PNG"):
+            list(record.png_stream(io.BytesIO(b"GIF89a" + b"\0" * 20)))
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ case "$user" in
 esac
 
 mkdir -p "$data/Library/vmlab" "$data/Library/LaunchDaemons" "$data/private/var/db"
+[ -n "$here" ] && [ "$here" != / ] || { echo "VML-88: here is empty or /" >&2; exit 1; }
 cp "$here/vmlab-agent" "$data/Library/vmlab/vmlab-agent"
 chown root:wheel "$data/Library/vmlab" "$data/Library/vmlab/vmlab-agent"
 chmod 0755 "$data/Library/vmlab" "$data/Library/vmlab/vmlab-agent"

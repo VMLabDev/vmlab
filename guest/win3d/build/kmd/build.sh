@@ -61,6 +61,7 @@ SRC_TREE=$(fetch_git yttrium-virtio-gpu)
 
 docker build -q -t "$IMAGE" "$HERE" >/dev/null
 
+[ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
 rm -rf "$OUT"
 mkdir -p "$OUT" "$CACHE/unpacked"
 docker run --rm --network none --user "$(id -u):$(id -g)" \

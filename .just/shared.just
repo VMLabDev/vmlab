@@ -52,5 +52,6 @@ ebpf-build: require-rustup require-bpf-linker
 	cd ebpf && {{ebpf_target_env}}cargo test -p fastpath-logic
 	cd ebpf && {{ebpf_target_env}}cargo build --release --target bpfel-unknown-none -Z build-std=core \
 		-p fastpath-sockmap -p xdp-switch
+	[ -n {{quote(ebpf_target)}} ] && [ {{quote(ebpf_target)}} != / ] || { echo "VML-88: ebpf_target is empty or /" >&2; exit 1; }
 	cp {{quote(ebpf_target)}}/bpfel-unknown-none/release/fastpath-sockmap src/net/fastpath/bpf/fastpath_sockmap.bpf.o
 	cp {{quote(ebpf_target)}}/bpfel-unknown-none/release/xdp-switch src/net/fastpath/bpf/xdp_switch.bpf.o

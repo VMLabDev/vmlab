@@ -8,6 +8,9 @@
 # by install.sh from the Recovery Terminal. Logs to
 # /var/log/vmlab-firstboot.log, never the password.
 
+# check-shell-paths: no-errexit finish must run on every path, or the password file survives a failed defaults or chown.
+set -u
+
 conf=/Library/vmlab/firstboot.conf
 plist=/Library/LaunchDaemons/dev.vmlab.firstboot.plist
 
@@ -47,6 +50,7 @@ fi
 # The per-user setup screens a first login would otherwise walk through, each
 # marked seen, so that login lands on the desktop.
 home="$(dscl . -read "/Users/$user" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')"
+[ -n "$home" ] && [ "$home" != / ] || { log "no home directory for $user"; finish 1; }
 prefs="$home/Library/Preferences/com.apple.SetupAssistant"
 mkdir -p "$home/Library/Preferences"
 for key in DidSeeCloudSetup DidSeePrivacy DidSeeSiriSetup DidSeeTouchIDSetup \

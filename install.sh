@@ -151,6 +151,7 @@ trap 'rm -f "$tmp"' EXIT INT TERM
 download_file "$url" "$tmp" || err "download failed: $url
 The release may not exist or may lack a $suffix asset. See https://github.com/$REPO/releases"
 
+[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
 chmod +x "$tmp"
 mkdir -p "$BIN_DIR"
 # Whether the binary being replaced had the fast path's capabilities: the new
@@ -161,6 +162,8 @@ if have getcap && [ -f "$BIN_DIR/vmlab" ]; then
     *cap_bpf*) HAD_CAPS=1 ;;
   esac
 fi
+[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || { echo "VML-88: BIN_DIR is empty or /" >&2; exit 1; }
+[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
 mv "$tmp" "$BIN_DIR/vmlab"
 trap - EXIT INT TERM
 
@@ -283,6 +286,8 @@ install_guest() {
   mkdir -p "$gparent" || { guest_fallback "cannot create $gparent"; return 0; }
   gtmp="$(mktemp -d "$gparent/.vmlab-guest.XXXXXX")" \
     || { guest_fallback "cannot create a staging directory in $gparent"; return 0; }
+  [ -n "$gtmp" ] && [ -d "$gtmp" ] && [ "$gtmp" != / ] \
+    || { guest_fallback "the staging directory in $gparent is missing"; return 0; }
   trap 'rm -rf "$gtmp"' EXIT INT TERM
 
   if ! download_file "$gurl" "$gtmp/$gname" || ! download_file "$gurl.sha256" "$gtmp/$gname.sha256"; then
