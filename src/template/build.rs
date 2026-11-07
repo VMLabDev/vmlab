@@ -2330,8 +2330,8 @@ fn synth_spec_lab(
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildBoot, EffectiveHardware, SealedImage, build_lab_name, claim_workdir, seal_meta, sweep_workdirs_in,
-        synth_lab, wcl_str,
+        BuildBoot, EffectiveHardware, SealedImage, build_lab_name, claim_workdir, seal_meta,
+        sweep_workdirs_in, synth_lab, wcl_str,
     };
     use crate::config::model::SecureBootKeys;
     use crate::qemu::resolve::KeyStore;
@@ -2428,8 +2428,13 @@ mod tests {
         assert!(!left.exists());
 
         // A second build of the same workdir is refused, and wipes nothing.
-        let err = claim_workdir(&held).err().expect("a held workdir was claimed");
-        assert!(format!("{err:#}").contains("in use by another build"), "{err:#}");
+        let err = claim_workdir(&held)
+            .err()
+            .expect("a held workdir was claimed");
+        assert!(
+            format!("{err:#}").contains("in use by another build"),
+            "{err:#}"
+        );
         assert!(held.join("media.iso").is_file());
 
         // The build ends: its dir goes, and the name is free to claim again.
