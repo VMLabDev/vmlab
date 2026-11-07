@@ -32,6 +32,19 @@ use crate::{
     PciSnapshot, Snapshot, VirtioDevice, VirtioInterrupt,
 };
 
+/// Driver-visible transport events, for diagnosing guest drivers. Enable with
+/// `VMLAB_HV_LOG=info,vmlab_hv_devices::virtio::trace=debug`.
+macro_rules! vtrace {
+    ($($arg:tt)*) => {
+        if log::log_enabled!(target: "vmlab_hv_devices::virtio::trace", log::Level::Debug) {
+            log::debug!(target: "vmlab_hv_devices::virtio::trace", $($arg)*);
+        }
+    };
+}
+
+/// Hot-path events (notifies, interrupts) traced per activation.
+const TRACE_HOT_LIMIT: u32 = 64;
+
 #[path = "transitional.rs"]
 mod transitional;
 use transitional::LegacyPci;
@@ -139,6 +152,8 @@ struct InterruptState {
     queue_vectors: Vec<u16>,
     isr: u8,
     config_generation: u8,
+    /// Interrupts traced since the last reset (diagnostics only).
+    traced: u32,
 }
 
 impl InterruptState {
@@ -163,11 +178,22 @@ impl InterruptState {
             queue_vectors: vec![NO_VECTOR; num_queues],
             isr: 0,
             config_generation: 0,
+            traced: 0,
         }
     }
 
     /// Deliver one interrupt at `vector`, setting `bits` in ISR first.
     fn deliver(&mut self, vector: u16, bits: u8) {
+        if self.traced < TRACE_HOT_LIMIT {
+            self.traced += 1;
+            vtrace!(
+                "deliver vector={vector:#x} bits={bits} msix={} fmask={} entry_masked={:?} intx={}",
+                self.msix_enabled,
+                self.function_masked,
+                self.entries.get(vector as usize).map(|e| e.masked),
+                self.intx.is_some()
+            );
+        }
         self.isr |= bits;
         if self.msix_enabled {
             let Some(msi) = self.msi.clone() else { return };
@@ -299,6 +325,10 @@ pub struct VirtioPciDevice {
     queue_select: u16,
     queue_cfg: Vec<QueueCfg>,
     activated: bool,
+    /// Notifications traced since the last reset (diagnostics only).
+    trace_notifies: u32,
+    /// Register reads traced since the last reset (diagnostics only).
+    trace_reads: u32,
     // PCI state the guest writes.
     command: u16,
     bar4: u64,
@@ -413,6 +443,8 @@ impl VirtioPciDevice {
             queue_select: 0,
             queue_cfg,
             activated: false,
+            trace_notifies: 0,
+            trace_reads: 0,
             command: 0,
             bar4: 0,
             interrupt_line: 0,
@@ -448,6 +480,9 @@ impl VirtioPciDevice {
 
     /// Reset to the power-on state (driver wrote status 0).
     fn virtio_reset(&mut self) {
+        vtrace!("{}: reset from status={:#x} activated={}", self.id, self.driver_status, self.activated);
+        self.trace_notifies = 0;
+        self.trace_reads = 0;
         self.driver_status = 0;
         self.device_feature_select = 0;
         self.guest_feature_select = 0;
@@ -470,6 +505,7 @@ impl VirtioPciDevice {
         int.queue_vectors.fill(NO_VECTOR);
         int.isr = 0;
         int.config_generation = 0;
+        int.traced = 0;
         if let Some(irq) = &int.intx {
             irq.set_level(false);
         }
@@ -514,6 +550,14 @@ impl VirtioPciDevice {
                 self.device.ack_features(self.driver_features);
             }
         }
+        vtrace!(
+            "{}: status write {new:#x} -> {status:#x} (was {:#x}) driver_features={:#x} offered={:#x} legacy={}",
+            self.id,
+            self.driver_status,
+            self.driver_features,
+            self.offered_features(),
+            self.transitional.as_ref().is_some_and(|s| s.active)
+        );
         self.driver_status = status;
         if activating && status & device_status::DRIVER_OK != 0 {
             self.activate();
@@ -549,17 +593,35 @@ impl VirtioPciDevice {
                 queue.set_event_idx(negotiated & F_RING_EVENT_IDX != 0);
                 queue.set_ready(true);
                 if !queue.is_valid(&self.mem) {
+                    vtrace!("{}: activate: queue {i} is not valid", self.id);
                     self.driver_status |= device_status::DEVICE_NEEDS_RESET;
                     return;
                 }
             }
             queues.push(queue);
         }
+        if log::log_enabled!(target: "vmlab_hv_devices::virtio::trace", log::Level::Debug) {
+            let int = self.int.lock();
+            for (i, cfg) in self.queue_cfg.iter().enumerate() {
+                vtrace!(
+                    "{}: activate queue {i} enabled={} size={} desc={:#x} avail={:#x} used={:#x} vector={:#x}",
+                    self.id, cfg.enabled, cfg.size, cfg.desc, cfg.avail, cfg.used,
+                    int.queue_vectors.get(i).copied().unwrap_or(NO_VECTOR)
+                );
+            }
+            vtrace!(
+                "{}: activate negotiated={negotiated:#x} msix={} config_vector={:#x}",
+                self.id, int.msix_enabled, int.config_vector
+            );
+        }
         let interrupt: Arc<dyn VirtioInterrupt> =
             Arc::new(TransportInterrupt::new(Arc::clone(&self.int)));
         match self.device.activate(self.mem.clone(), interrupt, queues) {
             Ok(()) => self.activated = true,
-            Err(_) => self.driver_status |= device_status::DEVICE_NEEDS_RESET,
+            Err(e) => {
+                vtrace!("{}: activate failed: {e}", self.id);
+                self.driver_status |= device_status::DEVICE_NEEDS_RESET
+            }
         }
     }
 
@@ -709,8 +771,17 @@ impl VirtioPciDevice {
         size | ((int.function_masked as u16) << 14) | ((int.msix_enabled as u16) << 15)
     }
 
+    /// Trace one queue notification (the first few per activation).
+    fn trace_notify(&mut self, queue: u64, path: &str) {
+        if self.trace_notifies < TRACE_HOT_LIMIT {
+            self.trace_notifies += 1;
+            vtrace!("{}: notify {path} queue={queue} activated={}", self.id, self.activated);
+        }
+    }
+
     /// Handle a guest write into the MSI-X message-control word.
     fn msix_control_write(&mut self, value: u16) {
+        vtrace!("{}: msix control write {value:#x}", self.id);
         let mut int = self.int.lock();
         let was_enabled = int.msix_enabled;
         int.msix_enabled = value & 0x8000 != 0;
@@ -752,7 +823,9 @@ impl PciDevice for VirtioPciDevice {
             return 0;
         }
         if self.transitional.is_some() {
-            return self.transitional_config_read(reg);
+            let value = self.transitional_config_read(reg);
+            self.trace_read("cfg", 0, reg as u64 * 4, &value.to_le_bytes());
+            return value;
         }
         match reg * 4 {
             0x04 => {
@@ -809,6 +882,7 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn config_write(&mut self, reg: usize, offset: u64, data: &[u8]) {
+        vtrace!("{}: pci config write reg={reg:#x} off={offset} data={data:02x?}", self.id);
         if self.transitional.is_some() {
             self.transitional_config_write(reg, offset, data);
             return;
@@ -852,6 +926,34 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn bar_read(&mut self, bar: u8, offset: u64, data: &mut [u8]) {
+        if self.trace_reads < TRACE_READ_LIMIT && self.transitional.is_some() {
+            vtrace!("{}: bar read begin bar={bar} off={offset:#x} len={}", self.id, data.len());
+        }
+        self.bar_read_inner(bar, offset, data);
+        self.trace_read("bar", bar, offset, data);
+    }
+
+    fn bar_write(&mut self, bar: u8, offset: u64, data: &[u8]) {
+        let notify = (bar == 0 && offset == 16) || (bar == 4 && (0x3000..0x4000).contains(&offset));
+        if self.transitional.is_some() && !notify {
+            vtrace!("{}: bar write bar={bar} off={offset:#x} data={data:02x?}", self.id);
+        }
+        self.bar_write_inner(bar, offset, data);
+    }
+}
+
+/// Register reads traced per reset.
+const TRACE_READ_LIMIT: u32 = 600;
+
+impl VirtioPciDevice {
+    fn trace_read(&mut self, kind: &str, bar: u8, offset: u64, data: &[u8]) {
+        if self.trace_reads < TRACE_READ_LIMIT && self.transitional.is_some() {
+            self.trace_reads += 1;
+            vtrace!("{}: {kind} read bar={bar} off={offset:#x} -> {data:02x?}", self.id);
+        }
+    }
+
+    fn bar_read_inner(&mut self, bar: u8, offset: u64, data: &mut [u8]) {
         if bar == ROM_BAR {
             data.fill(0xff);
             if let Some(image) = self
@@ -919,7 +1021,7 @@ impl PciDevice for VirtioPciDevice {
         }
     }
 
-    fn bar_write(&mut self, bar: u8, offset: u64, data: &[u8]) {
+    fn bar_write_inner(&mut self, bar: u8, offset: u64, data: &[u8]) {
         let offset = if self.transitional.is_some() {
             match bar {
                 0 => return self.legacy_write(offset, data),
@@ -938,6 +1040,7 @@ impl PciDevice for VirtioPciDevice {
         }
         match offset {
             o if o < 0x1000 && o + data.len() as u64 <= COMMON_CFG_LEN => {
+                vtrace!("{}: common write off={o:#x} data={data:02x?} queue_select={}", self.id, self.queue_select);
                 let mut buf = self.common_bytes();
                 let start = o as usize;
                 buf[start..start + data.len()].copy_from_slice(data);
@@ -946,6 +1049,7 @@ impl PciDevice for VirtioPciDevice {
             }
             o if (0x1000..0x2000).contains(&o) => {
                 let queue = (o - NOTIFY_OFF) / NOTIFY_OFF_MULTIPLIER;
+                self.trace_notify(queue, "modern");
                 if self.activated && queue < self.num_queues() as u64 {
                     self.device.queue_notify(queue as u16);
                 }
