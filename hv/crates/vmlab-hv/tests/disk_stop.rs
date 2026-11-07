@@ -294,7 +294,11 @@ fn sigterm_keeps_guest_writes_to_new_qcow2_clusters() {
         if text.contains("VML107:WRITTEN") {
             break;
         }
-        assert!(!text.contains("VML107:FAILED"), "ATA write failed\n{}", logs());
+        assert!(
+            !text.contains("VML107:FAILED"),
+            "ATA write failed\n{}",
+            logs()
+        );
         assert!(
             child.try_wait().unwrap().is_none() && Instant::now() < deadline,
             "the ROM did not finish its writes\n{}",
@@ -313,7 +317,11 @@ fn sigterm_keeps_guest_writes_to_new_qcow2_clusters() {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "no exit after SIGTERM\n{}", logs());
+        assert!(
+            Instant::now() < deadline,
+            "no exit after SIGTERM\n{}",
+            logs()
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(
