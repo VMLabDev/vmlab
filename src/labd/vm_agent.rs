@@ -159,6 +159,10 @@ struct Inner {
     /// reconnect would queue in the listen backlog forever).
     reader: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     writer: Mutex<OwnedWriteHalf>,
+    /// The socket itself, apart from its two halves, so [`AgentHandle::shutdown`]
+    /// can hang up on QEMU without waiting for the writer lock or for the
+    /// last handle clone (see there).
+    sock: std::os::fd::OwnedFd,
     /// When the reader last got bytes from the agent: how long a connection
     /// that misses a ping had been silent says whether the guest stalled or
     /// the pong was only late.
@@ -263,6 +267,9 @@ impl AgentHandle {
         let stream = UnixStream::connect(path)
             .await
             .with_context(|| format!("connecting agent socket {}", path.display()))?;
+        let sock = std::os::fd::AsFd::as_fd(&stream)
+            .try_clone_to_owned()
+            .context("duplicating the agent socket")?;
         let (read_half, write_half) = stream.into_split();
 
         let token = format!("{:016x}", rand::random::<u64>());
@@ -270,6 +277,7 @@ impl AgentHandle {
             rt: tokio::runtime::Handle::current(),
             reader: std::sync::Mutex::new(None),
             writer: Mutex::new(write_half),
+            sock,
             last_rx: std::sync::Mutex::new(std::time::Instant::now()),
             sessions: Mutex::new(HashMap::new()),
             open_waiters: std::sync::Mutex::new(HashMap::new()),
@@ -353,20 +361,29 @@ impl AgentHandle {
         Ok(())
     }
 
-    /// Tear the connection down now — both socket halves — and fail every
-    /// open session so consumers unblock. Used around snapshot restores and
-    /// when replacing a dead handle; dropping the last handle does the same
-    /// implicitly.
+    /// Tear the connection down now — both directions of the socket — and
+    /// fail every open session so consumers unblock. Used around snapshot
+    /// restores and when replacing a dead handle; dropping the last handle
+    /// does the same implicitly.
     pub async fn shutdown(&self) {
         if let Some(task) = self.inner.reader.lock_recover().take() {
             task.abort();
         }
-        // Close the write half explicitly: QEMU frees its one-client
-        // chardev slot only when *its* read side sees EOF, and session-held
-        // handle clones (an attached terminal, a lingering tail) would
-        // otherwise keep the socket half-open indefinitely, wedging every
-        // future connect in the listen backlog.
-        let _ = self.inner.writer.lock().await.shutdown().await;
+        // Hang up both directions, on the socket itself rather than on the
+        // write half. QEMU's `server=on` chardev serves one client, and
+        // session-held handle clones (an exec, an attached terminal, a
+        // lingering tail) keep this socket open past the shutdown. A write
+        // shutdown alone only puts an EOF in the stream, which QEMU sees
+        // when it next reads — and it reads only while the guest has
+        // receive buffers free. A guest agent stuck writing to a host that
+        // stopped reading frees none, so QEMU never read the EOF, never let
+        // the next client in (connects failed with EAGAIN on the full
+        // backlog), and the agent stayed unreachable until the last clone
+        // dropped: the 25-220 s outages after an online restore (VML-106).
+        // Shutting down both directions raises a hangup QEMU handles without
+        // reading, and fails any write of ours blocked on the full socket,
+        // which frees the writer lock.
+        let _ = socket2::SockRef::from(&self.inner.sock).shutdown(std::net::Shutdown::Both);
         // Dropping the entries drops their event senders, so session
         // consumers' recv() sees end-of-stream and their pumps wind down.
         let mut sessions = self.inner.sessions.lock().await;
@@ -398,12 +415,14 @@ impl AgentHandle {
     pub async fn ping(&self, timeout: Duration) -> bool {
         let mut rx = self.inner.pong.subscribe();
         rx.mark_unchanged();
-        if self.send_msg(&HostMsg::Ping).await.is_err() {
-            return false;
-        }
-        let answered = tokio::time::timeout(timeout, rx.changed())
-            .await
-            .is_ok_and(|r| r.is_ok());
+        // The whole ping is bounded, the send too: a guest that stopped
+        // reading leaves the socket full, and an unbounded write would hold
+        // the caller (and the agent slot's lock) for as long as that lasts.
+        let answered = tokio::time::timeout(timeout, async {
+            self.send_msg(&HostMsg::Ping).await.is_ok() && rx.changed().await.is_ok()
+        })
+        .await
+        .unwrap_or(false);
         if !answered {
             return false;
         }
@@ -3262,6 +3281,63 @@ mod tests {
         let third = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
         assert_eq!(third.info().agent_version, "seq-mock");
         drop(keep_alive);
+    }
+
+    /// QEMU reads the agent socket only while the guest has receive buffers
+    /// free, so it can miss an EOF in the stream for as long as the guest is
+    /// stuck — and with it the end of its one client. A shutdown must
+    /// therefore hang up, which QEMU sees without reading, also while a
+    /// session still holds a clone of the handle (VML-106).
+    #[tokio::test]
+    async fn shutdown_hangs_up_on_a_peer_that_does_not_read() {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsFd as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Answer the handshake, then never read again.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut dec = FrameDecoder::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).expect("read");
+                assert!(n > 0, "the host hung up before its hello");
+                dec.push(&buf[..n]);
+                while let Some(f) = dec.next_frame() {
+                    if let Ok(HostMsg::Hello { token, .. }) = serde_json::from_slice::<HostMsg>(&f.payload) {
+                        let reply = encode_ctrl(&AgentMsg::Hello {
+                            proto_version: PROTO_VERSION,
+                            agent_version: "deaf-mock".into(),
+                            os: "linux".into(),
+                            features: vec![],
+                            token,
+                            instance: None,
+                        })
+                        .unwrap();
+                        stream.write_all(&reply).expect("hello");
+                        return stream;
+                    }
+                }
+            }
+        });
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let peer = tokio::task::spawn_blocking(move || server.join().expect("server"))
+            .await
+            .expect("join");
+        let session_clone = handle.clone();
+        handle.shutdown().await;
+
+        let mut fds = [PollFd::new(peer.as_fd(), PollFlags::POLLIN)];
+        poll(&mut fds, PollTimeout::from(2000u16)).expect("poll");
+        let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+        assert!(
+            revents.contains(PollFlags::POLLHUP),
+            "the peer sees no hangup, only {revents:?}: QEMU would keep the client slot"
+        );
+        drop(session_clone);
     }
 
     #[tokio::test]
