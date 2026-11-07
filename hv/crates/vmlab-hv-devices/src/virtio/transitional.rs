@@ -295,9 +295,6 @@ impl VirtioPciDevice {
     }
 
     pub(super) fn legacy_write(&mut self, offset: u64, data: &[u8]) {
-        if offset != 16 || !self.activated {
-            vtrace!("{}: legacy write off={offset} data={data:02x?} queue_select={}", self.id, self.queue_select);
-        }
         let config_off = if self.int.lock().msix_enabled { 24 } else { 20 };
         if offset >= config_off {
             let rel = offset - config_off;
@@ -335,7 +332,6 @@ impl VirtioPciDevice {
             (14, 2) => self.queue_select = u16::from_le_bytes(data.try_into().unwrap()),
             (16, 2) if self.activated => {
                 let queue = u16::from_le_bytes(data.try_into().unwrap());
-                self.trace_notify(queue as u64, "legacy");
                 if (queue as usize) < self.num_queues() {
                     self.device.queue_notify(queue);
                 }

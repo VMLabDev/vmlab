@@ -363,15 +363,6 @@ pub struct Block {
     io_buffer: Vec<u8>,
     /// Coalesced guest ranges for reads, rebuilt without retaining guest pointers.
     read_ranges: Vec<(GuestAddress, usize)>,
-    /// Requests traced since the last reset (diagnostics only).
-    traced: u32,
-}
-
-/// Requests traced per activation with `vmlab_hv_devices::virtio::trace=debug`.
-const TRACE_LIMIT: u32 = 64;
-
-fn trace_on() -> bool {
-    log::log_enabled!(target: "vmlab_hv_devices::virtio::trace", log::Level::Debug)
 }
 
 impl Block {
@@ -414,7 +405,6 @@ impl Block {
             pending_queues: None,
             io_buffer: Vec::new(),
             read_ranges: Vec::new(),
-            traced: 0,
         }
     }
 
@@ -462,10 +452,6 @@ impl Block {
                 let table = self.queues[index].desc_table();
                 let size = self.queues[index].size();
                 let written = self.handle_chain(&mem, chain, table, size);
-                if self.traced < TRACE_LIMIT && trace_on() {
-                    self.traced += 1;
-                    log::debug!(target: "vmlab_hv_devices::virtio::trace", "{}: queue {index} head {head} written {written}", self.id);
-                }
                 // The used ring lives in guest memory validated at
                 // activation; failing here means the guest corrupted it,
                 // and the only recourse is to drop the request.
@@ -498,9 +484,6 @@ impl Block {
                         )
                         .is_ok_and(|flags| u16::from_le(flags) & AVAIL_F_NO_INTERRUPT == 0))
         });
-        if self.traced < TRACE_LIMIT && trace_on() {
-            log::debug!(target: "vmlab_hv_devices::virtio::trace", "{}: queue {index} drained used_any={used_any} notify={notified}", self.id);
-        }
         if used_any && notified {
             interrupt.notify_queue(index as u16);
         }
@@ -832,7 +815,6 @@ impl VirtioDevice for Block {
     }
 
     fn reset(&mut self) {
-        self.traced = 0;
         self.acked_features = 0;
         self.mem = None;
         self.interrupt = None;

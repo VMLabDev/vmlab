@@ -880,7 +880,12 @@ fn winpe_disc_probe_sequence_reports_one_complete_session() {
     let points: Vec<_> = raw[4..].chunks(11).map(|e| (e[0], e[1], e[3])).collect();
     assert_eq!(
         points,
-        [(1, 0x14, 0xa0), (1, 0x14, 0xa1), (1, 0x14, 0xa2), (1, 0x14, 1)]
+        [
+            (1, 0x14, 0xa0),
+            (1, 0x14, 0xa1),
+            (1, 0x14, 0xa2),
+            (1, 0x14, 1)
+        ]
     );
     // Lead-out at LBA 64: 64 + 150 frames = 00:02:64.
     assert_eq!(&raw[4 + 2 * 11 + 8..4 + 2 * 11 + 11], &[0, 2, 64]);

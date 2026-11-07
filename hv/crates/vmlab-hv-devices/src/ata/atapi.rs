@@ -19,7 +19,11 @@ fn lba_to_msf(lba: u32) -> [u8; 3] {
     if frames >= 256 * 4500 {
         return [0xff, 59, 74];
     }
-    [(frames / 4500) as u8, (frames / 75 % 60) as u8, (frames % 75) as u8]
+    [
+        (frames / 4500) as u8,
+        (frames / 75 % 60) as u8,
+        (frames % 75) as u8,
+    ]
 }
 
 pub(crate) struct Optical {
@@ -122,36 +126,6 @@ impl Optical {
     }
 
     pub fn packet(&mut self, cdb: &[u8; 16]) -> Result<Payload, u8> {
-        let result = self.packet_inner(cdb);
-        if log::log_enabled!(target: "vmlab_hv_devices::ata::trace", log::Level::Debug)
-            && (result.is_err() || !matches!(cdb[0], 0x28 | 0xa8))
-        {
-            let size = self.image.as_ref().map_or(0, |image| image.size());
-            match &result {
-                Ok(Payload::Bytes(data)) => log::debug!(
-                    target: "vmlab_hv_devices::ata::trace",
-                    "atapi cdb={:02x?} size={size} -> ok {} bytes {:02x?}",
-                    cdb,
-                    data.len(),
-                    &data[..data.len().min(48)]
-                ),
-                Ok(_) => log::debug!(
-                    target: "vmlab_hv_devices::ata::trace",
-                    "atapi cdb={:02x?} size={size} -> ok",
-                    cdb
-                ),
-                Err(status) => log::debug!(
-                    target: "vmlab_hv_devices::ata::trace",
-                    "atapi cdb={:02x?} size={size} -> err {status:#x} sense={:02x?}",
-                    cdb,
-                    self.sense
-                ),
-            }
-        }
-        result
-    }
-
-    fn packet_inner(&mut self, cdb: &[u8; 16]) -> Result<Payload, u8> {
         if self.attention && !matches!(cdb[0], 0x03 | 0x12 | 0x4a) {
             self.attention = false;
             return self.fail(6, 0x28, 0);
