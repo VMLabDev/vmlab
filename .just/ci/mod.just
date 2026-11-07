@@ -31,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: path-check shell-paths lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+check: path-check shell-paths release-version lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
 
 # Refuse tracked paths that Windows cannot check out (: * ? " < > | \, trailing dot or space)
 [group('ci')]
@@ -45,6 +45,11 @@ path-check:
 shell-paths:
 	python3 -m unittest discover -s scripts -p 'test_check_shell_paths.py'
 	python3 scripts/check_shell_paths.py
+
+# Test the release version calculation of ci.yml's "Calculate version" job: promotion of a pre-release, bumps, and 0.x breaking changes (VML-104)
+[group('ci')]
+release-version:
+	python3 -m unittest discover -s scripts -p 'test_release_version.py'
 
 # Run clippy with warnings as errors
 [group('ci')]

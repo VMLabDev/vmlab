@@ -200,60 +200,22 @@ jobs:
         with:
           fetch-depth: 0
       - id: calc
+        # The rules live in scripts/release-version.sh, tested by
+        # `just ci::release-version` (VML-104).
         run: |
-          IS_RELEASE=$(git log -1 --format='%(trailers:key=release,valueonly)')
-          IS_PRERELEASE=$(git log -1 --format='%(trailers:key=pre-release,valueonly)')
+          set -eu
+          ./scripts/release-version.sh > "$RUNNER_TEMP/release.env"
+          grep -E '^(do_release|version|prerelease)=' "$RUNNER_TEMP/release.env" >> "$GITHUB_OUTPUT"
 
-          if [[ "$IS_RELEASE" != "true" && "$IS_PRERELEASE" != "true" ]]; then
-            echo "do_release=false" >> "$GITHUB_OUTPUT"
+          if grep -qx 'do_release=false' "$RUNNER_TEMP/release.env"; then
             echo "No release/pre-release trailer on HEAD — tests only." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          # Next version = bump from the last v* tag, scanning conventional
-          # commits since that tag for the bump level (0.x: major -> minor).
-          LAST_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "")
-          if [[ -z "$LAST_TAG" ]]; then
-            PREV_MAJOR=0; PREV_MINOR=0; PREV_PATCH=0; RANGE="HEAD"
-          else
-            VER="${LAST_TAG#v}"; VER="${VER%%-*}"
-            IFS='.' read -r PREV_MAJOR PREV_MINOR PREV_PATCH <<< "$VER"
-            RANGE="${LAST_TAG}..HEAD"
-          fi
-
-          BUMP="none"
-          while IFS= read -r HASH; do
-            SUBJECT=$(git log -1 --format='%s' "$HASH")
-            BODY=$(git log -1 --format='%b' "$HASH")
-            if echo "$SUBJECT" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODY" | grep -qiE '^BREAKING[ -]CHANGE:'; then
-              BUMP="major"
-            elif echo "$SUBJECT" | grep -qE '^feat(\(.+\))?:' && [[ "$BUMP" != "major" ]]; then
-              BUMP="minor"
-            elif echo "$SUBJECT" | grep -qE '^(fix|perf|refactor|build|ci|docs|style|test|chore|revert)(\(.+\))?:' && [[ "$BUMP" == "none" ]]; then
-              BUMP="patch"
-            fi
-          done < <(git log --format='%H' $RANGE)
-          [[ "$BUMP" == "none" ]] && BUMP="patch"
-
-          case "$BUMP" in
-            major)
-              if [[ "$PREV_MAJOR" -eq 0 ]]; then MAJOR=0; MINOR=$((PREV_MINOR + 1)); PATCH=0
-              else MAJOR=$((PREV_MAJOR + 1)); MINOR=0; PATCH=0; fi ;;
-            minor) MAJOR=$PREV_MAJOR; MINOR=$((PREV_MINOR + 1)); PATCH=0 ;;
-            patch) MAJOR=$PREV_MAJOR; MINOR=$PREV_MINOR; PATCH=$((PREV_PATCH + 1)) ;;
-          esac
-
-          VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          PRERELEASE=false
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            VERSION="${VERSION}-alpha"
-            PRERELEASE=true
-          fi
-
-          echo "Calculated version: $VERSION (bump=$BUMP, prerelease=$PRERELEASE, from ${LAST_TAG:-none})"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          echo "do_release=true" >> "$GITHUB_OUTPUT"
+          VERSION=$(sed -n 's/^version=//p' "$RUNNER_TEMP/release.env")
+          PRERELEASE=$(sed -n 's/^prerelease=//p' "$RUNNER_TEMP/release.env")
+          BUMP=$(sed -n 's/^bump=//p' "$RUNNER_TEMP/release.env")
+          LAST_TAG=$(sed -n 's/^last_tag=//p' "$RUNNER_TEMP/release.env")
 
           cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
           ## Release
