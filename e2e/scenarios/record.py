@@ -151,6 +151,8 @@ def firmware_kind(upper: str):
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # One line of ffmpeg's showinfo filter per decoded frame, in output order.
 SHOWINFO = re.compile(rb"\[Parsed_showinfo_\d+ @ [^]]*\] n:\s*(\d+)\s+pts:\s*\S+\s+pts_time:(\S+)")
+# How long a piped frame may wait for its showinfo line.
+SHOWINFO_WAIT = 60.0
 _END = object()
 
 
@@ -179,6 +181,49 @@ def png_stream(stream):
         yield b"".join(parts)
 
 
+def _stop(proc, reader):
+    """Stop ffmpeg if it still runs, reap it, and let the log reader end."""
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+    reader.join(timeout=10)
+    proc.stdout.close()
+    proc.stderr.close()
+
+
+def _shown(times: queue.Queue, n: int, video: pathlib.Path):
+    """The (frame number, pts_time) showinfo logged for piped frame n."""
+    try:
+        item = times.get(timeout=SHOWINFO_WAIT)
+    except queue.Empty:
+        raise RuntimeError(
+            f"frame {n} of {video} was piped but ffmpeg logged no showinfo line for it "
+            f"within {SHOWINFO_WAIT:g} s"
+        ) from None
+    if item is _END:
+        raise RuntimeError(f"ffmpeg piped frame {n} of {video} but logged no time for it")
+    return item
+
+
+def _loop_failure(exc: BaseException, proc, reader, cmd, log):
+    """What to raise when the frame loop fails. When ffmpeg itself failed
+    (killed, or a non-zero exit) its status is the cause, and a cut stream
+    is only its symptom. Otherwise the loop's own error stands, with
+    ffmpeg's log attached. ffmpeg still running is stopped first: a
+    desynced stream leaves it blocked on the pipe."""
+    try:
+        rc = proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        rc = None
+    reader.join(timeout=10)
+    if rc:
+        return subprocess.CalledProcessError(rc, cmd, stderr="\n".join(log))
+    exc.add_note("ffmpeg's last log lines:\n" + "\n".join(log))
+    return exc
+
+
 def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
     """Every distinct frame of the first `seconds`: (time, png), in order.
 
@@ -188,59 +233,75 @@ def early_frames(video: pathlib.Path, seconds: float, out: pathlib.Path):
     a packet does not give one frame (packets before the first keyframe
     decode to nothing). ffmpeg counts the time from the start of the
     stream, as `-t` does. Frames are decoded only as far as the caller
-    reads: when it stops (a match), ffmpeg is stopped."""
+    reads: when it stops (a match), ffmpeg is stopped.
+
+    The showinfo frame number must equal the frame's index in the pipe;
+    if it does not, the times and the frames are out of step and this
+    raises. A failing ffmpeg raises CalledProcessError with its log."""
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob("f*.png"):
         old.unlink()
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info",
+        "-i", str(video), "-t", f"{seconds:.3f}", "-vf", "showinfo",
+        "-fps_mode", "passthrough", "-pix_fmt", "rgb24",
+        "-f", "image2pipe", "-c:v", "png", "-pred", "none", "-",
+    ]
     proc = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info",
-         "-i", str(video), "-t", f"{seconds:.3f}", "-vf", "showinfo",
-         "-fps_mode", "passthrough", "-pix_fmt", "rgb24",
-         "-f", "image2pipe", "-c:v", "png", "-pred", "none", "-"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     times = queue.Queue()
     log = collections.deque(maxlen=20)
 
     def read_log():
-        for line in proc.stderr:
-            m = SHOWINFO.search(line)
-            if m:
-                times.put(m.group(2).decode())
-            else:
-                log.append(line.decode(errors="replace").rstrip())
-        times.put(_END)
+        try:
+            for line in proc.stderr:
+                m = SHOWINFO.search(line)
+                if m:
+                    times.put((int(m.group(1)), m.group(2).decode()))
+                else:
+                    log.append(line.decode(errors="replace").rstrip())
+        finally:
+            times.put(_END)
 
     reader = threading.Thread(target=read_log, daemon=True)
     reader.start()
     try:
-        previous = None
-        for n, data in enumerate(png_stream(proc.stdout)):
-            # showinfo runs before the PNG encoder, so frame n's line is
-            # written before frame n reaches the pipe.
-            pts_time = times.get(timeout=60)
-            if pts_time is _END:
-                raise RuntimeError(f"ffmpeg piped frame {n} of {video} but logged no time for it")
-            try:
-                at = float(pts_time)
-            except ValueError:
-                raise RuntimeError(f"frame {n} of {video} has no timestamp ({pts_time})") from None
-            digest = zlib.crc32(data)
-            if digest == previous:
-                continue
-            previous = digest
-            png = out / f"f{n + 1:05d}.png"
-            png.write_bytes(data)
-            yield at, png
-        if proc.wait() != 0:
-            raise subprocess.CalledProcessError(proc.returncode, "ffmpeg", stderr="\n".join(log))
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait()
-        proc.stdout.close()
+        try:
+            previous = None
+            for n, data in enumerate(png_stream(proc.stdout)):
+                # showinfo runs before the PNG encoder, so frame n's line is
+                # written before frame n reaches the pipe.
+                shown_n, pts_time = _shown(times, n, video)
+                if shown_n != n:
+                    raise RuntimeError(
+                        f"frame {n} of {video} is out of step with showinfo: "
+                        f"ffmpeg logged frame {shown_n} for it"
+                    )
+                try:
+                    at = float(pts_time)
+                except ValueError:
+                    raise RuntimeError(f"frame {n} of {video} has no timestamp ({pts_time})") from None
+                digest = zlib.crc32(data)
+                if digest == previous:
+                    continue
+                previous = digest
+                png = out / f"f{n + 1:05d}.png"
+                png.write_bytes(data)
+                yield at, png
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            failure = _loop_failure(exc, proc, reader, cmd, log)
+            if failure is exc:
+                raise
+            raise failure from exc
+        rc = proc.wait()
         reader.join(timeout=10)
-        proc.stderr.close()
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd, stderr="\n".join(log))
+    finally:
+        _stop(proc, reader)
 
 
 def firmware_frame(video: pathlib.Path, out: pathlib.Path, seconds: float = FIRMWARE_WITHIN):
