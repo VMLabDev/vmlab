@@ -192,6 +192,7 @@ stage_zig() {
   else
     log "zig: fetching $ZIG_VERSION"
     tmp="$(mktemp -d)"
+    [ -n "$tmp" ] && [ -d "$tmp" ] || { echo "VML-88: tmp is empty or missing" >&2; exit 1; }
     fetch_pinned "$ZIG_URL" "$tmp/zig.tar.xz" "$ZIG_SHA256"
     [ -n "$ZIG_DIR" ] && [ "$ZIG_DIR" != / ] || { echo "VML-88: ZIG_DIR is empty or /" >&2; exit 1; }
     rm -rf "$ZIG_DIR"
@@ -212,6 +213,7 @@ stage_zig() {
   else
     log "zig: fetching rcodesign $RCODESIGN_VERSION"
     tmp="$(mktemp -d)"
+    [ -n "$tmp" ] && [ -d "$tmp" ] || { echo "VML-88: tmp is empty or missing" >&2; exit 1; }
     fetch_pinned "$RCODESIGN_URL" "$tmp/rcodesign.tar.gz" "$RCODESIGN_SHA256"
     tar -xzf "$tmp/rcodesign.tar.gz" -C "$tmp" --strip-components=1
     [ -n "$bin" ] && [ "$bin" != / ] || { echo "VML-88: bin is empty or /" >&2; exit 1; }
@@ -240,6 +242,7 @@ stage_uv() {
   local bin="${VMLAB_BIN_DIR:-$HOME/.local/bin}" tmp
   mkdir -p "$bin"
   tmp="$(mktemp -d)"
+  [ -n "$tmp" ] && [ -d "$tmp" ] || { echo "VML-88: tmp is empty or missing" >&2; exit 1; }
   fetch_pinned "$UV_URL" "$tmp/uv.tar.gz" "$UV_SHA256"
   tar -xzf "$tmp/uv.tar.gz" -C "$tmp" --strip-components=1
   install -m 0755 "$tmp/uv" "$bin/uv"

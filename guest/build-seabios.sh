@@ -17,6 +17,7 @@ if [[ ! -f "$archive" ]]; then
 fi
 echo "$SHA256  $archive" | sha256sum -c --quiet -
 work="$(mktemp -d "$CACHE/build.XXXXXX")"
+[ -n "$work" ] && [ -d "$work" ] || { echo "VML-88: work is empty or missing" >&2; exit 1; }
 # shellcheck disable=SC2064
 trap "rm -rf '$work'" EXIT
 tar -xzf "$archive" --strip-components=1 -C "$work"
