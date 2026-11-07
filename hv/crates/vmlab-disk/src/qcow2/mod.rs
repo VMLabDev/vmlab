@@ -1542,7 +1542,10 @@ mod tests {
         assert!(img.refblock_cache.dirty().is_empty());
         // Read through a second handle while `img` is alive, so its Drop
         // cannot write the tables for the retry.
-        assert_eq!(read_back(&img.path, 0, cluster * 2), vec![0x6b; cluster * 2]);
+        assert_eq!(
+            read_back(&img.path, 0, cluster * 2),
+            vec![0x6b; cluster * 2]
+        );
         let mut check = Qcow2Image::open(&img.path, true).unwrap();
         assert_eq!(check.get_refcount(0).unwrap(), 1, "header cluster");
         let (source, _) = check.read_extent(0, cluster).unwrap();
