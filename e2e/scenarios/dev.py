@@ -39,16 +39,23 @@ def halted(h, lab) -> str:
 
 def conflict(h, lab, name: str, tag: str) -> str:
     """Edit `name` on both sides inside one debounce window, so a pass sees
-    both changed since they last agreed. The guest keeps rewriting it for three
+    both changed since they last agreed. The guest keeps rewriting it for six
     seconds — a path still moving keeps waiting — and the host writes once in
-    the middle. Returns the halt report."""
+    the middle: after the guest shows the guest copy, not after a fixed second,
+    because on a loaded host `vmlab exec` can take longer than that to start
+    the writer, and a host write that lands first is simply carried (VML-105).
+    Returns the halt report."""
     for attempt in range(3):
         loop = h.background(
             ["vmlab", "exec", M, "--", "sh", "-c",
-             f"for i in $(seq 1 30); do echo guest-{tag} > /src/{name}; sleep 0.1; done"],
+             f"for i in $(seq 1 60); do echo guest-{tag} > /src/{name}; sleep 0.1; done"],
             cwd=lab,
         )
-        time.sleep(1)
+        try:
+            h.wait_until(lambda: f"guest-{tag}" in guest_cat(h, lab, name), timeout=15, interval=0.2,
+                         what=f"the guest to start writing {name}")
+        except ScenarioFailed:
+            pass  # The attempt below then finds no halt and tries again.
         (lab / "ws1" / name).write_text(f"host-{tag}\n")
         loop.wait(timeout=60)
         try:
