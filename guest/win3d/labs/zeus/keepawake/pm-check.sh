@@ -7,7 +7,8 @@
 #
 # Prints one line per phase: the samples, then the counts per state. Build
 # keepawake first (build.sh next to this script).
-set -euo pipefail
+# check-shell-paths: no-errexit wait on the killed keepawake returns 143 and the next phase must run (VML-88).
+set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 PCI=${1:-0000:01:00.0}
 N=${2:-40}

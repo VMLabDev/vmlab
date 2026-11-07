@@ -15,7 +15,8 @@
 # while it runs. Writes <evidence-dir>/apps/: per app the run summary and
 # module list, the last console capture, and apps.json. Whether an app
 # rendered is judged from the captures; see docs/acceptance.md.
-set -euo pipefail
+# check-shell-paths: no-errexit each app records a failed Run-Probe rc and the run goes on (VML-88).
+set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 LABDIR=$(cd "$1" && pwd)

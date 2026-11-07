@@ -16,7 +16,8 @@
 # and a console capture, and samples.json.
 # Exit status: 0 when every sample exited 0 by itself after the close,
 # loaded no app-local module and left a console capture; 1 otherwise.
-set -euo pipefail
+# check-shell-paths: no-errexit each sample records a failed Run-Probe rc and the run goes on (VML-88).
+set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 HERE=$REPO/tests/apps/d3d12
 SECS=30

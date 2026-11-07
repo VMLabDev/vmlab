@@ -28,7 +28,7 @@ while read -r kind name tag commit sha url; do
   fi
   srcdir[$name]="$work/src/$name"
   srctag[$name]="$tag"
-  [ -n "$srcdir" ] && [ "$srcdir" != / ] || { echo "VML-88: srcdir is empty or /" >&2; exit 1; }
+  [ -n "${srcdir[$name]}" ] && [ "${srcdir[$name]}" != / ] || { echo "VML-88: srcdir[$name] is empty or /" >&2; exit 1; }
   rm -rf "${srcdir[$name]}"
   mkdir -p "${srcdir[$name]}"
   tar -C "${srcdir[$name]}" --strip-components=1 -xzf "$file"

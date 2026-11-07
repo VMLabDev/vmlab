@@ -29,7 +29,8 @@
 # goes straight to the applications. --only runs the named runs (see
 # run_all in apps.sh). --lab-only stops after the install and keeps the lab.
 # The lab is destroyed at the end unless --keep or --lab-only.
-set -euo pipefail
+# check-shell-paths: no-errexit each app records a failed Run-Probe rc and the sweep goes on to destroy the lab (VML-88).
+set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 HERE=$REPO/tests/apps/compat
 HOST_GPU=Nvidia2
