@@ -201,9 +201,13 @@ async fn run_async() -> Result<()> {
     Ok(())
 }
 
-/// Release every lab daemon (each stops its own machines), then the GPUs
-/// held awake for them, and join the supervisor's background tasks.
+/// Stop every template operation (a build stops its own build VM), release
+/// every lab daemon (each stops its own machines), then the GPUs held awake
+/// for them, and join the supervisor's background tasks.
 async fn teardown(sup: &Arc<Supervisor>, tasks: &crate::lifecycle::TaskGroup) {
+    // Builds run in this process, and their VMs are its children: an exit
+    // with a build in flight leaves vmlab-hv/QEMU and swtpm running unowned.
+    templates::stop_all(&sup.template_ops, templates::STOP_DEADLINE).await;
     let names: Vec<String> = {
         let reg = sup.registry.lock().await;
         reg.labs().iter().map(|l| l.name.clone()).collect()

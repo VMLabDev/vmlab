@@ -181,6 +181,28 @@ impl TemplateOps {
         Ok(())
     }
 
+    /// Cancel every running operation, of any kind and lab. Returns how many
+    /// were running.
+    fn cancel_all(&self) -> usize {
+        let ops = self.inner.lock_recover();
+        for op in ops.values() {
+            op.cancel.cancel();
+        }
+        ops.len()
+    }
+
+    /// The synthetic lab of every running build.
+    fn build_labs(&self) -> Vec<String> {
+        self.inner
+            .lock_recover()
+            .iter()
+            .filter(|(_, op)| op.kind == "build")
+            .map(|((_, arch, template), _)| {
+                crate::template::build::build_lab_name(arch, template)
+            })
+            .collect()
+    }
+
     /// Every running operation, oldest first, for `template.status`.
     fn running(&self) -> Vec<crate::template::store_view::RunningOp> {
         let ops = self.inner.lock_recover();
@@ -495,6 +517,42 @@ pub fn status(ops: &TemplateOps) -> Value {
     json!(ops.running())
 }
 
+/// How long a supervisor shutdown waits for its cancelled template
+/// operations before it kills what their build VMs left running. A cancelled
+/// build forces its VM down at once, but one caught sealing finishes its
+/// graceful shutdown first.
+pub(super) const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Cancel every template operation and wait until each has ended: a
+/// cancelled build stops its build VM and the VM's helpers (swtpm) itself.
+/// Past `deadline`, SIGKILL every process still running for a build's
+/// synthetic lab, so the supervisor never exits leaving one behind.
+pub(super) async fn stop_all(ops: &TemplateOps, deadline: std::time::Duration) {
+    let running = ops.cancel_all();
+    if running == 0 {
+        return;
+    }
+    tracing::info!("stopping {running} template operation(s) before shutdown");
+    let started = std::time::Instant::now();
+    loop {
+        // Again each round: a build claimed while the first cancel ran.
+        if ops.cancel_all() == 0 {
+            return;
+        }
+        if started.elapsed() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    for lab in ops.build_labs() {
+        let killed = crate::qemu::process::kill_lab_orphans(&lab, None);
+        tracing::warn!(
+            "build in {lab} did not stop within {}s; killed {killed} process(es) it left running",
+            deadline.as_secs()
+        );
+    }
+}
+
 /// Stop the active build for one exact architecture/template pair.
 pub fn stop_build(
     sup: Arc<Supervisor>,
@@ -629,6 +687,109 @@ mod tests {
         ops.cancel("lab1", "x86_64", "base", "build").unwrap();
         assert!(x86.cancel_token().is_cancelled());
         assert!(!arm.cancel_token().is_cancelled());
+    }
+
+    /// `vmlab daemon stop` with a build in flight (VML-100): the shutdown
+    /// cancels every operation and returns only once each has ended, which
+    /// for a build is after it forced its VM down.
+    #[tokio::test]
+    async fn stop_all_cancels_every_operation_and_waits_for_it_to_end() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ops = TemplateOps::default();
+        let mut ended = Vec::new();
+        for (template, kind) in [("base", "build"), ("other", "push")] {
+            let guard = ops.try_begin("lab1", "x86_64", template, kind).unwrap();
+            let cancel = guard.cancel_token();
+            let done = Arc::new(AtomicBool::new(false));
+            ended.push(done.clone());
+            tokio::spawn(async move {
+                let _guard = guard;
+                cancel.cancelled().await;
+                // The build's own teardown: `down(force)` of its build VM.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                done.store(true, Ordering::SeqCst);
+            });
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stop_all(&ops, STOP_DEADLINE),
+        )
+        .await
+        .expect("returns as soon as the operations end, not at the deadline");
+        assert!(ended.iter().all(|d| d.load(Ordering::SeqCst)));
+        assert!(ops.running().is_empty());
+    }
+
+    /// A build that does not end by the deadline does not get to leave its
+    /// VM behind: the shutdown kills the vmlab-hv and swtpm of its synthetic
+    /// lab. The two are stand-ins (`sh` under those names, running a loop)
+    /// with the argv markers the orphan reaper knows them by.
+    #[tokio::test]
+    async fn stop_all_kills_what_a_stuck_build_left_running() {
+        use std::os::unix::process::ExitStatusExt;
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(scratch.path().join("socket"), "while :; do sleep 1; done\n").unwrap();
+        for name in ["vmlab-hv", "swtpm"] {
+            std::os::unix::fs::symlink("/bin/sh", scratch.path().join(name)).unwrap();
+        }
+        let template = format!("vml100-stuck-{}", std::process::id());
+        let vm_dir = crate::paths::lab_runtime_dir(&crate::template::build::build_lab_name(
+            "x86_64", &template,
+        ))
+        .join("vms")
+        .join("build");
+        let spawn = |exe: &str, args: Vec<String>| {
+            std::process::Command::new(scratch.path().join(exe))
+                .arg("socket")
+                .args(args)
+                .current_dir(scratch.path())
+                .spawn()
+                .unwrap()
+        };
+        let mut children = [
+            spawn(
+                "vmlab-hv",
+                vec![
+                    "--machine".into(),
+                    vm_dir.join("machine.json").display().to_string(),
+                ],
+            ),
+            spawn(
+                "swtpm",
+                vec![
+                    "--ctrl".into(),
+                    format!("type=unixio,path={}", vm_dir.join("swtpm.ctrl").display()),
+                ],
+            ),
+        ];
+
+        let ops = TemplateOps::default();
+        // Held for the whole test: the build never ends by itself.
+        let _stuck = ops.try_begin("lab1", "x86_64", &template, "build").unwrap();
+        stop_all(&ops, std::time::Duration::from_millis(200)).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut statuses = Vec::new();
+        for child in &mut children {
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            statuses.push(status);
+        }
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        for status in statuses {
+            let status = status.expect("the build's process is gone");
+            assert_eq!(status.signal(), Some(9), "{status:?}");
+        }
     }
 
     #[test]
