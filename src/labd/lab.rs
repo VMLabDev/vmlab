@@ -1982,9 +1982,26 @@ impl LabRuntime {
     /// provisioning — and provision every machine in parallel once it has
     /// started, each running its own steps in declaration order after the
     /// machines its `depends_on_provision` names have finished theirs.
+    ///
+    /// Returns without waiting on a machine nothing waits on (§7.2); see
+    /// [`up_with`](Self::up_with) for `vmlab up --wait`.
     pub async fn up(
         self: &Arc<Self>,
         subset: &[String],
+        output: crate::scripting::OutputSink,
+    ) -> Result<()> {
+        self.up_with(subset, false, output).await
+    }
+
+    /// [`up`](Self::up), and with `wait_ready` (`vmlab up --wait`, §7.2)
+    /// it also waits, before it calls the lab up, until every machine it
+    /// brought up is ready — each within its own ready timeout — so an
+    /// `exec` straight after it finds the agent answering. A machine that
+    /// cannot become ready in that time fails `up`.
+    pub async fn up_with(
+        self: &Arc<Self>,
+        subset: &[String],
+        wait_ready: bool,
         output: crate::scripting::OutputSink,
     ) -> Result<()> {
         // Decide the whole schedule before touching anything: which
@@ -2268,6 +2285,14 @@ impl LabRuntime {
             }
         }
 
+        // `--wait`: nothing above waited on a machine nothing depends on,
+        // so wait for each one here, all at once. A guest that can never
+        // answer (no agent channel, or a template that sealed no agent)
+        // is ready once it runs, so it does not hold this (§7.4).
+        if wait_ready {
+            self.wait_all_ready(&targets, &output).await?;
+        }
+
         for line in self.install_forwards(&targets).await {
             output(format!("{line}\n"));
         }
@@ -2282,6 +2307,40 @@ impl LabRuntime {
         report_share_mounts(mounts, MOUNT_REPORT_HOLD, &output).await;
 
         self.events.emit("lab.up", json!({"vms": targets}));
+        Ok(())
+    }
+
+    /// Wait, in parallel, until every machine in `targets` is ready, each
+    /// within its own [`ready_timeout`](Machine::ready_timeout). Says which
+    /// machines it waits for; fails naming every machine that did not
+    /// become ready.
+    async fn wait_all_ready(
+        &self,
+        targets: &[String],
+        output: &crate::scripting::OutputSink,
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        for name in targets {
+            let m = self.machine(name)?;
+            if !m.is_ready().await {
+                pending.push(m);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = pending.iter().map(|m| m.name()).collect();
+        output(format!("waiting for {} to be ready\n", names.join(", ")));
+        let results =
+            futures::future::join_all(pending.iter().map(|m| m.wait_ready(m.ready_timeout())))
+                .await;
+        let failed: Vec<String> = results
+            .into_iter()
+            .filter_map(|r| r.err().map(|e| format!("{e:#}")))
+            .collect();
+        if !failed.is_empty() {
+            bail!("--wait: {}", failed.join("; "));
+        }
         Ok(())
     }
 
@@ -4768,6 +4827,84 @@ lab "t" {
             !lab.deferred_refresh.lock_recover().contains_key("silent"),
             "the handshake claims it, once"
         );
+    }
+
+    /// A lab of one VM nothing waits on, whose agent answers `settle` after
+    /// it starts (VML-91: the alpine guest took 7-31 s).
+    fn lab_of_one_slow_vm(dir: &std::path::Path, settle: Duration) -> Arc<LabRuntime> {
+        let sh = shared(dir);
+        let mut m = Arc::into_inner(FakeMachine::new("t", MachineKind::Vm, &sh)).expect("sole");
+        m.settle = settle;
+        lab_of(
+            dir,
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "t" { template = "x86_64/t" }
+}"#,
+            vec![Arc::new(m)],
+        )
+    }
+
+    /// VML-91: plain `up` returns before a VM nothing waits on is ready
+    /// (§7.2), so an `exec` straight after it can find no agent. `up --wait`
+    /// returns only once that VM is ready, and says what it waits for.
+    #[tokio::test]
+    async fn up_wait_returns_only_once_every_machine_is_ready() {
+        let settle = Duration::from_millis(1500);
+
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of_one_slow_vm(dir.path(), settle);
+        lab.up(&[], quiet()).await.expect("up");
+        assert!(
+            !lab.machine("t").unwrap().is_ready().await,
+            "plain up returns before the agent answers"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of_one_slow_vm(dir.path(), settle);
+        let said = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink: crate::scripting::OutputSink = {
+            let said = said.clone();
+            Arc::new(move |s| said.lock().unwrap().push_str(&s))
+        };
+        tokio::time::timeout(Duration::from_secs(20), lab.up_with(&[], true, sink))
+            .await
+            .expect("up --wait returns within the settle time")
+            .expect("up --wait");
+        assert!(
+            lab.machine("t").unwrap().is_ready().await,
+            "up --wait returned before the agent answered"
+        );
+        assert!(
+            said.lock().unwrap().contains("waiting for t to be ready\n"),
+            "{:?}",
+            said.lock().unwrap()
+        );
+    }
+
+    /// `up --wait` fails, naming the machine, when a guest does not become
+    /// ready within its ready timeout.
+    #[tokio::test]
+    async fn up_wait_fails_naming_a_machine_that_is_never_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut m = Arc::into_inner(FakeMachine::never_ready("t", MachineKind::Vm, &sh))
+            .expect("sole");
+        m.ready_timeout = Duration::from_millis(300);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "t" { template = "x86_64/t" }
+}"#,
+            vec![Arc::new(m)],
+        );
+        let err = tokio::time::timeout(Duration::from_secs(10), lab.up_with(&[], true, quiet()))
+            .await
+            .expect("the wait is bounded by the ready timeout")
+            .expect_err("up --wait fails");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--wait: t: not ready after"), "{msg}");
     }
 
     /// `up` refreshes the agent of a machine it waits on itself, inline, so

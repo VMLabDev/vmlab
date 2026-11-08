@@ -67,7 +67,7 @@ the code is the contract.
 | `version` | — | `cli` | This daemon's build (`vmlab::version::BUILD`): what the CLI compares with its own before it drives the daemon, since one build cannot drive another's. |
 | `status` | — | `cli` | The whole lab's runtime status: machines, segments, readiness. |
 | `dns.table` | — | `cli` | The DNS zones the lab's segments serve. |
-| `up` | `machines: Vec<String>`, `record: Vec<RecordRequest>` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
+| `up` | `machines: Vec<String>`, `record: Vec<RecordRequest>`, `wait: bool` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
 | `pull` | `machines: Vec<String>` | `cli` | Download every pending template and image without starting anything, over the code path `up` runs first. |
 | `lab.reload` | — | `cli` | Read the lab file afresh and apply it machine by machine (PRD §7.1): rebuild what is stopped, leave what runs pending, add and drop, reinstall forwards and swap handlers. A network change refuses the whole reload. Answers with what each machine did. |
 | `pull.cancel` | `machine: String` | `cli` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
