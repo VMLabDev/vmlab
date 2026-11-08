@@ -6,12 +6,40 @@ verb here names its machine — which is itself the ladder's first rung.
 """
 
 import os
+import pathlib
 import subprocess
 import time
 
 from harness import ScenarioFailed
 
 M = "dev01"
+LABD_LOG = pathlib.Path.home() / ".local" / "state" / "vmlab" / "labd-e2e-dev.log"
+# What labd logs when it gives up on a guest agent connection (src/labd/machine.rs).
+AGENT_LOST = ("the cached connection does not answer; reconnecting", "agent: handshake failed")
+# What a capture refusal says when the guest's watch did not answer the flush (VML-110).
+WATCH_SILENT = "watch did not answer"
+
+
+def labd_log_size() -> int:
+    try:
+        return LABD_LOG.stat().st_size
+    except OSError:
+        return 0
+
+
+def agent_replaced(since: int) -> str:
+    """The first labd log line after byte `since` that says dev01's agent
+    connection was given up on, or "" when there is none."""
+    try:
+        with open(LABD_LOG, "rb") as f:
+            f.seek(since)
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return ""
+    for line in tail.splitlines():
+        if M in line and any(lost in line for lost in AGENT_LOST):
+            return line.strip()[-300:]
+    return ""
 
 
 def gx(h, lab, script: str, **kw):
@@ -180,12 +208,20 @@ def run(h):
         # rightly lets the capture through. That is an agent outage, not a
         # bracket failure, so the attempt is dropped and retried (three at most),
         # and every outage is printed as a WARN line and kept in the result.
+        #
+        # The WARN tells two causes apart (VML-110): "agent went away" only when
+        # labd gave up on dev01's agent connection during the attempt (its log
+        # says so) or `vmlab exec dev01 -- true` fails after it. Otherwise the
+        # guest was only slow: its watch did not answer the flush in time, and
+        # the capture refuses on that by name.
         busy_detail = "capture refused while the guest was still writing busy.txt, naming it"
         busy_outages: list[str] = []
 
         def busy_attempt(name: str):
             """One capture against a running writer: the capture's result (None
-            when it never ran) and why the attempt does not count ("" when it does)."""
+            when it never ran), why the attempt does not count ("" when it does),
+            and the labd log offset where the attempt began."""
+            since = labd_log_size()
             gx(h, lab, "rm -f /tmp/busy-stop", check=False)
             loop = h.background(
                 ["vmlab", "exec", M, "--", "sh", "-c",
@@ -197,7 +233,7 @@ def run(h):
                     h.wait_until(lambda: guest_cat(h, lab, "busy.txt").strip(), timeout=30, interval=0.2,
                                  what="the guest to start writing busy.txt")
                 except ScenarioFailed:
-                    return None, "the guest did not show busy.txt within 30 s of starting the writer"
+                    return None, "the guest did not show busy.txt within 30 s of starting the writer", since
                 started = time.monotonic()
                 r = h.vmlab("snapshot", "create", name, "--vm", M, cwd=lab, check=False)
                 took = time.monotonic() - started
@@ -210,11 +246,20 @@ def run(h):
                     loop.kill()
                     loop.wait()
             if alive:
-                return r, ""
-            return r, f"the guest writer ended during the {took:.0f} s capture (exit {loop.returncode})"
+                return r, "", since
+            return r, f"the guest writer ended during the {took:.0f} s capture (exit {loop.returncode})", since
 
-        def busy_warn(attempt: int, why: str) -> None:
-            said = f"WARN dev.snapshot-bracket attempt {attempt}: dev01's agent went away ({why}); see VML-106"
+        def busy_kind(since: int) -> str:
+            """Which outage an attempt had: a lost agent, or a slow guest."""
+            replaced = agent_replaced(since)
+            if replaced:
+                return f"dev01's agent went away (labd: {replaced}); see VML-106"
+            if gx(h, lab, "true", check=False).code != 0:
+                return "dev01's agent went away (`vmlab exec dev01 -- true` failed); see VML-106"
+            return "guest slow (watch not answering); see VML-110"
+
+        def busy_warn(attempt: int, kind: str, why: str) -> None:
+            said = f"WARN dev.snapshot-bracket attempt {attempt}: {kind}: {why}"
             print(f"   {said}", flush=True)
             h.log.write(f"\n[dev] {said}\n")
             busy_outages.append(said)
@@ -222,10 +267,14 @@ def run(h):
         def refuse_busy():
             for attempt in range(1, 4):
                 name = "busy" if attempt == 1 else f"busy-{attempt}"
-                r, outage = busy_attempt(name)
+                r, outage, since = busy_attempt(name)
                 refused = r is not None and r.code != 0
+                silent = refused and WATCH_SILENT in r.text
                 if outage:
-                    busy_warn(attempt, outage)
+                    busy_warn(attempt, busy_kind(since), outage)
+                elif silent:
+                    busy_warn(attempt, "guest slow (watch not answering); see VML-110",
+                              "the capture was refused because the guest's watch did not answer the flush")
                 if outage and not refused:
                     if r is not None:
                         h.vmlab("snapshot", "delete", M, name, cwd=lab, check=False)
@@ -234,10 +283,12 @@ def run(h):
                     h.wait_until(lambda: in_step(h, lab), timeout=120, what="busy.txt to settle before a retry")
                     continue
                 said = f"{r.text} {busy_outages}" if busy_outages else r.text
-                assert refused and "busy.txt" in r.text and "no flag" in r.text, said
+                # A slow guest is refused on its silent watch, which can come
+                # before its report of busy.txt: either reason is a refusal.
+                assert refused and ("busy.txt" in r.text or silent) and "no flag" in r.text, said
                 assert "not a workspace backup" in r.text, said
                 return True
-            raise ScenarioFailed("three capture attempts each lost dev01's agent: " + "; ".join(busy_outages))
+            raise ScenarioFailed("three capture attempts each had an outage: " + "; ".join(busy_outages))
 
         if h.check("dev.snapshot-bracket", refuse_busy, busy_detail) and busy_outages:
             h.ok("dev.snapshot-bracket", True, busy_detail + "; " + "; ".join(busy_outages))

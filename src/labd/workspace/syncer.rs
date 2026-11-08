@@ -267,6 +267,14 @@ pub struct Report {
     /// projection too, because "how far behind is my workspace" is a question
     /// `dev sync status` should not have to be halted to answer.
     pub unsynced: Vec<String>,
+    /// The guest's watch did not answer the drain a verb's pass asked for
+    /// within [`SETTLE`], so guest writes it has not reported yet are not in
+    /// [`unsynced`](Report::unsynced) and the host cannot know about them.
+    ///
+    /// Set only by a pass a verb asked for, and cleared by the next pass. A
+    /// **snapshot capture** refuses on it (VML-110): a very slow guest would
+    /// otherwise pass the bracket with its latest writes left out.
+    pub unanswered: Option<String>,
     /// The last pass or an individual apply failed. Failed paths remain
     /// pending and retry even if neither watcher reports another change.
     pub trouble: Option<String>,
@@ -346,12 +354,16 @@ pub struct Syncer {
     /// one happened to be running.
     requested: AtomicU64,
     served: watch::Sender<u64>,
+    /// How long a verb's pass waits for the guest's watch to answer: [`SETTLE`],
+    /// shorter only in tests.
+    settle: Duration,
 }
 
 impl Syncer {
-    fn new(workspace: Workspace) -> Syncer {
+    fn new(workspace: Workspace, settle: Duration) -> Syncer {
         Syncer {
             workspace,
+            settle,
             report: std::sync::Mutex::new(Report::default()),
             resolved: std::sync::Mutex::new(BTreeMap::new()),
             wake: Notify::new(),
@@ -444,6 +456,10 @@ impl Syncer {
 #[derive(Default)]
 pub struct WorkspaceSyncers {
     running: Mutex<HashMap<String, Running>>,
+    /// The settle bound of every syncer started here, `None` for [`SETTLE`].
+    /// Set only by tests, so a guest watch that never answers costs a test a
+    /// fraction of a second rather than the real bound twice.
+    settle: Option<Duration>,
 }
 
 struct Running {
@@ -484,7 +500,7 @@ impl WorkspaceSyncers {
         self.stop(&workspace.machine).await;
         let (stop, halted) = watch::channel(false);
         let machine = workspace.machine.clone();
-        let syncer = Arc::new(Syncer::new(workspace));
+        let syncer = Arc::new(Syncer::new(workspace, self.settle.unwrap_or(SETTLE)));
         let task = tokio::spawn(run(
             syncer.clone(),
             sessions.clone(),
@@ -978,14 +994,22 @@ async fn run(
             // alone since is carried, and a path still being written stays in
             // flight — which is what a snapshot capture must refuse on, and
             // what the debounce exists to keep from being read torn.
+            //
+            // A guest whose watch does not answer within the bound is asked
+            // once more, and if the last ask is still unanswered the pass says
+            // so ([`Report::unanswered`]): its unreported writes are unknown,
+            // and a capture must refuse rather than leave them out.
+            let mut unanswered = None;
             if serving > *syncer.served.borrow() {
+                let mut answered = true;
                 for round in 0..2 {
                     if round == 1 {
-                        if host_debounce.is_empty() && guest_debounce.is_empty() {
+                        if answered && host_debounce.is_empty() && guest_debounce.is_empty() {
                             break;
                         }
                         tokio::time::sleep(QUIET).await;
                     }
+                    answered = true;
                     let now = Instant::now();
                     for event in host_watch.settle() {
                         match event {
@@ -993,20 +1017,36 @@ async fn run(
                             HostEvent::Rescan => rescan = true,
                         }
                     }
-                    if let Some(watch) = guest_watch.as_deref_mut()
-                        && let Err(e) =
-                            settle_guest(watch, &mut draining, &mut guest_debounce, &mut rescan)
-                                .await
-                    {
-                        drop_watch(
-                            &mut guest_watch,
+                    if let Some(watch) = guest_watch.as_deref_mut() {
+                        match settle_guest(
+                            watch,
+                            &mut draining,
+                            &mut guest_debounce,
                             &mut rescan,
-                            &events,
-                            &workspace,
-                            &syncer,
-                            e,
-                        );
+                            syncer.settle,
+                        )
+                        .await
+                        {
+                            Ok(said) => answered = said,
+                            // A dropped watch means a walk, which answers
+                            // what the guest did without asking the watch.
+                            Err(e) => drop_watch(
+                                &mut guest_watch,
+                                &mut rescan,
+                                &events,
+                                &workspace,
+                                &syncer,
+                                e,
+                            ),
+                        }
                     }
+                }
+                if !answered {
+                    unanswered = Some(format!(
+                        "The guest's watch did not answer within {} s, so writes the guest has \
+                         not reported yet are unknown to the host and would be missing from it",
+                        syncer.settle.as_secs_f64(),
+                    ));
                 }
                 let now = Instant::now();
                 host_dirty.extend(host_debounce.settled(now));
@@ -1077,6 +1117,7 @@ async fn run(
                         rescans,
                         passes,
                         unsynced: unsynced.into_iter().collect(),
+                        unanswered,
                         ..done.report
                     });
                     let _ = syncer.served.send(serving);
@@ -1296,14 +1337,17 @@ fn drop_watch(
 /// Every drain already on the wire is answered first, in order, and a nudge
 /// that arrives meanwhile is answered with a drain of its own rather than
 /// swallowed — the agent sends one per window, and a lost one would leave
-/// its set undrained. Bounded: a guest slow to answer costs the verb the
-/// writes it has not reported yet, never the verb itself.
+/// its set undrained. Bounded by `bound` ([`SETTLE`]): a guest slow to answer
+/// never holds the verb. It returns `false` when the bound ran out with drains
+/// still unanswered, so the caller can say that the guest's unreported writes
+/// are unknown (a capture refuses on that) rather than pass over them.
 async fn settle_guest(
     watch: &mut dyn GuestWatch,
     draining: &mut u32,
     debounce: &mut Debounce,
     rescan: &mut bool,
-) -> Result<()> {
+    bound: Duration,
+) -> Result<bool> {
     watch.drain().await?;
     *draining += 1;
     let answered = async {
@@ -1330,9 +1374,10 @@ async fn settle_guest(
         }
         Ok(())
     };
-    tokio::time::timeout(SETTLE, answered)
-        .await
-        .unwrap_or(Ok(()))
+    match tokio::time::timeout(bound, answered).await {
+        Ok(done) => done.map(|()| true),
+        Err(_) => Ok(false),
+    }
 }
 
 /// The next thing the guest's watch says, or nothing at all while there is no
@@ -2823,6 +2868,55 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    /// VML-110: a guest whose watch does not answer the pre-flight flush
+    /// within the bound (a very slow guest) refuses the capture and says why,
+    /// rather than capturing a tree with the guest's unreported writes left
+    /// out. Once the guest catches up, the capture goes through with the write
+    /// carried.
+    #[tokio::test]
+    async fn a_capture_refuses_while_the_guest_watch_does_not_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "seed").unwrap();
+        let settle = Duration::from_millis(300);
+        let (syncers, guest, sessions) =
+            seeded_lab_settling(dir.path(), state.path(), "/src/main.rs", Some(settle)).await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        syncers.before_capture("dev01", None).await.unwrap();
+
+        sessions.watcher.mute();
+        guest.file("/src/late.txt", "written in the guest", 42);
+        sessions.watcher.mark("late.txt");
+        let started = Instant::now();
+        let refused = syncers
+            .before_capture("dev01", None)
+            .await
+            .expect_err("a capture must refuse while the guest's watch does not answer");
+        let said = format!("{refused:#}");
+        assert!(said.contains("watch did not answer within 0.3 s"), "{said}");
+        assert!(said.contains("no flag for this"), "{said}");
+        // Two bounded asks and one quiet period, never the verb timeout.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!dir.path().join("late.txt").exists());
+        assert!(syncer.report().unanswered.is_some());
+
+        sessions.watcher.unmute();
+        assert!(
+            eventually(|| std::fs::read_to_string(dir.path().join("late.txt")).ok().as_deref()
+                == Some("written in the guest"))
+            .await,
+            "the late answer was not carried"
+        );
+        syncers.before_capture("dev01", None).await.unwrap();
+        assert!(syncer.report().unanswered.is_none());
+        syncers.stop("dev01").await;
+    }
+
     #[tokio::test]
     async fn watcher_events_detect_edits_with_unchanged_size_and_mtime() {
         let dir = tempfile::tempdir().unwrap();
@@ -3485,9 +3579,23 @@ mod tests {
         state: &std::path::Path,
         landed: &str,
     ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>) {
+        seeded_lab_settling(dir, state, landed, None).await
+    }
+
+    /// [`seeded_lab`] with the syncer's settle bound set, so a test of a guest
+    /// watch that never answers does not wait out the real [`SETTLE`] twice.
+    async fn seeded_lab_settling(
+        dir: &std::path::Path,
+        state: &std::path::Path,
+        landed: &str,
+        settle: Option<Duration>,
+    ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>) {
         let guest = Arc::new(FakeGuest::new());
         let (events, _rx) = EventLog::recording("lab", state.join("events.jsonl"));
-        let syncers = WorkspaceSyncers::default();
+        let syncers = WorkspaceSyncers {
+            settle,
+            ..WorkspaceSyncers::default()
+        };
         let sessions = OneFake::new(guest.clone());
         syncers
             .start(workspace(dir, state), sessions.clone(), events)
