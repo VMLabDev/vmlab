@@ -2491,7 +2491,10 @@ mod tests {
         let known = merge_known_versions(Some(s(&["3.23.4.7"])), None);
         assert_eq!(next_subbuild("3.23.4", &known), "3.23.4.8");
 
-        assert_eq!(next_subbuild("3.23.4", &merge_known_versions(None, None)), "3.23.4.0");
+        assert_eq!(
+            next_subbuild("3.23.4", &merge_known_versions(None, None)),
+            "3.23.4.0"
+        );
     }
 
     fn def(source: &str) -> crate::config::model::TemplateDef {
