@@ -117,23 +117,30 @@ impl TableCache {
         self.order.retain(|k| *k != key);
     }
 
-    fn take_dirty(&mut self) -> Vec<(u64, Vec<u8>)> {
-        let keys: Vec<u64> = self
-            .map
+    /// Copies of the dirty entries. They stay dirty: the caller marks each
+    /// one clean with [`TableCache::mark_clean`] only after its write
+    /// succeeded, so a failed write leaves it for the next flush (VML-108).
+    fn dirty(&self) -> Vec<(u64, Vec<u8>)> {
+        self.map
             .iter()
             .filter(|(_, (_, dirty))| *dirty)
-            .map(|(k, _)| *k)
-            .collect();
-        let mut out = Vec::new();
-        for k in keys {
-            if let Some((buf, dirty)) = self.map.get_mut(&k)
-                && *dirty
-            {
-                out.push((k, buf.clone()));
-                *dirty = false;
-            }
+            .map(|(k, (buf, _))| (*k, buf.clone()))
+            .collect()
+    }
+
+    fn mark_clean(&mut self, key: u64) {
+        if let Some(entry) = self.map.get_mut(&key) {
+            entry.1 = false;
         }
-        out
+    }
+
+    /// Put back evicted dirty entries whose write failed. This can take
+    /// the cache over its capacity until the next `put` evicts again.
+    fn restore_dirty(&mut self, entries: impl IntoIterator<Item = (u64, Vec<u8>)>) {
+        for (key, data) in entries {
+            self.touch(key);
+            self.map.insert(key, (data, true));
+        }
     }
 }
 
@@ -513,8 +520,14 @@ impl Qcow2Image {
         }
         let mut buf = vec![0u8; self.cluster_size as usize];
         self.read_file(host_offset, &mut buf)?;
-        for (host, table) in self.l2_cache.put(host_offset, buf, false) {
-            self.write_file(host, &table)?;
+        let mut evicted = self.l2_cache.put(host_offset, buf, false).into_iter();
+        while let Some((host, table)) = evicted.next() {
+            if let Err(e) = self.write_file(host, &table) {
+                // Keep the failed table and the unwritten rest dirty.
+                self.l2_cache
+                    .restore_dirty(std::iter::once((host, table)).chain(evicted));
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -823,9 +836,12 @@ impl Qcow2Image {
         self.check_writable()?;
         // Refblocks first (their location comes from the refcount table),
         // then the refcount table, the L1, the L2s and the header.
-        for (index, block) in self.refblock_cache.take_dirty() {
+        // Each table is marked clean only after its write succeeded, so a
+        // failed flush can be retried.
+        for (index, block) in self.refblock_cache.dirty() {
             let host = self.refblock_host(index)?;
             self.write_file(host, &block)?;
+            self.refblock_cache.mark_clean(index);
         }
         if self.refcount_table_dirty {
             let bytes: Vec<u8> = self
@@ -841,8 +857,9 @@ impl Qcow2Image {
             self.write_file(self.l1_table_offset, &bytes)?;
             self.l1_dirty = false;
         }
-        for (host, table) in self.l2_cache.take_dirty() {
+        for (host, table) in self.l2_cache.dirty() {
             self.write_file(host, &table)?;
+            self.l2_cache.mark_clean(host);
         }
         if self.header_dirty {
             self.patch_header_fields();
@@ -1479,6 +1496,94 @@ mod tests {
             len_after <= len_freed + img_cluster_size(&path),
             "reopen did not reuse freed holes: {len_freed} -> {len_after}"
         );
+    }
+
+    /// Make every later write of `img` fail (EBADF) by swapping in a
+    /// read-only handle, as a full or failing host disk would.
+    fn fail_writes(img: &mut Qcow2Image) {
+        img.file = File::open(&img.path).expect("open read-only handle");
+    }
+
+    fn allow_writes(img: &mut Qcow2Image) {
+        img.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img.path)
+            .expect("open read-write handle");
+    }
+
+    fn read_back(path: &Path, offset: u64, len: usize) -> Vec<u8> {
+        let mut reopened = Qcow2Image::open(path, true).expect("reopen read-only");
+        let mut buf = vec![0u8; len];
+        reopened.read_at(offset, &mut buf).expect("read back");
+        buf
+    }
+
+    #[test]
+    fn failed_metadata_flush_keeps_tables_dirty_for_a_retry() {
+        let (_dir, mut img) = testsupport::blank(8 * 1024 * 1024);
+        let cluster = img.cluster_size as usize;
+        // New clusters: the data goes to the file now, the L2 entry and the
+        // refcounts wait in the caches.
+        img.write_at(0, &vec![0x6b; cluster * 2]).unwrap();
+        assert!(!img.l2_cache.dirty().is_empty());
+        assert!(!img.refblock_cache.dirty().is_empty());
+
+        fail_writes(&mut img);
+        assert!(img.flush().is_err(), "flush must fail without writes");
+        assert!(
+            !img.l2_cache.dirty().is_empty() && !img.refblock_cache.dirty().is_empty(),
+            "a failed flush marked the unwritten tables clean"
+        );
+
+        allow_writes(&mut img);
+        img.flush().expect("retried flush");
+        assert!(img.l2_cache.dirty().is_empty());
+        assert!(img.refblock_cache.dirty().is_empty());
+        // Read through a second handle while `img` is alive, so its Drop
+        // cannot write the tables for the retry.
+        assert_eq!(
+            read_back(&img.path, 0, cluster * 2),
+            vec![0x6b; cluster * 2]
+        );
+        let mut check = Qcow2Image::open(&img.path, true).unwrap();
+        assert_eq!(check.get_refcount(0).unwrap(), 1, "header cluster");
+        let (source, _) = check.read_extent(0, cluster).unwrap();
+        let ReadSource::File(host) = source else {
+            panic!("guest cluster 0 is not mapped after the retry");
+        };
+        assert_eq!(check.get_refcount(host / img.cluster_size).unwrap(), 1);
+    }
+
+    #[test]
+    fn failed_eviction_write_keeps_the_evicted_table_dirty() {
+        // Two L2 tables: with 64 KiB clusters one table maps 512 MiB.
+        let (_dir, mut img) = testsupport::blank(1024 * 1024 * 1024);
+        let cluster = img.cluster_size as usize;
+        let far = 600 * 1024 * 1024;
+        img.write_at(0, &vec![0x11; cluster]).unwrap();
+        img.write_at(far, &vec![0x22; cluster]).unwrap();
+        img.flush().unwrap();
+
+        // One L2 table fits. Map a new cluster in the first table, so it is
+        // dirty, then load the second one with writes failing: the dirty
+        // table is evicted and its write fails.
+        // Every table is clean after the flush, so a new cache loses nothing.
+        img.l2_cache = TableCache::new(1);
+        let second = 4 * cluster as u64;
+        img.write_at(second, &vec![0x33; cluster]).unwrap();
+        fail_writes(&mut img);
+        let mut buf = vec![0u8; cluster];
+        assert!(
+            img.read_at(far, &mut buf).is_err(),
+            "the evicted table's write must fail"
+        );
+
+        allow_writes(&mut img);
+        img.flush().expect("retried flush");
+        assert!(img.l2_cache.dirty().is_empty());
+        assert_eq!(read_back(&img.path, second, cluster), vec![0x33; cluster]);
+        assert_eq!(read_back(&img.path, far, cluster), vec![0x22; cluster]);
     }
 
     fn img_cluster_size(path: &Path) -> u64 {
