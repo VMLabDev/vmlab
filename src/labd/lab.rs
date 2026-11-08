@@ -4888,8 +4888,8 @@ lab "t" {
     async fn up_wait_fails_naming_a_machine_that_is_never_ready() {
         let dir = tempfile::tempdir().unwrap();
         let sh = shared(dir.path());
-        let mut m = Arc::into_inner(FakeMachine::never_ready("t", MachineKind::Vm, &sh))
-            .expect("sole");
+        let mut m =
+            Arc::into_inner(FakeMachine::never_ready("t", MachineKind::Vm, &sh)).expect("sole");
         m.ready_timeout = Duration::from_millis(300);
         let lab = lab_of(
             dir.path(),
