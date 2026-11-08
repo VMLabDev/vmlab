@@ -38,32 +38,36 @@ def halted(h, lab) -> str:
 
 
 def conflict(h, lab, name: str, tag: str) -> str:
-    """Edit `name` on both sides inside one debounce window, so a pass sees
-    both changed since they last agreed. The guest keeps rewriting it for six
-    seconds — a path still moving keeps waiting — and the host writes once in
-    the middle: after the guest shows the guest copy, not after a fixed second,
-    because on a loaded host `vmlab exec` can take longer than that to start
-    the writer, and a host write that lands first is simply carried (VML-105).
-    Returns the halt report."""
-    for attempt in range(3):
-        loop = h.background(
-            ["vmlab", "exec", M, "--", "sh", "-c",
-             f"for i in $(seq 1 60); do echo guest-{tag} > /src/{name}; sleep 0.1; done"],
-            cwd=lab,
-        )
-        try:
-            h.wait_until(lambda: f"guest-{tag}" in guest_cat(h, lab, name), timeout=15, interval=0.2,
-                         what=f"the guest to start writing {name}")
-        except ScenarioFailed:
-            pass  # The attempt below then finds no halt and tries again.
+    """Keep the guest path inside debounce until the host edit has landed.
+
+    Do not sleep between writes: a scheduled 0.1 s sleep can exceed the
+    syncer's quiet period on a loaded host. The stop file is outside /src so
+    only the test, not the syncer, can release the writer. The deadline is a
+    safety bound, not the signal to make the path quiet.
+    """
+    stop = f"/tmp/conflict-{tag}-stop"
+    gx(h, lab, f"set -eu; rm -f {stop}")
+    loop = h.background(
+        ["vmlab", "exec", M, "--", "sh", "-c",
+         (f"set -eu; end=$(($(date +%s) + 120)); "
+          f"while [ ! -e {stop} ] && [ $(date +%s) -lt $end ]; do "
+          f"echo guest-{tag} > /src/{name}; done")],
+        cwd=lab,
+    )
+    try:
+        h.wait_until(lambda: f"guest-{tag}" in guest_cat(h, lab, name), timeout=30, interval=0.2,
+                     what=f"the guest to start writing {name}")
         (lab / "ws1" / name).write_text(f"host-{tag}\n")
-        loop.wait(timeout=60)
+        assert loop.poll() is None, f"guest writer ended before the host edit of {name}"
+    finally:
+        gx(h, lab, f"set -eu; touch {stop}", check=False)
         try:
-            return h.wait_until(lambda: halted(h, lab), timeout=15, what=f"a halt on {name}")
-        except ScenarioFailed:
-            # The race went one way and the sides agreed; try again.
-            h.wait_until(lambda: in_step(h, lab), timeout=30, what="the workspace to settle")
-    raise ScenarioFailed(f"three attempts at a both-sides edit of {name} never halted the workspace")
+            loop.wait(timeout=150)
+        except subprocess.TimeoutExpired:
+            loop.kill()
+            loop.wait()
+    assert loop.returncode == 0, f"guest writer failed for {name}: exit {loop.returncode}"
+    return h.wait_until(lambda: halted(h, lab), timeout=30, what=f"a halt on {name}")
 
 
 def run(h):
