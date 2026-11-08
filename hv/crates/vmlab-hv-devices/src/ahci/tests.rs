@@ -321,6 +321,41 @@ fn msi_reports_a_second_port_while_the_first_port_is_pending() {
     assert_eq!(d.irq.messages.lock().unwrap().len(), 2);
 }
 
+/// The Windows storahci interrupt order with MSI: clear PxIS, issue the next
+/// command (vmlab-hv completes it at once), then acknowledge IS. The second
+/// completion is still pending in PxIS when IS is acknowledged, so it must
+/// raise a new MSI. Without it, every CD-ROM read after the first waited for
+/// the driver's timeout, and Windows Setup stalled applying install.wim.
+#[test]
+fn msi_signals_a_completion_that_lands_before_the_is_acknowledgement() {
+    let mut d = Driver::cdrom();
+    d.hba.config_write(32, 2, &[0x81]);
+    let messages = |d: &Driver| d.irq.messages.lock().unwrap().len();
+    let tur = |d: &mut Driver| {
+        let mut packet = [0; 16];
+        packet[0] = 0; // TEST UNIT READY
+        d.prepare(0xa0, 0x20, 0, 0, Some(packet), &[]);
+        assert_eq!(d.issue(0), 0x50);
+    };
+    tur(&mut d);
+    assert_eq!(messages(&d), 1);
+    let base = port_base(0);
+    // The handler clears PxIS, then the next request goes out before IS is
+    // acknowledged.
+    d.write(base + 0x10, u32::MAX);
+    tur(&mut d);
+    assert_eq!(messages(&d), 1, "IS is still set: no edge yet");
+    assert_ne!(d.read(base + 0x10) & DHRS, 0);
+    d.write(8, 1);
+    assert_eq!(messages(&d), 2, "the pending completion is signalled");
+    assert_eq!(d.read(8), 1);
+    // A clean acknowledgement sends nothing more.
+    d.write(base + 0x10, u32::MAX);
+    d.write(8, 1);
+    assert_eq!(messages(&d), 2);
+    assert_eq!(d.read(8), 0);
+}
+
 #[test]
 fn pci_identity_capabilities_and_bar_probes() {
     let mut d = Driver::new();
