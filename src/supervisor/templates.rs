@@ -197,9 +197,7 @@ impl TemplateOps {
             .lock_recover()
             .iter()
             .filter(|(_, op)| op.kind == "build")
-            .map(|((_, arch, template), _)| {
-                crate::template::build::build_lab_name(arch, template)
-            })
+            .map(|((_, arch, template), _)| crate::template::build::build_lab_name(arch, template))
             .collect()
     }
 
