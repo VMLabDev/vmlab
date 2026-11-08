@@ -745,44 +745,49 @@ fn bridge_playbook_events(
 /// prefix (the upstream/OS identity); vmlab appends a trailing build counter,
 /// `<declared>.<N>`, where N is the highest existing `<declared>.<N>` plus one,
 /// or 0 if none exist yet. Existing builds come from the template's registry
-/// tags when it has a `registry` (falling back to the local store), so the
-/// counter continues across machines. Changing the declared prefix (e.g. a new
-/// Windows build number) restarts the counter at `.0`.
+/// tags when it has a `registry`, and from the local store, so the counter
+/// continues across machines and never lands on a version that was built here
+/// and not pushed. The counter is above the highest of both. Changing the
+/// declared prefix (e.g. a new Windows build number) restarts the counter at `.0`.
 async fn next_version(
     def: &TemplateDef,
     store: &TemplateStore,
     log: &OutputSink,
 ) -> Result<String> {
-    let mut existing: Vec<String> = Vec::new();
-    let mut source = "fresh";
-
-    let mut from_registry = false;
+    let mut registry: Option<Vec<String>> = None;
     if let Some(repo) = &def.registry {
         match list_registry_versions(repo).await {
-            Ok(tags) => {
-                from_registry = true;
-                existing = tags;
-                source = "registry";
-            }
+            Ok(tags) => registry = Some(tags),
             Err(e) => log(format!(
                 "warning: could not read registry tags from {repo} ({e:#}); \
-                 falling back to the local store\n"
+                 using the local store only\n"
             )),
         }
     }
+    let local = store.versions_of(&def.arch, &def.name).ok();
 
-    // Fall back to the local store only when the registry wasn't consulted.
-    if !from_registry && let Ok(local) = store.versions_of(&def.arch, &def.name) {
-        existing = local;
-        source = "local store";
-    }
-
+    let source = match (registry.is_some(), local.is_some()) {
+        (true, true) => "registry + local store",
+        (true, false) => "registry",
+        (false, true) => "local store",
+        (false, false) => "fresh",
+    };
+    let existing = merge_known_versions(registry, local);
     let next = super::store::next_subbuild(&def.version, &existing);
     log(format!(
         "auto-version: {next} (prefix {}, {source})\n",
         def.version
     ));
     Ok(next)
+}
+
+/// The build versions known from the registry and from the local store, as one
+/// list. A source that could not be read (`None`) adds nothing. A version in
+/// both lists is listed twice, which does not change the highest counter.
+fn merge_known_versions(registry: Option<Vec<String>>, local: Option<Vec<String>>) -> Vec<String> {
+    let mut all = registry.unwrap_or_default();
+    all.extend(local.unwrap_or_default());
+    all
 }
 
 /// Fetch the concrete version tags published under `repo` (excludes moving
@@ -2444,6 +2449,49 @@ mod tests {
         assert!(held.is_dir());
         drop(again);
         assert_eq!(sweep_workdirs_in(dir.path()), 0);
+    }
+
+    /// The next version counts the registry and the local store together. A
+    /// local build that was never pushed, above the registry's highest, must
+    /// not be reused: the counter goes above it.
+    #[test]
+    fn next_version_is_above_the_highest_of_registry_and_local_store() {
+        use super::merge_known_versions;
+        use crate::template::store::next_subbuild;
+
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // Registry higher than the local store.
+        let known = merge_known_versions(
+            Some(s(&["26100.1742.2", "26100.1742.3"])),
+            Some(s(&["26100.1742.0", "26100.1742.1"])),
+        );
+        assert_eq!(next_subbuild("26100.1742", &known), "26100.1742.4");
+
+        // Local store higher than the registry (an unpushed local build).
+        let known = merge_known_versions(
+            Some(s(&["26100.1742.0", "26100.1742.1"])),
+            Some(s(&["26100.1742.2", "26100.1742.5"])),
+        );
+        assert_eq!(next_subbuild("26100.1742", &known), "26100.1742.6");
+    }
+
+    /// When the registry cannot be read, the local store alone sets the
+    /// counter; when the store cannot be read, the registry alone does.
+    #[test]
+    fn next_version_uses_the_source_that_answered() {
+        use super::merge_known_versions;
+        use crate::template::store::next_subbuild;
+
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        let known = merge_known_versions(None, Some(s(&["3.23.4.7"])));
+        assert_eq!(next_subbuild("3.23.4", &known), "3.23.4.8");
+
+        let known = merge_known_versions(Some(s(&["3.23.4.7"])), None);
+        assert_eq!(next_subbuild("3.23.4", &known), "3.23.4.8");
+
+        assert_eq!(next_subbuild("3.23.4", &merge_known_versions(None, None)), "3.23.4.0");
     }
 
     fn def(source: &str) -> crate::config::model::TemplateDef {
