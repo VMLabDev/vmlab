@@ -2907,7 +2907,9 @@ mod tests {
 
         sessions.watcher.unmute();
         assert!(
-            eventually(|| std::fs::read_to_string(dir.path().join("late.txt")).ok().as_deref()
+            eventually(|| std::fs::read_to_string(dir.path().join("late.txt"))
+                .ok()
+                .as_deref()
                 == Some("written in the guest"))
             .await,
             "the late answer was not carried"
