@@ -437,9 +437,49 @@ pub fn join_rel(dir: &str, name: &str) -> String {
     }
 }
 
+/// A guest directory entry is one component, never a path.
+pub fn validate_entry_name(name: &str, windows: bool) -> anyhow::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\0'])
+        || (windows && name.contains(['\\', ':']))
+    {
+        return Err(
+            GuestListingError(format!("invalid guest directory entry name: {name:?}")).into(),
+        );
+    }
+    Ok(())
+}
+
+pub const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+pub const MAX_SCAN_ENTRIES: usize = 1_000_000;
+
+/// A protocol violation is fatal to a scan, not an unreadable subtree.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct GuestListingError(pub String);
+
+pub fn entry_budget(current: usize, added: usize, limit: usize) -> anyhow::Result<usize> {
+    match current.checked_add(added) {
+        Some(total) if total <= limit => Ok(total),
+        _ => Err(GuestListingError(format!("guest entry limit exceeded ({limit})")).into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_entry_limits_include_the_boundary_and_reject_overflow() {
+        for limit in [MAX_DIRECTORY_ENTRIES, MAX_SCAN_ENTRIES] {
+            assert_eq!(entry_budget(limit - 1, 1, limit).unwrap(), limit);
+            assert!(entry_budget(limit, 1, limit).is_err());
+            assert!(entry_budget(0, limit + 1, limit).is_err());
+            assert!(entry_budget(usize::MAX, 1, limit).is_err());
+        }
+    }
 
     /// Lay out a tree of ignore files and read every one of them, in the
     /// order a descent would.
