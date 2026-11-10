@@ -1299,6 +1299,50 @@ impl HttpTransport {
             && url.password().is_none()
     }
 
+    /// Login uses the same destination policy as registry requests, and
+    /// rejects token realms outside the configured registry origin.
+    pub(super) async fn validate_login(&self) -> Result<()> {
+        let url = reqwest::Url::parse(&self.url("/v2/"))?;
+        anyhow::ensure!(self.credential_url(&url), "registry login requires HTTPS");
+        let basic = self
+            .credential
+            .basic_header()
+            .ok_or_else(|| anyhow!("missing login credential"))?;
+        let resp = self
+            .send_request(
+                self.client
+                    .get(url)
+                    .header(reqwest::header::AUTHORIZATION, basic)
+                    .build()?,
+            )
+            .await?;
+        anyhow::ensure!(
+            self.credential_url(resp.url()),
+            "login redirected outside the registry origin"
+        );
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let challenge = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(auth::parse_bearer_challenge)
+                .ok_or_else(|| anyhow!("login failed: registry rejected the credential"))?;
+            let realm = reqwest::Url::parse(&challenge.realm)?;
+            anyhow::ensure!(
+                self.credential_url(&realm),
+                "login token realm must use HTTPS on the registry origin"
+            );
+            self.fetch_token(&challenge).await?;
+        } else {
+            anyhow::ensure!(
+                resp.status().is_success(),
+                "login failed: registry returned {}",
+                resp.status()
+            );
+        }
+        Ok(())
+    }
+
     /// Follow download redirects explicitly, rechecking the destination on
     /// every hop. Registry credentials never reach a CDN or an HTTP URL.
     async fn send_request(&self, mut req: reqwest::Request) -> Result<reqwest::Response> {
@@ -1803,6 +1847,19 @@ mod tests {
             assert!(!transport.credential_url(&url.parse().unwrap()), "{url}");
         }
         assert!(transport.credential_url(&"https://registry.example/token".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn login_refuses_plain_http_before_sending_a_credential() {
+        let transport = private_transport("127.0.0.1:1");
+        assert!(
+            transport
+                .validate_login()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("requires HTTPS")
+        );
     }
 
     #[tokio::test]
