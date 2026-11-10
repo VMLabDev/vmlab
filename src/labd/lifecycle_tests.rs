@@ -2117,6 +2117,29 @@ async fn a_reported_capability_is_used() {
     vm.stop(true).await.expect("stop");
 }
 
+#[tokio::test]
+async fn a_failed_online_snapshot_load_resumes_the_vm() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB }"#,
+        Script {
+            capabilities: Capabilities::all(),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.unwrap();
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let machine: Arc<dyn Machine> = vm.clone();
+    let error = machine.restore(lab, "missing", true).await.unwrap_err();
+    assert!(format!("{error:#}").contains("does not exist"));
+    assert!(!hv.paused(), "failed load left CPUs paused");
+    assert_eq!(vm.state().await, PowerState::Running);
+    vm.stop(true).await.unwrap();
+}
+
 /// A container's online snapshot rides the same capability: absent, the
 /// refusal it always gave; present, an online capture it can restore.
 #[tokio::test]

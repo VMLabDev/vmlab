@@ -1806,29 +1806,7 @@ impl VmInstance {
                 Ok(true)
             }
             PowerState::Stopped => {
-                let disks = self.all_disk_paths();
-                // Do not remove a pre-existing snapshot during rollback.
-                for disk in &disks {
-                    if crate::template::qimg::image_info(disk).await?.snapshots
-                        .iter().any(|snapshot| snapshot.name == name) {
-                        bail!("{}: snapshot {name:?} already exists", disk.display());
-                    }
-                }
-                let mut created: Vec<&std::path::Path> = Vec::new();
-                for disk in &disks {
-                    if let Err(error) = crate::template::qimg::snapshot_create(disk, name).await {
-                        let mut failures = Vec::new();
-                        for earlier in created.iter().rev() {
-                            if let Err(rollback) = crate::template::qimg::snapshot_delete(earlier, name).await {
-                                failures.push(format!("{}: {rollback}", earlier.display()));
-                            }
-                        }
-                        return Err(anyhow::anyhow!(error).context(format!(
-                            "offline snapshot failed, rollback errors: {failures:?}"
-                        )));
-                    }
-                    created.push(disk.as_path());
-                }
+                snapshot_offline_disks(&self.all_disk_paths(), name).await?;
                 Ok(false)
             }
             // Capturing must not change the guest, and waking it would.
@@ -1909,7 +1887,12 @@ impl VmInstance {
             }
             _ => {
                 for disk in self.all_disk_paths() {
-                    crate::template::qimg::snapshot_delete(&disk, name).await?;
+                    // Capture rollback may already have removed this disk's
+                    // entry. Pending-intent cleanup is idempotent.
+                    if crate::template::qimg::image_info(&disk).await?.snapshots
+                        .iter().any(|snapshot| snapshot.name == name) {
+                        crate::template::qimg::snapshot_delete(&disk, name).await?;
+                    }
                 }
             }
         }
@@ -2593,6 +2576,31 @@ fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
 }
 
+async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
+    // Refuse duplicate names before changing any disk, so rollback never
+    // removes a snapshot that predates this operation.
+    for disk in disks {
+        if crate::template::qimg::image_info(disk).await?.snapshots
+            .iter().any(|snapshot| snapshot.name == name) {
+            bail!("{}: snapshot {name:?} already exists", disk.display());
+        }
+    }
+    for (index, disk) in disks.iter().enumerate() {
+        if let Err(error) = crate::template::qimg::snapshot_create(disk, name).await {
+            let mut failures = Vec::new();
+            for earlier in disks[..index].iter().rev() {
+                if let Err(rollback) = crate::template::qimg::snapshot_delete(earlier, name).await {
+                    failures.push(format!("{}: {rollback}", earlier.display()));
+                }
+            }
+            return Err(anyhow!(error).context(format!(
+                "offline snapshot failed, rollback errors: {failures:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_snapshot_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
@@ -2690,6 +2698,21 @@ impl KeepAwake {
 #[cfg(test)]
 mod tests {
     use super::{clone_source, clone_source_refusal, no_agent_hint};
+
+    #[tokio::test]
+    async fn offline_capture_rolls_back_an_earlier_disk_when_a_later_disk_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.qcow2");
+        let second = dir.path().join("second.raw");
+        crate::template::qimg::create_blank(&first, 1 << 20).await.unwrap();
+        std::fs::write(&second, [0; 512]).unwrap();
+        let error = super::snapshot_offline_disks(&[first.clone(), second], "capture").await.unwrap_err();
+        assert!(format!("{error:#}").contains("rollback errors: []"));
+        assert!(crate::template::qimg::image_info(&first).await.unwrap().snapshots.is_empty());
+        crate::template::qimg::snapshot_create(&first, "capture").await.unwrap();
+        assert!(super::snapshot_offline_disks(&[first.clone()], "capture").await.is_err());
+        assert_eq!(crate::template::qimg::image_info(&first).await.unwrap().snapshots.len(), 1);
+    }
 
     fn vm(decl: &str) -> crate::config::model::Vm {
         crate::qemu::resolve::testing::vm(decl)

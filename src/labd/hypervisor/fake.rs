@@ -224,6 +224,7 @@ impl Script {
 
 pub struct FakeHypervisor {
     script: Script,
+    paused: Arc<AtomicBool>,
     /// Which start attempt the next `start_emulator` is.
     attempts: AtomicUsize,
     /// Every helper the fake started (TPMs, filesystem daemons), so a test
@@ -235,6 +236,7 @@ impl FakeHypervisor {
     pub fn new(script: Script) -> Arc<Self> {
         Arc::new(Self {
             script,
+            paused: Arc::new(AtomicBool::new(false)),
             attempts: AtomicUsize::new(0),
             helpers: Mutex::new(Vec::new()),
         })
@@ -243,6 +245,11 @@ impl FakeHypervisor {
     /// How many times the emulator was started.
     pub fn starts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
+    }
+
+    /// CPU pause state of the in-memory control adapter.
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
     }
 
     /// Helper processes this fake started that are still alive. Teardown is
@@ -383,6 +390,7 @@ impl Hypervisor for FakeHypervisor {
 
         Ok(Running {
             control: Arc::new(FakeControl {
+                paused: self.paused.clone(),
                 machine: machine.clone(),
                 ignores_powerdown: run.ignores_powerdown,
                 ignores_quit: run.ignores_quit,
@@ -527,6 +535,7 @@ impl Process for FakeProc {
 }
 
 struct FakeControl {
+    paused: Arc<AtomicBool>,
     machine: Arc<FakeProc>,
     ignores_powerdown: bool,
     ignores_quit: bool,
@@ -543,10 +552,12 @@ impl FakeControl {
 #[async_trait::async_trait]
 impl Control for FakeControl {
     async fn resume(&self) -> Result<()> {
+        self.paused.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn pause(&self) -> Result<()> {
+        self.paused.store(true, Ordering::SeqCst);
         Ok(())
     }
 

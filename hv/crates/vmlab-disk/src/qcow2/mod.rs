@@ -1491,6 +1491,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_ambiguous_snapshot_lookup_prefers_id() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        img.snapshot_create("x", 0, 0).unwrap();
+        img.snapshot_create("y", 0, 0).unwrap();
+        // Simulate a legacy file whose first snapshot name equals the
+        // second snapshot ID. Fixed header 40, extra 24, one-byte ID.
+        img.file.write_all_at(b"2", img.snapshots_offset + 65).unwrap();
+        assert_eq!(img.snapshot_apply("2").unwrap().name, "y");
+        img.snapshot_delete("2").unwrap();
+        let entries = img.snapshots().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "1");
+        assert_eq!(entries[0].name, "2");
+    }
+
+    #[test]
     fn snapshot_namespace_rejects_ids_and_skips_numeric_names() {
         let (_dir, mut img) = testsupport::blank(8 << 20);
         img.snapshot_create("2", 0, 0).unwrap();
