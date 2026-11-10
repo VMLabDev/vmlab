@@ -15,6 +15,8 @@ pub fn configure() {
             "VMLAB_REQUIRE_KVM=1 but /dev/kvm is absent or not accessible read/write"
         );
         println!("cargo:rustc-cfg=vmlab_ci_no_kvm");
-        println!("cargo:warning=KVM tests ignored: /dev/kvm is absent or not accessible read/write");
+        println!(
+            "cargo:warning=KVM tests ignored: /dev/kvm is absent or not accessible read/write"
+        );
     }
 }
