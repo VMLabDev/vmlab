@@ -59,7 +59,7 @@ const EV_PORT_OPEN: u16 = 6;
 const EV_PORT_NAME: u16 = 7;
 /// Largest read the worker takes from a client socket in one go.
 const READ_CHUNK: usize = 64 * 1024;
-/// Apply backpressure after this much staged output, plus at most one chain.
+/// Hard limit on staged output, including the current pass.
 const MAX_TX_STAGE: usize = 1024 * 1024;
 
 /// One named virtio-serial port served on a unix socket.
@@ -107,6 +107,32 @@ struct Shared {
     device_ready: bool,
     ports: Vec<PortState>,
     pending: VecDeque<CtrlMsg>,
+}
+
+impl Shared {
+    fn control_cap(&self) -> usize {
+        self.ports.len().saturating_mul(8).saturating_add(8)
+    }
+
+    fn enqueue_ctrl(&mut self, msg: CtrlMsg) {
+        if let Some(old) = self
+            .pending
+            .iter_mut()
+            .rev()
+            .find(|old| old.id == msg.id)
+            .filter(|old| old.event == msg.event)
+        {
+            *old = msg;
+        } else if self.pending.len() < self.control_cap() {
+            self.pending.push_back(msg);
+        } else {
+            log::warn!(
+                "virtio-console control queue full, dropping port {} event {}",
+                msg.id,
+                msg.event
+            );
+        }
+    }
 }
 
 /// Commands from the device (vCPU path) to the worker thread.
@@ -358,7 +384,7 @@ fn run(
                         let mut sh = lock(&shared);
                         sh.ports[i].host_open = true;
                         let port = i as u16 + 1;
-                        sh.pending.push_back(CtrlMsg {
+                        sh.enqueue_ctrl(CtrlMsg {
                             id: u32::from(port),
                             event: EV_PORT_OPEN,
                             value: 1,
@@ -425,7 +451,7 @@ fn disconnect(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], i
     // chardev does; host bytes already staged still reach the guest.
     sh.ports[i].tx_stage.clear();
     let port = i as u16 + 1;
-    sh.pending.push_back(CtrlMsg {
+    sh.enqueue_ctrl(CtrlMsg {
         id: u32::from(port),
         event: EV_PORT_OPEN,
         value: 0,
@@ -569,12 +595,23 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
                         if !connected {
                             reader.available_bytes() as u32
                         } else {
-                            let mut buf = vec![0u8; reader.available_bytes()];
-                            if reader.read_exact(&mut buf).is_ok() {
-                                out.extend_from_slice(&buf);
-                                buf.len() as u32
-                            } else {
+                            let size = reader.available_bytes();
+                            if size > MAX_TX_STAGE {
+                                // Refuse a single oversized guest chain.
                                 0
+                            } else if size > MAX_TX_STAGE - pending - out.len() {
+                                q.go_to_previous_position();
+                                blocked = true;
+                                break;
+                            } else {
+                                let start = out.len();
+                                out.resize(start + size, 0);
+                                if reader.read_exact(&mut out[start..]).is_ok() {
+                                    size as u32
+                                } else {
+                                    out.truncate(start);
+                                    0
+                                }
                             }
                         }
                     }
@@ -604,7 +641,10 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
                 }
             }
         }
-        if !blocked || lock(shared).ports[port as usize - 1].tx_stage.len() >= MAX_TX_STAGE {
+        if !blocked
+            || out.is_empty()
+            || lock(shared).ports[port as usize - 1].tx_stage.len() >= MAX_TX_STAGE
+        {
             return;
         }
     }
@@ -640,43 +680,57 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
     if sh.snapshot_paused {
         return;
     }
-    let msgs: Vec<(u32, u16, u16)> = {
-        let Some(mem) = sh.mem.as_ref() else {
-            return;
-        };
-        let Some(q) = sh.queues.get_mut(3).and_then(|q| q.as_mut()) else {
-            return;
-        };
-        let mut msgs = Vec::new();
-        while let Some(chain) = q.pop_descriptor_chain(mem) {
-            let head = chain.head_index();
-            let mut buf = [0u8; CTRL_LEN];
-            let mut len = 0;
-            if let Ok(mut reader) = chain.reader(mem)
-                && reader.available_bytes() >= CTRL_LEN
-                && reader.read_exact(&mut buf).is_ok()
-            {
-                len = CTRL_LEN as u32;
-                msgs.push((
-                    u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-                    u16::from_le_bytes(buf[4..6].try_into().unwrap()),
-                    u16::from_le_bytes(buf[6..8].try_into().unwrap()),
-                ));
-            }
-            if q.add_used(mem, head, len).is_err() {
-                break;
-            }
-        }
-        if q.needs_notification(mem).unwrap_or(false) {
-            irq = sh.interrupt.clone().map(|irq| (irq, 3));
-        }
-        msgs
-    };
-    let max_port = sh.ports.len() as u32;
-    for (id, event, value) in msgs {
-        dispatch_ctrl(sh, id, event, value, max_port);
-    }
     flush_pending(sh);
+    loop {
+        let room = sh.control_cap().saturating_sub(sh.pending.len());
+        if room < sh.ports.len().max(2) {
+            break;
+        }
+        let msgs: Vec<(u32, u16, u16)> = {
+            let Some(mem) = sh.mem.as_ref() else {
+                return;
+            };
+            let Some(q) = sh.queues.get_mut(3).and_then(|q| q.as_mut()) else {
+                return;
+            };
+            let mut msgs = Vec::new();
+            while let Some(chain) = q.pop_descriptor_chain(mem) {
+                if msgs.len() >= room / sh.ports.len().max(2) {
+                    q.go_to_previous_position();
+                    break;
+                }
+                let head = chain.head_index();
+                let mut buf = [0u8; CTRL_LEN];
+                let mut len = 0;
+                if let Ok(mut reader) = chain.reader(mem)
+                    && reader.available_bytes() >= CTRL_LEN
+                    && reader.read_exact(&mut buf).is_ok()
+                {
+                    len = CTRL_LEN as u32;
+                    msgs.push((
+                        u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                        u16::from_le_bytes(buf[4..6].try_into().unwrap()),
+                        u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+                    ));
+                }
+                if q.add_used(mem, head, len).is_err() {
+                    break;
+                }
+            }
+            if q.needs_notification(mem).unwrap_or(false) {
+                irq = sh.interrupt.clone().map(|irq| (irq, 3));
+            }
+            msgs
+        };
+        if msgs.is_empty() {
+            break;
+        }
+        let max_port = sh.ports.len() as u32;
+        for (id, event, value) in msgs {
+            dispatch_ctrl(sh, id, event, value, max_port);
+        }
+        flush_pending(sh);
+    }
     drop(guard);
     if let Some((irq, queue)) = irq {
         irq.notify_queue(queue);
@@ -693,7 +747,7 @@ fn dispatch_ctrl(sh: &mut Shared, id: u32, event: u16, value: u16, max_port: u32
             }
         }
         EV_PORT_READY if value == 1 && id >= 1 && id <= max_port => {
-            sh.pending.push_back(CtrlMsg {
+            sh.enqueue_ctrl(CtrlMsg {
                 id,
                 event: EV_PORT_NAME,
                 value: 0,
@@ -702,7 +756,7 @@ fn dispatch_ctrl(sh: &mut Shared, id: u32, event: u16, value: u16, max_port: u32
             // Mirror the current host connection state to a freshly added
             // port, as QEMU does when the driver acks a port.
             if sh.ports[id as usize - 1].host_open {
-                sh.pending.push_back(CtrlMsg {
+                sh.enqueue_ctrl(CtrlMsg {
                     id,
                     event: EV_PORT_OPEN,
                     value: 1,
@@ -724,7 +778,7 @@ fn dispatch_ctrl(sh: &mut Shared, id: u32, event: u16, value: u16, max_port: u32
 /// the guest has created the port and can associate a name with it.
 fn announce_ports(sh: &mut Shared, max_port: u32) {
     for id in 1..=max_port {
-        sh.pending.push_back(CtrlMsg {
+        sh.enqueue_ctrl(CtrlMsg {
             id,
             event: EV_PORT_ADD,
             value: 1,
@@ -1436,8 +1490,78 @@ mod tests {
     const BAD_ID_FOR_TEST: u32 = u32::MAX;
 
     #[test]
+    fn duplicate_control_messages_do_not_grow_pending() {
+        let f = Fixture::new();
+        let mut sh = lock(&f.dev.shared);
+        for _ in 0..100_000 {
+            dispatch_ctrl(&mut sh, 1, EV_PORT_READY, 1, 2);
+        }
+        assert_eq!(sh.pending.len(), 1);
+        assert!(sh.pending.len() <= sh.control_cap());
+    }
+
+    #[test]
+    fn setup_without_control_rx_preserves_distinct_events() {
+        let f = Fixture::new();
+        let mut sh = lock(&f.dev.shared);
+        let mut expected = VecDeque::new();
+        // All six host event kinds, across every configured port. No RX
+        // buffers are posted, so every event must remain pending in order.
+        for event in [EV_PORT_ADD, 2, 4, 5, EV_PORT_OPEN, EV_PORT_NAME] {
+            for id in 1..=sh.ports.len() as u32 {
+                let msg = CtrlMsg {
+                    id,
+                    event,
+                    value: 1,
+                    name: (event == EV_PORT_NAME).then(|| format!("port-{id}")),
+                };
+                expected.push_back(msg.clone());
+                sh.enqueue_ctrl(msg);
+            }
+        }
+        flush_pending(&mut sh);
+        assert_eq!(sh.pending, expected);
+        assert!(sh.pending.len() <= sh.control_cap());
+    }
+
+    #[test]
+    fn add_remove_add_preserves_port_lifecycle_order() {
+        let f = Fixture::new();
+        let mut sh = lock(&f.dev.shared);
+        for event in [EV_PORT_ADD, 2, EV_PORT_ADD] {
+            sh.enqueue_ctrl(CtrlMsg {
+                id: 1,
+                event,
+                value: 1,
+                name: None,
+            });
+        }
+        assert_eq!(
+            sh.pending.iter().map(|m| m.event).collect::<Vec<_>>(),
+            [EV_PORT_ADD, 2, EV_PORT_ADD]
+        );
+        // A neighbouring port does not prevent coalescing the newest event
+        // for port 1, but no earlier event for that port may be replaced.
+        sh.enqueue_ctrl(CtrlMsg {
+            id: 2,
+            event: EV_PORT_ADD,
+            value: 1,
+            name: None,
+        });
+        sh.enqueue_ctrl(CtrlMsg {
+            id: 1,
+            event: EV_PORT_ADD,
+            value: 0,
+            name: None,
+        });
+        assert_eq!(sh.pending.len(), 4);
+        assert_eq!(sh.pending[0].value, 1);
+        assert_eq!(sh.pending[2].value, 0);
+    }
+
+    #[test]
     fn transmit_staging_is_bounded_when_client_stops_reading() {
-        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 2 << 20)]).unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
         let shared = Arc::new(Mutex::new(Shared {
             snapshot_paused: false,
             mem: Some(mem.clone()),
@@ -1472,6 +1596,17 @@ mod tests {
                 "iteration {iteration}: staged {bytes} bytes"
             );
         }
+        lock(&shared).ports[0].tx_stage.clear();
+        let payload = vec![23; MAX_TX_STAGE + 1];
+        mem.write_slice(&payload, GuestAddress(0x100000)).unwrap();
+        let mut ring = TestVq::new(0x1000, 8);
+        mem.write_obj(0u16, GuestAddress(ring.avail + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(ring.used + 2)).unwrap();
+        ring.add_chain(&mem, &[(0x100000, payload.len() as u32, false)]);
+        lock(&shared).queues[5] = Some(ring.queue());
+        process_tx(&shared, &mut clients, 1);
+        assert!(lock(&shared).ports[0].tx_stage.is_empty());
+        assert_eq!(ring.used_idx(&mem), 1);
     }
 
     #[test]

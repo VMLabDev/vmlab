@@ -1514,6 +1514,9 @@ impl FileOps {
 
         let mut hasher = Sha256::new();
         let mut got = 0u64;
+        // A changing or dishonest guest must not turn a finite pull into an
+        // endless disk write. Allow one chunk of growth after the stat.
+        let limit = attrs.size.saturating_add(TRANSFER_CHUNK as u64);
         let mut queued = 0u64;
         let mut window: std::collections::VecDeque<tokio::task::JoinHandle<Result<Vec<u8>>>> =
             std::collections::VecDeque::new();
@@ -1548,6 +1551,9 @@ impl FileOps {
             // The agent fills a read or hits end-of-file, so anything short
             // is the end — whether or not the stat agreed.
             let done = bytes.len() < TRANSFER_CHUNK;
+            if bytes.len() as u64 > limit.saturating_sub(got) {
+                break Err(anyhow!("pull exceeds stat size plus growth allowance"));
+            }
             hasher.update(&bytes);
             got += bytes.len() as u64;
             if let Err(e) = sink.write(&bytes).await {
@@ -3286,7 +3292,9 @@ mod tests {
                                     // the file does not have — what a file
                                     // truncated between the stat and the
                                     // reads looks like to a puller.
-                                    size: if path.contains("shrinking") {
+                                    size: if path.contains("growing-hostile") {
+                                        0
+                                    } else if path.contains("shrinking") {
                                         file.len() as u64 + (1 << 20)
                                     } else {
                                         file.len() as u64
@@ -3792,6 +3800,27 @@ mod tests {
         assert_eq!(landed.len(), 10_000);
         use sha2::{Digest, Sha256};
         assert_eq!(sha, hex::encode(Sha256::digest(&landed)));
+    }
+
+    #[tokio::test]
+    async fn hostile_pull_cannot_write_past_stat_allowance() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, vec![7; TRANSFER_CHUNK * 4]).unwrap();
+        ops.push(&source, "/growing-hostile", None).await.unwrap();
+        let dest = work.path().join("dest");
+        let err = ops.pull_to("/growing-hostile", &dest).await.unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"));
+        assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
+        let err = agent
+            .pull_file("/growing-hostile", &dest)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"));
+        assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
     }
 
     /// A directory arrives whole, however many slices the guest streams it

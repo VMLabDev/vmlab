@@ -282,6 +282,7 @@ struct DirtySet {
 #[derive(Default)]
 struct SetState {
     paths: BTreeSet<String>,
+    encoded_bytes: usize,
     overflow: bool,
     /// The set went empty → non-empty and the host has not been nudged yet.
     nudge: bool,
@@ -297,6 +298,7 @@ impl SetState {
 
     /// Take the window's contents, leaving an empty set behind.
     fn swap(&mut self) -> Drained {
+        self.encoded_bytes = 0;
         if self.overflow {
             self.paths.clear();
             self.overflow = false;
@@ -331,13 +333,22 @@ impl DirtySet {
             state.nudge = true;
         }
         if !state.overflow {
-            if state.paths.len() >= DIRTY_SET_CAP && !state.paths.contains(&rel) {
+            let bytes = vmlab_agent_proto::watch::dirty_path_bytes(&rel);
+            if !state.paths.contains(&rel)
+                && (state.paths.len() >= DIRTY_SET_CAP
+                    || bytes
+                        > vmlab_agent_proto::watch::DIRTY_SET_BYTES
+                            .saturating_sub(state.encoded_bytes))
+            {
                 // The cap is the batch bound too, so overflow frees the paths
                 // rather than holding a set the host will never receive.
                 state.paths.clear();
+                state.encoded_bytes = 0;
                 state.overflow = true;
             } else {
-                state.paths.insert(rel);
+                if state.paths.insert(rel) {
+                    state.encoded_bytes += bytes;
+                }
             }
         }
         drop(state);
@@ -351,6 +362,7 @@ impl DirtySet {
             state.nudge = true;
         }
         state.paths.clear();
+        state.encoded_bytes = 0;
         state.overflow = true;
         drop(state);
         self.work.notify_all();

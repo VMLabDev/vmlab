@@ -39,6 +39,15 @@ use serde::{Deserialize, Serialize};
 /// of JSON — past that the host's stat-walk is cheaper than the transfer.
 pub const DIRTY_SET_CAP: usize = 20_000;
 
+/// Encoded path budget, leaving room for stat fields and record framing.
+pub const DIRTY_SET_BYTES: usize = 4 * 1024 * 1024;
+
+/// JSON strings can use six bytes per input byte (escaped controls).
+/// Include a conservative allowance for each entry's stat and punctuation.
+pub fn dirty_path_bytes(path: &str) -> usize {
+    path.len().saturating_mul(6).saturating_add(256)
+}
+
 /// Largest single record either side accepts, a decoder-buffer bound rather
 /// than a policy: a full [`DIRTY_SET_CAP`] batch of long paths fits with room
 /// to spare, and anything larger is a desynced stream.

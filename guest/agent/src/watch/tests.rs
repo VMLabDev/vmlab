@@ -13,6 +13,19 @@ use crate::fake_spawner::TestPlatform;
 use crate::mux::Input;
 use crate::testutil::{Capture, capture_mux};
 
+#[test]
+fn long_escaped_paths_collapse_before_record_limit() {
+    let set = DirtySet::default();
+    for i in 0..20_000 {
+        set.mark(format!("{i}{}", "\u{1}".repeat(4096)));
+        let state = set.state.lock().unwrap();
+        assert!(state.encoded_bytes <= vmlab_agent_proto::watch::DIRTY_SET_BYTES);
+    }
+    assert!(matches!(drain(&set), Drained::Rescan));
+    set.mark("small".into());
+    assert!(matches!(drain(&set), Drained::Paths(_)));
+}
+
 // --- the set ------------------------------------------------------------
 
 /// Whether the set owes the host a nudge, and clear it — what the sender
