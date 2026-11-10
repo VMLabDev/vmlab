@@ -75,7 +75,7 @@ fn host_path(root: &std::path::Path, rel: &str) -> anyhow::Result<HostPath> {
     use std::os::fd::AsRawFd;
 
     for component in rel.split('/') {
-        super::ignore::validate_entry_name(component)?;
+        super::ignore::validate_entry_name(component, false)?;
     }
     let rel = std::path::Path::new(rel);
     let root = open(
@@ -587,7 +587,7 @@ async fn verify_copy(
     expected: Option<&State>,
 ) -> anyhow::Result<()> {
     for component in path.split('/') {
-        super::ignore::validate_entry_name(component)?;
+        super::ignore::validate_entry_name(component, false)?;
     }
     let resolved = if direction == Direction::ToHost {
         match host_path(&target.host_root, path) {
@@ -759,7 +759,7 @@ async fn place_in_guest(
     expected: Option<&State>,
 ) -> anyhow::Result<()> {
     let rel = action.path();
-    let temp = temp_beside(guest_path);
+    let temp = temp_beside(guest_path, guest.windows_names());
     // A temp left by an earlier attempt is not an obstacle: the name is
     // derived from the path, so the previous pass's leftovers are this pass's
     // to clear.
@@ -855,10 +855,10 @@ where
 /// The temp name for one target, in the target's own directory so the rename
 /// is atomic. Derived from the target rather than random, so a crashed pass
 /// leaves at most one leftover per path and the next pass reclaims it.
-fn temp_beside(guest_path: &str) -> String {
+fn temp_beside(guest_path: &str, windows: bool) -> String {
     use sha2::{Digest, Sha256};
     let tag = hex::encode(&Sha256::digest(guest_path.as_bytes())[..8]);
-    match guest_path.rfind(['/', '\\']) {
+    match guest_path.rfind(|c| c == '/' || (windows && c == '\\')) {
         Some(cut) => format!("{}{TEMP_PREFIX}{tag}", &guest_path[..cut + 1]),
         None => format!("{TEMP_PREFIX}{tag}"),
     }
@@ -892,7 +892,6 @@ mod tests {
             "../escape",
             "/absolute",
             "a/../b",
-            "a\\b",
             "a\0b",
             "escape/file",
         ] {
@@ -1160,6 +1159,36 @@ mod tests {
 
     /// The acceptance case: a declared workspace appears in the guest, whole.
     #[tokio::test]
+    async fn linux_colon_and_backslash_names_sync_both_ways() {
+        let names = ["a:b", "a\\b", "dir:\\name/file:\\name"];
+        let dir = workspace(&names.map(|name| (name, "host")));
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        for name in names {
+            assert_eq!(guest.text(&format!("/src/{name}")).as_deref(), Some("host"));
+        }
+        let (_, ignores) = host_scan(dir.path(), &ledger, CAP).unwrap();
+        let probe = super::super::scan::guest_walk(&guest, "/src", &ignores, &ledger, true, CAP)
+            .await
+            .unwrap();
+        for name in names {
+            assert!(probe.tree.contains_key(name), "{name:?}");
+            guest.file(&format!("/src/{name}"), "guest", 9_999);
+        }
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        assert_eq!(done.to_host.placed, names.len());
+        for name in names {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                "guest"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_first_pass_seeds_the_guest() {
         let dir = workspace(&[("src/main.rs", "fn main() {}"), ("README.md", "hi")]);
         let guest = FakeGuest::new();
@@ -1212,7 +1241,7 @@ mod tests {
         let dir = workspace(&[("a.txt", "hello")]);
         let guest = FakeGuest::new();
         let mut ledger = ledger_for(dir.path());
-        guest.fail_push(&temp_beside("/src/a.txt"));
+        guest.fail_push(&temp_beside("/src/a.txt", false));
 
         let first = pass(dir.path(), &guest, &mut ledger).await;
         assert_eq!(first.to_guest.placed, 0);
@@ -1820,11 +1849,16 @@ mod tests {
     /// rather than a cross-volume copy.
     #[test]
     fn a_temp_name_sits_beside_its_target() {
-        let temp = temp_beside("/src/a/b.txt");
+        let temp = temp_beside("/src/a/b.txt", false);
         assert!(temp.starts_with("/src/a/.vmlab-sync."), "{temp}");
-        assert_ne!(temp, temp_beside("/src/a/c.txt"));
-        assert_eq!(temp, temp_beside("/src/a/b.txt"), "derived, not random");
-        assert!(temp_beside("b.txt").starts_with(".vmlab-sync."));
-        assert!(temp_beside("C:\\src\\b.txt").starts_with("C:\\src\\.vmlab-sync."));
+        assert_ne!(temp, temp_beside("/src/a/c.txt", false));
+        assert_eq!(
+            temp,
+            temp_beside("/src/a/b.txt", false),
+            "derived, not random"
+        );
+        assert!(temp_beside("b.txt", false).starts_with(".vmlab-sync."));
+        assert!(temp_beside("C:\\src\\b.txt", true).starts_with("C:\\src\\.vmlab-sync."));
+        assert!(temp_beside("/src/a\\b", false).starts_with("/src/.vmlab-sync."));
     }
 }

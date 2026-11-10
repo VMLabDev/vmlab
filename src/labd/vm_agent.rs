@@ -1320,6 +1320,10 @@ fn digest_budget(stall: Duration, len: u64) -> Duration {
 }
 
 impl FileOps {
+    /// The connected agent's OS, not the host's path syntax.
+    pub fn windows_names(&self) -> bool {
+        self.inner.handle.info().os == "windows"
+    }
     fn start(session: AgentSession) -> FileOps {
         let inner = Arc::new(FileOpsInner {
             handle: session.handle.clone(),
@@ -1605,7 +1609,10 @@ impl FileOps {
             match self.inner.call(Op::ReadDir { handle }, &[]).await {
                 Ok((Reply::Entries { entries, eof }, _)) => {
                     if let Err(e) = entries.iter().try_for_each(|entry| {
-                        super::workspace::ignore::validate_entry_name(&entry.name)
+                        super::workspace::ignore::validate_entry_name(
+                            &entry.name,
+                            self.windows_names(),
+                        )
                     }) {
                         break Err(e);
                     }

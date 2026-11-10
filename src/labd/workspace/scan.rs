@@ -385,7 +385,7 @@ pub async fn guest_walk(
                 super::ignore::MAX_SCAN_ENTRIES,
             )?;
             for entry in entries {
-                super::ignore::validate_entry_name(&entry.name)?;
+                super::ignore::validate_entry_name(&entry.name, files.windows_names())?;
                 let rel = join_rel(&dir, &entry.name);
                 let is_dir = entry.attrs.kind == crate::labd::vm_agent::EntryKind::Dir;
                 if ignores.verdict(&rel, is_dir) == Verdict::GuestOwned {
@@ -583,36 +583,45 @@ mod tests {
     #[tokio::test]
     async fn hostile_guest_directory_names_abort_the_walk() {
         use crate::labd::vm_agent::{Attrs, DirEntry, EntryKind};
-        for name in [
-            "",
-            ".",
-            "..",
-            "/absolute",
-            "a/b",
-            "a\\b",
-            "a\0b",
-            "C:escape",
-            "\\absolute",
-        ] {
-            let guest = FakeGuest::new();
-            guest.dir("/src");
-            guest.listing(vec![DirEntry {
-                name: name.into(),
-                attrs: Attrs {
-                    kind: EntryKind::Dir,
-                    size: 0,
-                    mtime_ns: 0,
-                    atime_ns: 0,
-                    mode: None,
-                },
-            }]);
-            let ignores = Ignores::new();
-            assert!(
-                guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, NO_CAP)
-                    .await
-                    .is_err(),
-                "{name:?}"
-            );
+        for windows in [false, true] {
+            for name in [
+                "",
+                ".",
+                "..",
+                "/absolute",
+                "a/b",
+                "a\\b",
+                "a\0b",
+                "C:escape",
+                "a:b",
+                "\\absolute",
+            ] {
+                if !windows && ["a\\b", "C:escape", "a:b", "\\absolute"].contains(&name) {
+                    continue;
+                }
+                let guest = FakeGuest::new();
+                if windows {
+                    guest.windows();
+                }
+                guest.dir("/src");
+                guest.listing(vec![DirEntry {
+                    name: name.into(),
+                    attrs: Attrs {
+                        kind: EntryKind::Dir,
+                        size: 0,
+                        mtime_ns: 0,
+                        atime_ns: 0,
+                        mode: None,
+                    },
+                }]);
+                let ignores = Ignores::new();
+                assert!(
+                    guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, NO_CAP)
+                        .await
+                        .is_err(),
+                    "{name:?}, windows={windows}"
+                );
+            }
         }
     }
 

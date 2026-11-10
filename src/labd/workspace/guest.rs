@@ -23,6 +23,10 @@ use crate::labd::vm_agent::{Attrs, DirEntry, FileOps, LinkKind, WatchReport, Wat
 /// Everything the syncer can do to a guest tree.
 #[async_trait]
 pub trait GuestFs: Send + Sync {
+    /// Whether guest directory components use Windows separators and ADS syntax.
+    fn windows_names(&self) -> bool {
+        false
+    }
     /// What is at `path` itself, never followed. `None` where nothing is.
     async fn lstat(&self, path: &str) -> Result<Option<Attrs>>;
     /// Every entry in a directory, each with its own attributes and none of
@@ -80,6 +84,9 @@ pub trait GuestWatch: Send + Sync {
 
 #[async_trait]
 impl GuestFs for FileOps {
+    fn windows_names(&self) -> bool {
+        FileOps::windows_names(self)
+    }
     async fn lstat(&self, path: &str) -> Result<Option<Attrs>> {
         FileOps::lstat(self, path).await
     }
@@ -175,6 +182,9 @@ fn guest_parent(path: &str) -> Option<&str> {
 /// forwarding methods to say nothing.
 #[async_trait]
 impl<T: GuestFs + ?Sized> GuestFs for std::sync::Arc<T> {
+    fn windows_names(&self) -> bool {
+        (**self).windows_names()
+    }
     async fn lstat(&self, path: &str) -> Result<Option<Attrs>> {
         (**self).lstat(path).await
     }
@@ -249,6 +259,7 @@ pub mod fake {
 
     #[derive(Debug, Default)]
     struct Guest {
+        windows_names: bool,
         hostile_listing: Option<Vec<DirEntry>>,
         nodes: BTreeMap<String, (Node, i64)>,
         /// Every path the guest was asked to write to, in order — so a test
@@ -329,6 +340,9 @@ pub mod fake {
     }
 
     impl FakeGuest {
+        pub fn windows(&self) {
+            self.inner.lock().expect("fake guest").windows_names = true;
+        }
         pub fn listing(&self, entries: Vec<DirEntry>) {
             self.inner.lock().expect("fake guest").hostile_listing = Some(entries);
         }
@@ -635,6 +649,9 @@ pub mod fake {
 
     #[async_trait]
     impl GuestFs for FakeGuest {
+        fn windows_names(&self) -> bool {
+            self.inner.lock().expect("fake guest").windows_names
+        }
         async fn lstat(&self, path: &str) -> Result<Option<Attrs>> {
             let guest = self.inner.lock().expect("fake guest");
             if guest.unreadable.iter().any(|p| p == path) {

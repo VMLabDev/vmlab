@@ -438,8 +438,13 @@ pub fn join_rel(dir: &str, name: &str) -> String {
 }
 
 /// A guest directory entry is one component, never a path.
-pub fn validate_entry_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0', ':']) {
+pub fn validate_entry_name(name: &str, windows: bool) -> anyhow::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\0'])
+        || (windows && name.contains(['\\', ':']))
+    {
         return Err(
             GuestListingError(format!("invalid guest directory entry name: {name:?}")).into(),
         );
