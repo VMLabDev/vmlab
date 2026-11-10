@@ -78,6 +78,10 @@ just ci::check
 
 ## Release gate
 
+- `scripts/release-version.sh` honors HEAD's `bump: major|minor|patch`
+  trailer, falling back to commit subjects without it. A 0.x major bumps
+  minor. The `release: true` promotion of an alpha keeps its version,
+  regardless of a bump trailer.
 - Run `ci::hv-gate` first, then one full green e2e on the exact release
   commit that will merge to `main`. The main merge must have the same tree.
   Otherwise record a written waiver for each failed scenario on the release
