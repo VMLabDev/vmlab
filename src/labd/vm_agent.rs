@@ -1320,6 +1320,10 @@ fn digest_budget(stall: Duration, len: u64) -> Duration {
 }
 
 impl FileOps {
+    /// The connected agent's OS, not the host's path syntax.
+    pub fn windows_names(&self) -> bool {
+        self.inner.handle.info().os == "windows"
+    }
     fn start(session: AgentSession) -> FileOps {
         let inner = Arc::new(FileOpsInner {
             handle: session.handle.clone(),
@@ -1510,6 +1514,9 @@ impl FileOps {
 
         let mut hasher = Sha256::new();
         let mut got = 0u64;
+        // A changing or dishonest guest must not turn a finite pull into an
+        // endless disk write. Allow one chunk of growth after the stat.
+        let limit = attrs.size.saturating_add(TRANSFER_CHUNK as u64);
         let mut queued = 0u64;
         let mut window: std::collections::VecDeque<tokio::task::JoinHandle<Result<Vec<u8>>>> =
             std::collections::VecDeque::new();
@@ -1544,6 +1551,9 @@ impl FileOps {
             // The agent fills a read or hits end-of-file, so anything short
             // is the end — whether or not the stat agreed.
             let done = bytes.len() < TRANSFER_CHUNK;
+            if bytes.len() as u64 > limit.saturating_sub(got) {
+                break Err(anyhow!("pull exceeds stat size plus growth allowance"));
+            }
             hasher.update(&bytes);
             got += bytes.len() as u64;
             if let Err(e) = sink.write(&bytes).await {
@@ -1604,6 +1614,27 @@ impl FileOps {
         let outcome = loop {
             match self.inner.call(Op::ReadDir { handle }, &[]).await {
                 Ok((Reply::Entries { entries, eof }, _)) => {
+                    if let Err(e) = entries.iter().try_for_each(|entry| {
+                        super::workspace::ignore::validate_entry_name(
+                            &entry.name,
+                            self.windows_names(),
+                        )
+                    }) {
+                        break Err(e);
+                    }
+                    if entries.is_empty() && !eof {
+                        break Err(super::workspace::ignore::GuestListingError(
+                            "guest directory listing made no progress".into(),
+                        )
+                        .into());
+                    }
+                    if let Err(e) = super::workspace::ignore::entry_budget(
+                        all.len(),
+                        entries.len(),
+                        super::workspace::ignore::MAX_DIRECTORY_ENTRIES,
+                    ) {
+                        break Err(e);
+                    }
                     all.extend(entries);
                     if eof {
                         break Ok(());
@@ -2993,6 +3024,9 @@ mod tests {
         /// A directory handle's remaining entries, served a slice at a time
         /// so a reader that stopped at the first reply would come up short.
         dir_handles: HashMap<u64, std::collections::VecDeque<DirEntry>>,
+        /// Malicious directories that never send eof. The value selects
+        /// empty non-progress pages rather than an endless stream of entries.
+        endless_dirs: HashMap<u64, bool>,
         next_handle: u64,
         decoder: fileops::RecordDecoder,
         /// What the open said this session runs as, reportable through
@@ -3027,6 +3061,7 @@ mod tests {
                 fs,
                 handles: HashMap::new(),
                 dir_handles: HashMap::new(),
+                endless_dirs: HashMap::new(),
                 next_handle: 1,
                 decoder: fileops::RecordDecoder::new(),
                 who: logon
@@ -3150,6 +3185,7 @@ mod tests {
                 Op::Close { handle } => {
                     self.handles.remove(&handle);
                     self.dir_handles.remove(&handle);
+                    self.endless_dirs.remove(&handle);
                     (Reply::Ok, Vec::new())
                 }
                 Op::OpenDir { path } => {
@@ -3193,10 +3229,39 @@ mod tests {
                     entries.sort_by(|a, b| a.name.cmp(&b.name));
                     let handle = self.next_handle;
                     self.next_handle += 1;
+                    if path == "/guest/never-eof" || path == "/guest/never-eof-empty" {
+                        self.endless_dirs.insert(handle, path.ends_with("empty"));
+                    }
                     self.dir_handles.insert(handle, entries.into());
                     (Reply::Handle { handle }, Vec::new())
                 }
                 Op::ReadDir { handle } => {
+                    if let Some(empty) = self.endless_dirs.get(&handle) {
+                        let entries = if *empty {
+                            Vec::new()
+                        } else {
+                            vec![
+                                DirEntry {
+                                    name: "entry".into(),
+                                    attrs: Attrs {
+                                        kind: EntryKind::File,
+                                        size: 0,
+                                        mtime_ns: 0,
+                                        atime_ns: 0,
+                                        mode: None
+                                    },
+                                };
+                                fileops::READDIR_CHUNK
+                            ]
+                        };
+                        return (
+                            Reply::Entries {
+                                entries,
+                                eof: false,
+                            },
+                            Vec::new(),
+                        );
+                    }
                     let Some(left) = self.dir_handles.get_mut(&handle) else {
                         return (
                             Reply::Error {
@@ -3227,7 +3292,9 @@ mod tests {
                                     // the file does not have — what a file
                                     // truncated between the stat and the
                                     // reads looks like to a puller.
-                                    size: if path.contains("shrinking") {
+                                    size: if path.contains("growing-hostile") {
+                                        0
+                                    } else if path.contains("shrinking") {
                                         file.len() as u64 + (1 << 20)
                                     } else {
                                         file.len() as u64
@@ -3735,6 +3802,27 @@ mod tests {
         assert_eq!(sha, hex::encode(Sha256::digest(&landed)));
     }
 
+    #[tokio::test]
+    async fn hostile_pull_cannot_write_past_stat_allowance() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, vec![7; TRANSFER_CHUNK * 4]).unwrap();
+        ops.push(&source, "/growing-hostile", None).await.unwrap();
+        let dest = work.path().join("dest");
+        let err = ops.pull_to("/growing-hostile", &dest).await.unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"));
+        assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
+        let err = agent
+            .pull_file("/growing-hostile", &dest)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"));
+        assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
+    }
+
     /// A directory arrives whole, however many slices the guest streams it
     /// in — the walk that reads it descends a directory at a time, and one
     /// that stopped at the first slice would report a tree with one file in
@@ -3763,6 +3851,37 @@ mod tests {
         // A directory nobody made is an error rather than an empty tree: an
         // empty answer would read as "the guest deleted everything".
         assert!(ops.readdir("/guest/absent").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_never_sets_eof_fails_and_releases_its_handle() {
+        for dir in ["/guest/never-eof", "/guest/never-eof-empty"] {
+            let (_dir, path) = mock_agent(true).await;
+            let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+            let ops = agent.open_fileops(None).await.unwrap();
+            ops.mkdir(dir, false).await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(15), ops.readdir(dir))
+                .await
+                .expect("a non-terminating guest must not hang readdir")
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::labd::workspace::ignore::GuestListingError>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let (reply, _) = ops.request(Op::ReadDir { handle: 1 }, &[]).await.unwrap();
+            assert!(
+                matches!(
+                    reply,
+                    Reply::Error {
+                        code: ErrorCode::BadHandle,
+                        ..
+                    }
+                ),
+                "{reply:?}"
+            );
+        }
     }
 
     /// The inline form of a pull: the same transfer, verified the same way,

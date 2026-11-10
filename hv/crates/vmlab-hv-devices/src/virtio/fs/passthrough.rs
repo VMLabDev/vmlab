@@ -43,6 +43,13 @@ const TIMEOUT: Duration = Duration::from_secs(1);
 /// Snapshot format magic: "IPFS" (in-process fs).
 const MAGIC: u32 = 0x5346_5049;
 
+// Bound guest-held descriptors and bookkeeping per share. Tests exercise
+// the same admission paths with a smaller budget.
+#[cfg(not(test))]
+const SESSION_LIMIT: usize = 4096;
+#[cfg(test)]
+const SESSION_LIMIT: usize = 32;
+
 /// A passthrough filesystem serving `root` on the host. Clones share one
 /// session, so the device and its FUSE server observe the same inodes.
 #[derive(Clone)]
@@ -50,6 +57,7 @@ pub struct PassthroughFs {
     root: PathBuf,
     read_only: bool,
     inner: std::sync::Arc<Mutex<Session>>,
+    request_limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Everything the guest has made the server remember.
@@ -61,6 +69,8 @@ struct Session {
     by_path: HashMap<PathBuf, u64>,
     /// Open files and directories by handle.
     handles: HashMap<u64, Handle>,
+    /// Open handle counts by inode, so FORGET is constant-time.
+    handles_by_inode: HashMap<u64, usize>,
     next_ino: u64,
     next_handle: u64,
 }
@@ -127,6 +137,9 @@ impl PassthroughFs {
         Ok(Self {
             root: root.canonicalize().unwrap_or(root),
             read_only,
+            request_limit: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                super::fuse::server::MAX_BUFFER_SIZE as usize + 4096,
+            )),
             inner: std::sync::Arc::new(Mutex::new(Session {
                 inodes: HashMap::from([(
                     ROOT_ID,
@@ -144,6 +157,7 @@ impl PassthroughFs {
                 )]),
                 by_path: [(PathBuf::new(), ROOT_ID)].into(),
                 handles: HashMap::new(),
+                handles_by_inode: HashMap::new(),
                 next_ino: ROOT_ID + 1,
                 next_handle: 1,
             })),
@@ -158,6 +172,13 @@ impl PassthroughFs {
     /// Whether mutating operations are refused.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Largest negotiated payload plus the FUSE header allowance. Before
+    /// INIT (or on a fresh restore), use the server's absolute maximum.
+    pub fn request_limit(&self) -> usize {
+        self.request_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Serialise the session: every inode with its path and lookup count,
@@ -231,6 +252,9 @@ impl PassthroughFs {
         let root_fd = self.inner.lock().inodes[&ROOT_ID].fd.try_clone()?;
 
         let count = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        if count > SESSION_LIMIT {
+            return Err(err());
+        }
         let mut inodes: HashMap<u64, Inode> = HashMap::with_capacity(count);
         let mut by_path = HashMap::new();
         for _ in 0..count {
@@ -290,6 +314,9 @@ impl PassthroughFs {
                 }
             }
             if alive {
+                alive = kind_of(fstat(fd.as_raw_fd())?.st_mode) == kind;
+            }
+            if alive {
                 by_path.insert(path.clone(), ino);
             }
             inodes.insert(
@@ -307,6 +334,9 @@ impl PassthroughFs {
         }
 
         let count = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        if count > SESSION_LIMIT {
+            return Err(err());
+        }
         let mut handles: HashMap<u64, Handle> = HashMap::with_capacity(count);
         for _ in 0..count {
             let handle = u64::from_le_bytes(take(8)?.try_into().unwrap());
@@ -316,8 +346,7 @@ impl PassthroughFs {
             };
             let kind = match take(1)?[0] {
                 0 => {
-                    let flags = i32::from_le_bytes(take(4)?.try_into().unwrap())
-                        & !(libc::O_CREAT | libc::O_EXCL);
+                    let flags = host_open_flags(i32::from_le_bytes(take(4)?.try_into().unwrap()));
                     let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
                     let path = PathBuf::from(OsStr::from_bytes(take(len)?));
                     let file = if inode.dead {
@@ -341,6 +370,10 @@ impl PassthroughFs {
         let mut session = self.inner.lock();
         session.inodes = inodes;
         session.by_path = by_path;
+        session.handles_by_inode.clear();
+        for open in handles.values() {
+            *session.handles_by_inode.entry(open.ino).or_default() += 1;
+        }
         session.handles = handles;
         session.next_ino = next_ino;
         session.next_handle = next_handle;
@@ -375,7 +408,15 @@ impl FileSystem for PassthroughFs {
             // writeback it would flush every write synchronously.
             want |= FsOptions::WRITEBACK_CACHE;
         }
-        Ok(want & capable)
+        let enabled = want & capable;
+        let payload = if enabled.intersects(FsOptions::BIG_WRITES | FsOptions::MAX_PAGES) {
+            super::fuse::server::MAX_BUFFER_SIZE as usize
+        } else {
+            4096
+        };
+        self.request_limit
+            .store(payload + 4096, std::sync::atomic::Ordering::Relaxed);
+        Ok(enabled)
     }
 
     fn destroy(&self) {}
@@ -436,27 +477,27 @@ impl FileSystem for PassthroughFs {
         self.refuse_writes()?;
         let session = self.inner.lock();
         let state = live_inode(&session, inode)?;
-        let reply_fd = if let Some(handle) = handle
-            && let Some(open) = session.handles.get(&handle)
-            && let HandleKind::File { file, .. } = &open.kind
+        if let Some(handle) = handle {
+            session.file_handle(inode, handle)?;
+        }
+        if valid.contains(SetattrValid::SIZE)
+            && kind_of(fstat(state.fd.as_raw_fd())?.st_mode) != FileKind::File
         {
-            file.as_raw_fd()
-        } else {
-            state.fd.as_raw_fd()
-        };
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
         if valid.contains(SetattrValid::MODE) {
-            fchmodat(&state.parent, &state.name, attr.st_mode)?;
+            fchmodat(&state.fd, attr.st_mode)?;
         }
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
-            fchownat(&state.parent, &state.name, valid, &attr)?;
+            fchownat(&state.fd, valid, &attr)?;
         }
         if valid.contains(SetattrValid::SIZE) {
-            truncateat(&state.parent, &state.name, attr.st_size)?;
+            truncateat(&state.fd, attr.st_size)?;
         }
         if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
-            utimensat(&state.parent, &state.name, valid, &attr)?;
+            utimensat(&state.fd, valid, &attr)?;
         }
-        let mut st = fstat(reply_fd)?;
+        let mut st = fstat(state.fd.as_raw_fd())?;
         st.st_ino = inode;
         Ok((st, TIMEOUT))
     }
@@ -519,6 +560,9 @@ impl FileSystem for PassthroughFs {
         _umask: u32,
     ) -> io::Result<Entry> {
         self.refuse_writes()?;
+        if !matches!(mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFSOCK) {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
         let mut session = self.inner.lock();
         let parent = live_inode(&session, parent)?;
         if parent.kind != FileKind::Dir {
@@ -639,19 +683,47 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
         self.refuse_writes()?;
         let mut session = self.inner.lock();
+        session.check_handle_capacity()?;
+        if session.inodes.len() >= SESSION_LIMIT {
+            return Err(io::Error::from_raw_os_error(libc::ENFILE));
+        }
         let parent = live_inode(&session, parent)?;
         if parent.kind != FileKind::Dir {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
         let bytes = checked_name(name)?;
-        let flags = args.flags as i32 | libc::O_CREAT;
-        let file = createat(&parent.fd, bytes, flags, args.mode)?;
+        let flags = host_open_flags(args.flags as i32);
+        // EXCL makes creation atomic. Existing names are vetted with
+        // O_PATH|NOFOLLOW and opened through that fd, never by name again.
+        let file = match createat(
+            &parent.fd,
+            bytes,
+            flags | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            args.mode,
+        ) {
+            Ok(file) => file,
+            Err(e)
+                if e.raw_os_error() == Some(libc::EEXIST)
+                    && args.flags as i32 & libc::O_EXCL == 0 =>
+            {
+                let fd = openat(&parent.fd, bytes, libc::O_PATH | libc::O_NOFOLLOW)?;
+                let file = reopen(&fd, flags)?;
+                if args.flags as i32 & libc::O_TRUNC != 0 {
+                    file.set_len(0)?;
+                }
+                file
+            }
+            Err(e) => return Err(e),
+        };
         let path = parent.path.join(OsStr::from_bytes(bytes));
-        let fd = openat(&parent.fd, bytes, libc::O_PATH | libc::O_NOFOLLOW)?;
+        let fd = open_path(
+            Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())),
+            libc::O_PATH,
+        )?;
         let st = fstat(fd.as_raw_fd())?;
         let dirfd = parent.fd.try_clone()?;
         let entry = session.entry_for(path.clone(), fd, dirfd, bytes, kind_of(st.st_mode), &st)?;
-        let handle = session.insert_file_handle(entry.inode, file, flags & !libc::O_CREAT, path);
+        let handle = session.insert_file_handle(entry.inode, file, flags, path)?;
         Ok((entry, Some(handle), OpenOptions::empty(), None))
     }
 
@@ -746,10 +818,13 @@ impl FileSystem for PassthroughFs {
                 return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
             }
         }
-        if flags as i32 & libc::O_ACCMODE != libc::O_RDONLY {
+        if flags as i32 & libc::O_ACCMODE != libc::O_RDONLY
+            || flags as i32 & (libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) != 0
+        {
             self.refuse_writes()?;
         }
         let mut session = self.inner.lock();
+        session.check_handle_capacity()?;
         let handle = session.next_handle;
         session.next_handle += 1;
         session.handles.insert(
@@ -759,6 +834,7 @@ impl FileSystem for PassthroughFs {
                 kind: HandleKind::Dir { entries: None },
             },
         );
+        *session.handles_by_inode.entry(inode).or_default() += 1;
         Ok((Some(handle), OpenOptions::empty()))
     }
 
@@ -889,6 +965,9 @@ impl Session {
     /// One FORGET: drop the inode when no lookup count and no handle keeps
     /// it.
     fn forget_one(&mut self, inode: u64, count: u64) {
+        if inode == ROOT_ID {
+            return;
+        }
         let lookups = match self.inodes.get_mut(&inode) {
             Some(state) => {
                 state.lookups = state.lookups.saturating_sub(count);
@@ -907,7 +986,7 @@ impl Session {
     }
 
     fn holds(&self, inode: u64) -> bool {
-        self.handles.values().any(|open| open.ino == inode)
+        self.handles_by_inode.contains_key(&inode)
     }
 
     /// The inode for `path`, newly opened (`fd`) or already live: repeat
@@ -930,11 +1009,15 @@ impl Session {
                     state.fd = fd;
                     state.parent = parent;
                     state.name = name.to_vec();
+                    state.kind = kind;
                     state.dead = false;
                 }
                 ino
             }
             None => {
+                if self.inodes.len() >= SESSION_LIMIT {
+                    return Err(io::Error::from_raw_os_error(libc::ENFILE));
+                }
                 let ino = self.next_ino;
                 self.next_ino += 1;
                 self.by_path.insert(path.clone(), ino);
@@ -954,7 +1037,7 @@ impl Session {
             }
         };
         let state = self.inodes.get_mut(&ino).expect("just inserted");
-        state.lookups += 1;
+        state.lookups = state.lookups.saturating_add(1);
         let mut attr = *st;
         attr.st_ino = ino;
         Ok(Entry {
@@ -992,7 +1075,21 @@ impl Session {
         )
     }
 
-    fn insert_file_handle(&mut self, ino: u64, file: File, flags: i32, path: PathBuf) -> u64 {
+    fn check_handle_capacity(&self) -> io::Result<()> {
+        if self.handles.len() >= SESSION_LIMIT {
+            return Err(io::Error::from_raw_os_error(libc::ENFILE));
+        }
+        Ok(())
+    }
+
+    fn insert_file_handle(
+        &mut self,
+        ino: u64,
+        file: File,
+        flags: i32,
+        path: PathBuf,
+    ) -> io::Result<u64> {
+        self.check_handle_capacity()?;
         let handle = self.next_handle;
         self.next_handle += 1;
         self.handles.insert(
@@ -1002,18 +1099,25 @@ impl Session {
                 kind: HandleKind::File { file, flags, path },
             },
         );
-        handle
+        *self.handles_by_inode.entry(ino).or_default() += 1;
+        Ok(handle)
     }
 
     fn open_file(&mut self, read_only: bool, inode: u64, flags: i32) -> io::Result<u64> {
+        self.check_handle_capacity()?;
         let state = live_inode(self, inode)?;
-        let flags = flags | libc::O_CLOEXEC;
-        if read_only && flags & libc::O_ACCMODE != libc::O_RDONLY {
+        if read_only
+            && (flags & libc::O_ACCMODE != libc::O_RDONLY
+                || flags & (libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) != 0)
+        {
             return Err(io::Error::from_raw_os_error(libc::EROFS));
         }
-        let file = reopen(&state.fd, flags)?;
+        let file = reopen(&state.fd, host_open_flags(flags))?;
+        if flags & libc::O_TRUNC != 0 {
+            file.set_len(0)?;
+        }
         let path = state.path.clone();
-        Ok(self.insert_file_handle(inode, file, flags, path))
+        self.insert_file_handle(inode, file, host_open_flags(flags), path)
     }
 
     /// A clone of the open file behind `handle` for one I/O operation.
@@ -1065,8 +1169,18 @@ impl Session {
     }
 
     fn forget_handle(&mut self, inode: u64, handle: u64) {
-        let open = self.handles.remove(&handle);
-        if open.is_some_and(|open| open.ino == inode) {
+        if self
+            .handles
+            .get(&handle)
+            .is_some_and(|open| open.ino == inode)
+        {
+            self.handles.remove(&handle);
+            if let Some(count) = self.handles_by_inode.get_mut(&inode) {
+                *count -= 1;
+                if *count == 0 {
+                    self.handles_by_inode.remove(&inode);
+                }
+            }
             // The open kept the inode alive beyond its last FORGET.
             self.forget_one(inode, 0);
         }
@@ -1136,7 +1250,27 @@ fn open_path(path: &Path, flags: i32) -> io::Result<OwnedFd> {
 /// Reopen the file an `O_PATH` descriptor points at with real `flags`: the
 /// procfs fd link resolves to exactly that inode, so the guest opens what
 /// it looked up even if the host replaced the name meanwhile.
+fn host_open_flags(flags: i32) -> i32 {
+    (flags
+        & (libc::O_ACCMODE
+            | libc::O_DIRECT
+            | libc::O_NONBLOCK
+            | libc::O_NOATIME
+            | libc::O_APPEND
+            | libc::O_SYNC
+            | libc::O_DSYNC))
+        | libc::O_CLOEXEC
+}
+
 fn reopen(path_fd: &OwnedFd, flags: i32) -> io::Result<File> {
+    // Inspect the held inode, not its saved name or kind. This also
+    // protects restored handles when a regular file became a special file.
+    match kind_of(fstat(path_fd.as_raw_fd())?.st_mode) {
+        FileKind::File => {}
+        FileKind::Dir if flags & libc::O_DIRECTORY != 0 => {}
+        FileKind::Symlink => return Err(io::Error::from_raw_os_error(libc::ELOOP)),
+        _ => return Err(io::Error::from_raw_os_error(libc::EPERM)),
+    }
     let path = CString::new(format!("/proc/self/fd/{}", path_fd.as_raw_fd()))
         .expect("proc path has no NUL");
     // SAFETY: `path` is NUL-terminated; the fd is owned from return.
@@ -1289,11 +1423,19 @@ fn linkat(path_fd: &OwnedFd, dir: &OwnedFd, name: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// `fchmodat(2)` relative to a parent descriptor: `O_PATH` handles cannot
-/// carry fchmod(2) themselves.
-fn fchmodat(parent: &OwnedFd, name: &[u8], mode: libc::mode_t) -> io::Result<()> {
-    // SAFETY: `cname` is NUL-terminated; the fd is owned.
-    if unsafe { libc::fchmodat(parent.as_raw_fd(), cname(name).as_ptr(), mode, 0) } != 0 {
+/// Change the held inode, never a saved name that may have been replaced.
+fn fchmodat(fd: &OwnedFd, mode: libc::mode_t) -> io::Result<()> {
+    match kind_of(fstat(fd.as_raw_fd())?.st_mode) {
+        FileKind::File | FileKind::Dir => {}
+        FileKind::Symlink => return Err(io::Error::from_raw_os_error(libc::ELOOP)),
+        FileKind::Other => return Err(io::Error::from_raw_os_error(libc::EPERM)),
+    }
+    // Unlike opening for read, chmod through the held fd also works for
+    // an owner restoring permissions on a mode-000 file. Never allow a
+    // symlink here: chmod would follow its target.
+    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+    // SAFETY: the path is NUL-terminated and the owned fd remains live.
+    if unsafe { libc::chmod(path.as_ptr(), mode) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1304,7 +1446,7 @@ fn cname(name: &[u8]) -> CString {
     CString::new(name.to_vec()).expect("a component has no NUL")
 }
 
-fn fchownat(parent: &OwnedFd, name: &[u8], valid: SetattrValid, attr: &stat64) -> io::Result<()> {
+fn fchownat(fd: &OwnedFd, valid: SetattrValid, attr: &stat64) -> io::Result<()> {
     // -1 leaves a field unchanged; uid_t and gid_t are unsigned on Linux.
     let uid = if valid.contains(SetattrValid::UID) {
         attr.st_uid
@@ -1316,9 +1458,17 @@ fn fchownat(parent: &OwnedFd, name: &[u8], valid: SetattrValid, attr: &stat64) -
     } else {
         u32::MAX
     };
-    // SAFETY: `cname` is NUL-terminated; the fd is owned; -1 leaves a
-    // field unchanged.
-    if unsafe { libc::fchownat(parent.as_raw_fd(), cname(name).as_ptr(), uid, gid, 0) } != 0 {
+    // SAFETY: the empty path names the owned O_PATH fd, including symlinks.
+    if unsafe {
+        libc::fchownat(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            uid,
+            gid,
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1326,8 +1476,11 @@ fn fchownat(parent: &OwnedFd, name: &[u8], valid: SetattrValid, attr: &stat64) -
 
 /// Truncate through a write-mode reopen: O_PATH handles cannot carry
 /// ftruncate(2).
-fn truncateat(parent: &OwnedFd, name: &[u8], size: i64) -> io::Result<()> {
-    let file = openat(parent, name, libc::O_WRONLY)?;
+fn truncateat(fd: &OwnedFd, size: i64) -> io::Result<()> {
+    if kind_of(fstat(fd.as_raw_fd())?.st_mode) != FileKind::File {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let file = reopen(fd, libc::O_WRONLY)?;
     // SAFETY: the fd is owned.
     if unsafe { libc::ftruncate(file.as_raw_fd(), size) } != 0 {
         return Err(io::Error::last_os_error());
@@ -1335,7 +1488,7 @@ fn truncateat(parent: &OwnedFd, name: &[u8], size: i64) -> io::Result<()> {
     Ok(())
 }
 
-fn utimensat(parent: &OwnedFd, name: &[u8], valid: SetattrValid, attr: &stat64) -> io::Result<()> {
+fn utimensat(fd: &OwnedFd, valid: SetattrValid, attr: &stat64) -> io::Result<()> {
     let omit = libc::UTIME_OMIT;
     let times = [
         if valid.contains(SetattrValid::ATIME) {
@@ -1361,9 +1514,15 @@ fn utimensat(parent: &OwnedFd, name: &[u8], valid: SetattrValid, attr: &stat64) 
             }
         },
     ];
-    // SAFETY: `cname` is NUL-terminated; the fd is owned; `times` outlives
-    // the call.
-    if unsafe { libc::utimensat(parent.as_raw_fd(), cname(name).as_ptr(), times.as_ptr(), 0) } != 0
+    // SAFETY: the empty path names the owned O_PATH fd and times outlives the call.
+    if unsafe {
+        libc::utimensat(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            times.as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
     {
         return Err(io::Error::last_os_error());
     }
@@ -1509,6 +1668,198 @@ mod tests {
     }
 
     #[test]
+    fn hostile_create_symlink_cannot_truncate_outside_share() {
+        let (dir, fs) = scratch();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"private").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let result = fs.create(
+            &ctx(),
+            ROOT_ID,
+            c"escape",
+            CreateIn {
+                flags: (libc::O_RDWR | libc::O_TRUNC) as u32,
+                mode: 0o600,
+                ..Default::default()
+            },
+        );
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"private");
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn hostile_readonly_open_refuses_mutating_flags() {
+        let (dir, _) = scratch();
+        let fs = PassthroughFs::new(dir.path().to_path_buf(), true).unwrap();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        for flags in [libc::O_TRUNC, libc::O_APPEND, libc::O_CREAT] {
+            let result = fs.open(&ctx(), ino, flags as u32, 0);
+            assert_eq!(
+                std::fs::read(dir.path().join("hello.txt")).unwrap(),
+                b"hello share\n"
+            );
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EROFS));
+        }
+    }
+
+    #[test]
+    fn hostile_setattr_swapped_name_changes_only_original_inode() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"hello.txt").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"private").unwrap();
+        std::fs::rename(dir.path().join("hello.txt"), dir.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("hello.txt")).unwrap();
+        let mut attr = entry.attr;
+        attr.st_size = 2;
+        attr.st_mode = 0o640;
+        fs.setattr(
+            &ctx(),
+            entry.inode,
+            attr,
+            None,
+            SetattrValid::SIZE | SetattrValid::MODE,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"private");
+        assert_eq!(std::fs::read(dir.path().join("original")).unwrap(), b"he");
+    }
+
+    #[test]
+    fn hostile_mknod_refuses_fifo_and_devices() {
+        let (_dir, fs) = scratch();
+        for mode in [libc::S_IFIFO, libc::S_IFCHR, libc::S_IFBLK] {
+            assert_eq!(
+                fs.mknod(&ctx(), ROOT_ID, c"special", mode | 0o600, 0, 0)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_fifo_open_is_refused_even_with_nonblock() {
+        let (dir, fs) = scratch();
+        let root = open_path(dir.path(), libc::O_PATH).unwrap();
+        mknodat(&root, b"fifo", libc::S_IFIFO | 0o600, 0).unwrap();
+        let ino = lookup(&fs, b"fifo").unwrap().inode;
+        // NONBLOCK keeps the pre-fix regression safe to run.
+        assert_eq!(
+            fs.open(&ctx(), ino, libc::O_NONBLOCK as u32, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[test]
+    fn hostile_inode_lookup_flood_is_bounded() {
+        let (dir, fs) = scratch();
+        for i in 0..32 {
+            let n = format!("inode-{i}");
+            std::fs::write(dir.path().join(&n), b"").unwrap();
+            let result = lookup(&fs, n.as_bytes());
+            if i == 31 {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENFILE));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_handle_open_flood_is_bounded() {
+        let (_dir, fs) = scratch();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        for _ in 0..32 {
+            fs.open(&ctx(), ino, 0, 0).unwrap();
+        }
+        assert_eq!(
+            fs.open(&ctx(), ino, 0, 0).unwrap_err().raw_os_error(),
+            Some(libc::ENFILE)
+        );
+        assert_eq!(
+            fs.opendir(&ctx(), ROOT_ID, 0).unwrap_err().raw_os_error(),
+            Some(libc::ENFILE)
+        );
+    }
+
+    #[test]
+    fn hostile_symlink_setattr_size_is_refused() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"link").unwrap();
+        let mut attr = entry.attr;
+        attr.st_size = 0;
+        let result = fs.setattr(&ctx(), entry.inode, attr, None, SetattrValid::SIZE);
+        assert_eq!(
+            std::fs::read(dir.path().join("hello.txt")).unwrap(),
+            b"hello share\n"
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn hostile_open_flags_cannot_turn_data_handle_into_path_handle() {
+        let (_dir, fs) = scratch();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        let (handle, _, _) = fs.open(&ctx(), ino, libc::O_PATH as u32, 0).unwrap();
+        let file = fs.inner.lock().file_handle(ino, handle.unwrap()).unwrap();
+        use std::os::unix::fs::FileExt;
+        let mut data = [0; 5];
+        file.read_exact_at(&mut data, 0).unwrap();
+        assert_eq!(&data, b"hello");
+    }
+
+    #[test]
+    fn handle_budget_is_reclaimed_only_by_matching_release() {
+        let (_dir, fs) = scratch();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        let mut handles = Vec::new();
+        for _ in 0..SESSION_LIMIT {
+            handles.push(fs.open(&ctx(), ino, 0, 0).unwrap().0.unwrap());
+        }
+        fs.inner.lock().forget_handle(ROOT_ID, handles[0]);
+        assert!(fs.inner.lock().file_handle(ino, handles[0]).is_ok());
+        fs.forget(&ctx(), ino, 1);
+        for handle in handles {
+            fs.inner.lock().forget_handle(ino, handle);
+        }
+        assert!(!fs.inner.lock().inodes.contains_key(&ino));
+        assert!(fs.inner.lock().handles_by_inode.is_empty());
+        assert!(fs.opendir(&ctx(), ROOT_ID, 0).is_ok());
+    }
+
+    #[test]
+    fn create_existing_regular_file_uses_vetted_inode() {
+        let (dir, fs) = scratch();
+        let (entry, handle, _, _) = fs
+            .create(
+                &ctx(),
+                ROOT_ID,
+                c"hello.txt",
+                CreateIn {
+                    flags: (libc::O_RDWR | libc::O_TRUNC) as u32,
+                    mode: 0o600,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(entry.attr.st_size, 0);
+        assert!(
+            fs.inner
+                .lock()
+                .file_handle(entry.inode, handle.unwrap())
+                .is_ok()
+        );
+        assert!(
+            std::fs::read(dir.path().join("hello.txt"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn lookup_rejects_escapes_and_odd_names() {
         let (_dir, fs) = scratch();
         for bad in [&b".."[..], b".", b"", b"a/b", b"hello.txt/."] {
@@ -1597,6 +1948,68 @@ mod tests {
             std::fs::read(_dir.path().join("hello.txt")).unwrap(),
             b"HELLO share\n"
         );
+    }
+
+    #[test]
+    fn append_uses_host_eof_instead_of_stale_guest_offset() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"hello.txt").unwrap();
+        let guest_offset = entry.attr.st_size as u64;
+        let (handle, _, _) = fs
+            .open(
+                &ctx(),
+                entry.inode,
+                (libc::O_WRONLY | libc::O_APPEND) as u32,
+                0,
+            )
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("hello.txt"))
+            .unwrap()
+            .write_all(b"host append\n")
+            .unwrap();
+        let data = b"guest append\n";
+        let written = fs
+            .write(
+                &ctx(),
+                entry.inode,
+                handle.unwrap(),
+                &mut SliceReader(data),
+                data.len() as u32,
+                guest_offset,
+                None,
+                false,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(written, data.len());
+        assert_eq!(
+            std::fs::read(dir.path().join("hello.txt")).unwrap(),
+            b"hello share\nhost append\nguest append\n"
+        );
+    }
+
+    #[test]
+    fn synchronous_open_flags_survive_open_and_restore() {
+        let (_dir, fs) = scratch();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        for flag in [libc::O_SYNC, libc::O_DSYNC] {
+            let (handle, _, _) = fs
+                .open(&ctx(), ino, (libc::O_WRONLY | flag) as u32, 0)
+                .unwrap();
+            for restored in [false, true] {
+                if restored {
+                    fs.restore_state(&fs.save_state()).unwrap();
+                }
+                let file = fs.inner.lock().file_handle(ino, handle.unwrap()).unwrap();
+                // SAFETY: F_GETFL takes no third argument and the fd is owned.
+                let actual = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                assert_ne!(actual, -1);
+                assert_eq!(actual & flag, flag);
+            }
+        }
     }
 
     /// A `ZeroCopyWriter` into a buffer, for driving reads off the queue.

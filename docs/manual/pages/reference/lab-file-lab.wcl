@@ -286,7 +286,7 @@ SRC
     rows:
       | "Field" | "Type" | "Default" | "Meaning" |
       | "`host_port`" | "i64" | "automatic" | "Host port to listen on, 1 to 65535. Unique across the lab on the addresses it binds. Omitted: vmlab picks a free port when it installs the forward." |
-      | "`bind`" | "utf8" | "`0.0.0.0`" | "Host IPv4 address to listen on, one the host owns. Omitted: every interface." |
+      | "`bind`" | "utf8" | "`127.0.0.1`" | "Host IPv4 address to listen on, one the host owns. Omitted: loopback only." |
       | "`to`" | "utf8" | "required" | "Target as `vm:port`. The machine must be declared in this lab." |
       | "`proto`" | "utf8" | "`tcp`" | "Protocol: `tcp`, `udp` or `both`." |
   }
@@ -299,10 +299,10 @@ SRC
   DOC
   h3 "Bind address"
   p <<DOC
-    A forward listens on every host interface (`0.0.0.0`) unless it declares
-    `bind`. Set `bind = "127.0.0.1"` for a forward to a service that trusts
-    its caller, such as an admin console with no login, to keep it off the
-    LAN. Windows on WSL 2 still reaches a loopback forward through WSL's
+    Behaviour change: forwards now listen on loopback (`127.0.0.1`) by
+    default, not every interface. To expose one to the LAN, declare
+    `bind = "0.0.0.0"` or a specific host IPv4 address. Keep services that
+    trust their callers on loopback. Windows on WSL 2 still reaches a loopback forward through WSL's
     localhost forwarding.
   DOC
   list {

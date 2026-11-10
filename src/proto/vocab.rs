@@ -471,6 +471,9 @@ vocabulary! {
             /// each VM named is started paused, its recorder attached, then
             /// continued.
             #[serde(default)] record: Vec<RecordRequest>,
+            /// Also wait until every machine brought up is ready (`vmlab up
+            /// --wait`, §7.2), not only those something else waits on.
+            #[serde(default)] wait: bool,
         },
         /// Download every pending template and image without starting
         /// anything, over the code path `up` runs first.
@@ -1204,6 +1207,7 @@ vocabulary! {
         StoreImport = "store.import" {
             archive: std::path::PathBuf,
             #[serde(default)] overwrite: bool,
+            #[serde(default)] trust_scripts: bool,
         },
         /// Download a published template into the store.
         #[one_way("cli", "Store management, for the reason on `store.list`.")]
@@ -1377,6 +1381,7 @@ mod tests {
                 LabRequest::Up {
                     machines: vec!["dc01".into()],
                     record: Vec::new(),
+                    wait: false,
                 }
             );
         }
@@ -1401,6 +1406,7 @@ mod tests {
             LabRequest::Up {
                 machines: vec!["a".into()],
                 record: Vec::new(),
+                wait: false,
             }
         );
     }
