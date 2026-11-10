@@ -89,7 +89,7 @@ set -eu
     def test_guest_marker_allows_upgrade(self):
         self.guest_bundle()
         guest = self.root / 'guest'
-        guest.mkdir()
+        self.old_guest(guest)
         (guest / '.vmlab-guest').touch()
         (guest / 'old').write_text('obsolete')
         result = self.install()
@@ -98,6 +98,37 @@ set -eu
         self.assertTrue((guest / '.vmlab-guest').is_file())
         self.assertTrue((guest / 'agent/new').is_file())
 
+    def old_guest(self, guest):
+        (guest / 'agent/linux-x86_64').mkdir(parents=True)
+        (guest / 'agent/linux-x86_64/vmlab-agent').write_text('old agent')
+        (guest / 'firmware').mkdir()
+        (guest / 'x86_64').mkdir()
+        (guest / 'x86_64/vmlinuz').write_text('old kernel')
+        (guest / 'x86_64/initramfs.img').write_text('old initramfs')
+
+    def test_unmarked_old_guest_is_adopted_and_upgraded(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        self.old_guest(guest)
+        self.assertFalse((guest / '.vmlab-guest').exists())
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((guest / '.vmlab-guest').is_file())
+        self.assertTrue((guest / 'agent/new').is_file())
+        self.assertFalse((guest / 'agent/linux-x86_64/vmlab-agent').exists())
+
+    def test_foreign_owned_guest_is_preserved(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        self.old_guest(guest)
+        # Simulate stat's ownership result without requiring root/chown.
+        self.tool('stat', '#!/bin/sh\nset -eu\nprintf "%s\\n" foreign-uid\n')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('non-owned', result.stderr)
+        self.assertFalse((guest / '.vmlab-guest').exists())
+        self.assertEqual((guest / 'x86_64/vmlinuz').read_text(), 'old kernel')
+
     def test_guest_without_marker_is_preserved(self):
         self.guest_bundle()
         guest = self.root / 'guest'
@@ -105,14 +136,14 @@ set -eu
         (guest / 'valuable').write_text('keep')
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('refusing to replace unmarked', result.stderr)
+        self.assertIn('refusing to replace unrelated', result.stderr)
         self.assertEqual((guest / 'valuable').read_text(), 'keep')
 
     def test_guest_symlink_is_preserved(self):
         self.guest_bundle()
         guest = self.root / 'guest'
         target = self.root / 'other'
-        target.mkdir()
+        self.old_guest(target)
         (target / '.vmlab-guest').touch()
         guest.symlink_to(target)
         result = self.install()

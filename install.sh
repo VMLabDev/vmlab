@@ -332,13 +332,22 @@ a lab container and a template build both do. Build them from source instead:
 
 install_guest() {
   [ -n "$GUEST_DIR" ] && [ "$GUEST_DIR" != / ] || err "unsafe guest directory"
-  # Never delete an arbitrary directory supplied through --guest-dir. Older
-  # unmarked installs must be moved aside explicitly by their owner first.
+  # Never delete an arbitrary directory supplied through --guest-dir. Adopt
+  # older unmarked installs only when ownership and the bundle layout match.
   if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
-    if [ -L "$GUEST_DIR" ] || [ ! -f "$GUEST_DIR/.vmlab-guest" ]; then
-      guest_fallback "refusing to replace unmarked guest directory $GUEST_DIR; move it aside and retry."
+    if [ -L "$GUEST_DIR" ] || [ ! -d "$GUEST_DIR" ] \
+      || [ "$(stat -c %u -- "$GUEST_DIR" 2>/dev/null || true)" != "$(id -u)" ]; then
+      guest_fallback "refusing to replace symlink or non-owned guest directory $GUEST_DIR."
       return 0
     fi
+    if [ ! -d "$GUEST_DIR/agent" ] || [ ! -d "$GUEST_DIR/firmware" ] \
+      || [ ! -f "$GUEST_DIR/agent/linux-x86_64/vmlab-agent" ] \
+      || [ ! -f "$GUEST_DIR/x86_64/vmlinuz" ] \
+      || [ ! -f "$GUEST_DIR/x86_64/initramfs.img" ]; then
+      guest_fallback "refusing to replace unrelated guest directory $GUEST_DIR: expected the vmlab guest bundle layout."
+      return 0
+    fi
+    touch "$GUEST_DIR/.vmlab-guest" || { guest_fallback "cannot mark $GUEST_DIR."; return 0; }
   fi
   gname="vmlab-guest-${ver}.tar.gz"
   gurl="$BASE_URL/$tag/$gname"
