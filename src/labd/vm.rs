@@ -2731,7 +2731,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            super::snapshot_offline_disks(&[first.clone()], "capture")
+            super::snapshot_offline_disks(std::slice::from_ref(&first), "capture")
                 .await
                 .is_err()
         );
