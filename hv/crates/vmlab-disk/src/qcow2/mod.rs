@@ -997,7 +997,9 @@ impl Qcow2Image {
 
     fn check_writable(&self) -> Result<()> {
         if self.poisoned {
-            return Err(Error::Unsupported("snapshot change failed; reopen the image before writing".into()));
+            return Err(Error::Unsupported(
+                "snapshot change failed; reopen the image before writing".into(),
+            ));
         }
         if self.read_only {
             return Err(Error::ReadOnly);
@@ -1497,7 +1499,9 @@ mod tests {
         img.snapshot_create("y", 0, 0).unwrap();
         // Simulate a legacy file whose first snapshot name equals the
         // second snapshot ID. Fixed header 40, extra 24, one-byte ID.
-        img.file.write_all_at(b"2", img.snapshots_offset + 65).unwrap();
+        img.file
+            .write_all_at(b"2", img.snapshots_offset + 65)
+            .unwrap();
         assert_eq!(img.snapshot_apply("2").unwrap().name, "y");
         img.snapshot_delete("2").unwrap();
         let entries = img.snapshots().unwrap();
@@ -1557,7 +1561,7 @@ mod tests {
 
     #[test]
     fn hostile_metadata_lengths_fail_before_allocation() {
-        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let (_dir, img) = testsupport::blank(8 << 20);
         img.file.write_all_at(&u32::MAX.to_be_bytes(), 36).unwrap();
         assert!(Qcow2Image::open(&img.path, true).is_err());
         img.file.write_all_at(&1u32.to_be_bytes(), 36).unwrap();
@@ -1571,14 +1575,19 @@ mod tests {
         let (_dir, mut img) = testsupport::blank(8 << 20);
         let size = img.cluster_size as usize;
         for len in [size - 1, size, size + 1] {
-            let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
             encoder.write_all(&vec![0x5a; len]).unwrap();
             let mut bytes = encoder.finish().unwrap();
             bytes.resize(512, 0);
             let offset = img.file.metadata().unwrap().len().div_ceil(512) * 512;
             img.file.write_all_at(&bytes, offset).unwrap();
             let mut out = vec![0; size];
-            assert_eq!(img.read_compressed_cluster(COMPRESSED_BIT | offset, &mut out).is_ok(), len == size);
+            assert_eq!(
+                img.read_compressed_cluster(COMPRESSED_BIT | offset, &mut out)
+                    .is_ok(),
+                len == size
+            );
         }
     }
 

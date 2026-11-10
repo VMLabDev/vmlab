@@ -3330,7 +3330,10 @@ impl LabRuntime {
             state.machine_mut(vm_name).pending_snapshots.remove(snap);
             if let Err(error) = state.save(&self.lab_local) {
                 state.machine_mut(vm_name).snapshots.remove(snap);
-                state.machine_mut(vm_name).pending_snapshots.insert(snap.to_string());
+                state
+                    .machine_mut(vm_name)
+                    .pending_snapshots
+                    .insert(snap.to_string());
                 drop(state);
                 let cleanup = m.delete_snapshot(snap).await;
                 if cleanup.is_ok() {
@@ -3338,7 +3341,9 @@ impl LabRuntime {
                     state.machine_mut(vm_name).pending_snapshots.remove(snap);
                     state.save(&self.lab_local)?;
                 }
-                return Err(error.context(format!("capture record save failed, cleanup: {cleanup:?}")));
+                return Err(
+                    error.context(format!("capture record save failed, cleanup: {cleanup:?}"))
+                );
             }
         }
         self.events.emit(
@@ -3348,8 +3353,8 @@ impl LabRuntime {
         Ok(online)
     }
 
-    /// Lab-wide snapshot: every VM and container under one name; consistency
-    /// across machines is best-effort, not coordinated (PRD §7.3).
+    /// Lab-wide capture rolls back earlier machines if a later one fails.
+    /// Capture times remain uncoordinated across guests (PRD §7.3).
     pub async fn snapshot_all(&self, snap: &str) -> Result<Value> {
         let mut results = Vec::new();
         let mut captured: Vec<String> = Vec::new();
@@ -3617,8 +3622,9 @@ impl LabRuntime {
             .map(|m| m.snapshots.clone())
             .unwrap_or_default();
         let mut listed = snaps
-                .into_iter()
-                .map(|(name, r)| json!({
+            .into_iter()
+            .map(|(name, r)| {
+                json!({
                     "name": name,
                     "online": r.online,
                     "taken_at": r.taken_at,
@@ -3627,13 +3633,16 @@ impl LabRuntime {
                     "locked": r.frozen_in.is_some(),
                     "frozen_in": r.frozen_in,
                     "freeze_point": r.freeze_point,
-                }))
-                .collect::<Vec<_>>();
+                })
+            })
+            .collect::<Vec<_>>();
         if let Some(machine) = state.machines.get(vm_name) {
-            listed.extend(machine.pending_snapshots.iter().map(|name| json!({
-                "name": name, "pending": true,
-                "reason": "interrupted capture, delete to clean up before retrying",
-            })));
+            listed.extend(machine.pending_snapshots.iter().map(|name| {
+                json!({
+                    "name": name, "pending": true,
+                    "reason": "interrupted capture, delete to clean up before retrying",
+                })
+            }));
         }
         Ok(json!(listed))
     }
@@ -4450,11 +4459,15 @@ mod tests {
         let first = FakeMachine::new("a", MachineKind::Vm, &sh);
         let mut last = Arc::into_inner(FakeMachine::new("b", MachineKind::Vm, &sh)).unwrap();
         last.snapshot_failure = true;
-        let lab = lab_of(dir.path(), r#"import <vmlab.wcl>
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
 lab "t" {
  vm "a" { template = "x86_64/t" }
  vm "b" { template = "x86_64/t" }
-}"#, vec![first, Arc::new(last)]);
+}"#,
+            vec![first, Arc::new(last)],
+        );
         let error = lab.snapshot_all("capture").await.unwrap_err();
         assert!(format!("{error:#}").contains("rolled back"));
         let state = lab.state.lock().await;
@@ -4465,19 +4478,28 @@ lab "t" {
         let listed = lab.snapshots("b").await.unwrap();
         assert_eq!(listed[0]["pending"], true);
         let log = sh.log.lock().await;
-        assert!(log.iter().any(|line| line.contains("delete_snapshot:capture")));
+        assert!(
+            log.iter()
+                .any(|line| line.contains("delete_snapshot:capture"))
+        );
     }
 
     #[tokio::test]
     async fn pending_capture_is_durable_and_cannot_be_replaced_or_restored() {
         let dir = tempfile::tempdir().unwrap();
         let sh = shared(dir.path());
-        let lab = lab_of(dir.path(), r#"import <vmlab.wcl>
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
 lab "t" { vm "a" { template = "x86_64/t" } }"#,
-            vec![FakeMachine::new("a", MachineKind::Vm, &sh)]);
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
+        );
         {
             let mut state = lab.state.lock().await;
-            state.machine_mut("a").pending_snapshots.insert("interrupted".into());
+            state
+                .machine_mut("a")
+                .pending_snapshots
+                .insert("interrupted".into());
             state.save(&lab.lab_local).unwrap();
         }
         assert!(lab.snapshot("a", "interrupted").await.is_err());
@@ -4485,7 +4507,11 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
         let disk = std::fs::read_to_string(lab.lab_local.join("state.json")).unwrap();
         assert!(disk.contains("interrupted"));
         lab.delete_snapshot("a", "interrupted").await.unwrap();
-        assert!(lab.state.lock().await.machines["a"].pending_snapshots.is_empty());
+        assert!(
+            lab.state.lock().await.machines["a"]
+                .pending_snapshots
+                .is_empty()
+        );
     }
 
     fn quiet() -> crate::scripting::OutputSink {

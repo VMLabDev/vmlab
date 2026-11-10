@@ -1889,8 +1889,12 @@ impl VmInstance {
                 for disk in self.all_disk_paths() {
                     // Capture rollback may already have removed this disk's
                     // entry. Pending-intent cleanup is idempotent.
-                    if crate::template::qimg::image_info(&disk).await?.snapshots
-                        .iter().any(|snapshot| snapshot.name == name) {
+                    if crate::template::qimg::image_info(&disk)
+                        .await?
+                        .snapshots
+                        .iter()
+                        .any(|snapshot| snapshot.name == name)
+                    {
                         crate::template::qimg::snapshot_delete(&disk, name).await?;
                     }
                 }
@@ -2580,8 +2584,12 @@ async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
     // Refuse duplicate names before changing any disk, so rollback never
     // removes a snapshot that predates this operation.
     for disk in disks {
-        if crate::template::qimg::image_info(disk).await?.snapshots
-            .iter().any(|snapshot| snapshot.name == name) {
+        if crate::template::qimg::image_info(disk)
+            .await?
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.name == name)
+        {
             bail!("{}: snapshot {name:?} already exists", disk.display());
         }
     }
@@ -2704,14 +2712,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.qcow2");
         let second = dir.path().join("second.raw");
-        crate::template::qimg::create_blank(&first, 1 << 20).await.unwrap();
+        crate::template::qimg::create_blank(&first, 1 << 20)
+            .await
+            .unwrap();
         std::fs::write(&second, [0; 512]).unwrap();
-        let error = super::snapshot_offline_disks(&[first.clone(), second], "capture").await.unwrap_err();
+        let error = super::snapshot_offline_disks(&[first.clone(), second], "capture")
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("rollback errors: []"));
-        assert!(crate::template::qimg::image_info(&first).await.unwrap().snapshots.is_empty());
-        crate::template::qimg::snapshot_create(&first, "capture").await.unwrap();
-        assert!(super::snapshot_offline_disks(&[first.clone()], "capture").await.is_err());
-        assert_eq!(crate::template::qimg::image_info(&first).await.unwrap().snapshots.len(), 1);
+        assert!(
+            crate::template::qimg::image_info(&first)
+                .await
+                .unwrap()
+                .snapshots
+                .is_empty()
+        );
+        crate::template::qimg::snapshot_create(&first, "capture")
+            .await
+            .unwrap();
+        assert!(
+            super::snapshot_offline_disks(&[first.clone()], "capture")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::template::qimg::image_info(&first)
+                .await
+                .unwrap()
+                .snapshots
+                .len(),
+            1
+        );
     }
 
     fn vm(decl: &str) -> crate::config::model::Vm {

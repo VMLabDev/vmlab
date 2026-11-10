@@ -126,9 +126,9 @@ impl Qcow2Image {
                 vm_state_size_large,
                 disk_size,
             });
-            off = off.checked_add(entry_len.div_ceil(8) * 8).ok_or_else(|| {
-                Error::Unsupported("snapshot table offset overflow".into())
-            })?;
+            off = off
+                .checked_add(entry_len.div_ceil(8) * 8)
+                .ok_or_else(|| Error::Unsupported("snapshot table offset overflow".into()))?;
         }
         Ok(entries)
     }
@@ -205,9 +205,12 @@ impl Qcow2Image {
             self.punch_vmstate(vm_state_size)?;
         }
 
-        let changed: std::collections::HashSet<u64> = snap_l1_pre.iter()
+        let changed: std::collections::HashSet<u64> = snap_l1_pre
+            .iter()
             .chain(self.l1.iter())
-            .map(|e| e & OFFSET_MASK).filter(|&host| host != 0).collect();
+            .map(|e| e & OFFSET_MASK)
+            .filter(|&host| host != 0)
+            .collect();
         self.rewrite_copied_bits(Some(&changed))?;
 
         // Snapshot L1 values with copied bits recomputed from the final
@@ -326,7 +329,10 @@ impl Qcow2Image {
         self.rewrite_copied_bits(None)
     }
 
-    fn rewrite_copied_bits(&mut self, changed: Option<&std::collections::HashSet<u64>>) -> Result<()> {
+    fn rewrite_copied_bits(
+        &mut self,
+        changed: Option<&std::collections::HashSet<u64>>,
+    ) -> Result<()> {
         for l1_index in 0..self.l1.len() {
             let l2_host = self.l1[l1_index] & OFFSET_MASK;
             if l2_host == 0 || changed.is_some_and(|set| !set.contains(&l2_host)) {
@@ -398,8 +404,11 @@ impl Qcow2Image {
         // both the old and the new view never drop to zero.
         self.snapshot_mutating = true;
         self.walk_refcounts(&snap_l1, 1)?;
-        let changed: std::collections::HashSet<u64> = snap_l1.iter()
-            .map(|e| e & OFFSET_MASK).filter(|&host| host != 0).collect();
+        let changed: std::collections::HashSet<u64> = snap_l1
+            .iter()
+            .map(|e| e & OFFSET_MASK)
+            .filter(|&host| host != 0)
+            .collect();
         let old_active = self.l1.clone();
         self.walk_refcounts(&old_active, -1)?;
 
@@ -444,8 +453,11 @@ impl Qcow2Image {
             .collect();
         self.snapshot_mutating = true;
         self.walk_refcounts(&snap_l1, -1)?;
-        let changed: std::collections::HashSet<u64> = snap_l1.iter()
-            .map(|e| e & OFFSET_MASK).filter(|&host| host != 0).collect();
+        let changed: std::collections::HashSet<u64> = snap_l1
+            .iter()
+            .map(|e| e & OFFSET_MASK)
+            .filter(|&host| host != 0)
+            .collect();
         for idx in 0..self.l1_bytes_clusters(entry_l1_size) {
             self.dec_refcount(entry_l1_offset / self.cluster_size + idx)?;
         }
@@ -520,9 +532,9 @@ fn next_snapshot_id(entries: &[SnapshotEntry], name: &str) -> Result<String> {
         .unwrap_or(0);
     let mut candidate = max;
     loop {
-        candidate = candidate.checked_add(1).ok_or_else(|| {
-            Error::Unsupported("snapshot ID space exhausted".into())
-        })?;
+        candidate = candidate
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("snapshot ID space exhausted".into()))?;
         let id = candidate.to_string();
         if id != name && !entries.iter().any(|e| e.name == id) {
             return Ok(id);
