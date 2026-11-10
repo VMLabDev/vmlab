@@ -291,38 +291,42 @@ impl FrameDecoder {
     }
 
     pub fn next_frame(&mut self) -> Option<Frame> {
+        let mut offset = 0;
         loop {
             // Scan to the next magic, discarding garbage.
-            match find_magic(&self.buf) {
+            match find_magic(&self.buf[offset..]) {
                 Some(0) => {}
                 Some(off) => {
-                    self.buf.drain(..off);
+                    offset += off;
                 }
                 None => {
                     // No magic: keep at most the last 3 bytes (a magic could
                     // straddle the boundary), drop the rest.
-                    let keep = self.buf.len().min(MAGIC.len() - 1);
+                    let keep = (self.buf.len() - offset).min(MAGIC.len() - 1);
                     self.buf.drain(..self.buf.len() - keep);
                     return None;
                 }
             }
-            if self.buf.len() < HEADER_LEN {
+            if self.buf.len() - offset < HEADER_LEN {
+                self.buf.drain(..offset);
                 return None;
             }
-            let len = u32::from_le_bytes(self.buf[4..8].try_into().unwrap()) as usize;
-            let kind = FrameKind::from_u8(self.buf[8]);
+            let len =
+                u32::from_le_bytes(self.buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let kind = FrameKind::from_u8(self.buf[offset + 8]);
             let (Some(kind), true) = (kind, len <= MAX_PAYLOAD) else {
                 // Implausible header: this "magic" was stream data. Skip one
                 // byte and rescan.
-                self.buf.drain(..1);
+                offset += 1;
                 continue;
             };
-            if self.buf.len() < HEADER_LEN + len {
+            if self.buf.len() - offset < HEADER_LEN + len {
+                self.buf.drain(..offset);
                 return None;
             }
-            let channel = u32::from_le_bytes(self.buf[9..13].try_into().unwrap());
-            let payload = self.buf[HEADER_LEN..HEADER_LEN + len].to_vec();
-            self.buf.drain(..HEADER_LEN + len);
+            let channel = u32::from_le_bytes(self.buf[offset + 9..offset + 13].try_into().unwrap());
+            let payload = self.buf[offset + HEADER_LEN..offset + HEADER_LEN + len].to_vec();
+            self.buf.drain(..offset + HEADER_LEN + len);
             return Some(Frame {
                 kind,
                 channel,
@@ -745,6 +749,25 @@ pub struct OsInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_headers_resync_to_valid_frame() {
+        let mut decoder = FrameDecoder::new();
+        let mut wire = Vec::new();
+        for _ in 0..100_000 {
+            wire.extend_from_slice(&MAGIC);
+            wire.extend_from_slice(&u32::MAX.to_le_bytes());
+            wire.extend_from_slice(&[255; 5]);
+        }
+        wire.extend(encode_frame(FrameKind::Data, 7, b"ok"));
+        decoder.push(&wire);
+        let frame = decoder.next_frame().unwrap();
+        assert_eq!(frame.payload, b"ok");
+        assert!(decoder.buf.is_empty());
+        decoder.push(&wire[..wire.len() - 1]);
+        assert!(decoder.next_frame().is_none());
+        assert!(decoder.buf.len() <= HEADER_LEN + 2);
+    }
 
     /// `open_app` flattens its mode beside the channel id, and both opens
     /// round-trip through the spelling the agent and the daemon share.

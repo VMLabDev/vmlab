@@ -23,6 +23,15 @@ just ci::check
   comment. There is no `validating` column and no `terrarium card validate`
   for card work. Persistent target dirs: set
   `VMLAB_TARGET_ROOT=/var/build/cache/vmlab/<you>` so a rerun is fast.
+  This also redirects CI reports, virgl, hv iPXE and rebuilt BPF objects.
+  A read-only checkout owned by another user needs command-local Git trust
+  (inherited by Git subprocesses), not a global safe.directory change:
+
+  ```sh
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory \
+    GIT_CONFIG_VALUE_0=/absolute/path/to/checkout \
+    VMLAB_TARGET_ROOT=/var/build/cache/vmlab/<you> just ci::check
+  ```
 - The merge queue runs the same command on each batch merged onto `next`
   (one `terrarium card merge A B C ...` job); its two slots serve merges only.
 - Pass: every recipe of `ci::check` exits 0. Push the test results with
@@ -52,3 +61,17 @@ just ci::check
 
 - Card branches start from `next` and are named after the card (`vml-<n>`).
 - Only the lead merges onto `next`, `release/*` and `main`. No force pushes.
+
+## Release gate
+
+- Run `ci::hv-gate` first, then one full green e2e on the exact release
+  commit that will merge to `main`. The main merge must have the same tree.
+  Otherwise record a written waiver for each failed scenario on the release
+  card. A partial run or a green run on another tree is not release evidence.
+- Do not cut another version while a cut version waits for its e2e.
+- Reserve the host during release e2e. No other heavy vmlab runs may overlap.
+  Use the heavy wrapper hold file and drain both slots as described in
+  `docs/agents/release-gate.md`. All heavy runs start with `terrarium run`
+  through `/var/build/cache/vmlab/bin/heavy`.
+- Follow the exact-tree evidence checklist in `docs/agents/release-gate.md`
+  before merging. Signing and GitHub publication remain main-only.

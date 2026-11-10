@@ -103,7 +103,23 @@ main() {
   "$SCRIPT_DIR/build-agent.sh"
   # After build-agent.sh: the legacy linux-x86 build shares that directory.
   "$SCRIPT_DIR/build-agent-legacy.sh"
-  python3 "$SCRIPT_DIR/vdisplay-windows/package.py" \
+  local display_args=()
+  if [ "${VMLAB_RELEASE_DRY_RUN:-0}" = 1 ]; then
+    # A deliberately incomplete, non-installable artifact, never publication.
+    [ "${GITHUB_EVENT_NAME:-}" = push ] || die 'dry-run requires a release branch push'
+    case "${GITHUB_REF:-}" in refs/heads/release/*) ;; *) die 'dry-run requires release/**' ;; esac
+    [ "$version" = 0.0.0-dry-run ] || die 'dry-run requires the dry-run version'
+    display_args=(--unsigned-dry-run)
+    local filtered=() member
+    for member in "${EXPECTED[@]}"; do
+      case "$member" in
+        vdisplay-windows/x86_64/vmlab-display.cat|vdisplay-windows/x86_64/vmlab-display.cer) ;;
+        *) filtered+=("$member") ;;
+      esac
+    done
+    EXPECTED=("${filtered[@]}")
+  fi
+  python3 "$SCRIPT_DIR/vdisplay-windows/package.py" "${display_args[@]}" \
     "${VMLAB_VDISPLAY_PACKAGE_DIR:-$SCRIPT_DIR/vdisplay-windows/target/signed-package}" \
     "$DIST_DIR/vdisplay-windows/x86_64"
 

@@ -14,6 +14,7 @@ import tarfile
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
+HV_OUTPUT = Path(os.environ["VMLAB_TARGET_ROOT"]) / "ipxe" if os.environ.get("VMLAB_TARGET_ROOT") else ROOT / "hv/target/ipxe"
 
 # What each profile builds and where. Both share the pin, the console
 # configuration and this procedure; they differ in `config/<profile>/` and in
@@ -30,8 +31,8 @@ PROFILES = {
         "order": None,
     },
     "hv": {
-        "source": ROOT / "hv/target/ipxe/upstream",
-        "output": ROOT / "hv/target/ipxe",
+        "source": HV_OUTPUT / "upstream",
+        "output": HV_OUTPUT,
         "models": (("virtio-net", "1af41000"),),
         "singles": "virtio-net",
         "sums": "SHA256SUMS",
