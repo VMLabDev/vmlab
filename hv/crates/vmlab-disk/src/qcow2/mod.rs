@@ -157,6 +157,8 @@ pub struct Qcow2Image {
     file: File,
     path: PathBuf,
     read_only: bool,
+    poisoned: bool,
+    snapshot_mutating: bool,
 
     version: u32,
     cluster_bits: u32,
@@ -419,6 +421,8 @@ impl Qcow2Image {
             file,
             path: path.to_path_buf(),
             read_only,
+            poisoned: false,
+            snapshot_mutating: false,
             version,
             cluster_bits,
             cluster_size,
@@ -632,13 +636,19 @@ impl Qcow2Image {
         let mut compressed = vec![0u8; (end - host_offset) as usize];
         self.read_file(host_offset, &mut compressed)?;
         let mut decompressor = flate2::Decompress::new(false);
-        let _status = decompressor
+        let status = decompressor
             .decompress(&compressed, out, flate2::FlushDecompress::None)
             .map_err(|e| Error::Format {
                 format: "qcow2",
                 reason: format!("deflate error in compressed cluster: {e}"),
             })?;
-        // corrupt image, but QEMU tolerates trailing garbage so we do too.
+        if status != flate2::Status::StreamEnd || decompressor.total_out() != out.len() as u64 {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: "compressed cluster must contain one complete cluster".into(),
+            });
+        }
+        // Sector padding after the complete stream is allowed.
         Ok(())
     }
 
@@ -974,6 +984,9 @@ impl Qcow2Image {
     }
 
     fn check_writable(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Unsupported("snapshot change failed; reopen the image before writing".into()));
+        }
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -1286,6 +1299,7 @@ impl DiskImage for Qcow2Image {
 
     fn flush(&mut self) -> Result<()> {
         if !self.read_only {
+            self.check_writable()?;
             self.flush_metadata()?;
             self.file.sync_all()?;
         }
@@ -1338,15 +1352,18 @@ impl DiskImage for Qcow2Image {
         vm_state_size: u64,
         vm_clock_nsec: u64,
     ) -> Result<()> {
-        self.snapshot_create_impl(name, vm_state_size, vm_clock_nsec)
+        let result = self.snapshot_create_impl(name, vm_state_size, vm_clock_nsec);
+        self.finish_snapshot_change(result)
     }
 
     fn snapshot_apply(&mut self, name: &str) -> Result<SnapshotInfo> {
-        self.snapshot_apply_impl(name)
+        let result = self.snapshot_apply_impl(name);
+        self.finish_snapshot_change(result)
     }
 
     fn snapshot_delete(&mut self, name: &str) -> Result<()> {
-        self.snapshot_delete_impl(name)
+        let result = self.snapshot_delete_impl(name);
+        self.finish_snapshot_change(result)
     }
 
     fn write_vmstate(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
@@ -1377,7 +1394,7 @@ impl DiskImage for Qcow2Image {
 /// Call [`DiskImage::flush`] to see errors and for durability.
 impl Drop for Qcow2Image {
     fn drop(&mut self) {
-        if !self.read_only {
+        if !self.read_only && !self.poisoned {
             let _ = self.close_clean();
         }
     }
@@ -1433,6 +1450,23 @@ pub(crate) fn probe_format(path: &Path) -> Result<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_cluster_requires_complete_exact_length_stream() {
+        use std::io::Write;
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let size = img.cluster_size as usize;
+        for len in [size - 1, size, size + 1] {
+            let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&vec![0x5a; len]).unwrap();
+            let mut bytes = encoder.finish().unwrap();
+            bytes.resize(512, 0);
+            let offset = img.file.metadata().unwrap().len().div_ceil(512) * 512;
+            img.file.write_all_at(&bytes, offset).unwrap();
+            let mut out = vec![0; size];
+            assert_eq!(img.read_compressed_cluster(COMPRESSED_BIT | offset, &mut out).is_ok(), len == size);
+        }
+    }
 
     #[test]
     fn crash_writer_child() {
