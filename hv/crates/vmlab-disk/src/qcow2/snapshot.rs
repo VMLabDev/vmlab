@@ -197,7 +197,7 @@ impl Qcow2Image {
         // Everything reachable from the active L1 becomes shared with the
         // snapshot that will point at the same L2 tables and clusters.
         let snap_l1_pre = self.l1.clone();
-        self.walk_refcounts(&snap_l1_pre, 1)?;
+        let mut changed = self.walk_refcounts(&snap_l1_pre, 1)?;
 
         // Punch the vmstate out of the active layer; the snapshot L1 (cloned
         // above) keeps pointing at the original L2 tables and data.
@@ -205,12 +205,12 @@ impl Qcow2Image {
             self.punch_vmstate(vm_state_size)?;
         }
 
-        let changed: std::collections::HashSet<u64> = snap_l1_pre
-            .iter()
-            .chain(self.l1.iter())
-            .map(|e| e & OFFSET_MASK)
-            .filter(|&host| host != 0)
-            .collect();
+        changed.extend(
+            self.l1
+                .iter()
+                .map(|e| e & OFFSET_MASK)
+                .filter(|&host| host != 0),
+        );
         self.rewrite_copied_bits(Some(&changed))?;
 
         // Snapshot L1 values with copied bits recomputed from the final
@@ -331,12 +331,26 @@ impl Qcow2Image {
 
     fn rewrite_copied_bits(
         &mut self,
-        changed: Option<&std::collections::HashSet<u64>>,
+        changed: Option<&std::collections::BTreeSet<u64>>,
     ) -> Result<()> {
         for l1_index in 0..self.l1.len() {
             let l2_host = self.l1[l1_index] & OFFSET_MASK;
-            if l2_host == 0 || changed.is_some_and(|set| !set.contains(&l2_host)) {
+            if l2_host == 0 {
                 continue;
+            }
+            if let Some(changed) = changed
+                && !changed.contains(&l2_host)
+            {
+                // A COWed L2 may still reference data also held by a
+                // snapshot's older L2, including aliases at other guest
+                // offsets. Filter by data references, not table identity.
+                if !self.l2_data_ranges.contains_key(&l2_host) {
+                    self.load_l2(l2_host)?;
+                }
+                let &(first, last) = self.l2_data_ranges.get(&l2_host).expect("loaded range");
+                if first > last || changed.range(first..=last).next().is_none() {
+                    continue;
+                }
             }
             let want = if self.get_refcount(l2_host / self.cluster_size)? == 1 {
                 COPIED_BIT
@@ -403,14 +417,9 @@ impl Qcow2Image {
         // Raise the snapshot's references first so clusters referenced by
         // both the old and the new view never drop to zero.
         self.snapshot_mutating = true;
-        self.walk_refcounts(&snap_l1, 1)?;
-        let changed: std::collections::HashSet<u64> = snap_l1
-            .iter()
-            .map(|e| e & OFFSET_MASK)
-            .filter(|&host| host != 0)
-            .collect();
+        let mut changed = self.walk_refcounts(&snap_l1, 1)?;
         let old_active = self.l1.clone();
-        self.walk_refcounts(&old_active, -1)?;
+        changed.extend(self.walk_refcounts(&old_active, -1)?);
 
         // Install the snapshot's L1 as the active table.
         self.ensure_l1_size(snap_l1_size)?;
@@ -452,12 +461,7 @@ impl Qcow2Image {
             .map(|c| u64::from_be_bytes(*c))
             .collect();
         self.snapshot_mutating = true;
-        self.walk_refcounts(&snap_l1, -1)?;
-        let changed: std::collections::HashSet<u64> = snap_l1
-            .iter()
-            .map(|e| e & OFFSET_MASK)
-            .filter(|&host| host != 0)
-            .collect();
+        let changed = self.walk_refcounts(&snap_l1, -1)?;
         for idx in 0..self.l1_bytes_clusters(entry_l1_size) {
             self.dec_refcount(entry_l1_offset / self.cluster_size + idx)?;
         }

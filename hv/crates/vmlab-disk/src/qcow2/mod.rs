@@ -186,6 +186,9 @@ pub struct Qcow2Image {
     refcount_table: Vec<u64>,
 
     l2_cache: TableCache,
+    /// Conservative data-offset bounds for each L2 we have read. Retained
+    /// across cache eviction so snapshot repair can skip unrelated tables.
+    l2_data_ranges: HashMap<u64, (u64, u64)>,
     refblock_cache: TableCache,
     free: FreeClusters,
     header_dirty: bool,
@@ -448,6 +451,7 @@ impl Qcow2Image {
             l1,
             refcount_table,
             l2_cache: TableCache::new(64),
+            l2_data_ranges: HashMap::new(),
             refblock_cache: TableCache::new(64),
             header_dirty: false,
             l1_dirty: false,
@@ -541,6 +545,16 @@ impl Qcow2Image {
         }
         let mut buf = vec![0u8; self.cluster_size as usize];
         self.read_file(host_offset, &mut buf)?;
+        let mut range = (u64::MAX, 0);
+        for bytes in buf.as_chunks::<8>().0 {
+            let entry = u64::from_be_bytes(*bytes);
+            let host = entry & OFFSET_MASK;
+            if host != 0 && entry & COMPRESSED_BIT == 0 {
+                range.0 = range.0.min(host);
+                range.1 = range.1.max(host);
+            }
+        }
+        self.l2_data_ranges.insert(host_offset, range);
         let mut evicted = self.l2_cache.put(host_offset, buf, false).into_iter();
         while let Some((host, table)) = evicted.next() {
             if let Err(e) = self.write_file(host, &table) {
@@ -566,6 +580,14 @@ impl Qcow2Image {
         let (buf, _) = self.l2_cache.map.get_mut(&l2_host).expect("just cached");
         let off = index as usize * 8;
         buf[off..off + 8].copy_from_slice(&value.to_be_bytes());
+        let host = value & OFFSET_MASK;
+        if host != 0 && value & COMPRESSED_BIT == 0 {
+            let range = self.l2_data_ranges.get_mut(&l2_host).expect("loaded range");
+            // Do not shrink after replacement. Extra overlap only costs a
+            // repair, whereas omitting an alias would leave copied bits stale.
+            range.0 = range.0.min(host);
+            range.1 = range.1.max(host);
+        }
         Ok(())
     }
 
@@ -1114,6 +1136,7 @@ impl Qcow2Image {
             l1: vec![0u64; l1_size as usize],
             refcount_table,
             l2_cache: TableCache::new(64),
+            l2_data_ranges: HashMap::new(),
             refblock_cache: TableCache::new(64),
             header_dirty: false,
             l1_dirty: false,
@@ -1476,6 +1499,20 @@ pub(crate) fn probe_format(path: &Path) -> Result<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_delete_repairs_data_in_a_cowed_active_l2() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let cluster = img.cluster_size;
+        img.write_at(0, &[0x11; 512]).unwrap();
+        img.write_at(cluster, &[0x22; 512]).unwrap();
+        img.snapshot_create("before", 0, 0).unwrap();
+        img.write_at(0, &[0x33; 512]).unwrap();
+        let active_l2 = img.l1[0] & OFFSET_MASK;
+        assert_eq!(img.l2_entry(active_l2, 1).unwrap() & COPIED_BIT, 0);
+        img.snapshot_delete("before").unwrap();
+        assert_ne!(img.l2_entry(active_l2, 1).unwrap() & COPIED_BIT, 0);
+    }
 
     #[test]
     fn deleting_snapshot_does_not_walk_unrelated_active_l2() {

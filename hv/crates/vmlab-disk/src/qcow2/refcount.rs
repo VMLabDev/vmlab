@@ -269,6 +269,7 @@ impl Qcow2Image {
         };
         let host = host_idx * self.cluster_size;
         self.l2_cache.remove(host);
+        self.l2_data_ranges.remove(&host);
         // Install the table entry first so refblock_set can resolve it.
         self.refcount_table[table_index as usize] = host;
         self.refcount_table_dirty = true;
@@ -289,6 +290,7 @@ impl Qcow2Image {
         // A freed cluster may retain a cached L2 from its previous owner.
         // Discard it before the storage is used for a new allocation.
         self.l2_cache.remove(idx * self.cluster_size);
+        self.l2_data_ranges.remove(&(idx * self.cluster_size));
         self.set_cluster_refcount(idx, 1)?;
         Ok(idx * self.cluster_size)
     }
@@ -298,6 +300,7 @@ impl Qcow2Image {
         let first = self.find_free(count)?;
         for idx in first..first + count {
             self.l2_cache.remove(idx * self.cluster_size);
+            self.l2_data_ranges.remove(&(idx * self.cluster_size));
             self.set_cluster_refcount(idx, 1)?;
         }
         Ok(first * self.cluster_size)
@@ -469,13 +472,19 @@ impl Qcow2Image {
     /// Adjust the refcount of every cluster referenced by an L1 table
     /// (the L2 tables it points at and all clusters those map, including
     /// compressed-cluster byte ranges).
-    pub(crate) fn walk_refcounts(&mut self, l1: &[u64], delta: i64) -> Result<()> {
+    pub(crate) fn walk_refcounts(
+        &mut self,
+        l1: &[u64],
+        delta: i64,
+    ) -> Result<std::collections::BTreeSet<u64>> {
+        let mut changed = std::collections::BTreeSet::new();
         for &l1e in l1 {
             let l2_host = l1e & OFFSET_MASK;
             if l2_host == 0 {
                 continue;
             }
             self.adjust_one(l2_host / self.cluster_size, delta)?;
+            changed.insert(l2_host);
             self.load_l2(l2_host)?;
             let entries: Vec<u64> = {
                 let (buf, _) = self.l2_cache.get(l2_host).expect("cached");
@@ -492,11 +501,12 @@ impl Qcow2Image {
                     let host = entry & OFFSET_MASK;
                     if host != 0 {
                         self.adjust_one(host / self.cluster_size, delta)?;
+                        changed.insert(host);
                     }
                 }
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn adjust_one(&mut self, cluster_idx: u64, delta: i64) -> Result<()> {
