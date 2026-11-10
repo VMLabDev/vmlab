@@ -256,16 +256,22 @@ mod tests {
     #[test]
     fn canonical_root_resolves_relative_absolute_and_symlink_paths() {
         let cwd = std::env::current_dir().unwrap();
-        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("lab");
         std::fs::create_dir(&root).unwrap();
         let link = temp.path().join("lab-link");
         symlink(&root, &link).unwrap();
-        let relative = root.strip_prefix(&cwd).unwrap();
+        // Reach the temporary fixture from cwd without writing in the checkout
+        // or changing the process-wide cwd while other tests are running.
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(root.strip_prefix("/").unwrap());
 
         let canonical = canonical_root(&root).unwrap();
 
-        assert_eq!(canonical_root(relative).unwrap(), canonical);
+        assert_eq!(canonical_root(&relative).unwrap(), canonical);
         assert_eq!(canonical_root(&link).unwrap(), canonical);
     }
 }
