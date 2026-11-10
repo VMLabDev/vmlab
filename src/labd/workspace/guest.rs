@@ -249,6 +249,7 @@ pub mod fake {
 
     #[derive(Debug, Default)]
     struct Guest {
+        hostile_listing: Option<Vec<DirEntry>>,
         nodes: BTreeMap<String, (Node, i64)>,
         /// Every path the guest was asked to write to, in order — so a test
         /// can assert a rename happened *after* the bytes landed, and that a
@@ -328,6 +329,9 @@ pub mod fake {
     }
 
     impl FakeGuest {
+        pub fn listing(&self, entries: Vec<DirEntry>) {
+            self.inner.lock().expect("fake guest").hostile_listing = Some(entries);
+        }
         pub fn new() -> FakeGuest {
             FakeGuest::default()
         }
@@ -651,6 +655,9 @@ pub mod fake {
 
         async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
             let guest = self.inner.lock().expect("fake guest");
+            if let Some(entries) = &guest.hostile_listing {
+                return Ok(entries.clone());
+            }
             if guest.unreadable.iter().any(|p| p == path) {
                 bail!("permission denied: {path}");
             }

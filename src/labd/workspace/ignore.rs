@@ -437,6 +437,18 @@ pub fn join_rel(dir: &str, name: &str) -> String {
     }
 }
 
+/// A guest directory entry is one component, never a path.
+pub fn validate_entry_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0', ':']),
+        "invalid guest directory entry name: {name:?}"
+    );
+    Ok(())
+}
+
+pub const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+pub const MAX_SCAN_ENTRIES: usize = 1_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

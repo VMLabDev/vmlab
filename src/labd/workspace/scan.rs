@@ -345,6 +345,7 @@ pub async fn guest_walk(
     }
 
     let mut suspects: Vec<(String, State)> = Vec::new();
+    let mut entry_count = 0usize;
     let mut level = vec![String::new()];
     while !level.is_empty() {
         // One level at a time, every directory in it at once: a source tree
@@ -374,7 +375,17 @@ pub async fn guest_walk(
                     continue;
                 }
             };
+            anyhow::ensure!(
+                entries.len() <= super::ignore::MAX_DIRECTORY_ENTRIES,
+                "guest directory entry limit exceeded"
+            );
+            entry_count += entries.len();
+            anyhow::ensure!(
+                entry_count <= super::ignore::MAX_SCAN_ENTRIES,
+                "guest scan entry limit exceeded"
+            );
             for entry in entries {
+                super::ignore::validate_entry_name(&entry.name)?;
                 let rel = join_rel(&dir, &entry.name);
                 let is_dir = entry.attrs.kind == crate::labd::vm_agent::EntryKind::Dir;
                 if ignores.verdict(&rel, is_dir) == Verdict::GuestOwned {
@@ -567,6 +578,41 @@ mod tests {
     /// A cap no test file comes near, so the guard is out of the way except
     /// where a test is about it.
     const NO_CAP: u64 = u64::MAX;
+
+    #[tokio::test]
+    async fn hostile_guest_directory_names_abort_the_walk() {
+        use crate::labd::vm_agent::{Attrs, DirEntry, EntryKind};
+        for name in [
+            "",
+            ".",
+            "..",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            "C:escape",
+            "\\absolute",
+        ] {
+            let guest = FakeGuest::new();
+            guest.dir("/src");
+            guest.listing(vec![DirEntry {
+                name: name.into(),
+                attrs: Attrs {
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    mtime_ns: 0,
+                    atime_ns: 0,
+                },
+            }]);
+            let ignores = Ignores::new();
+            assert!(
+                guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, NO_CAP)
+                    .await
+                    .is_err(),
+                "{name:?}"
+            );
+        }
+    }
 
     fn empty_ledger() -> Ledger {
         Ledger::new(Path::new("/lab/src"), "/src")

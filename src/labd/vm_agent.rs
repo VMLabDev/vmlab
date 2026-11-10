@@ -1604,6 +1604,17 @@ impl FileOps {
         let outcome = loop {
             match self.inner.call(Op::ReadDir { handle }, &[]).await {
                 Ok((Reply::Entries { entries, eof }, _)) => {
+                    if let Err(e) = entries.iter().try_for_each(|entry| {
+                        super::workspace::ignore::validate_entry_name(&entry.name)
+                    }) {
+                        break Err(e);
+                    }
+                    if entries.is_empty() && !eof {
+                        break Err(anyhow!("guest directory listing made no progress"));
+                    }
+                    if entries.len() > super::workspace::ignore::MAX_DIRECTORY_ENTRIES - all.len() {
+                        break Err(anyhow!("guest directory entry limit exceeded"));
+                    }
                     all.extend(entries);
                     if eof {
                         break Ok(());
