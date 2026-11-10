@@ -5,6 +5,7 @@
 //! observations that pin the vmstate layout.
 
 mod refcount;
+mod recovery;
 mod snapshot;
 
 use self::refcount::FreeClusters;
@@ -29,6 +30,7 @@ const EXT_BACKING_FORMAT: u32 = 0xe279_2aca;
 const EXT_END: u32 = 0;
 
 const MAX_BACKING_DEPTH: usize = 8;
+const INCOMPAT_DIRTY: u64 = 1;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ReadSource {
@@ -187,6 +189,9 @@ pub struct Qcow2Image {
     header_dirty: bool,
     l1_dirty: bool,
     refcount_table_dirty: bool,
+    // A zero refcount is not reusable until the old mapping is durable.
+    retired: std::collections::HashSet<u64>,
+    write_started: bool,
 }
 
 impl Qcow2Image {
@@ -203,6 +208,14 @@ impl Qcow2Image {
         }
         let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let mut img = Self::parse(path, file, read_only)?;
+        // v2 has no dirty marker, so never trust its refcounts on writable open.
+        if !read_only && (img.is_dirty() || img.version == 2) {
+            if let Err(error) = img.rebuild_refcounts() {
+                // Never flush a partially recovered image from Drop.
+                img.read_only = true;
+                return Err(error);
+            }
+        }
         img.open_backing(depth)?;
         Ok(img)
     }
@@ -281,7 +294,6 @@ impl Qcow2Image {
                 });
             }
         }
-        const INCOMPAT_DIRTY: u64 = 1;
         const INCOMPAT_CORRUPT: u64 = 1 << 1;
         const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
         const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
@@ -295,13 +307,6 @@ impl Qcow2Image {
             return Err(Error::Unsupported(format!(
                 "unknown incompatible features {incompatible_features:#x}"
             )));
-        }
-        if incompatible_features & INCOMPAT_DIRTY != 0 {
-            return Err(Error::Unsupported(
-                "image has the dirty bit set (lazy refcounts were not flushed); \
-                 run qemu-img check on it first"
-                    .into(),
-            ));
         }
         if incompatible_features & INCOMPAT_CORRUPT != 0 {
             return Err(Error::Unsupported("image is marked corrupt".into()));
@@ -435,6 +440,8 @@ impl Qcow2Image {
             l1_dirty: false,
             refcount_table_dirty: false,
             free: FreeClusters::default(),
+            retired: Default::default(),
+            write_started: false,
         };
         Ok(img)
     }
@@ -508,6 +515,7 @@ impl Qcow2Image {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        self.begin_write()?;
         self.file.write_all_at(buf, offset)?;
         Ok(())
     }
@@ -834,6 +842,7 @@ impl Qcow2Image {
 
     fn flush_metadata(&mut self) -> Result<()> {
         self.check_writable()?;
+        self.begin_write()?;
         // Refblocks first (their location comes from the refcount table),
         // then the refcount table, the L1, the L2s and the header.
         // Each table is marked clean only after its write succeeded, so a
@@ -852,6 +861,9 @@ impl Qcow2Image {
             self.write_file(self.refcount_table_offset, &bytes)?;
             self.refcount_table_dirty = false;
         }
+        self.file.sync_all()?;
+        #[cfg(test)]
+        self.crash_checkpoint("refcounts");
         if self.l1_dirty {
             let bytes: Vec<u8> = self.l1.iter().flat_map(|e| e.to_be_bytes()).collect();
             self.write_file(self.l1_table_offset, &bytes)?;
@@ -867,7 +879,62 @@ impl Qcow2Image {
             self.write_file(0, &cluster)?;
             self.header_dirty = false;
         }
+        self.file.sync_all()?;
+        #[cfg(test)]
+        self.crash_checkpoint("mappings");
+        self.retired.clear();
+        self.free = FreeClusters::default();
         Ok(())
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.version >= 3
+            && u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap())
+                & INCOMPAT_DIRTY != 0
+    }
+
+    /// Persist the dirty marker before the first data or metadata write.
+    /// Version 2 has no incompatible-feature word.
+    fn begin_write(&mut self) -> Result<()> {
+        if self.write_started {
+            return Ok(());
+        }
+        if self.version >= 3 {
+            let features = u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap())
+                | INCOMPAT_DIRTY;
+            self.file.write_all_at(&features.to_be_bytes(), 72)?;
+            self.file.sync_all()?;
+            self.header_cluster[72..80].copy_from_slice(&features.to_be_bytes());
+        }
+        self.write_started = true;
+        Ok(())
+    }
+
+    fn close_clean(&mut self) -> Result<()> {
+        self.flush()?;
+        if self.is_dirty() {
+            let features = u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap())
+                & !INCOMPAT_DIRTY;
+            self.file.write_all_at(&features.to_be_bytes(), 72)?;
+            self.file.sync_all()?;
+            self.header_cluster[72..80].copy_from_slice(&features.to_be_bytes());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn crash_checkpoint(&self, phase: &str) {
+        if std::env::var_os("VMLAB_QCOW_CRASH_IMAGE").as_deref() == Some(self.path.as_os_str())
+            && std::env::var("VMLAB_QCOW_CRASH_PHASE").as_deref() == Ok(phase)
+        {
+            use std::io::Write;
+            println!("QCOW_CHECKPOINT");
+            std::io::stdout().flush().unwrap();
+            // The parent kills this child by PID. Do not run Drop.
+            let mut byte = [0];
+            std::io::stdin().read_exact(&mut byte).unwrap();
+            panic!("crash checkpoint unexpectedly resumed");
+        }
     }
 
     fn refblock_host(&self, table_index: u64) -> Result<u64> {
@@ -1022,12 +1089,15 @@ impl Qcow2Image {
             l1_dirty: false,
             refcount_table_dirty: false,
             free: FreeClusters::default(),
+            retired: Default::default(),
+            write_started: false,
         };
+        // Install the initial header before begin_write updates its marker.
+        img.file.write_all_at(&hc, 0)?;
         // Refcounts for the metadata clusters themselves.
         for idx in 0u64..(3 + l1_clusters) {
             img.set_cluster_refcount(idx, 1)?;
         }
-        img.write_file(0, &hc)?;
         img.write_file(cluster_size, &rt)?;
         img.open_backing(0)?;
         Ok(img)
@@ -1302,12 +1372,12 @@ impl DiskImage for Qcow2Image {
 /// until a flush. Without this, an owner that drops the image without
 /// `flush` leaves the data in the file but unmapped (VML-107).
 ///
-/// This is best effort, like `BufWriter`: an error is dropped and nothing is
-/// synced. Call [`DiskImage::flush`] to see errors and for durability.
+/// This is best effort, like `BufWriter`: errors leave the dirty marker set.
+/// Call [`DiskImage::flush`] to see errors and for durability.
 impl Drop for Qcow2Image {
     fn drop(&mut self) {
         if !self.read_only {
-            let _ = self.flush_metadata();
+            let _ = self.close_clean();
         }
     }
 }
@@ -1362,6 +1432,92 @@ pub(crate) fn probe_format(path: &Path) -> Result<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_writer_child() {
+        let Some(path) = std::env::var_os("VMLAB_QCOW_CRASH_IMAGE") else {
+            return;
+        };
+        let mut img = Qcow2Image::open(Path::new(&path), false).unwrap();
+        img.write_at(img.cluster_size, &vec![0x72; img.cluster_size as usize]).unwrap();
+        img.flush().unwrap();
+        panic!("child did not stop at the crash checkpoint");
+    }
+
+    #[test]
+    fn killed_metadata_writer_recovers_before_allocating() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        for phase in ["refcounts", "mappings"] {
+            let (_dir, mut img) = testsupport::blank(8 << 20);
+            let path = img.path.clone();
+            let cluster = img.cluster_size;
+            img.write_at(0, &vec![0x31; cluster as usize]).unwrap();
+            img.snapshot_create("before", 0, 0).unwrap();
+            drop(img);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "qcow2::tests::crash_writer_child", "--nocapture"])
+                .env("VMLAB_QCOW_CRASH_IMAGE", &path)
+                .env("VMLAB_QCOW_CRASH_PHASE", phase)
+                .stdout(Stdio::piped()).stdin(Stdio::piped()).spawn().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if line.unwrap().contains("QCOW_CHECKPOINT") {
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+            });
+            let checkpoint = rx.recv_timeout(Duration::from_secs(30));
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            reader.join().unwrap();
+            checkpoint.expect("child reached metadata boundary");
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9));
+
+            let read_only = Qcow2Image::open(&path, true).unwrap();
+            assert!(read_only.is_dirty());
+            drop(read_only);
+            let mut recovered = Qcow2Image::open(&path, false).unwrap();
+            let mut bytes = vec![0; cluster as usize];
+            recovered.read_at(0, &mut bytes).unwrap();
+            assert_eq!(bytes, vec![0x31; cluster as usize]);
+            recovered.read_at(cluster, &mut bytes).unwrap();
+            assert_eq!(bytes, vec![if phase == "mappings" { 0x72 } else { 0 }; cluster as usize]);
+            recovered.write_at(2 * cluster, &vec![0x93; cluster as usize]).unwrap();
+            recovered.flush().unwrap();
+            recovered.read_at(0, &mut bytes).unwrap();
+            assert_eq!(bytes, vec![0x31; cluster as usize]);
+            recovered.snapshot_apply("before").unwrap();
+            recovered.read_at(0, &mut bytes).unwrap();
+            assert_eq!(bytes, vec![0x31; cluster as usize]);
+            drop(recovered);
+            assert!(!Qcow2Image::open(&path, true).unwrap().is_dirty());
+            let check = Command::new("qemu-img").args(["check", "-f", "qcow2"])
+                .arg(&path).output().expect("qemu-img is required for crash recovery test");
+            assert!(check.status.success(), "{}{}", String::from_utf8_lossy(&check.stdout), String::from_utf8_lossy(&check.stderr));
+        }
+    }
+
+    #[test]
+    fn dirty_marker_survives_flush_and_failed_close() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let path = img.path.clone();
+        img.write_at(0, &[0x51; 512]).unwrap();
+        img.flush().unwrap();
+        assert!(Qcow2Image::open(&path, true).unwrap().is_dirty());
+        img.write_at(img.cluster_size, &[0x52; 512]).unwrap();
+        fail_writes(&mut img);
+        drop(img);
+        assert!(Qcow2Image::open(&path, true).unwrap().is_dirty());
+        drop(Qcow2Image::open(&path, false).unwrap());
+        assert!(!Qcow2Image::open(&path, true).unwrap().is_dirty());
+    }
 
     #[test]
     fn read_extents_coalesce_adjacent_clusters_and_stop_at_holes() {
@@ -1426,6 +1582,7 @@ mod tests {
         assert_eq!(b, a + img.cluster_size);
         img.dec_refcount(a / img.cluster_size).unwrap();
         img.dec_refcount(c / img.cluster_size).unwrap();
+        img.flush().unwrap();
         // The lowest hole goes first, then the next.
         assert_eq!(img.alloc_cluster().unwrap(), a);
         assert_eq!(img.alloc_cluster().unwrap(), c);
