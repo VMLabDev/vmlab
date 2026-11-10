@@ -4,7 +4,7 @@
 // found in the LICENSE-BSD-3-Clause file.
 
 use log::{error, info, trace, warn};
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, IoSlice, Write};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
