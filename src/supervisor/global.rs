@@ -1174,6 +1174,25 @@ mod tests {
         assert!(list.is_empty(), "rejected peer still created the segment");
     }
 
+    #[tokio::test]
+    async fn silent_trunk_peer_is_disconnected_after_handshake_timeout() {
+        use tokio::io::AsyncReadExt;
+        let host = instance("secret").await;
+        let mut stream = tokio::net::TcpStream::connect(host.addr).await.unwrap();
+        let mut greeting = [0; 44];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting[..12], b"VMLABTRUNK2\n");
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(7), stream.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(host.globals.list().await.is_empty());
+    }
+
     // ---- the shared segment's DNS (PRD §9.2, §9.5) ---------------------------
 
     fn member(machine: &str, last: u8, ip: Option<[u8; 4]>) -> GlobalMember {

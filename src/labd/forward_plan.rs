@@ -20,7 +20,7 @@
 //! losers failing at bind time with nothing to say why.
 //!
 //! The host address a rule listens on is decided here too (§9.8): what its
-//! block declares as `bind`, else every interface, and `127.0.0.1` under
+//! block declares as `bind`, else loopback, and `127.0.0.1` under
 //! worktree isolation whatever it declares (§21.4).
 
 use std::collections::HashMap;
@@ -1053,10 +1053,10 @@ lab "l" {
         )
     }
 
-    /// Each rule carries the address it binds: what it declares, else every
-    /// interface (§9.8).
+    /// Each rule carries the address it binds: what it declares, else
+    /// loopback (§9.8).
     #[test]
-    fn a_rule_binds_its_declared_address_else_every_interface() {
+    fn a_rule_binds_its_declared_address_else_loopback() {
         let lab = bind_lab();
         let obs = leased(&[("web", 10), ("c", 11)]);
         let p = plan(&inputs(&lab, &obs), &[]);
@@ -1065,7 +1065,7 @@ lab "l" {
             binds,
             vec![
                 Ipv4Addr::LOCALHOST,
-                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::LOCALHOST,
                 Ipv4Addr::new(192, 168, 1, 5)
             ]
         );
@@ -1137,11 +1137,14 @@ lab "l" {{
         let p = contest(Some("127.0.0.1"), Some("127.0.0.2"), false);
         assert!(p.conflicts.is_empty(), "{p:#?}");
         assert_eq!(p.rules.len(), 2);
+        let p = contest(None, Some("127.0.0.2"), false);
+        assert!(p.conflicts.is_empty(), "{p:#?}");
+        assert_eq!(p.rules.len(), 2);
 
         for (a, b) in [
             (Some("127.0.0.1"), Some("127.0.0.1")),
             (Some("127.0.0.1"), None),
-            (None, Some("127.0.0.2")),
+            (None, Some("127.0.0.1")),
             (Some("0.0.0.0"), Some("127.0.0.2")),
         ] {
             let p = contest(a, b, false);
