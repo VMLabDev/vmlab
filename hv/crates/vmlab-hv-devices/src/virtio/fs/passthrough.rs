@@ -1251,7 +1251,14 @@ fn open_path(path: &Path, flags: i32) -> io::Result<OwnedFd> {
 /// procfs fd link resolves to exactly that inode, so the guest opens what
 /// it looked up even if the host replaced the name meanwhile.
 fn host_open_flags(flags: i32) -> i32 {
-    (flags & (libc::O_ACCMODE | libc::O_DIRECT | libc::O_NONBLOCK | libc::O_NOATIME))
+    (flags
+        & (libc::O_ACCMODE
+            | libc::O_DIRECT
+            | libc::O_NONBLOCK
+            | libc::O_NOATIME
+            | libc::O_APPEND
+            | libc::O_SYNC
+            | libc::O_DSYNC))
         | libc::O_CLOEXEC
 }
 
@@ -1941,6 +1948,68 @@ mod tests {
             std::fs::read(_dir.path().join("hello.txt")).unwrap(),
             b"HELLO share\n"
         );
+    }
+
+    #[test]
+    fn append_uses_host_eof_instead_of_stale_guest_offset() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"hello.txt").unwrap();
+        let guest_offset = entry.attr.st_size as u64;
+        let (handle, _, _) = fs
+            .open(
+                &ctx(),
+                entry.inode,
+                (libc::O_WRONLY | libc::O_APPEND) as u32,
+                0,
+            )
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("hello.txt"))
+            .unwrap()
+            .write_all(b"host append\n")
+            .unwrap();
+        let data = b"guest append\n";
+        let written = fs
+            .write(
+                &ctx(),
+                entry.inode,
+                handle.unwrap(),
+                &mut SliceReader(data),
+                data.len() as u32,
+                guest_offset,
+                None,
+                false,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(written, data.len());
+        assert_eq!(
+            std::fs::read(dir.path().join("hello.txt")).unwrap(),
+            b"hello share\nhost append\nguest append\n"
+        );
+    }
+
+    #[test]
+    fn synchronous_open_flags_survive_open_and_restore() {
+        let (_dir, fs) = scratch();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        for flag in [libc::O_SYNC, libc::O_DSYNC] {
+            let (handle, _, _) = fs
+                .open(&ctx(), ino, (libc::O_WRONLY | flag) as u32, 0)
+                .unwrap();
+            for restored in [false, true] {
+                if restored {
+                    fs.restore_state(&fs.save_state()).unwrap();
+                }
+                let file = fs.inner.lock().file_handle(ino, handle.unwrap()).unwrap();
+                // SAFETY: F_GETFL takes no third argument and the fd is owned.
+                let actual = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                assert_ne!(actual, -1);
+                assert_eq!(actual & flag, flag);
+            }
+        }
     }
 
     /// A `ZeroCopyWriter` into a buffer, for driving reads off the queue.
