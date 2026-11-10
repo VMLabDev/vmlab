@@ -34,6 +34,10 @@ pub struct MachineState {
     /// Snapshot name → record.
     #[serde(default)]
     pub snapshots: BTreeMap<String, SnapshotRecord>,
+    /// Durable capture intents. A crash or failed rollback leaves the name
+    /// here, never silently presenting a partial capture as restorable.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub pending_snapshots: std::collections::BTreeSet<String>,
     /// The agent version `vmlab machine repair-agent` pushed into this
     /// machine, which is what makes it a **diverged machine** (PRD §19.4):
     /// its guest content no longer matches the artefact it was created from,

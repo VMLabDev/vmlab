@@ -170,10 +170,18 @@ impl A20 {
 
     /// The caller parks all vCPUs before changing the CPU address space.
     pub fn set_enabled(&mut self, enabled: bool) -> Result<(), VmmError> {
-        use std::os::fd::AsRawFd;
         if self.enabled == enabled {
             return Ok(());
         }
+        change_or_restore(self.enabled, enabled, |value| self.apply_mapping(value))?;
+        self.enabled = enabled;
+        Ok(())
+    }
+
+    // Also used for rollback. Do not skip work based on self.enabled: a
+    // failed attempt may have changed any prefix of the mappings or slots.
+    fn apply_mapping(&self, enabled: bool) -> Result<(), VmmError> {
+        use std::os::fd::AsRawFd;
         self.map_rom(enabled)?;
         if !enabled {
             self.map(APERTURE_SLOT, 0x1a0000, 0)?;
@@ -217,12 +225,28 @@ impl A20 {
         }
         // MAP_FIXED replaces VMA advice along with the mapping.
         crate::memory::dont_dump(&self.cpu)?;
-        self.enabled = enabled;
         if enabled {
             self.map(APERTURE_SLOT, 0x1a0000, 0x60000)?;
         }
         Ok(())
     }
+}
+
+fn change_or_restore(
+    old: bool,
+    new: bool,
+    mut apply: impl FnMut(bool) -> Result<(), VmmError>,
+) -> Result<(), VmmError> {
+    if let Err(error) = apply(new) {
+        if let Err(rollback) = apply(old) {
+            // This process owns one VM. Returning would let the caller
+            // resume vCPUs with an unknown RAM/ROM/PAM view.
+            tracing::error!(%error, %rollback, "A20 rollback failed, stopping VM");
+            std::process::abort();
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 impl Snapshot for A20 {
@@ -245,6 +269,29 @@ impl Snapshot for A20 {
 mod tests {
     use super::*;
     use vm_memory::Bytes;
+
+    #[test]
+    fn partial_a20_changes_restore_every_bank_before_returning_error() {
+        for old in [false, true] {
+            for fail_at in 0..4 {
+                let mut banks = [old; 4];
+                let mut attempts = 0;
+                let result = change_or_restore(old, !old, |value| {
+                    attempts += 1;
+                    for (index, bank) in banks.iter_mut().enumerate() {
+                        if attempts == 1 && index == fail_at {
+                            return Err(VmmError::Memory("injected mmap failure".into()));
+                        }
+                        *bank = value;
+                    }
+                    Ok(())
+                });
+                assert!(result.is_err());
+                assert_eq!(attempts, 2);
+                assert_eq!(banks, [old; 4]);
+            }
+        }
+    }
 
     #[test]
     #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]

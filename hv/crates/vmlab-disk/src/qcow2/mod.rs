@@ -363,6 +363,14 @@ impl Qcow2Image {
             });
         }
 
+        // Validate hostile allocation lengths against the opened file first.
+        let file_len = file.metadata()?.len();
+        checked_file_range(file_len, l1_table_offset, u64::from(l1_size) * 8)?;
+        checked_file_range(
+            file_len,
+            refcount_table_offset,
+            u64::from(refcount_table_clusters) * cluster_size,
+        )?;
         // Read the active L1.
         let mut l1_bytes = vec![0u8; l1_size as usize * 8];
         if !l1_bytes.is_empty() {
@@ -636,8 +644,11 @@ impl Qcow2Image {
         let mut compressed = vec![0u8; (end - host_offset) as usize];
         self.read_file(host_offset, &mut compressed)?;
         let mut decompressor = flate2::Decompress::new(false);
+        // One spare byte lets the decoder consume the end marker even when
+        // the valid output fills a whole cluster, and detects overlong data.
+        let mut decoded = vec![0; out.len() + 1];
         let status = decompressor
-            .decompress(&compressed, out, flate2::FlushDecompress::None)
+            .decompress(&compressed, &mut decoded, flate2::FlushDecompress::Finish)
             .map_err(|e| Error::Format {
                 format: "qcow2",
                 reason: format!("deflate error in compressed cluster: {e}"),
@@ -648,6 +659,7 @@ impl Qcow2Image {
                 reason: "compressed cluster must contain one complete cluster".into(),
             });
         }
+        out.copy_from_slice(&decoded[..out.len()]);
         // Sector padding after the complete stream is allowed.
         Ok(())
     }
@@ -1400,6 +1412,16 @@ impl Drop for Qcow2Image {
     }
 }
 
+fn checked_file_range(file_len: u64, offset: u64, len: u64) -> Result<()> {
+    if len != 0 && offset.checked_add(len).is_none_or(|end| end > file_len) {
+        return Err(Error::Format {
+            format: "qcow2",
+            reason: "metadata range exceeds file length".into(),
+        });
+    }
+    Ok(())
+}
+
 fn l1_size_as_clusters(l1_size: u32, cluster_size: u64) -> u64 {
     ((l1_size as u64) * 8).div_ceil(cluster_size).max(1)
 }
@@ -1450,6 +1472,82 @@ pub(crate) fn probe_format(path: &Path) -> Result<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_snapshot_does_not_walk_unrelated_active_l2() {
+        let (_dir, mut img) = testsupport::blank(1 << 30);
+        img.write_at(0, &[0x11; 512]).unwrap();
+        img.snapshot_create("early", 0, 0).unwrap();
+        let far = img.l2_span();
+        img.write_at(far, &[0x22; 512]).unwrap();
+        img.flush().unwrap();
+        let unrelated = img.l1[1] & OFFSET_MASK;
+        img.l2_cache = TableCache::new(64);
+        img.snapshot_delete("early").unwrap();
+        assert!(!img.l2_cache.map.contains_key(&unrelated));
+        let mut byte = [0];
+        img.read_at(far, &mut byte).unwrap();
+        assert_eq!(byte, [0x22]);
+    }
+
+    #[test]
+    fn snapshot_namespace_rejects_ids_and_skips_numeric_names() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        img.snapshot_create("2", 0, 0).unwrap();
+        img.snapshot_create("second", 0, 0).unwrap();
+        let entries = img.snapshots().unwrap();
+        assert_eq!(entries[0].id, "1");
+        assert_eq!(entries[1].id, "3");
+        assert!(img.snapshot_create("1", 0, 0).is_err());
+        assert!(!img.poisoned, "validation must not poison the image");
+        assert_eq!(img.snapshot_apply("2").unwrap().name, "2");
+        img.snapshot_delete("3").unwrap();
+        assert_eq!(img.snapshots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_snapshot_changes_poison_all_write_entry_points() {
+        for operation in ["create", "apply", "delete"] {
+            let (_dir, mut img) = testsupport::blank(8 << 20);
+            img.write_at(0, &[0x35; 512]).unwrap();
+            img.snapshot_create("saved", 0, 0).unwrap();
+            fail_writes(&mut img);
+            let result = match operation {
+                "create" => img.snapshot_create("new", 0, 0),
+                "apply" => img.snapshot_apply("saved").map(|_| ()),
+                _ => img.snapshot_delete("saved"),
+            };
+            assert!(result.is_err(), "{operation}");
+            assert!(img.poisoned, "{operation}");
+            allow_writes(&mut img);
+            assert!(img.write_at(0, &[1]).is_err());
+            assert!(img.discard(0, img.cluster_size).is_err());
+            assert!(img.write_vmstate(0, &[1]).is_err());
+            assert!(img.snapshot_create("retry", 0, 0).is_err());
+            assert!(img.flush().is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_reads_keep_inode_and_seek_position() {
+        let (dir, mut img) = testsupport::blank(8 << 20);
+        img.snapshot_create("original", 0, 0).unwrap();
+        img.file.seek(SeekFrom::Start(123)).unwrap();
+        std::fs::rename(&img.path, dir.path().join("moved.qcow2")).unwrap();
+        std::fs::write(&img.path, b"replacement").unwrap();
+        assert_eq!(img.snapshots().unwrap()[0].name, "original");
+        assert_eq!(img.file.stream_position().unwrap(), 123);
+    }
+
+    #[test]
+    fn hostile_metadata_lengths_fail_before_allocation() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        img.file.write_all_at(&u32::MAX.to_be_bytes(), 36).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        img.file.write_all_at(&1u32.to_be_bytes(), 36).unwrap();
+        img.file.write_all_at(&u32::MAX.to_be_bytes(), 56).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+    }
 
     #[test]
     fn compressed_cluster_requires_complete_exact_length_stream() {

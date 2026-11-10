@@ -1806,8 +1806,28 @@ impl VmInstance {
                 Ok(true)
             }
             PowerState::Stopped => {
-                for disk in self.all_disk_paths() {
-                    crate::template::qimg::snapshot_create(&disk, name).await?;
+                let disks = self.all_disk_paths();
+                // Do not remove a pre-existing snapshot during rollback.
+                for disk in &disks {
+                    if crate::template::qimg::image_info(disk).await?.snapshots
+                        .iter().any(|snapshot| snapshot.name == name) {
+                        bail!("{}: snapshot {name:?} already exists", disk.display());
+                    }
+                }
+                let mut created: Vec<&std::path::Path> = Vec::new();
+                for disk in &disks {
+                    if let Err(error) = crate::template::qimg::snapshot_create(disk, name).await {
+                        let mut failures = Vec::new();
+                        for earlier in created.iter().rev() {
+                            if let Err(rollback) = crate::template::qimg::snapshot_delete(earlier, name).await {
+                                failures.push(format!("{}: {rollback}", earlier.display()));
+                            }
+                        }
+                        return Err(anyhow::anyhow!(error).context(format!(
+                            "offline snapshot failed, rollback errors: {failures:?}"
+                        )));
+                    }
+                    created.push(disk.as_path());
                 }
                 Ok(false)
             }
@@ -1848,7 +1868,11 @@ impl VmInstance {
             control.pause().await?;
             let nodes = disk_nodes(self.all_disk_paths().len());
             let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-            snapshots.load(name, "disk0", &refs).await?;
+            if let Err(error) = snapshots.load(name, "disk0", &refs).await {
+                // A failed load must not strand a previously running VM.
+                let resume = control.resume().await;
+                return Err(error.context(format!("snapshot load failed, resume: {resume:?}")));
+            }
             // Drop the agent connection BEFORE resuming: the rewound guest
             // replays virtio-serial response bytes the host already
             // consumed. With no client attached QEMU discards the replayed
