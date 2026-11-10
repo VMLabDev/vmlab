@@ -19,7 +19,7 @@ for target in qcow2 hv_proto agent_proto; do
     if [ -d "$crate/corpus/$target" ]; then
         cp -R "$crate/corpus/$target/." "$corpus/"
     fi
-    (cd "$crate" && cargo +"$nightly" fuzz run "$target" "$corpus" -- \
+    cargo +"$nightly" fuzz run --fuzz-dir "$crate" --target-dir "$out/build" "$target" "$corpus" -- \
         -max_total_time="$seconds" -timeout=10 -rss_limit_mb=2048 \
-        -max_len=1048576 -artifact_prefix="$artifacts/")
+        -max_len=1048576 -artifact_prefix="$artifacts/"
 done

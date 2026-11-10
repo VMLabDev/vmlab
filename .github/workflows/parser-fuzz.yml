@@ -22,6 +22,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly-2026-07-21
+          components: rust-src
       - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
