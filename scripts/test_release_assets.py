@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -33,6 +35,7 @@ class ReleaseDryRun(unittest.TestCase):
                         FIXTURES=str(self.dist), MARKER=str(self.root / 'executed'),
                         VMLAB_RELEASE_BASE_URL='https://fixture.invalid',
                         VMLAB_INSTALL_DIR=str(self.root / 'installed'),
+                        VMLAB_INSECURE_SKIP_SIGNATURE='0',
                         VMLAB_GUEST_DIR=str(self.root / 'guest'))
         with patch.dict(os.environ, self.env):
             ASSETS.prepare(self.dist, '1.2.3')
@@ -76,6 +79,68 @@ set -eu
 
     def test_bad_signature_never_executes(self):
         self.env['BAD_SIGNATURE'] = '1'
+        self.refused(self.install('--no-guest'))
+
+    def restricted_path(self, *, cosign=True, sha256sum=True):
+        # Do not accidentally find a host-installed cosign or sha256sum.
+        if not cosign:
+            (self.bin / 'cosign').unlink()
+        for name in ['sh', 'uname', 'cat', 'mktemp', 'awk', 'cut', 'chmod',
+                     'mkdir', 'mv', 'rm', 'id', 'sed', 'head']:
+            (self.bin / name).symlink_to(shutil.which(name))
+        if sha256sum:
+            (self.bin / 'sha256sum').symlink_to(shutil.which('sha256sum'))
+        self.env['PATH'] = str(self.bin)
+
+    def test_missing_cosign_refuses_by_default(self):
+        self.restricted_path(cosign=False)
+        result = self.install('--no-guest')
+        self.refused(result)
+        self.assertIn('need cosign', result.stderr)
+
+    def test_insecure_flag_without_cosign(self):
+        self.restricted_path(cosign=False)
+        self.env['FAIL_DOWNLOAD'] = 'SHA256SUMS.bundle'
+        result = self.install('--no-guest', '--insecure-skip-signature')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('An attacker can replace', result.stderr)
+        self.assertTrue((self.root / 'executed').exists())
+
+    def test_insecure_environment_without_cosign(self):
+        self.restricted_path(cosign=False)
+        self.env['VMLAB_INSECURE_SKIP_SIGNATURE'] = '1'
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('INSECURE', result.stderr)
+
+    def test_insecure_still_rejects_corrupt_binary(self):
+        self.restricted_path(cosign=False)
+        (self.dist / self.asset).write_text('tampered')
+        self.refused(self.install('--no-guest', '--insecure-skip-signature'))
+
+    def test_insecure_still_requires_manifest(self):
+        self.restricted_path(cosign=False)
+        self.env['FAIL_DOWNLOAD'] = 'SHA256SUMS'
+        self.refused(self.install('--no-guest', '--insecure-skip-signature'))
+
+    def test_shasum_fallback(self):
+        self.restricted_path(sha256sum=False)
+        self.tool('shasum', f'''#!{sys.executable}
+import hashlib, sys
+assert sys.argv[1:3] == ['-a', '256']
+print(hashlib.sha256(open(sys.argv[3], 'rb').read()).hexdigest() + '  ' + sys.argv[3])
+''')
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_hash_tool_refuses(self):
+        self.restricted_path(sha256sum=False)
+        result = self.install('--no-guest')
+        self.refused(result)
+        self.assertIn('need sha256sum or shasum', result.stderr)
+
+    def test_invalid_insecure_environment_refuses(self):
+        self.env['VMLAB_INSECURE_SKIP_SIGNATURE'] = 'yes'
         self.refused(self.install('--no-guest'))
 
     def test_missing_signature(self):

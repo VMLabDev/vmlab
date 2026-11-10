@@ -19,6 +19,11 @@
 #                     (CAP_BPF, CAP_NET_ADMIN) through sudo, without asking
 #   --no-fastpath     do not offer them; or set VMLAB_FASTPATH_CAPS=yes|no
 #   --skip-checks     do not report missing runtime tools after installing
+#   --insecure-skip-signature  skip cosign authentication (unsafe), but still
+#                     verify SHA256SUMS; or VMLAB_INSECURE_SKIP_SIGNATURE=1
+#                     Without cosign the default is to refuse installation.
+#                     Skipping permits an attacker to replace both assets and
+#                     checksums. Use only with an independently trusted source.
 #   --help            show this help
 #
 #   VMLAB_RELEASE_BASE_URL  where releases are downloaded from, as
@@ -54,6 +59,7 @@ GUEST_DIR="${VMLAB_GUEST_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/vmlab/guest}"
 BASE_URL="${VMLAB_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
 PRE=0
 SKIP_CHECKS=0
+INSECURE_SKIP_SIGNATURE="${VMLAB_INSECURE_SKIP_SIGNATURE:-0}"
 NO_GUEST=0
 FASTPATH="${VMLAB_FASTPATH_CAPS:-ask}"
 
@@ -80,6 +86,7 @@ while [ $# -gt 0 ]; do
     --fastpath) FASTPATH=yes; shift ;;
     --no-fastpath) FASTPATH=no; shift ;;
     --skip-checks) SKIP_CHECKS=1; shift ;;
+    --insecure-skip-signature) INSECURE_SKIP_SIGNATURE=1; shift ;;
     -h|--help) usage 0 ;;
     -*) err "unknown option: $1 (try --help)" ;;
     *) [ -z "$VERSION" ] || err "unexpected argument: $1"; VERSION="$1"; shift ;;
@@ -92,6 +99,21 @@ case "$FASTPATH" in
 esac
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+sha256_of() {
+  if have sha256sum; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif have shasum; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
+case "$INSECURE_SKIP_SIGNATURE" in
+  0|1) ;;
+  *) err "VMLAB_INSECURE_SKIP_SIGNATURE must be 0 or 1" ;;
+esac
 
 # ── HTTP helper (curl or wget) ──────────────────────────────────────────────
 if command -v curl >/dev/null 2>&1; then
@@ -142,8 +164,12 @@ ver="${tag#v}"
 case "$ver" in
   ''|*[!0-9A-Za-z.-]*) err "invalid release version" ;;
 esac
-have cosign || err "need cosign (v2.6.1 or newer) on PATH to verify release signatures; install it from https://docs.sigstore.dev/cosign/system_config/installation/"
-have sha256sum || err "need sha256sum on PATH to verify release assets"
+if [ "$INSECURE_SKIP_SIGNATURE" -eq 1 ]; then
+  warn "INSECURE: skipping release signature verification. An attacker can replace both the assets and SHA256SUMS to execute malicious code. Checksums alone do not authenticate the release."
+else
+  have cosign || err "need cosign (v2.6.1 or newer) on PATH to verify release signatures; install it from https://docs.sigstore.dev/cosign/system_config/installation/"
+fi
+have sha256sum || have shasum || err "need sha256sum or shasum on PATH to verify release assets"
 asset="vmlab-${ver}-${suffix}"
 BASE_URL="${BASE_URL%/}"
 url="$BASE_URL/$tag/$asset"
@@ -159,18 +185,20 @@ cleanup_release() {
 }
 trap cleanup_release EXIT INT TERM
 download_file "$BASE_URL/$tag/SHA256SUMS" "$verify_dir/SHA256SUMS" || err "release has no checksum manifest"
-download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" || err "release has no signature bundle"
-cosign verify-blob --bundle "$verify_dir/SHA256SUMS.bundle" \
-  --certificate-identity 'https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main' \
-  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  "$verify_dir/SHA256SUMS" || err "release signature verification failed"
+if [ "$INSECURE_SKIP_SIGNATURE" -eq 0 ]; then
+  download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" || err "release has no signature bundle"
+  cosign verify-blob --bundle "$verify_dir/SHA256SUMS.bundle" \
+    --certificate-identity 'https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main' \
+    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+    "$verify_dir/SHA256SUMS" || err "release signature verification failed"
+fi
 
 verify_asset() {
   # Match one exact basename, never interpret paths supplied by a manifest.
   want="$(awk -v name="$1" '$2 == name && NF == 2 {print $1}' "$verify_dir/SHA256SUMS")"
   [ "${#want}" -eq 64 ] || err "missing or duplicate checksum for $1"
   case "$want" in *[!0-9a-f]*) err "invalid checksum for $1" ;; esac
-  got="$(sha256sum "$2" | cut -d' ' -f1)"
+  got="$(sha256_of "$2")" || err "cannot compute SHA256 for $1"
   [ "$want" = "$got" ] || err "checksum mismatch for $1"
 }
 

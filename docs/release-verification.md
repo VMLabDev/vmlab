@@ -7,7 +7,21 @@ key. The bundle includes the certificate and transparency-log evidence.
 
 Install cosign v2.6.1 or newer through a trusted package source before using
 `install.sh`. The installer will not bootstrap its own verifier from an
-unverified download. Older releases without a signature are refused.
+unverified download. By default, missing cosign or unsigned releases are refused.
+Hash verification requires `sha256sum`, or `shasum -a 256` as a fallback.
+
+For an independently trusted source only, an explicit opt-out is available:
+
+```sh
+sh install.sh --insecure-skip-signature
+# Equivalent: VMLAB_INSECURE_SKIP_SIGNATURE=1 sh install.sh
+```
+
+This prints a warning and skips cosign signature authentication only. The
+installer still downloads `SHA256SUMS` and verifies each asset digest before
+using it. An attacker who replaces both an asset and its checksum can execute
+malicious code with this option. Checksums alone do not authenticate a release.
+Neither `--skip-checks` nor a missing cosign implicitly enables this opt-out.
 
 To verify a downloaded manifest:
 
