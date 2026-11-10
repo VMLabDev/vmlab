@@ -41,8 +41,10 @@
 # The network fabric needs no privilege. Its optional eBPF fast path needs
 # CAP_BPF and CAP_NET_ADMIN, which an install as an ordinary user can give the
 # binary as file capabilities (`sudo setcap`). Run from a terminal, the
-# installer asks; otherwise it says how. Replacing the binary drops them, so
-# every install asks again.
+# installer asks with a default of no; non-interactive installs grant nothing
+# unless --fastpath is explicit. Every vmlab command then holds CAP_BPF and
+# CAP_NET_ADMIN for its lifetime, including its parsers, not just network setup.
+# Replacing the binary drops them, so every install requires consent again.
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
 # Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
@@ -221,14 +223,6 @@ verify_asset "$asset" "$tmp"
 [ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
 chmod +x "$tmp"
 mkdir -p "$BIN_DIR"
-# Whether the binary being replaced had the fast path's capabilities: the new
-# file does not inherit them, and the question below defaults to keeping them.
-HAD_CAPS=0
-if have getcap && [ -f "$BIN_DIR/vmlab" ]; then
-  case "$(getcap "$BIN_DIR/vmlab" 2>/dev/null)" in
-    *cap_bpf*) HAD_CAPS=1 ;;
-  esac
-fi
 [ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
 [ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
 mv "$tmp" "$BIN_DIR/vmlab"
@@ -254,16 +248,19 @@ fastpath_hint() {
   printf 'Without them vmlab uses its userspace network fabric, which needs no privilege.\n'
 }
 
+fastpath_warning() {
+  printf '%s\n' 'WARNING: every vmlab command runs with CAP_BPF and CAP_NET_ADMIN for its lifetime, including parsers of untrusted guest and template data, not just network setup.'
+}
+
 # Ask on the terminal: under `curl | sh` the script itself is stdin.
 fastpath_ask() {
-  if [ "$HAD_CAPS" -eq 1 ]; then choices="[Y/n]"; else choices="[y/N]"; fi
+  fastpath_warning >/dev/tty
   printf '\nGrant vmlab CAP_BPF and CAP_NET_ADMIN for the eBPF network fast path?\n' >/dev/tty
   printf 'This runs: sudo setcap %s %s\n' "$CAPS" "$BIN_DIR/vmlab" >/dev/tty
-  printf 'Any program running as you can then use those capabilities through vmlab. %s ' "$choices" >/dev/tty
+  printf 'Any program running as you can then use those capabilities through vmlab. [y/N] ' >/dev/tty
   read -r answer </dev/tty || answer=""
   case "$answer" in
     [Yy]|[Yy][Ee][Ss]) return 0 ;;
-    "") [ "$HAD_CAPS" -eq 1 ] ;;
     *) return 1 ;;
   esac
 }
@@ -272,6 +269,7 @@ fastpath_caps() {
   # root's daemons hold every capability already.
   [ "$(id -u)" -eq 0 ] && return 0
   [ "$FASTPATH" = no ] && return 0
+  [ "$FASTPATH" != yes ] || fastpath_warning >&2
   if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     [ "$FASTPATH" = yes ] && printf '\nWSL 2 cannot run the eBPF fast path, so no capabilities were granted.\n'
     return 0
@@ -294,7 +292,7 @@ fastpath_caps() {
     # In a subshell: a failed redirect on `:`, a special builtin, would end
     # this shell.
     if ! ( : </dev/tty ) 2>/dev/null; then
-      fastpath_hint
+      printf '\nNo terminal: no capabilities granted. Use --fastpath only after reviewing the lifetime privilege risk.\n'
       return 0
     fi
     fastpath_ask || { printf 'Not granted. '; fastpath_hint; return 0; }
