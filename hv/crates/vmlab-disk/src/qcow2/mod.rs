@@ -1092,6 +1092,8 @@ impl Qcow2Image {
             file,
             path: path.to_path_buf(),
             read_only: false,
+            poisoned: false,
+            snapshot_mutating: false,
             version: 3,
             cluster_bits,
             cluster_size,
