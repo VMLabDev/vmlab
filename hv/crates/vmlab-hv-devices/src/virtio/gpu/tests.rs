@@ -1,6 +1,55 @@
 use super::*;
 
 #[test]
+fn backing_entries_are_bounded_across_resources() {
+    let gpu = Gpu::new("gpu");
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+    let mut state = gpu.state.lock();
+    for id in 1..=2 {
+        state.resources.insert(
+            id,
+            Resource {
+                width: 1,
+                height: 1,
+                format: 1,
+                pixels: vec![0; 4],
+                backing: vec![],
+            },
+        );
+    }
+    let attach = |id: u32, count: usize| {
+        let mut req = vec![0; 24];
+        req[..4].copy_from_slice(&0x106u32.to_le_bytes());
+        req.extend_from_slice(&id.to_le_bytes());
+        req.extend_from_slice(&(count as u32).to_le_bytes());
+        for _ in 0..count {
+            req.extend_from_slice(&0u64.to_le_bytes());
+            req.extend_from_slice(&1u32.to_le_bytes());
+            req.extend_from_slice(&0u32.to_le_bytes());
+        }
+        req
+    };
+    assert!(state.command(&mem, 0, &attach(1, MAX_ENTRIES)).is_ok());
+    for _ in 0..100 {
+        assert_eq!(state.command(&mem, 0, &attach(2, 1)), Err(INVALID));
+    }
+    assert_eq!(
+        state
+            .resources
+            .values()
+            .map(|r| r.backing.len())
+            .sum::<usize>(),
+        MAX_ENTRIES
+    );
+    let mut detach = vec![0; 24];
+    detach[..4].copy_from_slice(&0x107u32.to_le_bytes());
+    detach.extend_from_slice(&1u32.to_le_bytes());
+    detach.extend_from_slice(&0u32.to_le_bytes());
+    assert!(state.command(&mem, 0, &detach).is_ok());
+    assert!(state.command(&mem, 0, &attach(2, 1)).is_ok());
+}
+
+#[test]
 fn edid_has_valid_checksum_and_preferred_timing() {
     for (w, h) in [(1024, 768), (1920, 1080), (3840, 2160)] {
         let e = edid(w, h);

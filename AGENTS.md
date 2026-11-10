@@ -47,3 +47,17 @@ just ci::check
 
 - Card branches start from `next` and are named after the card (`vml-<n>`).
 - Only the lead merges onto `next`, `release/*` and `main`. No force pushes.
+
+## Release gate
+
+- Run `ci::hv-gate` first, then one full green e2e on the exact release
+  commit that will merge to `main`. The main merge must have the same tree.
+  Otherwise record a written waiver for each failed scenario on the release
+  card. A partial run or a green run on another tree is not release evidence.
+- Do not cut another version while a cut version waits for its e2e.
+- Reserve the host during release e2e. No other heavy vmlab runs may overlap.
+  Use the heavy wrapper hold file and drain both slots as described in
+  `docs/agents/release-gate.md`. All heavy runs start with `terrarium run`
+  through `/var/build/cache/vmlab/bin/heavy`.
+- Follow the exact-tree evidence checklist in `docs/agents/release-gate.md`
+  before merging. Signing and GitHub publication remain main-only.

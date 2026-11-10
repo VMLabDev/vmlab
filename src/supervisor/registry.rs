@@ -261,13 +261,11 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let link = temp.path().join("lab-link");
         symlink(&root, &link).unwrap();
-        // Reach the temporary fixture from cwd without writing in the checkout
+        // Reach the system temp directory without writing into the checkout
         // or changing the process-wide cwd while other tests are running.
-        let mut relative = PathBuf::new();
-        for _ in cwd.components().skip(1) {
-            relative.push("..");
-        }
+        let mut relative: PathBuf = cwd.ancestors().skip(1).map(|_| "..").collect();
         relative.push(root.strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
 
         let canonical = canonical_root(&root).unwrap();
 
