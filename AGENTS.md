@@ -27,6 +27,15 @@ just ci::check
   from a vmlab-owned copy of the pushed checkout at `$VMLAB_TARGET_ROOT/src`.
   Update it with `rsync -a --delete --exclude target/` and restore the
   executable bits of tracked mode-100755 files before running the gate.
+  This also redirects CI reports, virgl, hv iPXE and rebuilt BPF objects.
+  A read-only checkout owned by another user needs command-local Git trust
+  (inherited by Git subprocesses), not a global safe.directory change:
+
+  ```sh
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory \
+    GIT_CONFIG_VALUE_0=/absolute/path/to/checkout \
+    VMLAB_TARGET_ROOT=/var/build/cache/vmlab/<you> just ci::check
+  ```
 - The merge queue runs the same command on each batch merged onto `next`
   (one `terrarium card merge A B C ...` job), sharing the heavy wrapper slots.
 - Pass: every recipe of `ci::check` exits 0. Record the log's pass, fail and
