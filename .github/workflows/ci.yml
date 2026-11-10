@@ -48,6 +48,8 @@ jobs:
       - run: just ci::path-check
       # VML-88: unguarded variable paths in shell scripts and just recipes (no build needed).
       - run: just ci::shell-paths
+      - run: just ci::tap-test
+      - run: just ci::wscript-test
       # The fmt checks need no build: run them first.
       - run: just ci::fmt-check
       - run: just ci::hv-fmt-check
@@ -106,6 +108,7 @@ jobs:
       # One part of the merge bar per step; `just ci::check` runs the same set
       # in one go.
       - run: just ci::test
+      - run: just ci::kvm-policy-test
       - run: just ci::agent-conformance
 
   hv-check:
