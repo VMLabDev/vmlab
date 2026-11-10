@@ -18,7 +18,9 @@
 //!   holding a version of the repository that exists nowhere else. There is no
 //!   flag because there is no case for one: the fix is to let the flush finish,
 //!   or to resolve the halt, and both are the thing the developer wanted
-//!   anyway.
+//!   anyway. That holds for a guest whose watch did not answer the flush in
+//!   time too (VML-110): [`DISCARD_FLAG`] is restore-only and never lets a
+//!   capture through.
 //! - **Restore refuses only while a halt stands, and an explicit flag answers
 //!   it.** Refusing outright would be obstruction: wanting to throw the guest
 //!   copy away is frequently *why* someone restores. But a restore discards the
@@ -88,6 +90,9 @@ pub struct Outstanding {
     /// The guest's watch did not answer the pre-flight flush within its bound,
     /// so writes the guest has not reported are missing from `unsynced`. A
     /// very slow guest is still writing as far as anyone knows (VML-110).
+    /// Like every reason here it has no override: `--discard-guest-changes`
+    /// answers only a restore's halt. The way out is a later capture, once
+    /// the guest has caught up.
     pub unanswered: Option<String>,
     /// Paths the flush did not carry, by name.
     pub unsynced: Vec<String>,
