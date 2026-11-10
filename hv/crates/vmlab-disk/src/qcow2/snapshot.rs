@@ -67,13 +67,21 @@ impl SnapshotEntry {
 }
 
 impl Qcow2Image {
+    pub(crate) fn finish_snapshot_change<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() && self.snapshot_mutating {
+            self.poisoned = true;
+        }
+        self.snapshot_mutating = false;
+        result
+    }
+
     /// Parse the snapshot table with a private read handle (`snapshots()` is
     /// `&self`).
     fn parse_table(&self) -> Result<Vec<SnapshotEntry>> {
         if self.nb_snapshots == 0 {
             return Ok(Vec::new());
         }
-        let mut file = std::fs::File::open(&self.path)?;
+        let mut file = self.file.try_clone()?;
         use std::io::{Read, Seek, SeekFrom};
         let mut off = self.snapshots_offset;
         let mut entries = Vec::with_capacity(self.nb_snapshots as usize);
@@ -130,7 +138,8 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let entry = entries
             .iter()
-            .find(|e| e.name == name || e.id == name)
+            .find(|e| e.id == name)
+            .or_else(|| entries.iter().find(|e| e.name == name))
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let info = entry.info();
         let disk_size = entry.disk_size;
@@ -162,12 +171,14 @@ impl Qcow2Image {
             ));
         }
         let entries = self.parse_table()?;
-        if entries.iter().any(|e| e.name == name) {
+        if entries.iter().any(|e| e.name == name || e.id == name) {
             return Err(Error::Unsupported(format!(
                 "snapshot {name:?} already exists"
             )));
         }
-        let id = next_snapshot_id(&entries);
+        let id = next_snapshot_id(&entries, name)?;
+
+        self.snapshot_mutating = true;
 
         // The active L1 must cover the vmstate area too.
         if vm_state_size > 0 {
@@ -352,7 +363,8 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let entry = entries
             .iter()
-            .find(|e| e.name == name || e.id == name)
+            .find(|e| e.id == name)
+            .or_else(|| entries.iter().find(|e| e.name == name))
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let info = entry.info();
         let snap_l1_size = entry.l1_size;
@@ -369,6 +381,7 @@ impl Qcow2Image {
 
         // Raise the snapshot's references first so clusters referenced by
         // both the old and the new view never drop to zero.
+        self.snapshot_mutating = true;
         self.walk_refcounts(&snap_l1, 1)?;
         let old_active = self.l1.clone();
         self.walk_refcounts(&old_active, -1)?;
@@ -398,7 +411,8 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let pos = entries
             .iter()
-            .position(|e| e.name == name || e.id == name)
+            .position(|e| e.id == name)
+            .or_else(|| entries.iter().position(|e| e.name == name))
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let entry_l1_offset = entries[pos].l1_table_offset;
         let entry_l1_size = entries[pos].l1_size;
@@ -411,6 +425,7 @@ impl Qcow2Image {
             .iter()
             .map(|c| u64::from_be_bytes(*c))
             .collect();
+        self.snapshot_mutating = true;
         self.walk_refcounts(&snap_l1, -1)?;
         for idx in 0..self.l1_bytes_clusters(entry_l1_size) {
             self.dec_refcount(entry_l1_offset / self.cluster_size + idx)?;
@@ -478,11 +493,20 @@ impl Qcow2Image {
     }
 }
 
-fn next_snapshot_id(entries: &[SnapshotEntry]) -> String {
+fn next_snapshot_id(entries: &[SnapshotEntry], name: &str) -> Result<String> {
     let max = entries
         .iter()
         .filter_map(|e| e.id.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
-    (max + 1).to_string()
+    let mut candidate = max;
+    loop {
+        candidate = candidate.checked_add(1).ok_or_else(|| {
+            Error::Unsupported("snapshot ID space exhausted".into())
+        })?;
+        let id = candidate.to_string();
+        if id != name && !entries.iter().any(|e| e.name == id) {
+            return Ok(id);
+        }
+    }
 }
