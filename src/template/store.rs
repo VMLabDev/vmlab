@@ -989,13 +989,13 @@ fn verify_variants(dir: &Path, meta: &TemplateMeta, base_digest: Option<&str>) -
     };
     for v in &meta.variants {
         let overlay = dir.join(variant_disk_rel(&v.name));
-        regular_file(&overlay)?;
         ensure!(
             overlay.is_file(),
             "variant `{}` of {reference} has no {}",
             v.name,
             variant_disk_rel(&v.name).display()
         );
+        regular_file(&overlay)?;
         let actual = sha256_file(&overlay)?;
         ensure!(
             digest_matches(&actual, &v.sha256),
