@@ -27,9 +27,9 @@ def main():
         raise SystemExit("ci_test requires no inherited runner or RUSTC_BOOTSTRAP")
     import shlex
     env[runner_key] = shlex.join([sys.executable, str(Path(__file__).resolve()), "--run"])
-    # Doctests run through rustdoc, not Cargo's target runner. Leave them on
-    # stable with their normal text output and retain cargo's combined status.
-    command = ["cargo", "test", *args]
+    # Keep the runner out of rustdoc as well. Cargo otherwise passes it as
+    # --test-runtool, which breaks dependency loading on the pinned toolchain.
+    command = ["cargo", "test", *args, "--lib", "--bins", "--tests"]
     with result.open("w") as output:
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                               text=True) as process:
@@ -37,6 +37,9 @@ def main():
                 output.write(line)
                 print(line, end="", flush=True)
             status = process.wait()
+    if status == 0 and "--no-run" not in args:
+        status = subprocess.run(["cargo", "test", *args, "--doc"],
+                                env=os.environ.copy()).returncode
     print(f"Test results ({name}, exit {status}): {result}", flush=True)
     return status
 

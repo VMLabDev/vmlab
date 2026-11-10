@@ -16,11 +16,13 @@ class EvidenceTests(unittest.TestCase):
                 with patch.dict(os.environ, VMLAB_TARGET_ROOT=root), \
                         patch("sys.argv", ["ci_test.py", "main", "--all-features"]), \
                         patch("subprocess.check_output", return_value="host: x86_64-unknown-linux-gnu\n"), \
+                        patch("subprocess.run") as docs, \
                         patch("subprocess.Popen") as popen, \
                         contextlib.redirect_stdout(io.StringIO()) as console:
                     process = popen.return_value.__enter__.return_value
                     process.stdout = ['{"type":"suite","event":"started"}\n']
                     process.wait.return_value = status
+                    docs.return_value.returncode = 0
                     self.assertEqual(ci_test.main(), status)
                     self.assertEqual(
                         (Path(root) / "test-results/main.json").read_text(),
@@ -30,6 +32,12 @@ class EvidenceTests(unittest.TestCase):
                     self.assertNotIn("RUSTC_BOOTSTRAP", popen.call_args.kwargs["env"])
                     self.assertIn("--run", popen.call_args.kwargs["env"][
                         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"])
+                    if status == 0:
+                        self.assertIn("--doc", docs.call_args.args[0])
+                        self.assertNotIn("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+                                         docs.call_args.kwargs["env"])
+                    else:
+                        docs.assert_not_called()
 
     def test_runner_sets_bootstrap_only_for_binary(self):
         with patch("sys.argv", ["ci_test.py", "--run", "/tmp/test", "arg"]), \
