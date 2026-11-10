@@ -209,7 +209,8 @@ impl Qcow2Image {
         let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let mut img = Self::parse(path, file, read_only)?;
         // v2 has no dirty marker, so never trust its refcounts on writable open.
-        if !read_only && (img.is_dirty() || img.version == 2)
+        if !read_only
+            && (img.is_dirty() || img.version == 2)
             && let Err(error) = img.rebuild_refcounts()
         {
             // Never flush a partially recovered image from Drop.
