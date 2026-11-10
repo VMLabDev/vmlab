@@ -49,7 +49,7 @@ impl AppleSmcOsk {
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
-    /// Exact registry/repository names trusted to supply host-side scripts.
+    /// Repository names or slash-terminated namespaces trusted for host scripts.
     pub trusted_template_repositories: Vec<String>,
     pub subnet_pool: ipnet::Ipv4Net,
     pub dns_suffix: String,
@@ -170,7 +170,7 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             subnet_pool: "10.213.0.0/16".parse().expect("valid default pool"),
-            trusted_template_repositories: Vec::new(),
+            trusted_template_repositories: vec!["ghcr.io/vmlabdev/vmlab-templates/".into()],
             dns_suffix: "vmlab.internal".to_string(),
             dns_upstream: None,
             disk_low_percent: 10,
@@ -251,7 +251,9 @@ impl HostConfig {
                 cfg.trunk_port = v;
             }
             cfg.viewer = r.string("viewer").unspan();
-            cfg.trusted_template_repositories = r.string_list("trusted_template_repositories");
+            if let Some(repositories) = r.opt_string_list("trusted_template_repositories") {
+                cfg.trusted_template_repositories = repositories;
+            }
             cfg.waypipe = r.path("waypipe").unspan();
             cfg.ffmpeg = r.path("ffmpeg").unspan();
             cfg.freerdp = r.path("freerdp").unspan();
@@ -502,7 +504,11 @@ mod tests {
         assert_eq!(cfg.firmware_dir, None);
         assert!(cfg.btrfs_nocow);
         assert!(cfg.gpus.is_empty() && cfg.default_gpu().is_none());
-        assert!(cfg.trusted_template_repositories.is_empty());
+        assert!(crate::template::trust::repository_trusted(
+            &cfg.trusted_template_repositories,
+            "ghcr.io",
+            "vmlabdev/vmlab-templates/windows-11"
+        ));
     }
 
     #[test]
@@ -512,6 +518,16 @@ mod tests {
             "config.wcl",
         ).unwrap();
         assert_eq!(cfg.trusted_template_repositories, ["ghcr.io/org/template"]);
+        let cfg = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { trusted_template_repositories = [] }",
+            "config.wcl",
+        )
+        .unwrap();
+        assert!(!crate::template::trust::repository_trusted(
+            &cfg.trusted_template_repositories,
+            "ghcr.io",
+            "vmlabdev/vmlab-templates/windows-11"
+        ));
     }
 
     /// The default hypervisor is keyed by machine kind (PRD §22) and starts

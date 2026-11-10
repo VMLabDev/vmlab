@@ -654,6 +654,15 @@ impl TemplateStore {
     /// recorded digest and every variant against its own and its base's
     /// (§6.6), then installs.
     pub fn import(&self, archive: &Path, overwrite: bool) -> Result<TemplateMeta> {
+        self.import_trusting_scripts(archive, overwrite, false)
+    }
+
+    pub fn import_trusting_scripts(
+        &self,
+        archive: &Path,
+        overwrite: bool,
+        trust_scripts: bool,
+    ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let staging = StagingDir::create(&self.root)?;
 
@@ -665,7 +674,7 @@ impl TemplateStore {
         let meta = TemplateMeta::read_from(&staging.path().join(META_FILE))
             .with_context(|| format!("{} is not a vmlab template archive", archive.display()))?;
         super::trust::names(&meta)?;
-        super::trust::scripts(&meta, false)?;
+        super::trust::scripts(&meta, trust_scripts)?;
         ensure!(
             meta.sha256.is_some(),
             "template archive is missing the disk digest"
@@ -2721,10 +2730,39 @@ mod tests {
         m.variants.push(v);
         assert!(super::super::trust::scripts(&m, false).is_err());
         super::super::trust::scripts(&m, true).unwrap();
+        assert_eq!(
+            super::super::trust::script_paths(&m),
+            ["template.wcl:variant/desktop/first_boot_script"]
+        );
         m.variants[0].name = "../../escape".into();
         assert!(super::super::trust::names(&m).is_err());
         let (_tmp, store) = new_store();
         assert!(install(&store, &m, b"disk").is_err());
+    }
+
+    #[test]
+    fn archive_script_trust_requires_explicit_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join(DISK_FILE), b"raw").unwrap();
+        let mut m = meta("x86_64", "test", "1");
+        m.first_boot_script = Some("fn main(lab) {}".into());
+        m.sha256 = Some(sha256_file(&staged.join(DISK_FILE)).unwrap());
+        m.write_to(&staged.join(META_FILE)).unwrap();
+        let archive = tmp.path().join("scripts.tar.zst");
+        repack(&archive, &staged, &[META_FILE, DISK_FILE]);
+        let (_tmp, store) = new_store();
+        assert!(store.import(&archive, false).is_err());
+        assert!(store.list().unwrap().is_empty());
+        let imported = store
+            .import_trusting_scripts(&archive, false, true)
+            .unwrap();
+        assert_eq!(imported.first_boot_script, m.first_boot_script);
+        assert_eq!(
+            super::super::trust::script_paths(&imported),
+            ["template.wcl:first_boot_script"]
+        );
     }
 
     #[test]

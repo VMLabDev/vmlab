@@ -32,15 +32,32 @@ pub(crate) fn scripts(meta: &TemplateMeta, trusted: bool) -> Result<()> {
         trusted
             || (meta.first_boot_script.is_none()
                 && meta.variants.iter().all(|v| v.first_boot_script.is_none())),
-        "template first_boot_script refused: allow its exact registry repository in host.trusted_template_repositories; archives cannot establish registry trust"
+        "template first_boot_script refused: allow its registry repository in host.trusted_template_repositories, or explicitly import with --trust-scripts"
     );
     Ok(())
 }
 
 pub(crate) fn repository_trusted(allowed: &[String], host: &str, repository: &str) -> bool {
+    let actual = format!("{host}/{repository}");
     allowed
         .iter()
-        .any(|name| name == &format!("{host}/{repository}"))
+        .any(|name| name == &actual || (name.ends_with('/') && actual.starts_with(name)))
+}
+
+pub(crate) fn script_paths(meta: &TemplateMeta) -> Vec<String> {
+    let mut paths = Vec::new();
+    if meta.first_boot_script.is_some() {
+        paths.push("template.wcl:first_boot_script".into());
+    }
+    for variant in &meta.variants {
+        if variant.first_boot_script.is_some() {
+            paths.push(format!(
+                "template.wcl:variant/{}/first_boot_script",
+                variant.name
+            ));
+        }
+    }
+    paths
 }
 
 #[cfg(test)]
@@ -64,6 +81,22 @@ mod tests {
             &allowed,
             "evil.ghcr.io",
             "org/template"
+        ));
+        let defaults = crate::config::host::HostConfig::default().trusted_template_repositories;
+        assert!(repository_trusted(
+            &defaults,
+            "ghcr.io",
+            "vmlabdev/vmlab-templates/windows-11"
+        ));
+        assert!(!repository_trusted(
+            &defaults,
+            "ghcr.io",
+            "vmlabdev/vmlab-templates-evil/windows-11"
+        ));
+        assert!(!repository_trusted(
+            &defaults,
+            "evil.ghcr.io",
+            "vmlabdev/vmlab-templates/windows-11"
         ));
     }
 
