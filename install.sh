@@ -41,8 +41,10 @@
 # The network fabric needs no privilege. Its optional eBPF fast path needs
 # CAP_BPF and CAP_NET_ADMIN, which an install as an ordinary user can give the
 # binary as file capabilities (`sudo setcap`). Run from a terminal, the
-# installer asks; otherwise it says how. Replacing the binary drops them, so
-# every install asks again.
+# installer asks with a default of no; non-interactive installs grant nothing
+# unless --fastpath is explicit. Every vmlab command then holds CAP_BPF and
+# CAP_NET_ADMIN for its lifetime, including its parsers, not just network setup.
+# Replacing the binary drops them, so every install requires consent again.
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
 # Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
@@ -67,8 +69,16 @@ err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 warn() { printf '\nwarning: %s\n' "$1" >&2; }
 
 usage() {
-  # The header comment, up to the first blank line.
-  sed -n '2,/^$/p' "$0" | sed -n 's/^# \{0,1\}//p'
+  printf '%s\n' \
+    'Usage: install.sh [--version X | --pre] [options]' \
+    '  --bin-dir DIR       binary destination (default ~/.local/bin)' \
+    '  --guest-dir DIR     guest assets destination' \
+    '  --no-guest          binary only' \
+    '  --fastpath          request eBPF capabilities (privileged)' \
+    '  --no-fastpath       do not request capabilities' \
+    '  --skip-checks       skip runtime tool checks' \
+    '  --insecure-skip-signature  unsafe: skip cosign, still check SHA256SUMS' \
+    '  --help              show this help'
   exit "${1:-0}"
 }
 
@@ -109,9 +119,14 @@ esac
 if command -v curl >/dev/null 2>&1; then
   http_get()      { curl -fsSL "$1"; }
   download_file() { curl -fsSL -o "$2" "$1"; }
+  latest_url() { curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest"; }
 elif command -v wget >/dev/null 2>&1; then
   http_get()      { wget -qO- "$1"; }
   download_file() { wget -qO "$2" "$1"; }
+  latest_url() {
+    wget --server-response -O /dev/null "https://github.com/$REPO/releases/latest" 2>&1 |
+      sed -n 's/^[[:space:]]*[Ll]ocation: \([^[:space:]]*\).*/\1/p' | tail -n1
+  }
 else
   err "need curl or wget on PATH"
 fi
@@ -144,6 +159,12 @@ elif [ "$PRE" -eq 1 ]; then
   [ -n "$tag" ] || err "could not find any release for $REPO"
 else
   tag="$(http_get "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | first_tag || true)"
+  if [ -z "$tag" ]; then
+    resolved="$(latest_url 2>/dev/null || true)"
+    case "$resolved" in
+      https://github.com/"$REPO"/releases/tag/v*) tag="${resolved##*/}" ;;
+    esac
+  fi
   [ -n "$tag" ] || err "no stable release published yet.
 vmlab is pre-release only for now — re-run with --pre to get the newest pre-release:
   curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre
@@ -173,7 +194,9 @@ cleanup_release() {
   [ -n "$verify_dir" ] && [ "$verify_dir" != / ] || return 1
   rm -rf "$verify_dir"
 }
-trap cleanup_release EXIT INT TERM
+trap cleanup_release EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 download_file "$BASE_URL/$tag/SHA256SUMS" "$verify_dir/SHA256SUMS" || err "release has no checksum manifest"
 if [ "$INSECURE_SKIP_SIGNATURE" -eq 0 ]; then
   download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" || err "release has no signature bundle"
@@ -197,19 +220,11 @@ download_file "$url" "$tmp" || err "download failed: $url
 The release may not exist or may lack a $suffix asset. See https://github.com/$REPO/releases"
 verify_asset "$asset" "$tmp"
 
-[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
 chmod +x "$tmp"
 mkdir -p "$BIN_DIR"
-# Whether the binary being replaced had the fast path's capabilities: the new
-# file does not inherit them, and the question below defaults to keeping them.
-HAD_CAPS=0
-if have getcap && [ -f "$BIN_DIR/vmlab" ]; then
-  case "$(getcap "$BIN_DIR/vmlab" 2>/dev/null)" in
-    *cap_bpf*) HAD_CAPS=1 ;;
-  esac
-fi
-[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || { echo "VML-88: BIN_DIR is empty or /" >&2; exit 1; }
-[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
+[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
 mv "$tmp" "$BIN_DIR/vmlab"
 
 printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
@@ -233,16 +248,19 @@ fastpath_hint() {
   printf 'Without them vmlab uses its userspace network fabric, which needs no privilege.\n'
 }
 
+fastpath_warning() {
+  printf '%s\n' 'WARNING: every vmlab command runs with CAP_BPF and CAP_NET_ADMIN for its lifetime, including parsers of untrusted guest and template data, not just network setup.'
+}
+
 # Ask on the terminal: under `curl | sh` the script itself is stdin.
 fastpath_ask() {
-  if [ "$HAD_CAPS" -eq 1 ]; then choices="[Y/n]"; else choices="[y/N]"; fi
+  fastpath_warning >/dev/tty
   printf '\nGrant vmlab CAP_BPF and CAP_NET_ADMIN for the eBPF network fast path?\n' >/dev/tty
   printf 'This runs: sudo setcap %s %s\n' "$CAPS" "$BIN_DIR/vmlab" >/dev/tty
-  printf 'Any program running as you can then use those capabilities through vmlab. %s ' "$choices" >/dev/tty
+  printf 'Any program running as you can then use those capabilities through vmlab. [y/N] ' >/dev/tty
   read -r answer </dev/tty || answer=""
   case "$answer" in
     [Yy]|[Yy][Ee][Ss]) return 0 ;;
-    "") [ "$HAD_CAPS" -eq 1 ] ;;
     *) return 1 ;;
   esac
 }
@@ -251,6 +269,7 @@ fastpath_caps() {
   # root's daemons hold every capability already.
   [ "$(id -u)" -eq 0 ] && return 0
   [ "$FASTPATH" = no ] && return 0
+  [ "$FASTPATH" != yes ] || fastpath_warning >&2
   if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     [ "$FASTPATH" = yes ] && printf '\nWSL 2 cannot run the eBPF fast path, so no capabilities were granted.\n'
     return 0
@@ -273,7 +292,7 @@ fastpath_caps() {
     # In a subshell: a failed redirect on `:`, a special builtin, would end
     # this shell.
     if ! ( : </dev/tty ) 2>/dev/null; then
-      fastpath_hint
+      printf '\nNo terminal: no capabilities granted. Use --fastpath only after reviewing the lifetime privilege risk.\n'
       return 0
     fi
     fastpath_ask || { printf 'Not granted. '; fastpath_hint; return 0; }
@@ -312,6 +331,24 @@ a lab container and a template build both do. Build them from source instead:
 }
 
 install_guest() {
+  [ -n "$GUEST_DIR" ] && [ "$GUEST_DIR" != / ] || err "unsafe guest directory"
+  # Never delete an arbitrary directory supplied through --guest-dir. Adopt
+  # older unmarked installs only when ownership and the bundle layout match.
+  if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
+    if [ -L "$GUEST_DIR" ] || [ ! -d "$GUEST_DIR" ] \
+      || [ "$(stat -c %u -- "$GUEST_DIR" 2>/dev/null || true)" != "$(id -u)" ]; then
+      guest_fallback "refusing to replace symlink or non-owned guest directory $GUEST_DIR."
+      return 0
+    fi
+    if [ ! -d "$GUEST_DIR/agent" ] || [ ! -d "$GUEST_DIR/firmware" ] \
+      || [ ! -f "$GUEST_DIR/agent/linux-x86_64/vmlab-agent" ] \
+      || [ ! -f "$GUEST_DIR/x86_64/vmlinuz" ] \
+      || [ ! -f "$GUEST_DIR/x86_64/initramfs.img" ]; then
+      guest_fallback "refusing to replace unrelated guest directory $GUEST_DIR: expected the vmlab guest bundle layout."
+      return 0
+    fi
+    touch "$GUEST_DIR/.vmlab-guest" || { guest_fallback "cannot mark $GUEST_DIR."; return 0; }
+  fi
   gname="vmlab-guest-${ver}.tar.gz"
   gurl="$BASE_URL/$tag/$gname"
   printf '\nInstalling guest assets to %s\n' "$GUEST_DIR"
@@ -328,7 +365,7 @@ install_guest() {
     rm -rf "$gtmp"
     cleanup_release
   }
-  trap cleanup_guest EXIT INT TERM
+  trap cleanup_guest EXIT
 
   if ! download_file "$gurl" "$gtmp/$gname"; then
     guest_fallback "could not download $gurl."
@@ -342,6 +379,7 @@ install_guest() {
     guest_fallback "$gname did not unpack into a guest directory."
     return 0
   fi
+  touch "$gtmp/new/.vmlab-guest"
 
   # Swap: the old directory moves aside whole (nothing from an older version
   # survives in the new one), the new one renames into its place, and the old
@@ -355,7 +393,7 @@ install_guest() {
     return 0
   fi
   rm -rf "$gtmp"
-  trap cleanup_release EXIT INT TERM
+  trap cleanup_release EXIT
 
   printf 'Installed guest assets: %s\n' "$(ls "$GUEST_DIR" | tr '\n' ' ')"
 
