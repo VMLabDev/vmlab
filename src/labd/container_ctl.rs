@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
@@ -25,6 +25,7 @@ use vmlab_cinit_proto::{CtlCommand, CtlEvent, PROTO_VERSION};
 /// Broadcast capacity: cinit emits a handful of events over a container's
 /// whole life, so 64 gives slow subscribers plenty of slack.
 const EVENT_CAPACITY: usize = 64;
+const MAX_CTL_LINE: usize = 64 * 1024;
 
 /// Handle to one container's ctl channel. Cheap to clone (`Arc` inner);
 /// dropping every handle does not tear the reader down — that ends on EOF
@@ -71,9 +72,9 @@ impl CtlHandle {
 
         let reader_inner = inner.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(read_half).lines();
+            let mut reader = BufReader::new(read_half);
             // Ok(None) is EOF; Err is a dead socket. Both end the channel.
-            while let Ok(Some(line)) = lines.next_line().await {
+            while let Ok(Some(line)) = read_ctl_line(&mut reader).await {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -95,7 +96,10 @@ impl CtlHandle {
                         }
                     }
                     CtlEvent::NetUp { ip } => {
-                        *reader_inner.last_ip.write().await = Some(ip.clone());
+                        let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() else {
+                            continue;
+                        };
+                        *reader_inner.last_ip.write().await = Some(ip.to_string());
                     }
                     CtlEvent::Started { .. } | CtlEvent::Idle => {
                         let _ = started_tx.send(true);
@@ -170,6 +174,28 @@ impl CtlHandle {
     }
 }
 
+async fn read_ctl_line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let n = reader
+        .take((MAX_CTL_LINE + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .await?;
+    if n > MAX_CTL_LINE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ctl line too long",
+        ));
+    }
+    if n == 0 {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +226,34 @@ mod tests {
         let mut line = serde_json::to_string(ev).unwrap();
         line.push('\n');
         stream.write_all(line.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unterminated_ctl_line_is_refused_at_cap() {
+        let input = vec![b'x'; MAX_CTL_LINE + 1];
+        let mut reader = BufReader::new(input.as_slice());
+        assert_eq!(
+            read_ctl_line(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_net_up_ip_is_not_cached() {
+        let (_dir, path) = spawn_mock(|mut stream| async move {
+            write_line(
+                &mut stream,
+                &CtlEvent::NetUp {
+                    ip: "127.0.0.1; hostile".into(),
+                },
+            )
+            .await;
+            write_line(&mut stream, &CtlEvent::Started { pid: 1 }).await;
+        })
+        .await;
+        let ctl = CtlHandle::connect(&path).await.unwrap();
+        ctl.wait_started(LONG).await.unwrap();
+        assert!(ctl.inner.last_ip.read().await.is_none());
     }
 
     #[tokio::test]

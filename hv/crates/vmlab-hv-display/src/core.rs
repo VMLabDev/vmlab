@@ -471,8 +471,15 @@ impl DisplayServer {
                     }
                 }
                 Message::CpuCopy { surface_id } if caps.has(Capabilities::CPU_COPY) => {
-                    if local.lock().unwrap().surface != surface_id {
-                        return Err(invalid("CpuCopy names stale surface"));
+                    {
+                        let mut s = local.lock().unwrap();
+                        if s.surface != surface_id {
+                            return Err(invalid("CpuCopy names stale surface"));
+                        }
+                        // Select CPU mode before seq advances: the frames worker reads
+                        // both under the state lock, so it never sees the new seq
+                        // without the mode and sends no dma-buf configure in between.
+                        s.cpu_copy = true;
                     }
                     if matches!(
                         self.shared.state.lock().unwrap().frame.pixels,
@@ -482,7 +489,6 @@ impl DisplayServer {
                     } else {
                         self.capture(true)?;
                     }
-                    local.lock().unwrap().cpu_copy = true;
                 }
                 Message::Key { .. }
                 | Message::PointerAbs { .. }
@@ -524,19 +530,17 @@ impl DisplayServer {
         let mut cpu_mode = !caps.has(Capabilities::DMABUF_OK);
         let mut cpu_client = None;
         loop {
-            let (closed, cpu_copy, can_send_frame, local_revision) = {
-                let s = local.lock().unwrap();
-                (
-                    s.closed,
-                    s.cpu_copy,
-                    caps.has(Capabilities::FRAMES) && s.held.len() < 3,
-                    s.revision,
-                )
-            };
+            // One snapshot of both, state before local as in the wait below. CpuCopy
+            // sets cpu_copy before it advances seq, so a new seq comes with the mode.
             // Keep metadata flowing when the ring is full without pinning skipped pixels.
-            let (frame, seq, cursor, cs, leds, ls, revision) = {
+            let (closed, cpu_copy, local_revision, frame, seq, cursor, cs, leds, ls, revision) = {
                 let s = self.shared.state.lock().unwrap();
+                let l = local.lock().unwrap();
+                let can_send_frame = caps.has(Capabilities::FRAMES) && l.held.len() < 3;
                 (
+                    l.closed,
+                    l.cpu_copy,
+                    l.revision,
                     can_send_frame.then(|| s.frame.clone()),
                     s.seq,
                     s.cursor.clone(),
@@ -576,8 +580,10 @@ impl DisplayServer {
                 send(stream, &Message::LedState { mask: leds }, &[])?;
                 led_seen = ls;
             }
+            // CpuCopy always advances seq after it sets cpu_copy. Waiting for that seq
+            // sends one CPU frame, not a stale one followed by the captured one.
             if let Some(frame) = frame
-                && (seq != last || cpu_copy)
+                && seq != last
             {
                 cpu_mode |= cpu_copy;
                 if cpu_copy && cpu_client.is_none() && caps.has(Capabilities::DMABUF_OK) {

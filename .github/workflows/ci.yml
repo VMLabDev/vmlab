@@ -2,6 +2,9 @@ name: CI
 
 # CI runs only on main and release/**. Card branches and next are validated
 # locally with `just ci::check` (D12), so a push to them starts no workflow.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, 'release/**']
@@ -15,6 +18,16 @@ env:
 # step 20 minutes (VML-78): a hung apt mirror held the 0.44.0 release for 68
 # minutes, and the GitHub default is 6 hours.
 jobs:
+  release-dry-run:
+    name: Release supply-chain dry-run (no signing identity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
+      - run: just ci::release-dry-run
+
   # The fast gate: every fmt and clippy step of the host and hypervisor
   # workspaces, so a fmt or lint failure ends the run before the long test
   # jobs (`check`, `hv-check`) start. Those two jobs `need` this one and the
@@ -24,17 +37,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@just
-      - uses: taiki-e/install-action@uv
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
       # Paths Windows cannot check out (VML-60): no build needed.
       - run: just ci::path-check
       # VML-88: unguarded variable paths in shell scripts and just recipes (no build needed).
       - run: just ci::shell-paths
+      - run: just ci::tap-test
+      - run: just ci::wscript-test
       # The fmt checks need no build: run them first.
       - run: just ci::fmt-check
       - run: just ci::hv-fmt-check
@@ -48,11 +63,11 @@ jobs:
       - name: Resolve virglrenderer cache identity
         id: virgl
         run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci-cache/virglrenderer-*
           key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: fmt-lint
       - run: just ci::lint
@@ -66,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -84,15 +99,16 @@ jobs:
             qemu-efi-aarch64 qemu-efi-riscv64 \
             tesseract-ocr passt \
             xorriso mtools dosfstools samba bubblewrap waypipe
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # One part of the merge bar per step; `just ci::check` runs the same set
       # in one go.
       - run: just ci::test
+      - run: just ci::kvm-policy-test
       - run: just ci::agent-conformance
 
   hv-check:
@@ -101,13 +117,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@just
-      - uses: taiki-e/install-action@uv
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -117,11 +133,11 @@ jobs:
       - name: Resolve virglrenderer cache identity
         id: virgl
         run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci-cache/virglrenderer-*
           key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: hv-check
       - run: just ci::hv-desktop-test
@@ -136,14 +152,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, riscv64gc-unknown-linux-musl, x86_64-pc-windows-gnu, x86_64-apple-darwin
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             guest/cinit-proto
@@ -165,15 +181,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # ebpf/rust-toolchain.toml selects the pinned nightly automatically;
       # install it (with rust-src) up front so cargo doesn't have to.
       - name: Install pinned ebpf toolchain
         run: |
           channel=$(grep '^channel' ebpf/rust-toolchain.toml | cut -d'"' -f2)
           rustup toolchain install "$channel" --profile minimal --component rust-src
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: ebpf
       - run: just ebpf-tools
@@ -190,70 +206,36 @@ jobs:
     name: Calculate version
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     outputs:
       version: ${{ steps.calc.outputs.version }}
       prerelease: ${{ steps.calc.outputs.prerelease }}
       do_release: ${{ steps.calc.outputs.do_release }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - id: calc
+        # The rules live in scripts/release-version.sh, tested by
+        # `just ci::release-version` (VML-104).
         run: |
-          IS_RELEASE=$(git log -1 --format='%(trailers:key=release,valueonly)')
-          IS_PRERELEASE=$(git log -1 --format='%(trailers:key=pre-release,valueonly)')
+          set -eu
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            printf 'do_release=false\nversion=0.0.0-dry-run\nprerelease=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ./scripts/release-version.sh > "$RUNNER_TEMP/release.env"
+          grep -E '^(do_release|version|prerelease)=' "$RUNNER_TEMP/release.env" >> "$GITHUB_OUTPUT"
 
-          if [[ "$IS_RELEASE" != "true" && "$IS_PRERELEASE" != "true" ]]; then
-            echo "do_release=false" >> "$GITHUB_OUTPUT"
+          if grep -qx 'do_release=false' "$RUNNER_TEMP/release.env"; then
             echo "No release/pre-release trailer on HEAD — tests only." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          # Next version = bump from the last v* tag, scanning conventional
-          # commits since that tag for the bump level (0.x: major -> minor).
-          LAST_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "")
-          if [[ -z "$LAST_TAG" ]]; then
-            PREV_MAJOR=0; PREV_MINOR=0; PREV_PATCH=0; RANGE="HEAD"
-          else
-            VER="${LAST_TAG#v}"; VER="${VER%%-*}"
-            IFS='.' read -r PREV_MAJOR PREV_MINOR PREV_PATCH <<< "$VER"
-            RANGE="${LAST_TAG}..HEAD"
-          fi
-
-          BUMP="none"
-          while IFS= read -r HASH; do
-            SUBJECT=$(git log -1 --format='%s' "$HASH")
-            BODY=$(git log -1 --format='%b' "$HASH")
-            if echo "$SUBJECT" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODY" | grep -qiE '^BREAKING[ -]CHANGE:'; then
-              BUMP="major"
-            elif echo "$SUBJECT" | grep -qE '^feat(\(.+\))?:' && [[ "$BUMP" != "major" ]]; then
-              BUMP="minor"
-            elif echo "$SUBJECT" | grep -qE '^(fix|perf|refactor|build|ci|docs|style|test|chore|revert)(\(.+\))?:' && [[ "$BUMP" == "none" ]]; then
-              BUMP="patch"
-            fi
-          done < <(git log --format='%H' $RANGE)
-          [[ "$BUMP" == "none" ]] && BUMP="patch"
-
-          case "$BUMP" in
-            major)
-              if [[ "$PREV_MAJOR" -eq 0 ]]; then MAJOR=0; MINOR=$((PREV_MINOR + 1)); PATCH=0
-              else MAJOR=$((PREV_MAJOR + 1)); MINOR=0; PATCH=0; fi ;;
-            minor) MAJOR=$PREV_MAJOR; MINOR=$((PREV_MINOR + 1)); PATCH=0 ;;
-            patch) MAJOR=$PREV_MAJOR; MINOR=$PREV_MINOR; PATCH=$((PREV_PATCH + 1)) ;;
-          esac
-
-          VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          PRERELEASE=false
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            VERSION="${VERSION}-alpha"
-            PRERELEASE=true
-          fi
-
-          echo "Calculated version: $VERSION (bump=$BUMP, prerelease=$PRERELEASE, from ${LAST_TAG:-none})"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          echo "do_release=true" >> "$GITHUB_OUTPUT"
+          VERSION=$(sed -n 's/^version=//p' "$RUNNER_TEMP/release.env")
+          PRERELEASE=$(sed -n 's/^prerelease=//p' "$RUNNER_TEMP/release.env")
+          BUMP=$(sed -n 's/^bump=//p' "$RUNNER_TEMP/release.env")
+          LAST_TAG=$(sed -n 's/^last_tag=//p' "$RUNNER_TEMP/release.env")
 
           cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
           ## Release
@@ -274,7 +256,7 @@ jobs:
     # The whole merge bar, not only the host job: a release is never cut from
     # a commit any part of `ci::check` rejected.
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
-    if: needs.version.outputs.do_release == 'true'
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -285,13 +267,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: linux-x86_64
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: build-${{ matrix.target }}
       - name: Stamp version
@@ -304,7 +286,7 @@ jobs:
         run: |
           V="${{ needs.version.outputs.version }}"
           cp "target/${{ matrix.target }}/release/vmlab" "vmlab-$V-${{ matrix.suffix }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bin-${{ matrix.target }}
           path: vmlab-${{ needs.version.outputs.version }}-${{ matrix.suffix }}
@@ -313,13 +295,13 @@ jobs:
   vdisplay-build:
     name: Compile Windows display driver
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
-    if: needs.version.outputs.do_release == 'true'
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -340,7 +322,7 @@ jobs:
             -p virtio-win10-prewhql-0.1-161.zip -O ".ci-cache/vdisplay-windows/ivshmem-$sha.zip"
       - name: Compile against pinned kits
         run: python3 guest/vdisplay-windows/build.py --output target/vdisplay-unsigned
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vdisplay-unsigned
           path: target/vdisplay-unsigned
@@ -349,24 +331,24 @@ jobs:
   vdisplay-sign:
     name: Catalog and test-sign Windows display driver
     needs: [version, vdisplay-build]
-    if: needs.version.outputs.do_release == 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version.outputs.do_release == 'true'
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: vdisplay-unsigned
           path: target/vdisplay-package
       # build.ps1 verifies every archive against its pin, so a warm cache means no fetch at release time.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: C:\vdisplay-tools\downloads
           key: vdisplay-tools-${{ runner.os }}-${{ hashFiles('guest/vdisplay-windows/dependencies.json', 'guest/vdisplay-windows/build-vm/toolchain/toolchain.json') }}
       - name: Sign with pinned SDK and WDK tools
         shell: powershell
         run: ./guest/vdisplay-windows/build.ps1 -Mode sign-only -Package "$PWD/target/vdisplay-package"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vdisplay-signed
           path: target/vdisplay-package
@@ -384,13 +366,18 @@ jobs:
     # This job installs the build container's toolchains directly on the runner.
     env:
       VMLAB_BUILD_ENV: '1'
-    needs: [version, check, hv-check, guest-crates, ebpf-verify, vdisplay-sign]
-    if: needs.version.outputs.do_release == 'true'
+    needs: [version, check, hv-check, guest-crates, ebpf-verify, vdisplay-build, vdisplay-sign]
+    # vdisplay-sign is deliberately skipped on release branches. Do not let
+    # that skip suppress the dry build, but never ignore a failed prerequisite.
+    if: >-
+      always() && !failure() && !cancelled() &&
+      (needs.version.outputs.do_release == 'true' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')))
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@just
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -407,14 +394,14 @@ jobs:
         id: mingw
         run: echo "version=$(dpkg-query -W -f='${Version}' mingw-w64-common)" >> "$GITHUB_OUTPUT"
       # Both caches sit at the default locations the build scripts look in.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.local/share/vmlab/toolchains/mingw-msvcrt
           key: mingw-msvcrt-${{ runner.os }}-${{ steps.mingw.outputs.version }}-${{ hashFiles('guest/build-mingw-msvcrt.sh', 'scripts/guest-toolchains.sh') }}
       - name: Build msvcrt CRT
         run: ./scripts/guest-toolchains.sh msvcrt
       # OpenWatcom is a pinned 150 MB snapshot; the pin lives in the script.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.local/opt/open-watcom-v2
           key: open-watcom-${{ runner.os }}-${{ hashFiles('scripts/guest-toolchains.sh') }}
@@ -423,19 +410,21 @@ jobs:
       # zig, cargo-zigbuild and rcodesign for the macOS agent, all pinned there.
       - name: Install the macOS agent toolchain
         run: ./scripts/guest-toolchains.sh zig
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: guest-assets
           workspaces: |
             guest/cinit
             guest/agent
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: vdisplay-signed
+          name: ${{ github.ref == 'refs/heads/main' && 'vdisplay-signed' || 'vdisplay-unsigned' }}
           path: guest/vdisplay-windows/target/signed-package
       - name: Build and package
+        env:
+          VMLAB_RELEASE_DRY_RUN: ${{ startsWith(github.ref, 'refs/heads/release/') && '1' || '0' }}
         run: just guest-package "${{ needs.version.outputs.version }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: guest-assets
           path: |
@@ -447,16 +436,16 @@ jobs:
   hv-build:
     name: Build hypervisor bundle
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
-    if: needs.version.outputs.do_release == 'true'
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0
-      - uses: taiki-e/install-action@just
-      - uses: taiki-e/install-action@uv
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -467,17 +456,17 @@ jobs:
         id: virgl
         run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
       # Outside target/: rust-cache restores that directory separately.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci-cache/virglrenderer-*
           key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: hv-build
           workspaces: . -> target/hv
       - name: Build and check hypervisor bundle
         run: just ci::hv-package "${{ needs.version.outputs.version }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hv-assets
           path: |
@@ -485,42 +474,82 @@ jobs:
             target/dist/vmlab-hv-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz.sha256
           retention-days: 1
 
+  # Prepare real build artifacts on release branches too, with read-only
+  # permissions and no signing tools or identity. Publication is main-only.
+  release-assets:
+    name: Prepare release assets (unsigned)
+    needs: [version, build, guest-assets, hv-build, release-dry-run]
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          pattern: bin-*
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          name: guest-assets
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          name: hv-assets
+      - name: Prepare checksums and provenance without signing
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          python3 scripts/release-assets.py dist "$VERSION"
+          cd dist
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-assets-unsigned
+          path: dist
+          retention-days: 1
+
   # ── Release ───────────────────────────────────────────────────────────────
   # Tag the commit and cut a GitHub (pre-)release with the binary and the
   # guest and hypervisor bundles (and their checksums) attached.
   release:
     name: Create GitHub release
-    needs: [version, build, guest-assets, hv-build]
-    if: needs.version.outputs.do_release == 'true'
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    needs: [version, release-assets]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
-          pattern: bin-*
-      - uses: actions/download-artifact@v8
+          name: release-assets-unsigned
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
         with:
-          path: dist
-          name: guest-assets
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          name: hv-assets
-      - name: Tag
+          cosign-release: v2.6.1
+      - name: Prepare authenticated release assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          V="${{ needs.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v$V"
-          git push origin "v$V"
-      - uses: softprops/action-gh-release@v3
+          set -eu
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.bundle dist/SHA256SUMS
+          cosign verify-blob --bundle dist/SHA256SUMS.bundle \
+            --certificate-identity https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com dist/SHA256SUMS
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
           prerelease: ${{ needs.version.outputs.prerelease }}

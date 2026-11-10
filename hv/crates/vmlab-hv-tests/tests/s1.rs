@@ -541,6 +541,89 @@ fn boots_to_idle_exec_and_scratch_roundtrip() {
     guest.quit_and_exit_zero();
 }
 
+/// VML-107: virtio-blk writes the guest never flushed survive a SIGTERM stop.
+/// The guest writes the last 256 KiB of the 2 GiB scratch disk (its ext4 does not
+/// use it yet) with O_DIRECT and no fsync, so the device gets the writes and
+/// no FLUSH. After SIGTERM, `qemu-img check` must be clean and the bytes must
+/// be mapped.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn sigterm_keeps_unflushed_virtio_blk_writes() {
+    const SCRATCH_SIZE: u64 = 2 << 30;
+    // Exec stdin must fit the agent's initial credit window (256 KiB).
+    const LEN: usize = 256 << 10;
+    const LINE: &[u8] = b"VML107-sigterm-keeps-this\n";
+    let Some(assets) = check() else { return };
+    let spec = MachineSpec::idle("s1-sigterm-disk");
+    let mut guest = vmlab_hv_tests::launch(&spec, &assets);
+    let container = spec.container_spec();
+    let (_ctl, _) = boot_to_idle(&guest, &container, BOOT);
+    let mut agent = agent_ready(&guest);
+
+    let block = 65536u64;
+    let seek = (SCRATCH_SIZE - LEN as u64) / block;
+    let pattern: Vec<u8> = LINE.iter().copied().cycle().take(LEN).collect();
+    let script = format!(
+        "{BUSYBOX} dd of=/dev/vdb bs={block} count={} seek={seek} iflag=fullblock oflag=direct",
+        LEN as u64 / block
+    );
+    let write = agent
+        .exec_with_stdin(
+            &[BUSYBOX, "sh", "-c", &script],
+            &pattern,
+            Duration::from_secs(30),
+        )
+        .expect("guest dd");
+    assert_eq!(
+        write.exit_code,
+        0,
+        "guest dd: {write:?}\n{}",
+        guest.diagnostics("dd")
+    );
+    drop(agent);
+
+    let pid = guest.child.id() as i32;
+    // SAFETY: kill(2) on the vmlab-hv child this test spawned.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let status = guest.wait_exit(Duration::from_secs(30));
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGTERM),
+        "SIGTERM must stop the machine cleanly\n{}",
+        guest.diagnostics("sigterm")
+    );
+
+    let disk = guest.dir().join("scratch.qcow2");
+    let check = std::process::Command::new("qemu-img")
+        .arg("check")
+        .arg(&disk)
+        .output()
+        .expect("qemu-img check");
+    let report = String::from_utf8_lossy(&check.stdout).into_owned();
+    assert!(check.status.success(), "qemu-img check: {report}");
+    let raw = guest.dir().join("scratch.raw");
+    let convert = std::process::Command::new("qemu-img")
+        .args(["convert", "-f", "qcow2", "-O", "raw"])
+        .arg(&disk)
+        .arg(&raw)
+        .output()
+        .expect("qemu-img convert");
+    assert!(convert.status.success(), "{convert:?}");
+    let mut actual = vec![0; LEN];
+    std::os::unix::fs::FileExt::read_exact_at(
+        &std::fs::File::open(&raw).unwrap(),
+        &mut actual,
+        SCRATCH_SIZE - LEN as u64,
+    )
+    .unwrap();
+    assert!(
+        actual == pattern,
+        "the guest's unflushed write is not in the image after SIGTERM \
+         (first bytes {:02x?})\n{report}",
+        &actual[..16]
+    );
+}
+
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn workload_container_exit_powers_off_machine() {

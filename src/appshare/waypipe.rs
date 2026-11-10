@@ -106,13 +106,34 @@ impl Client {
 mod tests {
     use super::*;
 
+    async fn start_fake_client(bin: &Path, verbose: bool) -> Client {
+        // A parallel test's fork can inherit fs::write's handle until exec
+        // or exit, even though our writer is already closed. Retry only
+        // ETXTBSY, and keep both the attempts and their delay bounded.
+        for attempt in 0..50 {
+            match Client::start(bin, verbose).await {
+                Ok(client) => return client,
+                Err(error)
+                    if attempt < 49
+                        && error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                            e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        }) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("starting fake waypipe: {error:#}"),
+            }
+        }
+        unreachable!("the last attempt returns or panics")
+    }
+
     #[tokio::test]
     async fn stderr_probe() {
         let Some(bin) = std::env::var_os("VMLAB_TEST_WAYPIPE_BIN") else {
             return;
         };
         let verbose = std::env::var_os("VMLAB_TEST_WAYPIPE_VERBOSE").is_some();
-        let _client = Client::start(Path::new(&bin), verbose).await.unwrap();
+        let _client = start_fake_client(Path::new(&bin), verbose).await;
     }
 
     #[test]
@@ -187,7 +208,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let client = Client::start(&fake, false).await.unwrap();
+        let client = start_fake_client(&fake, false).await;
         let dir = client.socket.parent().unwrap().to_path_buf();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);

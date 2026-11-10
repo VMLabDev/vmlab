@@ -4,6 +4,7 @@
 //! see `DESIGN.md` for the imago-vs-own decision and the black-box QEMU
 //! observations that pin the vmstate layout.
 
+mod recovery;
 mod refcount;
 mod snapshot;
 
@@ -29,6 +30,7 @@ const EXT_BACKING_FORMAT: u32 = 0xe279_2aca;
 const EXT_END: u32 = 0;
 
 const MAX_BACKING_DEPTH: usize = 8;
+const INCOMPAT_DIRTY: u64 = 1;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ReadSource {
@@ -117,23 +119,30 @@ impl TableCache {
         self.order.retain(|k| *k != key);
     }
 
-    fn take_dirty(&mut self) -> Vec<(u64, Vec<u8>)> {
-        let keys: Vec<u64> = self
-            .map
+    /// Copies of the dirty entries. They stay dirty: the caller marks each
+    /// one clean with [`TableCache::mark_clean`] only after its write
+    /// succeeded, so a failed write leaves it for the next flush (VML-108).
+    fn dirty(&self) -> Vec<(u64, Vec<u8>)> {
+        self.map
             .iter()
             .filter(|(_, (_, dirty))| *dirty)
-            .map(|(k, _)| *k)
-            .collect();
-        let mut out = Vec::new();
-        for k in keys {
-            if let Some((buf, dirty)) = self.map.get_mut(&k)
-                && *dirty
-            {
-                out.push((k, buf.clone()));
-                *dirty = false;
-            }
+            .map(|(k, (buf, _))| (*k, buf.clone()))
+            .collect()
+    }
+
+    fn mark_clean(&mut self, key: u64) {
+        if let Some(entry) = self.map.get_mut(&key) {
+            entry.1 = false;
         }
-        out
+    }
+
+    /// Put back evicted dirty entries whose write failed. This can take
+    /// the cache over its capacity until the next `put` evicts again.
+    fn restore_dirty(&mut self, entries: impl IntoIterator<Item = (u64, Vec<u8>)>) {
+        for (key, data) in entries {
+            self.touch(key);
+            self.map.insert(key, (data, true));
+        }
     }
 }
 
@@ -180,6 +189,9 @@ pub struct Qcow2Image {
     header_dirty: bool,
     l1_dirty: bool,
     refcount_table_dirty: bool,
+    // A zero refcount is not reusable until the old mapping is durable.
+    retired: std::collections::HashSet<u64>,
+    write_started: bool,
 }
 
 impl Qcow2Image {
@@ -196,6 +208,15 @@ impl Qcow2Image {
         }
         let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let mut img = Self::parse(path, file, read_only)?;
+        // v2 has no dirty marker, so never trust its refcounts on writable open.
+        if !read_only
+            && (img.is_dirty() || img.version == 2)
+            && let Err(error) = img.rebuild_refcounts()
+        {
+            // Never flush a partially recovered image from Drop.
+            img.read_only = true;
+            return Err(error);
+        }
         img.open_backing(depth)?;
         Ok(img)
     }
@@ -274,7 +295,6 @@ impl Qcow2Image {
                 });
             }
         }
-        const INCOMPAT_DIRTY: u64 = 1;
         const INCOMPAT_CORRUPT: u64 = 1 << 1;
         const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
         const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
@@ -288,13 +308,6 @@ impl Qcow2Image {
             return Err(Error::Unsupported(format!(
                 "unknown incompatible features {incompatible_features:#x}"
             )));
-        }
-        if incompatible_features & INCOMPAT_DIRTY != 0 {
-            return Err(Error::Unsupported(
-                "image has the dirty bit set (lazy refcounts were not flushed); \
-                 run qemu-img check on it first"
-                    .into(),
-            ));
         }
         if incompatible_features & INCOMPAT_CORRUPT != 0 {
             return Err(Error::Unsupported("image is marked corrupt".into()));
@@ -428,6 +441,8 @@ impl Qcow2Image {
             l1_dirty: false,
             refcount_table_dirty: false,
             free: FreeClusters::default(),
+            retired: Default::default(),
+            write_started: false,
         };
         Ok(img)
     }
@@ -501,6 +516,7 @@ impl Qcow2Image {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        self.begin_write()?;
         self.file.write_all_at(buf, offset)?;
         Ok(())
     }
@@ -513,8 +529,14 @@ impl Qcow2Image {
         }
         let mut buf = vec![0u8; self.cluster_size as usize];
         self.read_file(host_offset, &mut buf)?;
-        for (host, table) in self.l2_cache.put(host_offset, buf, false) {
-            self.write_file(host, &table)?;
+        let mut evicted = self.l2_cache.put(host_offset, buf, false).into_iter();
+        while let Some((host, table)) = evicted.next() {
+            if let Err(e) = self.write_file(host, &table) {
+                // Keep the failed table and the unwritten rest dirty.
+                self.l2_cache
+                    .restore_dirty(std::iter::once((host, table)).chain(evicted));
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -821,11 +843,15 @@ impl Qcow2Image {
 
     fn flush_metadata(&mut self) -> Result<()> {
         self.check_writable()?;
+        self.begin_write()?;
         // Refblocks first (their location comes from the refcount table),
         // then the refcount table, the L1, the L2s and the header.
-        for (index, block) in self.refblock_cache.take_dirty() {
+        // Each table is marked clean only after its write succeeded, so a
+        // failed flush can be retried.
+        for (index, block) in self.refblock_cache.dirty() {
             let host = self.refblock_host(index)?;
             self.write_file(host, &block)?;
+            self.refblock_cache.mark_clean(index);
         }
         if self.refcount_table_dirty {
             let bytes: Vec<u8> = self
@@ -836,13 +862,17 @@ impl Qcow2Image {
             self.write_file(self.refcount_table_offset, &bytes)?;
             self.refcount_table_dirty = false;
         }
+        self.file.sync_all()?;
+        #[cfg(test)]
+        self.crash_checkpoint("refcounts");
         if self.l1_dirty {
             let bytes: Vec<u8> = self.l1.iter().flat_map(|e| e.to_be_bytes()).collect();
             self.write_file(self.l1_table_offset, &bytes)?;
             self.l1_dirty = false;
         }
-        for (host, table) in self.l2_cache.take_dirty() {
+        for (host, table) in self.l2_cache.dirty() {
             self.write_file(host, &table)?;
+            self.l2_cache.mark_clean(host);
         }
         if self.header_dirty {
             self.patch_header_fields();
@@ -850,7 +880,62 @@ impl Qcow2Image {
             self.write_file(0, &cluster)?;
             self.header_dirty = false;
         }
+        self.file.sync_all()?;
+        #[cfg(test)]
+        self.crash_checkpoint("mappings");
+        self.retired.clear();
+        self.free = FreeClusters::default();
         Ok(())
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.version >= 3
+            && u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap()) & INCOMPAT_DIRTY
+                != 0
+    }
+
+    /// Persist the dirty marker before the first data or metadata write.
+    /// Version 2 has no incompatible-feature word.
+    fn begin_write(&mut self) -> Result<()> {
+        if self.write_started {
+            return Ok(());
+        }
+        if self.version >= 3 {
+            let features = u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap())
+                | INCOMPAT_DIRTY;
+            self.file.write_all_at(&features.to_be_bytes(), 72)?;
+            self.file.sync_all()?;
+            self.header_cluster[72..80].copy_from_slice(&features.to_be_bytes());
+        }
+        self.write_started = true;
+        Ok(())
+    }
+
+    fn close_clean(&mut self) -> Result<()> {
+        self.flush()?;
+        if self.is_dirty() {
+            let features = u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap())
+                & !INCOMPAT_DIRTY;
+            self.file.write_all_at(&features.to_be_bytes(), 72)?;
+            self.file.sync_all()?;
+            self.header_cluster[72..80].copy_from_slice(&features.to_be_bytes());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn crash_checkpoint(&self, phase: &str) {
+        if std::env::var_os("VMLAB_QCOW_CRASH_IMAGE").as_deref() == Some(self.path.as_os_str())
+            && std::env::var("VMLAB_QCOW_CRASH_PHASE").as_deref() == Ok(phase)
+        {
+            use std::io::Write;
+            println!("QCOW_CHECKPOINT");
+            std::io::stdout().flush().unwrap();
+            // The parent kills this child by PID. Do not run Drop.
+            let mut byte = [0];
+            std::io::stdin().read_exact(&mut byte).unwrap();
+            panic!("crash checkpoint unexpectedly resumed");
+        }
     }
 
     fn refblock_host(&self, table_index: u64) -> Result<u64> {
@@ -1005,12 +1090,15 @@ impl Qcow2Image {
             l1_dirty: false,
             refcount_table_dirty: false,
             free: FreeClusters::default(),
+            retired: Default::default(),
+            write_started: false,
         };
+        // Install the initial header before begin_write updates its marker.
+        img.file.write_all_at(&hc, 0)?;
         // Refcounts for the metadata clusters themselves.
         for idx in 0u64..(3 + l1_clusters) {
             img.set_cluster_refcount(idx, 1)?;
         }
-        img.write_file(0, &hc)?;
         img.write_file(cluster_size, &rt)?;
         img.open_backing(0)?;
         Ok(img)
@@ -1280,6 +1368,21 @@ impl DiskImage for Qcow2Image {
     }
 }
 
+/// Closing an image writes its cached metadata. Data clusters are written at
+/// once, but the L2 and refcount updates that map them wait in the caches
+/// until a flush. Without this, an owner that drops the image without
+/// `flush` leaves the data in the file but unmapped (VML-107).
+///
+/// This is best effort, like `BufWriter`: errors leave the dirty marker set.
+/// Call [`DiskImage::flush`] to see errors and for durability.
+impl Drop for Qcow2Image {
+    fn drop(&mut self) {
+        if !self.read_only {
+            let _ = self.close_clean();
+        }
+    }
+}
+
 fn l1_size_as_clusters(l1_size: u32, cluster_size: u64) -> u64 {
     ((l1_size as u64) * 8).div_ceil(cluster_size).max(1)
 }
@@ -1330,6 +1433,109 @@ pub(crate) fn probe_format(path: &Path) -> Result<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_writer_child() {
+        let Some(path) = std::env::var_os("VMLAB_QCOW_CRASH_IMAGE") else {
+            return;
+        };
+        let mut img = Qcow2Image::open(Path::new(&path), false).unwrap();
+        img.write_at(img.cluster_size, &vec![0x72; img.cluster_size as usize])
+            .unwrap();
+        img.flush().unwrap();
+        panic!("child did not stop at the crash checkpoint");
+    }
+
+    #[test]
+    fn killed_metadata_writer_recovers_before_allocating() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        for phase in ["refcounts", "mappings"] {
+            let (_dir, mut img) = testsupport::blank(8 << 20);
+            let path = img.path.clone();
+            let cluster = img.cluster_size;
+            img.write_at(0, &vec![0x31; cluster as usize]).unwrap();
+            img.snapshot_create("before", 0, 0).unwrap();
+            drop(img);
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "qcow2::tests::crash_writer_child", "--nocapture"])
+                .env("VMLAB_QCOW_CRASH_IMAGE", &path)
+                .env("VMLAB_QCOW_CRASH_PHASE", phase)
+                .stdout(Stdio::piped())
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if line.unwrap().contains("QCOW_CHECKPOINT") {
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+            });
+            let checkpoint = rx.recv_timeout(Duration::from_secs(30));
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            reader.join().unwrap();
+            checkpoint.expect("child reached metadata boundary");
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9));
+
+            let read_only = Qcow2Image::open(&path, true).unwrap();
+            assert!(read_only.is_dirty());
+            drop(read_only);
+            let mut recovered = Qcow2Image::open(&path, false).unwrap();
+            let mut bytes = vec![0; cluster as usize];
+            recovered.read_at(0, &mut bytes).unwrap();
+            assert_eq!(bytes, vec![0x31; cluster as usize]);
+            recovered.read_at(cluster, &mut bytes).unwrap();
+            assert_eq!(
+                bytes,
+                vec![if phase == "mappings" { 0x72 } else { 0 }; cluster as usize]
+            );
+            recovered
+                .write_at(2 * cluster, &vec![0x93; cluster as usize])
+                .unwrap();
+            recovered.flush().unwrap();
+            recovered.read_at(0, &mut bytes).unwrap();
+            assert_eq!(bytes, vec![0x31; cluster as usize]);
+            recovered.snapshot_apply("before").unwrap();
+            recovered.read_at(0, &mut bytes).unwrap();
+            assert_eq!(bytes, vec![0x31; cluster as usize]);
+            drop(recovered);
+            assert!(!Qcow2Image::open(&path, true).unwrap().is_dirty());
+            let check = Command::new("qemu-img")
+                .args(["check", "-f", "qcow2"])
+                .arg(&path)
+                .output()
+                .expect("qemu-img is required for crash recovery test");
+            assert!(
+                check.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_marker_survives_flush_and_failed_close() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let path = img.path.clone();
+        img.write_at(0, &[0x51; 512]).unwrap();
+        img.flush().unwrap();
+        assert!(Qcow2Image::open(&path, true).unwrap().is_dirty());
+        img.write_at(img.cluster_size, &[0x52; 512]).unwrap();
+        fail_writes(&mut img);
+        drop(img);
+        assert!(Qcow2Image::open(&path, true).unwrap().is_dirty());
+        drop(Qcow2Image::open(&path, false).unwrap());
+        assert!(!Qcow2Image::open(&path, true).unwrap().is_dirty());
+    }
 
     #[test]
     fn read_extents_coalesce_adjacent_clusters_and_stop_at_holes() {
@@ -1394,6 +1600,7 @@ mod tests {
         assert_eq!(b, a + img.cluster_size);
         img.dec_refcount(a / img.cluster_size).unwrap();
         img.dec_refcount(c / img.cluster_size).unwrap();
+        img.flush().unwrap();
         // The lowest hole goes first, then the next.
         assert_eq!(img.alloc_cluster().unwrap(), a);
         assert_eq!(img.alloc_cluster().unwrap(), c);
@@ -1464,6 +1671,94 @@ mod tests {
             len_after <= len_freed + img_cluster_size(&path),
             "reopen did not reuse freed holes: {len_freed} -> {len_after}"
         );
+    }
+
+    /// Make every later write of `img` fail (EBADF) by swapping in a
+    /// read-only handle, as a full or failing host disk would.
+    fn fail_writes(img: &mut Qcow2Image) {
+        img.file = File::open(&img.path).expect("open read-only handle");
+    }
+
+    fn allow_writes(img: &mut Qcow2Image) {
+        img.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img.path)
+            .expect("open read-write handle");
+    }
+
+    fn read_back(path: &Path, offset: u64, len: usize) -> Vec<u8> {
+        let mut reopened = Qcow2Image::open(path, true).expect("reopen read-only");
+        let mut buf = vec![0u8; len];
+        reopened.read_at(offset, &mut buf).expect("read back");
+        buf
+    }
+
+    #[test]
+    fn failed_metadata_flush_keeps_tables_dirty_for_a_retry() {
+        let (_dir, mut img) = testsupport::blank(8 * 1024 * 1024);
+        let cluster = img.cluster_size as usize;
+        // New clusters: the data goes to the file now, the L2 entry and the
+        // refcounts wait in the caches.
+        img.write_at(0, &vec![0x6b; cluster * 2]).unwrap();
+        assert!(!img.l2_cache.dirty().is_empty());
+        assert!(!img.refblock_cache.dirty().is_empty());
+
+        fail_writes(&mut img);
+        assert!(img.flush().is_err(), "flush must fail without writes");
+        assert!(
+            !img.l2_cache.dirty().is_empty() && !img.refblock_cache.dirty().is_empty(),
+            "a failed flush marked the unwritten tables clean"
+        );
+
+        allow_writes(&mut img);
+        img.flush().expect("retried flush");
+        assert!(img.l2_cache.dirty().is_empty());
+        assert!(img.refblock_cache.dirty().is_empty());
+        // Read through a second handle while `img` is alive, so its Drop
+        // cannot write the tables for the retry.
+        assert_eq!(
+            read_back(&img.path, 0, cluster * 2),
+            vec![0x6b; cluster * 2]
+        );
+        let mut check = Qcow2Image::open(&img.path, true).unwrap();
+        assert_eq!(check.get_refcount(0).unwrap(), 1, "header cluster");
+        let (source, _) = check.read_extent(0, cluster).unwrap();
+        let ReadSource::File(host) = source else {
+            panic!("guest cluster 0 is not mapped after the retry");
+        };
+        assert_eq!(check.get_refcount(host / img.cluster_size).unwrap(), 1);
+    }
+
+    #[test]
+    fn failed_eviction_write_keeps_the_evicted_table_dirty() {
+        // Two L2 tables: with 64 KiB clusters one table maps 512 MiB.
+        let (_dir, mut img) = testsupport::blank(1024 * 1024 * 1024);
+        let cluster = img.cluster_size as usize;
+        let far = 600 * 1024 * 1024;
+        img.write_at(0, &vec![0x11; cluster]).unwrap();
+        img.write_at(far, &vec![0x22; cluster]).unwrap();
+        img.flush().unwrap();
+
+        // One L2 table fits. Map a new cluster in the first table, so it is
+        // dirty, then load the second one with writes failing: the dirty
+        // table is evicted and its write fails.
+        // Every table is clean after the flush, so a new cache loses nothing.
+        img.l2_cache = TableCache::new(1);
+        let second = 4 * cluster as u64;
+        img.write_at(second, &vec![0x33; cluster]).unwrap();
+        fail_writes(&mut img);
+        let mut buf = vec![0u8; cluster];
+        assert!(
+            img.read_at(far, &mut buf).is_err(),
+            "the evicted table's write must fail"
+        );
+
+        allow_writes(&mut img);
+        img.flush().expect("retried flush");
+        assert!(img.l2_cache.dirty().is_empty());
+        assert_eq!(read_back(&img.path, second, cluster), vec![0x33; cluster]);
+        assert_eq!(read_back(&img.path, far, cluster), vec![0x22; cluster]);
     }
 
     fn img_cluster_size(path: &Path) -> u64 {

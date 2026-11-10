@@ -61,7 +61,7 @@ fn bits_get(buf: &[u8], index: u64, width: u32) -> u64 {
 }
 
 /// Write one refcount of `width` bits into a refcount block.
-fn bits_set(buf: &mut [u8], index: u64, width: u32, value: u64) {
+pub(super) fn bits_set(buf: &mut [u8], index: u64, width: u32, value: u64) {
     match width {
         1 | 2 | 4 | 8 => {
             let bit = index * width as u64;
@@ -93,7 +93,7 @@ impl Qcow2Image {
     }
 
     fn refcount_max(&self) -> u64 {
-        (1u64 << self.refcount_bits) - 1
+        u64::MAX >> (64 - self.refcount_bits)
     }
 
     fn load_refblock(&mut self, table_index: u64) -> Result<()> {
@@ -105,9 +105,17 @@ impl Qcow2Image {
         self.read_file(host, &mut buf)?;
         // Dirty evictees must reach the disk before their clusters can be
         // handed out again.
-        for (index, block) in self.refblock_cache.put(table_index, buf, false) {
-            let host = self.refblock_host(index)?;
-            self.write_file(host, &block)?;
+        let mut evicted = self.refblock_cache.put(table_index, buf, false).into_iter();
+        while let Some((index, block)) = evicted.next() {
+            let written = self
+                .refblock_host(index)
+                .and_then(|host| self.write_file(host, &block));
+            if let Err(e) = written {
+                // Keep the failed block and the unwritten rest dirty.
+                self.refblock_cache
+                    .restore_dirty(std::iter::once((index, block)).chain(evicted));
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -158,6 +166,7 @@ impl Qcow2Image {
         }
         self.refblock_set(table_index, cluster_idx % rbe, value)?;
         if value == 0 {
+            self.retired.insert(cluster_idx);
             self.free.set.insert(cluster_idx);
         } else {
             self.free.set.remove(&cluster_idx);
@@ -387,6 +396,10 @@ impl Qcow2Image {
         let mut len = 0u64;
         let mut found = None;
         for &c in &self.free.set {
+            if self.retired.contains(&c) {
+                len = 0;
+                continue;
+            }
             if len > 0 && c == start + len {
                 len += 1;
             } else {

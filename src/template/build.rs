@@ -151,9 +151,7 @@ pub async fn build_template(
     // Working area: a throwaway lab root under the artefact cache. Removed on
     // both success and failure, so nothing leaks.
     let work = build_workdir(def);
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-    let guard = WorkdirGuard(work.clone());
+    let guard = claim_workdir(&work)?;
 
     let result = run_build(
         def,
@@ -403,9 +401,7 @@ async fn build_variants(
             "{}-{}-{}-variant-{}",
             def.arch, def.name, def.version, v.name
         ));
-        let _ = std::fs::remove_dir_all(&work);
-        std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-        let guard = WorkdirGuard(work.clone());
+        let guard = claim_workdir(&work)?;
         let built = build_variant(
             def,
             v,
@@ -749,44 +745,49 @@ fn bridge_playbook_events(
 /// prefix (the upstream/OS identity); vmlab appends a trailing build counter,
 /// `<declared>.<N>`, where N is the highest existing `<declared>.<N>` plus one,
 /// or 0 if none exist yet. Existing builds come from the template's registry
-/// tags when it has a `registry` (falling back to the local store), so the
-/// counter continues across machines. Changing the declared prefix (e.g. a new
-/// Windows build number) restarts the counter at `.0`.
+/// tags when it has a `registry`, and from the local store, so the counter
+/// continues across machines and never lands on a version that was built here
+/// and not pushed. The counter is above the highest of both. Changing the
+/// declared prefix (e.g. a new Windows build number) restarts the counter at `.0`.
 async fn next_version(
     def: &TemplateDef,
     store: &TemplateStore,
     log: &OutputSink,
 ) -> Result<String> {
-    let mut existing: Vec<String> = Vec::new();
-    let mut source = "fresh";
-
-    let mut from_registry = false;
+    let mut registry: Option<Vec<String>> = None;
     if let Some(repo) = &def.registry {
         match list_registry_versions(repo).await {
-            Ok(tags) => {
-                from_registry = true;
-                existing = tags;
-                source = "registry";
-            }
+            Ok(tags) => registry = Some(tags),
             Err(e) => log(format!(
                 "warning: could not read registry tags from {repo} ({e:#}); \
-                 falling back to the local store\n"
+                 using the local store only\n"
             )),
         }
     }
+    let local = store.versions_of(&def.arch, &def.name).ok();
 
-    // Fall back to the local store only when the registry wasn't consulted.
-    if !from_registry && let Ok(local) = store.versions_of(&def.arch, &def.name) {
-        existing = local;
-        source = "local store";
-    }
-
+    let source = match (registry.is_some(), local.is_some()) {
+        (true, true) => "registry + local store",
+        (true, false) => "registry",
+        (false, true) => "local store",
+        (false, false) => "fresh",
+    };
+    let existing = merge_known_versions(registry, local);
     let next = super::store::next_subbuild(&def.version, &existing);
     log(format!(
         "auto-version: {next} (prefix {}, {source})\n",
         def.version
     ));
     Ok(next)
+}
+
+/// The build versions known from the registry and from the local store, as one
+/// list. A source that could not be read (`None`) adds nothing. A version in
+/// both lists is listed twice, which does not change the highest counter.
+fn merge_known_versions(registry: Option<Vec<String>>, local: Option<Vec<String>>) -> Vec<String> {
+    let mut all = registry.unwrap_or_default();
+    all.extend(local.unwrap_or_default());
+    all
 }
 
 /// Fetch the concrete version tags published under `repo` (excludes moving
@@ -871,11 +872,92 @@ impl Drop for Inspection {
     }
 }
 
-struct WorkdirGuard(PathBuf);
+/// A build's working directory, held for as long as the build runs.
+///
+/// The hold is an exclusive `flock` on the directory's lock file (see
+/// [`workdir_lock_path`]). Every supervisor of an account that shares one
+/// data dir — two agents, a user and an agent, two shells with different
+/// `XDG_RUNTIME_DIR`s — sees the same `cache/builds`, and the lock is what
+/// tells a sweeping supervisor that a directory is someone's live build. The
+/// kernel drops the lock when its holder dies, however it dies, so a killed
+/// supervisor's leftovers become sweepable at once.
+///
+/// Dropping the guard removes the directory, then releases the lock.
+pub struct WorkdirGuard {
+    path: PathBuf,
+    _lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+impl WorkdirGuard {
+    /// The working directory this guard holds.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl Drop for WorkdirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // Fields drop after this body, so the directory goes while the lock
+        // is still held: nobody can claim it half-removed.
+        let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// The lock file of working directory `work`: `<work>.lock`, beside it.
+///
+/// It lives outside the directory so that removing the directory never
+/// unlinks a lock someone else holds or waits on, and lock files are never
+/// deleted for the same reason: a lock taken on an unlinked file excludes
+/// nobody who opens the path afresh. They are empty, one per template
+/// version or variant ever built, and the sweep leaves them (it only removes
+/// directories).
+fn workdir_lock_path(work: &Path) -> PathBuf {
+    let mut name = work.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Take the lock of working directory `work` without waiting. `Ok(None)` when
+/// another holder has it.
+fn try_lock_workdir(work: &Path) -> Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    use nix::fcntl::{Flock, FlockArg};
+    let path = workdir_lock_path(work);
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, errno)) => Err(anyhow::anyhow!("cannot lock {}: {errno}", path.display())),
+    }
+}
+
+/// Claim working directory `work` for a build: take its lock, clear whatever
+/// a dead build left in it, and create it empty.
+///
+/// Refuses when a live build — in this supervisor or another one on the same
+/// data dir — holds it, rather than deleting that build's disk and media.
+pub fn claim_workdir(work: &Path) -> Result<WorkdirGuard> {
+    if let Some(parent) = work.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let Some(lock) = try_lock_workdir(work)? else {
+        bail!(
+            "{} is in use by another build (this or another vmlab supervisor on the same data \
+             directory); wait for it to finish",
+            work.display()
+        );
+    };
+    let _ = std::fs::remove_dir_all(work);
+    std::fs::create_dir_all(work).with_context(|| format!("creating {}", work.display()))?;
+    Ok(WorkdirGuard {
+        path: work.to_path_buf(),
+        _lock: lock,
+    })
 }
 
 /// Where every build's working directory lives.
@@ -887,14 +969,19 @@ fn build_workdir(def: &TemplateDef) -> PathBuf {
     builds_dir().join(format!("{}-{}-{}", def.arch, def.name, def.version))
 }
 
-/// Delete every build working directory, returning how many went.
+/// Delete every build working directory no live build holds, returning how
+/// many went.
 ///
 /// [`WorkdirGuard`] clears one up when its build ends, but it is a `Drop` and
 /// a killed process runs none: a supervisor that is SIGKILLed — or that exits
 /// through `process::exit` on `shutdown` — leaves its in-flight builds' disks
-/// behind, several gigabytes each. The supervisor sweeps at startup, when by
-/// definition it owns no build, so a leftover survives at most until the next
-/// time the daemon comes up (ADR-0010).
+/// behind, several gigabytes each. The supervisor sweeps at startup, so a
+/// leftover survives at most until the next time the daemon comes up
+/// (ADR-0010).
+///
+/// A starting supervisor owns no build, but it is not the only supervisor
+/// that can use this data dir: a directory whose lock another process holds
+/// is that process's in-flight build and is left alone.
 pub fn sweep_build_workdirs() -> usize {
     sweep_workdirs_in(&builds_dir())
 }
@@ -905,7 +992,18 @@ fn sweep_workdirs_in(dir: &Path) -> usize {
     };
     entries
         .flatten()
-        .filter(|e| e.path().is_dir() && std::fs::remove_dir_all(e.path()).is_ok())
+        .filter(|e| {
+            let path = e.path();
+            if !path.is_dir() {
+                return false;
+            }
+            // A lock that cannot be taken (held, or not even openable) means
+            // the directory is not provably a leftover: keep it.
+            let Ok(Some(_held)) = try_lock_workdir(&path) else {
+                return false;
+            };
+            std::fs::remove_dir_all(&path).is_ok()
+        })
         .count()
 }
 
@@ -2237,8 +2335,8 @@ fn synth_spec_lab(
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildBoot, EffectiveHardware, SealedImage, build_lab_name, seal_meta, sweep_workdirs_in,
-        synth_lab, wcl_str,
+        BuildBoot, EffectiveHardware, SealedImage, build_lab_name, claim_workdir, seal_meta,
+        sweep_workdirs_in, synth_lab, wcl_str,
     };
     use crate::config::model::SecureBootKeys;
     use crate::qemu::resolve::KeyStore;
@@ -2312,6 +2410,91 @@ mod tests {
         assert_eq!(sweep_workdirs_in(dir.path()), 2);
         assert!(!dir.path().join("x86_64-base-1.0").exists());
         assert!(dir.path().join("stray").is_file());
+    }
+
+    /// Two supervisors of one account share a data dir (VML-90): one's
+    /// startup sweep must leave the other's in-flight build alone, and a
+    /// second build of the same workdir is refused rather than wiping it.
+    /// `flock` locks belong to open file descriptions, so two holders in one
+    /// process exclude each other exactly as two processes do.
+    #[test]
+    fn a_sweep_leaves_a_working_directory_a_live_build_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("x86_64-win95-1.0");
+        let guard = claim_workdir(&held).unwrap();
+        assert_eq!(guard.path(), held.as_path());
+        std::fs::write(held.join("media.iso"), "pretend").unwrap();
+        let left = dir.path().join("x86_64-dead-1.0");
+        std::fs::create_dir_all(&left).unwrap();
+
+        // The other supervisor starts: only the dead build's dir goes.
+        assert_eq!(sweep_workdirs_in(dir.path()), 1);
+        assert!(held.join("media.iso").is_file());
+        assert!(!left.exists());
+
+        // A second build of the same workdir is refused, and wipes nothing.
+        let err = claim_workdir(&held)
+            .err()
+            .expect("a held workdir was claimed");
+        assert!(
+            format!("{err:#}").contains("in use by another build"),
+            "{err:#}"
+        );
+        assert!(held.join("media.iso").is_file());
+
+        // The build ends: its dir goes, and the name is free to claim again.
+        drop(guard);
+        assert!(!held.exists());
+        let again = claim_workdir(&held).unwrap();
+        assert!(held.is_dir());
+        drop(again);
+        assert_eq!(sweep_workdirs_in(dir.path()), 0);
+    }
+
+    /// The next version counts the registry and the local store together. A
+    /// local build that was never pushed, above the registry's highest, must
+    /// not be reused: the counter goes above it.
+    #[test]
+    fn next_version_is_above_the_highest_of_registry_and_local_store() {
+        use super::merge_known_versions;
+        use crate::template::store::next_subbuild;
+
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // Registry higher than the local store.
+        let known = merge_known_versions(
+            Some(s(&["26100.1742.2", "26100.1742.3"])),
+            Some(s(&["26100.1742.0", "26100.1742.1"])),
+        );
+        assert_eq!(next_subbuild("26100.1742", &known), "26100.1742.4");
+
+        // Local store higher than the registry (an unpushed local build).
+        let known = merge_known_versions(
+            Some(s(&["26100.1742.0", "26100.1742.1"])),
+            Some(s(&["26100.1742.2", "26100.1742.5"])),
+        );
+        assert_eq!(next_subbuild("26100.1742", &known), "26100.1742.6");
+    }
+
+    /// When the registry cannot be read, the local store alone sets the
+    /// counter; when the store cannot be read, the registry alone does.
+    #[test]
+    fn next_version_uses_the_source_that_answered() {
+        use super::merge_known_versions;
+        use crate::template::store::next_subbuild;
+
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        let known = merge_known_versions(None, Some(s(&["3.23.4.7"])));
+        assert_eq!(next_subbuild("3.23.4", &known), "3.23.4.8");
+
+        let known = merge_known_versions(Some(s(&["3.23.4.7"])), None);
+        assert_eq!(next_subbuild("3.23.4", &known), "3.23.4.8");
+
+        assert_eq!(
+            next_subbuild("3.23.4", &merge_known_versions(None, None)),
+            "3.23.4.0"
+        );
     }
 
     fn def(source: &str) -> crate::config::model::TemplateDef {

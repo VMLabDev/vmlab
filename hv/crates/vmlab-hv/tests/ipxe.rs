@@ -11,8 +11,13 @@ fn nic_rom_decode_requires_enable_and_memory_space() {
     };
     use vmlab_hv_vmm::pci::PciRoot;
 
-    let image =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ipxe/virtio-net.rom");
+    let image = std::env::var_os("VMLAB_TARGET_ROOT")
+        .filter(|root| !root.is_empty())
+        .map(|root| std::path::PathBuf::from(root).join("ipxe/virtio-net.rom"))
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/ipxe/virtio-net.rom")
+        });
     if !image.is_file() {
         eprintln!("SKIP: run just firmware-ipxe-build for NIC ROM decode test");
         return;
