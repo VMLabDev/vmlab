@@ -31,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: path-check shell-paths release-version lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+check: path-check shell-paths release-version release-dry-run lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
 
 # Refuse tracked paths that Windows cannot check out (: * ? " < > | \, trailing dot or space)
 [group('ci')]
@@ -50,6 +50,11 @@ shell-paths:
 [group('ci')]
 release-version:
 	python3 -m unittest discover -s scripts -p 'test_release_version.py'
+
+# Offline release/installer dry-run, with an explicit signature-verifier stub
+[group('ci')]
+release-dry-run: require-uv
+	uv run --no-project --with pytest==8.4.2 python -m pytest scripts/test_release_assets.py --junitxml=target/release-dry-run.xml
 
 # Run clippy with warnings as errors
 [group('ci')]
