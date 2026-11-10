@@ -139,6 +139,9 @@ pub enum TemplateCmd {
         /// Overwrite an existing version
         #[arg(long)]
         overwrite: bool,
+        /// Accept embedded host-side scripts from this archive
+        #[arg(long)]
+        trust_scripts: bool,
     },
     /// Push a template to an OCI registry
     Push {
@@ -253,7 +256,11 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 force,
             } => clean(&sup, filter, keep, yes, force).await,
             TemplateCmd::Export { reference, out } => export(&sup, reference, out).await,
-            TemplateCmd::Import { archive, overwrite } => import(&sup, archive, overwrite).await,
+            TemplateCmd::Import {
+                archive,
+                overwrite,
+                trust_scripts,
+            } => import(&sup, archive, overwrite, trust_scripts).await,
             TemplateCmd::Push {
                 reference,
                 target,
@@ -868,12 +875,41 @@ async fn export(sup: &SupClient, reference: String, out: PathBuf) -> Result<()> 
     Ok(())
 }
 
-async fn import(sup: &SupClient, archive: PathBuf, overwrite: bool) -> Result<()> {
+async fn import(
+    sup: &SupClient,
+    archive: PathBuf,
+    overwrite: bool,
+    trust_scripts: bool,
+) -> Result<()> {
     let archive = abs_path(&archive)?;
-    let imported: InstalledVersion =
-        ask(sup, SupRequest::StoreImport { archive, overwrite }).await?;
+    #[derive(serde::Deserialize)]
+    struct Imported {
+        #[serde(flatten)]
+        version: InstalledVersion,
+        #[serde(default)]
+        script_paths: Vec<String>,
+    }
+    let imported: Imported = ask(
+        sup,
+        SupRequest::StoreImport {
+            archive,
+            overwrite,
+            trust_scripts,
+        },
+    )
+    .await?;
+    for path in imported.script_paths {
+        eprintln!("{}", script_trust_warning(&path));
+    }
+    let imported = imported.version;
     println!("imported {imported}");
     Ok(())
+}
+
+fn script_trust_warning(path: &str) -> String {
+    format!(
+        "warning: trusted host-side script {path} from archive; it runs with your user's host and lab scripting rights"
+    )
 }
 
 async fn pull(
@@ -1064,6 +1100,28 @@ fn normalize_git_url(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn import_script_consent_is_explicit_and_warns_by_path() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Args {
+            #[command(subcommand)]
+            cmd: super::TemplateCmd,
+        }
+        for trusted in [false, true] {
+            let mut args = vec!["template", "import", "archive.tar.zst"];
+            if trusted {
+                args.push("--trust-scripts");
+            }
+            let parsed = Args::try_parse_from(args).unwrap();
+            assert!(
+                matches!(parsed.cmd, super::TemplateCmd::Import { trust_scripts, .. } if trust_scripts == trusted)
+            );
+        }
+        let warning = super::script_trust_warning("template.wcl:variant/desktop/first_boot_script");
+        assert!(warning.contains("template.wcl:variant/desktop/first_boot_script"));
+        assert!(warning.contains("host and lab scripting rights"));
+    }
     use std::sync::{Arc, Mutex};
 
     use serde_json::json;

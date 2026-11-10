@@ -636,6 +636,13 @@ impl Registry {
         let config = TemplateConfig::from_json(&config_bytes)?;
         let vars = config.vars()?;
         let meta = config.into_meta(Some(self.reference.canonical()))?;
+        crate::template::trust::names(&meta)?;
+        let trusted = crate::template::trust::repository_trusted(
+            &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
+            &self.reference.host,
+            &self.reference.repository,
+        );
+        crate::template::trust::scripts(&meta, trusted)?;
 
         // A requested arch must match what we resolved (defence in depth
         // for the plain-manifest path which has no index keying).
@@ -722,6 +729,9 @@ impl Registry {
             .to_string();
         let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
         let (listed, default) = manifest.variants()?;
+        for entry in &listed {
+            crate::template::trust::component(&entry.name)?;
+        }
         let chosen = want.choose(&listed, default.as_deref(), &reference)?;
 
         // The same version already in the store: the same artefact is used
@@ -785,6 +795,15 @@ impl Registry {
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
             let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
+            crate::template::trust::component(&variant.name)?;
+            let mut checked = meta.clone();
+            checked.variants = vec![variant.clone()];
+            let trusted = crate::template::trust::repository_trusted(
+                &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
+                &self.reference.host,
+                &self.reference.repository,
+            );
+            crate::template::trust::scripts(&checked, trusted)?;
             ensure!(
                 variant.name == entry.name && digest_eq(&variant.sha256, &layout.overlay_digest),
                 "variant `{}`'s config blob disagrees with its manifest",
@@ -839,14 +858,16 @@ impl Registry {
         let store = dest_store.clone();
         let meta = tokio::task::spawn_blocking(move || -> Result<TemplateMeta> {
             let mut variants = Vec::new();
-            for (mut variant, paths, digest) in overlays {
+            for (variant, paths, digest) in overlays {
                 let disk = staging.join(crate::template::meta::variant_disk_rel(&variant.name));
                 chunking::assemble(&paths, &disk)?;
                 chunking::verify_whole(&disk, &digest)
                     .with_context(|| format!("variant `{}`", variant.name))?;
-                if crate::template::store::ensure_variant_backing(&disk)? {
-                    variant.sha256 = crate::template::store::sha256_file(&disk)?;
-                }
+                ensure!(
+                    crate::template::store::qcow2_backing_file(&disk)?.as_deref()
+                        == Some(crate::template::store::VARIANT_BACKING),
+                    "untrusted variant backing file"
+                );
                 variants.push(variant);
             }
             match local {
@@ -2532,7 +2553,7 @@ mod tests {
 
     /// A template directory laid out as the store lays a version out: a real
     /// qcow2 base, and the overlays `standard` (default) and `extra`
-    /// (`memory` and `first_boot_script` overridden, described), each
+    /// (`memory` overridden, described), each
     /// backed on `../../disk.qcow2` and each holding data of its own.
     fn variant_template(dir: &Path) -> TemplateMeta {
         std::fs::create_dir_all(dir).unwrap();
@@ -2549,7 +2570,6 @@ mod tests {
         let base_sha = sha256_file(&dir.join(DISK_FILE)).unwrap();
         let mut m = meta("x86_64");
         m.sha256 = Some(base_sha.clone());
-        m.first_boot_script = Some("base script".into());
         for (name, pattern) in [("standard", "0x11"), ("extra", "0x22")] {
             let vdir = dir.join("variants").join(name);
             std::fs::create_dir_all(&vdir).unwrap();
@@ -2577,7 +2597,6 @@ mod tests {
             let mut v = variant(name, name == "standard", sha, &base_sha);
             if name == "extra" {
                 v.memory = Some(8 << 30);
-                v.first_boot_script = Some("extra script".into());
                 v.description = Some("more memory".into());
             }
             m.variants.push(v);
@@ -2815,6 +2834,70 @@ mod tests {
         let root = work.join(name);
         std::fs::create_dir_all(&root).unwrap();
         TemplateStore::new(root)
+    }
+
+    #[tokio::test]
+    async fn pull_refuses_untrusted_names_scripts_and_base_backing() {
+        for case in 0..5 {
+            let fake = std::sync::Arc::new(FakeRegistry::default());
+            let work = tempfile::tempdir().unwrap();
+            let tdir = work.path().join("tmpl");
+            let mut m = meta("x86_64");
+            let mut disk = b"raw disk".to_vec();
+            let expected = match case {
+                0 => {
+                    m.name = "../escape".into();
+                    "path component"
+                }
+                1 => {
+                    m.version = "../escape".into();
+                    "path component"
+                }
+                2 => {
+                    m.first_boot_script = Some("fn main(lab) {}".into());
+                    "first_boot_script refused"
+                }
+                3 => {
+                    m.name = "a".repeat(129);
+                    "path component"
+                }
+                _ => {
+                    disk = vec![0; 120];
+                    disk[..4].copy_from_slice(b"QFI\xfb");
+                    disk[4..8].copy_from_slice(&3u32.to_be_bytes());
+                    disk[8..16].copy_from_slice(&104u64.to_be_bytes());
+                    disk[16..20].copy_from_slice(&4u32.to_be_bytes());
+                    "base disk must not have a backing file"
+                }
+            };
+            m.sha256 = Some(hex::encode(sha2::Sha256::digest(&disk)));
+            make_template(&tdir, &m, &disk);
+            registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+                .push(
+                    &tdir,
+                    SMALL_CHUNKS,
+                    "x86_64",
+                    &work.path().join("push"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let store = store_in(work.path(), "victim");
+            let err = pull_want(
+                &fake,
+                "ghcr.io/owner/alpine:3.20",
+                &store,
+                &VariantWant::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains(expected),
+                "case {case}: {err:#}"
+            );
+            assert!(store.list().unwrap().is_empty());
+        }
     }
 
     async fn pull_want(

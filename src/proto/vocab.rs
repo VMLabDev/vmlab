@@ -1207,6 +1207,7 @@ vocabulary! {
         StoreImport = "store.import" {
             archive: std::path::PathBuf,
             #[serde(default)] overwrite: bool,
+            #[serde(default)] trust_scripts: bool,
         },
         /// Download a published template into the store.
         #[one_way("cli", "Store management, for the reason on `store.list`.")]

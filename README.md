@@ -279,3 +279,36 @@ absent at daemon start.
 [wscript]: https://github.com/Configweave/wscript
 [config-weave]: https://github.com/Configweave/config-weave
 [just]: https://github.com/casey/just
+# Template trust
+
+Template disks and metadata are untrusted input. Pull and import validate path
+components, reject linked or non-regular disks, and refuse base disks with a
+qcow2 backing file. Import requires a disk digest and accepts only template
+metadata, disks, variant disks and the optional UEFI VARS file in the archive.
+Digests detect corruption, not publisher identity.
+
+Embedded `first_boot_script` is host-side code, not a guest sandbox. By default
+pull trusts only the project's official namespace,
+`ghcr.io/vmlabdev/vmlab-templates/`, including variant scripts. Other publishers
+are refused. The host configuration replaces this list, not extends it:
+
+```wcl
+host {
+  trusted_template_repositories = ["ghcr.io/my-org/my-template"]
+}
+```
+
+This grants that repository's scripts the user's lab and host scripting rights.
+Entries without a trailing slash match an exact repository, without a tag.
+Entries ending in `/` trust descendants on whole path segments only, so the
+default does not trust `ghcr.io/vmlabdev/vmlab-templates-evil/x`. An explicit
+`trusted_template_repositories = []` trusts nothing, including official images.
+
+Archive import refuses embedded scripts by default because an archive cannot
+prove its registry origin. If you trust the archive's publisher, use
+`vmlab template import --trust-scripts archive.tar.zst`. This accepts the scripts
+and prints a warning naming each script's metadata path. It grants host-side
+code execution, not just guest access. Other disk, path and digest checks remain
+enforced. Locally built
+templates remain trusted user code. Only use trusted local template builds and
+protect the template store from other users. This is not a VM isolation boundary.
