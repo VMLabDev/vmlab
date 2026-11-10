@@ -27,9 +27,20 @@ just ci::check
   (one `terrarium card merge A B C ...` job); its two slots serve merges only.
 - Pass: every recipe of `ci::check` exits 0. Push the test results with
   `terrarium test push --card <id>`.
+  The main crate and hv workspace write raw libtest JSON to
+  `$VMLAB_TARGET_ROOT/test-results/main.json` and `hv.json` (under
+  `target/test-results` if unset). Each test step prints its path even on
+  failure, and a successful check prints both paths at the end. Push both:
+  `terrarium test push <path> --format libtest-json --name <main-or-hv> --card <id>`.
+  Push failed runs before rerunning too. Copy evidence from the target to
+  your workspace when it is outside the shared mount. These two files cover
+  the main and hv test steps, not the separate guest/conformance checks.
 - A known flaky test that fails once is rerun alone before the run counts as
   failed; name it on the card. Red again: fix it, or move the card to
   `blocked` with the output tail.
+  The quarantine register and reporting rules are in
+  `docs/agents/flaky-tests.md`. Quarantined failures stay in the evidence.
+  A rerun without a named flaky test needs a reason comment first.
 - Every shell script you write or run: `set -eu`, and refuse an empty or `/`
   path before `cp`, `rsync`, `mv` or `rm` (`just ci::shell-paths` checks the
   tracked ones).
