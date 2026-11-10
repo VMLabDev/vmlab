@@ -241,7 +241,7 @@ fn change_or_restore(
         if let Err(rollback) = apply(old) {
             // This process owns one VM. Returning would let the caller
             // resume vCPUs with an unknown RAM/ROM/PAM view.
-            tracing::error!(%error, %rollback, "A20 rollback failed, stopping VM");
+            log::error!("A20 rollback failed, stopping VM: {error}; rollback: {rollback}");
             std::process::abort();
         }
         return Err(error);
