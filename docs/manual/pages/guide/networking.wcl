@@ -175,8 +175,9 @@ page guide_networking {
   DOC
 
   p <<DOC
-    A forward listens on every host interface unless it declares `bind`, an
-    IPv4 address the host owns. `bind = "127.0.0.1"` makes a forward
+    Behaviour change: a forward now listens on loopback by default, rather
+    than every interface. Declare `bind = "0.0.0.0"` or a specific host
+    IPv4 address to expose it to the LAN. `bind = "127.0.0.1"` keeps a forward
     reachable from the host itself and nowhere else, which suits a guest
     service that trusts its caller:
   DOC
@@ -333,6 +334,15 @@ SRC
     their host configuration and listening on `trunk_port`. VMs stay local;
     only the wire spans hosts. `connect` on a segment that is not global is a
     validation error.
+  DOC
+
+  p <<DOC
+    Trunk protocol v2 uses fresh random challenges and mutual HMAC-SHA256
+    proofs of the PSK, with a five-second handshake timeout. It never sends
+    the key. Both hosts must upgrade together: v1 peers are incompatible.
+    Ethernet frames remain unencrypted and have no cryptographic integrity
+    protection after authentication. Use a trusted network or a VPN. Use a
+    strong random PSK, since a captured handshake permits offline guesses.
   DOC
 
   p <<DOC

@@ -87,12 +87,17 @@ impl SmbCredentials {
         }
         let c = Self::generate(lab, "");
         let _ = std::fs::create_dir_all(smb_dir);
-        if std::fs::write(&path, format!("{}:{}", c.username, c.password)).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        // Never truncate an existing file (or follow a pre-existing symlink).
+        if let Ok(mut file) = options.open(&path) {
+            let _ = write!(file, "{}:{}", c.username, c.password);
         }
         c
     }
@@ -432,5 +437,33 @@ mod tests {
     fn check_nt1_returns_bool() {
         // Must not panic regardless of whether smbd exists.
         let _ = check_nt1_supported();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_credentials_are_private_and_stable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = SmbCredentials::load_or_create("lab", dir.path());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("creds"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(SmbCredentials::load_or_create("lab", dir.path()), first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_creation_does_not_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "do not overwrite").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("creds")).unwrap();
+        SmbCredentials::load_or_create("lab", dir.path());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "do not overwrite");
     }
 }

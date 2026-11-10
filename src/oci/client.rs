@@ -1227,6 +1227,27 @@ pub struct HttpTransport {
 }
 
 const MAX_RETRIES: u32 = 3;
+const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
+const MAX_BLOB_BODY: usize = 1024 * 1024 * 1024;
+const MAX_STREAMED_BLOB: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_LIST_PAGES: usize = 100;
+const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
+
+/// Check the stream as well as Content-Length: a registry can omit or lie
+/// about its length. Never collect an unbounded response in memory.
+async fn bounded_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        bail!("registry response exceeds {limit} bytes");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("reading registry response")? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            bail!("registry response exceeds {limit} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 const ACCEPT_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json, \
      application/vnd.oci.image.index.v1+json, \
      application/vnd.docker.distribution.manifest.v2+json, \
@@ -1242,7 +1263,8 @@ struct TokenResponse {
 
 impl HttpTransport {
     pub fn new(host: String, credential: Credential) -> Result<Self> {
-        let scheme = if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+        let parsed = reqwest::Url::parse(&format!("https://{host}"))?;
+        let scheme = if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) {
             "http"
         } else {
             "https"
@@ -1250,6 +1272,7 @@ impl HttpTransport {
         let base = format!("{scheme}://{host}");
         let client = reqwest::Client::builder()
             .user_agent("vmlab-oci/1")
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("cannot build HTTP client")?;
         Ok(Self {
@@ -1263,6 +1286,118 @@ impl HttpTransport {
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    fn credential_url(&self, url: &reqwest::Url) -> bool {
+        let Ok(registry) = reqwest::Url::parse(&self.base) else {
+            return false;
+        };
+        url.scheme() == "https"
+            && url.host_str() == registry.host_str()
+            && url.port_or_known_default() == registry.port_or_known_default()
+            && url.username().is_empty()
+            && url.password().is_none()
+    }
+
+    fn challenge_source(&self, url: &reqwest::Url, redirected: bool) -> bool {
+        !redirected && self.credential_url(url)
+    }
+
+    fn apply_auth_policy(&self, req: &mut reqwest::Request, token_realm: bool, redirected: bool) {
+        let url = req.url();
+        let allowed = !redirected
+            && (self.credential_url(url)
+                || (token_realm
+                    && url.scheme() == "https"
+                    && url.username().is_empty()
+                    && url.password().is_none()));
+        if !allowed {
+            req.headers_mut().remove(reqwest::header::AUTHORIZATION);
+        }
+    }
+
+    /// Login also permits a separate HTTPS token realm named directly by
+    /// the configured HTTPS registry, never by a redirected response.
+    pub(super) async fn validate_login(&self) -> Result<()> {
+        let url = reqwest::Url::parse(&self.url("/v2/"))?;
+        anyhow::ensure!(self.credential_url(&url), "registry login requires HTTPS");
+        let basic = self
+            .credential
+            .basic_header()
+            .ok_or_else(|| anyhow!("missing login credential"))?;
+        let (resp, redirected) = self
+            .send_request(
+                self.client
+                    .get(url)
+                    .header(reqwest::header::AUTHORIZATION, basic)
+                    .build()?,
+                false,
+            )
+            .await?;
+        anyhow::ensure!(
+            self.challenge_source(resp.url(), redirected),
+            "login redirected outside the registry origin"
+        );
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let challenge = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(auth::parse_bearer_challenge)
+                .ok_or_else(|| anyhow!("login failed: registry rejected the credential"))?;
+            let realm = reqwest::Url::parse(&challenge.realm)?;
+            anyhow::ensure!(
+                realm.scheme() == "https"
+                    && realm.username().is_empty()
+                    && realm.password().is_none(),
+                "login token realm must use HTTPS without URL credentials"
+            );
+            self.fetch_token(&challenge, true).await?;
+        } else {
+            anyhow::ensure!(
+                resp.status().is_success(),
+                "login failed: registry returned {}",
+                resp.status()
+            );
+        }
+        Ok(())
+    }
+
+    /// Follow download redirects explicitly, rechecking the destination on
+    /// every hop. `token_realm` is only for the first request to a realm
+    /// named in a direct 401 from the configured HTTPS registry. No
+    /// credentials survive a redirect, including a same-origin redirect.
+    async fn send_request(
+        &self,
+        mut req: reqwest::Request,
+        token_realm: bool,
+    ) -> Result<(reqwest::Response, bool)> {
+        for hop in 0..10 {
+            self.apply_auth_policy(&mut req, token_realm, hop != 0);
+            let saved = req
+                .try_clone()
+                .ok_or_else(|| anyhow!("request cannot be replayed"))?;
+            let resp = self.client.execute(req).await?;
+            if !resp.status().is_redirection() {
+                return Ok((resp, hop != 0));
+            }
+            if saved.method() != reqwest::Method::GET && saved.method() != reqwest::Method::HEAD {
+                bail!("registry redirected a non-download request");
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| anyhow!("redirect has no Location"))?
+                .to_str()?;
+            let url = resp.url().join(location)?;
+            anyhow::ensure!(
+                matches!(url.scheme(), "http" | "https"),
+                "invalid redirect scheme"
+            );
+            req = saved;
+            *req.url_mut() = url;
+        }
+        bail!("too many registry redirects")
     }
 
     /// Send a request builder factory, performing the 401 Bearer token
@@ -1282,9 +1417,12 @@ impl HttpTransport {
             } else if let Some(basic) = self.credential.basic_header() {
                 req = req.header(reqwest::header::AUTHORIZATION, basic);
             }
-            let resp = match req.send().await {
+            let (resp, redirected) = match self.send_request(req.build()?, false).await {
                 Ok(r) => r,
-                Err(e) if attempt < MAX_RETRIES && is_transient(&e) => {
+                Err(e)
+                    if attempt < MAX_RETRIES
+                        && e.downcast_ref::<reqwest::Error>().is_some_and(is_transient) =>
+                {
                     backoff(attempt).await;
                     continue;
                 }
@@ -1298,7 +1436,8 @@ impl HttpTransport {
                     .and_then(|v| v.to_str().ok())
                     .and_then(auth::parse_bearer_challenge)
             {
-                let token = self.fetch_token(&challenge).await?;
+                let trusted_source = self.challenge_source(resp.url(), redirected);
+                let token = self.fetch_token(&challenge, trusted_source).await?;
                 self.tokens.lock().await.insert(scope.to_string(), token);
                 // Retry now that we have a token.
                 if attempt < MAX_RETRIES {
@@ -1314,9 +1453,11 @@ impl HttpTransport {
         }
     }
 
-    /// Exchange a Bearer challenge for a token, GETting the realm with basic
-    /// auth when a credential is available (anonymous otherwise).
-    async fn fetch_token(&self, challenge: &BearerChallenge) -> Result<String> {
+    fn token_request(
+        &self,
+        challenge: &BearerChallenge,
+        trusted_source: bool,
+    ) -> Result<reqwest::Request> {
         let mut req = self.client.get(&challenge.realm);
         let mut query = Vec::new();
         if let Some(service) = &challenge.service {
@@ -1328,10 +1469,28 @@ impl HttpTransport {
         if !query.is_empty() {
             req = req.query(&query);
         }
-        if let Some(basic) = self.credential.basic_header() {
+        if trusted_source && let Some(basic) = self.credential.basic_header() {
             req = req.header(reqwest::header::AUTHORIZATION, basic);
         }
-        let resp = req.send().await.context("token request failed")?;
+        let mut req = req.build()?;
+        self.apply_auth_policy(&mut req, trusted_source, false);
+        Ok(req)
+    }
+
+    /// Only a direct challenge from the HTTPS registry delegates Basic
+    /// credentials to a separate HTTPS realm. Redirects cannot delegate.
+    async fn fetch_token(
+        &self,
+        challenge: &BearerChallenge,
+        trusted_source: bool,
+    ) -> Result<String> {
+        let (resp, _) = self
+            .send_request(
+                self.token_request(challenge, trusted_source)?,
+                trusted_source,
+            )
+            .await
+            .context("token request failed")?;
         if !resp.status().is_success() {
             bail!(
                 "token endpoint {} returned {}",
@@ -1339,7 +1498,8 @@ impl HttpTransport {
                 resp.status()
             );
         }
-        let body: TokenResponse = resp.json().await.context("malformed token response")?;
+        let body: TokenResponse = serde_json::from_slice(&bounded_body(resp, MAX_JSON_BODY).await?)
+            .context("malformed token response")?;
         body.token
             .or(body.access_token)
             .ok_or_else(|| anyhow!("token response had no token"))
@@ -1371,7 +1531,7 @@ impl Transport for HttpTransport {
         if !resp.status().is_success() {
             bail!("GET blob {digest} returned {}", resp.status());
         }
-        Ok(resp.bytes().await.context("reading blob body")?.to_vec())
+        bounded_body(resp, MAX_BLOB_BODY).await
     }
 
     async fn get_blob_to_file(
@@ -1400,6 +1560,9 @@ impl Transport for HttpTransport {
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("reading blob {digest} stream"))?;
+            if chunk.len() as u64 > MAX_STREAMED_BLOB.saturating_sub(done) {
+                bail!("registry blob exceeds {MAX_STREAMED_BLOB} bytes");
+            }
             hasher.update(&chunk);
             file.write_all(&chunk)
                 .await
@@ -1483,11 +1646,7 @@ impl Transport for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .unwrap_or(media_types::OCI_MANIFEST)
             .to_string();
-        let body = resp
-            .bytes()
-            .await
-            .context("reading manifest body")?
-            .to_vec();
+        let body = bounded_body(resp, MAX_JSON_BODY).await?;
         Ok(Some(Fetched { media_type, body }))
     }
 
@@ -1529,7 +1688,11 @@ impl Transport for HttpTransport {
         let scope = self.scope(repository, false);
         let mut tags = Vec::new();
         let mut next = Some(self.url(&format!("/v2/{repository}/tags/list?n=1000")));
+        let mut pages = 0;
+        let mut bytes = 0;
         while let Some(url) = next.take() {
+            pages += 1;
+            anyhow::ensure!(pages <= MAX_LIST_PAGES, "too many registry list pages");
             let resp = self
                 .send_with_auth(&scope, || self.client.get(&url))
                 .await?;
@@ -1545,7 +1708,12 @@ impl Transport for HttpTransport {
                 .get(reqwest::header::LINK)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let body = resp.bytes().await.context("reading tags/list body")?;
+            let body = bounded_body(resp, MAX_JSON_BODY).await?;
+            bytes += body.len();
+            anyhow::ensure!(
+                bytes <= MAX_LIST_BYTES,
+                "registry list exceeds total body limit"
+            );
             let parsed: TagList =
                 serde_json::from_slice(&body).context("parsing tags/list response")?;
             if let Some(mut t) = parsed.tags {
@@ -1572,7 +1740,11 @@ impl Transport for HttpTransport {
         let scope = "registry:catalog:*";
         let mut repos = Vec::new();
         let mut next = Some(self.url("/v2/_catalog?n=1000"));
+        let mut pages = 0;
+        let mut bytes = 0;
         while let Some(url) = next.take() {
+            pages += 1;
+            anyhow::ensure!(pages <= MAX_LIST_PAGES, "too many registry list pages");
             let resp = self.send_with_auth(scope, || self.client.get(&url)).await?;
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 bail!(
@@ -1588,7 +1760,12 @@ impl Transport for HttpTransport {
                 .get(reqwest::header::LINK)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let body = resp.bytes().await.context("reading _catalog body")?;
+            let body = bounded_body(resp, MAX_JSON_BODY).await?;
+            bytes += body.len();
+            anyhow::ensure!(
+                bytes <= MAX_LIST_BYTES,
+                "registry list exceeds total body limit"
+            );
             let parsed: Catalog =
                 serde_json::from_slice(&body).context("parsing _catalog response")?;
             if let Some(mut r) = parsed.repositories {
@@ -1671,6 +1848,233 @@ mod tests {
     use crate::template::META_FILE;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    async fn http_once(reply: String) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            String::from_utf8(head).unwrap()
+        });
+        (url, task)
+    }
+
+    fn private_transport(host: &str) -> HttpTransport {
+        HttpTransport::new(
+            host.into(),
+            Credential::Basic {
+                username: "test".into(),
+                password: "not-a-real-secret".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn credentials_require_https_and_exact_registry_origin() {
+        let transport = private_transport("registry.example");
+        for url in [
+            "http://registry.example/token",
+            "https://evil.example/token",
+            "https://registry.example.evil/token",
+            "https://registry.example:444/token",
+            "https://user@registry.example/token",
+        ] {
+            assert!(!transport.credential_url(&url.parse().unwrap()), "{url}");
+        }
+        assert!(transport.credential_url(&"https://registry.example/token".parse().unwrap()));
+    }
+
+    #[test]
+    fn docker_hub_https_challenge_delegates_credentials_only_to_its_realm() {
+        let transport = private_transport("registry-1.docker.io");
+        let source = "https://registry-1.docker.io/v2/library/alpine/manifests/latest"
+            .parse()
+            .unwrap();
+        let challenge = BearerChallenge {
+            realm: "https://auth.docker.io/token".into(),
+            service: Some("registry.docker.io".into()),
+            scope: Some("repository:library/alpine:pull".into()),
+        };
+        let trusted = transport.challenge_source(&source, false);
+        assert!(trusted);
+        let request = transport.token_request(&challenge, trusted).unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            transport.credential.basic_header().unwrap().as_str()
+        );
+        assert_eq!(request.url().host_str(), Some("auth.docker.io"));
+        assert!(request.url().query().unwrap().contains("scope=repository"));
+
+        // Link and upload Location requests do not get realm delegation.
+        let mut ordinary = transport
+            .client
+            .get(&challenge.realm)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                transport.credential.basic_header().unwrap(),
+            )
+            .build()
+            .unwrap();
+        transport.apply_auth_policy(&mut ordinary, false, false);
+        assert!(
+            !ordinary
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+    }
+
+    #[test]
+    fn insecure_foreign_or_redirected_challenges_cannot_delegate_credentials() {
+        let transport = private_transport("registry-1.docker.io");
+        let challenge = BearerChallenge {
+            realm: "https://auth.docker.io/token".into(),
+            service: None,
+            scope: None,
+        };
+        for (source, redirected) in [
+            ("https://registry-1.docker.io/v2/", true),
+            ("https://foreign.example/v2/", false),
+            ("http://registry-1.docker.io/v2/", false),
+        ] {
+            let trusted = transport.challenge_source(&source.parse().unwrap(), redirected);
+            assert!(!trusted);
+            let request = transport.token_request(&challenge, trusted).unwrap();
+            assert!(
+                !request
+                    .headers()
+                    .contains_key(reqwest::header::AUTHORIZATION)
+            );
+        }
+        let insecure = BearerChallenge {
+            realm: "http://auth.docker.io/token".into(),
+            service: None,
+            scope: None,
+        };
+        assert!(
+            !transport
+                .token_request(&insecure, true)
+                .unwrap()
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+
+        for target in [
+            "https://auth.docker.io/redirected",
+            "https://other.example/token",
+            "http://auth.docker.io/token",
+        ] {
+            let mut request = transport.token_request(&challenge, true).unwrap();
+            *request.url_mut() = target.parse().unwrap();
+            transport.apply_auth_policy(&mut request, true, true);
+            assert!(
+                !request
+                    .headers()
+                    .contains_key(reqwest::header::AUTHORIZATION)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn login_refuses_plain_http_before_sending_a_credential() {
+        let transport = private_transport("127.0.0.1:1");
+        assert!(
+            transport
+                .validate_login()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("requires HTTPS")
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_are_stripped_on_http_and_redirects() {
+        let (destination, captured) =
+            http_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".into()).await;
+        let (source, first) = http_once(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {destination}/blob\r\nContent-Length: 0\r\n\r\n"
+        ))
+        .await;
+        let transport = private_transport("registry.example");
+        let req = transport
+            .client
+            .get(source)
+            .bearer_auth("test-token")
+            .build()
+            .unwrap();
+        assert_eq!(
+            bounded_body(transport.send_request(req, false).await.unwrap().0, 2)
+                .await
+                .unwrap(),
+            b"ok"
+        );
+        assert!(
+            !first
+                .await
+                .unwrap()
+                .to_lowercase()
+                .contains("authorization:")
+        );
+        assert!(
+            !captured
+                .await
+                .unwrap()
+                .to_lowercase()
+                .contains("authorization:")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_realm_does_not_receive_credentials_over_http() {
+        let (realm, captured) =
+            http_once("HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n{\"token\":\"ok\"}".into())
+                .await;
+        let transport = private_transport("registry.example");
+        assert_eq!(
+            transport
+                .fetch_token(
+                    &BearerChallenge {
+                        realm,
+                        service: None,
+                        scope: None
+                    },
+                    true
+                )
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            !captured
+                .await
+                .unwrap()
+                .to_lowercase()
+                .contains("authorization:")
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_body_caps_cover_declared_and_chunked_lengths() {
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n1234",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n12\r\n2\r\n34\r\n0\r\n\r\n",
+        ] {
+            let (url, task) = http_once(response.into()).await;
+            let resp = reqwest::get(url).await.unwrap();
+            assert!(bounded_body(resp, 3).await.is_err());
+            task.await.unwrap();
+        }
+    }
 
     /// An in-memory fake registry: blobs keyed by digest, manifests keyed
     /// by reference (tag or digest), all per-repository.
