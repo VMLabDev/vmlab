@@ -173,7 +173,9 @@ cleanup_release() {
   [ -n "$verify_dir" ] && [ "$verify_dir" != / ] || return 1
   rm -rf "$verify_dir"
 }
-trap cleanup_release EXIT INT TERM
+trap cleanup_release EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 download_file "$BASE_URL/$tag/SHA256SUMS" "$verify_dir/SHA256SUMS" || err "release has no checksum manifest"
 if [ "$INSECURE_SKIP_SIGNATURE" -eq 0 ]; then
   download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" || err "release has no signature bundle"
@@ -312,6 +314,15 @@ a lab container and a template build both do. Build them from source instead:
 }
 
 install_guest() {
+  [ -n "$GUEST_DIR" ] && [ "$GUEST_DIR" != / ] || err "unsafe guest directory"
+  # Never delete an arbitrary directory supplied through --guest-dir. Older
+  # unmarked installs must be moved aside explicitly by their owner first.
+  if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
+    if [ -L "$GUEST_DIR" ] || [ ! -f "$GUEST_DIR/.vmlab-guest" ]; then
+      guest_fallback "refusing to replace unmarked guest directory $GUEST_DIR; move it aside and retry."
+      return 0
+    fi
+  fi
   gname="vmlab-guest-${ver}.tar.gz"
   gurl="$BASE_URL/$tag/$gname"
   printf '\nInstalling guest assets to %s\n' "$GUEST_DIR"
@@ -328,7 +339,7 @@ install_guest() {
     rm -rf "$gtmp"
     cleanup_release
   }
-  trap cleanup_guest EXIT INT TERM
+  trap cleanup_guest EXIT
 
   if ! download_file "$gurl" "$gtmp/$gname"; then
     guest_fallback "could not download $gurl."
@@ -342,6 +353,7 @@ install_guest() {
     guest_fallback "$gname did not unpack into a guest directory."
     return 0
   fi
+  touch "$gtmp/new/.vmlab-guest"
 
   # Swap: the old directory moves aside whole (nothing from an older version
   # survives in the new one), the new one renames into its place, and the old
@@ -355,7 +367,7 @@ install_guest() {
     return 0
   fi
   rm -rf "$gtmp"
-  trap cleanup_release EXIT INT TERM
+  trap cleanup_release EXIT
 
   printf 'Installed guest assets: %s\n' "$(ls "$GUEST_DIR" | tr '\n' ' ')"
 
