@@ -68,7 +68,7 @@ release-version:
 # Offline release/installer dry-run, with an explicit signature-verifier stub
 [group('ci')]
 release-dry-run: require-uv
-	uv run --no-project --with pytest==8.4.2 python -m pytest scripts/test_release_assets.py --junitxml=target/release-dry-run.xml
+	uv run --no-project --with pytest==8.4.2 --with PyYAML==6.0.3 python -m pytest scripts/test_release_assets.py scripts/test_release_workflow.py --junitxml=target/release-dry-run.xml
 
 # Run clippy with warnings as errors
 [group('ci')]
