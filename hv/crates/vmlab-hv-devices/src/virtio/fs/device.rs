@@ -435,7 +435,7 @@ mod tests {
         /// The same fixture over a directory the caller keeps alive.
         fn over(dir: tempfile::TempDir, read_only: bool) -> Self {
             std::fs::write(dir.path().join("hello.txt"), b"hello fuse\n").unwrap();
-            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
             let interrupt = Arc::new(RecInterrupt::default());
             let mut fs = InProcessFs::new(
                 "fs@test",
@@ -586,6 +586,28 @@ mod tests {
     /// SAFETY: the struct is four fixed-width little-endian fields with no
     /// padding, so any byte pattern is a valid value.
     unsafe impl ByteValued for Desc {}
+
+    #[test]
+    fn hostile_oversized_chains_are_discarded() {
+        for writable in [false, true] {
+            let mut f = Fixture::new(false);
+            f.request(Opcode::Lookup, 1, b"hello.txt\0");
+            let oversized = (1 << 20) + 4097;
+            f.chain(if writable { 50 } else { oversized }, if writable { oversized } else { 256 });
+            f.submit();
+            assert_eq!(f.used_slot(0).2, 0);
+        }
+    }
+
+    #[test]
+    fn hostile_ioctl_without_body_answers_enotty() {
+        let mut f = Fixture::new(false);
+        f.request(Opcode::Ioctl, 1, &[]);
+        f.chain(std::mem::size_of::<InHeader>() as u32, 256);
+        f.submit();
+        assert_eq!(f.used_slot(0).2, std::mem::size_of::<OutHeader>() as u32);
+        assert_eq!(f.out_header().error, -libc::ENOTTY);
+    }
 
     #[test]
     fn init_negotiates_capabilities() {

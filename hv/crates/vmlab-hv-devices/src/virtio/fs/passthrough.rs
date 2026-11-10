@@ -1509,6 +1509,95 @@ mod tests {
     }
 
     #[test]
+    fn hostile_create_symlink_cannot_truncate_outside_share() {
+        let (dir, fs) = scratch();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"private").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let result = fs.create(&ctx(), ROOT_ID, c"escape", CreateIn {
+            flags: (libc::O_RDWR | libc::O_TRUNC) as u32,
+            mode: 0o600,
+            ..Default::default()
+        });
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"private");
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn hostile_readonly_open_refuses_mutating_flags() {
+        let (dir, _) = scratch();
+        let fs = PassthroughFs::new(dir.path().to_path_buf(), true).unwrap();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        for flags in [libc::O_TRUNC, libc::O_APPEND, libc::O_CREAT] {
+            let result = fs.open(&ctx(), ino, flags as u32, 0);
+            assert_eq!(std::fs::read(dir.path().join("hello.txt")).unwrap(), b"hello share\n");
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EROFS));
+        }
+    }
+
+    #[test]
+    fn hostile_setattr_swapped_name_changes_only_original_inode() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"hello.txt").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"private").unwrap();
+        std::fs::rename(dir.path().join("hello.txt"), dir.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("hello.txt")).unwrap();
+        let mut attr = entry.attr;
+        attr.st_size = 2;
+        attr.st_mode = 0o640;
+        fs.setattr(&ctx(), entry.inode, attr, None, SetattrValid::SIZE | SetattrValid::MODE).unwrap();
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"private");
+        assert_eq!(std::fs::read(dir.path().join("original")).unwrap(), b"he");
+    }
+
+    #[test]
+    fn hostile_mknod_refuses_fifo_and_devices() {
+        let (_dir, fs) = scratch();
+        for mode in [libc::S_IFIFO, libc::S_IFCHR, libc::S_IFBLK] {
+            assert_eq!(fs.mknod(&ctx(), ROOT_ID, c"special", mode | 0o600, 0, 0)
+                .unwrap_err().raw_os_error(), Some(libc::EPERM));
+        }
+    }
+
+    #[test]
+    fn hostile_fifo_open_is_refused_even_with_nonblock() {
+        let (dir, fs) = scratch();
+        let root = open_path(dir.path(), libc::O_PATH).unwrap();
+        mknodat(&root, b"fifo", libc::S_IFIFO | 0o600, 0).unwrap();
+        let ino = lookup(&fs, b"fifo").unwrap().inode;
+        // NONBLOCK keeps the pre-fix regression safe to run.
+        assert_eq!(fs.open(&ctx(), ino, libc::O_NONBLOCK as u32, 0)
+            .unwrap_err().raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn hostile_inode_lookup_flood_is_bounded() {
+        let (dir, fs) = scratch();
+        for i in 0..32 {
+            let n = format!("inode-{i}");
+            std::fs::write(dir.path().join(&n), b"").unwrap();
+            let result = lookup(&fs, n.as_bytes());
+            if i == 31 {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENFILE));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_handle_open_flood_is_bounded() {
+        let (_dir, fs) = scratch();
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        for _ in 0..32 {
+            fs.open(&ctx(), ino, 0, 0).unwrap();
+        }
+        assert_eq!(fs.open(&ctx(), ino, 0, 0).unwrap_err().raw_os_error(), Some(libc::ENFILE));
+        assert_eq!(fs.opendir(&ctx(), ROOT_ID, 0).unwrap_err().raw_os_error(), Some(libc::ENFILE));
+    }
+
+    #[test]
     fn lookup_rejects_escapes_and_odd_names() {
         let (_dir, fs) = scratch();
         for bad in [&b".."[..], b".", b"", b"a/b", b"hello.txt/."] {
