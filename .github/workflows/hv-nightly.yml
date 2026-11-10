@@ -1,0 +1,51 @@
+name: Nightly hypervisor gate
+
+# No push, PR or dispatch trigger: never run a card branch. Scheduled workflows
+# live on the default branch, but explicitly check out the integration branch.
+on:
+  schedule:
+    - cron: '30 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hv-nightly-next
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '4'
+      VMLAB_SKIP_UPDATES: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: next
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@uv
+      - name: Require KVM
+        run: |
+          set -eu
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+      - run: just ci::hv-test-native-deps-install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hv-nightly
+      - name: Gate next
+        run: |
+          set -eu
+          set -o pipefail
+          just ci::hv-gate 2>&1 | tee hv-gate.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hv-gate-next
+          path: hv-gate.log

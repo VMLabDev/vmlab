@@ -31,7 +31,21 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: path-check shell-paths release-version lint fmt-check test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+check: path-check shell-paths release-version kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+
+# Prove absent-device skip and required-device failure without booting a guest
+[group('ci')]
+kvm-policy-test: require-cargo require-bwrap
+	python3 -m unittest discover -s scripts -p 'test_kvm_policy.py'
+
+# The excluded TAP helper and patched wscript dependencies are not swept by host tests
+[group('ci')]
+tap-test: require-cargo
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'tap') + ' ' } }}cargo test --manifest-path tap/Cargo.toml
+
+[group('ci')]
+wscript-test: require-cargo
+	{{host_target_env}}cargo test -p wscript-core -p wscript-compiler
 
 # Refuse tracked paths that Windows cannot check out (: * ? " < > | \, trailing dot or space)
 [group('ci')]
@@ -153,10 +167,10 @@ hv-test: require-cargo hv-virgl-build hv-ipxe-build
 hv-ipxe-build: require-uv
 	uv run --no-project python guest/ipxe/build.py --profile hv
 
-# Run the guest-booting hypervisor gate locally, once per orchestrator batch (env: RUST_TEST_THREADS, default 2; VMLAB_HV_TEST_VM_LIMIT, default 4)
+# Run before release e2e and nightly on next (see docs/agents/hv-gate.md)
 [group('ci')]
 hv-gate: require-cargo hv-virgl-build hv-ipxe-build
-	PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
+	VMLAB_REQUIRE_KVM=1 PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
 
 # Check guest pins, documentation, Python packaging and shell scripts without building drivers
 [group('ci')]
