@@ -144,12 +144,12 @@ pub struct ForwardInputs<'a> {
 
 /// The host address a forward binds (§9.8): `127.0.0.1` under worktree
 /// isolation (§21.4) whatever `declared` says, else the declared `bind`, else
-/// every interface.
+/// loopback only.
 pub fn bind_address(declared: Option<Ipv4Addr>, isolated: bool) -> Ipv4Addr {
     if isolated {
         return Ipv4Addr::LOCALHOST;
     }
-    declared.unwrap_or(Ipv4Addr::UNSPECIFIED)
+    declared.unwrap_or(Ipv4Addr::LOCALHOST)
 }
 
 impl ForwardInputs<'_> {
@@ -1094,7 +1094,11 @@ lab "l" {
             bind_address(Some(Ipv4Addr::new(10, 1, 1, 1)), true),
             Ipv4Addr::LOCALHOST
         );
-        assert_eq!(bind_address(None, false), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(bind_address(None, false), Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            bind_address(Some(Ipv4Addr::UNSPECIFIED), false),
+            Ipv4Addr::UNSPECIFIED
+        );
     }
 
     /// Plan a lab whose two forwards share host port 8080, each binding

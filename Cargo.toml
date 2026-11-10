@@ -66,6 +66,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 sha2 = "0.11"
+hmac = "0.12"
+sha2_10 = { package = "sha2", version = "0.10" }
 hex = "0.4"
 rand = "0.10"
 base64 = "0.23"

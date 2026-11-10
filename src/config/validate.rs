@@ -211,7 +211,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     // address (§9.8).
     let mut fwd_ports: Vec<(u16, Ipv4Addr)> = Vec::new();
     let mut claim = |port: u16, bind: Option<Ipv4Addr>| {
-        let bind = bind.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let bind = bind.unwrap_or(Ipv4Addr::LOCALHOST);
         let taken = fwd_ports
             .iter()
             .any(|(p, b)| *p == port && forward_binds_overlap(*b, bind));

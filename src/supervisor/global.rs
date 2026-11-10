@@ -867,19 +867,21 @@ fn domain_label(name: &str) -> String {
 }
 
 async fn dial_peer(addr: SocketAddr, segment: &str, psk: &str) -> Result<tokio::net::TcpStream> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .with_context(|| format!("connecting to peer {addr}"))?;
-    // Simple PSK handshake: send a line `VMLABTRUNK1 <segment> <psk>\n`; the
-    // peer replies `OK\n` or `NO\n`. No certificate machinery in v1 (§9.2).
-    let hello = format!("VMLABTRUNK1 {segment} {psk}\n");
-    stream.write_all(hello.as_bytes()).await?;
-    let mut buf = [0u8; 3];
-    stream.read_exact(&mut buf).await?;
-    if &buf != b"OK\n" && &buf[..2] != b"OK" {
-        bail!("peer {addr} rejected the trunk (bad PSK, or it already has this trunk)");
-    }
+    tokio::time::timeout(super::trunk_auth::TIMEOUT, async {
+        super::trunk_auth::client(&mut stream, segment, psk).await?;
+        let mut buf = [0u8; 3];
+        stream.read_exact(&mut buf).await?;
+        if &buf != b"OK\n" {
+            bail!("peer {addr} rejected the trunk");
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("trunk handshake timed out")??;
     Ok(stream)
 }
 
@@ -904,26 +906,15 @@ pub async fn bind_peer_listener(
             let globals = globals.clone();
             let psk = psk.clone();
             tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut line = Vec::new();
-                let mut byte = [0u8; 1];
-                // Read the hello line.
-                for _ in 0..256 {
-                    if stream.read_exact(&mut byte).await.is_err() {
-                        return;
-                    }
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    line.push(byte[0]);
-                }
-                let hello = String::from_utf8_lossy(&line);
-                let parts: Vec<&str> = hello.split_whitespace().collect();
-                if parts.len() != 3 || parts[0] != "VMLABTRUNK1" || parts[2] != psk {
-                    let _ = stream.write_all(b"NO\n").await;
+                use tokio::io::AsyncWriteExt;
+                let Ok(Ok(segment)) = tokio::time::timeout(
+                    super::trunk_auth::TIMEOUT,
+                    super::trunk_auth::server(&mut stream, &psk),
+                )
+                .await
+                else {
                     return;
-                }
-                let segment = parts[1].to_string();
+                };
                 // Single-slot rule: refuse up front when a trunk to/from this
                 // host already exists (mutual connect, duplicate dial). The
                 // atomic reserve inside accept_peer catches the race window.

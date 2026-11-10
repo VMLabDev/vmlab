@@ -187,6 +187,18 @@ page guide_registries {
   DOC
 
   p <<DOC
+    Basic credentials and Bearer tokens are sent only over HTTPS to the
+    configured registry host and port. A challenge realm, pagination link,
+    upload location or download redirect on another origin receives no
+    credentials. Registries requiring login at a separate token host are
+    not supported. Plain HTTP loopback registries work anonymously only.
+    Registry JSON responses are limited to 8 MiB, in-memory blobs to 1 GiB,
+    streamed blobs to 8 GiB, and decompressed template chunks to 1 GiB
+    (with a 128 MiB zstd window). Larger custom chunks must be republished
+    with a smaller chunk size. Paginated lists have a 32 MiB total body limit.
+  DOC
+
+  p <<DOC
     For a machine with no Docker tooling, `vmlab template login <registry>
     --username <user> --password <secret>` validates the credential against
     the registry and stores it in the same Docker config file, so a later
