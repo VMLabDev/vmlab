@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
@@ -75,6 +76,110 @@ set -eu
         result = self.install('--no-guest')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.root / 'executed').exists())
+
+    def guest_bundle(self):
+        agent = self.root / 'agent'
+        agent.mkdir()
+        (agent / 'new').write_text('new agent')
+        with tarfile.open(self.dist / 'vmlab-guest-1.2.3.tar.gz', 'w:gz') as bundle:
+            bundle.add(agent, arcname='agent')
+        with patch.dict(os.environ, self.env):
+            ASSETS.prepare(self.dist, '1.2.3')
+
+    def test_guest_marker_allows_upgrade(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        self.old_guest(guest)
+        (guest / '.vmlab-guest').touch()
+        (guest / 'old').write_text('obsolete')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((guest / 'old').exists())
+        self.assertTrue((guest / '.vmlab-guest').is_file())
+        self.assertTrue((guest / 'agent/new').is_file())
+
+    def old_guest(self, guest):
+        (guest / 'agent/linux-x86_64').mkdir(parents=True)
+        (guest / 'agent/linux-x86_64/vmlab-agent').write_text('old agent')
+        (guest / 'firmware').mkdir()
+        (guest / 'x86_64').mkdir()
+        (guest / 'x86_64/vmlinuz').write_text('old kernel')
+        (guest / 'x86_64/initramfs.img').write_text('old initramfs')
+
+    def test_unmarked_old_guest_is_adopted_and_upgraded(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        self.old_guest(guest)
+        self.assertFalse((guest / '.vmlab-guest').exists())
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((guest / '.vmlab-guest').is_file())
+        self.assertTrue((guest / 'agent/new').is_file())
+        self.assertFalse((guest / 'agent/linux-x86_64/vmlab-agent').exists())
+
+    def test_foreign_owned_guest_is_preserved(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        self.old_guest(guest)
+        # Simulate stat's ownership result without requiring root/chown.
+        self.tool('stat', '#!/bin/sh\nset -eu\nprintf "%s\\n" foreign-uid\n')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('non-owned', result.stderr)
+        self.assertFalse((guest / '.vmlab-guest').exists())
+        self.assertEqual((guest / 'x86_64/vmlinuz').read_text(), 'old kernel')
+
+    def test_guest_without_marker_is_preserved(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        guest.mkdir()
+        (guest / 'valuable').write_text('keep')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('refusing to replace unrelated', result.stderr)
+        self.assertEqual((guest / 'valuable').read_text(), 'keep')
+
+    def test_guest_symlink_is_preserved(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        target = self.root / 'other'
+        self.old_guest(target)
+        (target / '.vmlab-guest').touch()
+        guest.symlink_to(target)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(guest.is_symlink())
+
+    def test_piped_help(self):
+        result = subprocess.run(['sh', '-s', '--', '--help'],
+                                input=(ROOT / 'install.sh').read_text(),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Usage: install.sh', result.stdout)
+
+    def test_latest_redirect_after_api_failure(self):
+        self.tool('curl', '''#!/bin/sh
+set -eu
+case "$*" in
+  *api.github.com*) exit 22 ;;
+  *url_effective*) printf 'https://github.com/VMLabDev/vmlab/releases/tag/v1.2.3' ;;
+  *) cat "$FIXTURES/${4##*/}" > "$3" ;;
+esac
+''')
+        result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--no-guest',
+                                 '--no-fastpath', '--skip-checks'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / 'installed/vmlab').exists())
+
+    def test_noninteractive_default_never_grants_capabilities(self):
+        self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
+        self.tool('sudo', '#!/bin/sh\nset -eu\nexit 99\n')
+        result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--version',
+                                 '1.2.3', '--no-guest', '--skip-checks'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('no capabilities granted', result.stdout)
 
     def test_bad_signature_never_executes(self):
         self.env['BAD_SIGNATURE'] = '1'
