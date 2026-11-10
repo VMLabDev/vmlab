@@ -53,8 +53,8 @@ release-version:
 
 # Offline release/installer dry-run, with an explicit signature-verifier stub
 [group('ci')]
-release-dry-run:
-	python3 -m unittest discover -s scripts -p 'test_release_assets.py'
+release-dry-run: require-uv
+	uv run --no-project --with pytest==8.4.2 python -m pytest scripts/test_release_assets.py --junitxml=target/release-dry-run.xml
 
 # Run clippy with warnings as errors
 [group('ci')]
