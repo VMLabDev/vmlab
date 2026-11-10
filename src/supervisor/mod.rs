@@ -9,6 +9,7 @@ pub mod keepawake;
 pub mod registry;
 pub mod store;
 pub mod templates;
+mod trunk_auth;
 
 use std::path::PathBuf;
 use std::sync::Arc;

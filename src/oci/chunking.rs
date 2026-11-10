@@ -21,6 +21,8 @@ use sha2::{Digest, Sha256};
 /// Default chunk size: 512 MiB (PRD §6.4 — clears GHCR's 10-minute
 /// per-upload timeout with wide margin while keeping retry/resume cheap).
 pub const DEFAULT_CHUNK_SIZE: u64 = 512 * 1024 * 1024;
+/// Hard ceiling for both locally produced and untrusted decompressed chunks.
+pub const MAX_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// zstd compression level for chunk blobs. Level 3 is zstd's default —
 /// a good speed/ratio balance for large, already-sparse qcow2 data.
@@ -75,6 +77,7 @@ fn digest_str(hex_digest: &str) -> String {
 /// layer/round-trip invariants hold.
 pub fn chunk_and_compress(qcow2: &Path, chunk_size: u64, out_dir: &Path) -> Result<ChunkSet> {
     ensure!(chunk_size > 0, "chunk_size must be non-zero");
+    ensure!(chunk_size <= MAX_CHUNK_SIZE, "chunk_size exceeds 1 GiB");
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create chunk dir {}", out_dir.display()))?;
 
@@ -174,12 +177,24 @@ pub fn assemble(chunk_paths: &[PathBuf], out: &Path) -> Result<()> {
             File::open(path).with_context(|| format!("cannot open chunk {}", path.display()))?;
         let mut decoder = zstd::Decoder::new(BufReader::with_capacity(COPY_BUF, compressed))
             .with_context(|| format!("cannot read zstd chunk {}", path.display()))?;
-        std::io::copy(&mut decoder, &mut writer)
+        decoder.window_log_max(27).context("limiting zstd window")?;
+        copy_chunk(decoder, &mut writer, MAX_CHUNK_SIZE)
             .with_context(|| format!("cannot decompress chunk {}", path.display()))?;
     }
     writer
         .flush()
         .with_context(|| format!("cannot flush {}", out.display()))?;
+    Ok(())
+}
+
+fn copy_chunk(reader: impl Read, writer: &mut impl Write, limit: u64) -> Result<()> {
+    let mut bounded = reader.take(limit);
+    std::io::copy(&mut bounded, writer)?;
+    let mut extra = [0];
+    ensure!(
+        bounded.into_inner().read(&mut extra)? == 0,
+        "decompressed chunk exceeds {limit} bytes"
+    );
     Ok(())
 }
 
@@ -243,6 +258,22 @@ impl<W: Write> Write for HashingWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decompressed_chunk_limit_is_enforced() {
+        let compressed = zstd::encode_all(&b"1234"[..], 3).unwrap();
+        let mut output = Vec::new();
+        assert!(
+            copy_chunk(
+                zstd::Decoder::new(compressed.as_slice()).unwrap(),
+                &mut output,
+                3
+            )
+            .is_err()
+        );
+        assert_eq!(output, b"123");
+        assert!(copy_chunk(&b"123"[..], &mut Vec::new(), 3).is_ok());
+    }
 
     fn sha256_hex(bytes: &[u8]) -> String {
         format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
