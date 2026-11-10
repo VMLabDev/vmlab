@@ -32,6 +32,7 @@ main:
 # Everything a change must pass before it can merge
 [group('ci')]
 check: path-check shell-paths release-version release-dry-run kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+	@printf 'Test results: %s/test-results/main.json\nTest results: %s/test-results/hv.json\n' {{quote(test_result_root)}} {{quote(test_result_root)}}
 
 # Prove absent-device skip and required-device failure without booting a guest
 [group('ci')]
@@ -83,7 +84,7 @@ fmt-check: require-cargo
 # Run the test suite
 [group('ci')]
 test: require-cargo require-bwrap
-	{{host_target_env}}cargo test --all-features
+	{{host_target_env}}python3 scripts/ci_test.py main --all-features
 
 # Run the Linux agent against the required protocol contract
 [group('ci')]
@@ -167,7 +168,7 @@ hv-lint: require-cargo hv-virgl-build
 # Run hypervisor tests, ignoring KVM guests and host-asset acceptance cases
 [group('ci')]
 hv-test: require-cargo hv-virgl-build hv-ipxe-build
-	{{hv_target_env}}PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
+	{{hv_target_env}}PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 python3 scripts/ci_test.py hv --workspace --exclude vmlab
 
 # Build the hypervisor's pinned iPXE option ROMs for non-guest tests
 [group('ci')]
@@ -193,6 +194,7 @@ win3d-check: require-uv
 # `guest-<crate>` each standalone guest workspace. Each *_env is a
 # `CARGO_TARGET_DIR=... ` prefix, empty when VMLAB_TARGET_ROOT is unset.
 host_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'host') + ' ' }
+test_result_root := if _target_root == '' { 'target' } else { _target_root }
 hv_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'hv') + ' ' }
 agent_target := if _target_root == '' { 'guest/agent/target' } else { _target_root / 'guest-agent' }
 agent_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(agent_target) + ' ' }
