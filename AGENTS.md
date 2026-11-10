@@ -35,6 +35,9 @@ just ci::check
   Push failed runs before rerunning too. Copy evidence from the target to
   your workspace when it is outside the shared mount. These two files cover
   the main and hv test steps, not the separate guest/conformance checks.
+  The target runner enables JSON only for test binaries. Doctests still run
+  on stable rustdoc with text output, included in cargo's exit status but not
+  in the uploaded case counts.
 - A known flaky test that fails once is rerun alone before the run counts as
   failed; name it on the card. Red again: fix it, or move the card to
   `blocked` with the output tail.

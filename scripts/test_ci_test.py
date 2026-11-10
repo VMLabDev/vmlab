@@ -36,7 +36,8 @@ class EvidenceTests(unittest.TestCase):
                 patch("os.execvpe", side_effect=RuntimeError) as execute:
             with self.assertRaises(RuntimeError):
                 ci_test.main()
-            self.assertEqual(execute.call_args.args[:2], ("/tmp/test", ["/tmp/test", "arg"]))
+            self.assertEqual(execute.call_args.args[:2], ("/tmp/test", [
+                "/tmp/test", "arg", "-Z", "unstable-options", "--format", "json", "--report-time"]))
             self.assertEqual(execute.call_args.args[2]["RUSTC_BOOTSTRAP"], "1")
 
     def test_refuses_root(self):

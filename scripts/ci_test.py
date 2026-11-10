@@ -9,7 +9,9 @@ import sys
 
 def main():
     if sys.argv[1] == "--run":
-        os.execvpe(sys.argv[2], sys.argv[2:], dict(os.environ, RUSTC_BOOTSTRAP="1"))
+        os.execvpe(sys.argv[2], [*sys.argv[2:], "-Z", "unstable-options",
+                               "--format", "json", "--report-time"],
+                   dict(os.environ, RUSTC_BOOTSTRAP="1"))
     name, *args = sys.argv[1:]
     root = Path(os.environ.get("VMLAB_TARGET_ROOT", "target"))
     if str(root) in ("", "/"):
@@ -25,8 +27,9 @@ def main():
         raise SystemExit("ci_test requires no inherited runner or RUSTC_BOOTSTRAP")
     import shlex
     env[runner_key] = shlex.join([sys.executable, str(Path(__file__).resolve()), "--run"])
-    command = ["cargo", "test", *args, "--", "-Z", "unstable-options",
-               "--format", "json", "--report-time"]
+    # Doctests run through rustdoc, not Cargo's target runner. Leave them on
+    # stable with their normal text output and retain cargo's combined status.
+    command = ["cargo", "test", *args]
     with result.open("w") as output:
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                               text=True) as process:
