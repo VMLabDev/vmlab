@@ -279,3 +279,26 @@ absent at daemon start.
 [wscript]: https://github.com/Configweave/wscript
 [config-weave]: https://github.com/Configweave/config-weave
 [just]: https://github.com/casey/just
+# Template trust
+
+Template disks and metadata are untrusted input. Pull and import validate path
+components, reject linked or non-regular disks, and refuse base disks with a
+qcow2 backing file. Import requires a disk digest and accepts only template
+metadata, disks, variant disks and the optional UEFI VARS file in the archive.
+Digests detect corruption, not publisher identity.
+
+Embedded `first_boot_script` is host-side code, not a guest sandbox. By default
+pull refuses templates containing it, including variant scripts. To trust a
+publisher, add its exact repository (without a tag) to your host configuration:
+
+```wcl
+host {
+  trusted_template_repositories = ["ghcr.io/my-org/my-template"]
+}
+```
+
+This grants that repository's scripts the user's lab and host scripting rights.
+There are no wildcard or prefix matches. Archive import always refuses embedded
+scripts because an archive cannot prove its registry origin. Locally built
+templates remain trusted user code. Only use trusted local template builds and
+protect the template store from other users. This is not a VM isolation boundary.

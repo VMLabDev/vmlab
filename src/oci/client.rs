@@ -636,6 +636,13 @@ impl Registry {
         let config = TemplateConfig::from_json(&config_bytes)?;
         let vars = config.vars()?;
         let meta = config.into_meta(Some(self.reference.canonical()))?;
+        crate::template::trust::names(&meta)?;
+        let trusted = crate::template::trust::repository_trusted(
+            &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
+            &self.reference.host,
+            &self.reference.repository,
+        );
+        crate::template::trust::scripts(&meta, trusted)?;
 
         // A requested arch must match what we resolved (defence in depth
         // for the plain-manifest path which has no index keying).
@@ -722,6 +729,9 @@ impl Registry {
             .to_string();
         let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
         let (listed, default) = manifest.variants()?;
+        for entry in &listed {
+            crate::template::trust::component(&entry.name)?;
+        }
         let chosen = want.choose(&listed, default.as_deref(), &reference)?;
 
         // The same version already in the store: the same artefact is used
@@ -785,6 +795,15 @@ impl Registry {
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
             let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
+            crate::template::trust::component(&variant.name)?;
+            let mut checked = meta.clone();
+            checked.variants = vec![variant.clone()];
+            let trusted = crate::template::trust::repository_trusted(
+                &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
+                &self.reference.host,
+                &self.reference.repository,
+            );
+            crate::template::trust::scripts(&checked, trusted)?;
             ensure!(
                 variant.name == entry.name && digest_eq(&variant.sha256, &layout.overlay_digest),
                 "variant `{}`'s config blob disagrees with its manifest",
@@ -839,14 +858,16 @@ impl Registry {
         let store = dest_store.clone();
         let meta = tokio::task::spawn_blocking(move || -> Result<TemplateMeta> {
             let mut variants = Vec::new();
-            for (mut variant, paths, digest) in overlays {
+            for (variant, paths, digest) in overlays {
                 let disk = staging.join(crate::template::meta::variant_disk_rel(&variant.name));
                 chunking::assemble(&paths, &disk)?;
                 chunking::verify_whole(&disk, &digest)
                     .with_context(|| format!("variant `{}`", variant.name))?;
-                if crate::template::store::ensure_variant_backing(&disk)? {
-                    variant.sha256 = crate::template::store::sha256_file(&disk)?;
-                }
+                ensure!(
+                    crate::template::store::qcow2_backing_file(&disk)?.as_deref()
+                        == Some(crate::template::store::VARIANT_BACKING),
+                    "untrusted variant backing file"
+                );
                 variants.push(variant);
             }
             match local {

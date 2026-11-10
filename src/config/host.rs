@@ -49,6 +49,8 @@ impl AppleSmcOsk {
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
+    /// Exact registry/repository names trusted to supply host-side scripts.
+    pub trusted_template_repositories: Vec<String>,
     pub subnet_pool: ipnet::Ipv4Net,
     pub dns_suffix: String,
     pub dns_upstream: Option<String>,
@@ -168,6 +170,7 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             subnet_pool: "10.213.0.0/16".parse().expect("valid default pool"),
+            trusted_template_repositories: Vec::new(),
             dns_suffix: "vmlab.internal".to_string(),
             dns_upstream: None,
             disk_low_percent: 10,
@@ -248,6 +251,7 @@ impl HostConfig {
                 cfg.trunk_port = v;
             }
             cfg.viewer = r.string("viewer").unspan();
+            cfg.trusted_template_repositories = r.string_list("trusted_template_repositories");
             cfg.waypipe = r.path("waypipe").unspan();
             cfg.ffmpeg = r.path("ffmpeg").unspan();
             cfg.freerdp = r.path("freerdp").unspan();

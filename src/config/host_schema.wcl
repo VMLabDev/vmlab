@@ -10,6 +10,8 @@ type HostDoc {
 
 @block("host")
 type HostConfig {
+  @doc("Exact registry/repository names allowed to supply host-side first_boot_script code; default: none. No tags or wildcards.")
+  trusted_template_repositories: list<utf8>?
   @doc("Segment auto-allocation pool (CIDR); default `10.213.0.0/16`")
   subnet_pool: utf8?
   @doc("Suffix for auto-registered VM names; default `vmlab.internal`")
