@@ -68,7 +68,7 @@ release-version:
 # Offline release/installer dry-run, with an explicit signature-verifier stub
 [group('ci')]
 release-dry-run: require-uv
-	uv run --no-project --with pytest==8.4.2 python -m pytest scripts/test_release_assets.py --junitxml=target/release-dry-run.xml
+	uv run --no-project --with pytest==8.4.2 python -m pytest -p no:cacheprovider scripts/test_release_assets.py --junitxml={{quote(release_report)}}
 
 # Run clippy with warnings as errors
 [group('ci')]
@@ -120,6 +120,8 @@ guest-cross-build: require-cargo
 # Verify the committed BPF objects match the ebpf/ sources
 [group('ci')]
 ebpf-verify: ebpf-build
+	cmp {{quote(ebpf_output)}}/fastpath_sockmap.bpf.o src/net/fastpath/bpf/fastpath_sockmap.bpf.o
+	cmp {{quote(ebpf_output)}}/xdp_switch.bpf.o src/net/fastpath/bpf/xdp_switch.bpf.o
 	git diff --exit-code src/net/fastpath/bpf/
 
 # Install the hypervisor's native build dependencies on Ubuntu
@@ -160,12 +162,12 @@ hv-fmt-check: require-cargo
 # Lint every hypervisor crate without enabling guest-boot tests
 [group('ci')]
 hv-lint: require-cargo hv-virgl-build
-	{{hv_target_env}}PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" cargo clippy --workspace --exclude vmlab --all-targets -- -D warnings
+	{{hv_target_env}}PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" cargo clippy --workspace --exclude vmlab --all-targets -- -D warnings
 
 # Run hypervisor tests, ignoring KVM guests and host-asset acceptance cases
 [group('ci')]
 hv-test: require-cargo hv-virgl-build hv-ipxe-build
-	{{hv_target_env}}PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
+	{{hv_target_env}}PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
 
 # Build the hypervisor's pinned iPXE option ROMs for non-guest tests
 [group('ci')]
@@ -175,7 +177,7 @@ hv-ipxe-build: require-uv
 # Run before release e2e and nightly on next (see docs/agents/hv-gate.md)
 [group('ci')]
 hv-gate: require-cargo hv-virgl-build hv-ipxe-build
-	VMLAB_REQUIRE_KVM=1 PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
+	VMLAB_REQUIRE_KVM=1 PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
 
 # Check guest pins, documentation, Python packaging and shell scripts without building drivers
 [group('ci')]

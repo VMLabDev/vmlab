@@ -23,6 +23,15 @@ just ci::check
   comment. There is no `validating` column and no `terrarium card validate`
   for card work. Persistent target dirs: set
   `VMLAB_TARGET_ROOT=/var/build/cache/vmlab/<you>` so a rerun is fast.
+  This also redirects CI reports, virgl, hv iPXE and rebuilt BPF objects.
+  A read-only checkout owned by another user needs command-local Git trust
+  (inherited by Git subprocesses), not a global safe.directory change:
+
+  ```sh
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory \
+    GIT_CONFIG_VALUE_0=/absolute/path/to/checkout \
+    VMLAB_TARGET_ROOT=/var/build/cache/vmlab/<you> just ci::check
+  ```
 - The merge queue runs the same command on each batch merged onto `next`
   (one `terrarium card merge A B C ...` job); its two slots serve merges only.
 - Pass: every recipe of `ci::check` exits 0. Push the test results with
