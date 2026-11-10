@@ -4,8 +4,8 @@
 //! see `DESIGN.md` for the imago-vs-own decision and the black-box QEMU
 //! observations that pin the vmstate layout.
 
-mod refcount;
 mod recovery;
+mod refcount;
 mod snapshot;
 
 use self::refcount::FreeClusters;
@@ -889,8 +889,8 @@ impl Qcow2Image {
 
     fn is_dirty(&self) -> bool {
         self.version >= 3
-            && u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap())
-                & INCOMPAT_DIRTY != 0
+            && u64::from_be_bytes(self.header_cluster[72..80].try_into().unwrap()) & INCOMPAT_DIRTY
+                != 0
     }
 
     /// Persist the dirty marker before the first data or metadata write.
@@ -1439,7 +1439,8 @@ mod tests {
             return;
         };
         let mut img = Qcow2Image::open(Path::new(&path), false).unwrap();
-        img.write_at(img.cluster_size, &vec![0x72; img.cluster_size as usize]).unwrap();
+        img.write_at(img.cluster_size, &vec![0x72; img.cluster_size as usize])
+            .unwrap();
         img.flush().unwrap();
         panic!("child did not stop at the crash checkpoint");
     }
@@ -1461,7 +1462,10 @@ mod tests {
                 .args(["--exact", "qcow2::tests::crash_writer_child", "--nocapture"])
                 .env("VMLAB_QCOW_CRASH_IMAGE", &path)
                 .env("VMLAB_QCOW_CRASH_PHASE", phase)
-                .stdout(Stdio::piped()).stdin(Stdio::piped()).spawn().unwrap();
+                .stdout(Stdio::piped())
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
             let stdout = child.stdout.take().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let reader = std::thread::spawn(move || {
@@ -1488,8 +1492,13 @@ mod tests {
             recovered.read_at(0, &mut bytes).unwrap();
             assert_eq!(bytes, vec![0x31; cluster as usize]);
             recovered.read_at(cluster, &mut bytes).unwrap();
-            assert_eq!(bytes, vec![if phase == "mappings" { 0x72 } else { 0 }; cluster as usize]);
-            recovered.write_at(2 * cluster, &vec![0x93; cluster as usize]).unwrap();
+            assert_eq!(
+                bytes,
+                vec![if phase == "mappings" { 0x72 } else { 0 }; cluster as usize]
+            );
+            recovered
+                .write_at(2 * cluster, &vec![0x93; cluster as usize])
+                .unwrap();
             recovered.flush().unwrap();
             recovered.read_at(0, &mut bytes).unwrap();
             assert_eq!(bytes, vec![0x31; cluster as usize]);
@@ -1498,9 +1507,17 @@ mod tests {
             assert_eq!(bytes, vec![0x31; cluster as usize]);
             drop(recovered);
             assert!(!Qcow2Image::open(&path, true).unwrap().is_dirty());
-            let check = Command::new("qemu-img").args(["check", "-f", "qcow2"])
-                .arg(&path).output().expect("qemu-img is required for crash recovery test");
-            assert!(check.status.success(), "{}{}", String::from_utf8_lossy(&check.stdout), String::from_utf8_lossy(&check.stderr));
+            let check = Command::new("qemu-img")
+                .args(["check", "-f", "qcow2"])
+                .arg(&path)
+                .output()
+                .expect("qemu-img is required for crash recovery test");
+            assert!(
+                check.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr)
+            );
         }
     }
 

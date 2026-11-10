@@ -24,16 +24,26 @@ impl Qcow2Image {
             self.count_range(&mut counts, l1_offset, entries * 8)?;
             let mut bytes = vec![0; (entries * 8) as usize];
             self.file.read_exact_at(&mut bytes, l1_offset)?;
-            let l1: Vec<_> = bytes.as_chunks::<8>().0.iter().map(|b| u64::from_be_bytes(*b)).collect();
+            let l1: Vec<_> = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| u64::from_be_bytes(*b))
+                .collect();
             self.count_view(&mut counts, &l1)?;
             let id = u16::from_be_bytes(fixed[12..14].try_into().unwrap()) as u64;
             let name = u16::from_be_bytes(fixed[14..16].try_into().unwrap()) as u64;
             let extra = u32::from_be_bytes(fixed[36..40].try_into().unwrap()) as u64;
-            offset = offset.checked_add((40 + extra + id + name).div_ceil(8) * 8)
+            offset = offset
+                .checked_add((40 + extra + id + name).div_ceil(8) * 8)
                 .ok_or_else(|| Error::Unsupported("snapshot table overflows u64".into()))?;
         }
         if self.nb_snapshots != 0 {
-            self.count_range(&mut counts, self.snapshots_offset, offset - self.snapshots_offset)?;
+            self.count_range(
+                &mut counts,
+                self.snapshots_offset,
+                offset - self.snapshots_offset,
+            )?;
         }
 
         let first = self.file.metadata()?.len().div_ceil(self.cluster_size);
@@ -50,8 +60,13 @@ impl Qcow2Image {
         };
         let table_offset = first * self.cluster_size;
         let block_start = first + table_clusters;
-        self.file.set_len((block_start + blocks) * self.cluster_size)?;
-        self.count_range(&mut counts, table_offset, (table_clusters + blocks) * self.cluster_size)?;
+        self.file
+            .set_len((block_start + blocks) * self.cluster_size)?;
+        self.count_range(
+            &mut counts,
+            table_offset,
+            (table_clusters + blocks) * self.cluster_size,
+        )?;
         let mut table = vec![0u8; (table_clusters * self.cluster_size) as usize];
         for index in 0..blocks {
             let host = (block_start + index) * self.cluster_size;
@@ -75,7 +90,12 @@ impl Qcow2Image {
         self.file.sync_all()?;
         self.refcount_table_offset = table_offset;
         self.refcount_table_clusters = table_clusters;
-        self.refcount_table = table.as_chunks::<8>().0.iter().map(|b| u64::from_be_bytes(*b)).collect();
+        self.refcount_table = table
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_be_bytes(*b))
+            .collect();
         self.refblock_cache = TableCache::new(64);
         self.patch_header_fields();
         self.write_started = true;
@@ -87,14 +107,18 @@ impl Qcow2Image {
         if len == 0 {
             return Ok(());
         }
-        let end = offset.checked_add(len)
+        let end = offset
+            .checked_add(len)
             .ok_or_else(|| Error::Unsupported("qcow2 reference overflows u64".into()))?;
         if end > self.file.metadata()?.len() {
-            return Err(Error::Unsupported("qcow2 reference beyond end of file".into()));
+            return Err(Error::Unsupported(
+                "qcow2 reference beyond end of file".into(),
+            ));
         }
         for cluster in offset / self.cluster_size..end.div_ceil(self.cluster_size) {
             let count = counts.entry(cluster).or_default();
-            *count = count.checked_add(1)
+            *count = count
+                .checked_add(1)
                 .filter(|n| *n <= (u64::MAX >> (64 - self.refcount_bits)))
                 .ok_or_else(|| Error::Unsupported("recovered refcount overflow".into()))?;
         }
