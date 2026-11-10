@@ -105,9 +105,17 @@ impl Qcow2Image {
         self.read_file(host, &mut buf)?;
         // Dirty evictees must reach the disk before their clusters can be
         // handed out again.
-        for (index, block) in self.refblock_cache.put(table_index, buf, false) {
-            let host = self.refblock_host(index)?;
-            self.write_file(host, &block)?;
+        let mut evicted = self.refblock_cache.put(table_index, buf, false).into_iter();
+        while let Some((index, block)) = evicted.next() {
+            let written = self
+                .refblock_host(index)
+                .and_then(|host| self.write_file(host, &block));
+            if let Err(e) = written {
+                // Keep the failed block and the unwritten rest dirty.
+                self.refblock_cache
+                    .restore_dirty(std::iter::once((index, block)).chain(evicted));
+                return Err(e);
+            }
         }
         Ok(())
     }
