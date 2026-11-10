@@ -111,18 +111,26 @@ struct Shared {
 
 impl Shared {
     fn control_cap(&self) -> usize {
-        self.ports.len().saturating_mul(4).saturating_add(4)
+        self.ports.len().saturating_mul(8).saturating_add(8)
     }
 
     fn enqueue_ctrl(&mut self, msg: CtrlMsg) {
         if let Some(old) = self
             .pending
             .iter_mut()
-            .find(|old| old.id == msg.id && old.event == msg.event)
+            .rev()
+            .find(|old| old.id == msg.id)
+            .filter(|old| old.event == msg.event)
         {
             *old = msg;
         } else if self.pending.len() < self.control_cap() {
             self.pending.push_back(msg);
+        } else {
+            log::warn!(
+                "virtio-console control queue full, dropping port {} event {}",
+                msg.id,
+                msg.event
+            );
         }
     }
 }
@@ -1490,6 +1498,65 @@ mod tests {
         }
         assert_eq!(sh.pending.len(), 1);
         assert!(sh.pending.len() <= sh.control_cap());
+    }
+
+    #[test]
+    fn setup_without_control_rx_preserves_distinct_events() {
+        let f = Fixture::new();
+        let mut sh = lock(&f.dev.shared);
+        let mut expected = VecDeque::new();
+        // All six host event kinds, across every configured port. No RX
+        // buffers are posted, so every event must remain pending in order.
+        for event in [EV_PORT_ADD, 2, 4, 5, EV_PORT_OPEN, EV_PORT_NAME] {
+            for id in 1..=sh.ports.len() as u32 {
+                let msg = CtrlMsg {
+                    id,
+                    event,
+                    value: 1,
+                    name: (event == EV_PORT_NAME).then(|| format!("port-{id}")),
+                };
+                expected.push_back(msg.clone());
+                sh.enqueue_ctrl(msg);
+            }
+        }
+        flush_pending(&mut sh);
+        assert_eq!(sh.pending, expected);
+        assert!(sh.pending.len() <= sh.control_cap());
+    }
+
+    #[test]
+    fn add_remove_add_preserves_port_lifecycle_order() {
+        let f = Fixture::new();
+        let mut sh = lock(&f.dev.shared);
+        for event in [EV_PORT_ADD, 2, EV_PORT_ADD] {
+            sh.enqueue_ctrl(CtrlMsg {
+                id: 1,
+                event,
+                value: 1,
+                name: None,
+            });
+        }
+        assert_eq!(
+            sh.pending.iter().map(|m| m.event).collect::<Vec<_>>(),
+            [EV_PORT_ADD, 2, EV_PORT_ADD]
+        );
+        // A neighbouring port does not prevent coalescing the newest event
+        // for port 1, but no earlier event for that port may be replaced.
+        sh.enqueue_ctrl(CtrlMsg {
+            id: 2,
+            event: EV_PORT_ADD,
+            value: 1,
+            name: None,
+        });
+        sh.enqueue_ctrl(CtrlMsg {
+            id: 1,
+            event: EV_PORT_ADD,
+            value: 0,
+            name: None,
+        });
+        assert_eq!(sh.pending.len(), 4);
+        assert_eq!(sh.pending[0].value, 1);
+        assert_eq!(sh.pending[2].value, 0);
     }
 
     #[test]
