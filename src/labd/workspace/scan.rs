@@ -602,6 +602,7 @@ mod tests {
                     size: 0,
                     mtime_ns: 0,
                     atime_ns: 0,
+                    mode: None,
                 },
             }]);
             let ignores = Ignores::new();
