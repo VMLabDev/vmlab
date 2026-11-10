@@ -31,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: path-check shell-paths release-version kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+check: path-check shell-paths release-version release-dry-run kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
 
 # Prove absent-device skip and required-device failure without booting a guest
 [group('ci')]
@@ -64,6 +64,11 @@ shell-paths:
 [group('ci')]
 release-version:
 	python3 -m unittest discover -s scripts -p 'test_release_version.py'
+
+# Offline release/installer dry-run, with an explicit signature-verifier stub
+[group('ci')]
+release-dry-run: require-uv
+	uv run --no-project --with pytest==8.4.2 python -m pytest scripts/test_release_assets.py --junitxml=target/release-dry-run.xml
 
 # Run clippy with warnings as errors
 [group('ci')]

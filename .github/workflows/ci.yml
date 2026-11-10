@@ -2,6 +2,9 @@ name: CI
 
 # CI runs only on main and release/**. Card branches and next are validated
 # locally with `just ci::check` (D12), so a push to them starts no workflow.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, 'release/**']
@@ -15,6 +18,16 @@ env:
 # step 20 minutes (VML-78): a hung apt mirror held the 0.44.0 release for 68
 # minutes, and the GitHub default is 6 hours.
 jobs:
+  release-dry-run:
+    name: Release supply-chain dry-run (no signing identity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
+      - run: just ci::release-dry-run
+
   # The fast gate: every fmt and clippy step of the host and hypervisor
   # workspaces, so a fmt or lint failure ends the run before the long test
   # jobs (`check`, `hv-check`) start. Those two jobs `need` this one and the
@@ -24,13 +37,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@just
-      - uses: taiki-e/install-action@uv
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
       # Paths Windows cannot check out (VML-60): no build needed.
       - run: just ci::path-check
       # VML-88: unguarded variable paths in shell scripts and just recipes (no build needed).
@@ -50,11 +63,11 @@ jobs:
       - name: Resolve virglrenderer cache identity
         id: virgl
         run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci-cache/virglrenderer-*
           key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: fmt-lint
       - run: just ci::lint
@@ -68,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -86,12 +99,12 @@ jobs:
             qemu-efi-aarch64 qemu-efi-riscv64 \
             tesseract-ocr passt \
             xorriso mtools dosfstools samba bubblewrap waypipe
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # One part of the merge bar per step; `just ci::check` runs the same set
       # in one go.
       - run: just ci::test
@@ -104,13 +117,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@just
-      - uses: taiki-e/install-action@uv
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -120,11 +133,11 @@ jobs:
       - name: Resolve virglrenderer cache identity
         id: virgl
         run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci-cache/virglrenderer-*
           key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: hv-check
       - run: just ci::hv-desktop-test
@@ -139,14 +152,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, riscv64gc-unknown-linux-musl, x86_64-pc-windows-gnu, x86_64-apple-darwin
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             guest/cinit-proto
@@ -168,15 +181,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # ebpf/rust-toolchain.toml selects the pinned nightly automatically;
       # install it (with rust-src) up front so cargo doesn't have to.
       - name: Install pinned ebpf toolchain
         run: |
           channel=$(grep '^channel' ebpf/rust-toolchain.toml | cut -d'"' -f2)
           rustup toolchain install "$channel" --profile minimal --component rust-src
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: ebpf
       - run: just ebpf-tools
@@ -199,7 +212,7 @@ jobs:
       prerelease: ${{ steps.calc.outputs.prerelease }}
       do_release: ${{ steps.calc.outputs.do_release }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - id: calc
@@ -250,13 +263,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: linux-x86_64
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
           targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@just
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: build-${{ matrix.target }}
       - name: Stamp version
@@ -269,7 +282,7 @@ jobs:
         run: |
           V="${{ needs.version.outputs.version }}"
           cp "target/${{ matrix.target }}/release/vmlab" "vmlab-$V-${{ matrix.suffix }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bin-${{ matrix.target }}
           path: vmlab-${{ needs.version.outputs.version }}-${{ matrix.suffix }}
@@ -284,7 +297,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -305,7 +318,7 @@ jobs:
             -p virtio-win10-prewhql-0.1-161.zip -O ".ci-cache/vdisplay-windows/ivshmem-$sha.zip"
       - name: Compile against pinned kits
         run: python3 guest/vdisplay-windows/build.py --output target/vdisplay-unsigned
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vdisplay-unsigned
           path: target/vdisplay-unsigned
@@ -318,20 +331,20 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: vdisplay-unsigned
           path: target/vdisplay-package
       # build.ps1 verifies every archive against its pin, so a warm cache means no fetch at release time.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: C:\vdisplay-tools\downloads
           key: vdisplay-tools-${{ runner.os }}-${{ hashFiles('guest/vdisplay-windows/dependencies.json', 'guest/vdisplay-windows/build-vm/toolchain/toolchain.json') }}
       - name: Sign with pinned SDK and WDK tools
         shell: powershell
         run: ./guest/vdisplay-windows/build.ps1 -Mode sign-only -Package "$PWD/target/vdisplay-package"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vdisplay-signed
           path: target/vdisplay-package
@@ -354,8 +367,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@just
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -372,14 +385,14 @@ jobs:
         id: mingw
         run: echo "version=$(dpkg-query -W -f='${Version}' mingw-w64-common)" >> "$GITHUB_OUTPUT"
       # Both caches sit at the default locations the build scripts look in.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.local/share/vmlab/toolchains/mingw-msvcrt
           key: mingw-msvcrt-${{ runner.os }}-${{ steps.mingw.outputs.version }}-${{ hashFiles('guest/build-mingw-msvcrt.sh', 'scripts/guest-toolchains.sh') }}
       - name: Build msvcrt CRT
         run: ./scripts/guest-toolchains.sh msvcrt
       # OpenWatcom is a pinned 150 MB snapshot; the pin lives in the script.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.local/opt/open-watcom-v2
           key: open-watcom-${{ runner.os }}-${{ hashFiles('scripts/guest-toolchains.sh') }}
@@ -388,19 +401,19 @@ jobs:
       # zig, cargo-zigbuild and rcodesign for the macOS agent, all pinned there.
       - name: Install the macOS agent toolchain
         run: ./scripts/guest-toolchains.sh zig
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: guest-assets
           workspaces: |
             guest/cinit
             guest/agent
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: vdisplay-signed
           path: guest/vdisplay-windows/target/signed-package
       - name: Build and package
         run: just guest-package "${{ needs.version.outputs.version }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: guest-assets
           path: |
@@ -416,12 +429,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0
-      - uses: taiki-e/install-action@just
-      - uses: taiki-e/install-action@uv
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
+      - uses: taiki-e/install-action@59efbae88300b1298fd71ecd2fc553f6dcbd1c96 # uv
       # VML-78: apt fails fast on a dead mirror and retries.
       - name: Make apt fail fast
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-vmlab-ci
@@ -432,17 +445,17 @@ jobs:
         id: virgl
         run: just ci::hv-cache-key >> "$GITHUB_OUTPUT"
       # Outside target/: rust-cache restores that directory separately.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci-cache/virglrenderer-*
           key: hv-${{ runner.os }}-${{ runner.arch }}-${{ steps.virgl.outputs.key }}-${{ hashFiles('build/hv.py', 'build/hv-pins.toml') }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: hv-build
           workspaces: . -> target/hv
       - name: Build and check hypervisor bundle
         run: just ci::hv-package "${{ needs.version.outputs.version }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hv-assets
           path: |
@@ -455,37 +468,50 @@ jobs:
   # guest and hypervisor bundles (and their checksums) attached.
   release:
     name: Create GitHub release
-    needs: [version, build, guest-assets, hv-build]
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    needs: [version, build, guest-assets, hv-build, release-dry-run]
     if: needs.version.outputs.do_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           pattern: bin-*
-      - uses: actions/download-artifact@v8
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           name: guest-assets
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           name: hv-assets
-      - name: Tag
-        run: |
-          V="${{ needs.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v$V"
-          git push origin "v$V"
-      - uses: softprops/action-gh-release@v3
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
         with:
+          cosign-release: v2.6.1
+      - name: Prepare authenticated release assets
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          python3 scripts/release-assets.py dist "$VERSION"
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.bundle dist/SHA256SUMS
+          cosign verify-blob --bundle dist/SHA256SUMS.bundle \
+            --certificate-identity https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com dist/SHA256SUMS
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
+        with:
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
           prerelease: ${{ needs.version.outputs.prerelease }}

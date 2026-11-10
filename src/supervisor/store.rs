@@ -450,12 +450,20 @@ pub async fn export(reference: String, out: PathBuf) -> Result<Value, CommandErr
 
 /// `store.import`: read a template back out of an archive, with its
 /// variants (§6.6).
-pub async fn import(archive: PathBuf, overwrite: bool) -> Result<Value, CommandError> {
-    let meta = tokio::task::spawn_blocking(move || store().import(&archive, overwrite))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
-    answer(InstalledVersion::of(&meta))
+pub async fn import(
+    archive: PathBuf,
+    overwrite: bool,
+    trust_scripts: bool,
+) -> Result<Value, CommandError> {
+    let meta = tokio::task::spawn_blocking(move || {
+        store().import_trusting_scripts(&archive, overwrite, trust_scripts)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    let mut result = answer(InstalledVersion::of(&meta))?;
+    result["script_paths"] = serde_json::json!(crate::template::trust::script_paths(&meta));
+    Ok(result)
 }
 
 /// `store.pull`: download a published template into the store — the base,
