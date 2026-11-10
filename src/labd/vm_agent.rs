@@ -1610,10 +1610,17 @@ impl FileOps {
                         break Err(e);
                     }
                     if entries.is_empty() && !eof {
-                        break Err(anyhow!("guest directory listing made no progress"));
+                        break Err(super::workspace::ignore::GuestListingError(
+                            "guest directory listing made no progress".into(),
+                        )
+                        .into());
                     }
-                    if entries.len() > super::workspace::ignore::MAX_DIRECTORY_ENTRIES - all.len() {
-                        break Err(anyhow!("guest directory entry limit exceeded"));
+                    if let Err(e) = super::workspace::ignore::entry_budget(
+                        all.len(),
+                        entries.len(),
+                        super::workspace::ignore::MAX_DIRECTORY_ENTRIES,
+                    ) {
+                        break Err(e);
                     }
                     all.extend(entries);
                     if eof {
