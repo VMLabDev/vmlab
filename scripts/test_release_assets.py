@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import subprocess
 import shutil
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -123,21 +122,11 @@ set -eu
         self.env['FAIL_DOWNLOAD'] = 'SHA256SUMS'
         self.refused(self.install('--no-guest', '--insecure-skip-signature'))
 
-    def test_shasum_fallback(self):
-        self.restricted_path(sha256sum=False)
-        self.tool('shasum', f'''#!{sys.executable}
-import hashlib, sys
-assert sys.argv[1:3] == ['-a', '256']
-print(hashlib.sha256(open(sys.argv[3], 'rb').read()).hexdigest() + '  ' + sys.argv[3])
-''')
-        result = self.install('--no-guest')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_missing_hash_tool_refuses(self):
         self.restricted_path(sha256sum=False)
         result = self.install('--no-guest')
         self.refused(result)
-        self.assertIn('need sha256sum or shasum', result.stderr)
+        self.assertIn('need sha256sum', result.stderr)
 
     def test_invalid_insecure_environment_refuses(self):
         self.env['VMLAB_INSECURE_SKIP_SIGNATURE'] = 'yes'

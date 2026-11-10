@@ -100,16 +100,6 @@ esac
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-sha256_of() {
-  if have sha256sum; then
-    sha256sum "$1" | cut -d' ' -f1
-  elif have shasum; then
-    shasum -a 256 "$1" | cut -d' ' -f1
-  else
-    return 1
-  fi
-}
-
 case "$INSECURE_SKIP_SIGNATURE" in
   0|1) ;;
   *) err "VMLAB_INSECURE_SKIP_SIGNATURE must be 0 or 1" ;;
@@ -169,7 +159,7 @@ if [ "$INSECURE_SKIP_SIGNATURE" -eq 1 ]; then
 else
   have cosign || err "need cosign (v2.6.1 or newer) on PATH to verify release signatures; install it from https://docs.sigstore.dev/cosign/system_config/installation/"
 fi
-have sha256sum || have shasum || err "need sha256sum or shasum on PATH to verify release assets"
+have sha256sum || err "need sha256sum on PATH to verify release assets"
 asset="vmlab-${ver}-${suffix}"
 BASE_URL="${BASE_URL%/}"
 url="$BASE_URL/$tag/$asset"
@@ -198,7 +188,7 @@ verify_asset() {
   want="$(awk -v name="$1" '$2 == name && NF == 2 {print $1}' "$verify_dir/SHA256SUMS")"
   [ "${#want}" -eq 64 ] || err "missing or duplicate checksum for $1"
   case "$want" in *[!0-9a-f]*) err "invalid checksum for $1" ;; esac
-  got="$(sha256_of "$2")" || err "cannot compute SHA256 for $1"
+  got="$(sha256sum "$2" | cut -d' ' -f1)" || err "cannot compute SHA256 for $1"
   [ "$want" = "$got" ] || err "checksum mismatch for $1"
 }
 

@@ -8,7 +8,7 @@ key. The bundle includes the certificate and transparency-log evidence.
 Install cosign v2.6.1 or newer through a trusted package source before using
 `install.sh`. The installer will not bootstrap its own verifier from an
 unverified download. By default, missing cosign or unsigned releases are refused.
-Hash verification requires `sha256sum`, or `shasum -a 256` as a fallback.
+Hash verification requires `sha256sum`.
 
 For an independently trusted source only, an explicit opt-out is available:
 
