@@ -502,6 +502,16 @@ mod tests {
         assert_eq!(cfg.firmware_dir, None);
         assert!(cfg.btrfs_nocow);
         assert!(cfg.gpus.is_empty() && cfg.default_gpu().is_none());
+        assert!(cfg.trusted_template_repositories.is_empty());
+    }
+
+    #[test]
+    fn parses_explicit_template_script_trust() {
+        let cfg = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { trusted_template_repositories = [\"ghcr.io/org/template\"] }",
+            "config.wcl",
+        ).unwrap();
+        assert_eq!(cfg.trusted_template_repositories, ["ghcr.io/org/template"]);
     }
 
     /// The default hypervisor is keyed by machine kind (PRD §22) and starts

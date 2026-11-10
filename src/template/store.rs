@@ -844,6 +844,9 @@ pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
         (2..=3).contains(&version),
         "unsupported qcow2 version {version}"
     );
+    let header_size = if version == 2 { 72 } else { 104 };
+    let file_size = f.metadata()?.len();
+    ensure!(file_size >= header_size, "truncated qcow2 header");
     ensure!(
         (offset == 0) == (size == 0),
         "inconsistent qcow2 backing fields"
@@ -852,10 +855,10 @@ pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     ensure!(
-        offset >= if version == 2 { 72 } else { 104 }
+        offset >= header_size
             && offset
                 .checked_add(u64::from(size))
-                .is_some_and(|end| end <= f.metadata().map(|m| m.len()).unwrap_or(0)),
+                .is_some_and(|end| end <= file_size),
         "qcow2 backing file name is outside the image"
     );
     ensure!(
@@ -2857,7 +2860,10 @@ mod tests {
     fn record_variant_digests(store: &TemplateStore) {
         let dir = store.version_dir("x86_64", "win", "1");
         let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
+        // Archive transport cannot authenticate a script publisher.
+        m.first_boot_script = None;
         for v in &mut m.variants {
+            v.first_boot_script = None;
             v.sha256 = sha256_file(&dir.join(variant_disk_rel(&v.name))).unwrap();
         }
         m.write_to(&dir.join(META_FILE)).unwrap();
