@@ -151,7 +151,11 @@ def run(h):
             kind = [l for l in snap(h, lab, "list", "vm01").out.splitlines() if l.startswith("off1")]
             assert kind and "offline" in kind[0], f"list row {kind}"
             h.vmlab("vm", "start", "vm01", cwd=lab, timeout=300)
-            h.wait_ready(lab, "vm01", timeout=180)
+            # These are cold boots, not online restores. Use the harness's
+            # normal boot budget, including under shared-host load.
+            h.wait_ready(lab, "vm01")
+            got = get(h, lab, "vm01")
+            assert got == "off-before", f"before offline restore marker={got!r}"
             put(h, lab, "vm01", "off-after")
             h.vmlab("vm", "stop", "vm01", cwd=lab, timeout=180)
             h.wait_until(lambda: state(h, lab, "vm01") == "state=stopped", timeout=120, what="vm01 stopped")
@@ -159,7 +163,7 @@ def run(h):
             st = state(h, lab, "vm01")
             assert st == "state=stopped", f"after offline restore {st}"
             h.vmlab("vm", "start", "vm01", cwd=lab, timeout=300)
-            h.wait_ready(lab, "vm01", timeout=180)
+            h.wait_ready(lab, "vm01")
             got = get(h, lab, "vm01")
             assert got == "off-before", f"marker={got!r}"
             return True
