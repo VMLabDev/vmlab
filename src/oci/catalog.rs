@@ -12,6 +12,68 @@ use serde::Deserialize;
 
 use super::Registry;
 use super::auth::{self, Credential};
+use super::client::{MAX_JSON_BODY, MAX_LIST_BYTES, MAX_LIST_PAGES, bounded_body};
+
+// Provider reads share registry limits: 8 MiB/page, 32 MiB/list, 100 pages.
+// Count raw items, before filtering/deduplication, with a 10,000-item ceiling.
+const MAX_LIST_ITEMS: usize = 10_000;
+
+fn provider_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("vmlab-oci/1")
+        // No provider needs redirects. In particular, never replay a PAT on one.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?)
+}
+
+fn package_request(client: &reqwest::Client, url: &str, token: &str) -> Result<reqwest::Request> {
+    let url = reqwest::Url::parse(url)?;
+    let mut request = client.get(url.clone());
+    // Intentional GHCR PAT reuse is restricted to the GitHub API HTTPS origin.
+    if url.scheme() == "https"
+        && url.host_str() == Some("api.github.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+    {
+        request = request.bearer_auth(token);
+    }
+    Ok(request
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .build()?)
+}
+
+#[derive(Default)]
+struct ProviderBudget {
+    pages: usize,
+    bytes: usize,
+    items: usize,
+}
+
+impl ProviderBudget {
+    fn page(&mut self) -> Result<()> {
+        anyhow::ensure!(self.pages < MAX_LIST_PAGES, "provider page limit exceeded");
+        self.pages += 1;
+        Ok(())
+    }
+
+    async fn body(&mut self, response: reqwest::Response) -> Result<Vec<u8>> {
+        let body = bounded_body(response, MAX_JSON_BODY.min(MAX_LIST_BYTES - self.bytes)).await?;
+        self.bytes += body.len();
+        Ok(body)
+    }
+
+    fn items(&mut self, count: usize) -> Result<()> {
+        anyhow::ensure!(
+            count <= MAX_LIST_ITEMS - self.items,
+            "provider item limit exceeded"
+        );
+        self.items += count;
+        Ok(())
+    }
+}
 
 /// Full repository paths (`host/owner/.../name`) published under `namespace`,
 /// optionally filtered by leaf name. GHCR uses GitHub Packages, Docker Hub
@@ -60,10 +122,7 @@ async fn list_docker_hub(owner: &str, subpath: &str, query: Option<&str>) -> Res
     if !subpath.is_empty() {
         bail!("Docker Hub namespaces cannot contain a nested group (`{owner}/{subpath}`)");
     }
-    let client = reqwest::Client::builder()
-        .user_agent("vmlab-oci/1")
-        .build()
-        .context("cannot build Docker Hub client")?;
+    let client = provider_client()?;
     let mut request = client
         .get(format!(
             "https://hub.docker.com/v2/namespaces/{owner}/repositories"
@@ -76,7 +135,12 @@ async fn list_docker_hub(owner: &str, subpath: &str, query: Option<&str>) -> Res
     if !response.status().is_success() {
         bail!("Docker Hub namespace search returned {}", response.status());
     }
-    let page: DockerHubRepositories = response.json().await.context("parsing Docker Hub search")?;
+    // Hub search intentionally reads only its first page (at most 100 results).
+    let mut budget = ProviderBudget::default();
+    budget.page()?;
+    let page: DockerHubRepositories = serde_json::from_slice(&budget.body(response).await?)
+        .context("parsing Docker Hub search")?;
+    budget.items(page.results.len())?;
     Ok(page
         .results
         .into_iter()
@@ -108,10 +172,7 @@ struct GhPackage {
 }
 
 async fn list_ghcr(host: &str, owner: &str, subpath: &str) -> Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .user_agent("vmlab-oci/1")
-        .build()
-        .context("cannot build HTTP client")?;
+    let client = provider_client()?;
 
     // GitHub's package-list REST endpoint requires authentication even when
     // every result is public. When no credential is configured, enumerate the
@@ -156,17 +217,26 @@ async fn fetch_packages(
     kind: &str,
     owner: &str,
 ) -> Result<Option<Vec<String>>> {
-    let mut names = Vec::new();
-    let mut url = Some(format!(
+    let url = format!(
         "https://api.github.com/{kind}/{owner}/packages?package_type=container&per_page=100"
-    ));
+    );
+    fetch_packages_from(client, token, kind, owner, url).await
+}
+
+async fn fetch_packages_from(
+    client: &reqwest::Client,
+    token: &str,
+    kind: &str,
+    owner: &str,
+    start: String,
+) -> Result<Option<Vec<String>>> {
+    let mut names = Vec::new();
+    let mut budget = ProviderBudget::default();
+    let mut url = Some(start);
     while let Some(u) = url.take() {
+        budget.page()?;
         let resp = client
-            .get(&u)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
+            .execute(package_request(client, &u, token)?)
             .await
             .context("GitHub packages request failed")?;
         match resp.status() {
@@ -184,7 +254,9 @@ async fn fetch_packages(
             .get(reqwest::header::LINK)
             .and_then(|v| v.to_str().ok())
             .and_then(next_link);
-        let page: Vec<GhPackage> = resp.json().await.context("parsing GitHub packages list")?;
+        let page: Vec<GhPackage> = serde_json::from_slice(&budget.body(resp).await?)
+            .context("parsing GitHub packages list")?;
+        budget.items(page.len())?;
         names.extend(page.into_iter().map(|p| p.name));
         url = next;
     }
@@ -198,12 +270,20 @@ async fn fetch_public_packages(
     kind: &str,
     owner: &str,
 ) -> Result<Option<Vec<String>>> {
+    let url = format!("https://github.com/{kind}/{owner}/packages?ecosystem=container");
+    fetch_public_packages_from(client, url).await
+}
+
+async fn fetch_public_packages_from(
+    client: &reqwest::Client,
+    start: String,
+) -> Result<Option<Vec<String>>> {
     let mut names = Vec::new();
-    let mut url = Some(format!(
-        "https://github.com/{kind}/{owner}/packages?ecosystem=container"
-    ));
+    let mut budget = ProviderBudget::default();
+    let mut url = Some(start);
 
     while let Some(u) = url.take() {
+        budget.page()?;
         let response = client
             .get(&u)
             .send()
@@ -216,14 +296,13 @@ async fn fetch_public_packages(
             }
             _ => {}
         }
-        let body = response
-            .text()
-            .await
+        let body = String::from_utf8(budget.body(response).await?)
             .context("reading GitHub public packages page")?;
         let (page_names, next) = parse_public_packages_page(&body)?;
+        budget.items(page_names.len())?;
         names.extend(page_names);
         url = next.map(|next| {
-            if next.starts_with("https://") {
+            if next.starts_with("https://") || next.starts_with("http://") {
                 next
             } else {
                 format!("https://github.com{next}")
@@ -309,6 +388,185 @@ fn next_link(header: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn fake_provider(
+        status: &str,
+        headers: &str,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n{headers}\r\n{body}")
+            .replace("{SELF}", &url);
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            // Enough for the entire production page budget, without test-only limits.
+            for _ in 0..MAX_LIST_PAGES {
+                let accepted =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                        .await;
+                let Ok(Ok((mut socket, _))) = accepted else {
+                    break;
+                };
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 1024];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            requests
+        });
+        (url, task)
+    }
+
+    #[test]
+    fn pat_has_an_explicit_https_api_allow_list() {
+        let client = provider_client().unwrap();
+        for (url, allowed) in [
+            ("https://api.github.com/x", true),
+            ("https://api.github.com:443/x", true),
+            ("http://api.github.com/x", false),
+            ("https://api.github.com:444/x", false),
+            ("https://api.github.com.evil.example/x", false),
+            ("https://github.com/x", false),
+            ("https://user@api.github.com/x", false),
+        ] {
+            let request = package_request(&client, url, "fake-secret").unwrap();
+            assert_eq!(
+                request.headers().contains_key("authorization"),
+                allowed,
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_link_and_redirect_cannot_receive_pat() {
+        let client = provider_client().unwrap();
+        let (hostile, received) = fake_provider("200 OK", "Content-Length: 2\r\n", "[]").await;
+        let (source, first) = fake_provider(
+            "200 OK",
+            &format!("Content-Length: 2\r\nLink: <{hostile}>; rel=\"next\"\r\n"),
+            "[]",
+        )
+        .await;
+        fetch_packages_from(&client, "fake-secret", "orgs", "test", source)
+            .await
+            .unwrap();
+        for request in first
+            .await
+            .unwrap()
+            .into_iter()
+            .chain(received.await.unwrap())
+        {
+            assert!(!request.to_lowercase().contains("authorization:"));
+            assert!(!request.contains("fake-secret"));
+        }
+
+        let (hostile, received) = fake_provider("200 OK", "Content-Length: 2\r\n", "[]").await;
+        let (source, first) = fake_provider(
+            "302 Found",
+            &format!("Content-Length: 0\r\nLocation: {hostile}\r\n"),
+            "",
+        )
+        .await;
+        assert!(
+            fetch_packages_from(&client, "fake-secret", "orgs", "test", source)
+                .await
+                .is_err()
+        );
+        assert_eq!(first.await.unwrap().len(), 1);
+        assert!(received.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_reads_reject_declared_and_chunked_oversize() {
+        let client = provider_client().unwrap();
+        let large = "x".repeat(MAX_JSON_BODY + 1);
+        for (headers, body) in [
+            (
+                format!("Content-Length: {}\r\n", MAX_JSON_BODY + 1),
+                String::new(),
+            ),
+            (
+                "Transfer-Encoding: chunked\r\n".into(),
+                format!("{:x}\r\n{large}\r\n0\r\n\r\n", large.len()),
+            ),
+        ] {
+            let (url, task) = fake_provider("200 OK", &headers, &body).await;
+            let response = client.get(url).send().await.unwrap();
+            assert!(ProviderBudget::default().body(response).await.is_err());
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn endless_packages_stop_at_page_limit() {
+        let (source, task) = fake_provider(
+            "200 OK",
+            "Content-Length: 2\r\nLink: <{SELF}>; rel=\"next\"\r\n",
+            "[]",
+        )
+        .await;
+        let error = fetch_packages_from(
+            &provider_client().unwrap(),
+            "fake-secret",
+            "orgs",
+            "test",
+            source,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("page limit"));
+        assert_eq!(task.await.unwrap().len(), MAX_LIST_PAGES);
+    }
+
+    #[tokio::test]
+    async fn endless_public_pages_stop_at_page_limit() {
+        let html = "<a href=\"{SELF}\" rel=\"next\">Next</a>";
+        // Content-Length is computed after substituting the local server URL.
+        let (source, task) = fake_provider("200 OK", "", html).await;
+        let error = fetch_public_packages_from(&provider_client().unwrap(), source)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("page limit"));
+        assert_eq!(task.await.unwrap().len(), MAX_LIST_PAGES);
+    }
+
+    #[tokio::test]
+    async fn aggregate_byte_budget_is_enforced_on_the_stream() {
+        let mut budget = ProviderBudget {
+            bytes: MAX_LIST_BYTES - 2,
+            ..ProviderBudget::default()
+        };
+        let (url, task) = fake_provider(
+            "200 OK",
+            "Transfer-Encoding: chunked\r\n",
+            "3\r\nabc\r\n0\r\n\r\n",
+        )
+        .await;
+        let response = provider_client().unwrap().get(url).send().await.unwrap();
+        assert!(budget.body(response).await.is_err());
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn aggregate_items_and_bytes_are_bounded() {
+        let mut budget = ProviderBudget::default();
+        budget.items(MAX_LIST_ITEMS).unwrap();
+        assert!(budget.items(1).is_err());
+        assert_eq!(MAX_LIST_BYTES, 4 * MAX_JSON_BODY);
+    }
 
     #[test]
     fn splits_namespace_forms() {
