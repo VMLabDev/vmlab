@@ -182,6 +182,23 @@ impl InProcessFs {
         mem: &GuestMemory,
         chain: virtio_queue::DescriptorChain<&GuestMemory>,
     ) -> u32 {
+        // INIT advertises at most 1 MiB of payload. Include FUSE's 4 KiB
+        // header allowance, but bound both directions before constructing
+        // transport buffers: the header's length is not the chain length.
+        let limit = self.fs.request_limit() as u64;
+        let mut readable = 0u64;
+        let mut writable = 0u64;
+        for desc in chain.clone() {
+            let total = if desc.is_write_only() {
+                &mut writable
+            } else {
+                &mut readable
+            };
+            *total += u64::from(desc.len());
+            if *total > limit {
+                return 0;
+            }
+        }
         let Ok(reader) = Reader::from_descriptor_chain(mem, chain.clone()) else {
             return 0;
         };
@@ -593,7 +610,10 @@ mod tests {
             let mut f = Fixture::new(false);
             f.request(Opcode::Lookup, 1, b"hello.txt\0");
             let oversized = (1 << 20) + 4097;
-            f.chain(if writable { 50 } else { oversized }, if writable { oversized } else { 256 });
+            f.chain(
+                if writable { 50 } else { oversized },
+                if writable { oversized } else { 256 },
+            );
             f.submit();
             assert_eq!(f.used_slot(0).2, 0);
         }

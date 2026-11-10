@@ -26,7 +26,9 @@ vmlab runs machines on QEMU/KVM, driven directly over QMP — no libvirt — and
 
 - **Performance.** The userspace network fabric will not approach tap/bridge throughput. Acceptable for v1; vhost-user or tap backends are future optimisations.
 - **Multi-host scheduling.** vmlab runs VMs on one host. The only cross-host feature is attaching a network segment to a peer daemon (§9.4); placing or migrating VMs across hosts is out of scope.
-- **Security isolation / multi-tenancy.** vmlab is a lab tool for a single trusted user. It is not a security boundary and makes no hardening claims.
+- **Multi-tenancy.** vmlab is a lab tool for a single trusted host user, not a multi-tenant service. Guest input and pulled templates are untrusted.
+
+  Guest-to-host channels must validate messages and bound resource use. Shares must confine guest access to the declared host directory and enforce read-only declarations. Pulled templates, including their metadata and disk contents, must be treated as untrusted input rather than authority to access host resources. This does not isolate X11 shared apps from the host desktop: opting into the X11 app-share transport grants the desktop access described in ADR-0016.
 - **libvirt compatibility.** No domain XML, no virsh interop.
 - **Hypervisors other than QEMU/KVM and vmlab-hv.** vmlab runs machines on QEMU and, machine by machine, on its own hypervisor vmlab-hv (§22, ADR-0021); it does not drive Xen, Hyper-V, VirtualBox, cloud-hypervisor or any other.
 
