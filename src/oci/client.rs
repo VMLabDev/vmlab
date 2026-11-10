@@ -1299,8 +1299,25 @@ impl HttpTransport {
             && url.password().is_none()
     }
 
-    /// Login uses the same destination policy as registry requests, and
-    /// rejects token realms outside the configured registry origin.
+    fn challenge_source(&self, url: &reqwest::Url, redirected: bool) -> bool {
+        !redirected && self.credential_url(url)
+    }
+
+    fn apply_auth_policy(&self, req: &mut reqwest::Request, token_realm: bool, redirected: bool) {
+        let url = req.url();
+        let allowed = !redirected
+            && (self.credential_url(url)
+                || (token_realm
+                    && url.scheme() == "https"
+                    && url.username().is_empty()
+                    && url.password().is_none()));
+        if !allowed {
+            req.headers_mut().remove(reqwest::header::AUTHORIZATION);
+        }
+    }
+
+    /// Login also permits a separate HTTPS token realm named directly by
+    /// the configured HTTPS registry, never by a redirected response.
     pub(super) async fn validate_login(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.url("/v2/"))?;
         anyhow::ensure!(self.credential_url(&url), "registry login requires HTTPS");
@@ -1308,16 +1325,17 @@ impl HttpTransport {
             .credential
             .basic_header()
             .ok_or_else(|| anyhow!("missing login credential"))?;
-        let resp = self
+        let (resp, redirected) = self
             .send_request(
                 self.client
                     .get(url)
                     .header(reqwest::header::AUTHORIZATION, basic)
                     .build()?,
+                false,
             )
             .await?;
         anyhow::ensure!(
-            self.credential_url(resp.url()),
+            self.challenge_source(resp.url(), redirected),
             "login redirected outside the registry origin"
         );
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -1329,10 +1347,12 @@ impl HttpTransport {
                 .ok_or_else(|| anyhow!("login failed: registry rejected the credential"))?;
             let realm = reqwest::Url::parse(&challenge.realm)?;
             anyhow::ensure!(
-                self.credential_url(&realm),
-                "login token realm must use HTTPS on the registry origin"
+                realm.scheme() == "https"
+                    && realm.username().is_empty()
+                    && realm.password().is_none(),
+                "login token realm must use HTTPS without URL credentials"
             );
-            self.fetch_token(&challenge).await?;
+            self.fetch_token(&challenge, true).await?;
         } else {
             anyhow::ensure!(
                 resp.status().is_success(),
@@ -1344,18 +1364,22 @@ impl HttpTransport {
     }
 
     /// Follow download redirects explicitly, rechecking the destination on
-    /// every hop. Registry credentials never reach a CDN or an HTTP URL.
-    async fn send_request(&self, mut req: reqwest::Request) -> Result<reqwest::Response> {
-        for _ in 0..10 {
-            if !self.credential_url(req.url()) {
-                req.headers_mut().remove(reqwest::header::AUTHORIZATION);
-            }
+    /// every hop. `token_realm` is only for the first request to a realm
+    /// named in a direct 401 from the configured HTTPS registry. No
+    /// credentials survive a redirect, including a same-origin redirect.
+    async fn send_request(
+        &self,
+        mut req: reqwest::Request,
+        token_realm: bool,
+    ) -> Result<(reqwest::Response, bool)> {
+        for hop in 0..10 {
+            self.apply_auth_policy(&mut req, token_realm, hop != 0);
             let saved = req
                 .try_clone()
                 .ok_or_else(|| anyhow!("request cannot be replayed"))?;
             let resp = self.client.execute(req).await?;
             if !resp.status().is_redirection() {
-                return Ok(resp);
+                return Ok((resp, hop != 0));
             }
             if saved.method() != reqwest::Method::GET && saved.method() != reqwest::Method::HEAD {
                 bail!("registry redirected a non-download request");
@@ -1393,7 +1417,7 @@ impl HttpTransport {
             } else if let Some(basic) = self.credential.basic_header() {
                 req = req.header(reqwest::header::AUTHORIZATION, basic);
             }
-            let resp = match self.send_request(req.build()?).await {
+            let (resp, redirected) = match self.send_request(req.build()?, false).await {
                 Ok(r) => r,
                 Err(e)
                     if attempt < MAX_RETRIES
@@ -1412,7 +1436,8 @@ impl HttpTransport {
                     .and_then(|v| v.to_str().ok())
                     .and_then(auth::parse_bearer_challenge)
             {
-                let token = self.fetch_token(&challenge).await?;
+                let trusted_source = self.challenge_source(resp.url(), redirected);
+                let token = self.fetch_token(&challenge, trusted_source).await?;
                 self.tokens.lock().await.insert(scope.to_string(), token);
                 // Retry now that we have a token.
                 if attempt < MAX_RETRIES {
@@ -1428,9 +1453,11 @@ impl HttpTransport {
         }
     }
 
-    /// Exchange a Bearer challenge for a token, GETting the realm with basic
-    /// auth when a credential is available (anonymous otherwise).
-    async fn fetch_token(&self, challenge: &BearerChallenge) -> Result<String> {
+    fn token_request(
+        &self,
+        challenge: &BearerChallenge,
+        trusted_source: bool,
+    ) -> Result<reqwest::Request> {
         let mut req = self.client.get(&challenge.realm);
         let mut query = Vec::new();
         if let Some(service) = &challenge.service {
@@ -1442,11 +1469,26 @@ impl HttpTransport {
         if !query.is_empty() {
             req = req.query(&query);
         }
-        if let Some(basic) = self.credential.basic_header() {
+        if trusted_source && let Some(basic) = self.credential.basic_header() {
             req = req.header(reqwest::header::AUTHORIZATION, basic);
         }
-        let resp = self
-            .send_request(req.build()?)
+        let mut req = req.build()?;
+        self.apply_auth_policy(&mut req, trusted_source, false);
+        Ok(req)
+    }
+
+    /// Only a direct challenge from the HTTPS registry delegates Basic
+    /// credentials to a separate HTTPS realm. Redirects cannot delegate.
+    async fn fetch_token(
+        &self,
+        challenge: &BearerChallenge,
+        trusted_source: bool,
+    ) -> Result<String> {
+        let (resp, _) = self
+            .send_request(
+                self.token_request(challenge, trusted_source)?,
+                trusted_source,
+            )
             .await
             .context("token request failed")?;
         if !resp.status().is_success() {
@@ -1849,6 +1891,99 @@ mod tests {
         assert!(transport.credential_url(&"https://registry.example/token".parse().unwrap()));
     }
 
+    #[test]
+    fn docker_hub_https_challenge_delegates_credentials_only_to_its_realm() {
+        let transport = private_transport("registry-1.docker.io");
+        let source = "https://registry-1.docker.io/v2/library/alpine/manifests/latest"
+            .parse()
+            .unwrap();
+        let challenge = BearerChallenge {
+            realm: "https://auth.docker.io/token".into(),
+            service: Some("registry.docker.io".into()),
+            scope: Some("repository:library/alpine:pull".into()),
+        };
+        let trusted = transport.challenge_source(&source, false);
+        assert!(trusted);
+        let request = transport.token_request(&challenge, trusted).unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            transport.credential.basic_header().unwrap().as_str()
+        );
+        assert_eq!(request.url().host_str(), Some("auth.docker.io"));
+        assert!(request.url().query().unwrap().contains("scope=repository"));
+
+        // Link and upload Location requests do not get realm delegation.
+        let mut ordinary = transport
+            .client
+            .get(&challenge.realm)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                transport.credential.basic_header().unwrap(),
+            )
+            .build()
+            .unwrap();
+        transport.apply_auth_policy(&mut ordinary, false, false);
+        assert!(
+            !ordinary
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+    }
+
+    #[test]
+    fn insecure_foreign_or_redirected_challenges_cannot_delegate_credentials() {
+        let transport = private_transport("registry-1.docker.io");
+        let challenge = BearerChallenge {
+            realm: "https://auth.docker.io/token".into(),
+            service: None,
+            scope: None,
+        };
+        for (source, redirected) in [
+            ("https://registry-1.docker.io/v2/", true),
+            ("https://foreign.example/v2/", false),
+            ("http://registry-1.docker.io/v2/", false),
+        ] {
+            let trusted = transport.challenge_source(&source.parse().unwrap(), redirected);
+            assert!(!trusted);
+            let request = transport.token_request(&challenge, trusted).unwrap();
+            assert!(
+                !request
+                    .headers()
+                    .contains_key(reqwest::header::AUTHORIZATION)
+            );
+        }
+        let insecure = BearerChallenge {
+            realm: "http://auth.docker.io/token".into(),
+            service: None,
+            scope: None,
+        };
+        assert!(
+            !transport
+                .token_request(&insecure, true)
+                .unwrap()
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+
+        for target in [
+            "https://auth.docker.io/redirected",
+            "https://other.example/token",
+            "http://auth.docker.io/token",
+        ] {
+            let mut request = transport.token_request(&challenge, true).unwrap();
+            *request.url_mut() = target.parse().unwrap();
+            transport.apply_auth_policy(&mut request, true, true);
+            assert!(
+                !request
+                    .headers()
+                    .contains_key(reqwest::header::AUTHORIZATION)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn login_refuses_plain_http_before_sending_a_credential() {
         let transport = private_transport("127.0.0.1:1");
@@ -1878,7 +2013,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            bounded_body(transport.send_request(req).await.unwrap(), 2)
+            bounded_body(transport.send_request(req, false).await.unwrap().0, 2)
                 .await
                 .unwrap(),
             b"ok"
@@ -1907,11 +2042,14 @@ mod tests {
         let transport = private_transport("registry.example");
         assert_eq!(
             transport
-                .fetch_token(&BearerChallenge {
-                    realm,
-                    service: None,
-                    scope: None
-                })
+                .fetch_token(
+                    &BearerChallenge {
+                        realm,
+                        service: None,
+                        scope: None
+                    },
+                    true
+                )
                 .await
                 .unwrap(),
             "ok"

@@ -188,10 +188,13 @@ page guide_registries {
 
   p <<DOC
     Basic credentials and Bearer tokens are sent only over HTTPS to the
-    configured registry host and port. A challenge realm, pagination link,
-    upload location or download redirect on another origin receives no
-    credentials. Registries requiring login at a separate token host are
-    not supported. Plain HTTP loopback registries work anonymously only.
+    configured registry host and port. There is one exception: Basic
+    credentials may go to a separate HTTPS token realm named by a direct
+    401 challenge from that HTTPS registry, as Docker Hub requires. A
+    challenge received after a redirect cannot delegate credentials. A
+    pagination link or upload location on another origin gets no credentials,
+    and no credentials survive a redirect, including a token realm redirect.
+    Plain HTTP loopback registries work anonymously only.
     Registry JSON responses are limited to 8 MiB, in-memory blobs to 1 GiB,
     streamed blobs to 8 GiB, and decompressed template chunks to 1 GiB
     (with a 128 MiB zstd window). Larger custom chunks must be republished
