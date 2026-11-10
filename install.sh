@@ -67,8 +67,16 @@ err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 warn() { printf '\nwarning: %s\n' "$1" >&2; }
 
 usage() {
-  # The header comment, up to the first blank line.
-  sed -n '2,/^$/p' "$0" | sed -n 's/^# \{0,1\}//p'
+  printf '%s\n' \
+    'Usage: install.sh [--version X | --pre] [options]' \
+    '  --bin-dir DIR       binary destination (default ~/.local/bin)' \
+    '  --guest-dir DIR     guest assets destination' \
+    '  --no-guest          binary only' \
+    '  --fastpath          request eBPF capabilities (privileged)' \
+    '  --no-fastpath       do not request capabilities' \
+    '  --skip-checks       skip runtime tool checks' \
+    '  --insecure-skip-signature  unsafe: skip cosign, still check SHA256SUMS' \
+    '  --help              show this help'
   exit "${1:-0}"
 }
 
@@ -109,9 +117,14 @@ esac
 if command -v curl >/dev/null 2>&1; then
   http_get()      { curl -fsSL "$1"; }
   download_file() { curl -fsSL -o "$2" "$1"; }
+  latest_url() { curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest"; }
 elif command -v wget >/dev/null 2>&1; then
   http_get()      { wget -qO- "$1"; }
   download_file() { wget -qO "$2" "$1"; }
+  latest_url() {
+    wget --server-response -O /dev/null "https://github.com/$REPO/releases/latest" 2>&1 |
+      sed -n 's/^[[:space:]]*[Ll]ocation: \([^[:space:]]*\).*/\1/p' | tail -n1
+  }
 else
   err "need curl or wget on PATH"
 fi
@@ -144,6 +157,12 @@ elif [ "$PRE" -eq 1 ]; then
   [ -n "$tag" ] || err "could not find any release for $REPO"
 else
   tag="$(http_get "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | first_tag || true)"
+  if [ -z "$tag" ]; then
+    resolved="$(latest_url 2>/dev/null || true)"
+    case "$resolved" in
+      https://github.com/"$REPO"/releases/tag/v*) tag="${resolved##*/}" ;;
+    esac
+  fi
   [ -n "$tag" ] || err "no stable release published yet.
 vmlab is pre-release only for now — re-run with --pre to get the newest pre-release:
   curl -fsSL https://vmlab.io/install.sh | sh -s -- --pre
@@ -199,7 +218,7 @@ download_file "$url" "$tmp" || err "download failed: $url
 The release may not exist or may lack a $suffix asset. See https://github.com/$REPO/releases"
 verify_asset "$asset" "$tmp"
 
-[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
 chmod +x "$tmp"
 mkdir -p "$BIN_DIR"
 # Whether the binary being replaced had the fast path's capabilities: the new
@@ -210,8 +229,8 @@ if have getcap && [ -f "$BIN_DIR/vmlab" ]; then
     *cap_bpf*) HAD_CAPS=1 ;;
   esac
 fi
-[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || { echo "VML-88: BIN_DIR is empty or /" >&2; exit 1; }
-[ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
+[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
 mv "$tmp" "$BIN_DIR/vmlab"
 
 printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
