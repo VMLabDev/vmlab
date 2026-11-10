@@ -110,6 +110,7 @@ stage_rust() {
     log "rust: installing rustup"
     local tmp
     tmp="$(mktemp -d)"
+    [ -n "$tmp" ] && [ -d "$tmp" ] || die "missing rustup staging directory"
     fetch_pinned "$RUSTUP_URL" "$tmp/rustup-init" "$RUSTUP_SHA256"
     chmod +x "$tmp/rustup-init"
     "$tmp/rustup-init" -y --profile minimal --default-toolchain none
@@ -242,6 +243,7 @@ stage_just() {
   log "just: installing into $bin"
   mkdir -p "$bin"
   tmp="$(mktemp -d)"
+  [ -n "$tmp" ] && [ -d "$tmp" ] || die "missing just staging directory"
   fetch_pinned "$JUST_URL" "$tmp/just.tar.gz" "$JUST_SHA256"
   tar -xzf "$tmp/just.tar.gz" -C "$tmp" just
   install -m 0755 "$tmp/just" "$bin/just"
