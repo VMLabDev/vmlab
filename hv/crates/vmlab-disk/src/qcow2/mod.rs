@@ -1280,6 +1280,21 @@ impl DiskImage for Qcow2Image {
     }
 }
 
+/// Closing an image writes its cached metadata. Data clusters are written at
+/// once, but the L2 and refcount updates that map them wait in the caches
+/// until a flush. Without this, an owner that drops the image without
+/// `flush` leaves the data in the file but unmapped (VML-107).
+///
+/// This is best effort, like `BufWriter`: an error is dropped and nothing is
+/// synced. Call [`DiskImage::flush`] to see errors and for durability.
+impl Drop for Qcow2Image {
+    fn drop(&mut self) {
+        if !self.read_only {
+            let _ = self.flush_metadata();
+        }
+    }
+}
+
 fn l1_size_as_clusters(l1_size: u32, cluster_size: u64) -> u64 {
     ((l1_size as u64) * 8).div_ceil(cluster_size).max(1)
 }

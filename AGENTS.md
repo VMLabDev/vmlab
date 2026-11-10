@@ -17,13 +17,22 @@ just ci::check
   full checkout (no `--depth`: `win3d-check` needs the history), under
   `systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0`, with
   `CARGO_BUILD_JOBS=4` (or less) and `VMLAB_SKIP_UPDATES=1`.
-- Slots: N = 2. At most two validation runs at once on the target; a third
-  queues (`validation:queued`) until one ends.
-- Pass: every recipe of `ci::check` exits 0. Record the exit code and the
-  pass and fail counts on the card, and push the results with
-  `terrarium test push`.
+- Who runs it (operator, 2026-11-07): the worker runs it itself on its
+  target against its pushed commit before it moves the card to `review`, and
+  puts the command, the commit, the exit code and the pass count in the move
+  comment. There is no `validating` column and no `terrarium card validate`
+  for card work. Persistent target dirs: set
+  `VMLAB_TARGET_ROOT=/var/build/cache/vmlab/<you>` so a rerun is fast.
+- The merge queue runs the same command on each batch merged onto `next`
+  (one `terrarium card merge A B C ...` job); its two slots serve merges only.
+- Pass: every recipe of `ci::check` exits 0. Push the test results with
+  `terrarium test push --card <id>`.
 - A known flaky test that fails once is rerun alone before the run counts as
-  failed; name it on the card.
+  failed; name it on the card. Red again: fix it, or move the card to
+  `blocked` with the output tail.
+- Every shell script you write or run: `set -eu`, and refuse an empty or `/`
+  path before `cp`, `rsync`, `mv` or `rm` (`just ci::shell-paths` checks the
+  tracked ones).
 
 ## Branches
 

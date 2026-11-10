@@ -648,6 +648,29 @@ impl VmShared {
         self.snapshot.lock().clone()
     }
 
+    /// Flush every writable disk: cached qcow2 metadata (L2 tables, refcount
+    /// blocks) goes to the file, then the file is synced. The stop paths call
+    /// this after the vCPUs are joined. Without it, writes made after the
+    /// guest's last FLUSH leave their data clusters in the file but unmapped
+    /// (VML-107). Returns the disks that failed, with the error.
+    pub(crate) fn flush_disks(&self) -> Vec<(String, vmlab_disk::Error)> {
+        let Some(registry) = self.snapshot_registry() else {
+            return Vec::new();
+        };
+        registry
+            .disks
+            .iter()
+            .filter(|disk| disk.writable)
+            .filter_map(|disk| {
+                disk.image
+                    .lock()
+                    .flush()
+                    .err()
+                    .map(|error| (disk.id.clone(), error))
+            })
+            .collect()
+    }
+
     /// Guest RAM, when the machine is assembled.
     pub(crate) fn ram(&self) -> Option<Arc<GuestRam>> {
         self.ram.lock().clone()
@@ -1531,6 +1554,9 @@ impl Vm {
     pub fn wait(mut self) -> ExitReason {
         let mut reason = self.shared.wait_exit();
         self.join_workers();
+        for (id, error) in self.shared.flush_disks() {
+            reason.cleanup_error(&format!("disk {id} flush at VM exit"), &error);
+        }
         if let Some(flash) = self.shared.pflash.lock().as_ref()
             && let Err(error) = flash.lock().flush()
         {
@@ -1589,6 +1615,11 @@ impl Drop for Vm {
         self.shared
             .finalized
             .store(true, std::sync::atomic::Ordering::Release);
+        if !finished {
+            for (id, error) in self.shared.flush_disks() {
+                log::error!("disk {id} flush while dropping VM: {error}");
+            }
+        }
         if !finished
             && let Some(flash) = self.shared.pflash.lock().as_ref()
             && let Err(error) = flash.lock().flush()
