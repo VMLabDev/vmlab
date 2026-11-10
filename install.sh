@@ -29,7 +29,7 @@
 # The guest assets — the container micro-VM kernel/initramfs, every in-guest
 # agent build and the UEFI firmware vmlab boots its VMs with (OVMF/AAVMF,
 # secure boot included) — come from the same release as the binary
-# (vmlab-guest-<version>.tar.gz, checked against its .sha256) and replace
+# (vmlab-guest-<version>.tar.gz, checked against signed SHA256SUMS) and replace
 # whatever an older install left in the guest directory. A release without
 # them, or a failed download, costs only the guest assets: the binary stays.
 #
@@ -139,6 +139,11 @@ See $( printf 'https://github.com/%s/releases' "$REPO" )"
 fi
 
 ver="${tag#v}"
+case "$ver" in
+  ''|*[!0-9A-Za-z.-]*) err "invalid release version" ;;
+esac
+have cosign || err "need cosign (v2.6.1 or newer) on PATH to verify release signatures; install it from https://docs.sigstore.dev/cosign/system_config/installation/"
+have sha256sum || err "need sha256sum on PATH to verify release assets"
 asset="vmlab-${ver}-${suffix}"
 BASE_URL="${BASE_URL%/}"
 url="$BASE_URL/$tag/$asset"
@@ -146,10 +151,33 @@ url="$BASE_URL/$tag/$asset"
 # ── Download + install ──────────────────────────────────────────────────────
 printf 'Installing vmlab %s to %s\n' "$ver" "$BIN_DIR"
 
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT INT TERM
+verify_dir="$(mktemp -d)"
+[ -n "$verify_dir" ] && [ "$verify_dir" != / ] || err "unsafe verification directory"
+cleanup_release() {
+  [ -n "$verify_dir" ] && [ "$verify_dir" != / ] || return 1
+  rm -rf "$verify_dir"
+}
+trap cleanup_release EXIT INT TERM
+download_file "$BASE_URL/$tag/SHA256SUMS" "$verify_dir/SHA256SUMS" || err "release has no checksum manifest"
+download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" || err "release has no signature bundle"
+cosign verify-blob --bundle "$verify_dir/SHA256SUMS.bundle" \
+  --certificate-identity 'https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  "$verify_dir/SHA256SUMS" || err "release signature verification failed"
+
+verify_asset() {
+  # Match one exact basename, never interpret paths supplied by a manifest.
+  want="$(awk -v name="$1" '$2 == name && NF == 2 {print $1}' "$verify_dir/SHA256SUMS")"
+  [ "${#want}" -eq 64 ] || err "missing or duplicate checksum for $1"
+  case "$want" in *[!0-9a-f]*) err "invalid checksum for $1" ;; esac
+  got="$(sha256sum "$2" | cut -d' ' -f1)"
+  [ "$want" = "$got" ] || err "checksum mismatch for $1"
+}
+
+tmp="$verify_dir/$asset"
 download_file "$url" "$tmp" || err "download failed: $url
 The release may not exist or may lack a $suffix asset. See https://github.com/$REPO/releases"
+verify_asset "$asset" "$tmp"
 
 [ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
 chmod +x "$tmp"
@@ -165,7 +193,6 @@ fi
 [ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || { echo "VML-88: BIN_DIR is empty or /" >&2; exit 1; }
 [ -n "$tmp" ] && [ "$tmp" != / ] || { echo "VML-88: tmp is empty or /" >&2; exit 1; }
 mv "$tmp" "$BIN_DIR/vmlab"
-trap - EXIT INT TERM
 
 printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
 
@@ -266,16 +293,6 @@ a lab container and a template build both do. Build them from source instead:
   git clone https://github.com/$REPO && cd vmlab && just guest-install"
 }
 
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | cut -d' ' -f1
-  else
-    return 1
-  fi
-}
-
 install_guest() {
   gname="vmlab-guest-${ver}.tar.gz"
   gurl="$BASE_URL/$tag/$gname"
@@ -288,22 +305,19 @@ install_guest() {
     || { guest_fallback "cannot create a staging directory in $gparent"; return 0; }
   [ -n "$gtmp" ] && [ -d "$gtmp" ] && [ "$gtmp" != / ] \
     || { guest_fallback "the staging directory in $gparent is missing"; return 0; }
-  trap 'rm -rf "$gtmp"' EXIT INT TERM
-
-  if ! download_file "$gurl" "$gtmp/$gname" || ! download_file "$gurl.sha256" "$gtmp/$gname.sha256"; then
-    guest_fallback "could not download $gurl (or its .sha256) — releases before the guest bundle do not carry one."
-    return 0
-  fi
-
-  want="$(sed -n '1s/^\([0-9a-fA-F]\{64\}\).*/\1/p' "$gtmp/$gname.sha256")"
-  got="$(sha256_of "$gtmp/$gname")" || {
-    guest_fallback "need sha256sum or shasum to verify $gname; refusing to install it unverified."
-    return 0
+  cleanup_guest() {
+    [ -n "$gtmp" ] && [ "$gtmp" != / ] || return 1
+    rm -rf "$gtmp"
+    cleanup_release
   }
-  if [ -z "$want" ] || [ "$want" != "$got" ]; then
-    guest_fallback "checksum mismatch for $gname (expected ${want:-nothing}, got $got); refusing to install it."
+  trap cleanup_guest EXIT INT TERM
+
+  if ! download_file "$gurl" "$gtmp/$gname"; then
+    guest_fallback "could not download $gurl."
     return 0
   fi
+
+  verify_asset "$gname" "$gtmp/$gname"
 
   mkdir "$gtmp/new"
   if ! tar -xzf "$gtmp/$gname" -C "$gtmp/new" || [ ! -d "$gtmp/new/agent" ]; then
@@ -323,7 +337,7 @@ install_guest() {
     return 0
   fi
   rm -rf "$gtmp"
-  trap - EXIT INT TERM
+  trap cleanup_release EXIT INT TERM
 
   printf 'Installed guest assets: %s\n' "$(ls "$GUEST_DIR" | tr '\n' ' ')"
 
