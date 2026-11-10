@@ -10,17 +10,17 @@ In the vmlab-owned full copy of the pushed release commit on helios, run:
 set -eu
 . ~/.cargo/env
 export PATH="$HOME/.local/bin:$PATH"
-export CARGO_BUILD_JOBS=4 VMLAB_SKIP_UPDATES=1
+export VMLAB_SKIP_UPDATES=1
 export VMLAB_TARGET_ROOT=/var/build/cache/vmlab/lead
 cd "$VMLAB_TARGET_ROOT/src"
-systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 \
-  ionice -c3 nice -n19 just ci::hv-gate
+/var/build/cache/vmlab/bin/heavy just ci::hv-gate
 ```
 
 Use `terrarium run vmlab-helios-vmlab --name release-hv-gate -- sh -c '<script above>'`
 to retain the log. Record the release branch, exact commit, command, exit
 code, passed/failed/ignored counts and run ID on the release card. Only then
-start the release e2e. Keep one heavy run at a time and obey target GPU and
+start the release e2e. The wrapper waits for a shared heavy-run slot and
+applies the target resource limits. Obey target GPU and
 VFIO reservations. In particular, no GPU use before 14:15 UTC on 2026-11-10.
 
 `hv-nightly.yml` runs the same gate on `next` at 02:30 UTC on GitHub-hosted
