@@ -29,6 +29,10 @@ fn provider_client() -> Result<reqwest::Client> {
 
 fn package_request(client: &reqwest::Client, url: &str, token: &str) -> Result<reqwest::Request> {
     let url = reqwest::Url::parse(url)?;
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "provider URL must not contain credentials"
+    );
     let mut request = client.get(url.clone());
     // Intentional GHCR PAT reuse is restricted to the GitHub API HTTPS origin.
     if url.scheme() == "https"
@@ -439,7 +443,6 @@ mod tests {
             ("https://api.github.com:444/x", false),
             ("https://api.github.com.evil.example/x", false),
             ("https://github.com/x", false),
-            ("https://user@api.github.com/x", false),
         ] {
             let request = package_request(&client, url, "fake-secret").unwrap();
             assert_eq!(
@@ -448,6 +451,7 @@ mod tests {
                 "{url}"
             );
         }
+        assert!(package_request(&client, "https://user@api.github.com/x", "fake-secret").is_err());
     }
 
     #[tokio::test]
