@@ -596,6 +596,10 @@ impl E1000 {
             self.wire.data_out = self.wire.out >> self.wire.out_bits & 1 != 0;
             return;
         }
+        // Non-read commands have no further input bits until CS drops.
+        if self.wire.count >= 9 {
+            return;
+        }
         let bit = u32::from(value & EECD_DI != 0);
         if self.wire.count == 0 && bit == 0 {
             // Waiting for the start bit.
@@ -985,9 +989,13 @@ impl E1000 {
         let mut written = 0usize;
         let mut index = head;
         while written < frame.len() {
-            let address = GuestAddress(base.wrapping_add(u64::from(index) * 16));
+            let Some(address) = GuestAddress(base).checked_add(u64::from(index) * 16) else {
+                return true;
+            };
             let mut desc = [0u8; 16];
-            let _ = self.memory.read_slice(&mut desc[..8], address);
+            if self.memory.read_slice(&mut desc[..8], address).is_err() {
+                return true;
+            }
             let buffer = u64::from_le_bytes(desc[..8].try_into().unwrap());
             let chunk = (frame.len() - written).min(size);
             let _ = self
@@ -1405,7 +1413,13 @@ impl Snapshot for E1000 {
     fn restore_state(&mut self, state: &[u8]) -> Result<(), DeviceError> {
         let saved: Saved =
             serde_json::from_slice(state).map_err(|e| DeviceError::State(e.to_string()))?;
-        if saved.version != 1 || saved.config.len() != 256 || saved.phy.len() != 32 {
+        if saved.version != 1
+            || saved.config.len() != 256
+            || saved.phy.len() != 32
+            || saved.wire.count > 9
+            || saved.wire.out_bits > 16
+            || saved.wire.address >= 64
+        {
             return Err(DeviceError::State("invalid e1000 state".into()));
         }
         let mut regs = vec![0; self.regs.len()];

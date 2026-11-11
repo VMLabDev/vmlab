@@ -633,15 +633,15 @@ impl Snapshot for Fs {
         // The callers pause the vCPUs first, so no kick can race the stop.
         inner.quiesce();
         let mut bases = Vec::with_capacity(inner.vrings.len());
-        for index in 0..inner.vrings.len() {
-            bases.push(
-                inner
-                    .vu
-                    .get_vring_base(index)
-                    .map_err(|e| DeviceError::State(format!("vhost-user GET_VRING_BASE: {e}")))?,
-            );
-        }
-        let state = inner.save_backend_state()?;
+        let state =
+            (|| {
+                for index in 0..inner.vrings.len() {
+                    bases.push(inner.vu.get_vring_base(index).map_err(|e| {
+                        DeviceError::State(format!("vhost-user GET_VRING_BASE: {e}"))
+                    })?);
+                }
+                inner.save_backend_state()
+            })();
         // The machine continues after the snapshot: re-arm with the saved
         // bases, exactly where the queues stopped.
         for (index, base) in bases.iter().enumerate() {
@@ -649,6 +649,8 @@ impl Snapshot for Fs {
         }
         inner.enable_vrings()?;
         inner.start_worker()?;
+        // Resume the live device even when backend serialization failed.
+        let state = state?;
 
         out.push(1);
         out.extend_from_slice(&inner.acked_features.to_le_bytes());
@@ -778,6 +780,7 @@ mod tests {
         /// The bytes each load transfer delivered.
         device_state_loads: Vec<Vec<u8>>,
         check_device_state: usize,
+        fail_check_device_state: bool,
         kicks: BTreeMap<usize, u64>,
         unexpected: Vec<String>,
     }
@@ -1080,6 +1083,10 @@ mod tests {
                 }
                 req::CHECK_DEVICE_STATE => {
                     log.lock().check_device_state += 1;
+                    if log.lock().fail_check_device_state {
+                        send_u64_reply(&mut stream, received.code, 1);
+                        continue;
+                    }
                 }
                 other => {
                     log.lock()
@@ -1479,6 +1486,34 @@ mod tests {
         assert_eq!(log2.check_device_state, 1);
         assert_eq!(log2.vring_base, BTreeMap::from([(0, 7), (1, 7)]));
         assert_eq!(log2.enabled, vec![(0, true), (1, true)]);
+    }
+
+    #[test]
+    fn failed_snapshot_rearms_rings_and_restarts_worker() {
+        let backend = FakeBackend::new("save-error").serve();
+        let mem = shared_guest_memory();
+        let mut fs = Fs::new("fs-scratch", backend.config()).unwrap();
+        fs.ack_features(1 << 32);
+        fs.activate(
+            mem.clone(),
+            Arc::new(RecInterrupt::default()),
+            ready_queues(&mem, 128),
+        )
+        .unwrap();
+        backend.log.lock().fail_check_device_state = true;
+        assert!(fs.save_state().is_err());
+        assert!(fs.inner.lock().worker.is_some());
+        fs.queue_notify(1);
+        eventually(2, || {
+            backend.log.lock().kicks.get(&1).copied().unwrap_or(0) >= 1
+        });
+        drop(fs);
+        let log = backend.join();
+        let log = log.lock();
+        assert_eq!(
+            log.enabled.iter().filter(|(_, enabled)| *enabled).count(),
+            4
+        );
     }
 
     #[test]

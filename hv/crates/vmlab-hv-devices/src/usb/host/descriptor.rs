@@ -120,6 +120,16 @@ impl Deref for InterfaceDescriptorTree {
 /// Given `data` containing a full set of descriptors as provided by the Linux kernel
 /// usbdevfs `descriptors` file, parse the descriptors into a tree data structure.
 pub fn parse_usbfs_descriptors(data: &[u8]) -> Result<DeviceDescriptorTree> {
+    // Validate all declared extents, including unknown/trailing descriptors.
+    // The tree search below may stop before visiting those records.
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let length = usize::from(*remaining.first().ok_or(Error::DescriptorParse)?);
+        if length < size_of::<DescriptorHeader>() || length > remaining.len() {
+            return Err(Error::DescriptorParse);
+        }
+        remaining = &remaining[length..];
+    }
     let mut offset = 0;
 
     // Find the next descriptor of type T and return it and its offset.
@@ -304,5 +314,17 @@ mod tests {
     fn parse_rejects_truncated_input() {
         assert!(parse_usbfs_descriptors(&[]).is_err());
         assert!(parse_usbfs_descriptors(MASS_STORAGE[..20].try_into().unwrap()).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_declared_lengths_even_in_trailing_descriptors() {
+        for tail in [&[1, 0x30][..], &[255, 0x30][..]] {
+            let mut raw = MASS_STORAGE.to_vec();
+            raw.extend_from_slice(tail);
+            assert!(parse_usbfs_descriptors(&raw).is_err());
+        }
+        let mut raw = MASS_STORAGE.to_vec();
+        raw[0] = 255;
+        assert!(parse_usbfs_descriptors(&raw).is_err());
     }
 }

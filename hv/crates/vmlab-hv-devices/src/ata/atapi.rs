@@ -298,7 +298,7 @@ impl Optical {
                     }
                     data.extend([0, 0x14, track, 0]);
                     if cdb[1] & 2 != 0 {
-                        let frames = lba + 150;
+                        let frames = u64::from(lba) + 150;
                         data.extend([
                             0,
                             (frames / 4500) as u8,

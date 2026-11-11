@@ -124,6 +124,47 @@ fn udp_frame(payload: usize) -> Vec<u8> {
 }
 
 #[test]
+fn unreadable_rx_descriptor_does_not_dma_to_zero() {
+    let mut n = Nic::new();
+    n.rx_ring(8, RCTL_UPE);
+    n.write(RDBAL, 0x20_0000);
+    n.mem.write_slice(&[0x5a; 128], GuestAddress(0)).unwrap();
+    assert!(n.dev.receive_frame(&udp_frame(16), Instant::now()));
+    let mut low = [0; 128];
+    n.mem.read_slice(&mut low, GuestAddress(0)).unwrap();
+    assert_eq!(low, [0x5a; 128]);
+    assert_eq!(n.read(RDH), 0);
+}
+
+#[test]
+fn restore_rejects_invalid_eeprom_wire_fields() {
+    let mut n = Nic::new();
+    let original = n.dev.save_state().unwrap();
+    for (field, value) in [("count", 10), ("out_bits", 17), ("address", 64)] {
+        let mut state: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        state["wire"][field] = value.into();
+        assert!(
+            n.dev
+                .restore_state(&serde_json::to_vec(&state).unwrap())
+                .is_err()
+        );
+        assert_eq!(n.dev.save_state().unwrap(), original);
+    }
+}
+
+#[test]
+fn non_read_eeprom_command_ignores_extra_clocks() {
+    let mut n = Nic::new();
+    for bit in [1, 0, 0, 0, 0, 0, 0, 0, 0].into_iter().chain([1; 32]) {
+        n.write(EECD, EECD_CS | if bit != 0 { EECD_DI } else { 0 });
+        n.write(EECD, EECD_CS | EECD_SK | if bit != 0 { EECD_DI } else { 0 });
+    }
+    assert_eq!(n.dev.wire.count, 9);
+    let saved = n.dev.save_state().unwrap();
+    n.dev.restore_state(&saved).unwrap();
+}
+
+#[test]
 fn pci_identity_and_bars_match_the_capture() {
     let mut nic = Nic::new();
     // pc-seabios-legacy lspci: 86 80 0e 10 ... rev 03, class 0200,

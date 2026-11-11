@@ -470,6 +470,29 @@ fn transfer_flush_damage_is_clipped_to_scanout_and_idle_flushes_are_silent() {
 }
 
 #[test]
+fn many_overlapping_flushes_copy_the_union_without_touching_gaps() {
+    let mut d = Driver::new();
+    d.start();
+    d.create(1, 64, 48, 2);
+    d.backing(1, &vec![0; 64 * 48 * 4]);
+    d.transfer(1, 64, 48);
+    d.ok(0x103, &[0, 0, 64, 48, 0, 1]);
+    d.dev.frame();
+    d.mem
+        .write_slice(&vec![42; 64 * 48 * 4], GuestAddress(0x100000))
+        .unwrap();
+    d.transfer(1, 64, 48);
+    for _ in 0..128 {
+        d.ok(0x104, &[0, 0, 16, 16, 1, 0]);
+        d.ok(0x104, &[48, 0, 16, 16, 1, 0]);
+    }
+    let frame = d.dev.frame();
+    assert_eq!(&frame.pixels[..4], &[42, 42, 42, 0]);
+    assert_eq!(&frame.pixels[32 * 4..33 * 4], &[0; 4]);
+    assert_eq!(&frame.pixels[48 * 4..49 * 4], &[42, 42, 42, 0]);
+}
+
+#[test]
 fn firmware_latency_timer_write_is_ignored_as_in_the_oracle() {
     let mut d = Driver::new();
     d.dev.config_write(3, 1, &[0x40]);

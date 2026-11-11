@@ -8,6 +8,39 @@ use crate::GuestMemory;
 use crate::chipset::rtc::Rtc;
 use crate::qtest_oracle::{self, Comparison, Line, Op};
 
+#[test]
+fn sector_255_steps_to_next_track_without_wrapping_to_zero() {
+    let mut m = Machine::new("floppy");
+    m.floppy.drives[0].at.sect = 255;
+    m.floppy.execution = Some(Execution {
+        operation: Operation::Read,
+        command: vec![0x66, 0, 0, 0, 255, 2, 255, 0x1b, 0xff],
+        seeked: false,
+        pio: Vec::new(),
+        pio_position: 0,
+        remaining_ns: 0,
+    });
+    assert!(m.floppy.step(0, 255, false));
+    assert_eq!(m.floppy.drives[0].at.sect, 1);
+}
+
+#[test]
+fn restore_rejects_pio_position_at_end_of_buffer() {
+    let mut m = Machine::new("floppy");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&m.floppy.save_state().unwrap()).unwrap();
+    state["phase"] = "Execution".into();
+    state["execution"] = serde_json::json!({
+        "operation":"Read", "command":[0x66,0,0,0,1,2,18,0x1b,0xff],
+        "seeked":false, "pio":vec![0; SECTOR], "pio_position":SECTOR, "remaining_ns":0
+    });
+    assert!(
+        m.floppy
+            .restore_state(&serde_json::to_vec(&state).unwrap())
+            .is_err()
+    );
+}
+
 struct Machine {
     isa: Arc<Mutex<IsaDevices>>,
     floppy: Floppy,

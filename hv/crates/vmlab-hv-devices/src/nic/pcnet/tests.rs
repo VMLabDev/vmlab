@@ -13,6 +13,17 @@ const RX_RING: u64 = 0x2_4460;
 const TX_RING: u64 = 0x2_4458;
 const BUFFERS: u64 = 0x3_0000;
 
+#[test]
+fn guest_ring_lengths_are_clamped_at_use() {
+    let mut n = Nic::new();
+    for length in [0, 1, 512, 513, u16::MAX] {
+        n.set_csr(76, length);
+        n.set_csr(78, length);
+        assert_eq!(n.dev.ring(true).1, u32::from(length).clamp(1, 512));
+        assert_eq!(n.dev.ring(false).1, u32::from(length).clamp(1, 512));
+    }
+}
+
 #[derive(Default)]
 struct Line(AtomicBool);
 

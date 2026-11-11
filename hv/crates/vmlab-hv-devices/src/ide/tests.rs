@@ -2,6 +2,67 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 
+#[test]
+fn atapi_packet_keeps_its_unit_when_guest_selects_slave() {
+    let mut d = Driver::new();
+    d.ide
+        .attach_cdrom(0, 0, Some(d.disk("cd", &[0; 4096], true)))
+        .unwrap();
+    d.attach(0, 1, &[0; 4096]);
+    d.w(0, 4, 8);
+    d.w(0, 5, 0);
+    d.w(0, 7, 0xa0);
+    d.w(0, 6, 0xb0);
+    d.put(0, &[0x12, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(d.ide.channels[0].transfer.unit, 0);
+    assert_eq!(d.bytes(0, 8)[0], 5);
+}
+
+#[test]
+fn restore_rejects_ide_limits_outside_media_and_protocol() {
+    let mut d = Driver::new();
+    d.attach(0, 0, &[0; 4096]);
+    let original = d.ide.save_state().unwrap();
+    for field in ["limit", "packet_limit"] {
+        let mut state: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        if field == "packet_limit" {
+            state["channels"][0][field] = 65535.into();
+        } else {
+            state["channels"][0]["units"][0][field] = 255.into();
+        }
+        assert!(
+            d.ide
+                .restore_state(&serde_json::to_vec(&state).unwrap())
+                .is_err()
+        );
+        assert_eq!(d.ide.save_state().unwrap(), original);
+    }
+}
+
+#[test]
+fn atapi_msf_toc_handles_maximum_lba_without_overflow() {
+    let mut d = Driver::new();
+    let path = d.directory.path().join("large-cd");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(u64::from(u32::MAX) * 2048)
+        .unwrap();
+    let image = vmlab_disk::open(&path, vmlab_disk::Format::Raw, true).unwrap();
+    d.ide.attach_cdrom(0, 0, Some(image)).unwrap();
+    d.packet(0, [0x43, 2, 0, 0, 0, 0, 0xaa, 0, 12, 0, 0, 0], 512, false);
+    let toc = d.bytes(0, 12);
+    let frames = u64::from(u32::MAX) + 150;
+    assert_eq!(
+        &toc[8..12],
+        &[
+            0,
+            (frames / 4500) as u8,
+            (frames / 75 % 60) as u8,
+            (frames % 75) as u8
+        ]
+    );
+}
+
 #[derive(Default)]
 struct Line(AtomicBool);
 impl IrqLine for Line {
