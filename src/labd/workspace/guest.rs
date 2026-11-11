@@ -531,6 +531,10 @@ pub mod fake {
         outbox: VecDeque<WatchReport>,
         drains: usize,
         closed: bool,
+        /// The guest is too slow to answer: drain answers are held here
+        /// instead of sent, until [`FakeWatcher::unmute`].
+        muted: bool,
+        held: VecDeque<WatchReport>,
     }
 
     impl FakeWatcher {
@@ -570,6 +574,20 @@ pub mod fake {
                 .expect("fake watch")
                 .outbox
                 .push_back(WatchReport::Error(why.to_string()));
+        }
+
+        /// The guest stops answering drains (a very slow guest): each answer
+        /// is held back until [`unmute`](Self::unmute). Nudges still arrive.
+        pub fn mute(&self) {
+            self.state.lock().expect("fake watch").muted = true;
+        }
+
+        /// The slow guest catches up: every held answer is sent, in order.
+        pub fn unmute(&self) {
+            let mut state = self.state.lock().expect("fake watch");
+            state.muted = false;
+            let held = std::mem::take(&mut state.held);
+            state.outbox.extend(held);
         }
 
         pub fn drains(&self) -> usize {
@@ -622,12 +640,12 @@ pub mod fake {
             } else {
                 WatchReport::Batch(paths.iter().map(|rel| self.0.record(rel)).collect())
             };
-            self.0
-                .state
-                .lock()
-                .expect("fake watch")
-                .outbox
-                .push_back(report);
+            let mut state = self.0.state.lock().expect("fake watch");
+            if state.muted {
+                state.held.push_back(report);
+            } else {
+                state.outbox.push_back(report);
+            }
             Ok(())
         }
 

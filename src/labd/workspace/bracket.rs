@@ -18,7 +18,9 @@
 //!   holding a version of the repository that exists nowhere else. There is no
 //!   flag because there is no case for one: the fix is to let the flush finish,
 //!   or to resolve the halt, and both are the thing the developer wanted
-//!   anyway.
+//!   anyway. That holds for a guest whose watch did not answer the flush in
+//!   time too (VML-110): [`DISCARD_FLAG`] is restore-only and never lets a
+//!   capture through.
 //! - **Restore refuses only while a halt stands, and an explicit flag answers
 //!   it.** Refusing outright would be obstruction: wanting to throw the guest
 //!   copy away is frequently *why* someone restores. But a restore discards the
@@ -85,6 +87,13 @@ pub struct Outstanding {
     /// restore has not finished re-converging this tree, so it is mid-rewrite
     /// and a capture of it would hold neither version whole.
     pub reseed: Option<String>,
+    /// The guest's watch did not answer the pre-flight flush within its bound,
+    /// so writes the guest has not reported are missing from `unsynced`. A
+    /// very slow guest is still writing as far as anyone knows (VML-110).
+    /// Like every reason here it has no override: `--discard-guest-changes`
+    /// answers only a restore's halt. The way out is a later capture, once
+    /// the guest has caught up.
+    pub unanswered: Option<String>,
     /// Paths the flush did not carry, by name.
     pub unsynced: Vec<String>,
     /// The syncer has never completed a pass, so nothing about this workspace
@@ -107,6 +116,7 @@ impl Outstanding {
             trouble: report.trouble.clone(),
             rescan: report.rescan.clone(),
             reseed: report.reseed.clone(),
+            unanswered: report.unanswered.clone(),
             unsynced: report.unsynced.clone(),
             never_synced: report.passes == 0,
         };
@@ -114,6 +124,7 @@ impl Outstanding {
             || found.trouble.is_some()
             || found.rescan.is_some()
             || found.reseed.is_some()
+            || found.unanswered.is_some()
             || !found.unsynced.is_empty()
             || found.never_synced)
             .then_some(found)
@@ -152,6 +163,7 @@ impl Outstanding {
             }),
             trouble: None,
             rescan: None,
+            unanswered: None,
             unsynced: halted.to_vec(),
             never_synced: false,
         };
@@ -180,7 +192,10 @@ impl std::fmt::Display for Outstanding {
                  unknown rather than merely behind: {trouble}"
             )?;
         }
-        for waiting in [&self.rescan, &self.reseed].into_iter().flatten() {
+        for waiting in [&self.rescan, &self.reseed, &self.unanswered]
+            .into_iter()
+            .flatten()
+        {
             write!(f, ". {waiting}")?;
         }
         if self.never_synced {
@@ -305,6 +320,22 @@ mod tests {
         };
         assert_eq!(Outstanding::of("dev01", &report), None);
         assert_eq!(halted("dev01", &report), None);
+    }
+
+    /// A guest watch that did not answer the flush is a refusal on its own,
+    /// with nothing else outstanding: its unreported writes are unknown
+    /// (VML-110).
+    #[test]
+    fn an_unanswered_guest_watch_refuses_a_capture() {
+        let report = Report {
+            passes: 4,
+            unanswered: Some("The guest's watch did not answer within 5 s".into()),
+            ..Report::default()
+        };
+        let said = Outstanding::of("dev01", &report).unwrap().to_string();
+        assert!(said.contains("watch did not answer within 5 s"), "{said}");
+        assert!(said.contains("no flag for this"), "{said}");
+        assert!(said.contains(NOT_A_BACKUP), "{said}");
     }
 
     /// **Capture refuses with no escape**, and says so — otherwise the next
