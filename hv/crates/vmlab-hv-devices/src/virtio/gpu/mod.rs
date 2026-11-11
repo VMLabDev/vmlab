@@ -612,7 +612,8 @@ impl State {
             0x106 => {
                 let id = d.u32()?;
                 let n = d.u32()? as usize;
-                if n == 0 || n > MAX_ENTRIES {
+                let total: usize = self.resources.values().map(|r| r.backing.len()).sum();
+                if n == 0 || n > MAX_ENTRIES.saturating_sub(total) {
                     return Err(INVALID);
                 }
                 let r = self.resources.get_mut(&id).ok_or(RESOURCE)?;

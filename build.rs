@@ -20,7 +20,11 @@ use std::process::Command;
 const SOURCE: &str = "src/qemu/vk_pci_filter.c";
 const KEEPAWAKE: &str = "src/qemu/gpu_keepawake.c";
 
+#[path = "build/kvm-tests.rs"]
+mod kvm_tests;
+
 fn main() {
+    kvm_tests::configure();
     println!("cargo:rerun-if-changed={SOURCE}");
     println!("cargo:rerun-if-changed={KEEPAWAKE}");
     println!("cargo:rerun-if-changed=build.rs");

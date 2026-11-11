@@ -32,11 +32,13 @@ def build(steps):
     return tmp, repo
 
 
-def calc(repo):
+def calc(repo, source=None):
     run = subprocess.run(["bash", str(SCRIPT)], cwd=repo, capture_output=True,
                          text=True, env=GIT_ENV)
     if run.returncode != 0:
         raise AssertionError(f"exit {run.returncode}: {run.stderr}")
+    if source is not None and f"source={source}" not in run.stderr:
+        raise AssertionError(f"missing source {source}: {run.stderr}")
     out = {}
     for line in run.stdout.splitlines():
         key, _, value = line.partition("=")
@@ -45,12 +47,34 @@ def calc(repo):
 
 
 class ReleaseVersionTest(unittest.TestCase):
-    def check(self, steps, **expected):
+    def check(self, steps, source=None, **expected):
         tmp, repo = build(steps)
         self.addCleanup(tmp.cleanup)
-        got = calc(repo)
+        got = calc(repo, source)
         for key, value in expected.items():
             self.assertEqual(got.get(key), value, f"{key} in {got}")
+
+    def test_head_bump_trailer_overrides_subjects(self):
+        for bump, base, subject, version in [
+            ("major", "1.2.3", "fix: a", "2.0.0-alpha"),
+            ("major", "0.2.3", "fix: a", "0.3.0-alpha"),
+            ("minor", "1.2.3", "feat!: a", "1.3.0-alpha"),
+            ("patch", "1.2.3", "feat!: a", "1.2.4-alpha"),
+        ]:
+            with self.subTest(bump=bump, base=base):
+                self.check(
+                    [("chore: init", None, f"v{base}"),
+                     (subject, ["pre-release: true", f"bump: {bump}"], None)],
+                    version=version, bump=bump, source="HEAD bump trailer")
+
+    def test_bump_trailer_does_not_change_promotion(self):
+        for bump in ("major", "minor", "patch"):
+            with self.subTest(bump=bump):
+                self.check(
+                    [("chore: init", None, "v1.2.3-alpha"),
+                     ("feat!: a", ["release: true", f"bump: {bump}"], None)],
+                    version="1.2.3", bump="promote", prerelease="false",
+                    source="pre-release promotion")
 
     def test_pre_release_after_alpha_bumps_past_it(self):
         self.check(
@@ -87,7 +111,7 @@ class ReleaseVersionTest(unittest.TestCase):
             [("chore: init", None, "v0.45.1"),
              ("feat: new thing", ["release: true"], None)],
             do_release="true", version="0.46.0", prerelease="false",
-            bump="minor", last_tag="v0.45.1")
+            bump="minor", last_tag="v0.45.1", source="commit subjects")
 
     def test_release_without_tag_starts_from_zero(self):
         self.check(

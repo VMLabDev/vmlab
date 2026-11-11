@@ -241,8 +241,14 @@ pub fn classify_xdp_guest(
     conf_flags: u32,
     my_tag: u32,
     dst_mac: &[u8; 6],
+    src_mac: &[u8; 6],
     lookup: impl Fn(&[u8; 6]) -> Option<u32>,
 ) -> XdpVerdict {
+    // Match the sockmap tier: unknown/moved sources must reach userspace
+    // for learning and policy rather than using the direct redirect.
+    if lookup(src_mac) != Some(my_tag) {
+        return XdpVerdict::Punt;
+    }
     if conf_flags & XDP_FLAG_ISOLATED == 0 && dst_mac[0] & 0x01 == 0 {
         if let Some(tag) = lookup(dst_mac) {
             return if tag == my_tag {
@@ -474,19 +480,21 @@ mod tests {
     #[test]
     fn xdp_verdicts() {
         use XdpVerdict::*;
+        assert_eq!(classify_xdp_guest(0, 1, &MAC_A, &MAC_B, xdp_table), Punt);
+        assert_eq!(classify_xdp_guest(0, 1, &MAC_B, &MAC_X, xdp_table), Punt);
         assert_eq!(
-            classify_xdp_guest(0, 1, &MAC_B, xdp_table),
+            classify_xdp_guest(0, 1, &MAC_B, &MAC_A, xdp_table),
             ForwardTo { tag: 2 }
         );
         // Self-addressed known unicast drops (never echo).
-        assert_eq!(classify_xdp_guest(0, 1, &MAC_A, xdp_table), Drop);
+        assert_eq!(classify_xdp_guest(0, 1, &MAC_A, &MAC_A, xdp_table), Drop);
         // Broadcast, multicast, unknown: punt to the daemon.
-        assert_eq!(classify_xdp_guest(0, 1, &BCAST, xdp_table), Punt);
-        assert_eq!(classify_xdp_guest(0, 1, &MCAST, xdp_table), Punt);
-        assert_eq!(classify_xdp_guest(0, 1, &MAC_X, xdp_table), Punt);
+        assert_eq!(classify_xdp_guest(0, 1, &BCAST, &MAC_A, xdp_table), Punt);
+        assert_eq!(classify_xdp_guest(0, 1, &MCAST, &MAC_A, xdp_table), Punt);
+        assert_eq!(classify_xdp_guest(0, 1, &MAC_X, &MAC_A, xdp_table), Punt);
         // Isolated ports punt everything, even known unicast.
         assert_eq!(
-            classify_xdp_guest(XDP_FLAG_ISOLATED, 1, &MAC_B, xdp_table),
+            classify_xdp_guest(XDP_FLAG_ISOLATED, 1, &MAC_B, &MAC_A, xdp_table),
             Punt
         );
     }

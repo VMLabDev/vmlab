@@ -9,6 +9,7 @@ pub mod keepawake;
 pub mod registry;
 pub mod store;
 pub mod templates;
+mod trunk_auth;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -804,9 +805,11 @@ impl Handler<SupRequest> for SupervisorHandler {
                 force,
             } => store::prune(filter, keep, apply, force).await,
             SupRequest::StoreExport { reference, out } => store::export(reference, out).await,
-            SupRequest::StoreImport { archive, overwrite } => {
-                store::import(archive, overwrite).await
-            }
+            SupRequest::StoreImport {
+                archive,
+                overwrite,
+                trust_scripts,
+            } => store::import(archive, overwrite, trust_scripts).await,
             SupRequest::StorePull {
                 target,
                 arch,

@@ -6,6 +6,9 @@ name: Deploy Site
 # dashboard). Runs only when docs/ — or the deploy config — change on main, so
 # an ordinary code push doesn't trigger a deploy.
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -28,14 +31,14 @@ jobs:
       contents: read
       deployments: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0  # rust-toolchain.toml
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Cache the built wcl CLI binary, keyed on the pinned rev, to skip the
       # (slow) cargo install on subsequent deploys. It lives in ~/.wcl, not
@@ -43,7 +46,7 @@ jobs:
       # ignores WCL_REV, so a wcl of an older rev could sit there.
       - name: Cache wcl CLI
         id: wcl-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.wcl
           key: wcl-${{ env.WCL_REV }}
@@ -62,7 +65,7 @@ jobs:
       - name: Check wcl CLI
         run: wcl --version
 
-      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@66f567e72f7d264686a8d5f09f38f0829b4feb80 # just
 
       - name: Build docs site
         run: just docs-build
@@ -74,7 +77,7 @@ jobs:
         run: cp install.sh docs/_site/
 
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v4
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -1,4 +1,4 @@
-# vmlab-hypervisor task runner
+# In-tree vmlab-hv task runner
 
 # Run repository-wide verification from the root with just ci::check.
 

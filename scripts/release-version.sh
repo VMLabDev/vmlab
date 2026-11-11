@@ -12,7 +12,8 @@
 #   - release: true on HEAD (not pre-release) and the last v* tag has a suffix
 #     (vX.Y.Z-alpha): promote it. The version is X.Y.Z, with no bump.
 #   - Otherwise bump from the last v* tag with its suffix stripped. The bump
-#     level comes from the conventional-commit subjects since that tag. In 0.x a
+#     level comes from HEAD's bump trailer, or otherwise the conventional-commit
+#     subjects since that tag. In 0.x a
 #     major bump is a minor bump.
 #   - pre-release: true appends -alpha to the version.
 set -eu
@@ -46,9 +47,15 @@ if [ "$IS_RELEASE" = "true" ] && [ "$IS_PRERELEASE" != "true" ] \
   && [ -n "$LAST_TAG" ] && [ "$VER" != "$BASE" ]; then
   # Promote the pre-release: the same version without its suffix.
   BUMP="promote"
+  SOURCE="pre-release promotion"
   MAJOR=$PREV_MAJOR; MINOR=$PREV_MINOR; PATCH=$PREV_PATCH
 else
-  BUMP="none"
+  BUMP=$(trailer bump)
+  case "$BUMP" in
+    major|minor|patch) SOURCE="HEAD bump trailer" ;;
+    *) BUMP="none"; SOURCE="commit subjects" ;;
+  esac
+  if [ "$BUMP" = "none" ]; then
   while IFS= read -r HASH; do
     SUBJECT=$(git log -1 --format='%s' "$HASH")
     BODY=$(git log -1 --format='%b' "$HASH")
@@ -63,6 +70,7 @@ else
   done < <(git log --format='%H' "$RANGE")
   if [ "$BUMP" = "none" ]; then
     BUMP="patch"
+  fi
   fi
 
   case "$BUMP" in
@@ -81,7 +89,7 @@ if [ "$IS_PRERELEASE" = "true" ]; then
   PRERELEASE=true
 fi
 
-echo "Calculated version: $VERSION (bump=$BUMP, prerelease=$PRERELEASE, from ${LAST_TAG:-none})" >&2
+echo "Calculated version: $VERSION (bump=$BUMP, source=$SOURCE, prerelease=$PRERELEASE, from ${LAST_TAG:-none})" >&2
 echo "do_release=true"
 echo "version=$VERSION"
 echo "prerelease=$PRERELEASE"
