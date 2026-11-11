@@ -1227,15 +1227,15 @@ pub struct HttpTransport {
 }
 
 const MAX_RETRIES: u32 = 3;
-const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
+pub(super) const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_BLOB_BODY: usize = 1024 * 1024 * 1024;
 const MAX_STREAMED_BLOB: u64 = 8 * 1024 * 1024 * 1024;
-const MAX_LIST_PAGES: usize = 100;
-const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_LIST_PAGES: usize = 100;
+pub(super) const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
 
 /// Check the stream as well as Content-Length: a registry can omit or lie
 /// about its length. Never collect an unbounded response in memory.
-async fn bounded_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(super) async fn bounded_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     if resp.content_length().is_some_and(|n| n > limit as u64) {
         bail!("registry response exceeds {limit} bytes");
     }
