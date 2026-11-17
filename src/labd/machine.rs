@@ -1057,6 +1057,7 @@ enum Backoff {
 /// template rebuild, a container wants its guest boot asset rebuilt — so
 /// [`connect`](Self::connect) takes the hint rather than owning one.
 pub(super) struct AgentSlot {
+    wait_for_guest: std::sync::atomic::AtomicBool,
     handle: tokio::sync::Mutex<Option<AgentHandle>>,
     failed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// The version the last successful handshake reported, kept apart from
@@ -1081,6 +1082,7 @@ pub(super) struct AgentSlot {
 impl Default for AgentSlot {
     fn default() -> Self {
         Self {
+            wait_for_guest: std::sync::atomic::AtomicBool::new(false),
             handle: tokio::sync::Mutex::new(None),
             failed_at: tokio::sync::Mutex::new(None),
             answered: std::sync::Mutex::new(None),
@@ -1104,6 +1106,31 @@ enum Checked<'a> {
 }
 
 impl AgentSlot {
+    pub fn for_transport(transport: crate::profiles::AgentTransport) -> Self {
+        Self {
+            wait_for_guest: std::sync::atomic::AtomicBool::new(
+                transport == crate::profiles::AgentTransport::IsaSerial,
+            ),
+            ..Self::default()
+        }
+    }
+
+    pub fn set_transport(&self, transport: crate::profiles::AgentTransport) {
+        self.wait_for_guest.store(
+            transport == crate::profiles::AgentTransport::IsaSerial,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    async fn handshake(&self, sock: &Path, timeout: Duration) -> Result<AgentHandle> {
+        AgentHandle::connect_serial(
+            sock,
+            timeout,
+            self.wait_for_guest.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .await
+    }
+
     /// A slot whose connects wait `grace` on a silent connection, so tests
     /// need not wait out [`PING_GRACE`].
     #[cfg(test)]
@@ -1235,7 +1262,7 @@ impl AgentSlot {
                 .into());
             }
         }
-        match AgentHandle::connect(sock, Duration::from_secs(5)).await {
+        match self.handshake(sock, Duration::from_secs(5)).await {
             Ok(handle) => {
                 *self.failed_at.lock().await = None;
                 self.note_answered(&handle);
@@ -1278,7 +1305,7 @@ impl AgentSlot {
         if agent.is_some() {
             return true;
         }
-        match AgentHandle::connect(sock, Duration::from_secs(2)).await {
+        match self.handshake(sock, Duration::from_secs(2)).await {
             Ok(handle) => {
                 *self.failed_at.lock().await = None;
                 self.note_answered(&handle);

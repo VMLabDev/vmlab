@@ -146,6 +146,11 @@ fn winsize(cols: u16, rows: u16) -> Winsize {
 }
 
 static PORT_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static SERIAL_PORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_legacy_serial() -> bool {
+    SERIAL_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// `--port <device>`: serve on this serial device instead of the virtio port.
 pub fn set_port_override(path: PathBuf) {
@@ -217,6 +222,10 @@ pub fn open_port() -> (
                         thread::sleep(Duration::from_secs(2));
                         continue;
                     }
+                    SERIAL_PORT.store(
+                        tty && path.to_string_lossy().starts_with("/dev/ttyS"),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     return (port, w);
                 }
                 Err(e) => {

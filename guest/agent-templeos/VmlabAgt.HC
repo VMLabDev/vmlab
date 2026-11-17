@@ -35,10 +35,18 @@ U0 VaUartInit()
   OutU8(VA_BASE+4,0x0B);     // DTR | RTS | OUT2
 }
 
+F64 va_announce_at=0;
+
 U8 VaRx()
 {
-  while (!(InU8(VA_BASE+5)&1))
+  while (!(InU8(VA_BASE+5)&1)) {
+    // The host waits for guest bytes before sending anything to COM1.
+    if (tS>=va_announce_at && InU8(VA_BASE+5)&0x20) {
+      OutU8(VA_BASE,0);
+      va_announce_at=tS+1;
+    }
     Yield;
+  }
   return InU8(VA_BASE);
 }
 

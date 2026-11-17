@@ -286,6 +286,13 @@ impl Mux {
         }
     }
 
+    /// Announce ownership of the legacy serial port without a host request.
+    #[cfg(unix)]
+    pub fn announce_serial(&self) {
+        // One byte between complete frames, skipped by FrameDecoder.
+        self.send(vec![0]);
+    }
+
     /// Send a control message to the host.
     pub fn send_ctrl(&self, msg: &AgentMsg) {
         let bytes = encode_ctrl(msg).unwrap_or_else(|error| {
