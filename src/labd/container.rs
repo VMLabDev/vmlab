@@ -1290,18 +1290,20 @@ impl super::machine::Machine for ContainerInstance {
         vec![self.dirs.scratch_disk()]
     }
 
-    /// A micro-VM needs the host-arch emulator; `qemu-img` creates its
-    /// scratch overlay.
-    /// `qemu-img` either way: it makes the scratch disk and takes the
-    /// offline snapshots, whichever hypervisor runs the micro-VM.
+    /// A micro-VM needs the host-arch emulator, and `qemu-img` when it is the
+    /// image tool (`VMLAB_IMAGE_TOOL`): the image tool makes the scratch disk
+    /// and takes the offline snapshots, whichever hypervisor runs the micro-VM.
     fn required_binaries(&self) -> Vec<String> {
-        vec![
-            "qemu-img".to_string(),
-            match self.hypervisor {
-                HypervisorKind::Qemu => qemu::emulator_binary(&self.resolved.arch),
-                HypervisorKind::Vmlab => self.hv.emulator_binary(&self.resolved.arch),
-            },
-        ]
+        let mut needed: Vec<String> = crate::template::qimg::backend()
+            .required_binary()
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        needed.push(match self.hypervisor {
+            HypervisorKind::Qemu => qemu::emulator_binary(&self.resolved.arch),
+            HypervisorKind::Vmlab => self.hv.emulator_binary(&self.resolved.arch),
+        });
+        needed
     }
 
     fn hypervisor(&self) -> HypervisorKind {

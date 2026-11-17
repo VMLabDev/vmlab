@@ -211,7 +211,7 @@ SRC
     rows:
       | "Package" | "Provides" | "Needed for" |
       | "`qemu-system-x86`, `qemu-system-arm`, `qemu-system-misc`" | "`qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64`" | "Running guests. Install only the architectures you use." |
-      | "`qemu-utils`" | "`qemu-img`" | "Every disk operation: clones, snapshots, template builds" |
+      | "`qemu-utils`" | "`qemu-img`" | "Optional. vmlab makes clones, snapshots and template disks itself; `qemu-img` runs them only when `VMLAB_IMAGE_TOOL=qemu-img` selects it as a fallback" |
       | "`seabios`" | "BIOS firmware" | "Booting `firmware = \"seabios\"` guests; usually pulled in by QEMU itself" |
       | "`qemu-efi-riscv64`" | "UEFI firmware for riscv64" | "riscv64 guests; vmlab bundles no riscv64 firmware" |
       | "`ovmf`, `qemu-efi-aarch64`" | "The distribution's UEFI firmware" | "Optional. vmlab boots its bundled firmware first and falls back to these only when the guest assets are missing" |
@@ -246,7 +246,7 @@ SRC
 
   callout "Runtime tools are installed" {
     kind = :success
-    body = "`qemu-system-x86_64 --version` and `qemu-img --version` both print a version. `ls /dev/kvm` shows the device."
+    body = "`qemu-system-x86_64 --version` prints a version. `ls /dev/kvm` shows the device."
   }
 
   h2 "Get the guest assets"

@@ -142,6 +142,7 @@ page ref_paths {
       | "`VMLAB_GUEST_ASSET_DIR`" | "Searched first for the micro-VM kernel and initramfs (`<arch>/`), the agent binaries (`agent/<os>-<arch>/`) and the bundled UEFI firmware (`firmware/<arch>/`), before `/usr/share/vmlab/guest` and the data root's `guest/`." |
       | "`VMLAB_CONFIG_WEAVE_DIR`" | "Where the playbook engine's guest binaries are, instead of `~/.local/share/config-weave/bin`." |
       | "`VMLAB_VIRTIOFSD`" | "The `virtiofsd` binary to use, before searching `PATH`." |
+      | "`VMLAB_IMAGE_TOOL`" | "Which tool runs every disk-image operation (clones, snapshots, resize, convert, freeze): `vmlab-disk`, the linked default, or `qemu-img` as a fallback. A malformed value is ignored with a warning." |
       | "`VMLAB_FASTPATH`" | "Overrides the host config's `fastpath`: `auto`, `off`, `sockmap` or `afxdp`. A malformed value is ignored with a warning. See [Host configuration and WSL 2](guide_host)." |
       | "`VMLAB_INSTANCE`" | "The instance this directory's lab runs as, named `<declared>-<instance>`, when `--instance` is not given. Set but empty means none, which also overrides a linked git worktree's name. See [How vmlab runs a lab](guide_architecture)." |
       | "`VMLAB_DEV_MACHINE`" | "Which dev machine `vmlab dev` verbs mean, second on the selection ladder after an explicit argument. See [vmlab dev](cmd_dev)." |

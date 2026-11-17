@@ -521,8 +521,9 @@ QEMU falls back to TCG, vmlab-hv refuses the machine. And an online snapshot
 is stored in the format of the hypervisor that took it, so it does not restore
 after the machine moves to the other one. Set `hypervisor` back and the
 snapshot restores again; an offline snapshot restores under either.
-`qemu-img` is still required, because the scratch disk and offline snapshots
-are made with it. The [hypervisor {}](ref_host) reference lists the host
+The scratch disk and offline snapshots are made by vmlab's linked image tool,
+so neither hypervisor needs `qemu-img` unless `VMLAB_IMAGE_TOOL=qemu-img`
+selects it. The [hypervisor {}](ref_host) reference lists the host
 defaults and the rules that check them.
 DOC
 
