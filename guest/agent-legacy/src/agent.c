@@ -298,9 +298,11 @@ static void drop_all_sessions(void)
 struct exec_args {
     char pool[STR_CAP * 4];
     int used;
-    char *argv[MAX_ARGV];
+    /* One slot past the cap stays NULL: execvp and spawnvp take the vector
+     * as is and need its terminator even when all MAX_ARGV are used. */
+    char *argv[MAX_ARGV + 1];
     int argc;
-    char *env[MAX_ENV];
+    char *env[MAX_ENV + 1];
     int nenv;
     char *cwd;
 };
