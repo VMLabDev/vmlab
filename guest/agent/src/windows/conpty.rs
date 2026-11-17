@@ -112,10 +112,8 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
     let (in_read, in_write) = pipe()?;
     let (out_read, out_write) = pipe()?;
 
-    let size = COORD {
-        X: cols.max(2) as i16,
-        Y: rows.max(2) as i16,
-    };
+    let (x, y) = crate::terminal::console_dims(cols, rows);
+    let size = COORD { X: x, Y: y };
     let conpty = api::conpty().ok_or_else(|| std::io::Error::other(NO_CONPTY))?;
     let mut hpc: HPCON = 0;
     // SAFETY: fresh pipe handles; ConPTY duplicates what it needs.
@@ -151,10 +149,8 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
         output: Box::new(output),
         errors: None,
         resize: Some(Box::new(move |cols, rows| {
-            let size = COORD {
-                X: cols.max(2) as i16,
-                Y: rows.max(2) as i16,
-            };
+            let (x, y) = crate::terminal::console_dims(cols, rows);
+            let size = COORD { X: x, Y: y };
             // SAFETY: live HPCON until the session's reaper closes it.
             unsafe { (conpty.resize)(resize_pty.0, size) };
         })),

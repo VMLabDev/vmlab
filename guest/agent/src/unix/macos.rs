@@ -229,10 +229,8 @@ impl Clipboard {
     }
 
     pub(super) fn get(&self) -> Result<String, String> {
-        let out = pasteboard(darwin::pasteboard_argv(console_user()?, "/usr/bin/pbpaste"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+        let mut cmd = pasteboard(darwin::pasteboard_argv(console_user()?, "/usr/bin/pbpaste"));
+        let out = crate::clipboard::tool_output(cmd.stderr(Stdio::piped()))
             .map_err(|e| format!("pbpaste: {e}"))?;
         if !out.status.success() {
             return Err(format!(

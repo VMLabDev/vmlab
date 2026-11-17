@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use vmlab_agent_proto::app::{AppMode, AppRecord, RecordDecoder};
 use vmlab_agent_proto::{AgentMsg, Frame, FrameKind, HostMsg, Logon};
 
-use crate::app::{FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, xauthority};
+use crate::app::{
+    FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, x11_dir, x11_dir_owner_trusted, xauthority,
+};
 use crate::fake_spawner::TestPlatform;
 use crate::mux::{Input, Mux, Platform};
 use crate::testutil::{Capture, capture_mux};
@@ -921,4 +923,49 @@ fn rdp_on_a_guest_that_cannot_serve_it_fails_the_open() {
             msg: "shared apps over RDP need a Windows guest".into()
         }
     );
+}
+
+/// Code review F54: a symlink planted at the X socket directory's name is
+/// refused rather than followed, and its target is left as it was.
+#[test]
+fn the_x11_socket_dir_refuses_a_planted_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = tmp.path().join(".X11-unix");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert!(x11_dir(&link, None).is_err());
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o700, "the link's target was not touched");
+}
+
+/// Code review F54: a missing directory is made world-writable and sticky,
+/// and one already there is used as it is.
+#[test]
+fn the_x11_socket_dir_is_made_sticky_and_an_existing_one_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("tmp/.X11-unix");
+    x11_dir(&dir, None).unwrap();
+    let meta = std::fs::symlink_metadata(&dir).unwrap();
+    assert!(meta.is_dir());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o1777);
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    x11_dir(&dir, None).unwrap();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o755, "an existing directory is not re-moded");
+}
+
+/// Code review F54: only root, the agent or the session's account may own
+/// the X socket directory.
+#[test]
+fn the_x11_socket_dir_owner_must_be_root_the_agent_or_the_session() {
+    let agent = 0;
+    assert!(x11_dir_owner_trusted(0, agent, None));
+    assert!(x11_dir_owner_trusted(1000, agent, Some((1000, 1000))));
+    assert!(!x11_dir_owner_trusted(1001, agent, Some((1000, 1000))));
+    assert!(!x11_dir_owner_trusted(1001, agent, None));
+    assert!(x11_dir_owner_trusted(500, 500, None), "the agent's own");
 }

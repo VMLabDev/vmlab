@@ -14,12 +14,16 @@
 #define _WIN32_WINNT 0x0400
 #include <windows.h>
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "agent.h"
 #include "plat.h"
+
+/* The longest command line CreateProcess takes, terminator included. */
+#define CMDLINE_CAP 32768
 
 static HANDLE port = INVALID_HANDLE_VALUE;
 static DWORD port_error; /* why the last port_open failed */
@@ -29,14 +33,33 @@ static HANDLE log_file = INVALID_HANDLE_VALUE;
 
 /* ---- text ----------------------------------------------------------- */
 
-/* UTF-8 (the wire) -> the ANSI code page (every A API), by hand through
- * UTF-16 so no code page support is assumed of the guest. */
-static void utf8_to_ansi(const char *src, char *dst, int cap)
+/* _snprintf leaves the buffer unterminated when the text does not fit (both
+ * msvcrt's and OpenWatcom's); every formatted string here goes through this
+ * instead, which always terminates. */
+static void fmt(char *dst, size_t cap, const char *f, ...)
 {
-    WCHAR wide[2048];
-    int n = 0;
+    va_list ap;
+    if (cap == 0)
+        return;
+    va_start(ap, f);
+    _vsnprintf(dst, cap, f, ap);
+    va_end(ap);
+    dst[cap - 1] = 0;
+}
+
+/* UTF-8 (the wire) -> the ANSI code page (every A API), by hand through
+ * UTF-16 so no code page support is assumed of the guest. 0, or -1 when the
+ * text does not fit (`dst` then holds what did, terminated). Called from the
+ * core loop's thread only, hence the static scratch. */
+static int utf8_to_ansi(const char *src, char *dst, int cap)
+{
+    static WCHAR wide[CMDLINE_CAP];
+    int n = 0, r;
     const unsigned char *s = (const unsigned char *)src;
-    while (*s && n < 2046) {
+    if (cap <= 0)
+        return -1;
+    dst[0] = 0;
+    while (*s && n < CMDLINE_CAP - 2) {
         unsigned long cp;
         int extra;
         if (*s < 0x80) {
@@ -67,10 +90,17 @@ static void utf8_to_ansi(const char *src, char *dst, int cap)
         }
     }
     wide[n] = 0;
-    if (cap > 0) {
-        int r = WideCharToMultiByte(CP_ACP, 0, wide, n, dst, cap - 1, NULL, NULL);
-        dst[r < 0 ? 0 : r] = 0;
+    if (*s)
+        return -1; /* longer than the scratch */
+    if (n == 0)
+        return 0;
+    r = WideCharToMultiByte(CP_ACP, 0, wide, n, dst, cap - 1, NULL, NULL);
+    if (r <= 0) {
+        dst[0] = 0; /* 0 is ERROR_INSUFFICIENT_BUFFER */
+        return -1;
     }
+    dst[r] = 0;
+    return 0;
 }
 
 /* ---- the channel ---------------------------------------------------- */
@@ -82,13 +112,13 @@ int port_open(const char *spec, char *err, int errcap)
     COMMTIMEOUTS to;
     /* "COM1" works through COM9; the \\.\ form works for any. */
     if (strncmp(spec, "\\\\.\\", 4) == 0)
-        _snprintf(path, sizeof path, "%s", spec);
+        fmt(path, sizeof path, "%s", spec);
     else
-        _snprintf(path, sizeof path, "\\\\.\\%s", spec);
+        fmt(path, sizeof path, "\\\\.\\%s", spec);
     port = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (port == INVALID_HANDLE_VALUE) {
         port_error = GetLastError();
-        _snprintf(err, (size_t)errcap, "open %s: error %lu", spec, (unsigned long)port_error);
+        fmt(err, (size_t)errcap, "open %s: error %lu", spec, (unsigned long)port_error);
         return -1;
     }
     SetupComm(port, 65536, 65536);
@@ -111,7 +141,7 @@ int port_open(const char *spec, char *err, int errcap)
     dcb.fRtsControl = RTS_CONTROL_ENABLE;
     dcb.fAbortOnError = FALSE;
     if (!SetCommState(port, &dcb)) {
-        _snprintf(err, (size_t)errcap, "configure %s: error %lu", spec, (unsigned long)GetLastError());
+        fmt(err, (size_t)errcap, "configure %s: error %lu", spec, (unsigned long)GetLastError());
         CloseHandle(port);
         port = INVALID_HANDLE_VALUE;
         return -1;
@@ -140,7 +170,7 @@ long port_read(void *buf, long cap)
         }
         {
             char msg[64];
-            _snprintf(msg, sizeof msg, "read: error %lu", (unsigned long)e);
+            fmt(msg, sizeof msg, "read: error %lu", (unsigned long)e);
             plat_log(msg);
         }
         return -1;
@@ -184,6 +214,10 @@ struct plat_proc {
     int err_closed;
     /* stdin writer thread */
     HANDLE writer;
+    /* Set by the writer as it leaves; `detached` by proc_free when the
+     * writer outlived its wait, handing the struct over for it to free. */
+    int writer_done;
+    int detached;
     CRITICAL_SECTION lock;
     HANDLE wake;
     char *pending;
@@ -196,17 +230,19 @@ struct plat_proc {
     long code;
 };
 
-/* Quote one argument the way CommandLineToArgvW / the CRT undo it. */
-static void quote_arg(const char *arg, char *out, int cap, int *len)
+/* Quote one argument the way CommandLineToArgvW / the CRT undo it,
+ * appending at `*len` and always leaving room for the terminator. -1 when
+ * it does not fit: a truncated command line runs a different command. */
+static int quote_arg(const char *arg, char *out, int cap, int *len)
 {
     int need = strchr(arg, ' ') || strchr(arg, '\t') || strchr(arg, '"') || !*arg;
     int bs = 0;
     const char *p;
-#define PUT(c) do { if (*len + 1 < cap) out[(*len)++] = (c); } while (0)
+#define PUT(c) do { if (*len + 1 >= cap) return -1; out[(*len)++] = (c); } while (0)
     if (!need) {
         for (p = arg; *p; p++)
             PUT(*p);
-        return;
+        return 0;
     }
     PUT('"');
     for (p = arg; *p; p++) {
@@ -235,6 +271,7 @@ static void quote_arg(const char *arg, char *out, int cap, int *len)
     }
     PUT('"');
 #undef PUT
+    return 0;
 }
 
 /* The agent's environment with `KEY=VALUE` overrides applied (keys compared
@@ -246,11 +283,17 @@ static char *build_env_block(char **env, int nenv)
     const char *e;
     size_t total = 1;
     int i;
+    if (!base)
+        return NULL;
     for (e = base; *e; e += strlen(e) + 1)
         total += strlen(e) + 1;
     for (i = 0; i < nenv; i++)
         total += strlen(env[i]) * 3 + 1;
     out = malloc(total);
+    if (!out) {
+        FreeEnvironmentStringsA(base);
+        return NULL;
+    }
     w = out;
     for (e = base; *e; e += strlen(e) + 1) {
         const char *eq = strchr(e + 1, '='); /* a leading '=' is a drive cwd entry */
@@ -272,12 +315,40 @@ static char *build_env_block(char **env, int nenv)
         }
     }
     for (i = 0; i < nenv; i++) {
-        utf8_to_ansi(env[i], w, (int)(strlen(env[i]) * 3 + 1));
-        w += strlen(w) + 1;
+        /* An entry that does not convert is left out, not truncated. */
+        if (utf8_to_ansi(env[i], w, (int)(strlen(env[i]) * 3 + 1)) == 0 && *w)
+            w += strlen(w) + 1;
     }
     *w = 0;
     FreeEnvironmentStringsA(base);
     return out;
+}
+
+/* What proc_free and a detached writer both release: everything but the
+ * child's process and output handles, which proc_free closes itself. */
+static void free_writer_side(struct plat_proc *p)
+{
+    if (p->wake)
+        CloseHandle(p->wake);
+    DeleteCriticalSection(&p->lock);
+    if (p->in_w != INVALID_HANDLE_VALUE)
+        CloseHandle(p->in_w);
+    free(p->pending);
+    free(p);
+}
+
+/* The writer's last touch of `p`. Once it has set writer_done and seen no
+ * hand-over, proc_free owns the struct; after a hand-over it is the
+ * writer's to free. */
+static void writer_exit(struct plat_proc *p)
+{
+    int detached;
+    EnterCriticalSection(&p->lock);
+    p->writer_done = 1;
+    detached = p->detached;
+    LeaveCriticalSection(&p->lock);
+    if (detached)
+        free_writer_side(p);
 }
 
 static DWORD WINAPI stdin_writer(LPVOID arg)
@@ -334,11 +405,19 @@ static DWORD WINAPI stdin_writer(LPVOID arg)
             LeaveCriticalSection(&p->lock);
         }
     }
+    writer_exit(p);
     return 0;
+}
+
+static void close_if_open(HANDLE h)
+{
+    if (h != INVALID_HANDLE_VALUE)
+        CloseHandle(h);
 }
 
 /* An inheritable pipe end for the child plus a private one for us. 9x has
  * no SetHandleInformation, so the private end is made by duplication. */
+
 static int make_pipe(HANDLE *ours, HANDLE *theirs, int ours_is_read)
 {
     SECURITY_ATTRIBUTES sa;
@@ -374,21 +453,41 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     DWORD tid;
 
     for (i = 0; i < spec->argc; i++) {
-        char ansi[4096];
-        utf8_to_ansi(spec->argv[i], ansi, sizeof ansi);
+        static char ansi[CMDLINE_CAP];
+        if (utf8_to_ansi(spec->argv[i], ansi, (int)sizeof ansi) < 0 ||
+            (i && len + 1 >= (int)sizeof cmdline)) {
+            fmt(err, (size_t)errcap, "exec: command line too long");
+            return NULL;
+        }
         if (i)
             cmdline[len++] = ' ';
-        quote_arg(ansi, cmdline, (int)sizeof cmdline, &len);
+        if (quote_arg(ansi, cmdline, (int)sizeof cmdline, &len) < 0) {
+            fmt(err, (size_t)errcap, "exec: command line too long");
+            return NULL;
+        }
     }
     cmdline[len] = 0;
-    if (spec->cwd)
-        utf8_to_ansi(spec->cwd, cwd, sizeof cwd);
+    if (spec->cwd && utf8_to_ansi(spec->cwd, cwd, (int)sizeof cwd) < 0) {
+        fmt(err, (size_t)errcap, "exec: cwd too long");
+        return NULL;
+    }
 
     p = calloc(1, sizeof *p);
+    if (!p) {
+        fmt(err, (size_t)errcap, "exec: out of memory");
+        return NULL;
+    }
     p->in_w = p->out_r = p->err_r = INVALID_HANDLE_VALUE;
+    in_r = out_w = err_w = INVALID_HANDLE_VALUE;
     if (make_pipe(&p->in_w, &in_r, 0) < 0 || make_pipe(&p->out_r, &out_w, 1) < 0 ||
         make_pipe(&p->err_r, &err_w, 1) < 0) {
-        _snprintf(err, (size_t)errcap, "pipe: error %lu", (unsigned long)GetLastError());
+        fmt(err, (size_t)errcap, "pipe: error %lu", (unsigned long)GetLastError());
+        close_if_open(in_r);
+        close_if_open(out_w);
+        close_if_open(err_w);
+        close_if_open(p->in_w);
+        close_if_open(p->out_r);
+        close_if_open(p->err_r);
         free(p);
         return NULL;
     }
@@ -404,10 +503,13 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
      * for command.com, so it gets a new hidden one. */
     flags = is_win9x ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
     envblock = build_env_block(spec->env, spec->nenv);
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, flags, envblock,
-                        spec->cwd ? cwd : NULL, &si, &pi)) {
-        _snprintf(err, (size_t)errcap, "exec %s: error %lu",
-                  spec->argv[0], (unsigned long)GetLastError());
+    if (!envblock || !CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, flags, envblock,
+                                     spec->cwd ? cwd : NULL, &si, &pi)) {
+        if (!envblock)
+            fmt(err, (size_t)errcap, "exec: out of memory");
+        else
+            fmt(err, (size_t)errcap, "exec %s: error %lu",
+                spec->argv[0], (unsigned long)GetLastError());
         free(envblock);
         CloseHandle(in_r);
         CloseHandle(out_w);
@@ -427,7 +529,19 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
 
     InitializeCriticalSection(&p->lock);
     p->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
-    p->writer = CreateThread(NULL, 0, stdin_writer, p, 0, &tid);
+    p->writer = p->wake ? CreateThread(NULL, 0, stdin_writer, p, 0, &tid) : NULL;
+    if (!p->writer) {
+        /* No writer, no stdin: refuse rather than leave a child nothing
+         * can feed or free. */
+        fmt(err, (size_t)errcap, "exec: cannot start the stdin writer: error %lu",
+            (unsigned long)GetLastError());
+        TerminateProcess(p->process, 137);
+        CloseHandle(p->process);
+        CloseHandle(p->out_r);
+        CloseHandle(p->err_r);
+        free_writer_side(p);
+        return NULL;
+    }
     return p;
 }
 
@@ -465,21 +579,46 @@ long proc_read(struct plat_proc *p, int which, void *buf, long cap)
 
 void proc_write_in(struct plat_proc *p, const void *buf, long len)
 {
+    long keep = 0;
+    int dropped = 0;
+    if (len <= 0)
+        return;
     EnterCriticalSection(&p->lock);
     if (p->quit) {
         p->consumed += (unsigned long)len;
     } else {
-        if (p->pending_len + len > p->pending_cap) {
+        /* The writer takes the queue whole, so pending_len is what waits. */
+        keep = PLAT_STDIN_CAP - p->pending_len;
+        if (keep > len)
+            keep = len;
+        if (keep < 0)
+            keep = 0;
+        if (keep && p->pending_len + keep > p->pending_cap) {
             long cap = p->pending_cap ? p->pending_cap * 2 : 8192;
-            while (cap < p->pending_len + len)
+            char *grown;
+            while (cap < p->pending_len + keep)
                 cap *= 2;
-            p->pending = realloc(p->pending, (size_t)cap);
-            p->pending_cap = cap;
+            grown = realloc(p->pending, (size_t)cap);
+            if (grown) {
+                p->pending = grown;
+                p->pending_cap = cap;
+            } else {
+                keep = 0;
+            }
         }
-        memcpy(p->pending + p->pending_len, buf, (size_t)len);
-        p->pending_len += len;
+        if (keep) {
+            memcpy(p->pending + p->pending_len, buf, (size_t)keep);
+            p->pending_len += keep;
+        }
+        if (keep < len) {
+            /* Credited back, so the host never stalls on what was dropped. */
+            p->consumed += (unsigned long)(len - keep);
+            dropped = 1;
+        }
     }
     LeaveCriticalSection(&p->lock);
+    if (dropped)
+        plat_log("stdin queue full or out of memory, bytes dropped");
     SetEvent(p->wake);
 }
 
@@ -521,23 +660,35 @@ void proc_kill(struct plat_proc *p)
         TerminateProcess(p->process, 137);
 }
 
+/* The writer can be stuck in WriteFile past its wait — a grandchild that
+ * inherited the child's stdin and never reads it keeps the pipe open after
+ * the child is gone. Freeing under it would be a use after free, so the
+ * struct is then handed to the writer, which frees it whenever its write
+ * returns (or leaks it, if never). */
 void proc_free(struct plat_proc *p)
 {
+    int handed_over = 0;
     EnterCriticalSection(&p->lock);
     p->quit = 1;
     LeaveCriticalSection(&p->lock);
     SetEvent(p->wake);
-    WaitForSingleObject(p->writer, 2000);
-    CloseHandle(p->writer);
-    CloseHandle(p->wake);
-    DeleteCriticalSection(&p->lock);
-    if (p->in_w != INVALID_HANDLE_VALUE)
-        CloseHandle(p->in_w);
     CloseHandle(p->out_r);
     CloseHandle(p->err_r);
     CloseHandle(p->process);
-    free(p->pending);
-    free(p);
+    if (WaitForSingleObject(p->writer, 2000) != WAIT_OBJECT_0) {
+        EnterCriticalSection(&p->lock);
+        if (!p->writer_done) {
+            p->detached = 1;
+            handed_over = 1;
+        }
+        LeaveCriticalSection(&p->lock);
+    }
+    CloseHandle(p->writer);
+    if (handed_over) {
+        plat_log("stdin writer still blocked; it frees the exec when its write returns");
+        return;
+    }
+    free_writer_side(p);
 }
 
 /* ---- the machine ---------------------------------------------------- */
@@ -576,10 +727,10 @@ void plat_os_info(struct os_info *info)
                "ProductName", info->name, sizeof info->name);
     if (!info->name[0])
         strcpy(info->name, is_win9x ? "Windows" : "Windows NT");
-    _snprintf(info->version, sizeof info->version, "%lu.%lu%s%s",
+    fmt(info->version, sizeof info->version, "%lu.%lu%s%s",
               (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion,
               v.szCSDVersion[0] ? " " : "", v.szCSDVersion);
-    _snprintf(info->kernel, sizeof info->kernel, "%lu.%lu.%lu",
+    fmt(info->kernel, sizeof info->kernel, "%lu.%lu.%lu",
               (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion,
               (unsigned long)(is_win9x ? LOWORD(v.dwBuildNumber) : v.dwBuildNumber));
     GetSystemInfo(&si);
@@ -659,7 +810,7 @@ int plat_set_time(const struct plat_time *t, char *err, int errcap)
     if (!is_win9x)
         take_privilege("SeSystemtimePrivilege");
     if (!SetSystemTime(&st)) {
-        _snprintf(err, (size_t)errcap, "set_time: SetSystemTime: error %lu",
+        fmt(err, (size_t)errcap, "set_time: SetSystemTime: error %lu",
                   (unsigned long)GetLastError());
         return -1;
     }
@@ -670,7 +821,7 @@ void plat_log(const char *msg)
 {
     char line[512];
     DWORD n;
-    _snprintf(line, sizeof line, "vmlab-agent-legacy: %s\r\n", msg);
+    fmt(line, sizeof line, "vmlab-agent-legacy: %s\r\n", msg);
     OutputDebugStringA(line);
     if (console_mode)
         fprintf(stderr, "%s", line);
@@ -761,7 +912,7 @@ static void stop_enumerating_port(void)
                     continue;
                 }
                 RegCloseKey(key);
-                _snprintf(path, sizeof path, "System\\CurrentControlSet\\Services\\Class\\%s", driver);
+                fmt(path, sizeof path, "System\\CurrentControlSet\\Services\\Class\\%s", driver);
                 if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_READ | KEY_WRITE, &key) == ERROR_SUCCESS) {
                     if (RegDeleteValueA(key, "Enumerator") == ERROR_SUCCESS) {
                         plat_log("stopped serial Plug and Play enumeration of the agent's port");
@@ -941,7 +1092,7 @@ static int install_9x(const char *exe)
     /* Start it now, detached, so the build's handshake needs no reboot. */
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
-    _snprintf(cmd, sizeof cmd, "\"%s\"", exe);
+    fmt(cmd, sizeof cmd, "\"%s\"", exe);
     if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -963,7 +1114,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--console") == 0) {
             console_mode = 1;
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            _snprintf(port_name, sizeof port_name, "%s", argv[++i]);
+            fmt(port_name, sizeof port_name, "%s", argv[++i]);
         } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
             log_file = CreateFileA(argv[++i], GENERIC_WRITE, FILE_SHARE_READ, NULL,
                                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);

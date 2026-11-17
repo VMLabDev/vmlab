@@ -271,6 +271,12 @@ impl Fixture {
         })
     }
 
+    /// The client socket, for a test that drives the agent itself instead of
+    /// through `run`. The fixture accepts one connection.
+    pub(in crate::labd) fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     pub(in crate::labd) async fn run(&self, tier: &str, root: Option<String>) -> Result<()> {
         let handle = AgentHandle::connect(&self.socket, BUDGET).await?;
         let root = root.unwrap_or_else(|| self.dir.path().to_string_lossy().into_owned());

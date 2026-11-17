@@ -904,7 +904,7 @@ mod parking {
                 (vec![listener], vec![], None)
             }
             Protocol::X11 { cookie } => {
-                let (n, listeners, path) = claim_display(&home.x11_unix)?;
+                let (n, listeners, path) = claim_display(&home.x11_unix, home.owner)?;
                 let claimed = (|| {
                     give(&path, home.owner, 0o600)?;
                     let file = home.dir.join("Xauthority");
@@ -947,11 +947,11 @@ mod parking {
     /// tries the abstract name first and a future one only the path; a
     /// display holding one of the two would let whoever owns the other
     /// capture the program.
-    fn claim_display(x11_unix: &Path) -> std::io::Result<(u32, Vec<UnixListener>, PathBuf)> {
-        if !x11_unix.is_dir() {
-            std::fs::create_dir_all(x11_unix)?;
-            std::fs::set_permissions(x11_unix, std::fs::Permissions::from_mode(0o1777))?;
-        }
+    fn claim_display(
+        x11_unix: &Path,
+        owner: Option<(u32, u32)>,
+    ) -> std::io::Result<(u32, Vec<UnixListener>, PathBuf)> {
+        x11_dir(x11_unix, owner)?;
         for n in FIRST_DISPLAY..=LAST_DISPLAY {
             let name = format!("/tmp/.X11-unix/X{n}");
             let Ok(abstract_) = SocketAddr::from_abstract_name(name.as_bytes())
@@ -968,6 +968,67 @@ mod parking {
             std::io::ErrorKind::AddrInUse,
             format!("no free X display between :{FIRST_DISPLAY} and :{LAST_DISPLAY}"),
         ))
+    }
+
+    /// Make `x11_unix` the X socket directory, or check the one already there
+    /// (code review F54): a real directory — a symlink at the name is
+    /// refused, never followed — owned by root, the agent or the session's
+    /// own account. Anyone may create `/tmp/.X11-unix` before the agent
+    /// does, and a directory they own is one where they can swap the
+    /// session's socket out from under it.
+    pub(crate) fn x11_dir(x11_unix: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let created = match std::fs::symlink_metadata(x11_unix) {
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = x11_unix.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                match std::fs::create_dir(x11_unix) {
+                    Ok(()) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        // O_NOFOLLOW: a symlink at the name fails here rather than being
+        // followed, and every check below is of what was opened.
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(x11_unix)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: not a directory the agent trusts: {e}",
+                        x11_unix.display()
+                    ),
+                )
+            })?;
+        let meta = dir.metadata()?;
+        let agent = nix::unistd::geteuid().as_raw();
+        if !x11_dir_owner_trusted(meta.uid(), agent, owner) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is owned by uid {}, not root or the session's account",
+                    x11_unix.display(),
+                    meta.uid()
+                ),
+            ));
+        }
+        if created {
+            dir.set_permissions(std::fs::Permissions::from_mode(0o1777))?;
+        }
+        Ok(())
+    }
+
+    /// Whether an X socket directory owned by `uid` is one the agent may put
+    /// a session's socket in: root's, the agent's own, or the session's.
+    pub(crate) fn x11_dir_owner_trusted(uid: u32, agent: u32, owner: Option<(u32, u32)>) -> bool {
+        uid == 0 || uid == agent || owner.is_some_and(|(o, _)| o == uid)
     }
 
     /// `waypipe server` on the session's socket, with the program after it.
@@ -1148,4 +1209,6 @@ mod parking {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use parking::{FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, xauthority};
+pub(crate) use parking::{
+    FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, x11_dir, x11_dir_owner_trusted, xauthority,
+};

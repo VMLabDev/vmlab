@@ -392,11 +392,12 @@ impl crate::mux::Platform for UnixPlatform {
             .resolve(identity)
             .map_err(|e| e.to_string())?;
         let owner = owner(&self.spawner.route(&held)).map(|a| (a.uid, a.gid));
-        let resolve = |path: String| {
-            (self.path_resolver())(path.clone(), crate::mux::Last::Follow)
+        let resolve_as = |path: String, last: crate::mux::Last| {
+            (self.path_resolver())(path.clone(), last)
                 .map(PathBuf::from)
                 .map_err(|e| format!("{path}: {e}"))
         };
+        let resolve = |path: String| resolve_as(path, crate::mux::Last::Follow);
         let seen = format!("{}/{name}", self.app_paths.run);
         let dir = resolve(seen.clone())?;
         linux::make_app_dir(&resolve(self.app_paths.run.clone())?, &dir, owner)
@@ -404,7 +405,9 @@ impl crate::mux::Platform for UnixPlatform {
         Ok(AppHome {
             dir,
             seen,
-            x11_unix: resolve(self.app_paths.x11_unix.clone())?,
+            // Kept, not followed: a symlink at the X socket directory's name
+            // is refused where the session binds (code review F54).
+            x11_unix: resolve_as(self.app_paths.x11_unix.clone(), crate::mux::Last::Keep)?,
             owner,
             hostname: uname().2,
         })

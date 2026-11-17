@@ -110,3 +110,25 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
         mux.remove_finished(id);
     });
 }
+
+/// A terminal size as a Windows console `COORD` takes it (code review
+/// F61e): at least 2 by 2, and never past `i16::MAX`, where a plain cast of
+/// a host's `u16` would wrap a wide request to a negative size.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn console_dims(cols: u16, rows: u16) -> (i16, i16) {
+    let fit = |n: u16| n.clamp(2, i16::MAX as u16) as i16;
+    (fit(cols), fit(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_dims;
+
+    #[test]
+    fn console_dims_clamp_into_a_coord() {
+        assert_eq!(console_dims(80, 24), (80, 24));
+        assert_eq!(console_dims(0, 1), (2, 2));
+        assert_eq!(console_dims(u16::MAX, 40_000), (i16::MAX, i16::MAX));
+        assert_eq!(console_dims(32_767, 32_768), (32_767, 32_767));
+    }
+}
