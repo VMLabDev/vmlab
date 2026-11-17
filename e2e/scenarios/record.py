@@ -102,6 +102,18 @@ def ocr(png: pathlib.Path) -> str:
     ).stdout
 
 
+def recorded_probe(video: pathlib.Path, events: dict, png: pathlib.Path) -> bool:
+    # Text events mark the start of typing, whose duration grows under host
+    # load. The following move is sent only after type_text has completed.
+    # Allow the guest display half a second to paint the completed input.
+    move = next(e for e in events["events"] if e["kind"] == "move")
+    text = ocr(frame_at(video, move["at"] + 0.5, png))
+    # The console font's V can be read as U. Require both unambiguous words
+    # in full, so a partial input such as "VMLAB REC" cannot pass.
+    assert re.search(r"\bRECORD\s+PROBE\b", text.upper()), f"OCR read {text.strip()[:200]!r}"
+    return True
+
+
 def placement(fb_w: int, fb_h: int, out_w: int = 1920, out_h: int = 1080):
     """Where a framebuffer pixel lands in the letterboxed output."""
     scale = min(out_w / fb_w, out_h / fb_h)
@@ -429,10 +441,7 @@ def run(h):
         h.check("record.timeline", timeline, "events.json lists text, move, click in video time")
 
         def typed_text():
-            at = events["events"][0]["at"] + 2.0
-            text = ocr(frame_at(out, at, rec / "typed.png"))
-            assert "PROBE" in text.upper() or "RECORD" in text.upper(), f"OCR read {text.strip()[:200]!r}"
-            return True
+            return recorded_probe(out, events, rec / "typed.png")
 
         h.check("record.ocr", typed_text, "OCR finds the typed text in a frame after typing")
 
