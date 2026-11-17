@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
-use log::{error, info, trace, warn};
+use log::{Level, trace};
 use std::io::{self, IoSlice, Write};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -15,100 +15,13 @@ use super::{
     MetricsHook, Server, ServerUtil, ServerVersion, SrvContext, ZcReader, ZcWriter,
 };
 use crate::virtio::fs::fuse::abi::fuse_abi::*;
-#[cfg(feature = "virtiofs")]
-use crate::virtio::fs::fuse::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
 use crate::virtio::fs::fuse::filesystem::{
     DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply,
 };
-#[cfg(feature = "fusedev")]
-use crate::virtio::fs::fuse::transport::FuseDevWriter;
 use crate::virtio::fs::fuse::transport::{FsCacheReqHandler, Reader, Writer, pagesize};
 use crate::virtio::fs::fuse::{BitmapSlice, Error, Result, bytes_to_cstr, encode_io_error_kind};
 
 impl<F: FileSystem + Sync> Server<F> {
-    #[cfg(feature = "fusedev")]
-    /// Use to send notify msg to kernel fuse
-    pub fn notify_inval_entry<S: BitmapSlice>(
-        &self,
-        mut w: FuseDevWriter<'_, S>,
-        parent: u64,
-        name: &std::ffi::CStr,
-    ) -> Result<usize> {
-        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let mut entry = NotifyInvalEntryOut::default();
-        let mut header = OutHeader::default();
-        let name_with_null = name.to_bytes_with_nul();
-        header.unique = 0;
-        header.error = NotifyOpcode::InvalEntry as i32;
-        header.len = std::mem::size_of::<OutHeader>() as u32
-            + std::mem::size_of::<NotifyInvalEntryOut>() as u32
-            + name_with_null.len() as u32;
-        // the namelne don't contains the nul
-        entry.namelen = (name_with_null.len() - 1) as u32;
-        entry.parent = parent;
-
-        buffer_writer
-            .write_obj(header)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer
-            .write_obj(entry)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer
-            .write(name_with_null)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)
-    }
-    /// Notify the kernel that an inode's data has been invalidated.
-    #[cfg(feature = "fusedev")]
-    pub fn notify_inval_inode<S: BitmapSlice>(
-        &self,
-        mut w: FuseDevWriter<'_, S>,
-        ino: u64,
-        off: u64,
-        len: u64,
-    ) -> Result<usize> {
-        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let mut header = OutHeader::default();
-        let mut inode = NotifyInvalInodeOut::default();
-
-        header.unique = 0;
-        header.error = NotifyOpcode::InvalInode as i32;
-        header.len = std::mem::size_of::<OutHeader>() as u32
-            + std::mem::size_of::<NotifyInvalInodeOut>() as u32;
-
-        inode.ino = ino;
-        inode.off = off as i64;
-        inode.len = len as i64;
-
-        buffer_writer
-            .write_obj(header)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer
-            .write_obj(inode)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)
-    }
-    #[cfg(feature = "fusedev")]
-    /// Send a resend notification message to the kernel via FUSE. This function should be invoked as part of
-    /// the crash recovery routine. Given that FUSE initialization does not occur again during recovery,
-    /// the capability to support resend notifications may not be automatically detected. It is the responsibility
-    /// of the upper layers to verify and persist the kernel's support for this feature upon the initial FUSE setup.
-    pub fn notify_resend<S: BitmapSlice>(&self, mut w: FuseDevWriter<'_, S>) -> Result<()> {
-        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let header = {
-            OutHeader {
-                len: std::mem::size_of::<OutHeader>() as u32,
-                unique: 0,
-                error: NotifyOpcode::Resend as i32,
-            }
-        };
-        buffer_writer
-            .write_obj(header)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)?;
-        Ok(())
-    }
-
     /// Main entrance to handle requests from the transport layer.
     ///
     /// It receives Fuse requests from transport layers, parses the request according to Fuse ABI,
@@ -123,7 +36,7 @@ impl<F: FileSystem + Sync> Server<F> {
         hook: Option<&dyn MetricsHook>,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
-        let mut ctx = SrvContext::<F, S>::new(in_header, r, w);
+        let mut ctx = SrvContext::<F, S>::new(in_header, r, w, &self.guest_log);
         self.fs
             .id_remap(&mut ctx.context)
             .map_err(|e| Error::FailedToRemapID((ctx.context.uid, ctx.context.gid)))?;
@@ -195,10 +108,6 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(ctx),
             #[cfg(target_os = "linux")]
             x if x == Opcode::Lseek as u32 => self.lseek(ctx),
-            #[cfg(feature = "virtiofs")]
-            x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
-            #[cfg(feature = "virtiofs")]
-            x if x == Opcode::RemoveMapping as u32 => self.removemapping(ctx, vu_req),
             // Group reqeusts don't need reply together
             x => match x {
                 x if x == Opcode::Interrupt as u32 => {
@@ -225,27 +134,17 @@ impl<F: FileSystem + Sync> Server<F> {
 
     fn lookup<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
-        #[cfg(not(feature = "fuse-t"))]
         let version = self.vers.load();
         let result = self.fs.lookup(ctx.context(), ctx.nodeid(), name);
 
         match result {
             // before ABI 7.4 inode == 0 was invalid, only ENOENT means negative dentry
-            #[cfg(not(feature = "fuse-t"))]
             Ok(entry)
                 if version.minor < KERNEL_MINOR_VERSION_LOOKUP_NEGATIVE_ENTRY_ZERO
                     && entry.inode == 0 =>
             {
-                ctx.reply_error(io::Error::from_raw_os_error(libc::ENOENT))
-            }
-            #[cfg(feature = "fuse-t")]
-            Ok(entry) if entry.inode == 0 => {
                 ctx.reply_error(io::Error::from_raw_os_error(libc::ENOENT))
             }
             Ok(entry) => {
@@ -320,11 +219,7 @@ impl<F: FileSystem + Sync> Server<F> {
             mode, rdev, umask, ..
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MknodIn>())?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self
             .fs
@@ -338,11 +233,7 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn mkdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let MkdirIn { mode, umask } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<MkdirIn>())?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self
             .fs
@@ -355,11 +246,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn unlink<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self.fs.unlink(ctx.context(), ctx.nodeid(), name) {
             Ok(()) => ctx.reply_ok(None::<u8>, None),
@@ -369,11 +256,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
     pub(super) fn rmdir<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self.fs.rmdir(ctx.context(), ctx.nodeid(), name) {
             Ok(()) => ctx.reply_ok(None::<u8>, None),
@@ -423,11 +306,7 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn link<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let LinkIn { oldnodeid } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<LinkIn>())?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self
             .fs
@@ -623,11 +502,7 @@ impl<F: FileSystem + Sync> Server<F> {
         if size != value.len() as u32 {
             return Err(Error::InvalidXattrSize((size, value.len())));
         }
-        let name = bytes_to_cstr(name).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(name).map_err(|e| ctx.invalid_name(name.len(), e))?;
 
         match self
             .fs
@@ -643,11 +518,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let buf =
             ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<GetxattrIn>())?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self.fs.getxattr(ctx.context(), ctx.nodeid(), name, size) {
             Ok(GetxattrReply::Value(val)) => ctx.reply_ok(None::<u8>, Some(&val)),
@@ -685,11 +556,7 @@ impl<F: FileSystem + Sync> Server<F> {
         mut ctx: SrvContext<'_, F, S>,
     ) -> Result<usize> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, 0)?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self.fs.removexattr(ctx.context(), ctx.nodeid(), name) {
             Ok(()) => ctx.reply_ok(None::<u8>, None),
@@ -718,7 +585,10 @@ impl<F: FileSystem + Sync> Server<F> {
         } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
 
         if major < KERNEL_VERSION {
-            error!("Unsupported fuse protocol version: {}.{}", major, minor);
+            self.guest_log.log(
+                Level::Warn,
+                format_args!("fuse: unsupported protocol version {major}.{minor}"),
+            );
             return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EPROTO));
         }
 
@@ -747,9 +617,13 @@ impl<F: FileSystem + Sync> Server<F> {
         match self.fs.init(capable) {
             Ok(want) => {
                 let enabled = capable & want;
-                info!(
-                    "FUSE INIT major {} minor {}\n in_opts: {:?}\nout_opts: {:?}",
-                    major, minor, capable, enabled
+                self.guest_log.log(
+                    Level::Info,
+                    format_args!(
+                        "fuse: INIT {major}.{minor} in_opts {:#x} out_opts {:#x}",
+                        capable.bits(),
+                        enabled.bits()
+                    ),
                 );
 
                 let readahead = if cfg!(target_os = "macos") {
@@ -999,11 +873,7 @@ impl<F: FileSystem + Sync> Server<F> {
     fn create<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
         let args: CreateIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<CreateIn>())?;
-        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| {
-            let _ = ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL));
-            error!("fuse: bytes to cstr error: {:?}, {:?}", buf, e);
-            e
-        })?;
+        let name = bytes_to_cstr(buf.as_ref()).map_err(|e| ctx.invalid_name(buf.len(), e))?;
 
         match self.fs.create(ctx.context(), ctx.nodeid(), name, args) {
             Ok((entry, handle, opts, passthrough)) => {
@@ -1046,7 +916,8 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn destroy<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) {
         self.fs.destroy();
         if let Err(e) = ctx.reply_ok(None::<u8>, None) {
-            warn!("fuse channel reply destroy failed {:?}", e);
+            self.guest_log
+                .log(Level::Warn, format_args!("fuse: reply to DESTROY failed: {e}"));
         }
     }
 
@@ -1170,78 +1041,6 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
-#[cfg(feature = "virtiofs")]
-impl<F: FileSystem + Sync> Server<F> {
-    pub(super) fn setupmapping<S: BitmapSlice>(
-        &self,
-        mut ctx: SrvContext<'_, F, S>,
-        vu_req: Option<&mut dyn FsCacheReqHandler>,
-    ) -> Result<usize> {
-        if let Some(req) = vu_req {
-            let SetupmappingIn {
-                fh,
-                foffset,
-                len,
-                flags,
-                moffset,
-            } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-
-            match self.fs.setupmapping(
-                ctx.context(),
-                ctx.nodeid(),
-                fh.into(),
-                foffset,
-                len,
-                flags,
-                moffset,
-                req,
-            ) {
-                Ok(()) => ctx.reply_ok(None::<u8>, None),
-                Err(e) => ctx.reply_error(e),
-            }
-        } else {
-            ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL))
-        }
-    }
-
-    pub(super) fn removemapping<S: BitmapSlice>(
-        &self,
-        mut ctx: SrvContext<'_, F, S>,
-        vu_req: Option<&mut dyn FsCacheReqHandler>,
-    ) -> Result<usize> {
-        if let Some(req) = vu_req {
-            let RemovemappingIn { count } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-
-            if let Some(size) = (count as usize).checked_mul(size_of::<RemovemappingOne>()) {
-                if size > MAX_BUFFER_SIZE as usize {
-                    return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::ENOMEM));
-                }
-            } else {
-                return ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EOVERFLOW));
-            }
-
-            let mut requests = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                requests.push(
-                    ctx.r
-                        .read_obj::<RemovemappingOne>()
-                        .map_err(Error::DecodeMessage)?,
-                );
-            }
-
-            match self
-                .fs
-                .removemapping(ctx.context(), ctx.nodeid(), requests, req)
-            {
-                Ok(()) => ctx.reply_ok(None::<u8>, None),
-                Err(e) => ctx.reply_error(e),
-            }
-        } else {
-            ctx.reply_error_explicit(io::Error::from_raw_os_error(libc::EINVAL))
-        }
-    }
-}
-
 impl<F: FileSystem, S: BitmapSlice> SrvContext<'_, F, S> {
     fn reply_ok<T: ByteValued>(&mut self, out: Option<T>, data: Option<&[u8]>) -> Result<usize> {
         let data2 = out.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
@@ -1291,7 +1090,15 @@ impl<F: FileSystem, S: BitmapSlice> SrvContext<'_, F, S> {
         };
 
         if explicit || err.raw_os_error().is_none() {
-            error!("fuse: reply error header {:?}, error {:?}", header, err);
+            self.log.log(
+                Level::Warn,
+                format_args!(
+                    "fuse: opcode {} request of {} bytes answered with errno {}: {err}",
+                    self.in_header.opcode,
+                    self.in_header.len,
+                    -header.error
+                ),
+            );
         } else {
             trace!("fuse: reply error header {:?}, error {:?}", header, err);
         }
@@ -1307,6 +1114,20 @@ impl<F: FileSystem, S: BitmapSlice> SrvContext<'_, F, S> {
                 self.w.bytes_written()
             })
             .map_err(Error::EncodeMessage)
+    }
+
+    /// Answer a request whose name is not a C string with EINVAL, and say
+    /// so in one bounded line: the name's length, never its bytes.
+    fn invalid_name(&mut self, len: usize, err: Error) -> Error {
+        self.log.log(
+            Level::Warn,
+            format_args!(
+                "fuse: opcode {} request with an invalid name of {len} bytes answered with EINVAL: {err}",
+                self.in_header.opcode
+            ),
+        );
+        let _ = self.reply_error(io::Error::from_raw_os_error(libc::EINVAL));
+        err
     }
 
     // reply operation error back to fuse client, don't print error message, as they are not server's

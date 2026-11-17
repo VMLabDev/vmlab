@@ -53,6 +53,25 @@ async fn copy_redacted(
     log.flush().await
 }
 
+/// The size at which an emulator's log is rotated: at the next launch it is
+/// renamed to `<name>.1`, replacing the previous one, and a fresh log is
+/// started. Inside one run vmlab-hv caps its own output (its stderr cap), so
+/// a guest cannot grow the pair past about twice this.
+pub const LOG_ROTATE_BYTES: u64 = 64 << 20;
+
+/// Rotate `log` to `<log>.1` when it has reached `limit` bytes.
+pub fn rotate_log(log: &Path, limit: u64) -> Result<()> {
+    match std::fs::metadata(log) {
+        Ok(meta) if meta.len() >= limit => {
+            let mut rotated = log.as_os_str().to_owned();
+            rotated.push(".1");
+            std::fs::rename(log, &rotated)
+                .with_context(|| format!("rotating {}", log.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A spawned VM (or helper) process.
 pub struct Proc {
     pub name: String,
@@ -103,6 +122,7 @@ impl Proc {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        rotate_log(log_path, LOG_ROTATE_BYTES)?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -266,6 +286,7 @@ pub fn write_launch_header(
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    rotate_log(log, LOG_ROTATE_BYTES)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -602,6 +623,60 @@ fn process_table() -> Vec<(i32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_at_its_limit_is_rotated_and_a_smaller_one_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("vmlab-hv.log");
+        let rotated = tmp.path().join("vmlab-hv.log.1");
+
+        rotate_log(&log, 10).unwrap();
+        assert!(!log.exists() && !rotated.exists());
+
+        std::fs::write(&log, "123456789").unwrap();
+        rotate_log(&log, 10).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "123456789");
+        assert!(!rotated.exists());
+
+        std::fs::write(&log, "0123456789").unwrap();
+        rotate_log(&log, 10).unwrap();
+        assert!(!log.exists());
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "0123456789");
+
+        std::fs::write(&log, "newer run, also full").unwrap();
+        rotate_log(&log, 10).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "newer run, also full"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_log_is_rotated_before_the_launch_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("vmlab-hv.log");
+        let file = std::fs::File::create(&log).unwrap();
+        file.set_len(LOG_ROTATE_BYTES).unwrap();
+        drop(file);
+
+        write_launch_header(&log, "/bin/true", &[], &Default::default()).unwrap();
+        let header_len = log_offset(&log);
+        assert!(header_len > 0 && header_len < 4096, "{header_len}");
+        let proc = Proc::spawn("t", "/bin/true", &[], &Default::default(), &log)
+            .await
+            .unwrap();
+        proc.wait_exit(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with(LAUNCH_LOG_PREFIX), "{text}");
+        assert_eq!(
+            std::fs::metadata(tmp.path().join("vmlab-hv.log.1"))
+                .unwrap()
+                .len(),
+            LOG_ROTATE_BYTES
+        );
+    }
 
     #[tokio::test]
     async fn apple_smc_osk_is_redacted_in_headers_output_and_startup_errors() {

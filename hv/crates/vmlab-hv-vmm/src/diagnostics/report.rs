@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use log::{LevelFilter, Log, Metadata, Record};
@@ -15,6 +15,10 @@ use vmlab_hv_proto::control::ProcessExitReason;
 
 const LOG_CAPACITY: usize = 1024;
 const MESSAGE_LIMIT: usize = 4096;
+/// The most bytes the logger writes to stderr in one process: what vmlab
+/// keeps as `vmlab-hv.log`. The crash report's last line is written past it.
+const STDERR_CAP: u64 = 64 << 20;
+static STDERR_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static LOGGER: OnceLock<Recorder> = OnceLock::new();
 static CONTEXT: OnceLock<Context> = OnceLock::new();
 static STDERR: Mutex<()> = Mutex::new(());
@@ -112,7 +116,7 @@ impl Log for Recorder {
     }
 
     fn log(&self, record: &Record<'_>) {
-        let mut message = self.scrub(&record.args().to_string());
+        let mut message = self.bounded_message(record.args());
         truncate(&mut message, MESSAGE_LIMIT);
         let thread = std::thread::current();
         let name = thread.name().unwrap_or("unnamed");
@@ -137,7 +141,16 @@ impl Log for Recorder {
         ) {
             let _output = STDERR.lock();
             if !FINISHED.load(Ordering::Acquire) {
-                let _ = writeln!(std::io::stderr().lock(), "{entry}");
+                let line = entry.to_string();
+                match stderr_admit(&STDERR_WRITTEN, line.len() as u64 + 1, STDERR_CAP) {
+                    StderrAdmit::Write => {
+                        let _ = writeln!(std::io::stderr().lock(), "{line}");
+                    }
+                    StderrAdmit::CapReached => {
+                        let _ = writeln!(std::io::stderr().lock(), "{}", stderr_cap_notice(name));
+                    }
+                    StderrAdmit::Drop => {}
+                }
             }
         }
     }
@@ -148,6 +161,31 @@ impl Log for Recorder {
 }
 
 impl Recorder {
+    /// Format a record's message without formatting more than the ring
+    /// keeps: the limit, plus the longest secret so that a secret starting
+    /// inside the limit is still whole when it is scrubbed. A secret's
+    /// prefix left at the end of a cut text is dropped too, because the
+    /// scrubbing before it can pull it inside the limit.
+    fn bounded_message(&self, args: &std::fmt::Arguments<'_>) -> String {
+        let secrets = self.secrets.read();
+        let longest = secrets.iter().map(String::len).max().unwrap_or(0);
+        let (raw, cut) = format_bounded(args, MESSAGE_LIMIT + longest);
+        drop(secrets);
+        let mut message = self.scrub(&raw);
+        if cut {
+            for secret in self.secrets.read().iter() {
+                let bytes = secret.as_bytes();
+                if let Some(k) = (1..bytes.len())
+                    .rev()
+                    .find(|&k| message.as_bytes().ends_with(&bytes[..k]))
+                {
+                    message.truncate(message.len() - k);
+                }
+            }
+        }
+        message
+    }
+
     fn scrub(&self, text: &str) -> String {
         let mut output = text.to_owned();
         for secret in self.secrets.read().iter() {
@@ -155,6 +193,75 @@ impl Recorder {
         }
         output
     }
+}
+
+/// Format `args` into at most `max` bytes, stopping the formatter there;
+/// the flag says whether anything was cut.
+fn format_bounded(args: &std::fmt::Arguments<'_>, max: usize) -> (String, bool) {
+    struct Capped {
+        text: String,
+        room: usize,
+        cut: bool,
+    }
+    impl std::fmt::Write for Capped {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            if s.len() <= self.room {
+                self.text.push_str(s);
+                self.room -= s.len();
+                return Ok(());
+            }
+            let mut end = self.room;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.push_str(&s[..end]);
+            self.room = 0;
+            self.cut = true;
+            Err(std::fmt::Error)
+        }
+    }
+    let mut out = Capped {
+        text: String::new(),
+        room: max,
+        cut: false,
+    };
+    let _ = std::fmt::Write::write_fmt(&mut out, *args);
+    (out.text, out.cut)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StderrAdmit {
+    Write,
+    CapReached,
+    Drop,
+}
+
+/// Whether a stderr line of `len` bytes fits under `cap`, given what
+/// `written` says has gone out. The first line that does not fit is
+/// replaced by one notice, and every later line is dropped. Called under
+/// the `STDERR` lock.
+fn stderr_admit(written: &AtomicU64, len: u64, cap: u64) -> StderrAdmit {
+    let before = written.load(Ordering::Relaxed);
+    if before >= cap {
+        return StderrAdmit::Drop;
+    }
+    if before.saturating_add(len) > cap {
+        written.store(cap, Ordering::Relaxed);
+        return StderrAdmit::CapReached;
+    }
+    written.store(before + len, Ordering::Relaxed);
+    StderrAdmit::Write
+}
+
+fn stderr_cap_notice(thread: &str) -> Value {
+    json!({
+        "unix_ns": super::flight::unix_ns(), "level": "WARN", "thread": thread,
+        "target": "vmlab_hv_vmm::diagnostics",
+        "message": format!(
+            "stderr log cap of {} MiB reached; later records stay only in the crash report ring",
+            STDERR_CAP >> 20
+        ),
+    })
 }
 
 fn truncate(text: &mut String, limit: usize) {
@@ -541,6 +648,75 @@ mod tests {
         let logs = logger.logs.lock();
         assert_eq!(logs.len(), LOG_CAPACITY);
         assert_eq!(logs[0]["level"], "DEBUG");
+    }
+
+    #[test]
+    fn a_huge_message_is_cut_while_it_is_formatted() {
+        let logger = Recorder {
+            filter: RwLock::new(parse_filter("off").unwrap()),
+            logs: Mutex::new(VecDeque::new()),
+            secrets: RwLock::new(vec![]),
+        };
+        let huge = vec![0xabu8; 1 << 20];
+        let (text, cut) = format_bounded(&format_args!("{huge:?}"), 100);
+        assert!(cut);
+        assert_eq!(text.len(), 100);
+        assert_eq!(format_bounded(&format_args!("{}", 7), 100), ("7".into(), false));
+
+        logger.log(
+            &Record::builder()
+                .level(log::Level::Warn)
+                .args(format_args!("guest buffer {huge:?}"))
+                .build(),
+        );
+        let logs = logger.logs.lock();
+        assert!(logs[0]["message"].as_str().unwrap().len() <= MESSAGE_LIMIT);
+    }
+
+    #[test]
+    fn a_secret_across_the_cut_is_scrubbed_or_dropped() {
+        let secret = (0..40)
+            .map(|n| char::from(b'a' + n % 26))
+            .collect::<String>();
+        let logger = Recorder {
+            filter: RwLock::new(parse_filter("off").unwrap()),
+            logs: Mutex::new(VecDeque::new()),
+            secrets: RwLock::new(vec![secret.clone()]),
+        };
+        // Secrets before the cut shrink the text when they are scrubbed;
+        // one straddling the limit and one cut at the formatting bound
+        // must both stay hidden.
+        for pad in [0, 1, 17, 39, 40, 41, 100] {
+            let filler = "x".repeat(MESSAGE_LIMIT - 20 - pad);
+            let text = format!("{secret}{filler}{secret}{secret}{secret}");
+            let message = logger.bounded_message(&format_args!("{text}"));
+            let mut kept = message.clone();
+            truncate(&mut kept, MESSAGE_LIMIT);
+            for k in 8..=secret.len() {
+                assert!(!kept.contains(&secret[..k]), "pad {pad}: {k} bytes leaked");
+            }
+        }
+    }
+
+    #[test]
+    fn stderr_stops_at_its_cap_with_one_notice() {
+        let written = AtomicU64::new(0);
+        let mut admitted = Vec::new();
+        for _ in 0..10 {
+            admitted.push(stderr_admit(&written, 30, 100));
+        }
+        assert_eq!(
+            admitted[..5],
+            [
+                StderrAdmit::Write,
+                StderrAdmit::Write,
+                StderrAdmit::Write,
+                StderrAdmit::CapReached,
+                StderrAdmit::Drop
+            ]
+        );
+        assert!(admitted[5..].iter().all(|a| *a == StderrAdmit::Drop));
+        assert_eq!(stderr_cap_notice("t")["level"], "WARN");
     }
 
     #[test]
