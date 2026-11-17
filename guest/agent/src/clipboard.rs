@@ -28,6 +28,7 @@ pub const NO_DESKTOP_LOGON: &str = "no one is logged on to the desktop; the Wind
 /// (code review F61b). The reply is one control frame, which cannot carry
 /// more, so reading further would only hold a hostile helper's output in
 /// memory to fail with afterwards.
+#[cfg(unix)]
 pub const MAX_CLIPBOARD: usize = vmlab_agent_proto::MAX_PAYLOAD;
 
 /// What a clipboard tool printed, read no further than [`MAX_CLIPBOARD`].
