@@ -801,11 +801,11 @@ impl Report {
 
 /// The legacy tier is checked strictly guest-first, with no fallback hello,
 /// so a C agent that stopped announcing itself fails conformance.
-fn greeting(tier: &str) -> super::vm_agent::Greeting {
+fn greeting(tier: &str) -> crate::labd::vm_agent::Greeting {
     if tier == "legacy" {
-        super::vm_agent::Greeting::GuestFirst { fallback: false }
+        crate::labd::vm_agent::Greeting::GuestFirst { fallback: false }
     } else {
-        super::vm_agent::Greeting::HostFirst
+        crate::labd::vm_agent::Greeting::HostFirst
     }
 }
 
