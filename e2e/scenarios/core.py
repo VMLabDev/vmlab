@@ -7,7 +7,7 @@ import json
 import os
 import pathlib
 import re
-import tempfile
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -33,14 +33,15 @@ def parallel_provisions(lab):
     """Rendezvous only in the measured up, never in partial/reload ups."""
     script = lab / "scripts/prov.ws"
     original = script.read_text()
-    # A new directory per measurement prevents old arrivals passing the check.
-    with tempfile.TemporaryDirectory(prefix="e2e-provision-", dir=lab) as barrier:
-        source = (E2E / "labs/core-lab/scripts/parallel.ws").read_text()
-        script.write_text(source.replace('"BARRIER_DIR"', json.dumps(barrier)))
-        try:
-            yield
-        finally:
-            script.write_text(original)
+    # A fresh guest path prevents old arrivals passing the check. The guests
+    # are destroyed by the scenario, taking these temporary markers with them.
+    marker = "/tmp/e2e-provision-" + uuid.uuid4().hex
+    source = (E2E / "labs/core-lab/scripts/parallel.ws").read_text()
+    script.write_text(source.replace('"BARRIER_PATH"', json.dumps(marker)))
+    try:
+        yield
+    finally:
+        script.write_text(original)
 
 
 def pinned_tsc(h, lab):
