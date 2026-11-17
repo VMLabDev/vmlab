@@ -272,7 +272,7 @@ impl Fixture {
     }
 
     pub(in crate::labd) async fn run(&self, tier: &str, root: Option<String>) -> Result<()> {
-        let handle = AgentHandle::connect_serial(&self.socket, BUDGET, tier == "legacy").await?;
+        let handle = AgentHandle::connect_serial(&self.socket, BUDGET, greeting(tier)).await?;
         let root = root.unwrap_or_else(|| self.dir.path().to_string_lossy().into_owned());
         let mut report = Report::default();
         macro_rules! check {
@@ -401,7 +401,7 @@ impl Fixture {
                     for mode in [ShutdownMode::Reboot, ShutdownMode::Halt] {
                         let fixture = Fixture::process(bin, transport, args.clone()).await?;
                         let client =
-                            AgentHandle::connect_serial(&fixture.socket, BUDGET, tier == "legacy")
+                            AgentHandle::connect_serial(&fixture.socket, BUDGET, greeting(tier))
                                 .await?;
                         client.shutdown_guest(mode, BUDGET).await?;
                         ensure(fixture.trace.lock().unwrap().ctrl.iter().any(|m|
@@ -796,6 +796,16 @@ impl Report {
             self.failures.is_empty(),
             &format!("failed cases: {}", self.failures.join(", ")),
         )
+    }
+}
+
+/// The legacy tier is checked strictly guest-first, with no fallback hello,
+/// so a C agent that stopped announcing itself fails conformance.
+fn greeting(tier: &str) -> super::vm_agent::Greeting {
+    if tier == "legacy" {
+        super::vm_agent::Greeting::GuestFirst { fallback: false }
+    } else {
+        super::vm_agent::Greeting::HostFirst
     }
 }
 
