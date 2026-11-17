@@ -2015,7 +2015,12 @@ mod tests {
 
     #[test]
     fn plain_http_credentials_only_for_a_literal_loopback_registry() {
-        for host in ["localhost:5000", "127.0.0.1:5000", "127.8.9.10:5000", "[::1]:5000"] {
+        for host in [
+            "localhost:5000",
+            "127.0.0.1:5000",
+            "127.8.9.10:5000",
+            "[::1]:5000",
+        ] {
             let transport = private_transport(host);
             assert!(transport.base.starts_with("http://"), "{host}");
             let url = format!("http://{host}/v2/").parse().unwrap();
