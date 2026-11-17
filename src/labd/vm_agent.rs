@@ -3696,14 +3696,20 @@ mod tests {
             );
             port.write_all(&[0]).await.unwrap();
             let mut agent = UnixStream::connect(mock_path).await.unwrap();
-            tokio::io::copy_bidirectional(&mut port, &mut agent).await.unwrap();
+            tokio::io::copy_bidirectional(&mut port, &mut agent)
+                .await
+                .unwrap();
         });
         for _ in 0..2 {
-            assert!(AgentHandle::connect_serial(&path, Duration::from_millis(100), true)
-                .await
-                .is_err());
+            assert!(
+                AgentHandle::connect_serial(&path, Duration::from_millis(100), true)
+                    .await
+                    .is_err()
+            );
         }
-        let agent = AgentHandle::connect_serial(&path, HANDSHAKE, true).await.unwrap();
+        let agent = AgentHandle::connect_serial(&path, HANDSHAKE, true)
+            .await
+            .unwrap();
         assert_eq!(agent.info().os, "linux");
         assert!(agent.ping(HANDSHAKE).await);
         agent.shutdown().await;

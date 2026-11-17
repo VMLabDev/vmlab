@@ -187,11 +187,13 @@ fn run_with(platform: PlatformImpl) -> ! {
     #[cfg(unix)]
     if unix::is_legacy_serial() {
         let announcer = mux.clone();
-        std::thread::spawn(move || loop {
-            // A queued announcement survives concurrent session writes and
-            // lets an ISA-serial host reconnect without speaking first.
-            announcer.announce_serial();
-            std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::spawn(move || {
+            loop {
+                // A queued announcement survives concurrent session writes and
+                // lets an ISA-serial host reconnect without speaking first.
+                announcer.announce_serial();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
         });
     }
     #[cfg(windows)]

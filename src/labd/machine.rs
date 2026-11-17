@@ -1126,7 +1126,8 @@ impl AgentSlot {
         AgentHandle::connect_serial(
             sock,
             timeout,
-            self.wait_for_guest.load(std::sync::atomic::Ordering::Relaxed),
+            self.wait_for_guest
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
         .await
     }
