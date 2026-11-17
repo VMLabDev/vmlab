@@ -32,7 +32,7 @@ main:
 # Everything a change must pass before it can merge
 [group('ci')]
 check: path-check shell-paths release-version release-dry-run kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
-	@printf 'Test results: %s/test-results/main.json\nTest results: %s/test-results/hv.json\n' {{quote(test_result_root)}} {{quote(test_result_root)}}
+	@python3 -c 'import pathlib, sys; root = pathlib.Path(sys.argv[1]); [print("Test results:", root / "test-results" / (name + ".json")) for name in sys.argv[2:]]' {{quote(test_result_root)}} main hv tap wscript guest-cinit-proto guest-cinit guest-agent-proto guest-agent agent-conformance
 
 # Prove absent-device skip and required-device failure without booting a guest
 [group('ci')]
@@ -42,11 +42,11 @@ kvm-policy-test: require-cargo require-bwrap
 # The excluded TAP helper and patched wscript dependencies are not swept by host tests
 [group('ci')]
 tap-test: require-cargo
-	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'tap') + ' ' } }}cargo test --manifest-path tap/Cargo.toml
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'tap') + ' ' } }}python3 scripts/ci_test.py tap --manifest-path tap/Cargo.toml
 
 [group('ci')]
 wscript-test: require-cargo
-	{{host_target_env}}cargo test -p wscript-core -p wscript-compiler
+	{{host_target_env}}python3 scripts/ci_test.py wscript -p wscript-core -p wscript-compiler
 
 # Refuse tracked paths that Windows cannot check out (: * ? " < > | \, trailing dot or space)
 [group('ci')]
@@ -90,14 +90,14 @@ test: require-cargo require-bwrap
 [group('ci')]
 agent-conformance: require-cargo require-bwrap require-waypipe
 	cargo build --manifest-path guest/agent/Cargo.toml --target-dir {{quote(agent_target)}}
-	{{host_target_env}}VMLAB_CONFORMANCE_AGENT={{quote(agent_target / 'debug/vmlab-agent')}} VMLAB_CONFORMANCE_TIER=full cargo test --lib external_agent -- --ignored --nocapture --test-threads=1
+	{{host_target_env}}VMLAB_CONFORMANCE_AGENT={{quote(agent_target / 'debug/vmlab-agent')}} VMLAB_CONFORMANCE_TIER=full python3 scripts/ci_test.py agent-conformance --lib external_agent -- --ignored --nocapture --test-threads=1
 
 # Format check, lint and test one guest-side crate
 [group('ci')]
 guest-crate-check crate: require-cargo
 	cargo fmt --check --manifest-path guest/{{crate}}/Cargo.toml
 	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}cargo clippy --all-targets --manifest-path guest/{{crate}}/Cargo.toml -- -D warnings
-	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}cargo test --manifest-path guest/{{crate}}/Cargo.toml
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}python3 scripts/ci_test.py guest-{{crate}} --manifest-path guest/{{crate}}/Cargo.toml
 
 # Check every guest-side crate (standalone workspaces the host build never sweeps in)
 [group('ci')]

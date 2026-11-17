@@ -13,6 +13,10 @@ def main():
                                "--format", "json", "--report-time"],
                    dict(os.environ, RUSTC_BOOTSTRAP="1"))
     name, *args = sys.argv[1:]
+    harness = []
+    if "--" in args:
+        split = args.index("--")
+        args, harness = args[:split], args[split:]
     root = Path(os.environ.get("VMLAB_TARGET_ROOT", "target"))
     if str(root) in ("", "/"):
         raise SystemExit("unsafe VMLAB_TARGET_ROOT")
@@ -29,7 +33,8 @@ def main():
     env[runner_key] = shlex.join([sys.executable, str(Path(__file__).resolve()), "--run"])
     # Keep the runner out of rustdoc as well. Cargo otherwise passes it as
     # --test-runtool, which breaks dependency loading on the pinned toolchain.
-    command = ["cargo", "test", *args, "--lib", "--bins", "--tests"]
+    targets = [] if "--lib" in args else ["--lib", "--bins", "--tests"]
+    command = ["cargo", "test", *args, *targets, *harness]
     with result.open("w") as output:
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                               text=True) as process:
@@ -37,7 +42,7 @@ def main():
                 output.write(line)
                 print(line, end="", flush=True)
             status = process.wait()
-    if status == 0 and "--no-run" not in args:
+    if status == 0 and "--no-run" not in args and not harness and "--lib" not in args:
         status = subprocess.run(["cargo", "test", *args, "--doc"],
                                 env=os.environ.copy()).returncode
     print(f"Test results ({name}, exit {status}): {result}", flush=True)
