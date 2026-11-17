@@ -3,7 +3,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{COMPRESSED_BIT, COPIED_BIT, OFFSET_MASK, Qcow2Image, ZERO_BIT};
+use super::{COMPRESSED_BIT, COPIED_BIT, OFFSET_MASK, Qcow2Image, ZERO_BIT, checked_file_range};
 use crate::{Error, Result, SnapshotInfo};
 
 /// One snapshot table entry, as stored on disk.
@@ -67,20 +67,28 @@ impl SnapshotEntry {
 }
 
 impl Qcow2Image {
-    /// Parse the snapshot table with a private read handle (`snapshots()` is
-    /// `&self`).
+    pub(crate) fn finish_snapshot_change<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() && self.snapshot_mutating {
+            self.poisoned = true;
+        }
+        self.snapshot_mutating = false;
+        result
+    }
+
+    /// Positioned reads retain the opened inode without sharing a seek cursor.
     fn parse_table(&self) -> Result<Vec<SnapshotEntry>> {
         if self.nb_snapshots == 0 {
             return Ok(Vec::new());
         }
-        let mut file = std::fs::File::open(&self.path)?;
-        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::FileExt;
+        let file = &self.file;
+        let file_len = file.metadata()?.len();
         let mut off = self.snapshots_offset;
+        checked_file_range(file_len, off, u64::from(self.nb_snapshots) * 40)?;
         let mut entries = Vec::with_capacity(self.nb_snapshots as usize);
         for _ in 0..self.nb_snapshots {
             let mut fixed = [0u8; 40];
-            file.seek(SeekFrom::Start(off))?;
-            file.read_exact(&mut fixed)?;
+            file.read_exact_at(&mut fixed, off)?;
             let l1_table_offset = u64::from_be_bytes(fixed[0..8].try_into().unwrap());
             let l1_size = u32::from_be_bytes(fixed[8..12].try_into().unwrap());
             let id_len = u16::from_be_bytes(fixed[12..14].try_into().unwrap()) as usize;
@@ -90,14 +98,20 @@ impl Qcow2Image {
             let vm_clock_nsec = u64::from_be_bytes(fixed[24..32].try_into().unwrap());
             let vm_state_size = u32::from_be_bytes(fixed[32..36].try_into().unwrap());
             let extra = u32::from_be_bytes(fixed[36..40].try_into().unwrap()) as usize;
-            let mut extra_buf = vec![0u8; extra];
-            file.read_exact(&mut extra_buf)?;
+            let entry_len = (40 + extra + id_len + name_len) as u64;
+            checked_file_range(file_len, off, entry_len)?;
+            checked_file_range(file_len, l1_table_offset, u64::from(l1_size) * 8)?;
+            // Only the first two extra fields are consumed. Never allocate
+            // according to an untrusted extra-data length.
+            let mut extra_buf = [0u8; 16];
+            let used = extra.min(extra_buf.len());
+            file.read_exact_at(&mut extra_buf[..used], off + 40)?;
             let vm_state_size_large =
                 (extra >= 8).then(|| u64::from_be_bytes(extra_buf[0..8].try_into().unwrap()));
             let disk_size =
                 (extra >= 16).then(|| u64::from_be_bytes(extra_buf[8..16].try_into().unwrap()));
             let mut ids = vec![0u8; id_len + name_len];
-            file.read_exact(&mut ids)?;
+            file.read_exact_at(&mut ids, off + 40 + extra as u64)?;
             let id = String::from_utf8_lossy(&ids[..id_len]).into_owned();
             let name = String::from_utf8_lossy(&ids[id_len..]).into_owned();
             entries.push(SnapshotEntry {
@@ -112,7 +126,9 @@ impl Qcow2Image {
                 vm_state_size_large,
                 disk_size,
             });
-            off += ((40 + extra + id_len + name_len) as u64).div_ceil(8) * 8;
+            off = off
+                .checked_add(entry_len.div_ceil(8) * 8)
+                .ok_or_else(|| Error::Unsupported("snapshot table offset overflow".into()))?;
         }
         Ok(entries)
     }
@@ -130,7 +146,8 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let entry = entries
             .iter()
-            .find(|e| e.name == name || e.id == name)
+            .find(|e| e.id == name)
+            .or_else(|| entries.iter().find(|e| e.name == name))
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let info = entry.info();
         let disk_size = entry.disk_size;
@@ -162,12 +179,14 @@ impl Qcow2Image {
             ));
         }
         let entries = self.parse_table()?;
-        if entries.iter().any(|e| e.name == name) {
+        if entries.iter().any(|e| e.name == name || e.id == name) {
             return Err(Error::Unsupported(format!(
                 "snapshot {name:?} already exists"
             )));
         }
-        let id = next_snapshot_id(&entries);
+        let id = next_snapshot_id(&entries, name)?;
+
+        self.snapshot_mutating = true;
 
         // The active L1 must cover the vmstate area too.
         if vm_state_size > 0 {
@@ -178,7 +197,7 @@ impl Qcow2Image {
         // Everything reachable from the active L1 becomes shared with the
         // snapshot that will point at the same L2 tables and clusters.
         let snap_l1_pre = self.l1.clone();
-        self.walk_refcounts(&snap_l1_pre, 1)?;
+        let mut changed = self.walk_refcounts(&snap_l1_pre, 1)?;
 
         // Punch the vmstate out of the active layer; the snapshot L1 (cloned
         // above) keeps pointing at the original L2 tables and data.
@@ -186,7 +205,13 @@ impl Qcow2Image {
             self.punch_vmstate(vm_state_size)?;
         }
 
-        self.rewrite_active_copied_bits()?;
+        changed.extend(
+            self.l1
+                .iter()
+                .map(|e| e & OFFSET_MASK)
+                .filter(|&host| host != 0),
+        );
+        self.rewrite_copied_bits(Some(&changed))?;
 
         // Snapshot L1 values with copied bits recomputed from the final
         // refcounts (vmstate L2s are back to rc 1; the rest is shared).
@@ -301,10 +326,31 @@ impl Qcow2Image {
     /// is only accurate in the active view, so it must be rebuilt whenever
     /// the active L1 or the refcounts change.
     pub(crate) fn rewrite_active_copied_bits(&mut self) -> Result<()> {
+        self.rewrite_copied_bits(None)
+    }
+
+    fn rewrite_copied_bits(
+        &mut self,
+        changed: Option<&std::collections::BTreeSet<u64>>,
+    ) -> Result<()> {
         for l1_index in 0..self.l1.len() {
             let l2_host = self.l1[l1_index] & OFFSET_MASK;
             if l2_host == 0 {
                 continue;
+            }
+            if let Some(changed) = changed
+                && !changed.contains(&l2_host)
+            {
+                // A COWed L2 may still reference data also held by a
+                // snapshot's older L2, including aliases at other guest
+                // offsets. Filter by data references, not table identity.
+                if !self.l2_data_ranges.contains_key(&l2_host) {
+                    self.load_l2(l2_host)?;
+                }
+                let &(first, last) = self.l2_data_ranges.get(&l2_host).expect("loaded range");
+                if first > last || changed.range(first..=last).next().is_none() {
+                    continue;
+                }
             }
             let want = if self.get_refcount(l2_host / self.cluster_size)? == 1 {
                 COPIED_BIT
@@ -352,7 +398,8 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let entry = entries
             .iter()
-            .find(|e| e.name == name || e.id == name)
+            .find(|e| e.id == name)
+            .or_else(|| entries.iter().find(|e| e.name == name))
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let info = entry.info();
         let snap_l1_size = entry.l1_size;
@@ -369,9 +416,10 @@ impl Qcow2Image {
 
         // Raise the snapshot's references first so clusters referenced by
         // both the old and the new view never drop to zero.
-        self.walk_refcounts(&snap_l1, 1)?;
+        self.snapshot_mutating = true;
+        let mut changed = self.walk_refcounts(&snap_l1, 1)?;
         let old_active = self.l1.clone();
-        self.walk_refcounts(&old_active, -1)?;
+        changed.extend(self.walk_refcounts(&old_active, -1)?);
 
         // Install the snapshot's L1 as the active table.
         self.ensure_l1_size(snap_l1_size)?;
@@ -385,7 +433,7 @@ impl Qcow2Image {
         self.header_dirty = true;
         self.l1_dirty = true;
 
-        self.rewrite_active_copied_bits()?;
+        self.rewrite_copied_bits(Some(&changed))?;
         self.flush_metadata()?;
         self.file.sync_all()?;
         Ok(info)
@@ -398,7 +446,8 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let pos = entries
             .iter()
-            .position(|e| e.name == name || e.id == name)
+            .position(|e| e.id == name)
+            .or_else(|| entries.iter().position(|e| e.name == name))
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let entry_l1_offset = entries[pos].l1_table_offset;
         let entry_l1_size = entries[pos].l1_size;
@@ -411,7 +460,8 @@ impl Qcow2Image {
             .iter()
             .map(|c| u64::from_be_bytes(*c))
             .collect();
-        self.walk_refcounts(&snap_l1, -1)?;
+        self.snapshot_mutating = true;
+        let changed = self.walk_refcounts(&snap_l1, -1)?;
         for idx in 0..self.l1_bytes_clusters(entry_l1_size) {
             self.dec_refcount(entry_l1_offset / self.cluster_size + idx)?;
         }
@@ -421,7 +471,7 @@ impl Qcow2Image {
         self.rewrite_snapshot_table(&remaining)?;
         // Clusters that were shared with this snapshot may now be
         // exclusively owned by the active layer again.
-        self.rewrite_active_copied_bits()?;
+        self.rewrite_copied_bits(Some(&changed))?;
         self.flush_metadata()?;
         self.file.sync_all()?;
         Ok(())
@@ -478,11 +528,20 @@ impl Qcow2Image {
     }
 }
 
-fn next_snapshot_id(entries: &[SnapshotEntry]) -> String {
+fn next_snapshot_id(entries: &[SnapshotEntry], name: &str) -> Result<String> {
     let max = entries
         .iter()
         .filter_map(|e| e.id.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
-    (max + 1).to_string()
+    let mut candidate = max;
+    loop {
+        candidate = candidate
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("snapshot ID space exhausted".into()))?;
+        let id = candidate.to_string();
+        if id != name && !entries.iter().any(|e| e.name == id) {
+            return Ok(id);
+        }
+    }
 }
