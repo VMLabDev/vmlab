@@ -2915,16 +2915,16 @@ mod tests {
             sessions.watcher.overflow();
             sessions.watcher.unmute();
             let (guest, watcher) = (guest.clone(), sessions.watcher.clone());
-            tokio::spawn(async move {
+            (tokio::spawn(async move {
                 for i in 0..100 {
                     guest.file("/src/busy.txt", &i.to_string(), 101 + i);
                     // Like a saturated queue, give no usable named events.
                     watcher.overflow();
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            })
+            }),)
         };
-        let (result, writer) = tokio::join!(capture, overflow);
+        let (result, (writer,)) = tokio::join!(capture, overflow);
         writer.abort();
         let refused = result.expect_err("overflow must not let a moving file into capture");
         let said = format!("{refused:#}");
