@@ -97,7 +97,7 @@ agent-conformance: require-cargo require-bwrap require-waypipe
 guest-crate-check crate: require-cargo
 	cargo fmt --check --manifest-path guest/{{crate}}/Cargo.toml
 	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}cargo clippy --all-targets --manifest-path guest/{{crate}}/Cargo.toml -- -D warnings
-	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}python3 scripts/ci_test.py guest-{{crate}} --manifest-path guest/{{crate}}/Cargo.toml {{ if crate == 'cinit' || crate == 'agent' { '--bins' } else { '' } }}
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}python3 scripts/ci_test.py guest-{{crate}} --manifest-path guest/{{crate}}/Cargo.toml {{ if crate == 'cinit' || crate == 'agent' { '--bins --tests' } else { '' } }}
 
 # Check every guest-side crate (standalone workspaces the host build never sweeps in)
 [group('ci')]
