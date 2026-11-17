@@ -12,7 +12,7 @@ S1  A shell script turns on errexit (`set -e`) before its first command.
     Files with no shebang are sourced libraries and are not checked.
 
 P1  An argument of cp, rsync, mv, rm, install, chown or chmod that starts with
-    a variable or a command substitution, and is followed by `/` or ends
+    a variable or a command substitution, and is followed by `/`, a glob, or ends
     there, needs that variable to be safe at that point. The file is read top
     to bottom, and a variable becomes safe by:
       - a test on the whole variable inside `[ ]`, `[[ ]]` or `test`: -n, -d,
@@ -71,7 +71,7 @@ COMPARE = {"!=", "=", "=="}
 # A variable name, with an optional array subscript: `srcdir[$name]` is its own name.
 NAME = r"\w+(?:\[[^\]]*\])?"
 WHOLE_VAR = re.compile(r"^\$(?:\{(" + NAME + r")\}|(\w+))$")
-VAR_BASE = re.compile(r"^\$(?:\{(" + NAME + r")[^}]*\}|(\w+))(/|$)")
+VAR_BASE = re.compile(r"^\$(?:\{(" + NAME + r")[^}]*\}|(\w+))(/|[*?\[]|$)")
 GUARD_EXPAND = re.compile(r"\$\{(" + NAME + r"):\?")
 ASSIGN = re.compile(r"^(" + NAME + r")\+?=(.*)$", re.DOTALL)
 EXPANSION = re.compile(r"\$\{[^}]*\}|\$\w+|\$[#?@*!$-]")
@@ -168,6 +168,8 @@ def whole_var(token: str) -> str | None:
 
 def safe_value(value: str) -> bool:
     """True when the value of an assignment can be neither empty nor `/`."""
+    if re.fullmatch(r"\$\{" + NAME + r":\?[^}]*\}", value):
+        return True
     literal = EXPANSION.sub("", DEFAULT.sub(r"\1", value))
     return any(c not in "/." for c in literal)
 
