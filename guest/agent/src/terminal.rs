@@ -10,11 +10,18 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 
 use crate::mux::{Input, Mux, pump_out};
 use crate::spawn::{Identity, Spawned, Spawner, TerminalSpec};
+
+/// How long the output a shell left behind may take to drain once it has
+/// exited. A background job still holding the terminal keeps the output
+/// stream open for as long as it lives, so the session cannot wait for the
+/// stream's end before reporting the exit.
+const DRAIN: Duration = Duration::from_secs(2);
 
 pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec: TerminalSpec) {
     let mux = &mux.for_channel(id);
@@ -77,18 +84,27 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
     }
 
     // Output pump: terminal → host.
-    let out_pump = {
+    let (pumped, out_pump) = std::sync::mpsc::channel::<()>();
+    {
         let (mux, credit) = (mux.clone(), credit.clone());
-        thread::spawn(move || pump_out(&mux, id, FrameKind::Data, &credit, output))
-    };
+        thread::spawn(move || {
+            pump_out(&mux, id, FrameKind::Data, &credit, output);
+            drop(pumped);
+        });
+    }
 
     // Reaper: the shell exited, so `wait` also releases the terminal, which
-    // ends the output pump; flush it, report, clean up.
+    // ends the output pump unless a background job still holds it. Flush
+    // what drains within [`DRAIN`], report, clean up; closing the session
+    // stops a pump still running.
     let mux = mux.clone();
     thread::spawn(move || {
         let code = wait();
         done.store(true, Ordering::SeqCst);
-        let _ = out_pump.join();
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = out_pump.recv_timeout(DRAIN) {
+            // Whatever the job writes from here on is not this session's.
+            credit.close();
+        }
         // The channel-bound mux suppresses this reply after host close.
         mux.send_ctrl(&AgentMsg::Exited { id, code });
         mux.remove_finished(id);

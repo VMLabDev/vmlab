@@ -55,6 +55,28 @@ pub fn unsubscribe() {
     cv.notify_all();
 }
 
+/// Drop the subscription `mux`'s port holds, if it holds the current one:
+/// a host re-handshake ends every session of the previous host, and its
+/// samples with them.
+pub fn release(mux: &Mux) {
+    let Some((lock, cv)) = STATE.get() else {
+        return; // nothing ever subscribed
+    };
+    if release_from(&mut lock.lock().unwrap(), mux) {
+        cv.notify_all();
+    }
+}
+
+/// Clear `sub` if it sends to `mux`'s port; whether it did.
+fn release_from(sub: &mut Sub, mux: &Mux) -> bool {
+    if !sub.mux.as_ref().is_some_and(|m| m.same_port(mux)) {
+        return false;
+    }
+    sub.interval = None;
+    sub.mux = None;
+    true
+}
+
 /// The counters this tick measures against: none on a fresh subscription,
 /// whose tick only records the baseline the next one reports from.
 fn baseline<T>(prev: Option<T>, fresh: bool) -> Option<T> {
@@ -94,7 +116,26 @@ fn sampler() {
 
 #[cfg(test)]
 mod tests {
-    use super::baseline;
+    use super::{Sub, baseline, release_from};
+    use crate::testutil::capture_mux;
+    use std::time::Duration;
+
+    /// A re-handshake on the subscribing port ends the subscription; one on
+    /// another port leaves it alone.
+    #[test]
+    fn a_rehandshake_releases_only_its_own_ports_subscription() {
+        let (ours, _cap) = capture_mux();
+        let (other, _other_cap) = capture_mux();
+        let mut sub = Sub {
+            interval: Some(Duration::from_secs(5)),
+            mux: Some(ours.clone()),
+            fresh: false,
+        };
+        assert!(!release_from(&mut sub, &other));
+        assert!(sub.interval.is_some());
+        assert!(release_from(&mut sub, &ours.for_channel(3)));
+        assert!(sub.interval.is_none() && sub.mux.is_none());
+    }
 
     #[test]
     fn a_fresh_subscription_reports_nothing_until_it_has_a_baseline() {
