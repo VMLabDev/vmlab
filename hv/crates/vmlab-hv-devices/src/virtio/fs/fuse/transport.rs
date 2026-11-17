@@ -903,7 +903,14 @@ mod tests {
     fn zero_length_descriptors_are_skipped_by_split() {
         let (mut z0, mut z1, mut z2, mut z3) = ([0u8; 0], [0u8; 0], [0u8; 0], [0u8; 0]);
         let (mut a, mut b) = ([0u8; 8], [0u8; 8]);
-        let mut buffers = io_buffers(vec![&mut z0[..], &mut a[..], &mut z1[..], &mut z2[..], &mut b[..], &mut z3[..]]);
+        let mut buffers = io_buffers(vec![
+            &mut z0[..],
+            &mut a[..],
+            &mut z1[..],
+            &mut z2[..],
+            &mut b[..],
+            &mut z3[..],
+        ]);
         assert_eq!(buffers.available_bytes(), 16);
         let other = buffers.split_at(8).unwrap();
         assert_eq!(lengths(&buffers), [0, 8, 0, 0]);
@@ -923,7 +930,13 @@ mod tests {
         let (mut z0, mut z1, mut z2) = ([0u8; 0], [0u8; 0], [0u8; 0]);
         let mut a = [1u8, 2, 3];
         let mut b = [4u8, 5];
-        let mut reader = Reader::from_slices(vec![&mut z0[..], &mut a[..], &mut z1[..], &mut b[..], &mut z2[..]]);
+        let mut reader = Reader::from_slices(vec![
+            &mut z0[..],
+            &mut a[..],
+            &mut z1[..],
+            &mut b[..],
+            &mut z2[..],
+        ]);
         let mut out = [0u8; 8];
         let mut read = 0;
         loop {
@@ -960,7 +973,8 @@ mod tests {
         let (mut z0, mut z1) = ([0u8; 0], [0u8; 0]);
         let (mut a, mut b) = ([0u8; 2], [0u8; 3]);
         {
-            let mut writer = Writer::from_slices(vec![&mut a[..], &mut z0[..], &mut z1[..], &mut b[..]]);
+            let mut writer =
+                Writer::from_slices(vec![&mut a[..], &mut z0[..], &mut z1[..], &mut b[..]]);
             writer.write_all(&[9, 8, 7, 6, 5]).unwrap();
             assert_eq!(writer.bytes_written(), 5);
         }

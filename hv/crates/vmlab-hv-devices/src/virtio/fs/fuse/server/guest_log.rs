@@ -156,11 +156,7 @@ pub(crate) mod tests {
         }
         assert_eq!(lines.lock().len(), GUEST_LOG_BURST as usize);
 
-        log.log_at(
-            start + GUEST_LOG_WINDOW,
-            Level::Warn,
-            format_args!("after"),
-        );
+        log.log_at(start + GUEST_LOG_WINDOW, Level::Warn, format_args!("after"));
         let lines = lines.lock();
         assert_eq!(lines.len(), GUEST_LOG_BURST as usize + 2);
         let notice = &lines[GUEST_LOG_BURST as usize].1;

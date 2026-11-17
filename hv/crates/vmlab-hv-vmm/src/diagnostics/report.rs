@@ -661,7 +661,10 @@ mod tests {
         let (text, cut) = format_bounded(&format_args!("{huge:?}"), 100);
         assert!(cut);
         assert_eq!(text.len(), 100);
-        assert_eq!(format_bounded(&format_args!("{}", 7), 100), ("7".into(), false));
+        assert_eq!(
+            format_bounded(&format_args!("{}", 7), 100),
+            ("7".into(), false)
+        );
 
         logger.log(
             &Record::builder()

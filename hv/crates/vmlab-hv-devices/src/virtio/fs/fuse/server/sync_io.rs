@@ -916,8 +916,10 @@ impl<F: FileSystem + Sync> Server<F> {
     pub(super) fn destroy<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) {
         self.fs.destroy();
         if let Err(e) = ctx.reply_ok(None::<u8>, None) {
-            self.guest_log
-                .log(Level::Warn, format_args!("fuse: reply to DESTROY failed: {e}"));
+            self.guest_log.log(
+                Level::Warn,
+                format_args!("fuse: reply to DESTROY failed: {e}"),
+            );
         }
     }
 
@@ -1094,9 +1096,7 @@ impl<F: FileSystem, S: BitmapSlice> SrvContext<'_, F, S> {
                 Level::Warn,
                 format_args!(
                     "fuse: opcode {} request of {} bytes answered with errno {}: {err}",
-                    self.in_header.opcode,
-                    self.in_header.len,
-                    -header.error
+                    self.in_header.opcode, self.in_header.len, -header.error
                 ),
             );
         } else {

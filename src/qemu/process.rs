@@ -65,8 +65,7 @@ pub fn rotate_log(log: &Path, limit: u64) -> Result<()> {
         Ok(meta) if meta.len() >= limit => {
             let mut rotated = log.as_os_str().to_owned();
             rotated.push(".1");
-            std::fs::rename(log, &rotated)
-                .with_context(|| format!("rotating {}", log.display()))
+            std::fs::rename(log, &rotated).with_context(|| format!("rotating {}", log.display()))
         }
         _ => Ok(()),
     }
