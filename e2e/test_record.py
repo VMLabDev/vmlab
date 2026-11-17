@@ -44,6 +44,9 @@ class RecordedProbeTests(unittest.TestCase):
     def test_accepts_case_and_line_wrapping(self):
         self.assertTrue(self.check_probe("e2e login: VMLAB record\nprobe"))
 
+    def test_accepts_a_console_cursor_after_the_phrase(self):
+        self.assertTrue(self.check_probe("e2e login: VMLAB RECORD PROBE_"))
+
     def test_rejects_partial_or_unrelated_text(self):
         for text in ("VMLAB REC", "VMLAB RECORD", "PROBE", "RECORD PROBES", "Welcome to Alpine"):
             with self.subTest(text=text), self.assertRaisesRegex(AssertionError, "OCR read"):

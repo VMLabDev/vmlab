@@ -110,7 +110,8 @@ def recorded_probe(video: pathlib.Path, events: dict, png: pathlib.Path) -> bool
     text = ocr(frame_at(video, move["at"] + 0.5, png))
     # The console font's V can be read as U. Require both unambiguous words
     # in full, so a partial input such as "VMLAB REC" cannot pass.
-    assert re.search(r"\bRECORD\s+PROBE\b", text.upper()), f"OCR read {text.strip()[:200]!r}"
+    # A blinking console cursor may OCR as an underscore attached to PROBE.
+    assert re.search(r"\bRECORD\s+PROBE(?![A-Z0-9])", text.upper()), f"OCR read {text.strip()[:200]!r}"
     return True
 
 
