@@ -4,8 +4,10 @@
 //! drives the real mechanism end-to-end over throwaway sockets and either
 //! proves it works on this host or reports why it doesn't. That's what
 //! keeps the PRD's rootless guarantee intact with zero special-casing —
-//! on an unprivileged daemon the first BPF syscall fails with EPERM and
-//! the tier quietly stays userspace.
+//! without the `vmlab-fastpath` helper, or with a helper that lacks its
+//! capabilities, the first step fails and the tier quietly stays userspace.
+//! The probes drive the helper exactly as the daemon's segments do, so a
+//! tier that passes has proved the helper path too.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixDatagram, UnixStream};
@@ -25,7 +27,11 @@ const TIMEOUT: Duration = Duration::from_millis(500);
 /// Decorate permission failures with the one actionable fix.
 fn hint(msg: String) -> String {
     if msg.contains("EPERM") || msg.contains("Operation not permitted") {
-        format!("{msg} — run the vmlab daemons with CAP_BPF + CAP_NET_ADMIN to enable")
+        format!(
+            "{msg} — grant the {} helper CAP_BPF + CAP_NET_ADMIN to enable \
+             (`install.sh --fastpath`, or `sudo setcap cap_bpf,cap_net_admin+ep` on it)",
+            super::helper::HELPER_NAME
+        )
     } else {
         msg
     }
