@@ -3,7 +3,6 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -11,9 +10,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Project VMs allowed on the host at once unless `VMLAB_HV_TEST_VM_LIMIT`
-/// says otherwise. Every VM runs under a 24 GiB memory cap, so four fit the
-/// development host with headroom.
-const DEFAULT_VM_LIMIT: usize = 4;
+/// says otherwise. Only test processes holding slot locks count.
+const DEFAULT_VM_LIMIT: usize = 2;
+const VM_MEMORY_KIB: u64 = 24 * 1024 * 1024;
+const MEMORY_FLOOR_KIB: u64 = 32 * 1024 * 1024;
 
 /// A slot shared by all S1 and acceptance test processes for this user.
 pub struct VmPermit(File);
@@ -25,57 +25,35 @@ fn vm_slot_directory() -> PathBuf {
     Path::new("/tmp").join(format!("vmlab-hv-vm-slots-{uid}"))
 }
 
-fn project_vm(command_line: &[u8]) -> bool {
-    let arguments: Vec<_> = command_line.split(|byte| *byte == 0).collect();
-    let Some(program) = arguments.first() else {
-        return false;
-    };
-    let Some(name) = Path::new(std::ffi::OsStr::from_bytes(program)).file_name() else {
-        return false;
-    };
-    let name = name.as_bytes();
-    if name.starts_with(b"qemu-system-") {
-        return !arguments.contains(&b"-avd".as_slice());
+fn available_memory_kib(meminfo: &Path) -> io::Result<u64> {
+    let text = std::fs::read_to_string(meminfo)?;
+    let value = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
+        .ok_or_else(|| io::Error::other("MemAvailable missing from meminfo"))?;
+    let mut fields = value.split_whitespace();
+    let available = fields.next().unwrap_or("").parse::<u64>().map_err(io::Error::other)?;
+    if fields.next() != Some("kB") {
+        return Err(io::Error::other("MemAvailable must use kB"));
     }
-    name == b"vmlab-hv" || name.starts_with(b"vmlab-hv-test-")
+    Ok(available)
 }
 
-fn project_vm_count(processes: &Path) -> io::Result<usize> {
-    let mut count = 0;
-    for entry in std::fs::read_dir(processes)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-            .is_none()
-        {
-            continue;
-        }
-        match std::fs::read(entry.path().join("cmdline")) {
-            Ok(command_line) => count += usize::from(project_vm(&command_line)),
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(count)
+fn memory_wait_message(available: u64) -> Option<String> {
+    (available < VM_MEMORY_KIB + MEMORY_FLOOR_KIB).then(|| format!(
+        "waiting for test VM memory: MemAvailable {available} KiB, need {} KiB (24 GiB VM cap + 32 GiB floor)",
+        VM_MEMORY_KIB + MEMORY_FLOOR_KIB
+    ))
 }
 
-fn wait_for_vm_capacity(processes: &Path, limit: usize, timeout: Duration) -> io::Result<()> {
+fn wait_for_memory(meminfo: &Path, timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     let mut waiting = false;
-    while project_vm_count(processes)? >= limit {
+    while let Some(message) = memory_wait_message(available_memory_kib(meminfo)?) {
         if !waiting {
-            eprintln!("waiting for fewer than {limit} project VMs before boot");
+            eprintln!("{message}");
             waiting = true;
         }
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "waiting for shared host VM capacity",
-            ));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, message));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -100,12 +78,14 @@ impl VmPermit {
         std::fs::create_dir_all(&directory)?;
         let timeout = ManagedChild::timeout()?;
         let permit = Self::acquire_in(&directory, limit, timeout)?;
-        wait_for_vm_capacity(Path::new("/proc"), limit, timeout)?;
+        wait_for_memory(Path::new("/proc/meminfo"), timeout)?;
         Ok(permit)
     }
 
     fn acquire_in(directory: &Path, limit: usize, timeout: Duration) -> io::Result<Self> {
         let deadline = Instant::now() + timeout;
+        let message = format!("waiting for a test VM slot: all {limit} own test VM slots occupied");
+        let mut waiting = false;
         loop {
             for slot in 0..limit {
                 let file = OpenOptions::new()
@@ -120,10 +100,14 @@ impl VmPermit {
                     Err(std::fs::TryLockError::Error(error)) => return Err(error),
                 }
             }
+            if !waiting {
+                eprintln!("{message}");
+                waiting = true;
+            }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "waiting for a test VM slot",
+                    message,
                 ));
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -195,7 +179,7 @@ impl ManagedChild {
         timeout: Duration,
     ) -> io::Result<Self> {
         if permit.is_some() {
-            wait_for_vm_capacity(Path::new("/proc"), vm_limit()?, timeout)?;
+            wait_for_memory(Path::new("/proc/meminfo"), timeout)?;
         }
         // SAFETY: the pre-exec closure calls only async-signal-safe syscalls.
         // A killed test runner must not leave a VM running without its guard.
@@ -289,44 +273,33 @@ mod tests {
     }
 
     #[test]
-    fn host_capacity_counts_project_guests_and_excludes_android() {
+    fn memory_floor_and_wait_message() {
         let directory = tempfile::tempdir().unwrap();
-        for (pid, command) in [
-            (
-                1,
-                b"/usr/bin/qemu-system-x86_64\0-name\0vmlab:bench/test\0".as_slice(),
-            ),
-            (
-                2,
-                b"/tmp/debug/vmlab-hv-test-testing\0--machine\0machine.json\0".as_slice(),
-            ),
-            (
-                3,
-                b"/opt/emulator/qemu-system-x86_64\0-avd\0thevault\0".as_slice(),
-            ),
-            (4, b"/usr/bin/qemu-img\0info\0disk.img\0".as_slice()),
-            (
-                5,
-                b"/tmp/release/vmlab-hv\0--machine\0machine.json\0".as_slice(),
-            ),
-        ] {
-            let process = directory.path().join(pid.to_string());
-            std::fs::create_dir(&process).unwrap();
-            std::fs::write(process.join("cmdline"), command).unwrap();
+        let meminfo = directory.path().join("meminfo");
+        let required = VM_MEMORY_KIB + MEMORY_FLOOR_KIB;
+        for available in [0, required - 1, required, required + 1] {
+            std::fs::write(&meminfo, format!("MemTotal: 999999999 kB\nMemAvailable: {available} kB\n")).unwrap();
+            let result = wait_for_memory(&meminfo, Duration::ZERO);
+            if available < required {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert_eq!(error.to_string(), memory_wait_message(available).unwrap());
+                assert!(error.to_string().contains(&format!("MemAvailable {available} KiB")));
+                assert!(error.to_string().contains("24 GiB VM cap + 32 GiB floor"));
+            } else {
+                result.unwrap();
+            }
         }
-        assert_eq!(project_vm_count(directory.path()).unwrap(), 3);
-        assert_eq!(
-            wait_for_vm_capacity(directory.path(), 2, Duration::ZERO)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::TimedOut
-        );
-        std::fs::write(directory.path().join("2/cmdline"), b"").unwrap();
-        assert_eq!(project_vm_count(directory.path()).unwrap(), 2);
-        assert!(wait_for_vm_capacity(directory.path(), 2, Duration::ZERO).is_err());
-        std::fs::write(directory.path().join("5/cmdline"), b"").unwrap();
-        assert_eq!(project_vm_count(directory.path()).unwrap(), 1);
-        wait_for_vm_capacity(directory.path(), 2, Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn invalid_memory_data_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let meminfo = directory.path().join("meminfo");
+        for text in ["MemFree: 100 kB", "MemAvailable: bad kB", "MemAvailable: 100 MB"] {
+            std::fs::write(&meminfo, text).unwrap();
+            assert!(wait_for_memory(&meminfo, Duration::ZERO).is_err());
+        }
     }
 
     #[test]
@@ -335,7 +308,12 @@ mod tests {
         let acquire = || VmPermit::acquire_in(directory.path(), 2, Duration::from_millis(30));
         let first = acquire().unwrap();
         let second = acquire().unwrap();
-        assert_eq!(acquire().err().unwrap().kind(), io::ErrorKind::TimedOut);
+        let error = acquire().err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "waiting for a test VM slot: all 2 own test VM slots occupied"
+        );
         drop(first);
         let third = acquire().unwrap();
         drop((second, third));
