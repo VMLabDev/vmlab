@@ -84,10 +84,18 @@ fn sink_prerequisites_distinguish_headless_and_desktop_sessions() {
                 .unwrap_err()
                 .contains("no playback sink")
         );
-        assert!(usable_sink(&json!([sink("auto_null")]), pipewire)
-            .unwrap_err()
-            .contains("auto_null"));
-        assert!(usable_sink(&json!([sink("auto_null"), sink("alsa_output.test")]), pipewire).is_ok());
+        assert!(
+            usable_sink(&json!([sink("auto_null")]), pipewire)
+                .unwrap_err()
+                .contains("auto_null")
+        );
+        assert!(
+            usable_sink(
+                &json!([sink("auto_null"), sink("alsa_output.test")]),
+                pipewire
+            )
+            .is_ok()
+        );
         assert!(usable_sink(&json!([sink("test-driven-null")]), pipewire).is_ok());
         assert!(usable_sink(&Value::Null, pipewire).is_err());
     }
