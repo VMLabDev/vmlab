@@ -108,7 +108,11 @@ fn a_terminal_shell_starts_with_default_signals() {
             .find(|l| l.starts_with(field))
             .unwrap_or_else(|| panic!("no {field} in {text}"));
         assert!(
-            line.split_whitespace().nth(1).unwrap().bytes().all(|b| b == b'0'),
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .bytes()
+                .all(|b| b == b'0'),
             "the shell inherited a signal state: {line}"
         );
     }

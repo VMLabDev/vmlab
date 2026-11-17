@@ -15,8 +15,7 @@ use windows_sys::Win32::System::EventLog::{
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerW, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
     SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
-    StartServiceCtrlDispatcherW,
+    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
 };
 
 use super::port::wide;

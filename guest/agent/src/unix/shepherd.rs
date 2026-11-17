@@ -383,8 +383,8 @@ pub fn kill_tree(tree: &str) {
             let process = super::ProcessRef::open(*pid);
             // The pid was read from a scan: only kill it if, now that it is
             // pinned, it is still a member and not a newcomer to the number.
-            let still_member = stat(*pid)
-                .is_some_and(|(ppid, _)| ppid == shepherd || members.contains(&ppid));
+            let still_member =
+                stat(*pid).is_some_and(|(ppid, _)| ppid == shepherd || members.contains(&ppid));
             if still_member {
                 process.signal(Signal::SIGKILL);
             }
