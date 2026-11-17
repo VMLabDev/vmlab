@@ -194,7 +194,11 @@ page guide_registries {
     challenge received after a redirect cannot delegate credentials. A
     pagination link or upload location on another origin gets no credentials,
     and no credentials survive a redirect, including a token realm redirect.
-    Plain HTTP loopback registries work anonymously only.
+    A registry whose host is written as a loopback literal (`localhost`, an
+    address in 127.0.0.0/8, or `::1`) is reached over plain HTTP, and it gets
+    its credentials over plain HTTP too, `vmlab template login` included,
+    because they do not leave the host. A name that only resolves to
+    loopback is not such a host and stays HTTPS-only.
     Registry JSON responses are limited to 8 MiB, in-memory blobs to 1 GiB,
     streamed blobs to 8 GiB, and decompressed template chunks to 1 GiB
     (with a 128 MiB zstd window). Larger custom chunks must be republished
