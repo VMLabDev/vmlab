@@ -16,7 +16,7 @@ pub mod service;
 pub mod sysinfo;
 pub mod tree;
 
-pub use conpty::kill_process;
+pub use conpty::process_killer;
 pub use metrics::{cpu_pct, cpu_sample, disk_sample, mem_sample};
 pub use port::open_port;
 

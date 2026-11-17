@@ -30,9 +30,10 @@ use crate::virtio::fs::fuse::filesystem::{Context, FileSystem, ZeroCopyReader, Z
 use crate::virtio::fs::fuse::transport::{Reader, Writer};
 use crate::virtio::fs::fuse::{BitmapSlice, Error, Result, bytes_to_cstr};
 
-#[cfg(feature = "async-io")]
-mod async_io;
+mod guest_log;
 mod sync_io;
+
+use guest_log::GuestLog;
 
 /// Maximum buffer size of FUSE requests.
 #[cfg(target_os = "linux")]
@@ -51,6 +52,7 @@ pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
     vers: ArcSwap<ServerVersion>,
+    guest_log: GuestLog,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -62,6 +64,15 @@ impl<F: FileSystem + Sync> Server<F> {
                 major: KERNEL_VERSION,
                 minor: KERNEL_MINOR_VERSION,
             })),
+            guest_log: GuestLog::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_guest_log(fs: F, guest_log: GuestLog) -> Server<F> {
+        Server {
+            guest_log,
+            ..Server::new(fs)
         }
     }
 }
@@ -171,12 +182,13 @@ struct SrvContext<'a, F, S: BitmapSlice = ()> {
     context: Context,
     r: Reader<'a, S>,
     w: Writer<'a, S>,
+    log: &'a GuestLog,
     phantom: PhantomData<F>,
     phantom2: PhantomData<S>,
 }
 
 impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
-    fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>) -> Self {
+    fn new(in_header: InHeader, r: Reader<'a, S>, w: Writer<'a, S>, log: &'a GuestLog) -> Self {
         let context = Context::from(&in_header);
 
         SrvContext {
@@ -184,6 +196,7 @@ impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
             context,
             r,
             w,
+            log,
             phantom: PhantomData,
             phantom2: PhantomData,
         }
@@ -213,8 +226,7 @@ impl<'a, F: FileSystem, S: BitmapSlice> SrvContext<'a, F, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "fusedev")]
-    use crate::virtio::fs::fuse::transport::FuseBuf;
+    use vm_memory::ByteValued;
 
     #[test]
     fn test_extract_cstrs() {
@@ -252,41 +264,79 @@ mod tests {
         ServerUtil::extract_two_cstrs(&[0x1u8, 0x2u8]).unwrap_err();
     }
 
-    #[cfg(feature = "fusedev")]
+    // Ported from fuse-backend-rs 0.14.0, where it ran over a fusedev
+    // buffer; here over a reader split into two descriptors.
     #[test]
     fn test_get_message_body() {
-        let mut read_buf = [0u8; 4096];
-
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
-        let in_header = InHeader {
+        let header = InHeader {
             len: 0x1000,
             ..Default::default()
         };
-        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0).unwrap();
-        assert_eq!(buf.len(), 0x1000 - size_of::<InHeader>());
+        for (sub_header, expected) in [
+            (0, Some(0x1000 - size_of::<InHeader>())),
+            (0x100, Some(0x1000 - size_of::<InHeader>() - 0x100)),
+            (0x1000, None),
+            (0x1001, None),
+        ] {
+            let (mut a, mut b) = ([0u8; 0x800], [0u8; 0x800]);
+            let mut r = Reader::from_slices(vec![&mut a[..], &mut b[..]]);
+            let body = ServerUtil::get_message_body(&mut r, &header, sub_header);
+            assert_eq!(body.ok().map(|b| b.len()), expected, "{sub_header:#x}");
+        }
+    }
 
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
-        let in_header = InHeader {
-            len: 0x1000,
+    struct NoFs;
+
+    impl FileSystem for NoFs {
+        type Inode = u64;
+        type Handle = u64;
+    }
+
+    /// One LOOKUP whose name has no terminating nul, as a guest can send
+    /// as often as it likes; returns the errno of the reply.
+    fn send_bad_lookup(server: &Server<NoFs>, name: &[u8], unique: u64) -> i32 {
+        let header = InHeader {
+            len: (size_of::<InHeader>() + name.len()) as u32,
+            opcode: Opcode::Lookup as u32,
+            unique,
+            nodeid: 1,
             ..Default::default()
         };
-        let buf = ServerUtil::get_message_body(&mut r, &in_header, 0x100).unwrap();
-        assert_eq!(buf.len(), 0x1000 - size_of::<InHeader>() - 0x100);
+        let mut request = header.as_slice().to_vec();
+        request.extend_from_slice(name);
+        let mut reply = [0u8; size_of::<OutHeader>()];
+        let r = Reader::from_slices(vec![&mut request[..]]);
+        let w = Writer::from_slices(vec![&mut reply[..]]);
+        assert!(server.handle_message(r, w, None, None).is_err());
+        let out = OutHeader::from_slice(&reply).unwrap();
+        assert_eq!(out.unique, unique);
+        out.error
+    }
 
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
-        let in_header = InHeader {
-            len: 0x1000,
-            ..Default::default()
-        };
-        // shoutld fail because of invalid sub header size
-        assert!(ServerUtil::get_message_body(&mut r, &in_header, 0x1000).is_err());
+    #[test]
+    fn a_guest_flood_of_failing_requests_leaves_a_bounded_log() {
+        let (log, lines) = guest_log::tests::collecting();
+        let server = Server::with_guest_log(NoFs, log);
+        let name = vec![b'A'; 4096];
+        let started = std::time::Instant::now();
+        let requests = 20_000;
+        for unique in 0..requests {
+            assert_eq!(send_bad_lookup(&server, &name, unique), -libc::EINVAL);
+        }
+        let windows = started.elapsed().as_secs() / guest_log::GUEST_LOG_WINDOW.as_secs() + 1;
+        // Each window lets the burst through plus one line counting the
+        // suppressed rest.
+        let bound = windows as usize * (guest_log::GUEST_LOG_BURST as usize + 1);
 
-        let mut r = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut read_buf)).unwrap();
-        let in_header = InHeader {
-            len: 0x1000,
-            ..Default::default()
-        };
-        // shoutld fail because of invalid sub header size
-        assert!(ServerUtil::get_message_body(&mut r, &in_header, 0x1001).is_err());
+        let lines = lines.lock();
+        assert!(!lines.is_empty());
+        assert!(lines.len() <= bound, "{} lines, bound {bound}", lines.len());
+        for (_, line) in lines.iter() {
+            assert!(line.len() <= guest_log::GUEST_LOG_LINE_MAX, "{line}");
+            assert!(!line.contains("AAAA") && !line.contains("65, 65"), "{line}");
+        }
+        assert!(lines[0].1.contains("4096 bytes"), "{}", lines[0].1);
+        let total: usize = lines.iter().map(|(_, l)| l.len()).sum();
+        assert!(total <= bound * guest_log::GUEST_LOG_LINE_MAX);
     }
 }

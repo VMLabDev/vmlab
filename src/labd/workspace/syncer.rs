@@ -307,6 +307,7 @@ impl Report {
             volume: self.volume.as_ref().map(Volume::to_string),
             rescan: self.rescan.clone(),
             reseed: self.reseed.clone(),
+            unanswered: self.unanswered.clone(),
             rescans: self.rescans,
             skipped: self
                 .skipped
@@ -1000,7 +1001,8 @@ async fn run(
             // so ([`Report::unanswered`]): its unreported writes are unknown,
             // and a capture must refuse rather than leave them out.
             let mut unanswered = None;
-            if serving > *syncer.served.borrow() {
+            let flush = serving > *syncer.served.borrow();
+            if flush {
                 let mut answered = true;
                 for round in 0..2 {
                     if round == 1 {
@@ -1068,6 +1070,7 @@ async fn run(
                         .cloned()
                         .collect(),
                     rescan,
+                    flush,
                     lock_candidates: &lock_candidates,
                     resolved: &resolutions,
                     marker: marker.clone(),
@@ -1081,6 +1084,15 @@ async fn run(
                     passes += 1;
                     if rescan {
                         rescans += 1;
+                        if flush {
+                            // The walk recovered paths whose events were
+                            // lost. Give them a quiet window and a retry even
+                            // if the writer sends no further notification.
+                            let now = Instant::now();
+                            for path in &done.deferred {
+                                guest_debounce.touch(path.clone(), now);
+                            }
+                        }
                     }
                     // The barrier lifts only on a completed walk.
                     rescan = false;
@@ -1528,6 +1540,8 @@ struct Pending<'a> {
     /// Take the stat-walk rather than probing named paths, and do not
     /// propagate anything until it has completed.
     rescan: bool,
+    /// A verb is waiting: a walk cannot establish a guest path's quiet period.
+    flush: bool,
     /// Guest-side git locks seen on an earlier pass and not yet observed gone.
     lock_candidates: &'a BTreeSet<String>,
     /// Who wins where, as the developer has already said.
@@ -1690,6 +1704,21 @@ async fn pass(
     // Everything neither side can be read for, plus everything still being
     // written: deferred, never guessed at.
     let mut undecided = pending.in_flight.clone();
+    if pending.rescan && pending.flush {
+        // An overflow loses the named events that would have kept these
+        // paths in the debounce set. A walk finds their current contents,
+        // but cannot prove they have stopped changing. Leave them owed so
+        // this flush (and therefore capture) cannot declare them in step.
+        rehash_guest.extend(
+            ledger
+                .entries
+                .keys()
+                .filter(|path| !probe.tree.contains_key(*path))
+                .filter(|path| !ignores.verdict(path, false).is_guest_owned())
+                .cloned(),
+        );
+        undecided.extend(rehash_guest.iter().cloned());
+    }
     let skipped: Vec<Skip> = scan
         .skipped
         .iter()
@@ -2393,6 +2422,7 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan: true,
+                flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
                 marker: None,
@@ -2715,6 +2745,7 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan,
+                flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
                 marker: None,
@@ -2868,6 +2899,58 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    #[tokio::test]
+    async fn capture_refuses_a_guest_writer_after_overflow_during_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "seed").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        // Hold the flush's first answer so the discontinuity happens while
+        // capture is waiting, rather than on an earlier background pass.
+        sessions.watcher.mute();
+        let drains = sessions.watcher.drains();
+        let capture = syncers.before_capture("dev01", None);
+        let overflow = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while sessions.watcher.drains() == drains {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("capture did not ask the guest watch");
+            guest.file("/src/busy.txt", "writing", 100);
+            sessions.watcher.overflow();
+            sessions.watcher.unmute();
+            let (guest, watcher) = (guest.clone(), sessions.watcher.clone());
+            (tokio::spawn(async move {
+                for i in 0..100 {
+                    guest.file("/src/busy.txt", &i.to_string(), 101 + i);
+                    // Like a saturated queue, give no usable named events.
+                    watcher.overflow();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }),)
+        };
+        let (result, (writer,)) = tokio::join!(capture, overflow);
+        writer.abort();
+        let refused = result.expect_err("overflow must not let a moving file into capture");
+        let said = format!("{refused:#}");
+        assert!(said.contains("Still owed: busy.txt"), "{said}");
+
+        // The deferred path is retained and a later flush can carry it once
+        // the writer has stopped, without needing a new named event.
+        syncer.pass_now().await.unwrap();
+        syncers.before_capture("dev01", None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("busy.txt")).unwrap(),
+            guest.text("/src/busy.txt").unwrap(),
+        );
+        syncers.stop("dev01").await;
+    }
+
     /// VML-110: a guest whose watch does not answer the pre-flight flush
     /// within the bound (a very slow guest) refuses the capture and says why,
     /// rather than capturing a tree with the guest's unreported writes left
@@ -2905,6 +2988,22 @@ mod tests {
         assert!(!dir.path().join("late.txt").exists());
         assert!(syncer.report().unanswered.is_some());
 
+        // Flush and status must give the same reason as capture, including
+        // through the serialized status the daemon sends to the CLI.
+        let flush = syncer.pass_now().await.unwrap().project();
+        let status = syncer.report().project();
+        for report in [flush, status] {
+            let wire = serde_json::to_value(report).unwrap();
+            let report = serde_json::from_value(wire).unwrap();
+            let said = crate::cli::dev::sync_report("dev01", &report);
+            assert!(
+                said.contains("waiting: The guest's watch did not answer"),
+                "{said}"
+            );
+            assert!(said.contains("not reported yet are unknown"), "{said}");
+            assert!(!said.contains("in step"), "{said}");
+        }
+
         sessions.watcher.unmute();
         assert!(
             eventually(|| std::fs::read_to_string(dir.path().join("late.txt"))
@@ -2916,6 +3015,13 @@ mod tests {
         );
         syncers.before_capture("dev01", None).await.unwrap();
         assert!(syncer.report().unanswered.is_none());
+        let flush = syncer.pass_now().await.unwrap().project();
+        let status = syncer.report().project();
+        for report in [flush, status] {
+            let said = crate::cli::dev::sync_report("dev01", &report);
+            assert!(!said.contains("watch did not answer"), "{said}");
+            assert!(said.contains("in step"), "{said}");
+        }
         syncers.stop("dev01").await;
     }
 
@@ -3022,6 +3128,7 @@ mod tests {
             host_dirty: &BTreeSet::new(),
             in_flight: BTreeSet::new(),
             rescan: true,
+            flush: false,
             lock_candidates: &BTreeSet::new(),
             resolved: &BTreeMap::new(),
             marker: None,

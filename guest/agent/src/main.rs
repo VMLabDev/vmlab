@@ -30,6 +30,9 @@ mod rdp;
 #[cfg(any(windows, test))]
 mod rtc;
 mod spawn;
+// What the Windows service reports to the SCM: portable like `rdp`.
+#[cfg(any(windows, test))]
+mod svc;
 mod tail;
 mod terminal;
 // The recursive tree watch has a backend on Linux (inotify) and Windows
@@ -62,7 +65,7 @@ use windows as platform_impl;
 
 /// Platform functions the portable modules call directly.
 pub mod platform {
-    pub use crate::platform_impl::{cpu_pct, cpu_sample, disk_sample, kill_process, mem_sample};
+    pub use crate::platform_impl::{cpu_pct, cpu_sample, disk_sample, mem_sample, process_killer};
 }
 
 use std::io::Read;

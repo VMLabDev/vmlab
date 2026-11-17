@@ -181,12 +181,59 @@ pub fn hold_until_it_exits<T: Send + Sync + 'static>(
 /// lives here rather than being written twice.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn command_line(argv: &[String]) -> String {
+    render_command_line(argv, false)
+}
+
+/// What `cmd.exe` acts on even inside double quotes: `%` and `!` expand
+/// variables, a quote ends the quoting, and a line break ends the command.
+/// Outside quotes `& | < > ^ ( )` matter too, which is why every argument of
+/// a batch file is quoted.
+#[cfg_attr(not(windows), allow(dead_code))]
+const BATCH_UNSAFE: [char; 6] = ['"', '%', '!', '\r', '\n', '\0'];
+
+/// Whether Windows runs `program` through `cmd.exe`: a `.bat` or `.cmd`,
+/// matched as Windows matches names, ignoring case and any trailing dots
+/// and spaces.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_batch(program: &str) -> bool {
+    let name = program.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+    name.ends_with(".bat") || name.ends_with(".cmd")
+}
+
+/// [`command_line`], made safe for a batch file target.
+///
+/// `CreateProcess` hands a `.bat` or `.cmd` to `cmd.exe`, which parses the
+/// line again by its own rules rather than `CommandLineToArgvW`'s, so an
+/// argument quoted for a program can still run a second command in a batch
+/// file. A batch target gets every argument quoted, and an argument holding
+/// anything `cmd.exe` acts on inside quotes is refused by name.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn checked_command_line(argv: &[String]) -> std::io::Result<String> {
+    let Some(program) = argv.first() else {
+        return Ok(String::new());
+    };
+    if !is_batch(program) {
+        return Ok(command_line(argv));
+    }
+    if let Some(arg) = argv.iter().find(|a| a.contains(BATCH_UNSAFE)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "batch file {program}: argument {arg:?} holds a character cmd.exe \
+                 would interpret (a double quote, %, ! or a line break)"
+            ),
+        ));
+    }
+    Ok(render_command_line(argv, true))
+}
+
+fn render_command_line(argv: &[String], quote_all: bool) -> String {
     let mut out = String::new();
     for (i, arg) in argv.iter().enumerate() {
         if i > 0 {
             out.push(' ');
         }
-        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        if !quote_all && !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
             out.push_str(arg);
             continue;
         }
@@ -261,15 +308,15 @@ pub fn piped_command(
     let input = child.stdin.take().expect("piped stdin");
     let output = child.stdout.take().expect("piped stdout");
     let errors = child.stderr.take().expect("piped stderr");
-    // The kill hook works from the pid: the caller stops using it once the
-    // reaper below has consumed the child.
-    let pid = child.id();
+    // The kill hook is resolved now, while the child cannot have been
+    // reaped, so it never reaches a later holder of the pid.
+    let kill = crate::platform::process_killer(child.id());
     Ok(Spawned {
         input: Box::new(input),
         output: Box::new(output),
         errors: Some(Box::new(errors)),
         resize: None,
-        kill: Box::new(move || crate::platform::kill_process(pid)),
+        kill,
         wait: Box::new(move || match child.wait() {
             Ok(status) => exit_code(status),
             Err(_) => 127,
@@ -293,7 +340,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Spawned, command_line, hold_until_it_exits};
+    use super::{Spawned, checked_command_line, command_line, hold_until_it_exits};
     use std::sync::Arc;
 
     /// A `Spawned` with nothing behind it: `wait` reports what the test
@@ -357,5 +404,37 @@ mod tests {
         // An embedded quote is escaped, and the backslashes before it with it.
         assert_eq!(command_line(&[r#"say"hi"#.into()]), r#""say\"hi""#);
         assert_eq!(command_line(&["".into()]), r#""""#);
+    }
+
+    fn args(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// `cmd.exe` re-parses a batch file's command line, so what is safely
+    /// quoted for a program can run a second command there: an argument a
+    /// batch file would interpret is refused, and the rest are all quoted.
+    #[test]
+    fn a_batch_target_is_quoted_for_cmd_or_refused() {
+        // A program is unaffected.
+        assert_eq!(
+            checked_command_line(&args(&["git.exe", "a&b"])).unwrap(),
+            "git.exe a&b"
+        );
+        // Every batch argument is quoted, so & | < > ^ ( ) are inert.
+        assert_eq!(
+            checked_command_line(&args(&["C:\\x\\build.bat", "a&b", "(c)"])).unwrap(),
+            r#""C:\x\build.bat" "a&b" "(c)""#
+        );
+        for bad in ["\"&calc", "%PATH%", "!x!", "a\r\nwhoami"] {
+            for program in ["run.bat", "RUN.CMD", "run.bat. .", "run.cmd "] {
+                let err = checked_command_line(&args(&[program, bad])).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "{program} {bad:?}"
+                );
+            }
+        }
+        assert_eq!(checked_command_line(&[]).unwrap(), "");
     }
 }

@@ -710,6 +710,8 @@ impl Spawner for UnixSpawner {
         let plan = self.shell_plan(&route, spec.command, spec.env)?;
         let size = winsize(spec.cols, spec.rows);
         let (master, pid) = spawn_shell(&plan, &size, self.jail()?, owner(&route))?;
+        // Resolved before anything can reap the shell.
+        let process = ProcessRef::open(pid.as_raw() as u32);
         // The master is shared: one dup drives keystrokes in, another the VT
         // stream out, and the resize hook needs the fd itself.
         let master = Arc::new(master);
@@ -726,7 +728,7 @@ impl Spawner for UnixSpawner {
                 let _ = unsafe { tiocswinsz(resize_master.as_raw_fd(), &ws) };
             })),
             kill: Box::new(move || {
-                let _ = kill(pid, Signal::SIGKILL);
+                process.signal(Signal::SIGKILL);
             }),
             wait: Box::new(move || {
                 let code = match waitpid(pid, None) {
@@ -995,6 +997,8 @@ fn spawn_shell(
             if chdir(c_workdir.as_c_str()).is_err() && chdir(c_root.as_c_str()).is_err() {
                 die("chdir");
             }
+            // SAFETY: post-fork, pre-exec, as `reset_signals` requires.
+            unsafe { reset_signals() };
             let _ = execve(&c_exe, &c_argv, &env);
             die("execve");
         }
@@ -1016,8 +1020,95 @@ fn write_all_raw(fd: libc::c_int, mut buf: &[u8]) -> bool {
     true
 }
 
-pub fn kill_process(pid: u32) {
-    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+/// Give a child about to exec the signal state a fresh process has.
+///
+/// Every Rust binary starts with SIGPIPE ignored, and an ignored disposition
+/// and the blocked mask both survive `execve`: a shell started under them
+/// sees `yes | head` spin on EPIPE instead of dying. `std::process::Command`
+/// resets both itself; a raw fork does not.
+///
+/// # Safety
+/// Post-fork, pre-exec: it only makes async-signal-safe calls.
+pub(crate) unsafe fn reset_signals() {
+    // SAFETY: sigemptyset/sigprocmask/signal are async-signal-safe and
+    // take a valid, local set.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// A process to signal, held by a pidfd where the kernel has them.
+///
+/// A raw pid names whichever process holds the number now: once the child
+/// is reaped the number can be handed to another process, and a kill hook
+/// racing the reaper would hit that one. A pidfd names the process it was
+/// opened on, and signalling it after its end fails with ESRCH instead.
+/// Open it while the process is known to be alive or an unreaped zombie.
+/// A kernel without pidfds (before 5.3), and macOS, fall back to the pid.
+pub struct ProcessRef {
+    pid: libc::pid_t,
+    #[cfg(target_os = "linux")]
+    fd: Option<OwnedFd>,
+}
+
+impl ProcessRef {
+    pub fn open(pid: u32) -> ProcessRef {
+        let pid = pid as libc::pid_t;
+        ProcessRef {
+            pid,
+            #[cfg(target_os = "linux")]
+            fd: pidfd_open(pid),
+        }
+    }
+
+    /// Whether the reference is a pidfd rather than a bare pid.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn is_pidfd(&self) -> bool {
+        self.fd.is_some()
+    }
+
+    /// Send `signal`. `false` when the process is gone or refused it.
+    pub fn signal(&self, signal: Signal) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.fd {
+            // SAFETY: pidfd_send_signal(2) on an fd we own, with no siginfo.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    signal as libc::c_int,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                )
+            };
+            return rc == 0;
+        }
+        kill(Pid::from_raw(self.pid), signal).is_ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
+    // SAFETY: pidfd_open(2) with no flags; a non-negative result is a new
+    // fd this process owns.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: the kernel just returned this fd to us, close-on-exec.
+    Some(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as libc::c_int) })
+}
+
+/// The kill hook for a child that has not been reaped yet: resolved now,
+/// so it can never reach a later holder of the pid.
+pub fn process_killer(pid: u32) -> Box<dyn Fn() + Send + Sync> {
+    let process = ProcessRef::open(pid);
+    Box::new(move || {
+        process.signal(Signal::SIGKILL);
+    })
 }
 
 /// Utilisation between two cumulative (busy, total) samples, in percent.
@@ -1071,6 +1162,24 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A kill hook resolves its process while it is known to be that one:
+    /// it reaches the child while it runs, and once the child has been
+    /// reaped it reaches nothing, whatever now holds the pid.
+    #[test]
+    fn a_process_ref_signals_its_own_process_and_nothing_after_it() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let process = ProcessRef::open(child.id());
+        assert!(process.is_pidfd(), "the build host has pidfds (Linux 5.3)");
+        assert!(process.signal(Signal::SIGKILL));
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            !process.signal(Signal::SIGKILL),
+            "a reaped process must not be signalled again"
+        );
+    }
 
     #[test]
     fn cpu_pct_computes_delta_utilisation() {

@@ -26,9 +26,26 @@ def marker(h, lab, vm) -> str:
     return h.vmlab("exec", vm, "--", "cat", "/etc/e2e-variant", cwd=lab, timeout=60).out.strip()
 
 
+def markers(h, lab) -> dict[str, str]:
+    # Variant selection needs disk contents, not concurrent guests. Under host
+    # load, booting both UEFI guests together exhausted the readiness budget.
+    got = {}
+    for vm in ("plain", "extra"):
+        h.vmlab("up", vm, cwd=lab, timeout=600)
+        h.wait_ready(lab, vm)
+        got[vm] = marker(h, lab, vm)
+        h.vmlab("vm", "stop", vm, cwd=lab, timeout=300)
+    return got
+
+
 def run(h):
     try:
         _run(h)
+    except ScenarioFailed as exc:
+        for f in OWNED:
+            if f not in h.results:
+                h.ok(f, False, f"scenario aborted: {exc}")
+        raise
     finally:
         for f in OWNED:
             if f not in h.results:
@@ -66,9 +83,7 @@ def _run(h):
         base_refused = refused.code != 0 and all(w in refused.text for w in ('"base"', "#base", "refused"))
         wcl = lab / "vmlab.wcl"
         wcl.write_text(re.sub(r'\n  vm "base" \{[^}]*\}\n', "\n", wcl.read_text()))
-        h.vmlab("up", cwd=lab, timeout=600)
-        h.wait_ready(lab, "plain", "extra")
-        got = {vm: marker(h, lab, vm) for vm in ("plain", "extra")}
+        got = markers(h, lab)
         h.ok(
             "template.variant.select",
             base_refused and got == {"plain": "standard", "extra": "extra"},
@@ -83,9 +98,7 @@ def _run(h):
     with h.lab("variants-lab", under="rebuild") as lab:
         wcl = lab / "vmlab.wcl"
         wcl.write_text(re.sub(r'\n  vm "base" \{[^}]*\}\n', "\n", wcl.read_text()))
-        h.vmlab("up", cwd=lab, timeout=600)
-        h.wait_ready(lab, "plain", "extra")
-        got = {vm: marker(h, lab, vm) for vm in ("plain", "extra")}
+        got = markers(h, lab)
     h.ok(
         "template.variant.rebuild",
         rebuilt.code == 0

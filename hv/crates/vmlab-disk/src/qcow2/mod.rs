@@ -157,6 +157,8 @@ pub struct Qcow2Image {
     file: File,
     path: PathBuf,
     read_only: bool,
+    poisoned: bool,
+    snapshot_mutating: bool,
 
     version: u32,
     cluster_bits: u32,
@@ -184,6 +186,9 @@ pub struct Qcow2Image {
     refcount_table: Vec<u64>,
 
     l2_cache: TableCache,
+    /// Conservative data-offset bounds for each L2 we have read. Retained
+    /// across cache eviction so snapshot repair can skip unrelated tables.
+    l2_data_ranges: HashMap<u64, (u64, u64)>,
     refblock_cache: TableCache,
     free: FreeClusters,
     header_dirty: bool,
@@ -370,6 +375,14 @@ impl Qcow2Image {
             });
         }
 
+        // Validate hostile allocation lengths against the opened file first.
+        let file_len = file.metadata()?.len();
+        checked_file_range(file_len, l1_table_offset, u64::from(l1_size) * 8)?;
+        checked_file_range(
+            file_len,
+            refcount_table_offset,
+            u64::from(refcount_table_clusters) * cluster_size,
+        )?;
         // Read the active L1.
         let mut l1_bytes = vec![0u8; l1_size as usize * 8];
         if !l1_bytes.is_empty() {
@@ -428,6 +441,8 @@ impl Qcow2Image {
             file,
             path: path.to_path_buf(),
             read_only,
+            poisoned: false,
+            snapshot_mutating: false,
             version,
             cluster_bits,
             cluster_size,
@@ -445,6 +460,7 @@ impl Qcow2Image {
             l1,
             refcount_table,
             l2_cache: TableCache::new(64),
+            l2_data_ranges: HashMap::new(),
             refblock_cache: TableCache::new(64),
             header_dirty: false,
             l1_dirty: false,
@@ -538,6 +554,16 @@ impl Qcow2Image {
         }
         let mut buf = vec![0u8; self.cluster_size as usize];
         self.read_file(host_offset, &mut buf)?;
+        let mut range = (u64::MAX, 0);
+        for bytes in buf.as_chunks::<8>().0 {
+            let entry = u64::from_be_bytes(*bytes);
+            let host = entry & OFFSET_MASK;
+            if host != 0 && entry & COMPRESSED_BIT == 0 {
+                range.0 = range.0.min(host);
+                range.1 = range.1.max(host);
+            }
+        }
+        self.l2_data_ranges.insert(host_offset, range);
         let mut evicted = self.l2_cache.put(host_offset, buf, false).into_iter();
         while let Some((host, table)) = evicted.next() {
             if let Err(e) = self.write_file(host, &table) {
@@ -563,6 +589,14 @@ impl Qcow2Image {
         let (buf, _) = self.l2_cache.map.get_mut(&l2_host).expect("just cached");
         let off = index as usize * 8;
         buf[off..off + 8].copy_from_slice(&value.to_be_bytes());
+        let host = value & OFFSET_MASK;
+        if host != 0 && value & COMPRESSED_BIT == 0 {
+            let range = self.l2_data_ranges.get_mut(&l2_host).expect("loaded range");
+            // Do not shrink after replacement. Extra overlap only costs a
+            // repair, whereas omitting an alias would leave copied bits stale.
+            range.0 = range.0.min(host);
+            range.1 = range.1.max(host);
+        }
         Ok(())
     }
 
@@ -641,13 +675,23 @@ impl Qcow2Image {
         let mut compressed = vec![0u8; (end - host_offset) as usize];
         self.read_file(host_offset, &mut compressed)?;
         let mut decompressor = flate2::Decompress::new(false);
-        let _status = decompressor
-            .decompress(&compressed, out, flate2::FlushDecompress::None)
+        // One spare byte lets the decoder consume the end marker even when
+        // the valid output fills a whole cluster, and detects overlong data.
+        let mut decoded = vec![0; out.len() + 1];
+        let status = decompressor
+            .decompress(&compressed, &mut decoded, flate2::FlushDecompress::Finish)
             .map_err(|e| Error::Format {
                 format: "qcow2",
                 reason: format!("deflate error in compressed cluster: {e}"),
             })?;
-        // corrupt image, but QEMU tolerates trailing garbage so we do too.
+        if status != flate2::Status::StreamEnd || decompressor.total_out() != out.len() as u64 {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: "compressed cluster must contain one complete cluster".into(),
+            });
+        }
+        out.copy_from_slice(&decoded[..out.len()]);
+        // Sector padding after the complete stream is allowed.
         Ok(())
     }
 
@@ -983,6 +1027,11 @@ impl Qcow2Image {
     }
 
     fn check_writable(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Unsupported(
+                "snapshot change failed; reopen the image before writing".into(),
+            ));
+        }
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -1074,6 +1123,8 @@ impl Qcow2Image {
             file,
             path: path.to_path_buf(),
             read_only: false,
+            poisoned: false,
+            snapshot_mutating: false,
             version: 3,
             cluster_bits,
             cluster_size,
@@ -1094,6 +1145,7 @@ impl Qcow2Image {
             l1: vec![0u64; l1_size as usize],
             refcount_table,
             l2_cache: TableCache::new(64),
+            l2_data_ranges: HashMap::new(),
             refblock_cache: TableCache::new(64),
             header_dirty: false,
             l1_dirty: false,
@@ -1295,6 +1347,7 @@ impl DiskImage for Qcow2Image {
 
     fn flush(&mut self) -> Result<()> {
         if !self.read_only {
+            self.check_writable()?;
             self.flush_metadata()?;
             self.file.sync_all()?;
         }
@@ -1347,15 +1400,18 @@ impl DiskImage for Qcow2Image {
         vm_state_size: u64,
         vm_clock_nsec: u64,
     ) -> Result<()> {
-        self.snapshot_create_impl(name, vm_state_size, vm_clock_nsec)
+        let result = self.snapshot_create_impl(name, vm_state_size, vm_clock_nsec);
+        self.finish_snapshot_change(result)
     }
 
     fn snapshot_apply(&mut self, name: &str) -> Result<SnapshotInfo> {
-        self.snapshot_apply_impl(name)
+        let result = self.snapshot_apply_impl(name);
+        self.finish_snapshot_change(result)
     }
 
     fn snapshot_delete(&mut self, name: &str) -> Result<()> {
-        self.snapshot_delete_impl(name)
+        let result = self.snapshot_delete_impl(name);
+        self.finish_snapshot_change(result)
     }
 
     fn write_vmstate(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
@@ -1386,10 +1442,20 @@ impl DiskImage for Qcow2Image {
 /// Call [`DiskImage::flush`] to see errors and for durability.
 impl Drop for Qcow2Image {
     fn drop(&mut self) {
-        if !self.read_only {
+        if !self.read_only && !self.poisoned {
             let _ = self.close_clean();
         }
     }
+}
+
+fn checked_file_range(file_len: u64, offset: u64, len: u64) -> Result<()> {
+    if len != 0 && offset.checked_add(len).is_none_or(|end| end > file_len) {
+        return Err(Error::Format {
+            format: "qcow2",
+            reason: "metadata range exceeds file length".into(),
+        });
+    }
+    Ok(())
 }
 
 fn l1_size_as_clusters(l1_size: u32, cluster_size: u64) -> u64 {
@@ -1442,6 +1508,136 @@ pub(crate) fn probe_format(path: &Path) -> Result<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_delete_repairs_data_in_a_cowed_active_l2() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let cluster = img.cluster_size;
+        img.write_at(0, &[0x11; 512]).unwrap();
+        img.write_at(cluster, &[0x22; 512]).unwrap();
+        img.snapshot_create("before", 0, 0).unwrap();
+        img.write_at(0, &[0x33; 512]).unwrap();
+        let active_l2 = img.l1[0] & OFFSET_MASK;
+        assert_eq!(img.l2_entry(active_l2, 1).unwrap() & COPIED_BIT, 0);
+        img.snapshot_delete("before").unwrap();
+        assert_ne!(img.l2_entry(active_l2, 1).unwrap() & COPIED_BIT, 0);
+    }
+
+    #[test]
+    fn deleting_snapshot_does_not_walk_unrelated_active_l2() {
+        let (_dir, mut img) = testsupport::blank(1 << 30);
+        img.write_at(0, &[0x11; 512]).unwrap();
+        img.snapshot_create("early", 0, 0).unwrap();
+        let far = img.l2_span();
+        img.write_at(far, &[0x22; 512]).unwrap();
+        img.flush().unwrap();
+        let unrelated = img.l1[1] & OFFSET_MASK;
+        img.l2_cache = TableCache::new(64);
+        img.snapshot_delete("early").unwrap();
+        assert!(!img.l2_cache.map.contains_key(&unrelated));
+        let mut byte = [0];
+        img.read_at(far, &mut byte).unwrap();
+        assert_eq!(byte, [0x22]);
+    }
+
+    #[test]
+    fn legacy_ambiguous_snapshot_lookup_prefers_id() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        img.snapshot_create("x", 0, 0).unwrap();
+        img.snapshot_create("y", 0, 0).unwrap();
+        // Simulate a legacy file whose first snapshot name equals the
+        // second snapshot ID. Fixed header 40, extra 24, one-byte ID.
+        img.file
+            .write_all_at(b"2", img.snapshots_offset + 65)
+            .unwrap();
+        assert_eq!(img.snapshot_apply("2").unwrap().name, "y");
+        img.snapshot_delete("2").unwrap();
+        let entries = img.snapshots().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "1");
+        assert_eq!(entries[0].name, "2");
+    }
+
+    #[test]
+    fn snapshot_namespace_rejects_ids_and_skips_numeric_names() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        img.snapshot_create("2", 0, 0).unwrap();
+        img.snapshot_create("second", 0, 0).unwrap();
+        let entries = img.snapshots().unwrap();
+        assert_eq!(entries[0].id, "1");
+        assert_eq!(entries[1].id, "3");
+        assert!(img.snapshot_create("1", 0, 0).is_err());
+        assert!(!img.poisoned, "validation must not poison the image");
+        assert_eq!(img.snapshot_apply("2").unwrap().name, "2");
+        img.snapshot_delete("3").unwrap();
+        assert_eq!(img.snapshots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_snapshot_changes_poison_all_write_entry_points() {
+        for operation in ["create", "apply", "delete"] {
+            let (_dir, mut img) = testsupport::blank(8 << 20);
+            img.write_at(0, &[0x35; 512]).unwrap();
+            img.snapshot_create("saved", 0, 0).unwrap();
+            fail_writes(&mut img);
+            let result = match operation {
+                "create" => img.snapshot_create("new", 0, 0),
+                "apply" => img.snapshot_apply("saved").map(|_| ()),
+                _ => img.snapshot_delete("saved"),
+            };
+            assert!(result.is_err(), "{operation}");
+            assert!(img.poisoned, "{operation}");
+            allow_writes(&mut img);
+            assert!(img.write_at(0, &[1]).is_err());
+            assert!(img.discard(0, img.cluster_size).is_err());
+            assert!(img.write_vmstate(0, &[1]).is_err());
+            assert!(img.snapshot_create("retry", 0, 0).is_err());
+            assert!(img.flush().is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_reads_keep_inode_and_seek_position() {
+        let (dir, mut img) = testsupport::blank(8 << 20);
+        img.snapshot_create("original", 0, 0).unwrap();
+        img.file.seek(SeekFrom::Start(123)).unwrap();
+        std::fs::rename(&img.path, dir.path().join("moved.qcow2")).unwrap();
+        std::fs::write(&img.path, b"replacement").unwrap();
+        assert_eq!(img.snapshots().unwrap()[0].name, "original");
+        assert_eq!(img.file.stream_position().unwrap(), 123);
+    }
+
+    #[test]
+    fn hostile_metadata_lengths_fail_before_allocation() {
+        let (_dir, img) = testsupport::blank(8 << 20);
+        img.file.write_all_at(&u32::MAX.to_be_bytes(), 36).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        img.file.write_all_at(&1u32.to_be_bytes(), 36).unwrap();
+        img.file.write_all_at(&u32::MAX.to_be_bytes(), 56).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+    }
+
+    #[test]
+    fn compressed_cluster_requires_complete_exact_length_stream() {
+        use std::io::Write;
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let size = img.cluster_size as usize;
+        for len in [size - 1, size, size + 1] {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&vec![0x5a; len]).unwrap();
+            let mut bytes = encoder.finish().unwrap();
+            bytes.resize(512, 0);
+            let offset = img.file.metadata().unwrap().len().div_ceil(512) * 512;
+            img.file.write_all_at(&bytes, offset).unwrap();
+            let mut out = vec![0; size];
+            assert_eq!(
+                img.read_compressed_cluster(COMPRESSED_BIT | offset, &mut out)
+                    .is_ok(),
+                len == size
+            );
+        }
+    }
 
     #[test]
     fn crash_writer_child() {
