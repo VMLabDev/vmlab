@@ -1612,8 +1612,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: false });
         }
-        *slot.fallback_at.lock_recover() =
-            Some(std::time::Instant::now() - LEGACY_HELLO_INTERVAL);
+        *slot.fallback_at.lock_recover() = Some(std::time::Instant::now() - LEGACY_HELLO_INTERVAL);
         assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: true });
         assert_eq!(
             AgentSlot::for_transport(AgentTransport::VirtioSerial).greeting(),
