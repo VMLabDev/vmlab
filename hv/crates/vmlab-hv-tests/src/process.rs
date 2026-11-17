@@ -27,10 +27,16 @@ fn vm_slot_directory() -> PathBuf {
 
 fn available_memory_kib(meminfo: &Path) -> io::Result<u64> {
     let text = std::fs::read_to_string(meminfo)?;
-    let value = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
         .ok_or_else(|| io::Error::other("MemAvailable missing from meminfo"))?;
     let mut fields = value.split_whitespace();
-    let available = fields.next().unwrap_or("").parse::<u64>().map_err(io::Error::other)?;
+    let available = fields
+        .next()
+        .unwrap_or("")
+        .parse::<u64>()
+        .map_err(io::Error::other)?;
     if fields.next() != Some("kB") {
         return Err(io::Error::other("MemAvailable must use kB"));
     }
@@ -105,10 +111,7 @@ impl VmPermit {
                 waiting = true;
             }
             if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    message,
-                ));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, message));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -278,13 +281,21 @@ mod tests {
         let meminfo = directory.path().join("meminfo");
         let required = VM_MEMORY_KIB + MEMORY_FLOOR_KIB;
         for available in [0, required - 1, required, required + 1] {
-            std::fs::write(&meminfo, format!("MemTotal: 999999999 kB\nMemAvailable: {available} kB\n")).unwrap();
+            std::fs::write(
+                &meminfo,
+                format!("MemTotal: 999999999 kB\nMemAvailable: {available} kB\n"),
+            )
+            .unwrap();
             let result = wait_for_memory(&meminfo, Duration::ZERO);
             if available < required {
                 let error = result.unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::TimedOut);
                 assert_eq!(error.to_string(), memory_wait_message(available).unwrap());
-                assert!(error.to_string().contains(&format!("MemAvailable {available} KiB")));
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("MemAvailable {available} KiB"))
+                );
                 assert!(error.to_string().contains("24 GiB VM cap + 32 GiB floor"));
             } else {
                 result.unwrap();
@@ -296,7 +307,11 @@ mod tests {
     fn invalid_memory_data_is_an_error() {
         let directory = tempfile::tempdir().unwrap();
         let meminfo = directory.path().join("meminfo");
-        for text in ["MemFree: 100 kB", "MemAvailable: bad kB", "MemAvailable: 100 MB"] {
+        for text in [
+            "MemFree: 100 kB",
+            "MemAvailable: bad kB",
+            "MemAvailable: 100 MB",
+        ] {
             std::fs::write(&meminfo, text).unwrap();
             assert!(wait_for_memory(&meminfo, Duration::ZERO).is_err());
         }
