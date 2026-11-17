@@ -102,20 +102,18 @@ fn a_terminal_shell_starts_with_default_signals() {
     let (out, _err, code) = cap.until_exited(4);
     assert_eq!(code, 0);
     let text = String::from_utf8_lossy(&out);
-    for field in ["SigBlk", "SigIgn"] {
+    let mask = |field: &str| {
         let line = text
             .lines()
             .find(|l| l.starts_with(field))
             .unwrap_or_else(|| panic!("no {field} in {text}"));
-        assert!(
-            line.split_whitespace()
-                .nth(1)
-                .unwrap()
-                .bytes()
-                .all(|b| b == b'0'),
-            "the shell inherited a signal state: {line}"
-        );
-    }
+        u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+    };
+    assert_eq!(mask("SigBlk:"), 0, "the shell inherited a blocked mask");
+    // Signal n is bit n-1. Only SIGPIPE is the agent's own doing: whatever
+    // the agent was itself started ignoring is the guest's business.
+    let sigpipe = 1u64 << (libc::SIGPIPE - 1);
+    assert_eq!(mask("SigIgn:") & sigpipe, 0, "the shell inherited SIGPIPE ignored");
 }
 
 /// A background job keeps the terminal open after its shell has exited, and
