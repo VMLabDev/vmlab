@@ -547,13 +547,15 @@ DOC
   h2 "macOS guests under KVM"
 
   p <<'DOC'
-An Intel macOS guest on the shipped `macos` profile needs one thing from the
-host that no other guest does: KVM must ignore the model-specific registers it
+An Intel macOS guest on the shipped `macos` profile, when it runs on QEMU,
+needs one thing from the host that no other guest does: KVM must ignore the model-specific registers it
 does not emulate. XNU reads Intel MSRs that KVM has no model for, and by
 default KVM answers each read with a general-protection fault, so the guest
 panics or hangs early in boot. On an AMD host that happens on every boot. Turn
 the `kvm` module's `ignore_msrs` parameter on for good with a modprobe file,
-and for the current boot through sysfs:
+and for the current boot through sysfs. On vmlab-hv, which new macOS VMs
+select, none of this is needed: vmlab-hv reads those MSRs as 0 for a macOS
+guest itself.
 DOC
 
   code sh { source = <<'SRC'

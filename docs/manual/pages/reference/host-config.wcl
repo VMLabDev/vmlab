@@ -172,7 +172,9 @@ SRC
     host configuration and launch paths also redact it. The key is never
     recorded in templates or OCI metadata. It remains visible to host
     processes allowed to read QEMU's operating-system process arguments.
-    vmlab-hv continues to refuse Apple SMC machines until its macOS phase.
+    vmlab-hv receives the key through a private pipe at its machine
+    description's path, replaced by the redacted description once read, so
+    under vmlab-hv the key is in no process argument and no file.
   DOC
 
   h2 "hypervisor {}"
@@ -203,7 +205,7 @@ SRC
   list {
     li "Each field is `qemu` or `vmlab`. Any other value is rejected with a parse error that names it."
     li "A machine's own `hypervisor` wins over this block. The field never resolves through a template or a profile."
-    li "Explicit `vmlab` settings are validated against the refusal list. Automatic VM selection falls back to QEMU for refused hardware, including legacy PCs, macOS, `qemu_args`, TCG and pinned TSC."
+    li "Explicit `vmlab` settings are validated against the refusal list. Automatic VM selection falls back to QEMU for refused hardware, including legacy PCs, `qemu_args`, TCG and pinned TSC. New macOS VMs select vmlab-hv."
     li "A VM's identity is saved before boot creates disks. It survives stops and daemon restarts until destroy or an explicit machine or host setting. Old disks without an identity stay on QEMU; the newest snapshot supplies identity where recorded."
     li "Changing an explicit default can move an existing VM. Online snapshots still require the hypervisor that captured them; offline snapshots restore under either."
   }
