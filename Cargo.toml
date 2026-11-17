@@ -47,6 +47,9 @@ vmlab-hv-proto = { path = "hv/crates/vmlab-hv-proto", features = ["gdb"] }
 # vmlab-hv's native frame protocol (§22, phase 2b): screenshots, scripted
 # input and the recorder's frame stream on a vmlab-hv VM's `display.sock`.
 vmlab-hv-display = { path = "hv/crates/vmlab-hv-display" }
+# qcow2 image operations (HV-D15): the default behind `template::qimg`'s
+# `ImageTool`, with `qemu-img` kept as a fallback (`VMLAB_IMAGE_TOOL`).
+vmlab-disk = { path = "hv/crates/vmlab-disk" }
 
 anyhow = "1"
 thiserror = "2"

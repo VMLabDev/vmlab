@@ -199,6 +199,15 @@ impl Qcow2Image {
         Self::open_depth(path, read_only, 0)
     }
 
+    /// Open read-only without opening the backing chain: the header, the
+    /// snapshot table and the backing reference are readable, guest data that
+    /// would read through to a backing file is not. A missing backing file is
+    /// no error here (`qemu-img info` without `--backing-chain`).
+    pub fn open_header(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        Self::parse(path, file, true)
+    }
+
     fn open_depth(path: &Path, read_only: bool, depth: usize) -> Result<Self> {
         if depth > MAX_BACKING_DEPTH {
             return Err(Error::Unsupported(format!(
