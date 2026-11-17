@@ -15,7 +15,7 @@ fn stamp(lab: Lab) -> Result[unit, string] {
         let peer_name = if name == "vm02" { "vm03" } else { "vm02" }
         let peer = lab.vm(peer_name)?
         let attempts = 0
-        while peer.exec("/bin/test", ["-f", marker])?.exit_code != 0 {
+        while peer.exec("/bin/sh", ["-c", "set -eu; test -f \"$1\"", "e2e-provision", marker])?.exit_code != 0 {
             if attempts >= 120 {
                 return Err("parallel provision timed out waiting for " + peer_name)
             }
