@@ -658,7 +658,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("net_fds"));
-        assert!(peer.send(b"closed").is_err());
+        assert!(
+            peer_closed_within(&peer, Duration::from_secs(10)).await,
+            "a descriptor rejected without net_fds is still open"
+        );
         assert!(hv.seen.try_recv().is_err());
     }
 
