@@ -56,21 +56,32 @@ pub(crate) enum Request {
         flags: u32,
     },
     /// Forget a tap: drop its port config and the helper's queue.
-    XdpRelease { engine: u32, ifindex: u32 },
+    XdpRelease {
+        engine: u32,
+        ifindex: u32,
+    },
     /// Point a unicast MAC at a slot (`tag`), or remove it (`None`).
     XdpMac {
         engine: u32,
         mac: [u8; 6],
         tag: Option<u32>,
     },
-    XdpStats { engine: u32 },
+    XdpStats {
+        engine: u32,
+    },
     /// Load one fastpath_sockmap object (one per switch).
     SockmapLoad {},
     /// Offload the unix stream socket passed with the request as port `id`.
-    SockmapStream { engine: u32, id: u64 },
+    SockmapStream {
+        engine: u32,
+        id: u64,
+    },
     /// Register a TX loopback: the kernel end, then the end the daemon
     /// writes, both unix datagram sockets passed with the request.
-    SockmapTx { engine: u32, id: u64 },
+    SockmapTx {
+        engine: u32,
+        id: u64,
+    },
     /// Point a unicast MAC at an offloaded port (`id`), or remove it.
     SockmapMac {
         engine: u32,
@@ -83,10 +94,16 @@ pub(crate) enum Request {
         tx_cookie: u64,
         macs: Vec<[u8; 6]>,
     },
-    SockmapStats { engine: u32 },
-    SockmapDebug { engine: u32 },
+    SockmapStats {
+        engine: u32,
+    },
+    SockmapDebug {
+        engine: u32,
+    },
     /// Drop an engine and everything it holds.
-    Unload { engine: u32 },
+    Unload {
+        engine: u32,
+    },
 }
 
 impl Request {
@@ -104,17 +121,35 @@ impl Request {
 #[serde(tag = "reply", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Reply {
     Done,
-    Engine { engine: u32 },
+    Engine {
+        engine: u32,
+    },
     /// The tap's queues ride this reply.
-    Tap { name: String, ifindex: u32 },
-    XdpStats { counters: [u64; 4] },
-    Cookie { cookie: u64 },
-    SockmapStats { frames: u64, bytes: u64 },
-    Debug { text: String },
+    Tap {
+        name: String,
+        ifindex: u32,
+    },
+    XdpStats {
+        counters: [u64; 4],
+    },
+    Cookie {
+        cookie: u64,
+    },
+    SockmapStats {
+        frames: u64,
+        bytes: u64,
+    },
+    Debug {
+        text: String,
+    },
     /// Not a fast-path operation, or not one this connection may make.
-    Refused { reason: String },
+    Refused {
+        reason: String,
+    },
     /// A permitted operation the kernel failed.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 /// Send one record with its descriptors.

@@ -261,8 +261,9 @@ impl SockmapEngine {
 pub(super) fn create_tap(queue_pairs: Option<u16>) -> Result<(String, Vec<OwnedFd>)> {
     let opened = match queue_pairs {
         None => vmlab_tap::create("vmfp%d", MAX_TAP_MTU).map(|tap| (tap.name, vec![tap.fd])),
-        Some(pairs) => vmlab_tap::create_vnet("vmfp%d", MAX_TAP_MTU, pairs)
-            .map(|tap| (tap.name, tap.queues)),
+        Some(pairs) => {
+            vmlab_tap::create_vnet("vmfp%d", MAX_TAP_MTU, pairs).map(|tap| (tap.name, tap.queues))
+        }
     };
     opened.map_err(|error| {
         anyhow!(

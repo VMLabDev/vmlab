@@ -25,8 +25,10 @@ pub(crate) trait Kernel {
     type Sockmap;
     fn xdp_load(&mut self) -> Result<Self::Xdp, String>;
     /// Create a tap; returns its name, ifindex and queues.
-    fn tap_create(&mut self, queue_pairs: Option<u16>)
-    -> Result<(String, u32, Vec<OwnedFd>), String>;
+    fn tap_create(
+        &mut self,
+        queue_pairs: Option<u16>,
+    ) -> Result<(String, u32, Vec<OwnedFd>), String>;
     fn xdp_attach(&mut self, xdp: &mut Self::Xdp, ifname: &str) -> Result<(), String>;
     fn xdp_port(
         &mut self,
@@ -36,8 +38,12 @@ pub(crate) trait Kernel {
         flags: u32,
     ) -> Result<(), String>;
     fn xdp_unport(&mut self, xdp: &mut Self::Xdp, ifindex: u32);
-    fn xdp_mac(&mut self, xdp: &mut Self::Xdp, mac: [u8; 6], tag: Option<u32>)
-    -> Result<(), String>;
+    fn xdp_mac(
+        &mut self,
+        xdp: &mut Self::Xdp,
+        mac: [u8; 6],
+        tag: Option<u32>,
+    ) -> Result<(), String>;
     fn xdp_stats(&mut self, xdp: &Self::Xdp) -> [u64; 4];
     fn sockmap_load(&mut self) -> Result<Self::Sockmap, String>;
     fn sockmap_stream(
@@ -119,8 +125,10 @@ fn unicast(mac: &[u8; 6]) -> bool {
 
 /// The passed descriptor is a unix socket of `kind`.
 fn unix_socket(fd: BorrowedFd<'_>, kind: SocketType) -> bool {
-    matches!(rustix::net::sockopt::socket_domain(fd), Ok(AddressFamily::UNIX))
-        && matches!(rustix::net::sockopt::socket_type(fd), Ok(t) if t == kind)
+    matches!(
+        rustix::net::sockopt::socket_domain(fd),
+        Ok(AddressFamily::UNIX)
+    ) && matches!(rustix::net::sockopt::socket_type(fd), Ok(t) if t == kind)
 }
 
 impl<K: Kernel> Server<K> {
@@ -159,14 +167,13 @@ impl<K: Kernel> Server<K> {
     fn xdp(&mut self, engine: u32) -> Result<(&mut K, &mut XdpSlot<K::Xdp>), Answer> {
         match self.slots.get_mut(&engine) {
             Some(Slot::Xdp(slot)) => Ok((&mut self.kernel, slot)),
-            _ => Err(refused(format!("no xdp engine {engine} on this connection"))),
+            _ => Err(refused(format!(
+                "no xdp engine {engine} on this connection"
+            ))),
         }
     }
 
-    fn sockmap(
-        &mut self,
-        engine: u32,
-    ) -> Result<(&mut K, &mut K::Sockmap), Answer> {
+    fn sockmap(&mut self, engine: u32) -> Result<(&mut K, &mut K::Sockmap), Answer> {
         match self.slots.get_mut(&engine) {
             Some(Slot::Sockmap(slot)) => Ok((&mut self.kernel, slot)),
             _ => Err(refused(format!(
@@ -186,7 +193,9 @@ impl<K: Kernel> Server<K> {
         }
         match request {
             Request::XdpLoad {} | Request::SockmapLoad {} if self.slots.len() >= MAX_ENGINES => {
-                refused(format!("this connection already holds {MAX_ENGINES} engines"))
+                refused(format!(
+                    "this connection already holds {MAX_ENGINES} engines"
+                ))
             }
             Request::XdpLoad {} => match self.kernel.xdp_load() {
                 Ok(engine) => self.insert(Slot::Xdp(XdpSlot {
@@ -512,13 +521,23 @@ mod tests {
             let queues = (0..n)
                 .map(|_| UnixDatagram::pair().unwrap().0.into())
                 .collect();
-            Ok((format!("vmfp{}", self.next_ifindex), 100 + self.next_ifindex, queues))
+            Ok((
+                format!("vmfp{}", self.next_ifindex),
+                100 + self.next_ifindex,
+                queues,
+            ))
         }
         fn xdp_attach(&mut self, _: &mut (), name: &str) -> Result<(), String> {
             self.calls.push(format!("attach {name}"));
             Ok(())
         }
-        fn xdp_port(&mut self, _: &mut (), tag: u32, ifindex: u32, flags: u32) -> Result<(), String> {
+        fn xdp_port(
+            &mut self,
+            _: &mut (),
+            tag: u32,
+            ifindex: u32,
+            flags: u32,
+        ) -> Result<(), String> {
             self.calls.push(format!("port {tag} {ifindex} {flags}"));
             Ok(())
         }
@@ -725,21 +744,34 @@ mod tests {
             Reply::Engine { engine } => engine,
             other => panic!("{other:?}"),
         };
-        assert!(is_refused(&ask(&mut server, &Request::XdpStats { engine: sockmap }, vec![]).0));
-        assert!(is_refused(&ask(&mut server, &Request::SockmapStats { engine: xdp }, vec![]).0));
-        assert!(is_refused(&ask(&mut server, &Request::XdpStats { engine: 999 }, vec![]).0));
+        assert!(is_refused(
+            &ask(&mut server, &Request::XdpStats { engine: sockmap }, vec![]).0
+        ));
+        assert!(is_refused(
+            &ask(&mut server, &Request::SockmapStats { engine: xdp }, vec![]).0
+        ));
+        assert!(is_refused(
+            &ask(&mut server, &Request::XdpStats { engine: 999 }, vec![]).0
+        ));
         assert_eq!(
             ask(&mut server, &Request::XdpStats { engine: xdp }, vec![]).0,
             Reply::XdpStats {
                 counters: [1, 2, 3, 4]
             }
         );
-        assert_eq!(ask(&mut server, &Request::Unload { engine: xdp }, vec![]).0, Reply::Done);
-        assert!(is_refused(&ask(&mut server, &Request::XdpStats { engine: xdp }, vec![]).0));
+        assert_eq!(
+            ask(&mut server, &Request::Unload { engine: xdp }, vec![]).0,
+            Reply::Done
+        );
+        assert!(is_refused(
+            &ask(&mut server, &Request::XdpStats { engine: xdp }, vec![]).0
+        ));
         for _ in server.slots.len()..MAX_ENGINES {
             load_xdp(&mut server);
         }
-        assert!(is_refused(&ask(&mut server, &Request::XdpLoad {}, vec![]).0));
+        assert!(is_refused(
+            &ask(&mut server, &Request::XdpLoad {}, vec![]).0
+        ));
     }
 
     #[test]
@@ -758,15 +790,29 @@ mod tests {
 
         // Wrong count, wrong kind, wrong family, not a socket.
         assert!(is_refused(&ask(&mut server, &stream, vec![]).0));
-        assert!(is_refused(&ask(&mut server, &stream, vec![unix_stream(), unix_stream()]).0));
+        assert!(is_refused(
+            &ask(&mut server, &stream, vec![unix_stream(), unix_stream()]).0
+        ));
         assert!(is_refused(&ask(&mut server, &stream, vec![dgram()]).0));
         assert!(is_refused(&ask(&mut server, &stream, vec![file()]).0));
         assert!(is_refused(&ask(&mut server, &tx, vec![dgram(), udp()]).0));
-        assert!(is_refused(&ask(&mut server, &tx, vec![unix_stream(), dgram()]).0));
-        assert!(is_refused(&ask(&mut server, &Request::SockmapStats { engine }, vec![dgram()]).0));
+        assert!(is_refused(
+            &ask(&mut server, &tx, vec![unix_stream(), dgram()]).0
+        ));
+        assert!(is_refused(
+            &ask(
+                &mut server,
+                &Request::SockmapStats { engine },
+                vec![dgram()]
+            )
+            .0
+        ));
         assert_eq!(server.kernel.calls, vec!["sockmap_load"]);
 
-        assert_eq!(ask(&mut server, &stream, vec![unix_stream()]).0, Reply::Done);
+        assert_eq!(
+            ask(&mut server, &stream, vec![unix_stream()]).0,
+            Reply::Done
+        );
         assert_eq!(
             ask(&mut server, &tx, vec![dgram(), dgram()]).0,
             Reply::Cookie { cookie: 77 }
@@ -789,7 +835,12 @@ mod tests {
     fn the_loop_answers_refusals_and_ends_with_its_peer() {
         let (daemon, helper) = proto::pair().unwrap();
         let worker = std::thread::spawn(move || serve(helper, Fake::default()));
-        rustix::net::send(&daemon, br#"{"op":"exec"}"#, rustix::net::SendFlags::empty()).unwrap();
+        rustix::net::send(
+            &daemon,
+            br#"{"op":"exec"}"#,
+            rustix::net::SendFlags::empty(),
+        )
+        .unwrap();
         let (bytes, _) = proto::recv(daemon.as_fd()).unwrap().unwrap();
         assert!(is_refused(&serde_json::from_slice(&bytes).unwrap()));
         proto::send(daemon.as_fd(), &Request::XdpLoad {}, &[]).unwrap();
