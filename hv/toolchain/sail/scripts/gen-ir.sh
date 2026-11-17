@@ -37,6 +37,7 @@ test -s riscv64.ir || { echo "gen-ir: isla-sail produced no output" >&2; cat isl
 IR_SHA=$(sha256sum riscv64.ir | cut -d' ' -f1)
 CFG_SHA=$(sha256sum "$CFG" | cut -d' ' -f1)
 
+[ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
 cp riscv64.ir "$OUT/riscv64.ir"
 tail -n 50 isla-sail.log > "$OUT/riscv64.ir.log" || true
 {

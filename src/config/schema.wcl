@@ -172,7 +172,7 @@ type DnsRecord {
 type Forward {
   @doc("Host port to listen on (1–65535), unique across the lab; omitted = vmlab picks a free port when the forward is installed, shown by `vmlab status`")
   @range(1, 65535) host_port: i64?
-  @doc("Host IPv4 address to listen on, one the host owns; omitted = `0.0.0.0` (every interface). `127.0.0.1` keeps the forward off the LAN. Worktree isolation binds `127.0.0.1` whatever is declared")
+  @doc("Host IPv4 address to listen on, one the host owns; omitted = `127.0.0.1` (loopback). Declare `0.0.0.0` to expose every interface. Worktree isolation binds `127.0.0.1` whatever is declared")
   bind: utf8?
   @doc("Target as `vm:port`; the VM must be declared (required)")
   to: utf8
@@ -306,7 +306,7 @@ type Vm {
   secure_boot_vars: utf8?
   @doc("Raw QEMU flags appended last — escape hatch")
   qemu_args: list<utf8>?
-  @doc("Hypervisor that runs the VM: `qemu` | `vmlab` (vmlab-hv; refused on a VM until its phase 2, PRD §22); unset = the host config's default for VMs, itself `qemu` unless set")
+  @doc("Hypervisor that runs the VM: `qemu` | `vmlab` (vmlab-hv; q35 VMs supported, legacy pc support in progress in phases 4a-4e, PRD §22); unset = the host config's default for VMs, itself `qemu` unless set")
   @options(["qemu", "vmlab"]) hypervisor: utf8?
   @doc("GPU acceleration (passthrough / virgl / vulkan)")
   @child("gpu")     gpu: Gpu?
@@ -446,7 +446,7 @@ type Volume {
 type PortMap {
   @doc("Host port to listen on (1–65535), unique across the lab; omitted = vmlab picks a free port when the forward is installed, shown by `vmlab status`")
   @range(1, 65535) host: i64?
-  @doc("Host IPv4 address to listen on, one the host owns; omitted = `0.0.0.0` (every interface). `127.0.0.1` keeps the forward off the LAN. Worktree isolation binds `127.0.0.1` whatever is declared")
+  @doc("Host IPv4 address to listen on, one the host owns; omitted = `127.0.0.1` (loopback). Declare `0.0.0.0` to expose every interface. Worktree isolation binds `127.0.0.1` whatever is declared")
   bind: utf8?
   @doc("Container port to forward to (1–65535) (required)")
   @range(1, 65535) container: i64

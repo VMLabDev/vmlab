@@ -292,6 +292,8 @@ struct Case {
     full: pc::Platform,
     staged: pc::Platform,
     cdrom: bool,
+    /// The capture's display is Cirrus CL-GD5446 rather than std-VGA.
+    cirrus: bool,
     processor_id: [u8; 8],
 }
 
@@ -337,19 +339,9 @@ impl Case {
             com2: name != "pc-windows-7",
             physical_address_bits: if name == "pc-windows-98-se" { 32 } else { 48 },
         };
-        let mut staged = full.clone();
-        staged.pci_devices.clear();
-        for (device, description) in devices.iter().zip(&full.pci_devices) {
-            let class = device["class_info"]["class"].as_u64().unwrap();
-            if class == 0x200 || (description.device, description.function) == (1, 2) {
-                continue;
-            }
-            let mut kept = description.clone();
-            if class == 0x300 {
-                kept.vga = true;
-            }
-            staged.pci_devices.push(kept);
-        }
+        // 4a to 4d are delivered: the probe machine stages every captured
+        // function at its captured address (NICs, UHCI, Cirrus).
+        let staged = full.clone();
         let mut processor_id = smbios::SmbiosConfig::default().processor_id;
         if name == "pc-freedos-1.3" {
             processor_id[7] = 7;
@@ -357,11 +349,17 @@ impl Case {
         if name == "pc-windows-98-se" {
             processor_id = [0x73, 6, 0, 0, 0xff, 0xfb, 0x83, 3];
         }
+        let cirrus = devices.iter().any(|device| {
+            device["class_info"]["class"].as_u64() == Some(0x300)
+                && device["id"]["vendor"].as_u64() == Some(0x1013)
+                && device["id"]["device"].as_u64() == Some(0xb8)
+        });
         Self {
             name,
             full,
             staged,
             cdrom: name != "pc-templeos",
+            cirrus,
             processor_id,
         }
     }
@@ -387,8 +385,9 @@ impl Case {
             .staged
             .pci_devices
             .iter()
-            .find(|device| device.vga)
+            .find(|device| device.device > 1 && device.function == 0 && !device.hotplug)
             .unwrap();
+        let device = if self.cirrus { "cirrus-vga" } else { "std-vga" };
         let mut description = serde_json::json!({
             "name":self.name,"machine":"pc","arch":"x86_64","accel":"kvm",
             "vcpus":self.staged.vcpus,
@@ -396,9 +395,19 @@ impl Case {
             "boot":{"kind":"firmware","firmware":"seabios","code":bios},
             "disks":[{"id":"probe","bus":"ide","channel":0,"unit":0,
                 "path":path.join("probe.raw"),"format":"raw","read_only":true}],
-            "display":{"device":"std-vga","pci":{"bus":0,"device":display.device,"function":display.function},"rom":vga},
+            "display":{"device":device,"pci":{"bus":0,"device":display.device,"function":display.function},"rom":vga},
             "nics":[],"serial_log":path.join("probe.log"),"ports":[]
         });
+        // The captured NIC at its captured address, on a switch socket that
+        // never answers: the probe reads its identity, not its traffic.
+        for (index, nic) in self.nics().into_iter().enumerate() {
+            description["nics"].as_array_mut().unwrap().push(serde_json::json!({
+                "model": nic.model,
+                "pci": {"bus":0,"device":nic.device,"function":nic.function},
+                "mac": format!("52:54:00:00:00:{:02x}", index + 1),
+                "attachment": {"kind":"stream","socket":path.join(format!("unused-nic{index}.sock"))}
+            }));
+        }
         if self.cdrom {
             description["disks"]
                 .as_array_mut()
@@ -408,6 +417,9 @@ impl Case {
                     "format":"raw","read_only":true
                 }));
         }
+        // vmlab's legacy profiles add `-usb -device usb-tablet`: the UHCI
+        // function and its tablet.
+        description["tablet"] = serde_json::json!({"bus":0,"device":1,"function":2});
         if self.full.com2 {
             description["ports"] = serde_json::json!([{"name":"hwref-com2","transport":"com2","socket":path.join("unused-com2.sock")}]);
         } else {
@@ -419,6 +431,126 @@ impl Case {
         }
         description
     }
+}
+
+/// A captured Ethernet function and the baseline capture's config bytes for
+/// its model.
+struct CapturedNic {
+    model: &'static str,
+    device: u8,
+    function: u8,
+    baseline_bdf: u16,
+}
+
+impl Case {
+    fn nics(&self) -> Vec<CapturedNic> {
+        let pci: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture(self.name).join("query-pci.json")).unwrap(),
+        )
+        .unwrap();
+        pci[0]["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|device| device["class_info"]["class"].as_u64() == Some(0x200))
+            .map(|device| {
+                let e1000 = device["id"]["vendor"].as_u64() == Some(0x8086);
+                CapturedNic {
+                    model: if e1000 { "e1000" } else { "pcnet" },
+                    device: device["slot"].as_u64().unwrap() as u8,
+                    function: device["function"].as_u64().unwrap() as u8,
+                    // pc-seabios-legacy: e1000 at 02.0, PCnet at 03.0.
+                    baseline_bdf: if e1000 { 0x10 } else { 0x18 },
+                }
+            })
+            .collect()
+    }
+}
+
+/// Compare a NIC function's config space with the baseline capture of the
+/// same model, byte by byte. Placement and driver state are the only bounded
+/// differences.
+fn compare_nic(
+    case: &Case,
+    nic: &CapturedNic,
+    actual: &[u8],
+    baseline: &[u8],
+    problems: &mut Vec<String>,
+    differences: &mut Vec<String>,
+) {
+    let mut reasons = BTreeSet::new();
+    for offset in 0..256 {
+        if actual[offset] == baseline[offset] {
+            continue;
+        }
+        let reason = match offset {
+            4 if (actual[4] ^ baseline[4]) & !0x04 == 0 => Some(
+                "command bus-master bit: the capture's driver enabled DMA; the probe runs before any driver",
+            ),
+            0x10..=0x27 => Some("BAR addresses follow the slot's allocation"),
+            0x30..=0x33 => Some("no option ROM is attached (D14: no QEMU ROMs)"),
+            0x3c => Some("interrupt line follows the slot's PIRQ routing"),
+            _ => None,
+        };
+        match reason {
+            Some(reason) => {
+                reasons.insert(reason);
+            }
+            None => problems.push(format!(
+                "{} {} {:02x}.{} config[{offset:#x}]={:#04x}, captured {:#04x}",
+                case.name, nic.model, nic.device, nic.function, actual[offset], baseline[offset]
+            )),
+        }
+    }
+    differences.extend(reasons.into_iter().map(|reason| {
+        format!(
+            "{:02x}.{} {}: {reason}",
+            nic.device, nic.function, nic.model
+        )
+    }));
+}
+
+/// Compare the PIIX3 UHCI's config space with the Linux baseline's, byte by
+/// byte. The baseline's driver state and slot allocation are the only
+/// bounded differences.
+fn compare_uhci(
+    case: &Case,
+    actual: &[u8],
+    baseline: &[u8],
+    problems: &mut Vec<String>,
+    differences: &mut Vec<String>,
+) {
+    let mut reasons = BTreeSet::new();
+    for offset in 0..256 {
+        if actual[offset] == baseline[offset] {
+            continue;
+        }
+        let reason = match offset {
+            4 if (actual[4] ^ baseline[4]) & !0x07 == 0 => Some(
+                "command I/O, memory and bus-master bits: the baseline's uhci_hcd enabled them; the probe runs after SeaBIOS only",
+            ),
+            0x20..=0x23 => Some("BAR4 address follows the slot's allocation"),
+            0x3c => Some("interrupt line follows PIRQD's routing"),
+            0xc0 | 0xc1 => Some(
+                "LEGSUP: the baseline's uhci_hcd wrote USBPIRQDEN (0x2000); QEMU resets it to 0",
+            ),
+            _ => None,
+        };
+        match reason {
+            Some(reason) => {
+                reasons.insert(reason);
+            }
+            None => problems.push(format!(
+                "{} uhci 01.2 config[{offset:#x}]={:#04x}, baseline {:#04x}",
+                case.name, actual[offset], baseline[offset]
+            )),
+        }
+    }
+    differences.extend(
+        reasons
+            .into_iter()
+            .map(|reason| format!("01.2 uhci: {reason}")),
+    );
 }
 
 fn normalize_acpi(bytes: &[u8]) -> Vec<u8> {
@@ -618,7 +750,7 @@ fn pci_exception(
                     || matches!(actual[offset]&15,3..=7|9..=12|14..=15)) =>
         {
             Some(
-                "PIRQ selections/disable bits reflect the deferred NIC/UHCI functions and BIOS-only probe, rather than a running Linux PCI/ACPI stack",
+                "PIRQ selections/disable bits reflect the BIOS-only probe, rather than a running Linux PCI/ACPI stack",
             )
         }
         (9, 4) if (actual[offset] ^ expected[offset]) & !4 == 0 => Some(
@@ -628,7 +760,9 @@ fn pci_exception(
             if le32(actual, 0x20) & 15 == 1
                 && (0x1000..=0xfff0).contains(&(le32(actual, 0x20) & !15)) =>
         {
-            Some("IDE BAR4 allocation moves when NIC/UHCI BAR consumers are absent")
+            Some(
+                "IDE BAR4 allocation follows this profile's device set, not the superset baseline's",
+            )
         }
         (9, 0x40..=0x44)
             if (actual[offset] ^ expected[offset])
@@ -651,16 +785,9 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
     capture_anchor(case)?;
     let mut problems = Vec::new();
     let mut differences=vec![
-        "4c: UHCI 00:01.2 and its AML/hotplug notification are absent".into(),
         "D3: genroms/kvmvapic.bin is absent".into(),
         "the original boot disk has fixture contents/capacity; CMOS disk geometry describes that disk".into(),
     ];
-    if case.name != "pc-templeos" {
-        differences.push("4b: captured e1000/PCnet function and its AML are absent".into());
-    }
-    if matches!(case.name, "pc-freedos-1.3" | "pc-windows-98-se") {
-        differences.push("4d: captured Cirrus is replaced at the same BDF by std-VGA, including its three ACPI sleep methods".into());
-    }
     let expected_bdfs: BTreeSet<_> = case
         .staged
         .pci_devices
@@ -686,17 +813,13 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
             continue;
         };
         let class = device["class_info"]["class"].as_u64().unwrap() as u16;
-        let (identity, subsystem, pin) = if class == 0x300 {
-            (0x1111_1234u32, 0x1100_1af4u32, 0u8)
-        } else {
-            (
-                (device["id"]["device"].as_u64().unwrap() as u32) << 16
-                    | device["id"]["vendor"].as_u64().unwrap() as u32,
-                (device["id"]["subsystem"].as_u64().unwrap_or(0) as u32) << 16
-                    | device["id"]["subsystem-vendor"].as_u64().unwrap_or(0) as u32,
-                device["irq_pin"].as_u64().unwrap() as u8,
-            )
-        };
+        let (identity, subsystem, pin) = (
+            (device["id"]["device"].as_u64().unwrap() as u32) << 16
+                | device["id"]["vendor"].as_u64().unwrap() as u32,
+            (device["id"]["subsystem"].as_u64().unwrap_or(0) as u32) << 16
+                | device["id"]["subsystem-vendor"].as_u64().unwrap_or(0) as u32,
+            device["irq_pin"].as_u64().unwrap() as u8,
+        );
         if le32(actual, 0) != identity
             || le32(actual, 0x2c) != subsystem
             || le16(actual, 0xa) != class
@@ -754,6 +877,24 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
                 .map(|reason| format!("{:02x}.{}: {reason}", bdf / 8, bdf % 8)),
         );
     }
+    for nic in case.nics() {
+        let bdf = u16::from(nic.device) * 8 + u16::from(nic.function);
+        compare_nic(
+            case,
+            &nic,
+            &dump.pci[&bdf],
+            &baseline[&nic.baseline_bdf],
+            &mut problems,
+            &mut differences,
+        );
+    }
+    compare_uhci(
+        case,
+        &dump.pci[&0x0a],
+        &baseline[&0x0a],
+        &mut problems,
+        &mut differences,
+    );
     let cpuid = &dump.records[&9];
     record_check(
         &mut problems,
@@ -875,7 +1016,7 @@ fn compare(case: &Case, dump: &Dump) -> Result<Vec<String>, String> {
     )
     .map_err(|e| e.to_string())?;
     for index in [
-        0x15u8, 0x16, 0x17, 0x18, 0x30, 0x31, 0x34, 0x35, 0x5b, 0x5c, 0x5d, 0x5f,
+        0x10u8, 0x15, 0x16, 0x17, 0x18, 0x30, 0x31, 0x34, 0x35, 0x5b, 0x5c, 0x5d, 0x5f,
     ] {
         let name = format!("{index:#04x}");
         if let Some(values) = observed[&name]["read_values"].as_array() {
@@ -1273,7 +1414,10 @@ fn pc_hwref_differential_all_four_captures() {
     let vga = std::env::var_os("VMLAB_HV_STDVGABIOS")
         .map(PathBuf::from)
         .unwrap_or_else(|| "/usr/share/qemu/vgabios-stdvga.bin".into());
-    for path in [&bios, &vga] {
+    let cirrus = std::env::var_os("VMLAB_HV_CIRRUSBIOS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/usr/share/qemu/vgabios-cirrus.bin".into());
+    for path in [&bios, &vga, &cirrus] {
         if !path.is_file() {
             eprintln!(
                 "SKIP P2 pc differential: firmware {} is unavailable",
@@ -1284,7 +1428,8 @@ fn pc_hwref_differential_all_four_captures() {
     }
     for name in CAPTURES {
         let case = Case::new(name);
-        let mut vm = ProbeVm::boot(&case, &bios, &vga);
+        let rom = if case.cirrus { &cirrus } else { &vga };
+        let mut vm = ProbeVm::boot(&case, &bios, rom);
         let dump = vm.collect();
         let allowed = compare(&case, &dump).unwrap_or_else(|message| {
             panic!("{message}; artifacts {}", vm.directory.path().display())

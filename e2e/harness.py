@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from features import FEATURES, HOST, PHASE_ORDER, PHASES, QEMU_SCENARIOS, VMLAB_DELIVERED, out_of_scope
@@ -31,6 +32,51 @@ RESULTS = pathlib.Path(os.environ.get("E2E_RESULTS", "/results"))
 def redact_osk(text: str) -> str:
     """Hide device options, including keys containing printable whitespace."""
     return re.sub(r"osk=[^\r\n\x00]*", "osk=[REDACTED]", text)
+
+
+def host_load(proc: pathlib.Path = pathlib.Path("/proc")) -> str:
+    """The load average and the IO pressure of the host, in one line, so a
+    timeout says whether the disk was saturated. Best effort: a missing file
+    is left out."""
+    parts = []
+    with contextlib.suppress(OSError, IndexError):
+        parts.append("load " + " ".join((proc / "loadavg").read_text().split()[:3]))
+    with contextlib.suppress(OSError):
+        for line in (proc / "pressure" / "io").read_text().splitlines():
+            fields = dict(f.split("=", 1) for f in line.split()[1:] if "=" in f)
+            if "avg60" in fields:
+                parts.append(f"io {line.split()[0]} avg60={fields['avg60']}%")
+    return ", ".join(parts) or "load unknown"
+
+
+# C0 control characters that XML 1.0 forbids (all but tab, newline and
+# carriage return). Command output can carry them: the ESC of an ANSI colour
+# code, a NUL from a guest console.
+_XML_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_safe(text: str) -> str:
+    return _XML_FORBIDDEN.sub("?", text)
+
+
+def junit_xml(rows: list[dict], name: str = "e2e") -> str:
+    """The rows of `results.json` as JUnit XML, one test case per feature:
+    a fail or missing feature is a failure, a skipped one is skipped."""
+    failures = sum(r["status"] in ("fail", "missing") for r in rows)
+    skipped = sum(r["status"] == "skip" for r in rows)
+    attrs = {"name": name, "tests": str(len(rows)), "failures": str(failures),
+             "errors": "0", "skipped": str(skipped)}
+    root = ET.Element("testsuites", attrs)
+    suite = ET.SubElement(root, "testsuite", attrs)
+    for r in rows:
+        case = ET.SubElement(suite, "testcase", {"classname": f"e2e.{r['hypervisor']}", "name": r["feature"]})
+        detail = _xml_safe(r["detail"])
+        if r["status"] in ("fail", "missing"):
+            ET.SubElement(case, "failure", {"type": r["status"], "message": detail}).text = detail
+        elif r["status"] == "skip":
+            ET.SubElement(case, "skipped", {"message": detail})
+    ET.indent(root)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
 
 
 class ScenarioFailed(Exception):
@@ -80,6 +126,7 @@ class Harness:
         nonzero exit when `check` is set."""
         self.log.write(redact_osk(f"\n[{self.scenario}] $ {' '.join(argv)}  (cwd={cwd or WORK})\n"))
         full_env = dict(os.environ, **(env or {}))
+        started = time.monotonic()
         try:
             p = subprocess.run(
                 argv,
@@ -94,14 +141,17 @@ class Harness:
         except subprocess.TimeoutExpired as e:
             out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
             err = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
-            r = Result(argv, 124, out, err + f"\n[timed out after {timeout}s]")
+            # A slow disk and a hang look the same from here: say how loaded
+            # the host was when the bound ran out.
+            r = Result(argv, 124, out, err + f"\n[timed out after {timeout}s; host {host_load()}]")
+        elapsed = time.monotonic() - started
         r.out = redact_osk(r.out)
         r.err = redact_osk(r.err)
         r.argv = [redact_osk(arg) for arg in r.argv]
         self.log.write(r.out)
         if r.err:
             self.log.write("[stderr] " + r.err)
-        self.log.write(f"[exit {r.code}]\n")
+        self.log.write(f"[exit {r.code} after {elapsed:.1f}s]\n")
         if check and r.code != 0:
             raise ScenarioFailed(f"`{' '.join(r.argv)}` exited {r.code}: {r.text.strip()[-800:]}")
         return r
@@ -267,6 +317,7 @@ class Harness:
             rows.append({"feature": fid, "description": desc, "hypervisor": self.hypervisor,
                          "status": status, "detail": detail})
         (RESULTS / "results.json").write_text(json.dumps(rows, indent=2))
+        (RESULTS / "junit.xml").write_text(junit_xml(rows, f"e2e-{self.hypervisor}"))
         width = max((len(r["feature"]) for r in rows), default=0)
         counts: dict[str, int] = {}
         for r in rows:

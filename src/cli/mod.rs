@@ -84,6 +84,10 @@ pub enum Command {
     Up {
         /// VMs to bring up (default: all)
         vms: Vec<String>,
+        /// Return only once every machine brought up is ready (its agent
+        /// answers), not only those a provision or a dependent waits on
+        #[arg(long)]
+        wait: bool,
         #[command(flatten)]
         record: record::RecordFlags,
     },
@@ -713,7 +717,11 @@ pub struct As {
 }
 
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    run_parsed(Cli::parse())
+}
+
+/// Execute a parsed command with the CLI's diagnostics and exit mapping.
+pub(crate) fn run_parsed(cli: Cli) -> ExitCode {
     if let Some(instance) = cli.instance.clone() {
         crate::instance::set_flag(instance);
     }
@@ -730,7 +738,9 @@ pub fn run() -> ExitCode {
         broken_pipe::install();
     }
     let result = match cli.command {
-        Command::Up { vms, record } => record.requests().and_then(|r| lab::cmd_up(vms, r)),
+        Command::Up { vms, wait, record } => {
+            record.requests().and_then(|r| lab::cmd_up(vms, wait, r))
+        }
         Command::Pull { vms } => lab::cmd_pull(vms),
         Command::Down { vms, force } => lab::cmd_down(vms, force),
         Command::Destroy => lab::cmd_destroy(),

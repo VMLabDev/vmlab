@@ -31,6 +31,8 @@ done'
 export WINEPREFIX="$t/wineprefix" WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
 fail=0
 for d in x64 x86; do
+  [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
+  [ -n "$t" ] && [ "$t" != / ] || { echo "VML-88: t is empty or /" >&2; exit 1; }
   install -m 0644 "$out/$d/d3d12.dll" "$t/$d/d3d12.dll"
   echo "== $d"
   # The bridge in the exe's directory wins over Wine's builtin d3d12.

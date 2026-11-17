@@ -2,6 +2,67 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 
+#[test]
+fn atapi_packet_keeps_its_unit_when_guest_selects_slave() {
+    let mut d = Driver::new();
+    d.ide
+        .attach_cdrom(0, 0, Some(d.disk("cd", &[0; 4096], true)))
+        .unwrap();
+    d.attach(0, 1, &[0; 4096]);
+    d.w(0, 4, 8);
+    d.w(0, 5, 0);
+    d.w(0, 7, 0xa0);
+    d.w(0, 6, 0xb0);
+    d.put(0, &[0x12, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(d.ide.channels[0].transfer.unit, 0);
+    assert_eq!(d.bytes(0, 8)[0], 5);
+}
+
+#[test]
+fn restore_rejects_ide_limits_outside_media_and_protocol() {
+    let mut d = Driver::new();
+    d.attach(0, 0, &[0; 4096]);
+    let original = d.ide.save_state().unwrap();
+    for field in ["limit", "packet_limit"] {
+        let mut state: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        if field == "packet_limit" {
+            state["channels"][0][field] = 65535.into();
+        } else {
+            state["channels"][0]["units"][0][field] = 255.into();
+        }
+        assert!(
+            d.ide
+                .restore_state(&serde_json::to_vec(&state).unwrap())
+                .is_err()
+        );
+        assert_eq!(d.ide.save_state().unwrap(), original);
+    }
+}
+
+#[test]
+fn atapi_msf_toc_handles_maximum_lba_without_overflow() {
+    let mut d = Driver::new();
+    let path = d.directory.path().join("large-cd");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(u64::from(u32::MAX) * 2048)
+        .unwrap();
+    let image = vmlab_disk::open(&path, vmlab_disk::Format::Raw, true).unwrap();
+    d.ide.attach_cdrom(0, 0, Some(image)).unwrap();
+    d.packet(0, [0x43, 2, 0, 0, 0, 0, 0xaa, 0, 12, 0, 0, 0], 512, false);
+    let toc = d.bytes(0, 12);
+    let frames = u64::from(u32::MAX) + 150;
+    assert_eq!(
+        &toc[8..12],
+        &[
+            0,
+            (frames / 4500) as u8,
+            (frames / 75 % 60) as u8,
+            (frames % 75) as u8
+        ]
+    );
+}
+
 #[derive(Default)]
 struct Line(AtomicBool);
 impl IrqLine for Line {
@@ -419,6 +480,46 @@ fn atapi_dma_lock_media_change_and_snapshot_generation() {
         .unwrap();
     assert!(d.ide.restore_state(&state).is_err());
     assert!(d.ide.media_state(0, 0).unwrap().present);
+}
+
+/// The host's eject goes through a guest lock and leaves the tray closed on
+/// an empty drive: the guest sees the change, then "medium not present,
+/// tray closed", and its lock is gone.
+#[test]
+fn atapi_forced_eject_overrides_the_guest_lock_and_closes_the_tray() {
+    let mut d = Driver::new();
+    d.ide
+        .attach_cdrom(1, 0, Some(d.disk("cd", &vec![0x31; 4096], true)))
+        .unwrap();
+    d.packet(1, [0x1e, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], 512, false);
+    assert!(d.ide.media_state(1, 0).unwrap().locked);
+    assert!(d.ide.eject_media(1, 0).is_err());
+    let image = d.ide.force_eject_media(1, 0).unwrap();
+    assert_eq!(image.unwrap().size(), 4096);
+    assert_eq!(
+        d.ide.media_state(1, 0).unwrap(),
+        crate::ata::MediaState {
+            present: false,
+            tray_open: false,
+            locked: false
+        }
+    );
+    d.packet(1, [0; 12], 512, false);
+    assert_eq!(d.r(1, 7), 0x41);
+    assert_eq!(d.r(1, 1), 0x64);
+    d.packet(1, [0; 12], 512, false);
+    assert_eq!(d.r(1, 1), 0x24);
+    d.packet(1, [3, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0], 512, false);
+    let sense = d.bytes(1, 18);
+    assert_eq!((sense[2], sense[12], sense[13]), (2, 0x3a, 1));
+    d.packet(1, [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0], 512, false);
+    assert_eq!(d.r(1, 7), 0x41);
+    assert!(d.ide.force_eject_media(1, 0).unwrap().is_none());
+    assert!(d.ide.force_eject_media(1, 1).is_err());
+    d.ide
+        .insert_media(1, 0, d.disk("next", &vec![0x32; 2048], true))
+        .unwrap();
+    assert!(d.ide.media_state(1, 0).unwrap().present);
 }
 
 #[test]

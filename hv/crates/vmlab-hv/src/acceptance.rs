@@ -70,6 +70,31 @@ fn boot_template_with_tsc(
     firmware: Firmware,
     tsc_khz: Option<u32>,
 ) {
+    boot_template_with(
+        name,
+        variable,
+        snapshot,
+        bus,
+        display_test,
+        firmware,
+        tsc_khz,
+        false,
+    );
+}
+
+/// `eject` puts an install CD in the AHCI CD-ROM and runs
+/// [`eject_held_install_cdrom`] once the agent answers.
+#[allow(clippy::too_many_arguments)]
+fn boot_template_with(
+    name: &str,
+    variable: &str,
+    snapshot: bool,
+    bus: vmlab_hv_proto::machine::DiskBus,
+    display_test: DisplayTest,
+    firmware: Firmware,
+    tsc_khz: Option<u32>,
+    eject: bool,
+) {
     if !Path::new("/dev/kvm").exists() {
         eprintln!("skipping {name}: /dev/kvm is unavailable");
         return;
@@ -275,6 +300,21 @@ fn boot_template_with_tsc(
             "id": "cdrom0", "bus": "ahci", "port": 2, "cdrom": true,
             "format": "raw", "read_only": true
         }));
+    if eject {
+        let iso = dir.path().join("install.iso");
+        let mut image = vec![0; 64 * 2048];
+        image[..INSTALL_CD_MARKER.len()].copy_from_slice(INSTALL_CD_MARKER.as_bytes());
+        std::fs::write(&iso, image).unwrap();
+        let mut permissions = std::fs::metadata(&iso).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&iso, permissions).unwrap();
+        let cdrom = description["disks"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap();
+        cdrom["path"] = serde_json::to_value(&iso).unwrap();
+    }
     let machine = dir.path().join("machine.json");
     std::fs::write(&machine, serde_json::to_vec(&description).unwrap()).unwrap();
     let binary = std::env::var_os("VMLAB_HV_BINARY")
@@ -451,6 +491,9 @@ fn boot_template_with_tsc(
     );
     if let Some(khz) = tsc_khz.filter(|_| !windows) {
         assert_guest_tsc(&mut guest, khz);
+    }
+    if eject {
+        eject_held_install_cdrom(&mut client, &mut guest);
     }
     // Soak runs repeat the reset and snapshot-load cycles; one is the default.
     let cycles = |variable: &str| -> usize {
@@ -772,6 +815,96 @@ fn boot_template_with_tsc(
     }
 }
 
+/// The first sector of the install CD [`eject_held_install_cdrom`] reads.
+const INSTALL_CD_MARKER: &str = "vmlab-hv-install-cd";
+
+/// Run `script` under the guest's `/bin/sh` and return its output.
+fn guest_sh(guest: &mut AgentClient, script: &str) -> vmlab_hv_tests::agent::ExecOutput {
+    guest
+        .exec(&["/bin/sh", "-c", script], Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("guest script {script:?}: {error}"))
+}
+
+/// The host empties an install CD the guest holds open and has locked
+/// (`CDROM_LOCKDOOR`, the prevent-removal a setup program holds), and the
+/// guest sees the drive empty with its tray closed (`CDROM_DRIVE_STATUS` is
+/// `CDS_NO_DISC`), while the holder keeps running.
+fn eject_held_install_cdrom(client: &mut Client, guest: &mut AgentClient) {
+    let read = guest_sh(
+        guest,
+        "for i in $(seq 100); do test -b /dev/sr0 && break; sleep 0.1; done; \
+         dd if=/dev/sr0 bs=2048 count=1 status=none | head -c 19",
+    );
+    assert_eq!(read.exit_code, 0, "reading the install CD: {read:?}");
+    assert_eq!(String::from_utf8_lossy(&read.stdout), INSTALL_CD_MARKER);
+    let held = guest_sh(
+        guest,
+        "command -v python3 >/dev/null || { echo python3 is missing >&2; exit 2; }; \
+         rm -f /run/vmlab-hv-cd-held; \
+         nohup python3 -c 'import fcntl, os, time\n\
+fd = os.open(\"/dev/sr0\", os.O_RDONLY)\n\
+fcntl.ioctl(fd, 0x5329, 1)\n\
+open(\"/run/vmlab-hv-cd-held\", \"w\").write(str(os.getpid()))\n\
+time.sleep(3600)' >/dev/null 2>&1 </dev/null & \
+         for i in $(seq 100); do test -s /run/vmlab-hv-cd-held && exit 0; sleep 0.1; done; exit 1",
+    );
+    assert_eq!(held.exit_code, 0, "holding and locking /dev/sr0: {held:?}");
+    let status = "python3 -c 'import fcntl, os\n\
+fd = os.open(\"/dev/sr0\", os.O_RDONLY | os.O_NONBLOCK)\n\
+print(fcntl.ioctl(fd, 0x5326, 0x7fffffff))'";
+    let before = guest_sh(guest, status);
+    assert_eq!(
+        String::from_utf8_lossy(&before.stdout).trim(),
+        "4",
+        "CDS_DISC_OK before the eject: {before:?}"
+    );
+
+    let ejected = client
+        .call(Control::EjectMedia {
+            id: "cdrom0".into(),
+        })
+        .unwrap();
+    assert!(
+        matches!(ejected, Outcome::Ok { .. }),
+        "eject_media: {ejected:?}"
+    );
+
+    let after = guest_sh(guest, status);
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        "1",
+        "CDS_NO_DISC, tray closed, after the eject: {after:?}"
+    );
+    let read = guest_sh(guest, "dd if=/dev/sr0 bs=2048 count=1 of=/dev/null");
+    assert_ne!(read.exit_code, 0, "a read after the eject: {read:?}");
+    assert!(
+        String::from_utf8_lossy(&read.stderr).contains("No medium found"),
+        "a read after the eject: {read:?}"
+    );
+    let holder = guest_sh(
+        guest,
+        "pid=$(cat /run/vmlab-hv-cd-held) && kill -0 \"$pid\" && kill \"$pid\"",
+    );
+    assert_eq!(
+        holder.exit_code, 0,
+        "the holder survived the eject: {holder:?}"
+    );
+    let missing = client
+        .call(Control::EjectMedia { id: "nope".into() })
+        .unwrap();
+    assert!(
+        matches!(
+            missing,
+            Outcome::Error {
+                code: vmlab_hv_proto::control::ErrorCode::DeviceNotFound,
+                ..
+            }
+        ),
+        "eject_media on an unknown id: {missing:?}"
+    );
+    eprintln!("ubuntu-26.04: a held, locked install CD was ejected; the guest sees no disc");
+}
+
 fn assert_guest_tsc(guest: &mut AgentClient, khz: u32) {
     let output = guest.exec(&["dmesg"], Duration::from_secs(20)).unwrap();
     assert_eq!(output.exit_code, 0, "dmesg: {output:?}");
@@ -865,6 +998,23 @@ fn ubuntu_26_04_firmware_agent_and_snapshot() {
         vmlab_hv_proto::machine::DiskBus::Virtio,
         DisplayTest::None,
         Firmware::SeaBios,
+    );
+}
+
+/// S1 for the media capability: `eject_media` empties the install CD a
+/// running guest holds open and locked, and leaves the tray closed.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn ubuntu_26_04_ejects_a_held_install_cdrom() {
+    boot_template_with(
+        "ubuntu-26.04",
+        "VMLAB_HV_TEMPLATE_UBUNTU_26_04",
+        false,
+        vmlab_hv_proto::machine::DiskBus::Virtio,
+        DisplayTest::None,
+        Firmware::SeaBios,
+        None,
+        true,
     );
 }
 

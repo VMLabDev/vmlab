@@ -12,5 +12,7 @@ uv run --frozen --script "$SCRIPT_DIR/enroll-secureboot.py" \
   --template "$OUT/OVMF_VARS_4M.ms.debian.fd" \
   --microsoft-manifest "$SCRIPT_DIR/secureboot/microsoft-2023.json" \
   --output "$work/vars.fd" >"$work/BUILDINFO.json"
+[ -n "$work" ] && [ "$work" != / ] || { echo "VML-88: work is empty or /" >&2; exit 1; }
+[ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
 install -m 0644 "$work/vars.fd" "$OUT/OVMF_VARS_4M.ms.fd"
 install -m 0644 "$work/BUILDINFO.json" "$OUT/SECUREBOOT-BUILDINFO.json"

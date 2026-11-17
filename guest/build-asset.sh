@@ -34,7 +34,7 @@ MIRROR="${VMLAB_ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 
 # Pinned packages: repo|name|version|sha256(x86_64)|sha256(aarch64)
 PACKAGES=(
-  "main|linux-virt|6.12.115-r0|2c0146b71bb15b1dbfe3056d430ddcdb6f99ed937db51be0a2a7760db6a9b3fc|445dd29708c1df38c6643e2d6e7b4ac86ff6ab1e26e14f6c512c1e64794b51ef"
+  "main|linux-virt|6.12.117-r0|027dfb199c51172b4a02c4b265804f6df89a0f749de2f4e990c7f58652752cc2|dc01531450938a224f8cc369da67197aad4919d0841fb80754c40e6b6fb6adab"
   "main|busybox-static|1.37.0-r20|488ad6efd04b5a722719e79f8e0dcc2c24afd6758867af3ce41b04839e60c74b|ee469aee2958feffd7f64dd96655704025ff60af614f77a1d7323dc237c34da2"
   "main|musl|1.2.5-r13|359890bc7c4dc5fee7a85192de60a471c987e4664767288578beca60a44db2c8|d616c430bcbe0bf452b7f6ea2669f2cad14e85644a7599f4f495115d021742ef"
   "main|e2fsprogs|1.47.2-r2|4e59067f388ba8338dca3babd5784799d2d434eb6c19076d17ff96e50fbb1a49|3f57194ef8a75326d95ea2ab72ef92a82349230b1686c988c09e7ee869a1d24f"
@@ -218,6 +218,7 @@ case "$1" in
 esac
 exit 0
 EOF
+  [ -n "$root" ] && [ "$root" != / ] || { echo "VML-88: root is empty or /" >&2; exit 1; }
   chmod 0755 "$root/etc/udhcpc/default.script"
 }
 
@@ -260,13 +261,17 @@ build_arch() {
   done
 
   # /init: the static cinit binary.
+  [ -n "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != / ] || { echo "VML-88: SCRIPT_DIR is empty or /" >&2; exit 1; }
+  [ -n "$root" ] && [ "$root" != / ] || { echo "VML-88: root is empty or /" >&2; exit 1; }
   install -m 0755 "$SCRIPT_DIR/cinit/target/$target/release/vmlab-cinit" "$root/init"
 
   # /vmlab-agent: terminals/exec/files over vmlab.agent.0 (spawned by cinit).
+  [ -n "$AGENT_DIST_DIR" ] && [ "$AGENT_DIST_DIR" != / ] || { echo "VML-88: AGENT_DIST_DIR is empty or /" >&2; exit 1; }
   install -m 0755 "$AGENT_DIST_DIR/linux-$arch/vmlab-agent" "$root/vmlab-agent"
 
   # busybox + the /bin/sh the udhcpc hook needs (cinit calls applets as
   # `busybox <applet>`, so no other symlinks are required).
+  [ -n "$extract" ] && [ "$extract" != / ] || { echo "VML-88: extract is empty or /" >&2; exit 1; }
   install -m 0755 "$extract/bin/busybox.static" "$root/bin/busybox"
   ln -sf busybox "$root/bin/sh"
   write_udhcpc_script "$root"
@@ -292,6 +297,7 @@ build_arch() {
   local meta
   for meta in modules.dep modules.alias modules.builtin modules.builtin.modinfo \
     modules.symbols modules.order; do
+    [ -n "$moddest" ] && [ "$moddest" != / ] || { echo "VML-88: moddest is empty or /" >&2; exit 1; }
     [[ -f "$kmoddir/$meta" ]] && cp "$kmoddir/$meta" "$moddest/"
   done
 
@@ -319,6 +325,7 @@ build_arch() {
   mkdir -p "$out"
   (cd "$root" && find . -print0 | LC_ALL=C sort -z |
     cpio --null -o -H newc --owner=+0:+0 --quiet) | gzip -9 >"$out/initramfs.img"
+  [ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
   cp "$vmlinuz" "$out/vmlinuz"
 
   local cinit_rev="unknown"

@@ -111,7 +111,7 @@ lines with no id.
 - Commands, phase 1: `status`, `resume`, `pause`, `powerdown` (ACPI power button), `quit`, `snapshot_save {name}`, `snapshot_load {name}`, `snapshot_delete {name}`. Snapshot commands complete when done (no job polling, D6).
 - Events, phase 1: `shutdown {reason: guest_shutdown | guest_reset | host_request | guest_panic}`, `reset`, `stopped`, `resumed`, `suspend`, `wakeup`.
 - Capabilities advertised in the handshake so vmlab's capability traits (D19) know what to offer: phase 1 advertises `snapshots`, and not `display`, `input` or `hotplug`.
-- Later phases add: `send_keys`, `input_event`, `frame_*` (D21), `device_add`/`device_del` for USB (D25), `wakeup`.
+- Later phases add: `send_keys`, `input_event`, `frame_*` (D21), `device_add`/`device_del` for USB (D25), `wakeup`, and `eject_media {id}` under the `media` capability, which empties a CD-ROM even while the guest locks it and leaves its tray closed.
 
 ### Phase 1 machine (D4)
 

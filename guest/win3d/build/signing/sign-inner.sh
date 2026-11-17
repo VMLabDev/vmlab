@@ -23,10 +23,12 @@ mapfile -t files < <(find . -type f ! -iname '*.cat' ! -iname '*.pdb' | sed 's|^
 for f in "${files[@]}"; do
     is_pe "$f" || continue
     # osslsigncode will not overwrite an existing output file.
+    [ -n "$TMP" ] && [ "$TMP" != / ] || { echo "VML-88: TMP is empty or /" >&2; exit 1; }
     rm -f "$TMP/sig" "$TMP/unsigned" "$TMP/signed"
     if osslsigncode extract-signature -in "$f" -out "$TMP/sig" >/dev/null 2>&1; then
         osslsigncode remove-signature -in "$f" -out "$TMP/unsigned" >/dev/null
     else
+        [ -n "$f" ] && [ "$f" != / ] || { echo "VML-88: f is empty or /" >&2; exit 1; }
         cp "$f" "$TMP/unsigned"
     fi
     osslsigncode sign -certs "$CRT" -key "$KEY" -h sha256 -time "$SIGN_TIME" \

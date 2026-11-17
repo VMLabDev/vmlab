@@ -1,4 +1,8 @@
+#[path = "../../../build/kvm-tests.rs"]
+mod kvm_tests;
+
 fn main() {
+    kvm_tests::configure();
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)

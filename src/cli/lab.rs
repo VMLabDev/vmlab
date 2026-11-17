@@ -292,7 +292,11 @@ pub(super) fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Runtime::new()?)
 }
 
-pub fn cmd_up(vms: Vec<String>, record: Vec<crate::record::RecordRequest>) -> Result<()> {
+pub fn cmd_up(
+    vms: Vec<String>,
+    wait: bool,
+    record: Vec<crate::record::RecordRequest>,
+) -> Result<()> {
     super::record::check_targets(&record)?;
     rt()?.block_on(async {
         // Validate before any side effect (PRD §5.1: implicitly every verb).
@@ -310,6 +314,7 @@ pub fn cmd_up(vms: Vec<String>, record: Vec<crate::record::RecordRequest>) -> Re
                 LabRequest::Up {
                     machines: vms.clone(),
                     record: record.clone(),
+                    wait,
                 },
                 |chunk| print!("{chunk}"),
             )

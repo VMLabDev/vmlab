@@ -20,6 +20,7 @@ if [ ! -f "$headers/include/vulkan/vulkan.h" ]; then
   tarball=$out/deps/vulkan-headers.tar.gz
   curl -fsSL -o "$tarball" "$(pin vulkan-headers 4)"
   echo "$(pin vulkan-headers 3)  $tarball" | sha256sum -c --quiet -
+  [ -n "$headers" ] && [ "$headers" != / ] || { echo "VML-88: headers is empty or /" >&2; exit 1; }
   rm -rf "$headers" && mkdir -p "$headers"
   tar -xzf "$tarball" -C "$headers" --strip-components=1
   rm -f "$tarball"

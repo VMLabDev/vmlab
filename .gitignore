@@ -6,6 +6,7 @@
 /guest/*/target
 /.vmlab
 *.wscripti
+!vendor/wscript-compiler/tests/fixtures/**/*.wscripti
 examples/**/.vmlab/
 
 # Generated documentation site (regenerate with `just docs-build`).

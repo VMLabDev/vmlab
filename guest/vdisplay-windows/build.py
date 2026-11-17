@@ -28,8 +28,10 @@ def fetch(cache):
     for name, entry in dependencies.items():
         directory = cache / (name + "-" + entry["sha256"])
         archive = directory.with_suffix(".zip")
-        if not archive.exists():
-            print("Downloading", name, flush=True)
+        if archive.exists():
+            print("Using cached", name, archive, "(no download)", flush=True)
+        else:
+            print("Downloading", name, "from", entry["url"], flush=True)
             with tempfile.NamedTemporaryFile(dir=cache, delete=False) as output:
                 with urllib.request.urlopen(entry["url"], timeout=120) as response:
                     shutil.copyfileobj(response, output)

@@ -185,6 +185,7 @@ fn start_bridge(root: &Path, target: &str) -> (Process, String, std::thread::Joi
 }
 
 #[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires usable /dev/kvm")]
 fn debug_feature_cli_and_gdb_roundtrip_against_real_hypervisor() {
     let Some(binary) = std::env::var_os("VMLAB_HV_DEBUG_TEST_BINARY") else {
         eprintln!(

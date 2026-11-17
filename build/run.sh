@@ -83,6 +83,8 @@ exec docker run --rm --init "${tty[@]}" "${mounts[@]}" -w "$ROOT" "${env_args[@]
     ids="$VMLAB_BUILD_IDS" n="$VMLAB_BUILD_OWNED"
     unset VMLAB_BUILD_IDS VMLAB_BUILD_OWNED
     for d in "${@:1:$n}"; do
+      [ -n "$d" ] && [ "$d" != / ] || { echo "VML-88: d is empty or /" >&2; exit 1; }
+      [ -n "$ids" ] && [ "$ids" != / ] || { echo "VML-88: ids is empty or /" >&2; exit 1; }
       [ "$(stat -c %u:%g "$d")" = "$ids" ] || chown "$ids" "$d"
     done
     shift "$n"

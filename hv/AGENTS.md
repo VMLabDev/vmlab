@@ -47,7 +47,7 @@ the repository-root `THIRD_PARTY_NOTICES`. Apache-2.0 crates are used as depende
 
 A task is done when all three hold:
 
-1. From the repository root, `just ci::check` passes the light merge bar. The guest-booting `just ci::hv-gate` is run once per batch by the orchestrator, not by individual agents.
+1. From the repository root, `just ci::check` passes the light merge bar. The lead runs the guest-booting `just ci::hv-gate` before release e2e, and a nightly workflow runs it on `next` (see `docs/agents/hv-gate.md`). Individual agents do not run it.
 2. Every `unimplemented!()` or `todo!()` inside your task's scope has been replaced by working code with tests.
 3. The behaviour your task owns is proven by a test at the seam the spec names for it: S1 (the `vmlab-hv` control socket) or S2 (`vmlab-disk` against `qemu-img`). Device unit tests sit below those seams and do not replace them.
 

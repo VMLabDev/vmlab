@@ -705,6 +705,16 @@ fn every_command_round_trips() {
         },
         r#"{"type":"event","event":"device_deleted","id":"usbhost-1-2"}"#,
     );
+    wire(
+        &ClientMsg::Request {
+            id: 9,
+            command: Command::EjectMedia {
+                id: "cd0".to_owned(),
+            },
+        },
+        r#"{"type":"request","id":9,"command":{"command":"eject_media","id":"cd0"}}"#,
+    );
+    wire(&Capability::Media, r#""media""#);
     round_trip(&Command::Status);
     round_trip(&Command::Resume);
     round_trip(&Command::Pause);
@@ -776,6 +786,7 @@ fn every_capability_round_trips() {
         Capability::Display,
         Capability::Input,
         Capability::Hotplug,
+        Capability::Media,
     ] {
         round_trip(&capability);
     }

@@ -16,6 +16,7 @@ pub mod qimg;
 pub mod registries;
 pub mod store;
 pub mod store_view;
+pub(crate) mod trust;
 
 pub use meta::{META_FILE, TemplateMeta};
 pub use store::TemplateStore;

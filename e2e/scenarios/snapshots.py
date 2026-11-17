@@ -32,8 +32,13 @@ def get(h, lab, machine, container=False) -> str:
     return h.wait_until(read, timeout=120, interval=2, what=f"{machine} to answer exec")
 
 
-def snap(h, lab, *args, **kw):
-    return h.vmlab("snapshot", *args, cwd=lab, timeout=300, **kw)
+def snap(h, lab, *args, timeout=300, **kw):
+    return h.vmlab("snapshot", *args, cwd=lab, timeout=timeout, **kw)
+
+
+# A lab-wide snapshot takes each machine in turn (`snapshot_all`), so its bound
+# is the one-machine bound for each machine, not one bound for the lab.
+LAB_MACHINES = 4
 
 
 def drift(h, lab, machine, container=False) -> int:
@@ -92,10 +97,10 @@ def run(h):
         def lab_wide():
             put(h, lab, "vm01", "lab-before")
             put(h, lab, "c01", "lab-before", container=True)
-            c = snap(h, lab, "create", "lab1")
+            c = snap(h, lab, "create", "lab1", timeout=300 * LAB_MACHINES)
             put(h, lab, "vm01", "lab-after")
             put(h, lab, "c01", "lab-after", container=True)
-            r = snap(h, lab, "restore", "lab1")
+            r = snap(h, lab, "restore", "lab1", timeout=300 * LAB_MACHINES)
             vm = get(h, lab, "vm01")
             ct = get(h, lab, "c01", container=True)
             assert vm == "lab-before" and ct == "lab-before", f"vm01={vm!r} c01={ct!r}"
@@ -146,7 +151,11 @@ def run(h):
             kind = [l for l in snap(h, lab, "list", "vm01").out.splitlines() if l.startswith("off1")]
             assert kind and "offline" in kind[0], f"list row {kind}"
             h.vmlab("vm", "start", "vm01", cwd=lab, timeout=300)
-            h.wait_ready(lab, "vm01", timeout=180)
+            # These are cold boots, not online restores. Use the harness's
+            # normal boot budget, including under shared-host load.
+            h.wait_ready(lab, "vm01")
+            got = get(h, lab, "vm01")
+            assert got == "off-before", f"before offline restore marker={got!r}"
             put(h, lab, "vm01", "off-after")
             h.vmlab("vm", "stop", "vm01", cwd=lab, timeout=180)
             h.wait_until(lambda: state(h, lab, "vm01") == "state=stopped", timeout=120, what="vm01 stopped")
@@ -154,7 +163,7 @@ def run(h):
             st = state(h, lab, "vm01")
             assert st == "state=stopped", f"after offline restore {st}"
             h.vmlab("vm", "start", "vm01", cwd=lab, timeout=300)
-            h.wait_ready(lab, "vm01", timeout=180)
+            h.wait_ready(lab, "vm01")
             got = get(h, lab, "vm01")
             assert got == "off-before", f"marker={got!r}"
             return True

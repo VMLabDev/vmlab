@@ -15,6 +15,7 @@ ZEUS=${ZEUS:-zeus}
 DEST=win3d-zeus/repo
 if [ "${1:-}" = --fetch ]; then
     mkdir -p "$REPO/docs/evidence/zeus/$2"
+    [ -n "$REPO" ] && [ "$REPO" != / ] || { echo "VML-88: REPO is empty or /" >&2; exit 1; }
     rsync -a --delete "$ZEUS:$DEST/docs/evidence/zeus/$2/" "$REPO/docs/evidence/zeus/$2/"
     exit 0
 fi

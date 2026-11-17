@@ -40,6 +40,7 @@ tree_hash() {
 # --- tools -----------------------------------------------------------------
 tools=$work/tools
 if [[ ! -x $tools/xwin || ! -x $tools/dxc/bin/dxc ]]; then
+  [ -n "$tools" ] && [ "$tools" != / ] || { echo "VML-88: tools is empty or /" >&2; exit 1; }
   rm -rf "$tools"; mkdir -p "$tools/dxc"
   tar -C "$tools" --strip-components=1 -xzf "$(fetch xwin)" --wildcards '*/xwin'
   tar -C "$tools/dxc" -xzf "$(fetch dxc)"
@@ -51,6 +52,7 @@ read -r _ sdk_version _ < <(pin sdk-version)
 read -r _ _ sysroot_sha < <(pin winsysroot)
 sysroot=$work/winsysroot
 if [[ ! -f $sysroot.ok ]]; then
+  [ -n "$sysroot" ] && [ "$sysroot" != / ] || { echo "VML-88: sysroot is empty or /" >&2; exit 1; }
   rm -rf "$sysroot"
   # xwin reads the package manifest from its cache when it is there, under
   # the name it would download it to; the channel manifest it starts from is
@@ -59,6 +61,7 @@ if [[ ! -f $sysroot.ok ]]; then
   read -r vsman_url vsman_build _ < <(pin vsman)
   url_sha=$(basename "$(dirname "$vsman_url")")
   mkdir -p "$work/xwin-cache/dl"
+  [ -n "$work" ] && [ "$work" != / ] || { echo "VML-88: work is empty or /" >&2; exit 1; }
   cp "$(fetch vsman)" "$work/xwin-cache/dl/pkg_manifest_$url_sha.vsman"
   printf '{"channelItems":[{"id":"Microsoft.VisualStudio.Manifests.VisualStudio","version":"%s","type":"Manifest","payloads":[{"fileName":"VisualStudio.vsman","sha256":"%s","size":0,"url":"%s"}]}]}\n' \
     "$vsman_build" "$url_sha" "$vsman_url" > "$work/channel.json"
@@ -102,6 +105,7 @@ fi
 git -C "$src" checkout -q -f --detach "$samples_commit"
 git -C "$src" clean -qffdx
 
+[ -n "$out" ] && [ "$out" != / ] || { echo "VML-88: out is empty or /" >&2; exit 1; }
 rm -rf "$out/x64"
 python3 "$here/build-samples.py" --src "$src" --sysroot "$sysroot" \
   --dxc "$tools/dxc/bin/dxc" --agility "$work/nuget-d3d12" --pix "$work/nuget-pix" \

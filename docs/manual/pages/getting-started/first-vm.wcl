@@ -75,8 +75,10 @@ SRC
     pulls the template, installs it under `x86_64/alpine-3.23@<version>`, and
     creates the VM as a linked clone of it. The clone is a qcow2 file whose
     backing file is the sealed template, so it starts small and the template
-    is never modified. The VM boots and `up` waits until the guest agent
-    answers, which is what **ready** means.
+    is never modified. The VM boots. Its guest agent answers a few
+    seconds later, which is what **ready** means. Plain `up` does not wait for
+    that on a VM with no provision script: run `vmlab up --wait` to return
+    only once the VM is ready, before you `exec` into it.
   DOC
 
   p <<DOC

@@ -64,8 +64,16 @@ impl Rtc {
         self.cmos[0x5b..0x5e].copy_from_slice(&high.to_le_bytes()[..3]);
     }
 
-    pub fn configure_pc(&mut self, disk_sectors: [Option<u64>; 4], _cd_first: bool, cpus: u8) {
-        self.cmos[0x10] = 0;
+    /// `floppy` is the CMOS 0x10 drive-type byte (drive A in the high
+    /// nibble), as the floppy controller reports it.
+    pub fn configure_pc(
+        &mut self,
+        disk_sectors: [Option<u64>; 4],
+        _cd_first: bool,
+        cpus: u8,
+        floppy: u8,
+    ) {
+        self.cmos[0x10] = floppy;
         self.cmos[0x12] = 0;
         self.cmos[0x14] = 0x06;
         self.cmos[0x38] = 0x30;

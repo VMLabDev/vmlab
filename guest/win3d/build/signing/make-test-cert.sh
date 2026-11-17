@@ -25,6 +25,7 @@ fi
 
 build_tools_image
 mkdir -p "$SIGNING_DIR"
+[ -n "$SIGNING_DIR" ] && [ "$SIGNING_DIR" != / ] || { echo "VML-88: SIGNING_DIR is empty or /" >&2; exit 1; }
 chmod 700 "$SIGNING_DIR"
 printf '*\n' >"$SIGNING_DIR/.gitignore"
 

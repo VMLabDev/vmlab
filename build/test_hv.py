@@ -3,16 +3,36 @@
 import configparser
 import hashlib
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 import hv
 
 
 class ViewerDesktopTest(unittest.TestCase):
+    def test_external_ci_output_paths(self):
+        probe = """
+import json, runpy
+hv = runpy.run_path('build/hv.py')
+ipxe = runpy.run_path('guest/ipxe/build.py')
+print(json.dumps([str(hv['CACHE']), str(ipxe['PROFILES']['hv']['output']),
+                  str(ipxe['PROFILES']['hv']['source'])]))
+"""
+        for root in ("", "/tmp/vmlab-external-output"):
+            with self.subTest(root=root):
+                env = dict(os.environ, VMLAB_TARGET_ROOT=root, PYTHONDONTWRITEBYTECODE="1")
+                paths = json.loads(subprocess.check_output(
+                    ["python3", "-c", probe], cwd=hv.ROOT, env=env, text=True))
+                base = Path(root) if root else hv.ROOT
+                output = base / "ipxe" if root else base / "hv/target/ipxe"
+                self.assertEqual(paths, [str(base / ".ci-cache"), str(output),
+                                         str(output / "upstream")])
+
     def test_virgl_cache_key_covers_applied_patches(self):
         self.assertEqual(len(hv.PATCHES), 3)
         expected = hashlib.sha256(b"".join(
@@ -47,6 +67,27 @@ class ViewerDesktopTest(unittest.TestCase):
             packages = hv.native_packages(*groups)
             self.assertEqual(len(packages), len(set(packages)), groups)
             self.assertTrue(set(hv.native_packages("virgl")) <= set(packages), groups)
+
+    def test_test_native_deps_install_runs_every_step(self):
+        # VML-48: the steps after the apt install lost their sudo prefix
+        # and raised NameError. Run it with every host effect stubbed.
+        calls = []
+        with mock.patch.object(hv, "run", side_effect=lambda *a, **k: calls.append([str(x) for x in a])), \
+                mock.patch.object(hv.os, "geteuid", return_value=1000), \
+                mock.patch.object(hv.shutil, "which", return_value=None), \
+                mock.patch.object(hv.Path, "exists", return_value=False):
+            hv.test_native_deps_install()
+        self.assertEqual(calls[0], ["sudo", "apt-get", "update"])
+        self.assertEqual(calls[1][:5], ["sudo", "apt-get", "install", "-y", "--no-install-recommends"])
+        self.assertEqual(calls[1][5:], hv.native_packages("virgl", "hypervisor", "test"))
+        self.assertEqual(calls[2:], [
+            ["sudo", "install", "-d", "/usr/share/qemu"],
+            ["sudo", "ln", "-s", "/usr/share/seabios/vgabios-stdvga.bin",
+             "/usr/share/qemu/vgabios-stdvga.bin"],
+            ["sudo", "ln", "-s", "/usr/share/seabios/vgabios-virtio.bin",
+             "/usr/share/qemu/vgabios-virtio.bin"],
+            ["sudo", "ln", "-s", "/usr/bin/convert", "/usr/local/bin/magick"],
+        ])
 
     def test_release_stamp_updates_the_root_package(self):
         manifest = hv.ROOT / "Cargo.toml"

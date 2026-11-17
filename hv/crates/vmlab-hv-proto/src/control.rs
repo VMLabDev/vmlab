@@ -79,6 +79,13 @@ pub enum Command {
     DeviceDel {
         id: String,
     },
+    /// Remove the medium from the CD-ROM with disk id `id`, even while the
+    /// guest locks it, and leave the tray closed and the drive empty. The
+    /// guest sees a media change. `device_not_found` when no CD-ROM has that
+    /// id; an already empty drive is success.
+    EjectMedia {
+        id: String,
+    },
     SnapshotSave {
         name: String,
     },
@@ -133,7 +140,8 @@ pub enum ErrorCode {
     InvalidArgument,
     /// The machine lacks the capability the command needs.
     Unsupported,
-    /// No hot-plugged device carries the id the command named.
+    /// No hot-plugged device, or no CD-ROM for `eject_media`, carries the
+    /// id the command named.
     DeviceNotFound,
     SnapshotNotFound,
     /// The snapshot's device state has an incompatible major version.
@@ -155,6 +163,8 @@ pub enum Capability {
     Hotplug,
     /// The control socket accepts TAP and optional vhost-net descriptors.
     NetFds,
+    /// The machine has a CD-ROM that `eject_media` can empty.
+    Media,
     /// An optional feature this build cannot use.
     #[serde(untagged)]
     Unknown(String),

@@ -26,7 +26,9 @@ vmlab runs machines on QEMU/KVM, driven directly over QMP — no libvirt — and
 
 - **Performance.** The userspace network fabric will not approach tap/bridge throughput. Acceptable for v1; vhost-user or tap backends are future optimisations.
 - **Multi-host scheduling.** vmlab runs VMs on one host. The only cross-host feature is attaching a network segment to a peer daemon (§9.4); placing or migrating VMs across hosts is out of scope.
-- **Security isolation / multi-tenancy.** vmlab is a lab tool for a single trusted user. It is not a security boundary and makes no hardening claims.
+- **Multi-tenancy.** vmlab is a lab tool for a single trusted host user, not a multi-tenant service. Guest input and pulled templates are untrusted.
+
+  Guest-to-host channels must validate messages and bound resource use. Shares must confine guest access to the declared host directory and enforce read-only declarations. Pulled templates, including their metadata and disk contents, must be treated as untrusted input rather than authority to access host resources. This does not isolate X11 shared apps from the host desktop: opting into the X11 app-share transport grants the desktop access described in ADR-0016.
 - **libvirt compatibility.** No domain XML, no virsh interop.
 - **Hypervisors other than QEMU/KVM and vmlab-hv.** vmlab runs machines on QEMU and, machine by machine, on its own hypervisor vmlab-hv (§22, ADR-0021); it does not drive Xen, Hyper-V, VirtualBox, cloud-hypervisor or any other.
 
@@ -43,7 +45,7 @@ vmlab runs machines on QEMU/KVM, driven directly over QMP — no libvirt — and
 | **Provision script** | A wscript script listed in `vmlab.wcl`, run during `vmlab up` after its VMs are ready. Receives a lab handle. |
 | **Handler** | A wscript function bound to a daemon event (lifecycle, error, disk-space) for a lab or VM. |
 | **Guest OS profile** | A named bundle of hardware defaults (firmware, machine type, devices) applied to a VM or template. |
-| **Ready** | A VM is *ready* when its vmlab guest agent answers its handshake. A lab is *up* when all VMs are ready and all provision scripts have completed. |
+| **Ready** | A VM is *ready* when its vmlab guest agent answers its handshake. `vmlab up` returns once every machine has started, every machine something waits on (a first-boot, a provision or playbook, a dependent) is ready, and all provision scripts have completed; a machine nothing waits on may still be booting (§7.2). `vmlab up --wait` also waits until every machine it brought up is ready. |
 | **Dev machine** | A machine marked `@dev`: a machine with a synced workspace (§19). VM or container, Windows or Linux — one contract for both. |
 | **Workspace** | A dev machine's source tree: a guest-local working copy of a canonical host directory, kept in step by vmlab's syncer (§19.6). Not a `share {}`. |
 | **Login** | A labelled identity declared on a machine or inherited from its template: an account, its secret, and whether it is elevated. Inherited logins are never the default identity (§19.2). |
@@ -277,7 +279,7 @@ Each VM block can express:
 
   **A host GPU's own QEMU.** A GPU's driver can need a QEMU the host's package does not provide: QEMU 11.1's `egl-headless` binds a blob scanout's LINEAR dma-buf as `GL_TEXTURE_2D`, which NVIDIA's EGL accepts only as `GL_TEXTURE_EXTERNAL_OES`, so a Venus guest on an NVIDIA card renders behind a black console until QEMU is patched; AMD and Intel accept the 2D binding and keep the stock QEMU. The need follows the GPU, not the lab, so it lives on the host GPU:
   - `qemu_binary` — an absolute path. Every VM whose `gpu {}` resolves to that host GPU, in all three modes, runs it instead of `qemu-system-<arch>` from `PATH`. A file named `qemu-system-<a>` whose `<a>` is not the VM's QEMU arch is refused, naming both; a file of any other name is taken as given. A missing or non-executable path is refused, naming the host GPU and the path, by `vmlab validate` for the GPUs a lab uses and again at VM start. Such a VM also gets `-L <dir>`, where `<dir>` is the stock QEMU's data directory — `<prefix>/share/qemu` for the `qemu-system-<arch>` on `PATH`, symlinks followed — when that directory exists, so a minimal build finds the firmware and option ROMs it was not installed beside; QEMU still searches its own data directory after `-L`, so a full build loses nothing. With no stock QEMU on `PATH`, nothing is added. `vmlab status -v` shows `qemu=<path>` after `host_gpu=` for a VM that ran one.
-  - `qemu_env` — a record of strings, `{ KEY: "value" }` (WCL has no map type; the keys are identifiers). Applied to the QEMU process's own environment after the inherited Vulkan loader variables are removed and vmlab's derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and PCI-filter variables set, and an explicit host setting beats a derived one: a `qemu_env` key replaces vmlab's value for it. A key that is empty or contains `=` is refused. The `vmlab: env:` line lists every variable vmlab set, `qemu_env` included, with values. `vmlab status -v` shows the same set after `qemu=`, as `env=NAME=value,...` by name, values in full (vmlab is not a security boundary, and a path is the usual value); `vmlab status --json` carries it as the VM's `qemu_env` object. Both are what the VM was started with, recorded at that start, so a host config edited since does not change what a running VM reports; a VM that set nothing shows no `env=` and no `qemu_env`.
+- `qemu_env` — a record of strings, `{ KEY: "value" }` (WCL has no map type; the keys are identifiers). Applied to the QEMU process's own environment after the inherited Vulkan loader variables are removed and vmlab's derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and PCI-filter variables set, and an explicit host setting beats a derived one: a `qemu_env` key replaces vmlab's value for it. A key that is empty or contains `=` is refused. The `vmlab: env:` line lists every variable vmlab set, `qemu_env` included, with values. `vmlab status -v` shows the same set after `qemu=`, as `env=NAME=value,...` by name, values in full (the host user controls this configuration and a path is the usual value; do not put secrets here because logs and status expose these values, and untrusted guests and templates must not supply host configuration); `vmlab status --json` carries it as the VM's `qemu_env` object. Both are what the VM was started with, recorded at that start, so a host config edited since does not change what a running VM reports; a VM that set nothing shows no `env=` and no `qemu_env`.
 
   There is no host-wide `qemu_binary` and no one-off CLI override. Template builds never carry a `gpu {}`, so they always run the stock QEMU.
 
@@ -516,7 +518,7 @@ A variant's overlay holds only its delta from the base. The backing path is rela
 - **`depends_on`** is start order. A machine starts once every machine it names is **ready** (a VM's agent answers, §7.4; a container passes its healthcheck, §18). It does not wait for their provisioning. Machines whose dependencies are satisfied start in parallel. `down` stops in the reverse of this order.
 - **`depends_on_provision`** is provisioning order. A machine's first provision or playbook step waits until every machine it names has finished all of its own steps. It does not delay the machine's start: the two can boot together. A named machine with no steps counts as finished once it has started and is ready, so a dependent never provisions against a machine that has not come up.
 
-Without `depends_on_provision`, machines provision in parallel, each running its own steps in file order once it is ready, and their output is prefixed with the machine's name. `up <subset>` pulls in what the subset names through either key, saying so. The first failed step fails `up` and cancels the steps still running; `up` returns once every step has finished. A step that drives another machine through the lab handle (stand up the DC, then join the member) declares the order it needs with `depends_on_provision`.
+Without `depends_on_provision`, machines provision in parallel, each running its own steps in file order once it is ready, and their output is prefixed with the machine's name. `up <subset>` pulls in what the subset names through either key, saying so. The first failed step fails `up` and cancels the steps still running; `up` returns once every step has finished. `up` does not wait for a machine nothing waits on to become ready: it returns once that machine has started, so an `exec` straight after it can find the guest still booting and fail with the agent not answered yet. **`up --wait`** closes that gap: before it reports the lab up, it waits, in parallel, until every machine it brought up is ready, each within that machine's own ready timeout, and a machine that is not ready by then fails `up` by name. A guest that can never answer (no agent channel, or a template that sealed no agent) counts as ready once it runs (§7.4), so it never holds the wait. A step that drives another machine through the lab handle (stand up the DC, then join the member) declares the order it needs with `depends_on_provision`.
 
 **A guest can put itself to sleep.** QEMU's q35 machine advertises ACPI S3, and a Windows client edition takes it after an idle timeout: QEMU stays alive holding the guest's memory, the vCPUs stop, and nothing in the guest — the agent included — answers. The lab daemon follows QMP's `SUSPEND` and `WAKEUP` and reports such a VM as **`suspended`**, a power state of its own beside `stopped`, `starting`, `running` and `stopping`, in `vmlab status`, the status projection and wscript's `state()`; `vm.suspended` and `vm.woken` (carrying who woke it) go on the event log. It is never read as stopped. While a VM is suspended:
 
@@ -940,7 +942,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 
 | Verb | Action |
 |---|---|
-| `vmlab up [vm...] [--record vm=path]` | Create/start lab (or subset), run provision scripts; always from the lab file as it is on disk now (§7.1); `--record` records a VM from its first frame (§11.1) |
+| `vmlab up [vm...] [--wait] [--record vm=path]` | Create/start lab (or subset), run provision scripts; always from the lab file as it is on disk now (§7.1); `--wait` returns only once every machine it brought up is ready (§7.2); `--record` records a VM from its first frame (§11.1) |
 | `vmlab down [vm...]` | Graceful stop; clones retained; a full `down` also reaps the lab daemon and releases the lab name |
 | `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
 | `vmlab lab move <lab> [--from <dir>]` | Run in the lab root that should own a stopped lab (its `vmlab.wcl` declaring the same lab; `<lab>` is the declared name or an instance of it, §3.2): refuses while any of the lab's machines or processes run, or when this root already holds machine data; warns naming each machine the two lab files declare differently; releases the name; moves the working data (`.vmlab/`, or the `VMLAB_WORK_DIR` directory keyed by the root), renaming on one filesystem and otherwise copying, verifying and only then deleting the source; drops `smb/smb.conf` and rebases each `@dev` sync ledger onto the new root; lists each share, volume or workspace folder missing under the new root; and registers the lab from there under the name that root runs it as. `--from` names the old root once the name is released |
@@ -2104,7 +2106,10 @@ mid-transfer. `snapshot restore` needs an **explicit discard flag**, because
 restore discards the guest side by design and would silently destroy the guest
 copy of every conflicted path — but refusing outright is obstruction, since
 wanting to throw the guest away is frequently *why* you restore. `capture`
-refuses with no escape.
+refuses with no escape. That includes a guest too slow to answer the flush:
+when the guest's watch has not reported within the flush's bound, its latest
+writes are unknown, so the capture refuses and says so rather than freezing a
+tree without them. The discard flag is restore-only and does not apply here.
 
 **There is no resync token, and it costs nothing**, because the list of
 stat-walk triggers — first sync, ledger loss, overflow, post-restore
@@ -2643,9 +2648,18 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 2e | virtio-fs shares, served in process, and audio (HDA) | Selectable |
 | 2f | Host USB (`usb = true`) and vfio (`gpu { mode = "passthrough" }`) | Selectable |
 | 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
-| 4 | Legacy PCs | Refused |
+| 4 | Legacy PCs: i440fx, IDE, ISA serial, e1000, PCnet, floppy, UHCI and Cirrus | Selectable (4a to 4d); 4e in progress |
 
 macOS guests are a phase of their own after 2.
+
+Phase 4 lands as 4a, the pc machine core with IDE, std VGA, COM1 agent and
+COM2 log, named CPUs and local-time RTCs; 4b, e1000 and PCnet; 4c, floppy
+and the PIIX3 UHCI tablet; 4d, Cirrus; and 4e, vmlab integration and the
+legacy e2e lab. Each of 4a to 4d has one delivery flag in
+`src/config/hypervisor.rs`, opened once its acceptance and hwref tests passed
+in-tree; all four are open. A pc VM needs 4c even without a floppy, because the
+QEMU hardware it mirrors always includes the UHCI tablet. The gate guests are FreeDOS 1.3, Windows 98 SE, Windows 7 7600.0.1
+and TempleOS.
 
 **Refusals.** Validation (§5.1), and the lab daemon again before it builds a
 machine and before each start, refuse a machine on vmlab-hv that it cannot run
@@ -2657,16 +2671,21 @@ a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
 (2d, 2f), virtio-fs shares and a sound card (2e), `usb = true` (2f), and
 a pinned `tsc` (§5.2) — the
 Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
-macOS guest (its own phase); the i440fx machine, a floppy or
-`agent_transport = "isa-serial"` (4); `accel = "tcg"` (3); another display
-device, NIC model or `cpu_model`; `input = "usb"`; and `qemu_args`, QEMU's
-own argv, in every phase. A
+macOS guest (its own phase); on the pc machine, a virtio-net NIC and a pinned `tsc` (the pc machine
+core with IDE, a named CPU and `agent_transport = "isa-serial"` (4a), e1000 and
+PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); a
+floppy on a machine other than pc;
+`accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
+"usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
 container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
 no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
 hardware where the template is in the store, and the daemon, which always
 resolves it, finishes the check. The refusals are one list in code, which each
-phase shrinks.
+phase shrinks. Legacy pc reasons are collected separately, so a missing
+machine core does not hide the later device requirements. A named CPU on
+q35, an unknown display or NIC model, and a floppy outside pc remain
+unsupported after phase 4.
 
 **Launch.** For a container, vmlab writes a machine description beside the
 machine's control socket in its runtime directory — the guest asset's kernel
@@ -2754,6 +2773,11 @@ controller, `usbx`, which QEMU adds in the same slot and hangs the tablet on
 too. `vmlab usb attach` and `detach` (§5.2.1) are vmlab-hv's `device_add` and
 `device_del` with QEMU's `usb-host` arguments, and a detach completes when
 vmlab-hv reports `device_deleted` for the device, as QEMU's `DEVICE_DELETED`.
+
+**Media.** `eject_cdrom()` is vmlab-hv's `eject_media` on the install CD-ROM,
+`cd0`, offered where vmlab-hv advertises `media`: it takes the medium out
+even while the guest holds the drive locked and leaves the tray closed and
+empty, as QEMU's forced `eject` and `blockdev-close-tray` do.
 
 **Audio.** `audio = true` (§11) is an HDA function at 00:1b.0 whose node
 vmlab names `vmlab.<lab>.<machine>`, with the microphone as its capture

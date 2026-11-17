@@ -75,7 +75,8 @@ and checks for iPXE on serial or in VGA text memory, read by the VMM's
 diagnostic output when the probe quits through the control socket. The legacy
 ROM prefix uses BIOS text services before initializing iPXE's serial console.
 
-The hwref collector records NIC ROMs as `guest/pci-roms/<BDF>.rom`. The diff
+The hwref collector records NIC ROMs as `guest/pci-roms/<BDF>.rom`, with each
+`:` in the BDF written as `-` (`0000-00-03.0.rom`) so Windows can check it out. The diff
 compares PCI ROM vendor/device identity and image types, while lspci retains
 ROM presence and BAR size. Executable bytes are not compared.
 

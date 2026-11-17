@@ -23,7 +23,7 @@ pub mod types;
 #[cfg(test)]
 pub mod fake;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use descriptor::ConfigDescriptorTree;
@@ -73,7 +73,7 @@ pub struct HostUsbDevice {
     pending: HashMap<u8, Pending>,
     /// Endpoints whose in-flight work was dropped; their cancelled
     /// completions are discarded rather than delivered.
-    discarded: Vec<u8>,
+    discarded: HashSet<u8>,
 }
 
 impl HostUsbDevice {
@@ -98,7 +98,7 @@ impl HostUsbDevice {
             claimed_interfaces: Vec::new(),
             endpoints: HashMap::new(),
             pending: HashMap::new(),
-            discarded: Vec::new(),
+            discarded: HashSet::new(),
         };
         // Claim the interfaces of the active configuration, if the device
         // is configured; a freshly plugged device may still be at
@@ -139,9 +139,7 @@ impl HostUsbDevice {
         for transfer in completed {
             let endpoint = transfer.endpoint();
             match transfer.status() {
-                TransferStatus::Cancelled if self.discarded.contains(&endpoint) => {
-                    self.discarded.retain(|ep| *ep != endpoint);
-                }
+                _ if self.discarded.remove(&endpoint) => {}
                 status => {
                     let outcome = match status {
                         TransferStatus::Completed => {
@@ -170,6 +168,9 @@ impl HostUsbDevice {
     /// Start a transfer unless one is already in flight; `Nak` keeps the
     /// guest's TD queued until a retry finds the completion.
     fn start(&mut self, endpoint: u8, transfer: Transfer) -> UsbTransfer {
+        if self.discarded.contains(&endpoint) {
+            return UsbTransfer::Nak;
+        }
         match self.device.submit_transfer(transfer) {
             Ok(()) => {
                 self.pending.insert(endpoint, Pending::InFlight);
@@ -562,9 +563,10 @@ impl UsbDevice for HostUsbDevice {
     }
 
     fn endpoint_dropped(&mut self, endpoint: u8) {
-        self.device.discard_endpoint(endpoint);
-        self.pending.remove(&endpoint);
-        self.discarded.push(endpoint);
+        if matches!(self.pending.remove(&endpoint), Some(Pending::InFlight)) {
+            self.discarded.insert(endpoint);
+            self.device.discard_endpoint(endpoint);
+        }
     }
 
     fn is_lost(&self) -> bool {
@@ -891,5 +893,22 @@ mod tests {
         let (mut host, _fake) = device();
         assert!(host.save_state().is_err());
         assert!(host.restore_state(&[]).is_err());
+    }
+
+    #[test]
+    fn repeated_endpoint_drops_are_bounded() {
+        let (mut host, fake) = device();
+        for _ in 0..10_000 {
+            host.endpoint_dropped(0x81);
+        }
+        assert!(host.discarded.is_empty());
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        for _ in 0..10_000 {
+            host.endpoint_dropped(0x81);
+        }
+        assert_eq!(host.discarded.len(), 1);
+        fake.run_irq();
+        host.reap();
+        assert!(host.discarded.is_empty());
     }
 }

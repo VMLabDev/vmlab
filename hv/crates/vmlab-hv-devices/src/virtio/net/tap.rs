@@ -1396,7 +1396,28 @@ mod tests {
     fn ordinary_packet_socket_is_rejected_by_real_tap_validation_and_closed() {
         let (socket, peer) = UnixDatagram::pair().unwrap();
         assert!(TapBackend::new(vec![socket.into()], 1, false, memory(), offered()).is_err());
-        assert!(peer.send(b"closed").is_err());
+        assert!(
+            peer_closed_within(&peer, std::time::Duration::from_secs(10)),
+            "the rejected descriptor is still open"
+        );
+    }
+
+    /// Whether every other copy of `peer`'s other end has closed within
+    /// `bound`, which is when a send fails. Not at once in the test binary: a
+    /// test on another thread that spawns a process forks a child holding a
+    /// copy of every descriptor until it execs (`O_CLOEXEC` closes them only
+    /// at the exec), and on a loaded host that can take a while (VML-34,
+    /// VML-53).
+    fn peer_closed_within(peer: &UnixDatagram, bound: std::time::Duration) -> bool {
+        peer.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match peer.send(b"closed") {
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock => return true,
+                _ if std::time::Instant::now() >= deadline => return false,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
     }
 
     #[test]

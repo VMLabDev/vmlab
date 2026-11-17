@@ -29,6 +29,7 @@ cd "$ROOT"
 OUT="$ROOT/target/dist"
 BPF_OBJS=(fastpath_sockmap.bpf.o xdp_switch.bpf.o)
 BPF_DIR=src/net/fastpath/bpf
+[ -n "$BPF_DIR" ] && [ "$BPF_DIR" != / ] || { echo "VML-88: BPF_DIR is empty or /" >&2; exit 1; }
 
 log() { echo "dist: $*" >&2; }
 die() {
@@ -39,10 +40,12 @@ die() {
 cargo_version() { sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1; }
 
 SAVE="$(mktemp -d)"
+[ -n "$SAVE" ] && [ -d "$SAVE" ] || { echo "VML-88: SAVE is empty or not a directory" >&2; exit 1; }
 restore() {
   local f
   for f in Cargo.toml Cargo.lock "${BPF_OBJS[@]}"; do
     [[ -f "$SAVE/$f" ]] || continue
+    [ -n "$f" ] && [ "$f" != / ] || { echo "VML-88: f is empty or /" >&2; exit 1; }
     case "$f" in
       *.bpf.o) cp -p "$SAVE/$f" "$BPF_DIR/$f" ;;
       *) cp -p "$SAVE/$f" "$f" ;;
@@ -63,6 +66,7 @@ build_binary() {
   fi
   log "building vmlab $version (release)"
   cargo build --release "${locked[@]}" --bin vmlab
+  [ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
   install -m 0755 target/release/vmlab "$OUT/vmlab-$version-linux-x86_64"
   if [[ -f "$SAVE/Cargo.toml" ]]; then
     cp -p "$SAVE/Cargo.toml" Cargo.toml

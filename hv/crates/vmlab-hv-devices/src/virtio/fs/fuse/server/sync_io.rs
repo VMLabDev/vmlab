@@ -4,7 +4,7 @@
 // found in the LICENSE-BSD-3-Clause file.
 
 use log::{error, info, trace, warn};
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, IoSlice, Write};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use crate::virtio::fs::fuse::abi::fuse_abi::*;
 #[cfg(feature = "virtiofs")]
 use crate::virtio::fs::fuse::abi::virtio_fs::{RemovemappingIn, RemovemappingOne, SetupmappingIn};
 use crate::virtio::fs::fuse::filesystem::{
-    DirEntry, Entry, FileSystem, GetxattrReply, IoctlData, ListxattrReply,
+    DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply,
 };
 #[cfg(feature = "fusedev")]
 use crate::virtio::fs::fuse::transport::FuseDevWriter;
@@ -1051,48 +1051,9 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     pub(super) fn ioctl<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {
-        let IoctlIn {
-            fh,
-            flags,
-            cmd,
-            arg: _,
-            in_size,
-            out_size,
-        } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-        // TODO: check fs capability of FUSE_CAP_IOCTL_DIR and return ENOTTY if unsupported.
-        let mut buf = IoctlData {
-            ..Default::default()
-        };
-        let in_size = in_size as usize;
-        // Make sure we have enough bytes to read the ioctl in buffer.
-        if in_size > ctx.r.available_bytes() {
-            return ctx.reply_error(io::Error::from_raw_os_error(libc::ENOTTY));
-        }
-        let mut data = vec![0u8; in_size];
-        if in_size > 0 {
-            let size = ctx.r.read(&mut data).map_err(Error::DecodeMessage)?;
-            if size > 0 {
-                buf.data = Some(&data[..size]);
-            }
-        }
-        match self.fs.ioctl(
-            ctx.context(),
-            ctx.nodeid(),
-            fh.into(),
-            flags,
-            cmd,
-            buf,
-            out_size,
-        ) {
-            Ok(res) => ctx.reply_ok(
-                Some(IoctlOut {
-                    result: res.result,
-                    ..Default::default()
-                }),
-                res.data,
-            ),
-            Err(e) => ctx.reply_error(e),
-        }
+        // This server never forwards host ioctls. Reject before decoding
+        // the unsupported body or allocating guest-controlled input data.
+        ctx.reply_error(io::Error::from_raw_os_error(libc::ENOTTY))
     }
 
     pub(super) fn poll<S: BitmapSlice>(&self, mut ctx: SrvContext<'_, F, S>) -> Result<usize> {

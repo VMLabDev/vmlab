@@ -509,6 +509,12 @@ fn stable_dma_pool_keeps_imports_damage_and_release_tokens() {
         !second_lease.try_retire(),
         "the dma client still samples buffer one"
     );
+    // The cpu client's connect published again, so c's worker sends one more frame.
+    // Read it (bounded by the socket's read timeout) before closing c: a close first
+    // lets that send fail with a broken pipe under load.
+    let republished = ready(&c);
+    assert_eq!((republished.0, republished.1), (second.0, 1));
+    assert!(republished.2 > second.2);
     drop(c);
     h.join().unwrap().unwrap();
     until(|| second_lease.try_retire().then_some(()));

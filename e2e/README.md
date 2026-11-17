@@ -25,12 +25,13 @@ The main build sets `VMLAB_SKIP_FIRMWARE=1` for `build-asset.sh` and builds only
 - **Results.** Each scenario reports every feature it covers against the catalogue in `features.py` as pass, fail, or skip with a reason. A feature that no scenario reported counts as missing, and a missing feature fails the run.
 - **Output.** A run writes to `e2e/results/`:
   - `results.json`: one row per feature, naming the hypervisor the run used.
+  - `junit.xml`: the same rows as JUnit XML, one test case per feature, for `terrarium test push`. A failed or missing feature is a failure, a skipped one is skipped.
   - `e2e.log`: every command the run executed, with its output.
   - `registry.log`: the registry's log.
 
 ## Hypervisors
 
-A run defaults to `--hypervisor vmlab` (PRD §22); `--hypervisor qemu` retains QEMU coverage. The image builds `vmlab-hv` from the vmlab-hypervisor commit that `Cargo.lock` pins `vmlab-hv-proto` to, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
+A run defaults to `--hypervisor vmlab` (PRD §22); `--hypervisor qemu` retains QEMU coverage. The image builds `vmlab-hv` and its protocol crates from this checkout's in-tree `hv/` workspace, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
 
 The runner writes an explicit host config for both machine kinds in every scenario. On `vmlab`, containers use vmlab-hv, and VMs do too when the scenario covers a delivered VM phase. Other VMs are explicitly pinned to QEMU. A QEMU run pins both kinds to QEMU. `QEMU_SCENARIOS` names exceptions and their reasons. `fastpath` remains pinned to QEMU until N6-N8 lands. A VM feature it reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
 
@@ -61,3 +62,37 @@ To cover a new feature, add it to `features.py` and tag its phase, then report i
 Run `python3 -m unittest discover -s e2e -p 'test_*.py'` to check hypervisor routing and result accounting without booting VMs.
 
 Keep labs small: 1 CPU, 512 MiB to 1 GiB of memory, and the e2e template or small container images. `vmlab up` returns once machines have started, before they are ready. Call `h.wait_ready` before talking to a guest.
+
+## Legacy PC gate
+
+The `legacy` scenario boots FreeDOS 1.3, Windows 98 SE, Windows 7 7600.0.1 and
+TempleOS sequentially. It checks agent readiness, exec, a disk write/read,
+a PNG screenshot and emulator exit status zero after `vm stop`. Windows 98
+may reach the emulator-quit rung after ignoring guest shutdown. That is a
+flushed emulator exit, not proof that Windows shut itself down.
+
+The scenario uses these installed templates and disables automatic agent
+refresh:
+
+```text
+x86/freedos-1.3@1.3.0
+x86/windows-98-se@4.10.2222.5
+x86_64/windows-7@7600.0.1
+x86_64/templeos@5.03.2
+```
+
+If a template is missing, the scenario skips with the missing reference.
+`VMLAB_E2E_LEGACY_STORE` can name a populated source store. The scenario copies
+only its four template versions into the run's store, using sparse files and
+reflinks where available. With `just e2e::run`, set `VMLAB_E2E_LEGACY_STORE` on
+the host to the source store; the recipe mounts it read-only at `/legacy-store`
+and sets the variable to that path inside the container, so the source is never
+written. The recipe's 24 GiB container limit applies.
+`--only legacy` does not build the unrelated Alpine base template.
+
+Before each boot, the scenario waits until fewer than two project VMs run on
+the host, excluding `qemu-system-* -avd` Android emulators. Containers need
+`--pid=host` for that count. On a shared development host, run the VM-owning
+processes inside `systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0`.
+The four `vm.legacy.*` features remain tagged phase 4 and skip on vmlab-hv
+until that phase is delivered.

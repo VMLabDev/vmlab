@@ -517,13 +517,17 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::Version {} => Ok(json!(crate::version::BUILD)),
             LabRequest::Status {} => Ok(json!(lab.status().await)),
             LabRequest::DnsTable {} => Ok(lab.dns_table().await),
-            LabRequest::Up { machines, record } => {
+            LabRequest::Up {
+                machines,
+                record,
+                wait,
+            } => {
                 // Recordings ride the boot (D20): checked and armed first, so
                 // a refusal costs nothing, started in each VM's paused
                 // window, and anything left over settled after.
                 lab.record_arm(&record, None).await?;
                 let targets: Vec<String> = record.iter().map(|r| r.machine.clone()).collect();
-                let up = streamed(lab, stream, |output| lab.up(&machines, output)).await;
+                let up = streamed(lab, stream, |output| lab.up_with(&machines, wait, output)).await;
                 let settled = lab.record_settle(&targets).await;
                 up?;
                 settled?;

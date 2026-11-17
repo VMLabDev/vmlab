@@ -385,6 +385,7 @@ mod tests {
                 LabRequest::Up {
                     machines: vec!["a".into(), "b".into()],
                     record: Vec::new(),
+                    wait: false,
                 },
                 |c| chunks.push(c),
             )

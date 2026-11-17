@@ -36,7 +36,7 @@ def cache_key(version, sha256, patches):
 
 PATCH_SHA256 = patch_digest(PATCHES)
 CACHE_KEY = cache_key(VIRGL_VERSION, VIRGL_SHA256, PATCHES)
-CACHE = ROOT / ".ci-cache"
+CACHE = Path(os.environ["VMLAB_TARGET_ROOT"]) / ".ci-cache" if os.environ.get("VMLAB_TARGET_ROOT") else ROOT / ".ci-cache"
 VIRGL = CACHE / CACHE_KEY
 
 
@@ -57,8 +57,13 @@ def native_packages(*groups):
     return packages
 
 
+def sudo_prefix():
+    """`sudo` unless this already runs as root (as in a container build)."""
+    return [] if os.geteuid() == 0 else ["sudo"]
+
+
 def apt_install(*groups):
-    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    prefix = sudo_prefix()
     run(*prefix, "apt-get", "update")
     run(*prefix, "apt-get", "install", "-y", "--no-install-recommends",
         *native_packages(*groups))
@@ -71,6 +76,7 @@ def native_deps_install():
 
 def test_native_deps_install():
     apt_install("virgl", "hypervisor", "test")
+    prefix = sudo_prefix()
     run(*prefix, "install", "-d", "/usr/share/qemu")
     for name in ("vgabios-stdvga.bin", "vgabios-virtio.bin"):
         target = Path("/usr/share/qemu") / name
@@ -84,7 +90,7 @@ def virgl_build(prefix=None):
     """Build the pinned, patched virglrenderer into `prefix`, by default the
     cache directory named by its key, which is reused while it is complete."""
     if prefix is not None:
-        CACHE.mkdir(exist_ok=True)
+        CACHE.mkdir(parents=True, exist_ok=True)
         virgl_install(Path(prefix))
         return
     if (VIRGL / ".complete").is_file():
@@ -93,7 +99,7 @@ def virgl_build(prefix=None):
         if not (VIRGL / "libexec/virgl_render_server").is_file():
             raise RuntimeError("cached virglrenderer has no render server")
         return
-    CACHE.mkdir(exist_ok=True)
+    CACHE.mkdir(parents=True, exist_ok=True)
     virgl_install(VIRGL)
     (VIRGL / ".complete").touch()
 

@@ -6,11 +6,40 @@ verb here names its machine — which is itself the ladder's first rung.
 """
 
 import os
+import pathlib
+import subprocess
 import time
 
 from harness import ScenarioFailed
 
 M = "dev01"
+LABD_LOG = pathlib.Path.home() / ".local" / "state" / "vmlab" / "labd-e2e-dev.log"
+# What labd logs when it gives up on a guest agent connection (src/labd/machine.rs).
+AGENT_LOST = ("the cached connection does not answer; reconnecting", "agent: handshake failed")
+# What a capture refusal says when the guest's watch did not answer the flush (VML-110).
+WATCH_SILENT = "watch did not answer"
+
+
+def labd_log_size() -> int:
+    try:
+        return LABD_LOG.stat().st_size
+    except OSError:
+        return 0
+
+
+def agent_replaced(since: int) -> str:
+    """The first labd log line after byte `since` that says dev01's agent
+    connection was given up on, or "" when there is none."""
+    try:
+        with open(LABD_LOG, "rb") as f:
+            f.seek(since)
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return ""
+    for line in tail.splitlines():
+        if M in line and any(lost in line for lost in AGENT_LOST):
+            return line.strip()[-300:]
+    return ""
 
 
 def gx(h, lab, script: str, **kw):
@@ -37,25 +66,36 @@ def halted(h, lab) -> str:
 
 
 def conflict(h, lab, name: str, tag: str) -> str:
-    """Edit `name` on both sides inside one debounce window, so a pass sees
-    both changed since they last agreed. The guest keeps rewriting it for three
-    seconds — a path still moving keeps waiting — and the host writes once in
-    the middle. Returns the halt report."""
-    for attempt in range(3):
-        loop = h.background(
-            ["vmlab", "exec", M, "--", "sh", "-c",
-             f"for i in $(seq 1 30); do echo guest-{tag} > /src/{name}; sleep 0.1; done"],
-            cwd=lab,
-        )
-        time.sleep(1)
+    """Keep the guest path inside debounce until the host edit has landed.
+
+    Do not sleep between writes: a scheduled 0.1 s sleep can exceed the
+    syncer's quiet period on a loaded host. The stop file is outside /src so
+    only the test, not the syncer, can release the writer. The deadline is a
+    safety bound, not the signal to make the path quiet.
+    """
+    stop = f"/tmp/conflict-{tag}-stop"
+    gx(h, lab, f"set -eu; rm -f {stop}")
+    loop = h.background(
+        ["vmlab", "exec", M, "--", "sh", "-c",
+         (f"set -eu; end=$(($(date +%s) + 120)); "
+          f"while [ ! -e {stop} ] && [ $(date +%s) -lt $end ]; do "
+          f"echo guest-{tag} > /src/{name}; done")],
+        cwd=lab,
+    )
+    try:
+        h.wait_until(lambda: f"guest-{tag}" in guest_cat(h, lab, name), timeout=30, interval=0.2,
+                     what=f"the guest to start writing {name}")
         (lab / "ws1" / name).write_text(f"host-{tag}\n")
-        loop.wait(timeout=60)
+        assert loop.poll() is None, f"guest writer ended before the host edit of {name}"
+    finally:
+        gx(h, lab, f"set -eu; touch {stop}", check=False)
         try:
-            return h.wait_until(lambda: halted(h, lab), timeout=15, what=f"a halt on {name}")
-        except ScenarioFailed:
-            # The race went one way and the sides agreed; try again.
-            h.wait_until(lambda: in_step(h, lab), timeout=30, what="the workspace to settle")
-    raise ScenarioFailed(f"three attempts at a both-sides edit of {name} never halted the workspace")
+            loop.wait(timeout=150)
+        except subprocess.TimeoutExpired:
+            loop.kill()
+            loop.wait()
+    assert loop.returncode == 0, f"guest writer failed for {name}: exit {loop.returncode}"
+    return h.wait_until(lambda: halted(h, lab), timeout=30, what=f"a halt on {name}")
 
 
 def run(h):
@@ -160,19 +200,102 @@ def run(h):
 
         # Unsynced guest work, the slow way: a guest file still being written
         # sits inside its debounce window, so the pre-flight flush cannot carry it.
-        def refuse_busy():
+        # The flush waits out the 250 ms quiet period once, so the writer must
+        # never pause that long: it rewrites with no sleep until told to stop
+        # (60 s at most). The capture starts once the guest shows the file, not
+        # after a fixed delay: on a loaded host `vmlab exec` can take over a
+        # second to start the writer (VML-105).
+        #
+        # The writer must also still be running when the capture returns. Right
+        # after the restore above, dev01's agent can stop answering for minutes
+        # (VML-106): the writer dies, the guest goes quiet, and the bracket then
+        # rightly lets the capture through. That is an agent outage, not a
+        # bracket failure, so the attempt is dropped and retried (three at most),
+        # and every outage is printed as a WARN line and kept in the result.
+        #
+        # The WARN tells two causes apart (VML-110): "agent went away" only when
+        # labd gave up on dev01's agent connection during the attempt (its log
+        # says so) or `vmlab exec dev01 -- true` fails after it. Otherwise the
+        # guest was only slow: its watch did not answer the flush in time, and
+        # the capture refuses on that by name.
+        busy_detail = "capture refused while the guest was still writing busy.txt, naming it"
+        busy_outages: list[str] = []
+
+        def busy_attempt(name: str):
+            """One capture against a running writer: the capture's result (None
+            when it never ran), why the attempt does not count ("" when it does),
+            and the labd log offset where the attempt began."""
+            since = labd_log_size()
+            gx(h, lab, "rm -f /tmp/busy-stop", check=False)
             loop = h.background(
                 ["vmlab", "exec", M, "--", "sh", "-c",
-                 "for i in $(seq 1 40); do echo $i > /src/busy.txt; sleep 0.1; done"], cwd=lab)
-            time.sleep(1)
-            r = h.vmlab("snapshot", "create", "busy", "--vm", M, cwd=lab, check=False)
-            loop.wait(timeout=60)
-            assert r.code != 0 and "busy.txt" in r.text and "no flag" in r.text, r.text
-            assert "not a workspace backup" in r.text, r.text
-            return True
+                 ("i=0; end=$(($(date +%s) + 60)); "
+                  "while [ ! -e /tmp/busy-stop ] && [ $(date +%s) -lt $end ]; do "
+                  "i=$((i + 1)); echo $i > /src/busy.txt; done")], cwd=lab)
+            try:
+                try:
+                    h.wait_until(lambda: guest_cat(h, lab, "busy.txt").strip(), timeout=30, interval=0.2,
+                                 what="the guest to start writing busy.txt")
+                except ScenarioFailed:
+                    return None, "the guest did not show busy.txt within 30 s of starting the writer", since
+                started = time.monotonic()
+                r = h.vmlab("snapshot", "create", name, "--vm", M, cwd=lab, check=False)
+                took = time.monotonic() - started
+                alive = loop.poll() is None
+            finally:
+                gx(h, lab, "touch /tmp/busy-stop", check=False)
+                try:
+                    loop.wait(timeout=90)
+                except subprocess.TimeoutExpired:
+                    loop.kill()
+                    loop.wait()
+            if alive:
+                return r, "", since
+            return r, f"the guest writer ended during the {took:.0f} s capture (exit {loop.returncode})", since
 
-        h.check("dev.snapshot-bracket", refuse_busy,
-                "capture refused while the guest was still writing busy.txt, naming it")
+        def busy_kind(since: int) -> str:
+            """Which outage an attempt had: a lost agent, or a slow guest."""
+            replaced = agent_replaced(since)
+            if replaced:
+                return f"dev01's agent went away (labd: {replaced}); see VML-106"
+            if gx(h, lab, "true", check=False).code != 0:
+                return "dev01's agent went away (`vmlab exec dev01 -- true` failed); see VML-106"
+            return "guest slow (watch not answering); see VML-110"
+
+        def busy_warn(attempt: int, kind: str, why: str) -> None:
+            said = f"WARN dev.snapshot-bracket attempt {attempt}: {kind}: {why}"
+            print(f"   {said}", flush=True)
+            h.log.write(f"\n[dev] {said}\n")
+            busy_outages.append(said)
+
+        def refuse_busy():
+            for attempt in range(1, 4):
+                name = "busy" if attempt == 1 else f"busy-{attempt}"
+                r, outage, since = busy_attempt(name)
+                refused = r is not None and r.code != 0
+                silent = refused and WATCH_SILENT in r.text
+                if outage:
+                    busy_warn(attempt, busy_kind(since), outage)
+                elif silent:
+                    busy_warn(attempt, "guest slow (watch not answering); see VML-110",
+                              "the capture was refused because the guest's watch did not answer the flush")
+                if outage and not refused:
+                    if r is not None:
+                        h.vmlab("snapshot", "delete", M, name, cwd=lab, check=False)
+                    h.wait_until(lambda: gx(h, lab, "true", check=False).code == 0, timeout=300, interval=2,
+                                 what="dev01's agent to answer again")
+                    h.wait_until(lambda: in_step(h, lab), timeout=120, what="busy.txt to settle before a retry")
+                    continue
+                said = f"{r.text} {busy_outages}" if busy_outages else r.text
+                # A slow guest is refused on its silent watch, which can come
+                # before its report of busy.txt: either reason is a refusal.
+                assert refused and ("busy.txt" in r.text or silent) and "no flag" in r.text, said
+                assert "not a workspace backup" in r.text, said
+                return True
+            raise ScenarioFailed("three capture attempts each had an outage: " + "; ".join(busy_outages))
+
+        if h.check("dev.snapshot-bracket", refuse_busy, busy_detail) and busy_outages:
+            h.ok("dev.snapshot-bracket", True, busy_detail + "; " + "; ".join(busy_outages))
         h.wait_until(lambda: in_step(h, lab), timeout=30, what="busy.txt to settle")
 
         # -- conflict --------------------------------------------------------

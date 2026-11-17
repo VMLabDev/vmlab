@@ -15,8 +15,10 @@ pub mod ata;
 pub mod audio;
 pub mod chipset;
 pub mod display;
+pub mod floppy;
 pub mod hda;
 pub mod ide;
+pub mod nic;
 pub mod pflash;
 pub mod serial;
 pub mod tpm;
@@ -24,6 +26,9 @@ pub mod usb;
 pub mod vdisplay;
 pub mod vfio;
 pub mod virtio;
+
+#[cfg(test)]
+mod qtest_oracle;
 
 /// Guest physical memory as devices see it.
 pub type GuestMemory = vm_memory::GuestMemoryMmap<()>;

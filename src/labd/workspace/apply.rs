@@ -63,6 +63,45 @@ pub struct Target {
     pub case_sensitive_dirs: bool,
 }
 
+/// Keep the resolved parent alive across async transfers and renames. The
+/// proc-fd path addresses that directory, not a re-traversal of guest names.
+struct HostPath {
+    _parent: rustix::fd::OwnedFd,
+    path: PathBuf,
+}
+
+fn host_path(root: &std::path::Path, rel: &str) -> anyhow::Result<HostPath> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, open, openat2};
+    use std::os::fd::AsRawFd;
+
+    for component in rel.split('/') {
+        super::ignore::validate_entry_name(component, false)?;
+    }
+    let rel = std::path::Path::new(rel);
+    let root = open(
+        root,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let parent = openat2(
+        &root,
+        rel.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new(".")),
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(
+        rel.file_name()
+            .ok_or_else(|| anyhow::anyhow!("empty apply path"))?,
+    );
+    Ok(HostPath {
+        _parent: parent,
+        path,
+    })
+}
+
 /// One thing that did not land, named. Never a halt on its own: the rest of
 /// the pass still runs, and the path is simply not agreed, so the next pass
 /// tries it again.
@@ -427,7 +466,8 @@ async fn onto_host(
     expected: Option<&State>,
 ) -> anyhow::Result<Landed> {
     let path = action.path();
-    let host_path = target.host_root.join(path);
+    let resolved = host_path(&target.host_root, path)?;
+    let host_path = resolved.path.clone();
     match action {
         Action::Remove { kind, .. } => {
             let removed = match kind {
@@ -453,7 +493,9 @@ async fn onto_host(
             };
             match std::fs::create_dir(&host_path) {
                 Ok(()) => Ok(placed),
-                Err(_) if host_path.is_dir() => Ok(placed),
+                Err(_) if std::fs::symlink_metadata(&host_path).is_ok_and(|m| m.is_dir()) => {
+                    Ok(placed)
+                }
                 Err(e) => Err(anyhow::Error::new(e).context(format!("creating {path}"))),
             }
         }
@@ -519,7 +561,8 @@ async fn receiving_side(
             }
         }
         Direction::ToHost => {
-            let host_path = target.host_root.join(path);
+            let resolved = host_path(&target.host_root, path)?;
+            let host_path = resolved.path.clone();
             let meta = std::fs::symlink_metadata(&host_path).map_err(|e| {
                 anyhow::Error::new(e).context(
                     "placed, but the host copy could not \
@@ -543,12 +586,29 @@ async fn verify_copy(
     direction: Direction,
     expected: Option<&State>,
 ) -> anyhow::Result<()> {
+    for component in path.split('/') {
+        super::ignore::validate_entry_name(component, false)?;
+    }
+    let resolved = if direction == Direction::ToHost {
+        match host_path(&target.host_root, path) {
+            Ok(path) => Some(path),
+            Err(e)
+                if e.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT)
+                    && expected.is_none() =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
     let current = match direction {
         Direction::ToGuest => guest
             .lstat(&join_guest(&target.guest_root, path))
             .await?
             .map(|a| (Kind::of(a.kind), Side::new(a.size, a.mtime_ns))),
-        Direction::ToHost => match std::fs::symlink_metadata(target.host_root.join(path)) {
+        Direction::ToHost => match std::fs::symlink_metadata(&resolved.as_ref().unwrap().path) {
             Ok(m) => {
                 let kind = if m.is_symlink() {
                     Some(Kind::Symlink)
@@ -560,7 +620,7 @@ async fn verify_copy(
                     None
                 };
                 let size = kind
-                    .map(|k| host_size(&m, &target.host_root.join(path), k))
+                    .map(|k| host_size(&m, &resolved.as_ref().unwrap().path, k))
                     .unwrap_or(m.len());
                 Some((kind, Side::new(size, mtime_ns(&m))))
             }
@@ -595,7 +655,7 @@ async fn verify_copy(
         .ok_or_else(|| anyhow::anyhow!("{path}: destination has no verified digest"))?;
     match direction {
         Direction::ToHost => {
-            verify_host_contents(&target.host_root.join(path), expected.kind, digest)?
+            verify_host_contents(&resolved.as_ref().unwrap().path, expected.kind, digest)?
         }
         Direction::ToGuest => {
             let remote = join_guest(&target.guest_root, path);
@@ -623,7 +683,13 @@ fn verify_host_contents(path: &std::path::Path, kind: Kind, digest: &str) -> any
         super::scan::digest_of_target(&std::fs::read_link(path)?.to_string_lossy())
     } else {
         let mut hash = Sha256::new();
-        crate::hashing::feed(std::fs::File::open(path)?, &mut hash)?;
+        use rustix::fs::{Mode, OFlags, open};
+        let file = std::fs::File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        crate::hashing::feed(file, &mut hash)?;
         hex::encode(hash.finalize())
     };
     anyhow::ensure!(
@@ -693,13 +759,28 @@ async fn place_in_guest(
     expected: Option<&State>,
 ) -> anyhow::Result<()> {
     let rel = action.path();
-    let temp = temp_beside(guest_path);
+    let temp = temp_beside(guest_path, guest.windows_names());
     // A temp left by an earlier attempt is not an obstacle: the name is
     // derived from the path, so the previous pass's leftovers are this pass's
     // to clear.
     let _ = guest.remove(&temp).await;
     let written = match what {
-        Placing::File => guest.push(&target.host_root.join(rel), &temp).await,
+        Placing::File => {
+            let source = host_path(&target.host_root, rel)?;
+            use rustix::fs::{Mode, OFlags, open};
+            use std::os::fd::AsRawFd;
+            let file = open(
+                &source.path,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            guest
+                .push(
+                    &PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+                    &temp,
+                )
+                .await
+        }
         // Windows picks a different object for a file link and a directory
         // link at creation and cannot infer which from a target that is not
         // there yet. The plan decided it from the host tree it already holds,
@@ -774,10 +855,10 @@ where
 /// The temp name for one target, in the target's own directory so the rename
 /// is atomic. Derived from the target rather than random, so a crashed pass
 /// leaves at most one leftover per path and the next pass reclaims it.
-fn temp_beside(guest_path: &str) -> String {
+fn temp_beside(guest_path: &str, windows: bool) -> String {
     use sha2::{Digest, Sha256};
     let tag = hex::encode(&Sha256::digest(guest_path.as_bytes())[..8]);
-    match guest_path.rfind(['/', '\\']) {
+    match guest_path.rfind(|c| c == '/' || (windows && c == '\\')) {
         Some(cut) => format!("{}{TEMP_PREFIX}{tag}", &guest_path[..cut + 1]),
         None => format!("{TEMP_PREFIX}{tag}"),
     }
@@ -798,6 +879,35 @@ fn host_not_empty(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_paths_are_beneath_and_do_not_follow_symlink_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        for rel in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "/absolute",
+            "a/../b",
+            "a\0b",
+            "escape/file",
+        ] {
+            assert!(host_path(root.path(), rel).is_err(), "{rel:?}");
+        }
+        std::fs::create_dir(root.path().join("safe")).unwrap();
+        let pinned = host_path(root.path(), "safe/file").unwrap();
+        std::fs::rename(root.path().join("safe"), root.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("safe")).unwrap();
+        std::fs::write(&pinned.path, "inside").unwrap();
+        assert!(!outside.path().join("file").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("moved/file")).unwrap(),
+            "inside"
+        );
+    }
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
@@ -1049,6 +1159,36 @@ mod tests {
 
     /// The acceptance case: a declared workspace appears in the guest, whole.
     #[tokio::test]
+    async fn linux_colon_and_backslash_names_sync_both_ways() {
+        let names = ["a:b", "a\\b", "dir:\\name/file:\\name"];
+        let dir = workspace(&names.map(|name| (name, "host")));
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        for name in names {
+            assert_eq!(guest.text(&format!("/src/{name}")).as_deref(), Some("host"));
+        }
+        let (_, ignores) = host_scan(dir.path(), &ledger, CAP).unwrap();
+        let probe = super::super::scan::guest_walk(&guest, "/src", &ignores, &ledger, true, CAP)
+            .await
+            .unwrap();
+        for name in names {
+            assert!(probe.tree.contains_key(name), "{name:?}");
+            guest.file(&format!("/src/{name}"), "guest", 9_999);
+        }
+        let done = pass(dir.path(), &guest, &mut ledger).await;
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        assert_eq!(done.to_host.placed, names.len());
+        for name in names {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                "guest"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_first_pass_seeds_the_guest() {
         let dir = workspace(&[("src/main.rs", "fn main() {}"), ("README.md", "hi")]);
         let guest = FakeGuest::new();
@@ -1101,7 +1241,7 @@ mod tests {
         let dir = workspace(&[("a.txt", "hello")]);
         let guest = FakeGuest::new();
         let mut ledger = ledger_for(dir.path());
-        guest.fail_push(&temp_beside("/src/a.txt"));
+        guest.fail_push(&temp_beside("/src/a.txt", false));
 
         let first = pass(dir.path(), &guest, &mut ledger).await;
         assert_eq!(first.to_guest.placed, 0);
@@ -1709,11 +1849,16 @@ mod tests {
     /// rather than a cross-volume copy.
     #[test]
     fn a_temp_name_sits_beside_its_target() {
-        let temp = temp_beside("/src/a/b.txt");
+        let temp = temp_beside("/src/a/b.txt", false);
         assert!(temp.starts_with("/src/a/.vmlab-sync."), "{temp}");
-        assert_ne!(temp, temp_beside("/src/a/c.txt"));
-        assert_eq!(temp, temp_beside("/src/a/b.txt"), "derived, not random");
-        assert!(temp_beside("b.txt").starts_with(".vmlab-sync."));
-        assert!(temp_beside("C:\\src\\b.txt").starts_with("C:\\src\\.vmlab-sync."));
+        assert_ne!(temp, temp_beside("/src/a/c.txt", false));
+        assert_eq!(
+            temp,
+            temp_beside("/src/a/b.txt", false),
+            "derived, not random"
+        );
+        assert!(temp_beside("b.txt", false).starts_with(".vmlab-sync."));
+        assert!(temp_beside("C:\\src\\b.txt", true).starts_with("C:\\src\\.vmlab-sync."));
+        assert!(temp_beside("/src/a\\b", false).starts_with("/src/.vmlab-sync."));
     }
 }

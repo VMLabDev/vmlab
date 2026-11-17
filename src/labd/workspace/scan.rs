@@ -345,24 +345,28 @@ pub async fn guest_walk(
     }
 
     let mut suspects: Vec<(String, State)> = Vec::new();
+    let mut entry_count = 0usize;
     let mut level = vec![String::new()];
     while !level.is_empty() {
         // One level at a time, every directory in it at once: a source tree
         // is wide and shallow, so the window pays the round trip off across
         // siblings rather than across depth.
-        let listings: Vec<(String, Result<Vec<crate::labd::vm_agent::DirEntry>>)> =
-            futures::stream::iter(level.drain(..))
-                .map(|dir| async move {
-                    let entries = files.readdir(&join_guest(guest_root, &dir)).await;
-                    (dir, entries)
-                })
-                .buffered(PROBE_WINDOW)
-                .collect()
-                .await;
+        let mut listings = futures::stream::iter(std::mem::take(&mut level))
+            .map(|dir| async move {
+                let entries = files.readdir(&join_guest(guest_root, &dir)).await;
+                (dir, entries)
+            })
+            .buffered(PROBE_WINDOW);
 
-        for (dir, entries) in listings {
+        while let Some((dir, entries)) = listings.next().await {
             let entries = match entries {
                 Ok(entries) => entries,
+                Err(e)
+                    if e.downcast_ref::<super::ignore::GuestListingError>()
+                        .is_some() =>
+                {
+                    return Err(e);
+                }
                 // A directory the login cannot traverse is a named skip, not
                 // a halt — and emphatically not an empty listing, which would
                 // read as the guest having deleted everything under it.
@@ -374,7 +378,14 @@ pub async fn guest_walk(
                     continue;
                 }
             };
+            super::ignore::entry_budget(0, entries.len(), super::ignore::MAX_DIRECTORY_ENTRIES)?;
+            entry_count = super::ignore::entry_budget(
+                entry_count,
+                entries.len(),
+                super::ignore::MAX_SCAN_ENTRIES,
+            )?;
             for entry in entries {
+                super::ignore::validate_entry_name(&entry.name, files.windows_names())?;
                 let rel = join_rel(&dir, &entry.name);
                 let is_dir = entry.attrs.kind == crate::labd::vm_agent::EntryKind::Dir;
                 if ignores.verdict(&rel, is_dir) == Verdict::GuestOwned {
@@ -551,6 +562,7 @@ pub(super) fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::guest::fake::FakeGuest;
     use super::*;
     use std::os::unix::fs::symlink;
 
@@ -567,6 +579,86 @@ mod tests {
     /// A cap no test file comes near, so the guard is out of the way except
     /// where a test is about it.
     const NO_CAP: u64 = u64::MAX;
+
+    #[tokio::test]
+    async fn hostile_guest_directory_names_abort_the_walk() {
+        use crate::labd::vm_agent::{Attrs, DirEntry, EntryKind};
+        for windows in [false, true] {
+            for name in [
+                "",
+                ".",
+                "..",
+                "/absolute",
+                "a/b",
+                "a\\b",
+                "a\0b",
+                "C:escape",
+                "a:b",
+                "\\absolute",
+            ] {
+                if !windows && ["a\\b", "C:escape", "a:b", "\\absolute"].contains(&name) {
+                    continue;
+                }
+                let guest = FakeGuest::new();
+                if windows {
+                    guest.windows();
+                }
+                guest.dir("/src");
+                guest.listing(vec![DirEntry {
+                    name: name.into(),
+                    attrs: Attrs {
+                        kind: EntryKind::Dir,
+                        size: 0,
+                        mtime_ns: 0,
+                        atime_ns: 0,
+                        mode: None,
+                    },
+                }]);
+                let ignores = Ignores::new();
+                assert!(
+                    guest_walk(&guest, "/src", &ignores, &empty_ledger(), false, NO_CAP)
+                        .await
+                        .is_err(),
+                    "{name:?}, windows={windows}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_fake_guest_listing_aborts_the_walk() {
+        use crate::labd::vm_agent::{Attrs, DirEntry, EntryKind};
+        let guest = FakeGuest::new();
+        guest.dir("/src");
+        guest.listing(vec![
+            DirEntry {
+                name: "file".into(),
+                attrs: Attrs {
+                    kind: EntryKind::File,
+                    size: 0,
+                    mtime_ns: 0,
+                    atime_ns: 0,
+                    mode: None
+                },
+            };
+            super::super::ignore::MAX_DIRECTORY_ENTRIES + 1
+        ]);
+        let error = guest_walk(
+            &guest,
+            "/src",
+            &Ignores::new(),
+            &empty_ledger(),
+            false,
+            NO_CAP,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::super::ignore::GuestListingError>()
+                .is_some()
+        );
+    }
 
     fn empty_ledger() -> Ledger {
         Ledger::new(Path::new("/lab/src"), "/src")

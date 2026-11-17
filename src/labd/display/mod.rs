@@ -86,10 +86,11 @@ impl Display {
         Self { host }
     }
 
-    /// True when input should go over VNC instead of QMP (the profile's
-    /// `input_transport`).
+    /// VNC input is QEMU-specific. A native display uses its input capability
+    /// even when the guest's profile selects VNC (HV phase-4 D4).
     fn input_vnc(&self) -> bool {
         matches!(self.host.input_transport(), InputTransport::Vnc)
+            && matches!(self.host.stream_source(), StreamSource::Vnc(_))
     }
 
     /// The machine's VNC socket — what a console recorder connects to on its

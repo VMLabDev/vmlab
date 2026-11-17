@@ -23,6 +23,8 @@ mkdir -p "$TMP_INC"
 # needs, from the SDK, searched after the mingw headers so nothing else is
 # shadowed.
 for h in d3dkmthk.h d3dukmdt.h d3dkmdt.h; do
+    [ -n "$SINC" ] && [ "$SINC" != / ] || { echo "VML-88: SINC is empty or /" >&2; exit 1; }
+    [ -n "$TMP_INC" ] && [ "$TMP_INC" != / ] || { echo "VML-88: TMP_INC is empty or /" >&2; exit 1; }
     cp "$SINC/shared/$h" "$TMP_INC/" 2>/dev/null || cp "$SINC/um/$h" "$TMP_INC/"
 done
 

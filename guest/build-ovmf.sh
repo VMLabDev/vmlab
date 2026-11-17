@@ -27,6 +27,7 @@ fetch() {
     curl -fSL --retry 3 "https://deb.debian.org/debian/pool/main/e/edk2/${name//+/%2B}" \
       -o "$CACHE/$name.tmp" ||
       curl -fSL --retry 3 "https://snapshot.debian.org/file/$snapshot" -o "$CACHE/$name.tmp"
+    [ -n "$CACHE" ] && [ "$CACHE" != / ] || { echo "VML-88: CACHE is empty or /" >&2; exit 1; }
     mv "$CACHE/$name.tmp" "$CACHE/$name"
   fi
   echo "$sha  $CACHE/$name" | sha256sum -c --quiet - || die "digest mismatch: $name"
@@ -47,6 +48,7 @@ main() {
 
   local work
   work="$(mktemp -d "$CACHE/build.XXXXXX")"
+  [ -n "$work" ] && [ -d "$work" ] || { echo "VML-88: work is empty or missing" >&2; exit 1; }
   # shellcheck disable=SC2064
   trap "rm -rf '$work'" EXIT
   tar -xJf "$CACHE/$ORIG" --strip-components=1 -C "$work"
@@ -67,6 +69,7 @@ main() {
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/reproducible-debug-path.patch"
   sed -i 's/\r$//' "$work/OvmfPkg/OvmfPkgX64.dsc"
   patch -d "$work" -p1 <"$SCRIPT_DIR/ovmf/reproducible-source-path.patch"
+  [ -n "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != / ] || { echo "VML-88: SCRIPT_DIR is empty or /" >&2; exit 1; }
   cp "$SCRIPT_DIR/logo/Logo.bmp" "$work/MdeModulePkg/Logo/Logo.bmp"
 
   (
@@ -120,6 +123,7 @@ main() {
       [[ "$(stat -c %s "$fv/OVMF_CODE.fd")" == 3653632 ]] || die "unexpected CODE flash size"
       [[ "$(stat -c %s "$fv/OVMF_VARS.fd")" == 540672 ]] || die "unexpected VARS flash size"
       cmp "$fv/OVMF_VARS.fd" "$OUT/OVMF_VARS_4M.fd" || die "VARS layout/content differs from Debian"
+      [ -n "$fv" ] && [ "$fv" != / ] || { echo "VML-88: fv is empty or /" >&2; exit 1; }
       install -m 0644 "$fv/OVMF_CODE.fd" "$work/$dest"
       # Defines change between modes; never reuse modules from the other build.
       rm -rf Build
@@ -127,6 +131,7 @@ main() {
     done
     done
   )
+  [ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
   install -m 0644 "$work/OVMF_CODE_4M"*.fd "$OUT/"
   printf '{"boot_hints":true,"gop_resolution":true}\n' >"$OUT/features.json"
   {

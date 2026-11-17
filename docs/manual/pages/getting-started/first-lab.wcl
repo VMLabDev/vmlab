@@ -119,9 +119,10 @@ SRC
   DOC
 
   p <<DOC
-    `up` returns when every machine is ready and every provision script has
-    finished. This lab has no provision scripts, so it returns as soon as the
-    healthcheck passes. The lab keeps running after the command exits. It is
+    `up` returns when every machine has started, every machine a provision
+    script or a dependent waits on is ready, and every provision script has
+    finished. This lab has no provision scripts, so it can return before the
+    healthcheck passes; `vmlab up --wait` returns only once it has. The lab keeps running after the command exits. It is
     owned by the lab daemon, not by your terminal.
   DOC
 

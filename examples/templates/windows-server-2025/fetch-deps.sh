@@ -36,6 +36,8 @@ for drv in viostor NetKVM; do
     os=$(osdir "$drv")
     dest="unattend/drivers/${drv,,}"
     mkdir -p "$dest"
+    [ -n "$dest" ] && [ "$dest" != / ] || { echo "VML-88: dest is empty or /" >&2; exit 1; }
+    [ -n "$tmp" ] && [ -d "$tmp" ] || { echo "VML-88: tmp is empty or not a directory" >&2; exit 1; }
     cp "$tmp/$drv/$os/amd64/"* "$dest/"
     echo "drivers: $drv/$os/amd64 -> $dest"
 done

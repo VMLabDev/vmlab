@@ -48,7 +48,7 @@ the code is the contract.
 | `store.remove` | `reference: String`, `force: bool` | `cli` | Remove one exact store version `<arch>/<name>@<version>`. |
 | `store.prune` | `filter: Option<String>`, `keep: usize`, `apply: bool`, `force: bool` | `cli` | Plan a prune of superseded builds, and carry it out when `apply`. |
 | `store.export` | `reference: String`, `out: std::path::PathBuf` | `cli` | Write one store version to a portable archive. |
-| `store.import` | `archive: std::path::PathBuf`, `overwrite: bool` | `cli` | Read a template back out of an archive. |
+| `store.import` | `archive: std::path::PathBuf`, `overwrite: bool`, `trust_scripts: bool` | `cli` | Read a template back out of an archive. |
 | `store.pull` | `target: String`, `arch: Option<String>`, `overwrite: bool`, `all_variants: bool` | `cli` | Download a published template into the store. |
 | `store.push` | `reference: String`, `target: Option<String>`, `source: Option<String>`, `prerelease: bool`, `lab: String` | `cli` | Start uploading one store version to an OCI registry. |
 | `store.stop_push` | `lab: String`, `arch: String`, `template: String` | `cli` | Abort a running store push. |
@@ -67,7 +67,7 @@ the code is the contract.
 | `version` | — | `cli` | This daemon's build (`vmlab::version::BUILD`): what the CLI compares with its own before it drives the daemon, since one build cannot drive another's. |
 | `status` | — | `cli` | The whole lab's runtime status: machines, segments, readiness. |
 | `dns.table` | — | `cli` | The DNS zones the lab's segments serve. |
-| `up` | `machines: Vec<String>`, `record: Vec<RecordRequest>` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
+| `up` | `machines: Vec<String>`, `record: Vec<RecordRequest>`, `wait: bool` | `cli` | Bring the lab up, or just the named machines (empty = all). Streams provisioning output. |
 | `pull` | `machines: Vec<String>` | `cli` | Download every pending template and image without starting anything, over the code path `up` runs first. |
 | `lab.reload` | — | `cli` | Read the lab file afresh and apply it machine by machine (PRD §7.1): rebuild what is stopped, leave what runs pending, add and drop, reinstall forwards and swap handlers. A network change refuses the whole reload. Answers with what each machine did. |
 | `pull.cancel` | `machine: String` | `cli` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |

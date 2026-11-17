@@ -815,6 +815,10 @@ fn serve_vmlab_hv(
                 code: ErrorCode::Unsupported,
                 message: "diagnostics are not advertised by this fake".into(),
             },
+            Command::EjectMedia { .. } => Outcome::Error {
+                code: ErrorCode::Unsupported,
+                message: "media is not advertised by this fake".into(),
+            },
             // A USB unplug completes as it is asked for.
             Command::DeviceDel { id } => {
                 let _ = wake_tx

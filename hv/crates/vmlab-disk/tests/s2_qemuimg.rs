@@ -1406,3 +1406,62 @@ fn s2_sequential_throughput_1gib() {
     qemu_check(&path);
     let _ = std::io::stdout().flush();
 }
+
+/// VML-107: an owner that drops the image without `flush` keeps the writes.
+/// New clusters get their L2 and refcount updates in the write-back caches;
+/// closing the image must write them. The writes cover the first L2 table,
+/// a cluster boundary, and a second L2 table (so the L1 changes too).
+/// `qemu-img check` must be clean and qemu-img must read the data back.
+#[test]
+fn s2_drop_without_flush_keeps_new_clusters_mapped() {
+    require_qemu_img!();
+    let temp = tmpdir("drop-unflushed");
+    let path = temp.path().join("d.qcow2");
+    let size: u64 = 2 << 30;
+    qemu_img(&["create", "-f", "qcow2", &path.to_string_lossy(), "2G"]);
+    let writes: Vec<(u64, Vec<u8>)> = [
+        (0u64, 512usize, 1u8),
+        ((64 << 10) - 100, 200_000, 2),
+        (1 << 30, 70_000, 3),
+        ((3 << 29) + 4096, 4096, 4),
+        (size - 512, 512, 5),
+    ]
+    .into_iter()
+    .map(|(offset, len, seed)| (offset, pattern(len, seed)))
+    .collect();
+    {
+        let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+        for (offset, data) in &writes {
+            image.write_at(*offset, data).unwrap();
+        }
+        // No flush: the image is dropped here.
+    }
+    // qemu_img fails on a nonzero exit, so leaks (exit 3) fail here too.
+    qemu_check(&path);
+    let raw = temp.path().join("d.raw");
+    qemu_img(&[
+        "convert",
+        "-f",
+        "qcow2",
+        "-O",
+        "raw",
+        &path.to_string_lossy(),
+        &raw.to_string_lossy(),
+    ]);
+    let file = std::fs::File::open(&raw).unwrap();
+    for (offset, data) in &writes {
+        let mut actual = vec![0; data.len()];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut actual, *offset).unwrap();
+        assert!(
+            actual == *data,
+            "qemu-img does not read back the write at {offset} after a drop without flush"
+        );
+    }
+    let content = {
+        let mut image = vmlab_disk::open(&path, Format::Qcow2, true).unwrap();
+        let mut out = vec![0; 200_000];
+        image.read_at((64 << 10) - 100, &mut out).unwrap();
+        out
+    };
+    assert_eq!(content, writes[1].1);
+}

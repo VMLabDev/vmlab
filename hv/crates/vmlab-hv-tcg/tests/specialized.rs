@@ -176,6 +176,13 @@ fn a_batch_fault_keeps_the_completed_instruction_count() {
         assert_eq!(cpu.steps, before + 1);
         assert_eq!(cpu.gpr(3).unwrap(), 1);
         assert_eq!(cpu.interpreter.memory.stores, 1);
+        // Re-enter the cached trace after an execution error. Its scratch,
+        // stamps and captured inputs must have been returned to the trace.
+        cpu.interpreter.memory.fail = false;
+        cpu.set_pc(0x8000_0000);
+        cpu.set_gpr(3, 0).unwrap();
+        cpu.run(2).unwrap();
+        assert_eq!(cpu.gpr(3).unwrap(), 1);
     }
 }
 

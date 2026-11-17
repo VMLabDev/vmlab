@@ -89,12 +89,32 @@ mod tests {
         ));
     }
 
+    /// Whether `fd`'s reader is gone within `bound`. Dropping the other end
+    /// is not always seen at once in the test binary: a test on another
+    /// thread that spawns a process forks a child holding a copy of every
+    /// descriptor until it execs (`O_CLOEXEC` closes them only at the exec),
+    /// and on a loaded host that can take a while (VML-34).
+    fn gone_within(fd: impl AsFd, bound: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            if reader_gone(&fd) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
     #[test]
     fn a_pipe_without_a_reader_is_gone() {
         let (reader, writer) = std::io::pipe().unwrap();
         assert!(!reader_gone(&writer));
         drop(reader);
-        assert!(reader_gone(&writer));
+        assert!(gone_within(&writer, BOUND));
     }
 
     #[test]
@@ -102,6 +122,6 @@ mod tests {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
         assert!(!reader_gone(&ours));
         drop(theirs);
-        assert!(reader_gone(&ours));
+        assert!(gone_within(&ours, BOUND));
     }
 }

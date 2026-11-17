@@ -64,10 +64,15 @@ pub enum Plan {
 pub fn plan(clock: Clock, can_get: bool, can_set: bool) -> Plan {
     match clock {
         Clock::Snapshot | Clock::Fixed(_) => Plan::Leave,
+        Clock::Host if !can_get && !can_set => Plan::Unchecked(
+            "its agent supports neither `get_time` nor `set_time`. `clock = \"host\"` \
+             initializes the RTC from the host at startup, but cannot correct the guest \
+             clock after a reboot or an online snapshot restore"
+                .into(),
+        ),
         Clock::Host if !can_get => Plan::Unchecked(
             "its agent cannot report the guest clock (no `get_time` feature), so a clock \
-             wrong after a reboot is not corrected; `vmlab machine repair-agent` installs \
-             one that can"
+             wrong after a reboot is not corrected"
                 .into(),
         ),
         Clock::Host if !can_set => {
@@ -153,6 +158,7 @@ pub async fn check(
         Plan::Leave => {}
         Plan::Unchecked(reason) => {
             if !unchecked_said.swap(true, Ordering::SeqCst) {
+                tracing::warn!(machine, "guest clock unchecked: {reason}");
                 emit(
                     "machine.clock_unchecked",
                     json!({"vm": machine, "machine": machine, "reason": reason}),
@@ -236,7 +242,7 @@ mod tests {
     #[test]
     fn the_plan_follows_the_clock_and_the_agent() {
         let fixed = Clock::Fixed("2020-01-01T00:00:00Z".parse().unwrap());
-        for (can_get, can_set) in [(true, true), (false, true), (false, false)] {
+        for (can_get, can_set) in [(true, true), (false, true), (true, false), (false, false)] {
             assert_eq!(plan(Clock::Snapshot, can_get, can_set), Plan::Leave);
             assert_eq!(plan(fixed, can_get, can_set), Plan::Leave);
         }
@@ -245,13 +251,20 @@ mod tests {
             panic!("an old agent is unchecked");
         };
         assert!(
-            why.contains("get_time") && why.contains("repair-agent"),
+            why.contains("get_time") && !why.contains("set_time") && !why.contains("repair-agent"),
             "{why}"
         );
         let Plan::Unchecked(why) = plan(Clock::Host, true, false) else {
             panic!("an agent that cannot set is unchecked");
         };
         assert!(why.contains("set_time"), "{why}");
+        let Plan::Unchecked(why) = plan(Clock::Host, false, false) else {
+            panic!("an exec-only agent cannot synchronize its clock");
+        };
+        for expected in ["get_time", "set_time", "RTC", "reboot", "snapshot"] {
+            assert!(why.contains(expected), "{expected}: {why}");
+        }
+        assert!(!why.contains("repair-agent"), "{why}");
     }
 
     /// **The threshold is exclusive and symmetric**: two seconds either way
@@ -296,6 +309,7 @@ mod tests {
         features: Vec<&'static str>,
         ahead_ms: i64,
         refuse: Option<&'static str>,
+        reads: std::sync::atomic::AtomicUsize,
         set: Mutex<Vec<SystemTime>>,
     }
 
@@ -305,6 +319,7 @@ mod tests {
                 features: features.to_vec(),
                 ahead_ms,
                 refuse: None,
+                reads: std::sync::atomic::AtomicUsize::new(0),
                 set: Mutex::new(Vec::new()),
             }
         }
@@ -315,6 +330,7 @@ mod tests {
             self.features.contains(&feature)
         }
         fn get_time(&self) -> impl Future<Output = Result<i64>> + Send {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             let ms = unix_ms(SystemTime::now()) + self.ahead_ms;
             async move { Ok(ms) }
         }
@@ -388,9 +404,12 @@ mod tests {
     async fn a_snapshot_or_fixed_clock_is_never_touched() {
         let fixed = Clock::Fixed("2020-01-01T00:00:00Z".parse().unwrap());
         for clock in [Clock::Snapshot, fixed] {
-            let agent = Fake::new(BOTH, 36_000_000);
-            assert!(run(&agent, clock, &AtomicBool::new(false)).await.is_empty());
-            assert!(agent.set.lock().unwrap().is_empty());
+            for features in [BOTH, &[features::GET_TIME], &[features::SET_TIME], &[]] {
+                let agent = Fake::new(features, 36_000_000);
+                assert!(run(&agent, clock, &AtomicBool::new(false)).await.is_empty());
+                assert_eq!(agent.reads.load(Ordering::SeqCst), 0);
+                assert!(agent.set.lock().unwrap().is_empty());
+            }
         }
     }
 
@@ -406,6 +425,70 @@ mod tests {
         assert_eq!(first[0].0, "machine.clock_unchecked");
         assert!(first[0].1["reason"].as_str().unwrap().contains("get_time"));
         assert!(run(&agent, Clock::Host, &said).await.is_empty());
+        assert_eq!(agent.reads.load(Ordering::SeqCst), 0);
         assert!(agent.set.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_exec_only_agent_reports_both_missing_clock_features_once_per_start() {
+        let agent = Fake::new(&[features::EXEC], 36_000_000);
+        let said = AtomicBool::new(false);
+        let first = run(&agent, Clock::Host, &said).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "machine.clock_unchecked");
+        assert_eq!(first[0].1["machine"], "dc1");
+        let why = first[0].1["reason"].as_str().unwrap();
+        for expected in ["get_time", "set_time", "RTC", "reboot", "snapshot"] {
+            assert!(why.contains(expected), "{expected}: {why}");
+        }
+        assert!(!why.contains("repair-agent"), "{why}");
+        assert!(run(&agent, Clock::Host, &said).await.is_empty());
+        assert_eq!(agent.reads.load(Ordering::SeqCst), 0);
+        assert!(agent.set.lock().unwrap().is_empty());
+        assert_eq!(
+            run(&agent, Clock::Host, &AtomicBool::new(false))
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_set_time_does_not_read_a_clock_it_cannot_correct() {
+        let agent = Fake::new(&[features::EXEC, features::GET_TIME], 36_000_000);
+        let seen = run(&agent, Clock::Host, &AtomicBool::new(false)).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "machine.clock_unchecked");
+        assert!(seen[0].1["reason"].as_str().unwrap().contains("set_time"));
+        assert_eq!(agent.reads.load(Ordering::SeqCst), 0);
+        assert!(agent.set.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_exec_only_agents_clock_warning_reaches_the_user_event_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (events, mut rx) = super::super::events::EventLog::recording("legacy", path.clone());
+        let agent = Fake::new(&[features::EXEC], 36_000_000);
+        let emit = |event: &str, data: Value| events.emit(event, data);
+        check(
+            &agent,
+            "temple",
+            Clock::Host,
+            &AtomicBool::new(false),
+            &emit,
+        )
+        .await;
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event, "machine.clock_unchecked");
+        let rendered = crate::logs::format_event(&event);
+        for expected in [
+            "temple", "get_time", "set_time", "RTC", "reboot", "snapshot",
+        ] {
+            assert!(rendered.contains(expected), "{expected}: {rendered}");
+        }
+        let history = std::fs::read_to_string(path).unwrap();
+        let persisted: crate::proto::Event = serde_json::from_str(history.trim()).unwrap();
+        assert_eq!(persisted.data, event.data);
     }
 }

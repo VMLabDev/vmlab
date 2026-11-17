@@ -10,6 +10,8 @@ type HostDoc {
 
 @block("host")
 type HostConfig {
+  @doc("Trusted first_boot_script publishers: exact registry/repository, or namespace ending in /; default: ghcr.io/vmlabdev/vmlab-templates/. Replaces defaults; [] trusts none. No tags or wildcards.")
+  trusted_template_repositories: list<utf8>?
   @doc("Segment auto-allocation pool (CIDR); default `10.213.0.0/16`")
   subnet_pool: utf8?
   @doc("Suffix for auto-registered VM names; default `vmlab.internal`")

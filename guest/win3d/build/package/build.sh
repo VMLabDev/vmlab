@@ -27,10 +27,13 @@ for a in x64 x86; do
          out/d3d12/$a/d3d12.dll out/d3d12/$a/vkd3dcore.dll out/d3d12/$a/dxgi-vulkan.dll
 done
 
+[ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
 rm -rf "$OUT"
 mkdir -p "$B/driver/x64" "$B/driver/x86" "$B/runtime/x64" "$B/runtime/x86"
 
 echo "== driver package"
+[ -n "$B" ] && [ "$B" != / ] || { echo "VML-88: B is empty or /" >&2; exit 1; }
+[ -n "$REPO" ] && [ "$REPO" != / ] || { echo "VML-88: REPO is empty or /" >&2; exit 1; }
 cp "$REPO"/out/kmd/x64/{viogpu3d.sys,vgpusrv.exe,viogpuap.exe} "$B/driver/"
 python3 "$HERE/make-inf.py" "$REPO/out/kmd/viogpu3d_x64_wow64.inf.template" "$B/driver/viogpu3d.inf"
 for a in x64 x86; do
@@ -56,6 +59,7 @@ cp "$REPO/installer/vmlab-win3d.ps1" "$B/"
 # cmd.exe needs CRLF line endings.
 for f in Install.cmd Uninstall.cmd; do sed 's/\r*$/\r/' "$REPO/installer/$f" >"$B/$f"; done
 sed 's/\r*$/\r/' "$REPO/installer/README.txt" >"$B/README.txt"
+[ -n "$SIGNING_DIR" ] && [ "$SIGNING_DIR" != / ] || { echo "VML-88: SIGNING_DIR is empty or /" >&2; exit 1; }
 cp "$SIGNING_DIR/test-signing.cer" "$B/vmlab-win3d-test.cer"
 
 cp -r "$REPO/licenses" "$B/"

@@ -15,8 +15,10 @@ build_tools_image() {
     [ -d "$repo" ] || git clone -q --bare "$url" "$repo"
     git -C "$repo" cat-file -e "$rev^{commit}" 2>/dev/null || git -C "$repo" fetch -q origin "$rev"
     ctx=$CACHE/signing-ctx
+    [ -n "$ctx" ] && [ "$ctx" != / ] || { echo "VML-88: ctx is empty or /" >&2; exit 1; }
     rm -rf "$ctx"; mkdir -p "$ctx/generate-cat-file"
     git -C "$repo" archive "$rev" | tar -x -C "$ctx/generate-cat-file"
+    [ -n "$HERE" ] && [ "$HERE" != / ] || { echo "VML-88: HERE is empty or /" >&2; exit 1; }
     cp "$HERE/Dockerfile" "$ctx/"
     docker build -q -t "$IMAGE" "$ctx" >/dev/null
 }

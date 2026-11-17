@@ -35,11 +35,12 @@ struct State {
 }
 
 #[derive(Clone, Default)]
-struct Image {
+pub(super) struct Image {
     flags: vmlab_hv_display::FrameFlags,
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    /// XRGB8888, `width * 4` bytes per row.
+    pub(super) pixels: Vec<u8>,
 }
 #[derive(Default)]
 struct Images {
@@ -80,7 +81,7 @@ fn recognize(image: &Image) -> String {
     String::from_utf8(result.stdout).unwrap()
 }
 
-fn screenshot(path: &Path) -> Image {
+pub(super) fn screenshot(path: &Path) -> Image {
     let client = Client::connect(
         path,
         Capabilities(Capabilities::FRAMES | Capabilities::FRAME_FLAGS),

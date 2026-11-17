@@ -209,6 +209,10 @@ impl ControlHandler {
                     message: format!("no attached USB device with id {id:?}"),
                 },
             },
+            Command::EjectMedia { id } => match self.vm.eject_media(&id) {
+                Ok(()) => Outcome::Ok { status: None },
+                Err((code, message)) => Outcome::Error { code, message },
+            },
             Command::SnapshotSave { name } => {
                 snapshot_outcome(self.vm.status(), crate::snapshot::save(&self.vm, &name))
             }
@@ -282,6 +286,9 @@ pub fn serve_with_network(
     }
     if vm.shared().usb_hotplug() {
         capabilities.push(Capability::Hotplug);
+    }
+    if vm.shared().has_optical() {
+        capabilities.push(Capability::Media);
     }
     let server: Server<_> = Server::with_fds(
         env!("CARGO_PKG_VERSION"),
@@ -571,6 +578,73 @@ mod usb_tests {
                 code: ErrorCode::DeviceNotFound,
                 ..
             }
+        ));
+    }
+
+    /// `eject_media` empties the named CD-ROM on AHCI or IDE and leaves its
+    /// tray closed; an empty drive ejects again, and an unknown id is
+    /// `device_not_found`.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+    fn eject_media_empties_a_cdrom_on_either_bus() {
+        use vmlab_hv_devices::ahci::Ahci;
+        use vmlab_hv_devices::ide::Ide;
+        let Some(f) = fixture() else { return };
+        assert!(!f.shared.has_optical());
+        let dir = tempfile::tempdir().unwrap();
+        let iso = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![0x5a; 4096]).unwrap();
+            vmlab_disk::open(&path, vmlab_disk::Format::Raw, true).unwrap()
+        };
+        let mem = f.shared.ram.lock().clone().unwrap().mem.clone();
+        let ahci = Arc::new(parking_lot::Mutex::new(Ahci::new(
+            "ahci",
+            mem.clone(),
+            Arc::new(NullIrq),
+            Arc::new(Sinks::default()),
+        )));
+        ahci.lock().attach_cdrom(2, Some(iso("a.iso"))).unwrap();
+        let ide = Arc::new(parking_lot::Mutex::new(Ide::new(
+            "ide",
+            mem,
+            [Arc::new(NullIrq), Arc::new(NullIrq)],
+        )));
+        ide.lock().attach_cdrom(1, 0, Some(iso("b.iso"))).unwrap();
+        *f.shared.optical.lock() = vec![
+            (
+                "cd0".into(),
+                crate::vm::OpticalSlot::Ahci {
+                    controller: ahci.clone(),
+                    port: 2,
+                },
+            ),
+            (
+                "cd1".into(),
+                crate::vm::OpticalSlot::Ide {
+                    controller: ide.clone(),
+                    channel: 1,
+                    unit: 0,
+                },
+            ),
+        ];
+        assert!(f.shared.has_optical());
+        let empty = vmlab_hv_devices::ahci::MediaState {
+            present: false,
+            tray_open: false,
+            locked: false,
+        };
+        let eject = |id: &str| f.handler.handle(Command::EjectMedia { id: id.into() });
+        assert!(ahci.lock().media_state(2).unwrap().present);
+        assert!(matches!(eject("cd0"), Outcome::Ok { .. }));
+        assert_eq!(ahci.lock().media_state(2).unwrap(), empty);
+        assert!(ide.lock().media_state(1, 0).unwrap().present);
+        assert!(matches!(eject("cd1"), Outcome::Ok { .. }));
+        assert_eq!(ide.lock().media_state(1, 0).unwrap(), empty);
+        assert!(matches!(eject("cd0"), Outcome::Ok { .. }));
+        assert!(matches!(
+            eject("disk0"),
+            Outcome::Error { code: ErrorCode::DeviceNotFound, ref message } if message.contains("disk0")
         ));
     }
 

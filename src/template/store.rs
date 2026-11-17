@@ -157,12 +157,24 @@ impl TemplateStore {
     }
 
     // ---- reads (lock-free) -------------------------------------------------
+    //
+    // Each read first finishes any swap a crash interrupted in the
+    // templates it reads ([`Self::recover_swaps`]), so a version an
+    // overwrite had set aside is never missing from what a reader sees.
+    // That takes the lock only when a leftover is there, so no mutation
+    // holding the lock may call a read: one that needs a version uses
+    // `installed_locked`, which recovers under the lock it already holds.
 
     /// All templates in the store, sorted by arch, name, then version
     /// (natural order), each with the variants whose disks are installed.
     /// Entries with unreadable metadata — invalid variant blocks included —
     /// are skipped with a warning rather than failing the whole listing.
     pub fn list(&self) -> Result<Vec<TemplateMeta>> {
+        let mut names = Vec::new();
+        for arch in subdirs(&self.root)? {
+            names.extend(subdirs(&arch)?);
+        }
+        self.recover_swaps(&names);
         let mut out = Vec::new();
         for arch in subdirs(&self.root)? {
             for name in subdirs(&arch)? {
@@ -194,7 +206,10 @@ impl TemplateStore {
     /// version otherwise.
     pub fn exists(&self, arch: &str, name: &str, version: Option<&str>) -> bool {
         match version {
-            Some(v) => self.version_dir(arch, name, v).join(META_FILE).is_file(),
+            Some(v) => {
+                self.recover_swaps(&[self.root.join(arch).join(name)]);
+                self.version_dir(arch, name, v).join(META_FILE).is_file()
+            }
             None => !self.versions_of(arch, name).unwrap_or_default().is_empty(),
         }
     }
@@ -248,6 +263,31 @@ impl TemplateStore {
         name: &str,
         version: &str,
     ) -> Result<Option<TemplateVersion>> {
+        self.recover_swaps(&[self.root.join(arch).join(name)]);
+        self.installed_as_is(arch, name, version)
+    }
+
+    /// [`Self::installed`] for a caller that holds the store lock: it
+    /// recovers this version's interrupted swap itself, under the lock it
+    /// already has, since [`Self::recover_swaps`] would take it again and a
+    /// second flock from the same process waits forever.
+    fn installed_locked(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<TemplateVersion>> {
+        recover_swap(&self.version_dir(arch, name, version))?;
+        self.installed_as_is(arch, name, version)
+    }
+
+    /// The version as the disk has it now, recovering nothing.
+    fn installed_as_is(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<TemplateVersion>> {
         let dir = self.version_dir(arch, name, version);
         if !dir.join(META_FILE).is_file() {
             return Ok(None);
@@ -268,8 +308,10 @@ impl TemplateStore {
     /// Version directory names present for `<arch>/<name>` (those with
     /// metadata), unsorted.
     pub(crate) fn versions_of(&self, arch: &str, name: &str) -> Result<Vec<String>> {
+        let name_dir = self.root.join(arch).join(name);
+        self.recover_swaps(std::slice::from_ref(&name_dir));
         let mut versions = Vec::new();
-        for dir in subdirs(&self.root.join(arch).join(name))? {
+        for dir in subdirs(&name_dir)? {
             if dir.join(META_FILE).is_file()
                 && let Some(v) = dir.file_name().and_then(|n| n.to_str())
             {
@@ -277,6 +319,28 @@ impl TemplateStore {
             }
         }
         Ok(versions)
+    }
+
+    /// Finish every swap a crash interrupted in the `<arch>/<name>`
+    /// directories `name_dirs` (see [`recover_swap`]): the old version set
+    /// aside with nothing in its place goes back, and leftover `.next-` and
+    /// `.old-` directories go. Looks without the lock and takes it only when
+    /// something is left, then [`recover_swap`] looks again under it, so a
+    /// swap another process is still running is waited for, not undone.
+    ///
+    /// A read must not fail because of it: what cannot be recovered is
+    /// logged, and the read sees the store as it is.
+    fn recover_swaps(&self, name_dirs: &[PathBuf]) {
+        let leftovers: Vec<PathBuf> = name_dirs.iter().flat_map(|d| swap_leftovers(d)).collect();
+        if leftovers.is_empty() {
+            return;
+        }
+        let recovered = self
+            .lock()
+            .and_then(|_lock| leftovers.iter().try_for_each(|dest| recover_swap(dest)));
+        if let Err(e) = recovered {
+            tracing::warn!("cannot recover an interrupted template swap: {e:#}");
+        }
     }
 
     // ---- mutations (exclusive flock) ----------------------------------------
@@ -307,6 +371,7 @@ impl TemplateStore {
         overwrite: bool,
         ops: &InstallOps,
     ) -> Result<()> {
+        super::trust::names(meta)?;
         ensure!(
             staging.join(DISK_FILE).is_file(),
             "staging directory {} contains no {DISK_FILE}",
@@ -485,7 +550,7 @@ impl TemplateStore {
         in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<()> {
         let found = self
-            .installed(arch, name, version)?
+            .installed_locked(arch, name, version)?
             .ok_or_else(|| anyhow!("template {arch}/{name}@{version} not found in the store"))?;
         let reference = format!("{arch}/{name}@{version}#{variant}");
         if variant == BASE_VARIANT {
@@ -554,7 +619,11 @@ impl TemplateStore {
         let file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
         let encoder = zstd::Encoder::new(file, 0).context("cannot start zstd stream")?;
         let mut tar = tar::Builder::new(encoder);
-        let wcl = resolved.meta.to_wcl();
+        let mut exported = resolved.meta.clone();
+        if exported.sha256.is_none() {
+            exported.sha256 = Some(sha256_file(&resolved.disk_path)?);
+        }
+        let wcl = exported.to_wcl();
         let mut header = tar::Header::new_gnu();
         header.set_size(wcl.len() as u64);
         header.set_mode(0o644);
@@ -585,19 +654,33 @@ impl TemplateStore {
     /// recorded digest and every variant against its own and its base's
     /// (§6.6), then installs.
     pub fn import(&self, archive: &Path, overwrite: bool) -> Result<TemplateMeta> {
+        self.import_trusting_scripts(archive, overwrite, false)
+    }
+
+    pub fn import_trusting_scripts(
+        &self,
+        archive: &Path,
+        overwrite: bool,
+        trust_scripts: bool,
+    ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let staging = StagingDir::create(&self.root)?;
 
         let file =
             File::open(archive).with_context(|| format!("cannot open {}", archive.display()))?;
         let decoder = zstd::Decoder::new(file).context("cannot read zstd stream")?;
-        tar::Archive::new(decoder)
-            .unpack(staging.path())
-            .with_context(|| format!("cannot unpack {}", archive.display()))?;
+        unpack_template(decoder, staging.path())?;
 
         let meta = TemplateMeta::read_from(&staging.path().join(META_FILE))
             .with_context(|| format!("{} is not a vmlab template archive", archive.display()))?;
+        super::trust::names(&meta)?;
+        super::trust::scripts(&meta, trust_scripts)?;
+        ensure!(
+            meta.sha256.is_some(),
+            "template archive is missing the disk digest"
+        );
         let disk = staging.path().join(DISK_FILE);
+        verify_base(&disk)?;
         ensure!(
             disk.is_file(),
             "{} is not a vmlab template archive: missing {DISK_FILE}",
@@ -632,6 +715,8 @@ impl TemplateStore {
         meta: &TemplateMeta,
         overwrite: bool,
     ) -> Result<()> {
+        super::trust::names(meta)?;
+        verify_base(&staging_dir.join(DISK_FILE))?;
         verify_variants(staging_dir, meta, meta.sha256.as_deref())?;
         if meta.variants.is_empty() || meta.variants_expected {
             return self.install(staging_dir, meta, overwrite);
@@ -663,7 +748,7 @@ impl TemplateStore {
     ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let found = self
-            .installed(arch, name, version)?
+            .installed_locked(arch, name, version)?
             .ok_or_else(|| anyhow!("template {arch}/{name}@{version} not found in the store"))?;
         let mut incoming = found.meta.clone();
         incoming.variants = variants.to_vec();
@@ -751,6 +836,7 @@ pub const VARIANT_BACKING: &str = "../../disk.qcow2";
 /// contend with.
 pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
     use std::io::{Read, Seek, SeekFrom};
+    regular_file(path)?;
     let mut f = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut header = [0u8; 20];
     f.read_exact(&mut header)
@@ -762,9 +848,28 @@ pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
     );
     let offset = u64::from_be_bytes(header[8..16].try_into().expect("8 bytes"));
     let size = u32::from_be_bytes(header[16..20].try_into().expect("4 bytes"));
-    if offset == 0 || size == 0 {
+    let version = u32::from_be_bytes(header[4..8].try_into().expect("4 bytes"));
+    ensure!(
+        (2..=3).contains(&version),
+        "unsupported qcow2 version {version}"
+    );
+    let header_size = if version == 2 { 72 } else { 104 };
+    let file_size = f.metadata()?.len();
+    ensure!(file_size >= header_size, "truncated qcow2 header");
+    ensure!(
+        (offset == 0) == (size == 0),
+        "inconsistent qcow2 backing fields"
+    );
+    if offset == 0 {
         return Ok(None);
     }
+    ensure!(
+        offset >= header_size
+            && offset
+                .checked_add(u64::from(size))
+                .is_some_and(|end| end <= file_size),
+        "qcow2 backing file name is outside the image"
+    );
     ensure!(
         size <= 1023,
         "{} records a {size}-byte backing file name",
@@ -775,6 +880,89 @@ pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
     f.read_exact(&mut name)
         .with_context(|| format!("cannot read {}'s backing file name", path.display()))?;
     Ok(Some(String::from_utf8_lossy(&name).into_owned()))
+}
+
+fn regular_file(path: &Path) -> Result<()> {
+    ensure!(
+        fs::symlink_metadata(path)?.file_type().is_file(),
+        "{} must be a regular file, not a symlink",
+        path.display()
+    );
+    Ok(())
+}
+
+pub(crate) fn verify_base(path: &Path) -> Result<()> {
+    regular_file(path)?;
+    // Raw disks are supported too. Only qcow2 images carry backing fields.
+    use std::io::Read;
+    let mut magic = [0; 4];
+    let n = File::open(path)?.read(&mut magic)?;
+    if n == 4 && magic == *b"QFI\xfb" {
+        ensure!(
+            qcow2_backing_file(path)?.is_none(),
+            "template base disk must not have a backing file"
+        );
+    }
+    Ok(())
+}
+
+fn unpack_template(reader: impl std::io::Read, dest: &Path) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    let mut seen = std::collections::HashSet::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let parts: Vec<_> = path.components().collect();
+        ensure!(
+            parts
+                .iter()
+                .all(|p| matches!(p, std::path::Component::Normal(_))),
+            "unsafe template archive path"
+        );
+        let text = path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF8 archive path"))?;
+        let variant_disk = match parts.as_slice() {
+            [a, b, c] if a.as_os_str() == VARIANTS_DIR && c.as_os_str() == DISK_FILE => {
+                super::trust::component(
+                    b.as_os_str()
+                        .to_str()
+                        .ok_or_else(|| anyhow!("invalid variant name"))?,
+                )?;
+                true
+            }
+            _ => false,
+        };
+        let allowed = matches!(text, META_FILE | DISK_FILE | VARS_FILE) || variant_disk;
+        // Exports may include the two directory levels for variants.
+        if entry.header().entry_type().is_dir() {
+            ensure!(
+                text == VARIANTS_DIR
+                    || (parts.len() == 2
+                        && parts[0].as_os_str() == VARIANTS_DIR
+                        && super::trust::component(parts[1].as_os_str().to_str().unwrap_or(""))
+                            .is_ok()),
+                "unexpected archive directory"
+            );
+            continue;
+        }
+        // tar::Builder preserves holes as GNU sparse entries. Accept those
+        // only for disk/VARS payloads, never links or other special files.
+        let kind = entry.header().entry_type();
+        let sparse_payload =
+            kind.is_gnu_sparse() && (matches!(text, DISK_FILE | VARS_FILE) || variant_disk);
+        ensure!(
+            allowed && (kind.is_file() || sparse_payload),
+            "unexpected template archive entry: {}",
+            path.display()
+        );
+        ensure!(
+            seen.insert(path.clone()),
+            "duplicate template archive entry"
+        );
+        ensure!(entry.unpack_in(dest)?, "archive entry escaped staging");
+    }
+    Ok(())
 }
 
 /// Make a variant overlay name its base by [`VARIANT_BACKING`], the store's
@@ -804,6 +992,7 @@ pub fn ensure_variant_backing(overlay: &Path) -> Result<bool> {
 /// `base_sha256` equal to the digest of the staged `disk.qcow2`, which
 /// `base_digest` is when known.
 fn verify_variants(dir: &Path, meta: &TemplateMeta, base_digest: Option<&str>) -> Result<()> {
+    super::trust::names(meta)?;
     if meta.variants.is_empty() {
         return Ok(());
     }
@@ -820,6 +1009,7 @@ fn verify_variants(dir: &Path, meta: &TemplateMeta, base_digest: Option<&str>) -
             v.name,
             variant_disk_rel(&v.name).display()
         );
+        regular_file(&overlay)?;
         let actual = sha256_file(&overlay)?;
         ensure!(
             digest_matches(&actual, &v.sha256),
@@ -1084,6 +1274,28 @@ fn recover_swap(dest: &Path) -> Result<()> {
         }
     }
     remove_if_present(&next)
+}
+
+/// The version dirs under `name_dir` that an interrupted swap left a
+/// `.next-<version>` or `.old-<version>` beside, once each.
+fn swap_leftovers(name_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(name_dir) else {
+        return Vec::new();
+    };
+    let mut dests: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let version = name
+                .strip_prefix(".next-")
+                .or_else(|| name.strip_prefix(".old-"))?;
+            (!version.is_empty()).then(|| name_dir.join(version))
+        })
+        .collect();
+    dests.sort();
+    dests.dedup();
+    dests
 }
 
 fn remove_if_present(dir: &Path) -> Result<()> {
@@ -1689,6 +1901,124 @@ mod tests {
         assert_eq!(version_entries(&store), ["1"]);
     }
 
+    /// The state a crash between setting `x86_64/t@1` aside and the final
+    /// rename leaves: no version dir, the old one at `.old-1`, and a
+    /// half-staged replacement at `.next-1`.
+    fn crash_mid_swap(store: &TemplateStore) {
+        let dir = store.version_dir("x86_64", "t", "1");
+        let (next, old) = swap_paths(&dir);
+        fs::rename(&dir, &old).unwrap();
+        fs::create_dir_all(&next).unwrap();
+        fs::write(next.join(DISK_FILE), b"half").unwrap();
+        assert_eq!(version_entries(store), [".next-1", ".old-1"]);
+    }
+
+    /// VML-33: the next listing shows the version an interrupted swap set
+    /// aside, not only the next install of that version.
+    #[test]
+    fn a_listing_restores_a_version_an_interrupted_swap_set_aside() {
+        let (_tmp, store, _staging) = store_with_old_version();
+        let before = version_files(&store);
+        crash_mid_swap(&store);
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!((listed[0].version.as_str(), listed[0].cpus), ("1", Some(2)));
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store), before);
+    }
+
+    /// The same for a resolve, pinned or not, and for `exists`.
+    #[test]
+    fn a_resolve_or_exists_restores_it_too() {
+        for ask in ["pinned", "latest", "exists"] {
+            let (_tmp, store, _staging) = store_with_old_version();
+            let before = version_files(&store);
+            crash_mid_swap(&store);
+            match ask {
+                "pinned" => {
+                    let r = store.resolve_version("x86_64", "t", Some("1")).unwrap();
+                    assert_eq!(fs::read(&r.disk_path).unwrap(), b"one");
+                }
+                "latest" => {
+                    let r = store.resolve_version("x86_64", "t", None).unwrap();
+                    assert_eq!(r.meta.version, "1");
+                }
+                _ => assert!(store.exists("x86_64", "t", Some("1"))),
+            }
+            assert_eq!(version_entries(&store), ["1"], "{ask}");
+            assert_eq!(version_files(&store), before, "{ask}");
+        }
+    }
+
+    /// A listing also clears a `.next-1` or `.old-1` left beside an intact
+    /// version.
+    #[test]
+    fn a_listing_clears_leftovers_beside_an_intact_version() {
+        let (_tmp, store, _staging) = store_with_old_version();
+        let dir = store.version_dir("x86_64", "t", "1");
+        let (next, old) = swap_paths(&dir);
+        fs::create_dir_all(&next).unwrap();
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(DISK_FILE), b"older").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store).0, b"one");
+    }
+
+    /// Run `f` on another thread and wait at most 10 s for it: a mutation
+    /// that took the store lock a second time would never return.
+    fn returns_within_10s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("blocked on the store lock it already holds")
+    }
+
+    /// The mutations that look a version up while they hold the lock do
+    /// not take it again to recover a leftover (lead review F1): they
+    /// return, and recover the version themselves.
+    #[test]
+    fn locked_lookups_recover_without_taking_the_lock_again() {
+        let (_tmp, store, _staging) = store_with_old_version();
+        let before = version_files(&store);
+        crash_mid_swap(&store);
+        let removing = store.clone();
+        let err = returns_within_10s(move || {
+            removing
+                .remove("x86_64", "t", "1", Some("ghost"), false, &|_| None)
+                .unwrap_err()
+                .to_string()
+        });
+        // It found the version it recovered, and refused only the variant.
+        assert!(err.contains("has no variants"), "{err}");
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store), before);
+
+        crash_mid_swap(&store);
+        let adding = store.clone();
+        let staging = tempfile::tempdir_in(store.root()).unwrap();
+        let staging_path = staging.path().to_path_buf();
+        let added =
+            returns_within_10s(move || adding.add_variants("x86_64", "t", "1", &staging_path, &[]));
+        assert!(added.is_ok(), "{added:?}");
+        assert_eq!(version_entries(&store), ["1"]);
+        assert_eq!(version_files(&store).0, before.0);
+    }
+
+    /// A store with nothing to recover is read without taking the lock,
+    /// so reading creates no lock file.
+    #[test]
+    fn a_clean_store_is_read_without_the_lock() {
+        let (_tmp, store) = new_store();
+        install(&store, &meta("x86_64", "t", "1"), b"one").unwrap();
+        fs::remove_file(store.root().join(LOCK_FILE)).unwrap();
+        store.list().unwrap();
+        store.resolve_version("x86_64", "t", None).unwrap();
+        assert!(!store.root().join(LOCK_FILE).exists());
+    }
+
     /// A crash after the final rename leaves `.old-1` beside the new
     /// version, and one during staging a `.next-1`; both are cleared.
     #[test]
@@ -1788,6 +2118,46 @@ mod tests {
 
         // A template recording no file names none.
         assert_eq!(template_vars(&r.dir, &meta("x86_64", "x", "1")), None);
+    }
+
+    #[test]
+    fn export_import_round_trip_with_sparse_disk() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (_tmp, store) = new_store();
+        let m = meta("x86_64", "sparse", "1");
+        install(&store, &m, b"disk").unwrap();
+        let original = store.resolve_version("x86_64", "sparse", None).unwrap();
+        let mut disk = File::options()
+            .write(true)
+            .open(&original.disk_path)
+            .unwrap();
+        disk.seek(SeekFrom::Start(8 << 20)).unwrap();
+        disk.write_all(b"tail").unwrap();
+        drop(disk);
+
+        let out = tempfile::tempdir().unwrap();
+        let archive = out.path().join("sparse.tar.zst");
+        store.export("x86_64", "sparse", None, &archive).unwrap();
+        let decoder = zstd::Decoder::new(File::open(&archive).unwrap()).unwrap();
+        let mut tar = tar::Archive::new(decoder);
+        let mut found_sparse = false;
+        for entry in tar.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new(DISK_FILE) {
+                assert!(entry.header().entry_type().is_gnu_sparse());
+                found_sparse = true;
+            }
+        }
+        assert!(found_sparse);
+
+        let (_tmp2, other) = new_store();
+        other.import(&archive, false).unwrap();
+        let imported = other.resolve_version("x86_64", "sparse", None).unwrap();
+        assert_eq!(
+            fs::read(imported.disk_path).unwrap(),
+            fs::read(original.disk_path).unwrap()
+        );
     }
 
     #[test]
@@ -2366,6 +2736,157 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_base_refuses_backing_and_malformed_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join(DISK_FILE);
+        let header = |offset: u64, size: u32| {
+            let mut bytes = vec![0; 120];
+            bytes[..4].copy_from_slice(b"QFI\xfb");
+            bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
+            bytes[8..16].copy_from_slice(&offset.to_be_bytes());
+            bytes[16..20].copy_from_slice(&size.to_be_bytes());
+            bytes
+        };
+        fs::write(&disk, header(0, 0)).unwrap();
+        verify_base(&disk).unwrap();
+        for (offset, size) in [
+            (104, 4),
+            (0, 4),
+            (104, 0),
+            (1, 2),
+            (119, 2),
+            (u64::MAX, 2),
+            (104, 1024),
+        ] {
+            fs::write(&disk, header(offset, size)).unwrap();
+            assert!(verify_base(&disk).is_err(), "{offset}/{size}");
+        }
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&disk, &link).unwrap();
+        assert!(verify_base(&link).is_err());
+        assert!(verify_base(dir.path()).is_err());
+    }
+
+    #[test]
+    fn trust_checks_cover_variant_names_and_scripts() {
+        let mut m = meta("x86_64", "base", "1");
+        let mut v = variant_meta("desktop", true, "00");
+        v.first_boot_script = Some("fn main(lab) {}".into());
+        m.variants.push(v);
+        assert!(super::super::trust::scripts(&m, false).is_err());
+        super::super::trust::scripts(&m, true).unwrap();
+        assert_eq!(
+            super::super::trust::script_paths(&m),
+            ["template.wcl:variant/desktop/first_boot_script"]
+        );
+        m.variants[0].name = "../../escape".into();
+        assert!(super::super::trust::names(&m).is_err());
+        let (_tmp, store) = new_store();
+        assert!(install(&store, &m, b"disk").is_err());
+    }
+
+    #[test]
+    fn archive_script_trust_requires_explicit_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join(DISK_FILE), b"raw").unwrap();
+        let mut m = meta("x86_64", "test", "1");
+        m.first_boot_script = Some("fn main(lab) {}".into());
+        m.sha256 = Some(sha256_file(&staged.join(DISK_FILE)).unwrap());
+        m.write_to(&staged.join(META_FILE)).unwrap();
+        let archive = tmp.path().join("scripts.tar.zst");
+        repack(&archive, &staged, &[META_FILE, DISK_FILE]);
+        let (_tmp, store) = new_store();
+        assert!(store.import(&archive, false).is_err());
+        assert!(store.list().unwrap().is_empty());
+        let imported = store
+            .import_trusting_scripts(&archive, false, true)
+            .unwrap();
+        assert_eq!(imported.first_boot_script, m.first_boot_script);
+        assert_eq!(
+            super::super::trust::script_paths(&imported),
+            ["template.wcl:first_boot_script"]
+        );
+    }
+
+    #[test]
+    fn import_requires_digest_and_refuses_scripts_and_path_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join(DISK_FILE), b"raw").unwrap();
+        for case in 0..6 {
+            let mut m = meta("x86_64", "test", "1");
+            m.sha256 = Some(sha256_file(&staged.join(DISK_FILE)).unwrap());
+            match case {
+                0 => m.sha256 = None,
+                1 => m.first_boot_script = Some("fn main(lab) {}".into()),
+                2 => m.name = "../escape".into(),
+                3 => m.arch = "/tmp".into(),
+                4 => m.version = "a..b".into(),
+                _ => m.name = "a".repeat(129),
+            }
+            m.write_to(&staged.join(META_FILE)).unwrap();
+            let archive = tmp.path().join("bad.tar.zst");
+            repack(&archive, &staged, &[META_FILE, DISK_FILE]);
+            let (_tmp, victim) = new_store();
+            assert!(victim.import(&archive, false).is_err(), "case {case}");
+            assert!(victim.list().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn archive_filter_refuses_links_extra_files_and_duplicates() {
+        for kind in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Fifo,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            tar::EntryType::Continuous,
+            tar::EntryType::new(b'Z'),
+            tar::EntryType::Regular,
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut tar = tar::Builder::new(&mut bytes);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_entry_type(kind);
+                header.set_link_name("/etc/passwd").unwrap();
+                header.set_cksum();
+                tar.append_data(
+                    &mut header,
+                    if kind.is_file() {
+                        "unexpected"
+                    } else {
+                        DISK_FILE
+                    },
+                    &[][..],
+                )
+                .unwrap();
+            }
+            let dest = tempfile::tempdir().unwrap();
+            assert!(unpack_template(&bytes[..], dest.path()).is_err());
+        }
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            for _ in 0..2 {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(0);
+                h.set_mode(0o644);
+                h.set_cksum();
+                tar.append_data(&mut h, DISK_FILE, &[][..]).unwrap();
+            }
+        }
+        let dest = tempfile::tempdir().unwrap();
+        assert!(unpack_template(&bytes[..], dest.path()).is_err());
+    }
+
+    #[test]
     fn list_skips_lock_and_staging_entries() {
         let (_tmp, store) = new_store();
         install(&store, &meta("x86_64", "t", "1"), b"x").unwrap();
@@ -2426,7 +2947,10 @@ mod tests {
     fn record_variant_digests(store: &TemplateStore) {
         let dir = store.version_dir("x86_64", "win", "1");
         let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
+        // Archive transport cannot authenticate a script publisher.
+        m.first_boot_script = None;
         for v in &mut m.variants {
+            v.first_boot_script = None;
             v.sha256 = sha256_file(&dir.join(variant_disk_rel(&v.name))).unwrap();
         }
         m.write_to(&dir.join(META_FILE)).unwrap();

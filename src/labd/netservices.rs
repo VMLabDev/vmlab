@@ -520,28 +520,82 @@ mod tests {
             .unwrap()
     }
 
-    /// Re-installing a forward on the port it was just removed from binds
-    /// every time. Removal used to only abort the listener's task, and on a
-    /// multi-threaded runtime the new bind sometimes ran before the old
-    /// listener was dropped: the new forward died with the port in use, and
-    /// nothing said so (#144).
+    /// The inodes of the sockets this process holds open.
+    fn own_sockets() -> std::collections::HashSet<u64> {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter_map(|l| {
+                l.to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// The inode of the socket this process listens with on TCP `port`.
+    fn own_listener(port: u16) -> Option<u64> {
+        let own = own_sockets();
+        let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        tcp.lines().skip(1).find_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let local = u16::from_str_radix(f.get(1)?.rsplit(':').next()?, 16).ok()?;
+            let inode: u64 = f.get(9)?.parse().ok()?;
+            // State 0A is LISTEN.
+            (local == port && *f.get(3)? == "0A" && own.contains(&inode)).then_some(inode)
+        })
+    }
+
+    /// Removing a forward closes its listener before it returns, so a forward
+    /// re-installed on the port binds. Removal used to only abort the
+    /// listener's task, and on a multi-threaded runtime the new bind
+    /// sometimes ran before the old listener was dropped: the new forward
+    /// died with the port in use, and nothing said so (#144).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_forward_reinstalled_on_its_own_port_binds() {
+        use crate::config::model::Proto;
         let (services, _gw, _guest) = segment(true);
-        for _ in 0..50 {
+        let in_use = |e: &str| e.contains("Address already in use");
+        // A freed port is free for every program on the host, and on a
+        // loaded one another program takes it now and then (VML-61). The
+        // closed listener is checked directly, so such a loss proves
+        // nothing about removal: it is counted and the round is retried.
+        let (mut rounds, mut lost) = (0, 0);
+        while rounds < 50 {
+            assert!(lost < 50, "other programs took {lost} freed ports");
             let addr = free_port();
-            let (first, _) = services
-                .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
-                .unwrap();
+            let first = match services.add_forward(addr, GUEST_IP, 80, Proto::Tcp) {
+                Ok((id, _)) => id,
+                Err(e) if in_use(&e) => {
+                    lost += 1;
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            let listener = own_listener(addr.port()).expect("the forward listens");
             assert!(services.remove_forward(first).await);
-            let (second, bound) = services
-                .add_forward(addr, GUEST_IP, 80, crate::config::model::Proto::Tcp)
-                .expect("the removed forward's port is free again");
-            assert_eq!(bound, addr.port());
+            assert!(
+                !own_sockets().contains(&listener),
+                "the removed forward's listener is still open"
+            );
+            let second = match services.add_forward(addr, GUEST_IP, 80, Proto::Tcp) {
+                Ok((id, bound)) => {
+                    assert_eq!(bound, addr.port());
+                    id
+                }
+                Err(e) if in_use(&e) => {
+                    lost += 1;
+                    continue;
+                }
+                Err(e) => panic!("the removed forward's port is free again: {e}"),
+            };
             tokio::net::TcpStream::connect(addr)
                 .await
                 .expect("the re-installed forward is listening");
             services.remove_forward(second).await;
+            rounds += 1;
         }
     }
 
