@@ -261,11 +261,13 @@ seam.
   the userspace fabric, so `auto` never selects it.
 - **userspace** is the fabric as described, and always the fallback.
 
-Both kernel tiers need `CAP_BPF` and `CAP_NET_ADMIN`, and each daemon proves a
-tier works on its host, loading the programs and pushing frames through
-throwaway taps or sockets, before using it. An unprivileged or WSL 2 daemon
-degrades to userspace silently. The installer offers to grant the binary both
-capabilities with `setcap`. The gateway MAC and the service and trunk ports
+Both kernel tiers need `CAP_BPF` and `CAP_NET_ADMIN`, held only by the
+`vmlab-fastpath` helper beside `vmlab`, which each daemon starts and asks for
+every privileged step. Each daemon proves a tier works on its host, loading the
+programs and pushing frames through throwaway taps or sockets, before using it.
+Without the helper's capabilities, or on WSL 2, a daemon degrades to userspace
+silently. The installer offers to grant the helper both capabilities with
+`setcap`. The gateway MAC and the service and trunk ports
 never enter the kernel forwarding tables, so DHCP, DNS, NAT, rules and forwards
 behave identically on every tier. Force a tier with `fastpath` in the host
 configuration or the `VMLAB_FASTPATH` environment variable.

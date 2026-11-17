@@ -23,6 +23,14 @@ path = "src/lib.rs"
 name = "vmlab"
 path = "src/main.rs"
 
+# The eBPF fast path's privileged helper (F21): the only binary install.sh
+# grants CAP_BPF and CAP_NET_ADMIN. The daemons start it and ask it for each
+# privileged step over a closed request protocol.
+[[bin]]
+name = "vmlab-fastpath"
+path = "src/fastpath_helper.rs"
+required-features = ["ebpf"]
+
 [features]
 default = ["ebpf"]
 # The eBPF network fast path (PRD §9.1's substitutable backend): compiled in

@@ -311,7 +311,7 @@ and secure boot alike:
 
 Fast path note: `auto` never selects `sockmap`; it was measured slower than the
 userspace fabric and exists for explicit evaluation. Both kernel tiers need
-CAP_BPF and CAP_NET_ADMIN, and a daemon that cannot prove a tier works on its host
+CAP_BPF and CAP_NET_ADMIN on the `vmlab-fastpath` helper, and a daemon that cannot prove a tier works on its host
 falls back to userspace silently. `vmlab fastpath` reports the tier in use.
 
 ### The viewer
