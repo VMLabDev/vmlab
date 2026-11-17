@@ -93,7 +93,10 @@ pub(crate) struct Server<K: Kernel> {
     next: u32,
 }
 
-fn refused(reason: impl Into<String>) -> (Reply, Vec<OwnedFd>) {
+/// A reply and the descriptors riding it.
+type Answer = (Reply, Vec<OwnedFd>);
+
+fn refused(reason: impl Into<String>) -> Answer {
     (
         Reply::Refused {
             reason: reason.into(),
@@ -102,11 +105,11 @@ fn refused(reason: impl Into<String>) -> (Reply, Vec<OwnedFd>) {
     )
 }
 
-fn failed(reason: String) -> (Reply, Vec<OwnedFd>) {
+fn failed(reason: String) -> Answer {
     (Reply::Failed { reason }, Vec::new())
 }
 
-fn reply(reply: Reply) -> (Reply, Vec<OwnedFd>) {
+fn reply(reply: Reply) -> Answer {
     (reply, Vec::new())
 }
 
@@ -131,7 +134,7 @@ impl<K: Kernel> Server<K> {
 
     /// Answer one record. Never panics on input and never makes a kernel
     /// call for a request it refuses.
-    pub(crate) fn handle(&mut self, bytes: &[u8], fds: Vec<OwnedFd>) -> (Reply, Vec<OwnedFd>) {
+    pub(crate) fn handle(&mut self, bytes: &[u8], fds: Vec<OwnedFd>) -> Answer {
         let request: Request = match serde_json::from_slice(bytes) {
             Ok(request) => request,
             Err(error) => return refused(format!("not a fast-path request: {error}")),
@@ -146,14 +149,14 @@ impl<K: Kernel> Server<K> {
         self.dispatch(request, fds)
     }
 
-    fn insert(&mut self, slot: Slot<K>) -> (Reply, Vec<OwnedFd>) {
+    fn insert(&mut self, slot: Slot<K>) -> Answer {
         let engine = self.next;
         self.next = self.next.wrapping_add(1).max(1);
         self.slots.insert(engine, slot);
         reply(Reply::Engine { engine })
     }
 
-    fn xdp(&mut self, engine: u32) -> Result<(&mut K, &mut XdpSlot<K::Xdp>), (Reply, Vec<OwnedFd>)> {
+    fn xdp(&mut self, engine: u32) -> Result<(&mut K, &mut XdpSlot<K::Xdp>), Answer> {
         match self.slots.get_mut(&engine) {
             Some(Slot::Xdp(slot)) => Ok((&mut self.kernel, slot)),
             _ => Err(refused(format!("no xdp engine {engine} on this connection"))),
@@ -163,7 +166,7 @@ impl<K: Kernel> Server<K> {
     fn sockmap(
         &mut self,
         engine: u32,
-    ) -> Result<(&mut K, &mut K::Sockmap), (Reply, Vec<OwnedFd>)> {
+    ) -> Result<(&mut K, &mut K::Sockmap), Answer> {
         match self.slots.get_mut(&engine) {
             Some(Slot::Sockmap(slot)) => Ok((&mut self.kernel, slot)),
             _ => Err(refused(format!(
@@ -172,7 +175,7 @@ impl<K: Kernel> Server<K> {
         }
     }
 
-    fn dispatch(&mut self, request: Request, fds: Vec<OwnedFd>) -> (Reply, Vec<OwnedFd>) {
+    fn dispatch(&mut self, request: Request, fds: Vec<OwnedFd>) -> Answer {
         macro_rules! get {
             ($e:expr) => {
                 match $e {
@@ -562,7 +565,7 @@ mod tests {
         }
     }
 
-    fn ask(server: &mut Server<Fake>, request: &Request, fds: Vec<OwnedFd>) -> (Reply, Vec<OwnedFd>) {
+    fn ask(server: &mut Server<Fake>, request: &Request, fds: Vec<OwnedFd>) -> Answer {
         server.handle(&serde_json::to_vec(request).unwrap(), fds)
     }
 

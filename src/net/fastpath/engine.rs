@@ -17,7 +17,7 @@ const SOCKMAP_OBJ: &[u8] = include_bytes!("bpf/fastpath_sockmap.bpf.o");
 pub(super) const MAX_TAP_MTU: u32 = u16::MAX as u32 - 14;
 
 /// The loaded xdp_switch object for one segment: program and typed maps.
-pub(super) struct XdpEngine {
+pub(crate) struct XdpEngine {
     ebpf: aya::Ebpf,
     mac_table: BpfHashMap<MapData, [u8; 6], u32>,
     ports: DevMap<MapData>,
@@ -114,7 +114,7 @@ pub(super) fn socket_cookie(fd: BorrowedFd<'_>) -> Result<u64> {
 
 /// One loaded fastpath_sockmap object: programs attached, typed map handles
 /// taken.
-pub(super) struct SockmapEngine {
+pub(crate) struct SockmapEngine {
     /// Owns the loaded programs (and thus their attachments).
     _ebpf: aya::Ebpf,
     port_hash: SockHash<MapData, u64>,
