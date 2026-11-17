@@ -400,12 +400,9 @@ impl Fixture {
                 if let Some((bin, transport, args)) = &self.launch {
                     for mode in [ShutdownMode::Reboot, ShutdownMode::Halt] {
                         let fixture = Fixture::process(bin, transport, args.clone()).await?;
-                        let client = AgentHandle::connect_serial(
-                            &fixture.socket,
-                            BUDGET,
-                            tier == "legacy",
-                        )
-                        .await?;
+                        let client =
+                            AgentHandle::connect_serial(&fixture.socket, BUDGET, tier == "legacy")
+                                .await?;
                         client.shutdown_guest(mode, BUDGET).await?;
                         ensure(fixture.trace.lock().unwrap().ctrl.iter().any(|m|
                             matches!(m, AgentMsg::ShuttingDown { mode: actual } if *actual == mode)),
