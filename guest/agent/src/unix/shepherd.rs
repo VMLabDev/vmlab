@@ -193,11 +193,8 @@ fn release_stdio() {
 /// code without waiting for the rest of the tree.
 pub(super) fn spawn(mut plan: ExecPlan, tree: &str) -> std::io::Result<Spawned> {
     let (status_r, status_w) = pipe2(OFlag::O_CLOEXEC)?;
-    let mut argv = shepherd_argv();
-    argv.append(&mut plan.spec.argv);
-    plan.spec.argv = argv;
-    #[cfg(test)]
-    plan.spec.env.push((TEST_ENTRY_VAR.into(), "1".into()));
+    let command = std::mem::take(&mut plan.spec.argv);
+    plan.spec.argv = shepherd_argv(command, &mut plan.spec.env);
     let w = status_w.as_raw_fd();
     let spawned = spawn_piped_with(plan, |cmd| {
         // SAFETY: dup2/fcntl between fork and exec, both async-signal-safe.
@@ -264,18 +261,25 @@ pub(super) fn spawn(mut plan: ExecPlan, tree: &str) -> std::io::Result<Spawned> 
     })
 }
 
-/// This binary again, entered as the shepherd.
+/// This binary again, entered as the shepherd of `command`.
 #[cfg(not(test))]
-fn shepherd_argv() -> Vec<String> {
-    vec!["/proc/self/exe".into(), "--shepherd".into(), "--".into()]
+fn shepherd_argv(command: Vec<String>, _env: &mut Vec<(String, String)>) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["/proc/self/exe".into(), "--shepherd".into(), "--".into()];
+    argv.extend(command);
+    argv
 }
 
 /// The test binary again, entered through [`tests::shepherd_entry`]: a
-/// libtest binary has no `--shepherd` of its own. What libtest prints before
-/// the entry runs is not the command's output, so stdout waits on fd 4
-/// until the entry puts it back.
+/// libtest binary has no `--shepherd` of its own. The command travels in
+/// the environment, because libtest would take any argument for a test
+/// filter, and what it prints before the entry runs is set aside on fd 4
+/// rather than mixed into the command's output.
 #[cfg(test)]
-fn shepherd_argv() -> Vec<String> {
+fn shepherd_argv(command: Vec<String>, env: &mut Vec<(String, String)>) -> Vec<String> {
+    env.push((
+        TEST_ENTRY_VAR.into(),
+        serde_json::to_string(&command).expect("an argv serialises"),
+    ));
     let exe = std::env::current_exe().expect("the test binary's path");
     let mut argv: Vec<String> = ["/bin/sh", "-c", r#"exec 4>&1 >/dev/null; exec "$@""#, "sh"]
         .map(String::from)
@@ -287,14 +291,13 @@ fn shepherd_argv() -> Vec<String> {
             "--exact",
             "--nocapture",
             "-q",
-            "--",
         ]
         .map(String::from),
     );
     argv
 }
 
-/// Set in a test shepherd's environment, so the entry acts only there.
+/// The command a test shepherd runs, as JSON.
 #[cfg(test)]
 const TEST_ENTRY_VAR: &str = "VMLAB_AGENT_TEST_SHEPHERD";
 
@@ -460,19 +463,24 @@ mod tests {
     /// [`shepherd_argv`]). Run as an ordinary test it does nothing.
     #[test]
     fn shepherd_entry() {
-        if std::env::var_os(TEST_ENTRY_VAR).is_none() {
-            return;
-        }
-        let args: Vec<String> = std::env::args().collect();
-        let Some(at) = args.iter().position(|a| a == "--") else {
+        let Some(command) = std::env::var(TEST_ENTRY_VAR)
+            .ok()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        else {
             return;
         };
+        // The command must not see itself as a shepherd's.
+        // SAFETY: the process is about to become the shepherd; no other
+        // thread of this test binary reads the environment.
+        unsafe { std::env::remove_var(TEST_ENTRY_VAR) };
         // SAFETY: restoring the stdout `shepherd_argv` set aside on fd 4.
         unsafe {
             libc::dup2(4, 1);
             libc::close(4);
         }
-        main(&args[at..]);
+        let mut args = vec!["--".to_string()];
+        args.extend(command);
+        main(&args);
     }
 
     #[test]
