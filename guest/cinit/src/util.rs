@@ -142,7 +142,8 @@ pub fn write_in_root(root: &str, path: &str, contents: &str) -> Result<()> {
         return Err(format!("{path}: not a regular file"));
     }
     file.set_len(0).ctx(&format!("truncate {path}"))?;
-    file.write_all(contents.as_bytes()).ctx(&format!("write {path}"))
+    file.write_all(contents.as_bytes())
+        .ctx(&format!("write {path}"))
 }
 
 #[cfg(test)]
@@ -182,7 +183,10 @@ mod tests {
         assert_eq!(read("etc/../../etc/./sentinel"), "inner", "relative path");
         assert_eq!(in_root(&root, "/").unwrap(), r);
         // A missing component is taken as named, inside the root.
-        assert_eq!(in_root(&root, "/etcdir/new/file").unwrap(), r.join("etc/new/file"));
+        assert_eq!(
+            in_root(&root, "/etcdir/new/file").unwrap(),
+            r.join("etc/new/file")
+        );
     }
 
     #[test]
@@ -210,7 +214,10 @@ mod tests {
         assert!(!dir.path().join("run/resolv.conf").exists());
         // Rewriting truncates.
         write_in_root(&root, "/etc/resolv.conf", "x\n").unwrap();
-        assert_eq!(fs::read_to_string(r.join("run/resolv.conf")).unwrap(), "x\n");
+        assert_eq!(
+            fs::read_to_string(r.join("run/resolv.conf")).unwrap(),
+            "x\n"
+        );
         // A link onto a directory is refused, not written through.
         symlink("/run", r.join("etc/hosts")).unwrap();
         assert!(write_in_root(&root, "/etc/hosts", "x").is_err());

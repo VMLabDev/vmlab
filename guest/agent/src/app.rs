@@ -944,7 +944,10 @@ mod parking {
             .map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
-                    format!("{}: not a directory the agent trusts: {e}", x11_unix.display()),
+                    format!(
+                        "{}: not a directory the agent trusts: {e}",
+                        x11_unix.display()
+                    ),
                 )
             })?;
         let meta = dir.metadata()?;

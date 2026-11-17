@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
-use super::vm_agent::{AgentHandle, SessionEvent};
 use super::vm_agent::conformance::Fixture;
+use super::vm_agent::{AgentHandle, SessionEvent};
 
 const BUDGET: Duration = Duration::from_secs(12);
 

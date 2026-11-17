@@ -261,7 +261,9 @@ mod tests {
     fn a_clipboard_tool_is_read_no_further_than_the_cap() {
         let mut over = std::process::Command::new("/bin/sh");
         over.args(["-c", "head -c 200000 /dev/zero"]);
-        let err = tool_output(&mut over).err().expect("past the cap is refused");
+        let err = tool_output(&mut over)
+            .err()
+            .expect("past the cap is refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 
         let mut under = std::process::Command::new("/bin/sh");

@@ -30,9 +30,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
     FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileAttributesW,
-    INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, ReadDirectoryChangesW,
+    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
+    ReadDirectoryChangesW,
 };
 use windows_sys::Win32::System::IO::CancelIoEx;
 
@@ -143,9 +143,8 @@ fn run(watch: Arc<Watch>, dir: Arc<Dir>, mut dirs: Inventory) {
         }
         // SAFETY: a u32 slice viewed as its bytes; every offset in the
         // chain is checked against `returned` (code review F60).
-        let bytes = unsafe {
-            std::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len() * 4) };
         for (action, name) in super::records::parse(bytes, returned as usize) {
             handle(&watch, &mut dirs, action, name);
         }
@@ -243,4 +242,3 @@ impl Inventory {
         known
     }
 }
-

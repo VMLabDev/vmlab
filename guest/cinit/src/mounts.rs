@@ -194,9 +194,27 @@ pub fn mount_volume(
 /// symlink such as `/tmp -> /` cannot put a mount on the micro-VM's own tree.
 pub fn mount_rootfs_runtime() -> Result<()> {
     rootfs_dir("/etc")?;
-    do_mount("proc", &rootfs_dir("/proc")?, "proc", MsFlags::empty(), None)?;
-    do_mount("sysfs", &rootfs_dir("/sys")?, "sysfs", MsFlags::empty(), None)?;
-    do_mount("devtmpfs", &rootfs_dir("/dev")?, "devtmpfs", MsFlags::empty(), None)?;
+    do_mount(
+        "proc",
+        &rootfs_dir("/proc")?,
+        "proc",
+        MsFlags::empty(),
+        None,
+    )?;
+    do_mount(
+        "sysfs",
+        &rootfs_dir("/sys")?,
+        "sysfs",
+        MsFlags::empty(),
+        None,
+    )?;
+    do_mount(
+        "devtmpfs",
+        &rootfs_dir("/dev")?,
+        "devtmpfs",
+        MsFlags::empty(),
+        None,
+    )?;
     do_mount(
         "devpts",
         &rootfs_dir("/dev/pts")?,
@@ -268,7 +286,10 @@ pub fn write_identity(hostname: &str) -> Result<()> {
     nix::unistd::sethostname(hostname).ctx("sethostname")?;
     let files = [
         ("/etc/hostname", format!("{hostname}\n")),
-        ("/etc/hosts", format!("127.0.0.1\tlocalhost\n127.0.1.1\t{hostname}\n")),
+        (
+            "/etc/hosts",
+            format!("127.0.0.1\tlocalhost\n127.0.1.1\t{hostname}\n"),
+        ),
     ];
     for (path, contents) in &files {
         if let Err(e) = write_in_root(ROOTFS, path, contents) {
