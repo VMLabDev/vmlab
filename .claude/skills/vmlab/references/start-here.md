@@ -36,19 +36,22 @@ or set `VMLAB_VERSION`. To install somewhere other than `~/.local/bin`, pass
 your `PATH`, the installer prints the `export` line to add.
 
 The network fabric needs no privilege. Its optional eBPF fast path needs
-`CAP_BPF` and `CAP_NET_ADMIN`. Installed as an ordinary user from a terminal,
-the installer asks whether to grant the binary those two capabilities, and on
-yes runs `sudo setcap cap_bpf,cap_net_admin+ep` on it; any program running as
-the user can then use them through vmlab. `--fastpath` grants them without
+`CAP_BPF` and `CAP_NET_ADMIN`, and only one small helper holds them:
+`vmlab-fastpath`, which the installer puts beside `vmlab`. Each daemon that
+selects a kernel tier starts its own helper and asks it to create taps and to
+load, attach and update vmlab's own XDP and sockmap programs; the helper
+refuses every other request and exits with its daemon. The `vmlab` binary never
+gets a capability. Installed as an ordinary user from a terminal, the installer
+asks whether to grant the helper those two capabilities, and on yes runs `sudo
+setcap cap_bpf,cap_net_admin+ep` on it; any program running as the user can
+then start the helper and make those requests. `--fastpath` grants them without
 asking, `--no-fastpath` never offers, and `VMLAB_FASTPATH_CAPS=yes|no|ask` sets
 the same choice. With no terminal to ask on, the installer prints the `setcap`
-command instead. It offers nothing when run as root, whose daemons hold every
-capability already, or on WSL 2, which cannot run the fast path, and it says so
-when the binary sits on a `nosuid` mount, where the kernel ignores file
-capabilities. Replacing the binary drops its capabilities, so every install
-asks again, defaulting to yes when the binary it replaced had them. Daemons
-already running keep the privileges they started with: run `vmlab daemon stop`
-before `vmlab fastpath`.
+command instead. It offers nothing when run as root, or on WSL 2, which cannot
+run the fast path, and it says so when the helper sits on a `nosuid` mount,
+where the kernel ignores file capabilities. Replacing the helper drops its
+capabilities, so every install asks again. Daemons already running keep the
+helpers they started: run `vmlab daemon stop` before `vmlab fastpath`.
 
 ### Build from source instead
 
