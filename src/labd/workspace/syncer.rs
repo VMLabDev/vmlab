@@ -1000,7 +1000,8 @@ async fn run(
             // so ([`Report::unanswered`]): its unreported writes are unknown,
             // and a capture must refuse rather than leave them out.
             let mut unanswered = None;
-            if serving > *syncer.served.borrow() {
+            let flush = serving > *syncer.served.borrow();
+            if flush {
                 let mut answered = true;
                 for round in 0..2 {
                     if round == 1 {
@@ -1068,7 +1069,7 @@ async fn run(
                         .cloned()
                         .collect(),
                     rescan,
-                    flush: serving > *syncer.served.borrow(),
+                    flush,
                     lock_candidates: &lock_candidates,
                     resolved: &resolutions,
                     marker: marker.clone(),
