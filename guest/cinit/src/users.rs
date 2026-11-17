@@ -2,9 +2,7 @@
 //! the container's /etc/passwd and /etc/group. Pure string parsing, so it is
 //! fully unit-testable on the host.
 
-use std::fs;
-
-use crate::util::Result;
+use crate::util::{Result, read_in_root};
 
 /// A resolved container identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,10 +108,11 @@ pub fn resolve_user(spec: &str, passwd: &str, group: &str) -> Result<ResolvedUse
 }
 
 /// [`resolve_user`] against the container rootfs's passwd/group files.
-/// Missing files are treated as empty (numeric specs still work).
+/// Missing files are treated as empty (numeric specs still work). Both are
+/// the image's, read through the in-root walk (F56).
 pub fn resolve_user_in_rootfs(spec: &str, rootfs: &str) -> Result<ResolvedUser> {
-    let passwd = fs::read_to_string(format!("{rootfs}/etc/passwd")).unwrap_or_default();
-    let group = fs::read_to_string(format!("{rootfs}/etc/group")).unwrap_or_default();
+    let passwd = read_in_root(rootfs, "/etc/passwd").unwrap_or_default();
+    let group = read_in_root(rootfs, "/etc/group").unwrap_or_default();
     resolve_user(spec, &passwd, &group)
 }
 
