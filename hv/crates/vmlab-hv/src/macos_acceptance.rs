@@ -290,7 +290,7 @@ impl Launched {
 
 fn launch_macos(path: &Path, template: &Path, firmware: &Path, key: &str) -> Launched {
     let disk = path.join("disk.qcow2");
-    vmlab_disk::ops::create_linked_clone(&template, &disk).unwrap();
+    vmlab_disk::ops::create_linked_clone(template, &disk).unwrap();
     let vars = path.join("vars.fd");
     std::fs::copy(firmware.join("OVMF_VARS_4M.fd"), &vars).unwrap();
     let socket = path.join("control.sock");
