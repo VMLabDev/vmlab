@@ -2635,7 +2635,7 @@ mod tests {
 
     const HANDSHAKE: Duration = Duration::from_secs(5);
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn legacy_open_survives_slow_uart_but_modern_open_stays_bounded() {
         for legacy in [false, true] {
             let (_dir, path) = mock_agent(true).await;
