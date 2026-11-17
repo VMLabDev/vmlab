@@ -1698,8 +1698,7 @@ async fn pass(
         // paths in the debounce set. A walk finds their current contents,
         // but cannot prove they have stopped changing. Leave them owed so
         // this flush (and therefore capture) cannot declare them in step.
-        undecided.extend(rehash_guest.iter().cloned());
-        undecided.extend(
+        rehash_guest.extend(
             ledger
                 .entries
                 .keys()
@@ -1707,6 +1706,7 @@ async fn pass(
                 .filter(|path| !ignores.verdict(path, false).is_guest_owned())
                 .cloned(),
         );
+        undecided.extend(rehash_guest.iter().cloned());
     }
     let skipped: Vec<Skip> = scan
         .skipped
