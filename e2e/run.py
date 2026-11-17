@@ -37,6 +37,7 @@ SCENARIOS = [
     "sleep",
     "guest",
     "legacy",
+    "macos",
     "network",
     "containers",
     "snapshots",
@@ -119,7 +120,7 @@ def main() -> int:
     write_host_config(h)
     registry = start_registry()
     try:
-        if "template" not in runnable and any(n != "legacy" for n in runnable):
+        if "template" not in runnable and any(n not in ("legacy", "macos") for n in runnable):
             # Every other scenario boots the e2e template; build it without
             # reporting on it.
             h.scenario = "base"

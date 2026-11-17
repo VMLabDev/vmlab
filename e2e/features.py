@@ -215,6 +215,7 @@ FEATURES: dict[str, str] = {
     "vm.legacy.windows98": "Windows 98 SE: agent, exec, disk roundtrip, display and stop",
     "vm.legacy.windows7": "Windows 7 7600.0.1: agent, exec, disk roundtrip, display and stop",
     "vm.legacy.templeos": "TempleOS: HolyC agent, exec, disk roundtrip, display and stop",
+    "vm.macos": "macOS Tahoe on the `macos` profile: the selected hypervisor, agent, exec, display and stop",
 }
 
 # -- hypervisor scope (PRD §22) --------------------------------------------
@@ -295,7 +296,8 @@ _GROUPS: dict[str, list[str]] = {
     ],
     "2d": ["vm.hw.gpu"],
     "2e": ["share.virtiofs", "share.readonly", "share.unmountable", "vm.hw.audio"],
-    "2f": ["usb.controller", "usb.refusals", "usb.attach", "vm.hw.tsc"],
+    # macOS is a phase of its own after 2 (PRD §22), delivered with 2f.
+    "2f": ["usb.controller", "usb.refusals", "usb.attach", "vm.hw.tsc", "vm.macos"],
     # TCG emulation.
     "3": ["arch.emulated"],
     # The legacy PC: floppy controller, SMB1 guests.
