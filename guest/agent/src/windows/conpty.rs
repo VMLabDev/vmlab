@@ -309,6 +309,9 @@ pub fn process_killer(pid: u32) -> Box<dyn Fn() + Send + Sync> {
     // SAFETY: plain OpenProcess; a null handle is checked before use.
     let process = Owned(unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) });
     Box::new(move || {
+        // The whole `Owned` is captured, not its raw field, which would
+        // be neither `Send` nor `Sync`.
+        let process = &process;
         if !process.0.is_null() {
             // SAFETY: a process handle we hold open.
             unsafe { TerminateProcess(process.0, 137) };
