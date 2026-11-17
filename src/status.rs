@@ -399,6 +399,9 @@ pub struct WorkspaceSyncStatus {
     /// answers to the same pause: a rescan means vmlab does not know what the
     /// guest did, a re-seed means it knows exactly, because it did it.
     pub reseed: Option<String>,
+    /// The guest's watch did not answer a flush, so its unreported writes
+    /// are unknown to the host and snapshot capture refuses.
+    pub unanswered: Option<String>,
     /// How many watch discontinuities this syncer has answered with a walk.
     /// Repeated ones are the symptom a single lost event is not.
     pub rescans: u64,
@@ -950,6 +953,7 @@ pub(crate) mod fixtures {
                     volume: None,
                     rescan: None,
                     reseed: None,
+                    unanswered: None,
                     rescans: 0,
                     skipped: Vec::new(),
                     deferred: Vec::new(),
