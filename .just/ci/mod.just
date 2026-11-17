@@ -202,5 +202,5 @@ agent_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + qu
 hv_virgl_key := `python3 build/hv.py cache-key | cut -d= -f2`
 
 # Test threads for hv-gate: the caller's RUST_TEST_THREADS, else 2. VMLAB_HV_TEST_VM_LIMIT
-# passes through to vmlab-hv-tests, which defaults it to 4.
+# passes through to vmlab-hv-tests, which defaults it to 2 own test VMs.
 hv_gate_test_threads := env('RUST_TEST_THREADS', '2')
