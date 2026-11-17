@@ -160,6 +160,10 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an `open_*` waits for the agent's `opened`.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The polling C agent runs over a baud-limited ISA UART. Under host load
+/// DOS/9x can take longer than the modern agent to service an open.
+const LEGACY_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct Inner {
     /// The connection's runtime, so cleanup can be spawned from any thread
     /// (scripts drop sessions on non-runtime threads).
@@ -553,8 +557,21 @@ impl AgentHandle {
             session.forget().await;
             return Err(e);
         }
-        match tokio::time::timeout(OPEN_TIMEOUT, opened_rx).await {
-            Ok(Ok(Ok(()))) => Ok(session),
+        let timeout = if self.info().agent_version.starts_with("agent-legacy=") {
+            LEGACY_OPEN_TIMEOUT
+        } else {
+            OPEN_TIMEOUT
+        };
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(timeout, opened_rx).await {
+            Ok(Ok(Ok(()))) => {
+                tracing::info!(
+                    channel = id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "agent channel opened"
+                );
+                Ok(session)
+            }
             Ok(Ok(Err(refusal))) => {
                 session.forget().await;
                 Err(anyhow!("{refusal}"))
@@ -2618,6 +2635,31 @@ mod tests {
 
     const HANDSHAKE: Duration = Duration::from_secs(5);
 
+    #[tokio::test(start_paused = true)]
+    async fn legacy_open_survives_slow_uart_but_modern_open_stays_bounded() {
+        for legacy in [false, true] {
+            let (_dir, path) = mock_agent(true).await;
+            let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+            if legacy {
+                let mut info = handle.info();
+                info.agent_version = "agent-legacy=test".into();
+                handle.inner.hello.send_replace(Some(info));
+            }
+            let before = tokio::time::Instant::now();
+            let result = handle
+                .open_exec(vec!["mock:slow-open".into()], vec![], None, None)
+                .await;
+            if legacy {
+                assert!(result.is_ok());
+                assert!(before.elapsed() >= Duration::from_secs(20));
+            } else {
+                assert!(result.is_err());
+                assert!(before.elapsed() >= OPEN_TIMEOUT);
+                assert!(before.elapsed() < Duration::from_secs(20));
+            }
+        }
+    }
+
     /// A minimal in-process agent speaking the real frame protocol over a
     /// unix socket, mirroring what `guest/agent` does: echo terminals,
     /// canned exec output, in-memory file store.
@@ -2760,6 +2802,9 @@ mod tests {
                                     tree,
                                     ..
                                 } => {
+                                    if argv.first().is_some_and(|s| s == "mock:slow-open") {
+                                        tokio::time::sleep(Duration::from_secs(20)).await;
+                                    }
                                     send(AgentMsg::Opened { id }).await;
                                     // Echo who the open said to run as, so a
                                     // test can assert the identity actually
