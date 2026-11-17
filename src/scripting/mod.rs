@@ -1900,6 +1900,14 @@ fn main(lab: Lab) {
 mod example_tests {
     use super::check_script_source;
 
+    #[test]
+    fn parallel_provision_fixture_compiles() {
+        check_script_source(include_str!(
+            "../../e2e/labs/core-lab/scripts/parallel.ws"
+        ))
+        .unwrap();
+    }
+
     /// Every shipped example script (provision + handler, all labs and
     /// templates) must type-check against the host module (keeps docs
     /// honest).

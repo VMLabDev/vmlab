@@ -11,7 +11,7 @@ fn stamp(lab: Lab) -> Result[unit, string] {
         let dir = "BARRIER_DIR"
         fs::write(dir + "/" + name, "arrived")?
         let peer = if name == "vm02" { "vm03" } else { "vm02" }
-        let mut attempts = 0
+        let attempts = 0
         while !fs::exists(dir + "/" + peer) {
             if attempts >= 1200 {
                 return Err("parallel provision timed out waiting for " + peer)
