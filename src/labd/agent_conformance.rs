@@ -272,7 +272,7 @@ impl Fixture {
     }
 
     pub(in crate::labd) async fn run(&self, tier: &str, root: Option<String>) -> Result<()> {
-        let handle = AgentHandle::connect(&self.socket, BUDGET).await?;
+        let handle = AgentHandle::connect_serial(&self.socket, BUDGET, tier == "legacy").await?;
         let root = root.unwrap_or_else(|| self.dir.path().to_string_lossy().into_owned());
         let mut report = Report::default();
         macro_rules! check {
@@ -400,7 +400,12 @@ impl Fixture {
                 if let Some((bin, transport, args)) = &self.launch {
                     for mode in [ShutdownMode::Reboot, ShutdownMode::Halt] {
                         let fixture = Fixture::process(bin, transport, args.clone()).await?;
-                        let client = AgentHandle::connect(&fixture.socket, BUDGET).await?;
+                        let client = AgentHandle::connect_serial(
+                            &fixture.socket,
+                            BUDGET,
+                            tier == "legacy",
+                        )
+                        .await?;
                         client.shutdown_guest(mode, BUDGET).await?;
                         ensure(fixture.trace.lock().unwrap().ctrl.iter().any(|m|
                             matches!(m, AgentMsg::ShuttingDown { mode: actual } if *actual == mode)),
