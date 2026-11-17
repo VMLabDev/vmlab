@@ -50,7 +50,7 @@ stage() {
     # dxsdk-2.zip: the first version (dxsdk.zip) had no Developer Runtime.
     if [ ! -f "$STAGE/dxsdk-2.zip" ]; then
         note "unpacking the DirectX SDK's samples, media, redistributable and developer runtime"
-        [ -n "$STAGE" ] && [ "$STAGE" != / ] || { echo "VML-88: STAGE is empty or /" >&2; exit 1; }
+        [ -n "$STAGE" ] && [ "$STAGE" != / ] || { echo "VML-88: STAGE is empty or /" >&2; return 1; }
         rm -rf "$STAGE/dxsdk"
         7z x -y -o"$STAGE/dxsdk" "$sdk" "DXSDK/Redist/*" "DXSDK/Samples/Media/*" \
             "DXSDK/Samples/C++/Direct3D/*" "DXSDK/Samples/C++/Direct3D11/*" \

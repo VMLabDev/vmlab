@@ -163,6 +163,16 @@ class ShellPathsTest(unittest.TestCase):
     def test_assignment_in_the_same_line_before_the_use(self):
         self.assertEqual(len(self._p1('d=$(ls -d a* | head -1); cp -a "$d"/. x\n')), 1)
 
+    def test_glob_without_slash_needs_a_guard(self):
+        for arg in ('"$d"*', '"${d}"*', '"$d"?', '"$d"[ab]'):
+            self.assertEqual(len(self._p1(f'rm -rf {arg}\n')), 1, arg)
+            self.assertEqual(self._p1(f'[ -n "$d" ] || exit 1\nrm -rf {arg}\n'), [], arg)
+
+    def test_required_parameter_assignment_guards_destination(self):
+        for assignment in ('d=${1:?}', 'local d=${1:?missing path}', 'export d=${src:?}'):
+            self.assertEqual(self._p1(f'{assignment}\nrm -rf "$d"/*\n'), [], assignment)
+            self.assertEqual(len(self._p1(f'{assignment}\nd=$2\nrm -rf "$d"/*\n')), 1)
+
     def test_value_that_cannot_be_empty_or_root_is_safe(self):
         for value in ("/Library/x", "$work/src/$name", "${VMLAB_BIN_DIR:-$HOME/.local/bin}", "out"):
             self.assertEqual(self._p1(f'd={value}\nrm -rf "$d"/*\n'), [], value)
