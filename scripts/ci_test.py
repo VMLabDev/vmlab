@@ -33,7 +33,8 @@ def main():
     env[runner_key] = shlex.join([sys.executable, str(Path(__file__).resolve()), "--run"])
     # Keep the runner out of rustdoc as well. Cargo otherwise passes it as
     # --test-runtool, which breaks dependency loading on the pinned toolchain.
-    targets = [] if "--lib" in args else ["--lib", "--bins", "--tests"]
+    selected = "--lib" in args or "--bins" in args
+    targets = [] if selected else ["--tests"]
     command = ["cargo", "test", *args, *targets, *harness]
     with result.open("w") as output:
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
@@ -42,7 +43,7 @@ def main():
                 output.write(line)
                 print(line, end="", flush=True)
             status = process.wait()
-    if status == 0 and "--no-run" not in args and not harness and "--lib" not in args:
+    if status == 0 and "--no-run" not in args and not harness and not selected:
         status = subprocess.run(["cargo", "test", *args, "--doc"],
                                 env=os.environ.copy()).returncode
     print(f"Test results ({name}, exit {status}): {result}", flush=True)
