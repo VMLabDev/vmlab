@@ -723,8 +723,8 @@ mod tests {
     // Ported from fuse-backend-rs 0.14.0, src/transport/mod.rs.
     #[test]
     fn test_io_buffers() {
-        let mut buf1 = vec![0x0u8; 16];
-        let mut buf2 = vec![0x0u8; 16];
+        let mut buf1 = [0x0u8; 16];
+        let mut buf2 = [0x0u8; 16];
         let mut buffers = io_buffers(vec![&mut buf1[..], &mut buf2[..]]);
 
         assert_eq!(buffers.available_bytes(), 32);
