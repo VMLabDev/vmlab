@@ -1902,10 +1902,7 @@ mod example_tests {
 
     #[test]
     fn parallel_provision_fixture_compiles() {
-        check_script_source(include_str!(
-            "../../e2e/labs/core-lab/scripts/parallel.ws"
-        ))
-        .unwrap();
+        check_script_source(include_str!("../../e2e/labs/core-lab/scripts/parallel.ws")).unwrap();
     }
 
     /// Every shipped example script (provision + handler, all labs and
