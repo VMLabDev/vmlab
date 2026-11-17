@@ -432,8 +432,13 @@ impl ContainerInstance {
         })
     }
 
-    pub(super) fn with_hypervisor_fallback(mut self: Arc<Self>, reason: Option<String>) -> Arc<Self> {
-        Arc::get_mut(&mut self).expect("new container is unshared").hypervisor_fallback = reason;
+    pub(super) fn with_hypervisor_fallback(
+        mut self: Arc<Self>,
+        reason: Option<String>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("new container is unshared")
+            .hypervisor_fallback = reason;
         self
     }
 
@@ -761,7 +766,11 @@ impl ContainerInstance {
             let vfs_devices = self.start_virtiofsds().await?;
 
             let asset = self.hv.guest_asset(&self.resolved.arch)?;
-            anyhow::ensure!(crate::qemu::kvm_available(), "{}: KVM is required for containers", self.cfg.name);
+            anyhow::ensure!(
+                crate::qemu::kvm_available(),
+                "{}: KVM is required for containers",
+                self.cfg.name
+            );
             let machine = super::hypervisor::Launch::Container {
                 lab: self.lab.clone(),
                 resolved: Box::new(self.resolved.clone()),

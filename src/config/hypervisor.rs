@@ -629,15 +629,47 @@ mod tests {
         assert_eq!(picked.kind, HypervisorKind::Vmlab);
         assert!(picked.fallback_reason.is_none());
         for kind in [HypervisorKind::Qemu, HypervisorKind::Vmlab] {
-            assert_eq!(defaults.select(machine, &kvm_host(), None, Some(kind)).kind, kind);
-            let host = HypervisorDefaults { container: Some(kind), ..defaults };
-            assert_eq!(host.select(machine, &kvm_host(), None, Some(HypervisorKind::Vmlab)).kind, kind);
+            assert_eq!(
+                defaults.select(machine, &kvm_host(), None, Some(kind)).kind,
+                kind
+            );
+            let host = HypervisorDefaults {
+                container: Some(kind),
+                ..defaults
+            };
+            assert_eq!(
+                host.select(machine, &kvm_host(), None, Some(HypervisorKind::Vmlab))
+                    .kind,
+                kind
+            );
         }
-        assert_eq!(defaults.select(file.lab.machine("q").unwrap(), &kvm_host(), None, Some(HypervisorKind::Vmlab)).kind, HypervisorKind::Qemu);
-        for host in [HostFacts { kvm: false, ..kvm_host() }, HostFacts { arch: "aarch64".into(), ..kvm_host() }] {
+        assert_eq!(
+            defaults
+                .select(
+                    file.lab.machine("q").unwrap(),
+                    &kvm_host(),
+                    None,
+                    Some(HypervisorKind::Vmlab)
+                )
+                .kind,
+            HypervisorKind::Qemu
+        );
+        for host in [
+            HostFacts {
+                kvm: false,
+                ..kvm_host()
+            },
+            HostFacts {
+                arch: "aarch64".into(),
+                ..kvm_host()
+            },
+        ] {
             let picked = defaults.select(machine, &host, None, None);
             assert_eq!(picked.kind, HypervisorKind::Qemu);
-            assert_eq!(picked.fallback_reason, Some(vmlab_refusals(machine, &host, None).join("; ")));
+            assert_eq!(
+                picked.fallback_reason,
+                Some(vmlab_refusals(machine, &host, None).join("; "))
+            );
         }
     }
 

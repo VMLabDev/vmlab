@@ -357,8 +357,7 @@ pub(super) fn build_container(
     // layer sizes.
     let resolved = crate::qemu::resolve_container(c_cfg, arch, cx.profiles)?;
     let existing = c_state.existing_hypervisor(&dirs.local).or_else(|| {
-        (dirs.scratch_disk().exists() || dirs.qmp_sock().exists())
-            .then_some(HypervisorKind::Qemu)
+        (dirs.scratch_disk().exists() || dirs.qmp_sock().exists()).then_some(HypervisorKind::Qemu)
     });
     let selection = cx.host.hypervisor.select(
         MachineCfg::Container(c_cfg),
@@ -380,7 +379,10 @@ pub(super) fn build_container(
         hypervisor,
         super::hypervisor::for_machine(hypervisor, cx.host, false),
     );
-    Ok((container.with_hypervisor_fallback(selection.fallback_reason), pending))
+    Ok((
+        container.with_hypervisor_fallback(selection.fallback_reason),
+        pending,
+    ))
 }
 
 /// The hypervisor `machine` runs on (§22), refusing — in validation's words,
