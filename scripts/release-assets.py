@@ -15,6 +15,7 @@ def prepare(directory, version):
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?', version):
         raise ValueError('invalid release version')
     names = [f'vmlab-{version}-linux-x86_64',
+             f'vmlab-fastpath-{version}-linux-x86_64',
              f'vmlab-guest-{version}.tar.gz',
              f'vmlab-hv-{version}-linux-x86_64.tar.gz']
     subjects = []

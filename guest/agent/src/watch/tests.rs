@@ -364,7 +364,20 @@ fn a_directory_moved_away_collapses_to_a_rescan() {
 
     std::fs::rename(dir.path().join("old"), away.path().join("moved")).unwrap();
     assert_eq!(watcher.record().unwrap(), WatchRecord::Dirty);
-    assert_eq!(watcher.drain(&mux), WatchRecord::Rescan);
+    // Dirty only acknowledges the first mark. The backend can still be
+    // removing the subtree's watches before it records the lost coverage,
+    // so a drain may legitimately get the directory tombstone first. The
+    // Rescan response itself synchronizes us with that completed work.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match watcher.drain(&mux) {
+            WatchRecord::Rescan => break,
+            WatchRecord::Batch { .. } => {}
+            other => panic!("expected a batch or rescan, got {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "directory move never rescanned");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // The window resets: the next drain is an ordinary batch again.
     assert!(matches!(watcher.drain(&mux), WatchRecord::Batch { .. }));
 }

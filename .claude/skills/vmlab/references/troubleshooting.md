@@ -434,7 +434,9 @@ network fast path: userspace (mode auto)
 
 | Reason | Fix |
 | --- | --- |
-| `… — run the vmlab daemons with CAP_BPF + CAP_NET_ADMIN to enable` | Grant both capabilities to the daemon binaries, or run them where they hold them. |
+| `… — grant the vmlab-fastpath helper CAP_BPF + CAP_NET_ADMIN to enable …` | Grant both capabilities to the helper beside `vmlab` (`install.sh --fastpath`, or `sudo setcap cap_bpf,cap_net_admin+ep` on it), then restart the daemons. The `vmlab` binary itself needs none. |
+| `the fast-path helper {path} is not installed (vmlab looks for it beside its own binary)` | Install `vmlab-fastpath` beside `vmlab`; `install.sh` does, and `cargo build` puts it in the same target directory. `VMLAB_FASTPATH_HELPER` names another path. |
+| `creating a tap needs CAP_NET_ADMIN on the vmlab-fastpath helper. …` | Grant the helper its capabilities; in a container, add `--cap-add NET_ADMIN --cap-add BPF`. |
 | ``the tun driver is not loaded. Run `modprobe tun` on the host (not inside the container) and restart vmlab`` | As it says. If the kernel was upgraded in place, the longer variant of this message tells you to reboot first. |
 | `/dev/net/tun is missing. In a container, pass `--device /dev/net/tun`; …` | Expose the device to the container that runs the daemons. |
 | ``ignoring VMLAB_FASTPATH=`{value}` (want auto\|off\|sockmap\|afxdp)`` | The environment override is misspelled. The `fastpath` field of the host configuration takes the same four values. |

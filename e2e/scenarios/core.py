@@ -214,10 +214,12 @@ def run(h):
 
 
 def unmountable(h):
-    """`up` waits for the share mounts and names the one that cannot mount,
+    """`up --wait` waits for the share mounts and names the one that cannot mount,
     with the guest's own error, before `is up` — and still exits 0."""
     with h.lab("core-unmountable") as lab:
-        up = h.vmlab("up", cwd=lab, timeout=300, check=False)
+        # Plain `up` bounds its share-report wait and may return while the
+        # guest is still booting. Wait for readiness before testing mounts.
+        up = h.vmlab("up", "--wait", cwd=lab, timeout=300, check=False)
         lines = up.out.splitlines()
         warn = next((i for i, l in enumerate(lines) if l.startswith('WARNING: "um": share "blocked"')), None)
         is_up = next((i for i, l in enumerate(lines) if 'lab "e2e-core-unmountable" is up' in l), None)

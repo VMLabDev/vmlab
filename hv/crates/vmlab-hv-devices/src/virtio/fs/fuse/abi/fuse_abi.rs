@@ -748,10 +748,14 @@ pub enum Opcode {
 
 impl From<u32> for Opcode {
     fn from(op: u32) -> Opcode {
-        if op >= Opcode::MaxOpcode as u32 {
+        // The discriminants below `MaxOpcode` have gaps (0, 7, 19), and a
+        // guest chooses `op`: those values must not reach the transmute.
+        if op >= Opcode::MaxOpcode as u32 || matches!(op, 0 | 7 | 19) {
             return Opcode::MaxOpcode;
         }
-        unsafe { mem::transmute(op) }
+        // SAFETY: `op` is below `MaxOpcode` and not one of the gaps, so it
+        // is the discriminant of a variant of this `repr(u32)` enum.
+        unsafe { mem::transmute::<u32, Opcode>(op) }
     }
 }
 
@@ -1334,6 +1338,17 @@ unsafe impl ByteValued for CopyFileRangeIn {}
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn opcode_gaps_map_to_max_opcode() {
+        for op in [0, 7, 19, 50, 51, u32::MAX] {
+            assert!(matches!(Opcode::from(op), Opcode::MaxOpcode), "{op}");
+        }
+        assert!(matches!(Opcode::from(1), Opcode::Lookup));
+        assert!(matches!(Opcode::from(8), Opcode::Mknod));
+        assert!(matches!(Opcode::from(20), Opcode::Fsync));
+        assert!(matches!(Opcode::from(49), Opcode::RemoveMapping));
+    }
 
     #[test]
     fn test_struct_size() {

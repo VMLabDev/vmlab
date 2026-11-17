@@ -42,8 +42,9 @@ RUN --mount=type=cache,target=/var/cache/vmlab-build/cargo \
     # judges freshness by mtime: stamp this checkout's sources as newest so a
     # build never ships another checkout's binary.
     find src guest hv -type f -exec touch {} +; \
-    cargo build --release --locked --bin vmlab; \
+    cargo build --release --locked --bin vmlab --bin vmlab-fastpath; \
     install -D target/release/vmlab /out/vmlab; \
+    install -D target/release/vmlab-fastpath /out/vmlab-fastpath; \
     VMLAB_SKIP_FIRMWARE=1 ./guest/build-asset.sh x86_64; \
     test ! -e guest/dist/firmware; \
     ./guest/build-agent.sh linux-x86_64; \
@@ -94,6 +95,8 @@ RUN set -eux; \
     rm -rf "$deb" /tmp/virtiofsd-old
 COPY --from=registry /bin/registry /usr/local/bin/registry
 COPY --from=build /out/vmlab /usr/local/bin/vmlab
+# The fast path's privileged helper, found beside vmlab (F21).
+COPY --from=build /out/vmlab-fastpath /usr/local/bin/vmlab-fastpath
 COPY --from=build /out/vmlab-hv /usr/local/bin/vmlab-hv
 COPY --from=build /opt/virgl /opt/virgl
 COPY --from=build /out/guest /usr/share/vmlab/guest

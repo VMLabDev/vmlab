@@ -17,6 +17,9 @@ mod lifecycle;
 pub mod logs;
 mod media;
 mod net;
+/// `vmlab-fastpath`'s `main` (F21): the eBPF fast path's privileged helper.
+#[cfg(feature = "ebpf")]
+pub use net::fastpath::helper::main as fastpath_helper_main;
 mod nocow;
 mod oci;
 pub mod paths;

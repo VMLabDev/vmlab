@@ -33,7 +33,7 @@ use windows_sys::Win32::System::Threading::{
 use super::logon::MintedLogon;
 use super::port::wide;
 use super::tree;
-use crate::spawn::{ProcessSpec, Spawned, command_line};
+use crate::spawn::{ProcessSpec, Spawned, checked_command_line};
 
 /// A handle we own and close exactly once.
 pub struct Owned(pub HANDLE);
@@ -200,7 +200,7 @@ pub fn spawn_piped(logon: Option<&MintedLogon>, spec: ProcessSpec) -> std::io::R
 
     let pi = create(
         logon,
-        &command_line(&spec.argv),
+        &checked_command_line(&spec.argv)?,
         env.as_ref(),
         cwd.as_deref(),
         &si,

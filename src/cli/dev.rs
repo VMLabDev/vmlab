@@ -181,7 +181,7 @@ async fn sync_status(client: &LabClient, machine: &str) -> Result<WorkspaceSyncS
 /// to do, each by name. A skipped `.sock`, a refused 4 GB file and a deferred
 /// `.git/index` are all normal, and every one of them is the kind of thing
 /// that silently stops a tree syncing if nobody says it out loud.
-fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
+pub(crate) fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -227,6 +227,13 @@ fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
                 sync.passes,
             );
         }
+        None if sync.unanswered.is_some() => {
+            let _ = writeln!(
+                out,
+                "\"{machine}\"'s workspace has unknown guest writes ({} passes).",
+                sync.passes
+            );
+        }
         None => {
             let _ = writeln!(
                 out,
@@ -238,6 +245,7 @@ fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
     for (label, said) in [
         ("waiting", sync.rescan.as_ref()),
         ("re-seeding", sync.reseed.as_ref()),
+        ("waiting", sync.unanswered.as_ref()),
         ("volume", sync.volume.as_ref()),
         ("trouble", sync.trouble.as_ref()),
     ] {
@@ -453,6 +461,7 @@ mod tests {
             volume: None,
             rescan: None,
             reseed: None,
+            unanswered: None,
             rescans: 0,
             skipped: Vec::new(),
             deferred: Vec::new(),
@@ -506,6 +515,7 @@ mod tests {
                 volume: Some("this pass is carrying 4000 paths under target".into()),
                 rescan: Some("the guest's watch lost coverage".into()),
                 reseed: None,
+                unanswered: None,
                 rescans: 3,
                 skipped: vec![crate::status::WorkspaceSkipStatus {
                     path: "build/app.sock".into(),

@@ -86,7 +86,7 @@ machine is reached with `vmlab shell` and `vmlab exec`.
 "vmlab"` on a machine, else an explicit host default, else the VM's persisted
 identity, selects its hypervisor. New supported x86_64 KVM VMs default to
 vmlab-hv; refused declarations fall back to QEMU with a status and `up` reason.
-Containers still default to QEMU. VM identity sticks until destroy or an explicit
+Supported new containers also default to vmlab-hv and require KVM. Machine identity sticks until destroy or an explicit
 setting; old disks without an identity stay on QEMU. The selection puts it
 on QEMU or on vmlab-hv (`hv/`, with in-tree protocol crates). Phase 1 runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
