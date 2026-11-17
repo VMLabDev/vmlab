@@ -97,7 +97,7 @@ SRC
       | "`vmlab_hv_viewer`" | "utf8" | "`vmlab-hv-viewer` beside configured `vmlab_hv`, then on `PATH`" | "Native viewer binary for vmlab-hv machines. A path or a binary name, without arguments. Overrides discovery; a missing or non-executable binary falls back to VNC with an installation notice." |
       | "`viewer_release_chord`" | "utf8" | "viewer's left Ctrl+Alt" | "Native viewer grab release chord, passed as `--release-chord`. Example: `ctrl_r+alt_r`. The viewer validates chord syntax; this key does not affect VNC viewers." |
       | "`btrfs_nocow`" | "bool" | "`true`" | "On btrfs, set NOCOW (`chattr +C`) on each machine's disk directory before its first disk is created, so online snapshots do not fragment the disks. NOCOW files have no btrfs checksums or compression. `false` keeps them copy-on-write. Ignored on other filesystems." |
-      | "`hypervisor {}`" | "child" | "automatic VMs; QEMU containers" | "Explicit per-kind defaults, each `qemu` or `vmlab`. A machine's own setting wins. Unset VMs preserve existing identity, then select vmlab-hv when supported or QEMU with a fallback reason." |
+      | "`hypervisor {}`" | "child" | "automatic VMs and containers" | "Explicit per-kind defaults, each `qemu` or `vmlab`. A machine's own setting wins. Unset machines preserve existing identity, then select vmlab-hv when supported or QEMU with a fallback reason. Containers require KVM." |
   }
   p "The parser enforces these rules, and reports every violation in one pass:"
   list {

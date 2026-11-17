@@ -275,7 +275,7 @@ impl HostConfig {
                 use crate::config::hypervisor::HypervisorKind;
                 let mut h = Reader::new(&child, r.issues());
                 if let Some(v) = h.keyword("container", HypervisorKind::NAMES).unspan() {
-                    cfg.hypervisor.container = v;
+                    cfg.hypervisor.container = Some(v);
                 }
                 if let Some(v) = h.keyword("vm", HypervisorKind::NAMES).unspan() {
                     cfg.hypervisor.vm = Some(v);
@@ -536,7 +536,7 @@ mod tests {
     fn parses_the_hypervisor_defaults_and_binary() {
         use crate::config::hypervisor::HypervisorKind;
         let none = HostConfig::default();
-        assert_eq!(none.hypervisor.container, HypervisorKind::Qemu);
+        assert_eq!(none.hypervisor.container, None);
         assert_eq!(none.hypervisor.vm, None);
         assert_eq!(none.vmlab_hv, None);
         assert_eq!(none.vmlab_hv_viewer, None);
@@ -554,7 +554,7 @@ host {
             "<test>",
         )
         .unwrap();
-        assert_eq!(cfg.hypervisor.container, HypervisorKind::Vmlab);
+        assert_eq!(cfg.hypervisor.container, Some(HypervisorKind::Vmlab));
         assert_eq!(cfg.hypervisor.vm, None);
         assert_eq!(
             cfg.vmlab_hv.as_deref(),

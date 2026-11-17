@@ -382,6 +382,7 @@ pub struct ContainerInstance {
     /// Which hypervisor `hv` is, as the machine reports it and its snapshots
     /// record it (§22).
     hypervisor: HypervisorKind,
+    hypervisor_fallback: Option<String>,
 }
 
 impl ContainerInstance {
@@ -427,7 +428,13 @@ impl ContainerInstance {
             agent: super::machine::AgentSlot::default(),
             hv,
             hypervisor,
+            hypervisor_fallback: None,
         })
+    }
+
+    pub(super) fn with_hypervisor_fallback(mut self: Arc<Self>, reason: Option<String>) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("new container is unshared").hypervisor_fallback = reason;
+        self
     }
 
     /// The pulled image + merged spec, or an error while the deferred pull
@@ -754,17 +761,7 @@ impl ContainerInstance {
             let vfs_devices = self.start_virtiofsds().await?;
 
             let asset = self.hv.guest_asset(&self.resolved.arch)?;
-            // vmlab-hv has no TCG to fall back to; validation refused the
-            // machine on a host without KVM (§22).
-            if self.hypervisor == HypervisorKind::Qemu
-                && qemu::pick_accel(&self.resolved.arch) == qemu::Accel::Tcg
-            {
-                tracing::warn!(
-                    "{}: KVM unavailable for {} — falling back to TCG (slow)",
-                    self.cfg.name,
-                    self.resolved.arch
-                );
-            }
+            anyhow::ensure!(crate::qemu::kvm_available(), "{}: KVM is required for containers", self.cfg.name);
             let machine = super::hypervisor::Launch::Container {
                 lab: self.lab.clone(),
                 resolved: Box::new(self.resolved.clone()),
@@ -1306,6 +1303,10 @@ impl super::machine::Machine for ContainerInstance {
 
     fn hypervisor(&self) -> HypervisorKind {
         self.hypervisor
+    }
+
+    fn hypervisor_fallback(&self) -> Option<String> {
+        self.hypervisor_fallback.clone()
     }
 
     async fn state(&self) -> PowerState {
