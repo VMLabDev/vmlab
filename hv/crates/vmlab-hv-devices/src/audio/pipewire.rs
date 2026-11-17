@@ -533,10 +533,7 @@ mod tests {
         ignore = "requires a live PipeWire session and default sink"
     )]
     fn real_pipewire_formats() {
-        if !super::super::probe_environment().pipewire_socket_reachable {
-            eprintln!(
-                "SKIP real_pipewire_formats: PipeWire socket unavailable under XDG_RUNTIME_DIR"
-            );
+        if !super::super::test_session::available("real_pipewire_formats", true) {
             return;
         }
         let host = PipeWireHost::new("vmlab.test.formats", "vmlab format smoke").unwrap();

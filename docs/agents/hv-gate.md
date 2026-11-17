@@ -38,6 +38,15 @@ on the same host. Do not copy prebuilt test binaries between hosts. Existing
 local-asset and GPU prerequisites still apply, so inspect ignored counts
 alongside passes rather than treating them as hardware coverage.
 
+The real PipeWire and PulseAudio smoke tests inspect sinks with `pw-dump`
+and `pactl --format=json list sinks`, respectively. They print `SKIP` directly
+to the gate log when the session or inspection tool is unavailable, there
+are no sinks, or only the headless `auto_null` Dummy Output is present.
+These runtime skips are counted as passed by libtest, not ignored. Set
+`VMLAB_REQUIRE_AUDIO=1` to fail on any of those missing prerequisites.
+Sessions with other sinks still run the PCM assertions. The tests do not
+create or change sinks in the user's audio session.
+
 Test VM permits count only this user's vmlab test VMs through shared slot
 locks in `/tmp/vmlab-hv-vm-slots-<uid>`, across checkouts and test processes.
 The default hard cap is two, configurable with a positive
