@@ -751,7 +751,10 @@ mod tests {
             .await
             .unwrap_err();
         let text = err.to_string();
-        assert!(matches!(err, ImageError::Disk { op: "info", .. }), "{err:?}");
+        assert!(
+            matches!(err, ImageError::Disk { op: "info", .. }),
+            "{err:?}"
+        );
         assert!(text.contains("/nonexistent/nope.qcow2"), "{text}");
     }
 

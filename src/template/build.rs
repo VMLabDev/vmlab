@@ -4337,9 +4337,7 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
             .unwrap()
             .unwrap();
         let seeded = tmp.path().join("seeded.qcow2");
-        qimg::convert_to_qcow2(&r.disk_path, &seeded)
-            .await
-            .unwrap();
+        qimg::convert_to_qcow2(&r.disk_path, &seeded).await.unwrap();
         let info = qimg::image_info(&seeded).await.unwrap();
         assert!(info.backing_file.is_none(), "{info:?}");
         assert_eq!(info.virtual_size, 16 << 20);
