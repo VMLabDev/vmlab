@@ -2677,8 +2677,8 @@ PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); 
 floppy on a machine other than pc;
 `accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
 "usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
-container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
-no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
+container is refused on a host whose `/dev/kvm` is not usable — containers
+require KVM on either hypervisor. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
 hardware where the template is in the store, and the daemon, which always
 resolves it, finishes the check. The refusals are one list in code, which each
