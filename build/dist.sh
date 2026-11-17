@@ -5,6 +5,9 @@
 #
 #   vmlab-<version>-linux-x86_64              the release CLI, named as CI names
 #                                             the release asset
+#   vmlab-fastpath-<version>-linux-x86_64     the eBPF fast path's privileged
+#                                             helper, the only binary that is
+#                                             granted CAP_BPF and CAP_NET_ADMIN
 #   vmlab-guest-<version>.tar.gz (+ .sha256)  the strict guest bundle, from
 #                                             `just guest-package`
 #   vmlab-hv-<version>-linux-x86_64.tar.gz    hypervisor, viewer, desktop icons,
@@ -65,9 +68,10 @@ build_binary() {
     locked=()
   fi
   log "building vmlab $version (release)"
-  cargo build --release "${locked[@]}" --bin vmlab
+  cargo build --release "${locked[@]}" --bin vmlab --bin vmlab-fastpath
   [ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
   install -m 0755 target/release/vmlab "$OUT/vmlab-$version-linux-x86_64"
+  install -m 0755 target/release/vmlab-fastpath "$OUT/vmlab-fastpath-$version-linux-x86_64"
   if [[ -f "$SAVE/Cargo.toml" ]]; then
     cp -p "$SAVE/Cargo.toml" Cargo.toml
     cp -p "$SAVE/Cargo.lock" Cargo.lock

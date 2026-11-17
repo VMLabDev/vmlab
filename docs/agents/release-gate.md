@@ -28,13 +28,10 @@ owner and run ID. Existing runs are not stopped: wait for both `slot1.lock`
 and `slot2.lock` to drain. Hold both slot locks while setting up the reservation
 to close the admission race, then release them before starting e2e.
 
-The current wrapper has no hold-owner bypass. Leaving `heavy.hold` in place
-would block the release run too. Keep all other workers and merge jobs paused,
-with no queued wrapper commands, remove only the hold you created, and start
-the release via `terrarium run ... -- /var/build/cache/vmlab/bin/heavy ...`.
-Recreate your hold once the release has its slot to prevent new admissions.
-This is a coordinated reservation, not an atomic exclusive mode in the
-wrapper. If the host cannot be drained and other admissions paused, do not
+Mark the release invocation with `VMLAB_HEAVY_RELEASE=1` while `/var/build/cache/vmlab/heavy.hold` reserves the host.
+Keep all other workers and merge jobs paused, with no queued wrapper commands,
+and start the release via `terrarium run` through the heavy wrapper.
+If the host cannot be drained and other admissions paused, do not
 start. Keep the reservation through teardown, remove only your own hold,
 and tell the lead when the host is free. On interruption, record the hold
 owner and unfinished run on the release card before handing off.

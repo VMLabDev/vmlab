@@ -339,15 +339,7 @@ mod tests {
     #[test]
     #[cfg_attr(vmlab_ci_no_host_assets, ignore = "requires a live PulseAudio session")]
     fn real_pulse_streams() {
-        let server_set = std::env::var_os("PULSE_SERVER").is_some_and(|v| !v.is_empty());
-        let socket_reachable = std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| {
-            std::os::unix::net::UnixStream::connect(std::path::Path::new(&dir).join("pulse/native"))
-                .is_ok()
-        });
-        if !server_set && !socket_reachable {
-            eprintln!(
-                "SKIP real_pulse_streams: PULSE_SERVER unset and local PulseAudio socket unavailable"
-            );
+        if !super::super::test_session::available("real_pulse_streams", false) {
             return;
         }
         let host = PulseHost::new("vmlab.test.pulse", "vmlab PulseAudio smoke");

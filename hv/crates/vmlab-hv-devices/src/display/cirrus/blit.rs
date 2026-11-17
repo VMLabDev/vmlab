@@ -195,7 +195,7 @@ impl Blit {
         } else {
             spans.push((dst + first * dp, dst + last * dp + width));
         }
-        if self.system_source() || self.ext & EXT_SOLID != 0 {
+        if self.system_source() || (self.expand() && self.ext & EXT_SOLID != 0) {
         } else if self.mode & PATTERN != 0 {
             let base = self.pattern_base() as i64;
             let size = if self.expand() {

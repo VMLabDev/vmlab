@@ -1,4 +1,4 @@
-# vmlab-hypervisor
+# vmlab-hv
 
 `vmlab-hv` is a clean-room, MIT-licensed hypervisor written in Rust. vmlab
 (https://github.com/VMLabDev/vmlab) runs one `vmlab-hv` process per machine in

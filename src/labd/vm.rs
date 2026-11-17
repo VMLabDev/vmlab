@@ -2092,7 +2092,8 @@ impl super::machine::Machine for VmInstance {
         self.check_clone_source()
     }
 
-    /// The per-arch emulator, `qemu-img` for the clone, and `swtpm` when the
+    /// The per-arch emulator, `qemu-img` for the clone when it is the image
+    /// tool (`VMLAB_IMAGE_TOOL`), and `swtpm` when the
     /// resolved hardware wants a TPM. A VM whose host GPU carries its own
     /// `qemu_binary` needs no emulator on PATH: the start checks that one
     /// itself, naming the GPU (§5.2).
@@ -2102,7 +2103,11 @@ impl super::machine::Machine for VmInstance {
 
     fn required_binaries(&self) -> Vec<String> {
         let t = self.template();
-        let mut needed = vec!["qemu-img".to_string()];
+        let mut needed: Vec<String> = crate::template::qimg::backend()
+            .required_binary()
+            .map(str::to_string)
+            .into_iter()
+            .collect();
         let own_qemu = t.resolved.gpu.as_ref().is_some_and(|gpu| {
             crate::config::host::HostConfig::load_default().is_ok_and(|host| {
                 qemu::hostgpu::pick(gpu, &host)

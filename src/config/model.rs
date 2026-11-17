@@ -251,7 +251,7 @@ pub struct Forward {
     /// `None` = automatic: vmlab binds a free port when it installs the
     /// forward and reports it in `vmlab status`.
     pub host_port: Option<u16>,
-    /// The host address to listen on; `None` = every interface (`0.0.0.0`).
+    /// The host address to listen on; `None` = loopback (`127.0.0.1`).
     pub bind: Option<Ipv4Addr>,
     pub vm: String,
     pub guest_port: u16,

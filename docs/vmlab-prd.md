@@ -279,7 +279,7 @@ Each VM block can express:
 
   **A host GPU's own QEMU.** A GPU's driver can need a QEMU the host's package does not provide: QEMU 11.1's `egl-headless` binds a blob scanout's LINEAR dma-buf as `GL_TEXTURE_2D`, which NVIDIA's EGL accepts only as `GL_TEXTURE_EXTERNAL_OES`, so a Venus guest on an NVIDIA card renders behind a black console until QEMU is patched; AMD and Intel accept the 2D binding and keep the stock QEMU. The need follows the GPU, not the lab, so it lives on the host GPU:
   - `qemu_binary` — an absolute path. Every VM whose `gpu {}` resolves to that host GPU, in all three modes, runs it instead of `qemu-system-<arch>` from `PATH`. A file named `qemu-system-<a>` whose `<a>` is not the VM's QEMU arch is refused, naming both; a file of any other name is taken as given. A missing or non-executable path is refused, naming the host GPU and the path, by `vmlab validate` for the GPUs a lab uses and again at VM start. Such a VM also gets `-L <dir>`, where `<dir>` is the stock QEMU's data directory — `<prefix>/share/qemu` for the `qemu-system-<arch>` on `PATH`, symlinks followed — when that directory exists, so a minimal build finds the firmware and option ROMs it was not installed beside; QEMU still searches its own data directory after `-L`, so a full build loses nothing. With no stock QEMU on `PATH`, nothing is added. `vmlab status -v` shows `qemu=<path>` after `host_gpu=` for a VM that ran one.
-  - `qemu_env` — a record of strings, `{ KEY: "value" }` (WCL has no map type; the keys are identifiers). Applied to the QEMU process's own environment after the inherited Vulkan loader variables are removed and vmlab's derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and PCI-filter variables set, and an explicit host setting beats a derived one: a `qemu_env` key replaces vmlab's value for it. A key that is empty or contains `=` is refused. The `vmlab: env:` line lists every variable vmlab set, `qemu_env` included, with values. `vmlab status -v` shows the same set after `qemu=`, as `env=NAME=value,...` by name, values in full (vmlab is not a security boundary, and a path is the usual value); `vmlab status --json` carries it as the VM's `qemu_env` object. Both are what the VM was started with, recorded at that start, so a host config edited since does not change what a running VM reports; a VM that set nothing shows no `env=` and no `qemu_env`.
+- `qemu_env` — a record of strings, `{ KEY: "value" }` (WCL has no map type; the keys are identifiers). Applied to the QEMU process's own environment after the inherited Vulkan loader variables are removed and vmlab's derived `VK_LOADER_DRIVERS_SELECT`/`VK_DRIVER_FILES` and PCI-filter variables set, and an explicit host setting beats a derived one: a `qemu_env` key replaces vmlab's value for it. A key that is empty or contains `=` is refused. The `vmlab: env:` line lists every variable vmlab set, `qemu_env` included, with values. `vmlab status -v` shows the same set after `qemu=`, as `env=NAME=value,...` by name, values in full (the host user controls this configuration and a path is the usual value; do not put secrets here because logs and status expose these values, and untrusted guests and templates must not supply host configuration); `vmlab status --json` carries it as the VM's `qemu_env` object. Both are what the VM was started with, recorded at that start, so a host config edited since does not change what a running VM reports; a VM that set nothing shows no `env=` and no `qemu_env`.
 
   There is no host-wide `qemu_binary` and no one-off CLI override. Template builds never carry a `gpu {}`, so they always run the stock QEMU.
 
@@ -674,7 +674,7 @@ The substitution seam above is exercised by two opt-in eBPF fast-path tiers, sel
 - **sockmap** — the stream-socket attachment is kept, but sk_skb programs splice known guest-to-guest unicast between the QEMU sockets in-kernel; everything else passes to the daemon's readers unchanged. Functionally validated but *measured slower* than the userspace fabric (af_unix redirects ride the kernel's psock backlog workqueue), so `auto` never selects it — it exists for explicit evaluation via `fastpath = "sockmap"`.
 - **userspace** — the fabric exactly as specified above; always the fallback.
 
-The rootless guarantee is untouched: both kernel tiers need CAP_BPF + CAP_NET_ADMIN, and each daemon *proves* a tier works on its host (loading the programs and pushing frames through throwaway taps/sockets) before using it — an unprivileged or WSL2 daemon degrades to `userspace` silently. Installed as an ordinary user from a terminal, `install.sh` asks whether to grant the binary those two capabilities as file capabilities (`sudo setcap cap_bpf,cap_net_admin+ep`), defaulting to no unless the binary it replaces had them; `--fastpath`/`--no-fastpath` decide without asking, and with no terminal it prints the command. It offers nothing to root, on WSL2, or on a `nosuid` mount. Lab semantics are tier-invariant by construction: only frames the daemon provably doesn't need to see (known unicast between two non-isolated guest ports of one segment) are ever forwarded in-kernel; the gateway MAC and service/trunk ports never enter the kernel forwarding tables. Selection can be forced with the `fastpath` host-config field (`auto`/`off`/`sockmap`/`afxdp`) or `VMLAB_FASTPATH`.
+The rootless guarantee is untouched: both kernel tiers need CAP_BPF + CAP_NET_ADMIN, and each daemon *proves* a tier works on its host (loading the programs and pushing frames through throwaway taps/sockets) before using it — a daemon without a privileged helper, or on WSL2, degrades to `userspace` silently. The daemons never hold those capabilities: every privileged step (creating a tap, loading and attaching vmlab's embedded BPF objects, writing their maps) is a request to `vmlab-fastpath`, a helper installed beside `vmlab` that each daemon starts on a socket of its own and that exits with it. Its request vocabulary is closed — those steps and nothing else; a devmap slot may only point at a tap the helper created, MACs must be unicast, passed descriptors must be the unix sockets the sockmap tier expects — and it refuses anything else. Installed as an ordinary user from a terminal, `install.sh` asks whether to grant the helper, and only the helper, those two capabilities as file capabilities (`sudo setcap cap_bpf,cap_net_admin+ep`), defaulting to no; `--fastpath`/`--no-fastpath` decide without asking, and with no terminal it prints the command. It offers nothing to root, on WSL2, or on a `nosuid` mount. The `vmlab` binary itself has no file capabilities. Lab semantics are tier-invariant by construction: only frames the daemon provably doesn't need to see (known unicast between two non-isolated guest ports of one segment) are ever forwarded in-kernel; the gateway MAC and service/trunk ports never enter the kernel forwarding tables. Selection can be forced with the `fastpath` host-config field (`auto`/`off`/`sockmap`/`afxdp`) or `VMLAB_FASTPATH`.
 
 ### 9.2 Segments and namespacing
 
@@ -2106,7 +2106,10 @@ mid-transfer. `snapshot restore` needs an **explicit discard flag**, because
 restore discards the guest side by design and would silently destroy the guest
 copy of every conflicted path — but refusing outright is obstruction, since
 wanting to throw the guest away is frequently *why* you restore. `capture`
-refuses with no escape.
+refuses with no escape. That includes a guest too slow to answer the flush:
+when the guest's watch has not reported within the flush's bound, its latest
+writes are unknown, so the capture refuses and says so rather than freezing a
+tree without them. The discard flag is restore-only and does not apply here.
 
 **There is no resync token, and it costs nothing**, because the list of
 stat-walk triggers — first sync, ledger loss, overflow, post-restore
@@ -2616,7 +2619,8 @@ lifecycle.
 **Selection.** A `vm` or `container` block names its hypervisor with
 `hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
-`qemu` for both until changed. The field is declared on the machine only and
+automatic for both kinds, preserving existing identity and selecting vmlab-hv
+for supported new machines (§22.1). The field is declared on the machine only and
 never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
@@ -2637,7 +2641,7 @@ default for a phase's machines flips only once that phase has passed its gate:
 
 | Phase | Runs | Status |
 | --- | --- | --- |
-| 1 | Container micro-VMs (§18), x86_64 under KVM | Selectable |
+| 1 | Container micro-VMs (§18), x86_64 under KVM | Default for new containers |
 | 2a | Modern x86_64 VMs: q35 on SeaBIOS, virtio and AHCI disks, AHCI CD-ROMs, virtio-net, the USB tablet | Selectable |
 | 2b | Their display: the native frame protocol (screenshots, vision, input, the recorder) and an RFB server | Selectable |
 | 2c | OVMF, secure boot, a TPM, Hyper-V, Windows | Selectable |
@@ -2674,8 +2678,8 @@ PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); 
 floppy on a machine other than pc;
 `accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
 "usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
-container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
-no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
+container is refused on a host whose `/dev/kvm` is not usable — containers
+require KVM on either hypervisor. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
 hardware where the template is in the store, and the daemon, which always
 resolves it, finishes the check. The refusals are one list in code, which each
@@ -2823,15 +2827,20 @@ passed-through device's is vmlab-hv's to save; offline snapshots are
 unaffected. Host USB devices refuse an online snapshot while attached, on
 either hypervisor (§5.2.1).
 
-### 22.1 Amendment: automatic selection for modern VMs (2026-11-03)
+### 22.1 Amendment: automatic selection for modern VMs and containers
 
-This amendment replaces the original QEMU VM default above. Containers still
-default to QEMU. Selection follows this order:
+This amendment replaces the original QEMU defaults above. Supported new
+containers and modern VMs default to vmlab-hv. Selection follows this order:
 
 1. The machine's explicit `hypervisor`.
-2. An explicit host `hypervisor { vm = ... }` setting.
-3. The VM's persisted hypervisor identity.
-4. For a new VM, vmlab-hv when `vmlab_refusals` returns no reasons, otherwise QEMU.
+2. An explicit host `hypervisor { vm = ... container = ... }` setting for its kind.
+3. The machine's persisted hypervisor identity.
+4. For a new machine, vmlab-hv when `vmlab_refusals` returns no reasons, otherwise QEMU.
+
+Container fallback uses `container_refusals`. Containers require KVM, including
+when QEMU is selected: without it start fails with `KVM is required`, never TCG.
+Existing container scratch disks without an identity remain on QEMU until destroy
+or an explicit setting.
 
 Automatic fallback does not raise a vmlab-hv validation error. `status` shows
 the selected hypervisor and fallback reason. JSON includes `hypervisor` and
@@ -2849,8 +2858,8 @@ pulls resolve selection against the downloaded hardware before boot.
 
 Online snapshots remain bound to their recorded hypervisor. Explicitly moving
 a machine does not convert its snapshots. Offline snapshots remain portable.
-The e2e runner defaults to `--hypervisor vmlab` and explicitly pins both machine
-kinds for each scenario, retaining QEMU-only scenarios.
+The e2e runner defaults to `--hypervisor vmlab` and leaves containers unpinned
+to exercise automatic selection, retaining explicit QEMU-only runs.
 
 Pinned TSC and N6-N8 networking are supported on vmlab-hv. A supported new VM
 with `tsc = "host"` still selects vmlab-hv; its first KVM start probes and

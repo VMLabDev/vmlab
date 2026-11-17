@@ -4144,24 +4144,9 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         );
     }
 
-    fn have_qemu_img() -> bool {
-        std::env::var_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join("qemu-img").is_file())
-        })
-    }
-
-    fn qemu_img(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("qemu-img")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    // These tests run once under each image tool (`on_both_tools!`), which
+    // makes and reads every disk below.
+    use crate::template::qimg::{self, testing::on_both_tools};
 
     /// `x86_64/win11@26100.1` with a real base and two real overlays:
     /// `standard` (default, its own first-boot script at a surface this host
@@ -4171,7 +4156,9 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let store = TemplateStore::new(tmp.path().join("templates"));
         let dir = store.root().join("x86_64/win11/26100.1");
         std::fs::create_dir_all(&dir).unwrap();
-        qemu_img(&dir, &["create", "-q", "-f", "qcow2", DISK_FILE, "16M"]);
+        qimg::tool()
+            .create_blank(&dir.join(DISK_FILE), 16 << 20)
+            .unwrap();
         let base_sha = crate::template::store::sha256_file(&dir.join(DISK_FILE)).unwrap();
         let mut m = source_meta();
         m.sha256 = Some(base_sha.clone());
@@ -4180,20 +4167,13 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         for (name, default) in [("standard", true), ("extra", false)] {
             let vdir = dir.join("variants").join(name);
             std::fs::create_dir_all(&vdir).unwrap();
-            qemu_img(
-                &vdir,
-                &[
-                    "create",
-                    "-q",
-                    "-f",
-                    "qcow2",
-                    "-b",
-                    "../../disk.qcow2",
-                    "-F",
-                    "qcow2",
-                    DISK_FILE,
-                ],
-            );
+            let overlay = vdir.join(DISK_FILE);
+            qimg::tool()
+                .create_linked_clone(&dir.join(DISK_FILE), &overlay)
+                .unwrap();
+            qimg::tool()
+                .rebase_unsafe(&overlay, crate::template::store::VARIANT_BACKING)
+                .unwrap();
             m.variants.push(crate::template::meta::VariantMeta {
                 name: name.into(),
                 default,
@@ -4234,14 +4214,11 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         ))
     }
 
+    on_both_tools!(a_layered_build_seeds_from_the_selected_disk);
     /// A layered `from` is a build context (§6.6): no `#` seeds from the
     /// default variant and runs its first-boot script, `#<variant>` from that
     /// one, and `#base` from the base with no first-boot script at all.
-    #[test]
     fn a_layered_build_seeds_from_the_selected_disk() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let seed = |from: &str| {
             super::resolve_layered_source(&layered_from(from), &store)
@@ -4329,14 +4306,11 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         assert!(abort.is_finished());
     }
 
+    on_both_tools!(the_layered_surface_check_reads_the_selected_variant);
     /// The surface check reads the selected variant's script: a default whose
     /// script targets a newer surface refuses the layered build, while
     /// `#base` — which runs no script — does not.
-    #[test]
     fn the_layered_surface_check_reads_the_selected_variant() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let path = store
             .root()
@@ -4354,62 +4328,30 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         assert!(super::resolve_layered_source(&layered_from("x86_64/win11#base"), &store).is_ok());
     }
 
+    on_both_tools!(async seeding_from_a_variant_flattens_the_chain);
     /// Seeding from a variant flattens overlay and base into one standalone
     /// working disk.
-    #[tokio::test]
     async fn seeding_from_a_variant_flattens_the_chain() {
-        if !have_qemu_img() {
-            return;
-        }
         let (tmp, store) = variant_store();
         let r = super::resolve_layered_source(&layered_from("x86_64/win11"), &store)
             .unwrap()
             .unwrap();
         let seeded = tmp.path().join("seeded.qcow2");
-        crate::template::qimg::convert_to_qcow2(&r.disk_path, &seeded)
-            .await
-            .unwrap();
-        let out = std::process::Command::new("qemu-img")
-            .args(["info", "--output=json"])
-            .arg(&seeded)
-            .output()
-            .unwrap();
-        let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert!(info.get("backing-filename").is_none(), "{info}");
-        assert_eq!(info["virtual-size"], 16 << 20);
+        qimg::convert_to_qcow2(&r.disk_path, &seeded).await.unwrap();
+        let info = qimg::image_info(&seeded).await.unwrap();
+        assert!(info.backing_file.is_none(), "{info:?}");
+        assert_eq!(info.virtual_size, 16 << 20);
     }
 
     /// A built overlay the way `build_variant` leaves one: written against
     /// the base by absolute path, then rebased `-u` to `../../disk.qcow2`.
     fn built_overlay(base: &Path, scratch: &Path, file: &str) -> std::path::PathBuf {
-        let base = base.canonicalize().unwrap();
-        qemu_img(
-            scratch,
-            &[
-                "create",
-                "-q",
-                "-f",
-                "qcow2",
-                "-b",
-                base.to_str().unwrap(),
-                "-F",
-                "qcow2",
-                file,
-            ],
-        );
-        qemu_img(
-            scratch,
-            &[
-                "rebase",
-                "-u",
-                "-b",
-                "../../disk.qcow2",
-                "-F",
-                "qcow2",
-                file,
-            ],
-        );
-        scratch.join(file)
+        let overlay = scratch.join(file);
+        qimg::tool().create_linked_clone(base, &overlay).unwrap();
+        qimg::tool()
+            .rebase_unsafe(&overlay, crate::template::store::VARIANT_BACKING)
+            .unwrap();
+        overlay
     }
 
     fn built_block(
@@ -4432,14 +4374,11 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         m
     }
 
+    on_both_tools!(a_built_variant_installs_atomically);
     /// A rebuilt variant replaces its overlay and its block together and
     /// leaves the other variant alone; a new default takes the default over;
     /// one built on another base is refused with the store unchanged.
-    #[test]
     fn a_built_variant_installs_atomically() {
-        if !have_qemu_img() {
-            return;
-        }
         use crate::template::store::sha256_file;
         let (tmp, store) = variant_store();
         let base = store

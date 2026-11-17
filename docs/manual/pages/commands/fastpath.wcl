@@ -43,6 +43,14 @@ page cmd_fastpath {
     `ebpf` feature reports both kernel tiers unavailable for that reason.
   DOC
 
+  p <<DOC
+    The probes run through the `vmlab-fastpath` helper, the only binary that
+    holds `CAP_BPF` and `CAP_NET_ADMIN` (see [Installation](gs_install)), so a
+    kernel tier that passes has also proved the helper works. A missing
+    helper, or one without its capabilities, shows up here as the reason a
+    kernel tier is unavailable.
+  DOC
+
   code sh { source = <<'SRC'
 $ vmlab fastpath
 network fast path: userspace (mode auto)

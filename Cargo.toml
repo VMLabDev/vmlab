@@ -23,6 +23,14 @@ path = "src/lib.rs"
 name = "vmlab"
 path = "src/main.rs"
 
+# The eBPF fast path's privileged helper (F21): the only binary install.sh
+# grants CAP_BPF and CAP_NET_ADMIN. The daemons start it and ask it for each
+# privileged step over a closed request protocol.
+[[bin]]
+name = "vmlab-fastpath"
+path = "src/fastpath_helper.rs"
+required-features = ["ebpf"]
+
 [features]
 default = ["ebpf"]
 # The eBPF network fast path (PRD §9.1's substitutable backend): compiled in
@@ -47,6 +55,9 @@ vmlab-hv-proto = { path = "hv/crates/vmlab-hv-proto", features = ["gdb"] }
 # vmlab-hv's native frame protocol (§22, phase 2b): screenshots, scripted
 # input and the recorder's frame stream on a vmlab-hv VM's `display.sock`.
 vmlab-hv-display = { path = "hv/crates/vmlab-hv-display" }
+# qcow2 image operations (HV-D15): the default behind `template::qimg`'s
+# `ImageTool`, with `qemu-img` kept as a fallback (`VMLAB_IMAGE_TOOL`).
+vmlab-disk = { path = "hv/crates/vmlab-disk" }
 
 anyhow = "1"
 thiserror = "2"
@@ -66,6 +77,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 sha2 = "0.11"
+hmac = "0.12"
+sha2_10 = { package = "sha2", version = "0.10" }
 hex = "0.4"
 rand = "0.10"
 base64 = "0.23"
@@ -169,13 +182,9 @@ flate2 = "1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-# The vendored FUSE stack (crates/vmlab-hv-devices/src/virtio/fs/fuse) keeps
-# fuse-backend-rs's feature gates; this build only ever compiles the
-# virtqueue path, and the values below keep the dead gates from warning.
 unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(vmlab_ci_no_kvm)',
     'cfg(vmlab_ci_no_host_assets)',
-    'cfg(feature, values("async-io", "fuse-t", "fusedev", "macfuse", "persist", "vhost-user-fs", "virtiofs"))',
 ] }
 
 

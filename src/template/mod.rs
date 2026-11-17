@@ -1,7 +1,7 @@
 //! Template store and supporting machinery (PRD §4, §6, §7.1).
 //!
 //! - [`meta`] — `template.wcl` metadata read/written beside each disk image.
-//! - [`qimg`] — async `qemu-img` wrappers (blank disks, linked clones, info).
+//! - [`qimg`] — image operations behind one trait: `vmlab-disk`, or `qemu-img`.
 //! - [`store`] — the on-disk store at `~/.local/share/vmlab/templates`.
 
 pub mod agent_install;

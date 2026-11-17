@@ -16,200 +16,23 @@
 //! egress goes through a per-port `SOCK_DGRAM` loopback pair whose kernel
 //! end sits in `TX_HASH` with a trivial redirect verdict — dgram sends are
 //! atomic, and the backlog serializes all sources.
+//!
+//! The programs and maps are held by the `vmlab-fastpath` helper
+//! (`helper/`), which alone has CAP_BPF and CAP_NET_ADMIN; [`Engine`] is the
+//! daemon's handle on one loaded object there.
 
-use std::os::fd::{AsFd, AsRawFd as _};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, anyhow};
-use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuArray, SockHash};
-use aya::programs::SkSkb;
+use anyhow::{Context, Result};
 use tokio::net::UnixDatagram;
 use tokio::net::unix::OwnedWriteHalf;
 use tracing::{debug, warn};
 
+pub(super) use super::helper::client::RemoteSockmap as Engine;
 use crate::config::model::MacAddr;
 use crate::net::switch::PortId;
 use crate::sync::LockRecover;
-
-const OBJ: &[u8] = include_bytes!("bpf/fastpath_sockmap.bpf.o");
-
-/// `SOCK_STATE` map value: the BPF side's `SockState` (repr(C): `u64`
-/// port_id, then the 12-byte framing state, padded to 24). The kernel
-/// self-primes entries (keyed by the *sender* cookie, which userspace
-/// cannot query for QEMU's sockets); userspace only reads the leading
-/// port id when scanning entries to delete on port removal — so a byte
-/// array avoids needing an `unsafe impl aya::Pod` in this crate.
-const SOCK_STATE_LEN: usize = 24;
-
-fn socket_cookie(fd: impl AsFd) -> Result<u64> {
-    rustix::net::sockopt::socket_cookie(fd).context("SO_COOKIE")
-}
-
-/// One loaded fastpath_sockmap object: programs attached, typed map handles
-/// taken. Shared by [`SegmentOffload`] and the startup probe.
-pub(super) struct Engine {
-    /// Owns the loaded programs (and thus their attachments); maps have
-    /// been taken out into the typed handles below.
-    _ebpf: aya::Ebpf,
-    maps: Mutex<Maps>,
-}
-
-struct Maps {
-    port_hash: SockHash<MapData, u64>,
-    tx_hash: SockHash<MapData, u64>,
-    mac_map: BpfHashMap<MapData, [u8; 6], u64>,
-    sock_state: BpfHashMap<MapData, u64, [u8; SOCK_STATE_LEN]>,
-    tx_target: BpfHashMap<MapData, u64, u64>,
-    fp_stats: PerCpuArray<MapData, [u64; 2]>,
-    fp_debug: PerCpuArray<MapData, u64>,
-}
-
-impl Engine {
-    /// Load the embedded object and attach both verdict programs. Needs
-    /// CAP_BPF + CAP_NET_ADMIN; any failure (perms, verifier, old kernel)
-    /// surfaces here.
-    pub(super) fn load() -> Result<Engine> {
-        let mut ebpf = aya::Ebpf::load(OBJ).context("loading fastpath_sockmap.bpf.o")?;
-        let mut take = |name: &str| -> Result<aya::maps::Map> {
-            ebpf.take_map(name)
-                .ok_or_else(|| anyhow!("map {name} missing from object"))
-        };
-        let port_hash = SockHash::try_from(take("PORT_HASH")?)?;
-        let tx_hash = SockHash::try_from(take("TX_HASH")?)?;
-        let mac_map = BpfHashMap::try_from(take("MAC_MAP")?)?;
-        let sock_state = BpfHashMap::try_from(take("SOCK_STATE")?)?;
-        let tx_target = BpfHashMap::try_from(take("TX_TARGET")?)?;
-        let fp_stats = PerCpuArray::try_from(take("FP_STATS")?)?;
-        let fp_debug = PerCpuArray::try_from(take("FP_DEBUG")?)?;
-
-        let attach = |ebpf: &mut aya::Ebpf, name: &str, fd| -> Result<()> {
-            let prog: &mut SkSkb = ebpf
-                .program_mut(name)
-                .ok_or_else(|| anyhow!("program {name} missing from object"))?
-                .try_into()?;
-            prog.load().with_context(|| format!("loading {name}"))?;
-            prog.attach(fd)
-                .with_context(|| format!("attaching {name}"))?;
-            Ok(())
-        };
-        attach(&mut ebpf, "verdict_guest", port_hash.fd())?;
-        attach(&mut ebpf, "verdict_tx", tx_hash.fd())?;
-
-        Ok(Engine {
-            _ebpf: ebpf,
-            maps: Mutex::new(Maps {
-                port_hash,
-                tx_hash,
-                mac_map,
-                sock_state,
-                tx_target,
-                fp_stats,
-                fp_debug,
-            }),
-        })
-    }
-
-    /// Register a QEMU-facing stream socket as offloaded port `id`. The
-    /// per-stream state is self-primed by the verdict program (keyed by
-    /// the sender cookie only the kernel sees), so this is just the
-    /// sockmap membership that makes the verdict run at all.
-    pub(super) fn register_stream(&self, id: u64, sock: impl AsFd) -> Result<()> {
-        let mut maps = self.maps.lock_recover();
-        maps.port_hash
-            .insert(id, sock.as_fd().as_raw_fd(), 0)
-            .context("port_hash insert")?;
-        Ok(())
-    }
-
-    /// Register a TX loopback: `map_sock` (the kernel end) joins the
-    /// sockmap so the TX verdict runs on its ingress; `cookie_sock` (the
-    /// `tx_user` end the daemon writes) is the *sender* the kernel
-    /// attributes those dgrams to, hence the TX_TARGET key.
-    pub(super) fn register_tx(
-        &self,
-        id: u64,
-        map_sock: impl AsFd,
-        cookie_sock: impl AsFd,
-    ) -> Result<u64> {
-        let cookie = socket_cookie(cookie_sock.as_fd())?;
-        let mut maps = self.maps.lock_recover();
-        maps.tx_target
-            .insert(cookie, id, 0)
-            .context("tx_target insert")?;
-        if let Err(e) = maps.tx_hash.insert(id, map_sock.as_fd().as_raw_fd(), 0) {
-            let _ = maps.tx_target.remove(&cookie);
-            return Err(anyhow::Error::new(e).context("tx_hash insert"));
-        }
-        Ok(cookie)
-    }
-
-    pub(super) fn insert_mac(&self, mac: [u8; 6], id: u64) -> Result<()> {
-        Ok(self.maps.lock_recover().mac_map.insert(mac, id, 0)?)
-    }
-
-    pub(super) fn remove_mac(&self, mac: [u8; 6]) {
-        // Absent is fine: most MACs never belonged to an offloaded port.
-        let _ = self.maps.lock_recover().mac_map.remove(&mac);
-    }
-
-    /// Best-effort cleanup of everything a port registered. Closed sockets
-    /// are auto-removed by the kernel, so failures here are non-events.
-    /// SOCK_STATE entries are keyed by cookies only the kernel saw, so
-    /// they're found by scanning for the port id in the value.
-    pub(super) fn unregister(&self, id: u64, tx_cookie: u64, macs: &[[u8; 6]]) {
-        let mut maps = self.maps.lock_recover();
-        let _ = maps.port_hash.remove(&id);
-        let _ = maps.tx_hash.remove(&id);
-        let _ = maps.tx_target.remove(&tx_cookie);
-        for mac in macs {
-            let _ = maps.mac_map.remove(mac);
-        }
-        let stale: Vec<u64> = maps
-            .sock_state
-            .iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|(_, v)| v[..8] == id.to_ne_bytes())
-            .map(|(k, _)| k)
-            .collect();
-        for cookie in stale {
-            let _ = maps.sock_state.remove(&cookie);
-        }
-    }
-
-    /// Kernel-forwarded (frames, bytes), summed across CPUs.
-    pub(super) fn stats(&self) -> (u64, u64) {
-        let maps = self.maps.lock_recover();
-        match maps.fp_stats.get(&0, 0) {
-            Ok(values) => values.iter().fold((0, 0), |(f, b), v| (f + v[0], b + v[1])),
-            Err(_) => (0, 0),
-        }
-    }
-
-    /// The verdict programs' branch counters (see FP_DEBUG in the BPF
-    /// source), summed across CPUs — probe/field diagnosis only.
-    pub(super) fn debug_counters(&self) -> String {
-        let maps = self.maps.lock_recover();
-        let read = |i: u32| -> u64 {
-            maps.fp_debug
-                .get(&i, 0)
-                .map(|v| v.iter().sum())
-                .unwrap_or(0)
-        };
-        format!(
-            "invoked={} no_state={} passthrough={} aligned={} classify_pass={} \
-             redirect={} redirect_drop={} tx_invoked={}",
-            read(0),
-            read(1),
-            read(2),
-            read(3),
-            read(4),
-            read(5),
-            read(6),
-            read(7),
-        )
-    }
-}
 
 /// Egress handle for one offloaded port: each frame goes out as a single
 /// atomic dgram (`[4-byte BE length][frame]`) that the kernel splices into

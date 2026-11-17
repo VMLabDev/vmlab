@@ -414,7 +414,7 @@ fn container_with_volumes(
         crate::config::hypervisor::HypervisorKind::Qemu
     };
     let hv = FakeHypervisor::new(script);
-    let ctr = ContainerInstance::new(
+    let mut ctr = ContainerInstance::new(
         "t",
         cfg,
         resolved,
@@ -426,6 +426,7 @@ fn container_with_volumes(
         kind,
         hv.clone(),
     );
+    ctr.set_host_facts(kvm_host());
     (ctr, hv)
 }
 
@@ -2815,6 +2816,23 @@ async fn a_vmlab_hv_vm_on_a_host_without_kvm_is_refused_at_start() {
     assert!(format!("{err:#}").contains("/dev/kvm"), "{err:#}");
     assert_eq!(hv.starts(), 0, "nothing was started");
     assert_eq!(vm.state().await, PowerState::Stopped);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_without_kvm_is_refused_before_launch_on_either_hypervisor() {
+    for script in [Script::healthy(), on_vmlab_hv(Script::healthy())] {
+        let dirs = Dirs::new();
+        let (mut ctr, hv) = container(&dirs, WORKLOAD, script);
+        ctr.set_host_facts(crate::config::hypervisor::HostFacts {
+            kvm: false,
+            ..kvm_host()
+        });
+        let (cbs, _observed) = callbacks();
+        let err = start_container(&ctr, cbs).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("KVM is required"), "{err:#}");
+        assert_eq!(hv.starts(), 0, "nothing was started");
+        assert_eq!(ctr.state().await, PowerState::Stopped);
+    }
 }
 
 #[tokio::test]

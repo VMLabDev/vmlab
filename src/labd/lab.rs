@@ -1236,8 +1236,8 @@ impl LabRuntime {
     }
 
     /// Verify the external binaries starting `targets` will need are on PATH
-    /// (the per-arch QEMU emulator, `qemu-img` for clones, `swtpm` when a VM
-    /// wants a TPM), so a missing package surfaces as one clear error before
+    /// (the per-arch QEMU emulator, `qemu-img` when it is the image tool,
+    /// `swtpm` when a VM wants a TPM), so a missing package surfaces as one clear error before
     /// any clone or boot work begins instead of a spawn failure mid-`up`.
     pub fn preflight_binaries(&self, targets: &[String]) -> Result<()> {
         let mut needed: Vec<String> = Vec::new();

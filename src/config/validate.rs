@@ -211,7 +211,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     // address (§9.8).
     let mut fwd_ports: Vec<(u16, Ipv4Addr)> = Vec::new();
     let mut claim = |port: u16, bind: Option<Ipv4Addr>| {
-        let bind = bind.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let bind = bind.unwrap_or(Ipv4Addr::LOCALHOST);
         let taken = fwd_ports
             .iter()
             .any(|(p, b)| *p == port && forward_binds_overlap(*b, bind));
@@ -3997,6 +3997,19 @@ lab "l" {
 }"#,
         );
         assert!(es.is_empty(), "expected clean validation, got: {es:#?}");
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { forward { host_port = 18080 to = "c:80" } }
+  container "c" { image = "nginx" nic { segment = "s" }
+    port { bind = "127.0.0.2" host = 18080 container = 80 }
+  }
+}"#,
+        );
+        assert!(
+            es.is_empty(),
+            "implicit loopback must not collide with 127.0.0.2: {es:#?}"
+        );
         assert_err(
             r#"import <vmlab.wcl>
 lab "l" {
@@ -4796,7 +4809,7 @@ lab "l" {
     fn the_hosts_default_is_validated_like_a_declaration() {
         let host = HvHost {
             defaults: HypervisorDefaults {
-                container: HypervisorKind::Vmlab,
+                container: Some(HypervisorKind::Vmlab),
                 vm: Some(HypervisorKind::Vmlab),
             },
             ..HvHost::kvm()

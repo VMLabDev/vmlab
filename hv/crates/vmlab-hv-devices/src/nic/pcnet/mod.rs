@@ -489,7 +489,7 @@ impl Pcnet {
     fn ring(&self, rx: bool) -> (u32, u32) {
         let (low, length) = if rx { (24, 76) } else { (30, 78) };
         let base = u32::from(self.csr[low]) | u32::from(self.csr[low + 1]) << 16;
-        (base, u32::from(self.csr[length]).max(1))
+        (base, u32::from(self.csr[length]).clamp(1, 512))
     }
 
     fn descriptor_address(&self, rx: bool, index: u32) -> u64 {
@@ -568,7 +568,11 @@ impl Pcnet {
         }
         let (_, count) = self.ring(false);
         let mut interrupt = false;
+        let mut budget = count;
         for _ in 0..count {
+            if budget == 0 {
+                break;
+            }
             let first = self.tx_index;
             let Some(desc) = self.read_descriptor(false, first) else {
                 self.csr[0] |= MERR;
@@ -583,6 +587,10 @@ impl Pcnet {
             let mut chain = Vec::new();
             let mut complete = false;
             for _ in 0..count {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
                 let Some(d) = self.read_descriptor(false, index) else {
                     break;
                 };

@@ -34,7 +34,7 @@ pub mod reference;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
 pub use catalog::list_repositories_filtered;
 pub use client::{PullProgress, Registry, cached_registry_template, ensure_registry_template};
@@ -49,61 +49,15 @@ pub use reference::with_version_tag;
 /// template login`). `registry` is a bare host like `ghcr.io`. Returns the
 /// path the credential was written to.
 pub async fn login(registry: &str, username: &str, password: &str) -> Result<PathBuf> {
-    use base64::Engine as _;
-    let scheme = if registry.starts_with("localhost") || registry.starts_with("127.0.0.1") {
-        "http"
-    } else {
-        "https"
-    };
-    let url = format!("{scheme}://{registry}/v2/");
-    let client = reqwest::Client::builder()
-        .user_agent("vmlab-oci/1")
-        .build()
-        .context("cannot build HTTP client")?;
-    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-
-    // First request may come back 401 with a Bearer challenge; satisfy it
-    // to actually exercise the credential.
-    let resp = client
-        .get(&url)
-        .header(reqwest::header::AUTHORIZATION, format!("Basic {basic}"))
-        .send()
-        .await
-        .context("registry login request failed")?;
-
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        if let Some(challenge) = resp
-            .headers()
-            .get(reqwest::header::WWW_AUTHENTICATE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(auth::parse_bearer_challenge)
-        {
-            let mut req = client.get(&challenge.realm);
-            let mut query = Vec::new();
-            if let Some(service) = &challenge.service {
-                query.push(("service", service.clone()));
-            }
-            if !query.is_empty() {
-                req = req.query(&query);
-            }
-            let token_resp = req
-                .header(reqwest::header::AUTHORIZATION, format!("Basic {basic}"))
-                .send()
-                .await
-                .context("token request failed")?;
-            if !token_resp.status().is_success() {
-                bail!("login failed: registry rejected the credential");
-            }
-        } else {
-            bail!("login failed: registry rejected the credential");
-        }
-    } else if !resp.status().is_success() {
-        bail!(
-            "login failed: registry {registry} returned {}",
-            resp.status()
-        );
-    }
-
+    client::HttpTransport::new(
+        registry.into(),
+        auth::Credential::Basic {
+            username: username.into(),
+            password: password.into(),
+        },
+    )?
+    .validate_login()
+    .await?;
     auth::store_login(registry, username, password)
 }
 
