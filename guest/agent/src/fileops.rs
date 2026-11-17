@@ -379,8 +379,8 @@ impl Session {
                     handle: self.insert_handle(Handle::Dir(Box::new(Mutex::new(DirCursor {
                         iter,
                         done: false,
-                    })))),
-                })?,
+                    }))))?,
+                })
             }
             Op::ReadDir { handle } => {
                 let entry = self.get_handle(handle).ok_or_else(bad_handle)?;
