@@ -369,6 +369,10 @@ pub fn nsexec_main(args: &[String]) -> ! {
             std::process::exit(127);
         }
     }
+    // This is a fresh start of the agent binary, so SIGPIPE is ignored
+    // again: the command must not inherit that.
+    // SAFETY: single-threaded trampoline about to exec.
+    unsafe { super::reset_signals() };
     // execvp: resolves argv[0] via the inherited PATH inside the chroot.
     let _ = nix::unistd::execvp(&c_argv[0], &c_argv);
     eprintln!("vmlab-agent: nsexec: exec {} failed", argv[0]);

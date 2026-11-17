@@ -34,8 +34,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 
 use nix::fcntl::OFlag;
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction};
-use nix::unistd::{Pid, pipe2};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use nix::unistd::pipe2;
 use std::os::unix::process::CommandExt;
 
 use super::{ExecPlan, spawn_piped_with};
@@ -46,11 +46,35 @@ const STATUS_FD: libc::c_int = 3;
 
 /// The command the shepherd started, for the SIGTERM handler.
 static COMMAND: AtomicI32 = AtomicI32::new(0);
+/// A pidfd on the command, or -1: what the SIGTERM handler kills through,
+/// so a SIGTERM racing the command's reaping can never reach a process that
+/// was handed its pid afterwards.
+static COMMAND_FD: AtomicI32 = AtomicI32::new(-1);
 /// A SIGTERM that arrived before the command had a pid.
 static TERMINATED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigterm(_: libc::c_int) {
     TERMINATED.store(true, Ordering::SeqCst);
+    kill_command();
+}
+
+/// SIGKILL the command, through its pidfd where there is one.
+fn kill_command() {
+    let fd = COMMAND_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: pidfd_send_signal(2) is a plain, async-signal-safe syscall
+        // on an fd this process holds open until it exits.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        };
+        return;
+    }
     let pid = COMMAND.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: kill(2) is async-signal-safe.
@@ -104,10 +128,14 @@ pub fn main(args: &[String]) -> ! {
             std::process::exit(127);
         }
     };
+    // SAFETY: pidfd_open(2) on the child just started, not yet reaped.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0u32) };
+    if fd >= 0 {
+        COMMAND_FD.store(fd as i32, Ordering::SeqCst);
+    }
     COMMAND.store(child, Ordering::SeqCst);
     if TERMINATED.load(Ordering::SeqCst) {
-        // SAFETY: plain kill(2) on the child just started.
-        unsafe { libc::kill(child, libc::SIGKILL) };
+        kill_command();
     }
     // The exec's stdio belong to the command. Holding them here would keep
     // the session's output open for as long as an orphan lives.
@@ -123,6 +151,11 @@ pub fn main(args: &[String]) -> ! {
                 nix::errno::Errno::EINTR => continue,
                 _ => break, // ECHILD: the tree has drained
             }
+        }
+        if pid == child {
+            // Reaped: its pid may be reused from here on, and only the
+            // pidfd still names it.
+            COMMAND.store(0, Ordering::SeqCst);
         }
         if pid == child
             && let Some(mut out) = status.take()
@@ -160,9 +193,11 @@ fn release_stdio() {
 /// code without waiting for the rest of the tree.
 pub(super) fn spawn(mut plan: ExecPlan, tree: &str) -> std::io::Result<Spawned> {
     let (status_r, status_w) = pipe2(OFlag::O_CLOEXEC)?;
-    let mut argv = vec!["/proc/self/exe".into(), "--shepherd".into(), "--".into()];
+    let mut argv = shepherd_argv();
     argv.append(&mut plan.spec.argv);
     plan.spec.argv = argv;
+    #[cfg(test)]
+    plan.spec.env.push((TEST_ENTRY_VAR.into(), "1".into()));
     let w = status_w.as_raw_fd();
     let spawned = spawn_piped_with(plan, |cmd| {
         // SAFETY: dup2/fcntl between fork and exec, both async-signal-safe.
@@ -190,6 +225,8 @@ pub(super) fn spawn(mut plan: ExecPlan, tree: &str) -> std::io::Result<Spawned> 
             "process tree {tree}: the shepherd exited with {code} before starting"
         )));
     };
+    // Resolved before anything can reap the shepherd.
+    let shepherd = super::ProcessRef::open(pid);
     record(tree, pid)?;
     let Spawned {
         input,
@@ -206,7 +243,7 @@ pub(super) fn spawn(mut plan: ExecPlan, tree: &str) -> std::io::Result<Spawned> 
         errors,
         resize,
         kill: Box::new(move || {
-            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+            shepherd.signal(Signal::SIGTERM);
         }),
         wait: Box::new(move || match read_number::<i32>(&mut status) {
             Some(code) => {
@@ -226,6 +263,32 @@ pub(super) fn spawn(mut plan: ExecPlan, tree: &str) -> std::io::Result<Spawned> 
         }),
     })
 }
+
+/// This binary again, entered as the shepherd.
+#[cfg(not(test))]
+fn shepherd_argv() -> Vec<String> {
+    vec!["/proc/self/exe".into(), "--shepherd".into(), "--".into()]
+}
+
+/// The test binary again, entered through [`tests::shepherd_entry`]: a
+/// libtest binary has no `--shepherd` of its own.
+#[cfg(test)]
+fn shepherd_argv() -> Vec<String> {
+    [
+        "/proc/self/exe",
+        "unix::shepherd::tests::shepherd_entry",
+        "--exact",
+        "--nocapture",
+        "-q",
+        "--",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// Set in a test shepherd's environment, so the entry acts only there.
+#[cfg(test)]
+const TEST_ENTRY_VAR: &str = "VMLAB_AGENT_TEST_SHEPHERD";
 
 fn read_number<T: std::str::FromStr>(from: &mut impl BufRead) -> Option<T> {
     let mut line = String::new();
@@ -273,21 +336,61 @@ fn forget(tree: &str, pid: u32) {
 /// shepherd. Zero when there is no record, or the pid it names is no longer
 /// that shepherd.
 pub fn status(tree: &str) -> Result<u32, String> {
+    match shepherd_of(tree) {
+        Some(pid) => Ok(descendants(pid, &parents()?)),
+        None => Ok(0),
+    }
+}
+
+/// The live shepherd `tree`'s record names, dropping a stale record.
+fn shepherd_of(tree: &str) -> Option<u32> {
     let path = trees_dir().join(tree);
-    let Ok(text) = fs::read_to_string(&path) else {
-        return Ok(0);
-    };
+    let text = fs::read_to_string(&path).ok()?;
     let mut fields = text.split_whitespace().map(str::parse::<u64>);
     let (Some(Ok(pid)), Some(Ok(start))) = (fields.next(), fields.next()) else {
         let _ = fs::remove_file(&path);
-        return Ok(0);
+        return None;
     };
     let pid = pid as u32;
     if start_time(pid) != Some(start) {
         let _ = fs::remove_file(&path);
-        return Ok(0);
+        return None;
     }
-    Ok(descendants(pid, &parents()?))
+    Some(pid)
+}
+
+/// SIGKILL every process of `tree` below its shepherd, at any depth,
+/// repeating while a pass still finds one so a process forked mid-pass is
+/// caught too. The shepherd itself is left to its own kill, which ends the
+/// command and lets it report the exit code.
+///
+/// This reaches what an environment scan cannot: a process that cleared its
+/// environment, or detached with `setsid` and a double fork, is still the
+/// shepherd's (PR_SET_CHILD_SUBREAPER).
+pub fn kill_tree(tree: &str) {
+    let Some(shepherd) = shepherd_of(tree) else {
+        return;
+    };
+    for _ in 0..5 {
+        let Ok(parents) = parents() else {
+            return;
+        };
+        let members = members(shepherd, &parents);
+        if members.is_empty() {
+            return;
+        }
+        for pid in &members {
+            let process = super::ProcessRef::open(*pid);
+            // The pid was read from a scan: only kill it if, now that it is
+            // pinned, it is still a member and not a newcomer to the number.
+            let still_member = stat(*pid)
+                .is_some_and(|(ppid, _)| ppid == shepherd || members.contains(&ppid));
+            if still_member {
+                process.signal(Signal::SIGKILL);
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// One process's (parent, start time) from `/proc/<pid>/stat`.
@@ -321,24 +424,43 @@ fn parents() -> Result<HashMap<u32, u32>, String> {
 
 /// How many processes descend from `root` in `parents`.
 fn descendants(root: u32, parents: &HashMap<u32, u32>) -> u32 {
+    members(root, parents).len() as u32
+}
+
+/// Every process descending from `root` in `parents`, at any depth.
+fn members(root: u32, parents: &HashMap<u32, u32>) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (&pid, &ppid) in parents {
         children.entry(ppid).or_default().push(pid);
     }
-    let mut count = 0;
+    let mut found = Vec::new();
     let mut stack = vec![root];
     while let Some(pid) = stack.pop() {
         for &child in children.get(&pid).map(Vec::as_slice).unwrap_or_default() {
-            count += 1;
+            found.push(child);
             stack.push(child);
         }
     }
-    count
+    found
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shepherd, when the test binary is re-entered as one (see
+    /// [`shepherd_argv`]). Run as an ordinary test it does nothing.
+    #[test]
+    fn shepherd_entry() {
+        if std::env::var_os(TEST_ENTRY_VAR).is_none() {
+            return;
+        }
+        let args: Vec<String> = std::env::args().collect();
+        let Some(at) = args.iter().position(|a| a == "--") else {
+            return;
+        };
+        main(&args[at..]);
+    }
 
     #[test]
     fn stat_fields_survive_a_command_name_with_spaces_and_parens() {

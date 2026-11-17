@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{
 use super::logon::MintedLogon;
 use super::port::wide;
 use super::proc::{Owned, agent_env_block, create_as_user, env_block};
-use crate::spawn::{Spawned, TerminalSpec, command_line};
+use crate::spawn::{Spawned, TerminalSpec, checked_command_line};
 
 /// Windows-side MOTD, written down the ConPTY input? No — ConPTY input is
 /// keystrokes. The banner is printed by prepending an echo to the command
@@ -104,7 +104,7 @@ pub fn spawn(spec: TerminalSpec, logon: Option<&MintedLogon>) -> std::io::Result
         env,
     } = spec;
     let cmdline = match command {
-        Some(argv) if !argv.is_empty() => command_line(&argv),
+        Some(argv) if !argv.is_empty() => checked_command_line(&argv)?,
         _ => DEFAULT_SHELL.to_string(),
     };
 
@@ -301,15 +301,17 @@ fn spawn_with_conpty(
     }
 }
 
-/// Kill an arbitrary process by pid (exec sessions).
-pub fn kill_process(pid: u32) {
+/// The kill hook for a child not yet waited on (exec sessions). The handle
+/// is opened now and held, so it names this process until the hook is
+/// dropped: a later process handed the pid is never the one terminated.
+pub fn process_killer(pid: u32) -> Box<dyn Fn() + Send + Sync> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
-    // SAFETY: open-then-terminate; a null handle is checked.
-    unsafe {
-        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if !h.is_null() {
-            TerminateProcess(h, 137);
-            CloseHandle(h);
+    // SAFETY: plain OpenProcess; a null handle is checked before use.
+    let process = Owned(unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) });
+    Box::new(move || {
+        if !process.0.is_null() {
+            // SAFETY: a process handle we hold open.
+            unsafe { TerminateProcess(process.0, 137) };
         }
-    }
+    })
 }

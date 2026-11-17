@@ -269,6 +269,11 @@ impl Mux {
 
     /// Bind all replies and cleanup to this opening of a channel. Old
     /// workers retain its cancellation flag even if the host reuses the id.
+    /// Whether `other` is a handle onto the same port connection as this.
+    pub fn same_port(&self, other: &Mux) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn for_channel(&self, id: u32) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -512,8 +517,10 @@ impl Mux {
                 token,
             } => {
                 // Fresh host handshake: whatever the previous host connection
-                // had open is gone.
+                // had open is gone, its metrics subscription included — a
+                // new host that never subscribed must not receive samples.
                 self.remove_all();
+                crate::metrics::release(self);
                 if proto_version != PROTO_VERSION {
                     self.send_error(
                         None,

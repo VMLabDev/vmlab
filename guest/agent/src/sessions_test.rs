@@ -58,6 +58,95 @@ fn terminal_runs_an_interactive_shell() {
     assert_eq!(code, 7);
 }
 
+/// A shell on a terminal starts with the signal state of a fresh process:
+/// the agent's ignored SIGPIPE and whatever mask the spawning thread holds
+/// survive `execve` unless the fork undoes them, and a shell with SIGPIPE
+/// ignored cannot end `yes | head`.
+#[test]
+fn a_terminal_shell_starts_with_default_signals() {
+    // Block a signal in the thread that forks the shell, as a library
+    // the agent links could.
+    // SAFETY: plain pthread_sigmask on this test thread with a local set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTerminal {
+            id: 4,
+            cols: 200,
+            rows: 24,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec grep -E '^Sig(Blk|Ign)' /proc/self/status".into(),
+            ]),
+            env: vec![],
+            logon: None,
+        },
+    );
+    // SAFETY: as above, undoing the block.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
+    let (out, _err, code) = cap.until_exited(4);
+    assert_eq!(code, 0);
+    let text = String::from_utf8_lossy(&out);
+    for field in ["SigBlk", "SigIgn"] {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(field))
+            .unwrap_or_else(|| panic!("no {field} in {text}"));
+        assert!(
+            line.split_whitespace().nth(1).unwrap().bytes().all(|b| b == b'0'),
+            "the shell inherited a signal state: {line}"
+        );
+    }
+}
+
+/// A background job keeps the terminal open after its shell has exited, and
+/// the session must still end: the host hears `exited` with the shell's
+/// code, not when the job finally lets go of the terminal.
+#[test]
+fn a_terminal_ends_while_a_background_job_holds_it() {
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTerminal {
+            id: 5,
+            cols: 80,
+            rows: 24,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 60 & exit 3".into(),
+            ]),
+            env: vec![],
+            logon: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 5 });
+    let started = std::time::Instant::now();
+    let (_out, _err, code) = cap.until_exited(5);
+    assert_eq!(code, 3);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(9),
+        "the session waited on the background job"
+    );
+}
+
 #[test]
 fn terminal_resize_reaches_the_pty() {
     let (mux, mut cap) = capture_mux();
