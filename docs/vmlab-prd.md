@@ -2619,7 +2619,8 @@ lifecycle.
 **Selection.** A `vm` or `container` block names its hypervisor with
 `hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
-`qemu` for both until changed. The field is declared on the machine only and
+automatic for both kinds, preserving existing identity and selecting vmlab-hv
+for supported new machines (§22.1). The field is declared on the machine only and
 never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
@@ -2640,7 +2641,7 @@ default for a phase's machines flips only once that phase has passed its gate:
 
 | Phase | Runs | Status |
 | --- | --- | --- |
-| 1 | Container micro-VMs (§18), x86_64 under KVM | Selectable |
+| 1 | Container micro-VMs (§18), x86_64 under KVM | Default for new containers |
 | 2a | Modern x86_64 VMs: q35 on SeaBIOS, virtio and AHCI disks, AHCI CD-ROMs, virtio-net, the USB tablet | Selectable |
 | 2b | Their display: the native frame protocol (screenshots, vision, input, the recorder) and an RFB server | Selectable |
 | 2c | OVMF, secure boot, a TPM, Hyper-V, Windows | Selectable |
