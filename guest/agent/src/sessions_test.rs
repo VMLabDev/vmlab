@@ -113,7 +113,11 @@ fn a_terminal_shell_starts_with_default_signals() {
     // Signal n is bit n-1. Only SIGPIPE is the agent's own doing: whatever
     // the agent was itself started ignoring is the guest's business.
     let sigpipe = 1u64 << (libc::SIGPIPE - 1);
-    assert_eq!(mask("SigIgn:") & sigpipe, 0, "the shell inherited SIGPIPE ignored");
+    assert_eq!(
+        mask("SigIgn:") & sigpipe,
+        0,
+        "the shell inherited SIGPIPE ignored"
+    );
 }
 
 /// A background job keeps the terminal open after its shell has exited, and
