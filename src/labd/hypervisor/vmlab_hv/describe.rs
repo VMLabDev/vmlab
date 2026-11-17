@@ -627,7 +627,6 @@ pub(crate) fn vm(
         DisplayDevice::CirrusVga => roms.vgabios_cirrus.clone(),
         // OVMF drives it through its GOP; no legacy VGA BIOS.
         DisplayDevice::VmwareSvga => None,
-        }
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
     // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead. Under
