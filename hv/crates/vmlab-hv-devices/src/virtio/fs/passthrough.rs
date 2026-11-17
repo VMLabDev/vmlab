@@ -1582,13 +1582,14 @@ fn read_dir(dir: &OwnedFd) -> io::Result<Vec<CachedDirent>> {
         }
         let mut pos = 0usize;
         while pos < n as usize {
-            // SAFETY: getdents64 wrote `n` bytes of well-formed records;
-            // every record is at least DIRENT_FIXED bytes long and its
-            // reclen bounds the name.
-            let record = unsafe { &*(buffer.as_ptr().add(pos) as *const Dirent64) };
-            let reclen = record.reclen as usize;
-            if pos + DIRENT_FIXED > n as usize || reclen < DIRENT_FIXED || pos + reclen > n as usize
-            {
+            if pos + DIRENT_FIXED > n as usize {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            // Parse bytes rather than forming an aligned reference into a u8 buffer.
+            let record = &buffer[pos..n as usize];
+            let ino = u64::from_ne_bytes(record[..8].try_into().unwrap());
+            let reclen = u16::from_ne_bytes(record[16..18].try_into().unwrap()) as usize;
+            if reclen < DIRENT_FIXED || pos + reclen > n as usize {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             let name = buffer[pos + DIRENT_FIXED..pos + reclen]
@@ -1599,24 +1600,14 @@ fn read_dir(dir: &OwnedFd) -> io::Result<Vec<CachedDirent>> {
             if name != b"." && name != b".." {
                 entries.push(CachedDirent {
                     name,
-                    host_ino: record.ino,
-                    d_type: record.d_type,
+                    host_ino: ino,
+                    d_type: record[18],
                 });
             }
             pos += reclen;
         }
     }
     Ok(entries)
-}
-
-/// `struct linux_dirent64` as getdents64 writes it: three fixed fields,
-/// a one-byte type, then the NUL-terminated name padded to 8 bytes.
-#[repr(C)]
-struct Dirent64 {
-    ino: u64,
-    off: i64,
-    reclen: u16,
-    d_type: u8,
 }
 
 /// offsetof(d_type) in `struct linux_dirent64`: 8 + 8 + 2 + 1.
@@ -2139,6 +2130,27 @@ mod tests {
             names,
             vec![b"hello.txt".to_vec(), b"link".to_vec(), b"sub".to_vec()]
         );
+        FileSystem::releasedir(&fs, &ctx(), ROOT_ID, 0, handle).unwrap();
+    }
+
+    #[test]
+    fn readdir_handles_mixed_record_lengths() {
+        let (dir, fs) = scratch();
+        let expected = (1..=64).map(|n| "x".repeat(n)).collect::<Vec<_>>();
+        for name in &expected {
+            std::fs::write(dir.path().join(name), []).unwrap();
+        }
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        let mut names = Vec::new();
+        FileSystem::readdir(&fs, &ctx(), ROOT_ID, handle, 65536, 0, &mut |d| {
+            names.push(d.name.to_vec());
+            Ok(d.name.len() + 24)
+        })
+        .unwrap();
+        for name in expected {
+            assert!(names.contains(&name.into_bytes()));
+        }
         FileSystem::releasedir(&fs, &ctx(), ROOT_ID, 0, handle).unwrap();
     }
 

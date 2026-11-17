@@ -306,21 +306,31 @@ impl State {
             let resource = &s.resources[&id];
             let full = previous.is_none() || s.flushes.is_empty();
             for y in 0..r.h {
-                for x in 0..r.w {
-                    if !full
-                        && !s.flushes.iter().any(|f| {
-                            x + r.x >= f.x
-                                && x + r.x < f.x + f.w
-                                && y + r.y >= f.y
-                                && y + r.y < f.y + f.h
+                // Merge damage on each row before copying. Testing every
+                // rectangle at every pixel multiplies guest-controlled work.
+                let mut spans = if full {
+                    vec![(0, r.w)]
+                } else {
+                    s.flushes
+                        .iter()
+                        .filter_map(|f| {
+                            let start = f.x.max(r.x);
+                            let end = (f.x + f.w).min(r.x + r.w);
+                            (y + r.y >= f.y && y + r.y < f.y + f.h && start < end)
+                                .then(|| (start - r.x, end - r.x))
                         })
-                    {
-                        continue;
+                        .collect::<Vec<_>>()
+                };
+                spans.sort_unstable();
+                let mut copied = 0;
+                for (start, end) in spans {
+                    for x in start.max(copied)..end {
+                        let src = ((y + r.y) * resource.width + x + r.x) as usize * 4;
+                        let dst = (y * r.w + x) as usize * 4;
+                        let p = resource.pixel(src);
+                        pixels[dst..dst + 3].copy_from_slice(&p[..3]);
                     }
-                    let src = ((y + r.y) * resource.width + x + r.x) as usize * 4;
-                    let dst = (y * r.w + x) as usize * 4;
-                    let p = resource.pixel(src);
-                    pixels[dst..dst + 3].copy_from_slice(&p[..3]);
+                    copied = copied.max(end);
                 }
             }
         }

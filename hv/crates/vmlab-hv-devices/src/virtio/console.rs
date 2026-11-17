@@ -61,6 +61,7 @@ const EV_PORT_NAME: u16 = 7;
 const READ_CHUNK: usize = 64 * 1024;
 /// Hard limit on staged output, including the current pass.
 const MAX_TX_STAGE: usize = 1024 * 1024;
+const MAX_RX_STAGE: usize = READ_CHUNK;
 
 /// One named virtio-serial port served on a unix socket.
 #[derive(Debug, Clone)]
@@ -405,7 +406,11 @@ fn run(
             }
             if revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; READ_CHUNK];
-                let outcome = clients[i].as_mut().map(|c| c.read(&mut buf));
+                let capacity = MAX_RX_STAGE.saturating_sub(lock(&shared).ports[i].rx_stage.len());
+                if capacity == 0 {
+                    continue;
+                }
+                let outcome = clients[i].as_mut().map(|c| c.read(&mut buf[..capacity]));
                 match outcome {
                     Some(Ok(0)) => disconnect(&shared, &mut clients, i),
                     Some(Ok(n)) => {
@@ -492,7 +497,7 @@ fn rx_has_capacity(shared: &Arc<Mutex<Shared>>, queue: u16) -> bool {
     let open = rx_port(queue)
         .filter(|port| *port >= 1)
         .and_then(|port| sh.ports.get(usize::from(port - 1)))
-        .is_some_and(|port| port.guest_open);
+        .is_some_and(|port| port.guest_open && port.rx_stage.len() < MAX_RX_STAGE);
     if sh.snapshot_paused || !open {
         return false;
     }
@@ -865,7 +870,12 @@ impl VirtioDevice for Console {
         let mut config = [0u8; CONFIG_LEN];
         config[4..8].copy_from_slice(&self.max_nr_ports().to_le_bytes());
         for (i, byte) in data.iter_mut().enumerate() {
-            *byte = config.get(offset as usize + i).copied().unwrap_or(0);
+            *byte = usize::try_from(offset)
+                .ok()
+                .and_then(|offset| offset.checked_add(i))
+                .and_then(|index| config.get(index))
+                .copied()
+                .unwrap_or(0);
         }
     }
 
@@ -1522,6 +1532,29 @@ mod tests {
         flush_pending(&mut sh);
         assert_eq!(sh.pending, expected);
         assert!(sh.pending.len() <= sh.control_cap());
+    }
+
+    #[test]
+    fn config_reads_at_maximum_offset_return_zero() {
+        let f = Fixture::new();
+        let mut bytes = [0xff; 8];
+        f.dev.read_config(u64::MAX, &mut bytes);
+        assert_eq!(bytes, [0; 8]);
+    }
+
+    #[test]
+    fn full_receive_stage_backpressures_the_host_socket() {
+        let f = Fixture::new();
+        {
+            let mut sh = lock(&f.dev.shared);
+            sh.ports[0].guest_open = true;
+            sh.ports[0].rx_stage.resize(MAX_RX_STAGE, 42);
+        }
+        // An available but unusable guest chain must not permit more staging.
+        f.mem
+            .write_obj(1u16, GuestAddress(f.vqs[0].avail + 2))
+            .unwrap();
+        assert!(!rx_has_capacity(&f.dev.shared, rx_queue(1)));
     }
 
     #[test]

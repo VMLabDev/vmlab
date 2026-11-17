@@ -727,7 +727,11 @@ impl Ide {
             Payload::Read { offset, .. } => (offset, None),
             Payload::Bytes(bytes) => (0, Some(bytes)),
         };
-        let unit = self.channels[channel].selected;
+        let unit = if packet {
+            self.channels[channel].transfer.unit
+        } else {
+            self.channels[channel].selected
+        };
         self.channels[channel].transfer = Transfer {
             phase: if dma { Phase::DmaRead } else { Phase::Read },
             unit,
@@ -1167,6 +1171,7 @@ impl Snapshot for Ide {
                 || c.buffer.len() > 65536
                 || c.position > c.buffer.len()
                 || c.phase_bytes > c.buffer.len()
+                || c.packet_limit > 65534
                 || t.bytes.as_ref().is_some_and(|v| v.len() > MAX_TRANSFER)
                 || c.units.iter().any(|u| {
                     u.heads == 0
@@ -1182,6 +1187,15 @@ impl Snapshot for Ide {
                     .is_some_and(|bytes| t.offset + t.remaining as u64 > bytes.len() as u64)
             {
                 return Err(invalid());
+            }
+            for (unit, drive) in c.units.iter().zip(&self.drives[index]) {
+                let limit = match drive {
+                    Some(Drive::Disk(d)) => d.image.size() / 512,
+                    _ => 0,
+                };
+                if unit.limit > limit {
+                    return Err(invalid());
+                }
             }
             if matches!(t.phase, Phase::Read | Phase::Write | Phase::Packet)
                 && (c.phase_bytes == 0
