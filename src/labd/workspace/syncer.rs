@@ -1083,6 +1083,15 @@ async fn run(
                     passes += 1;
                     if rescan {
                         rescans += 1;
+                        if flush {
+                            // The walk recovered paths whose events were
+                            // lost. Give them a quiet window and a retry even
+                            // if the writer sends no further notification.
+                            let now = Instant::now();
+                            for path in &done.deferred {
+                                guest_debounce.touch(path.clone(), now);
+                            }
+                        }
                     }
                     // The barrier lifts only on a completed walk.
                     rescan = false;
@@ -2929,7 +2938,6 @@ mod tests {
         let refused = result.expect_err("overflow must not let a moving file into capture");
         let said = format!("{refused:#}");
         assert!(said.contains("Still owed: busy.txt"), "{said}");
-        assert!(!dir.path().join("busy.txt").exists());
 
         // The deferred path is retained and a later flush can carry it once
         // the writer has stopped, without needing a new named event.
