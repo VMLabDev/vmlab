@@ -436,9 +436,17 @@ pub fn shell_quote(arg: &str) -> String {
 /// `su -l` resets the environment on purpose (that is the login), so the
 /// host's overrides are re-applied here rather than passed to `su`, which
 /// would drop them.
+///
+/// A key goes into the script unquoted, where only a shell name can stand,
+/// so a key that is not one (`A=1; reboot; B`) is left out rather than run
+/// (code review F61a).
 pub fn login_script(env: &[(String, String)], cwd: Option<&str>, argv: &[String]) -> String {
     let mut script = String::new();
     for (key, value) in env {
+        if !is_shell_name(key) {
+            eprintln!("vmlab-agent: environment key {key:?} is not a shell name; left out");
+            continue;
+        }
         script.push_str(&format!("export {key}={}; ", shell_quote(value)));
     }
     if let Some(cwd) = cwd {
@@ -450,6 +458,16 @@ pub fn login_script(env: &[(String, String)], cwd: Option<&str>, argv: &[String]
         script.push_str(&shell_quote(arg));
     }
     script
+}
+
+/// Whether `key` is a name a POSIX shell can `export`: a letter or `_`, then
+/// letters, digits and `_`.
+pub fn is_shell_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// `su -l <account>`, optionally running one script rather than a shell.
@@ -929,6 +947,24 @@ mod tests {
             "export K='a b'; cd '/src/my project' || exit 1; \
              exec 'git' 'commit' '-m' 'it'\\''s $HOME'"
         );
+    }
+
+    /// Code review F61a: a key that is not a shell name never reaches the
+    /// script, where it would run as a command.
+    #[test]
+    fn the_login_script_leaves_out_a_key_that_is_not_a_name() {
+        let script = login_script(
+            &[
+                ("A=1; reboot; B".into(), "x".into()),
+                ("$(id)".into(), "x".into()),
+                ("".into(), "x".into()),
+                ("1X".into(), "x".into()),
+                ("_OK2".into(), "y".into()),
+            ],
+            None,
+            &["true".into()],
+        );
+        assert_eq!(script, "export _OK2='y'; exec 'true'");
     }
 
     /// `exec` rather than a plain call: the shell `su` started is replaced, so

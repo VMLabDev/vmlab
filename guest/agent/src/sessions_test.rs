@@ -636,6 +636,101 @@ fn closing_the_channel_releases_every_handle() {
     ));
 }
 
+/// Code review F61d: one channel holds at most `MAX_HANDLES` handles, a
+/// close makes room again, and an offset that would pass `u64::MAX` is an
+/// error rather than a wrap (or a panic).
+#[test]
+fn fileops_caps_handles_and_refuses_an_overflowing_offset() {
+    use crate::fileops::MAX_HANDLES;
+    // Enough descriptors for the cap, where the hard limit allows it.
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    let want = (MAX_HANDLES as libc::rlim_t) * 4;
+    if lim.rlim_cur < want {
+        if lim.rlim_max < want {
+            eprintln!("skipped: RLIMIT_NOFILE hard limit {} too low", lim.rlim_max);
+            return;
+        }
+        lim.rlim_cur = want;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"data").unwrap();
+    let path = path.to_str().unwrap().to_string();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenFileOps {
+            id: 30,
+            logon: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 30 });
+    let open_one = |cap: &mut crate::testutil::Capture, req: u64| {
+        ask(
+            &mux,
+            30,
+            req,
+            Op::Open {
+                path: path.clone(),
+                flags: OpenFlags::create_truncate(),
+                mode: None,
+            },
+        );
+        cap.fileops(30).0.reply
+    };
+    let mut first = None;
+    for i in 0..MAX_HANDLES as u64 {
+        match open_one(&mut cap, i + 1) {
+            Reply::Handle { handle } => first = first.or(Some(handle)),
+            other => panic!("open {i} failed: {other:?}"),
+        }
+    }
+    match open_one(&mut cap, 5000) {
+        Reply::Error { msg, .. } => assert!(msg.contains("open handles"), "{msg}"),
+        other => panic!("expected the cap, got {other:?}"),
+    }
+    let handle = first.unwrap();
+
+    ask_with(
+        &mux,
+        30,
+        5001,
+        Op::Write {
+            handle,
+            offset: u64::MAX - 1,
+        },
+        b"xyz",
+    );
+    assert!(matches!(cap.fileops(30).0.reply, Reply::Error { .. }));
+    ask(
+        &mux,
+        30,
+        5002,
+        Op::Read {
+            handle,
+            offset: u64::MAX,
+            len: 8,
+        },
+    );
+    // Past the end: nothing to read, and no panic on the way.
+    let (reply, bytes) = cap.fileops(30);
+    assert!(matches!(reply.reply, Reply::Data | Reply::Error { .. }));
+    assert!(bytes.is_empty());
+
+    ask(&mux, 30, 5003, Op::Close { handle });
+    assert_eq!(cap.fileops(30).0.reply, Reply::Ok);
+    assert!(matches!(open_one(&mut cap, 5004), Reply::Handle { .. }));
+    mux.remove(30);
+}
+
 #[test]
 fn tail_sends_backlog_then_appends() {
     use std::io::Write;
@@ -668,6 +763,36 @@ fn tail_sends_backlog_then_appends() {
     std::fs::write(&path, "rotated content\n").unwrap();
     cap.data_until(9, b"rotated content");
     mux.remove(9);
+}
+
+/// Code review F61c: a FIFO at the path is refused at once rather than
+/// blocking the open until a writer comes; a directory is refused too.
+#[cfg(unix)]
+#[test]
+fn tail_refuses_a_fifo_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    for (id, path) in [(21, fifo.as_path()), (22, dir.path())] {
+        open(
+            &mux,
+            &p,
+            HostMsg::OpenTail {
+                id,
+                path: path.to_str().unwrap().into(),
+                logon: None,
+            },
+        );
+        match cap.ctrl() {
+            AgentMsg::Error { id: Some(got), msg } => {
+                assert_eq!(got, id);
+                assert!(msg.contains("not a regular file"), "{msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
 }
 
 #[test]

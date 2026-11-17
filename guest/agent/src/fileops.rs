@@ -60,6 +60,11 @@ type WorkQueue = Arc<Mutex<Receiver<Work>>>;
 /// throttled by the credit window rather than by an unbounded queue.
 const WORK_QUEUE: usize = 64;
 
+/// The most handles one session holds open at once (code review F61d).
+/// A transfer holds a handful; a tree push pipelines at most
+/// [`WORK_QUEUE`] requests, so this is far past any honest client.
+pub(crate) const MAX_HANDLES: usize = 1024;
+
 /// Open a file session on channel `id`, serving `identity`'s view of the
 /// filesystem. `resolve` maps host-supplied guest paths (a container
 /// micro-VM resolves them inside its rootfs).
@@ -228,13 +233,27 @@ impl Session {
             .cloned()
     }
 
-    fn insert_handle(&self, handle: Handle) -> u64 {
+    /// Refuse an open before it touches the guest when the table is full.
+    fn room_for_handle(&self) -> Result<(), OpError> {
+        if self.handles.lock().expect("handles lock").len() >= MAX_HANDLES {
+            return Err(too_many_handles());
+        }
+        Ok(())
+    }
+
+    /// Hand out a handle, never past [`MAX_HANDLES`] (code review F61d): a
+    /// host that opens and never closes would otherwise hold guest file
+    /// descriptors until the agent itself runs out. Checked again here
+    /// because two workers can pass [`Self::room_for_handle`] at once; the
+    /// refused handle is dropped, which closes it.
+    fn insert_handle(&self, handle: Handle) -> Result<u64, OpError> {
+        let mut handles = self.handles.lock().expect("handles lock");
+        if handles.len() >= MAX_HANDLES {
+            return Err(too_many_handles());
+        }
         let id = self.next_handle.fetch_add(1, Ordering::SeqCst);
-        self.handles
-            .lock()
-            .expect("handles lock")
-            .insert(id, Arc::new(handle));
-        id
+        handles.insert(id, Arc::new(handle));
+        Ok(id)
     }
 
     /// Serve one operation. The payload is a write's bytes; the returned
@@ -256,13 +275,14 @@ impl Session {
         let ok = |reply| Ok((reply, Vec::new()));
         match op {
             Op::Open { path, flags, mode } => {
+                self.room_for_handle()?;
                 let path = self.path(&path, Last::Follow)?;
                 let file = open_file(&path, flags, mode).context(&path)?;
                 ok(Reply::Handle {
                     handle: self.insert_handle(Handle::File {
                         file,
                         append: flags.append,
-                    }),
+                    })?,
                 })
             }
             Op::Close { handle } => {
@@ -352,6 +372,7 @@ impl Session {
                 ok(Reply::Ok)
             }
             Op::OpenDir { path } => {
+                self.room_for_handle()?;
                 let path = self.path(&path, Last::Follow)?;
                 let iter = std::fs::read_dir(&path).context(&path)?;
                 ok(Reply::Handle {
@@ -359,7 +380,7 @@ impl Session {
                         iter,
                         done: false,
                     })))),
-                })
+                })?,
             }
             Op::ReadDir { handle } => {
                 let entry = self.get_handle(handle).ok_or_else(bad_handle)?;
@@ -471,6 +492,13 @@ impl From<std::io::Error> for OpError {
     }
 }
 
+fn too_many_handles() -> OpError {
+    OpError {
+        code: ErrorCode::Failure,
+        msg: format!("this channel already holds {MAX_HANDLES} open handles; close some first"),
+    }
+}
+
 fn bad_handle() -> OpError {
     OpError {
         code: ErrorCode::BadHandle,
@@ -521,12 +549,23 @@ fn open_file(path: &str, flags: OpenFlags, mode: Option<u32>) -> std::io::Result
     Ok(file)
 }
 
+/// `offset + done`, or an error where a client's offset would carry it past
+/// `u64::MAX` (code review F61d) rather than wrap onto the file's start.
+fn at(offset: u64, done: usize) -> std::io::Result<u64> {
+    offset.checked_add(done as u64).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "offset past the largest file offset",
+        )
+    })
+}
+
 #[cfg(unix)]
 fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
     let mut done = 0;
     while done < buf.len() {
-        match file.read_at(&mut buf[done..], offset + done as u64)? {
+        match file.read_at(&mut buf[done..], at(offset, done)?)? {
             0 => break,
             n => done += n,
         }
@@ -539,7 +578,7 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     use std::os::windows::fs::FileExt;
     let mut done = 0;
     while done < buf.len() {
-        match file.seek_read(&mut buf[done..], offset + done as u64)? {
+        match file.seek_read(&mut buf[done..], at(offset, done)?)? {
             0 => break,
             n => done += n,
         }
@@ -556,7 +595,7 @@ fn write_at(file: &File, offset: u64, buf: &[u8], append: bool) -> std::io::Resu
     }
     let mut done = 0;
     while done < buf.len() {
-        let n = write_some(file, offset + done as u64, &buf[done..])?;
+        let n = write_some(file, at(offset, done)?, &buf[done..])?;
         if n == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
         }
