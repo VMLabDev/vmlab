@@ -307,6 +307,7 @@ impl Report {
             volume: self.volume.as_ref().map(Volume::to_string),
             rescan: self.rescan.clone(),
             reseed: self.reseed.clone(),
+            unanswered: self.unanswered.clone(),
             rescans: self.rescans,
             skipped: self
                 .skipped
@@ -2905,6 +2906,22 @@ mod tests {
         assert!(!dir.path().join("late.txt").exists());
         assert!(syncer.report().unanswered.is_some());
 
+        // Flush and status must give the same reason as capture, including
+        // through the serialized status the daemon sends to the CLI.
+        let flush = syncer.pass_now().await.unwrap().project();
+        let status = syncer.report().project();
+        for report in [flush, status] {
+            let wire = serde_json::to_value(report).unwrap();
+            let report = serde_json::from_value(wire).unwrap();
+            let said = crate::cli::dev::sync_report("dev01", &report);
+            assert!(
+                said.contains("waiting: The guest's watch did not answer"),
+                "{said}"
+            );
+            assert!(said.contains("not reported yet are unknown"), "{said}");
+            assert!(!said.contains("in step"), "{said}");
+        }
+
         sessions.watcher.unmute();
         assert!(
             eventually(|| std::fs::read_to_string(dir.path().join("late.txt"))
@@ -2916,6 +2933,13 @@ mod tests {
         );
         syncers.before_capture("dev01", None).await.unwrap();
         assert!(syncer.report().unanswered.is_none());
+        let flush = syncer.pass_now().await.unwrap().project();
+        let status = syncer.report().project();
+        for report in [flush, status] {
+            let said = crate::cli::dev::sync_report("dev01", &report);
+            assert!(!said.contains("watch did not answer"), "{said}");
+            assert!(said.contains("in step"), "{said}");
+        }
         syncers.stop("dev01").await;
     }
 
