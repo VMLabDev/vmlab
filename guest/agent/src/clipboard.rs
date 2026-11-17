@@ -31,7 +31,9 @@ pub const NO_DESKTOP_LOGON: &str = "no one is logged on to the desktop; the Wind
 pub const MAX_CLIPBOARD: usize = vmlab_agent_proto::MAX_PAYLOAD;
 
 /// What a clipboard tool printed, read no further than [`MAX_CLIPBOARD`].
+/// Linux reads only `stdout`; macOS reports `status` and `stderr` too.
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct ToolOutput {
     pub status: std::process::ExitStatus,
     pub stdout: Vec<u8>,

@@ -36,18 +36,16 @@ pub(super) fn parse(bytes: &[u8], len: usize) -> Vec<(u32, String)> {
         let Some(name_end) = name_at.checked_add(name_len) else {
             return out;
         };
-        if name_end > len || name_len % 2 != 0 {
+        if name_end > len || !name_len.is_multiple_of(2) {
             return out;
         }
-        let units: Vec<u16> = bytes[name_at..name_end]
-            .chunks_exact(2)
-            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
-            .collect();
+        let (pairs, _) = bytes[name_at..name_end].as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|&c| u16::from_ne_bytes(c)).collect();
         let rel = String::from_utf16_lossy(&units).replace('\\', "/");
         if !rel.is_empty() {
             out.push((action, rel));
         }
-        if next == 0 || next % 4 != 0 {
+        if next == 0 || !next.is_multiple_of(4) {
             return out;
         }
         match offset.checked_add(next) {
