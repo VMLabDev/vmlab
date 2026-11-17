@@ -271,19 +271,27 @@ fn shepherd_argv() -> Vec<String> {
 }
 
 /// The test binary again, entered through [`tests::shepherd_entry`]: a
-/// libtest binary has no `--shepherd` of its own.
+/// libtest binary has no `--shepherd` of its own. What libtest prints before
+/// the entry runs is not the command's output, so stdout waits on fd 4
+/// until the entry puts it back.
 #[cfg(test)]
 fn shepherd_argv() -> Vec<String> {
-    [
-        "/proc/self/exe",
-        "unix::shepherd::tests::shepherd_entry",
-        "--exact",
-        "--nocapture",
-        "-q",
-        "--",
-    ]
-    .map(String::from)
-    .to_vec()
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let mut argv: Vec<String> = ["/bin/sh", "-c", r#"exec 4>&1 >/dev/null; exec "$@""#, "sh"]
+        .map(String::from)
+        .to_vec();
+    argv.push(exe.display().to_string());
+    argv.extend(
+        [
+            "unix::shepherd::tests::shepherd_entry",
+            "--exact",
+            "--nocapture",
+            "-q",
+            "--",
+        ]
+        .map(String::from),
+    );
+    argv
 }
 
 /// Set in a test shepherd's environment, so the entry acts only there.
@@ -459,6 +467,11 @@ mod tests {
         let Some(at) = args.iter().position(|a| a == "--") else {
             return;
         };
+        // SAFETY: restoring the stdout `shepherd_argv` set aside on fd 4.
+        unsafe {
+            libc::dup2(4, 1);
+            libc::close(4);
+        }
         main(&args[at..]);
     }
 
