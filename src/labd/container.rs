@@ -383,6 +383,9 @@ pub struct ContainerInstance {
     /// record it (§22).
     hypervisor: HypervisorKind,
     hypervisor_fallback: Option<String>,
+    /// Probe the host in production; fake-driven tests inject their own
+    /// facts so container starts do not depend on the test host's KVM.
+    host_facts: Arc<dyn Fn() -> crate::config::hypervisor::HostFacts + Send + Sync>,
 }
 
 impl ContainerInstance {
@@ -429,6 +432,7 @@ impl ContainerInstance {
             hv,
             hypervisor,
             hypervisor_fallback: None,
+            host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
         })
     }
 
@@ -440,6 +444,14 @@ impl ContainerInstance {
             .expect("new container is unshared")
             .hypervisor_fallback = reason;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_host_facts(
+        self: &mut Arc<Self>,
+        facts: crate::config::hypervisor::HostFacts,
+    ) {
+        Arc::get_mut(self).expect("sole owner").host_facts = Arc::new(move || facts.clone());
     }
 
     /// The pulled image + merged spec, or an error while the deferred pull
@@ -744,7 +756,7 @@ impl ContainerInstance {
         };
         let run = async {
             anyhow::ensure!(
-                crate::qemu::kvm_available(),
+                (self.host_facts)().kvm,
                 "{}: KVM is required for containers",
                 self.cfg.name
             );
