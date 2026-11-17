@@ -74,11 +74,12 @@ mod tests {
 
     #[test]
     fn a_chain_is_read_to_its_last_record() {
-        let mut bytes = record(16, 1, "a\\b", 16);
+        // 12 + 6 bytes, padded to the next DWORD.
+        let mut bytes = record(20, 1, "a\\b", 20);
         // Last record: a one-character name, 14 bytes reported, no padding.
         bytes.extend(record(0, 2, "c", 0));
         let len = bytes.len();
-        assert_eq!(len, 30);
+        assert_eq!(len, 34);
         bytes.resize(64, 0xff);
         assert_eq!(
             parse(&bytes, len),
