@@ -91,7 +91,7 @@ pub struct HostConfig {
     /// Native viewer grab release chord; `None` keeps the viewer's default.
     pub viewer_release_chord: Option<String>,
     /// The hypervisor a machine that names none runs on, by kind (PRD §22,
-    /// `host { hypervisor { … } }`). Automatic VMs; QEMU containers.
+    /// `host { hypervisor { … } }`). Automatic VMs and containers.
     pub hypervisor: crate::config::hypervisor::HypervisorDefaults,
     /// Set NOCOW on a machine's disk directory on btrfs before its disks
     /// are created (PRD §7.1, `nocow.rs`); `false` keeps them copy-on-write.

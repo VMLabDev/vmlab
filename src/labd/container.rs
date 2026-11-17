@@ -743,6 +743,11 @@ impl ContainerInstance {
             }
         };
         let run = async {
+            anyhow::ensure!(
+                crate::qemu::kvm_available(),
+                "{}: KVM is required for containers",
+                self.cfg.name
+            );
             std::fs::create_dir_all(&self.dirs.local)?;
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
@@ -766,11 +771,6 @@ impl ContainerInstance {
             let vfs_devices = self.start_virtiofsds().await?;
 
             let asset = self.hv.guest_asset(&self.resolved.arch)?;
-            anyhow::ensure!(
-                crate::qemu::kvm_available(),
-                "{}: KVM is required for containers",
-                self.cfg.name
-            );
             let machine = super::hypervisor::Launch::Container {
                 lab: self.lab.clone(),
                 resolved: Box::new(self.resolved.clone()),
