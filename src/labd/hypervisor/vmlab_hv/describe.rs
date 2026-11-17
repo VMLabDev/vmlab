@@ -17,9 +17,9 @@ use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
     Accel, AppleSmc, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat,
-    Display, DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV, Machine,
-    MsrPolicy, Nic, NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm, VfioDevice,
-    VirtualDisplay,
+    Display, DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV,
+    Machine, MsrPolicy, Nic, NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm,
+    VfioDevice, VirtualDisplay,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -550,9 +550,11 @@ pub(crate) fn vm(
             // macOS's AppleVirtIO drives a transitional, single-queue
             // virtio-net, so both take the plain stream (vm.rs agrees);
             // any other virtio-net takes the vnet stream.
-            NicBackend::Stream { sock } if macos || model != NicModel::Virtio => NicAttachment::Stream {
-                socket: sock.clone(),
-            },
+            NicBackend::Stream { sock } if macos || model != NicModel::Virtio => {
+                NicAttachment::Stream {
+                    socket: sock.clone(),
+                }
+            }
             NicBackend::Stream { sock } => NicAttachment::StreamVnet {
                 socket: sock.clone(),
                 queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
