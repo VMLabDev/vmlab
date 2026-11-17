@@ -2619,7 +2619,8 @@ lifecycle.
 **Selection.** A `vm` or `container` block names its hypervisor with
 `hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
-`qemu` for both until changed. The field is declared on the machine only and
+automatic for both kinds, preserving existing identity and selecting vmlab-hv
+for supported new machines (§22.1). The field is declared on the machine only and
 never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
@@ -2640,7 +2641,7 @@ default for a phase's machines flips only once that phase has passed its gate:
 
 | Phase | Runs | Status |
 | --- | --- | --- |
-| 1 | Container micro-VMs (§18), x86_64 under KVM | Selectable |
+| 1 | Container micro-VMs (§18), x86_64 under KVM | Default for new containers |
 | 2a | Modern x86_64 VMs: q35 on SeaBIOS, virtio and AHCI disks, AHCI CD-ROMs, virtio-net, the USB tablet | Selectable |
 | 2b | Their display: the native frame protocol (screenshots, vision, input, the recorder) and an RFB server | Selectable |
 | 2c | OVMF, secure boot, a TPM, Hyper-V, Windows | Selectable |
@@ -2677,8 +2678,8 @@ PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); 
 floppy on a machine other than pc;
 `accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
 "usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
-container is refused on a host whose `/dev/kvm` is not usable — vmlab-hv has
-no emulation fallback, where QEMU falls back to TCG. Most of what decides a VM
+container is refused on a host whose `/dev/kvm` is not usable — containers
+require KVM on either hypervisor. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
 hardware where the template is in the store, and the daemon, which always
 resolves it, finishes the check. The refusals are one list in code, which each
@@ -2826,15 +2827,20 @@ passed-through device's is vmlab-hv's to save; offline snapshots are
 unaffected. Host USB devices refuse an online snapshot while attached, on
 either hypervisor (§5.2.1).
 
-### 22.1 Amendment: automatic selection for modern VMs (2026-11-03)
+### 22.1 Amendment: automatic selection for modern VMs and containers
 
-This amendment replaces the original QEMU VM default above. Containers still
-default to QEMU. Selection follows this order:
+This amendment replaces the original QEMU defaults above. Supported new
+containers and modern VMs default to vmlab-hv. Selection follows this order:
 
 1. The machine's explicit `hypervisor`.
-2. An explicit host `hypervisor { vm = ... }` setting.
-3. The VM's persisted hypervisor identity.
-4. For a new VM, vmlab-hv when `vmlab_refusals` returns no reasons, otherwise QEMU.
+2. An explicit host `hypervisor { vm = ... container = ... }` setting for its kind.
+3. The machine's persisted hypervisor identity.
+4. For a new machine, vmlab-hv when `vmlab_refusals` returns no reasons, otherwise QEMU.
+
+Container fallback uses `container_refusals`. Containers require KVM, including
+when QEMU is selected: without it start fails with `KVM is required`, never TCG.
+Existing container scratch disks without an identity remain on QEMU until destroy
+or an explicit setting.
 
 Automatic fallback does not raise a vmlab-hv validation error. `status` shows
 the selected hypervisor and fallback reason. JSON includes `hypervisor` and
@@ -2852,8 +2858,8 @@ pulls resolve selection against the downloaded hardware before boot.
 
 Online snapshots remain bound to their recorded hypervisor. Explicitly moving
 a machine does not convert its snapshots. Offline snapshots remain portable.
-The e2e runner defaults to `--hypervisor vmlab` and explicitly pins both machine
-kinds for each scenario, retaining QEMU-only scenarios.
+The e2e runner defaults to `--hypervisor vmlab` and leaves containers unpinned
+to exercise automatic selection, retaining explicit QEMU-only runs.
 
 Pinned TSC and N6-N8 networking are supported on vmlab-hv. A supported new VM
 with `tsc = "host"` still selects vmlab-hv; its first KVM start probes and

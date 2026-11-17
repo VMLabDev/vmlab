@@ -97,7 +97,7 @@ SRC
       | "`vmlab_hv_viewer`" | "utf8" | "`vmlab-hv-viewer` beside configured `vmlab_hv`, then on `PATH`" | "Native viewer binary for vmlab-hv machines. A path or a binary name, without arguments. Overrides discovery; a missing or non-executable binary falls back to VNC with an installation notice." |
       | "`viewer_release_chord`" | "utf8" | "viewer's left Ctrl+Alt" | "Native viewer grab release chord, passed as `--release-chord`. Example: `ctrl_r+alt_r`. The viewer validates chord syntax; this key does not affect VNC viewers." |
       | "`btrfs_nocow`" | "bool" | "`true`" | "On btrfs, set NOCOW (`chattr +C`) on each machine's disk directory before its first disk is created, so online snapshots do not fragment the disks. NOCOW files have no btrfs checksums or compression. `false` keeps them copy-on-write. Ignored on other filesystems." |
-      | "`hypervisor {}`" | "child" | "automatic VMs; QEMU containers" | "Explicit per-kind defaults, each `qemu` or `vmlab`. A machine's own setting wins. Unset VMs preserve existing identity, then select vmlab-hv when supported or QEMU with a fallback reason." |
+      | "`hypervisor {}`" | "child" | "automatic VMs and containers" | "Explicit per-kind defaults, each `qemu` or `vmlab`. A machine's own setting wins. Unset machines preserve existing identity, then select vmlab-hv when supported or QEMU with a fallback reason. Containers require KVM." |
   }
   p "The parser enforces these rules, and reports every violation in one pass:"
   list {
@@ -196,7 +196,7 @@ SRC
   table {
     rows:
       | "Field" | "Type" | "Default" | "Meaning" |
-      | "`container`" | "utf8" | "`qemu`" | "The hypervisor for every `container {}` that does not set `hypervisor`: `qemu` or `vmlab`." |
+      | "`container`" | "utf8" | "automatic" | "An explicit `qemu` or `vmlab` for containers that do not set `hypervisor`. Unset preserves existing identity, then selects vmlab-hv if supported or QEMU with a reason. KVM is required." |
       | "`vm`" | "utf8" | "automatic" | "An explicit `qemu` or `vmlab` for VMs that do not set `hypervisor`. Unset preserves existing identity, then selects vmlab-hv if supported or QEMU with a reason." |
   }
   p "These rules apply:"
@@ -204,7 +204,7 @@ SRC
     li "Each field is `qemu` or `vmlab`. Any other value is rejected with a parse error that names it."
     li "A machine's own `hypervisor` wins over this block. The field never resolves through a template or a profile."
     li "Explicit `vmlab` settings are validated against the refusal list. Automatic VM selection falls back to QEMU for refused hardware, including legacy PCs, macOS, `qemu_args`, TCG and pinned TSC."
-    li "A VM's identity is saved before boot creates disks. It survives stops and daemon restarts until destroy or an explicit machine or host setting. Old disks without an identity stay on QEMU; the newest snapshot supplies identity where recorded."
+    li "A machine's identity is saved before boot creates disks. It survives stops and daemon restarts until destroy or an explicit machine or host setting. Old disks without an identity stay on QEMU; the newest snapshot supplies identity where recorded."
     li "Changing an explicit default can move an existing VM. Online snapshots still require the hypervisor that captured them; offline snapshots restore under either."
   }
   p <<DOC
