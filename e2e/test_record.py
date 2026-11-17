@@ -20,6 +20,39 @@ NO_DISPLAY = "Display output is not active."
 GRUB = "GNU GRUB version 2.12"
 
 
+class RecordedProbeTests(unittest.TestCase):
+    def check_probe(self, text):
+        events = {"events": [
+            {"kind": "text", "at": 1.0, "text": "VMLAB RECORD PROBE"},
+            {"kind": "move", "at": 5.6},
+            {"kind": "click", "at": 5.7},
+        ]}
+        def frame(video, at, png):
+            # The old text.at + 2 sample sees only partially typed input.
+            return Path("complete.png" if at >= 6.1 else "partial.png")
+
+        def read(png):
+            return text if png == Path("complete.png") else "e2e login: UMLAB REC"
+
+        with patch.object(record, "frame_at", side_effect=frame), \
+                patch.object(record, "ocr", side_effect=read):
+            return record.recorded_probe(Path("demo.mp4"), events, Path("typed.png"))
+
+    def test_waits_for_completed_typing_under_load(self):
+        self.assertTrue(self.check_probe("e2e login: UMLAB RECORD PROBE"))
+
+    def test_accepts_case_and_line_wrapping(self):
+        self.assertTrue(self.check_probe("e2e login: VMLAB record\nprobe"))
+
+    def test_accepts_a_console_cursor_after_the_phrase(self):
+        self.assertTrue(self.check_probe("e2e login: VMLAB RECORD PROBE_"))
+
+    def test_rejects_partial_or_unrelated_text(self):
+        for text in ("VMLAB REC", "VMLAB RECORD", "PROBE", "RECORD PROBES", "Welcome to Alpine"):
+            with self.subTest(text=text), self.assertRaisesRegex(AssertionError, "OCR read"):
+                self.check_probe(text)
+
+
 class FirmwareFrameTests(unittest.TestCase):
     def scan(self, frames):
         """Run firmware_frame over distinct frames given as (time, text);
