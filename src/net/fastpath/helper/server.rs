@@ -185,17 +185,17 @@ impl<K: Kernel> Server<K> {
             };
         }
         match request {
-            Request::XdpLoad | Request::SockmapLoad if self.slots.len() >= MAX_ENGINES => {
+            Request::XdpLoad {} | Request::SockmapLoad {} if self.slots.len() >= MAX_ENGINES => {
                 refused(format!("this connection already holds {MAX_ENGINES} engines"))
             }
-            Request::XdpLoad => match self.kernel.xdp_load() {
+            Request::XdpLoad {} => match self.kernel.xdp_load() {
                 Ok(engine) => self.insert(Slot::Xdp(XdpSlot {
                     engine,
                     taps: HashMap::new(),
                 })),
                 Err(e) => failed(e),
             },
-            Request::SockmapLoad => match self.kernel.sockmap_load() {
+            Request::SockmapLoad {} => match self.kernel.sockmap_load() {
                 Ok(engine) => self.insert(Slot::Sockmap(engine)),
                 Err(e) => failed(e),
             },
@@ -574,7 +574,7 @@ mod tests {
     }
 
     fn load_xdp(server: &mut Server<Fake>) -> u32 {
-        match ask(server, &Request::XdpLoad, vec![]).0 {
+        match ask(server, &Request::XdpLoad {}, vec![]).0 {
             Reply::Engine { engine } => engine,
             other => panic!("{other:?}"),
         }
@@ -721,7 +721,7 @@ mod tests {
     fn engines_are_per_connection_and_typed() {
         let mut server = Server::new(Fake::default());
         let xdp = load_xdp(&mut server);
-        let sockmap = match ask(&mut server, &Request::SockmapLoad, vec![]).0 {
+        let sockmap = match ask(&mut server, &Request::SockmapLoad {}, vec![]).0 {
             Reply::Engine { engine } => engine,
             other => panic!("{other:?}"),
         };
@@ -739,13 +739,13 @@ mod tests {
         for _ in server.slots.len()..MAX_ENGINES {
             load_xdp(&mut server);
         }
-        assert!(is_refused(&ask(&mut server, &Request::XdpLoad, vec![]).0));
+        assert!(is_refused(&ask(&mut server, &Request::XdpLoad {}, vec![]).0));
     }
 
     #[test]
     fn sockmap_takes_only_the_unix_sockets_it_expects() {
         let mut server = Server::new(Fake::default());
-        let engine = match ask(&mut server, &Request::SockmapLoad, vec![]).0 {
+        let engine = match ask(&mut server, &Request::SockmapLoad {}, vec![]).0 {
             Reply::Engine { engine } => engine,
             other => panic!("{other:?}"),
         };
@@ -792,7 +792,7 @@ mod tests {
         rustix::net::send(&daemon, br#"{"op":"exec"}"#, rustix::net::SendFlags::empty()).unwrap();
         let (bytes, _) = proto::recv(daemon.as_fd()).unwrap().unwrap();
         assert!(is_refused(&serde_json::from_slice(&bytes).unwrap()));
-        proto::send(daemon.as_fd(), &Request::XdpLoad, &[]).unwrap();
+        proto::send(daemon.as_fd(), &Request::XdpLoad {}, &[]).unwrap();
         let (bytes, _) = proto::recv(daemon.as_fd()).unwrap().unwrap();
         assert_eq!(
             serde_json::from_slice::<Reply>(&bytes).unwrap(),

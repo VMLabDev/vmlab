@@ -38,8 +38,10 @@ pub(crate) const HOST_TAG: u32 = 0;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
-    /// Load one xdp_switch object (one per segment).
-    XdpLoad,
+    /// Load one xdp_switch object (one per segment). The load requests are
+    /// empty struct variants so that `deny_unknown_fields` refuses extra
+    /// fields on them too.
+    XdpLoad {},
     /// Create a `vmfp%d` tap, attach the engine's program to it and return
     /// its queues: one raw queue, or `queue_pairs` vnet queues.
     XdpTap {
@@ -63,7 +65,7 @@ pub(crate) enum Request {
     },
     XdpStats { engine: u32 },
     /// Load one fastpath_sockmap object (one per switch).
-    SockmapLoad,
+    SockmapLoad {},
     /// Offload the unix stream socket passed with the request as port `id`.
     SockmapStream { engine: u32, id: u64 },
     /// Register a TX loopback: the kernel end, then the end the daemon
@@ -224,7 +226,7 @@ mod tests {
     #[test]
     fn requests_round_trip_and_nothing_else_parses() {
         let all = [
-            Request::XdpLoad,
+            Request::XdpLoad {},
             Request::XdpTap {
                 engine: 1,
                 queue_pairs: Some(2),
@@ -245,7 +247,7 @@ mod tests {
                 tag: None,
             },
             Request::XdpStats { engine: 1 },
-            Request::SockmapLoad,
+            Request::SockmapLoad {},
             Request::SockmapStream { engine: 2, id: 3 },
             Request::SockmapTx { engine: 2, id: 3 },
             Request::SockmapMac {
@@ -292,7 +294,7 @@ mod tests {
             &[x.as_fd()],
         )
         .unwrap();
-        send(a.as_fd(), &Request::XdpLoad, &[]).unwrap();
+        send(a.as_fd(), &Request::XdpLoad {}, &[]).unwrap();
         let (first, fds) = recv(b.as_fd()).unwrap().unwrap();
         assert_eq!(fds.len(), 1);
         assert_eq!(
@@ -303,7 +305,7 @@ mod tests {
         assert!(fds.is_empty());
         assert_eq!(
             serde_json::from_slice::<Request>(&second).unwrap(),
-            Request::XdpLoad
+            Request::XdpLoad {}
         );
         drop(a);
         assert!(recv(b.as_fd()).unwrap().is_none());

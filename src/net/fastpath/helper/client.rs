@@ -163,7 +163,7 @@ pub(crate) struct RemoteXdp {
 impl RemoteXdp {
     pub(crate) fn load() -> Result<RemoteXdp> {
         let broker = broker()?;
-        let engine = broker.engine(Request::XdpLoad)?;
+        let engine = broker.engine(Request::XdpLoad {})?;
         Ok(RemoteXdp { broker, engine })
     }
 
@@ -260,7 +260,7 @@ pub(crate) struct RemoteSockmap {
 impl RemoteSockmap {
     pub(crate) fn load() -> Result<RemoteSockmap> {
         let broker = broker()?;
-        let engine = broker.engine(Request::SockmapLoad)?;
+        let engine = broker.engine(Request::SockmapLoad {})?;
         Ok(RemoteSockmap { broker, engine })
     }
 
