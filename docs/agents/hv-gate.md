@@ -37,3 +37,18 @@ Cargo tracks `/dev/kvm` and the environment flag for rebuilds. Build and run
 on the same host. Do not copy prebuilt test binaries between hosts. Existing
 local-asset and GPU prerequisites still apply, so inspect ignored counts
 alongside passes rather than treating them as hardware coverage.
+
+Test VM permits count only this user's vmlab test VMs through shared slot
+locks in `/tmp/vmlab-hv-vm-slots-<uid>`, across checkouts and test processes.
+The default hard cap is two, configurable with a positive
+`VMLAB_HV_TEST_VM_LIMIT`. Unrelated QEMU and vmlab-hv processes do not consume
+slots. Before boot, Linux `MemAvailable` must cover the VM's 24 GiB cap plus
+a 32 GiB host floor. Other host workloads therefore affect the memory check,
+but not the VM count. No VM-limit override is needed for the docker labs.
+The memory check is a point-in-time check, not a reservation against other
+host workloads.
+
+While blocked, the permit prints either the occupied own-slot limit or
+the available memory, required memory, VM cap and host floor. It waits up to
+`VMLAB_HV_TEST_PROCESS_TIMEOUT_SECS` (default 600 seconds) for each check,
+and a timeout error includes the reason.

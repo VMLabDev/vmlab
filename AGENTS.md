@@ -39,13 +39,27 @@ just ci::check
 - The merge queue runs the same command on each batch merged onto `next`
   (one `terrarium card merge A B C ...` job), sharing the heavy wrapper slots.
 - Pass: every recipe of `ci::check` exits 0. Record the log's pass, fail and
-  ignored counts. Upload native machine-readable reports, when emitted, with
+  ignored counts. Upload native machine-readable reports with
   `terrarium test push --card <id>`. Do not fabricate reports or convert counts
-  into test cases. VML-122 adds host/hv libtest JSON and VML-114 tracks the
-  remaining steps. Until those land, retain the full gate log as evidence.
+  into test cases. Retain the full gate log for steps without reports.
+  The main crate and hv workspace write raw libtest JSON to
+  `$VMLAB_TARGET_ROOT/test-results/main.json` and `hv.json` (under
+  `target/test-results` if unset). Each test step prints its path even on
+  failure, and a successful check prints both paths at the end. Push both:
+  `terrarium test push <path> --format libtest-json --name <main-or-hv> --card <id>`.
+  Push failed runs before rerunning too. Copy evidence from the target to
+  your workspace when it is outside the shared mount. These two files cover
+  the main and hv test steps, not the separate guest/conformance checks.
+  The target runner enables JSON only for test binaries. Doctests still run
+  separately on stable rustdoc without the runner, with text output included in cargo's exit status but not
+  in the uploaded case counts.
+  VML-114 tracks native reports for the remaining steps.
 - A known flaky test that fails once is rerun alone before the run counts as
   failed; name it on the card. Red again: fix it, or move the card to
   `blocked` with the output tail.
+  The quarantine register and reporting rules are in
+  `docs/agents/flaky-tests.md`. Quarantined failures stay in the evidence.
+  A rerun without a named flaky test needs a reason comment first.
 - Every shell script you write or run: `set -eu`, and refuse an empty or `/`
   path before `cp`, `rsync`, `mv` or `rm` (`just ci::shell-paths` checks the
   tracked ones).

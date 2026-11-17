@@ -2106,7 +2106,10 @@ mid-transfer. `snapshot restore` needs an **explicit discard flag**, because
 restore discards the guest side by design and would silently destroy the guest
 copy of every conflicted path — but refusing outright is obstruction, since
 wanting to throw the guest away is frequently *why* you restore. `capture`
-refuses with no escape.
+refuses with no escape. That includes a guest too slow to answer the flush:
+when the guest's watch has not reported within the flush's bound, its latest
+writes are unknown, so the capture refuses and says so rather than freezing a
+tree without them. The discard flag is restore-only and does not apply here.
 
 **There is no resync token, and it costs nothing**, because the list of
 stat-walk triggers — first sync, ledger loss, overflow, post-restore

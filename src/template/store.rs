@@ -946,8 +946,13 @@ fn unpack_template(reader: impl std::io::Read, dest: &Path) -> Result<()> {
             );
             continue;
         }
+        // tar::Builder preserves holes as GNU sparse entries. Accept those
+        // only for disk/VARS payloads, never links or other special files.
+        let kind = entry.header().entry_type();
+        let sparse_payload =
+            kind.is_gnu_sparse() && (matches!(text, DISK_FILE | VARS_FILE) || variant_disk);
         ensure!(
-            allowed && entry.header().entry_type().is_file(),
+            allowed && (kind.is_file() || sparse_payload),
             "unexpected template archive entry: {}",
             path.display()
         );
@@ -2116,6 +2121,46 @@ mod tests {
     }
 
     #[test]
+    fn export_import_round_trip_with_sparse_disk() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (_tmp, store) = new_store();
+        let m = meta("x86_64", "sparse", "1");
+        install(&store, &m, b"disk").unwrap();
+        let original = store.resolve_version("x86_64", "sparse", None).unwrap();
+        let mut disk = File::options()
+            .write(true)
+            .open(&original.disk_path)
+            .unwrap();
+        disk.seek(SeekFrom::Start(8 << 20)).unwrap();
+        disk.write_all(b"tail").unwrap();
+        drop(disk);
+
+        let out = tempfile::tempdir().unwrap();
+        let archive = out.path().join("sparse.tar.zst");
+        store.export("x86_64", "sparse", None, &archive).unwrap();
+        let decoder = zstd::Decoder::new(File::open(&archive).unwrap()).unwrap();
+        let mut tar = tar::Archive::new(decoder);
+        let mut found_sparse = false;
+        for entry in tar.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new(DISK_FILE) {
+                assert!(entry.header().entry_type().is_gnu_sparse());
+                found_sparse = true;
+            }
+        }
+        assert!(found_sparse);
+
+        let (_tmp2, other) = new_store();
+        other.import(&archive, false).unwrap();
+        let imported = other.resolve_version("x86_64", "sparse", None).unwrap();
+        assert_eq!(
+            fs::read(imported.disk_path).unwrap(),
+            fs::read(original.disk_path).unwrap()
+        );
+    }
+
+    #[test]
     fn export_import_round_trip() {
         let (_tmp, store) = new_store();
         let disk_bytes = b"pretend qcow2 bytes".as_slice();
@@ -2797,6 +2842,10 @@ mod tests {
             tar::EntryType::Symlink,
             tar::EntryType::Link,
             tar::EntryType::Fifo,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            tar::EntryType::Continuous,
+            tar::EntryType::new(b'Z'),
             tar::EntryType::Regular,
         ] {
             let mut bytes = Vec::new();
