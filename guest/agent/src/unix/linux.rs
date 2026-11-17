@@ -9,7 +9,7 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use vmlab_agent_proto::{DiskUsage, OsInfo, PORT_NAME, ShutdownMode, features};
 
@@ -318,11 +318,12 @@ impl Clipboard {
     }
 
     pub(super) fn get(&self) -> Result<String, String> {
-        let out = Command::new(&self.get[0])
-            .args(&self.get[1..])
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| format!("the clipboard tool failed: {e}"))?;
+        let out = crate::clipboard::tool_output(
+            Command::new(&self.get[0])
+                .args(&self.get[1..])
+                .stderr(Stdio::null()),
+        )
+        .map_err(|e| format!("the clipboard tool failed: {e}"))?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
@@ -379,12 +380,22 @@ pub(super) fn set_clock(unix_ms: i64) -> Result<(), String> {
 /// logind owns this directory on a guest that has one and will mount its own
 /// tmpfs over ours; doing it anyway is what covers the guests that have PAM
 /// but no logind, and the `setuid` route, which has neither.
+///
+/// The path is resolved inside `root` ([`super::in_root::resolve`]), so a
+/// container's own `/run` or `/run/user` symlink cannot steer the create out
+/// of its root filesystem, and the directory itself is opened without
+/// following a symlink planted at its name: the mode and the owner are then
+/// set on what was opened, never on a link's target.
 pub(super) fn runtime_dir(root: &Path, account: &Account) -> Option<String> {
     let inside = format!("/run/user/{}", account.uid);
-    let path = root.join(inside.trim_start_matches('/'));
+    let path = super::in_root::resolve(root, &inside, crate::mux::Last::Keep).ok()?;
     fs::create_dir_all(&path).ok()?;
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
-    let dir = fs::File::open(&path).ok()?;
+    let dir = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .ok()?;
+    let _ = nix::sys::stat::fchmod(dir.as_fd(), nix::sys::stat::Mode::from_bits_truncate(0o700));
     // Root-owned it would be useless to the session it exists for.
     nix::unistd::fchown(
         dir.as_fd(),
@@ -567,5 +578,57 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    fn me() -> super::Account {
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        super::Account {
+            name: "me".to_string(),
+            uid,
+            gid,
+            groups: vec![gid],
+            home: "/".to_string(),
+            shell: "/bin/sh".to_string(),
+        }
+    }
+
+    /// Code review F55: a container's `/run` symlinked out of its root
+    /// filesystem does not steer the runtime directory out with it.
+    #[test]
+    fn the_runtime_dir_stays_inside_the_root_past_a_run_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("run")).unwrap();
+        let account = me();
+
+        let inside = super::runtime_dir(&root, &account).unwrap();
+        assert_eq!(inside, format!("/run/user/{}", account.uid));
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing was made outside the root"
+        );
+    }
+
+    /// Code review F55: a symlink planted at the runtime directory's own name
+    /// is refused, and its target's mode is left alone.
+    #[test]
+    fn the_runtime_dir_refuses_a_symlink_at_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        let target = dir.path().join("target");
+        let account = me();
+        std::fs::create_dir_all(root.join("run/user")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let name = root.join(format!("run/user/{}", account.uid));
+        std::os::unix::fs::symlink(&target, &name).unwrap();
+
+        assert_eq!(super::runtime_dir(&root, &account), None);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the link's target was not touched");
     }
 }

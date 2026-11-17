@@ -30,7 +30,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
     FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION,
+    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileAttributesW,
     INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, ReadDirectoryChangesW,
 };
@@ -100,7 +100,7 @@ pub(super) fn start(watch: Arc<Watch>) -> Result<(), String> {
 }
 
 fn run(watch: Arc<Watch>, dir: Arc<Dir>, mut dirs: Inventory) {
-    // u32-aligned, as FILE_NOTIFY_INFORMATION requires.
+    // u32-aligned, as the FILE_NOTIFY_INFORMATION chain requires.
     let mut buffer = vec![0u32; BUFFER_BYTES / 4];
     while !watch.stopped() {
         let mut returned: u32 = 0;
@@ -141,9 +141,12 @@ fn run(watch: Arc<Watch>, dir: Arc<Dir>, mut dirs: Inventory) {
             watch.overflow();
             continue;
         }
-        // SAFETY: the kernel filled `returned` bytes of `buffer` with a
-        // chain of FILE_NOTIFY_INFORMATION records.
-        for (action, name) in unsafe { records(&buffer, returned as usize) } {
+        // SAFETY: a u32 slice viewed as its bytes; every offset in the
+        // chain is checked against `returned` (code review F60).
+        let bytes = unsafe {
+            std::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len() * 4)
+        };
+        for (action, name) in super::records::parse(bytes, returned as usize) {
             handle(&watch, &mut dirs, action, name);
         }
         if !root_exists(&watch) {
@@ -241,38 +244,3 @@ impl Inventory {
     }
 }
 
-/// Walk the FILE_NOTIFY_INFORMATION chain the kernel wrote into `buffer`,
-/// yielding `(action, root-relative path)`.
-///
-/// # Safety
-///
-/// `buffer` must hold `len` bytes of a well-formed record chain.
-unsafe fn records(buffer: &[u32], len: usize) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
-    let base = buffer.as_ptr() as *const u8;
-    let mut offset = 0usize;
-    loop {
-        if offset + size_of::<FILE_NOTIFY_INFORMATION>() > len {
-            return out;
-        }
-        // SAFETY: the record starts within the filled region.
-        let record = unsafe { &*(base.add(offset) as *const FILE_NOTIFY_INFORMATION) };
-        let name_bytes = record.FileNameLength as usize;
-        let name_at = offset + std::mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName);
-        if name_at + name_bytes > len {
-            return out;
-        }
-        // SAFETY: the name is `FileNameLength` bytes of UTF-16 inside the
-        // filled region; it is not NUL-terminated.
-        let name =
-            unsafe { std::slice::from_raw_parts(base.add(name_at) as *const u16, name_bytes / 2) };
-        let rel = String::from_utf16_lossy(name).replace('\\', "/");
-        if !rel.is_empty() {
-            out.push((record.Action, rel));
-        }
-        match record.NextEntryOffset {
-            0 => return out,
-            next => offset += next as usize,
-        }
-    }
-}
