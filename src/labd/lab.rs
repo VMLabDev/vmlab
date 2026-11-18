@@ -14,7 +14,7 @@ use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, InstalledForward};
 use super::freeze_clone;
-use super::machine::{Machine, MachineKind};
+use super::machine::{AgentOrigin, Machine};
 use super::machine_build::{self, BuildContext, Built, MachineSet};
 use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
@@ -3562,7 +3562,7 @@ impl LabRuntime {
         }
         // An unstamped VM may have a manually installed agent. Give it one
         // handshake, but reserve retries for guests with evidence of an agent.
-        let handshake = if m.kind() == MachineKind::Vm
+        let handshake = if m.agent_origin() == AgentOrigin::Image
             && m.sealed_agent_version().is_none()
             && !m.is_agent_up().await
         {
