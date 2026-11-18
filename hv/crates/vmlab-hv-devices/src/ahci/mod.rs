@@ -637,13 +637,17 @@ impl Ahci {
                 }
             }
             8 => {
-                // Acknowledged bits are no longer signalled: a port whose
-                // PxIS is still pending sets them again below and so sends
-                // a new MSI. Without this, a command completed between the
-                // guest's PxIS and IS writes would never be signalled.
-                let cleared = value & mask;
-                self.put32(8, old & !cleared);
-                self.msi_pending &= !cleared;
+                // An acknowledgement ends what the last MSI signalled.
+                // Whatever IS holds after it sends a new MSI below: a port
+                // whose PxIS is still pending sets its bit again, and the
+                // bits of other ports the guest did not acknowledge stay
+                // set. storahci serves one port per interrupt and
+                // acknowledges only that port's bit, and two MSIs sent
+                // before the handler ran reach the guest as one. Without
+                // the new MSI the other port waited for the next unrelated
+                // completion.
+                self.put32(8, old & !(value & mask));
+                self.msi_pending = 0;
             }
             0x100..=0x3ff => {
                 let port = (offset - 0x100) / 0x80;

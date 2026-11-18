@@ -183,6 +183,9 @@ impl<M: Memory> Riscv64<M> {
     /// Returns true if the hart is waiting rather than advancing its PC.
     pub fn step(&mut self) -> Result<bool> {
         self.interpreter.fetch_address = None;
+        // The budget bounds this instruction, not the guest's lifetime: a hart
+        // that has run for hours gets the same allowance as a fresh one.
+        self.interpreter.arm_step_budget();
         if self.specialize {
             let pc_slot = self.interpreter.globals.slot("zPC");
             self.interpreter.globals.begin_native();
@@ -246,6 +249,13 @@ impl<M: Memory> Riscv64<M> {
     }
 
     fn specialized_run(&mut self, limit: u32, pc_slot: Option<usize>) -> Result<(u32, bool)> {
+        // A trace runs up to `limit` instructions and may fall back to the
+        // interpreter in any of them. Recording arms the budget per step itself.
+        let budget = self
+            .interpreter
+            .step_operation_budget
+            .saturating_mul(u64::from(limit.max(1)));
+        self.interpreter.arm_operation_budget(budget);
         let pc = match pc_slot.and_then(|slot| self.interpreter.globals.native_slot(slot)) {
             Some((vmlab_hv_tcg_ir::native::ScalarType::Bits(64), raw)) => raw as u64,
             Some(_) => return Err(crate::Error::Type("native PC is not Bits(64)".into())),

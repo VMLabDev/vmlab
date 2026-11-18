@@ -160,7 +160,7 @@ impl StepCpu for LockstepCpu {
     fn state(&mut self) -> Result<State, CpuError> {
         // Observation executes generated CSR accessors too. Budget each bounded
         // snapshot independently instead of charging sampling to guest lifetime.
-        self.interpreter.operation_limit = self.interpreter.operations.saturating_add(1_000_000);
+        self.interpreter.arm_operation_budget(1_000_000);
         let mut state = State {
             pc: self.pc().map_err(model_error)?,
             ..State::default()
@@ -193,7 +193,7 @@ impl StepCpu for LockstepCpu {
         &self.interpreter.memory.memory
     }
     fn step(&mut self) -> Result<Vec<MemoryWrite>, CpuError> {
-        self.interpreter.operation_limit = self.interpreter.operations.saturating_add(1_000_000);
+        self.interpreter.step_operation_budget = 1_000_000;
         Riscv64::step(self).map_err(model_error)?;
         Ok(self.interpreter.memory.memory.take_writes())
     }

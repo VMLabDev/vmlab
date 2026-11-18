@@ -356,6 +356,43 @@ fn msi_signals_a_completion_that_lands_before_the_is_acknowledgement() {
     assert_eq!(d.read(8), 0);
 }
 
+/// Windows storahci serves one port for each interrupt and acknowledges only
+/// that port's IS bit. Two ports that complete before the handler runs send
+/// two MSIs, which the guest's interrupt controller can deliver as one. The
+/// acknowledgement of the first port must then send a new MSI for the port
+/// that is left. Without it, the second port waited for the next completion
+/// on any port, and Windows Setup read its install media at about one command
+/// a second (the stall at 5 percent).
+#[test]
+fn msi_signals_the_ports_left_after_a_partial_is_acknowledgement() {
+    let mut d = Driver::new();
+    d.hba.attach_disk(0, image(vec![0; 4096], false)).unwrap();
+    d.hba.attach_cdrom(1, None).unwrap();
+    d.start(0);
+    d.hba.config_write(32, 2, &[0x81]);
+    let messages = |d: &Driver| d.irq.messages.lock().unwrap().len();
+    d.prepare(0xec, 0, 0, 0, None, &[(0x4000, 512, false)]);
+    d.issue(0);
+    assert_eq!(messages(&d), 1);
+    // Port 1 raises its own interrupt before the handler has run.
+    let base = port_base(1);
+    d.write(base + 8, 0x2000);
+    d.write(base + 0x14, u32::MAX);
+    d.write(base + 0x18, 0x10);
+    assert_eq!(d.read(8), 3);
+    assert_eq!(messages(&d), 2);
+    // The handler serves port 0 alone: port 1 is still in IS.
+    d.write(port_base(0) + 0x10, u32::MAX);
+    d.write(8, 1);
+    assert_eq!(d.read(8), 2);
+    assert_eq!(messages(&d), 3, "the port left in IS is signalled again");
+    // Port 1's own acknowledgement leaves nothing and sends nothing.
+    d.write(base + 0x10, u32::MAX);
+    d.write(8, 2);
+    assert_eq!(d.read(8), 0);
+    assert_eq!(messages(&d), 3);
+}
+
 #[test]
 fn pci_identity_capabilities_and_bar_probes() {
     let mut d = Driver::new();

@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu = Riscv64::new(memory)?;
     cpu.set_pc(0x8000_0000);
     cpu.set_gpr(2, iterations)?;
-    cpu.interpreter.operation_limit = u64::MAX;
+    cpu.interpreter.step_operation_budget = u64::MAX;
     cpu.interpreter.memoize = !std::env::args().any(|arg| arg == "--no-memo");
     cpu.interpreter.indexed = !std::env::args().any(|arg| arg == "--no-indexed");
     cpu.specialize = std::env::args().any(|arg| arg == "--specialize");

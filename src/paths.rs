@@ -67,15 +67,28 @@ pub fn config_dir() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config").join("vmlab")
 }
 
-/// `$XDG_RUNTIME_DIR/vmlab` — control sockets. Some WSL setups lack
-/// `XDG_RUNTIME_DIR`; fall back to a uid-scoped tmp directory (PRD §13).
+/// `$XDG_RUNTIME_DIR/vmlab` — control sockets. Use a private, uid-scoped
+/// directory under /tmp when XDG_RUNTIME_DIR is absent or too long.
 pub fn runtime_dir() -> PathBuf {
-    match env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir).join("vmlab"),
-        None => {
-            let uid = nix::unistd::Uid::effective().as_raw();
-            PathBuf::from(format!("/tmp/vmlab-{uid}"))
+    let xdg = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty());
+    runtime_dir_in(xdg.as_deref().map(Path::new))
+}
+
+/// Select the runtime base for an explicit XDG_RUNTIME_DIR.
+pub fn runtime_dir_in(xdg: Option<&Path>) -> PathBuf {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    match xdg {
+        Some(dir) => {
+            let base = dir.join("vmlab");
+            if base.as_os_str().len() <= RUNTIME_BASE_MAX {
+                base
+            } else {
+                // Keep different XDG sessions in separate runtime trees.
+                let digest = Sha256::digest(dir.as_os_str().as_encoded_bytes());
+                PathBuf::from(format!("/tmp/vmlab-{uid}-{}", hex::encode(&digest[..6])))
+            }
         }
+        None => PathBuf::from(format!("/tmp/vmlab-{uid}")),
     }
 }
 
@@ -98,6 +111,10 @@ const MACHINE_SOCKET_NAME_MAX: usize = "app-4294967295-conns.sock".len();
 const MACHINE_DIR_RESERVE: usize =
     "/containers/".len() + HASHED_COMPONENT_LEN + 1 + MACHINE_SOCKET_NAME_MAX;
 
+/// Space left for the runtime base with both DNS labels hashed.
+const RUNTIME_BASE_MAX: usize =
+    SUN_PATH_MAX - "/labs/".len() - HASHED_COMPONENT_LEN - MACHINE_DIR_RESERVE;
+
 /// `_` plus 12 hex characters.
 const HASHED_COMPONENT_LEN: usize = 13;
 
@@ -108,8 +125,7 @@ const HASHED_COMPONENT_LEN: usize = 13;
 /// plain path does not always fit in `sun_path`: QEMU then fails to bind its
 /// QMP or VNC socket. A DNS label cannot start with `_`, so a hashed component
 /// never collides with a real name. With both components hashed every socket
-/// fits as long as the runtime base ([`runtime_dir`]) is at most 37 bytes;
-/// `/run/user/<uid>/vmlab` is at most 26.
+/// fits within the budget reserved by [`runtime_dir`].
 fn fitted(parent: &Path, name: &str, reserve: usize) -> PathBuf {
     let plain = parent.join(name);
     if plain.as_os_str().len() + reserve <= SUN_PATH_MAX {
@@ -343,6 +359,22 @@ mod tests {
     /// The longest socket any machine binds, for the given names and base.
     fn longest_machine_socket(base: &Path, lab: &str, kind: MachineKind, m: &str) -> PathBuf {
         machine_runtime_dir_in(base, lab, kind, m).join("app-4294967295-conns.sock")
+    }
+
+    #[test]
+    fn long_xdg_runtime_dirs_get_distinct_short_bases() {
+        let xdg = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
+        let base = runtime_dir_in(Some(&xdg));
+        assert_eq!(base, runtime_dir_in(Some(&xdg)));
+        assert_ne!(base, runtime_dir_in(Some(&xdg.join("other"))));
+        assert_ne!(base, runtime_dir_in(None));
+        assert!(base.as_os_str().len() <= RUNTIME_BASE_MAX);
+
+        let label = "a".repeat(63);
+        for kind in [MachineKind::Vm, MachineKind::Container] {
+            let socket = longest_machine_socket(&base, &label, kind, &label);
+            assert!(socket.as_os_str().len() <= SUN_PATH_MAX);
+        }
     }
 
     #[test]

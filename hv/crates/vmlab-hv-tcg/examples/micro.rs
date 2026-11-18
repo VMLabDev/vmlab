@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(iterations) = iterations {
         cpu.set_gpr(2, iterations)?;
     }
-    cpu.interpreter.operation_limit = u64::MAX;
+    cpu.interpreter.step_operation_budget = u64::MAX;
     cpu.interpreter.memoize = std::env::var_os("VMLAB_TCG_NO_MEMO").is_none();
     cpu.interpreter.indexed = std::env::var_os("VMLAB_TCG_NO_INDEXED").is_none();
     cpu.specialize = std::env::var_os("VMLAB_TCG_SPECIALIZE").is_some();

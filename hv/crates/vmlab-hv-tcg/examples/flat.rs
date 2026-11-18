@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limit = args.get(2).map_or(Ok(100_000u64), |s| s.parse())?;
     let mut cpu = Riscv64::new(FlatMemory::new(0x8000_0000, image))?;
     cpu.set_pc(0x8000_0000);
-    cpu.interpreter.operation_limit = 5_000_000_000;
+    cpu.interpreter.step_operation_budget = 5_000_000_000;
     cpu.specialize = std::env::var_os("VMLAB_TCG_SPECIALIZE").is_some();
     let start = std::time::Instant::now();
     for _ in 0..limit {
