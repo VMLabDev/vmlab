@@ -60,7 +60,7 @@ lab "console-test" {{
             }]
         }))
         .unwrap();
-        let runtime = root.path().join("runtime/vmlab");
+        let runtime = vmlab::paths::runtime_dir_in(Some(&root.path().join("runtime")));
         let socket =
             vmlab::paths::lab_runtime_dir_in(&runtime, "console-test").join("control.sock");
         let server = Server::bind(&socket, Arc::new(Daemon(status)))

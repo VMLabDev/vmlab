@@ -4,7 +4,7 @@
 //! clean shutdown (S5, guest reset, `quit`). Other outcomes and reports are
 //! documented in docs/diagnostics.md. The control socket is bound before vCPUs start.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use vmlab_hv_proto::MachineDescription;
@@ -206,6 +206,18 @@ fn read_machine(path: &PathBuf, control: &std::path::Path) -> Result<MachineDesc
     })
 }
 
+fn check_socket_path(path: &Path) -> Result<(), String> {
+    const MAX_BYTES: usize = 107; // Linux sun_path also needs a terminating NUL.
+    let bytes = path.as_os_str().len();
+    if bytes > MAX_BYTES {
+        return Err(format!(
+            "Unix socket path {} is {bytes} bytes; the limit is {MAX_BYTES} bytes",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn run(desc: MachineDescription, args: Args) -> Result<ExitReason, String> {
     // sigwait requires termination signals blocked before workers inherit the mask.
     block_termination_signals()?;
@@ -216,6 +228,24 @@ fn run(desc: MachineDescription, args: Args) -> Result<ExitReason, String> {
         desc.vcpus,
         desc.memory_mib
     );
+
+    check_socket_path(&args.control)?;
+    let display_paths = desc.display.as_ref().map(|display| {
+        let directory = args.control.parent().unwrap_or(Path::new("."));
+        let native = display
+            .socket
+            .clone()
+            .unwrap_or_else(|| directory.join("display.sock"));
+        let rfb = display
+            .vnc_socket
+            .clone()
+            .unwrap_or_else(|| directory.join("vnc.sock"));
+        (native, rfb)
+    });
+    if let Some((native, rfb)) = &display_paths {
+        check_socket_path(native)?;
+        check_socket_path(rfb)?;
+    }
 
     // Refuse an occupied control path before doing any work, so a stale
     // socket or a second launch fails fast and leaves the path alone.
@@ -244,16 +274,7 @@ fn run(desc: MachineDescription, args: Args) -> Result<ExitReason, String> {
     let handle = vm.handle();
 
     // Bind every served socket before the vCPUs run.
-    if let Some(display) = &desc.display {
-        let directory = args.control.parent().unwrap_or(std::path::Path::new("."));
-        let native = display
-            .socket
-            .clone()
-            .unwrap_or_else(|| directory.join("display.sock"));
-        let rfb = display
-            .vnc_socket
-            .clone()
-            .unwrap_or_else(|| directory.join("vnc.sock"));
+    if let Some((native, rfb)) = display_paths {
         handle
             .serve_display(&native, &rfb)
             .map_err(|e| e.to_string())?;
