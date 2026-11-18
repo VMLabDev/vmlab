@@ -1,8 +1,66 @@
 # Phase-2 performance gate (HV-D28)
 
-**Verdict: NOT passed. The round-5 full-suite window met six of ten core bars.
-The round-6 focused window now passes G4, G7, G9, and G10; other bars were
-not rerun.** The VM default must remain unchanged.
+**Verdict: D28 remains open. Round 7 met six of ten core bars.**
+
+## Round 7 full quiet-host window (2026-11-18)
+
+Card #32 ran the full x86_64 KVM suite on helios from
+`82bec6b52c422a8313849f0496fdca4b989ad400`. The board reserved the window
+for this card. Admission found zero project VMs at the start and after
+the run. The log records host load. The opticlang pause was unconfirmed.
+
+Each backend completed three fresh-overlay repeats for Ubuntu 26.04.3
+(full and guest-to-guest) and Windows 10 19045.2006.10 (standard variant,
+boot only). Within each configuration all QEMU repeats ran before the
+vmlab-hv repeats. Single-VM runs used CPUs 16–23 and the TCP pair used
+16–19 and 20–23. The governor was set to performance and VM scopes had a
+24 GiB cap with swap disabled. QEMU was 11.1.3. The release vmlab-hv binary
+SHA-256 was `a7eea151afd10d8e589a854052691f53d34fdfa710989a95154f3f8218fc3ae9`.
+The iPXE ROM SHA-256 was
+`d16c126333662d3cd6127d9ef27c463a04de263d7edbde200441c2c58bf4153e`.
+
+The first Windows attempts stopped before VM launch because the runner's
+default OVMF path was absent. Both retries used the same plain OVMF pair
+from the published v0.46.1-alpha guest bundle retained by the q35 soak.
+The CODE SHA-256 was
+`29ae4bcaea971a66df26493f294a786986dcce482e3109e45634b951c362cf26`
+and the VARS SHA-256 was
+`5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e`.
+All six measured configurations and `bench/report.py --arch x86_64`
+completed successfully.
+
+The monitor took 298 samples at five-second intervals from 10:43:08 to
+11:07:54 UTC. Load averages (1, 5, and 15 minutes) started at
+1.38, 1.27, and 2.12 and ended at 1.87, 1.79, and 1.78. The sampled
+ranges were 0.45–3.15, 0.90–2.13, and 1.53–2.16. The runner logs and both
+load logs remain on helios under
+`/home/vmlab/src/stc/logs/d28-vml-13.n9E4VicG/`.
+
+Boot requires a median ratio at most 1.00. Throughput requires at least
+0.80. Verdicts use the ratios before rounding.
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---:|---:|---:|---|
+| G1 | Ubuntu boot (s) | 6.60 | 6.93 | 1.0500 | FAIL |
+| G2 | Windows 10 boot (s) | 89.93 | 103.11 | 1.1466 | FAIL |
+| G3 | Sequential read (MiB/s) | 15505.99 | 17166.19 | 1.1071 | PASS |
+| G4 | Sequential write (MiB/s) | 1480.02 | 3898.07 | 2.6338 | PASS |
+| G5 | Random read 4 KiB (IOPS) | 50750.00 | 70941.20 | 1.3979 | PASS |
+| G6 | Random write 4 KiB (IOPS) | 17723.00 | 13200.50 | 0.7448 | FAIL |
+| G7 | UDP TX (Mbit/s) | 35457.47 | 25763.87 | 0.7266 | FAIL |
+| G8 | UDP RX (Mbit/s) | 86199.69 | 107667.66 | 1.2490 | PASS |
+| G9 | TCP A to B (Mbit/s) | 26851.93 | 31155.99 | 1.1603 | PASS |
+| G10 | TCP B to A (Mbit/s) | 26498.21 | 31063.02 | 1.1723 | PASS |
+
+Idle host CPU was 0.95% of one core on QEMU and 1.93% on vmlab-hv.
+D28 sets no idle CPU threshold. The QEMU sequential-write median
+fell from 4,769.18 MiB/s in round 6 to 1,480.02 MiB/s here, so the wider
+passing margin reflects a lower QEMU baseline.
+
+All 22 aggregate records and their raw samples are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl). The runner marks later
+configurations dirty because earlier configurations had already appended
+to that tracked file. Both backends used the source revision above.
 
 ## Round 6 owner decisions (2026-11-02)
 
