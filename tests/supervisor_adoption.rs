@@ -107,7 +107,7 @@ impl Host {
     }
 
     fn runtime(&self) -> PathBuf {
-        self.path().join("runtime/vmlab")
+        vmlab::paths::runtime_dir_in(Some(&self.path().join("runtime")))
     }
 
     fn registry(&self) -> PathBuf {
