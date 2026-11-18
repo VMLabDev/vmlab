@@ -1320,7 +1320,12 @@ impl VmShared {
             .filter(|id| broadcast || *id == 0)
             .collect();
         self.pending_smis.lock().extend(targets.iter().copied());
-        self.kick_all();
+        // The issuer injects its own SMI when this returns. Only another
+        // target has to leave KVM_RUN, so an SMI for the issuer alone kicks
+        // nobody: SeaBIOS raises one for every 16-bit disk call.
+        if targets.iter().any(|id| *id != issuer) {
+            self.kick_all();
+        }
         targets.contains(&issuer)
     }
 
@@ -2032,6 +2037,60 @@ mod tests {
                 if pause { vec![1] } else { vec![] }
             );
         }
+    }
+
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+    fn smi_for_the_issuer_alone_kicks_no_vcpu() {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("skipping SMI kick test: /dev/kvm is unavailable");
+            return;
+        }
+        let kvm = KvmVm::new().unwrap();
+        let signal = Arc::new(SleepSignal::default());
+        let shared = VmShared::new(
+            kvm,
+            IoBus::new(),
+            MmioBus::new(),
+            Arc::new(Mutex::new(PciRoot::new(1 << 32))),
+            Arc::new(Mutex::new(PmDevice::new(Arc::new(NullIrq), signal.sink()))),
+            signal,
+            1 << 32,
+        );
+        *shared.vcpus.lock() = (0..2)
+            .map(|id| (id, Arc::new(Mutex::new(shared.kvm.create_vcpu(id).unwrap()))))
+            .collect();
+        crate::vcpu::install_kick_handler();
+        // A registered thread stands in for a vCPU blocked in KVM_RUN: a kick
+        // interrupts its sleep. `kicked` reports whether one arrived.
+        let kicked = |issuer: u8, expect_issuer_targeted: bool| {
+            let (ready, started) = std::sync::mpsc::channel();
+            let registry = shared.clone();
+            let sleeper = std::thread::spawn(move || {
+                // SAFETY: pthread_self(3) reads the calling thread's own id.
+                let tid = unsafe { libc::pthread_self() };
+                registry.register_vcpu(tid);
+                ready.send(()).unwrap();
+                let request = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 300_000_000,
+                };
+                // SAFETY: nanosleep(2) with a valid request and no remainder.
+                let interrupted = unsafe { libc::nanosleep(&request, std::ptr::null_mut()) } != 0;
+                registry.unregister_vcpu(tid);
+                interrupted
+            });
+            started.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(shared.dispatch_smi(issuer), expect_issuer_targeted);
+            assert_eq!(shared.save_pending_smis(), vec![0]);
+            assert!(shared.take_pending_smi(0));
+            sleeper.join().unwrap()
+        };
+        // Without broadcast only vCPU 0 is a target. It injects its own SMI.
+        assert!(!kicked(0, true));
+        // Raised by vCPU 1, the SMI has to take vCPU 0 out of KVM_RUN.
+        assert!(kicked(1, false));
     }
 
     #[test]
