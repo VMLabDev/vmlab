@@ -1,6 +1,128 @@
 # Phase-2 performance gate (HV-D28)
 
-**Verdict: D28 remains open. Round 7 met six of ten core bars.**
+**Verdict: D28 remains open. Round 7 met six of ten core bars. Card #71 then
+closed G1 (0.9770).**
+
+## Round 7 follow-up: G1 Ubuntu boot (card #71, 2026-11-18)
+
+G1 now passes: vmlab-hv boots Ubuntu in 6.36 seconds against QEMU's 6.51,
+a ratio of 0.9770. Round 7 measured 6.93 against 6.60.
+
+### Where the time went
+
+Guest serial output, per-thread CPU time, `/proc/<pid>/io` and KVM's own
+vCPU statistics (`KVM_GET_STATS_FD` for vmlab-hv, QMP `query-stats` for
+QEMU) split the round-7 boot into phases. The Linux kernel and userspace
+were not slower: the agent started at 4.85 seconds of guest time under
+vmlab-hv and 5.03 under QEMU. The whole gap sat before the first kernel
+line on the serial port: 1.86 to 2.00 seconds under vmlab-hv, 1.46 to 1.56
+under QEMU. SeaBIOS took the same time on both. GRUB's 88 MiB of disk reads
+took 1.07 seconds against 0.80, and the kernel's decompression 0.27 against
+0.16.
+
+GRUB reads through SeaBIOS in about 5,500 calls of 16 KiB. Each call enters
+SeaBIOS's 32-bit code through four SMIs and through legacy mode switches.
+Three causes were found there. No single one closes the gap.
+
+- F1, RTC index port. A read of port 0x70 returned the CMOS index. QEMU
+  returns 0xff, checked in a guest on both backends. SeaBIOS reads the port
+  before each legacy mode switch, and a clear bit 7 makes it mask NMI and
+  restore it. That was 20 port exits for each disk call against QEMU's 12.
+  The index ports (0x70, 0x72, 0x74, 0x76) now read 0xff.
+- F2, 4 KiB nested pages for low RAM. q35's main low region starts at guest
+  address 1 MiB and had its own anonymous mapping at an address the kernel
+  chose. KVM uses 2 MiB pages for a memslot only when the host and guest
+  addresses are equal modulo 2 MiB, so the low 2 GiB was mapped 4 KiB at a
+  time: about 3,270 nested page faults per 100 ms during GRUB against 7
+  under QEMU, 22,000 for the 88 MiB. Decompression touches fresh pages the
+  same way. Each anonymous region is now placed congruent with its guest address. The
+  mapping stays owned by vm-memory. A region that cannot be placed keeps
+  its plain mapping.
+- F3, SMI kicks. Every SMI signalled every vCPU thread, although without
+  broadcast the only target is the vCPU that raised it. The halted second
+  vCPU left `KVM_RUN` 22,000 times and spent 1.1 seconds of host kernel
+  time during GRUB. An SMI whose only target is its issuer now signals no
+  thread.
+
+Diagnostic boots after each step, one to three per build, on the shared
+host. One QEMU boot slowed by statistics polling is left out:
+
+| Build | First kernel line (s) | Boot to agent ready (s) |
+|---|---|---|
+| QEMU 11.1.3 | 1.46 to 1.56 | 6.56 to 6.78 |
+| vmlab-hv at round 7 | 1.86 to 2.00 | 6.85 to 6.99 |
+| F3 only | 1.81 to 1.87 | 6.79 to 6.86 |
+| F3 and F1 | 1.66 to 1.75 | 6.67 to 6.80 |
+| F3, F1 and F2 | 1.41 to 1.47 | 6.39 to 6.48 |
+
+### Quiet-window rerun
+
+The rerun used round 7's method on helios from
+`45558cb1811443e4e3fc726991eb20a80425412c`: `bench/run.py --arch x86_64
+--guest ubuntu-26.04 --repeats 3`, all three QEMU repeats and then all
+three vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Ubuntu 26.04.3. QEMU was
+11.1.3. The release vmlab-hv binary SHA-256 was
+`5b99c245498fe33920e636aab2fddd1347c7ca56edee82ca1c12b5e50f9154a8` and the
+iPXE ROM, rebuilt from this revision, was
+`66308ed2100e05385a600baae371e9e69675e4bd0b287f4e57bfce04c4e8b727`.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 125 samples at
+five-second intervals from 17:35:15 to 17:45:35 UTC. The one-minute load
+ranged from 0.58 to 1.68, the five-minute load from 1.00 to 1.49 and the
+fifteen-minute load from 1.09 to 1.23. The opticlang pause was not
+confirmed. Logs, hashes and the diagnostic scripts remain on helios under
+`/home/vmlab/src/stc/logs/d28-card-71.r8a/`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G1 | Ubuntu boot (s) | 6.51, 6.54, 6.48 | 6.51 | 6.38, 6.36, 6.34 | 6.36 | 0.9770 | PASS |
+
+Every vmlab-hv sample is below every QEMU sample.
+
+The same runs measure the other single-VM workloads. Their cards own the
+verdicts (#73, #74). The values are recorded here because F2 changes how
+all low guest RAM is mapped:
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Round 7 |
+|---|---|---:|---:|---:|---:|
+| G3 | Sequential read (MiB/s) | 18473.58 | 20967.17 | 1.1350 | 1.1071 |
+| G4 | Sequential write (MiB/s) | 1488.03 | 3065.61 | 2.0602 | 2.6338 |
+| G5 | Random read 4 KiB (IOPS) | 50452.60 | 70349.60 | 1.3944 | 1.3979 |
+| G6 | Random write 4 KiB (IOPS) | 17263.90 | 16996.50 | 0.9845 | 0.7448 |
+| G7 | UDP TX (Mbit/s) | 36694.70 | 25056.39 | 0.6828 | 0.7266 |
+| G8 | UDP RX (Mbit/s) | 86395.98 | 109299.92 | 1.2651 | 1.2490 |
+
+Idle host CPU was 0.93% of one core on QEMU and 1.97% on vmlab-hv. All 16
+aggregate records and their samples are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl). The vmlab-hv records are
+marked dirty because the QEMU run had appended to that tracked file.
+Windows boot (G2) and the guest-to-guest pair were not run.
+
+### Verification
+
+Unit tests cover the three changes: the index ports read 0xff and keep the
+selected register, a q35 layout's anonymous regions are congruent with
+their guest addresses, and an SMI for its issuer alone interrupts no
+registered vCPU thread while one raised by another vCPU does. The SMI test
+needs KVM. It ran on helios outside the merge bar, which ignores KVM tests.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD1: RAM backed by the shared memfd (a machine with virtio-fs shares, and
+  every pc machine) still gets 4 KiB nested pages. It needs shmem huge
+  pages, which depend on the host's `shmem_enabled` setting and on
+  `MADV_HUGEPAGE`.
+- FD2: anonymous guest RAM is not marked `MADV_HUGEPAGE`. QEMU marks it. On
+  a host with transparent huge pages set to `madvise`, vmlab-hv would get
+  none. helios runs `always`.
+- FD3: vmlab-hv answers ports 0x72 to 0x77 with an extended CMOS bank and
+  aliases. QEMU's q35 reads 0xff on all six.
+- FD4: each SMI still pays one extra `KVM_RUN` with `immediate_exit` to
+  complete the APMC write, about 22,000 during this boot.
 
 ## Round 7 full quiet-host window (2026-11-18)
 

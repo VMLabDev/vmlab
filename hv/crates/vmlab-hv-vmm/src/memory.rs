@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VmFd;
-use vm_memory::{FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{
+    FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionMmap, MmapRegion,
+};
 
 use crate::error::VmmError;
 use crate::layout::MemLayout;
@@ -25,7 +28,7 @@ pub struct GuestRam {
 impl GuestRam {
     /// Anonymous private RAM.
     pub fn anonymous(layout: MemLayout) -> Result<Self, VmmError> {
-        let mem = mmap_regions(&layout, None)
+        let mem = mmap_anonymous(&layout)
             .map_err(|e| VmmError::Memory(format!("allocating guest RAM: {e}")))?;
         dont_dump(&mem)?;
         Ok(GuestRam {
@@ -51,7 +54,7 @@ impl GuestRam {
         // top of RAM.
         file.set_len(total)
             .map_err(|e| VmmError::Memory(format!("sizing memfd: {e}")))?;
-        let mem = mmap_regions(&layout, Some(&file))
+        let mem = mmap_regions(&layout, &file)
             .map_err(|e| VmmError::Memory(format!("mapping guest RAM: {e}")))?;
         dont_dump(&mem)?;
         Ok(GuestRam {
@@ -107,13 +110,103 @@ pub(crate) fn dont_dump(mem: &GuestMemoryMmap) -> Result<(), VmmError> {
 
 fn mmap_regions(
     layout: &MemLayout,
-    file: Option<&File>,
+    file: &File,
 ) -> Result<GuestMemoryMmap, vm_memory::mmap::FromRangesError> {
     let ranges = layout.regions.iter().map(|(base, size)| {
-        let file_offset = file.map(|f| FileOffset::new(f.try_clone().expect("clone memfd"), *base));
-        (GuestAddress(*base), *size as usize, file_offset)
+        let file_offset = FileOffset::new(file.try_clone().expect("clone memfd"), *base);
+        (GuestAddress(*base), *size as usize, Some(file_offset))
     });
     GuestMemoryMmap::from_ranges_with_files(ranges)
+}
+
+/// The page size KVM maps guest RAM with when the host backs it with
+/// transparent huge pages.
+const HUGE_PAGE: usize = 2 << 20;
+
+/// KVM maps a memslot with 2 MiB pages only when its host address and its
+/// guest address are equal modulo 2 MiB.
+fn huge_page_congruent(host: *mut u8, base: u64) -> bool {
+    (host as u64 ^ base) & (HUGE_PAGE as u64 - 1) == 0
+}
+
+/// Anonymous RAM, one mapping per region, each placed so KVM can use 2 MiB
+/// pages for it. q35's main low region starts at guest address 1 MiB, and an
+/// address the kernel chooses is not congruent with that: every page of low
+/// RAM then costs its own nested page fault (card #71, D28 G1).
+fn mmap_anonymous(layout: &MemLayout) -> Result<GuestMemoryMmap, String> {
+    let regions = layout
+        .regions
+        .iter()
+        .map(|&(base, size)| {
+            let mapping = map_congruent(base, size as usize).map_err(|e| e.to_string())?;
+            GuestRegionMmap::new(mapping, GuestAddress(base))
+                .ok_or_else(|| format!("RAM region {base:#x}+{size:#x} wraps the address space"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    GuestMemoryMmap::from_regions(regions).map_err(|e| e.to_string())
+}
+
+/// One anonymous mapping for the region at guest address `base`. vm-memory
+/// owns only a mapping it makes itself, at an address the kernel picks, so
+/// the address is steered: see [`map_into_hole`]. A region the steering
+/// cannot place keeps a plain mapping, which is correct and only slower.
+fn map_congruent(base: u64, size: usize) -> Result<MmapRegion, vm_memory::mmap::MmapRegionError> {
+    let plain = MmapRegion::new(size)?;
+    if size < HUGE_PAGE || huge_page_congruent(plain.as_ptr(), base) {
+        return Ok(plain);
+    }
+    // A mapping that landed elsewhere stays mapped until the end: it fills
+    // the gap that took it, so the next attempt cannot fall into it again.
+    let mut misplaced = Vec::new();
+    for _ in 0..4 {
+        match map_into_hole(base, size) {
+            Some(mapping) if huge_page_congruent(mapping.as_ptr(), base) => return Ok(mapping),
+            Some(mapping) => misplaced.push(mapping),
+            None => break,
+        }
+    }
+    Ok(plain)
+}
+
+/// Reserve a span 2 MiB longer than the region, open a hole of exactly the
+/// region's size at the congruent address inside it, and map: the kernel
+/// places a mapping in the highest gap that fits, which is that hole unless
+/// another gap or another thread takes it. The caller checks the address.
+fn map_into_hole(base: u64, size: usize) -> Option<MmapRegion> {
+    let span = size.checked_add(HUGE_PAGE)?;
+    // SAFETY: a fresh anonymous reservation that nothing else refers to.
+    let start = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if start == libc::MAP_FAILED {
+        return None;
+    }
+    let start = start as usize;
+    let lead = (base as usize).wrapping_sub(start) & (HUGE_PAGE - 1);
+    let hole = start + lead;
+    let tail = span - lead - size;
+    // SAFETY: the three ranges partition the reservation made above, which
+    // only this function knows. The hole is unmapped before the mapping is
+    // made and the two guards after it, so the hole is the gap between them.
+    let mapping = unsafe {
+        libc::munmap(hole as *mut libc::c_void, size);
+        let mapping = MmapRegion::new(size);
+        if lead != 0 {
+            libc::munmap(start as *mut libc::c_void, lead);
+        }
+        if tail != 0 {
+            libc::munmap((hole + size) as *mut libc::c_void, tail);
+        }
+        mapping
+    };
+    mapping.ok()
 }
 
 fn create_memfd() -> Result<File, String> {
@@ -206,6 +299,39 @@ mod tests {
                 assert!(excluded, "guest mapping must carry MADV_DONTDUMP");
             }
         }
+    }
+
+    #[test]
+    fn anonymous_ram_is_congruent_with_its_guest_address_modulo_2_mib() {
+        // q35's low region starts at 1 MiB and has an odd size in MiB, the
+        // shape the kernel's own placement leaves without huge pages.
+        let layout = MemLayout::q35(8192).unwrap();
+        let ram = GuestRam::anonymous(layout.clone()).unwrap();
+        let regions: Vec<_> = ram
+            .mem
+            .iter()
+            .map(|region| (region.start_addr().0, region.len()))
+            .collect();
+        assert_eq!(regions, layout.regions);
+        for region in ram.mem.iter().filter(|r| r.len() >= HUGE_PAGE as u64) {
+            let base = region.start_addr().0;
+            assert!(
+                huge_page_congruent(region.as_ptr(), base),
+                "region {base:#x} is mapped at {:p}",
+                region.as_ptr()
+            );
+        }
+        // The steered mapping is ordinary RAM: both ends take a write.
+        let (base, size) = layout.regions[1];
+        ram.mem.write_slice(&[0x5a], GuestAddress(base)).unwrap();
+        ram.mem
+            .write_slice(&[0xa5], GuestAddress(base + size - 1))
+            .unwrap();
+        let mut byte = [0];
+        ram.mem
+            .read_slice(&mut byte, GuestAddress(base + size - 1))
+            .unwrap();
+        assert_eq!(byte, [0xa5]);
     }
 
     #[test]
