@@ -38,7 +38,10 @@ fn the_operation_budget_bounds_one_step_and_not_the_guest_lifetime() {
     while cpu.interpreter.operations - start <= budget * 4 {
         cpu.step().unwrap();
         steps += 1;
-        assert!(steps < 1_000_000, "the spinning hart stopped costing operations");
+        assert!(
+            steps < 1_000_000,
+            "the spinning hart stopped costing operations"
+        );
     }
     assert_eq!(cpu.pc().unwrap(), 0x8000_0000);
 
@@ -67,7 +70,10 @@ fn the_terminal_keeps_only_the_newest_output() {
             .call("zplat_term_write", vec![Value::bits(8, *byte)])
             .unwrap();
     }
-    assert_eq!(interpreter.terminal.iter().copied().collect::<Vec<_>>(), b"defg");
+    assert_eq!(
+        interpreter.terminal.iter().copied().collect::<Vec<_>>(),
+        b"defg"
+    );
     assert_eq!(interpreter.terminal_dropped, 3);
 
     // A guest that prints without end cannot grow the buffer past the limit.

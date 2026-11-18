@@ -137,9 +137,7 @@ mod tests {
         // The digest in the generated source is the SHA-256 of the IR the
         // payload decompresses to.
         let digest = format!("{:x}", Sha256::digest(&json));
-        assert!(
-            a.0.contains(&format!("pub const IR_SHA256: &str = {digest:?};"))
-        );
+        assert!(a.0.contains(&format!("pub const IR_SHA256: &str = {digest:?};")));
         let program: vmlab_hv_tcg_ir::Program = serde_json::from_slice(&json).unwrap();
         assert_eq!(program.functions["zexecute"].code.len(), 2);
     }

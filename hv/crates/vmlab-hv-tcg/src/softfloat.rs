@@ -6,14 +6,7 @@ use vmlab_hv_tcg_ir::{Program, Type};
 include!(concat!(env!("OUT_DIR"), "/softfloat_names.rs"));
 
 unsafe extern "C" {
-    fn hv_softfloat(
-        operation: u32,
-        p0: u64,
-        p1: u64,
-        p2: u64,
-        p3: u64,
-        flags: *mut u8,
-    ) -> u64;
+    fn hv_softfloat(operation: u32, p0: u64, p1: u64, p2: u64, p3: u64, flags: *mut u8) -> u64;
 }
 
 /// The dispatch index of a Sail SoftFloat primitive.
