@@ -30,7 +30,7 @@ issued the restore command. See `rechecks/windows-11/` for the repeat.
 
 ## Findings
 
-- **F1. Windows Server Core Setup advances much more slowly on vmlab-hv.**
+- **F1. Windows Server Core Setup advances much more slowly on vmlab-hv (card #70).**
   With the same install media and definitions, earlier vmlab-hv builds
   were at 45%, 2% and 7% for 2019, 2022 and 2025, respectively. The QEMU
   builds launched around 06:44 UTC had reached “Getting ready” on 2019 and
@@ -40,13 +40,14 @@ issued the restore command. See `rechecks/windows-11/` for the repeat.
   vmlab-hv runs with bundled firmware exceeded 900 s. Fresh clones with
   the same firmware and shorter runtime paths reached agent-ready in
   478.4 s and 362.5 s, respectively, and passed every vmlab-hv check.
-- **F3. A long XDG runtime path stops vmlab-hv startup.** Repeating
+  The readiness timeout did not recur in the fresh clones, so no bug card
+  was filed for it.
+- **F3. A long XDG runtime path stops vmlab-hv startup (card #69).** Repeating
   Windows 10 and 11 with a longer `XDG_RUNTIME_DIR` caused vmlab-hv to fail
   binding `display.sock` with `path must be shorter than SUN_LEN`. The
   Windows 11 QEMU control reached its agent and captured a snapshot with
   the same path length.
 
-The board denied `kanban card_add` because the worker lacks keeper access.
 The two bug drafts, command logs and screenshots are on helios in
 `/home/vmlab/src/stc/soak-vml-12/`. See `windows-core-installer-defect.md`,
 `windows-lifecycle-defects.md`, `install-comparison/` and
