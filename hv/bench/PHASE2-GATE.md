@@ -112,23 +112,24 @@ winlogon, on the guest clock, which starts from the host's.
   and the configuration writes through ECAM (2,254, 0.034 seconds
   together behind the all-vCPU barrier).
 
-### Follow-up drafts
+### Follow-ups
 
-These are drafts. No card exists for them.
+FD5, FD6 and FD7 are cards now. FD8 is a decision that waits for the
+operator.
 
-- FD5: serve virtio-gpu 2D commands off the vCPU thread, and compose a
+- FD5 (card #97): serve virtio-gpu 2D commands off the vCPU thread, and compose a
   frame once per published frame, not once per flush command. Up to 1.4 seconds of a
   Windows boot.
-- FD6: wake the virtio-blk worker from an ioeventfd, not from a userspace
+- FD6 (card #98): wake the virtio-blk worker from an ioeventfd, not from a userspace
   MMIO exit. Up to 0.5 seconds of a Windows boot, and every block
   workload.
-- FD7: G2 cannot resolve 2% as it is measured. Either probe readiness
+- FD7 (card #96): G2 cannot resolve 2% as it is measured. Either probe readiness
   every second in the benchmark, or alternate the backends and take more
   than three repeats, and record a host sync-latency probe beside each
   boot.
 - FD8: the owner accepted G1 at 1.003 in round 6. G2 at 1.02, with a
   spread of 9 seconds on the QEMU side, is a candidate for the same
-  decision.
+  decision. No card: the lead asked the operator, and the answer is open.
 
 ## Round 7 follow-up: G1 Ubuntu boot (card #71, 2026-11-18)
 
