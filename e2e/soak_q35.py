@@ -74,7 +74,11 @@ lab "soak-{name}" {{
                 raise RuntimeError(message)
 
         def state():
-            lines = run("status", "-v", timeout=15, check=False).splitlines()
+            try:
+                lines = run("status", "-v", timeout=15, check=False).splitlines()
+            except subprocess.TimeoutExpired as exc:
+                print(str(exc), file=log)
+                return ""
             return next((detail for row, detail in zip(lines, lines[1:])
                          if row.split()[:1] == ["guest"]), "")
 
@@ -84,9 +88,15 @@ lab "soak-{name}" {{
                 require(time.monotonic() < deadline, message)
                 time.sleep(2)
 
+        def is_ready():
+            detail = state().split()
+            if "ready=yes" not in detail:
+                return False
+            require(f"hypervisor={backend}" in detail, "unexpected hypervisor in status")
+            return True
+
         def ready():
-            wait_until(lambda: "ready=yes" in state(), 900, "agent readiness timed out")
-            require(f"hypervisor={backend}" in state().split(), "unexpected hypervisor in status")
+            wait_until(is_ready, 900, "agent readiness timed out")
 
         def guest(command):
             if windows:
@@ -195,8 +205,7 @@ lab "soak-{name}" {{
                 def running_agent():
                     if up.done():
                         up.result()
-                    detail = state().split()
-                    return "ready=yes" in detail and f"hypervisor={backend}" in detail
+                    return is_ready()
 
                 agent_ready = step("agent-ready", lambda: wait_until(
                     running_agent, 900, "agent readiness timed out",
