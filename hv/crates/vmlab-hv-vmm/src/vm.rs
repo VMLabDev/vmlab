@@ -2058,7 +2058,12 @@ mod tests {
             1 << 32,
         );
         *shared.vcpus.lock() = (0..2)
-            .map(|id| (id, Arc::new(Mutex::new(shared.kvm.create_vcpu(id).unwrap()))))
+            .map(|id| {
+                (
+                    id,
+                    Arc::new(Mutex::new(shared.kvm.create_vcpu(id).unwrap())),
+                )
+            })
             .collect();
         crate::vcpu::install_kick_handler();
         // A registered thread stands in for a vCPU blocked in KVM_RUN: a kick

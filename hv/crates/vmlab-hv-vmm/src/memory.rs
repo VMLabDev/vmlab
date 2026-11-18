@@ -328,7 +328,9 @@ mod tests {
             .write_slice(&[0xa5], GuestAddress(base + size - 1))
             .unwrap();
         let mut byte = [0];
-        ram.mem.read_slice(&mut byte, GuestAddress(base + size - 1)).unwrap();
+        ram.mem
+            .read_slice(&mut byte, GuestAddress(base + size - 1))
+            .unwrap();
         assert_eq!(byte, [0xa5]);
     }
 
