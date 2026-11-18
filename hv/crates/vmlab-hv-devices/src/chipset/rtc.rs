@@ -210,7 +210,11 @@ impl BusDevice for Rtc {
             let port = offset.saturating_add(i as u64) & 7;
             let bank = ((port >> 1) & 1) as usize;
             if port & 1 == 0 {
-                *byte = self.index[bank];
+                // The index register is write-only and reads 0xff, as on
+                // QEMU. SeaBIOS reads port 0x70 before each 16-bit disk
+                // call: a set bit 7 tells it NMI is masked already, a clear
+                // one costs two more port writes and two more reads.
+                *byte = 0xff;
                 continue;
             }
             let reg = usize::from(self.index[bank] & 0x7f) + bank * 128;
@@ -335,6 +339,19 @@ mod tests {
     fn put(rtc: &mut Rtc, reg: u8, value: u8) {
         rtc.write(0, &[reg]);
         rtc.write(1, &[value]);
+    }
+    #[test]
+    fn index_ports_read_ff_and_keep_the_selected_register() {
+        let mut rtc = Rtc::new(2 << 30, 1_793_355_112, Arc::new(Line::default()));
+        put(&mut rtc, 0x38, 0x42);
+        for port in [0, 2, 4, 6] {
+            let mut b = [0];
+            rtc.read(port, &mut b);
+            assert_eq!(b[0], 0xff, "index port {port}");
+        }
+        let mut b = [0];
+        rtc.read(1, &mut b);
+        assert_eq!(b[0], 0x42);
     }
     #[test]
     fn system_reset_preserves_calendar_and_cmos_but_clears_interrupts() {
