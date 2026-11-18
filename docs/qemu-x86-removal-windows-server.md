@@ -50,3 +50,22 @@ agent-ready in 361 s and reported build `10.0.17763.9245`. Both control
 clones used the existing guest agent with automatic agent updates disabled.
 See `control-vmlab/boot.log`, `control-vmlab/failure.png`, and
 `control-qemu/boot.log` under `/home/vmlab/src/stc/card-7`.
+
+Card 76 booted two fresh clones of the `17763.737.7` control on helios
+with vmlab and vmlab-hv built from vmlab `next` at
+`1c289d35d93cb1acc0b5b37b01fad1524771d509`. Both used the shared OVMF
+firmware (Debian `2026.08+ds-2`) and kept the baked agent (`f1e4515`)
+with automatic agent updates disabled. `vmlab up --wait` finished in
+209 s and 161 s. For both clones, `vmlab status -v` reported
+`hypervisor=vmlab` and `ready=yes`, and
+`vmlab exec server -- cmd.exe /c ver` reported `10.0.17763.9245`.
+Both clones were destroyed after the checks. See
+`17763.737.7-vmlab/boot.log` and `17763.737.7-vmlab-repeat/boot.log`
+under `/home/vmlab/src/stc/card-76-work`.
+
+The timeout did not recur in either run. The agent briefly disconnected
+during Windows setup, then returned. The first-boot provision cleared
+the specialize marker and completed its reboot in both runs. The cause of the
+original stall remains unknown. An
+[earlier q35 soak](agents/q35-soak-vml-12.md#windows-server-2019177637377)
+also reached agent-ready with this version on vmlab-hv.
