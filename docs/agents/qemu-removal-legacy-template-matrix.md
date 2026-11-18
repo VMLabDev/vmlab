@@ -66,8 +66,8 @@ ISO files belong in the templates checkout's `iso/` directory. The control
 version is installed locally. A trace filename is relative to
 `evidence/<template directory>/`.
 
-Of 27 installed controls, 14 passed agent readiness, exec, and online
-snapshot restore with post-restore exec. Those include all four
+In card #3's run, 14 of 27 installed controls passed agent readiness,
+exec, and online snapshot restore with post-restore exec. Those include all four
 phase 4 gate images. Three definitions had no installed control.
 Both Windows 98 controls passed after using the explicit
 `C:\COMMAND.COM /c ver` invocation from the legacy test pattern. The
@@ -88,7 +88,7 @@ initial bare `ver` attempt failed with error 2, as recorded in
 | windows-8.1 | x86_64 | Open, `en_windows_8_1_enterprise_x64_dvd_2971902.iso` | `9600.0.0` | Running, no agent | Fail | Restore passed, no agent check | `verify-boot.log` |
 | windows-8.1-x86 | x86 | Open, `en_windows_8_1_enterprise_x86_dvd_2972289.iso` | `9600.0.0` | Pass | Pass | Pass | `verify-boot.log` |
 | windows-95 | x86 | Open, `win95_en.iso` | `4.00.950.4` | Agent wait timed out | Open | Open | `dos-boot.log` |
-| windows-95-osr2 | x86 | Deferred to #77 | `4.00.1111.3` | TCG refused, KVM override timed out | Open | Open | `osr2-kvm-boot.log` |
+| windows-95-osr2 | x86 | Deferred to #77 | `4.00.1111.3` | Pass with KVM override and longer wait (F2) | Pass | Pass | Card #83, see F2 |
 | windows-95-osr25 | x86 | Open, `win95c_osr25.iso` | `4.03.1216.4` | Agent wait timed out | Open | Open | `dos-boot.log` |
 | windows-98 | x86 | Open, `win98_fe_en.iso` | `4.10.1998.3` | Pass | Pass | Pass | `win98-retry-boot.log` |
 | windows-98-se | x86 | Open, `win98_se_en.iso` | `4.10.2222.5` | Pass | Pass | Pass | `win98-retry-boot.log` |
@@ -120,15 +120,26 @@ one, then run `vmlab template build` with the vmlab-hv host default and
 verify the resulting sealed version. Rebuild MS-DOS 6.22 before Windows
 for Workgroups 3.11.
 
-### F2. Make the retained Windows 95 OSR2 control boot on KVM
+### F2. Retained Windows 95 OSR2 control boots on KVM
 
-Pin `x86/windows-95-osr2@4.00.1111.3` in a fresh lab with
-`hypervisor = "vmlab"` and run `vmlab up --wait`. The stored
-`accel = "tcg"` prevents launch. With `accel = "kvm"` on the VM,
-the guest starts but does not report agent readiness within 150 seconds.
-See `evidence/windows-95-osr2/osr2-boot.log` and
-`evidence/windows-95-osr2/osr2-kvm-boot.log`. Card #77 covers the
-separate rebuild from real installation media.
+The sealed `x86/windows-95-osr2@4.00.1111.3` records `accel = "tcg"`,
+which vmlab-hv refuses for x86. Set `hypervisor = "vmlab"` and
+`accel = "kvm"` on the VM. The clone inherits the sealed `pentium3`
+CPU model and the Windows 9x profile's Cirrus VGA. Card #3 stopped its
+KVM probe after 150 seconds (`evidence/windows-95-osr2/osr2-kvm-boot.log`).
+
+On helios, card #83 let that configuration continue. Using card #3's
+binaries, a fresh clone reached `vm.ready` 160 seconds after
+`vm.starting`. It spent part of the boot in the Cirrus VGA option ROM
+before SeaBIOS booted the hard disk. A separate standard VGA probe
+reached readiness in 97 seconds. With Cirrus, `vmlab exec guest --
+'C:\COMMAND.COM' /c ver` returned `Windows 95. [Version 4.00.1111]`
+before and after creating and restoring an online snapshot.
+
+The retest used disposable overlays and `agent_update = false`. Its
+daemon, VM and event logs are under `/home/vmlab/src/stc/o83/s/vmlab`
+on helios. Allow up to 300 seconds for `vmlab up --wait` when repeating
+the probe. Card #77 covers the rebuild from installation media.
 
 ### F3. Restore agent coverage for legacy Windows controls
 
