@@ -51,16 +51,8 @@ fn atapi_msf_toc_handles_maximum_lba_without_overflow() {
     d.ide.attach_cdrom(0, 0, Some(image)).unwrap();
     d.packet(0, [0x43, 2, 0, 0, 0, 0, 0xaa, 0, 12, 0, 0, 0], 512, false);
     let toc = d.bytes(0, 12);
-    let frames = u64::from(u32::MAX) + 150;
-    assert_eq!(
-        &toc[8..12],
-        &[
-            0,
-            (frames / 4500) as u8,
-            (frames / 75 % 60) as u8,
-            (frames % 75) as u8
-        ]
-    );
+    // Past 255 minutes the lead-out saturates at the largest MSF address.
+    assert_eq!(&toc[8..12], &[0, 0xff, 59, 74]);
 }
 
 #[derive(Default)]

@@ -636,7 +636,15 @@ impl Ahci {
                     self.put32(4, (merged & 2) | (1 << 31));
                 }
             }
-            8 => self.put32(8, old & !(value & mask)),
+            8 => {
+                // Acknowledged bits are no longer signalled: a port whose
+                // PxIS is still pending sets them again below and so sends
+                // a new MSI. Without this, a command completed between the
+                // guest's PxIS and IS writes would never be signalled.
+                let cleared = value & mask;
+                self.put32(8, old & !cleared);
+                self.msi_pending &= !cleared;
+            }
             0x100..=0x3ff => {
                 let port = (offset - 0x100) / 0x80;
                 let base = port_base(port);
