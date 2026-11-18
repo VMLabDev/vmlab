@@ -61,7 +61,7 @@ The work is done in sub-phases (D12):
 |---|---|
 | `vmlab-hv-sail-ir` | Jib text parser into a Rust AST. Pure, fuzzed. |
 | `vmlab-hv-tcg-ir` | The typed emulation IR: ops over u8–u128, explicit flags, memory ops through a softmmu interface, exceptions as IR terminators. Plus the specialisation passes: bitvector-to-integer lowering, constant folding, dead-path removal, register-file layout. |
-| `vmlab-hv-tcg-emit` | Jib AST to IR, run by `just tcg-generate` against the pinned toolchain. Its output is committed generated Rust in `vmlab-hv-tcg-riscv64` (later `-aarch64`): decoder tables and per-instruction IR builders, with Sail notices. |
+| `vmlab-hv-tcg-emit` | Jib AST to IR, run by `just tcg-generate` against the pinned toolchain. Its output is committed generated Rust in `vmlab-hv-tcg-riscv64` (later `-aarch64`): decoder accessors and the instruction tag list, with Sail notices. The runtime specialises the IR per instruction. |
 | `vmlab-hv-tcg` | The runtime: CPU state, the softmmu (TLB, page walks driven by the generated semantics, MMIO dispatch to the VMM's buses), exceptions and interrupts, the reference interpreter, the block/trace cache with self-modifying-code invalidation, and later the Cranelift JIT. It is driven per vCPU thread by `vmlab-hv-vmm` in place of `KVM_RUN` when the machine's accel is `tcg`. |
 | `vmlab-hv-lockstep` | The per-instruction oracle: the Sail-generated C++ model built in the toolchain container and linked through FFI, exposing step, state get/set and memory hooks. Plus a harness that runs our interpreter or JIT and the oracle side by side, reporting the first differing architectural state. |
 | `bench/` | The suite, its recipes and the result history (D2). |
