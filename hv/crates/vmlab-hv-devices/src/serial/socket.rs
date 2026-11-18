@@ -44,6 +44,18 @@ impl SocketBackend {
         let Some(client) = self.client.as_mut() else {
             return 0;
         };
+        match readiness(client) {
+            Readiness::Idle => return 0,
+            Readiness::HungUp => {
+                // QEMU's socket chardev disconnects on hangup and discards
+                // what the guest has not read yet. The legacy agent relies
+                // on it: a hello left by a host that gave up must not reach
+                // COM1 later.
+                self.client = None;
+                return 0;
+            }
+            Readiness::Input => {}
+        }
         match client.read(bytes) {
             Ok(0) => {
                 self.client = None;
@@ -85,6 +97,32 @@ impl SocketBackend {
             }
             result => result,
         }
+    }
+}
+
+enum Readiness {
+    Idle,
+    Input,
+    HungUp,
+}
+
+/// One poll in place of a speculative read: input waiting, nothing, or a
+/// host end that has closed, whatever it left unread. A half-close is
+/// not a hangup, as in QEMU, which watches for `G_IO_HUP` only.
+fn readiness(client: &UnixStream) -> Readiness {
+    let mut fd = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(client),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the duration of the call, no wait.
+    let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+    if ready <= 0 {
+        Readiness::Idle
+    } else if fd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        Readiness::HungUp
+    } else {
+        Readiness::Input
     }
 }
 

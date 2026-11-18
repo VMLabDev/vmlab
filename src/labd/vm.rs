@@ -434,6 +434,7 @@ impl VmInstance {
             cdroms,
             floppy,
             share_hosts,
+            agent: super::machine::AgentSlot::for_transport(template.resolved.agent_transport),
             template: std::sync::RwLock::new(Arc::new(template)),
             nic_attachments: Mutex::new(Vec::new()),
             state: RwLock::new(PowerState::Stopped),
@@ -452,7 +453,6 @@ impl VmInstance {
             snapshot_refusal: std::sync::Mutex::new(None),
             usb: Mutex::new(Vec::new()),
             control: Mutex::new(None),
-            agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
             hypervisor: HypervisorKind::Qemu,
             hypervisor_fallback: None,
@@ -608,6 +608,7 @@ impl VmInstance {
 
     /// Bind the template parts resolved by a deferred pull.
     pub fn set_template(&self, parts: TemplateParts) {
+        self.agent.set_transport(parts.resolved.agent_transport);
         *self.template.write().expect("template lock") = Arc::new(parts);
     }
 

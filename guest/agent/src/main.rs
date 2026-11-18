@@ -187,6 +187,18 @@ type PlatformImpl = windows::WindowsPlatform;
 fn run_with(platform: PlatformImpl) -> ! {
     let (mut port_r, port_w) = platform_impl::open_port();
     let mux = Mux::new(port_w);
+    #[cfg(unix)]
+    if unix::is_legacy_serial() {
+        let announcer = mux.clone();
+        std::thread::spawn(move || {
+            loop {
+                // A queued announcement survives concurrent session writes and
+                // lets an ISA-serial host reconnect without speaking first.
+                announcer.announce_serial();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
+    }
     #[cfg(windows)]
     platform.start_clipboard(&mux);
     eprintln!(
