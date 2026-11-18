@@ -244,13 +244,14 @@ fn debug_feature_cli_and_gdb_roundtrip_against_real_hypervisor() {
                 "MemorySwapMax=0",
                 "--",
             ])
+            .arg("env")
+            .arg(format!("XDG_RUNTIME_DIR={}", xdg.display()))
             .arg(binary)
             .arg("--machine")
             .arg(&machine)
             .arg("--control")
             .arg(&control)
             .arg("--paused")
-            .env("XDG_RUNTIME_DIR", &xdg)
             .env("VMLAB_HV_LOG", "off")
             .stdout(Stdio::null())
             .stderr(Stdio::from(File::create(root.join("hv.log")).unwrap()))
