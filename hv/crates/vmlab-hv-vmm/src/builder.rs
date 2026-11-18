@@ -1664,9 +1664,9 @@ pub fn build(
             let mut mbr = [0; 512];
             let mbr = image.read_at(0, &mut mbr).ok().map(|()| &mbr);
             disks[drive] = Some(sectors);
-            translations[drive] = Some(
-                vmlab_hv_devices::chipset::rtc::ChsTranslation::for_disk(sectors, mbr),
-            );
+            translations[drive] = Some(vmlab_hv_devices::chipset::rtc::ChsTranslation::for_disk(
+                sectors, mbr,
+            ));
         }
         let rtc = &chipset.as_ref().unwrap().rtc;
         rtc.lock().set_disk_translations(translations);

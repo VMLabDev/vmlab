@@ -429,7 +429,10 @@ fn cmos_disk_translation_follows_the_partition_table_as_qemu_does() {
     let mut unsigned = mbr(127);
     unsigned[511] = 0;
     for blank in [None, Some(&[0; 512]), Some(&unsigned)] {
-        assert_eq!(ChsTranslation::for_disk(2 * GIB, blank), ChsTranslation::Lba);
+        assert_eq!(
+            ChsTranslation::for_disk(2 * GIB, blank),
+            ChsTranslation::Lba
+        );
         assert_eq!(
             ChsTranslation::for_disk(1024 * 16 * 63, blank),
             ChsTranslation::None
