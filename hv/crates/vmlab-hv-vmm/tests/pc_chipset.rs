@@ -6,7 +6,7 @@ use std::sync::{
 use parking_lot::Mutex;
 use vmlab_hv_devices::chipset::{
     lpc::{Lpc, PowerAction},
-    rtc::Rtc,
+    rtc::{ChsTranslation, Rtc},
 };
 use vmlab_hv_devices::{BusDevice, IrqLine, PciDevice, Resettable, Snapshot};
 use vmlab_hv_vmm::{
@@ -396,6 +396,61 @@ fn cmos_geometry_memory_checksum_and_reset_use_indexed_io() {
     secondary_only.configure_pc([None, None, Some(1_048_576), None], false, 1, 0x50);
     assert_eq!(cmos(&mut secondary_only, 0x12), 0);
     assert_eq!(cmos(&mut secondary_only, 0x19), 0);
+}
+
+/// A first sector whose one partition ends on `end_head` and sector 63.
+fn mbr(end_head: u8) -> [u8; 512] {
+    let mut mbr = [0; 512];
+    mbr[446 + 4] = 6;
+    mbr[446 + 5] = end_head;
+    mbr[446 + 6] = 63;
+    mbr[446 + 12] = 1;
+    mbr[510..].copy_from_slice(&[0x55, 0xaa]);
+    mbr
+}
+
+/// QEMU's CMOS 0x39 for the captured templates: 2 (large) for the 2 GiB
+/// Windows 9x disks partitioned with 128 heads, 1 (LBA) for Windows 7.
+#[test]
+fn cmos_disk_translation_follows_the_partition_table_as_qemu_does() {
+    const GIB: u64 = (1 << 30) / 512;
+    let large = ChsTranslation::for_disk(2 * GIB, Some(&mbr(127)));
+    assert_eq!(large, ChsTranslation::Large);
+    assert_eq!(
+        ChsTranslation::for_disk(40 * GIB, Some(&mbr(254))),
+        ChsTranslation::Lba
+    );
+    // Partitioned without translation: the disk keeps none.
+    assert_eq!(
+        ChsTranslation::for_disk(2 * GIB, Some(&mbr(15))),
+        ChsTranslation::None
+    );
+    // No usable entry: by size alone.
+    let mut unsigned = mbr(127);
+    unsigned[511] = 0;
+    for blank in [None, Some(&[0; 512]), Some(&unsigned)] {
+        assert_eq!(ChsTranslation::for_disk(2 * GIB, blank), ChsTranslation::Lba);
+        assert_eq!(
+            ChsTranslation::for_disk(1024 * 16 * 63, blank),
+            ChsTranslation::None
+        );
+    }
+    // An entry whose geometry cannot span the disk is skipped.
+    let mut tiny = mbr(127);
+    tiny[446 + 5] = 1;
+    tiny[446 + 6] = 1;
+    assert_eq!(
+        ChsTranslation::for_disk(40 * GIB, Some(&tiny)),
+        ChsTranslation::Lba
+    );
+
+    let mut rtc = Rtc::new(64 << 20, 0, Arc::new(Line::default()));
+    assert_eq!(cmos(&mut rtc, 0x39), 0);
+    rtc.set_disk_translations([Some(large), None, Some(ChsTranslation::Lba), None]);
+    assert_eq!(cmos(&mut rtc, 0x39), 0x12);
+    rtc.configure_pc([Some(2 * GIB), None, Some(40 * GIB), None], false, 1, 0x50);
+    rtc.reset().unwrap();
+    assert_eq!(cmos(&mut rtc, 0x39), 0x12);
 }
 
 #[test]
