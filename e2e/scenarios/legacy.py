@@ -165,6 +165,9 @@ def exercise_server2016(h, lab):
     h.vmlab("up", machine, cwd=lab)
     try:
         h.wait_ready(lab, machine, timeout=300)
+        status = h.machine_line(lab, machine)
+        if f"hypervisor={h.hypervisor}" not in status.split():
+            raise ScenarioFailed(f"{machine}: expected {h.hypervisor} hypervisor: {status}")
         check_version("after agent readiness")
         h.vmlab("snapshot", "create", "round-trip", "--vm", machine, cwd=lab, timeout=120)
         h.vmlab("snapshot", "restore", "round-trip", "--vm", machine, cwd=lab, timeout=120)
