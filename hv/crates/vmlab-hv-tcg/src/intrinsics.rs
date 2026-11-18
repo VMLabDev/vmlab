@@ -319,9 +319,9 @@ impl<M: Memory> Interpreter<'_, M> {
             "load_reservation" => {
                 // read_mem_exclusive captured the generation with the read. Do
                 // not refresh it after another hart could have invalidated it.
-                if !self.reservation.is_some_and(|(address, _)| {
+                if !self.reservation.is_some_and(|reservation| {
                     a(0).and_then(Value::u64)
-                        .is_ok_and(|expected| address == expected)
+                        .is_ok_and(|expected| reservation.address == expected)
                 }) {
                     return Err(Error::Type(
                         "reservation callback without exclusive read".into(),
@@ -330,16 +330,17 @@ impl<M: Memory> Interpreter<'_, M> {
                 Value::Unit
             }
             "match_reservation" => {
-                Value::Bool(self.reservation == Some((a(0)?.u64()?, self.memory.generation())))
+                let address = a(0)?.u64()?;
+                Value::Bool(
+                    self.reservation_intact()
+                        .is_some_and(|reservation| reservation.address == address),
+                )
             }
             "cancel_reservation" => {
                 self.reservation = None;
                 Value::Unit
             }
-            "valid_reservation" => Value::Bool(
-                self.reservation
-                    .is_some_and(|(_, g)| g == self.memory.generation()),
-            ),
+            "valid_reservation" => Value::Bool(self.reservation_intact().is_some()),
             "sys_enable_experimental_extensions" => Value::Bool(false),
             "parse_hex_bits" => {
                 let s = a(1)?.string()?.trim_start_matches("0x");

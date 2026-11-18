@@ -5,7 +5,8 @@
 The interpreter and the future trace compiler need the same instruction
 semantics. `vmlab-hv-tcg-emit` parses the complete textual Jib model and lowers
 it into `Program`. It commits that program as deterministic, gzip-compressed
-JSON beside generated Rust decoder accessors and instruction builders.
+JSON beside generated Rust decoder accessors and the list of instruction tags.
+The interpreter specialises `zexecute` per tag at run time.
 
 Rust compiles the small accessors and embeds the compressed data. On first
 use, `model()` decompresses and deserializes the IR once through `OnceLock`.

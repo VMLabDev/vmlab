@@ -103,6 +103,9 @@ mod tests {
         fn generation(&self) -> u64 {
             self.ram.generation()
         }
+        fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+            self.ram.reservation_generation(address, len)
+        }
         fn load_reserved(&mut self, address: u64, data: &mut [u8]) -> Result<u64> {
             self.ram.load_reserved(address, data)
         }
@@ -112,7 +115,7 @@ mod tests {
             data: &[u8],
             generation: u64,
         ) -> Result<bool> {
-            if self.generation() != generation {
+            if self.reservation_generation(address, data.len()) != generation {
                 return Ok(false);
             }
             self.write(address, data)?;

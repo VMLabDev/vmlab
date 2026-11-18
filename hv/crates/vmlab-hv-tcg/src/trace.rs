@@ -44,8 +44,10 @@ pub(crate) struct Trace {
     stages: Vec<Stage>,
     checkpoint_stages: Vec<Stage>,
     fused_guards: Vec<Option<vmlab_hv_tcg_ir::native::linear::Guard>>,
-    scratch: Vec<u128>,
-    stamps: Vec<u64>,
+    // A run takes these three out through a `Lease` and its drop puts them
+    // back, so they keep their validated lengths on every way out of a run.
+    scratch: Cell<Vec<u128>>,
+    stamps: Cell<Vec<u64>>,
     epoch: u64,
     waiting: Vec<Option<bool>>,
     global_identity: u64,
@@ -63,7 +65,7 @@ pub(crate) struct Trace {
     binding_slots: HashMap<usize, crate::publication::Plan>,
     pc_slot: Option<usize>,
     compact_loop: std::sync::OnceLock<bool>,
-    wide_inputs: Vec<Option<Value>>,
+    wide_inputs: Cell<Vec<Option<Value>>>,
     scalar_input_slots: Vec<Option<usize>>,
     slots: Vec<usize>,
     fast_events: Vec<usize>,
@@ -89,6 +91,49 @@ struct Evaluation<'a> {
     complete_path: bool,
     binding_slots: &'a HashMap<usize, crate::publication::Plan>,
     slots: &'a [usize],
+}
+
+/// One run's hold on a trace's scratch, stamps and wide inputs. The compiled
+/// program indexes scratch and stamps unchecked against the lengths validated
+/// at construction, so a trace must never be left with them taken: dropping
+/// the lease puts all three back, when a run returns, fails or unwinds.
+struct Lease<'a> {
+    trace: &'a Trace,
+    evaluation: Evaluation<'a>,
+}
+
+impl<'a> Lease<'a> {
+    fn new(trace: &'a Trace) -> Self {
+        Self {
+            trace,
+            evaluation: Evaluation {
+                recorded: &trace.recorded,
+                wide_inputs: trace.wide_inputs.take(),
+                scalar_input_slots: &trace.scalar_input_slots,
+                scalars: trace.scratch.take(),
+                stamps: trace.stamps.take(),
+                epoch: trace.epoch,
+                completed_steps: 0,
+                complete_path: false,
+                binding_slots: &trace.binding_slots,
+                slots: &trace.slots,
+            },
+        }
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        self.trace
+            .scratch
+            .set(std::mem::take(&mut self.evaluation.scalars));
+        self.trace
+            .stamps
+            .set(std::mem::take(&mut self.evaluation.stamps));
+        self.trace
+            .wide_inputs
+            .set(std::mem::take(&mut self.evaluation.wide_inputs));
+    }
 }
 
 enum Captured {
@@ -598,11 +643,11 @@ impl Trace {
                     matches!(self.recorded.inputs[id].shape, Shape::Scalar(expected) if expected == ty)
                 );
                 if let Some(slot) = self.scalar_input_slots[id] {
-                    self.scratch[slot] = raw;
-                    self.stamps[slot] = self.epoch;
+                    self.scratch.get_mut()[slot] = raw;
+                    self.stamps.get_mut()[slot] = self.epoch;
                 }
             }
-            Captured::Value(value) => self.wide_inputs[id] = Some(value),
+            Captured::Value(value) => self.wide_inputs.get_mut()[id] = Some(value),
             Captured::Verified => {}
         }
     }
@@ -643,6 +688,7 @@ impl Trace {
                 })
                 .flatten();
             interpreter.fetch_address = None;
+            interpreter.arm_step_budget();
             let result = interpreter.run_function(function, args.clone());
             let mut recorder = interpreter.recorder.take().expect("trace recorder");
             value = result?;
@@ -879,8 +925,8 @@ impl Trace {
             stages,
             checkpoint_stages,
             fused_guards,
-            scratch: Vec::new(),
-            stamps: Vec::new(),
+            scratch: Cell::new(Vec::new()),
+            stamps: Cell::new(Vec::new()),
             epoch: 0,
             waiting,
             global_identity: interpreter.globals.identity(),
@@ -898,7 +944,7 @@ impl Trace {
             binding_slots,
             pc_slot: interpreter.globals.slot("zPC"),
             compact_loop: std::sync::OnceLock::new(),
-            wide_inputs,
+            wide_inputs: Cell::new(wide_inputs),
             scalar_input_slots,
             slots,
             fast_events,
@@ -912,26 +958,39 @@ impl Trace {
                 trace.input_values[*id] = true;
             }
         }
-        trace
-            .scratch
-            .resize(slot_count + publication_constants.len(), 0);
-        trace.stamps.resize(trace.scratch.len(), 0);
+        let mut scratch = vec![0; slot_count + publication_constants.len()];
+        let mut stamps = vec![0; scratch.len()];
         for (index, value) in publication_constants.into_iter().enumerate() {
-            trace.scratch[slot_count + index] = value;
-            trace.stamps[slot_count + index] = u64::MAX;
+            scratch[slot_count + index] = value;
+            stamps[slot_count + index] = u64::MAX;
         }
         for (id, scalar) in trace.recorded.block.graph.scalars.iter().enumerate() {
             if let Operation::Constant(value) = scalar.operation {
-                trace.scratch[trace.slots[id]] = value;
-                trace.stamps[trace.slots[id]] = u64::MAX;
+                scratch[trace.slots[id]] = value;
+                stamps[trace.slots[id]] = u64::MAX;
             }
         }
-        assert!(trace.stages.iter().chain(&trace.checkpoint_stages)
-            .flat_map(|stage| stage.iter()).chain(&trace.fast_code)
-            .all(|instruction| instruction.valid_slots(trace.scratch.len(), trace.stamps.len())),
-            "compiled scalar program exceeds its scratch layout");
+        assert!(
+            trace
+                .stages
+                .iter()
+                .chain(&trace.checkpoint_stages)
+                .flat_map(|stage| stage.iter())
+                .chain(&trace.fast_code)
+                .all(|instruction| instruction.valid_slots(scratch.len(), stamps.len())),
+            "compiled scalar program exceeds its scratch layout"
+        );
+        trace.scratch.set(scratch);
+        trace.stamps.set(stamps);
         trace.cache_units = trace.calculate_cache_units();
         trace
+    }
+
+    fn scratch_len(&self) -> usize {
+        let scratch = self.scratch.take();
+        let len = scratch.len();
+        self.scratch.set(scratch);
+        len
     }
 
     fn code_valid(&self, memory: &impl Memory) -> bool {
@@ -1092,26 +1151,16 @@ impl Trace {
         interpreter: &mut Interpreter<'_, M>,
         limit: u32,
     ) -> Result<Outcome> {
-        let mut evaluation = Evaluation {
-            recorded: &self.recorded,
-            wide_inputs: std::mem::take(&mut self.wide_inputs),
-            scalar_input_slots: &self.scalar_input_slots,
-            scalars: std::mem::take(&mut self.scratch),
-            stamps: std::mem::take(&mut self.stamps),
-            epoch: self.epoch,
-            completed_steps: 0,
-            complete_path: false,
-            binding_slots: &self.binding_slots,
-            slots: &self.slots,
-        };
-        let outcome = self.execute(interpreter, &mut evaluation, limit);
-        interpreter.trace_completed = evaluation.completed_steps;
-        self.scratch = evaluation.scalars;
-        self.stamps = evaluation.stamps;
-        self.wide_inputs = evaluation.wide_inputs;
+        let mut lease = Lease::new(self);
+        let outcome = lease
+            .trace
+            .execute(interpreter, &mut lease.evaluation, limit);
+        interpreter.trace_completed = lease.evaluation.completed_steps;
+        let complete_path = lease.evaluation.complete_path;
+        drop(lease);
         if matches!(outcome, Ok(Outcome::Returned(_, _))) {
             self.returned_runs = self.returned_runs.saturating_add(1);
-            if evaluation.complete_path {
+            if complete_path {
                 self.successful_runs = self.successful_runs.saturating_add(1);
             }
         }
@@ -1693,7 +1742,7 @@ impl Trace {
                 .values()
                 .map(|plan| plan.words.len())
                 .sum::<usize>()
-            + self.scratch.len()
+            + self.scratch_len()
             + self.fast_events.len()
             + self.fast_code.len()
             + self.event_steps.len()
@@ -2207,6 +2256,9 @@ mod tests {
             fn transaction_lock(&self) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
                 None
             }
+            fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+                self.ram.reservation_generation(address, len)
+            }
             fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
                 self.ram.load_reserved(address, bytes)
             }
@@ -2281,6 +2333,108 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_unwinds_puts_scratch_and_stamps_back() {
+        struct PanickingMemory {
+            ram: FlatMemory,
+            panic: bool,
+        }
+        impl Memory for PanickingMemory {
+            fn read(&mut self, _address: u64, bytes: &mut [u8]) -> Result<()> {
+                assert!(!self.panic, "device model panicked");
+                bytes.copy_from_slice(&16u64.to_le_bytes());
+                Ok(())
+            }
+            fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
+                self.ram.write(address, bytes)
+            }
+            fn generation(&self) -> u64 {
+                self.ram.generation()
+            }
+            fn transaction_lock(&self) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
+                None
+            }
+            fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
+                self.ram.load_reserved(address, bytes)
+            }
+            fn store_conditional(
+                &mut self,
+                address: u64,
+                bytes: &[u8],
+                generation: u64,
+            ) -> Result<bool> {
+                self.ram.store_conditional(address, bytes, generation)
+            }
+        }
+        let function = Function {
+            name: "loaded_pointer".into(),
+            args: vec![],
+            result: Type::Bits(Some(64)),
+            locals: BTreeMap::new(),
+            code: vec![
+                Op::Call(
+                    Location::Id("loaded".into()),
+                    Target::Memory {
+                        name: "read_mem".into(),
+                        write: false,
+                        exclusive: false,
+                        fetch: false,
+                    },
+                    vec![
+                        Expr::Unit,
+                        Expr::Unit,
+                        Expr::Bits("0x0000000000000008".into()),
+                        Expr::Integer("8".into(), None),
+                    ],
+                ),
+                Op::Assign(Location::Id("return".into()), Expr::Id("loaded".into())),
+                Op::Return,
+            ],
+        };
+        let program = Program::default();
+        let mut interpreter = Interpreter::new(
+            &program,
+            PanickingMemory {
+                ram: FlatMemory::new(0, vec![0; 256]),
+                panic: false,
+            },
+        );
+        let (mut trace, _) =
+            Trace::record(&mut interpreter, &function, vec![], Options::default()).unwrap();
+        let returned = |outcome: Outcome| {
+            matches!(
+                outcome,
+                Outcome::Returned(value, 1) | Outcome::Resumed(value, 1)
+                    if value == Value::bits(64, 16u64)
+            )
+        };
+        assert!(returned(trace.run(&mut interpreter, &[], 1).unwrap()));
+        let lengths = |trace: &mut Trace| {
+            (
+                trace.scratch.get_mut().len(),
+                trace.stamps.get_mut().len(),
+                trace.wide_inputs.get_mut().len(),
+            )
+        };
+        let before = lengths(&mut trace);
+        assert_ne!(before.0, 0);
+        assert_eq!(before.0, before.1);
+
+        // The read panics in the middle of the compiled program, while the
+        // run holds the trace's scratch.
+        interpreter.memory.panic = true;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = trace.run(&mut interpreter, &[], 1);
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(lengths(&mut trace), before);
+
+        // So the same trace still runs, inside its validated scratch layout.
+        interpreter.memory.panic = false;
+        assert!(returned(trace.run(&mut interpreter, &[], 1).unwrap()));
+        assert_eq!(lengths(&mut trace), before);
+    }
+
+    #[test]
     fn nested_native_alternatives_preserve_a_completed_mmio_read() {
         struct CountingMemory {
             ram: FlatMemory,
@@ -2298,6 +2452,9 @@ mod tests {
             }
             fn generation(&self) -> u64 {
                 self.ram.generation()
+            }
+            fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+                self.ram.reservation_generation(address, len)
             }
             fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
                 self.ram.load_reserved(address, bytes)

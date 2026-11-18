@@ -132,6 +132,9 @@ fn a_batch_fault_keeps_the_completed_instruction_count() {
         fn code_stamp(&self, address: u64, len: usize) -> Option<vmlab_hv_tcg::CodeStamp> {
             self.ram.code_stamp(address, len)
         }
+        fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+            self.ram.reservation_generation(address, len)
+        }
         fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> vmlab_hv_tcg::Result<u64> {
             self.ram.load_reserved(address, bytes)
         }
@@ -261,6 +264,9 @@ fn address_specialization_preserves_pointer_reads_and_fault_state() {
         }
         fn ram_bounds(&self, address: u64) -> Option<(u64, u64)> {
             self.ram.ram_bounds(address)
+        }
+        fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+            self.ram.reservation_generation(address, len)
         }
         fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> vmlab_hv_tcg::Result<u64> {
             self.ram.load_reserved(address, bytes)

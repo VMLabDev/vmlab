@@ -52,11 +52,10 @@ fn generate(source: &str) -> Result<(String, Vec<u8>)> {
             && name == "zinstruction"
         {
             for (tag, _) in variants {
+                // The interpreter specialises `zexecute` per constructor at run
+                // time and caches the result, so no per-instruction builder is
+                // generated: nothing called them.
                 tags.push(tag.clone());
-                writeln!(
-                    rust,
-                    "pub fn build_{tag}() -> Function {{\n    let mut function = model().functions[\"zexecute\"].clone();\n    vmlab_hv_tcg_ir::specialize_constructor(&mut function, {tag:?});\n    function\n}}"
-                )?;
             }
         }
     }
@@ -130,10 +129,15 @@ mod tests {
         let source = "union zinstruction { zADD: %unit }\nval zexecute : (%union zinstruction) -> %unit\nfn zexecute(i) { return = (); end; }";
         let a = generate(source).unwrap();
         assert_eq!(a, generate(source).unwrap());
-        assert!(a.0.contains("build_zADD"));
+        assert!(a.0.contains("pub const INSTRUCTION_TAGS: &[&str] = &[\"zADD\"];"));
+        assert!(!a.0.contains("build_z"));
         let mut json = Vec::new();
         std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(a.1.as_slice()), &mut json)
             .unwrap();
+        // The digest in the generated source is the SHA-256 of the IR the
+        // payload decompresses to.
+        let digest = format!("{:x}", Sha256::digest(&json));
+        assert!(a.0.contains(&format!("pub const IR_SHA256: &str = {digest:?};")));
         let program: vmlab_hv_tcg_ir::Program = serde_json::from_slice(&json).unwrap();
         assert_eq!(program.functions["zexecute"].code.len(), 2);
     }

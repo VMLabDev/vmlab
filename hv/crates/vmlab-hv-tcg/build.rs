@@ -18,6 +18,9 @@ fn main() {
         build.define(name, None);
     }
     build.define("INLINE_LEVEL", "5");
+    // The rounding mode and the exception flags are per-thread, so harts on
+    // separate host threads need no lock around a SoftFloat call.
+    build.define("THREAD_LOCAL", "__thread");
     build.warnings(false).opt_level(2);
     // SoftFloat's multiword helpers are alternatives to FAST_INT64, not extra operations.
     let excluded = [
@@ -54,9 +57,8 @@ fn main() {
             }
         }
     }
-    let mut c = String::from(
-        "#include <stdint.h>\n#include <string.h>\n#include \"softfloat.h\"\nuint64_t hv_softfloat(const char *name, uint64_t p0, uint64_t p1, uint64_t p2, uint64_t p3, uint8_t *flags) {\nsoftfloat_exceptionFlags = 0;\nsoftfloat_roundingMode = p0;\nsoftfloat_detectTininess = softfloat_tininess_afterRounding;\nuint64_t result = 0;\nuint32_t found = 0;\n",
-    );
+    // (Sail name, C expression), dispatched by position in the sorted list.
+    let mut operations: Vec<(String, String)> = Vec::new();
     for width in [16, 32, 64] {
         for (sail, sf, arity, rounding, boolean) in [
             ("Add", "add", 2, true, false),
@@ -75,15 +77,19 @@ fn main() {
             let args: Vec<_> = (start..start + arity)
                 .map(|i| format!("(float{width}_t){{ .v = p{i} }}"))
                 .collect();
-            writeln!(
-                c,
-                "if (!strcmp(name, \"zriscv_f{width}{sail}\")) {{ found = 1; result = f{width}_{sf}({}){}; }}",
-                args.join(", "),
-                if boolean { "" } else { ".v" }
-            )
-            .unwrap();
+            operations.push((
+                format!("zriscv_f{width}{sail}"),
+                format!(
+                    "f{width}_{sf}({}){}",
+                    args.join(", "),
+                    if boolean { "" } else { ".v" }
+                ),
+            ));
         }
-        writeln!(c, "if (!strcmp(name, \"zriscv_f{width}roundToInt\")) {{ found = 1; result = f{width}_roundToInt((float{width}_t){{ .v = p1 }}, p0, p2).v; }}").unwrap();
+        operations.push((
+            format!("zriscv_f{width}roundToInt"),
+            format!("f{width}_roundToInt((float{width}_t){{ .v = p1 }}, p0, p2).v"),
+        ));
     }
     for (src, src_ty) in [
         ("f16", "float16_t"),
@@ -121,11 +127,29 @@ fn main() {
             } else {
                 format!("{}{}", dst[..1].to_ascii_uppercase(), &dst[1..])
             };
-            writeln!(c, "if (!strcmp(name, \"zriscv_{src}To{sail_dst}\")) {{ found = 1; result = {src}_to_{dst}({value}{extra}){suffix}; }}").unwrap();
+            operations.push((
+                format!("zriscv_{src}To{sail_dst}"),
+                format!("{src}_to_{dst}({value}{extra}){suffix}"),
+            ));
         }
     }
-    c.push_str("*flags = found ? softfloat_exceptionFlags : 255;\nreturn result;\n}\n");
-    let wrapper = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("softfloat_wrapper.c");
+    operations.sort();
+    operations.dedup_by(|a, b| a.0 == b.0);
+    let mut c = String::from(
+        "#include <stdint.h>\n#include \"softfloat.h\"\nuint64_t hv_softfloat(uint32_t operation, uint64_t p0, uint64_t p1, uint64_t p2, uint64_t p3, uint8_t *flags) {\nsoftfloat_exceptionFlags = 0;\nsoftfloat_roundingMode = p0;\nsoftfloat_detectTininess = softfloat_tininess_afterRounding;\nuint64_t result = 0;\n(void)p2; (void)p3;\nswitch (operation) {\n",
+    );
+    // The Rust side finds an operation's index by binary search in the same
+    // sorted list, so the two cannot disagree about which index is which.
+    let mut names = String::from("pub(crate) const NAMES: &[&str] = &[\n");
+    for (index, (name, expression)) in operations.iter().enumerate() {
+        writeln!(c, "case {index}: result = {expression}; break;").unwrap();
+        writeln!(names, "    {name:?},").unwrap();
+    }
+    names.push_str("];\n");
+    c.push_str("default: *flags = 255; return 0;\n}\n*flags = softfloat_exceptionFlags;\nreturn result;\n}\n");
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("softfloat_names.rs"), names).unwrap();
+    let wrapper = out.join("softfloat_wrapper.c");
     std::fs::write(&wrapper, c).unwrap();
     build.file(wrapper).compile("hv_softfloat");
 }
