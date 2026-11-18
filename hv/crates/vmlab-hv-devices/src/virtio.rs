@@ -33,6 +33,16 @@ pub(crate) mod testing {
         data: Arc<Mutex<Vec<u8>>>,
         read_only: bool,
         discards: Arc<Mutex<Vec<(u64, u64)>>>,
+        ops: Arc<Mutex<Vec<DiskOp>>>,
+        fail_flush: bool,
+    }
+
+    /// One write or flush a [`MemDisk`] served, in the order it served them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DiskOp {
+        /// A write at this byte offset.
+        Write(u64),
+        Flush,
     }
 
     impl MemDisk {
@@ -42,7 +52,20 @@ pub(crate) mod testing {
                 data: Arc::new(Mutex::new((0..len).map(|i| (i % 251) as u8).collect())),
                 read_only: false,
                 discards: Arc::new(Mutex::new(Vec::new())),
+                ops: Arc::new(Mutex::new(Vec::new())),
+                fail_flush: false,
             }
+        }
+
+        /// The same disk, with every flush failing.
+        pub fn failing_flush(mut self) -> Self {
+            self.fail_flush = true;
+            self
+        }
+
+        /// Shared log of the writes and flushes served.
+        pub fn op_log(&self) -> Arc<Mutex<Vec<DiskOp>>> {
+            Arc::clone(&self.ops)
         }
 
         /// Read-only disk of `len` bytes with the same pattern.
@@ -96,10 +119,15 @@ pub(crate) mod testing {
                 return Err(Error::Unsupported("write past end".into()));
             }
             data[offset as usize..end as usize].copy_from_slice(buf);
+            self.ops.lock().push(DiskOp::Write(offset));
             Ok(())
         }
 
         fn flush(&mut self) -> Result<()> {
+            self.ops.lock().push(DiskOp::Flush);
+            if self.fail_flush {
+                return Err(Error::Unsupported("memdisk flush fails".into()));
+            }
             Ok(())
         }
 

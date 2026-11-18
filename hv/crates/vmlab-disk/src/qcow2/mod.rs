@@ -901,6 +901,10 @@ impl Qcow2Image {
         // then the refcount table, the L1, the L2s and the header.
         // Each table is marked clean only after its write succeeded, so a
         // failed flush can be retried.
+        //
+        // Both syncs are fdatasync. A guest flush lands here, and fdatasync
+        // makes durable everything a later read needs: the data, and the
+        // file size when the image grew. Timestamps are not part of that.
         for (index, block) in self.refblock_cache.dirty() {
             let host = self.refblock_host(index)?;
             self.write_file(host, &block)?;
@@ -915,7 +919,7 @@ impl Qcow2Image {
             self.write_file(self.refcount_table_offset, &bytes)?;
             self.refcount_table_dirty = false;
         }
-        self.file.sync_all()?;
+        self.file.sync_data()?;
         #[cfg(test)]
         self.crash_checkpoint("refcounts");
         if self.l1_dirty {
@@ -933,7 +937,7 @@ impl Qcow2Image {
             self.write_file(0, &cluster)?;
             self.header_dirty = false;
         }
-        self.file.sync_all()?;
+        self.file.sync_data()?;
         #[cfg(test)]
         self.crash_checkpoint("mappings");
         self.retired.clear();
@@ -1348,8 +1352,8 @@ impl DiskImage for Qcow2Image {
     fn flush(&mut self) -> Result<()> {
         if !self.read_only {
             self.check_writable()?;
+            // Ends with a sync of the file, after the last write.
             self.flush_metadata()?;
-            self.file.sync_all()?;
         }
         Ok(())
     }

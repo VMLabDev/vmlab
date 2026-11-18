@@ -339,6 +339,36 @@ impl ReadDescriptors<'_> {
     }
 }
 
+/// What serving one descriptor chain produced.
+enum Served<'a> {
+    /// The request is answered: the bytes written to the driver-writable
+    /// descriptors, status byte included.
+    Done(usize),
+    /// A flush, not yet answered: the writer its status byte goes to.
+    Flush(virtio_queue::Writer<'a, ()>),
+}
+
+/// Write the status byte of a request and return the bytes written to its
+/// driver-writable descriptors.
+///
+/// The status byte terminates the chain: it belongs at the very end of the
+/// writable descriptors. When the request produced no data (a failure, or a
+/// command with no payload) the writer has not consumed the data
+/// descriptors, so the tail is split off and written there instead of at
+/// the front.
+fn finish_chain(mut writer: virtio_queue::Writer<'_, ()>, status: u8) -> usize {
+    let remaining = writer.available_bytes();
+    if remaining > 1 {
+        if let Ok(mut tail) = writer.split_at(remaining - 1) {
+            let _ = tail.write_all(&[status]);
+            return writer.bytes_written() + tail.bytes_written();
+        }
+        return writer.bytes_written();
+    }
+    let _ = writer.write_all(&[status]);
+    writer.bytes_written()
+}
+
 /// Snapshot format magic: "VBLK".
 const SNAPSHOT_MAGIC: u32 = 0x4B4C_4256;
 /// Serialized bytes per queue state (see [`virtio_queue::QueueState`]).
@@ -425,8 +455,18 @@ impl Block {
         Ok(self)
     }
 
-    /// Process every available request on queue `index`, publish them on the
-    /// used ring and raise the queue interrupt once.
+    /// Process every available request on queue `index` and publish them on
+    /// the used ring.
+    ///
+    /// A flush is not served where it stands in the ring. Its chain waits
+    /// while the requests behind it are served, and one flush of the image
+    /// then answers every flush that waited. A flush promises that the writes
+    /// completed before it was submitted are on stable storage; a request
+    /// submitted beside it was not completed before it, so serving that
+    /// request first keeps the promise and the later flush covers more. A
+    /// guest that queues flushes faster than the host syncs then pays for one
+    /// sync, not one per flush, and the requests behind a flush do not wait
+    /// for it.
     fn process_queue(&mut self, index: usize) {
         let Some(mem) = self.mem.clone() else { return };
         let Some(interrupt) = self.interrupt.clone() else {
@@ -442,6 +482,8 @@ impl Block {
         // and drain again if buffers arrived while the event was being
         // published — the loop the spec's suppression mechanism expects.
         let mut used_any = false;
+        let mut flushes: Vec<(u16, virtio_queue::Writer<'_, ()>)> = Vec::new();
+        let mut served_behind_flush = 0u32;
         loop {
             while let Some(chain) = self
                 .queues
@@ -451,7 +493,13 @@ impl Block {
                 let head = chain.head_index();
                 let table = self.queues[index].desc_table();
                 let size = self.queues[index].size();
-                let written = self.handle_chain(&mem, chain, table, size);
+                let written = match self.handle_chain(&mem, chain, table, size) {
+                    Served::Done(written) => written,
+                    Served::Flush(writer) => {
+                        flushes.push((head, writer));
+                        continue;
+                    }
+                };
                 // The used ring lives in guest memory validated at
                 // activation; failing here means the guest corrupted it,
                 // and the only recourse is to drop the request.
@@ -463,6 +511,40 @@ impl Block {
                     Some(()) => used_any = true,
                     None => break,
                 }
+                // A driver that never lets the ring run empty must not hold
+                // a flush back for ever.
+                if !flushes.is_empty() {
+                    served_behind_flush += 1;
+                    if served_behind_flush >= u32::from(size) {
+                        break;
+                    }
+                }
+            }
+            if !flushes.is_empty() {
+                // The requests served so far are complete: tell the driver
+                // before the sync, which can take milliseconds.
+                if used_any && self.wants_interrupt(index, &mem) {
+                    interrupt.notify_queue(index as u16);
+                }
+                used_any = false;
+                served_behind_flush = 0;
+                let status = match self.disk.flush() {
+                    Ok(()) => S_OK,
+                    Err(_) => S_IOERR,
+                };
+                for (head, writer) in flushes.drain(..) {
+                    let written = finish_chain(writer, status);
+                    if self
+                        .queues
+                        .get_mut(index)
+                        .and_then(|q| q.add_used(&mem, head, written as u32).ok())
+                        .is_some()
+                    {
+                        used_any = true;
+                    }
+                }
+                // Requests arrived while the image was flushing: serve them.
+                continue;
             }
             match self
                 .queues
@@ -474,8 +556,16 @@ impl Block {
                 _ => break,
             }
         }
-        let notified = self.queues.get_mut(index).is_some_and(|q| {
-            q.needs_notification(&mem).unwrap_or(false)
+        if used_any && self.wants_interrupt(index, &mem) {
+            interrupt.notify_queue(index as u16);
+        }
+    }
+
+    /// Whether the driver asked for an interrupt for what queue `index` has
+    /// used since the last time this was asked.
+    fn wants_interrupt(&mut self, index: usize, mem: &GuestMemory) -> bool {
+        self.queues.get_mut(index).is_some_and(|q| {
+            q.needs_notification(mem).unwrap_or(false)
                 && (q.event_idx_enabled()
                     || mem
                         .load::<u16>(
@@ -483,35 +573,32 @@ impl Block {
                             std::sync::atomic::Ordering::Relaxed,
                         )
                         .is_ok_and(|flags| u16::from_le(flags) & AVAIL_F_NO_INTERRUPT == 0))
-        });
-        if used_any && notified {
-            interrupt.notify_queue(index as u16);
-        }
+        })
     }
 
-    /// Serve one descriptor chain and return the number of bytes written to
-    /// the driver-writable descriptors (data plus status byte).
-    fn handle_chain(
+    /// Serve one descriptor chain. A flush comes back unanswered, for
+    /// `process_queue` to answer after the image is flushed.
+    fn handle_chain<'a>(
         &mut self,
-        mem: &GuestMemory,
-        chain: DescriptorChain<&GuestMemory>,
+        mem: &'a GuestMemory,
+        chain: DescriptorChain<&'a GuestMemory>,
         table: u64,
         size: u16,
-    ) -> usize {
+    ) -> Served<'a> {
         if let Some(written) = self.read_chain(mem, table, size, chain.head_index()) {
-            return written;
+            return Served::Done(written);
         }
         let mut reader = match chain.clone().reader(mem) {
             Ok(r) => r,
-            Err(_) => return 0,
+            Err(_) => return Served::Done(0),
         };
         let header: ReqHeader = match reader.read_obj() {
             Ok(h) => h,
-            Err(_) => return 0, // not even a header: nothing to answer on
+            Err(_) => return Served::Done(0), // not even a header: nothing to answer on
         };
         let mut writer = match chain.writer(mem) {
             Ok(w) => w,
-            Err(_) => return 0,
+            Err(_) => return Served::Done(0),
         };
 
         let kind = header.kind.to_native() & !T_BARRIER;
@@ -519,10 +606,7 @@ impl Block {
         let status = match kind {
             T_IN => self.read(sector, &mut writer),
             T_OUT => self.write(sector, &mut reader, &mut writer),
-            T_FLUSH => match self.disk.flush() {
-                Ok(()) => S_OK,
-                Err(_) => S_IOERR,
-            },
+            T_FLUSH => return Served::Flush(writer),
             T_GET_ID => {
                 let serial: [u8; SERIAL_LEN] = *b"vmlab-hv-blk-0000000";
                 match writer.write_all(&serial) {
@@ -533,21 +617,7 @@ impl Block {
             T_DISCARD => self.discard(&mut reader),
             _ => S_UNSUPP,
         };
-        // The status byte terminates the chain: it belongs at the very end
-        // of the writable descriptors. When the request produced no data
-        // (a failure, or a command with no payload) the writer has not
-        // consumed the data descriptors, so split the tail off and write
-        // there instead of at the front.
-        let remaining = writer.available_bytes();
-        if remaining > 1 {
-            if let Ok(mut tail) = writer.split_at(remaining - 1) {
-                let _ = tail.write_all(&[status]);
-                return writer.bytes_written() + tail.bytes_written();
-            }
-            return writer.bytes_written();
-        }
-        let _ = writer.write_all(&[status]);
-        writer.bytes_written()
+        Served::Done(finish_chain(writer, status))
     }
 
     /// Read requests normally have one header followed by writable buffers.
@@ -1522,6 +1592,96 @@ mod tests {
         f.submit(0);
         assert_eq!(f.status(), S_OK);
         assert_eq!(f.used_slot(0), (1, 0, 1));
+    }
+
+    /// Three chains submitted in one batch: a flush, a write of sector 3 and
+    /// a second flush. Returns the fixture after the device served them.
+    fn flush_write_flush(disk: MemDisk) -> Fixture {
+        let mut f = Fixture::new(Box::new(disk));
+        let header = |at: u64, kind: u32, sector: u64| {
+            f.mem
+                .write_obj(
+                    ReqHeader {
+                        kind: Le32::from(kind),
+                        reserved: Le32::from(0),
+                        sector: Le64::from(sector),
+                    },
+                    GuestAddress(f.headers + at),
+                )
+                .unwrap();
+        };
+        header(0, T_FLUSH, 0);
+        header(16, T_OUT, 3);
+        header(32, T_FLUSH, 0);
+        f.mem.write_slice(&[0xab; 512], GuestAddress(f.buf)).unwrap();
+        f.mem
+            .write_slice(&[0xee; 3], GuestAddress(f.buf + 0x800))
+            .unwrap();
+        // Head 0: flush. Head 2: write. Head 5: flush. Status bytes follow
+        // each other at `buf + 0x800`.
+        f.write_desc(0, desc(f.headers, 16, NEXT, 1));
+        f.write_desc(1, desc(f.buf + 0x800, 1, WRITE, 0));
+        f.write_desc(2, desc(f.headers + 16, 16, NEXT, 3));
+        f.write_desc(3, desc(f.buf, 512, NEXT, 4));
+        f.write_desc(4, desc(f.buf + 0x801, 1, WRITE, 0));
+        f.write_desc(5, desc(f.headers + 32, 16, NEXT, 6));
+        f.write_desc(6, desc(f.buf + 0x802, 1, WRITE, 0));
+        for (slot, head) in [0u16, 2, 5].into_iter().enumerate() {
+            f.mem
+                .write_obj(
+                    Le16::from(head),
+                    GuestAddress(f.avail + 4 + slot as u64 * 2),
+                )
+                .unwrap();
+        }
+        f.mem
+            .write_obj(Le16::from(3), GuestAddress(f.avail + 2))
+            .unwrap();
+        f.block.queue_notify(0);
+        f
+    }
+
+    #[test]
+    fn flushes_in_one_batch_share_one_flush_behind_the_other_requests() {
+        let disk = MemDisk::new(64 * 1024);
+        let ops = disk.op_log();
+        let f = flush_write_flush(disk);
+        // The write is served ahead of the flush it was queued behind, and
+        // one flush of the image answers both flush requests.
+        assert_eq!(
+            *ops.lock(),
+            [
+                crate::virtio::testing::DiskOp::Write(3 * 512),
+                crate::virtio::testing::DiskOp::Flush
+            ]
+        );
+        let mut status = [0xee; 3];
+        f.mem
+            .read_slice(&mut status, GuestAddress(f.buf + 0x800))
+            .unwrap();
+        assert_eq!(status, [S_OK; 3]);
+        // The write is used first, then the flushes in ring order.
+        assert_eq!(f.used_slot(0), (3, 2, 1));
+        assert_eq!(f.used_slot(1), (3, 0, 1));
+        assert_eq!(f.used_slot(2), (3, 5, 1));
+        // The driver hears of the write before the flush runs. Its
+        // used_event still names that first entry, so the flushes raise no
+        // second interrupt.
+        assert_eq!(*f.interrupt.notifies.lock(), [0]);
+    }
+
+    #[test]
+    fn a_failed_flush_fails_every_flush_it_answers_and_nothing_else() {
+        let disk = MemDisk::new(64 * 1024).failing_flush();
+        let content = disk.content();
+        let f = flush_write_flush(disk);
+        let mut status = [0xee; 3];
+        f.mem
+            .read_slice(&mut status, GuestAddress(f.buf + 0x800))
+            .unwrap();
+        assert_eq!(status, [S_IOERR, S_OK, S_IOERR]);
+        assert_eq!(content.lock()[3 * 512..4 * 512], [0xab; 512]);
+        assert_eq!(f.used_slot(2).0, 3);
     }
 
     #[test]
