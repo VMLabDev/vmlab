@@ -1,0 +1,8 @@
+import <vmlab.wcl>
+
+lab "e2e-server2016" {
+  vm "guest" {
+    template = "x86_64/windows-server-2016@14393.0.0"
+    agent_update = false
+  }
+}
