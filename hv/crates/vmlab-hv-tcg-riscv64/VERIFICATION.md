@@ -19,7 +19,7 @@ isla-sail -dno_cast -O -Oconstant_fold -memo_z3 -c_no_main
 ```
 
 Both `just tcg-generate` and `just tcg-generate-check` first run the toolchain
-package's `tcg-ir-generate` recipe. The former emits Rust builders and
+package's `tcg-ir-generate` recipe. The former emits Rust accessors and
 compressed IR; the latter compares both committed artifacts without rewriting
 them. Both accept an optional input path. The complete container-backed
 `just tcg-generate-check` passed with byte-identical artifacts.
@@ -49,9 +49,9 @@ executions in 75 seconds without a crash.
 The final fuzz target also checks canonical AST emission. It completed
 108,601 executions in 31 seconds without a crash.
 
-The generated crate has 361 instruction builders and includes 1,986 model
+The generated crate lists 361 instruction tags and includes 1,986 model
 functions, 214 registers, and 285 initialization functions. It contains
-81,607 bytes of generated Rust and 2,085,721 bytes of compressed IR.
+13,524 bytes of generated Rust and 2,085,721 bytes of compressed IR.
 The uncompressed JSON IR is 21,876,036 bytes. Measure with `wc -c` and
 decompress `src/model.json.gz` to count the JSON bytes.
 
