@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import lib
@@ -43,6 +44,7 @@ SHUTDOWN_TIMEOUT = 300
 X86_EXEC_TIMEOUT = 180
 X86_SHUTDOWN_TIMEOUT = 300
 X86_MAX_RESETS = 3
+WINDOWS_PROBE_INTERVAL = 1.0
 NET_WINDOW = 12.0        # seconds of sustained blasting per net direction
 NET_SETTLE = 1.0
 BLK_SEQ_MIB = 512        # sequential read/write volume
@@ -368,6 +370,25 @@ def windows_boot_id(agent):
     return None
 
 
+def windows_probe_ticks(deadline):
+    """Start readiness probes one second apart while a probe fits the cadence."""
+    while (started := time.monotonic()) < deadline:
+        yield
+        delay = min(started + WINDOWS_PROBE_INTERVAL, deadline) - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
+def host_sync_latency_ms(run_dir):
+    """Time fdatasync on a freshly written 4 KiB file on the overlay filesystem."""
+    with tempfile.TemporaryFile(dir=run_dir) as probe:
+        probe.write(bytes(4096))
+        probe.flush()
+        start = time.monotonic()
+        os.fdatasync(probe.fileno())
+        return round((time.monotonic() - start) * 1000, 3)
+
+
 class WindowsReady:
     """The windows first-boot sequence, ported from the template's
     provision script (see wait_x86_ready)."""
@@ -414,7 +435,7 @@ class WindowsReady:
         cand = None
         try:
             cand = lib.AgentClient(self.backend.agent_socket(), reset_monitor=self.reset_monitor)
-            hello = cand.handshake(3)
+            hello = cand.handshake(WINDOWS_PROBE_INTERVAL)
             return cand, hello
         except Exception:
             if cand is not None:
@@ -425,7 +446,7 @@ class WindowsReady:
         """Phase 1: the specialize marker, `cmd if exist` like vmlab's
         script (powershell is not dependable this early)."""
         marker_seen = False
-        while time.monotonic() < self.deadline:
+        for _ in windows_probe_ticks(self.deadline):
             agent, hello = self.connect()
             if agent is not None:
                 try:
@@ -444,7 +465,6 @@ class WindowsReady:
                 except (TimeoutError, ConnectionError, lib.BenchError, OSError):
                     pass
                 agent.close()
-            time.sleep(5)
         raise TimeoutError("windows first-boot marker never appeared")
 
     def wait_oobe(self, agent):
@@ -453,11 +473,10 @@ class WindowsReady:
         the specialize reboots, so every iteration works with whatever
         connection it can get."""
         end = min(time.monotonic() + 600, self.deadline)
-        while time.monotonic() < end:
+        for _ in windows_probe_ticks(end):
             if agent is None:
                 agent, _ = self.connect()
                 if agent is None:
-                    time.sleep(5)
                     continue
             try:
                 chan = win_ps(agent, WINDOWS_OOBE_PS)
@@ -471,7 +490,6 @@ class WindowsReady:
                 except Exception:
                     pass
                 agent = None
-            time.sleep(5)
         log("windows OOBE still running after ~10 minutes; continuing")
         return agent
 
@@ -516,18 +534,17 @@ class WindowsReady:
         for round_index in range(3):
             agent, _ = self.connect()
             if agent is None:
-                time.sleep(5)
+                time.sleep(WINDOWS_PROBE_INTERVAL)
                 continue
             self.request_reboot(agent, round_index)
             end = time.monotonic() + 60
-            while time.monotonic() < end:
+            for _ in windows_probe_ticks(end):
                 agent, _ = self.connect()
                 if agent is not None:
                     now_id = windows_boot_id(agent)
                     if before is None or (now_id is not None and now_id != before):
                         return self.wait_post_reboot_agent(agent)
                     agent.close()
-                time.sleep(5)
             log(f"windows still on the same boot ~60 s after request "
                 f"{round_index + 1}")
         log("windows in-guest reboot never took; forcing a host restart")
@@ -542,11 +559,10 @@ class WindowsReady:
         return agent, hello
 
     def wait_agent(self, deadline):
-        while time.monotonic() < deadline:
+        for _ in windows_probe_ticks(deadline):
             agent, hello = self.connect()
             if agent is not None:
                 return agent, hello
-            time.sleep(2)
         raise TimeoutError("windows agent never answered after the reboot")
 
     def wait_post_reboot_agent(self, agent):
@@ -678,6 +694,9 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
               "loadavg_start": loadavg_start}
     agent = None
     try:
+        if windows:
+            result["host_sync_latency_ms"] = host_sync_latency_ms(run_dir)
+            log(f"host fdatasync before launch: {result['host_sync_latency_ms']} ms")
         session = backend.launch()
         backend.release_cpus()
         result["t_release"] = round(session.elapsed(), 2)
@@ -893,9 +912,14 @@ def x86_run_config(args, guest, smp, pin, version, commit, dirty, host):
         "tools": {},
         "repeat_loadavg": [],
     }
+    if guest.startswith("windows-"):
+        env["readiness_probe_interval_s"] = WINDOWS_PROBE_INTERVAL
+        env["repeat_host_sync_latency_ms"] = []
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} x86_64 {guest} smp={smp} repeat {i}/{args.repeats}")
         result, backend, agent = x86_one_repeat(args, guest, smp, pin, version, i)
+        if "host_sync_latency_ms" in result:
+            env["repeat_host_sync_latency_ms"].append(result["host_sync_latency_ms"])
         env["backend_version"] = backend.backend_version()
         env["tools"] = result.get("tools", {})
         env["repeat_loadavg"].append({
