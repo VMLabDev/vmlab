@@ -183,3 +183,5 @@ and reached agent readiness on the retry. The first
 `vmlab exec guest -- cmd /c ver` timed out. Snapshot create and restore
 exited 0 and the second exec exited 137.
 See `evidence/windows-server-2016/{verify,boot-retry}-boot.log`.
+
+Card #87 did not reproduce F6 on 2026-11-18. The `vm.legacy.server2016` end-to-end check passed on vmlab-hv and QEMU with the pinned template, covering `cmd /c ver` after agent readiness and after online snapshot restore.
