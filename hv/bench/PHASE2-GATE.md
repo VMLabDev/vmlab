@@ -41,13 +41,13 @@ Boot requires a median ratio at most 1.00. Throughput requires at least
 
 | Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Verdict |
 |---|---|---:|---:|---:|---|
-| G1 | Ubuntu boot (s) | 6.60 | 6.93 | 1.0500 | FAIL |
-| G2 | Windows 10 boot (s) | 89.93 | 103.11 | 1.1466 | FAIL |
+| G1 | Ubuntu boot (s) | 6.60 | 6.93 | 1.0500 | FAIL (card #71) |
+| G2 | Windows 10 boot (s) | 89.93 | 103.11 | 1.1466 | FAIL (card #72) |
 | G3 | Sequential read (MiB/s) | 15505.99 | 17166.19 | 1.1071 | PASS |
 | G4 | Sequential write (MiB/s) | 1480.02 | 3898.07 | 2.6338 | PASS |
 | G5 | Random read 4 KiB (IOPS) | 50750.00 | 70941.20 | 1.3979 | PASS |
-| G6 | Random write 4 KiB (IOPS) | 17723.00 | 13200.50 | 0.7448 | FAIL |
-| G7 | UDP TX (Mbit/s) | 35457.47 | 25763.87 | 0.7266 | FAIL |
+| G6 | Random write 4 KiB (IOPS) | 17723.00 | 13200.50 | 0.7448 | FAIL (card #73) |
+| G7 | UDP TX (Mbit/s) | 35457.47 | 25763.87 | 0.7266 | FAIL (card #74) |
 | G8 | UDP RX (Mbit/s) | 86199.69 | 107667.66 | 1.2490 | PASS |
 | G9 | TCP A to B (Mbit/s) | 26851.93 | 31155.99 | 1.1603 | PASS |
 | G10 | TCP B to A (Mbit/s) | 26498.21 | 31063.02 | 1.1723 | PASS |
