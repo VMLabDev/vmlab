@@ -298,9 +298,11 @@ static void drop_all_sessions(void)
 struct exec_args {
     char pool[STR_CAP * 4];
     int used;
-    char *argv[MAX_ARGV];
+    /* One slot past the cap stays NULL: execvp and spawnvp take the vector
+     * as is and need its terminator even when all MAX_ARGV are used. */
+    char *argv[MAX_ARGV + 1];
     int argc;
-    char *env[MAX_ENV];
+    char *env[MAX_ENV + 1];
     int nenv;
     char *cwd;
 };
@@ -601,6 +603,7 @@ static int service_sessions(void)
 
 int agent_run(void)
 {
+    int idle_ticks = 0;
     wire_decoder_init(&dec, inbuf, IN_CAP);
     memset(sessions, 0, sizeof sessions);
 
@@ -642,7 +645,18 @@ int agent_run(void)
 
         active |= service_sessions();
 
-        if (!active)
+        if (!active) {
+            /* Announce ownership of COM1, including after a host reconnect.
+             * A zero byte is skipped by the host's frame resynchronizer. */
+            if (idle_ticks == 0) {
+                if (port_write("", 1) < 0) {
+                    drop_all_sessions();
+                    return -1;
+                }
+                idle_ticks = 200;
+            }
+            --idle_ticks;
             plat_sleep_ms(5);
+        }
     }
 }

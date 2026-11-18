@@ -428,6 +428,16 @@ fn capture_pattern_fill_with_colour_expansion() {
     assert_eq!(vram(&dev, 0, 4), [1; 4]);
 }
 
+#[test]
+fn solid_extension_without_expansion_still_reads_source() {
+    let mut dev = device();
+    mode(&mut dev, 640, 480, 0, 1);
+    fill_vram(&dev, 0x60000, &[1, 2, 3, 4]);
+    gr(&mut dev, 0x33, blit::EXT_SOLID);
+    blit(&mut dev, 0, 0x0d, 4, 1, 640, 640, 0, 0x60000);
+    assert_eq!(vram(&dev, 0, 4), [1, 2, 3, 4]);
+}
+
 /// mode=0xd0: the same fill at 16 bits per pixel, from GR1/GR11.
 #[test]
 fn capture_pattern_fill_at_sixteen_bits() {

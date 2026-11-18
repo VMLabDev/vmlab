@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import time
 
 from harness import RESULTS, ScenarioFailed
 
@@ -118,6 +119,7 @@ def exercise(h, lab, machine):
         # The agent can answer before the guest has finished starting, so the
         # screen check comes first and the guest operations run on the settled guest.
         marker = wait_for_screen(h, lab, machine)
+        screen_ready = time.monotonic()
         h.log.write(f"[legacy] {machine} screen shows {marker!r}\n")
         screen = RESULTS / f"legacy-{machine}.png"
         h.vmlab("vm", "screenshot", machine, str(screen), cwd=lab)
@@ -129,9 +131,11 @@ def exercise(h, lab, machine):
         # verify that the serial agent serves more than one request.
         if machine == "temple":
             result = h.vmlab("exec", machine, "--", command, cwd=lab)
+            h.log.write(f"[legacy] {machine} screen-ready to first exec complete (channel-open upper bound): {time.monotonic() - screen_ready:.3f}s\n")
         else:
             shell = {"freedos": "C:\\COMMAND.COM", "win98": "C:\\COMMAND.COM", "win7": "cmd.exe"}[machine]
             h.vmlab("exec", machine, "--", shell, "/c", "echo", "PHASE4_DISK_OK", ">", "C:\\P4CHECK.TXT", cwd=lab)
+            h.log.write(f"[legacy] {machine} screen-ready to first exec complete (channel-open upper bound): {time.monotonic() - screen_ready:.3f}s\n")
             result = h.vmlab("exec", machine, "--", shell, "/c", "type", "C:\\P4CHECK.TXT", cwd=lab)
             h.vmlab("exec", machine, "--", shell, "/c", "del", "C:\\P4CHECK.TXT", cwd=lab)
         if "PHASE4_DISK_OK" not in result.out:

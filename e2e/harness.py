@@ -260,9 +260,10 @@ class Harness:
 
     def host_config(self, vms: bool = False) -> str:
         """The `host {}` lines that put this run's machines on its hypervisor:
-        containers always, VMs where `vms` says (`vms_follow`)."""
+        containers automatically on vmlab, VMs where `vms` says (`vms_follow`)."""
         vm = self.hypervisor if vms else "qemu"
-        return f'  hypervisor {{ container = "{self.hypervisor}" vm = "{vm}" }}\n'
+        container = 'container = "qemu" ' if self.hypervisor == "qemu" else ""
+        return f'  hypervisor {{ {container}vm = "{vm}" }}\n'
 
     # -- recording -----------------------------------------------------------
 

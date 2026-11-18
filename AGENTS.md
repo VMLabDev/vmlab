@@ -53,7 +53,11 @@ just ci::check
   The target runner enables JSON only for test binaries. Doctests still run
   separately on stable rustdoc without the runner, with text output included in cargo's exit status but not
   in the uploaded case counts.
-  VML-114 tracks native reports for the remaining steps.
+  TAP, wscript, guest and agent-conformance steps use the same format under
+  the same directory: `tap.json`, `wscript.json`, `guest-cinit-proto.json`,
+  `guest-cinit.json`, `guest-agent-proto.json`, `guest-agent.json` and
+  `agent-conformance.json`. Push each with the command above, using its
+  filename stem as the name. These paths also print at the end of the gate.
 - A known flaky test that fails once is rerun alone before the run counts as
   failed; name it on the card. Red again: fix it, or move the card to
   `blocked` with the output tail.

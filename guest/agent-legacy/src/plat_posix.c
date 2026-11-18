@@ -33,6 +33,26 @@ static void set_nonblock(int fd)
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+/* Every descriptor the agent keeps for itself — the port, the listener,
+ * its ends of each child's pipes — is close-on-exec, so no child inherits
+ * the agent channel or holds another child's stdin open past its EOF.
+ * (fcntl rather than O_CLOEXEC/pipe2: the serial build targets old Linux.) */
+static void set_cloexec(int fd)
+{
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl >= 0)
+        fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
+static void close_pair(int fds[2])
+{
+    if (fds[0] >= 0)
+        close(fds[0]);
+    if (fds[1] >= 0)
+        close(fds[1]);
+    fds[0] = fds[1] = -1;
+}
+
 static int open_serial(const char *path, char *err, int errcap)
 {
     struct termios t;
@@ -41,6 +61,7 @@ static int open_serial(const char *path, char *err, int errcap)
         snprintf(err, (size_t)errcap, "open %s: %s", path, strerror(errno));
         return -1;
     }
+    set_cloexec(fd);
     if (tcgetattr(fd, &t) == 0) {
         cfmakeraw(&t);
         cfsetispeed(&t, B115200);
@@ -63,6 +84,7 @@ static int open_listener(const char *path, char *err, int errcap)
             snprintf(err, (size_t)errcap, "socket: %s", strerror(errno));
             return -1;
         }
+        set_cloexec(listen_fd);
         memset(&addr, 0, sizeof addr);
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
@@ -78,6 +100,7 @@ static int open_listener(const char *path, char *err, int errcap)
         snprintf(err, (size_t)errcap, "accept: %s", strerror(errno));
         return -1;
     }
+    set_cloexec(port_fd);
     set_nonblock(port_fd);
     return 0;
 }
@@ -157,16 +180,36 @@ struct plat_proc {
 
 struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap)
 {
-    int in[2], out[2], errp[2];
+    int in[2] = {-1, -1}, out[2] = {-1, -1}, errp[2] = {-1, -1};
     struct plat_proc *p;
     pid_t pid;
     if (pipe(in) < 0 || pipe(out) < 0 || pipe(errp) < 0) {
         snprintf(err, (size_t)errcap, "pipe: %s", strerror(errno));
+        close_pair(in);
+        close_pair(out);
+        close_pair(errp);
         return NULL;
     }
+    /* Allocated before the fork, so a failure leaves no child behind. */
+    p = calloc(1, sizeof *p);
+    if (!p) {
+        snprintf(err, (size_t)errcap, "exec: out of memory");
+        close_pair(in);
+        close_pair(out);
+        close_pair(errp);
+        return NULL;
+    }
+    /* Our ends; dup2 below clears the flag on the child's copies. */
+    set_cloexec(in[1]);
+    set_cloexec(out[0]);
+    set_cloexec(errp[0]);
     pid = fork();
     if (pid < 0) {
         snprintf(err, (size_t)errcap, "fork: %s", strerror(errno));
+        close_pair(in);
+        close_pair(out);
+        close_pair(errp);
+        free(p);
         return NULL;
     }
     if (pid == 0) {
@@ -174,12 +217,12 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         dup2(in[0], 0);
         dup2(out[1], 1);
         dup2(errp[1], 2);
-        close(in[0]);
-        close(in[1]);
-        close(out[0]);
-        close(out[1]);
-        close(errp[0]);
-        close(errp[1]);
+        if (in[0] > 2)
+            close(in[0]);
+        if (out[1] > 2)
+            close(out[1]);
+        if (errp[1] > 2)
+            close(errp[1]);
         for (i = 0; i < spec->nenv; i++)
             putenv(spec->env[i]);
         if (spec->cwd && chdir(spec->cwd) < 0)
@@ -190,7 +233,6 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     close(in[0]);
     close(out[1]);
     close(errp[1]);
-    p = calloc(1, sizeof *p);
     p->pid = pid;
     p->in_fd = in[1];
     p->out_fd = out[0];
@@ -246,19 +288,41 @@ static void flush_in(struct plat_proc *p)
 
 void proc_write_in(struct plat_proc *p, const void *buf, long len)
 {
+    long keep;
+    if (len <= 0)
+        return;
     if (p->in_fd < 0) {
         p->consumed += (unsigned long)len;
         return;
     }
-    if (p->pending_len + len > p->pending_cap) {
-        long cap = p->pending_cap ? p->pending_cap * 2 : 8192;
-        while (cap < p->pending_len + len)
-            cap *= 2;
-        p->pending = realloc(p->pending, (size_t)cap);
-        p->pending_cap = cap;
+    keep = PLAT_STDIN_CAP - p->pending_len;
+    if (keep > len)
+        keep = len;
+    if (keep < 0)
+        keep = 0;
+    if (keep < len) {
+        plat_log("agent: stdin queue full, bytes past the window dropped");
+        p->consumed += (unsigned long)(len - keep);
     }
-    memcpy(p->pending + p->pending_len, buf, (size_t)len);
-    p->pending_len += len;
+    if (keep && p->pending_len + keep > p->pending_cap) {
+        long cap = p->pending_cap ? p->pending_cap * 2 : 8192;
+        char *grown;
+        while (cap < p->pending_len + keep)
+            cap *= 2;
+        grown = realloc(p->pending, (size_t)cap);
+        if (!grown) {
+            plat_log("agent: out of memory queueing stdin, bytes dropped");
+            p->consumed += (unsigned long)keep;
+            keep = 0;
+        } else {
+            p->pending = grown;
+            p->pending_cap = cap;
+        }
+    }
+    if (keep) {
+        memcpy(p->pending + p->pending_len, buf, (size_t)keep);
+        p->pending_len += keep;
+    }
     flush_in(p);
 }
 

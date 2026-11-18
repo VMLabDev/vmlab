@@ -28,6 +28,8 @@ class ReleaseDryRun(unittest.TestCase):
         self.bin.mkdir()
         self.asset = 'vmlab-1.2.3-linux-x86_64'
         (self.dist / self.asset).write_text('#!/bin/sh\nprintf executed >> "$MARKER"\n')
+        self.helper = 'vmlab-fastpath-1.2.3-linux-x86_64'
+        (self.dist / self.helper).write_text('#!/bin/sh\nexit 2\n')
         for name in ['vmlab-guest-1.2.3.tar.gz', 'vmlab-hv-1.2.3-linux-x86_64.tar.gz']:
             (self.dist / name).write_bytes(b'fixture')
         self.env = dict(os.environ, GITHUB_SHA='a' * 40, GITHUB_RUN_ID='123',
@@ -181,6 +183,45 @@ esac
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('no capabilities granted', result.stdout)
 
+    def test_helper_is_installed_beside_the_binary(self):
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        helper = self.root / 'installed/vmlab-fastpath'
+        self.assertTrue(helper.is_file())
+        self.assertTrue(os.access(helper, os.X_OK))
+
+    def test_fastpath_grants_the_helper_and_never_the_binary(self):
+        log = self.root / 'sudo.log'
+        self.env['SUDO_LOG'] = str(log)
+        self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
+        self.tool('sudo', '#!/bin/sh\nset -eu\nprintf "%s\\n" "$*" >> "$SUDO_LOG"\n')
+        self.tool('setcap', '#!/bin/sh\nexit 99\n')
+        self.tool('getcap', '#!/bin/sh\nprintf "%s cap_bpf,cap_net_admin=ep\\n" "$1"\n')
+        self.tool('findmnt', '#!/bin/sh\nprintf "rw,relatime\\n"\n')
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        helper = self.root / 'installed/vmlab-fastpath'
+        self.assertEqual(log.read_text().splitlines(),
+                         [f'setcap cap_bpf,cap_net_admin+ep {helper}'])
+        self.assertIn('only the vmlab-fastpath helper', result.stderr)
+
+    def test_release_without_helper_still_installs_the_binary(self):
+        (self.dist / self.helper).unlink()
+        self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
+        self.tool('sudo', '#!/bin/sh\nset -eu\nexit 99\n')
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / 'installed/vmlab').exists())
+        self.assertFalse((self.root / 'installed/vmlab-fastpath').exists())
+        self.assertIn('fast path stays off', result.stderr)
+
+    def test_corrupt_helper_is_refused(self):
+        (self.dist / self.helper).write_text('tampered')
+        result = self.install('--no-guest')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('checksum mismatch', result.stderr)
+        self.assertFalse((self.root / 'installed/vmlab-fastpath').exists())
+
     def test_bad_signature_never_executes(self):
         self.env['BAD_SIGNATURE'] = '1'
         self.refused(self.install('--no-guest'))
@@ -269,16 +310,18 @@ esac
 
     def test_provenance_and_checksums(self):
         data = json.loads((self.dist / 'provenance.json').read_text())
-        self.assertEqual(len(data['subject']), 3)
+        self.assertEqual(len(data['subject']), 4)
         self.assertEqual(data['predicateType'], 'https://slsa.dev/provenance/v1')
         for line in (self.dist / 'SHA256SUMS').read_text().splitlines():
             digest, name = line.split()
             self.assertEqual(digest, hashlib.sha256((self.dist / name).read_bytes()).hexdigest())
 
     def test_missing_release_asset(self):
-        (self.dist / self.asset).unlink()
-        with self.assertRaises(ValueError):
-            ASSETS.prepare(self.dist, '1.2.3')
+        for name in [self.asset, self.helper]:
+            (self.dist / name).rename(self.root / name)
+            with self.assertRaises(ValueError):
+                ASSETS.prepare(self.dist, '1.2.3')
+            (self.root / name).rename(self.dist / name)
 
     def test_unsafe_inputs(self):
         for directory, version in [('/', '1.2.3'), (self.dist, '../escape')]:

@@ -1248,6 +1248,20 @@ pub(super) async fn bounded_body(mut resp: reqwest::Response, limit: usize) -> R
     }
     Ok(body)
 }
+/// A registry host written as a loopback literal: `localhost`, an address
+/// in 127.0.0.0/8, or `::1`. No name is resolved.
+fn loopback_registry(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
+}
+
 const ACCEPT_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json, \
      application/vnd.oci.image.index.v1+json, \
      application/vnd.docker.distribution.manifest.v2+json, \
@@ -1264,7 +1278,7 @@ struct TokenResponse {
 impl HttpTransport {
     pub fn new(host: String, credential: Credential) -> Result<Self> {
         let parsed = reqwest::Url::parse(&format!("https://{host}"))?;
-        let scheme = if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) {
+        let scheme = if loopback_registry(&parsed) {
             "http"
         } else {
             "https"
@@ -1288,11 +1302,20 @@ impl HttpTransport {
         format!("{}{path}", self.base)
     }
 
+    /// Credentials go only to the exact registry origin, over HTTPS, or
+    /// over plain HTTP when that registry is a loopback host written
+    /// literally (`localhost`, 127.0.0.0/8, `::1`): such credentials do
+    /// not leave the host. A name that merely resolves to loopback is
+    /// not one.
     fn credential_url(&self, url: &reqwest::Url) -> bool {
         let Ok(registry) = reqwest::Url::parse(&self.base) else {
             return false;
         };
-        url.scheme() == "https"
+        let secure = url.scheme() == "https"
+            || (url.scheme() == "http"
+                && registry.scheme() == "http"
+                && loopback_registry(&registry));
+        secure
             && url.host_str() == registry.host_str()
             && url.port_or_known_default() == registry.port_or_known_default()
             && url.username().is_empty()
@@ -1317,10 +1340,15 @@ impl HttpTransport {
     }
 
     /// Login also permits a separate HTTPS token realm named directly by
-    /// the configured HTTPS registry, never by a redirected response.
+    /// the configured registry, never by a redirected response. Plain HTTP
+    /// is accepted only for a loopback registry and a realm on that same
+    /// origin.
     pub(super) async fn validate_login(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.url("/v2/"))?;
-        anyhow::ensure!(self.credential_url(&url), "registry login requires HTTPS");
+        anyhow::ensure!(
+            self.credential_url(&url),
+            "registry login requires HTTPS (plain HTTP only for a loopback registry)"
+        );
         let basic = self
             .credential
             .basic_header()
@@ -1347,9 +1375,10 @@ impl HttpTransport {
                 .ok_or_else(|| anyhow!("login failed: registry rejected the credential"))?;
             let realm = reqwest::Url::parse(&challenge.realm)?;
             anyhow::ensure!(
-                realm.scheme() == "https"
-                    && realm.username().is_empty()
-                    && realm.password().is_none(),
+                self.credential_url(&realm)
+                    || (realm.scheme() == "https"
+                        && realm.username().is_empty()
+                        && realm.password().is_none()),
                 "login token realm must use HTTPS without URL credentials"
             );
             self.fetch_token(&challenge, true).await?;
@@ -1984,16 +2013,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plain_http_credentials_only_for_a_literal_loopback_registry() {
+        for host in [
+            "localhost:5000",
+            "127.0.0.1:5000",
+            "127.8.9.10:5000",
+            "[::1]:5000",
+        ] {
+            let transport = private_transport(host);
+            assert!(transport.base.starts_with("http://"), "{host}");
+            let url = format!("http://{host}/v2/").parse().unwrap();
+            assert!(transport.credential_url(&url), "{host}");
+            // Same loopback host, another port or user info: not the registry.
+            let other = transport.base.replace(":5000", ":5001");
+            assert!(!transport.credential_url(&format!("{other}/v2/").parse().unwrap()));
+            let userinfo = transport.base.replace("http://", "http://user@");
+            assert!(!transport.credential_url(&userinfo.parse().unwrap()));
+        }
+        // Names that only resolve to loopback, and loopback-looking
+        // non-literals, stay HTTPS-only: nothing is resolved.
+        for host in [
+            "registry.example:5000",
+            "localtest.me:5000",
+            "127.0.0.1.nip.io:5000",
+            "localhost.localdomain:5000",
+            "[::ffff:127.0.0.1]:5000",
+        ] {
+            let transport = private_transport(host);
+            assert!(transport.base.starts_with("https://"), "{host}");
+            let url = transport.base.replace("https://", "http://");
+            assert!(
+                !transport.credential_url(&format!("{url}/v2/").parse().unwrap()),
+                "{host}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn login_refuses_plain_http_before_sending_a_credential() {
-        let transport = private_transport("127.0.0.1:1");
+    async fn login_to_a_loopback_http_registry_sends_the_credential() {
+        let (url, captured) =
+            http_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".into()).await;
+        let transport = private_transport(url.trim_start_matches("http://"));
+        transport.validate_login().await.unwrap();
+        let head = captured.await.unwrap().to_lowercase();
+        assert!(head.starts_with("get /v2/ "), "{head}");
+        assert!(head.contains("authorization: basic "), "{head}");
+    }
+
+    #[tokio::test]
+    async fn loopback_login_refuses_a_plain_http_realm_on_another_origin() {
+        let (url, _captured) = http_once(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer \
+             realm=\"http://127.0.0.1:1/token\"\r\nContent-Length: 0\r\n\r\n"
+                .into(),
+        )
+        .await;
+        let transport = private_transport(url.trim_start_matches("http://"));
         assert!(
             transport
                 .validate_login()
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("requires HTTPS")
+                .contains("token realm must use HTTPS")
         );
     }
 

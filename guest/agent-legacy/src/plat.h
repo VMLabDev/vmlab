@@ -44,6 +44,12 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
 /* Read from stdout (`which` 0) or stderr (1): bytes, 0 for none right now,
  * -1 once that pipe is closed for good. */
 long proc_read(struct plat_proc *p, int which, void *buf, long cap);
+/* The most stdin a platform queues for one child: the initial window
+ * (wire.h), which a host that honours the credit it was given never
+ * exceeds. Bytes past it are dropped (and still credited back) rather than
+ * grown into without bound. */
+#define PLAT_STDIN_CAP (256L * 1024L)
+
 /* Queue bytes for the child's stdin. Never blocks. */
 void proc_write_in(struct plat_proc *p, const void *buf, long len);
 /* Stdin bytes actually handed to the child since the last call — what the

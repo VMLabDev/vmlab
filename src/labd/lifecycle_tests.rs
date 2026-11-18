@@ -414,7 +414,7 @@ fn container_with_volumes(
         crate::config::hypervisor::HypervisorKind::Qemu
     };
     let hv = FakeHypervisor::new(script);
-    let ctr = ContainerInstance::new(
+    let mut ctr = ContainerInstance::new(
         "t",
         cfg,
         resolved,
@@ -426,6 +426,7 @@ fn container_with_volumes(
         kind,
         hv.clone(),
     );
+    ctr.set_host_facts(kvm_host());
     (ctr, hv)
 }
 
@@ -2117,6 +2118,29 @@ async fn a_reported_capability_is_used() {
     vm.stop(true).await.expect("stop");
 }
 
+#[tokio::test]
+async fn a_failed_online_snapshot_load_resumes_the_vm() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB }"#,
+        Script {
+            capabilities: Capabilities::all(),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.unwrap();
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let machine: Arc<dyn Machine> = vm.clone();
+    let error = machine.restore(lab, "missing", true).await.unwrap_err();
+    assert!(format!("{error:#}").contains("does not exist"));
+    assert!(!hv.paused(), "failed load left CPUs paused");
+    assert_eq!(vm.state().await, PowerState::Running);
+    vm.stop(true).await.unwrap();
+}
+
 /// A container's online snapshot rides the same capability: absent, the
 /// refusal it always gave; present, an online capture it can restore.
 #[tokio::test]
@@ -2792,6 +2816,23 @@ async fn a_vmlab_hv_vm_on_a_host_without_kvm_is_refused_at_start() {
     assert!(format!("{err:#}").contains("/dev/kvm"), "{err:#}");
     assert_eq!(hv.starts(), 0, "nothing was started");
     assert_eq!(vm.state().await, PowerState::Stopped);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_without_kvm_is_refused_before_launch_on_either_hypervisor() {
+    for script in [Script::healthy(), on_vmlab_hv(Script::healthy())] {
+        let dirs = Dirs::new();
+        let (mut ctr, hv) = container(&dirs, WORKLOAD, script);
+        ctr.set_host_facts(crate::config::hypervisor::HostFacts {
+            kvm: false,
+            ..kvm_host()
+        });
+        let (cbs, _observed) = callbacks();
+        let err = start_container(&ctr, cbs).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("KVM is required"), "{err:#}");
+        assert_eq!(hv.starts(), 0, "nothing was started");
+        assert_eq!(ctr.state().await, PowerState::Stopped);
+    }
 }
 
 #[tokio::test]

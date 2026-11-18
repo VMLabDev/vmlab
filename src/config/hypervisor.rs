@@ -3,7 +3,7 @@
 //!
 //! A machine names its hypervisor with `hypervisor = "qemu" | "vmlab"`; one
 //! that names none takes an explicit host default, its existing hypervisor,
-//! or automatic VM selection. Containers still default to QEMU.
+//! or automatic selection for new VMs and containers.
 //! `vmlab` is `vmlab-hv`, vmlab's own hypervisor,
 //! which grows phase by phase. [`vmlab_refusals`] is **the** list of what it
 //! cannot run yet — validation reads it, and so does the lab daemon before
@@ -50,7 +50,7 @@ impl std::fmt::Display for HypervisorKind {
 /// phase that passes its gate flips the default for its machines alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HypervisorDefaults {
-    pub container: HypervisorKind,
+    pub container: Option<HypervisorKind>,
     /// `None` selects vmlab-hv for supported new VMs, QEMU otherwise.
     pub vm: Option<HypervisorKind>,
 }
@@ -62,7 +62,7 @@ pub struct HypervisorSelection {
 }
 
 impl HypervisorDefaults {
-    /// Explicit settings win over persisted identity. Only automatic VM
+    /// Explicit settings win over persisted identity. Only automatic
     /// selection falls back; an explicit vmlab selection is still validated.
     pub fn select(
         &self,
@@ -73,7 +73,7 @@ impl HypervisorDefaults {
     ) -> HypervisorSelection {
         let explicit = match machine {
             MachineCfg::Vm(vm) => vm.hypervisor.or(self.vm),
-            MachineCfg::Container(c) => Some(c.hypervisor.unwrap_or(self.container)),
+            MachineCfg::Container(c) => c.hypervisor.or(self.container),
         };
         if let Some(kind) = explicit.or(existing) {
             return HypervisorSelection {
@@ -480,7 +480,7 @@ mod tests {
   vm "d" { template = "x86_64/t" }
 }"#);
         let defaults = HypervisorDefaults {
-            container: HypervisorKind::Qemu,
+            container: Some(HypervisorKind::Qemu),
             vm: Some(HypervisorKind::Vmlab),
         };
         let pick = |name: &str| {
@@ -492,12 +492,12 @@ mod tests {
         assert_eq!(pick("b"), HypervisorKind::Qemu);
         assert_eq!(pick("c"), HypervisorKind::Qemu);
         assert_eq!(pick("d"), HypervisorKind::Vmlab);
-        // Containers keep QEMU; supported new VMs select vmlab-hv.
+        // Supported new containers and VMs select vmlab-hv.
         let none = HypervisorDefaults::default();
         assert_eq!(
             none.select(file.lab.machine("b").unwrap(), &kvm_host(), None, None)
                 .kind,
-            HypervisorKind::Qemu
+            HypervisorKind::Vmlab
         );
         assert_eq!(
             none.select(file.lab.machine("d").unwrap(), &kvm_host(), None, None)
@@ -614,6 +614,62 @@ mod tests {
             );
             assert_eq!(picked.kind, HypervisorKind::Vmlab, "{profile}");
             assert!(picked.fallback_reason.is_none(), "{profile}: {picked:?}");
+        }
+    }
+
+    #[test]
+    fn automatic_container_selection_preserves_identity_and_reports_refusals() {
+        let file = lab(r#"lab "l" {
+          container "c" { image = "alpine" }
+          container "q" { image = "alpine" hypervisor = "qemu" }
+        }"#);
+        let defaults = HypervisorDefaults::default();
+        let machine = file.lab.machine("c").unwrap();
+        let picked = defaults.select(machine, &kvm_host(), None, None);
+        assert_eq!(picked.kind, HypervisorKind::Vmlab);
+        assert!(picked.fallback_reason.is_none());
+        for kind in [HypervisorKind::Qemu, HypervisorKind::Vmlab] {
+            assert_eq!(
+                defaults.select(machine, &kvm_host(), None, Some(kind)).kind,
+                kind
+            );
+            let host = HypervisorDefaults {
+                container: Some(kind),
+                ..defaults
+            };
+            assert_eq!(
+                host.select(machine, &kvm_host(), None, Some(HypervisorKind::Vmlab))
+                    .kind,
+                kind
+            );
+        }
+        assert_eq!(
+            defaults
+                .select(
+                    file.lab.machine("q").unwrap(),
+                    &kvm_host(),
+                    None,
+                    Some(HypervisorKind::Vmlab)
+                )
+                .kind,
+            HypervisorKind::Qemu
+        );
+        for host in [
+            HostFacts {
+                kvm: false,
+                ..kvm_host()
+            },
+            HostFacts {
+                arch: "aarch64".into(),
+                ..kvm_host()
+            },
+        ] {
+            let picked = defaults.select(machine, &host, None, None);
+            assert_eq!(picked.kind, HypervisorKind::Qemu);
+            assert_eq!(
+                picked.fallback_reason,
+                Some(vmlab_refusals(machine, &host, None).join("; "))
+            );
         }
     }
 

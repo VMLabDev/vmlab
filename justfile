@@ -27,6 +27,11 @@ release:
 [group('test')]
 test: ci::test
 
+# Bounded parser fuzzing for the release gate or nightly (seconds per target).
+[group('test')]
+fuzz seconds='60':
+	./scripts/fuzz.sh {{seconds}}
+
 # Format the codebase (the fixer for `just ci::fmt-check`)
 [group('check')]
 fmt:

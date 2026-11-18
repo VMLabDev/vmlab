@@ -4809,7 +4809,7 @@ lab "l" {
     fn the_hosts_default_is_validated_like_a_declaration() {
         let host = HvHost {
             defaults: HypervisorDefaults {
-                container: HypervisorKind::Vmlab,
+                container: Some(HypervisorKind::Vmlab),
                 vm: Some(HypervisorKind::Vmlab),
             },
             ..HvHost::kvm()

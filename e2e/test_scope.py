@@ -44,12 +44,15 @@ class ScenarioScopeTests(unittest.TestCase):
         self.assertIn("vm.hw.tsc", delivered)
         self.assertEqual(len(delivered), 34)
 
-    def test_host_config_pins_both_kinds_for_every_run(self):
+    def test_host_config_exercises_automatic_containers_on_vmlab(self):
         for hypervisor in ("qemu", "vmlab"):
             h = self.new_harness(hypervisor)
             for vms in (False, True):
                 config = h.host_config(vms)
-                self.assertIn(f'container = "{hypervisor}"', config)
+                if hypervisor == "qemu":
+                    self.assertIn('container = "qemu"', config)
+                else:
+                    self.assertNotIn('container =', config)
                 vm = hypervisor if vms else "qemu"
                 self.assertIn(f'vm = "{vm}"', config)
 
