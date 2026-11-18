@@ -14,7 +14,7 @@ use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, InstalledForward};
 use super::freeze_clone;
-use super::machine::Machine;
+use super::machine::{AgentOrigin, Machine};
 use super::machine_build::{self, BuildContext, Built, MachineSet};
 use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
@@ -3560,7 +3560,17 @@ impl LabRuntime {
             Clock::Fixed(_) => return ClockAfterRestore::Fixed,
             Clock::Host => {}
         }
-        let agent = match m.wait_agent(CLOCK_AGENT_WAIT).await {
+        // An unstamped VM may have a manually installed agent. Give it one
+        // handshake, but reserve retries for guests with evidence of an agent.
+        let handshake = if m.agent_origin() == AgentOrigin::Image
+            && m.sealed_agent_version().is_none()
+            && !m.is_agent_up().await
+        {
+            m.agent().await
+        } else {
+            m.wait_agent(CLOCK_AGENT_WAIT).await
+        };
+        let agent = match handshake {
             Ok(agent) => agent,
             Err(e) => {
                 return ClockAfterRestore::NotSet(format!("its agent did not answer: {e:#}"));
@@ -3971,6 +3981,7 @@ mod tests {
         /// questions that are about what the agent said (§19.4). `None` — the
         /// usual case for a double — is a machine with no agent at all.
         agent: Option<super::super::vm_agent::AgentHandle>,
+        agent_stamped: bool,
         /// A first-boot script still to run; until it has, the machine is
         /// not ready, as a real one is not (§6.1).
         first_boot: std::sync::Mutex<Option<String>>,
@@ -4063,6 +4074,7 @@ mod tests {
                 seq: shared.seq.clone(),
                 dir: shared.dir.join(name),
                 agent: None,
+                agent_stamped: true,
                 first_boot: std::sync::Mutex::new(None),
                 mount: None,
                 failing_mount: None,
@@ -4340,7 +4352,7 @@ mod tests {
         /// A VM double seals an agent, as a template built with one does; a
         /// container double's agent ships with the host, as a real one's.
         fn sealed_agent_version(&self) -> Option<String> {
-            (self.kind == MachineKind::Vm).then(|| "agent=sealed".to_string())
+            (self.kind == MachineKind::Vm && self.agent_stamped).then(|| "agent=sealed".to_string())
         }
         fn agent_origin(&self) -> crate::labd::machine::AgentOrigin {
             match self.kind {
@@ -4349,6 +4361,13 @@ mod tests {
             }
         }
         async fn agent(&self) -> Result<super::super::vm_agent::AgentHandle> {
+            if !self.agent_stamped && self.agent.is_none() {
+                return Err(super::super::machine::AgentUnavailable::Handshake {
+                    machine: self.name.clone(),
+                    message: "no agent in an unstamped template".into(),
+                }
+                .into());
+            }
             self.agent
                 .clone()
                 .ok_or_else(|| anyhow!("{}: no agent in a double", self.name))
@@ -5874,12 +5893,14 @@ lab "t" {
     /// An online restore sets the guest clock unless the machine declares it
     /// should not (#157); one it should set but cannot is a warning the
     /// restore answers with, never a failed restore.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_online_restore_sets_the_clock_or_says_why_not() {
         use crate::config::model::Clock;
         let dir = tempfile::tempdir().unwrap();
         let sh = shared(dir.path());
         let fixed = Clock::Fixed(chrono::DateTime::UNIX_EPOCH);
+        let mut host = FakeMachine::clocked("host", &sh, Clock::Host);
+        Arc::get_mut(&mut host).unwrap().agent_stamped = false;
         let lab = lab_of(
             dir.path(),
             r#"import <vmlab.wcl>
@@ -5889,7 +5910,7 @@ lab "t" {
   vm "pinned" { template = "x86_64/t" }
 }"#,
             vec![
-                FakeMachine::clocked("host", &sh, Clock::Host),
+                host,
                 FakeMachine::clocked("kept", &sh, Clock::Snapshot),
                 FakeMachine::clocked("pinned", &sh, fixed),
             ],
@@ -5897,15 +5918,16 @@ lab "t" {
         for name in ["host", "kept", "pinned"] {
             assert!(lab.snapshot(name, "s1").await.unwrap(), "{name}: online");
         }
-        // The double has no agent, so the clock it should set it cannot.
+        // An unstamped guest's failed handshake must not use the retry budget.
         let warnings =
-            tokio::time::timeout(Duration::from_secs(30), lab.restore("host", "s1", false))
+            tokio::time::timeout(Duration::from_secs(1), lab.restore("host", "s1", false))
                 .await
                 .expect("restore returns")
                 .expect("restore succeeds without the clock");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
-            warnings[0].contains("\"host\": the guest clock was not set"),
+            warnings[0].contains("\"host\": the guest clock was not set")
+                && warnings[0].contains("no agent in an unstamped template"),
             "{warnings:?}"
         );
         for name in ["kept", "pinned"] {
