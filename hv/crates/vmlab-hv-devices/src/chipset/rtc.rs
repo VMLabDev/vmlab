@@ -45,7 +45,7 @@ fn partition_heads(sectors: u64, mbr: &[u8; 512]) -> Option<u64> {
     if mbr[510..] != [0x55, 0xaa] {
         return None;
     }
-    mbr[446..510].chunks_exact(16).find_map(|entry| {
+    mbr[446..510].as_chunks::<16>().0.iter().find_map(|entry| {
         let heads = u64::from(entry[5]) + 1;
         let per_track = u64::from(entry[6] & 63);
         let used = entry[12..16] != [0; 4] && entry[5] != 0 && per_track != 0;
