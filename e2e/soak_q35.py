@@ -9,6 +9,7 @@ stay there after the test labs are destroyed.
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -88,7 +89,12 @@ lab "soak-{name}" {{
             require(f"hypervisor={backend}" in state().split(), "unexpected hypervisor in status")
 
         def guest(command):
-            shell = ("powershell.exe", "-NoProfile", "-NonInteractive", "-Command") if windows else ("sh", "-c")
+            if windows:
+                shell = ("powershell.exe", "-NoProfile", "-NonInteractive", "-Command")
+            else:
+                shell = ("/bin/sh", "-c")
+                # NixOS's agent service does not get the system profile on PATH.
+                command = "export PATH=/run/current-system/sw/bin:/usr/bin:/bin; " + command
             return run("exec", "guest", "--", *shell, command, timeout=40).strip()
 
         def read(path):
@@ -168,7 +174,7 @@ lab "soak-{name}" {{
             require("state=running" in state(), "no running VM to bring down")
             result = run("down")
             require("is down (clones retained)" in result, "lab did not report down")
-            require(f'lab "soak-{name}": not running' in run("status"),
+            require(json.loads(run("status", "--json")).get("running") is False,
                     "lab daemon still served status after down")
 
         def restore_offline():
