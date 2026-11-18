@@ -209,14 +209,25 @@ fn debug_feature_cli_and_gdb_roundtrip_against_real_hypervisor() {
     let firmware = root.join("firmware.bin");
     std::fs::write(&firmware, rom).unwrap();
     let machine = root.join("machine.json");
-    let control = root.join("hv.sock");
+    let xdg = root.join(format!("runtime-{}", "x".repeat(108)));
+    let runtime_base = vmlab::paths::runtime_dir_in(Some(&xdg));
+    let machine_run = vmlab::paths::machine_runtime_dir_in(
+        &runtime_base,
+        "debug-cli",
+        vmlab::paths::MachineKind::Vm,
+        "vm",
+    );
+    vmlab::paths::ensure_private_dir(&runtime_base).unwrap();
+    vmlab::paths::ensure_private_dir(&machine_run).unwrap();
+    let control = machine_run.join("control.sock");
     std::fs::write(
         &machine,
         serde_json::to_vec(&json!({
             "name":"debug-cli", "machine":"q35", "arch":"x86_64", "accel":"kvm",
             "vcpus":1, "memory_mib":16,
             "boot":{"kind":"firmware", "firmware":"seabios", "code":firmware},
-            "disks":[], "nics":[], "ports":[], "shares":[], "serial_log":root.join("serial.log")
+            "disks":[], "nics":[], "ports":[], "shares":[], "serial_log":root.join("serial.log"),
+            "display":{"device":"virtio-vga", "pci":{"bus":0,"device":4,"function":0}}
         }))
         .unwrap(),
     )
@@ -233,6 +244,8 @@ fn debug_feature_cli_and_gdb_roundtrip_against_real_hypervisor() {
                 "MemorySwapMax=0",
                 "--",
             ])
+            .arg("env")
+            .arg(format!("XDG_RUNTIME_DIR={}", xdg.display()))
             .arg(binary)
             .arg("--machine")
             .arg(&machine)
@@ -259,10 +272,13 @@ fn debug_feature_cli_and_gdb_roundtrip_against_real_hypervisor() {
         assert!(Instant::now() < deadline, "hypervisor startup timeout");
         std::thread::sleep(Duration::from_millis(10));
     };
+    for name in ["display.sock", "vnc.sock"] {
+        std::os::unix::net::UnixStream::connect(machine_run.join(name)).unwrap();
+    }
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let client = Arc::new(Mutex::new(client));
-    let socket = vmlab::paths::lab_runtime_dir_in(&root.join("runtime/vmlab"), "debug-cli")
-        .join("control.sock");
+    let relay_base = vmlab::paths::runtime_dir_in(Some(&root.join("runtime")));
+    let socket = vmlab::paths::lab_runtime_dir_in(&relay_base, "debug-cli").join("control.sock");
     let server = runtime
         .block_on(Server::bind(&socket, Arc::new(Relay(client.clone()))))
         .unwrap();
@@ -468,4 +484,5 @@ fn debug_feature_cli_and_gdb_roundtrip_against_real_hypervisor() {
     client.lock().unwrap().call(Ctrl::Quit).unwrap();
     wait_child(&mut guest);
     drop(server);
+    std::fs::remove_dir_all(runtime_base).unwrap();
 }

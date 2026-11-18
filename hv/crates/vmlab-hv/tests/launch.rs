@@ -252,6 +252,32 @@ fn malformed_secret_descriptions_do_not_echo_values() {
 }
 
 #[test]
+fn oversized_display_socket_reports_path_and_limit() {
+    let dir = Dir::new("display-path");
+    let machine = dir.machine();
+    let native = dir.path.join("x".repeat(108)).join("display.sock");
+    let mut desc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&machine).unwrap()).unwrap();
+    desc["machine"] = "q35".into();
+    desc["display"] = serde_json::json!({
+        "device": "virtio-vga", "pci": {"bus": 0, "device": 4, "function": 0}, "socket": native
+    });
+    std::fs::write(&machine, serde_json::to_vec(&desc).unwrap()).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_vmlab-hv"))
+        .arg("--machine")
+        .arg(machine)
+        .arg("--control")
+        .arg(dir.control())
+        .arg("--paused")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains(native.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("the limit is 107 bytes"), "{stderr}");
+}
+
+#[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn display_startup_failure_preserves_targets_and_never_advertises_control() {
     if !Path::new("/dev/kvm").exists()
