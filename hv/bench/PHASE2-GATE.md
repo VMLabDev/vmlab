@@ -1,7 +1,135 @@
 # Phase-2 performance gate (HV-D28)
 
 **Verdict: D28 remains open. Round 7 met six of ten core bars. Card #71 then
-closed G1 (0.9770).**
+closed G1 (0.9770). Card #72 reran G2 and did not close it (1.0182).**
+
+## Round 7 follow-up: G2 Windows 10 boot (card #72, 2026-11-19)
+
+G2 still fails: vmlab-hv boots Windows 10 in 96.69 seconds against QEMU's
+94.96, a ratio of 1.0182. Round 7 measured 103.11 against 89.93. No runtime
+change is merged. The round-7 ratio of 1.1466 was not reproduced with any
+binary, including round 7's own.
+
+### Rerun
+
+The rerun used round 7's method on helios from
+`e10780873d648d8a34fb437af22d9cb3262744c7`: `bench/run.py --arch x86_64
+--guest windows-10 --repeats 3`, all three QEMU repeats and then all three
+vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Windows 10 19045.2006.10.
+QEMU was 11.1.3. The firmware was the plain OVMF pair of round 7 (same
+SHA-256), named with `VMLAB_BENCH_OVMF_DIR`, which this card adds because
+the default path is absent on helios. The release vmlab-hv binary SHA-256
+was `8a497fba60ab23d3c44c0ed7b39fe5eb154eeea5c9c80204b57fd7ab0fe12824`.
+That revision used fdatasync where the qcow2 flush uses fsync. The change
+measured as no change (F3 below) and was reverted after the rerun.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 119 samples at
+five-second intervals from 22:17:45 to 22:27:35 UTC on 2026-11-18. The
+one-minute load ranged from 1.29 to 3.79, the five-minute load from 1.72
+to 2.45 and the fifteen-minute load from 1.71 to 2.07. The booting guest
+itself accounts for one to three of that. The opticlang pause was not
+confirmed. Logs, hashes, the diagnostic scripts and their raw results
+remain on helios under `/home/vmlab/src/stc/logs/d28-card-72.r8b/`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G2 | Windows 10 boot (s) | 94.96, 97.76, 88.33 | 94.96 | 96.69, 98.61, 95.92 | 96.69 | 1.0182 | FAIL |
+
+Both aggregate records are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl).
+
+### Diagnostic cohorts
+
+Before the rerun, 71 diagnostic boots ran the same readiness sequence
+(`run.wait_x86_ready`) one at a time, with the backend order rotated each
+round. They also recorded the guest's own event log, per-thread CPU time
+and, in some boots, KVM statistics. These are not gate records.
+
+| Cohort | Backend | Boots to agent ready (s) | Median | Launch to end of specialize, median (s) | vCPU CPU there, median (s) |
+|---|---|---|---:|---:|---:|
+| 1 | QEMU 11.1.3 | 83.32, 89.30, 89.73, 90.65, 94.21 | 89.73 | 53.6 | 46.8 |
+| 1 | vmlab-hv at `9572cdba` | 89.43, 91.38, 92.69, 94.38, 97.11 | 92.69 | 54.7 | 48.8 |
+| 1 | vmlab-hv at round 7, `82bec6b5` | 89.23, 90.23, 91.23, 91.73, 93.34 | 91.23 | 54.4 | 50.5 |
+| 2 | QEMU 11.1.3 | 83.23, 87.43, 88.46, 96.85 | 87.94 | 52.8 | 47.1 |
+| 2 | vmlab-hv at `9572cdba` | 88.32, 96.88, 97.56, 97.88 | 97.22 | 55.0 | 49.1 |
+| 2 | vmlab-hv with fdatasync | 87.97, 88.52, 89.49, 89.50 | 89.00 | 55.1 | 49.5 |
+| 3 | QEMU 11.1.3 | 84.26, 88.59, 89.26, 96.93 | 88.93 | 52.6 | 47.0 |
+| 3 | vmlab-hv with fdatasync | 91.45, 93.99, 97.19, 97.57 | 95.59 | 55.2 | 48.9 |
+
+The round-7 binary measured 1.017 times QEMU in cohort 1, and the binary
+of `next` 1.033. "End of specialize" is the guest's event 1074 from
+winlogon, on the guest clock, which starts from the host's.
+
+### Findings
+
+- F1, the result moves in steps of about five seconds. The readiness
+  sequence probes every 5 seconds while the agent answers and every 8
+  while it does not, in three stages (marker, OOBE, reboot). The samples
+  of all backends fall near 84, 89, 94, 98 and 103 seconds. A backend that
+  is two seconds behind lands on the same step or on the next one, so
+  three samples cannot place a ratio within 5%.
+- F2, a quarter of the boot is host sync time, and it is not steady. One
+  boot sends 8,500 to 9,700 flushes. QEMU answered them with 5,250 to
+  5,970 fdatasync calls that took 23.8 to 28.7 seconds. vmlab-hv ran 5,950
+  to 6,170 syncs that reached the disk, 22.9 to 33.8 seconds. The time of
+  1,500 in-place 4 KiB sync writes in a Linux guest ranged from 5.9 to
+  14.5 seconds between runs of one binary minutes apart.
+- F3, the sync path is at parity. Those 1,500 writes cost 1,500 host
+  syncs on both backends, and 1,500 appending writes about 3,600 on both:
+  QEMU orders refcounts and data before mappings with a second sync, as
+  the qcow2 flush here does. The times overlap: QEMU 5.9 to 9.0 seconds,
+  vmlab-hv 5.9 to 14.5 with fsync and 6.1 to 12.0 with fdatasync. Three
+  candidate changes were built and measured, and none is merged.
+  Answering the flushes of one batch with one sync did nothing: Windows
+  queued no request behind any of 8,714 flushes. Dropping the third sync
+  of each flush removed 8,700 calls that cost 0.016 seconds together, and
+  fdatasync in place of fsync changed no time. Ignoring guest discards,
+  as QEMU does with this argv, removed about 160 of 1,280 second syncs
+  and showed no boot change.
+- F4, vmlab-hv reaches the end of the specialize pass 1.1 to 2.6 seconds
+  after QEMU, by the cohort medians, and its vCPU threads have used 1.9
+  to 2.4 seconds more CPU by then. This difference repeats in all three
+  cohorts. Its cause is not established. KVM exit counts are close to
+  QEMU's, 2.31 million against 2.28 million in one boot each, except that
+  vmlab-hv has 200,000 more MMIO exits. A vCPU thread spends 3.0 seconds
+  of one boot outside `KVM_RUN` after an exit. 1.4 seconds are about
+  2,400 virtio-gpu queue notifications of 0.58 ms each: the 2D transfer
+  and flush commands run on the vCPU thread, and each flush composes and
+  compares the whole frame. 0.55 seconds are 150,000 MMIO writes of 2 to
+  10 microseconds, 120,000 of them virtio-blk queue notifications. QEMU
+  serves both off the vCPU thread, through an ioeventfd and its main
+  loop. Serving the GPU queue on a worker thread was tried and is not
+  merged: the vCPU thread's CPU time in MMIO writes fell from 2.0 to 0.65
+  seconds, but its wall time stayed at 1.3 seconds, for a reason that was
+  not found, and the four boots (83.64 to 95.09) do not separate from the
+  others.
+- F5, checked and equal on both backends: the guest's CPU topology and
+  model, the PnP device list, and the parallel port registers, which the
+  guest polls 410,000 times a boot. Checked and cheap in vmlab-hv: the
+  flushes that follow no write (3,894 of 8,722, 0.015 seconds together)
+  and the configuration writes through ECAM (2,254, 0.034 seconds
+  together behind the all-vCPU barrier).
+
+### Follow-ups
+
+FD5, FD6 and FD7 are cards now. FD8 is a decision that waits for the
+operator.
+
+- FD5 (card #97): serve virtio-gpu 2D commands off the vCPU thread, and compose a
+  frame once per published frame, not once per flush command. Up to 1.4 seconds of a
+  Windows boot.
+- FD6 (card #98): wake the virtio-blk worker from an ioeventfd, not from a userspace
+  MMIO exit. Up to 0.5 seconds of a Windows boot, and every block
+  workload.
+- FD7 (card #96): G2 cannot resolve 2% as it is measured. Either probe readiness
+  every second in the benchmark, or alternate the backends and take more
+  than three repeats, and record a host sync-latency probe beside each
+  boot.
+- FD8: the owner accepted G1 at 1.003 in round 6. G2 at 1.02, with a
+  spread of 9 seconds on the QEMU side, is a candidate for the same
+  decision. No card: the lead asked the operator, and the answer is open.
 
 ## Round 7 follow-up: G1 Ubuntu boot (card #71, 2026-11-18)
 

@@ -85,6 +85,8 @@ count and memory), N repeats, fresh qcow2 overlay per repeat:
    (the gate vmlab's provision script applies). Both current backends
    reboot in-process. The runner retains a respawn path for older
    vmlab-hv binaries that exit on reset. The clock starts at the first spawn.
+   The OVMF pair comes from vmlab's installed guest bundle, or from the
+   directory `VMLAB_BENCH_OVMF_DIR` names.
    During Windows readiness, control-socket reset events cancel commands on
    the previous agent session. The runner reconnects and repeats the same
    readiness probe instead of waiting for an exec timeout after a reboot.

@@ -83,12 +83,13 @@ def require_vm_slots(count=1):
 SEABIOS = "/usr/share/qemu/bios-256k.bin"
 # vmlab's bundled edk2 pair (src/qemu/firmware.rs `bundled_names`, x86_64
 # plain pairing) — the highest-priority source on this host.
-OVMF_CODE = os.path.expanduser(
-    "~/.local/share/vmlab/guest/firmware/x86_64/OVMF_CODE_4M.fd"
+# VMLAB_BENCH_OVMF_DIR names another directory holding the same two files,
+# for a host where the bundle is not installed.
+OVMF_DIR = os.environ.get("VMLAB_BENCH_OVMF_DIR") or os.path.expanduser(
+    "~/.local/share/vmlab/guest/firmware/x86_64"
 )
-OVMF_VARS = os.path.expanduser(
-    "~/.local/share/vmlab/guest/firmware/x86_64/OVMF_VARS_4M.fd"
-)
+OVMF_CODE = os.path.join(OVMF_DIR, "OVMF_CODE_4M.fd")
+OVMF_VARS = os.path.join(OVMF_DIR, "OVMF_VARS_4M.fd")
 # The iPXE ROM the hv NIC carries (just firmware-ipxe-build). QEMU's NIC
 # keeps its own default combo ROM; D16 compares presence and identity, not
 # bytes, and neither ROM is on the measured path.
