@@ -7,6 +7,7 @@ stay there after the test labs are destroyed.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from pathlib import Path
 import re
@@ -43,7 +44,6 @@ lab "soak-{name}" {{
   vm "guest" {{
     template = "x86_64/{ref}"
     hypervisor = "{backend}"
-    machine = "q35"
     agent_update = false
     nic {{ segment = "lan" }}
     share {{
@@ -180,8 +180,22 @@ lab "soak-{name}" {{
 
         try:
             started = time.monotonic()
-            if step("up", lambda: run("up", timeout=900)) and step("agent-ready", ready):
-                ready_seconds = time.monotonic() - started
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                up = executor.submit(run, "up", timeout=900)
+
+                def running_agent():
+                    if up.done():
+                        up.result()
+                    detail = state().split()
+                    return "ready=yes" in detail and f"hypervisor={backend}" in detail
+
+                agent_ready = step("agent-ready", lambda: wait_until(
+                    running_agent, 900, "agent readiness timed out",
+                ))
+                if agent_ready:
+                    ready_seconds = time.monotonic() - started
+                started_ok = step("up", up.result)
+            if started_ok and agent_ready:
                 step("exec", lambda: require(guest("echo soak-exec") == "soak-exec", "unexpected output"))
                 if step("cp to guest", lambda: run("cp", str(probe), f"guest:{marker}")):
                     step("cp from guest", pull)
@@ -221,7 +235,7 @@ def main():
     with (root / "report.md").open("w", buffering=1) as report:
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         print(f"# Modern q35 lifecycle soak\n\nCheckout `{revision}`.", file=report)
-        print("Readiness time includes `up` and ends at the first subsequent `ready=yes`.", file=report)
+        print("Readiness time runs from invocation of `up` to the first observed `ready=yes`.", file=report)
         for ref in args.refs:
             hv_time, hv = test(root, ref, "vmlab")
             qemu_time, qemu = test(root, ref, "qemu")
