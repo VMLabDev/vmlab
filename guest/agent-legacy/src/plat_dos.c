@@ -22,6 +22,7 @@
 #include <i86.h>
 #include <io.h>
 #include <process.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,19 @@
 
 #include "agent.h"
 #include "plat.h"
+
+/* OpenWatcom's _snprintf leaves the buffer unterminated when the text does
+ * not fit; this always terminates. */
+static void fmt(char *dst, size_t cap, const char *f, ...)
+{
+    va_list ap;
+    if (cap == 0)
+        return;
+    va_start(ap, f);
+    _vsnprintf(dst, cap, f, ap);
+    va_end(ap);
+    dst[cap - 1] = 0;
+}
 
 /* ---- the UART ------------------------------------------------------- */
 
@@ -118,29 +132,41 @@ static void temp_path(char *dst, size_t cap, const char *name)
     const char *dir = getenv("TEMP");
     if (!dir)
         dir = getenv("TMP");
-    if (!dir)
+    if (!dir || !*dir)
         dir = "C:\\";
     if (dir[strlen(dir) - 1] == '\\')
-        _snprintf(dst, cap, "%s%s", dir, name);
+        fmt(dst, cap, "%s%s", dir, name);
     else
-        _snprintf(dst, cap, "%s\\%s", dir, name);
+        fmt(dst, cap, "%s\\%s", dir, name);
 }
 
 /* The DOS command tail: arguments joined by spaces, one containing a space
  * wrapped in quotes (what the C runtime of a well-behaved child undoes;
- * COMMAND.COM's internals take the tail verbatim either way). */
-static void build_tail(char **argv, int argc, char *out, size_t cap)
+ * COMMAND.COM's internals take the tail verbatim either way). -1 when it
+ * does not fit: a truncated tail runs a different command. */
+static int build_tail(char **argv, int argc, char *out, size_t cap)
 {
     size_t n = 0;
     int i;
+    if (cap == 0)
+        return -1;
     out[0] = 0;
     for (i = 0; i < argc; i++) {
         int q = strchr(argv[i], ' ') != NULL;
-        n += (size_t)_snprintf(out + n, cap - n, "%s%s%s%s", i ? " " : "",
-                               q ? "\"" : "", argv[i], q ? "\"" : "");
-        if (n >= cap - 1)
-            break;
+        size_t need = strlen(argv[i]) + (i ? 1u : 0u) + (q ? 2u : 0u);
+        if (need >= cap - n)
+            return -1;
+        if (i)
+            out[n++] = ' ';
+        if (q)
+            out[n++] = '"';
+        memcpy(out + n, argv[i], strlen(argv[i]));
+        n += strlen(argv[i]);
+        if (q)
+            out[n++] = '"';
+        out[n] = 0;
     }
+    return 0;
 }
 
 struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap)
@@ -152,10 +178,14 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     unsigned save_drive, drives;
 
     if (busy) {
-        _snprintf(err, (size_t)errcap, "exec: DOS runs one command at a time");
+        fmt(err, (size_t)errcap, "exec: DOS runs one command at a time");
         return NULL;
     }
     p = calloc(1, sizeof *p);
+    if (!p) {
+        fmt(err, (size_t)errcap, "exec: out of memory");
+        return NULL;
+    }
     temp_path(p->out_path, sizeof p->out_path, "VMLABOUT.TMP");
     temp_path(p->err_path, sizeof p->err_path, "VMLABERR.TMP");
 
@@ -163,7 +193,13 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     out = open(p->out_path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IREAD | S_IWRITE);
     errf = open(p->err_path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IREAD | S_IWRITE);
     if (in < 0 || out < 0 || errf < 0) {
-        _snprintf(err, (size_t)errcap, "exec: cannot create %s", p->out_path);
+        fmt(err, (size_t)errcap, "exec: cannot create %s", p->out_path);
+        if (in >= 0)
+            close(in);
+        if (out >= 0)
+            close(out);
+        if (errf >= 0)
+            close(errf);
         free(p);
         return NULL;
     }
@@ -194,8 +230,10 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
      * COMMAND.COM /C. */
     rc = spawnvp(P_WAIT, spec->argv[0], (const char *const *)spec->argv);
     if (rc < 0 && errno == ENOENT) {
-        build_tail(spec->argv, spec->argc, tail, sizeof tail);
-        rc = system(tail);
+        if (build_tail(spec->argv, spec->argc, tail, sizeof tail) == 0)
+            rc = system(tail);
+        else
+            fprintf(stderr, "exec: command line too long for COMMAND.COM\n");
     }
     busy = 0;
 
@@ -215,8 +253,10 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
             /* Watcom: "NAME=" with an empty value removes the variable. */
             {
                 static char del[256];
-                _snprintf(del, sizeof del, "%s=", spec->env[i]);
-                putenv(del);
+                if (strlen(spec->env[i]) + 2 <= sizeof del) {
+                    fmt(del, sizeof del, "%s=", spec->env[i]);
+                    putenv(del);
+                }
             }
             *eq = '=';
         }
@@ -307,7 +347,7 @@ void plat_os_info(struct os_info *info)
         strcpy(info->id, "msdos");
         strcpy(info->name, "MS-DOS");
     }
-    _snprintf(info->version, sizeof info->version, "%u.%02u", major, minor);
+    fmt(info->version, sizeof info->version, "%u.%02u", major, minor);
     strcpy(info->kernel, info->version);
     strcpy(info->arch, "i386");
     strcpy(info->hostname, "dos");
@@ -385,7 +425,7 @@ int plat_set_time(const struct plat_time *t, char *err, int errcap)
     r.h.dl = (unsigned char)t->day;
     int386(0x21, &r, &r);
     if (r.h.al != 0) {
-        _snprintf(err, (size_t)errcap, "set_time: DOS refused the date %04d-%02d-%02d",
+        fmt(err, (size_t)errcap, "set_time: DOS refused the date %04d-%02d-%02d",
                   t->year, t->month, t->day);
         return -1;
     }
@@ -397,7 +437,7 @@ int plat_set_time(const struct plat_time *t, char *err, int errcap)
     r.h.dl = 0; /* hundredths */
     int386(0x21, &r, &r);
     if (r.h.al != 0) {
-        _snprintf(err, (size_t)errcap, "set_time: DOS refused the time %02d:%02d:%02d",
+        fmt(err, (size_t)errcap, "set_time: DOS refused the time %02d:%02d:%02d",
                   t->hour, t->minute, t->second);
         return -1;
     }

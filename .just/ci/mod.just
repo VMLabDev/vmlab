@@ -32,6 +32,7 @@ main:
 # Everything a change must pass before it can merge
 [group('ci')]
 check: path-check shell-paths release-version release-dry-run kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+	@python3 -c 'import pathlib, sys; root = pathlib.Path(sys.argv[1]); [print("Test results:", root / "test-results" / (name + ".json")) for name in sys.argv[2:]]' {{quote(test_result_root)}} main hv tap wscript guest-cinit-proto guest-cinit guest-agent-proto guest-agent agent-conformance
 
 # Prove absent-device skip and required-device failure without booting a guest
 [group('ci')]
@@ -41,11 +42,11 @@ kvm-policy-test: require-cargo require-bwrap
 # The excluded TAP helper and patched wscript dependencies are not swept by host tests
 [group('ci')]
 tap-test: require-cargo
-	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'tap') + ' ' } }}cargo test --manifest-path tap/Cargo.toml
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'tap') + ' ' } }}python3 scripts/ci_test.py tap --manifest-path tap/Cargo.toml
 
 [group('ci')]
 wscript-test: require-cargo
-	{{host_target_env}}cargo test -p wscript-core -p wscript-compiler
+	{{host_target_env}}python3 scripts/ci_test.py wscript -p wscript-core -p wscript-compiler
 
 # Refuse tracked paths that Windows cannot check out (: * ? " < > | \, trailing dot or space)
 [group('ci')]
@@ -68,7 +69,7 @@ release-version:
 # Offline release/installer dry-run, with an explicit signature-verifier stub
 [group('ci')]
 release-dry-run: require-uv
-	uv run --no-project --with pytest==8.4.2 python -m pytest scripts/test_release_assets.py --junitxml=target/release-dry-run.xml
+	uv run --no-project --with pytest==8.4.2 --with PyYAML==6.0.3 python -m pytest -p no:cacheprovider scripts/test_release_assets.py scripts/test_release_workflow.py --junitxml={{quote(release_report)}}
 
 # Run clippy with warnings as errors
 [group('ci')]
@@ -83,20 +84,20 @@ fmt-check: require-cargo
 # Run the test suite
 [group('ci')]
 test: require-cargo require-bwrap
-	{{host_target_env}}cargo test --all-features
+	{{host_target_env}}python3 scripts/ci_test.py main --all-features
 
 # Run the Linux agent against the required protocol contract
 [group('ci')]
 agent-conformance: require-cargo require-bwrap require-waypipe
 	cargo build --manifest-path guest/agent/Cargo.toml --target-dir {{quote(agent_target)}}
-	{{host_target_env}}VMLAB_CONFORMANCE_AGENT={{quote(agent_target / 'debug/vmlab-agent')}} VMLAB_CONFORMANCE_TIER=full cargo test --lib external_agent -- --ignored --nocapture --test-threads=1
+	{{host_target_env}}VMLAB_CONFORMANCE_AGENT={{quote(agent_target / 'debug/vmlab-agent')}} VMLAB_CONFORMANCE_TIER=full python3 scripts/ci_test.py agent-conformance --lib external_agent -- --ignored --nocapture --test-threads=1
 
 # Format check, lint and test one guest-side crate
 [group('ci')]
 guest-crate-check crate: require-cargo
 	cargo fmt --check --manifest-path guest/{{crate}}/Cargo.toml
 	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}cargo clippy --all-targets --manifest-path guest/{{crate}}/Cargo.toml -- -D warnings
-	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}cargo test --manifest-path guest/{{crate}}/Cargo.toml
+	{{ if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / ('guest-' + crate)) + ' ' } }}python3 scripts/ci_test.py guest-{{crate}} --manifest-path guest/{{crate}}/Cargo.toml {{ if crate == 'cinit' { '--bins --tests' } else if crate == 'agent' { '--bins --tests' } else { '' } }}
 
 # Check every guest-side crate (standalone workspaces the host build never sweeps in)
 [group('ci')]
@@ -120,6 +121,8 @@ guest-cross-build: require-cargo
 # Verify the committed BPF objects match the ebpf/ sources
 [group('ci')]
 ebpf-verify: ebpf-build
+	cmp {{quote(ebpf_output)}}/fastpath_sockmap.bpf.o src/net/fastpath/bpf/fastpath_sockmap.bpf.o
+	cmp {{quote(ebpf_output)}}/xdp_switch.bpf.o src/net/fastpath/bpf/xdp_switch.bpf.o
 	git diff --exit-code src/net/fastpath/bpf/
 
 # Install the hypervisor's native build dependencies on Ubuntu
@@ -160,12 +163,12 @@ hv-fmt-check: require-cargo
 # Lint every hypervisor crate without enabling guest-boot tests
 [group('ci')]
 hv-lint: require-cargo hv-virgl-build
-	{{hv_target_env}}PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" cargo clippy --workspace --exclude vmlab --all-targets -- -D warnings
+	{{hv_target_env}}PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" cargo clippy --workspace --exclude vmlab --all-targets -- -D warnings
 
 # Run hypervisor tests, ignoring KVM guests and host-asset acceptance cases
 [group('ci')]
 hv-test: require-cargo hv-virgl-build hv-ipxe-build
-	{{hv_target_env}}PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 cargo test --workspace --exclude vmlab
+	{{hv_target_env}}PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUSTFLAGS="--cfg vmlab_ci_no_kvm --cfg vmlab_ci_no_host_assets" RUST_TEST_THREADS=2 python3 scripts/ci_test.py hv --workspace --exclude vmlab
 
 # Build the hypervisor's pinned iPXE option ROMs for non-guest tests
 [group('ci')]
@@ -175,7 +178,7 @@ hv-ipxe-build: require-uv
 # Run before release e2e and nightly on next (see docs/agents/hv-gate.md)
 [group('ci')]
 hv-gate: require-cargo hv-virgl-build hv-ipxe-build
-	VMLAB_REQUIRE_KVM=1 PKG_CONFIG_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{justfile_directory()}}/.ci-cache/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
+	VMLAB_REQUIRE_KVM=1 PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
 
 # Check guest pins, documentation, Python packaging and shell scripts without building drivers
 [group('ci')]
@@ -191,6 +194,7 @@ win3d-check: require-uv
 # `guest-<crate>` each standalone guest workspace. Each *_env is a
 # `CARGO_TARGET_DIR=... ` prefix, empty when VMLAB_TARGET_ROOT is unset.
 host_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'host') + ' ' }
+test_result_root := if _target_root == '' { 'target' } else { _target_root }
 hv_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'hv') + ' ' }
 agent_target := if _target_root == '' { 'guest/agent/target' } else { _target_root / 'guest-agent' }
 agent_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(agent_target) + ' ' }
@@ -198,5 +202,5 @@ agent_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + qu
 hv_virgl_key := `python3 build/hv.py cache-key | cut -d= -f2`
 
 # Test threads for hv-gate: the caller's RUST_TEST_THREADS, else 2. VMLAB_HV_TEST_VM_LIMIT
-# passes through to vmlab-hv-tests, which defaults it to 4.
+# passes through to vmlab-hv-tests, which defaults it to 2 own test VMs.
 hv_gate_test_threads := env('RUST_TEST_THREADS', '2')

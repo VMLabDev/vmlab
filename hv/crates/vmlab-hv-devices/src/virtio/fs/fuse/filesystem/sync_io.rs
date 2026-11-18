@@ -14,13 +14,9 @@ use super::{
     Context, DirEntry, Entry, FileLock, GetxattrReply, IoctlData, ListxattrReply, ZeroCopyReader,
     ZeroCopyWriter,
 };
-#[cfg(feature = "virtiofs")]
-pub use crate::abi::virtio_fs::RemovemappingOne;
 use crate::virtio::fs::fuse::abi::fuse_abi::{
     CreateIn, FsOptions, OpenOptions, SetattrValid, stat64, statvfs64,
 };
-#[cfg(feature = "virtiofs")]
-use crate::virtio::fs::fuse::transport::FsCacheReqHandler;
 
 /// The main trait that connects a file system with a transport.
 #[allow(unused_variables)]
@@ -748,47 +744,6 @@ pub trait FileSystem {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
-    #[cfg(feature = "virtiofs")]
-    /// Setup a mapping so that guest can access files in DAX style.
-    ///
-    /// The virtio-fs DAX Window allows bypassing guest page cache and allows mapping host
-    /// page cache directly in guest address space.
-    ///
-    /// When a page of file is needed, guest sends a request to map that page (in host page cache)
-    /// in VMM address space. Inside guest this is a physical memory range controlled by virtiofs
-    /// device. And guest directly maps this physical address range using DAX and hence gets
-    /// access to file data on host.
-    ///
-    /// This can speed up things considerably in many situations. Also this can result in
-    /// substantial memory savings as file data does not have to be copied in guest and it is
-    /// directly accessed from host page cache.
-    #[allow(clippy::too_many_arguments)]
-    fn setupmapping(
-        &self,
-        _ctx: &Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        foffset: u64,
-        len: u64,
-        flags: u64,
-        moffset: u64,
-        vu_req: &mut dyn FsCacheReqHandler,
-    ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
-    #[cfg(feature = "virtiofs")]
-    /// Teardown a mapping which was setup for guest DAX style access.
-    fn removemapping(
-        &self,
-        _ctx: &Context,
-        _inode: Self::Inode,
-        requests: Vec<RemovemappingOne>,
-        vu_req: &mut dyn FsCacheReqHandler,
-    ) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
-    }
-
     /// Check file access permissions.
     ///
     /// This method is called when a userspace process in the client makes an `access()` or
@@ -1220,34 +1175,6 @@ impl<FS: FileSystem> FileSystem for Arc<FS> {
         handle: Self::Handle,
     ) -> io::Result<()> {
         self.deref().releasedir(ctx, inode, flags, handle)
-    }
-
-    #[cfg(feature = "virtiofs")]
-    #[allow(clippy::too_many_arguments)]
-    fn setupmapping(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        foffset: u64,
-        len: u64,
-        flags: u64,
-        moffset: u64,
-        vu_req: &mut dyn FsCacheReqHandler,
-    ) -> io::Result<()> {
-        self.deref()
-            .setupmapping(ctx, inode, handle, foffset, len, flags, moffset, vu_req)
-    }
-
-    #[cfg(feature = "virtiofs")]
-    fn removemapping(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        requests: Vec<RemovemappingOne>,
-        vu_req: &mut dyn FsCacheReqHandler,
-    ) -> io::Result<()> {
-        self.deref().removemapping(ctx, inode, requests, vu_req)
     }
 
     fn access(&self, ctx: &Context, inode: Self::Inode, mask: u32) -> io::Result<()> {

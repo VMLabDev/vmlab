@@ -11,11 +11,11 @@ use std::thread;
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::{ForkResult, Pid, chdir, chroot, execve, fork, setsid};
+use nix::unistd::{ForkResult, Pid, chroot, execve, fork, setsid};
 
 use vmlab_cinit_proto::{CtlEvent, HealthSpec};
 
-use crate::container::Namespaces;
+use crate::container::{ExecIdentity, Namespaces};
 use crate::ctl::Ctl;
 use crate::mounts::ROOTFS;
 use crate::reap::Reaper;
@@ -30,6 +30,7 @@ fn run_check(
     c_env: &[CString],
     timeout: Duration,
     namespaces: &Namespaces,
+    identity: &ExecIdentity,
 ) -> bool {
     // SAFETY: same contract as the container fork — the child only makes
     // async-signal-safe calls before execve, with everything pre-allocated.
@@ -46,7 +47,8 @@ fn run_check(
                 Ok(ForkResult::Child) => {}
                 Err(_) => unsafe { libc::_exit(126) },
             }
-            if chroot(ROOTFS).is_err() || chdir("/").is_err() {
+            // As the workload runs (F58): its workdir, then its user.
+            if chroot(ROOTFS).is_err() || identity.apply().is_err() {
                 unsafe { libc::_exit(126) }
             }
             let _ = execve(c_exe, c_argv, c_env);
@@ -72,10 +74,11 @@ fn run_check(
 
 /// Spawn the healthcheck thread. `exited` stops the loop once the container
 /// is gone. The check command resolves inside the rootfs like the container
-/// itself and runs with the container's environment.
+/// itself and runs with the container's environment, user and workdir.
 pub fn spawn(
     spec: &HealthSpec,
     env: &[(String, String)],
+    identity: ExecIdentity,
     ctl: Arc<Ctl>,
     reaper: Arc<Reaper>,
     exited: Arc<AtomicBool>,
@@ -104,7 +107,15 @@ pub fn spawn(
         let mut consecutive_fails: u32 = 0;
         let mut state: Option<bool> = None; // None until the first report
         while !exited.load(Ordering::SeqCst) {
-            let pass = run_check(&reaper, &c_exe, &c_argv, &c_env, timeout, &namespaces);
+            let pass = run_check(
+                &reaper,
+                &c_exe,
+                &c_argv,
+                &c_env,
+                timeout,
+                &namespaces,
+                &identity,
+            );
             if exited.load(Ordering::SeqCst) {
                 break;
             }

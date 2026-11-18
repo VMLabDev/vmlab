@@ -31,6 +31,9 @@ pub mod pipewire;
 #[cfg(feature = "pulse")]
 pub mod pulse;
 
+#[cfg(all(test, any(feature = "pipewire", feature = "pulse")))]
+mod test_session;
+
 use std::sync::Arc;
 
 use crate::DeviceError;

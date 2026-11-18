@@ -58,6 +58,101 @@ fn terminal_runs_an_interactive_shell() {
     assert_eq!(code, 7);
 }
 
+/// A shell on a terminal starts with the signal state of a fresh process:
+/// the agent's ignored SIGPIPE and whatever mask the spawning thread holds
+/// survive `execve` unless the fork undoes them, and a shell with SIGPIPE
+/// ignored cannot end `yes | head`.
+#[test]
+fn a_terminal_shell_starts_with_default_signals() {
+    // Block a signal in the thread that forks the shell, as a library
+    // the agent links could.
+    // SAFETY: plain pthread_sigmask on this test thread with a local set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTerminal {
+            id: 4,
+            cols: 200,
+            rows: 24,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec grep -E '^Sig(Blk|Ign)' /proc/self/status".into(),
+            ]),
+            env: vec![],
+            logon: None,
+        },
+    );
+    // SAFETY: as above, undoing the block.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
+    let (out, _err, code) = cap.until_exited(4);
+    assert_eq!(code, 0);
+    let text = String::from_utf8_lossy(&out);
+    let mask = |field: &str| {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(field))
+            .unwrap_or_else(|| panic!("no {field} in {text}"));
+        u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+    };
+    assert_eq!(mask("SigBlk:"), 0, "the shell inherited a blocked mask");
+    // Signal n is bit n-1. Only SIGPIPE is the agent's own doing: whatever
+    // the agent was itself started ignoring is the guest's business.
+    let sigpipe = 1u64 << (libc::SIGPIPE - 1);
+    assert_eq!(
+        mask("SigIgn:") & sigpipe,
+        0,
+        "the shell inherited SIGPIPE ignored"
+    );
+}
+
+/// A background job keeps the terminal open after its shell has exited, and
+/// the session must still end: the host hears `exited` with the shell's
+/// code, not when the job finally lets go of the terminal.
+#[test]
+fn a_terminal_ends_while_a_background_job_holds_it() {
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenTerminal {
+            id: 5,
+            cols: 80,
+            rows: 24,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 60 & exit 3".into(),
+            ]),
+            env: vec![],
+            logon: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 5 });
+    let started = std::time::Instant::now();
+    let (_out, _err, code) = cap.until_exited(5);
+    assert_eq!(code, 3);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(9),
+        "the session waited on the background job"
+    );
+}
+
 #[test]
 fn terminal_resize_reaches_the_pty() {
     let (mux, mut cap) = capture_mux();
@@ -636,6 +731,101 @@ fn closing_the_channel_releases_every_handle() {
     ));
 }
 
+/// Code review F61d: one channel holds at most `MAX_HANDLES` handles, a
+/// close makes room again, and an offset that would pass `u64::MAX` is an
+/// error rather than a wrap (or a panic).
+#[test]
+fn fileops_caps_handles_and_refuses_an_overflowing_offset() {
+    use crate::fileops::MAX_HANDLES;
+    // Enough descriptors for the cap, where the hard limit allows it.
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    let want = (MAX_HANDLES as libc::rlim_t) * 4;
+    if lim.rlim_cur < want {
+        if lim.rlim_max < want {
+            eprintln!("skipped: RLIMIT_NOFILE hard limit {} too low", lim.rlim_max);
+            return;
+        }
+        lim.rlim_cur = want;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"data").unwrap();
+    let path = path.to_str().unwrap().to_string();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenFileOps {
+            id: 30,
+            logon: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 30 });
+    let open_one = |cap: &mut crate::testutil::Capture, req: u64| {
+        ask(
+            &mux,
+            30,
+            req,
+            Op::Open {
+                path: path.clone(),
+                flags: OpenFlags::create_truncate(),
+                mode: None,
+            },
+        );
+        cap.fileops(30).0.reply
+    };
+    let mut first = None;
+    for i in 0..MAX_HANDLES as u64 {
+        match open_one(&mut cap, i + 1) {
+            Reply::Handle { handle } => first = first.or(Some(handle)),
+            other => panic!("open {i} failed: {other:?}"),
+        }
+    }
+    match open_one(&mut cap, 5000) {
+        Reply::Error { msg, .. } => assert!(msg.contains("open handles"), "{msg}"),
+        other => panic!("expected the cap, got {other:?}"),
+    }
+    let handle = first.unwrap();
+
+    ask_with(
+        &mux,
+        30,
+        5001,
+        Op::Write {
+            handle,
+            offset: u64::MAX - 1,
+        },
+        b"xyz",
+    );
+    assert!(matches!(cap.fileops(30).0.reply, Reply::Error { .. }));
+    ask(
+        &mux,
+        30,
+        5002,
+        Op::Read {
+            handle,
+            offset: u64::MAX,
+            len: 8,
+        },
+    );
+    // Past the end: nothing to read, and no panic on the way.
+    let (reply, bytes) = cap.fileops(30);
+    assert!(matches!(reply.reply, Reply::Data | Reply::Error { .. }));
+    assert!(bytes.is_empty());
+
+    ask(&mux, 30, 5003, Op::Close { handle });
+    assert_eq!(cap.fileops(30).0.reply, Reply::Ok);
+    assert!(matches!(open_one(&mut cap, 5004), Reply::Handle { .. }));
+    mux.remove(30);
+}
+
 #[test]
 fn tail_sends_backlog_then_appends() {
     use std::io::Write;
@@ -668,6 +858,36 @@ fn tail_sends_backlog_then_appends() {
     std::fs::write(&path, "rotated content\n").unwrap();
     cap.data_until(9, b"rotated content");
     mux.remove(9);
+}
+
+/// Code review F61c: a FIFO at the path is refused at once rather than
+/// blocking the open until a writer comes; a directory is refused too.
+#[cfg(unix)]
+#[test]
+fn tail_refuses_a_fifo_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    for (id, path) in [(21, fifo.as_path()), (22, dir.path())] {
+        open(
+            &mux,
+            &p,
+            HostMsg::OpenTail {
+                id,
+                path: path.to_str().unwrap().into(),
+                logon: None,
+            },
+        );
+        match cap.ctrl() {
+            AgentMsg::Error { id: Some(got), msg } => {
+                assert_eq!(got, id);
+                assert!(msg.contains("not a regular file"), "{msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
 }
 
 #[test]

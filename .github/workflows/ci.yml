@@ -206,7 +206,7 @@ jobs:
     name: Calculate version
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     outputs:
       version: ${{ steps.calc.outputs.version }}
       prerelease: ${{ steps.calc.outputs.prerelease }}
@@ -220,6 +220,10 @@ jobs:
         # `just ci::release-version` (VML-104).
         run: |
           set -eu
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            printf 'do_release=false\nversion=0.0.0-dry-run\nprerelease=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           ./scripts/release-version.sh > "$RUNNER_TEMP/release.env"
           grep -E '^(do_release|version|prerelease)=' "$RUNNER_TEMP/release.env" >> "$GITHUB_OUTPUT"
 
@@ -252,7 +256,7 @@ jobs:
     # The whole merge bar, not only the host job: a release is never cut from
     # a commit any part of `ci::check` rejected.
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
-    if: needs.version.outputs.do_release == 'true'
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -291,7 +295,7 @@ jobs:
   vdisplay-build:
     name: Compile Windows display driver
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
-    if: needs.version.outputs.do_release == 'true'
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -327,7 +331,7 @@ jobs:
   vdisplay-sign:
     name: Catalog and test-sign Windows display driver
     needs: [version, vdisplay-build]
-    if: needs.version.outputs.do_release == 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version.outputs.do_release == 'true'
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
@@ -362,8 +366,13 @@ jobs:
     # This job installs the build container's toolchains directly on the runner.
     env:
       VMLAB_BUILD_ENV: '1'
-    needs: [version, check, hv-check, guest-crates, ebpf-verify, vdisplay-sign]
-    if: needs.version.outputs.do_release == 'true'
+    needs: [version, check, hv-check, guest-crates, ebpf-verify, vdisplay-build, vdisplay-sign]
+    # vdisplay-sign is deliberately skipped on release branches. Do not let
+    # that skip suppress the dry build, but never ignore a failed prerequisite.
+    if: >-
+      always() && !failure() && !cancelled() &&
+      (needs.version.outputs.do_release == 'true' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')))
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -409,9 +418,11 @@ jobs:
             guest/agent
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: vdisplay-signed
+          name: ${{ github.ref == 'refs/heads/main' && 'vdisplay-signed' || 'vdisplay-unsigned' }}
           path: guest/vdisplay-windows/target/signed-package
       - name: Build and package
+        env:
+          VMLAB_RELEASE_DRY_RUN: ${{ startsWith(github.ref, 'refs/heads/release/') && '1' || '0' }}
         run: just guest-package "${{ needs.version.outputs.version }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -425,7 +436,7 @@ jobs:
   hv-build:
     name: Build hypervisor bundle
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
-    if: needs.version.outputs.do_release == 'true'
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -463,25 +474,16 @@ jobs:
             target/dist/vmlab-hv-${{ needs.version.outputs.version }}-linux-x86_64.tar.gz.sha256
           retention-days: 1
 
-  # ── Release ───────────────────────────────────────────────────────────────
-  # Tag the commit and cut a GitHub (pre-)release with the binary and the
-  # guest and hypervisor bundles (and their checksums) attached.
-  release:
-    name: Create GitHub release
-    concurrency:
-      group: release
-      cancel-in-progress: false
+  # Prepare real build artifacts on release branches too, with read-only
+  # permissions and no signing tools or identity. Publication is main-only.
+  release-assets:
+    name: Prepare release assets (unsigned)
     needs: [version, build, guest-assets, hv-build, release-dry-run]
-    if: needs.version.outputs.do_release == 'true'
+    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
@@ -495,6 +497,43 @@ jobs:
         with:
           path: dist
           name: hv-assets
+      - name: Prepare checksums and provenance without signing
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          python3 scripts/release-assets.py dist "$VERSION"
+          cd dist
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-assets-unsigned
+          path: dist
+          retention-days: 1
+
+  # ── Release ───────────────────────────────────────────────────────────────
+  # Tag the commit and cut a GitHub (pre-)release with the binary and the
+  # guest and hypervisor bundles (and their checksums) attached.
+  release:
+    name: Create GitHub release
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    needs: [version, release-assets]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.version.outputs.do_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          name: release-assets-unsigned
       - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
         with:
           cosign-release: v2.6.1
@@ -503,7 +542,6 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -eu
-          python3 scripts/release-assets.py dist "$VERSION"
           cosign sign-blob --yes --bundle dist/SHA256SUMS.bundle dist/SHA256SUMS
           cosign verify-blob --bundle dist/SHA256SUMS.bundle \
             --certificate-identity https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main \

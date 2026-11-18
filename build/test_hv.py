@@ -3,6 +3,7 @@
 import configparser
 import hashlib
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -14,6 +15,24 @@ import hv
 
 
 class ViewerDesktopTest(unittest.TestCase):
+    def test_external_ci_output_paths(self):
+        probe = """
+import json, runpy
+hv = runpy.run_path('build/hv.py')
+ipxe = runpy.run_path('guest/ipxe/build.py')
+print(json.dumps([str(hv['CACHE']), str(ipxe['PROFILES']['hv']['output']),
+                  str(ipxe['PROFILES']['hv']['source'])]))
+"""
+        for root in ("", "/tmp/vmlab-external-output"):
+            with self.subTest(root=root):
+                env = dict(os.environ, VMLAB_TARGET_ROOT=root, PYTHONDONTWRITEBYTECODE="1")
+                paths = json.loads(subprocess.check_output(
+                    ["python3", "-c", probe], cwd=hv.ROOT, env=env, text=True))
+                base = Path(root) if root else hv.ROOT
+                output = base / "ipxe" if root else base / "hv/target/ipxe"
+                self.assertEqual(paths, [str(base / ".ci-cache"), str(output),
+                                         str(output / "upstream")])
+
     def test_virgl_cache_key_covers_applied_patches(self):
         self.assertEqual(len(hv.PATCHES), 3)
         expected = hashlib.sha256(b"".join(

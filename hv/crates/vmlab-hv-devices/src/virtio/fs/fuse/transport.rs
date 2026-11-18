@@ -675,3 +675,310 @@ pub fn pagesize() -> usize {
     // SAFETY: `sysconf(_SC_PAGESIZE)` only reads a constant.
     unsafe { sysconf(_SC_PAGESIZE) as usize }
 }
+
+#[cfg(test)]
+impl<'a> Reader<'a> {
+    /// A reader over plain memory, one buffer per slice, as a readable
+    /// descriptor chain with those lengths would give.
+    pub(crate) fn from_slices(bufs: Vec<&'a mut [u8]>) -> Reader<'a> {
+        Reader {
+            buffers: IoBuffers {
+                buffers: bufs.into_iter().map(VolatileSlice::from).collect(),
+                bytes_consumed: 0,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a> Writer<'a> {
+    /// A writer over plain memory, one buffer per slice, as a writable
+    /// descriptor chain with those lengths would give.
+    pub(crate) fn from_slices(bufs: Vec<&'a mut [u8]>) -> Writer<'a> {
+        Writer {
+            buffers: IoBuffers {
+                buffers: bufs.into_iter().map(VolatileSlice::from).collect(),
+                bytes_consumed: 0,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vm_memory::bitmap::{AtomicBitmap, Bitmap};
+
+    fn io_buffers<'a>(bufs: Vec<&'a mut [u8]>) -> IoBuffers<'a, ()> {
+        IoBuffers {
+            buffers: bufs.into_iter().map(VolatileSlice::from).collect(),
+            bytes_consumed: 0,
+        }
+    }
+
+    fn lengths<S: BitmapSlice>(buffers: &IoBuffers<'_, S>) -> Vec<usize> {
+        buffers.buffers.iter().map(|b| b.len()).collect()
+    }
+
+    // Ported from fuse-backend-rs 0.14.0, src/transport/mod.rs.
+    #[test]
+    fn test_io_buffers() {
+        let mut buf1 = [0x0u8; 16];
+        let mut buf2 = [0x0u8; 16];
+        let mut buffers = io_buffers(vec![&mut buf1[..], &mut buf2[..]]);
+
+        assert_eq!(buffers.available_bytes(), 32);
+        assert_eq!(buffers.bytes_consumed(), 0);
+
+        assert_eq!(
+            buffers.consume_for_read(2, |buf| Ok(buf[0].len())).unwrap(),
+            2
+        );
+        assert_eq!(buffers.available_bytes(), 30);
+        assert_eq!(buffers.bytes_consumed(), 2);
+
+        let mut buffers2 = buffers.split_at(10).unwrap();
+        assert_eq!(buffers.available_bytes(), 10);
+        assert_eq!(buffers.bytes_consumed(), 2);
+        assert_eq!(buffers2.available_bytes(), 20);
+        assert_eq!(buffers2.bytes_consumed(), 0);
+
+        assert_eq!(
+            buffers2
+                .consume_for_read(10, |buf| Ok(buf[0].len() + buf[1].len()))
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            buffers2
+                .consume_for_read(20, |buf| Ok(buf[0].len()))
+                .unwrap(),
+            10
+        );
+
+        let _buffers3 = buffers2.split_at(0).unwrap();
+        assert!(buffers2.split_at(1).is_err());
+    }
+
+    // Ported from fuse-backend-rs 0.14.0, src/transport/mod.rs.
+    #[test]
+    fn test_mark_dirty() {
+        let mut buf1 = vec![0x0u8; 16];
+        let bitmap1 = AtomicBitmap::new(16, std::num::NonZero::new(2).unwrap());
+
+        assert_eq!(bitmap1.len(), 8);
+        for i in 0..8 {
+            assert!(!bitmap1.is_bit_set(i));
+        }
+
+        let mut buf2 = vec![0x0u8; 16];
+        let bitmap2 = AtomicBitmap::new(16, std::num::NonZero::new(2).unwrap());
+        let mut bufs = VecDeque::new();
+
+        // SAFETY: each slice covers exactly its vector, which outlives the
+        // buffers and is not touched through any other path meanwhile.
+        unsafe {
+            bufs.push_back(VolatileSlice::with_bitmap(
+                buf1.as_mut_ptr(),
+                buf1.len(),
+                bitmap1.slice_at(0),
+                None,
+            ));
+            bufs.push_back(VolatileSlice::with_bitmap(
+                buf2.as_mut_ptr(),
+                buf2.len(),
+                bitmap2.slice_at(0),
+                None,
+            ));
+        }
+        let mut buffers = IoBuffers {
+            buffers: bufs,
+            bytes_consumed: 0,
+        };
+
+        assert_eq!(buffers.available_bytes(), 32);
+        assert_eq!(buffers.bytes_consumed(), 0);
+
+        assert_eq!(
+            buffers.consume_for_read(8, |buf| Ok(buf[0].len())).unwrap(),
+            8
+        );
+
+        assert_eq!(buffers.available_bytes(), 24);
+        assert_eq!(buffers.bytes_consumed(), 8);
+
+        for i in 0..8 {
+            assert!(!bitmap1.is_bit_set(i));
+        }
+
+        assert_eq!(
+            buffers
+                .consume(true, 16, |buf| Ok(buf[0].len() + buf[1].len()))
+                .unwrap(),
+            16
+        );
+        assert_eq!(buffers.available_bytes(), 8);
+        assert_eq!(buffers.bytes_consumed(), 24);
+        for i in 0..8 {
+            assert_eq!(bitmap1.is_bit_set(i), i >= 4, "bitmap1 bit {i}");
+            assert_eq!(bitmap2.is_bit_set(i), i < 4, "bitmap2 bit {i}");
+        }
+    }
+
+    #[test]
+    fn split_at_a_descriptor_border() {
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        let mut buffers = io_buffers(vec![&mut a[..], &mut b[..]]);
+        let other = buffers.split_at(16).unwrap();
+        assert_eq!(lengths(&buffers), [16]);
+        assert_eq!(lengths(&other), [16]);
+    }
+
+    #[test]
+    fn split_inside_a_descriptor() {
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        let mut buffers = io_buffers(vec![&mut a[..], &mut b[..]]);
+        let other = buffers.split_at(20).unwrap();
+        assert_eq!(lengths(&buffers), [16, 4]);
+        assert_eq!(lengths(&other), [12]);
+    }
+
+    #[test]
+    fn split_at_the_start_and_at_the_end() {
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        let mut buffers = io_buffers(vec![&mut a[..], &mut b[..]]);
+        let other = buffers.split_at(0).unwrap();
+        assert_eq!(buffers.available_bytes(), 0);
+        assert_eq!(lengths(&other), [16, 16]);
+
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        let mut buffers = io_buffers(vec![&mut a[..], &mut b[..]]);
+        let other = buffers.split_at(32).unwrap();
+        assert_eq!(lengths(&buffers), [16, 16]);
+        assert_eq!(other.available_bytes(), 0);
+    }
+
+    #[test]
+    fn split_past_the_end_is_refused() {
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        let mut buffers = io_buffers(vec![&mut a[..], &mut b[..]]);
+        assert!(matches!(
+            buffers.split_at(33),
+            Err(Error::SplitOutOfBounds(33))
+        ));
+        assert_eq!(lengths(&buffers), [16, 16]);
+    }
+
+    #[test]
+    fn an_object_split_across_descriptors_reads_whole() {
+        let value: u64 = 0x0102_0304_0506_0708;
+        let bytes = value.to_ne_bytes();
+        let (mut a, mut b, mut c) = ([0u8; 3], [0u8; 1], [0u8; 4]);
+        a.copy_from_slice(&bytes[..3]);
+        b.copy_from_slice(&bytes[3..4]);
+        c.copy_from_slice(&bytes[4..]);
+        let mut reader = Reader::from_slices(vec![&mut a[..], &mut b[..], &mut c[..]]);
+        assert_eq!(reader.read_obj::<u64>().unwrap(), value);
+        assert_eq!(reader.available_bytes(), 0);
+        assert_eq!(reader.bytes_read(), 8);
+    }
+
+    #[test]
+    fn an_object_split_across_descriptors_writes_whole() {
+        let value: u64 = 0x0102_0304_0506_0708;
+        let (mut a, mut b) = ([0u8; 5], [0u8; 3]);
+        {
+            let mut writer = Writer::from_slices(vec![&mut a[..], &mut b[..]]);
+            writer.write_obj(value).unwrap();
+            assert_eq!(writer.bytes_written(), 8);
+            assert_eq!(writer.available_bytes(), 0);
+            assert!(writer.write_obj(0u8).is_err());
+        }
+        let mut joined = a.to_vec();
+        joined.extend_from_slice(&b);
+        assert_eq!(joined, value.to_ne_bytes());
+    }
+
+    #[test]
+    fn zero_length_descriptors_are_skipped_by_split() {
+        let (mut z0, mut z1, mut z2, mut z3) = ([0u8; 0], [0u8; 0], [0u8; 0], [0u8; 0]);
+        let (mut a, mut b) = ([0u8; 8], [0u8; 8]);
+        let mut buffers = io_buffers(vec![
+            &mut z0[..],
+            &mut a[..],
+            &mut z1[..],
+            &mut z2[..],
+            &mut b[..],
+            &mut z3[..],
+        ]);
+        assert_eq!(buffers.available_bytes(), 16);
+        let other = buffers.split_at(8).unwrap();
+        assert_eq!(lengths(&buffers), [0, 8, 0, 0]);
+        assert_eq!(lengths(&other), [8, 0]);
+
+        let (mut z0, mut z1) = ([0u8; 0], [0u8; 0]);
+        let mut a = [0u8; 8];
+        let mut buffers = io_buffers(vec![&mut z0[..], &mut a[..], &mut z1[..]]);
+        let other = buffers.split_at(8).unwrap();
+        assert_eq!(buffers.available_bytes(), 8);
+        assert_eq!(other.available_bytes(), 0);
+        assert!(buffers.split_at(9).is_err());
+    }
+
+    #[test]
+    fn zero_length_descriptors_carry_no_bytes_through_a_read() {
+        let (mut z0, mut z1, mut z2) = ([0u8; 0], [0u8; 0], [0u8; 0]);
+        let mut a = [1u8, 2, 3];
+        let mut b = [4u8, 5];
+        let mut reader = Reader::from_slices(vec![
+            &mut z0[..],
+            &mut a[..],
+            &mut z1[..],
+            &mut b[..],
+            &mut z2[..],
+        ]);
+        let mut out = [0u8; 8];
+        let mut read = 0;
+        loop {
+            let n = reader.read(&mut out[read..]).unwrap();
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        assert_eq!(&out[..read], &[1, 2, 3, 4, 5]);
+        assert_eq!(reader.bytes_read(), 5);
+        assert_eq!(reader.available_bytes(), 0);
+    }
+
+    #[test]
+    fn a_chain_of_only_zero_length_descriptors_is_empty() {
+        let (mut z0, mut z1) = ([0u8; 0], [0u8; 0]);
+        let mut reader = Reader::from_slices(vec![&mut z0[..], &mut z1[..]]);
+        assert_eq!(reader.available_bytes(), 0);
+        let mut out = [0u8; 4];
+        assert_eq!(reader.read(&mut out).unwrap(), 0);
+        let err = reader.read_obj::<u32>().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        let (mut z0, mut z1) = ([0u8; 0], [0u8; 0]);
+        let mut writer = Writer::from_slices(vec![&mut z0[..], &mut z1[..]]);
+        assert_eq!(writer.write(&[]).unwrap(), 0);
+        assert!(writer.write(&[1]).is_err());
+        assert_eq!(writer.bytes_written(), 0);
+    }
+
+    #[test]
+    fn zero_length_descriptors_carry_no_bytes_through_a_write() {
+        let (mut z0, mut z1) = ([0u8; 0], [0u8; 0]);
+        let (mut a, mut b) = ([0u8; 2], [0u8; 3]);
+        {
+            let mut writer =
+                Writer::from_slices(vec![&mut a[..], &mut z0[..], &mut z1[..], &mut b[..]]);
+            writer.write_all(&[9, 8, 7, 6, 5]).unwrap();
+            assert_eq!(writer.bytes_written(), 5);
+        }
+        assert_eq!(a, [9, 8]);
+        assert_eq!(b, [7, 6, 5]);
+    }
+}

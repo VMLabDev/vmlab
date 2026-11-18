@@ -242,6 +242,53 @@ pub fn info(path: &Path) -> Result<ImageInfo> {
     }
 }
 
+/// Inspect one image's own header, like `qemu-img info` without
+/// `--backing-chain`: the backing chain is not opened, so an image whose
+/// backing file is missing still answers. `chain` holds the image alone.
+pub fn info_header(path: &Path) -> Result<ImageInfo> {
+    let actual_size = actual_size(path)?;
+    let (format, virtual_size, img) = match probe_format(path)? {
+        Format::Raw => ("raw", std::fs::metadata(path)?.len(), None),
+        Format::Qcow2 => {
+            let img = Qcow2Image::open_header(path)?;
+            ("qcow2", img.size(), Some(img))
+        }
+    };
+    let snapshots = match &img {
+        Some(img) => img
+            .snapshots()?
+            .into_iter()
+            .map(|s| SnapshotJson {
+                id: s.id,
+                name: s.name,
+                vm_state_size: s.vm_state_size,
+                date_sec: s.date_sec,
+                date_nsec: s.date_nsec,
+                vm_clock_nsec: s.vm_clock_nsec,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(ImageInfo {
+        format: format.into(),
+        virtual_size,
+        actual_size,
+        backing_file: img
+            .as_ref()
+            .and_then(|i| i.backing_file_name().map(str::to_string)),
+        full_backing_file: img.as_ref().and_then(Qcow2Image::backing_file_path),
+        backing_file_format: img
+            .as_ref()
+            .and_then(|i| i.backing_format().map(str::to_string)),
+        snapshots,
+        chain: vec![ChainEntry {
+            filename: absolute(path),
+            format: format.into(),
+            virtual_size,
+        }],
+    })
+}
+
 fn absolute(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -431,4 +478,29 @@ pub fn commit(top: &Path) -> Result<()> {
         Ok(())
     })?;
     backing.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header-only inspection answers for an image whose backing file is
+    /// gone, which the full chain walk cannot.
+    #[test]
+    fn info_header_survives_a_missing_backing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.qcow2");
+        let top = dir.path().join("top.qcow2");
+        create_qcow2(&base, 1 << 20, None, None).unwrap();
+        create_linked_clone(&base, &top).unwrap();
+        snapshot_create(&top, "one").unwrap();
+        let recorded = base.canonicalize().unwrap();
+        std::fs::remove_file(&base).unwrap();
+        assert!(info(&top).is_err());
+        let i = info_header(&top).unwrap();
+        assert_eq!(i.virtual_size, 1 << 20);
+        assert_eq!(i.full_backing_file, Some(recorded));
+        assert_eq!(i.snapshots.len(), 1);
+        assert_eq!(i.snapshots[0].name, "one");
+    }
 }

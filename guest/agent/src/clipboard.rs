@@ -24,6 +24,72 @@ use crate::mux::Mux;
 pub const NO_DESKTOP_LOGON: &str = "no one is logged on to the desktop; the Windows clipboard \
      belongs to an interactive session (it works once a user logs on)";
 
+/// The most clipboard text the agent reads from wherever the guest keeps it
+/// (code review F61b). The reply is one control frame, which cannot carry
+/// more, so reading further would only hold a hostile helper's output in
+/// memory to fail with afterwards.
+#[cfg(unix)]
+pub const MAX_CLIPBOARD: usize = vmlab_agent_proto::MAX_PAYLOAD;
+
+/// What a clipboard tool printed, read no further than [`MAX_CLIPBOARD`].
+/// Linux reads only `stdout`; macOS reports `status` and `stderr` too.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub struct ToolOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    /// The first few KiB of its stderr, where the caller piped it.
+    pub stderr: Vec<u8>,
+}
+
+/// Run a clipboard tool (`wl-paste`, `xclip -o`, `pbpaste`) and read its
+/// stdout up to [`MAX_CLIPBOARD`] bytes. A tool that prints more is killed
+/// and the read refused, rather than buffered whole as `output()` would.
+#[cfg(unix)]
+pub fn tool_output(cmd: &mut std::process::Command) -> std::io::Result<ToolOutput> {
+    use std::io::Read;
+    use std::process::Stdio;
+    const STDERR_CAP: u64 = 4096;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).spawn()?;
+    let mut stdout = Vec::new();
+    let read = match child.stdout.take() {
+        Some(out) => out
+            .take(MAX_CLIPBOARD as u64 + 1)
+            .read_to_end(&mut stdout)
+            .map(|_| ()),
+        None => Ok(()),
+    };
+    if read.is_err() || stdout.len() > MAX_CLIPBOARD {
+        let _ = child.kill();
+        let _ = child.wait();
+        read?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the clipboard holds more than {MAX_CLIPBOARD} bytes"),
+        ));
+    }
+    let mut stderr = Vec::new();
+    if let Some(err) = child.stderr.take() {
+        let _ = err.take(STDERR_CAP).read_to_end(&mut stderr);
+    }
+    let status = child.wait()?;
+    Ok(ToolOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// The UTF-16 text before the first NUL in `units`, or all of them where
+/// there is none (code review F59). The Windows helper hands it the whole of
+/// the clipboard's allocation as `GlobalSize` reports it, so the scan for the
+/// terminator can never run past what the owner actually allocated.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn until_nul(units: &[u16]) -> &[u16] {
+    let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    &units[..len]
+}
+
 /// Answer a `set_clipboard`.
 pub fn answer_set(mux: &Mux, outcome: Result<(), String>) {
     mux.send_ctrl(&match outcome {
@@ -183,6 +249,31 @@ mod tests {
                 msg: NO_DESKTOP_LOGON.into()
             }
         );
+    }
+
+    #[test]
+    fn the_terminator_scan_stops_at_the_allocation() {
+        assert_eq!(until_nul(&[104, 105, 0, 120]), &[104, 105]);
+        assert_eq!(until_nul(&[104, 105]), &[104, 105], "no NUL: all of it");
+        assert_eq!(until_nul(&[]), &[] as &[u16]);
+        assert_eq!(until_nul(&[0, 104]), &[] as &[u16]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clipboard_tool_is_read_no_further_than_the_cap() {
+        let mut over = std::process::Command::new("/bin/sh");
+        over.args(["-c", "head -c 200000 /dev/zero"]);
+        let err = tool_output(&mut over)
+            .err()
+            .expect("past the cap is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut under = std::process::Command::new("/bin/sh");
+        under.args(["-c", "printf hello"]);
+        let out = tool_output(&mut under).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"hello");
     }
 
     #[test]

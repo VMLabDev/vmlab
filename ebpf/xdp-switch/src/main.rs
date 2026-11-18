@@ -88,7 +88,11 @@ pub fn xdp_switch(ctx: XdpContext) -> u32 {
         bump(STAT_DROPPED);
         return xdp_action::XDP_DROP; // runt
     };
-    let verdict = classify_xdp_guest(conf.flags, conf.tag, &dst, |mac| unsafe {
+    let Some(src) = (unsafe { ptr_at::<[u8; 6]>(&ctx, 6).map(|p| *p) }) else {
+        bump(STAT_DROPPED);
+        return xdp_action::XDP_DROP;
+    };
+    let verdict = classify_xdp_guest(conf.flags, conf.tag, &dst, &src, |mac| unsafe {
         MAC_TABLE.get(mac).copied()
     });
     match verdict {

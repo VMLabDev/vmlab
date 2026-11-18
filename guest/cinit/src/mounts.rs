@@ -4,31 +4,43 @@
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nix::mount::{MsFlags, mount};
 
-use crate::util::{Ctx, Result};
+use crate::util::{Ctx, Result, in_root, write_in_root};
 
 /// Container rootfs mount point (overlay of squashfs + scratch).
 pub const ROOTFS: &str = "/rootfs";
 const ROOTFS_RO: &str = "/rootfs-ro";
 const SCRATCH: &str = "/scratch";
 
-pub fn ensure_dir(path: &str) -> Result<()> {
-    fs::create_dir_all(path).ctx(&format!("mkdir -p {path}"))
+pub fn ensure_dir<P: AsRef<Path> + ?Sized>(path: &P) -> Result<()> {
+    let path = path.as_ref();
+    fs::create_dir_all(path).ctx(&format!("mkdir -p {}", path.display()))
 }
 
-fn do_mount(
+/// The directory `path` names inside the container rootfs, resolved there
+/// (F56: an image symlink cannot point a mount outside the rootfs) and
+/// created if absent.
+fn rootfs_dir(path: &str) -> Result<PathBuf> {
+    let dir = in_root(ROOTFS, path)?;
+    ensure_dir(&dir)?;
+    Ok(dir)
+}
+
+fn do_mount<P: AsRef<Path> + ?Sized>(
     source: &str,
-    target: &str,
+    target: &P,
     fstype: &str,
     flags: MsFlags,
     data: Option<&str>,
 ) -> Result<()> {
+    let target = target.as_ref();
     mount(Some(source), target, Some(fstype), flags, data).ctx(&format!(
         "mount -t {fstype} {source} {target} ({data})",
+        target = target.display(),
         data = data.unwrap_or("-")
     ))
 }
@@ -128,8 +140,7 @@ pub fn mount_container_root(root_dev: &str, scratch_dev: &str) -> Result<()> {
 /// virtiofsd has the flag, and refuses online snapshots where not), which is
 /// exactly what an online snapshot stores.
 pub fn mount_virtiofs(tag: &str, target: &str, read_only: bool) -> Result<()> {
-    let inside = format!("{ROOTFS}/{}", target.trim_start_matches('/'));
-    ensure_dir(&inside)?;
+    let inside = rootfs_dir(target)?;
     let flags = if read_only {
         MsFlags::MS_RDONLY
     } else {
@@ -154,8 +165,7 @@ pub fn mount_volume(
     target: &str,
     read_only: bool,
 ) -> Result<()> {
-    let inside = format!("{ROOTFS}/{}", target.trim_start_matches('/'));
-    ensure_dir(&inside)?;
+    let inside = rootfs_dir(target)?;
     let source = format!("//{}/{}", smb.gateway, share);
     let opts = format!(
         "username={},password={},vers=3.0,ip={},echo_interval=5",
@@ -170,54 +180,58 @@ pub fn mount_volume(
     // carries the SMB credential — keep that out of the console log.
     mount(
         Some(source.as_str()),
-        inside.as_str(),
+        inside.as_path(),
         Some("cifs"),
         flags,
         Some(opts.as_str()),
     )
-    .ctx(&format!("mount -t cifs {source} {inside}"))
+    .ctx(&format!("mount -t cifs {source} {}", inside.display()))
 }
 
 /// The runtime mounts every container expects: /proc, /sys, /dev, /dev/pts,
-/// /dev/shm and a tmpfs /tmp under the container rootfs.
+/// /dev/shm and a tmpfs /tmp under the container rootfs. Each target is
+/// resolved inside the rootfs just before it is mounted (F56), so an image
+/// symlink such as `/tmp -> /` cannot put a mount on the micro-VM's own tree.
 pub fn mount_rootfs_runtime() -> Result<()> {
-    for d in [
-        "/rootfs/proc",
-        "/rootfs/sys",
-        "/rootfs/dev",
-        "/rootfs/tmp",
-        "/rootfs/etc",
-    ] {
-        ensure_dir(d)?;
-    }
-    do_mount("proc", "/rootfs/proc", "proc", MsFlags::empty(), None)?;
-    do_mount("sysfs", "/rootfs/sys", "sysfs", MsFlags::empty(), None)?;
+    rootfs_dir("/etc")?;
+    do_mount(
+        "proc",
+        &rootfs_dir("/proc")?,
+        "proc",
+        MsFlags::empty(),
+        None,
+    )?;
+    do_mount(
+        "sysfs",
+        &rootfs_dir("/sys")?,
+        "sysfs",
+        MsFlags::empty(),
+        None,
+    )?;
     do_mount(
         "devtmpfs",
-        "/rootfs/dev",
+        &rootfs_dir("/dev")?,
         "devtmpfs",
         MsFlags::empty(),
         None,
     )?;
-    ensure_dir("/rootfs/dev/pts")?;
-    ensure_dir("/rootfs/dev/shm")?;
     do_mount(
         "devpts",
-        "/rootfs/dev/pts",
+        &rootfs_dir("/dev/pts")?,
         "devpts",
         MsFlags::empty(),
         Some("gid=5,mode=620,ptmxmode=666"),
     )?;
     do_mount(
         "tmpfs",
-        "/rootfs/dev/shm",
+        &rootfs_dir("/dev/shm")?,
         "tmpfs",
         MsFlags::empty(),
         Some("mode=1777"),
     )?;
     do_mount(
         "tmpfs",
-        "/rootfs/tmp",
+        &rootfs_dir("/tmp")?,
         "tmpfs",
         MsFlags::empty(),
         Some("mode=1777"),
@@ -233,28 +247,30 @@ pub fn mount_rootfs_runtime() -> Result<()> {
 pub fn install_shell_fallback() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
-    let dir = format!("{ROOTFS}/.vmlab");
-    let dest = format!("{dir}/busybox");
-    let bin_dir = format!("{ROOTFS}{}", vmlab_agent_proto::BUSYBOX_BIN_DIR);
-    let result = fs::create_dir_all(&dir)
-        .and_then(|()| fs::copy("/bin/busybox", &dest).map(|_| ()))
-        .and_then(|()| fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)))
-        .and_then(|()| fs::create_dir_all(&bin_dir))
-        .and_then(|()| {
-            let output = Command::new("/bin/busybox").arg("--list").output()?;
-            if !output.status.success() {
-                return Err(std::io::Error::other("busybox --list failed"));
+    // Paths resolved inside the rootfs (F56): an image's own `/.vmlab`
+    // symlink must not aim this copy at the initramfs.
+    let result = (|| -> Result<()> {
+        rootfs_dir("/.vmlab")?;
+        let dest = in_root(ROOTFS, vmlab_agent_proto::BUSYBOX_FALLBACK)?;
+        fs::copy("/bin/busybox", &dest).ctx("copy busybox")?;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).ctx("chmod busybox")?;
+        let bin_dir = rootfs_dir(vmlab_agent_proto::BUSYBOX_BIN_DIR)?;
+        let output = Command::new("/bin/busybox")
+            .arg("--list")
+            .output()
+            .ctx("run busybox --list")?;
+        if !output.status.success() {
+            return Err("busybox --list failed".into());
+        }
+        for applet in String::from_utf8_lossy(&output.stdout).lines() {
+            match symlink("../busybox", bin_dir.join(applet)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("link {applet}: {e}")),
             }
-            for applet in String::from_utf8_lossy(&output.stdout).lines() {
-                let link = format!("{bin_dir}/{applet}");
-                match symlink("../busybox", &link) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(())
-        });
+        }
+        Ok(())
+    })();
     if let Err(e) = result {
         eprintln!("vmlab-cinit: warning: busybox shell fallback not installed: {e}");
     }
@@ -262,14 +278,24 @@ pub fn install_shell_fallback() {
 
 /// Write /etc/hostname and /etc/hosts inside the rootfs and set the (shared —
 /// v1 keeps the container in the init UTS namespace) kernel hostname.
+///
+/// The files are the image's (F56): resolved inside the rootfs, and a
+/// failure to write one — an image whose `/etc/hosts` is a link to nowhere —
+/// is a warning, not a reason to power the VM off.
 pub fn write_identity(hostname: &str) -> Result<()> {
     nix::unistd::sethostname(hostname).ctx("sethostname")?;
-    fs::write("/rootfs/etc/hostname", format!("{hostname}\n")).ctx("write /etc/hostname")?;
-    fs::write(
-        "/rootfs/etc/hosts",
-        format!("127.0.0.1\tlocalhost\n127.0.1.1\t{hostname}\n"),
-    )
-    .ctx("write /etc/hosts")?;
+    let files = [
+        ("/etc/hostname", format!("{hostname}\n")),
+        (
+            "/etc/hosts",
+            format!("127.0.0.1\tlocalhost\n127.0.1.1\t{hostname}\n"),
+        ),
+    ];
+    for (path, contents) in &files {
+        if let Err(e) = write_in_root(ROOTFS, path, contents) {
+            eprintln!("vmlab-cinit: warning: {path} not written: {e}");
+        }
+    }
     Ok(())
 }
 

@@ -41,6 +41,7 @@ to the one in `Cargo.toml`.
 | File | Built by |
 | --- | --- |
 | `vmlab-<version>-linux-x86_64` | `cargo build --release --bin vmlab`, named as CI names the release asset |
+| `vmlab-fastpath-<version>-linux-x86_64` | `cargo build --release --bin vmlab-fastpath`: the eBPF fast path's privileged helper, the only binary `install.sh` grants CAP_BPF and CAP_NET_ADMIN |
 | `vmlab-guest-<version>.tar.gz` and `.sha256` | `just guest-package`, which fails if any target is missing |
 | `vmlab-hv-<version>-linux-x86_64.tar.gz` and `.sha256` | `just ci::hv-package`, using the in-tree `hv/` crates and root `Cargo.lock` |
 | `bpf/fastpath_sockmap.bpf.o`, `bpf/xdp_switch.bpf.o` | `just ebpf-build` |

@@ -356,7 +356,17 @@ pub(super) fn build_container(
     // template layer). §5.1 validation has already rejected a container no
     // layer sizes.
     let resolved = crate::qemu::resolve_container(c_cfg, arch, cx.profiles)?;
-    let hypervisor = hypervisor_for(cx, MachineCfg::Container(c_cfg), None)?;
+    let existing = c_state.existing_hypervisor(&dirs.local).or_else(|| {
+        (dirs.scratch_disk().exists() || dirs.qmp_sock().exists()).then_some(HypervisorKind::Qemu)
+    });
+    let selection = cx.host.hypervisor.select(
+        MachineCfg::Container(c_cfg),
+        &crate::config::hypervisor::HostFacts::probe(),
+        None,
+        existing,
+    );
+    let hypervisor = checked_hypervisor(MachineCfg::Container(c_cfg), None, selection.kind)?;
+    c_state.hypervisor = Some(hypervisor);
     let container = ContainerInstance::new(
         cx.lab,
         c_cfg.clone(),
@@ -369,7 +379,10 @@ pub(super) fn build_container(
         hypervisor,
         super::hypervisor::for_machine(hypervisor, cx.host, false),
     );
-    Ok((container, pending))
+    Ok((
+        container.with_hypervisor_fallback(selection.fallback_reason),
+        pending,
+    ))
 }
 
 /// The hypervisor `machine` runs on (§22), refusing — in validation's words,
@@ -377,24 +390,6 @@ pub(super) fn build_container(
 /// first; this is the daemon not taking its word for it, since a host config
 /// edited since can move a machine onto vmlab-hv without touching the lab
 /// file.
-fn hypervisor_for(
-    cx: &BuildContext<'_>,
-    machine: MachineCfg<'_>,
-    hardware: Option<&crate::qemu::ResolvedVm>,
-) -> Result<HypervisorKind> {
-    let kind = cx
-        .host
-        .hypervisor
-        .select(
-            machine,
-            &crate::config::hypervisor::HostFacts::probe(),
-            hardware,
-            None,
-        )
-        .kind;
-    checked_hypervisor(machine, hardware, kind)
-}
-
 fn checked_hypervisor(
     machine: MachineCfg<'_>,
     hardware: Option<&crate::qemu::ResolvedVm>,

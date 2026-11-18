@@ -43,11 +43,14 @@ const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 pub fn net_info() -> Result<Vec<NetInterface>, String> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut len: u32 = 16 * 1024;
-    let mut buf: Vec<u8>;
+    // `u64`s, not bytes: the API lays IP_ADAPTER_ADDRESSES_LH records (8-byte
+    // aligned) from the buffer's start, and a byte vector promises no more
+    // than 1-byte alignment (code review F61f).
+    let mut buf: Vec<u64>;
     // Size-then-fetch loop: the table can grow between the two calls.
     loop {
-        buf = vec![0u8; len as usize];
-        // SAFETY: buffer of `len` bytes; the API writes a linked list into it.
+        buf = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: buffer of at least `len` bytes; the API writes a linked list into it.
         let rc = unsafe {
             GetAdaptersAddresses(
                 0, // AF_UNSPEC

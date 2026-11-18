@@ -46,21 +46,41 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What a cached logon is keyed on. The machine is the cache; the label
 /// deliberately is not part of it.
+///
+/// The secret is held as its SHA-256 digest (code review F61g): enough to
+/// tell a changed password from the same one, and no copy of the password
+/// itself sits in the cache, or in a `Debug` of the key, for the ten hours
+/// a logon lives.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LogonKey {
     account: String,
-    secret: String,
+    secret: [u8; 32],
     elevated: bool,
 }
 
 impl LogonKey {
     pub fn new(account: &str, secret: &str, elevated: bool) -> LogonKey {
+        use sha2::{Digest, Sha256};
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&Sha256::digest(secret.as_bytes()));
         LogonKey {
             account: account.to_string(),
-            secret: secret.to_string(),
+            secret: digest,
             elevated,
         }
     }
+}
+
+/// Overwrite `buf` with zeroes in a way the compiler may not drop as a dead
+/// store: what a copy of a password is wiped with once the call that needed
+/// it returns (code review F61g).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn wipe<T: Copy + Default>(buf: &mut [T]) {
+    for slot in buf.iter_mut() {
+        // SAFETY: `slot` is a valid, aligned, exclusive reference.
+        unsafe { std::ptr::write_volatile(slot, T::default()) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// A minted logon and when it was minted. Handed out behind an `Arc` so a
@@ -236,6 +256,19 @@ pub fn share_session_command(run_value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Code review F61g: the key keeps no copy of the password, yet still
+    /// tells a changed one apart; `wipe` zeroes a buffer.
+    #[test]
+    fn the_key_holds_no_plaintext_secret_and_wipe_zeroes() {
+        let key = LogonKey::new("dev", "hunter2-secret", false);
+        assert!(!format!("{key:?}").contains("hunter2"));
+        assert_eq!(key, LogonKey::new("dev", "hunter2-secret", false));
+        assert_ne!(key, LogonKey::new("dev", "hunter3-secret", false));
+        let mut buf: Vec<u16> = "hunter2".encode_utf16().collect();
+        wipe(&mut buf);
+        assert!(buf.iter().all(|&u| u == 0));
+    }
 
     /// A stand-in for the platform's token: counts how many were minted and
     /// records the drop, which on Windows is where the profile is unloaded.

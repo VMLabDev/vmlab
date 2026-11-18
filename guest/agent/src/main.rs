@@ -30,6 +30,9 @@ mod rdp;
 #[cfg(any(windows, test))]
 mod rtc;
 mod spawn;
+// What the Windows service reports to the SCM: portable like `rdp`.
+#[cfg(any(windows, test))]
+mod svc;
 mod tail;
 mod terminal;
 // The recursive tree watch has a backend on Linux (inotify) and Windows
@@ -62,7 +65,7 @@ use windows as platform_impl;
 
 /// Platform functions the portable modules call directly.
 pub mod platform {
-    pub use crate::platform_impl::{cpu_pct, cpu_sample, disk_sample, kill_process, mem_sample};
+    pub use crate::platform_impl::{cpu_pct, cpu_sample, disk_sample, mem_sample, process_killer};
 }
 
 use std::io::Read;
@@ -184,6 +187,18 @@ type PlatformImpl = windows::WindowsPlatform;
 fn run_with(platform: PlatformImpl) -> ! {
     let (mut port_r, port_w) = platform_impl::open_port();
     let mux = Mux::new(port_w);
+    #[cfg(unix)]
+    if unix::is_legacy_serial() {
+        let announcer = mux.clone();
+        std::thread::spawn(move || {
+            loop {
+                // A queued announcement survives concurrent session writes and
+                // lets an ISA-serial host reconnect without speaking first.
+                announcer.announce_serial();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
+    }
     #[cfg(windows)]
     platform.start_clipboard(&mux);
     eprintln!(

@@ -14,9 +14,18 @@
 //! startup and degrades to the userspace switch on any failure, so the PRD's
 //! rootless / no-CAP_NET_ADMIN guarantee (§1.1, §13, §14) holds on hosts
 //! without privileges — those simply keep today's path.
+//!
+//! The daemons never hold those capabilities themselves (F21). Every
+//! privileged step — creating taps, loading and attaching the BPF objects,
+//! writing their maps — is a request to `vmlab-fastpath` (`helper/`), the
+//! only binary `install.sh` grants CAP_BPF and CAP_NET_ADMIN.
 
 #[cfg(feature = "ebpf")]
 mod afxdp;
+#[cfg(feature = "ebpf")]
+mod engine;
+#[cfg(feature = "ebpf")]
+pub mod helper;
 #[cfg(all(test, feature = "ebpf"))]
 mod priv_tests;
 #[cfg(feature = "ebpf")]
@@ -142,6 +151,11 @@ pub fn init(mode: FastpathMode) -> FastpathTier {
             );
             for (tier, reason) in &status.reasons {
                 tracing::info!("fast-path tier {tier} unavailable: {reason}");
+            }
+            // No kernel tier: nothing will ask the helper anything again.
+            #[cfg(feature = "ebpf")]
+            if status.tier == FastpathTier::Userspace {
+                helper::client::release();
             }
             status
         })

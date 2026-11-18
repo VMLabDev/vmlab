@@ -658,6 +658,29 @@ fn socket_receive_applies_fifo_backpressure_and_accepts_reconnection() {
 }
 
 #[test]
+fn a_hung_up_client_loses_the_bytes_the_guest_had_not_taken() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("agent.sock");
+    let mut serial = socket_serial(&path);
+    configure(&mut serial, 1, 3, 1);
+    let bytes: Vec<u8> = (0..32).collect();
+    let mut client = UnixStream::connect(&path).unwrap();
+    client.write_all(&bytes).unwrap();
+    serial.advance(0);
+    // As QEMU's socket chardev: the FIFO keeps what it took, the rest goes.
+    drop(client);
+    for byte in &bytes[..16] {
+        assert_eq!(read(&mut serial, 0), *byte);
+    }
+    serial.advance(0);
+    assert_eq!(read(&mut serial, 5) & 1, 0);
+    let mut client = UnixStream::connect(&path).unwrap();
+    client.write_all(b"z").unwrap();
+    serial.advance(0);
+    assert_eq!(read(&mut serial, 0), b'z');
+}
+
+#[test]
 fn a_blocked_socket_keeps_accepted_transmit_bytes_until_the_client_reads() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("agent.sock");

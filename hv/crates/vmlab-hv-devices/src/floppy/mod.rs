@@ -712,8 +712,8 @@ impl Floppy {
     /// Move to the next sector; true at the end of the cylinder.
     fn step(&mut self, drive: usize, eot: u8, multitrack: bool) -> bool {
         let at = &mut self.drives[drive].at;
-        at.sect = at.sect.wrapping_add(1);
-        if at.sect <= eot {
+        if at.sect < eot {
+            at.sect += 1;
             return false;
         }
         at.sect = 1;
@@ -936,7 +936,11 @@ impl Snapshot for Floppy {
             let valid = execution.command.len() >= 2
                 && execution.command.len() == command_length(execution.command[0])
                 && (execution.pio.is_empty() || execution.pio.len() == SECTOR)
-                && execution.pio_position <= execution.pio.len()
+                && (if execution.pio.is_empty() {
+                    execution.pio_position == 0
+                } else {
+                    execution.pio_position < execution.pio.len()
+                })
                 && execution.remaining_ns <= READ_ID_NS
                 && saved.phase == Phase::Execution;
             if !valid {

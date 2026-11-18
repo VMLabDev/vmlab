@@ -7,8 +7,8 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::Arc;
 
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
@@ -20,13 +20,12 @@ use vmlab_cinit_proto::ContainerSpec;
 
 use crate::mounts::ROOTFS;
 use crate::users::ResolvedUser;
-use crate::util::{Ctx, Result};
+use crate::util::{Ctx, Result, in_root};
 
 pub(crate) const DEFAULT_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 const CLONE_STACK_SIZE: usize = 1024 * 1024;
-const ROOTFS_PROC: &str = "/rootfs/proc";
 
 /// Open namespace handles remain valid across workload exec and are shared
 /// with shell and healthcheck threads.
@@ -80,15 +79,19 @@ pub fn build_env(spec: &ContainerSpec, user: Option<&ResolvedUser>) -> Vec<(Stri
 /// with a slash is taken as-is, otherwise each PATH entry is searched under
 /// `rootfs`. Doing this pre-fork keeps the post-fork child async-signal-safe
 /// (no allocation) and gives a proper error instead of a bare ENOENT.
+///
+/// Candidates are resolved inside `rootfs` (F56), as the chrooted exec will
+/// see them, so an image symlink never probes the micro-VM's own files.
 pub fn resolve_exe(rootfs: &str, argv0: &str, env: &[(String, String)]) -> Result<String> {
-    let is_executable_file = |p: &Path| {
-        p.metadata()
+    let is_executable_file = |inside: &str| {
+        in_root(rootfs, inside)
+            .ok()
+            .and_then(|p| p.metadata().ok())
             .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
     };
     if argv0.contains('/') {
-        let full = format!("{rootfs}/{}", argv0.trim_start_matches('/'));
-        if is_executable_file(Path::new(&full)) {
+        if is_executable_file(argv0) {
             return Ok(argv0.to_string());
         }
         return Err(format!("executable {argv0} not found in container rootfs"));
@@ -100,8 +103,7 @@ pub fn resolve_exe(rootfs: &str, argv0: &str, env: &[(String, String)]) -> Resul
         .unwrap_or(DEFAULT_PATH);
     for dir in path_var.split(':').filter(|d| !d.is_empty()) {
         let inside = format!("{}/{argv0}", dir.trim_end_matches('/'));
-        let full = format!("{rootfs}/{}", inside.trim_start_matches('/'));
-        if is_executable_file(Path::new(&full)) {
+        if is_executable_file(&inside) {
             return Ok(inside);
         }
     }
@@ -128,9 +130,48 @@ fn cstring(s: &str) -> Result<CString> {
     CString::new(s).ctx(&format!("NUL byte in {s:?}"))
 }
 
-/// Fork the container: the child chroots into the overlay rootfs, drops to
-/// the resolved user (v1: primary gid only, no supplementary group list),
-/// chdirs to the workdir and execs. stdout/stderr are inherited, so container
+/// Who a workload process runs as and where, computed before fork: the
+/// workdir to chdir to inside the chroot and the identity to drop to. The
+/// container and its healthcheck (F58) both go through it, so a check runs
+/// exactly as the workload does — v1: primary gid only, no supplementary
+/// group list beyond it.
+pub struct ExecIdentity {
+    pub workdir: CString,
+    pub ids: Option<(Uid, Gid)>,
+}
+
+impl ExecIdentity {
+    pub fn new(workdir: Option<&str>, user: Option<&ResolvedUser>) -> Result<Self> {
+        Ok(Self {
+            workdir: cstring(workdir.unwrap_or("/"))?,
+            ids: user.map(|u| (Uid::from_raw(u.uid), Gid::from_raw(u.gid))),
+        })
+    }
+
+    /// Call after chroot, in the forked child: chdir to the workdir, then
+    /// drop groups, gid and uid. Allocation-free (async-signal-safe); the
+    /// error names the step that failed.
+    pub fn apply(&self) -> std::result::Result<(), &'static str> {
+        if chdir(self.workdir.as_c_str()).is_err() {
+            return Err("chdir to workdir");
+        }
+        if let Some((uid, gid)) = self.ids {
+            if nix::unistd::setgroups(&[gid]).is_err() {
+                return Err("setgroups");
+            }
+            if setgid(gid).is_err() {
+                return Err("setgid");
+            }
+            if setuid(uid).is_err() {
+                return Err("setuid");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Fork the container: the child chroots into the overlay rootfs, chdirs to
+/// the workdir, drops to the resolved user ([`ExecIdentity`]) and execs. stdout/stderr are inherited, so container
 /// output lands on the VM console.
 pub fn spawn(
     spec: &ContainerSpec,
@@ -139,7 +180,8 @@ pub fn spawn(
 ) -> Result<ContainerProcess> {
     let argv = build_argv(spec)?;
     let exe = resolve_exe(ROOTFS, &argv[0], env)?;
-    let workdir = spec.workdir.as_deref().unwrap_or("/");
+    // The container's /proc as the runtime mounts resolved it (F56).
+    let proc_dir = in_root(ROOTFS, "/proc")?;
 
     // Everything the child needs, allocated before fork (the child must not
     // allocate: another thread could hold the allocator lock at fork time).
@@ -149,8 +191,9 @@ pub fn spawn(
         .iter()
         .map(|(k, v)| cstring(&format!("{k}={v}")))
         .collect::<Result<_>>()?;
-    let c_workdir = cstring(workdir)?;
-    let ids = user.map(|u| (Uid::from_raw(u.uid), Gid::from_raw(u.gid)));
+    let c_proc = CString::new(proc_dir.into_os_string().into_vec())
+        .ctx("NUL byte in the container /proc path")?;
+    let identity = ExecIdentity::new(spec.workdir.as_deref(), user)?;
     let mut ready_fds = [0_i32; 2];
     if unsafe { libc::pipe2(ready_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(format!(
@@ -177,12 +220,12 @@ pub fn spawn(
         {
             die("make mounts private");
         }
-        if umount2(ROOTFS_PROC, MntFlags::MNT_DETACH).is_err() {
+        if umount2(c_proc.as_c_str(), MntFlags::MNT_DETACH).is_err() {
             die("unmount inherited /proc");
         }
         if mount(
             Some("proc"),
-            ROOTFS_PROC,
+            c_proc.as_c_str(),
             Some("proc"),
             MsFlags::empty(),
             None::<&str>,
@@ -202,19 +245,8 @@ pub fn spawn(
         if chroot(ROOTFS).is_err() {
             die("chroot");
         }
-        if chdir(c_workdir.as_c_str()).is_err() {
-            die("chdir to workdir");
-        }
-        if let Some((uid, gid)) = ids {
-            if nix::unistd::setgroups(&[gid]).is_err() {
-                die("setgroups");
-            }
-            if setgid(gid).is_err() {
-                die("setgid");
-            }
-            if setuid(uid).is_err() {
-                die("setuid");
-            }
+        if let Err(what) = identity.apply() {
+            die(what);
         }
         let _ = execve(&c_exe, &c_argv, &c_env);
         die("execve");
@@ -316,6 +348,44 @@ mod tests {
         );
         assert!(resolve_exe(&rootfs, "missing", &env).is_err());
         assert!(resolve_exe(&rootfs, "/missing", &env).is_err());
+    }
+
+    /// F58: the healthcheck runs through the same identity as the
+    /// workload — its uid, gid and workdir — never root in `/`.
+    #[test]
+    fn exec_identity_carries_the_workload_user_and_workdir() {
+        let user = ResolvedUser {
+            uid: 101,
+            gid: 102,
+            home: None,
+        };
+        let id = ExecIdentity::new(Some("/srv/app"), Some(&user)).unwrap();
+        assert_eq!(id.workdir.as_c_str().to_str().unwrap(), "/srv/app");
+        assert_eq!(id.ids, Some((Uid::from_raw(101), Gid::from_raw(102))));
+
+        // No user and no workdir: root in `/`, as the image asks.
+        let id = ExecIdentity::new(None, None).unwrap();
+        assert_eq!(id.workdir.as_c_str().to_str().unwrap(), "/");
+        assert_eq!(id.ids, None);
+    }
+
+    /// F56: an absolute link on PATH resolves inside the rootfs.
+    #[test]
+    fn exe_lookup_follows_links_inside_the_rootfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("bin")).unwrap();
+        fs::create_dir_all(dir.path().join("bin")).unwrap();
+        // Executable only beside the rootfs, where the link would land if
+        // it were followed on cinit's side.
+        let outside = dir.path().join("bin/outside");
+        fs::write(&outside, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("bin/tool")).unwrap();
+        let rootfs = rootfs.to_str().unwrap().to_string();
+        let env = vec![("PATH".to_string(), "/bin".to_string())];
+        assert!(resolve_exe(&rootfs, "tool", &env).is_err());
+        assert!(resolve_exe(&rootfs, "/bin/tool", &env).is_err());
     }
 
     #[test]

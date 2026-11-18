@@ -46,6 +46,12 @@ OW_URL="https://github.com/open-watcom/open-watcom-v2/releases/download/$OW_TAG/
 # bpf-linker links against the pinned nightly's libLLVM through its proxy, so
 # the objects are reproducible given this version and the channel pin.
 BPF_LINKER_VERSION="0.10.3"
+RUSTUP_VERSION="1.28.2"
+RUSTUP_SHA256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+RUSTUP_URL="https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/x86_64-unknown-linux-gnu/rustup-init"
+JUST_VERSION="1.40.0"
+JUST_SHA256="181b91d0ceebe8a57723fb648ed2ce1a44d849438ce2e658339df4f8db5f1263"
+JUST_URL="https://github.com/casey/just/releases/download/$JUST_VERSION/just-$JUST_VERSION-x86_64-unknown-linux-musl.tar.gz"
 UV_VERSION="0.10.6"
 UV_SHA256="aaa402e19d14a6b9a4267fcf4ec35380f804c68923525cea67cd6ee05bb4e930"
 UV_URL="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-x86_64-unknown-linux-gnu.tar.gz"
@@ -102,8 +108,14 @@ pinned_nightly() {
 stage_rust() {
   if ! command -v rustup >/dev/null 2>&1; then
     log "rust: installing rustup"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-      sh -s -- -y --profile minimal --default-toolchain none
+    local tmp
+    tmp="$(mktemp -d)"
+    [ -n "$tmp" ] && [ -d "$tmp" ] || die "missing rustup staging directory"
+    fetch_pinned "$RUSTUP_URL" "$tmp/rustup-init" "$RUSTUP_SHA256"
+    chmod +x "$tmp/rustup-init"
+    "$tmp/rustup-init" -y --profile minimal --default-toolchain none
+    [ -n "$tmp" ] && [ "$tmp" != / ] || die "unsafe rustup staging directory"
+    rm -rf "$tmp"
   fi
   # shellcheck disable=SC1091
   [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
@@ -227,11 +239,16 @@ stage_just() {
     log "just: $(just --version) already on PATH"
     return
   fi
-  local bin="${VMLAB_BIN_DIR:-$HOME/.local/bin}"
+  local bin="${VMLAB_BIN_DIR:-$HOME/.local/bin}" tmp
   log "just: installing into $bin"
   mkdir -p "$bin"
-  curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh |
-    bash -s -- --to "$bin"
+  tmp="$(mktemp -d)"
+  [ -n "$tmp" ] && [ -d "$tmp" ] || die "missing just staging directory"
+  fetch_pinned "$JUST_URL" "$tmp/just.tar.gz" "$JUST_SHA256"
+  tar -xzf "$tmp/just.tar.gz" -C "$tmp" just
+  install -m 0755 "$tmp/just" "$bin/just"
+  [ -n "$tmp" ] && [ "$tmp" != / ] || die "unsafe just staging directory"
+  rm -rf "$tmp"
 }
 
 stage_uv() {

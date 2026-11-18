@@ -13,6 +13,10 @@
 //! `guest/agent-proto`). No echo within the timeout means the guest has no
 //! agent (template predates it) — callers turn that into an actionable
 //! error.
+//! On ISA serial only, the guest announces itself first so the host cannot
+//! leave a hello in COM1 for Windows serial mouse detection to consume;
+//! agents older than the announcement get a rate-limited fallback hello
+//! ([`Greeting`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -160,6 +164,10 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an `open_*` waits for the agent's `opened`.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The polling C agent runs over a baud-limited ISA UART. Under host load
+/// DOS/9x can take longer than the modern agent to service an open.
+const LEGACY_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct Inner {
     /// The connection's runtime, so cleanup can be spawned from any thread
     /// (scripts drop sessions on non-runtime threads).
@@ -183,6 +191,7 @@ struct Inner {
     /// that misses a ping had been silent says whether the guest stalled or
     /// the pong was only late.
     last_rx: std::sync::Mutex<std::time::Instant>,
+    received: watch::Sender<bool>,
     sessions: Mutex<HashMap<u32, SessionEntry>>,
     /// Waiters for `opened`/error replies to an `open_*` message, keyed by
     /// channel id (std mutex: never held across await).
@@ -277,9 +286,32 @@ pub struct AgentHandle {
     inner: Arc<Inner>,
 }
 
+/// When the host may send its hello on a fresh agent connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Greeting {
+    /// At once: every transport but ISA serial.
+    HostFirst,
+    /// ISA serial: not before the guest has sent a byte, so no hello waits
+    /// in COM1 for Windows serial mouse detection to read as a mouse ID
+    /// ("VMLB" holds the `M` a Microsoft mouse answers with). With
+    /// `fallback`, a guest still silent when the handshake budget runs out
+    /// gets the hello anyway, for agents that predate the announcement.
+    GuestFirst { fallback: bool },
+}
+
 impl AgentHandle {
     /// Connect to the agent socket and complete the token handshake.
     pub async fn connect(path: &Path, handshake_timeout: Duration) -> Result<AgentHandle> {
+        Self::connect_serial(path, handshake_timeout, Greeting::HostFirst).await
+    }
+
+    /// Connect with an explicit [`Greeting`]: when the host may say hello.
+    pub(super) async fn connect_serial(
+        path: &Path,
+        handshake_timeout: Duration,
+        greeting: Greeting,
+    ) -> Result<AgentHandle> {
+        let mut deadline = tokio::time::Instant::now() + handshake_timeout;
         let stream = UnixStream::connect(path)
             .await
             .with_context(|| format!("connecting agent socket {}", path.display()))?;
@@ -296,6 +328,7 @@ impl AgentHandle {
             sock,
             closed: watch::Sender::new(false),
             last_rx: std::sync::Mutex::new(std::time::Instant::now()),
+            received: watch::Sender::new(false),
             sessions: Mutex::new(HashMap::new()),
             open_waiters: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
@@ -327,6 +360,23 @@ impl AgentHandle {
         let task = tokio::spawn(async move { reader_task(weak, read_half).await });
         *inner.reader.lock_recover() = Some(task);
 
+        if let Greeting::GuestFirst { fallback } = greeting {
+            let mut received = inner.received.subscribe();
+            let spoke = received.wait_for(|received| *received);
+            match tokio::time::timeout_at(deadline, spoke).await {
+                Ok(spoke) => {
+                    spoke.context("agent channel closed before guest spoke")?;
+                }
+                // An agent built before guest-first never speaks first: it
+                // gets its hello now, and the reply its own budget. Should
+                // nobody answer, dropping the connection drops whatever of
+                // the hello the guest had not read (both hypervisors discard
+                // unread input on hangup).
+                Err(_) if fallback => deadline = tokio::time::Instant::now() + handshake_timeout,
+                Err(_) => bail!("no vmlab-agent answered on the agent channel"),
+            }
+        }
+
         handle
             .send_msg(&HostMsg::Hello {
                 proto_version: PROTO_VERSION,
@@ -336,7 +386,6 @@ impl AgentHandle {
             .context("sending agent handshake")?;
 
         let mut rx = handle.inner.hello.subscribe();
-        let deadline = tokio::time::Instant::now() + handshake_timeout;
         loop {
             if rx.borrow().is_some() {
                 return Ok(handle);
@@ -553,8 +602,21 @@ impl AgentHandle {
             session.forget().await;
             return Err(e);
         }
-        match tokio::time::timeout(OPEN_TIMEOUT, opened_rx).await {
-            Ok(Ok(Ok(()))) => Ok(session),
+        let timeout = if self.info().agent_version.starts_with("agent-legacy=") {
+            LEGACY_OPEN_TIMEOUT
+        } else {
+            OPEN_TIMEOUT
+        };
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(timeout, opened_rx).await {
+            Ok(Ok(Ok(()))) => {
+                tracing::info!(
+                    channel = id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "agent channel opened"
+                );
+                Ok(session)
+            }
             Ok(Ok(Err(refusal))) => {
                 session.forget().await;
                 Err(anyhow!("{refusal}"))
@@ -1514,6 +1576,9 @@ impl FileOps {
 
         let mut hasher = Sha256::new();
         let mut got = 0u64;
+        // A changing or dishonest guest must not turn a finite pull into an
+        // endless disk write. Allow one chunk of growth after the stat.
+        let limit = attrs.size.saturating_add(TRANSFER_CHUNK as u64);
         let mut queued = 0u64;
         let mut window: std::collections::VecDeque<tokio::task::JoinHandle<Result<Vec<u8>>>> =
             std::collections::VecDeque::new();
@@ -1548,6 +1613,9 @@ impl FileOps {
             // The agent fills a read or hits end-of-file, so anything short
             // is the end — whether or not the stat agreed.
             let done = bytes.len() < TRANSFER_CHUNK;
+            if bytes.len() as u64 > limit.saturating_sub(got) {
+                break Err(anyhow!("pull exceeds stat size plus growth allowance"));
+            }
             hasher.update(&bytes);
             got += bytes.len() as u64;
             if let Err(e) = sink.write(&bytes).await {
@@ -2294,6 +2362,7 @@ async fn reader_task(weak: Weak<Inner>, mut read_half: tokio::net::unix::OwnedRe
         };
         let Some(inner) = weak.upgrade() else { break };
         *inner.last_rx.lock_recover() = std::time::Instant::now();
+        inner.received.send_replace(true);
         decoder.push(&buf[..n]);
         while let Some(frame) = decoder.next_frame() {
             match frame.kind {
@@ -2612,6 +2681,31 @@ mod tests {
 
     const HANDSHAKE: Duration = Duration::from_secs(5);
 
+    #[tokio::test]
+    async fn legacy_open_survives_slow_uart_but_modern_open_stays_bounded() {
+        for legacy in [false, true] {
+            let (_dir, path) = mock_agent(true).await;
+            let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+            if legacy {
+                let mut info = handle.info();
+                info.agent_version = "agent-legacy=test".into();
+                handle.inner.hello.send_replace(Some(info));
+            }
+            let before = tokio::time::Instant::now();
+            let result = handle
+                .open_exec(vec!["mock:slow-open".into()], vec![], None, None)
+                .await;
+            if legacy {
+                assert!(result.is_ok());
+                assert!(before.elapsed() >= Duration::from_secs(20));
+            } else {
+                assert!(result.is_err());
+                assert!(before.elapsed() >= OPEN_TIMEOUT);
+                assert!(before.elapsed() < Duration::from_secs(20));
+            }
+        }
+    }
+
     /// A minimal in-process agent speaking the real frame protocol over a
     /// unix socket, mirroring what `guest/agent` does: echo terminals,
     /// canned exec output, in-memory file store.
@@ -2754,6 +2848,9 @@ mod tests {
                                     tree,
                                     ..
                                 } => {
+                                    if argv.first().is_some_and(|s| s == "mock:slow-open") {
+                                        tokio::time::sleep(Duration::from_secs(20)).await;
+                                    }
                                     send(AgentMsg::Opened { id }).await;
                                     // Echo who the open said to run as, so a
                                     // test can assert the identity actually
@@ -3286,7 +3383,9 @@ mod tests {
                                     // the file does not have — what a file
                                     // truncated between the stat and the
                                     // reads looks like to a puller.
-                                    size: if path.contains("shrinking") {
+                                    size: if path.contains("growing-hostile") {
+                                        0
+                                    } else if path.contains("shrinking") {
                                         file.len() as u64 + (1 << 20)
                                     } else {
                                         file.len() as u64
@@ -3598,6 +3697,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_serial_sends_nothing_until_guest_speaks() {
+        let (_mock_dir, mock_path) = mock_agent(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serial.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let guest = tokio::spawn(async move {
+            // Repeated probes of a silent guest must not queue mouse IDs.
+            for _ in 0..2 {
+                let (mut port, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                port.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.is_empty(), "host queued bytes before guest spoke");
+            }
+            let (mut port, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), port.read(&mut byte))
+                    .await
+                    .is_err()
+            );
+            port.write_all(&[0]).await.unwrap();
+            let mut agent = UnixStream::connect(mock_path).await.unwrap();
+            tokio::io::copy_bidirectional(&mut port, &mut agent)
+                .await
+                .unwrap();
+        });
+        let greeting = Greeting::GuestFirst { fallback: false };
+        for _ in 0..2 {
+            assert!(
+                AgentHandle::connect_serial(&path, Duration::from_millis(100), greeting)
+                    .await
+                    .is_err()
+            );
+        }
+        let agent = AgentHandle::connect_serial(&path, HANDSHAKE, greeting)
+            .await
+            .unwrap();
+        assert_eq!(agent.info().os, "linux");
+        assert!(agent.ping(HANDSHAKE).await);
+        agent.shutdown().await;
+        guest.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_serial_falls_back_to_a_hello_for_an_agent_that_never_speaks() {
+        // The mock is an old agent: silent until the host's hello.
+        let (_mock_dir, mock_path) = mock_agent(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serial.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let wait = Duration::from_millis(300);
+        let guest = tokio::spawn(async move {
+            let (mut port, _) = listener.accept().await.unwrap();
+            let opened = tokio::time::Instant::now();
+            let mut first = [0];
+            port.read_exact(&mut first).await.unwrap();
+            // Accepting lags the host's clock start by a little.
+            assert!(
+                opened.elapsed() >= wait - Duration::from_millis(50),
+                "host sent a byte {:?} after connecting, before its guest-first wait",
+                opened.elapsed()
+            );
+            let mut agent = UnixStream::connect(mock_path).await.unwrap();
+            agent.write_all(&first).await.unwrap();
+            tokio::io::copy_bidirectional(&mut port, &mut agent)
+                .await
+                .unwrap();
+        });
+        let greeting = Greeting::GuestFirst { fallback: true };
+        let agent = AgentHandle::connect_serial(&path, wait, greeting)
+            .await
+            .unwrap();
+        assert_eq!(agent.info().os, "linux");
+        assert!(agent.ping(HANDSHAKE).await);
+        agent.shutdown().await;
+        guest.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_echoes_and_resizes() {
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
@@ -3792,6 +3970,27 @@ mod tests {
         assert_eq!(landed.len(), 10_000);
         use sha2::{Digest, Sha256};
         assert_eq!(sha, hex::encode(Sha256::digest(&landed)));
+    }
+
+    #[tokio::test]
+    async fn hostile_pull_cannot_write_past_stat_allowance() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, vec![7; TRANSFER_CHUNK * 4]).unwrap();
+        ops.push(&source, "/growing-hostile", None).await.unwrap();
+        let dest = work.path().join("dest");
+        let err = ops.pull_to("/growing-hostile", &dest).await.unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"));
+        assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
+        let err = agent
+            .pull_file("/growing-hostile", &dest)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"));
+        assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
     }
 
     /// A directory arrives whole, however many slices the guest streams it
