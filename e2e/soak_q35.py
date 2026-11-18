@@ -165,8 +165,11 @@ lab "soak-{name}" {{
         def down():
             if "state=stopped" in state():
                 start()
-            run("down")
-            wait_until(lambda: "state=stopped" in state(), 120, "VM did not stop after down")
+            require("state=running" in state(), "no running VM to bring down")
+            result = run("down")
+            require("is down (clones retained)" in result, "lab did not report down")
+            require(f'lab "soak-{name}": not running' in run("status"),
+                    "lab daemon still served status after down")
 
         def restore_offline():
             start()
@@ -207,7 +210,8 @@ lab "soak-{name}" {{
                 step("stop", lambda: stop_after_marker(write, stop, log))
                 if results["stop"] == "Pass" and step("offline snapshot", lambda: capture("offline")):
                     step("offline restore", restore_offline)
-            step("down", down)
+            if started_ok:
+                step("down", down)
         finally:
             step("cleanup", lambda: run("destroy", timeout=300))
     return ready_seconds, results
