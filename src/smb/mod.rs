@@ -468,12 +468,12 @@ mod tests {
         )];
         let lab = LabSmb::plan("l", Path::new("/lab/.vmlab"), 14451, &vms);
         let steps = lab.mount_plan("win", OsHint::Windows);
-        assert_eq!(steps.len(), 3, "{steps:#?}"); // net use auth + link + hook
-        assert_eq!(steps[1].command, "powershell");
-        assert_eq!(steps[1].refused_exit, Some(mount::LINK_REFUSED_EXIT));
+        assert_eq!(steps.len(), 4); // credential + net use auth + link + hook
+        assert_eq!(steps[2].command, "powershell");
+        assert_eq!(steps[2].refused_exit, Some(mount::LINK_REFUSED_EXIT));
         assert!(steps.iter().filter(|s| s.refused_exit.is_some()).count() == 1);
-        assert_eq!(steps[2].command, "reg");
-        let hook = steps[2].args.join(" ");
+        assert_eq!(steps[3].command, "reg");
+        let hook = steps[3].args.join(" ");
         assert!(
             hook.contains("CurrentVersion\\Run /v vmlab-shares"),
             "{hook}"
@@ -496,9 +496,9 @@ mod tests {
         )];
         let lab = LabSmb::plan("l", Path::new("/lab/.vmlab"), 14451, &vms);
         let steps = lab.mount_plan("win", OsHint::Windows);
-        assert_eq!(steps.len(), 4, "{steps:#?}"); // cleanup + map + script + hook
-        assert!(steps[2].args.join(" ").contains(mount::DESKTOP_SCRIPT));
-        assert!(steps[3].args.join(" ").contains("/v vmlab-shares"));
+        assert_eq!(steps.len(), 5); // credential + cleanup + map + script + hook
+        assert!(steps[3].args.join(" ").contains(mount::DESKTOP_SCRIPT));
+        assert!(steps[4].args.join(" ").contains("/v vmlab-shares"));
     }
 
     #[test]

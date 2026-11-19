@@ -2640,6 +2640,7 @@ impl LabRuntime {
                     output(line);
                 }
             }
+            report.check_provisioning_mounts(m)?;
         }
         let machine = self.machine(m)?;
         // The machine's own budget, never a literal: a VM may still be
@@ -4357,6 +4358,7 @@ mod tests {
             if let Some(calls) = self.failing_mount.clone() {
                 let retry = crate::smb::steps::RetryPolicy::MOUNT;
                 report.planned(["data"], &[], retry.deadline);
+                report.require_for_provisioning("data");
                 if self.wait_ready(self.ready_timeout).await.is_err() {
                     report.abandoned("the guest never became ready");
                     return;
@@ -4364,9 +4366,9 @@ mod tests {
                 report.ready();
                 let plan = crate::smb::steps::MountPlan {
                     steps: vec![crate::smb::MountStep {
-                        os_hint: crate::smb::OsHint::Linux,
-                        command: "mount".into(),
-                        args: vec!["-t".into(), "cifs".into()],
+                        os_hint: crate::smb::OsHint::Windows,
+                        command: "net".into(),
+                        args: vec!["use".into()],
                         share: Some("data".into()),
                         refused_exit: None,
                     }],
@@ -4382,7 +4384,7 @@ mod tests {
                         async {
                             Ok(super::super::mount_retry::Exited {
                                 exit_code: 32,
-                                stderr: "mount error(112): Host is down\n".into(),
+                                stderr: "Access is denied.\n".into(),
                             })
                         }
                     },
@@ -6023,6 +6025,45 @@ lab "t" {
             said.iter()
                 .any(|(_, s)| s.contains("waiting for its shares to mount")),
             "{said:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_windows_smb_mount_blocks_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        std::fs::write(
+            dir.path().join("p.ws"),
+            "use vmlab\n\nfn main(lab: Lab) {\n}\n",
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "win" {
+    template = "x86_64/t"
+    provision "p.ws" { }
+  }
+}"#,
+            vec![FakeMachine::failing_mount("win", &sh, Arc::clone(&calls))],
+        );
+        let (sink, said) = numbered(&sh);
+        let error = format!("{:#}", lab.up(&[], sink).await.unwrap_err());
+        assert!(error.contains("\"win\""), "{error}");
+        assert!(
+            error.contains("SMB share \"data\" did not mount"),
+            "{error}"
+        );
+        assert!(error.contains("Access is denied"), "{error}");
+        assert!(calls.load(Ordering::SeqCst) > 1);
+        assert!(
+            !said
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, line)| line.contains("provision p.ws"))
         );
     }
 

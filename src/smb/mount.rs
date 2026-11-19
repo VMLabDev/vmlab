@@ -123,7 +123,10 @@ pub const LINK_REFUSED_EXIT: i32 = 64;
 
 /// Build the Windows mount command(s) for a share.
 ///
-/// - **Drive-letter target** (`X:`): a single `net use X: \\<gw>\<share>
+/// The agent first stores the gateway credential in SYSTEM's Credential
+/// Manager so later opens can authenticate even if the mapping reconnects.
+///
+/// - **Drive-letter target** (`X:`): `net use X: \\<gw>\<share>
 ///   /user:<u> <p> /persistent:yes`. This maps directly (PRD §7.5).
 /// - **Folder-path target** (e.g. `C:\mnt\data`): realised as a directory
 ///   symbolic link to the UNC path. Windows permits UNC targets for `/D`;
@@ -145,6 +148,14 @@ pub fn windows_mount_cmds(
         args,
         refused_exit: None,
     };
+    let credential = cmd(
+        "cmdkey",
+        vec![
+            format!("/add:{gateway}"),
+            format!("/user:{user}"),
+            format!("/pass:{pass}"),
+        ],
+    );
     if is_drive_letter(guest_path) {
         // Normalise `X:\` to `X:` for net use.
         let letter = &guest_path[..2];
@@ -170,7 +181,7 @@ pub fn windows_mount_cmds(
                 "/persistent:yes".to_string(),
             ],
         );
-        vec![cleanup, map]
+        vec![credential, cleanup, map]
     } else {
         // Folder-path target: authenticate, then link the folder to the UNC.
         let auth = cmd(
@@ -199,7 +210,7 @@ pub fn windows_mount_cmds(
             ],
             refused_exit: Some(LINK_REFUSED_EXIT),
         };
-        vec![auth, link]
+        vec![credential, auth, link]
     }
 }
 
@@ -207,12 +218,14 @@ pub fn windows_mount_cmds(
 /// `\\<gateway>\<share>`, whatever the guest already has there.
 ///
 /// - Nothing there: create the link.
-/// - A link to this gateway's share: leave it, and succeed.
+/// - A link to this gateway's share: leave it.
 /// - A link to the same share on another gateway (a link vmlab made before
 ///   the VM's segment moved to another subnet): remove the link, which
 ///   leaves the share's files alone, and create it again.
 /// - Anything else: exit [`LINK_REFUSED_EXIT`] naming the path. A real
 ///   directory there may hold the user's data, so it is never removed.
+///
+/// Before succeeding, enumerate through the link to verify SMB access.
 ///
 /// Windows reports a UNC link's target as `UNC\<host>\<share>`; it is
 /// compared as `\\<host>\<share>`, case-insensitively. Progress records are
@@ -229,20 +242,31 @@ $ProgressPreference = 'SilentlyContinue'
 $path = {path}
 $target = {target}
 $share = {share}
+$current = ''
 $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
 if ($item) {{
-  $current = ''
   if ($item.LinkType -eq 'SymbolicLink') {{ $current = [string]@($item.Target)[0] }}
   if ($current -like 'UNC\*') {{ $current = '\' + $current.Substring(3) }}
-  if ($current -eq $target) {{ exit 0 }}
-  if ($current -notmatch ('^\\\\[^\\]+\\' + [regex]::Escape($share) + '\\?$')) {{
-    [Console]::Error.WriteLine("$path already exists and is not a link vmlab made to share $share, so vmlab will not replace it. Move it aside and run vmlab up again.")
-    exit {LINK_REFUSED_EXIT}
+  if ($current -ne $target) {{
+    if ($current -notmatch ('^\\\\[^\\]+\\' + [regex]::Escape($share) + '\\?$')) {{
+      [Console]::Error.WriteLine("$path already exists and is not a link vmlab made to share $share, so vmlab will not replace it. Move it aside and run vmlab up again.")
+      exit {LINK_REFUSED_EXIT}
+    }}
+    $item.Delete()
   }}
-  $item.Delete()
 }}
-& cmd.exe /c mklink /D $path $target
-exit $LASTEXITCODE
+if ($current -ne $target) {{
+  & cmd.exe /c mklink /D $path $target
+  if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
+}}
+try {{
+  $entries = [IO.Directory]::EnumerateFileSystemEntries($path).GetEnumerator()
+  try {{ [void]$entries.MoveNext() }} finally {{ $entries.Dispose() }}
+}} catch {{
+  [Console]::Error.WriteLine("Cannot open SMB share $target through ${{path}}: $($_.Exception.Message)")
+  exit 1
+}}
+exit 0
 "#
     )
 }
@@ -381,15 +405,18 @@ mod tests {
     #[test]
     fn windows_drive_letter_net_use() {
         let cmds = windows_mount_cmds(gw(), "data", "X:", "u", "p");
-        assert_eq!(cmds.len(), 2);
-        // First clears any stale remembered mapping — and must always
+        let [credential, cleanup, map] = cmds.as_slice() else {
+            panic!("expected credential registration, cleanup and mapping");
+        };
+        assert_eq!(credential.program, "cmdkey");
+        // Cleanup clears any stale remembered mapping and must always
         // exit 0 (the daemon retries failing steps).
-        assert_eq!(cmds[0].program, "cmd");
-        assert!(cmds[0].args[1].contains("net use X: /delete /y"));
-        assert!(cmds[0].args[1].contains("exit /b 0"));
+        assert_eq!(cleanup.program, "cmd");
+        assert!(cleanup.args[1].contains("net use X: /delete /y"));
+        assert!(cleanup.args[1].contains("exit /b 0"));
         // Then maps the drive.
-        assert_eq!(cmds[1].program, "net");
-        let joined = cmds[1].args.join(" ");
+        assert_eq!(map.program, "net");
+        let joined = map.args.join(" ");
         assert!(joined.starts_with("use X: \\\\10.0.0.1\\data"));
         assert!(joined.contains("/user:u"));
         assert!(joined.contains("/persistent:yes"));
@@ -441,20 +468,21 @@ mod tests {
     #[test]
     fn windows_folder_path_links_through_the_encoded_script() {
         let cmds = windows_mount_cmds(gw(), "data", "C:\\mnt\\data", "u", "p");
-        assert_eq!(cmds.len(), 2);
-        // first authenticates
-        assert_eq!(cmds[0].program, "net");
+        let [credential, auth, link] = cmds.as_slice() else {
+            panic!("expected credential registration, authentication and link check");
+        };
+        assert_eq!(credential.program, "cmdkey");
+        assert_eq!(credential.args, ["/add:10.0.0.1", "/user:u", "/pass:p"]);
+        assert_eq!(auth.program, "net");
         assert!(
-            cmds[0]
-                .args
+            auth.args
                 .join(" ")
                 .starts_with("use \\\\10.0.0.1\\data /user:u")
         );
-        // second is the link step, which refuses with its own exit code
-        assert_eq!(cmds[1].program, "powershell");
-        assert_eq!(cmds[1].refused_exit, Some(LINK_REFUSED_EXIT));
+        assert_eq!(link.program, "powershell");
+        assert_eq!(link.refused_exit, Some(LINK_REFUSED_EXIT));
         assert_eq!(
-            decoded(&cmds[1]),
+            decoded(link),
             windows_link_script(gw(), "data", "C:\\mnt\\data")
         );
     }
@@ -482,10 +510,7 @@ mod tests {
             ),
             "{script}"
         );
-        assert!(
-            script.contains("if ($current -eq $target) { exit 0 }"),
-            "{script}"
-        );
+        assert!(script.contains("if ($current -ne $target) {"), "{script}");
         // Only a link to this share on some gateway is vmlab's to replace;
         // anything else at the path is refused, by name.
         assert!(
@@ -502,6 +527,10 @@ mod tests {
         assert!(script.contains("$item.Delete()"), "{script}");
         assert!(!script.contains("Recurse"), "{script}");
         assert!(script.contains("mklink /D $path $target"), "{script}");
+        assert!(script.contains("EnumerateFileSystemEntries($path)"));
+        assert!(script.contains("$entries.MoveNext()"));
+        assert!(script.contains("Cannot open SMB share"));
+        assert_eq!(script.matches("exit 0").count(), 1);
     }
 
     /// A quote in a path would end PowerShell's string early.
