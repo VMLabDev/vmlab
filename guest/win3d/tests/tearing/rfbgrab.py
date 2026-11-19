@@ -147,12 +147,21 @@ def main():
     if args.out:
         os.makedirs(args.out, exist_ok=True)
     start = time.monotonic()
-    grabbed = seen = torn = changes = saved = 0
+    grabbed = seen = torn = changes = saved = reconnects = 0
     last_x = None
     examples = []
     while time.monotonic() - start < args.seconds and not (args.frames and seen >= args.frames):
         t0 = time.monotonic()
-        frame = rfb.grab()
+        try:
+            frame = rfb.grab()
+        except (ConnectionError, OSError):
+            # The server ends a connection when the screen mode changes.
+            reconnects += 1
+            if reconnects > 20:
+                raise
+            time.sleep(0.5)
+            rfb = Rfb(args.sock)
+            continue
         grabbed += 1
         has, x, bands = inspect(frame)
         if has:
@@ -177,7 +186,7 @@ def main():
     print(json.dumps({
         'screen': [rfb.width, rfb.height], 'seconds': round(elapsed, 1), 'grabbed': grabbed,
         'grab_fps': round(grabbed / max(elapsed, 1e-9), 1), 'frames_with_window': seen,
-        'position_changes': changes, 'torn': torn, 'examples': examples,
+        'position_changes': changes, 'reconnects': reconnects, 'torn': torn, 'examples': examples,
     }))
     return 2 if seen == 0 else 1 if torn else 0
 
