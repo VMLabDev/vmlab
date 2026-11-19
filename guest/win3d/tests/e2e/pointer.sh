@@ -69,7 +69,7 @@ python3 "$HERE/pointer.py" watch --display "$DIR/display.sock" --rfb "$DIR/vnc.s
     --seconds "$total" --until "$STAGE/done" --out "$EV/events.json" &
 watch_pid=$!
 sleep 1
-gps "& C:\\win3d\\guest\\Run-Probe.ps1 -Path C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Raw -NoModules -Name pointer -OutDir C:\\win3d\\results\\pointer -Seconds $total -TimeoutSec $total -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','C:\\win3d\\guest\\Show-TestPointer.ps1','-Shapes','\"$PLAN\"','-SecondsEach','$SECONDS_EACH','-X0','$X0','-Y0','$Y0','-StepX','$STEP_X','-Background','\"$BACKGROUND\"'; exit \$LASTEXITCODE" \
+gps "& C:\\win3d\\guest\\Run-Probe.ps1 -Path C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Raw -NoModules -Name pointer -OutDir C:\\win3d\\results\\pointer -Seconds $total -TimeoutSec $total -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','C:\\win3d\\guest\\Show-TestPointer.ps1','-Shapes','$PLAN','-SecondsEach','$SECONDS_EACH','-X0','$X0','-Y0','$Y0','-StepX','$STEP_X','-Background','$BACKGROUND'; exit \$LASTEXITCODE" \
     $((total + 120)) >"$STAGE/run.out" 2>&1 &
 guest_pid=$!
 n=0
