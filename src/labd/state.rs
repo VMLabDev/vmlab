@@ -83,6 +83,19 @@ impl MachineState {
                     .then_some(crate::config::hypervisor::HypervisorKind::Qemu)
             })
     }
+
+    /// The online snapshots QEMU took, by name. Their RAM and device state
+    /// are QEMU's own format, so none restores once QEMU stops running the
+    /// machine; they stay on disk.
+    pub fn qemu_online_snapshots(&self) -> Vec<String> {
+        self.snapshots
+            .iter()
+            .filter(|(_, s)| {
+                s.online && s.hypervisor == crate::config::hypervisor::HypervisorKind::Qemu
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 /// A config-weave run that timed out, and the process tree it ran in.
@@ -467,5 +480,31 @@ mod tests {
     fn a_missing_state_file_is_a_fresh_lab() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(LabState::load(tmp.path()).unwrap().machines.is_empty());
+    }
+
+    /// The removal listing names what QEMU took online, and nothing an
+    /// offline restore or vmlab-hv can still load.
+    #[test]
+    fn only_online_qemu_snapshots_are_lost_with_qemu() {
+        use crate::config::hypervisor::HypervisorKind;
+        let record = |online, hypervisor| SnapshotRecord {
+            online,
+            taken_at: chrono::Utc::now(),
+            image_digest: None,
+            freeze_point: None,
+            frozen_in: None,
+            hypervisor,
+        };
+        let mut state = MachineState::default();
+        for (name, online, hypervisor) in [
+            ("warm", true, HypervisorKind::Qemu),
+            ("cold", false, HypervisorKind::Qemu),
+            ("hv", true, HypervisorKind::Vmlab),
+        ] {
+            state
+                .snapshots
+                .insert(name.into(), record(online, hypervisor));
+        }
+        assert_eq!(state.qemu_online_snapshots(), ["warm"]);
     }
 }

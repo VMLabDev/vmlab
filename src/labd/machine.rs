@@ -631,6 +631,12 @@ pub trait Machine: Send + Sync + 'static {
         None
     }
 
+    /// The QEMU removal warning this machine earns: an x86 guest that runs
+    /// on QEMU, why, and the fix. Its online snapshots are the lab's to add.
+    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
+        None
+    }
+
     // ---- host USB passthrough (PRD §5.2.1) ---------------------------------
 
     /// Whether this machine can take a host USB device now: running, and
@@ -836,6 +842,7 @@ impl dyn Machine {
             recording: None,
             hypervisor: self.hypervisor(),
             hypervisor_fallback: self.hypervisor_fallback(),
+            qemu_removal: self.qemu_removal(),
             detail,
         }
     }

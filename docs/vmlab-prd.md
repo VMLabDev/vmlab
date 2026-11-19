@@ -2848,6 +2848,31 @@ the selected hypervisor and fallback reason. JSON includes `hypervisor` and
 Explicit vmlab selections, including a host override, still refuse unsupported
 hardware. Missing binaries and runtime failures do not trigger fallback.
 
+### 22.2 Amendment: the warning release before QEMU's x86 removal
+
+A later release removes QEMU for x86 and x86_64 guests. One release before it
+warns and changes nothing else. `up`, `vm start`, `validate` and `status`
+print one warning for each x86 machine that runs on QEMU. The warning names
+the machine, the reason and the fix. The reasons are the rungs above: an
+explicit `hypervisor = "qemu"`, the host default, the persisted identity,
+`qemu_args`, and a `vmlab_refusals` reason. Where vmlab-hv would still refuse
+the machine after the fix, the warning lists what it refuses. An x86 machine's
+`up` info line is replaced by its warning. A machine of another architecture
+is not warned.
+
+A host without usable KVM for x86 gets one warning per lab that has such a
+machine: x86 guests will need KVM.
+
+`status --json` is the listing. Each x86 machine on QEMU carries
+`qemu_removal { reason, warning, online_snapshots }`, where `reason` is
+`explicit`, `host_default`, `existing`, `qemu_args` or `refused`, and the lab
+carries `host_warnings`. A lab with no daemon answers from the lab file and
+its persisted state, with a top-level `qemu_removal` list that adds `machine`.
+`online_snapshots` names the machine's online snapshots taken under QEMU. They
+stay on disk. After the removal, restore of one by name is refused with a
+message to convert to offline first, and no converter exists: the user
+restores it, stops the machine and takes an offline snapshot before upgrading.
+
 Before the first boot can create disks, vmlab persists the selected hypervisor
 in `.vmlab/state.json`. The choice survives stops, reloads and daemon restarts
 until `destroy` or an explicit machine or host setting. Existing disks without

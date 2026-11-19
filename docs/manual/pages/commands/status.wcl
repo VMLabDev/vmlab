@@ -110,6 +110,20 @@ SRC
   DOC
 
   p <<DOC
+    An x86 machine that runs on QEMU prints a `warning:` line below its row
+    instead: QEMU support for x86 guests is going away, with the reason this
+    machine is on QEMU and the fix, and a second line listing its online QEMU
+    snapshots, which cannot be restored after the removal. A host without
+    usable KVM adds one `warning:` line under the table. JSON status carries
+    this as `qemu_removal` on the machine (`reason`, `warning` and
+    `online_snapshots`) and as `host_warnings` on the lab. A lab that is not
+    running prints the same warnings from the lab file and its saved state,
+    and its JSON answer has a top-level `qemu_removal` list whose entries
+    name their `machine`. See
+    [Getting ready for the removal](guide_host).
+  DOC
+
+  p <<DOC
     One row per machine with the columns `NAME`, `KIND` (`vm` or
     `container`), `STATUS`, `IP` and `TEMPLATE/IMAGE`. `STATUS` is a label
     the daemon derives from the power state, readiness and health, so every

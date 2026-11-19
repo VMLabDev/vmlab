@@ -454,6 +454,45 @@ DOC
 
   h2 "QEMU or vmlab-hv"
 
+  callout "QEMU support for x86 guests is going away" {
+    kind = :warning
+    body = "A later vmlab release removes QEMU for x86 and x86_64 guests: they will run on vmlab-hv only, which needs KVM. This release changes nothing about how a machine runs. It warns, at `vmlab up`, `vmlab vm start`, `vmlab validate` and `vmlab status`, for every x86 machine that runs on QEMU, with the reason and the fix. Guests of another architecture stay on QEMU and are not warned."
+  }
+
+  h3 "Getting ready for the removal"
+
+  p <<'DOC'
+Each warning names one machine, why it is on QEMU, and what to change:
+DOC
+
+  table {
+    rows:
+      | "Reason (`reason` in JSON)" | "Why the machine is on QEMU" | "Fix" |
+      | "`explicit`" | "It sets `hypervisor = \"qemu\"`." | "Set `hypervisor = \"vmlab\"`. Removing the line alone leaves a machine that already has disks on QEMU until it is destroyed." |
+      | "`host_default`" | "The host config sets `hypervisor { vm = \"qemu\" }` or `container = \"qemu\"`." | "Remove that default. A machine that already has disks then needs `hypervisor = \"vmlab\"` too, or a destroy." |
+      | "`existing`" | "Its disks were made under QEMU, and a machine keeps its hypervisor." | "Set `hypervisor = \"vmlab\"` on it, or destroy it with `vmlab vm destroy` or `vmlab container destroy` so the next `up` builds it on vmlab-hv." |
+      | "`qemu_args`" | "It declares `qemu_args`, which only QEMU takes." | "Remove `qemu_args`." |
+      | "`refused`" | "vmlab-hv cannot run it as declared, so automatic selection fell back." | "Change what the warning names. After the removal `hypervisor = \"qemu\"` is no longer a way out for an x86 guest." |
+  }
+
+  p <<'DOC'
+Where vmlab-hv would refuse the machine after the fix, the warning adds what
+it refuses, so one pass finds everything. On a host where `/dev/kvm` is not
+usable the lab gets one more warning: x86 guests run under QEMU's emulation
+(TCG) today and will need KVM. Enable virtualization in the firmware, load
+the kvm module and give your user access to `/dev/kvm`.
+
+An online snapshot taken under QEMU holds RAM and device state in QEMU's own
+format. Such snapshots stay on disk after the removal, but restoring one by
+name is refused, and vmlab has no converter. To keep one, restore it now,
+shut the machine down and take an offline snapshot, which either hypervisor
+restores. The warning lists each machine's online QEMU snapshots, and
+`vmlab status --json` carries the same listing: every x86 machine on QEMU has
+a `qemu_removal` object with `reason`, `warning` and `online_snapshots`, and
+the lab a `host_warnings` list when KVM is missing. A lab that is not running
+answers too, with a top-level `qemu_removal` list whose entries add `machine`.
+DOC
+
   p <<'DOC'
 Supported new x86_64 KVM VMs default to vmlab-hv. Other new VMs fall back
 to QEMU, with the reason in `status`, `status --json`, and an info line at `up`.

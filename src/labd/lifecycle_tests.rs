@@ -336,6 +336,22 @@ fn automatic_hypervisor_selection_follows_a_deferred_templates_hardware() {
     assert!(why.contains("qxl-vga"), "{why}");
 }
 
+/// A VM the lab builder left on QEMU reports the removal warning in its
+/// status, by the rung that chose QEMU; one nothing selected reports none.
+#[tokio::test]
+async fn a_qemu_vm_reports_the_removal_warning_in_its_status() {
+    use crate::config::hypervisor::{QemuReason, SelectionSource};
+    let dirs = Dirs::new();
+    let (mut machine, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    machine.set_host_facts(kvm_host());
+    assert_eq!(machine.qemu_removal(), None);
+    let machine = machine.with_selection_source(SelectionSource::Existing);
+    let removal = machine.qemu_removal().expect("an x86 VM on QEMU");
+    assert_eq!(removal.reason, QemuReason::Existing);
+    let machine: Arc<dyn Machine> = machine;
+    assert_eq!(machine.status().await.qemu_removal, Some(removal));
+}
+
 /// A legacy pc VM on vmlab-hv gets its e1000 or PCnet on a plain stream:
 /// vmlab-hv's emulated pc NICs take no TAP, and the same VM on QEMU does.
 #[test]
