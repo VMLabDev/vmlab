@@ -3,7 +3,134 @@
 **Verdict: D28 remains open. Round 7 met six of ten core bars. Card #71 then
 closed G1 (0.9770). Card #72 reran G2 and did not close it (1.0182). Card #73
 closed G6 (1.6307). Card #98 merged the ioeventfd wake of the virtio-blk
-worker (FD6) and reran both: G2 1.0240, G6 1.5416.**
+worker (FD6) and reran both: G2 1.0240, G6 1.5416. Card #97 moved the
+virtio-gpu 2D commands off the vCPU threads (FD5) and reran G2: 0.9361, with
+a boot time that did not move outside its spread.**
+
+## Round 7 follow-up: virtio-gpu 2D commands off the vCPU thread (card #97, 2026-11-19)
+
+The 2D commands of virtio-gpu no longer run on a vCPU thread, and a flush
+no longer composes a frame. The vCPU threads spend 2.0 seconds less of a
+Windows boot in the host. The boot time did not move outside its spread:
+the medians of six alternating boots are 91.83 seconds without the change
+and 91.52 with it. The compose time did not shrink. It moved to a frame
+thread, which says that Windows does not flush in bursts within a frame.
+
+### Change
+
+- The queues of the 2D device are served by a `QueueWorker`, as those of
+  virtio-blk are. The transport registers the queue eventfds with KVM on
+  the notify region of BAR2, so a kick does not exit to userspace. With a
+  renderer (`gpu = "virgl"` or `"venus"`) nothing changes: the queues are
+  served on the thread that kicks.
+- A flush records its damage and asks a frame thread for a frame. That
+  thread composes and publishes at most one frame per 16 ms, which holds
+  every flush before it and carries the timestamp of the newest. A lone
+  flush is published at once. SET_SCANOUT and RESOURCE_UNREF publish where
+  they are served, as before.
+- A kick no longer asks the GPU whether its scanout is native. That
+  question takes the device lock, which the worker holds while it serves a
+  batch. This is the probable cause of what card #72 saw with a worker
+  (vCPU CPU time fell, wall time did not): the vCPU that kicked slept on
+  the lock until the compose was over. A unit test holds the worker inside
+  a command and checks that a kick and a transport read return. The wait
+  itself was not measured in a boot.
+
+### Measurements
+
+All runs were on helios in one window with no build, check or other
+project VM: QEMU 11.1.3, CPUs 16 to 23, governor performance, 24 GiB
+scopes, Windows 10 19045.2006.10, fresh overlay per boot, the bundled OVMF
+pair, one-second readiness probes and the sync-latency probe of card #96
+(3.6 to 6.7 ms before every boot). The vmlab-hv binary of `0885e0cd` has
+SHA-256
+`eaf49e949df25f891debed8b3afe2a5d63c3cfacdeee842ebaae6db45d06bb11`, the
+base binary of `7352c514` (`next` before the card)
+`3d82fc7d9f1d0cedc5f666ab5c534853074c03a074c48b9271f4343a672a8446`, which
+is the binary card #98 measured, and the iPXE ROM
+`4f0b06896c9457499631ee07d0209aa3416fc82111ea3149cd86a78332a61268`. The
+monitor took 362 samples from 04:50:46 to 05:20:51 UTC on 2026-11-19:
+one-minute load 1.49 to 3.47, five-minute 2.05 to 2.88, and I/O pressure
+(`/proc/pressure/io`, some, 10 s) 43% to 75%, as in cards #73 and #98.
+Scripts, logs and raw results are on helios under
+`/home/vmlab/src/stc/logs/d28-card-97/`.
+
+- M1, gate rerun with the method of FD7: `bench/run.py --arch x86_64
+  --guest windows-10 --repeats 3`, three QEMU repeats and then three
+  vmlab-hv repeats.
+
+  | Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+  |---|---|---|---:|---|---:|---:|---|
+  | G2 | Windows 10 boot (s) | 102.82, 98.12, 94.92 | 98.12 | 102.95, 91.85, 89.38 | 91.85 | 0.9361 | PASS |
+
+  The ratio is under 1.00 for the first time, but three samples per side
+  with spreads of 7.9 and 13.6 seconds do not separate it from card #98's
+  1.0240: M2 shows no change of the boot time. Both aggregate records are
+  appended to [`history/x86_64.jsonl`](history/x86_64.jsonl). The runs
+  used a scratch copy of the tree, so the tool recorded no commit, and the
+  records carry `0885e0cd` by hand.
+- M2, Windows 10 boot, base against the change, six rounds of one boot
+  each, alternating, with the order reversed every round (`measure.sh`):
+
+  | Binary | Boot samples (s) | Median |
+  |---|---|---:|
+  | Base `7352c514` | 92.23, 91.43, 95.41, 91.27, 89.10, 97.19 | 91.83 |
+  | Change `0885e0cd` | 91.22, 95.90, 91.49, 102.70, 91.54, 91.24 | 91.52 |
+
+  The medians differ by 0.3 seconds, and the samples spread over 8.1
+  seconds for the base and 11.5 for the change. The change was faster in three rounds and slower
+  in three. This does not resolve an effect of 1.4 seconds.
+- M3, CPU time of the vmlab-hv threads over the boots of M2, from
+  `/proc/<pid>/task/*/stat` sampled every second (`cpusample.py`). Host
+  user time is user time less guest time.
+
+  | Binary | vCPU threads, host user (s) | vCPU threads, system (s) | GPU queue worker (s) | GPU frame thread (s) | Process, host (s) |
+  |---|---|---|---|---|---|
+  | Base | 9.80, 9.80, 9.58, 9.93, 9.74, 9.72 | 9.01, 9.14, 9.04, 9.12, 8.95, 8.96 | none | none | 23.57, 23.48, 23.24, 23.58, 23.20, 23.21 |
+  | Change | 7.65, 7.41, 7.85, 9.66, 7.83, 7.75 | 9.34, 9.55, 9.18, 9.16, 9.29, 9.11 | 0.18, 0.17, 0.16, 0.16, 0.17, 0.17 | 1.61, 1.59, 1.49, 1.68, 1.54, 1.62 | 23.42, 23.50, 23.24, 25.42, 23.46, 23.29 |
+
+  The vCPU threads' host user time falls from a median of 9.77 seconds to
+  7.79, by 2.0 seconds, in five of six boots. Their system time rises by
+  0.2 seconds. The fourth boot of the change is its slow one (102.70
+  seconds): the vCPU threads used 1.9 seconds more there. The first
+  vmlab-hv boot of M1 shows the same pair (102.95 seconds, 9.62), and QEMU
+  has such a boot too (102.82), so this is a mode of the guest's boot and
+  not of the change. The three boots of M1 measured the same thread times
+  as M2 (queue worker 0.16, frame thread 1.54 to 1.58).
+- M4, what did not happen. The frame thread uses 1.5 to 1.7 seconds per
+  boot, about what the commands cost on the vCPU threads before (1.4
+  seconds in card #72, for about 2,400 queue notifications). One compose
+  per frame interval saves little here, so most flushes still get a frame
+  of their own. The spacing of the flushes was not measured. A compose
+  still copies the whole frame twice and compares all of it.
+  The process uses the same host CPU time as before (23.2 to 23.6
+  seconds).
+
+### Verification
+
+`just ci::check` holds on the card's last commit. Four unit tests cover
+the change: the flushes of one frame interval publish one composed frame
+with the union of their damage, a flush is answered before its frame is
+composed, a kick returns while the worker serves a command, and the
+doorbells sit on the notify region of BAR2 and follow it. The merge bar
+ignores the tests that need KVM, so these ran alone on helios at
+`0885e0cd`: `kvm_tests` (11 passed) and `snapshot_tests` (24 passed) of
+`vmlab-hv-vmm`, and `viewer_input_and_resize_reach_guest_via_s1` of
+`vmlab-hv-viewer`, which boots Ubuntu on a 2D virtio-vga and checks its
+frames, a resize, input and a reset through the display socket.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD14: make a 2D compose cost what its damage costs. It copies the
+  frame twice (the previous pixels and the cached frame) and compares
+  every tile, where the flush rectangles bound what can have changed.
+  Worth up to 1.5 seconds of host CPU per Windows boot on the frame
+  thread, and no boot time.
+- FD15: G2 moves in two modes about 10 seconds apart on both backends
+  (M3), which is most of its spread. Finding what the guest does in the
+  slow boots would make the bar resolve smaller effects.
 
 ## Round 7 follow-up: virtio-blk kicks through an ioeventfd (card #98, 2026-11-19)
 
