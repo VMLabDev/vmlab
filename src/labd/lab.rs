@@ -1311,6 +1311,14 @@ impl LabRuntime {
 
     /// Boot one machine, whichever kind it is.
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.start_machine_with_output(name, None).await
+    }
+
+    pub(super) async fn start_machine_with_output(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         self.settle_pending(name).await?;
         self.prepare_disk_dir(name, None)?;
         self.clone_from_freeze(name).await?;
@@ -1318,7 +1326,7 @@ impl LabRuntime {
         // gate, so a reload is not held up behind it (§7.1).
         self.ensure_pulled(&[name.to_string()], None).await?;
         let _gate = self.rebuild_gate.read().await;
-        self.machine(name)?.start(self.services()).await
+        self.machine(name)?.start(self.services(), output).await
     }
 
     /// Set NOCOW on `name`'s disk directory when it is on btrfs, before the
@@ -1598,7 +1606,11 @@ impl LabRuntime {
     /// that is not eligible is never entered, so its readiness waits on
     /// nothing; one that is eligible but already current is held only for the
     /// one handshake it takes to find out.
-    pub async fn start_with_deferred_refresh(self: &Arc<Self>, name: &str) -> Result<()> {
+    pub async fn start_with_deferred_refresh(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         self.settle_pending(name).await?;
         let name = name.to_string();
         if self.refresh_could_be_owed(self.machine(&name)?.as_ref()) {
@@ -1606,7 +1618,7 @@ impl LabRuntime {
                 .lock_recover()
                 .insert(name.clone(), OwedRefresh::AtHandshake);
         }
-        self.start_machine(&name).await?;
+        self.start_machine_with_output(&name, output).await?;
         let m = &self.machine(&name)?;
         // Already running and ready, so no handshake is coming: a machine
         // other callers are already using is refreshed beside them, in the
@@ -1856,7 +1868,7 @@ impl LabRuntime {
         m.wait_state(PowerState::Stopped, Duration::from_secs(60))
             .await
             .map_err(|_| anyhow!("{name} did not stop for restart"))?;
-        self.start_machine(name).await?;
+        self.start_machine_with_output(name, Some(output)).await?;
         self.run_owed_first_boot(name, output).await
     }
 
@@ -2179,9 +2191,9 @@ impl LabRuntime {
                         if !first_boot {
                             hold = me.hold_for_inline_refresh(m.as_ref());
                         }
-                        me.start_machine(&n).await?;
+                        me.start_machine_with_output(&n, Some(&out)).await?;
                     } else {
-                        me.start_with_deferred_refresh(&n).await?;
+                        me.start_with_deferred_refresh(&n, Some(&out)).await?;
                     }
                     // The instance that booted: a reload may have rebuilt the
                     // one looked up above while it was still stopped (§7.1).
@@ -3469,6 +3481,12 @@ impl LabRuntime {
             state.machine_mut(name).snapshots.get(snap).cloned()
         }
         .ok_or_else(|| anyhow!("\"{name}\" has no snapshot \"{snap}\""))?;
+        let m = self.machine(name)?;
+        // Online state is bound to its capture hypervisor, including when
+        // it is stored in a frozen generation.
+        if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
+            return Err(crate::proto::CommandError::conflict(why).into());
+        }
         if let Some(g) = record.frozen_in {
             return Err(
                 crate::proto::CommandError::conflict(super::worktree::locked_refusal(
@@ -3481,13 +3499,6 @@ impl LabRuntime {
             );
         }
 
-        let m = self.machine(name)?;
-        // An online snapshot's RAM and device state are the format of the
-        // hypervisor that took it, which the machine may no longer run on
-        // (§22, D31). Refused before anything moves.
-        if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
-            return Err(crate::proto::CommandError::conflict(why).into());
-        }
         let workspace = self.workspace_of(name);
         // Before anything is rolled back, and before the syncer is taken off
         // the workspace: a refusal has to leave the machine exactly as it was.
@@ -3679,6 +3690,7 @@ impl LabRuntime {
     }
 
     pub async fn snapshots(&self, vm_name: &str) -> Result<Value> {
+        let hypervisor = self.machine(vm_name)?.hypervisor();
         let state = self.state.lock().await;
         let snaps = state
             .machines
@@ -3688,7 +3700,7 @@ impl LabRuntime {
         let mut listed = snaps
             .into_iter()
             .map(|(name, r)| {
-                json!({
+                let mut entry = json!({
                     "name": name,
                     "online": r.online,
                     "taken_at": r.taken_at,
@@ -3697,7 +3709,11 @@ impl LabRuntime {
                     "locked": r.frozen_in.is_some(),
                     "frozen_in": r.frozen_in,
                     "freeze_point": r.freeze_point,
-                })
+                });
+                if let Some(why) = r.hypervisor_refusal(vm_name, &name, hypervisor) {
+                    entry["unrestorable"] = Value::String(why);
+                }
+                entry
             })
             .collect::<Vec<_>>();
         if let Some(machine) = state.machines.get(vm_name) {
@@ -3786,10 +3802,28 @@ impl crate::labd::machine::LabServices for LabRuntime {
         &self,
         machine: &str,
         kind: crate::config::hypervisor::HypervisorKind,
+        migrating: bool,
+        output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
+        let previous = state.machine_mut(machine).hypervisor;
+        if previous == Some(kind) {
+            return Ok(());
+        }
         state.machine_mut(machine).hypervisor = Some(kind);
-        state.save(&self.lab_local)
+        if let Err(error) = state.save(&self.lab_local) {
+            state.machine_mut(machine).hypervisor = previous;
+            return Err(error);
+        }
+        drop(state);
+        if migrating {
+            let line = format!("info: {machine}: migrated from QEMU to vmlab-hv\n");
+            match output {
+                Some(output) => output(line),
+                None => daemon_log(machine)(line),
+            }
+        }
+        Ok(())
     }
 
     fn events(&self) -> &Arc<EventLog> {
@@ -4364,7 +4398,11 @@ mod tests {
 
         /// Readiness the way both adapters give it: the agent answers, the
         /// lab's `before_ready` settles what it owes the boot, then ready.
-        async fn start(self: Arc<Self>, lab: Arc<dyn LabServices>) -> Result<()> {
+        async fn start(
+            self: Arc<Self>,
+            lab: Arc<dyn LabServices>,
+            _output: Option<&crate::scripting::OutputSink>,
+        ) -> Result<()> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.note("start").await;
             *self.state.write().await = PowerState::Starting;
@@ -4955,7 +4993,7 @@ lab "t" {
         };
 
         for m in lab.machines().collect::<Vec<_>>() {
-            Arc::clone(&m).start(lab.services()).await.unwrap();
+            Arc::clone(&m).start(lab.services(), None).await.unwrap();
             lab.refresh_agent_with(&m, &sink, &shipped).await;
         }
         let out = said.lock().unwrap().clone();
@@ -6837,6 +6875,10 @@ fn main(lab: Lab) {
             .await
             .unwrap();
         assert_eq!(lab.vm("dc01").unwrap().macs, vec![mac]);
+        assert_eq!(
+            lab.machine("dc01").unwrap().hypervisor(),
+            crate::config::hypervisor::HypervisorKind::Vmlab
+        );
         assert_eq!(
             lab.vm("web").unwrap().macs,
             vec![crate::labd::state::generate_mac("l", "web", 0)]

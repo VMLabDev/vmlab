@@ -132,6 +132,8 @@ pub trait LabServices: Send + Sync + 'static {
         &self,
         _machine: &str,
         _kind: crate::config::hypervisor::HypervisorKind,
+        _migrating: bool,
+        _output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         Ok(())
     }
@@ -349,7 +351,11 @@ pub trait Machine: Send + Sync + 'static {
     /// The kind-specific work — a template clone and segment attachments for a
     /// VM, an image spec for a container — is implementation. What both need
     /// from the lab arrives through [`LabServices`].
-    async fn start(self: Arc<Self>, lab: Arc<dyn LabServices>) -> Result<()>;
+    async fn start(
+        self: Arc<Self>,
+        lab: Arc<dyn LabServices>,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()>;
 
     /// Roll this machine back to `snap` (PRD §7.3).
     ///
