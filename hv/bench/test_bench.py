@@ -228,6 +228,25 @@ class ResetMonitorTests(unittest.TestCase):
         self.assertIs(agent, second)
         self.assertEqual(len(calls), 3)
 
+    def test_windows_probe_interval_includes_time_spent_in_probe(self):
+        import run
+        now = 0.0
+        starts = []
+
+        def sleep(delay):
+            nonlocal now
+            self.assertGreater(delay, 0)
+            now += delay
+
+        with mock.patch.object(run.time, "monotonic", side_effect=lambda: now), \
+                mock.patch.object(run.time, "sleep", side_effect=sleep):
+            for _ in run.windows_probe_ticks(4):
+                starts.append(now)
+                now += 1.5 if now == 1 else 0.25
+
+        self.assertEqual(starts, [0, 1, 2.5, 3.5])
+        self.assertEqual(now, 4)
+
 
 class StatsTests(unittest.TestCase):
     def test_median_odd_and_even(self):

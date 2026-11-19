@@ -85,9 +85,19 @@ count and memory), N repeats, fresh qcow2 overlay per repeat:
    (the gate vmlab's provision script applies). Both current backends
    reboot in-process. The runner retains a respawn path for older
    vmlab-hv binaries that exit on reset. The clock starts at the first spawn.
+   The OVMF pair comes from vmlab's installed guest bundle, or from the
+   directory `VMLAB_BENCH_OVMF_DIR` names.
    During Windows readiness, control-socket reset events cancel commands on
    the previous agent session. The runner reconnects and repeats the same
    readiness probe instead of waiting for an exec timeout after a reboot.
+   Windows marker, OOBE, reboot detection and post-reboot Hello probes
+   target one-second intervals between starts. A slow guest command can
+   extend an interval. Before each launch the runner times `fdatasync`
+   on a fresh 4 KiB file in the overlay directory. This measures host
+   storage latency at launch and runs outside the boot timer. The
+   per-boot `result.json` records `host_sync_latency_ms`. History records
+   `env.readiness_probe_interval_s` and lists the sync latencies in
+   `env.repeat_host_sync_latency_ms` in the same order as `samples`.
 2. **blk_seq_read_mbps** — 1-MiB O_DIRECT reads over the template-backed
    overlay's allocated extent (`/dev/vda`), via bench/randblke.c copied in
    through the agent (the template ships no fio, and GNU dd's
@@ -249,6 +259,30 @@ the two spreads, or 5 % of the previous median. Cross-backend comparison
 is the phase bar; `bench-report` prints the hv/qemu ratio against it
 (TCG ≥ 1.00x, x86_64 boot ≤ 1.00x and throughput ≥ 0.80x) rather than
 gating on it, because the bar gates flipping a default, not every commit.
+
+## Windows readiness timing on helios (card #96)
+
+A short diagnostic on helios on 2026-11-18 UTC used harness commit
+`9e205fa9`, QEMU 11.1.3, Windows 10 template `19045.2006.10` (standard
+variant), four vCPUs pinned to CPUs 16–23, and the performance governor.
+
+| Repeat | Boot to ready (s) | Host fdatasync before launch (ms) |
+|---|---:|---:|
+| 1 | 141.32 | 5.135 |
+| 2 | 125.73 | 6.394 |
+
+The median was 133.53 s and the max-minus-min spread was 15.59 s (11.7%).
+At this median, 2% is 2.67 s and the one-second probe interval is 0.75%.
+At card #72's 94.96 s QEMU median, the interval is 1.05%, down from 5.27%
+for the previous five-second sleep alone. This describes the polling
+granularity for a single readiness phase. Guest command duration, several
+separately polled phases, and run-to-run variation all affect the total.
+The observed spread exceeds 2%. Another card's CI check overlapped the
+diagnostic, and the planned vmlab-hv binary disappeared from its build cache
+before that half of the run. A quiet-window comparison is still required
+to establish whether the end-to-end measurement can distinguish a 2% change.
+The raw record is at `/home/vmlab/src/stc/logs/card-96-windows/x86_64.jsonl`
+on helios.
 
 ## Profiling hooks
 
