@@ -559,3 +559,61 @@ fn bar_probes_pci_indirect_access_and_bounds() {
     assert!(modern.restore_state(&state).is_err());
     assert!(g.pci.restore_state(&modern.save_state().unwrap()).is_err());
 }
+
+#[test]
+fn notify_events_follow_activation_at_each_layout_notify_address() {
+    let modern = VirtioPciDevice::new(
+        "net",
+        Box::new(
+            Net::new(NetConfig {
+                id: "net".into(),
+                mac: [2, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                switch: "/nonexistent/vmlab-test-switch".into(),
+            })
+            .unwrap(),
+        ),
+        memory(),
+        None,
+        None,
+    );
+    for (mut pci, notify) in [(modern, 0x1000), (net(), 0x3000)] {
+        assert!(pci.notify_events().is_empty());
+        assert!(!pci.take_notify_change());
+        pci.bar_write(4, 0x14, &[0]);
+        pci.bar_write(4, 0x14, &[3]);
+        pci.bar_write(4, 8, &1u32.to_le_bytes());
+        pci.bar_write(4, 12, &1u32.to_le_bytes());
+        pci.bar_write(4, 0x14, &[11]);
+        for queue in 0..2u16 {
+            pci.bar_write(4, 0x16, &queue.to_le_bytes());
+            let base = DESC + u64::from(queue) * 0x4000;
+            for (off, addr) in [(0x20, base), (0x28, base + 0x1000), (0x30, base + 0x2000)] {
+                pci.bar_write(4, off, &addr.to_le_bytes());
+            }
+            pci.bar_write(4, 0x1c, &1u16.to_le_bytes());
+        }
+        assert!(pci.notify_events().is_empty());
+        pci.bar_write(4, 0x14, &[15]);
+        assert!(pci.activated);
+        assert!(pci.take_notify_change());
+        assert!(!pci.take_notify_change());
+        let events = pci.notify_events();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.bar, event.offset))
+                .collect::<Vec<_>>(),
+            [(4, notify), (4, notify + 4)]
+        );
+        // The address the event stands for reaches the same queue.
+        assert!(Arc::ptr_eq(
+            &events[1].event,
+            &pci.device().notify_event(1).unwrap()
+        ));
+
+        pci.bar_write(4, 0x14, &[0]);
+        assert!(pci.take_notify_change());
+        assert!(pci.notify_events().is_empty());
+    }
+}

@@ -17,9 +17,11 @@
 //! lock, but device service holds only the selected function's lock.
 
 use parking_lot::{Mutex, MutexGuard};
+use std::io;
 use std::sync::Arc;
 
 use vmlab_hv_devices::{BarInfo, BarKind, BusDevice, PciDevice};
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::layout::{IO_ALLOC_BASE, MMCONFIG_SIZE, MMIO32_BASE, MMIO32_SIZE, MMIO64_SIZE};
 
@@ -144,6 +146,20 @@ impl BarAllocator {
     }
 }
 
+/// Delivers a guest write at a guest-physical address as a count on an
+/// event, without a `bar_write` (KVM's ioeventfd). The root keeps the
+/// registrations equal to what it would decode itself.
+pub trait NotifyRegistrar: Send {
+    fn register(&mut self, address: u64, event: &EventFd) -> io::Result<()>;
+    fn unregister(&mut self, address: u64, event: &EventFd) -> io::Result<()>;
+}
+
+/// The registrar and what it holds now: function index, address, event.
+struct Notify {
+    registrar: Box<dyn NotifyRegistrar>,
+    active: Vec<(usize, u64, Arc<EventFd>)>,
+}
+
 /// The PCI root of the machine. Shared behind an `Arc<Mutex<...>>`.
 pub struct PciRoot {
     slots: Vec<Option<Function>>,
@@ -153,6 +169,7 @@ pub struct PciRoot {
     // Cache decoded targets, never register values. Exact addresses retain
     // ROM/BAR overlap priority until a config or topology change invalidates it.
     mmio_cache: [Option<CachedMmioBar>; 4],
+    notify: Option<Notify>,
 }
 
 #[derive(Clone, Copy)]
@@ -200,12 +217,17 @@ impl MmioTarget {
         }
     }
 
-    fn write(self, data: &[u8]) {
+    /// True when the write changed the device's notify events.
+    fn write(self, data: &[u8]) -> bool {
         if let Self::Bar {
             dev, bar, offset, ..
         } = self
         {
-            dev.lock().bar_write(bar, offset, data);
+            let mut dev = dev.lock();
+            dev.bar_write(bar, offset, data);
+            dev.take_notify_change()
+        } else {
+            false
         }
     }
 }
@@ -233,7 +255,11 @@ impl PciRoot {
         let resolved = start.map(|_| std::time::Instant::now());
         if let Some(target) = target {
             let location = target.location();
-            target.write(data);
+            if target.write(data)
+                && let Some((slot, ..)) = location
+            {
+                root.lock().sync_notify(slot);
+            }
             Self::log_mmio_time(start, resolved, addr, true, location);
             true
         } else {
@@ -253,6 +279,77 @@ impl PciRoot {
             let decode = resolved.duration_since(start);
             if service + decode > std::time::Duration::from_millis(1) {
                 log::debug!(target: "vmlab_hv_vmm::pci::latency", "PCI MMIO addr={addr:x} write={write} location={location:?} decode_ns={} service_ns={}", decode.as_nanos(), service.as_nanos());
+            }
+        }
+    }
+
+    /// Hand notify events to `registrar` from now on. Functions already
+    /// placed are registered at once.
+    pub fn set_notify_registrar(&mut self, registrar: Box<dyn NotifyRegistrar>) {
+        self.notify = Some(Notify {
+            registrar,
+            active: Vec::new(),
+        });
+        self.sync_all_notify();
+    }
+
+    fn sync_all_notify(&mut self) {
+        if self.notify.is_some() {
+            for index in 0..self.slots.len() {
+                self.sync_notify(index);
+            }
+        }
+    }
+
+    /// Make the registrations of the function at `index` equal to its notify
+    /// events at the addresses `decode_mmio` resolves now. A registration
+    /// that fails leaves the write to `bar_write`, which stays correct.
+    fn sync_notify(&mut self, index: usize) {
+        let Some(notify) = self.notify.as_mut() else {
+            return;
+        };
+        let mut wanted: Vec<(u64, Arc<EventFd>)> = Vec::new();
+        if let Some(func) = self.slots.get(index).and_then(Option::as_ref)
+            && !(self.firmware && func.command & 2 == 0)
+        {
+            for event in func.dev.lock().notify_events() {
+                if let Some(bar) = func.bars.iter().find(|bar| {
+                    bar.info.index == event.bar
+                        && !matches!(bar.info.kind, BarKind::Io)
+                        && !bar.sizing
+                        && bar.addr != 0
+                        && event.offset < bar.info.size
+                }) {
+                    wanted.push((bar.addr + event.offset, event.event));
+                }
+            }
+        } else if !notify.active.iter().any(|(slot, ..)| *slot == index) {
+            return;
+        }
+        let Notify { registrar, active } = notify;
+        active.retain(|(slot, address, event)| {
+            if *slot != index
+                || wanted
+                    .iter()
+                    .any(|(a, e)| a == address && Arc::ptr_eq(e, event))
+            {
+                return true;
+            }
+            if let Err(error) = registrar.unregister(*address, event) {
+                log::warn!("removing the notify event at {address:#x}: {error}");
+            }
+            false
+        });
+        for (address, event) in wanted {
+            if active
+                .iter()
+                .any(|(slot, a, e)| *slot == index && *a == address && Arc::ptr_eq(e, &event))
+            {
+                continue;
+            }
+            match registrar.register(address, &event) {
+                Ok(()) => active.push((index, address, event)),
+                Err(error) => log::warn!("registering a notify event at {address:#x}: {error}"),
             }
         }
     }
@@ -280,6 +377,7 @@ impl PciRoot {
             mmio64_end: mmio64_base + MMIO64_SIZE,
             firmware: false,
             mmio_cache: [None; 4],
+            notify: None,
         }
     }
 
@@ -516,14 +614,17 @@ impl PciRoot {
             offset += n;
             data = &data[n..];
         }
-        let mut dev = func.dev.lock();
-        func.command = dev.config_read(1) as u16;
-        for bar in &func.bars {
-            dev.set_bar_address(
-                bar.info.index,
-                (bar.addr != 0 && !bar.sizing).then_some(bar.addr),
-            );
+        {
+            let mut dev = func.dev.lock();
+            func.command = dev.config_read(1) as u16;
+            for bar in &func.bars {
+                dev.set_bar_address(
+                    bar.info.index,
+                    (bar.addr != 0 && !bar.sizing).then_some(bar.addr),
+                );
+            }
         }
+        self.sync_notify(slot as usize * 8 + function as usize);
         if let Some(start) =
             start.filter(|start| start.elapsed() > std::time::Duration::from_millis(1))
         {
@@ -591,7 +692,12 @@ impl PciRoot {
     /// Dispatch an MMIO write inside a BAR window.
     pub fn dispatch_mmio_write(&mut self, addr: u64, data: &[u8]) -> bool {
         if let Some(target) = self.decode_mmio(addr) {
-            target.write(data);
+            let location = target.location();
+            if target.write(data)
+                && let Some((slot, ..)) = location
+            {
+                self.sync_notify(slot);
+            }
             true
         } else {
             false
@@ -665,9 +771,16 @@ impl PciRoot {
 
     /// Dispatch a port-I/O write inside a BAR window.
     pub fn dispatch_io_write(&mut self, port: u16, data: &[u8]) -> bool {
-        self.find_bar(u64::from(port), true)
-            .map(|(mut dev, bar, offset, _)| dev.bar_write(bar, offset, data))
-            .is_some()
+        let Some((mut dev, bar, offset, slot)) = self.find_bar(u64::from(port), true) else {
+            return false;
+        };
+        dev.bar_write(bar, offset, data);
+        let changed = dev.take_notify_change();
+        drop(dev);
+        if changed {
+            self.sync_notify(slot);
+        }
+        true
     }
 
     /// Find the function and BAR covering `addr`, locking its device.
@@ -758,6 +871,8 @@ impl PciRoot {
             }
             func.command = func.dev.lock().config_read(1) as u16;
         }
+        // Device state restores before this, so activation is current too.
+        self.sync_all_notify();
         Ok(())
     }
 }
@@ -935,6 +1050,8 @@ mod tests {
         bar_log: Mutex<Vec<Access>>,
         config_log: Mutex<Vec<(usize, u64, Vec<u8>)>>,
         bar_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        events: Vec<vmlab_hv_devices::NotifyEvent>,
+        events_changed: bool,
     }
 
     impl FakePci {
@@ -946,6 +1063,8 @@ mod tests {
                 bar_log: Mutex::new(Vec::new()),
                 config_log: Mutex::new(Vec::new()),
                 bar_gate: None,
+                events: Vec::new(),
+                events_changed: false,
             }))
         }
     }
@@ -989,6 +1108,112 @@ mod tests {
             }
             self.bar_log.lock().push((bar, offset, data.to_vec(), true));
         }
+
+        fn notify_events(&self) -> Vec<vmlab_hv_devices::NotifyEvent> {
+            self.events.clone()
+        }
+
+        fn take_notify_change(&mut self) -> bool {
+            std::mem::take(&mut self.events_changed)
+        }
+    }
+
+    /// Records `(registered, address)` in call order.
+    struct RecNotify(Arc<Mutex<Vec<(bool, u64)>>>);
+
+    impl NotifyRegistrar for RecNotify {
+        fn register(&mut self, address: u64, _: &EventFd) -> io::Result<()> {
+            if address == 0xdead_0040 {
+                return Err(io::Error::other("refused"));
+            }
+            self.0.lock().push((true, address));
+            Ok(())
+        }
+        fn unregister(&mut self, address: u64, _: &EventFd) -> io::Result<()> {
+            self.0.lock().push((false, address));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn notify_registrations_follow_decode_and_the_device() {
+        let device = FakePci::new(test_bars());
+        let root = Arc::new(Mutex::new(PciRoot::q35(1 << 32)));
+        root.lock().add_device_at(3, 0, device.clone()).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let take = || std::mem::take(&mut *log.lock());
+        root.lock()
+            .set_notify_registrar(Box::new(RecNotify(log.clone())));
+        root.lock()
+            .config_write(0, 3, 0, 16, &0xc200_0000u32.to_le_bytes());
+        root.lock().config_write(0, 3, 0, 4, &2u16.to_le_bytes());
+        assert_eq!(take(), []);
+
+        // The device gains its events in a BAR write (a driver's DRIVER_OK).
+        let event = |bar, offset| vmlab_hv_devices::NotifyEvent {
+            bar,
+            offset,
+            event: Arc::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()),
+        };
+        {
+            let mut device = device.lock();
+            // Past the end of BAR 0, and in a BAR that does not exist.
+            device.events = vec![event(0, 0x40), event(0, 0x1000), event(1, 0)];
+            device.events_changed = true;
+        }
+        assert!(PciRoot::write_mmio(&root, 0xc200_0000, &[1]));
+        assert_eq!(take(), [(true, 0xc200_0040)]);
+        // Nothing changed: nothing is registered twice.
+        root.lock().config_write(0, 3, 0, 0x3c, &[5]);
+        assert!(PciRoot::write_mmio(&root, 0xc200_0000, &[1]));
+        assert_eq!(take(), []);
+
+        let saved = root.lock().save_bar_states();
+        root.lock().config_write(0, 3, 0, 4, &[0]);
+        assert_eq!(take(), [(false, 0xc200_0040)]);
+        root.lock().config_write(0, 3, 0, 4, &[2]);
+        assert_eq!(take(), [(true, 0xc200_0040)]);
+        root.lock()
+            .config_write(0, 3, 0, 16, &u32::MAX.to_le_bytes());
+        assert_eq!(take(), [(false, 0xc200_0040)]);
+        root.lock()
+            .config_write(0, 3, 0, 16, &0xc300_0000u32.to_le_bytes());
+        assert_eq!(take(), [(true, 0xc300_0040)]);
+        root.lock().restore_bar_states(&saved).unwrap();
+        assert_eq!(take(), [(false, 0xc300_0040), (true, 0xc200_0040)]);
+
+        // A refused registration leaves the address to `bar_write`.
+        root.lock()
+            .config_write(0, 3, 0, 16, &0xdead_0000u32.to_le_bytes());
+        assert_eq!(take(), [(false, 0xc200_0040)]);
+        assert!(root.lock().dispatch_mmio_write(0xdead_0040, &[9]));
+        root.lock()
+            .config_write(0, 3, 0, 16, &0xc200_0000u32.to_le_bytes());
+        assert_eq!(take(), [(true, 0xc200_0040)]);
+
+        // The device drops its events (a driver reset).
+        {
+            let mut device = device.lock();
+            device.events.clear();
+            device.events_changed = true;
+        }
+        assert!(root.lock().dispatch_mmio_write(0xc200_0000, &[0]));
+        assert_eq!(take(), [(false, 0xc200_0040)]);
+    }
+
+    #[test]
+    fn notify_registrations_use_preassigned_bars_without_firmware() {
+        let (root, device) = root_with_fake();
+        let address = u64::from(root.lock().config_read(0, 1, 0, 4) & !0xf);
+        device.lock().events = vec![vmlab_hv_devices::NotifyEvent {
+            bar: 0,
+            offset: 8,
+            event: Arc::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()),
+        }];
+        let log = Arc::new(Mutex::new(Vec::new()));
+        root.lock()
+            .set_notify_registrar(Box::new(RecNotify(log.clone())));
+        assert_eq!(*log.lock(), [(true, address + 8)]);
     }
 
     fn test_bars() -> Vec<BarInfo> {

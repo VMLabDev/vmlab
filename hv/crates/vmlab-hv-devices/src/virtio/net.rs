@@ -26,6 +26,12 @@
 //! one worker thread; the vCPU path sends wakeups or kernel kick eventfds. Receive is under backpressure: the
 //! worker stops reading the socket while frames are waiting for receiveq
 //! buffers.
+//!
+//! A switch-stream device also offers one event for all its queues
+//! (`notify_event`). Under KVM the PCI root registers it at each queue's
+//! notify address, so a kick wakes the worker from the kernel and the vCPU
+//! never leaves guest mode for it. `queue_notify` stays the path of every
+//! kick that is not registered.
 
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, VecDeque};
@@ -42,6 +48,7 @@ use std::time::{Duration, Instant};
 use virtio_queue::{Queue, QueueOwnedT, QueueState, QueueT};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, VolatileSlice};
+use vmm_sys_util::eventfd::EventFd;
 
 use crate::{DeviceError, GuestMemory, Snapshot, VirtioDevice, VirtioInterrupt};
 use vmlab_hv_proto::net::{
@@ -212,6 +219,9 @@ pub struct Net {
     commands: Sender<Cmd>,
     wake: UnixStream,
     wake_pending: Arc<AtomicBool>,
+    /// Queue kicks the hypervisor delivers without a `queue_notify` call
+    /// (`notify_event`). The worker serves a count like a wakeup.
+    kick: Arc<EventFd>,
     worker: Option<JoinHandle<()>>,
     /// Queue states restored before `activate`, applied when it arrives.
     pending_queues: Option<Vec<Option<QueueState>>>,
@@ -244,6 +254,7 @@ impl Net {
         wake_dev.set_nonblocking(true)?;
         wake_worker.set_nonblocking(true)?;
         let wake_pending = Arc::new(AtomicBool::new(false));
+        let kick = Arc::new(EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?);
         let (commands, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared {
             tap_mode: false,
@@ -274,7 +285,19 @@ impl Net {
             let shared = shared.clone();
             let negotiated = negotiated.clone();
             let pending = wake_pending.clone();
-            move || run(switch, retry, shared, negotiated, rx, wake_worker, pending)
+            let kick = kick.clone();
+            move || {
+                run(
+                    switch,
+                    retry,
+                    shared,
+                    negotiated,
+                    rx,
+                    wake_worker,
+                    pending,
+                    kick,
+                )
+            }
         })?;
         Ok(Net {
             queue_sizes: vec![QUEUE_SIZE; usize::from(pairs.map_or(2, |pairs| 2 * pairs + 1))],
@@ -284,6 +307,7 @@ impl Net {
             commands,
             wake: wake_dev,
             wake_pending,
+            kick,
             worker: Some(worker),
             pending_queues: None,
         })
@@ -318,6 +342,7 @@ fn lock(shared: &Arc<Mutex<Shared>>) -> MutexGuard<'_, Shared> {
 // ---- the worker thread ------------------------------------------------------
 
 /// Connect to the switch, exchange frames, and reconnect when it drops.
+#[allow(clippy::too_many_arguments)]
 fn run(
     switch: PathBuf,
     retry: Duration,
@@ -326,6 +351,7 @@ fn run(
     cmds: Receiver<Cmd>,
     wake: UnixStream,
     wake_pending: Arc<AtomicBool>,
+    kick: Arc<EventFd>,
 ) {
     let mut stream: Option<UnixStream> = None;
     let mut next_try = Instant::now();
@@ -340,12 +366,14 @@ fn run(
             fire_config(&shared);
         }
 
-        let mut polls: Vec<libc::pollfd> = Vec::with_capacity(2);
-        polls.push(libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        let mut polls: Vec<libc::pollfd> = Vec::with_capacity(3);
+        for fd in [wake.as_raw_fd(), kick.as_raw_fd()] {
+            polls.push(libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         if let Some(stream) = &stream {
             let mut events = 0;
             if rx_may_read(&shared) {
@@ -388,7 +416,13 @@ fn run(
             return;
         }
 
-        if polls[0].revents & libc::POLLIN != 0 {
+        let kicked = polls[1].revents & libc::POLLIN != 0;
+        if kicked {
+            // Clear the count before the queues are read: a kick that lands
+            // after this read leaves the event readable for the next poll.
+            let _ = kick.read();
+        }
+        if polls[0].revents & libc::POLLIN != 0 || kicked {
             drain_wakeup(&wake);
             // Rearm before consuming commands. Earlier senders are covered by
             // this drain; later senders must publish another readable byte.
@@ -416,7 +450,7 @@ fn run(
         }
 
         if stream.is_some() {
-            let revents = polls[1].revents;
+            let revents = polls[2].revents;
             let dead = revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
             if revents & libc::POLLIN != 0 {
                 let features = negotiated.load(Ordering::Acquire);
@@ -1816,6 +1850,14 @@ impl VirtioDevice for Net {
         drop(sh);
         self.wake_worker();
         Ok(())
+    }
+
+    /// Every queue of a switch-stream device wakes the one worker, so they
+    /// share one event. A TAP device keeps `queue_notify`: its kernel queues
+    /// take their kicks by index.
+    fn notify_event(&self, index: u16) -> Option<Arc<EventFd>> {
+        (usize::from(index) < self.queue_sizes.len() && !lock(&self.shared).tap_mode)
+            .then(|| self.kick.clone())
     }
 
     fn queue_notify(&mut self, index: u16) {
@@ -3856,6 +3898,36 @@ mod tests {
         wait_for("tx buffer returned", || f.vqs[1].used_idx(&f.mem) == 1);
         let (_, len) = f.vqs[1].used_entry(&f.mem, 0);
         assert_eq!(len as usize, 12 + frame.len());
+    }
+
+    #[test]
+    fn notify_event_transmits_without_a_queue_notify_call() {
+        let mut f = Fixture::new();
+        let mut switch = f.take_switch_side();
+        switch
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // The connection is up and the worker sleeps in poll.
+        wait_for("link up", || lock(&f.dev.shared).link_up);
+
+        let event = f.dev.notify_event(1).expect("the transmitq has an event");
+        assert!(Arc::ptr_eq(&event, &f.dev.notify_event(0).unwrap()));
+        assert!(f.dev.notify_event(2).is_none());
+        for frame in [&b"first frame"[..], &b"second frame"[..]] {
+            f.queue_tx(frame);
+            // What KVM does for a registered notify write.
+            event.write(1).unwrap();
+            let mut prefix = [0u8; 4];
+            switch.read_exact(&mut prefix).unwrap();
+            assert_eq!(u32::from_be_bytes(prefix), frame.len() as u32);
+            let mut got = vec![0u8; frame.len()];
+            switch.read_exact(&mut got).unwrap();
+            assert_eq!(got, frame);
+        }
+        wait_for("tx buffers returned", || f.vqs[1].used_idx(&f.mem) == 2);
+
+        lock(&f.dev.shared).tap_mode = true;
+        assert!(f.dev.notify_event(1).is_none());
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod factory;
 mod gpu;
 pub mod host;
 pub mod hyperv;
+mod ioevent;
 pub mod kvm;
 pub mod layout;
 pub mod loader;

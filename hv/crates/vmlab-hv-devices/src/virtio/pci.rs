@@ -28,8 +28,8 @@ use parking_lot::Mutex;
 use virtio_queue::{Queue, QueueT};
 
 use crate::{
-    BarInfo, BarKind, DeviceError, GuestMemory, IrqLine, MsiMessage, MsiSink, PciDevice,
-    PciSnapshot, Snapshot, VirtioDevice, VirtioInterrupt,
+    BarInfo, BarKind, DeviceError, GuestMemory, IrqLine, MsiMessage, MsiSink, NotifyEvent,
+    PciDevice, PciSnapshot, Snapshot, VirtioDevice, VirtioInterrupt,
 };
 
 #[path = "transitional.rs"]
@@ -299,6 +299,8 @@ pub struct VirtioPciDevice {
     queue_select: u16,
     queue_cfg: Vec<QueueCfg>,
     activated: bool,
+    /// Activation changed since the PCI root last asked for notify events.
+    notify_dirty: bool,
     // PCI state the guest writes.
     command: u16,
     bar4: u64,
@@ -413,6 +415,7 @@ impl VirtioPciDevice {
             queue_select: 0,
             queue_cfg,
             activated: false,
+            notify_dirty: false,
             command: 0,
             bar4: 0,
             interrupt_line: 0,
@@ -460,6 +463,7 @@ impl VirtioPciDevice {
                 ..QueueCfg::default()
             };
         }
+        self.notify_dirty |= self.activated;
         self.activated = false;
         if let Some(legacy) = &mut self.transitional {
             legacy.active = false;
@@ -558,7 +562,10 @@ impl VirtioPciDevice {
         let interrupt: Arc<dyn VirtioInterrupt> =
             Arc::new(TransportInterrupt::new(Arc::clone(&self.int)));
         match self.device.activate(self.mem.clone(), interrupt, queues) {
-            Ok(()) => self.activated = true,
+            Ok(()) => {
+                self.activated = true;
+                self.notify_dirty = true;
+            }
             Err(_) => self.driver_status |= device_status::DEVICE_NEEDS_RESET,
         }
     }
@@ -849,6 +856,34 @@ impl PciDevice for VirtioPciDevice {
             size: BAR_SIZE,
             kind: BarKind::Mmio64 { prefetchable: true },
         }]
+    }
+
+    /// One event per queue the device can be woken through, at that queue's
+    /// notify address. Only an activated device has any: before DRIVER_OK a
+    /// notify write does nothing, and firmware that sizes BARs then costs no
+    /// registration.
+    fn notify_events(&self) -> Vec<NotifyEvent> {
+        if !self.activated {
+            return Vec::new();
+        }
+        let base = if self.transitional.is_some() {
+            transitional::NOTIFY_BAR_OFF
+        } else {
+            NOTIFY_OFF
+        };
+        (0..self.num_queues() as u16)
+            .filter_map(|queue| {
+                Some(NotifyEvent {
+                    bar: BAR_INDEX,
+                    offset: base + u64::from(queue) * NOTIFY_OFF_MULTIPLIER,
+                    event: self.device.notify_event(queue)?,
+                })
+            })
+            .collect()
+    }
+
+    fn take_notify_change(&mut self) -> bool {
+        std::mem::take(&mut self.notify_dirty)
     }
 
     fn bar_read(&mut self, bar: u8, offset: u64, data: &mut [u8]) {

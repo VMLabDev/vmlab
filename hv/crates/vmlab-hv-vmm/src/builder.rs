@@ -664,6 +664,9 @@ pub fn build(
     pci_root
         .lock()
         .set_mmio64_window(layout.mmio64_base, layout.mmio64_size);
+    pci_root
+        .lock()
+        .set_notify_registrar(Box::new(crate::ioevent::KvmNotify(kvm.vm.clone())));
     let config_io = Arc::new(Mutex::new(PciConfigIo::new(pci_root.clone())));
     io_bus
         .register(0xCF8, 8, config_io.clone())

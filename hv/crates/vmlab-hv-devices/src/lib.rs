@@ -87,6 +87,24 @@ pub trait PciDevice: Send {
     fn bars(&self) -> Vec<BarInfo>;
     fn bar_read(&mut self, bar: u8, offset: u64, data: &mut [u8]);
     fn bar_write(&mut self, bar: u8, offset: u64, data: &[u8]);
+    /// The BAR writes that only signal an event, as the device stands now.
+    /// The PCI root may have the hypervisor deliver them without `bar_write`.
+    fn notify_events(&self) -> Vec<NotifyEvent> {
+        Vec::new()
+    }
+    /// True once after a `bar_write` changed what `notify_events` returns.
+    fn take_notify_change(&mut self) -> bool {
+        false
+    }
+}
+
+/// A guest write of any width and value at `offset` in memory BAR `bar`
+/// whose whole effect is one count added to `event`.
+#[derive(Clone)]
+pub struct NotifyEvent {
+    pub bar: u8,
+    pub offset: u64,
+    pub event: Arc<vmm_sys_util::eventfd::EventFd>,
 }
 
 /// Interrupt delivery a virtio transport gives its device.
@@ -123,6 +141,12 @@ pub trait VirtioDevice: Snapshot + Send {
     ) -> Result<(), DeviceError>;
     /// The driver kicked queue `index`.
     fn queue_notify(&mut self, index: u16);
+    /// An event that stands for `queue_notify(index)`: one count added to it
+    /// has the same effect, and may arrive before activation or after reset.
+    /// A device that returns one keeps serving `queue_notify` as well.
+    fn notify_event(&self, _index: u16) -> Option<Arc<vmm_sys_util::eventfd::EventFd>> {
+        None
+    }
     /// The driver reset the device. Returns to the pre-activation state.
     fn reset(&mut self);
 }
