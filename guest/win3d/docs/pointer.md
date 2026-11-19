@@ -88,3 +88,29 @@ The viewer draws from the same frame protocol messages the `shapes` check
 reads. No check looks at a viewer window.
 
 The script is not part of `tests/e2e/run.sh` and its 12 Done checks.
+
+## Verification
+
+On 2026-11-20, on helios, vmlab-hv built from `next`, the package built at
+`de4169bd` (driver `100.6.101.58106`, `HWCursor` 1 in the class key), a fresh
+`windows-11` lab for each host GPU:
+
+| Host GPU | `tests/e2e/run.sh` | `tests/e2e/pointer.sh` |
+| --- | --- | --- |
+| `AMD1` | 12 of 12 | 5 of 5 |
+| `Nvidia2` | 12 of 12, no Xid in the kernel log | 5 of 5 |
+
+In both runs the frame protocol held the arrow at (200,300) with hotspot
+(0,0), the I-beam at (320,300) with hotspot (8,9), the resize pointer at
+(440,300) with hotspot (11,4), nothing in the hidden step and the arrow at
+(680,300), which are the positions the guest script set. RFB carried all four
+kinds. The I-beam had 26 black and 54 white pixels. 31 captures showed the
+test window and none had a pointer in it.
+
+A first build sent the image's top left corner and hid with a move. The
+check failed it on both: the I-beam was reported at (312,291), and the
+hidden step still had a visible arrow.
+
+Not run: the check against the package before this patch, more than one
+display, a pointer above 64×64, and a device reset while the pointer is on
+(`RestoreCursor` is covered by the compile only).
