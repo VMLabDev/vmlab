@@ -2032,6 +2032,23 @@ but for the guest doing something catastrophic and the syncer faithfully
 replicating it onto the canonical copy. A single deletion still propagates
 immediately; the guard is about mass.
 
+**An absence nothing saw is not a deletion** (#190). The mass guard is about
+deletions somebody made; this is about a path the guest merely does not hold
+when the syncer looks again **after a break in the watch** — a new syncer for a
+machine that stopped, or a reopened channel. A guest answers for a write from
+its cache, and one stopped hard a moment later comes back without the file, so
+the ledger agrees about a path the guest never durably had. Reading that as a
+guest-side delete removes the canonical copy of a file nobody deleted. So the
+walk after a break never deletes from the host on absence alone, **for any
+count**. Every agreement starts *unconfirmed* and is borne out by the first
+walk after a break that still finds the path in the guest. An unconfirmed path
+found missing is the interrupted transfer: the agreement is dropped and the
+path **copied again**. A confirmed one found missing is a **halt on that
+path** — `--host` copies it back, `--guest` says it was a deletion — and it
+stays withheld, durably and by name in the ledger, on the passes after the
+break. An overflow is not a break: the watch stayed open and the guest stayed
+up, so the walk it forces reads a missing path as the deletion it is.
+
 **Renames are delete + create at the ledger level.** The two platforms disagree
 on rename events, so a syncer that *depends* on one forks by platform, which
 *one mechanism, every machine kind* forbids. Delete+create needs no rename event

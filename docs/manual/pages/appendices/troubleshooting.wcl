@@ -362,6 +362,12 @@ MSG
     halts. A line under `deferred while git holds a lock` is timing, not a
     conflict, and clears itself when the lock goes.
   DOC
+  p <<DOC
+    A halted path that says `the guest no longer holds it, and nothing saw it
+    deleted` was found missing in the guest after the machine or its watch
+    stopped. The host copy is kept. `vmlab dev sync resolve <path> --host`
+    copies it back into the guest, and `--guest` deletes it on the host.
+  DOC
 
   h2 "A snapshot capture is refused"
   code text { source = <<'MSG'

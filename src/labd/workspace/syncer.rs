@@ -821,6 +821,16 @@ async fn run(
     // drained yet, and the guest may have moved under a ledger that predates
     // this process.
     let mut rescan = true;
+    // Whether the walk that is owed follows a **break**: nothing was watching
+    // the guest, and it may not even be the same boot. Every (re)open of the
+    // watch is one. An overflow is not — the watch stayed open and the guest
+    // stayed up — so its walk reads a missing path as the deletion it is.
+    // Cleared by a completed pass, like the barrier.
+    let mut unwitnessed = true;
+    // The watch is being reopened by the syncer itself, on a guest it was
+    // talking to a moment ago — see [`Pending::bears_out`].
+    let mut same_guest = false;
+    let mut bears_out = true;
     let mut due = true;
     // Guest-side lock files seen and not yet observed gone. The watcher names
     // a path once, at the moment it appears, so a lock held across several
@@ -960,6 +970,8 @@ async fn run(
                     // one exception is the open that follows a re-seed, where
                     // the answer is already in hand.
                     rescan = !std::mem::take(&mut seeded);
+                    unwitnessed = rescan;
+                    bears_out = !std::mem::take(&mut same_guest);
                     due = true;
                 }
                 Err(e) => {
@@ -1070,6 +1082,8 @@ async fn run(
                         .cloned()
                         .collect(),
                     rescan,
+                    unwitnessed: rescan && unwitnessed,
+                    bears_out: rescan && unwitnessed && bears_out,
                     flush,
                     lock_candidates: &lock_candidates,
                     resolved: &resolutions,
@@ -1096,6 +1110,7 @@ async fn run(
                     }
                     // The barrier lifts only on a completed walk.
                     rescan = false;
+                    unwitnessed = false;
                     // Nothing the pass declined to decide is forgotten.
                     owed.extend(done.deferred);
                     host_dirty = done.host_deferred;
@@ -1140,6 +1155,7 @@ async fn run(
                         // agreement.
                         prune = done.prune;
                         guest_watch = None;
+                        same_guest = true;
                         continue;
                     }
                 }
@@ -1540,6 +1556,17 @@ struct Pending<'a> {
     /// Take the stat-walk rather than probing named paths, and do not
     /// propagate anything until it has completed.
     rescan: bool,
+    /// The walk follows a **break in the watch** — a new syncer or a reopened
+    /// channel, not an overflow — so an agreed path the guest does not hold is
+    /// an absence nothing saw, never a deletion to carry onto the host
+    /// ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
+    unwitnessed: bool,
+    /// That walk may also **bear agreements out**
+    /// ([`Ledger::unconfirmed`]): the guest may have been away and come back,
+    /// so a path it still holds was durably there. Not so where the syncer
+    /// itself reopened the watch for a changed prune list — the same guest,
+    /// seconds later, proves nothing about what a hard stop would keep.
+    bears_out: bool,
     /// A verb is waiting: a walk cannot establish a guest path's quiet period.
     flush: bool,
     /// Guest-side git locks seen on an earlier pass and not yet observed gone.
@@ -1793,6 +1820,19 @@ async fn pass(
         .map(|(path, _)| path.clone())
         .collect();
 
+    // The walk after a break is the one look at the guest that can bear an
+    // agreement out: a path still there once the watch, or the machine, has
+    // been away and come back was durably there. What it finds missing keeps
+    // its mark, which is what tells the plan to copy it again (#190).
+    let mut bookkeeping = false;
+    if pending.bears_out {
+        let before = ledger.unconfirmed.len();
+        ledger
+            .unconfirmed
+            .retain(|path| !probe.tree.contains_key(path));
+        bookkeeping = ledger.unconfirmed.len() != before;
+    }
+
     let plan = reconcile(&Inputs {
         host: &scan.tree,
         guest: &probe.tree,
@@ -1802,6 +1842,7 @@ async fn pass(
         resolved: pending.resolved,
         max_file_bytes: workspace.max_file_bytes,
         case_folding: learned.case_folding(),
+        unwitnessed: pending.unwitnessed,
     });
 
     // Before the transfer, always, and naming the file and both ways out.
@@ -1960,7 +2001,14 @@ async fn pass(
     // the syncer holding it — so without this, stopping a machine would be a
     // way to lose the refusal along with it.
     let halted_now = halt.as_ref().map(Halt::paths).unwrap_or_default();
+    // Absences nothing saw stay withheld by name, because the break that made
+    // them unwitnessed is over by the next pass.
+    if ledger.withheld != plan.withheld {
+        ledger.withheld = plan.withheld.clone();
+        bookkeeping = true;
+    }
     if !plan.nothing_to_record()
+        || bookkeeping
         || ledger.ignore_digest != record_rules
         || ledger.prune != prune
         || ledger.halted != halted_now
@@ -2241,6 +2289,7 @@ mod tests {
     use super::super::guest::fake::{FakeGuest, FakeWatcher, Node};
     use super::*;
     use crate::labd::workspace::ledger::Ledger;
+    use crate::labd::workspace::plan::ConflictKind;
 
     #[test]
     fn workspace_lock_child_probe() {
@@ -2422,6 +2471,8 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan: true,
+                unwitnessed: false,
+                bears_out: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
@@ -2745,6 +2796,8 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan,
+                unwitnessed: false,
+                bears_out: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
@@ -3128,6 +3181,8 @@ mod tests {
             host_dirty: &BTreeSet::new(),
             in_flight: BTreeSet::new(),
             rescan: true,
+            unwitnessed: false,
+            bears_out: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
             resolved: &BTreeMap::new(),
@@ -3966,6 +4021,133 @@ mod tests {
         assert!(
             !dir.path().join("f00.rs").exists(),
             "the deletion never went"
+        );
+        syncers.stop("dev01").await;
+    }
+
+    /// **An interrupted pass never costs the host a file** (#190). The machine
+    /// stops and comes back without a file the guest had already answered
+    /// for — a guest stopped hard loses what it had not written out — while
+    /// the ledger still agrees about it. The new syncer's walk finds an
+    /// agreed path the guest does not hold, and that used to read as a
+    /// guest-side delete and remove the canonical copy. The agreement had
+    /// never been borne out, so the path is copied again instead.
+    #[tokio::test]
+    async fn a_machine_stopped_mid_seed_loses_no_host_file_and_resumes_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept.rs"), "kept").unwrap();
+        std::fs::write(dir.path().join("lost.rs"), "source nobody deleted").unwrap();
+        let (syncers, guest, _sessions) = seeded_lab(dir.path(), state.path(), "/src/lost.rs").await;
+        let ledger_path = Ledger::path(state.path(), "dev01");
+        let recorded = {
+            let (path, root) = (ledger_path.clone(), dir.path().to_path_buf());
+            eventually(move || {
+                Ledger::load(&path, &root, "/src")
+                    .entries
+                    .contains_key("lost.rs")
+            })
+            .await
+        };
+        assert!(recorded, "the seed was never recorded");
+        syncers.stop("dev01").await;
+
+        // The machine went down hard, and came back without it.
+        guest.unlink("/src/lost.rs");
+
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                workspace(dir.path(), state.path()),
+                OneFake::new(guest.clone()),
+                events,
+            )
+            .await;
+        let copied = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/lost.rs").is_some()).await
+        };
+        assert!(copied, "the copy never resumed: {:?}", guest.paths());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lost.rs")).unwrap(),
+            "source nobody deleted",
+            "the canonical copy was touched"
+        );
+        let report = syncers.get("dev01").await.expect("no syncer").report();
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        syncers.stop("dev01").await;
+    }
+
+    /// The other half: an agreement a restart **had** borne out, and the
+    /// guest's copy gone at the next one with nothing having seen it go. That
+    /// may be a deletion, and it may be a disk that came back older — the
+    /// host cannot tell, and one of the two destroys the only good copy. So a
+    /// single path is held, the host file stays, and it stays held on the
+    /// passes after the break until the developer answers.
+    #[tokio::test]
+    async fn a_guest_copy_missing_after_a_restart_is_held_rather_than_deleted_on_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "agreed").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "other").unwrap();
+        let (syncers, guest, _sessions) = seeded_lab(dir.path(), state.path(), "/src/other.rs").await;
+        let ledger_path = Ledger::path(state.path(), "dev01");
+        let on_disk = {
+            let (path, root) = (ledger_path.clone(), dir.path().to_path_buf());
+            move || Ledger::load(&path, &root, "/src")
+        };
+        let recorded = {
+            let on_disk = on_disk.clone();
+            eventually(move || on_disk().entries.len() == 2).await
+        };
+        assert!(recorded, "the seed was never recorded");
+        syncers.stop("dev01").await;
+
+        // A clean restart: the walk finds both files, which bears them out.
+        let start = |guest: Arc<FakeGuest>| {
+            let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+            let syncers = WorkspaceSyncers::default();
+            let sessions = OneFake::new(guest);
+            let ws = workspace(dir.path(), state.path());
+            async move {
+                syncers.start(ws, sessions.clone(), events).await;
+                (syncers, sessions)
+            }
+        };
+        let (syncers, _sessions) = start(guest.clone()).await;
+        let borne_out = {
+            let on_disk = on_disk.clone();
+            eventually(move || on_disk().unconfirmed.is_empty()).await
+        };
+        assert!(borne_out, "the restart never bore the agreements out");
+        syncers.stop("dev01").await;
+
+        // Down again, and this time one file is not there afterwards.
+        guest.unlink("/src/main.rs");
+        let (syncers, _sessions) = start(guest.clone()).await;
+        let halt = halt_of(&syncers, "dev01")
+            .await
+            .expect("an unwitnessed absence was not held");
+        assert_eq!(halt.paths(), vec!["main.rs".to_string()]);
+        assert_eq!(halt.conflicts[0].kind, ConflictKind::MissingUnseen);
+        assert!(dir.path().join("main.rs").exists(), "the host copy went");
+
+        // An ordinary pass later — the break is over — it is still held.
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        let report = syncer.pass_now().await.expect("no pass");
+        assert!(report.halt.is_some(), "the halt lasted one pass");
+        assert!(dir.path().join("main.rs").exists(), "the host copy went");
+
+        // `--host` puts the guest's copy back; nothing was ever lost.
+        syncer
+            .resolve(vec!["main.rs".into()], Winner::Host)
+            .await
+            .expect("the resolution never completed");
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("agreed"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "agreed"
         );
         syncers.stop("dev01").await;
     }

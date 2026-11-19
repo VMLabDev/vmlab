@@ -27,7 +27,7 @@
 //! wipes it: the guest tree is gone and there is nothing left to have agreed
 //! with.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -155,6 +155,31 @@ pub struct Ledger {
     /// holding it.
     #[serde(default)]
     pub halted: Vec<String>,
+    /// Agreements no later look at the guest has borne out (§19.6, #190).
+    ///
+    /// An apply is verified before it is recorded, but what it verifies is
+    /// what the guest *answered*, and a guest answers from its cache: a
+    /// machine stopped hard a moment later can come back without the file.
+    /// So every agreement starts here, and leaves when a walk that follows a
+    /// **break in the watch** — a new syncer, a reopened channel — finds the
+    /// guest still holding the path. A path still here that such a walk finds
+    /// missing was most likely never durably there, so it is **copied again**
+    /// rather than read as a guest-side delete.
+    ///
+    /// A ledger written before this field existed has none, which reads as
+    /// "everything was borne out" — the side that asks rather than re-copies.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unconfirmed: BTreeSet<String>,
+    /// Paths whose guest copy went missing **with nothing watching**, and
+    /// whose removal from the canonical copy is therefore withheld until a
+    /// developer answers for it (§19.6, #190).
+    ///
+    /// Durable, and per path, because the break that made the absence
+    /// unwitnessed is over by the next pass: without this the pass after the
+    /// halt would see an agreed path the guest no longer holds and delete the
+    /// host's copy after all.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub withheld: BTreeSet<String>,
     /// Keyed by `/`-separated path relative to the workspace root.
     pub entries: BTreeMap<String, Agreed>,
 }
@@ -171,8 +196,23 @@ impl Ledger {
             prune: Vec::new(),
             reseed_owed: false,
             halted: Vec::new(),
+            unconfirmed: BTreeSet::new(),
+            withheld: BTreeSet::new(),
             entries: BTreeMap::new(),
         }
+    }
+
+    /// Record that both sides hold `agreed` at `path`, as an agreement nothing
+    /// has borne out yet — see [`unconfirmed`](Ledger::unconfirmed).
+    pub fn agree(&mut self, path: &str, agreed: Agreed) {
+        self.entries.insert(path.to_string(), agreed);
+        self.unconfirmed.insert(path.to_string());
+    }
+
+    /// Drop the agreement at `path`, and everything that was said about it.
+    pub fn forget(&mut self, path: &str) {
+        self.entries.remove(path);
+        self.unconfirmed.remove(path);
     }
 
     /// A ledger about no workspace at all — what a machine that declares none
