@@ -710,14 +710,20 @@ fn kernel_slide(client: &mut Client) -> Option<u16> {
 }
 
 /// The top 256 MiB below 2 GiB, where OVMF, OpenCore and boot.efi keep
-/// their pools and logs: what a boot stuck before XNU last said. A boot
+/// their pools and logs, then the first 36 MiB: what a boot stuck before XNU
+/// last said, and what lay under the kernel's lowest slides. A boot
 /// with the census's fake key puts no secret there.
 fn dump_firmware_ram(client: &mut Client, destination: &Path) {
     use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
     const CHUNK: usize = 64 * 1024;
     let mut out = File::create(destination).unwrap();
     debug(client, DebugRequest::Pause);
-    for address in (0x7000_0000u64..0x8000_0000).step_by(CHUNK) {
+    // The first 36 MiB too: where OVMF's own volumes sit under the kernel's
+    // lowest KASLR slides. The file is the two ranges end to end.
+    for address in (0x7000_0000u64..0x8000_0000)
+        .chain(0..0x240_0000)
+        .step_by(CHUNK)
+    {
         let chunk = client.call(Control::Debug {
             request: DebugRequest::ReadMemory {
                 space: AddressSpace::Physical,
