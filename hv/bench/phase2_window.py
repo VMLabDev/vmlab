@@ -32,6 +32,7 @@ import run
 REPEATS = 3
 GUEST = "ubuntu-26.04"
 SINGLE_PIN = "16-23"
+SINGLE_VCPUS = 2
 PAIR_PINS = ("16-19", "20-23")
 WORKLOADS = ("blk_seq_write_mbps", "net_tx_udp_mbps",
              "net_g2g_a2b_tcp_mbps", "net_g2g_b2a_tcp_mbps")
@@ -147,7 +148,7 @@ class Monitor:
 def vm(args, directory, pin, switch, mac, version):
     directory.mkdir()
     overlay, code, variables = lib.prepare_run_dir(str(directory), "x86_64", GUEST, version)
-    common = (str(directory), GUEST, 2, pin, overlay, code, variables,
+    common = (str(directory), GUEST, SINGLE_VCPUS, pin, overlay, code, variables,
               switch, mac, lib.BENCH_NET["mtu"], run.log)
     backend = (backends.X86QemuBackend(*common) if args.backend == "qemu" else
                backends.X86HvBackend(*common, args.hv_bin, lib.IPXE_ROM))
@@ -188,7 +189,8 @@ def ready(backend, args, directory):
 def single(args, directory, version):
     directory.mkdir()
     net = lib.BENCH_NET
-    peer = netpeer.Peer(str(directory), net["guest_ip"], net["guest_mac"], net["port"], run.log)
+    peer = netpeer.Peer(str(directory), net["guest_ip"], net["guest_mac"], net["port"],
+                        run.log, cpu=netpeer.host_peer_cpu())
     try:
         with vm(args, directory / "guest", SINGLE_PIN, peer.switch_sock, net["guest_mac"], version) as backend:
             with ready(backend, args, directory) as agent:
@@ -203,18 +205,10 @@ def single(args, directory, version):
                 if block["bytes"] != run.BLK_SEQ_MIB * 1048576 or block["secs"] <= 0:
                     raise lib.BenchError(f"invalid sequential write result: {block}")
                 run.must_sh(agent, "rm /var/tmp/bench-seq.img", "remove measured file")
-                peer.report()
-                output = run.must_sh(agent,
-                    f"python3 /tmp/vmlab-nettool.py udp-blast {net['peer_ip']} {net['port']} "
-                    f"{net['udp_payload']} {run.NET_WINDOW}", "UDP TX", timeout=run.NET_WINDOW * 3)
-                sent = json.loads(output.strip().splitlines()[-1])
-                time.sleep(run.NET_SETTLE)
-                received = peer.report()
-                if not sent["bytes"] or received["rx_bytes"] / sent["bytes"] < 0.9:
-                    raise lib.BenchError(f"UDP delivery below 90%: sent={sent}, received={received}")
+                mbps, sent, received = run.measure_udp_tx(agent, peer, SINGLE_VCPUS - 1)
                 return {"samples": {
                     "blk_seq_write_mbps": round(block["bytes"] / 1048576 / block["secs"], 2),
-                    "net_tx_udp_mbps": round(received["rx_bytes"] * 8 / run.NET_WINDOW / 1e6, 2)},
+                    "net_tx_udp_mbps": mbps},
                     "block": block, "udp_sender": sent, "udp_receiver": received,
                     "backend_version": backend.backend_version()}
     finally:
@@ -268,6 +262,8 @@ def aggregate(results, environment, commit, dirty):
             repeats = [result for result in selected if result["suite"] == suite]
             env = dict(environment, repeat_loadavg=[{"start": r["load_start"], "end": r["load_end"]}
                 for r in repeats], backend_version=repeats[0]["backend_version"], pin=pin, net_peer=peer)
+            if suite == "single":
+                env.update(udp_tx_guest_cpu=SINGLE_VCPUS - 1, net_peer_cpu=netpeer.host_peer_cpu())
             prepared.append((args, {key: samples[key] for key in keys}, env))
     for args, samples, env in prepared:
         records.extend(run.finish_config(args, "x86_64", 2, samples, env, commit, dirty, socket.gethostname()))
@@ -323,12 +319,17 @@ def main(argv=None):
                     monitor.close()
                 monitor.check()
             report["history"] = aggregate(report["results"], environment, commit, dirty)
-            medians = {(r["backend"], r["workload"]): r["median"] for r in report["history"]}
-            report["bars"] = [{"workload": w, "qemu": medians["qemu", w],
-                "vmlab_hv": medians["vmlab-hv", w],
-                "ratio": medians["vmlab-hv", w] / medians["qemu", w],
-                "passes": medians["vmlab-hv", w] / medians["qemu", w] >= lib.D28_BAR[w][1]}
-                for w in WORKLOADS]
+            records = {(r["backend"], r["workload"]): r for r in report["history"]}
+            report["bars"] = []
+            for workload in WORKLOADS:
+                qemu = records["qemu", workload]
+                hv = records["vmlab-hv", workload]
+                ratio = hv["median"] / qemu["median"]
+                report["bars"].append({
+                    "workload": workload, "qemu": qemu["median"], "vmlab_hv": hv["median"],
+                    "qemu_spread": qemu["spread"], "vmlab_hv_spread": hv["spread"],
+                    "ratio": ratio, "passes": ratio >= lib.D28_BAR[workload][1],
+                })
             report["complete"] = True
         except Exception as error:
             report["error"] = str(error)

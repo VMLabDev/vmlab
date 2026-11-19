@@ -50,7 +50,8 @@ or failure; logs and the JSON result remain under `bench/run/phase2-window-*`.
 Only a complete cohort appends history: eight records for G4, G7, G9, and
 G10, with three samples each. UDP delivery below 90%, unequal TCP byte counts,
 an unexpected VM exit, or a monitor failure aborts the cohort. The JSON retains
-failed attempts. Exit 0 means measurement completed; strict numerical bar
+failed attempts and reports each backend's median and max-minus-min spread in
+the workload's units. Exit 0 means measurement completed; strict numerical bar
 verdicts remain explicit in the result. The script changes no default.
 
 ## Workloads
@@ -224,6 +225,11 @@ interpreter numbers do, and the records say so (`warmup_excluded: false`).
   On helios, CPUs 16-23 are one SMT thread each on cores 0-7. Their siblings
   0-7 remain outside the window. Affinity does not reserve either thread
   against other host work.
+- **UDP transmit (G7)**: the sender runs on the last guest CPU (CPU 1 in
+  the two-vCPU window), and the host peer runs on the highest CPU in the
+  runner's allowed CPU set (CPU 31 on helios with unrestricted affinity).
+  The single-VM history records both CPU IDs. The peer's stderr is retained
+  in `netpeer.stderr.log` for each run, including failed runs.
 - **Recorded per run**: cpufreq governor, load average (start and end of
   each repeat), pin window, memory cap, template version, backend version,
   host CPU count, git commit (with dirty marker), and for x86_64 the APIC
