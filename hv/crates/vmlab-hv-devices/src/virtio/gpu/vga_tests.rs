@@ -975,8 +975,7 @@ fn queue_doorbells_sit_on_the_notify_region_of_bar2() {
     }
     let mut d = Driver::new();
     let registered = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    d.dev
-        .set_queue_doorbells(Box::new(Rec(registered.clone())));
+    d.dev.set_queue_doorbells(Box::new(Rec(registered.clone())));
     d.dev.set_bar_address(2, Some(0xc000_0000));
     assert!(registered.lock().is_empty());
     d.start();
