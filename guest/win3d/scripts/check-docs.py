@@ -56,6 +56,8 @@ EXTERNAL_COMMITS = {
     "be71ee8c": "dxil-spirv's SPIRV-Cross gitlink (build/d3d12/README.md)",
     "199cb207": "dxil-spirv's SPIRV-Tools gitlink (build/d3d12/README.md)",
     "c63848ec": "dxil-spirv's spirv-headers gitlink (build/d3d12/README.md)",
+    "b99d951a1c97f6fb3a1adbc08a4d2ab9ce9f5a15": "yttrium-virtio-gpu: the September 2026 release, pinned until the November rebase (prior-art.md, plan.md)",
+    "374c30222e0c08b04783c173c127abb3e465d028": "virtio-win-mesa: the September 2026 release, pinned until the November rebase (prior-art.md, plan.md, d3d12app.md)",
 }
 
 # Paths that documents describe as removed; they must exist in git history.
@@ -63,6 +65,14 @@ HISTORICAL_PATHS = {
     "labs/probe/vmlab-amd.sh": "the vmlab 0.23 supervisor workaround, removed in badd5c2 (host.md)",
     "labs/nvidia/vmlab-nv.sh": "the isolated-supervisor NVIDIA wrapper, removed in 08ff884 when vmlab 0.26 added qemu_binary (host.md, nvidia.md)",
     "patches/host/qemu/0001": "the single QEMU patch, replaced by the VMLabDev/qemu branch pin in patches/host/PINS (nvidia.md, zeus.md, acceptance.md)",
+    # Mesa patches dropped at the rebase to Yttrium's November 2026 release,
+    # which has each fix itself (build/mesa/README.md, "Dropped at the November rebase").
+    "patches/mesa/0020": "feedback-loop usage gate (nvidia.md, zeus.md, acceptance.md, plan.md)",
+    "patches/mesa/0020-yttrium-gate-feedback-loop-usage-on-format-support.patch": "feedback-loop usage gate (nvidia.md)",
+    "patches/mesa/0025": "packed 16-bit formats (nvtex.md)",
+    "patches/mesa/0075": "Vulkan swapchain blit for LINEAR shared images (godot.md, compat.md)",
+    "patches/mesa/0075-wsi-win32-blit-shared-swapchain-when-linear-cannot-render.patch": "Vulkan swapchain blit for LINEAR shared images (godot.md)",
+    "patches/mesa/0090": "D3D9 depth bias without the float representation (unid3d.md, compat.md)",
 }
 
 BACKTICK = re.compile(r"`([^`\n]+)`")

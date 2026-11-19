@@ -2,8 +2,8 @@
 
 Builds the Yttrium viogpu3d kernel-mode display driver (KMD), its two
 user-mode helpers, and the INF files, for x64 Windows 10 and 11. The source is
-`arehnman/yttrium-virtio-gpu` at tag `yttrium-experimental-2026-09-27`
-(`b99d951a1c97f6fb3a1adbc08a4d2ab9ce9f5a15`), a fork of virtio-win's
+`arehnman/yttrium-virtio-gpu` at tag `yttrium-experimental-2026-11-02`
+(`e9917ae25b2597306d483e1063dba08658139bc9`), a fork of virtio-win's
 kvm-guest-drivers-windows, plus the patches in `patches/kmd/`.
 
 Upstream builds with Visual Studio and the WDK on Windows. This build runs on
@@ -31,14 +31,14 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58104` | The PE version resource and the INF's `DriverVer` version. This version identifies the package with native x86 UMD mapping-fault handling. KMD recovery logic is unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58105` | The PE version resource and the INF's `DriverVer` version. This version identifies the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Outputs
 
 ```
 out/kmd/x64/viogpu3d.sys                  the KMD
 out/kmd/x64/viogpu3d.pdb                  its symbols (not packaged)
-out/kmd/x64/vgpusrv.exe                   the "VioGpu Resolution Service"
+out/kmd/x64/vgpusrv.exe                   the "Yttrium VirtIO Resolution Service"
 out/kmd/x64/viogpuap.exe                  started by vgpusrv in each user session
 out/kmd/x64/viogpu3d.inf                  kernel-only INF
 out/kmd/viogpu3d_x64_wow64.inf.template   full INF, the input to build/package/make-inf.py
@@ -53,7 +53,7 @@ out/kmd/BUILDINFO                         driver version, pins, patch hashes, ou
 2. Copies `VirtIO/`, `viogpu/` and `build/` from the source tree to the fixed
    path `/tmp/kmd-work/src`, and applies `patches/kmd/*.patch` in name order.
 3. Sets `SOURCE_DATE_EPOCH` and the INF date to upstream's tag date,
-   2026-09-27.
+   2026-11-02.
 4. Runs `compile-kmd.sh`, `compile-helpers.sh` and `stampinf.py`.
 
 ### The KMD (`compile-kmd.sh`)
@@ -74,7 +74,7 @@ output deterministic.
   the driver has no ETW provider.
 - **Sources.** VirtioLib (`VirtIO/VirtIOPCICommon.c`, `VirtIOPCILegacy.c`,
   `VirtIOPCIModern.c`, `VirtIORing.c`, `VirtIORing-Packed.c`) is archived with
-  `llvm-lib`. The driver is 13 `.cpp` files from `viogpu/common/` and
+  `llvm-lib`. The driver is 14 `.cpp` files from `viogpu/common/` and
   `viogpu/viogpu3d/`, listed in the script.
 - **Resources.** `viogpu3d.rc` is UTF-16 and includes mixed-case headers. The
   script converts it to UTF-8, preprocesses it with clang (which has the
@@ -102,9 +102,17 @@ Upstream's MSBuild turns it into an INF with three Windows-only steps.
 | Placeholder or entry | Becomes | Upstream step |
 | --- | --- | --- |
 | `$ARCH$` | `amd64.10.0`, so the decoration is `NTamd64.10.0...16299` | `stampinf.exe -a`, with the `InfArch` from `viogpu3d.vcxproj` |
-| `DriverVer` | `09/27/2026,<KMD_DRIVER_VERSION>` | `stampinf.exe` |
+| `DriverVer` | `11/02/2026,<KMD_DRIVER_VERSION>` | `stampinf.exe` |
 | `INX_COPYRIGHT_1`, `INX_COPYRIGHT_2`, `INX_COMPANY`, `INX_PREFIX_VENDOR`, `INX_PREFIX_VIRTIO`, `INX_PREFIX_QEMU`, `INX_PLATFORM_DRIVERS_DIR`, `_INX_SUBSYS_VENDOR_ID` | The Hardsoft vendor strings, `13` (driver store), `1AF4` | `Driver.Common.targets` |
-| Lavapipe files (`vulkan_lvp_*.dll`, `lvp_icd.*.json`) and the `yttrium12` D3D12 slot | Removed, because those payloads are not built | `tools/prepare_package_inx.ps1` |
+| Lavapipe files (`vulkan_lvp_*.dll`, `lvp_icd.*.json`), the `yttrium12` D3D12 slot, and the driver-store section `VioGpu3D_Files.Yttrium12` with `yttrium12.dll` and `d3d11on12.dll` | Removed, because those payloads are not built (below) | `tools/prepare_package_inx.ps1` |
+
+The November release moved `yttrium12.dll` out of System32 into the driver
+store (`%13%\x64\yttrium12.dll`) and added a patched `d3d11on12.dll` beside
+it. Neither upstream repository has the source of either file at the pinned
+commits, and upstream's own build only packages them when
+`YTTRIUM12_DLL_x64` and `YTTRIUM12_ON12_DLL_x64` point at prebuilt binaries.
+This package ships nothing it cannot build from source, so both stay out,
+which is what upstream's script does when those variables are empty.
 
 It writes two files:
 
@@ -132,7 +140,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 
 | Input | Version |
 | --- | --- |
-| yttrium-virtio-gpu | `b99d951a`, tag `yttrium-experimental-2026-09-27` |
+| yttrium-virtio-gpu | `e9917ae2`, tag `yttrium-experimental-2026-11-02` |
 | llvm-mingw | 20261006 (LLVM 23.1.3, ucrt) |
 | Microsoft.Windows.WDK.x64 | 10.0.26100.6584 |
 | Microsoft.Windows.SDK.CPP | 10.0.26100.6584 (headers only) |
@@ -147,23 +155,30 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `0001-kmd-r10-copy.patch` | Converts R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit, so 10-bit back buffers present correctly. It is a byte-identical copy of the prior art's `R/kmd-r10-copy.patch` on the same base (prior-art §2.2, `NW` F93). |
 | `0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch` | Sets `Flags.Cached` on the GDI shadow and staging surfaces, the destination of every Blt present, so the KMD's CPU present copy does not write uncached memory. It took D3D9 windowed presents from 25–31 fps to the refresh rate on AMD hosts ([`docs/present.md`](../../docs/present.md)). |
 
+| `0003-kmd-create-context-for-gdi-devices.patch` | Creates the legacy host context when the kernel device is constructed, so GDI devices that present without a UMD have one ([`docs/gdi-context.md`](../../docs/gdi-context.md)). |
+| `0004-kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
+
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
-records each patch's sha256 and origin.
+records the sha256 and origin of 0001 and 0002.
+
+0001 and 0002 apply to `e9917ae2` unchanged. 0003 and 0004 were rebased:
+upstream's November release added the native GPU clock, per-process
+IO-space views for blob mappings (`viogpu_blob_user_view.cpp`) and an unwind
+of failed adapter starts in the code they touch. In 0004 the reset path now
+revokes user blob mappings with `VioGpuUnmapBlobUserView` in place of
+`DxgkCbUnmapMemory`, takes the blob-map `KMUTEX` that replaced the fast
+mutex, and resets the native clock cache with the host objects.
 
 ## Reproducibility
 
-The build is bit-reproducible on this host. A run on 2026-10-17 from the
-`docs` worktree gave the same sha256 for all six outputs, including the PDB,
-as the run recorded in [docs/evidence/kmd/00-signing-host.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/00-signing-host.txt) from the `kmd`
-worktree:
+The build was bit-reproducible on this host at the September base
+(`b99d951a`): a run on 2026-10-17 gave the same sha256 for all six outputs,
+including the PDB, as the run recorded in [docs/evidence/kmd/00-signing-host.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/00-signing-host.txt).
+At `e9917ae2` with the four patches and version `100.6.101.58105`, one run
+on 2026-11-19 gave the hashes below. That build was not repeated:
 
 ```
-7fefcfcac00f1e9fb690036adbdba941517115b597f4cde657a336075a8cc07e  x64/viogpu3d.sys
-5d187833571a6bdb13b0ac0b6b72ca6d48ab5620dae599d8af04131802126116  x64/viogpu3d.pdb
-fd091e6d5d87ffca9c5e2b6c3c5e0d3d358a066304a4a464faeddc6e39f8bb48  x64/vgpusrv.exe
-fd78ce1c3a1cb30e7995310df3440953ea9a2bab6ce8e23b02a65c33e0761f50  x64/viogpuap.exe
-50b20f4493076fdc2b6f2d8920b57e78eb9087ac6bd2d399115278f7513b36f2  x64/viogpu3d.inf
-601ddd307f995980f4e1729cb4399b8de476863087fdf9f3ea894a4ebaf6bdf7  viogpu3d_x64_wow64.inf.template
+@@KMDHASHES@@
 ```
 
 The work tree is always `/tmp/kmd-work` in the container, `/Brepro` removes
