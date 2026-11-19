@@ -1,0 +1,236 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: a trace build for the order of renders, presents and flips
+
+Card #134 (stale bands on the console) is a question of order: when the
+host finished a process's rendering, when the present copy read it, when DWM
+composed and when the scanout changed. The release driver has no tracing, and
+the 256-record ring of 0004 holds a few frames.
+
+With VIOGPU_FLIP_TRACE=1 (build/kmd/build.sh with KMD_TRACE=1) the driver
+keeps 65536 timed records: every record of the existing ring except the bare
+interrupt, and the present copy, the DMA packets with their ring index, the
+flip commands, SetVidPnSourceAddress, the timer flip and the process of each
+context. A DRIVERPRIVATE escape (magic 0x56475446) returns the records after
+a sequence number, 1024 at a time (tests/tearing/Get-FlipTrace.ps1).
+
+Without the define nothing changes: FlipTrace is an empty inline function and
+the escape is not compiled.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 7806089..03105d8 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1391,6 +1391,17 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+             CopyTrace(trace);
+         return STATUS_SUCCESS;
+     }
++#if VIOGPU_FLIP_TRACE
++    if (pEscape->pPrivateDriverData && pEscape->PrivateDriverDataSize >= sizeof(UINT32) &&
++        *(UINT32 *)pEscape->pPrivateDriverData == 0x56475446)
++    {
++        VIOGPU_FLIP_TRACE_READ *read = static_cast<VIOGPU_FLIP_TRACE_READ *>(pEscape->pPrivateDriverData);
++        if (pEscape->PrivateDriverDataSize != sizeof(*read) || read->Version != 1 || read->Size != sizeof(*read))
++            return STATUS_INVALID_BUFFER_SIZE;
++        ReadFlipTrace(read);
++        return STATUS_SUCCESS;
++    }
++#endif
+     if (pEscape->pPrivateDriverData && pEscape->PrivateDriverDataSize >= sizeof(UINT32) &&
+         *(UINT32 *)pEscape->pPrivateDriverData == 0x56475444)
+     {
+@@ -2375,8 +2386,52 @@ void VioGpuAdapter::Trace(UINT event, UINT node, UINT engine, UINT context,
+     record->Response = response;
+     record->PendingPreemption = pending;
+     InterlockedExchange64(reinterpret_cast<volatile LONG64 *>(&record->Sequence), sequence);
++#if VIOGPU_FLIP_TRACE
++    if (event != 4) // every interrupt: too many, and events 2 and 5 say what it carried
++        FlipTrace(event, context, flags, fence, response, pending);
++#endif
+ }
+ 
++#if VIOGPU_FLIP_TRACE
++void VioGpuAdapter::FlipTrace(UINT event, UINT context, UINT flags, UINT64 fence, UINT response, UINT pending)
++{
++    LONG64 sequence = InterlockedIncrement64(&m_flipTraceSequence);
++    VIOGPU_TRACE_RECORD *record = &m_flipTrace[(sequence - 1) % RTL_NUMBER_OF(m_flipTrace)];
++    ULONG64 counter;
++    InterlockedExchange64(reinterpret_cast<volatile LONG64 *>(&record->Sequence), 0);
++    record->Tick = KeQueryInterruptTimePrecise(&counter);
++    record->Generation = m_transportGeneration;
++    record->Event = event;
++    record->Node = 0;
++    record->Engine = 0;
++    record->Context = context;
++    record->Flags = flags;
++    record->Fence = fence;
++    record->Response = response;
++    record->PendingPreemption = pending;
++    InterlockedExchange64(reinterpret_cast<volatile LONG64 *>(&record->Sequence), sequence);
++}
++
++void VioGpuAdapter::ReadFlipTrace(VIOGPU_FLIP_TRACE_READ *read)
++{
++    const LONG64 last = InterlockedCompareExchange64(&m_flipTraceSequence, 0, 0);
++    LONG64 next = static_cast<LONG64>(read->After) + 1;
++    if (next < last - static_cast<LONG64>(RTL_NUMBER_OF(m_flipTrace)) + 1)
++        next = last - static_cast<LONG64>(RTL_NUMBER_OF(m_flipTrace)) + 1;
++    if (next < 1)
++        next = 1;
++    UINT count = 0;
++    for (; next <= last && count < RTL_NUMBER_OF(read->Records); ++next)
++    {
++        VIOGPU_TRACE_RECORD record = m_flipTrace[(next - 1) % RTL_NUMBER_OF(m_flipTrace)];
++        if (record.Sequence == static_cast<UINT64>(next)) // else being written or already replaced
++            read->Records[count++] = record;
++    }
++    read->Count = count;
++    read->LastSequence = static_cast<UINT64>(last);
++}
++#endif
++
+ void VioGpuAdapter::CopyTrace(VIOGPU_TRACE *trace)
+ {
+     trace->Magic = 0x56475458;
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 0b84a1d..cf4ffc7 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -87,6 +87,34 @@ struct VIOGPU_TRACE
+ };
+ static_assert(sizeof(VIOGPU_TRACE_RECORD) == 56 && sizeof(VIOGPU_TRACE) == 14360, "GPU trace ABI");
+ 
++// Trace build only (build/kmd/build.sh with KMD_TRACE=1): a large ring of
++// timed records for the order of submissions, completions, present copies and
++// flips, read in pieces through a DRIVERPRIVATE escape. A release build
++// compiles none of it.
++#ifndef VIOGPU_FLIP_TRACE
++#define VIOGPU_FLIP_TRACE 0
++#endif
++#if VIOGPU_FLIP_TRACE
++enum
++{
++    VIOGPU_FT_CPU_COPY_BEGIN = 16, // Context, Flags = source resource, Fence = DMA fence, Response = destination
++    VIOGPU_FT_DMA_FLIP = 17,       // Context, Flags = resource, Fence = DMA fence, Response = is blob
++    VIOGPU_FT_SOURCE_ADDRESS = 18, // Flags = resource
++    VIOGPU_FT_TIMER_FLIP = 19,     // Flags = resource
++    VIOGPU_FT_DMA_PACKET = 20,     // Context, Flags = ring index, Fence = DMA fence, Response = command type
++    VIOGPU_FT_CONTEXT = 21,        // Context, Flags = capset, Fence = process id
++    VIOGPU_FT_CPU_COPY_END = 22,   // as VIOGPU_FT_CPU_COPY_BEGIN
++};
++struct VIOGPU_FLIP_TRACE_READ
++{
++    UINT32 Magic, Version, Size, Count; // Count out: records returned
++    UINT64 After;                       // in: return records with a larger Sequence
++    UINT64 LastSequence;                // out: the newest record in the ring
++    VIOGPU_TRACE_RECORD Records[1024];
++};
++static_assert(sizeof(VIOGPU_FLIP_TRACE_READ) == 32 + 1024 * 56, "flip trace ABI");
++#endif
++
+ virtio_gpu_formats ColorFormat(UINT format);
+ 
+ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+@@ -176,6 +204,10 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     volatile LONG64 m_traceSequence = 0;
+     VIOGPU_TRACE_RECORD m_trace[256] = {};
+     VIOGPU_TRACE m_timeoutTrace = {};
++#if VIOGPU_FLIP_TRACE
++    volatile LONG64 m_flipTraceSequence = 0;
++    VIOGPU_TRACE_RECORD m_flipTrace[65536] = {};
++#endif
+     KMUTEX m_recoveryMutex;
+     KMUTEX m_objectMutex;
+     LIST_ENTRY m_devices, m_allocations, m_deviceAllocations;
+@@ -290,6 +322,14 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     void Trace(UINT event, UINT node = 0, UINT engine = 0, UINT context = 0,
+                UINT flags = 0, UINT64 fence = 0, UINT response = 0, UINT pending = 0);
+     void CopyTrace(VIOGPU_TRACE *trace);
++#if VIOGPU_FLIP_TRACE
++    void FlipTrace(UINT event, UINT context = 0, UINT flags = 0, UINT64 fence = 0, UINT response = 0, UINT pending = 0);
++    void ReadFlipTrace(VIOGPU_FLIP_TRACE_READ *read);
++#else
++    void FlipTrace(UINT, UINT = 0, UINT = 0, UINT64 = 0, UINT = 0, UINT = 0)
++    {
++    }
++#endif
+     BOOLEAN IsRecovering() const { return m_tdr.RecoveryState != 0; }
+     void RegisterObject(LIST_ENTRY *entry, UINT kind);
+     void UnregisterObject(LIST_ENTRY *entry);
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index ee9565f..56cf721 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -756,6 +756,8 @@ void VioGpuCommand::Run()
+ 
+     if (m_cpuCopyBlt && m_cpuCopyBltMapped)
+     {
++        m_pAdapter->FlipTrace(16, GetContextId(), m_cpuCopySrc ? m_cpuCopySrc->GetId() : 0, m_FenceId,
++                              m_cpuCopyDst ? m_cpuCopyDst->GetId() : 0);
+         NTSTATUS copyStatus =
+             VioGpuCpuCopyBltPresent(this, m_cpuCopySrc,
+                                     m_cpuCopyDst, &m_cpuCopySrcRect,
+@@ -766,6 +768,8 @@ void VioGpuCommand::Run()
+                                     m_cpuCopyDstMapSize,
+                                     m_cpuCopySubRects,
+                                     m_cpuCopySubRectCnt);
++        m_pAdapter->FlipTrace(22, GetContextId(), m_cpuCopySrc ? m_cpuCopySrc->GetId() : 0, m_FenceId,
++                              m_cpuCopyDst ? m_cpuCopyDst->GetId() : 0);
+         if (!NT_SUCCESS(copyStatus))
+         {
+             DbgPrint(TRACE_LEVEL_WARNING,
+@@ -904,6 +908,7 @@ void VioGpuCommand::Run()
+             case VIOGPU_CMD_NOP:
+                 {
+                     InterlockedIncrement(&m_done);
++                    m_pAdapter->FlipTrace(20, GetContextId(), 0, m_FenceId, cmdHdr->type);
+ 
+                     UINT ret = m_pAdapter->ctrlQueue.SubmitNop(VioGpuCommand::RunningCbDone,
+                                                                 this,
+@@ -936,6 +941,7 @@ void VioGpuCommand::Run()
+                         protocolSize -= sizeof(*timeline);
+                     }
+ 
++                    m_pAdapter->FlipTrace(20, GetContextId(), ringIndex, m_FenceId, cmdHdr->type);
+                     PBYTE submitCmd = NULL;
+                     if (protocolSize > 0)
+                     {
+@@ -1013,6 +1019,7 @@ void VioGpuCommand::Run()
+                     VIOGPU_PRESENT_FLIP_CMD *flipCmd = (VIOGPU_PRESENT_FLIP_CMD *)cmdBody;
+ 
+                     InterlockedIncrement(&m_done);
++                    m_pAdapter->FlipTrace(17, GetContextId(), flipCmd->res_id, m_FenceId, flipCmd->is_blob);
+ 
+                     if (flipCmd->is_blob)
+                     {
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index dc59bbb..b4fe6a3 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -95,6 +95,7 @@ NTSTATUS VioGpuDevice::Init(VIOGPU_CTX_INIT_REQ *pOptions)
+     }
+     m_pAdapter->ctrlQueue.CreateCtx(m_id, context_init);
+     m_context_created = true;
++    m_pAdapter->FlipTrace(21, m_id, context_init, (UINT64)(ULONG_PTR)PsGetCurrentProcessId());
+ 
+     m_context_lost = false;
+     return STATUS_SUCCESS;
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index 6c161f1..d6d5b44 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -2039,6 +2039,7 @@ void VioGpuVidPN::Flip()
+ {
+     if (InterlockedExchange(&m_shouldFlip, 0))
+     {
++        m_pAdapter->FlipTrace(19, 0, m_sourceRes ? m_sourceRes->GetId() : 0);
+         if (m_sourceRes != NULL)
+         {
+             m_sourceRes->FlushToScreen(0);
+@@ -2150,6 +2151,7 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS
+ 
+     m_sourceAddress = pSetVidPnSourceAddress->PrimaryAddress;
+     m_sourceRes = sourceRes;
++    m_pAdapter->FlipTrace(18, 0, sourceRes ? sourceRes->GetId() : 0);
+     if (!QueueSourceAddress(m_sourceAddress))
+     {
+         LONG fullCount = InterlockedIncrement(&m_sourceQueueFullCount);

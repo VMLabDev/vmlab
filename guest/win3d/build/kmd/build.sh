@@ -71,10 +71,12 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
     -e TOOLCHAIN_TAR="/dl/$(basename "$TOOLCHAIN_TAR")" \
     -e WDK_PKG="/dl/$(basename "$WDK_PKG")" -e SDK_PKG="/dl/$(basename "$SDK_PKG")" \
     -e DRIVER_VERSION="$DRIVER_VERSION" \
+    -e KMD_TRACE="${KMD_TRACE:-0}" \
     "$IMAGE" /build/inner.sh
 
 {
     echo "driver_version $DRIVER_VERSION"
+    [ "${KMD_TRACE:-0}" != 1 ] || echo "trace_build 1"
     grep -v '^#' "$HERE/PINS" | grep -v '^\s*$' | awk '{print "pin", $1, $4, $5}'
     for p in "$REPO"/patches/kmd/*.patch; do echo "patch $(basename "$p") $(sha256sum <"$p" | cut -d' ' -f1)"; done
     (cd "$OUT" && find . -type f ! -name BUILDINFO | sort | xargs sha256sum | sed 's/^/sha256 /')
