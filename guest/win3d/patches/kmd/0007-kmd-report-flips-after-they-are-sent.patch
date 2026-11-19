@@ -1,0 +1,204 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: report a flip with a vsync only after it was sent to the host
+
+SetVidPnSourceAddress records the new primary and queues its address. The
+vsync timer sends the recorded flip (SET_SCANOUT_BLOB and RESOURCE_FLUSH) at
+its next tick, sets m_vsync and sends a NOP, and the interrupt routine then
+reports CRTC_VSYNC with the next address of the queue.
+
+An address that SetVidPnSourceAddress queued after the timer looked and
+before that interrupt was reported at once, one tick (16 ms) before its flip
+went to the host. Windows takes a reported address as shown. It frees the
+buffer that the host still shows, the compositor renders the next frame into
+it, and the console reads a frame that is half rendered: a band of the
+earlier frame (card #134, docs/tearing.md). The gap between the timer and
+the interrupt is the round trip of the NOP: microseconds on an idle host,
+milliseconds on a loaded one.
+
+The timer now takes the resource, its address and the tail of the queue as
+one set under a lock that SetVidPnSourceAddress holds while it changes them,
+and publishes how far the queue was sent after the flip is on the control
+queue. The interrupt reports only addresses below that mark, and with none
+left the address of the last flip sent, not the newest one recorded.
+
+The trace build records each vsync report (event 23) and each address held
+back (event 24), and its knob 2 brings the old order back for a comparison.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 2df62f0..fa5e1a7 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1427,6 +1427,9 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                     return STATUS_INVALID_PARAMETER;
+                 InterlockedExchange(&m_copyStallMicroseconds, static_cast<LONG>(knob[2]));
+                 return STATUS_SUCCESS;
++            case 2:
++                InterlockedExchange(&m_reportUnsentFlips, knob[2] ? 1 : 0);
++                return STATUS_SUCCESS;
+         }
+         return STATUS_INVALID_PARAMETER;
+     }
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 3dc05ac..41c72a2 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -343,6 +343,9 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     // Knobs of the trace build, set through the escape 0x56475453.
+     // Microseconds to hold each present copy when it is half done.
+     volatile LONG m_copyStallMicroseconds = 0;
++    // 1: a vsync reports queued addresses as the unpatched driver did, also
++    // one whose flip was not sent yet.
++    volatile LONG m_reportUnsentFlips = 0;
+     void FlipTrace(UINT event, UINT context = 0, UINT flags = 0, UINT64 fence = 0, UINT response = 0, UINT pending = 0);
+     void ReadFlipTrace(VIOGPU_FLIP_TRACE_READ *read);
+ #else
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index d6d5b44..6981b3e 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -35,6 +35,7 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
+ 
+     m_SystemDisplaySourceId = D3DDDI_ID_UNINITIALIZED;
+     KeInitializeSpinLock(&m_vsyncTimerLock);
++    KeInitializeSpinLock(&m_sourceLock);
+     KeInitializeTimerEx(&m_vsyncNotifyTimer, SynchronizationTimer);
+     KeInitializeDpc(&m_vsyncNotifyDpc, VioGpuVidPN::VsyncNotifyTimerDpc, this);
+ 
+@@ -124,6 +125,7 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
+ 
+     InterlockedExchange(&m_sourceAddressQueueHead, 0);
+     InterlockedExchange(&m_sourceAddressQueueTail, 0);
++    InterlockedExchange(&m_sourceAddressQueueSent, 0);
+     InterlockedExchange(&m_sourceQueueFullCount, 0);
+ 
+     StartVsyncTimer();
+@@ -2037,17 +2039,31 @@ VOID VioGpuVidPN::StopVsyncTimer(void)
+ 
+ void VioGpuVidPN::Flip()
+ {
+-    if (InterlockedExchange(&m_shouldFlip, 0))
++    // One flip, whole: the resource to show, its address, and how far the
++    // queue of addresses reaches with it.
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_sourceLock, &oldIrql);
++    const LONG shouldFlip = InterlockedExchange(&m_shouldFlip, 0);
++    VioGpuAllocation *sourceRes = m_sourceRes;
++    const PHYSICAL_ADDRESS sourceAddress = m_sourceAddress;
++    const LONG tail = InterlockedCompareExchange(&m_sourceAddressQueueTail, 0, 0);
++    KeReleaseSpinLock(&m_sourceLock, oldIrql);
++
++    if (shouldFlip)
+     {
+-        m_pAdapter->FlipTrace(19, 0, m_sourceRes ? m_sourceRes->GetId() : 0);
+-        if (m_sourceRes != NULL)
++        m_pAdapter->FlipTrace(19, 0, sourceRes ? sourceRes->GetId() : 0);
++        if (sourceRes != NULL)
+         {
+-            m_sourceRes->FlushToScreen(0);
++            sourceRes->FlushToScreen(0);
+         }
+         else
+         {
+             m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
+         }
++        // The flip is on the control queue, ahead of every later command.
++        // From here a vsync may report its address.
++        InterlockedExchange64(&m_sentSourceAddress, sourceAddress.QuadPart);
++        InterlockedExchange(&m_sourceAddressQueueSent, tail);
+     }
+ }
+ 
+@@ -2073,15 +2089,46 @@ BOOLEAN VioGpuVidPN::QueueSourceAddress(PHYSICAL_ADDRESS address)
+ BOOLEAN VioGpuVidPN::DequeueSourceAddress(PHYSICAL_ADDRESS *address)
+ {
+     LONG head = InterlockedCompareExchange(&m_sourceAddressQueueHead, 0, 0);
+-    LONG tail = InterlockedCompareExchange(&m_sourceAddressQueueTail, 0, 0);
+-    if (head == tail)
++    // SetVidPnSourceAddress queues an address at any time, and the timer
++    // sends its flip at the next tick. An address that arrived after the
++    // timer's Flip() and before this interrupt has no flip on the host yet.
++    // Reported now, Windows takes it as shown, frees the buffer that the host
++    // still shows, and the compositor renders the next frame into it: the
++    // console then shows a frame that is half rendered (docs/tearing.md).
++    // So only addresses whose flip was sent are reported.
++    LONG sent = InterlockedCompareExchange(&m_sourceAddressQueueSent, 0, 0);
++#if VIOGPU_FLIP_TRACE
++    const LONG tail = InterlockedCompareExchange(&m_sourceAddressQueueTail, 0, 0);
++    if (m_pAdapter->m_reportUnsentFlips)
++    {
++        // The knob of the trace build: the order of the unpatched driver.
++        if (head != tail && head - sent >= 0)
++        {
++            m_pAdapter->FlipTrace(24, 0, static_cast<UINT>(tail - head), 0, 1);
++        }
++        if (head == tail)
++        {
++            *address = m_sourceAddress;
++            m_pAdapter->FlipTrace(23, 0, static_cast<UINT>(address->QuadPart >> 12), 0, 0);
++            return TRUE;
++        }
++        sent = tail;
++    }
++    else if (head - sent >= 0 && head != tail)
++    {
++        m_pAdapter->FlipTrace(24, 0, static_cast<UINT>(tail - head), 0, 0);
++    }
++#endif
++    if (head - sent >= 0)
+     {
+-        *address = m_sourceAddress;
++        address->QuadPart = InterlockedCompareExchange64(&m_sentSourceAddress, 0, 0);
++        m_pAdapter->FlipTrace(23, 0, static_cast<UINT>(address->QuadPart >> 12), 0, 0);
+         return TRUE;
+     }
+ 
+     LONG slot = head & (kSourceAddressQueueSize-1);
+     *address = m_sourceAddressQueue[slot];
++    m_pAdapter->FlipTrace(23, 0, static_cast<UINT>(address->QuadPart >> 12), 0, 1);
+     KeMemoryBarrier();
+     InterlockedCompareExchange(&m_sourceAddressQueueHead, head + 1, head);
+     return TRUE;
+@@ -2149,10 +2196,15 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS
+         return STATUS_NOT_SUPPORTED;
+     }
+ 
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_sourceLock, &oldIrql);
+     m_sourceAddress = pSetVidPnSourceAddress->PrimaryAddress;
+     m_sourceRes = sourceRes;
++    const BOOLEAN queued = QueueSourceAddress(m_sourceAddress);
++    InterlockedOr(&m_shouldFlip, 1);
++    KeReleaseSpinLock(&m_sourceLock, oldIrql);
+     m_pAdapter->FlipTrace(18, 0, sourceRes ? sourceRes->GetId() : 0);
+-    if (!QueueSourceAddress(m_sourceAddress))
++    if (!queued)
+     {
+         LONG fullCount = InterlockedIncrement(&m_sourceQueueFullCount);
+         DbgPrint(TRACE_LEVEL_WARNING,
+@@ -2168,7 +2220,6 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS
+               __FUNCTION__,
+               m_sourceAddress.QuadPart,
+               m_sourceRes));
+-    InterlockedOr(&m_shouldFlip, 1);
+ 
+     return STATUS_SUCCESS;
+ };
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 5cd557f..81254d1 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -169,5 +169,14 @@ class VioGpuVidPN
+     volatile LONG m_sourceAddressQueueHead = 0;
+     volatile LONG m_sourceAddressQueueTail = 0;
+     PHYSICAL_ADDRESS m_lastQueuedSourceAddress = {0};
++    // m_sourceAddress, m_sourceRes, the tail of the queue and m_shouldFlip
++    // change together under this lock, so that the timer sees one flip whole.
++    KSPIN_LOCK m_sourceLock;
++    // The entries of the queue below this index had their flip sent to the
++    // host, and m_sentSourceAddress is the address of the last flip sent. A
++    // vsync reports no other address: Windows takes a reported address as
++    // shown and renders into the buffer that was shown before it.
++    volatile LONG m_sourceAddressQueueSent = 0;
++    volatile LONG64 m_sentSourceAddress = 0;
+     volatile LONG m_sourceQueueFullCount = 0;
+ };

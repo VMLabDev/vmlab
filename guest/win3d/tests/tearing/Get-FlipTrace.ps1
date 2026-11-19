@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
 Reads the flip trace of a trace-build kernel driver (build/kmd/build.sh with
-KMD_TRACE=1, patches/kmd/0005) into a CSV file.
+KMD_TRACE=1, patches/kmd/0006) into a CSV file.
 
 .DESCRIPTION
 Polls the driver's DRIVERPRIVATE escape (magic 0x56475446) for -Seconds and
@@ -16,7 +16,11 @@ param(
     [switch]$FromStart,
     # An experiment of the trace build: stall every present copy for this many
     # microseconds when it is half done (0 turns it off), then exit.
-    [int]$Stall = -1
+    [int]$Stall = -1,
+    # A comparison of the trace build: 1 makes a vsync report queued flips as
+    # the driver did before patches/kmd/0007, also one that was not sent to
+    # the host yet. 0 is the patched order. Sets it, then exits.
+    [int]$ReportUnsent = -1
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -62,10 +66,11 @@ public static class Win3dFlipTrace {
         return false;
     }
 
-    public static bool SetStall(uint microseconds) {
+    // Knob 1: microseconds to hold each present copy. Knob 2: report unsent flips.
+    public static bool SetKnob(uint knob, uint value) {
         Marshal.WriteInt32(buffer, 0, 0x56475453);
-        Marshal.WriteInt32(buffer, 4, 1);
-        Marshal.WriteInt32(buffer, 8, (int)microseconds);
+        Marshal.WriteInt32(buffer, 4, (int)knob);
+        Marshal.WriteInt32(buffer, 8, (int)value);
         var e = new ESCAPE { hAdapter = adapter, Type = 0, pPrivateDriverData = buffer, PrivateDriverDataSize = 12 };
         return D3DKMTEscape(ref e) == 0;
     }
@@ -100,7 +105,11 @@ if (-not [Win3dFlipTrace]::Open()) {
     exit 3
 }
 if ($Stall -ge 0) {
-    "stall $Stall us: {0}" -f [Win3dFlipTrace]::SetStall([uint32]$Stall)
+    "stall $Stall us: {0}" -f [Win3dFlipTrace]::SetKnob(1, [uint32]$Stall)
+    exit 0
+}
+if ($ReportUnsent -ge 0) {
+    "report unsent flips $ReportUnsent`: {0}" -f [Win3dFlipTrace]::SetKnob(2, [uint32]$ReportUnsent)
     exit 0
 }
 New-Item -ItemType Directory -Force (Split-Path -Parent $Out) | Out-Null
