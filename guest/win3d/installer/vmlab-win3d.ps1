@@ -14,9 +14,9 @@ Modes:
   Resume     Continue an install or uninstall after a reboot. Run by the
              vmlab-win3d-resume startup task.
   Repair     Put the D3D12 bridge back if Windows servicing replaced
-             d3d12.dll, and the device back on this package's driver if
-             another driver replaced it. Run by the vmlab-win3d-repair
-             startup task.
+             d3d12.dll, renew the native copy a Chromium GPU process loads,
+             and put the device back on this package's driver if another
+             driver replaced it. Run by the vmlab-win3d-repair startup task.
   Status     Print state.json.
 
 State lives in C:\ProgramData\vmlab-win3d:
@@ -58,6 +58,10 @@ $InfSystemFiles = @('viogpu_d3d10.dll', 'viogpu_wgl.dll', 'libvulkan_virtio.dll'
 # Files under runtime\<arch>\ in the bundle, and where they go.
 $PrivateFiles = @('vkd3dcore.dll', 'dxgi-vulkan.dll')
 $LoaderFiles = @('vulkan-1.dll', 'vulkaninfo.exe')
+# The machine's own d3d12.dll a second time, under its own file name, in
+# vmlab-win3d\native\. The UMD loads it into a Chromium GPU process, which
+# refuses the bridge (Update-NativeCopy).
+$NativeCopy = 'native\d3d12.dll'
 # The bridge names its private native copy; no Microsoft d3d12.dll does.
 $BridgeMarker = [Text.Encoding]::Unicode.GetBytes('d3d12-native.dll')
 
@@ -692,6 +696,29 @@ function Get-KnownBridgeHashes($Bundle) {
     return @($known | Where-Object { $_ } | Select-Object -Unique)
 }
 
+# Keep vmlab-win3d\native\d3d12.dll equal to d3d12-native.dll, the newest
+# native file. A Chromium GPU process (Chrome, Edge, Electron, WebView2)
+# takes only Microsoft-signed DLLs once it runs, so its late load of
+# d3d12.dll refuses the bridge and the process ends itself. The UMD loads
+# this copy into such a process first (patches/mesa 0095). The loader then
+# answers the later load by name, which is why the copy keeps the file name
+# d3d12.dll and has a folder of its own. Returns $true when it wrote the copy.
+function Update-NativeCopy($Arch) {
+    $private = Join-Path $Arch.Dir 'vmlab-win3d'
+    $native = Join-Path $private 'd3d12-native.dll'
+    $copy = Join-Path $private $NativeCopy
+    $hash = Get-Sha256 $native
+    if (-not $hash) { throw "$native is missing" }
+    if ((Get-Sha256 $copy) -eq $hash) { return $false }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $copy) -Force | Out-Null
+    # A running GPU process can have the old copy mapped.
+    if (Test-Path -LiteralPath $copy) { Move-ToTrash $copy }
+    Copy-Item -LiteralPath $native -Destination $copy
+    if ((Get-Sha256 $copy) -ne $hash) { throw "Copy to $copy did not verify" }
+    Write-Journal "native d3d12.dll $hash copied to $copy"
+    return $true
+}
+
 # Install the bridge for one architecture. A d3d12.dll that is not a bridge
 # is the machine's native one (the original, or one Windows servicing put
 # back); it becomes the private d3d12-native.dll first. Returns $true when
@@ -727,6 +754,8 @@ function Install-Bridge($Bundle, $Baseline, $Arch) {
         }
     }
     if (-not (Test-Path -LiteralPath $native)) { throw "$native is missing and $sys is already a bridge" }
+    # No reboot for this one: only a GPU process that starts later loads it.
+    Update-NativeCopy $Arch | Out-Null
     $bridge = Join-Path $src 'd3d12.dll'
     $s = Get-State
     $sddl = $(if ($s[("native_d3d12_" + $Arch.Name)]) { $s[("native_d3d12_" + $Arch.Name)].sddl } else { $null })
@@ -818,7 +847,9 @@ function Test-Installed($Bundle, $Device) {
     foreach ($a in $Arches) {
         $sys = Join-Path $a.Dir 'd3d12.dll'
         if ((Get-Sha256 $sys) -ne (Get-Sha256 (Join-Path $Bundle.Dir "runtime\$($a.Name)\d3d12.dll"))) { $problems += "$sys is not the bridge" }
-        if (-not (Test-Path -LiteralPath (Join-Path $a.Dir 'vmlab-win3d\d3d12-native.dll'))) { $problems += "$($a.Name) d3d12-native.dll is missing" }
+        $native = Join-Path $a.Dir 'vmlab-win3d\d3d12-native.dll'
+        if (-not (Test-Path -LiteralPath $native)) { $problems += "$($a.Name) d3d12-native.dll is missing" }
+        elseif ((Get-Sha256 (Join-Path $a.Dir "vmlab-win3d\$NativeCopy")) -ne (Get-Sha256 $native)) { $problems += "$($a.Name) $NativeCopy is not the native d3d12.dll" }
         $icd = Join-Path $a.Dir $a.Icd
         $key = Get-Item -LiteralPath $a.Vulkan -ErrorAction SilentlyContinue
         if (-not $key -or $key.GetValue($icd) -ne 0) { $problems += "Vulkan ICD $icd is not registered" }
@@ -903,7 +934,9 @@ function Invoke-Remove($Baseline) {
             Write-Journal "$sys is not the bridge; left alone"
         }
         if (Test-Path -LiteralPath $private) {
-            Get-ChildItem -LiteralPath $private -Force | ForEach-Object { Move-ToTrash $_.FullName }
+            # Files first, one by one: a folder with a mapped DLL in it (the
+            # native copy in a running browser) cannot be renamed.
+            Get-ChildItem -LiteralPath $private -Force -Recurse -File | ForEach-Object { Move-ToTrash $_.FullName }
             Remove-Item -LiteralPath $private -Recurse -Force -ErrorAction SilentlyContinue
             Write-Journal "removed $private"
         }
