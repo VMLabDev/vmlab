@@ -41,14 +41,15 @@ mkdir -p "$EV" "$STAGE/shots"
 find "$EV" -mindepth 1 -delete
 find "$STAGE" -mindepth 1 -type f -delete
 
-# The VM's sockets: <runtime>/labs/<lab>[-<instance>]/vms/<vm>/.
+# The VM's sockets are beside the machine description its vmlab-hv was started
+# with. vmlab shortens that path by hashing, so ask the processes: the one
+# whose description names this lab directory and whose directory is the VM's.
 DIR=${WIN3D_POINTER_DIR:-}
 if [ -z "$DIR" ]; then
-    lab=$(sed -n 's/^lab "\([^"]*\)".*/\1/p' "$LABDIR/vmlab.wcl" | head -1)
-    rt=${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/vmlab}
-    mapfile -t found < <(ls -d "${rt:-/tmp/vmlab-$(id -u)}/labs/$lab"*"/vms/$VM" 2>/dev/null)
-    [ "${#found[@]}" = 1 ] || { echo "found ${#found[@]} runtime directories for $lab/$VM; set WIN3D_POINTER_DIR" >&2; exit 2; }
-    DIR=${found[0]}
+    while read -r m; do
+        [ "$(basename "$(dirname "$m")")" = "$VM" ] && grep -qF "$LABDIR/" "$m" 2>/dev/null && DIR=$(dirname "$m")
+    done < <(pgrep -u "$(id -u)" -af 'vmlab-hv .*--machine ' | sed -n 's/.*--machine \([^ ]*\).*/\1/p')
+    [ -n "$DIR" ] || { echo "no running vmlab-hv for $VM of $LABDIR; set WIN3D_POINTER_DIR" >&2; exit 2; }
 fi
 [ -S "$DIR/display.sock" ] && [ -S "$DIR/vnc.sock" ] ||
     { echo "$DIR has no display.sock and vnc.sock: the pointer check needs vmlab-hv" >&2; exit 2; }
