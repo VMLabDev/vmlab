@@ -129,9 +129,9 @@ device.
 The package rebased to Yttrium's November 2026 release (kernel driver
 `e9917ae2`, Mesa `76c095bb`, driver version `100.6.101.58105`, bundle
 `vmlab-win3d-0.1.3`), on `hypervisor = "vmlab"` with vmlab and the vmlab-hv
-bundle built from the same commit, virglrenderer 1.3.0 with
-`patches/virglrenderer` 0001 to 0003, NVIDIA driver 615.78.08, Mesa 26.2.6 on
-the host. Template `x86_64/windows-11@26100.1742.11`. `windows-10` was not
+bundle built from the same commit, virglrenderer 1.3.0 with the
+repository root's virglrenderer patches 0001 to 0003, NVIDIA driver
+615.78.08, Mesa 26.2.6 on the host. Template `x86_64/windows-11@26100.1742.11`. `windows-10` was not
 run.
 
 | Run | Result | D3D9 x64, x86 | D3D11 x64, x86 | D3D12 x64, x86 | OpenGL x64, x86 | Vulkan x64, x86 |
