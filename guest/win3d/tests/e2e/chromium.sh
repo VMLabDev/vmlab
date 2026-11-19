@@ -36,7 +36,9 @@ EV=$3/chromium
 STAGE=$REPO/.scratch/e2e/chromium/$(basename "$3")
 CACHE=$REPO/.scratch/e2e/cache
 FEATURES=D3D12VideoEncodeAccelerator,D3D12VideoDecoder
-SECONDS_PER_PAGE=45
+# The page needs 21 s. The first start of Chrome for Testing in a guest took
+# 26 s to show its GPU process.
+SECONDS_PER_PAGE=90
 G='C:\win3d\guest'
 R='C:\win3d\results\chromium'
 INI='C:\ProgramData\Yttrium\yttrium.ini'
@@ -108,16 +110,19 @@ preload_on() {
 
 page chrome chrome
 page edge edge
-if preload_off; then
-    page chrome-control chrome
-    page edge-control edge
-fi
-preload_on || note "could not put $INI back"
 
 note "native"
 gfile 900 "$G\\Run-Probe.ps1" -Path 'C:\win3d\probes\x64\d3d12_probe.exe' -Name native -OutDir "$R" -Seconds 10 >"$STAGE/native.out" 2>&1
 note "  Run-Probe exit $?"
 in_lab vmlab cp "$VM:C:/win3d/results/chromium/native.run.json" "$EV/native.json" >/dev/null 2>&1 || note "  no result file"
+
+# The controls last: a GPU process that ends itself again and again is the
+# fault, and what it does to the guest must not cost the rows above.
+if preload_off; then
+    page chrome-control chrome
+    page edge-control edge
+fi
+preload_on || note "could not put $INI back"
 
 python3 - "$EV" <<'PYEOF'
 import json, os, re, sys
@@ -139,6 +144,8 @@ def hardware(s):
 def facts(d):
     r = d.get('result') or {}
     gpus = d.get('gpu_processes') or []
+    if len(gpus) == 1 and isinstance(gpus[0].get('value'), list):
+        gpus = gpus[0]['value']  # an array that Windows PowerShell 5.1 wrapped
     return {
         'before': r.get('before'), 'after': r.get('after') or [],
         'dumps': d.get('crash_dumps') or 0, 'gpu_processes': len(gpus),

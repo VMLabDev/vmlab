@@ -12,7 +12,8 @@ after -Seconds, when Run-Probe.ps1 has closed the browser.
 
 While the browser runs, a background job looks every half second for the
 profile's GPU processes (`--type=gpu-process`) and records each process ID,
-every d3d12.dll it has loaded and its MicrosoftSignedOnly mitigation. A GPU
+every d3d12.dll it has loaded and its MicrosoftSignedOnly mitigation as last
+seen. A GPU
 process that ended itself shows as a second process ID and as a dump in the
 profile's Crashpad\reports.
 
@@ -26,7 +27,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Page,
     [Parameter(Mandatory = $true)][string]$Name,
     [string]$OutDir = 'C:\win3d\results\chromium',
-    [int]$Seconds = 45,
+    [int]$Seconds = 90,
     # Chromium features to turn on, comma separated.
     [string]$Features = '',
     [string]$ChromeDir = 'C:\apps\chrome-win64',
@@ -100,9 +101,8 @@ $watch = Start-Job -ArgumentList $profileDir, $watchFile, $stopFile, ([IO.Path]:
                     if ($m.ModuleName -ieq 'd3d12.dll' -and $e.d3d12 -notcontains $m.FileName) { $e.d3d12 += $m.FileName }
                 }
             } catch { $e.error = "$_" }
-            if ($null -eq $e.microsoft_signed_only) {
-                try { $e.microsoft_signed_only = "$((Get-ProcessMitigation -Id $p.ProcessId -ErrorAction Stop).BinarySignature.MicrosoftSignedOnly)" } catch {}
-            }
+            # The process turns the mitigation on after it has started: keep the last answer.
+            try { $e.microsoft_signed_only = "$((Get-ProcessMitigation -Id $p.ProcessId -ErrorAction Stop).BinarySignature.MicrosoftSignedOnly)" } catch {}
         }
         Start-Sleep -Milliseconds 500
     }
@@ -120,7 +120,8 @@ Set-Content -LiteralPath $stopFile -Value 'stop'
 Wait-Job -Job $watch -Timeout 60 | Out-Null
 Remove-Job -Job $watch -Force -ErrorAction SilentlyContinue
 if (Test-Path -LiteralPath $watchFile) {
-    $summary.gpu_processes = @(Get-Content -LiteralPath $watchFile -Raw | ConvertFrom-Json)
+    # Windows PowerShell 5.1 hands a JSON array on as one object: unroll it.
+    $summary.gpu_processes = @(Get-Content -LiteralPath $watchFile -Raw | ConvertFrom-Json | ForEach-Object { $_ })
 }
 foreach ($f in $watchFile, $stopFile) { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
 
