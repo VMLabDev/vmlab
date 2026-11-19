@@ -544,10 +544,16 @@ pub fn cmd_status(verbose: bool, json: bool) -> Result<()> {
     rt()?.block_on(async {
         let (name, root) = current_lab()?;
         let Some(client) = daemon::try_own_lab_daemon(&name, &root).await? else {
+            // No daemon to ask, so the lab file and the lab's state answer:
+            // which x86 machines would run on QEMU, and their snapshots.
+            let report = super::validate::QemuRemovalReport::of_current_lab();
             if json {
-                return super::print_json(&not_running_status(&name));
+                return super::print_json(&not_running_status(&name, &report));
             }
             println!("lab \"{name}\": not running");
+            for warning in report.lines() {
+                println!("  warning: {warning}");
+            }
             return Ok(());
         };
         let payload = client.send(LabRequest::Status {}).await.map_err(remote)?;
@@ -566,8 +572,27 @@ pub fn cmd_status(verbose: bool, json: bool) -> Result<()> {
 /// What `status --json` prints for a lab with no daemon: the name and that
 /// nothing runs, so a script reads one shape from both answers rather than
 /// parsing a sentence.
-fn not_running_status(name: &str) -> Value {
-    serde_json::json!({ "lab": name, "running": false })
+///
+/// `qemu_removal` is there when an x86 machine would run on QEMU: one entry
+/// each, with the machine's name beside what the running status carries.
+fn not_running_status(name: &str, report: &super::validate::QemuRemovalReport) -> Value {
+    let mut status = serde_json::json!({ "lab": name, "running": false });
+    if !report.machines.is_empty() {
+        let machines: Vec<Value> = report
+            .machines
+            .iter()
+            .map(|(machine, removal)| {
+                let mut entry = serde_json::json!(removal);
+                entry["machine"] = Value::from(machine.as_str());
+                entry
+            })
+            .collect();
+        status["qemu_removal"] = Value::from(machines);
+    }
+    if !report.host.is_empty() {
+        status["host_warnings"] = serde_json::json!(report.host);
+    }
+    status
 }
 
 /// Ask a lab daemon for its status projection (ADR-0004).
@@ -656,9 +681,26 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
             if verbose {
                 let _ = writeln!(out, "      {}", machine_detail(m));
             }
-            if let Some(reason) = &m.hypervisor_fallback {
-                let _ = writeln!(out, "      hypervisor={} fallback: {reason}", m.hypervisor);
+            // An x86 machine on QEMU says its reason in the removal warning.
+            match &m.qemu_removal {
+                Some(removal) => {
+                    for line in removal.lines(&m.name) {
+                        let _ = writeln!(out, "      warning: {line}");
+                    }
+                }
+                None => {
+                    if let Some(reason) = &m.hypervisor_fallback {
+                        let _ =
+                            writeln!(out, "      hypervisor={} fallback: {reason}", m.hypervisor);
+                    }
+                }
             }
+        }
+    }
+    if !status.host_warnings.is_empty() {
+        let _ = writeln!(out);
+        for warning in &status.host_warnings {
+            let _ = writeln!(out, "  warning: {warning}");
         }
     }
 
@@ -3070,9 +3112,10 @@ mod tests {
     /// answers.
     #[test]
     fn a_lab_that_is_not_running_has_a_json_answer() {
-        let v = not_running_status("ad-lab");
+        let v = not_running_status("ad-lab", &Default::default());
         assert_eq!(v["lab"], "ad-lab");
         assert_eq!(v["running"], false);
+        assert!(v.get("qemu_removal").is_none(), "{v}");
     }
 
     /// A machine a repair verb changed in place says so wherever its state is
@@ -3393,5 +3436,68 @@ mod tests {
         );
         assert!(root_for(&labs, "gamma").is_none());
         assert!(root_for(&[], "alpha").is_none());
+    }
+
+    fn qemu_removal(snapshots: &[&str]) -> crate::config::hypervisor::QemuRemoval {
+        crate::config::hypervisor::QemuRemoval {
+            reason: crate::config::hypervisor::QemuReason::Existing,
+            warning: "vm \"old\" runs on QEMU because its disks were made under QEMU".into(),
+            online_snapshots: snapshots.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// An x86 machine on QEMU is warned under its row, with the snapshots
+    /// the removal costs, and `--json` carries the same as fields.
+    #[test]
+    fn status_warns_of_the_qemu_removal_and_lists_the_snapshots() {
+        let mut vm = crate::status::fixtures::machine("old", PowerState::Stopped, false, vm());
+        vm.hypervisor_fallback = Some("old: keeping existing QEMU machine".into());
+        vm.qemu_removal = Some(qemu_removal(&["warm"]));
+        let mut status = lab(vec![vm]);
+        status.host_warnings = vec!["/dev/kvm is not usable on this host".into()];
+        let text = render_status(&status, false);
+        assert!(
+            text.contains("      warning: vm \"old\" runs on QEMU because"),
+            "{text}"
+        );
+        assert!(text.contains("online snapshot(s) \"warm\""), "{text}");
+        assert!(text.contains("  warning: /dev/kvm is not usable"), "{text}");
+        // The warning carries the reason, so the fallback line is not repeated.
+        assert!(!text.contains("fallback:"), "{text}");
+        let json = serde_json::to_value(&status).unwrap();
+        let removal = &json["machines"][0]["qemu_removal"];
+        assert_eq!(removal["reason"], "existing");
+        assert_eq!(removal["online_snapshots"][0], "warm");
+        assert_eq!(json["host_warnings"][0], "/dev/kvm is not usable on this host");
+        // A machine that earns no warning carries no field.
+        let quiet = lab(vec![crate::status::fixtures::machine(
+            "new",
+            PowerState::Stopped,
+            false,
+            vm(),
+        )]);
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert!(json["machines"][0].get("qemu_removal").is_none(), "{json}");
+        assert!(json.get("host_warnings").is_none(), "{json}");
+    }
+
+    /// The listing answers with no daemon too, naming each machine.
+    #[test]
+    fn a_lab_that_is_not_running_still_lists_its_qemu_machines() {
+        let report = crate::cli::validate::QemuRemovalReport {
+            machines: vec![("old".into(), qemu_removal(&["warm"]))],
+            host: Vec::new(),
+        };
+        let v = not_running_status("ad-lab", &report);
+        assert_eq!(v["running"], false);
+        assert_eq!(v["qemu_removal"][0]["machine"], "old");
+        assert_eq!(v["qemu_removal"][0]["reason"], "existing");
+        assert_eq!(v["qemu_removal"][0]["online_snapshots"][0], "warm");
+        assert!(v.get("host_warnings").is_none(), "{v}");
+        assert_eq!(
+            report.lines(),
+            qemu_removal(&["warm"]).lines("old"),
+            "status prints what the listing names"
+        );
     }
 }

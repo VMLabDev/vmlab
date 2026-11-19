@@ -2100,12 +2100,19 @@ impl LabRuntime {
         // said, not refused (§5.2). After the pull, which binds the template
         // layer a model may come from.
         for name in &targets {
-            if let Some(reason) = self.machine(name)?.hypervisor_fallback() {
+            let m = self.machine(name)?;
+            // An x86 machine's reason is in its removal warning below.
+            if let Some(reason) = m.hypervisor_fallback()
+                && m.qemu_removal().is_none()
+            {
                 output(format!("info: {name}: using QEMU: {reason}\n"));
             }
-            for warning in self.machine(name)?.launch_warnings() {
+            for warning in m.launch_warnings() {
                 output(format!("warning: {warning}\n"));
             }
+        }
+        for warning in self.qemu_removal_warnings(&targets).await {
+            output(format!("warning: {warning}\n"));
         }
 
         self.preflight_binaries(&targets)?;
@@ -3146,6 +3153,21 @@ impl LabRuntime {
             status.agent_diverged = diverged.contains(&status.name);
             machines.push(status);
         }
+        // The snapshots a QEMU x86 machine loses with the removal, and what
+        // the host owes — lab-level: the records are the lab's state.
+        let host_warnings = {
+            let state = self.state.lock().await;
+            for status in &mut machines {
+                if let Some(removal) = &mut status.qemu_removal {
+                    removal.online_snapshots = state
+                        .machines
+                        .get(&status.name)
+                        .map(|m| m.qemu_online_snapshots())
+                        .unwrap_or_default();
+                }
+            }
+            self.kvm_removal_warning(machines.iter().any(|m| m.qemu_removal.is_some()))
+        };
 
         let net = self.network.lock().await;
         // Cross-host trunk state lives in the supervisor (it owns the global
@@ -3207,7 +3229,39 @@ impl LabRuntime {
             forwards,
             isolation: self.isolation.as_ref().map(|p| p.status()),
             freeze_stale,
+            host_warnings,
         }
+    }
+
+    /// The host half of the QEMU removal warning, when a machine earns the
+    /// machine half (`any`): this host has no usable KVM for an x86 guest.
+    fn kvm_removal_warning(&self, any: bool) -> Vec<String> {
+        any.then(crate::config::hypervisor::HostFacts::probe)
+            .and_then(|host| crate::config::hypervisor::kvm_removal_warning(&host))
+            .into_iter()
+            .collect()
+    }
+
+    /// The QEMU removal warnings `targets` earn, as lines: each x86 machine
+    /// that runs on QEMU with its reason and fix, its online QEMU snapshots,
+    /// and what the host owes. What `up` and `vm start` print.
+    pub async fn qemu_removal_warnings(&self, targets: &[String]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let state = self.state.lock().await;
+        for name in targets {
+            let Ok(m) = self.machine(name) else { continue };
+            let Some(mut removal) = m.qemu_removal() else {
+                continue;
+            };
+            removal.online_snapshots = state
+                .machines
+                .get(name)
+                .map(|m| m.qemu_online_snapshots())
+                .unwrap_or_default();
+            lines.extend(removal.lines(name));
+        }
+        lines.extend(self.kvm_removal_warning(!lines.is_empty()));
+        lines
     }
 
     /// The installed forwards as `status` reports them: by machine, then in

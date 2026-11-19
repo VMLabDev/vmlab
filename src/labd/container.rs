@@ -383,6 +383,9 @@ pub struct ContainerInstance {
     /// record it (§22).
     hypervisor: HypervisorKind,
     hypervisor_fallback: Option<String>,
+    /// The rung of the selection ladder the lab builder chose `hypervisor`
+    /// on. `None` on a container nothing selected a hypervisor for.
+    selection_source: Option<crate::config::hypervisor::SelectionSource>,
     /// Probe the host in production; fake-driven tests inject their own
     /// facts so container starts do not depend on the test host's KVM.
     host_facts: Arc<dyn Fn() -> crate::config::hypervisor::HostFacts + Send + Sync>,
@@ -432,6 +435,7 @@ impl ContainerInstance {
             hv,
             hypervisor,
             hypervisor_fallback: None,
+            selection_source: None,
             host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
         })
     }
@@ -443,6 +447,16 @@ impl ContainerInstance {
         Arc::get_mut(&mut self)
             .expect("new container is unshared")
             .hypervisor_fallback = reason;
+        self
+    }
+
+    pub(super) fn with_selection_source(
+        mut self: Arc<Self>,
+        source: crate::config::hypervisor::SelectionSource,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("new container is unshared")
+            .selection_source = Some(source);
         self
     }
 
@@ -1330,6 +1344,20 @@ impl super::machine::Machine for ContainerInstance {
 
     fn hypervisor_fallback(&self) -> Option<String> {
         self.hypervisor_fallback.clone()
+    }
+
+    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
+        let source = self.selection_source?;
+        crate::config::hypervisor::qemu_removal(
+            model::MachineCfg::Container(&self.cfg),
+            &crate::config::hypervisor::HypervisorSelection {
+                kind: self.hypervisor,
+                source,
+                fallback_reason: self.hypervisor_fallback.clone(),
+            },
+            &(self.host_facts)(),
+            None,
+        )
     }
 
     async fn state(&self) -> PowerState {

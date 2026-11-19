@@ -281,6 +281,7 @@ pub(super) async fn build_vm(
     );
     Ok((
         vm.with_hypervisor_fallback(selection.fallback_reason)
+            .with_selection_source(selection.source)
             .with_automatic_hypervisor(
                 (vm_cfg.hypervisor.is_none()
                     && cx.host.hypervisor.vm.is_none()
@@ -380,7 +381,9 @@ pub(super) fn build_container(
         super::hypervisor::for_machine(hypervisor, cx.host, false),
     );
     Ok((
-        container.with_hypervisor_fallback(selection.fallback_reason),
+        container
+            .with_hypervisor_fallback(selection.fallback_reason)
+            .with_selection_source(selection.source),
         pending,
     ))
 }

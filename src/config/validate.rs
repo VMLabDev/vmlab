@@ -2005,6 +2005,33 @@ fn selected_hypervisor(machine: MachineCfg<'_>, ctx: &dyn ValidationContext) -> 
         .kind
 }
 
+/// Every x86 machine of `lab` that runs on QEMU, by name, with the removal
+/// warning it earns ([`super::hypervisor::qemu_removal`]) — what `validate`
+/// prints, selected the way validation selects. The daemon says the same of
+/// the machines it built, with the hardware of a template pulled since.
+pub fn qemu_removals(
+    lab: &Lab,
+    ctx: &dyn ValidationContext,
+) -> Vec<(String, super::hypervisor::QemuRemoval)> {
+    let host = ctx.host_facts();
+    lab.machines()
+        .filter_map(|m| {
+            let hardware = match m {
+                MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
+                MachineCfg::Container(_) => None,
+            };
+            let selection = ctx.hypervisor_defaults().select(
+                m,
+                &host,
+                hardware.as_ref(),
+                ctx.existing_hypervisor(m.name()),
+            );
+            super::hypervisor::qemu_removal(m, &selection, &host, hardware.as_ref())
+                .map(|removal| (m.name().to_string(), removal))
+        })
+        .collect()
+}
+
 /// A VM's resolved hardware, when this context can resolve it: a store
 /// template it holds, and the profile that names. `None` otherwise — a
 /// registry template not pulled yet, an unknown profile (reported
@@ -4628,6 +4655,38 @@ lab "l" {
             .into_iter()
             .map(|i| i.message)
             .collect()
+    }
+
+    /// `validate` warns of the QEMU removal for the machines its own
+    /// selection puts on QEMU: the explicit one here, not its neighbours.
+    #[test]
+    fn validation_lists_the_x86_machines_the_qemu_removal_touches() {
+        let src = r#"import <vmlab.wcl>
+lab "l" {
+  vm "q" { template = "x86_64/t" hypervisor = "qemu" }
+  vm "arm" { template = "aarch64/t" }
+  container "c" { image = "alpine" }
+}"#;
+        let found = qemu_removals(&lab(src).lab, &HvHost::kvm());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "q");
+        assert_eq!(
+            found[0].1.reason,
+            crate::config::hypervisor::QemuReason::Explicit
+        );
+        // Without KVM the container falls back too, and is named.
+        let no_kvm = HvHost {
+            defaults: HypervisorDefaults::default(),
+            facts: HostFacts {
+                arch: "x86_64".into(),
+                kvm: false,
+            },
+        };
+        let names: Vec<String> = qemu_removals(&lab(src).lab, &no_kvm)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["q", "c"]);
     }
 
     #[test]
