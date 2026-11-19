@@ -14,6 +14,12 @@
 //! than the runtime one because the loader maps the library executable, and
 //! the runtime directory's fallback under `/tmp` is mounted `noexec` on
 //! hardened hosts.
+//!
+//! The same layer carries a second rule, off by default (PRD §5.2, a host
+//! GPU's `hide_uncached_memory`): with [`HIDE_UNCACHED_VAR`] set to `1` it
+//! reports an uncached host-visible memory type as not host-visible when the
+//! same heap has a cached counterpart, so no guest driver maps memory the
+//! host's CPU and GPU do not see alike.
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +38,11 @@ pub const ADDRESS_VAR: &str = "VMLAB_VK_PCI_ADDRESS";
 
 /// The manifest's `disable_environment`: `1` stops the loader loading it.
 pub const DISABLE_VAR: &str = "VMLAB_VK_PCI_FILTER_DISABLE";
+
+/// `1` turns the layer's memory rule on: an uncached host-visible memory
+/// type with a cached counterpart in the same heap is reported as not
+/// host-visible.
+pub const HIDE_UNCACHED_VAR: &str = "VMLAB_VK_HIDE_UNCACHED";
 
 /// The loader variable that adds a directory of implicit layer manifests.
 pub const PATH_VAR: &str = "VK_ADD_IMPLICIT_LAYER_PATH";
@@ -110,6 +121,136 @@ mod tests {
         assert_eq!(&LIBRARY[..4], b"\x7fELF");
         let needle = b"vkNegotiateLoaderLayerInterfaceVersion";
         assert!(LIBRARY.windows(needle.len()).any(|w| w == needle));
+    }
+
+    const LOCAL: u32 = 0x1;
+    const VISIBLE: u32 = 0x2;
+    const COHERENT: u32 = 0x4;
+    const CACHED: u32 = 0x8;
+
+    /// Run the layer's memory rule on `(heap, flags)` types, through the
+    /// layer's own source built as a program by `build.rs`: the types after
+    /// the rule, and for each hidden type the index of its counterpart.
+    fn rule(types: &[(u32, u32)]) -> (Vec<(u32, u32)>, Vec<(usize, usize)>) {
+        let out = std::process::Command::new(concat!(env!("OUT_DIR"), "/vk-rule-check"))
+            .args(types.iter().map(|(heap, flags)| format!("{heap}:{flags:x}")))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let mut after = Vec::new();
+        let mut hidden = Vec::new();
+        for (i, line) in String::from_utf8(out.stdout).unwrap().lines().enumerate() {
+            let mut words = line.split(' ');
+            let (heap, flags) = words.next().unwrap().split_once(':').unwrap();
+            after.push((
+                heap.parse().unwrap(),
+                u32::from_str_radix(flags, 16).unwrap(),
+            ));
+            if let Some(to) = words.next() {
+                hidden.push((i, to.parse().unwrap()));
+            }
+        }
+        (after, hidden)
+    }
+
+    /// The NVIDIA list of #136: type 2, host-visible and coherent but not
+    /// cached, has type 3 in its heap, and is the one type hidden. The
+    /// device-local host-visible type 4 stays, as does everything else.
+    #[test]
+    fn the_rule_hides_nvidias_uncached_type_and_names_the_cached_one() {
+        let types = [
+            (1, 0),
+            (0, LOCAL),
+            (1, VISIBLE | COHERENT),
+            (1, VISIBLE | COHERENT | CACHED),
+            (0, LOCAL | VISIBLE | COHERENT),
+        ];
+        let (after, hidden) = rule(&types);
+        assert_eq!(hidden, [(2, 3)]);
+        let mut want = types;
+        want[2].1 = 0;
+        assert_eq!(after, want);
+    }
+
+    /// A cached type in another heap is no counterpart: the uncached type
+    /// is the only way to map that heap, so it stays.
+    #[test]
+    fn the_rule_keeps_an_uncached_type_whose_heap_has_no_cached_one() {
+        let types = [
+            (0, LOCAL),
+            (1, VISIBLE | COHERENT),
+            (2, VISIBLE | COHERENT | CACHED),
+        ];
+        assert_eq!(rule(&types), (types.to_vec(), vec![]));
+    }
+
+    /// The counterpart has every flag of the type it stands in for: a
+    /// protected or otherwise flagged uncached type is not hidden behind a
+    /// cached type that lacks the flag, and is behind one that has it.
+    #[test]
+    fn the_rule_wants_every_flag_of_the_hidden_type_on_its_counterpart() {
+        const OTHER: u32 = 0x40;
+        let types = [
+            (0, VISIBLE | COHERENT | OTHER),
+            (0, VISIBLE | COHERENT | CACHED),
+        ];
+        assert_eq!(rule(&types), (types.to_vec(), vec![]));
+        let types = [
+            (0, VISIBLE | COHERENT | OTHER),
+            (0, VISIBLE | COHERENT | CACHED),
+            (0, VISIBLE | COHERENT | CACHED | OTHER),
+        ];
+        let (after, hidden) = rule(&types);
+        assert_eq!(hidden, [(0, 2)]);
+        assert_eq!(after[0], (0, OTHER));
+        assert_eq!(after[1..], types[1..]);
+    }
+
+    /// What the rule leaves alone: a cached type, a device-local one even
+    /// when uncached, a host-visible type that is not coherent, and a list
+    /// with nothing host-visible at all. The counterpart may come first.
+    #[test]
+    fn the_rule_touches_only_coherent_uncached_types_that_are_not_device_local() {
+        let types = [
+            (0, VISIBLE | COHERENT | CACHED),
+            (0, LOCAL | VISIBLE | COHERENT),
+            (0, VISIBLE),
+            (0, LOCAL),
+        ];
+        assert_eq!(rule(&types), (types.to_vec(), vec![]));
+        assert_eq!(rule(&[]), (vec![], vec![]));
+        let types = [(0, VISIBLE | COHERENT | CACHED), (0, VISIBLE | COHERENT)];
+        let (after, hidden) = rule(&types);
+        assert_eq!(hidden, [(1, 0)]);
+        assert_eq!(after, [(0, VISIBLE | COHERENT | CACHED), (0, 0)]);
+    }
+
+    /// Two uncached types of one heap are both hidden, each judged on the
+    /// driver's own answer, and all 32 types are read.
+    #[test]
+    fn the_rule_hides_every_uncached_type_with_a_counterpart() {
+        let mut types = vec![(0, VISIBLE | COHERENT); 31];
+        types.push((0, VISIBLE | COHERENT | CACHED));
+        let (after, hidden) = rule(&types);
+        assert_eq!(hidden, (0..31).map(|i| (i, 31)).collect::<Vec<_>>());
+        assert!(after[..31].iter().all(|t| *t == (0, 0)));
+        assert_eq!(after[31], types[31]);
+    }
+
+    /// The embedded layer answers the memory queries and reads its switch.
+    #[test]
+    fn the_embedded_layer_carries_the_memory_rule() {
+        for needle in [
+            "vkGetPhysicalDeviceMemoryProperties2KHR",
+            HIDE_UNCACHED_VAR,
+        ] {
+            assert!(
+                LIBRARY
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes()),
+                "{needle}"
+            );
+        }
     }
 
     /// The manifest names the library by absolute path, the layer by name,
