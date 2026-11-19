@@ -27,9 +27,9 @@
 # verdict. Exit status: 0 when all rows pass, 1 otherwise, 2 on usage.
 #
 # The check restarts the VM first. vmlab-hv does not give back every file
-# descriptor a guest GPU context used: after the probes of tests/e2e/run.sh
-# it held 825 of its 1024, each browser start cost 20 to 70 more, and the VM
-# stopped in the fourth one ("Too many open files").
+# descriptor a guest GPU context used. After the probes of tests/e2e/run.sh
+# it held 825 of its 1024 and the VM stopped in the fourth browser start
+# ("Too many open files"). From a restart the five rows end at about 860.
 # check-shell-paths: no-errexit each row records its rc and the judge decides; the ini must be put back (VML-88).
 set -uo pipefail
 [ $# -eq 3 ] || { sed -n '2,33p' "$0" >&2; exit 2; }
