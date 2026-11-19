@@ -65,6 +65,11 @@ page guide_snapshots {
     body = "Retake Windows online snapshots made with vmlab-hv before the pin to `36e90a92010ff37745f4ae053a4e2f802006571d`. Those snapshots lack CET state that the updated hypervisor saves and restores. Offline snapshots and QEMU snapshots are unaffected."
   }
 
+  callout "Online QEMU snapshots of x86 machines will not restore after the QEMU removal" {
+    kind = :warning
+    body = "A later release removes QEMU for x86 guests. Online snapshots QEMU took stay on disk, but restoring one by name is then refused, and there is no converter. To keep one, restore it, shut the machine down and take an offline snapshot. `vmlab status` and `vmlab status --json` list the snapshots this affects."
+  }
+
   h2 "Lab-wide snapshots"
 
   p <<DOC

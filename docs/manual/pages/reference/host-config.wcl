@@ -213,7 +213,9 @@ SRC
     anything. `vmlab status -v` shows `hypervisor=` for every machine.
     Ordinary status also prints fallback reasons, and `status --json` carries
     `hypervisor` and optional `hypervisor_fallback`. `up` prints an info line
-    for each fallback. See [Host configuration and WSL 2](guide_host) and
+    for each fallback. An x86 machine on QEMU gets the QEMU removal warning
+    instead, at `up`, `vm start`, `validate` and `status`, with
+    `qemu_removal` in `status --json`. See [Host configuration and WSL 2](guide_host) and
     [Snapshots](guide_snapshots).
   DOC
   h2 "gpu \"<name>\" {}"

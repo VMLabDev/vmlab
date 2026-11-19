@@ -49,6 +49,14 @@ page cmd_validate {
   DOC
 
   p <<DOC
+    A valid lab can still earn warnings, printed to standard error before
+    the `ok:` line. One of them is the QEMU removal warning: a line for each
+    x86 machine that would run on QEMU, with the reason and the fix, a line
+    for its online QEMU snapshots, and a line for a host without usable KVM.
+    [Getting ready for the removal](guide_host) explains each reason.
+  DOC
+
+  p <<DOC
     Nothing here probes a running machine. In particular whether a
     [dev machine](guide_dev)'s agent can serve the workspace syncer is
     checked when the syncer starts, deliberately not at `validate`, because
