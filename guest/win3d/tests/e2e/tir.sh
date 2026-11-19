@@ -15,16 +15,18 @@
 # when the probe found no pixel that differs from WARP or between its runs,
 # and every such line says coverage=passes. Without a line the probe did not
 # reach the path, and the run fails. Writes <evidence-dir>/tir/: tir.txt (the
-# verdict), tir-x64.json, tir-x86.json and driver-log.txt.
+# verdict), tir-<arch>.json (the probe), run-<arch>.json (Run-Probe.ps1) and
+# driver-log.txt.
 #
 # Exit status: 0 when both pass, 1 when one fails, 2 on usage.
 # check-shell-paths: no-errexit each probe run records its result and the check judges both (VML-88).
 set -uo pipefail
-[ $# -eq 3 ] || { sed -n '2,20p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,21p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 LABDIR=$(cd "$1" && pwd)
 VM=$2
-EV=$3/tir
+mkdir -p "$3/tir"
+EV=$(cd "$3/tir" && pwd)   # absolute: the vmlab commands run from the lab directory
 OUT=$REPO/out/probes-extra
 R='C:\win3d\results\tir'
 LOG='C:\ProgramData\Yttrium\yttrium-errors.log'
@@ -37,8 +39,7 @@ driver_lines() {
     gps "if (Test-Path '$LOG') { Get-Content '$LOG' | Where-Object { \$_ -match 'forced-sample draw tir_probe.exe' } | ForEach-Object { (\$_ -replace '^.*yttrium: ', '') -replace ' fs=\d+', '' } }" 60
 }
 
-[ -n "$EV" ] && [ "$EV" != /tir ] || { echo "VML-88: EV is empty or /" >&2; exit 2; }
-mkdir -p "$EV"
+[ -n "$EV" ] && [ -d "$EV" ] && [ "$EV" != / ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 find "$EV" -mindepth 1 -delete
 if [ ! -f "$OUT/x64/tir_probe.exe" ] || [ ! -f "$OUT/x86/tir_probe.exe" ]; then
     note "building probes/d3d11-tir"
@@ -53,7 +54,7 @@ for arch in x64 x86; do
     note "tir_probe $arch"
     in_lab vmlab cp "$OUT/$arch/tir_probe.exe" "$VM:C:/win3d/probes-extra/$arch/tir_probe.exe" >/dev/null || exit 1
     before=$(driver_lines | grep -c .)
-    gps "& 'C:\\win3d\\guest\\Run-Probe.ps1' -Path 'C:\\win3d\\probes-extra\\$arch\\tir_probe.exe' -NoModules -Name tir-$arch -OutDir '$R' -Seconds 30 | Out-Null" 400
+    gps "& 'C:\\win3d\\guest\\Run-Probe.ps1' -Path 'C:\\win3d\\probes-extra\\$arch\\tir_probe.exe' -NoModules -Name tir-$arch -OutDir '$R' -Seconds 30" 400 >"$EV/run-$arch.json" 2>&1
     in_lab vmlab cp "$VM:C:/win3d/results/tir/tir-$arch.json" "$EV/tir-$arch.json" >/dev/null 2>&1
     driver_lines | tail -n +$((before + 1)) >"$EV/lines-$arch.txt"
     sed "s/^/$arch: /" "$EV/lines-$arch.txt" >>"$EV/driver-log.txt"
