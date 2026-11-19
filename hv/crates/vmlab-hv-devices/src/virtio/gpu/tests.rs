@@ -259,7 +259,7 @@ fn snapshot_publishes_pending_flush_without_guest_activity() {
         let ScanoutPixels::Shm(frame) = &update.pixels else {
             panic!("expected a restored 2D scanout");
         };
-        assert_eq!(frame.pixels, [42, 42, 42, 0]);
+        assert_eq!(frame.pixels.as_slice(), [42, 42, 42, 0]);
         assert!(restored.state.lock().flush_pending.is_none());
     }
 }
