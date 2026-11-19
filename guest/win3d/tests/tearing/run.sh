@@ -52,10 +52,16 @@ LABDIR=$(cd "$1" && pwd); VM=$2
 OUT=${OUT:-$REPO/.scratch/tearing/$VM}
 [ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 2; }
 mkdir -p "$OUT"
-LAB=$(sed -n 's/^lab "\([^"]*\)".*/\1/p' "$LABDIR/vmlab.wcl" | head -1)
-VMDIR=${XDG_STATE_HOME:-$HOME/.local/state}/vmlab/labs/$LAB/vms/$VM
-SOCK=$VMDIR/vnc.sock
-[ -S "$SOCK" ] || { echo "no RFB socket at $SOCK: is the lab up?" >&2; exit 2; }
+# The VM's vmlab-hv is a child of the lab daemon of this directory. Its
+# --machine argument names the runtime directory that holds vnc.sock.
+LABD=$(pgrep -u "$(id -u)" -f "__labd .*--root $LABDIR( |\$)" | head -1 || true)
+[ -n "$LABD" ] || { echo "no lab daemon for $LABDIR: is the lab up?" >&2; exit 2; }
+HV=; SOCK=
+for p in $(pgrep -P "$LABD" || true); do
+    m=$(tr '\0' '\n' <"/proc/$p/cmdline" | grep -A1 -x -e --machine | tail -1 || true)
+    case $m in */vms/"$VM"/machine.json) HV=$p; SOCK=$(dirname "$m")/vnc.sock ;; esac
+done
+[ -n "$HV" ] && [ -S "$SOCK" ] || { echo "no vmlab-hv with an RFB socket for $VM in $LABDIR" >&2; exit 2; }
 
 in_lab() { (cd "$LABDIR" && "$@"); }
 gfile() { local t=$1; shift; in_lab "$VMLAB" exec --timeout "$t" "$VM" -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$@" | tr -d '\r'; }
@@ -79,8 +85,6 @@ WINDOW=$!
 sleep 20
 
 if [ "$LOAD" != 0 ]; then
-    HV=$(pgrep -u "$(id -u)" -f "vmlab-hv .*labs/$LAB/vms/$VM/" | head -1 || true)
-    [ -n "$HV" ] || { echo "no vmlab-hv process of $LAB/$VM" >&2; exit 2; }
     # The render server and its per-context workers are descendants of vmlab-hv.
     tree() { local p; echo "$1"; for p in $(pgrep -P "$1" || true); do tree "$p"; done; }
     PIDS=$(tree "$HV")

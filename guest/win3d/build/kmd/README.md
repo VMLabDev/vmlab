@@ -33,6 +33,40 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
 | `KMD_DRIVER_VERSION` | `100.6.101.58105` | The PE version resource and the INF's `DriverVer` version. This version identifies the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
+## Trace build
+
+```sh
+KMD_TRACE=1 KMD_DRIVER_VERSION=100.6.101.58190 build/kmd/build.sh
+```
+
+`KMD_TRACE=1` compiles the driver with `VIOGPU_FLIP_TRACE=1`
+(`patches/kmd/0005`). The driver then keeps a ring of 65536 timed records,
+and a DRIVERPRIVATE escape (magic `0x56475446`) returns the records after a
+sequence number, 1024 at a time. `tests/tearing/Get-FlipTrace.ps1` reads it
+in the guest into a CSV file. Give a trace build its own driver version, so
+that a guest shows which driver it runs. A trace build is for a lab: do not
+release one. `BUILDINFO` says `trace_build 1`.
+
+A record is `seq, time, event, context, flags, fence, response, pending`.
+The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
+
+| Event | Meaning | Fields |
+| --- | --- | --- |
+| 1 | A DMA buffer was submitted | context, fence = the submission fence of Windows |
+| 2 | A DMA buffer was reported complete to Windows | context, fence |
+| 3 | Preemption request | flags, pending = the preemption fence |
+| 5 | The host answered a control queue command | context, flags = the request's flags (1 fence, 2 ring index), fence = the virtio fence, response = the response type |
+| 6 to 9 | Timeout, reset, restart, power | as in `docs/tdr-recovery.md` |
+| 16, 22 | The CPU copy of a Blt present begins, ends | context, flags = source resource, fence, response = destination resource |
+| 17 | A flip from a DMA buffer: `SET_SCANOUT` and `RESOURCE_FLUSH` are sent | context, flags = resource, fence |
+| 18 | `SetVidPnSourceAddress` | flags = resource |
+| 19 | The vsync timer sends the recorded flip | flags = resource |
+| 20 | One packet of a DMA buffer goes to the control queue | context, flags = ring index, fence, response = command type (0 NOP, 1 SUBMIT, a timeline submit has a ring index) |
+| 21 | A host context was created | context, flags = capset, fence = process id |
+
+Events 1 to 9 are the records of the 256-record ring of `0004`, without the
+bare interrupt (event 4). A release build has that small ring only.
+
 ## Outputs
 
 ```
@@ -157,6 +191,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 
 | `0003-kmd-create-context-for-gdi-devices.patch` | Creates the legacy host context when the kernel device is constructed, so GDI devices that present without a UMD have one ([`docs/gdi-context.md`](../../docs/gdi-context.md)). |
 | `0004-kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
+| `0005-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
@@ -193,11 +228,12 @@ timestamps from objects and the PE, and the helpers use
 
 ## Caveats
 
-- **Release, not Debug.** The build defines no `DBG`. The driver's
-  `DbgPrint` calls compile to nothing, and with WPP stubbed there is no
-  trace output at all. The prior art ran upstream's Debug build, which prints
-  to the kernel debugger and breaks into it when one is attached. There is
-  no Debug variant of this script yet.
+- **Release, not Debug.** The build is upstream's Release configuration
+  with WPP stubbed, so the driver has no ETW provider, and its `DbgPrint`
+  output needs a kernel debugger. The prior art ran upstream's Debug build,
+  which prints to the kernel debugger and breaks into it when one is
+  attached. This script has no such variant. What it has is the
+  [trace build](#trace-build), which needs no debugger.
 - **lld-link `/SECTION` replaces attributes.** `INIT,d` alone left
   `DriverEntry` in a non-executable section, and the guest bugchecked 0x1A on
   load. The link uses `/SECTION:INIT,ERD`. See

@@ -451,18 +451,18 @@ frame-pacing work is out of scope.
 
 ### Kernel driver diagnostics
 
-The KMD build has no tracing:
+The release KMD build has no tracing:
 
 - WPP needs `tracewpp.exe`, which exists only on Windows.
   `build/kmd/compile-kmd.sh` replaces the generated `.tmh` files with empty
   stubs, so the driver has no ETW provider.
-- The build is Release with no `DBG`, so the source's `DbgPrint` calls compile
-  to nothing. The prior art ran a Debug build that printed to the kernel
-  debugger and broke into it when one was attached.
+- The driver's `DbgPrint` output needs a kernel debugger. The prior art ran
+  upstream's Debug build, which also breaks into the debugger.
 
-To debug the KMD you need another build: a `DBG` build from this repository
-does not exist yet, and upstream's Visual Studio project builds one on
-Windows. See `build/kmd/README.md`.
+For the order of renders, presents and flips there is a trace build:
+`KMD_TRACE=1 build/kmd/build.sh` (`build/kmd/README.md`, "Trace build"). It
+keeps 65536 timed records that `tests/tearing/Get-FlipTrace.ps1` reads in
+the guest. It needs no debugger.
 
 ### Windows 10
 
