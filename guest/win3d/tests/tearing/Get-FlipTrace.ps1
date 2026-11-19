@@ -13,7 +13,10 @@ param(
     [int]$Seconds = 10,
     [string]$Out = 'C:\win3d\results\fliptrace.csv',
     # Start with the records already in the ring (about the last 65536).
-    [switch]$FromStart
+    [switch]$FromStart,
+    # An experiment of the trace build: stall every present copy for this many
+    # microseconds when it is half done (0 turns it off), then exit.
+    [int]$Stall = -1
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -59,6 +62,14 @@ public static class Win3dFlipTrace {
         return false;
     }
 
+    public static bool SetStall(uint microseconds) {
+        Marshal.WriteInt32(buffer, 0, 0x56475453);
+        Marshal.WriteInt32(buffer, 4, 1);
+        Marshal.WriteInt32(buffer, 8, (int)microseconds);
+        var e = new ESCAPE { hAdapter = adapter, Type = 0, pPrivateDriverData = buffer, PrivateDriverDataSize = 12 };
+        return D3DKMTEscape(ref e) == 0;
+    }
+
     public static ulong Last() {
         Read(adapter, ulong.MaxValue >> 1);
         return (ulong)Marshal.ReadInt64(buffer, 24);
@@ -87,6 +98,10 @@ public static class Win3dFlipTrace {
 if (-not [Win3dFlipTrace]::Open()) {
     Write-Output 'no adapter answers the flip trace escape: not a trace build of viogpu3d.sys'
     exit 3
+}
+if ($Stall -ge 0) {
+    "stall $Stall us: {0}" -f [Win3dFlipTrace]::SetStall([uint32]$Stall)
+    exit 0
 }
 New-Item -ItemType Directory -Force (Split-Path -Parent $Out) | Out-Null
 $writer = New-Object IO.StreamWriter $Out, $false
