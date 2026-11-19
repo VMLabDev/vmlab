@@ -2295,6 +2295,9 @@ fn render_snapshots(list: &[Value]) -> String {
     if list.iter().any(|s| s["locked"].as_bool().unwrap_or(false)) {
         out.push_str("locked snapshots live in frozen files; `vmlab worktree thaw` unlocks them\n");
     }
+    for why in list.iter().filter_map(|s| s["unrestorable"].as_str()) {
+        out.push_str(&format!("{why}\n"));
+    }
     out
 }
 

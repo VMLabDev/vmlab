@@ -22,7 +22,7 @@ use super::share_plan;
 use super::state::{LabState, generate_mac};
 use super::vm::{VmDirs, VmInstance};
 use crate::config::LabFile;
-use crate::config::hypervisor::HypervisorKind;
+use crate::config::hypervisor::{HypervisorKind, SelectionSource};
 use crate::config::model::{Container, MachineCfg, Nic, TemplateRef, Vm};
 use crate::profiles::ProfileSet;
 use crate::template::TemplateStore;
@@ -162,17 +162,12 @@ pub(super) async fn build_vm(
     // A VM on vmlab-hv is refused anything its delivered phases cannot run;
     // a pending pull's placeholder hardware is checked again once it binds.
     let dirs = VmDirs::new(cx.lab, &vm_cfg.name, cx.lab_local);
-    let existing = state
-        .machines
-        .get(&vm_cfg.name)
+    let frozen = cx.freeze.and_then(|f| f.record(&vm_cfg.name));
+    let existing = frozen
+        .or_else(|| state.machines.get(&vm_cfg.name))
         .cloned()
         .unwrap_or_default()
         .existing_hypervisor(&dirs.local)
-        .or_else(|| {
-            cx.freeze
-                .and_then(|f| f.record(&vm_cfg.name))
-                .and_then(|record| record.existing_hypervisor(&dirs.local))
-        })
         .or_else(|| dirs.qmp_sock().exists().then_some(HypervisorKind::Qemu));
     let selection = cx.host.hypervisor.select(
         MachineCfg::Vm(vm_cfg),
@@ -180,10 +175,16 @@ pub(super) async fn build_vm(
         Some(&resolved),
         existing,
     );
-    let hypervisor = checked_hypervisor(MachineCfg::Vm(vm_cfg), Some(&resolved), selection.kind)?;
-    // Persist a migrated identity before a reload or deferred pull can rebuild it.
+    let hypervisor = if selection.source == SelectionSource::QemuMigration {
+        // Check the actual hardware at boot. Until then the lab can still
+        // list snapshots and operate on the stopped disks.
+        selection.kind
+    } else {
+        checked_hypervisor(MachineCfg::Vm(vm_cfg), Some(&resolved), selection.kind)?
+    };
+    // Persist an inferred identity before a reload or deferred pull can rebuild it.
     if existing.is_some()
-        && cx.freeze.and_then(|f| f.record(&vm_cfg.name)).is_none()
+        && frozen.is_none()
         && state.machine_mut(&vm_cfg.name).hypervisor.is_none()
     {
         state.machine_mut(&vm_cfg.name).hypervisor = existing;
@@ -194,7 +195,6 @@ pub(super) async fn build_vm(
     // nothing persisted here has reached a guest: the frozen
     // machine's MACs take that place, and are persisted with the
     // rest of its record when the clone is made (§21.2).
-    let frozen = cx.freeze.and_then(|f| f.record(&vm_cfg.name));
     let mut macs = Vec::new();
     for (i, nic) in vm_cfg.nics.iter().enumerate() {
         let mac = nic
@@ -366,8 +366,14 @@ pub(super) fn build_container(
         None,
         existing,
     );
-    let hypervisor = checked_hypervisor(MachineCfg::Container(c_cfg), None, selection.kind)?;
-    c_state.hypervisor = Some(hypervisor);
+    let hypervisor = if selection.source == SelectionSource::QemuMigration {
+        c_state.hypervisor = existing;
+        selection.kind
+    } else {
+        let hypervisor = checked_hypervisor(MachineCfg::Container(c_cfg), None, selection.kind)?;
+        c_state.hypervisor = Some(hypervisor);
+        hypervisor
+    };
     let container = ContainerInstance::new(
         cx.lab,
         c_cfg.clone(),

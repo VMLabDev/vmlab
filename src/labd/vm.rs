@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::hypervisor::HypervisorKind;
+use crate::config::hypervisor::{HypervisorKind, SelectionSource};
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, VmPaths};
@@ -2128,6 +2128,16 @@ impl super::machine::Machine for VmInstance {
     /// `qemu_binary` needs no emulator on PATH: the start checks that one
     /// itself, naming the GPU (§5.2).
     fn check_host_config(&self) -> Result<()> {
+        if self.selection().source == SelectionSource::QemuMigration {
+            let why = crate::config::hypervisor::vmlab_refusals(
+                model::MachineCfg::Vm(&self.cfg),
+                &(self.host_facts)(),
+                Some(&self.template().resolved),
+            );
+            if !why.is_empty() {
+                bail!("{}", why.join("\n"));
+            }
+        }
         self.check_apple_smc_osk()
     }
 
@@ -2203,7 +2213,11 @@ impl super::machine::Machine for VmInstance {
     /// Wire this VM's NICs into the lab fabric — taps on the fast path where
     /// available, since a VM's argv can carry pre-opened descriptors — then
     /// spawn QEMU with event-emitting callbacks.
-    async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
+    async fn start(
+        self: Arc<Self>,
+        lab: Arc<dyn super::machine::LabServices>,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         match self.power_state().await {
             PowerState::Stopped => {}
             // Starting a sleeping machine means waking it: QEMU is already
@@ -2214,8 +2228,12 @@ impl super::machine::Machine for VmInstance {
         // Safety net for paths that don't pull explicitly (restore, wscript):
         // a no-op unless this VM's template download is still pending.
         lab.ensure_pulled(&self.cfg.name).await?;
-        self.pinned_selection.get_or_init(|| self.selection());
-        lab.record_hypervisor(&self.cfg.name, self.hypervisor())
+        let selection = self.pinned_selection.get_or_init(|| self.selection());
+        let migrating = selection.source == SelectionSource::QemuMigration;
+        if migrating {
+            self.check_host_config()?;
+        }
+        lab.record_hypervisor(&self.cfg.name, selection.kind, migrating, output)
             .await?;
         let events = lab.events().clone();
         events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
@@ -2281,7 +2299,7 @@ impl super::machine::Machine for VmInstance {
         // Restoring into a running VM needs NIC listeners only if QEMU must be
         // booted; go through `start` for that so the wiring stays in one place.
         if online && self.power_state().await == PowerState::Stopped {
-            Arc::clone(&self).start(Arc::clone(&lab)).await?;
+            Arc::clone(&self).start(Arc::clone(&lab), None).await?;
         }
         let events_exit = lab.events().clone();
         let events_ready = lab.events().clone();

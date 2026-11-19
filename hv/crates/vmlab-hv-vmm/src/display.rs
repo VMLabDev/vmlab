@@ -447,7 +447,7 @@ impl vmlab_hv_devices::virtio::gpu::DisplaySink for GpuSink {
                         height: r.height,
                     })
                     .collect();
-                frame.pixels = Pixels::Shm(Arc::new(cpu.pixels));
+                frame.pixels = Pixels::Shm(cpu.pixels);
             }
             ScanoutPixels::Inactive | ScanoutPixels::Vga => {}
         }

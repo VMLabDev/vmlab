@@ -86,14 +86,17 @@ machine is reached with `vmlab shell` and `vmlab exec`.
 "vmlab"` on a machine, else an explicit host default, else the VM's persisted
 identity, selects its hypervisor. New supported x86_64 KVM VMs default to
 vmlab-hv; refused declarations fall back to QEMU with a status and `up` reason.
-Supported new containers also default to vmlab-hv and require KVM. **The
-warning release before QEMU's x86 removal is built** (§22.2): `up`, `vm start`,
-`validate` and `status` warn for every x86 machine on QEMU with its reason and
-fix (`config/hypervisor.rs`, `qemu_removal`), a host without KVM is told x86
-guests will need it, and `status --json` lists those machines and their online
-QEMU snapshots (`qemu_removal`, `host_warnings`). Machine identity sticks until destroy or an explicit
-setting; old disks without an identity stay on QEMU. The selection puts it
-on QEMU or on vmlab-hv (`hv/`, with in-tree protocol crates). Phase 1 runs container micro-VMs; phases 2a to 2f a
+Supported new containers also default to vmlab-hv and require KVM.
+**Existing x86 QEMU identities migrate at the next start** (§22.3), including
+identities inferred from old disks and inherited by clones from frozen worktree
+generations. Explicit machine and host settings still take precedence. Machine
+status shows the selected vmlab-hv before the switch is saved. The start
+reports any vmlab-hv refusal and keeps the old identity on refusal. After
+the checks pass, `up` saves the identity before boot and announces the switch
+once. Offline snapshots carry over. `snapshot list` names unrestorable online
+QEMU snapshots, and restore refuses them with offline conversion instructions.
+The removal warning (§22.2) remains for x86 machines selected for QEMU
+through explicit settings or automatic fallback. Phase 1 runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
 or Windows (`vmlab_hv/describe.rs` places every device where QEMU's q35 would;
 a guest reset happens in place, readiness dropping until the rebooted

@@ -22,7 +22,7 @@ use vmlab_cinit_proto::{
 use super::container_ctl::CtlHandle;
 use super::hypervisor::{Control, Hypervisor, Process};
 use super::vm::{PowerState, StopReason};
-use crate::config::hypervisor::HypervisorKind;
+use crate::config::hypervisor::{HypervisorKind, SelectionSource};
 use crate::config::model::{self, MacAddr, VolumeSource};
 use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
@@ -1322,6 +1322,20 @@ impl super::machine::Machine for ContainerInstance {
         vec![self.dirs.scratch_disk()]
     }
 
+    fn check_host_config(&self) -> Result<()> {
+        if self.selection_source == Some(SelectionSource::QemuMigration) {
+            let why = crate::config::hypervisor::vmlab_refusals(
+                model::MachineCfg::Container(&self.cfg),
+                &(self.host_facts)(),
+                None,
+            );
+            if !why.is_empty() {
+                bail!("{}", why.join("\n"));
+            }
+        }
+        Ok(())
+    }
+
     /// A micro-VM needs the host-arch emulator, and `qemu-img` when it is the
     /// image tool (`VMLAB_IMAGE_TOOL`): the image tool makes the scratch disk
     /// and takes the offline snapshots, whichever hypervisor runs the micro-VM.
@@ -1382,12 +1396,21 @@ impl super::machine::Machine for ContainerInstance {
     /// Wire this container's NICs into the lab fabric — stream sockets only,
     /// since the micro-VM argv carries no pre-opened descriptors — then boot
     /// the micro-VM with event-emitting callbacks.
-    async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
+    async fn start(
+        self: Arc<Self>,
+        lab: Arc<dyn super::machine::LabServices>,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         if self.power_state().await != PowerState::Stopped {
             return Ok(());
         }
         // Safety net (see the VM's start): no-op unless the image is pending.
         lab.ensure_pulled(&self.cfg.name).await?;
+        if self.selection_source == Some(SelectionSource::QemuMigration) {
+            self.check_host_config()?;
+            lab.record_hypervisor(&self.cfg.name, self.hypervisor(), true, output)
+                .await?;
+        }
         // Volumes mount from the lab's SMB server; make sure it is serving
         // (idempotent — a no-op when `up` already started it).
         if !self.volumes.is_empty() {
@@ -1471,7 +1494,7 @@ impl super::machine::Machine for ContainerInstance {
             // wires NIC listeners and the event callbacks. Whatever the fresh
             // boot writes is rewound by the load.
             if self.power_state().await == PowerState::Stopped {
-                Arc::clone(&self).start(Arc::clone(&lab)).await?;
+                Arc::clone(&self).start(Arc::clone(&lab), None).await?;
             }
             self.restore_online(snap).await?;
             // Re-point forwards / re-prime the NAT MAC at the restored lease.

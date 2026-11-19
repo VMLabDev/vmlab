@@ -837,7 +837,7 @@ impl crate::virtio::gpu::DisplaySink for RecSink {
             self.updates.lock().push(Published {
                 timestamp_ns: update.timestamp_ns,
                 damage: frame.damage,
-                pixels: frame.pixels,
+                pixels: frame.pixels.as_ref().clone(),
             });
         }
     }

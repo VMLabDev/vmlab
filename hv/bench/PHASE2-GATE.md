@@ -133,6 +133,56 @@ These are drafts. No card exists for them.
   (M3), which is most of its spread. Finding what the guest does in the
   slow boots would make the bar resolve smaller effects.
 
+### G2 boot milestones (card #121)
+
+Card #97's logs localize much of the spread to the first boot, before
+the host observes the specialize marker. The table uses whole-second
+wall-clock log timestamps from CPU release, while the total is the
+runner's monotonic measurement from launch.
+
+| Card #97 run | Total (s) | Release to marker (s) | Marker to OOBE done (s) | OOBE done to ready (s) |
+|---|---:|---:|---:|---:|
+| QEMU gate, fastest | 94.92 | 59 | 27 | 9 |
+| QEMU gate, slowest | 102.82 | 63 | 29 | 11 |
+| vmlab-hv gate, fastest | 89.38 | 56 | 25 | 8 |
+| vmlab-hv gate, slowest | 102.95 | 64 | 29 | 10 |
+| vmlab-hv A/B head, fastest | 91.22 | 56 | 24 | 11 |
+| vmlab-hv A/B head, slowest | 102.70 | 67 | 26 | 10 |
+
+The slow vmlab-hv A/B boot loses about 11 seconds by the marker. The
+slow QEMU gate boot loses about four seconds by that point and the rest
+after it. These samples do not establish a single binary mode selector.
+The guest has no NIC, and the prior disk measurements show variable sync
+costs. The logs cannot attribute the pre-marker delay to disk caching,
+CPU placement, a guest timer, or offline servicing.
+
+Guest event logs from card #72's 71 diagnostic boots also place the
+spread inside Windows. For each backend, the table compares medians for
+the fastest and slowest quarter by total boot time. Each cohort pools the
+diagnostic variants of that backend. The guest intervals use Kernel-General
+event 12 for kernel start and User32 event 1074 from winlogon for the
+specialize reboot request.
+
+| Backend | Cohort (boots) | Total (s) | First kernel start to specialize reboot request (s) | Request to second kernel start (s) | Second to final kernel start (s) |
+|---|---|---:|---:|---:|---:|
+| QEMU | Fastest (5) | 83.41 | 51.10 | 2.92 | 24.01 |
+| QEMU | Slowest (5) | 95.63 | 55.60 | 6.67 | 26.01 |
+| vmlab-hv | Fastest (12) | 88.63 | 53.85 | 2.55 | 26.00 |
+| vmlab-hv | Slowest (12) | 99.22 | 57.62 | 3.85 | 31.00 |
+
+The specialize pass contributes on both backends. QEMU also varies
+around the specialize reboot, while vmlab-hv shows a larger difference
+between the second and final kernel starts. This comparison locates
+the spread across multiple intervals even on the guest clock. The
+cohorts mix diagnostic conditions and cannot isolate a causal factor.
+The source logs are under
+`/home/vmlab/src/stc/logs/d28-card-72.r8b/diag/logs/` on helios.
+
+G2 now records monotonic readiness milestones for each repeat alongside
+its total, host sync probe, and load. The benchmark retains the existing
+guest configuration and readiness sequence so future runs can compare
+the spread by phase without changing the parity metric.
+
 
 ## Round 7 follow-up: G7 UDP transmit (card #74, 2026-11-19)
 

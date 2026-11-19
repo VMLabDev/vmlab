@@ -3,6 +3,7 @@
 //! `Gpu` clones share state. Keep a clone for frame and cursor publication
 //! while the PCI transport owns another clone. The default 2D mode needs no GPU.
 
+mod compose;
 mod modifiers;
 mod pacer;
 mod renderer;
@@ -13,9 +14,16 @@ pub use renderer::{APERTURE_SIZE, BlobMapper, GpuMode};
 
 pub enum ScanoutPixels {
     Dma(DmaFrame),
-    Shm(crate::display::Frame),
+    Shm(ShmFrame),
     Inactive,
     Vga,
+}
+
+#[derive(Clone)]
+pub struct ShmFrame {
+    pub mode: Mode,
+    pub pixels: Arc<Vec<u8>>,
+    pub damage: Vec<crate::display::Damage>,
 }
 
 pub struct ScanoutUpdate {
@@ -128,7 +136,7 @@ struct State {
     native: bool,
     scanout_generation: u64,
     dirty: bool,
-    cached_frame: Option<Frame>,
+    compose: compose::Compose,
     flushes: Vec<Rect>,
     cursor: Cursor,
     mem: Option<GuestMemory>,
@@ -178,7 +186,7 @@ impl Gpu {
                 native: false,
                 scanout_generation: 0,
                 dirty: true,
-                cached_frame: None,
+                compose: compose::Compose::default(),
                 flushes: Vec::new(),
                 cursor: Cursor::default(),
                 mem: None,
@@ -241,6 +249,9 @@ impl Gpu {
     pub fn set_display_sink(&self, sink: Arc<dyn DisplaySink>) {
         let mut s = self.state.lock();
         s.display = Some(sink);
+        if let Some(timestamp_ns) = s.flush_pending {
+            s.publish_scanout(timestamp_ns);
+        }
         if s.pacer.is_none() {
             match pacer::Pacer::spawn(&self.id, Arc::downgrade(&self.state)) {
                 Ok(pacer) => s.pacer = Some(pacer),
@@ -309,7 +320,12 @@ impl Gpu {
                 }
             }
         }
-        s.frame_2d()
+        s.frame_2d().map(|frame| Frame {
+            mode: frame.mode,
+            pixels: frame.pixels.as_ref().clone(),
+            dirty: !frame.damage.is_empty(),
+            damage: frame.damage,
+        })
     }
 
     /// Runtime surface generation, including same-size replacement and reset.
@@ -319,55 +335,12 @@ impl Gpu {
 }
 
 impl State {
-    fn frame_2d(&mut self) -> Option<Frame> {
-        let s = self;
-        let mode = s.mode()?;
-        if !s.dirty
-            && let Some(frame) = &s.cached_frame
-            && frame.mode == mode
-        {
-            return Some(frame.unchanged());
-        }
-        let previous = s.cached_frame.as_ref().filter(|f| f.mode == mode);
-        let mut pixels = previous
-            .map(|f| f.pixels.clone())
-            .unwrap_or_else(|| vec![0; mode.stride as usize * mode.height as usize]);
-        if let Some((id, r)) = s.scanout {
-            let resource = &s.resources[&id];
-            let full = previous.is_none() || s.flushes.is_empty();
-            for y in 0..r.h {
-                // Merge damage on each row before copying. Testing every
-                // rectangle at every pixel multiplies guest-controlled work.
-                let mut spans = if full {
-                    vec![(0, r.w)]
-                } else {
-                    s.flushes
-                        .iter()
-                        .filter_map(|f| {
-                            let start = f.x.max(r.x);
-                            let end = (f.x + f.w).min(r.x + r.w);
-                            (y + r.y >= f.y && y + r.y < f.y + f.h && start < end)
-                                .then(|| (start - r.x, end - r.x))
-                        })
-                        .collect::<Vec<_>>()
-                };
-                spans.sort_unstable();
-                let mut copied = 0;
-                for (start, end) in spans {
-                    for x in start.max(copied)..end {
-                        let src = ((y + r.y) * resource.width + x + r.x) as usize * 4;
-                        let dst = (y * r.w + x) as usize * 4;
-                        let p = resource.pixel(src);
-                        pixels[dst..dst + 3].copy_from_slice(&p[..3]);
-                    }
-                    copied = copied.max(end);
-                }
-            }
-        }
-        let frame = Frame::compare(mode, pixels, previous, (16, 16));
-        s.cached_frame = Some(frame.clone());
-        s.flushes.clear();
-        s.dirty = false;
+    fn frame_2d(&mut self) -> Option<ShmFrame> {
+        let mode = self.mode()?;
+        let scanout = self.scanout.map(|(id, rect)| (&self.resources[&id], rect));
+        let frame = self.compose.frame(mode, scanout, &self.flushes, self.dirty);
+        self.flushes.clear();
+        self.dirty = false;
         Some(frame)
     }
 
@@ -600,7 +573,7 @@ impl State {
                     self.scanout = None;
                     self.scanout_generation = self.scanout_generation.wrapping_add(1);
                     self.dirty = true;
-                    self.cached_frame = None;
+                    self.compose = compose::Compose::default();
                     self.flushes.clear();
                 }
                 NODATA
@@ -624,7 +597,7 @@ impl State {
                 self.native = true;
                 if previous != (self.native, self.scanout) {
                     self.scanout_generation = self.scanout_generation.wrapping_add(1);
-                    self.cached_frame = None;
+                    self.compose = compose::Compose::default();
                     self.flushes.clear();
                 }
                 self.dirty = true;
@@ -990,7 +963,7 @@ impl VirtioDevice for Gpu {
         s.native = false;
         s.scanout_generation = s.scanout_generation.wrapping_add(1);
         s.dirty = true;
-        s.cached_frame = None;
+        s.compose = compose::Compose::default();
         s.flushes.clear();
         let generation = s.cursor.generation.wrapping_add(1);
         s.cursor = Cursor {

@@ -63,8 +63,8 @@ pub struct MachineState {
 }
 
 impl MachineState {
-    /// Old disks without an identity predate automatic selection. Preserve
-    /// QEMU unless a snapshot records a later vmlab-hv run.
+    /// Old disks without an identity predate automatic selection. Infer QEMU
+    /// unless a snapshot records a later vmlab-hv run.
     pub fn existing_hypervisor(
         &self,
         local: &Path,
@@ -141,14 +141,22 @@ pub struct SnapshotRecord {
 impl SnapshotRecord {
     /// Why this snapshot cannot be restored on a machine that now runs on
     /// `now` — `None` when it can (PRD §22, D31). Only an online one is
-    /// bound to its hypervisor, and switching the machine back makes it
-    /// restorable again, so the refusal says how.
+    /// bound to its hypervisor.
     pub fn hypervisor_refusal(
         &self,
         machine: &str,
         snap: &str,
         now: crate::config::hypervisor::HypervisorKind,
     ) -> Option<String> {
+        use crate::config::hypervisor::HypervisorKind::{Qemu, Vmlab};
+        if self.online && self.hypervisor == Qemu && now == Vmlab {
+            return Some(format!(
+                "\"{machine}\": snapshot \"{snap}\" was taken online under QEMU and is \
+                 unrestorable on vmlab-hv. To convert it to offline, restore it with QEMU \
+                 using a release that supports it for this guest, stop the machine, and take \
+                 an offline snapshot before upgrading."
+            ));
+        }
         (self.online && self.hypervisor != now).then(|| {
             format!(
                 "\"{machine}\": snapshot \"{snap}\" was taken online under {took}, and the \

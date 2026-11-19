@@ -64,6 +64,8 @@ pub enum SelectionSource {
     HostDefault,
     /// The identity persisted with the machine's disks.
     Existing,
+    /// An existing x86 QEMU machine moving to vmlab-hv at its next start.
+    QemuMigration,
     /// Automatic selection: vmlab-hv unless [`vmlab_refusals`] names a reason.
     Automatic,
 }
@@ -90,6 +92,16 @@ impl HypervisorDefaults {
             MachineCfg::Container(c) => (c.hypervisor, self.container),
         };
         let explicit = own.or(default);
+        if explicit.is_none()
+            && existing == Some(HypervisorKind::Qemu)
+            && x86_guest(&guest_arch(machine, host, hardware))
+        {
+            return HypervisorSelection {
+                kind: HypervisorKind::Vmlab,
+                source: SelectionSource::QemuMigration,
+                fallback_reason: None,
+            };
+        }
         if let Some(kind) = explicit.or(existing) {
             return HypervisorSelection {
                 kind,
@@ -472,6 +484,16 @@ fn x86_guest(arch: &str) -> bool {
     crate::qemu::qemu_arch(arch) == VMLAB_ARCH
 }
 
+fn guest_arch(machine: MachineCfg<'_>, host: &HostFacts, hardware: Option<&ResolvedVm>) -> String {
+    match machine {
+        MachineCfg::Vm(vm) => hardware
+            .map(|h| h.arch.clone())
+            .or_else(|| crate::qemu::resolve::vm_arch(vm))
+            .unwrap_or_else(|| host.arch.clone()),
+        MachineCfg::Container(_) => host.arch.clone(),
+    }
+}
+
 /// The removal warning for `machine` under `selection` — `None` unless it is
 /// an x86 or x86_64 guest that runs on QEMU. `hardware` as in
 /// [`vmlab_refusals`]: without it a VM whose template is not local reports
@@ -485,27 +507,20 @@ pub fn qemu_removal(
     if selection.kind != HypervisorKind::Qemu {
         return None;
     }
-    let (kind, name, arch) = match machine {
-        MachineCfg::Vm(vm) => (
-            "vm",
-            &vm.name,
-            hardware
-                .map(|h| h.arch.clone())
-                .or_else(|| crate::qemu::resolve::vm_arch(vm))
-                .unwrap_or_else(|| host.arch.clone()),
-        ),
-        // A container runs the host's own architecture.
-        MachineCfg::Container(c) => ("container", &c.name, host.arch.clone()),
-    };
-    if !x86_guest(&arch) {
+    if !x86_guest(&guest_arch(machine, host, hardware)) {
         return None;
     }
+    let (kind, name) = match machine {
+        MachineCfg::Vm(vm) => ("vm", &vm.name),
+        MachineCfg::Container(c) => ("container", &c.name),
+    };
     let blockers = vmlab_refusals(machine, host, hardware);
     let qemu_args = matches!(machine, MachineCfg::Vm(vm) if !vm.qemu_args.is_empty());
     let reason = match selection.source {
         SelectionSource::Machine => QemuReason::Explicit,
         SelectionSource::HostDefault => QemuReason::HostDefault,
         SelectionSource::Existing => QemuReason::Existing,
+        SelectionSource::QemuMigration => return None,
         SelectionSource::Automatic if qemu_args => QemuReason::QemuArgs,
         SelectionSource::Automatic => QemuReason::Refused,
     };
@@ -692,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_vm_selection_falls_back_and_preserves_explicit_and_existing_choices() {
+    fn automatic_vm_selection_migrates_existing_x86_qemu_and_respects_explicit_choices() {
         let file = lab(r#"lab "l" {
           vm "modern" { template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 1GiB }
           vm "args" { template = "x86_64/t" qemu_args = ["-no-hpet"] }
@@ -724,13 +739,16 @@ mod tests {
                 .kind,
             HypervisorKind::Vmlab
         );
+        let migrated = defaults.select(
+            modern,
+            &kvm_host(),
+            Some(&hardware),
+            Some(HypervisorKind::Qemu),
+        );
+        assert_eq!(migrated.kind, HypervisorKind::Vmlab);
+        assert_eq!(migrated.source, SelectionSource::QemuMigration);
+        assert!(migrated.fallback_reason.is_none());
         for kind in [HypervisorKind::Qemu, HypervisorKind::Vmlab] {
-            assert_eq!(
-                defaults
-                    .select(modern, &kvm_host(), Some(&hardware), Some(kind))
-                    .kind,
-                kind
-            );
             let host = HypervisorDefaults {
                 vm: Some(kind),
                 ..defaults
@@ -803,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_container_selection_preserves_identity_and_reports_refusals() {
+    fn automatic_container_selection_migrates_existing_x86_qemu_and_reports_refusals() {
         let file = lab(r#"lab "l" {
           container "c" { image = "alpine" }
           container "q" { image = "alpine" hypervisor = "qemu" }
@@ -816,7 +834,7 @@ mod tests {
         for kind in [HypervisorKind::Qemu, HypervisorKind::Vmlab] {
             assert_eq!(
                 defaults.select(machine, &kvm_host(), None, Some(kind)).kind,
-                kind
+                HypervisorKind::Vmlab
             );
             let host = HypervisorDefaults {
                 container: Some(kind),
@@ -1339,10 +1357,7 @@ mod tests {
         assert!(w.warning.contains("container \"c\" runs on QEMU"), "{w:?}");
         assert!(w.warning.contains("{ container = \"qemu\" }"), "{w:?}");
 
-        let w = removal(&file, "plain", none, &host, qemu).unwrap();
-        assert_eq!(w.reason, QemuReason::Existing);
-        assert!(w.warning.contains("disks were made under QEMU"), "{w:?}");
-        assert!(w.warning.contains("vmlab vm destroy plain"), "{w:?}");
+        assert!(removal(&file, "plain", none, &host, qemu).is_none());
 
         let w = removal(&file, "args", none, &host, None).unwrap();
         assert_eq!(w.reason, QemuReason::QemuArgs);
