@@ -559,3 +559,36 @@ fn bar_probes_pci_indirect_access_and_bounds() {
     assert!(modern.restore_state(&state).is_err());
     assert!(g.pci.restore_state(&modern.save_state().unwrap()).is_err());
 }
+
+#[test]
+fn transitional_queue_doorbells_use_the_captured_notify_offset() {
+    struct Rec(Arc<Mutex<Vec<u64>>>);
+    impl crate::QueueDoorbells for Rec {
+        fn set(&mut self, doorbells: &[crate::QueueDoorbell]) -> std::io::Result<()> {
+            *self.0.lock() = doorbells.iter().map(|d| d.address).collect();
+            Ok(())
+        }
+    }
+    let block = Block::new("blk", Box::new(MemDisk::new(65536)))
+        .with_num_queues(2)
+        .unwrap();
+    let worker = crate::virtio::worker::QueueWorker::new(Box::new(block)).unwrap();
+    let mut pci =
+        VirtioPciDevice::new_transitional("pci", Box::new(worker), memory(), None, None, 3)
+            .unwrap();
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    pci.set_queue_doorbells(Box::new(Rec(registered.clone())));
+    pci.set_bar_address(4, Some(0xfe00_0000));
+    assert!(registered.lock().is_empty());
+    pci.bar_write(4, 0x14, &[0]);
+    pci.bar_write(4, 0x14, &[3]);
+    pci.bar_write(4, 8, &1u32.to_le_bytes());
+    pci.bar_write(4, 12, &1u32.to_le_bytes());
+    pci.bar_write(4, 0x14, &[11]);
+    for (off, addr) in [(0x20, DESC), (0x28, 0x11000u64), (0x30, 0x12000)] {
+        pci.bar_write(4, off, &addr.to_le_bytes());
+    }
+    pci.bar_write(4, 0x1c, &1u16.to_le_bytes());
+    pci.bar_write(4, 0x14, &[15]);
+    assert_eq!(*registered.lock(), [0xfe00_3000, 0xfe00_3004]);
+}
