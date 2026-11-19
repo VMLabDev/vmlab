@@ -466,10 +466,13 @@ impl VirtioPciDevice {
         let list: Vec<QueueDoorbell> = want
             .into_iter()
             .flat_map(|base| {
-                events.iter().enumerate().map(move |(queue, event)| QueueDoorbell {
-                    address: base + offset + NOTIFY_OFF_MULTIPLIER * queue as u64,
-                    event: event.clone(),
-                })
+                events
+                    .iter()
+                    .enumerate()
+                    .map(move |(queue, event)| QueueDoorbell {
+                        address: base + offset + NOTIFY_OFF_MULTIPLIER * queue as u64,
+                        event: event.clone(),
+                    })
             })
             .collect();
         match doorbells.set(&list) {

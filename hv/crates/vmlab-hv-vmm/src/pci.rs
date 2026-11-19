@@ -1164,12 +1164,7 @@ mod tests {
         assert!(root.dispatch_mmio_write(0xc200_0040, &[8]));
         // A restore tells the function where its BARs are, as a config
         // write does: a function with kernel registrations moves them.
-        assert!(
-            device
-                .lock()
-                .placements
-                .contains(&(0, Some(0xc200_0000)))
-        );
+        assert!(device.lock().placements.contains(&(0, Some(0xc200_0000))));
     }
 
     #[test]
