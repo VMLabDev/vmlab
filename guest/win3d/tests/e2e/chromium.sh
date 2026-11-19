@@ -25,9 +25,14 @@
 # for the whole page, and every d3d12.dll it loaded is the native copy.
 # Writes <evidence-dir>/chromium/: one JSON per row and chromium.json, the
 # verdict. Exit status: 0 when all rows pass, 1 otherwise, 2 on usage.
+#
+# The check restarts the VM first. vmlab-hv does not give back every file
+# descriptor a guest GPU context used: after the probes of tests/e2e/run.sh
+# it held 825 of its 1024, each browser start cost 20 to 70 more, and the VM
+# stopped in the fourth one ("Too many open files").
 # check-shell-paths: no-errexit each row records its rc and the judge decides; the ini must be put back (VML-88).
 set -uo pipefail
-[ $# -eq 3 ] || { sed -n '2,28p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,33p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 LABDIR=$(cd "$1" && pwd)
@@ -68,6 +73,14 @@ find "$EV" -mindepth 1 -delete
 find "$STAGE" -mindepth 1 -type f -delete
 
 note "chromium check in $LABDIR"
+note "restarting $VM"
+in_lab vmlab vm restart "$VM" || exit 1
+# The agent first, then the autologon user: Run-Probe.ps1 needs the desktop.
+for _ in $(seq 1 60); do
+    [ -n "$(gps '(Get-CimInstance Win32_ComputerSystem).UserName' 30 2>/dev/null | tr -d '[:space:]')" ] && break
+    sleep 10
+done
+sleep 30
 gps "New-Item -ItemType Directory -Force '$G', 'C:\\win3d\\chromium', 'C:\\apps' | Out-Null; if (Test-Path '$R') { Remove-Item '$R' -Recurse -Force }" 120 || exit 1
 for f in Run-Probe.ps1 Test-ChromiumGpu.ps1; do
     in_lab vmlab cp "$REPO/tests/guest/$f" "$VM:C:/win3d/guest/$f" || exit 1
