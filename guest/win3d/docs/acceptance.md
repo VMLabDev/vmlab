@@ -86,7 +86,7 @@ From nothing, with no manual step:
 | 1. One script builds the whole package | `scripts/build.sh` exits 0, or the bundle it built matches HEAD's sources |
 | 2. One documented install command | `scripts/install-into-vm.sh` exits 0 and the guest's `state.json` says `Installed` |
 | 2. `vulkaninfo` lists the Venus device | The installed x64 `vulkaninfo --summary` names a `Virtio-GPU Venus` device that is not a CPU device |
-| 2. D3D9, D3D11, D3D12 and OpenGL applications render on the GPU, with no app-local graphics DLLs, and show in a console screenshot | For each API, x64 and x86: the probe exits 0 and its readback matches; the adapter is not a software renderer and is ours (`Hardsoft VirtIO GPU 3D controller` for D3D, Zink on `Virtio-GPU Venus` for OpenGL); no module loads from the exe's directory; every graphics module comes from System32, SysWOW64, a subdirectory of either, or the driver store; the process loads our stack (`viogpu_d3d10.dll`; `d3d12.dll` with `vmlab-win3d\vkd3dcore.dll` and `libvulkan_virtio.dll`; `viogpu_wgl.dll` with `libvulkan_virtio.dll`); and at least one console capture shows the probe window's three marker squares |
+| 2. D3D9, D3D11, D3D12 and OpenGL applications render on the GPU, with no app-local graphics DLLs, and show in a console screenshot | For each API, x64 and x86: the probe exits 0 and its readback matches; the adapter is not a software renderer and is ours (`Yttrium VirtIO GPU 3D controller` for D3D, Zink on `Virtio-GPU Venus` for OpenGL; `Hardsoft VirtIO GPU 3D controller` before the November base); no module loads from the exe's directory; every graphics module comes from System32, SysWOW64, a subdirectory of either, or the driver store; the process loads our stack (`viogpu_d3d10.dll`; `d3d12.dll` with `vmlab-win3d\vkd3dcore.dll` and `libvulkan_virtio.dll`; `viogpu_wgl.dll` with `libvulkan_virtio.dll`); and at least one console capture shows the probe window's three marker squares |
 | 2. `dxdiag` reports hardware acceleration | `Get-Dxdiag.ps1`'s `hardware_acceleration` is true, which requires D3D and DirectDraw `Enabled`, a full (not display-only) device, and not the Basic Render Driver. The card or driver must also be `viogpu3d` / Hardsoft |
 | 3. `docs/` explains install, uninstall, the stack and pins, signing, known limits and the evidence | Not checked by the script; see "Done item 3" below |
 
@@ -123,6 +123,37 @@ NVIDIA GeForce RTX 5090, hid 1`), and every guest listed exactly one Venus
 device.
 
 ## Results
+
+### November base (2026-11-19)
+
+The package rebased to Yttrium's November 2026 release (kernel driver
+`e9917ae2`, Mesa `76c095bb`, driver version `100.6.101.58105`, bundle
+`vmlab-win3d-0.1.3`), on `hypervisor = "vmlab"` with vmlab and the vmlab-hv
+bundle built from the same commit, virglrenderer 1.3.0 with
+`patches/virglrenderer` 0001 to 0003, NVIDIA driver 615.78.08, Mesa 26.2.6 on
+the host. Template `x86_64/windows-11@26100.1742.11`. `windows-10` was not
+run.
+
+| Run | Result | D3D9 x64, x86 | D3D11 x64, x86 | D3D12 x64, x86 | OpenGL x64, x86 | Vulkan x64, x86 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `windows-11`, `AMD1` (Radeon 610M, RADV) | 12 of 12 | 59.58, 58.32 fps | 58.6, 58.85 fps | 55.39, 55.55 fps | 65.87, 64.34 fps | 58.87, 58.73 fps |
+| `windows-11-nvidia2`, `Nvidia2` (RTX 5090) | 12 of 12 | 57.85, 56.72 fps | 57.34, 57.69 fps | 52.87, 52.99 fps | 64.14, 63.35 fps | 56.44, 56.31 fps |
+
+The kernel log has no `NVRM: Xid` line before or after the runs. dxdiag
+names the card "Yttrium VirtIO GPU 3D controller", with Direct3D and
+DirectDraw enabled, WDDM 2.0. A first `AMD1` run passed every probe and
+counted 11 of 12, because `tests/e2e/check.py` still looked for the old
+adapter name in the dxdiag row. The table has the run after that fix.
+
+After each run, in the same lab, the reduction page of GitHub #233 (a red
+quad from a `STATIC_DRAW`, a `DYNAMIC_DRAW` and a `STREAM_DRAW` vertex
+buffer) was opened in the guest's Edge 157.0.4341.60, whose WebGL renderer
+was `ANGLE (VirtIO, Yttrium VirtIO GPU 3D controller (0x00001050) Direct3D11
+vs_5_0 ps_5_0, D3D11)`. All three lines read `255,0,0,255` with `glError 0`
+on both GPUs. The page and its runner are not in the repository.
+
+The stretch applications, the compatibility sweep and the feature probes
+were not run on this base.
 
 ### Release candidate 0.1.1-alpha-rc3 (NVIDIA with Resizable BAR)
 

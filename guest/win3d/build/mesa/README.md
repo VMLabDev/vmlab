@@ -187,7 +187,8 @@ Mesa tree; that work was in vkd3d-proton. The error-level `mesa_loge` lines in
 the Venus NT memory path are failure reports, not diagnostics, so 0011 keeps
 them.
 
-Which patches have run in a guest, and where:
+Which patches have run in a guest, and where. Every row but the last is a
+run on the September base (`374c3022`), and names patches as they were then:
 
 | Run | Mesa patches in the package | Evidence |
 | --- | --- | --- |
@@ -200,6 +201,7 @@ Which patches have run in a guest, and where:
 | unigl proof, Windows 11 on `Nvidia1` and `AMD1` (e2e, Unigine Heaven and Valley OpenGL) | 0001 to 0017, 0020 to 0027, 0030, 0035, 0040 to 0044, 0070, 0085, 0086 | `docs/unigl.md` |
 | unid3d proof, Windows 11 on `AMD1`, `Nvidia1` and `Nvidia2` (e2e, `d3d9_depthbias`, Unigine D3D9 and D3D11) | 0001 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0090 | `docs/unid3d.md` |
 | gzdoom proof, Windows 11 on `AMD1` and `Nvidia1` (e2e, `gzgl`, GZDoom OpenGL and Vulkan) | 0001 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0080; the `Nvidia1` runs add 0070 and 0086, the last e2e on each GPU adds 0070, 0086 and 0090 | `docs/gzdoom.md` |
+| November base, Windows 11 on `AMD1` and `Nvidia2` (e2e, and the static vertex buffer page of GitHub #233 in Edge) | The 43 patches of the series as it is now | `docs/acceptance.md`, "November base" |
 
 The nvtex proof run (2026-10-18) has the full series, 0001 to 0025, built by
 `scripts/build.sh` at commit [e428846](https://github.com/VMLabDev/vmlab-win3d/commit/e428846ccddaf01dba7efed9d057518f45c522fc). Before it, no recorded run had 0015
@@ -243,4 +245,19 @@ This build was not repeated, so its bit-reproducibility is not checked:
 ```
 a43c70d4e56407055e438a6fc831f61ad9c9e458d98ef9937c360a3863fca2fb  mesa/x64/viogpu_d3d10.dll
 657e89272ed867033f03a71204d39a30b5063f0e4b275b0a7a7ecd428813dd7e  mesa/x86/viogpu_d3d10.dll
+```
+
+The November base (`76c095bb`, the 43 patches) built once on 2026-11-19 with
+the same toolchain image. That build was not repeated, so its
+bit-reproducibility is not checked:
+
+```
+faa19d2a05a0ecea652f2bef2a60a05a9e65751688358eba8c4fee1b71061713  mesa/x64/libvulkan_virtio.dll
+04c5a9b5382a24d48764db83b6fdc369f18472699d547abbccc4c21bdfb6327c  mesa/x64/viogpu_d3d10.dll
+8905445289db3ca0cb530499a1adfae1852b219d077dcc8972342a60a283331b  mesa/x64/viogpu_wgl.dll
+f67d39fde82a46dfdbb34581493632e164fe6694310ff125c0c180c91283304a  mesa/x64/virtio_icd.json
+55da16b5e6c388bb546d208935693c57a46b875f0d17adc1b324f8b6fed92dd4  mesa/x86/libvulkan_virtio.dll
+8f92204488461d1dabb16c6119af49c3341f428abf67e9c4351cbc64b173f8b7  mesa/x86/viogpu_d3d10.dll
+dcf70f1b0b2b9bdf194f0d0bbeaaf6a47b27e95eb859bbed8877617ceb263ea4  mesa/x86/viogpu_wgl.dll
+69e6a7c23226a0c1c854f9b8ac340cedc361ad2db66fe6aa7733c8e060e03151  mesa/x86/virtio_icd.json
 ```

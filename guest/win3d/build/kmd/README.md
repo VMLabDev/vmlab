@@ -174,11 +174,17 @@ mutex, and resets the native clock cache with the host objects.
 The build was bit-reproducible on this host at the September base
 (`b99d951a`): a run on 2026-10-17 gave the same sha256 for all six outputs,
 including the PDB, as the run recorded in [docs/evidence/kmd/00-signing-host.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/00-signing-host.txt).
-At `e9917ae2` with the four patches and version `100.6.101.58105`, one run
-on 2026-11-19 gave the hashes below. That build was not repeated:
+At `e9917ae2` with the four patches and version `100.6.101.58105`, two runs
+on 2026-11-19 (one of `build/kmd/build.sh` alone, one inside
+`scripts/build.sh`) gave the same sha256 for all six outputs:
 
 ```
-@@KMDHASHES@@
+ff46043d31193414a86051aa049aa2ec5cad15a8c5e35cac146ae1041c9ebfd6  x64/viogpu3d.sys
+deff13da3ec96ce25f314e04eac18aeb27c37b30e3e35cfe27e56ef7d55ccb3e  x64/viogpu3d.pdb
+b5f16e3e38b953aad760fadd8fcea6db94b77c3d62a0b4e614a263d38a56a37a  x64/vgpusrv.exe
+9e783bc6f827dc3edb199132adf26ed8b0e99c6b9f61e3e451cecf22555a9df9  x64/viogpuap.exe
+690f9b47009f93e1b3c9225a16521216abe2412aef3d4acd3b529f3b9915aaab  x64/viogpu3d.inf
+15404c1100bb30ddc0a8abcff1b773e8fb02d736cc412f32f8c7b6b22c25c56d  viogpu3d_x64_wow64.inf.template
 ```
 
 The work tree is always `/tmp/kmd-work` in the container, `/Brepro` removes
