@@ -12,8 +12,8 @@
 # `vmlab vm screenshot` captures the console. pointer.py then checks that
 # every shape arrived at its position, that RFB carried them, that the I-beam
 # is black with a white outline, and that no capture has the pointer in the
-# frame. A `vmlab record` video of the run must show the pointer too, and
-# no pointer while it is hidden. Writes <evidence-dir>/pointer/: pointer.json
+# frame. A `vmlab record` video of the run must show the pointer at each
+# step's position, and none at the hidden step's. Writes <evidence-dir>/pointer/: pointer.json
 # (the verdict), events.json, guest.json, pointer.mp4 and one capture. Exit
 # status: 0 when all pass.
 #
@@ -32,7 +32,6 @@ PLAN=arrow,ibeam,sizewe,hidden,arrow
 SECONDS_EACH=6
 X0=200 Y0=300 STEP_X=120
 BACKGROUND=32,96,160
-SENT=100,100
 
 note() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 in_lab() { (cd "$LABDIR" && "$@"); }
@@ -67,9 +66,8 @@ in_lab vmlab vm screenshot "$VM" "$STAGE/size.png" >/dev/null 2>&1
 size=$(magick identify -format '%wx%h' "$STAGE/size.png" 2>/dev/null)
 rm -f "$STAGE/size.png"
 in_lab vmlab record start "$VM" -o "$STAGE/pointer.mp4" --size "${size:-1024x768}" || note "no recording"
-# A real pointer event first: Windows shows no pointer before one. The
-# recorder draws the pointer where vmlab last put it, which is here.
-in_lab vmlab vm mouse-move "$VM" "${SENT%,*}" "${SENT#*,}" || true
+# A real pointer event first: Windows shows no pointer before one.
+in_lab vmlab vm mouse-move "$VM" 100 100 || true
 in_lab vmlab vm sendkeys "$VM" esc || true
 
 steps=$(tr ',' '\n' <<<"$PLAN" | grep -c .)
@@ -96,7 +94,7 @@ in_lab vmlab cp "$VM:C:/win3d/results/pointer/guest.json" "$EV/guest.json" || tr
 frames=()
 if in_lab vmlab record stop "$VM" && [ -s "$STAGE/pointer.mp4" ]; then
     mkdir -p "$STAGE/frames"
-    ffmpeg -loglevel error -y -i "$STAGE/pointer.mp4" -vf fps=5 "$STAGE/frames/%04d.png" && frames=(--frames "$STAGE/frames" --sent "$SENT")
+    ffmpeg -loglevel error -y -i "$STAGE/pointer.mp4" -vf fps=5 "$STAGE/frames/%04d.png" && frames=(--frames "$STAGE/frames")
     cp "$STAGE/pointer.mp4" "$EV/pointer.mp4"
 fi
 

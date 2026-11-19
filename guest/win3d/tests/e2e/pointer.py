@@ -19,9 +19,11 @@
                    invert the screen, which a host pointer cannot do)
         frame      no console capture that shows the test window has anything
                    but the background where a step put the pointer
-        recording  (with --frames) the frames of a `vmlab record` video of the
-                   run show a pointer where vmlab last put it (--sent X,Y)
-                   in some frames, and none there while it was hidden
+        recording  (with --frames) frames of a `vmlab record` video of the run
+                   show a pointer at the position of every step but the
+                   hidden one, and none at the hidden step's position. A
+                   step whose shape has its hotspot at (0,0), the arrow, is
+                   not judged: vmlab's recorder hides it (docs/pointer.md)
 
 Only the standard library and ImageMagick's `magick` (for the captures).
 """
@@ -223,9 +225,9 @@ def frame_check(shots, plan, bg, size=64):
     return seen, dirty
 
 
-def recording_check(frames, sent, bg, size=40):
-    """Video frames that show the test window, split by whether a pointer is drawn at `sent`."""
-    with_pointer, without = [], []
+def recording_check(frames, plan, positions, bg, size=40):
+    """For each step, the number of video frames showing the test window with a pointer at its position."""
+    counts = [0] * len(plan)
     for png in sorted(glob.glob(os.path.join(frames, '*.png'))):
         raw = subprocess.run(['magick', png, '-depth', '8', 'rgb:-'], check=True, capture_output=True).stdout
         w, h = map(int, subprocess.run(['magick', 'identify', '-format', '%w %h', png], check=True,
@@ -234,13 +236,14 @@ def recording_check(frames, sent, bg, size=40):
         def off(x, y):  # how far from the background, summed over the channels (video compression moves it a little)
             p = raw[(y * w + x) * 3:(y * w + x) * 3 + 3]
             return sum(abs(p[i] - bg[i]) for i in range(3))
-        grid = [(x, y) for x in range(8, w, 97) for y in range(h // 2, h, 89)]
+        grid = [(x, y) for x in range(8, w, 97) for y in range(8, h, 89)]
         if sum(off(x, y) <= 24 for x, y in grid) < 0.98 * len(grid):
             continue
-        n = sum(1 for y in range(max(0, sent[1] - size), min(h, sent[1] + size))
-                for x in range(max(0, sent[0] - size), min(w, sent[0] + size)) if off(x, y) > 150)
-        (with_pointer if n >= 20 else without if n <= 2 else []).append(os.path.basename(png))
-    return with_pointer, without
+        for i, (px, py) in enumerate(positions):
+            n = sum(1 for y in range(max(0, py - size), min(h, py + size))
+                    for x in range(max(0, px - size), min(w, px + size)) if off(x, y) > 150)
+            counts[i] += n >= 8
+    return counts
 
 
 def check(args):
@@ -278,9 +281,18 @@ def check(args):
     results['frame'] = {'pass': len(seen) >= 3 and not dirty, 'captures_with_window': len(seen), 'with_pointer': dirty}
 
     if args.frames:
-        shown, absent = recording_check(args.frames, [int(v) for v in args.sent.split(',')], bg)
-        results['recording'] = {'pass': bool(shown) and bool(absent), 'frames_with_pointer': len(shown),
-                                'frames_without': len(absent)}
+        counts = recording_check(args.frames, plan, positions, bg)
+        # vmlab's recorder takes a repeated shape whose hotspot is (0,0) for a stale one and
+        # hides it, and vmlab-hv repeats the shape with every move (docs/pointer.md). Such a
+        # step is not judged.
+        origin = {m['step'] for m in matched if m['kind'] != 'hidden' and m['hot'] == [0, 0]}
+        judged = [(kind, n) for i, (kind, n) in enumerate(zip(plan, counts)) if i not in origin]
+        results['recording'] = {
+            'pass': any(kind != 'hidden' for kind, _ in judged)
+            and all((n == 0) if kind == 'hidden' else (n > 0) for kind, n in judged),
+            'frames_with_pointer_at_step': counts,
+            'steps_not_judged': sorted(origin),
+        }
 
     out = {'pass': all(r['pass'] for r in results.values()) and not data['errors'], 'watch_errors': data['errors'], **results}
     if args.guest:
@@ -316,7 +328,6 @@ def main():
     c.add_argument('--out', required=True)
     c.add_argument('--guest')
     c.add_argument('--frames')
-    c.add_argument('--sent', default='100,100')
     args = ap.parse_args()
     sys.exit(watch(args) if args.cmd == 'watch' else check(args))
 
