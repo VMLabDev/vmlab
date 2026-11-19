@@ -13,7 +13,7 @@
 //! reads a share must not race the mount; the end of `up` then reports only
 //! the machines no step waited on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -52,6 +52,8 @@ struct Inner {
     /// The retry policy's per-step deadline, for "1m20s of up to 5 min".
     window: Duration,
     shares: BTreeMap<String, ShareState>,
+    /// Modern Windows SMB shares that must be usable before provisioning.
+    required: BTreeSet<String>,
     /// Refusals that name no share of their own: a plan note, or a step
     /// shared by every share (the WinFsp registration).
     notes: Vec<String>,
@@ -73,6 +75,28 @@ enum ShareState {
 impl MountReport {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn require_for_provisioning(&self, share: &str) {
+        self.lock().required.insert(share.to_owned());
+    }
+
+    /// Check after the mount task settles, including when it was interrupted.
+    pub fn check_provisioning_mounts(&self, machine: &str) -> anyhow::Result<()> {
+        let inner = self.lock();
+        for share in &inner.required {
+            let reason = match inner.shares.get(share) {
+                Some(ShareState::Mounted) => continue,
+                Some(ShareState::Unmountable(reason)) => reason.as_str(),
+                Some(ShareState::Mounting { last: Some(reason), .. }) => reason.as_str(),
+                _ => "the mount task ended before the share was mounted",
+            };
+            anyhow::bail!(
+                "\"{machine}\": cannot start provisions or playbooks because SMB share \
+                 \"{share}\" did not mount: {reason}"
+            );
+        }
+        Ok(())
     }
 
     /// `shares` are about to be mounted and `unsupported` never will be.
