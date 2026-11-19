@@ -128,10 +128,15 @@ mod tests {
     const COHERENT: u32 = 0x4;
     const CACHED: u32 = 0x8;
 
+    /// A memory type: its heap and its property flags.
+    type Type = (u32, u32);
+    /// A hidden type's index and its counterpart's.
+    type Hidden = (usize, usize);
+
     /// Run the layer's memory rule on `(heap, flags)` types, through the
     /// layer's own source built as a program by `build.rs`: the types after
     /// the rule, and for each hidden type the index of its counterpart.
-    fn rule(types: &[(u32, u32)]) -> (Vec<(u32, u32)>, Vec<(usize, usize)>) {
+    fn rule(types: &[Type]) -> (Vec<Type>, Vec<Hidden>) {
         let out = std::process::Command::new(concat!(env!("OUT_DIR"), "/vk-rule-check"))
             .args(types.iter().map(|(heap, flags)| format!("{heap}:{flags:x}")))
             .output()
