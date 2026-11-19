@@ -641,6 +641,43 @@ fn sample_rips(client: &mut Client, vcpus: u8) -> Vec<u64> {
     rips
 }
 
+/// Where the vCPUs spend their time: `samples` looks 200 ms apart at every
+/// vCPU's RIP and interrupt flag, then the code around the commonest RIP.
+/// `VMLAB_HV_MACOS_STALL_PROBE=<samples>` runs it at the end of a census run.
+fn probe_idle(client: &mut Client, samples: usize) {
+    use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+    let mut seen = std::collections::BTreeMap::<(u64, bool), usize>::new();
+    for _ in 0..samples {
+        std::thread::sleep(Duration::from_millis(200));
+        debug(client, DebugRequest::Pause);
+        for vcpu in 0..4 {
+            if let DebugResponse::Registers { registers, .. } =
+                debug(client, DebugRequest::ReadRegisters { vcpu })
+            {
+                let key = (registers.general[16], registers.general[17] & 0x200 != 0);
+                *seen.entry(key).or_default() += 1;
+            }
+        }
+        debug(client, DebugRequest::Continue);
+    }
+    let mut ranked: Vec<_> = seen.into_iter().collect();
+    ranked.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    ranked.truncate(6);
+    eprintln!("census probe: (rip, IF) by samples {ranked:x?}");
+    debug(client, DebugRequest::Pause);
+    for ((rip, _), _) in ranked.iter().take(2) {
+        let code = client.call(Control::Debug {
+            request: DebugRequest::ReadMemory {
+                space: AddressSpace::Virtual { vcpu: 0 },
+                address: rip - 32,
+                length: 64,
+            },
+        });
+        eprintln!("census probe: code at {rip:x}-32: {code:x?}");
+    }
+    debug(client, DebugRequest::Continue);
+}
+
 /// vmlab#200 census: how often the macOS boot stalls before XNU.
 ///
 /// The stall #200 records first (the agent never answering with both vCPUs
@@ -684,6 +721,9 @@ fn macos_boot_stall_census() {
         .ok()
         .map(|s| Duration::from_secs(s.parse().unwrap()));
     let mut agent_times = Vec::new();
+    let probe = std::env::var("VMLAB_HV_MACOS_STALL_PROBE")
+        .ok()
+        .map(|s| s.parse::<usize>().unwrap());
     let interval = Duration::from_secs(3);
     let fake_key = "FAKE".repeat(16);
     let mut stalls = Vec::new();
@@ -768,6 +808,9 @@ fn macos_boot_stall_census() {
                 eprintln!("census run {run} diagnostics tail: {tail}");
                 stalls.push(run);
             }
+        }
+        if let Some(samples) = probe.filter(|_| vm.process.try_wait().unwrap().is_none()) {
+            probe_idle(&mut vm.client, samples);
         }
         if vm.process.try_wait().unwrap().is_none() {
             let _ = vm.client.call(Control::Quit);
