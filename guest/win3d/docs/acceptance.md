@@ -616,6 +616,7 @@ next to each probe's JSON.
 | Property | Check | What runs | Pass when |
 | --- | --- | --- | --- |
 | P1, a hardware pointer | `pointer` | `pointer_probe.exe` fills the display with one colour. The host moves the pointer to two places with `vmlab vm mouse-move` and takes a console capture at each (`tests/e2e/adapter/pointerframe.py`). | The capture is the flat colour where the pointer is, while Windows reports a visible pointer at that place. |
+| P1 | `pointer-shapes` | `tests/e2e/pointer.sh`, the check of the hardware pointer ([pointer.md](pointer.md#check)): arrow, I-beam, resize and hidden, watched on vmlab-hv's frame protocol, on RFB, in captures and in a recording. Its evidence is in `pointer/`. | Its five checks pass. |
 | P2, a vblank of the display | `vblank-interval` | `pace_probe.exe` times 10 s of `IDXGIOutput::WaitForVBlank`. | The mean interval is within 2 percent of the mode's refresh period, and the 1st and 99th percentile within half a period of it. |
 | P2 | `present-rate` | The same probe times 10 s of `Present(1)` on a flip-model swap chain. | The frame rate is within 5 percent of the refresh rate. |
 | P2 | `flip-timestamps` | DXGI frame statistics over those presents. | `SyncRefreshCount` over `SyncQPCTime` is within 2 percent of the refresh rate. |

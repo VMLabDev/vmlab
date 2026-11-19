@@ -11,6 +11,7 @@
 # in ADAPTER_CHECKS):
 #
 #   pointer       P1       the pointer is not part of the frame
+#   pointer-shapes P1      the pointer's shapes reach the host (tests/e2e/pointer.sh)
 #   pace          P2       vblank interval, present rate, flip timestamps, scan line
 #   tear-flip     P3-P5    the tearing probe, flip-model presents
 #   tear-blt      P3-P5    the tearing probe, presents of the Blt kind
@@ -34,7 +35,7 @@
 # that did not run is not a failure.
 # check-shell-paths: no-errexit each check records its own result and the suite goes on to the next (VML-88).
 set -uo pipefail
-[ $# -ge 3 ] || { sed -n '2,34p' "$0" >&2; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,35p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 A=$HERE/adapter
@@ -44,7 +45,7 @@ mkdir -p "$3/adapter"
 EV=$(cd "$3/adapter" && pwd)   # absolute: the vmlab commands run from the lab directory
 [ -n "$EV" ] && [ -d "$EV" ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 shift 3
-ALL="pointer pace tear-flip tear-blt duplication d2d svb-chrome venc-chrome svb-edge venc-edge wine"
+ALL="pointer pointer-shapes pace tear-flip tear-blt duplication d2d svb-chrome venc-chrome svb-edge venc-edge wine"
 CHECKS=${*:-${ADAPTER_CHECKS:-$ALL}}
 CACHE=$REPO/.scratch/e2e/cache
 STAGE=$REPO/.scratch/e2e/adapter/$(basename "$(dirname "$EV")")   # per evidence dir, so parallel runs do not share files
@@ -132,6 +133,23 @@ check_pointer() {
         done
     fi
     wait "$pid" && ran pointer || skip pointer "the pointer probe wrote no result"
+}
+
+check_pointer_shapes() {
+    # The check of the hardware pointer (docs/pointer.md) is a script of its own; it
+    # writes <evidence-dir>/pointer/ and its verdict there.
+    note "pointer-shapes"
+    local top rc
+    top=$(dirname "$EV")
+    "$HERE/pointer.sh" "$LABDIR" "$VM" "$top" >"$STAGE/pointer-shapes.out" 2>&1
+    rc=$?
+    grep -E '^(PASS|FAIL) ' "$STAGE/pointer-shapes.out" | while read -r l; do note "  $l"; done
+    if [ -f "$top/pointer/pointer.json" ]; then
+        cp "$top/pointer/pointer.json" "$EV/pointer-shapes.json"
+        ran pointer-shapes
+    else
+        skip pointer-shapes "tests/e2e/pointer.sh ended with exit $rc and no verdict: $(tail -1 "$STAGE/pointer-shapes.out" | cut -c1-160)"
+    fi
 }
 
 check_pace() {
@@ -309,6 +327,7 @@ else
         if ! guest_up; then skip "$c" "the guest stopped answering before this check"; continue; fi
         case $c in
             pointer) check_pointer ;;
+            pointer-shapes) check_pointer_shapes ;;
             pace) check_pace ;;
             tear-flip) check_tear flip ;;
             tear-blt) check_tear blt ;;
