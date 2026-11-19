@@ -3117,8 +3117,17 @@ mod tests {
         place_rx_frames(&f.dev.shared, 12, false, false);
         assert_eq!(f.vqs[2].used_idx(&f.mem), 1);
         assert_eq!(lock(&f.dev.shared).rx_pending.len(), 1);
+        f.dev.quiesce();
         let state = f.dev.save_state().unwrap();
-        assert_eq!(f.control_pairs(1, 4), 0);
+        {
+            // Change the device state without advancing the guest's rings.
+            // A real VM restore rewinds guest memory along with device state.
+            let mut state = lock(&f.dev.shared);
+            let vnet = state.vnet.as_mut().unwrap();
+            vnet.active_pairs = 1;
+            vnet.steering.clear();
+            state.rx_pending.clear();
+        }
         f.dev.restore_state(&state).unwrap();
         let state = lock(&f.dev.shared);
         assert_eq!(state.vnet.as_ref().unwrap().active_pairs, 2);
