@@ -84,6 +84,8 @@ type HostGpu {
   @schemaless qemu_env: QemuEnv?
   @doc("Hold the GPU out of runtime suspend from the first virgl/vulkan VM on it until the supervisor stops: `auto` (default; an NVIDIA GPU that can runtime-suspend), `on`, or `off`")
   keepawake: utf8?
+  @doc("Hide an uncached host-visible memory type from a `vulkan` guest when the same heap has a cached one (default false); for a host whose CPU and GPU do not see that memory alike")
+  hide_uncached_memory: bool?
 }
 
 // `qemu_env`'s shape: a record of strings, keyed by variable name. WCL has
