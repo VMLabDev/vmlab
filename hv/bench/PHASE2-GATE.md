@@ -161,11 +161,13 @@ registers the one event at both queues' notify addresses from DRIVER_OK
 until reset. The tests of card #98 cover the transport and the KVM
 registration.
 
-At `42425590`, on the seam that is now removed, the three S1 NIC tests on
-booted guests (`nic_dhcp_exchange_with_test_switch`,
+The three S1 NIC tests on booted guests
+(`nic_dhcp_exchange_with_test_switch`,
 `nic_traffic_survives_snapshot_load`,
-`nic_vnet_multiqueue_traffic_survives_snapshot_load`) passed on helios
-outside the merge bar. They were not run again after the merge.
+`nic_vnet_multiqueue_traffic_survives_snapshot_load`) need KVM, so they
+ran on helios outside the merge bar. They passed at `42425590` on the seam
+that is now removed, and again at `eb71a71b` on the merged one. They
+assert traffic, not that the kick takes the ioeventfd.
 
 ### Follow-up drafts
 
