@@ -315,7 +315,7 @@ committed.
 | | | [`0003`](../patches/kmd/0003-kmd-create-context-for-gdi-devices.patch) | viogpu3d: create a legacy context before opening GDI allocations | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0004`](../patches/kmd/0004-kmd-recover-from-timeouts.patch) | viogpu3d: recover transport and device state after a timeout | [`docs/tdr-recovery.md`](tdr-recovery.md) |
 | | | [`0005`](../patches/kmd/0005-kmd-hardware-pointer.patch) | viogpu3d: a hardware pointer on the cursor queue | [`docs/pointer.md`](pointer.md) |
-| mesa | 43 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
+| mesa | 44 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0002`](../patches/mesa/0002-util-xmlconfig-case-insensitive-exe-match.patch) | util/xmlconfig: match drirc executable names case-insensitively on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0003`](../patches/mesa/0003-util-u_queue-windows-loader-lock-join.patch) | util/u_queue: do not join worker threads under the loader lock on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0004`](../patches/mesa/0004-wgl-unbind-through-stw-on-delete.patch) | wgl: unbind the current context through stw_make_current on delete | [`build/mesa/README.md`](../build/mesa/README.md) |
@@ -358,6 +358,7 @@ committed.
 | | | [`0091`](../patches/mesa/0091-d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch) | d3d9: stop copying every vertex-buffer lock for the ordered worker | [`docs/f6va.md`](f6va.md) |
 | | | [`0092`](../patches/mesa/0092-yttrium-bound-in-flight-uploads.patch) | yttrium: bound in-flight upload buffers in 32-bit processes | [`docs/f6va.md`](f6va.md) |
 | | | [`0093`](../patches/mesa/0093-yttrium-guard-revoked-batch-feedback.patch) | yttrium: report device loss for revoked feedback mappings | [`docs/tdr-recovery.md`](tdr-recovery.md) |
+| | | [`0094`](../patches/mesa/0094-yttrium-forced-sample-coverage-one-pass-per-sample.patch) | yttrium: draw forced-sample coverage as one pass per sample | [`docs/d2d-coverage.md`](d2d-coverage.md) |
 | vkd3d-proton | 6 | [`0001`](../patches/vkd3d-proton/0001-vkd3d-Reject-root-signatures-with-overlapping-regist.patch) | vkd3d: Reject root signatures with overlapping register bindings. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0002`](../patches/vkd3d-proton/0002-vkd3d-Report-FORMAT_INFO-plane-counts-without-a-Vulk.patch) | vkd3d: Report FORMAT_INFO plane counts without a Vulkan format mapping. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0003`](../patches/vkd3d-proton/0003-vkd3d-Allow-depth-stencil-textures-in-CPU-visible-he.patch) | vkd3d: Allow depth-stencil textures in CPU-visible heaps. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
