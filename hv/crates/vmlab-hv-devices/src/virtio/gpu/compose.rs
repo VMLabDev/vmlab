@@ -51,7 +51,12 @@ impl Compose {
             update(&mut pixels, resource, view, flushes, &mut changed);
         }
         let damage = if previous.is_none() {
-            vec![Damage { x: 0, y: 0, width: mode.width, height: mode.height }]
+            vec![Damage {
+                x: 0,
+                y: 0,
+                width: mode.width,
+                height: mode.height,
+            }]
         } else {
             tile_damage(mode, changed)
         };
@@ -64,7 +69,11 @@ impl Compose {
             }
             previous => {
                 self.spare = previous.map(|frame| frame.pixels);
-                ShmFrame { mode, pixels: Arc::new(pixels), damage }
+                ShmFrame {
+                    mode,
+                    pixels: Arc::new(pixels),
+                    damage,
+                }
             }
         };
         self.current = Some(frame.clone());
@@ -81,8 +90,13 @@ fn update(
 ) {
     // Within a band the same clipped flushes cover every row. Merge their
     // spans once so overlapping flushes never compare or write a pixel twice.
-    let rects: Vec<_> = flushes.iter().copied().filter(|r| view.overlaps(*r)).collect();
-    let mut edges: Vec<_> = rects.iter()
+    let rects: Vec<_> = flushes
+        .iter()
+        .copied()
+        .filter(|r| view.overlaps(*r))
+        .collect();
+    let mut edges: Vec<_> = rects
+        .iter()
         .flat_map(|r| [r.y.max(view.y), (r.y + r.h).min(view.y + view.h)])
         .collect();
     edges.sort_unstable();
@@ -91,8 +105,17 @@ fn update(
     for band in edges.windows(2) {
         let [top, bottom] = [band[0], band[1]];
         spans.clear();
-        spans.extend(rects.iter().filter(|r| (r.y..r.y + r.h).contains(&top))
-            .map(|r| (r.x.max(view.x) - view.x, (r.x + r.w).min(view.x + view.w) - view.x)));
+        spans.extend(
+            rects
+                .iter()
+                .filter(|r| (r.y..r.y + r.h).contains(&top))
+                .map(|r| {
+                    (
+                        r.x.max(view.x) - view.x,
+                        (r.x + r.w).min(view.x + view.w) - view.x,
+                    )
+                }),
+        );
         spans.sort_unstable();
         let mut covered = 0;
         for &(start, end) in &spans {
@@ -132,7 +155,12 @@ fn tile_damage(mode: Mode, changed: BTreeSet<(u32, u32)>) -> Vec<Damage> {
         {
             last.width += width;
         } else {
-            damage.push(Damage { x, y, width, height: TILE.min(mode.height - y) });
+            damage.push(Damage {
+                x,
+                y,
+                width,
+                height: TILE.min(mode.height - y),
+            });
         }
     }
     damage
