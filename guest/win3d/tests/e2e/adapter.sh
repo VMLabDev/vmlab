@@ -231,11 +231,20 @@ vm_restart() { # start the VM again after a test ended it, and wait for the user
     [ "$RESTARTS" -lt 3 ] || { note "  the VM is down and was restarted 3 times already; not again"; return 1; }
     RESTARTS=$((RESTARTS + 1))
     note "  the VM is down; starting it again (restart $RESTARTS)"
-    in_lab vmlab up >"$STAGE/restart-$RESTARTS.out" 2>&1 || { tail -3 "$STAGE/restart-$RESTARTS.out"; return 1; }
     local i r
+    # Right after the hypervisor ended, the lab daemon can still count the VM
+    # as running and refuse the start; ask until it takes it.
+    for i in $(seq 1 12); do
+        in_lab vmlab vm start "$VM" >"$STAGE/restart-$RESTARTS.out" 2>&1 && break
+        sleep 5
+    done
     for i in $(seq 1 60); do
         r=$(gps '$e = Get-Process explorer -ErrorAction SilentlyContinue | Where-Object SessionId -gt 0; $up = ((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalSeconds; "{0} {1}" -f [bool]$e, [int]$up' 60 2>/dev/null | tail -1)
         case $r in "True "*) [ "${r#True }" -ge 90 ] && return 0 ;; esac
+        # Still stopped after a minute: the start did not take.
+        if [ "$i" = 6 ] && in_lab vmlab status 2>/dev/null | grep -Eq "^ *$VM +vm +stopped"; then
+            in_lab vmlab vm start "$VM" >>"$STAGE/restart-$RESTARTS.out" 2>&1
+        fi
         sleep 10
     done
     note "  the desktop did not come back"
