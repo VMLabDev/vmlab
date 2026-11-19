@@ -133,6 +133,34 @@ These are drafts. No card exists for them.
   (M3), which is most of its spread. Finding what the guest does in the
   slow boots would make the bar resolve smaller effects.
 
+### G2 boot milestones (card #121)
+
+Card #97's logs localize much of the spread to the first boot, before
+the host observes the specialize marker. The table uses whole-second
+wall-clock log timestamps from CPU release, while the total is the
+runner's monotonic measurement from launch.
+
+| Card #97 run | Total (s) | Release to marker (s) | Marker to OOBE done (s) | OOBE done to ready (s) |
+|---|---:|---:|---:|---:|
+| QEMU gate, fastest | 94.92 | 59 | 27 | 9 |
+| QEMU gate, slowest | 102.82 | 63 | 29 | 11 |
+| vmlab-hv gate, fastest | 89.38 | 56 | 25 | 8 |
+| vmlab-hv gate, slowest | 102.95 | 64 | 29 | 10 |
+| vmlab-hv A/B head, fastest | 91.22 | 56 | 24 | 11 |
+| vmlab-hv A/B head, slowest | 102.70 | 67 | 26 | 10 |
+
+The slow vmlab-hv A/B boot loses about 11 seconds by the marker. The
+slow QEMU gate boot loses about four seconds by that point and the rest
+after it. These samples do not establish a single binary mode selector.
+The guest has no NIC, and the prior disk measurements show variable sync
+costs. The logs cannot attribute the pre-marker delay to disk caching,
+CPU placement, a guest timer, or offline servicing.
+
+G2 now records monotonic readiness milestones for each repeat alongside
+its total, host sync probe, and load. The benchmark retains the existing
+guest configuration and readiness sequence so future runs can compare
+the spread by phase without changing the parity metric.
+
 
 ## Round 7 follow-up: G7 UDP transmit (card #74, 2026-11-19)
 

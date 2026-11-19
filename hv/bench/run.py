@@ -393,15 +393,19 @@ class WindowsReady:
     """The windows first-boot sequence, ported from the template's
     provision script (see wait_x86_ready)."""
 
-    def __init__(self, backend, args, run_dir, t0):
+    def __init__(self, backend, args, run_dir, t0, milestones=None):
         self.backend = backend
         self.args = args
         self.run_dir = run_dir
         self.t0 = t0
+        self.milestones = {} if milestones is None else milestones
         self.deadline = t0 + X86_BOOT_DEADLINE["windows-10"] * args.timeout_scale
         self.resets = 0
         self.reset_monitor = None
         self.reset_session = None
+
+    def mark(self, name):
+        self.milestones[name] = round(time.monotonic() - self.t0, 2)
 
     def ensure_vm(self):
         """vmlab-hv exits 0 on every guest reset; vmlab restarts it, and so
@@ -458,6 +462,8 @@ class WindowsReady:
                             60,
                         )
                         marker_seen = chan["code"] == 0
+                        if marker_seen:
+                            self.mark("marker_seen")
                     if marker_seen:
                         log("windows first boot finished; clearing marker")
                         win_exec(agent, ["cmd.exe", "/C", f"del /f /q {WINDOWS_MARKER}"], 60)
@@ -482,6 +488,7 @@ class WindowsReady:
                 chan = win_ps(agent, WINDOWS_OOBE_PS)
                 state = chan["data"].decode(errors="replace").strip()
                 if chan["code"] == 0 and state == "done":
+                    self.mark("oobe_done")
                     log("windows OOBE finished")
                     return agent
             except (TimeoutError, ConnectionError, lib.BenchError, OSError):
@@ -491,6 +498,7 @@ class WindowsReady:
                     pass
                 agent = None
         log("windows OOBE still running after ~10 minutes; continuing")
+        self.mark("oobe_timeout")
         return agent
 
     def settle_appx(self, agent):
@@ -536,6 +544,7 @@ class WindowsReady:
             if agent is None:
                 time.sleep(WINDOWS_PROBE_INTERVAL)
                 continue
+            self.mark(f"reboot_request_{round_index + 1}")
             self.request_reboot(agent, round_index)
             end = time.monotonic() + 60
             for _ in windows_probe_ticks(end):
@@ -543,11 +552,13 @@ class WindowsReady:
                 if agent is not None:
                     now_id = windows_boot_id(agent)
                     if before is None or (now_id is not None and now_id != before):
+                        self.mark("reboot_agent_seen")
                         return self.wait_post_reboot_agent(agent)
                     agent.close()
             log(f"windows still on the same boot ~60 s after request "
                 f"{round_index + 1}")
         log("windows in-guest reboot never took; forcing a host restart")
+        self.mark("host_restart")
         if self.args.backend == "qemu":
             self.backend.session.kill()
             session = self.backend.launch()
@@ -574,17 +585,20 @@ class WindowsReady:
     def run(self):
         try:
             agent, hello = self.wait_marker()
+            self.mark("marker_handling_ended")
             agent = self.wait_oobe(agent) or agent
             self.settle_appx(agent)
+            self.mark("appx_settle_ended")
             agent, hello = self.reboot_and_return(agent)
             agent.reset_monitor = None
-            return agent, hello, round(time.monotonic() - self.t0, 2)
+            self.mark("agent_ready")
+            return agent, hello, self.milestones["agent_ready"]
         finally:
             if self.reset_monitor is not None:
                 self.reset_monitor.close()
 
 
-def wait_x86_ready(backend, args, guest, run_dir, t0):
+def wait_x86_ready(backend, args, guest, run_dir, t0, milestones=None):
     """Boot to agent ready, vmlab's readiness semantics.
 
     Linux: the agent answers its Hello and runs an exec. Windows: the
@@ -596,7 +610,7 @@ def wait_x86_ready(backend, args, guest, run_dir, t0):
     the first spawn and never resets.
     """
     if guest.startswith("windows-"):
-        return WindowsReady(backend, args, run_dir, t0).run()
+        return WindowsReady(backend, args, run_dir, t0, milestones).run()
     deadline = t0 + X86_BOOT_DEADLINE[guest] * args.timeout_scale
     while time.monotonic() < deadline:
         if backend.session.exited():
@@ -724,7 +738,9 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
         result["t_release"] = round(session.elapsed(), 2)
         log(f"released CPUs after {result['t_release']}s; waiting for agent")
 
-        agent, hello, boot_secs = wait_x86_ready(backend, args, guest, run_dir, session.t0)
+        milestones = result.setdefault("windows_boot_milestones_s", {}) if windows else None
+        agent, hello, boot_secs = wait_x86_ready(
+            backend, args, guest, run_dir, session.t0, milestones)
         result["boot_to_agent_ready"] = boot_secs
         result["agent_hello"] = {k: hello.get(k) for k in ("agent_version", "os")}
         log(f"agent ready after {boot_secs}s")
@@ -912,6 +928,7 @@ def x86_run_config(args, guest, smp, pin, version, commit, dirty, host):
     if guest.startswith("windows-"):
         env["readiness_probe_interval_s"] = WINDOWS_PROBE_INTERVAL
         env["repeat_host_sync_latency_ms"] = []
+        env["repeat_windows_boot_milestones_s"] = []
     else:
         env["udp_tx_guest_cpu"] = smp - 1
         env["net_peer_cpu"] = netpeer.host_peer_cpu()
@@ -920,6 +937,9 @@ def x86_run_config(args, guest, smp, pin, version, commit, dirty, host):
         result, backend, agent = x86_one_repeat(args, guest, smp, pin, version, i)
         if "host_sync_latency_ms" in result:
             env["repeat_host_sync_latency_ms"].append(result["host_sync_latency_ms"])
+            milestones = result["windows_boot_milestones_s"]
+            env["repeat_windows_boot_milestones_s"].append(milestones)
+            log(f"repeat {i} Windows boot milestones since launch (s): {milestones}")
         env["backend_version"] = backend.backend_version()
         env["tools"] = result.get("tools", {})
         env["repeat_loadavg"].append({

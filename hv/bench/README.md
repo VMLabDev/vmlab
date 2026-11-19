@@ -268,6 +268,15 @@ gating on it, because the bar gates flipping a default, not every commit.
 
 ## Windows readiness timing on helios (card #96)
 
+Windows boot results include `windows_boot_milestones_s` in each run's
+`result.json` and `env.repeat_windows_boot_milestones_s` in benchmark history,
+in the same order as the boot samples. The milestones are elapsed monotonic
+seconds from the initial launch. Subtract adjacent milestones to compare the
+time to observe the specialize marker, wait for OOBE, settle AppX, and reboot.
+An OOBE timeout, additional reboot requests, and a host restart have their own
+milestones. The timestamps record host observations and include probe latency.
+The total boot sample still ends at the final agent handshake.
+
 A short diagnostic on helios on 2026-11-18 UTC used harness commit
 `9e205fa9`, QEMU 11.1.3, Windows 10 template `19045.2006.10` (standard
 variant), four vCPUs pinned to CPUs 16–23, and the performance governor.
