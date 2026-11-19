@@ -391,6 +391,17 @@ releases the withheld removals.
 DOC
 
   p <<'DOC'
+**A file the guest lost is not a file the guest deleted.** When a machine stops
+part way through a pass, or is stopped hard, the guest can come back without a
+file it had already taken. The first pass after the machine or its watch comes
+back therefore never deletes a host file only because the guest lacks it. A
+path whose copy had not been seen in the guest since an earlier restart is
+copied again. Any other is held as a halt on that path, for one path as much
+as for many: `--host` copies it back into the guest, and `--guest` deletes it
+on the host if the deletion was intended.
+DOC
+
+  p <<'DOC'
 **`.git` syncs bidirectionally**, because the guest can stay offline while the
 host has the network, so a host-side `git fetch` is a first-class operation,
 and because a coding agent inside the dev machine commits and branches with no

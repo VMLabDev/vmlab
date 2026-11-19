@@ -44,7 +44,10 @@ can get; resolution is host-side necessarily, through `vmlab dev sync
 status/flush/diff/resolve`, with `--host`/`--guest`/`--all` and a free third
 route — make the two sides identical by hand — that needs no verb. With it the
 **guest→host bulk-delete guard** (a proportion with a floor; host→guest deletes
-stay unguarded), the **volume warning** that names a subtree and never halts,
+stay unguarded), the **unwitnessed-absence rule** (#190: after a break in the
+watch a path the guest lacks is never deleted on the host — an unconfirmed
+agreement is copied again, a confirmed one halts on that path), the
+**volume warning** that names a subtree and never halts,
 and the `.git` **lock deferral** that clears itself. So is **snapshot
 bracketing** (#97): vmlab performs a
 restore, so it brackets it — capture **pre-flight flushes and refuses with no
