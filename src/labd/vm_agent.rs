@@ -377,6 +377,10 @@ impl AgentHandle {
             }
         }
 
+        // Subscribe before sending: the reader can process the reply on
+        // another worker before the write returns, and watch::send drops it
+        // if no receiver is subscribed.
+        let mut rx = handle.inner.hello.subscribe();
         handle
             .send_msg(&HostMsg::Hello {
                 proto_version: PROTO_VERSION,
@@ -385,7 +389,6 @@ impl AgentHandle {
             .await
             .context("sending agent handshake")?;
 
-        let mut rx = handle.inner.hello.subscribe();
         loop {
             if rx.borrow().is_some() {
                 return Ok(handle);
