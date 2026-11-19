@@ -3910,7 +3910,10 @@ mod tests {
         // The connection is up and the worker sleeps in poll.
         wait_for("link up", || lock(&f.dev.shared).link_up);
 
-        let events = f.dev.queue_events().expect("a switch-stream device has events");
+        let events = f
+            .dev
+            .queue_events()
+            .expect("a switch-stream device has events");
         assert_eq!(events.len(), f.dev.queue_sizes.len());
         assert!(events.iter().all(|event| Arc::ptr_eq(event, &events[0])));
         let event = events[1].clone();
