@@ -266,7 +266,7 @@ impl Gpu {
         s.resources = resources;
         s.cursor = cursor;
         s.dirty = true;
-        s.cached_frame = None;
+        s.compose = super::compose::Compose::default();
         s.flushes.clear();
         s.flush_pending = flush_pending;
         s.last_publish = None;
