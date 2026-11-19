@@ -34,7 +34,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 VMLAB=${VMLAB:-vmlab}
 SECONDS_RUN=60; FRAMES=0; LOAD=0; CPUS=; TRACE=0; OUT=; FULL=
-usage() { sed -n '2,32p' "$0"; }
+usage() { sed -n '2,31p' "$0"; }
 while [ $# -gt 0 ]; do
     case $1 in
         --seconds) SECONDS_RUN=${2:-}; shift 2 ;;
