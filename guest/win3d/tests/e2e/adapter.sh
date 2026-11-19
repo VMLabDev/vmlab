@@ -141,6 +141,7 @@ check_pointer_shapes() {
     note "pointer-shapes"
     local top rc
     top=$(dirname "$EV")
+    [ -n "$top" ] && [ -d "$top" ] || { skip pointer-shapes "no evidence directory"; return; }
     "$HERE/pointer.sh" "$LABDIR" "$VM" "$top" >"$STAGE/pointer-shapes.out" 2>&1
     rc=$?
     grep -E '^(PASS|FAIL) ' "$STAGE/pointer-shapes.out" | while read -r l; do note "  $l"; done
