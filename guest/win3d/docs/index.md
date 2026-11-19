@@ -64,6 +64,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | --- | --- |
 | [acceptance.md](acceptance.md) | See each Done item checked on fresh `windows-11` and `windows-10` labs, the stretch applications, and the index of every evidence directory |
 | [tdr-recovery.md](tdr-recovery.md) | Force a guest timeout and require reset/restart telemetry plus hardware pixel readback |
+| [chromium.md](chromium.md) | See why Chrome and Edge lost WebGL with the Direct3D 12 bridge installed, how `patches/mesa/0095` and the installer's native copy keep their GPU process alive, and the check |
 | [pointer.md](pointer.md) | See why the pointer lagged, what the hardware pointer of `patches/kmd/0005` sends to the host, its limits, and the check |
 | [dxdiag.md](dxdiag.md) | See why dxdiag reported DirectDraw "Not Available" and how `patches/mesa/0012` to `0014` fixed it |
 | [d3d11-apps.md](d3d11-apps.md) | See why two DirectX SDK D3D11 samples did not show, the UMD fixes `patches/mesa/0015` to `0017`, and the DXUT window bug |
