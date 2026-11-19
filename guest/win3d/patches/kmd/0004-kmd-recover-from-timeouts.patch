@@ -8,7 +8,7 @@ same context invalidation to D3/D0. Retain fences and a frozen timeout trace.
 Test contract and host quiescence prerequisite: docs/tdr-recovery.md.
 ---
 diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
-index ead5cfd..090cfa9 100644
+index 1ac5b57..a3608ab 100644
 --- a/viogpu/common/viogpu_queue.cpp
 +++ b/viogpu/common/viogpu_queue.cpp
 @@ -80,6 +80,9 @@ typedef struct _CTRL_QUEUE_WAIT_CTX
@@ -406,7 +406,7 @@ index ead5cfd..090cfa9 100644
  
      // The buffer is now staged and owned by the queue. Flush() drains as much as
      // the control virtqueue currently accepts; whatever it cannot submit right
-@@ -2231,6 +2454,12 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
+@@ -2249,6 +2472,12 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
  
      ASSERT(outcnt);
      Lock(&SavedIrql);
@@ -420,10 +420,10 @@ index ead5cfd..090cfa9 100644
      Kick();
      Unlock(SavedIrql);
 diff --git a/viogpu/common/viogpu_queue.h b/viogpu/common/viogpu_queue.h
-index 8c9f318..b149652 100644
+index 9b3d5ef..ac64bb0 100644
 --- a/viogpu/common/viogpu_queue.h
 +++ b/viogpu/common/viogpu_queue.h
-@@ -183,6 +183,10 @@ class VioGpuQueue
+@@ -184,6 +184,10 @@ class VioGpuQueue
      ~VioGpuQueue();
      BOOLEAN Init(_In_ VirtIODevice *pVIODevice, _In_ struct virtqueue *pVirtQueue, _In_ UINT index);
      void Close(void);
@@ -434,7 +434,7 @@ index 8c9f318..b149652 100644
      int AddBuf(_In_ struct VirtIOBufferDescriptor sg[],
                 _In_ UINT out_num,
                 _In_ UINT in_num,
-@@ -265,6 +269,7 @@ class VioGpuQueue
+@@ -266,6 +270,7 @@ class VioGpuQueue
  
    protected:
      VioGpuBuf *m_pBuf;
@@ -442,7 +442,7 @@ index 8c9f318..b149652 100644
  };
  
  class CtrlQueue : public VioGpuQueue
-@@ -278,8 +283,11 @@ class CtrlQueue : public VioGpuQueue
+@@ -279,8 +284,11 @@ class CtrlQueue : public VioGpuQueue
          m_CtrlQueueFlushInProgress = 0;
          m_CtrlQueueFlushRequested = 0;
          m_CtrlQueueFullRequeues = 0;
@@ -454,7 +454,7 @@ index 8c9f318..b149652 100644
      PVOID AllocCmd(PGPU_VBUFFER *buf, int sz);
      PVOID AllocCmdResp(PGPU_VBUFFER *buf, int cmd_sz, PVOID resp_buf, int resp_sz);
  
-@@ -294,6 +302,7 @@ class CtrlQueue : public VioGpuQueue
+@@ -295,6 +303,7 @@ class CtrlQueue : public VioGpuQueue
  
      void CreateResource(UINT res_id, UINT format, UINT width, UINT height);
      void CreateResource3D(UINT res_id, VIOGPU_RESOURCE_OPTIONS *options);
@@ -462,7 +462,7 @@ index 8c9f318..b149652 100644
  
      NTSTATUS CreateResourceBlob(UINT res_id,
                                  ULONGLONG size,
-@@ -310,6 +319,7 @@ class CtrlQueue : public VioGpuQueue
+@@ -311,6 +320,7 @@ class CtrlQueue : public VioGpuQueue
      void DestroyResource(UINT id);
      void CtxResource(bool attach, UINT ctx_id, UINT res_id);
      NTSTATUS CtxResourceWait(UINT ctx_id, UINT res_id);
@@ -470,7 +470,7 @@ index 8c9f318..b149652 100644
  
      UINT SubmitCommand(void *cmdbuf,
                         ULONG size,
-@@ -345,6 +355,7 @@ class CtrlQueue : public VioGpuQueue
+@@ -346,6 +356,7 @@ class CtrlQueue : public VioGpuQueue
      void TransferToHost3D(UINT res_id, GPU_BOX *box);
  
      void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
@@ -478,7 +478,7 @@ index 8c9f318..b149652 100644
      void DetachBacking(UINT id);
  
      BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);
-@@ -355,6 +366,7 @@ class CtrlQueue : public VioGpuQueue
+@@ -356,6 +367,7 @@ class CtrlQueue : public VioGpuQueue
      BOOLEAN AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_size, ULONG capset_version);
  
      void CreateCtx(UINT ctx_id, UINT context_init);
@@ -486,7 +486,7 @@ index 8c9f318..b149652 100644
      void DestroyCtx(UINT ctx_id);
  
    private:
-@@ -365,16 +377,18 @@ class CtrlQueue : public VioGpuQueue
+@@ -366,16 +378,18 @@ class CtrlQueue : public VioGpuQueue
                               BOOLEAN kickOnSuccess);
      UINT SubmitBuffer(PGPU_VBUFFER buf);
      UINT QueueBuffer(PGPU_VBUFFER buf);
@@ -510,10 +510,10 @@ index 8c9f318..b149652 100644
      // queue is applying backpressure (packets staged, drained by a later Flush);
      // it is NOT an error. Watch this to confirm how often the vq runs dry.
 diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
-index bf6beda..bc44f55 100644
+index 3d7005b..6832dc2 100644
 --- a/viogpu/viogpu3d/driver.cpp
 +++ b/viogpu/viogpu3d/driver.cpp
-@@ -1441,10 +1441,7 @@ NTSTATUS
+@@ -1448,10 +1448,7 @@ NTSTATUS
  APIENTRY
  VioGpu3DDdiRestartFromTimeout(_In_ CONST HANDLE hAdapter)
  {
@@ -525,7 +525,7 @@ index bf6beda..bc44f55 100644
  };
  
  NTSTATUS
-@@ -1502,23 +1499,14 @@ NTSTATUS
+@@ -1509,23 +1506,14 @@ NTSTATUS
  APIENTRY
  VioGpu3DDdiCollectDbgInfo(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_COLLECTDBGINFO *pCollectDbgInfo)
  {
@@ -552,7 +552,7 @@ index bf6beda..bc44f55 100644
  
  #if defined(DBG)
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 20fe40c..317e3a0 100644
+index c68334c..7806089 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
 @@ -169,6 +169,17 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
@@ -573,7 +573,7 @@ index 20fe40c..317e3a0 100644
  
      RtlZeroMemory(&m_VioDev, sizeof(m_VioDev));
      m_Id = g_InstanceId++;
-@@ -485,6 +496,19 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
+@@ -512,6 +523,19 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
                                        _In_ POWER_ACTION ActionType)
  {
      PAGED_CODE();
@@ -593,7 +593,7 @@ index 20fe40c..317e3a0 100644
  
      DbgPrint(TRACE_LEVEL_FATAL,
               ("---> %s HardwareUid = 0x%x ActionType = %s DevicePowerState = %s AdapterPowerState = %s\n",
-@@ -496,6 +520,7 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
+@@ -523,6 +547,7 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
  
      if (HardwareUid == DISPLAY_ADAPTER_HW_ID)
      {
@@ -601,7 +601,7 @@ index 20fe40c..317e3a0 100644
          NTSTATUS status = STATUS_SUCCESS;
  
          if (DevicePowerState == PowerDeviceD0)
-@@ -528,18 +553,14 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
+@@ -555,18 +580,14 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
              case PowerDeviceUnspecified:
              case PowerDeviceD0:
                  {
@@ -626,7 +626,7 @@ index 20fe40c..317e3a0 100644
                      }
                  }
                  break;
-@@ -547,10 +568,17 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
+@@ -574,10 +595,17 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
              case PowerDeviceD2:
              case PowerDeviceD3:
                  {
@@ -648,7 +648,7 @@ index 20fe40c..317e3a0 100644
                  }
                  break;
              default:
-@@ -1324,6 +1352,40 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+@@ -1351,6 +1379,40 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
  
      VIOGPU_ASSERT(pEscape != NULL);
  
@@ -689,7 +689,7 @@ index 20fe40c..317e3a0 100644
      DbgPrint(TRACE_LEVEL_INFORMATION, ("<---> %s Flags = %d\n", __FUNCTION__, pEscape->Flags.Value));
      PAGED_CODE();
      PVIOGPU_ESCAPE pVioGpuEscape = (PVIOGPU_ESCAPE)pEscape->pPrivateDriverData;
-@@ -1342,6 +1404,11 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+@@ -1369,6 +1431,11 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
          return STATUS_INVALID_BUFFER_SIZE;
      }
  
@@ -700,8 +700,8 @@ index 20fe40c..317e3a0 100644
 +
      switch (pVioGpuEscape->Type)
      {
-         case VIOGPU_QUERY_TIMELINE_SUBMIT:
-@@ -1927,6 +1994,7 @@ NTSTATUS VioGpuAdapter::PreemptCommand(_In_ CONST DXGKARG_PREEMPTCOMMAND *pPreem
+         case VIOGPU_NATIVE_CLOCK:
+@@ -1984,6 +2051,7 @@ NTSTATUS VioGpuAdapter::PreemptCommand(_In_ CONST DXGKARG_PREEMPTCOMMAND *pPreem
      UINT nodeOrdinal = pPreemptCommand->NodeOrdinal;
      UINT engineOrdinal = pPreemptCommand->EngineOrdinal;
      UINT preemptionFenceId = pPreemptCommand->PreemptionFenceId;
@@ -709,7 +709,7 @@ index 20fe40c..317e3a0 100644
  
      if (nodeOrdinal >= kMaxTrackedNodes || engineOrdinal >= kMaxTrackedEngines)
      {
-@@ -2043,7 +2111,9 @@ void VioGpuAdapter::RecordDmaSubmittedForPreemption(UINT fenceId,
+@@ -2100,7 +2168,9 @@ void VioGpuAdapter::RecordDmaSubmittedForPreemption(UINT fenceId,
      }
  
      LONG outstanding = InterlockedIncrement(&m_preemptSubmittedOutstanding[nodeOrdinal][engineOrdinal]);
@@ -719,7 +719,7 @@ index 20fe40c..317e3a0 100644
      if (pendingFence != 0)
      {
          DbgPrint(TRACE_LEVEL_WARNING,
-@@ -2072,6 +2142,7 @@ void VioGpuAdapter::RecordDmaCompletionForPreemptionFromIsr(UINT fenceId,
+@@ -2129,6 +2199,7 @@ void VioGpuAdapter::RecordDmaCompletionForPreemptionFromIsr(UINT fenceId,
      }
  
      LONG outstanding = InterlockedDecrement(&m_preemptSubmittedOutstanding[nodeOrdinal][engineOrdinal]);
@@ -727,7 +727,7 @@ index 20fe40c..317e3a0 100644
      if (outstanding < 0)
      {
          DbgPrint(TRACE_LEVEL_WARNING,
-@@ -2227,6 +2298,95 @@ VOID VioGpuAdapter::ResetDevice(VOID)
+@@ -2287,6 +2358,95 @@ VOID VioGpuAdapter::ResetDevice(VOID)
      DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
  }
  
@@ -823,7 +823,7 @@ index 20fe40c..317e3a0 100644
  #pragma code_seg(pop) // End Non-Paged Code
  
  PAGED_CODE_SEG_BEGIN
-@@ -2475,7 +2635,8 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
+@@ -2535,7 +2695,8 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
          return status;
      }
  
@@ -833,7 +833,7 @@ index 20fe40c..317e3a0 100644
  
      m_u64HostFeatures = virtio_get_features(&m_VioDev);
      m_u64GuestFeatures = 0;
-@@ -2552,6 +2713,7 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
+@@ -2612,6 +2773,7 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
      if (status == STATUS_SUCCESS)
      {
          virtio_device_ready(&m_VioDev);
@@ -841,7 +841,7 @@ index 20fe40c..317e3a0 100644
          InterlockedExchange(&m_InterruptsClosing, 0);
          SetHardwareInit(TRUE);
      }
-@@ -2615,6 +2777,220 @@ void VioGpuAdapter::VioGpuAdapterClose()
+@@ -2678,6 +2840,224 @@ void VioGpuAdapter::VioGpuAdapterClose()
      DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s\n", __FUNCTION__));
  }
  
@@ -929,6 +929,10 @@ index 20fe40c..317e3a0 100644
 +void VioGpuAdapter::InvalidateHostObjects()
 +{
 +    PAGED_CODE();
++#if VIOGPU_WDDM2
++    // Samples came from host contexts this reset destroyed.
++    ResetNativeClock();
++#endif
 +    KeWaitForSingleObject(&m_objectMutex, Executive, KernelMode, FALSE, NULL);
 +    for (LIST_ENTRY *entry = m_devices.Flink; entry != &m_devices; entry = entry->Flink)
 +    {
@@ -1062,7 +1066,7 @@ index 20fe40c..317e3a0 100644
  void VioGpuAdapter::SynchronizeInterruptsForClose(void)
  {
      PAGED_CODE();
-@@ -3068,18 +3444,17 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
+@@ -3128,18 +3508,17 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
      {
          UNREFERENCED_PARAMETER(MessageNumber);
          UCHAR isrstat = virtio_read_isr_status(&m_VioDev);
@@ -1091,7 +1095,7 @@ index 20fe40c..317e3a0 100644
      }
  
      if (serviced)
-@@ -3091,6 +3466,10 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
+@@ -3151,6 +3530,10 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
  
              while ((pvbuf = ctrlQueue.DequeueBufferFromIsr(&len)) != NULL)
              {
@@ -1102,7 +1106,7 @@ index 20fe40c..317e3a0 100644
                  if (pvbuf->complete_cb == VioGpuCommand::RunningCbDone && pvbuf->complete_ctx != NULL)
                  {
                      VioGpuCommand *cmd = reinterpret_cast<VioGpuCommand *>(pvbuf->complete_ctx);
-@@ -3106,6 +3485,7 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
+@@ -3166,6 +3549,7 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
                          // DMA and later engine retirements for the scheduler's
                          // existing timeout/reset path; never signal success.
                          cmd->Retirement.Failed = 1;
@@ -1111,7 +1115,7 @@ index 20fe40c..317e3a0 100644
                                   ("%s GPU timeline response failed owner=viogpu3d fence=%u len=%u response=%#x; DMA retained for timeout/reset\n",
                                    __FUNCTION__, cmd->GetSubmissionFenceId(), len,
 diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
-index 0bac394..1075c5f 100644
+index ecc0d12..0b84a1d 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.h
 +++ b/viogpu/viogpu3d/viogpu_adapter.h
 @@ -61,6 +61,32 @@ struct CAPSET_INFO
@@ -1147,7 +1151,7 @@ index 0bac394..1075c5f 100644
  virtio_gpu_formats ColorFormat(UINT format);
  
  class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
-@@ -137,6 +163,21 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+@@ -142,6 +168,21 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
      volatile LONG m_preemptionNotifyCount;
      volatile LONG m_preemptionInvalidCount;
      volatile LONG m_outOfOrderFenceDropCount;
@@ -1169,7 +1173,7 @@ index 0bac394..1075c5f 100644
      CAPSET_INFO m_capsetInfos[VIRTIO_GPU_MAX_CAPSET_ID + 1];
  
    public:
-@@ -234,6 +275,17 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+@@ -243,6 +284,17 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
                                                   HANDLE ownerPid);
      UINT GetLastNotifiedFence(UINT nodeOrdinal, UINT engineOrdinal);
      BOOLEAN TrackDmaSubmission(VioGpuCommand *command);
@@ -1187,7 +1191,7 @@ index 0bac394..1075c5f 100644
  
      void SetVsyncInterruptEnabled(BOOLEAN enabled)
      {
-@@ -297,6 +349,10 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+@@ -308,6 +360,10 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
      NTSTATUS VirtIoDeviceInit(void);
      BOOLEAN AckFeature(UINT64 Feature);
      void SynchronizeInterruptsForClose(void);
@@ -1199,10 +1203,10 @@ index 0bac394..1075c5f 100644
      void static ThreadWork(_In_ PVOID Context);
      NTSTATUS StartWorkThread(void);
 diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
-index 6bbfb49..e2417d4 100644
+index 5fdb003..a46f0b7 100644
 --- a/viogpu/viogpu3d/viogpu_allocation.cpp
 +++ b/viogpu/viogpu3d/viogpu_allocation.cpp
-@@ -60,7 +60,7 @@ void VioGpuAllocation::BlobCreateCompleteCB(void *ctx_void)
+@@ -58,7 +58,7 @@ void VioGpuAllocation::BlobCreateCompleteCB(void *ctx_void)
      VioGpuAllocation *alloc = reinterpret_cast<VioGpuAllocation *>(ctx->owner);
      PGPU_CTRL_HDR resp = ctx->vbuf ? (PGPU_CTRL_HDR)ctx->vbuf->resp_buf : NULL;
      NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -1211,7 +1215,7 @@ index 6bbfb49..e2417d4 100644
          status = STATUS_SUCCESS;
      }
  
-@@ -133,10 +133,95 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_CREATE_ALLOCAT
+@@ -132,10 +132,74 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_CREATE_ALLOCAT
  
      KeInitializeEvent(&m_busyNotification, NotificationEvent, TRUE);
      m_busy = 0;
@@ -1225,40 +1229,19 @@ index 6bbfb49..e2417d4 100644
 +    PAGED_CODE();
 +    // Called only after device reset, cancellation, and DPC drain. The OS
 +    // allocation and its MDL remain alive until VidMm evicts/destroys them.
-+    ExAcquireFastMutex(&m_blob_map_mutex);
-+    LIST_ENTRY mappings;
-+    InitializeListHead(&mappings);
++    KeWaitForSingleObject(&m_blob_map_mutex, Executive, KernelMode, FALSE, NULL);
 +    while (!IsListEmpty(&m_blob_map_list))
-+        InsertTailList(&mappings, RemoveHeadList(&m_blob_map_list));
-+    ExReleaseFastMutex(&m_blob_map_mutex);
-+    while (!IsListEmpty(&mappings))
 +    {
-+        BlobUserMapping *map = CONTAINING_RECORD(RemoveHeadList(&mappings), BlobUserMapping, ListEntry);
-+        BOOLEAN attached = map->Process && map->Process != PsGetCurrentProcess();
-+        if (attached)
-+            KeAttachProcess(reinterpret_cast<PRKPROCESS>(map->Process));
-+        NTSTATUS status = STATUS_SUCCESS;
-+        if (map->UserVa)
-+            status = m_adapter->GetDxgkInterface()->DxgkCbUnmapMemory(m_adapter->GetDxgkInterface()->DeviceHandle, map->UserVa);
-+        if (attached)
-+            KeDetachProcess();
-+        if (!NT_SUCCESS(status))
-+        {
-+            // Keep the process reference and aperture reservation for final
-+            // cleanup. Never recycle a range while a guest VA still maps it.
-+            ExAcquireFastMutex(&m_blob_map_mutex);
-+            InsertTailList(&m_blob_map_list, &map->ListEntry);
-+            ExReleaseFastMutex(&m_blob_map_mutex);
-+            DbgPrint(TRACE_LEVEL_ERROR, ("TDR blob unmap failed resource=%u pid=%p status=%#x\n", m_Id, map->ProcessId, status));
-+            continue;
-+        }
++        BlobUserMapping *map = CONTAINING_RECORD(RemoveHeadList(&m_blob_map_list), BlobUserMapping, ListEntry);
++        // The view registry revokes the mapping in its owner's address space,
++        // also when that process is exiting. It cannot fail, so no stale user
++        // VA outlives the reset.
++        VioGpuUnmapBlobUserView(&map->View);
 +        if (map->Process)
 +            ObDereferenceObject(map->Process);
 +        delete map;
 +    }
-+    ExAcquireFastMutex(&m_blob_map_mutex);
-+    if (IsListEmpty(&m_blob_map_list))
-+        m_blob_map_user_refs = 0;
++    m_blob_map_user_refs = 0;
 +    if (m_blob_kernel_va)
 +        MmUnmapIoSpace(m_blob_kernel_va, (SIZE_T)m_blob_kernel_map_size);
 +    m_blob_kernel_va = NULL;
@@ -1276,7 +1259,7 @@ index 6bbfb49..e2417d4 100644
 +        m_valid = false;
 +    // Keep its aperture reservation until destruction; stale user mappings
 +    // must never alias a newly allocated resource after reset.
-+    ExReleaseFastMutex(&m_blob_map_mutex);
++    KeReleaseMutex(&m_blob_map_mutex, FALSE);
 +}
 +
 +NTSTATUS VioGpuAllocation::RestoreHostResource()
@@ -1307,7 +1290,7 @@ index 6bbfb49..e2417d4 100644
  UINT VioGpuAllocation::GetStride(void) const
  {
      if (m_stride)
-@@ -170,6 +255,8 @@ NTSTATUS VioGpuAllocation::CreateBlobResource(UINT ctx_id,
+@@ -169,6 +233,8 @@ NTSTATUS VioGpuAllocation::CreateBlobResource(UINT ctx_id,
                                                void (*complete_cb)(void *),
                                                void *complete_ctx)
  {
@@ -1316,15 +1299,15 @@ index 6bbfb49..e2417d4 100644
      if (!ExAcquireRundownProtection(&m_blob_create_rundown))
      {
          return STATUS_DELETE_PENDING;
-@@ -287,6 +374,7 @@ VioGpuAllocation::~VioGpuAllocation(void)
+@@ -286,6 +352,7 @@ VioGpuAllocation::~VioGpuAllocation(void)
      DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s res_id=0x%x\n", __FUNCTION__, m_Id));
  
      ASSERT(m_busy == 0);
 +    m_adapter->UnregisterObject(&m_adapterEntry);
      ExWaitForRundownProtectionRelease(&m_blob_create_rundown);
  
-     ExAcquireFastMutex(&m_blob_map_mutex);
-@@ -403,7 +491,10 @@ void VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOff
+     KeWaitForSingleObject(&m_blob_map_mutex, Executive, KernelMode, FALSE, NULL);
+@@ -403,7 +470,10 @@ void VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOff
          ents[i].padding = 0;
      }
  
@@ -1336,7 +1319,7 @@ index 6bbfb49..e2417d4 100644
      DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
  }
  
-@@ -419,7 +510,8 @@ void VioGpuAllocation::DetachBacking()
+@@ -419,7 +489,8 @@ void VioGpuAllocation::DetachBacking()
      m_pageOffset = 0;
      ExReleaseFastMutex(&m_cpu_copy_mutex);
  
@@ -1347,10 +1330,10 @@ index 6bbfb49..e2417d4 100644
  }
  
 diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
-index 4541e07..610567e 100644
+index 1336768..1ef2bc9 100644
 --- a/viogpu/viogpu3d/viogpu_allocation.h
 +++ b/viogpu/viogpu3d/viogpu_allocation.h
-@@ -20,6 +20,8 @@ class VioGpuResource
+@@ -21,6 +21,8 @@ class VioGpuResource
  
  class VioGpuAllocation
  {
@@ -1359,7 +1342,7 @@ index 4541e07..610567e 100644
    public:
      VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_CREATE_ALLOCATION_EXCHANGE *exchange);
      ~VioGpuAllocation(void);
-@@ -128,6 +130,8 @@ class VioGpuAllocation
+@@ -130,6 +132,8 @@ class VioGpuAllocation
      NTSTATUS EscapeResourceSetScanoutBlob(VIOGPU_RES_SET_SCANOUT_BLOB_REQ *resScanout);
      NTSTATUS MapForCpuCopy(ULONG ctx_id, PVOID *map_va, ULONGLONG *map_size, BOOLEAN *io_mapping);
      void UnmapForCpuCopy(PVOID map_va, ULONGLONG map_size, BOOLEAN io_mapping);
@@ -1431,19 +1414,19 @@ index f830883..b9ecb8c 100644
      VioGpuCommand(VioGpuAdapter *adapter);
      ~VioGpuCommand();
 diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
-index 2e3f4ca..5d00bfb 100644
+index ba5e6a8..dc59bbb 100644
 --- a/viogpu/viogpu3d/viogpu_device.cpp
 +++ b/viogpu/viogpu3d/viogpu_device.cpp
-@@ -28,6 +28,7 @@ VioGpuDevice::VioGpuDevice(VioGpuAdapter *pAdapter)
-     // Init replaces it when a UMD requests another capset.
+@@ -29,6 +29,7 @@ VioGpuDevice::VioGpuDevice(VioGpuAdapter *pAdapter)
      m_pAdapter->ctrlQueue.CreateCtx(m_id, 0);
      m_context_created = true;
+     m_clockPublisher.Generation = 0;
 +    m_pAdapter->RegisterObject(&m_adapterEntry, 0);
  }
  
  VioGpuDevice::~VioGpuDevice()
-@@ -35,7 +36,8 @@ VioGpuDevice::~VioGpuDevice()
-     PAGED_CODE();
+@@ -39,7 +40,8 @@ VioGpuDevice::~VioGpuDevice()
+ #endif
      DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s\n", __FUNCTION__));
  
 -    if (m_context_created)
@@ -1452,7 +1435,7 @@ index 2e3f4ca..5d00bfb 100644
      {
          m_pAdapter->ctrlQueue.DestroyCtx(m_id);
          m_context_created = false;
-@@ -87,6 +89,7 @@ NTSTATUS VioGpuDevice::Init(VIOGPU_CTX_INIT_REQ *pOptions)
+@@ -94,6 +96,7 @@ NTSTATUS VioGpuDevice::Init(VIOGPU_CTX_INIT_REQ *pOptions)
      m_pAdapter->ctrlQueue.CreateCtx(m_id, context_init);
      m_context_created = true;
  
@@ -1460,7 +1443,7 @@ index 2e3f4ca..5d00bfb 100644
      return STATUS_SUCCESS;
  }
  
-@@ -213,6 +216,8 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAlloc
+@@ -220,6 +223,8 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAlloc
  NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
  {
      PAGED_CODE();
@@ -1469,7 +1452,7 @@ index 2e3f4ca..5d00bfb 100644
  
      DXGK_ALLOCATIONLIST *dxgk_src =
          pPresent->pAllocationList ? &pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX] : NULL;
-@@ -463,6 +468,8 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
+@@ -470,6 +475,8 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
  NTSTATUS VioGpuDevice::Render(DXGKARG_RENDER *pRender)
  {
      PAGED_CODE();
@@ -1478,7 +1461,7 @@ index 2e3f4ca..5d00bfb 100644
  
      DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
  
-@@ -720,6 +727,7 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
+@@ -727,6 +734,7 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
      m_pAllocation = allocation;
      m_pDevice = device;
      m_attached = false;
@@ -1486,7 +1469,7 @@ index 2e3f4ca..5d00bfb 100644
  
      if (m_pAllocation->IsBlob() || !m_pDevice->IsVenusContext())
      {
-@@ -734,7 +742,8 @@ VioGpuDeviceAllocation::~VioGpuDeviceAllocation()
+@@ -741,7 +749,8 @@ VioGpuDeviceAllocation::~VioGpuDeviceAllocation()
      DbgPrint(TRACE_LEVEL_VERBOSE,
               ("<---> %s res_id=%d ctx_id=%d\n", __FUNCTION__, m_pAllocation->GetId(), m_pDevice->GetId()));
  
@@ -1497,7 +1480,7 @@ index 2e3f4ca..5d00bfb 100644
          m_pDevice->GetCtrlQueue()->CtxResource(false, m_pDevice->GetId(), m_pAllocation->GetId());
          m_attached = false;
 diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
-index ba8c6bf..00b0faf 100644
+index 1ecb2ac..a122cc5 100644
 --- a/viogpu/viogpu3d/viogpu_device.h
 +++ b/viogpu/viogpu3d/viogpu_device.h
 @@ -18,6 +18,9 @@ class CtrlQueue;
@@ -1518,14 +1501,15 @@ index ba8c6bf..00b0faf 100644
  
      CtrlQueue *GetCtrlQueue();
      PEPROCESS GetOwnerProcess() const
-@@ -62,12 +66,15 @@ class VioGpuDevice
+@@ -66,6 +70,7 @@ class VioGpuDevice
      ULONG m_id;
      ULONG m_capset_id;
      bool m_context_created;
 +    bool m_context_lost = false;
      PEPROCESS m_owner_process;
      HANDLE m_owner_pid;
- };
+     VIOGPU_CLOCK_PUBLISHER m_clockPublisher;
+@@ -73,6 +78,8 @@ class VioGpuDevice
  
  class VioGpuDeviceAllocation
  {
@@ -1534,4 +1518,3 @@ index ba8c6bf..00b0faf 100644
    public:
      VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAllocation *allocation);
      ~VioGpuDeviceAllocation();
-

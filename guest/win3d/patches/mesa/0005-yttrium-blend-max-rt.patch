@@ -11,10 +11,10 @@ Origin: codex working tree R/mesa (git diff 374c3022), re-exported by
 vmlab-win3d build/mesa; see build/mesa/README.md.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
-index a6c9e18aac0759ea70a5e7ff47040899a65bcd2b..709dff03c6a3d66fddf2b43db4b5bb5600dcda8e 100644
+index b6ede53..0a2f152 100644
 --- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
 +++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
-@@ -963,6 +963,7 @@ CreateBlendState(D3D10DDI_HDEVICE hDevice,                     // IN
+@@ -932,6 +932,7 @@ CreateBlendState(D3D10DDI_HDEVICE hDevice,                     // IN
  
     struct pipe_blend_state state;
     memset(&state, 0, sizeof state);
@@ -22,7 +22,7 @@ index a6c9e18aac0759ea70a5e7ff47040899a65bcd2b..709dff03c6a3d66fddf2b43db4b5bb56
  
     for (i = 0; i < MIN2(PIPE_MAX_COLOR_BUFS, D3D10_DDI_SIMULTANEOUS_RENDER_TARGET_COUNT); ++i) {
        state.rt[i].blend_enable = pBlendDesc->BlendEnable[i];
-@@ -1038,6 +1039,7 @@ CreateBlendState1(D3D10DDI_HDEVICE hDevice,                     // IN
+@@ -1007,6 +1008,7 @@ CreateBlendState1(D3D10DDI_HDEVICE hDevice,                     // IN
  
     struct pipe_blend_state state;
     memset(&state, 0, sizeof state);
@@ -30,7 +30,7 @@ index a6c9e18aac0759ea70a5e7ff47040899a65bcd2b..709dff03c6a3d66fddf2b43db4b5bb56
  
     state.alpha_to_coverage = pBlendDesc->AlphaToCoverageEnable;
     state.independent_blend_enable = pBlendDesc->IndependentBlendEnable;
-@@ -1084,6 +1086,7 @@ CreateBlendState11_1Impl(D3D10DDI_HDEVICE hDevice,
+@@ -1053,6 +1055,7 @@ CreateBlendState11_1Impl(D3D10DDI_HDEVICE hDevice,
  
     struct pipe_blend_state state;
     memset(&state, 0, sizeof state);
@@ -39,7 +39,7 @@ index a6c9e18aac0759ea70a5e7ff47040899a65bcd2b..709dff03c6a3d66fddf2b43db4b5bb56
     state.alpha_to_coverage = pBlendDesc->AlphaToCoverageEnable;
     state.independent_blend_enable = pBlendDesc->IndependentBlendEnable;
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_state.c b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
-index 797c7f66978669c4c7f274dc128553797bdeb795..dd7c3c398827e9446c4ffc29fb0332c85bd074e9 100644
+index 797c7f6..dd7c3c3 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_state.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
 @@ -548,13 +548,26 @@ yttrium_pipe_colormask(unsigned colormask)

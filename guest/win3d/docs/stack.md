@@ -136,9 +136,9 @@ vkd3d-proton queues go to DXVK's DXGI, and everything else stays native.
 | Guest files | x64 and x86: `viogpu_d3d10.dll` |
 | Found by | Class key `UserModeDriverName` = `C:\Windows\System32\viogpu_d3d10.dll` three times (D3D9, D3D10, D3D11), `UserModeDriverNameWow` = the SysWOW64 path three times, `InstalledDisplayDrivers` = `viogpu_d3d10` three times. There is no D3D12 entry. |
 | Installed by | The INF (`VioGpu3D_Files.Usermode`, `VioGpu3D_Files.Wow64`, `VioGpu3D_DeviceSettings`) |
-| Upstream | [arehnman/virtio-win-mesa](https://github.com/arehnman/virtio-win-mesa), branch `yttrium-experimental`, commit `374c3022` (Mesa 26.1.0) |
+| Upstream | [arehnman/virtio-win-mesa](https://github.com/arehnman/virtio-win-mesa), branch `yttrium-experimental`, commit `76c095bb`, the November 2026 release (Mesa 26.1.0) |
 | Build | [`build/mesa/`](../build/mesa/README.md) |
-| Patches | Mesa 19, shared with the two Mesa components below (table below). 0005 to 0010, 0012 to 0017, 0020 and 0021 change this UMD; 0001 to 0003 are shared build and utility fixes. |
+| Patches | Mesa 43, shared with the two Mesa components below (table below). [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
 | Licence | Mesa MIT; the Yttrium winsys (`src/gallium/winsys/yttrium/gdi/`) MPL-2.0 |
 
 `viogpu_d3d10.dll` is Mesa's `d3d10umd` front end (D3D10/11 DDI, plus a
@@ -180,15 +180,16 @@ renderer, `vn_renderer_d3dkmt.c`, submits Venus commands to the KMD with
 | | |
 | --- | --- |
 | Guest files | `viogpu3d.sys`, `vgpusrv.exe`, `viogpuap.exe` in the driver store (`C:\Windows\System32\DriverStore\FileRepository\viogpu3d.inf_amd64_<hash>\`, INF DIRID 13); the INF as `C:\Windows\INF\oem<NN>.inf` |
-| Found by | PnP matches the INF's hardware ID `PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01`. The INF adds the kernel service `VioGpu3D` and the user service `vgpusrv` ("VioGpu Resolution Service"), which starts `viogpuap.exe` in each user session. |
+| Found by | PnP matches the INF's hardware ID `PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01`. The INF adds the kernel service `VioGpu3D` and the user service `vgpusrv` ("Yttrium VirtIO Resolution Service"), which starts `viogpuap.exe` in each user session. |
 | Installed by | The installer runs `pnputil /add-driver viogpu3d.inf /install`. The package is test-signed ([decision 0001](decisions/0001-signing.md)). |
-| Upstream | [arehnman/yttrium-virtio-gpu](https://github.com/arehnman/yttrium-virtio-gpu), tag `yttrium-experimental-2026-09-27`, a fork of virtio-win/kvm-guest-drivers-windows |
+| Upstream | [arehnman/yttrium-virtio-gpu](https://github.com/arehnman/yttrium-virtio-gpu), tag `yttrium-experimental-2026-11-02` (`e9917ae2`), a fork of virtio-win/kvm-guest-drivers-windows |
 | Build | [`build/kmd/`](../build/kmd/README.md), clang-cl and lld-link against the WDK NuGet packages |
-| Patches | 1 (table below) |
+| Patches | 4 (table below) |
 | Licence | BSD-3-Clause; Yttrium's changes to `viogpu3d` are also MPL-2.0 where marked |
 
-The device appears as "Hardsoft VirtIO GPU 3D controller", driver version
-100.6.101.58100. It is a WDDM 2.0 display miniport with Venus and blob
+The device appears as "Yttrium VirtIO GPU 3D controller" (upstream renamed
+it from "Hardsoft VirtIO GPU 3D controller" in the November release), driver
+version 100.6.101.58105. It is a WDDM 2.0 display miniport with Venus and blob
 resource support and a 60 Hz VidPN timer. It needs the
 `VIRTIO_GPU_F_VIRGL` feature, so it fails to start on a plain `virtio-vga`.
 
@@ -220,8 +221,9 @@ The repository-root patches/virglrenderer/ directory carries 0001
 image-allocation logging, 0002 NVIDIA queue-sync fence timing and 0003
 memory-import export-info removal. The root build/hv.py and e2e image
 apply all three; hypervisor tests use that build. diagnostic/0040 remains
-unapplied. The obsolete feedback-loop workaround is removed because guest
-Mesa patch 0020 handles it.
+unapplied. The obsolete feedback-loop workaround is removed because the
+guest UMD asks the host before it adds feedback-loop usage (Mesa patch 0020
+until the November rebase, upstream's own check since).
 
 The vmlab-hv release bundle ships the patched library and render server.
 win3d no longer builds or ships a QEMU fork or a separate host asset.
@@ -260,12 +262,12 @@ Dockerfiles pin their Debian packages by version.
 | [`d3d12-samples`](../build/d3d12-samples/PINS) | nuget-d3d12 | `1.618.3` | — | `799981b3569eae3a08468891fd4a0b027907b262a75a5cc3f48d621ee68a21db` | https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.618.3/microsoft.direct3d.d3d12.1.618.3.nupkg |
 | [`d3d12-samples`](../build/d3d12-samples/PINS) | nuget-pix | `1.0.240308001` | — | `726acc93d6968e2146261a1e415521747d50ad69894c2b42b5d0d4c29fd66ec4` | https://api.nuget.org/v3-flatcontainer/winpixeventruntime/1.0.240308001/winpixeventruntime.1.0.240308001.nupkg |
 | [`d3d12-samples`](../build/d3d12-samples/PINS) | dxc | `v1.8.2505.1` | — | `f2213da1fc99dc8778c8823078e16ba97c7f80f86a1d4520ab1adf4b462bc48c` | https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/linux_dxc_2025_07_14.x86_64.tar.gz |
-| [`kmd`](../build/kmd/PINS) | yttrium-virtio-gpu | `yttrium-experimental-2026-09-27` | `b99d951a1c97f6fb3a1adbc08a4d2ab9ce9f5a15` | — | https://github.com/arehnman/yttrium-virtio-gpu |
+| [`kmd`](../build/kmd/PINS) | yttrium-virtio-gpu | `yttrium-experimental-2026-11-02` | `e9917ae25b2597306d483e1063dba08658139bc9` | — | https://github.com/arehnman/yttrium-virtio-gpu |
 | [`kmd`](../build/kmd/PINS) | llvm-mingw | `20261006` | — | `5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4` | https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64.tar.xz |
 | [`kmd`](../build/kmd/PINS) | wdk-x64 | `10.0.26100.6584` | — | `c393d03dfb640b5c92f546b32f6770ef68cd3aaf691956e7d66d8e2c28a1b55e` | https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/10.0.26100.6584/microsoft.windows.wdk.x64.10.0.26100.6584.nupkg |
 | [`kmd`](../build/kmd/PINS) | sdk-cpp | `10.0.26100.6584` | — | `5d31b38205bdd9ac761b4cb39fbbc6b7209b01c11194324afc674d7d119483a0` | https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.26100.6584/microsoft.windows.sdk.cpp.10.0.26100.6584.nupkg |
 | [`kmd`](../build/kmd/PINS) | debian | `debian:12` | `sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858` | — | docker.io/library/debian |
-| [`mesa`](../build/mesa/PINS) | mesa | — | `374c30222e0c08b04783c173c127abb3e465d028` | `7d8538c1d17ffe2a2abe733532d1dd1be9b43089ec79e9c2460730ea0694f72a` | https://github.com/arehnman/virtio-win-mesa/archive/374c30222e0c08b04783c173c127abb3e465d028.tar.gz |
+| [`mesa`](../build/mesa/PINS) | mesa | — | `76c095bbbd875fda21e55c69d9e1eed56980d956` | `3b7a26e16b513fde18e02adf2478f9fc02d03793c64a61516f3935226cee3902` | https://github.com/arehnman/virtio-win-mesa/archive/76c095bbbd875fda21e55c69d9e1eed56980d956.tar.gz |
 | [`mesa`](../build/mesa/PINS) | windows-sdk-cpp | `10.0.26100.1` | — | `b4730a467a8f29145fc0136b2b3f626767e985f6aa6e32f1352953c38d6ff5d2` | https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.26100.1/microsoft.windows.sdk.cpp.10.0.26100.1.nupkg |
 | [`mesa`](../build/mesa/PINS) | windows-wdk-x64 | `10.0.26100.1` | — | `247b2919ae451f65ba5f1cd51c7c39730fb0fc383d607f3e8ab317fddc8a8239` | https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/10.0.26100.1/microsoft.windows.wdk.x64.10.0.26100.1.nupkg |
 | [`mesa`](../build/mesa/PINS) | DirectX-Headers | `v1.619.1` | `9e393d6d8a3b30dcc6f2806ef604ec16a27b0d7e` | `6193774904c940eebb9b0c51b816b93dd776cfeb25a951f0f4a58f22387e5008` | https://github.com/microsoft/DirectX-Headers/archive/refs/tags/v1.619.1.tar.gz |
@@ -311,7 +313,7 @@ committed.
 | | | [`0002`](../patches/kmd/0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch) | viogpu3d: map GDI shadow and staging surfaces cached | [`docs/present.md`](present.md) |
 | | | [`0003`](../patches/kmd/0003-kmd-create-context-for-gdi-devices.patch) | viogpu3d: create a legacy context before opening GDI allocations | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0004`](../patches/kmd/0004-kmd-recover-from-timeouts.patch) | viogpu3d: recover transport and device state after a timeout | [`docs/tdr-recovery.md`](tdr-recovery.md) |
-| mesa | 47 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
+| mesa | 43 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0002`](../patches/mesa/0002-util-xmlconfig-case-insensitive-exe-match.patch) | util/xmlconfig: match drirc executable names case-insensitively on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0003`](../patches/mesa/0003-util-u_queue-windows-loader-lock-join.patch) | util/u_queue: do not join worker threads under the loader lock on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0004`](../patches/mesa/0004-wgl-unbind-through-stw-on-delete.patch) | wgl: unbind the current context through stw_make_current on delete | [`build/mesa/README.md`](../build/mesa/README.md) |
@@ -328,12 +330,10 @@ committed.
 | | | [`0015`](../patches/mesa/0015-d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch) | d3d10umd: hull shader vPrim, indexed patch constants and control points | [`docs/d3d11-apps.md`](d3d11-apps.md) |
 | | | [`0016`](../patches/mesa/0016-d3d10umd-immediate-constant-buffer-relative-offset.patch) | d3d10umd: keep the offset in dynamically indexed immediate constant buffer reads | [`docs/d3d11-apps.md`](d3d11-apps.md) |
 | | | [`0017`](../patches/mesa/0017-yttrium-honour-wireframe-fill-mode.patch) | yttrium: honour D3D11_FILL_WIREFRAME | [`docs/d3d11-apps.md`](d3d11-apps.md) |
-| | | [`0020`](../patches/mesa/0020-yttrium-gate-feedback-loop-usage-on-format-support.patch) | yttrium: gate feedback-loop image usage on the renderer's format support | [`docs/nvidia.md`](nvidia.md) |
 | | | [`0021`](../patches/mesa/0021-yttrium-d3d11-typed-uav-loads-without-formatless-read.patch) | d3d10umd, yttrium: create WDDM 2.0 D3D11 devices without formatless storage-image reads; R32 typed UAV loads only, and TypedUAVLoadAdditionalFormats from the host (Intel ANV) | [`docs/zeus.md`](zeus.md) |
 | | | [`0022`](../patches/mesa/0022-yttrium-render-shadow-for-linear-colour-with-depth.patch) | yttrium: render LINEAR colour targets next to depth through an OPTIMAL shadow | [`docs/xid69.md`](xid69.md) |
 | | | [`0023`](../patches/mesa/0023-yttrium-shared-colour-optimal-when-linear-refused.patch) | yttrium: shared colour images fall back to OPTIMAL where the host refuses LINEAR | [`docs/nvtex.md`](nvtex.md) |
 | | | [`0024`](../patches/mesa/0024-d3d9-positiont-vs-for-runtime-fixed-function-ps.patch) | d3d9: generate the POSITIONT vertex shader for any runtime fixed-function pixel shader | [`docs/nvtex.md`](nvtex.md) |
-| | | [`0025`](../patches/mesa/0025-yttrium-packed-16-bit-formats-match-vulkan.patch) | yttrium: map D3D R5G6B5 and A1R5G5B5 to the matching Vulkan PACK16 formats | [`docs/nvtex.md`](nvtex.md) |
 | | | [`0026`](../patches/mesa/0026-d3d9-ddraw-present-sources-in-host-cached-memory.patch) | d3d9: put DirectDraw present sources in host-cached memory | [`docs/present.md`](present.md) |
 | | | [`0027`](../patches/mesa/0027-wgl-present-windows-opaque.patch) | wgl: present windows opaque through kopper | [`docs/present.md`](present.md) |
 | | | [`0030`](../patches/mesa/0030-d3d10umd-domain-shader-indexed-patch-constants.patch) | d3d10umd: domain shaders read patch constants with a register index | [`docs/ds.md`](ds.md) |
@@ -350,11 +350,9 @@ committed.
 | | | [`0066`](../patches/mesa/0066-venus-disable-feedback-when-writes-do-not-arrive.patch) | venus: disable feedback for a device whose feedback writes do not arrive | [`docs/nvfb.md`](nvfb.md) |
 | | | [`0067`](../patches/mesa/0067-venus-back-uncached-host-memory-with-cached-when-gpu-writes-do-not-arrive.patch) | venus: back uncached host memory with cached memory when GPU writes do not arrive | [`docs/nvfb.md`](nvfb.md) |
 | | | [`0070`](../patches/mesa/0070-venus-hide-host-access-to-small-bar-heap.patch) | venus: hide host access to a small BAR heap | [`docs/nvva.md`](nvva.md) |
-| | | [`0075`](../patches/mesa/0075-wsi-win32-blit-shared-swapchain-when-linear-cannot-render.patch) | wsi/win32: render DXGI_SHARED swapchains through an OPTIMAL image when LINEAR cannot be a render target | [`docs/godot.md`](godot.md) |
 | | | [`0080`](../patches/mesa/0080-wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch) | wgl: pin opengl32.dll so pixel formats set through GDI last | [`docs/gzdoom.md`](gzdoom.md) |
 | | | [`0085`](../patches/mesa/0085-venus-allocate-from-small-device-local-heap-synchronously.patch) | venus: allocate from a small device-local heap synchronously | [`docs/unigl.md`](unigl.md) |
 | | | [`0086`](../patches/mesa/0086-zink-keep-buffers-mappable-without-visible-vram.patch) | zink: keep buffers mappable when CPU-visible VRAM is missing or full | [`docs/unigl.md`](unigl.md) |
-| | | [`0090`](../patches/mesa/0090-yttrium-d3d9-depth-bias-without-float-representation.patch) | yttrium: convert D3D9 depth bias when the float representation is missing | [`docs/unid3d.md`](unid3d.md) |
 | | | [`0091`](../patches/mesa/0091-d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch) | d3d9: stop copying every vertex-buffer lock for the ordered worker | [`docs/f6va.md`](f6va.md) |
 | | | [`0092`](../patches/mesa/0092-yttrium-bound-in-flight-uploads.patch) | yttrium: bound in-flight upload buffers in 32-bit processes | [`docs/f6va.md`](f6va.md) |
 | | | [`0093`](../patches/mesa/0093-yttrium-guard-revoked-batch-feedback.patch) | yttrium: report device loss for revoked feedback mappings | [`docs/tdr-recovery.md`](tdr-recovery.md) |

@@ -18,10 +18,10 @@ Origin: codex working tree R/mesa (git diff 374c3022), re-exported by
 vmlab-win3d build/mesa; see build/mesa/README.md.
 ---
 diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
-index 27cb23dce878f2f9ba43bcf789ee83d95e18f638..48189d87e1a353b60c1ebfa7e540eb882f0afb2e 100644
+index 0da6217..77a3817 100644
 --- a/src/virtio/vulkan/vn_device.c
 +++ b/src/virtio/vulkan/vn_device.c
-@@ -314,6 +314,7 @@ vn_device_fix_create_info(const struct vn_device *dev,
+@@ -325,6 +325,7 @@ vn_device_fix_create_info(const struct vn_device *dev,
     }
  
     if (app_exts->KHR_external_memory_fd ||
@@ -29,7 +29,7 @@ index 27cb23dce878f2f9ba43bcf789ee83d95e18f638..48189d87e1a353b60c1ebfa7e540eb88
         app_exts->EXT_external_memory_dma_buf || has_wsi) {
        if (physical_dev->external_memory.renderer_handle_type ==
            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
-@@ -328,6 +329,11 @@ vn_device_fix_create_info(const struct vn_device *dev,
+@@ -339,6 +340,11 @@ vn_device_fix_create_info(const struct vn_device *dev,
        }
     }
  
@@ -42,10 +42,10 @@ index 27cb23dce878f2f9ba43bcf789ee83d95e18f638..48189d87e1a353b60c1ebfa7e540eb88
     if (!app_exts->KHR_external_semaphore_fd && has_wsi) {
        assert(physical_dev->renderer_sync_fd.semaphore_importable);
 diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
-index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0f0469ab6 100644
+index 947ab64..fc6a094 100644
 --- a/src/virtio/vulkan/vn_device_memory.c
 +++ b/src/virtio/vulkan/vn_device_memory.c
-@@ -16,6 +16,7 @@
+@@ -21,6 +21,7 @@
  #endif
  #include "venus-protocol/vn_protocol_driver_transport.h"
  #include "vk_debug_utils.h"
@@ -53,7 +53,7 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
  
  #include "vn_android.h"
  #include "vn_buffer.h"
-@@ -95,6 +96,12 @@ vn_device_memory_bo_init(struct vn_device *dev, struct vn_device_memory *mem)
+@@ -100,6 +101,12 @@ vn_device_memory_bo_init(struct vn_device *dev, struct vn_device_memory *mem)
     const struct vk_device_memory *mem_vk = &mem->base.vk;
     const VkMemoryType *mem_type = &dev->physical_device->memory_properties
                                        .memoryTypes[mem_vk->memory_type_index];
@@ -66,7 +66,7 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
     return vn_renderer_bo_create_from_device_memory(
        dev->renderer, mem_vk->size, mem->base.id, mem_type->propertyFlags,
        mem_vk->export_handle_types, &mem->base_bo);
-@@ -109,23 +116,12 @@ vn_device_memory_bo_fini(struct vn_device *dev, struct vn_device_memory *mem)
+@@ -114,23 +121,12 @@ vn_device_memory_bo_fini(struct vn_device *dev, struct vn_device_memory *mem)
     }
  }
  
@@ -93,7 +93,7 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
     vn_ring_roundtrip(dev->primary_ring);
  
     const VkImportMemoryResourceInfoMESA import_memory_resource_info = {
-@@ -139,19 +135,36 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
+@@ -144,19 +140,36 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
        .allocationSize = alloc_info->allocationSize,
        .memoryTypeIndex = alloc_info->memoryTypeIndex,
     };
@@ -130,10 +130,10 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
 +   return result;
 +}
 +
- #if defined(HAVE_YTTRIUM)
- static uint32_t
- vn_choose_memory_type(const VkPhysicalDeviceMemoryProperties *props,
-@@ -272,9 +285,17 @@ vn_device_memory_alloc_guest_vram(struct vn_device *dev,
+ static VkResult
+ vn_device_memory_alloc_guest_vram(struct vn_device *dev,
+                                   struct vn_device_memory *mem,
+@@ -175,9 +188,17 @@ vn_device_memory_alloc_guest_vram(struct vn_device *dev,
     if (mem_vk->export_handle_types)
        flags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
  
@@ -154,7 +154,7 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
     if (result != VK_SUCCESS) {
        return result;
     }
-@@ -447,6 +468,7 @@ vn_device_memory_emit_report(struct vn_device *dev,
+@@ -350,6 +371,7 @@ vn_device_memory_emit_report(struct vn_device *dev,
                  : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT;
     }
     const uint64_t mem_obj_id =
@@ -162,34 +162,33 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
        (mem_vk->import_handle_type | mem_vk->export_handle_types)
           ? mem->base_bo->res_id
           : mem->base.id;
-@@ -475,12 +497,22 @@ vn_AllocateMemory(VkDevice device,
+@@ -464,6 +486,21 @@ vn_AllocateMemory(VkDevice device,
+ 
     const VkImportMemoryFdInfoKHR *import_fd_info =
        vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
- #if defined(HAVE_YTTRIUM)
++#if defined(HAVE_YTTRIUM)
 +   const VkImportMemoryWin32HandleInfoKHR *import_nt =
 +      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
 +   const VkExportMemoryWin32HandleInfoKHR *export_nt =
 +      vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
 +   const bool export_nt_requested = mem->base.vk.export_handle_types &
 +      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-    const struct wsi_memory_win32_handle_import_info *import_win32_info = NULL;
-    vk_foreach_struct_const(pnext, pAllocateInfo->pNext) {
++   vk_foreach_struct_const(pnext, pAllocateInfo->pNext) {
 +      if (pnext->sType == VK_STRUCTURE_TYPE_YTTRIUM_MEMORY_RUNTIME_DATA_INFO) {
 +         const struct yttrium_memory_runtime_data_info *runtime = (const void *)pnext;
 +         mem->runtime_data = runtime->data;
 +         mem->runtime_size = runtime->size;
 +      }
-       if (pnext->sType ==
-           VK_STRUCTURE_TYPE_WSI_MEMORY_WIN32_HANDLE_IMPORT_INFO_MESA) {
-          import_win32_info = (const void *)pnext;
--         break;
-       }
-    }
- #endif
-@@ -492,6 +524,38 @@ vn_AllocateMemory(VkDevice device,
++   }
++#endif
+ 
+    VkResult result;
+    if (mem->base.vk.ahardware_buffer) {
+@@ -471,12 +508,64 @@ vn_AllocateMemory(VkDevice device,
+    } else if (import_fd_info) {
        result = vn_device_memory_import_dma_buf(dev, mem, pAllocateInfo,
                                                 import_fd_info->fd);
- #if defined(HAVE_YTTRIUM)
++#if defined(HAVE_YTTRIUM)
 +   } else if (import_nt) {
 +      HANDLE owned_handle = NULL;
 +      if (import_nt->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT) {
@@ -222,10 +221,10 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
 +            mesa_loge("venus: NT memory import failed, result %d", result);
 +         CloseHandle(owned_handle);
 +      }
-    } else if (import_win32_info) {
-       result = vn_device_memory_import_win32_handle(dev, mem, pAllocateInfo,
-                                                     import_win32_info->handle);
-@@ -502,6 +566,24 @@ vn_AllocateMemory(VkDevice device,
++#endif
+    } else {
+       result = vn_device_memory_alloc(dev, mem, pAllocateInfo);
+       if (result == VK_SUCCESS)
           vn_wsi_memory_info_init(mem, pAllocateInfo);
     }
  
@@ -250,7 +249,7 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
     vn_device_memory_emit_report(dev, mem, /* is_alloc */ true, result);
  
     if (result != VK_SUCCESS) {
-@@ -526,6 +608,11 @@ vn_FreeMemory(VkDevice device,
+@@ -501,6 +590,11 @@ vn_FreeMemory(VkDevice device,
  
     vn_device_memory_emit_report(dev, mem, /* is_alloc */ false, VK_SUCCESS);
  
@@ -262,7 +261,7 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
     /* ensure renderer side import still sees the resource */
     vn_device_memory_bo_fini(dev, mem);
  
-@@ -668,6 +755,38 @@ vn_GetDeviceMemoryCommitment(VkDevice device,
+@@ -643,6 +737,38 @@ vn_GetDeviceMemoryCommitment(VkDevice device,
                                         pCommittedMemoryInBytes);
  }
  
@@ -302,7 +301,7 @@ index f52ec262511ad08072efce764f1ae24183042aae..5487eb2d0c35973c59c7663d84256aa0
  vn_GetMemoryFdKHR(VkDevice device,
                    const VkMemoryGetFdInfoKHR *pGetFdInfo,
 diff --git a/src/virtio/vulkan/vn_device_memory.h b/src/virtio/vulkan/vn_device_memory.h
-index c70b6681701cc0e81b9083f48de0b07a01511f3c..099d7babc36b0c8655f818d71cefe5a257026f19 100644
+index b94b7be..ca35af2 100644
 --- a/src/virtio/vulkan/vn_device_memory.h
 +++ b/src/virtio/vulkan/vn_device_memory.h
 @@ -18,6 +18,12 @@ struct vn_device_memory {
@@ -319,10 +318,10 @@ index c70b6681701cc0e81b9083f48de0b07a01511f3c..099d7babc36b0c8655f818d71cefe5a2
     /* ensure renderer side resource create is called after vkAllocateMemory
      *
 diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
-index 2d2e22b500e340bb1a17dc5919a37eea805d140b..66dafe3ab574035f441e09cdd2d15002a49123aa 100644
+index 40e2975..8f27145 100644
 --- a/src/virtio/vulkan/vn_physical_device.c
 +++ b/src/virtio/vulkan/vn_physical_device.c
-@@ -1048,7 +1048,10 @@ vn_physical_device_init_external_memory(
+@@ -1060,7 +1060,10 @@ vn_physical_device_init_external_memory(
        physical_dev->external_memory.renderer_handle_type =
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
  
@@ -334,7 +333,7 @@ index 2d2e22b500e340bb1a17dc5919a37eea805d140b..66dafe3ab574035f441e09cdd2d15002
        physical_dev->external_memory.supported_handle_types |=
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
  #else
-@@ -1211,6 +1214,8 @@ vn_physical_device_get_native_extensions(
+@@ -1223,6 +1226,8 @@ vn_physical_device_get_native_extensions(
  #if !DETECT_OS_WINDOWS
        exts->KHR_external_memory_fd = true;
        exts->EXT_external_memory_dma_buf = true;
@@ -344,10 +343,10 @@ index 2d2e22b500e340bb1a17dc5919a37eea805d140b..66dafe3ab574035f441e09cdd2d15002
     }
  #endif /* VK_USE_PLATFORM_ANDROID_KHR */
 diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
-index 3b83cba4ce984fb318dcb46b795a535d73fbfc2f..d80336e3b7a2979de387ea7cf9b51294edaf8596 100644
+index 72bc817..dbf31d4 100644
 --- a/src/virtio/vulkan/vn_renderer.h
 +++ b/src/virtio/vulkan/vn_renderer.h
-@@ -367,6 +367,26 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
+@@ -371,6 +371,26 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
  }
  
  #if defined(HAVE_YTTRIUM)
@@ -372,13 +371,13 @@ index 3b83cba4ce984fb318dcb46b795a535d73fbfc2f..d80336e3b7a2979de387ea7cf9b51294
 +vn_renderer_open_nt_handle(struct vn_renderer *renderer, const WCHAR *name);
 +
  static inline VkResult
- vn_renderer_bo_create_from_win32_handle(struct vn_renderer *renderer,
-                                         VkDeviceSize size,
+ vn_renderer_bo_create_from_win32_handle(
+    struct vn_renderer *renderer,
 diff --git a/src/virtio/vulkan/vn_renderer_d3dkmt.c b/src/virtio/vulkan/vn_renderer_d3dkmt.c
-index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a39b848a91 100644
+index 0ce4858..ce79c5a 100644
 --- a/src/virtio/vulkan/vn_renderer_d3dkmt.c
 +++ b/src/virtio/vulkan/vn_renderer_d3dkmt.c
-@@ -59,7 +59,7 @@ struct virtgpu_shmem {
+@@ -62,7 +62,7 @@ struct virtgpu_shmem {
  struct virtgpu_bo {
     struct vn_renderer_bo base;
     uint32_t alloc_handle;
@@ -387,7 +386,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
      * owned by that resource and must be destroyed through it, not by the
      * allocation handle alone.
      */
-@@ -154,6 +154,8 @@ struct virtgpu {
+@@ -157,6 +157,8 @@ struct virtgpu {
     PFND3DKMT_DESTROYALLOCATION pfnDestroyAllocation;
     PFND3DKMT_SHAREOBJECTS pfnShareObjects;
     PFND3DKMT_OPENRESOURCEFROMNTHANDLE pfnOpenResourceFromNtHandle;
@@ -396,7 +395,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  #if defined(HAVE_YTTRIUM)
     PFND3DKMT_QUERYRESOURCEINFO pfnQueryResourceInfo;
     PFND3DKMT_OPENRESOURCE pfnOpenResource;
-@@ -615,6 +617,9 @@ virtgpu_context_init(struct virtgpu *gpu, uint32_t capset_id)
+@@ -618,6 +620,9 @@ virtgpu_context_init(struct virtgpu *gpu, uint32_t capset_id)
  
  static void
  virtgpu_d3dkmt_gem_close(struct virtgpu *gpu, uint32_t alloc_handle);
@@ -406,7 +405,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  
  static uint32_t
  virtgpu_d3dkmt_resource_create_blob(struct virtgpu *gpu,
-@@ -622,7 +627,9 @@ virtgpu_d3dkmt_resource_create_blob(struct virtgpu *gpu,
+@@ -625,7 +630,9 @@ virtgpu_d3dkmt_resource_create_blob(struct virtgpu *gpu,
                                     uint32_t blob_flags,
                                     size_t blob_size,
                                     uint64_t blob_id,
@@ -417,7 +416,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  {
  #ifdef SIMULATE_BO_SIZE_FIX
     blob_size = align64(blob_size, 4096);
-@@ -664,6 +671,12 @@ virtgpu_d3dkmt_resource_create_blob(struct virtgpu *gpu,
+@@ -667,6 +674,12 @@ virtgpu_d3dkmt_resource_create_blob(struct virtgpu *gpu,
     create.pPrivateDriverData = &res_exchange;
     create.PrivateDriverDataSize = sizeof(res_exchange);
     create.Flags.CreateResource = TRUE;
@@ -430,7 +429,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  
     NTSTATUS status = gpu->pfnCreateAllocation(&create);
     if (!NT_SUCCESS(status))
-@@ -681,11 +694,14 @@ virtgpu_d3dkmt_resource_create_blob(struct virtgpu *gpu,
+@@ -684,11 +697,14 @@ virtgpu_d3dkmt_resource_create_blob(struct virtgpu *gpu,
     resinfo.ResourceInfo.ResHandle = alloc_info.hAllocation;
     if (!virtgpu_d3dkmt_escape(gpu, &resinfo)) {
        vn_log(gpu->instance,"virtgpu_d3dkmt_escape failed");
@@ -446,7 +445,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
     return (uint32_t)alloc_info.hAllocation;
  }
  
-@@ -877,29 +893,125 @@ virtgpu_d3dkmt_shared_handle_to_handle(struct virtgpu *gpu, void *handle,
+@@ -912,29 +928,125 @@ virtgpu_d3dkmt_shared_handle_to_handle(
  #endif
  
  static uint32_t
@@ -575,7 +574,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  static bool
  virtgpu_load_d3dkmt(struct virtgpu *gpu)
  {
-@@ -950,6 +1062,12 @@ virtgpu_load_d3dkmt(struct virtgpu *gpu)
+@@ -985,6 +1097,12 @@ virtgpu_load_d3dkmt(struct virtgpu *gpu)
     gpu->pfnOpenResourceFromNtHandle =
        (PFND3DKMT_OPENRESOURCEFROMNTHANDLE)GetProcAddress(
           gpu->gdi32, "D3DKMTOpenResourceFromNtHandle");
@@ -588,7 +587,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  #if defined(HAVE_YTTRIUM)
     gpu->pfnQueryResourceInfo = (PFND3DKMT_QUERYRESOURCEINFO)GetProcAddress(
        gpu->gdi32, "D3DKMTQueryResourceInfo");
-@@ -972,6 +1090,7 @@ virtgpu_load_d3dkmt(struct virtgpu *gpu)
+@@ -1007,6 +1125,7 @@ virtgpu_load_d3dkmt(struct virtgpu *gpu)
         !gpu->pfnSignalSynchronizationObject2 ||
         !gpu->pfnDestroyAllocation || !gpu->pfnShareObjects ||
         !gpu->pfnOpenResourceFromNtHandle ||
@@ -596,7 +595,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
         !gpu->pfnOpenAdapterFromHdc ||
         !gpu->pfnCloseAdapter) {
        FreeLibrary(gpu->gdi32);
-@@ -1505,7 +1624,7 @@ virtgpu_bo_export_dma_buf(struct vn_renderer *renderer,
+@@ -1540,7 +1659,7 @@ virtgpu_bo_export_dma_buf(struct vn_renderer *renderer,
     const bool shareable = bo->blob_flags & VIRTGPU_BLOB_FLAG_USE_SHAREABLE;
  
     return shareable
@@ -605,7 +604,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
                                                  mappable)
               : -1;
  }
-@@ -1633,34 +1752,58 @@ virtgpu_bo_close_failed_import_handle(struct virtgpu *gpu,
+@@ -1668,34 +1787,58 @@ virtgpu_bo_close_failed_import_handle(struct virtgpu *gpu,
  }
  
  static VkResult
@@ -668,8 +667,8 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
 +
  #if defined(HAVE_YTTRIUM)
  static VkResult
- virtgpu_bo_create_from_win32_handle(struct vn_renderer *renderer,
-@@ -1699,25 +1842,27 @@ fail:
+ virtgpu_bo_create_from_win32_handle(
+@@ -1737,25 +1880,27 @@ fail:
  #endif
  
  static VkResult
@@ -700,7 +699,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  
     if (!alloc_handle)
        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-@@ -1732,6 +1877,7 @@ virtgpu_bo_create_from_device_memory(
+@@ -1770,6 +1915,7 @@ virtgpu_bo_create_from_device_memory(
        },
        .alloc_handle = alloc_handle,
        .blob_flags = blob_flags,
@@ -708,7 +707,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
     };
  
     *out_bo = &bo->base;
-@@ -1739,6 +1885,27 @@ virtgpu_bo_create_from_device_memory(
+@@ -1777,6 +1923,27 @@ virtgpu_bo_create_from_device_memory(
     return VK_SUCCESS;
  }
  
@@ -736,7 +735,7 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
  static void
  virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
                            struct vn_renderer_shmem *_shmem)
-@@ -1789,7 +1956,7 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -1827,7 +1994,7 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
     uint32_t res_id;
     uint32_t alloc_handle = virtgpu_d3dkmt_resource_create_blob(
        gpu, gpu->shmem_blob_mem, VIRTGPU_BLOB_FLAG_USE_MAPPABLE, alloc_size, 0,
@@ -746,14 +745,14 @@ index 16a040a56994bb092a73cb66b5ea4a3a8b3eb46e..84ea85e8dd60bc102088bc1ab42011a3
     if (!alloc_handle)
        return NULL;
 diff --git a/src/vulkan/util/vk_internal_exts.h b/src/vulkan/util/vk_internal_exts.h
-index 8a0b2e3368bee4dd68852b20291a129b5d75efc4..7c2758c8d29fe204657c5f8aee509e6c85c305ca 100644
+index 497d28b..17d8005 100644
 --- a/src/vulkan/util/vk_internal_exts.h
 +++ b/src/vulkan/util/vk_internal_exts.h
-@@ -69,6 +69,15 @@ struct wsi_memory_win32_handle_import_info {
-     const void *pNext;
-     void *handle;
+@@ -63,6 +63,16 @@ struct wsi_memory_allocate_info {
+     bool dma_buf_sync_file;
  };
-+
+ 
++#if defined(HAVE_YTTRIUM)
 +/* Private Yttrium runtime-to-driver contract, copied by D3DKMT at allocation. */
 +struct yttrium_memory_runtime_data_info {
 +    VkStructureType sType;
@@ -762,6 +761,7 @@ index 8a0b2e3368bee4dd68852b20291a129b5d75efc4..7c2758c8d29fe204657c5f8aee509e6c
 +    const void *data;
 +};
 +#define VK_STRUCTURE_TYPE_YTTRIUM_MEMORY_RUNTIME_DATA_INFO ((VkStructureType)1000001006)
- #endif
- 
++#endif
  /* To be chained into VkSurfaceCapabilities2KHR */
+ struct wsi_surface_supported_counters {
+    VkStructureType sType;

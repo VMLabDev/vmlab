@@ -23,9 +23,11 @@ context.
 Evidence: docs/dwmheap.md, docs/evidence/dwmheap/.
 Origin: vmlab-win3d dwmheap worker.
 ---
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index e92cf84..4707fc8 100644
 --- a/src/gallium/frontends/d3d10umd/Device.cpp
 +++ b/src/gallium/frontends/d3d10umd/Device.cpp
-@@ -1201,12 +1201,17 @@
+@@ -1239,12 +1239,17 @@ FillDeviceFuncsWDDM2_0(D3DWDDM2_0DDI_DEVICEFUNCS *funcs)
  static HRESULT APIENTRY
  TrimResidencySetWDDM2_0(DXGI_DDI_ARG_TRIMRESIDENCYSET *args)
  {

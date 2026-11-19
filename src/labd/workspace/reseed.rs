@@ -281,6 +281,7 @@ pub async fn reconverge(
         resolved: &empty_resolutions,
         max_file_bytes: cap,
         case_folding,
+        unwitnessed: false,
     });
     debug_assert!(
         !plan
@@ -551,6 +552,7 @@ mod tests {
                 resolved: &self.resolved,
                 max_file_bytes: NO_CAP,
                 case_folding: false,
+                unwitnessed: false,
             })
         }
     }
@@ -677,6 +679,7 @@ mod tests {
             resolved: &sides.resolved,
             max_file_bytes: 16,
             case_folding: false,
+            unwitnessed: false,
         });
         assert!(plan.adopt.is_empty(), "never hashed, so never agreed");
         assert!(plan.actions.is_empty(), "refused before transfer");

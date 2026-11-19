@@ -2530,13 +2530,18 @@ impl super::machine::Machine for VmInstance {
             &[],
             crate::smb::steps::RetryPolicy::MOUNT.deadline,
         );
+        let os_hint = crate::smb::guest_os_hint(self.template().resolved.profile.as_deref());
+        let smb_steps = lab.smb_mount_plan(vm_name, os_hint).await;
+        if os_hint == crate::smb::OsHint::Windows {
+            for share in smb_steps.iter().filter_map(|step| step.share.as_deref()) {
+                report.require_for_provisioning(share);
+            }
+        }
         if self.wait_ready(self.ready_timeout()).await.is_err() {
             report.abandoned("the guest never became ready");
             return;
         }
         report.ready();
-        let os_hint = crate::smb::guest_os_hint(self.template().resolved.profile.as_deref());
-        let smb_steps = lab.smb_mount_plan(vm_name, os_hint).await;
         let plan = crate::smb::mount_plan(os_hint, &self.virtiofs_mounts().await, smb_steps);
         report.planned(
             plan.steps.iter().filter_map(|s| s.share.as_deref()),

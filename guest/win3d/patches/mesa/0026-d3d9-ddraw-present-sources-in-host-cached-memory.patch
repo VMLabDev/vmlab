@@ -19,10 +19,10 @@ Evidence: docs/present.md, docs/evidence/present/.
 Origin: vmlab-win3d present worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
-index ae9ab75..b221c1c 100644
+index 33565c3..299a590 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
-@@ -2769,11 +2769,17 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
+@@ -2814,7 +2814,9 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
              templ.nr_samples = 1;
           templ.nr_storage_samples = templ.nr_samples;
           templ.bind = D3D9PipeBind(data);
@@ -32,7 +32,11 @@ index ae9ab75..b221c1c 100644
 +         if (ddraw_present_source)
              templ.bind |= PIPE_BIND_RENDER_TARGET | PIPE_BIND_DISPLAY_TARGET |
                            PIPE_BIND_SHARED;
-          templ.usage = D3D9PipeUsage(data->Pool);
+          templ.usage = D3D9PipeUsage(data);
+@@ -2825,7 +2827,11 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
+              !data->Flags.SharedResource &&
+              (data->Flags.Texture || data->Flags.Primary))
+             templ.flags |= YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER;
 -         if (yttrium && data->Flags.DiscardRenderTarget)
 +         /* A DirectDraw Blt to the primary reaches the KMD as a Blt present,
 +          * which the KMD carries out on Venus as a CPU copy out of the

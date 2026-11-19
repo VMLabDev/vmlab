@@ -9,6 +9,23 @@ entry names its evidence. "Prior art" means `docs/prior-art.md`, a review of
 an earlier attempt whose findings were not repeated here unless this page
 says so.
 
+## Base release
+
+Since 2026-11-19 the package is built from Yttrium's November 2026 release
+(kernel driver `e9917ae2`, Mesa `76c095bb`). Entries below that name
+`patches/mesa/0020`, `0025`, `0075` or `0090` describe the September base:
+the November release has those fixes itself and the series no longer carries
+them ([`build/mesa/README.md`](../build/mesa/README.md), "Dropped at the
+November rebase"). On the November base only the acceptance run
+(`tests/e2e/run.sh`, `windows-11` on `AMD1` and `Nvidia2`) and the static
+vertex buffer page of GitHub #233 have been run. Not repeated on it: the
+DirectX SDK samples, the compatibility sweep (Unigine, Godot, GZDoom), the
+`d3d9_depthbias` and fixed-function probes, the TDR regression, Windows 10,
+and the Intel and laptop NVIDIA hosts.
+
+The device is now named "Yttrium VirtIO GPU 3D controller". Older evidence
+says "Hardsoft VirtIO GPU 3D controller".
+
 ## Timeout recovery
 
 The unreleased `0.1.3` candidate implements adapter timeout reset and restart.
@@ -717,6 +734,12 @@ pixel for pixel ([`ddraw.md`](ddraw.md)). What remains:
   on the CPU.
 
 ### Vulkan swapchains on NVIDIA cost one copy per present
+
+This section describes the September base. The November release rewrote the
+Win32 WSI so that a swapchain image is created from the D3D11 texture's own
+shared descriptor, and `patches/mesa/0075` is gone. Whether a present on
+NVIDIA still costs a copy there was not measured. The Vulkan probe passes on
+`Nvidia2` with no host Xid.
 
 NVIDIA's driver does not support LINEAR images as colour attachments, and
 the Win32 WSI's swapchain images alias a LINEAR shared D3D11 texture. On

@@ -26,10 +26,10 @@ Evidence: docs/f6va.md, docs/evidence/f6va/.
 Origin: vmlab-win3d f6va worker.
 ---
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_context.c b/src/gallium/winsys/yttrium/gdi/yttrium_context.c
-index a43095e..11339a2 100644
+index 69c0016..fa72e80 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_context.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_context.c
-@@ -347,6 +347,9 @@ yttrium_flush_internal(struct pipe_context *ctx,
+@@ -337,6 +337,9 @@ yttrium_flush_internal(struct pipe_context *ctx,
        }
        if (flush_called && !flush_ok)
           YTTRIUM_WARN("yttrium: Venus flush failed\n");
@@ -40,10 +40,10 @@ index a43095e..11339a2 100644
  
     if (signal_context && flush_called && flush_ok)
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h b/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
-index aac1204..48b1894 100644
+index 9992e73..6d4f135 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
-@@ -108,6 +108,11 @@ yttrium_gdi_debug_get_option(const char *name, const char *dfault);
+@@ -136,6 +136,11 @@ yttrium_gdi_debug_get_option(const char *name, const char *dfault);
  bool
  yttrium_gdi_debug_get_bool_option(const char *name, bool dfault);
  
@@ -56,10 +56,10 @@ index aac1204..48b1894 100644
  yttrium_gdi_debug_get_num_option(const char *name, int64_t dfault);
  
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_resource.c b/src/gallium/winsys/yttrium/gdi/yttrium_resource.c
-index e5fe977..5549e5d 100644
+index 8e61346..0bb6479 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_resource.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_resource.c
-@@ -19,6 +19,7 @@
+@@ -18,6 +18,7 @@
  #include "virtio-gpu/virgl_hw.h"
  
  #include "util/u_atomic.h"
@@ -67,7 +67,7 @@ index e5fe977..5549e5d 100644
  
  #include "yttrium_gdi_public.h"
  #include "yttrium_internal.h"
-@@ -162,6 +163,161 @@ yttrium_buffer_storage_pool_return(struct yttrium_buffer_storage *storage)
+@@ -150,6 +151,161 @@ yttrium_buffer_storage_pool_return(struct yttrium_buffer_storage *storage)
     return pooled;
  }
  
@@ -229,15 +229,15 @@ index e5fe977..5549e5d 100644
  static void
  yttrium_ordered_upload_rehome_venus_handles(
     struct yttrium_venus_resource *venus)
-@@ -798,6 +954,7 @@ yttrium_map_allocation(struct pipe_screen *pscreen,
+@@ -757,6 +913,7 @@ yttrium_map_allocation(struct pipe_screen *pscreen,
     *out_map = (void *)(uintptr_t)map.ResourceMapBlob.UserVa;
     *out_map_info = map.ResourceMapBlob.MapInfo;
     *out_map_is_blob = true;
 +   yttrium_stats_blob_map(size, true);
  
-    YTTRIUM_LOG("yttrium: mapped %s blob hAllocation=0x%lx va=%p size=0x%llx map_info=0x%x\n",
-                label, (unsigned long)hAllocation, *out_map,
-@@ -982,8 +1139,10 @@ yttrium_unmap_display_allocation(struct pipe_screen *pscreen,
+    return true;
+ }
+@@ -933,8 +1090,10 @@ yttrium_unmap_display_allocation(struct pipe_screen *pscreen,
        NTSTATUS status = screen->device->escape(screen->device, &unmap,
                                                 sizeof(unmap));
        if (!NT_SUCCESS(status)) {
@@ -249,7 +249,7 @@ index e5fe977..5549e5d 100644
        }
     }
  
-@@ -1011,6 +1170,8 @@ yttrium_buffer_storage_destroy(struct yttrium_buffer_storage *storage)
+@@ -963,6 +1122,8 @@ yttrium_buffer_storage_destroy(struct yttrium_buffer_storage *storage)
                        (unsigned long)status,
                        (unsigned long)storage->hAllocation,
                        (unsigned long long)storage->size);
@@ -258,7 +258,7 @@ index e5fe977..5549e5d 100644
        }
     }
  
-@@ -1027,6 +1188,7 @@ yttrium_buffer_storage_destroy(struct yttrium_buffer_storage *storage)
+@@ -979,6 +1140,7 @@ yttrium_buffer_storage_destroy(struct yttrium_buffer_storage *storage)
        }
     }
  
@@ -266,7 +266,7 @@ index e5fe977..5549e5d 100644
     FREE(storage);
  }
  
-@@ -1077,6 +1239,7 @@ yttrium_buffer_storage_attach(struct yttrium_resource *res)
+@@ -1021,6 +1183,7 @@ yttrium_buffer_storage_attach(struct yttrium_resource *res)
  
     storage->reference_count = 1;
     storage->screen = yttrium_screen(res->base.screen);
@@ -274,7 +274,7 @@ index e5fe977..5549e5d 100644
     storage->hAllocation = res->hAllocation;
     storage->hResource = res->hResource;
     storage->hAllocationResource = res->hAllocationResource;
-@@ -1828,6 +1991,7 @@ yttrium_resource_create(struct pipe_screen *pscreen,
+@@ -1776,6 +1939,7 @@ yttrium_resource_create(struct pipe_screen *pscreen,
         (res->replacement_storage || yttrium_buffer_storage_attach(res)))
        threaded_resource(&res->base)->is_shared = false;
  
@@ -282,28 +282,28 @@ index e5fe977..5549e5d 100644
     return &res->base;
  }
  
-@@ -1859,6 +2023,7 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
+@@ -1807,6 +1971,7 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
  
     yttrium_trace_resource_destroy_state(
        YTTRIUM_TRACE_RESOURCE_DESTROY_BEGIN, 0, res);
 +   yttrium_upload_stats_update(res, false);
  
-    YTTRIUM_LOG("yttrium: resource_destroy begin resource=%p hAllocation=0x%lx hResource=%p res_id=%u mem_id=0x%llx display=%u primary=%u classic=%u owns=%u size=0x%llx stride=%u venus=(init=%u buffer=%u image_id=%llu buffer_id=%llu memory_id=%llu)\n",
-                 (void *)res,
-@@ -1943,6 +2108,8 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
+ 
+    if (res->replacement_storage) {
+@@ -1868,6 +2033,8 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
     }
  
     if (res->hAllocation) {
 +      if (res->allocation_destroyed_by_runtime && res->map && res->map_is_blob)
 +         yttrium_stats_skipped_unmap(res->size);
        if (res->allocation_destroyed_by_runtime) {
-          YTTRIUM_LOG("yttrium: release runtime-owned allocation without "
-                      "DeallocateCb hAllocation=0x%lx res_id=%u\n",
+          yttrium_trace_resource_destroy_state(
+             YTTRIUM_TRACE_RESOURCE_DESTROY_ALLOCATION_CLOSED, 0, res);
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_resource.h b/src/gallium/winsys/yttrium/gdi/yttrium_resource.h
-index c418027..8715bfa 100644
+index 198463d..67e3f2e 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_resource.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_resource.h
-@@ -63,6 +63,16 @@ struct pipe_resource *
+@@ -71,6 +71,16 @@ struct pipe_resource *
  yttrium_resource_create(struct pipe_screen *pscreen,
                          const struct pipe_resource *templ);
  
@@ -321,10 +321,10 @@ index c418027..8715bfa 100644
  yttrium_resource_destroy(struct pipe_screen *pscreen,
                           struct pipe_resource *resource);
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus.c
-index daeb96c..61c0cbf 100644
+index 0d23303..a007c2b 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus.c
-@@ -700,6 +700,16 @@ yttrium_venus_flush_labeled(struct yttrium_venus *venus, const char *label)
+@@ -710,6 +710,16 @@ yttrium_venus_flush_labeled(struct yttrium_venus *venus, const char *label)
     return ok;
  }
  
@@ -342,10 +342,10 @@ index daeb96c..61c0cbf 100644
  yttrium_venus_flush_async_labeled(struct yttrium_venus *venus,
                                    const char *label)
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
-index 99bcf6b..bde07e2 100644
+index 066688c..19cee70 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
-@@ -802,6 +802,12 @@ yttrium_venus_flush_async_present_publish(
+@@ -821,6 +821,12 @@ yttrium_venus_flush_async_present_publish(
  bool
  yttrium_venus_flush_labeled(struct yttrium_venus *venus, const char *label);
  
@@ -358,7 +358,7 @@ index 99bcf6b..bde07e2 100644
  bool
  yttrium_venus_flush_async_labeled(struct yttrium_venus *venus,
                                    const char *label);
-@@ -1071,6 +1077,17 @@ struct yttrium_venus_allocation_snapshot {
+@@ -1122,6 +1128,17 @@ struct yttrium_venus_allocation_snapshot {
     bool allocation_destroyed_by_runtime;
  };
  
@@ -377,10 +377,10 @@ index 99bcf6b..bde07e2 100644
  yttrium_venus_resource_fini(struct yttrium_venus *venus,
                              struct gdikmt_context *ctx,
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus2.h
-index b32610b..2b22eb1 100644
+index 04d495a..fb01383 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2.h
-@@ -42,6 +42,11 @@
+@@ -43,6 +43,11 @@
  #undef yttrium_venus_flush
  #undef yttrium_venus_flush_async
  #undef yttrium_venus_flush_async_present_publish
@@ -393,19 +393,19 @@ index b32610b..2b22eb1 100644
  #undef yttrium_venus_submit_order_complete
  #undef yttrium_venus_wait_resource
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
-index 104c1e8..a873367 100644
+index 23ce52e..1897dc1 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
-@@ -588,6 +588,8 @@ yttrium_venus_destroy_retired_allocation(
+@@ -617,6 +617,8 @@ yttrium_venus_destroy_retired_allocation(
        return;
  
     if (retired->allocation_destroyed_by_runtime) {
 +      if (retired->map && retired->map_is_blob)
 +         yttrium_stats_skipped_unmap(retired->allocation_size);
-       YTTRIUM_LOG("yttrium: Venus release runtime-owned allocation without "
-                   "DeallocateCb hAllocation=0x%lx size=0x%llx\n",
-                   (unsigned long)retired->hAllocation,
-@@ -610,10 +612,12 @@ yttrium_venus_destroy_retired_allocation(
+       retired->hAllocation = 0;
+       retired->hResource = NULL;
+       retired->map = NULL;
+@@ -636,10 +638,12 @@ yttrium_venus_destroy_retired_allocation(
        NTSTATUS status = venus->device->escape(venus->device, &unmap,
                                                sizeof(unmap));
        if (!NT_SUCCESS(status)) {
@@ -422,7 +422,7 @@ index 104c1e8..a873367 100644
        }
     }
  
-@@ -3979,3 +3983,41 @@ yttrium_venus_begin_transfer_batch(struct yttrium_venus *venus)
+@@ -4702,3 +4706,41 @@ yttrium_venus_begin_transfer_batch(struct yttrium_venus *venus)
     return yttrium_venus_begin_command_batch(venus, "transfer batch",
                                             false, true);
  }
@@ -465,10 +465,10 @@ index 104c1e8..a873367 100644
 +   }
 +}
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
-index b347499..e22a03e 100644
+index e62d777..928f2e8 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
-@@ -486,6 +486,10 @@ yttrium_venus_unmap_memory(struct yttrium_venus *venus,
+@@ -514,6 +514,10 @@ yttrium_venus_unmap_memory(struct yttrium_venus *venus,
         !mapping->hAllocation)
        return;
  
@@ -476,10 +476,10 @@ index b347499..e22a03e 100644
 +      yttrium_stats_venus_mapping(mapping->size, false);
 +   if (mapping->map_is_blob)
 +      yttrium_stats_blob_map(mapping->size, false);
-    if (mapping->map && mapping->map_is_blob) {
+    if (mapping->map && mapping->map_is_blob &&
+        !gdikmt_device_is_removed(venus->device)) {
        VIOGPU_ESCAPE unmap;
-       memset(&unmap, 0, sizeof(unmap));
-@@ -583,6 +587,8 @@ yttrium_venus_map_memory(struct yttrium_venus *venus,
+@@ -612,6 +616,8 @@ yttrium_venus_map_memory(struct yttrium_venus *venus,
     if (NT_SUCCESS(status) && map.ResourceMapBlob.UserVa) {
        mapping->map = (void *)(uintptr_t)map.ResourceMapBlob.UserVa;
        mapping->map_is_blob = true;
@@ -489,10 +489,10 @@ index b347499..e22a03e 100644
     }
  
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
-index 9140e5d..1ebae06 100644
+index be84777..7d03d75 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
-@@ -1524,6 +1524,10 @@ yttrium_venus_batch_retire_resource(
+@@ -1576,6 +1576,10 @@ yttrium_venus_batch_retire_resource(
     struct yttrium_venus_batch *batch,
     struct yttrium_venus_retired_resource *retired);
  
@@ -504,18 +504,18 @@ index 9140e5d..1ebae06 100644
  yttrium_venus_find_latest_pipeline_batch(
     struct yttrium_venus *venus,
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_transport.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_transport.c
-index b1a4ccf..200688e 100644
+index 3a04a7f..251562e 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_transport.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_transport.c
-@@ -445,6 +445,7 @@ yttrium_venus_bo_create(struct yttrium_venus *venus,
+@@ -495,6 +495,7 @@ yttrium_venus_bo_create(struct yttrium_venus *venus,
  
     bo->map = (void *)(uintptr_t)map.ResourceMapBlob.UserVa;
     bo->map_info = map.ResourceMapBlob.MapInfo;
 +   yttrium_stats_blob_map(bo->size, true);
     memset(bo->map, 0, bo->size);
  
-    YTTRIUM_LOG("yttrium: Venus BO hAllocation=0x%lx res_id=%u size=0x%llx map=%p\n",
-@@ -473,6 +474,8 @@ yttrium_venus_bo_destroy(struct yttrium_venus *venus,
+    return true;
+@@ -520,6 +521,8 @@ yttrium_venus_bo_destroy(struct yttrium_venus *venus,
                        (unsigned long)unmap_status,
                        (unsigned long)bo->hAllocation, bo->hResource,
                        bo->res_id, (unsigned long long)bo->size);
@@ -525,10 +525,10 @@ index b1a4ccf..200688e 100644
     }
  
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend.h
-index a5fb8a6..f23209b 100644
+index b84c71b..0edee88 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend.h
-@@ -254,6 +254,7 @@ struct yttrium_venus_backend {
+@@ -255,6 +255,7 @@ struct yttrium_venus_backend {
                                      VkImageAspectFlags aspect_mask);
     bool (*flush)(void *ctx);
     bool (*flush_async)(void *ctx);
@@ -537,10 +537,10 @@ index a5fb8a6..f23209b 100644
        void *ctx,
        const struct yttrium_venus_present_publication *publication);
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend_adapter.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend_adapter.h
-index a3bcd10..0daec45 100644
+index bc9a57b..401d22a 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend_adapter.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus_backend_adapter.h
-@@ -458,6 +458,12 @@ backend_flush_async(void *ctx)
+@@ -464,6 +464,12 @@ backend_flush_async(void *ctx)
     return YTTRIUM_VENUS_BACKEND_SYM(flush_async)(ctx);
  }
  
@@ -553,7 +553,7 @@ index a3bcd10..0daec45 100644
  static bool
  backend_flush_async_present_publish(
     void *ctx,
-@@ -890,6 +896,7 @@ const struct yttrium_venus_backend YTTRIUM_VENUS_BACKEND_SYM(backend) = {
+@@ -954,6 +960,7 @@ const struct yttrium_venus_backend YTTRIUM_VENUS_BACKEND_SYM(backend) = {
     .copy_depth_stencil_image = backend_copy_depth_stencil_image,
     .flush = backend_flush,
     .flush_async = backend_flush_async,

@@ -609,9 +609,9 @@ password. Only SMB is affected.
 - **macOS (SMB):** `/sbin/mount_smbfs -N //<user>:<password>@<gateway>/<share> <guest_path>` (`-o rdonly` for a read-only share) with the generated credential, percent-encoded. macOS has no virtiofs client, so a virtiofs share on it is reported unmountable (§5.3).
 - On Linux and macOS the guest path is created (`mkdir -p`) before any mount. A mount that still fails once its retries run out is reported as a `share.unmountable` event naming the share and the error.
 - **Retries.** Each mount step is retried on a capped backoff, 1 second doubling to at most 10, for five minutes from its first attempt: Windows' SMB client takes three to four minutes after boot to start. An attempt starts only within the five minutes, and its exec is cut to the time left, at most 30 seconds, so a step gives up at most five minutes plus one exec timeout after it began. A refusal the step names (`refused_exit`) stops it at once. The window is a constant, not a setting.
-- **A machine's provisions and playbooks wait for its mounts.** A step may read a share, so `up` starts a machine's first provision or playbook only once that machine's mount steps have finished, every share mounted or given up, and prints that machine's mount report there, in the form below, before the step runs.
+- **A machine's provisions and playbooks wait for its mounts.** A step may read a share, so `up` waits for that machine's mounts to finish and prints its mount report before provisioning. A failed SMB mount on a modern Windows guest fails the wait and stops provisioning for that machine.
 - **`up` reports the mounts before it reports the lab up.** For the machines no step waited on, once everything else is done it waits, at most 30 seconds, for each machine's mount steps to finish, then prints a `WARNING:` line naming the machine, the share and the reason for every share that will not mount, and for every share still failing when the wait runs out, with its attempt count, how long it has been retried out of the five minutes, and its last error; that share keeps retrying and its `share.unmountable` event follows if it gives up. A share whose guest is not ready yet, or whose step has not failed yet, gets a plain line saying it is still mounting, and so does a Windows share whose `net use` still fails with system error 67: the SMB client takes three to four minutes after boot to start, longer than the wait, so that failure is the guest warming up, not a fault (error 53, an unreachable gateway, is still a warning). An unmountable share does not fail `up`: the machines are up and the rest of the lab works, as with a forward that cannot be installed, so the exit status stays 0.
-- **Windows:** mapped via the SMB client with the generated credential. A drive-letter `guest` target maps directly; a folder-path target is realised as a directory symbolic link to the UNC path. Windows supports UNC targets with `mklink /D`; `mklink /J` junctions cannot target UNC paths. The link is checked on every `up`: one already pointing at the current gateway's share is kept, and a link to the same share through another gateway (the VM's segment moved to another subnet) is replaced. Anything else at the path is never removed — the share is refused at once with a `share.unmountable` event naming the path, since a real directory there may hold the user's data. A drive-letter mapping is deleted and mapped again on every `up`, so it follows a gateway change too.
+- **Windows:** the agent stores the generated gateway credential in SYSTEM's Credential Manager before mapping the share. A drive-letter `guest` target maps directly. A folder-path target uses `mklink /D` to create a directory symbolic link to the UNC path. On every `up`, vmlab keeps a link pointing at the current gateway's share and replaces a link to the same share through another gateway. It verifies SMB access by opening a directory enumeration through the link, including for an empty share. Anything else at the path is preserved and the mount is refused with a `share.unmountable` event naming the path. A drive-letter mapping is deleted and mapped again on every `up` so it follows a gateway change.
 
 **Server implementation.** No mature embeddable SMB *server* library exists in the Rust ecosystem (clients only, verified at time of writing), so this is the largest single engineering component the feature implies. Two permitted strategies behind the identical WCL/user surface:
 
@@ -2031,6 +2031,23 @@ lets a ten-file project lose everything). This exists not for deliberate deletio
 but for the guest doing something catastrophic and the syncer faithfully
 replicating it onto the canonical copy. A single deletion still propagates
 immediately; the guard is about mass.
+
+**An absence nothing saw is not a deletion** (#190). The mass guard is about
+deletions somebody made; this is about a path the guest merely does not hold
+when the syncer looks again **after a break in the watch** — a new syncer for a
+machine that stopped, or a reopened channel. A guest answers for a write from
+its cache, and one stopped hard a moment later comes back without the file, so
+the ledger agrees about a path the guest never durably had. Reading that as a
+guest-side delete removes the canonical copy of a file nobody deleted. So the
+walk after a break never deletes from the host on absence alone, **for any
+count**. Every agreement starts *unconfirmed* and is borne out by the first
+walk after a break that still finds the path in the guest. An unconfirmed path
+found missing is the interrupted transfer: the agreement is dropped and the
+path **copied again**. A confirmed one found missing is a **halt on that
+path** — `--host` copies it back, `--guest` says it was a deletion — and it
+stays withheld, durably and by name in the ledger, on the passes after the
+break. An overflow is not a break: the watch stayed open and the guest stayed
+up, so the walk it forces reads a missing path as the deletion it is.
 
 **Renames are delete + create at the ledger level.** The two platforms disagree
 on rename events, so a syncer that *depends* on one forks by platform, which

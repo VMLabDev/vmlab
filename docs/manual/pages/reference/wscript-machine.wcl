@@ -471,8 +471,8 @@ SRC
     An online snapshot resumes running where it was; an offline one leaves
     the machine off. A container's pinned image digest is checked first, and
     a mismatch fails with a message naming both digests and the two ways
-    out: destroy the machine or restore the original pin. It fails with
-    "<name> has no snapshot <snap>" for an unknown name.
+    out: destroy the machine or restore the original pin. A missing snapshot
+    fails with `no snapshot "<name>" on <machine>`.
   DOC
   p <<DOC
     On a dev machine the syncer is taken off the workspace before the rewind

@@ -450,6 +450,10 @@ fn freeze_declared(
     vms.chain(containers).collect()
 }
 
+fn missing_snapshot(machine: &str, snap: &str) -> crate::proto::CommandError {
+    crate::proto::CommandError::not_found(format!("no snapshot {snap:?} on {machine}"))
+}
+
 impl LabRuntime {
     pub async fn build(
         config: LabFile,
@@ -2636,6 +2640,7 @@ impl LabRuntime {
                     output(line);
                 }
             }
+            report.check_provisioning_mounts(m)?;
         }
         let machine = self.machine(m)?;
         // The machine's own budget, never a literal: a VM may still be
@@ -3473,15 +3478,24 @@ impl LabRuntime {
         snap: &str,
         discard: bool,
     ) -> Result<Vec<String>> {
+        let m = self
+            .machine(name)
+            .map_err(|_| missing_snapshot(name, snap))?;
         let record = {
-            let mut state = self.state.lock().await;
-            if state.machine_mut(name).pending_snapshots.contains(snap) {
+            let state = self.state.lock().await;
+            let machine = state
+                .machines
+                .get(name)
+                .ok_or_else(|| missing_snapshot(name, snap))?;
+            if machine.pending_snapshots.contains(snap) {
                 bail!("{name}: snapshot {snap:?} is pending cleanup after an interrupted capture");
             }
-            state.machine_mut(name).snapshots.get(snap).cloned()
-        }
-        .ok_or_else(|| anyhow!("\"{name}\" has no snapshot \"{snap}\""))?;
-        let m = self.machine(name)?;
+            machine
+                .snapshots
+                .get(snap)
+                .cloned()
+                .ok_or_else(|| missing_snapshot(name, snap))?
+        };
         // Online state is bound to its capture hypervisor, including when
         // it is stored in a frozen generation.
         if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
@@ -3656,10 +3670,17 @@ impl LabRuntime {
     /// restore left one) goes with it.
     pub async fn delete_snapshot(&self, vm_name: &str, snap: &str) -> Result<()> {
         let mut state = self.state.lock().await;
-        let record = state
+        let m = self
+            .machine(vm_name)
+            .map_err(|_| missing_snapshot(vm_name, snap))?;
+        let machine = state
             .machines
             .get(vm_name)
-            .and_then(|m| m.snapshots.get(snap));
+            .ok_or_else(|| missing_snapshot(vm_name, snap))?;
+        let record = machine.snapshots.get(snap);
+        if record.is_none() && !machine.pending_snapshots.contains(snap) {
+            return Err(missing_snapshot(vm_name, snap).into());
+        }
         if let Some(g) = record.and_then(|r| r.frozen_in) {
             return Err(
                 crate::proto::CommandError::conflict(super::worktree::locked_refusal(
@@ -3669,7 +3690,6 @@ impl LabRuntime {
             );
         }
         if record.is_some_and(|r| r.freeze_point.is_some()) {
-            let m = self.machine(vm_name)?;
             for disk in m.disk_paths() {
                 let marked = crate::freeze::inspect::disk_facts(&disk)
                     .await?
@@ -3682,7 +3702,7 @@ impl LabRuntime {
             state.save(&self.lab_local)?;
             return Ok(());
         }
-        self.machine(vm_name)?.delete_snapshot(snap).await?;
+        m.delete_snapshot(snap).await?;
         state.machine_mut(vm_name).snapshots.remove(snap);
         state.machine_mut(vm_name).pending_snapshots.remove(snap);
         state.save(&self.lab_local)?;
@@ -4338,6 +4358,7 @@ mod tests {
             if let Some(calls) = self.failing_mount.clone() {
                 let retry = crate::smb::steps::RetryPolicy::MOUNT;
                 report.planned(["data"], &[], retry.deadline);
+                report.require_for_provisioning("data");
                 if self.wait_ready(self.ready_timeout).await.is_err() {
                     report.abandoned("the guest never became ready");
                     return;
@@ -4345,9 +4366,9 @@ mod tests {
                 report.ready();
                 let plan = crate::smb::steps::MountPlan {
                     steps: vec![crate::smb::MountStep {
-                        os_hint: crate::smb::OsHint::Linux,
-                        command: "mount".into(),
-                        args: vec!["-t".into(), "cifs".into()],
+                        os_hint: crate::smb::OsHint::Windows,
+                        command: "net".into(),
+                        args: vec!["use".into()],
                         share: Some("data".into()),
                         refused_exit: None,
                     }],
@@ -4363,7 +4384,7 @@ mod tests {
                         async {
                             Ok(super::super::mount_retry::Exited {
                                 exit_code: 32,
-                                stderr: "mount error(112): Host is down\n".into(),
+                                stderr: "Access is denied.\n".into(),
                             })
                         }
                     },
@@ -4593,6 +4614,31 @@ lab "t" {
             log.iter()
                 .any(|line| line.contains("delete_snapshot:capture"))
         );
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_returns_not_found_without_calling_the_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
+        );
+
+        for machine in ["a", "unknown"] {
+            let delete = lab.delete_snapshot(machine, "missing").await.unwrap_err();
+            let restore = lab.restore(machine, "missing", false).await.unwrap_err();
+            for error in [delete, restore] {
+                assert_eq!(code_of(&error), Some(crate::proto::ErrorCode::NotFound));
+                assert_eq!(
+                    error.to_string(),
+                    format!("no snapshot \"missing\" on {machine}")
+                );
+            }
+        }
+        assert!(sh.log.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -5979,6 +6025,45 @@ lab "t" {
             said.iter()
                 .any(|(_, s)| s.contains("waiting for its shares to mount")),
             "{said:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_windows_smb_mount_blocks_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        std::fs::write(
+            dir.path().join("p.ws"),
+            "use vmlab\n\nfn main(lab: Lab) {\n}\n",
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+  vm "win" {
+    template = "x86_64/t"
+    provision "p.ws" { }
+  }
+}"#,
+            vec![FakeMachine::failing_mount("win", &sh, Arc::clone(&calls))],
+        );
+        let (sink, said) = numbered(&sh);
+        let error = format!("{:#}", lab.up(&[], sink).await.unwrap_err());
+        assert!(error.contains("\"win\""), "{error}");
+        assert!(
+            error.contains("SMB share \"data\" did not mount"),
+            "{error}"
+        );
+        assert!(error.contains("Access is denied"), "{error}");
+        assert!(calls.load(Ordering::SeqCst) > 1);
+        assert!(
+            !said
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, line)| line.contains("provision p.ws"))
         );
     }
 

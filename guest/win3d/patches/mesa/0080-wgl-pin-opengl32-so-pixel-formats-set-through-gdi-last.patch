@@ -22,7 +22,7 @@ Evidence: docs/gzdoom.md, docs/evidence/gzdoom/ (src/gzgl.c).
 Origin: vmlab-win3d gzdoom worker.
 ---
 diff --git a/src/gallium/frontends/wgl/stw_device.c b/src/gallium/frontends/wgl/stw_device.c
-index 24fd03d..dbb98c3 100644
+index 24fd03d..c26ca6d 100644
 --- a/src/gallium/frontends/wgl/stw_device.c
 +++ b/src/gallium/frontends/wgl/stw_device.c
 @@ -299,5 +299,27 @@ DrvValidateVersion(ULONG ulVersion)

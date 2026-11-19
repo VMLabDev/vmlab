@@ -90,7 +90,8 @@ GPU_INC=(/I"$SRC/viogpu/common" /I"$SRC/viogpu/shared" /I"$SRC/VirtIO" /I"$SRC/v
          /DVIOGPU_3D=1 /std:c++17)
 for f in common/edid.cpp common/viogpu_idr.cpp common/viogpu_pci.cpp common/viogpu_queue.cpp \
          viogpu3d/driver.cpp viogpu3d/viogpu_command.cpp viogpu3d/viogpu_device.cpp \
-         viogpu3d/viogpu_allocation.cpp viogpu3d/viogpu_adapter.cpp \
+         viogpu3d/viogpu_allocation.cpp viogpu3d/viogpu_blob_user_view.cpp \
+         viogpu3d/viogpu_adapter.cpp \
          viogpu3d/viogpu_shmem_allocator.cpp common/baseobj.cpp common/bitops.cpp \
          viogpu3d/viogpu_vidpn.cpp; do
     cc "$OBJ/viogpu3d" "$SRC/viogpu/$f" "${GPU_INC[@]}"

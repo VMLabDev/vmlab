@@ -36,10 +36,10 @@ Evidence: docs/shaders2.md, docs/evidence/shaders2/.
 Origin: vmlab-win3d shaders2 worker.
 ---
 diff --git a/src/gallium/auxiliary/nir/tgsi_to_nir.c b/src/gallium/auxiliary/nir/tgsi_to_nir.c
-index 7d41b4c..3bb86a5 100644
+index c3cc1d2..1e1afd1 100644
 --- a/src/gallium/auxiliary/nir/tgsi_to_nir.c
 +++ b/src/gallium/auxiliary/nir/tgsi_to_nir.c
-@@ -923,6 +923,27 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
+@@ -924,6 +924,27 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
           nir_variable *var = c->outputs[index];
           nir_deref_instr *deref;
  
@@ -68,10 +68,10 @@ index 7d41b4c..3bb86a5 100644
              deref = ttn_array_deref(c, var, c->output_regs[index].offset,
                                      indirect);
 diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-index 7f82f53..f3c7fab 100644
+index f7c1947..fa06c16 100644
 --- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
 +++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-@@ -464,6 +464,11 @@ struct Shader_xlate {
+@@ -465,6 +465,11 @@ struct Shader_xlate {
     } outputs[SHADER_MAX_OUTPUTS];
     bool has_gs_scalar_outputs;
     unsigned tcs_tess_factor_writemask[SHADER_MAX_OUTPUTS];
@@ -83,7 +83,7 @@ index 7f82f53..f3c7fab 100644
     unsigned tcs_tess_factor_range_first[SHADER_MAX_OUTPUTS];
     unsigned tcs_tess_factor_range_end[SHADER_MAX_OUTPUTS];
     struct {
-@@ -1152,6 +1157,20 @@ tessellation_translation_unsupported(struct Shader_xlate *sx,
+@@ -1153,6 +1158,20 @@ tessellation_translation_unsupported(struct Shader_xlate *sx,
     sx->translation_failed = true;
  }
  
@@ -104,7 +104,7 @@ index 7f82f53..f3c7fab 100644
  static void
  dcl_tess_input(struct Shader_xlate *sx,
                 struct ureg_program *ureg,
-@@ -1209,8 +1228,7 @@ dcl_tess_input(struct Shader_xlate *sx,
+@@ -1210,8 +1229,7 @@ dcl_tess_input(struct Shader_xlate *sx,
               * lower it to a TCS output load instead of declaring a second
               * shader input interface.
               */
@@ -114,7 +114,7 @@ index 7f82f53..f3c7fab 100644
           } else {
              sx->patch_inputs[input].reg =
                 ureg_DECL_input(ureg, TGSI_SEMANTIC_PATCH, input, 0, 1);
-@@ -1412,6 +1430,7 @@ dcl_tcs_tess_factor_output(struct Shader_xlate *sx,
+@@ -1413,6 +1431,7 @@ dcl_tcs_tess_factor_output(struct Shader_xlate *sx,
     for (unsigned i = 0; i < 4; ++i)
        sx->outputs[output].reg[i] = reg;
     sx->tcs_tess_factor_writemask[output] = writemask;
@@ -122,7 +122,7 @@ index 7f82f53..f3c7fab 100644
  }
  
  static void
-@@ -2264,7 +2283,7 @@ patch_input_reg(struct Shader_xlate *sx, uint input)
+@@ -2265,7 +2284,7 @@ patch_input_reg(struct Shader_xlate *sx, uint input)
              sx, "patch-input-has-no-prior-output");
           return ureg_src(sx->outputs[0].reg[0]);
        }
@@ -132,10 +132,10 @@ index 7f82f53..f3c7fab 100644
        sx->patch_inputs[input].reg =
           ureg_DECL_input(sx->ureg, TGSI_SEMANTIC_PATCH, input, 0, 1);
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_shader.c b/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
-index e4a778d..c4d7c10 100644
+index 4b0c688..7c42689 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
-@@ -1391,6 +1391,23 @@ yttrium_tgsi_explicit_sview_src_supported_for_ttn(
+@@ -1093,6 +1093,23 @@ yttrium_tgsi_explicit_sview_src_supported_for_ttn(
            opcode == TGSI_OPCODE_SAMPLE_C_LZ;
  }
  
@@ -159,7 +159,7 @@ index e4a778d..c4d7c10 100644
  static bool
  yttrium_shader_preflight_tgsi_for_nir(
     const struct yttrium_shader_state *shader,
-@@ -1513,8 +1530,13 @@ yttrium_shader_preflight_tgsi_for_nir(
+@@ -1215,8 +1232,13 @@ yttrium_shader_preflight_tgsi_for_nir(
              goto out;
           }
  

@@ -41,10 +41,10 @@ Evidence: docs/d3d11-apps.md, docs/evidence/d3d11-apps/.
 Origin: vmlab-win3d fix-d3d11-apps worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-index 0ad98f1..246fc1b 100644
+index 94076a7..05636e4 100644
 --- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
 +++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-@@ -928,14 +928,24 @@ dcl_input_index_range(struct Shader_xlate *sx,
+@@ -929,14 +929,24 @@ dcl_input_index_range(struct Shader_xlate *sx,
     const struct Shader_dst_operand *dst = &opcode->dst[0];
     uint first, count;
  
@@ -73,7 +73,7 @@ index 0ad98f1..246fc1b 100644
     count = opcode->specific.index_range_count;
     if (!count || first >= SHADER_MAX_INPUTS ||
         count > SHADER_MAX_INPUTS - first) {
-@@ -968,8 +978,7 @@ dcl_tcs_tess_factor_index_range(struct Shader_xlate *sx,
+@@ -969,8 +979,7 @@ dcl_tcs_tess_factor_index_range(struct Shader_xlate *sx,
     if (!sx->is_tcs || !sx->tcs_patch_phase_active ||
         dst->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT ||
         dst->base.index_dim != 1 ||
@@ -83,7 +83,7 @@ index 0ad98f1..246fc1b 100644
        SHADER_TRANSLATION_UNSUPPORTED(sx, true);
        return;
     }
-@@ -984,9 +993,18 @@ dcl_tcs_tess_factor_index_range(struct Shader_xlate *sx,
+@@ -985,9 +994,18 @@ dcl_tcs_tess_factor_index_range(struct Shader_xlate *sx,
  
     /* D3D scalar tessellation-factor registers are packed into components
      * of TGSI TESSOUTER/TESSINNER, not consecutive TGSI output registers.
@@ -103,7 +103,7 @@ index 0ad98f1..246fc1b 100644
           SHADER_TRANSLATION_UNSUPPORTED(sx, true);
           return;
        }
-@@ -1110,6 +1128,17 @@ dcl_tess_input(struct Shader_xlate *sx,
+@@ -1111,6 +1129,17 @@ dcl_tess_input(struct Shader_xlate *sx,
        return;
     }
  
@@ -121,7 +121,7 @@ index 0ad98f1..246fc1b 100644
     if (dst->base.type == DX11_SM5_OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
        if (dst->base.index_dim != 1 ||
            dst->base.index[0].index_rep !=
-@@ -2009,7 +2038,8 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
+@@ -2010,7 +2039,8 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
           index->index_rep == D3D10_SB_OPERAND_INDEX_RELATIVE ? 0 : index->imm;
        if (base >= SHADER_MAX_OUTPUTS ||
            sx->tcs_tess_factor_range_end[base] <= base ||
@@ -131,7 +131,7 @@ index 0ad98f1..246fc1b 100644
           SHADER_TRANSLATION_UNSUPPORTED(sx, true);
           return;
        }
-@@ -2036,6 +2066,31 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
+@@ -2037,6 +2067,31 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
     }
  }
  
@@ -163,7 +163,7 @@ index 0ad98f1..246fc1b 100644
  static void
  emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
  {
-@@ -2051,6 +2106,9 @@ emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
+@@ -2052,6 +2107,9 @@ emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
           ureg_src(sx->tcs_indexed_output_stores[slot].index), TGSI_SWIZZLE_X);
        const struct ureg_src value = ureg_scalar(
           ureg_src(sx->tcs_indexed_output_stores[slot].value), TGSI_SWIZZLE_X);
@@ -173,7 +173,7 @@ index 0ad98f1..246fc1b 100644
  
        for (unsigned output = first; output < end; ++output) {
           unsigned label = 0;
-@@ -2058,10 +2116,19 @@ emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
+@@ -2059,10 +2117,19 @@ emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
                      index, ureg_imm1u(ureg, output));
           ureg_UIF(ureg, ureg_scalar(ureg_src(predicate), TGSI_SWIZZLE_X),
                     &label);
@@ -197,7 +197,7 @@ index 0ad98f1..246fc1b 100644
           ureg_ENDIF(ureg);
        }
        ureg_release_temporary(ureg, sx->tcs_indexed_output_stores[slot].index);
-@@ -2110,6 +2177,73 @@ translate_indexed_input(struct Shader_xlate *sx,
+@@ -2111,6 +2178,73 @@ translate_indexed_input(struct Shader_xlate *sx,
     return ureg_src(selected);
  }
  
@@ -271,7 +271,7 @@ index 0ad98f1..246fc1b 100644
  static struct ureg_dst
  translate_operand(struct Shader_xlate *sx,
                    const struct Shader_operand *operand,
-@@ -2458,44 +2592,31 @@ translate_src_operand(struct Shader_xlate *sx,
+@@ -2459,44 +2593,31 @@ translate_src_operand(struct Shader_xlate *sx,
           assert(operand->base.index_dim == 2);
           assert(operand->base.index[1].imm < SHADER_MAX_INPUTS);
  

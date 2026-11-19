@@ -13,7 +13,7 @@ Origin: codex working tree R/mesa (git diff 374c3022), re-exported by
 vmlab-win3d build/mesa; see build/mesa/README.md.
 ---
 diff --git a/src/util/u_queue.c b/src/util/u_queue.c
-index 1ccf4af1ad82bb34f5bc76f7877c9cfe84bdf2eb..4326a7d62702174fcdb3a458b9e7538ef773a63e 100644
+index 1ccf4af..4326a7d 100644
 --- a/src/util/u_queue.c
 +++ b/src/util/u_queue.c
 @@ -34,6 +34,10 @@
@@ -143,7 +143,7 @@ index 1ccf4af1ad82bb34f5bc76f7877c9cfe84bdf2eb..4326a7d62702174fcdb3a458b9e7538e
  
  static void
 diff --git a/src/util/u_queue.h b/src/util/u_queue.h
-index 7cbb89cdec3a638559e7821ac72585555c52152a..6044ab7c03d9df96d140af7399ce543785f078a1 100644
+index 7cbb89c..6044ab7 100644
 --- a/src/util/u_queue.h
 +++ b/src/util/u_queue.h
 @@ -228,6 +228,9 @@ struct util_queue {

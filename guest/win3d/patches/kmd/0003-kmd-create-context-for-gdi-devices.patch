@@ -14,7 +14,21 @@ the context creation immediately.
 
 The changed upstream file retains its MPL-2.0 licence.
 ---
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index c830870..3d7005b 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -980,7 +980,7 @@ VioGpu3DCreateDevice(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEDEVICE *p
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+ 
+     VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
+-    if (!pAdapter->IsDriverActive())
++    if (!pAdapter->IsDriverActive() || !pAdapter->IsHardwareInit())
+     {
+         DbgPrint(TRACE_LEVEL_ERROR,
+                  ("<---> %s VioGpu (%p) is being called when not active!\n", __FUNCTION__, pAdapter));
 diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index dae998c..ba5e6a8 100644
 --- a/viogpu/viogpu3d/viogpu_device.cpp
 +++ b/viogpu/viogpu3d/viogpu_device.cpp
 @@ -23,7 +23,11 @@ VioGpuDevice::VioGpuDevice(VioGpuAdapter *pAdapter)
@@ -27,18 +41,6 @@ diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.c
 +    // Init replaces it when a UMD requests another capset.
 +    m_pAdapter->ctrlQueue.CreateCtx(m_id, 0);
 +    m_context_created = true;
+     m_clockPublisher.Generation = 0;
  }
  
- VioGpuDevice::~VioGpuDevice()
-diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
---- a/viogpu/viogpu3d/driver.cpp
-+++ b/viogpu/viogpu3d/driver.cpp
-@@ -973,7 +973,7 @@ VioGpu3DCreateDevice(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEDEVICE *pCreateDevice)
-     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
- 
-     VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
--    if (!pAdapter->IsDriverActive())
-+    if (!pAdapter->IsDriverActive() || !pAdapter->IsHardwareInit())
-     {
-         DbgPrint(TRACE_LEVEL_ERROR,
-                  ("<---> %s VioGpu (%p) is being called when not active!\n", __FUNCTION__, pAdapter));

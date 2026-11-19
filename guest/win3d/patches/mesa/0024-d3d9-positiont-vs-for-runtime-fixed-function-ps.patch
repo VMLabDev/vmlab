@@ -22,10 +22,10 @@ path=ff-rhw-diffuse).
 Origin: vmlab-win3d nvtex worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
-index c6bba44..4069ec6 100644
+index 2b9eea9..6b80729 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
-@@ -537,7 +537,7 @@ static bool
+@@ -554,7 +554,7 @@ static bool
  D3D9CanUsePositionTDiffuseFixedFunction(const D3D9Device *device);
  
  static bool
@@ -34,7 +34,7 @@ index c6bba44..4069ec6 100644
     const D3D9Device *device, const D3D9Object *ps, D3D9Object *vs_shader);
  
  static bool
-@@ -876,25 +876,30 @@ D3D9CanUsePositionTDiffuseFixedFunction(const D3D9Device *device)
+@@ -893,25 +893,30 @@ D3D9CanUsePositionTDiffuseFixedFunction(const D3D9Device *device)
  }
  
  static bool
@@ -77,7 +77,7 @@ index c6bba44..4069ec6 100644
     const D3D9Object *decl = (const D3D9Object *)device->vertex_shader_decl;
     if (!decl || decl->kind != D3D9_OBJECT_VERTEX_DECL)
        return false;
-@@ -902,35 +907,30 @@ D3D9InitPositionTTexture0RuntimePsFixedFunctionVsInfo(
+@@ -919,35 +924,30 @@ D3D9InitPositionTTexture0RuntimePsFixedFunctionVsInfo(
     const D3DDDIVERTEXELEMENT *elements =
        (const D3DDDIVERTEXELEMENT *)decl->data;
     const UINT element_count = (UINT)(decl->size / sizeof(*elements));
@@ -127,7 +127,7 @@ index c6bba44..4069ec6 100644
  }
  
  static bool
-@@ -1081,6 +1081,27 @@ D3D9InitPositionTDiffuseFixedFunctionVsInfo(D3D9Object *shader)
+@@ -1098,6 +1098,27 @@ D3D9InitPositionTDiffuseFixedFunctionVsInfo(D3D9Object *shader)
     shader->translated_vs_input_map[1] = NINE_DECLUSAGE_i(COLOR, 0);
  }
  
@@ -155,7 +155,7 @@ index c6bba44..4069ec6 100644
  static void *
  D3D9CreatePositionTPsInputFixedFunctionVs(D3D9Device *device,
                                            const D3D9Object *shader)
-@@ -1140,7 +1161,14 @@ D3D9CreatePositionTPsInputFixedFunctionVs(D3D9Device *device,
+@@ -1154,7 +1175,14 @@ D3D9CreatePositionTPsInputFixedFunctionVs(D3D9Device *device,
  
        struct ureg_dst output =
           ureg_DECL_output(ureg, (enum tgsi_semantic)semantic, index);
@@ -171,7 +171,7 @@ index c6bba44..4069ec6 100644
     }
  
     ureg_release_temporary(ureg, tmp);
-@@ -2756,10 +2784,10 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
+@@ -2775,10 +2803,10 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
        D3D9CanUsePositionTDiffuseFixedFunction(device);
     const D3D9Object *current_ps =
        translated_ps ? (const D3D9Object *)device->pixel_shader : NULL;
@@ -184,7 +184,7 @@ index c6bba44..4069ec6 100644
           device, current_ps, &fixed_function_vs_shader);
     /* DrawPrimitive2 can carry runtime-processed SWVP vertices. */
     const bool generate_position_t_runtime_processed_diffuse_vs =
-@@ -2780,13 +2808,13 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
+@@ -2799,13 +2827,13 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
      */
     const bool replace_position_t_runtime_ff_vs =
        runtime_fixed_function_pair && D3D9ActiveVertexDeclHasPositionT(device) &&
@@ -200,7 +200,7 @@ index c6bba44..4069ec6 100644
          !generate_position_t_runtime_processed_diffuse_vs &&
          !generate_position_t_runtime_processed_vs &&
          !replace_position_t_runtime_ff_vs) || !translated_ps)
-@@ -2806,7 +2834,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
+@@ -2825,7 +2853,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
        translated_ps ? (const D3D9Object *)device->pixel_shader : NULL;
     const D3D9Object *translated_vs_shader =
        (generate_position_t_ps_input_vs || generate_position_t_diffuse_vs ||
@@ -209,7 +209,7 @@ index c6bba44..4069ec6 100644
         generate_position_t_runtime_processed_diffuse_vs ||
         generate_position_t_runtime_processed_vs ||
         replace_position_t_runtime_ff_vs) ?
-@@ -2883,7 +2911,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
+@@ -2902,7 +2930,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
        mode == MESA_PRIM_POINTS &&
        (translated_vs_point_size || D3D9PointSize(device) > 1.0f);
     if (generate_position_t_ps_input_vs || generate_position_t_diffuse_vs ||
@@ -218,7 +218,7 @@ index c6bba44..4069ec6 100644
         generate_position_t_runtime_processed_diffuse_vs ||
         generate_position_t_runtime_processed_vs ||
         replace_position_t_runtime_ff_vs) {
-@@ -2891,7 +2919,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
+@@ -2910,7 +2938,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
           (generate_position_t_ps_input_vs ||
            replace_position_t_runtime_ff_vs ||
            generate_position_t_runtime_processed_vs ||
