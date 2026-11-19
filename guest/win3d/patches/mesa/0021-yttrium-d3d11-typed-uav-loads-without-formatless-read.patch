@@ -15,7 +15,7 @@ index 945ced1..e850214 100644
        }
        break;
 diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
-index d058855..12721fe 100644
+index d058855..e92cf84 100644
 --- a/src/gallium/frontends/d3d10umd/Device.cpp
 +++ b/src/gallium/frontends/d3d10umd/Device.cpp
 @@ -53,6 +53,10 @@
@@ -114,7 +114,7 @@ index d058855..12721fe 100644
 +   bool supported = true;
 +   for (unsigned i = 0; i < ARRAY_SIZE(TypedUavLoadAdditionalFormats); ++i) {
 +      if (!yttrium_venus_storage_image_formatless_format_supported(
-+             venus, TypedUavLoadAdditionalFormats[i], true, true)) {
++             venus, TypedUavLoadAdditionalFormats[i], true, true, false)) {
 +         supported = false;
 +         break;
 +      }
@@ -197,7 +197,7 @@ index 79dd5c5..39e204e 100644
        }
        if (!src)
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_screen.c b/src/gallium/winsys/yttrium/gdi/yttrium_screen.c
-index 93c577b..23f5234 100644
+index 93c577b..4b59fd7 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_screen.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_screen.c
 @@ -55,8 +55,16 @@ yttrium_gdi_screen_supports_typed_image_load(struct pipe_screen *pscreen,
@@ -207,7 +207,7 @@ index 93c577b..23f5234 100644
 -   return yttrium_venus_storage_image_formatless_format_supported(
 -      screen->venus, format, true, true);
 +   if (yttrium_venus_storage_image_formatless_format_supported(
-+          screen->venus, format, true, true))
++          screen->venus, format, true, true, false))
 +      return true;
 +   /* Without shaderStorageImageReadWithoutFormat, a loaded R32 image is
 +    * declared with its format (yttrium_shader_lower_formatless_images). */
