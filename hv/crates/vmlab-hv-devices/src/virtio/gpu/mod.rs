@@ -4,6 +4,7 @@
 //! while the PCI transport owns another clone. The default 2D mode needs no GPU.
 
 mod modifiers;
+mod pacer;
 mod renderer;
 mod scanout;
 pub use scanout::DmaFrame;
@@ -137,6 +138,21 @@ struct State {
     display: Option<Arc<dyn DisplaySink>>,
     retry_display: bool,
     display_timestamp: u64,
+    /// Publishes 2D flushes off the thread that serves the queue. `None`
+    /// until a display sink is set: a flush then publishes where it stands.
+    pacer: Option<Arc<pacer::Pacer>>,
+    /// The command timestamp of the newest 2D flush that no published
+    /// frame holds yet.
+    flush_pending: Option<u64>,
+    last_publish: Option<std::time::Instant>,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some(pacer) = &self.pacer {
+            pacer.close();
+        }
+    }
 }
 
 /// One output and two queues. `enable_3d` adds virgl, Venus and blob resources.
@@ -172,6 +188,9 @@ impl Gpu {
                 display: None,
                 retry_display: false,
                 display_timestamp: 0,
+                pacer: None,
+                flush_pending: None,
+                last_publish: None,
             })),
         }
     }
@@ -216,8 +235,19 @@ impl Gpu {
         })
     }
 
+    /// Publish scanout changes to `sink`. From here on a 2D flush only
+    /// records its damage, and a frame thread composes and publishes at
+    /// most one frame per [`pacer::FRAME_INTERVAL`].
     pub fn set_display_sink(&self, sink: Arc<dyn DisplaySink>) {
-        self.state.lock().display = Some(sink);
+        let mut s = self.state.lock();
+        s.display = Some(sink);
+        if s.pacer.is_none() {
+            match pacer::Pacer::spawn(&self.id, Arc::downgrade(&self.state)) {
+                Ok(pacer) => s.pacer = Some(pacer),
+                // Without the thread every flush publishes its own frame.
+                Err(error) => log::warn!("{}: no frame thread: {error}", self.id),
+            }
+        }
     }
 
     pub fn poll_scanout(&self) -> bool {
@@ -345,6 +375,9 @@ impl State {
         let Some(sink) = self.display.clone() else {
             return;
         };
+        // This frame holds every flush that came before it.
+        self.flush_pending = None;
+        self.last_publish = Some(std::time::Instant::now());
         let mut damage = Vec::new();
         let pixels = if let Some(renderer) = &self.renderer {
             let Ok(Some((generation, rectangles))) = renderer.take_damage() else {
@@ -387,6 +420,37 @@ impl State {
             damage,
             pixels,
         });
+    }
+}
+
+impl State {
+    /// A 2D flush changed the scanout at `timestamp_ns`. Leave the compose
+    /// to the frame thread, which runs it once for all the flushes of one
+    /// frame interval.
+    fn schedule_flush(&mut self, timestamp_ns: u64) {
+        let Some(pacer) = self.pacer.clone() else {
+            return self.publish_scanout(timestamp_ns);
+        };
+        self.flush_pending = Some(timestamp_ns);
+        pacer.request(self.frame_due(std::time::Instant::now()));
+    }
+
+    /// When the next frame may be published.
+    fn frame_due(&self, now: std::time::Instant) -> std::time::Instant {
+        self.last_publish
+            .map_or(now, |last| (last + pacer::FRAME_INTERVAL).max(now))
+    }
+
+    /// The frame thread's turn: publish the pending flushes, or return the
+    /// time to come back at when a frame was published too recently.
+    fn publish_pending(&mut self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let timestamp_ns = self.flush_pending?;
+        let due = self.frame_due(now);
+        if due > now {
+            return Some(due);
+        }
+        self.publish_scanout(timestamp_ns);
+        None
     }
 }
 
@@ -752,13 +816,14 @@ impl State {
         if writer.write_all(&response).is_err() {
             return 0;
         }
-        if kind < 0x1200
-            && matches!(
-                u32::from_le_bytes(request[..4].try_into().unwrap()),
-                0x102..=0x104 | 0x10d
-            )
-        {
-            self.publish_scanout(timestamp_ns);
+        if kind < 0x1200 {
+            match u32::from_le_bytes(request[..4].try_into().unwrap()) {
+                // A guest flushes many times in one frame. The renderer
+                // keeps its own damage, so its flushes publish here.
+                0x104 if self.renderer.is_none() => self.schedule_flush(timestamp_ns),
+                0x102..=0x104 | 0x10d => self.publish_scanout(timestamp_ns),
+                _ => {}
+            }
         }
         response.len() as u32
     }
@@ -916,6 +981,7 @@ impl VirtioDevice for Gpu {
             log::error!("GPU reset failed: {error:#x}");
         }
         s.fences.clear();
+        s.flush_pending = None;
         s.retry_display = false;
         s.acked = 0;
         s.events = 0;

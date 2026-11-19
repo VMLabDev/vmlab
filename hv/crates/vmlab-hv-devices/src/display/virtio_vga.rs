@@ -6,6 +6,11 @@
 //! BAR0 is 8 MiB and prefetchable. Preserve its config-space bit 3 in the root.
 //! ROM_BAR is the expansion ROM. Load `/usr/share/qemu/vgabios-virtio.bin`
 //! from SeaVGABIOS on the host and pass its bytes to `new`.
+//!
+//! The 2D device serves its queues on a worker thread
+//! ([`crate::virtio::worker::QueueWorker`]), and the kernel can deliver the
+//! kicks ([`VirtioVga::set_queue_doorbells`]). With `enable_3d` the queues
+//! are served on the thread that kicks, as the renderer has its own thread.
 
 use super::{Frame, Mode, ROM_BAR, ROM_SIZE, StandardVga};
 use crate::virtio::{
@@ -29,6 +34,28 @@ pub struct VirtioVga {
     accelerated: bool,
     aperture_size: u64,
     power_on_config: [u8; 256],
+    /// What a second transport is built from when `enable_3d` replaces the
+    /// first.
+    wiring: Wiring,
+}
+
+#[derive(Clone)]
+struct Wiring {
+    mem: GuestMemory,
+    msi: Option<Arc<dyn MsiSink>>,
+    intx: Option<Arc<dyn IrqLine>>,
+}
+
+impl Wiring {
+    fn transport(&self, id: &str, device: Box<dyn crate::VirtioDevice>) -> VirtioPciDevice {
+        VirtioPciDevice::new(
+            format!("{id}.transport"),
+            device,
+            self.mem.clone(),
+            self.msi.clone(),
+            self.intx.clone(),
+        )
+    }
 }
 
 impl VirtioVga {
@@ -42,13 +69,11 @@ impl VirtioVga {
         let id = id.into();
         let vga = StandardVga::new(format!("{id}.vga"), rom)?;
         let gpu = Gpu::new(format!("{id}.gpu"));
-        let transport = VirtioPciDevice::new(
-            format!("{id}.transport"),
-            Box::new(gpu.clone()),
-            mem,
-            msi,
-            intx,
-        );
+        let wiring = Wiring { mem, msi, intx };
+        // A 2D command copies and converts pixels. On the worker it does
+        // not hold the vCPU that kicked.
+        let worker = crate::virtio::worker::QueueWorker::new(Box::new(gpu.clone()))?;
+        let transport = wiring.transport(&id, Box::new(worker));
         let mut config = [0; 256];
         config[..4].copy_from_slice(&[0xf4, 0x1a, 0x50, 0x10]);
         config[6] = 0x10;
@@ -88,6 +113,7 @@ impl VirtioVga {
             accelerated: false,
             aperture_size: crate::virtio::gpu::APERTURE_SIZE,
             power_on_config: config,
+            wiring,
         })
     }
 
@@ -100,6 +126,10 @@ impl VirtioVga {
         let size = mapper.size();
         vmlab_hv_proto::machine::validate_gpu_vram_bytes(size).map_err(DeviceError::Other)?;
         self.gpu.enable_3d(mode, node, mapper)?;
+        // The device offers other features now, and the worker read them
+        // when it was made. The guest has not run yet, so the first
+        // transport holds no state.
+        self.transport = self.wiring.transport(&self.id, Box::new(self.gpu.clone()));
         self.aperture_size = size;
         self.accelerated = true;
         self.config[0x34] = 0xa4;
@@ -117,6 +147,12 @@ impl VirtioVga {
     }
     pub fn accelerated(&self) -> bool {
         self.accelerated
+    }
+
+    /// Let the kernel deliver the queue kicks of the 2D device. Call it
+    /// after `enable_3d`, which replaces the transport.
+    pub fn set_queue_doorbells(&mut self, doorbells: Box<dyn crate::QueueDoorbells>) {
+        self.transport.set_queue_doorbells(doorbells);
     }
 
     pub fn dma_frame(&self) -> Result<Option<crate::virtio::gpu::DmaFrame>, DeviceError> {
@@ -212,6 +248,15 @@ impl VirtioVga {
 }
 
 impl PciDevice for VirtioVga {
+    fn set_bar_address(&mut self, bar: u8, address: Option<u64>) {
+        // The transport's notify region is at 0x1000 of its own BAR and at
+        // NOTIFY of BAR2 here, so the transport's BAR would start that far
+        // into BAR2.
+        if bar == 2 {
+            self.transport
+                .set_bar_address(4, address.map(|base| base + (NOTIFY - 0x1000)));
+        }
+    }
     fn config_read(&mut self, reg: usize) -> u32 {
         if reg >= 64 {
             return 0;
@@ -361,12 +406,18 @@ impl PciDevice for VirtioVga {
             }
         } else if let Some(off) = transport_offset(bar, offset, data.len()) {
             self.transport.bar_write(4, off, data);
-            if !self.gpu.native() {
+            // A kick does not bring the VGA scanout back, and its commands
+            // may still run: asking the GPU here would wait for them.
+            let kick = bar == 2 && (NOTIFY..NOTIFY + 0x1000).contains(&offset);
+            if !kick && !self.gpu.native() {
                 self.vga.dirty = true;
             }
         }
     }
 }
+
+/// Offset of the virtio notify region in BAR2.
+const NOTIFY: u64 = 0x3000;
 
 fn transport_offset(bar: u8, off: u64, len: usize) -> Option<u64> {
     let (start, end, dest) = match (bar, off) {
@@ -384,6 +435,12 @@ fn transport_offset(bar: u8, off: u64, len: usize) -> Option<u64> {
 }
 
 impl Snapshot for VirtioVga {
+    fn quiesce(&mut self) {
+        PciSnapshot::quiesce(&mut self.transport);
+    }
+    fn resume_snapshot(&mut self) {
+        PciSnapshot::resume_snapshot(&mut self.transport);
+    }
     fn state_id(&self) -> String {
         self.id.clone()
     }
@@ -439,6 +496,12 @@ impl crate::Resettable for VirtioVga {
 }
 
 impl PciSnapshot for VirtioVga {
+    fn quiesce(&mut self) {
+        Snapshot::quiesce(self);
+    }
+    fn resume_snapshot(&mut self) {
+        Snapshot::resume_snapshot(self);
+    }
     fn snapshot_id(&self) -> String {
         self.id.clone()
     }
