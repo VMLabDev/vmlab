@@ -28,6 +28,29 @@ fn exec(guest: &mut AgentClient, script: &str) -> String {
     String::from_utf8(result.stdout).unwrap().trim().into()
 }
 
+/// OpenCore's `Booter > Quirks > ProvideCustomSlide` in the booted template,
+/// read from the EFI system partition: `true`, `false`, or what went wrong.
+///
+/// vmlab#200: boot.efi draws a random KASLR slide and loads the kernel at
+/// 1 MiB + slide x 2 MiB. OVMF keeps its firmware volumes at 8 to 23.5 MiB,
+/// so the 12 lowest of the 256 slides have no free memory, and boot.efi then
+/// shows the prohibited sign and waits for ever: one boot in 21. This quirk
+/// is what keeps boot.efi to the slides that fit.
+fn provide_custom_slide(guest: &mut AgentClient) -> String {
+    let script = "d=/tmp/vmlab-esp; mkdir -p $d && \
+        diskutil mount readOnly -mountPoint $d disk0s1 >/dev/null && \
+        plutil -extract Booter.Quirks.ProvideCustomSlide raw $d/EFI/OC/config.plist; \
+        diskutil unmount $d >/dev/null";
+    match guest.exec(&["/bin/sh", "-c", script], Duration::from_secs(60)) {
+        Ok(result) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout).trim(),
+            String::from_utf8_lossy(&result.stderr).trim()
+        ),
+        Err(error) => error,
+    }
+}
+
 fn control(client: &mut Client, command: Control) {
     let result = client.call(command).unwrap();
     assert!(matches!(result, Outcome::Ok { .. }), "{result:?}");
@@ -394,9 +417,9 @@ fn launch_macos(path: &Path, template: &Path, firmware: &Path, key: &str) -> Lau
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
-    // The live macOS boot is intermittent (OpenCore and early-boot stalls) and is
-    // parked under https://github.com/VMLabDev/vmlab/issues/200, so it runs only on
-    // request until that issue is picked up.
+    // Opt-in while https://github.com/VMLabDev/vmlab/issues/200 is open: its
+    // intermittent stall is the template's (see `provide_custom_slide`), and
+    // this test has yet to pass ten times in a row on a rebuilt template.
     if std::env::var_os("VMLAB_HV_MACOS_ACCEPTANCE").is_none() {
         eprintln!(
             "skipping macOS P1: opt-in while parked under vmlab#200; set VMLAB_HV_MACOS_ACCEPTANCE=1"
@@ -477,6 +500,13 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
     assert_eq!(
         exec(&mut guest, "printf macos-agent-ready"),
         "macos-agent-ready"
+    );
+    // This boot drew a slide that fits; without the quirk the next one may not.
+    assert_eq!(
+        provide_custom_slide(&mut guest),
+        "true",
+        "the macos-tahoe template boots with OpenCore's ProvideCustomSlide off, so one boot in 21 \
+         stops at the prohibited sign (vmlab#200): rebuild it with the quirk on"
     );
     let tsc = exec(&mut guest, "sysctl -n machdep.tsc.frequency");
     eprintln!("macOS P1 agent-ready; TSC Hz={tsc}");
@@ -743,9 +773,13 @@ fn dump_firmware_ram(client: &mut Client, destination: &Path) {
 
 /// vmlab#200 census: how often the macOS boot stalls before XNU.
 ///
-/// The stall #200 records first (the agent never answering with both vCPUs
-/// in firmware or OpenCore) comes before macOS reads the Apple SMC, so this
-/// boots with an obviously fake key: no owner secret is involved. Each run
+/// The stall #200 records (the agent never answering with the vCPUs in
+/// firmware or OpenCore, and the prohibited sign on the screen) comes before
+/// macOS reads the Apple SMC, so this boots with an obviously fake key: no
+/// owner secret is involved. On helios it measured 15 stalls in 460 boots
+/// of `macos-tahoe@26.7.0`, never a slide below 17 in the boots that
+/// worked, and no stall in 180 boots once `ProvideCustomSlide` was on: see
+/// `hv/docs/macos-verification.md`. Each run
 /// boots a fresh overlay and samples every vCPU's RIP through the debug
 /// protocol until one reaches XNU or `VMLAB_HV_MACOS_STALL_TIMEOUT` (240 s)
 /// passes, and reports the time or the stall with its RIPs and a screenshot.
@@ -829,6 +863,12 @@ fn macos_boot_stall_census() {
             match AgentClient::connect(&vm.agent, wait) {
                 Ok(mut guest) => {
                     agent_times.push(started.elapsed().as_secs_f64());
+                    if run == 1 {
+                        eprintln!(
+                            "census: the template's ProvideCustomSlide is {}",
+                            provide_custom_slide(&mut guest)
+                        );
+                    }
                     // `VMLAB_HV_MACOS_STALL_EXEC=<sh script>` runs it in the
                     // guest, powers the guest down and keeps the overlay: a
                     // changed disk a later census boots as its template
