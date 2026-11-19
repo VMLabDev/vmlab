@@ -8,11 +8,15 @@ a few frames after the hand moved.
 With the registry value HWCursor set, which the driver already reads,
 report a 64x64 pointer in all three forms and implement both calls. The
 shape goes to a 64x64 2D resource; "use it", "move" and "hide" go to
-virtio-gpu's cursor queue (VIRTIO_GPU_CMD_UPDATE_CURSOR and
-VIRTIO_GPU_CMD_MOVE_CURSOR, a resource id of 0 for hidden). The upload is
-on the control queue and the commands are on the cursor queue, which the
-host reads independently, so the shape waits up to 250 ms for a no-op
-behind the upload.
+virtio-gpu's cursor queue. VIRTIO_GPU_CMD_UPDATE_CURSOR sets the image and
+shows or hides the pointer (a resource id of 0 hides it), and
+VIRTIO_GPU_CMD_MOVE_CURSOR only moves it: vmlab-hv ignores the resource id
+of a move, so a hide sent as a move left the pointer on the screen. The
+position sent is the hotspot's, the image's top left corner plus the
+hotspot, because that is what vmlab-hv's frame protocol and QEMU's GTK and
+SDL windows draw from. The upload is on the control queue and the commands
+are on the cursor queue, which the host reads independently, so the shape
+waits up to 250 ms for a no-op behind the upload.
 
 A host pointer cannot invert the screen under it, which is what the
 monochrome and masked-colour forms ask for (the text I-beam). Those pixels
@@ -28,8 +32,9 @@ The INF sets HWCursor to 1.
 
 From VMLabDev/vmlab issue 235, ported to tag yttrium-experimental-2026-11-02
 over 0004. Changed there: the reset path above, a mutex over the pointer
-state, and the "invert" pixels are kept in a bit mask so that no colour
-value is reserved for them.
+state, the hotspot position, hiding with UPDATE_CURSOR, and the "invert"
+pixels are kept in a bit mask so that no colour value is reserved for them.
+See docs/pointer.md.
 
 The changed upstream files retain their BSD-3-Clause and MPL-2.0 licences.
 ---
@@ -85,7 +90,7 @@ index ddd6f46..401f8a5 100644
  HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
  ; KMTUMDVERSION_DX12 is slot 3; preserve the existing DX9/DX10/DX11 UMDs.
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 7806089..c372f4e 100644
+index 7806089..e313939 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
 @@ -166,6 +166,15 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
@@ -137,7 +142,7 @@ index 7806089..c372f4e 100644
  
                  DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Driver caps return\n", __FUNCTION__));
                  return STATUS_SUCCESS;
-@@ -2672,6 +2686,275 @@ NTSTATUS VioGpuAdapter::GetRegisterInfo(void)
+@@ -2672,6 +2686,276 @@ NTSTATUS VioGpuAdapter::GetRegisterInfo(void)
  }
  PAGED_CODE_SEG_END
  
@@ -298,8 +303,11 @@ index 7806089..c372f4e 100644
 +    KeReleaseMutex(&m_CursorMutex, FALSE);
 +}
 +
-+// One command on the cursor queue. A resource id of 0 tells the host the pointer is hidden.
-+void VioGpuAdapter::SendCursor(ULONG type, BOOLEAN visible, ULONG hotX, ULONG hotY)
++// One command on the cursor queue. "Use this image" (define) also carries whether the pointer
++// shows: a resource id of 0 hides it, and only that command hides or shows it on every host.
++// The position is the hotspot's, which is what the hosts draw from: Windows gives the top left
++// corner of the image. The hotspot is never left of or above the screen.
++void VioGpuAdapter::SendCursor(BOOLEAN define)
 +{
 +    PAGED_CODE();
 +    PGPU_VBUFFER vbuf = NULL;
@@ -313,12 +321,12 @@ index 7806089..c372f4e 100644
 +        return;
 +    }
 +    RtlZeroMemory(crsr, sizeof(*crsr));
-+    crsr->hdr.type = type;
-+    crsr->resource_id = visible ? m_pCursorBuf->GetId() : 0;
-+    crsr->pos.x = (ULONG)max(m_CursorX, 0);
-+    crsr->pos.y = (ULONG)max(m_CursorY, 0);
-+    crsr->hot_x = hotX;
-+    crsr->hot_y = hotY;
++    crsr->hdr.type = define ? VIRTIO_GPU_CMD_UPDATE_CURSOR : VIRTIO_GPU_CMD_MOVE_CURSOR;
++    crsr->resource_id = (m_CursorVisible && m_CursorShapeSet) ? m_pCursorBuf->GetId() : 0;
++    crsr->pos.x = (ULONG)max(m_CursorX + (LONG)m_CursorHotX, 0);
++    crsr->pos.y = (ULONG)max(m_CursorY + (LONG)m_CursorHotY, 0);
++    crsr->hot_x = m_CursorHotX;
++    crsr->hot_y = m_CursorHotY;
 +    m_CursorQueue.QueueCursor(vbuf);
 +}
 +
@@ -338,11 +346,7 @@ index 7806089..c372f4e 100644
 +        timeout.QuadPart = -10000LL * 250; // 250 ms
 +        KeWaitForSingleObject(&m_CursorUploaded, Executive, KernelMode, FALSE, &timeout);
 +    }
-+    SendCursor(VIRTIO_GPU_CMD_UPDATE_CURSOR, TRUE, m_CursorHotX, m_CursorHotY);
-+    if (!m_CursorVisible)
-+    {
-+        SendCursor(VIRTIO_GPU_CMD_MOVE_CURSOR, FALSE, 0, 0);
-+    }
++    SendCursor(TRUE);
 +}
 +
 +// After a device reset (a timeout recovery, or D3 to D0) the host has neither the pointer's
@@ -394,15 +398,17 @@ index 7806089..c372f4e 100644
 +    }
 +    BOOLEAN visible = pPosition->Flags.Visible ? TRUE : FALSE;
 +    KeWaitForSingleObject(&m_CursorMutex, Executive, KernelMode, FALSE, NULL);
-+    if (visible != m_CursorVisible || pPosition->X != m_CursorX || pPosition->Y != m_CursorY)
++    if (visible != m_CursorVisible || (visible && (pPosition->X != m_CursorX || pPosition->Y != m_CursorY)))
 +    {
++        BOOLEAN define = visible != m_CursorVisible;
 +        m_CursorVisible = visible;
-+        m_CursorX = pPosition->X;
-+        m_CursorY = pPosition->Y;
-+        if (m_pCursorBuf != NULL)
++        if (visible)
 +        {
-+            SendCursor(VIRTIO_GPU_CMD_MOVE_CURSOR, visible, 0, 0);
++            // Windows gives no position with a hidden pointer.
++            m_CursorX = pPosition->X;
++            m_CursorY = pPosition->Y;
 +        }
++        SendCursor(define);
 +    }
 +    KeReleaseMutex(&m_CursorMutex, FALSE);
 +    return STATUS_SUCCESS;
@@ -413,7 +419,7 @@ index 7806089..c372f4e 100644
  PAGED_CODE_SEG_BEGIN
  
  NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
-@@ -2986,6 +3269,10 @@ NTSTATUS VioGpuAdapter::RestoreHostObjects()
+@@ -2986,6 +3270,10 @@ NTSTATUS VioGpuAdapter::RestoreHostObjects()
              return resetStatus;
          InvalidateHostObjects();
      }
@@ -424,7 +430,7 @@ index 7806089..c372f4e 100644
      return status;
  }
  
-@@ -3382,6 +3669,10 @@ NTSTATUS VioGpuAdapter::HWClose(void)
+@@ -3382,6 +3670,10 @@ NTSTATUS VioGpuAdapter::HWClose(void)
      StopWorkThread();
  
      frameSegment.Close();
@@ -436,7 +442,7 @@ index 7806089..c372f4e 100644
      DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s\n", __FUNCTION__));
  
 diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
-index 0b84a1d..99537f5 100644
+index 0b84a1d..fc90e75 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.h
 +++ b/viogpu/viogpu3d/viogpu_adapter.h
 @@ -133,6 +133,14 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
@@ -465,7 +471,7 @@ index 0b84a1d..99537f5 100644
 +    void DestroyCursor(void);
 +    void UploadCursor(void);
 +    void RestoreCursor(void);
-+    void SendCursor(ULONG type, BOOLEAN visible, ULONG hotX, ULONG hotY);
++    void SendCursor(BOOLEAN define);
 +
      NTSTATUS StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
                           _In_ DXGKRNL_INTERFACE *pDxgkInterface,
