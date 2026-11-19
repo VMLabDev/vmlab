@@ -659,6 +659,27 @@ def allocated_span(template_disk):
     return end
 
 
+def measure_udp_tx(agent, peer, guest_cpu):
+    """Measure delivered throughput with the sender pinned for the whole window."""
+    net = lib.BENCH_NET
+    peer.report()
+    log(f"starting net tx on guest CPU {guest_cpu}")
+    output = must_sh(
+        agent,
+        f"taskset -c {guest_cpu} python3 /tmp/vmlab-nettool.py udp-blast "
+        f"{net['peer_ip']} {net['port']} {net['udp_payload']} {NET_WINDOW}",
+        "net tx", timeout=NET_WINDOW * 3,
+    )
+    sent = json.loads(output.strip().splitlines()[-1])
+    time.sleep(NET_SETTLE)
+    received = peer.report()
+    if not sent["bytes"] or received["rx_bytes"] / sent["bytes"] < 0.9:
+        raise lib.BenchError(f"UDP delivery below 90%: sent={sent}, received={received}")
+    mbps = round(received["rx_bytes"] * 8 / NET_WINDOW / 1e6, 2)
+    log(f"finished net tx: {mbps} Mbit/s")
+    return mbps, sent, received
+
+
 def x86_one_repeat(args, guest, smp, pin, version, index):
     """One x86_64 VM through the full workload set for its guest."""
     lib.require_vm_slots()
@@ -675,7 +696,8 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
     # (the reference lab boots this template without a NIC; a jumbo-MTU
     # NIC on it wedges the first-boot reboot).
     peer = None if windows else netpeer.Peer(
-        run_dir, net["guest_ip"], net["guest_mac"], net["port"], log)
+        run_dir, net["guest_ip"], net["guest_mac"], net["port"], log,
+        cpu=netpeer.host_peer_cpu())
     switch_sock = None if windows else peer.switch_sock
     mtu = None if windows else net["mtu"]
     if args.backend == "qemu":
@@ -785,32 +807,7 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
 
 
             # --- virtio-net ------------------------------------------------
-            # TX: the guest blasts UDP at the peer; the peer counts the
-            # ethernet bytes that crossed the whole path (device, backend
-            # netdev, framing socket). A delivery below 90% of what the
-            # guest sent means the measurement is broken, not slow.
-            peer.report()  # reset counters
-            log("starting net tx")
-            out = must_sh(
-                agent,
-                f"python3 /tmp/vmlab-nettool.py udp-blast {net['peer_ip']} {net['port']} "
-                f"{net['udp_payload']} {NET_WINDOW}",
-                "net tx", timeout=NET_WINDOW * 3,
-            )
-            blast = json.loads(out.strip().splitlines()[-1])
-            time.sleep(NET_SETTLE)
-            rx = peer.report()
-            if blast["bytes"] == 0:
-                raise lib.BenchError(f"net tx blasted nothing: {blast}")
-            delivery = rx["rx_bytes"] / blast["bytes"]
-            if delivery < 0.9:
-                raise lib.BenchError(
-                    f"net tx delivery {delivery:.0%}: guest sent {blast['bytes']}, "
-                    f"peer saw {rx['rx_bytes']} ({blast.get('last_error')})"
-                )
-            samples["net_tx_udp_mbps"] = round(
-                rx["rx_bytes"] * 8 / NET_WINDOW / 1e6, 2)
-            log(f"finished net tx: {samples['net_tx_udp_mbps']} Mbit/s")
+            samples["net_tx_udp_mbps"], _, _ = measure_udp_tx(agent, peer, smp - 1)
 
             # RX: the peer blasts; the rate is read from the guest's own
             # interface counter (kernel-counted, immune to userspace sink
@@ -915,6 +912,9 @@ def x86_run_config(args, guest, smp, pin, version, commit, dirty, host):
     if guest.startswith("windows-"):
         env["readiness_probe_interval_s"] = WINDOWS_PROBE_INTERVAL
         env["repeat_host_sync_latency_ms"] = []
+    else:
+        env["udp_tx_guest_cpu"] = smp - 1
+        env["net_peer_cpu"] = netpeer.host_peer_cpu()
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} x86_64 {guest} smp={smp} repeat {i}/{args.repeats}")
         result, backend, agent = x86_one_repeat(args, guest, smp, pin, version, i)
