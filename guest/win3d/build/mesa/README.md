@@ -202,7 +202,7 @@ run on the September base (`374c3022`), and names patches as they were then:
 | unigl proof, Windows 11 on `Nvidia1` and `AMD1` (e2e, Unigine Heaven and Valley OpenGL) | 0001 to 0017, 0020 to 0027, 0030, 0035, 0040 to 0044, 0070, 0085, 0086 | `docs/unigl.md` |
 | unid3d proof, Windows 11 on `AMD1`, `Nvidia1` and `Nvidia2` (e2e, `d3d9_depthbias`, Unigine D3D9 and D3D11) | 0001 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0090 | `docs/unid3d.md` |
 | gzdoom proof, Windows 11 on `AMD1` and `Nvidia1` (e2e, `gzgl`, GZDoom OpenGL and Vulkan) | 0001 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0080; the `Nvidia1` runs add 0070 and 0086, the last e2e on each GPU adds 0070, 0086 and 0090 | `docs/gzdoom.md` |
-| November base, Windows 11 on `AMD1` and `Nvidia2` (e2e, and the static vertex buffer page of GitHub #233 in Edge) | The 43 patches of the series as it is now | `docs/acceptance.md`, "November base" |
+| November base, Windows 11 on `AMD1` and `Nvidia2` (e2e, and the static vertex buffer page of GitHub #233 in Edge) | 0001 to 0093 (43 patches) | `docs/acceptance.md`, "November base" |
 
 The nvtex proof run (2026-10-18) has the full series, 0001 to 0025, built by
 `scripts/build.sh` at commit [e428846](https://github.com/VMLabDev/vmlab-win3d/commit/e428846ccddaf01dba7efed9d057518f45c522fc). Before it, no recorded run had 0015
