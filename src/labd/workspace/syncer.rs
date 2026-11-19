@@ -4038,7 +4038,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("kept.rs"), "kept").unwrap();
         std::fs::write(dir.path().join("lost.rs"), "source nobody deleted").unwrap();
-        let (syncers, guest, _sessions) = seeded_lab(dir.path(), state.path(), "/src/lost.rs").await;
+        let (syncers, guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/lost.rs").await;
         let ledger_path = Ledger::path(state.path(), "dev01");
         let recorded = {
             let (path, root) = (ledger_path.clone(), dir.path().to_path_buf());
@@ -4091,7 +4092,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "agreed").unwrap();
         std::fs::write(dir.path().join("other.rs"), "other").unwrap();
-        let (syncers, guest, _sessions) = seeded_lab(dir.path(), state.path(), "/src/other.rs").await;
+        let (syncers, guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/other.rs").await;
         let ledger_path = Ledger::path(state.path(), "dev01");
         let on_disk = {
             let (path, root) = (ledger_path.clone(), dir.path().to_path_buf());

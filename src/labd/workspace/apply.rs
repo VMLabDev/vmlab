@@ -1280,7 +1280,10 @@ mod tests {
     /// copied again, and nothing is removed.
     #[tokio::test]
     async fn an_interrupted_pass_resumes_the_copy_and_deletes_nothing_on_the_host() {
-        let dir = workspace(&[("answered.rs", "kept on the host"), ("failed.rs", "also kept")]);
+        let dir = workspace(&[
+            ("answered.rs", "kept on the host"),
+            ("failed.rs", "also kept"),
+        ]);
         let guest = FakeGuest::new();
         let mut ledger = ledger_for(dir.path());
         guest.fail_push(&temp_beside("/src/failed.rs", false));
@@ -1302,7 +1305,10 @@ mod tests {
         assert_eq!(second.failures, vec![]);
         assert_eq!(second.to_host.removed, 0, "the host copy was deleted");
         assert_eq!(second.to_guest.placed, 2);
-        for (path, body) in [("answered.rs", "kept on the host"), ("failed.rs", "also kept")] {
+        for (path, body) in [
+            ("answered.rs", "kept on the host"),
+            ("failed.rs", "also kept"),
+        ] {
             assert_eq!(
                 std::fs::read_to_string(dir.path().join(path)).unwrap(),
                 body,
