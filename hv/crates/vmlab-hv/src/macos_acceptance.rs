@@ -678,6 +678,32 @@ fn probe_idle(client: &mut Client, samples: usize) {
     debug(client, DebugRequest::Continue);
 }
 
+/// The top 256 MiB below 2 GiB, where OVMF, OpenCore and boot.efi keep
+/// their pools and logs: what a boot stuck before XNU last said. A boot
+/// with the census's fake key puts no secret there.
+fn dump_firmware_ram(client: &mut Client, destination: &Path) {
+    use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+    const CHUNK: usize = 64 * 1024;
+    let mut out = File::create(destination).unwrap();
+    debug(client, DebugRequest::Pause);
+    for address in (0x7000_0000u64..0x8000_0000).step_by(CHUNK) {
+        let chunk = client.call(Control::Debug {
+            request: DebugRequest::ReadMemory {
+                space: AddressSpace::Physical,
+                address,
+                length: CHUNK,
+            },
+        });
+        match chunk {
+            Ok(Outcome::Debug {
+                response: DebugResponse::Memory { data },
+            }) => out.write_all(&data).unwrap(),
+            _ => out.write_all(&[0; CHUNK]).unwrap(),
+        }
+    }
+    debug(client, DebugRequest::Continue);
+}
+
 /// vmlab#200 census: how often the macOS boot stalls before XNU.
 ///
 /// The stall #200 records first (the agent never answering with both vCPUs
@@ -790,6 +816,9 @@ fn macos_boot_stall_census() {
                     &kept.join("display.sock"),
                     &kept.join("stall.ppm"),
                 );
+                if agent_failed.is_none() && vm.process.try_wait().unwrap().is_none() {
+                    dump_firmware_ram(&mut vm.client, &kept.join("stall-ram.bin"));
+                }
                 eprintln!(
                     "census run {run}/{runs}: STALL {} after {:.0} s, resets {resets}, rips {:x?}, exited {}, artifacts {}",
                     match &agent_failed {
