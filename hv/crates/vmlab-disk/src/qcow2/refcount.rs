@@ -21,9 +21,14 @@ use crate::{Error, Result};
 /// rebuilt lazily — at open it is empty and `scan_next` is 0, refblocks are
 /// read only as the set drains (bounded per pass), so opening a large image
 /// costs nothing until it first allocates. Every refcount write keeps the
-/// set exact (zero inserts, non-zero removes), which is what makes holes
-/// freed by an earlier session reusable: the scan classifies them from the
-/// refblocks the same way this session's own frees do.
+/// set exact, which is what makes holes freed by an earlier session
+/// reusable: the scan classifies them from the refblocks.
+///
+/// A cluster this session frees is *retired*: it must not be handed out
+/// until the flush that makes its old mapping's removal durable. Retired
+/// clusters stay out of the set, so an allocation never walks them (a guest
+/// discard retires thousands at once). The flush clears the retired list
+/// and resets the scan, which then finds them as ordinary holes.
 #[derive(Default)]
 pub(crate) struct FreeClusters {
     set: BTreeSet<u64>,
@@ -154,9 +159,9 @@ impl Qcow2Image {
     }
 
     /// Set a cluster's refcount, allocating its refblock if needed. The
-    /// free map follows the refcount: zero puts the cluster on the free
-    /// list, non-zero takes it off, so the map can never hand out a
-    /// cluster twice.
+    /// free map follows the refcount: a cluster leaves it on any write, so
+    /// the map can never hand out a cluster twice. A cluster set to zero is
+    /// retired and returns through the scan after the next flush.
     pub(crate) fn set_cluster_refcount(&mut self, cluster_idx: u64, value: u64) -> Result<()> {
         let rbe = self.refblock_entries();
         let table_index = cluster_idx / rbe;
@@ -165,11 +170,9 @@ impl Qcow2Image {
             self.alloc_refblock(table_index)?;
         }
         self.refblock_set(table_index, cluster_idx % rbe, value)?;
+        self.free.set.remove(&cluster_idx);
         if value == 0 {
             self.retired.insert(cluster_idx);
-            self.free.set.insert(cluster_idx);
-        } else {
-            self.free.set.remove(&cluster_idx);
         }
         Ok(())
     }
@@ -370,13 +373,14 @@ impl Qcow2Image {
                 continue;
             }
             self.load_refblock(ti)?;
-            let buf = {
-                let (b, _) = self.refblock_cache.get(ti).expect("loaded");
-                b.clone()
-            };
+            let width = self.refcount_bits;
+            // Borrow the cached block in place: this runs on every
+            // allocation, and a copy of the block cost more than the scan.
+            let (buf, _) = self.refblock_cache.get(ti).expect("loaded");
             for i in self.free.scan_next % rbe..rbe {
-                if bits_get(&buf, i, self.refcount_bits) == 0 {
-                    self.free.set.insert(ti * rbe + i);
+                let cluster = ti * rbe + i;
+                if bits_get(buf, i, width) == 0 && !self.retired.contains(&cluster) {
+                    self.free.set.insert(cluster);
                 }
                 self.free.scan_next = ti * rbe + i + 1;
                 if !to_end && self.free.set.len() >= FREE_SCAN_TARGET {
@@ -392,17 +396,13 @@ impl Qcow2Image {
     }
 
     /// Take the lowest run of `count` adjacent free clusters out of the
-    /// free map.
+    /// free map. The map holds no retired cluster.
     fn take_mapped_run(&mut self, count: u64) -> Option<u64> {
         let count = count.max(1);
         let mut start = 0u64;
         let mut len = 0u64;
         let mut found = None;
         for &c in &self.free.set {
-            if self.retired.contains(&c) {
-                len = 0;
-                continue;
-            }
             if len > 0 && c == start + len {
                 len += 1;
             } else {
@@ -515,5 +515,54 @@ impl Qcow2Image {
         } else {
             self.dec_refcount(cluster_idx)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{ReadSource, testsupport};
+    use crate::DiskImage;
+
+    /// A guest discard retires thousands of clusters at once. They must
+    /// neither be handed out before the flush nor sit in the free map,
+    /// where every allocation would have to step over them.
+    #[test]
+    fn retired_clusters_stay_out_of_the_free_map_until_the_flush() {
+        let (_dir, mut img) = testsupport::blank(64 << 20);
+        let cluster = img.cluster_size;
+        let count = 32u64;
+        img.write_at(0, &vec![0x41; (count * cluster) as usize])
+            .unwrap();
+        img.flush().unwrap();
+        img.discard(0, count * cluster).unwrap();
+        let retired = img.retired.clone();
+        assert_eq!(retired.len(), count as usize);
+
+        let host_of = |img: &mut super::Qcow2Image, guest: u64| {
+            let (source, _) = img.read_extent(guest, cluster as usize).unwrap();
+            let ReadSource::File(host) = source else {
+                panic!("guest offset {guest:#x} is not mapped");
+            };
+            host / cluster
+        };
+        for i in 0..4 {
+            let guest = (40 + i) * cluster;
+            img.write_at(guest, &vec![0x42; cluster as usize]).unwrap();
+            let host = host_of(&mut img, guest);
+            assert!(!retired.contains(&host), "retired cluster {host} reused");
+        }
+        assert!(
+            img.free.set.iter().all(|c| !retired.contains(c)),
+            "a retired cluster is in the free map before the flush"
+        );
+
+        // The flush makes the removed mappings durable: the holes are
+        // ordinary free clusters now, lowest first.
+        img.flush().unwrap();
+        assert!(img.retired.is_empty());
+        let lowest = *retired.iter().min().unwrap();
+        img.write_at(50 * cluster, &vec![0x43; cluster as usize])
+            .unwrap();
+        assert_eq!(host_of(&mut img, 50 * cluster), lowest);
     }
 }
