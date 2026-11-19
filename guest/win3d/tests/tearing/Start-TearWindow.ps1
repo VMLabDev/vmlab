@@ -26,6 +26,10 @@ param(
     [double]$Animate = 4,
     [double]$Freeze = 0,
     [int]$Step = 16,
+    # Change the whole window on every frame (the background alternates between
+    # two blacks), so that each present copies the whole window and not only
+    # the rectangles. It widens the window in which a copy can be seen half done.
+    [switch]$Full,
     [string]$Out = 'C:\win3d\results\tearwindow.json'
 )
 $ErrorActionPreference = 'Stop'
@@ -55,6 +59,7 @@ for ($i = 0; $i -lt $colours.Count; $i++) {
     [void]$canvas.Children.Add($r); $rects += $r
 }
 
+$blacks = [Windows.Media.Brushes]::Black, (New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromRgb(2, 2, 2)))
 $state = @{ Frames = 0; Moves = 0 }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $period = $Animate + $Freeze
@@ -66,6 +71,7 @@ $handler = [EventHandler] {
     $state.Moves++
     $x = ($state.Moves * $Step) % $range
     foreach ($r in $rects) { [Windows.Controls.Canvas]::SetLeft($r, $x) }
+    if ($Full) { $window.Background = $blacks[$state.Moves % 2] }
 }
 [Windows.Media.CompositionTarget]::add_Rendering($handler)
 [void]$window.ShowDialog()
@@ -77,7 +83,7 @@ $result = [ordered]@{
     frames = $state.Frames; moves = $state.Moves
     seconds = [math]::Round($elapsed, 2)
     fps = [math]::Round($state.Frames / [math]::Max($elapsed, 0.001), 1)
-    step = $Step; freeze = $Freeze
+    step = $Step; freeze = $Freeze; full = [bool]$Full
 }
 New-Item -ItemType Directory -Force (Split-Path -Parent $Out) | Out-Null
 $result | ConvertTo-Json | Set-Content -LiteralPath $Out -Encoding UTF8

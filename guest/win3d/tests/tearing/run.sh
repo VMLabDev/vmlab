@@ -3,7 +3,7 @@
 # WPF window animates in the guest.
 #
 #   tests/tearing/run.sh [--seconds N] [--frames N] [--load PERCENT --cpus LIST]
-#                        [--trace] [--out DIR] <lab-dir> <vm>
+#                        [--full] [--trace] [--out DIR] <lab-dir> <vm>
 #
 # <lab-dir> holds the vmlab.wcl of a running lab whose <vm> has the package
 # installed and a user logged on at the console (tests/e2e/run.sh --keep
@@ -19,6 +19,9 @@
 # afterwards: an unprivileged user cannot raise it again. Restart the VM to
 # undo it.
 #
+# --full makes the window change as a whole on every frame, so that each
+# present copies all of it. That is the hardest case for the present copy.
+#
 # --trace also reads the flip trace of a trace-build kernel driver
 # (build/kmd/README.md) for the first 20 s into <out>/fliptrace.csv.
 #
@@ -30,8 +33,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 VMLAB=${VMLAB:-vmlab}
-SECONDS_RUN=60; FRAMES=0; LOAD=0; CPUS=; TRACE=0; OUT=
-usage() { sed -n '2,29p' "$0"; }
+SECONDS_RUN=60; FRAMES=0; LOAD=0; CPUS=; TRACE=0; OUT=; FULL=
+usage() { sed -n '2,32p' "$0"; }
 while [ $# -gt 0 ]; do
     case $1 in
         --seconds) SECONDS_RUN=${2:-}; shift 2 ;;
@@ -39,6 +42,7 @@ while [ $# -gt 0 ]; do
         --load) LOAD=${2:-}; shift 2 ;;
         --cpus) CPUS=${2:-}; shift 2 ;;
         --trace) TRACE=1; shift ;;
+        --full) FULL=",'-Full'"; shift ;;
         --out) OUT=${2:-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) usage >&2; exit 2 ;;
@@ -79,7 +83,7 @@ trap cleanup EXIT
 
 # The window outlives the grab by a margin, so the grab never sees it close.
 in_lab "$VMLAB" exec --timeout $((SECONDS_RUN + 400)) "$VM" -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \
-    "& 'C:\\win3d\\guest\\Run-Probe.ps1' -Path 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Raw -NoModules -Name tearwindow -TimeoutSec $((SECONDS_RUN + 300)) -OutDir 'C:\\win3d\\results' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\\win3d\\tearing\\Start-TearWindow.ps1','-Seconds','$((SECONDS_RUN + 60))'" \
+    "& 'C:\\win3d\\guest\\Run-Probe.ps1' -Path 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Raw -NoModules -Name tearwindow -TimeoutSec $((SECONDS_RUN + 300)) -OutDir 'C:\\win3d\\results' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\\win3d\\tearing\\Start-TearWindow.ps1','-Seconds','$((SECONDS_RUN + 60))'$FULL" \
     >"$OUT/window-run.json" 2>&1 &
 WINDOW=$!
 sleep 20
