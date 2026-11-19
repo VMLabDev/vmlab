@@ -723,6 +723,7 @@ pub fn build(
             |chipset| chipset.irq_source(id, gsi),
         )
     };
+    let doorbell_vm = kvm.vm.clone();
     let wiring = |address: Option<PciAddress>,
                   vectors: u16,
                   transitional: bool|
@@ -745,7 +746,7 @@ pub fn build(
             },
             msix_vectors: vectors,
             transitional: firmware_machine && transitional,
-            doorbells: Some(Box::new(crate::kvm::KvmDoorbells::new(vm_fd.clone()))),
+            doorbells: Some(Box::new(crate::kvm::KvmDoorbells::new(doorbell_vm.clone()))),
         })
     };
     let place = |function: Arc<Mutex<dyn vmlab_hv_devices::PciDevice>>,
