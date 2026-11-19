@@ -3477,7 +3477,9 @@ impl LabRuntime {
         snap: &str,
         discard: bool,
     ) -> Result<Vec<String>> {
-        let m = self.machine(name).map_err(|_| missing_snapshot(name, snap))?;
+        let m = self
+            .machine(name)
+            .map_err(|_| missing_snapshot(name, snap))?;
         let record = {
             let state = self.state.lock().await;
             let machine = state
