@@ -156,6 +156,28 @@ The guest has no NIC, and the prior disk measurements show variable sync
 costs. The logs cannot attribute the pre-marker delay to disk caching,
 CPU placement, a guest timer, or offline servicing.
 
+Guest event logs from card #72's 71 diagnostic boots also place the
+spread inside Windows. For each backend, the table compares medians for
+the fastest and slowest quarter by total boot time. Each cohort pools the
+diagnostic variants of that backend. The guest intervals use Kernel-General
+event 12 for kernel start and User32 event 1074 from winlogon for the
+specialize reboot request.
+
+| Backend | Cohort (boots) | Total (s) | First kernel start to specialize reboot request (s) | Request to second kernel start (s) | Second to final kernel start (s) |
+|---|---|---:|---:|---:|---:|
+| QEMU | Fastest (5) | 83.41 | 51.10 | 2.92 | 24.01 |
+| QEMU | Slowest (5) | 95.63 | 55.60 | 6.67 | 26.01 |
+| vmlab-hv | Fastest (12) | 88.63 | 53.85 | 2.55 | 26.00 |
+| vmlab-hv | Slowest (12) | 99.22 | 57.62 | 3.85 | 31.00 |
+
+The specialize pass contributes on both backends. QEMU also varies
+around the specialize reboot, while vmlab-hv shows a larger difference
+between the second and final kernel starts. This comparison locates
+the spread across multiple intervals even on the guest clock. The
+cohorts mix diagnostic conditions and cannot isolate a causal factor.
+The source logs are under
+`/home/vmlab/src/stc/logs/d28-card-72.r8b/diag/logs/` on helios.
+
 G2 now records monotonic readiness milestones for each repeat alongside
 its total, host sync probe, and load. The benchmark retains the existing
 guest configuration and readiness sequence so future runs can compare
