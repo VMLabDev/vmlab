@@ -3450,10 +3450,10 @@ mod tests {
     /// the removal costs, and `--json` carries the same as fields.
     #[test]
     fn status_warns_of_the_qemu_removal_and_lists_the_snapshots() {
-        let mut vm = crate::status::fixtures::machine("old", PowerState::Stopped, false, vm());
-        vm.hypervisor_fallback = Some("old: keeping existing QEMU machine".into());
-        vm.qemu_removal = Some(qemu_removal(&["warm"]));
-        let mut status = lab(vec![vm]);
+        let mut old = crate::status::fixtures::machine("old", PowerState::Stopped, false, vm());
+        old.hypervisor_fallback = Some("old: keeping existing QEMU machine".into());
+        old.qemu_removal = Some(qemu_removal(&["warm"]));
+        let mut status = lab(vec![old]);
         status.host_warnings = vec!["/dev/kvm is not usable on this host".into()];
         let text = render_status(&status, false);
         assert!(
