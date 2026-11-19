@@ -66,6 +66,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [tdr-recovery.md](tdr-recovery.md) | Force a guest timeout and require reset/restart telemetry plus hardware pixel readback |
 | [pointer.md](pointer.md) | See why the pointer lagged, what the hardware pointer of `patches/kmd/0005` sends to the host, its limits, and the check |
 | [dxdiag.md](dxdiag.md) | See why dxdiag reported DirectDraw "Not Available" and how `patches/mesa/0012` to `0014` fixed it |
+| [d2d-coverage.md](d2d-coverage.md) | See why Direct2D's antialiased fills had gaps on NVIDIA (Word's ribbon), the one-pass-per-sample fix `patches/mesa/0094`, and what an AMD host does without it |
 | [d3d11-apps.md](d3d11-apps.md) | See why two DirectX SDK D3D11 samples did not show, the UMD fixes `patches/mesa/0015` to `0017`, and the DXUT window bug |
 | [d3d12app.md](d3d12app.md) | See how Microsoft's D3D12 samples are built unmodified with clang-cl and xwin, how they ran on AMD1 and Nvidia1, and why ExecuteIndirect draws nothing |
 | [dwmheap.md](dwmheap.md) | Find out why dwm crashed with heap corruption in the first boot on NVIDIA, how the dump traced it to the UMD's trim path, and what `patches/mesa/0060` changes |
