@@ -655,111 +655,138 @@ to P14.
 
 ### Baseline
 
-The first runs of the suite, on 2026-11-20 at commit `41e2e2fa5b49`: the
-`windows-11` template with the 0.1.3 candidate package (driver
-`100.6.101.58105`, the November base) on vmlab-hv, once on AMD1 and once on
-Nvidia2, each with `tests/e2e/run.sh --template windows-11 --host-gpu <gpu>
---apps`. Both runs passed 12 of 12 Done checks first, and the host kernel
-logged no Xid. `tests/e2e/report.py` writes the two tables from each run's
+The runs of 2026-11-20 on the package that has the hardware pointer
+([pointer.md](pointer.md)) and the coverage patch
+([d2d-coverage.md](d2d-coverage.md)): the `windows-11` template with the
+0.1.3 candidate package (driver `100.6.101.58106`, the November base) on
+vmlab-hv, on Nvidia2 at commit `0216e6d0b5fa` and on AMD1 at commit
+`4b8e55853639`, each with `tests/e2e/run.sh --template windows-11 --host-gpu
+<gpu> --apps`. Between the two commits only `tests/e2e/adapter.sh` changed
+(B6). Both runs passed 12 of 12 Done checks first, and the host kernel logged
+no Xid. `tests/e2e/report.py` writes the two tables from each run's
 `adapter/adapter.json`.
+
+An earlier baseline, at commit `41e2e2fa5b49` on the package without those
+two changes (driver `100.6.101.58105`), had 11 checks pass and 11 fail on
+both GPUs. `pointer` failed there: Windows drew the pointer into the frame,
+144 pointer pixels at each place (GitHub #235). The checks `pointer-shapes`
+and `d2d-tir` were not in the suite.
 
 What the baseline says:
 
-- B1. Both GPUs give the same result: the same 11 checks pass and the same
-  11 fail.
-- B2. Four failures are the gaps the design names. `pointer`: Windows draws
-  the pointer into the frame (GitHub #235). `scan-line`: `D3DKMTGetScanLine`
-  answers line 0 and never "in vertical blank", because vsync is a guest
-  timer. `duplication`: every `AcquireNextFrame` answers
-  `DXGI_ERROR_ACCESS_LOST` (GitHub #237). `venc-chrome` and `venc-edge`: the
-  GPU process ends itself over the Direct3D 12 bridge and leaves crash
-  dumps (GitHub #238). In Chrome it does so three times and WebGL is gone.
-  Edge restarts it twice and keeps WebGL.
-- B3. The vblank interval, the present rate and the flip timestamps are
+- B1. Both GPUs give the same result: the same 14 checks pass and the same
+  10 fail.
+- B2. Against the earlier baseline one check changed: `pointer` passes. The
+  two new checks, `pointer-shapes` and `d2d-tir`, pass. No check changed
+  from pass to fail.
+- B3. Three failures are the gaps the design names. `scan-line`:
+  `D3DKMTGetScanLine` answers line 0 and never "in vertical blank", because
+  vsync is a guest timer. `duplication`: every `AcquireNextFrame` answers
+  `DXGI_ERROR_ACCESS_LOST` (0x887a0026, GitHub #237). `venc-chrome` and
+  `venc-edge`: the GPU process ends itself over the Direct3D 12 bridge and
+  leaves crash dumps (GitHub #238). How far a browser gets differs from run
+  to run. Chrome lost WebGL in every run, before the page's first context
+  or after the query. Edge kept WebGL with two crash dumps on Nvidia2, lost
+  it before the first context in the AMD1 run of the table, and lost it
+  after the query in an AMD1 run 50 minutes before. Edge is 158.0.4370.33
+  here and was 157.0.4341.60 in the earlier baseline: the guest's Edge
+  updates itself, so the Edge rows are not from a pinned browser.
+- B4. The vblank interval, the present rate and the flip timestamps are
   within their limits. One present in a hundred takes two refresh periods
-  (p99 33 ms).
-- B4. Three of Wine's nine test programs pass: `d3d10_1` and both d3d10
+  (p99 33 ms). The present rate on AMD1 is 57.9 frames per second, and it
+  was 57.5 in the AMD1 run that shared the host with the Nvidia2 run. The
+  limit is 57.0, so this row can fail on a loaded host.
+- B5. Three of Wine's nine test programs pass: `d3d10_1` and both d3d10
   programs. `d3d10core` and `d3d11` end on an access violation after calls
   begin to answer `DXGI_ERROR_DEVICE_REMOVED` (0x887a0005). The d3d9
   programs run to their end with failures: 11 in `d3d9ex`, 169 in
-  `stateblock`, and 343 of about 206,000 checks in `visual`. No failure was
-  looked into here. The failed lines of each program are in the evidence.
-- B5. Wine's d3d9 `device` program ends the hypervisor, on both GPUs, 15 to
-  36 s in: vmlab-hv exits with "Too many open files" after a run of `GPU
-  dma-buf import failed: 0x3003` lines for 800x600 scanouts. vmlab-hv
-  writes the digit 4 in its log messages as `[REDACTED]`, so the row reads
-  `os error 2[REDACTED]` for os error 24. This is a host fault that an
-  unprivileged guest program can cause. The suite starts the VM again and
-  goes on.
-- B6. Three checks pass that have never been seen to fail on this host, so
+  `stateblock`, and 343 (AMD1) or 345 (Nvidia2) of about 206,000 checks in
+  `visual`. No failure was looked into here. The failed lines of each
+  program are in the evidence.
+- B6. Wine's d3d9 `device` program ends the hypervisor, on both GPUs, 13 to
+  26 s in: vmlab-hv exits with "Too many open files" after a run of `GPU
+  dma-buf import failed: 0x3003` lines for 800x600 scanouts. vmlab-hv writes the digit 4 in its log messages as
+  `[REDACTED]`, so the row reads `os error 2[REDACTED]` for os error 24.
+  This is a host fault that an unprivileged guest program can cause. The
+  suite starts the VM again and goes on. `vmlab-hv.log` outlives a run of
+  the lab, and the first AMD1 run of this baseline quoted the exit line of
+  an older run in this row ("TPM shutdown ... Broken pipe"). The suite now
+  waits for an exit line that is new, and the AMD1 table is the run after
+  that fix. Its other rows gave the same results as the first run, but for
+  the difference in `venc-edge` that B3 names.
+- B7. Three checks pass that have never been seen to fail on this host, so
   the baseline does not prove that they detect their fault. `tear-flip` and
   `tear-blt`: no torn frame in about 1,260 console frames each. GitHub #231
   saw 0 or 1 torn frames in 2,000 without host load, and the suite does not
-  load the host. `d2d`: no hole on Nvidia2 either. GitHub #236 reported the
-  gaps on another NVIDIA host, and helios may not have the fault. The other
-  failing checks above show that their probes do detect.
-- B7. The first AMD1 run had one row not run: `vmlab up` left the VM
-  stopped after the d3d9 `device` program, and `stateblock` did not run. The
-  suite now starts the VM itself, and the AMD1 table is the second run.
+  load the host. `d2d`: no hole on either GPU, in the earlier baseline
+  without the coverage patch either. Its shapes do not reach the path of
+  GitHub #236 ([d2d-coverage.md](d2d-coverage.md)). `d2d-tir` is the check
+  of that path: its probe found pixels that differ on both GPUs without the
+  patch. The failing checks above, and `pointer` in the earlier baseline,
+  show that their probes do detect.
 
 <!-- e2e:adapter -->
 ### windows-11
 
-Host GPU: AMD1, /dev/dri/renderD130 0000:72:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Granite Ridge [Radeon 610M] (rev c1). Run 2026-11-20T04:33:32+10:00 at commit `41e2e2fa5b49`, template `x86_64/windows-11@26100.1742.11`. **11 pass, 11 fail, 0 not-run.**
+Host GPU: AMD1, /dev/dri/renderD130 0000:72:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Granite Ridge [Radeon 610M] (rev c1). Run 2026-11-20T09:01:11+10:00 at commit `4b8e55853639`, template `x86_64/windows-11@26100.1742.11`. **14 pass, 10 fail, 0 not-run.**
 
 | Property | Check | Result | Measured |
 | --- | --- | --- | --- |
-| P1 | `pointer`: the pointer is not part of the frame | **fail** | Windows drew the pointer into the frame: 144 and 144 pointer pixels at the two places the host moved it to |
-| P2 | `vblank-interval`: the vblank interval is the refresh period | **pass** | mean 16.665 ms, p01 15.94, p99 17.05, max 18.55 over 600 intervals; the 60 Hz mode is 16.667 ms (limits: mean within 2 percent, p01 and p99 within half a period) |
-| P2 | `present-rate`: a vsynced present runs at the refresh rate | **pass** | 57.31 frames per second with sync interval 1 on a 60 Hz mode (limit 5 percent); interval p01 13.25 ms, p99 33.24 ms |
-| P2 | `flip-timestamps`: frame statistics count the refreshes | **pass** | 597 refreshes in 9951 ms by SyncRefreshCount and SyncQPCTime: 59.99 Hz on a 60 Hz mode (limit 2 percent); 568 presents |
-| P2 | `scan-line`: the scan line moves and reaches vertical blank | **fail** | 1 different lines (highest 0) and 0 answers in vertical blank in 19945 samples over one second |
-| P3-P5 | `tear-flip`: no torn frame on the console, flip-model presents | **pass** | 0 torn of 1260 console frames (0 of them unchanged from the frame before), 36.8 grabs per second; the probe presented 1284 frames at 61.1 per second |
-| P3-P5 | `tear-blt`: no torn frame on the console, presents of the Blt kind | **pass** | 0 torn of 1260 console frames (0 of them unchanged from the frame before), 34.1 grabs per second; the probe presented 1268 frames at 60.2 per second |
+| P1 | `pointer`: the pointer is not part of the frame | **pass** | the capture is the flat fill colour at both places while Windows reports a visible pointer there |
+| P1 | `pointer-shapes`: the pointer's shapes, positions and hiding reach the host | **pass** | shapes pass, rfb pass, outline pass, frame pass, recording pass |
+| P2 | `vblank-interval`: the vblank interval is the refresh period | **pass** | mean 16.663 ms, p01 15.60, p99 17.24, max 18.60 over 600 intervals; the 60 Hz mode is 16.667 ms (limits: mean within 2 percent, p01 and p99 within half a period) |
+| P2 | `present-rate`: a vsynced present runs at the refresh rate | **pass** | 57.91 frames per second with sync interval 1 on a 60 Hz mode (limit 5 percent); interval p01 14.98 ms, p99 33.16 ms |
+| P2 | `flip-timestamps`: frame statistics count the refreshes | **pass** | 597 refreshes in 9951 ms by SyncRefreshCount and SyncQPCTime: 60.00 Hz on a 60 Hz mode (limit 2 percent); 574 presents |
+| P2 | `scan-line`: the scan line moves and reaches vertical blank | **fail** | 1 different lines (highest 0) and 0 answers in vertical blank in 19946 samples over one second |
+| P3-P5 | `tear-flip`: no torn frame on the console, flip-model presents | **pass** | 0 torn of 1260 console frames (0 of them unchanged from the frame before), 33.7 grabs per second; the probe presented 1285 frames at 61.1 per second |
+| P3-P5 | `tear-blt`: no torn frame on the console, presents of the Blt kind | **pass** | 0 torn of 1260 console frames (0 of them unchanged from the frame before), 34.1 grabs per second; the probe presented 1269 frames at 60.2 per second |
 | P7 | `duplication`: Desktop Duplication delivers lit frames | **fail** | 0 of 8 frames are lit and show the window's colour; AcquireNextFrame answered 0x887a0026 |
 | P10 | `d2d`: Direct2D fills antialiased shapes without gaps | **pass** | 0 holes and 0 spills against WARP, 0 pixels differ between 3 runs, 0 edge pixels off by more than 64, 176553 filled pixels |
+| P10 | `d2d-tir`: Direct2D antialiasing draws the coverage that WARP draws | **pass** | pass x64: 0 of 93467 covered pixels differ from WARP, 0 differ between 3 runs, 0 coverage bits lost, 0 extra; driver: passes (3 pipelines); pass x86: 0 of 93467 covered pixels differ from WARP, 0 differ between 3 runs, 0 coverage bits lost, 0 extra; driver: no line (0 pipelines); judged by the picture alone |
 | P10 | `svb-chrome`: WebGL draws from a STATIC_DRAW vertex buffer in Chrome | **pass** | Chrome 158.0.8127.36: STATIC_DRAW 255,0,0,255, DYNAMIC_DRAW 255,0,0,255, STREAM_DRAW 255,0,0,255; ANGLE (VirtIO, Yttrium VirtIO GPU 3D controller (0x00001050) Direct3D11 vs_5_0 ps_5_0, D3D11) |
 | P8 | `venc-chrome`: Chrome's GPU process survives the video encoder query | **fail** | Chrome 158.0.8127.36: no WebGL on the adapter when the page loaded ('NO WEBGL') and 3 crash dumps: the GPU process ended before the page's first WebGL context |
-| P10 | `svb-edge`: WebGL draws from a STATIC_DRAW vertex buffer in Edge | **pass** | Edge 157.0.4341.60: STATIC_DRAW 255,0,0,255, DYNAMIC_DRAW 255,0,0,255, STREAM_DRAW 255,0,0,255; ANGLE (VirtIO, Yttrium VirtIO GPU 3D controller (0x00001050) Direct3D11 vs_5_0 ps_5_0, D3D11) |
-| P8 | `venc-edge`: Edge's GPU process survives the video encoder query | **fail** | Edge 157.0.4341.60: WebGL on the adapter in 5 of 5 tries over 20 s after the query, 2 crash dumps; encoder supported: false; WebGPU no adapter |
+| P10 | `svb-edge`: WebGL draws from a STATIC_DRAW vertex buffer in Edge | **pass** | Edge 158.0.4370.33: STATIC_DRAW 255,0,0,255, DYNAMIC_DRAW 255,0,0,255, STREAM_DRAW 255,0,0,255; ANGLE (VirtIO, Yttrium VirtIO GPU 3D controller (0x00001050) Direct3D11 vs_5_0 ps_5_0, D3D11) |
+| P8 | `venc-edge`: Edge's GPU process survives the video encoder query | **fail** | Edge 158.0.4370.33: no WebGL on the adapter when the page loaded ('NO WEBGL') and 2 crash dumps: the GPU process ended before the page's first WebGL context |
 | P10 | `wine-d3d10_1_d3d10_1`: Wine's d3d10_1 test d3d10_1 passes | **pass** | 580 tests executed, 0 failures, 0 todo, 5 skipped in 4 s |
 | P10 | `wine-d3d10core_d3d10core`: Wine's d3d10core test d3d10core passes | **fail** | ended on an unhandled exception (exit code 0xc0000005) after 15 s; 4 failed checks printed before it |
-| P10 | `wine-d3d10_device`: Wine's d3d10 test device passes | **pass** | 206 tests executed, 0 failures, 0 todo, 0 skipped in 2 s |
+| P10 | `wine-d3d10_device`: Wine's d3d10 test device passes | **pass** | 206 tests executed, 0 failures, 0 todo, 0 skipped in 3 s |
 | P10 | `wine-d3d10_effect`: Wine's d3d10 test effect passes | **pass** | 5041 tests executed, 0 failures, 0 todo, 0 skipped in 4 s |
-| P10 | `wine-d3d11_d3d11`: Wine's d3d11 test d3d11 passes | **fail** | ended on an unhandled exception (exit code 0xc0000005) after 27 s; 93 failed checks printed before it |
-| P10 | `wine-d3d9_d3d9ex`: Wine's d3d9 test d3d9ex passes | **fail** | 2379 tests executed, 11 failures, 0 todo, 41 skipped in 28 s |
-| P10 | `wine-d3d9_device`: Wine's d3d9 test device passes | **fail** | the VM stopped 15 s into the program: process exit: RuntimeError; exit_code=1; error_chain=["control accept loop: Too many open files (os error 2[REDACTED])"] |
+| P10 | `wine-d3d11_d3d11`: Wine's d3d11 test d3d11 passes | **fail** | ended on an unhandled exception (exit code 0xc0000005) after 26 s; 93 failed checks printed before it |
+| P10 | `wine-d3d9_d3d9ex`: Wine's d3d9 test d3d9ex passes | **fail** | 2379 tests executed, 11 failures, 0 todo, 41 skipped in 30 s |
+| P10 | `wine-d3d9_device`: Wine's d3d9 test device passes | **fail** | the VM stopped 16 s into the program: process exit: RuntimeError; exit_code=1; error_chain=["control accept loop: Too many open files (os error 2[REDACTED])"] |
 | P10 | `wine-d3d9_stateblock`: Wine's d3d9 test stateblock passes | **fail** | 12268 tests executed, 169 failures, 0 todo, 0 skipped in 4 s |
-| P10 | `wine-d3d9_visual`: Wine's d3d9 test visual passes | **fail** | 206068 tests executed, 343 failures, 0 todo, 31 skipped in 58 s |
+| P10 | `wine-d3d9_visual`: Wine's d3d9 test visual passes | **fail** | 206068 tests executed, 343 failures, 0 todo, 31 skipped in 61 s |
 
 ### windows-11-nvidia2
 
-Host GPU: Nvidia2, /dev/dri/renderD129 0000:05:00.0 VGA compatible controller: NVIDIA Corporation GB202 [GeForce RTX 5090] (rev a1). Run 2026-11-20T04:01:17+10:00 at commit `41e2e2fa5b49`, template `x86_64/windows-11@26100.1742.11`. **11 pass, 11 fail, 0 not-run.**
+Host GPU: Nvidia2, /dev/dri/renderD129 0000:05:00.0 VGA compatible controller: NVIDIA Corporation GB202 [GeForce RTX 5090] (rev a1). Run 2026-11-20T08:21:14+10:00 at commit `0216e6d0b5fa`, template `x86_64/windows-11@26100.1742.11`. **14 pass, 10 fail, 0 not-run.**
 
 | Property | Check | Result | Measured |
 | --- | --- | --- | --- |
-| P1 | `pointer`: the pointer is not part of the frame | **fail** | Windows drew the pointer into the frame: 144 and 144 pointer pixels at the two places the host moved it to |
-| P2 | `vblank-interval`: the vblank interval is the refresh period | **pass** | mean 16.664 ms, p01 15.84, p99 17.18, max 18.32 over 600 intervals; the 60 Hz mode is 16.667 ms (limits: mean within 2 percent, p01 and p99 within half a period) |
-| P2 | `present-rate`: a vsynced present runs at the refresh rate | **pass** | 58.51 frames per second with sync interval 1 on a 60 Hz mode (limit 5 percent); interval p01 14.99 ms, p99 33.00 ms |
-| P2 | `flip-timestamps`: frame statistics count the refreshes | **pass** | 596 refreshes in 9936 ms by SyncRefreshCount and SyncQPCTime: 59.99 Hz on a 60 Hz mode (limit 2 percent); 580 presents |
-| P2 | `scan-line`: the scan line moves and reaches vertical blank | **fail** | 1 different lines (highest 0) and 0 answers in vertical blank in 19951 samples over one second |
-| P3-P5 | `tear-flip`: no torn frame on the console, flip-model presents | **pass** | 0 torn of 1262 console frames (0 of them unchanged from the frame before), 33.2 grabs per second; the probe presented 1266 frames at 60.4 per second |
-| P3-P5 | `tear-blt`: no torn frame on the console, presents of the Blt kind | **pass** | 0 torn of 1261 console frames (0 of them unchanged from the frame before), 34.3 grabs per second; the probe presented 1249 frames at 59.4 per second |
+| P1 | `pointer`: the pointer is not part of the frame | **pass** | the capture is the flat fill colour at both places while Windows reports a visible pointer there |
+| P1 | `pointer-shapes`: the pointer's shapes, positions and hiding reach the host | **pass** | shapes pass, rfb pass, outline pass, frame pass, recording pass |
+| P2 | `vblank-interval`: the vblank interval is the refresh period | **pass** | mean 16.661 ms, p01 15.61, p99 17.79, max 20.46 over 600 intervals; the 60 Hz mode is 16.667 ms (limits: mean within 2 percent, p01 and p99 within half a period) |
+| P2 | `present-rate`: a vsynced present runs at the refresh rate | **pass** | 58.89 frames per second with sync interval 1 on a 60 Hz mode (limit 5 percent); interval p01 14.38 ms, p99 32.55 ms |
+| P2 | `flip-timestamps`: frame statistics count the refreshes | **pass** | 596 refreshes in 9938 ms by SyncRefreshCount and SyncQPCTime: 59.97 Hz on a 60 Hz mode (limit 2 percent); 584 presents |
+| P2 | `scan-line`: the scan line moves and reaches vertical blank | **fail** | 1 different lines (highest 0) and 0 answers in vertical blank in 19389 samples over one second |
+| P3-P5 | `tear-flip`: no torn frame on the console, flip-model presents | **pass** | 0 torn of 1262 console frames (0 of them unchanged from the frame before), 33.4 grabs per second; the probe presented 1263 frames at 60.3 per second |
+| P3-P5 | `tear-blt`: no torn frame on the console, presents of the Blt kind | **pass** | 0 torn of 1261 console frames (0 of them unchanged from the frame before), 34.4 grabs per second; the probe presented 1250 frames at 59.4 per second |
 | P7 | `duplication`: Desktop Duplication delivers lit frames | **fail** | 0 of 8 frames are lit and show the window's colour; AcquireNextFrame answered 0x887a0026 |
 | P10 | `d2d`: Direct2D fills antialiased shapes without gaps | **pass** | 0 holes and 0 spills against WARP, 0 pixels differ between 3 runs, 0 edge pixels off by more than 64, 176553 filled pixels |
+| P10 | `d2d-tir`: Direct2D antialiasing draws the coverage that WARP draws | **pass** | pass x64: 0 of 93467 covered pixels differ from WARP, 0 differ between 3 runs, 0 coverage bits lost, 0 extra; driver: passes (3 pipelines); pass x86: 0 of 93467 covered pixels differ from WARP, 0 differ between 3 runs, 0 coverage bits lost, 0 extra; driver: no line (0 pipelines); judged by the picture alone |
 | P10 | `svb-chrome`: WebGL draws from a STATIC_DRAW vertex buffer in Chrome | **pass** | Chrome 158.0.8127.36: STATIC_DRAW 255,0,0,255, DYNAMIC_DRAW 255,0,0,255, STREAM_DRAW 255,0,0,255; ANGLE (VirtIO, Yttrium VirtIO GPU 3D controller (0x00001050) Direct3D11 vs_5_0 ps_5_0, D3D11) |
 | P8 | `venc-chrome`: Chrome's GPU process survives the video encoder query | **fail** | Chrome 158.0.8127.36: WebGL on the adapter in 0 of 5 tries over 20 s after the query, 3 crash dumps; encoder supported: false; WebGPU no adapter |
-| P10 | `svb-edge`: WebGL draws from a STATIC_DRAW vertex buffer in Edge | **pass** | Edge 157.0.4341.60: STATIC_DRAW 255,0,0,255, DYNAMIC_DRAW 255,0,0,255, STREAM_DRAW 255,0,0,255; ANGLE (VirtIO, Yttrium VirtIO GPU 3D controller (0x00001050) Direct3D11 vs_5_0 ps_5_0, D3D11) |
-| P8 | `venc-edge`: Edge's GPU process survives the video encoder query | **fail** | Edge 157.0.4341.60: WebGL on the adapter in 5 of 5 tries over 20 s after the query, 2 crash dumps; encoder supported: false; WebGPU no adapter |
-| P10 | `wine-d3d10_1_d3d10_1`: Wine's d3d10_1 test d3d10_1 passes | **pass** | 580 tests executed, 0 failures, 0 todo, 5 skipped in 9 s |
+| P10 | `svb-edge`: WebGL draws from a STATIC_DRAW vertex buffer in Edge | **pass** | Edge 158.0.4370.33: STATIC_DRAW 255,0,0,255, DYNAMIC_DRAW 255,0,0,255, STREAM_DRAW 255,0,0,255; ANGLE (VirtIO, Yttrium VirtIO GPU 3D controller (0x00001050) Direct3D11 vs_5_0 ps_5_0, D3D11) |
+| P8 | `venc-edge`: Edge's GPU process survives the video encoder query | **fail** | Edge 158.0.4370.33: WebGL on the adapter in 5 of 5 tries over 20 s after the query, 2 crash dumps; encoder supported: false; WebGPU no adapter |
+| P10 | `wine-d3d10_1_d3d10_1`: Wine's d3d10_1 test d3d10_1 passes | **pass** | 580 tests executed, 0 failures, 0 todo, 5 skipped in 10 s |
 | P10 | `wine-d3d10core_d3d10core`: Wine's d3d10core test d3d10core passes | **fail** | ended on an unhandled exception (exit code 0xc0000005) after 38 s; 4 failed checks printed before it |
 | P10 | `wine-d3d10_device`: Wine's d3d10 test device passes | **pass** | 206 tests executed, 0 failures, 0 todo, 0 skipped in 3 s |
-| P10 | `wine-d3d10_effect`: Wine's d3d10 test effect passes | **pass** | 5041 tests executed, 0 failures, 0 todo, 0 skipped in 14 s |
-| P10 | `wine-d3d11_d3d11`: Wine's d3d11 test d3d11 passes | **fail** | ended on an unhandled exception (exit code 0xc0000005) after 69 s; 93 failed checks printed before it |
-| P10 | `wine-d3d9_d3d9ex`: Wine's d3d9 test d3d9ex passes | **fail** | 2379 tests executed, 11 failures, 0 todo, 41 skipped in 90 s |
-| P10 | `wine-d3d9_device`: Wine's d3d9 test device passes | **fail** | the VM stopped 36 s into the program: process exit: RuntimeError; exit_code=1; error_chain=["control accept loop: Too many open files (os error 2[REDACTED])"] |
-| P10 | `wine-d3d9_stateblock`: Wine's d3d9 test stateblock passes | **fail** | 12268 tests executed, 169 failures, 0 todo, 0 skipped in 5 s |
-| P10 | `wine-d3d9_visual`: Wine's d3d9 test visual passes | **fail** | 206008 tests executed, 343 failures, 0 todo, 32 skipped in 160 s |
+| P10 | `wine-d3d10_effect`: Wine's d3d10 test effect passes | **pass** | 5041 tests executed, 0 failures, 0 todo, 0 skipped in 15 s |
+| P10 | `wine-d3d11_d3d11`: Wine's d3d11 test d3d11 passes | **fail** | ended on an unhandled exception (exit code 0xc0000005) after 73 s; 93 failed checks printed before it |
+| P10 | `wine-d3d9_d3d9ex`: Wine's d3d9 test d3d9ex passes | **fail** | 2379 tests executed, 11 failures, 0 todo, 41 skipped in 93 s |
+| P10 | `wine-d3d9_device`: Wine's d3d9 test device passes | **fail** | the VM stopped 26 s into the program: process exit: RuntimeError; exit_code=1; error_chain=["control accept loop: Too many open files (os error 2[REDACTED])"] |
+| P10 | `wine-d3d9_stateblock`: Wine's d3d9 test stateblock passes | **fail** | 12268 tests executed, 169 failures, 0 todo, 0 skipped in 6 s |
+| P10 | `wine-d3d9_visual`: Wine's d3d9 test visual passes | **fail** | 206068 tests executed, 345 failures, 0 todo, 31 skipped in 192 s |
 <!-- /e2e:adapter -->
 
 ## Findings from these runs
