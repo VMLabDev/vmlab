@@ -251,11 +251,16 @@ vm_restart() { # start the VM again after a test ended it, and wait for the user
     return 1
 }
 
-hv_exit() { # the last line vmlab-hv logged about its own end, for the note of a test that ended the VM
-    local log
+hv_exit() { # what vmlab-hv logged about its own end, for the note of a test that ended the VM
+    local log i
     log=${XDG_STATE_HOME:-$HOME/.local/state}/vmlab/labs/$(lab_name)/vms/$VM/vmlab-hv.log
     [ -f "$log" ] || return 0
-    grep -a '"process exit' "$log" | tail -1 | python3 -c 'import json,sys
+    # The exit line comes a few seconds after the first error.
+    for i in 1 2 3 4 5 6; do
+        grep -aq '"process exit' "$log" && break
+        sleep 2
+    done
+    { grep -a '"process exit' "$log" || grep -a '"level":"ERROR"' "$log"; } | tail -1 | python3 -c 'import json,sys
 for line in sys.stdin:
     try: print(json.loads(line)["message"][:200])
     except (ValueError, KeyError): pass'
