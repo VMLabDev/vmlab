@@ -17,6 +17,7 @@
 #   tear-blt      P3-P5    the tearing probe, presents of the Blt kind
 #   duplication   P7       Desktop Duplication delivers frames
 #   d2d           P10      the Direct2D coverage probe
+#   d2d-tir       P10      what Direct2D draws to antialias, against WARP (tests/e2e/tir.sh)
 #   svb-chrome    P10      the static vertex buffer page in Chrome
 #   venc-chrome   P8       venc.html in Chrome: the GPU process survives
 #   svb-edge, venc-edge    the same two pages in the guest's own Edge
@@ -35,7 +36,7 @@
 # that did not run is not a failure.
 # check-shell-paths: no-errexit each check records its own result and the suite goes on to the next (VML-88).
 set -uo pipefail
-[ $# -ge 3 ] || { sed -n '2,35p' "$0" >&2; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,36p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 A=$HERE/adapter
@@ -45,7 +46,7 @@ mkdir -p "$3/adapter"
 EV=$(cd "$3/adapter" && pwd)   # absolute: the vmlab commands run from the lab directory
 [ -n "$EV" ] && [ -d "$EV" ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 shift 3
-ALL="pointer pointer-shapes pace tear-flip tear-blt duplication d2d svb-chrome venc-chrome svb-edge venc-edge wine"
+ALL="pointer pointer-shapes pace tear-flip tear-blt duplication d2d d2d-tir svb-chrome venc-chrome svb-edge venc-edge wine"
 CHECKS=${*:-${ADAPTER_CHECKS:-$ALL}}
 CACHE=$REPO/.scratch/e2e/cache
 STAGE=$REPO/.scratch/e2e/adapter/$(basename "$(dirname "$EV")")   # per evidence dir, so parallel runs do not share files
@@ -207,6 +208,24 @@ check_d2d() {
     pull d2d.bmp && magick "$EV/d2d.bmp" -strip "$EV/d2d.png" && rm -f "$EV/d2d.bmp"
 }
 
+check_d2d_tir() {
+    # The check of target-independent rasterization (docs/d2d-coverage.md) is a
+    # script of its own; it writes <evidence-dir>/tir/ and its verdict there.
+    note "d2d-tir"
+    local top rc
+    top=$(dirname "$EV")
+    [ -n "$top" ] && [ -d "$top" ] || { skip d2d-tir "no evidence directory"; return; }
+    "$HERE/tir.sh" "$LABDIR" "$VM" "$top" >"$STAGE/d2d-tir.out" 2>&1
+    rc=$?
+    grep -E '^(pass|fail) ' "$STAGE/d2d-tir.out" | while read -r l; do note "  ${l:0:200}"; done
+    if [ -s "$top/tir/tir.txt" ]; then
+        cp "$top/tir/tir.txt" "$EV/d2d-tir.txt"
+        ran d2d-tir
+    else
+        skip d2d-tir "tests/e2e/tir.sh ended with exit $rc and no verdict: $(tail -1 "$STAGE/d2d-tir.out" | cut -c1-160)"
+    fi
+}
+
 CHROME=
 stage_chrome() { # once: Chrome for Testing into C:\apps\chrome-win64
     [ -z "$CHROME" ] || return 0
@@ -334,6 +353,7 @@ else
             tear-blt) check_tear blt ;;
             duplication) check_duplication ;;
             d2d) check_d2d ;;
+            d2d-tir) check_d2d_tir ;;
             svb-chrome) check_page svb-chrome chrome svb.html 25 ;;
             venc-chrome) check_page venc-chrome chrome venc.html 45 D3D12VideoEncodeAccelerator,D3D12VideoDecoder ;;
             svb-edge) check_page svb-edge edge svb.html 25 ;;
