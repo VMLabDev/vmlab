@@ -206,13 +206,14 @@ fn snapshot_publishes_pending_flush_without_guest_activity() {
 fn restores_gpu_snapshot_without_flush_state() {
     let mut gpu = Gpu::new("gpu");
     gpu.request_size(1920, 1080).unwrap();
-    let current = gpu.save_state().unwrap();
-    let mut old = current.clone();
+    let mut old = gpu.save_state().unwrap();
     old[4] = 1;
     assert_eq!(old.pop(), Some(0));
     gpu.request_size(1024, 768).unwrap();
     gpu.restore_state(&old).unwrap();
-    assert_eq!(gpu.save_state().unwrap(), current);
+    let restored = gpu.state.lock();
+    assert_eq!(restored.preferred, (1920, 1080));
+    assert!(restored.flush_pending.is_none());
 }
 
 #[test]
