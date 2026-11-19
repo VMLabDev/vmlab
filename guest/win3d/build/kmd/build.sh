@@ -18,8 +18,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
 OUT=$REPO/out/kmd
-# 58105 identifies the package rebased to Yttrium's November 2026 release.
-DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58105}
+# 58106 numbers the CPU copies of Blt presents (patches/kmd/0006). 58105 was
+# the package rebased to Yttrium's November 2026 release.
+DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58106}
 IMAGE=vmlab-win3d/kmd-build:1
 
 pin() { awk -v n="$1" '$1 == n { print $'"$2"' }' "$HERE/PINS"; }

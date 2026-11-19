@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58105` | The PE version resource and the INF's `DriverVer` version. This version identifies the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58106` | The PE version resource and the INF's `DriverVer` version. This version numbers the CPU copies of Blt presents (`0006`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Trace build
 
@@ -192,6 +192,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `0003-kmd-create-context-for-gdi-devices.patch` | Creates the legacy host context when the kernel device is constructed, so GDI devices that present without a UMD have one ([`docs/gdi-context.md`](../../docs/gdi-context.md)). |
 | `0004-kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
 | `0005-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
+| `0006-kmd-number-cpu-present-copies.patch` | Increments a sequence number before and after the CPU copy of each Blt present and returns it through the escape `VIOGPU_CPU_COPY_SEQUENCE`. The user-mode driver reads upload sources under it (`patches/mesa/0094`), so that the compositor does not compose a window from a copy that is half done ([`docs/tearing.md`](../../docs/tearing.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
@@ -209,9 +210,9 @@ mutex, and resets the native clock cache with the host objects.
 The build was bit-reproducible on this host at the September base
 (`b99d951a`): a run on 2026-10-17 gave the same sha256 for all six outputs,
 including the PDB, as the run recorded in [docs/evidence/kmd/00-signing-host.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/00-signing-host.txt).
-At `e9917ae2` with the four patches and version `100.6.101.58105`, two runs
-on 2026-11-19 (one of `build/kmd/build.sh` alone, one inside
-`scripts/build.sh`) gave the same sha256 for all six outputs:
+At `e9917ae2` with the four patches of that day and version
+`100.6.101.58105`, two runs on 2026-11-19 (one of `build/kmd/build.sh` alone,
+one inside `scripts/build.sh`) gave the same sha256 for all six outputs:
 
 ```
 ff46043d31193414a86051aa049aa2ec5cad15a8c5e35cac146ae1041c9ebfd6  x64/viogpu3d.sys

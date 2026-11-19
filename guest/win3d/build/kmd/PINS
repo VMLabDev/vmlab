@@ -18,3 +18,6 @@ debian              image docker.io/library/debian  sha256:2c037a04925515fdd6ea8
 #     Applies unchanged on e9917ae2.
 #   0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch  sha256 e980108d32c23c1726046a40259d2f45dab7ec6400dc3080230c66485a510f81
 #     this repository (docs/present.md): maps the Blt present destination cached.
+#   0005-kmd-flip-trace-build.patch, 0006-kmd-number-cpu-present-copies.patch
+#     this repository (docs/tearing.md): the trace build (KMD_TRACE=1), and the
+#     sequence number of Blt present copies that patches/mesa/0094 reads.

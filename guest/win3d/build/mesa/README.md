@@ -75,11 +75,11 @@ The series has two parts, and the patches apply in name order:
   build output, not source. The diff was then split by topic. Each patch has
   a header that says what it fixes and which prior-art finding it comes from.
 - **0012 to 0017, 0021 to 0024, 0026, 0027, 0030 to 0032, 0035, 0040 to 0044,
-  0060, 0065 to 0067, 0070, 0080, 0085, 0086 and 0091 to 0093** are this
+  0060, 0065 to 0067, 0070, 0080, 0085, 0086 and 0091 to 0094** are this
   repository's own fixes.
 
 By DLL: 0005 to 0010, 0012 to 0017, 0021 to 0024, 0026, 0030 to 0032, 0035,
-0040 to 0044, 0060 and 0091 to 0093 change `viogpu_d3d10.dll`, the
+0040 to 0044, 0060 and 0091 to 0094 change `viogpu_d3d10.dll`, the
 D3D9/D3D10/D3D11 UMD (the `d3d10umd` frontend and the Yttrium winsys). 0032
 also changes Gallium's `tgsi_to_nir`, in a branch that only a TGSI
 tessellation control shader reaches, which only the UMD makes. 0001 to 0003
@@ -142,6 +142,7 @@ what upstream now has.
 | 0086 zink-keep-buffers-mappable-without-visible-vram | Zink keeps directly mapped buffers in host-visible memory when the device has no device-local, host-visible type (needed with 0070; Unigine Heaven and Valley crashed). Written by the unigl worker; carried unchanged | [`docs/nvva.md`](../../docs/nvva.md) |
 | 0091 d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker | With the ordered context worker, D3D9 vertex-buffer locks are no longer copied whole into upload buffers: a `DISCARD|NOOVERWRITE` buffer lock is a NOOVERWRITE lock (as in DXVK), DISCARD and NOOVERWRITE locks need no copy, and after a plain lock each draw copies only the vertices it reads. Copies and user-pointer vertex data are packed into the uploader and the draw rebased. Unigine Valley D3D9, a 32-bit process, created about 400 MB/s of 4 MiB mapped upload buffers and ran out of address space (compat F6) | [`docs/f6va.md`](../../docs/f6va.md) |
 | 0092 yttrium-bound-in-flight-uploads | In a 32-bit process the live upload buffers are held to 256 MiB (`UPLOAD_BUDGET_MB`): over it, a flush waits for the oldest batches and D3D9 Present waits for the worker. `UPLOAD_STATS=1` logs upload, buffer, texture and blob-map counts every 5 s | [`docs/f6va.md`](../../docs/f6va.md) |
+| 0094 yttrium-read-upload-sources-under-the-present-copy-sequence | The copy of a caller's memory into the upload staging buffer (`UpdateSubresourceUP`) reads the KMD's sequence number of Blt present copies before and after, and repeats when a copy ran across it, for at most 100 ms. The compositor uploads the destination of a Blt present this way, so it no longer composes a window from a copy that is half done (with `patches/kmd/0006`; [`docs/tearing.md`](../../docs/tearing.md)) |
 
 0021 has no mail header. `scripts/pins-table.py` carries its one-line
 description.
