@@ -827,7 +827,38 @@ fn macos_boot_stall_census() {
         let mut agent_failed = None;
         if let (Some(_), Some(wait)) = (reached, agent_wait) {
             match AgentClient::connect(&vm.agent, wait) {
-                Ok(_) => agent_times.push(started.elapsed().as_secs_f64()),
+                Ok(mut guest) => {
+                    agent_times.push(started.elapsed().as_secs_f64());
+                    // `VMLAB_HV_MACOS_STALL_EXEC=<sh script>` runs it in the
+                    // guest, powers the guest down and keeps the overlay: a
+                    // changed disk a later census boots as its template
+                    // (`VMLAB_HV_MACOS_DISK`).
+                    if let Ok(script) = std::env::var("VMLAB_HV_MACOS_STALL_EXEC") {
+                        let result = guest
+                            .exec(&["/bin/sh", "-c", &script], Duration::from_secs(120))
+                            .unwrap();
+                        eprintln!(
+                            "census exec: exit {} stdout {:?} stderr {:?}",
+                            result.exit_code,
+                            String::from_utf8_lossy(&result.stdout),
+                            String::from_utf8_lossy(&result.stderr)
+                        );
+                        guest
+                            .shutdown("powerdown", Duration::from_secs(10))
+                            .unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(120);
+                        while vm.process.try_wait().unwrap().is_none() && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        directory.disable_cleanup(true);
+                        eprintln!(
+                            "census exec: stopped {}, overlay {}",
+                            vm.process.try_wait().unwrap().is_some(),
+                            path.join("disk.qcow2").display()
+                        );
+                    }
+                }
                 Err(error) => {
                     last = sample_rips(&mut vm.client, 4);
                     agent_failed = Some(error);
