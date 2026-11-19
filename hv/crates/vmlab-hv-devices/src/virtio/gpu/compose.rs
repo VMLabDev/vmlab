@@ -129,7 +129,8 @@ fn update(
                     let dest = ((row * view.w + x) * 4) as usize;
                     let len = ((right - x) * 4) as usize;
                     let mut differs = false;
-                    for (i, pixel) in pixels[dest..dest + len].chunks_exact_mut(4).enumerate() {
+                    let (row_pixels, _) = pixels[dest..dest + len].as_chunks_mut::<4>();
+                    for (i, pixel) in row_pixels.iter_mut().enumerate() {
                         let source = resource.pixel(offset + i * 4);
                         differs |= pixel[..3] != source[..3];
                         pixel[..3].copy_from_slice(&source[..3]);
