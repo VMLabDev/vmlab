@@ -1,7 +1,134 @@
 # Phase-2 performance gate (HV-D28)
 
 **Verdict: D28 remains open. Round 7 met six of ten core bars. Card #71 then
-closed G1 (0.9770). Card #72 reran G2 and did not close it (1.0182).**
+closed G1 (0.9770). Card #72 reran G2 and did not close it (1.0182). Card #73
+closed G6 (1.6307).**
+
+## Round 7 follow-up: G6 4 KiB random writes (card #73, 2026-11-19)
+
+G6 now passes: vmlab-hv writes 29,592.9 IOPS against QEMU's 18,147.4, a
+ratio of 1.6307. Round 7 measured 13,200.5 against 17,723.0.
+
+### Cause
+
+The gate runs the random write after it removes the 512 MiB file of the
+sequential write. The Ubuntu template mounts `/` with `discard` (checked
+in the guest), so the removal reaches the disk as discards of up to 8,192
+clusters. QEMU ignores discards with
+this argv. vmlab-hv frees the clusters. A freed cluster must not be handed
+out before the flush that makes the removal of its mapping durable, and
+since `30d3ba7a` (2026-11-10, between rounds 6 and 7) such *retired*
+clusters stayed in the qcow2 free map, where every allocation stepped over
+all of them, lowest first, with one hash lookup each. The random write
+allocates about 11,600 new clusters and sends no flush until its end.
+
+- F1, the walk. With the gate's order, 36% of the user-space instruction
+  samples of the vmlab-hv process (`bench/ipsample.c`, all threads) were in
+  that hash lookup. The disk worker used 0.57 to 0.59 seconds of user CPU
+  for the 20,000 writes. With the fix it uses 0.02 to 0.03.
+- F2, the order decides. On a fresh VM that runs only the random write,
+  vmlab-hv at `34e39e6c` wrote 31,131 IOPS. After the gate's earlier block
+  workloads the same binary wrote 13,643 to 16,568 in six runs. QEMU wrote
+  15,580 alone and 8,581 to 18,106 after the earlier workloads.
+- F3, not the cause: the queue notification (FD6, card #98). The wake of
+  the disk worker from the vCPU thread is 6% to 8% of the same samples with
+  and without the walk. Card #98 stays open. The round-7 binary and the
+  binary of `next` measured the same (5,082 to 15,513 against 15,332 to
+  16,568, three runs each on a loaded host), so the changes of card #71
+  did not move G6 either. Its rerun of 0.9845 and round 7's 0.7448 are one
+  state: the walk put vmlab-hv at about QEMU's rate, and host noise decided
+  the side of 0.80.
+
+### Fix
+
+Retired clusters stay out of the free map. The scan that fills the map
+skips them, and the flush clears the list and resets the scan as before,
+which then finds them as ordinary holes. The order of allocation is
+unchanged. The scan also reads the cached refcount block in place: it ran
+on every allocation and copied the 64 KiB block each time. A unit test
+discards 32 clusters and checks that none is reused or in the map before
+the flush, and that the lowest is reused after it.
+
+Diagnostic runs of the gate's block sequence on the shared host, one VM at
+a time, QEMU, fix, base in turn:
+
+| Build | Random write 4 KiB (IOPS) | Disk worker user CPU (s) |
+|---|---|---|
+| QEMU 11.1.3 | 16,601.5, 10,913.8 | n/a |
+| vmlab-hv at `34e39e6c` | 16,447.7, 13,642.9 | 0.58, 0.59 |
+| vmlab-hv with the fix | 30,226.0, 28,523.0 | 0.03, 0.02 |
+
+### Quiet-window rerun
+
+The rerun used round 7's method on helios from
+`2850c4543db2d7407f972ca5b0abc7af464c8e2e`: `bench/run.py --arch x86_64
+--guest ubuntu-26.04 --repeats 3`, all three QEMU repeats and then all
+three vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Ubuntu 26.04.3. QEMU was
+11.1.3. The release vmlab-hv binary SHA-256 was
+`3f91d729c8c029972686ce55b5f45cb3b215b0a275036e17a23aa89d3f6cb72a` and the
+iPXE ROM was
+`9bfcf6535d787e2083d65ee201d414669c7493e7dbdf52953a9513b6481af8a0`.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 125 samples at
+five-second intervals from 01:04:17 to 01:14:38 UTC on 2026-11-19. The
+one-minute load ranged from 0.67 to 2.19, the five-minute load from 1.14
+to 1.49 and the fifteen-minute load from 1.43 to 1.68. The opticlang pause
+was not confirmed. The host's I/O pressure (`/proc/pressure/io`, some)
+read 67% to 83% with no VM running, before the window. Logs, hashes, the
+diagnostic scripts and their raw results remain on helios under
+`/home/vmlab/src/stc/logs/d28-card-73/`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G6 | Random write 4 KiB (IOPS) | 11914.1, 18147.4, 18315.6 | 18147.40 | 32167.5, 10732.9, 29592.9 | 29592.90 | 1.6307 | PASS |
+
+One repeat of each backend is slow. QEMU's first repeat also wrote
+sequentially at 176 MiB/s against 1,500 and 1,636 in the other two. The
+second vmlab-hv repeat has no other slow workload, and its cause is not
+established. The verdict uses the medians, as every round does.
+
+The same runs measure the other single-VM workloads. Their cards own the
+verdicts:
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Round 7 |
+|---|---|---:|---:|---:|---:|
+| G1 | Ubuntu boot (s) | 6.55 | 6.40 | 0.9771 | 1.0500 |
+| G3 | Sequential read (MiB/s) | 18670.33 | 20527.83 | 1.0995 | 1.1071 |
+| G4 | Sequential write (MiB/s) | 1500.12 | 4011.44 | 2.6741 | 2.6338 |
+| G5 | Random read 4 KiB (IOPS) | 51404.30 | 68653.40 | 1.3356 | 1.3979 |
+| G7 | UDP TX (Mbit/s) | 31342.44 | 27116.01 | 0.8652 | 0.7266 |
+| G8 | UDP RX (Mbit/s) | 85529.15 | 107336.73 | 1.2550 | 1.2490 |
+
+Idle host CPU was 1.08% of one core on QEMU and 2.05% on vmlab-hv. All 16
+aggregate records and their samples are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl). The vmlab-hv records are
+marked dirty because the QEMU run had appended to that tracked file.
+Windows boot (G2) and the guest-to-guest pair were not run.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD9: a write that allocates a cluster writes the whole 64 KiB cluster.
+  The 20,000 random writes carry 82 MB of guest data. vmlab-hv wrote
+  758 MB to the host file for them (`write_bytes` of `/proc/<pid>/io`,
+  11,571 clusters), QEMU 90 to 102 MB: QEMU zeroes a new cluster through
+  the host file system and writes only the guest's bytes. The cost did not
+  show in G6 after the fix. It is about nine times the dirty page cache
+  for a guest that writes small blocks to new space.
+- FD10: vmlab-hv acts on guest discards where QEMU, with vmlab's argv,
+  ignores them. A discarded cluster's mapping is cleared, so a later read
+  of it returns the backing file's content, not zeros and not the last
+  written data. VIRTIO leaves the content after a discard undefined. Decide
+  whether the cluster should read as zeros (the qcow2 zero flag), as QEMU's
+  `discard=unmap` does for an image with a backing file.
+- FD11: QEMU's random write fell from 30,948 IOPS in round 5 to 17,723 in
+  round 7 on the same template, and its sequential write from 4,769 MiB/s
+  in round 6 to 1,480. QEMU went from 11.1.2 to 11.1.3 in between. The
+  cause is not established. The I/O pressure reading above is a place to
+  start.
 
 ## Round 7 follow-up: G2 Windows 10 boot (card #72, 2026-11-19)
 
@@ -296,7 +423,7 @@ Boot requires a median ratio at most 1.00. Throughput requires at least
 | G3 | Sequential read (MiB/s) | 15505.99 | 17166.19 | 1.1071 | PASS |
 | G4 | Sequential write (MiB/s) | 1480.02 | 3898.07 | 2.6338 | PASS |
 | G5 | Random read 4 KiB (IOPS) | 50750.00 | 70941.20 | 1.3979 | PASS |
-| G6 | Random write 4 KiB (IOPS) | 17723.00 | 13200.50 | 0.7448 | FAIL (card #73) |
+| G6 | Random write 4 KiB (IOPS) | 17723.00 | 13200.50 | 0.7448 | FAIL (card #73, closed above) |
 | G7 | UDP TX (Mbit/s) | 35457.47 | 25763.87 | 0.7266 | FAIL (card #74) |
 | G8 | UDP RX (Mbit/s) | 86199.69 | 107667.66 | 1.2490 | PASS |
 | G9 | TCP A to B (Mbit/s) | 26851.93 | 31155.99 | 1.1603 | PASS |
