@@ -88,7 +88,9 @@ impl MountReport {
             let reason = match inner.shares.get(share) {
                 Some(ShareState::Mounted) => continue,
                 Some(ShareState::Unmountable(reason)) => reason.as_str(),
-                Some(ShareState::Mounting { last: Some(reason), .. }) => reason.as_str(),
+                Some(ShareState::Mounting {
+                    last: Some(reason), ..
+                }) => reason.as_str(),
                 _ => "the mount task ended before the share was mounted",
             };
             anyhow::bail!(

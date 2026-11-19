@@ -6008,7 +6008,10 @@ lab "t" {
         let (sink, said) = numbered(&sh);
         let error = format!("{:#}", lab.up(&[], sink).await.unwrap_err());
         assert!(error.contains("\"win\""), "{error}");
-        assert!(error.contains("SMB share \"data\" did not mount"), "{error}");
+        assert!(
+            error.contains("SMB share \"data\" did not mount"),
+            "{error}"
+        );
         assert!(error.contains("Access is denied"), "{error}");
         assert!(calls.load(Ordering::SeqCst) > 1);
         assert!(
