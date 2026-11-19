@@ -1,0 +1,396 @@
+Subject: [PATCH] yttrium: draw forced-sample coverage as one pass per sample
+
+Direct2D on feature level 11.1 antialiases shapes with target-independent
+rasterization: it draws triangle fans with ForcedSampleCount 16 into a
+single-sampled R16_UINT texture, the pixel shader writes SV_Coverage, and the
+output merger XORs it in. The driver draws that once, at 16 samples with no
+attachment, and does the XOR in the fragment shader under a pixel interlock
+(VK_EXT_fragment_shader_interlock).
+
+On an NVIDIA host through Venus two fragments of one pixel whose coverage is
+disjoint lose one of their XORs. That is every pixel on an edge two triangles
+of a fan share. Microsoft Word's ribbon showed short pale gaps in its rounded
+boxes, in other places at every start (GitHub #236).
+
+Send such a draw as one single-sampled draw per sample instead, with the
+texture as an ordinary colour attachment and the blender's logic op XOR, so
+no lock is needed:
+
+- For sample i the viewport is moved so that the pixel centre falls on that
+  sample's position (D3D11's standard pattern).
+- One pipeline serves all the draws: each draw's viewport has its depth range
+  collapsed to (i + 0.5) / 16, and the fragment shader takes its SV_Coverage
+  bit from the fragment depth.
+- It is taken only for what Direct2D does here: one R16_UINT single-sampled
+  target, logic op XOR, no blending, no depth buffer, a shader that reads the
+  sample mask and does no per-sample shading. Everything else, and every
+  indirect draw, goes the old way.
+
+D3D10UMD_YTTRIUM_FORCED_SAMPLE_PASSES=0 (FORCED_SAMPLE_PASSES=0 in
+yttrium.ini) brings the interlock path back.
+
+Explained in docs/d2d-coverage.md, with the check and the result on an AMD
+host.
+---
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_internal.h b/src/gallium/winsys/yttrium/gdi/yttrium_internal.h
+index 05a0456..dfd90fd 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_internal.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_internal.h
+@@ -259,6 +259,7 @@ struct yttrium_context {
+    uint32_t current_pipeline_rasterization_samples;
+    uint32_t current_pipeline_forced_sample_count;
+    VkBool32 current_pipeline_forced_sample_interlock;
++   VkBool32 current_pipeline_forced_sample_pass;
+    uint32_t current_pipeline_rt_count;
+    uint32_t current_pipeline_render_width;
+    uint32_t current_pipeline_render_height;
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c
+index 39e204e..171295e 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c
+@@ -319,6 +319,12 @@ yttrium_pipeline_sample_mask_expand_fs_hash(uint64_t fs_hash,
+           ((uint64_t)hw_sample_count << 32) ^ (uint64_t)app_sample_count;
+ }
+ 
++static uint64_t
++yttrium_pipeline_forced_sample_pass_fs_hash(uint64_t fs_hash)
++{
++   return fs_hash ^ 0x5a3b1e5000000000ull;
++}
++
+ static uint64_t
+ yttrium_pipeline_forced_sample_interlock_fs_hash(uint64_t fs_hash)
+ {
+@@ -432,6 +438,103 @@ yttrium_pipeline_can_use_forced_sample_interlock(
+          yctx, draw_state->forced_sample_count) > 1;
+ }
+ 
++/* D3D11's standard sample positions, in sixteenths of a pixel from the pixel
++ * centre (D3D11_STANDARD_MULTISAMPLE_PATTERN).
++ */
++static const int8_t yttrium_forced_sample_offsets_2[2][2] = {
++   { 4, 4 }, { -4, -4 },
++};
++static const int8_t yttrium_forced_sample_offsets_4[4][2] = {
++   { -2, -6 }, { 6, -2 }, { -6, 2 }, { 2, 6 },
++};
++static const int8_t yttrium_forced_sample_offsets_8[8][2] = {
++   { 1, -3 }, { -1, 3 }, { 5, 1 }, { -3, -5 },
++   { -5, 5 }, { -7, -1 }, { 3, 7 }, { 7, -7 },
++};
++static const int8_t yttrium_forced_sample_offsets_16[16][2] = {
++   { 1, 1 }, { -1, -3 }, { -3, 2 }, { 4, -1 },
++   { -5, -2 }, { 2, 5 }, { 5, 3 }, { 3, -5 },
++   { -2, 6 }, { 0, -7 }, { -4, -6 }, { -6, 4 },
++   { -8, 0 }, { 7, -4 }, { 6, 7 }, { -7, -8 },
++};
++
++static const int8_t *
++yttrium_pipeline_forced_sample_offset(uint32_t sample_count, uint32_t sample)
++{
++   switch (sample_count) {
++   case 2:
++      return yttrium_forced_sample_offsets_2[sample];
++   case 4:
++      return yttrium_forced_sample_offsets_4[sample];
++   case 8:
++      return yttrium_forced_sample_offsets_8[sample];
++   case 16:
++      return yttrium_forced_sample_offsets_16[sample];
++   default:
++      return NULL;
++   }
++}
++
++static bool
++yttrium_pipeline_forced_sample_passes_enabled(void)
++{
++   static int enabled = -1;
++
++   if (enabled < 0)
++      enabled = yttrium_gdi_debug_get_bool_option(
++         "D3D10UMD_YTTRIUM_FORCED_SAMPLE_PASSES", true) ? 1 : 0;
++
++   return enabled != 0;
++}
++
++/* Number of single-sampled draws that stand in for one forced-sample draw, or
++ * 0 when the draw is not the XOR coverage accumulation of target-independent
++ * rasterization (Direct2D: SV_Coverage XORed into an R16_UINT target).
++ *
++ * The interlock path below rasterizes once at the forced sample count and
++ * XORs under a fragment shader pixel interlock.  Seen with an NVIDIA host
++ * (Venus): two fragments of one pixel with disjoint coverage (the triangles
++ * on either side of a shared edge) lose one of their XORs, as if the lock
++ * did not hold between them: thin gaps along the inner edges of Direct2D's
++ * triangle fans, in different places on every run.  One draw per sample needs
++ * no lock: each draw is single-sampled with the viewport moved so that the
++ * pixel centre falls on that sample's position, and the blender's logic op
++ * XORs that sample's bit in primitive order.
++ */
++static uint32_t
++yttrium_pipeline_forced_sample_pass_count(
++   struct yttrium_context *yctx,
++   const struct yttrium_resource *dst,
++   const struct yttrium_venus_draw_state *draw_state)
++{
++   struct yttrium_shader_state *fs =
++      yctx ? yctx->shaders[MESA_SHADER_FRAGMENT] : NULL;
++   const struct pipe_surface *cbuf =
++      yctx && yctx->fb.nr_cbufs == 1 ? &yctx->fb.cbufs[0] : NULL;
++
++   if (!yttrium_pipeline_forced_sample_passes_enabled() ||
++       !dst || !draw_state || !fs || !fs->nir || !cbuf || !cbuf->texture ||
++       yttrium_resource(cbuf->texture) != dst || yctx->fb.zsbuf.texture ||
++       draw_state->rt_count != 1 || draw_state->viewport_count > 1 ||
++       !yttrium_pipeline_forced_sample_offset(
++          draw_state->forced_sample_count, 0) ||
++       !draw_state->logic_op_enable ||
++       draw_state->logic_op != VK_LOGIC_OP_XOR ||
++       draw_state->rt_blend_enable[0] ||
++       !(draw_state->rt_color_write_mask[0] & VK_COLOR_COMPONENT_R_BIT) ||
++       draw_state->alpha_test_enable ||
++       draw_state->alpha_to_coverage_enable ||
++       cbuf->format != PIPE_FORMAT_R16_UINT ||
++       dst->base.target != PIPE_TEXTURE_2D ||
++       MAX2(dst->base.nr_samples, 1) != 1 ||
++       dst->venus.vk_format != VK_FORMAT_R16_UINT ||
++       !yttrium_shader_state_uses_sample_mask_in(fs) ||
++       yttrium_pipeline_fs_uses_sample_shading(fs))
++      return 0;
++
++   return draw_state->forced_sample_count;
++}
++
+ static VkBlendFactor
+ yttrium_pipeline_x8_color_blend_factor(VkBlendFactor factor)
+ {
+@@ -2359,6 +2462,10 @@ yttrium_pipeline_build_key(struct yttrium_context *yctx,
+    key->rasterization_samples = MAX2(draw_state->rasterization_samples, 1);
+    key->forced_sample_count = draw_state->forced_sample_count;
+    key->forced_sample_interlock = draw_state->forced_sample_interlock;
++   key->forced_sample_pass =
++      draw_state->forced_sample_pass ? VK_TRUE : VK_FALSE;
++   if (key->forced_sample_pass && fs)
++      key->fs_hash = yttrium_pipeline_forced_sample_pass_fs_hash(key->fs_hash);
+    const bool forced_sample_state = key->forced_sample_count > 1;
+    bool forced_sample_blend_sample_mask = false;
+    if (forced_sample_state && fs &&
+@@ -2829,6 +2936,8 @@ yttrium_pipeline_record_current_identity(
+       draw_state->forced_sample_count;
+    yctx->current_pipeline_forced_sample_interlock =
+       draw_state->forced_sample_interlock;
++   yctx->current_pipeline_forced_sample_pass =
++      draw_state->forced_sample_pass ? VK_TRUE : VK_FALSE;
+    yctx->current_pipeline_rt_count = draw_state->rt_count;
+    yctx->current_pipeline_render_width = draw_state->render_width;
+    yctx->current_pipeline_render_height = draw_state->render_height;
+@@ -2874,6 +2983,8 @@ yttrium_pipeline_current_identity_equal(
+              draw_state->forced_sample_count &&
+           yctx->current_pipeline_forced_sample_interlock ==
+              draw_state->forced_sample_interlock &&
++          yctx->current_pipeline_forced_sample_pass ==
++             (draw_state->forced_sample_pass ? VK_TRUE : VK_FALSE) &&
+           yctx->current_pipeline_rt_count == draw_state->rt_count &&
+           yctx->current_pipeline_render_width == draw_state->render_width &&
+           yctx->current_pipeline_render_height == draw_state->render_height &&
+@@ -3073,6 +3184,32 @@ yttrium_pipeline_get(struct yttrium_context *yctx,
+       pipeline_fs = generated_fs;
+    }
+ 
++   if (key.forced_sample_pass && pipeline_fs) {
++      struct yttrium_shader_state *pass_fs =
++         yttrium_shader_create_forced_sample_pass_fs(&yctx->base,
++                                                     pipeline_fs);
++      if (!pass_fs) {
++         YTTRIUM_WARN("yttrium: forced-sample-pass pipeline create failed fs=%u\n",
++                      key.fs_id);
++         if (generated_fs)
++            yttrium_shader_state_destroy(screen, generated_fs);
++         if (generated_gs)
++            yttrium_shader_state_destroy(screen, generated_gs);
++         if (generated_vs)
++            yttrium_shader_state_destroy(screen, generated_vs);
++         FREE(pipeline);
++         return NULL;
++      }
++      YTTRIUM_WARN("yttrium: forced-sample draw %s fs=%u coverage=passes rt_format=%u %ux%u\n",
++                   yttrium_trace_process_name(), key.fs_id,
++                   key.rt_count ? key.rt_format[0] : VK_FORMAT_UNDEFINED,
++                   key.width, key.height);
++      if (generated_fs)
++         yttrium_shader_state_destroy(screen, generated_fs);
++      generated_fs = pass_fs;
++      pipeline_fs = generated_fs;
++   }
++
+    if (emulate_forced_sample_mask && pipeline_fs) {
+       struct yttrium_shader_state *forced_sample_fs =
+          yttrium_shader_create_forced_sample_mask_fs(
+@@ -6137,6 +6274,40 @@ yttrium_pipeline_try_draw(struct pipe_context *ctx,
+       return true;
+    }
+ 
++   /* A forced-sample coverage draw goes out as one draw per sample; see
++    * yttrium_pipeline_forced_sample_pass_count.
++    */
++   const uint32_t forced_sample_passes =
++      draw_state->forced_sample_pass || indirect ? 0 :
++      yttrium_pipeline_forced_sample_pass_count(yctx, dst, draw_state);
++   for (uint32_t i = 0; i < forced_sample_passes; i++) {
++      const int8_t *offset =
++         yttrium_pipeline_forced_sample_offset(forced_sample_passes, i);
++      struct yttrium_venus_draw_state pass_state = *draw_state;
++
++      pass_state.forced_sample_pass = i + 1;
++      pass_state.forced_sample_count = 0;
++      pass_state.rasterization_samples = 1;
++      pass_state.depth_bias_enable = VK_FALSE;
++      pass_state.viewports[0].x -= (float)offset[0] / 16.0f;
++      pass_state.viewports[0].y -= (float)offset[1] / 16.0f;
++      pass_state.viewports[0].minDepth = ((float)i + 0.5f) / 16.0f;
++      pass_state.viewports[0].maxDepth = pass_state.viewports[0].minDepth;
++
++      const enum yttrium_pipeline_draw_result result =
++         yttrium_pipeline_try_draw(ctx, dst, info, indirect, draws,
++                                   num_draws, &pass_state);
++      if (result == YTTRIUM_PIPELINE_DRAW_EMITTED) {
++         if (i + 1 == forced_sample_passes)
++            return result;
++         continue;
++      }
++      /* Nothing drawn yet: the one-draw paths below can still take it. */
++      if (i == 0 && result == YTTRIUM_PIPELINE_DRAW_UNSUPPORTED)
++         break;
++      return YTTRIUM_PIPELINE_DRAW_EMIT_FAILED;
++   }
++
+    struct yttrium_resource *args = draw_indirect ?
+       yttrium_resource(indirect->buffer) : NULL;
+    if (draw_indirect) {
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h
+index 5703983..ed3580a 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h
+@@ -82,6 +82,7 @@ struct yttrium_pipeline_key {
+    uint32_t forced_sample_count;
+    uint32_t forced_sample_expand;
+    VkBool32 forced_sample_interlock;
++   VkBool32 forced_sample_pass;
+    VkBool32 sample_shading_enable;
+    VkBool32 alpha_to_coverage_enable;
+    VkBool32 logic_op_enable;
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_shader.c b/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
+index 7c42689..d50c974 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
+@@ -3866,6 +3866,78 @@ yttrium_shader_create_forced_sample_mask_fs(
+    return shader;
+ }
+ 
++static bool
++yttrium_shader_rewrite_forced_sample_pass_instr(nir_builder *b,
++                                                nir_intrinsic_instr *intrin,
++                                                void *data)
++{
++   (void)data;
++
++   if (intrin->intrinsic != nir_intrinsic_load_sample_mask_in)
++      return false;
++
++   /* One draw per sample: the draw for sample i runs single-sampled with the
++    * viewport's depth range collapsed to (i + 0.5) / 16, so the fragment
++    * depth names the sample and SV_Coverage is that sample's bit.
++    */
++   b->cursor = nir_before_instr(&intrin->instr);
++   nir_def *depth = nir_channel(b, nir_load_frag_coord(b), 2);
++   nir_def *index =
++      nir_iand_imm(b, nir_f2i32(b, nir_fmul_imm(b, depth, 16.0)), 15);
++   nir_def *mask = nir_ishl(b, nir_imm_int(b, 1), index);
++   nir_def_replace(&intrin->def, nir_u2uN(b, mask, intrin->def.bit_size));
++   BITSET_CLEAR(b->shader->info.system_values_read,
++                SYSTEM_VALUE_SAMPLE_MASK_IN);
++   return true;
++}
++
++struct yttrium_shader_state *
++yttrium_shader_create_forced_sample_pass_fs(
++   struct pipe_context *ctx,
++   const struct yttrium_shader_state *fs)
++{
++   struct yttrium_screen *screen = ctx ? yttrium_screen(ctx->screen) : NULL;
++
++   if (!ctx || !screen || !fs || !fs->nir ||
++       fs->stage != MESA_SHADER_FRAGMENT ||
++       !yttrium_shader_state_uses_sample_mask_in(fs))
++      return NULL;
++
++   nir_shader *nir = nir_shader_clone(NULL, fs->nir);
++   if (!nir)
++      return NULL;
++
++   if (!nir_shader_intrinsics_pass(
++          nir, yttrium_shader_rewrite_forced_sample_pass_instr,
++          nir_metadata_control_flow, NULL)) {
++      ralloc_free(nir);
++      return NULL;
++   }
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
++   struct pipe_shader_state state;
++   memset(&state, 0, sizeof(state));
++   state.type = PIPE_SHADER_IR_NIR;
++   state.ir.nir = nir;
++
++   struct yttrium_shader_state *shader =
++      yttrium_shader_state_create(ctx, &state, MESA_SHADER_FRAGMENT);
++   if (!shader)
++      return NULL;
++
++   yttrium_shader_copy_sampler_binding_map(shader, fs);
++   shader->token_hash = fs->token_hash ^ 0x5a3b1e5000000000ull;
++
++   if (!yttrium_shader_state_has_module(shader)) {
++      YTTRIUM_WARN("yttrium: forced-sample-pass FS create failed shader module id=%u base_fs=%u\n",
++                   shader->id, fs->id);
++      yttrium_shader_state_destroy(screen, shader);
++      return NULL;
++   }
++
++   return shader;
++}
++
+ struct yttrium_sample_mask_expand {
+    unsigned hw_sample_count;
+    unsigned app_sample_count;
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_shader.h b/src/gallium/winsys/yttrium/gdi/yttrium_shader.h
+index c792ff4..2b4cc71 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_shader.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_shader.h
+@@ -203,6 +203,11 @@ yttrium_shader_create_forced_sample_interlock_fs(
+    const struct yttrium_shader_state *fs,
+    unsigned image_slot);
+ 
++struct yttrium_shader_state *
++yttrium_shader_create_forced_sample_pass_fs(
++   struct pipe_context *ctx,
++   const struct yttrium_shader_state *fs);
++
+ uint32_t
+ yttrium_shader_state_sampler_used_mask(
+    const struct yttrium_shader_state *shader);
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
+index 19cee70..8bedf22 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
+@@ -455,6 +455,10 @@ struct yttrium_venus_draw_state {
+    uint32_t rasterization_samples;
+    uint32_t forced_sample_count;
+    VkBool32 forced_sample_interlock;
++   /* 1-based sample index while a forced-sample draw is emitted as one
++    * single-sampled draw per sample; 0 otherwise.
++    */
++   uint32_t forced_sample_pass;
+    VkBool32 alpha_to_coverage_enable;
+    VkBool32 logic_op_enable;
+    VkLogicOp logic_op;
