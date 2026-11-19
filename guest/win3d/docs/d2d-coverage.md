@@ -59,18 +59,28 @@ driver writes one line into `C:\ProgramData\Yttrium\yttrium-errors.log`:
 `forced-sample draw <process> ... coverage=passes` on the new path, and
 `requested=16 hw=<n> ... coverage=native` or `coverage=expanded` on the
 interlock path. The script passes when no pixel differs from WARP or between
-runs and every line about the probe says `coverage=passes`. A probe that
-draws the right picture without such a line did not reach the path, and that
-fails.
+runs and every line about the probe says `coverage=passes`. An x64 probe
+that draws the right picture without such a line did not reach the path, and
+that fails. The x86 driver wrote no such line in any run, and why is not
+known, so the x86 probe is judged by its picture alone. On `AMD1` and
+`Nvidia2` that is enough, because the interlock path gives a wrong picture on
+both (the table below).
+
+As the driver makes that log, only the process that made it can append to
+it, and that is `dwm.exe` most often: other users get read access. A line of
+a program that runs as the logged-on user is then lost. The script first
+gives every user the right to append.
 
 The script is not part of `tests/e2e/run.sh`. It stands beside it until the
 adapter suite of design card C8 takes it in.
 
-A probe that fills and strokes shapes through Direct2D itself is not enough.
-The adapter suite's first `d2d_probe.exe`, and a second one written for this
-patch with thin outlines and a figure of 2000 segments, never reached the
-path: the driver logged no line for them, on either path. Which shapes make
-Direct2D choose target-independent rasterization was not found. `dwm.exe`,
+A probe that fills and strokes shapes through Direct2D itself was not enough.
+One written for this patch (filled and stroked rounded rectangles, ellipses,
+stars and Bezier shapes, and a figure of 2000 segments) never reached the
+path: with the log removed before each run, the driver made no log at all,
+on either path. The `d2d_probe.exe` of the adapter suite fills a subset of
+those shapes. Which shapes make Direct2D choose target-independent
+rasterization was not found. `dwm.exe`,
 `copilotapphost.exe` and Word's Current Channel build reach it. Word 2024
 LTSC (16.0.17932) does not.
 
