@@ -19,17 +19,50 @@ handled; unrelated and unwind exceptions continue searching.
 Production-code checks: probes/feedback-loss in vmlab-win3d.
 Test contract and backend prerequisite: docs/tdr-recovery.md.
 ---
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
+index 1897dc1..d60a288 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
+@@ -2715,7 +2715,11 @@ yttrium_venus_batch_feedback_store(struct yttrium_venus *venus,
+        !yttrium_venus_ring_probe(venus, reason))
+       return false;
+ 
+-   *slot = (LONG)value;
++   if (!yttrium_venus_ring_store_dword("batch-feedback", (volatile uint32_t *)slot,
++                                       (uint32_t)value)) {
++      yttrium_venus_mark_ring_failed(venus, reason);
++      return false;
++   }
+    MemoryBarrier();
+    return true;
+ }
+@@ -3000,7 +3004,13 @@ yttrium_venus_batch_feedback_load(struct yttrium_venus *venus,
+       return VK_ERROR_DEVICE_LOST;
+ 
+    MemoryBarrier();
+-   return (VkResult)*slot;
++   uint32_t value;
++   if (!yttrium_venus_ring_load_dword("batch-feedback",
++                                      (const volatile uint32_t *)slot, &value)) {
++      yttrium_venus_mark_ring_failed(venus, "batch-feedback-load-fault");
++      return VK_ERROR_DEVICE_LOST;
++   }
++   return (VkResult)value;
+ }
+ 
+ static void
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
+index 7d03d75..778e560 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
-@@ -129,15 +129,17 @@
-
+@@ -126,15 +126,17 @@ struct hash_table_u64;
+ 
  #if defined(_MSC_VER) || (defined(__clang__) && defined(_WIN64))
  #define YTTRIUM_VENUS_HAS_NATIVE_SEH 1
 +#elif defined(_WIN32) && defined(__i386__)
 +#define YTTRIUM_VENUS_HAS_X86_SEH 1
  #endif
-
+ 
  #if defined(YTTRIUM_VENUS_HAS_NATIVE_SEH)
  #define YTTRIUM_VENUS_SEH_TRY __try
  #define YTTRIUM_VENUS_SEH_EXCEPT(filter) __except (filter)
@@ -42,37 +75,14 @@ diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h b/src/galli
  #pragma message("warning: Yttrium Venus ring fault handling: native SEH is unavailable; guarded accesses will execute but faults cannot be recovered")
  #endif
  #define YTTRIUM_VENUS_SEH_TRY if (1)
-diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h
---- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h
-+++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h
-@@ -73,6 +73,20 @@
- yttrium_venus_ring_probe(struct yttrium_venus *venus,
-                          const char *failure_reason);
-
-+void
-+yttrium_venus_mark_ring_failed(struct yttrium_venus *venus,
-+                               const char *reason);
-+
-+bool
-+yttrium_venus_ring_load_dword(const char *field,
-+                              const volatile uint32_t *ptr,
-+                              uint32_t *out);
-+
-+bool
-+yttrium_venus_ring_store_dword(const char *field,
-+                               volatile uint32_t *ptr,
-+                               uint32_t value);
-+
- bool
- yttrium_venus_ring_wait_for_seqno(struct yttrium_venus *venus,
-                                   const struct yttrium_venus_ring_dependency *dependency,
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c
+index 4e008f1..ef2a019 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c
-@@ -13,6 +13,11 @@
-
+@@ -17,6 +17,11 @@
+ 
  #include "venus-protocol/vn_protocol_driver_transport.h"
-
+ 
 +#if defined(YTTRIUM_VENUS_HAS_X86_SEH)
 +#include <excpt.h>
 +#include <setjmp.h>
@@ -80,20 +90,20 @@ diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c b/src/gallium/
 +
  #define YTTRIUM_VENUS_RING_PAUSE_BACKOFF_ITERS 4096
  #define YTTRIUM_VENUS_RING_SLEEP0_BACKOFF_ITERS 65536
-
-@@ -178,7 +183,7 @@
-                  NULL;
+ 
+@@ -189,7 +194,7 @@ yttrium_venus_ring_cancelled(const struct yttrium_venus *venus)
+           gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET;
  }
-
+ 
 -static void ATTRIBUTE_NOINLINE
 +void ATTRIBUTE_NOINLINE
  yttrium_venus_mark_ring_failed(struct yttrium_venus *venus,
                                 const char *reason)
  {
-@@ -229,7 +234,76 @@
+@@ -240,7 +245,76 @@ yttrium_venus_ring_faulting_copy_bytes(void *dst,
     memcpy(dst, src, size);
  }
-
+ 
 -static bool
 +#if defined(YTTRIUM_VENUS_HAS_X86_SEH)
 +/* Keep this boundary in C: only the access leaf is abandoned on a fault. */
@@ -168,10 +178,10 @@ diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c b/src/gallium/
  yttrium_venus_ring_load_dword(const char *field,
                                const volatile uint32_t *ptr,
                                uint32_t *out)
-@@ -243,6 +317,14 @@
+@@ -254,6 +328,14 @@ yttrium_venus_ring_load_dword(const char *field,
        return false;
     }
-
+ 
 +#if defined(YTTRIUM_VENUS_HAS_X86_SEH)
 +   if (yttrium_venus_ring_x86_access(YTTRIUM_VENUS_RING_X86_LOAD,
 +                                     out, (const void *)ptr, 0))
@@ -183,22 +193,22 @@ diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c b/src/gallium/
     YTTRIUM_VENUS_SEH_TRY {
        *out = yttrium_venus_ring_faulting_load_dword(ptr);
        return true;
-@@ -252,9 +334,10 @@
+@@ -263,9 +345,10 @@ yttrium_venus_ring_load_dword(const char *field,
                     field ? field : "<unknown>", (const void *)ptr);
        return false;
     }
 +#endif
  }
-
+ 
 -static bool
 +bool ATTRIBUTE_NOINLINE
  yttrium_venus_ring_store_dword(const char *field,
                                 volatile uint32_t *ptr,
                                 uint32_t value)
-@@ -265,6 +348,14 @@
+@@ -276,6 +359,14 @@ yttrium_venus_ring_store_dword(const char *field,
        return false;
     }
-
+ 
 +#if defined(YTTRIUM_VENUS_HAS_X86_SEH)
 +   if (yttrium_venus_ring_x86_access(YTTRIUM_VENUS_RING_X86_STORE,
 +                                     (void *)ptr, &value, 0))
@@ -210,22 +220,22 @@ diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c b/src/gallium/
     YTTRIUM_VENUS_SEH_TRY {
        yttrium_venus_ring_faulting_store_dword(ptr, value);
        return true;
-@@ -274,9 +365,10 @@
+@@ -285,9 +376,10 @@ yttrium_venus_ring_store_dword(const char *field,
                     field ? field : "<unknown>", (const void *)ptr);
        return false;
     }
 +#endif
  }
-
+ 
 -static bool
 +static bool ATTRIBUTE_NOINLINE
  yttrium_venus_ring_copy_bytes(const char *label,
                                void *dst,
                                const void *src,
-@@ -292,6 +384,15 @@
+@@ -303,6 +395,15 @@ yttrium_venus_ring_copy_bytes(const char *label,
        return false;
     }
-
+ 
 +#if defined(YTTRIUM_VENUS_HAS_X86_SEH)
 +   if (yttrium_venus_ring_x86_access(YTTRIUM_VENUS_RING_X86_COPY,
 +                                     dst, src, size))
@@ -238,52 +248,36 @@ diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.c b/src/gallium/
     YTTRIUM_VENUS_SEH_TRY {
        yttrium_venus_ring_faulting_copy_bytes(dst, src, size);
        return true;
-@@ -302,6 +403,7 @@
+@@ -313,6 +414,7 @@ yttrium_venus_ring_copy_bytes(const char *label,
                     (unsigned long long)size);
        return false;
     }
 +#endif
  }
-
+ 
  static bool
-diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
---- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
-+++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
-@@ -2423,7 +2423,11 @@
-        !yttrium_venus_ring_probe(venus, reason))
-       return false;
-
--   *slot = (LONG)value;
-+   if (!yttrium_venus_ring_store_dword("batch-feedback", (volatile uint32_t *)slot,
-+                                       (uint32_t)value)) {
-+      yttrium_venus_mark_ring_failed(venus, reason);
-+      return false;
-+   }
-    MemoryBarrier();
-    return true;
- }
-@@ -2706,7 +2710,13 @@
-       return VK_ERROR_DEVICE_LOST;
-
-    MemoryBarrier();
--   return (VkResult)*slot;
-+   uint32_t value;
-+   if (!yttrium_venus_ring_load_dword("batch-feedback",
-+                                      (const volatile uint32_t *)slot, &value)) {
-+      yttrium_venus_mark_ring_failed(venus, "batch-feedback-load-fault");
-+      return VK_ERROR_DEVICE_LOST;
-+   }
-+   return (VkResult)value;
- }
-
- static void
-@@ -2753,6 +2763,9 @@
-                                      venus->device_handle, fence);
-          const VkResult feedback_status_after_host_query =
-             yttrium_venus_batch_feedback_load(venus, slot);
-+         if (host_fence_status == VK_ERROR_DEVICE_LOST ||
-+             feedback_status_after_host_query == VK_ERROR_DEVICE_LOST)
-+            return VK_ERROR_DEVICE_LOST;
-          if (host_fence_status == VK_SUCCESS ||
-              feedback_status_after_host_query == VK_SUCCESS)
-             return VK_SUCCESS;
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h
+index f8cfd5a..8b794c3 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_ring.h
+@@ -75,6 +75,20 @@ bool
+ yttrium_venus_ring_probe(struct yttrium_venus *venus,
+                          const char *failure_reason);
+ 
++void
++yttrium_venus_mark_ring_failed(struct yttrium_venus *venus,
++                               const char *reason);
++
++bool
++yttrium_venus_ring_load_dword(const char *field,
++                              const volatile uint32_t *ptr,
++                              uint32_t *out);
++
++bool
++yttrium_venus_ring_store_dword(const char *field,
++                               volatile uint32_t *ptr,
++                               uint32_t value);
++
+ bool
+ yttrium_venus_ring_wait_for_seqno(struct yttrium_venus *venus,
+                                   const struct yttrium_venus_ring_dependency *dependency,

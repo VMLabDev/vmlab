@@ -10,7 +10,7 @@ Origin: codex working tree R/mesa (git diff 374c3022), re-exported by
 vmlab-win3d build/mesa; see build/mesa/README.md.
 ---
 diff --git a/src/gallium/frontends/wgl/stw_context.c b/src/gallium/frontends/wgl/stw_context.c
-index f0f543c243b4c3fd4f063217002d0ab294473962..60f0d39083369f3cc1a4fa63f47426c256b57935 100644
+index f0f543c..60f0d39 100644
 --- a/src/gallium/frontends/wgl/stw_context.c
 +++ b/src/gallium/frontends/wgl/stw_context.c
 @@ -327,7 +327,7 @@ DrvDeleteContext(DHGLRC dhglrc)

@@ -28,10 +28,10 @@ emulation layer, x64 and x86).
 Origin: vmlab-win3d ddraw worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
-index 5d9257d..76ee0eb 100644
+index cc3b7b2..8a2cc01 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
-@@ -737,14 +737,20 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
+@@ -720,11 +720,14 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
        if (FAILED(D3D9ValidateData(data, sizeof(DDRAW_CAPS))))
           return E_INVALIDARG;
        memset(data->pData, 0, data->DataSize);
@@ -42,25 +42,17 @@ index 5d9257d..76ee0eb 100644
        ((DDRAW_CAPS *)data->pData)->Caps2 = DDRAW_CAPS2_DYNAMICTEXTURES;
 -      ((DDRAW_CAPS *)data->pData)->CKeyCaps = 0;
 -      ((DDRAW_CAPS *)data->pData)->FxCaps = 0;
--      D3D9Tracef("GetCaps DDRAW caps=0x%08x caps2=0x%08x\n",
 +      ((DDRAW_CAPS *)data->pData)->CKeyCaps = DDRAW_CKEYCAPS_SRCBLT;
 +      ((DDRAW_CAPS *)data->pData)->FxCaps = DDRAW_FXCAPS_BLTMIRRORLEFTRIGHT |
 +                                            DDRAW_FXCAPS_BLTMIRRORUPDOWN;
-+      D3D9Tracef("GetCaps DDRAW caps=0x%08x caps2=0x%08x ckey=0x%08x "
-+                 "fx=0x%08x\n",
-                  ((DDRAW_CAPS *)data->pData)->Caps,
--                 ((DDRAW_CAPS *)data->pData)->Caps2);
-+                 ((DDRAW_CAPS *)data->pData)->Caps2,
-+                 ((DDRAW_CAPS *)data->pData)->CKeyCaps,
-+                 ((DDRAW_CAPS *)data->pData)->FxCaps);
        return S_OK;
     case D3DDDICAPS_DDRAW_MODE_SPECIFIC:
        if (FAILED(D3D9ValidateData(data, sizeof(DDRAW_MODE_SPECIFIC_CAPS))))
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Private.h b/src/gallium/frontends/d3d10umd/D3D9Private.h
-index 63a4f34..a116e9a 100644
+index 348b04b..3f81998 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Private.h
 +++ b/src/gallium/frontends/d3d10umd/D3D9Private.h
-@@ -106,6 +106,10 @@ struct D3D9Device
+@@ -107,6 +107,10 @@ struct D3D9Device
     struct pipe_resource *null_textures[4];
     D3D9Resource *last_systemmem_texture;
     D3D9Resource *last_systemmem_buffer;
@@ -71,13 +63,13 @@ index 63a4f34..a116e9a 100644
     HANDLE render_targets[4];
     UINT render_target_subresources[4];
     HANDLE depth_stencil;
-@@ -383,3 +387,4 @@ HRESULT APIENTRY D3D9DrawIndexedPrimitive2(
+@@ -389,3 +393,4 @@ HRESULT APIENTRY D3D9DrawIndexedPrimitive2(
     HANDLE hDevice, const D3DDDIARG_DRAWINDEXEDPRIMITIVE2 *data,
     UINT index_size, const void *indices, const UINT *index_remap);
  void D3D9DestroyDrawState(D3D9Device *device);
 +void D3D9DestroyKeyBlitState(D3D9Device *device);
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
-index ae9ab75..fade3a7 100644
+index 299a590..0f4ca1d 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
 @@ -7,8 +7,11 @@
@@ -92,7 +84,7 @@ index ae9ab75..fade3a7 100644
  #include "util/u_math.h"
  #include "util/u_threaded_context.h"
  #include "util/u_upload_mgr.h"
-@@ -3674,6 +3677,397 @@ D3D9CaptureToSysMem(HANDLE hDevice, const D3DDDIARG_CAPTURETOSYSMEM *data)
+@@ -3667,6 +3670,397 @@ D3D9CaptureToSysMem(HANDLE hDevice, const D3DDDIARG_CAPTURETOSYSMEM *data)
     return hr;
  }
  
@@ -490,7 +482,7 @@ index ae9ab75..fade3a7 100644
  HRESULT APIENTRY
  D3D9Blt(HANDLE hDevice, const D3DDDIARG_BLT *data)
  {
-@@ -3686,20 +4080,27 @@ D3D9Blt(HANDLE hDevice, const D3DDDIARG_BLT *data)
+@@ -3674,20 +4068,23 @@ D3D9Blt(HANDLE hDevice, const D3DDDIARG_BLT *data)
     if (!device || !data)
        return E_INVALIDARG;
  
@@ -512,22 +504,18 @@ index ae9ab75..fade3a7 100644
  
 +   if (data->Flags.SrcColorKey || data->Flags.MirrorLeftRight ||
 +       data->Flags.MirrorUpDown) {
-+      const HRESULT hr = D3D9KeyBlitPipe(device, data) ? S_OK : E_NOTIMPL;
-+      D3D9Tracef("Blt colorkey=%u key=0x%08x mirror=%u%u hr=0x%08lx\n",
-+                 data->Flags.SrcColorKey, data->ColorKey,
-+                 data->Flags.MirrorLeftRight, data->Flags.MirrorUpDown, hr);
-+      return hr;
++      return D3D9KeyBlitPipe(device, data) ? S_OK : E_NOTIMPL;
 +   }
 +
     HRESULT hr = D3D9CopyRectPipe(device, data->hDstResource,
                                   data->DstSubResourceIndex, &data->DstRect,
                                   data->hSrcResource,
 diff --git a/src/gallium/frontends/d3d10umd/D3D9State.cpp b/src/gallium/frontends/d3d10umd/D3D9State.cpp
-index b348bc8..b644268 100644
+index 8a91cc8..3801b97 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9State.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9State.cpp
-@@ -1397,6 +1397,7 @@ D3D9DestroyDevice(HANDLE hDevice)
-    device->gdi_device.base.runtime_destroying = true;
+@@ -1371,6 +1371,7 @@ D3D9DestroyDevice(HANDLE hDevice)
+    }
  
     D3D9DestroyDrawState(device);
 +   D3D9DestroyKeyBlitState(device);

@@ -33,10 +33,10 @@ index e7be2ff..519e07d 100644
  
     if (unlikely(!query_pool->fb_buf)) {
 diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
-index 48189d8..4e03ae1 100644
+index 77a3817..ec8dd92 100644
 --- a/src/virtio/vulkan/vn_device.c
 +++ b/src/virtio/vulkan/vn_device.c
-@@ -547,6 +547,8 @@ vn_device_init(struct vn_device *dev,
+@@ -647,6 +647,8 @@ vn_device_init(struct vn_device *dev,
     if (result != VK_SUCCESS)
        goto out_feedback_cmd_pools_fini;
  
@@ -46,12 +46,12 @@ index 48189d8..4e03ae1 100644
     vn_image_reqs_cache_init(dev);
  
 diff --git a/src/virtio/vulkan/vn_device.h b/src/virtio/vulkan/vn_device.h
-index e871564..765702f 100644
+index 818f95c..e5379ec 100644
 --- a/src/virtio/vulkan/vn_device.h
 +++ b/src/virtio/vulkan/vn_device.h
-@@ -47,6 +47,12 @@ struct vn_device {
- 
-    bool has_sync2;
+@@ -51,6 +51,12 @@ struct vn_device {
+    bool wsi_attachment_feedback_loop_layout;
+ #endif
  
 +   /* Set at device creation when a feedback write by the host GPU did not
 +    * reach the guest (vn_feedback_self_test). Fences, semaphores, events and

@@ -14,7 +14,7 @@ Origin: codex working tree R/mesa (git diff 374c3022), re-exported by
 vmlab-win3d build/mesa; see build/mesa/README.md.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
-index b9d75f819f3e8f2491ebf0f3cdae036b4e8c2a92..945ced18bcdb0d674fc3951beb9ff23b5fdc87c8 100644
+index b9d75f8..945ced1 100644
 --- a/src/gallium/frontends/d3d10umd/Adapter.cpp
 +++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
 @@ -144,6 +144,12 @@ OpenAdapter10(__inout D3D10DDIARG_OPENADAPTER *pOpenData)   // IN
@@ -69,10 +69,10 @@ index b9d75f819f3e8f2491ebf0f3cdae036b4e8c2a92..945ced18bcdb0d674fc3951beb9ff23b
     default:
        break;
 diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
-index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657cbd19be31 100644
+index c4014ce..d058855 100644
 --- a/src/gallium/frontends/d3d10umd/Device.cpp
 +++ b/src/gallium/frontends/d3d10umd/Device.cpp
-@@ -101,6 +101,9 @@ FeatureLevelFromCreateDevice(const D3D10DDIARG_CREATEDEVICE *pCreateData)
+@@ -104,6 +104,9 @@ FeatureLevelFromCreateDevice(const D3D10DDIARG_CREATEDEVICE *pCreateData)
  #endif
  #if SUPPORT_D3D_WDDM1_3
     case D3DWDDM1_3_DDI_INTERFACE_VERSION:
@@ -82,7 +82,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
  #endif
        switch (D3D11DDI_EXTRACT_3DPIPELINELEVEL_FROM_FLAGS(pCreateData->Flags)) {
  #if SUPPORT_D3D11_1
-@@ -853,6 +856,341 @@ FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *funcs)
+@@ -891,6 +894,341 @@ FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *funcs)
  #endif
  #endif
  
@@ -424,7 +424,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
  EXTERN_C bool use_old_tex_ops = false;
  
  /*
-@@ -919,6 +1257,9 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -948,6 +1286,9 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
  #if SUPPORT_D3D_WDDM1_3
     case D3DWDDM1_3_DDI_INTERFACE_VERSION:
  #endif
@@ -434,7 +434,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
  #endif
        break;
     default:
-@@ -966,6 +1307,17 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -995,6 +1336,17 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
        return E_FAIL;
     }
  
@@ -452,7 +452,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
     struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
     if (!pipe) {
        DebugPrintf("%s: failed to create pipe context\n", __func__);
-@@ -1074,6 +1426,10 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -1100,6 +1452,10 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
  #if SUPPORT_D3D_WDDM1_3
     } else if (pCreateData->Interface == D3DWDDM1_3_DDI_INTERFACE_VERSION) {
        memset(pCreateData->pWDDM1_3DeviceFuncs, 0, sizeof(*pCreateData->pWDDM1_3DeviceFuncs));
@@ -463,7 +463,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
  #endif
     }
  #endif
-@@ -1279,6 +1635,15 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -1305,6 +1661,15 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
        FillDeviceFuncsWDDM1_3(pWDDM1_3DeviceFuncs);
     }
  #endif
@@ -479,7 +479,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
  #endif
  
     /*
-@@ -1286,7 +1651,11 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -1312,7 +1677,11 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
      */
  #if SUPPORT_D3D11_1
  #if SUPPORT_D3D_WDDM1_3
@@ -492,7 +492,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
        DXGI1_3_DDI_BASE_FUNCTIONS *dxgiFuncs =
           pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions4;
  
-@@ -1310,6 +1679,14 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -1336,6 +1705,14 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
        dxgiFuncs->pfnPresent1 = _Present1;
        dxgiFuncs->pfnCheckPresentDurationSupport =
           _CheckPresentDurationSupport;
@@ -507,7 +507,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
     } else
  #endif
     if (pCreateData->Interface == D3D11_1_DDI_INTERFACE_VERSION) {
-@@ -1924,6 +2301,11 @@ CheckFormatSupport(D3D10DDI_HDEVICE hDevice, // IN
+@@ -1963,6 +2340,11 @@ CheckFormatSupport(D3D10DDI_HDEVICE hDevice, // IN
         is_format_supported_with_fallback(screen, format, PIPE_TEXTURE_2D, 0, 0,
                                           PIPE_BIND_SHADER_IMAGE)) {
        *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_UAV_WRITES;
@@ -520,7 +520,7 @@ index 260b6929492571f2da928c42050c2953a3e35367..f34334affa533ce54366bc52a65d657c
  #endif
  
 diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
-index abfc56446bd718716bdfbd46096ea0daf2a4843d..f4bb97b0b454f2de0eb86037b35ac4f03dfaa42c 100644
+index f64ce99..6527b98 100644
 --- a/src/gallium/frontends/d3d10umd/State.h
 +++ b/src/gallium/frontends/d3d10umd/State.h
 @@ -54,6 +54,9 @@
@@ -534,7 +534,7 @@ index abfc56446bd718716bdfbd46096ea0daf2a4843d..f4bb97b0b454f2de0eb86037b35ac4f0
  
  struct Adapter
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h b/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
-index 7a574f621fd7785103fbaf413df4d1cd85ce9ba6..aac1204ff7d775b3a3e58f3f7ccbd595509ad00e 100644
+index c320d18..9992e73 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
 @@ -10,6 +10,7 @@
@@ -545,7 +545,7 @@ index 7a574f621fd7785103fbaf413df4d1cd85ce9ba6..aac1204ff7d775b3a3e58f3f7ccbd595
  
  /* Yttrium-private pipe_resource flag: the KMD will CPU-read this display
   * image for a legacy blt Present, so its exported backing must be cached. */
-@@ -69,6 +70,10 @@ yttrium_gdi_flush_async_present(
+@@ -93,6 +94,10 @@ yttrium_gdi_flush_async_present(
  bool
  yttrium_gdi_screen_supports_logic_op(struct pipe_screen *screen);
  
@@ -557,10 +557,10 @@ index 7a574f621fd7785103fbaf413df4d1cd85ce9ba6..aac1204ff7d775b3a3e58f3f7ccbd595
   * the D3D DDI entry point.  Reading the latch never drains the worker. */
  bool
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_screen.c b/src/gallium/winsys/yttrium/gdi/yttrium_screen.c
-index fae945f1c9496858dff4245996340d1d50f48a31..1f47f77c0e0f1cb1578af910166e63c67835bc7f 100644
+index 24a2dc3..93c577b 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_screen.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_screen.c
-@@ -116,6 +116,19 @@ yttrium_gdi_screen_supports_logic_op(struct pipe_screen *pscreen)
+@@ -46,6 +46,19 @@ yttrium_gdi_screen_supports_logic_op(struct pipe_screen *pscreen)
     return yttrium_venus_logic_op_enabled(screen->venus);
  }
  
@@ -581,7 +581,7 @@ index fae945f1c9496858dff4245996340d1d50f48a31..1f47f77c0e0f1cb1578af910166e63c6
  yttrium_destroy_screen(struct pipe_screen *pscreen)
  {
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_format.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_format.c
-index da8c8520519a5c8408f6482f0e14676b2263ac00..2878d78b08b3102a871757c468bc9e6b436f999e 100644
+index cbe0187..67246f2 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_format.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_format.c
 @@ -25,6 +25,8 @@ yttrium_venus2_pipe_format(enum pipe_format format)

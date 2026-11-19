@@ -10,7 +10,7 @@ Origin: codex working tree R/mesa (git diff 374c3022), re-exported by
 vmlab-win3d build/mesa; see build/mesa/README.md.
 ---
 diff --git a/src/util/xmlconfig.c b/src/util/xmlconfig.c
-index 5922dc8704e2f7150a56893341b2ec88b5dfa87b..d1f9c08cc25d0c27a3ee6c9818de690f2666b5a8 100644
+index 5922dc8..d1f9c08 100644
 --- a/src/util/xmlconfig.c
 +++ b/src/util/xmlconfig.c
 @@ -60,6 +60,7 @@ static inline void regfree(regex_t* r) {}

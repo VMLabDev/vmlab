@@ -19,7 +19,7 @@ vb_indexed_*).
 Origin: vmlab-win3d ffp2 worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
-index 52ce2f7..d99ea58 100644
+index 3e141c1..d781d82 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
 @@ -188,7 +188,13 @@ D3D9FillCaps(const D3D9Adapter *adapter, D3DCAPS9 *caps)

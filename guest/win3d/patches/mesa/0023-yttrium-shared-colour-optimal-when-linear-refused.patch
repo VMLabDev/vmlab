@@ -30,10 +30,10 @@ VM).
 Origin: vmlab-win3d nvtex worker.
 ---
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
-index ec3f868..87970d4 100644
+index 6304ccd..012e5a8 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
-@@ -1141,6 +1141,74 @@ yttrium_venus2_sampled_image_supported(struct yttrium_venus *venus,
+@@ -2318,6 +2318,66 @@ yttrium_venus2_sampled_image_supported(struct yttrium_venus *venus,
        (props->sampleCounts & samples);
  }
  
@@ -68,18 +68,10 @@ index ec3f868..87970d4 100644
 +      .type = image_type,
 +      .tiling = VK_IMAGE_TILING_LINEAR,
 +      .usage = usage,
-+      .flags = image_flags |
-+               ((usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
-+                          VK_IMAGE_USAGE_STORAGE_BIT |
-+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) ?
-+                   VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0),
++      .flags = yttrium_venus_image_create_flags(venus, image_flags, usage,
++                                                VK_SAMPLE_COUNT_1_BIT,
++                                                VK_IMAGE_TILING_LINEAR),
 +   };
-+   /* yttrium_venus_create_image_tiled drops a refused feedback-loop usage */
-+   if ((usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) &&
-+       !yttrium_venus_feedback_loop_supported(venus, vk_format, image_type,
-+                                              VK_IMAGE_TILING_LINEAR,
-+                                              image_info.flags, usage))
-+      image_info.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 +   VkImageFormatProperties2 image_props = {
 +      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
 +   };
@@ -108,7 +100,7 @@ index ec3f868..87970d4 100644
  bool
  yttrium_venus2_sampled_texture_format_supported(
     struct yttrium_venus *venus,
-@@ -1237,17 +1305,21 @@ yttrium_venus2_create_texture_image_for_bind(struct yttrium_venus *venus,
+@@ -2416,17 +2476,21 @@ yttrium_venus2_create_texture_image_for_bind(struct yttrium_venus *venus,
  
     /* Shared single-sample colour images use linear tiling and ALIAS so
      * yttrium_venus2_import_texture_image_for_bind and the win32 WSI
@@ -132,9 +124,9 @@ index ec3f868..87970d4 100644
 +                                         image_layers, image_flags, usage) :
 +      VK_IMAGE_TILING_OPTIMAL;
  
-    if ((usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
-        !yttrium_venus2_sampled_image_supported(
-@@ -1759,10 +1831,13 @@ yttrium_venus2_import_texture_image_for_bind(
+    if (!yttrium_venus_select_depth_storage_format(
+           venus, &vk_format, image_type, width, image_height, image_depth,
+@@ -2915,10 +2979,13 @@ yttrium_venus2_import_texture_image_for_bind(
     const bool shared_colour = (bind & PIPE_BIND_SHARED) &&
                                !yttrium_venus_format_has_depth(vk_format) &&
                                samples == VK_SAMPLE_COUNT_1_BIT;
@@ -148,5 +140,5 @@ index ec3f868..87970d4 100644
 +                                         image_layers, image_flags, usage) :
 +      VK_IMAGE_TILING_OPTIMAL;
  
-    if (!yttrium_venus_create_image_tiled(
-           venus, resource, image_type, vk_format, width, image_height,
+    if (!yttrium_venus_select_depth_storage_format(
+           venus, &vk_format, image_type, width, image_height, image_depth,

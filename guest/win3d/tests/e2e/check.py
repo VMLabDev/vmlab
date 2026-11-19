@@ -19,7 +19,7 @@ STACK = {
     'opengl': [r'\\viogpu_wgl\.dll$', r'\\libvulkan_virtio\.dll$'],
     'vulkan': [r'\\libvulkan_virtio\.dll$'],
 }
-ADAPTER = {'d3d9': 'Hardsoft VirtIO GPU 3D', 'd3d11': 'Hardsoft VirtIO GPU 3D', 'd3d12': 'Hardsoft VirtIO GPU 3D',
+ADAPTER = {'d3d9': 'Yttrium VirtIO GPU 3D', 'd3d11': 'Yttrium VirtIO GPU 3D', 'd3d12': 'Yttrium VirtIO GPU 3D',
            'opengl': 'Virtio-GPU Venus', 'vulkan': 'Virtio-GPU Venus'}
 API_NAME = {'d3d9': 'Direct3D 9', 'd3d11': 'Direct3D 11', 'd3d12': 'Direct3D 12', 'opengl': 'OpenGL', 'vulkan': 'Vulkan'}
 
@@ -68,9 +68,9 @@ row('2', 'documented install command (scripts/install-into-vm.sh)', bool(irc and
 st = load('installed-gpu-state.json')
 if st is not None:
     devs = st.get('display_devices') or []
-    ok = any('Hardsoft VirtIO GPU 3D' in (dv.get('name') or '') and dv.get('problem_code') == 0 for dv in devs)
+    ok = any('Yttrium VirtIO GPU 3D' in (dv.get('name') or '') and dv.get('problem_code') == 0 for dv in devs)
     row('2', 'display device on our driver, problem code 0', ok, 'installed-gpu-state.json',
-        'Hardsoft VirtIO GPU 3D controller' if ok else 'device not on viogpu3d or has a problem code', extra=True)
+        'Yttrium VirtIO GPU 3D controller' if ok else 'device not on viogpu3d or has a problem code', extra=True)
 
 # 2. vulkaninfo lists the Venus device.
 for arch in ('x64', 'x86'):

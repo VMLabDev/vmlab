@@ -33,10 +33,10 @@ Evidence: docs/shaders2.md, docs/evidence/shaders2/.
 Origin: vmlab-win3d shaders2 worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-index 511620f..7f82f53 100644
+index 6690a18..f7c1947 100644
 --- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
 +++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-@@ -998,13 +998,19 @@ dcl_input_index_range(struct Shader_xlate *sx,
+@@ -999,13 +999,19 @@ dcl_input_index_range(struct Shader_xlate *sx,
     sx->num_input_ranges++;
  }
  
@@ -60,7 +60,7 @@ index 511620f..7f82f53 100644
         dst->base.index_dim != 1 ||
         dst->base.index[0].index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32) {
        SHADER_TRANSLATION_UNSUPPORTED(sx, true);
-@@ -1019,6 +1025,19 @@ dcl_tcs_tess_factor_index_range(struct Shader_xlate *sx,
+@@ -1020,6 +1026,19 @@ dcl_tcs_tess_factor_index_range(struct Shader_xlate *sx,
        return;
     }
  
@@ -80,7 +80,7 @@ index 511620f..7f82f53 100644
     /* D3D scalar tessellation-factor registers are packed into components
      * of TGSI TESSOUTER/TESSINNER, not consecutive TGSI output registers.
      * A range over ordinary patch constants (o6.x..o13.x written as
-@@ -2048,8 +2067,6 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
+@@ -2049,8 +2068,6 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
                                     const struct Shader_opcode *opcode)
  {
     assert(!sx->num_tcs_indexed_output_stores);
@@ -89,7 +89,7 @@ index 511620f..7f82f53 100644
  
     for (unsigned i = 0; i < opcode->num_dst; ++i) {
        const struct Shader_dst_operand *dst = &opcode->dst[i];
-@@ -2072,6 +2089,17 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
+@@ -2073,6 +2090,17 @@ prepare_tcs_indexed_output_stores(struct Shader_xlate *sx,
           return;
        }
  
@@ -107,7 +107,7 @@ index 511620f..7f82f53 100644
        const unsigned slot = sx->num_tcs_indexed_output_stores++;
        sx->tcs_indexed_output_stores[slot].operand = dst;
        sx->tcs_indexed_output_stores[slot].first =
-@@ -2149,6 +2177,21 @@ emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
+@@ -2150,6 +2178,21 @@ emit_tcs_indexed_output_stores(struct Shader_xlate *sx)
                       ureg_writemask(sx->outputs[output].reg[0],
                                      sx->tcs_tess_factor_writemask[output]),
                       value);
@@ -129,7 +129,7 @@ index 511620f..7f82f53 100644
           } else {
              /* An ordinary patch constant keeps the store's own mask. */
              ureg_MOV(ureg,
-@@ -6768,7 +6811,7 @@ Shader_tgsi_translate(const unsigned *code,
+@@ -6791,7 +6834,7 @@ Shader_tgsi_translate(const unsigned *code,
        }
        case D3D10_SB_OPCODE_DCL_INDEX_RANGE:
           if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT)

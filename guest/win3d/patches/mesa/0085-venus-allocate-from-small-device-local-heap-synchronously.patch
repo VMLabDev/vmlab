@@ -27,10 +27,10 @@ Evidence: docs/unigl.md, docs/evidence/unigl/.
 Origin: vmlab-win3d unigl worker.
 ---
 diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
-index 5487eb2..a479b46 100644
+index 819af1f..c6a52a9 100644
 --- a/src/virtio/vulkan/vn_device_memory.c
 +++ b/src/virtio/vulkan/vn_device_memory.c
-@@ -28,6 +28,34 @@
+@@ -33,6 +33,34 @@
  
  /* device memory commands */
  
@@ -65,7 +65,7 @@ index 5487eb2..a479b46 100644
  static inline VkResult
  vn_device_memory_alloc_simple(struct vn_device *dev,
                                struct vn_device_memory *mem,
-@@ -35,7 +63,8 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
+@@ -40,7 +68,8 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
  {
     VkDevice dev_handle = vn_device_to_handle(dev);
     VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);

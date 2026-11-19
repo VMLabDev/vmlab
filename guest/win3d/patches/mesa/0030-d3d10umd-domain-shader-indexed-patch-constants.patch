@@ -32,10 +32,10 @@ readback against the CPU and WARP).
 Origin: vmlab-win3d ds worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-index d36b498..511620f 100644
+index c9bef73..6690a18 100644
 --- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
 +++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-@@ -449,6 +449,11 @@ struct Shader_xlate {
+@@ -450,6 +450,11 @@ struct Shader_xlate {
        uint count;
     } input_ranges[SHADER_MAX_INPUTS];
     uint num_input_ranges;
@@ -47,7 +47,7 @@ index d36b498..511620f 100644
  
     struct {
        struct ureg_dst reg[4];
-@@ -928,6 +933,29 @@ dcl_input_index_range(struct Shader_xlate *sx,
+@@ -929,6 +934,29 @@ dcl_input_index_range(struct Shader_xlate *sx,
     const struct Shader_dst_operand *dst = &opcode->dst[0];
     uint first, count;
  
@@ -77,7 +77,7 @@ index d36b498..511620f 100644
     /* A range over per-vertex inputs (v[n][r] in a geometry shader,
      * vicp[n][r] in a hull shader) names its first register in the second
      * index; the vertex index is not part of the range.
-@@ -2177,6 +2205,73 @@ translate_indexed_input(struct Shader_xlate *sx,
+@@ -2178,6 +2206,73 @@ translate_indexed_input(struct Shader_xlate *sx,
     return ureg_src(selected);
  }
  
@@ -151,7 +151,7 @@ index d36b498..511620f 100644
  static struct ureg_src
  apply_input_vertex_index(struct Shader_xlate *sx,
                           struct ureg_src reg,
-@@ -2631,10 +2726,27 @@ translate_src_operand(struct Shader_xlate *sx,
+@@ -2632,10 +2727,27 @@ translate_src_operand(struct Shader_xlate *sx,
  
     case DX11_SM5_OPERAND_TYPE_INPUT_PATCH_CONSTANT:
        assert(operand->base.index_dim == 1);
