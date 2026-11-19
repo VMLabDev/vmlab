@@ -592,3 +592,45 @@ fn transitional_queue_doorbells_use_the_captured_notify_offset() {
     pci.bar_write(4, 0x14, &[15]);
     assert_eq!(*registered.lock(), [0xfe00_3000, 0xfe00_3004]);
 }
+
+#[test]
+fn net_queue_doorbells_share_one_event_at_each_queue_notify_address() {
+    struct Rec(Arc<Mutex<Vec<crate::QueueDoorbell>>>);
+    impl crate::QueueDoorbells for Rec {
+        fn set(&mut self, doorbells: &[crate::QueueDoorbell]) -> std::io::Result<()> {
+            *self.0.lock() = doorbells.to_vec();
+            Ok(())
+        }
+    }
+    let mut pci = net();
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    pci.set_queue_doorbells(Box::new(Rec(registered.clone())));
+    pci.set_bar_address(4, Some(0xfe00_0000));
+    pci.bar_write(4, 0x14, &[0]);
+    pci.bar_write(4, 0x14, &[3]);
+    pci.bar_write(4, 8, &1u32.to_le_bytes());
+    pci.bar_write(4, 12, &1u32.to_le_bytes());
+    pci.bar_write(4, 0x14, &[11]);
+    for queue in 0..2u16 {
+        pci.bar_write(4, 0x16, &queue.to_le_bytes());
+        let base = DESC + u64::from(queue) * 0x4000;
+        for (off, addr) in [(0x20, base), (0x28, base + 0x1000), (0x30, base + 0x2000)] {
+            pci.bar_write(4, off, &addr.to_le_bytes());
+        }
+        pci.bar_write(4, 0x1c, &1u16.to_le_bytes());
+    }
+    assert!(registered.lock().is_empty());
+    pci.bar_write(4, 0x14, &[15]);
+    assert!(pci.activated);
+    {
+        let doorbells = registered.lock();
+        assert_eq!(
+            doorbells.iter().map(|d| d.address).collect::<Vec<_>>(),
+            [0xfe00_3000, 0xfe00_3004]
+        );
+        // One worker serves every queue, so the queues share the event.
+        assert!(Arc::ptr_eq(&doorbells[0].event, &doorbells[1].event));
+    }
+    pci.bar_write(4, 0x14, &[0]);
+    assert!(registered.lock().is_empty());
+}
