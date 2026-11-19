@@ -13,7 +13,7 @@ impl Snapshot for Gpu {
                 "online snapshots are unavailable with an accelerated GPU".into(),
             ));
         }
-        let mut out = b"GPU2\x01\0\0\0".to_vec();
+        let mut out = b"GPU2\x02\0\0\0".to_vec();
         out.extend_from_slice(&s.acked.to_le_bytes());
         put(
             &mut out,
@@ -75,6 +75,12 @@ impl Snapshot for Gpu {
                 out.extend_from_slice(&addr.to_le_bytes());
             }
         }
+        if let Some(timestamp_ns) = s.flush_pending {
+            out.push(1);
+            out.extend_from_slice(&timestamp_ns.to_le_bytes());
+        } else {
+            out.push(0);
+        }
         Ok(out)
     }
 
@@ -93,9 +99,11 @@ fn put(out: &mut Vec<u8>, values: &[u32]) {
 impl Gpu {
     fn restore(&mut self, state: &[u8]) -> Result<(), u32> {
         let mut d = Decoder::new(state);
-        if d.take(8)? != b"GPU2\x01\0\0\0" {
-            return Err(INVALID);
-        }
+        let has_flush_state = match d.take(8)? {
+            b"GPU2\x01\0\0\0" => false,
+            b"GPU2\x02\0\0\0" => true,
+            _ => return Err(INVALID),
+        };
         let acked = d.u64()?;
         if acked & !FEATURES != 0 {
             return Err(INVALID);
@@ -225,6 +233,15 @@ impl Gpu {
             .map_err(|_| INVALID)?;
             queues.push(q);
         }
+        let flush_pending = if has_flush_state {
+            match d.take(1)?[0] {
+                0 => None,
+                1 => Some(d.u64()?),
+                _ => return Err(INVALID),
+            }
+        } else {
+            None
+        };
         if !d.bytes.is_empty() {
             return Err(INVALID);
         }
@@ -251,12 +268,16 @@ impl Gpu {
         s.dirty = true;
         s.cached_frame = None;
         s.flushes.clear();
+        s.flush_pending = flush_pending;
+        s.last_publish = None;
         if s.mem.is_some() {
             s.queues = queues;
         } else {
             s.pending = queues;
         }
-        s.publish_scanout(super::monotonic_ns());
+        // A new scanout generation needs a full frame, including the saved
+        // resource pixels covered by any pending flush.
+        s.publish_scanout(flush_pending.unwrap_or_else(super::monotonic_ns));
         Ok(())
     }
 }
