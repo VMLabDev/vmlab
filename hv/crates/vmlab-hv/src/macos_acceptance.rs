@@ -649,6 +649,8 @@ fn sample_rips(client: &mut Client, vcpus: u8) -> Vec<u64> {
 /// boots a fresh overlay and samples every vCPU's RIP through the debug
 /// protocol until one reaches XNU or `VMLAB_HV_MACOS_STALL_TIMEOUT` (240 s)
 /// passes, and reports the time or the stall with its RIPs and a screenshot.
+/// `VMLAB_HV_MACOS_STALL_AGENT=<seconds>` then waits that long for the agent,
+/// which the fake key does not stop, and counts the resets on the way.
 /// Opt-in: `VMLAB_HV_MACOS_STALL_RUNS=<n>`. It measures; it asserts no rate.
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
@@ -678,6 +680,10 @@ fn macos_boot_stall_census() {
             .map(|s| s.parse().unwrap())
             .unwrap_or(240),
     );
+    let agent_wait = std::env::var("VMLAB_HV_MACOS_STALL_AGENT")
+        .ok()
+        .map(|s| Duration::from_secs(s.parse().unwrap()));
+    let mut agent_times = Vec::new();
     let interval = Duration::from_secs(3);
     let fake_key = "FAKE".repeat(16);
     let mut stalls = Vec::new();
@@ -704,11 +710,30 @@ fn macos_boot_stall_census() {
                 break;
             }
         }
-        match reached {
+        // Past XNU the agent is a plain launchd daemon, which a fake key does
+        // not stop: `VMLAB_HV_MACOS_STALL_AGENT=<seconds>` waits for it too.
+        let mut agent_failed = None;
+        if let (Some(_), Some(wait)) = (reached, agent_wait) {
+            match AgentClient::connect(&vm.agent, wait) {
+                Ok(_) => agent_times.push(started.elapsed().as_secs_f64()),
+                Err(error) => {
+                    last = sample_rips(&mut vm.client, 4);
+                    agent_failed = Some(error);
+                }
+            }
+        }
+        let resets = vm
+            .client
+            .take_events()
+            .into_iter()
+            .filter(|event| matches!(event, vmlab_hv_proto::control::Event::Reset))
+            .count();
+        match reached.filter(|_| agent_failed.is_none()) {
             Some(elapsed) => {
                 eprintln!(
-                    "census run {run}/{runs}: XNU after {:.1} s",
-                    elapsed.as_secs_f64()
+                    "census run {run}/{runs}: XNU after {:.1} s, agent {:?} s, resets {resets}",
+                    elapsed.as_secs_f64(),
+                    agent_wait.and(agent_times.last())
                 );
                 times.push(elapsed.as_secs_f64());
             }
@@ -721,7 +746,11 @@ fn macos_boot_stall_census() {
                     &kept.join("stall.ppm"),
                 );
                 eprintln!(
-                    "census run {run}/{runs}: STALL before XNU after {:.0} s, rips {:x?}, exited {}, artifacts {}",
+                    "census run {run}/{runs}: STALL {} after {:.0} s, resets {resets}, rips {:x?}, exited {}, artifacts {}",
+                    match &agent_failed {
+                        Some(error) => format!("before the agent ({error})"),
+                        None => "before XNU".into(),
+                    },
                     started.elapsed().as_secs_f64(),
                     last,
                     vm.process.try_wait().unwrap().is_some(),
@@ -747,7 +776,7 @@ fn macos_boot_stall_census() {
     }
     times.sort_by(f64::total_cmp);
     eprintln!(
-        "census: {} of {runs} runs stalled before XNU {stalls:?}; time to XNU min {:.1} median {:.1} max {:.1} s",
+        "census: {} of {runs} runs stalled {stalls:?}; time to the agent {agent_times:.0?}; time to XNU min {:.1} median {:.1} max {:.1} s",
         stalls.len(),
         times.first().copied().unwrap_or(f64::NAN),
         times.get(times.len() / 2).copied().unwrap_or(f64::NAN),
