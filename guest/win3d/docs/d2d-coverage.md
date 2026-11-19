@@ -135,6 +135,12 @@ What this says about the cause:
 - On `AMD1` Word's ribbon shows almost none of it: 1 pixel in one of three
   starts, against 353 to 537 on `Nvidia2`.
 
+The acceptance run with the patch, on fresh `windows-11` labs:
+`tests/e2e/run.sh` 12 of 12 on `AMD1` and 12 of 12 on `Nvidia2`, and
+`tests/e2e/tir.sh` passes on both, x64 and x86 (0 of 93,467 pixels differ
+from WARP, 0 between runs; the x64 driver log says `coverage=passes` for all
+3 pipelines).
+
 Word was installed in the lab with Microsoft's Office Deployment Tool from
 Microsoft's CDN and is not part of any template. Its sign-in dialog was
 closed with Alt+F4 before each capture.
