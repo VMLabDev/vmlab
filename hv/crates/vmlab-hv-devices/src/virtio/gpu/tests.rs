@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn partial_compose_reuses_released_pixels_and_preserves_held_frames() {
+    let gpu = Gpu::new("gpu");
+    let mut state = gpu.state.lock();
+    state.native = true;
+    state.scanout = Some((1, Rect { x: 0, y: 0, w: 35, h: 17 }));
+    state.resources.insert(1, Resource {
+        width: 35,
+        height: 17,
+        format: 2,
+        pixels: vec![0; 35 * 17 * 4],
+        backing: Vec::new(),
+    });
+    let initial = state.frame_2d().unwrap();
+
+    let mut flush = |x, y, value| {
+        let offset = ((y * 35 + x) * 4) as usize;
+        state.resources.get_mut(&1).unwrap().pixels[offset] = value;
+        state.flushes.push(Rect { x, y, w: 1, h: 1 });
+        state.dirty = true;
+        state.frame_2d().unwrap()
+    };
+    let first = flush(0, 0, 10);
+    let second = flush(16, 0, 20);
+    assert_eq!(initial.pixels[0], 0);
+    assert_eq!(first.pixels[16 * 4], 0);
+    assert_eq!(second.pixels[0], 10);
+    assert_eq!(second.pixels[16 * 4], 20);
+    let reusable = first.pixels.as_ptr();
+    drop(first);
+
+    let third = flush(34, 16, 30);
+    assert_eq!(third.pixels.as_ptr(), reusable);
+    assert_eq!(third.pixels[0], 10);
+    assert_eq!(third.pixels[16 * 4], 20);
+    assert_eq!(third.pixels[(16 * 35 + 34) * 4], 30);
+    assert_eq!(third.damage, [crate::display::Damage { x: 32, y: 16, width: 3, height: 1 }]);
+    assert_eq!(second.pixels[(16 * 35 + 34) * 4], 0);
+    let unchanged = flush(34, 16, 30);
+    assert!(Arc::ptr_eq(&third.pixels, &unchanged.pixels));
+    assert!(unchanged.damage.is_empty());
+}
+
+#[test]
 fn backing_entries_are_bounded_across_resources() {
     let gpu = Gpu::new("gpu");
     let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
