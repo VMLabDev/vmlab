@@ -12,14 +12,16 @@
 # `vmlab vm screenshot` captures the console. pointer.py then checks that
 # every shape arrived at its position, that RFB carried them, that the I-beam
 # is black with a white outline, and that no capture has the pointer in the
-# frame. Writes <evidence-dir>/pointer/: pointer.json (the verdict),
-# events.json, guest.json and one capture. Exit status: 0 when all pass.
+# frame. A `vmlab record` video of the run must show the pointer too, and
+# no pointer while it is hidden. Writes <evidence-dir>/pointer/: pointer.json
+# (the verdict), events.json, guest.json, pointer.mp4 and one capture. Exit
+# status: 0 when all pass.
 #
 # WIN3D_POINTER_DIR names the VM's runtime directory (display.sock and
 # vnc.sock) when the script cannot find it.
 # check-shell-paths: no-errexit the guest run and the watcher record their rc and the check judges (VML-88).
 set -uo pipefail
-[ $# -eq 3 ] || { sed -n '2,21p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,23p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 LABDIR=$(cd "$1" && pwd)
@@ -30,6 +32,7 @@ PLAN=arrow,ibeam,sizewe,hidden,arrow
 SECONDS_EACH=6
 X0=200 Y0=300 STEP_X=120
 BACKGROUND=32,96,160
+SENT=100,100
 
 note() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 in_lab() { (cd "$LABDIR" && "$@"); }
@@ -59,8 +62,14 @@ in_lab vmlab cp "$REPO/tests/guest/Show-TestPointer.ps1" "$VM:C:/win3d/guest/Sho
 in_lab vmlab cp "$REPO/tests/guest/Run-Probe.ps1" "$VM:C:/win3d/guest/Run-Probe.ps1" || exit 1
 gps 'Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -like "*VirtIO GPU*" } | ForEach-Object { "driver: {0} {1}" -f $_.DeviceName, $_.DriverVersion }
      Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}" -ErrorAction SilentlyContinue | ForEach-Object { $v = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).HWCursor; if ($null -ne $v) { "HWCursor: {0}" -f $v } }' 120 | tee "$EV/driver.txt"
-# A real pointer event first: Windows shows no pointer before one.
-in_lab vmlab vm mouse-move "$VM" 100 100 || true
+# A recording of the run, at the size of the screen so that a frame's pixels are the screen's.
+in_lab vmlab vm screenshot "$VM" "$STAGE/size.png" >/dev/null 2>&1
+size=$(magick identify -format '%wx%h' "$STAGE/size.png" 2>/dev/null)
+rm -f "$STAGE/size.png"
+in_lab vmlab record start "$VM" -o "$STAGE/pointer.mp4" --size "${size:-1024x768}" || note "no recording"
+# A real pointer event first: Windows shows no pointer before one. The
+# recorder draws the pointer where vmlab last put it, which is here.
+in_lab vmlab vm mouse-move "$VM" "${SENT%,*}" "${SENT#*,}" || true
 in_lab vmlab vm sendkeys "$VM" esc || true
 
 steps=$(tr ',' '\n' <<<"$PLAN" | grep -c .)
@@ -84,12 +93,18 @@ sleep 2
 touch "$STAGE/done"
 wait "$watch_pid"; note "watch exit $?"
 in_lab vmlab cp "$VM:C:/win3d/results/pointer/guest.json" "$EV/guest.json" || true
+frames=()
+if in_lab vmlab record stop "$VM" && [ -s "$STAGE/pointer.mp4" ]; then
+    mkdir -p "$STAGE/frames"
+    ffmpeg -loglevel error -y -i "$STAGE/pointer.mp4" -vf fps=5 "$STAGE/frames/%04d.png" && frames=(--frames "$STAGE/frames" --sent "$SENT")
+    cp "$STAGE/pointer.mp4" "$EV/pointer.mp4"
+fi
 
 python3 "$HERE/pointer.py" check --events "$EV/events.json" --plan "$PLAN" --x0 "$X0" --y0 "$Y0" --step-x "$STEP_X" \
-    --background "$BACKGROUND" --shots "$STAGE/shots" --guest "$EV/guest.json" --out "$EV/pointer.json"
+    --background "$BACKGROUND" --shots "$STAGE/shots" --guest "$EV/guest.json" "${frames[@]}" --out "$EV/pointer.json"
 rc=$?
 # One capture of the window for the evidence: the middle one.
 mid=$(find "$STAGE/shots" -name '*.png' | sort | sed -n "$(((n + 1) / 2))p")
 [ -n "$mid" ] && magick "$mid" -resize 50% -strip -colors 256 "$EV/console-pointer.png"
-find "$STAGE/shots" -name '*.png' -delete
+find "$STAGE/shots" "$STAGE/frames" -name '*.png' -delete 2>/dev/null
 exit $rc
