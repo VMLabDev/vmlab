@@ -2619,8 +2619,9 @@ lifecycle.
 **Selection.** A `vm` or `container` block names its hypervisor with
 `hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
-automatic for both kinds, preserving existing identity and selecting vmlab-hv
-for supported new machines (§22.1). The field is declared on the machine only and
+automatic for both kinds. Automatic selection uses the existing identity,
+including the x86 migration (§22.3), and selects vmlab-hv for supported new
+machines (§22.1). The field is declared on the machine only and
 never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
@@ -2817,9 +2818,9 @@ puts it. vmlab-hv serves RFB on `vnc.sock` beside it for human viewers, so
 
 **Snapshots.** Every snapshot records the hypervisor that took it. An online
 snapshot holds RAM and device state in that hypervisor's own format, so
-restoring it on a machine that now runs on the other one is refused, naming the
-hypervisor that took it; setting the machine's `hypervisor` back makes it
-restorable again. An offline snapshot is a plain qcow2 internal snapshot and
+restoring it on a machine selected for the other one is refused, naming the
+hypervisor that took it. See §22.3 for QEMU online snapshots after migration.
+An offline snapshot is a plain qcow2 internal snapshot and
 restores under either. A snapshot recorded before vmlab kept the field was
 QEMU's. A VM on vmlab-hv with a `gpu {}` of any mode takes no online snapshot
 and loads none, because neither an accelerated renderer's state nor a
@@ -2834,13 +2835,13 @@ containers and modern VMs default to vmlab-hv. Selection follows this order:
 
 1. The machine's explicit `hypervisor`.
 2. An explicit host `hypervisor { vm = ... container = ... }` setting for its kind.
-3. The machine's persisted hypervisor identity.
+3. The machine's persisted hypervisor identity, subject to the x86 migration in §22.3.
 4. For a new machine, vmlab-hv when `vmlab_refusals` returns no reasons, otherwise QEMU.
 
 Container fallback uses `container_refusals`. Containers require KVM, including
 when QEMU is selected: without it start fails with `KVM is required`, never TCG.
-Existing container scratch disks without an identity remain on QEMU until destroy
-or an explicit setting.
+Existing container scratch disks without an identity are treated as QEMU disks
+for selection and follow the migration rule in §22.3.
 
 Automatic fallback does not raise a vmlab-hv validation error. `status` shows
 the selected hypervisor and fallback reason. JSON includes `hypervisor` and
@@ -2850,23 +2851,23 @@ hardware. Missing binaries and runtime failures do not trigger fallback.
 
 ### 22.2 Amendment: the warning release before QEMU's x86 removal
 
-A later release removes QEMU for x86 and x86_64 guests. One release before it
-warns and changes nothing else. `up`, `vm start`, `validate` and `status`
-print one warning for each x86 machine that runs on QEMU. The warning names
-the machine, the reason and the fix. The reasons are the rungs above: an
+This section records the warning release before x86 and x86_64 QEMU removal.
+See §22.3 for how migration changes selection and warnings. In the warning release,
+`up`, `vm start`, `validate` and `status` printed one warning for each x86
+machine that ran on QEMU. The warning named the machine, the reason and the
+fix. The reasons were an
 explicit `hypervisor = "qemu"`, the host default, the persisted identity,
 `qemu_args`, and a `vmlab_refusals` reason. Where vmlab-hv would still refuse
-the machine after the fix, the warning lists what it refuses. An x86 machine's
-`up` info line is replaced by its warning. A machine of another architecture
-is not warned.
+the machine after the fix, the warning listed the refusals. The warning
+replaced the `up` info line for x86 machines.
 
-A host without usable KVM for x86 gets one warning per lab that has such a
+A host without usable KVM for x86 got one warning per lab that had such a
 machine: x86 guests will need KVM.
 
-`status --json` is the listing. Each x86 machine on QEMU carries
+`status --json` provided the listing. Each x86 machine on QEMU carried
 `qemu_removal { reason, warning, online_snapshots }`, where `reason` is
 `explicit`, `host_default`, `existing`, `qemu_args` or `refused`, and the lab
-carries `host_warnings`. A lab with no daemon answers from the lab file and
+carried `host_warnings`. A lab with no daemon answered from the lab file and
 its persisted state, with a top-level `qemu_removal` list that adds `machine`.
 `online_snapshots` names the machine's online snapshots taken under QEMU. They
 stay on disk. After the removal, restore of one by name is refused with a
@@ -2875,9 +2876,10 @@ restores it, stops the machine and takes an offline snapshot before upgrading.
 
 Before the first boot can create disks, vmlab persists the selected hypervisor
 in `.vmlab/state.json`. The choice survives stops, reloads and daemon restarts
-until `destroy` or an explicit machine or host setting. Existing disks without
-an identity are treated as QEMU; where snapshots record a hypervisor, the most
-recent record supplies the identity. A recorded identity takes precedence over
+until `destroy`, an explicit machine or host setting, or the migration in
+§22.3. For existing disks without an identity, the most recent snapshot
+supplies the identity when it records a hypervisor. Otherwise vmlab infers
+QEMU. A recorded identity takes precedence over
 snapshot history. Worktree clones inherit the source identity. Deferred template
 pulls resolve selection against the downloaded hardware before boot.
 
@@ -2892,3 +2894,30 @@ persists the frequency as described in §5.2. The e2e `fastpath` scenario follow
 the selected hypervisor. Kernel fast-path tiers require the host capabilities
 described in §9.1. `qemu_args`, legacy PC/i440fx, macOS and non-KVM policies
 continue to select QEMU automatically.
+
+### 22.3 Amendment: migrate existing x86 QEMU machines
+
+An x86 or x86_64 VM or container whose selected identity would be QEMU
+because of its existing disks moves to vmlab-hv at the next start. An
+explicit machine setting or applicable host default takes precedence. The
+identity inferred from an older disk or snapshot follows the same rule.
+Worktree clones use the identity inherited from their frozen generation,
+and the new identity is saved in the starting lab's `.vmlab/state.json`.
+
+Machine `status` reports the hypervisor selected for the next start, so it
+can show vmlab-hv while the saved identity is still QEMU. At start,
+vmlab-hv checks the resolved hardware. A refusal fails the start with its
+reason and leaves the saved identity intact. After the checks pass, vmlab
+saves the switch before boot and `up` prints one migration notice. Later
+starts with that identity are silent about the switch.
+
+Offline snapshots, including available freeze points, remain restorable.
+Online QEMU snapshots stay on disk. `vmlab snapshot list` marks them
+unrestorable by name when vmlab-hv is selected. Restoring one by name
+returns a refusal with instructions to use a release that can restore it
+under QEMU, stop the guest, and capture an offline snapshot before upgrading.
+
+The removal warnings in §22.2 still apply to x86 machines selected for QEMU
+through an explicit setting or automatic fallback. The `existing` warning
+reason belongs to the warning release because these identities now select
+vmlab-hv.
