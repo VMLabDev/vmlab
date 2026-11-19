@@ -1319,7 +1319,10 @@ mod tests {
         assert!(w.warning.contains("vm \"explicit\" runs on QEMU"), "{w:?}");
         assert!(w.warning.contains("it sets hypervisor = \"qemu\""), "{w:?}");
         assert!(w.warning.contains("going away"), "{w:?}");
-        assert!(w.warning.contains("Fix: set hypervisor = \"vmlab\""), "{w:?}");
+        assert!(
+            w.warning.contains("Fix: set hypervisor = \"vmlab\""),
+            "{w:?}"
+        );
         // vmlab-hv would run it, so nothing else is named.
         assert!(!w.warning.contains("refuses it today"), "{w:?}");
 

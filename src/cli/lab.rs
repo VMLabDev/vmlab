@@ -3468,7 +3468,10 @@ mod tests {
         let removal = &json["machines"][0]["qemu_removal"];
         assert_eq!(removal["reason"], "existing");
         assert_eq!(removal["online_snapshots"][0], "warm");
-        assert_eq!(json["host_warnings"][0], "/dev/kvm is not usable on this host");
+        assert_eq!(
+            json["host_warnings"][0],
+            "/dev/kvm is not usable on this host"
+        );
         // A machine that earns no warning carries no field.
         let quiet = lab(vec![crate::status::fixtures::machine(
             "new",
