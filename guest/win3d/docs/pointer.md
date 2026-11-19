@@ -87,7 +87,11 @@ check leaves the arrow steps out and lists them in `steps_not_judged`.
 The viewer draws from the same frame protocol messages the `shapes` check
 reads. No check looks at a viewer window.
 
-The script is not part of `tests/e2e/run.sh` and its 12 Done checks.
+The script is not one of the 12 Done checks of `tests/e2e/run.sh`. The
+adapter suite (`tests/e2e/adapter.sh`, which `run.sh --apps` ends with) runs
+it as its check `pointer-shapes`, next to `pointer`, which looks only at
+whether the pointer is in the frame
+([acceptance.md](acceptance.md#adapter-suite)).
 
 ## Verification
 

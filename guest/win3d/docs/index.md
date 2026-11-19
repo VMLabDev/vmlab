@@ -62,7 +62,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 
 | Page | Read it to |
 | --- | --- |
-| [acceptance.md](acceptance.md) | See each Done item checked on fresh `windows-11` and `windows-10` labs, the stretch applications, and the index of every evidence directory |
+| [acceptance.md](acceptance.md) | See each Done item checked on fresh `windows-11` and `windows-10` labs, the stretch applications, the adapter suite with its baseline, and the index of every evidence directory |
 | [tdr-recovery.md](tdr-recovery.md) | Force a guest timeout and require reset/restart telemetry plus hardware pixel readback |
 | [pointer.md](pointer.md) | See why the pointer lagged, what the hardware pointer of `patches/kmd/0005` sends to the host, its limits, and the check |
 | [dxdiag.md](dxdiag.md) | See why dxdiag reported DirectDraw "Not Available" and how `patches/mesa/0012` to `0014` fixed it |

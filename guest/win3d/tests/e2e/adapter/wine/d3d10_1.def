@@ -1,0 +1,16 @@
+; Import library for d3d10_1.dll, which this mingw-w64 has none for
+; (tests/e2e/adapter/build.sh). Only what Wine's d3d10_1 test calls.
+LIBRARY d3d10_1.dll
+EXPORTS
+D3D10CreateDevice1
+D3D10CreateDeviceAndSwapChain1
+D3D10CreateBlob
+D3D10CompileShader
+D3D10CompileEffectFromMemory
+D3D10CreateEffectFromMemory
+D3D10CreateEffectPoolFromMemory
+D3D10CreateStateBlock
+D3D10ReflectShader
+D3D10GetVertexShaderProfile
+D3D10GetGeometryShaderProfile
+D3D10GetPixelShaderProfile

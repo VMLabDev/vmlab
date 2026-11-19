@@ -71,8 +71,9 @@ it, and that is `dwm.exe` most often: other users get read access. A line of
 a program that runs as the logged-on user is then lost. The script first
 gives every user the right to append.
 
-The script is not part of `tests/e2e/run.sh`. It stands beside it until the
-adapter suite of design card C8 takes it in.
+The adapter suite (`tests/e2e/adapter.sh`, which `run.sh --apps` ends with)
+runs it as its check `d2d-tir`
+([acceptance.md](acceptance.md#adapter-suite)).
 
 A probe that fills and strokes shapes through Direct2D itself was not enough.
 One written for this patch (filled and stroked rounded rectangles, ellipses,
