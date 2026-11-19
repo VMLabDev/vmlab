@@ -813,9 +813,15 @@ fn pci_configuration_access_capability_and_seavgabios_rom() {
 
 /// A display sink that records what the device publishes. With a gate, an
 /// update waits until the test sends on it.
+struct Published {
+    timestamp_ns: u64,
+    damage: Vec<super::super::Damage>,
+    pixels: Vec<u8>,
+}
+
 #[derive(Default)]
 struct RecSink {
-    updates: parking_lot::Mutex<Vec<(u64, Vec<super::super::Damage>, Vec<u8>)>>,
+    updates: parking_lot::Mutex<Vec<Published>>,
     gate: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
@@ -828,9 +834,11 @@ impl crate::virtio::gpu::DisplaySink for RecSink {
             gate.recv().unwrap();
         }
         if let crate::virtio::gpu::ScanoutPixels::Shm(frame) = update.pixels {
-            self.updates
-                .lock()
-                .push((update.timestamp_ns, frame.damage, frame.pixels));
+            self.updates.lock().push(Published {
+                timestamp_ns: update.timestamp_ns,
+                damage: frame.damage,
+                pixels: frame.pixels,
+            });
         }
     }
 }
@@ -890,7 +898,7 @@ fn the_flushes_of_one_frame_interval_publish_one_composed_frame() {
         frames <= most,
         "200 flushes in {burst:?} published {frames} frames, at most {most} expected"
     );
-    let mut damage: Vec<_> = updates[1..].iter().flat_map(|u| u.1.clone()).collect();
+    let mut damage: Vec<_> = updates[1..].iter().flat_map(|u| u.damage.clone()).collect();
     damage.sort_by_key(|d| d.x);
     damage.dedup();
     let tile = |x| super::super::Damage {
@@ -900,12 +908,16 @@ fn the_flushes_of_one_frame_interval_publish_one_composed_frame() {
         height: 16,
     };
     assert_eq!(damage, vec![tile(0), tile(48)]);
-    let last = &updates.last().unwrap().2;
+    let last = &updates.last().unwrap().pixels;
     assert_eq!(&last[..4], &[42, 42, 42, 0]);
     assert_eq!(&last[32 * 4..33 * 4], &[0; 4]);
     assert_eq!(&last[48 * 4..49 * 4], &[42, 42, 42, 0]);
     // A frame carries the time of its newest flush command.
-    assert!(updates.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    assert!(
+        updates
+            .windows(2)
+            .all(|pair| pair[0].timestamp_ns <= pair[1].timestamp_ns)
+    );
 }
 
 #[test]
@@ -919,7 +931,7 @@ fn a_flush_is_answered_before_its_frame_is_composed() {
     assert_eq!(sink.updates.lock().len(), 1);
     release.send(()).unwrap();
     sink.wait(2);
-    assert_eq!(&sink.updates.lock()[1].2[..4], &[42, 42, 42, 0]);
+    assert_eq!(&sink.updates.lock()[1].pixels[..4], &[42, 42, 42, 0]);
     *sink.gate.lock() = None;
 }
 

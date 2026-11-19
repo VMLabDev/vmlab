@@ -36,7 +36,26 @@ pub struct VirtioVga {
     power_on_config: [u8; 256],
     /// What a second transport is built from when `enable_3d` replaces the
     /// first.
-    wiring: (GuestMemory, Option<Arc<dyn MsiSink>>, Option<Arc<dyn IrqLine>>),
+    wiring: Wiring,
+}
+
+#[derive(Clone)]
+struct Wiring {
+    mem: GuestMemory,
+    msi: Option<Arc<dyn MsiSink>>,
+    intx: Option<Arc<dyn IrqLine>>,
+}
+
+impl Wiring {
+    fn transport(&self, id: &str, device: Box<dyn crate::VirtioDevice>) -> VirtioPciDevice {
+        VirtioPciDevice::new(
+            format!("{id}.transport"),
+            device,
+            self.mem.clone(),
+            self.msi.clone(),
+            self.intx.clone(),
+        )
+    }
 }
 
 impl VirtioVga {
@@ -50,18 +69,11 @@ impl VirtioVga {
         let id = id.into();
         let vga = StandardVga::new(format!("{id}.vga"), rom)?;
         let gpu = Gpu::new(format!("{id}.gpu"));
-        let wiring = (mem, msi, intx);
+        let wiring = Wiring { mem, msi, intx };
         // A 2D command copies and converts pixels. On the worker it does
         // not hold the vCPU that kicked.
-        let transport = VirtioPciDevice::new(
-            format!("{id}.transport"),
-            Box::new(crate::virtio::worker::QueueWorker::new(Box::new(
-                gpu.clone(),
-            ))?),
-            wiring.0.clone(),
-            wiring.1.clone(),
-            wiring.2.clone(),
-        );
+        let worker = crate::virtio::worker::QueueWorker::new(Box::new(gpu.clone()))?;
+        let transport = wiring.transport(&id, Box::new(worker));
         let mut config = [0; 256];
         config[..4].copy_from_slice(&[0xf4, 0x1a, 0x50, 0x10]);
         config[6] = 0x10;
@@ -117,13 +129,7 @@ impl VirtioVga {
         // The device offers other features now, and the worker read them
         // when it was made. The guest has not run yet, so the first
         // transport holds no state.
-        self.transport = VirtioPciDevice::new(
-            format!("{}.transport", self.id),
-            Box::new(self.gpu.clone()),
-            self.wiring.0.clone(),
-            self.wiring.1.clone(),
-            self.wiring.2.clone(),
-        );
+        self.transport = self.wiring.transport(&self.id, Box::new(self.gpu.clone()));
         self.aperture_size = size;
         self.accelerated = true;
         self.config[0x34] = 0xa4;
