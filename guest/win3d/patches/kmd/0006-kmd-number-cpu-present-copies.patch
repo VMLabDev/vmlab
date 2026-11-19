@@ -35,10 +35,10 @@ index affff98..85b95e8 100644
  #define VIOGPU_CTX_INIT              0x200
  #define VIOGPU_QUERY_TIMELINE_SUBMIT 0x301
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 03105d8..068cb4b 100644
+index 03105d8..7be6914 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
-@@ -1495,6 +1495,15 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+@@ -1495,6 +1495,16 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                  vidpn.EscapeCustomResoulution(&pVioGpuEscape->Resolution);
                  break;
              }
@@ -49,6 +49,7 @@ index 03105d8..068cb4b 100644
 +                    return STATUS_INVALID_BUFFER_SIZE;
 +                }
 +                pVioGpuEscape->Id = static_cast<ULONG>(InterlockedCompareExchange(&m_cpuCopySequence, 0, 0));
++                FlipTrace(25, 0, pVioGpuEscape->Id, (UINT64)(ULONG_PTR)PsGetCurrentProcessId());
 +                break;
 +            }
          case VIOGPU_GET_CAPS:

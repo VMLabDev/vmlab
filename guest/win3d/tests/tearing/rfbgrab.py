@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import struct
 import sys
 import time
@@ -141,6 +142,7 @@ def main():
     ap.add_argument('--fps', type=float, default=30)
     ap.add_argument('--out', help='directory for the first torn frames (PPM)')
     ap.add_argument('--keep', type=int, default=20, help='torn frames to save')
+    ap.add_argument('--on-torn', help='shell command to start at the first torn frame')
     args = ap.parse_args()
 
     rfb = Rfb(args.sock)
@@ -171,6 +173,8 @@ def main():
                 last_x = x
             if bands:
                 torn += 1
+                if torn == 1 and args.on_torn:
+                    subprocess.Popen(args.on_torn, shell=True)
                 if len(examples) < 50:
                     examples.append({'frame': grabbed, 't': round(t0 - start, 3), 'x': x, 'bands': bands[:8]})
                 if args.out and saved < args.keep:

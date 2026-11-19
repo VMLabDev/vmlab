@@ -3,7 +3,8 @@
 # WPF window animates in the guest.
 #
 #   tests/tearing/run.sh [--seconds N] [--frames N] [--load PERCENT --cpus LIST]
-#                        [--full] [--trace] [--out DIR] <lab-dir> <vm>
+#                        [--full] [--trace] [--trace-on-tear] [--out DIR]
+#                        <lab-dir> <vm>
 #
 # <lab-dir> holds the vmlab.wcl of a running lab whose <vm> has the package
 # installed and a user logged on at the console (tests/e2e/run.sh --keep
@@ -25,6 +26,10 @@
 # --trace also reads the flip trace of a trace-build kernel driver
 # (build/kmd/README.md) for the first 20 s into <out>/fliptrace.csv.
 #
+# --trace-on-tear reads the whole ring of the trace build at the first torn
+# frame into <out>/fliptrace-tear.csv: the records of the minute or two
+# before it.
+#
 # Prints rfbgrab.py's JSON, and writes it with the guest's report and the
 # first torn frames to --out (default .scratch/tearing/<vm>). Needs uv.
 # Exit status: 0 no torn frame, 1 torn frames, 2 usage or the window was
@@ -33,8 +38,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 VMLAB=${VMLAB:-vmlab}
-SECONDS_RUN=60; FRAMES=0; LOAD=0; CPUS=; TRACE=0; OUT=; FULL=
-usage() { sed -n '2,31p' "$0"; }
+SECONDS_RUN=60; FRAMES=0; LOAD=0; CPUS=; TRACE=0; ONTEAR=0; OUT=; FULL=
+usage() { sed -n '2,36p' "$0"; }
 while [ $# -gt 0 ]; do
     case $1 in
         --seconds) SECONDS_RUN=${2:-}; shift 2 ;;
@@ -42,6 +47,7 @@ while [ $# -gt 0 ]; do
         --load) LOAD=${2:-}; shift 2 ;;
         --cpus) CPUS=${2:-}; shift 2 ;;
         --trace) TRACE=1; shift ;;
+        --trace-on-tear) ONTEAR=1; shift ;;
         --full) FULL=",'-Full'"; shift ;;
         --out) OUT=${2:-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -112,13 +118,22 @@ if [ "$TRACE" = 1 ]; then
 fi
 
 rc=0
+ONTORN=()
+if [ "$ONTEAR" = 1 ]; then
+    printf -v hook 'cd %q && %q exec --timeout 120 %q -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\win3d\\tearing\\Get-FlipTrace.ps1 -FromStart -Seconds 1 -Out C:\\win3d\\results\\fliptrace-tear.csv >%q 2>&1' \
+        "$LABDIR" "$VMLAB" "$VM" "$OUT/fliptrace-tear.txt"
+    ONTORN=(--on-torn "$hook")
+fi
 uv run --no-project --with numpy python "$HERE/rfbgrab.py" "$SOCK" --seconds "$SECONDS_RUN" --frames "$FRAMES" \
-    --out "$OUT/torn" >"$OUT/grab.json" || rc=$?
+    --out "$OUT/torn" "${ONTORN[@]}" >"$OUT/grab.json" || rc=$?
 [ -z "$HOG" ] || { kill "$HOG" 2>/dev/null || true; HOG=; }
 cat "$OUT/grab.json"
 if [ "$TRACE" = 1 ]; then
     wait "$TRACER" || true; TRACER=
     in_lab "$VMLAB" cp "$VM:C:/win3d/results/fliptrace.csv" "$OUT/fliptrace.csv" || true
+fi
+if [ "$ONTEAR" = 1 ] && [ -s "$OUT/fliptrace-tear.txt" ]; then
+    in_lab "$VMLAB" cp "$VM:C:/win3d/results/fliptrace-tear.csv" "$OUT/fliptrace-tear.csv" || true
 fi
 # The window closes by itself; its report says whether WPF rendered on the GPU.
 wait "$WINDOW" || true; WINDOW=

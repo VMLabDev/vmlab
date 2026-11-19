@@ -63,6 +63,7 @@ The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
 | 19 | The vsync timer sends the recorded flip | flags = resource |
 | 20 | One packet of a DMA buffer goes to the control queue | context, flags = ring index, fence, response = command type (0 NOP, 1 SUBMIT, a timeline submit has a ring index) |
 | 21 | A host context was created | context, flags = capset, fence = process id |
+| 25 | A reader asked for the sequence number of Blt present copies (`0006`) | flags = the sequence, fence = process id |
 
 Events 1 to 9 are the records of the 256-record ring of `0004`, without the
 bare interrupt (event 4). A release build has that small ring only.
