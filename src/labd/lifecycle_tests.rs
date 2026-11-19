@@ -354,55 +354,82 @@ async fn a_qemu_vm_reports_the_removal_warning_in_its_status() {
 
 #[tokio::test]
 async fn qemu_identity_migrates_once_and_keeps_its_snapshots() {
-    use crate::config::hypervisor::{HypervisorKind, SelectionSource};
     use super::state::{LabState, SnapshotRecord};
+    use crate::config::hypervisor::{HypervisorKind, SelectionSource};
 
     let dirs = Dirs::new();
     let (machine, _) = vm(&dirs, LINUX_VM, on_vmlab_hv(Script::healthy()));
     let machine = machine.with_selection_source(SelectionSource::QemuMigration);
     let disk = machine.dirs.primary_disk();
     std::fs::remove_file(&disk).unwrap();
-    crate::template::qimg::create_blank(&disk, 1 << 20).await.unwrap();
-    crate::template::qimg::snapshot_create(&disk, "cold").await.unwrap();
+    crate::template::qimg::create_blank(&disk, 1 << 20)
+        .await
+        .unwrap();
+    crate::template::qimg::snapshot_create(&disk, "cold")
+        .await
+        .unwrap();
     let local = crate::paths::lab_local_dir(&dirs.root);
     let mut state = LabState::default();
     let saved = state.machine_mut(machine.name());
     saved.hypervisor = Some(HypervisorKind::Qemu);
     for (name, online) in [("cold", false), ("warm", true)] {
-        saved.snapshots.insert(name.into(), SnapshotRecord {
-            online,
-            taken_at: chrono::Utc::now(),
-            image_digest: None,
-            frozen_in: None,
-            freeze_point: None,
-            hypervisor: HypervisorKind::Qemu,
-        });
+        saved.snapshots.insert(
+            name.into(),
+            SnapshotRecord {
+                online,
+                taken_at: chrono::Utc::now(),
+                image_digest: None,
+                frozen_in: None,
+                freeze_point: None,
+                hypervisor: HypervisorKind::Qemu,
+            },
+        );
     }
     state.save(&local).unwrap();
     let config = crate::config::load_lab_source(
         &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
         "<test>",
         &dirs.root,
-    ).unwrap();
+    )
+    .unwrap();
     let lab = super::lab::LabRuntime::with_machines(config, vec![machine.clone()]).unwrap();
     let (tx, mut lines) = mpsc::unbounded_channel();
     let output: crate::scripting::OutputSink = Arc::new(move |line| tx.send(line).unwrap());
     let name = machine.name();
-    lab.start_machine_with_output(name, Some(&output)).await.unwrap();
-    assert_eq!(lines.try_recv().unwrap(), "info: dc01: migrated from QEMU to vmlab-hv\n");
-    assert_eq!(LabState::load(&local).unwrap().machines[name].hypervisor, Some(HypervisorKind::Vmlab));
+    lab.start_machine_with_output(name, Some(&output))
+        .await
+        .unwrap();
+    assert_eq!(
+        lines.try_recv().unwrap(),
+        "info: dc01: migrated from QEMU to vmlab-hv\n"
+    );
+    assert_eq!(
+        LabState::load(&local).unwrap().machines[name].hypervisor,
+        Some(HypervisorKind::Vmlab)
+    );
     let listed = lab.snapshots(name).await.unwrap();
     assert!(listed[0]["unrestorable"].is_null(), "{listed}");
     assert_eq!(listed[1]["name"], "warm");
     let why = listed[1]["unrestorable"].as_str().unwrap();
-    assert!(why.contains("\"warm\"") && why.contains("convert it to offline"), "{why}");
+    assert!(
+        why.contains("\"warm\"") && why.contains("convert it to offline"),
+        "{why}"
+    );
     let error = lab.restore(name, "warm", false).await.unwrap_err();
     assert_eq!(error.to_string(), why);
     lab.stop_machine(name, true).await.unwrap();
-    machine.wait_state(PowerState::Stopped, SETTLE).await.unwrap();
+    machine
+        .wait_state(PowerState::Stopped, SETTLE)
+        .await
+        .unwrap();
     lab.restore(name, "cold", false).await.unwrap();
-    assert_eq!(LabState::load(&local).unwrap().machines[name].snapshots, state.machines[name].snapshots);
-    lab.start_machine_with_output(name, Some(&output)).await.unwrap();
+    assert_eq!(
+        LabState::load(&local).unwrap().machines[name].snapshots,
+        state.machines[name].snapshots
+    );
+    lab.start_machine_with_output(name, Some(&output))
+        .await
+        .unwrap();
     assert!(lines.try_recv().is_err());
     lab.stop_machine(name, true).await.unwrap();
 }
@@ -427,12 +454,16 @@ async fn refused_qemu_migration_keeps_the_disk_identity() {
         &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
         "<test>",
         &dirs.root,
-    ).unwrap();
+    )
+    .unwrap();
     let lab = super::lab::LabRuntime::with_machines(config, vec![machine.clone()]).unwrap();
     let error = lab.start_machine(name).await.unwrap_err().to_string();
     assert!(error.contains("qxl-vga"), "{error}");
     assert_eq!(machine.state().await, PowerState::Stopped);
-    assert_eq!(LabState::load(&local).unwrap().machines[name].hypervisor, Some(HypervisorKind::Qemu));
+    assert_eq!(
+        LabState::load(&local).unwrap().machines[name].hypervisor,
+        Some(HypervisorKind::Qemu)
+    );
 }
 
 /// A legacy pc VM on vmlab-hv gets its e1000 or PCnet on a plain stream:
