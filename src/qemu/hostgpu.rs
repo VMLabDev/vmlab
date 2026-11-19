@@ -1576,7 +1576,10 @@ mod tests {
         let plan = |mode, name| render_plan(Some(&gpu(mode, Some(name))), &h, &sysfs).unwrap();
         let on = plan(GpuMode::Vulkan, "Nvidia2");
         assert_eq!(owned(&on.env).last(), Some(&switch));
-        for other in [plan(GpuMode::Vulkan, "Nvidia1"), plan(GpuMode::Vulkan, "AMD1")] {
+        for other in [
+            plan(GpuMode::Vulkan, "Nvidia1"),
+            plan(GpuMode::Vulkan, "AMD1"),
+        ] {
             assert!(!owned(&other.env).contains(&switch));
         }
         assert!(plan(GpuMode::Virgl, "Nvidia2").env.set.is_empty());
@@ -1586,7 +1589,10 @@ mod tests {
             .into_iter()
             .filter(|(k, _)| k == vk_layer::HIDE_UNCACHED_VAR)
             .collect();
-        assert_eq!(set, [(vk_layer::HIDE_UNCACHED_VAR.to_string(), "0".to_string())]);
+        assert_eq!(
+            set,
+            [(vk_layer::HIDE_UNCACHED_VAR.to_string(), "0".to_string())]
+        );
     }
 
     /// `virgl`, `passthrough`, no `gpu {}` and a `vulkan` guest with no host

@@ -138,7 +138,11 @@ mod tests {
     /// the rule, and for each hidden type the index of its counterpart.
     fn rule(types: &[Type]) -> (Vec<Type>, Vec<Hidden>) {
         let out = std::process::Command::new(concat!(env!("OUT_DIR"), "/vk-rule-check"))
-            .args(types.iter().map(|(heap, flags)| format!("{heap}:{flags:x}")))
+            .args(
+                types
+                    .iter()
+                    .map(|(heap, flags)| format!("{heap}:{flags:x}")),
+            )
             .output()
             .unwrap();
         assert!(out.status.success(), "{out:?}");
@@ -245,10 +249,7 @@ mod tests {
     /// The embedded layer answers the memory queries and reads its switch.
     #[test]
     fn the_embedded_layer_carries_the_memory_rule() {
-        for needle in [
-            "vkGetPhysicalDeviceMemoryProperties2KHR",
-            HIDE_UNCACHED_VAR,
-        ] {
+        for needle in ["vkGetPhysicalDeviceMemoryProperties2KHR", HIDE_UNCACHED_VAR] {
             assert!(
                 LIBRARY
                     .windows(needle.len())
