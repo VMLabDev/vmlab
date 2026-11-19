@@ -724,7 +724,12 @@ fn macos_boot_stall_census() {
     let probe = std::env::var("VMLAB_HV_MACOS_STALL_PROBE")
         .ok()
         .map(|s| s.parse::<usize>().unwrap());
-    let interval = Duration::from_secs(3);
+    let interval = Duration::from_millis(
+        std::env::var("VMLAB_HV_MACOS_STALL_INTERVAL_MS")
+            .ok()
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(3000),
+    );
     let fake_key = "FAKE".repeat(16);
     let mut stalls = Vec::new();
     let mut times = Vec::new();
