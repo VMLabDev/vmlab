@@ -5,6 +5,7 @@
 //! it with KVM as an ioeventfd, and then the kernel writes it and the vCPU
 //! never leaves guest mode for userspace ([`VirtioDevice::queue_events`]).
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
@@ -21,64 +22,140 @@ enum Command {
     Stop,
 }
 
-/// What the worker thread sleeps on: one eventfd for commands, one per queue.
+/// The epoll key of the command event. Queue `index` has `index + 1`.
+const COMMAND_KEY: u64 = 0;
+
+/// What the worker thread sleeps on: one eventfd for commands and one per
+/// queue, in an edge-triggered epoll set. Every write to an eventfd is one
+/// edge, so the worker never reads the counters, and a wake costs it one
+/// system call.
 struct Wake {
+    epoll: OwnedFd,
     command: EventFd,
     queues: Vec<Arc<EventFd>>,
 }
 
 impl Wake {
-    /// Serve queue `index` if it was kicked since it was last served.
-    fn serve(&self, index: usize, device: &Mutex<Box<dyn VirtioDevice>>) {
-        // The read takes every kick so far. It fails when there was none.
-        if self.queues[index].read().is_ok() {
-            device.lock().queue_notify(index as u16);
+    fn new(queues: usize) -> std::io::Result<Self> {
+        // SAFETY: the call takes no pointer, and the descriptor it returns
+        // is owned by nothing else.
+        let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epoll < 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: `epoll` is a descriptor this function just opened.
+        let epoll = unsafe { OwnedFd::from_raw_fd(epoll) };
+        let event = || EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
+        let wake = Self {
+            epoll,
+            command: event()?,
+            queues: (0..queues)
+                .map(|_| event().map(Arc::new))
+                .collect::<Result<_, _>>()?,
+        };
+        wake.watch(&wake.command, COMMAND_KEY)?;
+        for (index, queue) in wake.queues.iter().enumerate() {
+            wake.watch(queue, index as u64 + 1)?;
+        }
+        Ok(wake)
     }
 
-    fn run(&self, device: &Mutex<Box<dyn VirtioDevice>>, commands: &mpsc::Receiver<Command>) {
-        use std::os::fd::AsRawFd;
-        let mut fds: Vec<libc::pollfd> = std::iter::once(self.command.as_raw_fd())
-            .chain(self.queues.iter().map(|queue| queue.as_raw_fd()))
-            .map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect();
-        let mut paused = false;
+    fn watch(&self, event: &EventFd, key: u64) -> std::io::Result<()> {
+        let mut interest = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+            u64: key,
+        };
+        // SAFETY: both descriptors are open, and `interest` is valid for
+        // the call, which copies it.
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                event.as_raw_fd(),
+                &mut interest,
+            )
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Take the edges that arrived: mark each kicked queue in `kicked` and
+    /// return whether the command event was among them. `wait` blocks until
+    /// there is one.
+    fn collect(&self, wait: bool, kicked: &mut [bool]) -> std::io::Result<bool> {
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
+        let mut command = false;
+        let mut timeout = if wait { -1 } else { 0 };
         loop {
-            // A paused worker leaves the kicks in the eventfds, which
-            // coalesce them, and serves them after the resume.
-            let watched = if paused { 1 } else { fds.len() };
-            // SAFETY: `fds` holds `watched` initialised entries, and every
-            // descriptor is owned by `self` for the whole call.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), watched as libc::nfds_t, -1) };
-            if ready < 0 {
+            // SAFETY: `events` is writable for the length the call is given.
+            let count = unsafe {
+                libc::epoll_wait(
+                    self.epoll.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    timeout,
+                )
+            };
+            if count < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                log::error!("virtio queue worker: poll: {error}");
-                return;
+                return Err(error);
             }
-            for (index, fd) in fds[1..watched].iter().enumerate() {
-                if fd.revents & libc::POLLIN != 0 {
-                    self.serve(index, device);
+            for event in &events[..count as usize] {
+                let key = event.u64;
+                if key == COMMAND_KEY {
+                    command = true;
+                } else if let Some(queue) = kicked.get_mut(key as usize - 1) {
+                    *queue = true;
                 }
             }
-            if fds[0].revents & libc::POLLIN == 0 {
+            // A full buffer can leave edges behind. Take them without a wait.
+            if (count as usize) < events.len() {
+                return Ok(command);
+            }
+            timeout = 0;
+        }
+    }
+
+    fn serve(kicked: &mut [bool], device: &Mutex<Box<dyn VirtioDevice>>) {
+        for (index, queue) in kicked.iter_mut().enumerate() {
+            if std::mem::take(queue) {
+                device.lock().queue_notify(index as u16);
+            }
+        }
+    }
+
+    fn run(&self, device: &Mutex<Box<dyn VirtioDevice>>, commands: &mpsc::Receiver<Command>) {
+        // The kicks that arrived and are not served yet. A paused worker
+        // keeps them here, where they coalesce, and serves them after the
+        // resume.
+        let mut kicked = vec![false; self.queues.len()];
+        let mut paused = false;
+        let failed = |error: std::io::Error| log::error!("virtio queue worker: epoll: {error}");
+        loop {
+            let command = match self.collect(true, &mut kicked) {
+                Ok(command) => command,
+                Err(error) => return failed(error),
+            };
+            if !paused {
+                Self::serve(&mut kicked, device);
+            }
+            if !command {
                 continue;
             }
-            let _ = self.command.read();
             while let Ok(command) = commands.try_recv() {
                 // A kick that was written before the command was sent is
-                // served before it, whatever `poll` reported: a barrier
-                // promises that, and a snapshot must not lose a kick.
+                // served before it: a barrier promises that, and a
+                // snapshot must not lose a kick.
+                if let Err(error) = self.collect(false, &mut kicked) {
+                    return failed(error);
+                }
                 if !paused {
-                    for index in 0..self.queues.len() {
-                        self.serve(index, device);
-                    }
+                    Self::serve(&mut kicked, device);
                 }
                 match command {
                     Command::Barrier(done) => {
@@ -92,6 +169,7 @@ impl Wake {
                     Command::Resume => {
                         device.lock().resume_snapshot();
                         paused = false;
+                        Self::serve(&mut kicked, device);
                     }
                     Command::Stop => return,
                 }
@@ -124,14 +202,7 @@ impl QueueWorker {
         let config_len = device.config_len();
         let name = format!("{}-queues", device.state_id());
         let device = Arc::new(Mutex::new(device));
-        let event = || EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
-        let wake = Arc::new(Wake {
-            command: event()?,
-            queues: sizes
-                .iter()
-                .map(|_| event().map(Arc::new))
-                .collect::<Result<_, _>>()?,
-        });
+        let wake = Arc::new(Wake::new(sizes.len())?);
         let (sender, receiver) = mpsc::channel();
         let work = wake.clone();
         let inner = device.clone();
@@ -214,8 +285,8 @@ impl VirtioDevice for QueueWorker {
     }
     fn queue_notify(&mut self, index: u16) {
         if let Some(queue) = self.wake.queues.get(index as usize) {
-            // The write fails only when the counter is full, and then a
-            // kick is pending already.
+            // The worker counts edges and never reads the counter. The
+            // write fails only when the counter is full, after 2^64 kicks.
             let _ = queue.write(1);
         }
     }
@@ -223,10 +294,9 @@ impl VirtioDevice for QueueWorker {
         Some(self.wake.queues.clone())
     }
     fn reset(&mut self) {
+        // The barrier serves the kicks written before it. One that the
+        // kernel delivers after it finds a reset device, which ignores it.
         self.barrier(false);
-        for queue in &self.wake.queues {
-            let _ = queue.read();
-        }
         self.device.lock().reset();
     }
 }
