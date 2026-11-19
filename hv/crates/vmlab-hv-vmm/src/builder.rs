@@ -745,6 +745,7 @@ pub fn build(
             },
             msix_vectors: vectors,
             transitional: firmware_machine && transitional,
+            doorbells: Some(Box::new(crate::kvm::KvmDoorbells::new(vm_fd.clone()))),
         })
     };
     let place = |function: Arc<Mutex<dyn vmlab_hv_devices::PciDevice>>,

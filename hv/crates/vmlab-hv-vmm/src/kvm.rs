@@ -382,6 +382,62 @@ impl KvmMsiSink {
     }
 }
 
+/// Queue kicks delivered in the kernel: each doorbell is a KVM ioeventfd
+/// on its notify address, of length zero, which matches a write of any
+/// length and value.
+pub struct KvmDoorbells {
+    vm: Arc<VmFd>,
+    registered: Vec<vmlab_hv_devices::QueueDoorbell>,
+}
+
+impl KvmDoorbells {
+    pub fn new(vm: Arc<VmFd>) -> Self {
+        KvmDoorbells {
+            vm,
+            registered: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        for doorbell in self.registered.drain(..) {
+            if let Err(e) = self.vm.unregister_ioevent(
+                &*doorbell.event,
+                &kvm_ioctls::IoEventAddress::Mmio(doorbell.address),
+                kvm_ioctls::NoDatamatch,
+            ) {
+                log::error!(
+                    "kvm: removing the ioeventfd at {:#x} failed: {e}",
+                    doorbell.address
+                );
+            }
+        }
+    }
+}
+
+impl vmlab_hv_devices::QueueDoorbells for KvmDoorbells {
+    fn set(&mut self, doorbells: &[vmlab_hv_devices::QueueDoorbell]) -> std::io::Result<()> {
+        self.clear();
+        for doorbell in doorbells {
+            if let Err(e) = self.vm.register_ioevent(
+                &*doorbell.event,
+                &kvm_ioctls::IoEventAddress::Mmio(doorbell.address),
+                kvm_ioctls::NoDatamatch,
+            ) {
+                self.clear();
+                return Err(std::io::Error::other(e));
+            }
+            self.registered.push(doorbell.clone());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for KvmDoorbells {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 impl vmlab_hv_devices::MsiSink for KvmMsiSink {
     fn signal(&self, msg: vmlab_hv_devices::MsiMessage) {
         let msi = kvm_bindings::kvm_msi {
@@ -607,5 +663,131 @@ mod tests {
         let Some(vm) = kvm_or_skip() else { return };
         assert!(vm.set_irq_line(4, true).is_ok());
         assert!(vm.set_irq_line(4, false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod doorbell_tests {
+    use super::*;
+    use kvm_ioctls::VcpuExit;
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
+    use vmlab_hv_devices::{QueueDoorbell, QueueDoorbells};
+    use vmm_sys_util::eventfd::EventFd;
+
+    /// Run `mov dword [address], 0` and then `out 0xf4, al` on a fresh vCPU
+    /// state, and return the first exit as text.
+    fn write_then_port(
+        cpu: &mut kvm_ioctls::VcpuFd,
+        memory: &vmlab_hv_devices::GuestMemory,
+        address: u32,
+    ) -> String {
+        let mut code = vec![0x67, 0x66, 0xc7, 0x05];
+        code.extend(address.to_le_bytes());
+        code.extend(0u32.to_le_bytes());
+        code.extend([0xe6, 0xf4]);
+        memory.write_slice(&code, GuestAddress(0x1000)).unwrap();
+        cpu.set_regs(&kvm_bindings::kvm_regs {
+            rip: 0x1000,
+            rflags: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let exit = match cpu.run().unwrap() {
+            VcpuExit::IoOut(port, _) => format!("out {port:#x}"),
+            VcpuExit::MmioWrite(address, _) => format!("mmio {address:#x}"),
+            exit => format!("{exit:?}"),
+        };
+        if exit.starts_with("mmio") {
+            // KVM completes the write on the next entry. Let it, so that
+            // the next call starts with no instruction in flight.
+            assert!(matches!(cpu.run().unwrap(), VcpuExit::IoOut(0xf4, _)));
+        }
+        exit
+    }
+
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn a_registered_doorbell_write_signals_its_event_without_a_userspace_exit() {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP queue doorbells: /dev/kvm missing");
+            return;
+        }
+        let kvm = KvmVm::new().unwrap();
+        let memory =
+            vmlab_hv_devices::GuestMemory::from_ranges(&[(GuestAddress(0), 0x2000)]).unwrap();
+        let registration = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: 0,
+            memory_size: 0x2000,
+            userspace_addr: memory.get_host_address(GuestAddress(0)).unwrap() as u64,
+            flags: 0,
+        };
+        // SAFETY: this test retains memory until after the vCPU is dropped.
+        unsafe { kvm.vm.set_user_memory_region(registration) }.unwrap();
+        let mut cpu = kvm.vm.create_vcpu(0).unwrap();
+        let mut segments = cpu.get_sregs().unwrap();
+        segments.cs.base = 0;
+        segments.cs.selector = 0;
+        segments.ds.limit = u32::MAX;
+        segments.ds.g = 1;
+        cpu.set_sregs(&segments).unwrap();
+
+        let events: Vec<_> = (0..2)
+            .map(|_| Arc::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()))
+            .collect();
+        let at = |base: u64| -> Vec<QueueDoorbell> {
+            events
+                .iter()
+                .enumerate()
+                .map(|(queue, event)| QueueDoorbell {
+                    address: base + 0x1000 + 4 * queue as u64,
+                    event: event.clone(),
+                })
+                .collect()
+        };
+        let pending = |queue: usize| events[queue].read().ok();
+        let mut doorbells = KvmDoorbells::new(kvm.vm.clone());
+
+        doorbells.set(&at(0x9000_0000)).unwrap();
+        assert_eq!(write_then_port(&mut cpu, &memory, 0x9000_1004), "out 0xf4");
+        assert_eq!((pending(0), pending(1)), (None, Some(1)));
+        assert_eq!(write_then_port(&mut cpu, &memory, 0x9000_1000), "out 0xf4");
+        assert_eq!((pending(0), pending(1)), (Some(1), None));
+        // Beside the notify registers the write still exits.
+        assert_eq!(
+            write_then_port(&mut cpu, &memory, 0x9000_1008),
+            "mmio 0x90001008"
+        );
+
+        // A new set replaces the old one.
+        doorbells.set(&at(0xa000_0000)).unwrap();
+        assert_eq!(
+            write_then_port(&mut cpu, &memory, 0x9000_1000),
+            "mmio 0x90001000"
+        );
+        assert_eq!(write_then_port(&mut cpu, &memory, 0xa000_1000), "out 0xf4");
+        assert_eq!((pending(0), pending(1)), (Some(1), None));
+
+        // A set the kernel refuses leaves nothing registered: the second
+        // doorbell repeats the address and event of the first.
+        let mut twice = at(0xb000_0000);
+        twice[1] = twice[0].clone();
+        assert!(doorbells.set(&twice).is_err());
+        assert_eq!(
+            write_then_port(&mut cpu, &memory, 0xb000_1000),
+            "mmio 0xb0001000"
+        );
+        assert_eq!(
+            write_then_port(&mut cpu, &memory, 0xa000_1000),
+            "mmio 0xa0001000"
+        );
+
+        doorbells.set(&at(0xa000_0000)).unwrap();
+        drop(doorbells);
+        assert_eq!(
+            write_then_port(&mut cpu, &memory, 0xa000_1000),
+            "mmio 0xa0001000"
+        );
+        assert_eq!((pending(0), pending(1)), (None, None));
     }
 }
