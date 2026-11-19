@@ -136,9 +136,9 @@ vkd3d-proton queues go to DXVK's DXGI, and everything else stays native.
 | Guest files | x64 and x86: `viogpu_d3d10.dll` |
 | Found by | Class key `UserModeDriverName` = `C:\Windows\System32\viogpu_d3d10.dll` three times (D3D9, D3D10, D3D11), `UserModeDriverNameWow` = the SysWOW64 path three times, `InstalledDisplayDrivers` = `viogpu_d3d10` three times. There is no D3D12 entry. |
 | Installed by | The INF (`VioGpu3D_Files.Usermode`, `VioGpu3D_Files.Wow64`, `VioGpu3D_DeviceSettings`) |
-| Upstream | [arehnman/virtio-win-mesa](https://github.com/arehnman/virtio-win-mesa), branch `yttrium-experimental`, commit `374c3022` (Mesa 26.1.0) |
+| Upstream | [arehnman/virtio-win-mesa](https://github.com/arehnman/virtio-win-mesa), branch `yttrium-experimental`, commit `76c095bb`, the November 2026 release (Mesa 26.1.0) |
 | Build | [`build/mesa/`](../build/mesa/README.md) |
-| Patches | Mesa 19, shared with the two Mesa components below (table below). 0005 to 0010, 0012 to 0017, 0020 and 0021 change this UMD; 0001 to 0003 are shared build and utility fixes. |
+| Patches | Mesa 43, shared with the two Mesa components below (table below). [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
 | Licence | Mesa MIT; the Yttrium winsys (`src/gallium/winsys/yttrium/gdi/`) MPL-2.0 |
 
 `viogpu_d3d10.dll` is Mesa's `d3d10umd` front end (D3D10/11 DDI, plus a
@@ -180,15 +180,16 @@ renderer, `vn_renderer_d3dkmt.c`, submits Venus commands to the KMD with
 | | |
 | --- | --- |
 | Guest files | `viogpu3d.sys`, `vgpusrv.exe`, `viogpuap.exe` in the driver store (`C:\Windows\System32\DriverStore\FileRepository\viogpu3d.inf_amd64_<hash>\`, INF DIRID 13); the INF as `C:\Windows\INF\oem<NN>.inf` |
-| Found by | PnP matches the INF's hardware ID `PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01`. The INF adds the kernel service `VioGpu3D` and the user service `vgpusrv` ("VioGpu Resolution Service"), which starts `viogpuap.exe` in each user session. |
+| Found by | PnP matches the INF's hardware ID `PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01`. The INF adds the kernel service `VioGpu3D` and the user service `vgpusrv` ("Yttrium VirtIO Resolution Service"), which starts `viogpuap.exe` in each user session. |
 | Installed by | The installer runs `pnputil /add-driver viogpu3d.inf /install`. The package is test-signed ([decision 0001](decisions/0001-signing.md)). |
-| Upstream | [arehnman/yttrium-virtio-gpu](https://github.com/arehnman/yttrium-virtio-gpu), tag `yttrium-experimental-2026-09-27`, a fork of virtio-win/kvm-guest-drivers-windows |
+| Upstream | [arehnman/yttrium-virtio-gpu](https://github.com/arehnman/yttrium-virtio-gpu), tag `yttrium-experimental-2026-11-02` (`e9917ae2`), a fork of virtio-win/kvm-guest-drivers-windows |
 | Build | [`build/kmd/`](../build/kmd/README.md), clang-cl and lld-link against the WDK NuGet packages |
-| Patches | 1 (table below) |
+| Patches | 4 (table below) |
 | Licence | BSD-3-Clause; Yttrium's changes to `viogpu3d` are also MPL-2.0 where marked |
 
-The device appears as "Hardsoft VirtIO GPU 3D controller", driver version
-100.6.101.58100. It is a WDDM 2.0 display miniport with Venus and blob
+The device appears as "Yttrium VirtIO GPU 3D controller" (upstream renamed
+it from "Hardsoft VirtIO GPU 3D controller" in the November release), driver
+version 100.6.101.58105. It is a WDDM 2.0 display miniport with Venus and blob
 resource support and a 60 Hz VidPN timer. It needs the
 `VIRTIO_GPU_F_VIRGL` feature, so it fails to start on a plain `virtio-vga`.
 
@@ -220,8 +221,9 @@ The repository-root patches/virglrenderer/ directory carries 0001
 image-allocation logging, 0002 NVIDIA queue-sync fence timing and 0003
 memory-import export-info removal. The root build/hv.py and e2e image
 apply all three; hypervisor tests use that build. diagnostic/0040 remains
-unapplied. The obsolete feedback-loop workaround is removed because guest
-Mesa patch 0020 handles it.
+unapplied. The obsolete feedback-loop workaround is removed because the
+guest UMD asks the host before it adds feedback-loop usage (Mesa patch 0020
+until the November rebase, upstream's own check since).
 
 The vmlab-hv release bundle ships the patched library and render server.
 win3d no longer builds or ships a QEMU fork or a separate host asset.

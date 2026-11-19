@@ -143,7 +143,7 @@ for api in ('d3d9', 'd3d11', 'd3d12', 'opengl', 'vulkan'):
 # 2. dxdiag reports hardware acceleration on our driver.
 d = load('dxdiag', 'dxdiag.json')
 s = (d or {}).get('summary') or {}
-ours = bool(re.search(r'viogpu3d|Hardsoft', f"{s.get('card_name')} {s.get('driver_name')}", re.I))
+ours = bool(re.search(r'viogpu3d|Yttrium VirtIO GPU 3D', f"{s.get('card_name')} {s.get('driver_name')}", re.I))
 row('2', 'dxdiag reports hardware acceleration on our driver', bool(s.get('hardware_acceleration')) and ours,
     'dxdiag/dxdiag.json', f"hardware_acceleration={s.get('hardware_acceleration')}, card {s.get('card_name')!r}, "
     f"D3D {s.get('direct3d_acceleration')}, DDraw {s.get('directdraw_acceleration')}, {s.get('driver_model')}")
