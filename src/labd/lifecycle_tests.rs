@@ -336,6 +336,136 @@ fn automatic_hypervisor_selection_follows_a_deferred_templates_hardware() {
     assert!(why.contains("qxl-vga"), "{why}");
 }
 
+/// A VM the lab builder left on QEMU reports the removal warning in its
+/// status, by the rung that chose QEMU; one nothing selected reports none.
+#[tokio::test]
+async fn a_qemu_vm_reports_the_removal_warning_in_its_status() {
+    use crate::config::hypervisor::{QemuReason, SelectionSource};
+    let dirs = Dirs::new();
+    let (mut machine, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    machine.set_host_facts(kvm_host());
+    assert_eq!(machine.qemu_removal(), None);
+    let machine = machine.with_selection_source(SelectionSource::Existing);
+    let removal = machine.qemu_removal().expect("an x86 VM on QEMU");
+    assert_eq!(removal.reason, QemuReason::Existing);
+    let machine: Arc<dyn Machine> = machine;
+    assert_eq!(machine.status().await.qemu_removal, Some(removal));
+}
+
+#[tokio::test]
+async fn qemu_identity_migrates_once_and_keeps_its_snapshots() {
+    use super::state::{LabState, SnapshotRecord};
+    use crate::config::hypervisor::{HypervisorKind, SelectionSource};
+
+    let dirs = Dirs::new();
+    let (machine, _) = vm(&dirs, LINUX_VM, on_vmlab_hv(Script::healthy()));
+    let machine = machine.with_selection_source(SelectionSource::QemuMigration);
+    let disk = machine.dirs.primary_disk();
+    std::fs::remove_file(&disk).unwrap();
+    crate::template::qimg::create_blank(&disk, 1 << 20)
+        .await
+        .unwrap();
+    crate::template::qimg::snapshot_create(&disk, "cold")
+        .await
+        .unwrap();
+    let local = crate::paths::lab_local_dir(&dirs.root);
+    let mut state = LabState::default();
+    let saved = state.machine_mut(machine.name());
+    saved.hypervisor = Some(HypervisorKind::Qemu);
+    for (name, online) in [("cold", false), ("warm", true)] {
+        saved.snapshots.insert(
+            name.into(),
+            SnapshotRecord {
+                online,
+                taken_at: chrono::Utc::now(),
+                image_digest: None,
+                frozen_in: None,
+                freeze_point: None,
+                hypervisor: HypervisorKind::Qemu,
+            },
+        );
+    }
+    state.save(&local).unwrap();
+    let config = crate::config::load_lab_source(
+        &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
+        "<test>",
+        &dirs.root,
+    )
+    .unwrap();
+    let lab = super::lab::LabRuntime::with_machines(config, vec![machine.clone()]).unwrap();
+    let (tx, mut lines) = mpsc::unbounded_channel();
+    let output: crate::scripting::OutputSink = Arc::new(move |line| tx.send(line).unwrap());
+    let name = machine.name();
+    lab.start_machine_with_output(name, Some(&output))
+        .await
+        .unwrap();
+    assert_eq!(
+        lines.try_recv().unwrap(),
+        "info: dc01: migrated from QEMU to vmlab-hv\n"
+    );
+    assert_eq!(
+        LabState::load(&local).unwrap().machines[name].hypervisor,
+        Some(HypervisorKind::Vmlab)
+    );
+    let listed = lab.snapshots(name).await.unwrap();
+    assert!(listed[0]["unrestorable"].is_null(), "{listed}");
+    assert_eq!(listed[1]["name"], "warm");
+    let why = listed[1]["unrestorable"].as_str().unwrap();
+    assert!(
+        why.contains("\"warm\"") && why.contains("convert it to offline"),
+        "{why}"
+    );
+    let error = lab.restore(name, "warm", false).await.unwrap_err();
+    assert_eq!(error.to_string(), why);
+    lab.stop_machine(name, true).await.unwrap();
+    machine
+        .wait_state(PowerState::Stopped, SETTLE)
+        .await
+        .unwrap();
+    lab.restore(name, "cold", false).await.unwrap();
+    assert_eq!(
+        LabState::load(&local).unwrap().machines[name].snapshots,
+        state.machines[name].snapshots
+    );
+    lab.start_machine_with_output(name, Some(&output))
+        .await
+        .unwrap();
+    assert!(lines.try_recv().is_err());
+    lab.stop_machine(name, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn refused_qemu_migration_keeps_the_disk_identity() {
+    use super::state::LabState;
+    use crate::config::hypervisor::{HypervisorKind, SelectionSource};
+
+    let dirs = Dirs::new();
+    let (machine, _) = vm(&dirs, LINUX_VM, on_vmlab_hv(Script::healthy()));
+    let machine = machine.with_selection_source(SelectionSource::QemuMigration);
+    let mut parts = (*machine.template()).clone();
+    parts.resolved.display_device = Some("qxl-vga".into());
+    machine.set_template(parts);
+    let local = crate::paths::lab_local_dir(&dirs.root);
+    let mut state = LabState::default();
+    let name = machine.name();
+    state.machine_mut(name).hypervisor = Some(HypervisorKind::Qemu);
+    state.save(&local).unwrap();
+    let config = crate::config::load_lab_source(
+        &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
+        "<test>",
+        &dirs.root,
+    )
+    .unwrap();
+    let lab = super::lab::LabRuntime::with_machines(config, vec![machine.clone()]).unwrap();
+    let error = lab.start_machine(name).await.unwrap_err().to_string();
+    assert!(error.contains("qxl-vga"), "{error}");
+    assert_eq!(machine.state().await, PowerState::Stopped);
+    assert_eq!(
+        LabState::load(&local).unwrap().machines[name].hypervisor,
+        Some(HypervisorKind::Qemu)
+    );
+}
+
 /// A legacy pc VM on vmlab-hv gets its e1000 or PCnet on a plain stream:
 /// vmlab-hv's emulated pc NICs take no TAP, and the same VM on QEMU does.
 #[test]
@@ -414,7 +544,7 @@ fn container_with_volumes(
         crate::config::hypervisor::HypervisorKind::Qemu
     };
     let hv = FakeHypervisor::new(script);
-    let ctr = ContainerInstance::new(
+    let mut ctr = ContainerInstance::new(
         "t",
         cfg,
         resolved,
@@ -426,6 +556,7 @@ fn container_with_volumes(
         kind,
         hv.clone(),
     );
+    ctr.set_host_facts(kvm_host());
     (ctr, hv)
 }
 
@@ -708,7 +839,7 @@ async fn a_vm_that_becomes_ready_tells_the_lab() {
     let lab = Arc::new(TestLab::new(events));
 
     vm.clone()
-        .start(lab.clone() as Arc<dyn LabServices>)
+        .start(lab.clone() as Arc<dyn LabServices>, None)
         .await
         .expect("start");
     vm.wait_ready(SETTLE).await.expect("ready");
@@ -1345,7 +1476,7 @@ async fn a_guest_that_sleeps_is_suspended_until_a_start_wakes_it() {
     let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
     let m: Arc<dyn Machine> = vm.clone();
 
-    m.clone().start(lab.clone()).await.expect("start");
+    m.clone().start(lab.clone(), None).await.expect("start");
     m.wait_ready(SETTLE).await.expect("ready");
     m.wait_state(PowerState::Suspended, SETTLE)
         .await
@@ -1380,7 +1511,7 @@ async fn a_guest_that_sleeps_is_suspended_until_a_start_wakes_it() {
     assert!(started.elapsed() < Duration::from_secs(5));
 
     // A start wakes it — the same emulator, so nothing reports a stop.
-    m.clone().start(lab.clone()).await.expect("wake");
+    m.clone().start(lab.clone(), None).await.expect("wake");
     assert_eq!(m.state().await, PowerState::Running);
     let woke = collect_events(&mut rx, &["vm.woken", "vm.stopped", "vm.starting"], 1).await;
     assert_eq!(woke[0].event, "vm.woken");
@@ -1410,7 +1541,7 @@ async fn prevent_sleep_wakes_the_guest_and_records_it() {
     let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
     let m: Arc<dyn Machine> = vm.clone();
 
-    m.clone().start(lab).await.expect("start");
+    m.clone().start(lab, None).await.expect("start");
     let seen = collect_events(&mut rx, &["vm.suspended", "vm.woken"], 2).await;
     assert_eq!(seen[0].event, "vm.suspended");
     assert_eq!(seen[0].data["prevent_sleep"], true);
@@ -1920,7 +2051,7 @@ async fn a_crashed_container_stays_stopped_until_explicitly_started() {
     let (events, mut rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
     let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
 
-    ctr.clone().start(lab.clone()).await.expect("start");
+    ctr.clone().start(lab.clone(), None).await.expect("start");
 
     let exits = collect_events(&mut rx, &["container.crashed", "container.stopped"], 2).await;
 
@@ -1941,7 +2072,7 @@ async fn a_crashed_container_stays_stopped_until_explicitly_started() {
         .await
         .expect("stays stopped");
 
-    ctr.clone().start(lab).await.expect("explicit start");
+    ctr.clone().start(lab, None).await.expect("explicit start");
     let after_start = collect_events(
         &mut rx,
         &[
@@ -2115,6 +2246,29 @@ async fn a_reported_capability_is_used() {
     display.send_keys("ctrl-alt-delete").await.expect("keys");
 
     vm.stop(true).await.expect("stop");
+}
+
+#[tokio::test]
+async fn a_failed_online_snapshot_load_resumes_the_vm() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB }"#,
+        Script {
+            capabilities: Capabilities::all(),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.unwrap();
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let machine: Arc<dyn Machine> = vm.clone();
+    let error = machine.restore(lab, "missing", true).await.unwrap_err();
+    assert!(format!("{error:#}").contains("does not exist"));
+    assert!(!hv.paused(), "failed load left CPUs paused");
+    assert_eq!(vm.state().await, PowerState::Running);
+    vm.stop(true).await.unwrap();
 }
 
 /// A container's online snapshot rides the same capability: absent, the
@@ -2452,7 +2606,7 @@ async fn a_machine_owed_a_refresh_is_not_ready_until_the_refresh_has_run() {
     let mut events = lab.events.subscribe();
     let m: Arc<dyn Machine> = vm.clone();
 
-    lab.start_with_deferred_refresh(m.name())
+    lab.start_with_deferred_refresh(m.name(), None)
         .await
         .expect("start");
     m.wait_agent_up(SETTLE).await.expect("the agent answered");
@@ -2501,7 +2655,7 @@ async fn a_machine_owed_no_refresh_is_ready_at_its_handshake() {
     );
     let mut events = lab.events.subscribe();
     let m: Arc<dyn Machine> = vm1.clone();
-    lab.start_with_deferred_refresh(m.name())
+    lab.start_with_deferred_refresh(m.name(), None)
         .await
         .expect("start");
     m.wait_ready(SETTLE).await.expect("ready");
@@ -2521,7 +2675,7 @@ async fn a_machine_owed_no_refresh_is_ready_at_its_handshake() {
         })
     });
     let m: Arc<dyn Machine> = vm2.clone();
-    lab.start_with_deferred_refresh(m.name())
+    lab.start_with_deferred_refresh(m.name(), None)
         .await
         .expect("start");
     m.wait_ready(SETTLE).await.expect("ready");
@@ -2579,7 +2733,7 @@ async fn before_resume_runs_in_the_paused_window_and_can_refuse_the_start() {
     let m: Arc<dyn Machine> = vm.clone();
 
     m.clone()
-        .start(lab.clone() as Arc<dyn LabServices>)
+        .start(lab.clone() as Arc<dyn LabServices>, None)
         .await
         .expect("start");
     m.wait_ready(SETTLE).await.expect("ready");
@@ -2601,7 +2755,7 @@ async fn before_resume_runs_in_the_paused_window_and_can_refuse_the_start() {
     *lab.refuse_resume.lock().unwrap() = Some("recorder could not attach".into());
     let err = m
         .clone()
-        .start(lab.clone() as Arc<dyn LabServices>)
+        .start(lab.clone() as Arc<dyn LabServices>, None)
         .await
         .expect_err("a refused resume fails the start");
     assert!(
@@ -2765,7 +2919,7 @@ async fn prevent_sleep_wakes_a_vmlab_hv_guest_with_resume() {
     let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
     let m: Arc<dyn Machine> = vm.clone();
 
-    m.clone().start(lab).await.expect("start");
+    m.clone().start(lab, None).await.expect("start");
     let seen = collect_events(&mut rx, &["vm.suspended", "vm.woken"], 2).await;
     assert_eq!(seen[0].event, "vm.suspended");
     assert_eq!(seen[1].event, "vm.woken");
@@ -2792,6 +2946,23 @@ async fn a_vmlab_hv_vm_on_a_host_without_kvm_is_refused_at_start() {
     assert!(format!("{err:#}").contains("/dev/kvm"), "{err:#}");
     assert_eq!(hv.starts(), 0, "nothing was started");
     assert_eq!(vm.state().await, PowerState::Stopped);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_without_kvm_is_refused_before_launch_on_either_hypervisor() {
+    for script in [Script::healthy(), on_vmlab_hv(Script::healthy())] {
+        let dirs = Dirs::new();
+        let (mut ctr, hv) = container(&dirs, WORKLOAD, script);
+        ctr.set_host_facts(crate::config::hypervisor::HostFacts {
+            kvm: false,
+            ..kvm_host()
+        });
+        let (cbs, _observed) = callbacks();
+        let err = start_container(&ctr, cbs).await.expect_err("refused");
+        assert!(format!("{err:#}").contains("KVM is required"), "{err:#}");
+        assert_eq!(hv.starts(), 0, "nothing was started");
+        assert_eq!(ctr.state().await, PowerState::Stopped);
+    }
 }
 
 #[tokio::test]

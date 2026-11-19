@@ -24,7 +24,6 @@ SDK=$(unpack "$SDK_PKG" zip)
 
 # A fixed work path keeps object and PDB paths identical between builds.
 W=/tmp/kmd-work
-[ -n "$W" ] && [ "$W" != / ] || { echo "VML-88: W is empty or /" >&2; exit 1; }
 rm -rf "$W"
 export SRC=$W/src OBJ=$W/obj
 mkdir -p "$SRC"

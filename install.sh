@@ -15,8 +15,8 @@
 #   --guest-dir <dir> install the guest assets into <dir> (default: $VMLAB_GUEST_DIR,
 #                     else ~/.local/share/vmlab/guest — where vmlab looks for them)
 #   --no-guest        install the binary only, not the guest assets
-#   --fastpath        grant the binary the eBPF network fast path's capabilities
-#                     (CAP_BPF, CAP_NET_ADMIN) through sudo, without asking
+#   --fastpath        grant the eBPF network fast path's helper (vmlab-fastpath)
+#                     CAP_BPF and CAP_NET_ADMIN through sudo, without asking
 #   --no-fastpath     do not offer them; or set VMLAB_FASTPATH_CAPS=yes|no
 #   --skip-checks     do not report missing runtime tools after installing
 #   --insecure-skip-signature  skip cosign authentication (unsafe), but still
@@ -39,12 +39,15 @@
 # them, or a failed download, costs only the guest assets: the binary stays.
 #
 # The network fabric needs no privilege. Its optional eBPF fast path needs
-# CAP_BPF and CAP_NET_ADMIN, which an install as an ordinary user can give the
-# binary as file capabilities (`sudo setcap`). Run from a terminal, the
-# installer asks with a default of no; non-interactive installs grant nothing
-# unless --fastpath is explicit. Every vmlab command then holds CAP_BPF and
-# CAP_NET_ADMIN for its lifetime, including its parsers, not just network setup.
-# Replacing the binary drops them, so every install requires consent again.
+# CAP_BPF and CAP_NET_ADMIN, held by one small helper, vmlab-fastpath,
+# installed beside vmlab. The daemons start it and ask it, over a closed
+# request protocol, to create taps and to load, attach and update vmlab's own
+# BPF programs; it refuses anything else. An install as an ordinary user can
+# give the helper those capabilities as file capabilities (`sudo setcap`). Run
+# from a terminal, the installer asks with a default of no; non-interactive
+# installs grant nothing unless --fastpath is explicit. The vmlab binary itself
+# never gets a capability. Replacing the helper drops them, so every install
+# requires consent again.
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
 # Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
@@ -229,6 +232,23 @@ mv "$tmp" "$BIN_DIR/vmlab"
 
 printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
 
+# ── Fast-path helper ────────────────────────────────────────────────────────
+# vmlab-fastpath, the only binary the fast path's capabilities go to. The
+# daemons look for it beside vmlab. A release without it costs only the fast
+# path: the userspace fabric carries every lab without it.
+helper_asset="vmlab-fastpath-${ver}-${suffix}"
+helper_tmp="$verify_dir/$helper_asset"
+HELPER=""
+if download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" 2>/dev/null; then
+  verify_asset "$helper_asset" "$helper_tmp"
+  [ -n "$helper_tmp" ] && [ "$helper_tmp" != / ] || err "helper_tmp is empty or /"
+  chmod +x "$helper_tmp"
+  mv "$helper_tmp" "$BIN_DIR/vmlab-fastpath"
+  HELPER="$BIN_DIR/vmlab-fastpath"
+else
+  warn "this release has no $helper_asset, so the eBPF fast path stays off; the userspace network fabric needs no privilege."
+fi
+
 # ── PATH hint ───────────────────────────────────────────────────────────────
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -236,28 +256,29 @@ case ":$PATH:" in
 esac
 
 # ── eBPF fast path ──────────────────────────────────────────────────────────
-# The kernel fast-path tiers need CAP_BPF and CAP_NET_ADMIN (vmlab fastpath).
-# Every daemon proves a tier works before using it and falls back to the
-# userspace fabric otherwise, so this is an optimisation, never a requirement.
-# Nothing here can fail the install: the binary is already in place.
+# The kernel fast-path tiers need CAP_BPF and CAP_NET_ADMIN (vmlab fastpath),
+# granted to the helper only. Every daemon proves a tier works before using
+# it and falls back to the userspace fabric otherwise, so this is an
+# optimisation, never a requirement. Nothing here can fail the install: the
+# binaries are already in place.
 CAPS="cap_bpf,cap_net_admin+ep"
 
 fastpath_hint() {
-  printf '\nThe eBPF network fast path needs CAP_BPF and CAP_NET_ADMIN. To grant them:\n'
-  printf '  sudo setcap %s %s\n' "$CAPS" "$BIN_DIR/vmlab"
+  printf '\nThe eBPF network fast path needs CAP_BPF and CAP_NET_ADMIN on its helper. To grant them:\n'
+  printf '  sudo setcap %s %s\n' "$CAPS" "$HELPER"
   printf 'Without them vmlab uses its userspace network fabric, which needs no privilege.\n'
 }
 
 fastpath_warning() {
-  printf '%s\n' 'WARNING: every vmlab command runs with CAP_BPF and CAP_NET_ADMIN for its lifetime, including parsers of untrusted guest and template data, not just network setup.'
+  printf '%s\n' 'NOTE: only the vmlab-fastpath helper gets CAP_BPF and CAP_NET_ADMIN, not vmlab. Any program running as you can start it and ask it to create tap devices and load and update vmlab'"'"'s own XDP and sockmap programs on them; it refuses every other request.'
 }
 
 # Ask on the terminal: under `curl | sh` the script itself is stdin.
 fastpath_ask() {
   fastpath_warning >/dev/tty
-  printf '\nGrant vmlab CAP_BPF and CAP_NET_ADMIN for the eBPF network fast path?\n' >/dev/tty
-  printf 'This runs: sudo setcap %s %s\n' "$CAPS" "$BIN_DIR/vmlab" >/dev/tty
-  printf 'Any program running as you can then use those capabilities through vmlab. [y/N] ' >/dev/tty
+  printf '\nGrant the vmlab-fastpath helper CAP_BPF and CAP_NET_ADMIN for the eBPF network fast path?\n' >/dev/tty
+  printf 'This runs: sudo setcap %s %s\n' "$CAPS" "$HELPER" >/dev/tty
+  printf '[y/N] ' >/dev/tty
   read -r answer </dev/tty || answer=""
   case "$answer" in
     [Yy]|[Yy][Ee][Ss]) return 0 ;;
@@ -269,6 +290,7 @@ fastpath_caps() {
   # root's daemons hold every capability already.
   [ "$(id -u)" -eq 0 ] && return 0
   [ "$FASTPATH" = no ] && return 0
+  [ -n "$HELPER" ] || return 0
   [ "$FASTPATH" != yes ] || fastpath_warning >&2
   if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     [ "$FASTPATH" = yes ] && printf '\nWSL 2 cannot run the eBPF fast path, so no capabilities were granted.\n'
@@ -284,7 +306,7 @@ fastpath_caps() {
     case ",$(findmnt -no OPTIONS -T "$BIN_DIR" 2>/dev/null)," in
       *,nosuid,*)
         printf '\n%s is on a nosuid mount, where file capabilities do nothing; the eBPF\n' "$BIN_DIR"
-        printf 'fast path needs vmlab installed elsewhere (--bin-dir).\n'
+        printf 'fast path needs vmlab and its helper installed elsewhere (--bin-dir).\n'
         return 0 ;;
     esac
   fi
@@ -292,7 +314,7 @@ fastpath_caps() {
     # In a subshell: a failed redirect on `:`, a special builtin, would end
     # this shell.
     if ! ( : </dev/tty ) 2>/dev/null; then
-      printf '\nNo terminal: no capabilities granted. Use --fastpath only after reviewing the lifetime privilege risk.\n'
+      printf '\nNo terminal: no capabilities granted. Use --fastpath to grant them to the vmlab-fastpath helper.\n'
       return 0
     fi
     fastpath_ask || { printf 'Not granted. '; fastpath_hint; return 0; }
@@ -303,12 +325,12 @@ fastpath_caps() {
     return 0
   fi
   # sudo asks for its password on the terminal, not on stdin.
-  if sudo setcap "$CAPS" "$BIN_DIR/vmlab"; then
-    printf 'Granted: %s\n' "$(getcap "$BIN_DIR/vmlab" 2>/dev/null || echo "$CAPS")"
+  if sudo setcap "$CAPS" "$HELPER"; then
+    printf 'Granted: %s\n' "$(getcap "$HELPER" 2>/dev/null || echo "$CAPS")"
     printf 'Daemons already running keep their old privileges: run `vmlab daemon stop`,\n'
     printf 'then `vmlab fastpath` shows the tier the next daemon selects.\n'
   else
-    warn "setcap failed; the binary is installed without the fast path's capabilities."
+    warn "setcap failed; the helper is installed without the fast path's capabilities."
     fastpath_hint
   fi
 }

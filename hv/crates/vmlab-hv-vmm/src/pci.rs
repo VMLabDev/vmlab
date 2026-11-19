@@ -756,7 +756,14 @@ impl PciRoot {
                 rom.value = *value as u32;
                 rom.sizing = *sizing;
             }
-            func.command = func.dev.lock().config_read(1) as u16;
+            let mut dev = func.dev.lock();
+            func.command = dev.config_read(1) as u16;
+            for bar in &func.bars {
+                dev.set_bar_address(
+                    bar.info.index,
+                    (bar.addr != 0 && !bar.sizing).then_some(bar.addr),
+                );
+            }
         }
         Ok(())
     }
@@ -935,6 +942,7 @@ mod tests {
         bar_log: Mutex<Vec<Access>>,
         config_log: Mutex<Vec<(usize, u64, Vec<u8>)>>,
         bar_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        placements: Vec<(u8, Option<u64>)>,
     }
 
     impl FakePci {
@@ -946,11 +954,16 @@ mod tests {
                 bar_log: Mutex::new(Vec::new()),
                 config_log: Mutex::new(Vec::new()),
                 bar_gate: None,
+                placements: Vec::new(),
             }))
         }
     }
 
     impl PciDevice for FakePci {
+        fn set_bar_address(&mut self, bar: u8, address: Option<u64>) {
+            self.placements.push((bar, address));
+        }
+
         fn config_read(&mut self, reg: usize) -> u32 {
             self.config_reads += 1;
             match reg {
@@ -1131,7 +1144,7 @@ mod tests {
     fn mmio_dispatch_rechecks_command_sizing_relocation_and_restore() {
         let device = FakePci::new(test_bars());
         let mut root = PciRoot::q35(1 << 32);
-        root.add_device_at(3, 0, device).unwrap();
+        root.add_device_at(3, 0, device.clone()).unwrap();
         root.config_write(0, 3, 0, 16, &0xc200_0000u32.to_le_bytes());
         root.config_write(0, 3, 0, 4, &2u16.to_le_bytes());
         let saved = root.save_bar_states();
@@ -1145,9 +1158,13 @@ mod tests {
         root.config_write(0, 3, 0, 16, &0xc300_0000u32.to_le_bytes());
         assert!(root.dispatch_mmio_write(0xc300_0040, &[5]));
         assert!(!root.dispatch_mmio_write(0xc200_0040, &[6]));
+        device.lock().placements.clear();
         root.restore_bar_states(&saved).unwrap();
         assert!(!root.dispatch_mmio_write(0xc300_0040, &[7]));
         assert!(root.dispatch_mmio_write(0xc200_0040, &[8]));
+        // A restore tells the function where its BARs are, as a config
+        // write does: a function with kernel registrations moves them.
+        assert!(device.lock().placements.contains(&(0, Some(0xc200_0000))));
     }
 
     #[test]

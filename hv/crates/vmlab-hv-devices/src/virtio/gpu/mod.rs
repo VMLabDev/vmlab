@@ -3,7 +3,9 @@
 //! `Gpu` clones share state. Keep a clone for frame and cursor publication
 //! while the PCI transport owns another clone. The default 2D mode needs no GPU.
 
+mod compose;
 mod modifiers;
+mod pacer;
 mod renderer;
 mod scanout;
 pub use scanout::DmaFrame;
@@ -12,9 +14,16 @@ pub use renderer::{APERTURE_SIZE, BlobMapper, GpuMode};
 
 pub enum ScanoutPixels {
     Dma(DmaFrame),
-    Shm(crate::display::Frame),
+    Shm(ShmFrame),
     Inactive,
     Vga,
+}
+
+#[derive(Clone)]
+pub struct ShmFrame {
+    pub mode: Mode,
+    pub pixels: Arc<Vec<u8>>,
+    pub damage: Vec<crate::display::Damage>,
 }
 
 pub struct ScanoutUpdate {
@@ -127,7 +136,7 @@ struct State {
     native: bool,
     scanout_generation: u64,
     dirty: bool,
-    cached_frame: Option<Frame>,
+    compose: compose::Compose,
     flushes: Vec<Rect>,
     cursor: Cursor,
     mem: Option<GuestMemory>,
@@ -137,6 +146,21 @@ struct State {
     display: Option<Arc<dyn DisplaySink>>,
     retry_display: bool,
     display_timestamp: u64,
+    /// Publishes 2D flushes off the thread that serves the queue. `None`
+    /// until a display sink is set: a flush then publishes where it stands.
+    pacer: Option<Arc<pacer::Pacer>>,
+    /// The command timestamp of the newest 2D flush that no published
+    /// frame holds yet.
+    flush_pending: Option<u64>,
+    last_publish: Option<std::time::Instant>,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some(pacer) = &self.pacer {
+            pacer.close();
+        }
+    }
 }
 
 /// One output and two queues. `enable_3d` adds virgl, Venus and blob resources.
@@ -162,7 +186,7 @@ impl Gpu {
                 native: false,
                 scanout_generation: 0,
                 dirty: true,
-                cached_frame: None,
+                compose: compose::Compose::default(),
                 flushes: Vec::new(),
                 cursor: Cursor::default(),
                 mem: None,
@@ -172,6 +196,9 @@ impl Gpu {
                 display: None,
                 retry_display: false,
                 display_timestamp: 0,
+                pacer: None,
+                flush_pending: None,
+                last_publish: None,
             })),
         }
     }
@@ -216,8 +243,22 @@ impl Gpu {
         })
     }
 
+    /// Publish scanout changes to `sink`. From here on a 2D flush only
+    /// records its damage, and a frame thread composes and publishes at
+    /// most one frame per [`pacer::FRAME_INTERVAL`].
     pub fn set_display_sink(&self, sink: Arc<dyn DisplaySink>) {
-        self.state.lock().display = Some(sink);
+        let mut s = self.state.lock();
+        s.display = Some(sink);
+        if let Some(timestamp_ns) = s.flush_pending {
+            s.publish_scanout(timestamp_ns);
+        }
+        if s.pacer.is_none() {
+            match pacer::Pacer::spawn(&self.id, Arc::downgrade(&self.state)) {
+                Ok(pacer) => s.pacer = Some(pacer),
+                // Without the thread every flush publishes its own frame.
+                Err(error) => log::warn!("{}: no frame thread: {error}", self.id),
+            }
+        }
     }
 
     pub fn poll_scanout(&self) -> bool {
@@ -279,7 +320,12 @@ impl Gpu {
                 }
             }
         }
-        s.frame_2d()
+        s.frame_2d().map(|frame| Frame {
+            mode: frame.mode,
+            pixels: frame.pixels.as_ref().clone(),
+            dirty: !frame.damage.is_empty(),
+            damage: frame.damage,
+        })
     }
 
     /// Runtime surface generation, including same-size replacement and reset.
@@ -289,55 +335,12 @@ impl Gpu {
 }
 
 impl State {
-    fn frame_2d(&mut self) -> Option<Frame> {
-        let s = self;
-        let mode = s.mode()?;
-        if !s.dirty
-            && let Some(frame) = &s.cached_frame
-            && frame.mode == mode
-        {
-            return Some(frame.unchanged());
-        }
-        let previous = s.cached_frame.as_ref().filter(|f| f.mode == mode);
-        let mut pixels = previous
-            .map(|f| f.pixels.clone())
-            .unwrap_or_else(|| vec![0; mode.stride as usize * mode.height as usize]);
-        if let Some((id, r)) = s.scanout {
-            let resource = &s.resources[&id];
-            let full = previous.is_none() || s.flushes.is_empty();
-            for y in 0..r.h {
-                // Merge damage on each row before copying. Testing every
-                // rectangle at every pixel multiplies guest-controlled work.
-                let mut spans = if full {
-                    vec![(0, r.w)]
-                } else {
-                    s.flushes
-                        .iter()
-                        .filter_map(|f| {
-                            let start = f.x.max(r.x);
-                            let end = (f.x + f.w).min(r.x + r.w);
-                            (y + r.y >= f.y && y + r.y < f.y + f.h && start < end)
-                                .then(|| (start - r.x, end - r.x))
-                        })
-                        .collect::<Vec<_>>()
-                };
-                spans.sort_unstable();
-                let mut copied = 0;
-                for (start, end) in spans {
-                    for x in start.max(copied)..end {
-                        let src = ((y + r.y) * resource.width + x + r.x) as usize * 4;
-                        let dst = (y * r.w + x) as usize * 4;
-                        let p = resource.pixel(src);
-                        pixels[dst..dst + 3].copy_from_slice(&p[..3]);
-                    }
-                    copied = copied.max(end);
-                }
-            }
-        }
-        let frame = Frame::compare(mode, pixels, previous, (16, 16));
-        s.cached_frame = Some(frame.clone());
-        s.flushes.clear();
-        s.dirty = false;
+    fn frame_2d(&mut self) -> Option<ShmFrame> {
+        let mode = self.mode()?;
+        let scanout = self.scanout.map(|(id, rect)| (&self.resources[&id], rect));
+        let frame = self.compose.frame(mode, scanout, &self.flushes, self.dirty);
+        self.flushes.clear();
+        self.dirty = false;
         Some(frame)
     }
 
@@ -345,6 +348,9 @@ impl State {
         let Some(sink) = self.display.clone() else {
             return;
         };
+        // This frame holds every flush that came before it.
+        self.flush_pending = None;
+        self.last_publish = Some(std::time::Instant::now());
         let mut damage = Vec::new();
         let pixels = if let Some(renderer) = &self.renderer {
             let Ok(Some((generation, rectangles))) = renderer.take_damage() else {
@@ -387,6 +393,37 @@ impl State {
             damage,
             pixels,
         });
+    }
+}
+
+impl State {
+    /// A 2D flush changed the scanout at `timestamp_ns`. Leave the compose
+    /// to the frame thread, which runs it once for all the flushes of one
+    /// frame interval.
+    fn schedule_flush(&mut self, timestamp_ns: u64) {
+        let Some(pacer) = self.pacer.clone() else {
+            return self.publish_scanout(timestamp_ns);
+        };
+        self.flush_pending = Some(timestamp_ns);
+        pacer.request(self.frame_due(std::time::Instant::now()));
+    }
+
+    /// When the next frame may be published.
+    fn frame_due(&self, now: std::time::Instant) -> std::time::Instant {
+        self.last_publish
+            .map_or(now, |last| (last + pacer::FRAME_INTERVAL).max(now))
+    }
+
+    /// The frame thread's turn: publish the pending flushes, or return the
+    /// time to come back at when a frame was published too recently.
+    fn publish_pending(&mut self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let timestamp_ns = self.flush_pending?;
+        let due = self.frame_due(now);
+        if due > now {
+            return Some(due);
+        }
+        self.publish_scanout(timestamp_ns);
+        None
     }
 }
 
@@ -536,7 +573,7 @@ impl State {
                     self.scanout = None;
                     self.scanout_generation = self.scanout_generation.wrapping_add(1);
                     self.dirty = true;
-                    self.cached_frame = None;
+                    self.compose = compose::Compose::default();
                     self.flushes.clear();
                 }
                 NODATA
@@ -560,7 +597,7 @@ impl State {
                 self.native = true;
                 if previous != (self.native, self.scanout) {
                     self.scanout_generation = self.scanout_generation.wrapping_add(1);
-                    self.cached_frame = None;
+                    self.compose = compose::Compose::default();
                     self.flushes.clear();
                 }
                 self.dirty = true;
@@ -752,13 +789,14 @@ impl State {
         if writer.write_all(&response).is_err() {
             return 0;
         }
-        if kind < 0x1200
-            && matches!(
-                u32::from_le_bytes(request[..4].try_into().unwrap()),
-                0x102..=0x104 | 0x10d
-            )
-        {
-            self.publish_scanout(timestamp_ns);
+        if kind < 0x1200 {
+            match u32::from_le_bytes(request[..4].try_into().unwrap()) {
+                // A guest flushes many times in one frame. The renderer
+                // keeps its own damage, so its flushes publish here.
+                0x104 if self.renderer.is_none() => self.schedule_flush(timestamp_ns),
+                0x102..=0x104 | 0x10d => self.publish_scanout(timestamp_ns),
+                _ => {}
+            }
         }
         response.len() as u32
     }
@@ -916,6 +954,7 @@ impl VirtioDevice for Gpu {
             log::error!("GPU reset failed: {error:#x}");
         }
         s.fences.clear();
+        s.flush_pending = None;
         s.retry_display = false;
         s.acked = 0;
         s.events = 0;
@@ -924,7 +963,7 @@ impl VirtioDevice for Gpu {
         s.native = false;
         s.scanout_generation = s.scanout_generation.wrapping_add(1);
         s.dirty = true;
-        s.cached_frame = None;
+        s.compose = compose::Compose::default();
         s.flushes.clear();
         let generation = s.cursor.generation.wrapping_add(1);
         s.cursor = Cursor {

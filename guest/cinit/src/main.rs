@@ -154,7 +154,10 @@ fn run() -> Result<()> {
         }
     }
     if spec.nics > 0 {
-        net::write_resolv_conf(spec.nics)?;
+        // An image whose resolv.conf cannot be written (F56) still boots.
+        if let Err(e) = net::write_resolv_conf(spec.nics) {
+            eprintln!("vmlab-cinit: warning: /etc/resolv.conf not written: {e}");
+        }
     }
 
     // -- CIFS volumes (network mounts — after DHCP) ----------------------------
@@ -284,6 +287,7 @@ fn run() -> Result<()> {
         health::spawn(
             hc,
             &env,
+            container::ExecIdentity::new(spec.workdir.as_deref(), user.as_ref())?,
             ctl.clone(),
             reaper.clone(),
             exited.clone(),

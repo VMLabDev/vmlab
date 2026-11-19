@@ -80,7 +80,7 @@ def scenario_features(name: str) -> set[str]:
 
 def write_host_config(h: Harness, vms: bool = False) -> None:
     """The host config the run's supervisor and lab daemons read: only what
-    selects both machine kinds explicitly, including QEMU-only scenarios.
+    selects VMs explicitly and leaves vmlab containers automatic.
     Rewritten per scenario, since whether VMs follow is the scenario's."""
     lines = h.host_config(vms)
     if not lines:

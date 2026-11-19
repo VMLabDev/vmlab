@@ -39,6 +39,7 @@ use inotify as backend;
 
 #[cfg(windows)]
 mod rdcw;
+mod records;
 #[cfg(windows)]
 use rdcw as backend;
 

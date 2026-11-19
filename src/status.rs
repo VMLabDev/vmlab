@@ -399,6 +399,9 @@ pub struct WorkspaceSyncStatus {
     /// answers to the same pause: a rescan means vmlab does not know what the
     /// guest did, a re-seed means it knows exactly, because it did it.
     pub reseed: Option<String>,
+    /// The guest's watch did not answer a flush, so its unreported writes
+    /// are unknown to the host and snapshot capture refuses.
+    pub unanswered: Option<String>,
     /// How many watch discontinuities this syncer has answered with a walk.
     /// Repeated ones are the symptom a single lost event is not.
     pub rescans: u64,
@@ -480,6 +483,12 @@ pub struct MachineStatus {
     pub hypervisor: crate::config::hypervisor::HypervisorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hypervisor_fallback: Option<String>,
+    /// Set on an x86 machine that runs on QEMU, which a later release stops
+    /// running: the reason, the warning with its fix, and the machine's
+    /// online QEMU snapshots, which cannot be restored after the removal.
+    /// The snapshots are lab-level, like `agent_diverged`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qemu_removal: Option<crate::config::hypervisor::QemuRemoval>,
     #[serde(flatten)]
     pub detail: MachineDetail,
 }
@@ -742,6 +751,10 @@ pub struct LabStatus {
     /// a daemon that predates the field.
     #[serde(default)]
     pub pending: Vec<PendingMachine>,
+    /// What the host itself owes before QEMU stops running x86 guests: no
+    /// usable KVM while an x86 machine of this lab runs on QEMU.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_warnings: Vec<String>,
 }
 
 /// One machine a reload could not rebuild yet (PRD §7.1).
@@ -905,6 +918,7 @@ pub(crate) mod fixtures {
             recording: None,
             hypervisor: Default::default(),
             hypervisor_fallback: None,
+            qemu_removal: None,
             detail,
         }
     }
@@ -950,6 +964,7 @@ pub(crate) mod fixtures {
                     volume: None,
                     rescan: None,
                     reseed: None,
+                    unanswered: None,
                     rescans: 0,
                     skipped: Vec::new(),
                     deferred: Vec::new(),
@@ -975,6 +990,7 @@ pub(crate) mod fixtures {
             forwards: Vec::new(),
             isolation: None,
             freeze_stale: false,
+            host_warnings: Vec::new(),
             pending: Vec::new(),
         }
     }

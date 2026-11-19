@@ -29,8 +29,11 @@ page guide_containers {
 
   p <<DOC
     Each container boots a pinned Alpine `linux-virt` kernel and a
-    purpose-built initramfs, passed to QEMU directly with `-kernel` and
-    `-initrd`. PID 1 in that guest is `vmlab-cinit`, vmlab's own init. It
+    purpose-built initramfs, booted directly by its hypervisor. Supported new
+    containers default to vmlab-hv. An existing x86 container with a QEMU
+    identity moves to vmlab-hv at its next start unless a machine or host
+    setting takes precedence. The scratch disk carries over. PID 1 in that guest is
+    `vmlab-cinit`, vmlab's own init. It
     mounts the image's root filesystem read-only, lays a writable scratch
     disk over it with overlayfs, opens a control channel to the host on the
     `vmlab.ctl.0` virtio-serial port, and waits for the host to push the
@@ -50,9 +53,9 @@ page guide_containers {
   DOC
 
   p <<DOC
-    Nothing here needs privileges. The host uses `/dev/kvm` when it is
-    available and falls back to TCG when it is not, and no `--privileged` or
-    added capability is ever required.
+    The host must have a usable `/dev/kvm`. Without it, start fails with
+    `KVM is required`, including on QEMU. No `--privileged` or added
+    capability is required.
   DOC
 
   h2 "Pulling and flattening an image"

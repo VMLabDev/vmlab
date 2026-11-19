@@ -61,7 +61,8 @@ impl Driver {
         self.dev.bar_read(2, 0x1014, &mut status);
         assert_eq!(status, [15]);
     }
-    fn submit_raw(&mut self, q: usize, request: &[u8], response_size: u32) -> Vec<u8> {
+    /// Put `request` on queue `q` without a kick.
+    fn post(&mut self, q: usize, request: &[u8], response_size: u32) {
         let base = 0x1000 + q as u64 * 0x4000;
         let req = 0x10000;
         let resp: u64 = 0x60000;
@@ -86,8 +87,15 @@ impl Driver {
         self.mem
             .write_obj(self.avail[q], GuestAddress(base + 0x1002))
             .unwrap();
-        self.dev
-            .bar_write(2, 0x3000 + q as u64 * 4, &(q as u16).to_le_bytes());
+    }
+    fn submit_raw(&mut self, q: usize, request: &[u8], response_size: u32) -> Vec<u8> {
+        let base = 0x1000 + q as u64 * 0x4000;
+        let resp: u64 = 0x60000;
+        self.post(q, request, response_size);
+        self.kick(q);
+        if !self.dev.accelerated {
+            self.settle();
+        }
         if self.dev.accelerated {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while self
@@ -119,6 +127,20 @@ impl Driver {
         let mut out = vec![0; len as usize];
         self.mem.read_slice(&mut out, GuestAddress(resp)).unwrap();
         out
+    }
+    fn kick(&mut self, q: usize) {
+        self.dev
+            .bar_write(2, 0x3000 + q as u64 * 4, &(q as u16).to_le_bytes());
+    }
+    /// Wait until the queue worker has served every kick so far.
+    fn settle(&mut self) {
+        Snapshot::quiesce(&mut self.dev);
+        Snapshot::resume_snapshot(&mut self.dev);
+    }
+    fn used(&self, q: usize) -> u16 {
+        self.mem
+            .read_obj(GuestAddress(0x1000 + q as u64 * 0x4000 + 0x2002))
+            .unwrap()
     }
     fn command(&mut self, q: usize, kind: u32, words: &[u32]) -> Vec<u8> {
         let mut request = vec![0; 24];
@@ -787,4 +809,181 @@ fn pci_configuration_access_capability_and_seavgabios_rom() {
     } else {
         eprintln!("SKIP host SeaVGABIOS ROM: /usr/share/qemu/vgabios-virtio.bin missing");
     }
+}
+
+/// A display sink that records what the device publishes. With a gate, an
+/// update waits until the test sends on it.
+struct Published {
+    timestamp_ns: u64,
+    damage: Vec<super::super::Damage>,
+    pixels: Vec<u8>,
+}
+
+#[derive(Default)]
+struct RecSink {
+    updates: parking_lot::Mutex<Vec<Published>>,
+    gate: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl crate::virtio::gpu::DisplaySink for RecSink {
+    fn needs_cpu(&self) -> bool {
+        true
+    }
+    fn update(&self, update: crate::virtio::gpu::ScanoutUpdate) {
+        if let Some(gate) = self.gate.lock().as_ref() {
+            gate.recv().unwrap();
+        }
+        if let crate::virtio::gpu::ScanoutPixels::Shm(frame) = update.pixels {
+            self.updates.lock().push(Published {
+                timestamp_ns: update.timestamp_ns,
+                damage: frame.damage,
+                pixels: frame.pixels.as_ref().clone(),
+            });
+        }
+    }
+}
+
+impl RecSink {
+    /// Wait until `count` frames have arrived.
+    fn wait(&self, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.updates.lock().len() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the GPU published {} of {count} frames",
+                self.updates.lock().len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// A 64x48 scanout of zeroes on resource 1, published once, and the guest
+/// pixels behind it set to 42 and transferred.
+fn painted_scanout(sink: &Arc<RecSink>) -> Driver {
+    let mut d = Driver::new();
+    d.dev.set_display_sink(sink.clone());
+    d.start();
+    d.create(1, 64, 48, 2);
+    d.backing(1, &vec![0; 64 * 48 * 4]);
+    d.transfer(1, 64, 48);
+    d.ok(0x103, &[0, 0, 64, 48, 0, 1]);
+    sink.wait(1);
+    d.mem
+        .write_slice(&vec![42; 64 * 48 * 4], GuestAddress(0x100000))
+        .unwrap();
+    d.transfer(1, 64, 48);
+    d
+}
+
+#[test]
+fn the_flushes_of_one_frame_interval_publish_one_composed_frame() {
+    let sink = Arc::new(RecSink::default());
+    let mut d = painted_scanout(&sink);
+    // The scanout command published a frame a moment ago, so no flush of
+    // this burst is due before the frame interval has passed.
+    let started = std::time::Instant::now();
+    for i in 0..200 {
+        d.ok(0x104, &[(i % 2) * 48, 0, 16, 16, 1, 0]);
+    }
+    let burst = started.elapsed();
+    sink.wait(2);
+    // Every flush is in a frame once the device has been idle for a few
+    // frame intervals.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let updates = sink.updates.lock();
+    let frames = updates.len() - 1;
+    let most = burst.as_millis() as usize / 16 + 2;
+    assert!(
+        frames <= most,
+        "200 flushes in {burst:?} published {frames} frames, at most {most} expected"
+    );
+    let mut damage: Vec<_> = updates[1..].iter().flat_map(|u| u.damage.clone()).collect();
+    damage.sort_by_key(|d| d.x);
+    damage.dedup();
+    let tile = |x| super::super::Damage {
+        x,
+        y: 0,
+        width: 16,
+        height: 16,
+    };
+    assert_eq!(damage, vec![tile(0), tile(48)]);
+    let last = &updates.last().unwrap().pixels;
+    assert_eq!(&last[..4], &[42, 42, 42, 0]);
+    assert_eq!(&last[32 * 4..33 * 4], &[0; 4]);
+    assert_eq!(&last[48 * 4..49 * 4], &[42, 42, 42, 0]);
+    // A frame carries the time of its newest flush command.
+    assert!(
+        updates
+            .windows(2)
+            .all(|pair| pair[0].timestamp_ns <= pair[1].timestamp_ns)
+    );
+}
+
+#[test]
+fn a_flush_is_answered_before_its_frame_is_composed() {
+    let sink = Arc::new(RecSink::default());
+    let mut d = painted_scanout(&sink);
+    let (release, gate) = std::sync::mpsc::channel();
+    *sink.gate.lock() = Some(gate);
+    // The frame thread stops inside the sink with this flush's frame.
+    d.ok(0x104, &[0, 0, 16, 16, 1, 0]);
+    assert_eq!(sink.updates.lock().len(), 1);
+    release.send(()).unwrap();
+    sink.wait(2);
+    assert_eq!(&sink.updates.lock()[1].pixels[..4], &[42, 42, 42, 0]);
+    *sink.gate.lock() = None;
+}
+
+#[test]
+fn a_kick_returns_while_the_queue_worker_serves_the_command() {
+    let sink = Arc::new(RecSink::default());
+    let mut d = painted_scanout(&sink);
+    let (release, gate) = std::sync::mpsc::channel();
+    *sink.gate.lock() = Some(gate);
+    // A scanout command publishes where it is served, so the worker stops
+    // inside the sink and holds the device.
+    let mut request = vec![0; 24];
+    request[..4].copy_from_slice(&0x103u32.to_le_bytes());
+    for word in [0u32, 0, 32, 32, 0, 1] {
+        request.extend_from_slice(&word.to_le_bytes());
+    }
+    let used = d.used(0);
+    d.post(0, &request, 2048);
+    d.kick(0);
+    // A second kick, and a transport register beside it, do not wait.
+    d.kick(0);
+    let mut status = [0];
+    d.dev.bar_read(2, 0x1014, &mut status);
+    assert_eq!(status, [15]);
+    assert_eq!(d.used(0), used);
+    release.send(()).unwrap();
+    *sink.gate.lock() = None;
+    d.settle();
+    assert_eq!(d.used(0), used.wrapping_add(1));
+    assert_eq!(d.dev.frame().mode.width, 32);
+}
+
+#[test]
+fn queue_doorbells_sit_on_the_notify_region_of_bar2() {
+    struct Rec(Arc<parking_lot::Mutex<Vec<u64>>>);
+    impl crate::QueueDoorbells for Rec {
+        fn set(&mut self, doorbells: &[crate::QueueDoorbell]) -> std::io::Result<()> {
+            *self.0.lock() = doorbells.iter().map(|d| d.address).collect();
+            Ok(())
+        }
+    }
+    let mut d = Driver::new();
+    let registered = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    d.dev.set_queue_doorbells(Box::new(Rec(registered.clone())));
+    d.dev.set_bar_address(2, Some(0xc000_0000));
+    assert!(registered.lock().is_empty());
+    d.start();
+    assert_eq!(*registered.lock(), [0xc000_3000, 0xc000_3004]);
+    d.dev.set_bar_address(2, Some(0xd000_0000));
+    assert_eq!(*registered.lock(), [0xd000_3000, 0xd000_3004]);
+    d.dev.set_bar_address(0, Some(0xe000_0000));
+    assert_eq!(*registered.lock(), [0xd000_3000, 0xd000_3004]);
+    d.write(0x14, &[0]);
+    assert!(registered.lock().is_empty());
 }

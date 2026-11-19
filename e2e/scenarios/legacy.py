@@ -97,17 +97,16 @@ def lab_events(out: str) -> list[dict]:
     return events
 
 
-def stage_templates(h):
+def stage_template(h, relative):
     store = pathlib.Path(os.environ.get("XDG_DATA_HOME", pathlib.Path.home() / ".local/share")) / "vmlab/templates"
     source = os.environ.get("VMLAB_E2E_LEGACY_STORE")
-    for _, _, relative in GUESTS:
-        target = store / relative
-        if (target / "template.wcl").is_file() and (target / "disk.qcow2").is_file():
-            continue
-        if not source or not (pathlib.Path(source) / relative / "disk.qcow2").is_file():
-            raise ScenarioFailed(f"missing legacy template {relative}; set VMLAB_E2E_LEGACY_STORE to a populated template store")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        h.run(["cp", "-a", "--reflink=auto", "--sparse=always", str(pathlib.Path(source) / relative), str(target)])
+    target = store / relative
+    if (target / "template.wcl").is_file() and (target / "disk.qcow2").is_file():
+        return
+    if not source or not (pathlib.Path(source) / relative / "disk.qcow2").is_file():
+        raise ScenarioFailed(f"missing legacy template {relative}; set VMLAB_E2E_LEGACY_STORE to a populated template store")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    h.run(["cp", "-a", "--reflink=auto", "--sparse=always", str(pathlib.Path(source) / relative), str(target)])
 
 
 def exercise(h, lab, machine):
@@ -155,14 +154,47 @@ def exercise(h, lab, machine):
         h.vmlab("vm", "stop", machine, cwd=lab, check=False, timeout=300)
 
 
+def exercise_server2016(h, lab):
+    machine = "guest"
+    def check_version(stage):
+        result = h.vmlab("exec", machine, "--", "cmd", "/c", "ver", cwd=lab, timeout=60)
+        if "Microsoft Windows [Version 10.0.14393]" not in result.out:
+            raise ScenarioFailed(f"{machine} {stage}: unexpected version output: {result.text}")
+
+    h.wait_until(lambda: len(project_vms()) < 2, timeout=900, what="a host project VM slot")
+    h.vmlab("up", machine, cwd=lab)
+    try:
+        h.wait_ready(lab, machine, timeout=300)
+        status = h.machine_line(lab, machine)
+        if f"hypervisor={h.hypervisor}" not in status.split():
+            raise ScenarioFailed(f"{machine}: expected {h.hypervisor} hypervisor: {status}")
+        check_version("after agent readiness")
+        h.vmlab("snapshot", "create", "round-trip", "--vm", machine, cwd=lab, timeout=120)
+        h.vmlab("snapshot", "restore", "round-trip", "--vm", machine, cwd=lab, timeout=120)
+        check_version("after online restore")
+    finally:
+        h.vmlab("vm", "stop", machine, cwd=lab, check=False, timeout=300)
+
+
 def run(h):
     try:
-        stage_templates(h)
+        for _, _, relative in GUESTS:
+            stage_template(h, relative)
     except ScenarioFailed as error:
         for _, feature, _ in GUESTS:
             h.skip(feature, str(error))
-        return
-    with h.lab("legacy") as lab:
-        for machine, feature, _ in GUESTS:
-            h.check(feature, lambda m=machine: exercise(h, lab, m),
-                    "agent readiness, the usual screen by OCR, PNG capture, exec, disk write/read and stop")
+    else:
+        with h.lab("legacy") as lab:
+            for machine, feature, _ in GUESTS:
+                h.check(feature, lambda m=machine: exercise(h, lab, m),
+                        "agent readiness, the usual screen by OCR, PNG capture, exec, disk write/read and stop")
+
+    feature = "vm.legacy.server2016"
+    try:
+        stage_template(h, "x86_64/windows-server-2016/14393.0.0")
+    except ScenarioFailed as error:
+        h.skip(feature, str(error))
+    else:
+        with h.lab("server2016") as lab:
+            h.check(feature, lambda: exercise_server2016(h, lab),
+                    "cmd /c ver after agent readiness and online restore")

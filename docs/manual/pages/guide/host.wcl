@@ -454,10 +454,63 @@ DOC
 
   h2 "QEMU or vmlab-hv"
 
+  callout "Existing x86 QEMU machines move to vmlab-hv" {
+    kind = :warning
+    body = "An x86 or x86_64 VM or container with a QEMU identity moves to vmlab-hv at its next start. Explicit machine and host hypervisor settings still take precedence. vmlab-hv requires usable KVM."
+  }
+
+  p <<'DOC'
+Old disks without an identity use the newest snapshot's recorded hypervisor
+when available and otherwise count as QEMU disks. Worktree clones use the
+identity inherited from their frozen generation. Machine status shows the
+hypervisor selected for the next start, so it can show vmlab-hv while the
+saved identity is still QEMU. At start, a hardware refusal is reported and
+the old identity is kept. When the checks pass, vmlab saves the new identity
+before boot and `vmlab up` announces the switch once.
+DOC
+
+  h3 "Getting ready for the removal"
+
+  p <<'DOC'
+`vmlab up`, `vmlab vm start`, `vmlab validate` and `vmlab status` still
+warn about x86 machines selected for QEMU through explicit settings or
+automatic fallback. Each warning names the machine and the reason:
+DOC
+
+  table {
+    rows:
+      | "Reason (`reason` in JSON)" | "Why the machine is on QEMU" | "Fix" |
+      | "`explicit`" | "It sets `hypervisor = \"qemu\"`." | "Set `hypervisor = \"vmlab\"` or remove the setting to allow migration when there is no host override." |
+      | "`host_default`" | "The host config sets `hypervisor { vm = \"qemu\" }` or `container = \"qemu\"`." | "Remove the default to allow migration, or set `hypervisor = \"vmlab\"` on the machine." |
+      | "`qemu_args`" | "It declares `qemu_args`, which only QEMU takes." | "Remove `qemu_args`." |
+      | "`refused`" | "vmlab-hv cannot run it as declared, so automatic selection fell back." | "Change what the warning names. After the removal `hypervisor = \"qemu\"` is no longer a way out for an x86 guest." |
+  }
+
+  p <<'DOC'
+Where vmlab-hv would refuse the machine after the fix, the warning adds what
+it refuses, so one pass finds everything. On a host where `/dev/kvm` is not
+usable the lab gets one more warning: x86 guests run under QEMU's emulation
+(TCG) today and will need KVM. Enable virtualization in the firmware, load
+the kvm module and give your user access to `/dev/kvm`.
+
+An online snapshot taken under QEMU holds RAM and device state in QEMU's own
+format. Those snapshots stay on disk. Once vmlab-hv is selected,
+`vmlab snapshot list` marks them unrestorable by name. To convert one to
+offline, use a release that can restore it under QEMU, shut down the guest,
+and take an offline snapshot before upgrading. Offline snapshots restore
+under either hypervisor. The warning lists each affected machine's online QEMU snapshots, and
+`vmlab status --json` carries the same listing: every x86 machine on QEMU has
+a `qemu_removal` object with `reason`, `warning` and `online_snapshots`, and
+the lab a `host_warnings` list when KVM is missing. A lab that is not running
+answers too, with a top-level `qemu_removal` list whose entries add `machine`.
+DOC
+
   p <<'DOC'
 Supported new x86_64 KVM VMs default to vmlab-hv. Other new VMs fall back
 to QEMU, with the reason in `status`, `status --json`, and an info line at `up`.
-Containers still default to QEMU. vmlab-hv is vmlab's own
+Supported new containers also default to vmlab-hv. Unsupported hosts select QEMU
+with a reason, but containers require KVM and never fall back to TCG.
+vmlab-hv is vmlab's own
 hypervisor, built a phase at a time, on an x86_64 host with a usable
 `/dev/kvm`; it has no TCG fallback. It runs container micro-VMs, and modern
 VMs on the q35 machine: SeaBIOS or OVMF with secure boot, a TPM and the
@@ -511,18 +564,9 @@ design.
 DOC
 
   p <<'DOC'
-An existing VM keeps its recorded hypervisor until destroy or an explicit
-machine or host setting. Old disks without a record stay on QEMU; snapshot
-history supplies the identity where available. To force QEMU for VMs, set
-`host { hypervisor { vm = "qemu" } }`. Containers require an explicit vmlab
-setting to move to vmlab-hv. Legacy pc VMs run on vmlab-hv: the machine core and IDE (4a), e1000 and PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered. Two
-things differ on a vmlab-hv machine. It has no emulation fallback, so where
-QEMU falls back to TCG, vmlab-hv refuses the machine. And an online snapshot
-is stored in the format of the hypervisor that took it, so it does not restore
-after the machine moves to the other one. Set `hypervisor` back and the
-snapshot restores again; an offline snapshot restores under either.
-`qemu-img` is still required, because the scratch disk and offline snapshots
-are made with it. The [hypervisor {}](ref_host) reference lists the host
+The scratch disk and offline snapshots are made by vmlab's linked image tool,
+so neither hypervisor needs `qemu-img` unless `VMLAB_IMAGE_TOOL=qemu-img`
+selects it. The [hypervisor {}](ref_host) reference lists the host
 defaults and the rules that check them.
 DOC
 

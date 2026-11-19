@@ -22,7 +22,7 @@ use vmlab_cinit_proto::{
 use super::container_ctl::CtlHandle;
 use super::hypervisor::{Control, Hypervisor, Process};
 use super::vm::{PowerState, StopReason};
-use crate::config::hypervisor::HypervisorKind;
+use crate::config::hypervisor::{HypervisorKind, SelectionSource};
 use crate::config::model::{self, MacAddr, VolumeSource};
 use crate::oci::image::model::{ImageConfig, ImageHealthcheck};
 use crate::oci::image::pull::PulledImage;
@@ -382,6 +382,13 @@ pub struct ContainerInstance {
     /// Which hypervisor `hv` is, as the machine reports it and its snapshots
     /// record it (§22).
     hypervisor: HypervisorKind,
+    hypervisor_fallback: Option<String>,
+    /// The rung of the selection ladder the lab builder chose `hypervisor`
+    /// on. `None` on a container nothing selected a hypervisor for.
+    selection_source: Option<crate::config::hypervisor::SelectionSource>,
+    /// Probe the host in production; fake-driven tests inject their own
+    /// facts so container starts do not depend on the test host's KVM.
+    host_facts: Arc<dyn Fn() -> crate::config::hypervisor::HostFacts + Send + Sync>,
 }
 
 impl ContainerInstance {
@@ -427,7 +434,38 @@ impl ContainerInstance {
             agent: super::machine::AgentSlot::default(),
             hv,
             hypervisor,
+            hypervisor_fallback: None,
+            selection_source: None,
+            host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
         })
+    }
+
+    pub(super) fn with_hypervisor_fallback(
+        mut self: Arc<Self>,
+        reason: Option<String>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("new container is unshared")
+            .hypervisor_fallback = reason;
+        self
+    }
+
+    pub(super) fn with_selection_source(
+        mut self: Arc<Self>,
+        source: crate::config::hypervisor::SelectionSource,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("new container is unshared")
+            .selection_source = Some(source);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_host_facts(
+        self: &mut Arc<Self>,
+        facts: crate::config::hypervisor::HostFacts,
+    ) {
+        Arc::get_mut(self).expect("sole owner").host_facts = Arc::new(move || facts.clone());
     }
 
     /// The pulled image + merged spec, or an error while the deferred pull
@@ -731,6 +769,11 @@ impl ContainerInstance {
             }
         };
         let run = async {
+            anyhow::ensure!(
+                (self.host_facts)().kvm,
+                "{}: KVM is required for containers",
+                self.cfg.name
+            );
             std::fs::create_dir_all(&self.dirs.local)?;
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
@@ -754,17 +797,6 @@ impl ContainerInstance {
             let vfs_devices = self.start_virtiofsds().await?;
 
             let asset = self.hv.guest_asset(&self.resolved.arch)?;
-            // vmlab-hv has no TCG to fall back to; validation refused the
-            // machine on a host without KVM (§22).
-            if self.hypervisor == HypervisorKind::Qemu
-                && qemu::pick_accel(&self.resolved.arch) == qemu::Accel::Tcg
-            {
-                tracing::warn!(
-                    "{}: KVM unavailable for {} — falling back to TCG (slow)",
-                    self.cfg.name,
-                    self.resolved.arch
-                );
-            }
             let machine = super::hypervisor::Launch::Container {
                 lab: self.lab.clone(),
                 resolved: Box::new(self.resolved.clone()),
@@ -1290,22 +1322,56 @@ impl super::machine::Machine for ContainerInstance {
         vec![self.dirs.scratch_disk()]
     }
 
-    /// A micro-VM needs the host-arch emulator; `qemu-img` creates its
-    /// scratch overlay.
-    /// `qemu-img` either way: it makes the scratch disk and takes the
-    /// offline snapshots, whichever hypervisor runs the micro-VM.
+    fn check_host_config(&self) -> Result<()> {
+        if self.selection_source == Some(SelectionSource::QemuMigration) {
+            let why = crate::config::hypervisor::vmlab_refusals(
+                model::MachineCfg::Container(&self.cfg),
+                &(self.host_facts)(),
+                None,
+            );
+            if !why.is_empty() {
+                bail!("{}", why.join("\n"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A micro-VM needs the host-arch emulator, and `qemu-img` when it is the
+    /// image tool (`VMLAB_IMAGE_TOOL`): the image tool makes the scratch disk
+    /// and takes the offline snapshots, whichever hypervisor runs the micro-VM.
     fn required_binaries(&self) -> Vec<String> {
-        vec![
-            "qemu-img".to_string(),
-            match self.hypervisor {
-                HypervisorKind::Qemu => qemu::emulator_binary(&self.resolved.arch),
-                HypervisorKind::Vmlab => self.hv.emulator_binary(&self.resolved.arch),
-            },
-        ]
+        let mut needed: Vec<String> = crate::template::qimg::backend()
+            .required_binary()
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        needed.push(match self.hypervisor {
+            HypervisorKind::Qemu => qemu::emulator_binary(&self.resolved.arch),
+            HypervisorKind::Vmlab => self.hv.emulator_binary(&self.resolved.arch),
+        });
+        needed
     }
 
     fn hypervisor(&self) -> HypervisorKind {
         self.hypervisor
+    }
+
+    fn hypervisor_fallback(&self) -> Option<String> {
+        self.hypervisor_fallback.clone()
+    }
+
+    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
+        let source = self.selection_source?;
+        crate::config::hypervisor::qemu_removal(
+            model::MachineCfg::Container(&self.cfg),
+            &crate::config::hypervisor::HypervisorSelection {
+                kind: self.hypervisor,
+                source,
+                fallback_reason: self.hypervisor_fallback.clone(),
+            },
+            &(self.host_facts)(),
+            None,
+        )
     }
 
     async fn state(&self) -> PowerState {
@@ -1330,12 +1396,21 @@ impl super::machine::Machine for ContainerInstance {
     /// Wire this container's NICs into the lab fabric — stream sockets only,
     /// since the micro-VM argv carries no pre-opened descriptors — then boot
     /// the micro-VM with event-emitting callbacks.
-    async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
+    async fn start(
+        self: Arc<Self>,
+        lab: Arc<dyn super::machine::LabServices>,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         if self.power_state().await != PowerState::Stopped {
             return Ok(());
         }
         // Safety net (see the VM's start): no-op unless the image is pending.
         lab.ensure_pulled(&self.cfg.name).await?;
+        if self.selection_source == Some(SelectionSource::QemuMigration) {
+            self.check_host_config()?;
+            lab.record_hypervisor(&self.cfg.name, self.hypervisor(), true, output)
+                .await?;
+        }
         // Volumes mount from the lab's SMB server; make sure it is serving
         // (idempotent — a no-op when `up` already started it).
         if !self.volumes.is_empty() {
@@ -1419,7 +1494,7 @@ impl super::machine::Machine for ContainerInstance {
             // wires NIC listeners and the event callbacks. Whatever the fresh
             // boot writes is rewound by the load.
             if self.power_state().await == PowerState::Stopped {
-                Arc::clone(&self).start(Arc::clone(&lab)).await?;
+                Arc::clone(&self).start(Arc::clone(&lab), None).await?;
             }
             self.restore_online(snap).await?;
             // Re-point forwards / re-prime the NAT MAC at the restored lease.

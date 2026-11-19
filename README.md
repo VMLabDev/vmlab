@@ -251,8 +251,12 @@ NAT, routes, port forwards and L3 filtering — with no taps, bridges, or
 `CAP_NET_ADMIN`. An optional eBPF fast path (`VMLAB_FASTPATH=auto`, AF_XDP
 tier) accelerates it where the host allows; `vmlab fastpath` reports the
 selected tier, and an unavailable fast path silently falls back to userspace.
-The fast path needs `CAP_BPF` and `CAP_NET_ADMIN`, which `install.sh` offers
-to grant the binary with `sudo setcap` (`--fastpath` / `--no-fastpath`).
+The fast path needs `CAP_BPF` and `CAP_NET_ADMIN`. Only its helper,
+`vmlab-fastpath`, installed beside `vmlab`, holds them: the daemons ask it to
+create taps and to load, attach and update vmlab's own BPF programs, and it
+refuses every other request. `install.sh` offers to grant the helper those
+capabilities with `sudo setcap` (`--fastpath` / `--no-fastpath`); the `vmlab`
+binary never gets one.
 
 The AF_XDP tier supports QEMU and vmlab-hv VMs. The daemon creates TAP queues
 and passes them to vmlab-hv over its paused-launch control socket. If

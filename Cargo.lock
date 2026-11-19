@@ -4142,6 +4142,7 @@ dependencies = [
  "tracing-subscriber",
  "vmlab-agent-proto",
  "vmlab-cinit-proto",
+ "vmlab-disk",
  "vmlab-hv-display",
  "vmlab-hv-proto",
  "vmlab-tap",
@@ -4318,6 +4319,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "serde_json",
+ "sha2 0.10.9",
  "vmlab-hv-tcg-ir",
 ]
 

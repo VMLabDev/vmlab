@@ -35,7 +35,7 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, path
             return;
         }
     };
-    let mut file = match adopter().and_then(|_adopted| File::open(&path)) {
+    let mut file = match adopter().and_then(|_adopted| open_regular(&path)) {
         Ok(f) => f,
         Err(e) => {
             mux.send_error(Some(id), format!("tail {path}: {e}"));
@@ -83,7 +83,10 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, path
                     let rotated = std::fs::metadata(&path)
                         .map(|m| m.len() < pos || !same_file(&file, &path))
                         .unwrap_or(false);
-                    if rotated && let Ok(f) = File::open(&path) {
+                    // Through the same check as the first open: a FIFO put
+                    // at the path would otherwise park this thread in
+                    // open(2) where `stop` can never reach it.
+                    if rotated && let Ok(f) = open_regular(&path) {
                         file = f;
                         pos = 0;
                     }
@@ -109,6 +112,28 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, path
             }
         }
     });
+}
+
+/// Open `path` for a tail, refusing anything but a regular file (code
+/// review F61c). A FIFO would block the open (and so the session) until a
+/// writer came, and a device has no end to follow; `O_NONBLOCK` makes the
+/// open itself return, and the type check then refuses what it opened.
+pub(crate) fn open_regular(path: &str) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Whether the open handle still refers to the file currently at `path`

@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import lib
@@ -43,6 +44,7 @@ SHUTDOWN_TIMEOUT = 300
 X86_EXEC_TIMEOUT = 180
 X86_SHUTDOWN_TIMEOUT = 300
 X86_MAX_RESETS = 3
+WINDOWS_PROBE_INTERVAL = 1.0
 NET_WINDOW = 12.0        # seconds of sustained blasting per net direction
 NET_SETTLE = 1.0
 BLK_SEQ_MIB = 512        # sequential read/write volume
@@ -368,19 +370,42 @@ def windows_boot_id(agent):
     return None
 
 
+def windows_probe_ticks(deadline):
+    """Start readiness probes one second apart while a probe fits the cadence."""
+    while (started := time.monotonic()) < deadline:
+        yield
+        delay = min(started + WINDOWS_PROBE_INTERVAL, deadline) - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
+def host_sync_latency_ms(run_dir):
+    """Time fdatasync on a freshly written 4 KiB file on the overlay filesystem."""
+    with tempfile.TemporaryFile(dir=run_dir) as probe:
+        probe.write(bytes(4096))
+        probe.flush()
+        start = time.monotonic()
+        os.fdatasync(probe.fileno())
+        return round((time.monotonic() - start) * 1000, 3)
+
+
 class WindowsReady:
     """The windows first-boot sequence, ported from the template's
     provision script (see wait_x86_ready)."""
 
-    def __init__(self, backend, args, run_dir, t0):
+    def __init__(self, backend, args, run_dir, t0, milestones=None):
         self.backend = backend
         self.args = args
         self.run_dir = run_dir
         self.t0 = t0
+        self.milestones = {} if milestones is None else milestones
         self.deadline = t0 + X86_BOOT_DEADLINE["windows-10"] * args.timeout_scale
         self.resets = 0
         self.reset_monitor = None
         self.reset_session = None
+
+    def mark(self, name):
+        self.milestones[name] = round(time.monotonic() - self.t0, 2)
 
     def ensure_vm(self):
         """vmlab-hv exits 0 on every guest reset; vmlab restarts it, and so
@@ -414,7 +439,7 @@ class WindowsReady:
         cand = None
         try:
             cand = lib.AgentClient(self.backend.agent_socket(), reset_monitor=self.reset_monitor)
-            hello = cand.handshake(3)
+            hello = cand.handshake(WINDOWS_PROBE_INTERVAL)
             return cand, hello
         except Exception:
             if cand is not None:
@@ -425,7 +450,7 @@ class WindowsReady:
         """Phase 1: the specialize marker, `cmd if exist` like vmlab's
         script (powershell is not dependable this early)."""
         marker_seen = False
-        while time.monotonic() < self.deadline:
+        for _ in windows_probe_ticks(self.deadline):
             agent, hello = self.connect()
             if agent is not None:
                 try:
@@ -437,6 +462,8 @@ class WindowsReady:
                             60,
                         )
                         marker_seen = chan["code"] == 0
+                        if marker_seen:
+                            self.mark("marker_seen")
                     if marker_seen:
                         log("windows first boot finished; clearing marker")
                         win_exec(agent, ["cmd.exe", "/C", f"del /f /q {WINDOWS_MARKER}"], 60)
@@ -444,7 +471,6 @@ class WindowsReady:
                 except (TimeoutError, ConnectionError, lib.BenchError, OSError):
                     pass
                 agent.close()
-            time.sleep(5)
         raise TimeoutError("windows first-boot marker never appeared")
 
     def wait_oobe(self, agent):
@@ -453,16 +479,16 @@ class WindowsReady:
         the specialize reboots, so every iteration works with whatever
         connection it can get."""
         end = min(time.monotonic() + 600, self.deadline)
-        while time.monotonic() < end:
+        for _ in windows_probe_ticks(end):
             if agent is None:
                 agent, _ = self.connect()
                 if agent is None:
-                    time.sleep(5)
                     continue
             try:
                 chan = win_ps(agent, WINDOWS_OOBE_PS)
                 state = chan["data"].decode(errors="replace").strip()
                 if chan["code"] == 0 and state == "done":
+                    self.mark("oobe_done")
                     log("windows OOBE finished")
                     return agent
             except (TimeoutError, ConnectionError, lib.BenchError, OSError):
@@ -471,8 +497,8 @@ class WindowsReady:
                 except Exception:
                     pass
                 agent = None
-            time.sleep(5)
         log("windows OOBE still running after ~10 minutes; continuing")
+        self.mark("oobe_timeout")
         return agent
 
     def settle_appx(self, agent):
@@ -516,21 +542,23 @@ class WindowsReady:
         for round_index in range(3):
             agent, _ = self.connect()
             if agent is None:
-                time.sleep(5)
+                time.sleep(WINDOWS_PROBE_INTERVAL)
                 continue
+            self.mark(f"reboot_request_{round_index + 1}")
             self.request_reboot(agent, round_index)
             end = time.monotonic() + 60
-            while time.monotonic() < end:
+            for _ in windows_probe_ticks(end):
                 agent, _ = self.connect()
                 if agent is not None:
                     now_id = windows_boot_id(agent)
                     if before is None or (now_id is not None and now_id != before):
+                        self.mark("reboot_agent_seen")
                         return self.wait_post_reboot_agent(agent)
                     agent.close()
-                time.sleep(5)
             log(f"windows still on the same boot ~60 s after request "
                 f"{round_index + 1}")
         log("windows in-guest reboot never took; forcing a host restart")
+        self.mark("host_restart")
         if self.args.backend == "qemu":
             self.backend.session.kill()
             session = self.backend.launch()
@@ -542,11 +570,10 @@ class WindowsReady:
         return agent, hello
 
     def wait_agent(self, deadline):
-        while time.monotonic() < deadline:
+        for _ in windows_probe_ticks(deadline):
             agent, hello = self.connect()
             if agent is not None:
                 return agent, hello
-            time.sleep(2)
         raise TimeoutError("windows agent never answered after the reboot")
 
     def wait_post_reboot_agent(self, agent):
@@ -558,17 +585,20 @@ class WindowsReady:
     def run(self):
         try:
             agent, hello = self.wait_marker()
+            self.mark("marker_handling_ended")
             agent = self.wait_oobe(agent) or agent
             self.settle_appx(agent)
+            self.mark("appx_settle_ended")
             agent, hello = self.reboot_and_return(agent)
             agent.reset_monitor = None
-            return agent, hello, round(time.monotonic() - self.t0, 2)
+            self.mark("agent_ready")
+            return agent, hello, self.milestones["agent_ready"]
         finally:
             if self.reset_monitor is not None:
                 self.reset_monitor.close()
 
 
-def wait_x86_ready(backend, args, guest, run_dir, t0):
+def wait_x86_ready(backend, args, guest, run_dir, t0, milestones=None):
     """Boot to agent ready, vmlab's readiness semantics.
 
     Linux: the agent answers its Hello and runs an exec. Windows: the
@@ -580,7 +610,7 @@ def wait_x86_ready(backend, args, guest, run_dir, t0):
     the first spawn and never resets.
     """
     if guest.startswith("windows-"):
-        return WindowsReady(backend, args, run_dir, t0).run()
+        return WindowsReady(backend, args, run_dir, t0, milestones).run()
     deadline = t0 + X86_BOOT_DEADLINE[guest] * args.timeout_scale
     while time.monotonic() < deadline:
         if backend.session.exited():
@@ -643,6 +673,27 @@ def allocated_span(template_disk):
     return end
 
 
+def measure_udp_tx(agent, peer, guest_cpu):
+    """Measure delivered throughput with the sender pinned for the whole window."""
+    net = lib.BENCH_NET
+    peer.report()
+    log(f"starting net tx on guest CPU {guest_cpu}")
+    output = must_sh(
+        agent,
+        f"taskset -c {guest_cpu} python3 /tmp/vmlab-nettool.py udp-blast "
+        f"{net['peer_ip']} {net['port']} {net['udp_payload']} {NET_WINDOW}",
+        "net tx", timeout=NET_WINDOW * 3,
+    )
+    sent = json.loads(output.strip().splitlines()[-1])
+    time.sleep(NET_SETTLE)
+    received = peer.report()
+    if not sent["bytes"] or received["rx_bytes"] / sent["bytes"] < 0.9:
+        raise lib.BenchError(f"UDP delivery below 90%: sent={sent}, received={received}")
+    mbps = round(received["rx_bytes"] * 8 / NET_WINDOW / 1e6, 2)
+    log(f"finished net tx: {mbps} Mbit/s")
+    return mbps, sent, received
+
+
 def x86_one_repeat(args, guest, smp, pin, version, index):
     """One x86_64 VM through the full workload set for its guest."""
     lib.require_vm_slots()
@@ -659,7 +710,8 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
     # (the reference lab boots this template without a NIC; a jumbo-MTU
     # NIC on it wedges the first-boot reboot).
     peer = None if windows else netpeer.Peer(
-        run_dir, net["guest_ip"], net["guest_mac"], net["port"], log)
+        run_dir, net["guest_ip"], net["guest_mac"], net["port"], log,
+        cpu=netpeer.host_peer_cpu())
     switch_sock = None if windows else peer.switch_sock
     mtu = None if windows else net["mtu"]
     if args.backend == "qemu":
@@ -678,12 +730,17 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
               "loadavg_start": loadavg_start}
     agent = None
     try:
+        if windows:
+            result["host_sync_latency_ms"] = host_sync_latency_ms(run_dir)
+            log(f"host fdatasync before launch: {result['host_sync_latency_ms']} ms")
         session = backend.launch()
         backend.release_cpus()
         result["t_release"] = round(session.elapsed(), 2)
         log(f"released CPUs after {result['t_release']}s; waiting for agent")
 
-        agent, hello, boot_secs = wait_x86_ready(backend, args, guest, run_dir, session.t0)
+        milestones = result.setdefault("windows_boot_milestones_s", {}) if windows else None
+        agent, hello, boot_secs = wait_x86_ready(
+            backend, args, guest, run_dir, session.t0, milestones)
         result["boot_to_agent_ready"] = boot_secs
         result["agent_hello"] = {k: hello.get(k) for k in ("agent_version", "os")}
         log(f"agent ready after {boot_secs}s")
@@ -766,32 +823,7 @@ def x86_one_repeat(args, guest, smp, pin, version, index):
 
 
             # --- virtio-net ------------------------------------------------
-            # TX: the guest blasts UDP at the peer; the peer counts the
-            # ethernet bytes that crossed the whole path (device, backend
-            # netdev, framing socket). A delivery below 90% of what the
-            # guest sent means the measurement is broken, not slow.
-            peer.report()  # reset counters
-            log("starting net tx")
-            out = must_sh(
-                agent,
-                f"python3 /tmp/vmlab-nettool.py udp-blast {net['peer_ip']} {net['port']} "
-                f"{net['udp_payload']} {NET_WINDOW}",
-                "net tx", timeout=NET_WINDOW * 3,
-            )
-            blast = json.loads(out.strip().splitlines()[-1])
-            time.sleep(NET_SETTLE)
-            rx = peer.report()
-            if blast["bytes"] == 0:
-                raise lib.BenchError(f"net tx blasted nothing: {blast}")
-            delivery = rx["rx_bytes"] / blast["bytes"]
-            if delivery < 0.9:
-                raise lib.BenchError(
-                    f"net tx delivery {delivery:.0%}: guest sent {blast['bytes']}, "
-                    f"peer saw {rx['rx_bytes']} ({blast.get('last_error')})"
-                )
-            samples["net_tx_udp_mbps"] = round(
-                rx["rx_bytes"] * 8 / NET_WINDOW / 1e6, 2)
-            log(f"finished net tx: {samples['net_tx_udp_mbps']} Mbit/s")
+            samples["net_tx_udp_mbps"], _, _ = measure_udp_tx(agent, peer, smp - 1)
 
             # RX: the peer blasts; the rate is read from the guest's own
             # interface counter (kernel-counted, immune to userspace sink
@@ -893,9 +925,21 @@ def x86_run_config(args, guest, smp, pin, version, commit, dirty, host):
         "tools": {},
         "repeat_loadavg": [],
     }
+    if guest.startswith("windows-"):
+        env["readiness_probe_interval_s"] = WINDOWS_PROBE_INTERVAL
+        env["repeat_host_sync_latency_ms"] = []
+        env["repeat_windows_boot_milestones_s"] = []
+    else:
+        env["udp_tx_guest_cpu"] = smp - 1
+        env["net_peer_cpu"] = netpeer.host_peer_cpu()
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} x86_64 {guest} smp={smp} repeat {i}/{args.repeats}")
         result, backend, agent = x86_one_repeat(args, guest, smp, pin, version, i)
+        if "host_sync_latency_ms" in result:
+            env["repeat_host_sync_latency_ms"].append(result["host_sync_latency_ms"])
+            milestones = result["windows_boot_milestones_s"]
+            env["repeat_windows_boot_milestones_s"].append(milestones)
+            log(f"repeat {i} Windows boot milestones since launch (s): {milestones}")
         env["backend_version"] = backend.backend_version()
         env["tools"] = result.get("tools", {})
         env["repeat_loadavg"].append({

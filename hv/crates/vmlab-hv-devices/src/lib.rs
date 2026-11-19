@@ -123,8 +123,33 @@ pub trait VirtioDevice: Snapshot + Send {
     ) -> Result<(), DeviceError>;
     /// The driver kicked queue `index`.
     fn queue_notify(&mut self, index: u16);
+    /// One eventfd per queue, for a device that serves its queues off the
+    /// calling thread: a write to the event at `index` is the same kick as
+    /// `queue_notify(index)`. The transport hands them to
+    /// [`QueueDoorbells`] so the kernel can deliver a kick itself.
+    fn queue_events(&self) -> Option<Vec<Arc<vmm_sys_util::eventfd::EventFd>>> {
+        None
+    }
     /// The driver reset the device. Returns to the pre-activation state.
     fn reset(&mut self);
+}
+
+/// A guest memory address whose writes kick one queue.
+#[derive(Clone)]
+pub struct QueueDoorbell {
+    /// Guest-physical address of the queue's notify register. A write of
+    /// any length and value is a kick.
+    pub address: u64,
+    pub event: Arc<vmm_sys_util::eventfd::EventFd>,
+}
+
+/// Kernel delivery of queue kicks (KVM's ioeventfd), which the VMM gives a
+/// virtio transport. A registered write signals its event in the kernel and
+/// does not reach the transport's `bar_write`.
+pub trait QueueDoorbells: Send {
+    /// Replace every registration this object made with `doorbells`. An
+    /// empty slice removes them all. On an error none is left registered.
+    fn set(&mut self, doorbells: &[QueueDoorbell]) -> std::io::Result<()>;
 }
 
 /// Guest-visible state a device saves into and restores from a snapshot.

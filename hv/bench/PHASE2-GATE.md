@@ -1,8 +1,939 @@
 # Phase-2 performance gate (HV-D28)
 
-**Verdict: NOT passed. The round-5 full-suite window met six of ten core bars.
-The round-6 focused window now passes G4, G7, G9, and G10; other bars were
-not rerun.** The VM default must remain unchanged.
+**Verdict: D28 remains open. Round 7 met six of ten core bars. Card #71 then
+closed G1 (0.9770). Card #72 reran G2 and did not close it (1.0182). Card #73
+closed G6 (1.6307). Card #98 merged the ioeventfd wake of the virtio-blk
+worker (FD6) and reran both: G2 1.0240, G6 1.5416. Card #74 closed G7
+(1.1434). Card #97 moved the virtio-gpu 2D commands off the vCPU threads
+(FD5) and reran G2: 0.9361, with a boot time that did not move outside its
+spread.**
+
+## Round 7 follow-up: virtio-gpu 2D commands off the vCPU thread (card #97, 2026-11-19)
+
+The 2D commands of virtio-gpu no longer run on a vCPU thread, and a flush
+no longer composes a frame. The vCPU threads spend 2.0 seconds less of a
+Windows boot in the host. The boot time did not move outside its spread:
+the medians of six alternating boots are 91.83 seconds without the change
+and 91.52 with it. The compose time did not shrink. It moved to a frame
+thread, which says that Windows does not flush in bursts within a frame.
+
+### Change
+
+- The queues of the 2D device are served by a `QueueWorker`, as those of
+  virtio-blk are. The transport registers the queue eventfds with KVM on
+  the notify region of BAR2, so a kick does not exit to userspace. With a
+  renderer (`gpu = "virgl"` or `"venus"`) nothing changes: the queues are
+  served on the thread that kicks.
+- A flush records its damage and asks a frame thread for a frame. That
+  thread composes and publishes at most one frame per 16 ms, which holds
+  every flush before it and carries the timestamp of the newest. A lone
+  flush is published at once. SET_SCANOUT and RESOURCE_UNREF publish where
+  they are served, as before.
+- A kick no longer asks the GPU whether its scanout is native. That
+  question takes the device lock, which the worker holds while it serves a
+  batch. This is the probable cause of what card #72 saw with a worker
+  (vCPU CPU time fell, wall time did not): the vCPU that kicked slept on
+  the lock until the compose was over. A unit test holds the worker inside
+  a command and checks that a kick and a transport read return. The wait
+  itself was not measured in a boot.
+
+### Measurements
+
+All runs were on helios in one window with no build, check or other
+project VM: QEMU 11.1.3, CPUs 16 to 23, governor performance, 24 GiB
+scopes, Windows 10 19045.2006.10, fresh overlay per boot, the bundled OVMF
+pair, one-second readiness probes and the sync-latency probe of card #96
+(3.6 to 6.7 ms before every boot). The vmlab-hv binary of `0885e0cd` has
+SHA-256
+`eaf49e949df25f891debed8b3afe2a5d63c3cfacdeee842ebaae6db45d06bb11`, the
+base binary of `7352c514` (`next` before the card)
+`3d82fc7d9f1d0cedc5f666ab5c534853074c03a074c48b9271f4343a672a8446`, which
+is the binary card #98 measured, and the iPXE ROM
+`4f0b06896c9457499631ee07d0209aa3416fc82111ea3149cd86a78332a61268`. The
+monitor took 362 samples from 04:50:46 to 05:20:51 UTC on 2026-11-19:
+one-minute load 1.49 to 3.47, five-minute 2.05 to 2.88, and I/O pressure
+(`/proc/pressure/io`, some, 10 s) 43% to 75%, as in cards #73 and #98.
+Scripts, logs and raw results are on helios under
+`/home/vmlab/src/stc/logs/d28-card-97/`.
+
+- M1, gate rerun with the method of FD7: `bench/run.py --arch x86_64
+  --guest windows-10 --repeats 3`, three QEMU repeats and then three
+  vmlab-hv repeats.
+
+  | Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+  |---|---|---|---:|---|---:|---:|---|
+  | G2 | Windows 10 boot (s) | 102.82, 98.12, 94.92 | 98.12 | 102.95, 91.85, 89.38 | 91.85 | 0.9361 | PASS |
+
+  The ratio is under 1.00 for the first time, but three samples per side
+  with spreads of 7.9 and 13.6 seconds do not separate it from card #98's
+  1.0240: M2 shows no change of the boot time. Both aggregate records are
+  appended to [`history/x86_64.jsonl`](history/x86_64.jsonl). The runs
+  used a scratch copy of the tree, so the tool recorded no commit, and the
+  records carry `0885e0cd` by hand.
+- M2, Windows 10 boot, base against the change, six rounds of one boot
+  each, alternating, with the order reversed every round (`measure.sh`):
+
+  | Binary | Boot samples (s) | Median |
+  |---|---|---:|
+  | Base `7352c514` | 92.23, 91.43, 95.41, 91.27, 89.10, 97.19 | 91.83 |
+  | Change `0885e0cd` | 91.22, 95.90, 91.49, 102.70, 91.54, 91.24 | 91.52 |
+
+  The medians differ by 0.3 seconds, and the samples spread over 8.1
+  seconds for the base and 11.5 for the change. The change was faster in three rounds and slower
+  in three. This does not resolve an effect of 1.4 seconds.
+- M3, CPU time of the vmlab-hv threads over the boots of M2, from
+  `/proc/<pid>/task/*/stat` sampled every second (`cpusample.py`). Host
+  user time is user time less guest time.
+
+  | Binary | vCPU threads, host user (s) | vCPU threads, system (s) | GPU queue worker (s) | GPU frame thread (s) | Process, host (s) |
+  |---|---|---|---|---|---|
+  | Base | 9.80, 9.80, 9.58, 9.93, 9.74, 9.72 | 9.01, 9.14, 9.04, 9.12, 8.95, 8.96 | none | none | 23.57, 23.48, 23.24, 23.58, 23.20, 23.21 |
+  | Change | 7.65, 7.41, 7.85, 9.66, 7.83, 7.75 | 9.34, 9.55, 9.18, 9.16, 9.29, 9.11 | 0.18, 0.17, 0.16, 0.16, 0.17, 0.17 | 1.61, 1.59, 1.49, 1.68, 1.54, 1.62 | 23.42, 23.50, 23.24, 25.42, 23.46, 23.29 |
+
+  The vCPU threads' host user time falls from a median of 9.77 seconds to
+  7.79, by 2.0 seconds, in five of six boots. Their system time rises by
+  0.2 seconds. The fourth boot of the change is its slow one (102.70
+  seconds): the vCPU threads used 1.9 seconds more there. The first
+  vmlab-hv boot of M1 shows the same pair (102.95 seconds, 9.62), and QEMU
+  has such a boot too (102.82), so this is a mode of the guest's boot and
+  not of the change. The three boots of M1 measured the same thread times
+  as M2 (queue worker 0.16, frame thread 1.54 to 1.58).
+- M4, what did not happen. The frame thread uses 1.5 to 1.7 seconds per
+  boot, about what the commands cost on the vCPU threads before (1.4
+  seconds in card #72, for about 2,400 queue notifications). One compose
+  per frame interval saves little here, so most flushes still get a frame
+  of their own. The spacing of the flushes was not measured. A compose
+  still copies the whole frame twice and compares all of it.
+  The process uses the same host CPU time as before (23.2 to 23.6
+  seconds).
+
+### Verification
+
+`just ci::check` holds on the card's last commit. Four unit tests cover
+the change: the flushes of one frame interval publish one composed frame
+with the union of their damage, a flush is answered before its frame is
+composed, a kick returns while the worker serves a command, and the
+doorbells sit on the notify region of BAR2 and follow it. The merge bar
+ignores the tests that need KVM, so these ran alone on helios at
+`0885e0cd`: `kvm_tests` (11 passed) and `snapshot_tests` (24 passed) of
+`vmlab-hv-vmm`, and `viewer_input_and_resize_reach_guest_via_s1` of
+`vmlab-hv-viewer`, which boots Ubuntu on a 2D virtio-vga and checks its
+frames, a resize, input and a reset through the display socket.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD16: make a 2D compose cost what its damage costs. It copies the
+  frame twice (the previous pixels and the cached frame) and compares
+  every tile, where the flush rectangles bound what can have changed.
+  Worth up to 1.5 seconds of host CPU per Windows boot on the frame
+  thread, and no boot time.
+- FD17: G2 moves in two modes about 10 seconds apart on both backends
+  (M3), which is most of its spread. Finding what the guest does in the
+  slow boots would make the bar resolve smaller effects.
+
+### G2 boot milestones (card #121)
+
+Card #97's logs localize much of the spread to the first boot, before
+the host observes the specialize marker. The table uses whole-second
+wall-clock log timestamps from CPU release, while the total is the
+runner's monotonic measurement from launch.
+
+| Card #97 run | Total (s) | Release to marker (s) | Marker to OOBE done (s) | OOBE done to ready (s) |
+|---|---:|---:|---:|---:|
+| QEMU gate, fastest | 94.92 | 59 | 27 | 9 |
+| QEMU gate, slowest | 102.82 | 63 | 29 | 11 |
+| vmlab-hv gate, fastest | 89.38 | 56 | 25 | 8 |
+| vmlab-hv gate, slowest | 102.95 | 64 | 29 | 10 |
+| vmlab-hv A/B head, fastest | 91.22 | 56 | 24 | 11 |
+| vmlab-hv A/B head, slowest | 102.70 | 67 | 26 | 10 |
+
+The slow vmlab-hv A/B boot loses about 11 seconds by the marker. The
+slow QEMU gate boot loses about four seconds by that point and the rest
+after it. These samples do not establish a single binary mode selector.
+The guest has no NIC, and the prior disk measurements show variable sync
+costs. The logs cannot attribute the pre-marker delay to disk caching,
+CPU placement, a guest timer, or offline servicing.
+
+Guest event logs from card #72's 71 diagnostic boots also place the
+spread inside Windows. For each backend, the table compares medians for
+the fastest and slowest quarter by total boot time. Each cohort pools the
+diagnostic variants of that backend. The guest intervals use Kernel-General
+event 12 for kernel start and User32 event 1074 from winlogon for the
+specialize reboot request.
+
+| Backend | Cohort (boots) | Total (s) | First kernel start to specialize reboot request (s) | Request to second kernel start (s) | Second to final kernel start (s) |
+|---|---|---:|---:|---:|---:|
+| QEMU | Fastest (5) | 83.41 | 51.10 | 2.92 | 24.01 |
+| QEMU | Slowest (5) | 95.63 | 55.60 | 6.67 | 26.01 |
+| vmlab-hv | Fastest (12) | 88.63 | 53.85 | 2.55 | 26.00 |
+| vmlab-hv | Slowest (12) | 99.22 | 57.62 | 3.85 | 31.00 |
+
+The specialize pass contributes on both backends. QEMU also varies
+around the specialize reboot, while vmlab-hv shows a larger difference
+between the second and final kernel starts. This comparison locates
+the spread across multiple intervals even on the guest clock. The
+cohorts mix diagnostic conditions and cannot isolate a causal factor.
+The source logs are under
+`/home/vmlab/src/stc/logs/d28-card-72.r8b/diag/logs/` on helios.
+
+G2 now records monotonic readiness milestones for each repeat alongside
+its total, host sync probe, and load. The benchmark retains the existing
+guest configuration and readiness sequence so future runs can compare
+the spread by phase without changing the parity metric.
+
+
+## Round 7 follow-up: G7 UDP transmit (card #74, 2026-11-19)
+
+G7 now passes: vmlab-hv sends 35958.04 Mbit/s against QEMU's 31447.98, a
+ratio of 1.1434. Round 7 measured 25763.87 against 35457.47 (0.7266).
+
+### Cause
+
+Each kick of a virtio-net transmit queue was a user-space MMIO exit on the
+vCPU thread. QEMU takes the same kick in the kernel, through an ioeventfd.
+
+The workload sends one 65000-byte datagram per `sendto`, and the guest
+kicks once per datagram on both backends: a 12-second send on vmlab-hv
+had 738,000 transmit interrupts for 762,000 datagrams. The sending vCPU
+limits the rate. One 12-second send on each backend, with the sender alone
+on its guest CPU:
+
+| | QEMU 11.1.3 | vmlab-hv at `0c65636d` |
+|---|---:|---:|
+| Rate (Mbit/s) | 39711 | 33037 |
+| Sender's guest CPU in user and system time | 79% | 95% |
+| That CPU time per datagram (microseconds) | 10.4 | 15.0 |
+| Device thread CPU, user plus system (s) | 7.8 | 5.3 |
+
+vmlab-hv takes the checksum off the guest (N6) and its device thread uses
+less CPU than QEMU's main loop, yet the guest paid 4.6 microseconds more
+for each datagram. A user-space instruction sample of the vmlab-hv process
+(`bench/ipsample.c`, 3 seconds, 2697 samples, 455 unresolved) puts 64% of
+the samples in the kick's exit path on the vCPU thread: the vCPU run loop, the
+chipset clock step with its HPET, RTC and interrupt-line updates, the PCI
+window and BAR decode, and `queue_notify` with its write to the worker's
+wake socket. `process_tx`, the whole transmit copy, has 13%.
+
+### Change
+
+virtio-net on a switch stream offers one event for all its queues, and
+its worker polls it. The event is registered as a KVM ioeventfd at each
+queue's notify address while the driver has the device activated. A
+refused registration leaves the write to the old path. TAP devices are
+unchanged. The commit that was measured is
+`42425590b7132f6b4e1e8dd8f3b5d78064547df0`.
+
+That commit had its own seam for the registration, kept by the PCI root.
+Card #98 merged an equal seam for virtio-blk first (below), and the merge
+of `next` into this card left one: virtio-net returns its event from
+`VirtioDevice::queue_events`, and the transport registers it through
+`QueueDoorbells`, as it does for a `QueueWorker`. The seam of `42425590`
+is removed (`VirtioDevice::notify_event`, `PciDevice::notify_events` and
+`take_notify_change`, `NotifyEvent`, `NotifyRegistrar` and
+`PciRoot::set_notify_registrar`), so this card changes no shared
+interface. One difference follows: the PCI root of `42425590` removed a
+registration while the function's memory-decode bit was off, and the
+merged seam keeps it at the programmed BAR address. The numbers below
+are from `42425590` and were not measured again after the merge.
+
+### Diagnostic cohorts
+
+Before the rerun, 24 diagnostic sends of 12 seconds ran on a shared but
+lightly loaded host (one-minute load 1.1 to 5.1), three per fresh-overlay
+boot, with the backends rotated. "fix" is the change before its commit.
+These are not gate records.
+
+The spread of every gate round has one source on both backends: where the
+guest scheduler runs the sender. The transmit interrupt arrives on one
+guest CPU. A sender on the other CPU has a CPU to itself. A sender on the
+interrupt's CPU shares it with the completion softirq. A send is "mixed"
+when the sender moved during the 12 seconds.
+
+| Sender runs on | QEMU (Mbit/s) | vmlab-hv at `0c65636d` | vmlab-hv with the fix |
+|---|---:|---:|---:|
+| The other CPU | 41399 (n=2) | 32930 (n=3) | 44509 (n=1) |
+| Both (mixed) | 34085 (n=5) | 26673 (n=3) | 35959 (n=2) |
+| The interrupt's CPU | 29849 (n=2) | 24882 (n=3) | 30197 (n=3) |
+| Guest CPU per datagram, same order (microseconds) | 13.0, 15.5, 17.3 | 16.0, 19.7, 21.0 | 12.2, 14.8, 17.2 |
+
+Values are medians. The last row counts both guest CPUs with softirq
+time. In each placement the round-7 code is at 0.78 to 0.83 times QEMU
+and the fix at 1.01 to 1.08.
+
+### Findings
+
+- F1, the kick was the cost. With the ioeventfd the guest spends 3.8 to
+  4.9 microseconds less CPU on each datagram, in every placement.
+- F2, G7 cannot place a ratio within 30% from three samples. A sample is
+  near 30, 35 or 43 Gbit/s by the sender's placement, on both backends,
+  so two backends at parity can measure anywhere from 0.70 to 1.43. This
+  explains QEMU's samples from 28812 to 43560 in rounds 2 to 7. The rerun below
+  has one high sample on each side.
+- F3, boot is not slower. Registration happens at DRIVER_OK, not while
+  firmware sizes BARs. The diagnostic boots took 6.44 and 6.46 seconds
+  with the fix and 6.56 and 6.58 without.
+
+### Quiet-window rerun
+
+The rerun used round 7's method on helios from
+`42425590b7132f6b4e1e8dd8f3b5d78064547df0`: `bench/run.py --arch x86_64
+--guest ubuntu-26.04 --repeats 3`, all three QEMU repeats and then all
+three vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Ubuntu 26.04.3. QEMU was
+11.1.3. The release vmlab-hv binary SHA-256 was
+`bc8b50acc1b116271719017c4b582449351948a3180bf7ff491cb448b19bf26c` and the
+iPXE ROM SHA-256 was
+`1fcb174044dacabd6fc16d92eecee65ca2f92dfd5262f3a963f85da92b6ef101`.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 125 samples at
+five-second intervals from 02:29:34 to 02:39:54 UTC. The one-minute load
+ranged from 0.29 to 1.91, the five-minute load from 0.40 to 1.26 and the
+fifteen-minute load from 0.87 to 1.11. The opticlang pause was not
+confirmed. Logs, hashes, the diagnostic scripts and their raw results
+remain on helios under `/home/vmlab/src/stc/logs/d28-card-74/`. The rerun
+is in `gate2`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G7 | UDP TX (Mbit/s) | 42039.68, 29887.45, 31447.98 | 31447.98 | 35810.52, 35958.04, 44971.56 | 35958.04 | 1.1434 | PASS |
+
+The lowest vmlab-hv sample is above the QEMU median.
+
+This was the second attempt. The first, 18 minutes earlier (`gate1`),
+stopped in the QEMU cohort before any vmlab-hv sample: in QEMU's second
+repeat the host peer (`bench/netpeer`) died during the UDP receive blast,
+and the runner failed on its next request to the peer. QEMU's two
+transmit samples until then were 37982.92 and 38712.39. The attempt
+appended no record. Its cause was not found.
+
+The same runs measure the other single-VM workloads. Their cards own the
+verdicts (#71, #73). The values are recorded here because the change is
+in the PCI root, which every device's BAR writes pass through:
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Card #71's rerun |
+|---|---|---:|---:|---:|---:|
+| G1 | Ubuntu boot (s) | 6.67 | 6.50 | 0.9745 | 0.9770 |
+| G3 | Sequential read (MiB/s) | 20451.32 | 20321.24 | 0.9936 | 1.1350 |
+| G4 | Sequential write (MiB/s) | 1431.34 | 4060.75 | 2.8370 | 2.0602 |
+| G5 | Random read 4 KiB (IOPS) | 50584.50 | 68432.80 | 1.3528 | 1.3944 |
+| G6 | Random write 4 KiB (IOPS) | 18875.40 | 17136.90 | 0.9079 | 0.9845 |
+| G8 | UDP RX (Mbit/s) | 85294.26 | 109125.82 | 1.2794 | 1.2651 |
+
+The G3 ratio moved because QEMU's median rose from 18473.58 to 20451.32.
+vmlab-hv measured 20967.17 then and 20321.24 now. Idle host CPU was 1.07%
+of one core on QEMU and 2.18% on vmlab-hv. All 16 aggregate records and
+their samples are appended to [`history/x86_64.jsonl`](history/x86_64.jsonl).
+The vmlab-hv records are marked dirty because the QEMU run had appended
+to that tracked file. Windows boot (G2) and the guest-to-guest pair were
+not run.
+
+### Verification
+
+After the merge, unit tests cover virtio-net on the merged seam. The
+worker transmits on a count written to the event, with no `queue_notify`
+call, and a TAP device offers no event. The transitional transport
+registers the one event at both queues' notify addresses from DRIVER_OK
+until reset. The tests of card #98 cover the transport and the KVM
+registration.
+
+The three S1 NIC tests on booted guests
+(`nic_dhcp_exchange_with_test_switch`,
+`nic_traffic_survives_snapshot_load`,
+`nic_vnet_multiqueue_traffic_survives_snapshot_load`) need KVM, so they
+ran on helios outside the merge bar. They passed at `42425590` on the seam
+that is now removed, and again at `eb71a71b` on the merged one. They
+assert traffic, not that the kick takes the ioeventfd.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD14: G7 needs another method to resolve a ratio. Either pin the sender
+  in the guest (`taskset`) away from the interrupt's CPU, or take more
+  than three sends and alternate the backends.
+- FD15: `bench/netpeer` died once during a QEMU receive blast. The runner
+  keeps none of the peer's standard error, so the cause is not recorded.
+
+## Round 7 follow-up: virtio-blk kicks through an ioeventfd (card #98, 2026-11-19)
+
+The queue notification of virtio-blk no longer exits to userspace. The
+predicted gain of up to 0.5 seconds of a Windows boot did not appear: the
+boot time did not move outside its spread, and the vCPU threads spend one
+second more in the kernel per boot. On Ubuntu, sequential reads gained 4%
+and random writes about 13%. Random reads and the boot did not change.
+
+### Change
+
+Each queue of a device behind `QueueWorker` has an eventfd, and a kick is a
+write to it. The virtio-pci transport registers the eventfds with KVM as
+ioeventfds of length zero on the modern notify addresses, from DRIVER_OK
+until a reset, and moves them with the BAR. KVM then signals the eventfd
+on the guest's write and the vCPU continues in the guest. A kick that still
+reaches the transport (a legacy port write, or a refused registration)
+writes the same eventfd from the vCPU thread. The worker sleeps in an
+edge-triggered epoll set and never reads the counters, so a wake costs it
+one system call, as the channel did before. A barrier and a snapshot
+quiesce first serve the kicks that were written before them.
+
+### Measurements
+
+All runs were on helios in one window with no build, check or other
+project VM: QEMU 11.1.3, CPUs 16 to 23, governor performance, 24 GiB scopes
+with swap disabled, Ubuntu 26.04.3 and Windows 10 19045.2006.10, fresh
+overlay per boot. The vmlab-hv binary of `2d090d3d` has SHA-256
+`3d82fc7d9f1d0cedc5f666ab5c534853074c03a074c48b9271f4343a672a8446`, the
+base binary of `fea9ea9a` (`next` before the card)
+`8c07ee045f4bcdd5bd1b73fa77d5112b143208fb17ffa8f1654aab22afef74dc`, and the
+iPXE ROM `fec3e63efe0ad55e6ef2d00bf93c9d7bc969d3b515f9d2f77a9e6b6b85749d52`.
+The host's I/O pressure (`/proc/pressure/io`, some, 10 s) read 44% to 80%
+during the window, as in card #73. Scripts, logs and raw results are on
+helios under `/home/vmlab/src/stc/logs/d28-card-98/`.
+
+- M1, the kicks come from the kernel. A KVM test writes to a registered
+  notify address from a vCPU: the eventfd counts one and the vCPU reports
+  no MMIO exit. In the 20,000 random writes of the block sequence the
+  vmlab-hv process made 20,028 write system calls with the change and
+  20,027 without, so no vCPU thread wrote an eventfd.
+- M2, Ubuntu block sequence, base against the change, alternating, four
+  rounds, one fresh VM each (`ab2.sh`, medians):
+
+  | Workload | Base `fea9ea9a` | Change `2d090d3d` | Change/base |
+  |---|---:|---:|---:|
+  | Boot (s) | 6.53 | 6.50 | 0.995 |
+  | Sequential read (MiB/s) | 20,454 | 21,334 | 1.043 |
+  | Sequential write (MiB/s) | 3,719 | 3,646 | 0.980 |
+  | Random read 4 KiB (IOPS) | 68,867 | 68,289 | 0.992 |
+  | Random write 4 KiB (IOPS) | 29,870 | 33,896 | 1.135 |
+
+  The random-read samples overlap (68,172 to 69,498 against 65,970 to
+  68,990). The random-write samples of the change are 22,638 to 35,377
+  against 28,328 to 31,916. A first version of the worker used `poll` and
+  a read of the eventfd per wake. It lost 4% on random reads (median
+  66,327 in the same four rounds), which is why the worker uses
+  edge-triggered epoll.
+- M3, gate rerun, round 7's method: `bench/run.py --arch x86_64 --repeats
+  3`, three QEMU repeats and then three vmlab-hv repeats, for
+  `ubuntu-26.04` and then `windows-10`. The Windows boots use the
+  one-second readiness probes and the sync-latency probe of card #96
+  (3.6 to 4.0 ms before every boot). The monitor took 366 samples from
+  03:23:02 to 03:53:28 UTC on 2026-11-19, which also covers M4's first
+  three rounds: one-minute load 0.63 to 2.71, five-minute 1.05 to 2.08,
+  fifteen-minute 1.43 to 1.85.
+
+  | Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+  |---|---|---|---:|---|---:|---:|---|
+  | G2 | Windows 10 boot (s) | 89.51, 89.40, 107.37 | 89.51 | 87.43, 96.06, 91.66 | 91.66 | 1.0240 | FAIL |
+  | G6 | Random write 4 KiB (IOPS) | 19435.8, 15998.1, 17386.6 | 17386.60 | 26802.0, 25581.8, 28542.5 | 26802.00 | 1.5416 | PASS |
+
+  G2 is where card #72 left it (1.0182), which the operator accepted as
+  parity. The same runs measure the other single-VM workloads:
+
+  | Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Card #73 |
+  |---|---|---:|---:|---:|---:|
+  | G1 | Ubuntu boot (s) | 6.62 | 6.51 | 0.9834 | 0.9771 |
+  | G3 | Sequential read (MiB/s) | 18720.72 | 21882.80 | 1.1689 | 1.0995 |
+  | G4 | Sequential write (MiB/s) | 1500.64 | 2713.68 | 1.8083 | 2.6741 |
+  | G5 | Random read 4 KiB (IOPS) | 50534.70 | 66951.60 | 1.3249 | 1.3356 |
+  | G7 | UDP TX (Mbit/s) | 37083.91 | 29631.40 | 0.7990 | 0.8652 |
+  | G8 | UDP RX (Mbit/s) | 85427.29 | 114464.90 | 1.3399 | 1.2550 |
+
+  Idle host CPU was 1.17% of one core on QEMU and 2.30% on vmlab-hv. G7
+  is under its bar of 0.80 in this run. The card does not touch the
+  network path: QEMU's samples are 36,530 to 41,824 against 31,342 at the
+  median in card #73, and vmlab-hv's 24,843 to 30,817 against 27,116. All
+  18 aggregate records are appended to
+  [`history/x86_64.jsonl`](history/x86_64.jsonl). The vmlab-hv and Windows
+  records are marked dirty because the QEMU run had appended to that
+  tracked file.
+- M4, Windows 10 boot, base against the change, alternating, six rounds of
+  one boot each (`gate.sh` part 3 and `pairs2.sh`):
+
+  | Binary | Boot samples (s) | Median |
+  |---|---|---:|
+  | Base `fea9ea9a` | 99.23, 94.68, 93.62, 95.90, 85.76, 90.89 | 94.15 |
+  | Change `2d090d3d` | 101.57, 90.33, 91.82, 90.15, 98.69, 88.73 | 91.08 |
+
+  The medians differ by 3.1 seconds in favour of the change, and the
+  samples of each binary spread over 13 seconds. The change was faster in
+  four rounds and slower in two. This does not resolve an effect of 0.5
+  seconds. The monitor of the last three rounds took 118 samples from
+  03:54:23 to 04:04:08 UTC: one-minute load 0.85 to 2.97.
+- M5, CPU time of the vmlab-hv threads over the last three rounds of M4,
+  from `/proc/<pid>/task/*/stat` sampled every second until the process
+  ends (`cpusample.py`). Host user time is user time less guest time.
+
+  | Binary | vCPU threads, host user (s) | vCPU threads, system (s) | Disk worker, user + system (s) |
+  |---|---|---|---|
+  | Base | 11.27, 10.02, 10.43 | 7.61, 7.54, 7.76 | 2.15, 2.10, 2.13 |
+  | Change | 10.38, 11.61, 10.16 | 8.64, 8.62, 8.56 | 2.11, 2.04, 2.17 |
+
+  The vCPU threads' user time, where the 0.55 seconds of MMIO exits of
+  card #72's F4 would show, does not separate (the samples spread over 1.6
+  seconds). Their system time is 0.8 to 1.1 seconds higher with the change
+  in every round. The disk worker is unchanged. The cause of the added
+  system time is not established. One candidate: the guest now reaches
+  its idle loop before a short request completes, where the exit to
+  userspace used to outlast the request, so each such request adds a halt
+  exit and KVM's halt polling to the vCPU thread.
+
+### Verification
+
+`just ci::check` holds on the card's last commit. The merge bar ignores
+the tests that need KVM, so these ran alone on helios at `2d090d3d`:
+the two KVM doorbell tests, `kvm_tests` and `snapshot_tests` of
+`vmlab-hv-vmm` (37 passed), and `vm_restore` of `vmlab-hv-tests` (2
+passed), which boots Ubuntu
+and restores a snapshot ten times during fsync writes to a virtio-blk
+disk.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD12: find where the added second of vCPU system time of a Windows boot
+  goes (M5), with KVM's halt-poll and exit statistics for both binaries.
+  If it is halt polling, the kick could stay synchronous for a queue
+  whose requests complete from the page cache.
+- FD13: G7 measured 0.7990 here and 0.8652 in card #73 with the same
+  network code. Three repeats do not hold that bar to 0.80.
+
+## Round 7 follow-up: G6 4 KiB random writes (card #73, 2026-11-19)
+
+G6 now passes: vmlab-hv writes 29,592.9 IOPS against QEMU's 18,147.4, a
+ratio of 1.6307. Round 7 measured 13,200.5 against 17,723.0.
+
+### Cause
+
+The gate runs the random write after it removes the 512 MiB file of the
+sequential write. The Ubuntu template mounts `/` with `discard` (checked
+in the guest), so the removal reaches the disk as discards of up to 8,192
+clusters. QEMU ignores discards with
+this argv. vmlab-hv frees the clusters. A freed cluster must not be handed
+out before the flush that makes the removal of its mapping durable, and
+since `30d3ba7a` (2026-11-10, between rounds 6 and 7) such *retired*
+clusters stayed in the qcow2 free map, where every allocation stepped over
+all of them, lowest first, with one hash lookup each. The random write
+allocates about 11,600 new clusters and sends no flush until its end.
+
+- F1, the walk. With the gate's order, 36% of the user-space instruction
+  samples of the vmlab-hv process (`bench/ipsample.c`, all threads) were in
+  that hash lookup. The disk worker used 0.57 to 0.59 seconds of user CPU
+  for the 20,000 writes. With the fix it uses 0.02 to 0.03.
+- F2, the order decides. On a fresh VM that runs only the random write,
+  vmlab-hv at `34e39e6c` wrote 31,131 IOPS. After the gate's earlier block
+  workloads the same binary wrote 13,643 to 16,568 in six runs. QEMU wrote
+  15,580 alone and 8,581 to 18,106 after the earlier workloads.
+- F3, not the cause: the queue notification (FD6, card #98). The wake of
+  the disk worker from the vCPU thread is 6% to 8% of the same samples with
+  and without the walk. Card #98 stays open. The round-7 binary and the
+  binary of `next` measured the same (5,082 to 15,513 against 15,332 to
+  16,568, three runs each on a loaded host), so the changes of card #71
+  did not move G6 either. Its rerun of 0.9845 and round 7's 0.7448 are one
+  state: the walk put vmlab-hv at about QEMU's rate, and host noise decided
+  the side of 0.80.
+
+### Fix
+
+Retired clusters stay out of the free map. The scan that fills the map
+skips them, and the flush clears the list and resets the scan as before,
+which then finds them as ordinary holes. The order of allocation is
+unchanged. The scan also reads the cached refcount block in place: it ran
+on every allocation and copied the 64 KiB block each time. A unit test
+discards 32 clusters and checks that none is reused or in the map before
+the flush, and that the lowest is reused after it.
+
+Diagnostic runs of the gate's block sequence on the shared host, one VM at
+a time, QEMU, fix, base in turn:
+
+| Build | Random write 4 KiB (IOPS) | Disk worker user CPU (s) |
+|---|---|---|
+| QEMU 11.1.3 | 16,601.5, 10,913.8 | n/a |
+| vmlab-hv at `34e39e6c` | 16,447.7, 13,642.9 | 0.58, 0.59 |
+| vmlab-hv with the fix | 30,226.0, 28,523.0 | 0.03, 0.02 |
+
+### Quiet-window rerun
+
+The rerun used round 7's method on helios from
+`2850c4543db2d7407f972ca5b0abc7af464c8e2e`: `bench/run.py --arch x86_64
+--guest ubuntu-26.04 --repeats 3`, all three QEMU repeats and then all
+three vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Ubuntu 26.04.3. QEMU was
+11.1.3. The release vmlab-hv binary SHA-256 was
+`3f91d729c8c029972686ce55b5f45cb3b215b0a275036e17a23aa89d3f6cb72a` and the
+iPXE ROM was
+`9bfcf6535d787e2083d65ee201d414669c7493e7dbdf52953a9513b6481af8a0`.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 125 samples at
+five-second intervals from 01:04:17 to 01:14:38 UTC on 2026-11-19. The
+one-minute load ranged from 0.67 to 2.19, the five-minute load from 1.14
+to 1.49 and the fifteen-minute load from 1.43 to 1.68. The opticlang pause
+was not confirmed. The host's I/O pressure (`/proc/pressure/io`, some)
+read 67% to 83% with no VM running, before the window. Logs, hashes, the
+diagnostic scripts and their raw results remain on helios under
+`/home/vmlab/src/stc/logs/d28-card-73/`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G6 | Random write 4 KiB (IOPS) | 11914.1, 18147.4, 18315.6 | 18147.40 | 32167.5, 10732.9, 29592.9 | 29592.90 | 1.6307 | PASS |
+
+One repeat of each backend is slow. QEMU's first repeat also wrote
+sequentially at 176 MiB/s against 1,500 and 1,636 in the other two. The
+second vmlab-hv repeat has no other slow workload, and its cause is not
+established. The verdict uses the medians, as every round does.
+
+The same runs measure the other single-VM workloads. Their cards own the
+verdicts:
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Round 7 |
+|---|---|---:|---:|---:|---:|
+| G1 | Ubuntu boot (s) | 6.55 | 6.40 | 0.9771 | 1.0500 |
+| G3 | Sequential read (MiB/s) | 18670.33 | 20527.83 | 1.0995 | 1.1071 |
+| G4 | Sequential write (MiB/s) | 1500.12 | 4011.44 | 2.6741 | 2.6338 |
+| G5 | Random read 4 KiB (IOPS) | 51404.30 | 68653.40 | 1.3356 | 1.3979 |
+| G7 | UDP TX (Mbit/s) | 31342.44 | 27116.01 | 0.8652 | 0.7266 |
+| G8 | UDP RX (Mbit/s) | 85529.15 | 107336.73 | 1.2550 | 1.2490 |
+
+Idle host CPU was 1.08% of one core on QEMU and 2.05% on vmlab-hv. All 16
+aggregate records and their samples are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl). The vmlab-hv records are
+marked dirty because the QEMU run had appended to that tracked file.
+Windows boot (G2) and the guest-to-guest pair were not run.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD9: a write that allocates a cluster writes the whole 64 KiB cluster.
+  The 20,000 random writes carry 82 MB of guest data. vmlab-hv wrote
+  758 MB to the host file for them (`write_bytes` of `/proc/<pid>/io`,
+  11,571 clusters), QEMU 90 to 102 MB: QEMU zeroes a new cluster through
+  the host file system and writes only the guest's bytes. The cost did not
+  show in G6 after the fix. It is about nine times the dirty page cache
+  for a guest that writes small blocks to new space.
+- FD10: vmlab-hv acts on guest discards where QEMU, with vmlab's argv,
+  ignores them. A discarded cluster's mapping is cleared, so a later read
+  of it returns the backing file's content, not zeros and not the last
+  written data. VIRTIO leaves the content after a discard undefined. Decide
+  whether the cluster should read as zeros (the qcow2 zero flag), as QEMU's
+  `discard=unmap` does for an image with a backing file.
+- FD11: QEMU's random write fell from 30,948 IOPS in round 5 to 17,723 in
+  round 7 on the same template, and its sequential write from 4,769 MiB/s
+  in round 6 to 1,480. QEMU went from 11.1.2 to 11.1.3 in between. The
+  cause is not established. The I/O pressure reading above is a place to
+  start.
+
+## Round 7 follow-up: G2 Windows 10 boot (card #72, 2026-11-19)
+
+G2 still fails: vmlab-hv boots Windows 10 in 96.69 seconds against QEMU's
+94.96, a ratio of 1.0182. Round 7 measured 103.11 against 89.93. No runtime
+change is merged. The round-7 ratio of 1.1466 was not reproduced with any
+binary, including round 7's own.
+
+### Rerun
+
+The rerun used round 7's method on helios from
+`e10780873d648d8a34fb437af22d9cb3262744c7`: `bench/run.py --arch x86_64
+--guest windows-10 --repeats 3`, all three QEMU repeats and then all three
+vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Windows 10 19045.2006.10.
+QEMU was 11.1.3. The firmware was the plain OVMF pair of round 7 (same
+SHA-256), named with `VMLAB_BENCH_OVMF_DIR`, which this card adds because
+the default path is absent on helios. The release vmlab-hv binary SHA-256
+was `8a497fba60ab23d3c44c0ed7b39fe5eb154eeea5c9c80204b57fd7ab0fe12824`.
+That revision used fdatasync where the qcow2 flush uses fsync. The change
+measured as no change (F3 below) and was reverted after the rerun.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 119 samples at
+five-second intervals from 22:17:45 to 22:27:35 UTC on 2026-11-18. The
+one-minute load ranged from 1.29 to 3.79, the five-minute load from 1.72
+to 2.45 and the fifteen-minute load from 1.71 to 2.07. The booting guest
+itself accounts for one to three of that. The opticlang pause was not
+confirmed. Logs, hashes, the diagnostic scripts and their raw results
+remain on helios under `/home/vmlab/src/stc/logs/d28-card-72.r8b/`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G2 | Windows 10 boot (s) | 94.96, 97.76, 88.33 | 94.96 | 96.69, 98.61, 95.92 | 96.69 | 1.0182 | FAIL |
+
+Both aggregate records are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl).
+
+### Diagnostic cohorts
+
+Before the rerun, 71 diagnostic boots ran the same readiness sequence
+(`run.wait_x86_ready`) one at a time, with the backend order rotated each
+round. They also recorded the guest's own event log, per-thread CPU time
+and, in some boots, KVM statistics. These are not gate records.
+
+| Cohort | Backend | Boots to agent ready (s) | Median | Launch to end of specialize, median (s) | vCPU CPU there, median (s) |
+|---|---|---|---:|---:|---:|
+| 1 | QEMU 11.1.3 | 83.32, 89.30, 89.73, 90.65, 94.21 | 89.73 | 53.6 | 46.8 |
+| 1 | vmlab-hv at `9572cdba` | 89.43, 91.38, 92.69, 94.38, 97.11 | 92.69 | 54.7 | 48.8 |
+| 1 | vmlab-hv at round 7, `82bec6b5` | 89.23, 90.23, 91.23, 91.73, 93.34 | 91.23 | 54.4 | 50.5 |
+| 2 | QEMU 11.1.3 | 83.23, 87.43, 88.46, 96.85 | 87.94 | 52.8 | 47.1 |
+| 2 | vmlab-hv at `9572cdba` | 88.32, 96.88, 97.56, 97.88 | 97.22 | 55.0 | 49.1 |
+| 2 | vmlab-hv with fdatasync | 87.97, 88.52, 89.49, 89.50 | 89.00 | 55.1 | 49.5 |
+| 3 | QEMU 11.1.3 | 84.26, 88.59, 89.26, 96.93 | 88.93 | 52.6 | 47.0 |
+| 3 | vmlab-hv with fdatasync | 91.45, 93.99, 97.19, 97.57 | 95.59 | 55.2 | 48.9 |
+
+The round-7 binary measured 1.017 times QEMU in cohort 1, and the binary
+of `next` 1.033. "End of specialize" is the guest's event 1074 from
+winlogon, on the guest clock, which starts from the host's.
+
+### Findings
+
+- F1, the result moves in steps of about five seconds. The readiness
+  sequence probes every 5 seconds while the agent answers and every 8
+  while it does not, in three stages (marker, OOBE, reboot). The samples
+  of all backends fall near 84, 89, 94, 98 and 103 seconds. A backend that
+  is two seconds behind lands on the same step or on the next one, so
+  three samples cannot place a ratio within 5%.
+- F2, a quarter of the boot is host sync time, and it is not steady. One
+  boot sends 8,500 to 9,700 flushes. QEMU answered them with 5,250 to
+  5,970 fdatasync calls that took 23.8 to 28.7 seconds. vmlab-hv ran 5,950
+  to 6,170 syncs that reached the disk, 22.9 to 33.8 seconds. The time of
+  1,500 in-place 4 KiB sync writes in a Linux guest ranged from 5.9 to
+  14.5 seconds between runs of one binary minutes apart.
+- F3, the sync path is at parity. Those 1,500 writes cost 1,500 host
+  syncs on both backends, and 1,500 appending writes about 3,600 on both:
+  QEMU orders refcounts and data before mappings with a second sync, as
+  the qcow2 flush here does. The times overlap: QEMU 5.9 to 9.0 seconds,
+  vmlab-hv 5.9 to 14.5 with fsync and 6.1 to 12.0 with fdatasync. Three
+  candidate changes were built and measured, and none is merged.
+  Answering the flushes of one batch with one sync did nothing: Windows
+  queued no request behind any of 8,714 flushes. Dropping the third sync
+  of each flush removed 8,700 calls that cost 0.016 seconds together, and
+  fdatasync in place of fsync changed no time. Ignoring guest discards,
+  as QEMU does with this argv, removed about 160 of 1,280 second syncs
+  and showed no boot change.
+- F4, vmlab-hv reaches the end of the specialize pass 1.1 to 2.6 seconds
+  after QEMU, by the cohort medians, and its vCPU threads have used 1.9
+  to 2.4 seconds more CPU by then. This difference repeats in all three
+  cohorts. Its cause is not established. KVM exit counts are close to
+  QEMU's, 2.31 million against 2.28 million in one boot each, except that
+  vmlab-hv has 200,000 more MMIO exits. A vCPU thread spends 3.0 seconds
+  of one boot outside `KVM_RUN` after an exit. 1.4 seconds are about
+  2,400 virtio-gpu queue notifications of 0.58 ms each: the 2D transfer
+  and flush commands run on the vCPU thread, and each flush composes and
+  compares the whole frame. 0.55 seconds are 150,000 MMIO writes of 2 to
+  10 microseconds, 120,000 of them virtio-blk queue notifications. QEMU
+  serves both off the vCPU thread, through an ioeventfd and its main
+  loop. Serving the GPU queue on a worker thread was tried and is not
+  merged: the vCPU thread's CPU time in MMIO writes fell from 2.0 to 0.65
+  seconds, but its wall time stayed at 1.3 seconds, for a reason that was
+  not found, and the four boots (83.64 to 95.09) do not separate from the
+  others.
+- F5, checked and equal on both backends: the guest's CPU topology and
+  model, the PnP device list, and the parallel port registers, which the
+  guest polls 410,000 times a boot. Checked and cheap in vmlab-hv: the
+  flushes that follow no write (3,894 of 8,722, 0.015 seconds together)
+  and the configuration writes through ECAM (2,254, 0.034 seconds
+  together behind the all-vCPU barrier).
+
+### Follow-ups
+
+FD5, FD6 and FD7 are cards now. FD8 is a decision that waits for the
+operator.
+
+- FD5 (card #97): serve virtio-gpu 2D commands off the vCPU thread, and compose a
+  frame once per published frame, not once per flush command. Up to 1.4 seconds of a
+  Windows boot.
+- FD6 (card #98): wake the virtio-blk worker from an ioeventfd, not from a userspace
+  MMIO exit. Up to 0.5 seconds of a Windows boot, and every block
+  workload.
+- FD7 (card #96): G2 cannot resolve 2% as it is measured. Either probe readiness
+  every second in the benchmark, or alternate the backends and take more
+  than three repeats, and record a host sync-latency probe beside each
+  boot.
+- FD8: the owner accepted G1 at 1.003 in round 6. G2 at 1.02, with a
+  spread of 9 seconds on the QEMU side, is a candidate for the same
+  decision. No card: the lead asked the operator, and the answer is open.
+
+## Round 7 follow-up: G1 Ubuntu boot (card #71, 2026-11-18)
+
+G1 now passes: vmlab-hv boots Ubuntu in 6.36 seconds against QEMU's 6.51,
+a ratio of 0.9770. Round 7 measured 6.93 against 6.60.
+
+### Where the time went
+
+Guest serial output, per-thread CPU time, `/proc/<pid>/io` and KVM's own
+vCPU statistics (`KVM_GET_STATS_FD` for vmlab-hv, QMP `query-stats` for
+QEMU) split the round-7 boot into phases. The Linux kernel and userspace
+were not slower: the agent started at 4.85 seconds of guest time under
+vmlab-hv and 5.03 under QEMU. The whole gap sat before the first kernel
+line on the serial port: 1.86 to 2.00 seconds under vmlab-hv, 1.46 to 1.56
+under QEMU. SeaBIOS took the same time on both. GRUB's 88 MiB of disk reads
+took 1.07 seconds against 0.80, and the kernel's decompression 0.27 against
+0.16.
+
+GRUB reads through SeaBIOS in about 5,500 calls of 16 KiB. Each call enters
+SeaBIOS's 32-bit code through four SMIs and through legacy mode switches.
+Three causes were found there. No single one closes the gap.
+
+- F1, RTC index port. A read of port 0x70 returned the CMOS index. QEMU
+  returns 0xff, checked in a guest on both backends. SeaBIOS reads the port
+  before each legacy mode switch, and a clear bit 7 makes it mask NMI and
+  restore it. That was 20 port exits for each disk call against QEMU's 12.
+  The index ports (0x70, 0x72, 0x74, 0x76) now read 0xff.
+- F2, 4 KiB nested pages for low RAM. q35's main low region starts at guest
+  address 1 MiB and had its own anonymous mapping at an address the kernel
+  chose. KVM uses 2 MiB pages for a memslot only when the host and guest
+  addresses are equal modulo 2 MiB, so the low 2 GiB was mapped 4 KiB at a
+  time: about 3,270 nested page faults per 100 ms during GRUB against 7
+  under QEMU, 22,000 for the 88 MiB. Decompression touches fresh pages the
+  same way. Each anonymous region is now placed congruent with its guest address. The
+  mapping stays owned by vm-memory. A region that cannot be placed keeps
+  its plain mapping.
+- F3, SMI kicks. Every SMI signalled every vCPU thread, although without
+  broadcast the only target is the vCPU that raised it. The halted second
+  vCPU left `KVM_RUN` 22,000 times and spent 1.1 seconds of host kernel
+  time during GRUB. An SMI whose only target is its issuer now signals no
+  thread.
+
+Diagnostic boots after each step, one to three per build, on the shared
+host. One QEMU boot slowed by statistics polling is left out:
+
+| Build | First kernel line (s) | Boot to agent ready (s) |
+|---|---|---|
+| QEMU 11.1.3 | 1.46 to 1.56 | 6.56 to 6.78 |
+| vmlab-hv at round 7 | 1.86 to 2.00 | 6.85 to 6.99 |
+| F3 only | 1.81 to 1.87 | 6.79 to 6.86 |
+| F3 and F1 | 1.66 to 1.75 | 6.67 to 6.80 |
+| F3, F1 and F2 | 1.41 to 1.47 | 6.39 to 6.48 |
+
+### Quiet-window rerun
+
+The rerun used round 7's method on helios from
+`45558cb1811443e4e3fc726991eb20a80425412c`: `bench/run.py --arch x86_64
+--guest ubuntu-26.04 --repeats 3`, all three QEMU repeats and then all
+three vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Ubuntu 26.04.3. QEMU was
+11.1.3. The release vmlab-hv binary SHA-256 was
+`5b99c245498fe33920e636aab2fddd1347c7ca56edee82ca1c12b5e50f9154a8` and the
+iPXE ROM, rebuilt from this revision, was
+`66308ed2100e05385a600baae371e9e69675e4bd0b287f4e57bfce04c4e8b727`.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 125 samples at
+five-second intervals from 17:35:15 to 17:45:35 UTC. The one-minute load
+ranged from 0.58 to 1.68, the five-minute load from 1.00 to 1.49 and the
+fifteen-minute load from 1.09 to 1.23. The opticlang pause was not
+confirmed. Logs, hashes and the diagnostic scripts remain on helios under
+`/home/vmlab/src/stc/logs/d28-card-71.r8a/`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G1 | Ubuntu boot (s) | 6.51, 6.54, 6.48 | 6.51 | 6.38, 6.36, 6.34 | 6.36 | 0.9770 | PASS |
+
+Every vmlab-hv sample is below every QEMU sample.
+
+The same runs measure the other single-VM workloads. Their cards own the
+verdicts (#73, #74). The values are recorded here because F2 changes how
+all low guest RAM is mapped:
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Round 7 |
+|---|---|---:|---:|---:|---:|
+| G3 | Sequential read (MiB/s) | 18473.58 | 20967.17 | 1.1350 | 1.1071 |
+| G4 | Sequential write (MiB/s) | 1488.03 | 3065.61 | 2.0602 | 2.6338 |
+| G5 | Random read 4 KiB (IOPS) | 50452.60 | 70349.60 | 1.3944 | 1.3979 |
+| G6 | Random write 4 KiB (IOPS) | 17263.90 | 16996.50 | 0.9845 | 0.7448 |
+| G7 | UDP TX (Mbit/s) | 36694.70 | 25056.39 | 0.6828 | 0.7266 |
+| G8 | UDP RX (Mbit/s) | 86395.98 | 109299.92 | 1.2651 | 1.2490 |
+
+Idle host CPU was 0.93% of one core on QEMU and 1.97% on vmlab-hv. All 16
+aggregate records and their samples are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl). The vmlab-hv records are
+marked dirty because the QEMU run had appended to that tracked file.
+Windows boot (G2) and the guest-to-guest pair were not run.
+
+### Verification
+
+Unit tests cover the three changes: the index ports read 0xff and keep the
+selected register, a q35 layout's anonymous regions are congruent with
+their guest addresses, and an SMI for its issuer alone interrupts no
+registered vCPU thread while one raised by another vCPU does. The SMI test
+needs KVM. It ran on helios outside the merge bar, which ignores KVM tests.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD1: RAM backed by the shared memfd (a machine with virtio-fs shares, and
+  every pc machine) still gets 4 KiB nested pages. It needs shmem huge
+  pages, which depend on the host's `shmem_enabled` setting and on
+  `MADV_HUGEPAGE`.
+- FD2: anonymous guest RAM is not marked `MADV_HUGEPAGE`. QEMU marks it. On
+  a host with transparent huge pages set to `madvise`, vmlab-hv would get
+  none. helios runs `always`.
+- FD3: vmlab-hv answers ports 0x72 to 0x77 with an extended CMOS bank and
+  aliases. QEMU's q35 reads 0xff on all six.
+- FD4: each SMI still pays one extra `KVM_RUN` with `immediate_exit` to
+  complete the APMC write, about 22,000 during this boot.
+
+## Round 7 full quiet-host window (2026-11-18)
+
+Card #32 ran the full x86_64 KVM suite on helios from
+`82bec6b52c422a8313849f0496fdca4b989ad400`. The board reserved the window
+for this card. Admission found zero project VMs at the start and after
+the run. The log records host load. The opticlang pause was unconfirmed.
+
+Each backend completed three fresh-overlay repeats for Ubuntu 26.04.3
+(full and guest-to-guest) and Windows 10 19045.2006.10 (standard variant,
+boot only). Within each configuration all QEMU repeats ran before the
+vmlab-hv repeats. Single-VM runs used CPUs 16–23 and the TCP pair used
+16–19 and 20–23. The governor was set to performance and VM scopes had a
+24 GiB cap with swap disabled. QEMU was 11.1.3. The release vmlab-hv binary
+SHA-256 was `a7eea151afd10d8e589a854052691f53d34fdfa710989a95154f3f8218fc3ae9`.
+The iPXE ROM SHA-256 was
+`d16c126333662d3cd6127d9ef27c463a04de263d7edbde200441c2c58bf4153e`.
+
+The first Windows attempts stopped before VM launch because the runner's
+default OVMF path was absent. Both retries used the same plain OVMF pair
+from the published v0.46.1-alpha guest bundle retained by the q35 soak.
+The CODE SHA-256 was
+`29ae4bcaea971a66df26493f294a786986dcce482e3109e45634b951c362cf26`
+and the VARS SHA-256 was
+`5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e`.
+All six measured configurations and `bench/report.py --arch x86_64`
+completed successfully.
+
+The monitor took 298 samples at five-second intervals from 10:43:08 to
+11:07:54 UTC. Load averages (1, 5, and 15 minutes) started at
+1.38, 1.27, and 2.12 and ended at 1.87, 1.79, and 1.78. The sampled
+ranges were 0.45–3.15, 0.90–2.13, and 1.53–2.16. The runner logs and both
+load logs remain on helios under
+`/home/vmlab/src/stc/logs/d28-vml-13.n9E4VicG/`.
+
+Boot requires a median ratio at most 1.00. Throughput requires at least
+0.80. Verdicts use the ratios before rounding.
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---:|---:|---:|---|
+| G1 | Ubuntu boot (s) | 6.60 | 6.93 | 1.0500 | FAIL (card #71) |
+| G2 | Windows 10 boot (s) | 89.93 | 103.11 | 1.1466 | FAIL (card #72) |
+| G3 | Sequential read (MiB/s) | 15505.99 | 17166.19 | 1.1071 | PASS |
+| G4 | Sequential write (MiB/s) | 1480.02 | 3898.07 | 2.6338 | PASS |
+| G5 | Random read 4 KiB (IOPS) | 50750.00 | 70941.20 | 1.3979 | PASS |
+| G6 | Random write 4 KiB (IOPS) | 17723.00 | 13200.50 | 0.7448 | FAIL (card #73, closed above) |
+| G7 | UDP TX (Mbit/s) | 35457.47 | 25763.87 | 0.7266 | FAIL (card #74) |
+| G8 | UDP RX (Mbit/s) | 86199.69 | 107667.66 | 1.2490 | PASS |
+| G9 | TCP A to B (Mbit/s) | 26851.93 | 31155.99 | 1.1603 | PASS |
+| G10 | TCP B to A (Mbit/s) | 26498.21 | 31063.02 | 1.1723 | PASS |
+
+Idle host CPU was 0.95% of one core on QEMU and 1.93% on vmlab-hv.
+D28 sets no idle CPU threshold. The QEMU sequential-write median
+fell from 4,769.18 MiB/s in round 6 to 1,480.02 MiB/s here, so the wider
+passing margin reflects a lower QEMU baseline.
+
+All 22 aggregate records and their raw samples are appended to
+[`history/x86_64.jsonl`](history/x86_64.jsonl). The runner marks later
+configurations dirty because earlier configurations had already appended
+to that tracked file. Both backends used the source revision above.
 
 ## Round 6 owner decisions (2026-11-02)
 

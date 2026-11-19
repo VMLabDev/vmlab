@@ -723,6 +723,7 @@ pub fn build(
             |chipset| chipset.irq_source(id, gsi),
         )
     };
+    let doorbell_vm = kvm.vm.clone();
     let wiring = |address: Option<PciAddress>,
                   vectors: u16,
                   transitional: bool|
@@ -745,6 +746,7 @@ pub fn build(
             },
             msix_vectors: vectors,
             transitional: firmware_machine && transitional,
+            doorbells: Some(Box::new(crate::kvm::KvmDoorbells::new(doorbell_vm.clone()))),
         })
     };
     let place = |function: Arc<Mutex<dyn vmlab_hv_devices::PciDevice>>,
@@ -1031,6 +1033,9 @@ pub fn build(
                 vga.lock()
                     .enable_3d(mode, node, mapper)
                     .map_err(|e| VmmError::Other(e.to_string()))?;
+            }
+            if let Some(doorbells) = transport.doorbells {
+                vga.lock().set_queue_doorbells(doorbells);
             }
             place(vga.clone(), Some(display.pci))?;
             snap_nodes.push(DeviceNode::Resettable(vga.clone()));
@@ -1651,17 +1656,27 @@ pub fn build(
 
     if pc {
         let mut disks = [None; 4];
+        let mut translations = [None; 4];
         for disk in desc
             .disks
             .iter()
             .filter(|disk| disk.bus == DiskBus::Ide && !disk.cdrom)
         {
             let image = snap_disks.iter().find(|image| image.id == disk.id).unwrap();
-            disks[(disk.channel.unwrap() * 2 + disk.unit.unwrap()) as usize] =
-                Some(image.image.lock().size() / 512);
+            let drive = (disk.channel.unwrap() * 2 + disk.unit.unwrap()) as usize;
+            let mut image = image.image.lock();
+            let sectors = image.size() / 512;
+            let mut mbr = [0; 512];
+            let mbr = image.read_at(0, &mut mbr).ok().map(|()| &mbr);
+            disks[drive] = Some(sectors);
+            translations[drive] = Some(vmlab_hv_devices::chipset::rtc::ChsTranslation::for_disk(
+                sectors, mbr,
+            ));
         }
+        let rtc = &chipset.as_ref().unwrap().rtc;
+        rtc.lock().set_disk_translations(translations);
         let cd_first = desc.disks.iter().any(|disk| disk.cdrom);
-        chipset.as_ref().unwrap().rtc.lock().configure_pc(
+        rtc.lock().configure_pc(
             disks,
             cd_first,
             desc.vcpus as u8,

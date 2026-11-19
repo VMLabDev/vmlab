@@ -83,6 +83,9 @@ pub struct PciWiring {
     pub intx: Option<Arc<dyn IrqLine>>,
     pub transitional: bool,
     pub msix_vectors: u16,
+    /// Kernel delivery of queue kicks for a virtio transport, where the
+    /// machine has it.
+    pub doorbells: Option<Box<dyn vmlab_hv_devices::QueueDoorbells>>,
 }
 
 /// Produces the device models a machine description names.

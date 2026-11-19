@@ -215,6 +215,7 @@ FEATURES: dict[str, str] = {
     "vm.legacy.windows98": "Windows 98 SE: agent, exec, disk roundtrip, display and stop",
     "vm.legacy.windows7": "Windows 7 7600.0.1: agent, exec, disk roundtrip, display and stop",
     "vm.legacy.templeos": "TempleOS: HolyC agent, exec, disk roundtrip, display and stop",
+    "vm.legacy.server2016": "Windows Server 2016: exec after agent readiness and online restore",
     "vm.macos": "macOS Tahoe on the `macos` profile: the selected hypervisor, agent, exec, display and stop",
 }
 
@@ -302,7 +303,8 @@ _GROUPS: dict[str, list[str]] = {
     "3": ["arch.emulated"],
     # The legacy PC: floppy controller, SMB1 guests.
     "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1",
-          "vm.legacy.freedos", "vm.legacy.windows98", "vm.legacy.windows7", "vm.legacy.templeos"],
+          "vm.legacy.freedos", "vm.legacy.windows98", "vm.legacy.windows7", "vm.legacy.templeos",
+          "vm.legacy.server2016"],
 }
 
 # Scenarios whose VMs stay on QEMU on a vmlab-hv run, and why.

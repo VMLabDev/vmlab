@@ -16,7 +16,7 @@ mod memory;
 mod softfloat;
 mod value;
 pub use cpu::{Privilege, Riscv64, SpecializationStats, TraceProfile};
-pub use memory::{CodeStamp, FlatMemory, Memory, SharedMemory};
+pub use memory::{CodeStamp, FlatMemory, Memory, RESERVATION_GRANULE, SharedMemory};
 use num_bigint::BigUint;
 use std::collections::BTreeMap;
 pub use value::Value;
@@ -48,6 +48,22 @@ pub enum Error {
 
 type Frame = BTreeMap<String, Value>;
 
+/// The IR operations one guest instruction may take before `Error::Limit`.
+pub const STEP_OPERATION_BUDGET: u64 = 100_000_000;
+
+/// The most guest console output an interpreter keeps. A guest can print
+/// without end, so the oldest bytes are dropped past this many.
+pub const TERMINAL_LIMIT: usize = 1 << 20;
+
+/// What one hart reserved with LR: the address and length of the access, and
+/// the write generation of its reservation granules at the time of the read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reservation {
+    address: u64,
+    len: usize,
+    generation: u64,
+}
+
 #[derive(Default)]
 pub struct Profile {
     /// Function name -> (calls, exclusive operations, inclusive operations).
@@ -60,16 +76,24 @@ pub struct Interpreter<'a, M> {
     pub globals: Globals,
     pub memory: M,
     pub operations: u64,
+    /// The value of `operations` past which execution fails with
+    /// `Error::Limit`. `arm_operation_budget` moves it ahead of the counter.
     pub operation_limit: u64,
+    /// The budget `arm_step_budget` arms: what one guest instruction may take.
+    pub step_operation_budget: u64,
     pub diagnostics: std::collections::VecDeque<String>,
-    pub terminal: Vec<u8>,
+    /// The newest guest console output, at most `terminal_limit` bytes.
+    pub terminal: std::collections::VecDeque<u8>,
+    pub terminal_limit: usize,
+    /// Console bytes dropped from the front of `terminal` to stay in the limit.
+    pub terminal_dropped: u64,
     pub profile: Option<Profile>,
     pub memoize: bool,
     pub indexed: bool,
     indexed_cache: BTreeMap<String, std::sync::Arc<indexed::Compiled>>,
     memo: BTreeMap<String, memo::Memo>,
     depth: u32,
-    reservation: Option<(u64, u64)>,
+    reservation: Option<Reservation>,
     fetch_address: Option<u64>,
     decode_cache: BTreeMap<decode::CacheKey, Value>,
     decode_dependencies: decode::Dependencies,
@@ -90,9 +114,12 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             globals: Globals::default(),
             memory,
             operations: 0,
-            operation_limit: 100_000_000,
+            operation_limit: STEP_OPERATION_BUDGET,
+            step_operation_budget: STEP_OPERATION_BUDGET,
             diagnostics: std::collections::VecDeque::new(),
-            terminal: Vec::new(),
+            terminal: std::collections::VecDeque::new(),
+            terminal_limit: TERMINAL_LIMIT,
+            terminal_dropped: 0,
             profile: None,
             memoize: true,
             indexed: true,
@@ -281,14 +308,49 @@ impl<'a, M: Memory> Interpreter<'a, M> {
         Ok(())
     }
 
+    /// Arm the operation budget: the next `budget` IR operations may run, then
+    /// execution fails with `Error::Limit`. A caller that runs guest
+    /// instructions arms it per instruction, so the budget bounds one
+    /// instruction's work and never the lifetime of the guest.
+    pub fn arm_operation_budget(&mut self, budget: u64) {
+        self.operation_limit = self.operations.saturating_add(budget);
+    }
+
+    /// Arm `step_operation_budget` for the guest instruction about to run.
+    pub fn arm_step_budget(&mut self) {
+        self.arm_operation_budget(self.step_operation_budget);
+    }
+
+    fn terminal_write(&mut self, byte: u8) {
+        if self.terminal_limit == 0 {
+            self.terminal_dropped += 1;
+            return;
+        }
+        while self.terminal.len() >= self.terminal_limit {
+            self.terminal.pop_front();
+            self.terminal_dropped += 1;
+        }
+        self.terminal.push_back(byte);
+    }
+
+    /// Whether this hart's reservation is still intact: no write has landed in
+    /// its reservation granules since the exclusive read.
+    pub(crate) fn reservation_intact(&self) -> Option<Reservation> {
+        self.reservation.filter(|reservation| {
+            self.memory
+                .reservation_generation(reservation.address, reservation.len)
+                == reservation.generation
+        })
+    }
+
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value> {
         if name == "zplat_term_write" {
             let byte = args
                 .first()
                 .ok_or_else(|| Error::Type("terminal argument".into()))?
                 .u64()?;
-            self.terminal
-                .push(u8::try_from(byte).map_err(|_| Error::Type("terminal byte".into()))?);
+            let byte = u8::try_from(byte).map_err(|_| Error::Type("terminal byte".into()))?;
+            self.terminal_write(byte);
             return Ok(Value::Unit);
         }
         if name.starts_with("zriscv_") {
@@ -597,9 +659,9 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             bytes.resize(len, 0);
             let result = if exclusive {
                 match self.reservation.take() {
-                    Some((reserved, generation)) if reserved == address => self
+                    Some(reservation) if reservation.address == address => self
                         .memory
-                        .store_conditional(address, &bytes[..len], generation)?,
+                        .store_conditional(address, &bytes[..len], reservation.generation)?,
                     _ => false,
                 }
             } else {
@@ -621,7 +683,11 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             let mut bytes = vec![0; len];
             if exclusive {
                 let generation = self.memory.load_reserved(address, &mut bytes)?;
-                self.reservation = Some((address, generation));
+                self.reservation = Some(Reservation {
+                    address,
+                    len,
+                    generation,
+                });
             } else {
                 self.memory.read(address, &mut bytes)?;
             }

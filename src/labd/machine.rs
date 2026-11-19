@@ -47,7 +47,7 @@ use super::events::EventLog;
 use super::guest_os::GuestOs;
 use super::state::MachineState;
 use super::vm::PowerState;
-use super::vm_agent::AgentHandle;
+use super::vm_agent::{AgentHandle, Greeting};
 use crate::sync::LockRecover;
 
 /// The status vocabulary this seam reports in. Declared with the projection
@@ -132,6 +132,8 @@ pub trait LabServices: Send + Sync + 'static {
         &self,
         _machine: &str,
         _kind: crate::config::hypervisor::HypervisorKind,
+        _migrating: bool,
+        _output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         Ok(())
     }
@@ -349,7 +351,11 @@ pub trait Machine: Send + Sync + 'static {
     /// The kind-specific work — a template clone and segment attachments for a
     /// VM, an image spec for a container — is implementation. What both need
     /// from the lab arrives through [`LabServices`].
-    async fn start(self: Arc<Self>, lab: Arc<dyn LabServices>) -> Result<()>;
+    async fn start(
+        self: Arc<Self>,
+        lab: Arc<dyn LabServices>,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()>;
 
     /// Roll this machine back to `snap` (PRD §7.3).
     ///
@@ -631,6 +637,12 @@ pub trait Machine: Send + Sync + 'static {
         None
     }
 
+    /// The QEMU removal warning this machine earns: an x86 guest that runs
+    /// on QEMU, why, and the fix. Its online snapshots are the lab's to add.
+    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
+        None
+    }
+
     // ---- host USB passthrough (PRD §5.2.1) ---------------------------------
 
     /// Whether this machine can take a host USB device now: running, and
@@ -836,6 +848,7 @@ impl dyn Machine {
             recording: None,
             hypervisor: self.hypervisor(),
             hypervisor_fallback: self.hypervisor_fallback(),
+            qemu_removal: self.qemu_removal(),
             detail,
         }
     }
@@ -1057,6 +1070,12 @@ enum Backoff {
 /// template rebuild, a container wants its guest boot asset rebuilt — so
 /// [`connect`](Self::connect) takes the hint rather than owning one.
 pub(super) struct AgentSlot {
+    /// Whether the channel is ISA serial, where the guest speaks first
+    /// ([`Greeting::GuestFirst`]).
+    guest_first: std::sync::atomic::AtomicBool,
+    /// When a silent ISA-serial guest last got a fallback hello, so an
+    /// agent-less guest sees one at most every [`LEGACY_HELLO_INTERVAL`].
+    fallback_at: std::sync::Mutex<Option<std::time::Instant>>,
     handle: tokio::sync::Mutex<Option<AgentHandle>>,
     failed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// The version the last successful handshake reported, kept apart from
@@ -1081,6 +1100,8 @@ pub(super) struct AgentSlot {
 impl Default for AgentSlot {
     fn default() -> Self {
         Self {
+            guest_first: std::sync::atomic::AtomicBool::new(false),
+            fallback_at: std::sync::Mutex::new(None),
             handle: tokio::sync::Mutex::new(None),
             failed_at: tokio::sync::Mutex::new(None),
             answered: std::sync::Mutex::new(None),
@@ -1104,6 +1125,42 @@ enum Checked<'a> {
 }
 
 impl AgentSlot {
+    pub fn for_transport(transport: crate::profiles::AgentTransport) -> Self {
+        let slot = Self::default();
+        slot.set_transport(transport);
+        slot
+    }
+
+    pub fn set_transport(&self, transport: crate::profiles::AgentTransport) {
+        self.guest_first.store(
+            transport == crate::profiles::AgentTransport::IsaSerial,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// How this handshake may greet the guest. On ISA serial the host waits
+    /// for the guest's first byte, which every current agent sends about
+    /// once a second. An agent sealed into a template before that never
+    /// speaks first, so a silent guest still gets a hello after the wait,
+    /// but only once per [`LEGACY_HELLO_INTERVAL`]: a guest with no agent
+    /// yet (Windows 9x Setup probing COM1 for a mouse) sees a hello rarely,
+    /// and only after a full wait.
+    fn greeting(&self) -> Greeting {
+        if !self.guest_first.load(std::sync::atomic::Ordering::Relaxed) {
+            return Greeting::HostFirst;
+        }
+        let mut last = self.fallback_at.lock_recover();
+        let fallback = last.is_none_or(|at| at.elapsed() >= LEGACY_HELLO_INTERVAL);
+        if fallback {
+            *last = Some(std::time::Instant::now());
+        }
+        Greeting::GuestFirst { fallback }
+    }
+
+    async fn handshake(&self, sock: &Path, timeout: Duration) -> Result<AgentHandle> {
+        AgentHandle::connect_serial(sock, timeout, self.greeting()).await
+    }
+
     /// A slot whose connects wait `grace` on a silent connection, so tests
     /// need not wait out [`PING_GRACE`].
     #[cfg(test)]
@@ -1235,7 +1292,7 @@ impl AgentSlot {
                 .into());
             }
         }
-        match AgentHandle::connect(sock, Duration::from_secs(5)).await {
+        match self.handshake(sock, Duration::from_secs(5)).await {
             Ok(handle) => {
                 *self.failed_at.lock().await = None;
                 self.note_answered(&handle);
@@ -1278,7 +1335,7 @@ impl AgentSlot {
         if agent.is_some() {
             return true;
         }
-        match AgentHandle::connect(sock, Duration::from_secs(2)).await {
+        match self.handshake(sock, Duration::from_secs(2)).await {
             Ok(handle) => {
                 *self.failed_at.lock().await = None;
                 self.note_answered(&handle);
@@ -1362,6 +1419,11 @@ impl AgentSlot {
         *self.answered.lock_recover() = None;
     }
 }
+
+/// The least time between two fallback hellos to a silent ISA-serial guest
+/// ([`AgentSlot::greeting`]): how late an agent that never speaks first can
+/// be found, against how often an agent-less guest has a hello offered.
+pub const LEGACY_HELLO_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a cached connection that missed its first ping still gets to
 /// answer, while it stays open, before a connect replaces it.
@@ -1553,6 +1615,23 @@ mod tests {
     /// cached connection's agent answers its ping only after 3 s hands out
     /// that same connection — its sessions intact — instead of replacing it
     /// at the 2 s mark.
+
+    #[test]
+    fn isa_serial_offers_a_silent_guest_one_fallback_hello_per_interval() {
+        use crate::profiles::AgentTransport;
+        let slot = AgentSlot::for_transport(AgentTransport::IsaSerial);
+        assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: true });
+        // Every probe inside the interval waits for the guest and gives up.
+        for _ in 0..3 {
+            assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: false });
+        }
+        *slot.fallback_at.lock_recover() = Some(std::time::Instant::now() - LEGACY_HELLO_INTERVAL);
+        assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: true });
+        assert_eq!(
+            AgentSlot::for_transport(AgentTransport::VirtioSerial).greeting(),
+            Greeting::HostFirst
+        );
+    }
     #[tokio::test]
     async fn a_connect_keeps_a_slow_agents_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};

@@ -3,6 +3,56 @@
 use crate::{BusDevice, DeviceError, IrqLine, Snapshot};
 use std::sync::Arc;
 
+/// How the BIOS maps an IDE disk's ATA geometry onto INT 13h CHS, as the
+/// two bits per drive in CMOS 0x39 that SeaBIOS reads on this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChsTranslation {
+    None = 0,
+    Lba = 1,
+    Large = 2,
+}
+
+impl ChsTranslation {
+    /// QEMU's choice for a disk of `sectors` whose first sector is `mbr`
+    /// (`None` when it cannot be read). A guest that boots through CHS
+    /// (Windows 95's FAT16 boot sector) finds its system files only under
+    /// the translation its disk was partitioned with, so the partition table
+    /// decides: an entry ending on a head above 15 was written under a
+    /// translating BIOS, one within 16 heads under none. A disk with no
+    /// usable entry gets LBA once it passes 1024 cylinders.
+    pub fn for_disk(sectors: u64, mbr: Option<&[u8; 512]>) -> Self {
+        let cylinders = (sectors / (16 * 63)).clamp(2, 16383);
+        let Some(heads) = mbr.and_then(|mbr| partition_heads(sectors, mbr)) else {
+            return if cylinders <= 1024 {
+                Self::None
+            } else {
+                Self::Lba
+            };
+        };
+        if heads <= 16 {
+            Self::None
+        } else if cylinders * 16 <= 131_072 {
+            Self::Large
+        } else {
+            Self::Lba
+        }
+    }
+}
+
+/// The head count the first usable partition entry implies, taking it to end
+/// on a cylinder boundary.
+fn partition_heads(sectors: u64, mbr: &[u8; 512]) -> Option<u64> {
+    if mbr[510..] != [0x55, 0xaa] {
+        return None;
+    }
+    mbr[446..510].as_chunks::<16>().0.iter().find_map(|entry| {
+        let heads = u64::from(entry[5]) + 1;
+        let per_track = u64::from(entry[6] & 63);
+        let used = entry[12..16] != [0; 4] && entry[5] != 0 && per_track != 0;
+        (used && (1..=16383).contains(&(sectors / (heads * per_track)))).then_some(heads)
+    })
+}
+
 /// Register at I/O 0x70..=0x77. Advance with elapsed running guest time.
 pub struct Rtc {
     cmos: [u8; 256],
@@ -99,6 +149,14 @@ impl Rtc {
             .map(|byte| u16::from(*byte))
             .sum();
         self.cmos[0x2e..0x30].copy_from_slice(&checksum.to_be_bytes());
+    }
+
+    /// Record each IDE hard disk's BIOS translation, indexed by
+    /// `channel * 2 + unit` as in [`configure_pc`](Self::configure_pc).
+    pub fn set_disk_translations(&mut self, disks: [Option<ChsTranslation>; 4]) {
+        self.cmos[0x39] = disks.iter().enumerate().fold(0, |byte, (drive, disk)| {
+            byte | (disk.map_or(0, |translation| translation as u8) << (2 * drive))
+        });
     }
 
     /// Progress calendar and interrupt sources using the VMM's running clock.
@@ -210,7 +268,11 @@ impl BusDevice for Rtc {
             let port = offset.saturating_add(i as u64) & 7;
             let bank = ((port >> 1) & 1) as usize;
             if port & 1 == 0 {
-                *byte = self.index[bank];
+                // The index register is write-only and reads 0xff, as on
+                // QEMU. SeaBIOS reads port 0x70 before each 16-bit disk
+                // call: a set bit 7 tells it NMI is masked already, a clear
+                // one costs two more port writes and two more reads.
+                *byte = 0xff;
                 continue;
             }
             let reg = usize::from(self.index[bank] & 0x7f) + bank * 128;
@@ -335,6 +397,19 @@ mod tests {
     fn put(rtc: &mut Rtc, reg: u8, value: u8) {
         rtc.write(0, &[reg]);
         rtc.write(1, &[value]);
+    }
+    #[test]
+    fn index_ports_read_ff_and_keep_the_selected_register() {
+        let mut rtc = Rtc::new(2 << 30, 1_793_355_112, Arc::new(Line::default()));
+        put(&mut rtc, 0x38, 0x42);
+        for port in [0, 2, 4, 6] {
+            let mut b = [0];
+            rtc.read(port, &mut b);
+            assert_eq!(b[0], 0xff, "index port {port}");
+        }
+        let mut b = [0];
+        rtc.read(1, &mut b);
+        assert_eq!(b[0], 0x42);
     }
     #[test]
     fn system_reset_preserves_calendar_and_cmos_but_clears_interrupts() {

@@ -1,6 +1,9 @@
 //! The freeze, thaw and freeze-point restore plans run by the executor over
-//! real qcow2 files (PRD §21). Skipped, with a note, where `qemu-img` or
-//! `qemu-io` is not on PATH.
+//! real qcow2 files (PRD §21), once under each image tool (`qemu-img` and
+//! `vmlab-disk`, the HV-D15 parity measure). `qemu-io` writes and reads the
+//! patterns and `qemu-img check`/`map`/`info` judge the result whichever tool
+//! ran the plan, so each test is skipped, with a note, where either is not on
+//! PATH.
 //!
 //! Each disk is written with recognisable byte patterns at fixed offsets, so
 //! every assertion is "this chain reads back exactly what that state wrote".
@@ -13,6 +16,7 @@ use super::plan::{self, FreezeInput, FreezeMachine, ThawDisk, ThawInput, ThawMac
 use super::steps::execute;
 use crate::labd::state::SnapshotRecord;
 use crate::template::qimg;
+use crate::template::qimg::testing::on_both_tools;
 
 fn have(tool: &str) -> bool {
     let found = std::env::var_os("PATH")
@@ -225,7 +229,7 @@ fn snapshot_names(path: &Path) -> Vec<String> {
     names
 }
 
-#[tokio::test]
+on_both_tools!(async freeze_point_restore_refreeze_and_thaw_keep_every_state);
 async fn freeze_point_restore_refreeze_and_thaw_keep_every_state() {
     if !have("qemu-img") || !have("qemu-io") {
         return;
@@ -341,7 +345,7 @@ async fn freeze_point_restore_refreeze_and_thaw_keep_every_state() {
     }
 }
 
-#[tokio::test]
+on_both_tools!(async a_failure_mid_freeze_puts_every_disk_back);
 async fn a_failure_mid_freeze_puts_every_disk_back() {
     if !have("qemu-img") || !have("qemu-io") {
         return;
@@ -403,7 +407,7 @@ async fn a_failure_mid_freeze_puts_every_disk_back() {
     assert!(reads(&lab.disk("a"), 2, 0));
 }
 
-#[tokio::test]
+on_both_tools!(async a_rollback_after_every_step_ran_unfreezes_too);
 async fn a_rollback_after_every_step_ran_unfreezes_too() {
     if !have("qemu-img") || !have("qemu-io") {
         return;

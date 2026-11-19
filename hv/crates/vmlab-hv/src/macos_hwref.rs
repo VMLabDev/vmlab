@@ -30,6 +30,7 @@ fn macos_p2_all_pci_identities_classes_and_bar_sizes_match_hwref() {
         intx: Some(irq.clone()),
         transitional: true,
         msix_vectors: vectors,
+        doorbells: None,
     };
     let mut devices: BTreeMap<(u8, u8), Arc<Mutex<dyn PciDevice>>> = BTreeMap::new();
     let pam = Arc::new(Mutex::new(

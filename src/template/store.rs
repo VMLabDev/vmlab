@@ -972,17 +972,9 @@ pub fn ensure_variant_backing(overlay: &Path) -> Result<bool> {
     if qcow2_backing_file(overlay)?.as_deref() == Some(VARIANT_BACKING) {
         return Ok(false);
     }
-    let out = std::process::Command::new("qemu-img")
-        .args(["rebase", "-u", "-b", VARIANT_BACKING, "-F", "qcow2"])
-        .arg(overlay)
-        .output()
-        .context("cannot run qemu-img")?;
-    ensure!(
-        out.status.success(),
-        "cannot point {} at {VARIANT_BACKING}: {}",
-        overlay.display(),
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    super::qimg::tool()
+        .rebase_unsafe(overlay, VARIANT_BACKING)
+        .with_context(|| format!("cannot point {} at {VARIANT_BACKING}", overlay.display()))?;
     Ok(true)
 }
 
@@ -2238,37 +2230,30 @@ mod tests {
 
     // ---- variants (§6.6) --------------------------------------------------------
 
-    fn have_qemu_img() -> bool {
-        let found = std::env::var_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join("qemu-img").is_file())
-        });
-        if !found {
-            eprintln!("skipping: qemu-img not found on PATH");
-        }
-        found
+    // These tests run once under each image tool (`on_both_tools!`), which
+    // makes and reads every disk below.
+    use crate::template::qimg::{self, testing::on_both_tools};
+
+    /// A blank base `disk.qcow2` of `size` bytes in `dir`.
+    fn blank_base(dir: &Path, size: u64) {
+        qimg::tool()
+            .create_blank(&dir.join(DISK_FILE), size)
+            .unwrap();
     }
 
-    fn qemu_img(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("qemu-img")
-            .args(args)
-            .current_dir(dir)
-            .output()
+    /// An overlay `disk.qcow2` in `vdir` on the base two directories up,
+    /// named by [`VARIANT_BACKING`] as the store lays variants out (§6.6).
+    fn variant_overlay(vdir: &Path) {
+        let overlay = vdir.join(DISK_FILE);
+        let base = vdir.join(VARIANT_BACKING);
+        qimg::tool().create_linked_clone(&base, &overlay).unwrap();
+        qimg::tool()
+            .rebase_unsafe(&overlay, VARIANT_BACKING)
             .unwrap();
-        assert!(
-            out.status.success(),
-            "qemu-img {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
-    fn qemu_img_info(path: &Path) -> serde_json::Value {
-        let out = std::process::Command::new("qemu-img")
-            .args(["info", "--output=json"])
-            .arg(path)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        serde_json::from_slice(&out.stdout).unwrap()
+    fn image_info(path: &Path) -> qimg::ImageInfo {
+        qimg::tool().image_info(path).unwrap()
     }
 
     fn variant_meta(name: &str, default: bool, base_sha256: &str) -> VariantMeta {
@@ -2309,25 +2294,12 @@ mod tests {
         let (tmp, store) = new_store();
         let dir = store.version_dir("x86_64", "win", "1");
         fs::create_dir_all(&dir).unwrap();
-        qemu_img(&dir, &["create", "-q", "-f", "qcow2", DISK_FILE, "16M"]);
+        blank_base(&dir, 16 << 20);
         let base_sha = sha256_file(&dir.join(DISK_FILE)).unwrap();
         for v in ["standard", "extra"] {
             let vdir = dir.join(VARIANTS_DIR).join(v);
             fs::create_dir_all(&vdir).unwrap();
-            qemu_img(
-                &vdir,
-                &[
-                    "create",
-                    "-q",
-                    "-f",
-                    "qcow2",
-                    "-b",
-                    "../../disk.qcow2",
-                    "-F",
-                    "qcow2",
-                    DISK_FILE,
-                ],
-            );
+            variant_overlay(&vdir);
         }
         let mut m = meta("x86_64", "win", "1");
         m.sha256 = Some(base_sha.clone());
@@ -2339,7 +2311,7 @@ mod tests {
 
         let plain = store.version_dir("x86_64", "plain", "1");
         fs::create_dir_all(&plain).unwrap();
-        qemu_img(&plain, &["create", "-q", "-f", "qcow2", DISK_FILE, "16M"]);
+        blank_base(&plain, 16 << 20);
         meta("x86_64", "plain", "1")
             .write_to(&plain.join(META_FILE))
             .unwrap();
@@ -2350,14 +2322,11 @@ mod tests {
         VariantRef::Named(n.into())
     }
 
+    on_both_tools!(a_marked_base_without_its_variants_is_refused);
     /// A variant-bearing base whose overlays were deleted by hand reads with
     /// no variants, and is still never cloned by a lab: the marker refuses a
     /// bare ref, `#<name>` and `#base`, while a build's `#base` resolves.
-    #[test]
     fn a_marked_base_without_its_variants_is_refused() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let dir = store.version_dir("x86_64", "win", "1");
         let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
@@ -2394,12 +2363,9 @@ mod tests {
         assert_eq!(r.variant, None);
     }
 
+    on_both_tools!(resolve_without_a_variant);
     /// Row 1: no `#` — the default variant with variants, the base without.
-    #[test]
     fn resolve_without_a_variant() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let r = store
             .resolve("x86_64", "win", None, None, Purpose::Lab)
@@ -2416,13 +2382,10 @@ mod tests {
         assert_eq!(r.disk_path, r.dir.join(DISK_FILE));
     }
 
+    on_both_tools!(resolve_a_named_variant);
     /// Row 2: `#<name>` — that variant (with its effective metadata), an
     /// unknown name listing the variants, and an error on a base-only one.
-    #[test]
     fn resolve_a_named_variant() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let r = store
             .resolve(
@@ -2439,9 +2402,12 @@ mod tests {
         assert_eq!(r.meta.cpus, Some(2), "the base's own value");
         assert_eq!(r.meta.first_boot_script.as_deref(), Some("base script"));
         // The overlay is a real qcow2 on the base, by relative path.
-        let info = qemu_img_info(&r.disk_path);
-        assert_eq!(info["backing-filename"], "../../disk.qcow2");
-        assert_eq!(info["virtual-size"], 16 << 20);
+        let info = image_info(&r.disk_path);
+        assert_eq!(
+            info.backing_file.as_deref(),
+            Some(Path::new("../../disk.qcow2"))
+        );
+        assert_eq!(info.virtual_size, 16 << 20);
 
         let err = store
             .resolve("x86_64", "win", None, Some(&named("ghost")), Purpose::Lab)
@@ -2463,13 +2429,10 @@ mod tests {
         assert!(err.contains("has no variants"), "{err}");
     }
 
+    on_both_tools!(resolve_the_base);
     /// Row 3: `#base` — refused for a lab on a template with variants, the
     /// base in a build context, and the base everywhere without variants.
-    #[test]
     fn resolve_the_base() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let base = VariantRef::Base;
         let err = store
@@ -2495,13 +2458,10 @@ mod tests {
         }
     }
 
+    on_both_tools!(missing_overlays_and_stale_variants);
     /// A variant counts only with both its block and its overlay; a stale one
     /// is refused by name.
-    #[test]
     fn missing_overlays_and_stale_variants() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let dir = store.version_dir("x86_64", "win", "1");
         fs::remove_dir_all(dir.join("variants/extra")).unwrap();
@@ -2522,7 +2482,7 @@ mod tests {
         );
 
         // Rebuild the base under the variant: it goes stale.
-        qemu_img(&dir, &["create", "-q", "-f", "qcow2", DISK_FILE, "32M"]);
+        blank_base(&dir, 32 << 20);
         let mut m = TemplateMeta::read_from(&dir.join(META_FILE)).unwrap();
         m.sha256 = Some(sha256_file(&dir.join(DISK_FILE)).unwrap());
         m.write_to(&dir.join(META_FILE)).unwrap();
@@ -2534,13 +2494,10 @@ mod tests {
         assert!(err.contains("rebuild the variant"), "{err}");
     }
 
+    on_both_tools!(an_ambiguous_default_is_reported_by_the_reader);
     /// Invalid default rules make the store entry unreadable to resolution
     /// and leave it out of the listing.
-    #[test]
     fn an_ambiguous_default_is_reported_by_the_reader() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let dir = store.version_dir("x86_64", "win", "1");
         let text = fs::read_to_string(dir.join(META_FILE)).unwrap();
@@ -2562,54 +2519,34 @@ mod tests {
         assert!(store.list().unwrap().iter().all(|m| m.name != "win"));
     }
 
+    on_both_tools!(a_clone_of_a_variant_chains_to_the_base);
     /// A linked clone of the resolved disk chains clone → variant → base.
-    #[test]
     fn a_clone_of_a_variant_chains_to_the_base() {
-        if !have_qemu_img() {
-            return;
-        }
         let (tmp, store) = variant_store();
         let r = store
             .resolve("x86_64", "win", None, Some(&named("extra")), Purpose::Lab)
             .unwrap();
         let backing = r.disk_path.canonicalize().unwrap();
-        qemu_img(
-            tmp.path(),
-            &[
-                "create",
-                "-q",
-                "-f",
-                "qcow2",
-                "-b",
-                backing.to_str().unwrap(),
-                "-F",
-                "qcow2",
-                "clone.qcow2",
-            ],
-        );
-        let out = std::process::Command::new("qemu-img")
-            .args(["info", "--backing-chain", "--output=json"])
-            .arg(tmp.path().join("clone.qcow2"))
-            .output()
-            .unwrap();
-        let chain: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(chain.len(), 3, "clone, variant, base");
-        assert_eq!(chain[0]["backing-filename"], backing.to_str().unwrap());
-        let base = PathBuf::from(chain[2]["filename"].as_str().unwrap());
+        let clone = tmp.path().join("clone.qcow2");
+        qimg::tool().create_linked_clone(&backing, &clone).unwrap();
+        // Walk the chain header by header: clone, variant, base.
+        let mut chain = vec![clone.clone()];
+        while let Some(next) = image_info(chain.last().unwrap()).full_backing_file {
+            chain.push(next);
+        }
+        assert_eq!(chain.len(), 3, "clone, variant, base: {chain:?}");
+        assert_eq!(image_info(&clone).backing_file, Some(backing));
         assert_eq!(
-            base.canonicalize().unwrap(),
+            chain[2].canonicalize().unwrap(),
             r.dir.join(DISK_FILE).canonicalize().unwrap()
         );
     }
 
+    on_both_tools!(remove_one_variant);
     /// Removing a variant drops its overlay and its block alone, and is
     /// refused while a clone is backed by that overlay; removing the version
     /// hands every disk — base and overlays — to the in-use check.
-    #[test]
     fn remove_one_variant() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let dir = store.version_dir("x86_64", "win", "1");
         let extra = dir.join("variants/extra/disk.qcow2");
@@ -2674,11 +2611,8 @@ mod tests {
         assert!(err.contains("no variant `ghost`"), "{err}");
     }
 
-    #[test]
+    on_both_tools!(remove_the_default_variant_is_refused);
     fn remove_the_default_variant_is_refused() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let err = store
             .remove("x86_64", "win", "1", Some("standard"), false, &|_| None)
@@ -2688,11 +2622,8 @@ mod tests {
         assert!(err.contains("extra"), "{err}");
     }
 
-    #[test]
+    on_both_tools!(remove_a_version_removes_its_variants);
     fn remove_a_version_removes_its_variants() {
-        if !have_qemu_img() {
-            return;
-        }
         let (_tmp, store) = variant_store();
         let dir = store.version_dir("x86_64", "win", "1");
         let seen = std::cell::RefCell::new(Vec::new());
@@ -2956,13 +2887,10 @@ mod tests {
         m.write_to(&dir.join(META_FILE)).unwrap();
     }
 
+    on_both_tools!(export_import_round_trip_with_variants);
     /// An export carries `variants/` and the full `template.wcl`; an import
     /// restores both, every overlay still backed on `../../disk.qcow2`.
-    #[test]
     fn export_import_round_trip_with_variants() {
-        if !have_qemu_img() {
-            return;
-        }
         let (tmp, store) = variant_store();
         record_variant_digests(&store);
         let archive = tmp.path().join("win.tar.zst");
@@ -2995,8 +2923,11 @@ mod tests {
                 qcow2_backing_file(&disk).unwrap().as_deref(),
                 Some(VARIANT_BACKING)
             );
-            let info = qemu_img_info(&disk);
-            assert_eq!(info["backing-filename"], VARIANT_BACKING);
+            let info = image_info(&disk);
+            assert_eq!(
+                info.backing_file.as_deref(),
+                Some(Path::new(VARIANT_BACKING))
+            );
         }
         let r = other
             .resolve(
@@ -3010,14 +2941,11 @@ mod tests {
         assert_eq!(r.meta.memory, Some(8 << 30));
     }
 
+    on_both_tools!(import_refuses_a_tampered_variant);
     /// An import refuses a variant whose overlay is not the one its block
     /// names, one built on another base, and one whose overlay is missing —
     /// and installs nothing.
-    #[test]
     fn import_refuses_a_tampered_variant() {
-        if !have_qemu_img() {
-            return;
-        }
         let (tmp, store) = variant_store();
         record_variant_digests(&store);
         let archive = tmp.path().join("win.tar.zst");

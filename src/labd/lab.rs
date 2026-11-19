@@ -14,7 +14,7 @@ use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, InstalledForward};
 use super::freeze_clone;
-use super::machine::Machine;
+use super::machine::{AgentOrigin, Machine};
 use super::machine_build::{self, BuildContext, Built, MachineSet};
 use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
@@ -1236,8 +1236,8 @@ impl LabRuntime {
     }
 
     /// Verify the external binaries starting `targets` will need are on PATH
-    /// (the per-arch QEMU emulator, `qemu-img` for clones, `swtpm` when a VM
-    /// wants a TPM), so a missing package surfaces as one clear error before
+    /// (the per-arch QEMU emulator, `qemu-img` when it is the image tool,
+    /// `swtpm` when a VM wants a TPM), so a missing package surfaces as one clear error before
     /// any clone or boot work begins instead of a spawn failure mid-`up`.
     pub fn preflight_binaries(&self, targets: &[String]) -> Result<()> {
         let mut needed: Vec<String> = Vec::new();
@@ -1311,6 +1311,14 @@ impl LabRuntime {
 
     /// Boot one machine, whichever kind it is.
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.start_machine_with_output(name, None).await
+    }
+
+    pub(super) async fn start_machine_with_output(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         self.settle_pending(name).await?;
         self.prepare_disk_dir(name, None)?;
         self.clone_from_freeze(name).await?;
@@ -1318,7 +1326,7 @@ impl LabRuntime {
         // gate, so a reload is not held up behind it (§7.1).
         self.ensure_pulled(&[name.to_string()], None).await?;
         let _gate = self.rebuild_gate.read().await;
-        self.machine(name)?.start(self.services()).await
+        self.machine(name)?.start(self.services(), output).await
     }
 
     /// Set NOCOW on `name`'s disk directory when it is on btrfs, before the
@@ -1598,7 +1606,11 @@ impl LabRuntime {
     /// that is not eligible is never entered, so its readiness waits on
     /// nothing; one that is eligible but already current is held only for the
     /// one handshake it takes to find out.
-    pub async fn start_with_deferred_refresh(self: &Arc<Self>, name: &str) -> Result<()> {
+    pub async fn start_with_deferred_refresh(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         self.settle_pending(name).await?;
         let name = name.to_string();
         if self.refresh_could_be_owed(self.machine(&name)?.as_ref()) {
@@ -1606,7 +1618,7 @@ impl LabRuntime {
                 .lock_recover()
                 .insert(name.clone(), OwedRefresh::AtHandshake);
         }
-        self.start_machine(&name).await?;
+        self.start_machine_with_output(&name, output).await?;
         let m = &self.machine(&name)?;
         // Already running and ready, so no handshake is coming: a machine
         // other callers are already using is refreshed beside them, in the
@@ -1856,7 +1868,7 @@ impl LabRuntime {
         m.wait_state(PowerState::Stopped, Duration::from_secs(60))
             .await
             .map_err(|_| anyhow!("{name} did not stop for restart"))?;
-        self.start_machine(name).await?;
+        self.start_machine_with_output(name, Some(output)).await?;
         self.run_owed_first_boot(name, output).await
     }
 
@@ -2100,12 +2112,19 @@ impl LabRuntime {
         // said, not refused (§5.2). After the pull, which binds the template
         // layer a model may come from.
         for name in &targets {
-            if let Some(reason) = self.machine(name)?.hypervisor_fallback() {
+            let m = self.machine(name)?;
+            // An x86 machine's reason is in its removal warning below.
+            if let Some(reason) = m.hypervisor_fallback()
+                && m.qemu_removal().is_none()
+            {
                 output(format!("info: {name}: using QEMU: {reason}\n"));
             }
-            for warning in self.machine(name)?.launch_warnings() {
+            for warning in m.launch_warnings() {
                 output(format!("warning: {warning}\n"));
             }
+        }
+        for warning in self.qemu_removal_warnings(&targets).await {
+            output(format!("warning: {warning}\n"));
         }
 
         self.preflight_binaries(&targets)?;
@@ -2172,9 +2191,9 @@ impl LabRuntime {
                         if !first_boot {
                             hold = me.hold_for_inline_refresh(m.as_ref());
                         }
-                        me.start_machine(&n).await?;
+                        me.start_machine_with_output(&n, Some(&out)).await?;
                     } else {
-                        me.start_with_deferred_refresh(&n).await?;
+                        me.start_with_deferred_refresh(&n, Some(&out)).await?;
                     }
                     // The instance that booted: a reload may have rebuilt the
                     // one looked up above while it was still stopped (§7.1).
@@ -3146,6 +3165,21 @@ impl LabRuntime {
             status.agent_diverged = diverged.contains(&status.name);
             machines.push(status);
         }
+        // The snapshots a QEMU x86 machine loses with the removal, and what
+        // the host owes — lab-level: the records are the lab's state.
+        let host_warnings = {
+            let state = self.state.lock().await;
+            for status in &mut machines {
+                if let Some(removal) = &mut status.qemu_removal {
+                    removal.online_snapshots = state
+                        .machines
+                        .get(&status.name)
+                        .map(|m| m.qemu_online_snapshots())
+                        .unwrap_or_default();
+                }
+            }
+            self.kvm_removal_warning(machines.iter().any(|m| m.qemu_removal.is_some()))
+        };
 
         let net = self.network.lock().await;
         // Cross-host trunk state lives in the supervisor (it owns the global
@@ -3207,7 +3241,39 @@ impl LabRuntime {
             forwards,
             isolation: self.isolation.as_ref().map(|p| p.status()),
             freeze_stale,
+            host_warnings,
         }
+    }
+
+    /// The host half of the QEMU removal warning, when a machine earns the
+    /// machine half (`any`): this host has no usable KVM for an x86 guest.
+    fn kvm_removal_warning(&self, any: bool) -> Vec<String> {
+        any.then(crate::config::hypervisor::HostFacts::probe)
+            .and_then(|host| crate::config::hypervisor::kvm_removal_warning(&host))
+            .into_iter()
+            .collect()
+    }
+
+    /// The QEMU removal warnings `targets` earn, as lines: each x86 machine
+    /// that runs on QEMU with its reason and fix, its online QEMU snapshots,
+    /// and what the host owes. What `up` and `vm start` print.
+    pub async fn qemu_removal_warnings(&self, targets: &[String]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let state = self.state.lock().await;
+        for name in targets {
+            let Ok(m) = self.machine(name) else { continue };
+            let Some(mut removal) = m.qemu_removal() else {
+                continue;
+            };
+            removal.online_snapshots = state
+                .machines
+                .get(name)
+                .map(|m| m.qemu_online_snapshots())
+                .unwrap_or_default();
+            lines.extend(removal.lines(name));
+        }
+        lines.extend(self.kvm_removal_warning(!lines.is_empty()));
+        lines
     }
 
     /// The installed forwards as `status` reports them: by machine, then in
@@ -3290,7 +3356,30 @@ impl LabRuntime {
         self.workspaces
             .before_capture(vm_name, self.workspace_of(vm_name).as_ref())
             .await?;
-        let online = m.snapshot(snap).await?;
+        {
+            let mut state = self.state.lock().await;
+            let machine = state.machine_mut(vm_name);
+            if machine.snapshots.contains_key(snap) || machine.pending_snapshots.contains(snap) {
+                bail!("{vm_name}: snapshot {snap:?} already exists or is pending cleanup");
+            }
+            machine.pending_snapshots.insert(snap.to_string());
+            if let Err(error) = state.save(&self.lab_local) {
+                state.machine_mut(vm_name).pending_snapshots.remove(snap);
+                return Err(error);
+            }
+        }
+        let online = match m.snapshot(snap).await {
+            Ok(online) => online,
+            Err(error) => {
+                // The backend rolls back artifacts it created. Keep the
+                // intent visible because it may report a rollback failure.
+                // Do not blindly delete here: a backend may have refused
+                // an existing, previously unrecorded disk snapshot.
+                return Err(error.context(format!(
+                    "{vm_name}: snapshot capture failed, pending intent retained for cleanup"
+                )));
+            }
+        };
         {
             let mut state = self.state.lock().await;
             state.machine_mut(vm_name).snapshots.insert(
@@ -3304,7 +3393,24 @@ impl LabRuntime {
                     hypervisor: m.hypervisor(),
                 },
             );
-            state.save(&self.lab_local)?;
+            state.machine_mut(vm_name).pending_snapshots.remove(snap);
+            if let Err(error) = state.save(&self.lab_local) {
+                state.machine_mut(vm_name).snapshots.remove(snap);
+                state
+                    .machine_mut(vm_name)
+                    .pending_snapshots
+                    .insert(snap.to_string());
+                drop(state);
+                let cleanup = m.delete_snapshot(snap).await;
+                if cleanup.is_ok() {
+                    let mut state = self.state.lock().await;
+                    state.machine_mut(vm_name).pending_snapshots.remove(snap);
+                    state.save(&self.lab_local)?;
+                }
+                return Err(
+                    error.context(format!("capture record save failed, cleanup: {cleanup:?}"))
+                );
+            }
         }
         self.events.emit(
             "snapshot.created",
@@ -3313,12 +3419,27 @@ impl LabRuntime {
         Ok(online)
     }
 
-    /// Lab-wide snapshot: every VM and container under one name; consistency
-    /// across machines is best-effort, not coordinated (PRD §7.3).
+    /// Lab-wide capture rolls back earlier machines if a later one fails.
+    /// Capture times remain uncoordinated across guests (PRD §7.3).
     pub async fn snapshot_all(&self, snap: &str) -> Result<Value> {
         let mut results = Vec::new();
+        let mut captured: Vec<String> = Vec::new();
         for m in self.machines() {
-            let online = self.snapshot(m.name(), snap).await?;
+            let online = match self.snapshot(m.name(), snap).await {
+                Ok(online) => online,
+                Err(error) => {
+                    let mut failures = Vec::new();
+                    for name in captured.iter().rev() {
+                        if let Err(rollback) = self.delete_snapshot(name, snap).await {
+                            failures.push(format!("{name}: {rollback:#}"));
+                        }
+                    }
+                    return Err(error.context(format!(
+                        "lab capture rolled back earlier machines, rollback errors: {failures:?}"
+                    )));
+                }
+            };
+            captured.push(m.name().to_string());
             results.push(json!({"vm": m.name(), "online": online}));
         }
         Ok(json!(results))
@@ -3354,9 +3475,18 @@ impl LabRuntime {
     ) -> Result<Vec<String>> {
         let record = {
             let mut state = self.state.lock().await;
+            if state.machine_mut(name).pending_snapshots.contains(snap) {
+                bail!("{name}: snapshot {snap:?} is pending cleanup after an interrupted capture");
+            }
             state.machine_mut(name).snapshots.get(snap).cloned()
         }
         .ok_or_else(|| anyhow!("\"{name}\" has no snapshot \"{snap}\""))?;
+        let m = self.machine(name)?;
+        // Online state is bound to its capture hypervisor, including when
+        // it is stored in a frozen generation.
+        if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
+            return Err(crate::proto::CommandError::conflict(why).into());
+        }
         if let Some(g) = record.frozen_in {
             return Err(
                 crate::proto::CommandError::conflict(super::worktree::locked_refusal(
@@ -3369,13 +3499,6 @@ impl LabRuntime {
             );
         }
 
-        let m = self.machine(name)?;
-        // An online snapshot's RAM and device state are the format of the
-        // hypervisor that took it, which the machine may no longer run on
-        // (§22, D31). Refused before anything moves.
-        if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
-            return Err(crate::proto::CommandError::conflict(why).into());
-        }
         let workspace = self.workspace_of(name);
         // Before anything is rolled back, and before the syncer is taken off
         // the workspace: a refusal has to leave the machine exactly as it was.
@@ -3502,7 +3625,17 @@ impl LabRuntime {
             Clock::Fixed(_) => return ClockAfterRestore::Fixed,
             Clock::Host => {}
         }
-        let agent = match m.wait_agent(CLOCK_AGENT_WAIT).await {
+        // An unstamped VM may have a manually installed agent. Give it one
+        // handshake, but reserve retries for guests with evidence of an agent.
+        let handshake = if m.agent_origin() == AgentOrigin::Image
+            && m.sealed_agent_version().is_none()
+            && !m.is_agent_up().await
+        {
+            m.agent().await
+        } else {
+            m.wait_agent(CLOCK_AGENT_WAIT).await
+        };
+        let agent = match handshake {
             Ok(agent) => agent,
             Err(e) => {
                 return ClockAfterRestore::NotSet(format!("its agent did not answer: {e:#}"));
@@ -3551,21 +3684,23 @@ impl LabRuntime {
         }
         self.machine(vm_name)?.delete_snapshot(snap).await?;
         state.machine_mut(vm_name).snapshots.remove(snap);
+        state.machine_mut(vm_name).pending_snapshots.remove(snap);
         state.save(&self.lab_local)?;
         Ok(())
     }
 
     pub async fn snapshots(&self, vm_name: &str) -> Result<Value> {
+        let hypervisor = self.machine(vm_name)?.hypervisor();
         let state = self.state.lock().await;
         let snaps = state
             .machines
             .get(vm_name)
             .map(|m| m.snapshots.clone())
             .unwrap_or_default();
-        Ok(json!(
-            snaps
-                .into_iter()
-                .map(|(name, r)| json!({
+        let mut listed = snaps
+            .into_iter()
+            .map(|(name, r)| {
+                let mut entry = json!({
                     "name": name,
                     "online": r.online,
                     "taken_at": r.taken_at,
@@ -3574,9 +3709,22 @@ impl LabRuntime {
                     "locked": r.frozen_in.is_some(),
                     "frozen_in": r.frozen_in,
                     "freeze_point": r.freeze_point,
-                }))
-                .collect::<Vec<_>>()
-        ))
+                });
+                if let Some(why) = r.hypervisor_refusal(vm_name, &name, hypervisor) {
+                    entry["unrestorable"] = Value::String(why);
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        if let Some(machine) = state.machines.get(vm_name) {
+            listed.extend(machine.pending_snapshots.iter().map(|name| {
+                json!({
+                    "name": name, "pending": true,
+                    "reason": "interrupted capture, delete to clean up before retrying",
+                })
+            }));
+        }
+        Ok(json!(listed))
     }
 }
 
@@ -3654,10 +3802,28 @@ impl crate::labd::machine::LabServices for LabRuntime {
         &self,
         machine: &str,
         kind: crate::config::hypervisor::HypervisorKind,
+        migrating: bool,
+        output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
+        let previous = state.machine_mut(machine).hypervisor;
+        if previous == Some(kind) {
+            return Ok(());
+        }
         state.machine_mut(machine).hypervisor = Some(kind);
-        state.save(&self.lab_local)
+        if let Err(error) = state.save(&self.lab_local) {
+            state.machine_mut(machine).hypervisor = previous;
+            return Err(error);
+        }
+        drop(state);
+        if migrating {
+            let line = format!("info: {machine}: migrated from QEMU to vmlab-hv\n");
+            match output {
+                Some(output) => output(line),
+                None => daemon_log(machine)(line),
+            }
+        }
+        Ok(())
     }
 
     fn events(&self) -> &Arc<EventLog> {
@@ -3903,6 +4069,7 @@ mod tests {
         /// questions that are about what the agent said (§19.4). `None` — the
         /// usual case for a double — is a machine with no agent at all.
         agent: Option<super::super::vm_agent::AgentHandle>,
+        agent_stamped: bool,
         /// A first-boot script still to run; until it has, the machine is
         /// not ready, as a real one is not (§6.1).
         first_boot: std::sync::Mutex<Option<String>>,
@@ -3914,6 +4081,8 @@ mod tests {
         failing_mount: Option<Arc<AtomicU32>>,
         /// Snapshots it takes are online ones (RAM included).
         online_snapshots: bool,
+        snapshot_failure: bool,
+        snapshot_cleanup_failure: bool,
         clock: crate::config::model::Clock,
         /// What `boot_id` answers, in turn; the last answer repeats. Empty is
         /// a machine with no boot identity to read.
@@ -3993,10 +4162,13 @@ mod tests {
                 seq: shared.seq.clone(),
                 dir: shared.dir.join(name),
                 agent: None,
+                agent_stamped: true,
                 first_boot: std::sync::Mutex::new(None),
                 mount: None,
                 failing_mount: None,
                 online_snapshots: false,
+                snapshot_failure: false,
+                snapshot_cleanup_failure: false,
                 clock: crate::config::model::Clock::Host,
                 boot_ids: std::sync::Mutex::new(Vec::new()),
                 usb: None,
@@ -4226,7 +4398,11 @@ mod tests {
 
         /// Readiness the way both adapters give it: the agent answers, the
         /// lab's `before_ready` settles what it owes the boot, then ready.
-        async fn start(self: Arc<Self>, lab: Arc<dyn LabServices>) -> Result<()> {
+        async fn start(
+            self: Arc<Self>,
+            lab: Arc<dyn LabServices>,
+            _output: Option<&crate::scripting::OutputSink>,
+        ) -> Result<()> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.note("start").await;
             *self.state.write().await = PowerState::Starting;
@@ -4268,7 +4444,7 @@ mod tests {
         /// A VM double seals an agent, as a template built with one does; a
         /// container double's agent ships with the host, as a real one's.
         fn sealed_agent_version(&self) -> Option<String> {
-            (self.kind == MachineKind::Vm).then(|| "agent=sealed".to_string())
+            (self.kind == MachineKind::Vm && self.agent_stamped).then(|| "agent=sealed".to_string())
         }
         fn agent_origin(&self) -> crate::labd::machine::AgentOrigin {
             match self.kind {
@@ -4277,6 +4453,13 @@ mod tests {
             }
         }
         async fn agent(&self) -> Result<super::super::vm_agent::AgentHandle> {
+            if !self.agent_stamped && self.agent.is_none() {
+                return Err(super::super::machine::AgentUnavailable::Handshake {
+                    machine: self.name.clone(),
+                    message: "no agent in an unstamped template".into(),
+                }
+                .into());
+            }
             self.agent
                 .clone()
                 .ok_or_else(|| anyhow!("{}: no agent in a double", self.name))
@@ -4293,7 +4476,11 @@ mod tests {
             };
             next.map(String::from).map_err(|e| anyhow!(e))
         }
-        async fn snapshot(&self, _name: &str) -> Result<bool> {
+        async fn snapshot(&self, name: &str) -> Result<bool> {
+            self.note(&format!("snapshot:{name}")).await;
+            if self.snapshot_failure {
+                bail!("injected snapshot failure");
+            }
             Ok(self.online_snapshots)
         }
         async fn usb_ready(&self) -> Result<()> {
@@ -4340,7 +4527,11 @@ mod tests {
         fn clock(&self) -> crate::config::model::Clock {
             self.clock
         }
-        async fn delete_snapshot(&self, _name: &str) -> Result<()> {
+        async fn delete_snapshot(&self, name: &str) -> Result<()> {
+            self.note(&format!("delete_snapshot:{name}")).await;
+            if self.snapshot_cleanup_failure {
+                bail!("injected snapshot cleanup failure");
+            }
             Ok(())
         }
         async fn status_detail(&self) -> crate::status::MachineDetail {
@@ -4370,6 +4561,68 @@ mod tests {
     ) -> Arc<LabRuntime> {
         let config = crate::config::load_lab_source(src, "<test>", dir).expect("lab source");
         LabRuntime::with_machines(config, machines).expect("runtime")
+    }
+
+    #[tokio::test]
+    async fn failed_lab_capture_rolls_back_prior_machines_and_keeps_pending_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let first = FakeMachine::new("a", MachineKind::Vm, &sh);
+        let mut last = Arc::into_inner(FakeMachine::new("b", MachineKind::Vm, &sh)).unwrap();
+        last.snapshot_failure = true;
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+ vm "a" { template = "x86_64/t" }
+ vm "b" { template = "x86_64/t" }
+}"#,
+            vec![first, Arc::new(last)],
+        );
+        let error = lab.snapshot_all("capture").await.unwrap_err();
+        assert!(format!("{error:#}").contains("rolled back"));
+        let state = lab.state.lock().await;
+        assert!(state.machines["a"].snapshots.is_empty());
+        assert!(state.machines["a"].pending_snapshots.is_empty());
+        assert!(state.machines["b"].pending_snapshots.contains("capture"));
+        drop(state);
+        let listed = lab.snapshots("b").await.unwrap();
+        assert_eq!(listed[0]["pending"], true);
+        let log = sh.log.lock().await;
+        assert!(
+            log.iter()
+                .any(|line| line.contains("delete_snapshot:capture"))
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_capture_is_durable_and_cannot_be_replaced_or_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
+        );
+        {
+            let mut state = lab.state.lock().await;
+            state
+                .machine_mut("a")
+                .pending_snapshots
+                .insert("interrupted".into());
+            state.save(&lab.lab_local).unwrap();
+        }
+        assert!(lab.snapshot("a", "interrupted").await.is_err());
+        assert!(lab.restore("a", "interrupted", false).await.is_err());
+        let disk = std::fs::read_to_string(lab.lab_local.join("state.json")).unwrap();
+        assert!(disk.contains("interrupted"));
+        lab.delete_snapshot("a", "interrupted").await.unwrap();
+        assert!(
+            lab.state.lock().await.machines["a"]
+                .pending_snapshots
+                .is_empty()
+        );
     }
 
     fn quiet() -> crate::scripting::OutputSink {
@@ -4740,7 +4993,7 @@ lab "t" {
         };
 
         for m in lab.machines().collect::<Vec<_>>() {
-            Arc::clone(&m).start(lab.services()).await.unwrap();
+            Arc::clone(&m).start(lab.services(), None).await.unwrap();
             lab.refresh_agent_with(&m, &sink, &shipped).await;
         }
         let out = said.lock().unwrap().clone();
@@ -5732,12 +5985,14 @@ lab "t" {
     /// An online restore sets the guest clock unless the machine declares it
     /// should not (#157); one it should set but cannot is a warning the
     /// restore answers with, never a failed restore.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_online_restore_sets_the_clock_or_says_why_not() {
         use crate::config::model::Clock;
         let dir = tempfile::tempdir().unwrap();
         let sh = shared(dir.path());
         let fixed = Clock::Fixed(chrono::DateTime::UNIX_EPOCH);
+        let mut host = FakeMachine::clocked("host", &sh, Clock::Host);
+        Arc::get_mut(&mut host).unwrap().agent_stamped = false;
         let lab = lab_of(
             dir.path(),
             r#"import <vmlab.wcl>
@@ -5747,7 +6002,7 @@ lab "t" {
   vm "pinned" { template = "x86_64/t" }
 }"#,
             vec![
-                FakeMachine::clocked("host", &sh, Clock::Host),
+                host,
                 FakeMachine::clocked("kept", &sh, Clock::Snapshot),
                 FakeMachine::clocked("pinned", &sh, fixed),
             ],
@@ -5755,15 +6010,16 @@ lab "t" {
         for name in ["host", "kept", "pinned"] {
             assert!(lab.snapshot(name, "s1").await.unwrap(), "{name}: online");
         }
-        // The double has no agent, so the clock it should set it cannot.
+        // An unstamped guest's failed handshake must not use the retry budget.
         let warnings =
-            tokio::time::timeout(Duration::from_secs(30), lab.restore("host", "s1", false))
+            tokio::time::timeout(Duration::from_secs(1), lab.restore("host", "s1", false))
                 .await
                 .expect("restore returns")
                 .expect("restore succeeds without the clock");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
-            warnings[0].contains("\"host\": the guest clock was not set"),
+            warnings[0].contains("\"host\": the guest clock was not set")
+                && warnings[0].contains("no agent in an unstamped template"),
             "{warnings:?}"
         );
         for name in ["kept", "pinned"] {
@@ -6619,6 +6875,10 @@ fn main(lab: Lab) {
             .await
             .unwrap();
         assert_eq!(lab.vm("dc01").unwrap().macs, vec![mac]);
+        assert_eq!(
+            lab.machine("dc01").unwrap().hypervisor(),
+            crate::config::hypervisor::HypervisorKind::Vmlab
+        );
         assert_eq!(
             lab.vm("web").unwrap().macs,
             vec![crate::labd::state::generate_mac("l", "web", 0)]

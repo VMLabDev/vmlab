@@ -139,7 +139,7 @@ fn mint(logon: &Logon) -> std::io::Result<MintedLogon> {
     let (domain, user) = split_account(&logon.user);
     let wide_user = wide(user);
     let wide_domain = domain.map(wide);
-    let wide_secret = wide(&logon.secret);
+    let mut wide_secret = wide(&logon.secret);
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: three wide strings bound above, one out param.
     let ok = unsafe {
@@ -154,6 +154,9 @@ fn mint(logon: &Logon) -> std::io::Result<MintedLogon> {
             &mut token,
         )
     };
+    // The wide copy of the password is ours; it goes as soon as the one call
+    // that needed it returns (code review F61g).
+    crate::logon::wipe(&mut wide_secret);
     if ok == 0 {
         // §19.2: failure is loud and names the account. Falling back to the
         // agent identity would leave commands mysteriously running as

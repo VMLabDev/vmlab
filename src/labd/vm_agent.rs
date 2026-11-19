@@ -13,6 +13,10 @@
 //! `guest/agent-proto`). No echo within the timeout means the guest has no
 //! agent (template predates it) — callers turn that into an actionable
 //! error.
+//! On ISA serial only, the guest announces itself first so the host cannot
+//! leave a hello in COM1 for Windows serial mouse detection to consume;
+//! agents older than the announcement get a rate-limited fallback hello
+//! ([`Greeting`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -187,6 +191,7 @@ struct Inner {
     /// that misses a ping had been silent says whether the guest stalled or
     /// the pong was only late.
     last_rx: std::sync::Mutex<std::time::Instant>,
+    received: watch::Sender<bool>,
     sessions: Mutex<HashMap<u32, SessionEntry>>,
     /// Waiters for `opened`/error replies to an `open_*` message, keyed by
     /// channel id (std mutex: never held across await).
@@ -281,9 +286,32 @@ pub struct AgentHandle {
     inner: Arc<Inner>,
 }
 
+/// When the host may send its hello on a fresh agent connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Greeting {
+    /// At once: every transport but ISA serial.
+    HostFirst,
+    /// ISA serial: not before the guest has sent a byte, so no hello waits
+    /// in COM1 for Windows serial mouse detection to read as a mouse ID
+    /// ("VMLB" holds the `M` a Microsoft mouse answers with). With
+    /// `fallback`, a guest still silent when the handshake budget runs out
+    /// gets the hello anyway, for agents that predate the announcement.
+    GuestFirst { fallback: bool },
+}
+
 impl AgentHandle {
     /// Connect to the agent socket and complete the token handshake.
     pub async fn connect(path: &Path, handshake_timeout: Duration) -> Result<AgentHandle> {
+        Self::connect_serial(path, handshake_timeout, Greeting::HostFirst).await
+    }
+
+    /// Connect with an explicit [`Greeting`]: when the host may say hello.
+    pub(super) async fn connect_serial(
+        path: &Path,
+        handshake_timeout: Duration,
+        greeting: Greeting,
+    ) -> Result<AgentHandle> {
+        let mut deadline = tokio::time::Instant::now() + handshake_timeout;
         let stream = UnixStream::connect(path)
             .await
             .with_context(|| format!("connecting agent socket {}", path.display()))?;
@@ -300,6 +328,7 @@ impl AgentHandle {
             sock,
             closed: watch::Sender::new(false),
             last_rx: std::sync::Mutex::new(std::time::Instant::now()),
+            received: watch::Sender::new(false),
             sessions: Mutex::new(HashMap::new()),
             open_waiters: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
@@ -331,6 +360,23 @@ impl AgentHandle {
         let task = tokio::spawn(async move { reader_task(weak, read_half).await });
         *inner.reader.lock_recover() = Some(task);
 
+        if let Greeting::GuestFirst { fallback } = greeting {
+            let mut received = inner.received.subscribe();
+            let spoke = received.wait_for(|received| *received);
+            match tokio::time::timeout_at(deadline, spoke).await {
+                Ok(spoke) => {
+                    spoke.context("agent channel closed before guest spoke")?;
+                }
+                // An agent built before guest-first never speaks first: it
+                // gets its hello now, and the reply its own budget. Should
+                // nobody answer, dropping the connection drops whatever of
+                // the hello the guest had not read (both hypervisors discard
+                // unread input on hangup).
+                Err(_) if fallback => deadline = tokio::time::Instant::now() + handshake_timeout,
+                Err(_) => bail!("no vmlab-agent answered on the agent channel"),
+            }
+        }
+
         handle
             .send_msg(&HostMsg::Hello {
                 proto_version: PROTO_VERSION,
@@ -340,7 +386,6 @@ impl AgentHandle {
             .context("sending agent handshake")?;
 
         let mut rx = handle.inner.hello.subscribe();
-        let deadline = tokio::time::Instant::now() + handshake_timeout;
         loop {
             if rx.borrow().is_some() {
                 return Ok(handle);
@@ -2317,6 +2362,7 @@ async fn reader_task(weak: Weak<Inner>, mut read_half: tokio::net::unix::OwnedRe
         };
         let Some(inner) = weak.upgrade() else { break };
         *inner.last_rx.lock_recover() = std::time::Instant::now();
+        inner.received.send_replace(true);
         decoder.push(&buf[..n]);
         while let Some(frame) = decoder.next_frame() {
             match frame.kind {
@@ -3648,6 +3694,85 @@ mod tests {
             panic!("expected handshake timeout");
         };
         assert!(err.to_string().contains("no vmlab-agent answered"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn legacy_serial_sends_nothing_until_guest_speaks() {
+        let (_mock_dir, mock_path) = mock_agent(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serial.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let guest = tokio::spawn(async move {
+            // Repeated probes of a silent guest must not queue mouse IDs.
+            for _ in 0..2 {
+                let (mut port, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                port.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.is_empty(), "host queued bytes before guest spoke");
+            }
+            let (mut port, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), port.read(&mut byte))
+                    .await
+                    .is_err()
+            );
+            port.write_all(&[0]).await.unwrap();
+            let mut agent = UnixStream::connect(mock_path).await.unwrap();
+            tokio::io::copy_bidirectional(&mut port, &mut agent)
+                .await
+                .unwrap();
+        });
+        let greeting = Greeting::GuestFirst { fallback: false };
+        for _ in 0..2 {
+            assert!(
+                AgentHandle::connect_serial(&path, Duration::from_millis(100), greeting)
+                    .await
+                    .is_err()
+            );
+        }
+        let agent = AgentHandle::connect_serial(&path, HANDSHAKE, greeting)
+            .await
+            .unwrap();
+        assert_eq!(agent.info().os, "linux");
+        assert!(agent.ping(HANDSHAKE).await);
+        agent.shutdown().await;
+        guest.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_serial_falls_back_to_a_hello_for_an_agent_that_never_speaks() {
+        // The mock is an old agent: silent until the host's hello.
+        let (_mock_dir, mock_path) = mock_agent(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serial.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let wait = Duration::from_millis(300);
+        let guest = tokio::spawn(async move {
+            let (mut port, _) = listener.accept().await.unwrap();
+            let opened = tokio::time::Instant::now();
+            let mut first = [0];
+            port.read_exact(&mut first).await.unwrap();
+            // Accepting lags the host's clock start by a little.
+            assert!(
+                opened.elapsed() >= wait - Duration::from_millis(50),
+                "host sent a byte {:?} after connecting, before its guest-first wait",
+                opened.elapsed()
+            );
+            let mut agent = UnixStream::connect(mock_path).await.unwrap();
+            agent.write_all(&first).await.unwrap();
+            tokio::io::copy_bidirectional(&mut port, &mut agent)
+                .await
+                .unwrap();
+        });
+        let greeting = Greeting::GuestFirst { fallback: true };
+        let agent = AgentHandle::connect_serial(&path, wait, greeting)
+            .await
+            .unwrap();
+        assert_eq!(agent.info().os, "linux");
+        assert!(agent.ping(HANDSHAKE).await);
+        agent.shutdown().await;
+        guest.await.unwrap();
     }
 
     #[tokio::test]

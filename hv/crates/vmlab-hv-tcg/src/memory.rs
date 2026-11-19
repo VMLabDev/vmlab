@@ -1,6 +1,11 @@
 use crate::{Error, Result};
 
 const PAGE_SIZE: usize = 4096;
+/// The size of an LR/SC reservation granule in `FlatMemory`. A store by any
+/// hart to a granule breaks the reservations that cover it and no others, so
+/// unrelated stores elsewhere in RAM cannot starve an LR/SC loop. One page
+/// lets the granules share the per-page write generations code stamps keep.
+pub const RESERVATION_GRANULE: usize = PAGE_SIZE;
 static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) fn next_identity() -> u64 {
@@ -37,9 +42,19 @@ pub trait Memory {
     fn ram_bounds(&self, _address: u64) -> Option<(u64, u64)> {
         None
     }
-    /// Read and return the write generation as one atomic host operation.
+    /// The write generation of the reservation granules covering this range:
+    /// a value that changes whenever a write lands in any of them. An
+    /// implementation chooses its granule, and the whole of memory is a valid
+    /// one, which is this default. It must agree with what `load_reserved`
+    /// returns and `store_conditional` validates.
+    fn reservation_generation(&self, _address: u64, _len: usize) -> u64 {
+        self.generation()
+    }
+    /// Read and return `reservation_generation` for the range as one atomic
+    /// host operation.
     fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64>;
-    /// Validate the generation and write as one atomic host operation.
+    /// Validate that generation against the range's reservation granules and
+    /// write, as one atomic host operation.
     fn store_conditional(&mut self, address: u64, bytes: &[u8], generation: u64) -> Result<bool>;
     /// Serializes a generated read-modify-write sequence with ordinary accesses.
     fn transaction_lock(&self) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>>;
@@ -121,12 +136,29 @@ impl Memory for FlatMemory {
             generation: *self.page_generations[first..=last].iter().max()?,
         })
     }
+    fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+        // Every write stamps its pages with a fresh global generation, so the
+        // newest stamp over the covered granules moves exactly when one of
+        // them is written. A range outside RAM has no granule to track.
+        match self.range(address, len) {
+            Ok(range) if !range.is_empty() => {
+                let first = range.start / RESERVATION_GRANULE;
+                let last = (range.end - 1) / RESERVATION_GRANULE;
+                self.page_generations[first..=last]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(self.generation)
+            }
+            _ => self.generation,
+        }
+    }
     fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
         self.read(address, bytes)?;
-        Ok(self.generation)
+        Ok(self.reservation_generation(address, bytes.len()))
     }
     fn store_conditional(&mut self, address: u64, bytes: &[u8], generation: u64) -> Result<bool> {
-        if self.generation != generation {
+        if self.reservation_generation(address, bytes.len()) != generation {
             return Ok(false);
         }
         self.write(address, bytes)?;
@@ -177,6 +209,9 @@ impl Memory for SharedMemory {
     }
     fn code_stamp(&self, address: u64, len: usize) -> Option<CodeStamp> {
         self.with(|memory| memory.code_stamp(address, len))
+    }
+    fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+        self.with(|memory| memory.reservation_generation(address, len))
     }
     fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
         self.with(|memory| memory.load_reserved(address, bytes))
@@ -244,6 +279,54 @@ mod tests {
         m.read(0x8000, &mut bytes).unwrap();
         assert_eq!(bytes, [3, 4]);
         assert_eq!(m.generation(), 1);
+    }
+
+    #[test]
+    fn a_store_breaks_only_the_reservations_of_its_own_granule() {
+        let granule = RESERVATION_GRANULE as u64;
+        let mut hart0 = SharedMemory::new(FlatMemory::new(0x8000, vec![0; PAGE_SIZE * 4]));
+        let mut hart1 = hart0.clone();
+        let mut bytes = [0; 8];
+        // Another hart stores to other granules: the reservation survives.
+        let reserved = hart0.load_reserved(0x8000, &mut bytes).unwrap();
+        for address in [0x8000 + granule, 0x8000 + 3 * granule] {
+            hart1.write(address, &7u64.to_le_bytes()).unwrap();
+        }
+        assert_eq!(hart0.reservation_generation(0x8000, 8), reserved);
+        assert!(
+            hart0
+                .store_conditional(0x8000, &1u64.to_le_bytes(), reserved)
+                .unwrap()
+        );
+        // A store to the reserved granule itself, even to other bytes of it,
+        // breaks the reservation and the SC writes nothing.
+        let reserved = hart0.load_reserved(0x8000, &mut bytes).unwrap();
+        hart1.write(0x8000 + granule - 1, &[9]).unwrap();
+        assert_ne!(hart0.reservation_generation(0x8000, 8), reserved);
+        assert!(
+            !hart0
+                .store_conditional(0x8000, &2u64.to_le_bytes(), reserved)
+                .unwrap()
+        );
+        hart0.read(0x8000, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), 1);
+        // An access across a granule boundary is covered by both granules.
+        let reserved = hart0
+            .load_reserved(0x8000 + granule - 4, &mut bytes)
+            .unwrap();
+        hart1.write(0x8000 + granule + 100, &[1]).unwrap();
+        assert!(
+            !hart0
+                .store_conditional(0x8000 + granule - 4, &3u64.to_le_bytes(), reserved)
+                .unwrap()
+        );
+        // A stale reservation never validates again after the granule moved on.
+        let stale = hart0.load_reserved(0x8000, &mut bytes).unwrap();
+        hart1.write(0x8000, &[5]).unwrap();
+        let fresh = hart0.load_reserved(0x8000, &mut bytes).unwrap();
+        assert_ne!(stale, fresh);
+        assert!(!hart0.store_conditional(0x8000, &[0; 8], stale).unwrap());
+        assert!(hart0.store_conditional(0x8000, &[0; 8], fresh).unwrap());
     }
 
     #[test]

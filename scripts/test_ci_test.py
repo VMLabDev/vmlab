@@ -48,6 +48,24 @@ class EvidenceTests(unittest.TestCase):
                 "/tmp/test", "arg", "-Z", "unstable-options", "--format", "json", "--report-time"]))
             self.assertEqual(execute.call_args.args[2]["RUSTC_BOOTSTRAP"], "1")
 
+    def test_selected_conformance_keeps_harness_arguments(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.dict(os.environ, VMLAB_TARGET_ROOT=root), \
+                patch("sys.argv", ["ci_test.py", "agent-conformance", "--lib",
+                                   "external_agent", "--", "--ignored",
+                                   "--nocapture", "--test-threads=1"]), \
+                patch("subprocess.check_output", return_value="host: x86_64-unknown-linux-gnu\n"), \
+                patch("subprocess.run") as docs, \
+                patch("subprocess.Popen") as popen:
+            process = popen.return_value.__enter__.return_value
+            process.stdout = []
+            process.wait.return_value = 0
+            self.assertEqual(ci_test.main(), 0)
+            self.assertEqual(popen.call_args.args[0], [
+                "cargo", "test", "--lib", "external_agent", "--", "--ignored",
+                "--nocapture", "--test-threads=1"])
+            docs.assert_not_called()
+
     def test_refuses_root(self):
         with patch.dict(os.environ, VMLAB_TARGET_ROOT="/"), \
                 patch("sys.argv", ["ci_test.py", "hv"]):

@@ -592,6 +592,11 @@ mod parking {
     /// The last one tried before giving up.
     const LAST_DISPLAY: u32 = 1000;
 
+    /// The most connections one session holds parked at a time. A program
+    /// opens a handful; the abstract X socket has no file mode, so anyone in
+    /// the guest can dial it, and the queue must not grow without bound.
+    pub(crate) const MAX_PARKED: usize = 64;
+
     pub enum Protocol {
         Waypipe,
         X11 { cookie: String },
@@ -606,9 +611,46 @@ mod parking {
         dir: PathBuf,
         /// Sockets outside the private directory: the X display's path.
         unlink: Vec<PathBuf>,
+        /// The uid the program runs as, where it is not the agent's own.
+        owner: Option<u32>,
+    }
+
+    /// Whether a peer running as `peer` may hand the session a connection:
+    /// the program's own uid, the agent's, or root. The abstract X socket
+    /// carries no file permissions, so this is the only thing between it
+    /// and every other account in the guest.
+    pub(crate) fn admits(peer: u32, owner: Option<u32>, agent: u32) -> bool {
+        peer == 0 || peer == agent || Some(peer) == owner
     }
 
     impl Endpoint {
+        /// Park `stream` if its peer may connect and the queue has room.
+        /// `false` drops it, which closes it.
+        fn park(&self, stream: UnixStream) -> bool {
+            let peer = match nix::sys::socket::getsockopt(
+                &stream,
+                nix::sys::socket::sockopt::PeerCredentials,
+            ) {
+                Ok(cred) => cred.uid(),
+                Err(_) => return false,
+            };
+            if !admits(peer, self.owner, nix::unistd::geteuid().as_raw()) {
+                eprintln!("vmlab-agent: app: refused a connection from uid {peer}");
+                return false;
+            }
+            self.queue(stream)
+        }
+
+        /// Append `stream` to the parked queue, unless it is full.
+        fn queue(&self, stream: UnixStream) -> bool {
+            let mut parked = self.parked.lock().unwrap();
+            if parked.len() >= MAX_PARKED {
+                return false;
+            }
+            parked.push_back((Instant::now(), stream));
+            true
+        }
+
         /// The oldest connection still within the grace.
         pub fn adopt(&self, grace: Duration) -> Option<UnixStream> {
             let mut parked = self.parked.lock().unwrap();
@@ -673,6 +715,10 @@ mod parking {
                 if pid == me {
                     continue;
                 }
+                // Pinned before its environment is read, so the process
+                // killed is the one whose environment carried the tag, not
+                // a later holder of its pid.
+                let process = crate::unix::ProcessRef::open(pid);
                 let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
                     continue;
                 };
@@ -680,7 +726,7 @@ mod parking {
                     .split(|b| *b == 0)
                     .any(|var| var == marker.as_bytes())
                 {
-                    crate::platform::kill_process(pid);
+                    process.signal(nix::sys::signal::Signal::SIGKILL);
                     found = true;
                 }
             }
@@ -689,6 +735,11 @@ mod parking {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The process tree a session's program runs in, named for its tag.
+    pub(crate) fn app_tree(tag: &str) -> String {
+        format!("app-{tag}")
     }
 
     pub fn open(
@@ -727,6 +778,9 @@ mod parking {
         let tag = format!("{name}-{}", NEXT_TAG.fetch_add(1, Ordering::Relaxed));
         let mut env = spec.env;
         env.push((SESSION_VAR.into(), tag.clone()));
+        // The program runs under a shepherd, so whatever it starts stays
+        // reachable after it detaches or drops the tag.
+        let tree = app_tree(&tag);
         let split_logs = spec.split_logs && matches!(&protocol, Protocol::Waypipe);
         let (argv, env, display) = match &protocol {
             Protocol::Waypipe => (waypipe_argv(&home.seen, spec.argv, split_logs), env, None),
@@ -752,7 +806,7 @@ mod parking {
                 argv,
                 env,
                 cwd: spec.cwd,
-                tree: None,
+                tree: Some(tree.clone()),
             },
         ) {
             Ok(p) => p,
@@ -781,12 +835,14 @@ mod parking {
             id,
             None,
             Some(Box::new(move || {
+                // The program's children outlive a kill of the program, and
+                // hold its output open, which would keep the session from
+                // ever ending. The tree goes first: once the shepherd is
+                // gone its orphans are init's, and only the tag finds them.
+                crate::unix::shepherd::kill_tree(&tree);
                 if !kill_done.load(Ordering::SeqCst) {
                     session_kill();
                 }
-                // The program's children outlive a kill of the program, and
-                // hold its output open, which would keep the session from
-                // ever ending.
                 kill_tagged(&tag);
                 end_mux.apps().end(id);
             })),
@@ -848,7 +904,7 @@ mod parking {
                 (vec![listener], vec![], None)
             }
             Protocol::X11 { cookie } => {
-                let (n, listeners, path) = claim_display(&home.x11_unix)?;
+                let (n, listeners, path) = claim_display(&home.x11_unix, home.owner)?;
                 let claimed = (|| {
                     give(&path, home.owner, 0o600)?;
                     let file = home.dir.join("Xauthority");
@@ -872,6 +928,7 @@ mod parking {
                 closed: AtomicBool::new(false),
                 dir: home.dir.clone(),
                 unlink,
+                owner: home.owner.map(|(uid, _)| uid),
             },
             display,
         })
@@ -890,11 +947,11 @@ mod parking {
     /// tries the abstract name first and a future one only the path; a
     /// display holding one of the two would let whoever owns the other
     /// capture the program.
-    fn claim_display(x11_unix: &Path) -> std::io::Result<(u32, Vec<UnixListener>, PathBuf)> {
-        if !x11_unix.is_dir() {
-            std::fs::create_dir_all(x11_unix)?;
-            std::fs::set_permissions(x11_unix, std::fs::Permissions::from_mode(0o1777))?;
-        }
+    fn claim_display(
+        x11_unix: &Path,
+        owner: Option<(u32, u32)>,
+    ) -> std::io::Result<(u32, Vec<UnixListener>, PathBuf)> {
+        x11_dir(x11_unix, owner)?;
         for n in FIRST_DISPLAY..=LAST_DISPLAY {
             let name = format!("/tmp/.X11-unix/X{n}");
             let Ok(abstract_) = SocketAddr::from_abstract_name(name.as_bytes())
@@ -911,6 +968,67 @@ mod parking {
             std::io::ErrorKind::AddrInUse,
             format!("no free X display between :{FIRST_DISPLAY} and :{LAST_DISPLAY}"),
         ))
+    }
+
+    /// Make `x11_unix` the X socket directory, or check the one already there
+    /// (code review F54): a real directory — a symlink at the name is
+    /// refused, never followed — owned by root, the agent or the session's
+    /// own account. Anyone may create `/tmp/.X11-unix` before the agent
+    /// does, and a directory they own is one where they can swap the
+    /// session's socket out from under it.
+    pub(crate) fn x11_dir(x11_unix: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let created = match std::fs::symlink_metadata(x11_unix) {
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = x11_unix.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                match std::fs::create_dir(x11_unix) {
+                    Ok(()) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        // O_NOFOLLOW: a symlink at the name fails here rather than being
+        // followed, and every check below is of what was opened.
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(x11_unix)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{}: not a directory the agent trusts: {e}",
+                        x11_unix.display()
+                    ),
+                )
+            })?;
+        let meta = dir.metadata()?;
+        let agent = nix::unistd::geteuid().as_raw();
+        if !x11_dir_owner_trusted(meta.uid(), agent, owner) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is owned by uid {}, not root or the session's account",
+                    x11_unix.display(),
+                    meta.uid()
+                ),
+            ));
+        }
+        if created {
+            dir.set_permissions(std::fs::Permissions::from_mode(0o1777))?;
+        }
+        Ok(())
+    }
+
+    /// Whether an X socket directory owned by `uid` is one the agent may put
+    /// a session's socket in: root's, the agent's own, or the session's.
+    pub(crate) fn x11_dir_owner_trusted(uid: u32, agent: u32, owner: Option<(u32, u32)>) -> bool {
+        uid == 0 || uid == agent || owner.is_some_and(|(o, _)| o == uid)
     }
 
     /// `waypipe server` on the session's socket, with the program after it.
@@ -964,14 +1082,9 @@ mod parking {
             }
             for listener in &endpoint.listeners {
                 while let Ok((stream, _)) = listener.accept() {
-                    if stream.set_nonblocking(false).is_err() {
+                    if stream.set_nonblocking(false).is_err() || !endpoint.park(stream) {
                         continue;
                     }
-                    endpoint
-                        .parked
-                        .lock()
-                        .unwrap()
-                        .push_back((Instant::now(), stream));
                     records.send(&AppRecord::Pending);
                 }
             }
@@ -1040,7 +1153,62 @@ mod parking {
 
     pub(crate) const FAMILY_LOCAL: u16 = 256;
     pub(crate) const FAMILY_WILD: u16 = 65535;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn endpoint(owner: Option<u32>) -> Endpoint {
+            Endpoint {
+                listeners: vec![],
+                parked: Mutex::new(VecDeque::new()),
+                closed: AtomicBool::new(false),
+                dir: PathBuf::from("/nonexistent"),
+                unlink: vec![],
+                owner,
+            }
+        }
+
+        /// Only the program's own account, the agent's and root may hand a
+        /// session a connection; anyone else in the guest is refused.
+        #[test]
+        fn only_the_programs_owner_the_agent_or_root_may_connect() {
+            assert!(admits(1000, Some(1000), 0));
+            assert!(admits(0, Some(1000), 0));
+            assert!(admits(500, None, 500));
+            assert!(!admits(1001, Some(1000), 0));
+            assert!(!admits(1001, None, 500));
+        }
+
+        /// The peer of a connection this process made is this process:
+        /// admitted, and parked.
+        #[test]
+        fn a_connection_from_this_account_is_parked() {
+            let endpoint = endpoint(None);
+            let (ours, _theirs) = UnixStream::pair().unwrap();
+            assert!(endpoint.park(ours));
+            assert_eq!(endpoint.parked.lock().unwrap().len(), 1);
+        }
+
+        /// A session holds at most [`MAX_PARKED`] connections waiting for the
+        /// host; past that they are dropped, not queued.
+        #[test]
+        fn the_parked_queue_is_capped() {
+            let endpoint = endpoint(None);
+            let mut peers = Vec::new();
+            for _ in 0..MAX_PARKED {
+                let (ours, theirs) = UnixStream::pair().unwrap();
+                peers.push(theirs);
+                assert!(endpoint.queue(ours));
+            }
+            let (ours, _theirs) = UnixStream::pair().unwrap();
+            assert!(!endpoint.queue(ours), "the queue must stop at its cap");
+            assert_eq!(endpoint.parked.lock().unwrap().len(), MAX_PARKED);
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use parking::{FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, xauthority};
+pub(crate) use parking::{
+    FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, x11_dir, x11_dir_owner_trusted, xauthority,
+};

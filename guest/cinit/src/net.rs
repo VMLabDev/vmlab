@@ -75,6 +75,7 @@ pub fn dhcp_up(n: u32) -> Result<Option<String>> {
 
 /// Collect DHCP-provided DNS servers (all interfaces) and write the container
 /// rootfs resolv.conf. No servers → no file, matching "no DNS configured".
+/// The caller treats an error as a warning.
 pub fn write_resolv_conf(nics: u32) -> Result<()> {
     let mut servers: Vec<String> = Vec::new();
     for n in 0..nics {
@@ -94,5 +95,7 @@ pub fn write_resolv_conf(nics: u32) -> Result<()> {
     for s in &servers {
         out.push_str(&format!("nameserver {s}\n"));
     }
-    fs::write("/rootfs/etc/resolv.conf", out).ctx("write /etc/resolv.conf")
+    // The image's file, resolved inside the rootfs (F56): an absolute
+    // `resolv.conf` symlink must not aim this write at the micro-VM.
+    crate::util::write_in_root(crate::mounts::ROOTFS, "/etc/resolv.conf", &out)
 }

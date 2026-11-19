@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::hypervisor::HypervisorKind;
+use crate::config::hypervisor::{HypervisorKind, SelectionSource};
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
 use crate::qemu::{self, VmPaths};
@@ -363,6 +363,9 @@ pub struct VmInstance {
     /// snapshots record it.
     hypervisor: HypervisorKind,
     hypervisor_fallback: Option<String>,
+    /// The rung of the selection ladder the lab builder chose `hypervisor`
+    /// on. `None` on a machine nothing selected a hypervisor for.
+    selection_source: Option<crate::config::hypervisor::SelectionSource>,
     automatic_hypervisor: Option<crate::config::host::HostConfig>,
     pinned_selection: std::sync::OnceLock<crate::config::hypervisor::HypervisorSelection>,
     /// The host facts vmlab-hv's refusals read at each start (§22): this
@@ -434,6 +437,7 @@ impl VmInstance {
             cdroms,
             floppy,
             share_hosts,
+            agent: super::machine::AgentSlot::for_transport(template.resolved.agent_transport),
             template: std::sync::RwLock::new(Arc::new(template)),
             nic_attachments: Mutex::new(Vec::new()),
             state: RwLock::new(PowerState::Stopped),
@@ -452,10 +456,10 @@ impl VmInstance {
             snapshot_refusal: std::sync::Mutex::new(None),
             usb: Mutex::new(Vec::new()),
             control: Mutex::new(None),
-            agent: super::machine::AgentSlot::default(),
             hv: Arc::new(super::hypervisor::Qemu),
             hypervisor: HypervisorKind::Qemu,
             hypervisor_fallback: None,
+            selection_source: None,
             automatic_hypervisor: None,
             pinned_selection: std::sync::OnceLock::new(),
             host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
@@ -487,6 +491,16 @@ impl VmInstance {
         self
     }
 
+    pub(super) fn with_selection_source(
+        mut self: Arc<Self>,
+        source: crate::config::hypervisor::SelectionSource,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("a freshly built VM has one owner")
+            .selection_source = Some(source);
+        self
+    }
+
     pub(super) fn with_automatic_hypervisor(
         mut self: Arc<Self>,
         host: Option<crate::config::host::HostConfig>,
@@ -510,6 +524,9 @@ impl VmInstance {
             ),
             None => crate::config::hypervisor::HypervisorSelection {
                 kind: self.hypervisor,
+                source: self
+                    .selection_source
+                    .unwrap_or(crate::config::hypervisor::SelectionSource::Machine),
                 fallback_reason: self.hypervisor_fallback.clone(),
             },
         }
@@ -608,6 +625,7 @@ impl VmInstance {
 
     /// Bind the template parts resolved by a deferred pull.
     pub fn set_template(&self, parts: TemplateParts) {
+        self.agent.set_transport(parts.resolved.agent_transport);
         *self.template.write().expect("template lock") = Arc::new(parts);
     }
 
@@ -1806,9 +1824,7 @@ impl VmInstance {
                 Ok(true)
             }
             PowerState::Stopped => {
-                for disk in self.all_disk_paths() {
-                    crate::template::qimg::snapshot_create(&disk, name).await?;
-                }
+                snapshot_offline_disks(&self.all_disk_paths(), name).await?;
                 Ok(false)
             }
             // Capturing must not change the guest, and waking it would.
@@ -1848,7 +1864,11 @@ impl VmInstance {
             control.pause().await?;
             let nodes = disk_nodes(self.all_disk_paths().len());
             let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-            snapshots.load(name, "disk0", &refs).await?;
+            if let Err(error) = snapshots.load(name, "disk0", &refs).await {
+                // A failed load must not strand a previously running VM.
+                let resume = control.resume().await;
+                return Err(error.context(format!("snapshot load failed, resume: {resume:?}")));
+            }
             // Drop the agent connection BEFORE resuming: the rewound guest
             // replays virtio-serial response bytes the host already
             // consumed. With no client attached QEMU discards the replayed
@@ -1885,7 +1905,16 @@ impl VmInstance {
             }
             _ => {
                 for disk in self.all_disk_paths() {
-                    crate::template::qimg::snapshot_delete(&disk, name).await?;
+                    // Capture rollback may already have removed this disk's
+                    // entry. Pending-intent cleanup is idempotent.
+                    if crate::template::qimg::image_info(&disk)
+                        .await?
+                        .snapshots
+                        .iter()
+                        .any(|snapshot| snapshot.name == name)
+                    {
+                        crate::template::qimg::snapshot_delete(&disk, name).await?;
+                    }
                 }
             }
         }
@@ -2067,6 +2096,18 @@ impl super::machine::Machine for VmInstance {
         self.selection().fallback_reason
     }
 
+    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
+        if self.automatic_hypervisor.is_none() && self.selection_source.is_none() {
+            return None;
+        }
+        crate::config::hypervisor::qemu_removal(
+            crate::config::model::MachineCfg::Vm(&self.cfg),
+            &self.selection(),
+            &(self.host_facts)(),
+            Some(&self.template().resolved),
+        )
+    }
+
     fn event_subject(&self) -> &'static str {
         "vm"
     }
@@ -2088,17 +2129,32 @@ impl super::machine::Machine for VmInstance {
         self.check_clone_source()
     }
 
-    /// The per-arch emulator, `qemu-img` for the clone, and `swtpm` when the
+    /// The per-arch emulator, `qemu-img` for the clone when it is the image
+    /// tool (`VMLAB_IMAGE_TOOL`), and `swtpm` when the
     /// resolved hardware wants a TPM. A VM whose host GPU carries its own
     /// `qemu_binary` needs no emulator on PATH: the start checks that one
     /// itself, naming the GPU (§5.2).
     fn check_host_config(&self) -> Result<()> {
+        if self.selection().source == SelectionSource::QemuMigration {
+            let why = crate::config::hypervisor::vmlab_refusals(
+                model::MachineCfg::Vm(&self.cfg),
+                &(self.host_facts)(),
+                Some(&self.template().resolved),
+            );
+            if !why.is_empty() {
+                bail!("{}", why.join("\n"));
+            }
+        }
         self.check_apple_smc_osk()
     }
 
     fn required_binaries(&self) -> Vec<String> {
         let t = self.template();
-        let mut needed = vec!["qemu-img".to_string()];
+        let mut needed: Vec<String> = crate::template::qimg::backend()
+            .required_binary()
+            .map(str::to_string)
+            .into_iter()
+            .collect();
         let own_qemu = t.resolved.gpu.as_ref().is_some_and(|gpu| {
             crate::config::host::HostConfig::load_default().is_ok_and(|host| {
                 qemu::hostgpu::pick(gpu, &host)
@@ -2164,7 +2220,11 @@ impl super::machine::Machine for VmInstance {
     /// Wire this VM's NICs into the lab fabric — taps on the fast path where
     /// available, since a VM's argv can carry pre-opened descriptors — then
     /// spawn QEMU with event-emitting callbacks.
-    async fn start(self: Arc<Self>, lab: Arc<dyn super::machine::LabServices>) -> Result<()> {
+    async fn start(
+        self: Arc<Self>,
+        lab: Arc<dyn super::machine::LabServices>,
+        output: Option<&crate::scripting::OutputSink>,
+    ) -> Result<()> {
         match self.power_state().await {
             PowerState::Stopped => {}
             // Starting a sleeping machine means waking it: QEMU is already
@@ -2175,8 +2235,12 @@ impl super::machine::Machine for VmInstance {
         // Safety net for paths that don't pull explicitly (restore, wscript):
         // a no-op unless this VM's template download is still pending.
         lab.ensure_pulled(&self.cfg.name).await?;
-        self.pinned_selection.get_or_init(|| self.selection());
-        lab.record_hypervisor(&self.cfg.name, self.hypervisor())
+        let selection = self.pinned_selection.get_or_init(|| self.selection());
+        let migrating = selection.source == SelectionSource::QemuMigration;
+        if migrating {
+            self.check_host_config()?;
+        }
+        lab.record_hypervisor(&self.cfg.name, selection.kind, migrating, output)
             .await?;
         let events = lab.events().clone();
         events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
@@ -2242,7 +2306,7 @@ impl super::machine::Machine for VmInstance {
         // Restoring into a running VM needs NIC listeners only if QEMU must be
         // booted; go through `start` for that so the wiring stays in one place.
         if online && self.power_state().await == PowerState::Stopped {
-            Arc::clone(&self).start(Arc::clone(&lab)).await?;
+            Arc::clone(&self).start(Arc::clone(&lab), None).await?;
         }
         let events_exit = lab.events().clone();
         let events_ready = lab.events().clone();
@@ -2579,6 +2643,35 @@ fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
 }
 
+async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
+    // Refuse duplicate names before changing any disk, so rollback never
+    // removes a snapshot that predates this operation.
+    for disk in disks {
+        if crate::template::qimg::image_info(disk)
+            .await?
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.name == name)
+        {
+            bail!("{}: snapshot {name:?} already exists", disk.display());
+        }
+    }
+    for (index, disk) in disks.iter().enumerate() {
+        if let Err(error) = crate::template::qimg::snapshot_create(disk, name).await {
+            let mut failures = Vec::new();
+            for earlier in disks[..index].iter().rev() {
+                if let Err(rollback) = crate::template::qimg::snapshot_delete(earlier, name).await {
+                    failures.push(format!("{}: {rollback}", earlier.display()));
+                }
+            }
+            return Err(anyhow!(error).context(format!(
+                "offline snapshot failed, rollback errors: {failures:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_snapshot_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
@@ -2676,6 +2769,44 @@ impl KeepAwake {
 #[cfg(test)]
 mod tests {
     use super::{clone_source, clone_source_refusal, no_agent_hint};
+
+    #[tokio::test]
+    async fn offline_capture_rolls_back_an_earlier_disk_when_a_later_disk_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.qcow2");
+        let second = dir.path().join("second.raw");
+        crate::template::qimg::create_blank(&first, 1 << 20)
+            .await
+            .unwrap();
+        std::fs::write(&second, [0; 512]).unwrap();
+        let error = super::snapshot_offline_disks(&[first.clone(), second], "capture")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("rollback errors: []"));
+        assert!(
+            crate::template::qimg::image_info(&first)
+                .await
+                .unwrap()
+                .snapshots
+                .is_empty()
+        );
+        crate::template::qimg::snapshot_create(&first, "capture")
+            .await
+            .unwrap();
+        assert!(
+            super::snapshot_offline_disks(std::slice::from_ref(&first), "capture")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::template::qimg::image_info(&first)
+                .await
+                .unwrap()
+                .snapshots
+                .len(),
+            1
+        );
+    }
 
     fn vm(decl: &str) -> crate::config::model::Vm {
         crate::qemu::resolve::testing::vm(decl)

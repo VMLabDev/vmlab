@@ -1,7 +1,10 @@
 """Release branch dry builds must never acquire signing or publish rights."""
 import json
+import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -42,6 +45,56 @@ def test_signing_and_publication_are_main_only():
     assert 'scripts/release-assets.py' in commands
     assert 'sha256sum --check SHA256SUMS' in commands
     assert 'cosign' not in commands
+
+
+@pytest.mark.parametrize('matrix', JOBS['build']['strategy']['matrix']['include'])
+def test_release_build_uploads_required_assets(tmp_path, matrix):
+    version = '0.0.0-dry-run'
+    expressions = {'needs.version.outputs.version': version,
+                   'matrix.target': matrix['target'], 'matrix.suffix': matrix['suffix']}
+
+    def render(value):
+        return re.sub(r'\$\{\{\s*(.*?)\s*\}\}', lambda match: expressions[match[1]], value)
+
+    # Stand in for the explicit Cargo binary outputs, then run the real staging step.
+    steps = JOBS['build']['steps']
+    build = next(step['run'] for step in steps if step.get('run', '').startswith('cargo build '))
+    args = shlex.split(render(build))
+    output = tmp_path / 'target' / args[args.index('--target') + 1] / 'release'
+    output.mkdir(parents=True)
+    for index, arg in enumerate(args):
+        if arg == '--bin':
+            (output / args[index + 1]).write_bytes(b'compiled fixture')
+    stage = next(step['run'] for step in steps if step.get('name') == 'Stage assets')
+    subprocess.run(['bash', '-e', '-c', render(stage)], cwd=tmp_path, check=True)
+
+    # Stand in for the bundle recipes, then pass only the configured upload files
+    # to the same checksum and provenance step used on release branches.
+    for directory, name in [
+        ('target/guest-package', f'vmlab-guest-{version}.tar.gz'),
+        ('target/dist', f'vmlab-hv-{version}-linux-x86_64.tar.gz'),
+    ]:
+        output = tmp_path / directory
+        output.mkdir(parents=True)
+        (output / name).write_bytes(b'bundle fixture')
+        (output / f'{name}.sha256').write_bytes(b'checksum fixture')
+
+    dist = tmp_path / 'dist'
+    dist.mkdir()
+    for job in ('build', 'guest-assets', 'hv-build'):
+        upload = next(step['with'] for step in JOBS[job]['steps']
+                      if step.get('uses', '').startswith('actions/upload-artifact@'))
+        for pattern in render(upload['path']).splitlines():
+            for path in tmp_path.glob(pattern):
+                shutil.copy2(path, dist)
+
+    prepare = next(step for step in JOBS['release-assets']['steps']
+                   if 'scripts/release-assets.py' in step.get('run', ''))
+    (tmp_path / 'scripts').mkdir()
+    shutil.copy2(ROOT / 'scripts/release-assets.py', tmp_path / 'scripts')
+    env = dict(os.environ, VERSION=render(prepare['env']['VERSION']),
+               GITHUB_SHA='a' * 40, GITHUB_RUN_ID='123')
+    subprocess.run(['bash', '-e', '-c', prepare['run']], cwd=tmp_path, env=env, check=True)
 
 
 def test_action_pins_remain_immutable():

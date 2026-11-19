@@ -34,6 +34,10 @@ pub struct MachineState {
     /// Snapshot name → record.
     #[serde(default)]
     pub snapshots: BTreeMap<String, SnapshotRecord>,
+    /// Durable capture intents. A crash or failed rollback leaves the name
+    /// here, never silently presenting a partial capture as restorable.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub pending_snapshots: std::collections::BTreeSet<String>,
     /// The agent version `vmlab machine repair-agent` pushed into this
     /// machine, which is what makes it a **diverged machine** (PRD §19.4):
     /// its guest content no longer matches the artefact it was created from,
@@ -59,8 +63,8 @@ pub struct MachineState {
 }
 
 impl MachineState {
-    /// Old disks without an identity predate automatic selection. Preserve
-    /// QEMU unless a snapshot records a later vmlab-hv run.
+    /// Old disks without an identity predate automatic selection. Infer QEMU
+    /// unless a snapshot records a later vmlab-hv run.
     pub fn existing_hypervisor(
         &self,
         local: &Path,
@@ -78,6 +82,19 @@ impl MachineState {
                     .exists()
                     .then_some(crate::config::hypervisor::HypervisorKind::Qemu)
             })
+    }
+
+    /// The online snapshots QEMU took, by name. Their RAM and device state
+    /// are QEMU's own format, so none restores once QEMU stops running the
+    /// machine; they stay on disk.
+    pub fn qemu_online_snapshots(&self) -> Vec<String> {
+        self.snapshots
+            .iter()
+            .filter(|(_, s)| {
+                s.online && s.hypervisor == crate::config::hypervisor::HypervisorKind::Qemu
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 }
 
@@ -124,14 +141,22 @@ pub struct SnapshotRecord {
 impl SnapshotRecord {
     /// Why this snapshot cannot be restored on a machine that now runs on
     /// `now` — `None` when it can (PRD §22, D31). Only an online one is
-    /// bound to its hypervisor, and switching the machine back makes it
-    /// restorable again, so the refusal says how.
+    /// bound to its hypervisor.
     pub fn hypervisor_refusal(
         &self,
         machine: &str,
         snap: &str,
         now: crate::config::hypervisor::HypervisorKind,
     ) -> Option<String> {
+        use crate::config::hypervisor::HypervisorKind::{Qemu, Vmlab};
+        if self.online && self.hypervisor == Qemu && now == Vmlab {
+            return Some(format!(
+                "\"{machine}\": snapshot \"{snap}\" was taken online under QEMU and is \
+                 unrestorable on vmlab-hv. To convert it to offline, restore it with QEMU \
+                 using a release that supports it for this guest, stop the machine, and take \
+                 an offline snapshot before upgrading."
+            ));
+        }
         (self.online && self.hypervisor != now).then(|| {
             format!(
                 "\"{machine}\": snapshot \"{snap}\" was taken online under {took}, and the \
@@ -463,5 +488,31 @@ mod tests {
     fn a_missing_state_file_is_a_fresh_lab() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(LabState::load(tmp.path()).unwrap().machines.is_empty());
+    }
+
+    /// The removal listing names what QEMU took online, and nothing an
+    /// offline restore or vmlab-hv can still load.
+    #[test]
+    fn only_online_qemu_snapshots_are_lost_with_qemu() {
+        use crate::config::hypervisor::HypervisorKind;
+        let record = |online, hypervisor| SnapshotRecord {
+            online,
+            taken_at: chrono::Utc::now(),
+            image_digest: None,
+            freeze_point: None,
+            frozen_in: None,
+            hypervisor,
+        };
+        let mut state = MachineState::default();
+        for (name, online, hypervisor) in [
+            ("warm", true, HypervisorKind::Qemu),
+            ("cold", false, HypervisorKind::Qemu),
+            ("hv", true, HypervisorKind::Vmlab),
+        ] {
+            state
+                .snapshots
+                .insert(name.into(), record(online, hypervisor));
+        }
+        assert_eq!(state.qemu_online_snapshots(), ["warm"]);
     }
 }

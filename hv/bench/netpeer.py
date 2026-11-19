@@ -19,6 +19,11 @@ NETPEER_BIN = os.path.join(BIN_DIR, "netpeer")
 _RANDBLKE_BIN = os.path.join(BIN_DIR, "randblke")
 
 
+def host_peer_cpu():
+    """Use the highest allowed host CPU, outside the default helios VM window."""
+    return max(os.sched_getaffinity(0))
+
+
 def compile_tools(log=None):
     """Build netpeer and randblke (cc -O2 -static) if absent. Returns the
     randblke path; raises with the compiler's output when it cannot."""
@@ -74,34 +79,34 @@ class Peer:
     measurement window.
     """
 
-    def __init__(self, run_dir, guest_ip, guest_mac, udp_port, log=None):
-        self.run_dir = run_dir
+    def __init__(self, run_dir, guest_ip, guest_mac, udp_port, log=None, *, cpu=None):
+        self.ctl = None
+        self.log = log
+        self.stderr_path = os.path.join(run_dir, "netpeer.stderr.log")
         self.switch_sock = os.path.join(run_dir, "switch.sock")
         self.ctl_sock = os.path.join(run_dir, "peerctl.sock")
         for path in (self.switch_sock, self.ctl_sock):
             if os.path.exists(path):
                 os.remove(path)
-        self.proc = subprocess.Popen(
-            [
-                NETPEER_BIN, "peer", self.switch_sock, self.ctl_sock,
-                lib.BENCH_NET["peer_ip"], lib.BENCH_NET["peer_mac"],
-                guest_ip, guest_mac, str(udp_port),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+        argv = [
+            NETPEER_BIN, "peer", self.switch_sock, self.ctl_sock,
+            lib.BENCH_NET["peer_ip"], lib.BENCH_NET["peer_mac"],
+            guest_ip, guest_mac, str(udp_port),
+        ]
+        if cpu is not None:
+            argv = lib.taskset_prefix(str(cpu)) + argv
+        if log:
+            log(f"netpeer host CPU={cpu}; stderr at {self.stderr_path}")
+        with open(self.stderr_path, "wb") as stderr:
+            self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=stderr)
         deadline = time.monotonic() + 10
-        while not os.path.exists(self.switch_sock):
+        while not os.path.exists(self.ctl_sock):
             if self.proc.poll() is not None:
-                raise lib.BenchError(
-                    f"netpeer died: {self.proc.stderr.read().decode()[-500:]}"
-                )
+                raise lib.BenchError(f"netpeer exited {self.proc.returncode}; see {self.stderr_path}")
             if time.monotonic() > deadline:
                 self.kill()
-                raise lib.BenchError("netpeer never bound its socket")
+                raise lib.BenchError(f"netpeer never bound its control socket; see {self.stderr_path}")
             time.sleep(0.05)
-        self.ctl = None
-        self.log = log
 
     def control(self):
         if self.ctl is None:
@@ -110,11 +115,19 @@ class Peer:
 
     def report(self):
         """Snapshot (and reset) the peer's counters."""
-        return self.control().request(cmd="report")
+        return self.request(cmd="report")
+
+    def request(self, **msg):
+        try:
+            return self.control().request(**msg)
+        except (OSError, ValueError) as error:
+            raise lib.BenchError(
+                f"netpeer control {msg['cmd']} failed ({error}); see {self.stderr_path}"
+            ) from error
 
     def blast(self, secs, payload):
         """Fire the RX blast; returns when the peer acknowledges."""
-        reply = self.control().request(cmd="blast", secs=secs, payload=payload)
+        reply = self.request(cmd="blast", secs=secs, payload=payload)
         if not reply.get("ok"):
             raise lib.BenchError(f"netpeer blast refused: {reply}")
 

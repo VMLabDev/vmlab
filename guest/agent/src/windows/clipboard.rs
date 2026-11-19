@@ -558,7 +558,7 @@ mod clip {
         CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
-        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
     };
 
     const CF_UNICODETEXT: u32 = 13;
@@ -587,11 +587,12 @@ mod clip {
                         std::io::Error::last_os_error()
                     ))
                 } else {
-                    let mut len = 0usize;
-                    while *ptr.add(len) != 0 {
-                        len += 1;
-                    }
-                    let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                    // The owner's allocation bounds the scan for the NUL: a
+                    // clipboard owner that left none must not walk the read
+                    // past its memory (code review F59).
+                    let units = GlobalSize(handle as HGLOBAL) / 2;
+                    let all = std::slice::from_raw_parts(ptr, units);
+                    let text = String::from_utf16_lossy(crate::clipboard::until_nul(all));
                     GlobalUnlock(handle as HGLOBAL);
                     Ok(text)
                 }
