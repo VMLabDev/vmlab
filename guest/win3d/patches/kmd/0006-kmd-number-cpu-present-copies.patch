@@ -1,0 +1,107 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: number the CPU copies of Blt presents for their readers
+
+A windowed Direct3D 9 present and every other Blt present on a Venus context
+is a copy on a guest CPU, in DxgkDdiSubmitCommand, into a shadow or staging
+surface in guest memory. The compositor reads that memory on the CPU to
+compose the window. Windows orders the copy after the application's rendering
+(the ring fence of its queue) and the flip after the compositor's rendering,
+but nothing orders the compositor's read against the copy: on a real video
+card the Blt is a GPU operation and the read is too. A read that overlaps a
+copy takes rows of two frames, and the console shows a band of the earlier
+frame (card #134, docs/tearing.md). A host that preempts the vCPU inside the
+copy stretches it from about 30 us to milliseconds.
+
+The copy cannot see the reader and must not wait in DxgkDdiSubmitCommand. So
+it is numbered: m_cpuCopySequence is incremented before and after each copy,
+and the new escape VIOGPU_CPU_COPY_SEQUENCE returns it. It is odd while a
+copy writes. The user-mode driver reads it around its read of upload sources
+and reads again when it changed (patches/mesa/0094).
+---
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+index affff98..85b95e8 100644
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -76,6 +76,11 @@ typedef struct _VIOGPU_ADAPTERINFO
+ #define VIOGPU_RES_SET_SCANOUT_BLOB  0x105
+ #define VIOGPU_RES_ATTACH_WAIT       0x106
+ #define VIOGPU_CHECK_DIRECT_FLIP     0x107
++/* vmlab: the sequence number of the CPU copy of Blt presents, in Id. It is odd
++ * while a copy writes a destination. A reader of such a destination (the
++ * compositor's texture upload) reads it before and after, and reads again
++ * when the two differ or are odd. */
++#define VIOGPU_CPU_COPY_SEQUENCE     0x1F0
+ 
+ #define VIOGPU_CTX_INIT              0x200
+ #define VIOGPU_QUERY_TIMELINE_SUBMIT 0x301
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 03105d8..068cb4b 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1495,6 +1495,15 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                 vidpn.EscapeCustomResoulution(&pVioGpuEscape->Resolution);
+                 break;
+             }
++        case VIOGPU_CPU_COPY_SEQUENCE:
++            {
++                if (pVioGpuEscape->DataLength < sizeof(UINT))
++                {
++                    return STATUS_INVALID_BUFFER_SIZE;
++                }
++                pVioGpuEscape->Id = static_cast<ULONG>(InterlockedCompareExchange(&m_cpuCopySequence, 0, 0));
++                break;
++            }
+         case VIOGPU_GET_CAPS:
+             {
+                 size = sizeof(VIOGPU_CAPSET_REQ);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index cf4ffc7..3a88307 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -204,6 +204,7 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     volatile LONG64 m_traceSequence = 0;
+     VIOGPU_TRACE_RECORD m_trace[256] = {};
+     VIOGPU_TRACE m_timeoutTrace = {};
++    volatile LONG m_cpuCopySequence = 0;
+ #if VIOGPU_FLIP_TRACE
+     volatile LONG64 m_flipTraceSequence = 0;
+     VIOGPU_TRACE_RECORD m_flipTrace[65536] = {};
+@@ -322,6 +323,15 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     void Trace(UINT event, UINT node = 0, UINT engine = 0, UINT context = 0,
+                UINT flags = 0, UINT64 fence = 0, UINT response = 0, UINT pending = 0);
+     void CopyTrace(VIOGPU_TRACE *trace);
++    // Brackets the CPU copy of a Blt present: VIOGPU_CPU_COPY_SEQUENCE is odd in between.
++    void BeginCpuCopy()
++    {
++        InterlockedIncrement(&m_cpuCopySequence);
++    }
++    void EndCpuCopy()
++    {
++        InterlockedIncrement(&m_cpuCopySequence);
++    }
+ #if VIOGPU_FLIP_TRACE
+     void FlipTrace(UINT event, UINT context = 0, UINT flags = 0, UINT64 fence = 0, UINT response = 0, UINT pending = 0);
+     void ReadFlipTrace(VIOGPU_FLIP_TRACE_READ *read);
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index 56cf721..371668f 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -758,6 +758,10 @@ void VioGpuCommand::Run()
+     {
+         m_pAdapter->FlipTrace(16, GetContextId(), m_cpuCopySrc ? m_cpuCopySrc->GetId() : 0, m_FenceId,
+                               m_cpuCopyDst ? m_cpuCopyDst->GetId() : 0);
++        // The destination is guest memory that the compositor reads on the
++        // CPU whenever it likes. It cannot be stopped, so it is told: a
++        // reader that sees the sequence change reads again.
++        m_pAdapter->BeginCpuCopy();
+         NTSTATUS copyStatus =
+             VioGpuCpuCopyBltPresent(this, m_cpuCopySrc,
+                                     m_cpuCopyDst, &m_cpuCopySrcRect,
+@@ -768,6 +772,7 @@ void VioGpuCommand::Run()
+                                     m_cpuCopyDstMapSize,
+                                     m_cpuCopySubRects,
+                                     m_cpuCopySubRectCnt);
++        m_pAdapter->EndCpuCopy();
+         m_pAdapter->FlipTrace(22, GetContextId(), m_cpuCopySrc ? m_cpuCopySrc->GetId() : 0, m_FenceId,
+                               m_cpuCopyDst ? m_cpuCopyDst->GetId() : 0);
+         if (!NT_SUCCESS(copyStatus))
