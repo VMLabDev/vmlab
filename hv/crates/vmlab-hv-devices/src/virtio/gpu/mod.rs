@@ -241,6 +241,9 @@ impl Gpu {
     pub fn set_display_sink(&self, sink: Arc<dyn DisplaySink>) {
         let mut s = self.state.lock();
         s.display = Some(sink);
+        if let Some(timestamp_ns) = s.flush_pending {
+            s.publish_scanout(timestamp_ns);
+        }
         if s.pacer.is_none() {
             match pacer::Pacer::spawn(&self.id, Arc::downgrade(&self.state)) {
                 Ok(pacer) => s.pacer = Some(pacer),

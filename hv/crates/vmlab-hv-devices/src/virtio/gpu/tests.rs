@@ -124,6 +124,98 @@ fn all_formats_convert_to_bgra() {
 }
 
 #[test]
+fn snapshot_publishes_pending_flush_without_guest_activity() {
+    #[derive(Default)]
+    struct Sink(parking_lot::Mutex<Vec<ScanoutUpdate>>);
+
+    impl DisplaySink for Sink {
+        fn needs_cpu(&self) -> bool {
+            true
+        }
+
+        fn update(&self, frame: ScanoutUpdate) {
+            self.0.lock().push(frame);
+        }
+    }
+
+    let gpu = Gpu::new("gpu");
+    let original = Arc::new(Sink::default());
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+    };
+    {
+        let mut s = gpu.state.lock();
+        s.display = Some(original.clone());
+        // Record pacing requests without a thread that could publish before save.
+        s.pacer = Some(Arc::new(pacer::Pacer::default()));
+        s.native = true;
+        s.scanout = Some((1, rect));
+        s.resources.insert(
+            1,
+            Resource {
+                width: 1,
+                height: 1,
+                format: 2,
+                pixels: vec![0; 4],
+                backing: vec![],
+            },
+        );
+        s.publish_scanout(1);
+        s.resources.get_mut(&1).unwrap().pixels = vec![42, 42, 42, 0];
+
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let mut flush = vec![0; 24];
+        flush[..4].copy_from_slice(&0x104u32.to_le_bytes());
+        for word in [0u32, 0, 1, 1, 1, 0] {
+            flush.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(s.command(&mem, 0, &flush).is_ok());
+        s.schedule_flush(2);
+    }
+    let saved = gpu.save_state().unwrap();
+    assert_eq!(original.0.lock().len(), 1);
+
+    for attach_before_restore in [true, false] {
+        let mut restored = Gpu::new("restored");
+        let sink = Arc::new(Sink::default());
+        if attach_before_restore {
+            restored.set_display_sink(sink.clone());
+        }
+        restored.restore_state(&saved).unwrap();
+        if !attach_before_restore {
+            restored.set_display_sink(sink.clone());
+        }
+
+        let updates = sink.0.lock();
+        let [update] = updates.as_slice() else {
+            panic!("expected one restored frame, got {}", updates.len());
+        };
+        assert_eq!(update.timestamp_ns, 2);
+        let ScanoutPixels::Shm(frame) = &update.pixels else {
+            panic!("expected a restored 2D scanout");
+        };
+        assert_eq!(frame.pixels, [42, 42, 42, 0]);
+        assert!(restored.state.lock().flush_pending.is_none());
+    }
+}
+
+#[test]
+fn restores_gpu_snapshot_without_flush_state() {
+    let mut gpu = Gpu::new("gpu");
+    gpu.request_size(1920, 1080).unwrap();
+    let current = gpu.save_state().unwrap();
+    let mut old = current.clone();
+    old[4] = 1;
+    assert_eq!(old.pop(), Some(0));
+    gpu.request_size(1024, 768).unwrap();
+    gpu.restore_state(&old).unwrap();
+    assert_eq!(gpu.save_state().unwrap(), current);
+}
+
+#[test]
 fn invalid_snapshots_do_not_change_gpu() {
     let mut gpu = Gpu::new("gpu");
     gpu.request_size(1920, 1080).unwrap();
