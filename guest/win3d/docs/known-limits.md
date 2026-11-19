@@ -26,6 +26,16 @@ and the Intel and laptop NVIDIA hosts.
 The device is now named "Yttrium VirtIO GPU 3D controller". Older evidence
 says "Hardsoft VirtIO GPU 3D controller".
 
+## Hardware pointer
+
+Since driver `100.6.101.58106` Windows hands the pointer to the host
+([pointer.md](pointer.md)). Pixels that ask to invert the screen (the text
+I-beam) are black with a white outline. A pointer larger than 64×64 is drawn
+into the frame by Windows, and only the first display has a hardware pointer.
+Checked on `windows-11` on `AMD1` and `Nvidia2` with `tests/e2e/pointer.sh`.
+Not tested: more than one display, a pointer above 64×64, sleep and resume,
+a timeout recovery while the pointer is on, Windows 10, and QEMU.
+
 ## Timeout recovery
 
 The unreleased `0.1.3` candidate implements adapter timeout reset and restart.

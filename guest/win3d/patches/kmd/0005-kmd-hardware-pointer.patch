@@ -13,8 +13,7 @@ shows or hides the pointer (a resource id of 0 hides it), and
 VIRTIO_GPU_CMD_MOVE_CURSOR only moves it: vmlab-hv ignores the resource id
 of a move, so a hide sent as a move left the pointer on the screen. The
 position sent is the hotspot's, the image's top left corner plus the
-hotspot, because that is what vmlab-hv's frame protocol and QEMU's GTK and
-SDL windows draw from. The upload is on the control queue and the commands
+hotspot, because vmlab-hv's frame protocol defines it so. The upload is on the control queue and the commands
 are on the cursor queue, which the host reads independently, so the shape
 waits up to 250 ms for a no-op behind the upload.
 
@@ -90,7 +89,7 @@ index ddd6f46..401f8a5 100644
  HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
  ; KMTUMDVERSION_DX12 is slot 3; preserve the existing DX9/DX10/DX11 UMDs.
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 7806089..e313939 100644
+index 7806089..d819e81 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
 @@ -166,6 +166,15 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
@@ -305,7 +304,7 @@ index 7806089..e313939 100644
 +
 +// One command on the cursor queue. "Use this image" (define) also carries whether the pointer
 +// shows: a resource id of 0 hides it, and only that command hides or shows it on every host.
-+// The position is the hotspot's, which is what the hosts draw from: Windows gives the top left
++// The position is the hotspot's, which is what vmlab-hv draws from: Windows gives the top left
 +// corner of the image. The hotspot is never left of or above the screen.
 +void VioGpuAdapter::SendCursor(BOOLEAN define)
 +{
