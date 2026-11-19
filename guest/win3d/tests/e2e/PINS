@@ -2,6 +2,10 @@
 # guest. Not committed; fetched into .scratch/e2e/cache/ and checked here.
 # name  sha256  url
 lunarg-vulkanrt-components  a25a927aa8b9f0371048f1861cf88ac3b9bc9b1fb332c42d897c8ab32695769a  https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/VulkanRT-X64-1.4.363.0-Components.zip
+# Chrome for Testing 158.0.8127.36 (the Stable channel on 2026-11-19), win64,
+# for tests/e2e/chromium.sh. Google publishes no hash; this is the file the
+# URL served on 2026-11-19.
+chrome-for-testing  6a8ad290952cc612c7777ffb3eb62f345539a2a1a8d440cfac190c6d36b34d2c  https://storage.googleapis.com/chrome-for-testing-public/158.0.8127.36/win64/chrome-win64.zip
 # Stretch (tests/e2e/apps.sh): unmodified third-party applications.
 # DirectX SDK (June 2010): prebuilt D3D9 and D3D11 samples, their Media, and
 # the D3DX/D3DCompiler_43 redistributable (DXSETUP) they need. Microsoft does
