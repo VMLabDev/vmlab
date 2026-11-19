@@ -11,7 +11,8 @@
 # runs the x64 and the x86 probe in the user's session with
 # tests/guest/Run-Probe.ps1, and reads the lines the driver wrote about the
 # probe into C:\ProgramData\Yttrium\yttrium-errors.log: one "forced-sample
-# draw tir_probe.exe ... coverage=..." line for each pipeline. A run passes
+# draw tir_probe.exe ... coverage=..." line for each pipeline. It moves the
+# log that is there to yttrium-errors.log.before-tir-<arch> first. A run passes
 # when the probe found no pixel that differs from WARP or between its runs,
 # and every such line says coverage=passes. Without a line the probe did not
 # reach the path, and the run fails. Writes <evidence-dir>/tir/: tir.txt (the
@@ -21,7 +22,7 @@
 # Exit status: 0 when both pass, 1 when one fails, 2 on usage.
 # check-shell-paths: no-errexit each probe run records its result and the check judges both (VML-88).
 set -uo pipefail
-[ $# -eq 3 ] || { sed -n '2,21p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,22p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 LABDIR=$(cd "$1" && pwd)
 VM=$2
@@ -53,10 +54,13 @@ failed=0
 for arch in x64 x86; do
     note "tir_probe $arch"
     in_lab vmlab cp "$OUT/$arch/tir_probe.exe" "$VM:C:/win3d/probes-extra/$arch/tir_probe.exe" >/dev/null || exit 1
-    before=$(driver_lines | grep -c .)
+    # The log belongs to the process that made it, most often dwm.exe, and the
+    # probe's user cannot append to that file: its lines would be lost. Move
+    # the log away, so that the probe makes a new one.
+    gps "if (Test-Path '$LOG') { Move-Item -Force '$LOG' '$LOG.before-tir-$arch' }" 60
     gps "& 'C:\\win3d\\guest\\Run-Probe.ps1' -Path 'C:\\win3d\\probes-extra\\$arch\\tir_probe.exe' -NoModules -Name tir-$arch -OutDir '$R' -Seconds 30" 400 >"$EV/run-$arch.json" 2>&1
     in_lab vmlab cp "$VM:C:/win3d/results/tir/tir-$arch.json" "$EV/tir-$arch.json" >/dev/null 2>&1
-    driver_lines | tail -n +$((before + 1)) >"$EV/lines-$arch.txt"
+    driver_lines >"$EV/lines-$arch.txt"
     sed "s/^/$arch: /" "$EV/lines-$arch.txt" >>"$EV/driver-log.txt"
     python3 - "$arch" "$EV/tir-$arch.json" "$EV/lines-$arch.txt" <<'PY' | tee -a "$EV/tir.txt"
 import json, sys
