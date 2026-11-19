@@ -561,59 +561,76 @@ fn bar_probes_pci_indirect_access_and_bounds() {
 }
 
 #[test]
-fn notify_events_follow_activation_at_each_layout_notify_address() {
-    let modern = VirtioPciDevice::new(
-        "net",
-        Box::new(
-            Net::new(NetConfig {
-                id: "net".into(),
-                mac: [2, 0, 0, 0, 0, 1],
-                mtu: 1500,
-                switch: "/nonexistent/vmlab-test-switch".into(),
-            })
-            .unwrap(),
-        ),
-        memory(),
-        None,
-        None,
-    );
-    for (mut pci, notify) in [(modern, 0x1000), (net(), 0x3000)] {
-        assert!(pci.notify_events().is_empty());
-        assert!(!pci.take_notify_change());
-        pci.bar_write(4, 0x14, &[0]);
-        pci.bar_write(4, 0x14, &[3]);
-        pci.bar_write(4, 8, &1u32.to_le_bytes());
-        pci.bar_write(4, 12, &1u32.to_le_bytes());
-        pci.bar_write(4, 0x14, &[11]);
-        for queue in 0..2u16 {
-            pci.bar_write(4, 0x16, &queue.to_le_bytes());
-            let base = DESC + u64::from(queue) * 0x4000;
-            for (off, addr) in [(0x20, base), (0x28, base + 0x1000), (0x30, base + 0x2000)] {
-                pci.bar_write(4, off, &addr.to_le_bytes());
-            }
-            pci.bar_write(4, 0x1c, &1u16.to_le_bytes());
+fn transitional_queue_doorbells_use_the_captured_notify_offset() {
+    struct Rec(Arc<Mutex<Vec<u64>>>);
+    impl crate::QueueDoorbells for Rec {
+        fn set(&mut self, doorbells: &[crate::QueueDoorbell]) -> std::io::Result<()> {
+            *self.0.lock() = doorbells.iter().map(|d| d.address).collect();
+            Ok(())
         }
-        assert!(pci.notify_events().is_empty());
-        pci.bar_write(4, 0x14, &[15]);
-        assert!(pci.activated);
-        assert!(pci.take_notify_change());
-        assert!(!pci.take_notify_change());
-        let events = pci.notify_events();
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| (event.bar, event.offset))
-                .collect::<Vec<_>>(),
-            [(4, notify), (4, notify + 4)]
-        );
-        // The address the event stands for reaches the same queue.
-        assert!(Arc::ptr_eq(
-            &events[1].event,
-            &pci.device().notify_event(1).unwrap()
-        ));
-
-        pci.bar_write(4, 0x14, &[0]);
-        assert!(pci.take_notify_change());
-        assert!(pci.notify_events().is_empty());
     }
+    let block = Block::new("blk", Box::new(MemDisk::new(65536)))
+        .with_num_queues(2)
+        .unwrap();
+    let worker = crate::virtio::worker::QueueWorker::new(Box::new(block)).unwrap();
+    let mut pci =
+        VirtioPciDevice::new_transitional("pci", Box::new(worker), memory(), None, None, 3)
+            .unwrap();
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    pci.set_queue_doorbells(Box::new(Rec(registered.clone())));
+    pci.set_bar_address(4, Some(0xfe00_0000));
+    assert!(registered.lock().is_empty());
+    pci.bar_write(4, 0x14, &[0]);
+    pci.bar_write(4, 0x14, &[3]);
+    pci.bar_write(4, 8, &1u32.to_le_bytes());
+    pci.bar_write(4, 12, &1u32.to_le_bytes());
+    pci.bar_write(4, 0x14, &[11]);
+    for (off, addr) in [(0x20, DESC), (0x28, 0x11000u64), (0x30, 0x12000)] {
+        pci.bar_write(4, off, &addr.to_le_bytes());
+    }
+    pci.bar_write(4, 0x1c, &1u16.to_le_bytes());
+    pci.bar_write(4, 0x14, &[15]);
+    assert_eq!(*registered.lock(), [0xfe00_3000, 0xfe00_3004]);
+}
+
+#[test]
+fn net_queue_doorbells_share_one_event_at_each_queue_notify_address() {
+    struct Rec(Arc<Mutex<Vec<crate::QueueDoorbell>>>);
+    impl crate::QueueDoorbells for Rec {
+        fn set(&mut self, doorbells: &[crate::QueueDoorbell]) -> std::io::Result<()> {
+            *self.0.lock() = doorbells.to_vec();
+            Ok(())
+        }
+    }
+    let mut pci = net();
+    let registered = Arc::new(Mutex::new(Vec::new()));
+    pci.set_queue_doorbells(Box::new(Rec(registered.clone())));
+    pci.set_bar_address(4, Some(0xfe00_0000));
+    pci.bar_write(4, 0x14, &[0]);
+    pci.bar_write(4, 0x14, &[3]);
+    pci.bar_write(4, 8, &1u32.to_le_bytes());
+    pci.bar_write(4, 12, &1u32.to_le_bytes());
+    pci.bar_write(4, 0x14, &[11]);
+    for queue in 0..2u16 {
+        pci.bar_write(4, 0x16, &queue.to_le_bytes());
+        let base = DESC + u64::from(queue) * 0x4000;
+        for (off, addr) in [(0x20, base), (0x28, base + 0x1000), (0x30, base + 0x2000)] {
+            pci.bar_write(4, off, &addr.to_le_bytes());
+        }
+        pci.bar_write(4, 0x1c, &1u16.to_le_bytes());
+    }
+    assert!(registered.lock().is_empty());
+    pci.bar_write(4, 0x14, &[15]);
+    assert!(pci.activated);
+    {
+        let doorbells = registered.lock();
+        assert_eq!(
+            doorbells.iter().map(|d| d.address).collect::<Vec<_>>(),
+            [0xfe00_3000, 0xfe00_3004]
+        );
+        // One worker serves every queue, so the queues share the event.
+        assert!(Arc::ptr_eq(&doorbells[0].event, &doorbells[1].event));
+    }
+    pci.bar_write(4, 0x14, &[0]);
+    assert!(registered.lock().is_empty());
 }

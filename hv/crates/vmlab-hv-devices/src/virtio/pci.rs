@@ -28,8 +28,8 @@ use parking_lot::Mutex;
 use virtio_queue::{Queue, QueueT};
 
 use crate::{
-    BarInfo, BarKind, DeviceError, GuestMemory, IrqLine, MsiMessage, MsiSink, NotifyEvent,
-    PciDevice, PciSnapshot, Snapshot, VirtioDevice, VirtioInterrupt,
+    BarInfo, BarKind, DeviceError, GuestMemory, IrqLine, MsiMessage, MsiSink, PciDevice,
+    PciSnapshot, QueueDoorbell, QueueDoorbells, Snapshot, VirtioDevice, VirtioInterrupt,
 };
 
 #[path = "transitional.rs"]
@@ -299,13 +299,17 @@ pub struct VirtioPciDevice {
     queue_select: u16,
     queue_cfg: Vec<QueueCfg>,
     activated: bool,
-    /// Activation changed since the PCI root last asked for notify events.
-    notify_dirty: bool,
     // PCI state the guest writes.
     command: u16,
     bar4: u64,
     interrupt_line: u8,
     transitional: Option<LegacyPci>,
+    /// Kernel delivery of queue kicks, when the VMM offers it.
+    doorbells: Option<Box<dyn QueueDoorbells>>,
+    /// Where the PCI root decodes the BAR that holds the notify region.
+    notify_bar: Option<u64>,
+    /// The `notify_bar` the registered doorbells were made for.
+    doorbell_base: Option<u64>,
 }
 
 impl VirtioPciDevice {
@@ -415,12 +419,69 @@ impl VirtioPciDevice {
             queue_select: 0,
             queue_cfg,
             activated: false,
-            notify_dirty: false,
             command: 0,
             bar4: 0,
             interrupt_line: 0,
             transitional: None,
+            doorbells: None,
+            notify_bar: None,
+            doorbell_base: None,
             id,
+        }
+    }
+
+    /// Let the kernel deliver queue kicks. It takes effect for a device
+    /// that has [`VirtioDevice::queue_events`], while the device is
+    /// activated and the PCI root decodes the notify region. A kick that
+    /// still reaches `bar_write` is served as before.
+    pub fn set_queue_doorbells(&mut self, doorbells: Box<dyn QueueDoorbells>) {
+        self.doorbells = Some(doorbells);
+        self.sync_doorbells();
+    }
+
+    /// Offset of the notify region in the BAR that holds it.
+    fn notify_bar_offset(&self) -> u64 {
+        if self.transitional.is_some() {
+            transitional::NOTIFY_BAR_OFF
+        } else {
+            NOTIFY_OFF
+        }
+    }
+
+    /// Register or remove the doorbells so that they follow the activation
+    /// and the address of the notify region. Only the modern notify region
+    /// is registered: a legacy driver's port write still exits to userspace.
+    fn sync_doorbells(&mut self) {
+        let want = self.notify_bar.filter(|_| self.activated);
+        if want == self.doorbell_base {
+            return;
+        }
+        let offset = self.notify_bar_offset();
+        let Some(doorbells) = &mut self.doorbells else {
+            return;
+        };
+        let Some(events) = self.device.queue_events() else {
+            return;
+        };
+        let list: Vec<QueueDoorbell> = want
+            .into_iter()
+            .flat_map(|base| {
+                events
+                    .iter()
+                    .enumerate()
+                    .map(move |(queue, event)| QueueDoorbell {
+                        address: base + offset + NOTIFY_OFF_MULTIPLIER * queue as u64,
+                        event: event.clone(),
+                    })
+            })
+            .collect();
+        match doorbells.set(&list) {
+            Ok(()) => self.doorbell_base = want,
+            Err(error) => {
+                // The kicks keep arriving through `bar_write`.
+                log::warn!("{}: queue doorbells at {want:x?}: {error}", self.id);
+                self.doorbell_base = None;
+            }
         }
     }
 
@@ -463,8 +524,10 @@ impl VirtioPciDevice {
                 ..QueueCfg::default()
             };
         }
-        self.notify_dirty |= self.activated;
         self.activated = false;
+        // Before the device resets: its barrier then serves the last kicks
+        // the kernel delivered.
+        self.sync_doorbells();
         if let Some(legacy) = &mut self.transitional {
             legacy.active = false;
         }
@@ -564,7 +627,7 @@ impl VirtioPciDevice {
         match self.device.activate(self.mem.clone(), interrupt, queues) {
             Ok(()) => {
                 self.activated = true;
-                self.notify_dirty = true;
+                self.sync_doorbells();
             }
             Err(_) => self.driver_status |= device_status::DEVICE_NEEDS_RESET,
         }
@@ -847,6 +910,13 @@ impl PciDevice for VirtioPciDevice {
         }
     }
 
+    fn set_bar_address(&mut self, bar: u8, address: Option<u64>) {
+        if bar == BAR_INDEX {
+            self.notify_bar = address;
+            self.sync_doorbells();
+        }
+    }
+
     fn bars(&self) -> Vec<BarInfo> {
         if let Some(legacy) = &self.transitional {
             return legacy.bars();
@@ -856,34 +926,6 @@ impl PciDevice for VirtioPciDevice {
             size: BAR_SIZE,
             kind: BarKind::Mmio64 { prefetchable: true },
         }]
-    }
-
-    /// One event per queue the device can be woken through, at that queue's
-    /// notify address. Only an activated device has any: before DRIVER_OK a
-    /// notify write does nothing, and firmware that sizes BARs then costs no
-    /// registration.
-    fn notify_events(&self) -> Vec<NotifyEvent> {
-        if !self.activated {
-            return Vec::new();
-        }
-        let base = if self.transitional.is_some() {
-            transitional::NOTIFY_BAR_OFF
-        } else {
-            NOTIFY_OFF
-        };
-        (0..self.num_queues() as u16)
-            .filter_map(|queue| {
-                Some(NotifyEvent {
-                    bar: BAR_INDEX,
-                    offset: base + u64::from(queue) * NOTIFY_OFF_MULTIPLIER,
-                    event: self.device.notify_event(queue)?,
-                })
-            })
-            .collect()
-    }
-
-    fn take_notify_change(&mut self) -> bool {
-        std::mem::take(&mut self.notify_dirty)
     }
 
     fn bar_read(&mut self, bar: u8, offset: u64, data: &mut [u8]) {
@@ -1252,9 +1294,10 @@ impl VirtioPciDevice {
             let mut int = self.int.lock();
             int.epoch = int.epoch.wrapping_add(1);
         }
+        self.activated = false;
+        self.sync_doorbells();
         self.device.reset();
         self.driver_status = 0;
-        self.activated = false;
         self.device_feature_select = device_feature_select;
         self.guest_feature_select = guest_feature_select;
         self.driver_features = driver_features;
@@ -1390,13 +1433,16 @@ mod tests {
         }
 
         fn with_disk(disk: Box<dyn vmlab_disk::DiskImage>) -> Self {
+            Self::with_device(Box::new(Block::new("virtio-blk@guest", disk)))
+        }
+
+        fn with_device(device: Box<dyn VirtioDevice>) -> Self {
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
             let msi = Arc::new(RecMsi::default());
             let irq = Arc::new(RecIrq::default());
-            let block = Block::new("virtio-blk@guest", disk);
             let pci = VirtioPciDevice::new(
                 "pci@00:04.0",
-                Box::new(block),
+                device,
                 mem.clone(),
                 Some(msi.clone()),
                 Some(irq.clone()),
@@ -1509,6 +1555,13 @@ mod tests {
 
         /// Build an IN request chain for `sector` and kick the queue.
         fn submit_read(&mut self, sector: u64, head: u16, avail_idx: u16) {
+            self.queue_read(sector, head, avail_idx);
+            // Notify queue 0.
+            self.pci.bar_write(4, NOTIFY_OFF, &[0, 0, 0, 0]);
+        }
+
+        /// Build an IN request chain for `sector` without a kick.
+        fn queue_read(&mut self, sector: u64, head: u16, avail_idx: u16) {
             // Descriptor 0: request header. 1: data buffer (512, writable).
             // 2: status byte (writable).
             for (i, (addr, len, flags)) in [
@@ -1550,9 +1603,19 @@ mod tests {
                     GuestAddress(AVAIL + 4 + 2 * QUEUE_SIZE as u64),
                 )
                 .unwrap();
+        }
 
-            // Notify queue 0.
-            self.pci.bar_write(4, NOTIFY_OFF, &[0, 0, 0, 0]);
+        /// Wait for the used index a queue worker publishes.
+        fn wait_used(&self, idx: u16) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.used(0).0 != idx {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "used index stays at {}, expected {idx}",
+                    self.used(0).0
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
 
         fn used(&self, slot: u64) -> (u16, u16, u32) {
@@ -1571,6 +1634,136 @@ mod tests {
         fn status_byte(&self) -> u8 {
             self.mem.read_obj(GuestAddress(DATA + 0x800)).unwrap()
         }
+    }
+
+    /// Records what the transport asks the kernel to deliver.
+    #[derive(Default)]
+    struct RecDoorbells {
+        registered: Arc<Mutex<Vec<QueueDoorbell>>>,
+        refuse: Arc<Mutex<bool>>,
+    }
+
+    impl QueueDoorbells for RecDoorbells {
+        fn set(&mut self, doorbells: &[QueueDoorbell]) -> std::io::Result<()> {
+            self.registered.lock().clear();
+            if !doorbells.is_empty() && *self.refuse.lock() {
+                return Err(std::io::Error::other("refused"));
+            }
+            *self.registered.lock() = doorbells.to_vec();
+            Ok(())
+        }
+    }
+
+    fn worker_block(queues: u16) -> Box<dyn VirtioDevice> {
+        let block = Block::new("virtio-blk@guest", Box::new(MemDisk::new(64 * 1024)))
+            .with_num_queues(queues)
+            .unwrap();
+        Box::new(crate::virtio::worker::QueueWorker::new(Box::new(block)).unwrap())
+    }
+
+    fn addresses(registered: &Mutex<Vec<QueueDoorbell>>) -> Vec<u64> {
+        registered.lock().iter().map(|d| d.address).collect()
+    }
+
+    #[test]
+    fn queue_doorbells_follow_activation_and_the_notify_address() {
+        const BASE: u64 = 0x8_0000_0000;
+        let mut g = Guest::with_device(worker_block(2));
+        let doorbells = RecDoorbells::default();
+        let registered = doorbells.registered.clone();
+        g.pci.set_queue_doorbells(Box::new(doorbells));
+        g.pci.set_bar_address(BAR_INDEX, Some(BASE));
+        // Not before DRIVER_OK: a kick is ignored until then.
+        assert!(registered.lock().is_empty());
+        g.setup_msix();
+        g.negotiate_and_activate(0);
+        assert_eq!(
+            addresses(&registered),
+            [BASE + NOTIFY_OFF, BASE + NOTIFY_OFF + NOTIFY_OFF_MULTIPLIER]
+        );
+
+        // The kernel's delivery of a kick: a write to the event, with no
+        // call into the transport.
+        g.queue_read(2, 0, 1);
+        registered.lock()[0].event.write(1).unwrap();
+        g.wait_used(1);
+        assert_eq!(g.status_byte(), 0);
+        // A kick that exits to userspace is still served.
+        g.submit_read(3, 0, 2);
+        g.wait_used(2);
+
+        // The registrations follow the BAR, and leave while it is unmapped.
+        g.pci.set_bar_address(BAR_INDEX, Some(BASE + 0x10_0000));
+        assert_eq!(
+            addresses(&registered),
+            [
+                BASE + 0x10_0000 + NOTIFY_OFF,
+                BASE + 0x10_0000 + NOTIFY_OFF + NOTIFY_OFF_MULTIPLIER
+            ]
+        );
+        g.pci.set_bar_address(BAR_INDEX, None);
+        assert!(registered.lock().is_empty());
+        g.pci.set_bar_address(0, Some(BASE));
+        assert!(registered.lock().is_empty());
+        g.pci.set_bar_address(BAR_INDEX, Some(BASE));
+        assert_eq!(addresses(&registered).len(), 2);
+
+        // A driver reset removes them, and so does a system reset.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0);
+        assert!(registered.lock().is_empty());
+        g.negotiate_and_activate(0);
+        assert_eq!(addresses(&registered).len(), 2);
+        crate::Resettable::reset(&mut g.pci).unwrap();
+        assert!(registered.lock().is_empty());
+    }
+
+    #[test]
+    fn queue_doorbells_come_back_with_a_restored_transport() {
+        const BASE: u64 = 0x8_0000_0000;
+        let mut g = Guest::with_device(worker_block(1));
+        let doorbells = RecDoorbells::default();
+        let registered = doorbells.registered.clone();
+        g.pci.set_queue_doorbells(Box::new(doorbells));
+        g.pci.set_bar_address(BAR_INDEX, Some(BASE));
+        g.negotiate_and_activate(0);
+        let function = g.pci.save_function_state().unwrap();
+        let wrapped = g.pci.save_wrapped_state().unwrap();
+        g.pci.restore_function_state(&function).unwrap();
+        assert!(registered.lock().is_empty());
+        g.pci.restore_wrapped_state(&wrapped).unwrap();
+        assert_eq!(addresses(&registered), [BASE + NOTIFY_OFF]);
+    }
+
+    #[test]
+    fn a_refused_doorbell_leaves_the_userspace_kick() {
+        let mut g = Guest::with_device(worker_block(1));
+        let doorbells = RecDoorbells::default();
+        let registered = doorbells.registered.clone();
+        let refuse = doorbells.refuse.clone();
+        *refuse.lock() = true;
+        g.pci.set_queue_doorbells(Box::new(doorbells));
+        g.pci.set_bar_address(BAR_INDEX, Some(0x8_0000_0000));
+        g.negotiate_and_activate(0);
+        assert!(registered.lock().is_empty());
+        g.submit_read(2, 0, 1);
+        g.wait_used(1);
+        // The next placement tries again.
+        *refuse.lock() = false;
+        g.pci.set_bar_address(BAR_INDEX, Some(0x9_0000_0000));
+        assert_eq!(addresses(&registered), [0x9_0000_0000 + NOTIFY_OFF]);
+    }
+
+    #[test]
+    fn a_device_without_queue_events_registers_no_doorbell() {
+        let mut g = Guest::new();
+        let doorbells = RecDoorbells::default();
+        let registered = doorbells.registered.clone();
+        g.pci.set_queue_doorbells(Box::new(doorbells));
+        g.pci.set_bar_address(BAR_INDEX, Some(0x8_0000_0000));
+        g.negotiate_and_activate(0);
+        assert!(registered.lock().is_empty());
+        g.submit_read(2, 0, 1);
+        assert_eq!(g.used(0).0, 1);
     }
 
     #[test]

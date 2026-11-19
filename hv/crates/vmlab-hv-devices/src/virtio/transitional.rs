@@ -47,7 +47,7 @@ impl LegacyPci {
     }
 }
 
-/// Where the notify structure sits in the captured BAR4 layout.
+/// Offset of the notify region in the captured BAR4 layout.
 pub(super) const NOTIFY_BAR_OFF: u64 = 0x3000;
 
 /// Translate the captured BAR4 layout to the original modern implementation.
@@ -56,7 +56,7 @@ pub(super) fn modern_offset(offset: u64) -> Option<u64> {
         0..=0xfff => Some(offset),
         0x1000..=0x1fff => Some(ISR_OFF + offset - 0x1000),
         0x2000..=0x2fff => Some(DEVICE_CFG_OFF + offset - 0x2000),
-        0x3000..=0x3fff => Some(NOTIFY_OFF + offset - NOTIFY_BAR_OFF),
+        NOTIFY_BAR_OFF..=0x3fff => Some(NOTIFY_OFF + offset - NOTIFY_BAR_OFF),
         _ => None,
     }
 }

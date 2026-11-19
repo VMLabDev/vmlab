@@ -34,7 +34,7 @@ impl DeviceSet {
         msi: vmlab_hv_vmm::factory::PciWiring,
         rom: Option<&Path>,
     ) -> Result<BuiltPci, DeviceUnavailable> {
-        let transport = if msi.transitional {
+        let mut transport = if msi.transitional {
             VirtioPciDevice::new_transitional(
                 id,
                 device,
@@ -47,6 +47,9 @@ impl DeviceSet {
         } else {
             VirtioPciDevice::new(id, device, mem.clone(), Some(msi.msi), msi.intx)
         };
+        if let Some(doorbells) = msi.doorbells {
+            transport.set_queue_doorbells(doorbells);
+        }
         let transport = if let Some(path) = rom {
             let image = std::fs::read(path).map_err(|e| {
                 DeviceUnavailable::new("virtio-net ROM", format!("{}: {e}", path.display()))
@@ -276,6 +279,7 @@ mod tests {
                         intx: None,
                         transitional,
                         msix_vectors: 3,
+                        doorbells: None,
                     },
                 )
                 .unwrap();

@@ -664,9 +664,6 @@ pub fn build(
     pci_root
         .lock()
         .set_mmio64_window(layout.mmio64_base, layout.mmio64_size);
-    pci_root
-        .lock()
-        .set_notify_registrar(Box::new(crate::ioevent::KvmNotify(kvm.vm.clone())));
     let config_io = Arc::new(Mutex::new(PciConfigIo::new(pci_root.clone())));
     io_bus
         .register(0xCF8, 8, config_io.clone())
@@ -726,6 +723,7 @@ pub fn build(
             |chipset| chipset.irq_source(id, gsi),
         )
     };
+    let doorbell_vm = kvm.vm.clone();
     let wiring = |address: Option<PciAddress>,
                   vectors: u16,
                   transitional: bool|
@@ -748,6 +746,7 @@ pub fn build(
             },
             msix_vectors: vectors,
             transitional: firmware_machine && transitional,
+            doorbells: Some(Box::new(crate::kvm::KvmDoorbells::new(doorbell_vm.clone()))),
         })
     };
     let place = |function: Arc<Mutex<dyn vmlab_hv_devices::PciDevice>>,

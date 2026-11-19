@@ -28,10 +28,10 @@
 //! buffers.
 //!
 //! A switch-stream device also offers one event for all its queues
-//! (`notify_event`). Under KVM the PCI root registers it at each queue's
-//! notify address, so a kick wakes the worker from the kernel and the vCPU
-//! never leaves guest mode for it. `queue_notify` stays the path of every
-//! kick that is not registered.
+//! (`queue_events`). Under KVM the transport registers it as the doorbell of
+//! each queue's notify address, so a kick wakes the worker from the kernel
+//! and the vCPU never leaves guest mode for it. `queue_notify` stays the
+//! path of every kick that is not registered.
 
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, VecDeque};
@@ -220,7 +220,7 @@ pub struct Net {
     wake: UnixStream,
     wake_pending: Arc<AtomicBool>,
     /// Queue kicks the hypervisor delivers without a `queue_notify` call
-    /// (`notify_event`). The worker serves a count like a wakeup.
+    /// (`queue_events`). The worker serves a count like a wakeup.
     kick: Arc<EventFd>,
     worker: Option<JoinHandle<()>>,
     /// Queue states restored before `activate`, applied when it arrives.
@@ -1853,11 +1853,11 @@ impl VirtioDevice for Net {
     }
 
     /// Every queue of a switch-stream device wakes the one worker, so they
-    /// share one event. A TAP device keeps `queue_notify`: its kernel queues
-    /// take their kicks by index.
-    fn notify_event(&self, index: u16) -> Option<Arc<EventFd>> {
-        (usize::from(index) < self.queue_sizes.len() && !lock(&self.shared).tap_mode)
-            .then(|| self.kick.clone())
+    /// share one event, which may also arrive before activation or after a
+    /// reset. A TAP device keeps `queue_notify`: its kernel queues take
+    /// their kicks by index.
+    fn queue_events(&self) -> Option<Vec<Arc<EventFd>>> {
+        (!lock(&self.shared).tap_mode).then(|| vec![self.kick.clone(); self.queue_sizes.len()])
     }
 
     fn queue_notify(&mut self, index: u16) {
@@ -3901,7 +3901,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_event_transmits_without_a_queue_notify_call() {
+    fn queue_event_transmits_without_a_queue_notify_call() {
         let mut f = Fixture::new();
         let mut switch = f.take_switch_side();
         switch
@@ -3910,9 +3910,10 @@ mod tests {
         // The connection is up and the worker sleeps in poll.
         wait_for("link up", || lock(&f.dev.shared).link_up);
 
-        let event = f.dev.notify_event(1).expect("the transmitq has an event");
-        assert!(Arc::ptr_eq(&event, &f.dev.notify_event(0).unwrap()));
-        assert!(f.dev.notify_event(2).is_none());
+        let events = f.dev.queue_events().expect("a switch-stream device has events");
+        assert_eq!(events.len(), f.dev.queue_sizes.len());
+        assert!(events.iter().all(|event| Arc::ptr_eq(event, &events[0])));
+        let event = events[1].clone();
         for frame in [&b"first frame"[..], &b"second frame"[..]] {
             f.queue_tx(frame);
             // What KVM does for a registered notify write.
@@ -3927,7 +3928,7 @@ mod tests {
         wait_for("tx buffers returned", || f.vqs[1].used_idx(&f.mem) == 2);
 
         lock(&f.dev.shared).tap_mode = true;
-        assert!(f.dev.notify_event(1).is_none());
+        assert!(f.dev.queue_events().is_none());
     }
 
     #[test]
