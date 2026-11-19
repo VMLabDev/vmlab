@@ -76,6 +76,8 @@ From nothing, with no manual step:
    them (`results.json`, `results.txt`). With `--apps`, the stretch
    applications run after this, so one that hangs the guest cannot cost
    the Done evidence.
+   The adapter suite (`tests/e2e/adapter.sh`, see "Adapter suite") runs
+   after them, last.
 7. **Teardown.** Records the `qemu.log` lines and `vmlab status -v` again,
    then runs `vmlab destroy`, unless `--keep` was given.
 
@@ -582,6 +584,74 @@ toolchain:
 
 Building it unmodified needs MSVC or clang-cl with the Windows SDK. Patching
 the source would defeat the purpose, so this stretch item is skipped.
+
+## Adapter suite
+
+`tests/e2e/run.sh --apps` ends with `tests/e2e/adapter.sh`, after the
+stretch applications. The suite asks one question the Done checks do not:
+does the device behave like a real video card? It checks the properties
+that a test can check, with the property numbers of the design it comes from
+(docs/plans/win3d-real-adapter/DESIGN.md at the root of the vmlab
+repository, section 3). A property that is missing today has a check that fails
+today: the tables below are a baseline, and a check that changes from pass to
+fail in a later run is a regression. The suite does not count towards the
+exit status of `run.sh`.
+
+```sh
+tests/e2e/run.sh --template windows-11 --host-gpu Nvidia2 --apps      # the whole run
+tests/e2e/adapter.sh <lab-dir> win <evidence-dir> [check...]          # against a lab kept with --keep
+```
+
+Every check prints `pass`, `fail` or `not-run`. `not-run` means that nothing
+was measured, and the note says why: the check was not selected, its program
+did not start, or what it needs was missing (no WebGL on the adapter, a
+download that failed, a guest that stopped answering). The probes only
+measure. The limits are in `tests/e2e/adapter/judge.py`, which writes
+`adapter/adapter.json` and `adapter/adapter.txt` in the evidence directory,
+next to each probe's JSON.
+
+| Property | Check | What runs | Pass when |
+| --- | --- | --- | --- |
+| P1, a hardware pointer | `pointer` | `pointer_probe.exe` fills the display with one colour. The host moves the pointer to two places with `vmlab vm mouse-move` and takes a console capture at each (`tests/e2e/adapter/pointerframe.py`). | The capture is the flat colour where the pointer is, while Windows reports a visible pointer at that place. |
+| P2, a vblank of the display | `vblank-interval` | `pace_probe.exe` times 10 s of `IDXGIOutput::WaitForVBlank`. | The mean interval is within 2 percent of the mode's refresh period, and the 1st and 99th percentile within half a period of it. |
+| P2 | `present-rate` | The same probe times 10 s of `Present(1)` on a flip-model swap chain. | The frame rate is within 5 percent of the refresh rate. |
+| P2 | `flip-timestamps` | DXGI frame statistics over those presents. | `SyncRefreshCount` over `SyncQPCTime` is within 2 percent of the refresh rate. |
+| P2 | `scan-line` | One second of `D3DKMTGetScanLine`. | It answers more than one line, and "in vertical blank" at least once. |
+| P3 to P5, a flip shows a finished frame | `tear-flip` | `tear_probe.exe --mode flip`: every frame of its window is one colour of eight, drawn top to bottom in 48 strips by a slow pixel shader, without a clear. It animates for 3 s and holds for 3 s, for 40 s. `tests/e2e/adapter/rfbgrab.py` reads the window from the console's RFB socket about 30 times a second. | No console frame has rows of two colours. At least 100 frames showed the window. |
+| P3 to P5 | `tear-blt` | The same with `--mode blt`: a blt-model swap chain, the present of the Blt kind that windowed Direct3D 9, WPF and DirectDraw make. | As above. |
+| P7, Desktop Duplication | `duplication` | `dupl_probe.exe` takes eight frames with `AcquireNextFrame` while a window of its own changes colour. | Eight frames, each at least half lit, each with the window in the colour it had. |
+| P10, correct rendering | `d2d` | `d2d_probe.exe` fills rounded rectangles, ellipses and path geometries with Direct2D three times, each on a new device, and once on WARP. | No pixel WARP filled is missing, none it left white is drawn, and the three pictures are the same. The device must be feature level 11.1. |
+| P10 | `svb-chrome`, `svb-edge` | `tests/e2e/adapter/pages/svb.html`, the page of GitHub #233: a quad from a vertex buffer of each usage hint. | Each of the three lines reads `255,0,0,255`, with WebGL on the adapter. |
+| P8, a driver for every API | `venc-chrome`, `venc-edge` | `tests/e2e/adapter/pages/venc.html`, the page of GitHub #238: a hardware video encoder query, which makes a Chromium GPU process load `d3d12.dll`, then WebGL every 4 s for 20 s. The browsers run with `--enable-features=D3D12VideoEncodeAccelerator,D3D12VideoDecoder`. | WebGL stays on the adapter in all five tries, and the profile has no crash dump. |
+| P10 | `wine-<program>` | Wine's Direct3D 9, 10 and 11 tests, one row per test program. | The program reaches its summary line with 0 failures. |
+
+Chrome is Chrome for Testing 158, pinned in `tests/e2e/PINS`. Edge is the
+one the template has. A page writes its result to the browser's console, and
+`tests/e2e/adapter/guest/Run-Page.ps1` reads it from the browser's log file.
+
+The Wine tests are the nine programs that `tests/e2e/adapter/build.sh`
+builds from the Wine 11.0 source pinned in `tests/e2e/PINS`: `d3d9ex`,
+`device`, `stateblock` and `visual` of d3d9, `device` and `effect` of d3d10,
+and the single test files of d3d10core, d3d10_1 and d3d11. WineHQ no longer
+publishes a prebuilt `winetest`, so the suite builds each file as its own
+program with the toolchain image (`-DSTANDALONE`), against the mingw-w64
+headers. Each runs in the user's session for at most 900 s
+(`ADAPTER_WINE_TIMEOUT`). A program that does not reach its summary line in
+that time counts as a failure, and so does one that ends on an unhandled
+exception after it printed a summary. The lines that say what failed are
+kept as `adapter/wine-<program>.failures.txt`. The tests run last, because
+they change display modes and reset devices. When a program ends the VM, its
+row says so with the last line of `vmlab-hv.log`, and the suite starts the
+VM again for the next program, at most three times a run.
+
+Properties the suite does not check: P6 (it has no test of where a Blt
+present is copied), P9 (it needs an Intel CPU host with an NVIDIA GPU), P11
+to P14.
+
+### Baseline
+
+<!-- e2e:adapter -->
+<!-- /e2e:adapter -->
 
 ## Findings from these runs
 

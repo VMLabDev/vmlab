@@ -1,0 +1,34 @@
+<!doctype html><meta charset=utf-8><title>static vertex buffer</title><pre id=out></pre>
+<script>
+// The repro page of card #135, GitHub #233: a full-canvas red quad over a blue
+// clear, from a vertex buffer with each usage hint. Expected on every line:
+// 255,0,0,255. A driver that never uploads a STATIC_DRAW buffer leaves the
+// clear colour, 0,0,255,255, on that line. The result also goes to the
+// browser's log, where tests/e2e/adapter/guest/Run-Page.ps1 reads it.
+const out = [], result = {page: 'svb', lines: {}, renderer: null, error: null};
+try {
+  for (const usage of ['STATIC_DRAW', 'DYNAMIC_DRAW', 'STREAM_DRAW']) {
+    const cv = document.createElement('canvas'); cv.width = cv.height = 64; document.body.appendChild(cv);
+    const gl = cv.getContext('webgl');
+    if (!gl) { out.push(usage.padEnd(13) + 'NO WEBGL'); result.lines[usage] = 'NO WEBGL'; continue; }
+    const info = gl.getExtension('WEBGL_debug_renderer_info');
+    result.renderer = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+    const pr = gl.createProgram();
+    gl.attachShader(pr, sh(gl.VERTEX_SHADER, 'attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }'));
+    gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, 'void main(){ gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }'));
+    gl.bindAttribLocation(pr, 0, 'p'); gl.linkProgram(pr); gl.useProgram(pr);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl[usage]);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.clearColor(0, 0, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    const px = new Uint8Array(4); gl.readPixels(32, 32, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    result.lines[usage] = [...px].join(',');
+    out.push(usage.padEnd(13) + [...px] + '  glError ' + gl.getError());
+  }
+} catch (e) { result.error = String(e); out.push('threw ' + e); }
+out.push('renderer ' + result.renderer);
+document.getElementById('out').textContent = out.join('\n');
+console.log('WIN3D-RESULT ' + btoa(unescape(encodeURIComponent(JSON.stringify(result)))));
+</script>
