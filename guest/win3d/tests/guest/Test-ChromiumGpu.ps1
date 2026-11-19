@@ -30,11 +30,14 @@ param(
     # Chromium features to turn on, comma separated.
     [string]$Features = '',
     [string]$ChromeDir = 'C:\apps\chrome-win64',
-    [string]$RunProbe = (Join-Path $PSScriptRoot 'Run-Probe.ps1')
+    # Default: Run-Probe.ps1 beside this script.
+    [string]$RunProbe = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
+# $PSScriptRoot is empty in a param() default of Windows PowerShell 5.1.
+if (-not $RunProbe) { $RunProbe = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'Run-Probe.ps1' }
 $exe = $null
 if ($Browser -eq 'chrome') {
     $exe = Join-Path $ChromeDir 'chrome.exe'
