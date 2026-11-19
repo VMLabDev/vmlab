@@ -26,13 +26,14 @@
 # Writes <evidence-dir>/chromium/: one JSON per row and chromium.json, the
 # verdict. Exit status: 0 when all rows pass, 1 otherwise, 2 on usage.
 #
-# The check restarts the VM first. vmlab-hv does not give back every file
-# descriptor a guest GPU context used. After the probes of tests/e2e/run.sh
-# it held 825 of its 1024 and the VM stopped in the fourth browser start
-# ("Too many open files"). From a restart the five rows end at about 860.
+# The check restarts the VM at its start and again before the controls.
+# vmlab-hv does not give back every file descriptor a guest GPU context used.
+# After the probes of tests/e2e/run.sh it held 825 of its 1024 and the VM
+# stopped in the fourth browser start ("Too many open files"). From one
+# restart the five rows ended at 863 on AMD1 and at 910 on Nvidia2.
 # check-shell-paths: no-errexit each row records its rc and the judge decides; the ini must be put back (VML-88).
 set -uo pipefail
-[ $# -eq 3 ] || { sed -n '2,33p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,34p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 LABDIR=$(cd "$1" && pwd)
@@ -72,15 +73,19 @@ mkdir -p "$EV" "$STAGE"
 find "$EV" -mindepth 1 -delete
 find "$STAGE" -mindepth 1 -type f -delete
 
+restart_vm() {
+    note "restarting $VM"
+    in_lab vmlab vm restart "$VM" || return 1
+    # The agent first, then the autologon user: Run-Probe.ps1 needs the desktop.
+    for _ in $(seq 1 60); do
+        [ -n "$(gps '(Get-CimInstance Win32_ComputerSystem).UserName' 30 2>/dev/null | tr -d '[:space:]')" ] && break
+        sleep 10
+    done
+    sleep 30
+}
+
 note "chromium check in $LABDIR"
-note "restarting $VM"
-in_lab vmlab vm restart "$VM" || exit 1
-# The agent first, then the autologon user: Run-Probe.ps1 needs the desktop.
-for _ in $(seq 1 60); do
-    [ -n "$(gps '(Get-CimInstance Win32_ComputerSystem).UserName' 30 2>/dev/null | tr -d '[:space:]')" ] && break
-    sleep 10
-done
-sleep 30
+restart_vm || exit 1
 gps "New-Item -ItemType Directory -Force '$G', 'C:\\win3d\\chromium', 'C:\\apps' | Out-Null; if (Test-Path '$R') { Remove-Item '$R' -Recurse -Force }" 120 || exit 1
 for f in Run-Probe.ps1 Test-ChromiumGpu.ps1; do
     in_lab vmlab cp "$REPO/tests/guest/$f" "$VM:C:/win3d/guest/$f" || exit 1
@@ -131,6 +136,7 @@ in_lab vmlab cp "$VM:C:/win3d/results/chromium/native.run.json" "$EV/native.json
 
 # The controls last: a GPU process that ends itself again and again is the
 # fault, and what it does to the guest must not cost the rows above.
+restart_vm || note "could not restart $VM"
 if preload_off; then
     page chrome-control chrome
     page edge-control edge
