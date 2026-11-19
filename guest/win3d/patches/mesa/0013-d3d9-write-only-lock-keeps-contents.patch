@@ -12,10 +12,10 @@ Evidence: docs/dxdiag.md, docs/evidence/dxdiag/ (ddcaps blit checks).
 Origin: vmlab-win3d, worker fix-dxdiag.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
-index 7c5554c..6f27d53 100644
+index 6dc78d1..d612714 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
-@@ -3350,10 +3350,19 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
+@@ -3354,10 +3354,19 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
            !D3D9UploadSubResource(device, resource, subresource_index))
           return E_NOTIMPL;
  

@@ -36,7 +36,7 @@ SUBJECT_FALLBACK = {
         "vkr: log failed image creation and memory allocation, with the create-info (diagnostic render server)",
     "host/virglrenderer/workaround/0003-vkr-drop-unsupported-feedback-loop-usage.patch":
         "vkr: retry vkCreateImage and the image-format queries without feedback-loop usage "
-        "(superseded by mesa/0020; built only with WITH_WORKAROUND=1)",
+        "(superseded by the Yttrium UMD's own check; built only with WITH_WORKAROUND=1)",
 }
 
 # The document that explains a patch, by directory under patches/, when its

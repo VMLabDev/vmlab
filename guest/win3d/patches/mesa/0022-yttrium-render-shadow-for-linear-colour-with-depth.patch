@@ -30,10 +30,10 @@ its output reproduce the Xid with no VM).
 Origin: vmlab-win3d xid69 worker.
 ---
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
-index 97c5c4d..99bcf6b 100644
+index cc2f8b4..066688c 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
-@@ -296,6 +296,8 @@ struct yttrium_venus_resource {
+@@ -300,6 +300,8 @@ struct yttrium_venus_resource {
     struct yttrium_venus_object draw_index_memory_obj;
     struct yttrium_venus_object device_local_draw_buffer_obj;
     struct yttrium_venus_object device_local_draw_memory_obj;
@@ -42,7 +42,7 @@ index 97c5c4d..99bcf6b 100644
     VkImage image;
     VkBuffer buffer;
     VkDeviceMemory memory;
-@@ -318,10 +320,19 @@ struct yttrium_venus_resource {
+@@ -322,6 +324,14 @@ struct yttrium_venus_resource {
     VkDeviceMemory draw_index_memory;
     VkBuffer device_local_draw_buffer;
     VkDeviceMemory device_local_draw_memory;
@@ -57,16 +57,19 @@ index 97c5c4d..99bcf6b 100644
     struct yttrium_venus_memory_mapping draw_vertex_mapping;
     struct yttrium_venus_memory_mapping draw_index_mapping;
     VkImageLayout layout;
+@@ -336,6 +346,7 @@ struct yttrium_venus_resource {
+    VkImageAspectFlags display_endpoint_saved_aspects;
+    bool display_endpoint_saved_contents;
     VkImageUsageFlags image_usage;
 +   VkImageTiling tiling;
     VkImageAspectFlags initialized_aspects;
     VkBufferUsageFlags buffer_usage;
     VkFormat vk_format;
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
-index b5c55a4..104c1e8 100644
+index 7a32f67..23ce52e 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_batch.c
-@@ -274,6 +274,13 @@ yttrium_venus_retired_resource_rebuild_handles(
+@@ -303,6 +303,13 @@ yttrium_venus_retired_resource_rebuild_handles(
        retired->device_local_draw_memory =
           YTTRIUM_VENUS_HANDLE(
              VkDeviceMemory, &retired->device_local_draw_memory_obj);
@@ -80,7 +83,7 @@ index b5c55a4..104c1e8 100644
  }
  
  struct yttrium_venus_retired_resource *
-@@ -306,6 +313,8 @@ yttrium_venus_retired_resource_create(
+@@ -335,6 +342,8 @@ yttrium_venus_retired_resource_create(
        resource->device_local_draw_buffer_obj;
     retired->device_local_draw_memory_obj =
        resource->device_local_draw_memory_obj;
@@ -89,7 +92,7 @@ index b5c55a4..104c1e8 100644
     retired->image = resource->image;
     retired->buffer = resource->buffer;
     retired->memory = resource->memory;
-@@ -331,6 +340,8 @@ yttrium_venus_retired_resource_create(
+@@ -360,6 +369,8 @@ yttrium_venus_retired_resource_create(
        resource->device_local_draw_buffer;
     retired->device_local_draw_memory =
        resource->device_local_draw_memory;
@@ -98,7 +101,7 @@ index b5c55a4..104c1e8 100644
     retired->draw_vertex_mapping = resource->draw_vertex_mapping;
     retired->draw_index_mapping = resource->draw_index_mapping;
  
-@@ -757,6 +768,12 @@ yttrium_venus_destroy_retired_resource(
+@@ -775,6 +786,12 @@ yttrium_venus_destroy_retired_resource(
     if (retired->device_local_draw_memory)
        vn_async_vkFreeMemory(&venus->vn_ring, venus->device_handle,
                              retired->device_local_draw_memory, NULL);
@@ -112,10 +115,10 @@ index b5c55a4..104c1e8 100644
        vn_async_vkDestroyBuffer(&venus->vn_ring, venus->device_handle,
                                 retired->buffer, NULL);
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
-index 97692f9..b2bf7a0 100644
+index eb77f3a..e62d777 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
-@@ -1773,6 +1773,317 @@ yttrium_venus_cmd_transition_image(struct yttrium_venus *venus,
+@@ -1970,6 +1970,317 @@ yttrium_venus_cmd_transition_image(struct yttrium_venus *venus,
     resource->layout = new_layout;
  }
  
@@ -433,10 +436,10 @@ index 97692f9..b2bf7a0 100644
  static bool
  yttrium_venus_cmd_batch_transition_image(struct yttrium_venus *venus,
                                           struct yttrium_venus_resource *resource,
-@@ -3352,9 +3663,15 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
-       const uint32_t color_layer =
+@@ -3645,11 +3956,17 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
           draw_state && i < ARRAY_SIZE(draw_state->rt_layer) ?
              draw_state->rt_layer[i] : render_layer;
+       VkImageViewUsageCreateInfo view_usage;
 +      /* A LINEAR target next to depth renders through its OPTIMAL shadow. */
 +      const bool render_shadow = yttrium_venus_color_render_shadow(
 +         venus, color, attachment_format, has_depth,
@@ -445,12 +448,15 @@ index 97692f9..b2bf7a0 100644
 +         goto pipeline_submit_failed;
        const VkImageViewCreateInfo view_info = {
           .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+-         .pNext = yttrium_venus_image_view_usage(
++         .pNext = render_shadow ? NULL : yttrium_venus_image_view_usage(
+             color, attachment_format, &view_usage),
 -         .image = color->image,
 +         .image = render_shadow ? color->render_shadow_image : color->image,
           .viewType = yttrium_venus_render_view_type(color, render_layers),
           .format = attachment_format,
           .subresourceRange = {
-@@ -9669,6 +9986,9 @@ retry_batch_layout:
+@@ -9893,6 +10210,9 @@ retry_batch_layout:
     struct yttrium_venus_render_pass_group_key render_pass_key;
     bool render_pass_key_valid = false;
     memset(&render_pass_key, 0, sizeof(render_pass_key));
@@ -460,7 +466,7 @@ index 97692f9..b2bf7a0 100644
     const bool render_pass_batch_allowed =
        native_draw_batch_candidate && !draw_indirect &&
        (!has_cpu_vertex_upload || !has_sampled_descriptor ||
-@@ -9676,7 +9996,9 @@ retry_batch_layout:
+@@ -9900,7 +10220,9 @@ retry_batch_layout:
        yttrium_venus_deferred_draw_allowed(
           pipeline, sampled_images, sampled_image_count, color_resources,
           color_resource_count, depth_resource, storage_image_count,
@@ -471,7 +477,7 @@ index 97692f9..b2bf7a0 100644
     if (render_pass_batch_allowed) {
        render_pass_key_valid =
           yttrium_venus_deferred_draw_make_render_key(
-@@ -11128,6 +11450,11 @@ retry_batch_layout:
+@@ -11337,6 +11659,11 @@ retry_batch_layout:
               instance_count, vertex_offset))
           goto fail_restore_command_buffer;
     } else {
@@ -483,7 +489,7 @@ index 97692f9..b2bf7a0 100644
        const VkRenderPassBeginInfo render_pass_begin = {
           .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
           .renderPass = pipeline->render_pass,
-@@ -11259,6 +11586,11 @@ retry_batch_layout:
+@@ -11468,6 +11795,11 @@ retry_batch_layout:
              so_counter_buffers, so_counter_offsets);
        }
        vn_async_vkCmdEndRenderPass(&venus->vn_ring, venus->command_buffer);
@@ -496,10 +502,10 @@ index 97692f9..b2bf7a0 100644
  
     yttrium_venus_trace_timing(
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
-index d1759b6..2992225 100644
+index ddc2379..be84777 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
-@@ -374,6 +374,8 @@ struct yttrium_venus_retired_resource {
+@@ -344,6 +344,8 @@ struct yttrium_venus_retired_resource {
     struct yttrium_venus_object draw_index_memory_obj;
     struct yttrium_venus_object device_local_draw_buffer_obj;
     struct yttrium_venus_object device_local_draw_memory_obj;
@@ -508,7 +514,7 @@ index d1759b6..2992225 100644
     VkImage image;
     VkBuffer buffer;
     VkDeviceMemory memory;
-@@ -404,6 +406,8 @@ struct yttrium_venus_retired_resource {
+@@ -374,6 +376,8 @@ struct yttrium_venus_retired_resource {
     VkDeviceMemory draw_index_memory;
     VkBuffer device_local_draw_buffer;
     VkDeviceMemory device_local_draw_memory;
@@ -517,20 +523,20 @@ index d1759b6..2992225 100644
     struct yttrium_venus_memory_mapping draw_vertex_mapping;
     struct yttrium_venus_memory_mapping draw_index_mapping;
     struct yttrium_venus_render_target *render_target_cache_entry;
-@@ -733,6 +737,8 @@ struct yttrium_venus {
-    bool storage_image_write_without_format;
+@@ -729,6 +733,8 @@ struct yttrium_venus {
     /* Immutable per-device format support: 0 unknown, 1 unsupported, 2 supported. */
     uint8_t storage_image_formatless_formats[PIPE_FORMAT_COUNT];
+    uint8_t storage_buffer_formatless_formats[PIPE_FORMAT_COUNT];
 +   /* 0 unknown, 1 no, 2 yes: linearTilingFeatures has COLOR_ATTACHMENT. */
 +   uint8_t linear_color_attachment_formats[256];
     bool multisampled_render_to_single_sampled;
-    bool transform_feedback;
-    bool vertex_attribute_instance_rate_divisor;
+    bool depth_stencil_resolve;
+    VkResolveModeFlags depth_resolve_modes;
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
-index 119f7f7..ec3f868 100644
+index ce84008..6304ccd 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
-@@ -273,6 +273,7 @@ yttrium_venus_create_image_tiled(struct yttrium_venus *venus,
+@@ -454,6 +454,7 @@ yttrium_venus_create_image_tiled(struct yttrium_venus *venus,
     }
  
     resource->image_usage = usage;

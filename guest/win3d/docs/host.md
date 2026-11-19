@@ -17,7 +17,7 @@ device and a visible console. Every claim cites a file under
 [docs/evidence/host/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host/). Probe date: 2026-10-17.
 
 The NVIDIA failures this probe recorded have since been explained and fixed
-in `docs/nvidia.md` (`patches/mesa/0020` and the patched QEMU). Read
+in `docs/nvidia.md` (`patches/mesa/0020`, which upstream's November release replaced, and the patched QEMU). Read
 the NVIDIA results below as the state before those fixes.
 
 ## Update: vmlab 0.26 and 0.27 (2026-10-18)

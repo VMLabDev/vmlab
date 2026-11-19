@@ -20,9 +20,11 @@ integrated GPUs keep their host-visible VRAM type.
 Evidence: docs/nvva.md, docs/evidence/nvva/.
 Origin: vmlab-win3d nvva worker.
 ---
---- a/src/virtio/vulkan/vn_physical_device.c	2026-10-19 04:24:49.764066631 +1000
-+++ b/src/virtio/vulkan/vn_physical_device.c	2026-10-19 04:25:44.490924877 +1000
-@@ -974,6 +974,40 @@
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 8f27145..fd0a471 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -986,6 +986,40 @@ vn_physical_device_init_queue_family_properties(
     return VK_SUCCESS;
  }
  
@@ -63,7 +65,7 @@ Origin: vmlab-win3d nvva worker.
  static void
  vn_physical_device_init_memory_properties(
     struct vn_physical_device *physical_dev)
-@@ -988,6 +1022,9 @@
+@@ -1000,6 +1034,9 @@ vn_physical_device_init_memory_properties(
  
     physical_dev->memory_properties = props2.memoryProperties;
  

@@ -1,11 +1,11 @@
 [
   {
     "name": "KMD-BSD-3-Clause.txt",
-    "url": "https://raw.githubusercontent.com/arehnman/yttrium-virtio-gpu/b99d951a1c97f6fb3a1adbc08a4d2ab9ce9f5a15/viogpu/LICENSE"
+    "url": "https://raw.githubusercontent.com/arehnman/yttrium-virtio-gpu/e9917ae25b2597306d483e1063dba08658139bc9/viogpu/LICENSE"
   },
   {
     "name": "Mesa-MIT.txt",
-    "url": "https://raw.githubusercontent.com/arehnman/virtio-win-mesa/374c30222e0c08b04783c173c127abb3e465d028/licenses/MIT"
+    "url": "https://raw.githubusercontent.com/arehnman/virtio-win-mesa/76c095bbbd875fda21e55c69d9e1eed56980d956/licenses/MIT"
   },
   {
     "name": "MPL-2.0.txt",

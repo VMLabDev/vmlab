@@ -18,8 +18,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
 OUT=$REPO/out/kmd
-# 58104 identifies the package with native x86 UMD mapping-fault handling.
-DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58104}
+# 58105 identifies the package rebased to Yttrium's November 2026 release.
+DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58105}
 IMAGE=vmlab-win3d/kmd-build:1
 
 pin() { awk -v n="$1" '$1 == n { print $'"$2"' }' "$HERE/PINS"; }

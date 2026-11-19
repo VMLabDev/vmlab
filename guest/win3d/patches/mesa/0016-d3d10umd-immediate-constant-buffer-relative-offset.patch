@@ -18,9 +18,10 @@ Evidence: docs/d3d11-apps.md, docs/evidence/d3d11-apps/.
 Origin: vmlab-win3d fix-d3d11-apps worker.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index 05636e4..c9bef73 100644
 --- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
 +++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-@@ -2774,10 +2774,11 @@
+@@ -2775,10 +2775,11 @@ translate_src_operand(struct Shader_xlate *sx,
           break;
        case D3D10_SB_OPERAND_INDEX_RELATIVE:
        case D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE:

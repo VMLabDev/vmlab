@@ -1,8 +1,8 @@
 # mesa
 
 Builds the Yttrium Mesa drivers for x86_64 and i686 Windows from
-`arehnman/virtio-win-mesa` at `374c30222e0c08b04783c173c127abb3e465d028`
-(branch `yttrium-experimental`, Mesa 26.1.0) plus the patch series in
+`arehnman/virtio-win-mesa` at `76c095bbbd875fda21e55c69d9e1eed56980d956`
+(branch `yttrium-experimental`, the November 2026 release, Mesa 26.1.0) plus the patch series in
 `patches/mesa/`. The build uses the shared llvm-mingw toolchain image from
 `build/toolchain/`.
 
@@ -74,20 +74,22 @@ The series has two parts, and the patches apply in name order:
   mixed-case header symlinks that `prepare-build.py` creates, so they are
   build output, not source. The diff was then split by topic. Each patch has
   a header that says what it fixes and which prior-art finding it comes from.
-- **0012 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0060, 0065 to 0067, 0070, 0075, 0080, 0085 to 0086 and 0090 to 0092** are this repository's own fixes, found by
+- **0012 to 0017, 0021 to 0024, 0026, 0027, 0030 to 0032, 0035, 0040 to 0044,
+  0060, 0065 to 0067, 0070, 0080, 0085, 0086 and 0091 to 0093** are this
+  repository's own fixes.
 
-0005 to 0010, every patch from 0012 to 0026, 0030 to 0032 and 0090 to 0092 change
-`viogpu_d3d10.dll`, the D3D9/D3D10/D3D11 UMD (the `d3d10umd` frontend and the
-Yttrium winsys). 0032 also changes Gallium's `tgsi_to_nir`, in a branch that
-only a TGSI tessellation control shader reaches, which only the UMD makes.
-(WGL).
-0001 to 0003 are build and utility fixes that every DLL shares, 0004 and 0027
-0001 to 0003 are build and utility fixes that every DLL shares, 0004, 0027
-0075 is in Mesa's Win32 WSI, which the Venus ICD `libvulkan_virtio.dll` links.
-and 0080 are in WGL, 0011 and 0070 are in the Venus ICD, and 0086 is in Zink
-are in WGL, 0011 and 0070 are in the Venus ICD, and 0086 is in Zink (WGL).
-are in WGL, 0011, 0065 to 0067 and 0070 are in the Venus ICD, and 0086 is in Zink (WGL).
-are in WGL, 0011, 0070 and 0085 are in the Venus ICD, and 0086 is in Zink (WGL).
+By DLL: 0005 to 0010, 0012 to 0017, 0021 to 0024, 0026, 0030 to 0032, 0035,
+0040 to 0044, 0060 and 0091 to 0093 change `viogpu_d3d10.dll`, the
+D3D9/D3D10/D3D11 UMD (the `d3d10umd` frontend and the Yttrium winsys). 0032
+also changes Gallium's `tgsi_to_nir`, in a branch that only a TGSI
+tessellation control shader reaches, which only the UMD makes. 0001 to 0003
+are build and utility fixes that every DLL shares. 0004, 0027 and 0080 are in
+WGL. 0011, 0065 to 0067, 0070 and 0085 are in the Venus ICD, and 0086 is in
+Zink (WGL).
+
+The series was rebased from the September release (`374c3022`) to the
+November release on 2026-11-19. "Dropped at the November rebase" below lists
+what upstream now has.
 
 ### From the prior art
 
@@ -115,12 +117,10 @@ are in WGL, 0011, 0070 and 0085 are in the Venus ICD, and 0086 is in Zink (WGL).
 | 0015 d3d10umd-hull-shader-vprim-and-indexed-patch-io | Hull shaders with `vPrim`, indexed patch-constant outputs and indexed control-point reads translate (SubD11's device was removed) | [`docs/d3d11-apps.md`](../../docs/d3d11-apps.md) |
 | 0016 d3d10umd-immediate-constant-buffer-relative-offset | `icb[r + n]` reads keep their offset (SubD11 rendered purple) | [`docs/d3d11-apps.md`](../../docs/d3d11-apps.md) |
 | 0017 yttrium-honour-wireframe-fill-mode | `D3D11_FILL_WIREFRAME` draws wireframe when the host has `fillModeNonSolid` | [`docs/d3d11-apps.md`](../../docs/d3d11-apps.md) |
-| 0020 yttrium-gate-feedback-loop-usage-on-format-support | Drops `ATTACHMENT_FEEDBACK_LOOP` usage when the host driver refuses it for the image (NVIDIA rejects it on LINEAR images; dwm crashed before logon) | [`docs/nvidia.md`](../../docs/nvidia.md) |
 | 0021 yttrium-d3d11-typed-uav-loads-without-formatless-read | WDDM 2.0 D3D11 devices are created without `shaderStorageImageReadWithoutFormat`, with R32 typed UAV loads only, and GetCaps reports `TypedUAVLoadAdditionalFormats` from the host (Intel ANV; dwm crash-looped) | [`docs/zeus.md`](../../docs/zeus.md) |
 | 0022 yttrium-render-shadow-for-linear-colour-with-depth | Depth draws into LINEAR shared back buffers go through an OPTIMAL shadow image and copies, only when the renderer lacks linear colour-attachment support (NVIDIA 610.57.04 raised Xid 69 and hung the guest) | [`docs/xid69.md`](../../docs/xid69.md) |
 | 0023 yttrium-shared-colour-optimal-when-linear-refused | Shared colour images (every D3D9 colour texture outside the system-memory pools) use OPTIMAL tiling when the host refuses LINEAR for the exact create-info (NVIDIA allows LINEAR with one mip level only; mipmapped textures sampled black, DEFAULT-pool ones failed to create) | [`docs/nvtex.md`](../../docs/nvtex.md) |
 | 0024 d3d9-positiont-vs-for-runtime-fixed-function-ps | Pre-transformed fixed-function draws get a generated vertex shader for any declaration (XYZRHW with diffuse, specular or several texture sets failed with E_FAIL on every GPU) | [`docs/nvtex.md`](../../docs/nvtex.md) |
-| 0025 yttrium-packed-16-bit-formats-match-vulkan | D3D R5G6B5 and A1R5G5B5 map to `R5G6B5_UNORM_PACK16` and `A1R5G5B5_UNORM_PACK16` (red and blue were swapped on RADV; R5G6B5 was unsupported, so black, on NVIDIA) | [`docs/nvtex.md`](../../docs/nvtex.md) |
 | 0026 d3d9-ddraw-present-sources-in-host-cached-memory | DirectDraw off-screen surfaces that are Blt sources to the primary use host-cached memory, so the KMD's CPU present copy does not read them uncached (13 to 34 windowed Blts per second on AMD CPUs) | [`docs/present.md`](../../docs/present.md) |
 | 0027 wgl-present-windows-opaque | WGL windows present opaque: Kopper's swapchain no longer asks for premultiplied alpha, so the compositor ignores the alpha an application leaves in its back buffer (Blender's window was translucent on Windows 10) | [`docs/present.md`](../../docs/present.md) |
 | 0030 d3d10umd-domain-shader-indexed-patch-constants | Domain shaders read patch constants with a register index (`dcl_indexrange vpc`; the device was removed at the first draw) | [`docs/ds.md`](../../docs/ds.md) |
@@ -137,16 +137,36 @@ are in WGL, 0011, 0070 and 0085 are in the Venus ICD, and 0086 is in Zink (WGL).
 | 0066 venus-disable-feedback-when-writes-do-not-arrive | At device creation, one fence feedback write is checked; if it does not reach the guest, feedback is disabled for that device instead of hanging its waits | [`docs/nvfb.md`](../../docs/nvfb.md) |
 | 0067 venus-back-uncached-host-memory-with-cached-when-gpu-writes-do-not-arrive | The device-creation check also tests each uncached `HOST_COHERENT` type that has a cached counterpart; where the host GPU's writes do not arrive (the RTX 4060 Laptop host), allocations of that type are backed by the cached type (Zink's stream buffers there made about one OpenGL readback in three black) | [`docs/nvfb.md`](../../docs/nvfb.md) |
 | 0070 venus-hide-host-access-to-small-bar-heap | The Venus ICD reports a device-local, host-visible type on a heap less than half the largest device-local heap as device-local only, so Vulkan, DXVK, vkd3d-proton and Zink keep host-visible memory out of the host card's BAR1 (246 MiB without resizable BAR, shared by every VM on the card; "can't alloc VA space for mapping") | [`docs/nvva.md`](../../docs/nvva.md) |
-| 0075 wsi-win32-blit-shared-swapchain-when-linear-cannot-render | Vulkan swapchains render into an OPTIMAL image that the present copies into the LINEAR shared image, when the device's `linearTilingFeatures` lack what the swapchain usage needs (NVIDIA has no linear colour attachment; Godot's first frame raised Xid 69, ErrorCode 0x13d) | [`docs/godot.md`](../../docs/godot.md) |
 | 0080 wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last | The WGL ICD pins `opengl32.dll`, so a pixel format set through GDI before the program loaded `opengl32.dll` is still known to it (GZDoom's `wglCreateContext` failed with `ERROR_INVALID_PIXEL_FORMAT`: "Unable to create an OpenGL render context") | [`docs/gzdoom.md`](../../docs/gzdoom.md) |
 | 0085 venus-allocate-from-small-device-local-heap-synchronously | The Venus ICD allocates from a device-local heap smaller than the largest one (the RTX 5090's 246 MiB BAR window) synchronously, so a host out-of-memory reaches the driver's fallback instead of failing the whole context (Unigine OpenGL crashed on NVIDIA) | [`docs/unigl.md`](../../docs/unigl.md) |
 | 0086 zink-keep-buffers-mappable-without-visible-vram | Zink keeps directly mapped buffers in host-visible memory when the device has no device-local, host-visible type (needed with 0070; Unigine Heaven and Valley crashed). Written by the unigl worker; carried unchanged | [`docs/nvva.md`](../../docs/nvva.md) |
-| 0090 yttrium-d3d9-depth-bias-without-float-representation | D3D9 depth bias works on devices without `VK_EXT_depth_bias_control`'s float representation (NVIDIA): it is converted to integer units for the depth format and requested exact. Before, every pipeline with a D3D9 depth bias failed and its draws were skipped | [`docs/unid3d.md`](../../docs/unid3d.md) |
 | 0091 d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker | With the ordered context worker, D3D9 vertex-buffer locks are no longer copied whole into upload buffers: a `DISCARD|NOOVERWRITE` buffer lock is a NOOVERWRITE lock (as in DXVK), DISCARD and NOOVERWRITE locks need no copy, and after a plain lock each draw copies only the vertices it reads. Copies and user-pointer vertex data are packed into the uploader and the draw rebased. Unigine Valley D3D9, a 32-bit process, created about 400 MB/s of 4 MiB mapped upload buffers and ran out of address space (compat F6) | [`docs/f6va.md`](../../docs/f6va.md) |
 | 0092 yttrium-bound-in-flight-uploads | In a 32-bit process the live upload buffers are held to 256 MiB (`UPLOAD_BUDGET_MB`): over it, a flush waits for the oldest batches and D3D9 Present waits for the worker. `UPLOAD_STATS=1` logs upload, buffer, texture and blob-map counts every 5 s | [`docs/f6va.md`](../../docs/f6va.md) |
 
 0021 has no mail header. `scripts/pins-table.py` carries its one-line
 description.
+
+### Dropped at the November rebase
+
+Upstream's November release (`76c095bb`) has these fixes itself, so the
+series no longer carries them. Each was dropped after reading the upstream
+code, not after a test that isolates it:
+
+| Dropped | What upstream has now |
+| --- | --- |
+| 0020 yttrium-gate-feedback-loop-usage-on-format-support | `yttrium_venus_select_feedback_loop_usage` asks the host for the exact image before it adds `ATTACHMENT_FEEDBACK_LOOP` usage |
+| 0025 yttrium-packed-16-bit-formats-match-vulkan | `B5G5R5A1` maps to `A1R5G5B5_UNORM_PACK16` and `B5G6R5` to `R5G6B5_UNORM_PACK16` |
+| 0075 wsi-win32-blit-shared-swapchain-when-linear-cannot-render | The Win32 WSI was rewritten: a swapchain image is created from the D3D11 texture's shared descriptor (`create_image_and_memory_from_win32_handle`), which carries its tiling and modifier, so the code 0075 patched is gone |
+| 0090 yttrium-d3d9-depth-bias-without-float-representation | The pipeline converts an unscaled depth bias to exact `FORMAT` or `FORCE_UNORM` units when the host has no float representation |
+| 0006, depth-bias part and depth-upload part | D3D9 depth bias is set in `D3D9CreateRasterizerState` for triangles only, and buffer-to-image uploads use the depth aspect. The sampler-type, `A4R4G4B4`, `A8L8` and `D32F_LOCKABLE` parts stay |
+| 0008, UAV load swizzles | Raw and typed UAV loads apply the source swizzle. The array `TXD` gradient part stays |
+| 0009, compute buffer SRVs | Compute shaders sample buffer SRVs through uniform texel buffers. The rest stays |
+| 0011, WSI handle import | `wsi_memory_win32_handle_import_info` is gone with the WSI rewrite. NT handle export and import for `VK_KHR_external_memory_win32` stay |
+
+`D3D9Tracef` no longer exists upstream, so 0012 and 0035 lost their trace
+lines. 0023 no longer calls 0020's helper: it asks the host with
+`yttrium_venus_image_create_flags`, before upstream adds feedback-loop usage.
+0022 passes no `VkImageViewUsageCreateInfo` for a view of the shadow image.
 
 Applied in order to the pinned tarball, 0001 to 0011 give exactly the codex
 tree minus the parts listed below. This was checked by comparing git tree
@@ -167,7 +187,8 @@ Mesa tree; that work was in vkd3d-proton. The error-level `mesa_loge` lines in
 the Venus NT memory path are failure reports, not diagnostics, so 0011 keeps
 them.
 
-Which patches have run in a guest, and where:
+Which patches have run in a guest, and where. Every row but the last is a
+run on the September base (`374c3022`), and names patches as they were then:
 
 | Run | Mesa patches in the package | Evidence |
 | --- | --- | --- |
@@ -180,6 +201,7 @@ Which patches have run in a guest, and where:
 | unigl proof, Windows 11 on `Nvidia1` and `AMD1` (e2e, Unigine Heaven and Valley OpenGL) | 0001 to 0017, 0020 to 0027, 0030, 0035, 0040 to 0044, 0070, 0085, 0086 | `docs/unigl.md` |
 | unid3d proof, Windows 11 on `AMD1`, `Nvidia1` and `Nvidia2` (e2e, `d3d9_depthbias`, Unigine D3D9 and D3D11) | 0001 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0090 | `docs/unid3d.md` |
 | gzdoom proof, Windows 11 on `AMD1` and `Nvidia1` (e2e, `gzgl`, GZDoom OpenGL and Vulkan) | 0001 to 0017, 0020 to 0027, 0030 to 0032, 0035, 0040 to 0044, 0080; the `Nvidia1` runs add 0070 and 0086, the last e2e on each GPU adds 0070, 0086 and 0090 | `docs/gzdoom.md` |
+| November base, Windows 11 on `AMD1` and `Nvidia2` (e2e, and the static vertex buffer page of GitHub #233 in Edge) | The 43 patches of the series as it is now | `docs/acceptance.md`, "November base" |
 
 The nvtex proof run (2026-10-18) has the full series, 0001 to 0025, built by
 `scripts/build.sh` at commit [e428846](https://github.com/VMLabDev/vmlab-win3d/commit/e428846ccddaf01dba7efed9d057518f45c522fc). Before it, no recorded run had 0015
@@ -223,4 +245,19 @@ This build was not repeated, so its bit-reproducibility is not checked:
 ```
 a43c70d4e56407055e438a6fc831f61ad9c9e458d98ef9937c360a3863fca2fb  mesa/x64/viogpu_d3d10.dll
 657e89272ed867033f03a71204d39a30b5063f0e4b275b0a7a7ecd428813dd7e  mesa/x86/viogpu_d3d10.dll
+```
+
+The November base (`76c095bb`, the 43 patches) built once on 2026-11-19 with
+the same toolchain image. That build was not repeated, so its
+bit-reproducibility is not checked:
+
+```
+faa19d2a05a0ecea652f2bef2a60a05a9e65751688358eba8c4fee1b71061713  mesa/x64/libvulkan_virtio.dll
+04c5a9b5382a24d48764db83b6fdc369f18472699d547abbccc4c21bdfb6327c  mesa/x64/viogpu_d3d10.dll
+8905445289db3ca0cb530499a1adfae1852b219d077dcc8972342a60a283331b  mesa/x64/viogpu_wgl.dll
+f67d39fde82a46dfdbb34581493632e164fe6694310ff125c0c180c91283304a  mesa/x64/virtio_icd.json
+55da16b5e6c388bb546d208935693c57a46b875f0d17adc1b324f8b6fed92dd4  mesa/x86/libvulkan_virtio.dll
+8f92204488461d1dabb16c6119af49c3341f428abf67e9c4351cbc64b173f8b7  mesa/x86/viogpu_d3d10.dll
+dcf70f1b0b2b9bdf194f0d0bbeaaf6a47b27e95eb859bbed8877617ceb263ea4  mesa/x86/viogpu_wgl.dll
+69e6a7c23226a0c1c854f9b8ac340cedc361ad2db66fe6aa7733c8e060e03151  mesa/x86/virtio_icd.json
 ```

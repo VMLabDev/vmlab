@@ -18,7 +18,7 @@ Evidence: docs/dxdiag.md, docs/evidence/dxdiag/.
 Origin: vmlab-win3d, worker fix-dxdiag.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
-index 56dfee1..888dbf3 100644
+index a12aac1..ff35d2e 100644
 --- a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
 @@ -317,6 +317,46 @@ static constexpr DWORD d3d9_legacy_dev_hw_transform_light = 0x00010000u;
@@ -193,26 +193,19 @@ index 56dfee1..888dbf3 100644
  static HRESULT
  D3D9ValidateData(const D3DDDIARG_GETCAPS *data, UINT size)
  {
-@@ -675,6 +814,23 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
-                  ((D3D9LegacyGlobalDriverData *)data->pData)
-                     ->hwCaps.dwDeviceZBufferBitDepth);
+@@ -634,6 +773,16 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
+       D3D9FillLegacyCaps(adapter,
+                          (D3D9LegacyGlobalDriverData *)data->pData);
        return S_OK;
 +   case D3DDDICAPS_GETD3D7CAPS:
 +      if (FAILED(D3D9ValidateData(data, sizeof(D3D9LegacyExtendedCaps))))
 +         return E_INVALIDARG;
 +      D3D9FillExtendedCaps(adapter, (D3D9LegacyExtendedCaps *)data->pData);
-+      D3D9Tracef("GetCaps D3D7 size=%u max_tex=%lux%lu stages=%u\n",
-+                 data->DataSize,
-+                 ((D3D9LegacyExtendedCaps *)data->pData)->dwMaxTextureWidth,
-+                 ((D3D9LegacyExtendedCaps *)data->pData)->dwMaxTextureHeight,
-+                 ((D3D9LegacyExtendedCaps *)data->pData)
-+                    ->wMaxTextureBlendStages);
 +      return S_OK;
 +   case D3DDDICAPS_GETD3D8CAPS:
 +      if (FAILED(D3D9ValidateData(data, d3d8_caps_size)))
 +         return E_INVALIDARG;
 +      D3D9FillD3D8Caps(adapter, data->pData);
-+      D3D9Tracef("GetCaps D3D8 size=%u\n", data->DataSize);
 +      return S_OK;
     case D3DDDICAPS_GETD3D9CAPS:
        if (FAILED(D3D9ValidateData(data, sizeof(D3DCAPS9))))
