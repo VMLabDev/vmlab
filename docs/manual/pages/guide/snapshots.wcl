@@ -55,8 +55,7 @@ page guide_snapshots {
     `vmlab` (see [Host and firmware](guide_host)). An online snapshot holds
     RAM and device state in that hypervisor's own format, so restoring it on
     a machine that now runs on the other one is refused, naming the one that
-    took it; set the machine's `hypervisor` back and it restores again. An
-    offline snapshot is plain qcow2 and restores under either. A snapshot
+    took it. An offline snapshot is plain qcow2 and restores under either. A snapshot
     taken before vmlab recorded the field was QEMU's.
   DOC
 
@@ -65,9 +64,9 @@ page guide_snapshots {
     body = "Retake Windows online snapshots made with vmlab-hv before the pin to `36e90a92010ff37745f4ae053a4e2f802006571d`. Those snapshots lack CET state that the updated hypervisor saves and restores. Offline snapshots and QEMU snapshots are unaffected."
   }
 
-  callout "Online QEMU snapshots of x86 machines will not restore after the QEMU removal" {
+  callout "Online QEMU snapshots after migration to vmlab-hv" {
     kind = :warning
-    body = "A later release removes QEMU for x86 guests. Online snapshots QEMU took stay on disk, but restoring one by name is then refused, and there is no converter. To keep one, restore it, shut the machine down and take an offline snapshot. `vmlab status` and `vmlab status --json` list the snapshots this affects."
+    body = "Online QEMU snapshots stay on disk. When vmlab-hv is selected, `vmlab snapshot list` marks them unrestorable by name and restore refuses them. To convert one to offline, restore it with a release that supports QEMU for that guest, shut the machine down, and take an offline snapshot before upgrading."
   }
 
   h2 "Lab-wide snapshots"

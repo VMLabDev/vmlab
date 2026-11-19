@@ -368,9 +368,10 @@ async fn start_machine_request(
         output(format!("warning: {warning}\n"));
     }
     if m.pending_first_boot().is_none() {
-        lab.start_with_deferred_refresh(machine).await?;
+        lab.start_with_deferred_refresh(machine, Some(output))
+            .await?;
     } else {
-        lab.start_machine(machine).await?;
+        lab.start_machine_with_output(machine, Some(output)).await?;
         lab.run_owed_first_boot(machine, output).await?;
     }
     Ok(())
