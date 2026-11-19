@@ -678,6 +678,37 @@ fn probe_idle(client: &mut Client, samples: usize) {
     debug(client, DebugRequest::Continue);
 }
 
+/// The KASLR slide boot.efi chose, in its 2 MiB steps: the first step above
+/// XNU's unslid base where a vCPU running XNU maps a 64-bit Mach-O header.
+fn kernel_slide(client: &mut Client) -> Option<u16> {
+    use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+    debug(client, DebugRequest::Pause);
+    let vcpu = (0..4u8).find(|vcpu| {
+        matches!(
+            debug(client, DebugRequest::ReadRegisters { vcpu: *vcpu }),
+            DebugResponse::Registers { registers, .. } if registers.general[16] >= XNU_BASE
+        )
+    });
+    let slide = vcpu.and_then(|vcpu| {
+        (0..=255u16).find(|slide| {
+            let header = client.call(Control::Debug {
+                request: DebugRequest::ReadMemory {
+                    space: AddressSpace::Virtual { vcpu },
+                    address: 0xffff_ff80_0020_0000 + u64::from(*slide) * 0x20_0000,
+                    length: 4,
+                },
+            });
+            matches!(
+                header,
+                Ok(Outcome::Debug { response: DebugResponse::Memory { data } })
+                    if data == [0xcf, 0xfa, 0xed, 0xfe]
+            )
+        })
+    });
+    debug(client, DebugRequest::Continue);
+    slide
+}
+
 /// The top 256 MiB below 2 GiB, where OVMF, OpenCore and boot.efi keep
 /// their pools and logs: what a boot stuck before XNU last said. A boot
 /// with the census's fake key puts no secret there.
@@ -747,6 +778,7 @@ fn macos_boot_stall_census() {
         .ok()
         .map(|s| Duration::from_secs(s.parse().unwrap()));
     let mut agent_times = Vec::new();
+    let mut slides = Vec::new();
     let probe = std::env::var("VMLAB_HV_MACOS_STALL_PROBE")
         .ok()
         .map(|s| s.parse::<usize>().unwrap());
@@ -780,6 +812,9 @@ fn macos_boot_stall_census() {
                 reached = Some(started.elapsed());
                 break;
             }
+        }
+        if reached.is_some() {
+            slides.push(kernel_slide(&mut vm.client));
         }
         // Past XNU the agent is a plain launchd daemon, which a fake key does
         // not stop: `VMLAB_HV_MACOS_STALL_AGENT=<seconds>` waits for it too.
@@ -851,6 +886,8 @@ fn macos_boot_stall_census() {
         }
         let _ = vm.process.wait();
     }
+    slides.sort();
+    eprintln!("census: KASLR slides of the boots that reached XNU {slides:?}");
     times.sort_by(f64::total_cmp);
     eprintln!(
         "census: {} of {runs} runs stalled {stalls:?}; time to the agent {agent_times:.0?}; time to XNU min {:.1} median {:.1} max {:.1} s",
