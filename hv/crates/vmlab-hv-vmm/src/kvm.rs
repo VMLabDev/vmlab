@@ -401,7 +401,7 @@ impl KvmDoorbells {
     fn clear(&mut self) {
         for doorbell in self.registered.drain(..) {
             if let Err(e) = self.vm.unregister_ioevent(
-                &*doorbell.event,
+                &doorbell.event,
                 &kvm_ioctls::IoEventAddress::Mmio(doorbell.address),
                 kvm_ioctls::NoDatamatch,
             ) {
@@ -419,7 +419,7 @@ impl vmlab_hv_devices::QueueDoorbells for KvmDoorbells {
         self.clear();
         for doorbell in doorbells {
             if let Err(e) = self.vm.register_ioevent(
-                &*doorbell.event,
+                &doorbell.event,
                 &kvm_ioctls::IoEventAddress::Mmio(doorbell.address),
                 kvm_ioctls::NoDatamatch,
             ) {
