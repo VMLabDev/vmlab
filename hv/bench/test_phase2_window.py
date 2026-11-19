@@ -122,7 +122,8 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(result["samples"], {"blk_seq_write_mbps": 2048.0,
             "net_tx_udp_mbps": round(6500000 * 8 / 12 / 1e6, 2)})
         self.assertIn("/tmp/randblke seqwrite /var/tmp/bench-seq.img 536870912", commands)
-        self.assertTrue(any("65000 12.0" in text and "udp-blast" in text for text in commands))
+        self.assertTrue(any(text.startswith("taskset -c 1 ") and "udp-blast" in text
+                            and text.endswith("65000 12.0") for text in commands))
         self.assertFalse(any(mode in text for text in commands for mode in ("seqread", "randread", "randwrite", "udp-sink")))
 
     def test_udp_delivery_failure_is_not_recorded_as_low_throughput(self):
@@ -182,7 +183,7 @@ class WindowTests(unittest.TestCase):
             self.assertEqual(version, "version")
             return {"samples": {key: 100 for key in window.WORKLOADS}, "backend_version": "version"}
 
-        history = [{"backend": backend, "workload": key, "median": 100}
+        history = [{"backend": backend, "workload": key, "median": 100, "spread": 3}
                    for backend in ("qemu", "vmlab-hv") for key in window.WORKLOADS]
         with tempfile.TemporaryDirectory() as root, \
              mock.patch.object(window, "preflight", return_value=environment), \
@@ -201,6 +202,8 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertEqual(len(result["results"]), 12)
         self.assertEqual(len(result["bars"]), 4)
+        self.assertEqual(result["bars"][1]["qemu_spread"], 3)
+        self.assertEqual(result["bars"][1]["vmlab_hv_spread"], 3)
         self.assertEqual(single.call_count, 6)
         self.assertEqual(pair.call_count, 6)
         monitor.close.assert_called_once_with()

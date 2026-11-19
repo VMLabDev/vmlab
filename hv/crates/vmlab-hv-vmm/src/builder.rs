@@ -723,6 +723,7 @@ pub fn build(
             |chipset| chipset.irq_source(id, gsi),
         )
     };
+    let doorbell_vm = kvm.vm.clone();
     let wiring = |address: Option<PciAddress>,
                   vectors: u16,
                   transitional: bool|
@@ -745,6 +746,7 @@ pub fn build(
             },
             msix_vectors: vectors,
             transitional: firmware_machine && transitional,
+            doorbells: Some(Box::new(crate::kvm::KvmDoorbells::new(doorbell_vm.clone()))),
         })
     };
     let place = |function: Arc<Mutex<dyn vmlab_hv_devices::PciDevice>>,
@@ -1031,6 +1033,9 @@ pub fn build(
                 vga.lock()
                     .enable_3d(mode, node, mapper)
                     .map_err(|e| VmmError::Other(e.to_string()))?;
+            }
+            if let Some(doorbells) = transport.doorbells {
+                vga.lock().set_queue_doorbells(doorbells);
             }
             place(vga.clone(), Some(display.pci))?;
             snap_nodes.push(DeviceNode::Resettable(vga.clone()));

@@ -55,9 +55,23 @@ pub struct HypervisorDefaults {
     pub vm: Option<HypervisorKind>,
 }
 
+/// Which rung of the selection ladder named a machine's hypervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionSource {
+    /// The machine's own `hypervisor`.
+    Machine,
+    /// The host config's `hypervisor {}` default for its kind.
+    HostDefault,
+    /// The identity persisted with the machine's disks.
+    Existing,
+    /// Automatic selection: vmlab-hv unless [`vmlab_refusals`] names a reason.
+    Automatic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HypervisorSelection {
     pub kind: HypervisorKind,
+    pub source: SelectionSource,
     pub fallback_reason: Option<String>,
 }
 
@@ -71,13 +85,19 @@ impl HypervisorDefaults {
         hardware: Option<&ResolvedVm>,
         existing: Option<HypervisorKind>,
     ) -> HypervisorSelection {
-        let explicit = match machine {
-            MachineCfg::Vm(vm) => vm.hypervisor.or(self.vm),
-            MachineCfg::Container(c) => c.hypervisor.or(self.container),
+        let (own, default) = match machine {
+            MachineCfg::Vm(vm) => (vm.hypervisor, self.vm),
+            MachineCfg::Container(c) => (c.hypervisor, self.container),
         };
+        let explicit = own.or(default);
         if let Some(kind) = explicit.or(existing) {
             return HypervisorSelection {
                 kind,
+                source: match (own, default) {
+                    (Some(_), _) => SelectionSource::Machine,
+                    (None, Some(_)) => SelectionSource::HostDefault,
+                    (None, None) => SelectionSource::Existing,
+                },
                 fallback_reason: (explicit.is_none() && kind == HypervisorKind::Qemu)
                     .then(|| format!("{}: keeping existing QEMU machine until destroy or an explicit hypervisor setting", machine.name())),
             };
@@ -89,6 +109,7 @@ impl HypervisorDefaults {
             } else {
                 HypervisorKind::Qemu
             },
+            source: SelectionSource::Automatic,
             fallback_reason: (!why.is_empty()).then(|| why.join("; ")),
         }
     }
@@ -393,6 +414,170 @@ pub fn qemu_refusals(vm: &Vm) -> Vec<String> {
         }
     }
     why
+}
+
+/// Why an x86 machine is on QEMU, as the removal warning names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QemuReason {
+    /// The machine sets `hypervisor = "qemu"`.
+    Explicit,
+    /// The host config's `hypervisor {}` default for its kind is `qemu`.
+    HostDefault,
+    /// Its disks were made under QEMU, and a machine keeps its hypervisor.
+    Existing,
+    /// It declares `qemu_args`, which only QEMU takes.
+    QemuArgs,
+    /// vmlab-hv refuses it as declared, so automatic selection fell back.
+    Refused,
+}
+
+/// One x86 machine that runs on QEMU, which a later release stops running
+/// (the warning release before the removal): why it is there and what to do
+/// about it, and the online snapshots that go with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QemuRemoval {
+    pub reason: QemuReason,
+    /// The whole warning: the machine, the reason and the fix.
+    pub warning: String,
+    /// Online snapshots taken under QEMU. They stay on disk, but restoring
+    /// one by name is refused once QEMU no longer runs x86 guests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub online_snapshots: Vec<String>,
+}
+
+impl QemuRemoval {
+    /// What a surface prints: the warning, then the snapshots it costs.
+    pub fn lines(&self, machine: &str) -> Vec<String> {
+        let mut lines = vec![self.warning.clone()];
+        if !self.online_snapshots.is_empty() {
+            lines.push(format!(
+                "\"{machine}\": online snapshot(s) {} were taken under QEMU and cannot be \
+                 restored once QEMU support for x86 guests is removed — to keep one, restore \
+                 it, shut the machine down and take an offline snapshot, which either \
+                 hypervisor restores",
+                self.online_snapshots
+                    .iter()
+                    .map(|s| format!("\"{s}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        lines
+    }
+}
+
+/// Whether `arch` is an x86 guest, the only kind the removal touches.
+fn x86_guest(arch: &str) -> bool {
+    crate::qemu::qemu_arch(arch) == VMLAB_ARCH
+}
+
+/// The removal warning for `machine` under `selection` — `None` unless it is
+/// an x86 or x86_64 guest that runs on QEMU. `hardware` as in
+/// [`vmlab_refusals`]: without it a VM whose template is not local reports
+/// only what its declaration shows.
+pub fn qemu_removal(
+    machine: MachineCfg<'_>,
+    selection: &HypervisorSelection,
+    host: &HostFacts,
+    hardware: Option<&ResolvedVm>,
+) -> Option<QemuRemoval> {
+    if selection.kind != HypervisorKind::Qemu {
+        return None;
+    }
+    let (kind, name, arch) = match machine {
+        MachineCfg::Vm(vm) => (
+            "vm",
+            &vm.name,
+            hardware
+                .map(|h| h.arch.clone())
+                .or_else(|| crate::qemu::resolve::vm_arch(vm))
+                .unwrap_or_else(|| host.arch.clone()),
+        ),
+        // A container runs the host's own architecture.
+        MachineCfg::Container(c) => ("container", &c.name, host.arch.clone()),
+    };
+    if !x86_guest(&arch) {
+        return None;
+    }
+    let blockers = vmlab_refusals(machine, host, hardware);
+    let qemu_args = matches!(machine, MachineCfg::Vm(vm) if !vm.qemu_args.is_empty());
+    let reason = match selection.source {
+        SelectionSource::Machine => QemuReason::Explicit,
+        SelectionSource::HostDefault => QemuReason::HostDefault,
+        SelectionSource::Existing => QemuReason::Existing,
+        SelectionSource::Automatic if qemu_args => QemuReason::QemuArgs,
+        SelectionSource::Automatic => QemuReason::Refused,
+    };
+    let (because, fix) = match reason {
+        QemuReason::Explicit => (
+            "it sets hypervisor = \"qemu\"".to_string(),
+            format!(
+                "set hypervisor = \"vmlab\" on it (removing the line alone leaves a machine \
+                 that already has disks on QEMU until `vmlab {kind} destroy {name}`)"
+            ),
+        ),
+        QemuReason::HostDefault => (
+            format!("the host config sets `hypervisor {{ {kind} = \"qemu\" }}`"),
+            format!(
+                "remove that default from the host config; a machine that already has disks \
+                 then needs hypervisor = \"vmlab\" as well, or `vmlab {kind} destroy {name}`"
+            ),
+        ),
+        QemuReason::Existing => (
+            "its disks were made under QEMU and a machine keeps its hypervisor".to_string(),
+            format!(
+                "set hypervisor = \"vmlab\" on it, or run `vmlab {kind} destroy {name}` so \
+                 the next `up` builds it on vmlab-hv"
+            ),
+        ),
+        QemuReason::QemuArgs => (
+            "it declares `qemu_args`, which only QEMU takes".to_string(),
+            "remove `qemu_args`".to_string(),
+        ),
+        QemuReason::Refused => (
+            "vmlab-hv cannot run it as declared".to_string(),
+            "change what is named below so that vmlab-hv runs it".to_string(),
+        ),
+    };
+    let mut warning = format!(
+        "{kind} \"{name}\" runs on QEMU because {because}. QEMU support for x86 guests is \
+         going away in a later vmlab release, and this machine will then not start. Fix: {fix}."
+    );
+    // Not for `qemu_args` alone, which the reason above already names.
+    if !(reason == QemuReason::QemuArgs && blockers.len() == 1) && !blockers.is_empty() {
+        warning.push_str(&format!(
+            " vmlab-hv refuses it today, and `hypervisor = \"qemu\"` stops being the way out \
+             for an x86 guest: {}",
+            blockers.join("; ")
+        ));
+    }
+    Some(QemuRemoval {
+        reason,
+        warning,
+        online_snapshots: Vec::new(),
+    })
+}
+
+/// The host half of the removal warning: x86 guests run under QEMU's
+/// emulation (TCG) on a host without usable KVM, and vmlab-hv has none. Said
+/// once per lab that has an x86 machine on QEMU.
+pub fn kvm_removal_warning(host: &HostFacts) -> Option<String> {
+    if host.arch != VMLAB_ARCH {
+        return Some(format!(
+            "this host is {} and runs x86 guests under QEMU's emulation (TCG). x86 guests \
+             will need KVM on an x86_64 host once QEMU support for x86 guests is removed in \
+             a later vmlab release",
+            host.arch
+        ));
+    }
+    (!host.kvm).then(|| {
+        "/dev/kvm is not usable on this host, so x86 guests run under QEMU's emulation \
+         (TCG). x86 guests will need KVM once QEMU support for x86 guests is removed in a \
+         later vmlab release — enable virtualization in the firmware, load the kvm module, \
+         and give this user access to /dev/kvm"
+            .to_string()
+    })
 }
 
 /// Why an online snapshot of a running vmlab-hv VM with `hardware` cannot be
@@ -1098,5 +1283,157 @@ mod tests {
         let why = vmlab_refusals(file.lab.machine("v").unwrap(), &host, None);
         assert_eq!(why.len(), 1, "{why:?}");
         assert!(why[0].contains("/dev/kvm"), "{}", why[0]);
+    }
+
+    // -- the QEMU removal warning --------------------------------------------
+
+    fn removal(
+        file: &crate::config::LabFile,
+        name: &str,
+        defaults: HypervisorDefaults,
+        host: &HostFacts,
+        existing: Option<HypervisorKind>,
+    ) -> Option<QemuRemoval> {
+        let machine = file.lab.machine(name).unwrap();
+        let selection = defaults.select(machine, host, None, existing);
+        qemu_removal(machine, &selection, host, None)
+    }
+
+    /// Each rung of the ladder that lands an x86 machine on QEMU is its own
+    /// reason, and each warning names the machine, the removal and a fix.
+    #[test]
+    fn every_x86_machine_on_qemu_is_warned_naming_its_reason_and_fix() {
+        let file = lab(r#"lab "l" {
+  vm "explicit" { template = "x86_64/t" hypervisor = "qemu" }
+  vm "plain" { template = "x86_64/t" }
+  vm "args" { template = "x86_64/t" qemu_args = ["-no-hpet"] }
+  vm "tcg" { template = "x86_64/t" accel = "tcg" }
+  container "c" { image = "alpine" }
+}"#);
+        let none = HypervisorDefaults::default();
+        let host = kvm_host();
+        let qemu = Some(HypervisorKind::Qemu);
+
+        let w = removal(&file, "explicit", none, &host, None).unwrap();
+        assert_eq!(w.reason, QemuReason::Explicit);
+        assert!(w.warning.contains("vm \"explicit\" runs on QEMU"), "{w:?}");
+        assert!(w.warning.contains("it sets hypervisor = \"qemu\""), "{w:?}");
+        assert!(w.warning.contains("going away"), "{w:?}");
+        assert!(
+            w.warning.contains("Fix: set hypervisor = \"vmlab\""),
+            "{w:?}"
+        );
+        // vmlab-hv would run it, so nothing else is named.
+        assert!(!w.warning.contains("refuses it today"), "{w:?}");
+
+        let by_host = HypervisorDefaults {
+            vm: qemu,
+            container: qemu,
+        };
+        let w = removal(&file, "plain", by_host, &host, None).unwrap();
+        assert_eq!(w.reason, QemuReason::HostDefault);
+        assert!(w.warning.contains("hypervisor { vm = \"qemu\" }"), "{w:?}");
+        assert!(w.warning.contains("from the host config"), "{w:?}");
+        let w = removal(&file, "c", by_host, &host, None).unwrap();
+        assert_eq!(w.reason, QemuReason::HostDefault);
+        assert!(w.warning.contains("container \"c\" runs on QEMU"), "{w:?}");
+        assert!(w.warning.contains("{ container = \"qemu\" }"), "{w:?}");
+
+        let w = removal(&file, "plain", none, &host, qemu).unwrap();
+        assert_eq!(w.reason, QemuReason::Existing);
+        assert!(w.warning.contains("disks were made under QEMU"), "{w:?}");
+        assert!(w.warning.contains("vmlab vm destroy plain"), "{w:?}");
+
+        let w = removal(&file, "args", none, &host, None).unwrap();
+        assert_eq!(w.reason, QemuReason::QemuArgs);
+        assert!(w.warning.contains("Fix: remove `qemu_args`"), "{w:?}");
+        assert!(!w.warning.contains("refuses it today"), "{w:?}");
+
+        let w = removal(&file, "tcg", none, &host, None).unwrap();
+        assert_eq!(w.reason, QemuReason::Refused);
+        assert!(w.warning.contains("vmlab-hv cannot run it"), "{w:?}");
+        assert!(w.warning.contains("accel = \"tcg\""), "{w:?}");
+    }
+
+    /// An explicit setting that also hides a refusal says both: moving the
+    /// machine takes more than changing `hypervisor`.
+    #[test]
+    fn an_explicit_qemu_machine_names_what_vmlab_hv_refuses_too() {
+        let file = lab(r#"lab "l" {
+  vm "v" { template = "x86_64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }
+}"#);
+        let w = removal(&file, "v", HypervisorDefaults::default(), &kvm_host(), None).unwrap();
+        assert_eq!(w.reason, QemuReason::Explicit);
+        assert!(w.warning.contains("refuses it today"), "{w:?}");
+        assert!(w.warning.contains("`qemu_args`"), "{w:?}");
+    }
+
+    /// The removal is x86's: another architecture on QEMU, and any machine
+    /// on vmlab-hv, are told nothing.
+    #[test]
+    fn other_architectures_and_vmlab_hv_machines_are_not_warned() {
+        let file = lab(r#"lab "l" {
+  vm "arm" { template = "aarch64/t" }
+  vm "hv" { template = "x86_64/t" }
+  container "c" { image = "alpine" }
+}"#);
+        let none = HypervisorDefaults::default();
+        assert_eq!(removal(&file, "arm", none, &kvm_host(), None), None);
+        assert_eq!(removal(&file, "hv", none, &kvm_host(), None), None);
+        assert_eq!(removal(&file, "c", none, &kvm_host(), None), None);
+        // A container runs the host's architecture, whatever QEMU it is on.
+        let arm_host = HostFacts {
+            arch: "aarch64".into(),
+            kvm: true,
+        };
+        assert_eq!(removal(&file, "c", none, &arm_host, None), None);
+    }
+
+    /// A host without usable KVM is told x86 guests will need it, and its
+    /// x86 machines are warned with KVM as what vmlab-hv refuses.
+    #[test]
+    fn a_host_without_kvm_is_warned_that_x86_guests_will_need_it() {
+        assert_eq!(kvm_removal_warning(&kvm_host()), None);
+        let no_kvm = HostFacts {
+            arch: "x86_64".into(),
+            kvm: false,
+        };
+        let w = kvm_removal_warning(&no_kvm).unwrap();
+        assert!(w.contains("/dev/kvm"), "{w}");
+        assert!(w.contains("will need KVM"), "{w}");
+        let arm = HostFacts {
+            arch: "aarch64".into(),
+            kvm: true,
+        };
+        let w = kvm_removal_warning(&arm).unwrap();
+        assert!(w.contains("aarch64"), "{w}");
+        assert!(w.contains("will need KVM"), "{w}");
+
+        let file = lab(r#"lab "l" { vm "v" { template = "x86_64/t" } }"#);
+        let w = removal(&file, "v", HypervisorDefaults::default(), &no_kvm, None).unwrap();
+        assert_eq!(w.reason, QemuReason::Refused);
+        assert!(w.warning.contains("/dev/kvm"), "{w:?}");
+    }
+
+    /// The online snapshots are a line of their own, and none is none.
+    #[test]
+    fn the_warning_lists_the_online_snapshots_the_removal_costs() {
+        let mut w = QemuRemoval {
+            reason: QemuReason::Existing,
+            warning: "vm \"v\" runs on QEMU".into(),
+            online_snapshots: Vec::new(),
+        };
+        assert_eq!(w.lines("v"), ["vm \"v\" runs on QEMU"]);
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(json["reason"], "existing");
+        assert!(json.get("online_snapshots").is_none(), "{json}");
+        w.online_snapshots = vec!["warm".into(), "hot".into()];
+        let lines = w.lines("v");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("\"warm\", \"hot\""), "{lines:?}");
+        assert!(lines[1].contains("cannot be restored"), "{lines:?}");
+        assert!(lines[1].contains("offline snapshot"), "{lines:?}");
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(json["online_snapshots"][1], "hot");
     }
 }

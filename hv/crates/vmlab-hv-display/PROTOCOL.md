@@ -243,7 +243,10 @@ Native input-only and dma-buf-only connections do not request readback.
 
 The q35 adapter publishes native virtio-gpu frames on RESOURCE_FLUSH and
 SET_SCANOUT, even without clients. Timestamps mark host receipt of the guest
-command, before capture and GPU synchronization. Damage is clipped from the
+command, before capture and GPU synchronization. Without a renderer (2D), a
+RESOURCE_FLUSH only records its damage: a frame thread composes and publishes
+at most one frame per 16 ms, which holds every flush before it and carries the
+timestamp of the newest. A lone flush is published at once. Damage is clipped from the
 resource rectangle to the scanout. Only VGA compatibility paths poll at 16 ms,
 using VGA dirty state and KVM's framebuffer dirty log to avoid unchanged pixels.
 Native workers wait for publications and releases, without a delivery timer.

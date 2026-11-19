@@ -363,6 +363,9 @@ pub struct VmInstance {
     /// snapshots record it.
     hypervisor: HypervisorKind,
     hypervisor_fallback: Option<String>,
+    /// The rung of the selection ladder the lab builder chose `hypervisor`
+    /// on. `None` on a machine nothing selected a hypervisor for.
+    selection_source: Option<crate::config::hypervisor::SelectionSource>,
     automatic_hypervisor: Option<crate::config::host::HostConfig>,
     pinned_selection: std::sync::OnceLock<crate::config::hypervisor::HypervisorSelection>,
     /// The host facts vmlab-hv's refusals read at each start (§22): this
@@ -456,6 +459,7 @@ impl VmInstance {
             hv: Arc::new(super::hypervisor::Qemu),
             hypervisor: HypervisorKind::Qemu,
             hypervisor_fallback: None,
+            selection_source: None,
             automatic_hypervisor: None,
             pinned_selection: std::sync::OnceLock::new(),
             host_facts: Arc::new(crate::config::hypervisor::HostFacts::probe),
@@ -487,6 +491,16 @@ impl VmInstance {
         self
     }
 
+    pub(super) fn with_selection_source(
+        mut self: Arc<Self>,
+        source: crate::config::hypervisor::SelectionSource,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("a freshly built VM has one owner")
+            .selection_source = Some(source);
+        self
+    }
+
     pub(super) fn with_automatic_hypervisor(
         mut self: Arc<Self>,
         host: Option<crate::config::host::HostConfig>,
@@ -510,6 +524,9 @@ impl VmInstance {
             ),
             None => crate::config::hypervisor::HypervisorSelection {
                 kind: self.hypervisor,
+                source: self
+                    .selection_source
+                    .unwrap_or(crate::config::hypervisor::SelectionSource::Machine),
                 fallback_reason: self.hypervisor_fallback.clone(),
             },
         }
@@ -2070,6 +2087,18 @@ impl super::machine::Machine for VmInstance {
 
     fn hypervisor_fallback(&self) -> Option<String> {
         self.selection().fallback_reason
+    }
+
+    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
+        if self.automatic_hypervisor.is_none() && self.selection_source.is_none() {
+            return None;
+        }
+        crate::config::hypervisor::qemu_removal(
+            crate::config::model::MachineCfg::Vm(&self.cfg),
+            &self.selection(),
+            &(self.host_facts)(),
+            Some(&self.template().resolved),
+        )
     }
 
     fn event_subject(&self) -> &'static str {
