@@ -3,9 +3,10 @@
 **Verdict: D28 remains open. Round 7 met six of ten core bars. Card #71 then
 closed G1 (0.9770). Card #72 reran G2 and did not close it (1.0182). Card #73
 closed G6 (1.6307). Card #98 merged the ioeventfd wake of the virtio-blk
-worker (FD6) and reran both: G2 1.0240, G6 1.5416. Card #97 moved the
-virtio-gpu 2D commands off the vCPU threads (FD5) and reran G2: 0.9361, with
-a boot time that did not move outside its spread.**
+worker (FD6) and reran both: G2 1.0240, G6 1.5416. Card #74 closed G7
+(1.1434). Card #97 moved the virtio-gpu 2D commands off the vCPU threads
+(FD5) and reran G2: 0.9361, with a boot time that did not move outside its
+spread.**
 
 ## Round 7 follow-up: virtio-gpu 2D commands off the vCPU thread (card #97, 2026-11-19)
 
@@ -123,14 +124,188 @@ frames, a resize, input and a reset through the display socket.
 
 These are drafts. No card exists for them.
 
-- FD14: make a 2D compose cost what its damage costs. It copies the
+- FD16: make a 2D compose cost what its damage costs. It copies the
   frame twice (the previous pixels and the cached frame) and compares
   every tile, where the flush rectangles bound what can have changed.
   Worth up to 1.5 seconds of host CPU per Windows boot on the frame
   thread, and no boot time.
-- FD15: G2 moves in two modes about 10 seconds apart on both backends
+- FD17: G2 moves in two modes about 10 seconds apart on both backends
   (M3), which is most of its spread. Finding what the guest does in the
   slow boots would make the bar resolve smaller effects.
+
+
+## Round 7 follow-up: G7 UDP transmit (card #74, 2026-11-19)
+
+G7 now passes: vmlab-hv sends 35958.04 Mbit/s against QEMU's 31447.98, a
+ratio of 1.1434. Round 7 measured 25763.87 against 35457.47 (0.7266).
+
+### Cause
+
+Each kick of a virtio-net transmit queue was a user-space MMIO exit on the
+vCPU thread. QEMU takes the same kick in the kernel, through an ioeventfd.
+
+The workload sends one 65000-byte datagram per `sendto`, and the guest
+kicks once per datagram on both backends: a 12-second send on vmlab-hv
+had 738,000 transmit interrupts for 762,000 datagrams. The sending vCPU
+limits the rate. One 12-second send on each backend, with the sender alone
+on its guest CPU:
+
+| | QEMU 11.1.3 | vmlab-hv at `0c65636d` |
+|---|---:|---:|
+| Rate (Mbit/s) | 39711 | 33037 |
+| Sender's guest CPU in user and system time | 79% | 95% |
+| That CPU time per datagram (microseconds) | 10.4 | 15.0 |
+| Device thread CPU, user plus system (s) | 7.8 | 5.3 |
+
+vmlab-hv takes the checksum off the guest (N6) and its device thread uses
+less CPU than QEMU's main loop, yet the guest paid 4.6 microseconds more
+for each datagram. A user-space instruction sample of the vmlab-hv process
+(`bench/ipsample.c`, 3 seconds, 2697 samples, 455 unresolved) puts 64% of
+the samples in the kick's exit path on the vCPU thread: the vCPU run loop, the
+chipset clock step with its HPET, RTC and interrupt-line updates, the PCI
+window and BAR decode, and `queue_notify` with its write to the worker's
+wake socket. `process_tx`, the whole transmit copy, has 13%.
+
+### Change
+
+virtio-net on a switch stream offers one event for all its queues, and
+its worker polls it. The event is registered as a KVM ioeventfd at each
+queue's notify address while the driver has the device activated. A
+refused registration leaves the write to the old path. TAP devices are
+unchanged. The commit that was measured is
+`42425590b7132f6b4e1e8dd8f3b5d78064547df0`.
+
+That commit had its own seam for the registration, kept by the PCI root.
+Card #98 merged an equal seam for virtio-blk first (below), and the merge
+of `next` into this card left one: virtio-net returns its event from
+`VirtioDevice::queue_events`, and the transport registers it through
+`QueueDoorbells`, as it does for a `QueueWorker`. The seam of `42425590`
+is removed (`VirtioDevice::notify_event`, `PciDevice::notify_events` and
+`take_notify_change`, `NotifyEvent`, `NotifyRegistrar` and
+`PciRoot::set_notify_registrar`), so this card changes no shared
+interface. One difference follows: the PCI root of `42425590` removed a
+registration while the function's memory-decode bit was off, and the
+merged seam keeps it at the programmed BAR address. The numbers below
+are from `42425590` and were not measured again after the merge.
+
+### Diagnostic cohorts
+
+Before the rerun, 24 diagnostic sends of 12 seconds ran on a shared but
+lightly loaded host (one-minute load 1.1 to 5.1), three per fresh-overlay
+boot, with the backends rotated. "fix" is the change before its commit.
+These are not gate records.
+
+The spread of every gate round has one source on both backends: where the
+guest scheduler runs the sender. The transmit interrupt arrives on one
+guest CPU. A sender on the other CPU has a CPU to itself. A sender on the
+interrupt's CPU shares it with the completion softirq. A send is "mixed"
+when the sender moved during the 12 seconds.
+
+| Sender runs on | QEMU (Mbit/s) | vmlab-hv at `0c65636d` | vmlab-hv with the fix |
+|---|---:|---:|---:|
+| The other CPU | 41399 (n=2) | 32930 (n=3) | 44509 (n=1) |
+| Both (mixed) | 34085 (n=5) | 26673 (n=3) | 35959 (n=2) |
+| The interrupt's CPU | 29849 (n=2) | 24882 (n=3) | 30197 (n=3) |
+| Guest CPU per datagram, same order (microseconds) | 13.0, 15.5, 17.3 | 16.0, 19.7, 21.0 | 12.2, 14.8, 17.2 |
+
+Values are medians. The last row counts both guest CPUs with softirq
+time. In each placement the round-7 code is at 0.78 to 0.83 times QEMU
+and the fix at 1.01 to 1.08.
+
+### Findings
+
+- F1, the kick was the cost. With the ioeventfd the guest spends 3.8 to
+  4.9 microseconds less CPU on each datagram, in every placement.
+- F2, G7 cannot place a ratio within 30% from three samples. A sample is
+  near 30, 35 or 43 Gbit/s by the sender's placement, on both backends,
+  so two backends at parity can measure anywhere from 0.70 to 1.43. This
+  explains QEMU's samples from 28812 to 43560 in rounds 2 to 7. The rerun below
+  has one high sample on each side.
+- F3, boot is not slower. Registration happens at DRIVER_OK, not while
+  firmware sizes BARs. The diagnostic boots took 6.44 and 6.46 seconds
+  with the fix and 6.56 and 6.58 without.
+
+### Quiet-window rerun
+
+The rerun used round 7's method on helios from
+`42425590b7132f6b4e1e8dd8f3b5d78064547df0`: `bench/run.py --arch x86_64
+--guest ubuntu-26.04 --repeats 3`, all three QEMU repeats and then all
+three vmlab-hv repeats, each on a fresh overlay, CPUs 16 to 23, governor
+performance, 24 GiB scopes with swap disabled, Ubuntu 26.04.3. QEMU was
+11.1.3. The release vmlab-hv binary SHA-256 was
+`bc8b50acc1b116271719017c4b582449351948a3180bf7ff491cb448b19bf26c` and the
+iPXE ROM SHA-256 was
+`1fcb174044dacabd6fc16d92eecee65ca2f92dfd5262f3a963f85da92b6ef101`.
+
+The card ran alone on the board. No project VM ran before or after. No
+build or check ran during the window. The monitor took 125 samples at
+five-second intervals from 02:29:34 to 02:39:54 UTC. The one-minute load
+ranged from 0.29 to 1.91, the five-minute load from 0.40 to 1.26 and the
+fifteen-minute load from 0.87 to 1.11. The opticlang pause was not
+confirmed. Logs, hashes, the diagnostic scripts and their raw results
+remain on helios under `/home/vmlab/src/stc/logs/d28-card-74/`. The rerun
+is in `gate2`.
+
+| Bar | Workload | QEMU samples | QEMU median | vmlab-hv samples | vmlab-hv median | hv/qemu | Verdict |
+|---|---|---|---:|---|---:|---:|---|
+| G7 | UDP TX (Mbit/s) | 42039.68, 29887.45, 31447.98 | 31447.98 | 35810.52, 35958.04, 44971.56 | 35958.04 | 1.1434 | PASS |
+
+The lowest vmlab-hv sample is above the QEMU median.
+
+This was the second attempt. The first, 18 minutes earlier (`gate1`),
+stopped in the QEMU cohort before any vmlab-hv sample: in QEMU's second
+repeat the host peer (`bench/netpeer`) died during the UDP receive blast,
+and the runner failed on its next request to the peer. QEMU's two
+transmit samples until then were 37982.92 and 38712.39. The attempt
+appended no record. Its cause was not found.
+
+The same runs measure the other single-VM workloads. Their cards own the
+verdicts (#71, #73). The values are recorded here because the change is
+in the PCI root, which every device's BAR writes pass through:
+
+| Bar | Workload | QEMU median | vmlab-hv median | hv/qemu | Card #71's rerun |
+|---|---|---:|---:|---:|---:|
+| G1 | Ubuntu boot (s) | 6.67 | 6.50 | 0.9745 | 0.9770 |
+| G3 | Sequential read (MiB/s) | 20451.32 | 20321.24 | 0.9936 | 1.1350 |
+| G4 | Sequential write (MiB/s) | 1431.34 | 4060.75 | 2.8370 | 2.0602 |
+| G5 | Random read 4 KiB (IOPS) | 50584.50 | 68432.80 | 1.3528 | 1.3944 |
+| G6 | Random write 4 KiB (IOPS) | 18875.40 | 17136.90 | 0.9079 | 0.9845 |
+| G8 | UDP RX (Mbit/s) | 85294.26 | 109125.82 | 1.2794 | 1.2651 |
+
+The G3 ratio moved because QEMU's median rose from 18473.58 to 20451.32.
+vmlab-hv measured 20967.17 then and 20321.24 now. Idle host CPU was 1.07%
+of one core on QEMU and 2.18% on vmlab-hv. All 16 aggregate records and
+their samples are appended to [`history/x86_64.jsonl`](history/x86_64.jsonl).
+The vmlab-hv records are marked dirty because the QEMU run had appended
+to that tracked file. Windows boot (G2) and the guest-to-guest pair were
+not run.
+
+### Verification
+
+After the merge, unit tests cover virtio-net on the merged seam. The
+worker transmits on a count written to the event, with no `queue_notify`
+call, and a TAP device offers no event. The transitional transport
+registers the one event at both queues' notify addresses from DRIVER_OK
+until reset. The tests of card #98 cover the transport and the KVM
+registration.
+
+The three S1 NIC tests on booted guests
+(`nic_dhcp_exchange_with_test_switch`,
+`nic_traffic_survives_snapshot_load`,
+`nic_vnet_multiqueue_traffic_survives_snapshot_load`) need KVM, so they
+ran on helios outside the merge bar. They passed at `42425590` on the seam
+that is now removed, and again at `eb71a71b` on the merged one. They
+assert traffic, not that the kick takes the ioeventfd.
+
+### Follow-up drafts
+
+These are drafts. No card exists for them.
+
+- FD14: G7 needs another method to resolve a ratio. Either pin the sender
+  in the guest (`taskset`) away from the interrupt's CPU, or take more
+  than three sends and alternate the backends.
+- FD15: `bench/netpeer` died once during a QEMU receive blast. The runner
+  keeps none of the peer's standard error, so the cause is not recorded.
 
 ## Round 7 follow-up: virtio-blk kicks through an ioeventfd (card #98, 2026-11-19)
 
