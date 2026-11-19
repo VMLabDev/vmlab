@@ -1034,6 +1034,9 @@ pub fn build(
                     .enable_3d(mode, node, mapper)
                     .map_err(|e| VmmError::Other(e.to_string()))?;
             }
+            if let Some(doorbells) = transport.doorbells {
+                vga.lock().set_queue_doorbells(doorbells);
+            }
             place(vga.clone(), Some(display.pci))?;
             snap_nodes.push(DeviceNode::Resettable(vga.clone()));
             crate::display::Video::Virtio(vga)
