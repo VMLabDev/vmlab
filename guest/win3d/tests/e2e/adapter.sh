@@ -289,16 +289,22 @@ vm_restart() { # start the VM again after a test ended it, and wait for the user
     return 1
 }
 
-hv_exit() { # what vmlab-hv logged about its own end, for the note of a test that ended the VM
-    local log i
-    log=${XDG_STATE_HOME:-$HOME/.local/state}/vmlab/labs/$(lab_name)/vms/$VM/vmlab-hv.log
+hv_log() { echo "${XDG_STATE_HOME:-$HOME/.local/state}/vmlab/labs/$(lab_name)/vms/$VM/vmlab-hv.log"; }
+hv_exits() { # how many exit lines the log has: it outlives a run, and has those of earlier ones
+    local n
+    n=$(grep -ac '"process exit' "$(hv_log)" 2>/dev/null)
+    echo "${n:-0}"
+}
+hv_exit() { # hv_exit COUNT: what vmlab-hv logged about its own end since the log had COUNT exit lines, for the note of a test that ended the VM
+    local log i before=${1:-0}
+    log=$(hv_log)
     [ -f "$log" ] || return 0
     # The exit line comes a few seconds after the first error.
-    for i in 1 2 3 4 5 6; do
-        grep -aq '"process exit' "$log" && break
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ "$(hv_exits)" -gt "$before" ] && break
         sleep 2
     done
-    { grep -a '"process exit' "$log" || grep -a '"level":"ERROR"' "$log"; } | tail -1 | python3 -c 'import json,sys
+    if [ "$(hv_exits)" -gt "$before" ]; then grep -a '"process exit' "$log"; else grep -a '"level":"ERROR"' "$log"; fi | tail -1 | python3 -c 'import json,sys
 for line in sys.stdin:
     try: print(json.loads(line)["message"][:200])
     except (ValueError, KeyError): pass'
@@ -306,7 +312,7 @@ for line in sys.stdin:
 
 check_wine() {
     note "wine"
-    local exe base rc n=0 t0
+    local exe base rc n=0 t0 exits
     if ! compgen -G "$OUT/winetests/x64/*.exe" >/dev/null; then
         skip wine "Wine's tests were not built (the pin did not download, or the build failed)"
         return
@@ -318,6 +324,7 @@ check_wine() {
         if ! guest_up && ! vm_restart; then note "  the guest does not answer; $base not run"; continue; fi
         note "  $base (at most $WINE_TIMEOUT s)"
         t0=$(date +%s)
+        exits=$(hv_exits)
         in_lab vmlab exec --timeout $((WINE_TIMEOUT + 400)) "$VM" -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \
             "$G\\guest\\Run-WineTest.ps1" -Path "$G\\winetests\\$base.exe" -OutDir "$R" -TimeoutSec "$WINE_TIMEOUT" \
             >"$STAGE/wine-$base.out" 2>&1
@@ -327,7 +334,7 @@ check_wine() {
         elif ! guest_up; then
             # The program took the VM with it: say so in its place.
             python3 -c 'import json,sys; json.dump({"name": sys.argv[1], "completed": False, "vm_lost": True, "duration_s": int(sys.argv[2]), "hypervisor": sys.argv[3]}, open(sys.argv[4], "w"), indent=2)' \
-                "$base" "$(($(date +%s) - t0))" "$(hv_exit)" "$EV/wine-$base.wine.json"
+                "$base" "$(($(date +%s) - t0))" "$(hv_exit "${exits:-0}")" "$EV/wine-$base.wine.json"
         fi
         [ -f "$EV/wine-$base.wine.json" ] && n=$((n + 1))
         note "    exit $rc: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8-sig")); print("the VM stopped: " + d["hypervisor"] if d.get("vm_lost") else "%s executed, %s failures, %s skipped, %s s%s%s" % (d["executed"], d["failures"], d["skipped"], d["duration_s"], ", timed out" if d["timed_out"] else "", ", unhandled exception" if d["crashed"] else ""))' "$EV/wine-$base.wine.json" 2>/dev/null || echo 'no result')"
