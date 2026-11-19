@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58106` | The PE version resource and the INF's `DriverVer` version. This version numbers the CPU copies of Blt presents (`0006`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58107` | The PE version resource and the INF's `DriverVer` version. This version numbers the CPU copies of Blt presents (`0007`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Trace build
 
@@ -40,7 +40,7 @@ KMD_TRACE=1 KMD_DRIVER_VERSION=100.6.101.58190 build/kmd/build.sh
 ```
 
 `KMD_TRACE=1` compiles the driver with `VIOGPU_FLIP_TRACE=1`
-(`patches/kmd/0005`). The driver then keeps a ring of 65536 timed records,
+(`patches/kmd/0006`). The driver then keeps a ring of 65536 timed records,
 and a DRIVERPRIVATE escape (magic `0x56475446`) returns the records after a
 sequence number, 1024 at a time. `tests/tearing/Get-FlipTrace.ps1` reads it
 in the guest into a CSV file. Give a trace build its own driver version, so
@@ -63,7 +63,7 @@ The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
 | 19 | The vsync timer sends the recorded flip | flags = resource |
 | 20 | One packet of a DMA buffer goes to the control queue | context, flags = ring index, fence, response = command type (0 NOP, 1 SUBMIT, a timeline submit has a ring index) |
 | 21 | A host context was created | context, flags = capset, fence = process id |
-| 25 | A reader asked for the sequence number of Blt present copies (`0006`) | flags = the sequence, fence = process id |
+| 25 | A reader asked for the sequence number of Blt present copies (`0007`) | flags = the sequence, fence = process id |
 
 Events 1 to 9 are the records of the 256-record ring of `0004`, without the
 bare interrupt (event 4). A release build has that small ring only.
@@ -192,11 +192,15 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 
 | `0003-kmd-create-context-for-gdi-devices.patch` | Creates the legacy host context when the kernel device is constructed, so GDI devices that present without a UMD have one ([`docs/gdi-context.md`](../../docs/gdi-context.md)). |
 | `0004-kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
-| `0005-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
-| `0006-kmd-number-cpu-present-copies.patch` | Increments a sequence number before and after the CPU copy of each Blt present and returns it through the escape `VIOGPU_CPU_COPY_SEQUENCE`. The user-mode driver reads upload sources under it (`patches/mesa/0094`), so that the compositor does not compose a window from a copy that is half done ([`docs/tearing.md`](../../docs/tearing.md)). |
+| `0005-kmd-hardware-pointer.patch` | Hardware pointer: reports a 64×64 pointer when `HWCursor` is set, sends Windows' shape, position and visibility on the cursor queue, restores them after a device reset, and sets `HWCursor` to 1 in the INF ([`docs/pointer.md`](../../docs/pointer.md)). |
+| `0006-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
+| `0007-kmd-number-cpu-present-copies.patch` | Increments a sequence number before and after the CPU copy of each Blt present and returns it through the escape `VIOGPU_CPU_COPY_SEQUENCE`. The user-mode driver reads upload sources under it (`patches/mesa/0095`), so that the compositor does not compose a window from a copy that is half done ([`docs/tearing.md`](../../docs/tearing.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
+
+0005 is the patch of GitHub #235, ported over 0004 and changed as
+[`docs/pointer.md`](../../docs/pointer.md) says.
 
 0001 and 0002 apply to `e9917ae2` unchanged. 0003 and 0004 were rebased:
 upstream's November release added the native GPU clock, per-process
@@ -211,9 +215,9 @@ mutex, and resets the native clock cache with the host objects.
 The build was bit-reproducible on this host at the September base
 (`b99d951a`): a run on 2026-10-17 gave the same sha256 for all six outputs,
 including the PDB, as the run recorded in [docs/evidence/kmd/00-signing-host.txt](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/00-signing-host.txt).
-At `e9917ae2` with the four patches of that day and version
-`100.6.101.58105`, two runs on 2026-11-19 (one of `build/kmd/build.sh` alone,
-one inside `scripts/build.sh`) gave the same sha256 for all six outputs:
+At `e9917ae2` with patches 0001 to 0004 and version `100.6.101.58105`, two runs
+on 2026-11-19 (one of `build/kmd/build.sh` alone, one inside
+`scripts/build.sh`) gave the same sha256 for all six outputs:
 
 ```
 ff46043d31193414a86051aa049aa2ec5cad15a8c5e35cac146ae1041c9ebfd6  x64/viogpu3d.sys

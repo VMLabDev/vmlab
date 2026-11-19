@@ -26,6 +26,43 @@ and the Intel and laptop NVIDIA hosts.
 The device is now named "Yttrium VirtIO GPU 3D controller". Older evidence
 says "Hardsoft VirtIO GPU 3D controller".
 
+## Hardware pointer
+
+Since driver `100.6.101.58106` Windows hands the pointer to the host
+([pointer.md](pointer.md)). Pixels that ask to invert the screen (the text
+I-beam) are black with a white outline. A pointer larger than 64×64 is drawn
+into the frame by Windows, and only the first display has a hardware pointer.
+Checked on `windows-11` on `AMD1` and `Nvidia2` with `tests/e2e/pointer.sh`.
+In a `vmlab record` video the arrow is missing: vmlab's recorder hides a
+repeated shape whose hotspot is (0,0) ([pointer.md](pointer.md), "Check").
+Not tested: more than one display, a pointer above 64×64, sleep and resume,
+a timeout recovery while the pointer is on, Windows 10, and QEMU.
+
+## Direct2D antialiasing (forced sample count)
+
+Since `patches/mesa/0094` the driver draws Direct2D's coverage pass
+(`ForcedSampleCount` 16, `SV_Coverage` XORed into `R16_UINT`) as one
+single-sampled draw per sample ([d2d-coverage.md](d2d-coverage.md)). Upstream
+draws it once under a fragment shader interlock, and that loses XORs: pale
+gaps in Word's ribbon, in other places at every start (GitHub #236).
+
+- The fault is not NVIDIA's alone. Without the patch
+  (`FORCED_SAMPLE_PASSES=0`) the probe `tir_probe.exe` finds pixels that
+  change between runs on `AMD1` too: 389 to 484 of 93,467, against 229 to 297
+  on `Nvidia2`. On `AMD1` RADV has 8 samples, so the interlock path also
+  differs from WARP in a quarter of the covered pixels. Word's ribbon on
+  `AMD1` shows 1 changed pixel in one of three starts, on `Nvidia2` 353 to
+  537.
+- With the patch the probe matches WARP bit for bit on both, and three starts
+  of Word 16.0.20625 give the same ribbon on both (on `Nvidia2` one backdrop
+  pixel differs by 1/255).
+- 16 draws stand in for one, and the cost is not measured. Indirect draws
+  still take the interlock path.
+- Whether the interlock is lost in the driver's shader or in the Venus path
+  is not known. Not tested: Windows 10, the Intel and laptop NVIDIA hosts,
+  forced sample counts other than 16, and any Direct2D program besides Word
+  and `dwm.exe`.
+
 ## Timeout recovery
 
 The unreleased `0.1.3` candidate implements adapter timeout reset and restart.
