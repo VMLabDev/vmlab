@@ -13,6 +13,14 @@
  * one asked for. VMLAB_VK_PCI_FILTER_DISABLE=1 (the manifest's
  * disable_environment) keeps the loader from loading it at all.
  *
+ * A second rule, off unless VMLAB_VK_HIDE_UNCACHED=1 (a host GPU's
+ * `hide_uncached_memory`): vkGetPhysicalDeviceMemoryProperties and its `2`
+ * forms report an uncached host-visible memory type as not host-visible when
+ * the same heap has a cached type with every flag of it (hide_uncached,
+ * below). On an Intel CPU host with an NVIDIA GPU a guest's CPU write to the
+ * uncached type does not reach the GPU (guest/win3d/docs/nvfb.md), so every
+ * guest driver is steered to the cached type from the host side.
+ *
  * The few Vulkan types the layer touches are declared here rather than taken
  * from <vulkan/vulkan.h>, so building vmlab needs a C compiler (which ring,
  * zstd-sys and aws-lc-sys already need) and no Vulkan SDK. They are the
@@ -38,6 +46,14 @@ typedef int32_t VkStructureType;
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 1000059001
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES 1000070000
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT 1000212000
+
+typedef uint32_t VkMemoryPropertyFlags;
+#define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT 0x1
+#define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT 0x2
+#define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT 0x4
+#define VK_MEMORY_PROPERTY_HOST_CACHED_BIT 0x8
+#define VK_MAX_MEMORY_TYPES 32
+#define VK_MAX_MEMORY_HEAPS 16
 
 typedef struct VkInstance_T *VkInstance;
 typedef struct VkPhysicalDevice_T *VkPhysicalDevice;
@@ -126,6 +142,27 @@ typedef struct {
     VkBool32 subsetAllocation;
 } VkPhysicalDeviceGroupProperties;
 
+typedef struct {
+    VkMemoryPropertyFlags propertyFlags;
+    uint32_t heapIndex;
+} VkMemoryType;
+typedef struct {
+    uint64_t size;
+    uint32_t flags;
+} VkMemoryHeap;
+typedef struct {
+    uint32_t memoryTypeCount;
+    VkMemoryType memoryTypes[VK_MAX_MEMORY_TYPES];
+    uint32_t memoryHeapCount;
+    VkMemoryHeap memoryHeaps[VK_MAX_MEMORY_HEAPS];
+} VkPhysicalDeviceMemoryProperties;
+typedef struct {
+    VkStructureType sType;
+    void *pNext;
+    VkPhysicalDeviceMemoryProperties memoryProperties;
+} VkPhysicalDeviceMemoryProperties2;
+_Static_assert(sizeof(VkPhysicalDeviceMemoryProperties) == 520, "Vulkan's layout on LP64");
+
 typedef VkResult (*PFN_vkCreateInstance)(const void *, const void *, VkInstance *);
 typedef void (*PFN_vkDestroyInstance)(VkInstance, const void *);
 typedef VkResult (*PFN_vkCreateDevice)(VkPhysicalDevice, const void *, const void *, VkDevice *);
@@ -136,6 +173,10 @@ typedef VkResult (*PFN_vkEnumeratePhysicalDeviceGroups)(VkInstance, uint32_t *,
 typedef VkResult (*PFN_vkEnumerateDeviceExtensionProperties)(VkPhysicalDevice, const char *,
                                                              uint32_t *, VkExtensionProperties *);
 typedef void (*PFN_vkGetPhysicalDeviceProperties2)(VkPhysicalDevice, VkPhysicalDeviceProperties2 *);
+typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice,
+                                                        VkPhysicalDeviceMemoryProperties *);
+typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties2)(VkPhysicalDevice,
+                                                         VkPhysicalDeviceMemoryProperties2 *);
 
 /* Dispatchable handles start with the loader's dispatch table pointer, the
  * key a layer finds its own per-object state by. */
@@ -352,6 +393,100 @@ static VkResult EnumeratePhysicalDeviceGroupsKHR(VkInstance i, uint32_t *c,
     return enumerate_groups(i, c, o, "vkEnumeratePhysicalDeviceGroupsKHR");
 }
 
+/* The memory rule: an uncached type is one that is host-visible and coherent
+ * but neither cached nor device-local. It is hidden, by losing those two
+ * flags, when another type of the same heap has every flag of it and is
+ * cached too, so nothing that could be allocated is lost: a guest that asks
+ * for host-visible memory gets the cached counterpart. A type with no such
+ * counterpart, and a device-local host-visible type, stay as they are. The
+ * hidden type keeps its index and heap, so the type bits of a memory
+ * requirement still mean what they meant. Returns a bit per hidden type, and
+ * in `to` the counterpart of each. */
+static uint32_t hide_uncached(VkPhysicalDeviceMemoryProperties *p,
+                              uint32_t to[VK_MAX_MEMORY_TYPES]) {
+    const VkMemoryPropertyFlags visible =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t n = p->memoryTypeCount;
+    if (n > VK_MAX_MEMORY_TYPES)
+        n = VK_MAX_MEMORY_TYPES;
+    uint32_t hidden = 0;
+    /* Decided on the driver's answer, applied after: a type hidden earlier in
+     * the pass never changes what a later one is compared with. */
+    for (uint32_t i = 0; i < n; i++) {
+        VkMemoryPropertyFlags f = p->memoryTypes[i].propertyFlags;
+        if ((f & visible) != visible ||
+            (f & (VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+            continue;
+        VkMemoryPropertyFlags want = f | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        for (uint32_t j = 0; j < n; j++) {
+            if (p->memoryTypes[j].heapIndex != p->memoryTypes[i].heapIndex ||
+                (p->memoryTypes[j].propertyFlags & want) != want)
+                continue;
+            hidden |= 1u << i;
+            to[i] = j;
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < n; i++)
+        if (hidden & (1u << i))
+            p->memoryTypes[i].propertyFlags &= ~visible;
+    return hidden;
+}
+
+/* Whether the memory rule is on: VMLAB_VK_HIDE_UNCACHED=1, nothing else. */
+static int hide_uncached_wanted(void) {
+    const char *s = getenv("VMLAB_VK_HIDE_UNCACHED");
+    return s && !strcmp(s, "1");
+}
+
+/* Apply the rule to a driver's answer, and say once per process what it hid:
+ * on stderr, the render server's and so QEMU's, so qemu.log. */
+static void filter_memory(VkPhysicalDeviceMemoryProperties *p) {
+    static int said;
+    if (!hide_uncached_wanted())
+        return;
+    uint32_t to[VK_MAX_MEMORY_TYPES];
+    uint32_t hidden = hide_uncached(p, to);
+    pthread_mutex_lock(&lock);
+    int first = !said;
+    said = 1;
+    pthread_mutex_unlock(&lock);
+    if (!first)
+        return;
+    if (!hidden)
+        fprintf(stderr, "vmlab-hide-uncached: no uncached memory type has a cached counterpart, "
+                        "hid none\n");
+    for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
+        if (hidden & (1u << i))
+            fprintf(stderr,
+                    "vmlab-hide-uncached: memory type %u (uncached) is hidden, guests use type %u "
+                    "(cached)\n",
+                    i, to[i]);
+}
+
+static void GetPhysicalDeviceMemoryProperties(VkPhysicalDevice pd,
+                                              VkPhysicalDeviceMemoryProperties *p) {
+    struct entry in = find(pd);
+    ((PFN_vkGetPhysicalDeviceMemoryProperties)in.gipa(
+        in.instance, "vkGetPhysicalDeviceMemoryProperties"))(pd, p);
+    filter_memory(p);
+}
+
+static void memory_properties2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2 *p,
+                               const char *entry_point) {
+    struct entry in = find(pd);
+    ((PFN_vkGetPhysicalDeviceMemoryProperties2)in.gipa(in.instance, entry_point))(pd, p);
+    filter_memory(&p->memoryProperties);
+}
+static void GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd,
+                                               VkPhysicalDeviceMemoryProperties2 *p) {
+    memory_properties2(pd, p, "vkGetPhysicalDeviceMemoryProperties2");
+}
+static void GetPhysicalDeviceMemoryProperties2KHR(VkPhysicalDevice pd,
+                                                  VkPhysicalDeviceMemoryProperties2 *p) {
+    memory_properties2(pd, p, "vkGetPhysicalDeviceMemoryProperties2KHR");
+}
+
 /* The loader's link for this layer in a create-info's pNext chain. */
 static const VkBaseInStructure *link_info(const void *create_info, VkStructureType type) {
     const VkBaseInStructure *s = ((const VkBaseInStructure *)create_info)->pNext;
@@ -436,6 +571,12 @@ EXPORT PFN_vkVoidFunction vmlab_pci_filter_GetInstanceProcAddr(VkInstance instan
         {"vkEnumeratePhysicalDeviceGroups", (PFN_vkVoidFunction)EnumeratePhysicalDeviceGroups},
         {"vkEnumeratePhysicalDeviceGroupsKHR",
          (PFN_vkVoidFunction)EnumeratePhysicalDeviceGroupsKHR},
+        {"vkGetPhysicalDeviceMemoryProperties",
+         (PFN_vkVoidFunction)GetPhysicalDeviceMemoryProperties},
+        {"vkGetPhysicalDeviceMemoryProperties2",
+         (PFN_vkVoidFunction)GetPhysicalDeviceMemoryProperties2},
+        {"vkGetPhysicalDeviceMemoryProperties2KHR",
+         (PFN_vkVoidFunction)GetPhysicalDeviceMemoryProperties2KHR},
     };
     for (size_t i = 0; i < sizeof ours / sizeof ours[0]; i++)
         if (!strcmp(name, ours[i].name))
@@ -455,3 +596,30 @@ EXPORT VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface
     v->pfnGetPhysicalDeviceProcAddr = NULL;
     return VK_SUCCESS;
 }
+
+#ifdef VMLAB_VK_RULE_CHECK
+/* The memory rule alone, for the tests in vk_layer.rs, which run this file
+ * built as a program: each argument is one memory type, `<heap>:<flags, hex>`,
+ * and each line out is that type after the rule, `<heap>:<flags, hex>`, with
+ * ` <counterpart>` after it when the rule hid it. No Vulkan is involved. */
+int main(int argc, char **argv) {
+    VkPhysicalDeviceMemoryProperties p = {0};
+    uint32_t to[VK_MAX_MEMORY_TYPES];
+    if (argc - 1 > VK_MAX_MEMORY_TYPES)
+        return 2;
+    for (int i = 1; i < argc; i++) {
+        unsigned heap, flags;
+        if (sscanf(argv[i], "%u:%x", &heap, &flags) != 2)
+            return 2;
+        p.memoryTypes[p.memoryTypeCount++] = (VkMemoryType){flags, heap};
+    }
+    uint32_t hidden = hide_uncached(&p, to);
+    for (uint32_t i = 0; i < p.memoryTypeCount; i++) {
+        printf("%u:%x", p.memoryTypes[i].heapIndex, p.memoryTypes[i].propertyFlags);
+        if (hidden & (1u << i))
+            printf(" %u", to[i]);
+        printf("\n");
+    }
+    return 0;
+}
+#endif
