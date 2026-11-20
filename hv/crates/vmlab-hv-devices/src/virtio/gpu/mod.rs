@@ -11,6 +11,7 @@ mod renderer;
 mod scanout;
 pub use scanout::DmaFrame;
 mod snapshot;
+mod vblank;
 pub use renderer::{APERTURE_SIZE, BlobMapper, GpuMode};
 
 pub enum ScanoutPixels {
@@ -58,8 +59,8 @@ const FEATURES: u64 = (1 << 32) | (1 << 29) | (1 << 28) | (1 << ORDERED_FLIP_FEA
 /// is the furthest from the next standard bit. Only vmlab's viogpu3d driver
 /// acks it (`guest/win3d/docs/flip.md`). A driver that does not know it
 /// keeps `RESOURCE_FLUSH` and its own CPU copy of a Blt present. The bit
-/// enables both of vmlab's commands, [`CMD_ORDERED_FLIP`] and
-/// [`CMD_PRESENT_COPY`].
+/// enables vmlab's commands, [`CMD_ORDERED_FLIP`], [`CMD_PRESENT_COPY`] and
+/// [`CMD_VBLANK`].
 pub const ORDERED_FLIP_FEATURE: u32 = 23;
 /// The first command of [`ORDERED_FLIP_FEATURE`]. It takes the place of
 /// `RESOURCE_FLUSH` for a flip: header, scanout ID, resource ID, the
@@ -77,6 +78,19 @@ pub const CMD_ORDERED_FLIP: u32 = 0x0f00;
 /// destination. The queue serves no later command before that, so the
 /// fence of the present, which follows it, signals after the copy.
 pub const CMD_PRESENT_COPY: u32 = 0x0f01;
+/// The third command of [`ORDERED_FLIP_FEATURE`]: wait for the next vblank
+/// of the scanout's frame clock (`vblank.rs`). Header, scanout ID, reserved,
+/// 32 bytes, with no fence. The device holds it without holding the commands
+/// behind it, and answers [`RESP_OK_VBLANK`] at the first tick after it
+/// arrived. It takes the place of the guest's vsync timer and the empty
+/// command that it sent each tick. Refused on a device without a renderer,
+/// which keeps online snapshots and so cannot hold a chain across one.
+pub const CMD_VBLANK: u32 = 0x0f02;
+/// The answer of [`CMD_VBLANK`], 48 bytes: header, the tick number (u64),
+/// the host's `CLOCK_MONOTONIC` time of the tick in nanoseconds (u64), the
+/// period in nanoseconds (u32), reserved (u32). In the range of OK
+/// responses, above every one VIRTIO 1.2 defines.
+pub const RESP_OK_VBLANK: u32 = 0x11f0;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCES: usize = 4096;
 const MAX_ENTRIES: usize = 16384;
@@ -182,12 +196,23 @@ struct State {
     /// Ordered flips served since the last reset. The first is logged, so
     /// that a log shows which flip a guest uses.
     ordered_flips: u64,
+    /// Answers the held vblank waits. Started at the first wait.
+    vblank: Option<Arc<vblank::Clock>>,
+    /// The vblank waits that the next tick answers.
+    vblank_waits: Vec<vblank::Wait>,
+    /// The chain that [`State::chain`] has just held for a vblank.
+    held_vblank: Option<Vec<(GuestAddress, u32)>>,
+    /// Vblanks answered since the last reset. The first is logged.
+    host_vblanks: u64,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         if let Some(pacer) = &self.pacer {
             pacer.close();
+        }
+        if let Some(clock) = &self.vblank {
+            clock.close();
         }
     }
 }
@@ -229,12 +254,39 @@ impl Gpu {
                 flush_pending: None,
                 last_publish: None,
                 ordered_flips: 0,
+                vblank: None,
+                vblank_waits: Vec::new(),
+                held_vblank: None,
+                host_vblanks: 0,
             })),
         }
     }
 
     pub fn native(&self) -> bool {
         self.state.lock().native
+    }
+
+    /// A vblank wait is held: start the frame clock at the first, and have
+    /// it tick.
+    fn arm_vblank(&self, s: &mut State) {
+        if s.vblank.is_none() {
+            match vblank::Clock::spawn(&self.id, Arc::downgrade(&self.state)) {
+                Ok(clock) => s.vblank = Some(clock),
+                Err(error) => {
+                    // No clock to answer it: answer the waits at once, so
+                    // that the guest keeps a vsync, if not a paced one.
+                    log::warn!("{}: no vblank thread: {error}", self.id);
+                    s.answer_vblanks(vblank::Tick {
+                        sequence: 0,
+                        timestamp_ns: monotonic_ns(),
+                    });
+                    return;
+                }
+            }
+        }
+        if let Some(clock) = &s.vblank {
+            clock.arm();
+        }
     }
 
     pub fn enable_3d(
@@ -497,6 +549,57 @@ impl State {
 }
 
 impl State {
+    /// [`CMD_VBLANK`]: check the wait and return the writable descriptors
+    /// its answer goes into at the next tick.
+    fn vblank_wait(
+        &self,
+        request: &[u8],
+        chain: &DescriptorChain<&GuestMemory>,
+    ) -> Result<Vec<(GuestAddress, u32)>, u32> {
+        if self.acked & (1 << ORDERED_FLIP_FEATURE) == 0 {
+            return Err(INVALID);
+        }
+        // The unit tests hold waits on a 2D device, which has no renderer
+        // and so no host GPU to need.
+        if self.renderer.is_none() && !cfg!(test) {
+            return Err(INVALID);
+        }
+        let mut d = Decoder::new(request);
+        d.take(4)?;
+        // A fence on a wait would complete it twice.
+        if d.u32()? & 1 != 0 {
+            return Err(INVALID);
+        }
+        d.take(16)?;
+        if d.u32()? != 0 {
+            return Err(SCANOUT);
+        }
+        d.u32()?;
+        let response: Vec<_> = chain
+            .clone()
+            .filter(|desc| desc.is_write_only())
+            .map(|desc| (desc.addr(), desc.len()))
+            .collect();
+        let room: u64 = response.iter().map(|&(_, len)| u64::from(len)).sum();
+        if room < u64::from(vblank::RESPONSE_LEN) {
+            return Err(INVALID);
+        }
+        Ok(response)
+    }
+
+    /// Answer a command with `error` alone. The used length.
+    fn refuse(mem: &GuestMemory, chain: DescriptorChain<&GuestMemory>, error: u32) -> u32 {
+        let Ok(mut writer) = chain.writer(mem) else {
+            return 0;
+        };
+        let mut response = [0; 24];
+        response[..4].copy_from_slice(&error.to_le_bytes());
+        if writer.available_bytes() < 24 || writer.write_all(&response).is_err() {
+            return 0;
+        }
+        24
+    }
+
     /// A 2D flush changed the scanout at `timestamp_ns`. Leave the compose
     /// to the frame thread, which runs it once for all the flushes of one
     /// frame interval.
@@ -869,6 +972,15 @@ impl State {
         if reader.read_exact(&mut request).is_err() {
             return 0;
         }
+        if q == 0 && request[..4] == CMD_VBLANK.to_le_bytes() {
+            match self.vblank_wait(&request, &chain) {
+                Ok(response) => {
+                    self.held_vblank = Some(response);
+                    return 0;
+                }
+                Err(error) => return Self::refuse(mem, chain, error),
+            }
+        }
         let Ok(mut writer) = chain.writer(mem) else {
             return 0;
         };
@@ -1033,6 +1145,15 @@ impl VirtioDevice for Gpu {
             while let Some(chain) = s.queues[index].pop_descriptor_chain(&mem) {
                 let head = chain.head_index();
                 let len = s.chain(&mem, index, chain);
+                if let Some(response) = s.held_vblank.take() {
+                    s.vblank_waits.push(vblank::Wait {
+                        queue: index as u16,
+                        head,
+                        response,
+                    });
+                    self.arm_vblank(&mut s);
+                    continue;
+                }
                 if let Some((flags, id, ctx, ring)) = s.current_fence.take() {
                     s.fences.push(PendingFence {
                         queue: index as u16,
@@ -1073,6 +1194,9 @@ impl VirtioDevice for Gpu {
         s.retry_display = false;
         s.acked = 0;
         s.ordered_flips = 0;
+        s.vblank_waits.clear();
+        s.held_vblank = None;
+        s.host_vblanks = 0;
         s.events = 0;
         s.resources.clear();
         s.scanout = None;
