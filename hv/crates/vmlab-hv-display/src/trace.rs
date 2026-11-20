@@ -34,6 +34,26 @@ struct Trace {
     reread: bool,
 }
 
+impl Trace {
+    fn line(&self, at_ns: u64, event: &str, fields: Arguments<'_>) {
+        let Ok(mut sink) = self.sink.lock() else {
+            return;
+        };
+        let _ = writeln!(sink.out, "{at_ns} {event} {fields}");
+        if sink.flushed.elapsed() >= FLUSH_EVERY {
+            let _ = sink.out.flush();
+            sink.flushed = Instant::now();
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut sink) = self.sink.lock() {
+            let _ = sink.out.flush();
+            sink.flushed = Instant::now();
+        }
+    }
+}
+
 static TRACE: OnceLock<Option<Trace>> = OnceLock::new();
 
 const FLUSH_EVERY: Duration = Duration::from_millis(100);
@@ -93,16 +113,8 @@ pub fn now_ns() -> u64 {
 
 /// Record one event at the time `at_ns`. Does nothing with the trace off.
 pub fn write_at(at_ns: u64, event: &str, fields: Arguments<'_>) {
-    let Some(trace) = trace() else {
-        return;
-    };
-    let Ok(mut sink) = trace.sink.lock() else {
-        return;
-    };
-    let _ = writeln!(sink.out, "{at_ns} {event} {fields}");
-    if sink.flushed.elapsed() >= FLUSH_EVERY {
-        let _ = sink.out.flush();
-        sink.flushed = Instant::now();
+    if let Some(trace) = trace() {
+        trace.line(at_ns, event, fields);
     }
 }
 
@@ -115,11 +127,8 @@ pub fn write(event: &str, fields: Arguments<'_>) {
 
 /// Write out what is buffered.
 pub fn flush() {
-    if let Some(trace) = trace()
-        && let Ok(mut sink) = trace.sink.lock()
-    {
-        let _ = sink.out.flush();
-        sink.flushed = Instant::now();
+    if let Some(trace) = trace() {
+        trace.flush();
     }
 }
 
@@ -162,13 +171,15 @@ mod tests {
     fn a_trace_writes_one_line_per_event_with_its_time() {
         let dir = tempfile::tempdir().unwrap();
         let trace = open(dir.path(), false).unwrap();
-        {
-            let mut sink = trace.sink.lock().unwrap();
-            writeln!(sink.out, "{} {} {}", 42, "publish", format_args!("ts={} res={}", 7, 3)).unwrap();
-            sink.out.flush().unwrap();
-        }
-        let path = dir.path().join(format!("gpu-trace-{}.txt", std::process::id()));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "42 publish ts=7 res=3\n");
+        trace.line(42, "publish", format_args!("ts={} res={}", 7, 3));
+        trace.flush();
+        let path = dir
+            .path()
+            .join(format!("gpu-trace-{}.txt", std::process::id()));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "42 publish ts=7 res=3\n"
+        );
     }
 
     #[test]

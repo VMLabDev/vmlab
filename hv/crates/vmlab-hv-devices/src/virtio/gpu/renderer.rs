@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
-use zerocopy::IntoBytes;
 use vmlab_hv_display::trace;
+use zerocopy::IntoBytes;
 
 pub const APERTURE_SIZE: u64 = 1 << 32;
 
@@ -743,9 +743,9 @@ impl Renderer {
                     } else {
                         None
                     };
-                    let rows = second.as_ref().map(|second| {
-                        trace::differing_rows(&pixels, second, stride as usize)
-                    });
+                    let rows = second
+                        .as_ref()
+                        .map(|second| trace::differing_rows(&pixels, second, stride as usize));
                     let rows = match rows {
                         None => "-".to_string(),
                         Some(None) => "0".to_string(),
