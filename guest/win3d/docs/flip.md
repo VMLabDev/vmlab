@@ -27,14 +27,22 @@ ranges) in place of `RESOURCE_FLUSH` for every flush of the scanout:
 
 The host answers `OK_NODATA`, and only after these steps, in this order:
 
-1. It puts a fence on every context ring that the guest has fenced, whatever
-   process the ring belongs to, and waits until each of them and everything
-   else on its timeline has signalled. A guest sees only the fences of its own
-   submissions, so it cannot make this wait.
+1. It waits until every fence on its renderer's timeline has signalled,
+   whatever guest process and context it belongs to, and then until the
+   writers that the kernel tracks on the scanout's dma-buf are done (its
+   implicit fence, `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`). A guest sees only the
+   fences of its own submissions, so it cannot make this wait. NVIDIA
+   attaches no implicit fence, so there the second wait returns at once.
 2. It records the flush, publishes the frame to its display, and waits until
    the console has read it (the readback that RFB on `vnc.sock` and the
    recorder use runs on the renderer).
 3. It waits until no display reader holds an older frame.
+
+A first version also put a host fence on every context ring that the guest
+had fenced. virglrenderer refuses a fence on a ring whose queue the guest
+has destroyed (`vkr: submit_fence: invalid ring_idx`), and the render server
+then ends that Venus context: on Nvidia2 the Direct3D 12 checks of the e2e
+run lost their device. The host does not fence the guest's rings.
 
 The control queue serves no later command before the answer. The vsync of
 the driver comes from the NOP that its timer sends after the flip, and the

@@ -11,9 +11,10 @@ vmlab-hv offers the private feature bit VIRTIO_GPU_F_VMLAB_ORDERED_FLIP (23).
 When the driver acks it, CtrlQueue::ResFlush, which every flush of the
 scanout goes through (the vsync timer's flip, a flip from a DMA buffer, a
 mode set), sends VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP (0x0f00) with the frame
-number in place of RESOURCE_FLUSH. The host answers it after its GPU has
-finished the work given to it before the flip and the frame is on its
-display, and it serves no later command before that answer. So the NOP that
+number in place of RESOURCE_FLUSH. The host answers it after every fence of
+its renderer and the implicit fence of the scanout buffer have signalled and
+the frame is on its display, and it serves no later command before that
+answer. So the NOP that
 raises the vsync interrupt, and the completion of a flip's DMA buffer, both
 follow the publish, and Windows learns that the old primary is free only
 after the host has stopped reading it.
@@ -30,8 +31,8 @@ index 726cb67..c4a6643 100644
  #pragma pack()
  
 +/* VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP (VIRTIO_GPU_F_VMLAB_ORDERED_FLIP): the
-+ * flush of a flip. The host answers it OK_NODATA after its GPU has finished
-+ * all work given to it before the flip and the frame is on its display, and
++ * flush of a flip. The host answers it OK_NODATA after its fences and those
++ * of the scanout buffer have signalled and the frame is on its display, and
 + * it serves no later command of the control queue before that answer. */
 +#define VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP 0x0f00
 +#pragma pack(1)

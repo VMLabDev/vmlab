@@ -61,10 +61,10 @@ pub const ORDERED_FLIP_FEATURE: u32 = 23;
 /// The command of [`ORDERED_FLIP_FEATURE`]. It takes the place of
 /// `RESOURCE_FLUSH` for a flip: header, scanout ID, resource ID, the
 /// rectangle (x, y, width, height) and the guest's frame number, all
-/// little-endian, 56 bytes. It is answered `OK_NODATA` once the host GPU has
-/// finished all work given to it before the flip, the frame is published to
-/// the display, the console has read it, and no display reader holds an
-/// older frame. Outside the 2D, 3D and cursor ranges of VIRTIO 1.2.
+/// little-endian, 56 bytes. It is answered `OK_NODATA` once every fence on
+/// the renderer's timeline has signalled, the writers the kernel tracks on
+/// the scanout buffer are done, the frame is published to the display, the
+/// console has read it, and no display reader holds an older frame. Outside the 2D, 3D and cursor ranges of VIRTIO 1.2.
 pub const CMD_ORDERED_FLIP: u32 = 0x0f00;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCES: usize = 4096;
@@ -442,7 +442,7 @@ impl State {
         }
         if let Some(renderer) = &self.renderer {
             // Host GPU work that a fence of the guest does not cover can
-            // still write the new frame. Wait for all of it.
+            // still write the new frame. Wait for what the host can see.
             if let Err(error) = renderer.order() {
                 log::warn!("ordered flip {frame}: host GPU wait failed: {error:#x}");
             }

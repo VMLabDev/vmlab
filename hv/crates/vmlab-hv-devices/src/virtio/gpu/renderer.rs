@@ -157,18 +157,10 @@ struct HostResource {
     export_info: Option<Resource3DInfo>,
 }
 
-/// A fence on the renderer's timeline: the guest's, or one the host made.
-struct TimelineFence {
-    guest: Option<RutabagaFence>,
-    /// The ring the fence was created on, which its callback names.
-    ring: Ring,
-    signal: Arc<std::sync::atomic::AtomicBool>,
-}
-
 #[derive(Default)]
 struct Timeline {
     next: u64,
-    pending: BTreeMap<u64, TimelineFence>,
+    pending: BTreeMap<u64, (Option<RutabagaFence>, Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 impl Timeline {
@@ -184,27 +176,6 @@ impl Timeline {
         self.next += 1;
         Some(self.next)
     }
-
-    /// A callback retired `id` on `ring`. Virgl may coalesce callbacks on
-    /// a ring, so every earlier fence of that ring retires with it. Returns
-    /// the guest fences among them.
-    fn signal(&mut self, ring: Ring, id: u64) -> Vec<RutabagaFence> {
-        let ids: Vec<_> = self
-            .pending
-            .range(..=id)
-            .filter(|(_, fence)| fence.ring == ring)
-            .map(|(&id, _)| id)
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| {
-                let fence = self.pending.remove(&id).unwrap();
-                fence
-                    .signal
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                fence.guest
-            })
-            .collect()
-    }
 }
 
 struct Backend {
@@ -219,9 +190,6 @@ struct Backend {
     scanout_copy: Option<super::scanout::Scanout>,
     node: PathBuf,
     timeline: Arc<Mutex<Timeline>>,
-    /// The context rings the guest has fenced: every host queue that can
-    /// hold work for a frame. An ordered flip fences each of them.
-    rings: BTreeSet<Ring>,
     direct_frames: u64,
     fallback_frames: u64,
     external_frames: u64,
@@ -309,15 +277,29 @@ impl Renderer {
                     }
                 };
                 let handler = RutabagaFenceHandler::new(move |f: RutabagaFence| {
-                    let retired = callbacks
-                        .lock()
-                        .signal(ring(f.flags, f.ctx_id, f.ring_idx), f.fence_id);
-                    for guest in retired {
-                        let mut completed = done.lock();
-                        let value = completed
-                            .entry(ring(guest.flags, guest.ctx_id, guest.ring_idx))
-                            .or_default();
-                        *value = (*value).max(guest.fence_id);
+                    // Virgl may coalesce completion callbacks on a timeline.
+                    let mut pending = callbacks.lock();
+                    let key = ring(f.flags, f.ctx_id, f.ring_idx);
+                    let ids: Vec<_> = pending
+                        .pending
+                        .range(..=f.fence_id)
+                        .filter(|(_, (guest, _))| {
+                            guest.map_or((0, 0), |guest| {
+                                ring(guest.flags, guest.ctx_id, guest.ring_idx)
+                            }) == key
+                        })
+                        .map(|(&id, _)| id)
+                        .collect();
+                    for id in ids {
+                        let (guest, signal) = pending.pending.remove(&id).unwrap();
+                        signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(guest) = guest {
+                            let mut completed = done.lock();
+                            let value = completed
+                                .entry(ring(guest.flags, guest.ctx_id, guest.ring_idx))
+                                .or_default();
+                            *value = (*value).max(guest.fence_id);
+                        }
                     }
                 });
                 let gpu = RutabagaBuilder::new(mask, handler)
@@ -367,7 +349,6 @@ impl Renderer {
                     scanout_copy: None,
                     node,
                     timeline,
-                    rings: BTreeSet::new(),
                     direct_frames: 0,
                     fallback_frames: 0,
                     external_frames: 0,
@@ -721,13 +702,52 @@ impl Renderer {
             b.scanout = None;
             b.pending_frame = false;
             b.damage.clear();
-            b.rings.clear();
             b.timeline.lock().pending.clear();
             Ok(())
         })?;
         self.completed.lock().clear();
         Ok(())
     }
+}
+
+/// `struct dma_buf_export_sync_file` of Linux 6.0.
+#[repr(C)]
+struct ExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`: `_IOWR('b', 2, struct dma_buf_export_sync_file)`.
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u32 = 0xc008_6202;
+/// The fences a reader waits for: those of the writers.
+const DMA_BUF_SYNC_READ: u32 = 1;
+
+/// Wait at most `timeout` until the writers that the kernel tracks on the
+/// dma-buf `fd` have finished. False when the kernel gives no sync file, or
+/// the wait timed out. NVIDIA attaches no implicit fences, so there the
+/// sync file is already signalled.
+fn wait_writers(fd: std::os::fd::RawFd, timeout: Duration) -> bool {
+    use std::os::fd::FromRawFd;
+    let mut export = ExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    // SAFETY: the request takes a pointer to this struct, which outlives the call.
+    if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &mut export) } != 0
+        || export.fd < 0
+    {
+        return false;
+    }
+    // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+    let sync = unsafe { std::os::fd::OwnedFd::from_raw_fd(export.fd) };
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&sync),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd for the duration of the call.
+    unsafe { libc::poll(&mut poll, 1, millis) == 1 }
 }
 
 fn host<T>(result: RutabagaResult<T>) -> Result<T, u32> {
@@ -837,44 +857,12 @@ impl Backend {
         &mut self,
         guest: Option<RutabagaFence>,
     ) -> Result<Arc<std::sync::atomic::AtomicBool>, u32> {
-        let fence = match guest {
-            Some(guest) => {
-                let ring = ring(guest.flags, guest.ctx_id, guest.ring_idx);
-                if ring.0 != 0 {
-                    self.rings.insert(ring);
-                }
-                guest
-            }
-            None => RutabagaFence {
-                flags: 1,
-                fence_id: 0,
-                ctx_id: 0,
-                ring_idx: 0,
-            },
-        };
-        self.create_fence(fence, guest)
-    }
-
-    /// Put `fence` on the timeline under a fresh ID. `guest` is the fence
-    /// the guest waits for, `None` for one only the host waits for.
-    fn create_fence(
-        &mut self,
-        mut fence: RutabagaFence,
-        guest: Option<RutabagaFence>,
-    ) -> Result<Arc<std::sync::atomic::AtomicBool>, u32> {
         let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let start = std::time::Instant::now();
         let id = loop {
             let mut timeline = self.timeline.lock();
             if let Some(id) = timeline.reserve() {
-                timeline.pending.insert(
-                    id,
-                    TimelineFence {
-                        guest,
-                        ring: ring(fence.flags, fence.ctx_id, fence.ring_idx),
-                        signal: signal.clone(),
-                    },
-                );
+                timeline.pending.insert(id, (guest, signal.clone()));
                 break id;
             }
             drop(timeline);
@@ -884,7 +872,16 @@ impl Backend {
             }
             std::thread::yield_now();
         };
+        let mut fence = guest.unwrap_or(RutabagaFence {
+            flags: 1,
+            fence_id: 0,
+            ctx_id: 0,
+            ring_idx: 0,
+        });
         fence.fence_id = id;
+        if guest.is_none() {
+            fence.flags = 1;
+        }
         if let Err(error) = host(self.gpu.create_fence(fence)) {
             self.timeline.lock().pending.remove(&id);
             return Err(error);
@@ -899,7 +896,7 @@ impl Backend {
             .lock()
             .pending
             .values()
-            .map(|fence| fence.signal.clone())
+            .map(|(_, signal)| signal.clone())
             .collect();
         let start = std::time::Instant::now();
         while signals
@@ -914,24 +911,23 @@ impl Backend {
         }
         Ok(())
     }
-    /// Wait until the host GPU has finished all work it was given for this
-    /// guest: a fence on every context ring the guest has fenced, whatever
-    /// process the work came from, and then everything on the timeline.
-    /// A guest sees only its own fences, so it cannot make this wait.
+    /// The host wait of an ordered flip: everything on the timeline,
+    /// whatever context it came from, and then the writers that the kernel
+    /// tracks on the scanout's dma-buf. A guest sees only the fences of its
+    /// own submissions, so it cannot make this wait. A fence on each context
+    /// ring would reach further, but virglrenderer ends a Venus context
+    /// whose ring has lost its queue when it is fenced.
     fn order(&mut self) -> Result<(), u32> {
-        for (ctx, ring_idx) in self.rings.clone() {
-            let fence = RutabagaFence {
-                flags: 3,
-                fence_id: 0,
-                ctx_id: ctx,
-                ring_idx,
-            };
-            if self.create_fence(fence, None).is_err() {
-                // The ring's queue is gone: nothing more can run on it.
-                self.rings.remove(&(ctx, ring_idx));
+        self.synchronize()?;
+        if let Some((id, _)) = self.scanout
+            && let Some(fd) = self.resources.get(&id).and_then(|r| r.exported.clone())
+        {
+            use std::os::fd::AsRawFd;
+            if !wait_writers(fd.as_raw_fd(), Duration::from_secs(1)) {
+                log::debug!("scanout {id}: no implicit fence to wait for");
             }
         }
-        self.synchronize()
+        Ok(())
     }
 
     /// Refuse a resource the descriptor limit cannot pay for.
@@ -1018,7 +1014,6 @@ impl Backend {
             0x201 => {
                 host(self.gpu.destroy_context(ctx))?;
                 self.contexts.remove(&ctx);
-                self.rings.retain(|&(owner, _)| owner != ctx);
                 NODATA
             }
             0x202 | 0x203 => {
@@ -1606,48 +1601,11 @@ mod tests {
     }
 
     #[test]
-    fn a_host_fence_on_a_context_ring_retires_only_with_that_ring() {
-        let mut timeline = Timeline::default();
-        let signal = || Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let guest = RutabagaFence {
-            flags: 3,
-            fence_id: 7,
-            ctx_id: 5,
-            ring_idx: 1,
-        };
-        let (global, own, other) = (signal(), signal(), signal());
-        for (ring, guest, signal) in [
-            ((0, 0), None, &global),
-            ((5, 1), None, &own),
-            ((5, 1), Some(guest), &other),
-        ] {
-            let id = timeline.reserve().unwrap();
-            timeline.pending.insert(
-                id,
-                TimelineFence {
-                    guest,
-                    ring,
-                    signal: signal.clone(),
-                },
-            );
-        }
-        let done = |signal: &Arc<std::sync::atomic::AtomicBool>| {
-            signal.load(std::sync::atomic::Ordering::SeqCst)
-        };
-
-        // A callback of the global timeline does not retire ring work.
-        assert!(timeline.signal((0, 0), 3).is_empty());
-        assert!(done(&global) && !done(&own) && !done(&other));
-        // Nor does a callback of another ring of the same context.
-        assert!(timeline.signal((5, 0), 3).is_empty());
-        assert!(!done(&own));
-        // The ring's callback retires the host fence and hands back the
-        // guest's fence of the same ring.
-        let retired = timeline.signal((5, 1), 3);
-        assert_eq!(retired.len(), 1);
-        assert_eq!(retired[0].fence_id, 7);
-        assert!(done(&own) && done(&other));
-        assert!(timeline.pending.is_empty());
+    fn a_buffer_without_implicit_fences_gives_no_writers_to_wait_for() {
+        use std::os::fd::AsRawFd;
+        // Not a dma-buf: the kernel refuses the export, and the flip goes on.
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(!wait_writers(file.as_raw_fd(), Duration::from_millis(10)));
     }
 
     #[test]
@@ -1660,11 +1618,7 @@ mod tests {
         assert_eq!(last, u32::MAX as u64);
         timeline.pending.insert(
             last,
-            TimelineFence {
-                guest: None,
-                ring: (0, 0),
-                signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
+            (None, Arc::new(std::sync::atomic::AtomicBool::new(false))),
         );
         assert_eq!(timeline.reserve(), None);
         timeline.pending.clear();
