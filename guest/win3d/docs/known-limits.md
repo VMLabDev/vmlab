@@ -417,6 +417,12 @@ finds no D3D12 driver for this adapter. The repair was
 checked once, in the package slice's earlier lab, and that evidence was not
 kept ([docs/evidence/package/README.md](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md), "Earlier iteration").
 
+A Chromium GPU process (Chrome, Edge, Electron, WebView2) takes only
+Microsoft-signed DLLs and ended itself when it loaded the bridge. The UMD now
+loads Microsoft's file into such a process first ([chromium.md](chromium.md)).
+That is a workaround with limits of its own, listed there. Its real end is a
+native Direct3D 12 driver, which leaves `d3d12.dll` alone.
+
 The bridge also has functional limits (`build/d3d12/README.md`):
 
 - `D3D12DeviceRemovedExtendedData` is always empty, so DRED shows nothing.
