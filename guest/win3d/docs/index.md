@@ -64,7 +64,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | --- | --- |
 | [acceptance.md](acceptance.md) | See each Done item checked on fresh `windows-11` and `windows-10` labs, the stretch applications, the adapter suite with its baseline, and the index of every evidence directory |
 | [tdr-recovery.md](tdr-recovery.md) | Force a guest timeout and require reset/restart telemetry plus hardware pixel readback |
-| [tearing.md](tearing.md) | See why the console showed bands of an earlier frame under host load, what the trace build ruled out, and the vsync fix `patches/kmd/0008` |
+| [tearing.md](tearing.md) | See which waits the guest makes before a flip, why torn frames under host load need a flip ordered by the host, and the vsync fix `patches/kmd/0008` |
 | [pointer.md](pointer.md) | See why the pointer lagged, what the hardware pointer of `patches/kmd/0005` sends to the host, its limits, and the check |
 | [dxdiag.md](dxdiag.md) | See why dxdiag reported DirectDraw "Not Available" and how `patches/mesa/0012` to `0014` fixed it |
 | [d2d-coverage.md](d2d-coverage.md) | See why Direct2D's antialiased fills had gaps on NVIDIA (Word's ribbon), the one-pass-per-sample fix `patches/mesa/0094`, and what an AMD host does without it |
