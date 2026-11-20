@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A Chromium GPU process keeps running with the Direct3D 12 bridge installed
-# (patches/mesa 0095, docs/chromium.md, GitHub #238), checked in a lab where
+# (patches/mesa 0096, docs/chromium.md, GitHub #238), checked in a lab where
 # the package is installed and the autologon desktop is up (a lab kept with
 # tests/e2e/run.sh --keep). tests/e2e/adapter.sh runs it as its check
 # "chromium".

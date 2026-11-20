@@ -700,7 +700,7 @@ function Get-KnownBridgeHashes($Bundle) {
 # native file. A Chromium GPU process (Chrome, Edge, Electron, WebView2)
 # takes only Microsoft-signed DLLs once it runs, so its late load of
 # d3d12.dll refuses the bridge and the process ends itself. The UMD loads
-# this copy into such a process first (patches/mesa 0095). The loader then
+# this copy into such a process first (patches/mesa 0096). The loader then
 # answers the later load by name, which is why the copy keeps the file name
 # d3d12.dll and has a folder of its own. Returns $true when it wrote the copy.
 function Update-NativeCopy($Arch) {

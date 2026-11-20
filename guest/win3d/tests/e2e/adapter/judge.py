@@ -204,6 +204,24 @@ if d is not None:
             f"{len(good)} of {len(frames)} frames are lit and show the window's colour"
             + (f"; AcquireNextFrame answered {', '.join(hrs)}" if hrs else ''), 'duplication.json')
 
+# P7: the shape of a duplication surface, as an application's own shared texture.
+what = 'A shared BGRA render target works between two devices'
+d = probe('shared-texture', 'P7', what)
+if d is not None:
+    cases = d.get('cases') or []
+    bad = [f"{c.get('size')} {c.get('sharing')}" + (f" ({c['failed']} {c.get('hr')})" if c.get('failed') else '')
+           for c in cases if not c.get('match')]
+    if d.get('result') != 'ok' or not cases:
+        row('shared-texture', 'P7', what, 'fail', '; '.join(d.get('errors') or ['the probe shared no texture']),
+            'shared-texture.json')
+    elif bad:
+        row('shared-texture', 'P7', what, 'fail',
+            f"{len(cases) - len(bad)} of {len(cases)} cases pass; wrong: {', '.join(bad)}", 'shared-texture.json')
+    else:
+        row('shared-texture', 'P7', what, 'pass',
+            f"{len(cases)} cases, each read whole in both directions: {d.get('desktop_width')}x{d.get('desktop_height')} "
+            f"and 256x256, by legacy handle and with a keyed mutex", 'shared-texture.json')
+
 # P10: the Direct2D coverage probe.
 what = 'Direct2D fills antialiased shapes without gaps'
 d = probe('d2d', 'P10', what)
