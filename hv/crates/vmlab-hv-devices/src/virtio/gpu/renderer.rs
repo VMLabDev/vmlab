@@ -687,7 +687,8 @@ impl Renderer {
             }
             // With the reread on, a copied frame's readback also reads its
             // source, the guest's scanout, to compare it with the copy.
-            let source = (trace::reread() && !frame.direct).then(|| (fd_source, info, width, height));
+            let source =
+                (trace::reread() && !frame.direct).then_some((fd_source, info, width, height));
             Ok(Some((frame, id, b.exports, source)))
         })?;
         let (mut frame, res, seq, source) = match frame {
