@@ -282,7 +282,18 @@ pitch, not cleared).
   of the desktop and at 256×256. Each device fills it and the other reads
   every pixel.
 
-@RESULTS@
+**Results.** The runs of 2026-11-20 on helios, the `windows-11` template
+(`26100.1742.11`) at 1024×768 on vmlab-hv with the package at commit
+`1eeb643e` (driver `100.6.101.58107`): `tests/e2e/run.sh --keep`, then
+`tests/e2e/adapter.sh` with the three checks below, on each GPU. The host
+kernel logged no Xid.
+
+| Check | AMD1 | Nvidia2 | Before (driver `58106`, [acceptance.md](acceptance.md#baseline)) |
+| --- | --- | --- | --- |
+| The 12 Done checks of `run.sh` | 12 of 12 | 12 of 12 | 12 of 12 |
+| `duplication` | 8 of 8 frames, 786074 of 786432 pixels lit in each, the window's pixel in the colour it had | 8 of 8 frames, 786400 of 786432 pixels lit in each, the window's pixel in the colour it had | 0 of 8 frames, `AcquireNextFrame` answered `0x887a0026` |
+| `shared-texture` | 4 of 4 cases, every pixel in both directions | 4 of 4 cases, every pixel in both directions | not in the suite |
+| `tear-blt` (the same kernel copy, into a GDI surface) | 0 torn of 1259 console frames, 60.2 presents per second | 0 torn of 1260 console frames, 59.0 presents per second | 0 torn |
 
 Not tried: a rotated output, a second output (the device has one), capture
 while a full-screen application flips, protected content. ffmpeg's `ddagrab`

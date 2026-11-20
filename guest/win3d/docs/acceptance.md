@@ -725,6 +725,12 @@ What the baseline says:
   of that path: its probe found pixels that differ on both GPUs without the
   patch. The failing checks above, and `pointer` in the earlier baseline,
   show that their probes do detect.
+- B8. After the baseline: with driver `100.6.101.58107` (`patches/kmd/0006`
+  and `patches/mesa/0095`) `duplication` passes on both GPUs, eight lit
+  frames of eight, and the new check `shared-texture` passes
+  ([present.md](present.md#desktop-duplication)). Those runs selected
+  `duplication`, `shared-texture` and `tear-blt` only, so the tables below
+  are still the baseline's, with `duplication` failing.
 
 <!-- e2e:adapter -->
 ### windows-11
