@@ -4,6 +4,7 @@
 //! while the PCI transport owns another clone. The default 2D mode needs no GPU.
 
 mod compose;
+mod copy;
 mod modifiers;
 mod pacer;
 mod renderer;
@@ -56,9 +57,11 @@ const FEATURES: u64 = (1 << 32) | (1 << 29) | (1 << 28) | (1 << ORDERED_FLIP_FEA
 /// belong to the device type and VIRTIO 1.2 defines 0 to 5, so the top one
 /// is the furthest from the next standard bit. Only vmlab's viogpu3d driver
 /// acks it (`guest/win3d/docs/flip.md`). A driver that does not know it
-/// keeps `RESOURCE_FLUSH`.
+/// keeps `RESOURCE_FLUSH` and its own CPU copy of a Blt present. The bit
+/// enables both of vmlab's commands, [`CMD_ORDERED_FLIP`] and
+/// [`CMD_PRESENT_COPY`].
 pub const ORDERED_FLIP_FEATURE: u32 = 23;
-/// The command of [`ORDERED_FLIP_FEATURE`]. It takes the place of
+/// The first command of [`ORDERED_FLIP_FEATURE`]. It takes the place of
 /// `RESOURCE_FLUSH` for a flip: header, scanout ID, resource ID, the
 /// rectangle (x, y, width, height) and the guest's frame number, all
 /// little-endian, 56 bytes. It is answered `OK_NODATA` once every fence on
@@ -66,6 +69,14 @@ pub const ORDERED_FLIP_FEATURE: u32 = 23;
 /// the scanout buffer are done, the frame is published to the display, the
 /// console has read it, and no display reader holds an older frame. Outside the 2D, 3D and cursor ranges of VIRTIO 1.2.
 pub const CMD_ORDERED_FLIP: u32 = 0x0f00;
+/// The second command of [`ORDERED_FLIP_FEATURE`]: the copy of a present of
+/// the Blt kind, run on the host in place of the guest driver's CPU copy
+/// (`copy.rs` has the layout). It is answered `OK_NODATA` once every fence
+/// on the renderer's timeline has signalled, the writers and readers the
+/// kernel tracks on either resource are done, and the pixels are in the
+/// destination. The queue serves no later command before that, so the
+/// fence of the present, which follows it, signals after the copy.
+pub const CMD_PRESENT_COPY: u32 = 0x0f01;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCES: usize = 4096;
 const MAX_ENTRIES: usize = 16384;
@@ -567,6 +578,15 @@ impl State {
         d.take(20)?;
         if q == 0 && kind == CMD_ORDERED_FLIP {
             return self.ordered_flip(mem, request, &mut d);
+        }
+        if q == 0 && kind == CMD_PRESENT_COPY {
+            if self.acked & (1 << ORDERED_FLIP_FEATURE) == 0 {
+                return Err(INVALID);
+            }
+            let copy = copy::decode(&request[24..])?;
+            // A present copy exists only between renderer resources.
+            let renderer = self.renderer.as_ref().ok_or(INVALID)?;
+            return renderer.present_copy(copy).map(|()| (NODATA, Vec::new()));
         }
         if q == 0
             && !matches!(kind, 0x100 | 0x10a)

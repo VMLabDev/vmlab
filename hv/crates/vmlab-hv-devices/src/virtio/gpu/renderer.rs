@@ -155,6 +155,11 @@ struct HostResource {
     scanout_info: Option<Resource3DInfo>,
     exported: Option<Arc<std::os::fd::OwnedFd>>,
     export_info: Option<Resource3DInfo>,
+    /// The renderer's host mapping of a blob, address and length, while
+    /// the guest has it mapped.
+    host_map: Option<(usize, usize)>,
+    /// The host ranges of the guest backing, the iovecs the renderer holds.
+    backing: Vec<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -452,6 +457,17 @@ impl Renderer {
         self.call(Backend::order)
     }
 
+    /// [`Backend::present_copy`]. The renderer's display readers do not
+    /// read a Blt destination, so this does not wait for them.
+    pub fn present_copy(&self, request: super::copy::Request) -> Result<(), u32> {
+        let (src, dst) = (request.src, request.dst);
+        self.call(move |b| b.present_copy(&request)).map(|bytes| {
+            log::trace!("present copy {src} -> {dst}: {bytes} bytes");
+        }).inspect_err(|error| {
+            log::warn!("present copy {src} -> {dst} refused: {error:#x}");
+        })
+    }
+
     /// Return when the renderer has run every task queued before this
     /// call, among them the console's readback of a published frame.
     pub fn settle(&self) -> Result<(), u32> {
@@ -721,17 +737,22 @@ struct ExportSyncFile {
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u32 = 0xc008_6202;
 /// The fences a reader waits for: those of the writers.
 const DMA_BUF_SYNC_READ: u32 = 1;
+/// The fences a writer waits for: those of the readers and the writers.
+const DMA_BUF_SYNC_WRITE: u32 = 2;
 
 /// Wait at most `timeout` until the writers that the kernel tracks on the
 /// dma-buf `fd` have finished. False when the kernel gives no sync file, or
 /// the wait timed out. NVIDIA attaches no implicit fences, so there the
 /// sync file is already signalled.
 fn wait_writers(fd: std::os::fd::RawFd, timeout: Duration) -> bool {
+    wait_fences(fd, DMA_BUF_SYNC_READ, timeout)
+}
+
+/// [`wait_writers`] for the fences of `flags`: [`DMA_BUF_SYNC_READ`] for
+/// the writers, [`DMA_BUF_SYNC_WRITE`] for every reader and writer.
+fn wait_fences(fd: std::os::fd::RawFd, flags: u32, timeout: Duration) -> bool {
     use std::os::fd::FromRawFd;
-    let mut export = ExportSyncFile {
-        flags: DMA_BUF_SYNC_READ,
-        fd: -1,
-    };
+    let mut export = ExportSyncFile { flags, fd: -1 };
     // SAFETY: the request takes a pointer to this struct, which outlives the call.
     if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &mut export) } != 0
         || export.fd < 0
@@ -748,6 +769,11 @@ fn wait_writers(fd: std::os::fd::RawFd, timeout: Duration) -> bool {
     let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     // SAFETY: one valid pollfd for the duration of the call.
     unsafe { libc::poll(&mut poll, 1, millis) == 1 }
+}
+
+/// The host ranges of renderer iovecs.
+fn segments(vecs: &[RutabagaIovec]) -> Vec<(usize, usize)> {
+    vecs.iter().map(|v| (v.base as usize, v.len)).collect()
 }
 
 fn host<T>(result: RutabagaResult<T>) -> Result<T, u32> {
@@ -930,6 +956,37 @@ impl Backend {
         Ok(())
     }
 
+    /// [`super::CMD_PRESENT_COPY`]: the copy of a Blt present, ordered on
+    /// the host. It waits for everything on the timeline, the guest's
+    /// fences on every context ring among it, and for the fences the kernel
+    /// tracks on either resource's dma-buf. Then it copies on this thread,
+    /// so no other renderer command runs while the destination is half
+    /// written. The source is a blob the guest has mapped; the destination
+    /// is that, or a resource with a guest backing.
+    fn present_copy(&mut self, request: &super::copy::Request) -> Result<u64, u32> {
+        let memory = |id: u32| -> Result<(super::copy::Segments, Option<Arc<std::os::fd::OwnedFd>>), u32> {
+            let r = self.resources.get(&id).ok_or(RESOURCE)?;
+            let parts = match r.host_map {
+                Some(part) => vec![part],
+                None if !r.backing.is_empty() => r.backing.clone(),
+                None => return Err(INVALID),
+            };
+            Ok((super::copy::Segments { parts }, r.exported.clone()))
+        };
+        let (src, src_fd) = memory(request.src)?;
+        let (mut dst, dst_fd) = memory(request.dst)?;
+        if let Err(error) = self.synchronize() {
+            log::warn!("present copy: host GPU wait failed: {error:#x}");
+        }
+        use std::os::fd::AsRawFd;
+        for (fd, flags) in [(src_fd, DMA_BUF_SYNC_READ), (dst_fd, DMA_BUF_SYNC_WRITE)] {
+            if let Some(fd) = fd {
+                wait_fences(fd.as_raw_fd(), flags, Duration::from_secs(1));
+            }
+        }
+        super::copy::run(request, &src, &mut dst)
+    }
+
     /// Refuse a resource the descriptor limit cannot pay for.
     fn admit_resource(&mut self) -> Result<(), u32> {
         if self.resources.len() < self.budget {
@@ -1096,6 +1153,8 @@ impl Backend {
                         scanout_info: None,
                         exported: backing.as_ref().map(|(fd, _)| fd.clone()),
                         export_info: backing.map(|(_, info)| info),
+                        host_map: None,
+                        backing: Vec::new(),
                     },
                 );
                 NODATA
@@ -1118,15 +1177,19 @@ impl Backend {
                     return Err(INVALID);
                 }
                 let vecs = iovecs(mem, &mut d, count)?;
+                let ranges = segments(&vecs);
                 host(self.gpu.attach_backing(id, vecs))?;
                 resource.memory = Some(mem.clone());
+                resource.backing = ranges;
                 NODATA
             }
             0x107 => {
                 let id = d.u32()?;
                 d.u32()?;
                 host(self.gpu.detach_backing(id))?;
-                self.resources.get_mut(&id).ok_or(RESOURCE)?.memory = None;
+                let resource = self.resources.get_mut(&id).ok_or(RESOURCE)?;
+                resource.memory = None;
+                resource.backing.clear();
                 NODATA
             }
             0x105 | 0x205 | 0x206 => {
@@ -1265,6 +1328,7 @@ impl Backend {
                 // the C API would mark a host-only blob as already guest-backed.
                 let vecs = (!vecs.is_empty()).then_some(vecs);
                 let memory = vecs.as_ref().map(|_| mem.clone());
+                let ranges = vecs.as_deref().map(segments).unwrap_or_default();
                 log::debug!("GPU create blob: id={id} ctx={ctx} memory={blob_mem} entries={count}");
                 host(self.gpu.resource_create_blob(
                     ctx,
@@ -1290,6 +1354,8 @@ impl Backend {
                         scanout_info: None,
                         exported: None,
                         export_info: None,
+                        host_map: None,
+                        backing: ranges,
                     },
                 );
                 NODATA
@@ -1378,6 +1444,7 @@ impl Backend {
                     return Err(0x1200);
                 }
                 resource.mapped = true;
+                resource.host_map = Some((mapping.ptr as usize, size as usize));
                 out.extend_from_slice(&(info & RUTABAGA_MAP_CACHE_MASK).to_le_bytes());
                 out.extend_from_slice(&0u32.to_le_bytes());
                 0x1106
@@ -1392,6 +1459,7 @@ impl Backend {
                 self.mapper.unmap(id).map_err(|_| 0x1200u32)?;
                 host(self.gpu.unmap(id))?;
                 resource.mapped = false;
+                resource.host_map = None;
                 NODATA
             }
             _ => return Err(INVALID),
