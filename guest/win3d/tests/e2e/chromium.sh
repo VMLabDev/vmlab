@@ -33,7 +33,7 @@
 # restart the five rows ended at 863 on AMD1 and at 910 on Nvidia2.
 # check-shell-paths: no-errexit each row records its rc and the judge decides; the ini must be put back (VML-88).
 set -uo pipefail
-[ $# -eq 3 ] || { sed -n '2,34p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,33p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 LABDIR=$(cd "$1" && pwd)
