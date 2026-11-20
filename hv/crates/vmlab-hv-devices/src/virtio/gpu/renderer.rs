@@ -1908,6 +1908,22 @@ mod tests {
             eprintln!("SKIP render server loss: set VMLAB_HV_TEST_RENDER_NODE");
             return;
         };
+        // virglrenderer is one per process and does not start again after
+        // its render server is killed: the loss runs in a process of its own.
+        if std::env::var_os("VMLAB_HV_TEST_LOSS_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "virtio::gpu::renderer::tests::a_render_server_that_ends_is_a_lost_host_gpu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("VMLAB_HV_TEST_LOSS_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "the loss test process: {status}");
+            return;
+        }
         let renderer =
             Renderer::new(GpuMode::Venus, PathBuf::from(node), Arc::new(TestMapper)).unwrap();
         let mut watch = renderer.watch();
