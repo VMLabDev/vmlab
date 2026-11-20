@@ -132,17 +132,30 @@ pub fn flush() {
     }
 }
 
-/// Rows of two reads of one image that differ, as (first, last, count).
-/// None when the reads are equal.
-pub fn differing_rows(first: &[u8], second: &[u8], stride: usize) -> Option<(usize, usize, usize)> {
-    if stride == 0 {
+/// Rows of two images that differ in their first `row` bytes, as (first,
+/// last, count). Each image has its own stride. None when they agree.
+pub fn differing_rows(
+    first: &[u8],
+    first_stride: usize,
+    second: &[u8],
+    second_stride: usize,
+    row: usize,
+) -> Option<(usize, usize, usize)> {
+    if first_stride < row || second_stride < row || row == 0 {
         return None;
     }
     let mut result: Option<(usize, usize, usize)> = None;
-    for (row, (a, b)) in first.chunks(stride).zip(second.chunks(stride)).enumerate() {
-        if a != b {
-            let (start, _, count) = result.unwrap_or((row, row, 0));
-            result = Some((start, row, count + 1));
+    for (index, (a, b)) in first
+        .chunks(first_stride)
+        .zip(second.chunks(second_stride))
+        .enumerate()
+    {
+        if a.len() < row || b.len() < row {
+            break;
+        }
+        if a[..row] != b[..row] {
+            let (start, _, count) = result.unwrap_or((index, index, 0));
+            result = Some((start, index, count + 1));
         }
     }
     result
@@ -196,10 +209,15 @@ mod tests {
     fn differing_rows_name_the_first_and_last_row_and_their_count() {
         let a = vec![0u8; 4 * 8];
         let mut b = a.clone();
-        assert_eq!(differing_rows(&a, &b, 8), None);
+        assert_eq!(differing_rows(&a, 8, &b, 8, 8), None);
         b[8] = 1;
         b[3 * 8 + 7] = 1;
-        assert_eq!(differing_rows(&a, &b, 8), Some((1, 3, 2)));
+        assert_eq!(differing_rows(&a, 8, &b, 8, 8), Some((1, 3, 2)));
+        // Past the row length, padding does not count.
+        assert_eq!(differing_rows(&a, 8, &b, 8, 7), Some((1, 1, 1)));
+        // Images of different strides compare by their rows.
+        let narrow = vec![0u8; 4 * 4];
+        assert_eq!(differing_rows(&narrow, 4, &b, 8, 4), Some((1, 1, 1)));
         assert_ne!(digest(&a), digest(&b));
         assert_eq!(digest(&a), digest(&a.clone()));
     }

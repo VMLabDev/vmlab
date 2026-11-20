@@ -627,6 +627,7 @@ impl Renderer {
                     Some(Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }));
             }
             let fd = resource.exported.as_ref().unwrap().clone();
+            let fd_source = fd.clone();
             use std::os::fd::AsRawFd;
             if b.scanout_copy.is_none() {
                 b.scanout_copy = Some(super::scanout::Scanout::new(&b.node)?);
@@ -684,11 +685,14 @@ impl Renderer {
                     ),
                 );
             }
-            Ok(Some((frame, id, b.exports)))
+            // With the reread on, a copied frame's readback also reads its
+            // source, the guest's scanout, to compare it with the copy.
+            let source = (trace::reread() && !frame.direct).then(|| (fd_source, info, width, height));
+            Ok(Some((frame, id, b.exports, source)))
         })?;
-        let (mut frame, res, seq) = match frame {
-            Some((frame, res, seq)) => (Some(frame), res, seq),
-            None => (None, 0, 0),
+        let (mut frame, res, seq, source) = match frame {
+            Some((frame, res, seq, source)) => (Some(frame), res, seq, source),
+            None => (None, 0, 0, None),
         };
         if let Some(frame) = frame.as_mut() {
             if frame.direct {
@@ -730,32 +734,70 @@ impl Renderer {
                 if trace::on() {
                     let end = trace::now_ns();
                     // A second read of the same publication: rows that
-                    // differ were written while the display read them.
-                    let second = if trace::reread() {
-                        readback(
-                            b.scanout_copy.as_mut().ok_or(0x1200u32)?,
-                            fd.as_raw_fd(),
-                            info,
-                            width,
-                            height,
-                        )
-                        .ok()
-                    } else {
-                        None
+                    // differ were written while the display read them. For
+                    // a copied frame, read its source twice instead: rows in
+                    // which the copy differs from the source were written
+                    // after the copy, while the frame was published.
+                    let row = width as usize * 4;
+                    let rows = |found: Option<(usize, usize, usize)>| match found {
+                        None => "0".to_string(),
+                        Some((first, last, count)) => format!("{count}:{first}-{last}"),
                     };
-                    let rows = second
-                        .as_ref()
-                        .map(|second| trace::differing_rows(&pixels, second, stride as usize));
-                    let rows = match rows {
-                        None => "-".to_string(),
-                        Some(None) => "0".to_string(),
-                        Some(Some((first, last, count))) => format!("{count}:{first}-{last}"),
-                    };
+                    let (mut reread, mut copy_vs_source) = ("-".to_string(), "-".to_string());
+                    if !trace::reread() {
+                        // One read only.
+                    } else if let Some((source_fd, source_info, source_width, source_height)) =
+                        &source
+                    {
+                        let read = |b: &mut Backend| {
+                            readback(
+                                b.scanout_copy.as_mut()?,
+                                source_fd.as_raw_fd(),
+                                *source_info,
+                                *source_width,
+                                *source_height,
+                            )
+                            .ok()
+                        };
+                        if let (Some(first), Some(second)) = (read(b), read(b)) {
+                            let source_stride = source_info.strides[0] as usize;
+                            reread = rows(trace::differing_rows(
+                                &first,
+                                source_stride,
+                                &second,
+                                source_stride,
+                                row,
+                            ));
+                            if (*source_width, *source_height) == (width, height) {
+                                copy_vs_source = rows(trace::differing_rows(
+                                    &pixels,
+                                    stride as usize,
+                                    &first,
+                                    source_stride,
+                                    row,
+                                ));
+                            }
+                        }
+                    } else if let Ok(second) = readback(
+                        b.scanout_copy.as_mut().ok_or(0x1200u32)?,
+                        fd.as_raw_fd(),
+                        info,
+                        width,
+                        height,
+                    ) {
+                        reread = rows(trace::differing_rows(
+                            &pixels,
+                            stride as usize,
+                            &second,
+                            stride as usize,
+                            row,
+                        ));
+                    }
                     trace::write_at(
                         start,
                         "readback",
                         format_args!(
-                            "seq={seq} res={res} us={} writers={writers} digest={:016x} reread={rows} reread_us={}",
+                            "seq={seq} res={res} us={} writers={writers} digest={:016x} reread={reread} copy_vs_source={copy_vs_source} reread_us={}",
                             (end - start) / 1000,
                             trace::digest(&pixels),
                             (trace::now_ns() - end) / 1000
