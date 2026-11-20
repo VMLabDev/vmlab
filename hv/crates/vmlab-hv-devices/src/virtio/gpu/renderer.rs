@@ -461,11 +461,13 @@ impl Renderer {
     /// read a Blt destination, so this does not wait for them.
     pub fn present_copy(&self, request: super::copy::Request) -> Result<(), u32> {
         let (src, dst) = (request.src, request.dst);
-        self.call(move |b| b.present_copy(&request)).map(|bytes| {
-            log::trace!("present copy {src} -> {dst}: {bytes} bytes");
-        }).inspect_err(|error| {
-            log::warn!("present copy {src} -> {dst} refused: {error:#x}");
-        })
+        self.call(move |b| b.present_copy(&request))
+            .map(|bytes| {
+                log::trace!("present copy {src} -> {dst}: {bytes} bytes");
+            })
+            .inspect_err(|error| {
+                log::warn!("present copy {src} -> {dst} refused: {error:#x}");
+            })
     }
 
     /// Return when the renderer has run every task queued before this
@@ -964,15 +966,16 @@ impl Backend {
     /// written. The source is a blob the guest has mapped; the destination
     /// is that, or a resource with a guest backing.
     fn present_copy(&mut self, request: &super::copy::Request) -> Result<u64, u32> {
-        let memory = |id: u32| -> Result<(super::copy::Segments, Option<Arc<std::os::fd::OwnedFd>>), u32> {
-            let r = self.resources.get(&id).ok_or(RESOURCE)?;
-            let parts = match r.host_map {
-                Some(part) => vec![part],
-                None if !r.backing.is_empty() => r.backing.clone(),
-                None => return Err(INVALID),
+        let memory =
+            |id: u32| -> Result<(super::copy::Segments, Option<Arc<std::os::fd::OwnedFd>>), u32> {
+                let r = self.resources.get(&id).ok_or(RESOURCE)?;
+                let parts = match r.host_map {
+                    Some(part) => vec![part],
+                    None if !r.backing.is_empty() => r.backing.clone(),
+                    None => return Err(INVALID),
+                };
+                Ok((super::copy::Segments { parts }, r.exported.clone()))
             };
-            Ok((super::copy::Segments { parts }, r.exported.clone()))
-        };
         let (src, src_fd) = memory(request.src)?;
         let (mut dst, dst_fd) = memory(request.dst)?;
         if let Err(error) = self.synchronize() {

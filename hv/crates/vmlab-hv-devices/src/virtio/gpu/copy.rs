@@ -147,7 +147,11 @@ impl Segments {
             done += n;
             offset = 0;
         }
-        if done == len { Ok(()) } else { Err(super::INVALID) }
+        if done == len {
+            Ok(())
+        } else {
+            Err(super::INVALID)
+        }
     }
 }
 
@@ -220,9 +224,21 @@ pub(super) fn run(request: &Request, src: &dyn Memory, dst: &mut dyn Memory) -> 
     };
     let (src_len, dst_len) = (src.len(), dst.len());
     for b in &request.boxes {
-        if !fits(request.src_offset, request.src_stride, b.src_x, b.src_y, b, src_len)
-            || !fits(request.dst_offset, request.dst_stride, b.dst_x, b.dst_y, b, dst_len)
-        {
+        if !fits(
+            request.src_offset,
+            request.src_stride,
+            b.src_x,
+            b.src_y,
+            b,
+            src_len,
+        ) || !fits(
+            request.dst_offset,
+            request.dst_stride,
+            b.dst_x,
+            b.dst_y,
+            b,
+            dst_len,
+        ) {
             return Err(super::INVALID);
         }
     }
@@ -257,7 +273,11 @@ mod tests {
         }
         fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), u32> {
             let at = offset as usize;
-            out.copy_from_slice(self.0.get(at..at + out.len()).ok_or(super::super::INVALID)?);
+            out.copy_from_slice(
+                self.0
+                    .get(at..at + out.len())
+                    .ok_or(super::super::INVALID)?,
+            );
             Ok(())
         }
         fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), u32> {
@@ -285,7 +305,14 @@ mod tests {
     }
 
     fn whole(width: u32, height: u32) -> CopyBox {
-        CopyBox { src_x: 0, src_y: 0, dst_x: 1, dst_y: 1, width, height }
+        CopyBox {
+            src_x: 0,
+            src_y: 0,
+            dst_x: 1,
+            dst_y: 1,
+            width,
+            height,
+        }
     }
 
     #[test]
@@ -306,10 +333,16 @@ mod tests {
         let src = Plain(vec![1; 64]);
         let mut dst = Plain(vec![0; 16 + 32 * 4]);
         let boxes = vec![whole(1, 1), whole(2, 5)];
-        assert_eq!(run(&request(Mode::Direct, boxes), &src, &mut dst), Err(super::super::INVALID));
+        assert_eq!(
+            run(&request(Mode::Direct, boxes), &src, &mut dst),
+            Err(super::super::INVALID)
+        );
         assert!(dst.0.iter().all(|&b| b == 0));
         // A row wider than the pitch is refused too.
-        let wide = vec![CopyBox { width: 5, ..whole(5, 1) }];
+        let wide = vec![CopyBox {
+            width: 5,
+            ..whole(5, 1)
+        }];
         assert!(run(&request(Mode::Direct, wide), &src, &mut dst).is_err());
     }
 
@@ -318,17 +351,37 @@ mod tests {
         let pixel = |v: u32| v.to_le_bytes().to_vec();
         let mut src = Plain([pixel(0x1122_3344), vec![0; 12]].concat());
         let mut dst = Plain(vec![0; 16 + 32 * 4]);
-        run(&request(Mode::SwapRedBlue, vec![whole(1, 1)]), &src, &mut dst).unwrap();
+        run(
+            &request(Mode::SwapRedBlue, vec![whole(1, 1)]),
+            &src,
+            &mut dst,
+        )
+        .unwrap();
         assert_eq!(dst.0[16 + 36..16 + 40], pixel(0x1144_3322)[..]);
 
         // R10G10B10A2 white with alpha 3, and red at full scale.
         src.0[..4].copy_from_slice(&(0xffff_ffffu32).to_le_bytes());
-        run(&request(Mode::R10ToRgba8, vec![whole(1, 1)]), &src, &mut dst).unwrap();
+        run(
+            &request(Mode::R10ToRgba8, vec![whole(1, 1)]),
+            &src,
+            &mut dst,
+        )
+        .unwrap();
         assert_eq!(dst.0[16 + 36..16 + 40], pixel(0xffff_ffff)[..]);
         src.0[..4].copy_from_slice(&(0x3ffu32 | (1 << 30)).to_le_bytes());
-        run(&request(Mode::R10ToRgba8, vec![whole(1, 1)]), &src, &mut dst).unwrap();
+        run(
+            &request(Mode::R10ToRgba8, vec![whole(1, 1)]),
+            &src,
+            &mut dst,
+        )
+        .unwrap();
         assert_eq!(dst.0[16 + 36..16 + 40], pixel(0x5500_00ff)[..]);
-        run(&request(Mode::R10ToBgra8, vec![whole(1, 1)]), &src, &mut dst).unwrap();
+        run(
+            &request(Mode::R10ToBgra8, vec![whole(1, 1)]),
+            &src,
+            &mut dst,
+        )
+        .unwrap();
         assert_eq!(dst.0[16 + 36..16 + 40], pixel(0x55ff_0000)[..]);
     }
 
@@ -366,7 +419,17 @@ mod tests {
         }
         let request = decode(&body).unwrap();
         assert_eq!(request.mode, Mode::SwapRedBlue);
-        assert_eq!(request.boxes, vec![CopyBox { src_x: 0, src_y: 0, dst_x: 0, dst_y: 0, width: 2, height: 2 }]);
+        assert_eq!(
+            request.boxes,
+            vec![CopyBox {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                width: 2,
+                height: 2
+            }]
+        );
         // A conversion of pixels that are not 32-bit.
         let mut bad = body.clone();
         bad[36..40].copy_from_slice(&2u32.to_le_bytes());
