@@ -64,9 +64,9 @@ impl Watch {
         Self { probes }
     }
 
-    /// The probes for the renderer on `node`, and for the render server
-    /// child of this process when the renderer uses one.
-    pub(super) fn for_renderer(node: &Path, render_server: bool) -> Self {
+    /// The probes for the renderer on `node`, and for `servers`, the child
+    /// processes its start made: virglrenderer's render server.
+    pub(super) fn for_renderer(node: &Path, servers: &[u32]) -> Self {
         let mut probes: Vec<Box<dyn Probe>> = Vec::new();
         match RenderNode::new(node) {
             Some(probe) => probes.push(Box::new(probe)),
@@ -75,13 +75,9 @@ impl Watch {
                 node.display()
             ),
         }
-        if render_server {
-            match RenderServer::find(Path::new("/proc")) {
-                Some(probe) => probes.push(Box::new(probe)),
-                None => {
-                    log::warn!("virtio-gpu: no render server child found; its end is not detected")
-                }
-            }
+        let parent = std::process::id();
+        for &pid in servers {
+            probes.push(Box::new(RenderServer::watching(Path::new("/proc"), pid, parent)));
         }
         Self::new(probes)
     }
@@ -123,25 +119,16 @@ impl Probe for RenderNode {
 
 /// virglrenderer's render server, a child process that runs every Venus
 /// context: lost when it has ended. Nobody reaps it while the renderer
-/// lives, so an ended server stays a zombie.
+/// lives, so an ended server stays a zombie. virglrenderer forks it without
+/// a new program name, so it is known by its number: the child the
+/// renderer's start made ([`children`] before and after).
 pub(super) struct RenderServer {
     proc: PathBuf,
     pid: u32,
     parent: u32,
 }
 
-/// The name a render server runs under, as `/proc/<pid>/stat` cuts it to 15
-/// bytes: `virgl_render_server`.
-const RENDER_SERVER: &str = "virgl_render_se";
-
 impl RenderServer {
-    /// The render server among the children of this process, in `proc`.
-    pub(super) fn find(proc: &Path) -> Option<Self> {
-        let parent = std::process::id();
-        let pid = *render_servers(proc, parent).first()?;
-        Some(Self::watching(proc, pid, parent))
-    }
-
     pub(super) fn watching(proc: &Path, pid: u32, parent: u32) -> Self {
         Self {
             proc: proc.to_path_buf(),
@@ -151,8 +138,8 @@ impl RenderServer {
     }
 }
 
-/// The running render servers among the children of `parent`, in `proc`.
-pub(super) fn render_servers(proc: &Path, parent: u32) -> Vec<u32> {
+/// The running child processes of `parent`, in `proc`, in order.
+pub(super) fn children(proc: &Path, parent: u32) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(proc) else {
         return Vec::new();
     };
@@ -161,7 +148,7 @@ pub(super) fn render_servers(proc: &Path, parent: u32) -> Vec<u32> {
         .filter_map(|entry| {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
             let stat = Stat::read(proc, pid)?;
-            (stat.parent == parent && stat.name == RENDER_SERVER && stat.alive()).then_some(pid)
+            (stat.parent == parent && stat.alive()).then_some(pid)
         })
         .collect();
     pids.sort_unstable();
@@ -178,6 +165,7 @@ impl Probe for RenderServer {
 
 /// The fields of `/proc/<pid>/stat` the probe needs.
 struct Stat {
+    #[cfg_attr(not(test), allow(dead_code))]
     name: String,
     state: char,
     parent: u32,
@@ -246,8 +234,9 @@ mod tests {
         std::fs::create_dir_all(proc.join("self")).unwrap();
 
         // Only a child of this process counts.
-        assert_eq!(render_servers(&proc, 99), [10]);
-        assert!(render_servers(&proc, 98).is_empty());
+        proc_entry(&proc, 13, "13 (gone) Z 99 1 1");
+        assert_eq!(children(&proc, 99), [10, 12]);
+        assert!(children(&proc, 98).is_empty());
         let mut probe = RenderServer::watching(&proc, 10, 99);
         assert_eq!(probe.lost(), None);
 

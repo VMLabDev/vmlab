@@ -117,7 +117,8 @@ pub(super) struct Renderer {
     lost: super::lost::Flag,
     /// The render node, canonical.
     node: PathBuf,
-    mode: GpuMode,
+    /// The child processes the start made: the render server of Venus.
+    servers: Vec<u32>,
 }
 
 struct Worker {
@@ -330,6 +331,9 @@ impl Renderer {
                         }
                     }
                 });
+                // virglrenderer forks its render server while it starts.
+                let proc = std::path::Path::new("/proc");
+                let before = super::lost::children(proc, std::process::id());
                 let gpu = RutabagaBuilder::new(mask, handler)
                     .set_default_component(RutabagaComponentType::VirglRenderer)
                     .set_use_egl(true)
@@ -364,7 +368,11 @@ impl Renderer {
                     let _ = ready.send(Err("virglrenderer returned no usable Venus capset".into()));
                     return;
                 }
-                let _ = ready.send(Ok(gpu.get_num_capsets()));
+                let servers: Vec<u32> = super::lost::children(proc, std::process::id())
+                    .into_iter()
+                    .filter(|pid| !before.contains(pid))
+                    .collect();
+                let _ = ready.send(Ok((gpu.get_num_capsets(), servers)));
                 let mut backend = Backend {
                     gpu,
                     resources: BTreeMap::new(),
@@ -402,7 +410,7 @@ impl Renderer {
                     backend.gpu.event_poll();
                 }
             })?;
-        let capsets = initialized
+        let (capsets, servers) = initialized
             .recv()
             .map_err(|e| DeviceError::Other(e.to_string()))?
             .map_err(|e| DeviceError::Other(format!("initializing virtio-gpu renderer: {e}")))?;
@@ -417,7 +425,7 @@ impl Renderer {
             direct: Arc::new(Mutex::new(Vec::new())),
             lost,
             node,
-            mode,
+            servers,
         })
     }
 
@@ -428,7 +436,7 @@ impl Renderer {
 
     /// The probes that see this renderer's host GPU go (`lost.rs`).
     pub fn watch(&self) -> super::lost::Watch {
-        super::lost::Watch::for_renderer(&self.node, self.mode == GpuMode::Venus)
+        super::lost::Watch::for_renderer(&self.node, &self.servers)
     }
 
     pub fn set_base(&self, base: Option<u64>) -> Result<(), DeviceError> {
@@ -1900,31 +1908,13 @@ mod tests {
             eprintln!("SKIP render server loss: set VMLAB_HV_TEST_RENDER_NODE");
             return;
         };
-        let proc = std::path::Path::new("/proc");
-        let parent = std::process::id();
-        let before = super::super::lost::render_servers(proc, parent);
         let renderer =
             Renderer::new(GpuMode::Venus, PathBuf::from(node), Arc::new(TestMapper)).unwrap();
         let mut watch = renderer.watch();
         assert_eq!(watch.check(), None);
-        // Other tests of this process can run renderers of their own.
-        let Some(pid) = super::super::lost::render_servers(proc, parent)
-            .into_iter()
-            .find(|pid| !before.contains(pid))
-        else {
-            let children: Vec<_> = std::fs::read_dir(proc)
-                .unwrap()
-                .flatten()
-                .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
-                .filter(|stat| {
-                    stat.rsplit_once(')')
-                        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
-                        == Some(&parent.to_string())
-                })
-                .collect();
-            panic!("no render server among the children of {parent}: {children:?}");
+        let [pid] = renderer.servers[..] else {
+            panic!("expected one render server, got {:?}", renderer.servers);
         };
-        let mut server = super::super::lost::RenderServer::watching(proc, pid, parent);
         let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
         let mut create = vec![7, 4];
         create.extend_from_slice(&[0; 16]);
@@ -1934,13 +1924,13 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
         let start = std::time::Instant::now();
         let reason = loop {
-            if let Some(reason) = super::super::lost::Probe::lost(&mut server) {
+            if let Some(reason) = watch.check() {
                 break reason;
             }
             assert!(start.elapsed() < Duration::from_secs(5), "no loss seen");
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert!(reason.contains("render server"), "{reason}");
+        assert_eq!(reason, format!("the render server (pid {pid}) has ended"));
 
         // Lost: work is refused at once, a release succeeds, and the reset
         // and the drop end.
