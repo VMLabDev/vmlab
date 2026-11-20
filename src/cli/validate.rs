@@ -195,9 +195,6 @@ pub fn cmd_validate() -> Result<()> {
     for warning in gpu_warnings(&file, |_| true) {
         eprintln!("WARNING: {warning}");
     }
-    for warning in QemuRemovalReport::of(&file).lines() {
-        eprintln!("WARNING: {warning}");
-    }
     for line in nocow_notes(&file) {
         println!("{line}");
     }
@@ -211,69 +208,6 @@ pub fn cmd_validate() -> Result<()> {
     Ok(())
 }
 
-/// The QEMU removal warnings of a lab read from its file and its persisted
-/// state, with no daemon: every x86 machine that would run on QEMU, the
-/// online snapshots QEMU took of it, and what the host owes. `validate`
-/// prints it, and so does `status` on a lab that is not running.
-#[derive(Debug, Default)]
-pub struct QemuRemovalReport {
-    pub machines: Vec<(String, crate::config::hypervisor::QemuRemoval)>,
-    pub host: Vec<String>,
-}
-
-impl QemuRemovalReport {
-    /// Of a loaded lab. A lab whose state or profiles cannot be read
-    /// reports nothing here; validation already said why.
-    pub fn of(file: &crate::config::LabFile) -> Self {
-        match HostContext::at(&file.root) {
-            Ok(ctx) => Self::with(file, &ctx, &ctx.state),
-            Err(_) => Self::default(),
-        }
-    }
-
-    /// Of the lab in the current directory, or nothing where there is none
-    /// that loads.
-    pub fn of_current_lab() -> Self {
-        let Ok(cwd) = std::env::current_dir() else {
-            return Self::default();
-        };
-        crate::paths::find_lab_root(&cwd)
-            .ok()
-            .and_then(|root| config::load_lab_root(&root).ok())
-            .map(|file| Self::of(&file))
-            .unwrap_or_default()
-    }
-
-    fn with(
-        file: &crate::config::LabFile,
-        ctx: &dyn ValidationContext,
-        state: &crate::labd::state::LabState,
-    ) -> Self {
-        let mut machines = config::validate::qemu_removals(&file.lab, ctx);
-        for (name, removal) in &mut machines {
-            removal.online_snapshots = state
-                .machines
-                .get(name)
-                .map(|m| m.qemu_online_snapshots())
-                .unwrap_or_default();
-        }
-        let host = (!machines.is_empty())
-            .then(|| crate::config::hypervisor::kvm_removal_warning(&ctx.host_facts()))
-            .flatten()
-            .into_iter()
-            .collect();
-        Self { machines, host }
-    }
-
-    /// One line per warning, as a surface prints them.
-    pub fn lines(&self) -> Vec<String> {
-        self.machines
-            .iter()
-            .flat_map(|(name, removal)| removal.lines(name))
-            .chain(self.host.iter().cloned())
-            .collect()
-    }
-}
 
 /// What `up` will do to each machine's disk directory on btrfs (PRD §7.1,
 /// `crate::nocow`): a line per directory it will set NOCOW on, or a

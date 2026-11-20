@@ -6,7 +6,8 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use super::hypervisor::{
-    HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, vmlab_refusals,
+    HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, qemu_x86_refusals,
+    vmlab_refusals,
 };
 use super::model::*;
 use super::{Issue, IssueList};
@@ -1971,7 +1972,23 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
                 ),
             ));
         }
-        if selected_hypervisor(m, ctx) != HypervisorKind::Vmlab {
+        let host = host.get_or_insert_with(|| ctx.host_facts());
+        let hardware = match m {
+            MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
+            MachineCfg::Container(_) => None,
+        };
+        let selection = ctx.hypervisor_defaults().select(
+            m,
+            host,
+            hardware.as_ref(),
+            ctx.existing_hypervisor(m.name()),
+        );
+        // QEMU runs no x86 guest: a setting that puts one there is an error,
+        // and on vmlab-hv what it refuses is one too.
+        for why in qemu_x86_refusals(m, &selection, host, hardware.as_ref()) {
+            issues.push(Issue::at(m.span(), why));
+        }
+        if selection.kind != HypervisorKind::Vmlab {
             if let MachineCfg::Vm(vm) = m {
                 for why in qemu_refusals(vm) {
                     issues.push(Issue::at(vm.span, why));
@@ -1979,57 +1996,10 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
             }
             continue;
         }
-        let host = host.get_or_insert_with(|| ctx.host_facts());
-        let hardware = match m {
-            MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
-            MachineCfg::Container(_) => None,
-        };
         for why in vmlab_refusals(m, host, hardware.as_ref()) {
             issues.push(Issue::at(m.span(), why));
         }
     }
-}
-
-fn selected_hypervisor(machine: MachineCfg<'_>, ctx: &dyn ValidationContext) -> HypervisorKind {
-    let hardware = match machine {
-        MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
-        MachineCfg::Container(_) => None,
-    };
-    ctx.hypervisor_defaults()
-        .select(
-            machine,
-            &ctx.host_facts(),
-            hardware.as_ref(),
-            ctx.existing_hypervisor(machine.name()),
-        )
-        .kind
-}
-
-/// Every x86 machine of `lab` that runs on QEMU, by name, with the removal
-/// warning it earns ([`super::hypervisor::qemu_removal`]) — what `validate`
-/// prints, selected the way validation selects. The daemon says the same of
-/// the machines it built, with the hardware of a template pulled since.
-pub fn qemu_removals(
-    lab: &Lab,
-    ctx: &dyn ValidationContext,
-) -> Vec<(String, super::hypervisor::QemuRemoval)> {
-    let host = ctx.host_facts();
-    lab.machines()
-        .filter_map(|m| {
-            let hardware = match m {
-                MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
-                MachineCfg::Container(_) => None,
-            };
-            let selection = ctx.hypervisor_defaults().select(
-                m,
-                &host,
-                hardware.as_ref(),
-                ctx.existing_hypervisor(m.name()),
-            );
-            super::hypervisor::qemu_removal(m, &selection, &host, hardware.as_ref())
-                .map(|removal| (m.name().to_string(), removal))
-        })
-        .collect()
 }
 
 /// A VM's resolved hardware, when this context can resolve it: a store
@@ -3372,7 +3342,7 @@ lab "l" {
         let f = lab(r#"import <vmlab.wcl>
 lab "l" {
   segment "s" { }
-  vm "a" { template = "x86_64/t" hypervisor = "qemu" nic { segment = "s" }
+  vm "a" { template = "aarch64/t" hypervisor = "qemu" nic { segment = "s" }
     share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" }
     share { host = "." guest = "/mnt/a" name = "a" }
     share { host = "." guest = "/mnt/s" name = "s" transport = "smb" } }
@@ -3624,9 +3594,9 @@ template "t" {{
     fn a_host_gpus_qemu_binary_is_checked_against_the_vms_arch() {
         use std::os::unix::fs::PermissionsExt;
         let sys = crate::qemu::hostgpu::testing::fake_host();
-        let arm = sys.path().join("qemu-system-aarch64");
-        std::fs::write(&arm, "").unwrap();
-        std::fs::set_permissions(&arm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let x86 = sys.path().join("qemu-system-x86_64");
+        std::fs::write(&x86, "").unwrap();
+        std::fs::set_permissions(&x86, std::fs::Permissions::from_mode(0o755)).unwrap();
         let errs = |binary: &Path| -> Vec<String> {
             let host = crate::config::host::HostConfig::parse(
                 &format!(
@@ -3637,7 +3607,7 @@ template "t" {{
             )
             .unwrap();
             let f = lab(r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" hypervisor = "qemu" gpu { mode = "vulkan" } } }"#);
+lab "l" { vm "a" { template = "aarch64/t" hypervisor = "qemu" gpu { mode = "vulkan" } } }"#);
             validate(
                 &f,
                 &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path()), host),
@@ -3646,14 +3616,14 @@ lab "l" { vm "a" { template = "x86_64/t" hypervisor = "qemu" gpu { mode = "vulka
             .map(|i| i.message)
             .collect()
         };
-        let es = errs(&arm);
+        let es = errs(&x86);
         assert!(
             es.len() == 1
                 && es[0].starts_with("vm \"a\": host GPU `Nvidia1`")
-                && es[0].contains("emulates aarch64, but this VM is x86_64"),
+                && es[0].contains("emulates x86_64, but this VM is aarch64"),
             "{es:#?}"
         );
-        let es = errs(&sys.path().join("gone/qemu-system-x86_64"));
+        let es = errs(&sys.path().join("gone/qemu-system-aarch64"));
         assert!(es.len() == 1 && es[0].contains("does not exist"), "{es:#?}");
     }
 
@@ -4657,24 +4627,37 @@ lab "l" {
             .collect()
     }
 
-    /// `validate` warns of the QEMU removal for the machines its own
-    /// selection puts on QEMU: the explicit one here, not its neighbours.
+    /// QEMU runs no x86 guest: an x86 machine a setting puts there is an
+    /// error naming the replacement, an x86 machine without KVM is an error
+    /// saying KVM is required, and another architecture validates on QEMU.
     #[test]
-    fn validation_lists_the_x86_machines_the_qemu_removal_touches() {
-        let src = r#"import <vmlab.wcl>
-lab "l" {
-  vm "q" { template = "x86_64/t" hypervisor = "qemu" }
-  vm "arm" { template = "aarch64/t" }
-  container "c" { image = "alpine" }
-}"#;
-        let found = qemu_removals(&lab(src).lab, &HvHost::kvm());
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].0, "q");
-        assert_eq!(
-            found[0].1.reason,
-            crate::config::hypervisor::QemuReason::Explicit
+    fn validation_refuses_every_x86_machine_on_qemu() {
+        let body = r#"vm "q" { template = "x86_64/t" hypervisor = "qemu" }
+  vm "args" { template = "x86_64/t" qemu_args = ["-no-hpet"] }
+  vm "arm" { template = "aarch64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }
+  container "c" { image = "alpine" }"#;
+        let es = hv_errs(&HvHost::kvm(), body);
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(
+            es.iter()
+                .any(|e| e.contains("vm \"q\"") && e.contains("set hypervisor = \"vmlab\"")),
+            "{es:#?}"
         );
-        // Without KVM the container falls back too, and is named.
+        assert!(
+            es.iter()
+                .any(|e| e.contains("vm \"args\"") && e.contains("`qemu_args`")),
+            "{es:#?}"
+        );
+        let by_host = HvHost {
+            defaults: HypervisorDefaults {
+                vm: Some(HypervisorKind::Qemu),
+                container: None,
+            },
+            facts: HvHost::kvm().facts,
+        };
+        let es = hv_errs(&by_host, r#"vm "plain" { template = "x86_64/t" }"#);
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("remove that default"), "{es:#?}");
         let no_kvm = HvHost {
             defaults: HypervisorDefaults::default(),
             facts: HostFacts {
@@ -4682,11 +4665,13 @@ lab "l" {
                 kvm: false,
             },
         };
-        let names: Vec<String> = qemu_removals(&lab(src).lab, &no_kvm)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(names, ["q", "c"]);
+        let es = hv_errs(
+            &no_kvm,
+            r#"vm "v" { template = "x86_64/t" }
+  container "c" { image = "alpine" }"#,
+        );
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(es.iter().all(|e| e.contains("KVM is required")), "{es:#?}");
     }
 
     #[test]
@@ -4723,7 +4708,7 @@ lab "l" {
     fn audio_needs_vmlab_hv_and_a_microphone_needs_audio() {
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "q" { template = "x86_64/t" hypervisor = "qemu" audio = true microphone = true }"#,
+            r#"vm "q" { template = "aarch64/t" hypervisor = "qemu" audio = true microphone = true }"#,
         );
         assert_eq!(es.len(), 2, "{es:#?}");
         assert!(
@@ -4765,7 +4750,7 @@ lab "l" {
 lab "l" {
   vm "hv" { template = "x86_64/t" hypervisor = "vmlab"
     share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" } }
-  vm "q" { template = "x86_64/t" hypervisor = "qemu"
+  vm "q" { template = "aarch64/t" hypervisor = "qemu"
     share { host = "." guest = "/mnt/w" name = "w" transport = "virtiofs" } }
 }"#);
         let es: Vec<String> = validate(&f, &NoVirtiofsd)
@@ -4786,19 +4771,27 @@ lab "l" {
                 .any(|m| m.contains("`qemu_args`") && m.contains("vm \"v\"")),
             "{es:#?}"
         );
-        // The same declaration on QEMU is the escape hatch it always was.
+        // On QEMU it stays the escape hatch for the guests QEMU still runs.
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "x86_64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }"#,
+            r#"vm "v" { template = "aarch64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
     }
 
     #[test]
-    fn automatic_fallback_validates_while_an_explicit_vmlab_still_refuses() {
+    fn automatic_x86_selection_refuses_what_vmlab_hv_cannot_run() {
         for setting in [
             r#"profile = "linux-modern" qemu_args = ["-no-hpet"]"#,
             r#"profile = "linux-modern" accel = "tcg""#,
+        ] {
+            let body = format!(
+                r#"vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }}"#
+            );
+            let errors = hv_errs(&HvHost::kvm(), &body);
+            assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+        }
+        for setting in [
             r#"profile = "windows-legacy""#,
             r#"profile = "linux-modern" tsc = "host""#,
         ] {
@@ -4877,7 +4870,7 @@ lab "l" {
             &host,
             r#"container "c" { image = "alpine" }
 vm "v" { template = "x86_64/t" accel = "tcg" }
-vm "q" { template = "x86_64/t" hypervisor = "qemu" accel = "tcg" }"#,
+vm "q" { template = "aarch64/t" hypervisor = "qemu" accel = "tcg" }"#,
         );
         assert_eq!(es.len(), 1, "{es:#?}");
         assert!(es[0].contains("vm \"v\""), "{es:#?}");

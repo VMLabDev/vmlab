@@ -1,6 +1,8 @@
 //! Build the QEMU argv for one VM (PRD §3, §5.2). Pure function of the
 //! resolved hardware + runtime paths, so it is exhaustively unit-testable.
 //! `qemu_args` from the lab file are appended verbatim, last, so they win.
+//! QEMU runs aarch64 and riscv64 guests on the `virt` machine; an x86 guest
+//! runs on vmlab-hv only (§22), so no q35 or pc argv is composed here.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +11,7 @@ use vmlab_agent_proto::PORT_NAME as AGENT_PORT_NAME;
 
 use super::resolve::ResolvedVm;
 use crate::config::model::{AccelMode, GpuMode, InputDevices, MacAddr};
-use crate::profiles::{AgentTransport, DiskBus, FirmwareKind};
+use crate::profiles::{AgentTransport, FirmwareKind};
 
 /// One virtio-fs share a hypervisor serves in process
 /// ([`VmPaths::hypervisor_shares`]).
@@ -283,32 +285,6 @@ fn host_msrs_problem_in(sys_module: &Path) -> Option<String> {
     ))
 }
 
-/// The Hyper-V enlightenments `hyperv = true` adds to the KVM `-cpu` string
-/// (§5.2): Windows reads its clock from the reference TSC page instead of an
-/// emulated timer, and takes fewer exits for interrupts, timers, TLB flushes
-/// and IPIs. `+invtsc` is deliberately absent — QEMU refuses to migrate a
-/// guest that has it, and an online snapshot is a migration (§7.3).
-pub const HYPERV_FLAGS: &str = "hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,\
-                                hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,\
-                                hv-ipi";
-
-/// Added to [`HYPERV_FLAGS`] where the host's KVM virtualises the APIC
-/// (§5.2). Hyper-V's SynIC has Windows acknowledge its timer interrupts by
-/// AutoEOI, which KVM cannot do in hardware, so it turns APICv/AVIC off for
-/// the whole VM; `hv-avic` tells Windows not to use AutoEOI and leaves them
-/// on, so an end-of-interrupt stops being an exit. A Windows 11 24H2 or
-/// Server 2025 guest takes 512 clock interrupts a second on every vCPU even
-/// idle, so that is about one exit in three gone. Without APICv/AVIC the
-/// guest would pay for an EOI AutoEOI used to save, so it is added only
-/// where they are on.
-pub const HYPERV_APICV_FLAG: &str = "hv-avic";
-
-/// What AVIC also needs on an AMD host, set wherever [`HYPERV_APICV_FLAG`]
-/// is: KVM inhibits AVIC while its in-kernel PIT re-injects missed ticks,
-/// QEMU's default. A guest with the enlightenments keeps time from the
-/// reference TSC page and has no use for PIT ticks it missed.
-pub const HYPERV_APICV_PIT: &str = "kvm-pit.lost_tick_policy=discard";
-
 /// Whether the host's KVM virtualises the APIC: `kvm_intel`'s
 /// `enable_apicv` or `kvm_amd`'s `avic`. Read where the runtime paths are
 /// assembled and handed to the builder as
@@ -362,38 +338,6 @@ pub fn hyperv_not_applied(declared: Option<bool>, vm: &ResolvedVm, accel: Accel)
     })
 }
 
-/// The `-cpu` model under KVM. `host` passes the host CPU through, VMX/SVM
-/// included, so an x86 guest that did not ask for `nested = true` has both
-/// masked: the switch decides what the guest sees, not whatever the host
-/// happens to allow (§5.2). Masking the other vendor's flag too is harmless,
-/// and spares the builder asking which vendor the host is. Other arches pass
-/// the host CPU through unchanged. A resolved `hyperv` adds
-/// [`HYPERV_FLAGS`] on x86, with `nested` or without, and
-/// [`HYPERV_APICV_FLAG`] where the host virtualises the APIC.
-fn kvm_cpu_model(vm: &ResolvedVm, apic_virtualization: bool) -> String {
-    let x86 = qemu_arch(&vm.arch) == "x86_64";
-    let host = if vm.nested || !x86 {
-        "host"
-    } else {
-        "host,vmx=off,svm=off"
-    };
-    match hyperv_apicv(vm, Accel::Kvm, apic_virtualization) {
-        Some(true) => format!("{host},{HYPERV_FLAGS},{HYPERV_APICV_FLAG}"),
-        Some(false) => format!("{host},{HYPERV_FLAGS}"),
-        None => host.to_string(),
-    }
-}
-
-/// Whether the enlightenments apply under `accel`, and if so whether
-/// [`HYPERV_APICV_FLAG`] rides with them: `None` without them.
-fn hyperv_apicv(vm: &ResolvedVm, accel: Accel, apic_virtualization: bool) -> Option<bool> {
-    (vm.hyperv && hyperv_skipped(vm, accel).is_none()).then_some(apic_virtualization)
-}
-
-/// The qdev id of the xHCI controller `input = "usb"` puts the keyboard and
-/// tablet on (§5.2).
-pub const INPUT_XHCI_ID: &str = "xhci";
-
 /// Why a VM that resolved `tsc = "host"` boots without a pinned TSC under
 /// `accel` — `None` when it gets one, or never asked. The frequency is read
 /// from KVM, and `tsc-frequency` is an x86 CPU property (§5.2).
@@ -426,40 +370,24 @@ pub fn emulator_binary(arch: &str) -> String {
     format!("qemu-system-{}", qemu_arch(arch))
 }
 
-/// Which IDE/AHCI bus and unit the n-th disk-or-CD-ROM takes.
-///
-/// Every attachment is addressed, never auto-placed. QEMU places an
-/// unaddressed `ide-hd` on the secondary master (ide.1 unit 0) — the middle of
-/// the four legacy slots — and its CD-ROM auto-placement does not advance past
-/// the first bus, so the two together collide as soon as a guest carries a disk
-/// and more than one ISO. That is every legacy Windows build: install media,
-/// vmlab's bootstrap ISO, and (once the answer file grows drivers) an unattend
-/// ISO too, which is exactly the four slots a legacy `pc` has.
-///
-/// q35's AHCI ports hold one unit each, so there the slot IS the bus.
-fn ide_slot(slot: usize, machine: &MachineKind) -> (usize, usize) {
-    match machine {
-        MachineKind::Q35 => (slot, 0),
-        // Two units to a bus, primary first: (0,0) (0,1) (1,0) (1,1).
-        _ => (slot / 2, slot % 2),
-    }
-}
-
-/// The machine shape the argv is being built for, as far as device addressing
-/// cares: AHCI ports on q35, IDE buses on `pc`, neither on `virt`.
-enum MachineKind {
-    Q35,
-    LegacyPc,
-    Virt,
-}
-
 /// Build the full argv (excluding argv[0], which is `emulator_binary`).
+///
+/// QEMU runs the guests vmlab-hv does not: aarch64 and riscv64, on the
+/// `virt` machine. An x86 or x86_64 guest is refused here — vmlab-hv is its
+/// only hypervisor (PRD §22) — so no q35 or pc argv is composed.
 pub fn build_args(
     lab: &str,
     vm: &ResolvedVm,
     paths: &VmPaths,
     accel: Accel,
 ) -> Result<Vec<String>> {
+    if qemu_arch(&vm.arch) == "x86_64" {
+        anyhow::bail!(
+            "vm \"{}\": QEMU no longer runs x86 guests — vmlab-hv runs them (PRD §22); set \
+             hypervisor = \"vmlab\", or remove the setting that names QEMU",
+            vm.name
+        );
+    }
     if vm
         .gpu
         .as_ref()
@@ -467,6 +395,13 @@ pub fn build_args(
     {
         anyhow::bail!(
             "vm \"{}\": gpu virtual_display requires hypervisor = \"vmlab\"; QEMU does not support it",
+            vm.name
+        );
+    }
+    if vm.agent_transport == AgentTransport::IsaSerial {
+        anyhow::bail!(
+            "vm \"{}\": agent_transport = \"isa-serial\" is the legacy x86 tier, which QEMU \
+             no longer runs (PRD §22)",
             vm.name
         );
     }
@@ -482,8 +417,8 @@ pub fn build_args(
     }
     // vhost-user-fs shares need the guest RAM in shared memory. Only VMs
     // that carry one get the memfd backend: it renames the RAM block in
-    // internal snapshots (pc.ram → mem0), so the plain `-m` shape stays
-    // untouched for every other VM (§7.5).
+    // internal snapshots, so the plain `-m` shape stays untouched for every
+    // other VM (§7.5).
     if paths.virtiofs_shares.is_empty() {
         arg(&mut a, "machine", vm.machine.clone());
     } else {
@@ -503,23 +438,14 @@ pub fn build_args(
     }
     // A named model (§5.2) replaces the accelerator default under either
     // accelerator: it is the CPU the guest was declared to see. QEMU owns the
-    // catalogue, so an unknown name is refused by QEMU at start.
+    // catalogue, so an unknown name is refused by QEMU at start. Under KVM
+    // the host CPU passes through unchanged.
     let (accel_name, default_cpu) = match accel {
-        Accel::Kvm => ("kvm", kvm_cpu_model(vm, paths.apic_virtualization)),
-        Accel::Tcg => ("tcg", "max".to_string()),
+        Accel::Kvm => ("kvm", "host"),
+        Accel::Tcg => ("tcg", "max"),
     };
     arg(&mut a, "accel", accel_name.into());
-    let mut cpu = vm.cpu_model.clone().unwrap_or(default_cpu);
-    // `tsc = "host"` (§5.2): an invariant TSC, pinned at the host's
-    // frequency. `+invtsc` alone makes QEMU refuse every migration — and an
-    // online snapshot is one (§7.3) — unless the frequency is explicit, so
-    // the two only ever go together.
-    if vm.tsc.is_some() && tsc_skipped(vm, accel).is_none() {
-        let hz = paths.tsc_hz.ok_or_else(|| {
-            anyhow::anyhow!("tsc = \"host\" needs the host TSC frequency (PRD §5.2)")
-        })?;
-        cpu.push_str(&format!(",+invtsc,tsc-frequency={hz}"));
-    }
+    let cpu = vm.cpu_model.clone().unwrap_or_else(|| default_cpu.into());
     arg(&mut a, "cpu", cpu);
     arg(&mut a, "smp", vm.cpus.to_string());
     arg(&mut a, "m", format!("{}M", vm.memory >> 20));
@@ -528,25 +454,6 @@ pub fn build_args(
     // host's (§7.3); otherwise QEMU's default, the host's UTC time, applies.
     if let Some(base) = &vm.rtc_base {
         arg(&mut a, "rtc", format!("base={base}"));
-    }
-    // AVIC stays on only without PIT tick re-injection (§5.2).
-    if hyperv_apicv(vm, accel, paths.apic_virtualization) == Some(true) {
-        arg(&mut a, "global", HYPERV_APICV_PIT.into());
-    }
-    // The Apple SMC (§5.2): macOS reads the OSK from it and refuses to boot
-    // where there is none, and looks for an SMBIOS baseboard (type 2) table,
-    // which QEMU only emits when asked.
-    if vm.apple_smc {
-        let key = paths
-            .apple_smc_osk
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!(crate::config::host::APPLE_SMC_OSK_REQUIRED))?;
-        arg(
-            &mut a,
-            "device",
-            format!("isa-applesmc,osk={}", key.expose().replace(',', ",,")),
-        );
-        arg(&mut a, "smbios", "type=2".into());
     }
 
     // Always headless, with a VNC display on a unix socket (§11). A
@@ -579,57 +486,11 @@ pub fn build_args(
     a.push("none".into());
 
     if let Some(log) = &paths.serial_log {
-        if paths.firmware_debug {
-            arg(
-                &mut a,
-                "chardev",
-                format!(
-                    "file,id=fwlog,path={},append=on,mux=on",
-                    log.display().to_string().replace(',', ",,")
-                ),
-            );
-            if vm.agent_transport == AgentTransport::IsaSerial {
-                arg(&mut a, "device", "isa-serial,chardev=fwlog,index=1".into());
-            } else {
-                arg(&mut a, "serial", "chardev:fwlog".into());
-            }
-            arg(
-                &mut a,
-                "device",
-                "isa-debugcon,iobase=0x402,chardev=fwlog".into(),
-            );
-        } else {
-            match vm.agent_transport {
-                // `-serial` claims ISA index 0 (COM1) before any `-device` is
-                // placed, so where the agent needs COM1 the log is placed
-                // explicitly on COM2 instead.
-                AgentTransport::IsaSerial => {
-                    arg(
-                        &mut a,
-                        "chardev",
-                        format!("file,id=serlog,path={}", log.display()),
-                    );
-                    arg(&mut a, "device", "isa-serial,chardev=serlog,index=1".into());
-                }
-                _ => arg(&mut a, "serial", format!("file:{}", log.display())),
-            }
-        }
+        arg(&mut a, "serial", format!("file:{}", log.display()));
     }
 
     // UEFI firmware: CODE read-only pflash + per-VM writable VARS.
     if vm.firmware == Some(FirmwareKind::Ovmf) {
-        if let Some((width, height)) = paths.firmware_resolution {
-            arg(
-                &mut a,
-                "fw_cfg",
-                format!("name=opt/vmlab/gop-width,string={width}"),
-            );
-            arg(
-                &mut a,
-                "fw_cfg",
-                format!("name=opt/vmlab/gop-height,string={height}"),
-            );
-        }
         let code = paths
             .firmware_code
             .as_ref()
@@ -648,49 +509,12 @@ pub fn build_args(
             "drive",
             format!("if=pflash,format=raw,file={}", vars.display()),
         );
-        if vm.secure_boot && qemu_arch(vm.arch.as_str()) == "x86_64" {
-            // SMM is required for the secboot build to enforce anything.
-            a.push("-global".into());
-            a.push("driver=cfi.pflash01,property=secure,value=on".into());
-        }
-    }
-    if vm.firmware != Some(FirmwareKind::Ovmf)
-        && qemu_arch(&vm.arch) == "x86_64"
-        && let Some(code) = &paths.seabios_code
-    {
-        arg(&mut a, "bios", code.display().to_string());
-    }
-    if vm.firmware != Some(FirmwareKind::Ovmf)
-        && qemu_arch(&vm.arch) == "x86_64"
-        && let Some(splash) = &paths.bootsplash
-    {
-        arg(
-            &mut a,
-            "boot",
-            format!(
-                "menu={},splash={},splash-time={}",
-                if paths.seabios_code.is_some() {
-                    "off"
-                } else {
-                    "on"
-                },
-                splash.display().to_string().replace(',', ",,"),
-                if paths.seabios_code.is_some() {
-                    0
-                } else {
-                    1000
-                }
-            ),
-        );
     }
 
     // Guest agent channel (§7.4): the vmlab-agent port (interactive
     // terminals / exec / files / net-info / shutdown — guest/agent-proto).
-    // QEMU listens, the daemon connects — on the same socket whichever
-    // guest-facing device carries it: the virtio-serial port a modern guest
-    // drives, or a 16550 on COM1 for a guest with no virtio drivers, where
-    // the legacy agent speaks the same protocol.
-    if vm.agent_transport.has_channel() {
+    // QEMU listens, the daemon connects.
+    if vm.agent_transport == AgentTransport::VirtioSerial {
         arg(
             &mut a,
             "chardev",
@@ -699,44 +523,22 @@ pub fn build_args(
                 paths.agent_sock.display()
             ),
         );
-    }
-    match vm.agent_transport {
-        AgentTransport::VirtioSerial => {
-            arg(&mut a, "device", "virtio-serial-pci".into());
-            arg(
-                &mut a,
-                "device",
-                format!("virtserialport,chardev=vagent0,name={}", AGENT_PORT_NAME),
-            );
-        }
-        AgentTransport::IsaSerial => {
-            arg(
-                &mut a,
-                "device",
-                "isa-serial,chardev=vagent0,index=0".into(),
-            );
-        }
-        AgentTransport::None => {}
+        arg(&mut a, "device", "virtio-serial-pci".into());
+        arg(
+            &mut a,
+            "device",
+            format!("virtserialport,chardev=vagent0,name={}", AGENT_PORT_NAME),
+        );
     }
 
     // Primary + extra disks: explicit blockdev node names (disk0, disk1, …)
-    // so QMP snapshot commands can address them (§7.3).
-    // x86 OVMF uses these paths to connect attached boot devices selectively.
-    // Its bundled build preserves the guest's persistent boot order. SeaBIOS
-    // boots install media before disks; the answer-file floppy stays unindexed.
-    let uefi_hints = vm.firmware == Some(FirmwareKind::Ovmf)
-        && qemu_arch(&vm.arch) == "x86_64"
-        && paths.firmware_boot_hints;
-    let indexed_boot = vm.firmware != Some(FirmwareKind::Ovmf) || uefi_hints;
-    let machine_kind = if vm.machine.starts_with("virt") {
-        MachineKind::Virt
-    } else if vm.machine.starts_with("q35") {
-        MachineKind::Q35
-    } else {
-        MachineKind::LegacyPc
-    };
+    // so QMP snapshot commands can address them (§7.3). `virt` has no IDE or
+    // AHCI bus, so every disk is virtio-blk whatever the profile's bus.
+    // SeaBIOS boots install media before disks; under UEFI the guest's own
+    // boot order decides.
+    let indexed_boot = vm.firmware != Some(FirmwareKind::Ovmf);
     let mut disk_index = 0usize;
-    let mut add_disk = |a: &mut Vec<String>, path: &Path, bus: DiskBus| {
+    let mut add_disk = |a: &mut Vec<String>, path: &Path| {
         let node = format!("disk{disk_index}");
         a.push("-blockdev".into());
         a.push(format!(
@@ -749,40 +551,17 @@ pub fn build_args(
         } else {
             String::new()
         };
-        match bus {
-            DiskBus::Virtio => a.push(format!("virtio-blk-pci,drive={node}{boot}")),
-            // Addressed, never auto-placed: QEMU puts an unaddressed ide-hd on
-            // the secondary master (ide.1 unit 0), in the middle of the four
-            // slots, so every CD-ROM placed after it collides with something
-            // nothing asked for. Disks take the slots from the front; the
-            // CD-ROMs below carry on from where they stop.
-            DiskBus::Ide | DiskBus::Sata => {
-                let (bus_idx, unit) = ide_slot(disk_index, &machine_kind);
-                a.push(format!(
-                    "ide-hd,drive={node},bus=ide.{bus_idx},unit={unit}{boot}"
-                ))
-            }
-        }
+        a.push(format!("virtio-blk-pci,drive={node}{boot}"));
         disk_index += 1;
     };
-    add_disk(&mut a, &paths.primary_disk, vm.disk_bus);
+    add_disk(&mut a, &paths.primary_disk);
     for (_, path) in &paths.extra_disks {
-        add_disk(&mut a, path, vm.disk_bus);
+        add_disk(&mut a, path);
     }
 
-    // CD-ROMs. The `virt` machine (aarch64 et al.) has no IDE/AHCI bus at
-    // all, so attach ISOs as read-only virtio-blk there — cloud-init's
-    // NoCloud datasource finds the CIDATA seed by filesystem label on any
-    // block device, regardless of bus. On x86 they ride IDE/SATA, which is
-    // universally bootable. q35's AHCI ports hold a single unit each and
-    // QEMU's auto-placement does not advance past the first port, so address
-    // ports explicitly there, skipping any ports the IDE/SATA disks above
-    // already claimed. Legacy `pc` IDE buses take two units and auto-place.
-    let virt = vm.machine.starts_with("virt");
-    let sata_disks = match vm.disk_bus {
-        DiskBus::Virtio => 0,
-        DiskBus::Ide | DiskBus::Sata => disk_index,
-    };
+    // CD-ROMs: read-only virtio-blk, `virt` having no IDE/AHCI bus —
+    // cloud-init's NoCloud datasource finds the CIDATA seed by filesystem
+    // label on any block device, regardless of bus.
     for (i, iso) in paths.cdroms.iter().enumerate() {
         a.push("-blockdev".into());
         a.push(format!(
@@ -802,21 +581,13 @@ pub fn build_args(
         } else {
             String::new()
         };
-        if virt {
-            a.push(format!("virtio-blk-pci,drive=cd{i}{boot}{id}"));
-        } else {
-            let (bus, unit) = ide_slot(sata_disks + i, &machine_kind);
-            a.push(format!(
-                "ide-cd,drive=cd{i},bus=ide.{bus},unit={unit}{boot}{id}"
-            ));
-        }
+        a.push(format!("virtio-blk-pci,drive=cd{i}{boot}{id}"));
     }
 
-    if let Some(floppy) = &paths.floppy {
-        arg(
-            &mut a,
-            "drive",
-            format!("if=floppy,format=raw,file={}", floppy.display()),
+    if paths.floppy.is_some() {
+        anyhow::bail!(
+            "vm \"{}\": a floppy drive is x86 hardware, and QEMU runs no x86 guest (PRD §22)",
+            vm.name
         );
     }
 
@@ -842,17 +613,12 @@ pub fn build_args(
             }
         }
         // virtio-net negotiates a jumbo MTU with the guest via `host_mtu`;
-        // e1000/pcnet don't support it reliably, so they stay at the default.
+        // other models don't support it reliably, so they stay at the default.
         let host_mtu = nic
             .mtu
             .filter(|m| *m != 1500 && vm.nic_model.starts_with("virtio-net"))
             .map(|m| format!(",host_mtu={m}"))
             .unwrap_or_default();
-        let boot = if uefi_hints {
-            format!(",bootindex={}", 90 + i)
-        } else {
-            String::new()
-        };
         let rom = paths
             .nic_rom
             .as_ref()
@@ -862,7 +628,7 @@ pub fn build_args(
             &mut a,
             "device",
             format!(
-                "{},netdev=net{i},mac={}{host_mtu}{boot}{rom}",
+                "{},netdev=net{i},mac={}{host_mtu}{rom}",
                 vm.nic_model, nic.mac
             ),
         );
@@ -873,7 +639,7 @@ pub fn build_args(
         a.push("none".into());
     }
 
-    // TPM via swtpm (§5.3).
+    // TPM via swtpm (§5.3), the sysbus TIS `virt` takes.
     if let Some(tpm_sock) = &paths.tpm_sock {
         arg(
             &mut a,
@@ -881,12 +647,7 @@ pub fn build_args(
             format!("socket,id=chrtpm,path={}", tpm_sock.display()),
         );
         arg(&mut a, "tpmdev", "emulator,id=tpm0,chardev=chrtpm".into());
-        let dev = if qemu_arch(vm.arch.as_str()) == "x86_64" {
-            "tpm-tis"
-        } else {
-            "tpm-tis-device"
-        };
-        arg(&mut a, "device", format!("{dev},tpmdev=tpm0"));
+        arg(&mut a, "device", "tpm-tis-device,tpmdev=tpm0".into());
     }
 
     // Display device / GPU modes (§5.2). Paravirt GL renders host-side with
@@ -905,18 +666,11 @@ pub fn build_args(
                 }
             }
             GpuMode::Virgl | GpuMode::Vulkan => {
-                // One display adapter, the GL one. x86 machines take the
-                // VGA-compatible form, which keeps firmware and the boot
-                // console on it and stops q35/pc adding their default std
-                // VGA; `virt` has no legacy VGA, so the pure device plus an
-                // explicit `-vga none`. A second adapter in the guest leaves
-                // Venus enumerating no device at all.
-                let dev = match machine_kind {
-                    MachineKind::Virt => "virtio-gpu-gl",
-                    MachineKind::Q35 | MachineKind::LegacyPc => "virtio-vga-gl",
-                };
-                // QEMU refuses Venus without blob resources and a hostmem
-                // window.
+                // One display adapter, the GL one: `virt` has no legacy VGA,
+                // so the pure device plus an explicit `-vga none`. A second
+                // adapter in the guest leaves Venus enumerating no device at
+                // all. QEMU refuses Venus without blob resources and a
+                // hostmem window.
                 let size = gpu.vram_bytes();
                 let hostmem = if size >= 1 << 30 {
                     format!("{}G", size >> 30)
@@ -930,10 +684,8 @@ pub fn build_args(
                 } else {
                     String::new()
                 };
-                arg(&mut a, "device", format!("{dev}{opts}"));
-                if matches!(machine_kind, MachineKind::Virt) {
-                    arg(&mut a, "vga", "none".into());
-                }
+                arg(&mut a, "device", format!("virtio-gpu-gl{opts}"));
+                arg(&mut a, "vga", "none".into());
                 // The scanout has to come from the GPU Venus renders on, or
                 // the console is black.
                 let display = match &paths.gpu_render_node {
@@ -951,50 +703,20 @@ pub fn build_args(
     }
 
     // USB tablet: absolute pointer events for screen automation (§10.3).
-    // The `virt` machine has no default USB host controller, so `-usb` is a
-    // no-op there and usb-tablet has nothing to plug into — add an explicit
-    // xHCI controller. x86 q35/pc have a default controller via `-usb`.
-    //
-    // `usb = true` (§5.2.1) wants an xHCI with a known id for host devices
-    // to hot-plug onto. `virt` already has one, so it only gains the id; x86
-    // gains a second controller beside `-usb`'s. QEMU then places the
-    // unaddressed tablet on the xHCI (verified on q35, QEMU 11.1) — one more
-    // reason the flag is opt-in: the guest's USB topology changes with it.
-    //
-    // `input = "usb"` (§5.2) adds a USB keyboard beside the tablet, for a
-    // guest that reads no PS/2 keyboard (macOS, and OpenCore before it). On
-    // x86 both go on an xHCI of their own in place of `-usb`'s controller.
-    // Neither is bound to the display: QMP `send-key` names no console, and
-    // QEMU hands such an event to the newest *unbound* keyboard — the USB
-    // one, which takes over from PS/2 when it is created — so binding it
-    // would leave scripted keys on the PS/2 keyboard the guest ignores.
-    let usbx = format!("qemu-xhci,id={}", crate::usb::CONTROLLER_ID);
-    let usb_input = vm.input == InputDevices::Usb;
-    if virt {
-        let xhci = if vm.usb { usbx } else { "qemu-xhci".into() };
-        arg(&mut a, "device", xhci);
-        if usb_input {
-            arg(&mut a, "device", "usb-kbd".into());
-        }
-        arg(&mut a, "device", "usb-tablet".into());
-    } else if usb_input {
-        arg(&mut a, "device", format!("qemu-xhci,id={INPUT_XHCI_ID}"));
-        arg(&mut a, "device", format!("usb-kbd,bus={INPUT_XHCI_ID}.0"));
-        arg(
-            &mut a,
-            "device",
-            format!("usb-tablet,bus={INPUT_XHCI_ID}.0"),
-        );
-        if vm.usb {
-            arg(&mut a, "device", usbx);
-        }
+    // The `virt` machine has no default USB host controller, so it gets an
+    // explicit xHCI — with the known id `usb = true` (§5.2.1) gives host
+    // devices to hot-plug onto. `input = "usb"` (§5.2) adds a USB keyboard
+    // beside the tablet.
+    let xhci = if vm.usb {
+        format!("qemu-xhci,id={}", crate::usb::CONTROLLER_ID)
     } else {
-        a.push("-usb".into());
-        if vm.usb {
-            arg(&mut a, "device", usbx);
-        }
-        arg(&mut a, "device", "usb-tablet".into());
+        "qemu-xhci".into()
+    };
+    arg(&mut a, "device", xhci);
+    if vm.input == InputDevices::Usb {
+        arg(&mut a, "device", "usb-kbd".into());
     }
+    arg(&mut a, "device", "usb-tablet".into());
 
     // virtiofs shares: one vhost-user-fs device per export, tag = share
     // name — the guest agent mounts by tag once the VM is ready (§7.5).
@@ -1030,97 +752,18 @@ mod tests {
     use super::super::resolve::testing::resolved_gpu_vm as resolved_gpu;
     use super::super::resolve::testing::resolved_vm as resolved;
 
-    #[test]
-    fn selective_uefi_connection_requires_patched_firmware() {
-        let vm = resolved("linux-modern", "x86_64");
-        let mut p = paths();
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(!args.contains("bootindex="), "{args}");
-        p.firmware_boot_hints = true;
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(args.contains("bootindex=50"), "{args}");
-        assert!(args.contains("bootindex=90"), "{args}");
-    }
-
-    #[test]
-    fn an_explicit_nic_rom_is_passed_to_qemu() {
-        let vm = resolved("linux-modern", "x86_64");
-        let mut p = paths();
-        p.nic_rom = Some("/fw/virtio-net.rom".into());
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(args.contains("romfile=/fw/virtio-net.rom"), "{args}");
-    }
-
-    #[test]
-    fn bundled_seabios_has_no_splash_or_menu_wait() {
-        let mut vm = resolved("linux-modern", "x86_64");
-        vm.firmware = Some(FirmwareKind::Seabios);
-        let mut p = paths();
-        p.seabios_code = Some("/fw/bios-vmlab-q35.bin".into());
-        p.bootsplash = Some("/lab/splash.jpg".into());
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(args.contains("-bios /fw/bios-vmlab-q35.bin"), "{args}");
-        assert!(
-            args.contains("menu=off,splash=/lab/splash.jpg,splash-time=0"),
-            "{args}"
-        );
-    }
-
-    #[test]
-    fn debug_port_and_uart_share_one_append_log() {
-        let vm = resolved("linux-modern", "x86_64");
-        let mut p = paths();
-        p.firmware_debug = true;
-        p.serial_log = Some("/lab/serial.log".into());
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(
-            args.contains("file,id=fwlog,path=/lab/serial.log,append=on,mux=on"),
-            "{args}"
-        );
-        assert!(args.contains("-serial chardev:fwlog"), "{args}");
-        assert!(
-            args.contains("isa-debugcon,iobase=0x402,chardev=fwlog"),
-            "{args}"
-        );
-    }
-
-    #[test]
-    fn firmware_resolution_is_two_decimal_fw_cfg_files() {
-        let mut vm = resolved("linux-modern", "x86_64");
-        let mut p = paths();
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(!args.contains("opt/vmlab/gop-"), "{args}");
-        p.firmware_resolution = Some((1024, 768));
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(
-            args.contains("name=opt/vmlab/gop-width,string=1024"),
-            "{args}"
-        );
-        assert!(
-            args.contains("name=opt/vmlab/gop-height,string=768"),
-            "{args}"
-        );
-        vm.firmware = Some(FirmwareKind::Seabios);
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap().join(" ");
-        assert!(!args.contains("opt/vmlab/gop-"), "{args}");
-    }
-
     /// Runtime paths the lab daemon would hand the builder, including the
     /// firmware it discovered on the host. Both firmware paths are always
     /// present here; `build_args` only reads them under OVMF, and no test
     /// depends on this build host shipping edk2.
     fn paths() -> VmPaths {
         VmPaths {
-            apple_smc_osk: crate::config::host::HostConfig::parse(
-                "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST\" }",
-                "<test>",
-            ).unwrap().apple_smc_osk,
             qmp_sock: "/run/l/t/qmp.sock".into(),
             agent_sock: "/run/l/t/agent.sock".into(),
             vnc_sock: "/run/l/t/vnc.sock".into(),
             primary_disk: "/lab/.vmlab/t/disk0.qcow2".into(),
-            firmware_code: Some("/usr/share/edk2/x64/OVMF_CODE.4m.fd".into()),
-            ovmf_vars: Some("/lab/.vmlab/t/OVMF_VARS.fd".into()),
+            firmware_code: Some("/usr/share/AAVMF/AAVMF_CODE.fd".into()),
+            ovmf_vars: Some("/lab/.vmlab/t/AAVMF_VARS.fd".into()),
             nics: vec![NicSpec {
                 mac: "52:54:00:00:00:01".parse().unwrap(),
                 mtu: None,
@@ -1136,21 +779,38 @@ mod tests {
         args.join(" ")
     }
 
+    fn arm() -> ResolvedVm {
+        resolved("linux-modern", "aarch64")
+    }
+
+    /// QEMU runs no x86 guest (§22): every x86 profile, 32-bit included, is
+    /// refused before any argv is composed, naming vmlab-hv.
     #[test]
-    fn splash_is_only_passed_to_x86_seabios() {
-        let mut vm = resolved("linux-modern", "x86_64");
+    fn an_x86_guest_is_refused() {
+        for (profile, arch) in [
+            ("linux-modern", "x86_64"),
+            ("windows-11", "x86_64"),
+            ("windows-legacy", "x86_64"),
+            ("windows-9x", "x86"),
+            ("macos", "x86_64"),
+        ] {
+            let vm = resolved(profile, arch);
+            let e = build_args("l", &vm, &paths(), Accel::Kvm)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("QEMU no longer runs x86 guests") && e.contains("vmlab-hv"),
+                "{profile}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_nic_rom_is_passed_to_qemu() {
         let mut p = paths();
-        p.bootsplash = Some("/lab/with,comma/bootsplash.jpg".into());
-        assert!(!joined(&build_args("lab", &vm, &p, Accel::Kvm).unwrap()).contains("splash="));
-        vm.firmware = Some(FirmwareKind::Seabios);
-        let args = build_args("lab", &vm, &p, Accel::Kvm).unwrap();
-        assert!(args.windows(2).any(|a| a[0] == "-boot"
-            && a[1] == "menu=on,splash=/lab/with,,comma/bootsplash.jpg,splash-time=1000"));
-        p.bootsplash = None;
-        assert!(!joined(&build_args("lab", &vm, &p, Accel::Kvm).unwrap()).contains("splash="));
-        p.bootsplash = Some("/lab/bootsplash.jpg".into());
-        vm.arch = "aarch64".into();
-        assert!(!joined(&build_args("lab", &vm, &p, Accel::Tcg).unwrap()).contains("splash="));
+        p.nic_rom = Some("/fw/virtio-net.rom".into());
+        let args = joined(&build_args("l", &arm(), &p, Accel::Kvm).unwrap());
+        assert!(args.contains("romfile=/fw/virtio-net.rom"), "{args}");
     }
 
     /// virtiofs shares attach as vhost-user-fs devices and flip the RAM to
@@ -1158,7 +818,7 @@ mod tests {
     /// name stability for existing snapshots).
     #[test]
     fn virtiofs_shares_shape() {
-        let vm = resolved("linux-modern", "x86_64");
+        let vm = arm();
         let mut p = paths();
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("memory-backend"), "{s}");
@@ -1166,10 +826,15 @@ mod tests {
 
         p.virtiofs_shares = vec![("mnt_src".into(), PathBuf::from("/run/l/t/vfs0.sock"))];
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(s.contains("-machine q35,memory-backend=mem0"), "{s}");
-        // 4 GiB: the linux-modern profile's memory, through the resolver.
         assert!(
-            s.contains("memory-backend-memfd,id=mem0,size=4096M,share=on"),
+            s.contains(&format!("-machine {},memory-backend=mem0", vm.machine)),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!(
+                "memory-backend-memfd,id=mem0,size={}M,share=on",
+                vm.memory >> 20
+            )),
             "{s}"
         );
         assert!(s.contains("socket,id=vfs0,path=/run/l/t/vfs0.sock"), "{s}");
@@ -1179,162 +844,76 @@ mod tests {
         );
     }
 
-    #[test]
-    fn windows11_shape() {
-        let mut p = paths();
-        p.tpm_sock = Some("/run/l/t/tpm.sock".into());
-        let vm = resolved("windows-11", "x86_64");
-        let args = build_args("lab1", &vm, &p, Accel::Kvm).unwrap();
-        let s = joined(&args);
-        assert!(s.contains("-machine q35"));
-        assert!(s.contains("-accel kvm"));
-        assert!(s.contains("-cpu host"));
-        // 4 vCPU / 8 GiB come from the windows-11 profile via the resolver.
-        assert!(s.contains("-smp 4"), "{s}");
-        assert!(s.contains("-m 8192M"), "{s}");
-        // The CODE image is whatever the daemon discovered and injected —
-        // which build the host ships is firmware.rs's business, not this
-        // builder's, so these tests pass on a host with no edk2 at all.
-        assert!(
-            s.contains("if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd"),
-            "{s}"
-        );
-        assert!(s.contains("driver=cfi.pflash01,property=secure,value=on"));
-        assert!(s.contains("virtio-blk-pci,drive=disk0"));
-        assert!(s.contains("tpm-tis,tpmdev=tpm0"));
-        assert!(s.contains("virtio-vga"));
-        assert!(
-            s.contains("socket,id=vagent0,path=/run/l/t/agent.sock"),
-            "{s}"
-        );
-        assert!(
-            s.contains("virtserialport,chardev=vagent0,name=vmlab.agent.0"),
-            "{s}"
-        );
-        assert!(s.contains("netdev=net0,mac=52:54:00:00:00:01"));
-        assert!(s.contains("-vnc unix:/run/l/t/vnc.sock"));
-        assert!(s.contains("usb-tablet"));
-        assert!(args.last().unwrap() != "-S" || s.ends_with("-S"));
-    }
-
-    #[test]
-    fn legacy_shape() {
-        let vm = resolved("windows-legacy", "x86_64");
-        let args = build_args("lab1", &vm, &paths(), Accel::Kvm).unwrap();
-        let s = joined(&args);
-        assert!(s.contains("-machine pc"));
-        assert!(!s.contains("pflash"), "SeaBIOS must not add pflash: {s}");
-        assert!(s.contains("ide-hd,drive=disk0"));
-        assert!(s.contains("e1000,netdev=net0"));
-        assert!(s.contains("-device VGA"));
-        assert!(!s.contains("tpm"));
-    }
-
-    /// Guests with no agent transport at all get no agent socket, no
-    /// virtio-serial bus and no COM device — nothing for an agent to answer
-    /// over. The serial log keeps its `-serial` shorthand on COM1.
+    /// Guests with no agent transport at all get no agent socket and no
+    /// virtio-serial bus; the serial log keeps its `-serial` shorthand.
     #[test]
     fn no_agent_transport_emits_no_agent_device() {
-        let mut vm = resolved("windows-legacy", "x86_64");
+        let mut vm = arm();
         vm.agent_transport = AgentTransport::None;
         let mut p = paths();
         p.serial_log = Some("/logs/l/t/serial.log".into());
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("virtserialport"), "{s}");
         assert!(!s.contains("virtio-serial-pci"), "{s}");
-        assert!(!s.contains("vmlab.agent.0"), "{s}");
         assert!(!s.contains("vagent0"), "{s}");
-        assert!(!s.contains("isa-serial"), "{s}");
         assert!(s.contains("-serial file:/logs/l/t/serial.log"), "{s}");
     }
 
-    /// The legacy agent's channel (§7.4): the same host socket a modern
-    /// guest's virtio port lands on, carried by a 16550 on COM1 — and the
-    /// serial log moved to COM2 so the two never contend for index 0.
+    /// The legacy agent tier rides a 16550 on COM1, which is x86's.
     #[test]
-    fn isa_serial_transport_puts_the_agent_on_com1_and_the_log_on_com2() {
-        let vm = resolved("windows-xp", "x86_64");
-        assert_eq!(vm.agent_transport, AgentTransport::IsaSerial);
-        let mut p = paths();
-        p.serial_log = Some("/logs/l/t/serial.log".into());
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(
-            s.contains("socket,id=vagent0,path=/run/l/t/agent.sock,server=on,wait=off"),
-            "{s}"
-        );
-        assert!(s.contains("isa-serial,chardev=vagent0,index=0"), "{s}");
-        assert!(
-            s.contains("file,id=serlog,path=/logs/l/t/serial.log"),
-            "{s}"
-        );
-        assert!(s.contains("isa-serial,chardev=serlog,index=1"), "{s}");
-        assert!(!s.contains("-serial file:"), "{s}");
-        assert!(!s.contains("virtserialport"), "{s}");
-        assert!(!s.contains("virtio-serial-pci"), "{s}");
+    fn the_isa_serial_transport_is_refused() {
+        let mut vm = arm();
+        vm.agent_transport = AgentTransport::IsaSerial;
+        let e = build_args("l", &vm, &paths(), Accel::Kvm)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("isa-serial"), "{e}");
     }
 
-    /// `windows-legacy` (Vista/7/2008) keeps its virtio-serial channel: that
-    /// era has virtio-win drivers, and its agent blocker is ConPTY, not the
-    /// transport (decision Q1).
     #[test]
-    fn windows_legacy_keeps_the_virtio_serial_channel() {
-        let vm = resolved("windows-legacy", "x86_64");
-        let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
-        assert!(s.contains("-machine pc"));
-        assert!(s.contains("ide-hd,drive=disk0"));
-        assert!(
-            s.contains("virtserialport,chardev=vagent0,name=vmlab.agent.0"),
-            "{s}"
-        );
-        assert!(!s.contains("isa-serial"), "{s}");
+    fn a_floppy_is_refused() {
+        let mut p = paths();
+        p.floppy = Some("/lab/.vmlab/media/drivers.img".into());
+        let e = build_args("l", &arm(), &p, Accel::Kvm)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("floppy"), "{e}");
     }
 
     #[test]
     fn tap_backend_emits_fd_netdev() {
-        let vm = resolved("linux-modern", "x86_64");
         let mut p = paths();
         p.nics[0].backend = NicBackend::Tap { child_fd: 10 };
         p.nics[0].mtu = Some(9000);
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        let s = joined(&build_args("l", &arm(), &p, Accel::Kvm).unwrap());
         assert!(s.contains("-netdev tap,id=net0,fd=10"), "{s}");
         assert!(!s.contains("addr.type=unix"), "{s}");
         // The virtio device line is backend-agnostic (host_mtu still works).
         assert!(s.contains("netdev=net0,mac=52:54:00:00:00:01,host_mtu=9000"));
     }
 
-    /// `nested` is a real switch under KVM on x86: without it the guest
-    /// sees neither VMX nor SVM, with it the host CPU passes through whole.
+    /// KVM passes the host CPU through unchanged, `nested` or not; TCG
+    /// keeps `max`; a `cpu_model` replaces either default.
     #[test]
-    fn nested_decides_whether_kvm_guests_see_vmx_svm() {
-        let mut vm = resolved("linux-modern", "x86_64");
-        assert!(!vm.nested);
-        let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
-        let cpu = args.iter().position(|a| a == "-cpu").unwrap();
-        assert_eq!(args[cpu + 1], "host,vmx=off,svm=off");
-
-        vm.nested = true;
-        let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
-        let cpu = args.iter().position(|a| a == "-cpu").unwrap();
-        assert_eq!(args[cpu + 1], "host");
-
-        // TCG keeps `max` either way.
+    fn the_cpu_is_the_host_under_kvm_max_under_tcg_or_the_declared_model() {
+        let cpu = |vm: &ResolvedVm, accel: Accel| {
+            let args = build_args("l", vm, &paths(), accel).unwrap();
+            let i = args.iter().position(|a| a == "-cpu").unwrap();
+            args[i + 1].clone()
+        };
+        let mut vm = arm();
         for nested in [false, true] {
             vm.nested = nested;
-            let s = joined(&build_args("l", &vm, &paths(), Accel::Tcg).unwrap());
-            assert!(s.contains("-cpu max "), "{s}");
+            assert_eq!(cpu(&vm, Accel::Kvm), "host");
+            assert_eq!(cpu(&vm, Accel::Tcg), "max");
         }
-    }
-
-    /// The flag comes from the vm block through the resolver.
-    #[test]
-    fn nested_resolves_from_the_vm_block() {
-        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        let v = super::super::resolve::testing::vm(
-            "vm \"t\" { template = \"scratch\" arch = \"x86_64\" profile = \"linux-modern\" disk = 1GiB nested = true }",
-        );
-        let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
-        let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
-        assert!(s.contains("-cpu host "), "{s}");
+        // The enlightenments are x86's: the host CPU stays as it was.
+        vm.hyperv = true;
+        assert_eq!(cpu(&vm, Accel::Kvm), "host");
+        assert!(hyperv_skipped(&vm, Accel::Kvm).is_some_and(|w| w.contains("x86")));
+        vm.cpu_model = Some("cortex-a72".into());
+        assert_eq!(cpu(&vm, Accel::Kvm), "cortex-a72");
+        assert_eq!(cpu(&vm, Accel::Tcg), "cortex-a72");
     }
 
     /// A fixed clock starts the RTC at the declared instant; any other clock
@@ -1343,83 +922,15 @@ mod tests {
     fn a_fixed_clock_sets_the_rtc_base() {
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
         let v = super::super::resolve::testing::vm(
-            "vm \"t\" { template = \"scratch\" arch = \"x86_64\" profile = \"linux-generic\" disk = 1GiB clock = \"2020-01-01T00:00:00Z\" }",
+            "vm \"t\" { template = \"scratch\" arch = \"aarch64\" profile = \"linux-modern\" disk = 1GiB clock = \"2020-01-01T00:00:00Z\" }",
         );
         let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
         let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
         let rtc = args.iter().position(|a| a == "-rtc").expect("-rtc");
         assert_eq!(args[rtc + 1], "base=2020-01-01T00:00:00");
 
-        let host = resolved("linux-generic", "x86_64");
-        let args = build_args("l", &host, &paths(), Accel::Kvm).unwrap();
+        let args = build_args("l", &arm(), &paths(), Accel::Kvm).unwrap();
         assert!(!args.iter().any(|a| a == "-rtc"), "{args:?}");
-    }
-
-    /// A profile whose guest reads the RTC as local time (#166) starts it at
-    /// the host's: `base=localtime` for the host's clock, and a fixed instant
-    /// as the host's wall clock at it. A Windows profile on the Rust agent
-    /// keeps QEMU's UTC default — its agent tells the guest so.
-    #[test]
-    fn a_local_rtc_profile_starts_the_rtc_at_local_time() {
-        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        let rtc_of = |vm: &super::super::resolve::ResolvedVm| {
-            let args = build_args("l", vm, &paths(), Accel::Kvm).unwrap();
-            args.iter()
-                .position(|a| a == "-rtc")
-                .map(|i| args[i + 1].clone())
-        };
-        for profile in ["windows-xp", "windows-9x"] {
-            let host = resolved(profile, "x86_64");
-            assert_eq!(
-                rtc_of(&host).as_deref(),
-                Some("base=localtime"),
-                "{profile}"
-            );
-            let v = super::super::resolve::testing::vm(&format!(
-                "vm \"t\" {{ template = \"scratch\" arch = \"x86_64\" profile = \"{profile}\" disk = 1GiB clock = \"2020-01-01T00:00:00Z\" }}"
-            ));
-            let fixed = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
-            let at = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z").unwrap();
-            let local = at
-                .with_timezone(&chrono::Local)
-                .naive_local()
-                .format("%Y-%m-%dT%H:%M:%S");
-            assert_eq!(rtc_of(&fixed), Some(format!("base={local}")), "{profile}");
-        }
-        for profile in ["windows-11", "windows-server", "windows-legacy"] {
-            assert_eq!(rtc_of(&resolved(profile, "x86_64")), None, "{profile}");
-        }
-    }
-
-    /// A resolved `cpu_model` replaces the accelerator default under both
-    /// KVM and TCG — the guest sees the CPU it was declared, not the host's
-    /// (Windows 9x Setup on a modern host). Unset, both defaults stand.
-    #[test]
-    fn a_cpu_model_replaces_the_default_under_kvm_and_tcg() {
-        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        let v = super::super::resolve::testing::vm(
-            "vm \"t\" { template = \"scratch\" arch = \"x86\" profile = \"windows-9x\" disk = 1GiB cpu_model = \"pentium3\" }",
-        );
-        let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
-        for accel in [Accel::Kvm, Accel::Tcg] {
-            let args = build_args("l", &vm, &paths(), accel).unwrap();
-            let cpus: Vec<&String> = args
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| *a == "-cpu")
-                .map(|(i, _)| &args[i + 1])
-                .collect();
-            assert_eq!(cpus, ["pentium3"], "{accel:?}");
-        }
-
-        let unset = resolved("windows-9x", "x86");
-        assert_eq!(unset.cpu_model, None);
-        let kvm = build_args("l", &unset, &paths(), Accel::Kvm).unwrap();
-        let cpu = kvm.iter().position(|a| a == "-cpu").unwrap();
-        assert_eq!(kvm[cpu + 1], "host,vmx=off,svm=off");
-        let tcg = build_args("l", &unset, &paths(), Accel::Tcg).unwrap();
-        let cpu = tcg.iter().position(|a| a == "-cpu").unwrap();
-        assert_eq!(tcg[cpu + 1], "max");
     }
 
     /// Unset `accel` keeps vmlab's choice: KVM where usable, else the TCG
@@ -1431,7 +942,7 @@ mod tests {
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
         let with = |accel: &str| {
             let v = super::super::resolve::testing::vm(&format!(
-                "vm \"t\" {{ template = \"scratch\" arch = \"x86\" profile = \"windows-9x\" disk = 1GiB {accel} }}"
+                "vm \"t\" {{ template = \"scratch\" arch = \"aarch64\" profile = \"linux-modern\" disk = 1GiB {accel} }}"
             ));
             super::super::resolve::resolve_vm(&v, None, &profiles).unwrap()
         };
@@ -1454,109 +965,6 @@ mod tests {
         assert_eq!(AccelPlan::Kvm.accel(), Accel::Kvm);
         assert_eq!(AccelPlan::Tcg.accel(), Accel::Tcg);
         assert_eq!(AccelPlan::TcgFallback.accel(), Accel::Tcg);
-    }
-
-    /// A requested TCG emits `-accel tcg` with TCG's own `-cpu max` default,
-    /// unless a `cpu_model` names another (Windows 95 on an AMD host).
-    #[test]
-    fn a_requested_tcg_builds_a_tcg_argv() {
-        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        let build = |extra: &str| {
-            let v = super::super::resolve::testing::vm(&format!(
-                "vm \"t\" {{ template = \"scratch\" arch = \"x86\" profile = \"windows-9x\" disk = 1GiB accel = \"tcg\" {extra} }}"
-            ));
-            let vm = super::super::resolve::resolve_vm(&v, None, &profiles).unwrap();
-            let plan = plan_accel(&vm, true).unwrap();
-            joined(&build_args("l", &vm, &paths(), plan.accel()).unwrap())
-        };
-        let s = build("");
-        assert!(s.contains("-accel tcg -cpu max "), "{s}");
-        let s = build("cpu_model = \"pentium3\"");
-        assert!(s.contains("-accel tcg -cpu pentium3 "), "{s}");
-    }
-
-    /// Every combination `hyperv` meets (§5.2): the flags ride the KVM
-    /// `-cpu host` string on x86, with `nested` or without; TCG keeps `max`,
-    /// a `cpu_model` keeps the model, a non-x86 guest keeps `host`, and each
-    /// of those says why. `hyperv = false` (or unset) never adds them.
-    #[test]
-    fn hyperv_adds_the_enlightenments_under_kvm_on_the_host_cpu_only() {
-        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        let resolve = |profile: &str, arch: &str, extra: &str| {
-            let v = super::super::resolve::testing::vm(&format!(
-                "vm \"t\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"{profile}\" \
-                 disk = 1GiB {extra} }}"
-            ));
-            super::super::resolve::resolve_vm(&v, None, &profiles).unwrap()
-        };
-        let cpu = |vm: &super::super::resolve::ResolvedVm, accel: Accel| {
-            let args = build_args("l", vm, &paths(), accel).unwrap();
-            let i = args.iter().position(|a| a == "-cpu").unwrap();
-            args[i + 1].clone()
-        };
-        let flags = "hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,\
-                     hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,hv-ipi";
-        assert_eq!(HYPERV_FLAGS, flags);
-        assert!(!HYPERV_FLAGS.contains("invtsc"));
-
-        // The shipped profiles that set it, under KVM.
-        for profile in [
-            "windows-11",
-            "windows-10",
-            "windows-server",
-            "windows-legacy",
-        ] {
-            for arch in ["x86_64", "x86"] {
-                let vm = resolve(profile, arch, "");
-                assert!(vm.hyperv, "{profile}");
-                assert_eq!(
-                    cpu(&vm, Accel::Kvm),
-                    format!("host,vmx=off,svm=off,{flags}"),
-                    "{profile} {arch}"
-                );
-                assert_eq!(hyperv_skipped(&vm, Accel::Kvm), None, "{profile}");
-                // Under TCG: `max`, and the reason.
-                assert_eq!(cpu(&vm, Accel::Tcg), "max", "{profile}");
-                assert!(
-                    hyperv_skipped(&vm, Accel::Tcg).is_some_and(|w| w.contains("TCG")),
-                    "{profile}"
-                );
-            }
-        }
-        // With `nested`: the whole host CPU, plus the flags.
-        let nested = resolve("windows-11", "x86_64", "nested = true");
-        assert_eq!(cpu(&nested, Accel::Kvm), format!("host,{flags}"));
-        assert_eq!(cpu(&nested, Accel::Tcg), "max");
-        // A named model replaces the host CPU, flags and all, either way.
-        let model = resolve("windows-11", "x86_64", "cpu_model = \"Skylake-Client\"");
-        assert!(model.hyperv);
-        assert_eq!(cpu(&model, Accel::Kvm), "Skylake-Client");
-        assert_eq!(cpu(&model, Accel::Tcg), "Skylake-Client");
-        assert!(hyperv_skipped(&model, Accel::Kvm).is_some_and(|w| w.contains("cpu_model")));
-        // Opted out on the vm block: the old string, nothing to say.
-        for extra in ["hyperv = false", "hyperv = false nested = true"] {
-            let off = resolve("windows-server", "x86_64", extra);
-            assert!(!off.hyperv);
-            assert!(!cpu(&off, Accel::Kvm).contains("hv-"), "{extra}");
-            assert_eq!(hyperv_skipped(&off, Accel::Kvm), None);
-            assert_eq!(hyperv_skipped(&off, Accel::Tcg), None);
-        }
-        // Profiles that do not set it: no flags, nothing to say.
-        for profile in ["windows-xp", "windows-9x", "linux-modern"] {
-            let vm = resolve(profile, "x86_64", "");
-            assert_eq!(cpu(&vm, Accel::Kvm), "host,vmx=off,svm=off", "{profile}");
-            assert_eq!(hyperv_skipped(&vm, Accel::Tcg), None, "{profile}");
-        }
-        // Opted in where the profile does not: on.
-        let xp = resolve("windows-xp", "x86_64", "hyperv = true");
-        assert_eq!(
-            cpu(&xp, Accel::Kvm),
-            format!("host,vmx=off,svm=off,{flags}")
-        );
-        // Not x86: the host CPU unchanged, and the reason.
-        let arm = resolve("linux-modern", "aarch64", "hyperv = true");
-        assert_eq!(cpu(&arm, Accel::Kvm), "host");
-        assert!(hyperv_skipped(&arm, Accel::Kvm).is_some_and(|w| w.contains("x86")));
     }
 
     /// `up` speaks only for a `hyperv = true` the vm block itself set and
@@ -1595,13 +1003,17 @@ mod tests {
         assert_eq!(hyperv_not_applied(declared, &off, Accel::Tcg), None);
     }
 
-    /// Non-x86 KVM has no VMX/SVM to mask.
+    /// `tsc = "host"` is said when TCG leaves it off.
     #[test]
-    fn nested_masking_is_x86_only() {
-        let vm = resolved("linux-modern", "aarch64");
-        let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
-        let cpu = args.iter().position(|a| a == "-cpu").unwrap();
-        assert_eq!(args[cpu + 1], "host");
+    fn a_pinned_tsc_is_said_under_tcg() {
+        let vm = resolved("macos", "x86_64");
+        let said = tsc_not_applied(&vm, Accel::Tcg).unwrap();
+        assert!(said.contains("tsc = \"host\" is not applied"), "{said}");
+        assert_eq!(tsc_not_applied(&vm, Accel::Kvm), None);
+        assert_eq!(
+            tsc_not_applied(&resolved("linux-modern", "x86_64"), Accel::Tcg),
+            None
+        );
     }
 
     #[test]
@@ -1636,82 +1048,6 @@ mod tests {
         assert_eq!(host_nested_problem_in(sys.path()), None);
     }
 
-    /// With the host's APIC virtualised, an enlightened guest gains `hv-avic`
-    /// and the PIT stops re-injecting, together and only together (§5.2);
-    /// the host fact changes nothing for a guest the enlightenments skip.
-    #[test]
-    fn apic_virtualization_adds_hv_avic_and_drops_pit_reinjection_for_hyperv_only() {
-        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        let resolve = |profile: &str, arch: &str, extra: &str| {
-            let v = super::super::resolve::testing::vm(&format!(
-                "vm \"t\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"{profile}\" \
-                 disk = 1GiB {extra} }}"
-            ));
-            super::super::resolve::resolve_vm(&v, None, &profiles).unwrap()
-        };
-        let argv = |vm: &super::super::resolve::ResolvedVm, accel: Accel, apicv: bool| {
-            let p = VmPaths {
-                apic_virtualization: apicv,
-                ..paths()
-            };
-            build_args("l", vm, &p, accel).unwrap()
-        };
-        let cpu = |args: &[String]| {
-            let i = args.iter().position(|a| a == "-cpu").unwrap();
-            args[i + 1].clone()
-        };
-        let pit = |args: &[String]| {
-            args.windows(2)
-                .filter(|w| w[0] == "-global" && w[1] == HYPERV_APICV_PIT)
-                .count()
-        };
-        assert_eq!(HYPERV_APICV_FLAG, "hv-avic");
-        assert_eq!(HYPERV_APICV_PIT, "kvm-pit.lost_tick_policy=discard");
-
-        for profile in ["windows-11", "windows-server", "windows-legacy"] {
-            let vm = resolve(profile, "x86_64", "");
-            let on = argv(&vm, Accel::Kvm, true);
-            assert_eq!(
-                cpu(&on),
-                format!("host,vmx=off,svm=off,{HYPERV_FLAGS},hv-avic"),
-                "{profile}"
-            );
-            assert_eq!(pit(&on), 1, "{profile}");
-            // Without APICv/AVIC: the flags alone, the PIT left as it was.
-            let off = argv(&vm, Accel::Kvm, false);
-            assert_eq!(
-                cpu(&off),
-                format!("host,vmx=off,svm=off,{HYPERV_FLAGS}"),
-                "{profile}"
-            );
-            assert_eq!(pit(&off), 0, "{profile}");
-            // Under TCG the enlightenments are skipped, and so is this.
-            let tcg = argv(&vm, Accel::Tcg, true);
-            assert_eq!(cpu(&tcg), "max");
-            assert_eq!(pit(&tcg), 0);
-        }
-        // `nested` keeps it; a named model, `hyperv = false`, a profile
-        // without the enlightenments and a non-x86 guest get neither.
-        let nested = argv(
-            &resolve("windows-11", "x86_64", "nested = true"),
-            Accel::Kvm,
-            true,
-        );
-        assert_eq!(cpu(&nested), format!("host,{HYPERV_FLAGS},hv-avic"));
-        assert_eq!(pit(&nested), 1);
-        for (profile, arch, extra) in [
-            ("windows-11", "x86_64", "cpu_model = \"Skylake-Client\""),
-            ("windows-server", "x86_64", "hyperv = false"),
-            ("windows-xp", "x86_64", ""),
-            ("linux-modern", "x86_64", ""),
-            ("linux-modern", "aarch64", "hyperv = true"),
-        ] {
-            let args = argv(&resolve(profile, arch, extra), Accel::Kvm, true);
-            assert!(!cpu(&args).contains("hv-avic"), "{profile} {extra}");
-            assert_eq!(pit(&args), 0, "{profile} {extra}");
-        }
-    }
-
     #[test]
     fn host_apic_virtualization_reads_either_vendors_parameter() {
         let sys = tempfile::tempdir().unwrap();
@@ -1733,12 +1069,31 @@ mod tests {
         assert!(host_apic_virtualization_in(sys.path()));
     }
 
+    /// The ignore_msrs check reads the kvm module's parameter, and names the
+    /// fix when it is off.
+    #[test]
+    fn host_msrs_off_is_named_with_its_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = dir.path().join("kvm/parameters");
+        assert_eq!(host_msrs_problem_in(dir.path()), None, "no kvm module");
+        std::fs::create_dir_all(&params).unwrap();
+        std::fs::write(params.join("ignore_msrs"), "Y\n").unwrap();
+        assert_eq!(host_msrs_problem_in(dir.path()), None);
+        std::fs::write(params.join("ignore_msrs"), "N\n").unwrap();
+        let said = host_msrs_problem_in(dir.path()).unwrap();
+        assert!(said.contains("ignore_msrs = N"), "{said}");
+        assert!(
+            said.contains("options kvm ignore_msrs=1 report_ignored_msrs=0"),
+            "{said}"
+        );
+        assert!(said.contains("/etc/modprobe.d/"), "{said}");
+    }
+
     #[test]
     fn no_nics_means_nic_none() {
-        let vm = resolved("linux-modern", "x86_64");
         let mut p = paths();
         p.nics.clear();
-        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        let s = joined(&build_args("l", &arm(), &p, Accel::Tcg).unwrap());
         assert!(s.contains("-nic none"));
         assert!(s.contains("-accel tcg"));
         assert!(s.contains("-cpu max"));
@@ -1746,8 +1101,7 @@ mod tests {
 
     #[test]
     fn jumbo_mtu_sets_host_mtu_on_virtio_only() {
-        // virtio-net guest on a jumbo segment gets host_mtu=.
-        let vm = resolved("linux-modern", "x86_64");
+        let mut vm = arm();
         assert!(vm.nic_model.starts_with("virtio-net"));
         let mut p = paths();
         p.nics[0].mtu = Some(9000);
@@ -1755,15 +1109,12 @@ mod tests {
         assert!(s.contains("host_mtu=9000"), "{s}");
 
         // 1500 is the default — no host_mtu emitted even on virtio.
-        let mut p = paths();
         p.nics[0].mtu = Some(1500);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("host_mtu"), "{s}");
 
-        // Legacy e1000 NICs never get host_mtu, even on a jumbo segment.
-        let vm = resolved("windows-legacy", "x86_64");
-        assert!(!vm.nic_model.starts_with("virtio-net"));
-        let mut p = paths();
+        // Another model never gets host_mtu, even on a jumbo segment.
+        vm.nic_model = "e1000".into();
         p.nics[0].mtu = Some(9000);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("host_mtu"), "{s}");
@@ -1771,7 +1122,7 @@ mod tests {
 
     #[test]
     fn qemu_args_go_last() {
-        let mut vm = resolved("linux-generic", "x86_64");
+        let mut vm = arm();
         vm.qemu_args = vec!["-device".into(), "weird-thing".into()];
         let args = build_args("l", &vm, &paths(), Accel::Kvm).unwrap();
         assert_eq!(
@@ -1781,42 +1132,10 @@ mod tests {
     }
 
     #[test]
-    fn cdroms_and_floppy_attach() {
-        let vm = resolved("windows-legacy", "x86_64");
-        let mut p = paths();
-        p.cdroms = vec![
-            "/isos/win.iso".into(),
-            "/lab/.vmlab/media/unattend.iso".into(),
-        ];
-        p.floppy = Some("/lab/.vmlab/media/drivers.img".into());
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(s.contains("ide-cd,drive=cd0"));
-        assert!(s.contains("ide-cd,drive=cd1"));
-        assert!(s.contains("if=floppy,format=raw,file=/lab/.vmlab/media/drivers.img"));
-    }
-
-    /// `vulkan` on q35 is the VGA-compatible Venus device with blob
-    /// resources, so q35 adds no std VGA beside it.
-    #[test]
-    fn vulkan_on_q35_is_one_vga_venus_device_with_blob() {
-        let s = joined(
-            &build_args("l", &resolved_gpu("vulkan", "x86_64"), &paths(), Accel::Kvm).unwrap(),
-        );
-        assert!(s.contains("-machine q35"), "{s}");
-        assert!(
-            s.contains("-device virtio-vga-gl,venus=true,blob=true,hostmem=4G"),
-            "{s}"
-        );
-        assert!(!s.contains("virtio-gpu-gl"), "{s}");
-        assert!(!s.contains("-vga none"), "{s}");
-        assert!(s.contains("-display egl-headless"), "{s}");
-    }
-
-    #[test]
     fn gpu_vram_reaches_qemu_hostmem() {
         for mode in ["virgl", "vulkan"] {
             for (size, expected) in [(256 << 20, "256M"), (16 << 30, "16G"), (256 << 30, "256G")] {
-                let mut vm = resolved_gpu(mode, "x86_64");
+                let mut vm = resolved_gpu(mode, "aarch64");
                 vm.gpu.as_mut().unwrap().vram = Some(size);
                 let s = joined(&build_args("l", &vm, &paths(), Accel::Kvm).unwrap());
                 assert!(s.contains(&format!("blob=true,hostmem={expected}")), "{s}");
@@ -1843,22 +1162,18 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("-vga none"), "{s}");
+        assert!(s.contains("-display egl-headless"), "{s}");
     }
 
     /// `virgl` gets the same one-adapter treatment, without the Venus
     /// options.
     #[test]
-    fn virgl_is_one_gl_adapter_on_q35_and_virt() {
-        let s = joined(
-            &build_args("l", &resolved_gpu("virgl", "x86_64"), &paths(), Accel::Kvm).unwrap(),
-        );
-        assert!(s.contains("-device virtio-vga-gl "), "{s}");
-        assert!(!s.contains("venus"), "{s}");
-        assert!(!s.contains("-vga none"), "{s}");
+    fn virgl_is_one_gl_adapter_on_virt() {
         let s = joined(
             &build_args("l", &resolved_gpu("virgl", "aarch64"), &paths(), Accel::Tcg).unwrap(),
         );
         assert!(s.contains("-device virtio-gpu-gl "), "{s}");
+        assert!(!s.contains("venus"), "{s}");
         assert!(s.contains("-vga none"), "{s}");
     }
 
@@ -1866,7 +1181,7 @@ mod tests {
     /// lab daemon picked, and with none picked refuses rather than guess.
     #[test]
     fn passthrough_hands_over_the_picked_host_gpu() {
-        let vm = resolved_gpu("passthrough", "x86_64");
+        let vm = resolved_gpu("passthrough", "aarch64");
         let mut p = paths();
         let e = build_args("l", &vm, &p, Accel::Kvm)
             .unwrap_err()
@@ -1881,7 +1196,7 @@ mod tests {
     /// the argv names none.
     #[test]
     fn a_qemu_data_dir_becomes_dash_l() {
-        let vm = resolved_gpu("vulkan", "x86_64");
+        let vm = resolved_gpu("vulkan", "aarch64");
         let mut p = paths();
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("-L "), "{s}");
@@ -1898,7 +1213,7 @@ mod tests {
         p.gpu_render_node = Some("/dev/dri/renderD129".into());
         for mode in ["virgl", "vulkan"] {
             let s =
-                joined(&build_args("l", &resolved_gpu(mode, "x86_64"), &p, Accel::Kvm).unwrap());
+                joined(&build_args("l", &resolved_gpu(mode, "aarch64"), &p, Accel::Kvm).unwrap());
             assert!(
                 s.contains("-display egl-headless,rendernode=/dev/dri/renderD129"),
                 "{s}"
@@ -1910,9 +1225,7 @@ mod tests {
     /// is a separate viewer the CLI launches (§11), never QEMU's own GTK.
     #[test]
     fn always_headless_with_vnc() {
-        let vm = resolved("linux-modern", "x86_64");
-        let p = paths();
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        let s = joined(&build_args("l", &arm(), &paths(), Accel::Kvm).unwrap());
         assert!(s.contains("-display none"), "{s}");
         assert!(!s.contains("gtk"), "{s}");
         assert!(s.contains("-vnc unix:"), "{s}");
@@ -1923,7 +1236,7 @@ mod tests {
     /// mandatory (no SeaBIOS fallback). swtpm uses the MMIO tpm-tis-device.
     #[test]
     fn aarch64_virt_shape() {
-        let mut vm = resolved("linux-modern", "aarch64");
+        let mut vm = arm();
         vm.tpm = true;
         let mut p = paths();
         p.tpm_sock = Some("/run/l/t/tpm.sock".into());
@@ -1935,174 +1248,18 @@ mod tests {
             s.contains("virtio-blk-pci,drive=cd0"),
             "CD-ROM must ride virtio on virt: {s}"
         );
-        assert!(!s.contains("ide-cd"), "no IDE on virt: {s}");
+        assert!(!s.contains("ide-"), "no IDE on virt: {s}");
         assert!(s.contains("qemu-xhci"), "explicit USB controller: {s}");
         assert!(!s.contains("-usb "), "no bare -usb on virt: {s}");
         assert!(s.contains("usb-tablet"), "{s}");
         assert!(s.contains("virtio-gpu-pci"), "{s}");
         assert!(s.contains("tpm-tis-device,tpmdev=tpm0"), "{s}");
         assert!(s.contains("virtio-blk-pci,drive=disk0"), "{s}");
-    }
-
-    /// The `macos` profile's argv (§5.2) is Phase 0's working command line,
-    /// with vmlab's own ids, paths and plumbing around it: the Skylake model
-    /// with the VMware leaf and an invariant TSC pinned at the frequency the
-    /// lab daemon handed in, the Apple SMC and an SMBIOS type 2 table, OVMF
-    /// without secure boot, AHCI disks, VMware SVGA, a USB keyboard and
-    /// tablet on their own xHCI, virtio-net and the agent's virtio-serial
-    /// port, and no TPM.
-    #[test]
-    fn macos_shape_is_phase_0s_command_line() {
-        let vm = resolved("macos", "x86_64");
-        let mut p = paths();
-        p.extra_disks = vec![("oc".into(), "/lab/.vmlab/t/disk-oc.qcow2".into())];
-        p.serial_log = Some("/logs/l/t/serial.log".into());
-        p.tsc_hz = Some(4_291_956_000);
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert_eq!(
-            s,
-            "-name vmlab:l/t -machine q35 -accel kvm \
-             -cpu Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on,\
-             +invtsc,tsc-frequency=4291956000 \
-             -smp 4 -m 8192M \
-             -device isa-applesmc,osk=TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST \
-             -smbios type=2 \
-             -display none -vnc unix:/run/l/t/vnc.sock,share=ignore \
-             -qmp unix:/run/l/t/qmp.sock,server=on,wait=off -monitor none \
-             -serial file:/logs/l/t/serial.log \
-             -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
-             -drive if=pflash,format=raw,file=/lab/.vmlab/t/OVMF_VARS.fd \
-             -chardev socket,id=vagent0,path=/run/l/t/agent.sock,server=on,wait=off \
-             -device virtio-serial-pci \
-             -device virtserialport,chardev=vagent0,name=vmlab.agent.0 \
-             -blockdev driver=qcow2,node-name=disk0,file.driver=file,file.filename=/lab/.vmlab/t/disk0.qcow2 \
-             -device ide-hd,drive=disk0,bus=ide.0,unit=0 \
-             -blockdev driver=qcow2,node-name=disk1,file.driver=file,file.filename=/lab/.vmlab/t/disk-oc.qcow2 \
-             -device ide-hd,drive=disk1,bus=ide.1,unit=0 \
-             -netdev stream,id=net0,server=off,addr.type=unix,addr.path=/run/l/t/nic0.sock \
-             -device virtio-net-pci,netdev=net0,mac=52:54:00:00:00:01 \
-             -device vmware-svga \
-             -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
-             -S"
-        );
-        // Unaddressed PCI devices on q35 land on pcie.0 — where QEMU keeps a
-        // virtio device transitional, the mode AppleVirtIO drives.
-        assert!(!s.contains("pcie-root-port"), "{s}");
-    }
-
-    #[test]
-    fn apple_smc_requires_the_host_key_and_escapes_commas() {
-        let vm = resolved("macos", "x86_64");
-        let mut p = paths();
-        p.tsc_hz = Some(3_000_000_000);
-        p.apple_smc_osk = None;
-        let error = build_args("l", &vm, &p, Accel::Kvm).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            crate::config::host::APPLE_SMC_OSK_REQUIRED
-        );
-        let key = ",".repeat(64);
-        p.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse(key).unwrap());
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap();
-        assert!(args.contains(&format!("isa-applesmc,osk={}", ",,".repeat(64))));
-        assert!(!format!("{p:?}").contains(&",".repeat(64)));
-    }
-
-    /// `tsc = "host"` needs the frequency the lab daemon reads; under TCG,
-    /// where there is no KVM to read it from, it is left off and said.
-    #[test]
-    fn a_pinned_tsc_needs_kvm_and_a_frequency() {
-        let vm = resolved("macos", "x86_64");
-        let mut p = paths();
-        let err = build_args("l", &vm, &p, Accel::Kvm).unwrap_err();
-        assert!(err.to_string().contains("host TSC frequency"), "{err}");
-        p.tsc_hz = Some(3_000_000_000);
-        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
-        assert!(!s.contains("invtsc") && !s.contains("tsc-frequency"), "{s}");
-        let said = tsc_not_applied(&vm, Accel::Tcg).unwrap();
-        assert!(said.contains("tsc = \"host\" is not applied"), "{said}");
-        assert_eq!(tsc_not_applied(&vm, Accel::Kvm), None);
-        assert_eq!(
-            tsc_not_applied(&resolved("linux-modern", "x86_64"), Accel::Tcg),
-            None
-        );
-        // On the host CPU too: the pin follows the accelerator default.
-        let mut host = resolved("linux-modern", "x86_64");
-        host.tsc = Some(crate::config::model::TscMode::Host);
-        let s = joined(&build_args("l", &host, &p, Accel::Kvm).unwrap());
         assert!(
-            s.contains("-cpu host,vmx=off,svm=off,+invtsc,tsc-frequency=3000000000"),
+            s.contains("virtserialport,chardev=vagent0,name=vmlab.agent.0"),
             "{s}"
         );
-    }
-
-    /// `input = "usb"` beside `usb = true`: the input xHCI and the
-    /// passthrough one are separate controllers, and `-usb` is not used.
-    #[test]
-    fn usb_input_and_usb_passthrough_are_two_controllers() {
-        let mut vm = resolved("macos", "x86_64");
-        vm.usb = true;
-        let mut p = paths();
-        p.tsc_hz = Some(1);
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(s.contains("-device qemu-xhci,id=xhci "), "{s}");
-        assert!(s.contains("-device qemu-xhci,id=usbx"), "{s}");
-        assert!(!s.contains("-usb "), "{s}");
-        // Without `apple_smc`, no SMC and no SMBIOS table.
-        vm.apple_smc = false;
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(!s.contains("applesmc") && !s.contains("-smbios"), "{s}");
-    }
-
-    /// The ignore_msrs check reads the kvm module's parameter, and names the
-    /// fix when it is off.
-    #[test]
-    fn host_msrs_off_is_named_with_its_fix() {
-        let dir = tempfile::tempdir().unwrap();
-        let params = dir.path().join("kvm/parameters");
-        assert_eq!(host_msrs_problem_in(dir.path()), None, "no kvm module");
-        std::fs::create_dir_all(&params).unwrap();
-        std::fs::write(params.join("ignore_msrs"), "Y\n").unwrap();
-        assert_eq!(host_msrs_problem_in(dir.path()), None);
-        std::fs::write(params.join("ignore_msrs"), "N\n").unwrap();
-        let said = host_msrs_problem_in(dir.path()).unwrap();
-        assert!(said.contains("ignore_msrs = N"), "{said}");
-        assert!(
-            said.contains("options kvm ignore_msrs=1 report_ignored_msrs=0"),
-            "{said}"
-        );
-        assert!(said.contains("/etc/modprobe.d/"), "{said}");
-    }
-
-    /// `usb = true` (§5.2.1): an xHCI with the fixed id host devices
-    /// hot-plug onto. q35 gains it beside `-usb`; `virt` names the xHCI it
-    /// already has rather than adding a second.
-    #[test]
-    fn usb_passthrough_controller() {
-        let p = paths();
-        let mut vm = resolved("linux-modern", "x86_64");
-        assert!(!vm.usb, "off by default");
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(!s.contains("qemu-xhci"), "no controller unasked: {s}");
-        assert!(s.contains("-usb "), "{s}");
-
-        vm.usb = true;
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(s.contains("-device qemu-xhci,id=usbx"), "{s}");
-        assert!(s.contains("-usb "), "the default controllers stay: {s}");
-
-        let mut vm = resolved("linux-modern", "aarch64");
-        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
-        assert!(s.contains("-device qemu-xhci "), "{s}");
-        assert!(!s.contains("id=usbx"), "{s}");
-        vm.usb = true;
-        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
-        assert_eq!(
-            s.matches("qemu-xhci").count(),
-            1,
-            "one controller on virt: {s}"
-        );
-        assert!(s.contains("-device qemu-xhci,id=usbx"), "{s}");
+        assert!(s.ends_with("-S"), "{s}");
     }
 
     /// riscv64 shares the aarch64 `virt` path (virtio CD-ROMs, explicit
@@ -2121,7 +1278,7 @@ mod tests {
             s.contains("virtio-blk-pci,drive=cd0"),
             "CD-ROM must ride virtio on virt: {s}"
         );
-        assert!(!s.contains("ide-cd"), "no IDE on virt: {s}");
+        assert!(!s.contains("ide-"), "no IDE on virt: {s}");
         assert!(s.contains("qemu-xhci"), "explicit USB controller: {s}");
         assert!(!s.contains("-usb "), "no bare -usb on virt: {s}");
         assert!(s.contains("usb-tablet"), "{s}");
@@ -2129,42 +1286,46 @@ mod tests {
         assert!(s.contains("virtio-blk-pci,drive=disk0"), "{s}");
     }
 
-    /// Two CD-ROMs on q35 must land on distinct AHCI ports (a port holds a
-    /// single unit; auto-placement would stack them on ide.0 and fail).
+    /// `usb = true` (§5.2.1): `virt` names the xHCI it already has rather
+    /// than adding a second, and `input = "usb"` adds a keyboard to it.
     #[test]
-    fn q35_cdroms_get_their_own_ahci_ports() {
-        let vm = resolved("linux-modern", "x86_64");
-        let mut p = paths();
-        p.cdroms = vec![
-            "/isos/installer.iso".into(),
-            "/lab/.vmlab/media/cidata.iso".into(),
-        ];
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(s.contains("ide-cd,drive=cd0,bus=ide.0"), "{s}");
-        assert!(s.contains("ide-cd,drive=cd1,bus=ide.1"), "{s}");
+    fn usb_passthrough_controller_and_usb_input() {
+        let p = paths();
+        let mut vm = arm();
+        assert!(!vm.usb, "off by default");
+        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        assert!(s.contains("-device qemu-xhci "), "{s}");
+        assert!(!s.contains("id=usbx"), "{s}");
+        assert!(!s.contains("usb-kbd"), "{s}");
+        vm.usb = true;
+        vm.input = InputDevices::Usb;
+        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        assert_eq!(
+            s.matches("qemu-xhci").count(),
+            1,
+            "one controller on virt: {s}"
+        );
+        assert!(s.contains("-device qemu-xhci,id=usbx"), "{s}");
+        assert!(s.contains("-device usb-kbd -device usb-tablet"), "{s}");
     }
 
-    /// A legacy `pc` guest fills its four IDE slots in order: the disk, then
-    /// every CD-ROM. Nothing is auto-placed — QEMU drops an unaddressed
-    /// `ide-hd` on the secondary master, mid-list, and its CD auto-placement
-    /// will not advance past the first bus, so the pair collide with "IDE unit
-    /// N is in use" and refuse the whole command line.
+    /// Disks and CD-ROMs are boot-indexed under SeaBIOS only; under UEFI the
+    /// guest's own boot order decides. The disks are virtio-blk whatever the
+    /// profile's bus.
     #[test]
-    fn legacy_pc_fills_its_four_ide_slots_in_order() {
-        let vm = resolved("windows-legacy", "x86_64");
-        assert!(!vm.machine.starts_with("q35"), "profile must be legacy pc");
+    fn disks_are_virtio_and_boot_indexed_outside_uefi() {
+        let mut vm = arm();
         let mut p = paths();
-        // The Option 3 shape: install media, unattend+drivers, bootstrap ISO.
-        p.cdroms = vec![
-            "/isos/installer.iso".into(),
-            "/lab/.vmlab/media/unattend.iso".into(),
-            "/lab/.vmlab/media/vmlab.iso".into(),
-        ];
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(s.contains("ide-hd,drive=disk0,bus=ide.0,unit=0"), "{s}");
-        assert!(s.contains("ide-cd,drive=cd0,bus=ide.0,unit=1"), "{s}");
-        assert!(s.contains("ide-cd,drive=cd1,bus=ide.1,unit=0"), "{s}");
-        assert!(s.contains("ide-cd,drive=cd2,bus=ide.1,unit=1"), "{s}");
+        p.extra_disks = vec![("data".into(), "/lab/.vmlab/t/disk-data.qcow2".into())];
+        p.cdroms = vec!["/isos/installer.iso".into()];
+        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        assert!(!s.contains("bootindex="), "{s}");
+        vm.firmware = None;
+        vm.disk_bus = crate::profiles::DiskBus::Sata;
+        let s = joined(&build_args("l", &vm, &p, Accel::Tcg).unwrap());
+        assert!(s.contains("virtio-blk-pci,drive=disk0,bootindex=50"), "{s}");
+        assert!(s.contains("virtio-blk-pci,drive=disk1,bootindex=51"), "{s}");
+        assert!(s.contains("virtio-blk-pci,drive=cd0,bootindex=0"), "{s}");
     }
 
     /// Only the install CD-ROM carries the qdev id `eject_cdrom()` addresses;
@@ -2172,7 +1333,7 @@ mod tests {
     /// CD-ROM is built media names none.
     #[test]
     fn only_the_install_cdrom_carries_the_eject_id() {
-        let vm = resolved("windows-legacy", "x86_64");
+        let vm = arm();
         let mut p = paths();
         p.cdroms = vec![
             "/isos/installer.iso".into(),
@@ -2180,25 +1341,11 @@ mod tests {
         ];
         p.install_cdrom = true;
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(
-            s.contains("ide-cd,drive=cd0,bus=ide.0,unit=1,bootindex=0,id=install-cd"),
-            "{s}"
-        );
+        assert!(s.contains("virtio-blk-pci,drive=cd0,id=install-cd"), "{s}");
         assert_eq!(s.matches("id=install-cd").count(), 1, "{s}");
 
         p.install_cdrom = false;
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
         assert!(!s.contains("id=install-cd"), "{s}");
-    }
-
-    /// The disk is addressed on q35 too, where a slot is a whole AHCI port.
-    #[test]
-    fn q35_addresses_the_disk_and_cdroms_by_port() {
-        let vm = resolved("windows-server", "x86_64");
-        let mut p = paths();
-        p.cdroms = vec!["/isos/installer.iso".into()];
-        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        // windows-server is virtio-disk, so the CD-ROM starts at port 0.
-        assert!(s.contains("ide-cd,drive=cd0,bus=ide.0,unit=0"), "{s}");
     }
 }

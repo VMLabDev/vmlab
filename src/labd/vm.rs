@@ -993,7 +993,11 @@ impl VmInstance {
             return Ok(Some(hz));
         }
         let hz = match self.hypervisor {
-            HypervisorKind::Qemu => qemu::tsc::probe_host_hz(emulator).await,
+            // `tsc-frequency` is an x86 CPU property, and QEMU runs no x86
+            // guest (§22).
+            HypervisorKind::Qemu => Err(anyhow::anyhow!(
+                "a pinned TSC is an x86 CPU property, and QEMU runs no x86 guest (PRD §22)"
+            )),
             HypervisorKind::Vmlab => {
                 super::hypervisor::vmlab_hv::tsc::probe_host_hz(Path::new(emulator)).await
             }
@@ -2087,18 +2091,6 @@ impl super::machine::Machine for VmInstance {
 
     fn hypervisor_fallback(&self) -> Option<String> {
         self.selection().fallback_reason
-    }
-
-    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
-        if self.automatic_hypervisor.is_none() && self.selection_source.is_none() {
-            return None;
-        }
-        crate::config::hypervisor::qemu_removal(
-            crate::config::model::MachineCfg::Vm(&self.cfg),
-            &self.selection(),
-            &(self.host_facts)(),
-            Some(&self.template().resolved),
-        )
     }
 
     fn event_subject(&self) -> &'static str {
