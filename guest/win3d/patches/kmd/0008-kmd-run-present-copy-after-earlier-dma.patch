@@ -1,0 +1,118 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: run the copy of a Blt present after the DMA buffers before it
+
+A windowed Direct3D 9 present and every other Blt present on a Venus context
+is a copy on a guest CPU, in DxgkDdiSubmitCommand, into memory that the host
+GPU reads when the compositor draws the window. On a video card that Blt runs
+on the engine, after every DMA buffer that was submitted before it. Here it
+ran at once, also while the host still worked on an earlier DMA buffer of the
+compositor, which reads the destination. The trace build counted 0.3 to 0.6
+percent of present copies that began with such a buffer pending at 90 percent
+host load. A read by the host that overlaps the copy takes rows of two
+frames, and the console shows a band of the earlier one until the next
+present (card #134, docs/tearing.md).
+
+The copy now waits until every earlier DMA buffer of its engine has retired.
+The interrupt routine retires them while the processor of the copy waits. The
+wait ends after 8 ms, so that a host that is very late does not hold the
+guest.
+
+The trace build records each wait (event 26), and its knob 3 turns the wait
+off for a comparison.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index fa5e1a7..dca4aa0 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1430,6 +1430,9 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+             case 2:
+                 InterlockedExchange(&m_reportUnsentFlips, knob[2] ? 1 : 0);
+                 return STATUS_SUCCESS;
++            case 3:
++                InterlockedExchange(&m_copyDoesNotWait, knob[2] ? 1 : 0);
++                return STATUS_SUCCESS;
+         }
+         return STATUS_INVALID_PARAMETER;
+     }
+@@ -2286,6 +2289,45 @@ BOOLEAN VioGpuAdapter::TrackDmaSubmission(VioGpuCommand *command)
+     return ExecuteSynchronized(TrackDmaSubmissionSynchronized, &ctx);
+ }
+ 
++// On a video card the Blt of a present runs on the engine, after every DMA
++// buffer that was submitted before it. Here it is a copy on a guest CPU that
++// runs at once, in DxgkDdiSubmitCommand, while the host can still work on an
++// earlier DMA buffer: the compositor's, which reads the destination of this
++// copy. The host then reads rows of two frames, and the console shows a band
++// of the earlier one (docs/tearing.md). So the copy waits until every earlier
++// DMA buffer of the engine has retired. The interrupt routine retires them
++// while this processor waits. A host that is very late does not hold the
++// guest: after 8 ms the copy runs as before.
++void VioGpuAdapter::WaitForEarlierDma(VioGpuCommand *command)
++{
++    const UINT node = command->GetNodeOrdinal();
++    const UINT engine = command->GetEngineOrdinal();
++    if (node >= kMaxTrackedNodes || engine >= kMaxTrackedEngines || KeGetCurrentIrql() > DISPATCH_LEVEL)
++    {
++        return;
++    }
++#if VIOGPU_FLIP_TRACE
++    if (m_copyDoesNotWait)
++    {
++        return;
++    }
++#endif
++    VIOGPU_DMA_RETIREMENT *volatile *head = &m_dmaRetirement[node][engine].Head;
++    const ULONG kStepMicroseconds = 10;
++    const ULONG kMaxMicroseconds = 8000;
++    ULONG waited = 0;
++    while (*head != &command->Retirement && waited < kMaxMicroseconds)
++    {
++        KeStallExecutionProcessor(kStepMicroseconds);
++        waited += kStepMicroseconds;
++    }
++    if (waited)
++    {
++        FlipTrace(26, command->GetContextId(), waited, command->GetSubmissionFenceId(),
++                  *head != &command->Retirement);
++    }
++}
++
+ VOID VioGpuAdapter::CtrlStagePushFromIsr(PGPU_VBUFFER buf, UINT len)
+ {
+     buf->isr_stage_len = len;
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 41c72a2..f365d7c 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -333,6 +333,7 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+                                                  HANDLE ownerPid);
+     UINT GetLastNotifiedFence(UINT nodeOrdinal, UINT engineOrdinal);
+     BOOLEAN TrackDmaSubmission(VioGpuCommand *command);
++    void WaitForEarlierDma(VioGpuCommand *command);
+     NTSTATUS ResetFromTimeout();
+     NTSTATUS RestartFromTimeout();
+     NTSTATUS CollectDbgInfo(CONST DXGKARG_COLLECTDBGINFO *info);
+@@ -346,6 +347,9 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     // 1: a vsync reports queued addresses as the unpatched driver did, also
+     // one whose flip was not sent yet.
+     volatile LONG m_reportUnsentFlips = 0;
++    // 1: a present copy runs at once, as in the unpatched driver, also while
++    // an earlier DMA buffer is pending.
++    volatile LONG m_copyDoesNotWait = 0;
+     void FlipTrace(UINT event, UINT context = 0, UINT flags = 0, UINT64 fence = 0, UINT response = 0, UINT pending = 0);
+     void ReadFlipTrace(VIOGPU_FLIP_TRACE_READ *read);
+ #else
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index cd90d55..eb1fe83 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -762,6 +762,9 @@ void VioGpuCommand::Run()
+ 
+     if (m_cpuCopyBlt && m_cpuCopyBltMapped)
+     {
++        // The copy is the engine's work of this DMA buffer: it runs after
++        // the DMA buffers before it, not beside them.
++        m_pAdapter->WaitForEarlierDma(this);
+         m_pAdapter->FlipTrace(16, GetContextId(), m_cpuCopySrc ? m_cpuCopySrc->GetId() : 0, m_FenceId,
+                               m_cpuCopyDst ? m_cpuCopyDst->GetId() : 0);
+         NTSTATUS copyStatus =
