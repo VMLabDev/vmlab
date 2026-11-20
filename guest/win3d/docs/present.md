@@ -295,7 +295,9 @@ kernel logged no Xid.
 | `shared-texture` | 4 of 4 cases, every pixel in both directions | 4 of 4 cases, every pixel in both directions | not in the suite |
 | `tear-blt` (the same kernel copy, into a GDI surface) | 0 torn of 1259 console frames, 60.2 presents per second | 0 torn of 1260 console frames, 59.0 presents per second | 0 torn |
 
-Not tried: a rotated output, a second output (the device has one), capture
+Not measured: what linear storage in cached memory costs a program that
+shares a render target of exactly the desktop's size for its own use. Not
+tried: a rotated output, a second output (the device has one), capture
 while a full-screen application flips, protected content. ffmpeg's `ddagrab`
 fails earlier and for another reason ("Failed to create D3D11VA device": it
 wants a device with video support).
