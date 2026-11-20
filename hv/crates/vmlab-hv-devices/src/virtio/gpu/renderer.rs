@@ -30,6 +30,32 @@ pub enum GpuMode {
     Venus,
 }
 
+/// Descriptors held per live host resource: virglrenderer keeps the blob's
+/// descriptor and rutabaga a duplicate, until the guest unreferences it.
+const RESOURCE_DESCRIPTORS: u64 = 2;
+/// Descriptors left for the rest of the process: disks, sockets, contexts,
+/// the control and display clients.
+const RESERVED_DESCRIPTORS: u64 = 256;
+
+/// How many host resources the process's descriptor limit can pay for. A guest
+/// that reaches it gets an error, where an exhausted table ends the VM.
+fn resource_budget(descriptor_limit: u64) -> usize {
+    (descriptor_limit.saturating_sub(RESERVED_DESCRIPTORS) / RESOURCE_DESCRIPTORS)
+        .min(MAX_RESOURCES as u64) as usize
+}
+
+fn descriptor_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only the supplied structure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 1024;
+    }
+    limit.rlim_cur
+}
+
 type Task = Box<dyn FnOnce(&mut Backend) + Send>;
 type Ring = (u32, u8);
 
@@ -157,6 +183,8 @@ struct Backend {
     resources: BTreeMap<u32, HostResource>,
     contexts: BTreeSet<u32>,
     mapper: Arc<dyn BlobMapper>,
+    budget: usize,
+    budget_reported: bool,
     scanout: Option<(u32, Rect)>,
     mode: GpuMode,
     scanout_copy: Option<super::scanout::Scanout>,
@@ -200,6 +228,21 @@ impl Renderer {
         node: PathBuf,
         mapper: Arc<dyn BlobMapper>,
     ) -> Result<Self, DeviceError> {
+        Self::with_budget(mode, node, mapper, resource_budget(descriptor_limit()))
+    }
+
+    fn with_budget(
+        mode: GpuMode,
+        node: PathBuf,
+        mapper: Arc<dyn BlobMapper>,
+        budget: usize,
+    ) -> Result<Self, DeviceError> {
+        if budget < MAX_RESOURCES {
+            log::warn!(
+                "the descriptor limit of {} allows {budget} GPU resources of {MAX_RESOURCES}",
+                descriptor_limit()
+            );
+        }
         // Validate explicitly: virglrenderer otherwise falls back to another GPU.
         let node = std::fs::canonicalize(node)?;
         if !node.starts_with("/dev/dri")
@@ -299,6 +342,8 @@ impl Renderer {
                     resources: BTreeMap::new(),
                     contexts: BTreeSet::new(),
                     mapper: worker_mapper,
+                    budget,
+                    budget_reported: false,
                     scanout: None,
                     mode,
                     scanout_copy: None,
@@ -799,6 +844,25 @@ impl Backend {
         }
         Ok(())
     }
+    /// Refuse a resource the descriptor limit cannot pay for.
+    fn admit_resource(&mut self) -> Result<(), u32> {
+        if self.resources.len() < self.budget {
+            return Ok(());
+        }
+        if !self.budget_reported {
+            self.budget_reported = true;
+            log::warn!(
+                "GPU resource limit reached: the guest holds {} resources",
+                self.resources.len()
+            );
+        }
+        Err(if self.budget < MAX_RESOURCES {
+            OUT_OF_MEMORY
+        } else {
+            INVALID
+        })
+    }
+
     fn unref(&mut self, id: u32) -> Result<(), u32> {
         let r = self.resources.get(&id).ok_or(RESOURCE)?;
         if r.mapped {
@@ -909,9 +973,10 @@ impl Backend {
                         flags: d.u32()?,
                     }
                 };
-                if id == 0 || self.resources.len() >= MAX_RESOURCES {
+                if id == 0 {
                     return Err(INVALID);
                 }
+                self.admit_resource()?;
                 host(self.gpu.resource_create_3d(id, create))?;
                 let backing = if create.bind & (1 << 18) != 0 {
                     if self.scanout_copy.is_none() {
@@ -1105,13 +1170,10 @@ impl Backend {
                 let count = d.u32()? as usize;
                 let blob_id = d.u64()?;
                 let size = d.u64()?;
-                if id == 0
-                    || size == 0
-                    || size > self.mapper.size()
-                    || self.resources.len() >= MAX_RESOURCES
-                {
+                if id == 0 || size == 0 || size > self.mapper.size() {
                     return Err(INVALID);
                 }
+                self.admit_resource()?;
                 let vecs = iovecs(mem, &mut d, count)?;
                 // An empty Vec still has a non-null pointer. Passing it through
                 // the C API would mark a host-only blob as already guest-backed.
@@ -1306,6 +1368,150 @@ mod tests {
             .unwrap();
             assert_eq!(frame.pixels, [19, 37, 211, 255], "fourcc={fourcc:?}");
         }
+    }
+
+    #[test]
+    fn resource_budget_follows_the_descriptor_limit() {
+        // The default soft limit pays for fewer resources than the device allows.
+        assert_eq!(resource_budget(1024), 384);
+        assert_eq!(resource_budget(4096), 1920);
+        assert_eq!(resource_budget(1 << 20), MAX_RESOURCES);
+        assert_eq!(resource_budget(u64::MAX), MAX_RESOURCES);
+        assert_eq!(resource_budget(0), 0);
+        assert_eq!(resource_budget(RESERVED_DESCRIPTORS), 0);
+    }
+
+    struct TestMapper;
+    impl BlobMapper for TestMapper {
+        fn size(&self) -> u64 {
+            APERTURE_SIZE
+        }
+        fn set_base(&self, _: Option<u64>) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn map(&self, _: u32, _: u64, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn unmap(&self, _: u32) -> Result<(), DeviceError> {
+            Ok(())
+        }
+    }
+
+    fn request(kind: u32, ctx: u32, body: &[u32]) -> Vec<u8> {
+        let mut request = vec![0; 24];
+        request[..4].copy_from_slice(&kind.to_le_bytes());
+        request[16..20].copy_from_slice(&ctx.to_le_bytes());
+        for word in body {
+            request.extend_from_slice(&word.to_le_bytes());
+        }
+        request
+    }
+
+    /// The descriptors of blob memory this process holds. Other tests of the
+    /// binary open and close files of other kinds meanwhile.
+    fn open_descriptors() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| {
+                let target = target.to_string_lossy();
+                target.contains("vkr-shmem") || target.contains("dmabuf")
+            })
+            .count()
+    }
+
+    /// One Venus context that makes, maps, unmaps and unreferences `blobs`
+    /// shared-memory blobs, as a guest program does from start to exit.
+    fn guest_program(renderer: &Renderer, mem: &GuestMemory, ctx: u32, blobs: u32) -> usize {
+        let mut create = vec![7, 4];
+        create.extend_from_slice(&[0; 16]);
+        let mut create = request(0x200, ctx, &create);
+        create[32..39].copy_from_slice(b"fd-test");
+        renderer.command(mem, &create).unwrap();
+        for id in 1..=blobs {
+            // HOST3D memory, mappable, blob 0: a shared-memory allocation of the context.
+            let blob = [id, 2, 1, 0, 0, 0, 4096, 0];
+            renderer.command(mem, &request(0x10c, ctx, &blob)).unwrap();
+            let map = [id, 0, (id - 1) * 4096, 0];
+            renderer.command(mem, &request(0x208, ctx, &map)).unwrap();
+        }
+        let held = open_descriptors();
+        for id in 1..=blobs {
+            renderer
+                .command(mem, &request(0x209, ctx, &[id, 0]))
+                .unwrap();
+            renderer
+                .command(mem, &request(0x102, ctx, &[id, 0]))
+                .unwrap();
+        }
+        renderer.command(mem, &request(0x201, ctx, &[])).unwrap();
+        held
+    }
+
+    #[test]
+    #[cfg_attr(
+        vmlab_ci_no_host_assets,
+        ignore = "requires an owner-selected DRM render node"
+    )]
+    fn venus_blobs_return_their_descriptors_and_stop_at_the_budget() {
+        let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
+            eprintln!("SKIP blob descriptors: set VMLAB_HV_TEST_RENDER_NODE");
+            return;
+        };
+        const BLOBS: u32 = 32;
+        let renderer = Renderer::with_budget(
+            GpuMode::Venus,
+            PathBuf::from(node),
+            Arc::new(TestMapper),
+            BLOBS as usize,
+        )
+        .unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        // The first program pays for what the renderer opens once.
+        guest_program(&renderer, &mem, 1, BLOBS);
+        let idle = open_descriptors();
+        for round in 0..16 {
+            let held = guest_program(&renderer, &mem, 2 + round, BLOBS);
+            assert!(
+                held >= idle + BLOBS as usize,
+                "round {round}: {BLOBS} live blobs hold {held} descriptors, idle is {idle}"
+            );
+            assert_eq!(
+                open_descriptors(),
+                idle,
+                "round {round}: descriptors outlived their blobs"
+            );
+        }
+
+        // At the budget the guest gets an error and the host opens nothing.
+        let mut create = vec![7, 4];
+        create.extend_from_slice(&[0; 16]);
+        renderer
+            .command(&mem, &request(0x200, 99, &create))
+            .unwrap();
+        for id in 1..=BLOBS {
+            let blob = [id, 2, 1, 0, 0, 0, 4096, 0];
+            renderer.command(&mem, &request(0x10c, 99, &blob)).unwrap();
+        }
+        let full = open_descriptors();
+        let over = [BLOBS + 1, 2, 1, 0, 0, 0, 4096, 0];
+        assert_eq!(
+            renderer.command(&mem, &request(0x10c, 99, &over)),
+            Err(OUT_OF_MEMORY)
+        );
+        let classic = [BLOBS + 1, 2, 1, 2, 64, 64, 1, 1, 0, 0, 0];
+        assert_eq!(
+            renderer.command(&mem, &request(0x204, 99, &classic)),
+            Err(OUT_OF_MEMORY)
+        );
+        assert_eq!(open_descriptors(), full);
+        renderer
+            .command(&mem, &request(0x102, 99, &[1, 0]))
+            .unwrap();
+        renderer.command(&mem, &request(0x10c, 99, &over)).unwrap();
+        renderer.reset().unwrap();
+        assert_eq!(open_descriptors(), idle);
     }
 
     #[test]

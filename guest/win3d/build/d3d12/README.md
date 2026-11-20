@@ -115,6 +115,7 @@ x86 bridge is loaded from `SysWOW64`, so it finds the x86 private directory.
 | `C:\Windows\System32\vmlab-win3d\vkd3dcore.dll` | vkd3d-proton core | `out/d3d12/x64/vkd3dcore.dll` |
 | `C:\Windows\System32\vmlab-win3d\dxgi-vulkan.dll` | DXGI-only DXVK | `out/d3d12/x64/dxgi-vulkan.dll` |
 | `C:\Windows\System32\vmlab-win3d\d3d12-native.dll` | the machine's own original `d3d12.dll` | copied by the installer **on the target machine** before it replaces `d3d12.dll` |
+| `C:\Windows\System32\vmlab-win3d\native\d3d12.dll` | the same file under its own name, which the D3D10/11 UMD loads into a Chromium GPU process (`docs/chromium.md`) | copied by the installer on the target machine |
 
 The same layout works app-locally for testing: put `d3d12.dll` next to an
 executable and the `vmlab-win3d\` directory beside it. `test/run.sh` does

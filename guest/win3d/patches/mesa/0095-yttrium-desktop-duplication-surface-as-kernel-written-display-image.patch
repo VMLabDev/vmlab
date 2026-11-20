@@ -1,0 +1,249 @@
+Subject: [PATCH] yttrium: make a Desktop Duplication surface a kernel-written display image
+
+A program that captures the screen with DXGI Desktop Duplication got no
+picture: every AcquireNextFrame returned DXGI_ERROR_ACCESS_LOST. dxgi creates
+the duplication surface in the capturing program, and for each frame dxgkrnl
+has the KMD copy DWM's desktop into it (DxgkDdiPresent, Blt). The KMD does
+that copy on the CPU. Two things in the user-mode driver were in its way:
+
+- The surface could not be mapped. A shared render target is an optimal
+  image in device-local memory (YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED):
+  its blob is not mappable and it has no row pitch.
+- The first frame was thrown away. The driver clears an image nothing was
+  drawn to at its first use (contents_initialized), and the image starts in
+  VK_IMAGE_LAYOUT_UNDEFINED. The KMD's first copy, the only one of the whole
+  desktop, comes before that, so the later frames carried only what had
+  changed, on black.
+
+A texture that looks like a duplication surface is now created as a display
+image with the new winsys flag YTTRIUM_GDI_RESOURCE_FLAG_KERNEL_WRITTEN:
+linear, in host-visible cached memory, a mappable blob with the row pitch and
+the image offset in the allocation record the KMD reads. It is created
+VK_IMAGE_LAYOUT_PREINITIALIZED and counts as written, as an imported display
+image already does. Another device opens it through the display image import,
+which is how a shared display image has always been opened.
+
+The driver is not told which texture is a duplication surface: it sees a
+shared BGRA render target (format 87, bind 0x28, misc 0x2), and the runtime
+keeps the keyed mutex and NT handle flags to itself. The pattern is every
+shared B8G8R8A8_UNORM 2D texture that is exactly a render target and a shader
+resource, default usage, one level, one slice, one sample, no CPU access and
+no initial data, and of exactly the size of the current display mode. The
+size is what GitHub #237's pattern did not have: an application's own shared
+textures of any other size keep optimal storage.
+
+The kernel half is patches/kmd/0006, which allows the present copy into a
+mappable blob.
+
+Evidence: docs/present.md ("Desktop Duplication").
+Origin: GitHub VMLabDev/vmlab#237, written again on 76c095bb by card #146.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index 7b06c02..f6f3c43 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -640,6 +640,55 @@ sanitize_d3d11_resource_misc_flags(UINT flags)
+    return sanitized;
+ }
+ 
++/*
++ * A Desktop Duplication surface: dxgi creates it in the capturing program,
++ * and for each frame dxgkrnl has the KMD copy DWM's desktop into it
++ * (DxgkDdiPresent, Blt).  The KMD does that copy on the CPU, so the surface
++ * needs memory the KMD can map and a row pitch it is told: a display image
++ * gives both.  An ordinary shared render target is an optimal image in
++ * device-local memory, the KMD refuses the copy, and every AcquireNextFrame
++ * returns DXGI_ERROR_ACCESS_LOST.
++ *
++ * Nothing in the arguments names the surface as a duplication one (the
++ * runtime keeps the keyed mutex and NT handle flags to itself), so this is
++ * the shape dxgi asks for: a shared BGRA 2D texture that is exactly a render
++ * target and a shader resource, default usage, one level, one slice, one
++ * sample, no CPU access, no initial data, and of the size of the desktop.
++ * The size is what keeps an application's own shared textures out: only one
++ * of exactly the current display mode is taken for a duplication surface.
++ */
++static bool
++is_desktop_sized(UINT width, UINT height)
++{
++   DEVMODEW mode;
++
++   memset(&mode, 0, sizeof mode);
++   mode.dmSize = sizeof mode;
++   if (!EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode))
++      return false;
++
++   /* The duplication surface is not rotated; the reported mode is. */
++   return (width == mode.dmPelsWidth && height == mode.dmPelsHeight) ||
++          (width == mode.dmPelsHeight && height == mode.dmPelsWidth);
++}
++
++static bool
++is_desktop_duplication_surface(const D3D10DDIARG_CREATERESOURCE *create)
++{
++   return create->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D &&
++          create->Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
++          create->BindFlags == (D3D10_DDI_BIND_RENDER_TARGET |
++                                D3D10_DDI_BIND_SHADER_RESOURCE) &&
++          create->MiscFlags == D3D10_DDI_RESOURCE_MISC_SHARED &&
++          create->Usage == D3D10_DDI_USAGE_DEFAULT &&
++          !create->MapFlags && !create->pInitialDataUP &&
++          !create->pPrimaryDesc &&
++          create->MipLevels == 1 && create->ArraySize == 1 &&
++          create->SampleDesc.Count == 1 &&
++          is_desktop_sized(create->pMipInfoList[0].TexelWidth,
++                           create->pMipInfoList[0].TexelHeight);
++}
++
+ static UINT
+ translate_d3d11_resource_array_size(const D3D11DDIARG_CREATERESOURCE *create)
+ {
+@@ -973,6 +1022,9 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+       templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT;
+    }
+ 
++   const bool duplication_surface = yttrium && !scanout_primary &&
++      is_desktop_duplication_surface(pCreateResource);
++
+    if (yttrium && scanout_primary) {
+       /* Creation cannot prove the eventual Present model. The screen hook
+        * rejects non-flip consumers before publishing this narrow primary. */
+@@ -990,7 +1042,15 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+       templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT;
+    }
+ 
+-   if (yttrium && !scanout_primary &&
++   if (duplication_surface) {
++      /* The KMD writes this one on the CPU: a linear display image in
++       * mappable memory, shared and opened as a swap chain's buffer was
++       * before shared images became optimal. */
++      templat.bind |= PIPE_BIND_DISPLAY_TARGET;
++      templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_KERNEL_WRITTEN;
++   }
++
++   if (yttrium && !scanout_primary && !duplication_surface &&
+        (pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED)) {
+       /* API-shared DEFAULT textures use canonical GPU storage. Initial
+        * contents are uploaded below without exposing that storage to Map. */
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h b/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
+index 6d4f135..5c88cae 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_gdi_public.h
+@@ -32,6 +32,12 @@
+  * LINEAR endpoint registered as its real Windows display allocation. */
+ #define YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT (PIPE_RESOURCE_FLAG_DRV_PRIV << 4)
+ 
++/* The KMD writes this display image on the CPU (a Desktop Duplication
++ * surface), before the UMD has drawn to it. Its backing must be cached, and
++ * the image starts with defined contents: it is created PREINITIALIZED and is
++ * never cleared at first use. */
++#define YTTRIUM_GDI_RESOURCE_FLAG_KERNEL_WRITTEN (PIPE_RESOURCE_FLAG_DRV_PRIV << 5)
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_resource.c b/src/gallium/winsys/yttrium/gdi/yttrium_resource.c
+index 0bb6479..147d2eb 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_resource.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_resource.c
+@@ -1462,11 +1462,18 @@ yttrium_resource_create(struct pipe_screen *pscreen,
+       (templ->flags & YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT) != 0;
+    const bool optimal_shared =
+       (templ->flags & YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED) != 0;
++   /* Only a plain display image can be written by the KMD: the optimal
++    * kinds have no linear bytes at the allocation the KMD is given. */
++   res->venus.kernel_written =
++      (templ->flags & YTTRIUM_GDI_RESOURCE_FLAG_KERNEL_WRITTEN) != 0 &&
++      (templ->bind & PIPE_BIND_DISPLAY_TARGET) && !optimal_present &&
++      !optimal_shared;
+    res->base.flags &= ~(PIPE_RESOURCE_FLAG_FRONTEND_PRIV |
+                         YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK |
+                         YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER |
+                         YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED |
+-                        YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT);
++                        YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT |
++                        YTTRIUM_GDI_RESOURCE_FLAG_KERNEL_WRITTEN);
+    pipe_reference_init(&res->base.reference, 1);
+    yttrium_resource_init_threaded(res);
+    res->venus.owner = &res->base;
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
+index 8bedf22..0f2347b 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
+@@ -386,6 +386,7 @@ struct yttrium_venus_resource {
+    uint32_t layers;
+    VkSampleCountFlagBits samples;
+    bool cpu_readback;
++   bool kernel_written;
+    bool initialized;
+    bool buffer_backed;
+    bool contents_initialized;
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
+index 012e5a8..4184d5f 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_resource.c
+@@ -741,8 +741,21 @@ yttrium_venus2_create_display_image(struct yttrium_venus *venus,
+           venus, vk_format, VK_IMAGE_TYPE_2D, width, height, 1, 1, 1,
+           0, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_LINEAR, &usage))
+       return false;
+-   if (!yttrium_venus_create_image(venus, resource, vk_format, width, height,
+-                                    usage)) {
++   /*
++    * The KMD writes a kernel-written image (a Desktop Duplication surface)
++    * before anything is drawn to it, and its first write is the only one of
++    * the whole desktop.  PREINITIALIZED keeps those bytes across the first
++    * layout transition, where UNDEFINED lets the host discard them.
++    */
++   const bool kernel_written = resource->kernel_written;
++   const VkImageLayout initial_layout = kernel_written ?
++      VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED;
++   if (!yttrium_venus_create_image_tiled(
++          venus, resource, VK_IMAGE_TYPE_2D, vk_format, width, height, 1,
++          1, 1, 0, usage, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_LINEAR,
++          initial_layout)) {
++      if (kernel_written)
++         return false;
+       usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+       if (!yttrium_venus_create_image(venus, resource, vk_format, width,
+                                       height, usage))
+@@ -759,14 +772,16 @@ yttrium_venus2_create_display_image(struct yttrium_venus *venus,
+     * Display images remain CPU-mappable, but prefer coherent device-local
+     * memory because the host display path reads them with the GPU on Present.
+     * A legacy BAR can satisfy this preference while it has space; otherwise
+-    * the chooser falls back to any host-visible type.
++    * the chooser falls back to any host-visible type.  An image the KMD reads
++    * or writes on the CPU takes cached memory instead.
+     */
++   const bool cpu_access = resource->cpu_readback || kernel_written;
+    const VkMemoryPropertyFlags required_memory =
+       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+-      (resource->cpu_readback ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
++      (cpu_access ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+    const VkMemoryPropertyFlags preferred_memory =
+       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+-      (resource->cpu_readback ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++      (cpu_access ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const uint32_t memory_type_index =
+       yttrium_venus_choose_memory_type(venus, reqs.memoryTypeBits,
+                                        required_memory, preferred_memory);
+@@ -824,7 +839,7 @@ yttrium_venus2_create_display_image(struct yttrium_venus *venus,
+       return false;
+    }
+ 
+-   resource->layout = VK_IMAGE_LAYOUT_UNDEFINED;
++   resource->layout = initial_layout;
+    resource->allocation_size = memory_info.allocationSize;
+    resource->image_offset = layout.offset;
+    resource->image_size = layout.size;
+@@ -832,6 +847,11 @@ yttrium_venus2_create_display_image(struct yttrium_venus *venus,
+    resource->image_array_pitch = layout.arrayPitch;
+    resource->initialized = true;
+    resource->buffer_backed = false;
++   /* As for an imported display image: what the KMD wrote must not be
++    * cleared at the image's first use. */
++   resource->kernel_written = kernel_written;
++   if (kernel_written)
++      resource->contents_initialized = true;
+ 
+    if (out_memory_id)
+       *out_memory_id = resource->memory_obj.id;

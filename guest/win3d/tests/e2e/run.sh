@@ -17,7 +17,8 @@
 # <template>-<gpu, lower case>/; tests/e2e/check.py judges it. The lab is
 # win3d-e2e-<template>[-<gpu>] unless --lab names it.
 # The lab is destroyed unless --keep. --apps also runs the stretch
-# applications (tests/e2e/apps.sh) into <evidence>/apps/; they do not
+# applications (tests/e2e/apps.sh) into <evidence>/apps/ and then the adapter
+# suite (tests/e2e/adapter.sh) into <evidence>/adapter/; they do not
 # count towards the exit status.
 #
 # Exit status: 0 when every Done check passes, 1 otherwise, 2 on usage.
@@ -38,8 +39,8 @@ while [ $# -gt 0 ]; do
         --lab) LAB=${2:-}; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --apps) APPS=1; shift ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
-        *) sed -n '2,26p' "$0" >&2; exit 2 ;;
+        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        *) sed -n '2,27p' "$0" >&2; exit 2 ;;
     esac
 done
 case $TEMPLATE in windows-11|windows-10) ;; *) echo "unknown template $TEMPLATE" >&2; exit 2 ;; esac
@@ -360,6 +361,9 @@ apps() {
     # NVIDIA, docs/known-limits.md) cannot cost the Done evidence.
     say "6b stretch: third-party applications"
     "$HERE/apps.sh" "$LABDIR" "$VM" "$EV" || note "apps.sh failed"
+    # Last: Wine's tests change display modes and can take the adapter down.
+    say "6c adapter suite"
+    "$HERE/adapter.sh" "$LABDIR" "$VM" "$EV" || note "adapter.sh: a check failed, or the suite did not run"
 }
 
 collect() {

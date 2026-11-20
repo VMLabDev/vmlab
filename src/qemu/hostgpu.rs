@@ -248,7 +248,7 @@ fn driver(dev: &Path) -> Option<String> {
 /// into a guest's renderer. `MESA_VK_DEVICE_SELECT` is in the list but never
 /// set: Mesa's device-select layer breaks Venus
 /// (`vkr: venus driver is required to call vkEnumeratePhysicalDevices first`).
-pub const VULKAN_ENV_VARS: [&str; 7] = [
+pub const VULKAN_ENV_VARS: [&str; 8] = [
     "VK_DRIVER_FILES",
     "VK_ICD_FILENAMES",
     "VK_LOADER_DRIVERS_SELECT",
@@ -256,6 +256,7 @@ pub const VULKAN_ENV_VARS: [&str; 7] = [
     vk_layer::PATH_VAR,
     vk_layer::ADDRESS_VAR,
     vk_layer::DISABLE_VAR,
+    vk_layer::HIDE_UNCACHED_VAR,
 ];
 
 /// The emulator's environment for a VM (§5.2): the Vulkan loader
@@ -504,7 +505,8 @@ pub fn emulator(qemu_binary: Option<&Path>, arch: &str) -> String {
 /// any refusal. Its `vulkan_icd` must exist; its `qemu_binary`, in every
 /// mode, must run and suit `arch` (the VM's arch, when known); its
 /// `qemu_env` goes on last. A `vulkan` GPU's PCI-filter layer is planned
-/// under `data` ([`vk_layer::dir`]), not written.
+/// under `data` ([`vk_layer::dir`]), not written, and its
+/// `hide_uncached_memory` turns the layer's memory rule on.
 ///
 /// On vmlab-hv (`hypervisor`, PRD §22, HV phase-2 D10) the render node, the
 /// Vulkan environment, the filter layer and keep-awake are planned the same
@@ -580,6 +582,12 @@ pub fn render_plan(
             plan.keepawake = keepawake_wanted(d.keepawake, g, &sysfs.power(&g.address));
         }
         plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd, plan.vk_layer.as_deref());
+        // The memory rule is the layer's, so it goes only where the layer does.
+        if plan.vk_layer.is_some() && decl.is_some_and(|g| g.hide_uncached_memory) {
+            plan.env
+                .set
+                .push((vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()));
+        }
     }
     if let Some(decl) = decl
         && vmlab
@@ -931,6 +939,7 @@ mod tests {
             qemu_binary: None,
             qemu_env: Vec::new(),
             keepawake: KeepAwake::Auto,
+            hide_uncached_memory: false,
         }
     }
 
@@ -1552,6 +1561,40 @@ mod tests {
         }
     }
 
+    /// A host GPU's `hide_uncached_memory` turns the layer's memory rule on
+    /// for a `vulkan` guest on that GPU and on no other; the GPU's
+    /// `qemu_env` still has the last word. `virgl` on the same GPU loads no
+    /// layer and so gets no switch.
+    #[test]
+    fn hide_uncached_memory_sets_the_layers_switch_for_that_gpu_only() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let mut h = host();
+        let nvidia2 = h.gpus.iter().position(|g| g.name == "Nvidia2").unwrap();
+        h.gpus[nvidia2].hide_uncached_memory = true;
+        let switch = (vk_layer::HIDE_UNCACHED_VAR.to_string(), "1".to_string());
+        let plan = |mode, name| render_plan(Some(&gpu(mode, Some(name))), &h, &sysfs).unwrap();
+        let on = plan(GpuMode::Vulkan, "Nvidia2");
+        assert_eq!(owned(&on.env).last(), Some(&switch));
+        for other in [
+            plan(GpuMode::Vulkan, "Nvidia1"),
+            plan(GpuMode::Vulkan, "AMD1"),
+        ] {
+            assert!(!owned(&other.env).contains(&switch));
+        }
+        assert!(plan(GpuMode::Virgl, "Nvidia2").env.set.is_empty());
+        h.gpus[nvidia2].qemu_env = vec![(vk_layer::HIDE_UNCACHED_VAR.into(), "0".into())];
+        let off = render_plan(Some(&gpu(GpuMode::Vulkan, Some("Nvidia2"))), &h, &sysfs).unwrap();
+        let set: Vec<_> = owned(&off.env)
+            .into_iter()
+            .filter(|(k, _)| k == vk_layer::HIDE_UNCACHED_VAR)
+            .collect();
+        assert_eq!(
+            set,
+            [(vk_layer::HIDE_UNCACHED_VAR.to_string(), "0".to_string())]
+        );
+    }
+
     /// `virgl`, `passthrough`, no `gpu {}` and a `vulkan` guest with no host
     /// GPU resolved get no layer, though its variables are still stripped
     /// from what the emulator inherits.
@@ -1579,6 +1622,7 @@ mod tests {
                 vk_layer::PATH_VAR,
                 vk_layer::ADDRESS_VAR,
                 vk_layer::DISABLE_VAR,
+                vk_layer::HIDE_UNCACHED_VAR,
             ] {
                 assert!(
                     plan.env.remove.iter().any(|r| r == var),

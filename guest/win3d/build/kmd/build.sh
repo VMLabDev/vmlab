@@ -18,8 +18,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
 OUT=$REPO/out/kmd
-# 58105 identifies the package rebased to Yttrium's November 2026 release.
-DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58105}
+# 58109 reports a flip with a vsync only after it was sent (patches/kmd/0008).
+# 58108 was an experiment of card #143 that is not in this repository.
+# 58107 added the present copy into a mappable blob (0006, Desktop
+# Duplication) to 58106, which added the hardware pointer (0005) to 58105,
+# the package rebased to Yttrium's November 2026 release.
+DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58109}
 IMAGE=vmlab-win3d/kmd-build:1
 
 pin() { awk -v n="$1" '$1 == n { print $'"$2"' }' "$HERE/PINS"; }
@@ -71,10 +75,12 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
     -e TOOLCHAIN_TAR="/dl/$(basename "$TOOLCHAIN_TAR")" \
     -e WDK_PKG="/dl/$(basename "$WDK_PKG")" -e SDK_PKG="/dl/$(basename "$SDK_PKG")" \
     -e DRIVER_VERSION="$DRIVER_VERSION" \
+    -e KMD_TRACE="${KMD_TRACE:-0}" \
     "$IMAGE" /build/inner.sh
 
 {
     echo "driver_version $DRIVER_VERSION"
+    [ "${KMD_TRACE:-0}" != 1 ] || echo "trace_build 1"
     grep -v '^#' "$HERE/PINS" | grep -v '^\s*$' | awk '{print "pin", $1, $4, $5}'
     for p in "$REPO"/patches/kmd/*.patch; do echo "patch $(basename "$p") $(sha256sum <"$p" | cut -d' ' -f1)"; done
     (cd "$OUT" && find . -type f ! -name BUILDINFO | sort | xargs sha256sum | sed 's/^/sha256 /')
