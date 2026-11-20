@@ -178,10 +178,7 @@ impl Clock {
             };
             // Disarm before the device lock: a wait that the queue holds
             // while this tick is answered arms the clock again.
-            self.request
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .armed = false;
+            self.request.lock().unwrap_or_else(|e| e.into_inner()).armed = false;
             if state.lock().answer_vblanks(self.tick(sequence)) {
                 last = Some(sequence);
             }

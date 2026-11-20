@@ -541,8 +541,12 @@ impl QueueFixture {
     /// The head and length of used entry `slot`.
     fn used_entry(&self, slot: u64) -> (u32, u32) {
         (
-            self.mem.read_obj(GuestAddress(USED + 4 + slot * 8)).unwrap(),
-            self.mem.read_obj(GuestAddress(USED + 8 + slot * 8)).unwrap(),
+            self.mem
+                .read_obj(GuestAddress(USED + 4 + slot * 8))
+                .unwrap(),
+            self.mem
+                .read_obj(GuestAddress(USED + 8 + slot * 8))
+                .unwrap(),
         )
     }
 
@@ -606,7 +610,10 @@ fn a_vblank_wait_is_held_until_a_tick_without_holding_the_commands_behind_it() {
     assert_eq!(u64_at(&response, 32), 123_456_789);
     assert_eq!(u32_at(&response, 40), 16_666_666);
     assert_eq!(u32_at(&response, 44), 0);
-    assert!(f.interrupt.0.lock().len() > notified, "the guest is interrupted");
+    assert!(
+        f.interrupt.0.lock().len() > notified,
+        "the guest is interrupted"
+    );
 
     // A tick with no wait held answers nothing.
     assert!(!f.gpu.state.lock().answer_vblanks(tick));
