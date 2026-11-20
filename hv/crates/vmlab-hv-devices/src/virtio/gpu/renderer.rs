@@ -1219,12 +1219,15 @@ impl Backend {
         let copied = super::copy::run(request, &src, &mut dst)?;
         if let Some(before) = before {
             let stride = request.src_stride as usize;
-            let rows = |a: &[u8], b: &[u8]| match trace::differing_rows(a, stride, b, stride, stride) {
-                None => "0".to_string(),
-                Some((first, last, count)) => format!("{count}:{first}-{last}"),
-            };
+            let rows =
+                |a: &[u8], b: &[u8]| match trace::differing_rows(a, stride, b, stride, stride) {
+                    None => "0".to_string(),
+                    Some((first, last, count)) => format!("{count}:{first}-{last}"),
+                };
             let after = probe(&src);
-            let during = after.as_ref().map_or("-".to_string(), |after| rows(&before, after));
+            let during = after
+                .as_ref()
+                .map_or("-".to_string(), |after| rows(&before, after));
             // The reread knob also looks again 2 ms later.
             let late = match (&after, trace::reread()) {
                 (Some(after), true) => {
