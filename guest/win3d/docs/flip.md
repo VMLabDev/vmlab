@@ -97,6 +97,10 @@ design, the present copy on the host GPU, puts that copy on a host queue
 where it can be ordered. The flip stays ordered, so C12 can be measured
 against this probe without the display's read in question.
 
+The card of this work (C10, #227) asked for 0 torn frames. That goal moved to
+C12 (#229): C10 is kept as the device extension it built, the feature bit and
+the ordered flip, which C11 to C13 use too.
+
 A guest without the bit: the unit test
 `the_ordered_flip_is_offered_and_refused_until_the_driver_acks_it` (vmlab-hv)
 shows that the host refuses the command unless the driver acked the bit.
