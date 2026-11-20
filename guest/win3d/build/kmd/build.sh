@@ -18,9 +18,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
 OUT=$REPO/out/kmd
-# 58107 numbers the CPU copies of Blt presents (patches/kmd/0007). 58106 added
-# the hardware pointer (0005) to 58105, the package rebased to Yttrium's
-# November 2026 release.
+# 58107 reports a flip with a vsync only after it was sent (patches/kmd/0007).
+# 58106 added the hardware pointer (0005) to 58105, the package rebased to
+# Yttrium's November 2026 release.
 DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58107}
 IMAGE=vmlab-win3d/kmd-build:1
 

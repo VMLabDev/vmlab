@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58107` | The PE version resource and the INF's `DriverVer` version. This version numbers the CPU copies of Blt presents (`0007`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58107` | The PE version resource and the INF's `DriverVer` version. This version reports a flip with a vsync only after it was sent to the host (`0007`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Trace build
 
@@ -63,10 +63,21 @@ The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
 | 19 | The vsync timer sends the recorded flip | flags = resource |
 | 20 | One packet of a DMA buffer goes to the control queue | context, flags = ring index, fence, response = command type (0 NOP, 1 SUBMIT, a timeline submit has a ring index) |
 | 21 | A host context was created | context, flags = capset, fence = process id |
-| 25 | A reader asked for the sequence number of Blt present copies (`0007`) | flags = the sequence, fence = process id |
+| 23 | The interrupt routine reported a vsync (`0007`) | flags = the reported address divided by 4096, response = 1 when the address came from the queue of flips |
+| 24 | A queued flip was not sent to the host yet when a vsync was reported (`0007`) | flags = the flips in the queue, response = 0 the address was held back, 1 it was reported (knob 2) |
 
 Events 1 to 9 are the records of the 256-record ring of `0004`, without the
 bare interrupt (event 4). A release build has that small ring only.
+
+A second escape (magic `0x56475453`, then a knob and a value) changes the
+trace build for an experiment. `Get-FlipTrace.ps1` sets both knobs:
+
+| Knob | `Get-FlipTrace.ps1` | Effect |
+| --- | --- | --- |
+| 1 | `-Stall <microseconds>` | Holds every present copy for that time when it is half done, at most 20000. 0 turns it off |
+| 2 | `-ReportUnsent 1` | A vsync reports queued flips in the order of the driver before `0007`, also a flip that was not sent yet. 0 is the patched order |
+
+Both are off after a restart of the guest.
 
 ## Outputs
 
@@ -194,7 +205,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `0004-kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
 | `0005-kmd-hardware-pointer.patch` | Hardware pointer: reports a 64×64 pointer when `HWCursor` is set, sends Windows' shape, position and visibility on the cursor queue, restores them after a device reset, and sets `HWCursor` to 1 in the INF ([`docs/pointer.md`](../../docs/pointer.md)). |
 | `0006-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
-| `0007-kmd-number-cpu-present-copies.patch` | Increments a sequence number before and after the CPU copy of each Blt present and returns it through the escape `VIOGPU_CPU_COPY_SEQUENCE`. The user-mode driver reads upload sources under it (`patches/mesa/0095`), so that the compositor does not compose a window from a copy that is half done ([`docs/tearing.md`](../../docs/tearing.md)). |
+| `0007-kmd-report-flips-after-they-are-sent.patch` | A vsync reports the address of a flip only after the vsync timer sent that flip to the host. Before, a flip that Windows recorded between the timer and the interrupt was reported one tick early, Windows gave the buffer on screen back to the compositor, and the console showed a frame that was half rendered ([`docs/tearing.md`](../../docs/tearing.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
