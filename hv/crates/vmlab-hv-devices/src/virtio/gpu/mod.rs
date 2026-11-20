@@ -398,6 +398,10 @@ impl State {
                     height: r.h,
                 })
                 .collect();
+            vmlab_hv_display::trace::write(
+                "publish",
+                format_args!("ts={timestamp_ns} cpu={}", sink.needs_cpu() as u8),
+            );
             match renderer.dma_frame(sink.needs_cpu()) {
                 Ok(Some(frame)) => ScanoutPixels::Dma(frame),
                 Ok(None) => ScanoutPixels::Inactive,
@@ -465,15 +469,24 @@ impl State {
         } else {
             self.command(mem, 0, &flush)?;
         }
-        if self.publish_scanout(monotonic_ns())
-            && let Some(renderer) = &self.renderer
-        {
+        let start = monotonic_ns();
+        let published = self.publish_scanout(monotonic_ns());
+        if published && let Some(renderer) = &self.renderer {
             // The console's readback of this frame runs on the renderer.
             if let Err(error) = renderer.settle() {
                 log::warn!("ordered flip {frame}: readback wait failed: {error:#x}");
             }
             renderer.retire_previous();
         }
+        vmlab_hv_display::trace::write_at(
+            start,
+            "flip",
+            format_args!(
+                "frame={frame} res={id} published={} us={}",
+                published as u8,
+                (monotonic_ns() - start) / 1000
+            ),
+        );
         if self.ordered_flips == 0 {
             log::info!("virtio-gpu: the guest flips through the host-ordered flip (frame {frame})");
         }

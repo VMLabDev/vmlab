@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
+use vmlab_hv_display::trace;
 use zerocopy::IntoBytes;
 
 pub const APERTURE_SIZE: u64 = 1 << 32;
@@ -204,6 +205,8 @@ struct Backend {
     pending_frame: bool,
     scanout_dirty: bool,
     present_copies: u64,
+    /// Frames exported to the display, for the trace.
+    exports: u64,
 }
 
 impl Drop for Backend {
@@ -298,6 +301,14 @@ impl Renderer {
                         .collect();
                     for id in ids {
                         let (guest, signal) = pending.pending.remove(&id).unwrap();
+                        if trace::on() {
+                            let (ctx, ring, guest_id) =
+                                guest.map_or((0, 0, 0), |g| (g.ctx_id, g.ring_idx, g.fence_id));
+                            trace::write(
+                                "fence_done",
+                                format_args!("host={id} ctx={ctx} ring={ring} guest={guest_id}"),
+                            );
+                        }
                         signal.store(true, std::sync::atomic::Ordering::SeqCst);
                         if let Some(guest) = guest {
                             let mut completed = done.lock();
@@ -364,6 +375,7 @@ impl Renderer {
                     pending_frame: false,
                     scanout_dirty: true,
                     present_copies: 0,
+                    exports: 0,
                 };
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(2)) {
@@ -428,7 +440,33 @@ impl Renderer {
             let ctx = request
                 .get(16..20)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+            let start = trace::now_ns();
             let result = b.command(&mem, &request);
+            if trace::on() {
+                let word = |at: usize| {
+                    request
+                        .get(at..at + 4)
+                        .map_or(0, |bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                };
+                let fence = request
+                    .get(8..16)
+                    .map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+                trace::write_at(
+                    start,
+                    "cmd",
+                    format_args!(
+                        "kind={:#x} ctx={} flags={} fence={fence} ring={} res={} len={} us={} ok={}",
+                        word(0),
+                        word(16),
+                        word(4),
+                        request.get(20).copied().unwrap_or_default(),
+                        word(24),
+                        request.len(),
+                        (trace::now_ns() - start) / 1000,
+                        result.is_ok() as u8
+                    ),
+                );
+            }
             if let Err(error) = &result {
                 log::warn!(
                     "GPU command failed: type={:#x} ctx={} live={} bytes={} response={error:#x}",
@@ -547,7 +585,7 @@ impl Renderer {
     }
 
     pub fn dma_frame(&self, cpu: bool) -> Result<Option<super::DmaFrame>, u32> {
-        let mut frame = self.call(move |b| {
+        let frame = self.call(move |b| {
             let Some((id, rect)) = b.scanout else {
                 return Ok(None);
             };
@@ -589,6 +627,7 @@ impl Renderer {
                     Some(Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }));
             }
             let fd = resource.exported.as_ref().unwrap().clone();
+            let fd_source = fd.clone();
             use std::os::fd::AsRawFd;
             if b.scanout_copy.is_none() {
                 b.scanout_copy = Some(super::scanout::Scanout::new(&b.node)?);
@@ -632,8 +671,30 @@ impl Renderer {
             b.damage.clear();
             b.scanout_dirty = false;
             b.log_stats();
-            Ok(Some(frame))
+            b.exports += 1;
+            if trace::on() {
+                trace::write(
+                    "export",
+                    format_args!(
+                        "seq={} res={id} direct={} modifier={:#x} writers={} readers={}",
+                        b.exports,
+                        frame.direct as u8,
+                        info.modifier,
+                        fence_state(frame.fd.as_raw_fd(), DMA_BUF_SYNC_READ),
+                        fence_state(frame.fd.as_raw_fd(), DMA_BUF_SYNC_WRITE)
+                    ),
+                );
+            }
+            // With the reread on, a copied frame's readback also reads its
+            // source, the guest's scanout, to compare it with the copy.
+            let source =
+                (trace::reread() && !frame.direct).then_some((fd_source, info, width, height));
+            Ok(Some((frame, id, b.exports, source)))
         })?;
+        let (mut frame, res, seq, source) = match frame {
+            Some((frame, res, seq, source)) => (Some(frame), res, seq, source),
+            None => (None, 0, 0, None),
+        };
         if let Some(frame) = frame.as_mut() {
             if frame.direct {
                 let mut direct = self.direct.lock();
@@ -652,18 +713,102 @@ impl Renderer {
             let capture = move |b: &mut Backend| {
                 use std::os::fd::AsRawFd;
                 b.readbacks += 1;
+                let start = trace::now_ns();
+                let writers = if trace::on() {
+                    fence_state(fd.as_raw_fd(), DMA_BUF_SYNC_READ)
+                } else {
+                    ""
+                };
+                let info = Resource3DInfo {
+                    drm_fourcc: fourcc,
+                    modifier,
+                    strides: [stride, 0, 0, 0],
+                    ..Default::default()
+                };
                 let pixels = readback(
                     b.scanout_copy.as_mut().ok_or(0x1200u32)?,
                     fd.as_raw_fd(),
-                    Resource3DInfo {
-                        drm_fourcc: fourcc,
-                        modifier,
-                        strides: [stride, 0, 0, 0],
-                        ..Default::default()
-                    },
+                    info,
                     width,
                     height,
                 )?;
+                if trace::on() {
+                    let end = trace::now_ns();
+                    // A second read of the same publication: rows that
+                    // differ were written while the display read them. For
+                    // a copied frame, read its source twice instead: rows in
+                    // which the copy differs from the source were written
+                    // after the copy, while the frame was published.
+                    let row = width as usize * 4;
+                    let rows = |found: Option<(usize, usize, usize)>| match found {
+                        None => "0".to_string(),
+                        Some((first, last, count)) => format!("{count}:{first}-{last}"),
+                    };
+                    let (mut reread, mut copy_vs_source) = ("-".to_string(), "-".to_string());
+                    if !trace::reread() {
+                        // One read only.
+                    } else if let Some((source_fd, source_info, source_width, source_height)) =
+                        &source
+                    {
+                        let read = |b: &mut Backend| {
+                            let copy = b.scanout_copy.as_mut()?;
+                            let pixels = readback(
+                                copy,
+                                source_fd.as_raw_fd(),
+                                *source_info,
+                                *source_width,
+                                *source_height,
+                            );
+                            if pixels.is_err() {
+                                copy.clear_errors();
+                            }
+                            pixels.ok()
+                        };
+                        if let (Some(first), Some(second)) = (read(b), read(b)) {
+                            let source_stride = source_info.strides[0] as usize;
+                            reread = rows(trace::differing_rows(
+                                &first,
+                                source_stride,
+                                &second,
+                                source_stride,
+                                row,
+                            ));
+                            if (*source_width, *source_height) == (width, height) {
+                                copy_vs_source = rows(trace::differing_rows(
+                                    &pixels,
+                                    stride as usize,
+                                    &first,
+                                    source_stride,
+                                    row,
+                                ));
+                            }
+                        }
+                    } else if let Ok(second) = readback(
+                        b.scanout_copy.as_mut().ok_or(0x1200u32)?,
+                        fd.as_raw_fd(),
+                        info,
+                        width,
+                        height,
+                    ) {
+                        reread = rows(trace::differing_rows(
+                            &pixels,
+                            stride as usize,
+                            &second,
+                            stride as usize,
+                            row,
+                        ));
+                    }
+                    trace::write_at(
+                        start,
+                        "readback",
+                        format_args!(
+                            "seq={seq} res={res} us={} writers={writers} digest={:016x} reread={reread} copy_vs_source={copy_vs_source} reread_us={}",
+                            (end - start) / 1000,
+                            trace::digest(&pixels),
+                            (trace::now_ns() - end) / 1000
+                        ),
+                    );
+                }
                 b.log_stats();
                 Ok(pixels)
             };
@@ -773,6 +918,33 @@ fn wait_fences(fd: std::os::fd::RawFd, flags: u32, timeout: Duration) -> bool {
     let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     // SAFETY: one valid pollfd for the duration of the call.
     unsafe { libc::poll(&mut poll, 1, millis) == 1 }
+}
+
+/// The state of the fences of `flags` that the kernel tracks on the
+/// dma-buf `fd`, for the trace: `busy` while one is pending, `idle` when all
+/// have signalled, `none` when the kernel gives no sync file.
+fn fence_state(fd: std::os::fd::RawFd, flags: u32) -> &'static str {
+    use std::os::fd::FromRawFd;
+    let mut export = ExportSyncFile { flags, fd: -1 };
+    // SAFETY: the request takes a pointer to this struct, which outlives the call.
+    if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &mut export) } != 0
+        || export.fd < 0
+    {
+        return "none";
+    }
+    // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+    let sync = unsafe { std::os::fd::OwnedFd::from_raw_fd(export.fd) };
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&sync),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the duration of the call.
+    if unsafe { libc::poll(&mut poll, 1, 0) } == 1 {
+        "idle"
+    } else {
+        "busy"
+    }
 }
 
 /// The host ranges of renderer iovecs.
@@ -912,6 +1084,14 @@ impl Backend {
         if guest.is_none() {
             fence.flags = 1;
         }
+        if trace::on() {
+            let (ctx, ring, guest_id) =
+                guest.map_or((0, 0, 0), |g| (g.ctx_id, g.ring_idx, g.fence_id));
+            trace::write(
+                "fence_new",
+                format_args!("host={id} ctx={ctx} ring={ring} guest={guest_id}"),
+            );
+        }
         if let Err(error) = host(self.gpu.create_fence(fence)) {
             self.timeline.lock().pending.remove(&id);
             return Err(error);
@@ -948,11 +1128,24 @@ impl Backend {
     /// ring would reach further, but virglrenderer ends a Venus context
     /// whose ring has lost its queue when it is fenced.
     fn order(&mut self) -> Result<(), u32> {
+        let start = trace::now_ns();
+        let pending = self.timeline.lock().pending.len();
         self.synchronize()?;
         if let Some((id, _)) = self.scanout
             && let Some(fd) = self.resources.get(&id).and_then(|r| r.exported.clone())
         {
             use std::os::fd::AsRawFd;
+            if trace::on() {
+                trace::write_at(
+                    start,
+                    "order",
+                    format_args!(
+                        "res={id} pending={pending} sync_us={} writers={}",
+                        (trace::now_ns() - start) / 1000,
+                        fence_state(fd.as_raw_fd(), DMA_BUF_SYNC_READ)
+                    ),
+                );
+            }
             if !wait_writers(fd.as_raw_fd(), Duration::from_secs(1)) {
                 log::debug!("scanout {id}: no implicit fence to wait for");
             }
@@ -980,16 +1173,79 @@ impl Backend {
             };
         let (src, src_fd) = memory(request.src)?;
         let (mut dst, dst_fd) = memory(request.dst)?;
+        let start = trace::now_ns();
+        let pending = self.timeline.lock().pending.len();
         if let Err(error) = self.synchronize() {
             log::warn!("present copy: host GPU wait failed: {error:#x}");
         }
         use std::os::fd::AsRawFd;
+        if trace::on() {
+            let state = |fd: &Option<Arc<std::os::fd::OwnedFd>>, flags| {
+                fd.as_ref()
+                    .map_or("nofd", |fd| fence_state(fd.as_raw_fd(), flags))
+            };
+            trace::write_at(
+                start,
+                "pcopy",
+                format_args!(
+                    "src={} dst={} pending={pending} sync_us={} src_writers={} dst_users={}",
+                    request.src,
+                    request.dst,
+                    (trace::now_ns() - start) / 1000,
+                    state(&src_fd, DMA_BUF_SYNC_READ),
+                    state(&dst_fd, DMA_BUF_SYNC_WRITE)
+                ),
+            );
+        }
         for (fd, flags) in [(src_fd, DMA_BUF_SYNC_READ), (dst_fd, DMA_BUF_SYNC_WRITE)] {
             if let Some(fd) = fd {
                 wait_fences(fd.as_raw_fd(), flags, Duration::from_secs(1));
             }
         }
+        // With the trace on, read the source before and after the copy: rows
+        // that differ were written by other work while the copy read them.
+        let probe = |src: &super::copy::Segments| -> Option<Vec<u8>> {
+            use super::copy::Memory;
+            let top = request.boxes.iter().map(|b| b.src_y).min()?;
+            let bottom = request.boxes.iter().map(|b| b.src_y + b.height).max()?;
+            let start = request.src_offset + u64::from(top) * u64::from(request.src_stride);
+            let len = (u64::from(bottom - top) * u64::from(request.src_stride))
+                .min(src.len().checked_sub(start)?);
+            let mut out = vec![0; usize::try_from(len).ok()?];
+            src.read(start, &mut out).ok()?;
+            Some(out)
+        };
+        let before = trace::on().then(|| probe(&src)).flatten();
         let copied = super::copy::run(request, &src, &mut dst)?;
+        if let Some(before) = before {
+            let stride = request.src_stride as usize;
+            let rows =
+                |a: &[u8], b: &[u8]| match trace::differing_rows(a, stride, b, stride, stride) {
+                    None => "0".to_string(),
+                    Some((first, last, count)) => format!("{count}:{first}-{last}"),
+                };
+            let after = probe(&src);
+            let during = after
+                .as_ref()
+                .map_or("-".to_string(), |after| rows(&before, after));
+            // The reread knob also looks again 2 ms later.
+            let late = match (&after, trace::reread()) {
+                (Some(after), true) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    probe(&src).map_or("-".to_string(), |late| rows(after, &late))
+                }
+                _ => "-".to_string(),
+            };
+            trace::write(
+                "pcopy_src",
+                format_args!(
+                    "src={} dst={} digest={:016x} during={during} later={late}",
+                    request.src,
+                    request.dst,
+                    trace::digest(&before)
+                ),
+            );
+        }
         if self.present_copies == 0 {
             log::info!("virtio-gpu: the guest copies its Blt presents on the host");
         }

@@ -890,6 +890,26 @@ impl Scanout {
         }
     }
 
+    /// Clear the GL error flags that a failed read left, so that the next
+    /// capture does not take them for its own. The GPU trace's reread of a
+    /// source that GL cannot attach to a framebuffer fails that way.
+    pub fn clear_errors(&mut self) {
+        let _current = Current::save();
+        // SAFETY: the context is private to the renderer thread, as in readback.
+        unsafe {
+            if eglBindAPI(0x30a0) == 0
+                || eglMakeCurrent(self.display, null_mut(), null_mut(), self.context) == 0
+            {
+                return;
+            }
+            for _ in 0..16 {
+                if self.gl.get_error() == glow::NO_ERROR {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn readback(
         &mut self,
         fd: i32,
