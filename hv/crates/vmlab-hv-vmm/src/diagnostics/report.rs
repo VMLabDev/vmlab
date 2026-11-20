@@ -303,7 +303,7 @@ pub fn configure(control: &Path, machine: &Value) -> Result<(), String> {
         .to_path_buf();
     let context = Context {
         directory,
-        machine: redact_machine(machine),
+        machine: project_machine(machine, ""),
         state: RwLock::new(None),
         exit_sink: RwLock::new(None),
     };
@@ -341,8 +341,12 @@ fn collect_secrets(value: &Value, secret: bool, output: &mut Vec<String>) {
                 collect_secrets(item, secret, output);
             }
         }
-        Value::String(text) if secret && !text.is_empty() => output.push(text.clone()),
-        Value::Number(number) if secret => output.push(number.to_string()),
+        // These values are replaced as substrings in free-form log messages.
+        Value::String(text)
+            if secret && text.trim().chars().count() >= 8 && text.trim().parse::<f64>().is_err() =>
+        {
+            output.push(text.clone());
+        }
         _ => {}
     }
 }
@@ -434,7 +438,7 @@ fn safe_fields(path: &str) -> &'static [&'static str] {
     }
 }
 
-fn project_machine(value: &Value, path: &str, secrets: &mut Vec<String>) -> Value {
+fn project_machine(value: &Value, path: &str) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.iter()
@@ -445,10 +449,9 @@ fn project_machine(value: &Value, path: &str, secrets: &mut Vec<String>) -> Valu
                         format!("{path}.{key}")
                     };
                     let value = if secret_key(key) || !safe_fields(path).contains(&key.as_str()) {
-                        collect_secrets(value, true, secrets);
                         json!("[REDACTED]")
                     } else {
-                        project_machine(value, &child, secrets)
+                        project_machine(value, &child)
                     };
                     (key.clone(), value)
                 })
@@ -457,20 +460,11 @@ fn project_machine(value: &Value, path: &str, secrets: &mut Vec<String>) -> Valu
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|v| project_machine(v, &format!("{path}[]"), secrets))
+                .map(|v| project_machine(v, &format!("{path}[]")))
                 .collect(),
         ),
         _ => value.clone(),
     }
-}
-
-fn redact_machine(machine: &Value) -> Value {
-    let mut secrets = Vec::new();
-    let safe = project_machine(machine, "", &mut secrets);
-    if let Some(logger) = LOGGER.get() {
-        logger.secrets.write().extend(secrets);
-    }
-    safe
 }
 
 fn redact_keys(value: &mut Value) {
@@ -736,10 +730,26 @@ mod tests {
             logs: Mutex::new(VecDeque::new()),
             secrets: RwLock::new(secrets),
         };
-        let safe = redact_machine(&machine);
+        let safe = project_machine(&machine, "");
         let report = json!({"machine":safe, "error":logger.scrub(&format!("bad value {fake}"))});
         assert!(!serde_json::to_string(&report).unwrap().contains(&fake));
         assert_eq!(report["error"], "bad value [REDACTED]");
+    }
+
+    #[test]
+    fn log_scrubbing_preserves_short_and_numeric_values() {
+        let mut secrets = Vec::new();
+        collect_secrets(
+            &json!({
+                "password": "short",
+                "token": "12345678",
+                "credential": 87654321,
+                "future": "ordinary-value",
+            }),
+            false,
+            &mut secrets,
+        );
+        assert!(secrets.is_empty());
     }
 
     #[test]
@@ -804,11 +814,12 @@ mod tests {
             &PathBuf::from(directory).join("control.sock"),
             &json!({
                 "name":"panic-test", "applesmc":{"osk":fake},
-                "future_field":{"opaque_value":fake},
+                "future_field":4,
             }),
         )
         .unwrap();
         log::debug!("retained debug record");
+        log::error!("os error 24");
         // Exercise the devices crate's real logging path with its null backend.
         let audio = vmlab_hv_devices::audio::select_backend("diagnostic-test", "diagnostic test");
         assert_eq!(audio.name(), "null");
@@ -827,7 +838,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("VMLAB_HV_PANIC_TEST_DIR", directory.path())
-            .env("VMLAB_HV_LOG", "off")
+            .env("VMLAB_HV_LOG", "error")
             .env("XDG_RUNTIME_DIR", directory.path())
             .env_remove("PULSE_SERVER")
             .output()
@@ -843,7 +854,9 @@ mod tests {
             .map(|n| char::from(b'A' + n % 26))
             .collect::<String>();
         assert!(!text.contains(&fake));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(&fake));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains(&fake));
+        assert!(stderr.contains(r#""message":"os error 24""#));
         let report: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(report["reason"]["kind"], "panic");
         assert!(
@@ -853,6 +866,8 @@ mod tests {
                 .contains("panic_report_child")
         );
         let logs = report["logs"].as_array().unwrap();
+        assert_eq!(report["machine"]["future_field"], "[REDACTED]");
+        assert!(logs.iter().any(|entry| entry["message"] == "os error 24"));
         assert!(
             logs.iter()
                 .any(|entry| entry["message"] == "retained debug record")
@@ -863,13 +878,7 @@ mod tests {
                 .unwrap()
                 .starts_with("vmlab_hv_devices")
         }));
-        let last: Value = serde_json::from_str(
-            String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .last()
-                .unwrap(),
-        )
-        .unwrap();
+        let last: Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
         assert_eq!(last["level"], "ERROR");
         assert!(
             last["message"]
@@ -881,19 +890,16 @@ mod tests {
 
     #[test]
     fn machine_projection_defaults_new_fields_to_private() {
-        let mut secrets = Vec::new();
         let safe = project_machine(
             &json!({
                 "name":"fixture", "boot":{"kind":"kernel", "kernel":"kernel.bin", "new_field":"sensitive-value"},
                 "nics":[{"mac":"52:54:00:00:00:01", "attachment":{"kind":"stream", "socket":"switch.sock", "new_auth":"sensitive-auth"}}],
             }),
             "",
-            &mut secrets,
         );
         assert_eq!(safe["boot"]["kernel"], "kernel.bin");
         assert_eq!(safe["boot"]["new_field"], "[REDACTED]");
         assert_eq!(safe["nics"][0]["attachment"]["new_auth"], "[REDACTED]");
-        assert_eq!(secrets, vec!["sensitive-value", "sensitive-auth"]);
     }
 
     #[test]
