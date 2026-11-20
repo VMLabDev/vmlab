@@ -11,9 +11,10 @@
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use virtio_queue::QueueT;
 use vm_memory::{Bytes, GuestAddress};
 
-use super::{GuestMemory, State, VirtioInterrupt};
+use super::{GuestMemory, State};
 
 /// The refresh rate of the mode in the device's EDID.
 pub(super) const RATE_HZ: u64 = 60;
@@ -206,7 +207,7 @@ impl State {
                 continue;
             };
             if queue.add_used(&mem, wait.head, RESPONSE_LEN).is_ok()
-                && virtio_queue::QueueT::needs_notification(queue, &mem).unwrap_or(false)
+                && queue.needs_notification(&mem).unwrap_or(false)
             {
                 notify[wait.queue as usize & 1] = true;
             }
@@ -214,7 +215,7 @@ impl State {
         if let Some(irq) = &self.interrupt {
             for (queue, needed) in notify.into_iter().enumerate() {
                 if needed {
-                    VirtioInterrupt::notify_queue(irq.as_ref(), queue as u16);
+                    irq.notify_queue(queue as u16);
                 }
             }
         }
