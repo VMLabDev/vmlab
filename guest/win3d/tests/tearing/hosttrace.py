@@ -52,8 +52,11 @@ def resources(fields):
     return out
 
 
-def submits(events, vk_events, torn):
-    """Compositions against the host present copies into what they read."""
+def submits(events, vk_events, torn, alias=None):
+    """Compositions against the host present copies into what they read.
+    `alias` maps a present copy's destination to the resource that the
+    render worker knows the same memory as."""
+    alias = alias or {}
     done = {(f.get('ctx'), f.get('seq')): t for t, kind, f in vk_events if kind == 'vk_done'}
     subs = []
     for t, kind, f in vk_events:
@@ -69,7 +72,7 @@ def submits(events, vk_events, torn):
         key = (f.get('src'), f.get('dst'))
         if kind == 'pcopy':
             open_copy[key] = len(copies)
-            copies.append({'start': t, 'end': None, 'src': key[0], 'dst': key[1]})
+            copies.append({'start': t, 'end': None, 'src': key[0], 'dst': alias.get(key[1], key[1])})
         elif kind == 'pcopy_src' and key in open_copy:
             copies[open_copy.pop(key)]['end'] = t
     copies = [c for c in copies if c['end'] is not None]
@@ -156,6 +159,8 @@ def main():
     ap.add_argument('grab')
     ap.add_argument('--window-ms', type=float, default=50)
     ap.add_argument('--vk', nargs='*', default=[], help='traces of the render workers')
+    ap.add_argument('--alias', action='append', default=[], metavar='DST=RES',
+                    help='a present copy into DST writes the memory of resource RES')
     args = ap.parse_args()
     events = parse(args.trace)
     vk_events = sorted((e for path in args.vk for e in parse(path)), key=lambda e: e[0])
@@ -213,7 +218,7 @@ def main():
         'readbacks_differing_count': len(differ),
         'busy_fences': dict(busy),
         'torn': torn,
-        **({'submits': submits(events, vk_events, torn)} if args.vk else {}),
+        **({'submits': submits(events, vk_events, torn, dict(a.split('=', 1) for a in args.alias))} if args.vk else {}),
     }, indent=1))
     return 0
 
