@@ -168,6 +168,9 @@ struct State {
     /// frame holds yet.
     flush_pending: Option<u64>,
     last_publish: Option<std::time::Instant>,
+    /// Ordered flips served since the last reset. The first is logged, so
+    /// that a log shows which flip a guest uses.
+    ordered_flips: u64,
 }
 
 impl Drop for State {
@@ -214,6 +217,7 @@ impl Gpu {
                 pacer: None,
                 flush_pending: None,
                 last_publish: None,
+                ordered_flips: 0,
             })),
         }
     }
@@ -459,6 +463,10 @@ impl State {
             }
             renderer.retire_previous();
         }
+        if self.ordered_flips == 0 {
+            log::info!("virtio-gpu: the guest flips through the host-ordered flip (frame {frame})");
+        }
+        self.ordered_flips += 1;
         log::trace!("ordered flip {frame}: published resource {id}");
         Ok((NODATA, Vec::new()))
     }
@@ -1031,6 +1039,7 @@ impl VirtioDevice for Gpu {
         s.flush_pending = None;
         s.retry_display = false;
         s.acked = 0;
+        s.ordered_flips = 0;
         s.events = 0;
         s.resources.clear();
         s.scanout = None;
