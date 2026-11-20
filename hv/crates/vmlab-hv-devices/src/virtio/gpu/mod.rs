@@ -51,8 +51,7 @@ use std::{
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory as _, Permissions};
 
-const FEATURES: u64 =
-    (1 << 32) | (1 << 29) | (1 << 28) | (1 << ORDERED_FLIP_FEATURE) | (1 << 1);
+const FEATURES: u64 = (1 << 32) | (1 << 29) | (1 << 28) | (1 << ORDERED_FLIP_FEATURE) | (1 << 1);
 /// vmlab's private feature bit: the host-ordered flip. The bits up to 23
 /// belong to the device type and VIRTIO 1.2 defines 0 to 5, so the top one
 /// is the furthest from the next standard bit. Only vmlab's viogpu3d driver

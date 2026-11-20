@@ -380,7 +380,10 @@ fn an_ordered_flip_is_published_before_it_is_answered() {
     }
     assert!(s.command(&mem, 0, &flush).is_ok());
     s.schedule_flush(1);
-    assert!(sink.0.lock().is_empty(), "a plain flush is left to the pacer");
+    assert!(
+        sink.0.lock().is_empty(),
+        "a plain flush is left to the pacer"
+    );
 
     s.resources.get_mut(&1).unwrap().pixels = vec![42, 42, 42, 0];
     assert_eq!(

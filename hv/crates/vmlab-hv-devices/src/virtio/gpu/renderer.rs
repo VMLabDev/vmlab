@@ -198,7 +198,9 @@ impl Timeline {
         ids.into_iter()
             .filter_map(|id| {
                 let fence = self.pending.remove(&id).unwrap();
-                fence.signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                fence
+                    .signal
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 fence.guest
             })
             .collect()
