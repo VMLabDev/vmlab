@@ -343,7 +343,9 @@ fn collect_secrets(value: &Value, secret: bool, output: &mut Vec<String>) {
         }
         // These values are replaced as substrings in free-form log messages.
         Value::String(text)
-            if secret && text.trim().chars().count() >= 8 && text.trim().parse::<f64>().is_err() =>
+            if secret
+                && text.trim().chars().count() >= 8
+                && text.trim().parse::<f64>().is_err() =>
         {
             output.push(text.clone());
         }
