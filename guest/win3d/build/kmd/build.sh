@@ -18,9 +18,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
 OUT=$REPO/out/kmd
-# 58106 adds the hardware pointer (0005) to 58105, the package rebased to
-# Yttrium's November 2026 release.
-DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58106}
+# 58107 adds the present copy into a mappable blob (0006, Desktop
+# Duplication) to 58106, which added the hardware pointer (0005) to 58105,
+# the package rebased to Yttrium's November 2026 release.
+DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58107}
 IMAGE=vmlab-win3d/kmd-build:1
 
 pin() { awk -v n="$1" '$1 == n { print $'"$2"' }' "$HERE/PINS"; }
