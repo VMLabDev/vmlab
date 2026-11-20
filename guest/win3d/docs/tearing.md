@@ -327,3 +327,107 @@ which the ring thread decodes each `vkQueueSubmit`, with its context and
 the resources of its command buffers, into the same trace. Then find, in a
 torn frame, DWM's submission that read the destination of the present copy
 and see whether it ran during that copy.
+
+## The render server's submissions (card #237)
+
+The second and last session of the host trace. It recorded every Venus
+queue submission in the render server against the torn frames. The trace
+does not show unordered host work, and the investigation ends here.
+
+### The trace
+
+The diagnostic patch
+[0041](../../../patches/virglrenderer/diagnostic/0041-vkr-trace-queue-submissions-for-the-gpu-trace.patch)
+of virglrenderer 1.3.0 (at the root of the vmlab repository, not applied by
+the build) makes each render worker write to the trace of vmlab-hv when
+`VMLAB_HV_GPU_TRACE` is set. Each worker writes its own
+`gpu-trace-<pid>.txt` in the same format and on the same clock:
+
+| Event | What it records |
+| --- | --- |
+| `vk_submit` | Every `vkQueueSubmit` and `vkQueueSubmit2`, at the time the ring thread hands it to the host driver: context, queue, fence, the wait and signal semaphores of each batch, its command buffers, and the virgl resources that they use (`w` attachment or copy destination, `r` copy source, `d` descriptor, `b` barrier) |
+| `vk_done` | When an empty submission with a fence of the trace, made on the same queue just after it, signals. The host GPU has finished the work by then |
+
+The resources come from the objects of the context: memory imported from a
+resource or exported as one, the images and buffers bound to it, views,
+framebuffers and descriptor set slots. `vk_done` is an upper bound. Its
+waiter thread runs at `SCHED_IDLE` under the probe's load, like the rest of
+the render server.
+
+`tests/tearing/hosttrace.py <hv trace> <grab.json> --vk <worker traces>`
+then reports the compositions (submissions that write a scanout), the GPU
+writes before and after each present copy into its source, and for each
+torn frame its composition and the copy that fed it.
+`--alias DST=RES` names the resource that a context reads where a copy
+writes DST (see below).
+
+### Runs
+
+The labs of card #229 (driver `58111`), vmlab-hv of card #233 with this
+render server, whole-window mode, 90 percent load, 20,000 frames.
+
+| Run | Host GPU | Torn | Events |
+| --- | --- | --- | --- |
+| v1 | AMD1 | 3 grabs (frames 8366, 17969, 17970) | 2 |
+| v1 | Nvidia2 | 2 grabs (frames 7169, 7170) | 1 |
+
+Each event shows the upper rectangles of one frame and the lower ones of
+the other, as before. Run v1 on Nvidia2 also counted 48 grabs after frame
+17639 in which only the lowest rectangle was wrong or missing. That is the
+window being covered at the end of the run, as in run t1 of card #233, and
+it is not counted. No Xid on either GPU. With the trace on, both GPUs
+still tore, so this trace did not hide the fault.
+
+### What the trace shows
+
+On AMD1 the present copy always goes from resource 284 (the application's
+back buffer, context 30) to 287. Resource 287 has a guest backing and is
+attached to no Venus context. DWM (context 6) composes each frame by a copy
+from resource 62 into the scanout (24, 25 or 26) and into resource 20. On
+Nvidia2 the resources are 318, 321 and 160.
+
+- S1. No GPU work writes what DWM composes from. 0 of 70,082 submissions
+  on AMD1 and 0 of 61,052 on Nvidia2 write 62 or 160. No submission uses
+  287 or 321 at all. The memory that DWM reads is written only by a CPU.
+- S2. DWM reads it once for each present copy. 22,292 compositions read 62
+  for 22,375 copies on AMD1, and 19,365 read 160 for 19,420 copies on
+  Nvidia2. The analysis takes 62 and 160 as the memory that the copy
+  writes (`--alias 287=62`, `--alias 321=160`). The trace cannot show the
+  guest pages behind 287, so this is an assumption. If it is wrong, the
+  copy destination is read by no host GPU work at all, and S1 still holds.
+- S3. The composition of each torn frame began 6 to 49 ms after the copy
+  that fed it ended: 17.1 ms (frame 8366) and 6.1 ms (frames 17969 and
+  17970, one composition) on AMD1, and 48.9 ms (frames 7169 and 7170) on
+  Nvidia2. It ran for 1.2 to 4.2 ms, and no copy ran during it. Over all
+  compositions, 73 of 23,702 (AMD1) and 48 of 20,559 (Nvidia2) overlapped a
+  copy. None of them was a torn frame. The candidate of card #233, DWM's
+  composition reading the destination while the host copy writes it, did
+  not happen in any torn frame.
+- S4. The source was complete before each torn frame's copy. The
+  application's last submission that wrote it was done 3.8 ms and 0.03 ms
+  before the copy began on AMD1, and 2.4 ms before it on Nvidia2. For the
+  0.03 ms case, the guest's ring-1 fence of that submission had signalled
+  0.9 ms before the copy began, so the work was done. In 0 of 41,795 copies
+  was the next write into the source submitted before the copy ended. 185
+  copies on AMD1 and 170 on Nvidia2 began before the `vk_done` of the last
+  write. None of them fed a torn frame. They are within the latency of the
+  trace's waiter.
+- S5. The torn frames' copies took 2.25 ms and 3.88 ms on AMD1, longer
+  than 90 and 99.6 percent of all copies, and 0.95 ms on Nvidia2, longer
+  than 62 percent of them. Three events cannot show a link between a long
+  copy and a tear.
+
+### Result
+
+The trace does not show the unordered work. It traced each queue
+submission of every Venus context, with its resources and an upper bound
+of its GPU time, together with the present copies and publications of
+vmlab-hv. In each torn frame, the source was finished before the copy
+began, no submission changed it during the copy, and the composition read
+the destination several milliseconds after the copy ended, with no copy
+running. No host GPU work writes the memory that DWM composes from. So no
+host work that the trace can see makes the tear. What is left is outside
+the host's view: guest CPU writes into the memory that DWM reads, or the
+guest's order of them. vmlab-hv and the render server cannot record those.
+This was the second of the two bounded sessions, and the investigation of
+#134 ends with this result.
