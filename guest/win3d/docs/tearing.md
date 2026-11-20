@@ -196,6 +196,9 @@ its flip. The trace build counted 3 and 4 held back in 20 s.
   built ([flip.md](flip.md)). It did not end the tears: 2 torn of 20,000 on
   AMD1 and 2 of 20,000 on Nvidia2 in whole-window mode at 90 percent load,
   the rate of the runs above. What that leaves is in flip.md, "Result".
+- C12, the copy of a Blt present on the host behind the same bit, is built
+  ([present-copy.md](present-copy.md)). It did not end the tears either:
+  2 torn of 20,000 on AMD1 and 2 of 20,000 on Nvidia2 in the same probe.
 - The probe needs a host at 90 percent load and several minutes, and the
   fault is not at 0, so it stays a script (`tests/tearing/run.sh`) beside
   the e2e tests. The adapter suite keeps its short tearing checks

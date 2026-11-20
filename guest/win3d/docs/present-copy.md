@@ -67,3 +67,36 @@ at the root of the vmlab repository. The driver side is `patches/kmd/0010`.
   before.
 - vmlab-hv refuses the command unless the driver acked the bit, and on a
   device without a renderer.
+
+## Result
+
+Windows 11 (`26100.1742.11`) on vmlab-hv, driver `100.6.101.58111`, package
+of commit `a8f3b7a2`, vmlab-hv of commit `33765187`, 1024x768. After a
+restart of each VM, vmlab-hv logged "the guest copies its Blt presents on
+the host" and "the guest flips through the host-ordered flip" on both labs,
+so the driver had acked the bit and sent both commands. vmlab-hv logged no
+refused present copy.
+
+| Check | AMD1 | Nvidia2 |
+| --- | --- | --- |
+| win3d e2e (`tests/e2e/run.sh`) | 12 of 12 | 12 of 12 |
+| Tearing probe, `--full`, 90 percent load, 20,000 frames | 2 torn | 2 torn |
+| The same probe with the ordered flip only, driver `58110` ([flip.md](flip.md)) | 2 torn | 2 torn |
+
+No Xid on either GPU. The torn frames split the window at one row (AMD1
+frame 4147, Nvidia2 frame 7341) or show the lower rectangles of the other
+frame (AMD1 frame 7587, Nvidia2 frame 6158), as before.
+
+So the host copy does not end the tears, and the copy of the Blt present is
+not where they come from either: with the copy on the host, after every
+fence of the renderer, the guest's fences on every context ring among them,
+and with no other command served while it runs, the rate did not change.
+The goal of 0 torn frames of 20,000 is not met. What the two results leave
+is host work that no fence covers and that is not the display's read of the
+scanout (C10) or a write into the present's destination (this card): GPU
+work submitted without a fence, or the rendering of the frame before its
+present. The guest's records cannot tell which, as tearing.md says.
+
+Whether the host copy stays behind the bit is the lead's decision. It is
+the copy of the design's P6, it passed the e2e on both GPUs, and the guest CPU no longer spends the copy's
+time inside `pfnPresentCb`.
