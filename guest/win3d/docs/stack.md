@@ -319,7 +319,7 @@ committed.
 | | | [`0007`](../patches/kmd/0007-kmd-flip-trace-build.patch) | viogpu3d: a trace build for the order of renders, presents and flips | [`docs/tearing.md`](tearing.md) |
 | | | [`0008`](../patches/kmd/0008-kmd-report-flips-after-they-are-sent.patch) | viogpu3d: report a flip with a vsync only after it was sent to the host | [`docs/tearing.md`](tearing.md) |
 | | | [`0009`](../patches/kmd/0009-kmd-host-ordered-flip.patch) | viogpu3d: let the host order the flip when it offers to | [`docs/tearing.md`](tearing.md) |
-| | | [`0010`](../patches/kmd/0010-kmd-host-present-copy.patch) | viogpu3d: let the host copy a Blt present when it offers to | [`docs/present-copy.md`](present-copy.md) |
+| | | [`0010`](../patches/kmd/0010-kmd-host-present-copy.patch) | viogpu3d: let the host copy a Blt present when it offers to | [`docs/flip.md`](flip.md) |
 | mesa | 46 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0002`](../patches/mesa/0002-util-xmlconfig-case-insensitive-exe-match.patch) | util/xmlconfig: match drirc executable names case-insensitively on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0003`](../patches/mesa/0003-util-u_queue-windows-loader-lock-join.patch) | util/u_queue: do not join worker threads under the loader lock on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
