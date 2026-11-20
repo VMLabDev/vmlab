@@ -213,3 +213,117 @@ its flip. The trace build counted 3 and 4 held back in 20 s.
   descriptor for each blob resource. The runs here raised the limit
   (`ulimit -n`) before `vmlab up`. That is a fault of vmlab-hv, outside this
   card.
+
+## The host-side trace (card #233)
+
+Card #233 traced on the host what touches a torn frame, to name the host
+work that no fence covers. The effort was bounded to two sessions. This is
+the result of the first.
+
+### The trace
+
+vmlab-hv writes the trace when its environment sets `VMLAB_HV_GPU_TRACE` to
+a directory. It is off by default. Each process appends one line per event
+to `<dir>/gpu-trace-<pid>.txt`, with the time on `CLOCK_MONOTONIC`
+(`hv/crates/vmlab-hv-display/src/trace.rs`, at the root of the vmlab
+repository). The lines are buffered and written every 100 ms.
+
+| Event | Where | What it records |
+| --- | --- | --- |
+| `cmd` | renderer thread | Every control command: type, context, fence flags, fence id, ring, length, duration |
+| `fence_new`, `fence_done` | renderer timeline | Each host fence with the guest fence it carries (context, ring, id), and when it signals |
+| `order` | ordered flip | Fences pending before the host wait, the wait's duration, the dma-buf writers of the scanout |
+| `pcopy`, `pcopy_src` | present copy | Source and destination, fences pending, the wait, the dma-buf fences of both; rows of the source that changed while it was copied |
+| `publish`, `export` | display publish | The publication time, the scanout resource, direct or copied, its modifier and dma-buf fences |
+| `readback` | console readback | The resource, its dma-buf writers, a digest of the pixels |
+| `rfb_send` | RFB server | The publication that each RFB update sent |
+| `flip` | ordered flip | The guest frame number and resource |
+
+`VMLAB_HV_GPU_TRACE_REREAD=1` also reads each readback twice, and the
+present copy's source again 2 ms after the copy. It changes the timing more.
+
+`tests/tearing/rfbgrab.py` now records the `CLOCK_MONOTONIC` times of each
+torn grab, and `tests/tearing/hosttrace.py <trace> <grab.json>` takes each
+torn grab to the RFB update inside it, the publication that update sent,
+that publication's export and readback, and every event of the 50 ms before.
+
+### Runs
+
+The labs of card #229 (driver `58111`, the host-ordered flip and the host
+present copy), vmlab-hv of this card, whole-window mode, 90 percent load,
+20,000 frames.
+
+| Run | Host GPU | Trace | Torn |
+| --- | --- | --- | --- |
+| rr | AMD1 | on, with the reread | 0 |
+| t1 | AMD1 | on | 4 (frames 14815, 15602, 19648, 19894) |
+| t2 | AMD1 | on, with the source check of the present copy | 7 (5 events: frames 5037, 9583, 15446, 17116, 18139) |
+| t1 | Nvidia2 | on, with the source check | 0 |
+
+Run t1 on AMD1 also counted 79 frames after frame 20449 in which the lowest
+rectangle was missing or moved as a whole: something covered the window at
+the end of the run. They are not counted as torn. No Xid on either GPU.
+
+The trace without the reread did not stop the tears on AMD1: 11 torn
+frames (9 events) in 40,000, more than the 2 in 20,000 of card #229. The reread run and
+the Nvidia2 run did not tear, so the tears there say nothing.
+
+### What the trace shows
+
+The scanouts of this guest are three resources (24, 25 and 26 on AMD1) with
+the modifier `DRM_FORMAT_MOD_INVALID`, so vmlab-hv cannot hand them to the
+display as they are. Every publication is a GL copy of the scanout into a
+pool buffer, and each flip publishes twice: at `SET_SCANOUT_BLOB`, and again
+in the ordered flip, after its host wait.
+
+- T1. The torn image is in the scanout before the flip and does not change
+  after it. For every torn grab the publication sent was one of the two
+  copies of its flip, and the two copies of each flip had equal digests:
+  16,172 of 16,172 pairs (AMD1 rr), 17,915 of 17,915 (AMD1 t2), 15,336 of
+  15,336 (Nvidia2). The display path does not make the tear. GPU work in
+  the guest composed it into the frame before the flip.
+- T2. The source of the present copy, the application's back buffer, did
+  not change while the host copied it: 0 rows in 17,306 copies on AMD1 and
+  in 15,368 on Nvidia2. The application's rendering does not race the copy.
+- T3. When an ordered flip or a present copy waited, no fence was pending
+  on the renderer's timeline before 99 percent of them (AMD1 rr: 19,309
+  of 19,376 flips, 17,903 of 18,054 copies). The kernel's dma-buf fences
+  of the scanouts and destinations read busy once in about 35,000 exports
+  (AMD1 t2) and never in the other runs. The host waits had almost nothing
+  to wait for.
+- T4. The fences of ring 0 of the Venus contexts are not GPU fences. The
+  application's context and DWM's send three `SUBMIT_3D` per frame of 24
+  bytes, the size of `vkNotifyRingMESA`, each with a fence on ring 0. That
+  fence goes to virglrenderer's global timeline, which no Venus work
+  blocks: it signals about 20 us after it was made (median on AMD1, about
+  100 us on NVIDIA). The fences on ring 1, after a `vkQueueSubmit`, take 0.7 ms
+  (application) and 1.5 ms (DWM) on AMD1, 1.8 ms and 2.0 ms on NVIDIA.
+
+### What is left
+
+The trace does not name the work. What it leaves is narrower than before:
+the tear is composed by guest GPU work into the scanout, from inputs that
+were complete when the host wrote them. The candidate that fits T1 to T4 is
+DWM's composition reading the window's redirection surface (the destination
+of the present copy) while the host present copy writes it, or the reverse.
+
+- Venus commands reach the render server through the context's ring in
+  shared memory. The render server runs them when its ring thread reads
+  them, as soon as the user-mode driver writes them, and not when the
+  guest's scheduler runs the DMA buffer that holds the `vkNotifyRingMESA`.
+  So the order that the guest's scheduler gives the present copy and DWM's
+  next composition does not hold on the host.
+- That DMA buffer completes on a ring-0 fence, which signals at once (T4).
+  The present copy's host wait covers fences on the timeline only (T3), so
+  it cannot wait for GPU work that is reached through the ring.
+- A linear CPU copy that a tiled GPU read overtakes gives a split at one
+  row, with groups of one to four rows at the edge. That is what the torn
+  frames show.
+
+vmlab-hv does not see when the render server reads a ring or when the GPU
+runs that work, so this trace cannot prove it. The next step, for the
+second session of the card: record in `virgl_render_server` the time at
+which the ring thread decodes each `vkQueueSubmit`, with its context and
+the resources of its command buffers, into the same trace. Then find, in a
+torn frame, DWM's submission that read the destination of the present copy
+and see whether it ran during that copy.
