@@ -1748,6 +1748,9 @@ async fn a_booting_guest_that_ignores_acpi_is_stopped_through_its_agent() {
         },
     );
     assert!(!vm.template().resolved.acpi_shutdown);
+    // The profile pins the TSC; a pin from an earlier start spares the probe,
+    // which only vmlab-hv has now (§22.4).
+    crate::qemu::tsc::write_pin(&vm.dirs.tsc_pin(), 3_000_000_000).expect("pin");
     let (cbs, mut observed) = callbacks();
     start_vm(&vm, cbs).await.expect("start");
 

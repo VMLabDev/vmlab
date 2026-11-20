@@ -777,7 +777,11 @@ mod tests {
         args.join(" ")
     }
 
-    fn arm() -> ResolvedVm {
+    /// The resolver's output, named so a signature does not read as a
+    /// struct literal to `resolution_is_never_mirrored`.
+    type Resolved = ResolvedVm;
+
+    fn arm() -> Resolved {
         resolved("linux-modern", "aarch64")
     }
 

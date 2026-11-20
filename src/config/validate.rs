@@ -2684,7 +2684,7 @@ template "t" { arch = "x86" version = "1" disk = 1GiB cpu_model = ""
         // Any non-empty name is QEMU's to judge, not vmlab's.
         let es = errs(
             r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" cpu_model = "Westmere,+aes" } }"#,
+lab "l" { vm "a" { template = "aarch64/t" cpu_model = "Westmere,+aes" } }"#,
         );
         assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
     }
@@ -2747,7 +2747,7 @@ template "w98" { arch = "x86" version = "1" disk = 1GiB nested = true cpu_model 
             r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" nested = true } }"#,
             r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" cpu_model = "pentium3" } }"#,
+lab "l" { vm "a" { template = "aarch64/t" cpu_model = "pentium3" } }"#,
         ] {
             let es = hw_errs(&Hardware::blank(), src);
             assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
@@ -2770,7 +2770,7 @@ template "t" { arch = "x86" version = "1" disk = 1GiB accel = "whpx"
         }
         for ok in ["kvm", "tcg"] {
             let es = errs(&format!(
-                "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"x86_64/t\" accel = \"{ok}\" }} }}"
+                "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"aarch64/t\" accel = \"{ok}\" }} }}"
             ));
             assert!(es.iter().all(|m| !m.contains("accel")), "{es:#?}");
         }
@@ -4543,6 +4543,12 @@ lab "l" {
   }
 }"#,
         );
+        // vmlab-hv does not run macOS yet, and QEMU runs no x86 guest: that
+        // refusal stands beside what this test is about.
+        let es: Vec<_> = es
+            .into_iter()
+            .filter(|e| !e.contains("a macOS guest"))
+            .collect();
         assert!(
             es.len() == 1 && es[0].contains("config-weave ships no macOS binary"),
             "{es:#?}"
@@ -4558,7 +4564,10 @@ lab "l" {
   }
 }"#,
         );
-        assert!(es.is_empty(), "{es:#?}");
+        assert!(
+            es.iter().all(|e| e.contains("a macOS guest")),
+            "{es:#?}"
+        );
         assert_err(
             r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" profile = "macos"
@@ -4847,9 +4856,11 @@ lab "l" {
         );
         assert_eq!(es.len(), 1, "{es:#?}");
         assert!(es[0].contains("/dev/kvm"), "{es:#?}");
-        // On QEMU it falls back to TCG, as it always has.
+        // Automatic selection refuses it the same way: QEMU runs no x86
+        // guest, so there is no fallback.
         let es = hv_errs(&host, r#"container "c" { image = "alpine" }"#);
-        assert!(es.is_empty(), "{es:#?}");
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("KVM is required"), "{es:#?}");
     }
 
     #[test]
