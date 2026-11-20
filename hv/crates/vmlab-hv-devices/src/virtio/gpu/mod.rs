@@ -56,6 +56,7 @@ const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCES: usize = 4096;
 const MAX_ENTRIES: usize = 16384;
 const INVALID: u32 = 0x1205;
+const OUT_OF_MEMORY: u32 = 0x1201;
 const RESOURCE: u32 = 0x1203;
 const SCANOUT: u32 = 0x1202;
 const NODATA: u32 = 0x1100;
