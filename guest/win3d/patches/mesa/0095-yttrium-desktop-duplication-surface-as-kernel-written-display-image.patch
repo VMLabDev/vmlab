@@ -39,7 +39,7 @@ Evidence: docs/present.md ("Desktop Duplication").
 Origin: GitHub VMLabDev/vmlab#237, written again on 76c095bb by card #146.
 ---
 diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
-index 7b06c02..1c824f0 100644
+index 7b06c02..f6f3c43 100644
 --- a/src/gallium/frontends/d3d10umd/Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/Resource.cpp
 @@ -640,6 +640,55 @@ sanitize_d3d11_resource_misc_flags(UINT flags)
@@ -98,13 +98,21 @@ index 7b06c02..1c824f0 100644
  static UINT
  translate_d3d11_resource_array_size(const D3D11DDIARG_CREATERESOURCE *create)
  {
-@@ -990,7 +1039,17 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -973,6 +1022,9 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+       templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT;
+    }
+ 
++   const bool duplication_surface = yttrium && !scanout_primary &&
++      is_desktop_duplication_surface(pCreateResource);
++
+    if (yttrium && scanout_primary) {
+       /* Creation cannot prove the eventual Present model. The screen hook
+        * rejects non-flip consumers before publishing this narrow primary. */
+@@ -990,7 +1042,15 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
        templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT;
     }
  
 -   if (yttrium && !scanout_primary &&
-+   const bool duplication_surface = yttrium && !scanout_primary &&
-+      is_desktop_duplication_surface(pCreateResource);
 +   if (duplication_surface) {
 +      /* The KMD writes this one on the CPU: a linear display image in
 +       * mappable memory, shared and opened as a swap chain's buffer was
