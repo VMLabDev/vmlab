@@ -59,8 +59,9 @@ folder file by file for the same reason.
 ## The check
 
 `tests/e2e/chromium.sh <lab-dir> <vm> <evidence-dir>` runs in a lab that
-`tests/e2e/run.sh --keep` left. It opens `tests/e2e/chromium/venc.html`, the
-page of the GitHub issue: one WebGL context, a WebGPU adapter request, a
+`tests/e2e/run.sh --keep` left, and the adapter suite (`tests/e2e/adapter.sh`,
+[acceptance.md](acceptance.md#adapter-suite)) runs it as its check `chromium`.
+It opens `tests/e2e/adapter/pages/venc.html`, the page of the GitHub issue: one WebGL context, a WebGPU adapter request, a
 query for a hardware H.264 encoder, then a new WebGL context every 4 s for
 20 s. `tests/guest/Test-ChromiumGpu.ps1` starts the browser in the user's
 session with a new profile, and while the page runs it records the profile's
@@ -79,10 +80,10 @@ Chrome for Testing has no field trials. The two features are what Chrome's
 field trials turn on, and with them the GPU process loads `d3d12.dll` on this
 page. A plain Chrome for Testing does not load it at all.
 
-The check is a script of its own and is not part of `tests/e2e/run.sh`. The
-adapter suite of card #148 has the same page as its rows `venc-chrome` and
-`venc-edge`; when that suite is on `next`, the control rows and the module
-record of this script belong in it.
+The adapter suite has the same page as its checks `venc-chrome` and
+`venc-edge`, which judge what the page reported and the crash dumps. This
+check adds the control rows, the record of which `d3d12.dll` the GPU process
+loaded, and the native row.
 
 ## Results
 

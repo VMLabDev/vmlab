@@ -21,6 +21,7 @@
 #   svb-chrome    P10      the static vertex buffer page in Chrome
 #   venc-chrome   P8       venc.html in Chrome: the GPU process survives
 #   svb-edge, venc-edge    the same two pages in the guest's own Edge
+#   chromium      P8       the GPU process loads the native d3d12.dll, and ends itself without (tests/e2e/chromium.sh)
 #   wine          P10      Wine's Direct3D 9, 10 and 11 tests
 #
 # Each check prints pass, fail or not-run; tests/e2e/adapter/judge.py holds the
@@ -36,7 +37,7 @@
 # that did not run is not a failure.
 # check-shell-paths: no-errexit each check records its own result and the suite goes on to the next (VML-88).
 set -uo pipefail
-[ $# -ge 3 ] || { sed -n '2,36p' "$0" >&2; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,37p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 A=$HERE/adapter
@@ -46,7 +47,7 @@ mkdir -p "$3/adapter"
 EV=$(cd "$3/adapter" && pwd)   # absolute: the vmlab commands run from the lab directory
 [ -n "$EV" ] && [ -d "$EV" ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 shift 3
-ALL="pointer pointer-shapes pace tear-flip tear-blt duplication d2d d2d-tir svb-chrome venc-chrome svb-edge venc-edge wine"
+ALL="pointer pointer-shapes pace tear-flip tear-blt duplication d2d d2d-tir svb-chrome venc-chrome svb-edge venc-edge chromium wine"
 CHECKS=${*:-${ADAPTER_CHECKS:-$ALL}}
 CACHE=$REPO/.scratch/e2e/cache
 STAGE=$REPO/.scratch/e2e/adapter/$(basename "$(dirname "$EV")")   # per evidence dir, so parallel runs do not share files
@@ -341,6 +342,23 @@ check_wine() {
     done
     [ $n -gt 0 ] && ran wine || skip wine "no Wine test program wrote a result"
 }
+check_chromium() {
+    # The check of the native d3d12.dll preload (docs/chromium.md) is a script of its
+    # own; it writes <evidence-dir>/chromium/ and its verdict there. It restarts the VM.
+    note "chromium"
+    local top rc
+    top=$(dirname "$EV")
+    [ -n "$top" ] && [ -d "$top" ] || { skip chromium "no evidence directory"; return; }
+    "$HERE/chromium.sh" "$LABDIR" "$VM" "$top" >"$STAGE/chromium.out" 2>&1
+    rc=$?
+    grep -E '^(PASS|FAIL) ' "$STAGE/chromium.out" | while read -r l; do note "  ${l:0:200}"; done
+    if [ -f "$top/chromium/chromium.json" ]; then
+        cp "$top/chromium/chromium.json" "$EV/chromium.json"
+        ran chromium
+    else
+        skip chromium "tests/e2e/chromium.sh ended with exit $rc and no verdict: $(tail -1 "$STAGE/chromium.out" | cut -c1-160)"
+    fi
+}
 
 note "adapter suite: $CHECKS"
 if ! guest_up; then
@@ -365,6 +383,7 @@ else
             venc-chrome) check_page venc-chrome chrome venc.html 45 D3D12VideoEncodeAccelerator,D3D12VideoDecoder ;;
             svb-edge) check_page svb-edge edge svb.html 25 ;;
             venc-edge) check_page venc-edge edge venc.html 45 D3D12VideoEncodeAccelerator,D3D12VideoDecoder ;;
+            chromium) check_chromium ;;
             wine) check_wine ;;
         esac
     done

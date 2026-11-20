@@ -2,11 +2,12 @@
 # A Chromium GPU process keeps running with the Direct3D 12 bridge installed
 # (patches/mesa 0095, docs/chromium.md, GitHub #238), checked in a lab where
 # the package is installed and the autologon desktop is up (a lab kept with
-# tests/e2e/run.sh --keep).
+# tests/e2e/run.sh --keep). tests/e2e/adapter.sh runs it as its check
+# "chromium".
 #
 #   tests/e2e/chromium.sh <lab-dir> <vm> <evidence-dir>
 #
-# tests/guest/Test-ChromiumGpu.ps1 opens tests/e2e/chromium/venc.html in the
+# tests/guest/Test-ChromiumGpu.ps1 opens tests/e2e/adapter/pages/venc.html in the
 # user's session: the page asks for a hardware video encoder, which makes the
 # GPU process load d3d12.dll, then tries WebGL every 4 s for 20 s. Rows:
 #
@@ -33,12 +34,13 @@
 # restart the five rows ended at 863 on AMD1 and at 910 on Nvidia2.
 # check-shell-paths: no-errexit each row records its rc and the judge decides; the ini must be put back (VML-88).
 set -uo pipefail
-[ $# -eq 3 ] || { sed -n '2,33p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,34p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 LABDIR=$(cd "$1" && pwd)
 VM=$2
-EV=$3/chromium
+mkdir -p "$3/chromium"
+EV=$(cd "$3/chromium" && pwd)   # absolute: the vmlab commands run from the lab directory
 STAGE=$REPO/.scratch/e2e/chromium/$(basename "$3")
 CACHE=$REPO/.scratch/e2e/cache
 FEATURES=D3D12VideoEncodeAccelerator,D3D12VideoDecoder
@@ -67,7 +69,7 @@ fetch_pin() {
     echo "$f"
 }
 
-[ -n "$EV" ] && [ "$EV" != /chromium ] || { echo "VML-88: EV is empty or /" >&2; exit 2; }
+[ -n "$EV" ] && [ -d "$EV" ] && [ "$EV" != / ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 [ -n "$STAGE" ] && [ "$STAGE" != / ] || { echo "VML-88: STAGE is empty or /" >&2; exit 2; }
 mkdir -p "$EV" "$STAGE"
 find "$EV" -mindepth 1 -delete
@@ -90,7 +92,7 @@ gps "New-Item -ItemType Directory -Force '$G', 'C:\\win3d\\chromium', 'C:\\apps'
 for f in Run-Probe.ps1 Test-ChromiumGpu.ps1; do
     in_lab vmlab cp "$REPO/tests/guest/$f" "$VM:C:/win3d/guest/$f" || exit 1
 done
-in_lab vmlab cp "$HERE/chromium/venc.html" "$VM:C:/win3d/chromium/venc.html" || exit 1
+in_lab vmlab cp "$HERE/adapter/pages/venc.html" "$VM:C:/win3d/chromium/venc.html" || exit 1
 # What the installer left: the bridge, the native file and its copy, per architecture.
 gps 'foreach ($d in "System32", "SysWOW64") { foreach ($n in "d3d12.dll", "vmlab-win3d\d3d12-native.dll", "vmlab-win3d\native\d3d12.dll") {
         $p = Join-Path (Join-Path $env:SystemRoot $d) $n

@@ -5,7 +5,7 @@ whether the browser's GPU process survived it, and which d3d12.dll it loaded.
 
 .DESCRIPTION
 For `tests/e2e/chromium.sh` (docs/chromium.md, GitHub #238). The page
-(`tests/e2e/chromium/venc.html`) writes its result to the browser console as
+(`tests/e2e/adapter/pages/venc.html`) writes its result to the browser console as
 `WIN3D-RESULT <base64 JSON>`. The browser runs with a new profile and with
 --enable-logging --log-file, so the line lands in a file this script reads
 after -Seconds, when Run-Probe.ps1 has closed the browser.
