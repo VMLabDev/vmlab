@@ -226,7 +226,8 @@ jobs:
         run: |
           set -eu
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            if [ -n "$(git diff --name-only HEAD^1 HEAD -- guest/build-asset.sh)" ]; then
+            changed=$(git diff --name-only HEAD^1 HEAD -- guest/build-asset.sh)
+            if [ -n "$changed" ]; then
               printf 'guest_dry_run=true\nversion=0.0.0-dry-run\n' >> "$GITHUB_OUTPUT"
             fi
             exit 0
@@ -449,6 +450,7 @@ jobs:
           path: |
             target/guest-package/vmlab-guest-${{ needs.version.outputs.version }}.tar.gz
             target/guest-package/vmlab-guest-${{ needs.version.outputs.version }}.tar.gz.sha256
+          if-no-files-found: error
           retention-days: 1
 
   # The hypervisor and viewer share the in-tree protocol crates.
