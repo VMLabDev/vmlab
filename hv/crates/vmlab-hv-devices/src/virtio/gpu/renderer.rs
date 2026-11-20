@@ -1202,7 +1202,47 @@ impl Backend {
                 wait_fences(fd.as_raw_fd(), flags, Duration::from_secs(1));
             }
         }
+        // With the trace on, read the source before and after the copy: rows
+        // that differ were written by other work while the copy read them.
+        let probe = |src: &super::copy::Segments| -> Option<Vec<u8>> {
+            use super::copy::Memory;
+            let top = request.boxes.iter().map(|b| b.src_y).min()?;
+            let bottom = request.boxes.iter().map(|b| b.src_y + b.height).max()?;
+            let start = request.src_offset + u64::from(top) * u64::from(request.src_stride);
+            let len = (u64::from(bottom - top) * u64::from(request.src_stride))
+                .min(src.len().checked_sub(start)?);
+            let mut out = vec![0; usize::try_from(len).ok()?];
+            src.read(start, &mut out).ok()?;
+            Some(out)
+        };
+        let before = trace::on().then(|| probe(&src)).flatten();
         let copied = super::copy::run(request, &src, &mut dst)?;
+        if let Some(before) = before {
+            let stride = request.src_stride as usize;
+            let rows = |a: &[u8], b: &[u8]| match trace::differing_rows(a, stride, b, stride, stride) {
+                None => "0".to_string(),
+                Some((first, last, count)) => format!("{count}:{first}-{last}"),
+            };
+            let after = probe(&src);
+            let during = after.as_ref().map_or("-".to_string(), |after| rows(&before, after));
+            // The reread knob also looks again 2 ms later.
+            let late = match (&after, trace::reread()) {
+                (Some(after), true) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    probe(&src).map_or("-".to_string(), |late| rows(after, &late))
+                }
+                _ => "-".to_string(),
+            };
+            trace::write(
+                "pcopy_src",
+                format_args!(
+                    "src={} dst={} digest={:016x} during={during} later={late}",
+                    request.src,
+                    request.dst,
+                    trace::digest(&before)
+                ),
+            );
+        }
         if self.present_copies == 0 {
             log::info!("virtio-gpu: the guest copies its Blt presents on the host");
         }
