@@ -624,6 +624,7 @@ next to each probe's JSON.
 | P3 to P5, a flip shows a finished frame | `tear-flip` | `tear_probe.exe --mode flip`: every frame of its window is one colour of eight, drawn top to bottom in 48 strips by a slow pixel shader, without a clear. It animates for 3 s and holds for 3 s, for 40 s. `tests/e2e/adapter/rfbgrab.py` reads the window from the console's RFB socket about 30 times a second. | No console frame has rows of two colours. At least 100 frames showed the window. |
 | P3 to P5 | `tear-blt` | The same with `--mode blt`: a blt-model swap chain, the present of the Blt kind that windowed Direct3D 9, WPF and DirectDraw make. | As above. |
 | P7, Desktop Duplication | `duplication` | `dupl_probe.exe` takes eight frames with `AcquireNextFrame` while a window of its own changes colour. | Eight frames, each at least half lit, each with the window in the colour it had. |
+| P7 | `shared-texture` | `share_probe.exe` shares a BGRA render target between two Direct3D 11 devices, by legacy handle and with a keyed mutex, at the size of the desktop (the shape the driver takes for a duplication surface, [present.md](present.md#desktop-duplication)) and at 256×256. Each device fills it and the other reads it. | In all four cases every pixel read is the colour written, in both directions. |
 | P10, correct rendering | `d2d` | `d2d_probe.exe` fills rounded rectangles, ellipses and path geometries with Direct2D three times, each on a new device, and once on WARP. | No pixel WARP filled is missing, none it left white is drawn, and the three pictures are the same. The device must be feature level 11.1. |
 | P10 | `d2d-tir` | `tests/e2e/tir.sh`, the check of the coverage patch ([d2d-coverage.md](d2d-coverage.md)): `tir_probe.exe`, x64 and x86, draws what Direct2D draws to antialias a shape, on the adapter and on WARP. Its evidence is in `tir/`. | Both probes find no pixel that differs from WARP or between runs, and the driver logged one pass per sample for the x64 probe. |
 | P10 | `svb-chrome`, `svb-edge` | `tests/e2e/adapter/pages/svb.html`, the page of GitHub #233: a quad from a vertex buffer of each usage hint. | Each of the three lines reads `255,0,0,255`, with WebGL on the adapter. |
@@ -724,6 +725,12 @@ What the baseline says:
   of that path: its probe found pixels that differ on both GPUs without the
   patch. The failing checks above, and `pointer` in the earlier baseline,
   show that their probes do detect.
+- B8. After the baseline: with driver `100.6.101.58107` (`patches/kmd/0006`
+  and `patches/mesa/0095`) `duplication` passes on both GPUs, eight lit
+  frames of eight, and the new check `shared-texture` passes
+  ([present.md](present.md#desktop-duplication)). Those runs selected
+  `duplication`, `shared-texture` and `tear-blt` only, so the tables below
+  are still the baseline's, with `duplication` failing.
 
 <!-- e2e:adapter -->
 ### windows-11

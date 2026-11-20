@@ -138,7 +138,7 @@ vkd3d-proton queues go to DXVK's DXGI, and everything else stays native.
 | Installed by | The INF (`VioGpu3D_Files.Usermode`, `VioGpu3D_Files.Wow64`, `VioGpu3D_DeviceSettings`) |
 | Upstream | [arehnman/virtio-win-mesa](https://github.com/arehnman/virtio-win-mesa), branch `yttrium-experimental`, commit `76c095bb`, the November 2026 release (Mesa 26.1.0) |
 | Build | [`build/mesa/`](../build/mesa/README.md) |
-| Patches | Mesa 44, shared with the two Mesa components below (table below). [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
+| Patches | Mesa 45, shared with the two Mesa components below (table below). [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
 | Licence | Mesa MIT; the Yttrium winsys (`src/gallium/winsys/yttrium/gdi/`) MPL-2.0 |
 
 `viogpu_d3d10.dll` is Mesa's `d3d10umd` front end (D3D10/11 DDI, plus a
@@ -184,12 +184,12 @@ renderer, `vn_renderer_d3dkmt.c`, submits Venus commands to the KMD with
 | Installed by | The installer runs `pnputil /add-driver viogpu3d.inf /install`. The package is test-signed ([decision 0001](decisions/0001-signing.md)). |
 | Upstream | [arehnman/yttrium-virtio-gpu](https://github.com/arehnman/yttrium-virtio-gpu), tag `yttrium-experimental-2026-11-02` (`e9917ae2`), a fork of virtio-win/kvm-guest-drivers-windows |
 | Build | [`build/kmd/`](../build/kmd/README.md), clang-cl and lld-link against the WDK NuGet packages |
-| Patches | 5 (table below) |
+| Patches | 6 (table below) |
 | Licence | BSD-3-Clause; Yttrium's changes to `viogpu3d` are also MPL-2.0 where marked |
 
 The device appears as "Yttrium VirtIO GPU 3D controller" (upstream renamed
 it from "Hardsoft VirtIO GPU 3D controller" in the November release), driver
-version 100.6.101.58106. It is a WDDM 2.0 display miniport with Venus and blob
+version 100.6.101.58107. It is a WDDM 2.0 display miniport with Venus and blob
 resource support, a hardware pointer ([pointer.md](pointer.md)) and a 60 Hz
 VidPN timer. It needs the
 `VIRTIO_GPU_F_VIRGL` feature, so it fails to start on a plain `virtio-vga`.
@@ -310,12 +310,13 @@ committed.
 | --- | --- | --- | --- | --- |
 | dxil-spirv | 0 | — | None; see [`patches/dxil-spirv/`](../patches/dxil-spirv/) | — |
 | dxvk | 1 | [`0001`](../patches/dxvk/0001-dxgi-Keep-the-swap-chain-description-when-a-resize-fails.patch) | dxgi: Keep the swap-chain description when a resize fails. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| kmd | 5 | [`0001`](../patches/kmd/0001-kmd-r10-copy.patch) | Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD) | [`build/kmd/README.md`](../build/kmd/README.md) |
+| kmd | 6 | [`0001`](../patches/kmd/0001-kmd-r10-copy.patch) | Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD) | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0002`](../patches/kmd/0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch) | viogpu3d: map GDI shadow and staging surfaces cached | [`docs/present.md`](present.md) |
 | | | [`0003`](../patches/kmd/0003-kmd-create-context-for-gdi-devices.patch) | viogpu3d: create a legacy context before opening GDI allocations | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0004`](../patches/kmd/0004-kmd-recover-from-timeouts.patch) | viogpu3d: recover transport and device state after a timeout | [`docs/tdr-recovery.md`](tdr-recovery.md) |
 | | | [`0005`](../patches/kmd/0005-kmd-hardware-pointer.patch) | viogpu3d: a hardware pointer on the cursor queue | [`docs/pointer.md`](pointer.md) |
-| mesa | 44 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
+| | | [`0006`](../patches/kmd/0006-kmd-present-blt-into-mappable-blob.patch) | viogpu3d: allow a present copy into a mappable blob | [`docs/present.md`](present.md) |
+| mesa | 45 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0002`](../patches/mesa/0002-util-xmlconfig-case-insensitive-exe-match.patch) | util/xmlconfig: match drirc executable names case-insensitively on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0003`](../patches/mesa/0003-util-u_queue-windows-loader-lock-join.patch) | util/u_queue: do not join worker threads under the loader lock on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0004`](../patches/mesa/0004-wgl-unbind-through-stw-on-delete.patch) | wgl: unbind the current context through stw_make_current on delete | [`build/mesa/README.md`](../build/mesa/README.md) |
@@ -359,6 +360,7 @@ committed.
 | | | [`0092`](../patches/mesa/0092-yttrium-bound-in-flight-uploads.patch) | yttrium: bound in-flight upload buffers in 32-bit processes | [`docs/f6va.md`](f6va.md) |
 | | | [`0093`](../patches/mesa/0093-yttrium-guard-revoked-batch-feedback.patch) | yttrium: report device loss for revoked feedback mappings | [`docs/tdr-recovery.md`](tdr-recovery.md) |
 | | | [`0094`](../patches/mesa/0094-yttrium-forced-sample-coverage-one-pass-per-sample.patch) | yttrium: draw forced-sample coverage as one pass per sample | [`docs/d2d-coverage.md`](d2d-coverage.md) |
+| | | [`0095`](../patches/mesa/0095-yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch) | yttrium: make a Desktop Duplication surface a kernel-written display image | [`docs/present.md`](present.md) |
 | vkd3d-proton | 6 | [`0001`](../patches/vkd3d-proton/0001-vkd3d-Reject-root-signatures-with-overlapping-regist.patch) | vkd3d: Reject root signatures with overlapping register bindings. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0002`](../patches/vkd3d-proton/0002-vkd3d-Report-FORMAT_INFO-plane-counts-without-a-Vulk.patch) | vkd3d: Report FORMAT_INFO plane counts without a Vulkan format mapping. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0003`](../patches/vkd3d-proton/0003-vkd3d-Allow-depth-stencil-textures-in-CPU-visible-he.patch) | vkd3d: Allow depth-stencil textures in CPU-visible heaps. | [`build/d3d12/README.md`](../build/d3d12/README.md) |

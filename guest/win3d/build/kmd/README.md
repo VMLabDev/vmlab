@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58106` | The PE version resource and the INF's `DriverVer` version. This version adds the hardware pointer (0005). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58107` | The PE version resource and the INF's `DriverVer` version. This version adds the present copy into a mappable blob (0006). `58106` added the hardware pointer (0005). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Outputs
 
@@ -158,6 +158,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `0003-kmd-create-context-for-gdi-devices.patch` | Creates the legacy host context when the kernel device is constructed, so GDI devices that present without a UMD have one ([`docs/gdi-context.md`](../../docs/gdi-context.md)). |
 | `0004-kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
 | `0005-kmd-hardware-pointer.patch` | Hardware pointer: reports a 64×64 pointer when `HWCursor` is set, sends Windows' shape, position and visibility on the cursor queue, restores them after a device reset, and sets `HWCursor` to 1 in the INF ([`docs/pointer.md`](../../docs/pointer.md)). |
+| `0006-kmd-present-blt-into-mappable-blob.patch` | Desktop Duplication: a present copy of the Blt kind may write into a blob when source and destination are both mappable blobs. The destination is mapped in `Present` and written at the image's offset in the blob ([`docs/present.md`](../../docs/present.md#desktop-duplication)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
