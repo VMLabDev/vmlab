@@ -2,7 +2,7 @@
 # End-to-end acceptance run for the Done items in docs/brief.md.
 #
 #   tests/e2e/run.sh [--template windows-11|windows-10] [--host-gpu NAME]
-#                    [--lab NAME] [--keep] [--apps]
+#                    [--lab NAME] [--keep] [--apps] [--variant win3d]
 #
 # From nothing: builds the package (or reuses out/package/ when it was built
 # from a tree identical to HEAD), brings up a fresh lab from
@@ -20,9 +20,12 @@
 # applications (tests/e2e/apps.sh) into <evidence>/apps/ and then the adapter
 # suite (tests/e2e/adapter.sh) into <evidence>/adapter/; they do not
 # count towards the exit status.
+# --variant win3d clones the template's #win3d variant, which has the package
+# installed already: step 4 then checks that install instead of running one,
+# and the evidence and scratch names end in -win3d.
 #
 # Exit status: 0 when every Done check passes, 1 otherwise, 2 on usage.
-# Lab state lives in .scratch/e2e/<template>[-<gpu>]/lab/.vmlab/.
+# Lab state lives in .scratch/e2e/<template>[-<gpu>][-win3d]/lab/.vmlab/.
 # check-shell-paths: no-errexit probes and checks record a failed rc and go on; teardown and evidence must run (VML-88).
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -32,6 +35,7 @@ HOST_GPU=AMD1
 LAB=
 KEEP=0
 APPS=0
+VARIANT=
 while [ $# -gt 0 ]; do
     case $1 in
         --template) TEMPLATE=${2:-}; shift 2 ;;
@@ -39,11 +43,13 @@ while [ $# -gt 0 ]; do
         --lab) LAB=${2:-}; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --apps) APPS=1; shift ;;
-        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
-        *) sed -n '2,27p' "$0" >&2; exit 2 ;;
+        --variant) VARIANT=${2:-}; shift 2 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+        *) sed -n '2,28p' "$0" >&2; exit 2 ;;
     esac
 done
 case $TEMPLATE in windows-11|windows-10) ;; *) echo "unknown template $TEMPLATE" >&2; exit 2 ;; esac
+case $VARIANT in ''|win3d) ;; *) echo "unknown variant $VARIANT" >&2; exit 2 ;; esac
 [[ $HOST_GPU =~ ^[A-Za-z0-9_-]+$ ]] || { echo "bad --host-gpu '$HOST_GPU'" >&2; exit 2; }
 HOSTCFG=${XDG_CONFIG_HOME:-$HOME/.config}/vmlab/config.wcl
 gpu_attr() { # gpu_attr ATTR: a string attribute of the host config's gpu "$HOST_GPU" block
@@ -60,6 +66,8 @@ TDIR=$HOME/.local/share/vmlab/templates/x86_64/$TEMPLATE
 VER=$(ls "$TDIR" 2>/dev/null | sort -V | tail -1)
 [ -n "$VER" ] || { echo "no local template $TEMPLATE in $TDIR" >&2; exit 2; }
 SUFFIX=; [ "$HOST_GPU" = AMD1 ] || SUFFIX=-${HOST_GPU,,}
+[ -z "$VARIANT" ] || SUFFIX=$SUFFIX-$VARIANT
+TREF=x86_64/$TEMPLATE@$VER${VARIANT:+#$VARIANT}
 LAB=${LAB:-win3d-e2e-$TEMPLATE$SUFFIX}
 VM=win
 WORK=$REPO/.scratch/e2e/$TEMPLATE$SUFFIX
@@ -97,7 +105,7 @@ host_stack() {
         echo "date: $(date -Is)"
         echo "commit: $(git -C "$REPO" rev-parse HEAD)"
         echo "worktree changes: $(git -C "$REPO" status --porcelain | grep -v ' docs/evidence/acceptance/' | wc -l)"
-        echo "template: x86_64/$TEMPLATE@$VER"
+        echo "template: $TREF"
         echo "kernel: $(uname -r)"
         echo "qemu (PATH): $(qemu-system-x86_64 --version | head -1)"
         echo "hypervisor: $(command -v vmlab-hv)"
@@ -148,14 +156,14 @@ build() {
 }
 
 lab_up() {
-    say "2 fresh lab $LAB from x86_64/$TEMPLATE@$VER"
+    say "2 fresh lab $LAB from $TREF"
     if [ -f "$LABDIR/vmlab.wcl" ]; then
         note "destroying the previous $LAB"
         in_lab vmlab destroy || true
     fi
     mkdir -p "$LABDIR"
     sed -e "s/\"win3d-e2e-windows-11\"/\"$LAB\"/" \
-        -e "s#\"x86_64/windows-11@[^\"]*\"#\"x86_64/$TEMPLATE@$VER\"#" \
+        -e "s|\"x86_64/windows-11@[^\"]*\"|\"$TREF\"|" \
         -e "s/host_gpu = \"AMD1\"/host_gpu = \"$HOST_GPU\"/" \
         "$REPO/labs/acceptance/vmlab.wcl" >"$LABDIR/vmlab.wcl"
     [ -n "$EV" ] && [ "$EV" != / ] || { echo "VML-88: EV is empty or /" >&2; return 1; }
@@ -253,15 +261,37 @@ session_tests() {
 }
 
 install() {
-    say "4 install: scripts/install-into-vm.sh $LABDIR $VM"
     local rc=0
-    "$REPO/scripts/install-into-vm.sh" "$LABDIR" "$VM" 2>&1 | tee "$EV/install.log"
-    rc=${PIPESTATUS[0]}
+    if [ -n "$VARIANT" ]; then
+        preinstalled; rc=$?
+    else
+        say "4 install: scripts/install-into-vm.sh $LABDIR $VM"
+        "$REPO/scripts/install-into-vm.sh" "$LABDIR" "$VM" 2>&1 | tee "$EV/install.log"
+        rc=${PIPESTATUS[0]}
+    fi
     echo "exit: $rc" >"$EV/install.rc"
     gps 'Get-Content C:\ProgramData\vmlab-win3d\journal.log' >"$EV/install-journal.log" 2>&1 || true
     gps 'C:\win3d\guest\Get-GpuState.ps1 -OutFile C:\win3d\results\installed-gpu-state.json | Out-Null; Get-Content C:\win3d\results\installed-gpu-state.json -Raw' \
         >"$EV/installed-gpu-state.json" || true
     return "$rc"
+}
+
+preinstalled() { # --variant: the clone came with the package; check that install, write install.log
+    say "4 install: preinstalled by the #$VARIANT variant"
+    local st ver want
+    st=$(gps '$p = "C:\ProgramData\vmlab-win3d\state.json"; if (Test-Path $p) { $s = Get-Content $p -Raw | ConvertFrom-Json; "{0}|{1}|{2}" -f $s.status, $s.step, $s.last_error } else { "NotInstalled||" }' 60 | tail -1)
+    ver=$(gps '(Get-Content C:\ProgramData\vmlab-win3d\bundle\manifest.json -Raw | ConvertFrom-Json) | ForEach-Object { "{0} {1}" -f $_.version, $_.commit }' 60 | tail -1)
+    want=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["version"], d["commit"])' \
+        "$REPO/out/package/vmlab-win3d-$(cat "$REPO/installer/VERSION")/manifest.json" 2>/dev/null)
+    {
+        echo "variant: $TREF"
+        echo "state.json: $st"
+        echo "installed bundle: $ver"
+        echo "out/package bundle: $want"
+        [ "$ver" = "$want" ] || echo "note: the installed bundle is not the one in out/package"
+        [ "${st%%|*}" = Installed ] && echo "done: Installed"
+    } | tee "$EV/install.log"
+    [ "${st%%|*}" = Installed ]
 }
 
 wait_desktop() {
