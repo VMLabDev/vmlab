@@ -4564,10 +4564,7 @@ lab "l" {
   }
 }"#,
         );
-        assert!(
-            es.iter().all(|e| e.contains("a macOS guest")),
-            "{es:#?}"
-        );
+        assert!(es.iter().all(|e| e.contains("a macOS guest")), "{es:#?}");
         assert_err(
             r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" profile = "macos"
