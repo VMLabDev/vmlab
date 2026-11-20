@@ -1,0 +1,164 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: let the host order the flip when it offers to
+
+Card #143 (docs/tearing.md) found that no wait the guest can make ends the
+torn frames under host load: between a frame that the guest calls finished
+and the host's read of it for its display, host GPU work on the same surface
+can still run, and the guest has no fence that covers it. vmlab-hv sees
+every host queue, so it orders the flip itself (docs/flip.md).
+
+vmlab-hv offers the private feature bit VIRTIO_GPU_F_VMLAB_ORDERED_FLIP (23).
+When the driver acks it, CtrlQueue::ResFlush, which every flush of the
+scanout goes through (the vsync timer's flip, a flip from a DMA buffer, a
+mode set), sends VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP (0x0f00) with the frame
+number in place of RESOURCE_FLUSH. The host answers it after every fence of
+its renderer and the implicit fence of the scanout buffer have signalled and
+the frame is on its display, and it serves no later command before that
+answer. So the NOP that
+raises the vsync interrupt, and the completion of a flip's DMA buffer, both
+follow the publish, and Windows learns that the old primary is free only
+after the host has stopped reading it.
+
+A host that does not offer the bit (QEMU, an older vmlab-hv) leaves
+m_OrderedFlip false, and the driver sends RESOURCE_FLUSH as before.
+---
+diff --git a/viogpu/common/viogpu.h b/viogpu/common/viogpu.h
+index 726cb67..c4a6643 100644
+--- a/viogpu/common/viogpu.h
++++ b/viogpu/common/viogpu.h
+@@ -231,6 +231,22 @@ typedef struct virtio_gpu_resource_flush
+ } GPU_RES_FLUSH, *PGPU_RES_FLUSH;
+ #pragma pack()
+ 
++/* VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP (VIRTIO_GPU_F_VMLAB_ORDERED_FLIP): the
++ * flush of a flip. The host answers it OK_NODATA after its fences and those
++ * of the scanout buffer have signalled and the frame is on its display, and
++ * it serves no later command of the control queue before that answer. */
++#define VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP 0x0f00
++#pragma pack(1)
++typedef struct virtio_gpu_vmlab_ordered_flip
++{
++    GPU_CTRL_HDR hdr;
++    ULONG scanout_id;
++    ULONG resource_id;
++    GPU_RECT r;
++    ULONGLONG frame;
++} GPU_VMLAB_ORDERED_FLIP, *PGPU_VMLAB_ORDERED_FLIP;
++#pragma pack()
++
+ /* VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: simple transfer to_host */
+ #pragma pack(1)
+ typedef struct virtio_gpu_transfer_to_host_2d
+@@ -542,6 +558,10 @@ typedef struct _COLOR_CHARACTERISTICS
+ #define VIRTIO_GPU_F_RESOURCE_BLOB  3
+ #define VIRTIO_GPU_F_CONTEXT_INIT   4
+ #define VIRTIO_GPU_F_RESOURCE_SYNC  5
++/* vmlab-hv only, not in the VIRTIO specification: the host-ordered flip.
++ * The host offers it, and the driver then sends VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP
++ * in place of RESOURCE_FLUSH for every flush of the scanout. */
++#define VIRTIO_GPU_F_VMLAB_ORDERED_FLIP 23
+ 
+ #define ISR_REASON_DISPLAY 1
+ #define ISR_REASON_CURSOR  2
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index a3608ab..2777008 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -1053,17 +1053,37 @@ UINT CtrlQueue::ResFlush(UINT res_id,
+                          void *complete_ctx)
+ {
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+-    PGPU_RES_FLUSH cmd;
+     PGPU_VBUFFER vbuf;
+-    cmd = (PGPU_RES_FLUSH)AllocCmd(&vbuf, sizeof(*cmd));
+-    RtlZeroMemory(cmd, sizeof(*cmd));
++    if (m_OrderedFlip)
++    {
++        // Every caller flushes the scanout for a flip. A guest-side wait
++        // cannot order it after host GPU work that no guest fence covers
++        // (docs/flip.md), so the host orders it, and holds the commands
++        // behind it, among them the NOP of the vsync, until it is shown.
++        PGPU_VMLAB_ORDERED_FLIP flip = (PGPU_VMLAB_ORDERED_FLIP)AllocCmd(&vbuf, sizeof(*flip));
++        RtlZeroMemory(flip, sizeof(*flip));
++
++        flip->hdr.type = VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP;
++        flip->scanout_id = 0;
++        flip->resource_id = res_id;
++        flip->r.width = width;
++        flip->r.height = height;
++        flip->r.x = x;
++        flip->r.y = y;
++        flip->frame = (ULONGLONG)InterlockedIncrement64(&m_FlipFrame);
++    }
++    else
++    {
++        PGPU_RES_FLUSH cmd = (PGPU_RES_FLUSH)AllocCmd(&vbuf, sizeof(*cmd));
++        RtlZeroMemory(cmd, sizeof(*cmd));
+ 
+-    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+-    cmd->resource_id = res_id;
+-    cmd->r.width = width;
+-    cmd->r.height = height;
+-    cmd->r.x = x;
+-    cmd->r.y = y;
++        cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
++        cmd->resource_id = res_id;
++        cmd->r.width = width;
++        cmd->r.height = height;
++        cmd->r.x = x;
++        cmd->r.y = y;
++    }
+ 
+     vbuf->complete_cb = complete_cb;
+     vbuf->complete_ctx = complete_ctx;
+diff --git a/viogpu/common/viogpu_queue.h b/viogpu/common/viogpu_queue.h
+index ac64bb0..6bca5a3 100644
+--- a/viogpu/common/viogpu_queue.h
++++ b/viogpu/common/viogpu_queue.h
+@@ -299,6 +299,12 @@ class CtrlQueue : public VioGpuQueue
+     {
+         m_SyncExec = syncExec;
+     }
++    // VIRTIO_GPU_F_VMLAB_ORDERED_FLIP was negotiated: ResFlush sends the
++    // host-ordered flip.
++    void SetOrderedFlip(BOOLEAN orderedFlip)
++    {
++        m_OrderedFlip = orderedFlip;
++    }
+     UINT Flush();
+ 
+     void CreateResource(UINT res_id, UINT format, UINT width, UINT height);
+@@ -395,6 +401,8 @@ class CtrlQueue : public VioGpuQueue
+     // it is NOT an error. Watch this to confirm how often the vq runs dry.
+     volatile LONG m_CtrlQueueFullRequeues;
+     IVioGpuQueueSync *m_SyncExec = NULL;
++    BOOLEAN m_OrderedFlip = FALSE;
++    volatile LONG64 m_FlipFrame = 0;
+ };
+ 
+ class CrsrQueue : public VioGpuQueue
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index fa5e1a7..b49c365 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -3075,6 +3075,12 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
+         {
+             DbgPrint(TRACE_LEVEL_ERROR, ("VIRTIO_GPU_F_RESOURCE_BLOB not supported by host\n"));
+         }
++        // vmlab-hv's private feature. QEMU does not offer it, and the driver
++        // then keeps RESOURCE_FLUSH.
++        if (!AckFeature(VIRTIO_GPU_F_VMLAB_ORDERED_FLIP))
++        {
++            DbgPrint(TRACE_LEVEL_INFORMATION, ("host-ordered flip not offered; flips use RESOURCE_FLUSH\n"));
++        }
+         if (!AckFeature(VIRTIO_F_VERSION_1))
+         {
+             status = STATUS_UNSUCCESSFUL;
+@@ -3119,6 +3125,7 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
+         }
+ 
+         ctrlQueue.SetSynchronizeExecution(this);
++        ctrlQueue.SetOrderedFlip(virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_VMLAB_ORDERED_FLIP) ? TRUE : FALSE);
+ 
+         virtio_get_config(&m_VioDev,
+                           FIELD_OFFSET(GPU_CONFIG, num_scanouts),

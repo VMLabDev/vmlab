@@ -447,6 +447,33 @@ impl Renderer {
         })
     }
 
+    /// The host wait of an ordered flip, [`Backend::order`].
+    pub fn order(&self) -> Result<(), u32> {
+        self.call(Backend::order)
+    }
+
+    /// Return when the renderer has run every task queued before this
+    /// call, among them the console's readback of a published frame.
+    pub fn settle(&self) -> Result<(), u32> {
+        self.call(|_| Ok(()))
+    }
+
+    /// Wait until the display has stopped reading every published frame
+    /// but the newest one, and lend those no more.
+    pub fn retire_previous(&self) {
+        let older: Vec<_> = {
+            let mut direct = self.direct.lock();
+            direct.retain(|lease| lease.strong_count() != 0);
+            let live: Vec<_> = direct.iter().filter_map(|lease| lease.upgrade()).collect();
+            live.split_last()
+                .map(|(_, older)| older.to_vec())
+                .unwrap_or_default()
+        };
+        for lease in older {
+            lease.retire();
+        }
+    }
+
     pub fn complete(&self, flags: u32, id: u64, ctx: u32, index: u8) -> bool {
         self.completed
             .lock()
@@ -683,6 +710,46 @@ impl Renderer {
     }
 }
 
+/// `struct dma_buf_export_sync_file` of Linux 6.0.
+#[repr(C)]
+struct ExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`: `_IOWR('b', 2, struct dma_buf_export_sync_file)`.
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u32 = 0xc008_6202;
+/// The fences a reader waits for: those of the writers.
+const DMA_BUF_SYNC_READ: u32 = 1;
+
+/// Wait at most `timeout` until the writers that the kernel tracks on the
+/// dma-buf `fd` have finished. False when the kernel gives no sync file, or
+/// the wait timed out. NVIDIA attaches no implicit fences, so there the
+/// sync file is already signalled.
+fn wait_writers(fd: std::os::fd::RawFd, timeout: Duration) -> bool {
+    use std::os::fd::FromRawFd;
+    let mut export = ExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    // SAFETY: the request takes a pointer to this struct, which outlives the call.
+    if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &mut export) } != 0
+        || export.fd < 0
+    {
+        return false;
+    }
+    // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+    let sync = unsafe { std::os::fd::OwnedFd::from_raw_fd(export.fd) };
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&sync),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd for the duration of the call.
+    unsafe { libc::poll(&mut poll, 1, millis) == 1 }
+}
+
 fn host<T>(result: RutabagaResult<T>) -> Result<T, u32> {
     result.map_err(|error| {
         log::warn!("virtio-gpu: {error}");
@@ -844,6 +911,25 @@ impl Backend {
         }
         Ok(())
     }
+    /// The host wait of an ordered flip: everything on the timeline,
+    /// whatever context it came from, and then the writers that the kernel
+    /// tracks on the scanout's dma-buf. A guest sees only the fences of its
+    /// own submissions, so it cannot make this wait. A fence on each context
+    /// ring would reach further, but virglrenderer ends a Venus context
+    /// whose ring has lost its queue when it is fenced.
+    fn order(&mut self) -> Result<(), u32> {
+        self.synchronize()?;
+        if let Some((id, _)) = self.scanout
+            && let Some(fd) = self.resources.get(&id).and_then(|r| r.exported.clone())
+        {
+            use std::os::fd::AsRawFd;
+            if !wait_writers(fd.as_raw_fd(), Duration::from_secs(1)) {
+                log::debug!("scanout {id}: no implicit fence to wait for");
+            }
+        }
+        Ok(())
+    }
+
     /// Refuse a resource the descriptor limit cannot pay for.
     fn admit_resource(&mut self) -> Result<(), u32> {
         if self.resources.len() < self.budget {
@@ -1512,6 +1598,14 @@ mod tests {
         renderer.command(&mem, &request(0x10c, 99, &over)).unwrap();
         renderer.reset().unwrap();
         assert_eq!(open_descriptors(), idle);
+    }
+
+    #[test]
+    fn a_buffer_without_implicit_fences_gives_no_writers_to_wait_for() {
+        use std::os::fd::AsRawFd;
+        // Not a dma-buf: the kernel refuses the export, and the flip goes on.
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(!wait_writers(file.as_raw_fd(), Duration::from_millis(10)));
     }
 
     #[test]

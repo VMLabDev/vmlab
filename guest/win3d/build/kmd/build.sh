@@ -18,12 +18,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
 OUT=$REPO/out/kmd
-# 58109 reports a flip with a vsync only after it was sent (patches/kmd/0008).
+# 58110 lets vmlab-hv order the flip when it offers to (patches/kmd/0009).
+# 58109 reported a flip with a vsync only after it was sent (patches/kmd/0008).
 # 58108 was an experiment of card #143 that is not in this repository.
 # 58107 added the present copy into a mappable blob (0006, Desktop
 # Duplication) to 58106, which added the hardware pointer (0005) to 58105,
 # the package rebased to Yttrium's November 2026 release.
-DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58109}
+DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58110}
 IMAGE=vmlab-win3d/kmd-build:1
 
 pin() { awk -v n="$1" '$1 == n { print $'"$2"' }' "$HERE/PINS"; }

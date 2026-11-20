@@ -51,7 +51,21 @@ use std::{
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory as _, Permissions};
 
-const FEATURES: u64 = (1 << 32) | (1 << 29) | (1 << 28) | (1 << 1);
+const FEATURES: u64 = (1 << 32) | (1 << 29) | (1 << 28) | (1 << ORDERED_FLIP_FEATURE) | (1 << 1);
+/// vmlab's private feature bit: the host-ordered flip. The bits up to 23
+/// belong to the device type and VIRTIO 1.2 defines 0 to 5, so the top one
+/// is the furthest from the next standard bit. Only vmlab's viogpu3d driver
+/// acks it (`guest/win3d/docs/flip.md`). A driver that does not know it
+/// keeps `RESOURCE_FLUSH`.
+pub const ORDERED_FLIP_FEATURE: u32 = 23;
+/// The command of [`ORDERED_FLIP_FEATURE`]. It takes the place of
+/// `RESOURCE_FLUSH` for a flip: header, scanout ID, resource ID, the
+/// rectangle (x, y, width, height) and the guest's frame number, all
+/// little-endian, 56 bytes. It is answered `OK_NODATA` once every fence on
+/// the renderer's timeline has signalled, the writers the kernel tracks on
+/// the scanout buffer are done, the frame is published to the display, the
+/// console has read it, and no display reader holds an older frame. Outside the 2D, 3D and cursor ranges of VIRTIO 1.2.
+pub const CMD_ORDERED_FLIP: u32 = 0x0f00;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCES: usize = 4096;
 const MAX_ENTRIES: usize = 16384;
@@ -154,6 +168,9 @@ struct State {
     /// frame holds yet.
     flush_pending: Option<u64>,
     last_publish: Option<std::time::Instant>,
+    /// Ordered flips served since the last reset. The first is logged, so
+    /// that a log shows which flip a guest uses.
+    ordered_flips: u64,
 }
 
 impl Drop for State {
@@ -200,6 +217,7 @@ impl Gpu {
                 pacer: None,
                 flush_pending: None,
                 last_publish: None,
+                ordered_flips: 0,
             })),
         }
     }
@@ -345,9 +363,11 @@ impl State {
         Some(frame)
     }
 
-    fn publish_scanout(&mut self, timestamp_ns: u64) {
+    /// Hand the scanout to the display sink. False when nothing was
+    /// published: no sink, no new frame, or a failed export.
+    fn publish_scanout(&mut self, timestamp_ns: u64) -> bool {
         let Some(sink) = self.display.clone() else {
-            return;
+            return false;
         };
         // This frame holds every flush that came before it.
         self.flush_pending = None;
@@ -355,7 +375,7 @@ impl State {
         let mut damage = Vec::new();
         let pixels = if let Some(renderer) = &self.renderer {
             let Ok(Some((generation, rectangles))) = renderer.take_damage() else {
-                return;
+                return false;
             };
             self.scanout_generation = generation;
             damage = rectangles
@@ -376,7 +396,7 @@ impl State {
                     if error != EXPORT_BUSY {
                         log::warn!("GPU flush export failed: {error:#x}");
                     }
-                    return;
+                    return false;
                 }
             }
         } else if !self.native {
@@ -384,7 +404,9 @@ impl State {
         } else if self.scanout.is_none() {
             ScanoutPixels::Inactive
         } else {
-            let Some(frame) = self.frame_2d() else { return };
+            let Some(frame) = self.frame_2d() else {
+                return false;
+            };
             ScanoutPixels::Shm(frame)
         };
         self.retry_display = false;
@@ -394,6 +416,59 @@ impl State {
             damage,
             pixels,
         });
+        true
+    }
+
+    /// [`CMD_ORDERED_FLIP`]: the flush of a flip, published before the
+    /// answer. The queue holds every later command until then, so the
+    /// guest's vsync, which a later command raises, follows the publish.
+    fn ordered_flip(
+        &mut self,
+        mem: &GuestMemory,
+        request: &[u8],
+        d: &mut Decoder<'_>,
+    ) -> Result<(u32, Vec<u8>), u32> {
+        if self.acked & (1 << ORDERED_FLIP_FEATURE) == 0 {
+            return Err(INVALID);
+        }
+        if d.u32()? != 0 {
+            return Err(SCANOUT);
+        }
+        let id = d.u32()?;
+        let rect = d.rect()?;
+        let frame = d.u64()?;
+        // The RESOURCE_FLUSH that the flip takes the place of, without a fence.
+        let mut flush = request[..24].to_vec();
+        flush[..4].copy_from_slice(&0x104u32.to_le_bytes());
+        flush[4..8].fill(0);
+        for word in [rect.x, rect.y, rect.w, rect.h, id, 0] {
+            flush.extend_from_slice(&word.to_le_bytes());
+        }
+        if let Some(renderer) = &self.renderer {
+            // Host GPU work that a fence of the guest does not cover can
+            // still write the new frame. Wait for what the host can see.
+            if let Err(error) = renderer.order() {
+                log::warn!("ordered flip {frame}: host GPU wait failed: {error:#x}");
+            }
+            renderer.command(mem, &flush)?;
+        } else {
+            self.command(mem, 0, &flush)?;
+        }
+        if self.publish_scanout(monotonic_ns())
+            && let Some(renderer) = &self.renderer
+        {
+            // The console's readback of this frame runs on the renderer.
+            if let Err(error) = renderer.settle() {
+                log::warn!("ordered flip {frame}: readback wait failed: {error:#x}");
+            }
+            renderer.retire_previous();
+        }
+        if self.ordered_flips == 0 {
+            log::info!("virtio-gpu: the guest flips through the host-ordered flip (frame {frame})");
+        }
+        self.ordered_flips += 1;
+        log::trace!("ordered flip {frame}: published resource {id}");
+        Ok((NODATA, Vec::new()))
     }
 }
 
@@ -403,7 +478,8 @@ impl State {
     /// frame interval.
     fn schedule_flush(&mut self, timestamp_ns: u64) {
         let Some(pacer) = self.pacer.clone() else {
-            return self.publish_scanout(timestamp_ns);
+            self.publish_scanout(timestamp_ns);
+            return;
         };
         self.flush_pending = Some(timestamp_ns);
         pacer.request(self.frame_due(std::time::Instant::now()));
@@ -489,6 +565,9 @@ impl State {
         let mut d = Decoder::new(request);
         let kind = d.u32()?;
         d.take(20)?;
+        if q == 0 && kind == CMD_ORDERED_FLIP {
+            return self.ordered_flip(mem, request, &mut d);
+        }
         if q == 0
             && !matches!(kind, 0x100 | 0x10a)
             && let Some(renderer) = &self.renderer
@@ -795,7 +874,9 @@ impl State {
                 // A guest flushes many times in one frame. The renderer
                 // keeps its own damage, so its flushes publish here.
                 0x104 if self.renderer.is_none() => self.schedule_flush(timestamp_ns),
-                0x102..=0x104 | 0x10d => self.publish_scanout(timestamp_ns),
+                0x102..=0x104 | 0x10d => {
+                    self.publish_scanout(timestamp_ns);
+                }
                 _ => {}
             }
         }
@@ -958,6 +1039,7 @@ impl VirtioDevice for Gpu {
         s.flush_pending = None;
         s.retry_display = false;
         s.acked = 0;
+        s.ordered_flips = 0;
         s.events = 0;
         s.resources.clear();
         s.scanout = None;

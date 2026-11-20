@@ -291,3 +291,113 @@ fn invalid_snapshots_do_not_change_gpu() {
     state[0] = 0;
     assert!(gpu.restore_state(&state).is_err());
 }
+
+fn ordered_flip(scanout: u32, id: u32, frame: u64) -> Vec<u8> {
+    let mut request = vec![0; 24];
+    request[..4].copy_from_slice(&CMD_ORDERED_FLIP.to_le_bytes());
+    for word in [scanout, id, 0, 0, 1, 1] {
+        request.extend_from_slice(&word.to_le_bytes());
+    }
+    request.extend_from_slice(&frame.to_le_bytes());
+    request
+}
+
+#[test]
+fn the_ordered_flip_is_offered_and_refused_until_the_driver_acks_it() {
+    let mut gpu = Gpu::new("gpu");
+    let bit = 1u64 << ORDERED_FLIP_FEATURE;
+    assert_ne!(gpu.features() & bit, 0);
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+
+    // A driver that does not know the bit, as Linux's: the command is refused.
+    gpu.ack_features(gpu.features() & !bit);
+    assert_eq!(
+        gpu.state.lock().command(&mem, 0, &ordered_flip(0, 1, 1)),
+        Err(INVALID)
+    );
+
+    gpu.ack_features(gpu.features());
+    assert_ne!(gpu.state.lock().acked & bit, 0);
+    assert_eq!(
+        gpu.state.lock().command(&mem, 0, &ordered_flip(1, 1, 1)),
+        Err(SCANOUT)
+    );
+    // A short request is refused, not read past its end.
+    let mut short = ordered_flip(0, 1, 1);
+    short.truncate(50);
+    assert_eq!(gpu.state.lock().command(&mem, 0, &short), Err(INVALID));
+
+    gpu.reset();
+    assert_eq!(gpu.state.lock().acked & bit, 0);
+}
+
+#[test]
+fn an_ordered_flip_is_published_before_it_is_answered() {
+    #[derive(Default)]
+    struct Sink(parking_lot::Mutex<Vec<ScanoutUpdate>>);
+
+    impl DisplaySink for Sink {
+        fn needs_cpu(&self) -> bool {
+            true
+        }
+
+        fn update(&self, frame: ScanoutUpdate) {
+            self.0.lock().push(frame);
+        }
+    }
+
+    let mut gpu = Gpu::new("gpu");
+    gpu.ack_features(gpu.features());
+    let sink = Arc::new(Sink::default());
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+    };
+    let mut s = gpu.state.lock();
+    s.display = Some(sink.clone());
+    // A frame thread that never runs: a plain flush only waits for it.
+    s.pacer = Some(Arc::new(pacer::Pacer::default()));
+    s.native = true;
+    s.scanout = Some((1, rect));
+    s.resources.insert(
+        1,
+        Resource {
+            width: 1,
+            height: 1,
+            format: 2,
+            pixels: vec![1, 1, 1, 0],
+            backing: vec![],
+        },
+    );
+
+    let mut flush = vec![0; 24];
+    flush[..4].copy_from_slice(&0x104u32.to_le_bytes());
+    for word in [0u32, 0, 1, 1, 1, 0] {
+        flush.extend_from_slice(&word.to_le_bytes());
+    }
+    assert!(s.command(&mem, 0, &flush).is_ok());
+    s.schedule_flush(1);
+    assert!(
+        sink.0.lock().is_empty(),
+        "a plain flush is left to the pacer"
+    );
+
+    s.resources.get_mut(&1).unwrap().pixels = vec![42, 42, 42, 0];
+    assert_eq!(
+        s.command(&mem, 0, &ordered_flip(0, 1, 7)),
+        Ok((NODATA, Vec::new()))
+    );
+    let updates = sink.0.lock();
+    let [update] = updates.as_slice() else {
+        panic!("expected one published frame, got {}", updates.len());
+    };
+    let ScanoutPixels::Shm(frame) = &update.pixels else {
+        panic!("expected a 2D scanout");
+    };
+    assert_eq!(frame.pixels.as_slice(), [42, 42, 42, 0]);
+    // The flip's frame holds the earlier flush too: none is left pending.
+    assert!(s.flush_pending.is_none());
+}

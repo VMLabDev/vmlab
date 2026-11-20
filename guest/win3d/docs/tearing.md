@@ -192,7 +192,10 @@ its flip. The trace build counted 3 and 4 held back in 20 s.
 
 ## What is left
 
-- C10 of the design: a feature bit and a host-ordered flip command.
+- C10 of the design, a feature bit and a host-ordered flip command, is
+  built ([flip.md](flip.md)). It did not end the tears: 2 torn of 20,000 on
+  AMD1 and 2 of 20,000 on Nvidia2 in whole-window mode at 90 percent load,
+  the rate of the runs above. What that leaves is in flip.md, "Result".
 - The probe needs a host at 90 percent load and several minutes, and the
   fault is not at 0, so it stays a script (`tests/tearing/run.sh`) beside
   the e2e tests. The adapter suite keeps its short tearing checks
