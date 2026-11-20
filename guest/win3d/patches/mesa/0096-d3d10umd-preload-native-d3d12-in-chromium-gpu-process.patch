@@ -1,0 +1,104 @@
+Subject: [PATCH] d3d10umd: preload the native d3d12.dll in a Chromium GPU process
+
+The package puts its Direct3D 12 bridge (vkd3d-proton) in place of
+System32's d3d12.dll. A Chromium GPU process (Chrome, Edge, Electron,
+WebView2, CEF) takes only Microsoft-signed DLLs once it is running
+(MicrosoftSignedOnly). When a page makes it look for GPU video encoders it
+delay-loads d3d12.dll, Windows refuses the bridge (error 577), and the
+process ends itself on purpose (media::CreateD3D12Device ->
+HandleDelayLoadFailureCommon, exception 0x80000003). After three such
+crashes the browser runs without a GPU: no WebGL (GitHub #238).
+
+Such a process opens this driver's adapter before that restriction starts.
+OpenAdapterCommon now loads Microsoft's d3d12.dll there, from the copy the
+installer keeps as System32\vmlab-win3d\native\d3d12.dll (SysWOW64 for a
+32-bit process), when the command line has --type=gpu-process and no
+d3d12.dll is loaded yet. The loader resolves the later load of the bare
+name "d3d12.dll" to the module of that name that is already in the process,
+so the copy must keep the file name. The GPU process then has what stock
+Windows gives it; every other process still gets the bridge.
+
+D3D10UMD_YTTRIUM_NATIVE_D3D12_PRELOAD=0 in yttrium.ini turns it off.
+
+Evidence: docs/chromium.md, docs/evidence/chromium/.
+Origin: GitHub VMLabDev/vmlab#238 (card #140), carried by card #147.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index e850214..ee9bae3 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -41,6 +41,9 @@
+ 
+ #include "util/u_memory.h"
+ 
++#include <string.h>
++#include <wchar.h>
++
+ 
+ static HRESULT APIENTRY CloseAdapter(D3D10DDI_HADAPTER hAdapter);
+ 
+@@ -58,6 +61,55 @@ ExposeD3D11_1()
+ }
+ #endif
+ 
++/*
++ * The driver package puts its Direct3D 12 bridge (vkd3d-proton) in place of
++ * System32's d3d12.dll.  The bridge is not signed by Microsoft, and a
++ * Chromium GPU process (Chrome, Edge, Electron, WebView2, CEF) takes only
++ * Microsoft-signed DLLs once it has started: its later delay-load of
++ * d3d12.dll is refused (error 577) and it ends itself on purpose.
++ *
++ * Such a process opens this driver's adapter first, before that restriction.
++ * So load Microsoft's own d3d12.dll here, from the copy the package keeps
++ * under the same file name in another folder: the loader resolves a later
++ * load of the bare name "d3d12.dll" to a module of that name that is already
++ * loaded, whatever its folder.  The process then has what stock Windows gives
++ * it (no Direct3D 12 device on this adapter), and every other process the
++ * bridge.
++ */
++static void
++PreloadNativeD3D12ForChromiumGpuProcess(void)
++{
++   static LONG done;
++   if (InterlockedExchange(&done, 1))
++      return;
++
++   if (!yttrium_gdi_debug_get_bool_option(
++          "D3D10UMD_YTTRIUM_NATIVE_D3D12_PRELOAD", true))
++      return;
++
++   const wchar_t *command_line = GetCommandLineW();
++   if (!command_line || !wcsstr(command_line, L"--type=gpu-process"))
++      return;
++
++   if (GetModuleHandleW(L"d3d12.dll"))
++      return;
++
++   static const wchar_t tail[] = L"\\vmlab-win3d\\native\\d3d12.dll";
++   wchar_t path[MAX_PATH];
++   const UINT len = GetSystemDirectoryW(path, MAX_PATH);
++   if (!len || len + sizeof(tail) / sizeof(tail[0]) > MAX_PATH)
++      return;
++   memcpy(path + len, tail, sizeof(tail));
++
++   if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
++      return;
++
++   HMODULE native = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
++   yttrium_gdi_user_logf("d3d10umd: Chromium GPU process, native d3d12.dll %s error=%lu\n",
++                         native ? "preloaded" : "not loaded",
++                         native ? 0ul : (unsigned long)GetLastError());
++}
++
+ /*
+  * ----------------------------------------------------------------------
+  *
+@@ -79,6 +131,8 @@ OpenAdapterCommon(__inout D3D10DDIARG_OPENADAPTER *pOpenData)   // IN
+ #endif
+    ++numAdapters;
+ 
++   PreloadNativeD3D12ForChromiumGpuProcess();
++
+    Adapter *pAdaptor = (Adapter *)calloc(sizeof *pAdaptor, 1);
+    if (!pAdaptor) {
+       --numAdapters;

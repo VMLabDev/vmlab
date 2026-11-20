@@ -115,9 +115,9 @@ and loads the WGL ICD. The package changes only `d3d12.dll`, described below.
 
 | | |
 | --- | --- |
-| Guest files | x64 and x86: `d3d12.dll` (the bridge), `vmlab-win3d\vkd3dcore.dll`, `vmlab-win3d\dxgi-vulkan.dll`, and `vmlab-win3d\d3d12-native.dll`, which is the machine's own `d3d12.dll` copied at install time |
+| Guest files | x64 and x86: `d3d12.dll` (the bridge), `vmlab-win3d\vkd3dcore.dll`, `vmlab-win3d\dxgi-vulkan.dll`, `vmlab-win3d\d3d12-native.dll`, which is the machine's own `d3d12.dll` copied at install time, and `vmlab-win3d\native\d3d12.dll`, the same file a second time for Chromium GPU processes ([chromium.md](chromium.md)) |
 | Found by | Applications load `d3d12.dll` from System32/SysWOW64 as usual. The bridge finds `vmlab-win3d\` next to its own file, with no registry or environment lookup. |
-| Installed by | The installer: takes ownership of `d3d12.dll`, replaces it, and restores the TrustedInstaller owner and ACL. The `vmlab-win3d-repair` startup task puts the bridge back after Windows servicing. |
+| Installed by | The installer: takes ownership of `d3d12.dll`, replaces it, and restores the TrustedInstaller owner and ACL. The `vmlab-win3d-repair` startup task puts the bridge back after Windows servicing and renews both native copies. |
 | Upstream | [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) v3.0.1, [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv) at `8434b063` (newer than vkd3d-proton's gitlink), [DXVK](https://github.com/doitsujin/dxvk) v3.1.1 built with only DXGI |
 | Build | [`build/d3d12/`](../build/d3d12/README.md) |
 | Patches | vkd3d-proton 5, DXVK 1, dxil-spirv 0 (table below). `vkd3d-proton/0005` turns vkd3d-proton's `d3d12.dll` into the system-wide bridge. |
@@ -316,7 +316,7 @@ committed.
 | | | [`0004`](../patches/kmd/0004-kmd-recover-from-timeouts.patch) | viogpu3d: recover transport and device state after a timeout | [`docs/tdr-recovery.md`](tdr-recovery.md) |
 | | | [`0005`](../patches/kmd/0005-kmd-hardware-pointer.patch) | viogpu3d: a hardware pointer on the cursor queue | [`docs/pointer.md`](pointer.md) |
 | | | [`0006`](../patches/kmd/0006-kmd-present-blt-into-mappable-blob.patch) | viogpu3d: allow a present copy into a mappable blob | [`docs/present.md`](present.md) |
-| mesa | 45 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
+| mesa | 46 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0002`](../patches/mesa/0002-util-xmlconfig-case-insensitive-exe-match.patch) | util/xmlconfig: match drirc executable names case-insensitively on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0003`](../patches/mesa/0003-util-u_queue-windows-loader-lock-join.patch) | util/u_queue: do not join worker threads under the loader lock on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0004`](../patches/mesa/0004-wgl-unbind-through-stw-on-delete.patch) | wgl: unbind the current context through stw_make_current on delete | [`build/mesa/README.md`](../build/mesa/README.md) |
@@ -361,6 +361,7 @@ committed.
 | | | [`0093`](../patches/mesa/0093-yttrium-guard-revoked-batch-feedback.patch) | yttrium: report device loss for revoked feedback mappings | [`docs/tdr-recovery.md`](tdr-recovery.md) |
 | | | [`0094`](../patches/mesa/0094-yttrium-forced-sample-coverage-one-pass-per-sample.patch) | yttrium: draw forced-sample coverage as one pass per sample | [`docs/d2d-coverage.md`](d2d-coverage.md) |
 | | | [`0095`](../patches/mesa/0095-yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch) | yttrium: make a Desktop Duplication surface a kernel-written display image | [`docs/present.md`](present.md) |
+| | | [`0096`](../patches/mesa/0096-d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch) | d3d10umd: preload the native d3d12.dll in a Chromium GPU process | [`docs/chromium.md`](chromium.md) |
 | vkd3d-proton | 6 | [`0001`](../patches/vkd3d-proton/0001-vkd3d-Reject-root-signatures-with-overlapping-regist.patch) | vkd3d: Reject root signatures with overlapping register bindings. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0002`](../patches/vkd3d-proton/0002-vkd3d-Report-FORMAT_INFO-plane-counts-without-a-Vulk.patch) | vkd3d: Report FORMAT_INFO plane counts without a Vulkan format mapping. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0003`](../patches/vkd3d-proton/0003-vkd3d-Allow-depth-stencil-textures-in-CPU-visible-he.patch) | vkd3d: Allow depth-stencil textures in CPU-visible heaps. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
