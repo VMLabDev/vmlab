@@ -112,6 +112,12 @@ pub(super) struct Renderer {
     completed: Arc<Mutex<BTreeMap<Ring, u64>>>,
     mapper: Arc<dyn BlobMapper>,
     direct: Arc<Mutex<Vec<std::sync::Weak<vmlab_hv_display::BufferLease>>>>,
+    /// Set when the host GPU is lost (`lost.rs`). A call then fails at
+    /// once and does not reach the worker.
+    lost: super::lost::Flag,
+    /// The render node, canonical.
+    node: PathBuf,
+    mode: GpuMode,
 }
 
 struct Worker {
@@ -196,6 +202,8 @@ struct Backend {
     scanout_copy: Option<super::scanout::Scanout>,
     node: PathBuf,
     timeline: Arc<Mutex<Timeline>>,
+    /// The renderer's [`Renderer::lost`]: the waits below end with it.
+    lost: super::lost::Flag,
     direct_frames: u64,
     fallback_frames: u64,
     external_frames: u64,
@@ -274,6 +282,9 @@ impl Renderer {
         let timeline = Arc::new(Mutex::new(Timeline::default()));
         let callbacks = timeline.clone();
         let worker_mapper = mapper.clone();
+        let lost = super::lost::Flag::default();
+        let worker_lost = lost.clone();
+        let worker_node = node.clone();
         let join = std::thread::Builder::new()
             .name("virtio-gpu-renderer".into())
             .spawn(move || {
@@ -364,8 +375,9 @@ impl Renderer {
                     scanout: None,
                     mode,
                     scanout_copy: None,
-                    node,
+                    node: worker_node,
                     timeline,
+                    lost: worker_lost,
                     direct_frames: 0,
                     fallback_frames: 0,
                     external_frames: 0,
@@ -403,7 +415,20 @@ impl Renderer {
             completed,
             mapper,
             direct: Arc::new(Mutex::new(Vec::new())),
+            lost,
+            node,
+            mode,
         })
+    }
+
+    /// The flag that says the host GPU is lost.
+    pub fn lost(&self) -> super::lost::Flag {
+        self.lost.clone()
+    }
+
+    /// The probes that see this renderer's host GPU go (`lost.rs`).
+    pub fn watch(&self) -> super::lost::Watch {
+        super::lost::Watch::for_renderer(&self.node, self.mode == GpuMode::Venus)
     }
 
     pub fn set_base(&self, base: Option<u64>) -> Result<(), DeviceError> {
@@ -414,6 +439,9 @@ impl Renderer {
         &self,
         f: impl FnOnce(&mut Backend) -> Result<T, u32> + Send + 'static,
     ) -> Result<T, u32> {
+        if self.lost.get() {
+            return Err(UNSPEC);
+        }
         self.worker.call(f)
     }
 
@@ -421,6 +449,17 @@ impl Renderer {
         let kind = request
             .get(..4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+        if self.lost.get() {
+            // The host GPU is gone. A release still runs, because it
+            // removes host mappings from guest memory, and it succeeds
+            // whatever the renderer answers (`lost.rs`).
+            if !kind.is_some_and(super::lost::releases) {
+                return Err(UNSPEC);
+            }
+            let (mem, request) = (mem.clone(), request.to_vec());
+            let _ = self.worker.call(move |b| b.command(&mem, &request));
+            return Ok((NODATA, Vec::new()));
+        }
         if matches!(
             kind,
             Some(0x102 | 0x105 | 0x107 | 0x201 | 0x203 | 0x205 | 0x207 | 0x209)
@@ -851,14 +890,25 @@ impl Renderer {
         for lease in leases.into_iter().filter_map(|lease| lease.upgrade()) {
             lease.retire();
         }
-        self.call(|b| {
+        // A reset after a loss still frees what the guest held, and does
+        // not stop at the first failure of the host GPU.
+        let lost = self.lost.get();
+        self.worker.call(move |b| {
             log::debug!("GPU renderer reset: contexts={:?}", b.contexts);
             let ids: Vec<_> = b.resources.keys().copied().collect();
             for id in ids {
-                b.unref(id)?;
+                match b.unref(id) {
+                    Err(_) if lost => {
+                        b.resources.remove(&id);
+                    }
+                    result => result?,
+                }
             }
             for id in std::mem::take(&mut b.contexts) {
-                host(b.gpu.destroy_context(id))?;
+                match host(b.gpu.destroy_context(id)) {
+                    Err(_) if lost => {}
+                    result => result?,
+                }
             }
             b.scanout = None;
             b.pending_frame = false;
@@ -1065,7 +1115,7 @@ impl Backend {
             }
             drop(timeline);
             self.gpu.event_poll();
-            if start.elapsed() > Duration::from_secs(5) {
+            if start.elapsed() > Duration::from_secs(5) || self.lost.get() {
                 return Err(0x1200);
             }
             std::thread::yield_now();
@@ -1110,7 +1160,7 @@ impl Backend {
             .any(|signal| !signal.load(std::sync::atomic::Ordering::SeqCst))
         {
             self.gpu.event_poll();
-            if start.elapsed() > Duration::from_secs(5) {
+            if start.elapsed() > Duration::from_secs(5) || self.lost.get() {
                 return Err(0x1200);
             }
             std::thread::yield_now();
@@ -1269,9 +1319,12 @@ impl Backend {
     }
 
     fn unref(&mut self, id: u32) -> Result<(), u32> {
-        let r = self.resources.get(&id).ok_or(RESOURCE)?;
+        let r = self.resources.get_mut(&id).ok_or(RESOURCE)?;
         if r.mapped {
             self.mapper.unmap(id).map_err(|_| 0x1200u32)?;
+            // The guest no longer reaches the mapping: neither a failure
+            // below nor the drop of the backend unmaps it again.
+            r.mapped = false;
             host(self.gpu.unmap(id))?;
         }
         host(self.gpu.unref_resource(id))?;
@@ -1835,6 +1888,64 @@ mod tests {
                 target.contains("vkr-shmem") || target.contains("dmabuf")
             })
             .count()
+    }
+
+    #[test]
+    #[cfg_attr(
+        vmlab_ci_no_host_assets,
+        ignore = "requires an owner-selected DRM render node"
+    )]
+    fn a_render_server_that_ends_is_a_lost_host_gpu() {
+        let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
+            eprintln!("SKIP render server loss: set VMLAB_HV_TEST_RENDER_NODE");
+            return;
+        };
+        let proc = std::path::Path::new("/proc");
+        let parent = std::process::id();
+        let before = super::super::lost::render_servers(proc, parent);
+        let renderer =
+            Renderer::new(GpuMode::Venus, PathBuf::from(node), Arc::new(TestMapper)).unwrap();
+        let mut watch = renderer.watch();
+        assert_eq!(watch.check(), None);
+        // Other tests of this process can run renderers of their own.
+        let pid = super::super::lost::render_servers(proc, parent)
+            .into_iter()
+            .find(|pid| !before.contains(pid))
+            .expect("the renderer's render server");
+        let mut server = super::super::lost::RenderServer::watching(proc, pid, parent);
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let mut create = vec![7, 4];
+        create.extend_from_slice(&[0; 16]);
+        renderer.command(&mem, &request(0x200, 1, &create)).unwrap();
+
+        // SAFETY: the signal goes to this test's own child process.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+        let start = std::time::Instant::now();
+        let reason = loop {
+            if let Some(reason) = super::super::lost::Probe::lost(&mut server) {
+                break reason;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "no loss seen");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(reason.contains("render server"), "{reason}");
+
+        // Lost: work is refused at once, a release succeeds, and the reset
+        // and the drop end.
+        assert!(renderer.lost().set());
+        let start = std::time::Instant::now();
+        assert_eq!(
+            renderer.command(&mem, &request(0x200, 2, &create)),
+            Err(UNSPEC)
+        );
+        assert_eq!(renderer.fence(3, 1, 1, 0), Err(UNSPEC));
+        assert_eq!(
+            renderer.command(&mem, &request(0x201, 1, &[])),
+            Ok((NODATA, Vec::new()))
+        );
+        renderer.reset().unwrap();
+        drop(renderer);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     /// One Venus context that makes, maps, unmaps and unreferences `blobs`
