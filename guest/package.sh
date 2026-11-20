@@ -106,8 +106,10 @@ main() {
   local display_args=()
   if [ "${VMLAB_RELEASE_DRY_RUN:-0}" = 1 ]; then
     # A deliberately incomplete, non-installable artifact, never publication.
-    [ "${GITHUB_EVENT_NAME:-}" = push ] || die 'dry-run requires a release branch push'
-    case "${GITHUB_REF:-}" in refs/heads/release/*) ;; *) die 'dry-run requires release/**' ;; esac
+    case "${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}:${GITHUB_BASE_REF:-}" in
+      push:refs/heads/release/*:|pull_request:refs/pull/*/merge:next) ;;
+      *) die 'dry-run requires a release branch push or a pull request to next' ;;
+    esac
     [ "$version" = 0.0.0-dry-run ] || die 'dry-run requires the dry-run version'
     display_args=(--unsigned-dry-run)
     local filtered=() member

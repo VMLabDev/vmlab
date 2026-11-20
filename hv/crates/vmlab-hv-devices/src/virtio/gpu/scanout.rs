@@ -696,7 +696,10 @@ impl Scanout {
             {
                 return Err(0x1200);
             }
-            let source = self.import(fd, info, width, height)?;
+            let source = match self.import(fd, info, width, height) {
+                Ok(source) => source,
+                Err(error) => return self.finish_gl("export", Err(error)),
+            };
             if self.size != (rect.w, rect.h) {
                 self.pool.clear();
                 self.size = (rect.w, rect.h);
@@ -785,7 +788,7 @@ impl Scanout {
                 result
             })();
             (self.destroy_image)(self.display, source);
-            result
+            self.finish_gl("export", result)
         }
     }
 
@@ -852,11 +855,7 @@ impl Scanout {
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                     if !cpu {
                         gl.finish();
-                        return if gl.get_error() == glow::NO_ERROR {
-                            Ok(None)
-                        } else {
-                            Err(0x1200)
-                        };
+                        return Ok(None);
                     }
                     let mut rgba = vec![0; rect.w as usize * rect.h as usize * 4];
                     gl.read_pixels(
@@ -869,9 +868,6 @@ impl Scanout {
                         glow::PixelPackData::Slice(Some(&mut rgba)),
                     );
                     gl.finish();
-                    if gl.get_error() != glow::NO_ERROR {
-                        return Err(0x1200);
-                    }
                     let mut pixels = vec![0; stride as usize * rect.h as usize];
                     for (src, dst) in rgba.as_chunks::<4>().0.iter().zip(
                         pixels.chunks_mut(stride as usize).flat_map(|row| {
@@ -887,6 +883,26 @@ impl Scanout {
             gl.delete_texture(input);
             gl.delete_texture(output);
             result
+        }
+    }
+
+    /// Collect errors after cleanup, before restoring the previous EGL context.
+    fn finish_gl<T>(&self, operation: &str, result: Result<T, u32>) -> Result<T, u32> {
+        let mut failed = false;
+        // SAFETY: both callers have made this private GLES context current.
+        unsafe {
+            for _ in 0..16 {
+                let error = self.gl.get_error();
+                if error == glow::NO_ERROR {
+                    break;
+                }
+                failed = true;
+                log::warn!("GPU scanout {operation}: GL error {error:#x}");
+            }
+        }
+        match result {
+            Ok(_) if failed => Err(0x1200),
+            result => result,
         }
     }
 
@@ -906,10 +922,24 @@ impl Scanout {
             {
                 return Err(0x1200);
             }
-            let image = self.import(fd, info, width, height)?;
-            let gl = &self.gl;
+            let result = self.import(fd, info, width, height).and_then(|image| {
+                let result = self.read_image(image, width, height);
+                (self.destroy_image)(self.display, image);
+                result
+            });
+            self.finish_gl("readback", result)
+        }
+    }
+
+    fn read_image(&self, image: Handle, width: u32, height: u32) -> Result<Vec<u8>, u32> {
+        let gl = &self.gl;
+        // SAFETY: readback holds the image and its private GLES context current.
+        unsafe {
             let texture = gl.create_texture().map_err(|_| 0x1200u32)?;
-            let fbo = gl.create_framebuffer().map_err(|_| 0x1200u32)?;
+            let Ok(fbo) = gl.create_framebuffer() else {
+                gl.delete_texture(texture);
+                return Err(0x1200);
+            };
             let result = (|| {
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 (self.target)(glow::TEXTURE_2D, image);
@@ -935,9 +965,6 @@ impl Scanout {
                     glow::PixelPackData::Slice(Some(&mut rgba)),
                 );
                 gl.finish();
-                if gl.get_error() != glow::NO_ERROR {
-                    return Err(0x1200);
-                }
                 for pixel in rgba.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                 }
@@ -945,7 +972,6 @@ impl Scanout {
             })();
             gl.delete_framebuffer(fbo);
             gl.delete_texture(texture);
-            (self.destroy_image)(self.display, image);
             result
         }
     }
@@ -1243,12 +1269,29 @@ mod tests {
             .readback(first.fd.as_raw_fd(), output_info, 64, 32)
             .unwrap();
         assert_eq!(&old[..3], &[23, 41, 193]);
+        unsafe extern "C" fn fail_image_target(_: u32, _: Handle) {
+            // SAFETY: readback has a current GLES context. The invalid target
+            // sets GL_INVALID_ENUM and leaves the new texture without storage.
+            unsafe {
+                let bind = std::mem::transmute::<*const c_void, unsafe extern "C" fn(u32, u32)>(
+                    eglGetProcAddress(c"glBindTexture".as_ptr()),
+                );
+                bind(0, 0);
+            }
+        }
+        let target = std::mem::replace(&mut scanout.target, fail_image_target);
+        assert_eq!(
+            scanout.readback(first.fd.as_raw_fd(), output_info, 64, 32),
+            Err(0x1200)
+        );
+        scanout.target = target;
         drop(held);
         let third = scanout
             .capture(fd.as_raw_fd(), info, 64, 32, rect, false)
             .unwrap();
         assert_eq!(third.buffer, first.buffer);
         assert!(Arc::ptr_eq(&third.fd, &first.fd));
+        eprintln!("capture recovered after an injected GL readback failure");
         eprintln!(
             "external-only source modifier={:#x}, pooled modifier={:#x}; held GPU pixels preserved",
             info.modifier, first.modifier

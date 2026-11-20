@@ -11,7 +11,8 @@ starts or ends at another column than the others. That row is from an
 earlier frame.
 
 Prints one JSON object. With --out, writes the first torn frames there as
-PPM files. Exit status: 0 with no torn frame, 1 with torn frames, 2 when the
+PPM files. Each torn example carries 'mono_ns', the CLOCK_MONOTONIC times of
+the request and the reply of its grab, for hosttrace.py. Exit status: 0 with no torn frame, 1 with torn frames, 2 when the
 probe window was never seen. Needs numpy.
 """
 import argparse
@@ -154,6 +155,7 @@ def main():
     examples = []
     while time.monotonic() - start < args.seconds and not (args.frames and seen >= args.frames):
         t0 = time.monotonic()
+        t0_ns = time.monotonic_ns()
         try:
             frame = rfb.grab()
         except (ConnectionError, OSError):
@@ -165,6 +167,7 @@ def main():
             rfb = Rfb(args.sock)
             continue
         grabbed += 1
+        t1_ns = time.monotonic_ns()
         has, x, bands = inspect(frame)
         if has:
             seen += 1
@@ -176,7 +179,8 @@ def main():
                 if torn == 1 and args.on_torn:
                     subprocess.Popen(args.on_torn, shell=True)
                 if len(examples) < 50:
-                    examples.append({'frame': grabbed, 't': round(t0 - start, 3), 'x': x, 'bands': bands[:8]})
+                    examples.append({'frame': grabbed, 't': round(t0 - start, 3), 'x': x, 'bands': bands[:8],
+                                     'mono_ns': [t0_ns, t1_ns]})
                 if args.out and saved < args.keep:
                     saved += 1
                     rgb = np.dstack([(frame >> 16) & 255, (frame >> 8) & 255, frame & 255]).astype(np.uint8)
