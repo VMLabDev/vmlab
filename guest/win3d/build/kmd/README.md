@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58111` | The PE version resource and the INF's `DriverVer` version. This version has vmlab-hv copy a Blt present when it offers the feature bit (`0010`). `58110` sent the host-ordered flip when vmlab-hv offers it (`0009`). `58109` reported a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58112` | The PE version resource and the INF's `DriverVer` version. This version takes the vblank from vmlab-hv's frame clock when it offers the feature bit (`0011`). `58111` had vmlab-hv copy a Blt present when it offers the feature bit (`0010`). `58110` sent the host-ordered flip when vmlab-hv offers it (`0009`). `58109` reported a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Trace build
 
@@ -60,11 +60,12 @@ The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
 | 16, 22 | The copy of a Blt present begins, ends (with `0010` on vmlab-hv: the host command is queued) | context, flags = source resource, fence, response = destination resource |
 | 17 | A flip from a DMA buffer: `SET_SCANOUT` and `RESOURCE_FLUSH` are sent | context, flags = resource, fence |
 | 18 | `SetVidPnSourceAddress` | flags = resource |
-| 19 | The vsync timer sends the recorded flip | flags = resource |
+| 19 | The vsync timer, or with `0011` on vmlab-hv the completion of a host vblank, sends the recorded flip | flags = resource |
 | 20 | One packet of a DMA buffer goes to the control queue | context, flags = ring index, fence, response = command type (0 NOP, 1 SUBMIT, a timeline submit has a ring index) |
 | 21 | A host context was created | context, flags = capset, fence = process id |
 | 23 | The interrupt routine reported a vsync (`0008`) | flags = the reported address divided by 4096, response = 1 when the address came from the queue of flips |
 | 24 | A queued flip was not sent to the host yet when a vsync was reported (`0008`) | flags = the flips in the queue, response = 0 the address was held back, 1 it was reported (knob 2) |
+| 25 | The host answered a vblank wait (`0011`, interrupt routine) | flags = the host's tick (low 32 bits), fence = the host time of the tick in ns, response = 1 when this answer raised the vsync, 0 when the answer to a flip raises it |
 
 Events 1 to 9 are the records of the 256-record ring of `0004`, without the
 bare interrupt (event 4). A release build has that small ring only.
@@ -209,6 +210,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `0008-kmd-report-flips-after-they-are-sent.patch` | A vsync reports the address of a flip only after the vsync timer sent that flip to the host. Before, a flip that Windows recorded between the timer and the interrupt was reported one tick early, and Windows gave the buffer on screen back to the compositor 16 ms early. It is not the cause of the torn frames of #134 ([`docs/tearing.md`](../../docs/tearing.md)). |
 | `0009-kmd-host-ordered-flip.patch` | Acks vmlab-hv's private feature bit `VIRTIO_GPU_F_VMLAB_ORDERED_FLIP` (23) when the host offers it, and then sends every flush of the scanout as `VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP` (`0x0f00`), which the host answers only once the frame is on its display, after every fence of its renderer and the implicit fence of the scanout buffer have signalled. Without the bit (QEMU) the driver sends `RESOURCE_FLUSH` as before ([`docs/flip.md`](../../docs/flip.md)). |
 | `0010-kmd-host-present-copy.patch` | With the same bit, sends the copy of a Blt present as `VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY` (`0x0f01`) ahead of the present's fenced NOP, in place of the copy on a guest CPU. The boxes are clipped by the code of the CPU copy. Without the bit, or when the command cannot be queued, the CPU copy runs as before ([`docs/present-copy.md`](../../docs/present-copy.md)). |
+| `0011-kmd-host-vblank.patch` | With the same bit, starts no vsync timer: it keeps one `VIRTIO_GPU_CMD_VMLAB_VBLANK` (`0x0f02`) wait on the control queue, which vmlab-hv answers at each tick of its 60 Hz frame clock with the tick and its host time. The answer raises the vsync, or, when a flip is waiting, the host's answer to that flip does. No empty command is sent per tick. Without the bit, or when the host refuses the wait, the timer and its NOP run as before ([`docs/vblank.md`](../../docs/vblank.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
