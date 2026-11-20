@@ -751,14 +751,18 @@ impl Renderer {
                         &source
                     {
                         let read = |b: &mut Backend| {
-                            readback(
-                                b.scanout_copy.as_mut()?,
+                            let copy = b.scanout_copy.as_mut()?;
+                            let pixels = readback(
+                                copy,
                                 source_fd.as_raw_fd(),
                                 *source_info,
                                 *source_width,
                                 *source_height,
-                            )
-                            .ok()
+                            );
+                            if pixels.is_err() {
+                                copy.clear_errors();
+                            }
+                            pixels.ok()
                         };
                         if let (Some(first), Some(second)) = (read(b), read(b)) {
                             let source_stride = source_info.strides[0] as usize;
