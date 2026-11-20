@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58109` | The PE version resource and the INF's `DriverVer` version. This version reports a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58110` | The PE version resource and the INF's `DriverVer` version. This version sends the host-ordered flip when vmlab-hv offers it (`0009`). `58109` reported a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Trace build
 
@@ -207,6 +207,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `0006-kmd-present-blt-into-mappable-blob.patch` | Desktop Duplication: a present copy of the Blt kind may write into a blob when source and destination are both mappable blobs. The destination is mapped in `Present` and written at the image's offset in the blob ([`docs/present.md`](../../docs/present.md#desktop-duplication)). |
 | `0007-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
 | `0008-kmd-report-flips-after-they-are-sent.patch` | A vsync reports the address of a flip only after the vsync timer sent that flip to the host. Before, a flip that Windows recorded between the timer and the interrupt was reported one tick early, and Windows gave the buffer on screen back to the compositor 16 ms early. It is not the cause of the torn frames of #134 ([`docs/tearing.md`](../../docs/tearing.md)). |
+| `0009-kmd-host-ordered-flip.patch` | Acks vmlab-hv's private feature bit `VIRTIO_GPU_F_VMLAB_ORDERED_FLIP` (23) when the host offers it, and then sends every flush of the scanout as `VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP` (`0x0f00`), which the host answers only once the frame is on its display, after its GPU has finished all work given to it before the flip. Without the bit (QEMU) the driver sends `RESOURCE_FLUSH` as before ([`docs/flip.md`](../../docs/flip.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
