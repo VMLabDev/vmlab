@@ -175,9 +175,9 @@ A second attempt ([docs/evidence/hostvirgl/gl_alpha/](https://github.com/VMLabDe
 GL window's own redirection surface magenta as well, and judged by
 console captures every 3 s instead of `GetPixel` alone. With a WGL built
 without 0027, the window was still opaque on Windows 10 (`AMD1`) and
-Windows 11 (`Nvidia1`), at alpha 0 and 0.5. DXGI Desktop Duplication, as an
-in-guest reading of DWM's output, fails with `DXGI_ERROR_ACCESS_LOST` on
-this display stack.
+Windows 11 (`Nvidia1`), at alpha 0 and 0.5. DXGI Desktop Duplication was not
+tried as an in-guest reading of DWM's output: it gave no frames at that time
+([Desktop Duplication](#desktop-duplication)).
 
 ## The repro
 
@@ -206,6 +206,89 @@ replaces the installed UMD and WGL DLLs in such a lab for development. The
 isolation runs used it. The proof runs in the results table are clean
 installs.
 
+## Desktop Duplication
+
+A program that captured the screen with `IDXGIOutput1::DuplicateOutput` got
+no picture (GitHub #237): `DuplicateOutput` succeeded and every
+`AcquireNextFrame` returned `DXGI_ERROR_ACCESS_LOST` (`0x887A0026`). Screen
+recorders and remote-desktop tools showed black. Since driver
+`100.6.101.58107` (`patches/kmd/0006` and `patches/mesa/0095`) it delivers
+frames.
+
+**How a frame gets there.** dxgi creates the duplication surface in the
+capturing program. For each frame, DWM's context has dxgkrnl copy the desktop
+into that surface through the kernel driver's `DxgkDdiPresent` with `Blt`. A
+trace of `Microsoft-Windows-DxgKrnl` showed that copy failing:
+`OutputDuplicationBlit … Status=0xC00000BB` (`STATUS_NOT_SUPPORTED`) from
+dwm.exe, then `Dxgk_Diag_OutputDupl_Destroy`.
+
+**Three things were in the way.**
+
+1. The kernel driver refused the copy. In a Venus context it does a present
+   copy on the CPU, and only from a Venus image into a GDI surface
+   (`SetCpuCopyBlt` and `VioGpuCpuCopyBltPresent`: `!src->IsBlob() ||
+   dst->IsBlob()`). The duplication surface is a blob.
+2. The surface could not be mapped. Since the November release the
+   user-mode driver creates a shared render target as an "optimal shared"
+   image: optimal tiling in device-local memory, a blob that is not mappable,
+   and no row pitch. A CPU copy has nowhere to write.
+3. The first frame was thrown away. The user-mode driver clears an image
+   nothing was drawn to at its first use (`contents_initialized`), and the
+   image starts in `VK_IMAGE_LAYOUT_UNDEFINED`. The kernel's first copy, the
+   only one of the whole desktop, comes before that. With 1 and 2 fixed
+   alone, the first frame is black and the later ones carry only what
+   changed, on black.
+
+**The fixes.**
+
+- `patches/kmd/0006`: a present copy into a blob is allowed when source and
+  destination are both mappable blobs. The destination is mapped in
+  `Present`, where a refusal fails only that call, and written at the image's
+  offset in the blob with the row pitch of the allocation.
+- `patches/mesa/0095`: a texture that looks like a duplication surface is
+  created as a display image with the winsys flag
+  `YTTRIUM_GDI_RESOURCE_FLAG_KERNEL_WRITTEN`: linear, in cached host-visible
+  memory, a mappable blob, with its row pitch and offset in the allocation
+  record the kernel driver reads. It is created
+  `VK_IMAGE_LAYOUT_PREINITIALIZED` and counts as written, as an imported
+  display image already does.
+
+**The pattern.** The driver is not told which texture is a duplication
+surface. It sees `format=87 bind=0x28 misc=0x2` (BGRA, render target and
+shader resource, shared), and the runtime keeps the keyed-mutex and NT-handle
+flags to itself. The patch takes a shared `B8G8R8A8_UNORM` 2D texture that is
+exactly a render target and a shader resource, default usage, one level, one
+slice, one sample, no CPU access, no initial data, and of exactly the size of
+the current display mode (`EnumDisplaySettings`, either orientation). The size
+is narrower than the pattern in GitHub #237, which took such a texture of any
+size: an application's own shared textures keep optimal storage unless they
+are as large as the desktop. Such a texture works as before, with linear
+tiling, and the `shared-texture` check covers it.
+
+**The patch of GitHub #237 and this one.** The kernel patch is carried as
+written. The user-mode patch was written against the September release, where
+a shared texture was a Venus image in device-local memory, and only its
+first lines reached the board. It was written again for the November
+release's storage kinds, with the same three properties (mappable, a row
+pitch, not cleared).
+
+**Checks** (the adapter suite, [acceptance.md](acceptance.md#adapter-suite)):
+
+- `duplication`: `dupl_probe.exe` takes eight frames while a window of its
+  own changes colour, because Desktop Duplication delivers a frame only when
+  something changed.
+- `shared-texture`: `share_probe.exe` shares a BGRA render target between two
+  Direct3D 11 devices, by legacy handle and with a keyed mutex, at the size
+  of the desktop and at 256×256. Each device fills it and the other reads
+  every pixel.
+
+@RESULTS@
+
+Not tried: a rotated output, a second output (the device has one), capture
+while a full-screen application flips, protected content. ffmpeg's `ddagrab`
+fails earlier and for another reason ("Failed to create D3D11VA device": it
+wants a device with video support).
+
 ## What remains
 
 - **NVIDIA hosts present D3D9 below the refresh rate.** On `Nvidia1` the
@@ -217,6 +300,8 @@ installs.
   so 0026 leaves them device-local. The wait is probably a fence or host
   round trip on the NVIDIA Venus path. It was not investigated further
   within the time box.
+- A duplication frame is a CPU copy in the KMD too, of the whole desktop
+  for the first frame and of the changed rectangles after it.
 - The KMD still copies every Blt present on the CPU. That is now about
   1.5 ms at 640×480 on AMD. A GPU copy would need the destination to be a
   host resource.
