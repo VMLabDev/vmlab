@@ -1908,10 +1908,22 @@ mod tests {
         let mut watch = renderer.watch();
         assert_eq!(watch.check(), None);
         // Other tests of this process can run renderers of their own.
-        let pid = super::super::lost::render_servers(proc, parent)
+        let Some(pid) = super::super::lost::render_servers(proc, parent)
             .into_iter()
             .find(|pid| !before.contains(pid))
-            .expect("the renderer's render server");
+        else {
+            let children: Vec<_> = std::fs::read_dir(proc)
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
+                .filter(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                        == Some(&parent.to_string())
+                })
+                .collect();
+            panic!("no render server among the children of {parent}: {children:?}");
+        };
         let mut server = super::super::lost::RenderServer::watching(proc, pid, parent);
         let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
         let mut create = vec![7, 4];
