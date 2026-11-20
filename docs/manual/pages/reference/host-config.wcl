@@ -248,6 +248,7 @@ SRC
       | "`qemu_binary`" | "utf8" | "none" | "Absolute path to the QEMU every VM on this GPU runs, in every mode including passthrough, instead of `qemu-system-<arch>` from `PATH`. vmlab also passes it `-L <dir>` (see below)." |
       | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU or vmlab-hv process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for the Venus render server." |
       | "`keepawake`" | "utf8" | "`auto`" | "Whether the supervisor holds this GPU out of runtime suspend from the first virgl or vulkan VM started on it until the supervisor stops. `auto`: only an NVIDIA GPU that can runtime-suspend. `on`: always, on any driver with EGL. `off`: never. See below." |
+      | "`hide_uncached_memory`" | "bool" | "`false`" | "Under `vulkan`, report an uncached host-visible memory type of this GPU as not host-visible when the same heap has a cached one, so guest drivers map the cached type. For a host where guest images arrive with short dashes. See below." |
   }
   p "The parser enforces these rules:"
   list {
@@ -293,6 +294,19 @@ SRC
     `vmlab status --json` carries it as the VM's `qemu_env` object. Both
     show what the VM was started with, not the host config as it is now.
     Template builds never have a `gpu {}`, so they always run the stock QEMU.
+  DOC
+  p <<DOC
+    `hide_uncached_memory = true` adds `VMLAB_VK_HIDE_UNCACHED=1` to that
+    set, for a `vulkan` guest only. The same layer then changes what the
+    renderer learns about the GPU's memory types: a type that is host-visible
+    and coherent, but neither cached nor device-local, loses those two flags
+    when another type of the same heap has every flag of it and is cached
+    too. A type with no such counterpart is left alone. The first memory
+    query in each renderer process writes the result to `qemu.log`, either
+    `vmlab-hide-uncached: memory type 2 (uncached) is hidden, guests use
+    type 3 (cached)` or `vmlab-hide-uncached: no uncached memory type has a
+    cached counterpart, hid none`. The setting is read when a VM starts, so
+    restart the VM after changing it. It is off by default.
   DOC
   h3 "Runtime power management"
   p <<DOC

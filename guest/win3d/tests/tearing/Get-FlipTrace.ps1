@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
 Reads the flip trace of a trace-build kernel driver (build/kmd/build.sh with
-KMD_TRACE=1, patches/kmd/0006) into a CSV file.
+KMD_TRACE=1, patches/kmd/0007) into a CSV file.
 
 .DESCRIPTION
 Polls the driver's DRIVERPRIVATE escape (magic 0x56475446) for -Seconds and
@@ -18,7 +18,7 @@ param(
     # microseconds when it is half done (0 turns it off), then exit.
     [int]$Stall = -1,
     # A comparison of the trace build: 1 makes a vsync report queued flips as
-    # the driver did before patches/kmd/0007, also one that was not sent to
+    # the driver did before patches/kmd/0008, also one that was not sent to
     # the host yet. 0 is the patched order. Sets it, then exits.
     [int]$ReportUnsent = -1
 )

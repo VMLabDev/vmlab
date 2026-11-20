@@ -88,7 +88,7 @@ done
 echo "== viogpu3d"
 GPU_INC=(/I"$SRC/viogpu/common" /I"$SRC/viogpu/shared" /I"$SRC/VirtIO" /I"$SRC/viogpu/viogpu3d"
          /DVIOGPU_3D=1 /std:c++17)
-# KMD_TRACE=1: the trace build of patches/kmd/0006 (README.md, "Trace build").
+# KMD_TRACE=1: the trace build of patches/kmd/0007 (README.md, "Trace build").
 [ "${KMD_TRACE:-0}" = 1 ] && GPU_INC+=(/DVIOGPU_FLIP_TRACE=1)
 for f in common/edid.cpp common/viogpu_idr.cpp common/viogpu_pci.cpp common/viogpu_queue.cpp \
          viogpu3d/driver.cpp viogpu3d/viogpu_command.cpp viogpu3d/viogpu_device.cpp \

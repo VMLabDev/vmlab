@@ -64,7 +64,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | --- | --- |
 | [acceptance.md](acceptance.md) | See each Done item checked on fresh `windows-11` and `windows-10` labs, the stretch applications, the adapter suite with its baseline, and the index of every evidence directory |
 | [tdr-recovery.md](tdr-recovery.md) | Force a guest timeout and require reset/restart telemetry plus hardware pixel readback |
-| [tearing.md](tearing.md) | See why the console showed bands of an earlier frame under host load, what the trace build ruled out, and the vsync fix `patches/kmd/0007` |
+| [tearing.md](tearing.md) | See why the console showed bands of an earlier frame under host load, what the trace build ruled out, and the vsync fix `patches/kmd/0008` |
 | [pointer.md](pointer.md) | See why the pointer lagged, what the hardware pointer of `patches/kmd/0005` sends to the host, its limits, and the check |
 | [dxdiag.md](dxdiag.md) | See why dxdiag reported DirectDraw "Not Available" and how `patches/mesa/0012` to `0014` fixed it |
 | [d2d-coverage.md](d2d-coverage.md) | See why Direct2D's antialiased fills had gaps on NVIDIA (Word's ribbon), the one-pass-per-sample fix `patches/mesa/0094`, and what an AMD host does without it |
@@ -84,7 +84,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [wu.md](wu.md) | See why labs have a NAT NIC and run `slmgr /ato` (the evaluation templates shut down unactivated), and what a real Windows Update driver scan offers the device: nothing, and the package stays bound |
 | [ddraw.md](ddraw.md) | See DirectDraw fullscreen exclusive mode, 16 bpp modes, and the hardware colour-key and mirror blits of `patches/mesa/0035` |
 | [dd16.md](dd16.md) | See why 64-bit DirectDraw programs get no 16 bpp modes: the trace through `ddraw.dll`, win32k, CDD and `dxgkrnl.sys`, and the R5G6B5 KMD run |
-| [present.md](present.md) | See why presents were slow (CPU reads of write-combined memory) and why Blender was translucent on Windows 10, and the fixes `patches/kmd/0002` and `patches/mesa/0026`, `0027` |
+| [present.md](present.md) | See why presents were slow (CPU reads of write-combined memory) and why Blender was translucent on Windows 10, the fixes `patches/kmd/0002` and `patches/mesa/0026`, `0027`, and how Desktop Duplication got frames (`patches/kmd/0006`, `patches/mesa/0095`) |
 | [n5.md](n5.md) | See why D3D9 presents run below the refresh rate on NVIDIA hosts (slow wake-ups on virglrenderer's exportable fences) and the host-side fix: the vmlab render server, its deployment and A/B ([evidence](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/hostvirgl/README.md)) |
 | [ffp.md](ffp.md) | See how D3D9 fixed function was tested against the reference rasterizer, and the software-vertex-processing, fog and point fixes `patches/mesa/0040` to `0042` |
 | [compat.md](compat.md) | See which unmodified free applications (Unigine Heaven and Valley, Godot, GZDoom, Crispy Doom) run on AMD1 and Nvidia2 under each API, and each failure in detail, including the Godot Vulkan Xid 69 |

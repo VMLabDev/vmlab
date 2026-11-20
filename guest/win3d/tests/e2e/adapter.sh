@@ -16,6 +16,7 @@
 #   tear-flip     P3-P5    the tearing probe, flip-model presents
 #   tear-blt      P3-P5    the tearing probe, presents of the Blt kind
 #   duplication   P7       Desktop Duplication delivers frames
+#   shared-texture P7      a shared render target of the duplication surface's shape still works
 #   d2d           P10      the Direct2D coverage probe
 #   d2d-tir       P10      what Direct2D draws to antialias, against WARP (tests/e2e/tir.sh)
 #   svb-chrome    P10      the static vertex buffer page in Chrome
@@ -46,7 +47,7 @@ mkdir -p "$3/adapter"
 EV=$(cd "$3/adapter" && pwd)   # absolute: the vmlab commands run from the lab directory
 [ -n "$EV" ] && [ -d "$EV" ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 shift 3
-ALL="pointer pointer-shapes pace tear-flip tear-blt duplication d2d d2d-tir svb-chrome venc-chrome svb-edge venc-edge wine"
+ALL="pointer pointer-shapes pace tear-flip tear-blt duplication shared-texture d2d d2d-tir svb-chrome venc-chrome svb-edge venc-edge wine"
 CHECKS=${*:-${ADAPTER_CHECKS:-$ALL}}
 CACHE=$REPO/.scratch/e2e/cache
 STAGE=$REPO/.scratch/e2e/adapter/$(basename "$(dirname "$EV")")   # per evidence dir, so parallel runs do not share files
@@ -200,6 +201,11 @@ check_tear() { # check_tear flip|blt
 check_duplication() {
     note "duplication"
     probe duplication 10 dupl_probe.exe && ran duplication || skip duplication "the duplication probe wrote no result"
+}
+
+check_shared_texture() {
+    note "shared-texture"
+    probe shared-texture 10 share_probe.exe && ran shared-texture || skip shared-texture "the shared-texture probe wrote no result"
 }
 
 check_d2d() {
@@ -359,6 +365,7 @@ else
             tear-flip) check_tear flip ;;
             tear-blt) check_tear blt ;;
             duplication) check_duplication ;;
+            shared-texture) check_shared_texture ;;
             d2d) check_d2d ;;
             d2d-tir) check_d2d_tir ;;
             svb-chrome) check_page svb-chrome chrome svb.html 25 ;;
