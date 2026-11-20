@@ -1087,6 +1087,7 @@ async fn run(
                     flush,
                     lock_candidates: &lock_candidates,
                     resolved: &resolutions,
+                    previous_halt: syncer.report().halt,
                     marker: marker.clone(),
                 },
                 &mut ledger,
@@ -1573,6 +1574,8 @@ struct Pending<'a> {
     lock_candidates: &'a BTreeSet<String>,
     /// Who wins where, as the developer has already said.
     resolved: &'a BTreeMap<String, Winner>,
+    /// Conflicts a deferred comparison cannot clear.
+    previous_halt: Option<Halt>,
     /// What the guest's halt marker currently says, so an unchanged halt does
     /// not rewrite it once a pass.
     marker: Option<String>,
@@ -1833,7 +1836,7 @@ async fn pass(
         bookkeeping = ledger.unconfirmed.len() != before;
     }
 
-    let plan = reconcile(&Inputs {
+    let mut plan = reconcile(&Inputs {
         host: &scan.tree,
         guest: &probe.tree,
         ledger,
@@ -1844,6 +1847,22 @@ async fn pass(
         case_folding: learned.case_folding(),
         unwitnessed: pending.unwitnessed,
     });
+    // A flush that overlaps a watch reopen defers changed guest paths for
+    // another quiet window. Keep their known conflicts until a pass can
+    // compare the copies, so this pass cannot resume transfers or accept the
+    // new ignore digest while the conflict is still unresolved.
+    if let Some(previous) = &pending.previous_halt {
+        plan.conflicts.extend(
+            previous
+                .conflicts
+                .iter()
+                .filter(|conflict| {
+                    undecided.contains(&conflict.path) && !guest_owned.contains(&conflict.path)
+                })
+                .cloned(),
+        );
+        plan.conflicts.sort_by(|a, b| a.path.cmp(&b.path));
+    }
 
     // Before the transfer, always, and naming the file and both ways out.
     for refusal in &plan.oversize {
@@ -2060,10 +2079,9 @@ async fn pass(
         }
     }
 
-    // A resolution whose apply failed has not been carried out, so the
-    // developer's answer is kept rather than spent — the alternative is
-    // typing `resolve` twice because a channel blinked.
-    let unresolved: BTreeMap<String, Winner> = applied
+    // Keep resolutions that were deferred or failed to apply. They still
+    // need to be carried out.
+    let mut unresolved: BTreeMap<String, Winner> = applied
         .failures
         .iter()
         .chain(&applied.symlinks_refused)
@@ -2074,6 +2092,13 @@ async fn pass(
                 .map(|winner| (failure.path.clone(), *winner))
         })
         .collect();
+    unresolved.extend(
+        pending
+            .resolved
+            .iter()
+            .filter(|(path, _)| undecided.contains(*path))
+            .map(|(path, winner)| (path.clone(), *winner)),
+    );
 
     let failed: Vec<_> = applied
         .failures
@@ -2476,6 +2501,7 @@ mod tests {
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
+                previous_halt: None,
                 marker: None,
             },
             &mut ledger,
@@ -2801,6 +2827,7 @@ mod tests {
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
+                previous_halt: None,
                 marker: None,
             };
             let failed = pass(
@@ -3175,6 +3202,8 @@ mod tests {
             "guestnew",
             ledger.entries["main.rs"].guest.mtime_ns,
         );
+        std::fs::write(dir.path().join(".gitignore"), "build/\n").unwrap();
+        let agreed_rules = ledger.ignore_digest.clone();
         let watch = HostWatch::start().unwrap();
         let mut pending = Pending {
             guest_dirty: &BTreeSet::new(),
@@ -3186,6 +3215,7 @@ mod tests {
             flush: false,
             lock_candidates: &BTreeSet::new(),
             resolved: &BTreeMap::new(),
+            previous_halt: None,
             marker: None,
         };
         let first = pass(
@@ -3199,11 +3229,37 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(first.report.halt.is_some());
-        pending.rescan = false;
-        pending.guest_dirty = &first.deferred;
-        pending.host_dirty = &first.host_deferred;
+        assert!(
+            first
+                .report
+                .halt
+                .as_ref()
+                .is_some_and(|halt| halt.rules_changed)
+        );
+        pending.flush = true;
+        pending.previous_halt = first.report.halt;
         pending.marker = first.marker;
+        let flushed = pass(
+            &ws,
+            sessions.as_ref(),
+            &events,
+            &watch,
+            &pending,
+            &mut ledger,
+            &mut learned,
+        )
+        .await
+        .unwrap();
+        assert!(flushed.deferred.contains("main.rs"));
+        assert_eq!(flushed.report.halt, pending.previous_halt);
+        assert_eq!(ledger.ignore_digest, agreed_rules);
+
+        pending.rescan = false;
+        pending.flush = false;
+        pending.guest_dirty = &flushed.deferred;
+        pending.host_dirty = &flushed.host_deferred;
+        pending.previous_halt = flushed.report.halt;
+        pending.marker = flushed.marker;
         let second = pass(
             &ws,
             sessions.as_ref(),
