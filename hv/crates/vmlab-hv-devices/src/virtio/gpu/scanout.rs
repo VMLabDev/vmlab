@@ -1162,7 +1162,7 @@ mod tests {
         vmlab_ci_no_host_assets,
         ignore = "requires an owner-selected DRM render node"
     )]
-    fn scanout_recovers_from_failed_readback_and_reuses_pool() {
+    fn external_only_scanout_reuses_pool_and_keeps_held_gpu_pixels() {
         let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
             eprintln!("SKIP external-only scanout: set VMLAB_HV_TEST_RENDER_NODE");
             return;
@@ -1217,6 +1217,12 @@ mod tests {
         assert!(raw >= 0);
         // SAFETY: GBM returned a new descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        if !scanout.external_only(info) {
+            eprintln!(
+                "SKIP external-only scanout: selected driver does not mark linear XR24 external-only"
+            );
+            return;
+        }
         let paint = |colour: [u8; 4]| {
             let mut stride = 0;
             let mut data = null_mut();
@@ -1285,6 +1291,7 @@ mod tests {
             .unwrap();
         assert_eq!(third.buffer, first.buffer);
         assert!(Arc::ptr_eq(&third.fd, &first.fd));
+        eprintln!("capture recovered after an injected GL readback failure");
         eprintln!(
             "external-only source modifier={:#x}, pooled modifier={:#x}; held GPU pixels preserved",
             info.modifier, first.modifier
