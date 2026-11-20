@@ -2,7 +2,8 @@
 
 Card #134 reported bands of an earlier frame on the console of a Windows
 guest while a WPF window animated and the host was busy. Card #143 (C7 of
-`docs/plans/win3d-real-adapter/DESIGN.md`) looked for the missing order on
+the design, docs/plans/win3d-real-adapter/DESIGN.md at the root of the vmlab
+repository) looked for the missing order on
 vmlab-hv with a trace build of the kernel driver.
 
 The result: every wait that the guest can make with the fences of
@@ -95,7 +96,6 @@ counted once for each grab that shows it.
 | with W4 | trace | Nvidia2 | full | 8,972 | 0 |
 | with W4 and W5 (`58108`) | release | AMD1 | full | 20,000 | 4 |
 | with W4 and W5 (`58108`) | release | Nvidia2 | full | 20,000 | 1 |
-FINAL_ROWS
 
 The rectangles mode tears too seldom to tell a change from chance: about
 three events in 20,000 frames before any change. The whole-window mode
@@ -129,8 +129,8 @@ submission. It says nothing about other host work on the same surface:
 - NVIDIA dma-bufs carry no implicit fence (F10 of the design), so a blob
   that two host contexts use has no order between them.
 - vmlab-hv publishes a blob scanout to its display without an acquire fence
-  (`acquire: None` in `vmlab-hv-devices/src/virtio/gpu/renderer.rs`,
-  `dma_frame`), and its display reads the frame later, on its own thread.
+  (`acquire: None` in `dma_frame` of
+  hv/crates/vmlab-hv-devices/src/virtio/gpu/renderer.rs), and its display reads the frame later, on its own thread.
   It waits for its readers of the last frames before the next submission,
   but no fence orders that read after GPU work on the surface that the host
   had already started.
