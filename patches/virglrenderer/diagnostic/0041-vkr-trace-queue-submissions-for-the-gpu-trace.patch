@@ -1,0 +1,1303 @@
+Subject: [PATCH] vkr: write each queue submission into vmlab-hv's GPU trace (diagnostics)
+
+Diagnostics only; not applied by build/hv.py, which takes
+patches/virglrenderer/*.patch and not this directory. Applies on 1.3.0
+after 0001 to 0003. Card #237, guest/win3d/docs/tearing.md.
+
+With VMLAB_HV_GPU_TRACE=<dir> in its environment (vmlab-hv's own trace
+switch, which the render server inherits), each render worker writes
+<dir>/gpu-trace-<pid>.txt in the format of vmlab-hv's trace
+(hv/crates/vmlab-hv-display/src/trace.rs): one line per event, the time
+on CLOCK_MONOTONIC first.
+
+- vk_submit: every vkQueueSubmit and vkQueueSubmit2, at the time the ring
+  thread hands it to the host driver, with the context id and name, the
+  queue, the fence, each batch's wait and signal semaphores (with timeline
+  values) and command buffers, and the virgl resources those command
+  buffers use: w for an attachment, a copy, blit, resolve or clear
+  destination, r for a copy source, d through a bound or pushed
+  descriptor, b named by a barrier. The resources are found through the
+  objects the context made: memory imported from a resource or exported
+  as one, images and buffers bound to it, views, framebuffers and
+  descriptor set slots.
+- vk_done: when an empty submission with a fence of the trace, made on the
+  same queue right after the traced one, signals. The host GPU has
+  finished the traced submission's work by then.
+
+Off, it costs one branch per hooked command.
+---
+diff --git a/src/meson.build b/src/meson.build
+index 138301c..f5134b5 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -71,6 +71,7 @@ venus_sources = [
+    'venus/vkr_descriptor_set.c',
+    'venus/vkr_device.c',
+    'venus/vkr_device_memory.c',
++   'venus/vkr_gputrace.c',
+    'venus/vkr_host_copy.c',
+    'venus/vkr_image.c',
+    'venus/vkr_instance.c',
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index 9e466f8..cfe5ba7 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -6,6 +6,7 @@
+ #include "vkr_buffer.h"
+ 
+ #include "vkr_buffer_gen.h"
++#include "vkr_gputrace.h"
+ #include "vkr_physical_device.h"
+ 
+ static void
+@@ -78,6 +79,7 @@ vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   vkr_gt_link(VKR_GT_ID(args->buffer), VKR_GT_ID(args->memory), 0);
+    vn_replace_vkBindBufferMemory_args_handle(args);
+    args->ret =
+       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
+@@ -90,6 +92,9 @@ vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   for (uint32_t i = 0; vkr_gt_on() && i < args->bindInfoCount; i++)
++      vkr_gt_link(VKR_GT_ID(args->pBindInfos[i].buffer), VKR_GT_ID(args->pBindInfos[i].memory),
++                  0);
+    vn_replace_vkBindBufferMemory2_args_handle(args);
+    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+ }
+@@ -121,7 +126,10 @@ static void
+ vkr_dispatch_vkCreateBufferView(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkCreateBufferView *args)
+ {
+-   vkr_buffer_view_create_and_add(dispatch->data, args);
++   const uint64_t buffer = vkr_gt_on() ? VKR_GT_ID(args->pCreateInfo->buffer) : 0;
++   struct vkr_buffer_view *view = vkr_buffer_view_create_and_add(dispatch->data, args);
++   if (view)
++      vkr_gt_link(view->base.id, buffer, 0);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index 95a6be9..f487a89 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -7,6 +7,69 @@
+ 
+ #include "vkr_command_buffer_gen.h"
+ 
++#include "vkr_gputrace.h"
++
++/* card #237: what a command buffer touches, for the GPU trace */
++#define GT_USE(args, handle, flags)                                                      \
++   do {                                                                                  \
++      if (vkr_gt_on())                                                                   \
++         vkr_gt_link(VKR_GT_ID((args)->commandBuffer), VKR_GT_ID(handle), (flags));      \
++   } while (0)
++
++static void
++gt_barriers(uint64_t cb,
++            uint32_t buffer_count,
++            const VkBufferMemoryBarrier *buffers,
++            uint32_t image_count,
++            const VkImageMemoryBarrier *images)
++{
++   for (uint32_t i = 0; buffers && i < buffer_count; i++)
++      vkr_gt_link(cb, VKR_GT_ID(buffers[i].buffer), VKR_GT_BARRIER);
++   for (uint32_t i = 0; images && i < image_count; i++)
++      vkr_gt_link(cb, VKR_GT_ID(images[i].image), VKR_GT_BARRIER);
++}
++
++static void
++gt_dependency(uint64_t cb, const VkDependencyInfo *info)
++{
++   for (uint32_t i = 0; info && info->pBufferMemoryBarriers && i < info->bufferMemoryBarrierCount; i++)
++      vkr_gt_link(cb, VKR_GT_ID(info->pBufferMemoryBarriers[i].buffer), VKR_GT_BARRIER);
++   for (uint32_t i = 0; info && info->pImageMemoryBarriers && i < info->imageMemoryBarrierCount; i++)
++      vkr_gt_link(cb, VKR_GT_ID(info->pImageMemoryBarriers[i].image), VKR_GT_BARRIER);
++}
++
++static void
++gt_render_pass(uint64_t cb, const VkRenderPassBeginInfo *info)
++{
++   if (!info)
++      return;
++   vkr_gt_link(cb, VKR_GT_ID(info->framebuffer), VKR_GT_WRITE);
++   const VkRenderPassAttachmentBeginInfo *views =
++      vkr_find_struct(info->pNext, VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO);
++   for (uint32_t i = 0; views && views->pAttachments && i < views->attachmentCount; i++)
++      vkr_gt_link(cb, VKR_GT_ID(views->pAttachments[i]), VKR_GT_WRITE);
++}
++
++static void
++gt_rendering_attachment(uint64_t cb, const VkRenderingAttachmentInfo *a)
++{
++   if (!a)
++      return;
++   vkr_gt_link(cb, VKR_GT_ID(a->imageView), VKR_GT_WRITE);
++   vkr_gt_link(cb, VKR_GT_ID(a->resolveImageView), VKR_GT_WRITE);
++}
++
++static void
++gt_rendering(uint64_t cb, const VkRenderingInfo *info)
++{
++   if (!info)
++      return;
++   for (uint32_t i = 0; info->pColorAttachments && i < info->colorAttachmentCount; i++)
++      gt_rendering_attachment(cb, &info->pColorAttachments[i]);
++   gt_rendering_attachment(cb, info->pDepthAttachment);
++   gt_rendering_attachment(cb, info->pStencilAttachment);
++}
++
+ #ifdef __clang__
+ #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+ #endif
+@@ -125,6 +188,7 @@ vkr_dispatch_vkBeginCommandBuffer(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+    struct vn_device_proc_table *vk = &cmd->device->proc_table;
+ 
++   vkr_gt_reset(VKR_GT_ID(args->commandBuffer));
+    vn_replace_vkBeginCommandBuffer_args_handle(args);
+    args->ret = vk->BeginCommandBuffer(args->commandBuffer, args->pBeginInfo);
+ }
+@@ -218,6 +282,8 @@ static void
+ vkr_dispatch_vkCmdBindDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdBindDescriptorSets *args)
+ {
++   for (uint32_t i = 0; vkr_gt_on() && args->pDescriptorSets && i < args->descriptorSetCount; i++)
++      GT_USE(args, args->pDescriptorSets[i], VKR_GT_DESCRIPTOR);
+    VKR_CMD_CALL(CmdBindDescriptorSets, args, args->pipelineBindPoint, args->layout,
+                 args->firstSet, args->descriptorSetCount, args->pDescriptorSets,
+                 args->dynamicOffsetCount, args->pDynamicOffsets);
+@@ -289,6 +355,8 @@ static void
+ vkr_dispatch_vkCmdCopyBuffer(UNUSED struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkCmdCopyBuffer *args)
+ {
++   GT_USE(args, args->srcBuffer, VKR_GT_READ);
++   GT_USE(args, args->dstBuffer, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyBuffer, args, args->srcBuffer, args->dstBuffer, args->regionCount,
+                 args->pRegions);
+ }
+@@ -297,6 +365,8 @@ static void
+ vkr_dispatch_vkCmdCopyBuffer2(UNUSED struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkCmdCopyBuffer2 *args)
+ {
++   GT_USE(args, args->pCopyBufferInfo->srcBuffer, VKR_GT_READ);
++   GT_USE(args, args->pCopyBufferInfo->dstBuffer, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyBuffer2, args, args->pCopyBufferInfo);
+ }
+ 
+@@ -304,6 +374,8 @@ static void
+ vkr_dispatch_vkCmdCopyImage(UNUSED struct vn_dispatch_context *dispatch,
+                             struct vn_command_vkCmdCopyImage *args)
+ {
++   GT_USE(args, args->srcImage, VKR_GT_READ);
++   GT_USE(args, args->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyImage, args, args->srcImage, args->srcImageLayout, args->dstImage,
+                 args->dstImageLayout, args->regionCount, args->pRegions);
+ }
+@@ -312,6 +384,8 @@ static void
+ vkr_dispatch_vkCmdCopyImage2(UNUSED struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkCmdCopyImage2 *args)
+ {
++   GT_USE(args, args->pCopyImageInfo->srcImage, VKR_GT_READ);
++   GT_USE(args, args->pCopyImageInfo->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyImage2, args, args->pCopyImageInfo);
+ }
+ 
+@@ -319,6 +393,8 @@ static void
+ vkr_dispatch_vkCmdBlitImage(UNUSED struct vn_dispatch_context *dispatch,
+                             struct vn_command_vkCmdBlitImage *args)
+ {
++   GT_USE(args, args->srcImage, VKR_GT_READ);
++   GT_USE(args, args->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdBlitImage, args, args->srcImage, args->srcImageLayout, args->dstImage,
+                 args->dstImageLayout, args->regionCount, args->pRegions, args->filter);
+ }
+@@ -327,6 +403,8 @@ static void
+ vkr_dispatch_vkCmdBlitImage2(UNUSED struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkCmdBlitImage2 *args)
+ {
++   GT_USE(args, args->pBlitImageInfo->srcImage, VKR_GT_READ);
++   GT_USE(args, args->pBlitImageInfo->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdBlitImage2, args, args->pBlitImageInfo);
+ }
+ 
+@@ -334,6 +412,8 @@ static void
+ vkr_dispatch_vkCmdCopyBufferToImage(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdCopyBufferToImage *args)
+ {
++   GT_USE(args, args->srcBuffer, VKR_GT_READ);
++   GT_USE(args, args->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyBufferToImage, args, args->srcBuffer, args->dstImage,
+                 args->dstImageLayout, args->regionCount, args->pRegions);
+ }
+@@ -342,6 +422,8 @@ static void
+ vkr_dispatch_vkCmdCopyBufferToImage2(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdCopyBufferToImage2 *args)
+ {
++   GT_USE(args, args->pCopyBufferToImageInfo->srcBuffer, VKR_GT_READ);
++   GT_USE(args, args->pCopyBufferToImageInfo->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyBufferToImage2, args, args->pCopyBufferToImageInfo);
+ }
+ 
+@@ -349,6 +431,8 @@ static void
+ vkr_dispatch_vkCmdCopyImageToBuffer(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdCopyImageToBuffer *args)
+ {
++   GT_USE(args, args->srcImage, VKR_GT_READ);
++   GT_USE(args, args->dstBuffer, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyImageToBuffer, args, args->srcImage, args->srcImageLayout,
+                 args->dstBuffer, args->regionCount, args->pRegions);
+ }
+@@ -357,6 +441,8 @@ static void
+ vkr_dispatch_vkCmdCopyImageToBuffer2(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdCopyImageToBuffer2 *args)
+ {
++   GT_USE(args, args->pCopyImageToBufferInfo->srcImage, VKR_GT_READ);
++   GT_USE(args, args->pCopyImageToBufferInfo->dstBuffer, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdCopyImageToBuffer2, args, args->pCopyImageToBufferInfo);
+ }
+ 
+@@ -364,6 +450,7 @@ static void
+ vkr_dispatch_vkCmdUpdateBuffer(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdUpdateBuffer *args)
+ {
++   GT_USE(args, args->dstBuffer, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdUpdateBuffer, args, args->dstBuffer, args->dstOffset, args->dataSize,
+                 args->pData);
+ }
+@@ -372,6 +459,7 @@ static void
+ vkr_dispatch_vkCmdFillBuffer(UNUSED struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkCmdFillBuffer *args)
+ {
++   GT_USE(args, args->dstBuffer, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdFillBuffer, args, args->dstBuffer, args->dstOffset, args->size,
+                 args->data);
+ }
+@@ -380,6 +468,7 @@ static void
+ vkr_dispatch_vkCmdClearColorImage(UNUSED struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCmdClearColorImage *args)
+ {
++   GT_USE(args, args->image, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdClearColorImage, args, args->image, args->imageLayout, args->pColor,
+                 args->rangeCount, args->pRanges);
+ }
+@@ -389,6 +478,7 @@ vkr_dispatch_vkCmdClearDepthStencilImage(
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdClearDepthStencilImage *args)
+ {
++   GT_USE(args, args->image, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdClearDepthStencilImage, args, args->image, args->imageLayout,
+                 args->pDepthStencil, args->rangeCount, args->pRanges);
+ }
+@@ -405,6 +495,8 @@ static void
+ vkr_dispatch_vkCmdResolveImage(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdResolveImage *args)
+ {
++   GT_USE(args, args->srcImage, VKR_GT_READ);
++   GT_USE(args, args->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdResolveImage, args, args->srcImage, args->srcImageLayout,
+                 args->dstImage, args->dstImageLayout, args->regionCount, args->pRegions);
+ }
+@@ -413,6 +505,8 @@ static void
+ vkr_dispatch_vkCmdResolveImage2(UNUSED struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkCmdResolveImage2 *args)
+ {
++   GT_USE(args, args->pResolveImageInfo->srcImage, VKR_GT_READ);
++   GT_USE(args, args->pResolveImageInfo->dstImage, VKR_GT_WRITE);
+    VKR_CMD_CALL(CmdResolveImage2, args, args->pResolveImageInfo);
+ }
+ 
+@@ -444,6 +538,10 @@ static void
+ vkr_dispatch_vkCmdPipelineBarrier(UNUSED struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCmdPipelineBarrier *args)
+ {
++   if (vkr_gt_on())
++      gt_barriers(VKR_GT_ID(args->commandBuffer), args->bufferMemoryBarrierCount,
++                  args->pBufferMemoryBarriers, args->imageMemoryBarrierCount,
++                  args->pImageMemoryBarriers);
+    VKR_CMD_CALL(CmdPipelineBarrier, args, args->srcStageMask, args->dstStageMask,
+                 args->dependencyFlags, args->memoryBarrierCount, args->pMemoryBarriers,
+                 args->bufferMemoryBarrierCount, args->pBufferMemoryBarriers,
+@@ -501,6 +599,8 @@ static void
+ vkr_dispatch_vkCmdBeginRenderPass(UNUSED struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCmdBeginRenderPass *args)
+ {
++   if (vkr_gt_on())
++      gt_render_pass(VKR_GT_ID(args->commandBuffer), args->pRenderPassBegin);
+    VKR_CMD_CALL(CmdBeginRenderPass, args, args->pRenderPassBegin, args->contents);
+ }
+ 
+@@ -522,6 +622,8 @@ static void
+ vkr_dispatch_vkCmdExecuteCommands(UNUSED struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCmdExecuteCommands *args)
+ {
++   for (uint32_t i = 0; vkr_gt_on() && args->pCommandBuffers && i < args->commandBufferCount; i++)
++      GT_USE(args, args->pCommandBuffers[i], 0);
+    VKR_CMD_CALL(CmdExecuteCommands, args, args->commandBufferCount,
+                 args->pCommandBuffers);
+ }
+@@ -546,6 +648,8 @@ static void
+ vkr_dispatch_vkCmdBeginRenderPass2(UNUSED struct vn_dispatch_context *dispatch,
+                                    struct vn_command_vkCmdBeginRenderPass2 *args)
+ {
++   if (vkr_gt_on())
++      gt_render_pass(VKR_GT_ID(args->commandBuffer), args->pRenderPassBegin);
+    VKR_CMD_CALL(CmdBeginRenderPass2, args, args->pRenderPassBegin,
+                 args->pSubpassBeginInfo);
+ }
+@@ -797,6 +901,8 @@ static void
+ vkr_dispatch_vkCmdBeginRendering(UNUSED struct vn_dispatch_context *ctx,
+                                  struct vn_command_vkCmdBeginRendering *args)
+ {
++   if (vkr_gt_on())
++      gt_rendering(VKR_GT_ID(args->commandBuffer), args->pRenderingInfo);
+    VKR_CMD_CALL(CmdBeginRendering, args, args->pRenderingInfo);
+ }
+ 
+@@ -811,6 +917,8 @@ static void
+ vkr_dispatch_vkCmdPipelineBarrier2(UNUSED struct vn_dispatch_context *ctx,
+                                    struct vn_command_vkCmdPipelineBarrier2 *args)
+ {
++   if (vkr_gt_on())
++      gt_dependency(VKR_GT_ID(args->commandBuffer), args->pDependencyInfo);
+    VKR_CMD_CALL(CmdPipelineBarrier2, args, args->pDependencyInfo);
+ }
+ 
+@@ -864,6 +972,9 @@ static void
+ vkr_dispatch_vkCmdPushDescriptorSet(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdPushDescriptorSet *args)
+ {
++   if (vkr_gt_on())
++      vkr_gt_descriptor_writes(VKR_GT_ID(args->commandBuffer), args->descriptorWriteCount,
++                               args->pDescriptorWrites);
+    VKR_CMD_CALL(CmdPushDescriptorSet, args, args->pipelineBindPoint, args->layout,
+                 args->set, args->descriptorWriteCount, args->pDescriptorWrites);
+ }
+@@ -1092,6 +1203,10 @@ static void
+ vkr_dispatch_vkCmdBindDescriptorSets2(UNUSED struct vn_dispatch_context *dispatch,
+                                       struct vn_command_vkCmdBindDescriptorSets2 *args)
+ {
++   for (uint32_t i = 0; vkr_gt_on() && args->pBindDescriptorSetsInfo->pDescriptorSets &&
++                       i < args->pBindDescriptorSetsInfo->descriptorSetCount;
++        i++)
++      GT_USE(args, args->pBindDescriptorSetsInfo->pDescriptorSets[i], VKR_GT_DESCRIPTOR);
+    VKR_CMD_CALL(CmdBindDescriptorSets2, args, args->pBindDescriptorSetsInfo);
+ }
+ 
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 4bf526a..2f49e73 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -22,6 +22,7 @@
+ #include "vkr_cs.h"
+ #include "vkr_descriptor_set.h"
+ #include "vkr_device.h"
++#include "vkr_gputrace.h"
+ #include "vkr_device_memory.h"
+ #include "vkr_host_copy.h"
+ #include "vkr_image.h"
+@@ -346,6 +347,7 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+    }
+ 
+    *out_blob = blob;
++   vkr_gt_set_res(blob_id, res_id);
+ 
+    return true;
+ }
+diff --git a/src/venus/vkr_descriptor_set.c b/src/venus/vkr_descriptor_set.c
+index 5ec209f..00e4f2b 100644
+--- a/src/venus/vkr_descriptor_set.c
++++ b/src/venus/vkr_descriptor_set.c
+@@ -6,6 +6,7 @@
+ #include "vkr_descriptor_set.h"
+ 
+ #include "vkr_descriptor_set_gen.h"
++#include "vkr_gputrace.h"
+ 
+ static void
+ vkr_dispatch_vkGetDescriptorSetLayoutSupport(
+@@ -139,6 +140,8 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   vkr_gt_descriptor_writes(0, args->descriptorWriteCount, args->pDescriptorWrites);
++   vkr_gt_descriptor_copies(args->descriptorCopyCount, args->pDescriptorCopies);
+    vn_replace_vkUpdateDescriptorSets_args_handle(args);
+    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,
+                             args->pDescriptorWrites, args->descriptorCopyCount,
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 0b18bbd..8d1a41d 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -10,6 +10,7 @@
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
+ #include "vkr_device_memory_gen.h"
++#include "vkr_gputrace.h"
+ #include "vkr_physical_device.h"
+ 
+ static bool
+@@ -401,6 +402,9 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       return;
+    }
+ 
++   if (res_info)
++      vkr_gt_set_res(mem->base.id, res_info->resourceId);
++
+    mem->device = dev;
+    mem->might_export = might_export;
+    mem->property_flags = property_flags;
+diff --git a/src/venus/vkr_gputrace.c b/src/venus/vkr_gputrace.c
+new file mode 100644
+index 0000000..71b17ee
+--- /dev/null
++++ b/src/venus/vkr_gputrace.c
+@@ -0,0 +1,597 @@
++/*
++ * Diagnostics only (vmlab card #237): see vkr_gputrace.h.
++ */
++#include "vkr_gputrace.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "vkr_context.h"
++#include "vkr_device.h"
++#include "vkr_queue.h"
++
++/* -1 undecided, 0 off, 1 on */
++static int gt_state = -1;
++static once_flag gt_once = ONCE_FLAG_INIT;
++static mtx_t gt_mutex;
++static FILE *gt_file;
++static uint64_t gt_flushed_ns;
++static uint64_t gt_seq;
++
++uint64_t
++vkr_gt_now(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++static void
++gt_atexit(void)
++{
++   mtx_lock(&gt_mutex);
++   if (gt_file)
++      fflush(gt_file);
++   mtx_unlock(&gt_mutex);
++}
++
++static void
++gt_init(void)
++{
++   mtx_init(&gt_mutex, mtx_plain);
++   const char *dir = getenv("VMLAB_HV_GPU_TRACE");
++   gt_state = 0;
++   if (!dir || !*dir)
++      return;
++   char path[512];
++   snprintf(path, sizeof(path), "%s/gpu-trace-%d.txt", dir, (int)getpid());
++   gt_file = fopen(path, "a");
++   if (!gt_file) {
++      vkr_log("GPU trace: cannot open %s", path);
++      return;
++   }
++   setvbuf(gt_file, NULL, _IOFBF, 1 << 20);
++   vkr_log("GPU trace: writing %s", path);
++   atexit(gt_atexit);
++   gt_state = 1;
++}
++
++bool
++vkr_gt_on(void)
++{
++   if (gt_state < 0)
++      call_once(&gt_once, gt_init);
++   return gt_state == 1;
++}
++
++/* The caller holds gt_mutex. Lines are written out at most every 100 ms. */
++static void
++gt_line_locked(uint64_t at_ns, const char *line)
++{
++   fprintf(gt_file, "%" PRIu64 " %s\n", at_ns, line);
++   const uint64_t now = vkr_gt_now();
++   if (now - gt_flushed_ns >= 100000000ull) {
++      fflush(gt_file);
++      gt_flushed_ns = now;
++   }
++}
++
++/* The object graph: an open-addressed table of guest object ids. Ids are
++ * never reused within a context, so entries are never removed. */
++struct gt_edge {
++   uint64_t child;
++   uint32_t slot; /* descriptor slot + 1, or 0 */
++   uint32_t flags;
++};
++
++struct gt_node {
++   uint64_t id;
++   uint32_t res;
++   uint32_t count, cap;
++   struct gt_edge *edges;
++};
++
++static struct gt_node **gt_table;
++static size_t gt_cap, gt_len;
++
++static size_t
++gt_hash(uint64_t id)
++{
++   id ^= id >> 33;
++   id *= 0xff51afd7ed558ccdull;
++   id ^= id >> 33;
++   return (size_t)id;
++}
++
++static struct gt_node *
++gt_find(uint64_t id)
++{
++   if (!gt_cap)
++      return NULL;
++   for (size_t i = gt_hash(id) & (gt_cap - 1);; i = (i + 1) & (gt_cap - 1)) {
++      if (!gt_table[i])
++         return NULL;
++      if (gt_table[i]->id == id)
++         return gt_table[i];
++   }
++}
++
++static void
++gt_insert(struct gt_node *node)
++{
++   for (size_t i = gt_hash(node->id) & (gt_cap - 1);; i = (i + 1) & (gt_cap - 1)) {
++      if (!gt_table[i]) {
++         gt_table[i] = node;
++         return;
++      }
++   }
++}
++
++static struct gt_node *
++gt_get(uint64_t id)
++{
++   struct gt_node *node = gt_find(id);
++   if (node)
++      return node;
++   if ((gt_len + 1) * 2 > gt_cap) {
++      struct gt_node **old = gt_table;
++      size_t old_cap = gt_cap;
++      gt_cap = gt_cap ? gt_cap * 2 : 4096;
++      gt_table = calloc(gt_cap, sizeof(*gt_table));
++      if (!gt_table)
++         abort();
++      for (size_t i = 0; i < old_cap; i++) {
++         if (old[i])
++            gt_insert(old[i]);
++      }
++      free(old);
++   }
++   node = calloc(1, sizeof(*node));
++   if (!node)
++      abort();
++   node->id = id;
++   gt_insert(node);
++   gt_len++;
++   return node;
++}
++
++static void
++gt_add_edge(struct gt_node *node, uint64_t child, uint32_t slot, uint32_t flags)
++{
++   for (uint32_t i = 0; i < node->count; i++) {
++      struct gt_edge *e = &node->edges[i];
++      if (slot ? e->slot == slot : (!e->slot && e->child == child)) {
++         e->child = child;
++         e->flags |= flags;
++         return;
++      }
++   }
++   if (node->count == node->cap) {
++      node->cap = node->cap ? node->cap * 2 : 4;
++      node->edges = realloc(node->edges, node->cap * sizeof(*node->edges));
++      if (!node->edges)
++         abort();
++   }
++   node->edges[node->count++] = (struct gt_edge){ child, slot, flags };
++}
++
++void
++vkr_gt_set_res(uint64_t mem, uint32_t res_id)
++{
++   if (!vkr_gt_on() || !mem)
++      return;
++   mtx_lock(&gt_mutex);
++   gt_get(mem)->res = res_id;
++   mtx_unlock(&gt_mutex);
++}
++
++void
++vkr_gt_link(uint64_t parent, uint64_t child, uint32_t flags)
++{
++   if (!vkr_gt_on() || !parent || !child)
++      return;
++   mtx_lock(&gt_mutex);
++   gt_add_edge(gt_get(parent), child, 0, flags);
++   mtx_unlock(&gt_mutex);
++}
++
++void
++vkr_gt_slot(uint64_t set, uint32_t slot, uint64_t child)
++{
++   if (!vkr_gt_on() || !set)
++      return;
++   mtx_lock(&gt_mutex);
++   gt_add_edge(gt_get(set), child, slot + 1, 0);
++   mtx_unlock(&gt_mutex);
++}
++
++void
++vkr_gt_copy_slots(uint64_t src, uint32_t src_slot, uint64_t dst, uint32_t dst_slot,
++                  uint32_t count)
++{
++   if (!vkr_gt_on() || !src || !dst)
++      return;
++   mtx_lock(&gt_mutex);
++   struct gt_node *from = gt_find(src);
++   struct gt_node *to = gt_get(dst);
++   for (uint32_t n = 0; from && n < count; n++) {
++      for (uint32_t i = 0; i < from->count; i++) {
++         if (from->edges[i].slot == src_slot + n + 1) {
++            gt_add_edge(to, from->edges[i].child, dst_slot + n + 1, 0);
++            break;
++         }
++      }
++   }
++   mtx_unlock(&gt_mutex);
++}
++
++void
++vkr_gt_reset(uint64_t id)
++{
++   if (!vkr_gt_on() || !id)
++      return;
++   mtx_lock(&gt_mutex);
++   struct gt_node *node = gt_find(id);
++   if (node)
++      node->count = 0;
++   mtx_unlock(&gt_mutex);
++}
++
++void
++vkr_gt_sem(char *list, size_t size, uint64_t sem, const uint64_t *value)
++{
++   size_t n = strlen(list);
++   if (n + 48 >= size)
++      return;
++   if (value)
++      snprintf(list + n, size - n, "%s%" PRIu64 ":%" PRIu64, n ? "," : "", sem, *value);
++   else
++      snprintf(list + n, size - n, "%s%" PRIu64, n ? "," : "", sem);
++}
++
++#define GT_MAX_RES 128
++
++struct gt_acc {
++   uint32_t res[GT_MAX_RES];
++   uint32_t flags[GT_MAX_RES];
++   uint32_t count;
++};
++
++/* The caller holds gt_mutex. */
++static void
++gt_resolve(uint64_t id, uint32_t flags, int depth, struct gt_acc *acc)
++{
++   struct gt_node *node = gt_find(id);
++   if (!node || depth > 8)
++      return;
++   if (node->res) {
++      uint32_t i = 0;
++      while (i < acc->count && acc->res[i] != node->res)
++         i++;
++      if (i == acc->count && acc->count < GT_MAX_RES) {
++         acc->res[acc->count] = node->res;
++         acc->flags[acc->count++] = 0;
++      }
++      if (i < acc->count)
++         acc->flags[i] |= flags;
++   }
++   for (uint32_t i = 0; i < node->count; i++) {
++      const struct gt_edge *e = &node->edges[i];
++      gt_resolve(e->child, e->flags ? e->flags : flags, depth + 1, acc);
++   }
++}
++
++/* The fence waiter of a queue: vk_done for each traced submission, in the
++ * queue's order. */
++struct gt_pending {
++   struct gt_pending *next;
++   VkFence fence;
++   uint64_t seq;
++};
++
++struct gt_waiter {
++   struct vkr_queue *queue;
++   thrd_t thread;
++   mtx_t mutex;
++   cnd_t cond;
++   struct gt_pending *head, *tail;
++   bool join;
++};
++
++static struct gt_waiter *gt_waiters[16];
++
++static int
++gt_waiter_main(void *data)
++{
++   struct gt_waiter *w = data;
++   struct vkr_device *dev = w->queue->device;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   const uint32_t ctx_id = w->queue->context->ctx_id;
++   const uint64_t queue_id = w->queue->base.id;
++   for (;;) {
++      mtx_lock(&w->mutex);
++      while (!w->head && !w->join)
++         cnd_wait(&w->cond, &w->mutex);
++      struct gt_pending *p = w->head;
++      if (!p) {
++         mtx_unlock(&w->mutex);
++         return 0;
++      }
++      w->head = p->next;
++      if (!w->head)
++         w->tail = NULL;
++      mtx_unlock(&w->mutex);
++
++      VkResult r = VK_TIMEOUT;
++      for (int tries = 0; tries < 10 && r == VK_TIMEOUT; tries++)
++         r = vk->WaitForFences(dev->base.handle.device, 1, &p->fence, VK_TRUE, 1000000000ull);
++      const uint64_t at = vkr_gt_now();
++      vk->DestroyFence(dev->base.handle.device, p->fence, NULL);
++      char line[160];
++      snprintf(line, sizeof(line), "vk_done ctx=%u seq=%" PRIu64 " queue=%" PRIu64 " ret=%d",
++               ctx_id, p->seq, queue_id, r);
++      mtx_lock(&gt_mutex);
++      gt_line_locked(at, line);
++      mtx_unlock(&gt_mutex);
++      free(p);
++   }
++}
++
++/* The caller holds gt_mutex. */
++static struct gt_waiter *
++gt_waiter_for(struct vkr_queue *queue)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(gt_waiters); i++) {
++      if (gt_waiters[i] && gt_waiters[i]->queue == queue)
++         return gt_waiters[i];
++   }
++   for (unsigned i = 0; i < ARRAY_SIZE(gt_waiters); i++) {
++      if (gt_waiters[i])
++         continue;
++      struct gt_waiter *w = calloc(1, sizeof(*w));
++      if (!w)
++         return NULL;
++      w->queue = queue;
++      mtx_init(&w->mutex, mtx_plain);
++      cnd_init(&w->cond);
++      if (thrd_create(&w->thread, gt_waiter_main, w) != thrd_success) {
++         free(w);
++         return NULL;
++      }
++      gt_waiters[i] = w;
++      return w;
++   }
++   return NULL;
++}
++
++void
++vkr_gt_queue_fini(struct vkr_queue *queue)
++{
++   if (!vkr_gt_on())
++      return;
++   struct gt_waiter *w = NULL;
++   mtx_lock(&gt_mutex);
++   for (unsigned i = 0; i < ARRAY_SIZE(gt_waiters); i++) {
++      if (gt_waiters[i] && gt_waiters[i]->queue == queue) {
++         w = gt_waiters[i];
++         gt_waiters[i] = NULL;
++      }
++   }
++   mtx_unlock(&gt_mutex);
++   if (!w)
++      return;
++   mtx_lock(&w->mutex);
++   w->join = true;
++   cnd_signal(&w->cond);
++   mtx_unlock(&w->mutex);
++   /* The waiter drains what is queued (the device is idle) and returns. */
++   thrd_join(w->thread, NULL);
++   mtx_destroy(&w->mutex);
++   cnd_destroy(&w->cond);
++   free(w);
++}
++
++static void
++gt_name(char *out, size_t size, const char *name)
++{
++   size_t n = 0;
++   for (; name && *name && n + 1 < size; name++)
++      out[n++] = (*name == ' ' || *name == '=' || *name < 0x21) ? '_' : *name;
++   out[n] = '\0';
++   if (!n)
++      snprintf(out, size, "-");
++}
++
++void
++vkr_gt_submit(struct vkr_queue *queue,
++              const char *kind,
++              const struct vkr_gt_batch *batches,
++              uint32_t batch_count,
++              uint64_t fence,
++              uint64_t begin_ns,
++              VkResult ret)
++{
++   if (!vkr_gt_on())
++      return;
++   const uint64_t end_ns = vkr_gt_now();
++   struct vkr_device *dev = queue->device;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++
++   /* The empty submission behind it, as vkr_queue_sync_submit makes one. */
++   VkFence done = VK_NULL_HANDLE;
++   if (ret == VK_SUCCESS) {
++      const VkFenceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++      if (vk->CreateFence(dev->base.handle.device, &info, NULL, &done) != VK_SUCCESS)
++         done = VK_NULL_HANDLE;
++      else if (vk->QueueSubmit(queue->base.handle.queue, 0, NULL, done) != VK_SUCCESS) {
++         vk->DestroyFence(dev->base.handle.device, done, NULL);
++         done = VK_NULL_HANDLE;
++      }
++   }
++
++   char name[64];
++   gt_name(name, sizeof(name), queue->context->debug_name);
++   static char line[16384];
++   mtx_lock(&gt_mutex);
++   const uint64_t seq = ++gt_seq;
++   int n = snprintf(line, sizeof(line),
++                    "vk_submit ctx=%u name=%s seq=%" PRIu64 " kind=%s queue=%" PRIu64
++                    " family=%u ring=%u fence=%" PRIu64 " batches=%u us=%" PRIu64 " ret=%d",
++                    queue->context->ctx_id, name, seq, kind, queue->base.id, queue->family,
++                    queue->ring_idx, fence, batch_count, (end_ns - begin_ns) / 1000, ret);
++   struct gt_acc acc = { .count = 0 };
++   for (uint32_t b = 0; b < batch_count && n > 0 && (size_t)n < sizeof(line) - 1024; b++) {
++      const struct vkr_gt_batch *batch = &batches[b];
++      n += snprintf(line + n, sizeof(line) - n, " b%u.wait=%s b%u.signal=%s b%u.cbs=", b,
++                    batch->waits[0] ? batch->waits : "-", b,
++                    batch->signals[0] ? batch->signals : "-", b);
++      for (uint32_t c = 0; c < batch->cb_count && (size_t)n < sizeof(line) - 1024; c++) {
++         n += snprintf(line + n, sizeof(line) - n, "%s%" PRIu64, c ? "," : "", batch->cbs[c]);
++         gt_resolve(batch->cbs[c], 0, 0, &acc);
++      }
++      if (!batch->cb_count)
++         n += snprintf(line + n, sizeof(line) - n, "-");
++   }
++   n += snprintf(line + n, sizeof(line) - n, " res=");
++   for (uint32_t i = 0; i < acc.count && (size_t)n < sizeof(line) - 32; i++) {
++      const uint32_t f = acc.flags[i];
++      n += snprintf(line + n, sizeof(line) - n, "%s%u:%s%s%s%s", i ? "," : "", acc.res[i],
++                    f & VKR_GT_WRITE ? "w" : "", f & VKR_GT_READ ? "r" : "",
++                    f & VKR_GT_DESCRIPTOR ? "d" : "", f & VKR_GT_BARRIER ? "b" : "");
++   }
++   if (!acc.count)
++      snprintf(line + n, sizeof(line) - n, "-");
++   gt_line_locked(begin_ns, line);
++
++   struct gt_waiter *w = done != VK_NULL_HANDLE ? gt_waiter_for(queue) : NULL;
++   mtx_unlock(&gt_mutex);
++   if (done == VK_NULL_HANDLE)
++      return;
++   struct gt_pending *p = w ? calloc(1, sizeof(*p)) : NULL;
++   if (!p) {
++      vk->QueueWaitIdle(queue->base.handle.queue);
++      vk->DestroyFence(dev->base.handle.device, done, NULL);
++      return;
++   }
++   p->fence = done;
++   p->seq = seq;
++   mtx_lock(&w->mutex);
++   if (w->tail)
++      w->tail->next = p;
++   else
++      w->head = p;
++   w->tail = p;
++   cnd_signal(&w->cond);
++   mtx_unlock(&w->mutex);
++}
++
++struct vkr_gt_batch *
++vkr_gt_batches(const VkSubmitInfo *submits, uint32_t count)
++{
++   if (!vkr_gt_on() || !count)
++      return NULL;
++   struct vkr_gt_batch *out = calloc(count, sizeof(*out));
++   if (!out)
++      return NULL;
++   for (uint32_t i = 0; i < count; i++) {
++      const VkSubmitInfo *s = &submits[i];
++      const VkTimelineSemaphoreSubmitInfo *tl =
++         vkr_find_struct(s->pNext, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
++      for (uint32_t j = 0; j < s->waitSemaphoreCount; j++)
++         vkr_gt_sem(out[i].waits, sizeof(out[i].waits), VKR_GT_ID(s->pWaitSemaphores[j]),
++                    tl && tl->pWaitSemaphoreValues && j < tl->waitSemaphoreValueCount
++                       ? &tl->pWaitSemaphoreValues[j]
++                       : NULL);
++      for (uint32_t j = 0; j < s->signalSemaphoreCount; j++)
++         vkr_gt_sem(out[i].signals, sizeof(out[i].signals),
++                    VKR_GT_ID(s->pSignalSemaphores[j]),
++                    tl && tl->pSignalSemaphoreValues && j < tl->signalSemaphoreValueCount
++                       ? &tl->pSignalSemaphoreValues[j]
++                       : NULL);
++      for (uint32_t j = 0; j < s->commandBufferCount && j < ARRAY_SIZE(out[i].cbs); j++)
++         out[i].cbs[out[i].cb_count++] = VKR_GT_ID(s->pCommandBuffers[j]);
++   }
++   return out;
++}
++
++struct vkr_gt_batch *
++vkr_gt_batches2(const VkSubmitInfo2 *submits, uint32_t count)
++{
++   if (!vkr_gt_on() || !count)
++      return NULL;
++   struct vkr_gt_batch *out = calloc(count, sizeof(*out));
++   if (!out)
++      return NULL;
++   for (uint32_t i = 0; i < count; i++) {
++      const VkSubmitInfo2 *s = &submits[i];
++      for (uint32_t j = 0; j < s->waitSemaphoreInfoCount; j++)
++         vkr_gt_sem(out[i].waits, sizeof(out[i].waits),
++                    VKR_GT_ID(s->pWaitSemaphoreInfos[j].semaphore),
++                    &s->pWaitSemaphoreInfos[j].value);
++      for (uint32_t j = 0; j < s->signalSemaphoreInfoCount; j++)
++         vkr_gt_sem(out[i].signals, sizeof(out[i].signals),
++                    VKR_GT_ID(s->pSignalSemaphoreInfos[j].semaphore),
++                    &s->pSignalSemaphoreInfos[j].value);
++      for (uint32_t j = 0; j < s->commandBufferInfoCount && j < ARRAY_SIZE(out[i].cbs); j++)
++         out[i].cbs[out[i].cb_count++] = VKR_GT_ID(s->pCommandBufferInfos[j].commandBuffer);
++   }
++   return out;
++}
++
++static uint64_t
++gt_descriptor_id(const VkWriteDescriptorSet *w, uint32_t j)
++{
++   switch (w->descriptorType) {
++   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
++   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
++   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
++   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
++      return w->pImageInfo ? VKR_GT_ID(w->pImageInfo[j].imageView) : 0;
++   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
++   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
++      return w->pBufferInfo ? VKR_GT_ID(w->pBufferInfo[j].buffer) : 0;
++   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++      return w->pTexelBufferView ? VKR_GT_ID(w->pTexelBufferView[j]) : 0;
++   default:
++      return 0;
++   }
++}
++
++void
++vkr_gt_descriptor_writes(uint64_t cb, uint32_t count, const VkWriteDescriptorSet *writes)
++{
++   if (!vkr_gt_on())
++      return;
++   for (uint32_t i = 0; i < count; i++) {
++      const VkWriteDescriptorSet *w = &writes[i];
++      if (w->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
++         continue;
++      for (uint32_t j = 0; j < w->descriptorCount; j++) {
++         const uint64_t id = gt_descriptor_id(w, j);
++         if (cb)
++            vkr_gt_link(cb, id, VKR_GT_DESCRIPTOR);
++         else
++            vkr_gt_slot(VKR_GT_ID(w->dstSet), (w->dstBinding << 12) | (w->dstArrayElement + j),
++                        id);
++      }
++   }
++}
++
++void
++vkr_gt_descriptor_copies(uint32_t count, const VkCopyDescriptorSet *copies)
++{
++   if (!vkr_gt_on())
++      return;
++   for (uint32_t i = 0; i < count; i++) {
++      const VkCopyDescriptorSet *c = &copies[i];
++      vkr_gt_copy_slots(VKR_GT_ID(c->srcSet), (c->srcBinding << 12) | c->srcArrayElement,
++                        VKR_GT_ID(c->dstSet), (c->dstBinding << 12) | c->dstArrayElement,
++                        c->descriptorCount);
++   }
++}
+diff --git a/src/venus/vkr_gputrace.h b/src/venus/vkr_gputrace.h
+new file mode 100644
+index 0000000..9372780
+--- /dev/null
++++ b/src/venus/vkr_gputrace.h
+@@ -0,0 +1,110 @@
++/*
++ * Diagnostics only (vmlab card #237, guest/win3d/docs/tearing.md): with
++ * VMLAB_HV_GPU_TRACE=<dir> in its environment, a render worker writes every
++ * vkQueueSubmit and vkQueueSubmit2 of its context into
++ * <dir>/gpu-trace-<pid>.txt, the trace file format of vmlab-hv's GPU trace:
++ *
++ *    <CLOCK_MONOTONIC ns> vk_submit ctx=.. name=.. seq=.. queue=.. ...
++ *    <CLOCK_MONOTONIC ns> vk_done ctx=.. seq=.. queue=..
++ *
++ * vk_submit is written when the ring thread has handed the submission to the
++ * host driver; vk_done when an empty submission with a fence of the trace,
++ * made on the same queue right after it, signals: the host GPU has finished
++ * the submission's work by then.
++ */
++#ifndef VKR_GPUTRACE_H
++#define VKR_GPUTRACE_H
++
++#include "vkr_common.h"
++
++struct vkr_queue;
++
++/* Resource flags of an object a command buffer uses. */
++#define VKR_GT_WRITE 1u      /* attachment, copy or clear destination */
++#define VKR_GT_READ 2u       /* copy source */
++#define VKR_GT_DESCRIPTOR 4u /* through a bound or pushed descriptor */
++#define VKR_GT_BARRIER 8u    /* named by a pipeline barrier */
++
++bool
++vkr_gt_on(void);
++
++/* The guest id of a handle that the decoder has not replaced yet (it points
++ * at the vkr_object), 0 for VK_NULL_HANDLE. */
++static inline uint64_t
++vkr_gt_id_of(const void *handle)
++{
++   return handle ? ((const struct vkr_object *)handle)->id : 0;
++}
++#define VKR_GT_ID(handle) vkr_gt_id_of((const void *)(uintptr_t)(handle))
++
++/* The virgl resource behind a VkDeviceMemory. */
++void
++vkr_gt_set_res(uint64_t mem, uint32_t res_id);
++
++/* `parent` uses `child` (image -> memory, view -> image, command buffer ->
++ * image); flags 0 means the flags of the edge that reached the parent. */
++void
++vkr_gt_link(uint64_t parent, uint64_t child, uint32_t flags);
++
++/* A descriptor of a set: replaces what the slot held. */
++void
++vkr_gt_slot(uint64_t set, uint32_t slot, uint64_t child);
++
++/* Copy `count` slots of a set into another. */
++void
++vkr_gt_copy_slots(uint64_t src, uint32_t src_slot, uint64_t dst, uint32_t dst_slot,
++                  uint32_t count);
++
++/* Forget the edges of an object (vkBeginCommandBuffer). */
++void
++vkr_gt_reset(uint64_t id);
++
++struct vkr_gt_batch {
++   char waits[256];
++   char signals[256];
++   uint64_t cbs[64];
++   uint32_t cb_count;
++};
++
++/* Append a semaphore (with its timeline value, if any) to a list. */
++void
++vkr_gt_sem(char *list, size_t size, uint64_t sem, const uint64_t *value);
++
++/* Write vk_submit for a submission that the host driver has taken, and
++ * follow it with the empty submission whose fence gives vk_done. The caller
++ * holds queue->vk_mutex. */
++void
++vkr_gt_submit(struct vkr_queue *queue,
++              const char *kind,
++              const struct vkr_gt_batch *batches,
++              uint32_t batch_count,
++              uint64_t fence,
++              uint64_t begin_ns,
++              VkResult ret);
++
++/* CLOCK_MONOTONIC in ns. */
++uint64_t
++vkr_gt_now(void);
++
++/* The batches of a vkQueueSubmit or vkQueueSubmit2 whose handles the decoder
++ * has not replaced yet; free() the result. NULL when the trace is off. */
++struct vkr_gt_batch *
++vkr_gt_batches(const VkSubmitInfo *submits, uint32_t count);
++
++struct vkr_gt_batch *
++vkr_gt_batches2(const VkSubmitInfo2 *submits, uint32_t count);
++
++/* The objects that descriptor writes name: as slots of their sets
++ * (vkUpdateDescriptorSets, cb 0), or as descriptor uses of a command buffer
++ * (vkCmdPushDescriptorSet). */
++void
++vkr_gt_descriptor_writes(uint64_t cb, uint32_t count, const VkWriteDescriptorSet *writes);
++
++void
++vkr_gt_descriptor_copies(uint32_t count, const VkCopyDescriptorSet *copies);
++
++/* Stop the queue's fence waiter; the device is idle. */
++void
++vkr_gt_queue_fini(struct vkr_queue *queue);
++
++#endif /* VKR_GPUTRACE_H */
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index 20ba57a..f3aafec 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -8,6 +8,7 @@
+ #include <stdlib.h>
+ 
+ #include "vkr_image_gen.h"
++#include "vkr_gputrace.h"
+ #include "vkr_physical_device.h"
+ 
+ /* vmlab-win3d diagnostic: describe a VkImageCreateInfo and its pNext chain */
+@@ -159,6 +160,7 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   vkr_gt_link(VKR_GT_ID(args->image), VKR_GT_ID(args->memory), 0);
+    vn_replace_vkBindImageMemory_args_handle(args);
+    args->ret =
+       vk->BindImageMemory(args->device, args->image, args->memory, args->memoryOffset);
+@@ -171,6 +173,9 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   for (uint32_t i = 0; vkr_gt_on() && i < args->bindInfoCount; i++)
++      vkr_gt_link(VKR_GT_ID(args->pBindInfos[i].image), VKR_GT_ID(args->pBindInfos[i].memory),
++                  0);
+    vn_replace_vkBindImageMemory2_args_handle(args);
+    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+ }
+@@ -230,7 +235,10 @@ static void
+ vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCreateImageView *args)
+ {
+-   vkr_image_view_create_and_add(dispatch->data, args);
++   const uint64_t image = vkr_gt_on() ? VKR_GT_ID(args->pCreateInfo->image) : 0;
++   struct vkr_image_view *view = vkr_image_view_create_and_add(dispatch->data, args);
++   if (view)
++      vkr_gt_link(view->base.id, image, 0);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index ed21bf3..f167d56 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -10,6 +10,7 @@
+ #include "vkr_context.h"
+ #include "vkr_physical_device.h"
+ #include "vkr_queue_gen.h"
++#include "vkr_gputrace.h"
+ 
+ static struct vkr_queue_sync *
+ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+@@ -132,6 +133,7 @@ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
+ void
+ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue)
+ {
++   vkr_gt_queue_fini(queue);
+    vkr_queue_sync_thread_fini(queue);
+ 
+    list_del(&queue->base.track_head);
+@@ -373,12 +375,19 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   struct vkr_gt_batch *gt = vkr_gt_batches(args->pSubmits, args->submitCount);
++   const uint64_t gt_fence = vkr_gt_on() ? VKR_GT_ID(args->fence) : 0;
++
+    vn_replace_vkQueueSubmit_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
++   const uint64_t gt_begin = vkr_gt_on() ? vkr_gt_now() : 0;
+    args->ret =
+       vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
++   vkr_gt_submit(queue, "submit", gt, gt ? args->submitCount : 0, gt_fence, gt_begin,
++                 args->ret);
+    mtx_unlock(&queue->vk_mutex);
++   free(gt);
+ }
+ 
+ static void
+@@ -414,12 +423,19 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   struct vkr_gt_batch *gt = vkr_gt_batches2(args->pSubmits, args->submitCount);
++   const uint64_t gt_fence = vkr_gt_on() ? VKR_GT_ID(args->fence) : 0;
++
+    vn_replace_vkQueueSubmit2_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
++   const uint64_t gt_begin = vkr_gt_on() ? vkr_gt_now() : 0;
+    args->ret =
+       vk->QueueSubmit2(args->queue, args->submitCount, args->pSubmits, args->fence);
++   vkr_gt_submit(queue, "submit2", gt, gt ? args->submitCount : 0, gt_fence, gt_begin,
++                 args->ret);
+    mtx_unlock(&queue->vk_mutex);
++   free(gt);
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_render_pass.c b/src/venus/vkr_render_pass.c
+index 0cb3d70..0451415 100644
+--- a/src/venus/vkr_render_pass.c
++++ b/src/venus/vkr_render_pass.c
+@@ -6,6 +6,7 @@
+ #include "vkr_render_pass.h"
+ 
+ #include "vkr_render_pass_gen.h"
++#include "vkr_gputrace.h"
+ 
+ static void
+ vkr_dispatch_vkCreateRenderPass(struct vn_dispatch_context *dispatch,
+@@ -75,7 +76,15 @@ static void
+ vkr_dispatch_vkCreateFramebuffer(struct vn_dispatch_context *dispatch,
+                                  struct vn_command_vkCreateFramebuffer *args)
+ {
+-   vkr_framebuffer_create_and_add(dispatch->data, args);
++   uint64_t views[16] = { 0 };
++   const VkFramebufferCreateInfo *info = args->pCreateInfo;
++   for (uint32_t i = 0; vkr_gt_on() && info->pAttachments && i < info->attachmentCount &&
++                        i < ARRAY_SIZE(views);
++        i++)
++      views[i] = VKR_GT_ID(info->pAttachments[i]);
++   struct vkr_framebuffer *fb = vkr_framebuffer_create_and_add(dispatch->data, args);
++   for (uint32_t i = 0; fb && i < ARRAY_SIZE(views); i++)
++      vkr_gt_link(fb->base.id, views[i], 0);
+ }
+ 
+ static void
