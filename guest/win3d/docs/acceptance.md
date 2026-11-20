@@ -11,6 +11,7 @@ produces all of the evidence, and anyone can run it again:
 ```sh
 tests/e2e/run.sh --template windows-11     # or windows-10; --keep leaves the lab up
 tests/e2e/run.sh --template windows-11 --host-gpu Nvidia1   # another host GPU (default AMD1)
+tests/e2e/run.sh --template windows-11 --variant win3d      # a clone of #win3d: checks its install instead of installing
 ```
 
 It exits 0 only when every Done check passes, and it prints a pass/fail
