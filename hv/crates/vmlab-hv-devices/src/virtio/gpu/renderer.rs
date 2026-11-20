@@ -203,6 +203,7 @@ struct Backend {
     damage: Vec<Rect>,
     pending_frame: bool,
     scanout_dirty: bool,
+    present_copies: u64,
 }
 
 impl Drop for Backend {
@@ -362,6 +363,7 @@ impl Renderer {
                     damage: Vec::new(),
                     pending_frame: false,
                     scanout_dirty: true,
+                    present_copies: 0,
                 };
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(2)) {
@@ -987,7 +989,12 @@ impl Backend {
                 wait_fences(fd.as_raw_fd(), flags, Duration::from_secs(1));
             }
         }
-        super::copy::run(request, &src, &mut dst)
+        let copied = super::copy::run(request, &src, &mut dst)?;
+        if self.present_copies == 0 {
+            log::info!("virtio-gpu: the guest copies its Blt presents on the host");
+        }
+        self.present_copies += 1;
+        Ok(copied)
     }
 
     /// Refuse a resource the descriptor limit cannot pay for.
