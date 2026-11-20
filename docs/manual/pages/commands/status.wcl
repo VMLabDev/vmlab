@@ -103,7 +103,8 @@ SRC
   h3 "Machines"
 
   p <<DOC
-    A VM using automatic QEMU fallback prints `hypervisor=qemu fallback:`
+    A VM of another architecture than x86 using automatic QEMU fallback
+    prints `hypervisor=qemu fallback:`
     and its reason below the machine row, even without `--verbose`.
     JSON status includes `hypervisor` and optional `hypervisor_fallback`.
     For a stopped machine awaiting migration, the hypervisor shown is the one
@@ -113,16 +114,7 @@ SRC
   DOC
 
   p <<DOC
-    An x86 machine selected for QEMU by an explicit setting or automatic
-    fallback prints a `warning:` line below its row with the reason this
-    machine is on QEMU and the fix, and a second line listing its online QEMU
-    snapshots, which cannot be restored after the removal. A host without
-    usable KVM adds one `warning:` line under the table. JSON status carries
-    this as `qemu_removal` on the machine (`reason`, `warning` and
-    `online_snapshots`) and as `host_warnings` on the lab. A lab that is not
-    running prints the same warnings from the lab file and its saved state,
-    and its JSON answer has a top-level `qemu_removal` list whose entries
-    name their `machine`. See
+    QEMU runs no x86 guest, so no x86 machine reports QEMU. See
     [QEMU or vmlab-hv](guide_host). For a machine selected for vmlab-hv,
     `vmlab snapshot list` marks its online QEMU snapshots unrestorable by name.
   DOC
