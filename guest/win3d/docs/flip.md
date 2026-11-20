@@ -62,3 +62,46 @@ vmlab repository. The driver side is `patches/kmd/0009`.
 - A host that does not offer it (QEMU, a vmlab-hv before this change) leaves
   the driver on `RESOURCE_FLUSH`. That is the standard path of the driver,
   unchanged by `0009`.
+
+## Result
+
+Windows 11 (`26100.1742.11`) on vmlab-hv, driver `100.6.101.58110`, package
+of commit `9d0994e4`, vmlab-hv of commit `1f2de362`, 1024x768. vmlab-hv
+logged "the guest flips through the host-ordered flip" on both labs, so the
+driver had acked the bit.
+
+| Check | AMD1 | Nvidia2 |
+| --- | --- | --- |
+| win3d e2e (`tests/e2e/run.sh`) | 12 of 12 | 12 of 12 |
+| Tearing probe, `--full`, 90 percent load, 20,000 frames | 2 torn | 2 torn |
+| The same probe before, driver `58109` ([tearing.md](tearing.md)) | 1 torn | not run |
+| The same probe before, driver `58105`, 5,979 and 5,978 frames | 4 torn | 3 torn |
+
+No Xid on either GPU. Each torn frame showed in one grab only (33 ms at 30
+grabs per second). One Nvidia2 frame mixes single rows of two frames in
+groups of one to four rows, as in the `58108` run of tearing.md.
+
+So the host-ordered flip does not end the tears, and the order of the flip
+is not where they come from: with it, the display reads a frame only after
+every fence of the renderer has signalled, its console readback is done
+before the guest hears of the flip, and no display reader holds the older
+frame when Windows frees it. The rate did not change. What is left is a race
+inside the frame before it is flipped, between work that no fence orders:
+the compositor's GPU read of a window's redirection surface and the kernel
+driver's CPU copy of a Blt present into that surface (`VioGpuCpuCopyBltPresent`,
+F9 of the design). Rows in groups of up to four fit a GPU that reads in
+tiles while a CPU writes row by row. W3 of tearing.md, the test that ruled
+this read out, ran on a trace build, and tearing.md shows that a trace build
+never tore, so W3 does not rule it out for a release build. C12 of the
+design, the present copy on the host GPU, puts that copy on a host queue
+where it can be ordered. The flip stays ordered, so C12 can be measured
+against this probe without the display's read in question.
+
+A guest without the bit: the unit test
+`the_ordered_flip_is_offered_and_refused_until_the_driver_acks_it` (vmlab-hv)
+shows that the host refuses the command unless the driver acked the bit.
+The package of driver `58109` (commit `fcbd299c`), which does not know the
+bit, passed the win3d e2e on this vmlab-hv on AMD1, 12 of 12, and vmlab-hv
+logged no ordered flip for it. A host without the bit (QEMU) was not run:
+the driver's path there is the code of `RESOURCE_FLUSH` that `0009` does not
+change.
