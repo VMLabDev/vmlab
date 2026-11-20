@@ -96,6 +96,7 @@ counted once for each grab that shows it.
 | with W4 | trace | Nvidia2 | full | 8,972 | 0 |
 | with W4 and W5 (`58108`) | release | AMD1 | full | 20,000 | 4 |
 | with W4 and W5 (`58108`) | release | Nvidia2 | full | 20,000 | 1 |
+| `58109`, the package: W4 on the base with `0006` | release | AMD1 | full | 20,000 | 1 |
 
 The rectangles mode tears too seldom to tell a change from chance: about
 three events in 20,000 frames before any change. The whole-window mode
