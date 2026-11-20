@@ -224,15 +224,17 @@ fn vm_refusals(
     let name = &vm.name;
     let mut why = Vec::new();
     if host.arch != VMLAB_ARCH {
-        why.push(if x86_guest(&guest_arch(MachineCfg::Vm(vm), host, hardware)) {
-            format!(
-                "vm \"{name}\": KVM on an x86_64 host is required — x86 guests run on \
+        why.push(
+            if x86_guest(&guest_arch(MachineCfg::Vm(vm), host, hardware)) {
+                format!(
+                    "vm \"{name}\": KVM on an x86_64 host is required — x86 guests run on \
                  vmlab-hv only, and this host is {} (PRD §22)",
-                host.arch
-            )
-        } else {
-            arch_refusal("vm host", name, &host.arch)
-        });
+                    host.arch
+                )
+            } else {
+                arch_refusal("vm host", name, &host.arch)
+            },
+        );
     }
     if !vm.qemu_args.is_empty() {
         why.push(qemu_args_refusal(name));
@@ -482,16 +484,16 @@ pub fn qemu_x86_refusals(
         return Vec::new();
     }
     let mut why = vec![match selection.source {
-            SelectionSource::HostDefault => format!(
-                "{kind} \"{name}\": the host config sets `hypervisor {{ {kind} = \"qemu\" }}`, \
+        SelectionSource::HostDefault => format!(
+            "{kind} \"{name}\": the host config sets `hypervisor {{ {kind} = \"qemu\" }}`, \
                  and QEMU no longer runs x86 guests (PRD §22) — remove that default or set it \
                  to \"vmlab\", which runs them"
-            ),
-            _ => format!(
-                "{kind} \"{name}\": hypervisor = \"qemu\" no longer runs x86 guests (PRD §22) — \
+        ),
+        _ => format!(
+            "{kind} \"{name}\": hypervisor = \"qemu\" no longer runs x86 guests (PRD §22) — \
                  set hypervisor = \"vmlab\", or remove the line; vmlab-hv runs every x86 machine"
-            ),
-        }];
+        ),
+    }];
     if let MachineCfg::Vm(vm) = machine
         && !vm.qemu_args.is_empty()
     {
@@ -689,10 +691,7 @@ mod tests {
         assert_eq!(picked.kind, HypervisorKind::Vmlab);
         assert!(picked.fallback_reason.is_none());
         let why = vmlab_refusals(modern, &no_kvm, Some(&hardware));
-        assert!(
-            why.iter().any(|w| w.contains("KVM is required")),
-            "{why:?}"
-        );
+        assert!(why.iter().any(|w| w.contains("KVM is required")), "{why:?}");
     }
 
     #[test]
@@ -1242,7 +1241,8 @@ mod tests {
         let machine = file.lab.machine("v").unwrap();
         let why = vmlab_refusals(machine, &host, None);
         assert!(
-            why.iter().any(|w| w.contains("KVM on an x86_64 host is required")),
+            why.iter()
+                .any(|w| w.contains("KVM on an x86_64 host is required")),
             "{why:?}"
         );
         let picked = HypervisorDefaults::default().select(machine, &host, None, None);
@@ -1296,7 +1296,10 @@ mod tests {
 
         let why = qemu_refused(&file, "args", none, &host);
         assert_eq!(why.len(), 2, "{why:?}");
-        assert!(why[1].contains("`qemu_args`") && why[1].contains("remove it"), "{why:?}");
+        assert!(
+            why[1].contains("`qemu_args`") && why[1].contains("remove it"),
+            "{why:?}"
+        );
     }
 
     /// QEMU keeps the other architectures, `qemu_args` and settings alike.

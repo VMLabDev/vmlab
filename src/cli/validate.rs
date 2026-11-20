@@ -208,7 +208,6 @@ pub fn cmd_validate() -> Result<()> {
     Ok(())
 }
 
-
 /// What `up` will do to each machine's disk directory on btrfs (PRD §7.1,
 /// `crate::nocow`): a line per directory it will set NOCOW on, or a
 /// warning where the filesystem could not be asked. Nothing off btrfs,

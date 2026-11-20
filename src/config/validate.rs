@@ -6,8 +6,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use super::hypervisor::{
-    HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, qemu_x86_refusals,
-    vmlab_refusals,
+    HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, qemu_x86_refusals, vmlab_refusals,
 };
 use super::model::*;
 use super::{Issue, IssueList};
