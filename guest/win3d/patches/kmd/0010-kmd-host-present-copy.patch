@@ -1,0 +1,310 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: let the host copy a Blt present when it offers to
+
+Card #227 (docs/flip.md) left torn frames at 90 percent host load after the
+host had ordered the flip. What it left is the copy of a present of the Blt
+kind (windowed Direct3D 9, WPF, DirectDraw, blt-model DXGI, Desktop
+Duplication): VioGpuCommand::Run does it on a guest CPU, row by row, into a
+surface that the compositor reads on the host GPU, and no fence orders a
+guest CPU against host GPU work.
+
+When vmlab-hv offers VIRTIO_GPU_F_VMLAB_ORDERED_FLIP (23), Run sends
+VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY (0x0f01) on the control queue in place of
+the CPU copy. The command names both resources, the image offset and row
+pitch of each, the pixel conversion, and the boxes, which the code of the
+CPU copy clips as before (VioGpuBltCopyRegion records a box instead of
+copying). The host waits for its fences and the fences of both resources,
+copies, and serves no later command before it is done, so the fenced NOP of
+the present, which Run queues after it, completes after the copy.
+
+A host that does not offer the bit (QEMU, an older vmlab-hv), or a command
+that cannot be queued, leaves the copy on the guest CPU as before. Present
+and Patch still map both surfaces: the host copies from the source's blob
+mapping and into the destination's backing, which those mappings ensure.
+---
+diff --git a/viogpu/common/viogpu.h b/viogpu/common/viogpu.h
+index c4a6643..cb59085 100644
+--- a/viogpu/common/viogpu.h
++++ b/viogpu/common/viogpu.h
+@@ -247,6 +247,40 @@ typedef struct virtio_gpu_vmlab_ordered_flip
+ } GPU_VMLAB_ORDERED_FLIP, *PGPU_VMLAB_ORDERED_FLIP;
+ #pragma pack()
+ 
++/* VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY (VIRTIO_GPU_F_VMLAB_ORDERED_FLIP): the
++ * copy of a present of the Blt kind, which the host runs after its fences
++ * and those of both resources have signalled. It serves no later command of
++ * the control queue before the copy is done. The boxes follow the fixed
++ * part, count of them, already clipped to both surfaces. Mode is
++ * VIOGPU_BLT_COPY_MODE. */
++#define VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY 0x0f01
++#pragma pack(1)
++typedef struct virtio_gpu_vmlab_present_copy
++{
++    GPU_CTRL_HDR hdr;
++    ULONG src_resource_id;
++    ULONG dst_resource_id;
++    ULONGLONG src_offset;
++    ULONGLONG dst_offset;
++    ULONG src_stride;
++    ULONG dst_stride;
++    ULONG mode;
++    ULONG bpp;
++    ULONG count;
++    ULONG padding;
++} GPU_VMLAB_PRESENT_COPY, *PGPU_VMLAB_PRESENT_COPY;
++
++typedef struct virtio_gpu_vmlab_copy_box
++{
++    ULONG src_x;
++    ULONG src_y;
++    ULONG dst_x;
++    ULONG dst_y;
++    ULONG width;
++    ULONG height;
++} GPU_VMLAB_COPY_BOX, *PGPU_VMLAB_COPY_BOX;
++#pragma pack()
++
+ /* VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: simple transfer to_host */
+ #pragma pack(1)
+ typedef struct virtio_gpu_transfer_to_host_2d
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index 2777008..4525271 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -1108,6 +1108,36 @@ UINT CtrlQueue::ResFlush(UINT res_id,
+     return ret;
+ }
+ 
++UINT CtrlQueue::PresentCopy(const GPU_VMLAB_PRESENT_COPY *fields, PGPU_VMLAB_COPY_BOX boxes)
++{
++    PGPU_VBUFFER vbuf = NULL;
++    PGPU_VMLAB_PRESENT_COPY cmd = (PGPU_VMLAB_PRESENT_COPY)AllocCmd(&vbuf, sizeof(*cmd));
++    if (!cmd || !vbuf)
++    {
++        delete[] reinterpret_cast<PBYTE>(boxes);
++        return (UINT)-1;
++    }
++    *cmd = *fields;
++    cmd->hdr.type = VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY;
++    cmd->hdr.flags = 0;
++    cmd->hdr.fence_id = 0;
++
++    vbuf->data_buf = boxes;
++    vbuf->data_size = fields->count * sizeof(GPU_VMLAB_COPY_BOX);
++
++    // Unfenced: the queue's order is the point. The fenced NOP of the
++    // present follows it, and the host answers in order.
++    UINT ret = QueueBuffer(vbuf);
++    if (ret)
++    {
++        DbgPrint(TRACE_LEVEL_WARNING,
++                 ("%s failed to queue the host present copy src=%u dst=%u ret=%u\n",
++                  __FUNCTION__, fields->src_resource_id, fields->dst_resource_id, ret));
++        ReleaseBuffer(vbuf);
++    }
++    return ret;
++}
++
+ PAGED_CODE_SEG_BEGIN
+ 
+ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y)
+diff --git a/viogpu/common/viogpu_queue.h b/viogpu/common/viogpu_queue.h
+index 6bca5a3..5b77b9d 100644
+--- a/viogpu/common/viogpu_queue.h
++++ b/viogpu/common/viogpu_queue.h
+@@ -305,6 +305,14 @@ class CtrlQueue : public VioGpuQueue
+     {
+         m_OrderedFlip = orderedFlip;
+     }
++    // The same bit offers the host copy of a Blt present.
++    BOOLEAN HasHostPresentCopy() const
++    {
++        return m_OrderedFlip;
++    }
++    // Queues VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY. Takes ownership of boxes,
++    // fields->count entries allocated with new[] from non-paged pool.
++    UINT PresentCopy(const GPU_VMLAB_PRESENT_COPY *fields, PGPU_VMLAB_COPY_BOX boxes);
+     UINT Flush();
+ 
+     void CreateResource(UINT res_id, UINT format, UINT width, UINT height);
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index a969d90..ba153c1 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -487,7 +487,8 @@ static ULONGLONG VioGpuBltCopyRegion(VioGpuCommand *cmd,
+                                      UINT bpp,
+                                      UINT src_stride, UINT dst_stride,
+                                      VIOGPU_BLT_COPY_MODE copy_mode,
+-                                     const RECT *region)
++                                     const RECT *region,
++                                     PGPU_VMLAB_COPY_BOX box)
+ {
+     // Clip the requested region to the destination blt rectangle.
+     LONG rl = max(region->left, clampRect->left);
+@@ -554,6 +555,18 @@ static ULONGLONG VioGpuBltCopyRegion(VioGpuCommand *cmd,
+         return 0;
+     }
+ 
++    if (box)
++    {
++        // The host copies it (0010): record the clipped box, copy nothing.
++        box->src_x = (ULONG)sl;
++        box->src_y = (ULONG)st;
++        box->dst_x = (ULONG)rl;
++        box->dst_y = (ULONG)rt;
++        box->width = (ULONG)w;
++        box->height = (ULONG)h;
++        return (ULONGLONG)row_bytes * h;
++    }
++
+     PUCHAR s = src_va + src_offset;
+     PUCHAR d = dst_va + dst_offset;
+     for (LONG y = 0; y < h; y++)
+@@ -606,7 +619,9 @@ static NTSTATUS VioGpuCpuCopyBltPresent(VioGpuCommand *cmd,
+                                         PVOID dst_va,
+                                         ULONGLONG dst_map_size,
+                                         const RECT *subRects,
+-                                        UINT subRectCnt)
++                                        UINT subRectCnt,
++                                        PGPU_VMLAB_COPY_BOX boxes = NULL,
++                                        UINT *box_count = NULL)
+ {
+     if (!cmd || !src || !dst || !srcRect || !dstRect || !src_va || !dst_va)
+     {
+@@ -671,7 +686,7 @@ static NTSTATUS VioGpuCpuCopyBltPresent(VioGpuCommand *cmd,
+                                             src_map_size, (PUCHAR)dst_va,
+                                             dst_map_size, dstRect, dx, dy, bpp,
+                                             src_stride, dst_stride, copy_mode,
+-                                            dstRect);
++                                            dstRect, boxes);
+         regions_copied = bytes_copied ? 1 : 0;
+     }
+     else
+@@ -682,7 +697,8 @@ static NTSTATUS VioGpuCpuCopyBltPresent(VioGpuCommand *cmd,
+                                               src_map_size, (PUCHAR)dst_va,
+                                               dst_map_size, dstRect, dx, dy, bpp,
+                                               src_stride, dst_stride, copy_mode,
+-                                              &subRects[i]);
++                                              &subRects[i],
++                                              boxes ? &boxes[regions_copied] : NULL);
+             if (n)
+             {
+                 bytes_copied += n;
+@@ -706,9 +722,70 @@ static NTSTATUS VioGpuCpuCopyBltPresent(VioGpuCommand *cmd,
+               subRectCnt, regions_copied, bytes_copied, src_stride, dst_stride,
+               duration_us));
+ 
++    if (box_count)
++    {
++        *box_count = regions_copied;
++    }
++
+     return regions_copied ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+ }
+ 
++// With VIRTIO_GPU_F_VMLAB_ORDERED_FLIP the host runs the copy of a Blt
++// present (docs/present-copy.md). A copy on a guest CPU is ordered against
++// nothing that runs on the host: the compositor's GPU read of the
++// destination can overlap it. The host waits for its fences and those of
++// both resources first and holds the control queue while it copies, and the
++// fenced NOP of the present follows the command. The boxes are clipped here,
++// by the code of the CPU copy, so both paths copy the same pixels.
++static NTSTATUS VioGpuHostCopyBltPresent(VioGpuCommand *cmd,
++                                         CtrlQueue *queue,
++                                         VioGpuAllocation *src,
++                                         VioGpuAllocation *dst,
++                                         const RECT *srcRect,
++                                         const RECT *dstRect,
++                                         PVOID src_va,
++                                         ULONGLONG src_map_size,
++                                         PVOID dst_va,
++                                         ULONGLONG dst_map_size,
++                                         const RECT *subRects,
++                                         UINT subRectCnt)
++{
++    // One box per stored sub-rectangle, at most VIOGPU_BLT_MAX_SUBRECTS (64).
++    const UINT max_boxes = subRectCnt ? subRectCnt : 1;
++    PGPU_VMLAB_COPY_BOX boxes = reinterpret_cast<PGPU_VMLAB_COPY_BOX>(
++        new (NonPagedPoolNx) BYTE[max_boxes * sizeof(GPU_VMLAB_COPY_BOX)]);
++    if (!boxes)
++    {
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++
++    UINT count = 0;
++    NTSTATUS status = VioGpuCpuCopyBltPresent(cmd, src, dst, srcRect, dstRect,
++                                              src_va, src_map_size,
++                                              dst_va, dst_map_size,
++                                              subRects, subRectCnt,
++                                              boxes, &count);
++    if (!NT_SUCCESS(status) || count == 0)
++    {
++        delete[] reinterpret_cast<PBYTE>(boxes);
++        return NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER : status;
++    }
++
++    GPU_VMLAB_PRESENT_COPY fields;
++    RtlZeroMemory(&fields, sizeof(fields));
++    fields.src_resource_id = src->GetId();
++    fields.dst_resource_id = dst->GetId();
++    fields.src_offset = 0;
++    fields.dst_offset = dst->IsBlob() ? dst->GetScanoutOffset() : 0;
++    fields.src_stride = src->GetStride();
++    fields.dst_stride = dst->GetStride();
++    fields.mode = (ULONG)VioGpuBltCopyMode(src->GetFormat(), dst->GetFormat());
++    fields.bpp = VioGpuBltBytesPerPixel(dst->GetFormat());
++    fields.count = count;
++
++    return queue->PresentCopy(&fields, boxes) ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
++}
++
+ static UINT CountDmaCompletionPackets(char *command, char *end, UINT fenceId, BOOLEAN *valid)
+ {
+     UINT packets = 0;
+@@ -798,16 +875,36 @@ void VioGpuCommand::Run()
+     {
+         m_pAdapter->FlipTrace(16, GetContextId(), m_cpuCopySrc ? m_cpuCopySrc->GetId() : 0, m_FenceId,
+                               m_cpuCopyDst ? m_cpuCopyDst->GetId() : 0);
+-        NTSTATUS copyStatus =
+-            VioGpuCpuCopyBltPresent(this, m_cpuCopySrc,
+-                                    m_cpuCopyDst, &m_cpuCopySrcRect,
+-                                    &m_cpuCopyDstRect,
+-                                    m_cpuCopySrcVa,
+-                                    m_cpuCopySrcMapSize,
+-                                    m_cpuCopyDstVa,
+-                                    m_cpuCopyDstMapSize,
+-                                    m_cpuCopySubRects,
+-                                    m_cpuCopySubRectCnt);
++        NTSTATUS copyStatus = STATUS_NOT_SUPPORTED;
++        if (m_pAdapter->ctrlQueue.HasHostPresentCopy())
++        {
++            copyStatus =
++                VioGpuHostCopyBltPresent(this, &m_pAdapter->ctrlQueue,
++                                         m_cpuCopySrc,
++                                         m_cpuCopyDst, &m_cpuCopySrcRect,
++                                         &m_cpuCopyDstRect,
++                                         m_cpuCopySrcVa,
++                                         m_cpuCopySrcMapSize,
++                                         m_cpuCopyDstVa,
++                                         m_cpuCopyDstMapSize,
++                                         m_cpuCopySubRects,
++                                         m_cpuCopySubRectCnt);
++        }
++        if (!NT_SUCCESS(copyStatus))
++        {
++            // A host without the bit, or a command that could not be
++            // queued: the copy on this CPU, as before.
++            copyStatus =
++                VioGpuCpuCopyBltPresent(this, m_cpuCopySrc,
++                                        m_cpuCopyDst, &m_cpuCopySrcRect,
++                                        &m_cpuCopyDstRect,
++                                        m_cpuCopySrcVa,
++                                        m_cpuCopySrcMapSize,
++                                        m_cpuCopyDstVa,
++                                        m_cpuCopyDstMapSize,
++                                        m_cpuCopySubRects,
++                                        m_cpuCopySubRectCnt);
++        }
+         m_pAdapter->FlipTrace(22, GetContextId(), m_cpuCopySrc ? m_cpuCopySrc->GetId() : 0, m_FenceId,
+                               m_cpuCopyDst ? m_cpuCopyDst->GetId() : 0);
+         if (!NT_SUCCESS(copyStatus))
