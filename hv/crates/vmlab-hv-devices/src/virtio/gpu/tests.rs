@@ -539,7 +539,10 @@ fn a_lost_host_gpu_refuses_work_but_serves_the_display_and_releases() {
         assert_eq!(s.command(&mem, 0, &refused), Err(UNSPEC));
     }
     assert_eq!(s.command(&mem, 0, &command(0x100, &[])).unwrap().0, 0x1101);
-    assert_eq!(s.command(&mem, 0, &command(0x10a, &[0, 0])).unwrap().0, 0x1104);
+    assert_eq!(
+        s.command(&mem, 0, &command(0x10a, &[0, 0])).unwrap().0,
+        0x1104
+    );
     // A release still releases.
     assert_eq!(
         s.command(&mem, 0, &command(0x102, &[1, 0])),
@@ -557,8 +560,12 @@ fn a_lost_host_gpu_answers_every_fence_the_device_holds() {
     let mut queue = Queue::new(16).unwrap();
     queue.try_set_size(16).unwrap();
     queue.try_set_desc_table_address(GuestAddress(0)).unwrap();
-    queue.try_set_avail_ring_address(GuestAddress(0x400)).unwrap();
-    queue.try_set_used_ring_address(GuestAddress(0x800)).unwrap();
+    queue
+        .try_set_avail_ring_address(GuestAddress(0x400))
+        .unwrap();
+    queue
+        .try_set_used_ring_address(GuestAddress(0x800))
+        .unwrap();
     queue.set_ready(true);
     let irq = Arc::new(Interrupts::default());
     {
