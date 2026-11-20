@@ -149,10 +149,8 @@ mod descriptor_limit_tests {
                 rlim_max: 0,
             };
             // SAFETY: getrlimit writes only the supplied structure.
-            assert_eq!(
-                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-                0
-            );
+            let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+            assert_eq!(status, 0);
             limit
         };
         let hard = read().rlim_max;
