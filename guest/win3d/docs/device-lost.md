@@ -82,9 +82,9 @@ Event 10 of the driver's small trace ring records the loss.
 
 Not tested:
 
-- The driver patch. It applies on `0001` to `0010`, and compiles in the
-  build of `build/kmd/` (see the card's worklog for the build of the
-  version `58112`), but no Windows guest ran it. The test that it still
+- The driver patch. `build/kmd/build.sh` applies it on `0001` to `0010`
+  and builds version `100.6.101.58112` with no new compiler warning, but no
+  Windows guest ran it. The test that it still
   needs: boot a `#win3d` clone on vmlab-hv with the driver, run a Direct3D
   11 probe, kill the VM's render server on the host, and check that the
   probe reports `DXGI_ERROR_DEVICE_REMOVED`, the desktop goes on with WARP,
