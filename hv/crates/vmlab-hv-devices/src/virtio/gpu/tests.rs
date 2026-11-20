@@ -401,3 +401,45 @@ fn an_ordered_flip_is_published_before_it_is_answered() {
     // The flip's frame holds the earlier flush too: none is left pending.
     assert!(s.flush_pending.is_none());
 }
+
+fn present_copy(src: u32, dst: u32, boxes: &[[u32; 6]]) -> Vec<u8> {
+    let mut request = vec![0; 24];
+    request[..4].copy_from_slice(&CMD_PRESENT_COPY.to_le_bytes());
+    for word in [src, dst] {
+        request.extend_from_slice(&word.to_le_bytes());
+    }
+    request.extend_from_slice(&0u64.to_le_bytes());
+    request.extend_from_slice(&0u64.to_le_bytes());
+    for word in [64, 64, 1, 4, boxes.len() as u32, 0] {
+        request.extend_from_slice(&word.to_le_bytes());
+    }
+    for b in boxes {
+        for word in b {
+            request.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+    request
+}
+
+#[test]
+fn the_present_copy_is_refused_until_the_driver_acks_the_bit() {
+    let mut gpu = Gpu::new("gpu");
+    let bit = 1u64 << ORDERED_FLIP_FEATURE;
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+    let copy = present_copy(1, 2, &[[0, 0, 0, 0, 4, 4]]);
+
+    gpu.ack_features(gpu.features() & !bit);
+    assert_eq!(gpu.state.lock().command(&mem, 0, &copy), Err(INVALID));
+
+    // Acked, but a 2D device has no renderer resources to copy between.
+    gpu.ack_features(gpu.features());
+    assert_eq!(gpu.state.lock().command(&mem, 0, &copy), Err(INVALID));
+    // A request without boxes, or cut short, is refused before any lookup.
+    assert_eq!(
+        gpu.state.lock().command(&mem, 0, &present_copy(1, 2, &[])),
+        Err(INVALID)
+    );
+    let mut short = copy.clone();
+    short.truncate(80);
+    assert_eq!(gpu.state.lock().command(&mem, 0, &short), Err(INVALID));
+}

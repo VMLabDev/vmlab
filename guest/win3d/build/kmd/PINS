@@ -23,3 +23,5 @@ debian              image docker.io/library/debian  sha256:2c037a04925515fdd6ea8
 #     vsync that reports a flip only after it was sent to the host.
 #   0009-kmd-host-ordered-flip.patch
 #     this repository (docs/flip.md): the host-ordered flip of vmlab-hv, behind a feature bit.
+#   0010-kmd-host-present-copy.patch
+#     this repository (docs/present-copy.md): the copy of a Blt present on the host, behind the same bit.

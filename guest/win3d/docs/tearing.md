@@ -196,11 +196,18 @@ its flip. The trace build counted 3 and 4 held back in 20 s.
   built ([flip.md](flip.md)). It did not end the tears: 2 torn of 20,000 on
   AMD1 and 2 of 20,000 on Nvidia2 in whole-window mode at 90 percent load,
   the rate of the runs above. What that leaves is in flip.md, "Result".
+- C12, the copy of a Blt present on the host behind the same bit, is built
+  ([present-copy.md](present-copy.md)). It did not end the tears either:
+  2 torn of 20,000 on AMD1 and 2 of 20,000 on Nvidia2 in the same probe.
+- With C10 and C12 together the rate is 2 torn of 20,000 frames at
+  90 percent load on both GPUs. That rules out the flip order (C10) and the
+  present copy (C12) as the cause. What is left is host work that no fence
+  covers, and the guest cannot see which work that is. Finding it needs a
+  host-side trace, which is new work beyond C12.
 - The probe needs a host at 90 percent load and several minutes, and the
   fault is not at 0, so it stays a script (`tests/tearing/run.sh`) beside
   the e2e tests. The adapter suite keeps its short tearing checks
-  (`tear-flip`, `tear-blt`) without load. When C10 lands, a run of this probe
-  at load is its check.
+  (`tear-flip`, `tear-blt`) without load.
 - vmlab-hv ended with "Too many open files" after about 40 s of the probe on
   Nvidia2 at the default limit of 1024 descriptors: it holds one dma-buf
   descriptor for each blob resource. The runs here raised the limit

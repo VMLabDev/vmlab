@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58110` | The PE version resource and the INF's `DriverVer` version. This version sends the host-ordered flip when vmlab-hv offers it (`0009`). `58109` reported a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58111` | The PE version resource and the INF's `DriverVer` version. This version has vmlab-hv copy a Blt present when it offers the feature bit (`0010`). `58110` sent the host-ordered flip when vmlab-hv offers it (`0009`). `58109` reported a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Trace build
 
@@ -57,7 +57,7 @@ The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
 | 3 | Preemption request | flags, pending = the preemption fence |
 | 5 | The host answered a control queue command | context, flags = the request's flags (1 fence, 2 ring index), fence = the virtio fence, response = the response type |
 | 6 to 9 | Timeout, reset, restart, power | as in `docs/tdr-recovery.md` |
-| 16, 22 | The CPU copy of a Blt present begins, ends | context, flags = source resource, fence, response = destination resource |
+| 16, 22 | The copy of a Blt present begins, ends (with `0010` on vmlab-hv: the host command is queued) | context, flags = source resource, fence, response = destination resource |
 | 17 | A flip from a DMA buffer: `SET_SCANOUT` and `RESOURCE_FLUSH` are sent | context, flags = resource, fence |
 | 18 | `SetVidPnSourceAddress` | flags = resource |
 | 19 | The vsync timer sends the recorded flip | flags = resource |
@@ -208,6 +208,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `0007-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
 | `0008-kmd-report-flips-after-they-are-sent.patch` | A vsync reports the address of a flip only after the vsync timer sent that flip to the host. Before, a flip that Windows recorded between the timer and the interrupt was reported one tick early, and Windows gave the buffer on screen back to the compositor 16 ms early. It is not the cause of the torn frames of #134 ([`docs/tearing.md`](../../docs/tearing.md)). |
 | `0009-kmd-host-ordered-flip.patch` | Acks vmlab-hv's private feature bit `VIRTIO_GPU_F_VMLAB_ORDERED_FLIP` (23) when the host offers it, and then sends every flush of the scanout as `VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP` (`0x0f00`), which the host answers only once the frame is on its display, after every fence of its renderer and the implicit fence of the scanout buffer have signalled. Without the bit (QEMU) the driver sends `RESOURCE_FLUSH` as before ([`docs/flip.md`](../../docs/flip.md)). |
+| `0010-kmd-host-present-copy.patch` | With the same bit, sends the copy of a Blt present as `VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY` (`0x0f01`) ahead of the present's fenced NOP, in place of the copy on a guest CPU. The boxes are clipped by the code of the CPU copy. Without the bit, or when the command cannot be queued, the CPU copy runs as before ([`docs/present-copy.md`](../../docs/present-copy.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.
