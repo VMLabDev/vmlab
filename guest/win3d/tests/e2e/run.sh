@@ -163,7 +163,7 @@ lab_up() {
     fi
     mkdir -p "$LABDIR"
     sed -e "s/\"win3d-e2e-windows-11\"/\"$LAB\"/" \
-        -e "s#\"x86_64/windows-11@[^\"]*\"#\"$TREF\"#" \
+        -e "s|\"x86_64/windows-11@[^\"]*\"|\"$TREF\"|" \
         -e "s/host_gpu = \"AMD1\"/host_gpu = \"$HOST_GPU\"/" \
         "$REPO/labs/acceptance/vmlab.wcl" >"$LABDIR/vmlab.wcl"
     [ -n "$EV" ] && [ "$EV" != / ] || { echo "VML-88: EV is empty or /" >&2; return 1; }
