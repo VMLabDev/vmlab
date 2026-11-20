@@ -699,10 +699,7 @@ impl State {
         let mut d = Decoder::new(request);
         let kind = d.u32()?;
         d.take(20)?;
-        if self.lost.is_some()
-            && q == 0
-            && !matches!(kind, 0x100 | 0x10a)
-            && !lost::releases(kind)
+        if self.lost.is_some() && q == 0 && !matches!(kind, 0x100 | 0x10a) && !lost::releases(kind)
         {
             // The host GPU is gone (`lost.rs`).
             return Err(UNSPEC);

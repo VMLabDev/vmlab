@@ -338,7 +338,7 @@ impl Renderer {
                     .set_use_external_blob(mode == GpuMode::Venus)
                     .set_use_render_server(mode == GpuMode::Venus)
                     .set_rutabaga_paths(Some(vec![RutabagaPath {
-                        path: node.clone(),
+                        path: worker_node.clone(),
                         path_type: RUTABAGA_PATH_TYPE_GPU,
                     }]))
                     .build();

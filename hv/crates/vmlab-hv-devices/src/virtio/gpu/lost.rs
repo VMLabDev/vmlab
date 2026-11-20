@@ -78,9 +78,9 @@ impl Watch {
         if render_server {
             match RenderServer::find(Path::new("/proc")) {
                 Some(probe) => probes.push(Box::new(probe)),
-                None => log::warn!(
-                    "virtio-gpu: no render server child found; its end is not detected"
-                ),
+                None => {
+                    log::warn!("virtio-gpu: no render server child found; its end is not detected")
+                }
             }
         }
         Self::new(probes)
@@ -219,10 +219,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vmlab-gpu-lost-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vmlab-gpu-lost-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
