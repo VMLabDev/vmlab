@@ -4,7 +4,8 @@ Subject: [PATCH] viogpu3d: take the vblank from the host's frame clock when it o
 The vsync came from a guest timer: a DPC every 16.7 ms that sent the
 recorded flip and then an empty SUBMIT_3D, whose completion interrupt
 raised CRTC_VSYNC. Its period was the guest's timer resolution, and the
-guest's clock, not the host display's (P2 of the win3d design).
+guest's clock, not the host display's (P2 of the win3d design,
+docs/vblank.md).
 
 When vmlab-hv offers VIRTIO_GPU_F_VMLAB_ORDERED_FLIP (23), StartVsyncTimer
 starts no timer. It sends VIRTIO_GPU_CMD_VMLAB_VBLANK (0x0f02), which the
