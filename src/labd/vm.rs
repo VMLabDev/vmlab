@@ -917,11 +917,6 @@ impl VmInstance {
             );
         }
         Ok(VmPaths {
-            apple_smc_osk: if t.resolved.apple_smc {
-                (self.host_config)()?.apple_smc_osk
-            } else {
-                None
-            },
             qmp_sock: self.dirs.qmp_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
@@ -939,7 +934,6 @@ impl VmInstance {
             floppy: self.floppy.clone(),
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
-            firmware_debug: self.cfg.firmware_debug,
             firmware_resolution: self.cfg.firmware_width.zip(self.cfg.firmware_height),
             seabios_code: if firmware.is_none() && qemu::qemu_arch(&t.resolved.arch) == "x86_64" {
                 qemu::firmware::seabios(

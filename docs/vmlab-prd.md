@@ -2630,7 +2630,8 @@ declaring one fixed port still collide (§3.2).
 
 Every machine runs on exactly one hypervisor: **QEMU**, driven over QMP, or
 **vmlab-hv**, vmlab's own hypervisor under `hv/`,
-driven over its own control protocol. ADR-0021 records the decision; the
+driven over its own control protocol. Since §22.4, vmlab-hv is the only
+hypervisor for x86 and x86_64 guests, and QEMU runs the other architectures. ADR-0021 records the decision; the
 Hypervisor seam (ADR-0001, ADR-0020) is what lets both run behind one
 lifecycle.
 
@@ -2638,8 +2639,8 @@ lifecycle.
 `hypervisor = "qemu" | "vmlab"`. One that names none takes the host config's
 default for its kind, `host { hypervisor { container = …  vm = … } }`, which is
 automatic for both kinds. Automatic selection uses the existing identity,
-including the x86 migration (§22.3), and selects vmlab-hv for supported new
-machines (§22.1). The field is declared on the machine only and
+including the x86 migration (§22.3), and selects vmlab-hv for every new x86
+machine and QEMU for one of another architecture (§22.1, §22.4). The field is declared on the machine only and
 never resolves through template or profile. vmlab finds the binary as
 `vmlab-hv` on `PATH`, or at the host config's `vmlab_hv`; `up` checks it is
 there before it starts anything, as it does `qemu-system-<arch>`.
@@ -2696,7 +2697,9 @@ core with IDE, a named CPU and `agent_transport = "isa-serial"` (4a), e1000 and
 PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); a
 floppy on a machine other than pc;
 `accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
-"usb"`; and `qemu_args`, QEMU's own argv, in every phase. A
+"usb"`; and `qemu_args`, QEMU's own argv, in every phase. QEMU runs no x86
+guest (§22.4), so for an x86 machine a refusal is an error that only a change
+to the machine resolves. A
 container is refused on a host whose `/dev/kvm` is not usable — containers
 require KVM on either hypervisor. Most of what decides a VM
 comes from its template and profile, so validation reads the resolved
@@ -2855,6 +2858,7 @@ containers and modern VMs default to vmlab-hv. Selection follows this order:
 2. An explicit host `hypervisor { vm = ... container = ... }` setting for its kind.
 3. The machine's persisted hypervisor identity, subject to the x86 migration in §22.3.
 4. For a new machine, vmlab-hv when `vmlab_refusals` returns no reasons, otherwise QEMU.
+   Since §22.4, a new x86 machine always selects vmlab-hv, and its refusals are errors.
 
 Container fallback uses `container_refusals`. Containers require KVM, including
 when QEMU is selected: without it start fails with `KVM is required`, never TCG.
@@ -2935,7 +2939,51 @@ unrestorable by name when vmlab-hv is selected. Restoring one by name
 returns a refusal with instructions to use a release that can restore it
 under QEMU, stop the guest, and capture an offline snapshot before upgrading.
 
-The removal warnings in §22.2 still apply to x86 machines selected for QEMU
-through an explicit setting or automatic fallback. The `existing` warning
-reason belongs to the warning release because these identities now select
-vmlab-hv.
+The removal warnings in §22.2 applied to x86 machines selected for QEMU
+through an explicit setting or automatic fallback until §22.4 made each of
+those an error. The `existing` warning reason belongs to the warning release
+because these identities now select vmlab-hv.
+
+### 22.4 Amendment: QEMU runs no x86 guest
+
+This amendment removes QEMU as a hypervisor for x86 and x86_64 guests (HV-D29,
+MEM-40). It replaces the warnings of §22.2. QEMU stays for aarch64 and riscv64
+guests, under KVM where the host is that architecture and TCG elsewhere, and
+`qemu-img` stays the image tool for every machine.
+
+- **Selection.** Automatic selection puts every x86 VM and every container on
+  an x86_64 host on vmlab-hv. It does not fall back to QEMU: a
+  `vmlab_refusals` reason is an error from validation (§5.1) and from the lab
+  daemon before it builds the machine and before each start. A machine of
+  another architecture still falls back to QEMU with a reason in `status`.
+- **Settings that name QEMU.** `hypervisor = "qemu"` on an x86 machine, and a
+  host default `hypervisor { vm = "qemu" }` or `{ container = "qemu" }` that
+  reaches one, are validation errors that name the replacement: set
+  `hypervisor = "vmlab"` or remove the setting. `qemu_args` on an x86 VM is a
+  validation error that names the vm block's own hardware keys and profiles as
+  the replacement. On another architecture each stays valid.
+- **KVM.** vmlab-hv runs under KVM only. An x86 machine on a host without
+  usable `/dev/kvm`, or on a host that is not x86_64, fails validation and
+  start with an error that says KVM is required and how to enable it. There
+  is no TCG fallback for x86 guests.
+- **The argv builder.** QEMU's argv is composed for the `virt` machine only.
+  The q35 and pc composition, the Hyper-V CPU flags, the pinned TSC and its
+  QEMU probe, the Apple SMC device, ISA serial, the floppy, the SeaBIOS splash
+  and the x86 boot-order hints are gone from the QEMU path; vmlab-hv's
+  machine description carries them. A launch of an x86 guest on QEMU is
+  refused before an argv exists.
+- **Surfaces.** The `qemu_removal` field on a machine, the lab's
+  `host_warnings` and the warning lines of §22.2 in `up`, `vm start`,
+  `validate` and `status` are removed: no x86 machine reaches QEMU to earn
+  one.
+- **Existing machines.** §22.3 is unchanged: an existing x86 QEMU identity
+  moves to vmlab-hv at the next start, or that start fails with the refusal.
+  Online QEMU snapshots stay on disk and are refused by name with the
+  instructions of §22.3.
+- **What vmlab-hv cannot run yet.** A guest that vmlab-hv refuses, macOS and
+  `accel = "tcg"` among them, does not run on this release.
+  `docs/agents/qemu-removal-remaining.md` lists what still uses QEMU.
+- **e2e.** A vmlab run leaves both kinds to automatic selection, so the x86
+  scenarios run on vmlab-hv and `arch.emulated`'s aarch64 guest runs on QEMU.
+  `--hypervisor qemu` runs `arch.emulated` alone. The x86 features that only
+  QEMU ran, `vm.hw.qemu_args` and the external-virtiofsd checks, are removed.

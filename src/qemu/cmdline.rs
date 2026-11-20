@@ -27,7 +27,6 @@ pub struct HypervisorShare {
 /// Per-VM runtime paths and attachments supplied by the lab daemon.
 #[derive(Debug, Clone, Default)]
 pub struct VmPaths {
-    pub apple_smc_osk: Option<crate::config::host::AppleSmcOsk>,
     pub qmp_sock: PathBuf,
     /// vmlab-agent channel (`vmlab.agent.0`): interactive terminals,
     /// streaming exec, file transfer, metrics — see `guest/agent-proto`.
@@ -60,7 +59,6 @@ pub struct VmPaths {
     pub seabios_code: Option<PathBuf>,
     /// The selected firmware accepts connection hints without rewriting BootOrder.
     pub firmware_boot_hints: bool,
-    pub firmware_debug: bool,
     pub firmware_resolution: Option<(u32, u32)>,
     /// The reproducible PCI ROM for the resolved NIC model.
     pub nic_rom: Option<PathBuf>,
