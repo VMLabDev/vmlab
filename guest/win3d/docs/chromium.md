@@ -96,8 +96,10 @@ Desktop Duplication patch took 0095.
 
 The same rows ran again on the package of commit `d88304f2`, the series 0001
 to 0096 with both patches, as the adapter suite's check `chromium` inside
-`tests/e2e/run.sh --apps`: all five rows gave the results of the table on
-`AMD1` and on `Nvidia2`, after 12 of 12 Done checks, with no Xid
+`tests/e2e/run.sh --apps`, after 12 of 12 Done checks, with no Xid. On
+`AMD1` and on `Nvidia2` all five rows passed: `chrome` and `edge` kept WebGL
+in 5 of 5 tries with 0 dumps and one GPU process that loaded the native copy,
+and both control rows showed the fault
 ([acceptance.md](acceptance.md#baseline), B9).
 
 | Row | `AMD1` (Radeon 610M) | `Nvidia2` (RTX 5090) |
