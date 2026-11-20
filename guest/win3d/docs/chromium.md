@@ -91,6 +91,14 @@ Windows 11 (`x86_64/windows-11@26100.1742.11`) on vmlab-hv, 2026-11-20, with
 the package built at `63ff2278`: the November base with the Mesa series 0001
 to 0095. On each GPU `tests/e2e/run.sh --keep` ran first and passed 12 of 12,
 then this check ran in the same lab. The kernel log had no NVIDIA Xid.
+The preload patch had the number 0095 in that build. It is 0096 since the
+Desktop Duplication patch took 0095.
+
+The same rows ran again on the package of commit `d88304f2`, the series 0001
+to 0096 with both patches, as the adapter suite's check `chromium` inside
+`tests/e2e/run.sh --apps`: all five rows gave the results of the table on
+`AMD1` and on `Nvidia2`, after 12 of 12 Done checks, with no Xid
+([acceptance.md](acceptance.md#baseline), B9).
 
 | Row | `AMD1` (Radeon 610M) | `Nvidia2` (RTX 5090) |
 | --- | --- | --- |
