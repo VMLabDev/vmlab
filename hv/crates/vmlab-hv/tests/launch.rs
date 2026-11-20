@@ -333,6 +333,44 @@ fn display_startup_failure_preserves_targets_and_never_advertises_control() {
 
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn a_low_soft_descriptor_limit_is_raised_to_the_hard_one() {
+    if !kernel_available() {
+        eprintln!("skipping: /dev/kvm or container kernel is absent");
+        return;
+    }
+    let _permit = vmlab_hv_tests::process::VmPermit::acquire().unwrap();
+    let dir = Dir::new("descriptor-limit");
+    // The shell lowers the soft limit and becomes vmlab-hv, as a launcher
+    // with the default limit of 1024 does.
+    let child = ManagedChild::spawn(
+        Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -S -n 300 && exec \"$0\" --machine \"$1\" --control \"$2\" --paused")
+            .arg(env!("CARGO_BIN_EXE_vmlab-hv"))
+            .arg(dir.machine())
+            .arg(dir.control())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Client::connect(dir.control()).is_err() {
+        assert!(Instant::now() < deadline, "control startup timeout");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let limits = std::fs::read_to_string(format!("/proc/{}/limits", child.id())).unwrap();
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max open files"))
+        .unwrap();
+    let fields: Vec<_> = line.split_whitespace().collect();
+    let (soft, hard) = (fields[3], fields[4]);
+    assert_ne!(hard, "300", "the test needs a hard limit above its soft one");
+    assert_eq!(soft, hard, "{line}");
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn panic_after_control_ready_kills_and_reaps_vm() {
     if !kernel_available() {
         eprintln!("skipping: /dev/kvm or container kernel is absent");

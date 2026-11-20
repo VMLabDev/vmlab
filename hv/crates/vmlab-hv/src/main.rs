@@ -111,6 +111,59 @@ mod pc_acceptance;
 #[cfg(test)]
 mod pc_hwref;
 
+/// Raise the soft descriptor limit to the hard one. A guest GPU resource
+/// holds host descriptors for as long as the guest keeps it, and a guest may
+/// keep thousands: the usual soft limit of 1024 ends the VM under a Windows
+/// desktop that has run a few 3D programs. Returns the limit in force.
+fn raise_descriptor_limit() -> std::io::Result<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only the supplied structure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if limit.rlim_cur < limit.rlim_max {
+        let raised = libc::rlimit {
+            rlim_cur: limit.rlim_max,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: setrlimit reads the supplied structure and changes only
+        // this process's soft limit, which never exceeds the hard one.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        limit = raised;
+    }
+    Ok(limit.rlim_cur)
+}
+
+#[cfg(test)]
+mod descriptor_limit_tests {
+    #[test]
+    fn the_soft_descriptor_limit_becomes_the_hard_one() {
+        let read = || {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit writes only the supplied structure.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit
+        };
+        let hard = read().rlim_max;
+        assert_eq!(super::raise_descriptor_limit().unwrap(), hard);
+        assert_eq!(read().rlim_cur, hard);
+        assert_eq!(read().rlim_max, hard);
+        // A second call has nothing to raise.
+        assert_eq!(super::raise_descriptor_limit().unwrap(), hard);
+    }
+}
+
 fn main() -> ExitCode {
     if let Err(message) = diagnostics::report::init_logging() {
         // Logging cannot report its own initialization failure through the facade.
@@ -141,6 +194,11 @@ fn main() -> ExitCode {
             return ExitCode::from(ProcessExitReason::StartupError.exit_code());
         }
     };
+
+    if let Err(error) = raise_descriptor_limit() {
+        // The VM still runs: the GPU bounds its resources by the limit in force.
+        log::warn!("raising the descriptor limit: {error}");
+    }
 
     let desc = match read_machine(&args.machine, &args.control) {
         Ok(desc) => desc,
