@@ -365,7 +365,10 @@ fn a_low_soft_descriptor_limit_is_raised_to_the_hard_one() {
         .unwrap();
     let fields: Vec<_> = line.split_whitespace().collect();
     let (soft, hard) = (fields[3], fields[4]);
-    assert_ne!(hard, "300", "the test needs a hard limit above its soft one");
+    assert_ne!(
+        hard, "300",
+        "the test needs a hard limit above its soft one"
+    );
     assert_eq!(soft, hard, "{line}");
 }
 
