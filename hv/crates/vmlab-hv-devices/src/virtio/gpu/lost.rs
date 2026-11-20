@@ -77,7 +77,11 @@ impl Watch {
         }
         let parent = std::process::id();
         for &pid in servers {
-            probes.push(Box::new(RenderServer::watching(Path::new("/proc"), pid, parent)));
+            probes.push(Box::new(RenderServer::watching(
+                Path::new("/proc"),
+                pid,
+                parent,
+            )));
         }
         Self::new(probes)
     }
