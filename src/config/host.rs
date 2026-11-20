@@ -126,6 +126,10 @@ pub struct HostGpu {
     /// Whether the supervisor holds this GPU out of runtime suspend while
     /// VMs render on it (ADR-0018).
     pub keepawake: KeepAwake,
+    /// Hide this GPU's uncached host-visible memory types from a `vulkan`
+    /// guest where the same heap has a cached one (PRD §5.2). Off unless
+    /// set: for a host whose CPU and GPU do not see that memory alike.
+    pub hide_uncached_memory: bool,
 }
 
 /// A host GPU's `keepawake` (PRD §5.2, ADR-0018): whether the supervisor
@@ -329,6 +333,7 @@ impl HostConfig {
                     .keyword("keepawake", KeepAwake::NAMES)
                     .unspan()
                     .unwrap_or_default(),
+                hide_uncached_memory: r.bool("hide_uncached_memory").unspan().unwrap_or(false),
             };
             if let Some(prev) = cfg
                 .gpus
@@ -680,6 +685,22 @@ gpu "Nvidia1" {
         );
         let amd = cfg.gpu("AMD1").unwrap();
         assert!(amd.qemu_binary.is_none() && amd.qemu_env.is_empty());
+    }
+
+    /// `hide_uncached_memory` is off unless a GPU block turns it on.
+    #[test]
+    fn parses_a_host_gpus_hide_uncached_memory() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0"  default = true }
+gpu "Nvidia1" { address = "0000:01:00.0"  hide_uncached_memory = true }
+gpu "Nvidia2" { address = "0000:05:00.0"  hide_uncached_memory = false }
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let on: Vec<bool> = cfg.gpus.iter().map(|g| g.hide_uncached_memory).collect();
+        assert_eq!(on, [false, true, false]);
     }
 
     /// `keepawake` reads `auto`, `on` or `off`, defaults to `auto`, and
