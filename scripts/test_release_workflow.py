@@ -17,7 +17,7 @@ JOBS = WORKFLOW['jobs']
 
 def test_release_pushes_build_and_prepare():
     assert 'release/**' in WORKFLOW['on']['push']['branches']
-    assert JOBS['version']['if'] == "github.event_name == 'push'"
+    assert JOBS['version']['if'] == "github.event_name == 'push' || github.base_ref == 'next'"
     calc = next(s['run'] for s in JOBS['version']['steps'] if s.get('id') == 'calc')
     assert 'do_release=false\\nversion=0.0.0-dry-run' in calc
     for name in ['build', 'vdisplay-build', 'guest-assets', 'hv-build', 'release-assets']:
@@ -26,6 +26,35 @@ def test_release_pushes_build_and_prepare():
         assert "startsWith(github.ref, 'refs/heads/release/')" in condition
     assert 'always() && !failure() && !cancelled()' in JOBS['guest-assets']['if']
     assert 'vdisplay-build' in JOBS['guest-assets']['needs']
+
+
+@pytest.mark.parametrize('path', ['guest/build-asset.sh', 'README.md'])
+def test_next_pull_request_checks_guest_asset_pin_changes(tmp_path, path):
+    def git(*args):
+        subprocess.run(['git', *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git('init', '-b', 'next')
+    git('config', 'user.name', 'Fixture')
+    git('config', 'user.email', 'fixture@example.com')
+    git('commit', '--allow-empty', '-m', 'base')
+    git('switch', '-c', 'card')
+    changed = tmp_path / path
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text('changed\n')
+    git('add', path)
+    git('commit', '-m', 'card change')
+    git('switch', 'next')
+    git('merge', '--no-ff', '--no-edit', 'card')
+
+    output = tmp_path / 'output'
+    output.touch()
+    env = dict(os.environ, GITHUB_EVENT_NAME='pull_request', GITHUB_OUTPUT=str(output))
+    calc = next(s['run'] for s in JOBS['version']['steps'] if s.get('id') == 'calc')
+    subprocess.run(['bash', '-c', calc], cwd=tmp_path, env=env, check=True)
+    if path == 'guest/build-asset.sh':
+        assert output.read_text() == 'guest_dry_run=true\nversion=0.0.0-dry-run\n'
+    else:
+        assert output.read_text() == ''
 
 
 def test_signing_and_publication_are_main_only():
