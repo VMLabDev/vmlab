@@ -73,7 +73,7 @@ def hardware(h, lab):
 
 
 def run(h):
-    for fid in ("vm.hw.qemu_args", "vm.hw.floppy", "vm.media.floppy"):
+    for fid in ("vm.hw.floppy", "vm.media.floppy"):
         h.skip(fid, h.out_of_scope(fid) or "not declared by the compatible core labs")
     provision_order(h)
     forced_stop = scratch(h)

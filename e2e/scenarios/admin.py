@@ -1,6 +1,8 @@
 """Host-wide administration: the `vmlab lab` verbs against a running lab, the
 supervisor's own lifecycle, and an emulated (non-x86) guest on QEMU.
-On vmlab-hv, a supported x86_64 scratch VM exercises the same lab verbs.
+An x86_64 scratch VM on vmlab-hv exercises the lab verbs; the aarch64 guest
+has a lab of its own, which automatic selection puts on QEMU on every run,
+since QEMU runs no x86 guest (PRD §22).
 """
 
 import pathlib
@@ -118,13 +120,15 @@ def two_roots(h):
         )
 
 
-def run(h):
-    vm = "arm01" if h.hypervisor == "qemu" else "blank"
-    with h.lab("admin-lab" if h.hypervisor == "qemu" else "admin-hv") as lab:
-        h.vmlab("up", cwd=lab, timeout=300)
+def emulated_on_qemu(h):
+    """`arch.emulated`: the aarch64 guest of `admin-lab`, which QEMU runs
+    under TCG on this x86_64 host, in a lab of its own."""
+    with h.lab("admin-lab") as lab:
 
-        # -- an aarch64 guest under TCG ----------------------------------------
         def emulated():
+            # Inside the check, so a guest that does not come up fails this
+            # feature and not the rest of the scenario.
+            h.vmlab("up", cwd=lab, timeout=300)
             qemu = [p for p in pids(QEMU_NAME) if alive(p)]
             assert qemu, "no QEMU process for arm01"
             argv = argv_of(qemu[0])
@@ -144,11 +148,20 @@ def run(h):
             assert data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 1000, f"{len(data)} bytes"
             return True
 
-        if h.hypervisor == "qemu":
-            h.check("arch.emulated", emulated,
-                    "qemu-system-aarch64 -accel tcg; the bundled AAVMF reached its UEFI shell on serial; vm screenshot wrote a PNG")
-        else:
-            h.skip("arch.emulated", "vmlab-hv phase 3: aarch64 TCG emulation")
+        h.check("arch.emulated", emulated,
+                "qemu-system-aarch64 -accel tcg; the bundled AAVMF reached its UEFI shell on serial; vm screenshot wrote a PNG")
+        # Both labs are `e2e-admin`: this one goes before the next comes up.
+        h.destroy(lab)
+
+
+def run(h):
+    emulated_on_qemu(h)
+    if h.hypervisor == "qemu":
+        # QEMU runs no x86 guest: the aarch64 guest is all a QEMU run has.
+        return
+    vm = "blank"
+    with h.lab("admin-hv") as lab:
+        h.vmlab("up", cwd=lab, timeout=300)
 
         # -- lab verbs -------------------------------------------------------
         h.check("lab.list",

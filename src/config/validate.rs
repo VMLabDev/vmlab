@@ -2002,6 +2002,21 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
     }
 }
 
+fn selected_hypervisor(machine: MachineCfg<'_>, ctx: &dyn ValidationContext) -> HypervisorKind {
+    let hardware = match machine {
+        MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
+        MachineCfg::Container(_) => None,
+    };
+    ctx.hypervisor_defaults()
+        .select(
+            machine,
+            &ctx.host_facts(),
+            hardware.as_ref(),
+            ctx.existing_hypervisor(machine.name()),
+        )
+        .kind
+}
+
 /// A VM's resolved hardware, when this context can resolve it: a store
 /// template it holds, and the profile that names. `None` otherwise — a
 /// registry template not pulled yet, an unknown profile (reported
