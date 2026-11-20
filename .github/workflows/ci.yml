@@ -1,7 +1,7 @@
 name: CI
 
-# CI runs only on main and release/**. Card branches and next are validated
-# locally with `just ci::check` (D12), so a push to them starts no workflow.
+# Card branches and next use `just ci::check` (D12). Pull requests to next
+# that change the guest asset pins also test unsigned guest packaging.
 permissions:
   contents: read
 
@@ -9,7 +9,7 @@ on:
   push:
     branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    branches: [main, next]
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +20,7 @@ env:
 jobs:
   release-dry-run:
     name: Release supply-chain dry-run (no signing identity)
+    if: github.base_ref != 'next'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -34,6 +35,7 @@ jobs:
   # other fast jobs (`guest-crates`, `ebpf-verify`), which run beside it.
   fmt-lint:
     name: fmt + lint (host + hypervisor)
+    if: github.base_ref != 'next'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -149,6 +151,7 @@ jobs:
   # on the Windows and macOS targets type-checks without needing a linker.
   guest-crates:
     name: guest crates (cinit + agent)
+    if: github.base_ref != 'next'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -178,6 +181,7 @@ jobs:
   # bpf-linker version pinned in scripts/guest-toolchains.sh (`just ebpf-tools`).
   ebpf-verify:
     name: ebpf objects match source
+    if: github.base_ref != 'next'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -206,11 +210,12 @@ jobs:
     name: Calculate version
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.base_ref == 'next'
     outputs:
       version: ${{ steps.calc.outputs.version }}
       prerelease: ${{ steps.calc.outputs.prerelease }}
       do_release: ${{ steps.calc.outputs.do_release }}
+      guest_dry_run: ${{ steps.calc.outputs.guest_dry_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -220,6 +225,12 @@ jobs:
         # `just ci::release-version` (VML-104).
         run: |
           set -eu
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if [ -n "$(git diff --name-only HEAD^1 HEAD -- guest/build-asset.sh)" ]; then
+              printf 'guest_dry_run=true\nversion=0.0.0-dry-run\n' >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             printf 'do_release=false\nversion=0.0.0-dry-run\nprerelease=true\n' >> "$GITHUB_OUTPUT"
             exit 0
@@ -299,7 +310,11 @@ jobs:
   vdisplay-build:
     name: Compile Windows display driver
     needs: [version, check, hv-check, guest-crates, ebpf-verify]
-    if: needs.version.outputs.do_release == 'true' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
+    if: >-
+      !failure() && !cancelled() &&
+      (needs.version.outputs.guest_dry_run == 'true' ||
+      needs.version.outputs.do_release == 'true' ||
+      (needs.version.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -371,11 +386,11 @@ jobs:
     env:
       VMLAB_BUILD_ENV: '1'
     needs: [version, check, hv-check, guest-crates, ebpf-verify, vdisplay-build, vdisplay-sign]
-    # vdisplay-sign is deliberately skipped on release branches. Do not let
+    # vdisplay-sign is skipped for unsigned dry runs. Do not let
     # that skip suppress the dry build, but never ignore a failed prerequisite.
     if: >-
       always() && !failure() && !cancelled() &&
-      (needs.version.outputs.do_release == 'true' ||
+      (needs.version.outputs.do_release == 'true' || needs.version.outputs.guest_dry_run == 'true' ||
       (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')))
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -426,7 +441,7 @@ jobs:
           path: guest/vdisplay-windows/target/signed-package
       - name: Build and package
         env:
-          VMLAB_RELEASE_DRY_RUN: ${{ startsWith(github.ref, 'refs/heads/release/') && '1' || '0' }}
+          VMLAB_RELEASE_DRY_RUN: ${{ (startsWith(github.ref, 'refs/heads/release/') || needs.version.outputs.guest_dry_run == 'true') && '1' || '0' }}
         run: just guest-package "${{ needs.version.outputs.version }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
