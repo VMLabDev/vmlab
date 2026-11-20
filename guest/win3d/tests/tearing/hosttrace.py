@@ -20,7 +20,12 @@ from patches/virglrenderer/diagnostic/0041): every vk_submit with the
 virgl resources its command buffers use, and its vk_done. Then 'submits'
 says, for each composition (a submission that writes a scanout), whether a
 host present copy into a resource that it reads ran between its submission
-and its completion, for all compositions and for those of the torn frames.
+and its completion; for each present copy, whether the GPU write into its
+source before it was still running when it began, and whether the next one
+was submitted while it ran; how many GPU writes went into a copy
+destination; and for each torn frame, its composition and the copy that fed
+it. --alias DST=RES names the resource whose memory a copy into DST writes
+(a destination with a guest backing that a context knows as a mapped blob).
 """
 import argparse
 import bisect
@@ -117,6 +122,38 @@ def submits(events, vk_events, torn, alias=None):
         counts['reading-a-copied-resource'] += bool(rel)
         counts['with-an-overlapping-copy'] += 'copy-overlaps' in kinds
         by_name[s['name']] += 1
+
+    # The GPU writes into each copy's source: the last one before the copy
+    # (still running at its start?) and the next one (submitted during it?).
+    durations = sorted(c['end'] - c['start'] for c in copies)
+    writes = collections.defaultdict(list)
+    for s in subs:
+        for res, flags in s['res'].items():
+            if 'w' in flags:
+                writes[res].append(s)
+    write_t = {r: [s['t'] for s in v] for r, v in writes.items()}
+
+    def source(c):
+        v, t = writes.get(c['src'], []), write_t.get(c['src'], [])
+        i = bisect.bisect_left(t, c['start'])
+        last = v[i - 1] if i else None
+        nxt = v[i] if i < len(v) else None
+        return {
+            'copy_ms': round((c['end'] - c['start']) / 1e6, 3),
+            'longer_than_percent': round(100 * bisect.bisect_left(durations, c['end'] - c['start']) / len(durations), 2),
+            'last_write_done_ms': round((last['done'] - c['start']) / 1e6, 3) if last and last['done'] else None,
+            'next_write_submit_ms': round((nxt['t'] - c['end']) / 1e6, 3) if nxt else None,
+        }
+    sources = collections.Counter()
+    for c in copies:
+        info = source(c)
+        sources['copies'] += 1
+        sources['last-write-not-done-at-copy-start'] += (info['last_write_done_ms'] or 0) > 0
+        sources['next-write-submitted-during-copy'] += (info['next_write_submit_ms'] is not None
+                                                        and info['next_write_submit_ms'] < 0)
+    copied_into = {c['dst'] for c in copies}
+    q = lambda p: round(durations[min(len(durations) - 1, int(len(durations) * p))] / 1e6, 3) if durations else None
+
     times = [s['t'] for s in subs]
     frames = []
     for entry in torn:
@@ -130,20 +167,32 @@ def submits(events, vk_events, torn, alias=None):
         if comp is None:
             frames.append({'frame': entry['frame'], 'scanout': scanout, 'note': 'no submission wrote the scanout'})
             continue
-        frames.append({
+        frame = {
             'frame': entry['frame'], 'scanout': scanout, 'composition': {
                 'name': comp['name'], 'ctx': comp['ctx'], 'seq': comp['seq'],
                 'submit_ms': round((comp['t'] - origin) / 1e6, 3),
                 'done_ms': round((comp['done'] - origin) / 1e6, 3) if comp['done'] else None,
                 'res': comp['res']},
-            'copies': relation(comp)})
+            'copies': relation(comp)}
+        # The copy that fed it: the last one into a resource it reads that
+        # ended before its submission.
+        fed = [c for res, flags in comp['res'].items() if res in by_dst and ({'d', 'r'} & set(flags))
+               for c in by_dst[res] if c['end'] <= comp['t']]
+        if fed:
+            c = max(fed, key=lambda c: c['end'])
+            frame['feeding_copy'] = dict(source(c), dst=c['dst'], src=c['src'],
+                                         composition_after_copy_ms=round((comp['t'] - c['end']) / 1e6, 3))
+        frames.append(frame)
     return {
         'vk_submits': len(subs),
-        'vk_submits_by_context': dict(collections.Counter(s['name'] for s in subs)),
+        'vk_submits_by_context': dict(collections.Counter(s['ctx'] for s in subs)),
         'present_copies': len(copies),
+        'copy_ms': {'median': q(.5), 'p90': q(.9), 'p99': q(.99), 'max': q(1)},
         'scanouts': sorted(scanouts, key=lambda r: int(r) if r.isdigit() else 0),
-        'compositions_by_context': dict(by_name),
+        'gpu_writes_into_copy_destinations': sum(len(writes.get(d, [])) for d in copied_into),
+        'compositions_by_context': dict(collections.Counter(s['ctx'] for s in compositions)),
         'compositions': dict(counts),
+        'copy_sources': dict(sources),
         'torn': frames,
     }
 
