@@ -1272,6 +1272,11 @@ impl VirtioDevice for Gpu {
         }
         let mut used = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !crate::virtio::avail_idx_in_range(&s.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = s.queues[index].pop_descriptor_chain(&mem) {
                 let head = chain.head_index();
                 let len = s.chain(&mem, index, chain);

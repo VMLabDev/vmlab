@@ -62,6 +62,7 @@ pub struct PassthroughFs {
 
 /// Everything the guest has made the server remember.
 struct Session {
+    writeback_cache: bool,
     /// `O_PATH` descriptors by inode; the root holds the share directory.
     inodes: HashMap<u64, Inode>,
     /// Live path → inode, so repeat lookups of one file share one guest
@@ -142,6 +143,7 @@ impl PassthroughFs {
                 super::fuse::server::MAX_BUFFER_SIZE as usize + 4096,
             )),
             inner: std::sync::Arc::new(Mutex::new(Session {
+                writeback_cache: false,
                 inodes: HashMap::from([(
                     ROOT_ID,
                     Inode {
@@ -188,7 +190,8 @@ impl PassthroughFs {
         let session = self.inner.lock();
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.push(1); // format version
+        out.push(2); // format version
+        out.push(u8::from(session.writeback_cache));
         out.extend_from_slice(&(session.inodes.len() as u32).to_le_bytes());
         let mut inodes: Vec<(&u64, &Inode)> = session.inodes.iter().collect();
         inodes.sort_by_key(|(ino, _)| **ino);
@@ -237,13 +240,22 @@ impl PassthroughFs {
         if state.len() < 10 || u32::from_le_bytes(state[0..4].try_into().unwrap()) != MAGIC {
             return Err(err());
         }
-        if state[4] != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("passthrough state version {} is not 1", state[4]),
-            ));
-        }
-        let mut cur = 5usize;
+        let (writeback_cache, mut cur) = match state[4] {
+            // Version 1 did not record negotiated writeback. Preserve its
+            // host append behavior when restoring those sessions.
+            1 => (false, 5usize),
+            2 => match state[5] {
+                0 => (false, 6),
+                1 => (true, 6),
+                _ => return Err(err()),
+            },
+            version => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported passthrough state version {version}"),
+                ));
+            }
+        };
         let mut take = |len: usize| -> io::Result<&[u8]> {
             let end = cur.checked_add(len).ok_or_else(err)?;
             let slice = state.get(cur..end).ok_or_else(err)?;
@@ -347,7 +359,10 @@ impl PassthroughFs {
             };
             let kind = match take(1)?[0] {
                 0 => {
-                    let flags = host_open_flags(i32::from_le_bytes(take(4)?.try_into().unwrap()));
+                    let flags = host_open_flags(
+                        i32::from_le_bytes(take(4)?.try_into().unwrap()),
+                        writeback_cache,
+                    );
                     let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
                     let path = PathBuf::from(OsStr::from_bytes(take(len)?));
                     let file = if inode.dead {
@@ -368,6 +383,7 @@ impl PassthroughFs {
             return Err(err());
         }
         let mut session = self.inner.lock();
+        session.writeback_cache = writeback_cache;
         session.inodes = inodes;
         session.by_path = by_path;
         session.handles_by_inode.clear();
@@ -409,6 +425,7 @@ impl FileSystem for PassthroughFs {
             want |= FsOptions::WRITEBACK_CACHE;
         }
         let enabled = want & capable;
+        self.inner.lock().writeback_cache = enabled.contains(FsOptions::WRITEBACK_CACHE);
         let payload = if enabled.intersects(FsOptions::BIG_WRITES | FsOptions::MAX_PAGES) {
             super::fuse::server::MAX_BUFFER_SIZE as usize
         } else {
@@ -719,7 +736,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
         let bytes = checked_name(name)?;
-        let flags = host_open_flags(args.flags as i32);
+        let flags = host_open_flags(args.flags as i32, session.writeback_cache);
         // EXCL makes creation atomic. Existing names are vetted with
         // O_PATH|NOFOLLOW and opened through that fd, never by name again.
         let file = match createat(
@@ -1201,12 +1218,13 @@ impl Session {
         {
             return Err(io::Error::from_raw_os_error(libc::EROFS));
         }
-        let file = reopen(&state.fd, host_open_flags(flags))?;
+        let host_flags = host_open_flags(flags, self.writeback_cache);
+        let file = reopen(&state.fd, host_flags)?;
         if flags & libc::O_TRUNC != 0 {
             file.set_len(0)?;
         }
         let path = state.path.clone();
-        self.insert_file_handle(inode, file, host_open_flags(flags), path)
+        self.insert_file_handle(inode, file, host_flags, path)
     }
 
     /// A clone of the open file behind `handle` for one I/O operation.
@@ -1339,10 +1357,12 @@ fn open_path(path: &Path, flags: i32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Reopen the file an `O_PATH` descriptor points at with real `flags`: the
-/// procfs fd link resolves to exactly that inode, so the guest opens what
-/// it looked up even if the host replaced the name meanwhile.
-fn host_open_flags(flags: i32) -> i32 {
+fn host_open_flags(mut flags: i32, writeback_cache: bool) -> i32 {
+    // With writeback, the guest owns the append offset. Linux positional
+    // writes on an O_APPEND descriptor would still append at host EOF.
+    if writeback_cache {
+        flags &= !libc::O_APPEND;
+    }
     (flags
         & (libc::O_ACCMODE
             | libc::O_DIRECT
@@ -1354,6 +1374,7 @@ fn host_open_flags(flags: i32) -> i32 {
         | libc::O_CLOEXEC
 }
 
+/// Reopen the inode held by an `O_PATH` descriptor through its procfs fd link.
 fn reopen(path_fd: &OwnedFd, flags: i32) -> io::Result<File> {
     // Inspect the held inode, not its saved name or kind. This also
     // protects restored handles when a regular file became a special file.
@@ -2029,6 +2050,8 @@ mod tests {
     #[test]
     fn append_uses_host_eof_instead_of_stale_guest_offset() {
         let (dir, fs) = scratch();
+        fs.init(FsOptions::all() - FsOptions::WRITEBACK_CACHE)
+            .unwrap();
         let entry = lookup(&fs, b"hello.txt").unwrap();
         let guest_offset = entry.attr.st_size as u64;
         let (handle, _, _) = fs
@@ -2065,6 +2088,71 @@ mod tests {
             std::fs::read(dir.path().join("hello.txt")).unwrap(),
             b"hello share\nhost append\nguest append\n"
         );
+    }
+
+    #[test]
+    fn append_handle_under_writeback_honours_the_write_offset() {
+        let (dir, fs) = scratch();
+        assert!(
+            fs.init(FsOptions::all())
+                .unwrap()
+                .contains(FsOptions::WRITEBACK_CACHE)
+        );
+        let path = dir.path().join("append.txt");
+        std::fs::File::create(&path).unwrap();
+        let inode = lookup(&fs, b"append.txt").unwrap().inode;
+        let (handle, _, _) = fs
+            .open(&ctx(), inode, (libc::O_WRONLY | libc::O_APPEND) as u32, 0)
+            .unwrap();
+        let handle = handle.unwrap();
+
+        for data in [b"a\n".as_slice(), b"a\nb\n".as_slice()] {
+            let written = fs
+                .write(
+                    &ctx(),
+                    inode,
+                    handle,
+                    &mut SliceReader(data),
+                    data.len() as u32,
+                    0,
+                    None,
+                    true,
+                    0,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(written, data.len());
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"a\nb\n");
+    }
+
+    #[test]
+    fn restored_writeback_session_creates_handles_without_host_append() {
+        let (dir, fs) = scratch();
+        fs.init(FsOptions::all()).unwrap();
+        let restored = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        restored.restore_state(&fs.save_state()).unwrap();
+        let (entry, handle, _, _) = restored
+            .create(
+                &ctx(),
+                ROOT_ID,
+                &name(b"append.txt"),
+                CreateIn {
+                    flags: (libc::O_WRONLY | libc::O_APPEND) as u32,
+                    mode: 0o600,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let file = restored
+            .inner
+            .lock()
+            .file_handle(entry.inode, handle.unwrap())
+            .unwrap();
+        // SAFETY: F_GETFL takes no third argument and the fd is owned.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(flags & libc::O_APPEND, 0);
     }
 
     #[test]

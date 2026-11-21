@@ -143,6 +143,9 @@ Not read:
 - Confidence: high for the server side. Medium that a Linux guest sends the
   second write for `echo a >> f; echo b >> f`. An end-to-end run in a guest
   settles it.
+- Fixed in card #398. OPEN and CREATE clear host `O_APPEND` when writeback
+  is negotiated, so writes honor the guest offset. Snapshots now record
+  the negotiated setting.
 
 ### F4. virtio-sound: `PCM_INFO` allocates the guest's `size` field with no limit
 
@@ -223,6 +226,13 @@ Not read:
 
 ### F6. An `avail.idx` far ahead makes the queue drain loop spin forever (block, virtio-fs, GPU)
 
+- Fixed in #399. The three drain loops check `avail_idx_in_range`
+  (`devices/virtio.rs`) before each pass and stop on an index more than the
+  queue size ahead. The test `avail_idx_far_ahead_does_not_spin` in the
+  block, virtio-fs and GPU tests fails before the fix (`queue_notify` does
+  not return in two seconds) and passes after it. The device is not marked
+  `DEVICE_NEEDS_RESET`: it ignores the queue until the index is valid again,
+  as virtio-net does.
 - Where: `devices/virtio/block.rs:445-476`,
   `devices/virtio/fs/device.rs:137-166`,
   `devices/virtio/gpu/mod.rs:1274-1307`.
