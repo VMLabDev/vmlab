@@ -288,8 +288,9 @@ def check(args):
         results['rotation'] = {'pass': mode_ok, 'expected': args.rotation}
         if mode_ok:
             guest_steps = guest['steps']
-            expected_steps = list(zip(plan, positions))
-            results['guest_steps'] = {'pass': [(s['shape'], (s['x'], s['y'])) for s in guest_steps] == expected_steps}
+            actual_steps = [(s['shape'], (s['x'], s['y'])) for s in guest_steps]
+            results['guest_steps'] = {'pass': args.guest_exit == 0 and actual_steps == list(zip(plan, positions)),
+                                      'exit_code': args.guest_exit}
             screen = guest['screen']
             positions = [rotate(x, y, screen['width'], screen['height'], args.rotation)
                          for x, y in positions]
@@ -369,6 +370,7 @@ def main():
     c.add_argument('--shots', required=True)
     c.add_argument('--out', required=True)
     c.add_argument('--guest')
+    c.add_argument('--guest-exit', type=int, default=0)
     c.add_argument('--rotation', type=int, choices=(0, 90, 180, 270), default=0)
     c.add_argument('--frames')
     args = ap.parse_args()

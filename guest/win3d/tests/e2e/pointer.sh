@@ -105,7 +105,8 @@ if in_lab vmlab record stop "$VM" && [ -s "$STAGE/pointer.mp4" ]; then
 fi
 
 python3 "$HERE/pointer.py" check --events "$EV/events.json" --plan "$PLAN" --x0 "$X0" --y0 "$Y0" --step-x "$STEP_X" --rotation "$ROTATION" \
-    --background "$BACKGROUND" --shots "$STAGE/shots" --guest "$EV/guest.json" "${frames[@]}" --out "$EV/pointer.json"
+    --background "$BACKGROUND" --shots "$STAGE/shots" --guest "$EV/guest.json" --guest-exit "$guest_rc" \
+    "${frames[@]}" --out "$EV/pointer.json"
 rc=$?
 # One capture of the window for the evidence: the middle one.
 mid=$(find "$STAGE/shots" -name '*.png' | sort | sed -n "$(((n + 1) / 2))p")
