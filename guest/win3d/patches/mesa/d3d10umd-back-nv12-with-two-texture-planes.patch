@@ -71,7 +71,7 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
     free(resource->buffer_shadow);
     resource->buffer_shadow = NULL;
     resource->buffer_shadow_size = 0;
-@@ -886,6 +893,138 @@
+@@ -886,6 +893,140 @@
   *
   * ----------------------------------------------------------------------
   */
@@ -106,7 +106,7 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
 +CreateNV12(struct pipe_context *pipe, Resource *resource,
 +           struct pipe_resource plane, const D3D10DDIARG_CREATERESOURCE *create)
 +{
-+   if (!plane.width0 || !plane.height0 || (plane.width0 | plane.height0) & 1 ||
++   if (!plane.width0 || !plane.height0 || ((plane.width0 | plane.height0) & 1) ||
 +       (plane.target != PIPE_TEXTURE_2D && plane.target != PIPE_TEXTURE_2D_ARRAY) ||
 +       plane.last_level || plane.nr_samples != 1 || create->pPrimaryDesc ||
 +       (plane.bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) ||
@@ -174,12 +174,14 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
 +   unsigned level;
 +   subResourceBox(resource->resource, subresource, &level, &box);
 +   const unsigned pitch = box.width;
-+   const unsigned size = pitch * (box.height + box.height / 2);
++   const size_t size = size_t(pitch) * (box.height + box.height / 2);
++   if (size > UINT_MAX)
++      return E_INVALIDARG;
 +   uint8_t *data = (uint8_t *)malloc(size);
 +   if (!data)
 +      return E_OUTOFMEMORY;
 +
-+   if (usage & PIPE_MAP_READ) {
++   if (!(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE)) {
 +      const struct pipe_box chroma = NV12ChromaBox(box);
 +      const struct pipe_box boxes[] = {box, chroma};
 +      struct pipe_resource *planes[] = {resource->resource, resource->nv12_chroma};
@@ -187,7 +189,7 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
 +      for (unsigned plane = 0; plane < ARRAY_SIZE(planes); ++plane) {
 +         struct pipe_transfer *transfer;
 +         const uint8_t *input = static_cast<const uint8_t *>(pipe->texture_map(
-+            pipe, planes[plane], 0, usage & (PIPE_MAP_READ | PIPE_MAP_DONTBLOCK),
++            pipe, planes[plane], 0, PIPE_MAP_READ | (usage & PIPE_MAP_DONTBLOCK),
 +            &boxes[plane], &transfer));
 +         if (!input) {
 +            free(data);
@@ -204,13 +206,13 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
 +   resource->nv12_maps[subresource] = {data, bool(usage & PIPE_MAP_WRITE)};
 +   mapped->pData = data;
 +   mapped->RowPitch = pitch;
-+   mapped->DepthPitch = size;
++   mapped->DepthPitch = static_cast<UINT>(size);
 +   return S_OK;
 +}
  
  void APIENTRY
  CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
-@@ -1065,6 +1204,17 @@
+@@ -1065,6 +1206,17 @@
        if (templat.bind & PIPE_BIND_RENDER_TARGET)
           templat.bind |= PIPE_BIND_SAMPLER_VIEW;
        templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED;
@@ -228,7 +230,7 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
     }
  
     if (templat.target != PIPE_BUFFER) {
-@@ -1442,6 +1592,15 @@
+@@ -1442,6 +1594,15 @@
        return;
     }
  
@@ -244,7 +246,7 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
     if (DDIMap == D3D10_DDI_MAP_READ) {
        if (!RestoreConstantBufferOriginal(
               pDevice, pResource,
-@@ -1514,6 +1673,19 @@
+@@ -1514,6 +1675,19 @@
  
     assert(SubResource < pResource->NumSubResources);
  
@@ -264,7 +266,7 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
     if (pResource->transfers[SubResource]) {
        if (pResource->buffer) {
           pipe_buffer_unmap(pipe, pResource->transfers[SubResource]);
-@@ -1672,6 +1844,16 @@
+@@ -1672,6 +1846,16 @@
  
     struct pipe_resource *dst_resource = pDstResource->resource;
     struct pipe_resource *src_resource = pSrcResource->resource;
@@ -281,7 +283,7 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
     bool compatible;
     bool fallback_compatible;
  
-@@ -1812,6 +1994,12 @@
+@@ -1812,6 +1996,12 @@
        src_box.width  = u_minify(src_resource->width0,  src_level);
        src_box.height = u_minify(src_resource->height0, src_level);
        src_box.depth  = u_minify(src_resource->depth0,  src_level);
@@ -294,12 +296,12 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
     }
  
     const bool yttrium_srgb_copy = is_yttrium_screen(pipe->screen) &&
-@@ -2008,6 +2196,12 @@
+@@ -2008,6 +2198,12 @@
        subResourceBox(dst_resource, DstSubResource, &level, &box);
     }
  
 +   if (pDstResource->nv12_chroma) {
-+      if (NV12BoxAligned(box))
++      if (NV12BoxAligned(box) && box.depth == 1 && RowPitch >= unsigned(box.width))
 +         UploadNV12(pipe, pDstResource, box, pSysMemUP, RowPitch);
 +      return;
 +   }
@@ -331,6 +333,15 @@ diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d
 diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
 --- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
 +++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+@@ -56,7 +56,7 @@
+    // If it is not (resource rotated) then recreate surface
+    struct pipe_surface *currentSurface = &pRenderTargetView->surface;
+    Resource *res = pRenderTargetView->resource;
+-   if (currentSurface->texture != res->resource) {
++   if (!res->nv12_chroma && currentSurface->texture != res->resource) {
+       pipe_resource_reference(&currentSurface->texture, res->resource);
+    }
+    return &pRenderTargetView->surface;
 @@ -316,9 +316,15 @@
  {
     LOG_ENTRYPOINT();
