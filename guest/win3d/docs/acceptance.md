@@ -628,6 +628,7 @@ next to each probe's JSON.
 | P7 | `shared-texture` | `share_probe.exe` shares a BGRA render target between two Direct3D 11 devices, by legacy handle and with a keyed mutex, at the size of the desktop (the shape the driver takes for a duplication surface, [present.md](present.md#desktop-duplication)) and at 256×256. Each device fills it and the other reads it. | In all four cases every pixel read is the colour written, in both directions. |
 | P10, correct rendering | `d2d` | `d2d_probe.exe` fills rounded rectangles, ellipses and path geometries with Direct2D three times, each on a new device, and once on WARP. | No pixel WARP filled is missing, none it left white is drawn, and the three pictures are the same. The device must be feature level 11.1. |
 | P10 | `d2d-tir` | `tests/e2e/tir.sh`, the check of the coverage patch ([d2d-coverage.md](d2d-coverage.md)): `tir_probe.exe`, x64 and x86, draws what Direct2D draws to antialias a shape, on the adapter and on WARP. Its evidence is in `tir/`. | Both probes find no pixel that differs from WARP or between runs, and the driver logged one pass per sample for the x64 probe. |
+| P10 | `draws` | `draws_probe.exe` makes three draws that the driver once dropped, each on a device of its own: a quad whose colour element is `B8G8R8X8_UNORM`, and a point list drawn with `DrawIndexed` and with `DrawIndexedInstancedIndirect` while no index buffer is bound. After each it reads the 4x4 target, draws an ordinary quad, reads that, and asks `GetDeviceRemovedReason` (B11). | The quad has the colour of its vertices, the point list draws its first vertex only, the later quad is on the target, and the device is not removed. |
 | P10 | `svb-chrome`, `svb-edge` | `tests/e2e/adapter/pages/svb.html`, the page of GitHub #233: a quad from a vertex buffer of each usage hint. | Each of the three lines reads `255,0,0,255`, with WebGL on the adapter. |
 | P8, a driver for every API | `venc-chrome`, `venc-edge` | `tests/e2e/adapter/pages/venc.html`, the page of GitHub #238: a hardware video encoder query, which makes a Chromium GPU process load `d3d12.dll`, then WebGL every 4 s for 20 s. The browsers run with `--enable-features=D3D12VideoEncodeAccelerator,D3D12VideoDecoder`. | WebGL stays on the adapter in all five tries, and the profile has no crash dump. |
 | P8 | `chromium` | `tests/e2e/chromium.sh`, the check of the native `d3d12.dll` preload ([chromium.md](chromium.md)): the same page in both browsers while the GPU process's modules are recorded, the same again with the preload off, and the package's `d3d12_probe.exe`. It restarts the VM twice. Its evidence is in `chromium/`. | In both browsers WebGL stays on the adapter, there is no crash dump, one GPU process ran, and the `d3d12.dll` it loaded is the native copy. With the preload off the GPU process ends itself in both. The native probe still gets the bridge. |
@@ -780,7 +781,7 @@ What the baseline says:
   (a point-list draw with no index buffer bound, whose indices Yttrium
   does not have on the CPU) still mark a device as removed in the UMD log,
   but the tests release those devices without another call that reports
-  it. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
+  it. [Note C328](acceptance/C328.md) has the cause of both, and the fix. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
   also ended the VM after 17 s with the "Too many open files" exit of B6.
 
 See the [acceptance notes](acceptance/) for card-specific results and follow-ups.
@@ -934,6 +935,44 @@ On each GPU, the remaining messages matched the failures common to the
 table-fog and unbound-stream runs after removing the ten zero-size
 failures. The GPU validation for C338 covered `d3d9_visual`.
 
+#### Vertex fog (card #336)
+
+Card #336 used the [vertex fog patch](../patches/mesa/d3d9-vertex-fog-specular-alpha.patch)
+at `e6506ed1666e` on helios with the Windows 11 `26100.1742.11#win3d`
+template. Each `d3d9_visual` run executed 206,068 checks and skipped 31.
+All 56 removed failures per GPU were at `visual.c:28481` with table fog
+disabled. Pre-transformed vertices take the fog factor from their specular
+alpha. Legacy programmable vertex shaders use their output specular alpha
+when they leave `oFog` unwritten.
+
+| GPU | `visual` failures before → after | Pre-transformed, `vs_mode = 0` | Shader without `oFog`, `vs_mode = 2` |
+| --- | --- | --- | --- |
+| AMD1 (`renderD130`) | 343 → 287 | 24 → 0 | 32 → 0 |
+| Nvidia2 (`renderD129`) | 345 → 289 | 24 → 0 | 32 → 0 |
+
+#### Texture transforms with a programmable pixel shader (card #337)
+
+The [legacy pixel shader input patch](../patches/mesa/d3d9-record-legacy-pixel-shader-inputs.patch)
+records the implicit colour and texture-coordinate inputs of `ps_1_x` and
+`ps_2_x`. The generated `POSITIONT` vertex shader uses those inputs to
+pass through the pre-transformed coordinates, including `FLOAT1`.
+
+On helios with the Windows 11 template `26100.1742.11#win3d` and driver
+`100.6.101.58114` from commit `a2acaaabad43`, Wine 11.0's `d3d9_visual`
+reported zero failures at lines 28754 and 28870 on both GPUs. Each run
+cleared the 32 draw errors and their 32 texture readback failures.
+
+| GPU | Checks executed | Baseline failures | Patched failures |
+| --- | ---: | ---: | ---: |
+| AMD1 | 206,068 | 343 | 279 |
+| Nvidia2 | 206,008 | 345 | 279 |
+
+Both Nvidia2 runs skipped 60 assertions in a separate dynamic vertex
+buffer test after Wine's timed triangle estimate exceeded the device's
+primitive limit. That block includes two baseline failed assertions.
+All 17 non-Wine adapter rows passed on both GPUs. Each GPU's nine Wine
+programs had four passes and five known failures.
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -948,9 +987,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
-| Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
-| Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
