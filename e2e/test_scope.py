@@ -27,7 +27,7 @@ class ScenarioScopeTests(unittest.TestCase):
         self.addCleanup(h.log.close)
         return h
 
-    def test_all_36_delivered_core_and_admin_features_follow_vmlab(self):
+    def test_all_37_delivered_core_and_admin_features_follow_vmlab(self):
         h = self.new_harness("vmlab")
         delivered = set()
         for name in ("core", "admin"):
@@ -42,7 +42,8 @@ class ScenarioScopeTests(unittest.TestCase):
                 h.ok(feature, True, "scope regression")
                 self.assertEqual(h.results[feature][0], "pass", feature)
         self.assertIn("vm.hw.tsc", delivered)
-        self.assertEqual(len(delivered), 36)
+        self.assertIn("lab.down.isolation", delivered)
+        self.assertEqual(len(delivered), 37)
 
     def test_default_vmlab_scope_reports_phase_4_results(self):
         h = self.new_harness("vmlab")
