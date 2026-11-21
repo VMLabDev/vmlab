@@ -674,6 +674,16 @@ Table fog chooses W fog from the projection's W range, which the runtime
 reports through `UpdateWInfo`; a perspective projection reported with
 `WNear == WFar` would get Z fog.
 
+### D3D9Ex restricted-content surfaces
+
+Win3D lacks support for restricted-content surfaces. The Windows D3D9
+runtime rejects `CreateDepthStencilSurfaceEx` with
+`D3DUSAGE_RESTRICTED_CONTENT` before dispatching surface creation to the
+driver because Win3D lacks the required content-protection DDI. Wine 11.0
+`d3d9ex` assertions at lines 687 and 705 fail on AMD1 and Nvidia2.
+[Card 343 acceptance results](acceptance.md#c343--d3d9ex-texture-upload-and-restricted-depth-stencil-creation),
+[Microsoft Content Protection DDI](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/content-protection-ddi).
+
 ### DXUT (June 2010) D3D11 samples place their window off the screen
 
 `BasicHLSL11` renders on our device, but its window lands at
