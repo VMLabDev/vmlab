@@ -869,7 +869,8 @@ rejections can propagate through `Apply` at line 297. These two assertions
 account for 162 and seven failures respectively on each GPU. The
 [coordinate-wrap patch](../patches/mesa/d3d9-record-coordinate-wrap-render-states.patch)
 fixes the largest setter group by retaining the wrap flags through state
-block replay. Cylindrical interpolation still needs implementation.
+block replay. [Note C344](acceptance/C344.md) records the subsequent
+interpolation fix and validation counts.
 
 On helios with AMD1 and Windows 11 template `26100.1742.11`, the patched
 package ran the same 12,268 `stateblock` checks. Failures fell from 169 to

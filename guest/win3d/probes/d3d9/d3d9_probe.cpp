@@ -17,6 +17,115 @@ static D3DCOLOR to_d3dcolor(const float c[4])
     return D3DCOLOR_COLORVALUE(c[0], c[1], c[2], c[3]);
 }
 
+static bool check_wrap_draw(probe_ctx *ctx, IDirect3DDevice9 *dev,
+                            IDirect3DSurface9 *target, IDirect3DSurface9 *readback,
+                            unsigned set, DWORD mask)
+{
+    static const float vertices[][6] = {
+        {-1,  1, .85f, .85f, .85f, .85f}, {1,  1, .15f, .15f, .15f, .15f},
+        {-1, -1, .85f, .85f, .85f, .85f}, {1, -1, .15f, .15f, .15f, .15f},
+    };
+    if (probe_hr(ctx, dev->BeginScene(), "WRAP BeginScene") ||
+        probe_hr(ctx, dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices,
+                                           sizeof vertices[0]), "WRAP DrawPrimitiveUP") ||
+        probe_hr(ctx, dev->EndScene(), "WRAP EndScene") ||
+        probe_hr(ctx, dev->GetRenderTargetData(target, readback), "WRAP GetRenderTargetData"))
+        return false;
+
+    D3DLOCKED_RECT pixels;
+    if (probe_hr(ctx, readback->LockRect(&pixels, NULL, D3DLOCK_READONLY), "WRAP LockRect"))
+        return false;
+    const DWORD *row = (const DWORD *)((const char *)pixels.pBits + 16 * pixels.Pitch);
+    const DWORD samples[] = {row[8], row[24]};
+    readback->UnlockRect();
+    static const unsigned shifts[] = {16, 8, 0, 24};
+    for (unsigned c = 0; c < 4; ++c) {
+        const bool wrapped = (mask & (1u << c)) != 0;
+        const int expected[] = {wrapped ? 236 : 172, wrapped ? 19 : 83};
+        for (unsigned x = 0; x < 2; ++x) {
+            const int actual = (samples[x] >> shifts[c]) & 0xff;
+            if (abs(actual - expected[x]) > 5) {
+                probe_error(ctx, "WRAP%u mask %#lx component %u sample %u was %d, expected %d",
+                            set, (unsigned long)mask, c, x, actual, expected[x]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool check_coordinate_wrap(probe_ctx *ctx, IDirect3DDevice9 *dev)
+{
+    static const D3DVERTEXELEMENT9 elements[] = {
+        {0, 0, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
+        {0, 8, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
+        D3DDECL_END(),
+    };
+    IDirect3DVertexDeclaration9 *decl = NULL;
+    IDirect3DSurface9 *original = NULL, *target = NULL, *readback = NULL;
+    if (probe_hr(ctx, dev->GetRenderTarget(0, &original), "WRAP GetRenderTarget") ||
+        probe_hr(ctx, dev->CreateRenderTarget(32, 32, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE,
+                                             0, FALSE, &target, NULL), "WRAP CreateRenderTarget") ||
+        probe_hr(ctx, dev->CreateOffscreenPlainSurface(32, 32, D3DFMT_A8R8G8B8,
+             D3DPOOL_SYSTEMMEM, &readback, NULL), "WRAP CreateOffscreenPlainSurface") ||
+        probe_hr(ctx, dev->CreateVertexDeclaration(elements, &decl), "WRAP CreateVertexDeclaration") ||
+        probe_hr(ctx, dev->SetRenderTarget(0, target), "WRAP SetRenderTarget") ||
+        probe_hr(ctx, dev->SetVertexDeclaration(decl), "WRAP SetVertexDeclaration"))
+        return false;
+
+    /* Cover the legacy range, the start of the second range, and WRAP15. */
+    const unsigned sets[] = {0, 8, 15};
+    for (unsigned set : sets) {
+        const auto state = (D3DRENDERSTATETYPE)(set < 8 ? D3DRS_WRAP0 + set
+                                                       : D3DRS_WRAP8 + set - 8);
+        char source[384];
+        snprintf(source, sizeof source,
+                 "struct V { float4 pos : POSITION; float4 uv : TEXCOORD%u; };"
+                 "V vs(float2 p : POSITION, float4 uv : TEXCOORD0)"
+                 "{ V o; o.pos = float4(p, 0, 1); o.uv = uv; return o; }"
+                 "float4 ps(float4 uv : TEXCOORD%u) : COLOR { return uv; }", set, set);
+        size_t size;
+        void *vs_code = probe_compile_hlsl(ctx, source, "vs", "vs_3_0", &size);
+        void *ps_code = probe_compile_hlsl(ctx, source, "ps", "ps_3_0", &size);
+        IDirect3DVertexShader9 *vs = NULL;
+        IDirect3DPixelShader9 *ps = NULL;
+        if (!vs_code || !ps_code ||
+            probe_hr(ctx, dev->CreateVertexShader((const DWORD *)vs_code, &vs), "WRAP CreateVertexShader") ||
+            probe_hr(ctx, dev->CreatePixelShader((const DWORD *)ps_code, &ps), "WRAP CreatePixelShader") ||
+            probe_hr(ctx, dev->SetVertexShader(vs), "WRAP SetVertexShader") ||
+            probe_hr(ctx, dev->SetPixelShader(ps), "WRAP SetPixelShader"))
+            return false;
+        free(vs_code);
+        free(ps_code);
+        vs->Release();
+        ps->Release();
+
+        if (!check_wrap_draw(ctx, dev, target, readback, set, 0))
+            return false;
+        for (unsigned c = 0; c < 4; ++c) {
+            const DWORD mask = 1u << c;
+            IDirect3DStateBlock9 *block = NULL;
+            if (probe_hr(ctx, dev->BeginStateBlock(), "WRAP BeginStateBlock") ||
+                probe_hr(ctx, dev->SetRenderState(state, mask), "WRAP record state") ||
+                probe_hr(ctx, dev->EndStateBlock(&block), "WRAP EndStateBlock") ||
+                probe_hr(ctx, dev->SetRenderState(state, 0), "WRAP clear before Apply") ||
+                probe_hr(ctx, block->Apply(), "WRAP Apply"))
+                return false;
+            block->Release();
+            if (!check_wrap_draw(ctx, dev, target, readback, set, mask) ||
+                probe_hr(ctx, dev->SetRenderState(state, 0), "WRAP disable"))
+                return false;
+        }
+    }
+
+    const bool restored = !probe_hr(ctx, dev->SetRenderTarget(0, original), "WRAP restore render target");
+    original->Release();
+    target->Release();
+    readback->Release();
+    decl->Release();
+    return restored;
+}
+
 static int run(probe_ctx *ctx)
 {
     typedef HRESULT(WINAPI * create_ex_fn)(UINT, IDirect3D9Ex **);
@@ -139,6 +248,9 @@ static int run(probe_ctx *ctx)
     dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    if (!check_coordinate_wrap(ctx, dev))
+        return 1;
+    probe_bool(ctx, PROBE_API, "coordinate_wrap_state_block", true);
 
     probe_vertex *verts = (probe_vertex *)malloc(vb_bytes);
     for (;;) {
