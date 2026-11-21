@@ -2159,15 +2159,67 @@ async fn an_offline_capture_excludes_a_concurrent_start() {
     let start = tokio::time::timeout(SETTLE, start_vm(&vm, cbs)).await;
     release.send(()).unwrap();
     assert!(!capture.await.unwrap().expect("offline capture"));
-    let error = start.expect("start must refuse promptly").expect_err(
-        "start must refuse while an offline snapshot operation holds the disk",
-    );
+    let error = start
+        .expect("start must refuse promptly")
+        .expect_err("start must refuse while an offline snapshot operation holds the disk");
     assert!(error.to_string().contains("snapshot"), "{error:#}");
     assert_eq!(vm.state().await, PowerState::Stopped);
 
     let (cbs, _observed) = callbacks();
     start_vm(&vm, cbs).await.expect("start after capture");
     vm.stop(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_snapshot_writes_exclude_start_on_both_machine_kinds() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let vm_dirs = Dirs::new();
+    let ctr_dirs = Dirs::new();
+    let (vm, _) = vm(&vm_dirs, LINUX_VM, Script::healthy());
+    let (ctr, _) = container(&ctr_dirs, WORKLOAD, Script::healthy());
+    let vm_disk = vm.dirs.primary_disk();
+    let ctr_disk = ctr.dirs.scratch_disk();
+    let machines: [(Arc<dyn Machine>, PathBuf); 2] = [(vm, vm_disk), (ctr, ctr_disk)];
+
+    for (machine, disk) in machines {
+        qimg::create_blank(&disk, 1 << 20).await.unwrap();
+        let (events, _) = EventLog::recording("t", disk.with_extension("events.jsonl"));
+        let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+        for op in ["capture", "restore", "delete"] {
+            let (entered, release) = testing::pause_next("snapshot");
+            let work = {
+                let machine = machine.clone();
+                let lab = lab.clone();
+                tokio::spawn(async move {
+                    match op {
+                        "capture" => {
+                            assert!(!machine.snapshot("cold").await?);
+                            Ok(())
+                        }
+                        "restore" => machine.restore(lab, "cold", false).await,
+                        _ => machine.delete_snapshot("cold").await,
+                    }
+                })
+            };
+            tokio::time::timeout(SETTLE, entered)
+                .await
+                .unwrap_or_else(|_| panic!("{op} did not reach the image tool"))
+                .unwrap();
+
+            let start = tokio::time::timeout(SETTLE, machine.clone().start(lab.clone(), None)).await;
+            release.send(()).unwrap();
+            work.await.unwrap().unwrap();
+            let error = start
+                .expect("start must refuse promptly")
+                .expect_err("start must refuse during an offline snapshot operation");
+            assert!(error.to_string().contains("snapshot"), "{op}: {error:#}");
+            assert_eq!(machine.state().await, PowerState::Stopped);
+        }
+        machine.clone().start(lab, None).await.unwrap();
+        machine.stop(true).await.unwrap();
+    }
 }
 
 /// A machine whose hypervisor reports no snapshots capability — the fake's
