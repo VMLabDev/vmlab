@@ -10,13 +10,14 @@ use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
 
-use crate::config::model::{MacAddr, SinkholeMode};
+use crate::config::model::{BlockRule, HostPort, MacAddr, RedirectRule, SinkholeMode};
 use crate::net::dhcp::{DhcpConfig, DhcpServer};
 use crate::net::dns::{DnsAction, DnsServer, DnsZone};
 use crate::net::frame::{
     ArpView, EthView, IcmpView, Ipv4View, TcpView, UdpView, icmp_echo_reply_for,
     icmp_unreachable_for,
 };
+use crate::net::rules::{RuleSet, Verdict};
 use crate::oci;
 
 const GW: Ipv4Addr = Ipv4Addr::new(10, 213, 1, 1);
@@ -24,10 +25,12 @@ const GW_MAC: MacAddr = MacAddr([0x52, 0x56, 0, 0, 0, 1]);
 
 /// One ethernet frame as a guest NIC sends it, through every sans-I/O
 /// consumer of the userspace fabric: the header views with each accessor, the
-/// ICMP reply builders, the DHCP server and the DNS server. The NAT engine is
-/// left out on purpose: it opens host sockets to the frame's destination.
+/// ICMP reply builders, the L3 rules, the DHCP server and the DNS server. The
+/// NAT engine is left out on purpose: it opens host sockets to the frame's
+/// destination.
 ///
-/// Every reply the servers build must parse again and carry valid checksums.
+/// Every reply the servers build must parse again and carry valid checksums,
+/// and every packet the rules rewrite must still be an IPv4 packet.
 pub fn net_frame(data: &[u8]) {
     views(data);
 
@@ -51,6 +54,36 @@ pub fn net_frame(data: &[u8]) {
     zone.add_sinkhole("*.blocked.test", SinkholeMode::Nxdomain);
     zone.upstream = Some("192.0.2.1:53".parse().expect("a literal socket address"));
     let dns = DnsServer::new(zone);
+
+    // One block and one redirect for each shape a rule takes: a whole
+    // network, and one address with and without a port.
+    let mut rules = RuleSet::new();
+    rules.add_block(BlockRule {
+        cidr: Ipv4Net::new(Ipv4Addr::new(10, 213, 9, 0), 24).expect("a /24 is a valid prefix"),
+        proto: None,
+        port: None,
+        span: (0, 0),
+    });
+    rules.add_block(BlockRule {
+        cidr: Ipv4Net::new(Ipv4Addr::new(0, 0, 0, 0), 1).expect("a /1 is a valid prefix"),
+        proto: None,
+        port: Some(25),
+        span: (0, 0),
+    });
+    for (from, to) in [(None, None), (Some(80), Some(8080)), (Some(53), None)] {
+        rules.add_redirect(RedirectRule {
+            from: HostPort {
+                ip: Ipv4Addr::new(10, 213, 1, 7),
+                port: from,
+            },
+            to: HostPort {
+                ip: Ipv4Addr::new(10, 213, 1, 5),
+                port: to,
+            },
+            proto: None,
+            span: (0, 0),
+        });
+    }
 
     // The input is a sequence of frames, each behind a 2-byte length, so the
     // DHCP lease table sees DISCOVER, REQUEST, DECLINE and RELEASE in a row.
@@ -77,6 +110,22 @@ pub fn net_frame(data: &[u8]) {
             DnsAction::Ignore => {}
         }
         let _ = dhcp.leases();
+        if let Some(eth) = EthView::parse(frame) {
+            for verdict in [rules.eval(eth.payload()), rules.eval_return(eth.payload())] {
+                match verdict {
+                    Verdict::Rewrite(packet) => {
+                        Ipv4View::parse(&packet).expect("a rewritten packet is IPv4");
+                    }
+                    Verdict::Drop {
+                        reply: Some(packet),
+                    } => {
+                        let ip = Ipv4View::parse(&packet).expect("a block reply is IPv4");
+                        assert!(ip.checksum_valid(), "block reply IPv4 checksum");
+                    }
+                    Verdict::Drop { reply: None } | Verdict::Pass => {}
+                }
+            }
+        }
     }
 }
 
