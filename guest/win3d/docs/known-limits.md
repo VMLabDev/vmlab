@@ -725,7 +725,9 @@ every colour output, and the UMD logs
 `C:\ProgramData\Yttrium\yttrium-errors.log`. Before `patches/mesa/d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch`
 its creation removed the device. Wine's d3d11 test `test_high_resource_count`
 (50 textures sampled with two samplers, and 50 buffers) is such a shader, and
-its two checks fail. A vertex, geometry, hull, domain or compute shader that
+its two checks fail. [C375](acceptance/C375.md) records the translation
+trace and the binding changes needed to support this shader.
+A vertex, geometry, hull, domain or compute shader that
 needs more slots still fails to create and removes the device.
 
 ### D3D12: ExecuteIndirect is emulated, and an NVIDIA first-boot dwm crash
