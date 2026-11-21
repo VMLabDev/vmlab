@@ -10,7 +10,7 @@ failures:
   errors.
 
 F3 was a bug in the WGL ICD, `viogpu_wgl.dll`, and is fixed by
-`patches/mesa/0080`. F2 is the BAR1 exhaustion that worker `nvva` diagnosed
+`patches/mesa/wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch`. F2 is the BAR1 exhaustion that worker `nvva` diagnosed
 ([`nvva.md`](nvva.md)), not a GZDoom-specific bug. `nvva`'s `0070` and
 `0086` fix it, and GZDoom Vulkan now runs on NVIDIA. The work was done on
 2026-10-19 on helios: RADV (Mesa 26.2.2) on `AMD1`, NVIDIA 610.57.04,

@@ -40,7 +40,7 @@ KMD_TRACE=1 KMD_DRIVER_VERSION=100.6.101.58190 build/kmd/build.sh
 ```
 
 `KMD_TRACE=1` compiles the driver with `VIOGPU_FLIP_TRACE=1`
-(`patches/kmd/0007`). The driver then keeps a ring of 65536 timed records,
+(`patches/kmd/kmd-flip-trace-build.patch`). The driver then keeps a ring of 65536 timed records,
 and a DRIVERPRIVATE escape (magic `0x56475446`) returns the records after a
 sequence number, 1024 at a time. `tests/tearing/Get-FlipTrace.ps1` reads it
 in the guest into a CSV file. Give a trace build its own driver version, so

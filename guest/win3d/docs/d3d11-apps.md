@@ -14,7 +14,7 @@ There were two separate causes:
 
 | Sample | Cause | Owner | Fix |
 | --- | --- | --- | --- |
-| SubD11 | `CreateHullShader` failed in the UMD's shader translation, and the runtime removed the device. Two more UMD bugs then showed up: wrong colours and a missing wireframe overlay. | Our UMD | `patches/mesa/0015` to `0017` |
+| SubD11 | `CreateHullShader` failed in the UMD's shader translation, and the runtime removed the device. Two more UMD bugs then showed up: wrong colours and a missing wireframe overlay. | Our UMD | `patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch` to `0017` |
 | BasicHLSL11 | DXUT (June 2010) moves its window to (32758, −32768), off the screen, on any Windows 8 or later system without the SDK's `D3D11Ref.dll`. | The application (DXUT) | Not fixable in the UMD or KMD; see [BasicHLSL11](#basichlsl11-a-dxut-bug-on-windows-8-and-later) |
 
 With the fixes, the package was rebuilt (`scripts/build.sh`, commit
@@ -212,7 +212,7 @@ from the pinned SDK (commit [3bf8e4c](https://github.com/VMLabDev/vmlab-win3d/co
 - The samples ran only as x64, as in the e2e run. The probes ran as x64 and
   x86.
 - Dynamic indexing of patch constants in a domain shader
-  (`dcl_indexrange vpc6.xyz 4`) was rejected here; `patches/mesa/0030` added it
+  (`dcl_indexrange vpc6.xyz 4`) was rejected here; `patches/mesa/d3d10umd-domain-shader-indexed-patch-constants.patch` added it
   later ([ds.md](ds.md)). SubD11 does not use it.
   The first version of `tess_probe` did, and it failed with
   `dcl_input_index_range` unsupported.

@@ -8,8 +8,8 @@ This page explains three presentation bugs from
 2. DirectDraw windowed blits to the primary reached 13 to 17 per second.
 3. Blender's window was translucent on Windows 10.
 
-The fixes are `patches/kmd/0002`, `patches/mesa/0026` and
-`patches/mesa/0027`. All three are in the package from commit [12be6fd](https://github.com/VMLabDev/vmlab-win3d/commit/12be6fd7969a64a93a0ce60207edd9522a6a3049).
+The fixes are `patches/kmd/kmd-cache-gdi-shadow-and-staging-surfaces.patch`, `patches/mesa/d3d9-ddraw-present-sources-in-host-cached-memory.patch` and
+`patches/mesa/wgl-present-windows-opaque.patch`. All three are in the package from commit [12be6fd](https://github.com/VMLabDev/vmlab-win3d/commit/12be6fd7969a64a93a0ce60207edd9522a6a3049).
 
 helios: QEMU 11.1.1, virglrenderer 1.3.0, RADV (Mesa 26.2.2), NVIDIA
 610.57.04, vmlab 0.28.0-alpha. The AMD runs used the system QEMU. The
@@ -212,7 +212,7 @@ A program that captured the screen with `IDXGIOutput1::DuplicateOutput` got
 no picture (GitHub #237): `DuplicateOutput` succeeded and every
 `AcquireNextFrame` returned `DXGI_ERROR_ACCESS_LOST` (`0x887A0026`). Screen
 recorders and remote-desktop tools showed black. Since driver
-`100.6.101.58107` (`patches/kmd/0006` and `patches/mesa/0095`) it delivers
+`100.6.101.58107` (`patches/kmd/kmd-present-blt-into-mappable-blob.patch` and `patches/mesa/yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch`) it delivers
 frames.
 
 **How a frame gets there.** dxgi creates the duplication surface in the
@@ -241,11 +241,11 @@ dwm.exe, then `Dxgk_Diag_OutputDupl_Destroy`.
 
 **The fixes.**
 
-- `patches/kmd/0006`: a present copy into a blob is allowed when source and
+- `patches/kmd/kmd-present-blt-into-mappable-blob.patch`: a present copy into a blob is allowed when source and
   destination are both mappable blobs. The destination is mapped in
   `Present`, where a refusal fails only that call, and written at the image's
   offset in the blob with the row pitch of the allocation.
-- `patches/mesa/0095`: a texture that looks like a duplication surface is
+- `patches/mesa/yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch`: a texture that looks like a duplication surface is
   created as a display image with the winsys flag
   `YTTRIUM_GDI_RESOURCE_FLAG_KERNEL_WRITTEN`: linear, in cached host-visible
   memory, a mappable blob, with its row pitch and offset in the allocation

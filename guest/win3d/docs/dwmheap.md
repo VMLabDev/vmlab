@@ -120,7 +120,7 @@ recovers from one, so dwm rebuilds its device as Windows intends.
 
 ## The fix
 
-`patches/mesa/0060` changes one function in
+`patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch` changes one function in
 `src/gallium/frontends/d3d10umd/Device.cpp`:
 
 ```c

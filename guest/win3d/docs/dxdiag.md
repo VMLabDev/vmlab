@@ -11,7 +11,7 @@ device as follows:
 | `Get-Dxdiag.ps1` `hardware_acceleration` | `false` | `true` |
 
 Three Mesa patches against the D3D9 user-mode driver (UMD) fix it:
-`patches/mesa/0012` to `0014`. No KMD change was needed. The evidence is in
+`patches/mesa/d3d9-directdraw-hal-caps.patch` to `0014`. No KMD change was needed. The evidence is in
 [docs/evidence/dxdiag/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/).
 
 ## How DirectDraw finds the driver

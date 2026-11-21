@@ -212,7 +212,7 @@ environment. The host still supplies RADV, ANV or the NVIDIA Vulkan driver.
 
 The package was run on four host GPUs. AMD (RADV) is the reference: the
 acceptance runs in `docs/acceptance.md` used it. Intel (ANV) passes with
-`patches/mesa/0021`. NVIDIA works only partly. The full matrix, with the
+`patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch`. NVIDIA works only partly. The full matrix, with the
 evidence for each row, is in
 [Known limits: host GPU support](known-limits.md#host-gpu-support).
 

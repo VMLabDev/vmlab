@@ -22,8 +22,8 @@ Newest first. The package rows name the commit in the bundle's
 | 2026-10-19 | NVIDIA RTX 4060 Laptop, 615.71.09 | `main` ([82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75)) + the patched QEMU `d8a6048aae`, vmlab 0.28 | **Fails, 7 of 12.** The install, vulkaninfo, D3D9 and D3D11 pass. Every client that drives Venus through the Vulkan API (the Vulkan probes, D3D12 through vkd3d-proton, OpenGL through Zink) never sees its first fence signal, and dxdiag, run after them, returns nothing. The GPU stays healthy: no Xid in any run, with or without the keep-awake helper. Cause below |
 | 2026-10-19 | NVIDIA RTX 4060 Laptop | the same, with Venus feedback turned off in the guest (`VN_PERF`) | **11 of 12, twice.** Everything passes except one OpenGL probe per run, whose final readback is black although it rendered and showed on the console |
 | 2026-10-17 | Intel Iris Xe (Raptor Lake-P), ANV | `main` ([db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91)), vmlab 0.24 | **Fails.** dwm crash-loops after the install, the console is black, and no probe shows. Cause below |
-| 2026-10-17 | Intel Iris Xe (Raptor Lake-P), ANV | with `patches/mesa/0021` | **Passes**, 12 of 12 Done checks: vulkaninfo, all 10 probes on the console, dxdiag. R32 typed UAV loads work (uavtest). Fix below |
-| 2026-10-17 | AMD iGPU on helios, RADV (regression) | with `patches/mesa/0021` | **Passes**, 12 of 12 Done checks, 10 of 10 probes |
+| 2026-10-17 | Intel Iris Xe (Raptor Lake-P), ANV | with `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` | **Passes**, 12 of 12 Done checks: vulkaninfo, all 10 probes on the console, dxdiag. R32 typed UAV loads work (uavtest). Fix below |
+| 2026-10-17 | AMD iGPU on helios, RADV (regression) | with `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` | **Passes**, 12 of 12 Done checks, 10 of 10 probes |
 | 2026-10-17 | NVIDIA RTX 4060 Max-Q, 615.71.09 | `main` ([db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91)) + patched QEMU 11.1.1 | **Stopped.** Install, desktop and console work. One minute later the GPU **fell off the bus** (Xid 79), and QEMU aborted. The GPU stayed unusable until Zeus rebooted |
 
 ## Host
@@ -188,7 +188,7 @@ WIN3D_WORK=$PWD/.scratch/work WIN3D_E2E=$PWD/.scratch/e2e-main/tests/e2e \
 
 ### Regression on `main` (2026-10-19)
 
-The package from `main` at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75), which carries `patches/mesa/0021` and
+The package from `main` at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75), which carries `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` and
 every later patch up to `0042`, passes 12 of 12 Done checks on vmlab 0.28
 (`intel/06-main-82d8e51/results.txt`). All 10 probes render, read back
 correctly and animate on the console at 55 to 63 fps; vulkaninfo lists
@@ -199,7 +199,7 @@ D3D, DDraw and AGP acceleration. uavtest passes with
 ### Pass/fail (2026-10-17)
 
 `main` = the package at [db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91). `0021` = this branch's package with
-`patches/mesa/0021` (manifest commit [1bbbfe8](https://github.com/VMLabDev/vmlab-win3d/commit/1bbbfe887760c63c24fd423cd04f8fc18319018e), the final version of the
+`patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` (manifest commit [1bbbfe8](https://github.com/VMLabDev/vmlab-win3d/commit/1bbbfe887760c63c24fd423cd04f8fc18319018e), the final version of the
 patch).
 
 The `main` column comes from the diagnostic run: the isolated supervisor
@@ -273,7 +273,7 @@ The D3D9, OpenGL (Zink) and Vulkan paths have no hard requirement like this
 on ANV. With only this check relaxed, all of them pass
 (`03-experiment/results.txt`), and the UMD log has no other rejection.
 
-### The fix: `patches/mesa/0021`
+### The fix: `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch`
 
 `yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` (Mesa,
 the Yttrium d3d10umd frontend and gdi winsys):
