@@ -119,7 +119,11 @@ def two_roots(h):
 
 
 def down_isolation(h, attempts=1):
-    """Both labs share the supervisor, template and machine name."""
+    """Exercise a lab-scoped release with a live peer on the same supervisor.
+
+    In #324 the peer's daemon and the shared supervisor received termination
+    signals. Check the peer's guest boot ID so a restart cannot pass.
+    """
     with h.lab("admin-down-a") as a, h.lab("admin-down-b") as b:
         h.vmlab("up", cwd=b)
         h.wait_ready(b, "guest")
