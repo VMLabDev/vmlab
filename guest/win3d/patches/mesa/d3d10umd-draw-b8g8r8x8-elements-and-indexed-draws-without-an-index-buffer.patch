@@ -30,7 +30,7 @@ it does now:
   mapped, the draw is skipped with a line in the error log and no error
   is set.
 
-Evidence: docs/acceptance.md (B11), tests/e2e/adapter/probes/draws_probe.cpp.
+Evidence: docs/acceptance.md (B12), tests/e2e/adapter/probes/draws_probe.cpp.
 Origin: GitHub VMLabDev/vmlab#328 (card #328).
 ---
 diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
