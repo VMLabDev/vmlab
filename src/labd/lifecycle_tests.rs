@@ -2163,7 +2163,7 @@ async fn an_offline_capture_excludes_a_concurrent_start() {
         "start must refuse while an offline snapshot operation holds the disk",
     );
     assert!(error.to_string().contains("snapshot"), "{error:#}");
-    assert_eq!(vm.power_state().await, PowerState::Stopped);
+    assert_eq!(vm.state().await, PowerState::Stopped);
 
     let (cbs, _observed) = callbacks();
     start_vm(&vm, cbs).await.expect("start after capture");
