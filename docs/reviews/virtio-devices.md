@@ -94,6 +94,8 @@ Not read:
 
 ### F2. virtio-fs: after a restore, a handle whose file is gone accepts writes and reports success
 
+- Fixed in #392. Restored file handles without a reopened file return
+  `ESTALE` on read, write and fsync.
 - Where: `devices/virtio/fs/passthrough.rs:352-357`, `1285-1298`
   (`reopen_dead`), `1124-1138` (`file_handle`).
 - Fault: the handle is reopened on `/dev/null` with `O_RDWR`. The comments
