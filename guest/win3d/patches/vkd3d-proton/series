@@ -1,0 +1,7 @@
+vkd3d-Reject-root-signatures-with-overlapping-regist.patch
+vkd3d-Report-FORMAT_INFO-plane-counts-without-a-Vulk.patch
+vkd3d-Allow-depth-stencil-textures-in-CPU-visible-he.patch
+vkd3d-Default-the-Windows-shader-cache-to-LocalAppDa.patch
+d3d12-Build-a-system-wide-d3d12.dll-bridge.patch
+vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch
+vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch

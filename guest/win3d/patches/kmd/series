@@ -1,0 +1,13 @@
+kmd-r10-copy.patch
+kmd-cache-gdi-shadow-and-staging-surfaces.patch
+kmd-create-context-for-gdi-devices.patch
+kmd-recover-from-timeouts.patch
+kmd-hardware-pointer.patch
+kmd-present-blt-into-mappable-blob.patch
+kmd-flip-trace-build.patch
+kmd-report-flips-after-they-are-sent.patch
+kmd-host-ordered-flip.patch
+kmd-host-present-copy.patch
+kmd-host-gpu-lost.patch
+kmd-host-vblank.patch
+kmd-host-scan-line.patch

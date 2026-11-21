@@ -52,7 +52,7 @@ one and stopped reading the old one.
 
 The device is in `hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs`
 (`ordered_flip`) and `renderer.rs` (`Backend::order`), at the root of the
-vmlab repository. The driver side is `patches/kmd/0009`.
+vmlab repository. The driver side is `patches/kmd/kmd-host-ordered-flip.patch`.
 
 ## Without the bit
 

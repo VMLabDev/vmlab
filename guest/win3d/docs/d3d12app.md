@@ -103,9 +103,9 @@ the captures.
 
 ## ExecuteIndirect draws nothing
 
-> **Fixed later** by `patches/vkd3d-proton/0006`, which emulates
+> **Fixed later** by `patches/vkd3d-proton/vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch`, which emulates
 > state-changing command signatures without device-generated commands, and
-> `patches/vkd3d-proton/0007`, which adds vertex and index buffer view
+> `patches/vkd3d-proton/vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch`, which adds vertex and index buffer view
 > arguments ([ei.md](ei.md)). The rest of this section is the original
 > finding.
 

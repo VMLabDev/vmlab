@@ -1,0 +1,32 @@
+Subject: [PATCH] d3d9: record coordinate wrap render states
+
+Windows accepts WRAP0 through WRAP15 as render state and replays them when
+applying a state block, including when the application never draws with
+wrapping enabled. Preserve the values in the render state table. Keep the
+warning about the separate, unimplemented interpolation behavior.
+
+Evidence: docs/acceptance.md.
+
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D9State.cpp b/src/gallium/frontends/d3d10umd/D3D9State.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9State.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9State.cpp
+@@ -234,15 +234,16 @@ D3D9SetRenderState(HANDLE hDevice, const D3DDDIARG_RENDERSTATE *data)
+    case D3DDDIRS_WRAP13:
+    case D3DDDIRS_WRAP14:
+    case D3DDDIRS_WRAP15:
++      /* State blocks can record and restore wrap flags even when no
++       * primitive uses them. Retain them independently of interpolation. */
+       if (data->Value) {
+          static volatile LONG logged;
+          D3D9WarnOncef(
+             &logged,
+             "unsupported D3D9 coordinate wrapping owner=d3d9-state "
+             "reason=cylindrical-wrap-lowering-not-implemented "
+-            "action=reject state=%u value=0x%08x\n",
++            "fallback=interpolate-without-wrapping state=%u value=0x%08x\n",
+             data->State, data->Value);
+-         return E_NOTIMPL;
+       }
+       break;
+    case D3DDDIRS_PATCHEDGESTYLE:
