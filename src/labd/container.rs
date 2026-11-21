@@ -353,6 +353,7 @@ pub struct ContainerInstance {
     snapshot_refusal: std::sync::Mutex<Option<String>>,
 
     state: RwLock<PowerState>,
+    snapshot_gate: Arc<Mutex<()>>,
     /// The bundled vmlab-agent answers its handshake.
     agent_up: RwLock<bool>,
     /// cinit reported the container process running (ctl `started`).
@@ -422,6 +423,7 @@ impl ContainerInstance {
             virtiofs_active: AtomicBool::new(false),
             snapshot_refusal: std::sync::Mutex::new(None),
             state: RwLock::new(PowerState::Stopped),
+            snapshot_gate: Arc::default(),
             agent_up: RwLock::new(false),
             started: RwLock::new(false),
             ready: RwLock::new(false),
@@ -736,6 +738,7 @@ impl ContainerInstance {
         on_health: impl Fn(bool) + Send + Sync + 'static,
     ) -> Result<()> {
         {
+            let _snapshot = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
             let mut st = self.state.write().await;
             if *st != PowerState::Stopped {
                 bail!("{} is {:?}", self.cfg.name, *st);
@@ -1114,8 +1117,10 @@ impl ContainerInstance {
     /// the capture was online.
     async fn take_snapshot(&self, name: &str) -> Result<bool> {
         super::vm::validate_snapshot_name(name)?;
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
+                drop(guard);
                 if let Some(why) = self.online_snapshot_refusal().await {
                     bail!("{why}");
                 }
@@ -1131,7 +1136,12 @@ impl ContainerInstance {
                         self.cfg.name
                     );
                 }
-                crate::template::qimg::snapshot_create(&scratch, name).await?;
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    crate::template::qimg::snapshot_create(&scratch, &name).await?;
+                    Ok(())
+                })
+                .await?;
                 Ok(false)
             }
             other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
@@ -1187,23 +1197,38 @@ impl ContainerInstance {
     /// disk, stay off (PRD §7.3 restore semantics). The stop sets
     /// `stop_requested`, so the exit is classified as requested.
     async fn restore_offline(&self, name: &str) -> Result<()> {
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         if self.power_state().await != PowerState::Stopped {
             self.stop_ladder(false).await?;
             self.settle_stopped(Duration::from_secs(60)).await?;
         }
-        crate::template::qimg::snapshot_apply(&self.dirs.scratch_disk(), name).await?;
-        Ok(())
+        let scratch = self.dirs.scratch_disk();
+        let name = name.to_owned();
+        super::machine::finish_offline_snapshot(guard, async move {
+            crate::template::qimg::snapshot_apply(&scratch, &name).await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn drop_snapshot(&self, name: &str) -> Result<()> {
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
+                drop(guard);
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 snapshots.delete(name, &["scratch"]).await?;
             }
-            _ => {
-                crate::template::qimg::snapshot_delete(&self.dirs.scratch_disk(), name).await?;
+            PowerState::Stopped => {
+                let scratch = self.dirs.scratch_disk();
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    crate::template::qimg::snapshot_delete(&scratch, &name).await?;
+                    Ok(())
+                })
+                .await?;
             }
+            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
         }
         Ok(())
     }
