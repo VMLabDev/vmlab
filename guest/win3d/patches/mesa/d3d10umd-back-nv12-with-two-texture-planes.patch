@@ -1,0 +1,409 @@
+Back local D3D11 NV12 textures with separate luma and chroma images.
+
+Use typed views to select a plane, keep CPU maps in the packed NV12 layout,
+and apply updates and copies to both images. See docs/acceptance/C374.md.
+
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -254,6 +254,12 @@
+    SetErrorAt((hDevice), (hr), __func__, __LINE__)
+ 
+ 
++struct NV12Map
++{
++   uint8_t *data;
++   bool write;
++};
++
+ struct Resource
+ {
+    struct list_head list;
+@@ -279,6 +285,8 @@
+    uint32_t constant_buffer_bindings[MESA_SHADER_STAGES];
+    struct pipe_transfer **transfers;
+    struct pipe_stream_output_target *so_target;
++   struct pipe_resource *nv12_chroma;
++   NV12Map *nv12_maps;
+ };
+ 
+ 
+@@ -322,6 +330,25 @@
+    return static_cast<struct pipe_resource *>(pResource->resource);
+ }
+ 
++
++/* D3D11 selects an NV12 plane through the typed view format. */
++static inline struct pipe_resource *
++ViewPipeResource(Resource *resource, DXGI_FORMAT format)
++{
++   if (!resource || resource->Format != DXGI_FORMAT_NV12)
++      return resource ? resource->resource : NULL;
++
++   switch (format) {
++   case DXGI_FORMAT_R8_UINT:
++   case DXGI_FORMAT_R8_UNORM:
++      return resource->resource;
++   case DXGI_FORMAT_R8G8_UINT:
++   case DXGI_FORMAT_R8G8_UNORM:
++      return resource->nv12_chroma;
++   default:
++      return NULL;
++   }
++}
+ 
+ static inline int
+ PipeResourceRefCount(struct pipe_resource *resource)
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -488,6 +488,13 @@
+    resource->constant_original_stale = false;
+    ReleasePublishedConstantBuffer(pipe, resource);
+    pipe_resource_reference(&resource->resource, NULL);
++   pipe_resource_reference(&resource->nv12_chroma, NULL);
++   if (resource->nv12_maps) {
++      for (UINT i = 0; i < resource->NumSubResources; ++i)
++         free(resource->nv12_maps[i].data);
++      free(resource->nv12_maps);
++      resource->nv12_maps = NULL;
++   }
+    free(resource->buffer_shadow);
+    resource->buffer_shadow = NULL;
+    resource->buffer_shadow_size = 0;
+@@ -886,6 +893,138 @@
+  *
+  * ----------------------------------------------------------------------
+  */
++
++static struct pipe_box
++NV12ChromaBox(struct pipe_box box)
++{
++   box.x /= 2;
++   box.y /= 2;
++   box.width /= 2;
++   box.height /= 2;
++   return box;
++}
++
++static bool
++NV12BoxAligned(const struct pipe_box &box)
++{
++   return !((box.x | box.y | box.width | box.height) & 1);
++}
++
++static void
++UploadNV12(struct pipe_context *pipe, Resource *resource,
++           const struct pipe_box &box, const void *data, unsigned pitch)
++{
++   const struct pipe_box chroma = NV12ChromaBox(box);
++   const uint8_t *uv = static_cast<const uint8_t *>(data) + size_t(pitch) * box.height;
++   pipe->texture_subdata(pipe, resource->resource, 0, 0, &box, data, pitch, 0);
++   pipe->texture_subdata(pipe, resource->nv12_chroma, 0, 0, &chroma, uv, pitch, 0);
++}
++
++static HRESULT
++CreateNV12(struct pipe_context *pipe, Resource *resource,
++           struct pipe_resource plane, const D3D10DDIARG_CREATERESOURCE *create)
++{
++   if (!plane.width0 || !plane.height0 || (plane.width0 | plane.height0) & 1 ||
++       (plane.target != PIPE_TEXTURE_2D && plane.target != PIPE_TEXTURE_2D_ARRAY) ||
++       plane.last_level || plane.nr_samples != 1 || create->pPrimaryDesc ||
++       (plane.bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) ||
++       create->MiscFlags)
++      return E_INVALIDARG;
++
++   struct pipe_screen *screen = pipe->screen;
++   plane.format = PIPE_FORMAT_R8_UINT;
++   if (!is_resource_format_supported(screen, &plane))
++      return DXGI_DDI_ERR_UNSUPPORTED;
++   resource->resource = screen->resource_create(screen, &plane);
++   if (!resource->resource)
++      return E_OUTOFMEMORY;
++
++   plane.width0 /= 2;
++   plane.height0 /= 2;
++   plane.format = PIPE_FORMAT_R8G8_UINT;
++   if (is_resource_format_supported(screen, &plane))
++      resource->nv12_chroma = screen->resource_create(screen, &plane);
++   if (create->MapFlags)
++      resource->nv12_maps = (NV12Map *)calloc(plane.array_size, sizeof(NV12Map));
++   if (!resource->nv12_chroma || (create->MapFlags && !resource->nv12_maps)) {
++      ReleaseResourceContents(pipe, resource);
++      return E_OUTOFMEMORY;
++   }
++
++   resource->NumSubResources = plane.array_size;
++   if (create->pInitialDataUP) {
++      for (unsigned layer = 0; layer < plane.array_size; ++layer) {
++         const auto &initial = create->pInitialDataUP[layer];
++         struct pipe_box box;
++         unsigned level;
++         subResourceBox(resource->resource, layer, &level, &box);
++         UploadNV12(pipe, resource, box, initial.pSysMem, initial.SysMemPitch);
++      }
++   }
++
++   return S_OK;
++}
++
++static void
++CopyNV12(struct pipe_context *pipe, Resource *dst, unsigned x, unsigned y,
++         unsigned layer, Resource *src, const struct pipe_box &box)
++{
++   if (!dst->nv12_chroma || !src->nv12_chroma || !NV12BoxAligned(box) ||
++       ((x | y) & 1) || box.width <= 0 || box.height <= 0 || box.depth != 1)
++      return;
++
++   const struct pipe_box chroma = NV12ChromaBox(box);
++   pipe->resource_copy_region(pipe, dst->resource, 0, x, y, layer,
++                              src->resource, 0, &box);
++   pipe->resource_copy_region(pipe, dst->nv12_chroma, 0, x / 2, y / 2, layer,
++                              src->nv12_chroma, 0, &chroma);
++}
++
++static HRESULT
++MapNV12(struct pipe_context *pipe, Resource *resource, UINT subresource,
++        unsigned usage, D3D10DDI_MAPPED_SUBRESOURCE *mapped)
++{
++   if (!resource->nv12_maps || subresource >= resource->NumSubResources ||
++       resource->nv12_maps[subresource].data)
++      return E_INVALIDARG;
++
++   struct pipe_box box;
++   unsigned level;
++   subResourceBox(resource->resource, subresource, &level, &box);
++   const unsigned pitch = box.width;
++   const unsigned size = pitch * (box.height + box.height / 2);
++   uint8_t *data = (uint8_t *)malloc(size);
++   if (!data)
++      return E_OUTOFMEMORY;
++
++   if (usage & PIPE_MAP_READ) {
++      const struct pipe_box chroma = NV12ChromaBox(box);
++      const struct pipe_box boxes[] = {box, chroma};
++      struct pipe_resource *planes[] = {resource->resource, resource->nv12_chroma};
++      uint8_t *output = data;
++      for (unsigned plane = 0; plane < ARRAY_SIZE(planes); ++plane) {
++         struct pipe_transfer *transfer;
++         const uint8_t *input = static_cast<const uint8_t *>(pipe->texture_map(
++            pipe, planes[plane], 0, usage & (PIPE_MAP_READ | PIPE_MAP_DONTBLOCK),
++            &boxes[plane], &transfer));
++         if (!input) {
++            free(data);
++            return usage & PIPE_MAP_DONTBLOCK ? DXGI_DDI_ERR_WASSTILLDRAWING : E_FAIL;
++         }
++         for (int y = 0; y < boxes[plane].height; ++y) {
++            memcpy(output, input + size_t(y) * transfer->stride, pitch);
++            output += pitch;
++         }
++         pipe_texture_unmap(pipe, transfer);
++      }
++   }
++
++   resource->nv12_maps[subresource] = {data, bool(usage & PIPE_MAP_WRITE)};
++   mapped->pData = data;
++   mapped->RowPitch = pitch;
++   mapped->DepthPitch = size;
++   return S_OK;
++}
+ 
+ void APIENTRY
+ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -1065,6 +1204,17 @@
+       if (templat.bind & PIPE_BIND_RENDER_TARGET)
+          templat.bind |= PIPE_BIND_SAMPLER_VIEW;
+       templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED;
++   }
++
++   if (yttrium && pResource->Format == DXGI_FORMAT_NV12) {
++      /* Neither plane is a runtime-owned display allocation. */
++      device->device.hRTResource = NULL;
++      HRESULT hr = CreateNV12(pipe, pResource, templat, pCreateResource);
++      if (FAILED(hr))
++         SetError(hDevice, hr);
++      else
++         RegisterResource(device, pResource, "create", hResource, hRTResource);
++      goto unlock;
+    }
+ 
+    if (templat.target != PIPE_BUFFER) {
+@@ -1442,6 +1592,15 @@
+       return;
+    }
+ 
++   if (pResource->nv12_chroma) {
++      if (Flags & D3D10_DDI_MAP_FLAG_DONOTWAIT)
++         usage |= PIPE_MAP_DONTBLOCK;
++      HRESULT hr = MapNV12(pipe, pResource, SubResource, usage, pMappedSubResource);
++      if (FAILED(hr))
++         SetError(hDevice, hr);
++      return;
++   }
++
+    if (DDIMap == D3D10_DDI_MAP_READ) {
+       if (!RestoreConstantBufferOriginal(
+              pDevice, pResource,
+@@ -1514,6 +1673,19 @@
+ 
+    assert(SubResource < pResource->NumSubResources);
+ 
++   if (pResource->nv12_chroma) {
++      NV12Map &map = pResource->nv12_maps[SubResource];
++      if (map.write) {
++         struct pipe_box box;
++         unsigned level;
++         subResourceBox(pResource->resource, SubResource, &level, &box);
++         UploadNV12(pipe, pResource, box, map.data, box.width);
++      }
++      free(map.data);
++      map = {};
++      return;
++   }
++
+    if (pResource->transfers[SubResource]) {
+       if (pResource->buffer) {
+          pipe_buffer_unmap(pipe, pResource->transfers[SubResource]);
+@@ -1672,6 +1844,16 @@
+ 
+    struct pipe_resource *dst_resource = pDstResource->resource;
+    struct pipe_resource *src_resource = pSrcResource->resource;
++   if (pDstResource->nv12_chroma || pSrcResource->nv12_chroma) {
++      for (unsigned layer = 0; layer < src_resource->array_size; ++layer) {
++         struct pipe_box box;
++         unsigned level;
++         subResourceBox(src_resource, layer, &level, &box);
++         CopyNV12(pipe, pDstResource, 0, 0, layer, pSrcResource, box);
++      }
++      return;
++   }
++
+    bool compatible;
+    bool fallback_compatible;
+ 
+@@ -1812,6 +1994,12 @@
+       src_box.width  = u_minify(src_resource->width0,  src_level);
+       src_box.height = u_minify(src_resource->height0, src_level);
+       src_box.depth  = u_minify(src_resource->depth0,  src_level);
++   }
++
++   if (pDstResource->nv12_chroma || pSrcResource->nv12_chroma) {
++      if (!DstZ)
++         CopyNV12(pipe, pDstResource, DstX, DstY, dst_layer, pSrcResource, src_box);
++      return;
+    }
+ 
+    const bool yttrium_srgb_copy = is_yttrium_screen(pipe->screen) &&
+@@ -2008,6 +2196,12 @@
+       subResourceBox(dst_resource, DstSubResource, &level, &box);
+    }
+ 
++   if (pDstResource->nv12_chroma) {
++      if (NV12BoxAligned(box))
++         UploadNV12(pipe, pDstResource, box, pSysMemUP, RowPitch);
++      return;
++   }
++
+    if (pDstResource->buffer &&
+        ConstantBufferPublicationEligible(pDevice, pDstResource)) {
+       if (ConstantBufferPublicationUpdateHasCompleteContents(
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -3747,7 +3747,7 @@
+ 
+    struct pipe_sampler_view desc;
+    memset(&desc, 0, sizeof desc);
+-   resource = CastPipeResource(pCreateSRView->hDrvResource);
++   resource = ViewPipeResource(pSRView->resource, pCreateSRView->Format);
+    format = FormatTranslate(pCreateSRView->Format, false);
+    const bool buffer_structured =
+       pSRView->resource &&
+@@ -3892,7 +3892,7 @@
+ 
+    struct pipe_sampler_view desc;
+    memset(&desc, 0, sizeof desc);
+-   resource = CastPipeResource(pCreateSRView->hDrvResource);
++   resource = ViewPipeResource(pSRView->resource, pCreateSRView->Format);
+    format = FormatTranslate(pCreateSRView->Format, false);
+    const bool buffer_structured =
+       pSRView->resource &&
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+@@ -316,9 +316,15 @@
+ {
+    LOG_ENTRYPOINT();
+ 
+-   struct pipe_resource *resource = CastPipeResource(pCreateRenderTargetView->hDrvResource);
+    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
+    pRTView->resource = CastResource(pCreateRenderTargetView->hDrvResource);
++   struct pipe_resource *resource =
++      ViewPipeResource(pRTView->resource, pCreateRenderTargetView->Format);
++   if (!resource) {
++      pRTView->surface = {};
++      SetError(hDevice, E_INVALIDARG);
++      return;
++   }
+ 
+ 
+    struct pipe_surface desc;
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -900,11 +900,15 @@
+ 
+ #if SUPPORT_D3D_WDDM2_0
+ static bool
+-ValidPlaneWDDM2_0(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT format, UINT plane)
++ValidPlaneWDDM2_0(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT format, UINT plane,
++                  D3D10DDI_HRESOURCE handle = {})
+ {
+    const bool stencil = format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
+                         format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+-   if (plane > 1 || (plane && !stencil)) {
++   const Resource *resource = CastResource(handle);
++   const bool chroma = resource && resource->nv12_chroma &&
++      (format == DXGI_FORMAT_R8G8_UNORM || format == DXGI_FORMAT_R8G8_UINT);
++   if (plane > 1 || (plane && !stencil && !chroma)) {
+       SetError(hDevice, E_INVALIDARG);
+       return false;
+    }
+@@ -1021,7 +1025,8 @@
+    D3D10DDI_HSHADERRESOURCEVIEW view, D3D10DDI_HRTSHADERRESOURCEVIEW rtView)
+ {
+    if (source->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D &&
+-       !ValidPlaneWDDM2_0(device, source->Format, source->Tex2D.PlaneSlice))
++       !ValidPlaneWDDM2_0(device, source->Format, source->Tex2D.PlaneSlice,
++                          source->hDrvResource))
+       return;
+    auto desc = ConvertShaderViewWDDM2_0(source);
+    CreateShaderResourceView11(device, &desc, view, rtView);
+@@ -1062,7 +1067,8 @@
+    D3D10DDI_HRENDERTARGETVIEW view, D3D10DDI_HRTRENDERTARGETVIEW rtView)
+ {
+    if (source->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D &&
+-       !ValidPlaneWDDM2_0(device, source->Format, source->Tex2D.PlaneSlice))
++       !ValidPlaneWDDM2_0(device, source->Format, source->Tex2D.PlaneSlice,
++                          source->hDrvResource))
+       return;
+    auto desc = ConvertRenderViewWDDM2_0(source);
+    CreateRenderTargetView(device, &desc, view, rtView);
+@@ -2327,6 +2333,17 @@
+ 
+    *pFormatCaps = 0;
+ 
++   if (Format == DXGI_FORMAT_NV12 && strcmp(screen->get_name(screen), "yttrium") == 0) {
++      /* Typed luma and chroma views provide rendering and sampling. */
++      const unsigned bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
++      if (!screen->is_format_supported(screen, PIPE_FORMAT_R8_UINT, PIPE_TEXTURE_2D,
++                                       1, 1, bind) ||
++          !screen->is_format_supported(screen, PIPE_FORMAT_R8G8_UINT, PIPE_TEXTURE_2D,
++                                       1, 1, bind))
++         *pFormatCaps = D3D10_DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
++      return;
++   }
++
+    enum pipe_format format = FormatTranslate(Format, false);
+    if (format == PIPE_FORMAT_NONE) {
+       *pFormatCaps = D3D10_DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
