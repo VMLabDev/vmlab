@@ -38,7 +38,7 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/front
            * their actual Present is qualified. */
          if (yttrium && templ.target != PIPE_BUFFER &&
              !data->Flags.SharedResource &&
-@@ -3316,7 +3320,11 @@
+@@ -3316,11 +3320,15 @@
     unsigned usage = D3D9PipeMapUsage(data->Flags);
     /* D3DLOCK_DISCARD with D3DLOCK_NOOVERWRITE on a buffer is a NOOVERWRITE
      * lock, as DXVK's D3D9 and Windows drivers treat it. Valley locks a 4 MiB
@@ -52,3 +52,7 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/front
 +         usage &= ~PIPE_MAP_DISCARD_RANGE;
 +   }
     void *map = NULL;
+
+    if (buffer_resource) {
+       if (!resource->pipe_resource || !device->pipe) {
+          D3D9Warnf("unsupported buffer lock without pipe resource "
