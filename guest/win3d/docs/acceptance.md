@@ -919,20 +919,20 @@ supplies a size of one pixel.
 [Mesa patch](../patches/mesa/d3d9-suppress-zero-size-points-and-default-unbound-psize.patch).
 
 Wine 11.0's `d3d9_visual` ran on helios with Windows 11 template
-`26100.1742.11#win3d` and the signed package from `343571b7`. The AMD1
-run completed 206,068 checks with 31 skips.
+`26100.1742.11#win3d` and the signed package from `343571b7`. Each GPU
+completed 206,068 checks with 31 skips.
 
-| Failed assertions | AMD1 card #253 → C338 |
-| --- | ---: |
-| `visual.c:11460` — size-one draw rejected | 7 → 0 |
-| `visual.c:11490` — zero-size point changes the clear color | 10 → 0 |
-| `visual.c:11498` — size-one point leaves the clear color | 7 → 0 |
-| Full program | 343 → 125 |
+| Failed assertions | AMD1 card #253 → C338 | Nvidia2 card #253 → C338 |
+| --- | ---: | ---: |
+| `visual.c:11460` — size-one draw rejected | 7 → 0 | 7 → 0 |
+| `visual.c:11490` — zero-size point changes the clear color | 10 → 0 | 10 → 0 |
+| `visual.c:11498` — size-one point leaves the clear color | 7 → 0 | 7 → 0 |
+| Full program | 343 → 125 | 345 → 127 |
 
 Card #339 had already cleared the two size-one groups on both GPUs.
-The 125 remaining messages on AMD1 matched the failures common to the
-table-fog and unbound-stream runs, after removing the ten zero-size
-failures. Only `d3d9_visual` was run for C338.
+On each GPU, the remaining messages matched the failures common to the
+table-fog and unbound-stream runs after removing the ten zero-size
+failures. The GPU validation for C338 covered `d3d9_visual`.
 
 #### Draft cards
 
