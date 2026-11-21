@@ -47,3 +47,5 @@ d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch
 d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch
 d3d9-record-coordinate-wrap-render-states.patch
 d3d9-vertex-fog-specular-alpha.patch
+d3d9-select-table-fog-from-w-info.patch
+d3d9-default-inputs-for-unbound-streams.patch
