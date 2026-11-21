@@ -3,8 +3,8 @@ Subject: [PATCH] d3d10umd: keep the device through Wine's d3d10core and d3d11 te
 Wine's d3d10core and d3d11 tests ended on an access violation after calls
 began to answer DXGI_ERROR_DEVICE_REMOVED (GitHub #248). The runtime takes
 an error that a DDI function may not set as a removed device, and the
-tests then read through a pointer that a failed call left NULL. Each call
-that removed the device:
+tests then read through a pointer that a failed call left NULL. The calls
+that removed the device, and what they do now:
 
 - GetResourceLayout (WDDM 2.0) answered E_INVALIDARG for every resource.
   The runtime asks for the layout of each DEFAULT texture created with CPU
@@ -12,19 +12,14 @@ that removed the device:
   D3DWDDM2_0DDI_TL_UNDEFINED with no allocation and no error: the texture
   stays opaque, as before, and CPU access still goes through ResourceMap.
 - The Yttrium vertex input had no Vulkan format for R11G11B10_FLOAT, which
-  Direct3D 10 requires for vertex buffers, and none for B8G8R8X8_UNORM. The
-  draw was dropped and the next draw set E_FAIL (test_vertex_formats). They
-  are now fetched as B10G11R11_UFLOAT_PACK32 and B8G8R8A8_UNORM; the fourth
-  component of B8G8R8X8 reads the buffer's byte, as on AMD hardware.
-- The index buffer a draw gets when none is bound was IMMUTABLE, and
-  Yttrium keeps no CPU copy of an immutable draw buffer, so the draw was
-  dropped (test_index_buffer_offset). It is DYNAMIC now, which Yttrium
-  keeps a CPU copy of.
-- An indirect indexed draw with no index buffer set E_INVALIDARG. It is
-  skipped now, with a warning.
+  Direct3D 10 requires for vertex buffers. The draw was dropped and the
+  next draw set E_FAIL (test_vertex_formats). It is fetched as
+  B10G11R11_UFLOAT_PACK32 now. A vertex format that still has no Vulkan
+  format is named in the error log when its input layout is created.
 - A pixel shader that needs more combined texture slots than the 32 of
-  the sampler binding map set E_FAIL at its creation (test_high_resource_
-  count: 50 textures with two samplers and 50 buffers). It is created as a
+  the sampler binding map set E_FAIL at its creation
+  (test_high_resource_count: 50 textures with two samplers and 50
+  buffers), and the test then released the NULL shader. It is created as a
   shader that writes zero to every colour output, with an error in the log,
   so it draws zero instead of removing the device.
 
@@ -56,40 +51,6 @@ index 4707fc8..cb624b7 100644
  }
  
  static void
-diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
-index a206563..27588b1 100644
---- a/src/gallium/frontends/d3d10umd/Draw.cpp
-+++ b/src/gallium/frontends/d3d10umd/Draw.cpp
-@@ -238,9 +238,12 @@ create_null_index_buffer(struct pipe_context *ctx, uint num_indices,
- 
-    memset(buf, 0, buf_size);
- 
-+   /* DYNAMIC, not IMMUTABLE: Yttrium keeps a CPU copy of a dynamic draw
-+    * buffer, and a draw reads its indices from that copy. It has none of
-+    * an immutable or a default one created this way. */
-    ibuf = pipe_buffer_create_with_data(ctx,
-                                        PIPE_BIND_INDEX_BUFFER,
--                                       PIPE_USAGE_IMMUTABLE,
-+                                       PIPE_USAGE_DYNAMIC,
-                                        buf_size, buf);
-    *index_size = 4;
-    *restart_index = 0xffffffff;
-@@ -486,6 +489,15 @@ DrawIndirect(D3D10DDI_HDEVICE hDevice,
-    const UINT args_size = (indexed ? 5 : 4) * sizeof(UINT);
-    if (ConsumeBackendDrawFailure(hDevice))
-       return;
-+   if (indexed && !pDevice->index_buffer) {
-+      /* Direct3D reads index 0 for every index of a draw without an index
-+       * buffer. The count is in GPU memory here, so the draw is skipped,
-+       * as an application mistake: it must not remove the device. */
-+      YTTRIUM_WARN("yttrium: draw skipped owner=d3d10umd "
-+                   "component=DrawIndirect reason=no_index_buffer "
-+                   "action=skip-draw\n");
-+      return;
-+   }
-    if (!pArgs || !pArgs->resource ||
-        pArgs->resource->target != PIPE_BUFFER ||
-        !(pArgs->resource->bind & PIPE_BIND_COMMAND_ARGS_BUFFER) ||
 diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
 index c49e603..7731333 100644
 --- a/src/gallium/frontends/d3d10umd/Shader.cpp
@@ -183,20 +144,10 @@ index 27f1636..1f2d2ae 100644
  
  struct pipe_shader_state
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_state.c b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
-index dd7c3c3..b2d453c 100644
+index dd7c3c3..726c1fb 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_state.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
-@@ -78,12 +78,18 @@ yttrium_vertex_format_to_vk(enum pipe_format format)
-       return VK_FORMAT_A2B10G10R10_UINT_PACK32;
-    case PIPE_FORMAT_B8G8R8A8_UNORM:
-       return VK_FORMAT_B8G8R8A8_UNORM;
-+   /* Vulkan has no X variant. The fourth component reads the buffer's
-+    * byte, as it does on AMD hardware (Wine's test_vertex_formats). */
-+   case PIPE_FORMAT_B8G8R8X8_UNORM:
-+      return VK_FORMAT_B8G8R8A8_UNORM;
-    case PIPE_FORMAT_B8G8R8A8_SNORM:
-       return VK_FORMAT_B8G8R8A8_SNORM;
-    case PIPE_FORMAT_B8G8R8A8_UINT:
+@@ -84,6 +84,8 @@ yttrium_vertex_format_to_vk(enum pipe_format format)
        return VK_FORMAT_B8G8R8A8_UINT;
     case PIPE_FORMAT_B8G8R8A8_SINT:
        return VK_FORMAT_B8G8R8A8_SINT;
@@ -205,7 +156,7 @@ index dd7c3c3..b2d453c 100644
     case PIPE_FORMAT_R16_FLOAT:
        return VK_FORMAT_R16_SFLOAT;
     case PIPE_FORMAT_R16_UNORM:
-@@ -226,8 +232,11 @@ yttrium_build_vertex_input_state(struct yttrium_vertex_elements_state *state)
+@@ -226,8 +228,11 @@ yttrium_build_vertex_input_state(struct yttrium_vertex_elements_state *state)
        }
  
        vk_format = yttrium_vertex_format_to_vk(elem->src_format);
