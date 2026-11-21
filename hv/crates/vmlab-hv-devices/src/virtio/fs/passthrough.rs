@@ -2074,6 +2074,42 @@ mod tests {
     }
 
     #[test]
+    fn append_handle_under_writeback_honours_the_write_offset() {
+        let (dir, fs) = scratch();
+        assert!(
+            fs.init(FsOptions::all())
+                .unwrap()
+                .contains(FsOptions::WRITEBACK_CACHE)
+        );
+        let path = dir.path().join("append.txt");
+        std::fs::File::create(&path).unwrap();
+        let inode = lookup(&fs, b"append.txt").unwrap().inode;
+        let (handle, _, _) = fs
+            .open(&ctx(), inode, (libc::O_WRONLY | libc::O_APPEND) as u32, 0)
+            .unwrap();
+        let handle = handle.unwrap();
+
+        for data in [b"a\n".as_slice(), b"a\nb\n".as_slice()] {
+            let written = fs
+                .write(
+                    &ctx(),
+                    inode,
+                    handle,
+                    &mut SliceReader(data),
+                    data.len() as u32,
+                    0,
+                    None,
+                    true,
+                    0,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(written, data.len());
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"a\nb\n");
+    }
+
+    #[test]
     fn synchronous_open_flags_survive_open_and_restore() {
         let (_dir, fs) = scratch();
         let ino = lookup(&fs, b"hello.txt").unwrap().inode;
