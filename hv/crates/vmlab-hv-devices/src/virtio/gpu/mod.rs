@@ -12,6 +12,7 @@ mod renderer;
 mod scanout;
 pub use scanout::DmaFrame;
 mod snapshot;
+mod teardown;
 pub use renderer::{APERTURE_SIZE, BlobMapper, GpuMode};
 
 pub enum ScanoutPixels {
@@ -193,6 +194,11 @@ struct State {
     lost: Option<String>,
     /// Set with `lost`, and read without the device lock.
     lost_flag: lost::Flag,
+    /// The render workers of the guest's Venus contexts (`teardown.rs`).
+    workers: teardown::Workers,
+    /// The last reset has not confirmed that the renderer and its workers
+    /// stopped: the transport keeps the status nonzero.
+    unsettled: bool,
 }
 
 impl Drop for State {
@@ -242,6 +248,8 @@ impl Gpu {
                 ordered_flips: 0,
                 lost: None,
                 lost_flag: lost::Flag::default(),
+                workers: teardown::Workers::default(),
+                unsettled: false,
             })),
         }
     }
@@ -721,6 +729,10 @@ impl State {
             && let Some(renderer) = &self.renderer
         {
             let result = renderer.command(mem, request)?;
+            if kind == 0x200 {
+                // CTX_CREATE: a Venus context has a worker of its own.
+                self.workers.note(renderer.servers());
+            }
             if matches!(kind, 0x103 | 0x10d) {
                 self.native = true;
             }
@@ -1181,11 +1193,8 @@ impl VirtioDevice for Gpu {
     }
     fn reset(&mut self) {
         let mut s = self.state.lock();
-        if let Some(renderer) = &s.renderer
-            && let Err(error) = renderer.reset()
-        {
-            log::error!("GPU reset failed: {error:#x}");
-        }
+        let patience = s.workers.patience;
+        s.unsettled = !s.teardown(patience);
         s.fences.clear();
         s.flush_pending = None;
         s.retry_display = false;
@@ -1216,6 +1225,41 @@ impl VirtioDevice for Gpu {
                 pixels: ScanoutPixels::Vga,
             });
         }
+    }
+    fn reset_settled(&mut self) -> bool {
+        let mut s = self.state.lock();
+        if s.unsettled && s.teardown(std::time::Duration::ZERO) {
+            log::info!("GPU reset: the renderer and its workers have stopped");
+            s.unsettled = false;
+        }
+        !s.unsettled
+    }
+}
+
+impl State {
+    /// Stop the renderer and wait at most `wait` for the workers of the
+    /// guest's contexts to exit. False, logged, when either is not done.
+    fn teardown(&mut self, wait: std::time::Duration) -> bool {
+        let mut done = true;
+        if let Some(renderer) = &self.renderer {
+            if let Err(error) = renderer.reset() {
+                if !self.unsettled {
+                    log::error!("GPU reset failed: {error:#x}; the device status stays nonzero");
+                }
+                done = false;
+            }
+            // A worker the start of this reset did not know yet.
+            self.workers.note(renderer.servers());
+        }
+        if let Err(running) = self.workers.wait(wait) {
+            if !self.unsettled {
+                log::error!(
+                    "GPU reset: render workers {running:?} have not exited; the device status stays nonzero"
+                );
+            }
+            done = false;
+        }
+        done
     }
 }
 

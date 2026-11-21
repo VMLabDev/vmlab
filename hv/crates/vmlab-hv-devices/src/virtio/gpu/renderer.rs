@@ -893,36 +893,63 @@ impl Renderer {
         self.call(|b| Ok(b.pending_frame.then(|| (b.generation, b.damage.clone()))))
     }
 
+    /// The render server processes (Venus), whose children serve the
+    /// guest's contexts (`teardown.rs`).
+    pub fn servers(&self) -> &[u32] {
+        &self.servers
+    }
+
+    /// Free what the guest held, and wait until the renderer's own GPU
+    /// work has ended. A failure does not stop the teardown: everything
+    /// else is still freed, and the first error is returned. What failed
+    /// to go stays held, so that a later reset tries it again. The workers
+    /// of Venus contexts are waited for by the caller (`teardown.rs`).
     pub fn reset(&self) -> Result<(), u32> {
         let leases = std::mem::take(&mut *self.direct.lock());
         for lease in leases.into_iter().filter_map(|lease| lease.upgrade()) {
             lease.retire();
         }
-        // A reset after a loss still frees what the guest held, and does
-        // not stop at the first failure of the host GPU.
-        let lost = self.lost.get();
+        // After a loss the host GPU's answers do not count: the reset
+        // frees what the guest held and does not wait for the GPU.
+        let lost = self.lost.clone();
         self.worker.call(move |b| {
             log::debug!("GPU renderer reset: contexts={:?}", b.contexts);
+            let mut first = None;
             let ids: Vec<_> = b.resources.keys().copied().collect();
             for id in ids {
-                match b.unref(id) {
-                    Err(_) if lost => {
+                if let Err(error) = b.unref(id) {
+                    if lost.get() {
                         b.resources.remove(&id);
+                    } else {
+                        log::error!("GPU reset: resource {id} not freed: {error:#x}");
+                        first.get_or_insert(error);
                     }
-                    result => result?,
                 }
             }
             for id in std::mem::take(&mut b.contexts) {
-                match host(b.gpu.destroy_context(id)) {
-                    Err(_) if lost => {}
-                    result => result?,
+                if let Err(error) = host(b.gpu.destroy_context(id))
+                    && !lost.get()
+                {
+                    log::error!("GPU reset: context {id} not destroyed: {error:#x}");
+                    b.contexts.insert(id);
+                    first.get_or_insert(error);
                 }
             }
             b.scanout = None;
             b.pending_frame = false;
             b.damage.clear();
+            // The fences of destroyed contexts never signal: the wait
+            // below is for a fence of its own.
             b.timeline.lock().pending.clear();
-            Ok(())
+            if !lost.get()
+                && let Err(error) = b.synchronize()
+                && !lost.get()
+            {
+                log::error!("GPU reset: the renderer's GPU work did not end: {error:#x}");
+                first.get_or_insert(error);
+            }
+            b.timeline.lock().pending.clear();
+            first.map_or(Ok(()), Err)
         })?;
         self.completed.lock().clear();
         Ok(())
