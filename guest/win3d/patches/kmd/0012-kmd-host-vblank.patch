@@ -351,4 +351,72 @@ index a843a32b..afe72a3e 100644
 +
 +void VioGpuVidPN::HostVblankDone(void *ctx)
 +{
-+    VioGpuVidPN *vidpn = reint
++    VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
++    if (InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) != 0)
++    {
++        // Stopped, or cancelled by a reset. A start that came after the stop
++        // and found this wait still on the queue left the ticking to it, so
++        // look again once disarmed.
++        InterlockedExchange(&vidpn->m_vblankArmed, 0);
++        if (InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) != 0 ||
++            InterlockedCompareExchange(&vidpn->m_vblankArmed, 1, 0) != 0)
++        {
++            return;
++        }
++    }
++    if (InterlockedExchange(&vidpn->m_hostVblankFailed, 0))
++    {
++        vidpn->FallBackToTimer();
++        return;
++    }
++    // The flip goes ahead of the next wait, and the host serves it first.
++    vidpn->Flip();
++    vidpn->SubmitHostVblank();
++}
+ 
+ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
+ {
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 1f78fc42..275e682b 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -109,6 +109,14 @@ class VioGpuVidPN
+ 
+     void Flip();
+     static void VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2);
++    // The host's vblank (VIRTIO_GPU_CMD_VMLAB_VBLANK, docs/vblank.md): the
++    // completion of a wait, and the marker on the flush of a flip that
++    // Flip() sends in its place. The interrupt routine knows both by these.
++    static void HostVblankDone(void *ctx);
++    static void FlipShownDone(void *ctx);
++    // The interrupt routine's part. TRUE when the answer raises the vsync.
++    BOOLEAN OnHostVblankFromIsr(struct virtio_gpu_vbuffer *pvbuf, UINT len);
++    BOOLEAN OnFlipShownFromIsr(void);
+     PHYSICAL_ADDRESS GetCurrentSourceAddress() const
+     {
+         return m_sourceAddress;
+@@ -181,4 +189,24 @@ class VioGpuVidPN
+     volatile LONG m_sourceAddressQueueSent = 0;
+     volatile LONG64 m_sentSourceAddress = 0;
+     volatile LONG m_sourceQueueFullCount = 0;
++
++    // The host's vblank in place of the timer: set by StartVsyncTimer when
++    // the host offers it, cleared when it fails.
++    void SubmitHostVblank(void);
++    void FallBackToTimer(void);
++    volatile LONG m_hostVblank = 0;
++    // One wait is on the queue, sent on transport generation
++    // m_vblankGeneration. A reset cancels it, a teardown drops it.
++    volatile LONG m_vblankArmed = 0;
++    LONG m_vblankGeneration = -1;
++    // The interrupt routine saw an answer that was not a vblank.
++    volatile LONG m_hostVblankFailed = 0;
++    // Flip() sent a flip with FlipShownDone, and its answer raises the
++    // vsync of this tick. Ticks counts the vblanks since, so that a flip
++    // whose flush never reached the host cannot stop the vsync.
++    volatile LONG m_flipVsyncOwed = 0;
++    LONG m_flipVsyncOwedTicks = 0;
++    // The last host vblank: its tick and host time in nanoseconds.
++    volatile LONG64 m_hostVblankSequence = 0;
++    volatile LONG64 m_hostVblankTimeNs = 0;
+ };
