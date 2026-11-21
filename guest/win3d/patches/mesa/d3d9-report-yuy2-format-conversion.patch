@@ -1,0 +1,17 @@
+Subject: [PATCH] d3d9: report YUY2 as a source for RGB format queries
+
+The D3D9 runtime derives CheckDeviceFormatConversion from the format
+operations. Mark YUY2 as a conversion source. X8R8G8B8 and R5G6B5
+already belong to the ARGB destination group.
+
+--- a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
+@@ -97,7 +97,7 @@ static const FORMATOP g_format_ops[] = {
+    { D3D9_FMT_DF24, 0x000410c1, 0, 0, 0 },
+    { D3D9_FMT_INTZ, 0x000410c1, 0, 0, 0 },
+    { D3D9_FMT_AYUV, 0x00005000, 0, 0, 32 },
+-   { D3D9_FMT_YUY2, 0x00005000, 0, 0, 16 },
++   { D3D9_FMT_YUY2, FORMATOP_PIXELSIZE | FORMATOP_OFFSCREENPLAIN | FORMATOP_CONVERT_TO_ARGB, 0, 0, 16 },
+    { D3D9_FMT_R8, 0x00c2401f, d3d9_ms_types, 0, 0 },
+    { D3D9_FMT_G8R8, 0x00c2401f, d3d9_ms_types, 0, 0 },
+ };
