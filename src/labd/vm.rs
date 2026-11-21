@@ -2675,7 +2675,9 @@ async fn apply_offline_snapshot(disks: &[PathBuf], name: &str, backup: &str) -> 
     let mut rollback_errors = Vec::new();
     for (index, disk) in disks.iter().enumerate().rev() {
         // Include the failed disk: apply can return an error after a write.
-        if failure.as_ref().is_some_and(|(failed, _, _)| index <= *failed)
+        if failure
+            .as_ref()
+            .is_some_and(|(failed, _, _)| index <= *failed)
             && let Err(error) = qimg::snapshot_apply(disk, backup).await
         {
             rollback_errors.push(format!("{}: {error}", disk.display()));
@@ -2838,7 +2840,12 @@ mod tests {
             .unwrap()
             .read_at(0, &mut data)
             .unwrap();
-        assert_eq!(data, [0x42; 512], "post-snapshot data on {}", path.display());
+        assert_eq!(
+            data,
+            [0x42; 512],
+            "post-snapshot data on {}",
+            path.display()
+        );
     }
 
     #[tokio::test]
@@ -2877,7 +2884,9 @@ mod tests {
             qimg::snapshot_create(disk, "capture").await.unwrap();
             write_disk_pattern(disk);
         }
-        super::snapshot_offline_disks(&disks, "backup").await.unwrap();
+        super::snapshot_offline_disks(&disks, "backup")
+            .await
+            .unwrap();
         // Simulate the target becoming unavailable after the preflight.
         qimg::snapshot_delete(&disks[1], "capture").await.unwrap();
 
