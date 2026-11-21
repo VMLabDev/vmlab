@@ -704,6 +704,20 @@ in [`shaders2.md`](shaders2.md#what-remains): a range over a geometry
 shader's packed scalar system values is still rejected, and indexed reads of
 ordinary patch constants in a join phase were not run.
 
+### Direct3D 10 and 11: at most 32 texture and sampler pairs in one shader
+
+The Yttrium UMD binds each pair of a shader resource and a sampler that a
+shader uses, and each buffer it loads, as one combined slot, and it has 32.
+Direct3D 11 allows 128 resources and 16 samplers in one stage. A pixel
+shader that needs more slots is created as a shader that writes zero to
+every colour output, and the UMD logs
+`pixel shader needs more than 32 combined texture slots` in
+`C:\ProgramData\Yttrium\yttrium-errors.log`. Before `patches/mesa/0097`
+its creation removed the device. Wine's d3d11 test `test_high_resource_count`
+(50 textures sampled with two samplers, and 50 buffers) is such a shader, and
+its two checks fail. A vertex, geometry, hull, domain or compute shader that
+needs more slots still fails to create and removes the device.
+
 ### D3D12: ExecuteIndirect is emulated, and an NVIDIA first-boot dwm crash
 
 Five unmodified Microsoft DirectX-Graphics-Samples D3D12 samples now build
