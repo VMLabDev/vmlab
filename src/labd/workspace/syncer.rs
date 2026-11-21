@@ -4721,6 +4721,59 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn a_re_seed_completes_beside_a_socket_and_an_oversize_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let mut ws = workspace(dir.path(), state.path());
+        ws.max_file_bytes = 64;
+        let opens = sessions.opens().len();
+        syncers.stop("dev01").await;
+        syncers.mark_rewound(&ws).await.unwrap();
+        rewind(&guest);
+        let _socket =
+            std::os::unix::net::UnixListener::bind(dir.path().join("monitor.sock")).unwrap();
+        std::fs::write(dir.path().join("big.bin"), [0; 128]).unwrap();
+        guest.dir("/src/big.bin");
+        guest.file("/src/big.bin/child", "keep this", 1);
+        guest.file("/src/large.tmp", &"x".repeat(128), 1);
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        assert!(eventually(|| syncer.report().passes > 0).await);
+        let report = syncer.report();
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
+        assert!(guest.get("/src/experiment.rs").is_none());
+        assert!(report.reseed.is_none(), "the re-seed barrier never lifted");
+        assert!(!Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed);
+        assert!(eventually(|| sessions.opens().len() > opens).await);
+        assert_eq!(
+            guest.text("/src/big.bin/child").as_deref(),
+            Some("keep this")
+        );
+        assert!(guest.get("/src/large.tmp").is_some());
+        assert!(!dir.path().join("large.tmp").exists());
+        syncers.stop("dev01").await;
+        let events = events_of(state.path());
+        assert!(
+            events.iter().any(|(name, data)| {
+                name == "workspace.skipped" && data["path"] == "monitor.sock"
+            })
+        );
+        for path in ["big.bin", "large.tmp"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|(name, data)| { name == "workspace.refused" && data["path"] == path })
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn an_incomplete_reseed_keeps_the_loop_and_restart_behind_the_barrier() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -4730,7 +4783,8 @@ mod tests {
         let opens = sessions.opens().len();
         restore_bracket(&syncers, &ws, || {
             rewind(&guest);
-            guest.unreadable("/src/experiment.rs");
+            std::os::unix::fs::symlink("main.rs", dir.path().join("link.rs")).unwrap();
+            guest.refuse_symlinks();
         })
         .await;
         for restart in [false, true] {
