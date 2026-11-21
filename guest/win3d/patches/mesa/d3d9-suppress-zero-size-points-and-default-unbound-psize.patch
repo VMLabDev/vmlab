@@ -1,0 +1,116 @@
+Subject: [PATCH] d3d9: suppress zero-size points and default unbound PSIZE
+
+Keep zero through point-size clamping. A draw with a constant zero size
+has no fragments, and a zero size from a vertex shader produces a
+degenerate quad in the point expansion shader.
+
+A point declaration may put PSIZE on a stream with no bound buffer.
+Supply a constant size of one for that element, as on AMD and WARP.
+Keep the other inputs from their bound streams.
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+@@ -1276,6 +1276,7 @@
+ static UINT
+ D3D9FillTranslatedVsVertexElements(const D3D9Device *device,
+                                    const D3D9Object *shader,
++                                   bool points,
+                                    struct pipe_vertex_element *elements,
+                                    UINT max_elements,
+                                    uint32_t *stream_mask,
+@@ -1316,18 +1317,27 @@
+          }
+       }
+ 
+-      if (!element) {
++      if (element && (element->Stream >= ARRAYSIZE(device->streams) ||
++                      element->Method != D3DDECLMETHOD_DEFAULT))
++         return 0;
++
++      const bool unbound_psize =
++         points && input_usage == NINE_DECLUSAGE_PSIZE && element &&
++         !device->streams[element->Stream].sysmem &&
++         !device->streams[element->Stream].vertex_buffer;
++      if (!element || unbound_psize) {
+          memset(&elements[input], 0, sizeof(elements[input]));
+          elements[input].vertex_buffer_index = D3D9_DEFAULT_VERTEX_INPUT_BUFFER;
+-         elements[input].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
++         if (unbound_psize) {
++            elements[input].src_offset = 4 * sizeof(float);
++            elements[input].src_format = PIPE_FORMAT_R32_FLOAT;
++         } else {
++            elements[input].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
++         }
+          *uses_default_input = true;
+          count = input + 1;
+          continue;
+       }
+ 
+-      if (element->Stream >= ARRAYSIZE(device->streams) ||
+-          element->Method != D3DDECLMETHOD_DEFAULT)
+-         return 0;
+-
+       const enum pipe_format format = D3D9DeclTypeToPipeFormat(element->Type);
+       if (format == PIPE_FORMAT_NONE)
+@@ -1736,7 +1746,7 @@
+    state.fill_front = PIPE_POLYGON_MODE_FILL;
+    state.fill_back = PIPE_POLYGON_MODE_FILL;
+    state.line_width = 1.0f;
+-   state.point_size = D3D9PointSize(device);
++   state.point_size = MAX2(D3D9PointSize(device), 1.0f);
+    state.point_quad_rasterization = !point_position_gs &&
+       (state.point_size > 1.0f ||
+        device->render_states[D3DRS_POINTSPRITEENABLE]);
+@@ -1751,7 +1761,7 @@
+    float point_size =
+       D3D9RenderStateFloat(device->render_states[D3DRS_POINTSIZE]);
+-   if (point_size <= 0.0f)
+-      point_size = 1.0f;
++   if (point_size < 0.0f)
++      point_size = 0.0f;
+ 
+    const float point_min =
+       D3D9RenderStateFloat(device->render_states[D3DRS_POINTSIZE_MIN]);
+@@ -3007,7 +3017,8 @@
+    uint32_t stream_mask = 0;
+    bool uses_default_input = false;
+    const UINT element_count =
+-      D3D9FillTranslatedVsVertexElements(device, translated_vs_shader, elements,
++      D3D9FillTranslatedVsVertexElements(device, translated_vs_shader,
++                                         mode == MESA_PRIM_POINTS, elements,
+                                          ARRAYSIZE(elements), &stream_mask,
+                                          &uses_default_input);
+    if (!element_count || (!stream_mask && !uses_default_input))
+@@ -3025,7 +3036,8 @@
+          return E_INVALIDARG;
+       vbuffer_count = stream + 1;
+    }
+-   static const float default_input[4] = {};
++   /* The zero vector and the scalar fallback for an unbound PSIZE stream. */
++   static const float default_input[] = {0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    if (uses_default_input) {
+       vbuffers[D3D9_DEFAULT_VERTEX_INPUT_BUFFER].is_user_buffer = true;
+       vbuffers[D3D9_DEFAULT_VERTEX_INPUT_BUFFER].buffer.user = default_input;
+@@ -3080,8 +3092,11 @@
+             generated_vs_point_size = true;
+       }
+    }
++   const float point_size = D3D9PointSize(device);
++   if (mode == MESA_PRIM_POINTS && point_size == 0.0f &&
++       !translated_vs_point_size && !generated_vs_point_size)
++      return S_OK;
+    const bool point_position_gs =
+       mode == MESA_PRIM_POINTS &&
+-      (translated_vs_point_size || generated_vs_point_size ||
+-       D3D9PointSize(device) > 1.0f);
++      (translated_vs_point_size || generated_vs_point_size || point_size > 1.0f);
+    if (generate_position_t_ps_input_vs || generate_position_t_diffuse_vs ||
+@@ -3110,7 +3125,6 @@
+    void *dsa = D3D9CreateDepthStencilState(device);
+    void *point_gs = NULL;
+    if (point_position_gs) {
+-      const float point_size = D3D9PointSize(device);
+       const float width = device->viewport.Width ? (float)device->viewport.Width :
+          1.0f;
+       const float height = device->viewport.Height ?

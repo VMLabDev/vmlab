@@ -46,3 +46,4 @@ yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch
 d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch
 d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch
 d3d9-record-coordinate-wrap-render-states.patch
+d3d9-suppress-zero-size-points-and-default-unbound-psize.patch
