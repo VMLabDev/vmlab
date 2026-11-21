@@ -1,0 +1,181 @@
+Subject: [PATCH] d3d9: render W-buffer depth and wireframe fill
+
+Accept both states through the normal render-state store. Select a pixel
+shader variant that derives depth from reciprocal clip W and the runtime
+projection range. Preserve explicit pixel-shader depth outputs.
+
+Pass wireframe through the Gallium and Venus polygon mode path. Keep
+point sprites filled when expanded into triangles by the driver.
+
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D9State.cpp b/src/gallium/frontends/d3d10umd/D3D9State.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9State.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9State.cpp
+@@ -136,11 +136,3 @@
+          return E_INVALIDARG;
+-      if (data->Value == D3DZB_USEW) {
+-         static volatile LONG logged;
+-         D3D9WarnOncef(
+-            &logged,
+-            "unsupported D3D9 W-buffer owner=d3d9-state "
+-            "reason=w-depth-not-implemented action=reject\n");
+-         return E_NOTIMPL;
+-      }
+-      break;
++      break;
+    case D3DDDIRS_SHADEMODE:
+@@ -174,3 +166,3 @@
+          return E_INVALIDARG;
+-      if (data->Value != D3DFILL_SOLID) {
++      if (data->Value == D3DFILL_POINT) {
+          static volatile LONG logged;
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+@@ -530,6 +530,18 @@
+
+-         D3D9StoreFloat(&dst[0], alpha_ref);
+-      }
+-   }
+-}
++         D3D9StoreFloat(&dst[0], alpha_ref);
++      } else if (special == NINE_PS_CONST_W_DEPTH) {
++         float near_w = device->winfo.WNear;
++         float span = device->winfo.WFar - near_w;
++         if (!(span >= FLT_MIN && span <= FLT_MAX)) {
++            near_w = 0.0f;
++            span = 1.0f;
++         }
++         const D3DDDIARG_ZRANGE range = D3D9RasterDepthRange(device);
++         D3D9StoreFloat(&dst[0], near_w);
++         D3D9StoreFloat(&dst[1], 1.0f / span);
++         D3D9StoreFloat(&dst[2], range.MaxZ - range.MinZ);
++         D3D9StoreFloat(&dst[3], range.MinZ);
++      }
++   }
++}
+
+@@ -633,6 +645,8 @@
+       D3D9TranslatedPsFetch4(device, ps->translated_ps_sampler_mask, &fetch4,
+-                             &fetch4_ati1, &fetch4_projected_fallback);
+-      const UINT key = D3D9TranslatedPsFogKey(fog_enable, fog_mode, zfog) |
+-         ((UINT)projected << 4) | D3D9TranslatedPsShadeKey(device) |
+-         (sampler_ps1xtypes << 13);
++                             &fetch4_ati1, &fetch4_projected_fallback);
++      const bool w_depth = D3D9DepthTestActive(device) &&
++         device->render_states[D3DDDIRS_ZENABLE] == D3DZB_USEW;
++      const UINT key = D3D9TranslatedPsFogKey(fog_enable, fog_mode, zfog) |
++         ((UINT)projected << 4) | D3D9TranslatedPsShadeKey(device) |
++         (sampler_ps1xtypes << 13) | (w_depth ? D3D9_PS_KEY_W_DEPTH : 0u);
+       if (ps->translated_ps_key != key ||
+@@ -646,5 +660,5 @@
+           fetch4_projected_fallback) {
+-         HRESULT hr = D3D9TranslatePixelShaderForState(device, ps, fog_enable,
+-                                                       fog_mode, zfog,
+-                                                       projected,
++         HRESULT hr = D3D9TranslatePixelShaderForState(device, ps, fog_enable,
++                                                       fog_mode, zfog, w_depth,
++                                                       projected,
+                                                        sampler_ps1xtypes,
+@@ -1737,5 +1751,7 @@
+    }
+-   state.fill_front = PIPE_POLYGON_MODE_FILL;
+-   state.fill_back = PIPE_POLYGON_MODE_FILL;
+-   state.line_width = 1.0f;
++   const bool wireframe = !point_position_gs &&
++      device->render_states[D3DRS_FILLMODE] == D3DFILL_WIREFRAME;
++   state.fill_front = wireframe ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
++   state.fill_back = state.fill_front;
++   state.line_width = 1.0f;
+    state.point_size = D3D9PointSize(device);
+diff --git a/src/gallium/frontends/d3d10umd/D3D9NineShader.h b/src/gallium/frontends/d3d10umd/D3D9NineShader.h
+--- a/src/gallium/frontends/d3d10umd/D3D9NineShader.h
++++ b/src/gallium/frontends/d3d10umd/D3D9NineShader.h
+@@ -96,3 +96,4 @@
+    (NINE_MAX_CONST_F_PS3 + (NINE_MAX_CONST_I + NINE_MAX_CONST_B / 4))
+-#define NINE_MAX_CONST_PS_SPE 15
++#define NINE_PS_CONST_W_DEPTH 15
++#define NINE_MAX_CONST_PS_SPE 16
+ #define NINE_MAX_CONST_ALL_PS \
+@@ -158,3 +159,4 @@
+    uint8_t num_inputs;
+-   bool position_t;
++   bool w_depth;
++   bool position_t;
+    bool force_position_t;
+diff --git a/src/gallium/frontends/d3d10umd/D3D9NineShader.c b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+--- a/src/gallium/frontends/d3d10umd/D3D9NineShader.c
++++ b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+@@ -4084,4 +4084,25 @@
+         shader_add_ps_alpha_test_stage(tx, ureg_src(tmp_oCol0));
+-        ureg_MOV(tx->ureg, oCol0, ureg_src(tmp_oCol0));
+-    }
++        ureg_MOV(tx->ureg, oCol0, ureg_src(tmp_oCol0));
++
++        /* Explicit pixel-shader depth takes precedence over raster depth. */
++        if (info->w_depth && ureg_dst_is_undef(tx->regs.oDepth)) {
++            struct ureg_program *ureg = tx->ureg;
++            struct ureg_src pos = nine_get_position_input(tx);
++            struct ureg_src range = nine_special_constant_src(tx, NINE_PS_CONST_W_DEPTH);
++            struct ureg_dst w = tx_scratch_scalar(tx);
++            struct ureg_dst depth = ureg_DECL_output_masked(
++                ureg, TGSI_SEMANTIC_POSITION, 0, TGSI_WRITEMASK_Z, 0, 1);
++
++            /* Fragment position contains interpolated 1/W. Recover W,
++             * normalize it to the projection range, then map to the viewport. */
++            ureg_RCP(ureg, w, ureg_scalar(pos, TGSI_SWIZZLE_W));
++            ureg_ADD(ureg, w, tx_src_scalar(w),
++                     ureg_negate(ureg_scalar(range, TGSI_SWIZZLE_X)));
++            ureg_MUL(ureg, ureg_saturate(w), tx_src_scalar(w),
++                     ureg_scalar(range, TGSI_SWIZZLE_Y));
++            ureg_MAD(ureg, depth, tx_src_scalar(w),
++                     ureg_scalar(range, TGSI_SWIZZLE_Z),
++                     ureg_scalar(range, TGSI_SWIZZLE_W));
++        }
++    }
+
+diff --git a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h
+--- a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h
++++ b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h
+@@ -8,3 +8,5 @@
+
+-#include "D3D9Private.h"
++#include "D3D9Private.h"
++
++constexpr UINT D3D9_PS_KEY_W_DEPTH = 1u << 31;
+
+@@ -23,4 +25,5 @@
+                                          UINT fog_mode,
+-                                         bool zfog,
+-                                         uint8_t projected,
++                                         bool zfog,
++                                         bool w_depth,
++                                         uint8_t projected,
+                                          uint32_t sampler_ps1xtypes,
+diff --git a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp
+@@ -119,4 +119,4 @@
+ D3D9TranslatePixelShaderForState(D3D9Device *device, D3D9Object *shader,
+-                                 bool fog_enable, UINT fog_mode, bool zfog,
+-                                 uint8_t projected,
++                                 bool fog_enable, UINT fog_mode, bool zfog,
++                                 bool w_depth, uint8_t projected,
+                                  uint32_t sampler_ps1xtypes,
+@@ -150,3 +150,4 @@
+    info.fog_mode = fog_enable ? (uint8_t)fog_mode : D3DFOG_NONE;
+-   info.zfog = zfog ? 1 : 0;
++   info.zfog = zfog ? 1 : 0;
++   info.w_depth = w_depth;
+    info.projected = projected;
+@@ -179,3 +180,4 @@
+       (info.color_flatshade ? 1u << 12 : 0u) |
+-      (sampler_ps1xtypes << 13);
++      (sampler_ps1xtypes << 13) |
++      (w_depth ? D3D9_PS_KEY_W_DEPTH : 0u);
+    shader->translated_ps_sampler_type_overrides = sampler_type_overrides;
+@@ -207,3 +209,3 @@
+    return D3D9TranslatePixelShaderForState(device, shader, false,
+-                                          D3DFOG_NONE, true, 0, 0, 0, 0, 0,
++                                          D3DFOG_NONE, true, false, 0, 0, 0, 0, 0,
+                                           0, 0);
