@@ -2,8 +2,10 @@
 //! other verb uses to reach the daemons (PRD §3, §12).
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use tokio::process::{Child, Command};
 
 use crate::proto::client::{LabClient, SupClient};
 use crate::proto::{LabRequest, ProtoError, SupRequest};
@@ -45,14 +47,35 @@ pub async fn ensure_supervisor() -> Result<SupClient> {
         }
     }
 
-    spawn_supervisor()?;
+    let mut scoped = match spawn_supervisor(true) {
+        Ok(child) => Some(child),
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            spawn_supervisor(false).context("spawning vmlabd")?;
+            None
+        }
+        Err(err) => return Err(err).context("launching the vmlabd scope"),
+    };
 
-    for _ in 0..100 {
+    let startup_wait = std::time::Duration::from_secs(10);
+    let mut deadline = tokio::time::Instant::now() + startup_wait;
+    while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if let Ok(client) = SupClient::connect(&sock).await
             && client.send(SupRequest::Ping {}).await.is_ok()
         {
             return Ok(client);
+        }
+        if let Some(child) = &mut scoped
+            && let Some(status) = child.try_wait().context("checking the vmlabd scope")?
+        {
+            tracing::debug!(%status, "scoped vmlabd exited before readiness, trying direct spawn");
+            spawn_supervisor(false).context("spawning vmlabd without a systemd scope")?;
+            scoped = None;
+            deadline = tokio::time::Instant::now() + startup_wait;
         }
     }
     bail!(
@@ -78,7 +101,7 @@ async fn wait_supervisor_gone(sock: &std::path::Path) -> bool {
     false
 }
 
-fn spawn_supervisor() -> Result<()> {
+fn spawn_supervisor(scoped: bool) -> Result<Child> {
     // The supervisor + lab daemons live in the `vmlab` binary; resolve that
     // rather than assuming the current executable is it.
     let exe = crate::paths::vmlab_exe()?;
@@ -90,10 +113,7 @@ fn spawn_supervisor() -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let log_err = log.try_clone()?;
-    supervisor_command(&exe, log, log_err)
-        .spawn()
-        .context("spawning vmlabd")?;
-    Ok(())
+    Ok(supervisor_command(&exe, log, log_err, scoped).spawn()?)
 }
 
 /// The supervisor's spawn, minus the binary's own location.
@@ -102,14 +122,34 @@ fn spawn_supervisor() -> Result<()> {
 /// [`crate::supervisor::start_session`], and `setsid` refuses a process-group
 /// leader. Its own session is what lets it — and the lab daemons it spawns,
 /// which inherit that session — outlive the terminal the CLI ran in.
+/// A transient scope also lets the process tree outlive the starter's
+/// cgroup. Scope mode preserves the caller's environment and working directory.
 fn supervisor_command(
     exe: &Path,
     log: std::fs::File,
     log_err: std::fs::File,
-) -> std::process::Command {
-    let mut cmd = std::process::Command::new(exe);
+    scoped: bool,
+) -> Command {
+    let mut cmd = if scoped {
+        let mut cmd = Command::new("systemd-run");
+        cmd.args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--description=vmlab supervisor",
+        ]);
+        // Argument expansion in scope mode arrived with this option in v254.
+        // Ordinary paths also work with older systemd releases.
+        if exe.as_os_str().as_encoded_bytes().contains(&b'$') {
+            cmd.arg("--expand-environment=no");
+        }
+        cmd.arg("--").arg(exe);
+        cmd
+    } else {
+        Command::new(exe)
+    };
     cmd.arg("__supervisord")
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
     cmd
@@ -358,7 +398,7 @@ mod tests {
         let log = std::fs::File::create(dir.path().join("log")).unwrap();
         let log_err = log.try_clone().unwrap();
         let exe = std::env::current_exe().unwrap();
-        let mut cmd = supervisor_command(&exe, log, log_err);
+        let mut cmd = supervisor_command(&exe, log, log_err, false);
         cmd.args([
             "--exact",
             "cli::daemon::tests::session_helper",
@@ -367,7 +407,7 @@ mod tests {
             "--test-threads=1",
         ])
         .env(HELPER_ENV, "1");
-        let status = cmd.status().unwrap();
+        let status = cmd.as_std_mut().status().unwrap();
         assert!(status.success());
         let out = std::fs::read_to_string(dir.path().join("log")).unwrap();
         let line = out
