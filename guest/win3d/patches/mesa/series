@@ -55,4 +55,5 @@ d3d10umd-draw-b8g8r8x8-elements-and-indexed-draws-without-an-index-buffer.patch
 d3d9-interpolate-wrapped-coordinates.patch
 d3d9-map-dynamic-buffers-directly.patch
 d3d9-w-buffer-and-wireframe.patch
+d3d9-blit-yuy2-surfaces.patch
 d3d9-report-yuy2-format-conversion.patch
