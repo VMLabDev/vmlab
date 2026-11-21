@@ -1278,6 +1278,21 @@ impl Session {
         Ok(entries.as_ref().expect("just built").as_slice())
     }
 
+    /// Directory entries the session keeps in memory between requests,
+    /// over every open directory handle.
+    #[cfg(test)]
+    fn held_dirents(&self) -> usize {
+        self.handles
+            .values()
+            .map(|open| match &open.kind {
+                HandleKind::Dir {
+                    entries: Some(entries),
+                } => entries.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
     fn forget_handle(&mut self, inode: u64, handle: u64) {
         if self
             .handles
@@ -2304,6 +2319,66 @@ mod tests {
             vec![b"hello.txt".to_vec(), b"link".to_vec(), b"sub".to_vec()]
         );
         FileSystem::releasedir(&fs, &ctx(), ROOT_ID, 0, handle).unwrap();
+    }
+
+    /// List one directory handle to its end through the cookies, the way
+    /// the guest does: each request resumes at the last entry it took.
+    fn list_all(fs: &PassthroughFs, handle: u64, size: u32) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let mut last = None;
+            FileSystem::readdir(fs, &ctx(), ROOT_ID, handle, size, offset, &mut |d| {
+                names.push(d.name.to_vec());
+                last = Some(d.offset);
+                Ok(d.name.len() + 24)
+            })
+            .unwrap();
+            match last {
+                Some(next) => offset = next,
+                None => return names,
+            }
+        }
+    }
+
+    #[test]
+    fn directory_caches_are_bounded_across_handles() {
+        const FILES: usize = 2000;
+        let (dir, fs) = scratch();
+        for n in 0..FILES {
+            std::fs::write(dir.path().join(format!("f{n:04}")), []).unwrap();
+        }
+        // Every handle the share admits, each read one time from the start.
+        let mut handles = Vec::new();
+        for _ in 0..SESSION_LIMIT {
+            let (handle, _) =
+                FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+            let handle = handle.unwrap();
+            let mut served = 0;
+            FileSystem::readdir(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |d| {
+                served += 1;
+                Ok(d.name.len() + 24)
+            })
+            .unwrap();
+            assert!(served > 0);
+            handles.push(handle);
+        }
+        // The budget: what the session holds between requests must not grow
+        // with the number of handles. One listing's worth is the ceiling.
+        let held = fs.inner.lock().held_dirents();
+        assert!(
+            held <= FILES,
+            "{} handles hold {held} directory entries",
+            handles.len()
+        );
+        // A bounded server still lists the whole directory on every handle.
+        for handle in handles {
+            let mut names = list_all(&fs, handle, 4096);
+            names.sort();
+            names.dedup();
+            assert_eq!(names.len(), FILES + 3);
+            FileSystem::releasedir(&fs, &ctx(), ROOT_ID, 0, handle).unwrap();
+        }
     }
 
     #[test]
