@@ -4738,6 +4738,7 @@ mod tests {
         std::fs::write(dir.path().join("big.bin"), [0; 128]).unwrap();
         guest.dir("/src/big.bin");
         guest.file("/src/big.bin/child", "keep this", 1);
+        guest.file("/src/large.tmp", &"x".repeat(128), 1);
         let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
         syncers.start(ws.clone(), sessions.clone(), events).await;
 
@@ -4753,6 +4754,8 @@ mod tests {
             guest.text("/src/big.bin/child").as_deref(),
             Some("keep this")
         );
+        assert!(guest.get("/src/large.tmp").is_some());
+        assert!(!dir.path().join("large.tmp").exists());
         syncers.stop("dev01").await;
         let events = events_of(state.path());
         assert!(
@@ -4760,11 +4763,11 @@ mod tests {
                 name == "workspace.skipped" && data["path"] == "monitor.sock"
             })
         );
-        assert!(
-            events
-                .iter()
-                .any(|(name, data)| { name == "workspace.refused" && data["path"] == "big.bin" })
-        );
+        for path in ["big.bin", "large.tmp"] {
+            assert!(events.iter().any(|(name, data)| {
+                name == "workspace.refused" && data["path"] == path
+            }));
+        }
     }
 
     #[cfg(unix)]

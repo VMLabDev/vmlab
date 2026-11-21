@@ -96,6 +96,19 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
         }
         let host = inputs.host.get(path);
         let guest = inputs.guest.get(path);
+        // Apply requires a verified digest to remove or overwrite a guest
+        // file. An oversize guest file was deliberately left unhashed.
+        if let Some(guest) = guest.filter(|guest| guest.oversize)
+            && !host.is_some_and(|host| host.oversize)
+        {
+            plan.oversize.push(Oversize {
+                path: path.clone(),
+                direction: Direction::ToHost,
+                size: guest.size,
+                cap: inputs.max_file_bytes,
+            });
+            continue;
+        }
         match (host, guest) {
             // Host truth does not hold it, so the guest must not either: this
             // is the guest-side work the snapshot captured and the restore is
@@ -209,10 +222,7 @@ impl Reconverged {
     /// Skips and size refusals are warnings. Collisions and failed actions
     /// keep the re-seed barrier in place.
     pub fn complete(&self) -> bool {
-        self.oversize.is_empty()
-            && self.collisions.is_empty()
-            && self.skipped.is_empty()
-            && self.failures.is_empty()
+        self.collisions.is_empty() && self.failures.is_empty()
     }
 
     /// The one line the event feed and `dev sync status` both carry.
