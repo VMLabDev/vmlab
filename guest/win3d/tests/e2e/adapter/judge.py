@@ -254,6 +254,34 @@ else:
         '; '.join(f'{v[0]} {v[1].strip()}' for v in verdicts) + ('' if len(verdicts) == 2 else '; one probe gave no verdict'),
         'd2d-tir.txt, ../tir/tir-x64.json, ../tir/tir-x86.json, ../tir/driver-log.txt')
 
+# P10: three draws the driver once dropped (card #328), each followed by a use of the device.
+what = 'a B8G8R8X8 vertex colour and an indexed draw without an index buffer draw, and the device stays usable'
+d = probe('draws', 'P10', what)
+if d is not None:
+    cases = d.get('cases') or []
+    bad = []
+    for c in cases:
+        if c.get('pass'):
+            continue
+        if c.get('failed'):
+            why = f"{c['failed']} {c.get('hr')}"
+        elif not c.get('device_usable'):
+            why = f"the device is not usable afterwards, removed reason {c.get('removed_reason')}"
+        elif 'first_vertex_only' in c:
+            why = f"points drawn {c.get('points_drawn')}, {c.get('other_pixels')} other pixels"
+        else:
+            why = f"read {c.get('pixel')}, expected {c.get('expected_rgb')}"
+        bad.append(f"{c.get('case')} ({why})")
+    if d.get('result') != 'ok' or not cases:
+        row('draws', 'P10', what, 'fail', '; '.join(d.get('errors') or ['the probe made no draw']), 'draws.json')
+    elif bad:
+        row('draws', 'P10', what, 'fail', f"{len(cases) - len(bad)} of {len(cases)} cases pass; wrong: {'; '.join(bad)}",
+            'draws.json')
+    else:
+        row('draws', 'P10', what, 'pass',
+            f"{len(cases)} cases, each on a device of its own: the draw is on the target, an ordinary draw after it "
+            f"too, and GetDeviceRemovedReason answers S_OK", 'draws.json')
+
 # P10 and P8: the two pages, in Chrome and in Edge.
 for browser in ('chrome', 'edge'):
     label = 'Chrome' if browser == 'chrome' else 'Edge'

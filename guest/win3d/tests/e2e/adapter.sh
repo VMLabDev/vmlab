@@ -19,6 +19,7 @@
 #   shared-texture P7      a shared render target of the duplication surface's shape still works
 #   d2d           P10      the Direct2D coverage probe
 #   d2d-tir       P10      what Direct2D draws to antialias, against WARP (tests/e2e/tir.sh)
+#   draws         P10      three draws the driver once dropped leave the device usable
 #   svb-chrome    P10      the static vertex buffer page in Chrome
 #   venc-chrome   P8       venc.html in Chrome: the GPU process survives
 #   svb-edge, venc-edge    the same two pages in the guest's own Edge
@@ -48,7 +49,7 @@ mkdir -p "$3/adapter"
 EV=$(cd "$3/adapter" && pwd)   # absolute: the vmlab commands run from the lab directory
 [ -n "$EV" ] && [ -d "$EV" ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 shift 3
-ALL="pointer pointer-shapes pace tear-flip tear-blt duplication shared-texture d2d d2d-tir svb-chrome venc-chrome svb-edge venc-edge chromium wine"
+ALL="pointer pointer-shapes pace tear-flip tear-blt duplication shared-texture d2d d2d-tir draws svb-chrome venc-chrome svb-edge venc-edge chromium wine"
 CHECKS=${*:-${ADAPTER_CHECKS:-$ALL}}
 CACHE=$REPO/.scratch/e2e/cache
 STAGE=$REPO/.scratch/e2e/adapter/$(basename "$(dirname "$EV")")   # per evidence dir, so parallel runs do not share files
@@ -207,6 +208,11 @@ check_duplication() {
 check_shared_texture() {
     note "shared-texture"
     probe shared-texture 10 share_probe.exe && ran shared-texture || skip shared-texture "the shared-texture probe wrote no result"
+}
+
+check_draws() {
+    note "draws"
+    probe draws 10 draws_probe.exe && ran draws || skip draws "the draws probe wrote no result"
 }
 
 check_d2d() {
@@ -386,6 +392,7 @@ else
             shared-texture) check_shared_texture ;;
             d2d) check_d2d ;;
             d2d-tir) check_d2d_tir ;;
+            draws) check_draws ;;
             svb-chrome) check_page svb-chrome chrome svb.html 25 ;;
             venc-chrome) check_page venc-chrome chrome venc.html 45 D3D12VideoEncodeAccelerator,D3D12VideoDecoder ;;
             svb-edge) check_page svb-edge edge svb.html 25 ;;
