@@ -163,8 +163,12 @@ def build_images(h, lab: pathlib.Path) -> None:
     """`cd.iso` and `fd.img` for the `cdrom`/`floppy` attachments, built from
     `cd/` so no binary image is checked in."""
     h.run(["xorriso", "-as", "mkisofs", "-V", "E2ECDROM", "-o", str(lab / "cd.iso"), str(lab / "cd")])
-    h.run(["mkfs.fat", "-C", "-n", "E2EFD", str(lab / "fd.img"), "1440"])
-    h.run(["mcopy", "-i", str(lab / "fd.img"), str(lab / "cd" / "cdrom.txt"), "::/FD.TXT"])
+    build_floppy(h, lab / "fd.img", lab / "cd" / "cdrom.txt")
+
+
+def build_floppy(h, image, payload):
+    h.run(["mkfs.fat", "-C", "-n", "E2EFD", str(image), "1440"])
+    h.run(["mcopy", "-i", str(image), str(payload), "::/FD.TXT"])
 
 
 PROBE_VM01 = r"""

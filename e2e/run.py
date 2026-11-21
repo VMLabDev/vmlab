@@ -98,7 +98,7 @@ def main() -> int:
     ap.add_argument("--hypervisor", choices=["qemu", "vmlab"], default="vmlab",
                     help="the hypervisor the suite's machines run on (default vmlab)")
     ap.add_argument("--vmlab-phase", choices=PHASE_ORDER[1:], default=VMLAB_DELIVERED,
-                    help=f"the last vmlab-hv phase delivered (default {VMLAB_DELIVERED})")
+                    help=f"vmlab-hv phase cutoff (default {VMLAB_DELIVERED}; phase 3 only with 3)")
     args = ap.parse_args()
 
     if args.list:

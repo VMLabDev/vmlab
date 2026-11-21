@@ -177,24 +177,25 @@ def exercise_server2016(h, lab):
 
 
 def run(h):
-    try:
-        for _, _, relative in GUESTS:
+    def template_ready(feature, relative):
+        try:
             stage_template(h, relative)
-    except ScenarioFailed as error:
-        for _, feature, _ in GUESTS:
-            h.skip(feature, str(error))
-    else:
-        with h.lab("legacy") as lab:
-            for machine, feature, _ in GUESTS:
+        except ScenarioFailed as error:
+            if h.hypervisor == "vmlab":
+                h.ok(feature, False, str(error))
+            else:
+                h.skip(feature, str(error))
+            return False
+        return True
+
+    with h.lab("legacy") as lab:
+        for machine, feature, relative in GUESTS:
+            if template_ready(feature, relative):
                 h.check(feature, lambda m=machine: exercise(h, lab, m),
                         "agent readiness, the usual screen by OCR, PNG capture, exec, disk write/read and stop")
 
     feature = "vm.legacy.server2016"
-    try:
-        stage_template(h, "x86_64/windows-server-2016/14393.0.0")
-    except ScenarioFailed as error:
-        h.skip(feature, str(error))
-    else:
+    if template_ready(feature, "x86_64/windows-server-2016/14393.0.0"):
         with h.lab("server2016") as lab:
             h.check(feature, lambda: exercise_server2016(h, lab),
                     "cmd /c ver after agent readiness and online restore")

@@ -706,6 +706,7 @@ What the baseline says:
   `stateblock`, and 343 (AMD1) or 345 (Nvidia2) of about 206,000 checks in
   `visual`. No failure was looked into here. The failed lines of each
   program are in the evidence.
+  B10 says which calls removed the device, and the fix.
 - B6. Wine's d3d9 `device` program ends the hypervisor, on both GPUs, 13 to
   26 s in: vmlab-hv exits with "Too many open files" after a run of `GPU
   dma-buf import failed: 0x3003` lines for 800x600 scanouts. vmlab-hv writes the digit 4 in its log messages as
@@ -746,6 +747,41 @@ What the baseline says:
   limit 57.0, the loaded-host case of B4 (a run of the AMD1 suite at commit
   `f8b02e71` an hour before had 56.52). The other failures are the
   baseline's, `wine-d3d9_device` again ending the VM as B6 says.
+- B10. The device removal of B5 (GitHub #248). Single-threaded reruns
+  (`WINETEST_NO_MT_D3D=1`) with `C:\ProgramData\Yttrium\yttrium-errors.log`
+  name each UMD call that set an error the runtime does not allow, which
+  removes the device. The access violation is the test reading through a
+  pointer that a failed call left NULL. `patches/mesa/0097` changes these:
+  - `GetResourceLayout` (WDDM 2.0) set `E_INVALIDARG`. The runtime asks for
+    it for each DEFAULT texture created with CPU access flags
+    (`test_resource_access`, the first `0x887a0005` lines of both programs).
+    It answers an undefined layout now.
+  - The Yttrium vertex input had no Vulkan format for `R11G11B10_FLOAT`,
+    so the draw was dropped and the next draw set `E_FAIL`
+    (`test_vertex_formats`). It is `B10G11R11_UFLOAT_PACK32` now.
+  - A pixel shader that needs more than 32 combined texture slots set
+    `E_FAIL` at its creation (`test_high_resource_count`), and the test then
+    released the NULL shader. It is created as a shader that writes zero
+    ([known-limits.md](known-limits.md#direct3d-10-and-11-at-most-32-texture-and-sampler-pairs-in-one-shader)).
+
+  The runs of 2026-11-21 at commit `022cd405`, each a fresh lab with
+  `tests/e2e/run.sh --template windows-11 --host-gpu <gpu> --keep` and
+  vmlab-hv and vmlab built from `b09d50f0`, the base of that commit (12 of 12 Done checks pass on both GPUs, no
+  Xid): `d3d10core` executes 195908 checks with 0 failures on AMD1
+  (single-threaded) and 195912 with 0 failures on Nvidia2 (the suite's
+  run). `d3d11` reaches its summary on both, 476333 (AMD1) and 476337
+  (Nvidia2) checks with 14 failures, exit code 14, no unhandled exception,
+  and no `0x887a0005` line. On Nvidia2 `d3d10_1`, `d3d10_device` and
+  `d3d10_effect` still pass with 0 failures. The 14 failures: 11 NV12
+  textures `test_nv12` cannot create (`E_OUTOFMEMORY`), the two checks of
+  `test_high_resource_count`, and `B8G8R8X8_UNORM` in `test_vertex_formats`,
+  whose draw is dropped because one input element has no Vulkan vertex
+  format. That dropped draw and one more in `test_index_buffer_offset`
+  (a point-list draw with no index buffer bound, whose indices Yttrium
+  does not have on the CPU) still mark a device as removed in the UMD log,
+  but the tests release those devices without another call that reports
+  it. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
+  also ended the VM after 17 s with the "Too many open files" exit of B6.
 
 <!-- e2e:adapter -->
 ### windows-11
