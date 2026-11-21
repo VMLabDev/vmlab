@@ -924,8 +924,8 @@ cleared the 32 draw errors and their 32 texture readback failures.
 Both Nvidia2 runs skipped 60 assertions in a separate dynamic vertex
 buffer test after Wine's timed triangle estimate exceeded the device's
 primitive limit. That block includes two baseline failed assertions.
-All 17 non-Wine adapter rows passed on both GPUs. The other Wine program
-verdicts matched the baseline.
+All 17 non-Wine adapter rows passed on both GPUs. Each GPU's nine Wine
+programs had four passes and five known failures.
 
 #### Draft cards
 
