@@ -1886,10 +1886,7 @@ impl VmInstance {
                     .await
                     .with_context(|| format!("{} did not stop for restore", self.cfg.name))?;
             }
-            for disk in self.all_disk_paths() {
-                crate::template::qimg::snapshot_apply(&disk, name).await?;
-            }
-            Ok(())
+            restore_offline_disks(&self.all_disk_paths(), name).await
         }
     }
 
@@ -2638,6 +2635,13 @@ fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
 }
 
+async fn restore_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
+    for disk in disks {
+        crate::template::qimg::snapshot_apply(disk, name).await?;
+    }
+    Ok(())
+}
+
 async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
     // Refuse duplicate names before changing any disk, so rollback never
     // removes a snapshot that predates this operation.
@@ -2764,6 +2768,35 @@ impl KeepAwake {
 #[cfg(test)]
 mod tests {
     use super::{clone_source, clone_source_refusal, no_agent_hint};
+
+    #[tokio::test]
+    async fn an_offline_restore_checks_every_disk_first() {
+        use crate::template::qimg;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.qcow2");
+        let second = dir.path().join("second.qcow2");
+        qimg::create_blank(&first, 1 << 20).await.unwrap();
+        qimg::create_blank(&second, 1 << 20).await.unwrap();
+        qimg::snapshot_create(&first, "capture").await.unwrap();
+        super::run_tool(
+            "qemu-io",
+            &["-c".into(), "write -P 0x42 0 512".into(), first.display().to_string()],
+        )
+        .await
+        .unwrap();
+
+        let error = super::restore_offline_disks(&[first.clone(), second.clone()], "capture")
+            .await
+            .unwrap_err();
+        super::run_tool(
+            "qemu-io",
+            &["-c".into(), "read -P 0x42 0 512".into(), first.display().to_string()],
+        )
+        .await
+        .expect("the first disk should retain its post-snapshot data");
+        assert!(format!("{error:#}").contains(second.to_str().unwrap()));
+    }
 
     #[tokio::test]
     async fn offline_capture_rolls_back_an_earlier_disk_when_a_later_disk_refuses() {
