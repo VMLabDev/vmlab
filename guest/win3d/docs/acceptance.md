@@ -906,6 +906,17 @@ The standalone `visual` run on AMD1 reported the same 343 failures in
 206,068 checks. The test session used a soft open-file limit of 65,536
 after an earlier attempt exhausted the default limit of 1,024.
 
+The [unbound vertex stream patch](../patches/mesa/d3d9-default-inputs-for-unbound-streams.patch)
+uses the existing zero input when a vertex declaration names a stream
+with no bound source. Wine's `visual` ran 206,068 checks with 31 skips on
+each GPU on Windows 11 template `26100.1742.11#win3d`. Failures fell from
+343 to 303 on AMD1 and from 345 to 305 on Nvidia2. All 14 fixed-function
+draw and color readback failures at lines 25308 and 25313 and all 12
+missing attribute draw and readback failures at lines 27740 and 27745
+cleared on both GPUs. The 14 size-one point failures at lines 11460
+and 11498 also cleared. No new assertions failed. The Win3D end-to-end
+run on the prepared AMD1 clone passed all 12 Done checks.
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -928,8 +939,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
 | Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
-| Draw with the tested fixed-function vertex color declarations | `visual`, 14 / 14 | Lines 25308 and 25313, tests 13–19. Fix the draw errors and check diffuse and specular color readback. |
-| Supply default vertex attribute components | `visual`, 12 / 12 | Lines 27740 and 27745. Vertex shader cases 2 and 5 fail the draw and leave a red pixel in all three pixel shader cases. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
