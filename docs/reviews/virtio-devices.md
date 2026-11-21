@@ -91,6 +91,13 @@ Not read:
   and `fs.read` return the old content and that the created entry has a node
   id other than X. Today the read returns `new` and the id is X.
 - Confidence: high.
+- Fixed in card #391. `rename` moves the inode, and every known inode below
+  it, to the new path in `by_path`, and gives the moved inode its new parent
+  descriptor and name. A replaced destination loses the name, and
+  `RENAME_EXCHANGE` swaps both subtrees. The proposed test failed before the
+  fix (the create returned X) and passes after it. Not fixed here: `unlink`
+  and `rmdir` still leave the removed name in `by_path`, and the inode a
+  rename replaced keeps its old `path` for the snapshot.
 
 ### F2. virtio-fs: after a restore, a handle whose file is gone accepts writes and reports success
 

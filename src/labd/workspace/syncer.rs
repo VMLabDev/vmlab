@@ -543,26 +543,14 @@ impl WorkspaceSyncers {
                 ledger.reseed_owed,
             ));
         };
-        let report = match syncer.pass_now().await {
-            Ok(report) => report,
-            // The flush did not come back at all. That is the strongest reason
-            // of the lot to refuse — not knowing what the guest holds is worse
-            // than knowing it is behind — so it becomes the report's own
-            // `trouble` rather than a second error path with its own words.
-            Err(e) => Report {
-                trouble: Some(format!("{e:#}")),
-                ..syncer.report()
-            },
-        };
+        let report = snapshot_preflight(&syncer).await;
         refuse(super::bracket::Outstanding::of(machine, &report))
     }
 
-    /// What a **restore** has to be asked twice about (§19.6).
-    ///
-    /// A halt is the one state where restoring destroys something a developer
-    /// was about to be asked about, so it refuses — but only until the flag is
-    /// given, because wanting to throw the guest copy away is frequently why
-    /// someone restores.
+    /// Flush a running workspace before **restore** (§19.6). Refuse if the
+    /// flush leaves work outstanding or cannot establish what the guest holds.
+    /// An explicit discard skips the flush so pending guest changes can be
+    /// thrown away.
     ///
     /// It reaches a machine that is **down** through the same `declared`
     /// workspace, because a restore does not need a running machine and the
@@ -578,7 +566,16 @@ impl WorkspaceSyncers {
             return Ok(());
         }
         match self.get(machine).await {
-            Some(syncer) => refuse(super::bracket::halted(machine, &syncer.report())),
+            Some(syncer) => {
+                let report = snapshot_preflight(&syncer).await;
+                if let Some(halt) = super::bracket::halted(machine, &report) {
+                    return refuse(Some(halt));
+                }
+                refuse(
+                    super::bracket::Outstanding::of(machine, &report)
+                        .map(super::bracket::RestoreOutstanding),
+                )
+            }
             // A restore is not refused for owing a re-seed: it is about to
             // ask for another one, and the second answers the first.
             None => refuse(super::bracket::halted_when_stopped(
@@ -731,6 +728,17 @@ fn refuse(said: Option<impl std::fmt::Display>) -> Result<()> {
     match said {
         Some(said) => Err(anyhow::anyhow!("{said}")),
         None => Ok(()),
+    }
+}
+
+/// Treat a flush that fails to return as uncertainty about the guest tree.
+async fn snapshot_preflight(syncer: &Syncer) -> Report {
+    match syncer.pass_now().await {
+        Ok(report) => report,
+        Err(e) => Report {
+            trouble: Some(format!("{e:#}")),
+            ..syncer.report()
+        },
     }
 }
 
@@ -4894,6 +4902,49 @@ mod tests {
         let said = format!("{refused:#}");
         assert!(said.contains("no flag for this"), "{said}");
         assert!(said.contains(super::super::bracket::NOT_A_BACKUP), "{said}");
+        syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn a_restore_flushes_first_and_refuses_on_unsynced_guest_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "seed").unwrap();
+        let (syncers, guest, sessions) = seeded_lab_settling(
+            dir.path(),
+            state.path(),
+            "/src/main.rs",
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+        syncers.before_capture("dev01", None).await.unwrap();
+
+        guest.file("/src/main.rs", "typed just now", 900);
+        sessions.watcher.mark("main.rs");
+        syncers.before_restore("dev01", false, None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "typed just now",
+            "restore did not flush the guest's work",
+        );
+
+        sessions.watcher.mute();
+        guest.file("/src/late.txt", "written in the guest", 901);
+        sessions.watcher.mark("late.txt");
+        let refused = syncers
+            .before_restore("dev01", false, None)
+            .await
+            .expect_err("restore must refuse while the guest's watch does not answer");
+        let said = format!("{refused:#}");
+        assert!(said.contains("watch did not answer"), "{said}");
+        assert!(said.contains(super::super::bracket::DISCARD_FLAG), "{said}");
+        assert!(said.contains(super::super::bracket::NOT_A_BACKUP), "{said}");
+        assert_eq!(
+            guest.text("/src/late.txt").as_deref(),
+            Some("written in the guest"),
+        );
+        assert!(!dir.path().join("late.txt").exists());
+        syncers.before_restore("dev01", true, None).await.unwrap();
         syncers.stop("dev01").await;
     }
 

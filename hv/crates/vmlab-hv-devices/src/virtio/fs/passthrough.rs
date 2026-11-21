@@ -76,10 +76,10 @@ struct Session {
 }
 
 /// One guest-known file. `fd` is an `O_PATH` handle on the inode; `path` is
-/// its location under the root at lookup time (the snapshot form). The
-/// parent's `O_PATH` descriptor and the own name serve the `*at` syscalls,
-/// which `O_PATH` descriptors alone cannot express (fchmod, readlink,
-/// truncate...).
+/// its location under the root at lookup time, moved along by every guest
+/// rename (the snapshot form). The parent's `O_PATH` descriptor and the own
+/// name serve the `*at` syscalls, which `O_PATH` descriptors alone cannot
+/// express (fchmod, readlink, truncate...).
 struct Inode {
     fd: OwnedFd,
     parent: OwnedFd,
@@ -626,19 +626,44 @@ impl FileSystem for PassthroughFs {
         flags: u32,
     ) -> io::Result<()> {
         self.refuse_writes()?;
-        let session = self.inner.lock();
+        let mut session = self.inner.lock();
         let parent = live_inode(&session, parent)?;
         let newparent = live_inode(&session, newparent)?;
         if parent.kind != FileKind::Dir || newparent.kind != FileKind::Dir {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
-        renameat2(
-            &parent.fd,
-            checked_name(name)?,
-            &newparent.fd,
-            checked_name(newname)?,
-            flags,
-        )
+        let name = checked_name(name)?;
+        let newname = checked_name(newname)?;
+        let from = parent.path.join(OsStr::from_bytes(name));
+        let to = newparent.path.join(OsStr::from_bytes(newname));
+        // Cloned before the rename: once the host has moved the file, the
+        // session must be able to follow it without a step that can fail.
+        let dir = parent.fd.try_clone()?;
+        let newdir = newparent.fd.try_clone()?;
+        // rename(2) does nothing, and succeeds, when both names are links
+        // of one file. Then neither name moved.
+        let same_file = flags & libc::RENAME_EXCHANGE == 0
+            && matches!(
+                (host_identity(&dir, name), host_identity(&newdir, newname)),
+                (Some(a), Some(b)) if a == b
+            );
+        renameat2(&dir, name, &newdir, newname, flags)?;
+        if from == to || same_file {
+            return Ok(());
+        }
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            let moved = session.take_subtree(&from);
+            let back = session.take_subtree(&to);
+            session.place_subtree(moved, &to, newdir, newname);
+            session.place_subtree(back, &from, dir, name);
+        } else {
+            // Whatever the destination name held is replaced: its inodes
+            // stay with the guest until FORGET, but no longer own the name.
+            session.take_subtree(&to);
+            let moved = session.take_subtree(&from);
+            session.place_subtree(moved, &to, newdir, newname);
+        }
+        Ok(())
     }
 
     fn link(
@@ -984,6 +1009,64 @@ impl Session {
             && self.by_path.get(&state.path) == Some(&inode)
         {
             self.by_path.remove(&state.path);
+        }
+    }
+
+    /// Take the inode at `root` and every inode below it out of `by_path`,
+    /// each with its path relative to `root`. The inodes themselves stay.
+    fn take_subtree(&mut self, root: &Path) -> Vec<(PathBuf, u64)> {
+        let paths: Vec<PathBuf> = self
+            .by_path
+            .keys()
+            .filter(|path| path.starts_with(root))
+            .cloned()
+            .collect();
+        paths
+            .into_iter()
+            .map(|path| {
+                let ino = self.by_path.remove(&path).expect("key just listed");
+                let below = path.strip_prefix(root).expect("filtered on the prefix");
+                (below.to_path_buf(), ino)
+            })
+            .collect()
+    }
+
+    /// Record a subtree from [`Self::take_subtree`] at `root`, the name
+    /// `name` under the directory `parent`: a rename moved it there. Only
+    /// the subtree's own top changes parent and name; everything below
+    /// keeps both and changes path.
+    fn place_subtree(
+        &mut self,
+        subtree: Vec<(PathBuf, u64)>,
+        root: &Path,
+        parent: OwnedFd,
+        name: &[u8],
+    ) {
+        let mut parent = Some(parent);
+        for (below, ino) in &subtree {
+            let top = below.as_os_str().is_empty();
+            let path = if top {
+                root.to_path_buf()
+            } else {
+                root.join(below)
+            };
+            if let Some(state) = self.inodes.get_mut(ino) {
+                if top && let Some(parent) = parent.take() {
+                    state.parent = parent;
+                    state.name = name.to_vec();
+                }
+                state.path = path.clone();
+            }
+            self.by_path.insert(path, *ino);
+        }
+        // An open handle records its path for the snapshot.
+        for open in self.handles.values_mut() {
+            if let HandleKind::File { path, .. } = &mut open.kind
+                && subtree.iter().any(|(_, ino)| *ino == open.ino)
+                && let Some(state) = self.inodes.get(&open.ino)
+            {
+                path.clone_from(&state.path);
+            }
         }
     }
 
@@ -1368,6 +1451,14 @@ fn unlinkat(dir: &OwnedFd, name: &[u8], directory: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Which host file `name` in `dir` is, as (device, inode); `None` when it
+/// cannot be told.
+fn host_identity(dir: &OwnedFd, name: &[u8]) -> Option<(u64, u64)> {
+    let fd = openat(dir, name, libc::O_PATH | libc::O_NOFOLLOW).ok()?;
+    let st = fstat(fd.as_raw_fd()).ok()?;
+    Some((st.st_dev, st.st_ino))
 }
 
 fn renameat2(
@@ -2427,5 +2518,182 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    /// Read the whole of inode `ino` through a fresh read-only handle.
+    fn read_all(fs: &PassthroughFs, ino: u64) -> Vec<u8> {
+        let (handle, _, _) = FileSystem::open(fs, &ctx(), ino, libc::O_RDONLY as u32, 0).unwrap();
+        let mut served = Vec::new();
+        let mut writer = SinkWriter(&mut served);
+        let n = FileSystem::read(
+            fs,
+            &ctx(),
+            ino,
+            handle.unwrap(),
+            &mut writer,
+            64,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        served.truncate(n);
+        served
+    }
+
+    fn create_in() -> CreateIn {
+        CreateIn {
+            flags: libc::O_RDWR as u32,
+            mode: 0o644,
+            fuse_flags: 0,
+            umask: 0o022,
+        }
+    }
+
+    #[test]
+    fn rename_then_create_at_old_name_keeps_the_renamed_inode() {
+        let (dir, fs) = scratch();
+        let moved = lookup(&fs, b"hello.txt").unwrap().inode;
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"hello.txt"),
+            ROOT_ID,
+            &name(b"moved"),
+            0,
+        )
+        .unwrap();
+
+        let (created, _, _, _) =
+            FileSystem::create(&fs, &ctx(), ROOT_ID, &name(b"hello.txt"), create_in()).unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"new").unwrap();
+
+        // Two files, two node ids: the one the guest held follows the file
+        // to its new name, and the old name is a new inode.
+        assert_ne!(created.inode, moved);
+        assert_eq!(read_all(&fs, moved), b"hello share\n");
+        assert_eq!(read_all(&fs, created.inode), b"new");
+        assert_eq!(lookup(&fs, b"moved").unwrap().inode, moved);
+        assert_eq!(lookup(&fs, b"hello.txt").unwrap().inode, created.inode);
+    }
+
+    #[test]
+    fn rename_carries_a_directory_subtree_and_a_symlink() {
+        let (dir, fs) = scratch();
+        let sub = lookup(&fs, b"sub").unwrap().inode;
+        let nested = FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+        let link = lookup(&fs, b"link").unwrap().inode;
+        for (old, new) in [(&b"sub"[..], &b"dir2"[..]), (b"link", b"link2")] {
+            FileSystem::rename(&fs, &ctx(), ROOT_ID, &name(old), ROOT_ID, &name(new), 0).unwrap();
+        }
+
+        // The old names are taken again by other files.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/nested.txt"), b"other\n").unwrap();
+        std::os::unix::fs::symlink("elsewhere", dir.path().join("link")).unwrap();
+        let sub2 = lookup(&fs, b"sub").unwrap().inode;
+        assert_ne!(sub2, sub);
+        let nested2 = FileSystem::lookup(&fs, &ctx(), sub2, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+        assert_ne!(nested2, nested);
+        assert_ne!(lookup(&fs, b"link").unwrap().inode, link);
+
+        assert_eq!(lookup(&fs, b"dir2").unwrap().inode, sub);
+        assert_eq!(
+            FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+                .unwrap()
+                .inode,
+            nested
+        );
+        assert_eq!(read_all(&fs, nested), b"nested\n");
+        assert_eq!(read_all(&fs, nested2), b"other\n");
+        // readlink goes by the parent descriptor and the own name.
+        assert_eq!(
+            FileSystem::readlink(&fs, &ctx(), link).unwrap(),
+            b"hello.txt"
+        );
+
+        // The snapshot form follows the rename too.
+        let state = fs.save_state();
+        let fs2 = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        fs2.restore_state(&state).unwrap();
+        assert_eq!(read_all(&fs2, nested), b"nested\n");
+        assert_eq!(read_all(&fs2, nested2), b"other\n");
+    }
+
+    #[test]
+    fn rename_over_a_known_file_and_exchange_keep_node_ids_with_their_files() {
+        let (dir, fs) = scratch();
+        std::fs::write(dir.path().join("target"), b"target\n").unwrap();
+        let hello = lookup(&fs, b"hello.txt").unwrap().inode;
+        let target = lookup(&fs, b"target").unwrap().inode;
+        let sub = lookup(&fs, b"sub").unwrap().inode;
+        let nested = FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+
+        // Replace: the name now answers with the moved inode, and the
+        // replaced one is left to its FORGET without taking the name along.
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"hello.txt"),
+            ROOT_ID,
+            &name(b"target"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, b"target").unwrap().inode, hello);
+        assert_eq!(read_all(&fs, hello), b"hello share\n");
+        FileSystem::forget(&fs, &ctx(), target, 1);
+        assert_eq!(lookup(&fs, b"target").unwrap().inode, hello);
+
+        // Exchange a file with a directory: both subtrees swap.
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"target"),
+            ROOT_ID,
+            &name(b"sub"),
+            libc::RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, b"sub").unwrap().inode, hello);
+        assert_eq!(lookup(&fs, b"target").unwrap().inode, sub);
+        assert_eq!(
+            FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+                .unwrap()
+                .inode,
+            nested
+        );
+        assert_eq!(read_all(&fs, hello), b"hello share\n");
+    }
+
+    #[test]
+    fn rename_between_two_links_of_one_file_moves_nothing() {
+        let (dir, fs) = scratch();
+        std::fs::hard_link(dir.path().join("hello.txt"), dir.path().join("twin")).unwrap();
+        let hello = lookup(&fs, b"hello.txt").unwrap().inode;
+        let twin = lookup(&fs, b"twin").unwrap().inode;
+        // rename(2) does nothing when both names are one file.
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"hello.txt"),
+            ROOT_ID,
+            &name(b"twin"),
+            0,
+        )
+        .unwrap();
+        assert!(dir.path().join("hello.txt").exists());
+        assert_eq!(lookup(&fs, b"hello.txt").unwrap().inode, hello);
+        assert_eq!(lookup(&fs, b"twin").unwrap().inode, twin);
     }
 }
