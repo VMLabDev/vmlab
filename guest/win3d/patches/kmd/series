@@ -11,3 +11,4 @@ kmd-host-present-copy.patch
 kmd-host-gpu-lost.patch
 kmd-host-vblank.patch
 kmd-host-scan-line.patch
+kmd-allow-180-degree-display-rotation.patch
