@@ -198,6 +198,11 @@ where
     T: Send + 'static,
     F: FnOnce(&'static dyn ImageTool) -> Result<T> + Send + 'static,
 {
+    #[cfg(test)]
+    if let Some((entered, resume)) = testing::pause_for(op) {
+        let _ = entered.send(());
+        let _ = resume.await;
+    }
     let tool = tool();
     tokio::task::spawn_blocking(move || f(tool))
         .await
@@ -524,12 +529,34 @@ impl ImageTool for VmlabDisk {
 /// Run vmlab's own tests against either tool (the D15 parity measure).
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use tokio::sync::oneshot;
 
     use super::Backend;
 
+    type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
     thread_local! {
         static OVERRIDE: Cell<Option<Backend>> = const { Cell::new(None) };
+        static PAUSE: RefCell<Option<(&'static str, Pause)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn pause_next(op: &'static str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, wait) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        PAUSE.with(|pause| pause.replace(Some((op, (entered, resume)))));
+        (wait, release)
+    }
+
+    pub(super) fn pause_for(op: &str) -> Option<Pause> {
+        PAUSE.with(|pause| {
+            let mut pause = pause.borrow_mut();
+            if pause.as_ref().is_some_and(|(wanted, _)| *wanted == op) {
+                pause.take().map(|(_, channels)| channels)
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn current() -> Option<Backend> {

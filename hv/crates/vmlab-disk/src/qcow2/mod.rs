@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ambiguous_snapshot_lookup_prefers_id() {
+    fn legacy_ambiguous_snapshot_lookup_uses_name() {
         let (_dir, mut img) = testsupport::blank(8 << 20);
         img.snapshot_create("x", 0, 0).unwrap();
         img.snapshot_create("y", 0, 0).unwrap();
@@ -1550,27 +1550,32 @@ mod tests {
         img.file
             .write_all_at(b"2", img.snapshots_offset + 65)
             .unwrap();
-        assert_eq!(img.snapshot_apply("2").unwrap().name, "y");
+        assert_eq!(img.snapshot_apply("2").unwrap().name, "2");
         img.snapshot_delete("2").unwrap();
         let entries = img.snapshots().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "1");
-        assert_eq!(entries[0].name, "2");
+        assert_eq!(entries[0].id, "2");
+        assert_eq!(entries[0].name, "y");
     }
 
     #[test]
-    fn snapshot_namespace_rejects_ids_and_skips_numeric_names() {
+    fn snapshot_ids_skip_numeric_names_and_do_not_select_snapshots() {
         let (_dir, mut img) = testsupport::blank(8 << 20);
         img.snapshot_create("2", 0, 0).unwrap();
         img.snapshot_create("second", 0, 0).unwrap();
         let entries = img.snapshots().unwrap();
         assert_eq!(entries[0].id, "1");
         assert_eq!(entries[1].id, "3");
+        img.snapshot_create("1", 0, 0).unwrap();
         assert!(img.snapshot_create("1", 0, 0).is_err());
         assert!(!img.poisoned, "validation must not poison the image");
         assert_eq!(img.snapshot_apply("2").unwrap().name, "2");
-        img.snapshot_delete("3").unwrap();
-        assert_eq!(img.snapshots().unwrap().len(), 1);
+        assert!(matches!(
+            img.snapshot_delete("3"),
+            Err(Error::SnapshotNotFound(_))
+        ));
+        img.snapshot_delete("second").unwrap();
+        assert_eq!(img.snapshots().unwrap().len(), 2);
     }
 
     #[test]
