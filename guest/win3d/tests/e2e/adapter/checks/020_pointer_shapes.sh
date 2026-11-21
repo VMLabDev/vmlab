@@ -2,6 +2,7 @@
 # check-shell-paths: no-errexit the adapter suite records failed checks and continues.
 
 check_pointer_shapes() {
+    [ -n "$EV" ] && [ "$EV" != / ] && [ -d "$EV" ] || return 1
     # The check of the hardware pointer (docs/pointer.md) is a script of its own; it
     # writes <evidence-dir>/pointer/ and its verdict there.
     note "pointer-shapes"

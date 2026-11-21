@@ -2,6 +2,7 @@
 # check-shell-paths: no-errexit the adapter suite records failed checks and continues.
 
 check_chromium() {
+    [ -n "$EV" ] && [ "$EV" != / ] && [ -d "$EV" ] || return 1
     # The check of the native d3d12.dll preload (docs/chromium.md) is a script of its
     # own; it writes <evidence-dir>/chromium/ and its verdict there. It restarts the VM.
     note "chromium"

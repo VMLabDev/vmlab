@@ -2,6 +2,7 @@
 # check-shell-paths: no-errexit the adapter suite records failed checks and continues.
 
 check_d2d_tir() {
+    [ -n "$EV" ] && [ "$EV" != / ] && [ -d "$EV" ] || return 1
     # The check of target-independent rasterization (docs/d2d-coverage.md) is a
     # script of its own; it writes <evidence-dir>/tir/ and its verdict there.
     note "d2d-tir"
