@@ -1136,7 +1136,9 @@ impl Session {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
         match &open.kind {
-            HandleKind::File { file: Some(file), .. } => file
+            HandleKind::File {
+                file: Some(file), ..
+            } => file
                 .try_clone()
                 .map_err(|e| io::Error::new(e.kind(), format!("reopening for I/O: {e}"))),
             HandleKind::File { file: None, .. } => Err(io::Error::from_raw_os_error(libc::ESTALE)),
