@@ -1,0 +1,171 @@
+Subject: [PATCH] d3d9: convert packed YUY2 before RGB blits
+
+Keep plain YUY2 surfaces in CPU storage so they work without native
+packed YUV image support. Convert the source rectangle to a BGRA
+upload, then use the existing Gallium blit for scaling and packing.
+
+--- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
+@@ -11,2 +11,3 @@
+-#include "util/format/u_format.h"
+-#include "util/format_srgb.h"
++#include "util/format/u_format.h"
++#include "util/format/u_format_yuv.h"
++#include "util/format_srgb.h"
+@@ -83,2 +83,3 @@
+-   case D3D9_FMT_G8R8:
+-   case D3DDDIFMT_D16:
++   case D3D9_FMT_G8R8:
++   case D3D9_FMT_YUY2:
++   case D3DDDIFMT_D16:
+@@ -155,3 +155,5 @@
+-D3D9FormatRowPitch(D3DDDIFORMAT format, UINT width)
+-{
+-   if (D3D9FormatIsBlockCompressed(format))
++D3D9FormatRowPitch(D3DDDIFORMAT format, UINT width)
++{
++   if (format == D3D9_FMT_YUY2)
++      return DIV_ROUND_UP(width, 2u) * 4u;
++   if (D3D9FormatIsBlockCompressed(format))
+@@ -1454,13 +1454,16 @@
+-   const enum pipe_format src_format =
+-      D3D9FormatToPipe(src_resource->format);
+-   const UINT bpp = D3D9FormatBytesPerPixel(src_resource->format);
+-   const enum pipe_format dst_format =
+-      dst_resource->pipe_resource->format;
+-   if (src_format == PIPE_FORMAT_NONE || !bpp ||
+-       D3D9FormatIsBlockCompressed(src_resource->format) ||
+-       src_resource->format != dst_resource->format ||
+-       src_format != dst_format ||
+-       util_format_is_depth_or_stencil(src_format) ||
+-       util_format_is_depth_or_stencil(dst_format) ||
+-       dst_resource->pipe_resource->nr_samples > 1)
+-      return false;
++   const bool yuy2 = src_resource->format == D3D9_FMT_YUY2;
++   const enum pipe_format src_format = yuy2 ? PIPE_FORMAT_B8G8R8A8_UNORM :
++      D3D9FormatToPipe(src_resource->format);
++   const UINT bpp = D3D9FormatBytesPerPixel(src_resource->format);
++   const enum pipe_format dst_format =
++      dst_resource->pipe_resource->format;
++   if (src_format == PIPE_FORMAT_NONE || !bpp ||
++       D3D9FormatIsBlockCompressed(src_resource->format) ||
++       (!yuy2 && (src_resource->format != dst_resource->format ||
++                  src_format != dst_format)) ||
++       (yuy2 && util_format_description(dst_format)->colorspace !=
++                 UTIL_FORMAT_COLORSPACE_RGB) ||
++       util_format_is_depth_or_stencil(src_format) ||
++       util_format_is_depth_or_stencil(dst_format) ||
++       dst_resource->pipe_resource->nr_samples > 1)
++      return false;
+@@ -1492,5 +1492,12 @@
+-   struct pipe_resource templ;
+-   memset(&templ, 0, sizeof(templ));
+-   templ.target = PIPE_TEXTURE_2D;
+-   templ.format = src_format;
+-   templ.width0 = src_width;
++   /* A crop can start on either pixel in a Y0 U Y1 V pair. */
++   const size_t pair_end = (size_t)src.right + (src.right & 1);
++   if (yuy2 && (pair_end > pitch / 2 ||
++                (src.right & 1 && src_sub->data_capacity - required < 2) ||
++                width > UINT32_MAX / 4 || height > max_size / (width * 4)))
++      return false;
++
++   struct pipe_resource templ;
++   memset(&templ, 0, sizeof(templ));
++   templ.target = PIPE_TEXTURE_2D;
++   templ.format = src_format;
++   templ.width0 = src_width;
+@@ -1522,9 +1522,32 @@
+-   upload_resource.format = src_resource->format;
+-   upload_resource.mip_levels = 1;
+-   upload_resource.pipe_resource = upload;
+-   const uint8_t *src_data = src_sub->data + data_offset;
+-   if (!D3D9TextureSubdata(device, &upload_resource, 0,
+-                           PIPE_MAP_WRITE |
+-                              PIPE_MAP_DISCARD_WHOLE_RESOURCE,
+-                           &upload_box, src_data, src_sub->pitch,
+-                           src_sub->slice_pitch)) {
++   upload_resource.format = yuy2 ? D3DDDIFMT_A8R8G8B8 : src_resource->format;
++   upload_resource.mip_levels = 1;
++   upload_resource.pipe_resource = upload;
++   const uint8_t *src_data = src_sub->data + data_offset;
++   unsigned upload_pitch = src_sub->pitch;
++   uint8_t *pixels = NULL;
++   if (yuy2) {
++      upload_pitch = width * 4;
++      pixels = (uint8_t *)malloc(height * upload_pitch);
++      if (!pixels) {
++         pipe_resource_reference(&upload, NULL);
++         return false;
++      }
++      for (LONG y = 0; y < src_height; ++y) {
++         const uint8_t *row = src_sub->data + (size_t)(src.top + y) * pitch;
++         uint8_t *pixel = pixels + (size_t)y * upload_pitch;
++         for (LONG x = src.left; x < src.right; ++x, pixel += 4) {
++            const uint8_t *pair = row + (size_t)(x & ~1) * 2;
++            util_format_yuv_to_rgb_8unorm(pair[(x & 1) * 2], pair[1], pair[3],
++                                         &pixel[2], &pixel[1], &pixel[0]);
++            pixel[3] = 255;
++         }
++      }
++      src_data = pixels;
++   }
++   const bool uploaded =
++      D3D9TextureSubdata(device, &upload_resource, 0,
++                        PIPE_MAP_WRITE | PIPE_MAP_DISCARD_WHOLE_RESOURCE,
++                        &upload_box, src_data, upload_pitch,
++                        yuy2 ? height * upload_pitch : src_sub->slice_pitch);
++   free(pixels);
++   if (!uploaded) {
+@@ -2806,3 +2806,3 @@
+-   /* Plain system-memory surfaces need no Gallium resource or screen. */
+-   const bool cpu_only_plain =
+-      !D3D9PoolNeedsReadback(data->Pool) &&
++   /* Plain system-memory surfaces and packed YUY2 sources use CPU storage. */
++   const bool cpu_only_plain =
++      (!D3D9PoolNeedsReadback(data->Pool) || data->Format == D3D9_FMT_YUY2) &&
+@@ -3394,2 +3394,3 @@
+-      if (!D3D9PoolNeedsReadback(resource->pool)) {
+-         size_t cpu_backing_size = sub->size;
++      if (!D3D9PoolNeedsReadback(resource->pool) ||
++          (resource->format == D3D9_FMT_YUY2 && !resource->pipe_resource)) {
++         size_t cpu_backing_size = sub->size;
+@@ -4165,3 +4165,35 @@
+-   const bool cleared =
+-      D3D9ClearColorPipe(device, data->hResource, data->SubResourceIndex,
+-                         &data->DstRect, data->Color, false, true);
++   D3D9Resource *resource = D3D9CastResource(data->hResource);
++   if (resource && resource->format == D3D9_FMT_YUY2) {
++      D3D9SubResource *sub = D3D9GetSubResource(data->hResource,
++                                               data->SubResourceIndex);
++      if (!sub)
++         return E_INVALIDARG;
++
++      const RECT rect = D3D9ClipRect(sub, &data->DstRect);
++      if (rect.right <= rect.left || rect.bottom <= rect.top)
++         return S_OK;
++      if ((rect.left & 1) || ((rect.right & 1) && rect.right != (LONG)sub->width))
++         return E_INVALIDARG;
++      if (!D3D9EnsureCpuBacking(sub))
++         return E_OUTOFMEMORY;
++
++      /* ColorFill supplies Y, U and V in the R, G and B fields. */
++      const uint8_t y = (data->Color >> 16) & 0xff;
++      const uint8_t u = (data->Color >> 8) & 0xff;
++      const uint8_t v = data->Color & 0xff;
++      for (LONG row = rect.top; row < rect.bottom; ++row) {
++         uint8_t *pair = sub->data + (size_t)row * sub->pitch +
++            (size_t)rect.left * 2;
++         for (LONG x = rect.left; x < rect.right; x += 2, pair += 4) {
++            pair[0] = y;
++            pair[1] = u;
++            pair[2] = y;
++            pair[3] = v;
++         }
++      }
++      return S_OK;
++   }
++
++   const bool cleared =
++      D3D9ClearColorPipe(device, data->hResource, data->SubResourceIndex,
++                         &data->DstRect, data->Color, false, true);
