@@ -53,12 +53,12 @@ const T_DISCARD: u32 = 11;
 /// Legacy barrier flag some older drivers set on IN/OUT; ignored.
 const T_BARRIER: u32 = 0x8000_0000;
 
-// Request completion statuses (VIRTIO 1.2 §5.2.5).
 /// The most one request stages in host memory at a time on the
 /// scatter-gather path. The guest picks the length of a descriptor chain,
 /// and descriptors may alias one region, so that length is no bound.
 const IO_CHUNK: usize = 1 << 20;
 
+// Request completion statuses (VIRTIO 1.2 §5.2.5).
 const S_OK: u8 = 0;
 const S_IOERR: u8 = 1;
 const S_UNSUPP: u8 = 2;
@@ -1705,8 +1705,10 @@ mod tests {
                 for piece in content[4096..4096 + len].chunks(PIECE as usize) {
                     assert!(piece == pattern.as_slice());
                 }
-                assert!(content[..4096].iter().all(|&b| b == 0));
-                assert!(content[4096 + len..].iter().all(|&b| b == 0));
+                // The image outside the request keeps its own pattern.
+                let untouched = |(i, &b): (usize, &u8)| b == (i % 251) as u8;
+                assert!(content[..4096].iter().enumerate().all(untouched));
+                assert!(content.iter().enumerate().skip(4096 + len).all(untouched));
             } else {
                 // The last piece of the image range is what the aliased
                 // region holds at the end.
