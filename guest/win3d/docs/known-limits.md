@@ -75,11 +75,10 @@ loss and a reset callback. The full TDR regression also rejects APPCRASH
 records whose fault module is a `viogpu` DLL.
 
 Recovery requires a conforming virtio reset acknowledgement. Native vmlab-hv
-currently logs renderer-reset errors and still clears device status. Its Venus
-proxy also sends context destruction asynchronously, without an explicit reply
-that proves renderer workers and native GPU operations have stopped. Guest
-memory aliases are removed separately. Successful forced recovery does not,
-by itself, establish that backend quiescence guarantee.
+keeps the device status nonzero until its renderer and every Venus render
+worker of the guest's contexts have stopped, and reports a failed teardown as
+`DEVICE_NEEDS_RESET` ([tdr-recovery.md](tdr-recovery.md), "Backend
+prerequisite").
 
 ## Host
 

@@ -167,16 +167,19 @@ impl Probe for RenderServer {
     }
 }
 
-/// The fields of `/proc/<pid>/stat` the probe needs.
-struct Stat {
+/// The fields of `/proc/<pid>/stat` the probes need.
+pub(super) struct Stat {
     #[cfg_attr(not(test), allow(dead_code))]
     name: String,
     state: char,
-    parent: u32,
+    pub(super) parent: u32,
+    /// The start time, in clock ticks after boot: with the number, it
+    /// names one process. 0 when the line is too short to hold it.
+    pub(super) start: u64,
 }
 
 impl Stat {
-    fn read(proc: &Path, pid: u32) -> Option<Self> {
+    pub(super) fn read(proc: &Path, pid: u32) -> Option<Self> {
         Self::parse(&std::fs::read_to_string(proc.join(pid.to_string()).join("stat")).ok()?)
     }
 
@@ -188,14 +191,17 @@ impl Stat {
         let mut rest = stat.get(close + 1..)?.split_whitespace();
         let state = rest.next()?.chars().next()?;
         let parent = rest.next()?.parse().ok()?;
+        // Field 22 of proc(5); the state and the parent were 3 and 4.
+        let start = rest.nth(17).and_then(|v| v.parse().ok()).unwrap_or(0);
         Some(Self {
             name: stat.get(open + 1..close)?.to_string(),
             state,
             parent,
+            start,
         })
     }
 
-    fn alive(&self) -> bool {
+    pub(super) fn alive(&self) -> bool {
         !matches!(self.state, 'Z' | 'X' | 'x')
     }
 }
@@ -225,6 +231,9 @@ mod tests {
         assert_eq!(stat.state, 'S');
         assert_eq!(stat.parent, 7);
         assert!(stat.alive());
+        assert_eq!(stat.start, 0);
+        let full = Stat::parse("42 (x) S 7 42 42 0 -1 0 1 2 3 4 5 6 7 8 20 0 1 0 9876 5").unwrap();
+        assert_eq!(full.start, 9876);
         assert!(!Stat::parse("42 (x) Z 7").unwrap().alive());
         assert!(Stat::parse("42 (x)").is_none());
     }
