@@ -3516,7 +3516,8 @@ mod tests {
         assert!(reported, "the walk must report the unreadable directory");
         syncers.stop("dev01").await;
         assert_eq!(
-            std::fs::read_to_string(&source).expect("the host file must survive the failed listing"),
+            std::fs::read_to_string(&source)
+                .expect("the host file must survive the failed listing"),
             "a"
         );
         assert_eq!(guest.text("/src/lib/nested/a.rs").as_deref(), Some("a"));
