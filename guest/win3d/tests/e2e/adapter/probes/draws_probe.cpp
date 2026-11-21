@@ -1,7 +1,7 @@
 // P10, a draw the driver once dropped leaves the device usable.
 //
 // Wine's d3d11 test makes three draws that the driver dropped, and it marked
-// the device as removed at the next draw (card #328, docs/acceptance.md B12).
+// the device as removed at the next draw (card #328, docs/acceptance/C328.md).
 // The test releases those devices without another call, so its rows did not
 // show it. This probe makes each draw on a device of its own and then uses
 // the device:

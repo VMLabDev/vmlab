@@ -610,7 +610,7 @@ Every check prints `pass`, `fail` or `not-run`. `not-run` means that nothing
 was measured, and the note says why: the check was not selected, its program
 did not start, or what it needs was missing (no WebGL on the adapter, a
 download that failed, a guest that stopped answering). The probes only
-measure. The limits are in `tests/e2e/adapter/judge.py`, which writes
+measure. The limits are in `tests/e2e/adapter/checks/`. The judge writes
 `adapter/adapter.json` and `adapter/adapter.txt` in the evidence directory,
 next to each probe's JSON.
 
@@ -781,77 +781,10 @@ What the baseline says:
   (a point-list draw with no index buffer bound, whose indices Yttrium
   does not have on the CPU) still mark a device as removed in the UMD log,
   but the tests release those devices without another call that reports
-  it. B12 has the cause of both, and the fix. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
+  it. [Note C328](acceptance/C328.md) has the cause of both, and the fix. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
   also ended the VM after 17 s with the "Too many open files" exit of B6.
-- B11. `present-rate` on Nvidia2 needs the bundle's render server (card
-  #325). The live run of [vblank.md](vblank.md) had 43 to 45 frames per
-  second on Nvidia2 at `35f40299` and at `f16e1372`, against 58.32 in the
-  table below, and took it for something merged after `d88304f2eab7`. No
-  commit lowered it. That run's work tree had the cargo-built `vmlab-hv`
-  binary in the place of the bundle's launcher, `bin/vmlab-hv`. The launcher
-  sets `RENDER_SERVER_EXEC_PATH` to the bundle's `libexec/virgl_render_server`.
-  Without it virglrenderer starts its build-time server, on helios the
-  distribution's `/usr/lib/virgl_render_server` (`virglrenderer 1.3.0-2.1`),
-  which does not have ../../patches/virglrenderer/0002: on NVIDIA's driver each
-  Venus fence then wakes up to 10 ms late ([n5.md](n5.md)). The runs of
-  2026-11-21 on Nvidia2, `tests/e2e/adapter.sh <lab> win <dir> pace` on a
-  lab kept from `tests/e2e/run.sh --template windows-11 --host-gpu Nvidia2
-  --keep` (12 of 12 Done checks, no Xid), each row one lab and one half
-  hour, the host's load average between 6 and 18:
 
-  | Commit, driver, vmlab-hv | Render server | Present rate (frames per second), one value a run |
-  | --- | --- | --- |
-  | `d88304f2eab7`, `100.6.101.58107`, vmlab-hv of that commit | `/usr/lib/virgl_render_server` | 42.03, 40.61, 41.32, 40.06, 47.19 |
-  | the same lab | the bundle's, through the launcher | 58.52, 56.71, 59.25 |
-  | `a5f30b83` (`next`), `100.6.101.58113`, vmlab-hv of that commit | the bundle's, through the launcher | 59.92, 59.42, 60.12, 60.11, 59.15, 59.91 |
-  | the same lab | `/usr/lib/virgl_render_server` | 42.07, 46.63, 48.14 |
-
-  So the limit stays 57.0, and at `next` the check passes on Nvidia2 with
-  the host's vblank ([vblank.md](vblank.md)) as it does on AMD1. With the
-  timer of `d88304f2eab7` one run of three was under the limit at 56.71, the
-  loaded-host case of B4. RADV does not show the difference, which is why
-  AMD1 ran at 60 in the same work tree. `tests/e2e/run.sh` now writes
-  `render-server.txt`, the binary of the VM's vmlab-hv and the render server
-  it started, and warns when the server is not the one beside that binary.
-- B12. The two dropped draws of B10 (card #328), and a third that B10 did
-  not see. `draws_probe.exe` (the adapter check `draws`) makes each draw on
-  a device of its own and then uses the device. With the driver of B10 all
-  three cases fail on AMD1 and Nvidia2: the draw is not on the target, the
-  next `Map` answers `0x887a0005`, and `GetDeviceRemovedReason` answers
-  `0x887a0020`. The causes, and what
-  `patches/mesa/d3d10umd-draw-b8g8r8x8-elements-and-indexed-draws-without-an-index-buffer.patch`
-  does:
-  - An input element of the format `B8G8R8X8_UNORM`
-    (`test_vertex_formats`). `pipe_vertex_element::src_format` has 8 bits,
-    for Gallium's vertex formats. `PIPE_FORMAT_B8G8R8X8_UNORM` is not one
-    of them, and its value was cut to 26, another format, for which the
-    Yttrium vertex input has no Vulkan format. That is why a mapping for
-    `B8G8R8X8` in the Yttrium table changed nothing in B10. The element is
-    fetched as `B8G8R8A8_UNORM` now. Direct3D leaves its fourth component
-    undefined.
-  - `DrawIndexed` with no index buffer bound (`test_index_buffer_offset`).
-    The UMD made an index buffer of zeros for the one draw, the native draw
-    reads index bounds from a buffer's CPU copy, and that buffer has none.
-    The zeros are user indices now.
-  - `DrawIndexedInstancedIndirect` with no index buffer bound (the same
-    test) set `E_INVALIDARG`. B10's log does not have it because the
-    device was removed before the call. The UMD reads the arguments now and
-    draws with zero indices.
-
-  The runs of 2026-11-21 at commit `160caa72`, each a fresh lab with
-  `tests/e2e/run.sh --template windows-11 --host-gpu <gpu> --keep` (12 of
-  12 Done checks pass on both GPUs, no Xid), with the Wine programs
-  single-threaded (`WINETEST_NO_MT_D3D=1`): `draws` passes 3 of 3 cases on
-  both GPUs. On each GPU `d3d10core` executes 195908 checks with 0 failures
-  and `d3d11` executes 476333 checks with 13 failures and no `0x887a0005`
-  line, one failure fewer than B10: the `B8G8R8X8_UNORM` check passes. The 13 are the 11 NV12
-  textures and the two checks of `test_high_resource_count`. The UMD log
-  has no dropped draw and no `E_FAIL` or `E_INVALIDARG` for `d3d11_d3d11.exe`.
-  The tables below are older than this note and have no `draws` row.
-  For such a rerun `C:\ProgramData\Yttrium\yttrium-errors.log` must be
-  writable by the user. In these labs, after the log files were deleted and
-  a process of another account made them again, the probe's lines were
-  missing until the files were made writable for everyone.
+See the [acceptance notes](acceptance/) for card-specific results and follow-ups.
 
 <!-- e2e:adapter -->
 ### windows-11
@@ -979,6 +912,21 @@ enabled and `ortho_fog = 0`.
 
 The remaining failure messages matched the baseline on each GPU.
 
+#### Vertex fog (card #336)
+
+Card #336 used the [vertex fog patch](../patches/mesa/d3d9-vertex-fog-specular-alpha.patch)
+at `e6506ed1666e` on helios with the Windows 11 `26100.1742.11#win3d`
+template. Each `d3d9_visual` run executed 206,068 checks and skipped 31.
+All 56 removed failures per GPU were at `visual.c:28481` with table fog
+disabled. Pre-transformed vertices take the fog factor from their specular
+alpha. Legacy programmable vertex shaders use their output specular alpha
+when they leave `oFog` unwritten.
+
+| GPU | `visual` failures before → after | Pre-transformed, `vs_mode = 0` | Shader without `oFog`, `vs_mode = 2` |
+| --- | --- | --- | --- |
+| AMD1 (`renderD130`) | 343 → 287 | 24 → 0 | 32 → 0 |
+| Nvidia2 (`renderD129`) | 345 → 289 | 24 → 0 | 32 → 0 |
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -993,11 +941,8 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
-| Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
-| Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
