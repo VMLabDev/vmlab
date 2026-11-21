@@ -1762,6 +1762,20 @@ async fn pass(
         );
         undecided.insert(skip.path.clone());
     }
+    if !probe.unlisted_dirs.is_empty() {
+        // The listing says nothing about paths below a skipped directory.
+        // Defer existing agreements and host-only paths under it.
+        undecided.extend(
+            scan.tree
+                .keys()
+                .chain(ledger.entries.keys())
+                .filter(|path| {
+                    path.match_indices('/')
+                        .any(|(end, _)| probe.unlisted_dirs.contains(&path[..end]))
+                })
+                .cloned(),
+        );
+    }
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
@@ -3476,6 +3490,41 @@ mod tests {
         }
         assert!(warned, "the overflow was not reported");
         syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_guest_directory_never_deletes_host_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib/nested")).unwrap();
+        let source = dir.path().join("lib/nested/a.rs");
+        std::fs::write(&source, "a").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        assert_eq!(guest.text("/src/lib/nested/a.rs").as_deref(), Some("a"));
+
+        guest.unreadable("/src/lib");
+        guest.file("/src/lib-extra.rs", "found by the walk", 77);
+        sessions.watcher.overflow();
+        let reported = eventually(|| {
+            let report = syncer.report();
+            report.skipped.iter().any(|skip| skip.path == "lib")
+        })
+        .await;
+        assert!(reported, "the walk must report the unreadable directory");
+        syncers.stop("dev01").await;
+        assert_eq!(
+            std::fs::read_to_string(&source)
+                .expect("the host file must survive the failed listing"),
+            "a"
+        );
+        assert_eq!(guest.text("/src/lib/nested/a.rs").as_deref(), Some("a"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lib-extra.rs")).unwrap(),
+            "found by the walk"
+        );
     }
 
     /// The prune list is computed host-side and handed to the guest, which is
