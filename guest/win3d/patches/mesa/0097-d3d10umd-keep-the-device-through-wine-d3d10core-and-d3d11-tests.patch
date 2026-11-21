@@ -18,7 +18,8 @@ that removed the device:
   component of B8G8R8X8 reads the buffer's byte, as on AMD hardware.
 - The index buffer a draw gets when none is bound was IMMUTABLE, and
   Yttrium keeps no CPU copy of an immutable draw buffer, so the draw was
-  dropped (test_index_buffer_offset). It is DEFAULT now.
+  dropped (test_index_buffer_offset). It is DYNAMIC now, which Yttrium
+  keeps a CPU copy of.
 - An indirect indexed draw with no index buffer set E_INVALIDARG. It is
   skipped now, with a warning.
 - A pixel shader that needs more combined texture slots than the 32 of
@@ -56,23 +57,24 @@ index 4707fc8..cb624b7 100644
  
  static void
 diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
-index a206563..26283dd 100644
+index a206563..27588b1 100644
 --- a/src/gallium/frontends/d3d10umd/Draw.cpp
 +++ b/src/gallium/frontends/d3d10umd/Draw.cpp
-@@ -238,9 +238,11 @@ create_null_index_buffer(struct pipe_context *ctx, uint num_indices,
+@@ -238,9 +238,12 @@ create_null_index_buffer(struct pipe_context *ctx, uint num_indices,
  
     memset(buf, 0, buf_size);
  
-+   /* DEFAULT, not IMMUTABLE: Yttrium keeps no CPU copy of an immutable
-+    * draw buffer, and a draw reads its indices from that copy. */
++   /* DYNAMIC, not IMMUTABLE: Yttrium keeps a CPU copy of a dynamic draw
++    * buffer, and a draw reads its indices from that copy. It has none of
++    * an immutable or a default one created this way. */
     ibuf = pipe_buffer_create_with_data(ctx,
                                         PIPE_BIND_INDEX_BUFFER,
 -                                       PIPE_USAGE_IMMUTABLE,
-+                                       PIPE_USAGE_DEFAULT,
++                                       PIPE_USAGE_DYNAMIC,
                                         buf_size, buf);
     *index_size = 4;
     *restart_index = 0xffffffff;
-@@ -486,6 +488,15 @@ DrawIndirect(D3D10DDI_HDEVICE hDevice,
+@@ -486,6 +489,15 @@ DrawIndirect(D3D10DDI_HDEVICE hDevice,
     const UINT args_size = (indexed ? 5 : 4) * sizeof(UINT);
     if (ConsumeBackendDrawFailure(hDevice))
        return;
@@ -181,7 +183,7 @@ index 27f1636..1f2d2ae 100644
  
  struct pipe_shader_state
 diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_state.c b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
-index dd7c3c3..b90b700 100644
+index dd7c3c3..b2d453c 100644
 --- a/src/gallium/winsys/yttrium/gdi/yttrium_state.c
 +++ b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
 @@ -78,12 +78,18 @@ yttrium_vertex_format_to_vk(enum pipe_format format)
@@ -203,3 +205,16 @@ index dd7c3c3..b90b700 100644
     case PIPE_FORMAT_R16_FLOAT:
        return VK_FORMAT_R16_SFLOAT;
     case PIPE_FORMAT_R16_UNORM:
+@@ -226,8 +232,11 @@ yttrium_build_vertex_input_state(struct yttrium_vertex_elements_state *state)
+       }
+ 
+       vk_format = yttrium_vertex_format_to_vk(elem->src_format);
+-      if (vk_format == VK_FORMAT_UNDEFINED)
++      if (vk_format == VK_FORMAT_UNDEFINED) {
++         YTTRIUM_WARN("yttrium: vertex input unsupported owner=yttrium-state reason=no-vulkan-vertex-format element=%u format=%u action=drop-draws\n",
++                      i, (unsigned)elem->src_format);
+          state->vk_vertex_input_valid = false;
++      }
+ 
+       VkVertexInputAttributeDescription *attrib =
+          &state->attribs[state->num_attribs++];
