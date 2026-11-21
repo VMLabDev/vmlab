@@ -196,8 +196,165 @@ P58). The reasons:
 
 ## 4. The runs
 
-RUNS-PLACEHOLDER
+Host: helios, the account vmlab, 2026-11-22 (local time of the host). One
+target at a time, at nice 19, in a user unit with 24 GiB of memory. Toolchain
+nightly-2026-07-21, cargo-fuzz 0.13.2, ASan, debug assertions on. Each run:
+
+```
+FUZZ_TARGETS=<target> \
+FUZZ_ARGS='-fork=2 -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1' \
+  ./scripts/fuzz.sh 1800
+```
+
+with the limits of `scripts/fuzz.sh`: 10 s for one input, 2048 MiB of RSS,
+inputs up to 1 MiB.
+
+| Run | Target | Commit | Time | Executions | Coverage (edges) | Corpus kept | Crash, OOM, timeout |
+|---|---|---|---|---|---|---|---|
+| R1 | `vnet_offload` | 49912227 | 1813 s | 119 099 777 | 533 | 470 files, 2.0 MiB | 0, 0, 0 |
+| R2 | `net_frame` | 49912227 | 1813 s | 50 439 302 | 1866 | 1248 files, 7.4 MiB | 0, 0, 0 |
+| R3 | `oci_document` | 7c86ddab | 1814 s | 172 928 072 | 5129 | 6627 files, replaced by R4's | 0, 0, 0 |
+| R4 | `oci_document`, seeds corrected | f7544746 | 1818 s | 138 115 476 | 5870 | 6837 files, 27 MiB | 0, 0, 0 |
+
+R3 does not count for the config blob: the checked-in `template-config` seed
+lacked the required `created` field, so R3 very likely had no input that parsed as a config
+blob, and `TemplateConfig::vars` and `into_meta` were not reached in any
+depth. R4 covers 741 more edges than R3. The seeds were corrected (and a variant config and a variant
+manifest added) and the target ran again as R4, on top of the corpus of R3.
+
+The corpora are kept on helios, outside the build cache that `stc clean`
+removes:
+
+```
+/home/vmlab/src/stc/fuzz-corpus/card-382/vnet_offload/
+/home/vmlab/src/stc/fuzz-corpus/card-382/net_frame/
+/home/vmlab/src/stc/fuzz-corpus/card-382/oci_document/
+/home/vmlab/src/stc/fuzz-corpus/card-382/reproducers/
+/home/vmlab/src/stc/fuzz-corpus/card-382/run.log      (R1 to R3)
+/home/vmlab/src/stc/fuzz-corpus/card-382/run-r4.log
+```
+
+To continue a run from a kept corpus, copy it to
+`$CARGO_TARGET_DIR/fuzz-runs/<target>/corpus/` before `just fuzz`. They are
+not in the repository: 37 MiB in 8555 files. The checked-in seeds are the
+hand-written ones under `fuzz/corpus/` and those `scripts/fuzz-seeds.py`
+generates.
+
+What a clean run says, and what it does not:
+
+- The oracle is a panic, a sanitizer report, a 10 s hang, 2 GiB of memory, and
+  the assertions of each harness: a reply the DHCP or DNS server builds parses
+  again with valid checksums, a rewritten packet is IPv4, a vnet header
+  survives encode and decode, each segment for a raw port is a frame of legal
+  size. A segment with a wrong TCP checksum or a wrong sequence number would
+  pass: the targets have no reference implementation to compare with.
+- 30 minutes found no input that breaks these. The coverage of T5 was flat
+  after 10 minutes. T6 and T7 still gained edges in their last minutes, so a
+  longer run of those two can still reach new code.
 
 ## 5. Findings
 
-FINDINGS-PLACEHOLDER
+No run produced a crash artifact. One defect was found by reading the code
+while writing the list and then reproduced with the new target (D1). Three
+more were seen by reading and are not reproduced (D2 to D4): each needs a
+target that does not exist yet. Nothing is fixed in this card: no fix is one
+line.
+
+### D1 (draft card): the packed VARS of a template config blob unpack without a size cap
+
+- Kind: bug, security. Priority suggestion: P2.
+- Where: `TemplateConfig::vars`, `src/oci/config_blob.rs:276`. It base64-decodes
+  `secure_boot_vars` and calls `zstd::decode_all` on the result.
+- Who controls it: the registry. `Registry::resolve_manifest_meta` calls
+  `config.vars()` at `src/oci/client.rs:637`, straight after
+  `TemplateConfig::from_json`, before the trust checks and before any disk
+  chunk is fetched. The config blob
+  itself may be 1 GiB (`MAX_BLOB_BODY`).
+- Effect: a config blob of 176 KB makes the process that resolves the template (the
+  supervisor, which owns the store: ADR-0010) allocate 4 GiB. A larger one
+  allocates until the kernel kills it.
+- Reproducer: `/home/vmlab/src/stc/fuzz-corpus/card-382/reproducers/oci_document-vars-bomb.json`
+  on helios (sha256 `b42f1c914f0710279ba087411d384604334a66d1d89535fe01b1a770d4bf468e`). Made with:
+
+  ```
+  vars=$(head -c 4294967296 /dev/zero | zstd -19 -q -c | base64 -w0)
+  printf '{"name":"t","arch":"x86_64","version":"1.0.0","created":"2026-11-21T00:00:00Z","secure_boot_keys":"vars","secure_boot_vars":"%s"}' "$vars" > oci_document-vars-bomb.json
+  ```
+
+  Run: `target/fuzz-runs/build/x86_64-unknown-linux-gnu/release/oci_document -rss_limit_mb=2048 oci_document-vars-bomb.json`.
+  Result: `ERROR: libFuzzer: out-of-memory (malloc(2147483648))`, with
+  `zstd::stream::read::Decoder` copying into a `Vec<u8>` on the stack.
+- Fix to consider: read through `zstd::Decoder` with `take(limit + 1)` and
+  refuse a longer result. The limit can be the largest variable store vmlab
+  ships, with a margin. Cap the config blob itself well below 1 GiB too. Add the reproducer's small
+  form (a frame that unpacks past the cap) as a unit test.
+- The fuzzer did not find this alone in R4, with a valid packed VARS in its
+  seeds. A target finds a decompression bomb only with a low RSS limit or
+  with an explicit assertion on the unpacked size.
+
+### D2 (draft card, not reproduced): a vmstate can ask for a huge allocation
+
+- Kind: bug, security. Priority suggestion: P3.
+- Where: `decode_ram_regions`, `hv/crates/vmlab-hv-vmm/src/snapshot/format.rs:322`,
+  and `decode_msrs`, `hv/crates/vmlab-hv-vmm/src/snapshot.rs:999`. Both read a
+  `u32` count and call `Vec::with_capacity(count)` before any element is read.
+- Who controls it: whoever supplies the vmstate area of a qcow2: a template or
+  a disk image with an online snapshot. The restore checks a machine digest
+  first, which the same file supplies.
+- Effect, by reading: `count = 0xffff_ffff` asks for 64 GiB (16 bytes for each
+  entry), and a failed allocation aborts vmlab-hv.
+- Reproducer: none. It needs N4, a target on `snapshot::format`.
+- Fix to consider: bound the count by the bytes that remain in the reader.
+
+### D3 (draft card, not reproduced): the recorder draws a cursor of size zero, or with a short pixel buffer
+
+- Kind: bug. Priority suggestion: P3.
+- Where: `draw_cursor`, `src/record/core.rs:606`. It computes
+  `u32::from(cursor.height) - 1` and `u32::from(cursor.width) - 1`, and indexes
+  `cursor.rgba[i + 3]` with no check of the buffer's length.
+- Who controls it: the display. On RFB the size comes from the cursor
+  rectangle QEMU sends (`src/record/executor.rs:314`). On the native path
+  `src/hvdisplay.rs:368` passes `width`, `height` and `argb` of a
+  `CursorShape` message on with no check that `argb` holds
+  `width * height * 4` bytes.
+- Effect, by reading: a 0 by N cursor underflows (a panic in a debug build,
+  an index out of range in a release build), and a short `argb` indexes out
+  of range. The recording task panics and the recording ends. No memory is
+  corrupted.
+- Reproducer: none. `vmlab::record::core::Core` is public and pure, so N6 can
+  have a target in a few lines: `Core::cursor` with a zero width, then a frame.
+- Fix to consider: refuse a shape whose width or height is zero or whose
+  buffer is shorter than `width * height * 4`, where the shape enters `Core`.
+
+### D4 (draft card, not reproduced): the RFB client allocates what the server's length fields say
+
+- Kind: hardening. Priority suggestion: P4.
+- Where: `src/vnc.rs:102` (refusal reason), `:127` (desktop name), `:257` with
+  `skip` at `:447` (server cut text). Each reads a `u32` and allocates a
+  buffer of that size before reading.
+- Who controls it: the VNC server, QEMU or vmlab-hv on the VM's own socket.
+  The cut text is the guest's clipboard, relayed.
+- Effect, by reading: up to 4 GiB of zeroed buffer for one message. The pages
+  are touched only as bytes arrive, so the cost is what the server really
+  sends.
+- Reproducer: none. `VncClient` reads from a `UnixStream`, so a target needs
+  the reader made generic first (N6).
+- Fix to consider: cap the name and the reason, and discard cut text through
+  a fixed buffer.
+
+### Other notes for the lead
+
+- O1. `src/qmp/client.rs:474` and `guest/cinit/src/ctl.rs:230` read a line
+  with no cap. The peers are QEMU and the host: low hostility, no card
+  drafted.
+- O2. `net_frame` leaves the NAT engine out because `NatEngine::handle_frame`
+  opens host sockets to the destination a frame names. A target for the guest
+  TCP state machine (`nat/vtcp.rs`) needs the engine split from its sockets
+  first (N7).
+- O3. The nightly workflow `parser-fuzz.yml` now builds the main crate under
+  ASan for two targets. Its timeout went from 30 to 60 minutes. It was not run
+  on GitHub in this card.
+- O4. `fuzz/` now has a `Cargo.lock` (a copy of the main one, then resolved).
+  Without it cargo picked `filetime 0.2.30`, which does not build on the
+  pinned nightly. A change of the main lock file or of the `[patch]` section
+  must be repeated in `fuzz/`.
