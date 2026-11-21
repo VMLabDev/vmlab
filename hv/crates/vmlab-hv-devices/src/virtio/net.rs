@@ -3780,6 +3780,51 @@ mod tests {
     }
 
     #[test]
+    fn oversized_frame_without_mergeable_buffers_is_dropped() {
+        check_oversized_frame_is_dropped(None);
+    }
+
+    #[test]
+    fn oversized_vnet_frame_without_mergeable_buffers_is_dropped() {
+        check_oversized_frame_is_dropped(Some(2));
+    }
+
+    fn check_oversized_frame_is_dropped(pairs: Option<u16>) {
+        let mut f = Fixture::new_mode(pairs);
+        let _switch = f.take_switch_side();
+        f.dev.quiesce();
+        let oversized = [0x11; 1000];
+        let frame = [0x22; 60];
+        {
+            let mut state = lock(&f.dev.shared);
+            state.snapshot_paused = false;
+            for packet in [oversized.as_slice(), frame.as_slice()] {
+                state.rx_pending.push_back(if pairs.is_some() {
+                    vnet_body(Header::default(), packet)
+                } else {
+                    packet.to_vec()
+                });
+            }
+        }
+        for index in 0..2 {
+            let addr = f.data(index);
+            f.vqs[0].add_chain(&f.mem, &[(addr, 256, true)]);
+        }
+
+        place_rx_frames(&f.dev.shared, 12, false, false);
+
+        assert_eq!(f.vqs[0].used_idx(&f.mem), 2);
+        assert_eq!(f.vqs[0].used_entry(&f.mem, 0).1, 0);
+        assert_eq!(f.vqs[0].used_entry(&f.mem, 1).1, 72);
+        let mut received = [0; 60];
+        f.mem
+            .read_slice(&mut received, GuestAddress(f.data(1) + 12))
+            .unwrap();
+        assert_eq!(received, frame);
+        assert!(lock(&f.dev.shared).rx_pending.is_empty());
+    }
+
+    #[test]
     fn malformed_receive_available_index_does_not_spin() {
         let mut f = Fixture::new();
         let _switch = f.take_switch_side();
