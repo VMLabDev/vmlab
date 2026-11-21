@@ -368,11 +368,12 @@ committed.
 | | | [`0095`](../patches/mesa/0095-yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch) | yttrium: make a Desktop Duplication surface a kernel-written display image | [`docs/present.md`](present.md) |
 | | | [`0096`](../patches/mesa/0096-d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch) | d3d10umd: preload the native d3d12.dll in a Chromium GPU process | [`docs/chromium.md`](chromium.md) |
 | | | [`0097`](../patches/mesa/0097-d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch) | d3d10umd: keep the device through Wine's d3d10core and d3d11 tests | [`docs/acceptance.md`](acceptance.md) |
-| vkd3d-proton | 6 | [`0001`](../patches/vkd3d-proton/0001-vkd3d-Reject-root-signatures-with-overlapping-regist.patch) | vkd3d: Reject root signatures with overlapping register bindings. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
+| vkd3d-proton | 7 | [`0001`](../patches/vkd3d-proton/0001-vkd3d-Reject-root-signatures-with-overlapping-regist.patch) | vkd3d: Reject root signatures with overlapping register bindings. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0002`](../patches/vkd3d-proton/0002-vkd3d-Report-FORMAT_INFO-plane-counts-without-a-Vulk.patch) | vkd3d: Report FORMAT_INFO plane counts without a Vulkan format mapping. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0003`](../patches/vkd3d-proton/0003-vkd3d-Allow-depth-stencil-textures-in-CPU-visible-he.patch) | vkd3d: Allow depth-stencil textures in CPU-visible heaps. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0004`](../patches/vkd3d-proton/0004-vkd3d-Default-the-Windows-shader-cache-to-LocalAppDa.patch) | vkd3d: Default the Windows shader cache to LocalAppData. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0005`](../patches/vkd3d-proton/0005-d3d12-Build-a-system-wide-d3d12.dll-bridge.patch) | d3d12: Build a system-wide d3d12.dll bridge. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
 | | | [`0006`](../patches/vkd3d-proton/0006-vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch) | vkd3d: Emulate state-changing ExecuteIndirect without EXT_dgc. | [`docs/ei.md`](ei.md) |
+| | | [`0007`](../patches/vkd3d-proton/0007-vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch) | vkd3d: Emulate ExecuteIndirect vertex and index buffer views without EXT_dgc. | [`docs/ei.md`](ei.md) |
 | vulkan-tools | 1 | [`0001`](../patches/vulkan-tools/0001-vulkaninfo-Load-user32-on-every-Windows-compiler.patch) | vulkaninfo: Load user32 on every Windows compiler | [`build/vulkan-sdk/README.md`](../build/vulkan-sdk/README.md) |
 <!-- END generated patches table -->
