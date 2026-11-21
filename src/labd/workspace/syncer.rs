@@ -1762,6 +1762,20 @@ async fn pass(
         );
         undecided.insert(skip.path.clone());
     }
+    if !probe.unlisted_dirs.is_empty() {
+        // The listing says nothing about paths below a skipped directory.
+        // Defer existing agreements and host-only paths under it.
+        undecided.extend(
+            scan.tree
+                .keys()
+                .chain(ledger.entries.keys())
+                .filter(|path| {
+                    path.match_indices('/')
+                        .any(|(end, _)| probe.unlisted_dirs.contains(&path[..end]))
+                })
+                .cloned(),
+        );
+    }
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
@@ -3494,10 +3508,12 @@ mod tests {
         guest.unreadable("/src/lib");
         guest.file("/src/lib-extra.rs", "found by the walk", 77);
         sessions.watcher.overflow();
-        assert!(
-            eventually(|| syncer.report().skipped.iter().any(|skip| skip.path == "lib")).await,
-            "the walk must report the unreadable directory"
-        );
+        let reported = eventually(|| {
+            let report = syncer.report();
+            report.skipped.iter().any(|skip| skip.path == "lib")
+        })
+        .await;
+        assert!(reported, "the walk must report the unreadable directory");
         syncers.stop("dev01").await;
         assert_eq!(
             std::fs::read_to_string(&source).expect("the host file must survive the failed listing"),

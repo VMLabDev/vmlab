@@ -45,6 +45,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use futures::stream::StreamExt;
 
+use crate::labd::vm_agent::{ErrorCode, FileOpsError};
+
 use super::guest::GuestFs;
 use super::ignore::{Ignores, Verdict, join_rel};
 use super::ledger::{Kind, Ledger, Side};
@@ -98,6 +100,9 @@ pub struct HostScan {
 pub struct GuestProbe {
     pub tree: BTreeMap<String, State>,
     pub skipped: Vec<Skip>,
+    /// Directories whose entries could not be listed. Their descendants
+    /// are unknown even though the parent listing reported the directory.
+    pub unlisted_dirs: BTreeSet<String>,
     /// As [`HostScan::locks`], for the other side. A lock is one side's local
     /// claim, so either side holding one defers the set for both.
     pub locks: BTreeSet<String>,
@@ -361,21 +366,32 @@ pub async fn guest_walk(
         while let Some((dir, entries)) = listings.next().await {
             let entries = match entries {
                 Ok(entries) => entries,
-                Err(e)
-                    if e.downcast_ref::<super::ignore::GuestListingError>()
-                        .is_some() =>
-                {
-                    return Err(e);
-                }
                 // A directory the login cannot traverse is a named skip, not
                 // a halt — and emphatically not an empty listing, which would
                 // read as the guest having deleted everything under it.
-                Err(e) => {
+                Err(e)
+                    if !dir.is_empty()
+                        && e.downcast_ref::<FileOpsError>().is_some_and(|error| {
+                            matches!(
+                                error.code,
+                                ErrorCode::PermissionDenied
+                                    | ErrorCode::NoSuchFile
+                                    | ErrorCode::NotADirectory
+                            )
+                        }) =>
+                {
+                    probe.unlisted_dirs.insert(dir.clone());
                     probe.skipped.push(Skip {
-                        path: if dir.is_empty() { ".".into() } else { dir },
+                        path: dir,
                         why: format!("guest: cannot read the directory ({e:#})"),
                     });
                     continue;
+                }
+                // A failed root listing or session leaves the walk unusable.
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("listing guest directory {}", join_guest(guest_root, &dir))
+                    });
                 }
             };
             super::ignore::entry_budget(0, entries.len(), super::ignore::MAX_DIRECTORY_ENTRIES)?;

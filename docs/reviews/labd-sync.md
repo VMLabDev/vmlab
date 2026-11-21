@@ -43,7 +43,7 @@ depends on what a real guest or agent does, the finding says so.
 
 | Code | Fault | How bad |
 |---|---|---|
-| F1 | A guest directory that cannot be listed during a walk reads as deleted files, and the host copies are removed | Data loss (host) |
+| F1 | A guest directory that cannot be listed during a walk reads as deleted files, and the host copies are removed (fixed in #384) | Data loss (host) |
 | F2 | The host follows a guest-planted symlink named like a rule file, and sends the lines of the target back to the guest | Security against a hostile guest, and crash of the host process |
 | F3 | A restore does not flush and does not refuse on unsynced guest work | Data loss (guest work) |
 | F4 | A re-seed never completes while the tree holds a socket, an unreadable path or an oversize file | Wrong result (sync stops for good) |
@@ -56,6 +56,10 @@ depends on what a real guest or agent does, the finding says so.
 | F11 | A directory one side deleted comes back when the other side keeps ignored content in it | Cosmetic |
 
 ### F1. A failed guest `readdir` during a walk deletes host files
+
+**Fixed in #384.** Reconciliation defers the descendants of a guest
+directory it could not list. A failed root listing or a channel failure
+aborts the walk.
 
 **Where.** `src/labd/workspace/scan.rs:362-379` (`guest_walk`),
 `src/labd/workspace/syncer.rs:1758-1764`, `src/labd/workspace/plan.rs:750-767`.

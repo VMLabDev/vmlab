@@ -702,7 +702,11 @@ pub mod fake {
                 return Ok(entries.clone());
             }
             if guest.unreadable.iter().any(|p| p == path) {
-                bail!("permission denied: {path}");
+                return Err(FileOpsError {
+                    code: ErrorCode::PermissionDenied,
+                    msg: format!("permission denied: {path}"),
+                }
+                .into());
             }
             let dir = resolve(&guest, path);
             if !matches!(guest.nodes.get(&dir), Some((Node::Dir, _))) {
