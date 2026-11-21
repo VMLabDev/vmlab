@@ -911,6 +911,21 @@ enabled and `ortho_fog = 0`.
 
 The remaining failure messages matched the baseline on each GPU.
 
+#### Vertex fog (card #336)
+
+Card #336 used the [vertex fog patch](../patches/mesa/d3d9-vertex-fog-specular-alpha.patch)
+at `e6506ed1666e` on helios with the Windows 11 `26100.1742.11#win3d`
+template. Each `d3d9_visual` run executed 206,068 checks and skipped 31.
+All 56 removed failures per GPU were at `visual.c:28481` with table fog
+disabled. Pre-transformed vertices take the fog factor from their specular
+alpha. Legacy programmable vertex shaders use their output specular alpha
+when they leave `oFog` unwritten.
+
+| GPU | `visual` failures before → after | Pre-transformed, `vs_mode = 0` | Shader without `oFog`, `vs_mode = 2` |
+| --- | --- | --- | --- |
+| AMD1 (`renderD130`) | 343 → 287 | 24 → 0 | 32 → 0 |
+| Nvidia2 (`renderD129`) | 345 → 289 | 24 → 0 | 32 → 0 |
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -925,11 +940,8 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
-| Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
-| Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
