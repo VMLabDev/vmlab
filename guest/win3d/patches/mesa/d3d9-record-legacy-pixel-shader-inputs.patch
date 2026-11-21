@@ -1,0 +1,53 @@
+Subject: [PATCH] d3d9: record implicit pixel shader inputs for POSITIONT draws
+
+The generated POSITIONT vertex shader links its outputs to the pixel
+shader's input map. Nine records the semantics declared by ps_3_0, but
+leaves the map empty for ps_1_x and ps_2_x, which use implicit colour
+and texture-coordinate registers.
+
+Record these semantics where the translator declares their Gallium
+inputs so the generated vertex shader can pass through the matching
+declaration elements, including single-component texture coordinates.
+
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D9NineShader.c b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+--- a/src/gallium/frontends/d3d10umd/D3D9NineShader.c
++++ b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+@@ -974,9 +974,26 @@
++/* ps_1_x and ps_2_x use fixed input semantics without a usage declaration.
++ * Keep a compact list for the generated POSITIONT vertex shader. */
++static void
++tx_record_legacy_ps_input(struct shader_translator *tx, uint16_t usage)
++{
++    struct nine_shader_info *info = tx->info;
++    for (unsigned i = 0; i < info->num_inputs; ++i) {
++        if (info->input_map[i] == usage)
++            return;
++    }
++    assert(info->num_inputs < ARRAY_SIZE(info->input_map));
++    info->input_map[info->num_inputs++] = usage;
++}
++
+ static inline void
+ tx_texcoord_alloc(struct shader_translator *tx, INT idx)
+ {
+     assert(IS_PS);
+     assert(idx >= 0 && idx < ARRAY_SIZE(tx->regs.vT));
+-    if (ureg_src_is_undef(tx->regs.vT[idx]))
+-       tx->regs.vT[idx] = ureg_DECL_fs_input(tx->ureg, tx->texcoord_sn, idx,
+-                                             TGSI_INTERPOLATE_PERSPECTIVE);
++    if (ureg_src_is_undef(tx->regs.vT[idx])) {
++        tx->regs.vT[idx] = ureg_DECL_fs_input(tx->ureg, tx->texcoord_sn, idx,
++                                             TGSI_INTERPOLATE_PERSPECTIVE);
++        if (tx->version.major < 3)
++            tx_record_legacy_ps_input(tx, NINE_DECLUSAGE_i(TEXCOORD, idx));
++    }
+ }
+@@ -1133,6 +1150,7 @@ tx_src_param(struct shader_translator *tx, const struct sm1_src_param *param)
+                     TGSI_SEMANTIC_COLOR : TGSI_SEMANTIC_GENERIC;
+                 const unsigned index = param->idx == 0 ?
+                     0 : 10 * (param->idx - 1) + 8;
++                tx_record_legacy_ps_input(tx, NINE_DECLUSAGE_i(COLOR, param->idx));
+                 src = ureg_DECL_fs_input_centroid(
+                     ureg, semantic, index,
+                     tx->info->color_flatshade ? TGSI_INTERPOLATE_CONSTANT : TGSI_INTERPOLATE_PERSPECTIVE,
