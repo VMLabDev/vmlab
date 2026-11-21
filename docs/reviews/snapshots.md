@@ -18,7 +18,7 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 | F1 | data loss | An offline snapshot operation and a start of the same machine can write one qcow2 at the same time (fixed in #386) |
 | F2 | data loss | Snapshot lookup prefers the qcow2 id over the name, so an all-digit name can address another snapshot (fixed in #387) |
 | F3 | data loss | An offline restore of a multi-disk VM rewinds disk by disk with no check first and no way back |
-| F4 | data loss | A lab-wide restore rewinds machines one by one and stops at the first that fails |
+| F4 | data loss | A lab-wide restore rewinds machines one by one and stops at the first that fails (fixed in #389) |
 | F5 | wrong result | A container whose online restore fails stays paused |
 | F6 | wrong result | virtio-net restores the framing position of a host stream that has moved on |
 | F7 | wrong result | A capture that failed leaves a pending entry that a running vmlab-hv machine, or any container, cannot clear |
@@ -99,6 +99,10 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F3. Offline restore of several disks has no check and no way back (data loss)
 
+- Fixed in card #388. Restore checks each disk before stopping the VM and
+  saves the current disk states before applying the requested snapshot.
+  If an apply fails, restore rolls back the disks it attempted and retains
+  the recovery snapshot on any disk it cannot roll back.
 - Where: `src/labd/vm.rs:1881-1891`.
 - Why it is a fault: the offline branch stops the machine and then runs
   `snapshot_apply` on each path of `all_disk_paths()` in turn. It does not
@@ -118,6 +122,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F4. A lab-wide restore stops half way (data loss)
 
+- Fixed in #389. Lab-wide restore runs the same daemon preflight checks as
+  per-machine restore for every machine before any rewind begins.
 - Where: `src/labd/mod.rs:1226-1231`.
 - Why it is a fault: `snapshot.restore` with no machine loops over the
   machines and returns at the first error. The lab-wide capture
