@@ -1123,6 +1123,8 @@ int wmain(int argc, wchar_t **argv)
         write_bmp(base + L".gpu.bmp", gpu);
         gpu_wrong_cells = wrong_cells(gpu, gpu_wrong);
         DeleteFileW(raw.c_str());
+        /* The child must not write to this run's log. */
+        SetEnvironmentVariableW(L"VKD3D_LOG_FILE", NULL);
         if (run_warp_child(raw, warp_how) && read_file(raw, warp) && warp.size() >= RT * RT * 4)
         {
             warp_name.assign(warp.begin() + RT * RT * 4, warp.end());
