@@ -74,7 +74,7 @@ pub struct TimelineEntry {
     pub event: InputEvent,
 }
 
-/// The guest's hardware cursor as QEMU last described it.
+/// The guest's hardware cursor as the display last described it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorShape {
     pub hotspot: (u16, u16),
@@ -283,11 +283,16 @@ impl Core {
         }
     }
 
-    /// A cursor shape rectangle arrived. A genuinely new shape is drawn from
-    /// here on; QEMU's re-announcement of the shape already known (see
-    /// [`CursorShape::is_stale_resend_of`]) hides the pointer instead, since
-    /// QEMU only re-announces when the display that drew it was reset.
+    /// A native cursor shape arrived. The native stream sends the shape again
+    /// on pointer moves and reports visibility separately.
     pub fn cursor(&mut self, at: Duration, shape: CursorShape) {
+        self.advance(at);
+        self.cursor = Some(shape);
+    }
+
+    /// An RFB cursor shape arrived. Suppress QEMU's stale re-announcement
+    /// after a display reset.
+    pub fn rfb_cursor(&mut self, at: Duration, shape: CursorShape) {
         self.advance(at);
         if self
             .defined
