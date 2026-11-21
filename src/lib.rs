@@ -7,6 +7,10 @@ pub mod config;
 pub mod dev;
 #[allow(dead_code)] // Consumers land with #174-#177; drop once every item has a caller.
 mod freeze;
+/// The bodies of the cargo-fuzz targets under `fuzz/`; absent from every
+/// build but cargo-fuzz's.
+#[cfg(fuzzing)]
+pub mod fuzzing;
 pub mod guest_asset;
 mod hashing;
 mod hvdisplay;

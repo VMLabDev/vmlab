@@ -1,0 +1,1 @@
+{"name":"debian-13","arch":"x86_64","version":"1.2.0","created":"2026-11-21T00:00:00Z","sha256":"11","variant":{"name":"desktop","base_sha256":"00","default":true,"description":"with a desktop"}}

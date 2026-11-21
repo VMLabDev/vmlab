@@ -448,6 +448,11 @@ impl Block {
         // published — the loop the spec's suppression mechanism expects.
         let mut used_any = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !super::avail_idx_in_range(&self.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = self
                 .queues
                 .get_mut(index)
@@ -1088,6 +1093,19 @@ mod tests {
 
     fn sector_content(i: u64) -> Vec<u8> {
         (0..512).map(|j| ((i * 512 + j) % 251) as u8).collect()
+    }
+
+    #[test]
+    fn avail_idx_far_ahead_does_not_spin() {
+        let f = Fixture::new(Box::new(MemDisk::new(4096)));
+        f.mem
+            .write_obj(Le16::from(0x8000u16), GuestAddress(f.avail + 2))
+            .unwrap();
+        let mut block = f.block;
+        let returned = crate::virtio::testing::returns_in_time(move || block.queue_notify(0));
+        assert!(returned.is_some(), "queue_notify spins on a broken ring");
+        assert_eq!(f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(), 0);
+        assert!(f.interrupt.notifies.lock().is_empty());
     }
 
     #[test]
