@@ -27,7 +27,7 @@ upload, then use the existing Gallium blit for scaling and packing.
 +   if (format == D3D9_FMT_YUY2)
 +      return DIV_ROUND_UP(width, 2u) * 4u;
 +   if (D3D9FormatIsBlockCompressed(format))
-@@ -1454,13 +1454,15 @@
+@@ -1454,13 +1454,16 @@
 -   const enum pipe_format src_format =
 -      D3D9FormatToPipe(src_resource->format);
 -   const UINT bpp = D3D9FormatBytesPerPixel(src_resource->format);
@@ -51,7 +51,8 @@ upload, then use the existing Gallium blit for scaling and packing.
 +       D3D9FormatIsBlockCompressed(src_resource->format) ||
 +       (!yuy2 && (src_resource->format != dst_resource->format ||
 +                  src_format != dst_format)) ||
-+       (yuy2 && !util_format_is_rgb(dst_format)) ||
++       (yuy2 && util_format_description(dst_format)->colorspace !=
++                 UTIL_FORMAT_COLORSPACE_RGB) ||
 +       util_format_is_depth_or_stencil(src_format) ||
 +       util_format_is_depth_or_stencil(dst_format) ||
 +       dst_resource->pipe_resource->nr_samples > 1)
@@ -113,7 +114,7 @@ upload, then use the existing Gallium blit for scaling and packing.
 +      D3D9TextureSubdata(device, &upload_resource, 0,
 +                        PIPE_MAP_WRITE | PIPE_MAP_DISCARD_WHOLE_RESOURCE,
 +                        &upload_box, src_data, upload_pitch,
-+                        yuy2 ? 0 : src_sub->slice_pitch);
++                        yuy2 ? height * upload_pitch : src_sub->slice_pitch);
 +   free(pixels);
 +   if (!uploaded) {
 @@ -2806,3 +2806,3 @@
