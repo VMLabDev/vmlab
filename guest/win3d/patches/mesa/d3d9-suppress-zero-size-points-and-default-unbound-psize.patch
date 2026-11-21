@@ -19,24 +19,14 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends
                                     struct pipe_vertex_element *elements,
                                     UINT max_elements,
                                     uint32_t *stream_mask,
-@@ -1316,18 +1317,27 @@
-          }
-       }
- 
--      if (!element) {
-+      if (element && (element->Stream >= ARRAYSIZE(device->streams) ||
-+                      element->Method != D3DDECLMETHOD_DEFAULT))
-+         return 0;
-+
-+      const bool unbound_psize =
-+         points && input_usage == NINE_DECLUSAGE_PSIZE && element &&
-+         !device->streams[element->Stream].sysmem &&
-+         !device->streams[element->Stream].vertex_buffer;
-+      if (!element || unbound_psize) {
+@@ -1322,10 +1323,15 @@
+       if (!element ||
+           (!device->streams[element->Stream].sysmem &&
+            !device->streams[element->Stream].vertex_buffer)) {
           memset(&elements[input], 0, sizeof(elements[input]));
           elements[input].vertex_buffer_index = D3D9_DEFAULT_VERTEX_INPUT_BUFFER;
 -         elements[input].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
-+         if (unbound_psize) {
++         if (points && element && input_usage == NINE_DECLUSAGE_PSIZE) {
 +            elements[input].src_offset = 4 * sizeof(float);
 +            elements[input].src_format = PIPE_FORMAT_R32_FLOAT;
 +         } else {
@@ -46,13 +36,6 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends
           count = input + 1;
           continue;
        }
- 
--      if (element->Stream >= ARRAYSIZE(device->streams) ||
--          element->Method != D3DDECLMETHOD_DEFAULT)
--         return 0;
--
-       const enum pipe_format format = D3D9DeclTypeToPipeFormat(element->Type);
-       if (format == PIPE_FORMAT_NONE)
 @@ -1736,7 +1746,7 @@
     state.fill_front = PIPE_POLYGON_MODE_FILL;
     state.fill_back = PIPE_POLYGON_MODE_FILL;
