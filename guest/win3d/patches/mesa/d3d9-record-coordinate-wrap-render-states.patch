@@ -11,7 +11,7 @@ Evidence: docs/acceptance.md.
 diff --git a/src/gallium/frontends/d3d10umd/D3D9State.cpp b/src/gallium/frontends/d3d10umd/D3D9State.cpp
 --- a/src/gallium/frontends/d3d10umd/D3D9State.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9State.cpp
-@@ -234,14 +234,15 @@ D3D9SetRenderState(HANDLE hDevice, const D3DDDIARG_RENDERSTATE *data)
+@@ -234,15 +234,16 @@ D3D9SetRenderState(HANDLE hDevice, const D3DDDIARG_RENDERSTATE *data)
     case D3DDDIRS_WRAP13:
     case D3DDDIRS_WRAP14:
     case D3DDDIRS_WRAP15:

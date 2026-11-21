@@ -31,7 +31,7 @@ sources, kits and toolchain are mounted read-only. Each run deletes
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIN3D_CACHE` | `.scratch/cache` | Download and unpack cache |
-| `KMD_DRIVER_VERSION` | `100.6.101.58112` | The PE version resource and the INF's `DriverVer` version. This version makes a lost host GPU a removed device when vmlab-hv reports it (`0011`). `58111` had vmlab-hv copy a Blt present when it offers the feature bit (`0010`). `58110` sent the host-ordered flip when vmlab-hv offers it (`0009`). `58109` reported a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
+| `KMD_DRIVER_VERSION` | `100.6.101.58113` | Overrides the PE version resource and INF `DriverVer`. The default build component is 58101 plus the number of KMD patches. A release that rebases or removes patches can set a higher version for Windows driver ranking. This version takes the vblank from vmlab-hv's frame clock when it offers the feature bit (`0012`). `58112` made a lost host GPU a removed device when vmlab-hv reports it (`0011`). `58111` had vmlab-hv copy a Blt present when it offers the feature bit (`0010`). `58110` sent the host-ordered flip when vmlab-hv offers it (`0009`). `58109` reported a flip with a vsync only after it was sent to the host (`0008`). `58108` was an experiment of card #143 that is not in this repository: do not reuse the number. `58107` added the present copy into a mappable blob (`0006`). `58106` added the hardware pointer (`0005`). `58105` was the package rebased to Yttrium's November 2026 release. `58104` was the last on the September release, with native x86 UMD mapping-fault handling. Its KMD recovery logic was unchanged from `58103`, which retains drained-fence diagnostics above initial recovery `58102` and GDI context creation `58101`. |
 
 ## Trace build
 
@@ -40,7 +40,7 @@ KMD_TRACE=1 KMD_DRIVER_VERSION=100.6.101.58190 build/kmd/build.sh
 ```
 
 `KMD_TRACE=1` compiles the driver with `VIOGPU_FLIP_TRACE=1`
-(`patches/kmd/0007`). The driver then keeps a ring of 65536 timed records,
+(`patches/kmd/kmd-flip-trace-build.patch`). The driver then keeps a ring of 65536 timed records,
 and a DRIVERPRIVATE escape (magic `0x56475446`) returns the records after a
 sequence number, 1024 at a time. `tests/tearing/Get-FlipTrace.ps1` reads it
 in the guest into a CSV file. Give a trace build its own driver version, so
@@ -61,11 +61,12 @@ The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
 | 16, 22 | The copy of a Blt present begins, ends (with `0010` on vmlab-hv: the host command is queued) | context, flags = source resource, fence, response = destination resource |
 | 17 | A flip from a DMA buffer: `SET_SCANOUT` and `RESOURCE_FLUSH` are sent | context, flags = resource, fence |
 | 18 | `SetVidPnSourceAddress` | flags = resource |
-| 19 | The vsync timer sends the recorded flip | flags = resource |
+| 19 | The vsync timer, or with `0011` on vmlab-hv the completion of a host vblank, sends the recorded flip | flags = resource |
 | 20 | One packet of a DMA buffer goes to the control queue | context, flags = ring index, fence, response = command type (0 NOP, 1 SUBMIT, a timeline submit has a ring index) |
 | 21 | A host context was created | context, flags = capset, fence = process id |
 | 23 | The interrupt routine reported a vsync (`0008`) | flags = the reported address divided by 4096, response = 1 when the address came from the queue of flips |
 | 24 | A queued flip was not sent to the host yet when a vsync was reported (`0008`) | flags = the flips in the queue, response = 0 the address was held back, 1 it was reported (knob 2) |
+| 25 | The host answered a vblank wait (`0012`, interrupt routine) | flags = the host's tick (low 32 bits), fence = the host time of the tick in ns, response = 1 when this answer raised the vsync, 0 when the completion of the wait raises it after it sent the waiting flip |
 
 Events 1 to 10 are the records of the 256-record ring of `0004` and `0011`, without the
 bare interrupt (event 4). A release build has that small ring only.
@@ -98,7 +99,7 @@ out/kmd/BUILDINFO                         driver version, pins, patch hashes, ou
 
 1. Unpacks llvm-mingw and the two NuGet packages (they are zip files).
 2. Copies `VirtIO/`, `viogpu/` and `build/` from the source tree to the fixed
-   path `/tmp/kmd-work/src`, and applies `patches/kmd/*.patch` in name order.
+   path `/tmp/kmd-work/src`, and applies the patches in `patches/kmd/series` order.
 3. Sets `SOURCE_DATE_EPOCH` and the INF date to upstream's tag date,
    2026-11-02.
 4. Runs `compile-kmd.sh`, `compile-helpers.sh` and `stampinf.py`.
@@ -199,18 +200,19 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 
 | Patch | What it does |
 | --- | --- |
-| `0001-kmd-r10-copy.patch` | Converts R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit, so 10-bit back buffers present correctly. It is a byte-identical copy of the prior art's `R/kmd-r10-copy.patch` on the same base (prior-art §2.2, `NW` F93). |
-| `0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch` | Sets `Flags.Cached` on the GDI shadow and staging surfaces, the destination of every Blt present, so the KMD's CPU present copy does not write uncached memory. It took D3D9 windowed presents from 25–31 fps to the refresh rate on AMD hosts ([`docs/present.md`](../../docs/present.md)). |
+| `kmd-r10-copy.patch` | Converts R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit, so 10-bit back buffers present correctly. It is a byte-identical copy of the prior art's `R/kmd-r10-copy.patch` on the same base (prior-art §2.2, `NW` F93). |
+| `kmd-cache-gdi-shadow-and-staging-surfaces.patch` | Sets `Flags.Cached` on the GDI shadow and staging surfaces, the destination of every Blt present, so the KMD's CPU present copy does not write uncached memory. It took D3D9 windowed presents from 25–31 fps to the refresh rate on AMD hosts ([`docs/present.md`](../../docs/present.md)). |
 
-| `0003-kmd-create-context-for-gdi-devices.patch` | Creates the legacy host context when the kernel device is constructed, so GDI devices that present without a UMD have one ([`docs/gdi-context.md`](../../docs/gdi-context.md)). |
-| `0004-kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
-| `0005-kmd-hardware-pointer.patch` | Hardware pointer: reports a 64×64 pointer when `HWCursor` is set, sends Windows' shape, position and visibility on the cursor queue, restores them after a device reset, and sets `HWCursor` to 1 in the INF ([`docs/pointer.md`](../../docs/pointer.md)). |
-| `0006-kmd-present-blt-into-mappable-blob.patch` | Desktop Duplication: a present copy of the Blt kind may write into a blob when source and destination are both mappable blobs. The destination is mapped in `Present` and written at the image's offset in the blob ([`docs/present.md`](../../docs/present.md#desktop-duplication)). |
-| `0007-kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
-| `0008-kmd-report-flips-after-they-are-sent.patch` | A vsync reports the address of a flip only after the vsync timer sent that flip to the host. Before, a flip that Windows recorded between the timer and the interrupt was reported one tick early, and Windows gave the buffer on screen back to the compositor 16 ms early. It is not the cause of the torn frames of #134 ([`docs/tearing.md`](../../docs/tearing.md)). |
-| `0009-kmd-host-ordered-flip.patch` | Acks vmlab-hv's private feature bit `VIRTIO_GPU_F_VMLAB_ORDERED_FLIP` (23) when the host offers it, and then sends every flush of the scanout as `VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP` (`0x0f00`), which the host answers only once the frame is on its display, after every fence of its renderer and the implicit fence of the scanout buffer have signalled. Without the bit (QEMU) the driver sends `RESOURCE_FLUSH` as before ([`docs/flip.md`](../../docs/flip.md)). |
-| `0010-kmd-host-present-copy.patch` | With the same bit, sends the copy of a Blt present as `VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY` (`0x0f01`) ahead of the present's fenced NOP, in place of the copy on a guest CPU. The boxes are clipped by the code of the CPU copy. Without the bit, or when the command cannot be queued, the CPU copy runs as before ([`docs/present-copy.md`](../../docs/present-copy.md)). |
-| `0011-kmd-host-gpu-lost.patch` | With the same bit, reads vmlab-hv's private event `VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST` (bit 31 of `events_read`) on the configuration interrupt and at each negotiation. The adapter is then lost for the boot: every 3D device is context-lost and its UMD gets `STATUS_DEVICE_REMOVED`, a new 3D context is refused, a DMA buffer of a GDI device retires without the host, and a restart after a timeout restores no host objects ([`docs/device-lost.md`](../../docs/device-lost.md)). |
+| `kmd-create-context-for-gdi-devices.patch` | Creates the legacy host context when the kernel device is constructed, so GDI devices that present without a UMD have one ([`docs/gdi-context.md`](../../docs/gdi-context.md)). |
+| `kmd-recover-from-timeouts.patch` | Timeout (TDR) and D3/D0 recovery: quiesces the transport, cancels old requests, keeps OS allocations and restores legacy host state at restart ([`docs/tdr-recovery.md`](../../docs/tdr-recovery.md)). |
+| `kmd-hardware-pointer.patch` | Hardware pointer: reports a 64×64 pointer when `HWCursor` is set, sends Windows' shape, position and visibility on the cursor queue, restores them after a device reset, and sets `HWCursor` to 1 in the INF ([`docs/pointer.md`](../../docs/pointer.md)). |
+| `kmd-present-blt-into-mappable-blob.patch` | Desktop Duplication: a present copy of the Blt kind may write into a blob when source and destination are both mappable blobs. The destination is mapped in `Present` and written at the image's offset in the blob ([`docs/present.md`](../../docs/present.md#desktop-duplication)). |
+| `kmd-flip-trace-build.patch` | The [trace build](#trace-build): a 65536-record ring and its escape, compiled only with `VIOGPU_FLIP_TRACE=1`. A release build is unchanged by it. |
+| `kmd-report-flips-after-they-are-sent.patch` | A vsync reports the address of a flip only after the vsync timer sent that flip to the host. Before, a flip that Windows recorded between the timer and the interrupt was reported one tick early, and Windows gave the buffer on screen back to the compositor 16 ms early. It is not the cause of the torn frames of #134 ([`docs/tearing.md`](../../docs/tearing.md)). |
+| `kmd-host-ordered-flip.patch` | Acks vmlab-hv's private feature bit `VIRTIO_GPU_F_VMLAB_ORDERED_FLIP` (23) when the host offers it, and then sends every flush of the scanout as `VIRTIO_GPU_CMD_VMLAB_ORDERED_FLIP` (`0x0f00`), which the host answers only once the frame is on its display, after every fence of its renderer and the implicit fence of the scanout buffer have signalled. Without the bit (QEMU) the driver sends `RESOURCE_FLUSH` as before ([`docs/flip.md`](../../docs/flip.md)). |
+| `kmd-host-present-copy.patch` | With the same bit, sends the copy of a Blt present as `VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY` (`0x0f01`) ahead of the present's fenced NOP, in place of the copy on a guest CPU. The boxes are clipped by the code of the CPU copy. Without the bit, or when the command cannot be queued, the CPU copy runs as before ([`docs/present-copy.md`](../../docs/present-copy.md)). |
+| `kmd-host-gpu-lost.patch` | With the same bit, reads vmlab-hv's private event `VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST` (bit 31 of `events_read`) on the configuration interrupt and at each negotiation. The adapter is then lost for the boot: every 3D device is context-lost and its UMD gets `STATUS_DEVICE_REMOVED`, a new 3D context is refused, a DMA buffer of a GDI device retires without the host, and a restart after a timeout restores no host objects ([`docs/device-lost.md`](../../docs/device-lost.md)). |
+| `kmd-host-vblank.patch` | With the same bit, starts no vsync timer: it keeps one `VIRTIO_GPU_CMD_VMLAB_VBLANK` (`0x0f02`) wait on the control queue, which vmlab-hv answers at each tick of its 60 Hz frame clock with the tick and its host time. The answer raises the vsync, or, when a flip is waiting, the completion of the wait does, right after it sent the flip. No empty command is sent per tick. Without the bit, or when the host refuses the wait, the timer and its NOP run as before ([`docs/vblank.md`](../../docs/vblank.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.

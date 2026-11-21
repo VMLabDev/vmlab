@@ -69,9 +69,9 @@ device-local only (`venus-alloc-0070-heaven.txt`).
 
 | Patch | Owner | Change |
 | --- | --- | --- |
-| `patches/mesa/0070` | nvva | The Venus ICD reports a device-local, host-visible type whose heap is less than half the size of the largest device-local heap as device-local only. Guest allocations stay out of BAR1 (fault 3) |
-| `patches/mesa/0085` | unigl | `vkAllocateMemory` from a device-local heap smaller than the largest device-local heap is synchronous, so the caller sees the host's result and Zink's fallback runs (fault 1) |
-| `patches/mesa/0086` | unigl | Zink keeps those buffers mappable. A missing visible-VRAM heap is filled with the `HOST_VISIBLE_COHERENT` types, and a failed visible-VRAM allocation is retried there whenever the resource's `memoryTypeBits` allow it. Images that cannot use those types still go to `DEVICE_LOCAL` (fault 2) |
+| `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` | nvva | The Venus ICD reports a device-local, host-visible type whose heap is less than half the size of the largest device-local heap as device-local only. Guest allocations stay out of BAR1 (fault 3) |
+| `patches/mesa/venus-allocate-from-small-device-local-heap-synchronously.patch` | unigl | `vkAllocateMemory` from a device-local heap smaller than the largest device-local heap is synchronous, so the caller sees the host's result and Zink's fallback runs (fault 1) |
+| `patches/mesa/zink-keep-buffers-mappable-without-visible-vram.patch` | unigl | Zink keeps those buffers mappable. A missing visible-VRAM heap is filled with the `HOST_VISIBLE_COHERENT` types, and a failed visible-VRAM allocation is retried there whenever the resource's `memoryTypeBits` allow it. Images that cannot use those types still go to `DEVICE_LOCAL` (fault 2) |
 
 `0070` is nvva's patch, carried here byte for byte (nvva [e24e356](https://github.com/VMLabDev/vmlab-win3d/commit/e24e35690c914d3bf68cda5cf8d381731c5c76a0)) so that
 the proof package is the series that merges. nvva carries `0086` the same way,

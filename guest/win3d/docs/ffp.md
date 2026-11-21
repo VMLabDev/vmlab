@@ -7,7 +7,7 @@ texture coordinate generation and transforms, fog, lighting, alpha test and
 blending, point sprites, and transformed and pre-transformed vertices. Each
 test runs with both hardware and software vertex processing, and the
 results are compared with Microsoft's reference rasterizer. The page names
-the four faults found, the fixes (`patches/mesa/0040` to `0042`) and the
+the four faults found, the fixes (`patches/mesa/d3d9-swvp-processed-vertices-keep-declaration-vs.patch` to `0042`) and the
 evidence. The work was done on 2026-10-18 on helios: NVIDIA 610.57.04 on
 `Nvidia2` and RADV (Mesa 26.2.2) on `AMD1`, vmlab 0.28.0-alpha,
 virglrenderer 1.3.0. Evidence is in [docs/evidence/ffp/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/ffp/).
@@ -113,7 +113,7 @@ through the shader DDI:
   the UMD only as vertex shader constants. `SetTransform` is never called.
 - **Hardware vertex processing, `XYZRHW` vertices.** The runtime sends only
   the pixel shader. The UMD generates the vertex shader from the
-  declaration (`patches/mesa/0024`).
+  declaration (`patches/mesa/d3d9-positiont-vs-for-runtime-fixed-function-ps.patch`).
 - **Software vertex processing.** The runtime transforms and lights on the
   CPU. It writes POSITIONT, COLOR0, COLOR1, FOG and the texture coordinates
   into its own vertex buffer, which it draws with `DrawPrimitive2` and only
@@ -125,7 +125,7 @@ translator (`D3D9NineShader.c`) and `D3D9Draw.cpp` do this work. All four
 faults were in that part or in the generated vertex shaders, not in the
 runtime's shaders.
 
-## Software vertex processing: `patches/mesa/0040`
+## Software vertex processing: `patches/mesa/d3d9-swvp-processed-vertices-keep-declaration-vs.patch`
 
 A software-processed draw matched two of `D3D9DrawDiffuse`'s POSITIONT
 builders. `D3D9InitPositionTRuntimePsFixedFunctionVsInfo` (from `0024`)
@@ -139,7 +139,7 @@ coordinate 0: 144 of 168 cases failed on NVIDIA and 146 on AMD
 (`rtps=1 rp=1`, from a development build with extra trace lines). The pixel-shader-input builder now runs only when the
 declaration builder did not.
 
-## Fog: `patches/mesa/0041`
+## Fog: `patches/mesa/d3d9-fixed-function-fog.patch`
 
 - **W fog.** Table fog uses eye depth when the projection is perspective,
   and the UMD read that from `transforms[D3DTS_PROJECTION]`. A DDI trace of
@@ -162,7 +162,7 @@ declaration builder did not.
   `XYZRHW` vertex. Without a specular colour they write 0, which matches the
   reference (`fog_rhw_nospec`).
 
-## Points: `patches/mesa/0042`
+## Points: `patches/mesa/d3d9-fixed-function-points.patch`
 
 Points larger than one pixel go through `D3D9CreatePointPositionGs`, which
 expands each point into a quad:

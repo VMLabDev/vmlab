@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import harness
-from features import HOST, PHASES
+from features import HOST, PHASES, out_of_scope
 from run import scenario_features
 from scenarios.fastpath import nic_attachments
 
@@ -27,7 +27,7 @@ class ScenarioScopeTests(unittest.TestCase):
         self.addCleanup(h.log.close)
         return h
 
-    def test_all_34_delivered_core_and_admin_features_follow_vmlab(self):
+    def test_all_37_delivered_core_and_admin_features_follow_vmlab(self):
         h = self.new_harness("vmlab")
         delivered = set()
         for name in ("core", "admin"):
@@ -42,7 +42,23 @@ class ScenarioScopeTests(unittest.TestCase):
                 h.ok(feature, True, "scope regression")
                 self.assertEqual(h.results[feature][0], "pass", feature)
         self.assertIn("vm.hw.tsc", delivered)
-        self.assertEqual(len(delivered), 34)
+        self.assertIn("lab.down.isolation", delivered)
+        self.assertEqual(len(delivered), 37)
+
+    def test_default_vmlab_scope_reports_phase_4_results(self):
+        h = self.new_harness("vmlab")
+        phase_4 = {feature for feature, phase in PHASES.items() if phase == "4"}
+        self.assertEqual(len(phase_4), 8)
+        for feature in phase_4:
+            with self.subTest(feature=feature):
+                h.vms_here = h.vms_follow({feature})
+                h.ok(feature, True)
+                self.assertEqual(h.results[feature][0], "pass")
+                h.ok(feature, False)
+                self.assertEqual(h.results[feature][0], "fail")
+                self.assertEqual(out_of_scope(feature, "vmlab", "2f"), "vmlab-hv phase 4")
+        self.assertFalse(h.vms_follow({"arch.emulated"}))
+        self.assertIsNone(out_of_scope("arch.emulated", "vmlab", "3"))
 
     def test_host_config_exercises_automatic_containers_on_vmlab(self):
         for hypervisor in ("qemu", "vmlab"):
@@ -61,8 +77,6 @@ class ScenarioScopeTests(unittest.TestCase):
         h.vms_here = True
         for feature, reason in {
             "vm.hw.qemu_args": "QEMU only:",
-            "vm.hw.floppy": "vmlab-hv phase 4",
-            "vm.media.floppy": "vmlab-hv phase 4",
             "arch.emulated": "vmlab-hv phase 3",
         }.items():
             with self.subTest(feature=feature):

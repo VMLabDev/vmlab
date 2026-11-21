@@ -45,6 +45,7 @@ FEATURES: dict[str, str] = {
     "lab.info": "`vmlab lab info`",
     "lab.stop": "`vmlab lab stop`",
     "lab.down.release": "a full `vmlab down` releases the lab name, so another checkout declaring it can `up`",
+    "lab.down.isolation": "a full `vmlab down` leaves a guest in another lab running",
     "lab.move": "`vmlab lab move` hands a stopped lab's clones to another checkout declaring its name, and refuses while it runs",
     "lab.status.conflict": "`vmlab status` (and `down`) in a checkout whose lab name is registered from another root exit 5 naming it",
     "lab.restart": "`vmlab lab restart` (and its refusal while running)",
@@ -235,11 +236,11 @@ FEATURES: dict[str, str] = {
 
 HOST = "host"
 
-# Every phase in the order vmlab-hv delivers them.
+# Phase order for the historical coverage cutoff.
 PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
 
-# The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
-VMLAB_DELIVERED = "2f"
+# Phase 4 is delivered independently of TCG in phase 3.
+VMLAB_DELIVERED = "4"
 
 _GROUPS: dict[str, list[str]] = {
     HOST: [
@@ -283,7 +284,7 @@ _GROUPS: dict[str, list[str]] = {
         "lab.up.partial", "lab.depends_on", "lab.depends_on_provision", "lab.provision.parallel",
         "lab.status", "lab.down", "lab.up.reload", "lab.reload.stopped", "lab.reload.network",
         "lab.up.template-changed", "lab.destroy", "lab.list", "lab.info", "lab.stop", "lab.down.release",
-        "lab.move", "lab.status.conflict", "lab.restart", "lab.destroy.named", "vm.start", "vm.stop",
+        "lab.down.isolation", "lab.move", "lab.status.conflict", "lab.restart", "lab.destroy.named", "vm.start", "vm.stop",
         "vm.restart", "vm.destroy", "vm.ip", "vm.sleep", "vm.prevent_sleep", "vm.hw.cpus-memory",
         "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
         "vm.hw.nested", "vm.scratch", "vm.media.iso", "agent.eventlog", "login.elevated", "console.viewer",
@@ -337,6 +338,7 @@ def out_of_scope(feature: str, hypervisor: str, delivered: str = VMLAB_DELIVERED
     if feature in QEMU_ONLY:
         return f"QEMU only: {QEMU_ONLY[feature]}"
     phase = PHASES[feature]
-    if PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered):
+    if (phase == "3" and delivered != "3"
+            or PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered)):
         return f"vmlab-hv phase {phase}"
     return None

@@ -38,7 +38,7 @@ a timeout recovery while the pointer is on, Windows 10, and QEMU.
 
 ## Direct2D antialiasing (forced sample count)
 
-Since `patches/mesa/0094` the driver draws Direct2D's coverage pass
+Since `patches/mesa/yttrium-forced-sample-coverage-one-pass-per-sample.patch` the driver draws Direct2D's coverage pass
 (`ForcedSampleCount` 16, `SV_Coverage` XORed into `R16_UINT`) as one
 single-sampled draw per sample ([d2d-coverage.md](d2d-coverage.md)). Upstream
 draws it once under a fragment shader interlock, and that loses XORs: pale
@@ -90,9 +90,9 @@ result depends on the host GPU. Four were tried:
 | Host GPU, driver | Host | Result | Needs | Evidence |
 | --- | --- | --- | --- | --- |
 | AMD Radeon iGPU (Granite Ridge), RADV, Mesa 26.2.2 | helios | **Full pass**: every Done check in `docs/brief.md` item 2, on `windows-11` and `windows-10`, and every stretch application renders, and the compatibility sweep passes 12 of 12 (package 0.1.1-alpha-rc2, vmlab 0.28.0-alpha) | A plain vmlab lab that names the AMD GPU (`host_gpu = "AMD1"`) | [`acceptance.md`](acceptance.md) |
-| NVIDIA RTX 5090, 610.57.04 | helios | **Full pass**, 12 of 12 Done checks, through `tests/e2e/run.sh` with package 0.1.1-alpha-rc3 and vmlab 0.30.0-alpha, with Resizable BAR on (BAR1 32 GiB): `windows-11` and `windows-10` on `Nvidia1` and `windows-11` on `Nvidia2`; the guest lists exactly one Venus device, every stretch application renders (on `Nvidia2` Blender's kept capture caught its window before it had drawn, and a rerun rendered), and the host logged no Xid. The compatibility sweep passes 12 of 12 on `Nvidia2`, and three VMs on one card logged no `can't alloc VA space` line. rc1 passed the same checks with BAR1 at 256 MiB. Depth draws into the back buffer need `patches/mesa/0022`, and mipmapped and R5G6B5 D3D9 textures need `0023` and `0025` (below). Without Resizable BAR, applications that fill the 256 MiB BAR1 need `0070` and `0086`, and Vulkan applications with shading-rate state need `0075` (below) | `patches/mesa/0020`, `0022`, `0023` and `0025` (in the package) **and** the patched QEMU (the VMLabDev/qemu commit in [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS)) as the GPU's `qemu_binary` in the host config. Helios's host config gives both `Nvidia1` and `Nvidia2` one; without it the probes render but the console is black. The vmlab render server, selected with `qemu_env`, removes a 10 ms floor from every Venus fence ("Presentation pacing" below) | [`acceptance.md`](acceptance.md#nvidia-rtx-5090), [`nvidia.md`](nvidia.md) |
-| Intel Iris Xe (Raptor Lake-P), ANV, Mesa 26.2.2 | Zeus | **Full pass** on `windows-11`, 12 of 12 Done checks. Without `patches/mesa/0021`, dwm crash-loops and the console is black | `patches/mesa/0021` (in the package) | [`zeus.md`](zeus.md) |
-| NVIDIA RTX 4060 Max-Q (laptop), 615.71.09 | Zeus | **Full pass**, 12 of 12 twice (2026-10-19, [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) of branch `work/nvfb`, package defaults, the patched QEMU, vmlab 0.28). On this host the guest does not see the GPU's writes to uncached host-visible memory (type 2) and the GPU does not see the guest's; without the fixes every Vulkan, D3D12 and OpenGL client hung on its first fence (Venus feedback lived there), and with only the feedback fix about one OpenGL readback in three came back black (Zink's upload buffers live there). In a fresh lab the first D3D12 probe could present only one frame in its 20 seconds (not caused by the fixes, cause not investigated); the probes now count `--seconds` from their first frame ([`x86d3d12.md`](x86d3d12.md)) | `patches/mesa/0065` to `0067` (in the package) and the patched QEMU as `qemu_binary` | [`nvfb.md`](nvfb.md), [`zeus.md`](zeus.md#nvidia-rtx-4060) |
+| NVIDIA RTX 5090, 610.57.04 | helios | **Full pass**, 12 of 12 Done checks, through `tests/e2e/run.sh` with package 0.1.1-alpha-rc3 and vmlab 0.30.0-alpha, with Resizable BAR on (BAR1 32 GiB): `windows-11` and `windows-10` on `Nvidia1` and `windows-11` on `Nvidia2`; the guest lists exactly one Venus device, every stretch application renders (on `Nvidia2` Blender's kept capture caught its window before it had drawn, and a rerun rendered), and the host logged no Xid. The compatibility sweep passes 12 of 12 on `Nvidia2`, and three VMs on one card logged no `can't alloc VA space` line. rc1 passed the same checks with BAR1 at 256 MiB. Depth draws into the back buffer need `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`, and mipmapped and R5G6B5 D3D9 textures need `0023` and `0025` (below). Without Resizable BAR, applications that fill the 256 MiB BAR1 need `0070` and `0086`, and Vulkan applications with shading-rate state need `0075` (below) | `patches/mesa/0020`, `0022`, `0023` and `0025` (in the package) **and** the patched QEMU (the VMLabDev/qemu commit in [patches/host/PINS](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/patches/host/PINS)) as the GPU's `qemu_binary` in the host config. Helios's host config gives both `Nvidia1` and `Nvidia2` one; without it the probes render but the console is black. The vmlab render server, selected with `qemu_env`, removes a 10 ms floor from every Venus fence ("Presentation pacing" below) | [`acceptance.md`](acceptance.md#nvidia-rtx-5090), [`nvidia.md`](nvidia.md) |
+| Intel Iris Xe (Raptor Lake-P), ANV, Mesa 26.2.2 | Zeus | **Full pass** on `windows-11`, 12 of 12 Done checks. Without `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch`, dwm crash-loops and the console is black | `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` (in the package) | [`zeus.md`](zeus.md) |
+| NVIDIA RTX 4060 Max-Q (laptop), 615.71.09 | Zeus | **Full pass**, 12 of 12 twice (2026-10-19, [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) of branch `work/nvfb`, package defaults, the patched QEMU, vmlab 0.28). On this host the guest does not see the GPU's writes to uncached host-visible memory (type 2) and the GPU does not see the guest's; without the fixes every Vulkan, D3D12 and OpenGL client hung on its first fence (Venus feedback lived there), and with only the feedback fix about one OpenGL readback in three came back black (Zink's upload buffers live there). In a fresh lab the first D3D12 probe could present only one frame in its 20 seconds (not caused by the fixes, cause not investigated); the probes now count `--seconds` from their first frame ([`x86d3d12.md`](x86d3d12.md)) | `patches/mesa/venus-feedback-buffers-in-host-cached-memory.patch` to `0067` (in the package) and the patched QEMU as `qemu_binary` | [`nvfb.md`](nvfb.md), [`zeus.md`](zeus.md#nvidia-rtx-4060) |
 
 All four hosts ran QEMU 11.1.1 (on NVIDIA, the vmlab QEMU built on it) and
 virglrenderer 1.3.0. No other GPU or driver version was tried. On
@@ -116,7 +116,7 @@ needs `qemu_binary` on its host config block
 before it), dwm crashes before logon. `docs/nvidia.md` explains both faults.
 
 **On NVIDIA, depth draws into the back buffer hung the guest until
-`patches/mesa/0022`, and mipmapped textures were black until `0023`.**
+`patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`, and mipmapped textures were black until `0023`.**
 Before 0022, the DirectX SDK's D3D9 `BasicHLSL` hung on both RTX 5090s, and
 the host logged an Xid 69 each time:
 
@@ -153,7 +153,7 @@ evidence that shows the hang is in git history at [82d8e51](https://github.com/V
 > 2026-10-19 across 52 runtime-power resumes under Venus, with or without a
 > keep-awake helper. The 4060's other failure was a different one: Venus
 > feedback writes from the host GPU never reached the guest, so Vulkan, D3D12
-> and OpenGL clients hung. `patches/mesa/0065` to `0067` fix it
+> and OpenGL clients hung. `patches/mesa/venus-feedback-buffers-in-host-cached-memory.patch` to `0067` fix it
 > ([nvfb.md](nvfb.md)).
 
 On a host with an AMD or Intel GPU and an NVIDIA GPU, declare both in the host
@@ -194,7 +194,7 @@ while it renders, mostly for the Yttrium UMD's shared images. With three VMs
 on a card, BAR1 runs out: the host kernel logs `NVRM: dmaAllocMapping_GM107:
 can't alloc VA space for mapping`, and guest Venus contexts die (dwm or
 applications report ring timeouts, often in `vkGetImageSubresourceLayout`).
-`patches/mesa/0070` (with `0086`) keeps Vulkan, DXVK, vkd3d-proton and Zink
+`patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` (with `0086`) keeps Vulkan, DXVK, vkd3d-proton and Zink
 memory out of BAR1, but not the UMD's images. With `0070` and `0086` (package from
 [b74ea3c](https://github.com/VMLabDev/vmlab-win3d/commit/b74ea3c22396862ab54d5ef119a774942b938780)), a `windows-11` e2e run on a shared `Nvidia2` still lost the
 D3D11 x86 and D3D12 x64 probes: the render server logged
@@ -462,8 +462,8 @@ The probes here report frame rates, which are not a pacing measurement.
 D3D9 ran at about 30 fps on the AMD host and about 20 fps on its RTX 5090,
 and DirectDraw windowed blits to the primary reached 13 to 34 per second.
 On hosts with an AMD CPU, the KMD's CPU copy for a Blt present wrote an
-uncached destination and read an uncached source. `patches/kmd/0002` and
-`patches/mesa/0026` fix both ends ([`present.md`](present.md)). On
+uncached destination and read an uncached source. `patches/kmd/kmd-cache-gdi-shadow-and-staging-surfaces.patch` and
+`patches/mesa/d3d9-ddraw-present-sources-in-host-cached-memory.patch` fix both ends ([`present.md`](present.md)). On
 `AMD1` the D3D9 probe now runs at 59.4 and 58.2 fps (x64, x86), and
 DirectDraw at several hundred Blts per second.
 
@@ -519,7 +519,7 @@ also ran on Windows 10, on `Nvidia2` ([`ffp2.md`](ffp2.md)).
 Blender's window was translucent on Windows 10 in the 0.1.0 runs: the
 wallpaper showed through its viewport and panels. Mesa's WGL asked for a
 premultiplied-alpha swapchain for every window, so the compositor blended
-the alpha Blender leaves in its framebuffer. `patches/mesa/0027` presents
+the alpha Blender leaves in its framebuffer. `patches/mesa/wgl-present-windows-opaque.patch` presents
 WGL windows opaque ([`present.md`](present.md)), and the rc1 runs show
 Blender opaque on `AMD1` and `Nvidia1`
 ([docs/evidence/acceptance/windows-10/apps/console-opengl-x64-Blender.png](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10/apps/console-opengl-x64-Blender.png)).
@@ -540,8 +540,8 @@ OpenGL and Vulkan, x64 and x86), two diagnostic probes (`probes/dxut-enum`,
 
 - DirectX SDK (June 2010) samples: `BasicHLSL` and
   `ParallaxOcclusionMapping` (D3D9) render, textured on NVIDIA since
-  `patches/mesa/0023`; `SubD11` and `BasicHLSL11`
-  (D3D11) render after `patches/mesa/0015` to `0017`, with the window
+  `patches/mesa/yttrium-shared-colour-optimal-when-linear-refused.patch`; `SubD11` and `BasicHLSL11`
+  (D3D11) render after `patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch` to `0017`, with the window
   caveat below. In the 0.1.1-alpha-rc1 and rc3 acceptance runs they render on
   `AMD1`, `Nvidia1` and `Nvidia2`;
 - Blender 4.2.3 (OpenGL 4.3) renders its UI and viewport on the same three
@@ -559,23 +559,23 @@ OpenGL and Vulkan, x64 and x86), two diagnostic probes (`probes/dxut-enum`,
   - F1, Godot Vulkan on NVIDIA (host Xid 69, ErrorCode `0x13d`): fixed by
     `patches/mesa/0075` ([godot.md](godot.md)).
   - F2, GZDoom Vulkan on NVIDIA, and F4, Unigine OpenGL on NVIDIA: the
-    256 MiB BAR1 running out. Fixed by `patches/mesa/0070` and `0086`, with
+    256 MiB BAR1 running out. Fixed by `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` and `0086`, with
     `0085` for Unigine ([gzdoom.md](gzdoom.md), [unigl.md](unigl.md)).
   - F3, GZDoom could not create an OpenGL context on either GPU: fixed by
-    `patches/mesa/0080` ([gzdoom.md](gzdoom.md)).
+    `patches/mesa/wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch` ([gzdoom.md](gzdoom.md)).
   - F5, Unigine D3D9 skipped its depth-bias draws on NVIDIA: fixed by
     `patches/mesa/0090` ([unid3d.md](unid3d.md)).
   - F6, Valley D3D9 ran out of 32-bit address space and hung: fixed by
-    `patches/mesa/0091` and `0092` ([f6va.md](f6va.md)).
+    `patches/mesa/d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch` and `0092` ([f6va.md](f6va.md)).
   - F7, Heaven D3D11 crashed once on AMD1 with heap corruption: most likely
-    fixed by `patches/mesa/0060`, not yet proven (the Unigine section
+    fixed by `patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch`, not yet proven (the Unigine section
     below).
 
 D3D9 fixed function goes through the shaders that the Windows runtime
 generates; its coverage and what it still lacks are in the next section.
 
 D3D10 has no probe here. Five unmodified Microsoft D3D12 samples have run
-([d3d12app.md](d3d12app.md); all five render, `D3D12ExecuteIndirect` with `patches/vkd3d-proton/0006`, [ei.md](ei.md)). The prior art ran real applications on its own builds of the
+([d3d12app.md](d3d12app.md); all five render, `D3D12ExecuteIndirect` with `patches/vkd3d-proton/vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch`, [ei.md](ei.md)). The prior art ran real applications on its own builds of the
 same components:
 
 - GravityMark (D3D11, D3D12, OpenGL), Unigine Heaven (D3D9, D3D11, OpenGL),
@@ -605,7 +605,7 @@ Without it, the card's CPU-visible VRAM is a 256 MiB BAR1 window that
 every VM on the card shares. Unigine Heaven and
 Valley with OpenGL crashed on NVIDIA when that window ran out, or when Zink
 mapped a buffer it had moved out of the window (compat F4,
-[unigl.md](unigl.md)). With `patches/mesa/0070` (nvva), `0085` and `0086`,
+[unigl.md](unigl.md)). With `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` (nvva), `0085` and `0086`,
 Zink keeps such buffers in host memory, and both benchmarks run on
 `Nvidia1` (72 and 64 fps) and, in the merged package, on `Nvidia2` (53 and
 60 fps). On NVIDIA, OpenGL buffers that Zink would put in
@@ -624,7 +624,7 @@ when BAR1 runs out ("Two Windows VMs per RTX 5090" above).
   Unigine D3D9 skipped every draw that used a depth bias.
 - Unigine Valley's D3D9 renderer, a 32-bit process, ran out of its 4 GiB
   address space within 90 s through the UMD's ordered-context-worker upload
-  path, then hung or crashed. `patches/mesa/0091` and `0092` fix it
+  path, then hung or crashed. `patches/mesa/d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch` and `0092` fix it
   ([f6va.md](f6va.md)): Valley D3D9 runs 10 minutes on `AMD1` and `Nvidia1`
   within 2.1 GiB, and Heaven D3D9 exits cleanly. In a 32-bit process the
   UMD now holds its live upload buffers to 256 MiB (`UPLOAD_BUDGET_MB` in
@@ -634,7 +634,7 @@ when BAR1 runs out ("Two Windows VMs per RTX 5090" above).
 - Unigine Heaven D3D11 on AMD1 crashes intermittently with heap corruption.
   Under PageHeap it crashed in 2 of 5 runs, in both cases on a use-after-free
   of a queued flush label (`yttrium_threaded_set_flush_label`) run by the
-  threaded context's worker. `patches/mesa/0060` (the dwm double free in the
+  threaded context's worker. `patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch` (the dwm double free in the
   same flush-label path) most likely fixes it: 5 of 5 PageHeap runs were clean
   with it ([dwmheap.md](dwmheap.md#f7-heaven-d3d11)), which is not yet proof.
   At the old rate of 2 in 5, five clean runs would happen by chance about
@@ -647,7 +647,7 @@ against Microsoft's reference rasterizer: texture-stage blending with up to
 four stages, texture transforms and coordinate generation, vertex and table
 fog, lighting, alpha test and blending, point sprites, and transformed and
 pre-transformed vertices, with hardware and with software vertex
-processing ([`ffp.md`](ffp.md)). With `patches/mesa/0040` to `0042` every
+processing ([`ffp.md`](ffp.md)). With `patches/mesa/d3d9-swvp-processed-vertices-keep-declaration-vs.patch` to `0042` every
 case matches on `Nvidia2` and `AMD1` except two spotlight cases, where the
 Windows runtime's own vertex processing differs from the reference's by up
 to 12/255 on a few pixels; the reference fed by the runtime's software
@@ -658,7 +658,7 @@ W-buffering, multisampling and wide lines.
 vertex blending with up to three weights, indexed blending and tweening,
 bump environment mapping, cube and volume texture coordinates, and mixed
 devices that switch between hardware and software vertex processing. Both
-probes also ran on Windows 10. With `patches/mesa/0043` (the `L6V5U5` and
+probes also ran on Windows 10. With `patches/mesa/d3d9-bump-luminance-formats.patch` (the `L6V5U5` and
 `X8L8V8U8` bump maps) every case matches on `Nvidia2` and `AMD1`. The
 exception is `vb_indexed_color`, where the reference's own vertex
 processing loses the device. Limits:
@@ -691,7 +691,7 @@ redistributable, so the package cannot ship it. Evidence:
 ### Indexed shader inputs and outputs: what is covered
 
 Shaders may index their inputs and outputs with a register
-(`dcl_indexrange`). `patches/mesa/0015` covers hull shader patch phases,
+(`dcl_indexrange`). `patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch` covers hull shader patch phases,
 `0030` patch constants in domain shaders ([`ds.md`](ds.md)), `0031` output
 ranges in every other stage and in a hull shader's control-point phase, and
 `0032` hull shader join phases that read their fork phases' outputs
@@ -704,28 +704,49 @@ in [`shaders2.md`](shaders2.md#what-remains): a range over a geometry
 shader's packed scalar system values is still rejected, and indexed reads of
 ordinary patch constants in a join phase were not run.
 
-### D3D12: ExecuteIndirect with vertex or index buffer arguments, and an NVIDIA first-boot dwm crash
+### Direct3D 10 and 11: at most 32 texture and sampler pairs in one shader
+
+The Yttrium UMD binds each pair of a shader resource and a sampler that a
+shader uses, and each buffer it loads, as one combined slot, and it has 32.
+Direct3D 11 allows 128 resources and 16 samplers in one stage. A pixel
+shader that needs more slots is created as a shader that writes zero to
+every colour output, and the UMD logs
+`pixel shader needs more than 32 combined texture slots` in
+`C:\ProgramData\Yttrium\yttrium-errors.log`. Before `patches/mesa/d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch`
+its creation removed the device. Wine's d3d11 test `test_high_resource_count`
+(50 textures sampled with two samplers, and 50 buffers) is such a shader, and
+its two checks fail. A vertex, geometry, hull, domain or compute shader that
+needs more slots still fails to create and removes the device.
+
+### D3D12: ExecuteIndirect is emulated, and an NVIDIA first-boot dwm crash
 
 Five unmodified Microsoft DirectX-Graphics-Samples D3D12 samples now build
 with clang-cl and the MSVC CRT (`build/d3d12-samples/`) and run through the
 installed package with no app-local DLLs (`docs/d3d12app.md`).
 `D3D12HelloTriangle`, `D3D12HelloTexture`, `D3D12Bundles` and
 `D3D12nBodyGravity` render and exit 0 on AMD1 and Nvidia1. Two failures
-were found. The first is fixed in part, the second is fixed:
+were found. Both are fixed, the first with limits:
 
-- **`ExecuteIndirect` with a command signature that sets vertex or index
-  buffer views** draws wrongly, with no error. Venus (guest Mesa 26.1.0 and
-  virglrenderer 1.3.0) does not forward `VK_EXT_device_generated_commands`,
-  which vkd3d-proton uses for state-changing signatures.
-  `patches/vkd3d-proton/0006` emulates signatures that set root constants
-  or root CBV, SRV or UAV addresses: one GPU-patched indirect draw or
-  dispatch per sequence. With it, `D3D12ExecuteIndirect` renders as on WARP
-  on AMD1 and Nvidia1 ([ei.md](ei.md)). Vertex and index buffer view
-  arguments are still dropped. The emulation also moves every root
-  signature's root parameters into a push UBO and root CBVs to raw VAs,
-  with unmeasured cost per draw.
+- **`ExecuteIndirect` with a command signature that changes state** is
+  emulated. Venus (guest Mesa 26.1.0 and virglrenderer 1.3.0) does not
+  forward `VK_EXT_device_generated_commands`, which vkd3d-proton uses for
+  such signatures. `patches/vkd3d-proton/vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch` emulates signatures that set
+  root constants or root CBV, SRV or UAV addresses: one GPU-patched indirect
+  draw or dispatch per sequence. With it, `D3D12ExecuteIndirect` renders as
+  on WARP on AMD1 and Nvidia1. `patches/vkd3d-proton/vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch` emulates
+  signatures that set vertex or index buffer views: the GPU copies the
+  indices and vertices each sequence draws into scratch buffers
+  ([ei.md](ei.md#vertex-and-index-buffer-views)). The limits:
+  - The scratch buffers have a fixed size: 1024 vertices for each sequence
+    of `MaxCommandCount`, between 16,384 and 1,048,576 for one call, and four
+    times as many indices. A draw that does not fit is not drawn, and
+    vkd3d-proton logs an error when the command allocator is reset.
+    `VKD3D_EXECUTE_INDIRECT_VERTEX_BUDGET` sets the number of vertices.
+  - Every such call copies what it draws. The cost was not measured.
+  - The emulation moves every root signature's root parameters into a push
+    UBO and root CBVs to raw VAs, with unmeasured cost per draw.
 - **On NVIDIA, dwm.exe crashed in the first boot after the install.**
-  Fixed by `patches/mesa/0060`: the UMD's `TrimResidencySet` flushed its
+  Fixed by `patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch`: the UMD's `TrimResidencySet` flushed its
   threaded context from DXCore's trim-notification thread while dwm
   recovered from a lost device, and freed a record twice
   ([`dwmheap.md`](dwmheap.md)). The lost device itself remains: in a busy
@@ -755,7 +776,7 @@ check ([x86d3d12.md](x86d3d12.md)).
 ### DirectDraw: 16 bpp only for 32-bit programs, and flips below the refresh rate on NVIDIA
 
 Fullscreen exclusive DirectDraw works: the mode change, the flip chain,
-`Flip`, and restoring the desktop mode. `patches/mesa/0035` draws source
+`Flip`, and restoring the desktop mode. `patches/mesa/d3d9-hardware-colour-key-and-mirror-blits.patch` draws source
 colour-key and mirror blits on the GPU, matching DirectDraw's emulation
 pixel for pixel ([`ddraw.md`](ddraw.md)). What remains:
 

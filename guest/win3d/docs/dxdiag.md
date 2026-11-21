@@ -11,7 +11,7 @@ device as follows:
 | `Get-Dxdiag.ps1` `hardware_acceleration` | `false` | `true` |
 
 Three Mesa patches against the D3D9 user-mode driver (UMD) fix it:
-`patches/mesa/0012` to `0014`. No KMD change was needed. The evidence is in
+`patches/mesa/d3d9-directdraw-hal-caps.patch` to `0014`. No KMD change was needed. The evidence is in
 [docs/evidence/dxdiag/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/).
 
 ## How DirectDraw finds the driver
@@ -66,7 +66,7 @@ the same pattern, with DDraw and AGP both Enabled
 
 ### 0012: report the D3D7 and D3D8 caps
 
-`patches/mesa/0012-d3d9-directdraw-hal-caps.patch` adds three things:
+`patches/mesa/d3d9-directdraw-hal-caps.patch` adds three things:
 
 - `D3DDDICAPS_GETD3D7CAPS` returns `D3DHAL_D3DEXTENDEDCAPS` (116 bytes,
   mirrored locally like the D3D3 structure, because `d3dhal.h` clashes with
@@ -97,7 +97,7 @@ everything outside the rectangle became black. In the ddcaps blit test,
 every hardware copy and stretch result was lost and only the emulated mirror
 blit survived ([docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag/before/ddcaps-x64-0012-only.json)).
 
-`patches/mesa/0013-d3d9-write-only-lock-keeps-contents.patch` sends locks
+`patches/mesa/d3d9-write-only-lock-keeps-contents.patch` sends locks
 that are write-only without `Discard` through the existing readback path,
 which starts from the current contents. D3D9 applications rarely
 lock textures write-only without `Discard`, and the D3D9 probes show no
@@ -116,7 +116,7 @@ A D3D9 swapchain back buffer gets `PIPE_BIND_DISPLAY_TARGET`; the trace
 shows bind `0x100082` for a D3D9 back buffer and `0x100002` for a DirectDraw
 surface.
 
-`patches/mesa/0014-d3d9-ddraw-surfaces-are-present-sources.patch` records
+`patches/mesa/d3d9-ddraw-surfaces-are-present-sources.patch` records
 the runtime interface at `CreateDevice`. For interfaces below 9 (DirectDraw
 and Direct3D 7 and earlier), it creates plain colour surfaces in video memory
 as display targets. D3D9 devices are unchanged.

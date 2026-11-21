@@ -1,0 +1,357 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: take the vblank from the host's frame clock when it offers it
+
+The vsync came from a guest timer: a DPC every 16.7 ms that sent the
+recorded flip and then an empty SUBMIT_3D, whose completion interrupt
+raised CRTC_VSYNC. Its period was the guest's timer resolution, and the
+guest's clock, not the host display's (P2 of the win3d design,
+docs/vblank.md).
+
+When vmlab-hv offers VIRTIO_GPU_F_VMLAB_ORDERED_FLIP (23), StartVsyncTimer
+starts no timer. It sends VIRTIO_GPU_CMD_VMLAB_VBLANK (0x0f02), which the
+host holds, without holding the commands behind it, and answers at the next
+tick of its 60 Hz frame clock with the tick and its host time. The
+interrupt routine raises the vsync on that answer when no flip waits to be
+sent. When one waits, the completion of the wait, at DPC level, sends the
+flip, raises the vsync itself through DxgkCbSynchronizeExecution, and sends
+the next wait. So the vsync comes at the host's tick in both cases, and it
+reports a flip only after the flip was sent, as 0008 made it. It does not
+wait for the host's answer to the flip: that answer comes when the host GPU
+has shown the frame, and a vsync tied to it took the jitter of the host GPU
+and cost frames (docs/vblank.md, "Result").
+
+A host that does not offer the bit (QEMU, an older vmlab-hv) leaves the
+timer and its NOP as they were. So does a wait that the host refuses or that
+cannot be queued: the driver falls back to the timer. A reset cancels the
+wait, and a start on a new transport sends a new one. The trace build
+records each host vblank as event 25.
+---
+diff --git a/viogpu/common/viogpu.h b/viogpu/common/viogpu.h
+index 0c814435..86b6e8be 100644
+--- a/viogpu/common/viogpu.h
++++ b/viogpu/common/viogpu.h
+@@ -286,6 +286,31 @@ typedef struct virtio_gpu_vmlab_copy_box
+ } GPU_VMLAB_COPY_BOX, *PGPU_VMLAB_COPY_BOX;
+ #pragma pack()
+ 
++/* VIRTIO_GPU_CMD_VMLAB_VBLANK (VIRTIO_GPU_F_VMLAB_ORDERED_FLIP): wait for the
++ * next vblank of the host's frame clock. The host holds it, without holding
++ * the commands behind it, and answers VIRTIO_GPU_RESP_OK_VMLAB_VBLANK at the
++ * first tick after it arrived, with the tick's number and its host time
++ * (CLOCK_MONOTONIC, nanoseconds). No fence. */
++#define VIRTIO_GPU_CMD_VMLAB_VBLANK 0x0f02
++#define VIRTIO_GPU_RESP_OK_VMLAB_VBLANK 0x11f0
++#pragma pack(1)
++typedef struct virtio_gpu_vmlab_vblank
++{
++    GPU_CTRL_HDR hdr;
++    ULONG scanout_id;
++    ULONG padding;
++} GPU_VMLAB_VBLANK, *PGPU_VMLAB_VBLANK;
++
++typedef struct virtio_gpu_resp_vmlab_vblank
++{
++    GPU_CTRL_HDR hdr;
++    ULONGLONG sequence;
++    ULONGLONG timestamp_ns;
++    ULONG period_ns;
++    ULONG padding;
++} GPU_RESP_VMLAB_VBLANK, *PGPU_RESP_VMLAB_VBLANK;
++#pragma pack()
++
+ /* VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: simple transfer to_host */
+ #pragma pack(1)
+ typedef struct virtio_gpu_transfer_to_host_2d
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index 4525271c..ef478b57 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -1138,6 +1138,40 @@ UINT CtrlQueue::PresentCopy(const GPU_VMLAB_PRESENT_COPY *fields, PGPU_VMLAB_COP
+     return ret;
+ }
+ 
++UINT CtrlQueue::VblankWait(void (*complete_cb)(void *), void *complete_ctx)
++{
++    // The answer is larger than the inline response, so it has its own
++    // buffer. FreeBuf deletes it with the request.
++    PBYTE resp = new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_VMLAB_VBLANK)];
++    if (!resp)
++    {
++        return (UINT)-1;
++    }
++    RtlZeroMemory(resp, sizeof(GPU_RESP_VMLAB_VBLANK));
++    PGPU_VBUFFER vbuf = NULL;
++    PGPU_VMLAB_VBLANK cmd =
++        (PGPU_VMLAB_VBLANK)AllocCmdResp(&vbuf, sizeof(*cmd), resp, sizeof(GPU_RESP_VMLAB_VBLANK));
++    if (!cmd || !vbuf)
++    {
++        delete[] resp;
++        return (UINT)-1;
++    }
++    RtlZeroMemory(cmd, sizeof(*cmd));
++    cmd->hdr.type = VIRTIO_GPU_CMD_VMLAB_VBLANK;
++    cmd->scanout_id = 0;
++
++    vbuf->complete_cb = complete_cb;
++    vbuf->complete_ctx = complete_ctx;
++
++    UINT ret = QueueBuffer(vbuf);
++    if (ret)
++    {
++        DbgPrint(TRACE_LEVEL_WARNING, ("%s failed to queue the host vblank wait ret=%u\n", __FUNCTION__, ret));
++        ReleaseBuffer(vbuf);
++    }
++    return ret;
++}
++
+ PAGED_CODE_SEG_BEGIN
+ 
+ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y)
+diff --git a/viogpu/common/viogpu_queue.h b/viogpu/common/viogpu_queue.h
+index 5b77b9d0..13b55300 100644
+--- a/viogpu/common/viogpu_queue.h
++++ b/viogpu/common/viogpu_queue.h
+@@ -313,6 +313,15 @@ class CtrlQueue : public VioGpuQueue
+     // Queues VIRTIO_GPU_CMD_VMLAB_PRESENT_COPY. Takes ownership of boxes,
+     // fields->count entries allocated with new[] from non-paged pool.
+     UINT PresentCopy(const GPU_VMLAB_PRESENT_COPY *fields, PGPU_VMLAB_COPY_BOX boxes);
++    // The same bit offers the host's vblank.
++    BOOLEAN HasHostVblank() const
++    {
++        return m_OrderedFlip;
++    }
++    // Queues VIRTIO_GPU_CMD_VMLAB_VBLANK. complete_cb runs at the host's next
++    // tick, or with VIRTIO_GPU_RESP_ERR_UNSPEC when a reset cancels the wait.
++    // Non-zero when nothing was queued.
++    UINT VblankWait(void (*complete_cb)(void *), void *complete_ctx);
+     UINT Flush();
+ 
+     void CreateResource(UINT res_id, UINT format, UINT width, UINT height);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 406b469c..a6fddab5 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -109,6 +109,35 @@ static BOOLEAN InterruptCloseBarrier(PVOID)
+ 
+ #define VIOGPU_WORK_THREAD_WAIT_LOG_INTERVAL_MS 5000
+ 
++// The vsync of a host vblank whose flip was sent only now, from the DPC
++// (docs/vblank.md). The report runs as the interrupt routine's does.
++static BOOLEAN RaiseVsyncSyncRoutine(void *ctx)
++{
++    reinterpret_cast<VioGpuAdapter *>(ctx)->RaiseVsyncSynchronized();
++    return TRUE;
++}
++
++void VioGpuAdapter::RaiseVsyncSynchronized(void)
++{
++    if (!IsVsyncInterruptEnabled())
++    {
++        return;
++    }
++    PHYSICAL_ADDRESS sourceAddress = {};
++    vidpn.DequeueSourceAddress(&sourceAddress);
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
++    interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
++    interrupt.CrtcVsync.VidPnTargetId = 0;
++    interrupt.CrtcVsync.PhysicalAddress = sourceAddress;
++    m_DxgkInterface.DxgkCbNotifyInterrupt(m_DxgkInterface.DeviceHandle, &interrupt);
++    m_DxgkInterface.DxgkCbQueueDpc(m_DxgkInterface.DeviceHandle);
++}
++
++void VioGpuAdapter::RaiseVsync(void)
++{
++    ExecuteSynchronized(RaiseVsyncSyncRoutine, this);
++}
++
+ BOOLEAN VioGpuAdapter::ExecuteSynchronized(VIOGPU_SYNC_EXEC_ROUTINE routine, void *routineCtx)
+ {
+     if (!routine)
+@@ -3953,6 +3982,12 @@ BOOLEAN VioGpuAdapter::InterruptRoutine(_In_ ULONG MessageNumber)
+                 const PGPU_CTRL_HDR traceResponse = reinterpret_cast<PGPU_CTRL_HDR>(pvbuf->resp_buf);
+                 Trace(5, 0, 0, traceRequest->ctx_id, traceRequest->flags,
+                       traceRequest->fence_id, traceResponse && len >= sizeof(*traceResponse) ? traceResponse->type : 0);
++                // The host's vblank (docs/vblank.md): its answer raises the
++                // vsync below, unless a flip waits to be sent first.
++                if (pvbuf->complete_cb == VioGpuVidPN::HostVblankDone && vidpn.OnHostVblankFromIsr(pvbuf, len))
++                {
++                    InterlockedExchange(&vidpn.m_vsync, 1);
++                }
+                 if (pvbuf->complete_cb == VioGpuCommand::RunningCbDone && pvbuf->complete_ctx != NULL)
+                 {
+                     VioGpuCommand *cmd = reinterpret_cast<VioGpuCommand *>(pvbuf->complete_ctx);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 4abc3424..a2ca59a0 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -355,6 +355,10 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     }
+ #endif
+     BOOLEAN IsRecovering() const { return m_tdr.RecoveryState != 0; }
++    LONG TransportGeneration() const { return m_transportGeneration; }
++    // Report a vsync from a DPC, synchronized with the interrupt routine.
++    void RaiseVsync(void);
++    void RaiseVsyncSynchronized(void);
+     // vmlab-hv reported VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST: the host GPU is
+     // gone for the rest of this boot (docs/device-lost.md).
+     BOOLEAN IsHostGpuLost() const { return m_hostGpuLost != 0; }
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index a843a32b..736ee3a4 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -1999,6 +1999,27 @@ VOID VioGpuVidPN::StartVsyncTimer(void)
+ {
+     ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+ 
++    if (m_pAdapter->ctrlQueue.HasHostVblank())
++    {
++        // The host's frame clock answers a wait at each vblank, and the
++        // answer raises the vsync: no timer and no empty command per tick.
++        InterlockedExchange(&m_hostVblank, 1);
++        InterlockedExchange(&m_hostVblankFailed, 0);
++        InterlockedExchange(&m_vsyncOwed, 0);
++        InterlockedExchange(&m_shouldFlipStop, 0);
++        const LONG generation = m_pAdapter->TransportGeneration();
++        // A wait sent before a stop may still be on the queue. It goes on
++        // ticking, unless the transport was made again since.
++        if (InterlockedCompareExchange(&m_vblankArmed, 1, 0) == 0 || m_vblankGeneration != generation)
++        {
++            InterlockedExchange(&m_vblankArmed, 1);
++            m_vblankGeneration = generation;
++            SubmitHostVblank();
++        }
++        return;
++    }
++    InterlockedExchange(&m_hostVblank, 0);
++
+     if (!m_timerRes)
+     {
+         m_timerRes = ExSetTimerResolution(10000, TRUE);
+@@ -2202,6 +2223,88 @@ void VioGpuVidPN::VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID sy
+     KeReleaseSpinLockFromDpcLevel(&vidpn->m_vsyncTimerLock);
+ }
+ 
++void VioGpuVidPN::SubmitHostVblank(void)
++{
++    if (m_pAdapter->ctrlQueue.VblankWait(HostVblankDone, this))
++    {
++        FallBackToTimer();
++    }
++}
++
++// The host's vblank cannot be had: the timer and its NOP take over, as on a
++// host without the bit. The timer runs at the resolution Windows has.
++void VioGpuVidPN::FallBackToTimer(void)
++{
++    InterlockedExchange(&m_hostVblank, 0);
++    InterlockedExchange(&m_vsyncOwed, 0);
++    InterlockedExchange(&m_vblankArmed, 0);
++    DbgPrint(TRACE_LEVEL_ERROR, ("%s: the host's vblank failed; the vsync timer takes over\n", __FUNCTION__));
++
++    LARGE_INTEGER now;
++    LARGE_INTEGER due;
++    KeQuerySystemTime(&now);
++    next_vsync_time.QuadPart = now.QuadPart + kVsyncPeriod100ns;
++    due.QuadPart = -kVsyncPeriod100ns;
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_vsyncTimerLock, &oldIrql);
++    if (InterlockedCompareExchange(&m_shouldFlipStop, 0, 0) == 0)
++    {
++        KeSetTimerEx(&m_vsyncNotifyTimer, due, 0, &m_vsyncNotifyDpc);
++    }
++    KeReleaseSpinLock(&m_vsyncTimerLock, oldIrql);
++}
++
++BOOLEAN VioGpuVidPN::OnHostVblankFromIsr(struct virtio_gpu_vbuffer *pvbuf, UINT len)
++{
++    const PGPU_RESP_VMLAB_VBLANK resp = reinterpret_cast<PGPU_RESP_VMLAB_VBLANK>(pvbuf->resp_buf);
++    if (!resp || len < sizeof(*resp) || resp->hdr.type != VIRTIO_GPU_RESP_OK_VMLAB_VBLANK)
++    {
++        InterlockedExchange(&m_hostVblankFailed, 1);
++        return FALSE;
++    }
++    InterlockedExchange64(&m_hostVblankSequence, (LONG64)resp->sequence);
++    InterlockedExchange64(&m_hostVblankTimeNs, (LONG64)resp->timestamp_ns);
++
++    // A vsync reports a flip only once it was sent (0008). A flip that
++    // waits is sent from the completion of this wait, a DPC, which then
++    // raises the vsync of this tick itself. Without one this answer does.
++    const BOOLEAN raise = InterlockedCompareExchange(&m_shouldFlip, 0, 0) == 0;
++    if (!raise)
++    {
++        InterlockedExchange(&m_vsyncOwed, 1);
++    }
++    m_pAdapter->FlipTrace(25, 0, (UINT)resp->sequence, resp->timestamp_ns, raise ? 1 : 0);
++    return raise;
++}
++
++void VioGpuVidPN::HostVblankDone(void *ctx)
++{
++    VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
++    if (InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) != 0)
++    {
++        // Stopped, or cancelled by a reset. A start that came after the stop
++        // and found this wait still on the queue left the ticking to it, so
++        // look again once disarmed.
++        InterlockedExchange(&vidpn->m_vblankArmed, 0);
++        if (InterlockedCompareExchange(&vidpn->m_shouldFlipStop, 0, 0) != 0 ||
++            InterlockedCompareExchange(&vidpn->m_vblankArmed, 1, 0) != 0)
++        {
++            return;
++        }
++    }
++    if (InterlockedExchange(&vidpn->m_hostVblankFailed, 0))
++    {
++        vidpn->FallBackToTimer();
++        return;
++    }
++    // The flip goes ahead of the next wait, and the host serves it first.
++    vidpn->Flip();
++    if (InterlockedExchange(&vidpn->m_vsyncOwed, 0))
++    {
++        vidpn->m_pAdapter->RaiseVsync();
++    }
++    vidpn->SubmitHostVblank();
++}
+ 
+ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
+ {
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 1f78fc42..54f8c331 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -109,6 +109,11 @@ class VioGpuVidPN
+ 
+     void Flip();
+     static void VsyncNotifyTimerDpc(KDPC *dpc, PVOID deferredContext, PVOID systemArg1, PVOID systemArg2);
++    // The host's vblank (VIRTIO_GPU_CMD_VMLAB_VBLANK, docs/vblank.md): the
++    // completion of a wait, which the interrupt routine knows it by.
++    static void HostVblankDone(void *ctx);
++    // The interrupt routine's part. TRUE when the answer raises the vsync.
++    BOOLEAN OnHostVblankFromIsr(struct virtio_gpu_vbuffer *pvbuf, UINT len);
+     PHYSICAL_ADDRESS GetCurrentSourceAddress() const
+     {
+         return m_sourceAddress;
+@@ -181,4 +186,22 @@ class VioGpuVidPN
+     volatile LONG m_sourceAddressQueueSent = 0;
+     volatile LONG64 m_sentSourceAddress = 0;
+     volatile LONG m_sourceQueueFullCount = 0;
++
++    // The host's vblank in place of the timer: set by StartVsyncTimer when
++    // the host offers it, cleared when it fails.
++    void SubmitHostVblank(void);
++    void FallBackToTimer(void);
++    volatile LONG m_hostVblank = 0;
++    // One wait is on the queue, sent on transport generation
++    // m_vblankGeneration. A reset cancels it, a teardown drops it.
++    volatile LONG m_vblankArmed = 0;
++    LONG m_vblankGeneration = -1;
++    // The interrupt routine saw an answer that was not a vblank.
++    volatile LONG m_hostVblankFailed = 0;
++    // The interrupt routine left the vsync of this tick to the completion
++    // of the wait, which sends the waiting flip first.
++    volatile LONG m_vsyncOwed = 0;
++    // The last host vblank: its tick and host time in nanoseconds.
++    volatile LONG64 m_hostVblankSequence = 0;
++    volatile LONG64 m_hostVblankTimeNs = 0;
+ };

@@ -9,7 +9,7 @@ src DirectX-Headers v1.619.1 6193774904c940eebb9b0c51b816b93dd776cfeb25a951f0f4a
 # subproject, so Meson never downloads it.
 # The Mesa commit is branch yttrium-experimental of arehnman/virtio-win-mesa
 # ("yttrium: update experimental driver to November 2026 release", Mesa 26.1.0).
-# Local patches: patches/mesa/*.patch, applied in name order (see README.md).
+# Local patches: patches/mesa/series gives the application order (see README.md).
 # SOURCE_DATE_EPOCH used for the build.
 epoch 0
 # Toolchain: the image printed by build/toolchain/build.sh; its inputs are in
