@@ -10,3 +10,4 @@ kmd-host-ordered-flip.patch
 kmd-host-present-copy.patch
 kmd-host-gpu-lost.patch
 kmd-host-vblank.patch
+kmd-host-scan-line.patch
