@@ -2565,7 +2565,10 @@ mod tests {
         assert_eq!(read_all(&fs, nested), b"nested\n");
         assert_eq!(read_all(&fs, nested2), b"other\n");
         // readlink goes by the parent descriptor and the own name.
-        assert_eq!(FileSystem::readlink(&fs, &ctx(), link).unwrap(), b"hello.txt");
+        assert_eq!(
+            FileSystem::readlink(&fs, &ctx(), link).unwrap(),
+            b"hello.txt"
+        );
 
         // The snapshot form follows the rename too.
         let state = fs.save_state();
