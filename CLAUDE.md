@@ -163,6 +163,10 @@ Module map under `src/`:
   explicit settings, persisted VM identity, then automatic selection — and
   `vmlab_refusals`, the one list of what vmlab-hv cannot run yet, read by
   validation and again by the lab daemon.
+- `fuzzing.rs` — the bodies of the cargo-fuzz targets under `fuzz/` that
+  reach private modules (guest frames, registry documents), compiled under
+  `--cfg fuzzing` only; `docs/reviews/fuzz-coverage.md` lists every parser of
+  hostile input and its target.
 - `instance.rs` — lab instances (ADR-0011's amendment, PRD §3.2): the
   effective name `<declared>-<instance>` a directory runs its lab under, from
   `--instance`, `VMLAB_INSTANCE` or the linked git worktree, slugged to a DNS
