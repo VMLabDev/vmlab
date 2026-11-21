@@ -973,6 +973,38 @@ primitive limit. That block includes two baseline failed assertions.
 All 17 non-Wine adapter rows passed on both GPUs. Each GPU's nine Wine
 programs had four passes and five known failures.
 
+#### C343 — D3D9Ex texture upload and restricted depth-stencil creation
+
+The [Mesa patch](../patches/mesa/d3d9-preserve-borrowed-system-memory-pitch.patch)
+uses the supplied row and slice pitches when the resource borrows system
+memory. The 33-wide L8 texture in `d3d9ex.c:872` has a 33-byte row. The
+driver had used a 36-byte stride, so the center sample read column 31
+(`0xf7`) instead of column 16 (`0x7f`).
+
+The Windows 11 D3D9 runtime checks content-protection support before
+dispatching `CreateDepthStencilSurfaceEx` with
+`D3DUSAGE_RESTRICTED_CONTENT` to the driver. In
+`26100.1742.11#win3d`, the runtime's `CreateSurfaceLH` path queries
+`D3DDDICAPS_GETCONTENTPROTECTIONCAPS` and requires software or hardware
+protection with the corresponding driver callbacks. The Win3D driver has
+no [content-protection DDI](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/content-protection-ddi).
+The two assertions at lines 687 and 705 cover the return code and output
+pointer for that single rejected call.
+
+The Win3D e2e on AMD1 passed all 12 Done checks with the signed package
+from `a8ea869e`. It used Venus on `renderD130`.
+
+Wine 11.0's `d3d9ex` on the same package completed 2,379 checks with
+41 skips per GPU. Nvidia2 used Venus on `renderD129`. On each GPU,
+the remaining failure messages matched the comparison run after
+removing line 872.
+
+| Failed assertions | AMD1 #253 → C343 | Nvidia2 #337 rerun → C343 |
+| --- | ---: | ---: |
+| `d3d9ex.c:872` — texture sample after `UpdateTexture` | 1 → 0 | 1 → 0 |
+| `d3d9ex.c:687,705` — restricted depth-stencil creation | 2 → 2 | 2 → 2 |
+| Full program | 11 → 10 | 11 → 10 |
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.

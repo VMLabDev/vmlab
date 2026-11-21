@@ -7,9 +7,7 @@ of a 33-wide L8 texture to 36 samples the wrong bytes after UpdateTexture.
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
 --- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
-@@ -2593,6 +2593,17 @@ D3D9CopyInitialData(const D3DDDIARG_CREATERESOURCE *data,
-       return S_OK;
- 
+@@ -2595,4 +2595,15 @@ D3D9CopyInitialData(const D3DDDIARG_CREATERESOURCE *data,
     if (!D3D9PoolNeedsReadback(data->Pool)) {
 +      if (!data->Flags.VertexBuffer && !data->Flags.IndexBuffer) {
 +         /* This storage belongs to the caller and has no driver padding. */
