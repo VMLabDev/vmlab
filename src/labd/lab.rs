@@ -4642,6 +4642,51 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
     }
 
     #[tokio::test]
+    async fn a_lab_wide_restore_refuses_before_any_machine_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+ vm "a" { template = "x86_64/t" }
+ vm "b" { template = "x86_64/t" }
+}"#,
+            vec![
+                FakeMachine::new("a", MachineKind::Vm, &sh),
+                FakeMachine::new("b", MachineKind::Vm, &sh),
+            ],
+        );
+        lab.snapshot("a", "s").await.unwrap();
+        sh.log.lock().await.clear();
+
+        let sock = dir.path().join("lab.sock");
+        let _server = crate::proto::server::Server::bind(
+            &sock,
+            Arc::new(super::super::LabdHandler {
+                lab,
+                tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
+            }),
+        )
+        .await
+        .unwrap();
+        let client = crate::proto::client::LabClient::connect(&sock)
+            .await
+            .unwrap();
+        let error = client
+            .send(crate::proto::LabRequest::SnapshotRestore {
+                name: "s".into(),
+                machine: None,
+                discard: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no snapshot \"s\" on b"));
+        let log = sh.log.lock().await;
+        assert!(log.is_empty(), "restore called the backend: {log:?}");
+    }
+
+    #[tokio::test]
     async fn pending_capture_is_durable_and_cannot_be_replaced_or_restored() {
         let dir = tempfile::tempdir().unwrap();
         let sh = shared(dir.path());
