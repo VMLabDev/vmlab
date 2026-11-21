@@ -317,6 +317,46 @@ probe in a lab where the package is installed. A run passes when the probe
 passed, the default adapter is not a software renderer, and vkd3d-proton
 logged all five signatures as emulated.
 
+### Result of the check
+
+Fresh `windows-11` labs (template `26100.1742.11`) on helios with
+`hypervisor = "vmlab"`: Nvidia2 is an RTX 5090 (`0000:05:00.0`), AMD1 is RADV
+on the AMD iGPU (`0000:72:00.0`). No Xid was logged.
+
+| Check | Nvidia2 | AMD1 |
+| --- | --- | --- |
+| `tests/e2e/ei.sh`, x64 | pass: 0 of 25 cells wrong, 0 of 102,400 pixels differ from WARP, 5 of 5 signatures emulated | pass: the same numbers |
+| `tests/e2e/ei.sh`, x86 | pass: the same numbers | pass: the same numbers |
+| `tests/apps/d3d12/run.sh`, `D3D12ExecuteIndirect` | pass: exit 0, no app-local module, the capture shows the triangles | pass: the same |
+
+WARP itself drew all 25 cells as expected in every run.
+
+How the labs got the patch: `tests/e2e/run.sh --keep` installed the package
+built at `1ef33863`, and the checks passed with it on Nvidia2. The patch then
+got one more change (a sequence that draws nothing clears its slot). The
+numbers above are from the `vkd3dcore.dll` files of the build with that
+change, copied over the installed ones, with their hashes compared in the
+guest. On AMD1 the install was interrupted when the test rig stopped the VM,
+and it finished at the next start.
+
+Two controls ran on Nvidia2, in the same lab:
+
+- **Without `0007`.** With the `vkd3dcore.dll` of a build that has patches
+  `0001` to `0006` only, the probe fails: 19 of 25 cells are wrong, 19,456
+  pixels differ from WARP, and no signature is logged as emulated. The
+  picture is empty: the 19 wrong cells are the 19 that have a quad.
+- **A budget that is too small.** With
+  `VKD3D_EXECUTE_INDIRECT_VERTEX_BUDGET=8`, the probe fails with 8 cells
+  wrong, which are the draws that do not fit 8 vertices, and vkd3d-proton
+  logs `3 emulated ExecuteIndirect call(s) dropped draws`.
+
+Not checked: a frame rate, a real application that uses such signatures (none
+is known here), and a call large enough to leave vkd3d-proton's scratch pool.
+
+The evidence (probe results, both pictures of each run, vkd3d-proton's logs,
+the sample's captures) is on helios in
+`/home/vmlab/src/stc/evidence/card-254/`.
+
 ## What remains
 
 - **Vertex and index buffer view arguments** were dropped by `0006`.
