@@ -91,6 +91,8 @@ All control sockets are unix domain sockets under `$XDG_RUNTIME_DIR/vmlab/`: `vm
 
 **Segment trunks.** A lab daemon attaches to a supervisor-hosted global segment over a frame-forwarding trunk connection (unix socket locally). The **same trunk protocol over TCP** is what connects two supervisors for cross-host segments (§9.2) — one mechanism, two transports.
 
+**Daemon lifetime.** The CLI auto-starts the supervisor in a dedicated transient systemd user scope when it can. Lab daemons and their machines inherit that scope, so stopping the unit that ran `vmlab up` leaves them running. If the scope cannot be started, the CLI starts the supervisor directly. The supervisor still detaches from the terminal session, but the daemons remain in the starter's cgroup and can be stopped with it. A systemd scope lasts only as long as its user manager is running.
+
 ### 3.2 Lab identity and instances
 
 **The name a lab runs under is its host-global runtime identity** (ADR-0011): the registry, runtime and state directories, sockets, process markers, generated MACs, guest DNS names (`<vm>.<lab>`), `[lab/]vm` references and events all key on it. It is the declared name unless the directory runs the lab as an **instance**, whose effective name is `<declared>-<instance>`. The CLI resolves the instance, first match wins:

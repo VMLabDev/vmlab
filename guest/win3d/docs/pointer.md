@@ -77,6 +77,13 @@ pointer on vmlab-hv's native frame protocol (`display.sock`) and on RFB
 The viewer draws from the same frame protocol messages the `shapes` check
 reads. No check looks at a viewer window.
 
+Set `WIN3D_POINTER_ROTATION` to 90, 180 or 270 to run the same checks on a
+rotated Windows desktop. The guest records the selected orientation and
+restores the original display mode when the probe exits. The host checks
+the cursor bitmap and hotspot in the scanout's orientation and uses the
+transformed positions to check the recording. Use a separate evidence
+directory for each angle.
+
 The script is not one of the 12 Done checks of `tests/e2e/run.sh`. The
 adapter suite (`tests/e2e/adapter.sh`, which `run.sh --apps` ends with) runs
 it as its check `pointer-shapes`, next to `pointer`, which looks only at
