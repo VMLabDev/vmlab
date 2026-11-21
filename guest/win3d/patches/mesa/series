@@ -52,3 +52,5 @@ d3d9-select-table-fog-from-w-info.patch
 d3d9-default-inputs-for-unbound-streams.patch
 d3d9-suppress-zero-size-points-and-default-unbound-psize.patch
 d3d10umd-draw-b8g8r8x8-elements-and-indexed-draws-without-an-index-buffer.patch
+d3d9-map-dynamic-buffers-directly.patch
+d3d9-w-buffer-and-wireframe.patch
