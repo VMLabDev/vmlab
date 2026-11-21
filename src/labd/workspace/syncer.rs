@@ -1762,6 +1762,19 @@ async fn pass(
         );
         undecided.insert(skip.path.clone());
     }
+    // A refused rule file is said like a skip and decided like any other
+    // path: the link is still a sync object, and only its reading as rules
+    // was declined. Left out of `undecided`, so it never holds a pass open.
+    for refusal in &scan.refused_rules {
+        events.emit(
+            "workspace.skipped",
+            json!({"machine": workspace.machine, "path": refusal.path, "reason": refusal.why}),
+        );
+    }
+    let skipped: Vec<Skip> = skipped
+        .into_iter()
+        .chain(scan.refused_rules.iter().cloned())
+        .collect();
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
@@ -2235,7 +2248,7 @@ async fn reconverge(
             }),
         );
     }
-    for skip in &done.skipped {
+    for skip in done.skipped.iter().chain(done.refused_rules.iter()) {
         events.emit(
             "workspace.skipped",
             json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
@@ -2285,7 +2298,12 @@ async fn reconverge(
         // two sides were disagreeing about before it is not a disagreement any
         // more. There is nothing left for a developer to resolve.
         halt: None,
-        skipped: done.skipped.into_iter().take(REPORTED).collect(),
+        skipped: done
+            .skipped
+            .into_iter()
+            .chain(done.refused_rules)
+            .take(REPORTED)
+            .collect(),
         oversize: done.oversize,
         ..Report::default()
     })

@@ -87,6 +87,11 @@ pub struct HostScan {
     /// a rule matching at a depth its own text does not name.
     pub pruned: Vec<String>,
     pub skipped: Vec<Skip>,
+    /// Rule files whose rules were refused — a `.gitignore` or `.vmlabignore`
+    /// that is a symlink. Reported like a skip, and apart from
+    /// [`skipped`](HostScan::skipped) because the path itself is still an
+    /// ordinary sync object: only its reading as rules was declined.
+    pub refused_rules: Vec<Skip>,
     /// Git lock files this side is holding right now (§19.6). They never sync
     /// — the ignore floor sees to that — and their *presence* is the only
     /// thing read off them: it defers `.git`'s mutable set until git lets go.
@@ -217,6 +222,14 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
     scan.dirs.push(String::new());
     scan.dirs.sort();
     scan.pruned.sort();
+    scan.refused_rules = ignores
+        .refused()
+        .iter()
+        .map(|(path, why)| Skip {
+            path: path.clone(),
+            why: why.clone(),
+        })
+        .collect();
     Ok((scan, ignores))
 }
 
