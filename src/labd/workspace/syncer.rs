@@ -5021,4 +5021,66 @@ mod tests {
             .await
             .unwrap();
     }
+
+    /// A rule file is read by the host, and a symlink syncs guest to host
+    /// verbatim — so a guest that plants `.vmlabignore` as a link to a host
+    /// file must never get that file's lines back as a prune list (review
+    /// labd-sync F2). The link itself stays a sync object. Its rules are
+    /// refused, and the pass says so by name.
+    #[tokio::test]
+    async fn a_symlinked_rule_file_is_never_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "hunter2-token\nsecond/line\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        guest.put(
+            "/src/.vmlabignore",
+            Node::Symlink(secret.display().to_string()),
+            5,
+        );
+        sessions.watcher.mark(".vmlabignore");
+        let link = dir.path().join(".vmlabignore");
+        let landed = {
+            let link = link.clone();
+            eventually(move || link.symlink_metadata().is_ok()).await
+        };
+        assert!(landed, "the link is a sync object and still crosses");
+        assert_eq!(std::fs::read_link(&link).unwrap(), secret);
+
+        // Two host scans with the link in place: the one that would read it,
+        // and the one after any watch reopen that reading it would cause.
+        syncer.pass_now().await.unwrap();
+        let report = syncer.pass_now().await.unwrap();
+        let named = {
+            let syncer = syncer.clone();
+            eventually(move || {
+                syncer
+                    .report()
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.path == ".vmlabignore" && skip.why.contains("symlink"))
+            })
+            .await
+        };
+        let opens = sessions.opens();
+        syncers.stop("dev01").await;
+
+        for prune in &opens {
+            for prefix in prune {
+                assert!(
+                    prefix != "hunter2-token" && prefix != "second/line",
+                    "a line of a host file outside the workspace reached the guest: {opens:?}"
+                );
+            }
+        }
+        assert!(named, "the refused rule file is named: {:?}", report.skipped);
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        assert!(report.trouble.is_none(), "{:?}", report.trouble);
+    }
 }
