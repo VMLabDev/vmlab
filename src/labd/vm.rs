@@ -1879,14 +1879,16 @@ impl VmInstance {
             control.resume().await?;
             Ok(())
         } else {
-            // Offline: power off if needed, apply, stay off.
-            if self.power_state().await != PowerState::Stopped {
-                self.stop_ladder(false).await?;
-                self.settle_stopped(Duration::from_secs(60))
-                    .await
-                    .with_context(|| format!("{} did not stop for restore", self.cfg.name))?;
-            }
-            restore_offline_disks(&self.all_disk_paths(), name).await
+            restore_offline_disks(&self.all_disk_paths(), name, async {
+                if self.power_state().await != PowerState::Stopped {
+                    self.stop_ladder(false).await?;
+                    self.settle_stopped(Duration::from_secs(60))
+                        .await
+                        .with_context(|| format!("{} did not stop for restore", self.cfg.name))?;
+                }
+                Ok(())
+            })
+            .await
         }
     }
 
@@ -2635,9 +2637,64 @@ fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
 }
 
-async fn restore_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
+async fn restore_offline_disks(
+    disks: &[PathBuf],
+    name: &str,
+    stop: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    use crate::template::qimg;
+
     for disk in disks {
-        crate::template::qimg::snapshot_apply(disk, name).await?;
+        let info = qimg::image_info(disk)
+            .await
+            .with_context(|| format!("checking {} for snapshot {name:?}", disk.display()))?;
+        if !info.snapshots.iter().any(|snapshot| snapshot.name == name) {
+            bail!("{}: snapshot {name:?} is missing", disk.display());
+        }
+    }
+
+    stop.await?;
+    let backup = format!("vmlab-restore-{:032x}", rand::random::<u128>());
+    snapshot_offline_disks(disks, &backup)
+        .await
+        .context("saving disk state before offline restore")?;
+    apply_offline_snapshot(disks, name, &backup).await
+}
+
+async fn apply_offline_snapshot(disks: &[PathBuf], name: &str, backup: &str) -> Result<()> {
+    use crate::template::qimg;
+
+    let mut failure = None;
+    for (index, disk) in disks.iter().enumerate() {
+        if let Err(error) = qimg::snapshot_apply(disk, name).await {
+            failure = Some((index, disk, error));
+            break;
+        }
+    }
+
+    let mut rollback_errors = Vec::new();
+    for (index, disk) in disks.iter().enumerate().rev() {
+        // Include the failed disk: apply can return an error after a write.
+        if failure.as_ref().is_some_and(|(failed, _, _)| index <= *failed)
+            && let Err(error) = qimg::snapshot_apply(disk, backup).await
+        {
+            rollback_errors.push(format!("{}: {error}", disk.display()));
+            continue;
+        }
+        if let Err(error) = qimg::snapshot_delete(disk, backup).await {
+            tracing::warn!(disk = %disk.display(), backup, %error, "could not delete offline restore backup");
+        }
+    }
+    if let Some((_, disk, error)) = failure {
+        let error =
+            anyhow!(error).context(format!("restoring snapshot {name:?} on {}", disk.display()));
+        if rollback_errors.is_empty() {
+            return Err(error.context("offline restore failed and disk state was rolled back"));
+        }
+        return Err(error.context(format!(
+            "offline restore rollback failed; recovery snapshot {backup:?} retained on affected disks: {}",
+            rollback_errors.join(", ")
+        )));
     }
     Ok(())
 }
@@ -2769,6 +2826,21 @@ impl KeepAwake {
 mod tests {
     use super::{clone_source, clone_source_refusal, no_agent_hint};
 
+    fn write_disk_pattern(path: &std::path::Path) {
+        let mut image = vmlab_disk::open(path, vmlab_disk::Format::Qcow2, false).unwrap();
+        image.write_at(0, &[0x42; 512]).unwrap();
+        image.flush().unwrap();
+    }
+
+    fn assert_disk_pattern(path: &std::path::Path) {
+        let mut data = [0; 512];
+        vmlab_disk::open(path, vmlab_disk::Format::Qcow2, true)
+            .unwrap()
+            .read_at(0, &mut data)
+            .unwrap();
+        assert_eq!(data, [0x42; 512], "post-snapshot data on {}", path.display());
+    }
+
     #[tokio::test]
     async fn an_offline_restore_checks_every_disk_first() {
         use crate::template::qimg;
@@ -2779,23 +2851,51 @@ mod tests {
         qimg::create_blank(&first, 1 << 20).await.unwrap();
         qimg::create_blank(&second, 1 << 20).await.unwrap();
         qimg::snapshot_create(&first, "capture").await.unwrap();
-        super::run_tool(
-            "qemu-io",
-            &["-c".into(), "write -P 0x42 0 512".into(), first.display().to_string()],
-        )
-        .await
-        .unwrap();
+        write_disk_pattern(&first);
 
-        let error = super::restore_offline_disks(&[first.clone(), second.clone()], "capture")
+        let disks = [first.clone(), second.clone()];
+        let error = super::restore_offline_disks(&disks, "capture", async {
+            panic!("the VM should not stop when a disk lacks the snapshot");
+        })
+        .await
+        .unwrap_err();
+        assert_disk_pattern(&first);
+        assert!(format!("{error:#}").contains(second.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn offline_restore_rolls_back_when_a_later_apply_fails() {
+        use crate::template::qimg;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disks = [
+            dir.path().join("first.qcow2"),
+            dir.path().join("second.qcow2"),
+        ];
+        for disk in &disks {
+            qimg::create_blank(disk, 1 << 20).await.unwrap();
+            qimg::snapshot_create(disk, "capture").await.unwrap();
+            write_disk_pattern(disk);
+        }
+        super::snapshot_offline_disks(&disks, "backup").await.unwrap();
+        // Simulate the target becoming unavailable after the preflight.
+        qimg::snapshot_delete(&disks[1], "capture").await.unwrap();
+
+        let error = super::apply_offline_snapshot(&disks, "capture", "backup")
             .await
             .unwrap_err();
-        super::run_tool(
-            "qemu-io",
-            &["-c".into(), "read -P 0x42 0 512".into(), first.display().to_string()],
-        )
-        .await
-        .expect("the first disk should retain its post-snapshot data");
-        assert!(format!("{error:#}").contains(second.to_str().unwrap()));
+        assert!(format!("{error:#}").contains("disk state was rolled back"));
+        for disk in &disks {
+            assert_disk_pattern(disk);
+            assert!(
+                qimg::image_info(disk)
+                    .await
+                    .unwrap()
+                    .snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.name != "backup")
+            );
+        }
     }
 
     #[tokio::test]
