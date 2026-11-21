@@ -1,4 +1,4 @@
-Back local D3D11 NV12 textures with separate luma and chroma images.
+Subject: [PATCH] d3d10umd: back NV12 with separate luma and chroma images
 
 Use typed views to select a plane, keep CPU maps in the packed NV12 layout,
 and apply updates and copies to both images. See docs/acceptance/C374.md.
@@ -312,6 +312,15 @@ diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends
 diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
 --- a/src/gallium/frontends/d3d10umd/Shader.cpp
 +++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -1010,7 +1010,7 @@
+    Resource *res = pShaderResourceView->resource;
+    if (!res || !res->resource) return currentSurface;
+ 
+-   if (currentSurface->texture != res->resource) {
++   if (!res->nv12_chroma && currentSurface->texture != res->resource) {
+       struct pipe_context *pipe = currentSurface->context;
+       struct pipe_sampler_view *newView = pipe->create_sampler_view(pipe, res->resource, currentSurface);
+       pipe_sampler_view_reference(&pShaderResourceView->handle, newView);
 @@ -3747,7 +3747,7 @@
  
     struct pipe_sampler_view desc;
