@@ -16,6 +16,21 @@ pub mod pci;
 pub mod sound;
 pub mod worker;
 
+/// Whether the driver's `avail.idx` is one the queue can hold: at most the
+/// queue size ahead of the next chain the device takes. A driver that writes
+/// an index further ahead has broken the ring. No chain can be taken from it,
+/// while `enable_notification` still reports that buffers are waiting, so a
+/// drain loop that repeats on that answer must check this first and stop.
+pub(crate) fn avail_idx_in_range<M>(queue: &virtio_queue::Queue, mem: &M) -> bool
+where
+    M: vm_memory::GuestMemory + ?Sized,
+{
+    use virtio_queue::QueueT as _;
+    queue
+        .avail_idx(mem, std::sync::atomic::Ordering::Acquire)
+        .is_ok_and(|idx| idx.0.wrapping_sub(queue.next_avail()) <= queue.size())
+}
+
 /// Test doubles shared by the virtio device and transport tests: an
 /// in-memory [`vmlab_disk::DiskImage`] and interrupt sinks that record what
 /// they delivered.

@@ -135,6 +135,11 @@ impl InProcessFs {
         // published — the loop the spec's suppression mechanism expects.
         let mut used_any = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !crate::virtio::avail_idx_in_range(&inner.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = inner
                 .queues
                 .get_mut(index)

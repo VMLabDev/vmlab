@@ -443,6 +443,11 @@ impl Block {
         // published — the loop the spec's suppression mechanism expects.
         let mut used_any = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !super::avail_idx_in_range(&self.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = self
                 .queues
                 .get_mut(index)
@@ -1088,7 +1093,7 @@ mod tests {
 
     #[test]
     fn avail_idx_far_ahead_does_not_spin() {
-        let mut f = Fixture::new(Box::new(MemDisk::new(4096)));
+        let f = Fixture::new(Box::new(MemDisk::new(4096)));
         f.mem
             .write_obj(Le16::from(0x8000u16), GuestAddress(f.avail + 2))
             .unwrap();
