@@ -1,0 +1,27 @@
+Subject: [PATCH] d3d9: preserve the layout of borrowed system memory
+
+A SYSTEMMEM texture can point directly at caller memory. Its upload has
+to use the DDI row and slice strides. For example, rounding the stride
+of a 33-wide L8 texture to 36 samples the wrong bytes after UpdateTexture.
+
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
+@@ -2593,6 +2593,17 @@ D3D9CopyInitialData(const D3DDDIARG_CREATERESOURCE *data,
+       return S_OK;
+ 
+    if (!D3D9PoolNeedsReadback(data->Pool)) {
++      if (!data->Flags.VertexBuffer && !data->Flags.IndexBuffer) {
++         /* This storage belongs to the caller and has no driver padding. */
++         const UINT rows = D3D9FormatRowCount(data->Format, src->Height);
++         dst->pitch = src->SysMemPitch ? src->SysMemPitch :
++            D3D9FormatRowPitch(data->Format, src->Width);
++         dst->slice_pitch = src->SysMemSlicePitch ? src->SysMemSlicePitch :
++            dst->pitch * rows;
++         const UINT depth = src->Depth ? src->Depth : 1;
++         dst->size = (size_t)dst->slice_pitch * depth;
++      }
++
+       dst->data = (uint8_t *)(uintptr_t)src->pSysMem;
+       dst->data_capacity = dst->size;
+       dst->owns_data = false;
