@@ -4749,15 +4749,22 @@ mod tests {
         assert!(eventually(|| sessions.opens().len() > opens).await);
         assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
         assert!(guest.get("/src/experiment.rs").is_none());
-        assert_eq!(guest.text("/src/big.bin/child").as_deref(), Some("keep this"));
+        assert_eq!(
+            guest.text("/src/big.bin/child").as_deref(),
+            Some("keep this")
+        );
         syncers.stop("dev01").await;
         let events = events_of(state.path());
-        assert!(events.iter().any(|(name, data)| {
-            name == "workspace.skipped" && data["path"] == "monitor.sock"
-        }));
-        assert!(events.iter().any(|(name, data)| {
-            name == "workspace.refused" && data["path"] == "big.bin"
-        }));
+        assert!(
+            events.iter().any(|(name, data)| {
+                name == "workspace.skipped" && data["path"] == "monitor.sock"
+            })
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(name, data)| { name == "workspace.refused" && data["path"] == "big.bin" })
+        );
     }
 
     #[cfg(unix)]
