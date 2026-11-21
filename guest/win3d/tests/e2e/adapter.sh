@@ -7,26 +7,11 @@
 #
 #   tests/e2e/adapter.sh <lab-dir> <vm> <evidence-dir> [check...]
 #
-# Checks, in the order they run (all of them when none is named, or the ones
-# in ADAPTER_CHECKS):
+# Check names run in the order registered by adapter/checks/*.sh.
+# With no names on the command line, run ADAPTER_CHECKS or all checks.
 #
-#   pointer       P1       the pointer is not part of the frame
-#   pointer-shapes P1      the pointer's shapes reach the host (tests/e2e/pointer.sh)
-#   pace          P2       vblank interval, present rate, flip timestamps, scan line
-#   tear-flip     P3-P5    the tearing probe, flip-model presents
-#   tear-blt      P3-P5    the tearing probe, presents of the Blt kind
-#   duplication   P7       Desktop Duplication delivers frames
-#   shared-texture P7      a shared render target of the duplication surface's shape still works
-#   d2d           P10      the Direct2D coverage probe
-#   d2d-tir       P10      what Direct2D draws to antialias, against WARP (tests/e2e/tir.sh)
-#   svb-chrome    P10      the static vertex buffer page in Chrome
-#   venc-chrome   P8       venc.html in Chrome: the GPU process survives
-#   svb-edge, venc-edge    the same two pages in the guest's own Edge
-#   chromium      P8       the GPU process loads the native d3d12.dll, and ends itself without (tests/e2e/chromium.sh)
-#   wine          P10      Wine's Direct3D 9, 10 and 11 tests
-#
-# Each check prints pass, fail or not-run; tests/e2e/adapter/judge.py holds the
-# thresholds and writes <evidence-dir>/adapter/adapter.json and adapter.txt.
+# Each check prints pass, fail or not-run. The verdicts in adapter/checks/
+# feed adapter/judge.py, which writes <evidence-dir>/adapter/adapter.json and adapter.txt.
 # What the probes measured, the console captures and the Wine tests' failed
 # lines are next to them. Chrome is Chrome for Testing and the Wine tests are
 # built from Wine's source; both are pinned in tests/e2e/PINS.
@@ -38,18 +23,31 @@
 # that did not run is not a failure.
 # check-shell-paths: no-errexit each check records its own result and the suite goes on to the next (VML-88).
 set -uo pipefail
-[ $# -ge 3 ] || { sed -n '2,37p' "$0" >&2; exit 2; }
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 HERE=$REPO/tests/e2e
 A=$HERE/adapter
+
+# Source each check before running any of them. C locale fixes the file order.
+ALL=()
+load_checks() {
+    local LC_ALL=C check_file
+    for check_file in "$A"/checks/[0-9]*.sh; do
+        source "$check_file" || return
+    done
+}
+load_checks || exit 2
+if [ $# -lt 3 ]; then
+    sed -n '2,/^# check-shell-paths:/{ /^# check-shell-paths:/!p; }' "$0" >&2
+    printf 'Checks: %s\n' "${ALL[*]}" >&2
+    exit 2
+fi
 LABDIR=$(cd "$1" && pwd)
 VM=$2
 mkdir -p "$3/adapter"
 EV=$(cd "$3/adapter" && pwd)   # absolute: the vmlab commands run from the lab directory
 [ -n "$EV" ] && [ -d "$EV" ] || { echo "VML-88: the evidence directory is empty or missing" >&2; exit 2; }
 shift 3
-ALL="pointer pointer-shapes pace tear-flip tear-blt duplication shared-texture d2d d2d-tir svb-chrome venc-chrome svb-edge venc-edge chromium wine"
-CHECKS=${*:-${ADAPTER_CHECKS:-$ALL}}
+CHECKS=${*:-${ADAPTER_CHECKS:-${ALL[*]}}}
 CACHE=$REPO/.scratch/e2e/cache
 STAGE=$REPO/.scratch/e2e/adapter/$(basename "$(dirname "$EV")")   # per evidence dir, so parallel runs do not share files
 OUT=$REPO/out/adapter
@@ -110,163 +108,6 @@ stage() {
     in_lab vmlab cp "$OUT/x64" "$VM:C:/win3d/adapter/x64" || return 1
 }
 
-check_pointer() {
-    note "pointer"
-    local w h x y i pid shot=$STAGE/pointer.png
-    # The probe fills the display for 30 s; the pointer is moved while it does.
-    probe pointer 30 pointer_probe.exe &
-    pid=$!
-    for i in $(seq 1 60); do
-        sleep 2
-        capture "$shot" || continue
-        python3 "$A/pointerframe.py" "$shot" 0 0 >"$STAGE/pointer-wait.json" 2>/dev/null || continue
-        python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["background"] > 0.9 else 1)' "$STAGE/pointer-wait.json" && break
-        kill -0 "$pid" 2>/dev/null || break
-    done
-    if [ -f "$STAGE/pointer-wait.json" ]; then
-        read -r w h < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["width"], d["height"])' "$STAGE/pointer-wait.json")
-        i=0
-        for p in "$((w / 4)) $((h / 4))" "$((w * 3 / 5)) $((h * 3 / 5))"; do
-            i=$((i + 1))
-            read -r x y <<<"$p"
-            in_lab vmlab vm mouse-move "$VM" "$x" "$y" >/dev/null 2>&1 || note "  mouse-move failed"
-            sleep 2
-            capture "$STAGE/pointer-$i.png" && python3 "$A/pointerframe.py" "$STAGE/pointer-$i.png" "$x" "$y" >"$EV/pointer-frame-$i.json"
-            keep_png "$STAGE/pointer-$i.png" "$EV/console-pointer-$i.png"
-        done
-    fi
-    wait "$pid" && ran pointer || skip pointer "the pointer probe wrote no result"
-}
-
-check_pointer_shapes() {
-    # The check of the hardware pointer (docs/pointer.md) is a script of its own; it
-    # writes <evidence-dir>/pointer/ and its verdict there.
-    note "pointer-shapes"
-    local top rc
-    top=$(dirname "$EV")
-    [ -n "$top" ] && [ -d "$top" ] || { skip pointer-shapes "no evidence directory"; return; }
-    "$HERE/pointer.sh" "$LABDIR" "$VM" "$top" >"$STAGE/pointer-shapes.out" 2>&1
-    rc=$?
-    grep -E '^(PASS|FAIL) ' "$STAGE/pointer-shapes.out" | while read -r l; do note "  $l"; done
-    if [ -f "$top/pointer/pointer.json" ]; then
-        cp "$top/pointer/pointer.json" "$EV/pointer-shapes.json"
-        ran pointer-shapes
-    else
-        skip pointer-shapes "tests/e2e/pointer.sh ended with exit $rc and no verdict: $(tail -1 "$STAGE/pointer-shapes.out" | cut -c1-160)"
-    fi
-}
-
-check_pace() {
-    note "pace"
-    probe pace 10 pace_probe.exe && ran pace || skip pace "the pace probe wrote no result"
-}
-
-vnc_sock() {
-    # vmlab keeps a VM's sockets in <runtime>/labs/<lab>/vms/<vm>/. The runtime
-    # directory is $XDG_RUNTIME_DIR/vmlab, or /tmp/vmlab-<uid>-<hash> when that
-    # is too long for a socket path, and a long lab or VM name is hashed too
-    # (src/paths.rs in the vmlab repository). The lab daemon's command line has
-    # the name the lab runs under.
-    local xdg=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} lab base l v
-    lab=$(lab_name)
-    [ -n "$lab" ] || return 1
-    h() { printf %s "$1" | sha256sum | cut -c1-12; }
-    for base in "$xdg/vmlab" "/tmp/vmlab-$(id -u)-$(h "$xdg")"; do
-        for l in "$lab" "_$(h "$lab")"; do
-            for v in "$VM" "_$(h "$VM")"; do
-                [ -S "$base/labs/$l/vms/$v/vnc.sock" ] && { echo "$base/labs/$l/vms/$v/vnc.sock"; return 0; }
-            done
-        done
-    done
-    return 1
-}
-
-check_tear() { # check_tear flip|blt
-    local mode=$1 name=tear-$1 sock gpid
-    note "$name"
-    sock=$(vnc_sock)
-    [ -n "$sock" ] || { skip "$name" "found no vnc.sock for this lab's VM in the vmlab runtime directory"; return; }
-    # Park the pointer away from the window, for a console that paints it into the frame.
-    in_lab vmlab vm mouse-move "$VM" 1000 700 >/dev/null 2>&1
-    python3 "$A/rfbgrab.py" "$sock" "$EV/$name.grab.json" --seconds $((TEAR_SECONDS + 300)) --stop "$STAGE/$name.stop" \
-        --save-torn "$EV/$name-torn.png" >"$STAGE/$name.grab.out" 2>&1 &
-    gpid=$!
-    probe "$name" "$TEAR_SECONDS" tear_probe.exe --mode "$mode"
-    local rc=$?
-    : >"$STAGE/$name.stop"
-    wait "$gpid"
-    note "  $(tail -1 "$STAGE/$name.grab.out")"
-    [ $rc = 0 ] && ran "$name" || skip "$name" "the tearing probe wrote no result"
-}
-
-check_duplication() {
-    note "duplication"
-    probe duplication 10 dupl_probe.exe && ran duplication || skip duplication "the duplication probe wrote no result"
-}
-
-check_shared_texture() {
-    note "shared-texture"
-    probe shared-texture 10 share_probe.exe && ran shared-texture || skip shared-texture "the shared-texture probe wrote no result"
-}
-
-check_d2d() {
-    note "d2d"
-    probe d2d 30 d2d_probe.exe --bmp "$R\\d2d.bmp" && ran d2d || skip d2d "the Direct2D probe wrote no result"
-    pull d2d.bmp && magick "$EV/d2d.bmp" -strip "$EV/d2d.png" && rm -f "$EV/d2d.bmp"
-}
-
-check_d2d_tir() {
-    # The check of target-independent rasterization (docs/d2d-coverage.md) is a
-    # script of its own; it writes <evidence-dir>/tir/ and its verdict there.
-    note "d2d-tir"
-    local top rc
-    top=$(dirname "$EV")
-    [ -n "$top" ] && [ -d "$top" ] || { skip d2d-tir "no evidence directory"; return; }
-    "$HERE/tir.sh" "$LABDIR" "$VM" "$top" >"$STAGE/d2d-tir.out" 2>&1
-    rc=$?
-    grep -E '^(pass|fail) ' "$STAGE/d2d-tir.out" | while read -r l; do note "  ${l:0:200}"; done
-    if [ -s "$top/tir/tir.txt" ]; then
-        cp "$top/tir/tir.txt" "$EV/d2d-tir.txt"
-        ran d2d-tir
-    else
-        skip d2d-tir "tests/e2e/tir.sh ended with exit $rc and no verdict: $(tail -1 "$STAGE/d2d-tir.out" | cut -c1-160)"
-    fi
-}
-
-CHROME=
-stage_chrome() { # once: Chrome for Testing into C:\apps\chrome-win64
-    [ -z "$CHROME" ] || return 0
-    local zip
-    CHROME=failed
-    zip=$(fetch_pin chrome-for-testing) || return 1
-    note "copying Chrome for Testing into the guest"
-    in_lab vmlab cp "$zip" "$VM:C:/apps/chrome-win64.zip" || return 1
-    gps 'Set-Location C:\apps; if (Test-Path chrome-win64) { Remove-Item chrome-win64 -Recurse -Force }; tar.exe -xf chrome-win64.zip; Remove-Item chrome-win64.zip; Test-Path C:\apps\chrome-win64\chrome.exe' 900 | grep -q True || return 1
-    CHROME=ok
-}
-
-check_page() { # check_page NAME chrome|edge PAGE SECONDS [FEATURES]
-    local name=$1 browser=$2 page=$3 secs=$4 features=${5:-} rc spid
-    note "$name"
-    if [ "$browser" = chrome ]; then
-        stage_chrome
-        [ "$CHROME" = ok ] || { skip "$name" "Chrome for Testing did not download or unpack"; return; }
-    fi
-    (sleep $((secs - 6)); capture "$STAGE/$name.png") &
-    spid=$!
-    in_lab vmlab exec --timeout $((secs + 400)) "$VM" -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \
-        "$G\\guest\\Run-Page.ps1" -Browser "$browser" -Page "$page" -Name "$name" -OutDir "$R" -Seconds "$secs" \
-        ${features:+-Features "$features"} >"$STAGE/$name.out" 2>&1
-    rc=$?
-    wait "$spid"
-    keep_png "$STAGE/$name.png" "$EV/console-$name.png"
-    pull "$name.page.json"
-    note "  Run-Page exit $rc"
-    if [ $rc = 2 ]; then skip "$name" "$browser is not installed in the guest"
-    elif [ -f "$EV/$name.page.json" ]; then ran "$name"
-    else skip "$name" "Run-Page.ps1 wrote no result"; fi
-}
-
 lab_name() { # the name the lab runs under: a lab in a linked git worktree is <name>-<instance>
     pgrep -af -- "__labd --lab [^ ]* --root $LABDIR( |\$)" | sed -n 's/.*__labd --lab \([^ ]*\) .*/\1/p' | head -1
 }
@@ -317,55 +158,6 @@ for line in sys.stdin:
     except (ValueError, KeyError): pass'
 }
 
-check_wine() {
-    note "wine"
-    local exe base rc n=0 t0 exits
-    if ! compgen -G "$OUT/winetests/x64/*.exe" >/dev/null; then
-        skip wine "Wine's tests were not built (the pin did not download, or the build failed)"
-        return
-    fi
-    in_lab vmlab cp "$OUT/winetests/x64" "$VM:C:/win3d/adapter/winetests" || { skip wine "the tests did not copy into the guest"; return; }
-    for exe in "$OUT"/winetests/x64/*.exe; do basename "$exe" .exe; done >"$EV/wine.programs"
-    for exe in "$OUT"/winetests/x64/*.exe; do
-        base=$(basename "$exe" .exe)
-        if ! guest_up && ! vm_restart; then note "  the guest does not answer; $base not run"; continue; fi
-        note "  $base (at most $WINE_TIMEOUT s)"
-        t0=$(date +%s)
-        exits=$(hv_exits)
-        in_lab vmlab exec --timeout $((WINE_TIMEOUT + 400)) "$VM" -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \
-            "$G\\guest\\Run-WineTest.ps1" -Path "$G\\winetests\\$base.exe" -OutDir "$R" -TimeoutSec "$WINE_TIMEOUT" \
-            >"$STAGE/wine-$base.out" 2>&1
-        rc=$?
-        if pull "wine-$base.wine.json"; then
-            pull "wine-$base.failures.txt"
-        elif ! guest_up; then
-            # The program took the VM with it: say so in its place.
-            python3 -c 'import json,sys; json.dump({"name": sys.argv[1], "completed": False, "vm_lost": True, "duration_s": int(sys.argv[2]), "hypervisor": sys.argv[3]}, open(sys.argv[4], "w"), indent=2)' \
-                "$base" "$(($(date +%s) - t0))" "$(hv_exit "${exits:-0}")" "$EV/wine-$base.wine.json"
-        fi
-        [ -f "$EV/wine-$base.wine.json" ] && n=$((n + 1))
-        note "    exit $rc: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8-sig")); print("the VM stopped: " + d["hypervisor"] if d.get("vm_lost") else "%s executed, %s failures, %s skipped, %s s%s%s" % (d["executed"], d["failures"], d["skipped"], d["duration_s"], ", timed out" if d["timed_out"] else "", ", unhandled exception" if d["crashed"] else ""))' "$EV/wine-$base.wine.json" 2>/dev/null || echo 'no result')"
-    done
-    [ $n -gt 0 ] && ran wine || skip wine "no Wine test program wrote a result"
-}
-check_chromium() {
-    # The check of the native d3d12.dll preload (docs/chromium.md) is a script of its
-    # own; it writes <evidence-dir>/chromium/ and its verdict there. It restarts the VM.
-    note "chromium"
-    local top rc
-    top=$(dirname "$EV")
-    [ -n "$top" ] && [ -d "$top" ] || { skip chromium "no evidence directory"; return; }
-    "$HERE/chromium.sh" "$LABDIR" "$VM" "$top" >"$STAGE/chromium.out" 2>&1
-    rc=$?
-    grep -E '^(PASS|FAIL) ' "$STAGE/chromium.out" | while read -r l; do note "  ${l:0:200}"; done
-    if [ -f "$top/chromium/chromium.json" ]; then
-        cp "$top/chromium/chromium.json" "$EV/chromium.json"
-        ran chromium
-    else
-        skip chromium "tests/e2e/chromium.sh ended with exit $rc and no verdict: $(tail -1 "$STAGE/chromium.out" | cut -c1-160)"
-    fi
-}
-
 note "adapter suite: $CHECKS"
 if ! guest_up; then
     note "the guest does not answer"
@@ -373,29 +165,13 @@ if ! guest_up; then
 elif ! stage; then
     for c in $CHECKS; do skip "$c" "staging failed (see the run log)"; done
 else
-    for c in $ALL; do
+    for c in "${ALL[@]}"; do
         wanted "$c" || continue
         if ! guest_up; then skip "$c" "the guest stopped answering before this check"; continue; fi
-        case $c in
-            pointer) check_pointer ;;
-            pointer-shapes) check_pointer_shapes ;;
-            pace) check_pace ;;
-            tear-flip) check_tear flip ;;
-            tear-blt) check_tear blt ;;
-            duplication) check_duplication ;;
-            shared-texture) check_shared_texture ;;
-            d2d) check_d2d ;;
-            d2d-tir) check_d2d_tir ;;
-            svb-chrome) check_page svb-chrome chrome svb.html 25 ;;
-            venc-chrome) check_page venc-chrome chrome venc.html 45 D3D12VideoEncodeAccelerator,D3D12VideoDecoder ;;
-            svb-edge) check_page svb-edge edge svb.html 25 ;;
-            venc-edge) check_page venc-edge edge venc.html 45 D3D12VideoEncodeAccelerator,D3D12VideoDecoder ;;
-            chromium) check_chromium ;;
-            wine) check_wine ;;
-        esac
+        "check_${c//-/_}"
     done
 fi
-for c in $ALL; do
+for c in "${ALL[@]}"; do
     wanted "$c" || echo "not-run: not selected for this run" >"$EV/$c.status"
 done
 find "$STAGE" -name '*.png' -delete

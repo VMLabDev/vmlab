@@ -3,7 +3,7 @@
 
 usage: scripts/check-docs.py [-v]
 
-Reads README.md, docs/*.md, docs/decisions/*.md and build/*/README.md and checks:
+Reads README.md, docs/*.md, acceptance and decision notes, and build documents:
 
 - every backticked span that starts with a top-level directory of this
   repository (`build/...`, `docs/...`, `patches/mesa/0021` ...) names a path
@@ -84,8 +84,10 @@ FENCE = re.compile(r"^\s*(```|~~~)")
 def documents():
     yield REPO / "README.md"
     yield from sorted((REPO / "docs").glob("*.md"))
+    yield from sorted((REPO / "docs" / "acceptance").glob("*.md"))
     yield from sorted((REPO / "docs" / "decisions").glob("*.md"))
     yield from sorted((REPO / "build").glob("*/README.md"))
+    yield REPO / "build" / "mesa" / "fixes.md"
 
 
 def prose_lines(path):
