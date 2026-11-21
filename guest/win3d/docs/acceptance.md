@@ -864,7 +864,7 @@ The driver rejected nonzero values for `WRAP0` through `WRAP15`,
 `D3DZB_USEW` for `ZENABLE`, and wireframe for `FILLMODE`. The same
 rejections can propagate through `Apply` at line 297. These two assertions
 account for 162 and seven failures respectively on each GPU. The
-[coordinate-wrap patch](../patches/mesa/0097-d3d9-record-coordinate-wrap-render-states.patch)
+[coordinate-wrap patch](../patches/mesa/d3d9-record-coordinate-wrap-render-states.patch)
 fixes the largest setter group by retaining the wrap flags through state
 block replay. Cylindrical interpolation still needs implementation.
 
