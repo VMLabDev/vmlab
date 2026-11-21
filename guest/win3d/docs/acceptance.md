@@ -856,6 +856,9 @@ Host GPU: Nvidia2, /dev/dri/renderD129 0000:05:00.0 VGA compatible controller: N
 
 ### D3D9 failure groups
 
+[C376](acceptance/C376.md) records the four Wine D3D9 programs on the
+post-fix baseline and the remaining follow-ups.
+
 Card #253 uses the `adapter/wine-<program>.failures.txt` logs for the
 Windows 11 tables above. Counts below are failed assertions, including
 readback failures that follow a rejected draw. The Wine source locations
