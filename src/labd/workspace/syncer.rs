@@ -4897,6 +4897,49 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    #[tokio::test]
+    async fn a_restore_flushes_first_and_refuses_on_unsynced_guest_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "seed").unwrap();
+        let (syncers, guest, sessions) = seeded_lab_settling(
+            dir.path(),
+            state.path(),
+            "/src/main.rs",
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+        syncers.before_capture("dev01", None).await.unwrap();
+
+        guest.file("/src/main.rs", "typed just now", 900);
+        sessions.watcher.mark("main.rs");
+        syncers.before_restore("dev01", false, None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "typed just now",
+            "restore did not flush the guest's work",
+        );
+
+        sessions.watcher.mute();
+        guest.file("/src/late.txt", "written in the guest", 901);
+        sessions.watcher.mark("late.txt");
+        let refused = syncers
+            .before_restore("dev01", false, None)
+            .await
+            .expect_err("restore must refuse while the guest's watch does not answer");
+        let said = format!("{refused:#}");
+        assert!(said.contains("watch did not answer"), "{said}");
+        assert!(said.contains(super::super::bracket::DISCARD_FLAG), "{said}");
+        assert!(said.contains(super::super::bracket::NOT_A_BACKUP), "{said}");
+        assert_eq!(
+            guest.text("/src/late.txt").as_deref(),
+            Some("written in the guest"),
+        );
+        assert!(!dir.path().join("late.txt").exists());
+        syncers.before_restore("dev01", true, None).await.unwrap();
+        syncers.stop("dev01").await;
+    }
+
     /// A machine that is not a dev machine, or has no workspace, has nothing
     /// to bracket — and snapshotting one must not grow a dev machine's costs.
     #[tokio::test]
