@@ -32,21 +32,11 @@ vmlab-win3d: docs/ei.md.
  create mode 100644 libs/vkd3d/shaders/cs_execute_indirect_vertex_fetch.comp
 
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index af86b00..db263db 100644
+index af86b00..1cfdfc1 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
-@@ -2985,6 +2985,9 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
-         d3d12_command_allocator_free_command_pool(&allocator->primary_pool, device);
-         d3d12_command_allocator_free_command_pool(&allocator->fallback_pool, device);
- 
-+        d3d12_command_allocator_report_execute_indirect_dropped(allocator);
-+        vkd3d_free(allocator->execute_indirect_dropped);
-+
-         for (i = 0; i < VKD3D_SCRATCH_POOL_KIND_COUNT; i++)
-         {
-             for (j = 0; j < allocator->scratch_pools[i].scratch_buffer_count; j++)
-@@ -3012,6 +3015,25 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
-     return refcount;
+@@ -2922,6 +2922,25 @@ static void d3d12_command_allocator_free_command_pool(
+     VK_CALL(vkDestroyCommandPool(device->vk_device, pool->vk_command_pool, NULL));
  }
  
 +/* An emulated ExecuteIndirect that fetches vertices cannot know while recording how much
@@ -68,9 +58,19 @@ index af86b00..db263db 100644
 +    allocator->execute_indirect_dropped_count = 0;
 +}
 +
- static ULONG STDMETHODCALLTYPE d3d12_command_allocator_Release(ID3D12CommandAllocator *iface)
+ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator)
  {
-     struct d3d12_command_allocator *allocator = impl_from_ID3D12CommandAllocator(iface);
+     unsigned int i, j;
+@@ -2985,6 +3004,9 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
+         d3d12_command_allocator_free_command_pool(&allocator->primary_pool, device);
+         d3d12_command_allocator_free_command_pool(&allocator->fallback_pool, device);
+ 
++        d3d12_command_allocator_report_execute_indirect_dropped(allocator);
++        vkd3d_free(allocator->execute_indirect_dropped);
++
+         for (i = 0; i < VKD3D_SCRATCH_POOL_KIND_COUNT; i++)
+         {
+             for (j = 0; j < allocator->scratch_pools[i].scratch_buffer_count; j++)
 @@ -3133,6 +3155,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
      if (FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->fallback_pool)))
          return hr;
