@@ -1100,10 +1100,7 @@ mod tests {
         let mut block = f.block;
         let returned = crate::virtio::testing::returns_in_time(move || block.queue_notify(0));
         assert!(returned.is_some(), "queue_notify spins on a broken ring");
-        assert_eq!(
-            f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(),
-            0
-        );
+        assert_eq!(f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(), 0);
         assert!(f.interrupt.notifies.lock().is_empty());
     }
 
