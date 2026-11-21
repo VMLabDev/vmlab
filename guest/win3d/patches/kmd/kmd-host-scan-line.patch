@@ -1,0 +1,102 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -1343,7 +1343,6 @@
+         return STATUS_UNSUCCESSFUL;
+     }
+ 
++    pAdapter->vidpn.GetScanLine(pGetScanLine);
+-    pGetScanLine->InVerticalBlank = FALSE;
+-    pGetScanLine->ScanLine = 0;
+     return STATUS_SUCCESS;
+ }
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -15,3 +15,6 @@
+ static const LONGLONG kVsyncPeriod100ns = 166666LL; // 60 Hz
+ static const LONGLONG kVsyncMaxLead100ns = 333333LL;
++// Keep the guest timestamp and host period in one atomic microsecond sample.
++static const UINT kScanPeriodBits = 16;
++static const ULONGLONG kScanPeriodMask = (1ULL << kScanPeriodBits) - 1;
+ 
+@@ -2042,3 +2045,4 @@
+     InterlockedExchange(&m_shouldFlipStop, 1);
++    InterlockedExchange64(&m_scanLineTick, 0);
+     KeCancelTimer(&m_vsyncNotifyTimer);
+     KeReleaseSpinLock(&m_vsyncTimerLock, oldIrql);
+@@ -2262,3 +2266,17 @@
+     InterlockedExchange64(&m_hostVblankTimeNs, (LONG64)resp->timestamp_ns);
++    const ULONGLONG periodUs = resp->period_ns / 1000;
++    if (periodUs && periodUs <= kScanPeriodMask &&
++        InterlockedCompareExchange(&m_shouldFlipStop, 0, 0) == 0)
++    {
++        // The host timestamp has a different epoch. Observe its tick in
++        // the guest clock domain used by GetScanLine.
++        ULONGLONG qpc;
++        const ULONGLONG nowUs = KeQueryInterruptTimePrecise(&qpc) / 10;
++        InterlockedExchange64(&m_scanLineTick, (LONG64)((nowUs << kScanPeriodBits) | periodUs));
++    }
++    else
++    {
++        InterlockedExchange64(&m_scanLineTick, 0);
++    }
+ 
+     // A vsync reports a flip only once it was sent (0008). A flip that
+@@ -2276,4 +2294,44 @@
+     return raise;
+ }
+ 
++void VioGpuVidPN::GetScanLine(DXGKARG_GETSCANLINE *args)
++{
++    args->InVerticalBlank = FALSE;
++    args->ScanLine = 0;
++    if (args->VidPnTargetId != 0 || InterlockedCompareExchange(&m_hostVblank, 0, 0) == 0 ||
++        InterlockedCompareExchange(&m_shouldFlipStop, 0, 0) != 0)
++    {
++        return;
++    }
++
++    const ULONGLONG tick = (ULONGLONG)InterlockedCompareExchange64(&m_scanLineTick, 0, 0);
++    const ULONGLONG periodUs = tick & kScanPeriodMask;
++    const ULONG activeLines = m_CurrentModes[0].DispInfo.Height;
++    if (!periodUs || !activeLines)
++    {
++        return;
++    }
++
++    ULONGLONG qpc;
++    const ULONGLONG elapsedUs = KeQueryInterruptTimePrecise(&qpc) / 10 - (tick >> kScanPeriodBits);
++    if (elapsedUs >= 2 * periodUs)
++    {
++        return; // The tick stream has stopped or is too late to estimate phase.
++    }
++
++    // The virtual target exposes no blanking in its VidPN mode timings.
++    // Use a synthetic blanking interval like the host's generated EDID.
++    const UINT blankLines = 35;
++    const ULONGLONG phaseUs = elapsedUs % periodUs;
++    const UINT line = (UINT)(phaseUs * (activeLines + (ULONGLONG)blankLines) / periodUs);
++    if (line < blankLines)
++    {
++        args->InVerticalBlank = TRUE;
++    }
++    else
++    {
++        args->ScanLine = line - blankLines;
++    }
++}
++
+ void VioGpuVidPN::HostVblankDone(void *ctx)
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -115,2 +115,3 @@
+     BOOLEAN OnHostVblankFromIsr(struct virtio_gpu_vbuffer *pvbuf, UINT len);
++    void GetScanLine(DXGKARG_GETSCANLINE *args);
+     PHYSICAL_ADDRESS GetCurrentSourceAddress() const
+@@ -205,3 +206,4 @@
+     volatile LONG64 m_hostVblankSequence = 0;
+     volatile LONG64 m_hostVblankTimeNs = 0;
++    volatile LONG64 m_scanLineTick = 0;
+ };

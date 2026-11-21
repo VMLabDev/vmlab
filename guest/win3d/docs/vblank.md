@@ -85,8 +85,25 @@ tick. No tick raises two vsyncs.
 The interrupt data of `DXGK_INTERRUPT_CRTC_VSYNC` has no timestamp, so the
 host time reaches Windows only as the time of the interrupt. The driver
 keeps the last tick and host time (`m_hostVblankSequence`,
-`m_hostVblankTimeNs`) and the trace build records them. `GetScanLine` is
-still not implemented.
+`m_hostVblankTimeNs`) and the trace build records them.
+
+## Scan line
+
+`patches/kmd/kmd-host-scan-line.patch` implements `DxgkDdiGetScanLine` for
+target 0 with host vblank enabled. On each C11 tick the interrupt handler
+records the guest's precise interrupt time and the period from the host
+response in one atomic sample. The host's monotonic timestamp and the
+guest's interrupt time have different origins. The guest timestamp marks
+the observed start of blanking, with the delay of delivering the interrupt.
+
+The driver takes elapsed guest time modulo the period and scales it across
+35 virtual blank lines followed by the current mode's active height. The
+35 lines model the blanking interval of the host's generated EDID. During
+blanking the driver reports line 0 with `InVerticalBlank` set. Active lines
+start again at 0. Without a usable tick, including before the first reply,
+after stop or timer fallback, or once two periods have elapsed since the
+last tick, the driver returns line 0 with `InVerticalBlank` clear. Hosts
+without the feature bit keep that same answer.
 
 ## Without the bit
 
@@ -134,7 +151,8 @@ frame clock" in each lab. The three values in a cell are the three runs.
   same 43 to 45 frames per second in the same hour. So this is not the
   vblank. The baseline of acceptance.md had 58.32 on 2026-11-20 at commit
   `d88304f2`: something merged since lowered it, and it is not found yet.
-- `scan-line` fails as before: `GetScanLine` is not implemented.
+- Driver `58113` still returned line 0 with `InVerticalBlank` clear in
+  this run, which predates the scan-line patch.
 
 A first form of `0012` raised the vsync of a tick with a flip at the host's
 answer to that flip, when the frame is shown. On Nvidia2, with a second lab
