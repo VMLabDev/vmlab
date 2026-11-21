@@ -906,6 +906,19 @@ The standalone `visual` run on AMD1 reported the same 343 failures in
 206,068 checks. The test session used a soft open-file limit of 65,536
 after an earlier attempt exhausted the default limit of 1,024.
 
+Card #336 used the [vertex fog patch](../patches/mesa/d3d9-vertex-fog-specular-alpha.patch)
+at `e6506ed1666e` on helios with the Windows 11 `26100.1742.11#win3d`
+template. Each `d3d9_visual` run executed 206,068 checks and skipped 31.
+All 56 removed failures per GPU were at `visual.c:28481` with table fog
+disabled. Pre-transformed vertices take the fog factor from their specular
+alpha. Legacy programmable vertex shaders use their output specular alpha
+when they leave `oFog` unwritten.
+
+| GPU | `visual` failures before → after | Pre-transformed, `vs_mode = 0` | Shader without `oFog`, `vs_mode = 2` |
+| --- | --- | --- | --- |
+| AMD1 (`renderD130`) | 343 → 287 | 24 → 0 | 32 → 0 |
+| Nvidia2 (`renderD129`) | 345 → 289 | 24 → 0 | 32 → 0 |
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -923,8 +936,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Use reciprocal RHW for perspective table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 0`. Check fog uses W recovered from the pre-transformed vertex. |
 | Use transformed W for fixed-function table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 1`. Check fog uses the W produced by the fixed-function transform. |
 | Use shader output W for perspective table fog | `visual`, 72 / 72 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 2` or `3`. Check fog uses shader output W with and without an explicit fog output. |
-| Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
-| Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
 | Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
