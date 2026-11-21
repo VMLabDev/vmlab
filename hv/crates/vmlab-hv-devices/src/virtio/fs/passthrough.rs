@@ -2332,6 +2332,50 @@ mod tests {
     }
 
     #[test]
+    fn restored_handle_on_a_vanished_file_fails_io() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"hello.txt").unwrap();
+        let (handle, _, _) =
+            FileSystem::open(&fs, &ctx(), entry.inode, libc::O_RDWR as u32, 0).unwrap();
+        let handle = handle.unwrap();
+        let state = fs.save_state();
+        std::fs::remove_file(dir.path().join("hello.txt")).unwrap();
+
+        let restored = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        restored.restore_state(&state).unwrap();
+        let data = b"lost write";
+        let write = FileSystem::write(
+            &restored,
+            &ctx(),
+            entry.inode,
+            handle,
+            &mut SliceReader(data),
+            data.len() as u32,
+            0,
+            None,
+            false,
+            0,
+            0,
+        );
+        assert_eq!(write.map_err(|err| err.raw_os_error()), Err(Some(libc::ESTALE)));
+        let mut served = Vec::new();
+        let read = FileSystem::read(
+            &restored,
+            &ctx(),
+            entry.inode,
+            handle,
+            &mut SinkWriter(&mut served),
+            1,
+            0,
+            None,
+            0,
+        );
+        assert_eq!(read.map_err(|err| err.raw_os_error()), Err(Some(libc::ESTALE)));
+        let sync = FileSystem::fsync(&restored, &ctx(), entry.inode, false, handle);
+        assert_eq!(sync.map_err(|err| err.raw_os_error()), Err(Some(libc::ESTALE)));
+    }
+
+    #[test]
     fn restore_refuses_tampered_state() {
         let (_dir, fs) = scratch();
         let state = fs.save_state();
