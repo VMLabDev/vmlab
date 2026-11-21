@@ -95,7 +95,7 @@ Two hypotheses were tested and ruled out:
 
 ### The fix
 
-`patches/mesa/0080-wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch`
+`patches/mesa/wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch`
 changes `DrvValidateVersion`, the first entry point `opengl32.dll` calls in
 an ICD. On the first call, it pins `opengl32.dll`
 (`GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN, ...)`). GDI's

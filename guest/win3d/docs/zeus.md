@@ -275,7 +275,7 @@ on ANV. With only this check relaxed, all of them pass
 
 ### The fix: `patches/mesa/0021`
 
-`0021-yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` (Mesa,
+`yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` (Mesa,
 the Yttrium d3d10umd frontend and gdi winsys):
 
 - `CreateDevice` no longer fails. It logs once that typed UAV loads are

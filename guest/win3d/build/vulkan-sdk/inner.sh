@@ -35,10 +35,10 @@ while read -r kind name tag commit sha url; do
 done < "$pins"
 
 # Local patch series for Vulkan-Tools, applied in order.
-for p in /w/patches/vulkan-tools/*.patch; do
-  echo "apply $(basename "$p")"
-  patch --directory="${srcdir[Vulkan-Tools]}" --strip=1 --forward --batch --quiet < "$p"
-done
+while IFS= read -r p; do
+  echo "apply $p"
+  patch --directory="${srcdir[Vulkan-Tools]}" --strip=1 --forward --batch --quiet < "/w/patches/vulkan-tools/$p"
+done < /w/patches/vulkan-tools/series
 
 # Vulkan-Headers: header-only, installed once and shared by both arches.
 # Its project() still probes a compiler, so give it the x86_64 cross one.

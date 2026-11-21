@@ -46,12 +46,10 @@ submodules() {
 # apply <dir> <patch dir>: apply every patch in order.
 apply() {
   local p
-  shopt -s nullglob
-  for p in "$2"/*.patch; do
-    echo "applying $(basename "$p")"
-    git -C "$1" apply --whitespace=nowarn "$p"
-  done
-  shopt -u nullglob
+  while IFS= read -r p; do
+    echo "applying $p"
+    git -C "$1" apply --whitespace=nowarn "$2/$p"
+  done < "$2/series"
 }
 
 prepare_sources() {

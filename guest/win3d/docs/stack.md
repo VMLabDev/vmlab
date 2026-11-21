@@ -4,7 +4,7 @@ This page describes every layer between a Windows application in the guest
 and the GPU in the host. For each component it lists the files installed in
 the guest, how Windows finds them, the upstream source and pin, this
 repository's patches, and the licence. The pin and patch tables at the end
-are generated from `build/*/PINS` and `patches/` by `scripts/pins-table.py`.
+come from `build/*/PINS` and `patches/` through `scripts/pins-table.py`.
 
 ## The path of a frame
 
@@ -108,7 +108,7 @@ and loads the WGL ICD. The package changes only `d3d12.dll`, described below.
 | Installed by | `installer/vmlab-win3d.ps1`, only when the existing `vulkan-1.dll` is missing or has an older file version. The template has 1.3.300. |
 | Upstream | [KhronosGroup/Vulkan-Loader](https://github.com/KhronosGroup/Vulkan-Loader) and [Vulkan-Tools](https://github.com/KhronosGroup/Vulkan-Tools), tag `vulkan-sdk-1.4.363.0` |
 | Build | [`build/vulkan-sdk/`](../build/vulkan-sdk/README.md) |
-| Patches | Loader: none. Vulkan-Tools: 1, `vulkan-tools/0001`, which stops the llvm-mingw `vulkaninfo.exe` crashing on a null `user32_handles` (table below) |
+| Patches | Loader: none. Vulkan-Tools: 1, `vulkan-tools/0001`, which stops the llvm-mingw `vulkaninfo.exe` crashing on a null `user32_handles` (see [Patches](#patches)) |
 | Licence | Apache-2.0 |
 
 ### D3D12: the bridge, vkd3d-proton and DXVK's DXGI
@@ -120,7 +120,7 @@ and loads the WGL ICD. The package changes only `d3d12.dll`, described below.
 | Installed by | The installer: takes ownership of `d3d12.dll`, replaces it, and restores the TrustedInstaller owner and ACL. The `vmlab-win3d-repair` startup task puts the bridge back after Windows servicing and renews both native copies. |
 | Upstream | [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) v3.0.1, [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv) at `8434b063` (newer than vkd3d-proton's gitlink), [DXVK](https://github.com/doitsujin/dxvk) v3.1.1 built with only DXGI |
 | Build | [`build/d3d12/`](../build/d3d12/README.md) |
-| Patches | vkd3d-proton 5, DXVK 1, dxil-spirv 0 (table below). `vkd3d-proton/0005` turns vkd3d-proton's `d3d12.dll` into the system-wide bridge. |
+| Patches | vkd3d-proton 5, DXVK 1, dxil-spirv 0 (see [Patches](#patches)). `vkd3d-proton/0005` turns vkd3d-proton's `d3d12.dll` into the system-wide bridge. |
 | Licence | vkd3d-proton LGPL-2.1-or-later; dxil-spirv MIT; DXVK zlib |
 
 The bridge implements the D3D12 entry points with vkd3d-proton and forwards
@@ -138,7 +138,7 @@ vkd3d-proton queues go to DXVK's DXGI, and everything else stays native.
 | Installed by | The INF (`VioGpu3D_Files.Usermode`, `VioGpu3D_Files.Wow64`, `VioGpu3D_DeviceSettings`) |
 | Upstream | [arehnman/virtio-win-mesa](https://github.com/arehnman/virtio-win-mesa), branch `yttrium-experimental`, commit `76c095bb`, the November 2026 release (Mesa 26.1.0) |
 | Build | [`build/mesa/`](../build/mesa/README.md) |
-| Patches | Mesa 45, shared with the two Mesa components below (table below). [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
+| Patches | Mesa 45, shared with the two Mesa components below (see [Patches](#patches)). [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
 | Licence | Mesa MIT; the Yttrium winsys (`src/gallium/winsys/yttrium/gdi/`) MPL-2.0 |
 
 `viogpu_d3d10.dll` is Mesa's `d3d10umd` front end (D3D10/11 DDI, plus a
@@ -184,7 +184,7 @@ renderer, `vn_renderer_d3dkmt.c`, submits Venus commands to the KMD with
 | Installed by | The installer runs `pnputil /add-driver viogpu3d.inf /install`. The package is test-signed ([decision 0001](decisions/0001-signing.md)). |
 | Upstream | [arehnman/yttrium-virtio-gpu](https://github.com/arehnman/yttrium-virtio-gpu), tag `yttrium-experimental-2026-11-02` (`e9917ae2`), a fork of virtio-win/kvm-guest-drivers-windows |
 | Build | [`build/kmd/`](../build/kmd/README.md), clang-cl and lld-link against the WDK NuGet packages |
-| Patches | 11 (table below) |
+| Patches | 11 (see [Patches](#patches)) |
 | Licence | BSD-3-Clause; Yttrium's changes to `viogpu3d` are also MPL-2.0 where marked |
 
 The device appears as "Yttrium VirtIO GPU 3D controller" (upstream renamed
@@ -296,85 +296,12 @@ Dockerfiles pin their Debian packages by version.
 
 ## Patches
 
-Every patch is applied in name order to the pinned source by the component's
-build script. Each file's header says what it fixes and which prior-art
-finding or document it comes from; the last column links the document that
-explains it. `build/mesa/README.md` and `build/d3d12/README.md` list what was
-left out of the prior art's changes and why. The `host/` rows are host
-components, not part of the guest package ([Host patches](#host-patches)).
-The Mesa series skips 0018 and 0019; no patch with either number was ever
-committed.
+Each guest component applies the patches in its `patches/<component>/series`
+file in order. Run `scripts/pins-table.py` to print the current patch inventory
+with links to the documentation for each patch.
 
-<!-- BEGIN generated patches table: scripts/pins-table.py --write -->
-| Upstream | Patches | Patch | What it does | Explained in |
-| --- | --- | --- | --- | --- |
-| dxil-spirv | 0 | — | None; see [`patches/dxil-spirv/`](../patches/dxil-spirv/) | — |
-| dxvk | 1 | [`0001`](../patches/dxvk/0001-dxgi-Keep-the-swap-chain-description-when-a-resize-fails.patch) | dxgi: Keep the swap-chain description when a resize fails. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| kmd | 12 | [`0001`](../patches/kmd/0001-kmd-r10-copy.patch) | Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD) | [`build/kmd/README.md`](../build/kmd/README.md) |
-| | | [`0002`](../patches/kmd/0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch) | viogpu3d: map GDI shadow and staging surfaces cached | [`docs/present.md`](present.md) |
-| | | [`0003`](../patches/kmd/0003-kmd-create-context-for-gdi-devices.patch) | viogpu3d: create a legacy context before opening GDI allocations | [`build/kmd/README.md`](../build/kmd/README.md) |
-| | | [`0004`](../patches/kmd/0004-kmd-recover-from-timeouts.patch) | viogpu3d: recover transport and device state after a timeout | [`docs/tdr-recovery.md`](tdr-recovery.md) |
-| | | [`0005`](../patches/kmd/0005-kmd-hardware-pointer.patch) | viogpu3d: a hardware pointer on the cursor queue | [`docs/pointer.md`](pointer.md) |
-| | | [`0006`](../patches/kmd/0006-kmd-present-blt-into-mappable-blob.patch) | viogpu3d: allow a present copy into a mappable blob | [`docs/present.md`](present.md) |
-| | | [`0007`](../patches/kmd/0007-kmd-flip-trace-build.patch) | viogpu3d: a trace build for the order of renders, presents and flips | [`docs/tearing.md`](tearing.md) |
-| | | [`0008`](../patches/kmd/0008-kmd-report-flips-after-they-are-sent.patch) | viogpu3d: report a flip with a vsync only after it was sent to the host | [`docs/tearing.md`](tearing.md) |
-| | | [`0009`](../patches/kmd/0009-kmd-host-ordered-flip.patch) | viogpu3d: let the host order the flip when it offers to | [`docs/tearing.md`](tearing.md) |
-| | | [`0010`](../patches/kmd/0010-kmd-host-present-copy.patch) | viogpu3d: let the host copy a Blt present when it offers to | [`docs/flip.md`](flip.md) |
-| | | [`0011`](../patches/kmd/0011-kmd-host-gpu-lost.patch) | viogpu3d: a lost host GPU is a removed device | [`docs/device-lost.md`](device-lost.md) |
-| | | [`0012`](../patches/kmd/0012-kmd-host-vblank.patch) | viogpu3d: take the vblank from the host's frame clock when it offers it | [`docs/vblank.md`](vblank.md) |
-| mesa | 47 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0002`](../patches/mesa/0002-util-xmlconfig-case-insensitive-exe-match.patch) | util/xmlconfig: match drirc executable names case-insensitively on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0003`](../patches/mesa/0003-util-u_queue-windows-loader-lock-join.patch) | util/u_queue: do not join worker threads under the loader lock on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0004`](../patches/mesa/0004-wgl-unbind-through-stw-on-delete.patch) | wgl: unbind the current context through stw_make_current on delete | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0005`](../patches/mesa/0005-yttrium-blend-max-rt.patch) | d3d10umd, yttrium: honour blend max_rt and ignore factors when blending is off | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0006`](../patches/mesa/0006-d3d9-rendering-fixes.patch) | d3d10umd/d3d9, yttrium: D3D9 sampler, depth-bias, format and D32F fixes | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0007`](../patches/mesa/0007-d3d11-wddm20-ddi.patch) | d3d10umd: negotiate the WDDM 2.0 D3D11 DDI and report typed UAV loads | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0008`](../patches/mesa/0008-shader-translation-fixes.patch) | tgsi_to_nir, d3d10umd: fix array gradients and UAV load component selection | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0009`](../patches/mesa/0009-yttrium-compute-and-coherence.patch) | d3d10umd, yttrium: compute, constant-buffer and resource-coherence fixes | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0010`](../patches/mesa/0010-dxgi-blt-scaled-srgb-safe.patch) | d3d10umd: make the DXGI Blt scale and keep sRGB data bit-exact | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0011`](../patches/mesa/0011-venus-win32-nt-memory.patch) | venus: opaque Win32 (NT handle) memory export and import on D3DKMT | [`build/mesa/README.md`](../build/mesa/README.md) |
-| | | [`0012`](../patches/mesa/0012-d3d9-directdraw-hal-caps.patch) | d3d10umd: report the D3D7 and D3D8 caps DirectDraw asks the D3D9 UMD for | [`docs/dxdiag.md`](dxdiag.md) |
-| | | [`0013`](../patches/mesa/0013-d3d9-write-only-lock-keeps-contents.patch) | d3d10umd: keep a surface's contents across a write-only D3D9 lock | [`docs/dxdiag.md`](dxdiag.md) |
-| | | [`0014`](../patches/mesa/0014-d3d9-ddraw-surfaces-are-present-sources.patch) | d3d10umd: make DirectDraw surfaces display targets | [`docs/dxdiag.md`](dxdiag.md) |
-| | | [`0015`](../patches/mesa/0015-d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch) | d3d10umd: hull shader vPrim, indexed patch constants and control points | [`docs/d3d11-apps.md`](d3d11-apps.md) |
-| | | [`0016`](../patches/mesa/0016-d3d10umd-immediate-constant-buffer-relative-offset.patch) | d3d10umd: keep the offset in dynamically indexed immediate constant buffer reads | [`docs/d3d11-apps.md`](d3d11-apps.md) |
-| | | [`0017`](../patches/mesa/0017-yttrium-honour-wireframe-fill-mode.patch) | yttrium: honour D3D11_FILL_WIREFRAME | [`docs/d3d11-apps.md`](d3d11-apps.md) |
-| | | [`0021`](../patches/mesa/0021-yttrium-d3d11-typed-uav-loads-without-formatless-read.patch) | d3d10umd, yttrium: create WDDM 2.0 D3D11 devices without formatless storage-image reads; R32 typed UAV loads only, and TypedUAVLoadAdditionalFormats from the host (Intel ANV) | [`docs/zeus.md`](zeus.md) |
-| | | [`0022`](../patches/mesa/0022-yttrium-render-shadow-for-linear-colour-with-depth.patch) | yttrium: render LINEAR colour targets next to depth through an OPTIMAL shadow | [`docs/xid69.md`](xid69.md) |
-| | | [`0023`](../patches/mesa/0023-yttrium-shared-colour-optimal-when-linear-refused.patch) | yttrium: shared colour images fall back to OPTIMAL where the host refuses LINEAR | [`docs/nvtex.md`](nvtex.md) |
-| | | [`0024`](../patches/mesa/0024-d3d9-positiont-vs-for-runtime-fixed-function-ps.patch) | d3d9: generate the POSITIONT vertex shader for any runtime fixed-function pixel shader | [`docs/nvtex.md`](nvtex.md) |
-| | | [`0026`](../patches/mesa/0026-d3d9-ddraw-present-sources-in-host-cached-memory.patch) | d3d9: put DirectDraw present sources in host-cached memory | [`docs/present.md`](present.md) |
-| | | [`0027`](../patches/mesa/0027-wgl-present-windows-opaque.patch) | wgl: present windows opaque through kopper | [`docs/present.md`](present.md) |
-| | | [`0030`](../patches/mesa/0030-d3d10umd-domain-shader-indexed-patch-constants.patch) | d3d10umd: domain shaders read patch constants with a register index | [`docs/ds.md`](ds.md) |
-| | | [`0031`](../patches/mesa/0031-d3d10umd-output-index-ranges-in-every-stage.patch) | d3d10umd: output index ranges in every shader stage | [`docs/shaders2.md`](shaders2.md) |
-| | | [`0032`](../patches/mesa/0032-d3d10umd-hull-shader-join-phases-read-fork-phase-outputs.patch) | d3d10umd, yttrium: hull shader join phases read fork phase outputs | [`docs/shaders2.md`](shaders2.md) |
-| | | [`0035`](../patches/mesa/0035-d3d9-hardware-colour-key-and-mirror-blits.patch) | d3d9: hardware source colour-key and mirror blits for DirectDraw | [`docs/ddraw.md`](ddraw.md) |
-| | | [`0040`](../patches/mesa/0040-d3d9-swvp-processed-vertices-keep-declaration-vs.patch) | d3d9: keep the declaration-built vertex shader for software-processed vertices | [`docs/ffp.md`](ffp.md) |
-| | | [`0041`](../patches/mesa/0041-d3d9-fixed-function-fog.patch) | d3d9: fixed-function fog for perspective table fog, vertex fog clamping and pre-transformed vertices | [`docs/ffp.md`](ffp.md) |
-| | | [`0042`](../patches/mesa/0042-d3d9-fixed-function-points.patch) | d3d9: point expansion keeps vertex attributes, perspective size and per-vertex PSIZE | [`docs/ffp.md`](ffp.md) |
-| | | [`0043`](../patches/mesa/0043-d3d9-bump-luminance-formats.patch) | d3d9: L6V5U5 and X8L8V8U8 bump maps for BUMPENVMAPLUMINANCE | [`docs/ffp2.md`](ffp2.md) |
-| | | [`0044`](../patches/mesa/0044-d3d9-indexed-vertex-blend-palette.patch) | d3d9: report the runtime's matrix palette for indexed vertex blending | [`docs/ffp2.md`](ffp2.md) |
-| | | [`0060`](../patches/mesa/0060-d3d10umd-trim-residency-set-leaves-the-context-alone.patch) | d3d10umd: TrimResidencySet leaves the pipe context alone | [`docs/dwmheap.md`](dwmheap.md) |
-| | | [`0065`](../patches/mesa/0065-venus-feedback-buffers-in-host-cached-memory.patch) | venus: feedback buffers in host-cached memory | [`docs/nvfb.md`](nvfb.md) |
-| | | [`0066`](../patches/mesa/0066-venus-disable-feedback-when-writes-do-not-arrive.patch) | venus: disable feedback for a device whose feedback writes do not arrive | [`docs/nvfb.md`](nvfb.md) |
-| | | [`0067`](../patches/mesa/0067-venus-back-uncached-host-memory-with-cached-when-gpu-writes-do-not-arrive.patch) | venus: back uncached host memory with cached memory when GPU writes do not arrive | [`docs/nvfb.md`](nvfb.md) |
-| | | [`0070`](../patches/mesa/0070-venus-hide-host-access-to-small-bar-heap.patch) | venus: hide host access to a small BAR heap | [`docs/nvva.md`](nvva.md) |
-| | | [`0080`](../patches/mesa/0080-wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch) | wgl: pin opengl32.dll so pixel formats set through GDI last | [`docs/gzdoom.md`](gzdoom.md) |
-| | | [`0085`](../patches/mesa/0085-venus-allocate-from-small-device-local-heap-synchronously.patch) | venus: allocate from a small device-local heap synchronously | [`docs/unigl.md`](unigl.md) |
-| | | [`0086`](../patches/mesa/0086-zink-keep-buffers-mappable-without-visible-vram.patch) | zink: keep buffers mappable when CPU-visible VRAM is missing or full | [`docs/unigl.md`](unigl.md) |
-| | | [`0091`](../patches/mesa/0091-d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch) | d3d9: stop copying every vertex-buffer lock for the ordered worker | [`docs/f6va.md`](f6va.md) |
-| | | [`0092`](../patches/mesa/0092-yttrium-bound-in-flight-uploads.patch) | yttrium: bound in-flight upload buffers in 32-bit processes | [`docs/f6va.md`](f6va.md) |
-| | | [`0093`](../patches/mesa/0093-yttrium-guard-revoked-batch-feedback.patch) | yttrium: report device loss for revoked feedback mappings | [`docs/tdr-recovery.md`](tdr-recovery.md) |
-| | | [`0094`](../patches/mesa/0094-yttrium-forced-sample-coverage-one-pass-per-sample.patch) | yttrium: draw forced-sample coverage as one pass per sample | [`docs/d2d-coverage.md`](d2d-coverage.md) |
-| | | [`0095`](../patches/mesa/0095-yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch) | yttrium: make a Desktop Duplication surface a kernel-written display image | [`docs/present.md`](present.md) |
-| | | [`0096`](../patches/mesa/0096-d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch) | d3d10umd: preload the native d3d12.dll in a Chromium GPU process | [`docs/chromium.md`](chromium.md) |
-| | | [`0097`](../patches/mesa/0097-d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch) | d3d10umd: keep the device through Wine's d3d10core and d3d11 tests | [`docs/acceptance.md`](acceptance.md) |
-| vkd3d-proton | 7 | [`0001`](../patches/vkd3d-proton/0001-vkd3d-Reject-root-signatures-with-overlapping-regist.patch) | vkd3d: Reject root signatures with overlapping register bindings. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| | | [`0002`](../patches/vkd3d-proton/0002-vkd3d-Report-FORMAT_INFO-plane-counts-without-a-Vulk.patch) | vkd3d: Report FORMAT_INFO plane counts without a Vulkan format mapping. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| | | [`0003`](../patches/vkd3d-proton/0003-vkd3d-Allow-depth-stencil-textures-in-CPU-visible-he.patch) | vkd3d: Allow depth-stencil textures in CPU-visible heaps. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| | | [`0004`](../patches/vkd3d-proton/0004-vkd3d-Default-the-Windows-shader-cache-to-LocalAppDa.patch) | vkd3d: Default the Windows shader cache to LocalAppData. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| | | [`0005`](../patches/vkd3d-proton/0005-d3d12-Build-a-system-wide-d3d12.dll-bridge.patch) | d3d12: Build a system-wide d3d12.dll bridge. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| | | [`0006`](../patches/vkd3d-proton/0006-vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch) | vkd3d: Emulate state-changing ExecuteIndirect without EXT_dgc. | [`docs/ei.md`](ei.md) |
-| | | [`0007`](../patches/vkd3d-proton/0007-vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch) | vkd3d: Emulate ExecuteIndirect vertex and index buffer views without EXT_dgc. | [`docs/ei.md`](ei.md) |
-| vulkan-tools | 1 | [`0001`](../patches/vulkan-tools/0001-vulkaninfo-Load-user32-on-every-Windows-compiler.patch) | vulkaninfo: Load user32 on every Windows compiler | [`build/vulkan-sdk/README.md`](../build/vulkan-sdk/README.md) |
-<!-- END generated patches table -->
+Give a new patch a unique subject or card-based filename ending in `.patch`.
+Append that filename on its own line to the component's `series` file. Git's
+union merge driver keeps both additions when cards append independently.
+If a patch depends on another card's patch, merge the prerequisite first.
+Run `just ci::win3d-check` to verify each file is listed exactly once.

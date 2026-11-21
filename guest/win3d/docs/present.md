@@ -103,7 +103,7 @@ came from. The repro's lighter frame lost fewer vblanks (45.5 fps).
 
 ## Fixes for bugs 1 and 2
 
-**`patches/kmd/0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch`**
+**`patches/kmd/kmd-cache-gdi-shadow-and-staging-surfaces.patch`**
 sets `Flags.Cached` on the KMD's shadow and staging surfaces. The KMD
 already tags exactly these two standard allocation types with
 `VIRGL_RESOURCE_FLAG_MAP_COHERENT`, and the patch uses that tag. The
@@ -120,7 +120,7 @@ passed (`isolation/kmd-all-cached/e2e-results.txt`). The reason was not
 investigated, because the release KMD has no tracing. Some non-blob
 allocation besides the GDI surfaces must not be mapped cached.
 
-**`patches/mesa/0026-d3d9-ddraw-present-sources-in-host-cached-memory.patch`**
+**`patches/mesa/d3d9-ddraw-present-sources-in-host-cached-memory.patch`**
 puts DirectDraw present sources in host-cached memory (UMD
 `YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK`). Patch 0014 identifies these
 surfaces as Blt sources.
@@ -137,7 +137,7 @@ compositor then blended the alpha left in the back buffer with whatever
 was behind the window. The OpenGL probe writes alpha 1 and was opaque.
 Blender leaves alpha below 1 in its UI.
 
-**`patches/mesa/0027-wgl-present-windows-opaque.patch`** clears
+**`patches/mesa/wgl-present-windows-opaque.patch`** clears
 `has_alpha`. The swapchain becomes `VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR`,
 which the WSI maps to `DXGI_ALPHA_MODE_IGNORE`. That matches native
 Windows: GDI windows and DWM redirection surfaces ignore a GL

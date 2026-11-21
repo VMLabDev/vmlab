@@ -3,7 +3,7 @@
 The DirectX SDK (June 2010) D3D9 `BasicHLSL` sample hung the Windows guest on
 both RTX 5090s, and each time the host kernel logged an Xid 69. This page
 names the trigger, gives the evidence and records the fix,
-`patches/mesa/0022-yttrium-render-shadow-for-linear-colour-with-depth.patch`.
+`patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`.
 Investigated on 2026-10-18 on helios: NVIDIA 610.57.04, vmlab 0.28.0-alpha,
 QEMU 11.1.1 with the egl-headless patch, virglrenderer 1.3.0. Evidence is in
 [docs/evidence/xid69/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/xid69/).

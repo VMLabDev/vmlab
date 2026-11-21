@@ -82,7 +82,7 @@ so Intel1 passes too.
 
 ## The fixes
 
-`patches/mesa/0065-venus-feedback-buffers-in-host-cached-memory.patch`
+`patches/mesa/venus-feedback-buffers-in-host-cached-memory.patch`
 (`vn_feedback_buffer_create`, `src/virtio/vulkan/vn_feedback.c`): the
 feedback buffer takes the first memory type with `HOST_COHERENT` and
 `HOST_CACHED`, and otherwise the first `HOST_COHERENT` type as before. On
@@ -90,7 +90,7 @@ NVIDIA that is type 3, on RADV the cached GTT type, and on ANV the cached
 device-local type. Polling cached memory is also cheaper than polling uncached
 memory. Query feedback buffers go through the same function.
 
-`patches/mesa/0066-venus-disable-feedback-when-writes-do-not-arrive.patch`
+`patches/mesa/venus-disable-feedback-when-writes-do-not-arrive.patch`
 (`vn_feedback_self_test`) protects hosts where even that type fails. After
 `vkCreateDevice` it allocates a fence feedback slot, sets it to
 `VK_NOT_READY`, and submits the fence feedback command (`vkCmdFillBuffer` of

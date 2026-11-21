@@ -64,7 +64,7 @@ The Meson options are the prior art's (`R/build.sh`, prior-art section 6):
 
 ## Patches
 
-The series has two parts, and the patches apply in name order:
+The patches apply in the order listed in `patches/mesa/series`. The series has two parts.
 
 - **0001 to 0011** come from the prior art. The codex session left its fixes
   uncommitted in `R/mesa`, and its exported `R/mesa-driver.patch` is stale
