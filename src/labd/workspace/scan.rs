@@ -861,6 +861,20 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_channel_error_during_readdir_fails_the_guest_walk() {
+        let dir = workspace(&[]);
+        let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+        let guest = super::super::guest::fake::FakeGuest::new();
+        guest.dir("/src/lib");
+        guest.disconnect_on_readdir("/src/lib");
+
+        let error = guest_walk(&guest, "/src", &ignores, &empty_ledger(), true, NO_CAP)
+            .await
+            .expect_err("a dropped session must fail the walk");
+        assert!(format!("{error:#}").contains("file session closed"));
+    }
+
     /// The size guard is symmetric. A guest file over the cap is never hashed
     /// here either: the refusal happens before the transfer, and hashing it
     /// first spends the same time the guard exists to save.

@@ -3478,6 +3478,38 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    #[tokio::test]
+    async fn an_unreadable_guest_directory_never_deletes_host_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib/nested")).unwrap();
+        let source = dir.path().join("lib/nested/a.rs");
+        std::fs::write(&source, "a").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        assert_eq!(guest.text("/src/lib/nested/a.rs").as_deref(), Some("a"));
+
+        guest.unreadable("/src/lib");
+        guest.file("/src/lib-extra.rs", "found by the walk", 77);
+        sessions.watcher.overflow();
+        assert!(
+            eventually(|| syncer.report().skipped.iter().any(|skip| skip.path == "lib")).await,
+            "the walk must report the unreadable directory"
+        );
+        syncers.stop("dev01").await;
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("the host file must survive the failed listing"),
+            "a"
+        );
+        assert_eq!(guest.text("/src/lib/nested/a.rs").as_deref(), Some("a"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lib-extra.rs")).unwrap(),
+            "found by the walk"
+        );
+    }
+
     /// The prune list is computed host-side and handed to the guest, which is
     /// never asked to decide anything. A rules change reopens the watch on
     /// the new list, because a prefix cannot be edited in place.
