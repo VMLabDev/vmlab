@@ -19,6 +19,7 @@
 #
 # WIN3D_POINTER_DIR names the VM's runtime directory (display.sock and
 # vnc.sock) when the script cannot find it.
+# WIN3D_POINTER_ROTATION selects the guest display orientation in degrees.
 # check-shell-paths: no-errexit the guest run and the watcher record their rc and the check judges (VML-88).
 set -uo pipefail
 [ $# -eq 3 ] || { sed -n '2,23p' "$0" >&2; exit 2; }
@@ -32,6 +33,11 @@ PLAN=arrow,ibeam,sizewe,hidden,arrow
 SECONDS_EACH=6
 X0=200 Y0=300 STEP_X=120
 BACKGROUND=32,96,160
+ROTATION=${WIN3D_POINTER_ROTATION:-0}
+case "$ROTATION" in
+    0|90|180|270) ;;
+    *) echo "unsupported pointer rotation: $ROTATION" >&2; exit 2 ;;
+esac
 
 note() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 in_lab() { (cd "$LABDIR" && "$@"); }
@@ -76,7 +82,7 @@ python3 "$HERE/pointer.py" watch --display "$DIR/display.sock" --rfb "$DIR/vnc.s
     --seconds "$total" --until "$STAGE/done" --out "$EV/events.json" &
 watch_pid=$!
 sleep 1
-gps "& C:\\win3d\\guest\\Run-Probe.ps1 -Path C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Raw -NoModules -Name pointer -OutDir C:\\win3d\\results\\pointer -Seconds $total -TimeoutSec $total -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','C:\\win3d\\guest\\Show-TestPointer.ps1','-Shapes','$PLAN','-SecondsEach','$SECONDS_EACH','-X0','$X0','-Y0','$Y0','-StepX','$STEP_X','-Background','$BACKGROUND'; exit \$LASTEXITCODE" \
+gps "& C:\\win3d\\guest\\Run-Probe.ps1 -Path C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Raw -NoModules -Name pointer -OutDir C:\\win3d\\results\\pointer -Seconds $total -TimeoutSec $total -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','C:\\win3d\\guest\\Show-TestPointer.ps1','-Shapes','$PLAN','-SecondsEach','$SECONDS_EACH','-X0','$X0','-Y0','$Y0','-StepX','$STEP_X','-Background','$BACKGROUND','-Rotation','$ROTATION'; exit \$LASTEXITCODE" \
     $((total + 120)) >"$STAGE/run.out" 2>&1 &
 guest_pid=$!
 n=0
@@ -85,7 +91,7 @@ while kill -0 "$guest_pid" 2>/dev/null; do
     in_lab vmlab vm screenshot "$VM" "$STAGE/shots/$(printf %03d $n).png" >/dev/null 2>&1 || true
     sleep 1
 done
-wait "$guest_pid"; note "guest run exit $?"
+wait "$guest_pid"; guest_rc=$?; note "guest run exit $guest_rc"
 tail -3 "$STAGE/run.out"
 sleep 2
 touch "$STAGE/done"
@@ -98,11 +104,13 @@ if in_lab vmlab record stop "$VM" && [ -s "$STAGE/pointer.mp4" ]; then
     cp "$STAGE/pointer.mp4" "$EV/pointer.mp4"
 fi
 
-python3 "$HERE/pointer.py" check --events "$EV/events.json" --plan "$PLAN" --x0 "$X0" --y0 "$Y0" --step-x "$STEP_X" \
-    --background "$BACKGROUND" --shots "$STAGE/shots" --guest "$EV/guest.json" "${frames[@]}" --out "$EV/pointer.json"
+python3 "$HERE/pointer.py" check --events "$EV/events.json" --plan "$PLAN" --x0 "$X0" --y0 "$Y0" --step-x "$STEP_X" --rotation "$ROTATION" \
+    --background "$BACKGROUND" --shots "$STAGE/shots" --guest "$EV/guest.json" --guest-exit "$guest_rc" \
+    "${frames[@]}" --out "$EV/pointer.json"
 rc=$?
 # One capture of the window for the evidence: the middle one.
 mid=$(find "$STAGE/shots" -name '*.png' | sort | sed -n "$(((n + 1) / 2))p")
 [ -n "$mid" ] && magick "$mid" -resize 50% -strip -colors 256 "$EV/console-pointer.png"
 find "$STAGE/shots" "$STAGE/frames" -name '*.png' -delete 2>/dev/null
-exit $rc
+[ "$guest_rc" -eq 0 ] || exit "$guest_rc"
+exit "$rc"
