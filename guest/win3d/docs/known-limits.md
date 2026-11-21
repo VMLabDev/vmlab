@@ -718,26 +718,33 @@ its creation removed the device. Wine's d3d11 test `test_high_resource_count`
 its two checks fail. A vertex, geometry, hull, domain or compute shader that
 needs more slots still fails to create and removes the device.
 
-### D3D12: ExecuteIndirect with vertex or index buffer arguments, and an NVIDIA first-boot dwm crash
+### D3D12: ExecuteIndirect is emulated, and an NVIDIA first-boot dwm crash
 
 Five unmodified Microsoft DirectX-Graphics-Samples D3D12 samples now build
 with clang-cl and the MSVC CRT (`build/d3d12-samples/`) and run through the
 installed package with no app-local DLLs (`docs/d3d12app.md`).
 `D3D12HelloTriangle`, `D3D12HelloTexture`, `D3D12Bundles` and
 `D3D12nBodyGravity` render and exit 0 on AMD1 and Nvidia1. Two failures
-were found. The first is fixed in part, the second is fixed:
+were found. Both are fixed, the first with limits:
 
-- **`ExecuteIndirect` with a command signature that sets vertex or index
-  buffer views** draws wrongly, with no error. Venus (guest Mesa 26.1.0 and
-  virglrenderer 1.3.0) does not forward `VK_EXT_device_generated_commands`,
-  which vkd3d-proton uses for state-changing signatures.
-  `patches/vkd3d-proton/0006` emulates signatures that set root constants
-  or root CBV, SRV or UAV addresses: one GPU-patched indirect draw or
-  dispatch per sequence. With it, `D3D12ExecuteIndirect` renders as on WARP
-  on AMD1 and Nvidia1 ([ei.md](ei.md)). Vertex and index buffer view
-  arguments are still dropped. The emulation also moves every root
-  signature's root parameters into a push UBO and root CBVs to raw VAs,
-  with unmeasured cost per draw.
+- **`ExecuteIndirect` with a command signature that changes state** is
+  emulated. Venus (guest Mesa 26.1.0 and virglrenderer 1.3.0) does not
+  forward `VK_EXT_device_generated_commands`, which vkd3d-proton uses for
+  such signatures. `patches/vkd3d-proton/0006` emulates signatures that set
+  root constants or root CBV, SRV or UAV addresses: one GPU-patched indirect
+  draw or dispatch per sequence. With it, `D3D12ExecuteIndirect` renders as
+  on WARP on AMD1 and Nvidia1. `patches/vkd3d-proton/0007` emulates
+  signatures that set vertex or index buffer views: the GPU copies the
+  indices and vertices each sequence draws into scratch buffers
+  ([ei.md](ei.md#vertex-and-index-buffer-views)). The limits:
+  - The scratch buffers have a fixed size: 1024 vertices for each sequence
+    of `MaxCommandCount`, between 16,384 and 1,048,576 for one call, and four
+    times as many indices. A draw that does not fit is not drawn, and
+    vkd3d-proton logs an error when the command allocator is reset.
+    `VKD3D_EXECUTE_INDIRECT_VERTEX_BUDGET` sets the number of vertices.
+  - Every such call copies what it draws. The cost was not measured.
+  - The emulation moves every root signature's root parameters into a push
+    UBO and root CBVs to raw VAs, with unmeasured cost per draw.
 - **On NVIDIA, dwm.exe crashed in the first boot after the install.**
   Fixed by `patches/mesa/0060`: the UMD's `TrimResidencySet` flushed its
   threaded context from DXCore's trim-notification thread while dwm
