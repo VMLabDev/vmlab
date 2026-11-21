@@ -40,16 +40,18 @@ class ReleaseTest(unittest.TestCase):
             self.assertTrue(any("dxil-spirv" in row for row in original))
             self.assertFalse(any("host" in row for row in original))
 
-            patch = directory / "sample.patch"
+            patch = directory / "sample.dll.patch"
             patch.touch()
-            with self.assertRaisesRegex(SystemExit, "unlisted patches: sample.patch"):
+            with self.assertRaisesRegex(SystemExit, r"unlisted patches: sample\.dll\.patch"):
                 pins.read_series(directory)
             (directory / "series").write_text("other.patch\n")
             with self.assertRaisesRegex(SystemExit, "missing patch other.patch"):
                 pins.read_series(directory)
-            (directory / "series").write_text("sample.patch\nsample.patch\n")
-            with self.assertRaisesRegex(SystemExit, "duplicate entry sample.patch"):
+            (directory / "series").write_text(f"{patch.name}\n{patch.name}\n")
+            with self.assertRaisesRegex(SystemExit, r"duplicate entry sample\.dll\.patch"):
                 pins.read_series(directory)
+            (directory / "series").write_text(f"{patch.name}\n")
+            self.assertEqual(pins.read_series(directory), [patch])
 
     def test_dry_run_cannot_publish(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/release.sh"),

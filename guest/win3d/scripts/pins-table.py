@@ -271,7 +271,7 @@ def read_series(directory):
     names = data.decode("ascii", errors="replace").split("\n")[:-1]
     seen = set()
     for name in names:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*\.patch", name):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.patch", name):
             sys.exit(f"{label}: invalid patch name {name!r}")
         if name in seen:
             sys.exit(f"{label}: duplicate entry {name}")
