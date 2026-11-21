@@ -880,6 +880,11 @@ The standalone `visual` run on AMD1 reported the same 343 failures in
 206,068 checks. The test session used a soft open-file limit of 65,536
 after an earlier attempt exhausted the default limit of 1,024.
 
+Card #341 cleared the remaining W-buffer and wireframe setter and replay
+failures. Wine's `stateblock` ran 14,738 checks with zero failures on each
+GPU, up from 12,268 checks with 25 failures. The rendering checks passed
+on both AMD1 and Nvidia2. [Acceptance note C341](acceptance/C341.md)
+
 The [unbound vertex stream patch](../patches/mesa/d3d9-default-inputs-for-unbound-streams.patch)
 uses the existing zero input when a vertex declaration names a stream
 with no bound source. Wine's `visual` ran 206,068 checks with 31 skips on
@@ -980,15 +985,13 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 
 | Draft card | Program and failures | Evidence and completion check |
 | --- | --- | --- |
-| Accept and render W-buffer depth state | `stateblock`, part of the remaining 18 setter and seven replay failures on AMD1 | `ZENABLE = D3DZB_USEW` returns `E_NOTIMPL` in the driver. Exercise both state-block replay and W-depth rendering. |
-| Accept and render D3D9 wireframe fill | `stateblock`, part of the same remaining failures | `FILLMODE = D3DFILL_WIREFRAME` returns `E_NOTIMPL`. Exercise both state-block replay and visible wireframe output. |
 | Implement D3D9 cylindrical interpolation | `stateblock`, wrap setter and replay fix above | Draw across a coordinate seam with each wrap component set. Verify the driver interpolates across the seam and honors the flag after applying a state block. |
 | Support display rotation changes | `d3d9ex`, 2 / 2 | Lines 573 and 608. Restore the original orientation after a rotation and verify the reported orientation. |
-| Restore fullscreen notification and activation behavior | `d3d9ex`, 5 / 9 | Lines 2940–2961, 3007 and 3100. Check `WM_DISPLAYCHANGE` delivery and the foreground window across the fullscreen transition. |
+| Restore fullscreen notification and activation behavior | `d3d9ex`, 5 / 9 | Lines 2940–2961, 3007 and 3100. Check `WM_DISPLAYCHANGE` delivery and the foreground window across the fullscreen transition. [Retest counts and message traces](acceptance/C340.md). |
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
+| Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 → 0 / 3 → 0 | Lines 25148 and 26917. [C342](acceptance/C342.md) cleared all three assertions on both GPUs. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
 
