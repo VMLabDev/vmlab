@@ -3,8 +3,8 @@
 This page describes every layer between a Windows application in the guest
 and the GPU in the host. For each component it lists the files installed in
 the guest, how Windows finds them, the upstream source and pin, this
-repository's patches, and the licence. The pin and patch tables at the end
-come from `build/*/PINS` and `patches/` through `scripts/pins-table.py`.
+repository's patches, and the licence. The pin table comes from
+`build/*/PINS`. The [patch inventory](#patches) comes from the series files.
 
 ## The path of a frame
 
@@ -108,7 +108,7 @@ and loads the WGL ICD. The package changes only `d3d12.dll`, described below.
 | Installed by | `installer/vmlab-win3d.ps1`, only when the existing `vulkan-1.dll` is missing or has an older file version. The template has 1.3.300. |
 | Upstream | [KhronosGroup/Vulkan-Loader](https://github.com/KhronosGroup/Vulkan-Loader) and [Vulkan-Tools](https://github.com/KhronosGroup/Vulkan-Tools), tag `vulkan-sdk-1.4.363.0` |
 | Build | [`build/vulkan-sdk/`](../build/vulkan-sdk/README.md) |
-| Patches | Loader: none. Vulkan-Tools: 1, `vulkan-tools/0001`, which stops the llvm-mingw `vulkaninfo.exe` crashing on a null `user32_handles` (see [Patches](#patches)) |
+| Patches | [Vulkan-Tools series](../patches/vulkan-tools/series), which stops the llvm-mingw `vulkaninfo.exe` crashing on a null `user32_handles` |
 | Licence | Apache-2.0 |
 
 ### D3D12: the bridge, vkd3d-proton and DXVK's DXGI
@@ -120,7 +120,7 @@ and loads the WGL ICD. The package changes only `d3d12.dll`, described below.
 | Installed by | The installer: takes ownership of `d3d12.dll`, replaces it, and restores the TrustedInstaller owner and ACL. The `vmlab-win3d-repair` startup task puts the bridge back after Windows servicing and renews both native copies. |
 | Upstream | [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) v3.0.1, [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv) at `8434b063` (newer than vkd3d-proton's gitlink), [DXVK](https://github.com/doitsujin/dxvk) v3.1.1 built with only DXGI |
 | Build | [`build/d3d12/`](../build/d3d12/README.md) |
-| Patches | vkd3d-proton 5, DXVK 1, dxil-spirv 0 (see [Patches](#patches)). `vkd3d-proton/0005` turns vkd3d-proton's `d3d12.dll` into the system-wide bridge. |
+| Patches | [vkd3d-proton](../patches/vkd3d-proton/series), [DXVK](../patches/dxvk/series) and [dxil-spirv](../patches/dxil-spirv/series) series. The bridge patch turns vkd3d-proton's `d3d12.dll` into the system-wide bridge. |
 | Licence | vkd3d-proton LGPL-2.1-or-later; dxil-spirv MIT; DXVK zlib |
 
 The bridge implements the D3D12 entry points with vkd3d-proton and forwards
@@ -138,7 +138,7 @@ vkd3d-proton queues go to DXVK's DXGI, and everything else stays native.
 | Installed by | The INF (`VioGpu3D_Files.Usermode`, `VioGpu3D_Files.Wow64`, `VioGpu3D_DeviceSettings`) |
 | Upstream | [arehnman/virtio-win-mesa](https://github.com/arehnman/virtio-win-mesa), branch `yttrium-experimental`, commit `76c095bb`, the November 2026 release (Mesa 26.1.0) |
 | Build | [`build/mesa/`](../build/mesa/README.md) |
-| Patches | Mesa 45, shared with the two Mesa components below (see [Patches](#patches)). [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
+| Patches | [Mesa series](../patches/mesa/series), shared with the two Mesa components below. [`build/mesa/README.md`](../build/mesa/README.md) says which patch changes which DLL, and which patches the November rebase dropped. |
 | Licence | Mesa MIT; the Yttrium winsys (`src/gallium/winsys/yttrium/gdi/`) MPL-2.0 |
 
 `viogpu_d3d10.dll` is Mesa's `d3d10umd` front end (D3D10/11 DDI, plus a
@@ -153,7 +153,7 @@ embedded Venus transport.
 | Found by | Class key `OpenGLDriverName` and `OpenGLDriverNameWow` = `viogpu_wgl.dll` in System32 and SysWOW64, `OpenGLFlags[Wow]` = 3, `OpenGLVersion[Wow]` = 4096 |
 | Installed by | The INF. The package does not replace `opengl32.dll`, unlike Yttrium's release INF. |
 | Upstream | Same Mesa tree as above |
-| Patches | Mesa 0002 to 0004 |
+| Patches | Mesa's case-insensitive executable matching, loader lock and WGL unbind patches |
 | Licence | MIT |
 
 Zink turns OpenGL into Vulkan and runs on the Venus ICD through
@@ -168,7 +168,7 @@ Zink turns OpenGL into Vulkan and runs on the Venus ICD through
 | Found by | `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` value `C:\Windows\System32\virtio_icd.x86_64.json` = 0, and `HKLM\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers` value `C:\Windows\SysWOW64\virtio_icd.x86.json` = 0. Each manifest names `.\libvulkan_virtio.dll`, relative to itself, with `api_version` 1.4.348. |
 | Installed by | The INF (`VioGpu3D_Files.Vulkan`, `VioGpu3D_Files.VulkanWow64`) |
 | Upstream | Same Mesa tree, `src/virtio/vulkan` |
-| Patches | Mesa 0001 (build) and 0011 (Win32 NT-handle memory) |
+| Patches | Mesa's WDK build and Win32 NT-handle memory patches |
 | Licence | MIT; `vn_renderer_d3dkmt.c` MPL-2.0 |
 
 The ICD reports itself as `Virtio-GPU Venus (<host GPU name>)`. Its Windows
@@ -184,7 +184,7 @@ renderer, `vn_renderer_d3dkmt.c`, submits Venus commands to the KMD with
 | Installed by | The installer runs `pnputil /add-driver viogpu3d.inf /install`. The package is test-signed ([decision 0001](decisions/0001-signing.md)). |
 | Upstream | [arehnman/yttrium-virtio-gpu](https://github.com/arehnman/yttrium-virtio-gpu), tag `yttrium-experimental-2026-11-02` (`e9917ae2`), a fork of virtio-win/kvm-guest-drivers-windows |
 | Build | [`build/kmd/`](../build/kmd/README.md), clang-cl and lld-link against the WDK NuGet packages |
-| Patches | 11 (see [Patches](#patches)) |
+| Patches | [KMD series](../patches/kmd/series) |
 | Licence | BSD-3-Clause; Yttrium's changes to `viogpu3d` are also MPL-2.0 where marked |
 
 The device appears as "Yttrium VirtIO GPU 3D controller" (upstream renamed

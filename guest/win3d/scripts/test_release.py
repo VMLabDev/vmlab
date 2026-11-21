@@ -30,13 +30,26 @@ class ReleaseTest(unittest.TestCase):
         spec.loader.exec_module(pins)
         with tempfile.TemporaryDirectory() as temporary:
             pins.REPO = Path(temporary)
-            (pins.REPO / "patches/dxil-spirv").mkdir(parents=True)
-            (pins.REPO / "patches/dxil-spirv/README.md").write_text("No local patches.\n")
+            directory = pins.REPO / "patches/dxil-spirv"
+            directory.mkdir(parents=True)
+            (directory / "README.md").write_text("No local patches.\n")
+            (directory / "series").touch()
             original = pins.patches_table()
             (pins.REPO / "patches/host/virglrenderer/diagnostic").mkdir(parents=True)
             self.assertEqual(pins.patches_table(), original)
             self.assertTrue(any("dxil-spirv" in row for row in original))
             self.assertFalse(any("host" in row for row in original))
+
+            patch = directory / "sample.patch"
+            patch.touch()
+            with self.assertRaisesRegex(SystemExit, "unlisted patches: sample.patch"):
+                pins.read_series(directory)
+            (directory / "series").write_text("other.patch\n")
+            with self.assertRaisesRegex(SystemExit, "missing patch other.patch"):
+                pins.read_series(directory)
+            (directory / "series").write_text("sample.patch\nsample.patch\n")
+            with self.assertRaisesRegex(SystemExit, "duplicate entry sample.patch"):
+                pins.read_series(directory)
 
     def test_dry_run_cannot_publish(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/release.sh"),

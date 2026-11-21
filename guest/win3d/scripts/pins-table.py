@@ -268,7 +268,7 @@ def read_series(directory):
     data = series.read_bytes()
     if data and not data.endswith(b"\n"):
         sys.exit(f"{label}: each entry must end with a newline")
-    names = data.decode("ascii").split("\n")[:-1]
+    names = data.decode("ascii", errors="replace").split("\n")[:-1]
     seen = set()
     for name in names:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*\.patch", name):
@@ -291,7 +291,8 @@ def patches_table():
     root = REPO / "patches"
     for p in root.glob("*.patch"):
         sys.exit(f"{p.relative_to(REPO)}: patches belong in a component directory")
-    dirs = sorted(p for p in root.iterdir() if p.is_dir())
+    dirs = sorted(p for p in root.iterdir()
+                  if p.is_dir() and any(child.is_file() for child in p.rglob("*")))
     for d in dirs:
         rel = d.relative_to(root).as_posix()
         patches = read_series(d)

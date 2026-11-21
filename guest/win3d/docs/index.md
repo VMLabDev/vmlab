@@ -112,8 +112,9 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [`patches/dxil-spirv/README.md`](../patches/dxil-spirv/README.md) | Why dxil-spirv has no patches |
 
 `scripts/build.sh` builds everything. `scripts/pins-table.py --write`
-regenerates the pin and patch tables in `stack.md`, and `--check` fails when
-they are stale. `scripts/check-docs.py` checks that every repository path
+regenerates the pin table in `stack.md`. Run it with no arguments to print
+both tables. Its `--check` verifies the pin table and each patch series.
+`scripts/check-docs.py` checks that every repository path
 named in the documents exists. Shared virglrenderer patches live at the
 repository root in patches/virglrenderer/. The vmlab-hv bundle builds them;
 they are not part of the guest package ([stack](stack.md#host-patches)).
