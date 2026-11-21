@@ -61,13 +61,17 @@ run in sequence and reuse the original media and provision script.
 `admin-hv` uses one x86_64 scratch VM for the administration checks.
 `core-unmountable` and `admin-roots` run unchanged on both hypervisors.
 
-Four other features remain intentionally skipped on vmlab-hv:
+Phase 4 enables both floppy checks by default on vmlab-hv. The
+`core-hv-floppy` lab boots one FreeDOS VM at a time and reads a file from
+each floppy on drive A:. It tests the raw `floppy` attachment and
+folder-built `media` separately, using the FreeDOS template from the legacy
+gate.
+
+Two core and admin features remain skipped by default on vmlab-hv.
 
 | Feature | Scenario and QEMU lab | Skip reason |
 | --- | --- | --- |
 | `vm.hw.qemu_args` | core, core-lab/vm01 | QEMU-only command-line arguments |
-| `vm.hw.floppy` | core, core-lab/vm02 | Phase 4 floppy controller |
-| `vm.media.floppy` | core, core-lab/vm03 | Phase 4 floppy controller |
 | `arch.emulated` | admin, admin-lab/arm01 | Phase 3 aarch64 TCG emulation |
 
 Phase tags are unchanged. `lab.validate`, `lab.validate.reject`, and
