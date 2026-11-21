@@ -866,6 +866,7 @@ mod tests {
         let dir = workspace(&[]);
         let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
         let guest = super::super::guest::fake::FakeGuest::new();
+        guest.dir("/src");
         guest.dir("/src/lib");
         guest.disconnect_on_readdir("/src/lib");
 
