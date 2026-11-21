@@ -832,30 +832,37 @@ account for 162 and seven failures respectively on each GPU. The
 fixes the largest setter group by retaining the wrap flags through state
 block replay. Cylindrical interpolation still needs implementation.
 
+On helios with AMD1 and Windows 11 template `26100.1742.11`, the patched
+package ran the same 12,268 `stateblock` checks. Failures fell from 169 to
+25. The patch removed 144 setter failures, leaving 18 setter failures and
+seven replay failures. `d3d9ex` still reported 11 failures in 2,379 checks.
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
 
 | Draft card | Program and failures | Evidence and completion check |
 | --- | --- | --- |
-| Accept and render W-buffer depth state | `stateblock`, part of 162 / 162 setter and 7 / 7 replay failures | `ZENABLE = D3DZB_USEW` returns `E_NOTIMPL` in the driver. Exercise both state-block replay and W-depth rendering. |
-| Accept and render D3D9 wireframe fill | `stateblock`, part of the same setter and replay totals | `FILLMODE = D3DFILL_WIREFRAME` returns `E_NOTIMPL`. Exercise both state-block replay and visible wireframe output. |
+| Accept and render W-buffer depth state | `stateblock`, part of the remaining 18 setter and seven replay failures on AMD1 | `ZENABLE = D3DZB_USEW` returns `E_NOTIMPL` in the driver. Exercise both state-block replay and W-depth rendering. |
+| Accept and render D3D9 wireframe fill | `stateblock`, part of the same remaining failures | `FILLMODE = D3DFILL_WIREFRAME` returns `E_NOTIMPL`. Exercise both state-block replay and visible wireframe output. |
 | Implement D3D9 cylindrical interpolation | `stateblock`, wrap setter and replay fix above | Draw across a coordinate seam with each wrap component set. Verify the driver interpolates across the seam and honors the flag after applying a state block. |
 | Support display rotation changes | `d3d9ex`, 2 / 2 | Lines 573 and 608. Restore the original orientation after a rotation and verify the reported orientation. |
 | Restore fullscreen notification and activation behavior | `d3d9ex`, 5 / 9 | Lines 2940–2961, 3007 and 3100. Check `WM_DISPLAYCHANGE` delivery and the foreground window across the fullscreen transition. |
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Match perspective table fog | `visual`, 168 / 168 | Line 28481, nonzero pixel fog mode and `ortho_fog = 0`. Check the fog coordinate and equation for all four vertex paths. |
-| Use the expected fixed-function vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fixed-function fog calculation with orthographic and perspective transforms. |
-| Use specular alpha for pre-transformed vertex fog | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Compare the fog blend after the draw for each vertex fog mode. |
+| Use reciprocal RHW for perspective table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 0`. Check fog uses W recovered from the pre-transformed vertex. |
+| Use transformed W for fixed-function table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 1`. Check fog uses the W produced by the fixed-function transform. |
+| Use shader output W for perspective table fog | `visual`, 72 / 72 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 2` or `3`. Check fog uses shader output W with and without an explicit fog output. |
+| Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
+| Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
 | Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
 | Draw with the tested fixed-function vertex color declarations | `visual`, 14 / 14 | Lines 25308 and 25313, tests 13–19. Fix the draw errors and check diffuse and specular color readback. |
 | Supply default vertex attribute components | `visual`, 12 / 12 | Lines 27740 and 27745. Vertex shader cases 2 and 5 fail the draw and leave a red pixel in all three pixel shader cases. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
-| Report the expected ATI1 format conversions | `visual`, 2 / 2 | Line 28024 rejects ATI1 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
+| Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
 
 ## Findings from these runs

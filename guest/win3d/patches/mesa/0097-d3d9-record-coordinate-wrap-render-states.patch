@@ -5,6 +5,8 @@ applying a state block, including when the application never draws with
 wrapping enabled. Preserve the values in the render state table. Keep the
 warning about the separate, unimplemented interpolation behavior.
 
+Evidence: docs/acceptance.md.
+
 ---
 diff --git a/src/gallium/frontends/d3d10umd/D3D9State.cpp b/src/gallium/frontends/d3d10umd/D3D9State.cpp
 --- a/src/gallium/frontends/d3d10umd/D3D9State.cpp
