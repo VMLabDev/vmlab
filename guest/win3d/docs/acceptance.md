@@ -906,6 +906,27 @@ The standalone `visual` run on AMD1 reported the same 343 failures in
 206,068 checks. The test session used a soft open-file limit of 65,536
 after an earlier attempt exhausted the default limit of 1,024.
 
+The [legacy pixel shader input patch](../patches/mesa/d3d9-record-legacy-pixel-shader-inputs.patch)
+records the implicit colour and texture-coordinate inputs of `ps_1_x` and
+`ps_2_x`. The generated `POSITIONT` vertex shader uses those inputs to
+pass through the pre-transformed coordinates, including `FLOAT1`.
+
+On helios with the Windows 11 template `26100.1742.11#win3d` and driver
+`100.6.101.58114` from commit `a2acaaabad43`, Wine 11.0's `d3d9_visual`
+reported zero failures at lines 28754 and 28870 on both GPUs. Each run
+cleared the 32 draw errors and their 32 texture readback failures.
+
+| GPU | Checks executed | Baseline failures | Patched failures |
+| --- | ---: | ---: | ---: |
+| AMD1 | 206,068 | 343 | 279 |
+| Nvidia2 | 206,008 | 345 | 279 |
+
+Both Nvidia2 runs skipped 60 assertions in a separate dynamic vertex
+buffer test after Wine's timed triangle estimate exceeded the device's
+primitive limit. That block includes two baseline failed assertions.
+All 17 non-Wine adapter rows passed on both GPUs. The other Wine program
+verdicts matched the baseline.
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -925,7 +946,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Use shader output W for perspective table fog | `visual`, 72 / 72 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 2` or `3`. Check fog uses shader output W with and without an explicit fog output. |
 | Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
 | Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
-| Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
 | Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
 | Draw with the tested fixed-function vertex color declarations | `visual`, 14 / 14 | Lines 25308 and 25313, tests 13–19. Fix the draw errors and check diffuse and specular color readback. |
