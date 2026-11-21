@@ -912,6 +912,29 @@ enabled and `ortho_fog = 0`.
 
 The remaining failure messages matched the baseline on each GPU.
 
+#### C338 — D3D9 point drawing
+
+Constant zero-size points leave the clear color intact. For a point draw
+whose vertex declaration puts PSIZE on an unbound stream, the driver
+supplies a size of one pixel.
+[Mesa patch](../patches/mesa/d3d9-suppress-zero-size-points-and-default-unbound-psize.patch).
+
+Wine 11.0's `d3d9_visual` ran on helios with Windows 11 template
+`26100.1742.11#win3d` and the signed package from `343571b7`. Each GPU
+completed 206,068 checks with 31 skips.
+
+| Failed assertions | AMD1 card #253 → C338 | Nvidia2 card #253 → C338 |
+| --- | ---: | ---: |
+| `visual.c:11460` — size-one draw rejected | 7 → 0 | 7 → 0 |
+| `visual.c:11490` — zero-size point changes the clear color | 10 → 0 | 10 → 0 |
+| `visual.c:11498` — size-one point leaves the clear color | 7 → 0 | 7 → 0 |
+| Full program | 343 → 125 | 345 → 127 |
+
+Card #339 had already cleared the two size-one groups on both GPUs.
+On each GPU, the remaining messages matched the failures common to the
+table-fog and unbound-stream runs after removing the ten zero-size
+failures. The GPU validation for C338 covered `d3d9_visual`.
+
 #### Vertex fog (card #336)
 
 Card #336 used the [vertex fog patch](../patches/mesa/d3d9-vertex-fog-specular-alpha.patch)
@@ -964,7 +987,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
