@@ -16,7 +16,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     assert_eq!(Header::decode(&header.encode()).unwrap(), header);
-    assert_eq!(&header.metadata(queue)[..], &body[..METADATA_LEN]);
+    // The last two bytes are `num_buffers`, which the switch does not carry.
+    assert_eq!(&header.metadata(queue)[..14], &body[..14]);
     let _ = flow_hash(frame);
     if let Ok(segments) = header.segments(frame, mtu) {
         for segment in &segments {
