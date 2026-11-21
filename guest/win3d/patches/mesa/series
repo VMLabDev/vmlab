@@ -46,7 +46,9 @@ yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch
 d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch
 d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch
 d3d9-record-coordinate-wrap-render-states.patch
+d3d9-record-legacy-pixel-shader-inputs.patch
 d3d9-vertex-fog-specular-alpha.patch
 d3d9-select-table-fog-from-w-info.patch
 d3d9-default-inputs-for-unbound-streams.patch
+d3d9-suppress-zero-size-points-and-default-unbound-psize.patch
 d3d10umd-draw-b8g8r8x8-elements-and-indexed-draws-without-an-index-buffer.patch
