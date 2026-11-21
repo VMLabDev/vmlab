@@ -108,6 +108,7 @@ static bool check_coordinate_wrap(probe_ctx *ctx, IDirect3DDevice9 *dev)
             if (probe_hr(ctx, dev->BeginStateBlock(), "WRAP BeginStateBlock") ||
                 probe_hr(ctx, dev->SetRenderState(state, mask), "WRAP record state") ||
                 probe_hr(ctx, dev->EndStateBlock(&block), "WRAP EndStateBlock") ||
+                probe_hr(ctx, dev->SetRenderState(state, 0), "WRAP clear before Apply") ||
                 probe_hr(ctx, block->Apply(), "WRAP Apply"))
                 return false;
             block->Release();
@@ -249,6 +250,7 @@ static int run(probe_ctx *ctx)
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
     if (!check_coordinate_wrap(ctx, dev))
         return 1;
+    probe_bool(ctx, PROBE_API, "coordinate_wrap_state_block", true);
 
     probe_vertex *verts = (probe_vertex *)malloc(vb_bytes);
     for (;;) {
