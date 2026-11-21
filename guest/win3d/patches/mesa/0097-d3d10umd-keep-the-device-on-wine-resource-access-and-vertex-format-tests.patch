@@ -1,0 +1,58 @@
+Subject: [PATCH] d3d10umd: keep the device through Wine's resource access and vertex format tests
+
+Wine's d3d10core and d3d11 tests ended on an access violation after calls
+began to answer DXGI_ERROR_DEVICE_REMOVED (GitHub #248). Two calls removed
+the device:
+
+- GetResourceLayout (WDDM 2.0) answered E_INVALIDARG for every resource.
+  The runtime asks for the layout of each DEFAULT texture created with CPU
+  access flags (Wine's test_resource_access), and an error set there
+  removes the device. It now answers D3DWDDM2_0DDI_TL_UNDEFINED with no
+  allocation and no error: the texture stays opaque, as before, and CPU
+  access still goes through ResourceMap.
+- The Yttrium vertex input had no Vulkan format for R11G11B10_FLOAT, a
+  format Direct3D 10 requires for vertex buffers. The draw was dropped and
+  the next draw set E_FAIL, which removed the device (Wine's
+  test_vertex_formats). It now fetches it as VK_FORMAT_B10G11R11_UFLOAT_PACK32.
+
+Evidence: docs/acceptance.md (B10).
+Origin: GitHub VMLabDev/vmlab#248 (card #248).
+---
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 4707fc8..cb624b7 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -1203,11 +1203,17 @@ GetResourceLayoutWDDM2_0(D3D10DDI_HDEVICE device, D3D10DDI_HRESOURCE resource,
+    UINT count, D3DKMT_HANDLE *handle, D3DWDDM2_0DDI_TEXTURE_LAYOUT *layout,
+    UINT *transition, D3DWDDM2_0DDI_SUBRESOURCE_LAYOUT *subresources)
+ {
+-   /* Default textures remain opaque; CPU mapping uses ResourceMap. */
++   /* Default textures remain opaque; CPU mapping uses ResourceMap. An
++    * undefined layout is the answer for such a resource, not an error: the
++    * runtime takes an error set here as a removed device, and it asks for
++    * every DEFAULT texture created with CPU access flags. */
++   LOG_ENTRYPOINT();
+    *handle = 0;
+    *layout = D3DWDDM2_0DDI_TL_UNDEFINED;
+-   *transition = 0;
+-   SetError(device, E_INVALIDARG);
++   if (transition)
++      *transition = 0;
++   if (subresources)
++      memset(subresources, 0, sizeof(*subresources) * count);
+ }
+ 
+ static void
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_state.c b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
+index dd7c3c3..01ee84a 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_state.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
+@@ -84,6 +84,8 @@ yttrium_vertex_format_to_vk(enum pipe_format format)
+       return VK_FORMAT_B8G8R8A8_UINT;
+    case PIPE_FORMAT_B8G8R8A8_SINT:
+       return VK_FORMAT_B8G8R8A8_SINT;
++   case PIPE_FORMAT_R11G11B10_FLOAT:
++      return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    case PIPE_FORMAT_R16_FLOAT:
+       return VK_FORMAT_R16_SFLOAT;
+    case PIPE_FORMAT_R16_UNORM:
