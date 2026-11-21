@@ -796,6 +796,117 @@ fn tx_pre_buffers_until_started_and_rejects_foreign_streams() {
     );
 }
 
+/// Review virtio-devices F4: `size` is the guest's, so it cannot size a
+/// host allocation.
+#[test]
+fn pcm_info_with_a_huge_size_is_refused_or_bounded() {
+    let mut g = Guest::new(Arc::new(PacedHost::with_script(vec![])), true);
+    g.negotiate();
+    g.setup_queues();
+    let mut request = Vec::new();
+    request.extend_from_slice(&R_PCM_INFO.to_le_bytes());
+    request.extend_from_slice(&0u32.to_le_bytes()); // start_id
+    request.extend_from_slice(&2u32.to_le_bytes()); // count
+    request.extend_from_slice(&0x1000_0000u32.to_le_bytes()); // size
+    let response = g.device.lock().control(&request);
+    assert_eq!(response.len(), 4, "the reply is a bare status");
+    assert_eq!(response, S_BAD_MSG.to_le_bytes());
+    assert_eq!(g.control_status(&request), S_BAD_MSG);
+
+    // A size above the structure's is still answered, zero-padded.
+    request[12..16].copy_from_slice(&40u32.to_le_bytes());
+    let response = g.control(&request, 4 + 2 * 40);
+    assert_eq!(u32::from_le_bytes(response[0..4].try_into().unwrap()), S_OK);
+    assert_eq!(response[4 + 24], 0); // stream 0: output
+    assert!(response[4 + 32..4 + 40].iter().all(|&b| b == 0));
+    assert_eq!(response[4 + 40 + 24], 1); // stream 1: input
+}
+
+/// Review virtio-devices F5: no request this device serves is longer than
+/// SET_PARAMS, so a longer chain is refused without being copied.
+#[test]
+fn control_request_longer_than_any_request_is_bad_msg() {
+    let mut g = Guest::new(Arc::new(PacedHost::with_script(vec![])), true);
+    g.negotiate();
+    g.setup_queues();
+    let mut request = Vec::new();
+    request.extend_from_slice(&R_PCM_INFO.to_le_bytes());
+    request.extend_from_slice(&0u32.to_le_bytes()); // start_id
+    request.extend_from_slice(&1u32.to_le_bytes()); // count
+    request.extend_from_slice(&32u32.to_le_bytes()); // size
+    assert_eq!(g.control_status(&request), S_OK);
+    request.resize(4096, 0);
+    assert_eq!(g.control_status(&request), S_BAD_MSG);
+
+    // 64 descriptors that alias one megabyte: nothing of it is read.
+    let descriptors: Vec<(u64, u32, u16)> = (0..63)
+        .map(|_| (0u64, 1 << 20, NEXT))
+        .chain([(CTRL_RESP, 4, WRITE)])
+        .collect();
+    g.write_bytes(CTRL_RESP, &[0; 4]);
+    g.next_desc[VQ_CONTROL as usize] = 0;
+    g.submit(VQ_CONTROL, &descriptors);
+    assert_eq!(g.read_bytes(CTRL_RESP, 4), S_BAD_MSG.to_le_bytes());
+}
+
+/// Review virtio-devices F5: a tx message above the stream's `buffer_bytes`
+/// completes with an I/O error and none of it is copied.
+#[test]
+fn tx_message_larger_than_the_buffer_is_not_copied_whole() {
+    let host = PacedHost::default();
+    let mut g = Guest::new(Arc::new(host.clone()), true);
+    g.negotiate();
+    g.setup_queues();
+    g.start_streams();
+    g.advance(period_time());
+
+    let base = TX_BASE;
+    g.write_bytes(base, &0u32.to_le_bytes());
+    // 32 descriptors that alias one 32 KiB region: 1 MiB of PCM against
+    // the 4096 bytes of `buffer_bytes`.
+    let mut descriptors = vec![(base, 4, NEXT)];
+    descriptors.extend((0..32).map(|_| (0x80000u64, 32 * 1024u32, NEXT)));
+    descriptors.push((base + 0x1000, 8, WRITE));
+    g.submit(VQ_TX, &descriptors);
+    g.advance(period_time());
+    assert_eq!(g.used_idx(VQ_TX), 1);
+    assert_eq!(g.tx_status(0), (S_IO_ERR, 0));
+    assert!(host.pcm().is_empty(), "{} bytes played", host.pcm().len());
+
+    // The queue still serves a message of the negotiated size.
+    g.tx(1, 0, &period_pcm(0x33));
+    g.advance(period_time());
+    assert_eq!(g.used_idx(VQ_TX), 2);
+    assert_eq!(g.tx_status(1).0, S_OK);
+    assert_eq!(host.pcm(), period_pcm(0x33));
+}
+
+/// Review virtio-devices F5: an rx message with more room than a period is
+/// filled with one period, which is all the banked time pays for.
+#[test]
+fn rx_message_larger_than_a_period_pulls_one_period() {
+    let host = PacedHost::with_script(vec![period_pcm(0x61)]);
+    let mut g = Guest::new(Arc::new(host.clone()), true);
+    g.negotiate();
+    g.setup_queues();
+    g.start_streams();
+
+    // 16 writable descriptors that alias one 32 KiB region, then the status.
+    let base = RX_BASE;
+    g.write_bytes(base, &1u32.to_le_bytes());
+    let mut descriptors = vec![(base, 4, NEXT)];
+    descriptors.extend((0..16).map(|_| (0x80000u64, 32 * 1024u32, NEXT | WRITE)));
+    descriptors.push((base + 0x1000, 8, WRITE));
+    g.submit(VQ_RX, &descriptors);
+    g.advance(period_time());
+    assert_eq!(g.used_idx(VQ_RX), 1);
+    assert_eq!(host.pulls(), [1024]);
+    assert_eq!(g.used_entry(VQ_RX, 0).1, 1024 + 8);
+    assert_eq!(g.read_bytes(0x80000, 1024), period_pcm(0x61));
+    let status = g.read_bytes(base + 0x1000, 4);
+    assert_eq!(status, S_OK.to_le_bytes());
+}
+
 #[test]
 fn capture_paces_from_the_scripted_source() {
     // The recording backend (seam A1): scripted periods, in order.
