@@ -4,14 +4,9 @@ Quarantine is a report annotation, not a skip list. Run every test normally.
 The owner card must fix or renew its entry by the end date. An expired entry
 is not eligible for a flaky rerun exception.
 
-| Test | Hypervisor | Owner card | End date (UTC) |
-| --- | --- | --- | --- |
-| template.variant.rebuild | QEMU | VML-127 | 2026-11-17 |
-| vm.legacy.freedos | QEMU | VML-97 | 2026-11-17 |
-| record.ocr | vmlab-hv | VML-129 | 2026-11-17 |
-
-These failed the 0.45.2 full e2e run and passed their isolated reruns
-(VML-111). `snapshot.vm.offline` is no longer quarantined: VML-130 fixed it.
+The quarantine register is empty. The fixes in VML-127, VML-97 and VML-129
+retired `template.variant.rebuild`, `vm.legacy.freedos` and `record.ocr`,
+respectively. VML-130 fixed `snapshot.vm.offline`.
 `lab.provision.parallel` now uses a bounded rendezvous instead of a fixed
 sleep to prove overlapping provisions (VML-128).
 
