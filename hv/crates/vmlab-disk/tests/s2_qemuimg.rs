@@ -632,6 +632,59 @@ fn s2_snapshot_interop_disk_only() {
     );
 }
 
+#[test]
+fn a_name_wins_over_another_snapshots_id() {
+    require_qemu_img!();
+    let temp = tmpdir("snapshot-name-collision");
+    let path = temp.path().join("disk.qcow2");
+    let exported = temp.path().join("exported.qcow2");
+    ops::create_qcow2(&path, 1024 * 1024, None, None).unwrap();
+    let first = pattern(4096, 1);
+    let second = pattern(4096, 2);
+    write_pattern(&path, Format::Qcow2, 0, &first);
+    qemu_img(&["snapshot", "-c", "2", &path.to_string_lossy()]);
+    write_pattern(&path, Format::Qcow2, 0, &second);
+    qemu_img(&["snapshot", "-c", "b", &path.to_string_lossy()]);
+
+    let snapshots = ops::snapshot_list(&path).unwrap();
+    assert_eq!(snapshots[0].name, "2");
+    assert_eq!(snapshots[1].name, "b");
+    assert_eq!(snapshots[1].id, "2");
+
+    assert_eq!(ops::snapshot_apply(&path, "2").unwrap().name, "2");
+    assert_eq!(&read_all(&path, Format::Qcow2)[..first.len()], &first);
+    ops::convert(&path, &exported, Some("2"), None, None).unwrap();
+    assert_eq!(&read_all(&exported, Format::Qcow2)[..first.len()], &first);
+
+    ops::snapshot_delete(&path, "2").unwrap();
+    assert!(matches!(
+        ops::snapshot_apply(&path, "2"),
+        Err(vmlab_disk::Error::SnapshotNotFound(_))
+    ));
+    assert!(matches!(
+        ops::snapshot_delete(&path, "2"),
+        Err(vmlab_disk::Error::SnapshotNotFound(_))
+    ));
+    let remaining = ops::snapshot_list(&path).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name, "b");
+    qemu_check(&path);
+}
+
+#[test]
+fn a_digit_name_is_not_refused_for_an_unrelated_id() {
+    let temp = tmpdir("snapshot-digit-name");
+    let path = temp.path().join("disk.qcow2");
+    ops::create_qcow2(&path, 1024 * 1024, None, None).unwrap();
+    ops::snapshot_create(&path, "a").unwrap();
+    ops::snapshot_create(&path, "b").unwrap();
+    assert_eq!(ops::snapshot_list(&path).unwrap()[1].id, "2");
+
+    ops::snapshot_create(&path, "2").unwrap();
+    assert_eq!(ops::snapshot_list(&path).unwrap()[2].name, "2");
+    assert!(ops::snapshot_create(&path, "2").is_err());
+}
+
 /// A snapshot with vmstate written by the crate is listed by
 /// `qemu-img snapshot -l` with the right VM SIZE, reads back identically
 /// after apply, and every step passes `qemu-img check`.
