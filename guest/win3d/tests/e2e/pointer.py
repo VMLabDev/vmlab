@@ -22,9 +22,7 @@
                    but the background where a step put the pointer
         recording  (with --frames) frames of a `vmlab record` video of the run
                    show a pointer at the position of every step but the
-                   hidden one, and none at the hidden step's position. A
-                   step whose shape has its hotspot at (0,0), the arrow, is
-                   not judged: vmlab's recorder hides it (docs/pointer.md)
+                   hidden one, and none at the hidden step's position.
 
 Only the standard library and ImageMagick's `magick` (for the captures).
 """
@@ -41,6 +39,7 @@ import threading
 import time
 
 ALPHA_CURSOR = -314
+DESKTOP_SIZE = -223
 HOLD = 1.0  # a state counts as a step once it has lasted this long, in seconds
 
 
@@ -109,15 +108,16 @@ def watch_rfb(path, events, stop, t0):
     s.sendall(b'\x01')              # security: None
     recv_exact(s, 4)
     s.sendall(b'\x01')              # shared
-    w, h = struct.unpack('>HH', recv_exact(s, 4))
+    recv_exact(s, 4)
     recv_exact(s, 16)
     recv_exact(s, struct.unpack('>I', recv_exact(s, 4))[0])
-    s.sendall(struct.pack('>BBHii', 2, 0, 2, 0, ALPHA_CURSOR))  # SetEncodings: raw, cursor with alpha
+    s.sendall(struct.pack('>BBHiii', 2, 0, 3, 0, ALPHA_CURSOR, DESKTOP_SIZE))
     last = None
+    incremental = 0
     s.settimeout(0.5)
     while not stop.is_set():
         # A request for one pixel: the server answers when the frame or the pointer changed.
-        s.sendall(struct.pack('>BBHHHH', 3, 1, 0, 0, 1, 1))
+        s.sendall(struct.pack('>BBHHHH', 3, incremental, 0, 0, 1, 1))
         try:
             head = recv_exact(s, 4)
         except socket.timeout:
@@ -125,10 +125,13 @@ def watch_rfb(path, events, stop, t0):
         s.settimeout(10)
         if head[0] != 0:
             raise ValueError(f'unexpected RFB message {head[0]}')
+        incremental = 1
         for _ in range(struct.unpack('>H', head[2:])[0]):
             x, y, rw, rh, enc = struct.unpack('>HHHHi', recv_exact(s, 12))
             if enc == 0:
                 recv_exact(s, rw * rh * 4)
+            elif enc == DESKTOP_SIZE:
+                incremental = 0
             elif enc == ALPHA_CURSOR:
                 recv_exact(s, 4)
                 d = describe(rw, rh, (x, y), recv_exact(s, rw * rh * 4), (0, 1, 2, 3))
@@ -274,6 +277,7 @@ def check(args):
     bg = [int(v) for v in args.background.split(',')]
     results = {}
     guest = None
+    guest_steps = []
     if args.guest:
         try:
             with open(args.guest, encoding='utf-8-sig') as stream:
@@ -283,6 +287,9 @@ def check(args):
         mode_ok = isinstance(guest, dict) and guest.get('rotation', 0) == args.rotation
         results['rotation'] = {'pass': mode_ok, 'expected': args.rotation}
         if mode_ok:
+            guest_steps = guest['steps']
+            expected_steps = list(zip(plan, positions))
+            results['guest_steps'] = {'pass': [(s['shape'], (s['x'], s['y'])) for s in guest_steps] == expected_steps}
             screen = guest['screen']
             positions = [rotate(x, y, screen['width'], screen['height'], args.rotation)
                          for x, y in positions]
@@ -291,10 +298,21 @@ def check(args):
     # shapes: the plan is a subsequence of the held states, kind and position both.
     i, matched = 0, []
     for kind, x, y, shape in steps:
-        if i < len(plan) and kind == plan[i] and (kind == 'hidden' or (abs(x - positions[i][0]) <= 1 and abs(y - positions[i][1]) <= 1)):
-            matched.append({'step': i, 'kind': kind, 'x': x, 'y': y, 'hot': [shape['hot_x'], shape['hot_y']],
-                            'size': [shape['width'], shape['height']], 'sha256': shape['sha256']})
-            i += 1
+        if i == len(plan) or kind != plan[i]:
+            continue
+        hot = (shape['hot_x'], shape['hot_y'])
+        if kind != 'hidden':
+            px, py = positions[i]
+            if abs(x - px) > 1 or abs(y - py) > 1:
+                continue
+            if i < len(guest_steps):
+                step = guest_steps[i]
+                expected_hot = rotate(step['hot_x'], step['hot_y'], shape['width'], shape['height'], args.rotation)
+                if hot != expected_hot:
+                    continue
+        matched.append({'step': i, 'kind': kind, 'x': x, 'y': y, 'hot': hot,
+                        'size': [shape['width'], shape['height']], 'sha256': shape['sha256']})
+        i += 1
     results['shapes'] = {
         'pass': i == len(plan), 'matched': matched, 'planned': [[k, *p] for k, p in zip(plan, positions)],
         'held': [{'kind': k, 'x': x, 'y': y, 'hot': [s['hot_x'], s['hot_y']], 'bbox': s['bbox']} for k, x, y, s in steps],
