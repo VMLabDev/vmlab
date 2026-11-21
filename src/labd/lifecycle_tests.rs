@@ -2136,6 +2136,40 @@ async fn a_container_stops_through_its_ctl_channel() {
 
 // ---- what the seam does not cover -------------------------------------------
 
+#[tokio::test]
+async fn an_offline_capture_excludes_a_concurrent_start() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (vm, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    qimg::create_blank(&vm.dirs.primary_disk(), 1 << 20)
+        .await
+        .unwrap();
+
+    let (entered, release) = testing::pause_next("snapshot");
+    let machine = vm.clone();
+    let capture = tokio::spawn(async move { machine.snapshot("cold").await });
+    tokio::time::timeout(SETTLE, entered)
+        .await
+        .expect("capture did not reach the image tool")
+        .unwrap();
+
+    let (cbs, _observed) = callbacks();
+    let start = tokio::time::timeout(SETTLE, start_vm(&vm, cbs)).await;
+    release.send(()).unwrap();
+    assert!(!capture.await.unwrap().expect("offline capture"));
+    let error = start.expect("start must refuse promptly").expect_err(
+        "start must refuse while an offline snapshot operation holds the disk",
+    );
+    assert!(error.to_string().contains("snapshot"), "{error:#}");
+    assert_eq!(vm.power_state().await, PowerState::Stopped);
+
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start after capture");
+    vm.stop(true).await.unwrap();
+}
+
 /// A machine whose hypervisor reports no snapshots capability — the fake's
 /// default — reports exactly what a stopped one does rather than inventing a
 /// result: the honest failure that keeps what a snapshot does to a guest
