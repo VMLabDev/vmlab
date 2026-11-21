@@ -628,6 +628,7 @@ next to each probe's JSON.
 | P7 | `shared-texture` | `share_probe.exe` shares a BGRA render target between two Direct3D 11 devices, by legacy handle and with a keyed mutex, at the size of the desktop (the shape the driver takes for a duplication surface, [present.md](present.md#desktop-duplication)) and at 256×256. Each device fills it and the other reads it. | In all four cases every pixel read is the colour written, in both directions. |
 | P10, correct rendering | `d2d` | `d2d_probe.exe` fills rounded rectangles, ellipses and path geometries with Direct2D three times, each on a new device, and once on WARP. | No pixel WARP filled is missing, none it left white is drawn, and the three pictures are the same. The device must be feature level 11.1. |
 | P10 | `d2d-tir` | `tests/e2e/tir.sh`, the check of the coverage patch ([d2d-coverage.md](d2d-coverage.md)): `tir_probe.exe`, x64 and x86, draws what Direct2D draws to antialias a shape, on the adapter and on WARP. Its evidence is in `tir/`. | Both probes find no pixel that differs from WARP or between runs, and the driver logged one pass per sample for the x64 probe. |
+| P10 | `draws` | `draws_probe.exe` makes three draws that the driver once dropped, each on a device of its own: a quad whose colour element is `B8G8R8X8_UNORM`, and a point list drawn with `DrawIndexed` and with `DrawIndexedInstancedIndirect` while no index buffer is bound. After each it reads the 4x4 target, draws an ordinary quad, reads that, and asks `GetDeviceRemovedReason` (B11). | The quad has the colour of its vertices, the point list draws its first vertex only, the later quad is on the target, and the device is not removed. |
 | P10 | `svb-chrome`, `svb-edge` | `tests/e2e/adapter/pages/svb.html`, the page of GitHub #233: a quad from a vertex buffer of each usage hint. | Each of the three lines reads `255,0,0,255`, with WebGL on the adapter. |
 | P8, a driver for every API | `venc-chrome`, `venc-edge` | `tests/e2e/adapter/pages/venc.html`, the page of GitHub #238: a hardware video encoder query, which makes a Chromium GPU process load `d3d12.dll`, then WebGL every 4 s for 20 s. The browsers run with `--enable-features=D3D12VideoEncodeAccelerator,D3D12VideoDecoder`. | WebGL stays on the adapter in all five tries, and the profile has no crash dump. |
 | P8 | `chromium` | `tests/e2e/chromium.sh`, the check of the native `d3d12.dll` preload ([chromium.md](chromium.md)): the same page in both browsers while the GPU process's modules are recorded, the same again with the preload off, and the package's `d3d12_probe.exe`. It restarts the VM twice. Its evidence is in `chromium/`. | In both browsers WebGL stays on the adapter, there is no crash dump, one GPU process ran, and the `d3d12.dll` it loaded is the native copy. With the preload off the GPU process ends itself in both. The native probe still gets the bridge. |
@@ -780,8 +781,47 @@ What the baseline says:
   (a point-list draw with no index buffer bound, whose indices Yttrium
   does not have on the CPU) still mark a device as removed in the UMD log,
   but the tests release those devices without another call that reports
-  it. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
+  it. B11 has the cause of both, and the fix. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
   also ended the VM after 17 s with the "Too many open files" exit of B6.
+- B11. The two dropped draws of B10 (card #328), and a third that B10 did
+  not see. `draws_probe.exe` (the adapter check `draws`) makes each draw on
+  a device of its own and then uses the device. With the driver of B10 all
+  three cases fail on AMD1 and Nvidia2: the draw is not on the target, the
+  next `Map` answers `0x887a0005`, and `GetDeviceRemovedReason` answers
+  `0x887a0020`. The causes, and what
+  `patches/mesa/d3d10umd-draw-b8g8r8x8-elements-and-indexed-draws-without-an-index-buffer.patch`
+  does:
+  - An input element of the format `B8G8R8X8_UNORM`
+    (`test_vertex_formats`). `pipe_vertex_element::src_format` has 8 bits,
+    for Gallium's vertex formats. `PIPE_FORMAT_B8G8R8X8_UNORM` is not one
+    of them, and its value was cut to 26, another format, for which the
+    Yttrium vertex input has no Vulkan format. That is why a mapping for
+    `B8G8R8X8` in the Yttrium table changed nothing in B10. The element is
+    fetched as `B8G8R8A8_UNORM` now. Direct3D leaves its fourth component
+    undefined.
+  - `DrawIndexed` with no index buffer bound (`test_index_buffer_offset`).
+    The UMD made an index buffer of zeros for the one draw, the native draw
+    reads index bounds from a buffer's CPU copy, and that buffer has none.
+    The zeros are user indices now.
+  - `DrawIndexedInstancedIndirect` with no index buffer bound (the same
+    test) set `E_INVALIDARG`. B10's log does not have it because the
+    device was removed before the call. The UMD reads the arguments now and
+    draws with zero indices.
+
+  The runs of 2026-11-21 at commit `160caa72`, each a fresh lab with
+  `tests/e2e/run.sh --template windows-11 --host-gpu <gpu> --keep` (12 of
+  12 Done checks pass on both GPUs, no Xid), with the Wine programs
+  single-threaded (`WINETEST_NO_MT_D3D=1`): `draws` passes 3 of 3 cases on
+  both GPUs. On each GPU `d3d10core` executes 195908 checks with 0 failures
+  and `d3d11` executes 476333 checks with 13 failures and no `0x887a0005`
+  line, one failure fewer than B10: the `B8G8R8X8_UNORM` check passes. The 13 are the 11 NV12
+  textures and the two checks of `test_high_resource_count`. The UMD log
+  has no dropped draw and no `E_FAIL` or `E_INVALIDARG` for `d3d11_d3d11.exe`.
+  The tables below are older than this note and have no `draws` row.
+  For such a rerun `C:\ProgramData\Yttrium\yttrium-errors.log` must be
+  writable by the user. In these labs, after the log files were deleted and
+  a process of another account made them again, the probe's lines were
+  missing until the files were made writable for everyone.
 
 <!-- e2e:adapter -->
 ### windows-11
