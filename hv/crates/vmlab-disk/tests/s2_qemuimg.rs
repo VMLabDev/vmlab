@@ -657,6 +657,14 @@ fn a_name_wins_over_another_snapshots_id() {
     assert_eq!(&read_all(&exported, Format::Qcow2)[..first.len()], &first);
 
     ops::snapshot_delete(&path, "2").unwrap();
+    assert!(matches!(
+        ops::snapshot_apply(&path, "2"),
+        Err(vmlab_disk::Error::SnapshotNotFound(_))
+    ));
+    assert!(matches!(
+        ops::snapshot_delete(&path, "2"),
+        Err(vmlab_disk::Error::SnapshotNotFound(_))
+    ));
     let remaining = ops::snapshot_list(&path).unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].name, "b");

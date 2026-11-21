@@ -146,8 +146,7 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let entry = entries
             .iter()
-            .find(|e| e.id == name)
-            .or_else(|| entries.iter().find(|e| e.name == name))
+            .find(|e| e.name == name)
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let info = entry.info();
         let disk_size = entry.disk_size;
@@ -179,7 +178,7 @@ impl Qcow2Image {
             ));
         }
         let entries = self.parse_table()?;
-        if entries.iter().any(|e| e.name == name || e.id == name) {
+        if entries.iter().any(|e| e.name == name) {
             return Err(Error::Unsupported(format!(
                 "snapshot {name:?} already exists"
             )));
@@ -398,8 +397,7 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let entry = entries
             .iter()
-            .find(|e| e.id == name)
-            .or_else(|| entries.iter().find(|e| e.name == name))
+            .find(|e| e.name == name)
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let info = entry.info();
         let snap_l1_size = entry.l1_size;
@@ -446,8 +444,7 @@ impl Qcow2Image {
         let entries = self.parse_table()?;
         let pos = entries
             .iter()
-            .position(|e| e.id == name)
-            .or_else(|| entries.iter().position(|e| e.name == name))
+            .position(|e| e.name == name)
             .ok_or_else(|| Error::SnapshotNotFound(name.to_string()))?;
         let entry_l1_offset = entries[pos].l1_table_offset;
         let entry_l1_size = entries[pos].l1_size;
