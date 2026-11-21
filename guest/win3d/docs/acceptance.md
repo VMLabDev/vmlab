@@ -1025,7 +1025,7 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 → 0 / 3 → 0 | Lines 25148 and 26917. [C342](acceptance/C342.md) cleared all three assertions on both GPUs. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
-| Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
+| Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Both line 15668 readbacks match NVIDIA BC4 decoding and exceed Wine's red-channel tolerance. [C359](acceptance/C359.md) records the trace and counts. |
 
 ## Findings from these runs
 
