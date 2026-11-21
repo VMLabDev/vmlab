@@ -76,10 +76,10 @@ struct Session {
 }
 
 /// One guest-known file. `fd` is an `O_PATH` handle on the inode; `path` is
-/// its location under the root at lookup time (the snapshot form). The
-/// parent's `O_PATH` descriptor and the own name serve the `*at` syscalls,
-/// which `O_PATH` descriptors alone cannot express (fchmod, readlink,
-/// truncate...).
+/// its location under the root at lookup time, moved along by every guest
+/// rename (the snapshot form). The parent's `O_PATH` descriptor and the own
+/// name serve the `*at` syscalls, which `O_PATH` descriptors alone cannot
+/// express (fchmod, readlink, truncate...).
 struct Inode {
     fd: OwnedFd,
     parent: OwnedFd,
@@ -624,19 +624,44 @@ impl FileSystem for PassthroughFs {
         flags: u32,
     ) -> io::Result<()> {
         self.refuse_writes()?;
-        let session = self.inner.lock();
+        let mut session = self.inner.lock();
         let parent = live_inode(&session, parent)?;
         let newparent = live_inode(&session, newparent)?;
         if parent.kind != FileKind::Dir || newparent.kind != FileKind::Dir {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
-        renameat2(
-            &parent.fd,
-            checked_name(name)?,
-            &newparent.fd,
-            checked_name(newname)?,
-            flags,
-        )
+        let name = checked_name(name)?;
+        let newname = checked_name(newname)?;
+        let from = parent.path.join(OsStr::from_bytes(name));
+        let to = newparent.path.join(OsStr::from_bytes(newname));
+        // Cloned before the rename: once the host has moved the file, the
+        // session must be able to follow it without a step that can fail.
+        let dir = parent.fd.try_clone()?;
+        let newdir = newparent.fd.try_clone()?;
+        // rename(2) does nothing, and succeeds, when both names are links
+        // of one file. Then neither name moved.
+        let same_file = flags & libc::RENAME_EXCHANGE == 0
+            && matches!(
+                (host_identity(&dir, name), host_identity(&newdir, newname)),
+                (Some(a), Some(b)) if a == b
+            );
+        renameat2(&dir, name, &newdir, newname, flags)?;
+        if from == to || same_file {
+            return Ok(());
+        }
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            let moved = session.take_subtree(&from);
+            let back = session.take_subtree(&to);
+            session.place_subtree(moved, &to, newdir, newname);
+            session.place_subtree(back, &from, dir, name);
+        } else {
+            // Whatever the destination name held is replaced: its inodes
+            // stay with the guest until FORGET, but no longer own the name.
+            session.take_subtree(&to);
+            let moved = session.take_subtree(&from);
+            session.place_subtree(moved, &to, newdir, newname);
+        }
+        Ok(())
     }
 
     fn link(
@@ -982,6 +1007,64 @@ impl Session {
             && self.by_path.get(&state.path) == Some(&inode)
         {
             self.by_path.remove(&state.path);
+        }
+    }
+
+    /// Take the inode at `root` and every inode below it out of `by_path`,
+    /// each with its path relative to `root`. The inodes themselves stay.
+    fn take_subtree(&mut self, root: &Path) -> Vec<(PathBuf, u64)> {
+        let paths: Vec<PathBuf> = self
+            .by_path
+            .keys()
+            .filter(|path| path.starts_with(root))
+            .cloned()
+            .collect();
+        paths
+            .into_iter()
+            .map(|path| {
+                let ino = self.by_path.remove(&path).expect("key just listed");
+                let below = path.strip_prefix(root).expect("filtered on the prefix");
+                (below.to_path_buf(), ino)
+            })
+            .collect()
+    }
+
+    /// Record a subtree from [`Self::take_subtree`] at `root`, the name
+    /// `name` under the directory `parent`: a rename moved it there. Only
+    /// the subtree's own top changes parent and name; everything below
+    /// keeps both and changes path.
+    fn place_subtree(
+        &mut self,
+        subtree: Vec<(PathBuf, u64)>,
+        root: &Path,
+        parent: OwnedFd,
+        name: &[u8],
+    ) {
+        let mut parent = Some(parent);
+        for (below, ino) in &subtree {
+            let top = below.as_os_str().is_empty();
+            let path = if top {
+                root.to_path_buf()
+            } else {
+                root.join(below)
+            };
+            if let Some(state) = self.inodes.get_mut(ino) {
+                if top && let Some(parent) = parent.take() {
+                    state.parent = parent;
+                    state.name = name.to_vec();
+                }
+                state.path = path.clone();
+            }
+            self.by_path.insert(path, *ino);
+        }
+        // An open handle records its path for the snapshot.
+        for open in self.handles.values_mut() {
+            if let HandleKind::File { path, .. } = &mut open.kind
+                && subtree.iter().any(|(_, ino)| *ino == open.ino)
+                && let Some(state) = self.inodes.get(&open.ino)
+            {
+                path.clone_from(&state.path);
+            }
         }
     }
 
@@ -1374,6 +1457,14 @@ fn unlinkat(dir: &OwnedFd, name: &[u8], directory: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Which host file `name` in `dir` is, as (device, inode); `None` when it
+/// cannot be told.
+fn host_identity(dir: &OwnedFd, name: &[u8]) -> Option<(u64, u64)> {
+    let fd = openat(dir, name, libc::O_PATH | libc::O_NOFOLLOW).ok()?;
+    let st = fstat(fd.as_raw_fd()).ok()?;
+    Some((st.st_dev, st.st_ino))
 }
 
 fn renameat2(
