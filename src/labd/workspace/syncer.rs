@@ -4764,9 +4764,11 @@ mod tests {
             })
         );
         for path in ["big.bin", "large.tmp"] {
-            assert!(events.iter().any(|(name, data)| {
-                name == "workspace.refused" && data["path"] == path
-            }));
+            assert!(
+                events
+                    .iter()
+                    .any(|(name, data)| { name == "workspace.refused" && data["path"] == path })
+            );
         }
     }
 
