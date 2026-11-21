@@ -1,0 +1,578 @@
+Subject: [PATCH] d3d9: interpolate wrapped coordinates across the seam
+
+For each line or triangle, lift selected texture-coordinate components
+across the largest gap on the unit circle before rasterization. Fold the
+interpolated coordinates back before the pixel shader consumes them.
+
+Read WRAP0 through WRAP15 from the render state table at draw time so
+state-block replay takes the same path as direct setters.
+
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D9NineShader.h b/src/gallium/frontends/d3d10umd/D3D9NineShader.h
+--- a/src/gallium/frontends/d3d10umd/D3D9NineShader.h
++++ b/src/gallium/frontends/d3d10umd/D3D9NineShader.h
+@@ -20,6 +20,7 @@
+ #include "util/u_memory.h"
+ #include "util/compiler.h"
+ #include "tgsi/tgsi_ureg.h"
++#include "tgsi/tgsi_scan.h"
+
+ #ifndef unreachable
+ #define unreachable(msg) UNREACHABLE(msg)
+@@ -102,6 +103,23 @@
+ #define NINE_MAX_SAMPLERS 21
+
+ #define D3D9_NINE_POINT_SIZE_GENERIC 15
++
++/* Keep the upper texture coordinates distinct from COLOR1 and the
++ * point-size varying. TEXCOORD6 has a separate semantic on Zink. */
++static inline unsigned
++nine_texcoord_semantic_index(unsigned index, bool want_texcoord)
++{
++   if (index == 8)
++      return 26;
++   if (index == 15 && want_texcoord)
++      return 6;
++   return index;
++}
++
++void *nine_create_vs_and_record_outputs(struct ureg_program *ureg,
++                                       struct pipe_context *pipe,
++                                       struct tgsi_shader_info *vs_outputs);
++
+
+ #define NINED3DSTT_1D_TOKEN (1u << D3DSP_TEXTURETYPE_SHIFT)
+ #define NINED3DSTT_TOKEN_TO_TYPE(token) \
+@@ -154,6 +172,8 @@
+    const DWORD *byte_code;
+    DWORD byte_size;
+    void *cso;
++   struct tgsi_shader_info *vs_outputs;
++   uint64_t coordinate_wrap;
+    uint16_t input_map[PIPE_MAX_ATTRIBS];
+    uint8_t num_inputs;
+    bool position_t;
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Private.h b/src/gallium/frontends/d3d10umd/D3D9Private.h
+--- a/src/gallium/frontends/d3d10umd/D3D9Private.h
++++ b/src/gallium/frontends/d3d10umd/D3D9Private.h
+@@ -25,6 +25,7 @@
+ #include "pipe/p_context.h"
+ #include "pipe/p_defines.h"
+ #include "pipe/p_screen.h"
++#include "tgsi/tgsi_scan.h"
+ #include "gdikmt/gdikmt.h"
+ #include "gdikmt_d3dddi.h"
+ #include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+@@ -242,6 +243,18 @@
+    D3D9_OBJECT_QUERY,
+ };
+
++/* The DDI keeps WRAP8 through WRAP15 in a second range. */
++static inline uint64_t
++D3D9CoordinateWrapMask(const D3D9Device *device)
++{
++   uint64_t wrap = 0;
++   for (unsigned i = 0; i < 8; ++i) {
++      wrap |= (uint64_t)(device->render_states[D3DDDIRS_WRAP0 + i] & 0xf) << (4 * i);
++      wrap |= (uint64_t)(device->render_states[D3DDDIRS_WRAP8 + i] & 0xf) << (4 * (i + 8));
++   }
++   return wrap;
++}
++
+ struct nine_range;
+
+ struct D3D9Object
+@@ -254,12 +267,14 @@
+    struct nine_range *translated_vs_lconstf_ranges;
+    float *translated_vs_lconstf_data;
+    bool translated_vs_outputs_point_size;
++   struct tgsi_shader_info translated_vs_outputs;
+    uint16_t translated_vs_input_map[PIPE_MAX_ATTRIBS];
+    uint8_t translated_vs_num_inputs;
+    uint16_t translated_vs_sampler_mask;
+    uint8_t translated_vs_sampler_targets[4];
+    void *translated_ps_cso;
+    UINT translated_ps_key;
++   uint64_t translated_ps_wrap;
+    uint64_t translated_ps_sampler_type_overrides;
+    uint16_t translated_ps_sampler_type_override_mask;
+    uint16_t translated_ps_fetch4;
+diff --git a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp
+@@ -65,6 +65,8 @@
+
+    nine_shader_info info = {};
+    info.type = PIPE_SHADER_VERTEX;
++   struct tgsi_shader_info vs_outputs = {};
++   info.vs_outputs = &vs_outputs;
+    info.byte_code = (const DWORD *)tokens;
+    info.const_i_base = NINE_CONST_I_BASE(nine.max_vs_const_f) / 16;
+    info.const_b_base = NINE_CONST_B_BASE(nine.max_vs_const_f) / 16;
+@@ -95,6 +97,7 @@
+    shader->translated_vs_lconstf_ranges = info.lconstf.ranges;
+    shader->translated_vs_lconstf_data = info.lconstf.data;
+    shader->translated_vs_outputs_point_size = info.point_size;
++   shader->translated_vs_outputs = vs_outputs;
+    memcpy(shader->translated_vs_input_map, info.input_map,
+           sizeof(shader->translated_vs_input_map));
+    shader->translated_vs_num_inputs = info.num_inputs;
+@@ -143,6 +146,7 @@
+
+    nine_shader_info info = {};
+    info.type = PIPE_SHADER_FRAGMENT;
++   info.coordinate_wrap = D3D9CoordinateWrapMask(device);
+    info.byte_code = (const DWORD *)tokens;
+    info.const_i_base = NINE_CONST_I_BASE(NINE_MAX_CONST_F_PS3) / 16;
+    info.const_b_base = NINE_CONST_B_BASE(NINE_MAX_CONST_F_PS3) / 16;
+@@ -178,6 +182,7 @@
+       ((UINT)projected << 4) |
+       (info.color_flatshade ? 1u << 12 : 0u) |
+       (sampler_ps1xtypes << 13);
++   shader->translated_ps_wrap = info.coordinate_wrap;
+    shader->translated_ps_sampler_type_overrides = sampler_type_overrides;
+    shader->translated_ps_sampler_type_override_mask = sampler_type_override_mask;
+    shader->translated_ps_fetch4 = fetch4;
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+@@ -633,6 +633,7 @@
+          ((UINT)projected << 4) | D3D9TranslatedPsShadeKey(device) |
+          (sampler_ps1xtypes << 13);
+       if (ps->translated_ps_key != key ||
++          ps->translated_ps_wrap != D3D9CoordinateWrapMask(device) ||
+           ps->translated_ps_sampler_type_overrides !=
+           sampler_type_overrides ||
+           ps->translated_ps_sampler_type_override_mask !=
+@@ -989,7 +990,7 @@
+          return false;
+       *semantic = want_texcoord && usage_index < 8 ?
+          TGSI_SEMANTIC_TEXCOORD : TGSI_SEMANTIC_GENERIC;
+-      *index = usage_index;
++      *index = nine_texcoord_semantic_index(usage_index, want_texcoord);
+       return true;
+    case NINE_DECLUSAGE_BLENDWEIGHT:
+       *semantic = TGSI_SEMANTIC_GENERIC;
+@@ -1110,7 +1111,7 @@
+
+ static void *
+ D3D9CreatePositionTPsInputFixedFunctionVs(D3D9Device *device,
+-                                          const D3D9Object *shader)
++                                          D3D9Object *shader)
+ {
+    struct ureg_program *ureg = ureg_create(MESA_SHADER_VERTEX);
+    if (!ureg)
+@@ -1204,7 +1205,8 @@
+    ureg_release_temporary(ureg, tmp);
+    ureg_END(ureg);
+
+-   return ureg_create_shader_and_destroy(ureg, device->pipe);
++   return nine_create_vs_and_record_outputs(ureg, device->pipe,
++                                             &shader->translated_vs_outputs);
+ }
+
+ static UINT
+@@ -1333,7 +1335,8 @@
+ }
+
+ static void *
+-D3D9CreatePositionTDiffuseFixedFunctionVs(D3D9Device *device)
++D3D9CreatePositionTDiffuseFixedFunctionVs(D3D9Device *device,
++                                           D3D9Object *shader)
+ {
+    struct ureg_program *ureg = ureg_create(MESA_SHADER_VERTEX);
+    if (!ureg)
+@@ -1384,7 +1387,8 @@
+    ureg_release_temporary(ureg, tmp);
+    ureg_END(ureg);
+
+-   return ureg_create_shader_and_destroy(ureg, device->pipe);
++   return nine_create_vs_and_record_outputs(ureg, device->pipe,
++                                             &shader->translated_vs_outputs);
+ }
+
+ struct D3D9AutoShaderState
+@@ -1518,6 +1522,110 @@
+    return ureg_create_shader_and_destroy(ureg, pipe);
+ }
+
++/* Move the seam into the largest gap, then lift the vertices below it by
++ * one period. The rasterizer still performs clipping and perspective
++ * interpolation on the adjusted coordinates. */
++static void *
++D3D9CreateWrapGs(D3D9Device *device, enum mesa_prim mode,
++                 const struct tgsi_shader_info &vs, uint64_t wrap,
++                 bool &needs_gs)
++{
++   if (!wrap || mode == MESA_PRIM_POINTS)
++      return NULL;
++
++   const bool lines = mode == MESA_PRIM_LINES || mode == MESA_PRIM_LINE_STRIP;
++   const unsigned vertices = lines ? 2 : 3;
++   unsigned masks[PIPE_MAX_SHADER_OUTPUTS] = {};
++   for (unsigned i = 0; i < vs.num_outputs; ++i) {
++      for (unsigned t = 0; t < 16; ++t) {
++         const bool texcoord = device->screen->caps.tgsi_texcoord && t < 8;
++         const auto semantic = texcoord ? TGSI_SEMANTIC_TEXCOORD : TGSI_SEMANTIC_GENERIC;
++         if (vs.output_semantic_name[i] == semantic &&
++             vs.output_semantic_index[i] ==
++                nine_texcoord_semantic_index(t, device->screen->caps.tgsi_texcoord))
++            masks[i] = ((wrap >> (4 * t)) & 0xf) & vs.output_usagemask[i];
++      }
++      needs_gs |= masks[i] != 0;
++   }
++   if (!needs_gs)
++      return NULL;
++
++   struct ureg_program *ureg = ureg_create(MESA_SHADER_GEOMETRY);
++   if (!ureg)
++      return NULL;
++   ureg_property(ureg, TGSI_PROPERTY_GS_INPUT_PRIM,
++                 lines ? MESA_PRIM_LINES : MESA_PRIM_TRIANGLES);
++   ureg_property(ureg, TGSI_PROPERTY_GS_OUTPUT_PRIM,
++                 lines ? MESA_PRIM_LINE_STRIP : MESA_PRIM_TRIANGLE_STRIP);
++   ureg_property(ureg, TGSI_PROPERTY_GS_MAX_OUTPUT_VERTICES, vertices);
++   ureg_property(ureg, TGSI_PROPERTY_GS_INVOCATIONS, 1);
++
++   struct ureg_src inputs[PIPE_MAX_SHADER_OUTPUTS];
++   struct ureg_dst outputs[PIPE_MAX_SHADER_OUTPUTS];
++   struct ureg_dst seams[PIPE_MAX_SHADER_OUTPUTS];
++   const struct ureg_src one = ureg_imm1f(ureg, 1.0f);
++   const struct ureg_src zero = ureg_imm1f(ureg, 0.0f);
++   const struct ureg_dst low = ureg_DECL_temporary(ureg);
++   const struct ureg_dst high = ureg_DECL_temporary(ureg);
++   const struct ureg_dst middle = ureg_DECL_temporary(ureg);
++   const struct ureg_dst gap_low = ureg_DECL_temporary(ureg);
++   const struct ureg_dst gap_high = ureg_DECL_temporary(ureg);
++   const struct ureg_dst gap_wrap = ureg_DECL_temporary(ureg);
++   const struct ureg_dst tmp = ureg_DECL_temporary(ureg);
++
++   for (unsigned i = 0; i < vs.num_outputs; ++i) {
++      const auto semantic = (enum tgsi_semantic)vs.output_semantic_name[i];
++      const unsigned index = vs.output_semantic_index[i];
++      inputs[i] = ureg_DECL_input(ureg, semantic, index, 0, 1);
++      outputs[i] = ureg_DECL_output_masked(ureg, semantic, index,
++                                           vs.output_usagemask[i], 0, 1);
++      if (!masks[i])
++         continue;
++
++      seams[i] = ureg_DECL_temporary(ureg);
++      const auto seam = ureg_writemask(seams[i], masks[i]);
++      const auto a = ureg_src_dimension(inputs[i], 0);
++      const auto b = ureg_src_dimension(inputs[i], 1);
++      ureg_MIN(ureg, low, a, b);
++      ureg_MAX(ureg, high, a, b);
++      if (vertices == 3) {
++         const auto c = ureg_src_dimension(inputs[i], 2);
++         ureg_MIN(ureg, middle, ureg_src(high), c);
++         ureg_MAX(ureg, middle, ureg_src(low), ureg_src(middle));
++         ureg_MIN(ureg, low, ureg_src(low), c);
++         ureg_MAX(ureg, high, ureg_src(high), c);
++      } else {
++         ureg_MOV(ureg, middle, ureg_src(high));
++      }
++      ureg_ADD(ureg, gap_low, ureg_src(middle), ureg_negate(ureg_src(low)));
++      ureg_ADD(ureg, gap_high, ureg_src(high), ureg_negate(ureg_src(middle)));
++      ureg_ADD(ureg, gap_wrap, one, ureg_src(low));
++      ureg_ADD(ureg, gap_wrap, ureg_src(gap_wrap), ureg_negate(ureg_src(high)));
++      ureg_FSGE(ureg, tmp, ureg_src(gap_low), ureg_src(gap_high));
++      ureg_UCMP(ureg, seam, ureg_src(tmp), ureg_src(middle), ureg_src(high));
++      ureg_MAX(ureg, gap_low, ureg_src(gap_low), ureg_src(gap_high));
++      ureg_FSGE(ureg, tmp, ureg_src(gap_wrap), ureg_src(gap_low));
++      ureg_UCMP(ureg, seam, ureg_src(tmp), zero, ureg_src(seam));
++   }
++
++   for (unsigned v = 0; v < vertices; ++v) {
++      for (unsigned i = 0; i < vs.num_outputs; ++i) {
++         const auto input = ureg_src_dimension(inputs[i], v);
++         ureg_MOV(ureg, outputs[i], input);
++         if (masks[i]) {
++            ureg_FSLT(ureg, tmp, input, ureg_src(seams[i]));
++            ureg_UCMP(ureg, tmp, ureg_src(tmp), one, zero);
++            ureg_ADD(ureg, ureg_writemask(outputs[i], masks[i]),
++                     input, ureg_src(tmp));
++         }
++      }
++      ureg_EMIT(ureg, ureg_imm1u(ureg, 0));
++   }
++   ureg_ENDPRIM(ureg, ureg_imm1u(ureg, 0));
++   ureg_END(ureg);
++   return ureg_create_shader_and_destroy(ureg, device->pipe);
++}
++
+ static unsigned
+ D3D9BlendFactorToPipe(UINT blend)
+ {
+@@ -3078,7 +3186,7 @@
+           generate_position_t_runtime_ps_vs) ?
+          D3D9CreatePositionTPsInputFixedFunctionVs(device,
+                                                    &fixed_function_vs_shader) :
+-         D3D9CreatePositionTDiffuseFixedFunctionVs(device);
++         D3D9CreatePositionTDiffuseFixedFunctionVs(device, &fixed_function_vs_shader);
+       if (!fixed_function_shaders.vs)
+          return E_FAIL;
+       translated_vs = fixed_function_shaders.vs;
+@@ -3091,7 +3199,10 @@
+                                                 position_t_depth_clamp,
+                                                 point_position_gs, mode);
+    void *dsa = D3D9CreateDepthStencilState(device);
+-   void *point_gs = NULL;
++   bool needs_wrap_gs = false;
++   void *draw_gs = D3D9CreateWrapGs(device, mode,
++                                   translated_vs_shader->translated_vs_outputs,
++                                   D3D9CoordinateWrapMask(device), needs_wrap_gs);
+    if (point_position_gs) {
+       const float width = device->viewport.Width ? (float)device->viewport.Width :
+          1.0f;
+@@ -3109,7 +3220,7 @@
+
+       const bool sprite =
+          device->render_states[D3DRS_POINTSPRITEENABLE] != 0;
+-      point_gs = translated_vs_point_size || generated_vs_point_size ?
++      draw_gs = translated_vs_point_size || generated_vs_point_size ?
+          D3D9CreatePointPositionGs(device, 1.0f / width, 1.0f / height, true,
+                                    true,
+                                    point_size_min, point_size_max, sprite) :
+@@ -3121,7 +3232,7 @@
+    unsigned constants_size = 0;
+    void *constants = D3D9CreateNineVsConstants(device, &constants_size);
+    if (!blend || !rasterizer || !dsa ||
+-       (point_position_gs && !point_gs) ||
++       ((point_position_gs || needs_wrap_gs) && !draw_gs) ||
+        (!constants && translated_vs_needs_constants)) {
+       if (blend)
+          pipe->delete_blend_state(pipe, blend);
+@@ -3129,8 +3240,8 @@
+          pipe->delete_rasterizer_state(pipe, rasterizer);
+       if (dsa)
+          pipe->delete_depth_stencil_alpha_state(pipe, dsa);
+-      if (point_gs)
+-         pipe->delete_gs_state(pipe, point_gs);
++      if (draw_gs)
++         pipe->delete_gs_state(pipe, draw_gs);
+       free(constants);
+       return E_FAIL;
+    }
+@@ -3156,8 +3267,8 @@
+          pipe->delete_depth_stencil_alpha_state(pipe, dsa);
+          pipe->delete_rasterizer_state(pipe, rasterizer);
+          pipe->delete_blend_state(pipe, blend);
+-         if (point_gs)
+-            pipe->delete_gs_state(pipe, point_gs);
++         if (draw_gs)
++            pipe->delete_gs_state(pipe, draw_gs);
+          free(constants);
+          return E_FAIL;
+       }
+@@ -3175,8 +3286,8 @@
+       pipe->delete_rasterizer_state(pipe, rasterizer);
+       pipe->delete_blend_state(pipe, blend);
+       free(fs_constants);
+-      if (point_gs)
+-         pipe->delete_gs_state(pipe, point_gs);
++      if (draw_gs)
++         pipe->delete_gs_state(pipe, draw_gs);
+       free(constants);
+       return E_FAIL;
+    }
+@@ -3188,8 +3299,8 @@
+       pipe->delete_blend_state(pipe, blend);
+       pipe->delete_vertex_elements_state(pipe, dynamic_vertex_elements);
+       free(fs_constants);
+-      if (point_gs)
+-         pipe->delete_gs_state(pipe, point_gs);
++      if (draw_gs)
++         pipe->delete_gs_state(pipe, draw_gs);
+       free(constants);
+       return E_INVALIDARG;
+    }
+@@ -3210,10 +3321,7 @@
+                             device->render_states[D3DRS_MULTISAMPLEMASK]);
+    pipe->bind_vs_state(pipe, translated_vs);
+    pipe->bind_fs_state(pipe, translated_ps);
+-   if (point_position_gs)
+-      pipe->bind_gs_state(pipe, point_gs);
+-   else
+-      pipe->bind_gs_state(pipe, NULL);
++   pipe->bind_gs_state(pipe, draw_gs);
+    pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 0, &cb);
+    pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &fs_cb);
+    if (!D3D9BindTranslatedTextures(device, translated_texture_samplers,
+@@ -3221,7 +3329,7 @@
+                                    &translated_ps_texture_count,
+                                    &translated_vs_texture_count)) {
+       memset(&fb, 0, sizeof(fb));
+-      if (point_position_gs)
++      if (draw_gs)
+          pipe->bind_gs_state(pipe, NULL);
+       pipe->set_framebuffer_state(pipe, &fb);
+       pipe->delete_depth_stencil_alpha_state(pipe, dsa);
+@@ -3235,8 +3343,8 @@
+       pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, NULL);
+       pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 0, NULL);
+       free(fs_constants);
+-      if (point_gs)
+-         pipe->delete_gs_state(pipe, point_gs);
++      if (draw_gs)
++         pipe->delete_gs_state(pipe, draw_gs);
+       free(constants);
+       return E_FAIL;
+    }
+@@ -3281,7 +3389,7 @@
+                                 translated_vs_texture_count);
+    pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, NULL);
+    pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 0, NULL);
+-   if (point_position_gs)
++   if (draw_gs)
+       pipe->bind_gs_state(pipe, NULL);
+    pipe->bind_vs_state(pipe, NULL);
+    pipe->bind_fs_state(pipe, NULL);
+@@ -3294,8 +3402,8 @@
+    pipe->delete_rasterizer_state(pipe, rasterizer);
+    pipe->delete_blend_state(pipe, blend);
+    free(fs_constants);
+-   if (point_gs)
+-      pipe->delete_gs_state(pipe, point_gs);
++   if (draw_gs)
++      pipe->delete_gs_state(pipe, draw_gs);
+    free(constants);
+
+    return D3D9ConsumeBackendDrawFailure(device) ? E_FAIL : S_OK;
+diff --git a/src/gallium/frontends/d3d10umd/D3D9State.cpp b/src/gallium/frontends/d3d10umd/D3D9State.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9State.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9State.cpp
+@@ -245,17 +245,7 @@
+    case D3DDDIRS_WRAP13:
+    case D3DDDIRS_WRAP14:
+    case D3DDDIRS_WRAP15:
+-      /* State blocks can record and restore wrap flags even when no
+-       * primitive uses them. Retain them independently of interpolation. */
+-      if (data->Value) {
+-         static volatile LONG logged;
+-         D3D9WarnOncef(
+-            &logged,
+-            "unsupported D3D9 coordinate wrapping owner=d3d9-state "
+-            "reason=cylindrical-wrap-lowering-not-implemented "
+-            "fallback=interpolate-without-wrapping state=%u value=0x%08x\n",
+-            data->State, data->Value);
+-      }
++      /* The draw reads these values after any state-block replay. */
+       break;
+    case D3DDDIRS_PATCHEDGESTYLE:
+       if (data->Value == D3DPATCHEDGE_DISCRETE)
+diff --git a/src/gallium/frontends/d3d10umd/D3D9NineShader.c b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+--- a/src/gallium/frontends/d3d10umd/D3D9NineShader.c
++++ b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+@@ -985,6 +985,30 @@
+     info->input_map[info->num_inputs++] = usage;
+ }
+
++/* Undo the period added by the geometry shader before shader arithmetic. */
++static struct ureg_src
++tx_wrap_texcoord(struct shader_translator *tx, struct ureg_src input,
++                 unsigned index)
++{
++    const unsigned mask = (tx->info->coordinate_wrap >> (4 * index)) & 0xf;
++    if (!mask)
++        return input;
++
++    struct ureg_program *ureg = tx->ureg;
++    const struct ureg_dst result = ureg_DECL_temporary(ureg);
++    const struct ureg_dst adjusted = ureg_DECL_temporary(ureg);
++    const struct ureg_dst test = ureg_DECL_temporary(ureg);
++    const struct ureg_src one = ureg_imm1f(ureg, 1.0f);
++    ureg_MOV(ureg, result, input);
++    ureg_FSLT(ureg, test, one, input);
++    ureg_ADD(ureg, adjusted, input, ureg_negate(one));
++    ureg_UCMP(ureg, ureg_writemask(result, mask),
++              ureg_src(test), ureg_src(adjusted), input);
++    ureg_release_temporary(ureg, test);
++    ureg_release_temporary(ureg, adjusted);
++    return ureg_src(result);
++}
++
+ static inline void
+ tx_texcoord_alloc(struct shader_translator *tx, INT idx)
+ {
+@@ -993,6 +1017,7 @@
+     if (ureg_src_is_undef(tx->regs.vT[idx])) {
+         tx->regs.vT[idx] = ureg_DECL_fs_input(tx->ureg, tx->texcoord_sn, idx,
+                                              TGSI_INTERPOLATE_PERSPECTIVE);
++        tx->regs.vT[idx] = tx_wrap_texcoord(tx, tx->regs.vT[idx], idx);
+         if (tx->version.major < 3)
+             tx_record_legacy_ps_input(tx, NINE_DECLUSAGE_i(TEXCOORD, idx));
+     }
+@@ -2286,7 +2311,7 @@
+             sem->Name = TGSI_SEMANTIC_TEXCOORD;
+         else
+             sem->Name = TGSI_SEMANTIC_GENERIC;
+-        sem->Index = index;
++        sem->Index = nine_texcoord_semantic_index(index, tc);
+         break;
+     case D3DDECLUSAGE_BLENDWEIGHT:
+         sem->Name = TGSI_SEMANTIC_GENERIC;
+@@ -2524,6 +2549,9 @@
+                 ureg, tgsi.Name, tgsi.Index,
+                 interp_flag,
+                 interp_location, 0, 1);
++            if (sem.usage == D3DDECLUSAGE_TEXCOORD)
++                tx->regs.v[sem.reg.idx] =
++                    tx_wrap_texcoord(tx, tx->regs.v[sem.reg.idx], sem.usage_idx);
+         } else
+         if (!is_input && 0) { /* declare in COLOROUT/DEPTHOUT case */
+             /* FragColor or FragDepth */
+@@ -4242,7 +4270,8 @@
+ static void *
+ nine_ureg_create_shader(struct ureg_program                  *ureg,
+                         struct pipe_context                  *pipe,
+-                        const struct pipe_stream_output_info   *so)
++                        const struct pipe_stream_output_info   *so,
++                        struct tgsi_shader_info *vs_outputs)
+ {
+     struct pipe_shader_state state;
+     const struct tgsi_token *tgsi_tokens;
+@@ -4267,6 +4296,8 @@
+
+     switch (shader_type) {
+     case PIPE_SHADER_VERTEX:
++        if (vs_outputs)
++            tgsi_scan_shader(tgsi_tokens, vs_outputs);
+         return pipe->create_vs_state(pipe, &state);
+     case PIPE_SHADER_FRAGMENT:
+         return pipe->create_fs_state(pipe, &state);
+@@ -4281,11 +4312,21 @@
+                                        struct pipe_context                *pipe,
+                                        const struct pipe_stream_output_info *so)
+ {
+-    void *result = nine_ureg_create_shader(p, pipe, so);
++    void *result = nine_ureg_create_shader(p, pipe, so, NULL);
+     ureg_destroy(p);
+     return result;
+ }
+
++void *
++nine_create_vs_and_record_outputs(struct ureg_program *ureg,
++                                  struct pipe_context *pipe,
++                                  struct tgsi_shader_info *vs_outputs)
++{
++    void *result = nine_ureg_create_shader(ureg, pipe, NULL, vs_outputs);
++    ureg_destroy(ureg);
++    return result;
++}
++
+ HRESULT
+ nine_translate_shader(struct NineDevice9 *device, struct nine_shader_info *info, struct pipe_context *pipe)
+ {
+@@ -4497,8 +4538,11 @@
+                                                     tx->num_outputs,
+                                                     &(info->so));
+         info->cso = nine_create_shader_with_so_and_destroy(tx->ureg, pipe, &(info->so));
+-    } else
++    } else if (IS_VS) {
++        info->cso = nine_create_vs_and_record_outputs(tx->ureg, pipe, info->vs_outputs);
++    } else {
+         info->cso = nine_create_shader_with_so_and_destroy(tx->ureg, pipe, NULL);
++    }
+     if (!info->cso) {
+         hr = D3DERR_DRIVERINTERNALERROR;
+         FREE(info->lconstf.data);
