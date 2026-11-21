@@ -242,7 +242,7 @@ impl PassthroughFs {
         let (writeback_cache, mut cur) = match state[4] {
             // Version 1 did not record negotiated writeback. Preserve its
             // host append behavior when restoring those sessions.
-            1 => (false, 5),
+            1 => (false, 5usize),
             2 => match state[5] {
                 0 => (false, 6),
                 1 => (true, 6),
