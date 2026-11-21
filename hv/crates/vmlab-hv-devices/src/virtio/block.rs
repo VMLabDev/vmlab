@@ -1087,6 +1087,22 @@ mod tests {
     }
 
     #[test]
+    fn avail_idx_far_ahead_does_not_spin() {
+        let mut f = Fixture::new(Box::new(MemDisk::new(4096)));
+        f.mem
+            .write_obj(Le16::from(0x8000u16), GuestAddress(f.avail + 2))
+            .unwrap();
+        let mut block = f.block;
+        let returned = crate::virtio::testing::returns_in_time(move || block.queue_notify(0));
+        assert!(returned.is_some(), "queue_notify spins on a broken ring");
+        assert_eq!(
+            f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(),
+            0
+        );
+        assert!(f.interrupt.notifies.lock().is_empty());
+    }
+
+    #[test]
     fn file_reads_fill_fragmented_guest_targets_across_batches_and_report_eof() {
         use vmlab_disk::ReadTarget;
 

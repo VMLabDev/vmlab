@@ -26,6 +26,19 @@ pub(crate) mod testing {
     use parking_lot::Mutex;
     use vmlab_disk::{DiskImage, Error, Result, SnapshotInfo};
 
+    /// Run `f` on its own thread and give its result, or `None` when it has
+    /// not returned after two seconds. For a call that a fault makes spin
+    /// forever: the test fails instead of hanging the run.
+    pub(crate) fn returns_in_time<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+    }
+
     /// An in-memory disk image with a deterministic byte pattern. Content
     /// and discard log are shared by handle so tests can observe them after
     /// the disk is boxed into a device.

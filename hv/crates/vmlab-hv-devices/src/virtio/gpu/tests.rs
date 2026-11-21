@@ -558,6 +558,20 @@ impl QueueFixture {
     }
 }
 
+#[test]
+fn avail_idx_far_ahead_does_not_spin() {
+    let f = QueueFixture::new(0);
+    f.mem
+        .write_slice(&0x8000u16.to_le_bytes(), GuestAddress(AVAIL + 2))
+        .unwrap();
+    let used = f.mem.clone();
+    let mut gpu = f.gpu;
+    let returned = crate::virtio::testing::returns_in_time(move || gpu.queue_notify(0));
+    assert!(returned.is_some(), "queue_notify spins on a broken ring");
+    assert_eq!(used.read_obj::<u16>(GuestAddress(USED + 2)).unwrap(), 0);
+    assert!(f.interrupt.0.lock().is_empty());
+}
+
 fn vblank_wait(scanout: u32) -> Vec<u8> {
     let mut request = vec![0; 24];
     request[..4].copy_from_slice(&CMD_VBLANK.to_le_bytes());

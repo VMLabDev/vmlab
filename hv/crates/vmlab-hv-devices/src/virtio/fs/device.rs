@@ -605,6 +605,21 @@ mod tests {
     unsafe impl ByteValued for Desc {}
 
     #[test]
+    fn avail_idx_far_ahead_does_not_spin() {
+        let f = Fixture::new(false);
+        f.mem
+            .write_obj(Le16::from(0x8000u16), GuestAddress(f.avail + 2))
+            .unwrap();
+        let mut fs = f.fs;
+        let returned = crate::virtio::testing::returns_in_time(move || fs.queue_notify(1));
+        assert!(returned.is_some(), "queue_notify spins on a broken ring");
+        assert_eq!(
+            f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn hostile_oversized_chains_are_discarded() {
         for writable in [false, true] {
             let mut f = Fixture::new(false);
