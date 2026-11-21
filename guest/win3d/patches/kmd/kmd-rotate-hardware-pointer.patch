@@ -1,0 +1,146 @@
+Subject: [PATCH] viogpu3d: rotate the hardware pointer with the display
+
+Virtio's cursor queue uses physical scanout coordinates. Transform the
+desktop hotspot, and send a cursor bitmap and hotspot in the same
+orientation as the scanout. Keep the desktop image so mode changes and
+device resets can regenerate the upload without a new shape from Windows.
+Allow the remaining quarter turn on the single scanout.
+
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -2846,3 +2846,21 @@
++// Convert a desktop pixel to the counter-clockwise VidPN orientation.
++// Width and height describe the destination (the physical scanout).
++static POINT CursorRotate(LONG x, LONG y, LONG width, LONG height,
++                          D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rotation)
++{
++    switch (rotation)
++    {
++        case D3DKMDT_VPPR_ROTATE90:
++            return {y, height - 1 - x};
++        case D3DKMDT_VPPR_ROTATE180:
++            return {width - 1 - x, height - 1 - y};
++        case D3DKMDT_VPPR_ROTATE270:
++            return {width - 1 - y, x};
++        default:
++            return {x, y};
++    }
++}
++
+ // One command on the cursor queue. "Use this image" (define) also carries whether the pointer
+ // shows: a resource id of 0 hides it, and only that command hides or shows it on every host.
+ // The position is the hotspot's, which is what vmlab-hv draws from: Windows gives the top left
+@@ -2865,7 +2883,10 @@
+     crsr->hdr.type = define ? VIRTIO_GPU_CMD_UPDATE_CURSOR : VIRTIO_GPU_CMD_MOVE_CURSOR;
+     crsr->resource_id = (m_CursorVisible && m_CursorShapeSet) ? m_pCursorBuf->GetId() : 0;
+-    crsr->pos.x = (ULONG)max(m_CursorX + (LONG)m_CursorHotX, 0);
+-    crsr->pos.y = (ULONG)max(m_CursorY + (LONG)m_CursorHotY, 0);
+-    crsr->hot_x = m_CursorHotX;
+-    crsr->hot_y = m_CursorHotY;
++    const POINT pos = CursorRotate(m_CursorX + (LONG)m_CursorHotX, m_CursorY + (LONG)m_CursorHotY,
++                                  m_CursorScanoutWidth, m_CursorScanoutHeight, m_CursorRotation);
++    const POINT hot = CursorRotate(m_CursorHotX, m_CursorHotY, POINTER_SIZE, POINTER_SIZE, m_CursorRotation);
++    crsr->pos.x = (ULONG)max(pos.x, 0);
++    crsr->pos.y = (ULONG)max(pos.y, 0);
++    crsr->hot_x = hot.x;
++    crsr->hot_y = hot.y;
+     m_CursorQueue.QueueCursor(vbuf);
+@@ -2879,3 +2900,13 @@
+     PAGED_CODE();
++    ULONG *dst = (ULONG *)m_pCursorBuf->GetVirtualAddress();
++    for (LONG y = 0; y < POINTER_SIZE; ++y)
++    {
++        for (LONG x = 0; x < POINTER_SIZE; ++x)
++        {
++            const POINT p = CursorRotate(x, y, POINTER_SIZE, POINTER_SIZE, m_CursorRotation);
++            dst[p.y * POINTER_SIZE + p.x] = m_CursorImage[y * POINTER_SIZE + x];
++        }
++    }
++
+     // The image goes up on the control queue and the "use it" command on the cursor queue, which
+     // the host reads independently: wait for the upload first, or the host may show the old image.
+@@ -2892,3 +2923,23 @@
++void VioGpuAdapter::UpdateCursorMode(ULONG width, ULONG height, D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rotation)
++{
++    PAGED_CODE();
++    KeWaitForSingleObject(&m_CursorMutex, Executive, KernelMode, FALSE, NULL);
++    const BOOLEAN rotated = m_CursorRotation != rotation;
++    const BOOLEAN resized = m_CursorScanoutWidth != (LONG)width || m_CursorScanoutHeight != (LONG)height;
++    m_CursorRotation = rotation;
++    m_CursorScanoutWidth = (LONG)width;
++    m_CursorScanoutHeight = (LONG)height;
++    if (m_pCursorBuf != NULL && m_CursorShapeSet && rotated)
++    {
++        UploadCursor();
++    }
++    else if (resized && m_CursorVisible && m_CursorShapeSet)
++    {
++        SendCursor(FALSE);
++    }
++    KeReleaseMutex(&m_CursorMutex, FALSE);
++}
++
+ // After a device reset (a timeout recovery, or D3 to D0) the host has neither the pointer's
+ // resource nor its image, and Windows does not set a shape it believes is current again.
+ void VioGpuAdapter::RestoreCursor(void)
+@@ -2923,3 +2974,3 @@
+-    CursorConvertShape(pShape, (ULONG *)m_pCursorBuf->GetVirtualAddress());
++    CursorConvertShape(pShape, m_CursorImage);
+     m_CursorHotX = min(pShape->XHot, (UINT)(POINTER_SIZE - 1));
+     m_CursorHotY = min(pShape->YHot, (UINT)(POINTER_SIZE - 1));
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -142,3 +142,7 @@
+     ULONG m_CursorHotX;
+     ULONG m_CursorHotY;
++    ULONG m_CursorImage[POINTER_SIZE * POINTER_SIZE];
++    LONG m_CursorScanoutWidth = 0;
++    LONG m_CursorScanoutHeight = 0;
++    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION m_CursorRotation = D3DKMDT_VPPR_IDENTITY;
+ 
+@@ -260,3 +264,4 @@
+     void RestoreCursor(void);
+     void SendCursor(BOOLEAN define);
++    void UpdateCursorMode(ULONG width, ULONG height, D3DKMDT_VIDPN_PRESENT_PATH_ROTATION rotation);
+ 
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -428,6 +428,11 @@
+                 break;
+             }
+         }
++        if (NT_SUCCESS(Status) && pPath->VidPnSourceId == 0)
++        {
++            m_pAdapter->UpdateCursorMode(pCurrentMode->DispInfo.Width, pCurrentMode->DispInfo.Height,
++                                         pCurrentMode->Rotation);
++        }
+     }
+ 
+     return Status;
+@@ -470,5 +475,6 @@
+     else if ((pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_IDENTITY) &&
+              (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_ROTATE90) &&
+              (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_ROTATE180) &&
++             (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_ROTATE270) &&
+              (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_NOTSPECIFIED) &&
+              (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_UNINITIALIZED))
+@@ -549,4 +555,9 @@
+     m_CurrentModes[pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.VidPnSourceId].Rotation = pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.ContentTransformation.Rotation;
++    if (pUpdateActiveVidPnPresentPath->VidPnPresentPathInfo.VidPnSourceId == 0)
++    {
++        const CURRENT_MODE &mode = m_CurrentModes[0];
++        m_pAdapter->UpdateCursorMode(mode.DispInfo.Width, mode.DispInfo.Height, mode.Rotation);
++    }
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ 
+@@ -1489,5 +1501,5 @@
+                 LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate90 = 1;
+                 LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate180 = 1;
+-                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate270 = 0;
++                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate270 = 1;
+                 SupportFieldsModified = TRUE;
+             }
