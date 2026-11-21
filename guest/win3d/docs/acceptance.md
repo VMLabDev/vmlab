@@ -167,7 +167,7 @@ The compatibility sweep and the feature probes were not run on this base.
 2 on both RTX 5090s, with helios's new Resizable BAR, and on AMD1: four
 runs, 12 of 12 each.** BAR1 is now 32 GiB on both cards. NVIDIA's Vulkan
 driver offers the device-local, host-visible type on the VRAM heap, so
-`patches/mesa/0070` no longer hides it, and Venus guests on NVIDIA now use
+`patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` no longer hides it, and Venus guests on NVIDIA now use
 VRAM-mapped memory. These are the first NVIDIA runs with that behaviour.
 [docs/evidence/rc3/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc3/README.md) has the release record and
 every result below in more detail.
@@ -545,7 +545,7 @@ now rc3's, and `windows-10/apps/` is rc2's.
 | DirectX SDK `ParallaxOcclusionMapping.exe`, x64 | D3D9 | **renders** on all three: the textured, parallax-occlusion-mapped stone disc, HAL on our device (`console-d3d9-x64-ParallaxOcclusionMapping.png`) | **renders** on both | as above |
 | DirectX SDK `BasicHLSL11.exe`, x64 | D3D11 | **renders** on all three: the lit, textured "tiny" model in an 800×600 window; the overlay reads `HARDWARE: Hardsoft VirtIO GPU 3D controller` (`console-d3d11-x64-BasicHLSL11.png`) | **renders** on both | `d3d11.dll`, `dxgi.dll`, `viogpu_d3d10.dll`, D3DX 11 from System32; 0 app-local |
 | DirectX SDK `SubD11.exe`, x64 | D3D11 | **renders** on all three: the tessellated character with the green wire overlay, on `HARDWARE: Hardsoft VirtIO GPU 3D controller` (`console-d3d11-x64-SubD11.png`) | **renders** on both | as above |
-| Blender 4.2.3 LTS, `blender.exe --factory-startup` | OpenGL 4.3 | **renders**, opaque, on all three: the complete UI, 3D viewport, grid and gizmos (`console-opengl-x64-Blender.png`) | **renders, opaque**, on both, with the splash still in front; the wallpaper no longer shows through (`patches/mesa/0027`) | `opengl32.dll`, `viogpu_wgl.dll` with `libvulkan_virtio.dll`; app-local only Blender's own non-graphics DLLs (`python311.dll`, `python3.dll`, `blender_cpu_check.dll`, `cycles_kernel_oneapi_aot.dll`) |
+| Blender 4.2.3 LTS, `blender.exe --factory-startup` | OpenGL 4.3 | **renders**, opaque, on all three: the complete UI, 3D viewport, grid and gizmos (`console-opengl-x64-Blender.png`) | **renders, opaque**, on both, with the splash still in front; the wallpaper no longer shows through (`patches/mesa/wgl-present-windows-opaque.patch`) | `opengl32.dll`, `viogpu_wgl.dll` with `libvulkan_virtio.dll`; app-local only Blender's own non-graphics DLLs (`python311.dll`, `python3.dll`, `blender_cpu_check.dll`, `cycles_kernel_oneapi_aot.dll`) |
 
 On NVIDIA every application ran to its time limit. The host kernel logged
 no Xid during any rc run on Nvidia1 or Nvidia2
@@ -561,7 +561,7 @@ module lists are in `<app>.modules.txt`.
 earlier acceptance runs ([b3e1798](https://github.com/VMLabDev/vmlab-win3d/commit/b3e179837e76ff7ebf013ce90e60a586af5138a2), [cb4d53c](https://github.com/VMLabDev/vmlab-win3d/commit/cb4d53c67556805416790be6cf6246781a003d29)) recorded both as failures.
 `docs/d3d11-apps.md` found two causes:
 
-- SubD11 hit three UMD bugs, fixed by `patches/mesa/0015` to `0017`.
+- SubD11 hit three UMD bugs, fixed by `patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch` to `0017`.
 - The June 2010 DXUT places BasicHLSL11's window off the screen on Windows
   8 and later unless the SDK's `D3D11Ref.dll` is present. That is an
   application bug ([known limits](known-limits.md)). `tests/e2e/apps.sh`
@@ -704,8 +704,8 @@ What the baseline says:
   begin to answer `DXGI_ERROR_DEVICE_REMOVED` (0x887a0005). The d3d9
   programs run to their end with failures: 11 in `d3d9ex`, 169 in
   `stateblock`, and 343 (AMD1) or 345 (Nvidia2) of about 206,000 checks in
-  `visual`. No failure was looked into here. The failed lines of each
-  program are in the evidence.
+  `visual`. The [D3D9 failure groups](#d3d9-failure-groups) trace the
+  failed assertions to the Wine 11.0 source.
   B10 says which calls removed the device, and the fix.
 - B6. Wine's d3d9 `device` program ends the hypervisor, on both GPUs, 13 to
   26 s in: vmlab-hv exits with "Too many open files" after a run of `GPU
@@ -728,8 +728,8 @@ What the baseline says:
   of that path: its probe found pixels that differ on both GPUs without the
   patch. The failing checks above, and `pointer` in the earlier baseline,
   show that their probes do detect.
-- B8. After the baseline: with driver `100.6.101.58107` (`patches/kmd/0006`
-  and `patches/mesa/0095`) `duplication` passes on both GPUs, eight lit
+- B8. After the baseline: with driver `100.6.101.58107` (`patches/kmd/kmd-present-blt-into-mappable-blob.patch`
+  and `patches/mesa/yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch`) `duplication` passes on both GPUs, eight lit
   frames of eight, and the new check `shared-texture` passes
   ([present.md](present.md#desktop-duplication)). Those runs selected
   `duplication`, `shared-texture` and `tear-blt` only.
@@ -751,7 +751,7 @@ What the baseline says:
   (`WINETEST_NO_MT_D3D=1`) with `C:\ProgramData\Yttrium\yttrium-errors.log`
   name each UMD call that set an error the runtime does not allow, which
   removes the device. The access violation is the test reading through a
-  pointer that a failed call left NULL. `patches/mesa/0097` changes these:
+  pointer that a failed call left NULL. `patches/mesa/d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch` changes these:
   - `GetResourceLayout` (WDDM 2.0) set `E_INVALIDARG`. The runtime asks for
     it for each DEFAULT texture created with CPU access flags
     (`test_resource_access`, the first `0x887a0005` lines of both programs).
@@ -851,6 +851,59 @@ Host GPU: Nvidia2, /dev/dri/renderD129 0000:05:00.0 VGA compatible controller: N
 | P10 | `wine-d3d9_visual`: Wine's d3d9 test visual passes | **fail** | 206068 tests executed, 345 failures, 0 todo, 31 skipped in 164 s |
 <!-- /e2e:adapter -->
 
+### D3D9 failure groups
+
+Card #253 uses the `adapter/wine-<program>.failures.txt` logs for the
+Windows 11 tables above. Counts below are failed assertions, including
+readback failures that follow a rejected draw. The Wine source locations
+identify the failing behavior. Several rendering groups still need a
+driver-level diagnosis.
+
+`stateblock.c:1233` checks the result of setting each render state.
+The driver rejected nonzero values for `WRAP0` through `WRAP15`,
+`D3DZB_USEW` for `ZENABLE`, and wireframe for `FILLMODE`. The same
+rejections can propagate through `Apply` at line 297. These two assertions
+account for 162 and seven failures respectively on each GPU. The
+[coordinate-wrap patch](../patches/mesa/d3d9-record-coordinate-wrap-render-states.patch)
+fixes the largest setter group by retaining the wrap flags through state
+block replay. Cylindrical interpolation still needs implementation.
+
+On helios with AMD1 and Windows 11 template `26100.1742.11`, the patched
+package ran the same 12,268 `stateblock` checks. Failures fell from 169 to
+25. The patch removed 144 setter failures, leaving 18 setter failures and
+seven replay failures. `d3d9ex` still reported 11 failures in 2,379 checks.
+The standalone `visual` run on AMD1 reported the same 343 failures in
+206,068 checks. The test session used a soft open-file limit of 65,536
+after an earlier attempt exhausted the default limit of 1,024.
+
+#### Draft cards
+
+Each row is a draft card. Counts are AMD1 / Nvidia2.
+
+| Draft card | Program and failures | Evidence and completion check |
+| --- | --- | --- |
+| Accept and render W-buffer depth state | `stateblock`, part of the remaining 18 setter and seven replay failures on AMD1 | `ZENABLE = D3DZB_USEW` returns `E_NOTIMPL` in the driver. Exercise both state-block replay and W-depth rendering. |
+| Accept and render D3D9 wireframe fill | `stateblock`, part of the same remaining failures | `FILLMODE = D3DFILL_WIREFRAME` returns `E_NOTIMPL`. Exercise both state-block replay and visible wireframe output. |
+| Implement D3D9 cylindrical interpolation | `stateblock`, wrap setter and replay fix above | Draw across a coordinate seam with each wrap component set. Verify the driver interpolates across the seam and honors the flag after applying a state block. |
+| Support display rotation changes | `d3d9ex`, 2 / 2 | Lines 573 and 608. Restore the original orientation after a rotation and verify the reported orientation. |
+| Restore fullscreen notification and activation behavior | `d3d9ex`, 5 / 9 | Lines 2940–2961, 3007 and 3100. Check `WM_DISPLAYCHANGE` delivery and the foreground window across the fullscreen transition. |
+| Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
+| Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
+| Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
+| Use reciprocal RHW for perspective table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 0`. Check fog uses W recovered from the pre-transformed vertex. |
+| Use transformed W for fixed-function table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 1`. Check fog uses the W produced by the fixed-function transform. |
+| Use shader output W for perspective table fog | `visual`, 72 / 72 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 2` or `3`. Check fog uses shader output W with and without an explicit fog output. |
+| Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
+| Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
+| Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
+| Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
+| Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
+| Draw with the tested fixed-function vertex color declarations | `visual`, 14 / 14 | Lines 25308 and 25313, tests 13–19. Fix the draw errors and check diffuse and specular color readback. |
+| Supply default vertex attribute components | `visual`, 12 / 12 | Lines 27740 and 27745. Vertex shader cases 2 and 5 fail the draw and leave a red pixel in all three pixel shader cases. |
+| Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
+| Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
+| Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
+
 ## Findings from these runs
 
 Found by earlier runs, fixed on main, and confirmed by the final runs:
@@ -860,12 +913,12 @@ Found by earlier runs, fixed on main, and confirmed by the final runs:
   Vulkan-Tools sets up `User32Handles` only under `_MSC_VER`, so the
   llvm-mingw build dereferenced a null `user32_handles` when it created its
   surface window. LunarG's vulkaninfo worked with the same loader and ICD.
-  Fixed by `patches/vulkan-tools/0001`.
+  Fixed by `patches/vulkan-tools/vulkaninfo-Load-user32-on-every-Windows-compiler.patch`.
 - **dxdiag reported DirectDraw "Not Available"**, so `hardware_acceleration`
   was false even though D3D was `Enabled`. Fixed by
-  `patches/mesa/0012`–`0014` (the D3D9 UMD's DirectDraw HAL).
+  `patches/mesa/d3d9-directdraw-hal-caps.patch`–`0014` (the D3D9 UMD's DirectDraw HAL).
 - **The DirectX SDK's D3D11 (DXUT11) samples did not show.** Fixed by
-  `patches/mesa/0015`–`0017` and explained by DXUT's window placement, as
+  `patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch`–`0017` and explained by DXUT's window placement, as
   described under "Stretch" above. Both now render in the e2e run on both
   templates. The hypothesis recorded here earlier, DXGI output and mode
   enumeration, was wrong (`docs/d3d11-apps.md`).
@@ -886,14 +939,14 @@ Open:
 - **D3D9 ran at about 30 fps** on AMD1 (27 to 34) and about 20 on NVIDIA
   in the 0.1.0 runs, against about 60 for the other APIs. In the rc1 runs
   the D3D9 probe reached 57 to 60 fps on AMD1, 51 to 52 on Nvidia1 (windows-11)
-  and 40 to 42 on Nvidia2, after `patches/kmd/0002` and `patches/mesa/0026`
+  and 40 to 42 on Nvidia2, after `patches/kmd/kmd-cache-gdi-shadow-and-staging-surfaces.patch` and `patches/mesa/d3d9-ddraw-present-sources-in-host-cached-memory.patch`
   ([`present.md`](present.md)). On windows-10 Nvidia1 the x64 D3D9 probe
   measured 27 fps and the x86 one 46. Below the refresh rate on NVIDIA:
   [known limits](known-limits.md).
 - **Blender's window was translucent on Windows 10** in the 0.1.0 runs:
   the wallpaper showed through its viewport and panels, because Windows
   10's compositor honours the alpha Blender leaves in its framebuffer. With
-  `patches/mesa/0027` (WGL presents windows opaque), the rc1 windows-10
+  `patches/mesa/wgl-present-windows-opaque.patch` (WGL presents windows opaque), the rc1 windows-10
   runs on AMD1 and Nvidia1 show Blender opaque
   (`windows-10/apps/console-opengl-x64-Blender.png`,
   `windows-10-nvidia1/apps/console-opengl-x64-Blender.png`).
@@ -916,7 +969,7 @@ Fixed after the earlier runs; the final runs exercise part of the fix:
 ## Other hosts
 
 These runs used the AMD iGPU on helios. The same Done checks also pass on an
-Intel Iris Xe host (`docs/zeus.md`, 12 of 12 with `patches/mesa/0021`) and
+Intel Iris Xe host (`docs/zeus.md`, 12 of 12 with `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch`) and
 on helios's RTX 5090 (below). [Known limits](known-limits.md#host-gpu-support)
 has the matrix.
 
@@ -948,10 +1001,10 @@ evidence is in git history (above); the tables above are rc3's. Before 0.1.1 the
 fixed in this package:
 
 - The D3D9 `BasicHLSL` sample hung the guest with host Xid 69, so the
-  NVIDIA runs had no application results. Fixed by `patches/mesa/0022`
+  NVIDIA runs had no application results. Fixed by `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`
   ([`xid69.md`](xid69.md)).
 - After that fix the D3D9 samples' meshes rendered black. Fixed by
-  `patches/mesa/0023` to `0025` ([`nvtex.md`](nvtex.md)).
+  `patches/mesa/yttrium-shared-colour-optimal-when-linear-refused.patch` to `0025` ([`nvtex.md`](nvtex.md)).
 - The D3D9 probe ran at about 20 fps ([`present.md`](present.md)).
 
 The 0.1.0-alpha NVIDIA evidence (vmlab 0.27 and 0.28, package built at
@@ -978,12 +1031,12 @@ changed since.
 | [`rc2/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc2/README.md) | Release candidate 0.1.1-alpha-rc2 on AMD1: the release record (five asset hashes, notes, QEMU and render-server `BUILDINFO`, the host assets' install check), DirectDraw fullscreen rates and both D3D9 fixed-function suites with that package | 0.28.0-alpha | [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4) | Current |
 | [`compat/rc2-amd1/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/compat/rc2-amd1) | The compatibility sweep on AMD1 with the rc2 package ([`compat.md`](compat.md)) | 0.28.0-alpha, `host_gpu = "AMD1"` | [0d3eb68](https://github.com/VMLabDev/vmlab-win3d/commit/0d3eb68b7780c21061b34c9768df08aa418497e4) | Current |
 | [`rc/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/rc/README.md) | Release candidate 0.1.1-alpha-rc1: the release record (asset hashes, notes, QEMU `BUILDINFO`), DirectDraw fullscreen rates and the D3D9 fixed-function coverage with that package on AMD1 and Nvidia1, and the host kernel's NVRM lines during the runs | 0.28.0-alpha | [0ee5ba1](https://github.com/VMLabDev/vmlab-win3d/commit/0ee5ba149e10b7671aef8ab3db71f187c53d895c) | Current |
-| [`vulkaninfo/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/vulkaninfo/README.md) | The package's patched `vulkaninfo.exe` (`patches/vulkan-tools/0001`) lists Venus and exits 0, x64 and x86 | 0.24.0-alpha | [78fc688](https://github.com/VMLabDev/vmlab-win3d/commit/78fc688ec4ae7998d7fab978cd4de3cefed55603) (`work/fix-vulkaninfo`) | Current |
-| [`dxdiag/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag) | dxdiag's DDraw and AGP status before and after `patches/mesa/0012` to `0014`, with `ddcaps` DirectDraw checks ([`dxdiag.md`](dxdiag.md)) | 0.24.0-alpha | before: `main` at [be2ef9b](https://github.com/VMLabDev/vmlab-win3d/commit/be2ef9b0ece9d98a33a01ce049dc8fbe846fb6b8); after: [deb2585](https://github.com/VMLabDev/vmlab-win3d/commit/deb258516ab8cdb2c1b48623c01dcb0317ee2ef2) | Current |
-| [`d3d11-apps/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d11-apps) | SubD11 and BasicHLSL11: the causes, `patches/mesa/0015` to `0017`, the DXUT window bug and the `D3D11Ref.dll` workaround ([`d3d11-apps.md`](d3d11-apps.md)) | 0.24.0-alpha | [5fd206d](https://github.com/VMLabDev/vmlab-win3d/commit/5fd206d3c2fd259ad4a2a7e68394771ab9e1cf57) | Current |
+| [`vulkaninfo/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/vulkaninfo/README.md) | The package's patched `vulkaninfo.exe` (`patches/vulkan-tools/vulkaninfo-Load-user32-on-every-Windows-compiler.patch`) lists Venus and exits 0, x64 and x86 | 0.24.0-alpha | [78fc688](https://github.com/VMLabDev/vmlab-win3d/commit/78fc688ec4ae7998d7fab978cd4de3cefed55603) (`work/fix-vulkaninfo`) | Current |
+| [`dxdiag/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/dxdiag) | dxdiag's DDraw and AGP status before and after `patches/mesa/d3d9-directdraw-hal-caps.patch` to `0014`, with `ddcaps` DirectDraw checks ([`dxdiag.md`](dxdiag.md)) | 0.24.0-alpha | before: `main` at [be2ef9b](https://github.com/VMLabDev/vmlab-win3d/commit/be2ef9b0ece9d98a33a01ce049dc8fbe846fb6b8); after: [deb2585](https://github.com/VMLabDev/vmlab-win3d/commit/deb258516ab8cdb2c1b48623c01dcb0317ee2ef2) | Current |
+| [`d3d11-apps/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/d3d11-apps) | SubD11 and BasicHLSL11: the causes, `patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch` to `0017`, the DXUT window bug and the `D3D11Ref.dll` workaround ([`d3d11-apps.md`](d3d11-apps.md)) | 0.24.0-alpha | [5fd206d](https://github.com/VMLabDev/vmlab-win3d/commit/5fd206d3c2fd259ad4a2a7e68394771ab9e1cf57) | Current |
 | [`nvidia/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvidia) | The two RTX 5090 faults and their fixes, `patches/mesa/0020` and [patches/host/qemu/0001](https://github.com/VMLabDev/vmlab-win3d/blob/bea2a93d3ccbfff8b94e321541d573291bc8b4d1/patches/host/qemu/0001-ui-egl-headless-external-only-dmabuf-scanouts.patch); `05-amd-regression/` shows no AMD regression ([`nvidia.md`](nvidia.md)) | 0.24.0-alpha, isolated supervisor | [bea2a93](https://github.com/VMLabDev/vmlab-win3d/commit/bea2a93d3ccbfff8b94e321541d573291bc8b4d1) | Current for the diagnosis; `01-` to `03-` are diagnostic steps. The acceptance runs above replace `04-guest-fix/` as the proof that NVIDIA works |
-| [`zeus/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus) | Intel Iris Xe fails on `main` and passes with `patches/mesa/0021`; the AMD regression run with 0021; the RTX 4060 failure ([`zeus.md`](zeus.md)) | 0.24.0-alpha | `main` at [db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91); 0021 at [1bbbfe8](https://github.com/VMLabDev/vmlab-win3d/commit/1bbbfe887760c63c24fd423cd04f8fc18319018e) | Current |
-| [`package/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md) | A fresh-clone build, then install, probes, rerun, uninstall back to the baseline and reinstall, on a fresh `windows-11` lab | 0.23, with workarounds (`lab-vmlab.wcl`) | [f7fa236](https://github.com/VMLabDev/vmlab-win3d/commit/f7fa236b421a5467531c19da348738774f252698) (`work/package`) | **Historical.** The bundle predates `patches/vulkan-tools/0001` and Mesa 0012 on, so the file hashes it quotes are not today's. The uninstall evidence is still the only uninstall run |
+| [`zeus/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/zeus) | Intel Iris Xe fails on `main` and passes with `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch`; the AMD regression run with 0021; the RTX 4060 failure ([`zeus.md`](zeus.md)) | 0.24.0-alpha | `main` at [db07da3](https://github.com/VMLabDev/vmlab-win3d/commit/db07da3ced64c042d8a6240b1c54bf6e7d539b91); 0021 at [1bbbfe8](https://github.com/VMLabDev/vmlab-win3d/commit/1bbbfe887760c63c24fd423cd04f8fc18319018e) | Current |
+| [`package/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/package/README.md) | A fresh-clone build, then install, probes, rerun, uninstall back to the baseline and reinstall, on a fresh `windows-11` lab | 0.23, with workarounds (`lab-vmlab.wcl`) | [f7fa236](https://github.com/VMLabDev/vmlab-win3d/commit/f7fa236b421a5467531c19da348738774f252698) (`work/package`) | **Historical.** The bundle predates `patches/vulkan-tools/vulkaninfo-Load-user32-on-every-Windows-compiler.patch` and Mesa 0012 on, so the file hashes it quotes are not today's. The uninstall evidence is still the only uninstall run |
 | [`kmd/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/kmd/README.md) | The KMD's test signature is accepted and the driver loads, with no Code Integrity events | 0.23 (`display = "virtio-vga-gl"`) | [e166465](https://github.com/VMLabDev/vmlab-win3d/commit/e1664656b92d809c9f771b853e94128b4f89316f) | **Historical**: a kernel-only install with no UMDs, so the device showed problem code 43; the full package's device has problem code 0 ([acceptance/*/installed-gpu-state.json](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/acceptance/windows-10-nvidia1/installed-gpu-state.json)). Signing is unchanged since |
 | [`probes/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/probes/README.md) | The probes and guest scripts work on Microsoft's software renderers, before any driver from this repository | 0.23, no GPU | [26ca683](https://github.com/VMLabDev/vmlab-win3d/commit/26ca683dcf14e1f3688d346579ad18b6ec7433dc) | **Historical** |
 | [`host/`](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/host) | The host-probe captures `host.md` cites: which QEMU, display and loader settings Venus needs | 0.23, with `qemu_args` variants | [d1bad91](https://github.com/VMLabDev/vmlab-win3d/commit/d1bad91ba6285100b391080e9ab424da8435300e) | **Historical**: vmlab 0.24 emits these settings itself |

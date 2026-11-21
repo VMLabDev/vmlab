@@ -1,14 +1,14 @@
 # ExecuteIndirect with state-changing command signatures
 
-Two patches make this work. `patches/vkd3d-proton/0006` handles command
+Two patches make this work. `patches/vkd3d-proton/vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch` handles command
 signatures that set root constants and root descriptors, and is what the
-first sections describe. `patches/vkd3d-proton/0007` handles signatures that
+first sections describe. `patches/vkd3d-proton/vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch` handles signatures that
 set vertex and index buffer views
 ([below](#vertex-and-index-buffer-views)).
 
 `D3D12ExecuteIndirect`, one of Microsoft's DirectX-Graphics-Samples, drew
 only its clear colour on AMD1 and Nvidia1 ([d3d12app.md](d3d12app.md)).
-`patches/vkd3d-proton/0006` fixes this. Without `VK_EXT_device_generated_commands`,
+`patches/vkd3d-proton/vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch` fixes this. Without `VK_EXT_device_generated_commands`,
 vkd3d-proton now emulates `ExecuteIndirect` for command signatures that
 change root constants or root descriptors. The fix changes nothing on the
 host and nothing in Venus. The work was done on 2026-10-19 on helios: RADV
@@ -193,7 +193,7 @@ Nvidia1, and WARP covers 0.178 and 0.183.
 `0006` left out signatures with `D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW`
 or `D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW` arguments. vkd3d-proton
 then dropped the view arguments, and each sequence drew with the buffers
-bound on the CPU: wrong drawing with no error. `patches/vkd3d-proton/0007`
+bound on the CPU: wrong drawing with no error. `patches/vkd3d-proton/vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch`
 emulates them. The work was done on 2026-11-21 on helios (card 254).
 
 ### Why the views cannot be bound

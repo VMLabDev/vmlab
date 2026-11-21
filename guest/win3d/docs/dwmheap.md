@@ -18,7 +18,7 @@ the evidence, and lists what is still unproven.
   device's threaded context on that thread. The flush ran a queued batch
   outside the thread that owns the context. The batch's flush-label callback
   freed a record that had already been freed, and the heap stopped dwm.
-- **Fix:** `patches/mesa/0060-d3d10umd-trim-residency-set-leaves-the-context-alone.patch`.
+- **Fix:** `patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch`.
   `TrimResidencySet` is advisory, and it now returns `S_OK` without touching
   the pipe context.
 - **Why NVIDIA and the first boot:** dwm was recovering from a lost device
@@ -120,7 +120,7 @@ recovers from one, so dwm rebuilds its device as Windows intends.
 
 ## The fix
 
-`patches/mesa/0060` changes one function in
+`patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch` changes one function in
 `src/gallium/frontends/d3d10umd/Device.cpp`:
 
 ```c

@@ -283,7 +283,7 @@ render-server lines are virglrenderer's, from QEMU's log.
 - **Other GPUs and renderers:** the same demo passes on AMD1 at 60 fps, and
   on Nvidia2 under D3D12 (vkd3d-proton over the same Venus device) and
   OpenGL.
-- **Diagnosis:** `patches/mesa/0022` fixed Xid 69 for D3D9 depth draws
+- **Diagnosis:** `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch` fixed Xid 69 for D3D9 depth draws
   (ErrorCode `0x9c`, `docs/xid69.md`). This is a different error code, from a
   native Vulkan application, so the UMD is not involved.
 
@@ -297,7 +297,7 @@ OpenGL runs stayed clean.
 
 ### F2: GZDoom Vulkan on Nvidia2
 
-- **Status (2026-10-19): fixed** by `patches/mesa/0070` and `0086`
+- **Status (2026-10-19): fixed** by `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` and `0086`
   ([nvva.md](nvva.md)): the render-server lines are the BAR1 "allocation
   refused" failure. GZDoom Vulkan runs clean on Nvidia1 with them
   ([gzdoom.md](gzdoom.md#f2-gzdoom-vulkan-on-nvidia)).
@@ -319,7 +319,7 @@ OpenGL runs stayed clean.
 
 This happens on both GPUs.
 
-- **Status (2026-10-19): fixed** by `patches/mesa/0080`
+- **Status (2026-10-19): fixed** by `patches/mesa/wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch`
   ([gzdoom.md](gzdoom.md)). GZDoom started its OpenGL renderer through GDI
   before it loaded `opengl32.dll`; GDI's temporary load of `opengl32.dll`
   lost the pixel format, and `wglCreateContext` failed. With 0080, GZDoom
@@ -344,7 +344,7 @@ This happens on both GPUs.
 
 Both Unigine OpenGL runs crash on Nvidia2. Both pass on AMD1.
 
-**Status: fixed** by `patches/mesa/0070` (nvva), `0085` and `0086`
+**Status: fixed** by `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` (nvva), `0085` and `0086`
 ([unigl.md](unigl.md)). The cause was the RTX 5090's 246 MiB CPU-visible
 VRAM heap (its BAR1): Venus's asynchronous allocation hid the host's
 out-of-memory error from Zink, and Zink then mapped buffers that were not
@@ -412,7 +412,7 @@ failed there from F6's cause, which `0091` and `0092` fix.
   `Run-Probe` kills it.
 - **UMD log:** no lines for the process.
 
-**Status:** fixed by `patches/mesa/0091` and `0092` ([f6va.md](f6va.md)).
+**Status:** fixed by `patches/mesa/d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch` and `0092` ([f6va.md](f6va.md)).
 Valley, a 32-bit process, ran out of address space through the UMD's
 ordered-context-worker upload path: the UMD copied the whole 4 MiB of each
 of Valley's vertex-buffer locks, about 100 a second, into mapped upload
@@ -436,7 +436,7 @@ on `Heaven.exe` is the next step.
 
 **Status:** reproduced under PageHeap in 2 of 5 runs, as a use-after-free in
 the UMD's threaded context ([unid3d.md](unid3d.md#f7-heaven-d3d11-on-amd1)).
-Most likely fixed by `patches/mesa/0060`: with it, Heaven D3D11 ran 5 of 5
+Most likely fixed by `patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch`: with it, Heaven D3D11 ran 5 of 5
 times under PageHeap on AMD1 with no crash and no dump
 ([dwmheap.md](dwmheap.md#f7-heaven-d3d11)). The freed record is the same
 flush-label callback as in the dwm double free that 0060 fixes. Five clean
@@ -495,16 +495,16 @@ is still loading. The later frames render, so this is start-up, not a fault.
 ## What remains
 
 - F1: fixed (`patches/mesa/0075`, [godot.md](godot.md)).
-- F2: GZDoom Vulkan on NVIDIA: fixed by `patches/mesa/0070` and `0086` ([gzdoom.md](gzdoom.md)).
-- F3: GZDoom's OpenGL context: fixed by `patches/mesa/0080` ([gzdoom.md](gzdoom.md)).
-- F4: Unigine OpenGL on NVIDIA: fixed by `patches/mesa/0070`, `0085` and `0086` ([unigl.md](unigl.md)).
+- F2: GZDoom Vulkan on NVIDIA: fixed by `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` and `0086` ([gzdoom.md](gzdoom.md)).
+- F3: GZDoom's OpenGL context: fixed by `patches/mesa/wgl-pin-opengl32-so-pixel-formats-set-through-gdi-last.patch` ([gzdoom.md](gzdoom.md)).
+- F4: Unigine OpenGL on NVIDIA: fixed by `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch`, `0085` and `0086` ([unigl.md](unigl.md)).
 - F5: fixed (`patches/mesa/0090`).
-- F6: fixed (`patches/mesa/0091` and `0092`, [f6va.md](f6va.md)).
-- F7: the threaded-context use-after-free behind Heaven D3D11's heap corruption; most likely fixed by `patches/mesa/0060` (5 of 5 clean PageHeap runs, [dwmheap.md](dwmheap.md#f7-heaven-d3d11), and a clean run in the rc2 sweep).
+- F6: fixed (`patches/mesa/d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch` and `0092`, [f6va.md](f6va.md)).
+- F7: the threaded-context use-after-free behind Heaven D3D11's heap corruption; most likely fixed by `patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch` (5 of 5 clean PageHeap runs, [dwmheap.md](dwmheap.md#f7-heaven-d3d11), and a clean run in the rc2 sweep).
 - The whole sweep on NVIDIA with a package that has every fix: done with
   rc3 on Nvidia2, 12 of 12, on a Resizable BAR host
   ([rc3 on Nvidia2](#release-candidate-011-alpha-rc3-on-nvidia2)). It has
   not run on an NVIDIA host without Resizable BAR with this package, where
-  `patches/mesa/0070` is active.
+  `patches/mesa/venus-hide-host-access-to-small-bar-heap.patch` is active.
 - Not run: Windows 10, Nvidia1, x86 builds other than Unigine (which is
   32-bit only), and longer runs.

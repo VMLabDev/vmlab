@@ -1,6 +1,6 @@
 # DirectDraw: fullscreen exclusive mode and hardware colour-key and mirror blits
 
-`patches/mesa/0012` to `0014` gave DirectDraw a hardware HAL, but two gaps
+`patches/mesa/d3d9-directdraw-hal-caps.patch` to `0014` gave DirectDraw a hardware HAL, but two gaps
 stayed ([`dxdiag.md`](dxdiag.md#not-covered)). Fullscreen exclusive
 DirectDraw had never been run. Colour-key and mirror blits also fell back
 to the CPU. This page covers both: the cause, the fix, the evidence and
@@ -13,7 +13,7 @@ egl-headless patch, and virglrenderer 1.3.0. The evidence is in
 
 | Item | Before | After |
 | --- | --- | --- |
-| Colour-key blits (`DDBLT_KEYSRC`) | The HAL reports no `DDCKEYCAPS_SRCBLT`, so DirectDraw emulates them on the CPU through `Lock`. 50 blits of 128×128 take 440 to 460 ms on Nvidia1 | Drawn on the GPU by `patches/mesa/0035`. The HAL reports `DDCAPS_COLORKEY` and `DDCKEYCAPS_SRCBLT`. 50 blits take 1.4 to 10.4 ms, including the final readback |
+| Colour-key blits (`DDBLT_KEYSRC`) | The HAL reports no `DDCKEYCAPS_SRCBLT`, so DirectDraw emulates them on the CPU through `Lock`. 50 blits of 128×128 take 440 to 460 ms on Nvidia1 | Drawn on the GPU by `patches/mesa/d3d9-hardware-colour-key-and-mirror-blits.patch`. The HAL reports `DDCAPS_COLORKEY` and `DDCKEYCAPS_SRCBLT`. 50 blits take 1.4 to 10.4 ms, including the final readback |
 | Mirror blits (`DDBLTFX_MIRRORLEFTRIGHT`, `MIRRORUPDOWN`) | Not in the HAL's `dwFXCaps`, so emulated | Drawn on the GPU. The HAL reports `DDFXCAPS_BLTMIRRORLEFTRIGHT` and `BLTMIRRORUPDOWN` |
 | Pixel match with the emulation layer | — | Exact: 13 cases × 3 formats, x64 and x86, on Nvidia1 and AMD1 (`ddblit`) |
 | `ddcaps` (0012 to 0014) | Pass | Pass, with the colour-key and mirror steps now `"hal": true` |
@@ -72,7 +72,7 @@ each destination pixel took, for the odd ratio, on both paths.
 of a lab kept by `tests/e2e/run.sh --keep`. It takes a console screenshot
 every 2 s. `WIN3D_TRACE=1` turns on the D3D9 UMD trace for the run.
 
-## Colour-key and mirror blits: `patches/mesa/0035`
+## Colour-key and mirror blits: `patches/mesa/d3d9-hardware-colour-key-and-mirror-blits.patch`
 
 ### Cause
 

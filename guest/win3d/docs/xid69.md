@@ -3,7 +3,7 @@
 The DirectX SDK (June 2010) D3D9 `BasicHLSL` sample hung the Windows guest on
 both RTX 5090s, and each time the host kernel logged an Xid 69. This page
 names the trigger, gives the evidence and records the fix,
-`patches/mesa/0022-yttrium-render-shadow-for-linear-colour-with-depth.patch`.
+`patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`.
 Investigated on 2026-10-18 on helios: NVIDIA 610.57.04, vmlab 0.28.0-alpha,
 QEMU 11.1.1 with the egl-headless patch, virglrenderer 1.3.0. Evidence is in
 [docs/evidence/xid69/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/xid69/).
@@ -14,7 +14,7 @@ QEMU 11.1.1 with the egl-headless patch, virglrenderer 1.3.0. Evidence is in
 | --- | --- |
 | Trigger | A render pass that has a **LINEAR colour attachment and a depth attachment**. NVIDIA advertises no `COLOR_ATTACHMENT` feature for LINEAR images of any format. Yttrium renders straight into the shared back buffer, which is LINEAR. Without depth, the GPU tolerates this. With depth, the first draw raises the Xid |
 | Owner | Our guest UMD: the Yttrium venus2 winsys (upstream `arehnman/virtio-win-mesa`). It uses a format feature that the driver does not advertise. NVIDIA shares some blame: `vkGetPhysicalDeviceImageFormatProperties` accepts LINEAR with `COLOR_ATTACHMENT` usage, so its two queries disagree |
-| Fix | `patches/mesa/0022`: such passes render into an OPTIMAL shadow image of the target, and the draw copies the target into the shadow before the pass and back after it. AMD, Intel and depth-less draws are unchanged |
+| Fix | `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`: such passes render into an OPTIMAL shadow image of the target, and the draw copies the target into the shadow before the pass and back after it. AMD, Intel and depth-less draws are unchanged |
 | BasicHLSL on Nvidia1 | Runs, with no hang and no Xid. **The `tiny` model renders black**, and so does the disc in `ParallaxOcclusionMapping`. This is a separate NVIDIA texture defect, not investigated ([open items](#open-items)) |
 | BasicHLSL on AMD1 | Unchanged, renders as before |
 | Probes | See [Proof](#proof) |
@@ -87,7 +87,7 @@ depth. The hardware renders into a pitch-linear target as long as no Z
 buffer is bound, so they work. Any D3D9 or DXGI application that draws with a
 depth buffer into its back buffer hits the Xid on NVIDIA. Most 3D games do.
 
-## The fix: `patches/mesa/0022`
+## The fix: `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`
 
 The patch changes `yttrium_venus2_impl.c`, `yttrium_venus2_batch.c`,
 `yttrium_venus2_resource.c`, `yttrium_venus.h` and `yttrium_venus2_private.h`.
@@ -153,7 +153,7 @@ to it. The small drop on Nvidia1 was not investigated.
 ## Open items
 
 - **Textured meshes rendered black on NVIDIA.** Fixed by
-  `patches/mesa/0023`. With 0022 alone, BasicHLSL's `tiny` and
+  `patches/mesa/yttrium-shared-colour-optimal-when-linear-refused.patch`. With 0022 alone, BasicHLSL's `tiny` and
   ParallaxOcclusionMapping's disc rendered as black silhouettes on Nvidia1.
   The cause was not the shadow pass. Every mipmapped D3D9 colour texture
   outside the system-memory pools was a LINEAR image, and NVIDIA allows

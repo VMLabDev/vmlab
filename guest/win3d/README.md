@@ -34,11 +34,11 @@ off.
   console, and dxdiag reports hardware acceleration
   ([acceptance](docs/acceptance.md)).
 - **Also verified on Intel.** The same checks pass on an Intel Iris Xe host
-  (ANV) with `patches/mesa/0021` ([zeus](docs/zeus.md)).
+  (ANV) with `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` ([zeus](docs/zeus.md)).
 - **Also verified on NVIDIA.** On an RTX 5090 the same checks pass on
   `windows-11` and `windows-10` in the historical QEMU acceptance runs ([nvidia](docs/nvidia.md),
   [acceptance](docs/acceptance.md#nvidia-rtx-5090)), on both cards. The
-  DirectX SDK D3D9 samples render there too after `patches/mesa/0022` to
+  DirectX SDK D3D9 samples render there too after `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch` to
   `0025` ([xid69](docs/xid69.md), [nvtex](docs/nvtex.md); `0025` is upstream's own since the November base). On a laptop RTX 4060 (driver 615.71) Vulkan,
   D3D12 and OpenGL clients hang because Venus feedback writes never reach the
   guest; D3D9 and D3D11 work ([zeus](docs/zeus.md)).
