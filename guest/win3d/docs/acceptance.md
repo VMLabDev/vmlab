@@ -1018,7 +1018,7 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Draft card | Program and failures | Evidence and completion check |
 | --- | --- | --- |
 | Implement D3D9 cylindrical interpolation | `stateblock`, wrap setter and replay fix above | Draw across a coordinate seam with each wrap component set. Verify the driver interpolates across the seam and honors the flag after applying a state block. |
-| Support display rotation changes | `d3d9ex`, 2 / 2 | Lines 573 and 608. Restore the original orientation after a rotation and verify the reported orientation. |
+| Support display rotation changes | `d3d9ex`, 2 / 2 | Lines 573 and 608. The miniport accepts 180° and Windows reports the selected orientation and restores the original one. [Retest counts and rotation trace](acceptance/C356.md). |
 | Restore fullscreen notification and activation behavior | `d3d9ex`, 5 / 9 | Lines 2940–2961, 3007 and 3100. Check `WM_DISPLAYCHANGE` delivery and the foreground window across the fullscreen transition. [Retest counts and message traces](acceptance/C340.md). |
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
