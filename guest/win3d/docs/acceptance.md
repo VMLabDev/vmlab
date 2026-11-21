@@ -610,7 +610,7 @@ Every check prints `pass`, `fail` or `not-run`. `not-run` means that nothing
 was measured, and the note says why: the check was not selected, its program
 did not start, or what it needs was missing (no WebGL on the adapter, a
 download that failed, a guest that stopped answering). The probes only
-measure. The limits are in `tests/e2e/adapter/judge.py`, which writes
+measure. The limits are in `tests/e2e/adapter/checks/`. The judge writes
 `adapter/adapter.json` and `adapter/adapter.txt` in the evidence directory,
 next to each probe's JSON.
 
@@ -782,36 +782,8 @@ What the baseline says:
   but the tests release those devices without another call that reports
   it. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
   also ended the VM after 17 s with the "Too many open files" exit of B6.
-- B11. `present-rate` on Nvidia2 needs the bundle's render server (card
-  #325). The live run of [vblank.md](vblank.md) had 43 to 45 frames per
-  second on Nvidia2 at `35f40299` and at `f16e1372`, against 58.32 in the
-  table below, and took it for something merged after `d88304f2eab7`. No
-  commit lowered it. That run's work tree had the cargo-built `vmlab-hv`
-  binary in the place of the bundle's launcher, `bin/vmlab-hv`. The launcher
-  sets `RENDER_SERVER_EXEC_PATH` to the bundle's `libexec/virgl_render_server`.
-  Without it virglrenderer starts its build-time server, on helios the
-  distribution's `/usr/lib/virgl_render_server` (`virglrenderer 1.3.0-2.1`),
-  which does not have ../../patches/virglrenderer/0002: on NVIDIA's driver each
-  Venus fence then wakes up to 10 ms late ([n5.md](n5.md)). The runs of
-  2026-11-21 on Nvidia2, `tests/e2e/adapter.sh <lab> win <dir> pace` on a
-  lab kept from `tests/e2e/run.sh --template windows-11 --host-gpu Nvidia2
-  --keep` (12 of 12 Done checks, no Xid), each row one lab and one half
-  hour, the host's load average between 6 and 18:
 
-  | Commit, driver, vmlab-hv | Render server | Present rate (frames per second), one value a run |
-  | --- | --- | --- |
-  | `d88304f2eab7`, `100.6.101.58107`, vmlab-hv of that commit | `/usr/lib/virgl_render_server` | 42.03, 40.61, 41.32, 40.06, 47.19 |
-  | the same lab | the bundle's, through the launcher | 58.52, 56.71, 59.25 |
-  | `a5f30b83` (`next`), `100.6.101.58113`, vmlab-hv of that commit | the bundle's, through the launcher | 59.92, 59.42, 60.12, 60.11, 59.15, 59.91 |
-  | the same lab | `/usr/lib/virgl_render_server` | 42.07, 46.63, 48.14 |
-
-  So the limit stays 57.0, and at `next` the check passes on Nvidia2 with
-  the host's vblank ([vblank.md](vblank.md)) as it does on AMD1. With the
-  timer of `d88304f2eab7` one run of three was under the limit at 56.71, the
-  loaded-host case of B4. RADV does not show the difference, which is why
-  AMD1 ran at 60 in the same work tree. `tests/e2e/run.sh` now writes
-  `render-server.txt`, the binary of the VM's vmlab-hv and the render server
-  it started, and warns when the server is not the one beside that binary.
+See the [acceptance notes](acceptance/) for card-specific results and follow-ups.
 
 <!-- e2e:adapter -->
 ### windows-11

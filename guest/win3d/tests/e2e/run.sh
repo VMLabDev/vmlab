@@ -209,7 +209,7 @@ render_server() {
     # has patches/virglrenderer. A vmlab-hv run without the launcher starts
     # virglrenderer's build-time server, the distribution's: on NVIDIA that one
     # signals every Venus fence up to 10 ms late, and a vsynced present runs at
-    # about 44 frames per second instead of 60 (docs/acceptance.md, B11).
+    # about 44 frames per second instead of 60 (docs/acceptance/C325.md).
     local pid exe child server=
     pid=$(pgrep -f "vmlab-hv --machine .*/labs/$LAB/vms/$VM/" | head -1)
     [ -n "$pid" ] || return 0
@@ -225,7 +225,7 @@ render_server() {
     } >"$EV/render-server.txt"
     [ -n "$exe" ] && [ -n "$server" ] || return 0
     [ "$(dirname "$server")" = "$(dirname "$exe")" ] ||
-        note "WARNING: vmlab-hv ($exe) started the render server $server, not its bundle's; NVIDIA present rates will be low (docs/acceptance.md, B11)"
+        note "WARNING: vmlab-hv ($exe) started the render server $server, not its bundle's; NVIDIA present rates will be low (docs/acceptance/C325.md)"
 }
 
 prepare_guest() {
