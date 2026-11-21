@@ -2208,7 +2208,8 @@ async fn offline_snapshot_writes_exclude_start_on_both_machine_kinds() {
                 .unwrap_or_else(|_| panic!("{op} did not reach the image tool"))
                 .unwrap();
 
-            let start = tokio::time::timeout(SETTLE, machine.clone().start(lab.clone(), None)).await;
+            let start =
+                tokio::time::timeout(SETTLE, machine.clone().start(lab.clone(), None)).await;
             release.send(()).unwrap();
             work.await.unwrap().unwrap();
             let error = start
