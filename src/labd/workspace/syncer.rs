@@ -1776,6 +1776,19 @@ async fn pass(
                 .cloned(),
         );
     }
+    // A refused rule file is said like a skip and decided like any other
+    // path: the link is still a sync object, and only its reading as rules
+    // was declined. Left out of `undecided`, so it never holds a pass open.
+    for refusal in &scan.refused_rules {
+        events.emit(
+            "workspace.skipped",
+            json!({"machine": workspace.machine, "path": refusal.path, "reason": refusal.why}),
+        );
+    }
+    let skipped: Vec<Skip> = skipped
+        .into_iter()
+        .chain(scan.refused_rules.iter().cloned())
+        .collect();
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
@@ -2249,7 +2262,7 @@ async fn reconverge(
             }),
         );
     }
-    for skip in &done.skipped {
+    for skip in done.skipped.iter().chain(done.refused_rules.iter()) {
         events.emit(
             "workspace.skipped",
             json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
@@ -2299,7 +2312,12 @@ async fn reconverge(
         // two sides were disagreeing about before it is not a disagreement any
         // more. There is nothing left for a developer to resolve.
         halt: None,
-        skipped: done.skipped.into_iter().take(REPORTED).collect(),
+        skipped: done
+            .skipped
+            .into_iter()
+            .chain(done.refused_rules)
+            .take(REPORTED)
+            .collect(),
         oversize: done.oversize,
         ..Report::default()
     })
@@ -5069,5 +5087,71 @@ mod tests {
             .before_restore("dev01", false, Some(&ws))
             .await
             .unwrap();
+    }
+
+    /// A rule file is read by the host, and a symlink syncs guest to host
+    /// verbatim — so a guest that plants `.vmlabignore` as a link to a host
+    /// file must never get that file's lines back as a prune list (review
+    /// labd-sync F2). The link itself stays a sync object. Its rules are
+    /// refused, and the pass says so by name.
+    #[tokio::test]
+    async fn a_symlinked_rule_file_is_never_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "hunter2-token\nsecond/line\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        guest.put(
+            "/src/.vmlabignore",
+            Node::Symlink(secret.display().to_string()),
+            5,
+        );
+        sessions.watcher.mark(".vmlabignore");
+        let link = dir.path().join(".vmlabignore");
+        let landed = {
+            let link = link.clone();
+            eventually(move || link.symlink_metadata().is_ok()).await
+        };
+        assert!(landed, "the link is a sync object and still crosses");
+        assert_eq!(std::fs::read_link(&link).unwrap(), secret);
+
+        // Two host scans with the link in place: the one that would read it,
+        // and the one after any watch reopen that reading it would cause.
+        syncer.pass_now().await.unwrap();
+        let report = syncer.pass_now().await.unwrap();
+        let named = {
+            let syncer = syncer.clone();
+            eventually(move || {
+                syncer
+                    .report()
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.path == ".vmlabignore" && skip.why.contains("symlink"))
+            })
+            .await
+        };
+        let opens = sessions.opens();
+        syncers.stop("dev01").await;
+
+        for prune in &opens {
+            for prefix in prune {
+                assert!(
+                    prefix != "hunter2-token" && prefix != "second/line",
+                    "a line of a host file outside the workspace reached the guest: {opens:?}"
+                );
+            }
+        }
+        assert!(
+            named,
+            "the refused rule file is named: {:?}",
+            report.skipped
+        );
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        assert!(report.trouble.is_none(), "{:?}", report.trouble);
     }
 }

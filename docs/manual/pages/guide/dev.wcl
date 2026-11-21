@@ -226,7 +226,11 @@ a local cert or `appsettings.Development.json` that the app needs guest-side
 takes a negation. Precedence is git's own, deepest file first, `.vmlabignore`
 beating `.gitignore` in one directory, and a path under an ignored directory
 staying ignored. The floor covers the syncer's own scratch names and
-`.git/**/*.lock`, and no repo rule may override it.
+`.git/**/*.lock`, and no repo rule may override it. A `.gitignore` or
+`.vmlabignore` that is a symlink is never read as rules, wherever it points:
+the link syncs as a link, its rules do not apply, and `vmlab dev sync status`
+names it among the skipped paths. Make it a regular file to have its rules
+apply.
 DOC
 
   p <<'DOC'
