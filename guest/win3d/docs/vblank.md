@@ -120,8 +120,9 @@ frame clock" in each lab. The three values in a cell are the three runs.
 | --- | --- | --- | --- | --- |
 | AMD1, host vblank (`0012`) | 16.667, 16.667, 16.665 | 15.76, 16.50, 16.47 | 17.88, 16.81, 16.87 | 60.23, 60.21, 60.21 |
 | AMD1, timer, the baseline of [acceptance.md](acceptance.md) (2026-11-20, one run) | 16.661 | 15.87 | 17.18 | 56.54 |
-| Nvidia2, host vblank (`0012`) | 16.662, 16.662, 16.667 | 16.15, 15.13, 16.32 | 17.14, 17.30, 17.01 | 43.92, 43.84, 43.45 |
-| Nvidia2, timer: driver `58112` of commit `f16e1372`, the same vmlab-hv, the same hour | 16.652, 16.647, 16.651 | 15.25, 15.28, 15.68 | 17.61, 17.97, 17.30 | 43.37, 44.77, 43.80 |
+| Nvidia2, host vblank (`0012`), the distribution's render server (see below) | 16.662, 16.662, 16.667 | 16.15, 15.13, 16.32 | 17.14, 17.30, 17.01 | 43.92, 43.84, 43.45 |
+| Nvidia2, timer: driver `58112` of commit `f16e1372`, the same vmlab-hv, the same hour, the distribution's render server | 16.652, 16.647, 16.651 | 15.25, 15.28, 15.68 | 17.61, 17.97, 17.30 | 43.37, 44.77, 43.80 |
+| Nvidia2, host vblank (`0012`), the bundle's render server: commit `a5f30b83`, the run of card #325 | 16.665, 16.666, 16.662 | 16.09, 16.26, 15.95 | 17.07, 17.07, 17.23 | 59.92, 59.42, 60.12 |
 
 - The mode is 60 Hz, 16.667 ms. With the host's vblank the mean interval is
   the period on both GPUs, and its spread is smaller than with the timer:
@@ -129,11 +130,15 @@ frame clock" in each lab. The three values in a cell are the three runs.
   0.76 ms.
 - On AMD1 a vsynced present ran at the refresh rate, 597 presents in 597
   refreshes in each run. The baseline with the timer had 563 in 599.
-- On Nvidia2 the present rate fails the suite's limit (57.0) with and
-  without `0012`. The driver of `f16e1372`, which has no `0012`, gave the
-  same 43 to 45 frames per second in the same hour. So this is not the
-  vblank. The baseline of acceptance.md had 58.32 on 2026-11-20 at commit
-  `d88304f2`: something merged since lowered it, and it is not found yet.
+- On Nvidia2 the first two rows fail the suite's limit (57.0) with and
+  without `0012`, at 43 to 45 frames per second. That was the work tree of
+  the run, not the driver and not a merge: its `bin/vmlab-hv` was the
+  binary in place of the bundle's launcher, so vmlab-hv started the
+  distribution's render server, which lacks ../../patches/virglrenderer/0002
+  ([acceptance.md](acceptance.md), B11). The third row is the same driver
+  and vmlab-hv code through the launcher, on 2026-11-21: 594, 589 and 596
+  presents in 596, 594 and 596 refreshes, and a second set of runs on that
+  lab gave 60.11, 59.15 and 59.91. The AMD1 rows do not depend on it.
 - `scan-line` fails as before: `GetScanLine` is not implemented.
 
 A first form of `0012` raised the vsync of a tick with a flip at the host's
