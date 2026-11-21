@@ -310,15 +310,18 @@ async fn read_loop(
                                 w,
                                 h,
                                 rgba,
-                            } => c.cursor(
-                                at,
-                                CursorShape {
+                            } => {
+                                let shape = CursorShape {
                                     hotspot,
                                     width: w,
                                     height: h,
                                     rgba,
-                                },
-                            ),
+                                };
+                                match &client {
+                                    Stream::Vnc(_) => c.rfb_cursor(at, shape),
+                                    Stream::Native(_) => c.cursor(at, shape),
+                                }
+                            }
                             StreamEvent::Pointer { x, y, visible } => {
                                 c.pointer_state(at, i64::from(x), i64::from(y), visible)
                             }
