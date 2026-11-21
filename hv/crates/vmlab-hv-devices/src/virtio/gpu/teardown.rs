@@ -89,7 +89,13 @@ impl Workers {
 pub(super) mod tests {
     use super::*;
 
-    pub(in super::super) fn proc_entry(proc: &Path, pid: u32, state: char, parent: u32, start: u64) {
+    pub(in super::super) fn proc_entry(
+        proc: &Path,
+        pid: u32,
+        state: char,
+        parent: u32,
+        start: u64,
+    ) {
         let dir = proc.join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -100,10 +106,8 @@ pub(super) mod tests {
     }
 
     pub(in super::super) fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vmlab-gpu-teardown-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vmlab-gpu-teardown-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

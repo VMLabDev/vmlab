@@ -602,6 +602,7 @@ fn a_lost_host_gpu_answers_every_fence_the_device_holds() {
 fn a_reset_is_acknowledged_only_after_the_render_workers_have_exited() {
     use crate::PciDevice;
     use crate::virtio::pci::VirtioPciDevice;
+    use crate::virtio::pci::device_status::DEVICE_NEEDS_RESET;
     use std::time::{Duration, Instant};
     use teardown::tests::{proc_entry, scratch};
 
@@ -642,9 +643,9 @@ fn a_reset_is_acknowledged_only_after_the_render_workers_have_exited() {
     worker(Duration::from_millis(20));
     pci.bar_write(4, 0x14, &[1]);
     pci.bar_write(4, 0x14, &[0]);
-    assert_eq!(status(&mut pci), crate::virtio::pci::device_status::DEVICE_NEEDS_RESET);
+    assert_eq!(status(&mut pci), DEVICE_NEEDS_RESET);
     pci.bar_write(4, 0x14, &[1]);
-    assert_eq!(status(&mut pci), crate::virtio::pci::device_status::DEVICE_NEEDS_RESET);
+    assert_eq!(status(&mut pci), DEVICE_NEEDS_RESET);
     assert!(gpu.state.lock().unsettled);
 
     // It exits later: the next read finishes the reset.
