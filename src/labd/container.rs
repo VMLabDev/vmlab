@@ -1156,7 +1156,10 @@ impl ContainerInstance {
         let snapshots = self.capability(|c| c.snapshots()).await?;
         let control = self.running_control().await?;
         control.pause().await?;
-        snapshots.load(name, "scratch", &["scratch"]).await?;
+        if let Err(error) = snapshots.load(name, "scratch", &["scratch"]).await {
+            let resume = control.resume().await;
+            return Err(error.context(format!("snapshot load failed, resume: {resume:?}")));
+        }
         // Drop the agent connection BEFORE resuming: the rewound guest
         // replays virtio-serial response bytes the host already consumed.
         // With no client attached, QEMU discards the replayed bytes; the
