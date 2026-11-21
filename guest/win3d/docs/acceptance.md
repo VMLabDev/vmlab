@@ -911,6 +911,29 @@ enabled and `ortho_fog = 0`.
 
 The remaining failure messages matched the baseline on each GPU.
 
+#### C338 — D3D9 point drawing
+
+Constant zero-size points leave the clear color intact. For a point draw
+whose vertex declaration puts PSIZE on an unbound stream, the driver
+supplies a size of one pixel.
+[Mesa patch](../patches/mesa/d3d9-suppress-zero-size-points-and-default-unbound-psize.patch).
+
+Wine 11.0's `d3d9_visual` ran on helios with Windows 11 template
+`26100.1742.11#win3d` and the signed package from `343571b7`. The AMD1
+run completed 206,068 checks with 31 skips.
+
+| Failed assertions | AMD1 card #253 → C338 |
+| --- | ---: |
+| `visual.c:11460` — size-one draw rejected | 7 → 0 |
+| `visual.c:11490` — zero-size point changes the clear color | 10 → 0 |
+| `visual.c:11498` — size-one point leaves the clear color | 7 → 0 |
+| Full program | 343 → 125 |
+
+Card #339 had already cleared the two size-one groups on both GPUs.
+The 125 remaining messages on AMD1 matched the failures common to the
+table-fog and unbound-stream runs, after removing the ten zero-size
+failures. Only `d3d9_visual` was run for C338.
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -928,8 +951,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
 | Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
-| Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
-| Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |
