@@ -102,7 +102,8 @@ struct Handle {
 
 enum HandleKind {
     File {
-        file: File,
+        // A restored handle keeps its ID even when its file cannot be reopened.
+        file: Option<File>,
         flags: i32,
         /// Path under the root at open time, for the snapshot.
         path: PathBuf,
@@ -233,7 +234,7 @@ impl PassthroughFs {
     /// every inode is re-walked from the root, every file handle reopened at
     /// its recorded path (creation flags stripped), every directory handle
     /// reset to its start. A missing path becomes a dead inode; an open file
-    /// that vanished reopens on `/dev/null` and answers `ESTALE`.
+    /// that vanished keeps its handle ID and answers `ESTALE` on I/O.
     pub fn restore_state(&self, state: &[u8]) -> io::Result<()> {
         let err = || io::Error::new(io::ErrorKind::InvalidData, "bad passthrough state");
         if state.len() < 10 || u32::from_le_bytes(state[0..4].try_into().unwrap()) != MAGIC {
@@ -365,10 +366,9 @@ impl PassthroughFs {
                     let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
                     let path = PathBuf::from(OsStr::from_bytes(take(len)?));
                     let file = if inode.dead {
-                        // Nothing to reopen; I/O on it must fail loudly.
-                        reopen_dead()?
+                        None
                     } else {
-                        reopen(&inode.fd, flags).unwrap_or_else(|_| reopen_dead().unwrap())
+                        reopen(&inode.fd, flags).ok()
                     };
                     HandleKind::File { file, flags, path }
                 }
@@ -474,7 +474,9 @@ impl FileSystem for PassthroughFs {
             && let Some(open) = session.handles.get(&handle)
             && let HandleKind::File { file, .. } = &open.kind
         {
-            file.as_raw_fd()
+            file.as_ref()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+                .as_raw_fd()
         } else {
             live_inode(&session, inode)?.fd.as_raw_fd()
         };
@@ -1196,7 +1198,11 @@ impl Session {
             handle,
             Handle {
                 ino,
-                kind: HandleKind::File { file, flags, path },
+                kind: HandleKind::File {
+                    file: Some(file),
+                    flags,
+                    path,
+                },
             },
         );
         *self.handles_by_inode.entry(ino).or_default() += 1;
@@ -1231,9 +1237,12 @@ impl Session {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
         match &open.kind {
-            HandleKind::File { file, .. } => file
+            HandleKind::File {
+                file: Some(file), ..
+            } => file
                 .try_clone()
                 .map_err(|e| io::Error::new(e.kind(), format!("reopening for I/O: {e}"))),
+            HandleKind::File { file: None, .. } => Err(io::Error::from_raw_os_error(libc::ESTALE)),
             HandleKind::Dir { .. } => Err(io::Error::from_raw_os_error(libc::EISDIR)),
         }
     }
@@ -1379,21 +1388,6 @@ fn reopen(path_fd: &OwnedFd, flags: i32) -> io::Result<File> {
         .expect("proc path has no NUL");
     // SAFETY: `path` is NUL-terminated; the fd is owned from return.
     let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the fd is fresh and owned from the open above.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-/// A stand-in descriptor for an open file whose path died before a
-/// restore: reads and writes must fail, and nothing may share data with
-/// the guest.
-fn reopen_dead() -> io::Result<File> {
-    let path = b"/dev/null\0";
-    // SAFETY: `path` is a NUL-terminated literal; the fd is owned from
-    // return.
-    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -2508,6 +2502,59 @@ mod tests {
         // The root survives.
         let entry = lookup(&fs2, b"sub").unwrap();
         assert!(entry.attr.st_mode & libc::S_IFMT == libc::S_IFDIR);
+    }
+
+    #[test]
+    fn restored_handle_on_a_vanished_file_fails_io() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"hello.txt").unwrap();
+        let (handle, _, _) =
+            FileSystem::open(&fs, &ctx(), entry.inode, libc::O_RDWR as u32, 0).unwrap();
+        let handle = handle.unwrap();
+        let state = fs.save_state();
+        std::fs::remove_file(dir.path().join("hello.txt")).unwrap();
+
+        let restored = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        restored.restore_state(&state).unwrap();
+        let data = b"lost write";
+        let write = FileSystem::write(
+            &restored,
+            &ctx(),
+            entry.inode,
+            handle,
+            &mut SliceReader(data),
+            data.len() as u32,
+            0,
+            None,
+            false,
+            0,
+            0,
+        );
+        assert_eq!(
+            write.map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESTALE))
+        );
+        let mut served = Vec::new();
+        let read = FileSystem::read(
+            &restored,
+            &ctx(),
+            entry.inode,
+            handle,
+            &mut SinkWriter(&mut served),
+            1,
+            0,
+            None,
+            0,
+        );
+        assert_eq!(
+            read.map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESTALE))
+        );
+        let sync = FileSystem::fsync(&restored, &ctx(), entry.inode, false, handle);
+        assert_eq!(
+            sync.map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESTALE))
+        );
     }
 
     #[test]
