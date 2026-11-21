@@ -19,6 +19,25 @@ Start with [install](install.md) to build and use the package. Read
 [stack](stack.md) to see what it installs, and [known limits](known-limits.md)
 before you rely on it.
 
+## Add a patch, check, or acceptance note
+
+- Append each independent patch filename on its own line to its component's
+  `series`. Merge prerequisite patches first when application order matters.
+- Add a Bash runner and a Python judge under `tests/e2e/adapter/checks/` with
+  the same filename stem, starting with a numeric run position and a unique
+  name. Files run in filename order. The Bash file defines `check_<name>`
+  (using underscores for hyphens) and appends its public name to `ALL`.
+  The Python file defines `judge(report)` and adds verdicts through `report.row`.
+- Record card-specific acceptance evidence in its own file under
+  [acceptance/](acceptance/). Use the card number as the filename and heading
+  prefix, for example `C328.md` and `# C328. <title>`. Existing B notes
+  in the baseline are historical references.
+- Add independently mergeable Mesa patch descriptions as single rows in the
+  [Mesa fixes table](../build/mesa/fixes.md). The patch inventory in the
+  [stack guide](stack.md#patches) is printed from the series and patch headers.
+  When a component pin changes, update its `PINS` and regenerate the guide's
+  pin table with `scripts/pins-table.py --write`.
+
 ## Quick start
 
 On a Linux host with Docker (no sudo), vmlab 0.25.0-alpha or later, the

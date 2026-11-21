@@ -610,7 +610,7 @@ Every check prints `pass`, `fail` or `not-run`. `not-run` means that nothing
 was measured, and the note says why: the check was not selected, its program
 did not start, or what it needs was missing (no WebGL on the adapter, a
 download that failed, a guest that stopped answering). The probes only
-measure. The limits are in `tests/e2e/adapter/judge.py`, which writes
+measure. The limits are in `tests/e2e/adapter/checks/`. The judge writes
 `adapter/adapter.json` and `adapter/adapter.txt` in the evidence directory,
 next to each probe's JSON.
 
@@ -782,36 +782,8 @@ What the baseline says:
   but the tests release those devices without another call that reports
   it. Before the fix, with the vmlab-hv bundle of 2026-11-19, `d3d10core`
   also ended the VM after 17 s with the "Too many open files" exit of B6.
-- B11. `present-rate` on Nvidia2 needs the bundle's render server (card
-  #325). The live run of [vblank.md](vblank.md) had 43 to 45 frames per
-  second on Nvidia2 at `35f40299` and at `f16e1372`, against 58.32 in the
-  table below, and took it for something merged after `d88304f2eab7`. No
-  commit lowered it. That run's work tree had the cargo-built `vmlab-hv`
-  binary in the place of the bundle's launcher, `bin/vmlab-hv`. The launcher
-  sets `RENDER_SERVER_EXEC_PATH` to the bundle's `libexec/virgl_render_server`.
-  Without it virglrenderer starts its build-time server, on helios the
-  distribution's `/usr/lib/virgl_render_server` (`virglrenderer 1.3.0-2.1`),
-  which does not have ../../patches/virglrenderer/0002: on NVIDIA's driver each
-  Venus fence then wakes up to 10 ms late ([n5.md](n5.md)). The runs of
-  2026-11-21 on Nvidia2, `tests/e2e/adapter.sh <lab> win <dir> pace` on a
-  lab kept from `tests/e2e/run.sh --template windows-11 --host-gpu Nvidia2
-  --keep` (12 of 12 Done checks, no Xid), each row one lab and one half
-  hour, the host's load average between 6 and 18:
 
-  | Commit, driver, vmlab-hv | Render server | Present rate (frames per second), one value a run |
-  | --- | --- | --- |
-  | `d88304f2eab7`, `100.6.101.58107`, vmlab-hv of that commit | `/usr/lib/virgl_render_server` | 42.03, 40.61, 41.32, 40.06, 47.19 |
-  | the same lab | the bundle's, through the launcher | 58.52, 56.71, 59.25 |
-  | `a5f30b83` (`next`), `100.6.101.58113`, vmlab-hv of that commit | the bundle's, through the launcher | 59.92, 59.42, 60.12, 60.11, 59.15, 59.91 |
-  | the same lab | `/usr/lib/virgl_render_server` | 42.07, 46.63, 48.14 |
-
-  So the limit stays 57.0, and at `next` the check passes on Nvidia2 with
-  the host's vblank ([vblank.md](vblank.md)) as it does on AMD1. With the
-  timer of `d88304f2eab7` one run of three was under the limit at 56.71, the
-  loaded-host case of B4. RADV does not show the difference, which is why
-  AMD1 ran at 60 in the same work tree. `tests/e2e/run.sh` now writes
-  `render-server.txt`, the binary of the VM's vmlab-hv and the render server
-  it started, and warns when the server is not the one beside that binary.
+See the [acceptance notes](acceptance/) for card-specific results and follow-ups.
 
 <!-- e2e:adapter -->
 ### windows-11
@@ -906,6 +878,39 @@ The standalone `visual` run on AMD1 reported the same 343 failures in
 206,068 checks. The test session used a soft open-file limit of 65,536
 after an earlier attempt exhausted the default limit of 1,024.
 
+The [unbound vertex stream patch](../patches/mesa/d3d9-default-inputs-for-unbound-streams.patch)
+uses the existing zero input when a vertex declaration names a stream
+with no bound source. Wine's `visual` ran 206,068 checks with 31 skips on
+each GPU on Windows 11 template `26100.1742.11#win3d`. Failures fell from
+343 to 303 on AMD1 and from 345 to 305 on Nvidia2. All 14 fixed-function
+draw and color readback failures at lines 25308 and 25313 and all 12
+missing attribute draw and readback failures at lines 27740 and 27745
+cleared on both GPUs. The 14 size-one point failures at lines 11460
+and 11498 also cleared. No new assertions failed. The Win3D end-to-end
+run on the prepared AMD1 clone passed all 12 Done checks.
+
+#### Table fog (card #335)
+
+Table fog selects screen Z when the runtime reports `(1, 1)` through
+`UpdateWInfo`. Equal non-unit endpoints still select W fog. The pixel
+shader recovers W from the rasterizer's reciprocal clip W for
+pre-transformed, fixed-function and programmable vertices.
+[Mesa patch](../patches/mesa/d3d9-select-table-fog-from-w-info.patch).
+
+On helios, Wine 11.0's `d3d9_visual` ran 206,068 checks with 31 skips per
+GPU on Windows 11 template `26100.1742.11` using the signed package from
+`ab2afacc`. The targeted assertions are at `visual.c:28481` with table fog
+enabled and `ortho_fog = 0`.
+
+| D3D9 visual failures | AMD1 before → after | Nvidia2 before → after |
+| --- | --- | --- |
+| Pre-transformed vertices, reciprocal RHW (`vs_mode = 0`) | 48 → 0 | 48 → 0 |
+| Fixed-function transformed W (`vs_mode = 1`) | 48 → 0 | 48 → 0 |
+| Shader output W, with and without explicit fog (`vs_mode = 2` or `3`) | 72 → 0 | 72 → 0 |
+| Full program | 343 → 175 | 345 → 177 |
+
+The remaining failure messages matched the baseline on each GPU.
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -920,16 +925,11 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Use reciprocal RHW for perspective table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 0`. Check fog uses W recovered from the pre-transformed vertex. |
-| Use transformed W for fixed-function table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 1`. Check fog uses the W produced by the fixed-function transform. |
-| Use shader output W for perspective table fog | `visual`, 72 / 72 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 2` or `3`. Check fog uses shader output W with and without an explicit fog output. |
 | Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
 | Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
 | Suppress zero-size points | `visual`, 10 / 10 | Line 11490. Test 3 should retain the clear color at the point center. |
 | Draw size-one points with the tested vertex declaration | `visual`, 14 / 14 | Lines 11460 and 11498. Seven rejected draws leave the clear color unchanged in test 10. |
-| Draw with the tested fixed-function vertex color declarations | `visual`, 14 / 14 | Lines 25308 and 25313, tests 13–19. Fix the draw errors and check diffuse and specular color readback. |
-| Supply default vertex attribute components | `visual`, 12 / 12 | Lines 27740 and 27745. Vertex shader cases 2 and 5 fail the draw and leave a red pixel in all three pixel shader cases. |
 | Preserve dynamic buffer contents across discard and no-overwrite | `visual`, 3 / 3 | Lines 25148 and 26917. Investigate the two map-synchronization failures and the red pixel in the dynamic map draw. |
 | Report the expected YUY2 format conversions | `visual`, 2 / 2 | Line 28024 rejects YUY2 to X8R8G8B8 and R5G6B5. Check the format-conversion query for both destinations. |
 | Match Nvidia2 ATI1 Fetch4 sampling | `visual`, 0 / 2 | Line 15668 reports two ATI1 readback mismatches in the fixed-function and `texld` cases. Compare the sampled red channel against the test's accepted values. |

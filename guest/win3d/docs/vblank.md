@@ -152,7 +152,7 @@ frame clock" in each lab. The three values in a cell are the three runs.
   the run, not the driver and not a merge: its `bin/vmlab-hv` was the
   binary in place of the bundle's launcher, so vmlab-hv started the
   distribution's render server, which lacks ../../patches/virglrenderer/0002
-  ([acceptance.md](acceptance.md), B11). The third row is the same driver
+  ([acceptance note C325](acceptance/C325.md)). The third row is the same driver
   and vmlab-hv code through the launcher, on 2026-11-21: 594, 589 and 596
   presents in 596, 594 and 596 refreshes, and a second set of runs on that
   lab gave 60.11, 59.15 and 59.91. The AMD1 rows do not depend on it.
