@@ -670,20 +670,20 @@ impl Block {
         if end > self.disk.size() {
             return S_IOERR; // out of range
         }
-        if self.io_buffer.len() < data_len {
-            self.io_buffer.resize(data_len, 0);
+        // The range fits the image, which bounds the request but not the
+        // memory it would take whole: move it a piece at a time.
+        self.io_buffer.resize(data_len.min(IO_CHUNK), 0);
+        let mut done = 0;
+        while done < data_len {
+            let piece = &mut self.io_buffer[..(data_len - done).min(IO_CHUNK)];
+            if self.disk.read_at(offset + done as u64, piece).is_err()
+                || writer.write_all(piece).is_err()
+            {
+                return S_IOERR;
+            }
+            done += piece.len();
         }
-        if self
-            .disk
-            .read_at(offset, &mut self.io_buffer[..data_len])
-            .is_err()
-        {
-            return S_IOERR;
-        }
-        match writer.write_all(&self.io_buffer[..data_len]) {
-            Ok(()) => S_OK,
-            Err(_) => S_IOERR,
-        }
+        S_OK
     }
 
     /// `VIRTIO_BLK_T_OUT`: drain the driver-readable descriptors into the
@@ -700,26 +700,25 @@ impl Block {
         let Some(offset) = sector.checked_mul(SECTOR_SIZE) else {
             return S_IOERR;
         };
+        // Nothing is copied before the range check: the guest picks the
+        // length of the chain, and it may be far more than the image holds.
         let data_len = reader.available_bytes();
-        if self.io_buffer.len() < data_len {
-            self.io_buffer.resize(data_len, 0);
-        }
-        if reader.read_exact(&mut self.io_buffer[..data_len]).is_err() {
-            return S_IOERR;
-        }
-        if let Some(end) = offset.checked_add(data_len as u64) {
-            if end > self.disk.size() {
-                return S_IOERR; // out of range
-            }
-        } else {
-            return S_IOERR;
-        }
-        if self
-            .disk
-            .write_at(offset, &self.io_buffer[..data_len])
-            .is_err()
+        if !offset
+            .checked_add(data_len as u64)
+            .is_some_and(|end| end <= self.disk.size())
         {
-            return S_IOERR;
+            return S_IOERR; // out of range
+        }
+        self.io_buffer.resize(data_len.min(IO_CHUNK), 0);
+        let mut done = 0;
+        while done < data_len {
+            let piece = &mut self.io_buffer[..(data_len - done).min(IO_CHUNK)];
+            if reader.read_exact(piece).is_err()
+                || self.disk.write_at(offset + done as u64, piece).is_err()
+            {
+                return S_IOERR;
+            }
+            done += piece.len();
         }
         // The response consumes no writable bytes beyond the status.
         let _ = writer;

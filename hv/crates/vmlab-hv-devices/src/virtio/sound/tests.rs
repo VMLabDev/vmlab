@@ -809,6 +809,7 @@ fn pcm_info_with_a_huge_size_is_refused_or_bounded() {
     request.extend_from_slice(&2u32.to_le_bytes()); // count
     request.extend_from_slice(&0x1000_0000u32.to_le_bytes()); // size
     let response = g.device.lock().control(&request);
+    assert_eq!(response.len(), 4, "the reply is a bare status");
     assert_eq!(response, S_BAD_MSG.to_le_bytes());
     assert_eq!(g.control_status(&request), S_BAD_MSG);
 
