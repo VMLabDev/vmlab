@@ -3450,6 +3450,23 @@ impl LabRuntime {
         Ok(json!(results))
     }
 
+    /// Run daemon preflight for every machine before any rewind (PRD §7.3).
+    pub async fn restore_all(self: &Arc<Self>, snap: &str, discard: bool) -> Result<Vec<String>> {
+        let machines: Vec<_> = self.machines().collect();
+        for m in &machines {
+            let workspace = self.workspace_of(m.name());
+            self.check_restore(m.as_ref(), snap, discard, workspace.as_ref())
+                .await?;
+        }
+
+        let mut warnings = Vec::new();
+        for m in machines {
+            // Records and workspace halts can change while earlier machines restore.
+            warnings.extend(self.restore(m.name(), snap, discard).await?);
+        }
+        Ok(warnings)
+    }
+
     /// Roll one machine back to a snapshot (PRD §7.3; containers §18).
     ///
     /// The pin rule has one home: a record that names an artefact identity is
@@ -3481,59 +3498,10 @@ impl LabRuntime {
         let m = self
             .machine(name)
             .map_err(|_| missing_snapshot(name, snap))?;
-        let record = {
-            let state = self.state.lock().await;
-            let machine = state
-                .machines
-                .get(name)
-                .ok_or_else(|| missing_snapshot(name, snap))?;
-            if machine.pending_snapshots.contains(snap) {
-                bail!("{name}: snapshot {snap:?} is pending cleanup after an interrupted capture");
-            }
-            machine
-                .snapshots
-                .get(snap)
-                .cloned()
-                .ok_or_else(|| missing_snapshot(name, snap))?
-        };
-        // Online state is bound to its capture hypervisor, including when
-        // it is stored in a frozen generation.
-        if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
-            return Err(crate::proto::CommandError::conflict(why).into());
-        }
-        if let Some(g) = record.frozen_in {
-            return Err(
-                crate::proto::CommandError::conflict(super::worktree::locked_refusal(
-                    name,
-                    snap,
-                    g,
-                    "restoring",
-                ))
-                .into(),
-            );
-        }
-
         let workspace = self.workspace_of(name);
-        // Before anything is rolled back, and before the syncer is taken off
-        // the workspace: a refusal has to leave the machine exactly as it was.
-        self.workspaces
-            .before_restore(name, discard, workspace.as_ref())
+        let record = self
+            .check_restore(m.as_ref(), snap, discard, workspace.as_ref())
             .await?;
-        // The pin is compared after any deferred pull the machine's own
-        // restore performs, so bind the artefact first.
-        self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
-            .await?;
-        if let Some(want) = &record.image_digest {
-            let current = m.snapshot_pin();
-            if Some(want) != current.as_ref() {
-                bail!(
-                    "\"{name}\": snapshot \"{snap}\" was taken against {want}, but the pinned \
-                     artefact is now {} — destroy the machine (clearing its snapshots) or \
-                     restore the original pin",
-                    current.as_deref().unwrap_or("<not pulled>")
-                );
-            }
-        }
 
         // **Suspend first**, and it is load-bearing twice over. A pass already
         // scanning would otherwise be free to finish against a guest that gets
@@ -3555,7 +3523,7 @@ impl LabRuntime {
             self.usb_release_for(name, "restore").await;
         }
 
-        // **Every check that can refuse has already run**, so the note goes on
+        // **Daemon preflight has already run**, so the note goes on
         // before the rewind and stays on if the rewind fails. That ordering is
         // the bracket's whole safety argument: after this point nobody can
         // tell whether the guest was rolled back or not, and the two mistakes
@@ -3626,6 +3594,66 @@ impl LabRuntime {
         }
         self.events.emit("snapshot.restored", event);
         Ok(warnings)
+    }
+
+    async fn check_restore(
+        self: &Arc<Self>,
+        m: &dyn Machine,
+        snap: &str,
+        discard: bool,
+        workspace: Option<&crate::labd::workspace::Workspace>,
+    ) -> Result<SnapshotRecord> {
+        let name = m.name();
+        let record = {
+            let state = self.state.lock().await;
+            let machine = state
+                .machines
+                .get(name)
+                .ok_or_else(|| missing_snapshot(name, snap))?;
+            if machine.pending_snapshots.contains(snap) {
+                bail!("{name}: snapshot {snap:?} is pending cleanup after an interrupted capture");
+            }
+            machine
+                .snapshots
+                .get(snap)
+                .cloned()
+                .ok_or_else(|| missing_snapshot(name, snap))?
+        };
+        // Online state is bound to its capture hypervisor, including when
+        // it is stored in a frozen generation.
+        if let Some(why) = record.hypervisor_refusal(name, snap, m.hypervisor()) {
+            return Err(crate::proto::CommandError::conflict(why).into());
+        }
+        if let Some(g) = record.frozen_in {
+            return Err(
+                crate::proto::CommandError::conflict(super::worktree::locked_refusal(
+                    name,
+                    snap,
+                    g,
+                    "restoring",
+                ))
+                .into(),
+            );
+        }
+
+        self.workspaces
+            .before_restore(name, discard, workspace)
+            .await?;
+        // Bind any deferred artefact before comparing the snapshot pin.
+        self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
+            .await?;
+        if let Some(want) = &record.image_digest {
+            let current = m.snapshot_pin();
+            if Some(want) != current.as_ref() {
+                bail!(
+                    "\"{name}\": snapshot \"{snap}\" was taken against {want}, but the pinned \
+                     artefact is now {} — destroy the machine (clearing its snapshots) or \
+                     restore the original pin",
+                    current.as_deref().unwrap_or("<not pulled>")
+                );
+            }
+        }
+        Ok(record)
     }
 
     /// Bring a guest restored from an online snapshot back to the host's
