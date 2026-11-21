@@ -5097,7 +5097,11 @@ mod tests {
                 );
             }
         }
-        assert!(named, "the refused rule file is named: {:?}", report.skipped);
+        assert!(
+            named,
+            "the refused rule file is named: {:?}",
+            report.skipped
+        );
         assert!(report.halt.is_none(), "{:?}", report.halt);
         assert!(report.trouble.is_none(), "{:?}", report.trouble);
     }

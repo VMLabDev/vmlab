@@ -154,8 +154,8 @@ fn read_rule_file(file: &Path) -> std::io::Result<RuleFile> {
         Err(e) => {
             // `O_NOFOLLOW` answers a symlink with `ELOOP`: the name became a
             // link after the check above.
-            let now_a_link = std::fs::symlink_metadata(file)
-                .is_ok_and(|meta| meta.file_type().is_symlink());
+            let now_a_link =
+                std::fs::symlink_metadata(file).is_ok_and(|meta| meta.file_type().is_symlink());
             return if now_a_link {
                 Ok(RuleFile::Symlink)
             } else {
@@ -877,7 +877,11 @@ mod tests {
         assert_eq!(set.prune_list(&[]), vec!["target".to_string()]);
         assert_eq!(set.verdict("hunter2-token", true), Verdict::Synced);
         assert_eq!(set.verdict("web/in-tree-line", true), Verdict::Synced);
-        let refused: Vec<&str> = set.refused().iter().map(|(path, _)| path.as_str()).collect();
+        let refused: Vec<&str> = set
+            .refused()
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
         assert_eq!(refused, vec![".vmlabignore", "web/.gitignore"]);
         assert!(set.refused().iter().all(|(_, why)| why.contains("symlink")));
 
