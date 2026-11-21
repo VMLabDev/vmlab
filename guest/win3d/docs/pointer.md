@@ -72,17 +72,7 @@ pointer on vmlab-hv's native frame protocol (`display.sock`) and on RFB
 | `rfb` | RFB carries a cursor rectangle for each kind, and an empty one for hidden |
 | `outline` | The I-beam has only black and white opaque pixels, more white than black |
 | `frame` | At least three captures show the test window, and none has anything but the background where a step put the pointer |
-| `recording` | Frames of the video show a pointer at the position of every judged step but the hidden one, and none at the hidden step's position. The arrow steps are not judged (below) |
-
-**The arrow is missing from recordings.** This is a fault of vmlab's
-recorder, not of the driver. vmlab-hv sends the shape again with every move
-of the pointer. The recorder takes a repeated shape whose hotspot is (0,0)
-for QEMU announcing a stale shape again after a reset
-(`CursorShape::is_stale_resend_of` in `src/record/core.rs`) and hides the
-pointer. So a pointer with its hotspot at (0,0), which the standard arrow
-has, disappears from the video at its first move. The I-beam (hotspot 8,9)
-and the resize pointer (11,4) are drawn at the right place. The `recording`
-check leaves the arrow steps out and lists them in `steps_not_judged`.
+| `recording` | Frames of the video show a pointer at each visible step's position, including both arrow steps, and none at the hidden step's position |
 
 The viewer draws from the same frame protocol messages the `shapes` check
 reads. No check looks at a viewer window.
@@ -95,7 +85,8 @@ whether the pointer is in the frame
 
 ## Verification
 
-On 2026-11-20, on helios, vmlab-hv built from `next`, the package built at
+The 2026-11-20 recording check excluded both arrow steps. On helios, with
+vmlab-hv built from `next`, the package built at
 `de4169bd` (driver `100.6.101.58106`, `HWCursor` 1 in the class key), a fresh
 `windows-11` lab for each host GPU:
 
