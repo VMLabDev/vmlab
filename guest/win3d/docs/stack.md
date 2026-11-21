@@ -189,9 +189,9 @@ renderer, `vn_renderer_d3dkmt.c`, submits Venus commands to the KMD with
 
 The device appears as "Yttrium VirtIO GPU 3D controller" (upstream renamed
 it from "Hardsoft VirtIO GPU 3D controller" in the November release), driver
-version 100.6.101.58112. It is a WDDM 2.0 display miniport with Venus and blob
+version 100.6.101.58113. It is a WDDM 2.0 display miniport with Venus and blob
 resource support, a hardware pointer ([pointer.md](pointer.md)), a 60 Hz
-VidPN timer, and on vmlab-hv a flip that the host orders ([flip.md](flip.md)). It needs the
+VidPN timer (on vmlab-hv the host's frame clock, [vblank.md](vblank.md)), and on vmlab-hv a flip that the host orders ([flip.md](flip.md)). It needs the
 `VIRTIO_GPU_F_VIRGL` feature, so it fails to start on a plain `virtio-vga`.
 
 ### Device: virtio-gpu Venus in vmlab-hv
@@ -310,7 +310,7 @@ committed.
 | --- | --- | --- | --- | --- |
 | dxil-spirv | 0 | — | None; see [`patches/dxil-spirv/`](../patches/dxil-spirv/) | — |
 | dxvk | 1 | [`0001`](../patches/dxvk/0001-dxgi-Keep-the-swap-chain-description-when-a-resize-fails.patch) | dxgi: Keep the swap-chain description when a resize fails. | [`build/d3d12/README.md`](../build/d3d12/README.md) |
-| kmd | 11 | [`0001`](../patches/kmd/0001-kmd-r10-copy.patch) | Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD) | [`build/kmd/README.md`](../build/kmd/README.md) |
+| kmd | 12 | [`0001`](../patches/kmd/0001-kmd-r10-copy.patch) | Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD) | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0002`](../patches/kmd/0002-kmd-cache-gdi-shadow-and-staging-surfaces.patch) | viogpu3d: map GDI shadow and staging surfaces cached | [`docs/present.md`](present.md) |
 | | | [`0003`](../patches/kmd/0003-kmd-create-context-for-gdi-devices.patch) | viogpu3d: create a legacy context before opening GDI allocations | [`build/kmd/README.md`](../build/kmd/README.md) |
 | | | [`0004`](../patches/kmd/0004-kmd-recover-from-timeouts.patch) | viogpu3d: recover transport and device state after a timeout | [`docs/tdr-recovery.md`](tdr-recovery.md) |
@@ -321,6 +321,7 @@ committed.
 | | | [`0009`](../patches/kmd/0009-kmd-host-ordered-flip.patch) | viogpu3d: let the host order the flip when it offers to | [`docs/tearing.md`](tearing.md) |
 | | | [`0010`](../patches/kmd/0010-kmd-host-present-copy.patch) | viogpu3d: let the host copy a Blt present when it offers to | [`docs/flip.md`](flip.md) |
 | | | [`0011`](../patches/kmd/0011-kmd-host-gpu-lost.patch) | viogpu3d: a lost host GPU is a removed device | [`docs/device-lost.md`](device-lost.md) |
+| | | [`0012`](../patches/kmd/0012-kmd-host-vblank.patch) | viogpu3d: take the vblank from the host's frame clock when it offers it | [`docs/vblank.md`](vblank.md) |
 | mesa | 47 | [`0001`](../patches/mesa/0001-build-winddk-includes-and-x86-atomics.patch) | build: add the WDK include path and drop x86-unsafe 64-bit Interlocked calls | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0002`](../patches/mesa/0002-util-xmlconfig-case-insensitive-exe-match.patch) | util/xmlconfig: match drirc executable names case-insensitively on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |
 | | | [`0003`](../patches/mesa/0003-util-u_queue-windows-loader-lock-join.patch) | util/u_queue: do not join worker threads under the loader lock on Windows | [`build/mesa/README.md`](../build/mesa/README.md) |

@@ -18,6 +18,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 CACHE=${WIN3D_CACHE:-$REPO/.scratch/cache}
 OUT=$REPO/out/kmd
+# 58113 takes the vblank from vmlab-hv's frame clock when it offers it (patches/kmd/0012).
 # 58112 makes a lost host GPU a removed device when vmlab-hv reports it (patches/kmd/0011).
 # 58111 lets vmlab-hv copy a Blt present when it offers to (patches/kmd/0010).
 # 58110 lets vmlab-hv order the flip when it offers to (patches/kmd/0009).
@@ -26,7 +27,7 @@ OUT=$REPO/out/kmd
 # 58107 added the present copy into a mappable blob (0006, Desktop
 # Duplication) to 58106, which added the hardware pointer (0005) to 58105,
 # the package rebased to Yttrium's November 2026 release.
-DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58112}
+DRIVER_VERSION=${KMD_DRIVER_VERSION:-100.6.101.58113}
 IMAGE=vmlab-win3d/kmd-build:1
 
 pin() { awk -v n="$1" '$1 == n { print $'"$2"' }' "$HERE/PINS"; }
