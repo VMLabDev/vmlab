@@ -45,7 +45,7 @@ depends on what a real guest or agent does, the finding says so.
 |---|---|---|
 | F1 | A guest directory that cannot be listed during a walk reads as deleted files, and the host copies are removed (fixed in #384) | Data loss (host) |
 | F2 (fixed, card #385) | The host follows a guest-planted symlink named like a rule file, and sends the lines of the target back to the guest | Security against a hostile guest, and crash of the host process |
-| F3 | A restore does not flush and does not refuse on unsynced guest work | Data loss (guest work) |
+| F3 (fixed, card #390) | A restore does not flush and does not refuse on unsynced guest work | Data loss (guest work) |
 | F4 | A re-seed never completes while the tree holds a socket, an unreadable path or an oversize file | Wrong result (sync stops for good) |
 | F5 | A halted workspace keeps every path the guest reports, without a bound and without checking it is a path | Security against a hostile guest (host memory and CPU) |
 | F6 | A guest or host file that changed without a settled event is carried anyway, so the quiet period and the git lock deferral are bypassed | Wrong result (torn copy on the host) |
@@ -158,6 +158,10 @@ the pass names the refused rule file.
 crash of the host process.
 
 ### F3. A restore neither flushes nor refuses on unsynced guest work
+
+**Fixed in #390.** Restore checks a fresh flush report for a running workspace
+and refuses when guest work remains outstanding or the flush cannot account
+for it. The explicit discard flag bypasses this check.
 
 **Where.** `src/labd/workspace/syncer.rs:571-591` (`before_restore`),
 `src/labd/lab.rs:3519-3521`.

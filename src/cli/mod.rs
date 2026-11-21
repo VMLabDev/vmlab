@@ -648,8 +648,7 @@ pub enum SnapshotCmd {
         /// Machine ([lab/]name); omitted = every VM and container in the lab
         #[arg(long)]
         vm: Option<String>,
-        /// Restore a machine whose workspace is halted, throwing the guest
-        /// copy of every conflicting path away
+        /// Restore without flushing the workspace, discarding unsynced guest changes
         #[arg(long)]
         discard_guest_changes: bool,
     },

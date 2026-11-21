@@ -543,26 +543,14 @@ impl WorkspaceSyncers {
                 ledger.reseed_owed,
             ));
         };
-        let report = match syncer.pass_now().await {
-            Ok(report) => report,
-            // The flush did not come back at all. That is the strongest reason
-            // of the lot to refuse — not knowing what the guest holds is worse
-            // than knowing it is behind — so it becomes the report's own
-            // `trouble` rather than a second error path with its own words.
-            Err(e) => Report {
-                trouble: Some(format!("{e:#}")),
-                ..syncer.report()
-            },
-        };
+        let report = snapshot_preflight(&syncer).await;
         refuse(super::bracket::Outstanding::of(machine, &report))
     }
 
-    /// What a **restore** has to be asked twice about (§19.6).
-    ///
-    /// A halt is the one state where restoring destroys something a developer
-    /// was about to be asked about, so it refuses — but only until the flag is
-    /// given, because wanting to throw the guest copy away is frequently why
-    /// someone restores.
+    /// Flush a running workspace before **restore** (§19.6). Refuse if the
+    /// flush leaves work outstanding or cannot establish what the guest holds.
+    /// An explicit discard skips the flush so pending guest changes can be
+    /// thrown away.
     ///
     /// It reaches a machine that is **down** through the same `declared`
     /// workspace, because a restore does not need a running machine and the
@@ -578,7 +566,16 @@ impl WorkspaceSyncers {
             return Ok(());
         }
         match self.get(machine).await {
-            Some(syncer) => refuse(super::bracket::halted(machine, &syncer.report())),
+            Some(syncer) => {
+                let report = snapshot_preflight(&syncer).await;
+                if let Some(halt) = super::bracket::halted(machine, &report) {
+                    return refuse(Some(halt));
+                }
+                refuse(
+                    super::bracket::Outstanding::of(machine, &report)
+                        .map(super::bracket::RestoreOutstanding),
+                )
+            }
             // A restore is not refused for owing a re-seed: it is about to
             // ask for another one, and the second answers the first.
             None => refuse(super::bracket::halted_when_stopped(
@@ -731,6 +728,17 @@ fn refuse(said: Option<impl std::fmt::Display>) -> Result<()> {
     match said {
         Some(said) => Err(anyhow::anyhow!("{said}")),
         None => Ok(()),
+    }
+}
+
+/// Treat a flush that fails to return as uncertainty about the guest tree.
+async fn snapshot_preflight(syncer: &Syncer) -> Report {
+    match syncer.pass_now().await {
+        Ok(report) => report,
+        Err(e) => Report {
+            trouble: Some(format!("{e:#}")),
+            ..syncer.report()
+        },
     }
 }
 
