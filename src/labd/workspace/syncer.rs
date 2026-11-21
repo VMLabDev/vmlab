@@ -4721,6 +4721,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn a_re_seed_completes_beside_a_socket_and_an_oversize_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let _socket =
+            std::os::unix::net::UnixListener::bind(dir.path().join("monitor.sock")).unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        std::fs::write(dir.path().join("big.bin"), [0; 32]).unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let mut ws = workspace(dir.path(), state.path());
+        ws.max_file_bytes = 16;
+        let opens = sessions.opens().len();
+        syncers.stop("dev01").await;
+        syncers.mark_rewound(&ws).await.unwrap();
+        rewind(&guest);
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        assert!(eventually(|| syncer.report().passes > 0).await);
+        let report = syncer.report();
+        assert!(report.skipped.iter().any(|skip| skip.path == "monitor.sock"));
+        assert!(report.oversize.iter().any(|file| file.path == "big.bin"));
+        assert!(report.reseed.is_none(), "the re-seed barrier never lifted");
+        assert!(!Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed);
+        assert!(eventually(|| sessions.opens().len() > opens).await);
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
+        assert!(guest.get("/src/experiment.rs").is_none());
+        syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
     async fn an_incomplete_reseed_keeps_the_loop_and_restart_behind_the_barrier() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
