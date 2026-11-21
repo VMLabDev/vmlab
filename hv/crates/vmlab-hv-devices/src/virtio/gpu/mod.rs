@@ -5,12 +5,14 @@
 
 mod compose;
 mod copy;
+mod lost;
 mod modifiers;
 mod pacer;
 mod renderer;
 mod scanout;
 pub use scanout::DmaFrame;
 mod snapshot;
+mod teardown;
 mod vblank;
 pub use renderer::{APERTURE_SIZE, BlobMapper, GpuMode};
 
@@ -91,6 +93,11 @@ pub const CMD_VBLANK: u32 = 0x0f02;
 /// period in nanoseconds (u32), reserved (u32). In the range of OK
 /// responses, above every one VIRTIO 1.2 defines.
 pub const RESP_OK_VBLANK: u32 = 0x11f0;
+/// vmlab's private event of [`ORDERED_FLIP_FEATURE`], in `events_read`: the
+/// host GPU is lost (`lost.rs`). The top bit, the furthest from the
+/// standard `VIRTIO_GPU_EVENT_DISPLAY` (bit 0).
+pub const EVENT_DEVICE_LOST: u32 = 1 << 31;
+const UNSPEC: u32 = 0x1200;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCES: usize = 4096;
 const MAX_ENTRIES: usize = 16384;
@@ -204,6 +211,16 @@ struct State {
     held_vblank: Option<Vec<(GuestAddress, u32)>>,
     /// Vblanks answered since the last reset. The first is logged.
     host_vblanks: u64,
+    /// Why the host GPU is lost, from the loss on (`lost.rs`). It
+    /// outlives a device reset: a host GPU does not come back.
+    lost: Option<String>,
+    /// Set with `lost`, and read without the device lock.
+    lost_flag: lost::Flag,
+    /// The render workers of the guest's Venus contexts (`teardown.rs`).
+    workers: teardown::Workers,
+    /// The last reset has not confirmed that the renderer and its workers
+    /// stopped: the transport keeps the status nonzero.
+    unsettled: bool,
 }
 
 impl Drop for State {
@@ -258,6 +275,10 @@ impl Gpu {
                 vblank_waits: Vec::new(),
                 held_vblank: None,
                 host_vblanks: 0,
+                lost: None,
+                lost_flag: lost::Flag::default(),
+                workers: teardown::Workers::default(),
+                unsettled: false,
             })),
         }
     }
@@ -296,7 +317,31 @@ impl Gpu {
         mapper: Arc<dyn BlobMapper>,
     ) -> Result<(), DeviceError> {
         let renderer = renderer::Renderer::new(mode, node, mapper)?;
-        self.state.lock().renderer = Some(renderer);
+        let flag = renderer.lost();
+        let mut watch = renderer.watch();
+        {
+            let mut s = self.state.lock();
+            s.lost_flag = flag.clone();
+            s.renderer = Some(renderer);
+        }
+        let state = Arc::downgrade(&self.state);
+        std::thread::Builder::new()
+            .name("gpu-loss-watch".into())
+            .spawn(move || {
+                while state.strong_count() != 0 && !flag.get() {
+                    if let Some(reason) = watch.check() {
+                        // Set the flag before the device lock is taken: a
+                        // command that waits on the lost host GPU can hold
+                        // the lock, and the flag ends its wait.
+                        flag.set();
+                        if let Some(state) = state.upgrade() {
+                            lose(&state, reason);
+                        }
+                        return;
+                    }
+                    std::thread::sleep(lost::INTERVAL);
+                }
+            })?;
         let state = Arc::downgrade(&self.state);
         std::thread::Builder::new()
             .name("gpu-fence-completion".into())
@@ -308,6 +353,18 @@ impl Gpu {
                 }
             })?;
         Ok(())
+    }
+
+    /// Treat the host GPU as lost (`lost.rs`). The loss watch calls this
+    /// when it sees the render server end or the render node go; a test
+    /// calls it to simulate a loss. A second call changes nothing.
+    pub fn lose_host_gpu(&self, reason: impl Into<String>) {
+        lose(&self.state, reason.into());
+    }
+
+    /// Why the host GPU is lost, once it is.
+    pub fn host_gpu_lost(&self) -> Option<String> {
+        self.state.lock().lost.clone()
     }
 
     pub fn has_3d_contexts(&self) -> bool {
@@ -392,7 +449,7 @@ impl Gpu {
 
     pub fn frame(&self) -> Option<Frame> {
         let mut s = self.state.lock();
-        if let Some(renderer) = &s.renderer {
+        if let Some(renderer) = s.renderer.as_ref().filter(|_| s.lost.is_none()) {
             match renderer.frame() {
                 Ok(Some(frame)) => return Some(frame),
                 Ok(None) => {}
@@ -416,7 +473,64 @@ impl Gpu {
     }
 }
 
+fn lose(state: &Mutex<State>, reason: String) {
+    state.lock().lose(reason);
+}
+
 impl State {
+    /// The loss of the host GPU, as `lost.rs` describes it.
+    fn lose(&mut self, reason: String) {
+        if self.lost.is_some() {
+            return;
+        }
+        log::error!(
+            "virtio-gpu: the host GPU is lost: {reason}. The device answers its {} pending fences \
+             and refuses further GPU work; the guest is {}",
+            self.fences.len(),
+            if self.acked & (1 << ORDERED_FLIP_FEATURE) != 0 {
+                "told through the device-lost event"
+            } else {
+                "not told: its driver has not acked the vmlab feature bit"
+            }
+        );
+        self.lost_flag.set();
+        self.lost = Some(reason);
+        self.release_fences();
+        self.raise_lost();
+    }
+
+    /// Answer every fence the device holds. Their responses are written.
+    fn release_fences(&mut self) {
+        let fences = std::mem::take(&mut self.fences);
+        let Some(mem) = &self.mem else { return };
+        let mut notify = std::collections::BTreeSet::new();
+        for fence in fences {
+            let queue = &mut self.queues[fence.queue as usize];
+            if queue.add_used(mem, fence.head, fence.len).is_ok()
+                && queue.needs_notification(mem).unwrap_or(false)
+            {
+                notify.insert(fence.queue);
+            }
+        }
+        if let Some(irq) = &self.interrupt {
+            for queue in notify {
+                irq.notify_queue(queue);
+            }
+        }
+    }
+
+    /// Put [`EVENT_DEVICE_LOST`] in `events_read`, for a driver that acked
+    /// the vmlab bit, and raise a configuration interrupt.
+    fn raise_lost(&mut self) {
+        if self.lost.is_none() || self.acked & (1 << ORDERED_FLIP_FEATURE) == 0 {
+            return;
+        }
+        self.events |= EVENT_DEVICE_LOST;
+        if let Some(irq) = &self.interrupt {
+            irq.notify_config();
+        }
+    }
+
     fn frame_2d(&mut self) -> Option<ShmFrame> {
         let mode = self.mode()?;
         let scanout = self.scanout.map(|(id, rect)| (&self.resources[&id], rect));
@@ -640,6 +754,10 @@ fn valid_format(f: u32) -> bool {
 
 impl State {
     fn complete_fences(&mut self) {
+        if self.lost.is_some() {
+            self.release_fences();
+            return;
+        }
         if self.retry_display {
             self.publish_scanout(self.display_timestamp);
         }
@@ -692,6 +810,11 @@ impl State {
         let mut d = Decoder::new(request);
         let kind = d.u32()?;
         d.take(20)?;
+        if self.lost.is_some() && q == 0 && !matches!(kind, 0x100 | 0x10a) && !lost::releases(kind)
+        {
+            // The host GPU is gone (`lost.rs`).
+            return Err(UNSPEC);
+        }
         if q == 0 && kind == CMD_ORDERED_FLIP {
             return self.ordered_flip(mem, request, &mut d);
         }
@@ -709,6 +832,10 @@ impl State {
             && let Some(renderer) = &self.renderer
         {
             let result = renderer.command(mem, request)?;
+            if kind == 0x200 {
+                // CTX_CREATE: a Venus context has a worker of its own.
+                self.workers.note(renderer.servers());
+            }
             if matches!(kind, 0x103 | 0x10d) {
                 self.native = true;
             }
@@ -1072,7 +1199,10 @@ impl VirtioDevice for Gpu {
     }
     fn ack_features(&mut self, features: u64) {
         let supported = self.features();
-        self.state.lock().acked = features & supported;
+        let mut s = self.state.lock();
+        s.acked = features & supported;
+        // A host GPU lost before this negotiation is still lost.
+        s.raise_lost();
     }
     fn config_len(&self) -> u64 {
         16
@@ -1184,11 +1314,8 @@ impl VirtioDevice for Gpu {
     }
     fn reset(&mut self) {
         let mut s = self.state.lock();
-        if let Some(renderer) = &s.renderer
-            && let Err(error) = renderer.reset()
-        {
-            log::error!("GPU reset failed: {error:#x}");
-        }
+        let patience = s.workers.patience;
+        s.unsettled = !s.teardown(patience);
         s.fences.clear();
         s.flush_pending = None;
         s.retry_display = false;
@@ -1222,6 +1349,41 @@ impl VirtioDevice for Gpu {
                 pixels: ScanoutPixels::Vga,
             });
         }
+    }
+    fn reset_settled(&mut self) -> bool {
+        let mut s = self.state.lock();
+        if s.unsettled && s.teardown(std::time::Duration::ZERO) {
+            log::info!("GPU reset: the renderer and its workers have stopped");
+            s.unsettled = false;
+        }
+        !s.unsettled
+    }
+}
+
+impl State {
+    /// Stop the renderer and wait at most `wait` for the workers of the
+    /// guest's contexts to exit. False, logged, when either is not done.
+    fn teardown(&mut self, wait: std::time::Duration) -> bool {
+        let mut done = true;
+        if let Some(renderer) = &self.renderer {
+            if let Err(error) = renderer.reset() {
+                if !self.unsettled {
+                    log::error!("GPU reset failed: {error:#x}; the device status stays nonzero");
+                }
+                done = false;
+            }
+            // A worker the start of this reset did not know yet.
+            self.workers.note(renderer.servers());
+        }
+        if let Err(running) = self.workers.wait(wait) {
+            if !self.unsettled {
+                log::error!(
+                    "GPU reset: render workers {running:?} have not exited; the device status stays nonzero"
+                );
+            }
+            done = false;
+        }
+        done
     }
 }
 

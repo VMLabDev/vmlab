@@ -47,7 +47,7 @@ so cannot hold a chain across one. A reset of the device drops a held wait.
 The device is in `hv/crates/vmlab-hv-devices/src/virtio/gpu/vblank.rs` (the
 clock and the answer) and `mod.rs` (`vblank_wait`, the hold in
 `queue_notify`), at the root of the vmlab repository. The driver side is
-`patches/kmd/0011`.
+`patches/kmd/0012`.
 
 ## The driver
 
@@ -89,7 +89,7 @@ still not implemented.
 ## Without the bit
 
 - A host that does not offer it (QEMU, a vmlab-hv before this change)
-  leaves the driver on the timer and its NOP, unchanged by `0011`.
+  leaves the driver on the timer and its NOP, unchanged by `0012`.
 - A wait that the host refuses, or that the driver cannot queue, puts the
   driver back on the timer until the next start.
 - A driver that does not know the bit does not send the command, and the

@@ -697,3 +697,216 @@ fn the_clock_thread_answers_a_wait_and_each_next_one_a_period_later() {
         );
     }
 }
+
+#[derive(Default)]
+struct Interrupts {
+    queues: parking_lot::Mutex<Vec<u16>>,
+    config: std::sync::atomic::AtomicU32,
+}
+
+impl VirtioInterrupt for Interrupts {
+    fn notify_queue(&self, queue: u16) {
+        self.queues.lock().push(queue);
+    }
+    fn notify_config(&self) {
+        self.config
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn events(gpu: &Gpu) -> u32 {
+    let mut word = [0; 4];
+    gpu.read_config(0, &mut word);
+    u32::from_le_bytes(word)
+}
+
+fn command(kind: u32, words: &[u32]) -> Vec<u8> {
+    let mut request = vec![0; 24];
+    request[..4].copy_from_slice(&kind.to_le_bytes());
+    for word in words {
+        request.extend_from_slice(&word.to_le_bytes());
+    }
+    request
+}
+
+#[test]
+fn a_lost_host_gpu_is_an_event_only_for_a_driver_that_acked_the_bit() {
+    let bit = 1u64 << ORDERED_FLIP_FEATURE;
+    let irq = Arc::new(Interrupts::default());
+
+    // Linux's driver: no event, no configuration interrupt.
+    let mut gpu = Gpu::new("gpu");
+    gpu.ack_features(gpu.features() & !bit);
+    gpu.state.lock().interrupt = Some(irq.clone());
+    gpu.lose_host_gpu("test");
+    assert_eq!(events(&gpu), 0);
+    assert_eq!(irq.config.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(gpu.host_gpu_lost().as_deref(), Some("test"));
+
+    // vmlab's driver: the event and one interrupt, and a second loss is
+    // not a second event.
+    let mut gpu = Gpu::new("gpu");
+    gpu.ack_features(gpu.features());
+    gpu.state.lock().interrupt = Some(irq.clone());
+    gpu.lose_host_gpu("test");
+    gpu.lose_host_gpu("again");
+    assert_eq!(events(&gpu), EVENT_DEVICE_LOST);
+    assert_eq!(irq.config.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(gpu.host_gpu_lost().as_deref(), Some("test"));
+
+    // The driver clears it as it clears the display event.
+    gpu.write_config(4, &EVENT_DEVICE_LOST.to_le_bytes());
+    assert_eq!(events(&gpu), 0);
+
+    // The loss outlives a reset, and the next negotiation of the bit
+    // raises the event again.
+    gpu.reset();
+    assert_eq!(events(&gpu), 0);
+    gpu.ack_features(gpu.features() & !bit);
+    assert_eq!(events(&gpu), 0);
+    gpu.ack_features(gpu.features());
+    assert_eq!(events(&gpu), EVENT_DEVICE_LOST);
+    assert!(gpu.host_gpu_lost().is_some());
+}
+
+#[test]
+fn a_lost_host_gpu_refuses_work_but_serves_the_display_and_releases() {
+    let mut gpu = Gpu::new("gpu");
+    gpu.ack_features(gpu.features());
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+    let mut s = gpu.state.lock();
+    assert!(s.command(&mem, 0, &command(0x101, &[1, 2, 1, 1])).is_ok());
+    drop(s);
+    gpu.lose_host_gpu("test");
+
+    let mut s = gpu.state.lock();
+    for refused in [
+        command(0x101, &[2, 2, 1, 1]),
+        command(0x103, &[0, 0, 1, 1, 0, 1]),
+        command(0x104, &[0, 0, 1, 1, 1, 0]),
+        command(0x108, &[0, 0]),
+        command(0x200, &[0; 18]),
+        command(0x207, &[0, 0]),
+        ordered_flip(0, 1, 1),
+        present_copy(1, 2, &[[0, 0, 0, 0, 4, 4]]),
+    ] {
+        assert_eq!(s.command(&mem, 0, &refused), Err(UNSPEC));
+    }
+    assert_eq!(s.command(&mem, 0, &command(0x100, &[])).unwrap().0, 0x1101);
+    assert_eq!(
+        s.command(&mem, 0, &command(0x10a, &[0, 0])).unwrap().0,
+        0x1104
+    );
+    // A release still releases.
+    assert_eq!(
+        s.command(&mem, 0, &command(0x102, &[1, 0])),
+        Ok((NODATA, Vec::new()))
+    );
+    assert!(s.resources.is_empty());
+    // The cursor queue has no host GPU to wait for.
+    assert!(s.command(&mem, 1, &command(0x301, &[0; 8])).is_ok());
+}
+
+#[test]
+fn a_lost_host_gpu_answers_every_fence_the_device_holds() {
+    let gpu = Gpu::new("gpu");
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+    let mut queue = Queue::new(16).unwrap();
+    queue.try_set_size(16).unwrap();
+    queue.try_set_desc_table_address(GuestAddress(0)).unwrap();
+    queue
+        .try_set_avail_ring_address(GuestAddress(0x400))
+        .unwrap();
+    queue
+        .try_set_used_ring_address(GuestAddress(0x800))
+        .unwrap();
+    queue.set_ready(true);
+    let irq = Arc::new(Interrupts::default());
+    {
+        let mut s = gpu.state.lock();
+        s.mem = Some(mem.clone());
+        s.interrupt = Some(irq.clone());
+        s.queues = vec![queue, Queue::new(16).unwrap()];
+        for head in [3, 5] {
+            s.fences.push(PendingFence {
+                queue: 0,
+                head,
+                len: 24,
+                flags: 3,
+                id: u64::from(head),
+                ctx: 1,
+                ring: 0,
+            });
+        }
+    }
+    gpu.lose_host_gpu("test");
+
+    assert!(gpu.state.lock().fences.is_empty());
+    // The used ring holds both heads, in order, and the guest was told once.
+    let used = |at: u64| mem.read_obj::<u32>(GuestAddress(0x800 + at)).unwrap();
+    assert_eq!(used(0) >> 16, 2);
+    assert_eq!((used(4), used(12)), (3, 5));
+    assert_eq!(irq.queues.lock().as_slice(), [0]);
+}
+
+/// A reset whose render worker exits late, and one whose worker does not
+/// exit: the status reads zero only once the worker has gone, so that the
+/// guest frees nothing a worker can still use (`teardown.rs`).
+#[test]
+fn a_reset_is_acknowledged_only_after_the_render_workers_have_exited() {
+    use crate::PciDevice;
+    use crate::virtio::pci::VirtioPciDevice;
+    use crate::virtio::pci::device_status::DEVICE_NEEDS_RESET;
+    use std::time::{Duration, Instant};
+    use teardown::tests::{proc_entry, scratch};
+
+    let proc = scratch("gpu-reset");
+    let gpu = Gpu::new("gpu");
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+    let mut pci = VirtioPciDevice::new("pci", Box::new(gpu.clone()), mem, None, None);
+    let status = |pci: &mut VirtioPciDevice| {
+        let mut byte = [0];
+        pci.bar_read(4, 0x14, &mut byte);
+        byte[0]
+    };
+    let worker = |patience| {
+        // The render server 10 and its worker 20, of one guest context.
+        proc_entry(&proc, 10, 'S', 1, 100);
+        proc_entry(&proc, 20, 'S', 10, 200);
+        let mut workers = teardown::Workers::at(&proc, patience);
+        workers.note(&[10]);
+        gpu.state.lock().workers = workers;
+    };
+
+    // The worker exits while the reset waits: the reset is acknowledged.
+    worker(Duration::from_secs(5));
+    pci.bar_write(4, 0x14, &[1]);
+    let late = proc.clone();
+    let exit = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::remove_dir_all(late.join("20")).unwrap();
+    });
+    let start = Instant::now();
+    pci.bar_write(4, 0x14, &[0]);
+    assert!(start.elapsed() >= Duration::from_millis(50));
+    assert_eq!(status(&mut pci), 0);
+    exit.join().unwrap();
+
+    // The worker does not exit in time: the status says the reset failed,
+    // and the driver cannot start the device again.
+    worker(Duration::from_millis(20));
+    pci.bar_write(4, 0x14, &[1]);
+    pci.bar_write(4, 0x14, &[0]);
+    assert_eq!(status(&mut pci), DEVICE_NEEDS_RESET);
+    pci.bar_write(4, 0x14, &[1]);
+    assert_eq!(status(&mut pci), DEVICE_NEEDS_RESET);
+    assert!(gpu.state.lock().unsettled);
+
+    // It exits later: the next read finishes the reset.
+    proc_entry(&proc, 20, 'Z', 10, 200);
+    assert_eq!(status(&mut pci), 0);
+    assert!(!gpu.state.lock().unsettled);
+    pci.bar_write(4, 0x14, &[1]);
+    assert_eq!(status(&mut pci), 1);
+    std::fs::remove_dir_all(&proc).unwrap();
+}

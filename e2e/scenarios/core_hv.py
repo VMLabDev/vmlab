@@ -11,7 +11,7 @@ import shutil
 from datetime import datetime, timezone
 
 from harness import E2E
-from scenarios import core
+from scenarios import core, legacy
 
 
 def provision_order(h):
@@ -72,9 +72,31 @@ def hardware(h, lab):
          f"nested vm01: vmx|svm on {p.get('virt')} cpu(s); vm02 without it: on {other or '?'}")
 
 
+def floppies(h):
+    features = (
+        ("vm.hw.floppy", "raw", r"A:\FD.TXT", "cdrom attachment e2e"),
+        ("vm.media.floppy", "folder", r"A:\MFLOPPY.TXT", "media floppy e2e"),
+    )
+    if h.out_of_scope(features[0][0]):
+        return
+
+    def read_floppy(machine, path, expected):
+        legacy.stage_template(h, "x86/freedos-1.3/1.3.0")
+        with h.lab("core-hv-floppy") as lab:
+            source = E2E / "labs" / "core-lab"
+            core.build_floppy(h, lab / "fd.img", source / "cd" / "cdrom.txt")
+            shutil.copytree(source / "media-floppy", lab / "media-floppy")
+            h.vmlab("up", machine, cwd=lab)
+            h.wait_ready(lab, machine)
+            result = h.vmlab("exec", machine, "--", r"C:\COMMAND.COM", "/c", "type", path, cwd=lab)
+            assert expected in result.out, result.text
+
+    for feature, machine, path, expected in features:
+        h.check(feature, lambda: read_floppy(machine, path, expected), f"FreeDOS read {path}")
+
+
 def run(h):
-    for fid in ("vm.hw.qemu_args", "vm.hw.floppy", "vm.media.floppy"):
-        h.skip(fid, h.out_of_scope(fid) or "not declared by the compatible core labs")
+    floppies(h)
     provision_order(h)
     forced_stop = scratch(h)
     with h.lab("core-hv") as lab:

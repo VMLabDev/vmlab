@@ -33,8 +33,6 @@ Since driver `100.6.101.58106` Windows hands the pointer to the host
 I-beam) are black with a white outline. A pointer larger than 64×64 is drawn
 into the frame by Windows, and only the first display has a hardware pointer.
 Checked on `windows-11` on `AMD1` and `Nvidia2` with `tests/e2e/pointer.sh`.
-In a `vmlab record` video the arrow is missing: vmlab's recorder hides a
-repeated shape whose hotspot is (0,0) ([pointer.md](pointer.md), "Check").
 Not tested: more than one display, a pointer above 64×64, sleep and resume,
 a timeout recovery while the pointer is on, Windows 10, and QEMU.
 
@@ -77,11 +75,10 @@ loss and a reset callback. The full TDR regression also rejects APPCRASH
 records whose fault module is a `viogpu` DLL.
 
 Recovery requires a conforming virtio reset acknowledgement. Native vmlab-hv
-currently logs renderer-reset errors and still clears device status. Its Venus
-proxy also sends context destruction asynchronously, without an explicit reply
-that proves renderer workers and native GPU operations have stopped. Guest
-memory aliases are removed separately. Successful forced recovery does not,
-by itself, establish that backend quiescence guarantee.
+keeps the device status nonzero until its renderer and every Venus render
+worker of the guest's contexts have stopped, and reports a failed teardown as
+`DEVICE_NEEDS_RESET` ([tdr-recovery.md](tdr-recovery.md), "Backend
+prerequisite").
 
 ## Host
 
@@ -706,6 +703,20 @@ output ranges in every stage match WARP on AMD1 and Nvidia1. What remains is
 in [`shaders2.md`](shaders2.md#what-remains): a range over a geometry
 shader's packed scalar system values is still rejected, and indexed reads of
 ordinary patch constants in a join phase were not run.
+
+### Direct3D 10 and 11: at most 32 texture and sampler pairs in one shader
+
+The Yttrium UMD binds each pair of a shader resource and a sampler that a
+shader uses, and each buffer it loads, as one combined slot, and it has 32.
+Direct3D 11 allows 128 resources and 16 samplers in one stage. A pixel
+shader that needs more slots is created as a shader that writes zero to
+every colour output, and the UMD logs
+`pixel shader needs more than 32 combined texture slots` in
+`C:\ProgramData\Yttrium\yttrium-errors.log`. Before `patches/mesa/0097`
+its creation removed the device. Wine's d3d11 test `test_high_resource_count`
+(50 textures sampled with two samplers, and 50 buffers) is such a shader, and
+its two checks fail. A vertex, geometry, hull, domain or compute shader that
+needs more slots still fails to create and removes the device.
 
 ### D3D12: ExecuteIndirect with vertex or index buffer arguments, and an NVIDIA first-boot dwm crash
 

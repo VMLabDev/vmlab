@@ -65,6 +65,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [acceptance.md](acceptance.md) | See each Done item checked on fresh `windows-11` and `windows-10` labs, the stretch applications, the adapter suite with its baseline, and the index of every evidence directory |
 | [tdr-recovery.md](tdr-recovery.md) | Force a guest timeout and require reset/restart telemetry plus hardware pixel readback |
 | [flip.md](flip.md) | See how vmlab-hv orders a flip after the host GPU work it depends on, behind a private feature bit, and how a driver or a host without the bit keeps the standard path |
+| [device-lost.md](device-lost.md) | See how vmlab-hv sees a lost host GPU and tells the guest, behind the same feature bit, and how the kernel driver makes it a removed device in place of a stopped VM |
 | [vblank.md](vblank.md) | See how the driver takes its vblank from vmlab-hv's frame clock in place of a guest timer, behind the same feature bit, and what a host without it keeps |
 | [tearing.md](tearing.md) | See which waits the guest makes before a flip, why torn frames under host load need a flip ordered by the host, and the vsync fix `patches/kmd/0008` |
 | [chromium.md](chromium.md) | See why Chrome and Edge lost WebGL with the Direct3D 12 bridge installed, how `patches/mesa/0096` and the installer's native copy keep their GPU process alive, and the check |

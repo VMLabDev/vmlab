@@ -132,6 +132,17 @@ pub trait VirtioDevice: Snapshot + Send {
     }
     /// The driver reset the device. Returns to the pre-activation state.
     fn reset(&mut self);
+    /// Whether the last [`reset`](Self::reset) has ended every use of the
+    /// guest memory and the queues it had, work on other threads and
+    /// processes included. A driver frees that memory when it reads device
+    /// status zero (VIRTIO 1.2 §2.4), so the transport shows
+    /// `DEVICE_NEEDS_RESET` in its place until this is true. It asks after
+    /// the reset and again at each driver read of the transport, and the
+    /// device may finish its reset in those calls. A device whose reset
+    /// stops everything before it returns keeps the default.
+    fn reset_settled(&mut self) -> bool {
+        true
+    }
 }
 
 /// A guest memory address whose writes kick one queue.
