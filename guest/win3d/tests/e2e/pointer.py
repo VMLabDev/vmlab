@@ -10,6 +10,7 @@
 
   pointer.py check --events events.json --plan SHAPES --x0 N --y0 N --step-x N
                    --background R,G,B --shots DIR --out pointer.json [--guest guest.json]
+                   [--rotation DEGREES]
       Exit 0 when all of these hold:
         shapes     every planned step arrived on the native protocol, in
                    order, as the right kind of shape (arrow, ibeam, sizewe,
@@ -183,7 +184,26 @@ def kind_of(shape):
     return None
 
 
-def native_steps(events, end):
+def rotate(x, y, w, h, degrees):
+    """Counter-clockwise rotation of a pixel in a source rectangle."""
+    return {0: (x, y), 90: (y, w - 1 - x),
+            180: (w - 1 - x, h - 1 - y), 270: (h - 1 - y, x)}[degrees]
+
+
+def desktop_shape(shape, degrees):
+    """Undo the scanout rotation before classifying a pointer bitmap."""
+    if not degrees or not shape.get('bbox'):
+        return shape
+    x0, y0, x1, y1 = shape['bbox']
+    w, h = shape['width'], shape['height']
+    undo = 360 - degrees
+    a, b = rotate(x0, y0, w, h, undo), rotate(x1, y1, w, h, undo)
+    hx, hy = rotate(shape['hot_x'], shape['hot_y'], w, h, undo)
+    return {**shape, 'hot_x': hx, 'hot_y': hy,
+            'bbox': [min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1])]}
+
+
+def native_steps(events, end, degrees=0):
     """The native timeline as held states: (kind, x, y, shape) for each state that lasted HOLD."""
     shape, state, cur, since, out = None, None, None, 0.0, []
     for e in [e for e in events if e['src'] == 'native'] + [{'t': end, 'event': 'end'}]:
@@ -194,7 +214,7 @@ def native_steps(events, end):
         elif e['event'] == 'state':
             state = e
         if shape is not None and state is not None:
-            kind = kind_of(shape) if state['visible'] else 'hidden'
+            kind = kind_of(desktop_shape(shape, degrees)) if state['visible'] else 'hidden'
             new = (kind, state['x'], state['y'], shape)
             if cur is None or new[:3] != cur[:3]:
                 since = e['t']
@@ -252,8 +272,21 @@ def check(args):
     plan = [s.strip() for s in args.plan.split(',') if s.strip()]
     positions = [(args.x0 + i * args.step_x, args.y0) for i in range(len(plan))]
     bg = [int(v) for v in args.background.split(',')]
-    steps = native_steps(events, data['seconds'])
     results = {}
+    guest = None
+    if args.guest:
+        try:
+            with open(args.guest, encoding='utf-8-sig') as stream:
+                guest = json.load(stream)
+        except (OSError, ValueError) as e:
+            guest = f'unreadable: {e}'
+        mode_ok = isinstance(guest, dict) and guest.get('rotation', 0) == args.rotation
+        results['rotation'] = {'pass': mode_ok, 'expected': args.rotation}
+        if mode_ok:
+            screen = guest['screen']
+            positions = [rotate(x, y, screen['width'], screen['height'], args.rotation)
+                         for x, y in positions]
+    steps = native_steps(events, data['seconds'], args.rotation)
 
     # shapes: the plan is a subsequence of the held states, kind and position both.
     i, matched = 0, []
@@ -268,10 +301,11 @@ def check(args):
     }
 
     rfb = [e for e in events if e['src'] == 'rfb']
-    rfb_kinds = sorted({k for k in (kind_of(e) for e in rfb) if k})
+    rfb_kinds = sorted({k for k in (kind_of(desktop_shape(e, args.rotation)) for e in rfb) if k})
     results['rfb'] = {'pass': set(plan) <= set(rfb_kinds), 'kinds': rfb_kinds, 'shapes': len(rfb)}
 
-    ibeams = [e for e in events if e['event'] == 'shape' and e['src'] == 'native' and kind_of(e) == 'ibeam']
+    ibeams = [e for e in events if e['event'] == 'shape' and e['src'] == 'native'
+              and kind_of(desktop_shape(e, args.rotation)) == 'ibeam']
     results['outline'] = {
         'pass': bool(ibeams) and all(e['black'] > 0 and e['white'] > e['black'] and e['black'] + e['white'] == e['opaque'] for e in ibeams),
         'ibeams': [{k: e[k] for k in ('black', 'white', 'opaque', 'bbox')} for e in ibeams[:3]],
@@ -289,10 +323,7 @@ def check(args):
 
     out = {'pass': all(r['pass'] for r in results.values()) and not data['errors'], 'watch_errors': data['errors'], **results}
     if args.guest:
-        try:
-            out['guest'] = json.load(open(args.guest, encoding='utf-8-sig'))
-        except (OSError, ValueError) as e:
-            out['guest'] = f'unreadable: {e}'
+        out['guest'] = guest
     json.dump(out, open(args.out, 'w'), indent=1)
     for name, r in results.items():
         print(f"{'PASS' if r['pass'] else 'FAIL'}  pointer {name}")
@@ -320,8 +351,11 @@ def main():
     c.add_argument('--shots', required=True)
     c.add_argument('--out', required=True)
     c.add_argument('--guest')
+    c.add_argument('--rotation', type=int, choices=(0, 90, 180, 270), default=0)
     c.add_argument('--frames')
     args = ap.parse_args()
+    if args.cmd == 'check' and args.rotation and not args.guest:
+        c.error('--rotation requires --guest')
     sys.exit(watch(args) if args.cmd == 'watch' else check(args))
 
 
