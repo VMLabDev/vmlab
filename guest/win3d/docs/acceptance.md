@@ -879,6 +879,11 @@ The standalone `visual` run on AMD1 reported the same 343 failures in
 206,068 checks. The test session used a soft open-file limit of 65,536
 after an earlier attempt exhausted the default limit of 1,024.
 
+Card #341 cleared the remaining W-buffer and wireframe setter and replay
+failures. Wine's `stateblock` ran 14,738 checks with zero failures on each
+GPU, up from 12,268 checks with 25 failures. The rendering checks passed
+on both AMD1 and Nvidia2. [Acceptance note C341](acceptance/C341.md)
+
 The [unbound vertex stream patch](../patches/mesa/d3d9-default-inputs-for-unbound-streams.patch)
 uses the existing zero input when a vertex declaration names a stream
 with no bound source. Wine's `visual` ran 206,068 checks with 31 skips on
@@ -979,8 +984,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 
 | Draft card | Program and failures | Evidence and completion check |
 | --- | --- | --- |
-| Accept and render W-buffer depth state | `stateblock`, part of the remaining 18 setter and seven replay failures on AMD1 | `ZENABLE = D3DZB_USEW` returns `E_NOTIMPL` in the driver. Exercise both state-block replay and W-depth rendering. |
-| Accept and render D3D9 wireframe fill | `stateblock`, part of the same remaining failures | `FILLMODE = D3DFILL_WIREFRAME` returns `E_NOTIMPL`. Exercise both state-block replay and visible wireframe output. |
 | Implement D3D9 cylindrical interpolation | `stateblock`, wrap setter and replay fix above | Draw across a coordinate seam with each wrap component set. Verify the driver interpolates across the seam and honors the flag after applying a state block. |
 | Support display rotation changes | `d3d9ex`, 2 / 2 | Lines 573 and 608. Restore the original orientation after a rotation and verify the reported orientation. |
 | Restore fullscreen notification and activation behavior | `d3d9ex`, 5 / 9 | Lines 2940–2961, 3007 and 3100. Check `WM_DISPLAYCHANGE` delivery and the foreground window across the fullscreen transition. |
