@@ -14,7 +14,7 @@ their UMD initialization created separate, valid contexts.
 
 ## Fix
 
-Patch `0003-kmd-create-context-for-gdi-devices.patch` creates a legacy context
+Patch `kmd-create-context-for-gdi-devices.patch` creates a legacy context
 in `VioGpuDevice` construction, before allocation opens enqueue attachments.
 The existing `Init` path destroys and replaces that context when a UMD selects
 Venus or another capset. The existing destructor releases it. Device creation

@@ -3,7 +3,7 @@
 With the package installed, Chrome lost the GPU after a while: "It does not
 appear your computer supports WebGL", `GL_VENDOR = Disabled`. Edge, Electron
 applications and Windows' own WebView2 programs are the same kind of process
-(GitHub #238). Mesa patch `patches/mesa/0096` and a second copy of
+(GitHub #238). Mesa patch `patches/mesa/d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch` and a second copy of
 Microsoft's `d3d12.dll`, which the installer keeps, end that. This is a
 workaround: the bridge still replaces `System32\d3d12.dll`
 ([known limits](known-limits.md#d3d12dll-is-replaced)).

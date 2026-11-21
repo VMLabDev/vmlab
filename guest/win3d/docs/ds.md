@@ -2,9 +2,9 @@
 
 A D3D11 domain shader that indexed its patch constants with a register made
 the D3D11 runtime remove the device ([`known-limits.md`](known-limits.md)).
-`patches/mesa/0015` had added indexed patch constants and control points for
+`patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch` had added indexed patch constants and control points for
 hull shaders only ([`d3d11-apps.md`](d3d11-apps.md)). This page names the
-cause, the fix (`patches/mesa/0030`), what the repro checks for domain,
+cause, the fix (`patches/mesa/d3d10umd-domain-shader-indexed-patch-constants.patch`), what the repro checks for domain,
 geometry and pixel shaders, and what remains. Investigated on 2026-10-18 on
 helios: RADV (Mesa 26.2.2) on `AMD1`, NVIDIA 610.57.04 on `Nvidia2`, vmlab
 0.28.0-alpha, QEMU 11.1.1 (the egl-headless patched build for NVIDIA),
@@ -98,7 +98,7 @@ The runtime then removed the device: `Map` returned
 same lines appear on NVIDIA (`before/nvidia2/`); the gap is in the shader
 translation, not in a host driver.
 
-## Fix: `patches/mesa/0030`
+## Fix: `patches/mesa/d3d10umd-domain-shader-indexed-patch-constants.patch`
 
 Patch constants are separate TGSI `PATCH` inputs, one per D3D register.
 Tessellation factors are components of `TESSOUTER` and `TESSINNER`. Neither

@@ -40,10 +40,10 @@ tar -C "$src" --strip-components=1 -xzf "${file[mesa]}"
 mkdir -p "$src/subprojects/DirectX-Headers-1.0"
 tar -C "$src/subprojects/DirectX-Headers-1.0" --strip-components=1 \
   -xzf "${file[DirectX-Headers]}"
-for p in "$patches"/*.patch; do
-  echo "apply $(basename "$p")"
-  patch --directory="$src" --strip=1 --forward --batch --quiet < "$p"
-done
+while IFS= read -r p; do
+  echo "apply $p"
+  patch --directory="$src" --strip=1 --forward --batch --quiet < "$patches/$p"
+done < "$patches/series"
 python3 /w/build/mesa/prepare-winddk.py "$src" \
   "${file[windows-sdk-cpp]}" "${file[windows-wdk-x64]}"
 

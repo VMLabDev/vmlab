@@ -50,7 +50,7 @@ needs no host GPU, so the guest keeps its vsync.
 The device is in `hv/crates/vmlab-hv-devices/src/virtio/gpu/vblank.rs` (the
 clock and the answer) and `mod.rs` (`vblank_wait`, the hold in
 `queue_notify`), at the root of the vmlab repository. The driver side is
-`patches/kmd/0012`.
+`patches/kmd/kmd-host-vblank.patch`.
 
 ## The driver
 

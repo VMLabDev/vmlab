@@ -46,7 +46,7 @@ only the error answers. A restart of the VM starts a new renderer.
 
 ## The driver
 
-`patches/kmd/0011` reads the event on the configuration interrupt and at
+`patches/kmd/kmd-host-gpu-lost.patch` reads the event on the configuration interrupt and at
 each negotiation, because no interrupt reaches a driver before
 `DRIVER_OK`. The adapter is then lost until the next boot:
 

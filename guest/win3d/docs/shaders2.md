@@ -6,7 +6,7 @@ in hull and domain shaders, and output ranges outside a hull shader's patch
 phases. This page answers all three with one repro. It also covers a defect
 the repro found on the way: every hull shader whose join phase reads what its
 fork phases wrote removed the device, even with immediate indices. The fixes
-are `patches/mesa/0031` and `0032`. Investigated on 2026-10-18 and
+are `patches/mesa/d3d10umd-output-index-ranges-in-every-stage.patch` and `0032`. Investigated on 2026-10-18 and
 2026-10-19 on helios: NVIDIA 610.57.04 on `Nvidia1`, RADV (Mesa 26.2.2) on
 `AMD1`, vmlab 0.28.0-alpha, QEMU 11.1.1 on AMD1 and the egl-headless patched QEMU 11.1.50 on
 NVIDIA, virglrenderer 1.3.0. Evidence is in [docs/evidence/shaders2/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/shaders2/).
@@ -134,7 +134,7 @@ the autologon user's session. It copies the logs back and diffs every
 read-back line of hardware against WARP. It also collects the UMD's warning
 log. It exits 0 only when all four runs pass and both diffs are empty.
 
-## Cause and fix: output ranges (`patches/mesa/0031`)
+## Cause and fix: output ranges (`patches/mesa/d3d10umd-output-index-ranges-in-every-stage.patch`)
 
 The UMD translates DXBC to TGSI in `ShaderTGSI.c`. A `dcl_indexrange` over
 `o#` went to `dcl_tcs_tess_factor_index_range`, which accepts ranges only in
@@ -165,7 +165,7 @@ packed scalar system values (layer, viewport index, primitive ID) are
 written through a separate temporary, so a range over them is still
 reported as unsupported.
 
-## Cause and fix: join phases (`patches/mesa/0032`)
+## Cause and fix: join phases (`patches/mesa/d3d10umd-hull-shader-join-phases-read-fork-phase-outputs.patch`)
 
 d3dcompiler_47 emits a join phase whenever the patch-constant function
 computes one output from another. In `hs-join`, `o.c.x = o.e[idx]` becomes:

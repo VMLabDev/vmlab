@@ -19,7 +19,7 @@ start (GitHub #236, found on a laptop RTX 4050 with package 0.1.2-alpha).
 
 ## The fix
 
-`patches/mesa/0094` sends such a draw as one single-sampled draw per sample,
+`patches/mesa/yttrium-forced-sample-coverage-one-pass-per-sample.patch` sends such a draw as one single-sampled draw per sample,
 with the texture as an ordinary colour attachment and the blender's logic op
 XOR. No lock is needed, because the blender works in primitive order.
 

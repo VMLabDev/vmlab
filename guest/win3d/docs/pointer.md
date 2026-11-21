@@ -11,7 +11,7 @@ with the frame, a few frames after the hand moved (card #137, GitHub #235).
 
 ## Fix
 
-Patch `0005-kmd-hardware-pointer.patch` implements both calls, and the INF
+Patch `kmd-hardware-pointer.patch` implements both calls, and the INF
 sets `HWCursor` to 1 in the adapter's class key. `HWCursor` = 0 gives the
 old behaviour back after a restart of the device. The driver version is
 `100.6.101.58106`.
