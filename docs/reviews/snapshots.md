@@ -16,7 +16,7 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | data loss | An offline snapshot operation and a start of the same machine can write one qcow2 at the same time (fixed in #386) |
-| F2 | data loss | Snapshot lookup prefers the qcow2 id over the name, so an all-digit name can address another snapshot |
+| F2 | data loss | Snapshot lookup prefers the qcow2 id over the name, so an all-digit name can address another snapshot (fixed in #387) |
 | F3 | data loss | An offline restore of a multi-disk VM rewinds disk by disk with no check first and no way back |
 | F4 | data loss | A lab-wide restore rewinds machines one by one and stops at the first that fails |
 | F5 | wrong result | A container whose online restore fails stays paused |
@@ -62,6 +62,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F2. Lookup by id before name (data loss)
 
+- Fixed in #387. Snapshot lookup and duplicate-name checks match exact names
+  for apply, delete, export, creation and vmlab-hv restore preflight.
 - Where: `hv/crates/vmlab-disk/src/qcow2/snapshot.rs:147-151`
   (`load_snapshot_l1`), `:399-403` (`snapshot_apply_impl`), `:447-451`
   (`snapshot_delete_impl`), `:182-186` (`snapshot_create_impl`), and
