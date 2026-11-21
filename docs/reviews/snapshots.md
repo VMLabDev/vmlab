@@ -99,6 +99,10 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F3. Offline restore of several disks has no check and no way back (data loss)
 
+- Fixed in card #388. Restore checks each disk before stopping the VM and
+  saves the current disk states before applying the requested snapshot.
+  If an apply fails, restore rolls back the disks it attempted and retains
+  the recovery snapshot on any disk it cannot roll back.
 - Where: `src/labd/vm.rs:1881-1891`.
 - Why it is a fault: the offline branch stops the machine and then runs
   `snapshot_apply` on each path of `all_disk_paths()` in turn. It does not
