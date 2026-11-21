@@ -21,6 +21,12 @@ vmlab = { path = "..", default-features = false }
 [workspace]
 members = ["."]
 
+# A patch applies from the workspace root alone, and this crate is its own
+# workspace: repeat the main manifest's, or `vmlab` does not build here.
+[patch."https://github.com/Configweave/wscript.git"]
+wscript-core = { path = "../vendor/wscript-core" }
+wscript-compiler = { path = "../vendor/wscript-compiler" }
+
 [[bin]]
 name = "qcow2"
 path = "fuzz_targets/qcow2.rs"
