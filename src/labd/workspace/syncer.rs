@@ -4728,14 +4728,14 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
         let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
         let mut ws = workspace(dir.path(), state.path());
-        ws.max_file_bytes = 16;
+        ws.max_file_bytes = 64;
         let opens = sessions.opens().len();
         syncers.stop("dev01").await;
         syncers.mark_rewound(&ws).await.unwrap();
         rewind(&guest);
         let _socket =
             std::os::unix::net::UnixListener::bind(dir.path().join("monitor.sock")).unwrap();
-        std::fs::write(dir.path().join("big.bin"), [0; 32]).unwrap();
+        std::fs::write(dir.path().join("big.bin"), [0; 128]).unwrap();
         guest.dir("/src/big.bin");
         guest.file("/src/big.bin/child", "keep this", 1);
         let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
@@ -4744,11 +4744,11 @@ mod tests {
         let syncer = syncers.get("dev01").await.unwrap();
         assert!(eventually(|| syncer.report().passes > 0).await);
         let report = syncer.report();
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
+        assert!(guest.get("/src/experiment.rs").is_none());
         assert!(report.reseed.is_none(), "the re-seed barrier never lifted");
         assert!(!Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed);
         assert!(eventually(|| sessions.opens().len() > opens).await);
-        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
-        assert!(guest.get("/src/experiment.rs").is_none());
         assert_eq!(
             guest.text("/src/big.bin/child").as_deref(),
             Some("keep this")

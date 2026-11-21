@@ -209,7 +209,10 @@ impl Reconverged {
     /// Skips and size refusals are warnings. Collisions and failed actions
     /// keep the re-seed barrier in place.
     pub fn complete(&self) -> bool {
-        self.collisions.is_empty() && self.failures.is_empty()
+        self.oversize.is_empty()
+            && self.collisions.is_empty()
+            && self.skipped.is_empty()
+            && self.failures.is_empty()
     }
 
     /// The one line the event feed and `dev sync status` both carry.
