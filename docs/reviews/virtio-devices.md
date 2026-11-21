@@ -141,6 +141,9 @@ Not read:
 - Confidence: high for the server side. Medium that a Linux guest sends the
   second write for `echo a >> f; echo b >> f`. An end-to-end run in a guest
   settles it.
+- Fixed in card #398. OPEN and CREATE clear host `O_APPEND` when writeback
+  is negotiated, so writes honor the guest offset. Snapshots now record
+  the negotiated setting.
 
 ### F4. virtio-sound: `PCM_INFO` allocates the guest's `size` field with no limit
 
