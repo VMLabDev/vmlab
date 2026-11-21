@@ -60,28 +60,27 @@ the queue:
 1. The interrupt routine sees the answer of the wait. When no flip is
    waiting to be sent, it raises the vsync, which reports the addresses
    whose flips were sent, as `0008` made it.
-2. The completion of the wait, at DPC level, sends the waiting flip as the
-   timer did (`Flip()`), and then the next wait. The host serves the flip
-   before it holds the wait.
-3. A flip sent this way carries `FlipShownDone` on its flush. The host
-   answers the flush of a flip, the ordered flip of C10, once the frame is
-   on its display, and that answer raises the vsync of the tick. So the
-   address of a flip is reported when it is shown, as with the timer and
-   its NOP after the flip.
-4. When the answer to that flip has not come by the second vblank after it
-   (a flush that never reached the host), the vblank raises the vsync
-   itself, so the vsync cannot stop.
+2. When a flip is waiting, the interrupt routine leaves the vsync to the
+   completion of the wait. That completion, at DPC level, sends the flip as
+   the timer did (`Flip()`), then raises the vsync through
+   `DxgkCbSynchronizeExecution`, and then sends the next wait. The host
+   serves the flip before it holds the wait.
+
+So the vsync of every tick comes at the host's tick, a few microseconds
+later when a flip goes out first, and a flip is reported only after it was
+sent, as with the timer and its NOP after the flip. The vsync does not wait
+for the host's answer to the flip. That answer comes once the host GPU has
+shown the frame (the ordered flip of C10), so a vsync tied to it takes the
+jitter of the host GPU ("Result" has the measurement).
 
 `StopVsyncTimer` stops the resubmission. A wait still on the queue goes on
 ticking when a start follows before its answer. A reset cancels the wait
 with `ERR_UNSPEC`, and a start on a new transport sends a new one. The trace
 build records each answer as event 25 (`build/kmd/README.md`).
 
-One case gives two vsyncs in one tick: a flip that Windows records between
-the interrupt of the wait and its completion. The interrupt raised the vsync
-because no flip was waiting, and the completion sends the new flip, whose
-answer raises a second one. Windows takes a second vsync with a newer
-address as a frame shown early.
+A flip that Windows records between the interrupt of the wait and its
+completion is sent by that completion and reported by the vsync of the next
+tick. No tick raises two vsyncs.
 
 The interrupt data of `DXGK_INTERRUPT_CRTC_VSYNC` has no timestamp, so the
 host time reaches Windows only as the time of the interrupt. The driver
