@@ -1,5 +1,11 @@
 # ExecuteIndirect with state-changing command signatures
 
+Two patches make this work. `patches/vkd3d-proton/0006` handles command
+signatures that set root constants and root descriptors, and is what the
+first sections describe. `patches/vkd3d-proton/0007` handles signatures that
+set vertex and index buffer views
+([below](#vertex-and-index-buffer-views)).
+
 `D3D12ExecuteIndirect`, one of Microsoft's DirectX-Graphics-Samples, drew
 only its clear colour on AMD1 and Nvidia1 ([d3d12app.md](d3d12app.md)).
 `patches/vkd3d-proton/0006` fixes this. Without `VK_EXT_device_generated_commands`,
@@ -182,12 +188,140 @@ Nvidia1, and WARP covers 0.178 and 0.183.
 - Labs from the `windows-11` template report "Windows License is expired"
   and shut down about an hour after boot, even with a NAT NIC.
 
+## Vertex and index buffer views
+
+`0006` left out signatures with `D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW`
+or `D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW` arguments. vkd3d-proton
+then dropped the view arguments, and each sequence drew with the buffers
+bound on the CPU: wrong drawing with no error. `patches/vkd3d-proton/0007`
+emulates them. The work was done on 2026-11-21 on helios (card 254).
+
+### Why the views cannot be bound
+
+Root constants and root descriptor addresses are data, so the GPU can write
+them into a slot. A vertex or index buffer is different. Vulkan binds it with
+`vkCmdBindVertexBuffers2` or `vkCmdBindIndexBuffer`, by `VkBuffer` handle and
+offset, while the command buffer is recorded. The view in a sequence is an
+address the GPU reads when the command buffer runs, and it can name any
+buffer of the application at any offset. Only the first vertex, the first
+index and the vertex offset of an indirect draw come from the GPU.
+`VK_EXT_device_generated_commands` has tokens that bind by address, which is
+what vkd3d-proton uses when the device has it.
+
+### The vertex fetch
+
+`0007` does not bind the application's buffers. It copies what each sequence
+draws into scratch buffers, binds those for every sequence, and rewrites the
+draw arguments to point there. Each sequence stays one indirect draw, as in
+`0006`, so root arguments in the same signature keep working.
+
+A new compute shader, `cs_execute_indirect_vertex_fetch.comp`, runs up to
+four passes before the draws. They are recorded in the command list's own
+order, outside the render pass:
+
+1. **Index layout** (one invocation, indexed draws only): reads every
+   sequence's `IndexCountPerInstance` and gives it a range of the index
+   scratch buffer.
+2. **Index scan** (one invocation per index): reads the index through the
+   sequence's index buffer view, or through the view bound on the CPU when
+   the signature has none. It stores the index as 32 bits and keeps the lowest
+   and highest index of the sequence with atomic minimum and maximum. A strip
+   cut index is stored as `0xFFFFFFFF` and is not counted.
+3. **Vertex layout** (one invocation): gives every sequence a range of the
+   vertex scratch buffers, as long as the range of vertices it uses, and a
+   range of the instance scratch buffers, as long as its `InstanceCount`. It
+   then writes the sequence's draw arguments into its slot: the first index,
+   and a vertex offset that maps the lowest index to the start of the range.
+4. **Copy** (one invocation per vertex or instance element): copies the
+   element of every fetched binding from the address in the view. The view's
+   own stride and size are used, and bytes outside the view read as 0.
+
+The index values are not changed, so `SV_VertexID` is what Direct3D defines
+(the index, without `BaseVertexLocation`). `SV_InstanceID` is unchanged too.
+
+One draw gives all per-vertex bindings the same first vertex, and all
+per-instance bindings the same first instance. So when the signature sets one
+binding of a rate, the other bindings of that rate that the pipeline uses are
+fetched with it, from the views bound on the CPU. A signature that sets only
+the index buffer fetches indices and leaves the vertex buffers bound. For
+dispatch and mesh signatures the view arguments have no effect, as in
+Direct3D.
+
+A signature with view arguments and no root arguments has no root signature.
+Its slots then hold only the draw arguments, and the root parameters that
+are bound stay in effect.
+
+vkd3d-proton's line for such a signature ends in `fetching vertices`:
+
+```
+info:d3d12_command_signature_init_state_template_emulated: Emulating ExecuteIndirect state (4 patch words, slot stride 256, fetching vertices) without EXT_dgc.
+```
+
+### Limits of the vertex fetch
+
+- **The scratch buffers have a fixed size.** vkd3d-proton allocates them
+  while it records, before the GPU knows how much the sequences draw. One
+  `ExecuteIndirect` call can fetch 1024 vertices for each sequence of
+  `MaxCommandCount`, at least 16,384 and at most 1,048,576, the same number
+  of instance elements, and four times as many indices. The environment
+  variable `VKD3D_EXECUTE_INDIRECT_VERTEX_BUDGET` sets the number of vertices
+  instead. A draw that does not fit is not drawn. The GPU records that, and
+  vkd3d-proton logs an error when the command allocator is reset or
+  released:
+  `err:d3d12_command_allocator_report_execute_indirect_dropped: 1 emulated ExecuteIndirect call(s) dropped draws that did not fit the vertex scratch buffers.`
+- **Cost.** Every call copies the vertices and indices it draws, with two to
+  four compute dispatches. The two layout passes loop over `MaxCommandCount`
+  in one invocation. Scratch buffers above 1 MiB do not come from
+  vkd3d-proton's scratch pool: it creates them for the call and logs
+  `Requesting scratch buffer kind 0 larger than limit`. No frame rate was
+  measured.
+- **Strip cut.** The cut value follows the index format (`0xFFFF` for 16-bit,
+  `0xFFFFFFFF` for 32-bit), as in vkd3d-proton's ordinary indexed draws.
+- **The fetch reads the argument, index and vertex buffers in a compute
+  shader, by address.** It relies on the barriers the application's own
+  resource transitions record, as the `0006` patch pass does for the argument
+  buffer.
+
+### The check
+
+`ei_views_probe.exe` (source `probes/d3d12-ei/ei_views_probe.cpp`, built by
+`probes/d3d12-ei/build.sh`) draws a 5×5 grid of cells with five
+`ExecuteIndirect` calls and checks every cell:
+
+| Call | Signature | What it covers |
+| --- | --- | --- |
+| A | vertex buffer view (slot 0), index buffer view, root constants, indexed draw | Eight sequences, seven by the count buffer. 16-bit and 32-bit indices, `StartIndexLocation`, positive and negative `BaseVertexLocation`, two vertex strides. Slot 1 is bound on the CPU. |
+| B | vertex buffer view (slot 1, per instance), root constants, draw | Two instances a sequence, `StartInstanceLocation`. Slot 0 is bound on the CPU and read from `StartVertexLocation`. |
+| C | vertex buffer view (slot 0), index buffer view, indexed draw | Triangle strips with the `0xFFFF` strip cut, two quads a sequence. No root argument. |
+| D | vertex buffer view (slot 0), draw | Not indexed, `StartVertexLocation`. |
+| E | index buffer view, indexed draw | Only the index buffer comes from the arguments. |
+
+The sequences take their buffers from two resources, one in an upload heap
+and one in a default heap, at different offsets. Before each call the probe
+binds buffers that draw nothing and root constants that draw black, which the
+signature must replace. The vertex shader draws magenta when `SV_VertexID` or
+`SV_InstanceID` is not what Direct3D defines. The argument and count buffers
+are in a default heap and are written by a copy in the same command list, so
+the arguments exist only on the GPU when `ExecuteIndirect` is recorded.
+
+The probe draws the scene on the default adapter and, in a child process, on
+WARP. The child runs from a temporary directory with Microsoft's `d3d12.dll`
+(the package keeps it as `System32\vmlab-win3d\d3d12-native.dll`) and
+`D3D12Core.dll`, as the repro for `0006` did. Both pictures are compared with
+the expected colour of every cell and with each other, with 1/255 allowed for
+each channel. The probe also counts the `fetching vertices` lines in
+vkd3d-proton's log of its run.
+
+`tests/e2e/ei.sh <lab-dir> <vm> <evidence-dir>` runs the x64 and the x86
+probe in a lab where the package is installed. A run passes when the probe
+passed, the default adapter is not a software renderer, and vkd3d-proton
+logged all five signatures as emulated.
+
 ## What remains
 
-- **Vertex and index buffer view arguments** are bound on the CPU and cannot
-  come from the GPU in this scheme, so signatures with them are still
-  dropped, as before. Emulating them needs a pass that finds the VkBuffer
-  for each GPU VA. Alternatively, the shader could fetch vertices itself.
+- **Vertex and index buffer view arguments** were dropped by `0006`.
+  `0007` emulates them, with the limits listed
+  [below](#limits-of-the-vertex-fetch).
 - **Root CBVs through push descriptors.** On NVIDIA, vkd3d-proton normally
   binds root CBVs as push descriptors, which it measured as faster. Without
   DGC, they are now raw VAs on every vendor.
