@@ -446,13 +446,13 @@ fn a_stale_resend_of_the_known_shape_hides_the_pointer() {
     core.connected(secs(0.0), 8, 8);
     core.rect(secs(0.0), 0, 0, 8, 8, &solid(8, 8, BLACK));
     core.input(secs(0.01), InputEvent::Move { x: 4, y: 4 });
-    core.cursor(secs(0.02), arrow());
+    core.rfb_cursor(secs(0.02), arrow());
     assert!(core.draws_pointer());
 
     // The reset: same pixels, hotspot (0,0), no DesktopSize with it.
     let mut stale = arrow();
     stale.hotspot = (0, 0);
-    core.cursor(secs(0.5), stale.clone());
+    core.rfb_cursor(secs(0.5), stale.clone());
     assert!(!core.draws_pointer(), "the reset re-send hides the pointer");
     let frame = core.tick(secs(0.6)).pop().unwrap();
     assert!(all(&frame, BLACK));
@@ -460,16 +460,16 @@ fn a_stale_resend_of_the_known_shape_hides_the_pointer() {
     // Firmware text mode, then the kernel's mode: each DesktopSize carries
     // the stale shape again.
     core.desktop_size(secs(1.0), 4, 2);
-    core.cursor(secs(1.0), stale.clone());
+    core.rfb_cursor(secs(1.0), stale.clone());
     assert!(!core.draws_pointer(), "stale with the firmware DesktopSize");
     core.desktop_size(secs(2.0), 8, 8);
-    core.cursor(secs(2.0), stale);
+    core.rfb_cursor(secs(2.0), stale);
     assert!(!core.draws_pointer(), "stale with the kernel DesktopSize");
 
     // The greeter defines its own cursor: a different shape, drawn again.
     let mut greeter = arrow();
     greeter.rgba[0] = 0;
-    core.cursor(secs(3.0), greeter);
+    core.rfb_cursor(secs(3.0), greeter);
     assert!(core.draws_pointer(), "a genuinely new shape is drawn");
 }
 
@@ -484,15 +484,15 @@ fn a_legitimate_redefinition_after_a_mode_change_shows_the_pointer() {
     core.connected(secs(0.0), 8, 8);
     core.rect(secs(0.0), 0, 0, 8, 8, &solid(8, 8, BLACK));
     core.input(secs(0.01), InputEvent::Move { x: 4, y: 4 });
-    core.cursor(secs(0.02), arrow());
+    core.rfb_cursor(secs(0.02), arrow());
 
     core.desktop_size(secs(1.0), 4, 4);
     let mut stale = arrow();
     stale.hotspot = (0, 0);
-    core.cursor(secs(1.0), stale);
+    core.rfb_cursor(secs(1.0), stale);
     assert!(!core.draws_pointer(), "QEMU's re-send with the DesktopSize");
     core.rect(secs(1.1), 0, 0, 4, 4, &solid(4, 4, GREEN));
-    core.cursor(secs(1.2), arrow());
+    core.rfb_cursor(secs(1.2), arrow());
     assert!(
         core.draws_pointer(),
         "the compositor's own redefinition carries its hotspot"
@@ -505,18 +505,38 @@ fn a_legitimate_redefinition_after_a_mode_change_shows_the_pointer() {
 /// it: the first definition is drawn, an identical repeat is treated as
 /// stale and hides the pointer, and a different shape shows it again.
 #[test]
-fn an_identical_repeat_with_a_zero_hotspot_is_treated_as_stale() {
+fn rfb_treats_an_identical_repeat_with_a_zero_hotspot_as_stale() {
     let size = Size::new(8, 8);
     let mut core = Core::new(settings(10, size, None));
     core.connected(secs(0.0), 8, 8);
     core.input(secs(0.01), InputEvent::Move { x: 4, y: 4 });
     let zero = dot([255, 255, 255, 255], (0, 0));
-    core.cursor(secs(0.02), zero.clone());
+    core.rfb_cursor(secs(0.02), zero.clone());
     assert!(core.draws_pointer(), "the first definition is genuine");
-    core.cursor(secs(0.5), zero);
+    core.rfb_cursor(secs(0.5), zero);
     assert!(!core.draws_pointer(), "an identical repeat is hidden");
-    core.cursor(secs(1.0), dot([0, 0, 0, 255], (0, 0)));
+    core.rfb_cursor(secs(1.0), dot([0, 0, 0, 255], (0, 0)));
     assert!(core.draws_pointer(), "a different shape is drawn");
+}
+
+#[test]
+fn native_draws_an_identical_zero_hotspot_shape_after_a_move() {
+    let size = Size::new(8, 8);
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 8, 8);
+    core.rect(secs(0.0), 0, 0, 8, 8, &solid(8, 8, BLACK));
+    let mut shape = arrow();
+    shape.hotspot = (0, 0);
+    core.cursor(secs(0.01), shape.clone());
+    core.pointer_state(secs(0.01), 1, 1, true);
+    let frame = core.tick(secs(0.1)).pop().unwrap();
+    assert_eq!(pixel(&frame, size, 1, 1), [255; 3]);
+
+    core.cursor(secs(0.11), shape);
+    core.pointer_state(secs(0.11), 4, 4, true);
+    let frame = core.tick(secs(0.2)).pop().unwrap();
+    assert_eq!(pixel(&frame, size, 4, 4), [255; 3]);
+    assert_eq!(pixel(&frame, size, 1, 1), BLACK);
 }
 
 /// Alpha cursor pixels arrive premultiplied, so they are added to what is

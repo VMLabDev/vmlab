@@ -280,19 +280,12 @@ def check(args):
     seen, dirty = frame_check(args.shots, positions, bg)
     results['frame'] = {'pass': len(seen) >= 3 and not dirty, 'captures_with_window': len(seen), 'with_pointer': dirty}
 
-    if args.frames:
-        counts = recording_check(args.frames, plan, positions, bg)
-        # vmlab's recorder takes a repeated shape whose hotspot is (0,0) for a stale one and
-        # hides it, and vmlab-hv repeats the shape with every move (docs/pointer.md). Such a
-        # step is not judged.
-        origin = {m['step'] for m in matched if m['kind'] != 'hidden' and m['hot'] == [0, 0]}
-        judged = [(kind, n) for i, (kind, n) in enumerate(zip(plan, counts)) if i not in origin]
-        results['recording'] = {
-            'pass': any(kind != 'hidden' for kind, _ in judged)
-            and all((n == 0) if kind == 'hidden' else (n > 0) for kind, n in judged),
-            'frames_with_pointer_at_step': counts,
-            'steps_not_judged': sorted(origin),
-        }
+    counts = recording_check(args.frames, plan, positions, bg) if args.frames else []
+    results['recording'] = {
+        'pass': len(counts) == len(plan) and any(kind != 'hidden' for kind in plan)
+        and all((n == 0) if kind == 'hidden' else (n > 0) for kind, n in zip(plan, counts)),
+        'frames_with_pointer_at_step': counts,
+    }
 
     out = {'pass': all(r['pass'] for r in results.values()) and not data['errors'], 'watch_errors': data['errors'], **results}
     if args.guest:

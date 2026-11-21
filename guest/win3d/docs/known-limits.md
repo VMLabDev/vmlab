@@ -33,8 +33,6 @@ Since driver `100.6.101.58106` Windows hands the pointer to the host
 I-beam) are black with a white outline. A pointer larger than 64×64 is drawn
 into the frame by Windows, and only the first display has a hardware pointer.
 Checked on `windows-11` on `AMD1` and `Nvidia2` with `tests/e2e/pointer.sh`.
-In a `vmlab record` video the arrow is missing: vmlab's recorder hides a
-repeated shape whose hotspot is (0,0) ([pointer.md](pointer.md), "Check").
 Not tested: more than one display, a pointer above 64×64, sleep and resume,
 a timeout recovery while the pointer is on, Windows 10, and QEMU.
 
@@ -77,11 +75,10 @@ loss and a reset callback. The full TDR regression also rejects APPCRASH
 records whose fault module is a `viogpu` DLL.
 
 Recovery requires a conforming virtio reset acknowledgement. Native vmlab-hv
-currently logs renderer-reset errors and still clears device status. Its Venus
-proxy also sends context destruction asynchronously, without an explicit reply
-that proves renderer workers and native GPU operations have stopped. Guest
-memory aliases are removed separately. Successful forced recovery does not,
-by itself, establish that backend quiescence guarantee.
+keeps the device status nonzero until its renderer and every Venus render
+worker of the guest's contexts have stopped, and reports a failed teardown as
+`DEVICE_NEEDS_RESET` ([tdr-recovery.md](tdr-recovery.md), "Backend
+prerequisite").
 
 ## Host
 

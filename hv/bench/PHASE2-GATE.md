@@ -1,12 +1,25 @@
 # Phase-2 performance gate (HV-D28)
 
-**Verdict: D28 remains open. Round 7 met six of ten core bars. Card #71 then
-closed G1 (0.9770). Card #72 reran G2 and did not close it (1.0182). Card #73
-closed G6 (1.6307). Card #98 merged the ioeventfd wake of the virtio-blk
-worker (FD6) and reran both: G2 1.0240, G6 1.5416. Card #74 closed G7
-(1.1434). Card #97 moved the virtio-gpu 2D commands off the vCPU threads
-(FD5) and reran G2: 0.9361, with a boot time that did not move outside its
-spread.**
+**Verdict: D28 is closed. All ten core x86_64 KVM bars pass.**
+
+The operator accepted G2 at parity on 2026-11-18. Card #97 then measured
+0.9361, within the observed boot-time spread.
+
+| Bar | Workload | Passing vmlab-hv/QEMU ratio | Evidence |
+|---|---|---:|---|
+| G1 | Ubuntu boot | 0.9834 | Card #98 |
+| G2 | Windows 10 boot | 0.9361 | Card #97 |
+| G3 | Sequential read | 1.1689 | Card #98 |
+| G4 | Sequential write | 1.8083 | Card #98 |
+| G5 | Random read 4 KiB | 1.3249 | Card #98 |
+| G6 | Random write 4 KiB | 1.5416 | Card #98 |
+| G7 | UDP transmit | 1.1434 | Card #74 |
+| G8 | UDP receive | 1.3399 | Card #98 |
+| G9 | TCP A to B | 1.1603 | Round 7 |
+| G10 | TCP B to A | 1.1723 | Round 7 |
+
+Card #74's dedicated G7 rerun closed that bar. Card #98 also recorded
+0.7990 for UDP transmit in its virtio-blk follow-up.
 
 ## Round 7 follow-up: virtio-gpu 2D commands off the vCPU thread (card #97, 2026-11-19)
 

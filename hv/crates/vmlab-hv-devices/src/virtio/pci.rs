@@ -299,6 +299,10 @@ pub struct VirtioPciDevice {
     queue_select: u16,
     queue_cfg: Vec<QueueCfg>,
     activated: bool,
+    /// The device has not confirmed its last reset
+    /// ([`VirtioDevice::reset_settled`]): the status reads
+    /// `DEVICE_NEEDS_RESET`, not zero.
+    unsettled: bool,
     // PCI state the guest writes.
     command: u16,
     bar4: u64,
@@ -419,6 +423,7 @@ impl VirtioPciDevice {
             queue_select: 0,
             queue_cfg,
             activated: false,
+            unsettled: false,
             command: 0,
             bar4: 0,
             interrupt_line: 0,
@@ -542,6 +547,21 @@ impl VirtioPciDevice {
         }
         drop(int);
         self.device.reset();
+        // Until the device confirms the reset the status is
+        // DEVICE_NEEDS_RESET, so that a driver waiting for zero does not
+        // free memory the device may still use.
+        self.unsettled = !self.device.reset_settled();
+        if self.unsettled {
+            self.driver_status = device_status::DEVICE_NEEDS_RESET;
+        }
+    }
+
+    /// Show status zero once the device confirms its last reset.
+    fn settle(&mut self) {
+        if self.unsettled && self.device.reset_settled() {
+            self.unsettled = false;
+            self.driver_status = 0;
+        }
     }
 
     /// Handle a write to `device_status` (VIRTIO 1.2 §2.3-2.4.1).
@@ -549,6 +569,13 @@ impl VirtioPciDevice {
         if new == 0 {
             self.virtio_reset();
             return;
+        }
+        if self.unsettled {
+            // The driver did not wait for status zero.
+            self.settle();
+            if self.unsettled {
+                return;
+            }
         }
         let mut status = new & device_status::FAILED;
         if new & device_status::ACKNOWLEDGE != 0 {
@@ -929,6 +956,9 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn bar_read(&mut self, bar: u8, offset: u64, data: &mut [u8]) {
+        if self.unsettled {
+            self.settle();
+        }
         if bar == ROM_BAR {
             data.fill(0xff);
             if let Some(image) = self
@@ -1337,6 +1367,7 @@ impl VirtioPciDevice {
             self.device.ack_features(negotiated);
         }
         self.driver_status = driver_status;
+        self.unsettled = false;
         if activate && driver_status & device_status::DRIVER_OK != 0 {
             self.activate();
         }
