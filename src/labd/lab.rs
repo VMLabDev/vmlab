@@ -3483,10 +3483,9 @@ impl LabRuntime {
     /// on owing a **re-seed**, which carries the tree back host→guest and lets
     /// nothing flow the other way.
     ///
-    /// `discard` is the explicit flag a halted workspace needs. Refusing
-    /// outright would be obstruction — wanting to throw the guest copy away is
-    /// frequently *why* someone restores — but a restore destroys the guest
-    /// copy of every conflicting path, so it is asked for by name.
+    /// The pre-flight flush carries pending guest work to the host and
+    /// refuses if it cannot. `discard` explicitly allows the rewind to
+    /// throw away pending guest work.
     /// Restore `snap` on machine `name` (§7.3). Answers with what the
     /// restore could not do but did not fail over: the warnings to show.
     pub async fn restore(
@@ -3636,9 +3635,6 @@ impl LabRuntime {
             );
         }
 
-        self.workspaces
-            .before_restore(name, discard, workspace)
-            .await?;
         // Bind any deferred artefact before comparing the snapshot pin.
         self.ensure_pulled(std::slice::from_ref(&name.to_string()), None)
             .await?;
@@ -3653,6 +3649,10 @@ impl LabRuntime {
                 );
             }
         }
+        // Flush after any deferred pull, before the caller suspends sync.
+        self.workspaces
+            .before_restore(name, discard, workspace)
+            .await?;
         Ok(record)
     }
 
