@@ -54,6 +54,11 @@ const T_DISCARD: u32 = 11;
 const T_BARRIER: u32 = 0x8000_0000;
 
 // Request completion statuses (VIRTIO 1.2 §5.2.5).
+/// The most one request stages in host memory at a time on the
+/// scatter-gather path. The guest picks the length of a descriptor chain,
+/// and descriptors may alias one region, so that length is no bound.
+const IO_CHUNK: usize = 1 << 20;
+
 const S_OK: u8 = 0;
 const S_IOERR: u8 = 1;
 const S_UNSUPP: u8 = 2;
@@ -1632,6 +1637,87 @@ mod tests {
         f.chain_hdr_data_status(512, true);
         f.submit(0);
         assert_eq!(f.status(), S_IOERR);
+    }
+
+    /// Review virtio-devices F5: the guest picks the length of a chain, and
+    /// descriptors may alias one region, so a request is checked against the
+    /// disk before any of it is copied.
+    #[test]
+    fn write_larger_than_the_disk_is_refused_before_it_is_buffered() {
+        let mut f = Fixture::new(Box::new(MemDisk::new(4096)));
+        f.put_header(T_OUT, 0);
+        f.write_desc(0, desc(f.headers, 16, NEXT, 1));
+        for i in 1..=8 {
+            f.write_desc(i, desc(0x10000, 64 * 1024, NEXT, i + 1));
+        }
+        f.write_desc(9, desc(f.buf + 0x800, 1, WRITE, 0));
+        f.submit(0);
+        assert_eq!(f.status(), S_IOERR);
+        assert!(
+            f.block.io_buffer.capacity() <= 4096,
+            "{} bytes were buffered for a refused write",
+            f.block.io_buffer.capacity()
+        );
+    }
+
+    /// Review virtio-devices F5: a request the disk does hold is moved in
+    /// pieces, so the staging buffer stays bounded whatever the chain's
+    /// length. Both directions take the scatter-gather path here: the read's
+    /// header is split over two descriptors.
+    #[test]
+    fn large_requests_are_staged_in_bounded_pieces() {
+        const PIECE: u32 = 512 * 1024;
+        const PIECES: u16 = 5;
+        let len = (PIECE * u32::from(PIECES)) as usize;
+        for kind in [T_OUT, T_IN] {
+            let disk = MemDisk::new(4 << 20);
+            let content = disk.content();
+            let mut f = Fixture::new(Box::new(disk));
+            let pattern: Vec<u8> = (0..PIECE).map(|i| (i % 241) as u8).collect();
+            f.put_header(kind, 8);
+            let first_data = if kind == T_OUT {
+                f.mem.write_slice(&pattern, GuestAddress(0x40000)).unwrap();
+                f.write_desc(0, desc(f.headers, 16, NEXT, 1));
+                1
+            } else {
+                for piece in content.lock()[4096..4096 + len].chunks_mut(PIECE as usize) {
+                    piece.copy_from_slice(&pattern);
+                }
+                f.write_desc(0, desc(f.headers, 8, NEXT, 1));
+                f.write_desc(1, desc(f.headers + 8, 8, NEXT, 2));
+                2
+            };
+            let flags = NEXT | if kind == T_IN { WRITE } else { 0 };
+            // Every data descriptor names the same 512 KiB of guest memory.
+            for i in first_data..first_data + PIECES {
+                f.write_desc(i, desc(0x40000, PIECE, flags, i + 1));
+            }
+            f.write_desc(first_data + PIECES, desc(f.buf + 0x800, 1, WRITE, 0));
+            f.submit(0);
+            assert_eq!(f.status(), S_OK);
+            assert!(
+                f.block.io_buffer.capacity() <= IO_CHUNK,
+                "{} bytes were staged for one request",
+                f.block.io_buffer.capacity()
+            );
+            if kind == T_OUT {
+                let content = content.lock();
+                for piece in content[4096..4096 + len].chunks(PIECE as usize) {
+                    assert!(piece == pattern.as_slice());
+                }
+                assert!(content[..4096].iter().all(|&b| b == 0));
+                assert!(content[4096 + len..].iter().all(|&b| b == 0));
+            } else {
+                // The last piece of the image range is what the aliased
+                // region holds at the end.
+                let mut received = vec![0; PIECE as usize];
+                f.mem
+                    .read_slice(&mut received, GuestAddress(0x40000))
+                    .unwrap();
+                assert!(received == pattern);
+                assert_eq!(f.used_slot(0), (1, 0, len as u32 + 1));
+            }
+        }
     }
 
     #[test]
