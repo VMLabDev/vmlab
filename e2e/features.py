@@ -235,11 +235,11 @@ FEATURES: dict[str, str] = {
 
 HOST = "host"
 
-# Every phase in the order vmlab-hv delivers them.
+# Phase order for the historical coverage cutoff.
 PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
 
-# The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
-VMLAB_DELIVERED = "2f"
+# Phase 4 is delivered independently of TCG in phase 3.
+VMLAB_DELIVERED = "4"
 
 _GROUPS: dict[str, list[str]] = {
     HOST: [
@@ -337,6 +337,7 @@ def out_of_scope(feature: str, hypervisor: str, delivered: str = VMLAB_DELIVERED
     if feature in QEMU_ONLY:
         return f"QEMU only: {QEMU_ONLY[feature]}"
     phase = PHASES[feature]
-    if PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered):
+    if (phase == "3" and delivered != "3"
+            or PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered)):
         return f"vmlab-hv phase {phase}"
     return None
