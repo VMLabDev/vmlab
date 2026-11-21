@@ -42,7 +42,10 @@ answered as they come, and the wait completes out of order at its tick. The
 host refuses the wait (`ERR_INVALID_PARAMETER`) unless the driver acked the
 bit, when it carries a fence, when its response buffer is shorter than 48
 bytes, and on a device without a renderer, which keeps online snapshots and
-so cannot hold a chain across one. A reset of the device drops a held wait.
+so cannot hold a chain across one. A scanout other than 0 is refused with
+`ERR_INVALID_SCANOUT_ID`. A reset of the device drops a held wait. A lost
+host GPU ([device-lost.md](device-lost.md)) does not stop the clock: the wait
+needs no host GPU, so the guest keeps its vsync.
 
 The device is in `hv/crates/vmlab-hv-devices/src/virtio/gpu/vblank.rs` (the
 clock and the answer) and `mod.rs` (`vblank_wait`, the hold in
