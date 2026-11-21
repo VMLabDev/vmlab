@@ -1,0 +1,54 @@
+Subject: [PATCH] d3d9: map dynamic draw buffers directly
+
+DISCARD and NOOVERWRITE buffer locks are write maps even when the
+runtime leaves WriteOnly unset. A read flag prevents the threaded
+context from renaming on DISCARD and can make Zink stage NOOVERWRITE.
+Staging also hides writes from draws submitted before Unlock.
+
+Use write maps for these locks and make dynamic buffers persistently
+mappable. A full DISCARD can then rename busy storage while queued
+draws keep the old allocation. NOOVERWRITE continues to map the
+current allocation, including when combined with DISCARD.
+
+---
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -1679,7 +1679,8 @@
+    if (templ->target == PIPE_BUFFER) {
+       util_range_init(&res->valid_buffer_range);
+       res->base.b.bind |= PIPE_BIND_SHADER_IMAGE;
+-      if (!screen->resizable_bar && templ->width0 >= 8196) {
++      if (!screen->resizable_bar && templ->width0 >= 8196 &&
++          !(templ->flags & PIPE_RESOURCE_FLAG_MAP_PERSISTENT)) {
+          /* We don't want to evict buffers from VRAM by mapping them for CPU access,
+           * because they might never be moved back again. If a buffer is large enough,
+           * upload data by copying from a temporary GTT buffer. 8K might not seem much,
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
+@@ -2853,6 +2853,10 @@
+          templ.usage = D3D9PipeUsage(data);
++         /* Draws can consume a dynamic buffer while the application has it
++          * locked. Disable the threaded context's deferred CPU uploads. */
++         if (templ.target == PIPE_BUFFER && templ.usage == PIPE_USAGE_DYNAMIC)
++            templ.flags |= PIPE_RESOURCE_FLAG_MAP_PERSISTENT | PIPE_RESOURCE_FLAG_MAP_COHERENT;
+          /* Non-texture render-target surfaces can be legacy CPU-blt sources
+           * even without DiscardRenderTarget. Keep those conservative until
+           * their actual Present is qualified. */
+         if (yttrium && templ.target != PIPE_BUFFER &&
+             !data->Flags.SharedResource &&
+@@ -3316,7 +3320,11 @@
+    unsigned usage = D3D9PipeMapUsage(data->Flags);
+    /* D3DLOCK_DISCARD with D3DLOCK_NOOVERWRITE on a buffer is a NOOVERWRITE
+     * lock, as DXVK's D3D9 and Windows drivers treat it. Valley locks a 4 MiB
+     * vertex buffer whole with both, about 100 times a second. */
+-   if (buffer_resource && data->Flags.Discard && data->Flags.NoOverwrite)
+-      usage &= ~PIPE_MAP_DISCARD_RANGE;
++   if (buffer_resource && !data->Flags.ReadOnly) {
++      if (data->Flags.Discard || data->Flags.NoOverwrite)
++         usage &= ~PIPE_MAP_READ;
++      if (data->Flags.NoOverwrite)
++         usage &= ~PIPE_MAP_DISCARD_RANGE;
++   }
+    void *map = NULL;
