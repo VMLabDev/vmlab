@@ -203,6 +203,9 @@ pub fn oci_document(data: &[u8]) {
         let _ = config.vars();
         let again = config.to_json().expect("a parsed config serialises");
         oci::config_blob::TemplateConfig::from_json(&again).expect("and parses again");
+        if let Ok(base) = config.clone().into_meta(None) {
+            let _ = config.clone().into_variant(&base);
+        }
         let _ = config.into_meta(None);
     }
     let _ = serde_json::from_slice::<oci::image::model::ImageConfig>(data);
