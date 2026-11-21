@@ -49,3 +49,4 @@ d3d9-record-coordinate-wrap-render-states.patch
 d3d9-vertex-fog-specular-alpha.patch
 d3d9-select-table-fog-from-w-info.patch
 d3d9-default-inputs-for-unbound-streams.patch
+d3d10umd-draw-b8g8r8x8-elements-and-indexed-draws-without-an-index-buffer.patch
