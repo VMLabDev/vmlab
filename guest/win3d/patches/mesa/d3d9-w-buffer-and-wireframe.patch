@@ -55,7 +55,7 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends
 +   }
 +}
 
-@@ -633,6 +645,8 @@
+@@ -633,7 +645,10 @@
        D3D9TranslatedPsFetch4(device, ps->translated_ps_sampler_mask, &fetch4,
 -                             &fetch4_ati1, &fetch4_projected_fallback);
 -      const UINT key = D3D9TranslatedPsFogKey(fog_enable, fog_mode, zfog) |
@@ -66,9 +66,11 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends
 +         device->render_states[D3DDDIRS_ZENABLE] == D3DZB_USEW;
 +      const UINT key = D3D9TranslatedPsFogKey(fog_enable, fog_mode, zfog) |
 +         ((UINT)projected << 4) | D3D9TranslatedPsShadeKey(device) |
-+         (sampler_ps1xtypes << 13) | (w_depth ? D3D9_PS_KEY_W_DEPTH : 0u);
++         (sampler_ps1xtypes << 13);
        if (ps->translated_ps_key != key ||
-@@ -646,5 +660,5 @@
++          ps->translated_ps_w_depth != w_depth ||
+           ps->translated_ps_sampler_type_overrides !=
+@@ -646,5 +661,5 @@
            fetch4_projected_fallback) {
 -         HRESULT hr = D3D9TranslatePixelShaderForState(device, ps, fog_enable,
 -                                                       fog_mode, zfog,
@@ -77,7 +79,7 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends
 +                                                       fog_mode, zfog, w_depth,
 +                                                       projected,
                                                         sampler_ps1xtypes,
-@@ -1737,5 +1751,7 @@
+@@ -1737,5 +1752,7 @@
     }
 -   state.fill_front = PIPE_POLYGON_MODE_FILL;
 -   state.fill_back = PIPE_POLYGON_MODE_FILL;
@@ -134,17 +136,18 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9NineShader.c b/src/gallium/front
 +        }
 +    }
 
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Private.h b/src/gallium/frontends/d3d10umd/D3D9Private.h
+--- a/src/gallium/frontends/d3d10umd/D3D9Private.h
++++ b/src/gallium/frontends/d3d10umd/D3D9Private.h
+@@ -261,3 +261,4 @@
+    void *translated_ps_cso;
+    UINT translated_ps_key;
++   bool translated_ps_w_depth;
+    uint64_t translated_ps_sampler_type_overrides;
 diff --git a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h
 --- a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h
 +++ b/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.h
-@@ -8,3 +8,5 @@
-
--#include "D3D9Private.h"
-+#include "D3D9Private.h"
-+
-+constexpr UINT D3D9_PS_KEY_W_DEPTH = 1u << 31;
-
-@@ -23,4 +25,5 @@
+@@ -23,4 +23,5 @@
                                           UINT fog_mode,
 -                                         bool zfog,
 -                                         uint8_t projected,
@@ -170,9 +173,8 @@ diff --git a/src/gallium/frontends/d3d10umd/D3D9ShaderTranslate.cpp b/src/galliu
     info.projected = projected;
 @@ -179,3 +180,4 @@
        (info.color_flatshade ? 1u << 12 : 0u) |
--      (sampler_ps1xtypes << 13);
-+      (sampler_ps1xtypes << 13) |
-+      (w_depth ? D3D9_PS_KEY_W_DEPTH : 0u);
+       (sampler_ps1xtypes << 13);
++   shader->translated_ps_w_depth = w_depth;
     shader->translated_ps_sampler_type_overrides = sampler_type_overrides;
 @@ -207,3 +209,3 @@
     return D3D9TranslatePixelShaderForState(device, shader, false,
