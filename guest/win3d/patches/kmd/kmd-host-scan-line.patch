@@ -1,3 +1,9 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: report the scan line from host vblank ticks
+
+Estimate the current line and vertical blank state from the C11 tick and
+frame period. See docs/vblank.md.
+
 diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
 --- a/viogpu/viogpu3d/driver.cpp
 +++ b/viogpu/viogpu3d/driver.cpp
