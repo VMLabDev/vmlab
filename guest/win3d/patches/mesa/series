@@ -56,5 +56,6 @@ d3d9-preserve-borrowed-system-memory-pitch.patch
 d3d9-interpolate-wrapped-coordinates.patch
 d3d9-map-dynamic-buffers-directly.patch
 d3d9-w-buffer-and-wireframe.patch
+d3d9-register-ati2-scratch-pixel-size.patch
 d3d9-blit-yuy2-surfaces.patch
 d3d9-report-yuy2-format-conversion.patch
