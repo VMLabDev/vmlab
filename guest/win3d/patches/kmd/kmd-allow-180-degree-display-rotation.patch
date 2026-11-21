@@ -1,6 +1,9 @@
+Subject: [PATCH] viogpu3d: allow 180-degree display mode changes
+
 Allow the display manager to select a 180-degree orientation for the
 single scanout. Its primary surface retains the same dimensions, and
-the compositor can populate it in the selected orientation.
+the compositor can populate it in the selected orientation. See
+docs/acceptance/C356.md.
 
 diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
 --- a/viogpu/viogpu3d/viogpu_vidpn.cpp
