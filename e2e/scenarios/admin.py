@@ -132,7 +132,6 @@ def down_isolation(h, attempts=1):
 
         for attempt in range(1, attempts + 1):
             h.vmlab("up", cwd=a)
-            h.wait_ready(a, "guest")
             h.vmlab("down", cwd=a)
             labs = listed(h)
             assert "e2e-down-a" not in labs, f"attempt {attempt}: lab A is still registered"
