@@ -917,6 +917,28 @@ cleared on both GPUs. The 14 size-one point failures at lines 11460
 and 11498 also cleared. No new assertions failed. The Win3D end-to-end
 run on the prepared AMD1 clone passed all 12 Done checks.
 
+#### Table fog (card #335)
+
+Table fog selects screen Z when the runtime reports `(1, 1)` through
+`UpdateWInfo`. Equal non-unit endpoints still select W fog. The pixel
+shader recovers W from the rasterizer's reciprocal clip W for
+pre-transformed, fixed-function and programmable vertices.
+[Mesa patch](../patches/mesa/d3d9-select-table-fog-from-w-info.patch).
+
+On helios, Wine 11.0's `d3d9_visual` ran 206,068 checks with 31 skips per
+GPU on Windows 11 template `26100.1742.11` using the signed package from
+`ab2afacc`. The targeted assertions are at `visual.c:28481` with table fog
+enabled and `ortho_fog = 0`.
+
+| D3D9 visual failures | AMD1 before → after | Nvidia2 before → after |
+| --- | --- | --- |
+| Pre-transformed vertices, reciprocal RHW (`vs_mode = 0`) | 48 → 0 | 48 → 0 |
+| Fixed-function transformed W (`vs_mode = 1`) | 48 → 0 | 48 → 0 |
+| Shader output W, with and without explicit fog (`vs_mode = 2` or `3`) | 72 → 0 | 72 → 0 |
+| Full program | 343 → 175 | 345 → 177 |
+
+The remaining failure messages matched the baseline on each GPU.
+
 #### Draft cards
 
 Each row is a draft card. Counts are AMD1 / Nvidia2.
@@ -931,9 +953,6 @@ Each row is a draft card. Counts are AMD1 / Nvidia2.
 | Match Ex depth-stencil surface creation | `d3d9ex`, 2 / 2 | Lines 687 and 705 are the call and output pointer for the same case. Check both the return value and surface output for test 2. |
 | Preserve the uploaded Ex texture contents | `d3d9ex`, 1 / 1 | Line 872 samples `0xf7f7f7` after `UpdateTexture`, expected `0x7f7f7f`. Trace upload and sampling separately. |
 | Support the Ex ATI2 volume-texture case | `d3d9ex`, 1 / 1 | Line 4585. Match the expected result for volume-texture test 29. |
-| Use reciprocal RHW for perspective table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 0`. Check fog uses W recovered from the pre-transformed vertex. |
-| Use transformed W for fixed-function table fog | `visual`, 48 / 48 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 1`. Check fog uses the W produced by the fixed-function transform. |
-| Use shader output W for perspective table fog | `visual`, 72 / 72 | Line 28481, nonzero pixel fog mode, `ortho_fog = 0`, `vs_mode = 2` or `3`. Check fog uses shader output W with and without an explicit fog output. |
 | Match pre-transformed vertex fog | `visual`, 24 / 24 | Line 28481, pixel fog disabled, vertex fog enabled, `vs_mode = 0`. Check the fog blend derived from specular alpha. |
 | Use shader output specular alpha when oFog is absent | `visual`, 32 / 32 | Line 28481, pixel fog disabled, `vs_mode = 2`. Check the blend for each vertex fog mode with a shader that writes specular alpha. |
 | Support fixed-function texture transforms with programmable pixel shaders | `visual`, 64 / 64 | Lines 28754 and 28870. Investigate the 32 draw errors and verify the corresponding texture samples. |
