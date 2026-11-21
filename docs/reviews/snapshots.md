@@ -15,7 +15,7 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | An offline snapshot operation and a start of the same machine can write one qcow2 at the same time |
+| F1 | data loss | An offline snapshot operation and a start of the same machine can write one qcow2 at the same time (fixed in #386) |
 | F2 | data loss | Snapshot lookup prefers the qcow2 id over the name, so an all-digit name can address another snapshot |
 | F3 | data loss | An offline restore of a multi-disk VM rewinds disk by disk with no check first and no way back |
 | F4 | data loss | A lab-wide restore rewinds machines one by one and stops at the first that fails |
@@ -29,6 +29,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F1. Offline snapshot operations do not exclude a start (data loss)
 
+- Fixed in #386. A per-machine reservation excludes boot during offline
+  capture, restore and deletion for VMs and containers.
 - Where: `src/labd/vm.rs:1808-1829` (`take_snapshot`), `:1881-1891` (offline
   branch of `load_snapshot`), `:1896-1920` (`drop_snapshot`),
   `src/labd/vm.rs:1264-1270` (`boot_inner`), `src/labd/container.rs:1126-1135`,

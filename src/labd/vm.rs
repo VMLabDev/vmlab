@@ -312,6 +312,7 @@ pub struct VmInstance {
     /// RAII, so clearing detaches them.
     nic_attachments: Mutex<Vec<NicAttachment>>,
     state: RwLock<PowerState>,
+    snapshot_gate: Arc<Mutex<()>>,
     /// The guest agent answers `guest-ping`. Set by the readiness poller.
     agent_up: RwLock<bool>,
     /// The VM is fully provisioned and usable: agent up AND the first-boot
@@ -441,6 +442,7 @@ impl VmInstance {
             template: std::sync::RwLock::new(Arc::new(template)),
             nic_attachments: Mutex::new(Vec::new()),
             state: RwLock::new(PowerState::Stopped),
+            snapshot_gate: Arc::default(),
             agent_up: RwLock::new(false),
             ready: RwLock::new(false),
             stop_requested: RwLock::new(false),
@@ -1262,6 +1264,7 @@ impl VmInstance {
         before_resume: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
     ) -> Result<()> {
         {
+            let _snapshot = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
             let mut st = self.state.write().await;
             if *st != PowerState::Stopped {
                 bail!("{} is {:?}", self.cfg.name, *st);
@@ -1807,8 +1810,10 @@ impl VmInstance {
     /// Take a snapshot; returns whether it was online (running) or offline.
     async fn take_snapshot(&self, name: &str) -> Result<bool> {
         validate_snapshot_name(name)?;
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
+                drop(guard);
                 if let Some(why) = self.online_snapshot_refusal().await {
                     bail!("{why}");
                 }
@@ -1824,7 +1829,12 @@ impl VmInstance {
                 Ok(true)
             }
             PowerState::Stopped => {
-                snapshot_offline_disks(&self.all_disk_paths(), name).await?;
+                let disks = self.all_disk_paths();
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    snapshot_offline_disks(&disks, &name).await
+                })
+                .await?;
                 Ok(false)
             }
             // Capturing must not change the guest, and waking it would.
@@ -1879,43 +1889,58 @@ impl VmInstance {
             control.resume().await?;
             Ok(())
         } else {
-            restore_offline_disks(&self.all_disk_paths(), name, async {
-                if self.power_state().await != PowerState::Stopped {
-                    self.stop_ladder(false).await?;
-                    self.settle_stopped(Duration::from_secs(60))
-                        .await
-                        .with_context(|| format!("{} did not stop for restore", self.cfg.name))?;
-                }
-                Ok(())
+            let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
+            let vm = Arc::clone(self);
+            let name = name.to_owned();
+            super::machine::finish_offline_snapshot(guard, async move {
+                restore_offline_disks(&vm.all_disk_paths(), &name, async {
+                    if vm.power_state().await != PowerState::Stopped {
+                        vm.stop_ladder(false).await?;
+                        vm.settle_stopped(Duration::from_secs(60))
+                            .await
+                            .with_context(|| format!("{} did not stop for restore", vm.cfg.name))?;
+                    }
+                    Ok(())
+                })
+                .await
             })
             .await
         }
     }
 
     async fn drop_snapshot(&self, name: &str) -> Result<()> {
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             // Asleep is still a live QEMU holding the disks open, so the
             // offline path's qemu-img must not touch them.
             PowerState::Running | PowerState::Suspended => {
+                drop(guard);
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
                 snapshots.delete(name, &refs).await?;
             }
-            _ => {
-                for disk in self.all_disk_paths() {
-                    // Capture rollback may already have removed this disk's
-                    // entry. Pending-intent cleanup is idempotent.
-                    if crate::template::qimg::image_info(&disk)
-                        .await?
-                        .snapshots
-                        .iter()
-                        .any(|snapshot| snapshot.name == name)
-                    {
-                        crate::template::qimg::snapshot_delete(&disk, name).await?;
+            PowerState::Stopped => {
+                let disks = self.all_disk_paths();
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    for disk in disks {
+                        // Capture rollback may already have removed this disk's
+                        // entry. Pending-intent cleanup is idempotent.
+                        if crate::template::qimg::image_info(&disk)
+                            .await?
+                            .snapshots
+                            .iter()
+                            .any(|snapshot| snapshot.name == name)
+                        {
+                            crate::template::qimg::snapshot_delete(&disk, &name).await?;
+                        }
                     }
-                }
+                    Ok(())
+                })
+                .await?;
             }
+            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
         }
         Ok(())
     }

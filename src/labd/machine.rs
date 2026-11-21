@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
@@ -54,6 +55,30 @@ use crate::sync::LockRecover;
 /// (ADR-0004) because it is what reaches the CLI, the REST surface and the
 /// console; re-exported here because this is where machines produce it.
 pub use crate::status::{MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus};
+
+/// Boot reserves only the transition out of Stopped. Offline snapshot work
+/// reserves the power-state check and every disk operation together.
+pub(super) fn snapshot_guard(gate: &Arc<Mutex<()>>, name: &str) -> Result<OwnedMutexGuard<()>> {
+    Arc::clone(gate).try_lock_owned().map_err(|_| {
+        crate::proto::CommandError::conflict(format!(
+            "{name}: an offline snapshot operation is in progress"
+        ))
+        .into()
+    })
+}
+
+/// Keep the machine reserved if the caller is cancelled while an image
+/// tool's blocking disk operation is still running.
+pub(super) async fn finish_offline_snapshot(
+    guard: OwnedMutexGuard<()>,
+    work: impl Future<Output = Result<()>> + Send + 'static,
+) -> Result<()> {
+    tokio::spawn(async move {
+        let _guard = guard;
+        work.await
+    })
+    .await?
+}
 
 /// How long [`Machine::poweroff`] waits for the emulator to actually go.
 pub(super) const POWEROFF_SETTLE: Duration = Duration::from_secs(30);
