@@ -187,6 +187,9 @@ pub struct Reconverged {
     pub collisions: Vec<Collision>,
     /// Paths neither side could be read for.
     pub skipped: Vec<Skip>,
+    /// Rule files whose rules were refused (a symlink). Reported, and no part
+    /// of [`complete`](Reconverged::complete): the path itself converges.
+    pub refused_rules: Vec<Skip>,
     /// Paths that did not land and must retry under the host-only policy.
     pub failures: Vec<Failure>,
 }
@@ -315,6 +318,7 @@ pub async fn reconverge(
         oversize: plan.oversize,
         collisions: plan.collisions,
         skipped,
+        refused_rules: scan.refused_rules,
         failures: applied
             .failures
             .into_iter()

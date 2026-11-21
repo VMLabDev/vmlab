@@ -44,7 +44,7 @@ depends on what a real guest or agent does, the finding says so.
 | Code | Fault | How bad |
 |---|---|---|
 | F1 | A guest directory that cannot be listed during a walk reads as deleted files, and the host copies are removed (fixed in #384) | Data loss (host) |
-| F2 | The host follows a guest-planted symlink named like a rule file, and sends the lines of the target back to the guest | Security against a hostile guest, and crash of the host process |
+| F2 (fixed, card #385) | The host follows a guest-planted symlink named like a rule file, and sends the lines of the target back to the guest | Security against a hostile guest, and crash of the host process |
 | F3 | A restore does not flush and does not refuse on unsynced guest work | Data loss (guest work) |
 | F4 | A re-seed never completes while the tree holds a socket, an unreadable path or an oversize file | Wrong result (sync stops for good) |
 | F5 | A halted workspace keeps every path the guest reports, without a bound and without checking it is a path | Security against a hostile guest (host memory and CPU) |
@@ -108,6 +108,19 @@ walk.
 **How bad.** Data loss on the canonical copy.
 
 ### F2. A guest-planted rule-file symlink discloses host files to the guest
+
+**Status.** Fixed by card #385. `read_dir_rules` opens a rule file with
+`O_NOFOLLOW` and never reads one that is a symlink. The decision on a
+legitimate in-tree link: it is refused too, because its target can be a
+guest-owned path (`.env`) the guest was never given, and a rule about which
+targets are safe would need the rules that are being read. The link still syncs
+as a link. Its rules do not apply, and every pass names it in the skipped list
+and in a `workspace.skipped` event, without holding the pass or a re-seed open.
+The tests are `a_symlinked_rule_file_is_never_read_through` (syncer),
+`a_symlinked_rule_file_is_refused_by_name_and_never_read` and
+`a_rule_file_linked_to_an_endless_file_is_not_opened` (ignore rules). F9 is
+not fixed by this change: a directory named like a rule file still fails the
+scan. The text below describes the code before the fix.
 
 **Where.** `src/labd/workspace/ignore.rs:157-192` (`read_dir_rules`, the read at
 line 169), `ignore.rs:354-396` (`read_line`), `ignore.rs:289-322`
