@@ -1,0 +1,220 @@
+From: vmlab-win3d
+Subject: [PATCH] viogpu3d: a lost host GPU is a removed device
+
+vmlab-hv reports a lost host GPU, its render server ended or its render
+node gone, with the private event VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST
+(bit 31 of events_read) to a driver that acked
+VIRTIO_GPU_F_VMLAB_ORDERED_FLIP (docs/device-lost.md). The host has then
+answered every fence it held, answers every later command that needs the
+GPU with ERR_UNSPEC, and raises the event again after every reset.
+
+Before this patch the driver did not know the event. Its submissions after
+the loss got error answers, which it keeps for the timeout path, and every
+reset after it waited for host objects that the host refuses to make:
+timeout after timeout, to a stopped VM.
+
+With the event the driver marks the adapter lost for the rest of the boot.
+Every 3D device is context-lost, so its UMD gets STATUS_DEVICE_REMOVED as
+after a timeout reset, and a new 3D context is refused the same way. A DMA
+buffer that a GDI device submits after the loss retires at once, without
+the host. A restart after a timeout reset restores no host objects. The
+driver reads the event at each negotiation as well as on the configuration
+interrupt, because no interrupt reaches it before DRIVER_OK.
+
+A host that does not offer the feature bit (QEMU, an older vmlab-hv) never
+sets bit 31, and the driver behaves as before.
+---
+diff --git a/viogpu/common/viogpu.h b/viogpu/common/viogpu.h
+index 5389142..0c81443 100644
+--- a/viogpu/common/viogpu.h
++++ b/viogpu/common/viogpu.h
+@@ -97,6 +97,11 @@ enum virtio_gpu_ctrl_type
+ };
+ 
+ #define VIRTIO_GPU_EVENT_DISPLAY (1 << 0)
++/* vmlab-hv only, with VIRTIO_GPU_F_VMLAB_ORDERED_FLIP: the host GPU is lost.
++ * The host has answered every fence it held, answers every later command
++ * that needs the GPU with ERR_UNSPEC, and raises the event again after
++ * every reset. */
++#define VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST (1u << 31)
+ 
+ /* Blob resource memory types */
+ #define VIRTIO_GPU_BLOB_MEM_GUEST         0x0001
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index b49c365..406b469 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1992,6 +1992,33 @@ UINT VioGpuAdapter::GetLastNotifiedFence(UINT nodeOrdinal, UINT engineOrdinal)
+         InterlockedCompareExchange(&m_lastNotifiedFence[nodeOrdinal][engineOrdinal], 0, 0));
+ }
+ 
++void VioGpuAdapter::CompleteDmaWithoutHost(UINT fenceId, UINT nodeOrdinal, UINT engineOrdinal)
++{
++    if (nodeOrdinal < kMaxTrackedNodes && engineOrdinal < kMaxTrackedEngines)
++    {
++        InterlockedExchange(&m_lastSubmittedFence[nodeOrdinal][engineOrdinal], static_cast<LONG>(fenceId));
++        InterlockedExchange(&m_lastNotifiedFence[nodeOrdinal][engineOrdinal], static_cast<LONG>(fenceId));
++    }
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
++    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
++    interrupt.DmaCompleted.SubmissionFenceId = fenceId;
++    interrupt.DmaCompleted.NodeOrdinal = nodeOrdinal;
++    interrupt.DmaCompleted.EngineOrdinal = engineOrdinal;
++
++    NOTIFY_CONTEXT notify = {};
++    notify.pDxgkInterface = &m_DxgkInterface;
++    notify.interrupt = &interrupt;
++    notify.triggerDpc = TRUE;
++    BOOLEAN callbackRet = FALSE;
++    NTSTATUS status = m_DxgkInterface.DxgkCbSynchronizeExecution(m_DxgkInterface.DeviceHandle,
++                                                                  NotifyInterruptSyncRoutine,
++                                                                  &notify,
++                                                                  0,
++                                                                  &callbackRet);
++    if (!NT_SUCCESS(status) || !callbackRet)
++        DbgPrint(TRACE_LEVEL_ERROR, ("%s fence=%u status=0x%x callback=%u\n", __FUNCTION__, fenceId, status, callbackRet));
++}
++
+ void VioGpuAdapter::NotifyDmaPreempted(UINT preemptionFenceId,
+                                        UINT lastCompletedFenceId,
+                                        UINT nodeOrdinal,
+@@ -3133,6 +3160,16 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
+                           sizeof(m_u32NumScanouts));
+ 
+         virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, num_capsets), &m_u32NumCapsets, sizeof(m_u32NumCapsets));
++
++        // vmlab-hv raises the device-lost event again at every negotiation of
++        // its feature bit, and no configuration interrupt reaches a driver
++        // before DRIVER_OK: read it here.
++        if (virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_VMLAB_ORDERED_FLIP))
++        {
++            UINT32 events_read = 0;
++            virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_read), &events_read, sizeof(events_read));
++            OnHostGpuLost(events_read);
++        }
+     } while (0);
+     if (status == STATUS_SUCCESS)
+     {
+@@ -3315,6 +3352,16 @@ NTSTATUS VioGpuAdapter::RestoreHostObjects()
+         return status;
+     ctrlQueue.SetGpuBuf(&m_GpuBuf);
+     m_CursorQueue.SetGpuBuf(&m_GpuBuf);
++    if (IsHostGpuLost())
++    {
++        // The host keeps no objects any more, and refuses new ones: a restart
++        // that waited for them would fail, and Windows would stop the VM.
++        // Every 3D device stays lost; GDI devices go on without a context.
++        status = StartWorkThread();
++        if (NT_SUCCESS(status))
++            RestoreCursor();
++        return status;
++    }
+     KeWaitForSingleObject(&m_objectMutex, Executive, KernelMode, FALSE, NULL);
+     for (LIST_ENTRY *entry = m_devices.Flink; entry != &m_devices; entry = entry->Flink)
+     {
+@@ -4071,6 +4118,7 @@ void VioGpuAdapter::ConfigChanged(void)
+     DbgPrint(TRACE_LEVEL_FATAL, ("<--> %s\n", __FUNCTION__));
+     UINT32 events_read, events_clear = 0;
+     virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_read), &events_read, sizeof(m_u32NumScanouts));
++    OnHostGpuLost(events_read);
+     if (events_read & VIRTIO_GPU_EVENT_DISPLAY)
+     {
+         vidpn.GetDisplayInfo();
+@@ -4082,6 +4130,33 @@ void VioGpuAdapter::ConfigChanged(void)
+     }
+ }
+ 
++void VioGpuAdapter::OnHostGpuLost(UINT32 eventsRead)
++{
++    PAGED_CODE();
++
++    if (!(eventsRead & VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST))
++        return;
++    UINT32 events_clear = VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST;
++    virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(events_clear));
++    if (InterlockedExchange(&m_hostGpuLost, 1) != 0)
++        return;
++    DbgPrint(TRACE_LEVEL_FATAL, ("%s the host GPU is lost: 3D devices are removed\n", __FUNCTION__));
++    Trace(10);
++    // A lost 3D context answers its UMD STATUS_DEVICE_REMOVED, as after a
++    // timeout reset. The host answered every fence it held, so the DMA in
++    // flight retires on its own, and SubmitCommand retires what follows
++    // without the host. GDI devices keep presenting, into resources the host
++    // no longer has.
++    KeWaitForSingleObject(&m_objectMutex, Executive, KernelMode, FALSE, NULL);
++    for (LIST_ENTRY *entry = m_devices.Flink; entry != &m_devices; entry = entry->Flink)
++    {
++        VioGpuDevice *device = CONTAINING_RECORD(entry, VioGpuDevice, m_adapterEntry);
++        if (device->m_capset_id != 0)
++            device->m_context_lost = true;
++    }
++    KeReleaseMutex(&m_objectMutex, FALSE);
++}
++
+ bool VioGpuAdapter::GetShmemCpuTranslatedAddress(PHYSICAL_ADDRESS *out_pa)
+ {
+     PAGED_CODE();
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 41c72a2..4abc342 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -208,6 +208,7 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     volatile LONG m_intxCombinedCount = 0;
+     volatile LONG m_badTimelineResponseCount = 0;
+     volatile LONG m_transportGeneration = 0;
++    volatile LONG m_hostGpuLost = 0;
+     volatile LONG m_powerResetCount = 0;
+     volatile LONG64 m_traceSequence = 0;
+     VIOGPU_TRACE_RECORD m_trace[256] = {};
+@@ -354,6 +355,11 @@ class VioGpuAdapter : IVioGpuPCI, public IVioGpuQueueSync
+     }
+ #endif
+     BOOLEAN IsRecovering() const { return m_tdr.RecoveryState != 0; }
++    // vmlab-hv reported VIRTIO_GPU_EVENT_VMLAB_DEVICE_LOST: the host GPU is
++    // gone for the rest of this boot (docs/device-lost.md).
++    BOOLEAN IsHostGpuLost() const { return m_hostGpuLost != 0; }
++    void OnHostGpuLost(UINT32 eventsRead);
++    void CompleteDmaWithoutHost(UINT fenceId, UINT nodeOrdinal, UINT engineOrdinal);
+     void RegisterObject(LIST_ENTRY *entry, UINT kind);
+     void UnregisterObject(LIST_ENTRY *entry);
+     void RegisterPreparedCommand(VioGpuCommand *command);
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index ba153c1..43d25b0 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -1552,6 +1552,16 @@ NTSTATUS VioGpuCommander::SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitComm
+ 
+     cmd->PrepareSubmit(pSubmitCommand);
+     m_pAdapter->UnregisterPreparedCommand(cmd);
++    if (m_pAdapter->IsHostGpuLost())
++    {
++        // The host GPU is gone and would answer the commands with errors,
++        // which the scheduler would wait out to a timeout, again and again.
++        // A DMA buffer of a GDI device retires at once, without the host.
++        const UINT fenceId = cmd->GetSubmissionFenceId();
++        cmd->CancelBeforeRun();
++        m_pAdapter->CompleteDmaWithoutHost(fenceId, nodeOrdinal, pSubmitCommand->EngineOrdinal);
++        return STATUS_SUCCESS;
++    }
+     if (!m_pAdapter->TrackDmaSubmission(cmd))
+     {
+         DbgPrint(TRACE_LEVEL_ERROR, ("%s cannot track DMA retirement fence=%u\n", __FUNCTION__, cmd->GetSubmissionFenceId()));
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index 8ea6c34..831529b 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -85,6 +85,14 @@ NTSTATUS VioGpuDevice::Init(VIOGPU_CTX_INIT_REQ *pOptions)
+ 
+     UINT context_init = 0;
+ 
++    if (m_pAdapter->IsHostGpuLost() && pOptions->CapsetID != 0)
++    {
++        // A lost host GPU makes no new 3D context: the UMD reports device
++        // removed, and the application can fall back to WARP.
++        m_capset_id = pOptions->CapsetID;
++        m_context_lost = true;
++        return STATUS_DEVICE_REMOVED;
++    }
+     m_capset_id = pOptions->CapsetID;
+     context_init |= m_capset_id;
+ 
