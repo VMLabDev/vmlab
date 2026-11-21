@@ -1,0 +1,1 @@
+{"name":"debian-13","arch":"x86_64","version":"1.2.0","profile":"linux","cpus":2,"memory":2147483648,"disk":21474836480,"firmware":"uefi","tpm":false,"secure_boot":true,"secure_boot_keys":"vars","secure_boot_vars":"KLUv/SADGQAAYWJj"}

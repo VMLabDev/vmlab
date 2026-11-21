@@ -1,0 +1,1 @@
+{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/bin"],"Entrypoint":["/sbin/init"],"Cmd":["-v"],"WorkingDir":"/","User":"1000:1000","ExposedPorts":{"80/tcp":{}},"Healthcheck":{"Test":["CMD","true"],"Interval":1000000000}},"rootfs":{"type":"layers","diff_ids":["sha256:aa"]}}

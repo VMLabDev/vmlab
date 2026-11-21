@@ -9,7 +9,9 @@ out=${CARGO_TARGET_DIR:-$root/target}/fuzz-runs
 case "$out" in ''|/) exit 2;; esac
 mkdir -p "$out"
 python3 "$root/scripts/fuzz-seeds.py" "$out"
-for target in qcow2 hv_proto agent_proto; do
+# FUZZ_TARGETS narrows the run to some targets, for a long run of one.
+for target in ${FUZZ_TARGETS:-qcow2 hv_proto agent_proto vnet_offload net_frame oci_document}; do
+    case "$target" in qcow2|hv_proto|agent_proto|vnet_offload|net_frame|oci_document) ;; *) printf 'unknown fuzz target: %s\n' "$target" >&2; exit 2;; esac
     crate=$root/fuzz
     if [ "$target" = agent_proto ]; then crate=$root/guest/agent-proto/fuzz; fi
     corpus=$out/$target/corpus

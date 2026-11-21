@@ -12,6 +12,11 @@ libfuzzer-sys = "0.4"
 tempfile = "3"
 vmlab-disk = { path = "../hv/crates/vmlab-disk" }
 vmlab-hv-proto = { path = "../hv/crates/vmlab-hv-proto" }
+# The parsers of guest frames and registry documents are private modules of
+# the main crate: `vmlab::fuzzing` (compiled under `--cfg fuzzing`, which
+# cargo-fuzz sets) holds each target's body. No eBPF: the fabric under test is
+# the userspace one.
+vmlab = { path = "..", default-features = false }
 
 [workspace]
 members = ["."]
@@ -26,6 +31,27 @@ bench = false
 [[bin]]
 name = "hv_proto"
 path = "fuzz_targets/hv_proto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vnet_offload"
+path = "fuzz_targets/vnet_offload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_frame"
+path = "fuzz_targets/net_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oci_document"
+path = "fuzz_targets/oci_document.rs"
 test = false
 doc = false
 bench = false
