@@ -636,7 +636,7 @@ fn load_checkpoint_name(reg: &SnapshotRegistry, name: &str) -> Result<String, Sn
             .map_err(|e| SnapshotError::from_disk("snapshots", &disk.id, e))?;
         let target = snapshots
             .iter()
-            .find(|snapshot| snapshot.name == name || snapshot.id == name)
+            .find(|snapshot| snapshot.name == name)
             .ok_or_else(|| {
                 SnapshotError::NotFound(format!("disk `{}` has no snapshot {name:?}", disk.id))
             })?;

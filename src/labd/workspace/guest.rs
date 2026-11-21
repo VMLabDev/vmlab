@@ -275,6 +275,7 @@ pub mod fake {
         edit_after_rename: Option<(String, String)>,
         /// Paths the guest refuses to be read at all.
         unreadable: Vec<String>,
+        disconnect_on_readdir: Option<String>,
         /// This guest's filesystem folds case, like a default NTFS volume:
         /// two names differing only in case are one object — **except** in a
         /// directory that was created with §19.6's flag.
@@ -435,6 +436,10 @@ pub mod fake {
                 .expect("fake guest")
                 .unreadable
                 .push(path.to_string());
+        }
+
+        pub fn disconnect_on_readdir(&self, path: &str) {
+            self.inner.lock().expect("fake guest").disconnect_on_readdir = Some(path.into());
         }
 
         /// This guest's filesystem folds case, like a default NTFS volume.
@@ -690,11 +695,18 @@ pub mod fake {
 
         async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
             let guest = self.inner.lock().expect("fake guest");
+            if guest.disconnect_on_readdir.as_deref() == Some(path) {
+                bail!("file session closed");
+            }
             if let Some(entries) = &guest.hostile_listing {
                 return Ok(entries.clone());
             }
             if guest.unreadable.iter().any(|p| p == path) {
-                bail!("permission denied: {path}");
+                return Err(FileOpsError {
+                    code: ErrorCode::PermissionDenied,
+                    msg: format!("permission denied: {path}"),
+                }
+                .into());
             }
             let dir = resolve(&guest, path);
             if !matches!(guest.nodes.get(&dir), Some((Node::Dir, _))) {

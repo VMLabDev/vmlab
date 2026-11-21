@@ -21,12 +21,9 @@
 //!   anyway. That holds for a guest whose watch did not answer the flush in
 //!   time too (VML-110): [`DISCARD_FLAG`] is restore-only and never lets a
 //!   capture through.
-//! - **Restore refuses only while a halt stands, and an explicit flag answers
-//!   it.** Refusing outright would be obstruction: wanting to throw the guest
-//!   copy away is frequently *why* someone restores. But a restore discards the
-//!   guest side of every halted path by design, and each of those paths is a
-//!   file a developer was going to be asked about — so it must be asked for by
-//!   name rather than performed in passing.
+//! - **Restore flushes first and refuses while work is outstanding.** An
+//!   explicit discard flag allows the restore to throw away the guest copy.
+//!   A stopped workspace can still refuse based on a halt saved in its ledger.
 
 use super::syncer::Report;
 
@@ -65,7 +62,7 @@ fn named(paths: &[String]) -> String {
 pub const NOT_A_BACKUP: &str = "Snapshots are not a workspace backup: a dev machine's source lives on the host, which is \
      what survives `destroy` and what a restore re-converges the guest from.";
 
-/// Why a capture will not go ahead — one machine's workspace, not in step.
+/// Why a snapshot operation refuses an out-of-step workspace.
 ///
 /// Assembled from the pre-flight flush's own [`Report`] rather than from a
 /// second inspection, so what the refusal says and what `vmlab dev sync status`
@@ -90,9 +87,6 @@ pub struct Outstanding {
     /// The guest's watch did not answer the pre-flight flush within its bound,
     /// so writes the guest has not reported are missing from `unsynced`. A
     /// very slow guest is still writing as far as anyone knows (VML-110).
-    /// Like every reason here it has no override: `--discard-guest-changes`
-    /// answers only a restore's halt. The way out is a later capture, once
-    /// the guest has caught up.
     pub unanswered: Option<String>,
     /// Paths the flush did not carry, by name.
     pub unsynced: Vec<String>,
@@ -103,7 +97,7 @@ pub struct Outstanding {
 
 impl Outstanding {
     /// What the pre-flight flush found, or `None` where the workspace is in
-    /// step and the capture may go ahead.
+    /// step and the snapshot operation may go ahead.
     ///
     /// Everything here is a *transient* state that clears itself or resolves:
     /// a named skip is not among them, because a socket in the tree or a
@@ -169,19 +163,8 @@ impl Outstanding {
         };
         (found.halt.is_some() || found.reseed.is_some()).then_some(found)
     }
-}
 
-impl std::fmt::Display for Outstanding {
-    /// Names the machine, what is outstanding, and the way out — and says
-    /// there is no flag, because a developer who has just been refused will
-    /// look for one.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "\"{}\"'s workspace is not in step with the canonical copy, so this snapshot would \
-             capture a tree the host has never agreed with",
-            self.machine,
-        )?;
+    fn write_reasons(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(halt) = &self.halt {
             write!(f, ". {halt}")?;
         }
@@ -208,12 +191,46 @@ impl std::fmt::Display for Outstanding {
         if !self.unsynced.is_empty() {
             write!(f, ". Still owed: {}", named(&self.unsynced))?;
         }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Outstanding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\"{}\"'s workspace is not in step with the canonical copy, so this snapshot would \
+             capture a tree the host has never agreed with",
+            self.machine,
+        )?;
+        self.write_reasons(f)?;
         write!(
             f,
             ". There is no flag for this — a snapshot of a tree mid-transfer restores to \
              somewhere meaningless. `vmlab dev sync status {}` says what is outstanding and \
              `vmlab dev sync flush {}` waits for it; a halt has to be resolved first. {}",
             self.machine, self.machine, NOT_A_BACKUP,
+        )
+    }
+}
+
+pub(super) struct RestoreOutstanding(pub Outstanding);
+
+impl std::fmt::Display for RestoreOutstanding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let outstanding = &self.0;
+        write!(
+            f,
+            "\"{}\"'s workspace could have unsynced guest work that restoring would discard",
+            outstanding.machine,
+        )?;
+        outstanding.write_reasons(f)?;
+        write!(
+            f,
+            ". Run `vmlab dev sync status {}` to see what is outstanding and `vmlab dev sync \
+             flush {}` to wait for it. Pass `{}` to restore anyway and re-converge the guest \
+             from the host. {}",
+            outstanding.machine, outstanding.machine, DISCARD_FLAG, NOT_A_BACKUP,
         )
     }
 }
@@ -255,11 +272,10 @@ impl std::fmt::Display for Halted {
     }
 }
 
-/// The flag a restore needs while a halt stands, spelled once.
+/// The flag that allows a restore to discard unsynced guest work.
 pub const DISCARD_FLAG: &str = "--discard-guest-changes";
 
-/// The halt standing in this machine's way, or `None` where a restore may go
-/// ahead unasked.
+/// The halt reported by a completed pre-flight flush, if any.
 pub fn halted(machine: &str, report: &Report) -> Option<Halted> {
     report.halt.as_ref().map(|halt| Halted {
         machine: machine.to_string(),

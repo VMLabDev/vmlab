@@ -543,26 +543,14 @@ impl WorkspaceSyncers {
                 ledger.reseed_owed,
             ));
         };
-        let report = match syncer.pass_now().await {
-            Ok(report) => report,
-            // The flush did not come back at all. That is the strongest reason
-            // of the lot to refuse — not knowing what the guest holds is worse
-            // than knowing it is behind — so it becomes the report's own
-            // `trouble` rather than a second error path with its own words.
-            Err(e) => Report {
-                trouble: Some(format!("{e:#}")),
-                ..syncer.report()
-            },
-        };
+        let report = snapshot_preflight(&syncer).await;
         refuse(super::bracket::Outstanding::of(machine, &report))
     }
 
-    /// What a **restore** has to be asked twice about (§19.6).
-    ///
-    /// A halt is the one state where restoring destroys something a developer
-    /// was about to be asked about, so it refuses — but only until the flag is
-    /// given, because wanting to throw the guest copy away is frequently why
-    /// someone restores.
+    /// Flush a running workspace before **restore** (§19.6). Refuse if the
+    /// flush leaves work outstanding or cannot establish what the guest holds.
+    /// An explicit discard skips the flush so pending guest changes can be
+    /// thrown away.
     ///
     /// It reaches a machine that is **down** through the same `declared`
     /// workspace, because a restore does not need a running machine and the
@@ -578,7 +566,16 @@ impl WorkspaceSyncers {
             return Ok(());
         }
         match self.get(machine).await {
-            Some(syncer) => refuse(super::bracket::halted(machine, &syncer.report())),
+            Some(syncer) => {
+                let report = snapshot_preflight(&syncer).await;
+                if let Some(halt) = super::bracket::halted(machine, &report) {
+                    return refuse(Some(halt));
+                }
+                refuse(
+                    super::bracket::Outstanding::of(machine, &report)
+                        .map(super::bracket::RestoreOutstanding),
+                )
+            }
             // A restore is not refused for owing a re-seed: it is about to
             // ask for another one, and the second answers the first.
             None => refuse(super::bracket::halted_when_stopped(
@@ -731,6 +728,17 @@ fn refuse(said: Option<impl std::fmt::Display>) -> Result<()> {
     match said {
         Some(said) => Err(anyhow::anyhow!("{said}")),
         None => Ok(()),
+    }
+}
+
+/// Treat a flush that fails to return as uncertainty about the guest tree.
+async fn snapshot_preflight(syncer: &Syncer) -> Report {
+    match syncer.pass_now().await {
+        Ok(report) => report,
+        Err(e) => Report {
+            trouble: Some(format!("{e:#}")),
+            ..syncer.report()
+        },
     }
 }
 
@@ -1762,6 +1770,33 @@ async fn pass(
         );
         undecided.insert(skip.path.clone());
     }
+    if !probe.unlisted_dirs.is_empty() {
+        // The listing says nothing about paths below a skipped directory.
+        // Defer existing agreements and host-only paths under it.
+        undecided.extend(
+            scan.tree
+                .keys()
+                .chain(ledger.entries.keys())
+                .filter(|path| {
+                    path.match_indices('/')
+                        .any(|(end, _)| probe.unlisted_dirs.contains(&path[..end]))
+                })
+                .cloned(),
+        );
+    }
+    // A refused rule file is said like a skip and decided like any other
+    // path: the link is still a sync object, and only its reading as rules
+    // was declined. Left out of `undecided`, so it never holds a pass open.
+    for refusal in &scan.refused_rules {
+        events.emit(
+            "workspace.skipped",
+            json!({"machine": workspace.machine, "path": refusal.path, "reason": refusal.why}),
+        );
+    }
+    let skipped: Vec<Skip> = skipped
+        .into_iter()
+        .chain(scan.refused_rules.iter().cloned())
+        .collect();
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
@@ -2235,7 +2270,7 @@ async fn reconverge(
             }),
         );
     }
-    for skip in &done.skipped {
+    for skip in done.skipped.iter().chain(done.refused_rules.iter()) {
         events.emit(
             "workspace.skipped",
             json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
@@ -2285,7 +2320,12 @@ async fn reconverge(
         // two sides were disagreeing about before it is not a disagreement any
         // more. There is nothing left for a developer to resolve.
         halt: None,
-        skipped: done.skipped.into_iter().take(REPORTED).collect(),
+        skipped: done
+            .skipped
+            .into_iter()
+            .chain(done.refused_rules)
+            .take(REPORTED)
+            .collect(),
         oversize: done.oversize,
         ..Report::default()
     })
@@ -3476,6 +3516,41 @@ mod tests {
         }
         assert!(warned, "the overflow was not reported");
         syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_guest_directory_never_deletes_host_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib/nested")).unwrap();
+        let source = dir.path().join("lib/nested/a.rs");
+        std::fs::write(&source, "a").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        assert_eq!(guest.text("/src/lib/nested/a.rs").as_deref(), Some("a"));
+
+        guest.unreadable("/src/lib");
+        guest.file("/src/lib-extra.rs", "found by the walk", 77);
+        sessions.watcher.overflow();
+        let reported = eventually(|| {
+            let report = syncer.report();
+            report.skipped.iter().any(|skip| skip.path == "lib")
+        })
+        .await;
+        assert!(reported, "the walk must report the unreadable directory");
+        syncers.stop("dev01").await;
+        assert_eq!(
+            std::fs::read_to_string(&source)
+                .expect("the host file must survive the failed listing"),
+            "a"
+        );
+        assert_eq!(guest.text("/src/lib/nested/a.rs").as_deref(), Some("a"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lib-extra.rs")).unwrap(),
+            "found by the walk"
+        );
     }
 
     /// The prune list is computed host-side and handed to the guest, which is
@@ -4830,6 +4905,49 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    #[tokio::test]
+    async fn a_restore_flushes_first_and_refuses_on_unsynced_guest_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "seed").unwrap();
+        let (syncers, guest, sessions) = seeded_lab_settling(
+            dir.path(),
+            state.path(),
+            "/src/main.rs",
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+        syncers.before_capture("dev01", None).await.unwrap();
+
+        guest.file("/src/main.rs", "typed just now", 900);
+        sessions.watcher.mark("main.rs");
+        syncers.before_restore("dev01", false, None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "typed just now",
+            "restore did not flush the guest's work",
+        );
+
+        sessions.watcher.mute();
+        guest.file("/src/late.txt", "written in the guest", 901);
+        sessions.watcher.mark("late.txt");
+        let refused = syncers
+            .before_restore("dev01", false, None)
+            .await
+            .expect_err("restore must refuse while the guest's watch does not answer");
+        let said = format!("{refused:#}");
+        assert!(said.contains("watch did not answer"), "{said}");
+        assert!(said.contains(super::super::bracket::DISCARD_FLAG), "{said}");
+        assert!(said.contains(super::super::bracket::NOT_A_BACKUP), "{said}");
+        assert_eq!(
+            guest.text("/src/late.txt").as_deref(),
+            Some("written in the guest"),
+        );
+        assert!(!dir.path().join("late.txt").exists());
+        syncers.before_restore("dev01", true, None).await.unwrap();
+        syncers.stop("dev01").await;
+    }
+
     /// A machine that is not a dev machine, or has no workspace, has nothing
     /// to bracket — and snapshotting one must not grow a dev machine's costs.
     #[tokio::test]
@@ -5020,5 +5138,71 @@ mod tests {
             .before_restore("dev01", false, Some(&ws))
             .await
             .unwrap();
+    }
+
+    /// A rule file is read by the host, and a symlink syncs guest to host
+    /// verbatim — so a guest that plants `.vmlabignore` as a link to a host
+    /// file must never get that file's lines back as a prune list (review
+    /// labd-sync F2). The link itself stays a sync object. Its rules are
+    /// refused, and the pass says so by name.
+    #[tokio::test]
+    async fn a_symlinked_rule_file_is_never_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "hunter2-token\nsecond/line\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        guest.put(
+            "/src/.vmlabignore",
+            Node::Symlink(secret.display().to_string()),
+            5,
+        );
+        sessions.watcher.mark(".vmlabignore");
+        let link = dir.path().join(".vmlabignore");
+        let landed = {
+            let link = link.clone();
+            eventually(move || link.symlink_metadata().is_ok()).await
+        };
+        assert!(landed, "the link is a sync object and still crosses");
+        assert_eq!(std::fs::read_link(&link).unwrap(), secret);
+
+        // Two host scans with the link in place: the one that would read it,
+        // and the one after any watch reopen that reading it would cause.
+        syncer.pass_now().await.unwrap();
+        let report = syncer.pass_now().await.unwrap();
+        let named = {
+            let syncer = syncer.clone();
+            eventually(move || {
+                syncer
+                    .report()
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.path == ".vmlabignore" && skip.why.contains("symlink"))
+            })
+            .await
+        };
+        let opens = sessions.opens();
+        syncers.stop("dev01").await;
+
+        for prune in &opens {
+            for prefix in prune {
+                assert!(
+                    prefix != "hunter2-token" && prefix != "second/line",
+                    "a line of a host file outside the workspace reached the guest: {opens:?}"
+                );
+            }
+        }
+        assert!(
+            named,
+            "the refused rule file is named: {:?}",
+            report.skipped
+        );
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        assert!(report.trouble.is_none(), "{:?}", report.trouble);
     }
 }

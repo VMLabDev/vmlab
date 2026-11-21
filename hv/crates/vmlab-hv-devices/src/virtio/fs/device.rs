@@ -135,6 +135,11 @@ impl InProcessFs {
         // published — the loop the spec's suppression mechanism expects.
         let mut used_any = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !crate::virtio::avail_idx_in_range(&inner.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = inner
                 .queues
                 .get_mut(index)
@@ -603,6 +608,18 @@ mod tests {
     /// SAFETY: the struct is four fixed-width little-endian fields with no
     /// padding, so any byte pattern is a valid value.
     unsafe impl ByteValued for Desc {}
+
+    #[test]
+    fn avail_idx_far_ahead_does_not_spin() {
+        let f = Fixture::new(false);
+        f.mem
+            .write_obj(Le16::from(0x8000u16), GuestAddress(f.avail + 2))
+            .unwrap();
+        let mut fs = f.fs;
+        let returned = crate::virtio::testing::returns_in_time(move || fs.queue_notify(1));
+        assert!(returned.is_some(), "queue_notify spins on a broken ring");
+        assert_eq!(f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(), 0);
+    }
 
     #[test]
     fn hostile_oversized_chains_are_discarded() {
