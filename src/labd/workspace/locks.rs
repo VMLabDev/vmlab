@@ -95,7 +95,11 @@ pub fn candidates<'a>(moved: impl Iterator<Item = &'a String>) -> BTreeSet<Strin
         .map(|path| format!("{path}.lock"))
         .collect();
     if !asked.is_empty() {
-        asked.extend(MUTABLE_FILES.iter().map(|file| format!("{GIT}/{file}.lock")));
+        asked.extend(
+            MUTABLE_FILES
+                .iter()
+                .map(|file| format!("{GIT}/{file}.lock")),
+        );
     }
     asked
 }
