@@ -600,6 +600,11 @@ Not read:
   then `fs.setattr(ino, attr { st_size: 0 }, Some(handle), SetattrValid::SIZE)`
   must be `Ok`. Skip the test when it runs as root.
 - Confidence: high.
+- Fixed in card #433. A `SETATTR` with a size truncates through the supplied
+  handle when that descriptor is open for writing, and through the
+  `O_WRONLY` reopen otherwise (no handle, or a read-only one), where the
+  mode of the file decides as it does for `truncate(2)`. The proof test
+  fails before the fix (`EACCES`) and passes after it.
 
 ### F20. virtio-pci: the driver can change the feature set of a live device
 
