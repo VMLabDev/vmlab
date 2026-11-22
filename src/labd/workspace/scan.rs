@@ -62,8 +62,7 @@ const PROBE_WINDOW: usize = 32;
 /// content).
 type Content = (String, Option<String>);
 
-/// A path neither direction may touch, and why. Always reported: this is the
-/// one thing a syncer must never do quietly.
+/// A reported path the syncer declined to process, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skip {
     pub path: String,
@@ -89,6 +88,9 @@ pub struct HostScan {
     /// a rule matching at a depth its own text does not name.
     pub pruned: Vec<String>,
     pub skipped: Vec<Skip>,
+    /// Names outside the UTF-8 path space. Their escaped labels are for
+    /// reporting only and can coincide with valid UTF-8 paths.
+    pub unrepresentable: Vec<Skip>,
     /// Rule files whose rules were refused — a `.gitignore` or `.vmlabignore`
     /// that is a symlink. Reported like a skip, and apart from
     /// [`skipped`](HostScan::skipped) because the path itself is still an
@@ -132,8 +134,15 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
             .with_context(|| format!("reading directory {}", here.display()))?;
         for entry in entries {
             let entry = entry.with_context(|| format!("reading directory {}", here.display()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = join_rel(&dir, &name);
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                scan.unrepresentable.push(Skip {
+                    path: format!("{:?}", Path::new(&dir).join(&name)),
+                    why: "host: name is not UTF-8".into(),
+                });
+                continue;
+            };
+            let rel = join_rel(&dir, name);
             let path = entry.path();
             // Never followed, so a link is an entry to record rather than a
             // directory to descend.

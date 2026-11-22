@@ -381,6 +381,9 @@ hand.
 
 ### F10. A host file name that is not UTF-8 is trouble on every pass
 
+**Fixed in #436.** The host scan reports the escaped filename as a
+skip and leaves the entry out of reconciliation.
+
 **Where.** `src/labd/workspace/scan.rs:125`.
 
 **Why it is a fault.** The scan turns each name into a `String` with

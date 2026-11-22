@@ -1980,13 +1980,7 @@ async fn pass(
         .chain(probe.skipped.iter())
         .cloned()
         .collect();
-    for skip in &skipped {
-        events.emit(
-            "workspace.skipped",
-            json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
-        );
-        undecided.insert(skip.path.clone());
-    }
+    undecided.extend(skipped.iter().map(|skip| skip.path.clone()));
     if !probe.unlisted_dirs.is_empty() {
         // The listing says nothing about paths below a skipped directory.
         // Defer existing agreements, host-only paths and reported guest
@@ -2003,19 +1997,19 @@ async fn pass(
                 .cloned(),
         );
     }
-    // A refused rule file is said like a skip and decided like any other
-    // path: the link is still a sync object, and only its reading as rules
-    // was declined. Left out of `undecided`, so it never holds a pass open.
-    for refusal in &scan.refused_rules {
-        events.emit(
-            "workspace.skipped",
-            json!({"machine": workspace.machine, "path": refusal.path, "reason": refusal.why}),
-        );
-    }
+    // Escaped host names are diagnostic labels only. Refused rule files are
+    // still sync objects: only their reading as rules was declined.
     let skipped: Vec<Skip> = skipped
         .into_iter()
+        .chain(scan.unrepresentable.iter().cloned())
         .chain(scan.refused_rules.iter().cloned())
         .collect();
+    for skip in &skipped {
+        events.emit(
+            "workspace.skipped",
+            json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
+        );
+    }
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
