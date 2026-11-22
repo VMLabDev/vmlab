@@ -549,7 +549,10 @@ mod tests {
             let flags = first_tcp_flags(&mut guest).await;
             assert_ne!(flags & crate::net::frame::TCP_RST, 0, "{dst}: {flags:#x}");
         }
-        assert!(!accepted(&other).await, "a guest reached the host's loopback");
+        assert!(
+            !accepted(&other).await,
+            "a guest reached the host's loopback"
+        );
     }
 
     /// A `redirect` the lab declares onto loopback is the operator's grant,

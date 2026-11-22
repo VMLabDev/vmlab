@@ -1449,7 +1449,17 @@ async fn nat_refuses_every_loopback_address_and_protocol_without_isolation() {
         .into_iter()
         .enumerate()
     {
-        guest_tcp(&engine, 40210 + i as u16, (dst, port), 1, 0, TCP_SYN, b"", &[]).await;
+        guest_tcp(
+            &engine,
+            40210 + i as u16,
+            (dst, port),
+            1,
+            0,
+            TCP_SYN,
+            b"",
+            &[],
+        )
+        .await;
         let t = recv_tcp(&mut rx).await;
         assert_ne!(t.flags & TCP_RST, 0, "{dst}: {t:?}");
     }
