@@ -3675,6 +3675,108 @@ mod tests {
         assert_eq!(chunks, 0);
     }
 
+    /// Rebuild `standard` in the pushed template directory with other data
+    /// and push it again onto the same version tag, as `template build
+    /// --variant` followed by a push does. Returns the new overlay's digest.
+    async fn push_rebuilt_standard(fake: &std::sync::Arc<FakeRegistry>, work: &Path) -> String {
+        let tdir = work.join("tmpl");
+        let overlay = tdir.join(variant_disk_rel("standard"));
+        run(
+            overlay.parent().unwrap(),
+            "qemu-io",
+            &["-c", "write -q -P 0x33 2M 128k", DISK_FILE],
+        );
+        let rebuilt = sha256_file(&overlay).unwrap();
+        let mut m = TemplateMeta::read_from(&tdir.join(META_FILE)).unwrap();
+        m.variants
+            .iter_mut()
+            .find(|v| v.name == "standard")
+            .unwrap()
+            .sha256 = rebuilt.clone();
+        m.write_to(&tdir.join(META_FILE)).unwrap();
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.join("push-again"),
+                None,
+                Some("latest"),
+            )
+            .await
+            .unwrap();
+        rebuilt
+    }
+
+    /// Review templates-registry F1: a pull into a version the store holds
+    /// brings the default variant along, and the registry's default was
+    /// rebuilt since. The held overlay has a clone on it, so it stays as it
+    /// is — the clone is a delta against it — and the variant asked for
+    /// still arrives.
+    #[tokio::test]
+    async fn a_pull_does_not_replace_a_variant_a_clone_is_backed_by() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let reference = "ghcr.io/owner/alpine:3.20";
+        let store = store_in(work.path(), "store");
+        pull_want(&fake, reference, &store, &VariantWant::default())
+            .await
+            .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap()
+            .variant_disk("standard");
+        let digest_a = sha256_file(&held).unwrap();
+
+        // Lab A's clone of the default variant.
+        let clone = work.path().join("clone.qcow2");
+        run(
+            work.path(),
+            "qemu-img",
+            &[
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-b",
+                held.to_str().unwrap(),
+                "-F",
+                "qcow2",
+                clone.to_str().unwrap(),
+            ],
+        );
+
+        let digest_b = push_rebuilt_standard(&fake, work.path()).await;
+        assert_ne!(digest_a, digest_b);
+
+        // Lab B asks for a variant the store lacks.
+        let (meta, _) = pull_want(
+            &fake,
+            reference,
+            &store,
+            &VariantWant::of(Some(&VariantRefNamed("extra"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sha256_file(&held).unwrap(),
+            digest_a,
+            "the overlay under the clone was replaced"
+        );
+        assert_eq!(meta.variant("standard").unwrap().sha256, digest_a);
+        assert!(meta.variant("extra").is_some(), "the variant asked for");
+        assert_eq!(
+            crate::template::store::qcow2_backing_file(&clone)
+                .unwrap()
+                .as_deref(),
+            held.to_str()
+        );
+    }
+
     /// A corrupt overlay chunk fails the pull on its digest, and nothing of
     /// the version is installed.
     #[tokio::test]
