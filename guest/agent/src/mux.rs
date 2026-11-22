@@ -1391,7 +1391,11 @@ mod tests {
         let k = killed.clone();
         let (input, _credit) = mux
             .for_channel(9)
-            .register(9, None, Some(Box::new(move || k.store(true, Ordering::SeqCst))))
+            .register(
+                9,
+                None,
+                Some(Box::new(move || k.store(true, Ordering::SeqCst))),
+            )
             .unwrap();
         // Exactly the window, in small frames: all of it is held.
         let frame = vec![b'x'; 1024];
