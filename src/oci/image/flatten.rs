@@ -683,6 +683,53 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_link_survives_the_deletion_of_its_target() {
+        assert_hard_link_keeps_old_content(false);
+    }
+
+    #[test]
+    fn a_hard_link_survives_the_replacement_of_its_target() {
+        assert_hard_link_keeps_old_content(true);
+    }
+
+    fn assert_hard_link_keeps_old_content(replace: bool) {
+        if !have(SQFSTAR) || !have("unsquashfs") {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (l0, m0, d0) = Layer::new()
+            .file("b", 0o600, 1000, b"one")
+            .hardlink("a", "b")
+            .build(tmp.path(), "lower.tar.gz", true);
+        let upper = if replace {
+            Layer::new().file("b", 0o644, 0, b"two")
+        } else {
+            Layer::new().whiteout("b")
+        };
+        let (l1, m1, d1) = upper.build(tmp.path(), "upper.tar", false);
+        let dest = tmp.path().join("rootfs.sqfs");
+        flatten_to_squashfs(
+            &[(l0, m0), (l1, m1)],
+            &[d0, d1],
+            &dest,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let image = dest.to_str().unwrap();
+        assert_eq!(unsquashfs(&["-cat", image, "a"]), "one");
+        let listing = unsquashfs(&["-lln", image]);
+        let alias = listing.lines().find(|line| line.ends_with("/a")).unwrap();
+        assert!(alias.contains("rw-------"), "{alias}");
+        assert!(alias.contains("1000/1000"), "{alias}");
+        if replace {
+            assert_eq!(unsquashfs(&["-cat", image, "b"]), "two");
+        } else {
+            assert!(!listing.lines().any(|line| line.ends_with("/b")), "{listing}");
+        }
+    }
+
+    #[test]
     fn whiteout_deletes_whole_subtree() {
         if !have(SQFSTAR) {
             return;
