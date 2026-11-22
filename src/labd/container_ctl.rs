@@ -74,7 +74,15 @@ impl CtlHandle {
         tokio::spawn(async move {
             let mut reader = BufReader::new(read_half);
             // Ok(None) is EOF; Err is a dead socket. Both end the channel.
+            // A bad line does not: it is skipped like a line that is not JSON.
             while let Ok(Some(line)) = read_ctl_line(&mut reader).await {
+                let line = match line {
+                    CtlLine::Text(line) => line,
+                    CtlLine::Skipped(why) => {
+                        tracing::warn!("ctl: skipped an event line: {why}");
+                        continue;
+                    }
+                };
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -174,26 +182,64 @@ impl CtlHandle {
     }
 }
 
+/// One read of the ctl stream.
+#[derive(Debug, PartialEq)]
+enum CtlLine {
+    /// A whole line of text, its newline included.
+    Text(String),
+    /// A line the reader dropped, and why. The stream is at the start of the
+    /// next line.
+    Skipped(&'static str),
+}
+
+/// Read one line. `Ok(None)` is EOF and `Err` a dead socket. A line that is
+/// longer than [`MAX_CTL_LINE`] or not UTF-8 is not an error: it is dropped
+/// through its newline, in bounded memory, so one bad line costs that line
+/// and not the channel (review F11).
 async fn read_ctl_line(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<CtlLine>> {
     let mut bytes = Vec::new();
-    let n = reader
+    let n = (&mut *reader)
         .take((MAX_CTL_LINE + 1) as u64)
         .read_until(b'\n', &mut bytes)
         .await?;
-    if n > MAX_CTL_LINE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ctl line too long",
-        ));
-    }
     if n == 0 {
         return Ok(None);
     }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    if n > MAX_CTL_LINE {
+        if bytes.last() != Some(&b'\n') {
+            discard_through_newline(reader).await?;
+        }
+        return Ok(Some(CtlLine::Skipped("longer than the line cap")));
+    }
+    Ok(Some(match String::from_utf8(bytes) {
+        Ok(line) => CtlLine::Text(line),
+        Err(_) => CtlLine::Skipped("not UTF-8"),
+    }))
+}
+
+/// Consume the rest of the current line, holding no more of it than the
+/// reader's own buffer. EOF ends it too: the next read reports that.
+async fn discard_through_newline(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        match buf.iter().position(|b| *b == b'\n') {
+            Some(at) => {
+                reader.consume(at + 1);
+                return Ok(());
+            }
+            None => {
+                let len = buf.len();
+                reader.consume(len);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -229,13 +275,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unterminated_ctl_line_is_refused_at_cap() {
+    async fn unterminated_ctl_line_is_dropped_at_cap() {
         let input = vec![b'x'; MAX_CTL_LINE + 1];
         let mut reader = BufReader::new(input.as_slice());
-        assert_eq!(
-            read_ctl_line(&mut reader).await.unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
+        assert!(matches!(
+            read_ctl_line(&mut reader).await.unwrap(),
+            Some(CtlLine::Skipped(_))
+        ));
+        assert_eq!(read_ctl_line(&mut reader).await.unwrap(), None);
+    }
+
+    /// The cap is on the line with its newline, and a dropped line takes
+    /// nothing of the next one with it.
+    #[tokio::test]
+    async fn a_dropped_line_leaves_the_next_line_whole() {
+        for len in [MAX_CTL_LINE - 1, MAX_CTL_LINE, MAX_CTL_LINE + 1, 200_000] {
+            let mut input = vec![b'x'; len];
+            input.extend_from_slice(b"\nnext\n");
+            let mut reader = BufReader::new(input.as_slice());
+            let first = read_ctl_line(&mut reader).await.unwrap().unwrap();
+            assert_eq!(
+                matches!(first, CtlLine::Text(_)),
+                len < MAX_CTL_LINE,
+                "a line of {len} bytes and a newline"
+            );
+            assert_eq!(
+                read_ctl_line(&mut reader).await.unwrap(),
+                Some(CtlLine::Text("next\n".into())),
+                "after a line of {len} bytes"
+            );
+        }
     }
 
     #[tokio::test]

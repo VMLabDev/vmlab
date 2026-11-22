@@ -417,6 +417,14 @@ Not read:
   `src/labd/container_ctl.rs`. The mock writes `b"\xff\n"`, then a `started`
   event. Assert that `wait_started` succeeds. The same with a line of
   70 000 bytes before the event.
+- Fixed in card #510. `read_ctl_line` no longer returns an error for a bad
+  line. It reports the line as skipped, and the reader task warns and reads
+  on, as it does for a line that is not JSON. A line past the 64 KiB cap is
+  dropped through its newline without being held in memory. Only EOF and a
+  socket error end the reader. The tests
+  `a_line_that_is_not_utf8_is_skipped` and
+  `a_line_that_is_too_long_is_skipped` failed before the fix ("ctl channel
+  closed before the container started") and pass after it.
 
 ### F12. File names that are not UTF-8 are changed in a directory listing
 
