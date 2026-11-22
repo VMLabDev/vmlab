@@ -330,9 +330,7 @@ impl Qcow2Image {
         if u64::from(refcount_table_clusters) * cluster_size > MAX_REFCOUNT_TABLE_BYTES {
             return Err(Error::Format {
                 format: "qcow2",
-                reason: format!(
-                    "refcount table too large ({refcount_table_clusters} clusters)"
-                ),
+                reason: format!("refcount table too large ({refcount_table_clusters} clusters)"),
             });
         }
         if nb_snapshots > MAX_SNAPSHOTS {
@@ -1708,7 +1706,12 @@ mod tests {
         // Card #555 (F9): 40 zero bytes are a valid empty snapshot entry.
         let (_dir, img) = testsupport::blank(8 << 20);
         let count = MAX_SNAPSHOTS + 1;
-        let offset = img.file.metadata().unwrap().len().next_multiple_of(img.cluster_size);
+        let offset = img
+            .file
+            .metadata()
+            .unwrap()
+            .len()
+            .next_multiple_of(img.cluster_size);
         img.file.write_all_at(&count.to_be_bytes(), 60).unwrap();
         img.file.write_all_at(&offset.to_be_bytes(), 64).unwrap();
         img.file.set_len(offset + u64::from(count) * 40).unwrap();
@@ -1732,7 +1735,9 @@ mod tests {
     fn a_header_length_beyond_the_cluster_is_an_error() {
         // Card #555 (F10): rebase copied header_length bytes from one cluster.
         let (_dir, img) = testsupport::blank(8 << 20);
-        img.file.write_all_at(&0x0010_0000u32.to_be_bytes(), 100).unwrap();
+        img.file
+            .write_all_at(&0x0010_0000u32.to_be_bytes(), 100)
+            .unwrap();
         match Qcow2Image::open(&img.path, false) {
             Err(_) => {}
             Ok(mut opened) => assert!(opened.set_backing("base.qcow2", Some("qcow2")).is_err()),
