@@ -439,9 +439,8 @@ fn capture_and_write(
     if active_vmstate != 0
         && let Err(err) = vmstate_disk.image.lock().discard_vmstate(active_vmstate)
     {
-        cleanup.push(
-            SnapshotError::from_disk("discard_vmstate", &vmstate_disk.id, err).to_string(),
-        );
+        cleanup
+            .push(SnapshotError::from_disk("discard_vmstate", &vmstate_disk.id, err).to_string());
     }
     if cleanup.is_empty() {
         Err(error)
