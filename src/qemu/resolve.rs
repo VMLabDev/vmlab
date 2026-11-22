@@ -472,6 +472,28 @@ fn meta_firmware(s: &str) -> Option<FirmwareKind> {
     Firmware::parse(s).map(firmware_kind)
 }
 
+/// The `display` values a template's metadata may carry: vmlab's own names
+/// and QEMU's display devices by name, with no properties. Template metadata
+/// comes from any registry, and whatever passes here becomes the whole value
+/// of a `-device` argument, so this is a closed list and not a syntax check —
+/// `loader,file=…` is a device too. A lab file's `display` is not held to it:
+/// a lab file already has `qemu_args`.
+pub const TEMPLATE_DISPLAYS: &[&str] = &[
+    "std",
+    "qxl",
+    "virtio-vga",
+    "virtio-gpu",
+    "vmware",
+    "VGA",
+    "cirrus-vga",
+    "qxl-vga",
+    "virtio-gpu-pci",
+    "vmware-svga",
+    "bochs-display",
+    "ramfb",
+    "ati-vga",
+];
+
 fn display_device_name(d: &str, arch: &str) -> String {
     let x86 = arch == "x86_64" || arch == "x86";
     match d {
@@ -504,6 +526,11 @@ pub fn resolve_vm(
     template: Option<&TemplateMeta>,
     profiles: &ProfileSet,
 ) -> anyhow::Result<ResolvedVm> {
+    // Refused whether or not this VM restates `display`: the string would be
+    // the device of the next VM that does not.
+    if let Some(t) = template {
+        t.ensure_known_display()?;
+    }
     let profile_name = effective_profile_name(lab_vm, template);
     let default_profile = default_profile();
     let profile = match &profile_name {
@@ -863,6 +890,50 @@ mod tests {
         assert!(r.secure_boot);
         assert_eq!(r.machine, "q35");
         assert_eq!(r.firmware, Some(FirmwareKind::Ovmf));
+    }
+
+    /// A template's metadata comes from any registry, so its `display` is
+    /// one of the names vmlab knows and never a QEMU `-device` value of the
+    /// template's choosing (docs/reviews/config.md F1). The lab file's own
+    /// `display` stays free: it is as trusted as `qemu_args`.
+    #[test]
+    fn a_template_display_names_a_known_device_or_is_refused() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm("vm \"a\" { template = \"x86_64/win\" }");
+        let hostile = "loader,file=/etc/hostname,addr=0x1000000,force-raw=on";
+        let mut m = meta();
+        m.display = Some(hostile.into());
+        let err =
+            resolve_vm(&v, Some(&m), &profiles).expect_err("a template names its own QEMU device");
+        let text = format!("{err:#}");
+        assert!(text.contains("display"), "{text}");
+        assert!(text.contains("x86_64/win@1"), "{text}");
+        // A bare device name outside the display list is refused too.
+        m.display = Some("loader".into());
+        assert!(resolve_vm(&v, Some(&m), &profiles).is_err());
+        // The names vmlab maps, and a display device by its QEMU name, pass.
+        for (name, device) in [
+            ("std", "VGA"),
+            ("qxl", "qxl-vga"),
+            ("virtio-vga", "virtio-vga"),
+            ("virtio-gpu", "virtio-gpu-pci"),
+            ("vmware", "vmware-svga"),
+            ("cirrus-vga", "cirrus-vga"),
+        ] {
+            m.display = Some(name.into());
+            let r = resolve_vm(&v, Some(&m), &profiles).unwrap();
+            assert_eq!(r.display_device.as_deref(), Some(device), "{name}");
+        }
+        // The VM's own `display` wins and is taken as written.
+        m.display = Some(hostile.into());
+        let own =
+            vm("vm \"a\" { template = \"x86_64/win\" display = \"bochs-display,vgamem=8M\" }");
+        // The template's string is still refused: it would be the display of
+        // the next VM that does not restate one.
+        assert!(resolve_vm(&own, Some(&m), &profiles).is_err());
+        m.display = None;
+        let r = resolve_vm(&own, Some(&m), &profiles).unwrap();
+        assert_eq!(r.display_device.as_deref(), Some("bochs-display,vgamem=8M"));
     }
 
     /// Shipped profiles plus one user profile, `period`, that pins a CPU
