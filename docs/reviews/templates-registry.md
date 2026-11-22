@@ -32,7 +32,7 @@ much as a Makefile is.
 | F5 | security | A template pull bounds each chunk but not the number of chunks or the total size |
 | F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop |
 | F7 | security | The store accepts a qcow2 with an external data file (reachable only with `VMLAB_IMAGE_TOOL=qemu-img`) |
-| F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` |
+| F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` (fixed, #465) |
 | F9 | wrong result | A hard link in a container layer loses its target when a higher layer deletes or replaces that target |
 | F10 | wrong result | The registry HTTP client has no timeout |
 | F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest |
@@ -278,6 +278,17 @@ much as a Makefile is.
   succeeds and `a.example` is gone.
   `a_non_object_auths_is_an_error_not_a_panic`: write `{"auths":"x"}`. Today
   the call panics.
+- Fixed in card #465. `store_login_at` refuses a config that does not parse
+  as JSON, one whose top level is not an object, and one whose `auths` is not
+  an object. The error names the file and the file is left unchanged. A
+  missing file, an empty file and a null `auths` still start from an empty
+  object, because nothing is lost there. The temporary file has a name of its
+  own and mode 0600 from its creation, so two logins do not share it and the
+  written config is 0600 whatever mode the old file had. Both proof tests
+  failed before the fix (the first returned `Ok` with the file replaced, the
+  second panicked in `serde_json`) and pass after it. A third test,
+  `a_login_keeps_the_other_keys_and_writes_a_private_file`, covers the
+  smaller half. It failed before on the mode (0644).
 
 ### F9. A hard link in a layer loses its target (wrong result)
 

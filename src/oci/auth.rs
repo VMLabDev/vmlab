@@ -308,32 +308,62 @@ pub fn store_login_at(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
-    let mut root: serde_json::Value = if path.is_file() {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
-        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
+    // The file is Docker's and the user's: other registries' credentials,
+    // `credHelpers`, proxies. One this cannot read as a JSON object is left
+    // exactly as it is and the login refused, never replaced by an empty one.
+    let mut root = match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => serde_json::Map::new(),
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Object(root)) => root,
+            Ok(_) => bail!(
+                "{} is not a JSON object; fix or move it, then log in again (it was left unchanged)",
+                path.display()
+            ),
+            Err(error) => bail!(
+                "{} does not parse as JSON ({error}); fix or move it, then log in again (it was left unchanged)",
+                path.display()
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", path.display()));
+        }
     };
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
     let auth = BASE64.encode(format!("{username}:{password}"));
-    root["auths"][registry] = serde_json::json!({ "auth": auth });
-    let text = serde_json::to_string_pretty(&root).context("cannot serialise docker config")?;
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, format!("{text}\n"))
-        .with_context(|| format!("cannot write {}", temp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode())
-            .unwrap_or(0o600);
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("cannot protect {}", temp.display()))?;
+    let auths = root
+        .entry("auths")
+        .or_insert_with(|| serde_json::Value::Null);
+    if auths.is_null() {
+        *auths = serde_json::json!({});
     }
-    std::fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    let Some(auths) = auths.as_object_mut() else {
+        bail!(
+            "\"auths\" in {} is not a JSON object; fix or move the file, then log in again (it was left unchanged)",
+            path.display()
+        );
+    };
+    auths.insert(registry.to_string(), serde_json::json!({ "auth": auth }));
+    let text = serde_json::to_string_pretty(&root).context("cannot serialise docker config")?;
+    // A temporary file of its own name, private (0600) from its creation:
+    // two logins at once do not share it, and the password is at no moment
+    // readable by another local user, whatever mode the old file had.
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let mut temp = tempfile::Builder::new()
+        .prefix(".config.json.")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("cannot create a temporary file in {}", parent.display()))?;
+    {
+        use std::io::Write as _;
+        let written = temp.write_all(format!("{text}\n").as_bytes());
+        written.with_context(|| format!("cannot write {}", temp.path().display()))?;
+    }
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("cannot replace {}", path.display()))?;
     Ok(())
 }
 
@@ -471,5 +501,65 @@ mod tests {
             resolve_from_file("reg.example.com", &path).unwrap(),
             Credential::Basic { .. }
         ));
+    }
+
+    /// F8 of the templates review: a config that does not parse is the
+    /// user's, with other registries' credentials in it. It is refused, not
+    /// replaced by an empty one.
+    #[test]
+    fn a_malformed_config_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let before = r#"{"auths":{"a.example":{"auth":"eDp5"}},}"#;
+        std::fs::write(&path, before).unwrap();
+        let error = store_login_at(&path, "ghcr.io", "carol", "tok").unwrap_err();
+        assert!(format!("{error:#}").contains("config.json"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let before = r#"["not", "an", "object"]"#;
+        std::fs::write(&path, before).unwrap();
+        store_login_at(&path, "ghcr.io", "carol", "tok").unwrap_err();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_non_object_auths_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for before in [r#"{"auths":"x"}"#, r#"{"auths":[1]}"#, r#"{"auths":7}"#] {
+            std::fs::write(&path, before).unwrap();
+            let error = store_login_at(&path, "ghcr.io", "carol", "tok").unwrap_err();
+            assert!(format!("{error:#}").contains("auths"), "{error:#}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    /// The smaller half of F8: the password is never in a file other local
+    /// users can read, and the other keys of the config survive.
+    #[cfg(unix)]
+    #[test]
+    fn a_login_keeps_the_other_keys_and_writes_a_private_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"auths":{"a.example":{"auth":"eDp5"}},"credHelpers":{"b.example":"pass"}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store_login_at(&path, "ghcr.io", "carol", "tok").unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["auths"]["a.example"]["auth"], "eDp5");
+        assert_eq!(root["credHelpers"]["b.example"], "pass");
+        assert!(root["auths"]["ghcr.io"]["auth"].is_string());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("config.json")]);
     }
 }
