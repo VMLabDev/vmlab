@@ -25,7 +25,7 @@ much as a Makefile is.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it |
+| F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it (fixed, #461) |
 | F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check |
 | F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot |
 | F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference |
@@ -78,6 +78,17 @@ much as a Makefile is.
      pull, create a linked clone on `variants/v/disk.qcow2`, push a rebuilt
      `v` and a new variant `w`, pull `#w`. Assert the clone's backing file
      still hashes to digest A. Today it hashes to B.
+- Fixed in card #461. `add_variants` takes an in-use check, asks it under the
+  store lock about every overlay it would replace, and refuses with nothing
+  moved. A pull asks the same check (`Registry::guarding`, every registered
+  lab's clones) before it downloads a variant the store holds with another
+  digest. While a clone is backed by the held overlay, a pull that only
+  brought the variant along as the default keeps it and fetches the rest, and
+  a pull that asked for it is refused, naming the machines. A client with no
+  check replaces no held overlay. The second proof test failed before the fix
+  (the held overlay hashed to B) and passes after it. The first could not
+  compile before the fix, as the finding says. Not fixed here: `--overwrite`
+  (F2).
 
 ### F2. `--overwrite` on pull and import replaces a version with no in-use check (data loss)
 
