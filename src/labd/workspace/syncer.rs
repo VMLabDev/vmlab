@@ -1984,13 +1984,7 @@ async fn pass(
         .chain(probe.skipped.iter())
         .cloned()
         .collect();
-    for skip in &skipped {
-        events.emit(
-            "workspace.skipped",
-            json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
-        );
-        undecided.insert(skip.path.clone());
-    }
+    undecided.extend(skipped.iter().map(|skip| skip.path.clone()));
     if !probe.unlisted_dirs.is_empty() {
         // The listing says nothing about paths below a skipped directory.
         // Defer existing agreements, host-only paths and reported guest
@@ -2007,19 +2001,19 @@ async fn pass(
                 .cloned(),
         );
     }
-    // A refused rule file is said like a skip and decided like any other
-    // path: the link is still a sync object, and only its reading as rules
-    // was declined. Left out of `undecided`, so it never holds a pass open.
-    for refusal in &scan.refused_rules {
-        events.emit(
-            "workspace.skipped",
-            json!({"machine": workspace.machine, "path": refusal.path, "reason": refusal.why}),
-        );
-    }
+    // Escaped host names are diagnostic labels only. Refused rule files are
+    // still sync objects: only their reading as rules was declined.
     let skipped: Vec<Skip> = skipped
         .into_iter()
+        .chain(scan.unrepresentable.iter().cloned())
         .chain(scan.refused_rules.iter().cloned())
         .collect();
+    for skip in &skipped {
+        events.emit(
+            "workspace.skipped",
+            json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
+        );
+    }
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
@@ -5700,6 +5694,37 @@ mod tests {
             .before_restore("dev01", false, Some(&ws))
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_host_name_that_is_not_utf8_is_a_named_skip() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        let (syncers, guest, _) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let invalid = dir.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+        std::fs::write(&invalid, "local only").unwrap();
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        let first = syncer.pass_now().await.unwrap();
+        let second = syncer.pass_now().await.unwrap();
+        for report in [first, second] {
+            assert!(report.trouble.is_none(), "{:?}", report.trouble);
+            assert!(
+                report.skipped.iter().any(|skip| {
+                    skip.path.contains(r"caf\xE9.txt") && skip.why.contains("UTF-8")
+                }),
+                "{:?}",
+                report.skipped
+            );
+        }
+        assert!(guest.get("/src/caf�.txt").is_none());
+        syncers.before_capture("dev01", None).await.unwrap();
+        assert_eq!(std::fs::read_to_string(invalid).unwrap(), "local only");
+        syncers.stop("dev01").await;
     }
 
     /// A rule file is read by the host, and a symlink syncs guest to host
