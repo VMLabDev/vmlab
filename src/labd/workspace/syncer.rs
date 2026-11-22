@@ -2259,10 +2259,17 @@ async fn pass(
     // `.vmlabignore` needs most.
     let prune = ignores.prune_list(&scan.pruned);
     //
-    // A pass that held a moved path back for its quiet period leaves it alone
-    // too: that path may be the conflict the new rules bring, and it has not
-    // been compared yet.
-    let record_rules = if halt.is_some() || !found_host.is_empty() || !found_guest.is_empty() {
+    // So does a pass that left a path the ledger has never held waiting out
+    // its quiet period. A path the new rules bring into scope is exactly
+    // that, it may be the conflict they cause, and it has not been compared
+    // yet — the next pass has to be able to say why it halts.
+    let uncompared = pending
+        .in_flight
+        .iter()
+        .chain(found_host.iter())
+        .chain(found_guest.iter())
+        .any(|path| !ledger.entries.contains_key(path));
+    let record_rules = if halt.is_some() || (rules_changed && uncompared) {
         ledger.ignore_digest.clone()
     } else {
         rules
