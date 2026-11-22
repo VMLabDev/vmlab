@@ -781,6 +781,9 @@ mod tests {
         device_state_loads: Vec<Vec<u8>>,
         check_device_state: usize,
         fail_check_device_state: bool,
+        /// Signal the queue's call eventfd while answering GET_VRING_BASE,
+        /// as virtiofsd does for the requests it finishes on the stop.
+        call_on_get_vring_base: bool,
         kicks: BTreeMap<usize, u64>,
         unexpected: Vec<String>,
     }
@@ -970,6 +973,7 @@ mod tests {
         protocol: VhostUserProtocolFeatures,
         save_state: Vec<u8>,
     ) {
+        let mut calls: BTreeMap<usize, File> = BTreeMap::new();
         while let Some(received) = recv_request(&mut stream) {
             let u64_payload = |r: &Received| u64::from_le_bytes(r.payload[..8].try_into().unwrap());
             match received.code {
@@ -1030,8 +1034,9 @@ mod tests {
                 req::SET_VRING_CALL => {
                     let queue = (u64_payload(&received) & 0xff) as usize;
                     log.lock().call_queues.push(queue);
-                    // The fd stays open until it goes out of scope here; the
-                    // fake never signals calls, so nothing observes it.
+                    if let Some(fd) = received.fds.into_iter().next() {
+                        calls.insert(queue, File::from(fd));
+                    }
                 }
                 req::SET_VRING_ENABLE => {
                     let index =
@@ -1047,6 +1052,11 @@ mod tests {
                 }
                 req::GET_VRING_BASE => {
                     let index = u32::from_le_bytes(received.payload[0..4].try_into().unwrap());
+                    if log.lock().call_on_get_vring_base
+                        && let Some(call) = calls.get_mut(&(index as usize))
+                    {
+                        call.write_all(&1u64.to_le_bytes()).expect("signal call");
+                    }
                     let mut body = Vec::with_capacity(8);
                     body.extend_from_slice(&index.to_le_bytes());
                     body.extend_from_slice(&FAKE_VRING_BASE.to_le_bytes());
@@ -1187,6 +1197,43 @@ mod tests {
             self.notifies.lock().push(queue);
         }
         fn notify_config(&self) {}
+    }
+
+    /// Records each queue notification with the number of SET_VRING_ENABLE
+    /// messages (enable and disable) the backend had seen by then, which
+    /// places the notification in the message sequence.
+    struct OrderInterrupt {
+        log: Arc<Mutex<BackendLog>>,
+        seen: Mutex<Vec<(u16, usize)>>,
+    }
+
+    impl VirtioInterrupt for OrderInterrupt {
+        fn notify_queue(&self, queue: u16) {
+            let enables = {
+                let log = self.log.lock();
+                log.enabled.len() + log.disabled.len()
+            };
+            self.seen.lock().push((queue, enables));
+        }
+        fn notify_config(&self) {}
+    }
+
+    /// A section as an active device saves it: both queues at
+    /// [`FAKE_VRING_BASE`] and a backend state blob.
+    fn active_section() -> Vec<u8> {
+        let blob = b"virtiofsd-state-bytes";
+        let mut out = Vec::new();
+        out.extend_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
+        out.push(1);
+        out.push(1);
+        out.extend_from_slice(&(1u64 << 32).to_le_bytes());
+        out.extend_from_slice(&(NUM_QUEUES as u16).to_le_bytes());
+        for _ in 0..NUM_QUEUES {
+            out.extend_from_slice(&FAKE_VRING_BASE.to_le_bytes());
+        }
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(blob);
+        out
     }
 
     /// Poll `probe` until it returns true, or panic after `secs`.
@@ -1567,6 +1614,89 @@ mod tests {
         // The fresh session was quiesced, re-based and re-enabled.
         assert_eq!(log2.vring_base, BTreeMap::from([(0, 7), (1, 7)]));
         assert_eq!(log2.disabled, vec![0, 1]);
+    }
+
+    #[test]
+    fn restore_into_an_active_device_notifies_every_queue() {
+        // Review F12: a request the backend finished while the saving
+        // machine stopped its rings is in the used ring of the snapshot, but
+        // its interrupt went to the machine that kept running. The restored
+        // guest must be told to look at both queues.
+        let backend = FakeBackend::new("load-notify").serve();
+        let mem = shared_guest_memory();
+        let interrupt = Arc::new(RecInterrupt::default());
+        let mut fs = Fs::new("fs-scratch", backend.config()).unwrap();
+        fs.ack_features(1 << 32);
+        fs.activate(mem.clone(), interrupt.clone(), ready_queues(&mem, 128))
+            .unwrap();
+        assert!(interrupt.notifies.lock().is_empty());
+        {
+            use crate::Snapshot;
+            fs.restore_state(&active_section()).unwrap();
+        }
+        let mut notified = interrupt.notifies.lock().clone();
+        notified.sort_unstable();
+        assert_eq!(notified, vec![0, 1]);
+        drop(fs);
+        let log = backend.join();
+        assert!(log.lock().unexpected.is_empty());
+    }
+
+    #[test]
+    fn restored_state_applied_at_activation_notifies_every_queue() {
+        // The same section arriving before the transport activates the
+        // device: the notification follows the activation that applies it.
+        let backend = FakeBackend::new("pending-notify").serve();
+        let mem = shared_guest_memory();
+        let interrupt = Arc::new(RecInterrupt::default());
+        let mut fs = Fs::new("fs-scratch", backend.config()).unwrap();
+        {
+            use crate::Snapshot;
+            fs.restore_state(&active_section()).unwrap();
+        }
+        assert!(interrupt.notifies.lock().is_empty());
+        fs.ack_features(1 << 32);
+        fs.activate(mem.clone(), interrupt.clone(), ready_queues(&mem, 128))
+            .unwrap();
+        let mut notified = interrupt.notifies.lock().clone();
+        notified.sort_unstable();
+        assert_eq!(notified, vec![0, 1]);
+        drop(fs);
+    }
+
+    #[test]
+    fn save_delivers_calls_raised_during_get_vring_base() {
+        // Review F12: the backend finishes requests in flight when it
+        // answers GET_VRING_BASE and signals the call eventfd, at a moment
+        // when the call worker is stopped. The save itself must turn those
+        // calls into interrupts, before it re-arms the rings: 2 enables
+        // from the activation and 2 disables from the stop, and none of the
+        // 2 enables of the re-arm.
+        let backend = FakeBackend::new("save-call").serve();
+        let mem = shared_guest_memory();
+        let interrupt = Arc::new(OrderInterrupt {
+            log: Arc::clone(&backend.log),
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut fs = Fs::new("fs-scratch", backend.config()).unwrap();
+        fs.ack_features(1 << 32);
+        fs.activate(mem.clone(), interrupt.clone(), ready_queues(&mem, 128))
+            .unwrap();
+        backend.log.lock().call_on_get_vring_base = true;
+        {
+            use crate::Snapshot;
+            fs.save_state().unwrap();
+        }
+        let mut seen = interrupt.seen.lock().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![(0, 4), (1, 4)]);
+        // Each call is delivered one time: the restarted worker finds the
+        // eventfds empty.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(interrupt.seen.lock().len(), 2);
+        drop(fs);
+        let log = backend.join();
+        assert!(log.lock().unexpected.is_empty());
     }
 
     #[test]
