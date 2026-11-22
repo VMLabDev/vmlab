@@ -230,6 +230,9 @@ pub struct FakeHypervisor {
     /// Every helper the fake started (TPMs, filesystem daemons), so a test
     /// can assert teardown left nothing behind.
     helpers: Mutex<Vec<Arc<FakeProc>>>,
+    /// The extra disk images of every VM launch, in launch order, so a test
+    /// can assert what a machine was given.
+    launched_disks: std::sync::Mutex<Vec<Vec<PathBuf>>>,
 }
 
 impl FakeHypervisor {
@@ -239,7 +242,13 @@ impl FakeHypervisor {
             paused: Arc::new(AtomicBool::new(false)),
             attempts: AtomicUsize::new(0),
             helpers: Mutex::new(Vec::new()),
+            launched_disks: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// The extra disk image paths of each VM launch so far.
+    pub fn launched_disks(&self) -> Vec<Vec<PathBuf>> {
+        self.launched_disks.lock().expect("fake launch lock").clone()
     }
 
     /// How many times the emulator was started.
@@ -327,6 +336,12 @@ impl Hypervisor for FakeHypervisor {
     }
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
+        if let super::Launch::Vm { paths, .. } = &spec.machine {
+            self.launched_disks
+                .lock()
+                .expect("fake launch lock")
+                .push(paths.extra_disks.iter().map(|(_, p)| p.clone()).collect());
+        }
         let run = self.next_run();
         if let Some(msg) = &run.start_fails {
             bail!("{}: {msg}", spec.label);

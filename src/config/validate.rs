@@ -3051,6 +3051,41 @@ template "t" {
         );
     }
 
+    /// F4 (docs/reviews/config.md): two `disk` blocks with one name would
+    /// give the VM two writable drives on one image file.
+    #[test]
+    fn two_disks_with_one_name_are_refused() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "data" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("vm \"a\"") && m.contains("disk \"data\" is declared twice")),
+            "expected the duplicate disk name to be refused, got: {es:#?}"
+        );
+        let distinct = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "logs" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            !distinct.iter().any(|m| m.contains("declared twice")),
+            "two names are two images: {distinct:#?}"
+        );
+    }
+
     #[test]
     fn undeclared_segment() {
         assert_err(

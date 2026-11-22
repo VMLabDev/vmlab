@@ -824,6 +824,38 @@ async fn a_vm_starts_and_becomes_ready_without_a_hypervisor() {
     vm.stop(true).await.expect("stop");
 }
 
+/// F4 (docs/reviews/config.md): a disk's image is `disk-<name>.qcow2`, so
+/// two `disk` blocks with one name are one file. A configuration that reaches
+/// the lab daemon that way must never launch with that file as two drives:
+/// vmlab-hv takes no image lock, and writes through both corrupt it.
+#[tokio::test]
+async fn two_disks_with_one_name_never_launch_as_two_drives() {
+    let dirs = Dirs::new();
+    let decl = r#"vm "dc01" {
+        template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+        disk "data" { size = 1GiB }
+        disk "data" { size = 1GiB }
+    }"#;
+    let (vm, hv) = vm(&dirs, decl, Script::healthy());
+    // As for the primary disk: present, so nothing shells out to qemu-img.
+    std::fs::write(dirs.root.join("local").join("disk-data.qcow2"), b"").expect("disk-data");
+    let (cbs, _observed) = callbacks();
+
+    let started = start_vm(&vm, cbs).await;
+
+    for disks in hv.launched_disks() {
+        let mut seen = std::collections::HashSet::new();
+        for d in &disks {
+            assert!(seen.insert(d), "one image launched as two drives: {disks:?}");
+        }
+    }
+    let err = started.expect_err("a VM with one disk name twice must not start");
+    assert!(
+        format!("{err:#}").contains("disk \"data\" is declared twice"),
+        "the refusal names the duplicate: {err:#}"
+    );
+}
+
 /// Readiness is when the lab installs whatever is keyed on the machine's
 /// lease — a segment `forward {}` aimed at it above all (PRD §9.8). The VM
 /// must tell the lab exactly as a container does, or its forwards stay
