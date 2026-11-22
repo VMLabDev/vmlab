@@ -39,6 +39,7 @@ fi
 # Download beside the target, so the rename is on one filesystem, and never
 # leave an unchecked file under the final name.
 tmp="$(mktemp "$dir/.cosign.XXXXXX")"
+[ -n "$tmp" ] && [ "$tmp" != / ] && [ -f "$tmp" ] || die "mktemp gave no file"
 trap 'rm -f "$tmp"' EXIT
 curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp" "$URL" || die "could not download $URL"
 echo "$SHA256  $tmp" | sha256sum --check --quiet \
