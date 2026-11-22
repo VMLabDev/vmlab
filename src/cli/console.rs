@@ -62,9 +62,14 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
         // user to point any VNC client at (the WSL2 path).
         if tcp || viewer.is_none() {
             let (port, _) = bridge(&sock).await?;
+            // Take SIGINT before the address is printed: a reader that acts
+            // on the address line may interrupt at once, and until the
+            // handler is installed an interrupt kills the process.
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             println!("VNC for {lab}/{vm} on 127.0.0.1:{port}");
             println!("connect a VNC viewer there (Ctrl-C to stop the bridge)");
-            tokio::signal::ctrl_c().await.ok();
+            interrupt.recv().await;
             return Ok(());
         }
 
