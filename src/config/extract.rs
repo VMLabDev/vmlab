@@ -1146,11 +1146,18 @@ fn extract_source(b: &Block, issues: &mut IssueList) -> Option<TemplateSource> {
         match (path.clone(), url.clone()) {
             (Some(p), None) => Some(ArtefactSource::Path { path: p, span }),
             (None, Some(u)) => match sha256.clone() {
-                Some(h) => Some(ArtefactSource::Url {
-                    url: u,
-                    sha256: h,
-                    span,
-                }),
+                // The artefact cache names its files by this value.
+                Some(h) => match crate::template::artefact::digest_name(&h) {
+                    Ok(h) => Some(ArtefactSource::Url {
+                        url: u,
+                        sha256: h,
+                        span,
+                    }),
+                    Err(e) => {
+                        r.issue(format!("{e} (PRD §6.1)"));
+                        None
+                    }
+                },
                 None => {
                     r.issue("URL sources require `sha256 = ...` (PRD §6.1)");
                     None
