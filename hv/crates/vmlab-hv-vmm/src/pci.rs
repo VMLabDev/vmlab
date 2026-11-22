@@ -1297,6 +1297,35 @@ mod tests {
     }
 
     #[test]
+    fn a_device_rom_is_sized_at_once_and_read_on_the_first_guest_access() {
+        let mut bars = test_bars();
+        bars.push(BarInfo {
+            index: 6,
+            size: 0x1_0000,
+            kind: BarKind::Mmio32,
+        });
+        let device = FakePci::new(bars);
+        let mut root = PciRoot::q35(1 << 32);
+        root.add_device_at(3, 0, device.clone()).unwrap();
+        // Sizing and placement need no byte of the ROM: a passed-through
+        // card's flash takes seconds to read.
+        root.config_write(0, 3, 0, 0x30, &0xffff_f800u32.to_le_bytes());
+        assert_eq!(root.config_read(0, 3, 0, 12), 0xffff_0000);
+        root.config_write(0, 3, 0, 0x30, &0xc300_0001u32.to_le_bytes());
+        root.config_write(0, 3, 0, 4, &2u16.to_le_bytes());
+        assert!(device.lock().bar_log.lock().is_empty());
+        let mut bytes = [0; 2];
+        assert!(root.dispatch_mmio_read(0xc300_0000, &mut bytes));
+        assert_eq!(bytes, [0xaa; 2]);
+        assert!(root.dispatch_mmio_read(0xc300_fffe, &mut bytes));
+        assert_eq!(bytes, [0xaa; 2]);
+        // One read of the whole ROM serves every later access.
+        let log = device.lock().bar_log.lock().clone();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].0, log[0].1, log[0].2.len()), (6, 0, 0x1_0000));
+    }
+
+    #[test]
     fn cf8_cfc_routes_config_reads() {
         let (root, _dev) = root_with_fake();
         let root = Arc::try_unwrap(root).ok().unwrap().into_inner();

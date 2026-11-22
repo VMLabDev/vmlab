@@ -474,10 +474,15 @@ fn a_larger_64_bit_pci_window_changes_only_its_end_and_length() {
             .count()
     };
     // QWordMemory: minimum, maximum, translation, length.
-    let descriptor = [0x380000000000u64, 0x380000000000 + (96 << 30) - 1, 0, 96 << 30]
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect::<Vec<u8>>();
+    let descriptor = [
+        0x380000000000u64,
+        0x380000000000 + (96 << 30) - 1,
+        0,
+        96 << 30,
+    ]
+    .iter()
+    .flat_map(|value| value.to_le_bytes())
+    .collect::<Vec<u8>>();
     assert_eq!(
         wide.windows(descriptor.len())
             .filter(|window| *window == descriptor)

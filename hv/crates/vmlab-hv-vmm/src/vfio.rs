@@ -329,8 +329,11 @@ impl Backend for Host {
             .region_read(VFIO_PCI_CONFIG_REGION_INDEX, &mut command, 4);
         let decoding = command[0] & 2 != 0;
         if !decoding {
-            self.device
-                .region_write(VFIO_PCI_CONFIG_REGION_INDEX, &[command[0] | 2, command[1]], 4);
+            self.device.region_write(
+                VFIO_PCI_CONFIG_REGION_INDEX,
+                &[command[0] | 2, command[1]],
+                4,
+            );
         }
         self.device.region_read(u32::from(region), data, offset);
         if !decoding {

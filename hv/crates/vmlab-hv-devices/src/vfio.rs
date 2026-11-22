@@ -715,7 +715,10 @@ mod tests {
         assert_eq!(device.config_read(0x300 / 4), 0x0001_0018);
         // SR-IOV reads as nothing through to the next capability: no VF BAR
         // is left for firmware to size.
-        for offset in (0x200..0x300).step_by(4).chain([0x400, 0x404, 0x500, 0x504]) {
+        for offset in (0x200..0x300)
+            .step_by(4)
+            .chain([0x400, 0x404, 0x500, 0x504])
+        {
             assert_eq!(device.config_read(offset / 4), 0, "{offset:#x}");
         }
         // Writes to a hidden capability never reach the device.
