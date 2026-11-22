@@ -1296,6 +1296,7 @@ mod tests {
             "dialed trunk port survived detach"
         );
         drop(gateway_sender);
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.down");
         assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.down");
 
         let (a_sock, _) = a
