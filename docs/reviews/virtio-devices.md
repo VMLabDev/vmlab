@@ -293,7 +293,7 @@ Not read:
   - Changed for the guest: a cookie is now the host's `d_off` and not an
     index. After a snapshot restore a handle resumes by seeking to the
     cookie the guest sends.
-  - Not fixed here: F13.
+  - Not fixed here: F13 (fixed in card #417).
 
 ### F8. virtio-net: one frame larger than the guest's buffers stalls receive forever without mergeable buffers
 
@@ -429,6 +429,20 @@ Not read:
   `readdirplus_reports_a_full_inode_table`: create 40 files and assert that
   the call returns `ENFILE` or lists all 40.
 - Confidence: high.
+- Fixed in card #417. An entry that `add_entry` does not take (`Ok(0)` or an
+  error) gives its lookup back at once, and a request that fails gives back
+  the lookups of every entry it had already placed, because the guest gets
+  the error alone. A full inode table is no longer skipped: a request that
+  has placed entries ends there, and the next one, which can place none,
+  returns `ENFILE`. The tests
+  `readdirplus_does_not_leak_the_entry_that_did_not_fit`,
+  `readdirplus_takes_back_its_lookups_when_the_request_fails` and
+  `readdirplus_reports_a_full_inode_table` fail before the fix (the refused
+  entry stays in `by_path`, 4 inodes where 2 are due, 31 of 40 files listed
+  with no error) and pass after it.
+  - Not fixed here: every other error of `resolve` still skips the entry,
+    which is right for a file that raced away and hides one for a host
+    error such as `EMFILE`.
 
 ### F14. virtio-net on a TAP: one failed packet write or read latches `tap_error` for the life of the process
 
