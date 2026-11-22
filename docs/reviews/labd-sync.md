@@ -298,6 +298,10 @@ on the canonical copy for a time.
 
 ### F7. A guest delete across a prune-list reopen is undone
 
+**Fixed in #419.** The stat-walk after an immediate prune-list reopen
+recovers guest deletions. A failed reopen keeps the unwitnessed-absence
+policy on retry.
+
 **Where.** `src/labd/workspace/syncer.rs:1152-1161` and `syncer.rs:966-975`
 (`unwitnessed = rescan` on every open), `src/labd/workspace/plan.rs:716-735`.
 
