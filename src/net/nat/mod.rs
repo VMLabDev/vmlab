@@ -275,10 +275,17 @@ impl NatEngine {
         let seg = vtcp::Segment::from_view(&tcp);
         let tx = self.tcp_flows.lock_recover().get(&key).cloned();
         if let Some(tx) = tx {
-            // Preserve arrival order and backpressure. Deliberately dropping
-            // here turns a busy in-process proxy into apparent network loss
-            // and can poison protocols such as SMB under sustained writes.
-            let _ = tx.send(seg).await;
+            // Never wait for a flow task: the caller is the gateway task of
+            // the whole segment, and one flow that fell behind would stop
+            // ARP, DHCP, DNS and every other flow with it (review F4).
+            // `try_send` keeps arrival order. Backpressure is the flow's
+            // advertised window, which closes as its host side falls
+            // behind, and the channel holds more than a guest inside that
+            // window has in flight. So only a guest that ignores the window
+            // loses a segment here, and it sends that one again.
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(seg) {
+                trace!(?key, "nat: flow queue full, segment dropped");
+            }
             return;
         }
         let opens = seg.is_syn() && !seg.is_ack();
@@ -290,7 +297,7 @@ impl NatEngine {
                 return;
             };
             debug!(?key, "nat: passive vtcp open");
-            let (tx, rx) = mpsc::channel(64);
+            let (tx, rx) = mpsc::channel(vtcp::SEGMENT_QUEUE);
             self.tcp_flows.lock_recover().insert(key, tx);
             vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx, slot);
         } else if !seg.is_rst() {
