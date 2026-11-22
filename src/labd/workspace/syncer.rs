@@ -2429,6 +2429,7 @@ mod tests {
     struct OneFake {
         guest: Arc<FakeGuest>,
         watcher: Arc<FakeWatcher>,
+        before_watch: fn(&FakeGuest, &[String]),
         /// The prune list of every watch that has been opened, in order.
         opens: std::sync::Mutex<Vec<Vec<String>>>,
         /// How many guest writes had already happened when each watch opened.
@@ -2448,6 +2449,7 @@ mod tests {
             Arc::new(OneFake {
                 guest,
                 watcher,
+                before_watch: |_, _| {},
                 opens: std::sync::Mutex::new(Vec::new()),
                 opened_after: std::sync::Mutex::new(Vec::new()),
                 claims: std::sync::Mutex::new(Vec::new()),
@@ -2479,6 +2481,7 @@ mod tests {
             if !matches!(self.guest.get(root), Some(Node::Dir)) {
                 anyhow::bail!("watch root {root}: No such file or directory (os error 2)");
             }
+            (self.before_watch)(&self.guest, &prune);
             self.opens.lock().expect("opens").push(prune);
             self.opened_after
                 .lock()
@@ -3631,6 +3634,43 @@ mod tests {
             sessions.opens()
         );
         syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn a_guest_delete_across_a_prune_reopen_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let source = dir.path().join("old.rs");
+        std::fs::write(&source, "agreed").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        let mut sessions = OneFake::new(guest.clone());
+        Arc::get_mut(&mut sessions).unwrap().before_watch = |guest, prune| {
+            if prune.iter().any(|prefix| prefix == "build") {
+                guest.unlink("/src/old.rs");
+            }
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(workspace(dir.path(), state.path()), sessions, events)
+            .await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        assert!(
+            eventually(|| syncer.report().rescans == 1).await,
+            "the initial walk did not finish"
+        );
+        assert_eq!(guest.text("/src/old.rs").as_deref(), Some("agreed"));
+
+        std::fs::write(dir.path().join(".vmlabignore"), "build/\n").unwrap();
+        assert!(
+            eventually(|| syncer.report().rescans >= 2).await,
+            "the walk after the prune reopen did not finish"
+        );
+        syncers.stop("dev01").await;
+        assert!(syncer.report().halt.is_none());
+        assert!(!source.exists(), "the guest deletion must reach the host");
+        assert!(guest.get("/src/old.rs").is_none());
     }
 
     /// The ledger is written where `destroy` will wipe it, and it survives a
