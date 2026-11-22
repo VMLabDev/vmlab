@@ -357,6 +357,21 @@ impl RuleSet {
         }
     }
 
+    /// Whether some redirect rewrites traffic of `proto` onto `ip`, at
+    /// `port` when the rule names one: the question the NAT engine's guard
+    /// asks before it refuses a flow to the host's loopback, since a
+    /// declared `redirect` onto it is the operator's own grant (§9.7).
+    /// `port` is `None` for a protocol without ports.
+    pub fn redirects_onto(&self, ip: Ipv4Addr, proto: L4Proto, port: Option<u16>) -> bool {
+        self.redirects.iter().any(|(_, r)| {
+            r.to.ip == ip
+                && r.proto.is_none_or(|p| p == proto)
+                // A port-less rule keeps the port the guest dialled, so it
+                // reaches every port of its target.
+                && r.to.port.or(r.from.port).is_none_or(|p| port == Some(p))
+        })
+    }
+
     /// Number of live translation entries (diagnostics; asserted by tests).
     #[allow(dead_code)]
     pub fn conn_count(&self) -> usize {
@@ -771,6 +786,38 @@ mod tests {
                 v => panic!("expected rewrite, got {v:?}"),
             }
         }
+    }
+
+    /// What a redirect is asked for the NAT guard: its target address, in
+    /// its protocol, at the port a rewritten packet arrives on.
+    #[test]
+    fn redirects_onto_names_exactly_what_a_rule_rewrites_to() {
+        let lo = Ipv4Addr::LOCALHOST;
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        let mut rs = RuleSet::new();
+        assert!(!rs.redirects_onto(lo, L4Proto::Tcp, Some(8080)));
+
+        // from gw:445 to lo:44445, any protocol.
+        let id = rs.add_redirect(redirect(gw, Some(445), lo, Some(44445), None));
+        assert!(rs.redirects_onto(lo, L4Proto::Tcp, Some(44445)));
+        assert!(rs.redirects_onto(lo, L4Proto::Udp, Some(44445)));
+        assert!(!rs.redirects_onto(lo, L4Proto::Tcp, Some(445)));
+        assert!(!rs.redirects_onto(lo, L4Proto::Icmp, None));
+        assert!(!rs.redirects_onto(Ipv4Addr::new(127, 0, 0, 2), L4Proto::Tcp, Some(44445)));
+        assert!(rs.remove(id));
+        assert!(!rs.redirects_onto(lo, L4Proto::Tcp, Some(44445)));
+
+        // from gw:53 to lo, udp: the port the guest dialled is kept.
+        rs.add_redirect(redirect(gw, Some(53), lo, None, Some(L4Proto::Udp)));
+        assert!(rs.redirects_onto(lo, L4Proto::Udp, Some(53)));
+        assert!(!rs.redirects_onto(lo, L4Proto::Udp, Some(54)));
+        assert!(!rs.redirects_onto(lo, L4Proto::Tcp, Some(53)));
+
+        // A port-less rule reaches every port of its target, and ICMP.
+        let mut rs = RuleSet::new();
+        rs.add_redirect(redirect(gw, None, lo, None, None));
+        assert!(rs.redirects_onto(lo, L4Proto::Tcp, Some(1)));
+        assert!(rs.redirects_onto(lo, L4Proto::Icmp, None));
     }
 
     #[test]

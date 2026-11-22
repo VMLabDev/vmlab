@@ -39,9 +39,12 @@
 //! and [`NatEngine::udp_bind_guest_flow`] do the same for UDP datagrams.
 //! [`PortForwarder`] ties host listeners to those primitives.
 //!
-//! Under worktree isolation (PRD §21.4) a [`HostGuard`] refuses every new
-//! flow to the host's own addresses: a SYN is answered with RST, a UDP
-//! datagram or an ICMP echo is dropped ([`guard`]).
+//! The engine never lets a guest's flow land on the host's loopback
+//! (`127.0.0.0/8`, `0.0.0.0/8`) on its own: a SYN is answered with RST, a
+//! UDP datagram or an ICMP echo is dropped. A segment's [`HostGuard`] admits
+//! the lab's own host services and declared `redirect` targets there, and
+//! under worktree isolation (PRD §21.4) refuses every host address
+//! ([`guard`]).
 //!
 //! Frames toward a guest need the guest's MAC: it is learned from every
 //! frame the engine sees, and the gateway can prime the table via
@@ -126,8 +129,9 @@ pub struct NatEngine {
     macs: StdMutex<HashMap<Ipv4Addr, MacAddr>>,
     icmp: icmp::IcmpState,
     pinger: Arc<dyn Pinger>,
-    /// Worktree isolation's refusal of host addresses (§21.4); unset outside
-    /// a frozen family.
+    /// What of the host a new flow may not reach: the segment's guard, or
+    /// worktree isolation's (§21.4). Unset, the engine refuses the host's
+    /// loopback outright.
     guard: std::sync::OnceLock<Arc<HostGuard>>,
     ip_id: AtomicU16,
     eph_counter: AtomicU32,
@@ -172,16 +176,20 @@ impl NatEngine {
         &self.cfg
     }
 
-    /// Put the engine under worktree isolation (§21.4): from now on every
-    /// new flow `guard` refuses is reset or dropped. Set once; a second call
-    /// is ignored.
+    /// Give the engine its guard: from now on every new flow `guard`
+    /// refuses is reset or dropped, and nothing else is. Set once; a second
+    /// call is ignored.
     pub fn set_guard(&self, guard: Arc<HostGuard>) {
         let _ = self.guard.set(guard);
     }
 
-    /// Whether worktree isolation refuses a new flow to `dst`.
+    /// Whether a new flow to `dst` is refused: by the guard, and with none
+    /// set, whenever `dst` is the host's loopback.
     fn refused(&self, dst: Ipv4Addr, kind: guard::FlowKind) -> bool {
-        self.guard.get().is_some_and(|g| g.refuses(dst, kind))
+        match self.guard.get() {
+            Some(guard) => guard.refuses(dst, kind),
+            None => guard::is_loopback(dst),
+        }
     }
 
     /// Prime the IP → MAC table (the gateway sees ARP/DHCP and knows best).
@@ -240,8 +248,8 @@ impl NatEngine {
             self.tcp_flows.lock_recover().insert(key, tx);
             vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx);
         } else if !seg.is_rst() {
-            // Anything unexpected for an unknown flow, or a SYN worktree
-            // isolation refuses: reset it.
+            // Anything unexpected for an unknown flow, or a SYN to a host
+            // address the engine refuses: reset it.
             if let Some(rst) = vtcp::rst_for(ip, &tcp, self.next_ip_id()) {
                 self.send_frame(src_mac, &rst).await;
             }

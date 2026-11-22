@@ -31,7 +31,7 @@ Who the attacker is, per finding:
 | F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash |
 | F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses |
 | F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment |
-| F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services |
+| F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache |
 | F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet |
 | F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease |
@@ -202,6 +202,16 @@ Who the attacker is, per finding:
   set, send a guest SYN for that address and port. Assert the guest gets a
   RST and the listener accepts nothing. Today the guest gets a SYN-ACK and
   the listener accepts.
+- Fixed in card #460. Every NAT engine refuses a new flow to `127.0.0.0/8`
+  and `0.0.0.0/8`: a SYN gets a RST, UDP and ICMP are dropped. An engine with
+  no guard refuses all of it (`NatEngine::refused`, `guard::is_loopback`). A
+  segment outside isolation gets `HostGuard::loopback`, which admits two
+  things on loopback: the lab's own host services (its `smbd` behind
+  gateway:445) and the target of a `redirect` the lab declares onto loopback
+  (`RuleSet::redirects_onto`), since that rule is the operator's grant. The
+  host's interface addresses stay reachable outside isolation, as PRD §9.7
+  now says. The proof test failed before the fix (the guest got a SYN-ACK,
+  flags 18) and passes after it.
 
 ### F6. Tables learned from guest frames have no limit (security, guest)
 
