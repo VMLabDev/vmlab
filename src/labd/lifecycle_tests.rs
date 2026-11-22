@@ -846,7 +846,10 @@ async fn two_disks_with_one_name_never_launch_as_two_drives() {
     for disks in hv.launched_disks() {
         let mut seen = std::collections::HashSet::new();
         for d in &disks {
-            assert!(seen.insert(d), "one image launched as two drives: {disks:?}");
+            assert!(
+                seen.insert(d),
+                "one image launched as two drives: {disks:?}"
+            );
         }
     }
     let err = started.expect_err("a VM with one disk name twice must not start");

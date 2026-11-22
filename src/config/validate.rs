@@ -783,7 +783,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
-        check_disk_names(&format!("template \"{}\"", t.name), &t.extra_disks, &mut issues);
+        check_disk_names(
+            &format!("template \"{}\"", t.name),
+            &t.extra_disks,
+            &mut issues,
+        );
         // A build VM's `gpu {}` (§6.1) is a lab VM's, resolved on the host
         // that builds: the same check, including `passthrough`, which a
         // build may ask for on the same terms a lab VM may.

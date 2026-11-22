@@ -248,7 +248,10 @@ impl FakeHypervisor {
 
     /// The extra disk image paths of each VM launch so far.
     pub fn launched_disks(&self) -> Vec<Vec<PathBuf>> {
-        self.launched_disks.lock().expect("fake launch lock").clone()
+        self.launched_disks
+            .lock()
+            .expect("fake launch lock")
+            .clone()
     }
 
     /// How many times the emulator was started.
