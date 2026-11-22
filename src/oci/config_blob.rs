@@ -322,6 +322,25 @@ impl TemplateConfig {
 mod tests {
     use super::*;
 
+    /// A pull copies `display` out of a registry's config blob, and the
+    /// string ends up as a QEMU `-device` value: a blob naming anything but
+    /// a display device is refused (docs/reviews/config.md F1).
+    #[test]
+    fn a_blob_display_outside_the_known_devices_is_refused() {
+        let mut m = meta();
+        m.display = Some("loader,file=/etc/hostname,addr=0x1000000,force-raw=on".into());
+        let json = TemplateConfig::from_meta(&m).to_json().unwrap();
+        let err = TemplateConfig::from_json(&json)
+            .unwrap()
+            .into_meta(None)
+            .expect_err("the blob names its own QEMU device");
+        assert!(format!("{err:#}").contains("display"), "{err:#}");
+        m.display = Some("virtio-vga".into());
+        let json = TemplateConfig::from_meta(&m).to_json().unwrap();
+        let back = TemplateConfig::from_json(&json).unwrap().into_meta(None);
+        assert_eq!(back.unwrap().display.as_deref(), Some("virtio-vga"));
+    }
+
     fn meta() -> TemplateMeta {
         TemplateMeta {
             name: "win11".into(),

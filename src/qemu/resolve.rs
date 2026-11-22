@@ -865,6 +865,49 @@ mod tests {
         assert_eq!(r.firmware, Some(FirmwareKind::Ovmf));
     }
 
+    /// A template's metadata comes from any registry, so its `display` is
+    /// one of the names vmlab knows and never a QEMU `-device` value of the
+    /// template's choosing (docs/reviews/config.md F1). The lab file's own
+    /// `display` stays free: it is as trusted as `qemu_args`.
+    #[test]
+    fn a_template_display_names_a_known_device_or_is_refused() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let v = vm("vm \"a\" { template = \"x86_64/win\" }");
+        let hostile = "loader,file=/etc/hostname,addr=0x1000000,force-raw=on";
+        let mut m = meta();
+        m.display = Some(hostile.into());
+        let err = resolve_vm(&v, Some(&m), &profiles)
+            .expect_err("a template names its own QEMU device");
+        let text = format!("{err:#}");
+        assert!(text.contains("display"), "{text}");
+        assert!(text.contains("x86_64/win@1"), "{text}");
+        // A bare device name outside the display list is refused too.
+        m.display = Some("loader".into());
+        assert!(resolve_vm(&v, Some(&m), &profiles).is_err());
+        // The names vmlab maps, and a display device by its QEMU name, pass.
+        for (name, device) in [
+            ("std", "VGA"),
+            ("qxl", "qxl-vga"),
+            ("virtio-vga", "virtio-vga"),
+            ("virtio-gpu", "virtio-gpu-pci"),
+            ("vmware", "vmware-svga"),
+            ("cirrus-vga", "cirrus-vga"),
+        ] {
+            m.display = Some(name.into());
+            let r = resolve_vm(&v, Some(&m), &profiles).unwrap();
+            assert_eq!(r.display_device.as_deref(), Some(device), "{name}");
+        }
+        // The VM's own `display` wins and is taken as written.
+        m.display = Some(hostile.into());
+        let own = vm("vm \"a\" { template = \"x86_64/win\" display = \"bochs-display,vgamem=8M\" }");
+        // The template's string is still refused: it would be the display of
+        // the next VM that does not restate one.
+        assert!(resolve_vm(&own, Some(&m), &profiles).is_err());
+        m.display = None;
+        let r = resolve_vm(&own, Some(&m), &profiles).unwrap();
+        assert_eq!(r.display_device.as_deref(), Some("bochs-display,vgamem=8M"));
+    }
+
     /// Shipped profiles plus one user profile, `period`, that pins a CPU
     /// model — no shipped profile does, and none should (templates opt in).
     fn profiles_with_a_cpu_model() -> (tempfile::TempDir, ProfileSet) {
