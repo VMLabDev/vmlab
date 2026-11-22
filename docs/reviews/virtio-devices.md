@@ -347,6 +347,14 @@ Not read:
   does.
 - Confidence: high that the limit is missing. Medium that it grows to an
   out-of-memory state in practice.
+- Fixed in card #415. A queue holds at most its own size of chains, vblank
+  waits and fences counted together. A surplus vblank wait is answered at
+  once with `ERR_OUT_OF_MEMORY`, and a surplus fenced chain is answered at
+  once without waiting for its fence. The tests
+  `held_vblank_waits_are_bounded_by_the_queue_size` and
+  `held_fences_are_bounded_by_the_queue_size` prove it. The fence test calls
+  `State::hold_fence`, because a fenced chain needs a renderer to reach
+  `queue_notify`.
 
 ### F10. virtio-gpu: guest backing entries have no total cap in 3D mode
 
@@ -367,6 +375,15 @@ Not read:
   succeeds. The test needs a render node, so it does not run in
   `just ci::check`.
 - Confidence: high.
+- Fixed in card #415. Attach-backing and blob create refuse entries above a
+  total over all resources. The total is `MAX_TOTAL_ENTRIES`, 16 times
+  `MAX_ENTRIES` (262144 entries, about 12 MiB of host memory), not the
+  `MAX_ENTRIES` of the 2D path: a 3D guest backs every texture, and a total
+  of 16384 would refuse real guests. So the proof test fills 16 resources,
+  not one. `backing_entries_stop_at_the_room_left_over_all_resources` runs in
+  `just ci::check` and proves the count, also for an entry that crosses a
+  memory region. `renderer_backing_entries_are_bounded_across_resources`
+  needs a render node.
 
 ### F11. virtio-fs: a device reset does not end the FUSE session
 

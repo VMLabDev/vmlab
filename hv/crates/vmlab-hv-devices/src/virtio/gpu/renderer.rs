@@ -1095,8 +1095,22 @@ fn readback(
     Ok(output)
 }
 
-fn iovecs(mem: &GuestMemory, d: &mut Decoder<'_>, count: usize) -> Result<Vec<RutabagaIovec>, u32> {
-    if count > MAX_ENTRIES {
+/// The backing entries of all resources together. The 2D device caps them
+/// at [`MAX_ENTRIES`]. A 3D guest backs every texture, so its cap is
+/// higher: at three 16-byte copies of an entry (the renderer's iovec, the
+/// range kept here, virglrenderer's own) this is about 12 MiB of host memory.
+const MAX_TOTAL_ENTRIES: usize = 16 * MAX_ENTRIES;
+
+/// Decode `count` backing entries. `room` is how many host ranges the
+/// device may still hold over all resources: an entry that crosses a
+/// guest-memory region counts once for each range.
+fn iovecs(
+    mem: &GuestMemory,
+    d: &mut Decoder<'_>,
+    count: usize,
+    room: usize,
+) -> Result<Vec<RutabagaIovec>, u32> {
+    if count > MAX_ENTRIES.min(room) {
         return Err(INVALID);
     }
     let mut result = Vec::with_capacity(count);
@@ -1117,6 +1131,9 @@ fn iovecs(mem: &GuestMemory, d: &mut Decoder<'_>, count: usize) -> Result<Vec<Ru
         .map_err(|_| INVALID)?
         .try_for_each(|slice| {
             let slice = slice.map_err(|_| INVALID)?;
+            if result.len() >= room {
+                return Err(INVALID);
+            }
             result.push(RutabagaIovec {
                 base: slice.ptr_guard_mut().as_ptr().cast(),
                 len: slice.len(),
@@ -1334,6 +1351,13 @@ impl Backend {
         Ok(copied)
     }
 
+    /// How many backing entries the guest may still attach, over all
+    /// resources ([`MAX_TOTAL_ENTRIES`]).
+    fn entry_room(&self) -> usize {
+        let held: usize = self.resources.values().map(|r| r.backing.len()).sum();
+        MAX_TOTAL_ENTRIES.saturating_sub(held)
+    }
+
     /// Refuse a resource the descriptor limit cannot pay for.
     fn admit_resource(&mut self) -> Result<(), u32> {
         if self.resources.len() < self.budget {
@@ -1518,6 +1542,7 @@ impl Backend {
             0x106 => {
                 let id = d.u32()?;
                 let count = d.u32()? as usize;
+                let room = self.entry_room();
                 let resource = self.resources.get_mut(&id).ok_or(RESOURCE)?;
                 log::debug!(
                     "GPU attach backing: id={id} entries={count} backed={}",
@@ -1526,7 +1551,7 @@ impl Backend {
                 if resource.memory.is_some() {
                     return Err(INVALID);
                 }
-                let vecs = iovecs(mem, &mut d, count)?;
+                let vecs = iovecs(mem, &mut d, count, room)?;
                 let ranges = segments(&vecs);
                 host(self.gpu.attach_backing(id, vecs))?;
                 resource.memory = Some(mem.clone());
@@ -1673,7 +1698,7 @@ impl Backend {
                     return Err(INVALID);
                 }
                 self.admit_resource()?;
-                let vecs = iovecs(mem, &mut d, count)?;
+                let vecs = iovecs(mem, &mut d, count, self.entry_room())?;
                 // An empty Vec still has a non-null pointer. Passing it through
                 // the C API would mark a host-only blob as already guest-backed.
                 let vecs = (!vecs.is_empty()).then_some(vecs);
@@ -2084,6 +2109,71 @@ mod tests {
         renderer.command(&mem, &request(0x10c, 99, &over)).unwrap();
         renderer.reset().unwrap();
         assert_eq!(open_descriptors(), idle);
+    }
+
+    /// `count` one-page backing entries at guest address 0, as request words.
+    fn entries(count: usize) -> Vec<u32> {
+        [0, 0, 4096, 0].repeat(count)
+    }
+
+    #[test]
+    fn backing_entries_stop_at_the_room_left_over_all_resources() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let decode = |count: usize, room: usize| {
+            let words = entries(count);
+            iovecs(&mem, &mut Decoder::new(words.as_bytes()), count, room).map(|vecs| vecs.len())
+        };
+        assert_eq!(decode(3, 3), Ok(3));
+        assert_eq!(decode(3, 2), Err(INVALID));
+        assert_eq!(decode(1, 0), Err(INVALID));
+        assert_eq!(decode(MAX_ENTRIES, MAX_TOTAL_ENTRIES), Ok(MAX_ENTRIES));
+        assert_eq!(decode(MAX_ENTRIES + 1, MAX_TOTAL_ENTRIES), Err(INVALID));
+
+        // An entry across two memory regions is two host ranges.
+        let split =
+            GuestMemory::from_ranges(&[(GuestAddress(0), 4096), (GuestAddress(4096), 4096)])
+                .unwrap();
+        let words = [2048u32, 0, 4096, 0];
+        let decode = |room| {
+            iovecs(&split, &mut Decoder::new(words.as_bytes()), 1, room).map(|vecs| vecs.len())
+        };
+        assert_eq!(decode(2), Ok(2));
+        assert_eq!(decode(1), Err(INVALID));
+    }
+
+    #[test]
+    #[cfg_attr(
+        vmlab_ci_no_host_assets,
+        ignore = "requires an owner-selected DRM render node"
+    )]
+    fn renderer_backing_entries_are_bounded_across_resources() {
+        let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
+            eprintln!("SKIP backing entries: set VMLAB_HV_TEST_RENDER_NODE");
+            return;
+        };
+        let renderer =
+            Renderer::new(GpuMode::Venus, PathBuf::from(node), Arc::new(TestMapper)).unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let resources = (MAX_TOTAL_ENTRIES / MAX_ENTRIES) as u32;
+        let attach = |id: u32, count: usize| {
+            let mut body = vec![id, count as u32];
+            body.extend(entries(count));
+            renderer.command(&mem, &request(0x106, 0, &body))
+        };
+        for id in 1..=resources + 1 {
+            renderer
+                .command(&mem, &request(0x101, 0, &[id, 1, 64, 64]))
+                .unwrap();
+        }
+        for id in 1..=resources {
+            assert_eq!(attach(id, MAX_ENTRIES), Ok((NODATA, Vec::new())));
+        }
+        // The cap is over all resources: one more entry is one too many.
+        assert_eq!(attach(resources + 1, 1), Err(INVALID));
+        // A detach gives its entries back.
+        renderer.command(&mem, &request(0x107, 0, &[1, 0])).unwrap();
+        assert_eq!(attach(resources + 1, 1), Ok((NODATA, Vec::new())));
+        renderer.reset().unwrap();
     }
 
     #[test]
