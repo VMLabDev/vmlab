@@ -1467,6 +1467,7 @@ pub struct HttpTransport {
     base: String,
     credential: Credential,
     client: reqwest::Client,
+    limits: Limits,
     /// Cached bearer token per scope string.
     tokens: tokio::sync::Mutex<BTreeMap<String, String>>,
 }
@@ -1482,14 +1483,81 @@ const MAX_STREAMED_BLOB: u64 = 8 * 1024 * 1024 * 1024;
 pub(super) const MAX_LIST_PAGES: usize = 100;
 pub(super) const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
 
+/// How long the transport waits on a registry, a token realm or a mirror
+/// that has stopped talking. None of these bounds a whole transfer: a disk
+/// chunk is hundreds of MiB and takes as long as the link needs. Each one
+/// bounds a wait in which nothing arrives.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Limits {
+    /// Opening the connection, TLS handshake included.
+    connect: Duration,
+    /// From sending a request without a body to its response head.
+    answer: Duration,
+    /// The same for a request that carries a body, where the wait includes
+    /// the upload itself. reqwest's own `read_timeout` runs through the
+    /// upload too, which is why the transport keeps these waits itself.
+    upload: Duration,
+    /// Between two reads of a response body.
+    idle: Duration,
+}
+
+impl Limits {
+    /// The limits every registry call runs under. `upload` is past the ten
+    /// minutes after which GHCR drops an upload session (PRD §6.4), so it
+    /// never cuts a PUT the registry would still have taken.
+    pub(super) const DEFAULT: Limits = Limits {
+        connect: Duration::from_secs(30),
+        answer: Duration::from_secs(60),
+        upload: Duration::from_secs(15 * 60),
+        idle: Duration::from_secs(60),
+    };
+}
+
+/// A wait of [`Limits`] ran out: the other end is connected and silent.
+#[derive(Debug)]
+pub(super) struct NoAnswer {
+    waited: Duration,
+    /// Whether the request carried a body. Such a wait is long and is not
+    /// repeated.
+    upload: bool,
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the registry sent nothing for {:?}; giving up",
+            self.waited
+        )
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
 /// Check the stream as well as Content-Length: a registry can omit or lie
 /// about its length. Never collect an unbounded response in memory.
-pub(super) async fn bounded_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(super) async fn bounded_body(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    bounded_body_within(resp, limit, Limits::DEFAULT.idle).await
+}
+
+/// [`bounded_body`] with the wait between two reads given.
+async fn bounded_body_within(
+    mut resp: reqwest::Response,
+    limit: usize,
+    idle: Duration,
+) -> Result<Vec<u8>> {
     if resp.content_length().is_some_and(|n| n > limit as u64) {
         bail!("registry response exceeds {limit} bytes");
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.context("reading registry response")? {
+    while let Some(chunk) = tokio::time::timeout(idle, resp.chunk())
+        .await
+        .map_err(|_| NoAnswer {
+            waited: idle,
+            upload: false,
+        })?
+        .context("reading registry response")?
+    {
         if chunk.len() > limit.saturating_sub(body.len()) {
             bail!("registry response exceeds {limit} bytes");
         }
@@ -1526,6 +1594,10 @@ struct TokenResponse {
 
 impl HttpTransport {
     pub fn new(host: String, credential: Credential) -> Result<Self> {
+        Self::with_limits(host, credential, Limits::DEFAULT)
+    }
+
+    fn with_limits(host: String, credential: Credential, limits: Limits) -> Result<Self> {
         let parsed = reqwest::Url::parse(&format!("https://{host}"))?;
         let scheme = if loopback_registry(&parsed) {
             "http"
@@ -1536,6 +1608,7 @@ impl HttpTransport {
         let client = reqwest::Client::builder()
             .user_agent("vmlab-oci/1")
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(limits.connect)
             .build()
             .context("cannot build HTTP client")?;
         Ok(Self {
@@ -1543,12 +1616,17 @@ impl HttpTransport {
             base,
             credential,
             client,
+            limits,
             tokens: tokio::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    async fn body(&self, resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+        bounded_body_within(resp, limit, self.limits.idle).await
     }
 
     /// Credentials go only to the exact registry origin, over HTTPS, or
@@ -1655,7 +1733,15 @@ impl HttpTransport {
             let saved = req
                 .try_clone()
                 .ok_or_else(|| anyhow!("request cannot be replayed"))?;
-            let resp = self.client.execute(req).await?;
+            let upload = req.body().is_some();
+            let waited = if upload {
+                self.limits.upload
+            } else {
+                self.limits.answer
+            };
+            let resp = tokio::time::timeout(waited, self.client.execute(req))
+                .await
+                .map_err(|_| NoAnswer { waited, upload })??;
             if !resp.status().is_redirection() {
                 return Ok((resp, hop != 0));
             }
@@ -1697,10 +1783,7 @@ impl HttpTransport {
             }
             let (resp, redirected) = match self.send_request(req.build()?, false).await {
                 Ok(r) => r,
-                Err(e)
-                    if attempt < MAX_RETRIES
-                        && e.downcast_ref::<reqwest::Error>().is_some_and(is_transient) =>
-                {
+                Err(e) if attempt < MAX_RETRIES && worth_another_try(&e) => {
                     backoff(attempt).await;
                     continue;
                 }
@@ -1776,7 +1859,7 @@ impl HttpTransport {
                 resp.status()
             );
         }
-        let body: TokenResponse = serde_json::from_slice(&bounded_body(resp, MAX_JSON_BODY).await?)
+        let body: TokenResponse = serde_json::from_slice(&self.body(resp, MAX_JSON_BODY).await?)
             .context("malformed token response")?;
         body.token
             .or(body.access_token)
@@ -1809,7 +1892,7 @@ impl Transport for HttpTransport {
         if !resp.status().is_success() {
             bail!("GET blob {digest} returned {}", resp.status());
         }
-        bounded_body(resp, MAX_BLOB_BODY).await
+        self.body(resp, MAX_BLOB_BODY).await
     }
 
     async fn get_blob_bounded(
@@ -1826,7 +1909,7 @@ impl Transport for HttpTransport {
         if !resp.status().is_success() {
             bail!("GET blob {digest} returned {}", resp.status());
         }
-        bounded_body(resp, limit).await
+        self.body(resp, limit).await
     }
 
     async fn get_blob_to_file(
@@ -1853,7 +1936,14 @@ impl Transport for HttpTransport {
         let mut hasher = Sha256::new();
         let mut done: u64 = 0;
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        let idle = self.limits.idle;
+        while let Some(chunk) = tokio::time::timeout(idle, stream.next())
+            .await
+            .map_err(|_| NoAnswer {
+                waited: idle,
+                upload: false,
+            })?
+        {
             let chunk = chunk.with_context(|| format!("reading blob {digest} stream"))?;
             if chunk.len() as u64 > MAX_STREAMED_BLOB.saturating_sub(done) {
                 bail!("registry blob exceeds {MAX_STREAMED_BLOB} bytes");
@@ -1941,7 +2031,7 @@ impl Transport for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .unwrap_or(media_types::OCI_MANIFEST)
             .to_string();
-        let body = bounded_body(resp, MAX_JSON_BODY).await?;
+        let body = self.body(resp, MAX_JSON_BODY).await?;
         Ok(Some(Fetched { media_type, body }))
     }
 
@@ -2003,7 +2093,7 @@ impl Transport for HttpTransport {
                 .get(reqwest::header::LINK)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let body = bounded_body(resp, MAX_JSON_BODY).await?;
+            let body = self.body(resp, MAX_JSON_BODY).await?;
             bytes += body.len();
             anyhow::ensure!(
                 bytes <= MAX_LIST_BYTES,
@@ -2055,7 +2145,7 @@ impl Transport for HttpTransport {
                 .get(reqwest::header::LINK)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let body = bounded_body(resp, MAX_JSON_BODY).await?;
+            let body = self.body(resp, MAX_JSON_BODY).await?;
             bytes += body.len();
             anyhow::ensure!(
                 bytes <= MAX_LIST_BYTES,
@@ -2117,6 +2207,13 @@ impl HttpTransport {
 
 fn is_transient(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// A failed send that a second attempt can cure: a network error, or a
+/// silence on a request that had no body to send again.
+fn worth_another_try(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>().is_some_and(is_transient)
+        || e.downcast_ref::<NoAnswer>().is_some_and(|n| !n.upload)
 }
 
 /// How many times a blob PUT restarts its upload session before giving up.
@@ -3693,6 +3790,166 @@ mod tests {
             2,
             "the second attempt must open its own upload session"
         );
+    }
+
+    /// A registry that takes connections and holds them without a byte:
+    /// the stand-in for a silent registry, token realm or mirror.
+    async fn silent_registry() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                held.push(sock);
+            }
+        });
+        addr
+    }
+
+    /// Waits short enough for a test. `upload` is the long one, as in
+    /// [`Limits::DEFAULT`].
+    const QUICK: Limits = Limits {
+        connect: Duration::from_secs(5),
+        answer: Duration::from_millis(300),
+        upload: Duration::from_secs(20),
+        idle: Duration::from_millis(300),
+    };
+
+    /// Review F10: a registry that accepts the connection and then sends
+    /// nothing must fail the request, not hold it for ever. The outer
+    /// timeout is every attempt's wait plus a margin.
+    #[tokio::test]
+    async fn a_registry_that_never_answers_times_out() {
+        let addr = silent_registry().await;
+        let transport =
+            HttpTransport::with_limits(addr.to_string(), Credential::Anonymous, QUICK).unwrap();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.get_manifest("acme/ubuntu", "1.0.0"),
+        )
+        .await
+        .expect("the transport must give up by itself");
+        let err = answer.expect_err("a silent registry is an error");
+        assert!(
+            err.downcast_ref::<NoAnswer>().is_some(),
+            "the error names the silence: {err:#}"
+        );
+    }
+
+    /// The limits `new` runs under are the documented ones, and all are set.
+    #[test]
+    fn the_default_limits_bound_every_wait() {
+        let transport = HttpTransport::new("127.0.0.1:1".into(), Credential::Anonymous).unwrap();
+        let limits = transport.limits;
+        assert_eq!(limits.connect, Duration::from_secs(30));
+        assert_eq!(limits.answer, Duration::from_secs(60));
+        assert_eq!(limits.idle, Duration::from_secs(60));
+        assert!(
+            limits.upload > Duration::from_secs(600),
+            "past GHCR's session"
+        );
+    }
+
+    /// A registry that answers `head` to every request and then goes quiet
+    /// with the connection open.
+    async fn registry_that_stalls_after(head: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    if sock.read(&mut buf).await.is_ok() {
+                        let _ = sock.write_all(head.as_bytes()).await;
+                    }
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// F10's other half: a response head followed by silence. `bounded_body`
+    /// limits bytes, and the idle limit is what limits the time.
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_times_out() {
+        let addr = registry_that_stalls_after(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\n\
+             Content-Length: 4096\r\n\r\n{",
+        )
+        .await;
+        let transport =
+            HttpTransport::with_limits(addr.to_string(), Credential::Anonymous, QUICK).unwrap();
+
+        let manifest = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.get_manifest("acme/ubuntu", "1.0.0"),
+        )
+        .await
+        .expect("a stalled manifest body must not hold the call");
+        let err = manifest.expect_err("half a manifest is an error");
+        assert!(err.downcast_ref::<NoAnswer>().is_some(), "{err:#}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.get_blob_to_file(
+                "acme/ubuntu",
+                &digest_of(b"never sent"),
+                &tmp.path().join("blob"),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .expect("a stalled blob stream must not hold the call");
+        let err = blob.expect_err("half a blob is an error");
+        assert!(err.downcast_ref::<NoAnswer>().is_some(), "{err:#}");
+    }
+
+    /// The answer limit is for a request with nothing to send. A PUT whose
+    /// answer comes later than that is an upload in progress, not a silence.
+    #[tokio::test]
+    async fn an_upload_outlasts_the_answer_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let reply = if head.starts_with("POST") {
+                            "HTTP/1.1 202 Accepted\r\nLocation: /upload/1\r\nContent-Length: 0\r\n\r\n"
+                        } else {
+                            tokio::time::sleep(QUICK.answer * 3).await;
+                            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+                        };
+                        if sock.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let transport =
+            HttpTransport::with_limits(addr.to_string(), Credential::Anonymous, QUICK).unwrap();
+        let data = b"blob bytes".to_vec();
+        transport
+            .put_blob("acme/ubuntu", &digest_of(&data), data)
+            .await
+            .expect("a slow PUT is not a silent registry");
     }
 
     /// A refusal the registry means is reported, not retried into silence.
