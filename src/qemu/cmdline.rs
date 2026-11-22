@@ -11,6 +11,20 @@ use super::resolve::ResolvedVm;
 use crate::config::model::{AccelMode, GpuMode, InputDevices, MacAddr};
 use crate::profiles::{AgentTransport, DiskBus, FirmwareKind};
 
+/// The `-readconfig` file that gives QEMU the Apple SMC and its key. A value
+/// stands between double quotes and QEMU's parser has no escape for one, so a
+/// key that holds a double quote is refused. A comma needs no escape here.
+pub fn apple_smc_config(key: &crate::config::host::AppleSmcOsk) -> Result<String> {
+    anyhow::ensure!(
+        !key.expose().contains('"'),
+        "host.apple_smc_osk holds a double quote, which QEMU's configuration file cannot carry"
+    );
+    Ok(format!(
+        "[device]\n  driver = \"isa-applesmc\"\n  osk = \"{}\"\n",
+        key.expose()
+    ))
+}
+
 /// One virtio-fs share a hypervisor serves in process
 /// ([`VmPaths::hypervisor_shares`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +40,9 @@ pub struct HypervisorShare {
 #[derive(Debug, Clone, Default)]
 pub struct VmPaths {
     pub apple_smc_osk: Option<crate::config::host::AppleSmcOsk>,
+    /// Where the QEMU adapter writes [`apple_smc_config`] for the launch. The
+    /// argv names this file and never the key.
+    pub apple_smc_config: PathBuf,
     pub qmp_sock: PathBuf,
     /// vmlab-agent channel (`vmlab.agent.0`): interactive terminals,
     /// streaming exec, file transfer, metrics — see `guest/agent-proto`.
@@ -541,11 +558,11 @@ pub fn build_args(
             .apple_smc_osk
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!(crate::config::host::APPLE_SMC_OSK_REQUIRED))?;
-        arg(
-            &mut a,
-            "device",
-            format!("isa-applesmc,osk={}", key.expose().replace(',', ",,")),
-        );
+        // The key goes in a file only this user reads: every local user
+        // reads `/proc/<pid>/cmdline`. The device stands at this place in
+        // the argv, so QEMU creates it in the order it always did.
+        apple_smc_config(key)?;
+        arg(&mut a, "readconfig", path_str(&paths.apple_smc_config)?);
         arg(&mut a, "smbios", "type=2".into());
     }
 
@@ -1115,6 +1132,7 @@ mod tests {
                 "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST\" }",
                 "<test>",
             ).unwrap().apple_smc_osk,
+            apple_smc_config: "/run/l/t/applesmc.cfg".into(),
             qmp_sock: "/run/l/t/qmp.sock".into(),
             agent_sock: "/run/l/t/agent.sock".into(),
             vnc_sock: "/run/l/t/vnc.sock".into(),
@@ -1965,7 +1983,7 @@ mod tests {
              -cpu Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on,\
              +invtsc,tsc-frequency=4291956000 \
              -smp 4 -m 8192M \
-             -device isa-applesmc,osk=TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST \
+             -readconfig /run/l/t/applesmc.cfg \
              -smbios type=2 \
              -display none -vnc unix:/run/l/t/vnc.sock,share=ignore \
              -qmp unix:/run/l/t/qmp.sock,server=on,wait=off -monitor none \
@@ -1991,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn apple_smc_requires_the_host_key_and_escapes_commas() {
+    fn apple_smc_requires_the_host_key_and_writes_it_to_a_config_file() {
         let vm = resolved("macos", "x86_64");
         let mut p = paths();
         p.tsc_hz = Some(3_000_000_000);
@@ -2001,11 +2019,24 @@ mod tests {
             error.to_string(),
             crate::config::host::APPLE_SMC_OSK_REQUIRED
         );
-        let key = ",".repeat(64);
-        p.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse(key).unwrap());
-        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap();
-        assert!(args.contains(&format!("isa-applesmc,osk={}", ",,".repeat(64))));
-        assert!(!format!("{p:?}").contains(&",".repeat(64)));
+        // A comma is not doubled in the file: only a `-device` value needs that.
+        let key = ", ".repeat(32);
+        let osk = crate::config::host::AppleSmcOsk::parse(key.clone()).unwrap();
+        assert_eq!(
+            apple_smc_config(&osk).unwrap(),
+            format!("[device]\n  driver = \"isa-applesmc\"\n  osk = \"{key}\"\n")
+        );
+        p.apple_smc_osk = Some(osk);
+        let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
+        assert!(s.contains("-readconfig /run/l/t/applesmc.cfg -smbios type=2"), "{s}");
+        assert!(!s.contains("isa-applesmc"), "{s}");
+        assert!(!format!("{p:?}").contains(&key));
+        // QEMU's file has no escape for a double quote, so the launch is refused.
+        let quoted = crate::config::host::AppleSmcOsk::parse("\"".repeat(64)).unwrap();
+        p.apple_smc_osk = Some(quoted);
+        let error = build_args("l", &vm, &p, Accel::Kvm).unwrap_err().to_string();
+        assert!(error.contains("double quote"), "{error}");
+        assert!(!error.contains(&"\"".repeat(64)), "{error}");
     }
 
     /// `/proc/<pid>/cmdline` is readable by every local user, so the key is

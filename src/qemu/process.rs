@@ -105,11 +105,12 @@ impl Proc {
         env: &ChildEnv,
         log_path: &Path,
     ) -> Result<Arc<Proc>> {
-        Self::spawn_with_fds(name, binary, args, env, log_path, Vec::new()).await
+        Self::spawn_with_fds(name, binary, args, env, log_path, Vec::new(), Vec::new()).await
     }
 
     /// [`Proc::spawn`], additionally installing `fds` at their fixed
-    /// descriptor numbers in the child.
+    /// descriptor numbers in the child, and hiding `secrets` — values the
+    /// child holds that are not in its argv — in its output.
     pub async fn spawn_with_fds(
         name: &str,
         binary: &str,
@@ -117,6 +118,7 @@ impl Proc {
         env: &ChildEnv,
         log_path: &Path,
         fds: Vec<ChildFd>,
+        mut secrets: Vec<String>,
     ) -> Result<Arc<Proc>> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -128,7 +130,8 @@ impl Proc {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
         let log_err = log.try_clone()?;
-        let secrets = osk_secrets(args);
+        secrets.retain(|secret| !secret.is_empty());
+        secrets.extend(osk_secrets(args));
         let filter_output = !secrets.is_empty();
 
         let mut cmd = Command::new(binary);
@@ -702,6 +705,39 @@ mod tests {
         assert!(error.contains("[REDACTED]"));
         assert!(!error.contains(&key));
     }
+    /// A key the child got from a file is in no argv element, and its
+    /// output is filtered all the same.
+    #[tokio::test]
+    async fn a_secret_outside_the_argv_is_redacted_in_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("qemu.log");
+        let key = "TEST".repeat(16);
+        let key_file = tmp.path().join("key");
+        std::fs::write(&key_file, format!("{key}\n")).unwrap();
+        let args = vec![
+            "-c".into(),
+            "cat \"$0\"; cat \"$0\" >&2".into(),
+            key_file.to_str().unwrap().to_string(),
+        ];
+        let proc = super::Proc::spawn_with_fds(
+            "redaction",
+            "/bin/sh",
+            &args,
+            &Default::default(),
+            &log,
+            Vec::new(),
+            vec![key.clone()],
+        )
+        .await
+        .unwrap();
+        // No time limit: the waiter publishes the exit after the output is copied.
+        let mut exited = proc.exited.clone();
+        exited.wait_for(|status| status.is_some()).await.unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains(&key), "{text}");
+        assert_eq!(text.matches("[REDACTED]").count(), 2, "{text}");
+    }
+
     #[tokio::test]
     async fn redaction_hides_both_qemu_escaped_and_raw_keys() {
         let tmp = tempfile::tempdir().unwrap();

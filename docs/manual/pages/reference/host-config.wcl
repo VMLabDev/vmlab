@@ -167,11 +167,14 @@ SRC
     and at launch, so updating this key requires no daemon restart.
   DOC
   p <<DOC
-    QEMU receives the key in `isa-applesmc,osk=<value>`. vmlab redacts it
+    QEMU receives the key in a configuration file (`-readconfig`) that only
+    your account can read. vmlab writes it in the machine's runtime directory
+    at each launch and removes it once QEMU is up. The key is not in QEMU's
+    process arguments, which every local account can read. vmlab redacts it
     from launch headers, emulator output and startup errors. Debug dumps of
     host configuration and launch paths also redact it. The key is never
-    recorded in templates or OCI metadata. It remains visible to host
-    processes allowed to read QEMU's operating-system process arguments.
+    recorded in templates or OCI metadata. A key that holds a double quote is
+    refused at launch, because QEMU's configuration file cannot carry one.
     vmlab-hv continues to refuse Apple SMC machines until its macOS phase.
   DOC
 

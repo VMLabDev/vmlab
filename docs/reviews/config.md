@@ -35,7 +35,7 @@ The findings are ranked against these three facts, which the code states:
 |------|----------|-------------------|
 | F1 | security | A pulled template's `display` string becomes a QEMU `-device` argument unchecked, from any registry |
 | F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments |
-| F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read |
+| F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read. **Fixed by card #544.** |
 | F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file |
 | F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file |
 | F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear |
@@ -130,6 +130,12 @@ The findings are ranked against these three facts, which the code states:
   protected by that.
 
 ### F3. The Apple SMC OSK is in QEMU's argv (security)
+
+**Fixed by card #544.** The argv holds `-readconfig <run dir>/applesmc.cfg`
+in place of the `-device` value. The QEMU adapter writes that file with mode
+0600 before the spawn and removes it when QMP answers or the start fails.
+QEMU's output is still filtered for the key. A key that holds a double quote
+is refused at launch, because the file format has no escape for one.
 
 - Where: `src/qemu/cmdline.rs:541-548`
   (`format!("isa-applesmc,osk={}", …)`), `src/config/host.rs:26-34`.
