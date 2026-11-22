@@ -149,8 +149,8 @@ impl PcmParams {
     fn sizes_ok(buffer_bytes: u32, period_bytes: u32, format: &AudioFormat) -> bool {
         buffer_bytes != 0
             && period_bytes != 0
-            && buffer_bytes % period_bytes == 0
-            && period_bytes % format.frame_bytes() as u32 == 0
+            && buffer_bytes.is_multiple_of(period_bytes)
+            && period_bytes.is_multiple_of(format.frame_bytes() as u32)
     }
 
     /// Whole frames in one hardware period.
