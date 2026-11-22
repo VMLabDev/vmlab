@@ -1198,4 +1198,41 @@ mod tests {
         .await;
         assert_no_frame(&mut raw.rx).await;
     }
+
+    /// Review F9: a guest that sends from the gateway's MAC must not become
+    /// where the segment delivers the gateway's frames.
+    #[tokio::test]
+    async fn a_guest_cannot_take_the_gateway_mac() {
+        let sw = Switch::new("seg0".into());
+        let mut svc = sw.add_channel_port(PortClass::Service);
+        let mut a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let gateway = mac(0x47);
+
+        // The service port speaks from G, so the switch knows where G is.
+        let hello = frame(MAC_BROADCAST, gateway, b"from the gateway");
+        svc.tx.send(hello.clone()).await.unwrap();
+        assert_eq!(recv(&mut a.rx).await, hello);
+        assert_eq!(recv(&mut b.rx).await, hello);
+
+        // Guest A sends one frame with G as its source. Wait until the
+        // switch has dealt with it, whichever way.
+        a.tx.send(frame(mac(9), gateway, b"spoof")).await.unwrap();
+        wait_for(
+            || {
+                let s = sw.stats();
+                s.frames_flooded + s.frames_dropped >= 2
+            },
+            "the spoofed frame handled",
+        )
+        .await;
+        while b.rx.try_recv().is_ok() {}
+        while svc.rx.try_recv().is_ok() {}
+
+        // Guest B's frame to G still reaches the service port, not A.
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        b.tx.send(to_gateway.clone()).await.unwrap();
+        assert_no_frame(&mut a.rx).await;
+        assert_eq!(recv(&mut svc.rx).await, to_gateway);
+    }
 }
