@@ -523,9 +523,10 @@ impl FileSystem for PassthroughFs {
         self.refuse_writes()?;
         let session = self.inner.lock();
         let state = live_inode(&session, inode)?;
-        if let Some(handle) = handle {
-            session.file_handle(inode, handle)?;
-        }
+        let open = match handle {
+            Some(handle) => Some(session.file_handle(inode, handle)?),
+            None => None,
+        };
         if valid.contains(SetattrValid::SIZE)
             && kind_of(fstat(state.fd.as_raw_fd())?.st_mode) != FileKind::File
         {
@@ -538,7 +539,14 @@ impl FileSystem for PassthroughFs {
             fchownat(&state.fd, valid, &attr)?;
         }
         if valid.contains(SetattrValid::SIZE) {
-            truncateat(&state.fd, attr.st_size)?;
+            // ftruncate(2) asks for a writable descriptor, not for a
+            // writable file: a handle the guest opened for writing carries
+            // the truncation whatever the mode of the file is now. Without
+            // one the reopen applies the mode, as truncate(2) does.
+            match open.as_ref().filter(|file| opened_for_writing(file)) {
+                Some(file) => ftruncate(file, attr.st_size)?,
+                None => truncateat(&state.fd, attr.st_size)?,
+            }
         }
         if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
             utimensat(&state.fd, valid, &attr)?;
@@ -1725,12 +1733,22 @@ fn truncateat(fd: &OwnedFd, size: i64) -> io::Result<()> {
     if kind_of(fstat(fd.as_raw_fd())?.st_mode) != FileKind::File {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let file = reopen(fd, libc::O_WRONLY)?;
-    // SAFETY: the fd is owned.
+    ftruncate(&reopen(fd, libc::O_WRONLY)?, size)
+}
+
+fn ftruncate(file: &File, size: i64) -> io::Result<()> {
+    // SAFETY: the fd is owned for the call.
     if unsafe { libc::ftruncate(file.as_raw_fd(), size) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Whether the descriptor itself allows writing, as the host sees it.
+fn opened_for_writing(file: &File) -> bool {
+    // SAFETY: F_GETFL reads the flags of an owned descriptor.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    flags >= 0 && matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
 }
 
 fn utimensat(fd: &OwnedFd, valid: SetattrValid, attr: &stat64) -> io::Result<()> {
@@ -2728,6 +2746,64 @@ mod tests {
             std::fs::read(dir.path().join("hello.txt")).unwrap(),
             b"hell"
         );
+    }
+
+    /// F19 of the virtio devices review: `ftruncate(2)` works on a writable
+    /// descriptor whatever the mode of the file, so a SETATTR that carries
+    /// the handle truncates through it.
+    #[test]
+    fn ftruncate_through_a_handle_ignores_the_file_mode() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root opens a 0400 file for writing, so the fault does not show.
+            return;
+        }
+        let (dir, fs) = scratch();
+        let (entry, handle, _, _) = fs
+            .create(
+                &ctx(),
+                ROOT_ID,
+                c"readonly",
+                CreateIn {
+                    flags: libc::O_RDWR as u32,
+                    mode: 0o400,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        {
+            use std::os::unix::fs::FileExt;
+            let file = fs.inner.lock().file_handle(entry.inode, handle).unwrap();
+            file.write_all_at(b"content", 0).unwrap();
+        }
+        let mut attr = entry.attr;
+        attr.st_size = 3;
+        let (st, _) = fs
+            .setattr(&ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+        assert_eq!(st.st_size, 3);
+        assert_eq!(std::fs::read(dir.path().join("readonly")).unwrap(), b"con");
+
+        // Without the handle the mode of the file decides, as truncate(2).
+        attr.st_size = 0;
+        assert_eq!(
+            fs.setattr(&ctx(), entry.inode, attr, None, SetattrValid::SIZE)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        // A handle that is not open for writing does not truncate either.
+        let (reader, _, _) = fs
+            .open(&ctx(), entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert_eq!(
+            fs.setattr(&ctx(), entry.inode, attr, reader, SetattrValid::SIZE)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(std::fs::read(dir.path().join("readonly")).unwrap(), b"con");
     }
 
     #[test]
