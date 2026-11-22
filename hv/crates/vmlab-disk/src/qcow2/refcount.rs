@@ -424,6 +424,12 @@ impl Qcow2Image {
     /// Ensure the on-disk L1 region holds at least `needed` entries and the
     /// in-memory view matches.
     pub(crate) fn ensure_l1_size(&mut self, needed: u32) -> Result<()> {
+        if needed > super::MAX_L1_ENTRIES {
+            return Err(Error::Unsupported(format!(
+                "an L1 table of {needed} entries is over the qcow2 limit of {}",
+                super::MAX_L1_ENTRIES
+            )));
+        }
         if needed <= self.l1_size {
             if self.l1.len() > needed as usize {
                 // Zero the stale tail on disk.

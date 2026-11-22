@@ -28,8 +28,8 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file |
 | F7 | wrong result | A compressed cluster at the end of the file cannot be read |
 | F8 | wrong result | `convert -B` and `commit` fail when the disk size is not a multiple of the cluster size |
-| F9 | crash | The L1 size and the snapshot count of a header have no upper limit, so a small crafted image takes gigabytes of memory |
-| F10 | crash | Two header fields of a crafted image panic the process |
+| F9 | crash | The L1 size and the snapshot count of a header have no upper limit, so a small crafted image takes gigabytes of memory (fixed, card #555) |
+| F10 | crash | Two header fields of a crafted image panic the process (fixed, card #555) |
 | F11 | data loss | `convert` with the same path for source and destination deletes the source |
 
 ### F1. A write to a preallocated zero cluster is lost (data loss)
@@ -318,6 +318,13 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   headers above on a `testsupport::blank` image. Expected:
   `Qcow2Image::open(path, true)` and `open_header` return an error. Today:
   both succeed. No time or memory measurement is needed for the test.
+- Fixed in card #555. `parse` refuses an `l1_size` over 4194304 entries
+  (32 MiB), a refcount table over 8 MiB and more than 65536 snapshots,
+  QEMU's limits, before it allocates anything. The snapshot table parser and
+  refcount recovery refuse a snapshot L1 over the same limit. `create`,
+  `ensure_l1_size` and `snapshot_create` refuse to write an image past them.
+  The two proof tests failed before the fix (`open` succeeded) and pass
+  after it.
 
 ### F10. Two crafted header fields panic the process (crash)
 
@@ -343,6 +350,13 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   `Err`) and `a_header_length_beyond_the_cluster_is_an_error` (`open` or
   `set_backing` returns `Err`). Today both panic. The qcow2 fuzz target of
   `docs/reviews/fuzz-coverage.md` (P26) should reach the first one.
+- Fixed in card #555. `parse` computes the end of the backing name with a
+  checked sum and refuses a `header_length` larger than the cluster.
+  `set_backing` returns an error when the extensions do not fit after the
+  header, which a header length near the cluster size still allowed. The two
+  proof tests and a third,
+  `a_header_length_that_leaves_no_room_for_extensions_is_an_error`, panicked
+  before the fix and pass after it.
 
 ### F11. `convert` onto its own source deletes the source (data loss)
 
