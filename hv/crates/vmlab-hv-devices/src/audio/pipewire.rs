@@ -630,10 +630,11 @@ mod tests {
         // The sound ends on a partial pull, and the next one starts a second
         // later: no underrun.
         assert!(!gaps.pull(at(21), 256, 96, 48000, &health));
-        for step in 0..200 {
+        for step in 0..215 {
             assert!(!gaps.pull(at(26 + step * 5), 256, 0, 48000, &health));
         }
         assert!(!gaps.pull(at(1100), 256, 256, 48000, &health));
+        assert_eq!(health.late_callbacks.load(Ordering::Relaxed), 0);
         assert_eq!(health.underruns.load(Ordering::Relaxed), 2);
         // A callback 30 ms after the one before is late, while PCM flows.
         assert!(!gaps.pull(at(1130), 256, 256, 48000, &health));
