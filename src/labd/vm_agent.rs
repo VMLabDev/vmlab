@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 use vmlab_agent_proto::fileops::{self, Request, Response};
 // The file vocabulary itself, re-exported so callers of this client never
@@ -153,8 +153,9 @@ impl SendCredit {
 /// channel never pass [`INITIAL_WINDOW`].
 struct RecvCredit {
     avail: std::sync::Mutex<u64>,
-    /// Why the reader ended the channel, for the consumer to read once the
-    /// queue is drained (the queue can be full when the reader finds out).
+    /// Why the reader ended the channel (the guest sent past its window, or
+    /// the queue overflowed), for the consumer to read once the queue is
+    /// drained (the queue can be full when the reader finds out).
     overrun: std::sync::Mutex<Option<String>>,
 }
 
@@ -186,20 +187,110 @@ impl RecvCredit {
 }
 
 struct SessionEntry {
-    tx: mpsc::Sender<SessionEvent>,
+    queue: Arc<SessionQueue>,
     credit: Arc<SendCredit>,
     recv_credit: Arc<RecvCredit>,
 }
 
+impl Drop for SessionEntry {
+    /// The entry is the reader's end of the queue: once it is gone the
+    /// consumer reads what is queued and then end-of-stream.
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
 /// Per-session event queue depth. The reader enforces the receive window
 /// ([`RecvCredit`]), which caps the queued bytes, but a window's worth of
-/// tiny frames can outnumber a byte-sized bound — this is the safety valve;
-/// see the reader's stall policy.
+/// tiny frames can outnumber a byte-sized bound. This caps the count; see
+/// [`SessionQueue::push`] for what happens at it.
 const SESSION_QUEUE: usize = 2048;
 
-/// How long the reader waits on one session's full queue before declaring
-/// the consumer stuck and closing that session (never the whole port).
+/// How long the reader's `close` for one session may wait for the writer.
+/// The reader itself never waits (see [`close_session`]).
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The events of one session between the connection's one reader task and
+/// the session's consumer. The reader's side never waits: one consumer that
+/// stopped reading must not keep the reader from the frames of every other
+/// channel, nor from a `pong`, an `opened` or a `window_adjust`.
+struct SessionQueue {
+    state: std::sync::Mutex<SessionQueueState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct SessionQueueState {
+    events: std::collections::VecDeque<SessionEvent>,
+    closed: bool,
+}
+
+impl SessionQueue {
+    fn new() -> Self {
+        Self {
+            state: Default::default(),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Queue one event without waiting. Below [`SESSION_QUEUE`] events each
+    /// frame is its own event. At the depth, payload joins the last event
+    /// when that is the same stream (every consumer reads a channel as a
+    /// byte stream, and the receive window bounds the bytes). One `Eof` is
+    /// taken past the depth and a repeated one is dropped: an exec ends with
+    /// `Eof` and then its exit, and no payload can join behind an `Eof`, so
+    /// the queue grows by that one event. The event that ends the session
+    /// is always taken, as only one can arrive. `false` is an event the
+    /// full queue cannot take: the guest sent more frames than a consumer
+    /// this far behind can be kept for.
+    fn push(&self, ev: SessionEvent) -> bool {
+        let mut st = self.state.lock_recover();
+        let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
+        if st.events.len() < SESSION_QUEUE || terminal {
+            st.events.push_back(ev);
+        } else if matches!(ev, SessionEvent::Eof) {
+            if !matches!(st.events.back(), Some(SessionEvent::Eof)) {
+                st.events.push_back(ev);
+            }
+        } else {
+            match (st.events.back_mut(), ev) {
+                (Some(SessionEvent::Data(tail)), SessionEvent::Data(more))
+                | (Some(SessionEvent::Stderr(tail)), SessionEvent::Stderr(more)) => {
+                    tail.extend_from_slice(&more)
+                }
+                // An empty frame carries nothing a consumer acts on.
+                (_, SessionEvent::Data(more) | SessionEvent::Stderr(more)) if more.is_empty() => {}
+                _ => return false,
+            }
+        }
+        drop(st);
+        self.notify.notify_one();
+        true
+    }
+
+    /// No more events: the consumer reads what is queued, then `None`.
+    fn close(&self) {
+        self.state.lock_recover().closed = true;
+        self.notify.notify_one();
+    }
+
+    /// The next event, or `None` once the queue is closed and empty. One
+    /// consumer reads a queue, and nothing is lost when this is cancelled.
+    async fn recv(&self) -> Option<SessionEvent> {
+        loop {
+            {
+                let mut st = self.state.lock_recover();
+                if let Some(ev) = st.events.pop_front() {
+                    return Some(ev);
+                }
+                if st.closed {
+                    return None;
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+}
 
 /// The most output, stdout and stderr together, a collected
 /// [`AgentHandle::exec`] holds. The guest decides how much a command writes,
@@ -731,7 +822,7 @@ impl AgentHandle {
     /// Open a channel and wait for the agent's `opened` (or error).
     async fn open(&self, build: impl FnOnce(u32) -> HostMsg) -> Result<AgentSession> {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+        let queue = Arc::new(SessionQueue::new());
         // The opened/error reply arrives on a oneshot so the session's event
         // queue only ever carries post-open traffic.
         let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
@@ -740,7 +831,7 @@ impl AgentHandle {
         self.inner.sessions.lock().await.insert(
             id,
             SessionEntry {
-                tx,
+                queue: queue.clone(),
                 credit: credit.clone(),
                 recv_credit: recv_credit.clone(),
             },
@@ -755,7 +846,7 @@ impl AgentHandle {
         let mut session = AgentSession {
             handle: self.clone(),
             id,
-            rx,
+            rx: queue,
             credit,
             recv_credit,
             window: RecvWindow::default(),
@@ -1403,7 +1494,7 @@ pub const NO_CLIPBOARD: &str = "the guest agent has no clipboard (it offers one 
 pub struct AgentSession {
     handle: AgentHandle,
     pub id: u32,
-    rx: mpsc::Receiver<SessionEvent>,
+    rx: Arc<SessionQueue>,
     credit: Arc<SendCredit>,
     recv_credit: Arc<RecvCredit>,
     window: RecvWindow,
@@ -1415,8 +1506,8 @@ impl AgentSession {
     /// once the channel (or connection) is gone.
     pub async fn recv(&mut self) -> Option<SessionEvent> {
         let Some(ev) = self.rx.recv().await else {
-            // The reader ended the channel because the guest sent past its
-            // window: say so, once, after what was queued.
+            // The reader ended the channel (the guest sent past its window,
+            // or the queue overflowed): say so, once, after what was queued.
             let msg = self.recv_credit.overrun.lock_recover().take()?;
             self.closed = true; // the reader already sent the close
             return Some(SessionEvent::Error(msg));
@@ -2778,17 +2869,18 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
     }
 }
 
-/// Route a session event; a consumer stuck past [`STALL_TIMEOUT`] gets its
-/// session closed (the rest of the mux keeps flowing).
+/// Route a session event. This runs on the connection's one reader task and
+/// waits for no consumer: an event its session's queue cannot take closes
+/// that session (the rest of the mux keeps flowing).
 async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
     let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
     let entry = {
         let sessions = inner.sessions.lock().await;
         sessions
             .get(&id)
-            .map(|e| (e.tx.clone(), e.recv_credit.clone()))
+            .map(|e| (e.queue.clone(), e.recv_credit.clone()))
     };
-    let Some((tx, recv_credit)) = entry else {
+    let Some((queue, recv_credit)) = entry else {
         return; // late frames after close: normal
     };
     // The receive window: a guest that sends more than it was granted loses
@@ -2804,11 +2896,12 @@ async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
         close_session(inner, id).await;
         return;
     }
-    if tokio::time::timeout(STALL_TIMEOUT, tx.send(ev))
-        .await
-        .is_err()
-    {
-        tracing::warn!("agent session {id}: consumer stalled >10s, closing that session");
+    if !queue.push(ev) {
+        tracing::warn!("agent session {id}: its queue overflowed, closing that session");
+        *recv_credit.overrun.lock_recover() = Some(format!(
+            "the consumer of this channel fell behind and its queue of {SESSION_QUEUE} events \
+             overflowed, so the host closed the channel"
+        ));
         close_session(inner, id).await;
         return;
     }
@@ -2822,14 +2915,34 @@ async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
 }
 
 /// The reader ends one session: its queue closes behind what it holds, and
-/// the agent is told to drop its side.
+/// the agent is told to drop its side. The `close` is written by a task of
+/// its own, because the reader must not wait for the writer: a guest that
+/// does not read leaves the socket full and the writer lock held. That task
+/// waits [`STALL_TIMEOUT`] at most. When the `close` is never sent the
+/// agent keeps its side of the channel, and the host drops the late frames
+/// of a channel it no longer has. A write cut off in the middle of the
+/// frame tears the stream, so the connection then counts as over, as it
+/// does for a ping.
 async fn close_session(inner: &Arc<Inner>, id: u32) {
     if let Some(entry) = inner.sessions.lock().await.remove(&id) {
         entry.credit.close();
     }
-    let mut w = inner.writer.lock().await;
-    let frame = encode_ctrl(&HostMsg::Close { id }).expect("close fits one control frame");
-    let _ = w.write_all(&frame).await;
+    let inner = inner.clone();
+    inner.rt.clone().spawn(async move {
+        let deadline = tokio::time::Instant::now() + STALL_TIMEOUT;
+        let frame = encode_ctrl(&HostMsg::Close { id }).expect("close fits one control frame");
+        let Ok(mut w) = tokio::time::timeout_at(deadline, inner.writer.lock()).await else {
+            return;
+        };
+        let written = tokio::time::timeout_at(deadline, async {
+            w.write_all(&frame).await?;
+            w.flush().await
+        })
+        .await;
+        if written.is_err() {
+            inner.closed.send_replace(true);
+        }
+    });
 }
 
 /// Re-expose one terminal session as a raw-byte unix socket at `sock_path`:
@@ -3044,6 +3157,109 @@ mod tests {
         assert!(handle.ping(Duration::from_secs(2)).await);
     }
 
+    /// What `mock:small-frames` and `mock:mixed-frames` send: more frames
+    /// than one session queue holds, of one byte each. The first then ends
+    /// with `Eof` and an exit code of 3.
+    const SMALL_FRAMES: usize = SESSION_QUEUE + 500;
+
+    /// One channel holds more frames than its queue while nobody reads it.
+    /// The reader goes on to the frames behind them: a pong arrives inside
+    /// the ping's budget and a second channel opens and delivers. The first
+    /// channel is intact, since its frames fit the window (review of the
+    /// guest agents, F5).
+    #[tokio::test]
+    async fn a_full_session_queue_does_not_delay_a_pong() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut full = handle
+            .open_exec(vec!["mock:small-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        // `full` is not read. The pong and the second channel's frames are
+        // behind its frames on the stream.
+        assert!(
+            handle.ping(Duration::from_secs(2)).await,
+            "the pong waited behind a channel nobody reads"
+        );
+        let mut other = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.open_terminal(80, 24, None, vec![], None),
+        )
+        .await
+        .expect("a second channel did not open while the first was full")
+        .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), other.recv())
+            .await
+            .expect("the second channel delivered nothing while the first was full");
+        assert!(matches!(ev, Some(SessionEvent::Data(_))), "{ev:?}");
+
+        // Every byte of the first channel is still there, in order.
+        let mut got = 0usize;
+        while got < SMALL_FRAMES {
+            let ev = tokio::time::timeout(Duration::from_secs(5), full.recv())
+                .await
+                .expect("the first channel lost what it had queued");
+            match ev {
+                Some(SessionEvent::Data(b)) => {
+                    assert!(b.iter().all(|&c| c == b's'));
+                    got += b.len();
+                }
+                other => panic!("the first channel ended early: {other:?}"),
+            }
+        }
+        assert_eq!(got, SMALL_FRAMES);
+        // The command ended behind a full queue: its end is there too.
+        let mut end = Vec::new();
+        for _ in 0..2 {
+            end.push(
+                tokio::time::timeout(Duration::from_secs(5), full.recv())
+                    .await
+                    .expect("the first channel lost the end of its command"),
+            );
+        }
+        assert!(
+            matches!(
+                end[..],
+                [Some(SessionEvent::Eof), Some(SessionEvent::Exited(3))]
+            ),
+            "{end:?}"
+        );
+    }
+
+    /// Frames the queue cannot merge (stdout and stderr in turn) pass its
+    /// depth while nobody reads: the reader closes that one channel at once,
+    /// with an error that says why, and the connection goes on (F5).
+    #[tokio::test]
+    async fn a_channel_that_overfills_its_queue_is_closed_without_a_wait() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = handle
+            .open_exec(vec!["mock:mixed-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        assert!(
+            handle.ping(Duration::from_secs(2)).await,
+            "the pong waited behind a channel nobody reads"
+        );
+        assert!(
+            !handle.inner.sessions.lock().await.contains_key(&session.id),
+            "the host kept a channel whose queue overflowed"
+        );
+        let mut events = 0usize;
+        let error = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), session.recv())
+                .await
+                .expect("the session did not end");
+            match ev {
+                Some(SessionEvent::Data(_) | SessionEvent::Stderr(_)) => events += 1,
+                Some(SessionEvent::Error(msg)) => break msg,
+                other => panic!("the session ended without an error: {other:?}"),
+            }
+        };
+        assert!(error.contains("queue"), "{error}");
+        assert!(events <= SESSION_QUEUE, "{events} events sat in one queue");
+    }
+
     /// A minimal in-process agent speaking the real frame protocol over a
     /// unix socket, mirroring what `guest/agent` does: echo terminals,
     /// canned exec output, in-memory file store.
@@ -3224,6 +3440,36 @@ mod tests {
                                                     &chunk,
                                                 ))
                                                 .await;
+                                        }
+                                        continue;
+                                    }
+                                    // `mock:small-frames` and
+                                    // `mock:mixed-frames`: more frames than
+                                    // one session queue holds, one byte
+                                    // each, so far inside the window. The
+                                    // first is all stdout; the second
+                                    // alternates stdout and stderr.
+                                    if let Some(mixed) = match argv.first().map(String::as_str) {
+                                        Some("mock:small-frames") => Some(false),
+                                        Some("mock:mixed-frames") => Some(true),
+                                        _ => None,
+                                    } {
+                                        let mut w = tx.lock().await;
+                                        for n in 0..SMALL_FRAMES {
+                                            let kind = if mixed && n % 2 == 1 {
+                                                FrameKind::DataErr
+                                            } else {
+                                                FrameKind::Data
+                                            };
+                                            let _ =
+                                                w.write_all(&encode_frame(kind, id, b"s")).await;
+                                        }
+                                        drop(w);
+                                        // The all-stdout command ends as
+                                        // the agent's exec does.
+                                        if !mixed {
+                                            send(AgentMsg::Eof { id }).await;
+                                            send(AgentMsg::Exited { id, code: 3 }).await;
                                         }
                                         continue;
                                     }
