@@ -45,7 +45,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use virtio_queue::{Queue, QueueOwnedT, QueueState, QueueT};
+use virtio_queue::{DescriptorChain, Queue, QueueOwnedT, QueueState, QueueT};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, VolatileSlice};
 use vmm_sys_util::eventfd::EventFd;
