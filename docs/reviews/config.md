@@ -218,7 +218,7 @@ The findings are ranked against these three facts, which the code states:
   label points where it did. A file that does not parse is blanked whole, as
   the host config is. `load_lab_source`, `load_template_source` and
   `vmlab validate`'s own error use it. Not covered: a secret that the field
-  only refers to (a `let` elsewhere in the file), and the diagnostics of
+  refers to and does not hold (a value bound elsewhere in the file), and the diagnostics of
   profile files and template metadata (`IssueError::diagnostic` in
   `src/config/block.rs`), which still render from the file's text.
 
