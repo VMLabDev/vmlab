@@ -188,6 +188,9 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F7. A pending capture that cannot be cleared (wrong result)
 
+- Fixed in #420. Preflight refusals clear the durable capture intent.
+  Pending cleanup accepts absent disk snapshots and keeps the intent if a
+  deletion fails.
 - Where: `src/labd/lab.rs:3364-3386` (the intent, and it is kept on every
   error), `:3705-3708` (delete), `src/labd/vm.rs:1808-1809`,
   `src/labd/container.rs:1198-1209`,
