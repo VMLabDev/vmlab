@@ -28,7 +28,7 @@ much as a Makefile is.
 | F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it (fixed, #461) |
 | F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check (fixed in card #464) |
 | F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot (fixed, #480) |
-| F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference |
+| F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference (fixed in card #481) |
 | F5 | security | A template pull bounds each chunk but not the number of chunks or the total size |
 | F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop |
 | F7 | security | The store accepts a qcow2 with an external data file (reachable only with `VMLAB_IMAGE_TOOL=qemu-img`) |
@@ -214,6 +214,23 @@ much as a Makefile is.
 - The same code path reads the config blob with `get_blob`, so a 1 GiB JSON
   document is held in memory, then parsed. A test with the fake transport
   that serves a config blob of 16 MiB should see a refusal.
+- Fixed in card #481. `TemplateConfig::vars` reads the zstd frame through a
+  reader that stops one byte past `MAX_VARS_BYTES` (64 MiB, the largest real
+  VARS file) and refuses a payload that reaches it. `with_vars` refuses a
+  larger file on push. Every read of a template's config blob (`index_arches`,
+  `tag_version`, `resolve_manifest_meta`, the variant configs of a pull) goes
+  through `Registry::config_blob`, which refuses a descriptor that declares
+  more than `MAX_CONFIG_BLOB` (8 MiB, the JSON limit) before any request, and
+  fetches with `Transport::get_blob_bounded`, so the HTTP transport stops
+  reading at that limit whatever the descriptor says. `put_config` refuses
+  to publish a config blob over the same limit. Tests:
+  `an_oversized_vars_payload_is_refused` (`src/oci/config_blob.rs`) and
+  `an_oversized_config_blob_is_refused` (`src/oci/client.rs`). Both fail
+  before the fix (`vars()` returns 256 MiB, the pull of a 16 MiB config blob
+  succeeds) and pass with it.
+  - Not fixed here: the container image config (`src/oci/image/pull.rs:180`,
+    `index_platform_arches`) is still read with `get_blob` under the 1 GiB
+    limit.
 
 ### F5. A template pull does not bound the chunk count or the total size (security)
 
