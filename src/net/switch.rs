@@ -1283,7 +1283,11 @@ mod tests {
         sw.bind_mac(svc.id, gateway);
 
         a.tx.send(frame(mac(9), gateway, b"spoof")).await.unwrap();
-        wait_for(|| sw.stats().frames_dropped == 1, "the spoofed frame dropped").await;
+        wait_for(
+            || sw.stats().frames_dropped == 1,
+            "the spoofed frame dropped",
+        )
+        .await;
         assert_no_frame(&mut b.rx).await;
         assert_no_frame(&mut svc.rx).await;
 
@@ -1294,7 +1298,11 @@ mod tests {
 
         // Another service port may take it: the MAC moved behind a trunk.
         let mut trunk = sw.add_channel_port(PortClass::Service);
-        trunk.tx.send(frame(MAC_BROADCAST, gateway, b"moved")).await.unwrap();
+        trunk
+            .tx
+            .send(frame(MAC_BROADCAST, gateway, b"moved"))
+            .await
+            .unwrap();
         recv(&mut b.rx).await;
         let again = frame(gateway, mac(2), b"to the gateway again");
         b.tx.send(again.clone()).await.unwrap();
