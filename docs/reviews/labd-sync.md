@@ -191,6 +191,10 @@ where the flag is given.
 
 ### F4. A re-seed never completes while the tree holds a path it skips
 
+**Fixed in #403.** Skipped paths and size refusals are reported as warnings
+while the re-seed completes for the rest of the tree. Apply failures and case
+collisions still hold the re-seed barrier.
+
 **Where.** `src/labd/workspace/reseed.rs:193-199` (`Reconverged::complete`),
 `reseed.rs:326`, `src/labd/workspace/syncer.rs:884-899`.
 
