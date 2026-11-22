@@ -47,6 +47,27 @@ impl AppleSmcOsk {
     }
 }
 
+/// The pre-shared key that authenticates cross-host trunks (§9.2). Debug
+/// output must never expose its contents.
+#[derive(Clone)]
+pub struct TrunkPsk(String);
+
+impl std::fmt::Debug for TrunkPsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl TrunkPsk {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     /// Repository names or slash-terminated namespaces trusted for host scripts.
@@ -55,7 +76,7 @@ pub struct HostConfig {
     pub dns_suffix: String,
     pub dns_upstream: Option<String>,
     pub disk_low_percent: u8,
-    pub psk: Option<String>,
+    pub psk: Option<TrunkPsk>,
     pub apple_smc_osk: Option<AppleSmcOsk>,
     /// TCP listen port for inbound cross-host segment trunks (§9.2).
     pub trunk_port: u16,
@@ -244,7 +265,7 @@ impl HostConfig {
             if let Some(v) = r.int_in("disk_low_percent", 0, 100).unspan() {
                 cfg.disk_low_percent = v;
             }
-            cfg.psk = r.string("psk").unspan();
+            cfg.psk = r.string("psk").unspan().map(TrunkPsk::new);
             if let Some(v) = r.string("apple_smc_osk") {
                 match AppleSmcOsk::parse(v.value) {
                     Ok(key) => cfg.apple_smc_osk = Some(key),
@@ -498,6 +519,18 @@ mod tests {
         }
     }
 
+    /// The trunk PSK is a secret like the OSK (config review F6).
+    #[test]
+    fn the_psk_is_hidden_from_debug() {
+        let host = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { psk = \"sekrit-psk\" }",
+            "<test>",
+        )
+        .unwrap();
+        assert!(host.psk.is_some());
+        assert!(!format!("{host:?}").contains("sekrit-psk"));
+    }
+
     #[test]
     fn defaults_when_absent() {
         let cfg = HostConfig::default();
@@ -605,7 +638,7 @@ host {
         assert_eq!(cfg.subnet_pool.to_string(), "10.99.0.0/16");
         assert_eq!(cfg.dns_suffix, "lab.local");
         assert_eq!(cfg.disk_low_percent, 5);
-        assert_eq!(cfg.psk.as_deref(), Some("sekrit"));
+        assert_eq!(cfg.psk.as_ref().map(TrunkPsk::expose), Some("sekrit"));
         assert_eq!(cfg.trunk_port, 13948);
         assert_eq!(cfg.oci_chunk_size, 128 << 20);
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
