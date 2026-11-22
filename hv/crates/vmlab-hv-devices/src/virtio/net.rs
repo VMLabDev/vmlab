@@ -207,10 +207,9 @@ fn hdr_len(negotiated: u64) -> usize {
 /// The virtio-net device.
 ///
 /// The worker thread exists from [`Net::new`] and keeps trying to reach the
-/// switch until it connects. Snapshot restore assumes the in-place flow (same
-/// process, same socket): state is restored faithfully and the worker
-/// reconciles `link_up` with the live connection, so restoring into a fresh
-/// device degrades gracefully (it reconnects).
+/// switch until it connects. The worker keeps partial reads and writes with
+/// the live socket across an in-place restore. A fresh device connects with
+/// empty stream buffers. Snapshots carry queues and complete pending frames.
 pub struct Net {
     queue_sizes: Vec<u16>,
     config: NetConfig,
@@ -2018,20 +2017,10 @@ impl Snapshot for Net {
             }
         }
         enc.u8(sh.link_up as u8);
-        enc.bytes(&sh.tx_out);
-        match &sh.rx {
-            RxRead::Idle => enc.u8(0),
-            RxRead::Prefix { buf, got } => {
-                enc.u8(1);
-                enc.bytes(buf);
-                enc.u32(*got as u32);
-            }
-            RxRead::Body { buf, got } => {
-                enc.u8(2);
-                enc.bytes(buf);
-                enc.u32(*got as u32);
-            }
-        }
+        // Keep the wire layout, with empty TX and idle RX placeholders.
+        // Partial I/O belongs to the live stream and cannot be rewound.
+        enc.bytes(&[]);
+        enc.u8(0);
         enc.u32(sh.rx_pending.len() as u32);
         for frame in &sh.rx_pending {
             enc.bytes(frame);
@@ -2119,22 +2108,22 @@ impl Snapshot for Net {
             ));
         }
         let link_up = dec.u8()? == 1;
-        let tx_out = dec.bytes()?;
-        let rx = match dec.u8()? {
-            0 => RxRead::Idle,
-            1 => RxRead::Prefix {
-                buf: dec
-                    .bytes()?
-                    .try_into()
-                    .map_err(|_| DeviceError::State("bad rx prefix in snapshot".into()))?,
-                got: dec.u32()? as usize,
-            },
-            2 => RxRead::Body {
-                buf: dec.bytes()?,
-                got: dec.u32()? as usize,
-            },
+        // Consume legacy stream fields without applying them to the socket.
+        dec.byte_slice()?;
+        match dec.u8()? {
+            0 => {}
+            1 => {
+                if dec.byte_slice()?.len() != 4 {
+                    return Err(DeviceError::State("bad rx prefix in snapshot".into()));
+                }
+                dec.u32()?;
+            }
+            2 => {
+                dec.byte_slice()?;
+                dec.u32()?;
+            }
             _ => return Err(DeviceError::State("bad rx state in snapshot".into())),
-        };
+        }
         let npending = dec.u32()? as usize;
         let mut rx_pending = VecDeque::new();
         for _ in 0..npending {
@@ -2158,8 +2147,6 @@ impl Snapshot for Net {
         let mut sh = lock(&self.shared);
         sh.vnet = vnet;
         sh.link_up = link_up;
-        sh.tx_out = tx_out;
-        sh.rx = rx;
         sh.rx_pending = rx_pending;
         if sh.mem.is_some() {
             sh.queues = queues
@@ -2278,9 +2265,12 @@ impl Dec<'_> {
     fn raw(&mut self, n: usize) -> Result<&[u8], DeviceError> {
         self.take(n)
     }
-    fn bytes(&mut self) -> Result<Vec<u8>, DeviceError> {
+    fn byte_slice(&mut self) -> Result<&[u8], DeviceError> {
         let len = self.u32()? as usize;
-        Ok(self.take(len)?.to_vec())
+        self.take(len)
+    }
+    fn bytes(&mut self) -> Result<Vec<u8>, DeviceError> {
+        Ok(self.byte_slice()?.to_vec())
     }
 }
 
@@ -2605,13 +2595,14 @@ mod tests {
     }
 
     #[test]
-    fn partial_direct_receive_survives_snapshot_before_publication() {
+    fn restore_keeps_a_live_partial_receive_before_publication() {
         let mut f = Fixture::new();
         let _switch = f.take_switch_side();
         f.dev.quiesce();
-        lock(&f.dev.shared).snapshot_paused = false;
         let address = f.data(2);
         f.vqs[0].add_chain(&f.mem, &[(address, 256, true)]);
+        let snapshot = f.dev.save_state().unwrap();
+        lock(&f.dev.shared).snapshot_paused = false;
         let frame: Vec<_> = (0..128).map(|n| n as u8).collect();
         let (mut producer, mut receiver) = UnixStream::pair().unwrap();
         receiver.set_nonblocking(true).unwrap();
@@ -2629,8 +2620,6 @@ mod tests {
             RxRead::Body { got: 37, .. }
         ));
         f.dev.quiesce();
-        let snapshot = f.dev.save_state().unwrap();
-        lock(&f.dev.shared).rx = RxRead::Idle;
         f.dev.restore_state(&snapshot).unwrap();
         producer.write_all(&frame[37..]).unwrap();
         read_frames(&f.dev.shared, &mut receiver).unwrap();
@@ -3462,7 +3451,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_transmit_writes_and_snapshot_retain_exactly_the_unsent_suffix() {
+    fn restore_keeps_exactly_the_unsent_suffix_of_a_live_transmit() {
         let expected: Vec<_> = (0..MAX_TX_STAGE).map(|index| (index % 251) as u8).collect();
         let directory = TempDir::new();
         let mut device = Net::new(NetConfig {
@@ -3492,10 +3481,10 @@ mod tests {
             },
             0
         );
+        let snapshot = device.save_state().unwrap();
         flush_tx(&shared, &mut producer).unwrap();
         assert!(!lock(&shared).tx_out.is_empty());
-        let snapshot = device.save_state().unwrap();
-        lock(&shared).tx_out.clear();
+        assert!(lock(&shared).tx_out.len() < expected.len());
         device.restore_state(&snapshot).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut received = Vec::new();
