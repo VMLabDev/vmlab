@@ -3175,10 +3175,13 @@ mod tests {
             handle.ping(Duration::from_secs(2)).await,
             "the pong waited behind a channel nobody reads"
         );
-        let mut other = tokio::time::timeout(Duration::from_secs(2), handle.open_terminal(80, 24, None, vec![], None))
-            .await
-            .expect("a second channel did not open while the first was full")
-            .unwrap();
+        let mut other = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.open_terminal(80, 24, None, vec![], None),
+        )
+        .await
+        .expect("a second channel did not open while the first was full")
+        .unwrap();
         let ev = tokio::time::timeout(Duration::from_secs(2), other.recv())
             .await
             .expect("the second channel delivered nothing while the first was full");
