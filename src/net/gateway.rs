@@ -316,6 +316,9 @@ impl Gateway {
         } = config;
 
         let ChannelPort { id, tx, rx } = switch.add_channel_port(PortClass::Service);
+        // The gateway's MAC is its port's from the start: no guest frame
+        // can claim it in the switch (review F9).
+        switch.bind_mac(id, gw_mac);
 
         let dhcp = dhcp.map(|mut c| {
             c.gateway = gw_ip;
@@ -384,16 +387,40 @@ impl GatewayTask {
             return;
         };
         match eth.ethertype() {
-            ETHERTYPE_ARP => self.handle_arp(eth.payload()),
+            ETHERTYPE_ARP => self.handle_arp(&eth),
             ETHERTYPE_IPV4 => self.handle_ipv4(&eth, frame).await,
             _ => {}
         }
     }
 
-    fn handle_arp(&self, payload: &[u8]) {
-        let Some(arp) = ArpView::parse(payload) else {
+    /// Whether `mac` may speak for `ip` (review F9): false only when this
+    /// segment's DHCP server holds a lease of `ip` for another MAC. An
+    /// address with no lease (a static one) has no owner vmlab knows, so
+    /// whoever uses it is believed, as before.
+    fn may_claim(&self, ip: Ipv4Addr, mac: MacAddr) -> bool {
+        let Some(dhcp) = &self.dhcp else {
+            return true;
+        };
+        if dhcp.lock_recover().leased_to_another(ip, mac) {
+            debug!(segment = %self.segment, %ip, %mac, "frame claims another machine's leased address, dropped");
+            return false;
+        }
+        true
+    }
+
+    fn handle_arp(&self, eth: &EthView<'_>) {
+        let Some(arp) = ArpView::parse(eth.payload()) else {
             return;
         };
+        // An ARP that names a leased address from a MAC that does not hold
+        // the lease teaches the gateway nothing and gets no answer. Both
+        // the ethernet source and the ARP sender address must be the
+        // holder's, because the reply and the neighbour entry use the latter.
+        if !arp.spa().is_unspecified()
+            && !(self.may_claim(arp.spa(), arp.sha()) && self.may_claim(arp.spa(), eth.src_mac()))
+        {
+            return;
+        }
         // Every ARP on the segment teaches the gateway a neighbour: the
         // requests guests broadcast for anyone, and the replies to its own.
         if !arp.spa().is_unspecified() {
@@ -416,6 +443,15 @@ impl GatewayTask {
         let Some(ip) = Ipv4View::parse(eth.payload()) else {
             return;
         };
+
+        // A leased address is its lease holder's alone: a frame from another
+        // MAC with that source is dropped before DNS, the gateway's own
+        // echo, NAT and routing see it (review F9). DHCP's own frames pass
+        // this, because a client sends them from its own address or from
+        // 0.0.0.0, which nobody holds.
+        if !ip.src().is_unspecified() && !self.may_claim(ip.src(), eth.src_mac()) {
+            return;
+        }
 
         // DHCP and DNS first: DHCP arrives broadcast (DISCOVER/REQUEST) or
         // unicast (renewals), so match on the UDP port alone.
@@ -1011,5 +1047,99 @@ mod tests {
         let arp = ArpView::parse(EthView::parse(&reply).unwrap().payload()).unwrap();
         assert_eq!(arp.op(), ArpOp::Reply);
         assert_eq!(arp.sha(), gw.gw_mac());
+    }
+
+    /// Give `mac` a lease through `port` and return the leased address.
+    async fn lease(gw: &GatewayHandle, port: &mut ChannelPort, mac: MacAddr) -> Ipv4Addr {
+        port.tx
+            .send(Bytes::from(discover_frame(mac)))
+            .await
+            .unwrap();
+        recv(&mut port.rx).await;
+        gw.dhcp
+            .as_ref()
+            .unwrap()
+            .lock_recover()
+            .lease_of(mac)
+            .expect("the discover leaves a lease")
+    }
+
+    /// Review F9: an ARP from another MAC does not move a leased address in
+    /// the gateway's neighbour table, where routed traffic looks it up.
+    #[tokio::test]
+    async fn an_arp_cannot_claim_a_leased_address() {
+        const ATTACKER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut victim = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut attacker = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let victim_ip = lease(&gw, &mut victim, GUEST_MAC).await;
+        // The offer may be broadcast: the attacker's port sees it then.
+        while timeout(Duration::from_millis(100), attacker.rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        // The holder's own ARP is learned and answered.
+        let req = arp_request_build(GUEST_MAC, victim_ip, gw.gw_ip());
+        victim.tx.send(Bytes::from(req)).await.unwrap();
+        loop {
+            let f = recv(&mut victim.rx).await;
+            if EthView::parse(&f).unwrap().ethertype() == ETHERTYPE_ARP {
+                break;
+            }
+        }
+        while timeout(Duration::from_millis(100), attacker.rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        // The attacker's ARP for the same address is not: no answer, and
+        // the neighbour entry stays the holder's.
+        let req = arp_request_build(ATTACKER_MAC, victim_ip, gw.gw_ip());
+        attacker.tx.send(Bytes::from(req)).await.unwrap();
+        let got = timeout(Duration::from_millis(200), attacker.rx.recv()).await;
+        assert!(got.is_err(), "the spoofed ARP was answered: {got:?}");
+        assert_eq!(
+            gw.neighbours.lock_recover().table.get(&victim_ip),
+            Some(&GUEST_MAC)
+        );
+    }
+
+    /// Review F9: an IPv4 frame whose source is a leased address reaches the
+    /// uplink (NAT, routing) only from the MAC that holds the lease.
+    #[tokio::test]
+    async fn a_leased_source_address_needs_its_holders_mac() {
+        const ATTACKER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut victim = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let attacker = sw.add_channel_port(PortClass::Guest { isolated: true });
+        let victim_ip = lease(&gw, &mut victim, GUEST_MAC).await;
+
+        let (utx, mut urx) = mpsc::unbounded_channel::<Bytes>();
+        gw.set_uplink(Arc::new(move |f| {
+            let utx = utx.clone();
+            Box::pin(async move {
+                let _ = utx.send(f);
+            })
+        }));
+
+        let dst = Ipv4Addr::new(8, 8, 8, 8);
+        let udp = udp_build(victim_ip, dst, 5555, 443, b"hello").unwrap();
+        let ipp = ipv4_build(victim_ip, dst, IPPROTO_UDP, 64, &udp, 21).unwrap();
+        let spoofed = Bytes::from(eth_build(gw.gw_mac(), ATTACKER_MAC, ETHERTYPE_IPV4, &ipp));
+        let honest = Bytes::from(eth_build(gw.gw_mac(), GUEST_MAC, ETHERTYPE_IPV4, &ipp));
+
+        attacker.tx.send(spoofed).await.unwrap();
+        let got = timeout(Duration::from_millis(200), urx.recv()).await;
+        assert!(got.is_err(), "the spoofed frame reached the uplink");
+
+        victim.tx.send(honest.clone()).await.unwrap();
+        let got = timeout(Duration::from_secs(2), urx.recv())
+            .await
+            .expect("timed out waiting for uplink frame")
+            .expect("uplink channel closed");
+        assert_eq!(got, honest);
     }
 }
