@@ -149,7 +149,10 @@ pub struct TemplateStore {
 /// The in-use check of an overwriting install: handed the disks the
 /// replacement would delete, it says why they cannot go.
 #[derive(Clone)]
-struct ReplaceGuard(std::sync::Arc<dyn Fn(&[PathBuf]) -> Option<String> + Send + Sync>);
+struct ReplaceGuard(std::sync::Arc<InUse>);
+
+/// Why the disks it is handed cannot be deleted, `None` when they can.
+type InUse = dyn Fn(&[PathBuf]) -> Option<String> + Send + Sync;
 
 impl std::fmt::Debug for ReplaceGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
