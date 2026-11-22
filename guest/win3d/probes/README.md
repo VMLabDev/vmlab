@@ -67,6 +67,19 @@ still read back, and `window_closed_early` is set.
 | 2 | Readback mismatch: no API error, but a marker differs by more than 2 per channel |
 | 3 | Usage error |
 
+A warning does not change the exit code. The D3D9 probe also runs a
+self-check of `D3DRS_WRAP0`, `WRAP8` and `WRAP15` before the first frame
+([docs/acceptance/C344.md](../docs/acceptance/C344.md)). When a draw of
+that check gives the wrong value, the probe records it and still renders,
+reads back and presents. On the win3d adapter (PCI vendor `0x1af4`) the
+record is an error, so the run exits 1 with its frames and readback in the
+result. On any other adapter it is a warning. The Direct3D 9 header
+defines `WRAP8` to `WRAP15` for `vs_3_0` attributes with
+`D3DDECLUSAGE_TEXCOORD`, yet the native NVIDIA driver 32.0.16.1088 wraps
+neither `TEXCOORD8` nor `TEXCOORD15`. On an RTX 5090 passed through to a
+Windows 11 guest the probe passes with those two warnings, in x64 and x86
+(card #486).
+
 ## JSON result
 
 Schema version 1. Example (abridged) from `d3d11_probe.exe` on WARP:
@@ -106,7 +119,8 @@ Schema version 1. Example (abridged) from `d3d11_probe.exe` on WARP:
       {"name": "red_top_left", "x": 48, "y": 48, "expected": [255, 0, 0], "actual": [255, 0, 0], "match": true}
     ]
   },
-  "errors": []
+  "errors": [],
+  "warnings": []
 }
 ```
 
@@ -134,6 +148,7 @@ Schema version 1. Example (abridged) from `d3d11_probe.exe` on WARP:
 | `readback.ok` | bool | Every marker was read and matched within `tolerance` |
 | `readback.pixels[]` | array | `name`, `x`, `y` (client pixels, origin top left), `expected` and `actual` as `[r, g, b]` (`actual` is `null` if no readback happened), `match` |
 | `errors` | array of string | Every failure, in order. The first is usually the cause |
+| `warnings` | array of string | Differences that are not failures of the probe, in order: a self-check that another vendor's driver does not meet |
 
 ### `adapter`
 
@@ -153,7 +168,7 @@ Schema version 1. Example (abridged) from `d3d11_probe.exe` on WARP:
 
 | Probe | Fields |
 | --- | --- |
-| D3D9 | `create_function` (`Direct3DCreate9Ex` or `Direct3DCreate9`), `adapter_count`, `vertex_shader_version`, `pixel_shader_version`, `hw_transform_and_light`, `vertex_processing`, `device_type` |
+| D3D9 | `create_function` (`Direct3DCreate9Ex` or `Direct3DCreate9`), `adapter_count`, `vertex_shader_version`, `pixel_shader_version`, `hw_transform_and_light`, `vertex_processing`, `device_type`, `coordinate_wrap_state_block` (false when the `WRAP` self-check recorded an error or a warning) |
 | D3D11 | `driver_type` (`HARDWARE` or `WARP`), `feature_level`, `swap_effect` |
 | D3D12 | `adapter_selection`, `max_feature_level`, `highest_shader_model`, `swap_effect` |
 | OpenGL | `pixel_format`, `pfd_generic_format`, `pfd_generic_accelerated`, `context`, `gl_renderer`, `gl_vendor`, `gl_version`, `gl_shading_language_version`, `icd_loaded`, `icd_modules` (full paths of loaded modules that export `DrvSetPixelFormat`), `wgl_arb_create_context`, `swap_interval_1` |

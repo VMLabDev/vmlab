@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::template::TemplateMeta;
 use crate::template::meta::VariantMeta;
 
+/// The largest VARS file a config blob carries, unpacked: the 64 MiB of an
+/// AAVMF variable store (OVMF's is 528 KiB). [`TemplateConfig::vars`] reads
+/// no further, whatever the frame says.
+pub const MAX_VARS_BYTES: u64 = 64 * 1024 * 1024;
+
 /// JSON form of [`TemplateMeta`] for the config blob. Field names are
 /// stable wire keys; absent optionals are omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +255,7 @@ impl TemplateConfig {
             created,
             origin: origin_override.or(self.origin),
             registry: self.registry,
+            pulled_from: None,
             sha256: self.sha256,
             first_boot_script: self.first_boot_script,
             agent_version: self.agent_version,
@@ -267,6 +273,11 @@ impl TemplateConfig {
     /// Carry `vars` — the template's pre-enrolled VARS file — in this blob.
     pub fn with_vars(mut self, vars: &[u8]) -> Result<Self> {
         use base64::Engine as _;
+        anyhow::ensure!(
+            vars.len() as u64 <= MAX_VARS_BYTES,
+            "a VARS file of {} bytes is over the {MAX_VARS_BYTES} a config blob carries",
+            vars.len()
+        );
         let packed = zstd::encode_all(vars, 19)?;
         self.secure_boot_vars = Some(base64::engine::general_purpose::STANDARD.encode(packed));
         Ok(self)
@@ -281,9 +292,18 @@ impl TemplateConfig {
         let packed = base64::engine::general_purpose::STANDARD
             .decode(text)
             .map_err(|e| anyhow::anyhow!("malformed secure_boot_vars in the config blob: {e}"))?;
-        Ok(Some(zstd::decode_all(packed.as_slice()).map_err(|e| {
-            anyhow::anyhow!("malformed secure_boot_vars in the config blob: {e}")
-        })?))
+        // The frame says how far it expands, and a registry wrote the frame:
+        // read one byte past the limit and no further.
+        use std::io::Read as _;
+        let mut vars = Vec::new();
+        zstd::Decoder::new(packed.as_slice())
+            .and_then(|frame| frame.take(MAX_VARS_BYTES + 1).read_to_end(&mut vars))
+            .map_err(|e| anyhow::anyhow!("malformed secure_boot_vars in the config blob: {e}"))?;
+        anyhow::ensure!(
+            vars.len() as u64 <= MAX_VARS_BYTES,
+            "secure_boot_vars in the config blob unpacks to more than {MAX_VARS_BYTES} bytes"
+        );
+        Ok(Some(vars))
     }
 
     /// Serialise to canonical JSON bytes.
@@ -325,6 +345,7 @@ mod tests {
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),
+            pulled_from: None,
             sha256: Some("ab".repeat(32)),
             first_boot_script: Some("use vmlab\nfn main(lab) { let vm = lab.this_vm() }\n".into()),
             agent_version: Some("agent=abc123".into()),
@@ -395,6 +416,33 @@ mod tests {
             Some(crate::config::model::SecureBootKeys::Vars)
         );
         assert_eq!(TemplateConfig::from_meta(&m).vars().unwrap(), None);
+    }
+
+    /// A config blob is the registry's word. A zstd frame of zeros expands
+    /// by more than four orders of magnitude, so a few KiB of
+    /// `secure_boot_vars` must not be allowed to ask for memory without end
+    /// (review F4): the payload is refused past the largest VARS file there
+    /// is, and one of exactly that size still comes back.
+    #[test]
+    fn an_oversized_vars_payload_is_refused() {
+        use base64::Engine as _;
+        let pack = |len: usize| {
+            let packed = zstd::encode_all(vec![0u8; len].as_slice(), 3).unwrap();
+            base64::engine::general_purpose::STANDARD.encode(packed)
+        };
+        let mut cfg = TemplateConfig::from_meta(&meta());
+        let bomb = pack(256 * 1024 * 1024);
+        assert!(bomb.len() < 64 * 1024, "{} bytes of text", bomb.len());
+        cfg.secure_boot_vars = Some(bomb);
+        // Not `expect_err`: a failure would print every byte it was handed.
+        let err = match cfg.vars() {
+            Err(e) => e,
+            Ok(vars) => panic!("unpacked {} bytes", vars.map_or(0, |v| v.len())),
+        };
+        assert!(err.to_string().contains("secure_boot_vars"), "{err}");
+
+        cfg.secure_boot_vars = Some(pack(64 * 1024 * 1024));
+        assert_eq!(cfg.vars().unwrap().unwrap().len(), 64 * 1024 * 1024);
     }
 
     #[test]

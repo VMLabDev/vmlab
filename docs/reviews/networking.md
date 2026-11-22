@@ -29,15 +29,15 @@ Who the attacker is, per finding:
 |------|----------|-------------------|
 | F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466) |
 | F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467) |
-| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses |
-| F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment |
+| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476) |
+| F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment (fixed in card #477) |
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache |
 | F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet |
 | F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease |
 | F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards |
-| F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic |
-| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error |
+| F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
+| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again |
 | F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC |
 | F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused |
@@ -166,6 +166,27 @@ Who the attacker is, per finding:
   limit). The same shape with SYNs (`tcp_flows`), and with a counting
   `Pinger` stub and 5 000 echo destinations (assert a limit on concurrent
   `ping` calls).
+- Fixed in card #476. Each table has a limit per guest address and a limit
+  per engine, so one guest cannot take every slot of its segment. Guest-opened
+  TCP flows: 128 per guest and 256 in all (`MAX_TCP_FLOWS` in
+  `src/net/nat/mod.rs`). A SYN past the limit is dropped, and the guest's
+  retransmission retries it. Flows the engine opens toward a guest (port
+  forwards) are not counted. UDP flows: 128 per guest and 256 in all
+  (`MAX_UDP_FLOWS` in `src/net/nat/udp.rs`). A new flow past the limit
+  replaces the flow idle the longest, of that guest or of the table, so a
+  table full of abandoned flows does not refuse a live one. `ping` probes in
+  flight: 8 per guest and 32 in all (`MAX_PROBES` in `src/net/nat/icmp.rs`).
+  An echo request past the limit is dropped. Forwarded DNS queries in flight:
+  64 per gateway (`MAX_DNS_FORWARDS` in `src/net/gateway.rs`), with no share
+  per guest. A query past the limit is dropped. The proof tests
+  `udp_flows_are_bounded`, `tcp_flows_are_bounded` and
+  `ping_probes_are_bounded` in `src/net/nat/tests.rs` and
+  `forwarded_dns_queries_are_bounded` in `src/net/gateway.rs` failed before
+  the fix (1 833 UDP flows where the descriptor limit stopped the test, 5 000
+  TCP flows, 3 050 probes at once, 200 forwards) and pass after it. Not
+  changed: the limits count per segment, the lab daemon still does not raise
+  `RLIMIT_NOFILE`, and a guest that sends from many source addresses (F9)
+  has the engine's limit and not one guest's.
 
 ### F4. One stalled TCP flow blocks the whole gateway (security, guest)
 
@@ -195,6 +216,27 @@ Who the attacker is, per finding:
   after the host socket buffer plus 64 segments. A second form at the
   gateway: with the flow stalled, send an ARP request for the gateway and
   assert a reply within a second.
+- Fixed in card #477. `handle_tcp` hands a segment to its flow with
+  `try_send` and never waits: a segment that finds the flow's channel full
+  is dropped, and the guest sends it again. The flow task no longer waits
+  for the host's socket outside its `select!`. Guest data waits in a buffer
+  of one window per flow (`Flow::to_host` in `src/net/nat/vtcp.rs`), and the
+  window the guest is told is the room left in it, where it was a constant
+  64 KiB before. A host that does not read therefore closes the guest's
+  window, the flow sends a window update when the host reads again, and the
+  guest's FIN reaches the host after the buffered data. The channel grew
+  from 64 to 256 segments (`SEGMENT_QUEUE`), which is more than a guest
+  inside its window has in flight, so only a guest that ignores the window
+  loses segments there. The wait during the host `connect` is covered by
+  the same `try_send`. The proof test failed before the fix
+  (`handle_frame` blocked at segment 64) and passes after it. The second
+  form is `a_stalled_flow_does_not_block_the_gateway`, which got no ARP
+  reply before the fix. Two more tests cover the new path: the window
+  closes and reopens with every acknowledged byte delivered in order, and a
+  FIN behind buffered data. Not changed: `handle_udp` still awaits the
+  64-slot channel of an engine-originated UDP flow (`guest_udp`), and the
+  gateway still awaits the engine's output channel when it resets an
+  unknown flow.
 
 ### F5. A NAT guest reaches the host's loopback (security, guest)
 
@@ -373,6 +415,15 @@ Who the attacker is, per finding:
   }`. Build a UDP datagram to `10.0.1.5:53` of 2 000 bytes and split it into
   two fragments (the first with the more-fragments flag). Assert `eval` of
   each fragment is `Verdict::Drop`. Today both are `Verdict::Pass`.
+- Fixed in card #478. `Meta::of` reads no port from a fragment, and
+  `RuleSet::eval` drops a TCP or UDP fragment, with no reply, when a rule
+  with a port covers its destination address and protocol
+  (`port_rule_covers` in `src/net/rules.rs`). The rule set keeps no
+  reassembly state, so this drops every fragmented datagram to such an
+  address and protocol, also one to a port that no rule names. A fragment is
+  no longer tracked or rewritten on the return path. Tests
+  `a_fragment_does_not_evade_a_port_block` and
+  `a_fragment_does_not_evade_a_port_redirect` failed before and pass now.
 
 ### F11. The trunk listener before authentication (security, peer)
 
@@ -398,6 +449,25 @@ Who the attacker is, per finding:
   (`getrusage`). Assert it is under 100 ms and that a connection made after
   the first batch timed out still gets the `VMLABTRUNK2` greeting. Today the
   accept loop uses the whole second.
+- Fixed in card #479. `bind_peer_listener` counts the connections that have
+  not finished the handshake in `PreAuth` (`src/supervisor/global.rs`): at
+  most 32 in total and 8 from one address. A connection past a limit is
+  closed at once, with no task and no greeting, and a slot comes back when
+  the handshake ends either way. A refused peer dials again after its redial
+  delay. After a failed `accept` the loop waits 100 ms and logs the first
+  failure of a run only (`AcceptErrors`, `src/net/accept.rs`), and the port
+  forward listener in `src/net/nat/forward.rs` does the same. Tests in
+  `src/supervisor/global.rs`:
+  `silent_connections_do_not_take_the_process_to_its_descriptor_limit` (the
+  proof above, with the 80 connections made by the parent, because they
+  would count against the child's own limit),
+  `a_listener_at_the_descriptor_limit_waits` (a child with three free
+  descriptors, which reaches `EMFILE` under the new limits too),
+  `a_silent_address_holds_only_its_share_of_the_listener`,
+  `silent_connections_are_limited_in_total` and
+  `an_authenticated_connection_gives_its_slot_back`. Not changed: the limits
+  are per address, so an attacker with five addresses still holds all 32
+  slots for as long as it keeps opening connections.
 
 ### F12. A dialed bridge outlives its segment (wrong result)
 

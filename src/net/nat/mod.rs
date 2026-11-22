@@ -39,6 +39,13 @@
 //! and [`NatEngine::udp_bind_guest_flow`] do the same for UDP datagrams.
 //! [`PortForwarder`] ties host listeners to those primitives.
 //!
+//! What a guest can make the engine hold is limited, per guest address and
+//! per engine: guest-opened TCP flows ([`MAX_TCP_FLOWS`], a SYN past the
+//! limit is dropped), UDP flows (a new one past the limit replaces the one
+//! idle the longest, see [`udp`]) and `ping` probes in flight (see
+//! [`icmp`]). Without the limits one guest takes every descriptor of the
+//! lab daemon.
+//!
 //! The engine never lets a guest's flow land on the host's loopback
 //! (`127.0.0.0/8`, `0.0.0.0/8`) on its own: a SYN is answered with RST, a
 //! UDP datagram or an ICMP echo is dropped. A segment's [`HostGuard`] admits
@@ -120,6 +127,10 @@ pub struct NatEngine {
     output: mpsc::Sender<Bytes>,
     /// Live vTCP flows; the value feeds guest segments to the flow task.
     tcp_flows: StdMutex<HashMap<FlowKey, mpsc::Sender<vtcp::Segment>>>,
+    /// How many guest-opened vTCP flows each guest address holds; the sum
+    /// is held under [`MAX_TCP_FLOWS`]. Engine-originated flows (port
+    /// forwards) are in `tcp_flows` but not here: no guest opens them.
+    tcp_passive: StdMutex<HashMap<Ipv4Addr, usize>>,
     /// Outbound UDP NAT flows.
     udp_flows: StdMutex<HashMap<FlowKey, udp::UdpFlow>>,
     /// Engine-bound UDP flows for [`Self::udp_bind_guest_flow`], keyed
@@ -138,6 +149,34 @@ pub struct NatEngine {
     /// How many ports of the ephemeral range are handed out: all of it,
     /// except in tests that need to exhaust it.
     eph_span: AtomicU32,
+}
+
+/// How many guest-opened vTCP flows the engine holds at once (review F3):
+/// each is a host socket and a task, and a lab daemon that runs out of
+/// descriptors can open no QMP socket, agent socket or disk. A SYN past the
+/// limit is dropped, so the guest's own retransmission retries it.
+pub(super) const MAX_TCP_FLOWS: usize = 256;
+/// How many of [`MAX_TCP_FLOWS`] one guest address may hold, so that one
+/// guest cannot take every slot of its segment.
+pub(super) const MAX_TCP_FLOWS_PER_GUEST: usize = 128;
+
+/// One guest-opened vTCP flow's place under [`MAX_TCP_FLOWS`], held by the
+/// flow task for as long as it runs.
+pub(super) struct PassiveSlot {
+    engine: Arc<NatEngine>,
+    guest: Ipv4Addr,
+}
+
+impl Drop for PassiveSlot {
+    fn drop(&mut self) {
+        let mut held = self.engine.tcp_passive.lock_recover();
+        if let Some(n) = held.get_mut(&self.guest) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                held.remove(&self.guest);
+            }
+        }
+    }
 }
 
 /// The ephemeral range 49152..=65535.
@@ -160,6 +199,7 @@ impl NatEngine {
             cfg,
             output,
             tcp_flows: StdMutex::new(HashMap::new()),
+            tcp_passive: StdMutex::new(HashMap::new()),
             udp_flows: StdMutex::new(HashMap::new()),
             guest_udp: StdMutex::new(HashMap::new()),
             macs: StdMutex::new(HashMap::new()),
@@ -235,18 +275,31 @@ impl NatEngine {
         let seg = vtcp::Segment::from_view(&tcp);
         let tx = self.tcp_flows.lock_recover().get(&key).cloned();
         if let Some(tx) = tx {
-            // Preserve arrival order and backpressure. Deliberately dropping
-            // here turns a busy in-process proxy into apparent network loss
-            // and can poison protocols such as SMB under sustained writes.
-            let _ = tx.send(seg).await;
+            // Never wait for a flow task: the caller is the gateway task of
+            // the whole segment, and one flow that fell behind would stop
+            // ARP, DHCP, DNS and every other flow with it (review F4).
+            // `try_send` keeps arrival order. Backpressure is the flow's
+            // advertised window, which closes as its host side falls
+            // behind, and the channel holds more than a guest inside that
+            // window has in flight. So only a guest that ignores the window
+            // loses a segment here, and it sends that one again.
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(seg) {
+                trace!(?key, "nat: flow queue full, segment dropped");
+            }
             return;
         }
         let opens = seg.is_syn() && !seg.is_ack();
         if opens && !self.refused(key.dst_ip, guard::FlowKind::Tcp { port: key.dst_port }) {
+            let Some(slot) = self.claim_passive_tcp(key.guest_ip) else {
+                // Dropped, not reset: the guest's SYN retransmission finds
+                // the slot a finished flow gave back.
+                debug!(?key, "nat: tcp flow limit reached, SYN dropped");
+                return;
+            };
             debug!(?key, "nat: passive vtcp open");
-            let (tx, rx) = mpsc::channel(64);
+            let (tx, rx) = mpsc::channel(vtcp::SEGMENT_QUEUE);
             self.tcp_flows.lock_recover().insert(key, tx);
-            vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx);
+            vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx, slot);
         } else if !seg.is_rst() {
             // Anything unexpected for an unknown flow, or a SYN to a host
             // address the engine refuses: reset it.
@@ -444,6 +497,24 @@ impl NatEngine {
             }
         }
         bail!("no free ephemeral port for active open to {guest_ip}:{guest_port}");
+    }
+
+    /// Take a slot for one guest-opened vTCP flow, or `None` when `guest`
+    /// or the engine is at its limit. The slot is given back when dropped.
+    fn claim_passive_tcp(self: &Arc<Self>, guest: Ipv4Addr) -> Option<PassiveSlot> {
+        let mut held = self.tcp_passive.lock_recover();
+        if held.values().sum::<usize>() >= MAX_TCP_FLOWS {
+            return None;
+        }
+        let of_guest = held.entry(guest).or_insert(0);
+        if *of_guest >= MAX_TCP_FLOWS_PER_GUEST {
+            return None;
+        }
+        *of_guest += 1;
+        Some(PassiveSlot {
+            engine: self.clone(),
+            guest,
+        })
     }
 
     fn remove_tcp_flow(&self, key: &FlowKey) {

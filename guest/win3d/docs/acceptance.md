@@ -868,6 +868,9 @@ post-fix baseline and the remaining follow-ups.
 draft A1 and the counts of both programs that crashed there.
 [C413](acceptance/C413.md) traces the window styles of its draft A3 to
 the Windows runtime and repeats them without Win3D.
+[C414](acceptance/C414.md) records the fix of its draft A4, the indexed
+draw at `device.c:3238`, and which `d3d9_device` failures change from
+session to session.
 
 Card #253 uses the `adapter/wine-<program>.failures.txt` logs for the
 Windows 11 tables above. Counts below are failed assertions, including

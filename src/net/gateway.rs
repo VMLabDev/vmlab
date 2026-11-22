@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::debug;
 
 use crate::config::model::MacAddr;
@@ -38,6 +38,11 @@ use crate::net::switch::{ChannelPort, PortClass, Switch};
 
 /// How long the gateway waits for an upstream DNS resolver.
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How many forwarded DNS queries wait on the upstream at once (review F3):
+/// each is a task and a host UDP socket for up to [`UPSTREAM_DNS_TIMEOUT`].
+/// A query past the limit is dropped, and the guest's resolver retries it.
+const MAX_DNS_FORWARDS: usize = 64;
 
 /// How long a packet routed onto the segment waits for its next hop to
 /// answer ARP before it is dropped, and how often the question is repeated.
@@ -335,6 +340,7 @@ impl Gateway {
             dns: dns_zone.clone().map(DnsServer::shared),
             uplink: Arc::clone(&uplink),
             neighbours: Arc::clone(&neighbours),
+            dns_forwards: Arc::new(Semaphore::new(MAX_DNS_FORWARDS)),
         };
         debug!(segment = %task.segment, port = %id, ip = %gw_ip, mac = %gw_mac, "gateway spawned");
         let join = tokio::spawn(task.run(rx));
@@ -361,6 +367,8 @@ struct GatewayTask {
     dns: Option<DnsServer>,
     uplink: SharedUplink,
     neighbours: Arc<Mutex<Neighbours>>,
+    /// One permit per forwarded DNS query in flight ([`MAX_DNS_FORWARDS`]).
+    dns_forwards: Arc<Semaphore>,
 }
 
 impl GatewayTask {
@@ -471,9 +479,15 @@ impl GatewayTask {
                 respond,
                 ..
             } => {
+                let Ok(permit) = Arc::clone(&self.dns_forwards).try_acquire_owned() else {
+                    debug!(segment = %self.segment, "DNS forward limit reached, query dropped");
+                    return;
+                };
                 let tx = self.tx.clone();
                 let segment = self.segment.clone();
                 tokio::spawn(async move {
+                    // Given back when the forward ends.
+                    let _permit = permit;
                     match forward_upstream(upstream, &raw_query, UPSTREAM_DNS_TIMEOUT).await {
                         Some(resp) => {
                             if let Some(frame) = respond.build_frame(&resp) {
@@ -704,6 +718,52 @@ mod tests {
         assert_eq!(m[3] & 0x0F, 0); // NOERROR
         assert_eq!(u16::from_be_bytes([m[6], m[7]]), 1); // one answer
         assert_eq!(&m[m.len() - 4..], &web.octets()); // rdata
+    }
+
+    /// A guest that asks for 200 names outside the zone has no more queries
+    /// waiting on the upstream at once than the limit (review F3).
+    #[tokio::test]
+    async fn forwarded_dns_queries_are_bounded() {
+        // An upstream that never answers: every forward waits its 3 s.
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(
+            &sw,
+            GatewayConfig {
+                upstream_dns: Some(upstream.local_addr().unwrap()),
+                ..config()
+            },
+        );
+        let mut guest = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        const QUERIES: u16 = 200;
+        for i in 0..QUERIES {
+            let mut q = vec![(i >> 8) as u8, i as u8, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+            q.extend_from_slice(&crate::net::dns::encode_qname(&format!("n{i}.example.com")));
+            q.extend_from_slice(&[0, 1, 0, 1]); // A IN
+            let udp = udp_build(GUEST_IP, gw.gw_ip(), 33000, 53, &q).unwrap();
+            let ipp = ipv4_build(GUEST_IP, gw.gw_ip(), IPPROTO_UDP, 64, &udp, 9).unwrap();
+            let frame = eth_build(gw.gw_mac(), GUEST_MAC, ETHERTYPE_IPV4, &ipp);
+            guest.tx.send(Bytes::from(frame)).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        // The gateway handles frames in order: its answer to this ARP
+        // request says that every query before it was handled.
+        let arp = arp_request_build(GUEST_MAC, GUEST_IP, gw.gw_ip());
+        guest.tx.send(Bytes::from(arp)).await.unwrap();
+        recv(&mut guest.rx).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut forwarded = 0;
+        let mut buf = [0u8; 512];
+        while upstream.try_recv_from(&mut buf).is_ok() {
+            forwarded += 1;
+        }
+        assert!(forwarded > 0, "queries are forwarded");
+        assert!(
+            forwarded <= MAX_DNS_FORWARDS,
+            "{forwarded} queries waited on the upstream at once, over the limit of {MAX_DNS_FORWARDS}"
+        );
     }
 
     #[tokio::test]

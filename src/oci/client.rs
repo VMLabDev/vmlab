@@ -115,6 +115,21 @@ pub trait Transport: Send + Sync {
     async fn blob_exists(&self, repository: &str, digest: &str) -> Result<bool>;
     /// GET a blob's bytes.
     async fn get_blob(&self, repository: &str, digest: &str) -> Result<Vec<u8>>;
+    /// GET a blob that is refused past `limit` bytes. The default
+    /// implementation checks what [`get_blob`](Self::get_blob) returned;
+    /// [`HttpTransport`] overrides it to stop reading at the limit.
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self.get_blob(repository, digest).await?;
+        if bytes.len() > limit {
+            bail!("registry response exceeds {limit} bytes");
+        }
+        Ok(bytes)
+    }
     /// GET a blob into a file on disk, verifying its digest and reporting
     /// cumulative bytes to `progress`. Returns the byte count. The default
     /// implementation buffers through [`get_blob`](Self::get_blob);
@@ -204,9 +219,6 @@ impl Registry {
         }
     }
 
-    pub fn repository(&self) -> &str {
-        &self.reference.repository
-    }
     pub fn tag(&self) -> &str {
         &self.reference.tag
     }
@@ -239,11 +251,7 @@ impl Registry {
                 .collect()),
             ManifestOrIndex::Manifest(m) => {
                 // Plain single-arch manifest: read its config blob for the arch.
-                let config_bytes = self
-                    .transport
-                    .get_blob(repo, &m.config.digest)
-                    .await
-                    .context("downloading config blob")?;
+                let config_bytes = self.config_blob(repo, &m.config).await?;
                 Ok(vec![TemplateConfig::from_json(&config_bytes)?.arch])
             }
         }
@@ -290,11 +298,7 @@ impl Registry {
         if !manifest.is_vmlab_template() {
             bail!("{repo}:{tag} is not a vmlab template");
         }
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let arches = if arches.is_empty() {
             vec![config.arch]
@@ -521,9 +525,31 @@ impl Registry {
         Ok(count)
     }
 
+    /// A template's config blob, refused past [`MAX_CONFIG_BLOB`]: by the size
+    /// its descriptor declares before any request, and by the bytes that
+    /// arrive whatever it declares.
+    async fn config_blob(&self, repo: &str, config: &Descriptor) -> Result<Vec<u8>> {
+        ensure!(
+            config.size <= MAX_CONFIG_BLOB as u64,
+            "config blob {} of {} bytes exceeds the {MAX_CONFIG_BLOB} a template's may have",
+            config.digest,
+            config.size
+        );
+        self.transport
+            .get_blob_bounded(repo, &config.digest, MAX_CONFIG_BLOB)
+            .await
+            .context("downloading config blob")
+    }
+
     /// Upload a config blob unless present, returning its descriptor.
     async fn put_config(&self, repo: &str, config: &TemplateConfig) -> Result<Descriptor> {
         let bytes = config.to_json()?;
+        // What no pull would read back is not published.
+        ensure!(
+            bytes.len() <= MAX_CONFIG_BLOB,
+            "the template's config blob is {} bytes, over the {MAX_CONFIG_BLOB} a pull accepts",
+            bytes.len()
+        );
         let digest = digest_of(&bytes);
         if !self.transport.blob_exists(repo, &digest).await? {
             self.transport
@@ -643,14 +669,14 @@ impl Registry {
         }
 
         // 3. Download config → TemplateMeta.
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let vars = config.vars()?;
-        let meta = config.into_meta(Some(self.reference.canonical()))?;
+        let mut meta = config.into_meta(Some(self.reference.canonical()))?;
+        // Who published it, from the reference and never from the blob: the
+        // blob chooses the store name and version, so this is what keeps the
+        // entry from standing for another repository's reference.
+        meta.pulled_from = Some(self.reference.source());
         crate::template::trust::names(&meta)?;
         let trusted = crate::template::trust::repository_trusted(
             &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
@@ -770,6 +796,20 @@ impl Registry {
         } else {
             dest_store.installed(&meta.arch, &meta.name, &meta.version)?
         };
+        // A version another repository put there is not this reference's,
+        // whatever its disk: its metadata and its variants are that
+        // repository's. It is refused rather than used or merged into.
+        if let Some(other) = local
+            .as_ref()
+            .and_then(|l| l.meta.pulled_from_other(&self.reference.source()))
+        {
+            bail!(
+                "template {reference} is already in the store, pulled from {other}, and {} \
+                 states the same name and version — remove it first, or pull with overwrite \
+                 to replace it",
+                self.reference.canonical()
+            );
+        }
         if let Some(local) = &local {
             let held = local.clone();
             let whole = whole.clone();
@@ -840,8 +880,7 @@ impl Registry {
                 }
             }
             let config_bytes = self
-                .transport
-                .get_blob(repo, &vm.config.digest)
+                .config_blob(repo, &vm.config)
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
             let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
@@ -1195,18 +1234,42 @@ pub fn cached_registry_template(
     arch: &str,
     store: &TemplateStore,
 ) -> Result<Option<crate::template::store::TemplateVersion>> {
-    let registry = Registry::new(reference)?;
-    // Templates live at `host/owner/[group/]name:VERSION`; the store name is
-    // the last repository path component.
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    Ok(store
-        .resolve_version(arch, &store_name, Some(registry.tag()))
-        .ok())
+    let reference = Reference::parse(reference)?;
+    Ok(held_for(&reference, arch, store, &reference.tag))
+}
+
+/// The store version the registry `reference` stands for at version `pin`,
+/// offline. Templates live at `host/owner/[group/]name:VERSION`; the store
+/// name is the last repository path component.
+///
+/// A version pulled from another repository is never the answer
+/// ([`TemplateMeta::pulled_from_other`]): its config blob chose the name and
+/// version it sits under. Where such a version is the newest match of the
+/// pin, the newest one this reference can stand for is taken instead, so the
+/// other repository cannot hide it either.
+fn held_for(
+    reference: &Reference,
+    arch: &str,
+    store: &TemplateStore,
+    pin: &str,
+) -> Option<crate::template::store::TemplateVersion> {
+    let name = reference.repository.rsplit('/').next().unwrap_or_default();
+    let source = reference.source();
+    let newest = store.resolve_version(arch, name, Some(pin)).ok()?;
+    if newest.meta.pulled_from_other(&source).is_none() {
+        return Some(newest);
+    }
+    let mut held = Vec::new();
+    for version in store.versions_of(arch, name).unwrap_or_default() {
+        if let Ok(Some(v)) = store.installed(arch, name, &version)
+            && v.meta.pulled_from_other(&source).is_none()
+        {
+            held.push(v);
+        }
+    }
+    let versions: Vec<String> = held.iter().map(|v| v.meta.version.clone()).collect();
+    let version = crate::template::store::resolve_version_pin(&versions, pin)?;
+    held.into_iter().find(|v| v.meta.version == version)
 }
 
 /// Resolve a `registry` template reference to a cached store entry, pulling it
@@ -1236,12 +1299,6 @@ pub async fn ensure_registry_template(
         return Ok(r);
     }
     let registry = Registry::new(reference)?;
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
     // Not cached. Resolve the requested tag against the registry's published
     // tags first: a version pin (e.g. 26100.1742, or 24.04) resolves to the
     // version `latest` names when it falls under the pin, else to the newest
@@ -1258,7 +1315,7 @@ pub async fn ensure_registry_template(
         .resolve_version(Some(arch))
         .await
         .with_context(|| format!("resolving {reference}"))?;
-    if let Ok(r) = store.resolve_version(arch, &store_name, Some(&real))
+    if let Some(r) = held_for(&registry.reference, arch, store, &real)
         && want.held_by(&r.meta)
     {
         return Ok(r);
@@ -1273,7 +1330,19 @@ pub async fn ensure_registry_template(
         .pull_with_progress(Some(arch), store, work.path(), false, want, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
-    store.resolve_version(&meta.arch, &meta.name, Some(&meta.version))
+    // Exactly the version the pull installed or found held. A pin
+    // resolution here would prefer a `<version>.<N>` sub-build, which another
+    // repository may have put in the store.
+    store
+        .installed(&meta.arch, &meta.name, &meta.version)?
+        .ok_or_else(|| {
+            anyhow!(
+                "template {}/{}@{} is not in the store after its pull",
+                meta.arch,
+                meta.name,
+                meta.version
+            )
+        })
 }
 
 /// `sha256:<hex>` of a byte slice.
@@ -1297,6 +1366,10 @@ pub struct HttpTransport {
 const MAX_RETRIES: u32 = 3;
 pub(super) const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_BLOB_BODY: usize = 1024 * 1024 * 1024;
+/// A template's config blob: a JSON document, read whole on every resolve of
+/// a registry reference. Its one large field is the packed VARS file, which
+/// is tens of KiB for a real one.
+const MAX_CONFIG_BLOB: usize = MAX_JSON_BODY;
 const MAX_STREAMED_BLOB: u64 = 8 * 1024 * 1024 * 1024;
 pub(super) const MAX_LIST_PAGES: usize = 100;
 pub(super) const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
@@ -1629,6 +1702,23 @@ impl Transport for HttpTransport {
             bail!("GET blob {digest} returned {}", resp.status());
         }
         bounded_body(resp, MAX_BLOB_BODY).await
+    }
+
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let url = self.url(&format!("/v2/{repository}/blobs/{digest}"));
+        let scope = self.scope(repository, false);
+        let resp = self
+            .send_with_auth(&scope, || self.client.get(&url))
+            .await?;
+        if !resp.status().is_success() {
+            bail!("GET blob {digest} returned {}", resp.status());
+        }
+        bounded_body(resp, limit).await
     }
 
     async fn get_blob_to_file(
@@ -2348,6 +2438,7 @@ mod tests {
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -2663,6 +2754,68 @@ mod tests {
         assert_eq!(std::fs::read(held).unwrap(), vars);
     }
 
+    /// A template's config blob is a small JSON document, and it is read
+    /// whole on every resolve of a registry reference. One of 16 MiB is
+    /// refused by its size rather than held and parsed (review F4).
+    #[tokio::test]
+    async fn an_oversized_config_blob_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same template under the tag `big`, its config blob padded with
+        // JSON whitespace to 16 MiB: still a document that parses.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let mut config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        config.resize(16 * 1024 * 1024, b' ');
+        TemplateConfig::from_json(&config).expect("the padded blob still parses");
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "big",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let err = registry_with_fake("ghcr.io/owner/alpine:big", fake.clone())
+            .pull(Some("x86_64"), &store, &store_root.join(".oci-pull"), false)
+            .await
+            .expect_err("a 16 MiB config blob is refused");
+        assert!(format!("{err:#}").contains("config blob"), "{err:#}");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+    }
+
     /// Pulling a version the store already holds uses the stored copy when it
     /// is the same image, without downloading, and refuses only when the two
     /// disks differ.
@@ -2729,6 +2882,121 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("different disk"), "{err}");
+    }
+
+    /// Push a template under `reference`, with the name and version its
+    /// config blob states chosen freely, as a repository can.
+    async fn push_stating(
+        fake: &std::sync::Arc<FakeRegistry>,
+        reference: &str,
+        name: &str,
+        version: &str,
+        disk: &[u8],
+    ) {
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.name = name.into();
+        m.version = version.into();
+        make_template(&tdir, &m, disk);
+        registry_with_fake(reference, fake.clone())
+            .push(&tdir, 1024, "x86_64", &work.path().join("push"), None, None)
+            .await
+            .unwrap();
+    }
+
+    /// F3 of docs/reviews/templates-registry.md. The store slot comes from
+    /// the config blob, so `evil/x` can state `ubuntu` at a version under the
+    /// pin `24.04`. The offline lookup of `good/ubuntu:24.04` must not take
+    /// it, and it must not hide what `good/ubuntu` itself put in the store.
+    #[tokio::test]
+    async fn a_cached_registry_reference_is_not_served_from_another_repository() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let want = VariantWant::default();
+        let good = "localhost:5000/good/ubuntu:24.04";
+
+        push_stating(
+            &fake,
+            "localhost:5000/evil/x:1",
+            "ubuntu",
+            "24.04.9",
+            b"evil",
+        )
+        .await;
+        let (pulled, _) = pull_want(&fake, "localhost:5000/evil/x:1", &store, &want)
+            .await
+            .unwrap();
+        assert_eq!(
+            (pulled.name.as_str(), pulled.version.as_str()),
+            ("ubuntu", "24.04.9")
+        );
+        assert_eq!(pulled.pulled_from.as_deref(), Some("localhost:5000/evil/x"));
+
+        let served = cached_registry_template(good, "x86_64", &store).unwrap();
+        assert!(
+            served.is_none(),
+            "{good} resolved to the entry pulled from {:?}",
+            served.map(|v| v.meta.origin)
+        );
+
+        // What the named repository published is found under the entry that
+        // sorts above it.
+        push_stating(
+            &fake,
+            "localhost:5000/good/ubuntu:24.04.3",
+            "ubuntu",
+            "24.04.3",
+            b"good",
+        )
+        .await;
+        pull_want(&fake, "localhost:5000/good/ubuntu:24.04.3", &store, &want)
+            .await
+            .unwrap();
+        let served = cached_registry_template(good, "x86_64", &store)
+            .unwrap()
+            .expect("the version good/ubuntu published is in the store");
+        assert_eq!(served.meta.version, "24.04.3");
+        assert_eq!(
+            served.meta.pulled_from.as_deref(),
+            Some("localhost:5000/good/ubuntu")
+        );
+    }
+
+    /// F3, the pull side: a version another repository installed is not this
+    /// reference's even with the same disk, since its metadata and variants
+    /// are that repository's. The pull is refused and names the repository.
+    /// The same repository pulls onto its own version as before.
+    #[tokio::test]
+    async fn a_pull_does_not_use_a_version_another_repository_installed() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let want = VariantWant::default();
+        for reference in ["ghcr.io/evil/alpine:3.20", "ghcr.io/owner/alpine:3.20"] {
+            push_stating(&fake, reference, "alpine", "3.20", b"same disk").await;
+        }
+        pull_want(&fake, "ghcr.io/evil/alpine:3.20", &store, &want)
+            .await
+            .unwrap();
+        pull_want(&fake, "ghcr.io/evil/alpine:3.20", &store, &want)
+            .await
+            .expect("a repository pulls onto its own version");
+
+        let err = pull_want(&fake, "ghcr.io/owner/alpine:3.20", &store, &want)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pulled from ghcr.io/evil/alpine"), "{err}");
+        let held = store
+            .installed("x86_64", "alpine", "3.20")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.meta.pulled_from.as_deref(),
+            Some("ghcr.io/evil/alpine")
+        );
     }
 
     #[tokio::test]
@@ -3008,6 +3276,7 @@ mod tests {
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -3673,6 +3942,7 @@ mod tests {
             assert_eq!(pulled.effective(Some(got)), {
                 let mut e = m.effective(Some(v));
                 e.origin = pulled.origin.clone();
+                e.pulled_from = pulled.pulled_from.clone();
                 e
             });
             assert_eq!(got.description, v.description);

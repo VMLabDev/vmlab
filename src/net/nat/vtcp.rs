@@ -29,6 +29,14 @@
 //! window, buffered a fast download until it ran out of memory, and the flow
 //! fell to one retransmit per RTO.
 //!
+//! Guest→host data waits in the flow's own buffer of one window
+//! ([`Flow::to_host`]) and the flow task never waits for the host's socket
+//! outside its `select!`. The window advertised to the guest is the room left
+//! in that buffer, so a host that reads slowly closes the guest's window, as
+//! a real TCP peer's would. Awaiting the write in line let one host that did
+//! not read stop the flow task from draining its channel, and the gateway
+//! task of the whole segment waited behind that channel (review F4).
+//!
 //! Segments arriving ahead of `rcv_nxt` ARE buffered (up to one window per
 //! flow) and stitched in when the hole fills. Dropping them and dup-ACKing —
 //! the original behaviour — cost the guest its entire in-flight window for
@@ -40,6 +48,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -67,8 +76,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Guest-side handshake timeout for active opens.
 const ACTIVE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-/// Fixed receive window advertised to the guest (64 KiB - 1; no scaling).
+/// Largest receive window advertised to the guest (64 KiB - 1; no scaling),
+/// and so the most guest data a flow holds for a host that has not taken it.
 const WINDOW: u16 = 0xFFFF;
+/// Guest segments a flow's channel holds for its task. [`NatEngine`] drops a
+/// segment that finds it full and never waits (review F4), so it is sized
+/// for what a guest inside its window can have in flight: one window in
+/// segments of the smallest MSS (65535 / 536 = 123), and as many again for
+/// the acknowledgements of a transfer the other way.
+pub(super) const SEGMENT_QUEUE: usize = 256;
 /// In-memory pipe capacity backing [`GuestStream`].
 const DUPLEX_CAPACITY: usize = 64 * 1024;
 /// Guest data held per flow while waiting for a missing segment. One advertised
@@ -224,15 +240,19 @@ impl AsyncWrite for GuestStream {
 // ---------------------------------------------------------------------------
 
 /// Spawn the flow task answering a guest SYN (already inserted in the flow
-/// table by the caller).
+/// table by the caller). The task holds `slot`, the flow's place under the
+/// engine's limit, until it ends.
 pub(super) fn spawn_passive(
     engine: Arc<NatEngine>,
     key: FlowKey,
     guest_mac: MacAddr,
     syn: Segment,
     rx: mpsc::Receiver<Segment>,
+    slot: super::PassiveSlot,
 ) {
     tokio::spawn(async move {
+        // Given back when the task ends, however it ends.
+        let _slot = slot;
         let dst = (key.dst_ip, key.dst_port);
         match timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
             Ok(Ok(stream)) => {
@@ -258,7 +278,7 @@ pub(super) async fn open_active(
     guest_ip: Ipv4Addr,
     guest_port: u16,
 ) -> Result<GuestStream> {
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel(SEGMENT_QUEUE);
     let key = engine.alloc_active_tcp_flow(guest_ip, guest_port, tx)?;
     let guest_mac = engine.guest_mac(guest_ip);
     let (ours, theirs) = tokio::io::duplex(DUPLEX_CAPACITY);
@@ -328,6 +348,14 @@ struct Flow {
     last_activity: Instant,
     our_fin_sent: bool,
     guest_fin_rcvd: bool,
+    /// Guest data accepted and acknowledged that the host side has not
+    /// taken yet, at most [`WINDOW`] bytes.
+    to_host: VecDeque<u8>,
+    /// The guest's FIN arrived while `to_host` held data: the host side is
+    /// shut down once the buffer is written out.
+    host_fin_pending: bool,
+    /// The window in the last segment sent to the guest.
+    advertised: AtomicU16,
 }
 
 impl Flow {
@@ -352,6 +380,9 @@ impl Flow {
             last_activity: Instant::now(),
             our_fin_sent: false,
             guest_fin_rcvd: false,
+            to_host: VecDeque::new(),
+            host_fin_pending: false,
+            advertised: AtomicU16::new(WINDOW),
         }
     }
 
@@ -376,6 +407,9 @@ impl Flow {
             last_activity: Instant::now(),
             our_fin_sent: false,
             guest_fin_rcvd: false,
+            to_host: VecDeque::new(),
+            host_fin_pending: false,
+            advertised: AtomicU16::new(WINDOW),
         }
     }
 
@@ -383,8 +417,17 @@ impl Flow {
         self.engine.config().mtu.saturating_sub(40).max(536)
     }
 
+    /// Room left for guest data, which is the receive window the guest is
+    /// told. Accepting a byte moves `rcv_nxt` up and the room down by one,
+    /// so the window's right edge never moves back.
+    fn rcv_window(&self) -> u16 {
+        WINDOW.saturating_sub(self.to_host.len().min(usize::from(WINDOW)) as u16)
+    }
+
     /// Emit one segment toward the guest.
     async fn emit(&self, seq: u32, ack: u32, flags: u8, payload: &[u8], options: &[u8]) {
+        let window = self.rcv_window();
+        self.advertised.store(window, Ordering::Relaxed);
         let seg = frame::tcp_build(
             self.key.dst_ip,
             self.key.guest_ip,
@@ -394,7 +437,7 @@ impl Flow {
                 seq,
                 ack,
                 flags,
-                window: WINDOW,
+                window,
                 options,
             },
             payload,
@@ -563,15 +606,13 @@ impl Flow {
                     // New bytes (possibly a retransmission overlapping old
                     // data; accept the tail).
                     let fresh = &seg.payload[off as usize..];
-                    if *wr_open && wr.write_all(fresh).await.is_err() {
-                        // Proxied peer is gone: reset the guest.
-                        self.send_rst().await;
-                        return false;
-                    }
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
-                    // This segment may have filled a hole: drain whatever of
+                    self.accept(fresh, *wr_open);
+                    // This segment may have filled a hole: take whatever of
                     // the out-of-order queue is now contiguous.
-                    if !self.drain_ooo(wr, wr_open).await {
+                    self.drain_ooo(*wr_open);
+                    // Hand it to the host now if its socket takes it, so the
+                    // ACK below still advertises a full window.
+                    if !self.flush_to_host(wr, wr_open).await {
                         return false;
                     }
                 }
@@ -593,8 +634,13 @@ impl Flow {
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
                 self.guest_fin_rcvd = true;
                 if *wr_open {
-                    let _ = wr.shutdown().await;
-                    *wr_open = false;
+                    if self.to_host.is_empty() {
+                        let _ = wr.shutdown().await;
+                        *wr_open = false;
+                    } else {
+                        // The host gets the buffered data first.
+                        self.host_fin_pending = true;
+                    }
                 }
             }
             need_ack = true;
@@ -631,11 +677,28 @@ impl Flow {
         }
     }
 
-    /// Write out every queued segment that is now contiguous with `rcv_nxt`,
-    /// trimming any overlap. Returns `false` when the flow must die.
-    async fn drain_ooo<W: AsyncWrite + Unpin>(&mut self, wr: &mut W, wr_open: &mut bool) -> bool {
+    /// Take in-order guest bytes: as many as the advertised window has room
+    /// for. The rest is not acknowledged, so the guest sends it again once
+    /// the window reopens. Returns how many bytes were taken. With the host
+    /// side already shut down the bytes are acknowledged and discarded.
+    fn accept(&mut self, fresh: &[u8], wr_open: bool) -> usize {
+        let n = if wr_open {
+            let n = fresh.len().min(usize::from(self.rcv_window()));
+            self.to_host.extend(&fresh[..n]);
+            n
+        } else {
+            fresh.len()
+        };
+        self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
+        n
+    }
+
+    /// Take every queued segment that is now contiguous with `rcv_nxt`,
+    /// trimming any overlap, for as long as the window has room. A segment
+    /// that does not fit whole stays queued for the next call.
+    fn drain_ooo(&mut self, wr_open: bool) {
         loop {
-            // Forget anything that ends at or before rcv_nxt — already written.
+            // Forget anything that ends at or before rcv_nxt — already taken.
             let stale: Vec<u32> = self
                 .ooo
                 .iter()
@@ -652,21 +715,99 @@ impl Flow {
             // What's left starting at or before rcv_nxt therefore extends past
             // it: it continues the stream.
             let Some(&seq) = self.ooo.keys().find(|&&seq| seq_le(seq, self.rcv_nxt)) else {
-                return true;
+                return;
             };
             let payload = self.ooo.remove(&seq).expect("key just found");
             self.ooo_bytes -= payload.len();
             let fresh = &payload[self.rcv_nxt.wrapping_sub(seq) as usize..];
-            if *wr_open && wr.write_all(fresh).await.is_err() {
+            if self.accept(fresh, wr_open) < fresh.len() {
+                // No room for all of it: keep it for when the host has
+                // taken some of the buffer.
+                self.ooo_bytes += payload.len();
+                self.ooo.insert(seq, payload);
+                return;
+            }
+        }
+    }
+
+    /// Write buffered guest data to the host side for as long as it takes
+    /// the data at once, and never wait for it: the flow's `select!` waits,
+    /// together with everything else the flow has to answer. Returns `false`
+    /// when the flow must die (the proxied peer is gone; the guest is reset).
+    async fn flush_to_host<W: AsyncWrite + Unpin>(
+        &mut self,
+        wr: &mut W,
+        wr_open: &mut bool,
+    ) -> bool {
+        while *wr_open && !self.to_host.is_empty() {
+            let chunk = self.to_host.as_slices().0;
+            let wrote = std::future::poll_fn(|cx| {
+                Poll::Ready(match Pin::new(&mut *wr).poll_write(cx, chunk) {
+                    Poll::Ready(result) => Some(result),
+                    Poll::Pending => None,
+                })
+            })
+            .await;
+            match wrote {
+                None => return true,
+                Some(result) => {
+                    if !self.wrote_to_host(result, wr, wr_open).await {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The host side took `result` bytes of `to_host` (or failed): drop
+    /// them, and shut the host side down once a pending guest FIN has
+    /// nothing in front of it. Returns `false` when the flow must die.
+    async fn wrote_to_host<W: AsyncWrite + Unpin>(
+        &mut self,
+        result: std::io::Result<usize>,
+        wr: &mut W,
+        wr_open: &mut bool,
+    ) -> bool {
+        match result {
+            Ok(n) if n > 0 => {
+                self.to_host.drain(..n.min(self.to_host.len()));
+            }
+            // Proxied peer is gone: reset the guest.
+            _ => {
                 self.send_rst().await;
                 return false;
             }
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(fresh.len() as u32);
+        }
+        if self.to_host.is_empty() && self.host_fin_pending {
+            self.host_fin_pending = false;
+            let _ = wr.shutdown().await;
+            *wr_open = false;
+        }
+        true
+    }
+
+    /// After the host took buffered data: stitch in what was waiting for
+    /// room, and tell the guest when its window has grown by a segment or
+    /// is whole again (receiver-side silly-window avoidance, RFC 1122
+    /// 4.2.3.3). Without the update a guest that filled the window would
+    /// only learn of the room from its own zero-window probe.
+    async fn after_host_write(&mut self, wr_open: bool) {
+        let before = self.rcv_nxt;
+        self.drain_ooo(wr_open);
+        let window = self.rcv_window();
+        let advertised = self.advertised.load(Ordering::Relaxed);
+        let grown = usize::from(window.saturating_sub(advertised));
+        if self.rcv_nxt != before || grown >= self.mss || (grown > 0 && window == WINDOW) {
+            self.send_ack().await;
         }
     }
 
     fn closed_both_ways(&self) -> bool {
-        self.guest_fin_rcvd && self.our_fin_sent && self.snd_una == self.snd_nxt
+        self.guest_fin_rcvd
+            && self.our_fin_sent
+            && self.snd_una == self.snd_nxt
+            && self.to_host.is_empty()
     }
 
     // -- passive ---------------------------------------------------------
@@ -818,6 +959,7 @@ impl Flow {
             let window_closed = sending && allowance == 0 && self.unacked.is_empty();
             let rto_deadline = self.rto_at.unwrap_or_else(|| Instant::now() + RTO);
             let idle_deadline = self.last_activity + IDLE_TIMEOUT;
+            let host_owed = wr_open && !self.to_host.is_empty();
 
             tokio::select! {
                 seg = rx.recv() => {
@@ -825,6 +967,14 @@ impl Flow {
                     if !self.on_segment(seg, &mut wr, &mut wr_open).await {
                         return;
                     }
+                }
+                wrote = wr.write(self.to_host.as_slices().0), if host_owed => {
+                    if !self.wrote_to_host(wrote, &mut wr, &mut wr_open).await
+                        || !self.flush_to_host(&mut wr, &mut wr_open).await
+                    {
+                        return;
+                    }
+                    self.after_host_write(wr_open).await;
                 }
                 read = rd.read(&mut buf[..allowance]), if can_read => {
                     match read {
