@@ -188,11 +188,13 @@ def run(h):
             return False
         return True
 
+    # `vmlab up <machine>` validates the whole lab file, so every template the
+    # lab names is staged before the first guest boots.
+    ready = [(machine, feature) for machine, feature, relative in GUESTS if template_ready(feature, relative)]
     with h.lab("legacy") as lab:
-        for machine, feature, relative in GUESTS:
-            if template_ready(feature, relative):
-                h.check(feature, lambda m=machine: exercise(h, lab, m),
-                        "agent readiness, the usual screen by OCR, PNG capture, exec, disk write/read and stop")
+        for machine, feature in ready:
+            h.check(feature, lambda m=machine: exercise(h, lab, m),
+                    "agent readiness, the usual screen by OCR, PNG capture, exec, disk write/read and stop")
 
     feature = "vm.legacy.server2016"
     if template_ready(feature, "x86_64/windows-server-2016/14393.0.0"):
