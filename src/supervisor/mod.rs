@@ -895,6 +895,32 @@ impl Handler<SupRequest> for SupervisorHandler {
 mod tests {
     use super::{daemon_running, process_running, process_start_time};
 
+    /// A release that kills a lab daemon before one guest's graceful stop
+    /// could end cuts that guest's power in the middle of its shutdown
+    /// (lab-lifecycle review F6). The longest ladder of a guest that acts on
+    /// ACPI is one stopped while it boots with a sealed agent: the wait for
+    /// that agent, then the agent, ACPI and quit rungs. Constants only, no
+    /// clock.
+    #[test]
+    fn the_release_deadline_covers_the_longest_stop_plan() {
+        use crate::labd::stop_plan::{StopFacts, plan_stop, plan_wait};
+        let booting = StopFacts {
+            force: false,
+            agent_channel: true,
+            agent_answered: false,
+            agent_sealed: true,
+            acpi_shutdown: true,
+            ready_timeout: std::time::Duration::from_secs(300),
+        };
+        let longest = plan_wait(&plan_stop(&booting));
+        assert!(
+            longest < super::RELEASE_DEADLINE,
+            "a booting guest's stop takes up to {}s, the release kills after {}s",
+            longest.as_secs(),
+            super::RELEASE_DEADLINE.as_secs()
+        );
+    }
+
     /// A pid is reused once its process is gone; the start time is what
     /// tells the daemon from whatever runs at its pid now.
     #[test]
