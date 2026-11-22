@@ -1154,7 +1154,9 @@ impl ContainerInstance {
                 .map_err(Attempted)?;
                 Ok(false)
             }
-            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
+            other => {
+                Err(anyhow!("{} is {:?} — wait for it to settle", self.cfg.name, other).into())
+            }
         }
     }
 
