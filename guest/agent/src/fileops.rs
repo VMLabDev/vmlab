@@ -810,9 +810,8 @@ fn symlink(target: &str, link: &str, kind: LinkKind) -> std::io::Result<()> {
 /// the client never named.
 fn seen_from(root: &str, resolved: &str) -> Option<String> {
     let root = std::path::Path::new(root);
-    if root.parent().is_none() {
-        return None;
-    }
+    // `/` has no parent: the session is not rooted anywhere of its own.
+    root.parent()?;
     let inside = std::path::Path::new(resolved).strip_prefix(root).ok()?;
     Some(
         std::path::Path::new("/")
