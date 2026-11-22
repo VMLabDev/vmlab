@@ -1222,6 +1222,30 @@ mod tests {
         assert!(matches!(input.recv().unwrap(), Input::Eof));
     }
 
+    /// Review F6 (card #507). The host's window counts bytes, so a session
+    /// whose pump has stopped reading can still be sent a window's worth of
+    /// one-byte frames. Routing them must not hold up the reader thread: the
+    /// ping behind them is answered.
+    #[test]
+    fn a_session_that_stops_reading_does_not_block_other_channels() {
+        let (mux, mut cap) = capture_mux();
+        // Held and never read: a terminal whose program ignores its input.
+        let (_input, _credit) = mux.for_channel(9).register(9, None, None).unwrap();
+        let (done, routed) = std::sync::mpsc::channel();
+        let reader = mux.clone();
+        thread::spawn(move || {
+            for _ in 0..600 {
+                reader.route_input(9, Input::Bytes(vec![b'x']));
+            }
+            reader.handle_msg(HostMsg::Ping, &TestPlatform::new());
+            let _ = done.send(());
+        });
+        routed
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the reader got past a session that does not read its input");
+        assert!(matches!(cap.ctrl(), AgentMsg::Pong { .. }));
+    }
+
     #[test]
     fn oversized_control_replies_fail_without_stopping_the_writer() {
         let (mux, mut cap) = capture_mux();
