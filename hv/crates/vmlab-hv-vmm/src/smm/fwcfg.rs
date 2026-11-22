@@ -247,6 +247,7 @@ mod pc_tests {
             ram_regions: vec![(0, 0x80000000), (0x100000000, 0x180000000)],
             ecam_base: 0xe0000000,
             pci64_base: Some(32 << 30),
+            pci64_size: 32 << 30,
             pci_devices: [
                 (0, 0),
                 (1, 0),
