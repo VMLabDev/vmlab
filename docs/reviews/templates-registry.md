@@ -27,7 +27,7 @@ much as a Makefile is.
 |------|----------|-------------------|
 | F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it (fixed, #461) |
 | F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check (fixed in card #464) |
-| F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot |
+| F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot (fixed, #480) |
 | F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference (fixed in card #481) |
 | F5 | security | A template pull bounds each chunk but not the number of chunks or the total size |
 | F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop |
@@ -157,6 +157,36 @@ much as a Makefile is.
   `cached_registry_template("localhost:5000/good/ubuntu:24.04", "x86_64", &store)`.
   Expect `None`. Today it returns the entry whose `origin` is
   `localhost:5000/evil/x:1`.
+- Fixed in card #480. `origin` could not carry the check: a build writes its
+  source there, and a source may be a URL or a reference. A pull now records
+  the repository it was given, `host/owner/name`, as `pulled_from` in the
+  version's `template.wcl`, from the reference and never from the config
+  blob. `cached_registry_template` and `ensure_registry_template` take a
+  version for a registry reference only when it was pulled from that
+  repository or was not pulled at all (a build or an import is the user's
+  own). Where another repository's entry is the newest match of a pin, the
+  newest entry of the named repository is taken, so the hostile entry cannot
+  hide it. A pull that finds its slot holding a version pulled from another
+  repository is refused and names that repository, with the same disk too,
+  since the held metadata and variants are the other publisher's.
+  `ensure_registry_template` returns exactly the version its pull installed,
+  where it used a pin resolution that preferred a `<version>.<N>` sub-build.
+  Tests: `a_cached_registry_reference_is_not_served_from_another_repository`
+  and `a_pull_does_not_use_a_version_another_repository_installed`
+  (`src/oci/client.rs`), `round_trip_pulled_from` (`src/template/meta.rs`).
+  The two client tests failed before the fix (the lookup returned the entry
+  from `evil/x`, the second pull succeeded) and pass after it.
+  - Not fixed here: a local reference (`x86_64/ubuntu`) still resolves to the
+    newest version of that name whoever published it. It names the store
+    slot by design, and `vmlab template list` shows the origin.
+  - Not fixed here: a version pulled before this change has no `pulled_from`
+    and is treated as the user's own. Pull it again with `--overwrite` to
+    record its repository.
+  - Not fixed here: a pull still merges variants into a version that was
+    built or imported locally when the base disk is the same. An archive
+    given to `template import` can state any `pulled_from`.
+  - Changed behaviour: the same artefact published under two repositories
+    can no longer share one store version. The second pull is refused.
 
 ### F4. The config blob's VARS file is decompressed with no limit (security, crash)
 

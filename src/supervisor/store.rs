@@ -817,6 +817,7 @@ mod tests {
             created: chrono::Utc::now(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,

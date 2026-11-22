@@ -219,9 +219,6 @@ impl Registry {
         }
     }
 
-    pub fn repository(&self) -> &str {
-        &self.reference.repository
-    }
     pub fn tag(&self) -> &str {
         &self.reference.tag
     }
@@ -675,7 +672,11 @@ impl Registry {
         let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let vars = config.vars()?;
-        let meta = config.into_meta(Some(self.reference.canonical()))?;
+        let mut meta = config.into_meta(Some(self.reference.canonical()))?;
+        // Who published it, from the reference and never from the blob: the
+        // blob chooses the store name and version, so this is what keeps the
+        // entry from standing for another repository's reference.
+        meta.pulled_from = Some(self.reference.source());
         crate::template::trust::names(&meta)?;
         let trusted = crate::template::trust::repository_trusted(
             &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
@@ -795,6 +796,20 @@ impl Registry {
         } else {
             dest_store.installed(&meta.arch, &meta.name, &meta.version)?
         };
+        // A version another repository put there is not this reference's,
+        // whatever its disk: its metadata and its variants are that
+        // repository's. It is refused rather than used or merged into.
+        if let Some(other) = local
+            .as_ref()
+            .and_then(|l| l.meta.pulled_from_other(&self.reference.source()))
+        {
+            bail!(
+                "template {reference} is already in the store, pulled from {other}, and {} \
+                 states the same name and version — remove it first, or pull with overwrite \
+                 to replace it",
+                self.reference.canonical()
+            );
+        }
         if let Some(local) = &local {
             let held = local.clone();
             let whole = whole.clone();
@@ -1219,18 +1234,42 @@ pub fn cached_registry_template(
     arch: &str,
     store: &TemplateStore,
 ) -> Result<Option<crate::template::store::TemplateVersion>> {
-    let registry = Registry::new(reference)?;
-    // Templates live at `host/owner/[group/]name:VERSION`; the store name is
-    // the last repository path component.
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    Ok(store
-        .resolve_version(arch, &store_name, Some(registry.tag()))
-        .ok())
+    let reference = Reference::parse(reference)?;
+    Ok(held_for(&reference, arch, store, &reference.tag))
+}
+
+/// The store version the registry `reference` stands for at version `pin`,
+/// offline. Templates live at `host/owner/[group/]name:VERSION`; the store
+/// name is the last repository path component.
+///
+/// A version pulled from another repository is never the answer
+/// ([`TemplateMeta::pulled_from_other`]): its config blob chose the name and
+/// version it sits under. Where such a version is the newest match of the
+/// pin, the newest one this reference can stand for is taken instead, so the
+/// other repository cannot hide it either.
+fn held_for(
+    reference: &Reference,
+    arch: &str,
+    store: &TemplateStore,
+    pin: &str,
+) -> Option<crate::template::store::TemplateVersion> {
+    let name = reference.repository.rsplit('/').next().unwrap_or_default();
+    let source = reference.source();
+    let newest = store.resolve_version(arch, name, Some(pin)).ok()?;
+    if newest.meta.pulled_from_other(&source).is_none() {
+        return Some(newest);
+    }
+    let mut held = Vec::new();
+    for version in store.versions_of(arch, name).unwrap_or_default() {
+        if let Ok(Some(v)) = store.installed(arch, name, &version)
+            && v.meta.pulled_from_other(&source).is_none()
+        {
+            held.push(v);
+        }
+    }
+    let versions: Vec<String> = held.iter().map(|v| v.meta.version.clone()).collect();
+    let version = crate::template::store::resolve_version_pin(&versions, pin)?;
+    held.into_iter().find(|v| v.meta.version == version)
 }
 
 /// Resolve a `registry` template reference to a cached store entry, pulling it
@@ -1260,12 +1299,6 @@ pub async fn ensure_registry_template(
         return Ok(r);
     }
     let registry = Registry::new(reference)?;
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
     // Not cached. Resolve the requested tag against the registry's published
     // tags first: a version pin (e.g. 26100.1742, or 24.04) resolves to the
     // version `latest` names when it falls under the pin, else to the newest
@@ -1282,7 +1315,7 @@ pub async fn ensure_registry_template(
         .resolve_version(Some(arch))
         .await
         .with_context(|| format!("resolving {reference}"))?;
-    if let Ok(r) = store.resolve_version(arch, &store_name, Some(&real))
+    if let Some(r) = held_for(&registry.reference, arch, store, &real)
         && want.held_by(&r.meta)
     {
         return Ok(r);
@@ -1297,7 +1330,19 @@ pub async fn ensure_registry_template(
         .pull_with_progress(Some(arch), store, work.path(), false, want, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
-    store.resolve_version(&meta.arch, &meta.name, Some(&meta.version))
+    // Exactly the version the pull installed or found held. A pin
+    // resolution here would prefer a `<version>.<N>` sub-build, which another
+    // repository may have put in the store.
+    store
+        .installed(&meta.arch, &meta.name, &meta.version)?
+        .ok_or_else(|| {
+            anyhow!(
+                "template {}/{}@{} is not in the store after its pull",
+                meta.arch,
+                meta.name,
+                meta.version
+            )
+        })
 }
 
 /// `sha256:<hex>` of a byte slice.
@@ -2393,6 +2438,7 @@ mod tests {
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -2838,6 +2884,121 @@ mod tests {
         assert!(err.contains("different disk"), "{err}");
     }
 
+    /// Push a template under `reference`, with the name and version its
+    /// config blob states chosen freely, as a repository can.
+    async fn push_stating(
+        fake: &std::sync::Arc<FakeRegistry>,
+        reference: &str,
+        name: &str,
+        version: &str,
+        disk: &[u8],
+    ) {
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.name = name.into();
+        m.version = version.into();
+        make_template(&tdir, &m, disk);
+        registry_with_fake(reference, fake.clone())
+            .push(&tdir, 1024, "x86_64", &work.path().join("push"), None, None)
+            .await
+            .unwrap();
+    }
+
+    /// F3 of docs/reviews/templates-registry.md. The store slot comes from
+    /// the config blob, so `evil/x` can state `ubuntu` at a version under the
+    /// pin `24.04`. The offline lookup of `good/ubuntu:24.04` must not take
+    /// it, and it must not hide what `good/ubuntu` itself put in the store.
+    #[tokio::test]
+    async fn a_cached_registry_reference_is_not_served_from_another_repository() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let want = VariantWant::default();
+        let good = "localhost:5000/good/ubuntu:24.04";
+
+        push_stating(
+            &fake,
+            "localhost:5000/evil/x:1",
+            "ubuntu",
+            "24.04.9",
+            b"evil",
+        )
+        .await;
+        let (pulled, _) = pull_want(&fake, "localhost:5000/evil/x:1", &store, &want)
+            .await
+            .unwrap();
+        assert_eq!(
+            (pulled.name.as_str(), pulled.version.as_str()),
+            ("ubuntu", "24.04.9")
+        );
+        assert_eq!(pulled.pulled_from.as_deref(), Some("localhost:5000/evil/x"));
+
+        let served = cached_registry_template(good, "x86_64", &store).unwrap();
+        assert!(
+            served.is_none(),
+            "{good} resolved to the entry pulled from {:?}",
+            served.map(|v| v.meta.origin)
+        );
+
+        // What the named repository published is found under the entry that
+        // sorts above it.
+        push_stating(
+            &fake,
+            "localhost:5000/good/ubuntu:24.04.3",
+            "ubuntu",
+            "24.04.3",
+            b"good",
+        )
+        .await;
+        pull_want(&fake, "localhost:5000/good/ubuntu:24.04.3", &store, &want)
+            .await
+            .unwrap();
+        let served = cached_registry_template(good, "x86_64", &store)
+            .unwrap()
+            .expect("the version good/ubuntu published is in the store");
+        assert_eq!(served.meta.version, "24.04.3");
+        assert_eq!(
+            served.meta.pulled_from.as_deref(),
+            Some("localhost:5000/good/ubuntu")
+        );
+    }
+
+    /// F3, the pull side: a version another repository installed is not this
+    /// reference's even with the same disk, since its metadata and variants
+    /// are that repository's. The pull is refused and names the repository.
+    /// The same repository pulls onto its own version as before.
+    #[tokio::test]
+    async fn a_pull_does_not_use_a_version_another_repository_installed() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let want = VariantWant::default();
+        for reference in ["ghcr.io/evil/alpine:3.20", "ghcr.io/owner/alpine:3.20"] {
+            push_stating(&fake, reference, "alpine", "3.20", b"same disk").await;
+        }
+        pull_want(&fake, "ghcr.io/evil/alpine:3.20", &store, &want)
+            .await
+            .unwrap();
+        pull_want(&fake, "ghcr.io/evil/alpine:3.20", &store, &want)
+            .await
+            .expect("a repository pulls onto its own version");
+
+        let err = pull_want(&fake, "ghcr.io/owner/alpine:3.20", &store, &want)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pulled from ghcr.io/evil/alpine"), "{err}");
+        let held = store
+            .installed("x86_64", "alpine", "3.20")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.meta.pulled_from.as_deref(),
+            Some("ghcr.io/evil/alpine")
+        );
+    }
+
     #[tokio::test]
     async fn pull_reports_progress() {
         let fake = std::sync::Arc::new(FakeRegistry::default());
@@ -3115,6 +3276,7 @@ mod tests {
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -3780,6 +3942,7 @@ mod tests {
             assert_eq!(pulled.effective(Some(got)), {
                 let mut e = m.effective(Some(v));
                 e.origin = pulled.origin.clone();
+                e.pulled_from = pulled.pulled_from.clone();
                 e
             });
             assert_eq!(got.description, v.description);
