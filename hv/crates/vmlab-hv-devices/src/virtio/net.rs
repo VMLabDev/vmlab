@@ -3415,6 +3415,53 @@ mod tests {
     }
 
     #[test]
+    fn a_load_does_not_resume_a_frame_the_stream_no_longer_holds() {
+        let mut f = Fixture::new();
+        let _switch = f.take_switch_side();
+        f.dev.quiesce();
+        let address = f.data(2);
+        f.vqs[0].add_chain(&f.mem, &[(address, 64, true)]);
+
+        let (mut peer, mut socket) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        peer.write_all(&8u32.to_be_bytes()).unwrap();
+        peer.write_all(b"old ").unwrap();
+        read_frames(&f.dev.shared, &mut socket).unwrap();
+        lock(&f.dev.shared).tx_out.extend_from_slice(b"old tail");
+        let snapshot = f.dev.save_state().unwrap();
+
+        // The live stream has since completed both frames.
+        peer.write_all(b"body").unwrap();
+        read_frames(&f.dev.shared, &mut socket).unwrap();
+        flush_tx(&f.dev.shared, &mut socket).unwrap();
+        let mut tail = [0; 8];
+        peer.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"old tail");
+
+        f.dev.restore_state(&snapshot).unwrap();
+        flush_tx(&f.dev.shared, &mut socket).unwrap();
+        let tx = peer.read(&mut tail);
+        let frame = b"new frame";
+        peer.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(frame).unwrap();
+        assert_eq!(
+            read_frames(&f.dev.shared, &mut socket),
+            Ok(()),
+            "restore lost receive framing"
+        );
+        assert_eq!(tx.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+
+        lock(&f.dev.shared).snapshot_paused = false;
+        place_rx_frames(&f.dev.shared, 12, true, false);
+        assert_eq!(f.vqs[0].used_idx(&f.mem), 1);
+        let mut received = [0; 9];
+        f.mem
+            .read_slice(&mut received, GuestAddress(address + 12))
+            .unwrap();
+        assert_eq!(&received, frame);
+    }
+
+    #[test]
     fn partial_transmit_writes_and_snapshot_retain_exactly_the_unsent_suffix() {
         let expected: Vec<_> = (0..MAX_TX_STAGE).map(|index| (index % 251) as u8).collect();
         let directory = TempDir::new();
