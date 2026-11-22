@@ -2666,6 +2666,75 @@ mod tests {
         );
     }
 
+    /// A version-3 qcow2 header, with the external-data-file feature bit
+    /// when `bit`, the data-file extension naming `/etc/hostname` when
+    /// `extension`, and `backing` as its backing file name.
+    fn qcow2_header(bit: bool, extension: bool, backing: Option<&str>) -> Vec<u8> {
+        let mut bytes = vec![0; 104];
+        bytes[..4].copy_from_slice(b"QFI\xfb");
+        bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&16u32.to_be_bytes());
+        if bit {
+            bytes[72..80].copy_from_slice(&(1u64 << 2).to_be_bytes());
+        }
+        bytes[100..104].copy_from_slice(&104u32.to_be_bytes());
+        if extension {
+            let name = b"/etc/hostname";
+            bytes.extend_from_slice(&0x4441_5441u32.to_be_bytes());
+            bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(name);
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+        }
+        // The end-of-extensions marker.
+        bytes.extend_from_slice(&[0; 8]);
+        if let Some(backing) = backing {
+            let offset = bytes.len() as u64;
+            bytes[8..16].copy_from_slice(&offset.to_be_bytes());
+            bytes[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(backing.as_bytes());
+        }
+        bytes.resize(512, 0);
+        bytes
+    }
+
+    // Review templates-registry F7.
+    #[test]
+    fn a_base_with_an_external_data_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join(DISK_FILE);
+        fs::write(&disk, qcow2_header(false, false, None)).unwrap();
+        verify_base(&disk).unwrap();
+        for (bit, extension) in [(true, true), (true, false), (false, true)] {
+            fs::write(&disk, qcow2_header(bit, extension, None)).unwrap();
+            let err = verify_base(&disk).expect_err(&format!("bit {bit}, extension {extension}"));
+            assert!(format!("{err:#}").contains("external data file"), "{err:#}");
+        }
+    }
+
+    // Review templates-registry F7: the same for a variant overlay whose
+    // backing name is the correct one.
+    #[test]
+    fn a_variant_with_an_external_data_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(DISK_FILE), qcow2_header(false, false, None)).unwrap();
+        let base_sha = sha256_file(&dir.path().join(DISK_FILE)).unwrap();
+        let overlay = dir.path().join(variant_disk_rel("standard"));
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        let staged = |bit: bool, extension: bool| {
+            fs::write(&overlay, qcow2_header(bit, extension, Some(VARIANT_BACKING))).unwrap();
+            let mut variant = variant_meta("standard", true, &base_sha);
+            variant.sha256 = sha256_file(&overlay).unwrap();
+            let mut m = meta("x86_64", "win", "1");
+            m.variants = vec![variant];
+            verify_variants(dir.path(), &m, Some(&base_sha))
+        };
+        staged(false, false).unwrap();
+        for (bit, extension) in [(true, true), (true, false), (false, true)] {
+            let err = staged(bit, extension).expect_err(&format!("bit {bit}, extension {extension}"));
+            assert!(format!("{err:#}").contains("external data file"), "{err:#}");
+        }
+    }
+
     #[test]
     fn untrusted_base_refuses_backing_and_malformed_fields() {
         let dir = tempfile::tempdir().unwrap();
