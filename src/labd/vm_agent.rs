@@ -3044,6 +3044,89 @@ mod tests {
         assert!(handle.ping(Duration::from_secs(2)).await);
     }
 
+    /// What `mock:small-frames` and `mock:mixed-frames` send: more frames
+    /// than one session queue holds, of one byte each.
+    const SMALL_FRAMES: usize = SESSION_QUEUE + 500;
+
+    /// One channel holds more frames than its queue while nobody reads it.
+    /// The reader goes on to the frames behind them: a pong arrives inside
+    /// the ping's budget and a second channel opens and delivers. The first
+    /// channel is intact, since its frames fit the window (review of the
+    /// guest agents, F5).
+    #[tokio::test]
+    async fn a_full_session_queue_does_not_delay_a_pong() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut full = handle
+            .open_exec(vec!["mock:small-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        // `full` is not read. The pong and the second channel's frames are
+        // behind its frames on the stream.
+        assert!(
+            handle.ping(Duration::from_secs(2)).await,
+            "the pong waited behind a channel nobody reads"
+        );
+        let mut other = tokio::time::timeout(Duration::from_secs(2), handle.open_terminal(80, 24, None, vec![], None))
+            .await
+            .expect("a second channel did not open while the first was full")
+            .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), other.recv())
+            .await
+            .expect("the second channel delivered nothing while the first was full");
+        assert!(matches!(ev, Some(SessionEvent::Data(_))), "{ev:?}");
+
+        // Every byte of the first channel is still there, in order.
+        let mut got = 0usize;
+        while got < SMALL_FRAMES {
+            let ev = tokio::time::timeout(Duration::from_secs(5), full.recv())
+                .await
+                .expect("the first channel lost what it had queued");
+            match ev {
+                Some(SessionEvent::Data(b)) => {
+                    assert!(b.iter().all(|&c| c == b's'));
+                    got += b.len();
+                }
+                other => panic!("the first channel ended early: {other:?}"),
+            }
+        }
+        assert_eq!(got, SMALL_FRAMES);
+    }
+
+    /// Frames the queue cannot merge (stdout and stderr in turn) pass its
+    /// depth while nobody reads: the reader closes that one channel at once,
+    /// with an error that says why, and the connection goes on (F5).
+    #[tokio::test]
+    async fn a_channel_that_overfills_its_queue_is_closed_without_a_wait() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = handle
+            .open_exec(vec!["mock:mixed-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        assert!(
+            handle.ping(Duration::from_secs(2)).await,
+            "the pong waited behind a channel nobody reads"
+        );
+        assert!(
+            !handle.inner.sessions.lock().await.contains_key(&session.id),
+            "the host kept a channel whose queue overflowed"
+        );
+        let mut events = 0usize;
+        let error = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), session.recv())
+                .await
+                .expect("the session did not end");
+            match ev {
+                Some(SessionEvent::Data(_) | SessionEvent::Stderr(_)) => events += 1,
+                Some(SessionEvent::Error(msg)) => break msg,
+                other => panic!("the session ended without an error: {other:?}"),
+            }
+        };
+        assert!(error.contains("queue"), "{error}");
+        assert!(events <= SESSION_QUEUE, "{events} events sat in one queue");
+    }
+
     /// A minimal in-process agent speaking the real frame protocol over a
     /// unix socket, mirroring what `guest/agent` does: echo terminals,
     /// canned exec output, in-memory file store.
@@ -3224,6 +3307,29 @@ mod tests {
                                                     &chunk,
                                                 ))
                                                 .await;
+                                        }
+                                        continue;
+                                    }
+                                    // `mock:small-frames` and
+                                    // `mock:mixed-frames`: more frames than
+                                    // one session queue holds, one byte
+                                    // each, so far inside the window. The
+                                    // first is all stdout; the second
+                                    // alternates stdout and stderr.
+                                    if let Some(mixed) = match argv.first().map(String::as_str) {
+                                        Some("mock:small-frames") => Some(false),
+                                        Some("mock:mixed-frames") => Some(true),
+                                        _ => None,
+                                    } {
+                                        let mut w = tx.lock().await;
+                                        for n in 0..SMALL_FRAMES {
+                                            let kind = if mixed && n % 2 == 1 {
+                                                FrameKind::DataErr
+                                            } else {
+                                                FrameKind::Data
+                                            };
+                                            let _ =
+                                                w.write_all(&encode_frame(kind, id, b"s")).await;
                                         }
                                         continue;
                                     }
