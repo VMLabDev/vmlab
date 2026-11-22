@@ -64,8 +64,10 @@ pub async fn pull(
     // rename (the OCI module documents this), and each pull gets its own
     // directory so a concurrent one cannot delete it.
     let work = fresh_work_dir(&crate::paths::template_store_dir().join(".oci-pull"))?;
+    let work = std::sync::Arc::new(work);
     registry
         .guarding(in_use)
+        .holding(work.clone())
         .pull_with_progress(arch, store, work.path(), overwrite, &want, &mut |_| {})
         .await
 }

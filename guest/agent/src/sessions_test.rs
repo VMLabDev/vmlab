@@ -307,6 +307,39 @@ fn exec_streams_stdio_and_exit_code() {
 }
 
 #[test]
+fn an_exec_reports_its_exit_while_a_background_child_holds_the_pipe() {
+    let keep_running = tempfile::tempdir().unwrap();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 4,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "(while [ -d \"$1\" ]; do sleep 1; done) & \
+                 printf stdout; printf stderr >&2; exit 3"
+                    .into(),
+                "sh".into(),
+                keep_running.path().to_str().unwrap().into(),
+            ],
+            env: vec![],
+            cwd: None,
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
+    // The background child keeps both pipes open until this directory drops.
+    let (out, err, code) = cap.until_exited(4);
+    assert_eq!(code, 3);
+    assert_eq!(out, b"stdout");
+    assert_eq!(err, b"stderr");
+}
+
+#[test]
 fn stdin_after_the_child_closed_it_is_still_credited() {
     let (mux, mut cap) = capture_mux();
     let p = platform();

@@ -6,15 +6,19 @@
 //! The process comes from the [`Spawner`] seam, so this plumbing is the same
 //! on both guest targets.
 
-use std::io::Write;
-use std::sync::Arc;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use vmlab_agent_proto::{AgentMsg, FrameKind, RecvWindow};
 
-use crate::mux::{Input, Mux, pump_out};
+use crate::mux::{Input, Mux, pump_out_with};
 use crate::spawn::{Identity, ProcessSpec, Spawned, Spawner};
+
+// As with terminals, a descendant can keep the output pipes open after exit.
+const DRAIN: Duration = Duration::from_secs(2);
 
 pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec: ProcessSpec) {
     let mux = &mux.for_channel(id);
@@ -86,17 +90,31 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
     }
 
     // stdout / stderr pumps.
-    let out_pump = {
+    let (pumped, pumps) = mpsc::channel::<()>();
+    let accepting_output = Arc::new(Mutex::new(true));
+    let start_pump = |kind, pipe: Box<dyn Read + Send>| {
         let (mux, credit) = (mux.clone(), credit.clone());
-        thread::spawn(move || pump_out(&mux, id, FrameKind::Data, &credit, output))
+        let accepting_output = accepting_output.clone();
+        let pumped = pumped.clone();
+        thread::spawn(move || {
+            pump_out_with(&credit, pipe, |bytes| {
+                let accepting = accepting_output.lock().unwrap();
+                if *accepting {
+                    mux.send_data(kind, id, bytes);
+                }
+                *accepting
+            });
+            drop(pumped);
+        });
     };
+    start_pump(FrameKind::Data, output);
     // An exec always asks the seam for piped stderr; an adapter that has
     // none simply produces no DATA_ERR frames rather than taking the agent
     // down.
-    let err_pump = errors.map(|errors| {
-        let (mux, credit) = (mux.clone(), credit.clone());
-        thread::spawn(move || pump_out(&mux, id, FrameKind::DataErr, &credit, errors))
-    });
+    if let Some(errors) = errors {
+        start_pump(FrameKind::DataErr, errors);
+    }
+    drop(pumped);
 
     // Reaper: wait for exit, let the output pumps flush what the pipes still
     // hold, then report and clean up.
@@ -104,14 +122,13 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
     thread::spawn(move || {
         let code = wait();
         done.store(true, Ordering::SeqCst);
-        let _ = out_pump.join();
-        if let Some(err_pump) = err_pump {
-            let _ = err_pump.join();
+        if let Err(mpsc::RecvTimeoutError::Timeout) = pumps.recv_timeout(DRAIN) {
+            // Stop forwarding before queuing EOF, including frames whose
+            // pumps already took credit. Closing credit wakes stalled pumps.
+            *accepting_output.lock().unwrap() = false;
+            credit.close();
         }
-        // Both pipes are drained: the channel's guest→host bytes are
-        // complete. A consumer that only wants the output no longer has to
-        // read `exited` to learn that. The channel-bound mux suppresses both
-        // messages if the host already closed the channel.
+        // The channel-bound mux suppresses both messages after host close.
         mux.send_ctrl(&AgentMsg::Eof { id });
         mux.send_ctrl(&AgentMsg::Exited { id, code });
         mux.remove_finished(id);

@@ -577,6 +577,13 @@ long proc_read(struct plat_proc *p, int which, void *buf, long cap)
     return (long)got;
 }
 
+long proc_output_pending(struct plat_proc *p, int which)
+{
+    HANDLE h = which ? p->err_r : p->out_r;
+    DWORD avail = 0;
+    return PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) ? (long)avail : 0;
+}
+
 void proc_write_in(struct plat_proc *p, const void *buf, long len)
 {
     long keep = 0;

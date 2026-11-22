@@ -367,6 +367,10 @@ Not read:
 
 ### F9. An exec does not report its exit while a background child holds its output pipe
 
+- Status: fixed in card #526. The Rust agent gives both output pumps one
+  two-second drain window after process exit and stops forwarding before
+  sending EOF and the exit code. The legacy agent drains the bytes buffered
+  at exit, regardless of whether a descendant keeps the pipes open.
 - Where: `guest/agent/src/exec.rs:100-114` (the reaper joins both output
   pumps before it sends `exited`). The legacy agent has the same rule at
   `guest/agent-legacy/src/agent.c:590`.
@@ -380,9 +384,11 @@ Not read:
 - Severity: wrong result. A provision step that starts a daemon fails on its
   timeout.
 - Confidence: high.
-- Test: `an_exec_reports_its_exit_while_a_background_child_holds_the_pipe`
-  in `guest/agent/src/sessions_test.rs`. Run
-  `sh -c 'sleep 30 & exit 3'`. Assert `exited` with code 3 within 5 s.
+- Tests: `an_exec_reports_its_exit_while_a_background_child_holds_the_pipe`
+  in `guest/agent/src/sessions_test.rs` and
+  `legacy_exec_reports_exit_with_inherited_output_pipes` in
+  `src/labd/legacy_agent_tests.rs`. Assert stdout, stderr and exit code 3
+  while a descendant still holds the pipes open.
 
 ### F10. An exec with stdin can deadlock, and the timeout does not cover it
 
