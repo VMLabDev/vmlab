@@ -26,8 +26,14 @@ This requires Docker, the local Windows 11 `standard` template, and config-weave
 Windows executable. See `guest/vdisplay-windows/README.md` for the pinned build
 lab and the MSVC alternative. Guest packaging refuses a missing or stale signed
 package. `VMLAB_VDISPLAY_PACKAGE_DIR` selects a separately built package.
-Release CI supplies that package through its Ubuntu compile and Windows signing
-jobs before running `guest-package`.
+GitHub builds no version any more: `just release::local --display rebuild` runs
+that rebuild before the build.
+
+A version for publishing is `just release::local`, which wraps `buildbox::dist`:
+it calculates the version, builds here, and puts the four assets with
+`SHA256SUMS`, `provenance.json` and the signature into a release directory.
+`just release::publish` uploads that directory. See
+`docs/agents/release-gate.md`.
 
 ```sh
 just buildbox::image          # build the image (tag: $VMLAB_BUILD_IMAGE, default vmlab-build)
@@ -56,7 +62,7 @@ was.
 ## How it runs
 
 To build only the hypervisor bundle, rebuild the image after native dependency
-changes, then use the same recipe as release CI:
+changes, then use the recipe of the release build:
 
 ```sh
 just buildbox::image
@@ -94,8 +100,8 @@ bash guest/build-firmware.sh x86_64
 
 The image and `build/run.sh` set `VMLAB_BUILD_ENV=1`. Firmware runs directly
 when that marker is present, so `buildbox::dist` does not start a nested
-container. The release CI job sets the same marker because it installs the
-toolchains directly on its runner.
+container. A host with the toolchains installed directly can set the same
+marker.
 
 The container setup:
 
