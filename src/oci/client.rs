@@ -4872,25 +4872,31 @@ mod tests {
             .variant_disk("standard");
         let digest_b = push_rebuilt_standard(&fake, work.path()).await;
 
-        // The in-use check runs on the install thread, after the overlay is
-        // staged and before it moves into the store. It says where it is
-        // and waits there.
-        let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
-        let (release, released) = tokio::sync::watch::channel(false);
-        let in_use: crate::template::build::InUse = std::sync::Arc::new(move |_| {
-            let reached_tx = reached_tx.clone();
-            let mut released = released.clone();
-            Box::pin(async move {
-                let _ = reached_tx.send(());
-                let _ = released.wait_for(|go| *go).await;
-                None
-            })
-        });
-
         let op = std::sync::Arc::new(
             crate::template::oci_bridge::fresh_work_dir(&store.root().join(".oci-pull")).unwrap(),
         );
         let op_dir = op.path().to_path_buf();
+        let staged = op_dir.join("staging").join(variant_disk_rel("standard"));
+
+        // The pull asks the in-use check twice: before the download, and on
+        // the install thread once the overlay is staged, before it moves
+        // into the store. The second says where it is and waits there.
+        let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let seen = staged.clone();
+        let in_use: crate::template::build::InUse = std::sync::Arc::new(move |_| {
+            let reached_tx = reached_tx.clone();
+            let mut released = released.clone();
+            let installing = seen.is_file();
+            Box::pin(async move {
+                if installing {
+                    let _ = reached_tx.send(());
+                    let _ = released.wait_for(|go| *go).await;
+                }
+                None
+            })
+        });
+
         let registry = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
             .guarding(in_use)
             .holding(op);
@@ -4908,11 +4914,10 @@ mod tests {
                 )
                 .await
         });
-        reached.recv().await.expect("the install asks the in-use check");
+        reached.recv().await.expect("the install asks the check");
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
 
-        let staged = op_dir.join("staging").join(variant_disk_rel("standard"));
         assert!(
             staged.is_file(),
             "the cancel removed {} under the running install",
