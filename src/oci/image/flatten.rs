@@ -133,7 +133,8 @@ fn survey_layers(
     let mut entries: u64 = 0;
     let mut unpacked_left = limits.unpacked_bytes;
     for (i, (path, media_type)) in layers.iter().enumerate() {
-        let mut reader = LayerStream::hashed(layer_reader(path, media_type)?, cancel, unpacked_left);
+        let mut reader =
+            LayerStream::hashed(layer_reader(path, media_type)?, cancel, unpacked_left);
         {
             let mut archive = tar::Archive::new(&mut reader);
             for entry in archive
@@ -640,7 +641,13 @@ mod tests {
             .build(tmp.path(), "layer1.tar", false);
 
         let dest = tmp.path().join("rootfs.sqfs");
-        flatten_to_squashfs(&[(l0, m0), (l1, m1)], &[d0, d1], &dest, &AtomicBool::new(false)).unwrap();
+        flatten_to_squashfs(
+            &[(l0, m0), (l1, m1)],
+            &[d0, d1],
+            &dest,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(dest.is_file());
         assert!(std::fs::metadata(&dest).unwrap().len() > 0);
 
@@ -692,7 +699,13 @@ mod tests {
             .build(tmp.path(), "l1.tar.gz", true);
 
         let dest = tmp.path().join("out.sqfs");
-        flatten_to_squashfs(&[(l0, m0), (l1, m1)], &[d0, d1], &dest, &AtomicBool::new(false)).unwrap();
+        flatten_to_squashfs(
+            &[(l0, m0), (l1, m1)],
+            &[d0, d1],
+            &dest,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         if !have("unsquashfs") {
             return;
@@ -713,8 +726,7 @@ mod tests {
                 .file("x", 0o644, 0, b"x")
                 .build(tmp.path(), "l0.tar.gz", true);
         let bogus = format!("sha256:{}", "0".repeat(64));
-        let err =
-            flatten_to_squashfs(
+        let err = flatten_to_squashfs(
             &[(l0, m0)],
             &[bogus],
             &tmp.path().join("out.sqfs"),
@@ -802,7 +814,10 @@ mod tests {
         let err = survey_layers(&layers, &diff_ids, &limits, &cancel)
             .err()
             .expect("101 entries pass a limit of 100");
-        assert!(format!("{err:#}").contains("more than 100 entries"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("more than 100 entries"),
+            "{err:#}"
+        );
 
         // One entry that names many directories: the paths are counted too.
         let deep = (0..200).map(|i| format!("d{i}")).collect::<Vec<_>>();
@@ -813,7 +828,10 @@ mod tests {
         let err = survey_layers(&[(path, media)], &[diff_id], &limits, &cancel)
             .err()
             .expect("200 paths pass a limit of 100");
-        assert!(format!("{err:#}").contains("more than 100 paths"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("more than 100 paths"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -860,7 +878,10 @@ mod tests {
         let err = survey_layers(&[(p0, m0), (p1, m1)], &[d0, d1], &limits, &cancel)
             .err()
             .expect("80 KiB pass a limit of 64 KiB");
-        assert!(format!("{err:#}").contains("unpack to more bytes"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("unpack to more bytes"),
+            "{err:#}"
+        );
     }
 
     /// Review F6: the flatten runs on a blocking thread, which an aborted

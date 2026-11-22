@@ -266,8 +266,8 @@ pub(crate) async fn pull_with_transport(
             flatten_to_squashfs(&layer_files, &diff_ids, &dest, &cancel)
         })
         .await
-            .context("flatten task panicked")?
-            .with_context(|| format!("flattening {reference}"))?;
+        .context("flatten task panicked")?
+        .with_context(|| format!("flattening {reference}"))?;
     }
     drop(holds);
 
