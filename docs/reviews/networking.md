@@ -35,7 +35,7 @@ Who the attacker is, per finding:
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache |
 | F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet |
 | F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease (fixed in card #501) |
-| F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards |
+| F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards (fixed in card #502) |
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
 | F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again |
@@ -405,6 +405,32 @@ Who the attacker is, per finding:
   `handle_frame` with a frame from `attacker_mac` with source `victim_ip`,
   then `open_tcp_to_guest(victim_ip, 22)`. Assert the SYN's destination MAC
   is `victim_mac`. Today it is `attacker_mac`.
+- Fixed in card #502, in three places, each with the knowledge vmlab already
+  had.
+  1. The switch drops a guest port's frame whose source MAC a service port
+     holds, and leaves the MAC where it is. `Gateway::spawn` binds the
+     gateway MAC to its port with `Switch::bind_mac` before any frame, so a
+     guest cannot claim it first. A MAC learned behind a trunk is held the
+     same way. A MAC still moves between two guest ports and between two
+     service ports.
+  2. The NAT engine keeps the address the lab daemon bound with `learn_mac`
+     (the MAC of the NIC that holds the lease, set when a forward is
+     installed): a frame from another MAC no longer changes where a forward's
+     SYN goes. An address nobody bound is still learned from frames.
+  3. The gateway drops an ARP or an IPv4 frame whose source address is under
+     a DHCP lease of another MAC (`DhcpServer::leased_to_another`), before
+     the neighbour table, DNS, NAT and routing see it.
+  Both proof tests failed before the change and pass after it, with
+  `a_bound_mac_is_held_before_its_port_speaks` in `src/net/switch.rs` and
+  `an_arp_cannot_claim_a_leased_address` and
+  `a_leased_source_address_needs_its_holders_mac` in `src/net/gateway.rs`.
+  Not covered: an address with no lease and no forward (a static one) has no
+  owner vmlab knows, so the last frame or ARP still wins for it. Two guests on
+  non-isolated ports can still take each other's MAC in the switch, because a
+  MAC that moves between guest ports is also what a restarted machine and a
+  failover address do. The lease check is only as strong as the lease, which
+  the fix of F8 in card #501 now ties to the ethernet source of the DHCP
+  message.
 
 ### F10. IP fragments evade port rules on routed traffic (security, guest)
 
