@@ -55,6 +55,60 @@ const JITTER_MS: u32 = 2000;
 #[cfg(test)]
 const JITTER_MS: u32 = 100;
 
+/// How many connections the trunk listener holds that have not finished the
+/// handshake. A connection costs a descriptor and a task for up to
+/// `trunk_auth::TIMEOUT` before its peer has proved anything, and the
+/// listener is open to every host that reaches the port
+/// (docs/reviews/networking.md F11). A real peer dials once per segment and
+/// finishes in milliseconds, and it dials again after `REDIAL_DELAY` when it
+/// is refused.
+const PREAUTH_MAX: usize = 32;
+/// The share of [`PREAUTH_MAX`] one remote address may hold, so that one
+/// address cannot shut the others out.
+const PREAUTH_MAX_PER_ADDR: usize = 8;
+
+/// The connections the trunk listener holds before authentication, counted
+/// per remote address.
+#[derive(Default)]
+struct PreAuth {
+    held: std::sync::Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl PreAuth {
+    /// A slot for a new connection from `ip`, or `None` when the address or
+    /// the listener holds its limit: the caller drops the connection.
+    fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<PreAuthSlot> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = held.get(&ip).copied().unwrap_or(0);
+        if mine >= PREAUTH_MAX_PER_ADDR || held.values().sum::<usize>() >= PREAUTH_MAX {
+            return None;
+        }
+        held.insert(ip, mine + 1);
+        Some(PreAuthSlot {
+            table: self.clone(),
+            ip,
+        })
+    }
+}
+
+/// One held connection. Dropping it gives the slot back.
+struct PreAuthSlot {
+    table: Arc<PreAuth>,
+    ip: IpAddr,
+}
+
+impl Drop for PreAuthSlot {
+    fn drop(&mut self) {
+        let mut held = self.table.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = held.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// One cross-host trunk slot.
 enum TrunkState {
     /// Our dialer is mid-handshake to this IP.
@@ -918,8 +972,23 @@ pub async fn bind_peer_listener(
     let addr = listener.local_addr()?;
     tracing::info!("cross-host trunk listener on {addr}");
     let handle = tokio::spawn(async move {
+        let preauth = Arc::new(PreAuth::default());
+        let mut errors = crate::net::accept::AcceptErrors::default();
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
+            let (mut stream, remote) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    errors.failed("cross-host trunk listener", &e).await;
+                    continue;
+                }
+            };
+            errors.accepted();
+            // Past the limit the connection is closed here, before it gets a
+            // task or a greeting.
+            let Some(slot) = preauth.admit(remote.ip()) else {
+                tracing::debug!(
+                    "trunk listener: too many unauthenticated connections, {remote} dropped"
+                );
                 continue;
             };
             let globals = globals.clone();
@@ -934,6 +1003,8 @@ pub async fn bind_peer_listener(
                 else {
                     return;
                 };
+                // The peer holds the PSK: it no longer counts.
+                drop(slot);
                 // The peer chose this name, and it names a socket file.
                 if let Err(e) = check_segment_name(&segment) {
                     tracing::warn!("refusing a peer trunk: {e:#}");
@@ -974,9 +1045,6 @@ mod tests {
     use crate::net::framing::{read_frame, write_frame};
     use bytes::Bytes;
     use tokio::time::{Duration, sleep, timeout};
-
-    const PREAUTH_MAX: usize = 32;
-    const PREAUTH_MAX_PER_ADDR: usize = 8;
 
     struct Instance {
         globals: Arc<GlobalSegments>,
