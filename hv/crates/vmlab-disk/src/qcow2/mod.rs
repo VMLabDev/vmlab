@@ -1644,6 +1644,22 @@ mod tests {
     }
 
     #[test]
+    fn compressed_refcounts_end_at_the_last_sector() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let cluster = img.cluster_size;
+        assert_eq!(cluster, 0x10000);
+        // Offset 0x1ff37 with no further sector, moved past the metadata:
+        // the data ends on the boundary of cluster 11.
+        let offset = 10 * cluster + 0xff37;
+        img.set_cluster_refcount(10, 5).unwrap();
+        img.set_cluster_refcount(11, 5).unwrap();
+        img.adjust_compressed_refcounts(COMPRESSED_BIT | offset, 1)
+            .unwrap();
+        assert_eq!(img.get_refcount(10).unwrap(), 6);
+        assert_eq!(img.get_refcount(11).unwrap(), 5);
+    }
+
+    #[test]
     fn compressed_cluster_requires_complete_exact_length_stream() {
         use std::io::Write;
         let (_dir, mut img) = testsupport::blank(8 << 20);
