@@ -315,6 +315,32 @@ impl Qcow2Image {
                 });
             }
         }
+        if u64::from(header_length) > cluster_size {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("header length {header_length} is larger than the cluster"),
+            });
+        }
+        if l1_size > MAX_L1_ENTRIES {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("active L1 table too large ({l1_size} entries)"),
+            });
+        }
+        if u64::from(refcount_table_clusters) * cluster_size > MAX_REFCOUNT_TABLE_BYTES {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!(
+                    "refcount table too large ({refcount_table_clusters} clusters)"
+                ),
+            });
+        }
+        if nb_snapshots > MAX_SNAPSHOTS {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("snapshot table too large ({nb_snapshots} snapshots)"),
+            });
+        }
         const INCOMPAT_CORRUPT: u64 = 1 << 1;
         const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
         const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
@@ -424,16 +450,16 @@ impl Qcow2Image {
                     reason: format!("backing file name too long ({backing_file_size})"),
                 });
             }
-            let start = backing_file_offset as usize;
-            let end = start + backing_file_size as usize;
-            if end > header_cluster.len() {
+            let end = backing_file_offset.checked_add(backing_file_size);
+            let Some(end) = end.filter(|&end| end <= header_cluster.len() as u64) else {
                 return Err(Error::Format {
                     format: "qcow2",
                     reason: format!(
                         "backing file name at {backing_file_offset:#x} is outside the header cluster"
                     ),
                 });
-            }
+            };
+            let (start, end) = (backing_file_offset as usize, end as usize);
             let name = String::from_utf8_lossy(&header_cluster[start..end]).into_owned();
             Some(BackingRef {
                 name,
@@ -1072,7 +1098,13 @@ impl Qcow2Image {
     ) -> Result<Qcow2Image> {
         let cluster_size = 1u64 << cluster_bits;
         let span = (cluster_size / 8) * cluster_size;
-        let l1_size = size.div_ceil(span).max(1) as u32;
+        let l1_entries = size.div_ceil(span).max(1);
+        if l1_entries > u64::from(MAX_L1_ENTRIES) {
+            return Err(Error::Unsupported(format!(
+                "a {size}-byte disk needs an L1 table over the qcow2 limit at cluster_bits {cluster_bits}"
+            )));
+        }
+        let l1_size = l1_entries as u32;
         let l1_clusters = l1_size_as_clusters(l1_size, cluster_size);
 
         let file = OpenOptions::new()
@@ -1221,16 +1253,24 @@ impl Qcow2Image {
         // unknown extensions; QEMU's rebase does the same for formats it
         // rewrites. Keep it simple: rebuild extensions from scratch.
         let mut ext_off = header_len;
-        let add_ext = |hc: &mut [u8], off: &mut usize, et: u32, data: &[u8]| {
+        // A crafted header length can leave no room for the extensions.
+        let add_ext = |hc: &mut [u8], off: &mut usize, et: u32, data: &[u8]| -> Result<()> {
+            let next = *off + 8 + data.len().div_ceil(8) * 8;
+            if next > hc.len() {
+                return Err(Error::Unsupported(
+                    "header extensions do not fit in the header cluster".into(),
+                ));
+            }
             hc[*off..*off + 4].copy_from_slice(&et.to_be_bytes());
             hc[*off + 4..*off + 8].copy_from_slice(&(data.len() as u32).to_be_bytes());
             hc[*off + 8..*off + 8 + data.len()].copy_from_slice(data);
-            *off += 8 + data.len().div_ceil(8) * 8;
+            *off = next;
+            Ok(())
         };
         if let Some(fmt) = format {
-            add_ext(&mut hc, &mut ext_off, EXT_BACKING_FORMAT, fmt.as_bytes());
+            add_ext(&mut hc, &mut ext_off, EXT_BACKING_FORMAT, fmt.as_bytes())?;
         }
-        add_ext(&mut hc, &mut ext_off, EXT_END, &[]);
+        add_ext(&mut hc, &mut ext_off, EXT_END, &[])?;
         let name_bytes = name.as_bytes();
         if name_bytes.len() > 1023 || ext_off + name_bytes.len() > hc.len() {
             return Err(Error::Unsupported(

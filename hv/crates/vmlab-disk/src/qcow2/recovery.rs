@@ -20,7 +20,14 @@ impl Qcow2Image {
             let mut fixed = [0u8; 40];
             self.file.read_exact_at(&mut fixed, offset)?;
             let l1_offset = u64::from_be_bytes(fixed[..8].try_into().unwrap());
-            let entries = u32::from_be_bytes(fixed[8..12].try_into().unwrap()) as u64;
+            let entries = u32::from_be_bytes(fixed[8..12].try_into().unwrap());
+            if entries > super::MAX_L1_ENTRIES {
+                return Err(Error::Format {
+                    format: "qcow2",
+                    reason: format!("snapshot L1 table too large ({entries} entries)"),
+                });
+            }
+            let entries = u64::from(entries);
             self.count_range(&mut counts, l1_offset, entries * 8)?;
             let mut bytes = vec![0; (entries * 8) as usize];
             self.file.read_exact_at(&mut bytes, l1_offset)?;
