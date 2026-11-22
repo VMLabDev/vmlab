@@ -570,21 +570,6 @@ impl GlobalSegments {
         })
     }
 
-    async fn alloc_subnet(&self, declared: Option<Ipv4Net>) -> Result<Ipv4Net> {
-        if let Some(d) = declared {
-            return Ok(d);
-        }
-        let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
-        let mut idx = self.next_index.lock().await;
-        let subnet = pool
-            .subnets(24)
-            .expect("pool splits")
-            .nth(*idx as usize)
-            .ok_or_else(|| anyhow::anyhow!("global subnet pool exhausted"))?;
-        *idx += 1;
-        Ok(subnet)
-    }
-
     /// Attach to (creating if needed) the global segment `name`. Returns the
     /// unix socket the caller's lab daemon connects its trunk to, and the
     /// warnings that lab should show (see [`Directory::admit`]).
@@ -601,16 +586,18 @@ impl GlobalSegments {
         lab: Option<Joining>,
     ) -> Result<(PathBuf, Vec<String>)> {
         check_segment_name(name)?;
+        let peer = peer
+            .map(|peer| self.require_psk().map(|psk| (peer, psk)))
+            .transpose()?;
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
             seg.refcount += 1;
             let warnings = seg.join(name, lab);
             // A later lab may be the one declaring `connect` — start the
             // dialer on an already-existing segment too.
-            if let Some(peer) = peer
+            if let Some((peer, psk)) = peer
                 && seg.dialer.is_none()
             {
-                let psk = self.require_psk()?;
                 seg.dialer = Some(spawn_tcp_peer_dialer(
                     seg.switch.clone(),
                     peer,
@@ -621,9 +608,32 @@ impl GlobalSegments {
             return Ok((seg.sock.clone(), warnings));
         }
 
-        let subnet = self.alloc_subnet(subnet).await?;
-        let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
+        let mut next_index = self.next_index.lock().await;
+        let automatic_subnet = subnet.is_none();
+        let subnet = match subnet {
+            Some(subnet) => subnet,
+            None => {
+                let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
+                pool.subnets(24)
+                    .expect("pool splits")
+                    .nth(*next_index as usize)
+                    .ok_or_else(|| anyhow::anyhow!("global subnet pool exhausted"))?
+            }
+        };
+        std::fs::create_dir_all(&self.sock_dir)?;
+        let sock = self.sock_dir.join(format!("{name}.sock"));
         let switch = Switch::new(format!("global/{name}"));
+        let listener = switch
+            .listen_unix(&sock, PortClass::Service)
+            .await
+            .with_context(|| format!("listening on {}", sock.display()))?;
+
+        // Commit the allocation only after the last fallible setup step.
+        if automatic_subnet {
+            *next_index += 1;
+        }
+
+        let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
         let gw_mac = gateway_mac("__global", name);
 
         let mut dhcp = DhcpConfig::new(subnet, gw_ip, gw_mac);
@@ -646,24 +656,9 @@ impl GlobalSegments {
         let directory: Arc<std::sync::Mutex<Directory>> = Arc::default();
         let dns_sync = spawn_dns_sync(&gateway, directory.clone());
 
-        std::fs::create_dir_all(&self.sock_dir)?;
-        let sock = self.sock_dir.join(format!("{name}.sock"));
-        let listener = switch
-            .listen_unix(&sock, PortClass::Service)
-            .await
-            .with_context(|| format!("listening on {}", sock.display()))?;
-
         let trunks = TrunkTable::new(name, self.events.clone());
-        let mut dialer = None;
-        if let Some(peer) = peer {
-            let psk = self.require_psk()?;
-            dialer = Some(spawn_tcp_peer_dialer(
-                switch.clone(),
-                peer,
-                psk,
-                trunks.clone(),
-            ));
-        }
+        let dialer = peer
+            .map(|(peer, psk)| spawn_tcp_peer_dialer(switch.clone(), peer, psk, trunks.clone()));
 
         let seg = GlobalSeg {
             switch,
@@ -1053,6 +1048,64 @@ mod tests {
     use crate::net::framing::{read_frame, write_frame};
     use bytes::Bytes;
     use tokio::time::{Duration, sleep, timeout};
+
+    fn globals_without_psk(sock_dir: PathBuf) -> Arc<GlobalSegments> {
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        GlobalSegments::new_at(sock_dir, "test.internal".into(), None, None, events)
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_on_existing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        globals.attach("wan", None, None, None).await.unwrap();
+        let lab = joining("refused", None, vec![member("vm", 1, None)]);
+        assert!(
+            globals
+                .attach("wan", None, Some("127.0.0.1:1".into()), Some(lab))
+                .await
+                .is_err()
+        );
+        globals.detach("wan", None).await;
+        assert!(
+            globals.list().await.is_empty(),
+            "refused attach added a reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_on_new_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("global");
+        let globals = globals_without_psk(sock_dir.clone());
+        assert!(
+            globals
+                .attach("wan", None, Some("127.0.0.1:1".into()), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !sock_dir.join("wan.sock").exists(),
+            "refused attach left a socket"
+        );
+        assert!(globals.list().await.is_empty());
+        assert_eq!(*globals.next_index.lock().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_when_socket_setup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("wan.sock");
+        std::fs::create_dir(&socket).unwrap();
+        let globals = globals_without_psk(dir.path().to_path_buf());
+        assert!(globals.attach("wan", None, None, None).await.is_err());
+        assert!(globals.list().await.is_empty());
+        assert_eq!(*globals.next_index.lock().await, 0);
+
+        std::fs::remove_dir(socket).unwrap();
+        globals.attach("wan", None, None, None).await.unwrap();
+        globals.detach("wan", None).await;
+    }
 
     struct Instance {
         globals: Arc<GlobalSegments>,
