@@ -34,7 +34,7 @@ much as a Makefile is.
 | F7 | security | The store accepts a qcow2 with an external data file (reachable only with `VMLAB_IMAGE_TOOL=qemu-img`) |
 | F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` (fixed, #465) |
 | F9 | wrong result | A hard link in a container layer loses its target when a higher layer deletes or replaces that target |
-| F10 | wrong result | The registry HTTP client has no timeout |
+| F10 | wrong result | The registry HTTP client has no timeout (fixed, #505) |
 | F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest |
 | F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" |
 | F13 | wrong result | A cancelled pull removes the work directory under the install that is still running |
@@ -425,6 +425,22 @@ much as a Makefile is.
   and call `get_manifest` under `tokio::time::timeout` of the documented
   limit plus a margin. Expect an `Err` from the transport. Today the outer
   timeout fires.
+- Fixed in card #505. `HttpTransport` runs under `Limits`: 30 s to connect,
+  60 s from a request without a body to its response head, 60 s between two
+  reads of a body, and 15 minutes for a request that carries a body. The
+  transport keeps the waits itself, because reqwest's `read_timeout` also
+  runs through the upload and would cut a slow chunk PUT. A silence is the
+  error `NoAnswer`, retried like a network error except after an upload. No
+  limit bounds a whole transfer. The artefact download client sets
+  `connect_timeout` (30 s) and `read_timeout` (60 s).
+  - Proof: `a_registry_that_never_answers_times_out`, with
+    `a_body_that_stops_arriving_times_out` and
+    `an_upload_outlasts_the_answer_limit` in `src/oci/client.rs`, and
+    `a_mirror_that_never_answers_times_out` in `src/template/artefact.rs`.
+    The tests inject short limits. `the_default_limits_bound_every_wait`
+    holds the limits that `new` uses.
+  - Not fixed here: the supervisor's `template pull`, `search` and `login`
+    still have no cancel. They now end by themselves on a silent registry.
 
 ### F11. Recorded digests are not compared with the content (wrong result)
 
