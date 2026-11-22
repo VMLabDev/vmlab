@@ -7,15 +7,17 @@
 The latency probe (tests/e2e/adapter/probes/latency_probe.cpp) fills its
 window with the colour of the column the pointer is in. This RFB client does
 what a person at a viewer does: it sends a pointer event that moves the
-pointer to another column, and then asks the console for a few pixels of the
-window again and again until they have the new colour. The time between the
-pointer event and that answer is one sample. It includes the input path into
-the guest, the guest's drawing and composition, the scanout, and the console's
-copy of the frame.
+pointer to another column, and then waits for the console frame in which the
+window has the new colour. The time between the two is one sample. It
+includes the input path into the guest, the guest's drawing and composition,
+the scanout, and the console's copy of the frame.
 
-The console answers a request at most every `poll_ms` (measured here, with
-the picture at rest): a sample is late by up to that much, and by half of it
-on average.
+It waits with incremental update requests, which the console answers when it
+has a new frame, so the console copies one frame for each frame the guest
+shows and no more. Asking for the picture again and again instead holds the
+guest's frames and stops the desktop. The console looks for a new frame every
+10 ms at most, and copies it for this client (`readback_ms`, measured here on
+a picture at rest): a sample is late by that much.
 
 The result is one JSON object in <out.json>; tests/e2e/adapter/judge.py
 decides.
@@ -24,6 +26,7 @@ import argparse
 import json
 import os
 import random
+import socket
 import struct
 import sys
 import time
@@ -78,8 +81,8 @@ def main():
         sx, sy = x + w // 2, y + h * 3 // 4
         py = y + h // 4
 
-        def look():
-            rfb.frame(sx, sy, SAMPLE, SAMPLE, fb)
+        def look(incremental=False):
+            rfb.frame(sx, sy, SAMPLE, SAMPLE, fb, incremental)
             return colour_of(fb)
 
         def point(column):
@@ -91,11 +94,14 @@ def main():
             if time.monotonic() > deadline or (a.stop and os.path.exists(a.stop)):
                 raise RuntimeError('the probe window did not appear on the console')
             time.sleep(0.5)
-        # How often the console answers while nothing changes.
-        t0 = time.monotonic()
-        for _ in range(50):
+        # What one copy of the frame for this client costs, with the picture at rest.
+        costs = []
+        for _ in range(10):
+            time.sleep(0.1)
+            t0 = time.monotonic()
             look()
-        res['poll_ms'] = round((time.monotonic() - t0) * 1000 / 50, 2)
+            costs.append((time.monotonic() - t0) * 1000)
+        res['readback_ms'] = round(sorted(costs)[len(costs) // 2], 2)
 
         rng = random.Random(447)
         column = 0
@@ -108,20 +114,29 @@ def main():
             want = COLUMN_COLOURS[column]
             # Not in step with the display: wait a random part of a few frames.
             time.sleep(rng.uniform(0.15, 0.35))
+            # The frame now on the console, which also makes it the one later frames are new against.
             if look() == want:
-                continue  # cannot happen unless the picture is stale; do not count it
+                continue
             t0 = time.monotonic()
             point(column)
             res['moves'] += 1
-            while True:
-                seen = look()
-                dt = (time.monotonic() - t0) * 1000
-                if seen == want:
-                    res['samples_ms'].append(round(dt, 2))
-                    break
-                if dt > a.timeout_ms:
-                    res['timeouts'] += 1
-                    break
+            rfb.s.settimeout(a.timeout_ms / 1000)
+            try:
+                while True:
+                    seen = look(incremental=True)
+                    dt = (time.monotonic() - t0) * 1000
+                    if seen == want:
+                        res['samples_ms'].append(round(dt, 2))
+                        break
+                    if dt > a.timeout_ms:
+                        res['timeouts'] += 1
+                        break
+                rfb.s.settimeout(30)
+            except (TimeoutError, socket.timeout):
+                # No new frame in time. The answer may be half read: start a new connection.
+                res['timeouts'] += 1
+                rfb.s.close()
+                rfb = Rfb(a.target)
         if res['samples_ms']:
             res['latency_ms'] = summary(res['samples_ms'])
     except (OSError, EOFError, RuntimeError, struct.error) as e:
@@ -131,7 +146,7 @@ def main():
         json.dump(res, f, indent=2)
     lat = res.get('latency_ms')
     print(f"latency: {res['moves']} moves, {res['timeouts']} without an answer"
-          + (f", p50 {lat['p50']} ms, p90 {lat['p90']} ms, max {lat['max']} ms, console poll {res.get('poll_ms')} ms"
+          + (f", p50 {lat['p50']} ms, p90 {lat['p90']} ms, max {lat['max']} ms, console readback {res.get('readback_ms')} ms"
              if lat else '')
           + (f"; error: {res['error']}" if res['error'] else ''))
     return 1 if res['error'] else 0

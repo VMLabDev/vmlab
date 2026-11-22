@@ -25,6 +25,6 @@ def judge(report):
         f"{lat['n']} of {g['moves']} pointer moves answered, {g['timeouts']} not within {g['timeout_ms']:.0f} ms: "
         f"p50 {lat['p50']:.0f} ms, p90 {lat['p90']:.0f} ms, p99 {lat['p99']:.0f} ms, max {lat['max']:.0f} ms from the "
         f"pointer event to the console frame (limits: p50 {P50_LIMIT_MS} ms, p90 {P90_LIMIT_MS} ms, every move "
-        f"answered); the console answers a request every {g.get('poll_ms', 0):.1f} ms; in the guest the wait for "
+        f"answered); the console's copy of a frame takes {g.get('readback_ms', 0):.1f} ms; in the guest the wait for "
         f"composition was p50 {c.get('p50', 0):.1f} ms, p90 {c.get('p90', 0):.1f} ms; host load "
         f"{host.get('host_load', 0)} busy processes on {host.get('host_cpus', '?')} CPUs", ev)

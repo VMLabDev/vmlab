@@ -2,6 +2,7 @@
 """Count the breaks in a capture of the tone probe's sine (card #447).
 
     audio.py <capture.wav> <out.json> [--hz 997] [--hv-log FILE --hv-log-offset BYTES]
+             [--raw RATE]
 
 The tone probe (tests/e2e/adapter/probes/tone_probe.cpp) plays one sine. The
 capture is what vmlab-hv played into the host's PipeWire, S16 at 48 kHz, taken
@@ -19,6 +20,11 @@ and the last loud sample, this counts
 With --hv-log it also sums the underruns vmlab-hv wrote to the VM's log after
 the byte offset: the pulls of the host's sound server that the VM could not
 fill, and the frames of silence it put in their place.
+
+With --raw the capture is headerless S16LE stereo at that rate: the file
+vmlab-hv appends each period it hands to the host to, when it runs with
+VMLAB_HV_TEST_AUDIO_PLAYBACK=<file> and VMLAB_HV_TEST_AUDIO_TEE=1. A break
+that is in that file was made before the host's sound server.
 
 The result is one JSON object in <out.json>; tests/e2e/adapter/judge.py
 decides. Only the standard library.
@@ -104,15 +110,22 @@ def main():
     ap.add_argument('--hz', type=float, default=997)
     ap.add_argument('--hv-log')
     ap.add_argument('--hv-log-offset', type=int, default=0)
+    ap.add_argument('--raw', type=int, metavar='RATE')
     a = ap.parse_args()
     res = {'capture': a.capture, 'hz': a.hz, 'error': None}
     try:
-        with wave.open(a.capture) as wav:
-            if wav.getsampwidth() != 2:
-                raise ValueError(f'the capture has {wav.getsampwidth() * 8}-bit samples; S16 is expected')
-            rate, channels = wav.getframerate(), wav.getnchannels()
-            data = array.array('h')
-            data.frombytes(wav.readframes(wav.getnframes()))
+        data = array.array('h')
+        if a.raw:
+            rate, channels = a.raw, 2
+            with open(a.capture, 'rb') as f:
+                raw = f.read()
+            data.frombytes(raw[:len(raw) - len(raw) % 4])
+        else:
+            with wave.open(a.capture) as wav:
+                if wav.getsampwidth() != 2:
+                    raise ValueError(f'the capture has {wav.getsampwidth() * 8}-bit samples; S16 is expected')
+                rate, channels = wav.getframerate(), wav.getnchannels()
+                data.frombytes(wav.readframes(wav.getnframes()))
         if sys.byteorder == 'big':
             data.byteswap()
         res.update(rate=rate, channels=channels, capture_seconds=round(len(data) / channels / rate, 3))
