@@ -436,12 +436,16 @@ impl Backend for Host {
                     return Err("VFIO BAR overlaps RAM or platform MMIO".into());
                 }
             }
-            self.register_mapping(m, None)?;
-            if let Err(error) = self.register_mapping(m, base) {
-                let _ = self.register_mapping(m, None);
-                return Err(error);
+            // KVM answers EINVAL to the removal of a slot that does not exist,
+            // so only a mapping the guest can see now is taken away first.
+            if m.base.is_some() {
+                self.register_mapping(m, None)?;
+                self.mappings[i].base = None;
             }
-            self.mappings[i].base = base;
+            if base.is_some() {
+                self.register_mapping(&self.mappings[i], base)?;
+                self.mappings[i].base = base;
+            }
         }
         Ok(())
     }
@@ -548,7 +552,7 @@ impl Drop for Host {
         let _ = self.stop_interrupts();
         self.device.reset();
         for mapping in &self.mappings {
-            if self.register_mapping(mapping, None).is_ok() {
+            if mapping.base.is_none() || self.register_mapping(mapping, None).is_ok() {
                 // SAFETY: no KVM mapping remains and no Rust reference aliases the mmap.
                 unsafe {
                     libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize);
