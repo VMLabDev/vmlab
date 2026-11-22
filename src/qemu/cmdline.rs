@@ -562,7 +562,11 @@ pub fn build_args(
         // reads `/proc/<pid>/cmdline`. The device stands at this place in
         // the argv, so QEMU creates it in the order it always did.
         apple_smc_config(key)?;
-        arg(&mut a, "readconfig", path_str(&paths.apple_smc_config)?);
+        arg(
+            &mut a,
+            "readconfig",
+            paths.apple_smc_config.display().to_string(),
+        );
         arg(&mut a, "smbios", "type=2".into());
     }
 
@@ -2028,13 +2032,18 @@ mod tests {
         );
         p.apple_smc_osk = Some(osk);
         let s = joined(&build_args("l", &vm, &p, Accel::Kvm).unwrap());
-        assert!(s.contains("-readconfig /run/l/t/applesmc.cfg -smbios type=2"), "{s}");
+        assert!(
+            s.contains("-readconfig /run/l/t/applesmc.cfg -smbios type=2"),
+            "{s}"
+        );
         assert!(!s.contains("isa-applesmc"), "{s}");
         assert!(!format!("{p:?}").contains(&key));
         // QEMU's file has no escape for a double quote, so the launch is refused.
         let quoted = crate::config::host::AppleSmcOsk::parse("\"".repeat(64)).unwrap();
         p.apple_smc_osk = Some(quoted);
-        let error = build_args("l", &vm, &p, Accel::Kvm).unwrap_err().to_string();
+        let error = build_args("l", &vm, &p, Accel::Kvm)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("double quote"), "{error}");
         assert!(!error.contains(&"\"".repeat(64)), "{error}");
     }
