@@ -521,7 +521,7 @@ impl PciRoot {
         for bar in &func.bars {
             dev.set_bar_address(
                 bar.info.index,
-                (bar.addr != 0 && !bar.sizing).then_some(bar.addr),
+                bar_placement(self.firmware, func.command, bar),
             );
         }
         if let Some(start) =
@@ -761,12 +761,26 @@ impl PciRoot {
             for bar in &func.bars {
                 dev.set_bar_address(
                     bar.info.index,
-                    (bar.addr != 0 && !bar.sizing).then_some(bar.addr),
+                    bar_placement(self.firmware, func.command, bar),
                 );
             }
         }
         Ok(())
     }
+}
+
+/// The address a function is told its BAR is at, or `None` while the root
+/// does not decode it: unprogrammed, mid-sizing, or, on a root that firmware
+/// programs, with the BAR's decode bit of the command register clear. A
+/// function registers kernel-side decoding from this (queue doorbells, direct
+/// mappings), so it must not outlive what `decode_mmio` and `find_bar` decode.
+fn bar_placement(firmware: bool, command: u16, bar: &BarState) -> Option<u64> {
+    let enable = if matches!(bar.info.kind, BarKind::Io) {
+        1
+    } else {
+        2
+    };
+    (bar.addr != 0 && !bar.sizing && (!firmware || command & enable != 0)).then_some(bar.addr)
 }
 
 fn bar_low_read(bar: &BarState) -> u32 {
@@ -1205,7 +1219,7 @@ mod tests {
     #[test]
     fn a_root_without_firmware_places_bars_whatever_the_command_register() {
         let (root, device) = root_with_fake();
-        root.lock().config_write(0, 0, 0, 4, &0u16.to_le_bytes());
+        root.lock().config_write(0, 1, 0, 4, &0u16.to_le_bytes());
         let device = device.lock();
         let (_, address) = device.placements.iter().rev().find(|p| p.0 == 0).unwrap();
         assert!(address.is_some());
