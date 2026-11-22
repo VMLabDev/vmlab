@@ -20,6 +20,15 @@
 //!
 //! Remaining ties are broken by insertion (declaration) order.
 //!
+//! **Fragments.** The rule set keeps no reassembly state, so the port of an
+//! IP fragment is not known: a later fragment has no L4 header, and a first
+//! one can be cut short of it. A TCP or UDP fragment is therefore dropped,
+//! with no reply, when a rule *with a port* covers its destination address
+//! and protocol, whatever port the whole datagram has. Otherwise the
+//! datagram would pass the rule in pieces and be put together again by its
+//! destination. Port-less rules match a fragment as they match any packet.
+//! No fragment is tracked or rewritten on the return path.
+//!
 //! Reply packets synthesized for blocks are sourced from the *blocked
 //! destination address* (the host the guest believed it was talking to);
 //! the rule set is gateway-agnostic and has no address of its own.
@@ -134,10 +143,28 @@ struct Meta {
     /// this is `(id, 0)`, for replies `(0, id)`; `None` for untrackable
     /// protocols/messages.
     conn_ports: Option<(u16, u16)>,
+    /// The packet is an IP fragment: its ports are unknown, so both fields
+    /// above are `None`.
+    fragment: bool,
 }
 
 impl Meta {
     fn of(ip: &Ipv4View<'_>) -> Self {
+        if ip.more_fragments() || ip.frag_offset() != 0 {
+            // Bytes at the L4 offset of a later fragment are payload, and a
+            // first fragment can end inside the header. Read neither.
+            return Self {
+                l4: match ip.proto() {
+                    IPPROTO_TCP => Some(L4Proto::Tcp),
+                    IPPROTO_UDP => Some(L4Proto::Udp),
+                    IPPROTO_ICMP => Some(L4Proto::Icmp),
+                    _ => None,
+                },
+                dst_port: None,
+                conn_ports: None,
+                fragment: true,
+            };
+        }
         match ip.proto() {
             IPPROTO_TCP => {
                 let p = TcpView::parse(ip.payload());
@@ -145,6 +172,7 @@ impl Meta {
                     l4: Some(L4Proto::Tcp),
                     dst_port: p.map(|t| t.dst_port()),
                     conn_ports: p.map(|t| (t.src_port(), t.dst_port())),
+                    fragment: false,
                 }
             }
             IPPROTO_UDP => {
@@ -153,6 +181,7 @@ impl Meta {
                     l4: Some(L4Proto::Udp),
                     dst_port: p.map(|u| u.dst_port()),
                     conn_ports: p.map(|u| (u.src_port(), u.dst_port())),
+                    fragment: false,
                 }
             }
             IPPROTO_ICMP => {
@@ -168,12 +197,14 @@ impl Meta {
                     l4: Some(L4Proto::Icmp),
                     dst_port: None,
                     conn_ports,
+                    fragment: false,
                 }
             }
             _ => Self {
                 l4: None,
                 dst_port: None,
                 conn_ports: None,
+                fragment: false,
             },
         }
     }
@@ -278,6 +309,13 @@ impl RuleSet {
         };
         self.expire_conns();
         let meta = Meta::of(&ip);
+
+        // A fragment's port is unknown: one that a port rule could cover is
+        // dropped rather than let past the rule (see the module docs). No
+        // reply: an error is never sent for a later fragment (RFC 1122).
+        if meta.fragment && self.port_rule_covers(&ip, &meta) {
+            return Verdict::Drop { reply: None };
+        }
 
         // Layer 1: redirects.
         if let Some(rule) = self.best_redirect(&ip, &meta) {
@@ -389,6 +427,23 @@ impl RuleSet {
         if !conns.is_empty() {
             conns.retain(|_, v| v.last.elapsed() < idle);
         }
+    }
+
+    /// Whether a rule with a port covers the destination address and
+    /// protocol of this packet, leaving the port aside. Only TCP and UDP
+    /// have ports, so no port rule covers another protocol.
+    fn port_rule_covers(&self, ip: &Ipv4View<'_>, meta: &Meta) -> bool {
+        if !matches!(meta.l4, Some(L4Proto::Tcp | L4Proto::Udp)) {
+            return false;
+        }
+        let proto_ok = |p: Option<L4Proto>| p.is_none_or(|p| meta.l4 == Some(p));
+        self.redirects
+            .iter()
+            .any(|(_, r)| r.from.port.is_some() && r.from.ip == ip.dst() && proto_ok(r.proto))
+            || self
+                .blocks
+                .iter()
+                .any(|(_, b)| b.port.is_some() && b.cidr.contains(&ip.dst()) && proto_ok(b.proto))
     }
 
     /// Most specific matching redirect: `ip:port` beats `ip`; ties go to the
@@ -882,6 +937,93 @@ mod tests {
         // A port-bearing rule can never match a portless protocol.
         let p = icmp_echo_pkt(GUEST, DST_A, 7, false);
         assert_eq!(rs.eval(&p), Verdict::Pass);
+    }
+
+    // --- fragments ---
+
+    /// Split a full IPv4 packet (20-byte header) into fragments of at most
+    /// `chunk` payload bytes each (a multiple of 8), as a sender would.
+    fn fragments(pkt: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+        assert_eq!(chunk % 8, 0);
+        let ip = Ipv4View::parse(pkt).unwrap();
+        let payload = ip.payload();
+        let count = payload.len().div_ceil(chunk);
+        payload
+            .chunks(chunk)
+            .enumerate()
+            .map(|(i, part)| {
+                let mut f = ipv4_build(ip.src(), ip.dst(), ip.proto(), 64, part, ip.id()).unwrap();
+                let more = if i + 1 < count { 0x2000 } else { 0 };
+                let field = more | (i * chunk / 8) as u16;
+                f[6..8].copy_from_slice(&field.to_be_bytes());
+                f[10..12].copy_from_slice(&[0, 0]);
+                let c = frame::internet_checksum(&f[..20]);
+                f[10..12].copy_from_slice(&c.to_be_bytes());
+                f
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fragment_does_not_evade_a_port_block() {
+        let mut rs = RuleSet::new();
+        rs.add_block(block("10.0.1.0/24", Some(L4Proto::Udp), Some(53)));
+        let dst = Ipv4Addr::new(10, 0, 1, 5);
+        let whole = udp_pkt(GUEST, dst, 5000, 53, &[0xAB; 2000]);
+        let frags = fragments(&whole, 1480);
+        assert_eq!(frags.len(), 2);
+        let first = Ipv4View::parse(&frags[0]).unwrap();
+        assert!(first.more_fragments() && first.checksum_valid());
+        assert_eq!(Ipv4View::parse(&frags[1]).unwrap().frag_offset(), 185);
+        for f in &frags {
+            assert_eq!(rs.eval(f), Verdict::Drop { reply: None });
+        }
+    }
+
+    #[test]
+    fn a_fragment_does_not_evade_a_port_redirect() {
+        let mut rs = RuleSet::new();
+        rs.add_redirect(redirect(DST_A, Some(53), TARGET, Some(5353), None));
+        // A TCP first fragment too short to hold the header, and its tail.
+        let whole = tcp_pkt(GUEST, DST_A, 5000, 53, frame::TCP_SYN);
+        for f in &fragments(&whole, 8) {
+            assert_eq!(rs.eval(f), Verdict::Drop { reply: None });
+        }
+        assert_eq!(rs.conn_count(), 0);
+    }
+
+    #[test]
+    fn a_fragment_passes_where_no_port_rule_covers_it() {
+        let mut rs = RuleSet::new();
+        rs.add_block(block("192.0.2.1/32", Some(L4Proto::Tcp), Some(445)));
+        rs.add_redirect(redirect(DST_B, Some(53), TARGET, None, Some(L4Proto::Udp)));
+        // Another protocol than the rule names.
+        let udp = udp_pkt(GUEST, DST_A, 5000, 445, &[0; 2000]);
+        // Another address than any rule names.
+        let other = udp_pkt(GUEST, Ipv4Addr::new(192, 0, 2, 9), 5000, 53, &[0; 2000]);
+        // ICMP has no ports, so a port rule never covered it.
+        let icmp = ipv4_build(GUEST, DST_A, IPPROTO_ICMP, 64, &[0; 2000], 45).unwrap();
+        for whole in [udp, other, icmp] {
+            for f in &fragments(&whole, 1480) {
+                assert_eq!(rs.eval(f), Verdict::Pass);
+            }
+        }
+    }
+
+    #[test]
+    fn a_fragment_is_never_tracked_or_rewritten_on_return() {
+        let mut rs = RuleSet::new();
+        rs.add_redirect(redirect(DST_A, Some(53), TARGET, Some(5353), None));
+        let q = udp_pkt(GUEST, DST_A, 5000, 53, b"q");
+        assert!(matches!(rs.eval(&q), Verdict::Rewrite(_)));
+        // A whole reply is rewritten, the same reply in fragments is not:
+        // only its first fragment has the ports, and a fragment's checksum
+        // cannot be redone.
+        let reply = udp_pkt(TARGET, GUEST, 5353, 5000, &[0; 64]);
+        assert!(matches!(rs.eval_return(&reply), Verdict::Rewrite(_)));
+        for f in &fragments(&reply, 32) {
+            assert_eq!(rs.eval_return(f), Verdict::Pass);
+        }
     }
 
     // --- DNAT rewrite correctness ---

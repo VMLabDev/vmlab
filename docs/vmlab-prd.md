@@ -749,6 +749,8 @@ Two enforcement layers, declared in WCL and **mutable at runtime from wscript sc
 
 Evaluation order: redirect rules before block rules; within a layer, most-specific match wins; ties broken by declaration order. The full resolution algorithm must be specified precisely in the implementation design doc.
 
+An IP fragment carries no port a rule can trust. A TCP or UDP fragment is dropped, with no reply, when a rule with a port covers its destination address and protocol; port-less rules match a fragment as any packet.
+
 ---
 
 ## 10. wscript scripting surface

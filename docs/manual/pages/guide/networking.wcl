@@ -306,6 +306,13 @@ SRC
   DOC
 
   p <<DOC
+    The port of an IP fragment is not known, so a TCP or UDP fragment is
+    dropped when a rule with a port covers its destination address and
+    protocol, whatever port the whole datagram has. A fragmented datagram
+    does not get past a port rule in pieces.
+  DOC
+
+  p <<DOC
     From a script, `Segment.block`, `block_port`, `redirect`, `dns_set` and
     `dns_sinkhole` each return a rule id, and `unblock` and `dns_clear`
     remove one. `rules` lists what is currently in force. The full API is in
