@@ -1369,11 +1369,7 @@ fn drop_watch(
 }
 
 /// Only workspace-relative paths can enter the guest debounce set.
-fn record_guest_paths(
-    debounce: &mut Debounce,
-    paths: impl Iterator<Item = String>,
-    windows: bool,
-) {
+fn record_guest_paths(debounce: &mut Debounce, paths: impl Iterator<Item = String>, windows: bool) {
     let now = Instant::now();
     for path in paths {
         if path
@@ -1415,7 +1411,11 @@ async fn settle_guest(
                 }
                 Some(WatchReport::Batch(entries)) => {
                     *draining -= 1;
-                    record_guest_paths(debounce, entries.into_iter().map(|entry| entry.path), windows);
+                    record_guest_paths(
+                        debounce,
+                        entries.into_iter().map(|entry| entry.path),
+                        windows,
+                    );
                 }
                 Some(WatchReport::Rescan) => {
                     *draining -= 1;
@@ -4123,9 +4123,16 @@ mod tests {
         let mut watch = sessions.watcher.session();
         let mut debounce = Debounce::default();
         assert!(
-            settle_guest(watch.as_mut(), &mut 0, &mut debounce, &mut false, SETTLE, false)
-                .await
-                .unwrap()
+            settle_guest(
+                watch.as_mut(),
+                &mut 0,
+                &mut debounce,
+                &mut false,
+                SETTLE,
+                false
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(debounce.in_flight(), BTreeSet::from(["valid.rs".into()]));
     }
