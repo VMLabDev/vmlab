@@ -1077,7 +1077,9 @@ fn a_write_to_a_cluster_qemu_zeroed_in_place_reads_back() {
         // A partial write to the first cluster, a whole-cluster write to
         // the second.
         image.write_at(512, &[0xaa; 512]).unwrap();
-        image.write_at(cluster as u64, &vec![0xbb; cluster]).unwrap();
+        image
+            .write_at(cluster as u64, &vec![0xbb; cluster])
+            .unwrap();
         image.flush().unwrap();
     }
     let mut expected = vec![0u8; 1 << 20];
