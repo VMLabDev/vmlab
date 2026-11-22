@@ -100,6 +100,37 @@ mod tests {
         ));
     }
 
+    /// A namespace entry trusts the repositories under it by name. A `..`
+    /// segment is removed from the request path, so the text under the
+    /// namespace is not the repository that answers (config review F2).
+    #[test]
+    fn a_dot_segment_does_not_inherit_a_namespace_trust() {
+        let allowed = vec!["ghcr.io/vmlabdev/vmlab-templates/".to_string()];
+        for repo in [
+            "vmlabdev/vmlab-templates/../../other/tpl",
+            "vmlabdev/vmlab-templates/./tpl",
+            "vmlabdev/vmlab-templates//tpl",
+            "vmlabdev/vmlab-templates/%2e%2e/%2e%2e/other/tpl",
+            "vmlabdev/vmlab-templates/..\\..\\other\\tpl",
+            "vmlabdev/vmlab-templates/tpl?x",
+            "vmlabdev/vmlab-templates/tpl#x",
+        ] {
+            assert!(!repository_trusted(&allowed, "ghcr.io", repo), "{repo}");
+        }
+        assert!(repository_trusted(
+            &allowed,
+            "ghcr.io",
+            "vmlabdev/vmlab-templates/tpl"
+        ));
+        // An exact entry does not trust an unnormalised spelling of itself.
+        let exact = vec!["ghcr.io/org/../org/template".to_string()];
+        assert!(!repository_trusted(
+            &exact,
+            "ghcr.io",
+            "org/../org/template"
+        ));
+    }
+
     #[test]
     fn path_components_refuse_escape_and_ambiguous_names() {
         for bad in [

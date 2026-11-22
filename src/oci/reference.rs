@@ -169,6 +169,36 @@ mod tests {
         assert_eq!(r.tag, "v3");
     }
 
+    /// The repository goes into the request path as written, and the URL
+    /// parser removes dot segments from it, so a reference with one would
+    /// name another repository than its text says (config review F2).
+    #[test]
+    fn a_repository_with_a_dot_segment_is_rejected() {
+        for bad in [
+            "ghcr.io/a/../b:1",
+            "ghcr.io/a/./b:1",
+            "ghcr.io/../b:1",
+            "ghcr.io/a/..:1",
+            "ghcr.io/a//b:1",
+            "ghcr.io/a/b/:1",
+            "ghcr.io/a/%2e%2e/b:1",
+            "ghcr.io/a\\..\\b/c:1",
+            "ghcr.io/a/b?x:1",
+            "ghcr.io/a/b#x:1",
+            "ghcr.io/a/b c:1",
+        ] {
+            let err = Reference::parse(bad).expect_err(bad);
+            assert!(err.to_string().contains("repository"), "{bad}: {err}");
+        }
+        for good in [
+            "ghcr.io/a/b:1",
+            "ghcr.io/VMLabDev/vmlab-templates/windows-11:1",
+            "ghcr.io/a/b.c_d-e/f..g:1",
+        ] {
+            Reference::parse(good).expect(good);
+        }
+    }
+
     #[test]
     fn bare_owner_name_rejected() {
         let err = Reference::parse("owner/name:1.2").unwrap_err();
