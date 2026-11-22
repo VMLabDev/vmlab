@@ -2,7 +2,7 @@
 //! handler, fan out events to subscribed connections.
 
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -57,12 +57,99 @@ pub trait Handler<R: WireRequest>: Send + Sync + 'static {
 pub struct Server<R: WireRequest> {
     pub events: broadcast::Sender<Event>,
     handle: tokio::task::JoinHandle<()>,
+    /// Held for as long as the server lives; dropped after `Drop` has
+    /// removed the socket file.
+    guard: SocketGuard,
     _vocabulary: PhantomData<fn() -> R>,
 }
 
+/// The right to serve one control socket: what makes a daemon the only one
+/// at its path.
+///
+/// It is an exclusive `flock` on `<socket>.lock`, which the kernel drops when
+/// the holder dies however it dies, so a killed daemon leaves nothing stale.
+/// A daemon takes it before it touches anything a peer would also own (the
+/// lab's state file, the registry) and keeps it until it exits; binding the
+/// socket needs one. Taking it also refuses a path somebody still accepts
+/// connections on without holding the lock — a daemon whose lock file was
+/// removed under it, or one from a build that took none.
+#[derive(Debug)]
+pub struct SocketGuard {
+    path: PathBuf,
+    _lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+impl SocketGuard {
+    /// Take the guard of the socket at `path` (parent directories created),
+    /// or fail with [`std::io::ErrorKind::AddrInUse`], naming the holder,
+    /// when a live daemon has it. Never waits.
+    pub fn acquire(path: &Path) -> std::io::Result<SocketGuard> {
+        use std::io::{Read as _, Seek as _, Write as _};
+        use std::os::unix::fs::MetadataExt as _;
+
+        // The socket is a full-privilege interface (scripts, guest files,
+        // daemon-side writes), so the directory holding it is owner-only.
+        if let Some(parent) = path.parent() {
+            crate::paths::ensure_private_dir(parent).map_err(std::io::Error::other)?;
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let in_use = |holder: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} belongs to a running daemon{holder}; a second one is refused",
+                    path.display()
+                ),
+            )
+        };
+        let mut lock = loop {
+            let file = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)?;
+            let lock =
+                match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                    Ok(lock) => lock,
+                    Err((mut file, nix::errno::Errno::EWOULDBLOCK)) => {
+                        let mut pid = String::new();
+                        let _ = file.read_to_string(&mut pid);
+                        return Err(match pid.trim() {
+                            "" => in_use(""),
+                            pid => in_use(&format!(" (pid {pid})")),
+                        });
+                    }
+                    Err((_, errno)) => return Err(errno.into()),
+                };
+            // The lock is on whatever the path named when it was opened. A
+            // file removed or replaced since is not the one a peer would
+            // lock, so open the path again.
+            let held = lock.metadata()?;
+            match std::fs::metadata(&lock_path) {
+                Ok(now) if now.ino() == held.ino() && now.dev() == held.dev() => break lock,
+                _ => continue,
+            }
+        };
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return Err(in_use(""));
+        }
+        lock.set_len(0)?;
+        lock.rewind()?;
+        write!(lock, "{}", std::process::id())?;
+        Ok(SocketGuard {
+            path: path.to_path_buf(),
+            _lock: lock,
+        })
+    }
+}
+
 impl<R: WireRequest + Send + 'static> Server<R> {
-    /// Bind `path` (parent dirs created, stale socket file replaced) and
-    /// serve until dropped/aborted.
+    /// Bind `path` (parent dirs created, a dead daemon's socket file
+    /// replaced) and serve until dropped/aborted. A path a live daemon
+    /// serves is refused: see [`SocketGuard`].
     pub async fn bind(path: &Path, handler: Arc<dyn Handler<R>>) -> std::io::Result<Server<R>> {
         let (events, _) = broadcast::channel::<Event>(1024);
         Self::bind_with_events(path, handler, events).await
@@ -75,13 +162,21 @@ impl<R: WireRequest + Send + 'static> Server<R> {
         handler: Arc<dyn Handler<R>>,
         events: broadcast::Sender<Event>,
     ) -> std::io::Result<Server<R>> {
-        // The socket is a full-privilege interface (scripts, guest files,
-        // daemon-side writes), so both the directory holding it and the socket
-        // itself are owner-only — `bind` would otherwise honour the umask and
-        // leave it connectable by any local user.
-        if let Some(parent) = path.parent() {
-            crate::paths::ensure_private_dir(parent).map_err(std::io::Error::other)?;
-        }
+        Self::bind_guarded(SocketGuard::acquire(path)?, handler, events)
+    }
+
+    /// [`bind_with_events`](Self::bind_with_events) for a daemon that took
+    /// its [`SocketGuard`] earlier, before it built what it serves.
+    pub fn bind_guarded(
+        guard: SocketGuard,
+        handler: Arc<dyn Handler<R>>,
+        events: broadcast::Sender<Event>,
+    ) -> std::io::Result<Server<R>> {
+        let path = guard.path.as_path();
+        // The guard says nobody serves this path, so a file there is a dead
+        // daemon's. The socket itself is owner-only too — `bind` would
+        // otherwise honour the umask and leave it connectable by any local
+        // user.
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         #[cfg(unix)]
@@ -112,6 +207,7 @@ impl<R: WireRequest + Send + 'static> Server<R> {
         Ok(Server {
             events,
             handle,
+            guard,
             _vocabulary: PhantomData,
         })
     }
@@ -125,6 +221,10 @@ impl<R: WireRequest + Send + 'static> Server<R> {
 impl<R: WireRequest> Drop for Server<R> {
     fn drop(&mut self) {
         self.handle.abort();
+        // The abort closes the listener only when the task is next polled.
+        // Without the file nobody connects in between, so a successor's
+        // guard does not take this server for a live one.
+        let _ = std::fs::remove_file(&self.guard.path);
     }
 }
 

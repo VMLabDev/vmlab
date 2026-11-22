@@ -117,6 +117,13 @@ async fn run_async() -> Result<()> {
     crate::paths::ensure_private_dir(&runtime_dir)?;
     crate::paths::ensure_dir(&crate::paths::state_dir())?;
 
+    // One supervisor per user. Two CLI commands that both found none each
+    // start one; the second ends here, before it loads a registry the first
+    // also writes or spawns a lab daemon the first already has.
+    let sock = crate::paths::supervisor_socket();
+    let guard = crate::proto::server::SocketGuard::acquire(&sock)
+        .context("a supervisor is already running")?;
+
     let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
     // Select the network fast-path tier (PRD §9.1) before any switch exists —
     // the global segments this daemon hosts pick it up from here.
@@ -138,13 +145,11 @@ async fn run_async() -> Result<()> {
     // can cancel and join them deterministically.
     let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
 
-    let sock = crate::paths::supervisor_socket();
     let handler: Arc<dyn Handler<SupRequest>> = Arc::new(SupervisorHandler {
         sup: supervisor.clone(),
         tasks: tasks.clone(),
     });
-    let server = Server::bind_with_events(&sock, handler, events_tx)
-        .await
+    let server = Server::bind_guarded(guard, handler, events_tx)
         .with_context(|| format!("binding {}", sock.display()))?;
 
     // Cross-host trunk listener (PRD §9.2): enabled when a PSK is configured.
@@ -455,6 +460,28 @@ impl Supervisor {
                 && c.send(LabRequest::Ping {}).await.is_ok()
             {
                 return Ok(sock);
+            }
+        }
+
+        // The registry does not prove a daemon dead: a `failed` entry, or
+        // none at all, can belong to one that still runs and owns the lab's
+        // machines. A successor beside it would start each of them a second
+        // time on the same disks, so ask the socket's guard, which a live
+        // daemon holds, and refuse rather than spawn.
+        match crate::proto::server::SocketGuard::acquire(&sock) {
+            Ok(free) => drop(free),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(CommandError::conflict(format!(
+                    "lab `{name}` still has a daemon the supervisor lost track of, and a second \
+                     one would run the same machines on the same disks: {e}. Stop that process \
+                     (a plain `kill` lets it shut its machines down) and try again"
+                )));
+            }
+            Err(e) => {
+                return Err(CommandError::failed(format!(
+                    "cannot check {} for a running daemon: {e}",
+                    sock.display()
+                )));
             }
         }
 
@@ -1137,6 +1164,9 @@ mod tests {
                 format!("import <vmlab.wcl>\nlab \"{name}\" {{ }}\n"),
             )
             .unwrap();
+            // With the directory there, nothing but the guard stands
+            // between `ensure_lab` and the spawn.
+            crate::paths::ensure_dir(&crate::paths::state_dir()).unwrap();
             let socket = crate::paths::lab_socket(name);
             let _daemon = Server::<LabRequest>::bind(&socket, Arc::new(Alive))
                 .await

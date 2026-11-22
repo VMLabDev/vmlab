@@ -100,6 +100,13 @@ pub fn run(lab: String, root: PathBuf) -> Result<()> {
 }
 
 async fn run_async(lab: String, root: PathBuf) -> Result<()> {
+    // One daemon per lab. Building the runtime rewrites the lab's state file
+    // and treats every machine as stopped, so the guard comes before all of
+    // it: a second daemon ends here, having touched nothing.
+    let sock = crate::paths::lab_socket(&lab);
+    let guard = crate::proto::server::SocketGuard::acquire(&sock)
+        .with_context(|| format!("lab {lab} already has a daemon"))?;
+
     let mut config = crate::config::load_lab_root(&root)
         .map_err(|e| anyhow::anyhow!("cannot load lab config: {e}"))?;
     // The CLI chose the name, an instance of the declared one when this
@@ -153,13 +160,11 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     // can cancel and join them deterministically.
     let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
 
-    let sock = crate::paths::lab_socket(&lab);
     let handler: Arc<dyn Handler<LabRequest>> = Arc::new(LabdHandler {
         lab: runtime.clone(),
         tasks: tasks.clone(),
     });
-    let server = Server::bind_with_events(&sock, handler, events_tx.clone())
-        .await
+    let server = Server::bind_guarded(guard, handler, events_tx.clone())
         .with_context(|| format!("binding {}", sock.display()))?;
 
     // Disk-space watchdog on the lab-local filesystem — linked clones grow
