@@ -347,6 +347,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &vm.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(&format!("vm \"{}\"", vm.name), &vm.extra_disks, &mut issues);
         if let Some(gpu) = &vm.gpu {
             check_virtual_display_family(
                 gpu,
@@ -782,6 +783,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(&format!("template \"{}\"", t.name), &t.extra_disks, &mut issues);
         // A build VM's `gpu {}` (§6.1) is a lab VM's, resolved on the host
         // that builds: the same check, including `passthrough`, which a
         // build may ask for on the same terms a lab VM may.
@@ -1938,6 +1940,25 @@ fn check_media(root: &Path, m: &Media, issues: &mut IssueList) {
             m.span,
             format!("media source folder {} does not exist", m.from.display()),
         ));
+    }
+}
+
+/// A `disk` block's image is `disk-<name>.qcow2` in the machine's directory,
+/// so two blocks with one name would be two drives on one image file. QEMU's
+/// image lock refuses the second; vmlab-hv takes no lock, and writes through
+/// both corrupt the image. `who` is the block they sit in (`vm "a"`).
+fn check_disk_names(who: &str, disks: &[DiskBlock], issues: &mut IssueList) {
+    for (i, d) in disks.iter().enumerate() {
+        if disks[..i].iter().any(|e| e.name == d.name) {
+            issues.push(Issue::at(
+                d.span,
+                format!(
+                    "{who}: disk \"{}\" is declared twice; each `disk` block needs its own name, \
+                     because the name is its image file",
+                    d.name
+                ),
+            ));
+        }
     }
 }
 
