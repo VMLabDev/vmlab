@@ -33,7 +33,7 @@ Two facts are used by several findings:
 |------|----------|-------------------|
 | F1 | data loss | Nothing makes a supervisor or a lab daemon the only one, and binding the socket unlinks a live one (fixed, card #546) |
 | F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned (fixed, card #547) |
-| F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name |
+| F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name (fixed, card #557) |
 | F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine (fixed, card #547) |
 | F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host |
 | F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down |
@@ -169,6 +169,12 @@ Two facts are used by several findings:
   with `mylab` registered from `/labs/first`, bind no supervisor socket,
   call `check_registration("mylab", "/labs/second")`. It must return the
   ADR-0011 conflict. Today it returns `Ok`.
+- Fixed in card #557. When no supervisor answers, `check_registration`
+  reads the registry the supervisor persisted (`Registry::load`, the
+  `labs.json` the next supervisor adopts) and applies the same
+  `LabEntry::claims` decision to it. The proof test (with a helper that runs
+  in a child process with scratch XDG directories) failed before the fix and
+  passes after it.
 
 ### F4. Destroy does not exclude a start (data loss)
 

@@ -202,17 +202,24 @@ fn same_build(what: &str, answer: Option<serde_json::Value>) -> Result<()> {
 /// `lab.ensure` (`status`, `down`, `destroy`): a lab daemon's socket is keyed
 /// by name, so without this a second checkout declaring the same name would
 /// read, stop or destroy the first one's lab as if it were its own. No
-/// supervisor running means nothing is registered, so nothing conflicts.
+/// supervisor running does not mean nothing is registered: a lab daemon
+/// outlives a supervisor that crashed or was killed, so the registry the
+/// supervisor persisted (`labs.json`) is read instead, as the next supervisor
+/// would adopt it.
 pub async fn check_registration(name: &str, root: &Path) -> Result<()> {
-    let Ok(supervisor) = SupClient::connect(&crate::paths::supervisor_socket()).await else {
-        return Ok(());
-    };
-    let labs = supervisor
-        .send(SupRequest::Status {})
-        .await
-        .map_err(remote)?;
-    let labs: Vec<crate::supervisor::registry::LabEntry> = serde_json::from_value(labs)
-        .context("the supervisor reported a registry vmlab cannot read")?;
+    use crate::supervisor::registry::{LabEntry, Registry};
+    let labs: Vec<LabEntry> =
+        match SupClient::connect(&crate::paths::supervisor_socket()).await {
+            Ok(supervisor) => {
+                let labs = supervisor
+                    .send(SupRequest::Status {})
+                    .await
+                    .map_err(remote)?;
+                serde_json::from_value(labs)
+                    .context("the supervisor reported a registry vmlab cannot read")?
+            }
+            Err(_) => Registry::load().labs().to_vec(),
+        };
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     match labs.iter().find(|entry| entry.name == name) {
         Some(entry) => entry.claims(name, &root).map_err(anyhow::Error::new),
