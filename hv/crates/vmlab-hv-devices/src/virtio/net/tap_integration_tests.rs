@@ -378,3 +378,40 @@ fn tap_worker_kernel_mq_and_late_call_snapshot_keep_queue_ids() {
     assert_eq!(lock(&f.dev.shared).tap.as_ref().unwrap().pollfds().len(), 2);
     assert!(lock(&f.dev.shared).tap_error.is_none());
 }
+
+/// Review F14 (card #431): a failed packet write is the fault of one
+/// negotiation of the device. A reset starts the next one without it.
+#[test]
+fn a_failed_tap_write_does_not_outlive_a_device_reset() {
+    let (mut f, peers) = tap_worker_fixture(1, false, false);
+    // Only the TAP decides the link from here on.
+    f.switch_down();
+    wait_for("link up on the TAP alone", || f.status() & S_LINK_UP != 0);
+    // A TAP stand-in whose write fails: the peer of the socket is closed.
+    drop(peers);
+    tap_worker_queue_tx(&mut f, 0, Header::default(), &checksum_frame(false), 0);
+    wait_for("the failed TAP write", || {
+        lock(&f.dev.shared).tap_error.is_some()
+    });
+    wait_for("link down after the failed write", || {
+        f.status() & S_LINK_UP == 0
+    });
+    f.dev.quiesce();
+    assert!(f.dev.save_state().is_err());
+    f.dev.resume_snapshot();
+
+    let features = f.dev.features() & !F_EVENT_IDX & !F_MRG_RXBUF;
+    f.dev.reset();
+    // The driver starts with empty rings, as a rebooted guest does.
+    for ring in &f.vqs {
+        f.mem.write_obj(0u16, GuestAddress(ring.avail + 2)).unwrap();
+        f.mem.write_obj(0u16, GuestAddress(ring.used + 2)).unwrap();
+    }
+    f.dev.ack_features(features);
+    f.activate();
+    wait_for("link up after the reset", || f.status() & S_LINK_UP != 0);
+    f.dev.quiesce();
+    let saved = f.dev.save_state();
+    f.dev.resume_snapshot();
+    assert!(saved.is_ok(), "save_state after a reset: {:?}", saved.err());
+}

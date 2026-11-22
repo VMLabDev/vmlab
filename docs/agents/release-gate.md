@@ -143,7 +143,13 @@ SignTool (the former `vdisplay-sign` job on a GitHub Windows runner).
 - `--display staged` (default): the package staged in
   `guest/vdisplay-windows/target/signed-package`, or in
   `VMLAB_VDISPLAY_PACKAGE_DIR` inside the checkout. `guest/package.sh` refuses
-  it when a source file changed after signing.
+  it when a source file changed after signing. When no build input of
+  `guest/vdisplay-windows` changed since a published release, stage the
+  package of that release: `scripts/release-display-from.sh <tag> [checkout]`.
+  It downloads the guest bundle of the release, verifies the signature of its
+  `SHA256SUMS` with cosign the way `install.sh` does (an unsigned release is
+  refused), and stages the package through `package.py`, which compares every
+  build input that the package names with the checkout.
 - `--display rebuild`: runs `guest/vdisplay-windows/rebuild.py --route container`
   first. That compiles in the container and signs in the Windows 11 build lab
   on the host. It needs a built vmlab CLI (`VMLAB_RELEASE_VMLAB`, default
@@ -153,11 +159,21 @@ SignTool (the former `vdisplay-sign` job on a GitHub Windows runner).
   The bundle has no catalog and no certificate. It proves the build, and it is
   never a release.
 
-Left open by card 423: `--display rebuild` was not run on helios. The proof
-of the card built `0.0.0-dry-run` with `--display unsigned`. Helios has the
-Windows 11 template, and no config-weave Windows binary was found in the
-account vmlab. A real version needs one green `--display rebuild`, or a
-signed package staged by hand, before B1.
+Which way to take: compare the build inputs with the last release that has a
+signed package, `git diff --stat <tag> HEAD -- guest/vdisplay-windows`. The
+build inputs are the files that `SOURCES` in `rebuild.py` lists (`README.md`
+and `TESTING.md` are none). No change: stage the package of that release. A
+change: `--display rebuild`. `0.49.0-alpha` (card 444) took the package of
+`v0.48.0-alpha` this way, because the two differ in `README.md` only.
+
+Still open: `--display rebuild` was never run on helios (cards 423 and 444).
+Helios has the Windows 11 template. The account vmlab has no config-weave
+Windows binary. It is the asset `config-weave-windows-x86_64.exe` of a release
+of `github.com/Configweave/config-weave` (with a `SHA256SUMS`), or the output
+of `just install` in that repo. vmlab looks for it in `config_weave_bin_dir`
+of the host config, then `VMLAB_CONFIG_WEAVE_DIR`, then
+`~/.local/share/config-weave/bin`. The first version that changes a build
+input of the driver needs one green `--display rebuild` before B1.
 
 ## Signing: two ways, and the decision of the operator
 
@@ -212,8 +228,11 @@ To turn `key` on:
   `just ci::release-dry-run` fails when the two differ.
 - K4. Deploy that `install.sh` to vmlab.io before the first key-signed
   release.
-- K5. Install cosign v2.6.1 on helios. It has none today. Signing with
-  cosign v3 fails on `--tlog-upload=false`. Verifying works with v2.6.1 and v3.
+- K5. cosign v2.6.1 on the build host: `scripts/install-cosign.sh` downloads
+  the pinned binary, checks its sha256 and puts it in `~/.local/bin` of the
+  account that runs it. The account vmlab on helios has it (card 444). Signing
+  with cosign v3 fails on `--tlog-upload=false`. Verifying works with v2.6.1
+  and v3.
 - K6. Build with `just release::local ... --signing key`. To sign a directory
   that exists: `just release::sign <dir> key`.
 

@@ -69,7 +69,7 @@ release-version:
 # Offline dry-run of the local release: manifest, provenance, both signing ways and the installer through a cosign stub, the upload command, and ci.yml without a release job
 [group('ci')]
 release-dry-run: require-uv
-	uv run --no-project --with pytest==8.4.2 --with PyYAML==6.0.3 python -m pytest -p no:cacheprovider scripts/test_release_assets.py scripts/test_release_workflow.py --junitxml={{quote(release_report)}}
+	uv run --no-project --with pytest==8.4.2 --with PyYAML==6.0.3 python -m pytest -p no:cacheprovider scripts/test_release_assets.py scripts/test_release_workflow.py scripts/test_release_display.py --junitxml={{quote(release_report)}}
 
 # Run clippy with warnings as errors
 [group('ci')]
