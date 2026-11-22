@@ -1741,7 +1741,8 @@ mod tests {
             }
             filler.truncate(filler.len().saturating_sub(3));
         }
-        println!("TRUNK-LISTENER {}", i.addr);
+        // libtest has written `test <name> ... ` on this line already.
+        println!("\nTRUNK-LISTENER {}", i.addr);
         sleep(Duration::from_secs(60)).await;
     }
 
