@@ -772,6 +772,35 @@ mod tests {
         assert!(scan.tree.contains_key("src/main.rs"));
     }
 
+    /// A directory or a FIFO named like a rule file holds no rules, and it
+    /// must not stop the scan: a guest makes one with `mkdir`, it syncs to the
+    /// host, and a scan that failed on it would fail every pass from then on
+    /// (review labd-sync F9). The name is a named skip, the directory still
+    /// syncs as a directory, and the regular rule file beside it applies.
+    #[test]
+    fn a_rule_file_that_is_not_a_file_is_a_named_skip() {
+        let dir = workspace(&[
+            (".gitignore/inner.txt", "x"),
+            (".vmlabignore", "target/\n"),
+            ("target/out", "o"),
+            ("src/main.rs", "y"),
+        ]);
+        let fifo = dir.path().join("src/.vmlabignore");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (scan, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+
+        assert_eq!(scan.tree[".gitignore"].kind, Kind::Dir);
+        assert!(scan.tree.contains_key(".gitignore/inner.txt"));
+        assert!(scan.tree.contains_key("src/main.rs"));
+        assert!(!scan.tree.contains_key("target/out"));
+        assert_eq!(ignores.prune_list(&[]), vec!["target".to_string()]);
+        let refused: Vec<&str> = scan.refused_rules.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(refused, vec![".gitignore", "src/.vmlabignore"]);
+        assert!(scan.refused_rules[0].why.contains("directory"));
+        assert!(scan.refused_rules[1].why.contains("not a regular file"));
+    }
+
     /// The pre-filter's whole job: a path whose own recorded pair still
     /// matches is not hashed, and one whose does not is.
     #[test]
