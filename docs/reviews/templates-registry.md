@@ -37,7 +37,7 @@ much as a Makefile is.
 | F10 | wrong result | The registry HTTP client has no timeout (fixed, #505) |
 | F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest (fixed, #504) |
 | F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" |
-| F13 | wrong result | A cancelled pull removes the work directory under the install that is still running |
+| F13 | wrong result | A cancelled pull removes the work directory under the install that is still running (fixed, #521) |
 | F14 | wrong result | Staging directories of the store, of pulls, of pushes and of the image cache are never swept |
 | F15 | wrong result | The artefact cache shares one `.part` file between concurrent downloads, and uses the declared `sha256` as a file name unchecked |
 | F16 | wrong result | A push onto a tag that holds a plain manifest drops that manifest's architecture |
@@ -547,6 +547,14 @@ much as a Makefile is.
   use: a `write_meta` that deletes `staging/disk.qcow2` and then writes the
   metadata. Expect `install_with` to fail and the version to be absent.
   Today the rename succeeds and `installed()` returns the "corrupt" error.
+- Fixed in card #521: the blocking thread that installs holds the owner of
+  the work directory (`Registry::holding`), so a cancelled pull removes it
+  only when the install has ended (client test
+  `a_cancelled_pull_keeps_its_work_directory_until_the_install_ends`).
+  `install_with` also checks the staged disks again after it writes the
+  metadata and after the rename, and takes out a version that arrived
+  without one. The untrue comment on `cancel_pull` is corrected. The sweep
+  of work directories that a killed process leaves is F14.
 
 ### F14. Staging directories are never swept (wrong result)
 

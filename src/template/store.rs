@@ -463,14 +463,33 @@ impl TemplateStore {
         if dest.exists() {
             self.check_replace(&meta.arch, &meta.name, &meta.version)?;
         }
+        // What the version needs, and held at the first check: the staging
+        // directory is the caller's, and whoever removes it during the
+        // install (a cancelled pull did, review templates-registry F13) must
+        // not leave a version with metadata and no disk.
+        let needed: Vec<PathBuf> = [PathBuf::from(DISK_FILE)]
+            .into_iter()
+            .chain(template_vars(Path::new(""), meta))
+            .chain(
+                meta.variants
+                    .iter()
+                    .map(|v| variant_disk_rel(&v.name))
+                    .filter(|rel| staging.join(rel).is_file()),
+            )
+            .collect();
         (ops.write_meta)(meta, &staging.join(META_FILE))?;
+        still_staged(staging, &needed)?;
         let parent = dest.parent().expect("version dir always has a parent");
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
         if dest.exists() {
-            self.swap_in(staging, &dest, ops)
+            self.swap_in(staging, &dest, &needed, ops)
         } else {
-            self.move_in(staging, &dest, &ops.rename)
+            self.move_in(staging, &dest, &ops.rename)?;
+            // Once more where the remover's path no longer reaches.
+            still_staged(&dest, &needed).inspect_err(|_| {
+                let _ = fs::remove_dir_all(&dest);
+            })
         }
     }
 
@@ -478,7 +497,8 @@ impl TemplateStore {
     /// until the new one is in place:
     ///
     /// 1. `staging` moves to `.next-<version>` beside `dest` (copied first
-    ///    when on another filesystem); the old version is not touched yet,
+    ///    when on another filesystem) and must still hold every file in
+    ///    `needed`; the old version is not touched yet,
     /// 2. the old version is renamed to `.old-<version>`,
     /// 3. `.next-<version>` is renamed to `dest`; on failure the old
     ///    version is renamed back,
@@ -487,10 +507,19 @@ impl TemplateStore {
     /// The dot names keep both out of version listings. An interruption
     /// between 2 and 3 leaves `dest` missing and the old version at
     /// `.old-<version>`; [`recover_swap`] puts it back on the next install.
-    fn swap_in(&self, staging: &Path, dest: &Path, ops: &InstallOps) -> Result<()> {
+    fn swap_in(
+        &self,
+        staging: &Path,
+        dest: &Path,
+        needed: &[PathBuf],
+        ops: &InstallOps,
+    ) -> Result<()> {
         let (next, old) = swap_paths(dest);
         remove_if_present(&next)?;
-        if let Err(e) = self.move_in(staging, &next, &ops.rename) {
+        let moved = self
+            .move_in(staging, &next, &ops.rename)
+            .and_then(|()| still_staged(&next, needed));
+        if let Err(e) = moved {
             let _ = fs::remove_dir_all(&next);
             return Err(e);
         }
@@ -1374,6 +1403,18 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fail unless `dir` holds every file in `needed`, paths relative to it.
+fn still_staged(dir: &Path, needed: &[PathBuf]) -> Result<()> {
+    match needed.iter().find(|rel| !dir.join(rel).is_file()) {
+        None => Ok(()),
+        Some(gone) => bail!(
+            "{} was removed from {} during the install; nothing was installed",
+            gone.display(),
+            dir.display()
+        ),
+    }
 }
 
 /// The filesystem steps of an install. [`InstallOps::REAL`] outside tests.

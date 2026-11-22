@@ -1011,7 +1011,11 @@ impl Registry {
         // overlay: a clone can have been made since the check above.
         let in_use = self.in_use.clone();
         let runtime = tokio::runtime::Handle::current();
+        // An abort of this future does not stop the blocking thread, so the
+        // thread holds the work directory until it ends (F13).
+        let work = self.work.clone();
         let meta = tokio::task::spawn_blocking(move || -> Result<TemplateMeta> {
+            let _work = work;
             let mut variants = Vec::new();
             for (variant, paths, digest) in overlays {
                 let disk = staging.join(crate::template::meta::variant_disk_rel(&variant.name));
@@ -1444,11 +1448,12 @@ pub async fn ensure_registry_template(
     }
     // Its own staging directory, on the store's filesystem: two labs pulling
     // at once must not share (and then delete) one.
-    let work = crate::template::oci_bridge::fresh_work_dir(
+    let work = std::sync::Arc::new(crate::template::oci_bridge::fresh_work_dir(
         &crate::paths::template_store_dir().join(".oci-pull"),
-    )?;
+    )?);
     let meta = registry
         .guarding(in_use)
+        .holding(work.clone())
         .pull_with_progress(Some(arch), store, work.path(), false, want, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
