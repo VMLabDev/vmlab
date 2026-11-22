@@ -319,7 +319,32 @@ pub fn gpu_warnings(
         .iter()
         .filter(|vm| chosen(vm))
         .filter_map(|vm| Some((vm.name.as_str(), vm.gpu.as_ref()?)));
-    crate::qemu::hostgpu::warnings(gpus, &host, &crate::qemu::hostgpu::Sysfs::host())
+    let mut out = crate::qemu::hostgpu::warnings(gpus, &host, &crate::qemu::hostgpu::Sysfs::host());
+    // What a vmlab-hv VM's `gpu {}` earns besides (card #447): the host
+    // GPU's `qemu_env` it ignores, and a render server that is not its
+    // bundle's, judged by this process's `RENDER_SERVER_EXEC_PATH`. The lab
+    // daemon judges its own environment again at the start and logs it.
+    if let Ok(ctx) = HostContext::at(&file.root) {
+        let on_vmlab: Vec<String> = config::validate::vm_hypervisors(&file.lab, &ctx)
+            .into_iter()
+            .filter(|(_, kind)| *kind == crate::config::hypervisor::HypervisorKind::Vmlab)
+            .map(|(name, _)| name)
+            .collect();
+        let gpus = file
+            .lab
+            .vms
+            .iter()
+            .filter(|vm| chosen(vm) && on_vmlab.contains(&vm.name))
+            .filter_map(|vm| vm.gpu.as_ref());
+        let inherited = std::env::var(crate::qemu::hostgpu::RENDER_SERVER_VAR).ok();
+        out.extend(crate::qemu::hostgpu::vmlab_hv_warnings(
+            gpus,
+            &host,
+            std::env::var_os("PATH").as_deref(),
+            inherited.as_deref(),
+        ));
+    }
+    out
 }
 
 /// Full validation of the cwd's lab; every side-effecting verb runs this

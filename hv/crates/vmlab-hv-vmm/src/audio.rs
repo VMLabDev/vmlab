@@ -231,6 +231,11 @@ mod file_recording {
                 .as_ref()
                 .map_or_else(|| self.latency_bytes(), |sink| sink.queued_bytes())
         }
+        fn queue_limit_bytes(&self) -> Option<usize> {
+            self.downstream
+                .as_ref()
+                .and_then(|sink| sink.queue_limit_bytes())
+        }
     }
 
     struct FileSource {

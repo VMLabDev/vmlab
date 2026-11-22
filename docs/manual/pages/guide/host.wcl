@@ -574,9 +574,12 @@ guests.
 A `virgl` or `vulkan` GPU renders on the render node of the host GPU your host
 config picks, exactly as under QEMU, with the same Vulkan filter and
 keep-awake; with no declared GPU it renders on the host's first render node,
-and `up` says which. A host GPU's `qemu_env` also applies to vmlab-hv,
-including `RENDER_SERVER_EXEC_PATH` for the Venus render server.
-`qemu_binary` is ignored with a warning. `passthrough` needs the
+and `up` says which. A host GPU's `qemu_binary` and `qemu_env`
+are QEMU's and do not apply to vmlab-hv: `validate` and `up` warn about each
+and name the ignored variables. A vmlab-hv VM runs the Venus render server of
+its vmlab-hv bundle, and `validate` and `up` warn when it would start another
+one, from `RENDER_SERVER_EXEC_PATH` in your environment or because `vmlab_hv`
+is not a bundle's `bin/vmlab-hv`. `passthrough` needs the
 GPU already bound to `vfio-pci`, which you do yourself; vmlab-hv refuses one
 that is not, and neither it nor vmlab ever rebinds a device. Shares are
 served by vmlab-hv itself from the host directory, so no virtiofsd runs for a

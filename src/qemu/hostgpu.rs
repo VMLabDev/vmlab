@@ -510,8 +510,10 @@ pub fn emulator(qemu_binary: Option<&Path>, arch: &str) -> String {
 ///
 /// On vmlab-hv (`hypervisor`, PRD §22, HV phase-2 D10) the render node, the
 /// Vulkan environment, the filter layer and keep-awake are planned the same
-/// way. `qemu_env` also applies to its shared virglrenderer runtime, while
-/// `qemu_binary` is ignored with a warning. vmlab-hv renders on a
+/// way. `qemu_binary` and `qemu_env` are QEMU's and are ignored with a
+/// warning each ([`qemu_env_ignored_warning`]): an entry written for QEMU,
+/// `RENDER_SERVER_EXEC_PATH` above all, would otherwise replace the render
+/// server of vmlab-hv's own bundle (card #447). vmlab-hv renders on a
 /// node it is named, never one it finds, so a paravirtual GPU no declared
 /// GPU resolves for renders on this host's first render node, and says so.
 pub fn render_plan(
@@ -592,7 +594,7 @@ pub fn render_plan(
     if let Some(decl) = decl
         && vmlab
     {
-        // The executable override is specific to QEMU.
+        // The executable and environment overrides are specific to QEMU.
         if let Some(binary) = &decl.qemu_binary {
             plan.warnings.push(format!(
                 "host GPU `{}`: qemu_binary {} is QEMU's and does not apply on vmlab-hv; \
@@ -601,16 +603,136 @@ pub fn render_plan(
                 binary.display()
             ));
         }
-    } else if let Some(decl) = decl
-        && let Some(binary) = &decl.qemu_binary
-    {
-        check_qemu_binary(&decl.name, binary, arch)?;
-        plan.qemu_binary = Some(binary.clone());
-    }
-    if let Some(decl) = decl {
+        plan.warnings.extend(qemu_env_ignored_warning(decl));
+    } else if let Some(decl) = decl {
+        if let Some(binary) = &decl.qemu_binary {
+            check_qemu_binary(&decl.name, binary, arch)?;
+            plan.qemu_binary = Some(binary.clone());
+        }
         apply_qemu_env(&decl.name, &mut plan.env, &decl.qemu_env)?;
     }
     Ok(plan)
+}
+
+/// The variable virglrenderer reads for the Venus render server to start in
+/// place of its build-time path. vmlab-hv's bundle launcher sets it to the
+/// bundle's own server unless the process already carries one.
+pub const RENDER_SERVER_VAR: &str = "RENDER_SERVER_EXEC_PATH";
+
+/// The warning a host GPU's `qemu_env` earns on vmlab-hv, where it does not
+/// apply: the keys it names, and for [`RENDER_SERVER_VAR`] that the VM runs
+/// its bundle's render server instead. `None` for an empty `qemu_env`.
+pub fn qemu_env_ignored_warning(decl: &HostGpu) -> Option<String> {
+    if decl.qemu_env.is_empty() {
+        return None;
+    }
+    let keys: Vec<&str> = decl.qemu_env.iter().map(|(k, _)| k.as_str()).collect();
+    let server = if keys.contains(&RENDER_SERVER_VAR) {
+        "; the VM runs the render server of its vmlab-hv bundle"
+    } else {
+        ""
+    };
+    Some(format!(
+        "host GPU `{}`: qemu_env ({}) is QEMU's and does not apply on vmlab-hv; ignored{server}",
+        decl.name,
+        keys.join(", ")
+    ))
+}
+
+/// `binary` as a spawn finds it: a path with a `/` as it is, a bare name
+/// through `path` (the `PATH` value).
+pub fn find_binary(binary: &Path, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if binary.components().count() > 1 {
+        return Some(binary.to_path_buf());
+    }
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The warning a `vulkan` VM on vmlab-hv earns when the Venus render server
+/// it will start is not the one of its vmlab-hv bundle (card #325, card
+/// #447: on NVIDIA an unpatched server presents at about 40 frames a
+/// second). `binary` is the vmlab-hv a spawn runs ([`find_binary`]) and
+/// `inherited` the [`RENDER_SERVER_VAR`] of the process that spawns it, which
+/// the bundle's launcher keeps. A bundle is `bin/vmlab-hv`, a launcher
+/// script, beside `libexec/virgl_render_server`. Three cases warn: an
+/// inherited server that is not the bundle's, a vmlab-hv that is no bundle
+/// launcher (virglrenderer then starts its build-time server), and an
+/// inherited server with no bundle to compare it with.
+pub fn render_server_warning(binary: &Path, inherited: Option<&str>) -> Option<String> {
+    let real = binary.canonicalize().ok()?;
+    let root = real.parent().and_then(Path::parent)?;
+    let bundled = root.join("libexec/virgl_render_server");
+    let launcher = real.parent().is_some_and(|dir| dir.ends_with("bin"))
+        && root.join("libexec/vmlab-hv").is_file()
+        && bundled.is_file();
+    let same = |other: &str| {
+        Path::new(other)
+            .canonicalize()
+            .is_ok_and(|other| bundled.canonicalize().is_ok_and(|b| b == other))
+    };
+    match (launcher, inherited.filter(|value| !value.is_empty())) {
+        (true, None) => None,
+        (true, Some(other)) if same(other) => None,
+        (true, Some(other)) => Some(format!(
+            "vmlab-hv starts the Venus render server {other} from {RENDER_SERVER_VAR} in the \
+             environment, not its bundle's {}; an older or unpatched render server costs frame \
+             rate (about 40 frames a second on NVIDIA) — unset {RENDER_SERVER_VAR} unless you \
+             mean to test another server",
+            bundled.display()
+        )),
+        (false, Some(other)) => Some(format!(
+            "vmlab-hv at {} is not a bundle launcher, and starts the Venus render server \
+             {other} from {RENDER_SERVER_VAR} in the environment; no bundle render server is \
+             beside it to compare with",
+            real.display()
+        )),
+        (false, None) => Some(format!(
+            "vmlab-hv at {} is not a bundle launcher (bin/vmlab-hv beside \
+             libexec/virgl_render_server), so virglrenderer starts its build-time Venus render \
+             server, which may lack the bundle's patches — set host {{ vmlab_hv = … }} to a \
+             bundle's bin/vmlab-hv",
+            real.display()
+        )),
+    }
+}
+
+/// What these `vulkan`/`virgl` VMs on vmlab-hv earn short of an error, once
+/// each: the `qemu_env` of the host GPU each picks, ignored
+/// ([`qemu_env_ignored_warning`]), and for a `vulkan` one the render server
+/// that is not its bundle's ([`render_server_warning`]). `validate` and `up`
+/// print them; the start logs the same from its plan.
+pub fn vmlab_hv_warnings<'a>(
+    gpus: impl IntoIterator<Item = &'a Gpu>,
+    host: &HostConfig,
+    path: Option<&std::ffi::OsStr>,
+    inherited: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut venus = false;
+    for gpu in gpus {
+        if gpu.mode == GpuMode::Passthrough {
+            continue;
+        }
+        venus |= gpu.mode == GpuMode::Vulkan;
+        if let Ok(picked) = pick(gpu, host)
+            && let Some(w) = picked.gpu.and_then(qemu_env_ignored_warning)
+            && !out.contains(&w)
+        {
+            out.push(w);
+        }
+    }
+    if venus {
+        let binary = host
+            .vmlab_hv
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("vmlab-hv"));
+        out.extend(
+            find_binary(&binary, path).and_then(|found| render_server_warning(&found, inherited)),
+        );
+    }
+    out
 }
 
 /// Whether any of these `gpu {}` blocks renders on a host GPU nothing
@@ -1298,14 +1420,22 @@ mod tests {
         );
     }
 
-    /// vmlab-hv shares virglrenderer with QEMU, including its render-server
-    /// environment. The QEMU binary override still does not apply.
+    /// vmlab-hv takes the derived Vulkan environment and nothing of the host
+    /// GPU's QEMU-only keys: `qemu_binary` and `qemu_env` are ignored, each
+    /// with a warning, so an entry written for QEMU cannot replace the
+    /// bundle's render server (card #447). QEMU still gets both.
     #[test]
-    fn on_vmlab_hv_gpu_environment_is_applied_and_a_render_node_is_always_named() {
+    fn on_vmlab_hv_qemu_env_is_ignored_and_a_render_node_is_always_named() {
         let sys = fake_host();
         let sysfs = Sysfs::new(sys.path());
         let gone = sys.path().join("nope/qemu-system-x86_64");
-        let h = host_with_qemu(&gone, &[("RENDER_SERVER_EXEC_PATH", "/x")]);
+        let h = host_with_qemu(
+            &gone,
+            &[
+                ("RENDER_SERVER_EXEC_PATH", "/x"),
+                ("VK_LOADER_DRIVERS_SELECT", "*custom*"),
+            ],
+        );
         let on = |gpu: &Gpu, h: &HostConfig| {
             super::render_plan(
                 Some(gpu),
@@ -1322,28 +1452,29 @@ mod tests {
             plan.env
                 .set
                 .iter()
-                .any(|(k, v)| k == "RENDER_SERVER_EXEC_PATH" && v == "/x")
+                .all(|(k, v)| k != "RENDER_SERVER_EXEC_PATH" && v != "*custom*"),
+            "{:?}",
+            plan.env
         );
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
         assert!(plan.warnings[0].contains("qemu_binary") && plan.warnings[0].contains("ignored"));
-        let override_env = host_with_qemu(&gone, &[("VK_LOADER_DRIVERS_SELECT", "*custom*")]);
-        let override_plan = on(&gpu(GpuMode::Vulkan, None), &override_env).unwrap();
         assert_eq!(
-            override_plan
+            plan.warnings[1],
+            "host GPU `Nvidia1`: qemu_env (RENDER_SERVER_EXEC_PATH, VK_LOADER_DRIVERS_SELECT) is \
+             QEMU's and does not apply on vmlab-hv; ignored; the VM runs the render server of \
+             its vmlab-hv bundle"
+        );
+        // The same host GPU on QEMU keeps its environment.
+        let exe = fake_qemu(&sys.path().join("q"), "qemu-system-x86_64");
+        let qemu_host = host_with_qemu(&exe, &[("RENDER_SERVER_EXEC_PATH", "/x")]);
+        let on_qemu = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &qemu_host, &sysfs).unwrap();
+        assert!(
+            on_qemu
                 .env
                 .set
-                .iter()
-                .filter(|(k, _)| k == "VK_LOADER_DRIVERS_SELECT")
-                .collect::<Vec<_>>(),
-            vec![&("VK_LOADER_DRIVERS_SELECT".into(), "*custom*".into())]
+                .contains(&("RENDER_SERVER_EXEC_PATH".into(), "/x".into()))
         );
-        let invalid = host_with_qemu(&gone, &[("A=B", "x")]);
-        assert!(
-            on(&gpu(GpuMode::Vulkan, None), &invalid)
-                .unwrap_err()
-                .to_string()
-                .contains("variable name containing `=`")
-        );
+        assert!(on_qemu.warnings.is_empty(), "{:?}", on_qemu.warnings);
         let qemu = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &host(), &sysfs).unwrap();
         let vmlab = on(&gpu(GpuMode::Vulkan, None), &host()).unwrap();
         assert_eq!(
@@ -1360,6 +1491,98 @@ mod tests {
             "{:?}",
             plan.warnings
         );
+    }
+
+    /// A bundle as `build/hv.py` stages it: the launcher, the binary and the
+    /// render server.
+    fn bundle(root: &Path) -> PathBuf {
+        fake_qemu(&root.join("libexec"), "vmlab-hv");
+        fake_qemu(&root.join("libexec"), "virgl_render_server");
+        fake_qemu(&root.join("bin"), "vmlab-hv")
+    }
+
+    /// The render server a vmlab-hv VM starts is its bundle's, or the start
+    /// says which one it is instead.
+    #[test]
+    fn a_render_server_that_is_not_the_bundles_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = bundle(&dir.path().join("bundle"));
+        let bundled = dir.path().join("bundle/libexec/virgl_render_server");
+        assert_eq!(render_server_warning(&launcher, None), None);
+        assert_eq!(render_server_warning(&launcher, Some("")), None);
+        assert_eq!(
+            render_server_warning(&launcher, Some(bundled.to_str().unwrap())),
+            None
+        );
+        // A symlink to the launcher, as an install puts on PATH, is the bundle.
+        let link = dir.path().join("vmlab-hv");
+        std::os::unix::fs::symlink(&launcher, &link).unwrap();
+        assert_eq!(render_server_warning(&link, None), None);
+
+        let old = fake_qemu(&dir.path().join("old/libexec"), "virgl_render_server");
+        let w = render_server_warning(&launcher, Some(old.to_str().unwrap())).unwrap();
+        assert!(
+            w.contains(old.to_str().unwrap())
+                && w.contains("not its bundle's")
+                && w.contains(bundled.canonicalize().unwrap().to_str().unwrap()),
+            "{w}"
+        );
+
+        // The binary without its launcher: virglrenderer's build-time server.
+        let bare = dir.path().join("bundle/libexec/vmlab-hv");
+        let w = render_server_warning(&bare, None).unwrap();
+        assert!(
+            w.contains("build-time") && w.contains("not a bundle launcher"),
+            "{w}"
+        );
+        let cargo = fake_qemu(&dir.path().join("target/release"), "vmlab-hv");
+        assert!(
+            render_server_warning(&cargo, None)
+                .unwrap()
+                .contains("build-time")
+        );
+        let w = render_server_warning(&cargo, Some("/opt/virgl_render_server")).unwrap();
+        assert!(w.contains("/opt/virgl_render_server"), "{w}");
+        // A vmlab-hv that is not there is the start's refusal, not a warning.
+        assert_eq!(render_server_warning(&dir.path().join("nope"), None), None);
+    }
+
+    /// `validate` and `up` say both things of a vmlab-hv VM before it
+    /// starts: the ignored `qemu_env` of the GPU it picks, once, and a
+    /// render server that is not the bundle's for a `vulkan` one only.
+    #[test]
+    fn vmlab_hv_warnings_name_the_ignored_qemu_env_and_the_render_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = bundle(&dir.path().join("bundle"));
+        let mut h = host_with_qemu(Path::new("/q"), &[("RENDER_SERVER_EXEC_PATH", "/old")]);
+        h.vmlab_hv = Some(launcher.clone());
+        let vulkan = gpu(GpuMode::Vulkan, Some("Nvidia1"));
+        let virgl = gpu(GpuMode::Virgl, Some("Nvidia1"));
+        let amd = gpu(GpuMode::Vulkan, Some("AMD1"));
+        let pass = gpu(GpuMode::Passthrough, Some("Nvidia1"));
+
+        let w = vmlab_hv_warnings([&vulkan, &virgl], &h, None, None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("qemu_env (RENDER_SERVER_EXEC_PATH)"), "{w:?}");
+        assert!(vmlab_hv_warnings([&amd, &pass], &h, None, None).is_empty());
+
+        let w = vmlab_hv_warnings([&amd], &h, None, Some("/old"));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("/old") && w[0].contains("not its bundle's"),
+            "{w:?}"
+        );
+        // `virgl` starts no render server.
+        let w = vmlab_hv_warnings([&gpu(GpuMode::Virgl, Some("AMD1"))], &h, None, Some("/old"));
+        assert!(w.is_empty(), "{w:?}");
+
+        // No `vmlab_hv` in the host config: the one on PATH.
+        h.vmlab_hv = None;
+        let path = std::env::join_paths([dir.path().join("bundle/libexec")]).unwrap();
+        let w = vmlab_hv_warnings([&amd], &h, Some(&path), None);
+        assert!(w[0].contains("build-time"), "{w:?}");
+        let path = std::env::join_paths([dir.path().join("bundle/bin")]).unwrap();
+        assert!(vmlab_hv_warnings([&amd], &h, Some(&path), None).is_empty());
     }
 
     /// A `qemu_binary` that is missing, or is there but cannot run, is
