@@ -1455,7 +1455,8 @@ enum SeedDisk {
 /// `standalone` source is the image a template definition names itself.
 async fn seed_working_disk(src: &Path, standalone: bool, dest: &Path) -> Result<()> {
     let _ = standalone;
-    super::qimg::convert_to_qcow2(src, dest).await
+    super::qimg::convert_to_qcow2(src, dest).await?;
+    Ok(())
 }
 
 struct BuildRun<'a> {
