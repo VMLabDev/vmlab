@@ -1531,9 +1531,16 @@ mod tests {
         // The binary without its launcher: virglrenderer's build-time server.
         let bare = dir.path().join("bundle/libexec/vmlab-hv");
         let w = render_server_warning(&bare, None).unwrap();
-        assert!(w.contains("build-time") && w.contains("not a bundle launcher"), "{w}");
+        assert!(
+            w.contains("build-time") && w.contains("not a bundle launcher"),
+            "{w}"
+        );
         let cargo = fake_qemu(&dir.path().join("target/release"), "vmlab-hv");
-        assert!(render_server_warning(&cargo, None).unwrap().contains("build-time"));
+        assert!(
+            render_server_warning(&cargo, None)
+                .unwrap()
+                .contains("build-time")
+        );
         let w = render_server_warning(&cargo, Some("/opt/virgl_render_server")).unwrap();
         assert!(w.contains("/opt/virgl_render_server"), "{w}");
         // A vmlab-hv that is not there is the start's refusal, not a warning.
@@ -1561,7 +1568,10 @@ mod tests {
 
         let w = vmlab_hv_warnings([&amd], &h, None, Some("/old"));
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("/old") && w[0].contains("not its bundle's"), "{w:?}");
+        assert!(
+            w[0].contains("/old") && w[0].contains("not its bundle's"),
+            "{w:?}"
+        );
         // `virgl` starts no render server.
         let w = vmlab_hv_warnings([&gpu(GpuMode::Virgl, Some("AMD1"))], &h, None, Some("/old"));
         assert!(w.is_empty(), "{w:?}");

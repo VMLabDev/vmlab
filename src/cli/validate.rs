@@ -319,8 +319,7 @@ pub fn gpu_warnings(
         .iter()
         .filter(|vm| chosen(vm))
         .filter_map(|vm| Some((vm.name.as_str(), vm.gpu.as_ref()?)));
-    let mut out =
-        crate::qemu::hostgpu::warnings(gpus, &host, &crate::qemu::hostgpu::Sysfs::host());
+    let mut out = crate::qemu::hostgpu::warnings(gpus, &host, &crate::qemu::hostgpu::Sysfs::host());
     // What a vmlab-hv VM's `gpu {}` earns besides (card #447): the host
     // GPU's `qemu_env` it ignores, and a render server that is not its
     // bundle's, judged by this process's `RENDER_SERVER_EXEC_PATH`. The lab
