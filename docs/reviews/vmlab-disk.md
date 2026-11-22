@@ -23,7 +23,7 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | F1 | data loss | A write to a cluster that QEMU zeroed in place keeps the zero flag, so the written data reads back as zeros (fixed, #542) |
 | F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk (fixed, card #541) |
 | F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster (fixed, card #549) |
-| F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes |
+| F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes (fixed, card #556) |
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data |
 | F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file |
 | F7 | wrong result | A compressed cluster at the end of the file cannot be read |
@@ -179,6 +179,10 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   create snapshot `a`, write its entry again with extra data size 0, create
   snapshot `b`, apply `a`. Expected: `size()` is unchanged and the first
   cluster reads the data of `a`. Today: `size()` is 0.
+- Fixed in card #556. `serialize` writes 8 bytes of extra data (the large
+  vmstate size only) for an entry that records no disk size, so the disk size
+  stays absent through every rewrite and applying the snapshot keeps the
+  current size. An entry with a disk size keeps its 24 bytes.
 
 ### F5. Growing an image shows vmstate as disk data (wrong result)
 
