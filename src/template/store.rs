@@ -2793,7 +2793,11 @@ mod tests {
         let overlay = dir.path().join(variant_disk_rel("standard"));
         fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         let staged = |bit: bool, extension: bool| {
-            fs::write(&overlay, qcow2_header(bit, extension, Some(VARIANT_BACKING))).unwrap();
+            fs::write(
+                &overlay,
+                qcow2_header(bit, extension, Some(VARIANT_BACKING)),
+            )
+            .unwrap();
             let mut variant = variant_meta("standard", true, &base_sha);
             variant.sha256 = sha256_file(&overlay).unwrap();
             let mut m = meta("x86_64", "win", "1");
@@ -2802,7 +2806,8 @@ mod tests {
         };
         staged(false, false).unwrap();
         for (bit, extension) in [(true, true), (true, false), (false, true)] {
-            let err = staged(bit, extension).expect_err(&format!("bit {bit}, extension {extension}"));
+            let err =
+                staged(bit, extension).expect_err(&format!("bit {bit}, extension {extension}"));
             assert!(format!("{err:#}").contains("external data file"), "{err:#}");
         }
     }
