@@ -40,6 +40,7 @@ pub mod record;
 pub mod reload_plan;
 pub mod share_plan;
 mod snapshot_state;
+mod start_gate;
 pub mod state;
 pub mod stop_plan;
 pub mod usb;
@@ -264,7 +265,7 @@ async fn announce_exit(lab: &str) {
 /// switches (§9.2), and cancel + join background tasks so nothing dies
 /// mid-flight.
 async fn teardown(lab: &Arc<LabRuntime>, tasks: &crate::lifecycle::TaskGroup) {
-    let _ = lab.down(&[], false).await;
+    lab.stop_for_exit().await;
     if let Some(mut smb) = lab.smb.lock().await.take() {
         smb.stop();
     }
