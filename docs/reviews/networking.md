@@ -28,7 +28,7 @@ Who the attacker is, per finding:
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466) |
-| F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash |
+| F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467) |
 | F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses |
 | F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment |
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
@@ -124,6 +124,19 @@ Who the attacker is, per finding:
   descriptor. Assert that no neighbour advertisement can be read back within
   one second. Today the host answers. Repeat with the helper process killed
   instead of `unload`.
+- Fixed in card #467. The assumption held: aya attaches through a `bpf_link`,
+  which ends when the helper drops the engine or exits. `XdpEngine::attach`
+  (`src/net/fastpath/engine.rs`) now sets the program on the tap through
+  rtnetlink (`RTM_SETLINK`, `IFLA_XDP`, generic mode). The device then holds
+  the program and its maps until the tap is destroyed, so `unload`, a helper
+  exit and a daemon crash all leave the filter in place. The proof tests are
+  `fastpath_afxdp_tap_is_closed_to_the_host_stack_after_unload` and
+  `fastpath_afxdp_tap_is_closed_to_the_host_stack_after_the_helper_is_killed`
+  (the `fastpath_afxdp_` prefix is what `just fastpath-test` selects by). They
+  run the helper as a real process and read the address from
+  `/proc/net/if_inet6`, which also says when duplicate address detection is
+  over. They need CAP_BPF and CAP_NET_ADMIN, so `just ci::check` does not run
+  them.
 
 ### F3. NAT has no limit on flows or on `ping` subprocesses (security, guest)
 
