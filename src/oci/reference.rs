@@ -74,6 +74,12 @@ impl Reference {
         })
     }
 
+    /// The repository with its host and without a tag
+    /// (`host/owner/[group/]name`): who publishes what this reference names.
+    pub fn source(&self) -> String {
+        format!("{}/{}", self.host, self.repository)
+    }
+
     /// The reference rendered back to canonical text.
     pub fn canonical(&self) -> String {
         format!("{}/{}:{}", self.host, self.repository, self.tag)
