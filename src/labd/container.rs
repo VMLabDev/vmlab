@@ -1115,7 +1115,10 @@ impl ContainerInstance {
     /// state outside snapshot scope, §7.5 semantics). Online captures RAM +
     /// device state into the same qcow2, exactly like a VM; returns whether
     /// the capture was online.
-    async fn take_snapshot(&self, name: &str) -> Result<bool, super::machine::SnapshotCaptureError> {
+    async fn take_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<bool, super::machine::SnapshotCaptureError> {
         use super::machine::SnapshotCaptureError::Attempted;
 
         super::vm::validate_snapshot_name(name)?;
@@ -1127,7 +1130,10 @@ impl ContainerInstance {
                     return Err(anyhow!("{why}").into());
                 }
                 let snapshots = self.capability(|c| c.snapshots()).await?;
-                snapshots.save(name, "scratch", &["scratch"]).await.map_err(Attempted)?;
+                snapshots
+                    .save(name, "scratch", &["scratch"])
+                    .await
+                    .map_err(Attempted)?;
                 Ok(true)
             }
             PowerState::Stopped => {
@@ -1136,7 +1142,8 @@ impl ContainerInstance {
                     return Err(anyhow!(
                         "{}: no scratch disk yet — the container has never started",
                         self.cfg.name
-                    ).into());
+                    )
+                    .into());
                 }
                 let name = name.to_owned();
                 super::machine::finish_offline_snapshot(guard, async move {
@@ -1846,6 +1853,8 @@ mod tests {
         crate::template::qimg::create_blank(&scratch, 1024 * 1024)
             .await
             .unwrap();
+        c.drop_snapshot("missing").await.unwrap();
+        std::fs::remove_file(&scratch).unwrap();
         c.drop_snapshot("missing").await.unwrap();
     }
 

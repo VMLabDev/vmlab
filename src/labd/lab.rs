@@ -3371,14 +3371,17 @@ impl LabRuntime {
             if machine.snapshots.contains_key(snap) || machine.pending_snapshots.contains(snap) {
                 bail!("{vm_name}: snapshot {snap:?} already exists or is pending cleanup");
             }
+            let key = (vm_name.to_owned(), snap.to_owned());
+            if !self.active_captures.lock_recover().insert(key.clone()) {
+                bail!("{vm_name}: snapshot {snap:?} is still being captured");
+            }
+            let active = ActiveCapture { lab: self, key };
             machine.pending_snapshots.insert(snap.to_string());
             if let Err(error) = state.save(&self.lab_local) {
                 state.machine_mut(vm_name).pending_snapshots.remove(snap);
                 return Err(error);
             }
-            let key = (vm_name.to_owned(), snap.to_owned());
-            self.active_captures.lock_recover().insert(key.clone());
-            ActiveCapture { lab: self, key }
+            active
         };
         let online = match m.snapshot(snap).await {
             Ok(online) => online,
@@ -3386,7 +3389,10 @@ impl LabRuntime {
                 let mut state = self.state.lock().await;
                 state.machine_mut(vm_name).pending_snapshots.remove(snap);
                 if let Err(save) = state.save(&self.lab_local) {
-                    state.machine_mut(vm_name).pending_snapshots.insert(snap.to_owned());
+                    state
+                        .machine_mut(vm_name)
+                        .pending_snapshots
+                        .insert(snap.to_owned());
                     return Err(error.context(format!("could not clear pending capture: {save:#}")));
                 }
                 return Err(error);
@@ -3725,10 +3731,15 @@ impl LabRuntime {
         if record.is_none() && !machine.pending_snapshots.contains(snap) {
             return Err(missing_snapshot(vm_name, snap).into());
         }
-        if self.active_captures.lock_recover().contains(&(vm_name.to_owned(), snap.to_owned())) {
+        if self
+            .active_captures
+            .lock_recover()
+            .contains(&(vm_name.to_owned(), snap.to_owned()))
+        {
             return Err(crate::proto::CommandError::conflict(format!(
                 "{vm_name}: snapshot {snap:?} is still being captured"
-            )).into());
+            ))
+            .into());
         }
         if let Some(g) = record.and_then(|r| r.frozen_in) {
             return Err(
@@ -3760,15 +3771,14 @@ impl LabRuntime {
             }
         }
         let machine = state.machine_mut(vm_name);
-        let removed = machine.snapshots.remove(snap);
+        machine.snapshots.remove(snap);
         let pending = machine.pending_snapshots.remove(snap);
         if let Err(error) = state.save(&self.lab_local) {
-            let machine = state.machine_mut(vm_name);
-            if let Some(record) = removed {
-                machine.snapshots.insert(snap.to_owned(), record);
-            }
             if pending {
-                machine.pending_snapshots.insert(snap.to_owned());
+                state
+                    .machine_mut(vm_name)
+                    .pending_snapshots
+                    .insert(snap.to_owned());
             }
             return Err(error);
         }
@@ -4586,7 +4596,9 @@ mod tests {
                 return Err(anyhow!("injected capture refusal").into());
             }
             if self.snapshot_failure {
-                return Err(SnapshotCaptureError::Attempted(anyhow!("injected snapshot failure")));
+                return Err(SnapshotCaptureError::Attempted(anyhow!(
+                    "injected snapshot failure"
+                )));
             }
             Ok(self.online_snapshots)
         }
@@ -4820,7 +4832,14 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
         let error = lab.snapshot("a", "capture").await.unwrap_err();
         assert_eq!(error.to_string(), "injected capture refusal");
         lab.snapshot("a", "invalid/name").await.unwrap_err();
-        assert!(lab.snapshots("a").await.unwrap().as_array().unwrap().is_empty());
+        assert!(
+            lab.snapshots("a")
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let disk = std::fs::read_to_string(lab.lab_local.join("state.json")).unwrap();
         assert!(!disk.contains("\"capture\""));
     }
@@ -4839,11 +4858,21 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
         );
         {
             let mut state = lab.state.lock().await;
-            state.machine_mut("a").pending_snapshots.insert("interrupted".into());
+            state
+                .machine_mut("a")
+                .pending_snapshots
+                .insert("interrupted".into());
             state.save(&lab.lab_local).unwrap();
         }
         lab.delete_snapshot("a", "interrupted").await.unwrap();
-        assert!(lab.snapshots("a").await.unwrap().as_array().unwrap().is_empty());
+        assert!(
+            lab.snapshots("a")
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(lab.snapshot("a", "interrupted").await.is_ok());
     }
 
