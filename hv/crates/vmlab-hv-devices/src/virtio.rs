@@ -16,6 +16,21 @@ pub mod pci;
 pub mod sound;
 pub mod worker;
 
+/// Whether the driver's `avail.idx` is one the queue can hold: at most the
+/// queue size ahead of the next chain the device takes. A driver that writes
+/// an index further ahead has broken the ring. No chain can be taken from it,
+/// while `enable_notification` still reports that buffers are waiting, so a
+/// drain loop that repeats on that answer must check this first and stop.
+pub(crate) fn avail_idx_in_range<M>(queue: &virtio_queue::Queue, mem: &M) -> bool
+where
+    M: vm_memory::GuestMemory + ?Sized,
+{
+    use virtio_queue::QueueT as _;
+    queue
+        .avail_idx(mem, std::sync::atomic::Ordering::Acquire)
+        .is_ok_and(|idx| idx.0.wrapping_sub(queue.next_avail()) <= queue.size())
+}
+
 /// Test doubles shared by the virtio device and transport tests: an
 /// in-memory [`vmlab_disk::DiskImage`] and interrupt sinks that record what
 /// they delivered.
@@ -25,6 +40,19 @@ pub(crate) mod testing {
 
     use parking_lot::Mutex;
     use vmlab_disk::{DiskImage, Error, Result, SnapshotInfo};
+
+    /// Run `f` on its own thread and give its result, or `None` when it has
+    /// not returned after two seconds. For a call that a fault makes spin
+    /// forever: the test fails instead of hanging the run.
+    pub(crate) fn returns_in_time<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+    }
 
     /// An in-memory disk image with a deterministic byte pattern. Content
     /// and discard log are shared by handle so tests can observe them after

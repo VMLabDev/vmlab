@@ -91,9 +91,18 @@ Not read:
   and `fs.read` return the old content and that the created entry has a node
   id other than X. Today the read returns `new` and the id is X.
 - Confidence: high.
+- Fixed in card #391. `rename` moves the inode, and every known inode below
+  it, to the new path in `by_path`, and gives the moved inode its new parent
+  descriptor and name. A replaced destination loses the name, and
+  `RENAME_EXCHANGE` swaps both subtrees. The proposed test failed before the
+  fix (the create returned X) and passes after it. Not fixed here: `unlink`
+  and `rmdir` still leave the removed name in `by_path`, and the inode a
+  rename replaced keeps its old `path` for the snapshot.
 
 ### F2. virtio-fs: after a restore, a handle whose file is gone accepts writes and reports success
 
+- Fixed in #392. Restored file handles without a reopened file return
+  `ESTALE` on read, write and fsync.
 - Where: `devices/virtio/fs/passthrough.rs:352-357`, `1285-1298`
   (`reopen_dead`), `1124-1138` (`file_handle`).
 - Fault: the handle is reopened on `/dev/null` with `O_RDWR`. The comments
@@ -134,6 +143,9 @@ Not read:
 - Confidence: high for the server side. Medium that a Linux guest sends the
   second write for `echo a >> f; echo b >> f`. An end-to-end run in a guest
   settles it.
+- Fixed in card #398. OPEN and CREATE clear host `O_APPEND` when writeback
+  is negotiated, so writes honor the guest offset. Snapshots now record
+  the negotiated setting.
 
 ### F4. virtio-sound: `PCM_INFO` allocates the guest's `size` field with no limit
 
@@ -153,6 +165,10 @@ Not read:
   that `guest.device.lock().control(&request)` returns at most
   `4 + 2 * PCM_INFO_LEN` bytes. Today it returns more than 512 MiB.
 - Confidence: high.
+- Fixed in card #393. A `size` above `PCM_INFO_SIZE_MAX` (256) is answered
+  `S_BAD_MSG` before anything is allocated. A smaller `size` above the
+  structure's 32 bytes is still zero-padded. The proposed test failed before
+  the fix (a 512 MiB reply) and passes after it.
 
 ### F5. A descriptor chain is copied into host memory whole, with no limit (block, sound)
 
@@ -190,9 +206,33 @@ Not read:
   - Twins `rx_message_larger_than_a_period_pulls_one_period` and
     `control_request_longer_than_any_request_is_bad_msg`.
 - Confidence: high.
+- Fixed in card #393.
+  - Block: `VIRTIO_BLK_T_OUT` checks the range against the disk before it
+    copies anything. Both scatter-gather paths then move a request through
+    `io_buffer` in pieces of at most `IO_CHUNK` (1 MiB), so the buffer no
+    longer follows the chain length or the disk size. A write that fails in
+    the image partway can leave the earlier pieces written, with `S_IOERR`.
+  - Sound tx: a message with more PCM than the stream's `buffer_bytes`, or
+    than `PCM_MESSAGE_MAX` (1 MiB), completes with `S_IO_ERR`. A message
+    that is not played is not copied at all.
+  - Sound rx: one message is filled with at most one `period_bytes`, and at
+    most `PCM_MESSAGE_MAX`.
+  - Sound control: a request longer than 24 bytes (`SET_PARAMS`, the longest
+    one served) is answered `S_BAD_MSG` without being read.
+  - The four proposed tests and `large_requests_are_staged_in_bounded_pieces`
+    (block, both directions) failed before the fix and pass after it.
+  - Not fixed here: `set_params` still accepts any `buffer_bytes` and
+    `period_bytes`. The two caps above bound what that can cost.
 
 ### F6. An `avail.idx` far ahead makes the queue drain loop spin forever (block, virtio-fs, GPU)
 
+- Fixed in #399. The three drain loops check `avail_idx_in_range`
+  (`devices/virtio.rs`) before each pass and stop on an index more than the
+  queue size ahead. The test `avail_idx_far_ahead_does_not_spin` in the
+  block, virtio-fs and GPU tests fails before the fix (`queue_notify` does
+  not return in two seconds) and passes after it. The device is not marked
+  `DEVICE_NEEDS_RESET`: it ignores the queue until the index is valid again,
+  as virtio-net does.
 - Where: `devices/virtio/block.rs:445-476`,
   `devices/virtio/fs/device.rs:137-166`,
   `devices/virtio/gpu/mod.rs:1274-1307`.
