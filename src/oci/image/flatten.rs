@@ -170,7 +170,9 @@ fn survey_layers(
                     ordinal: entries,
                     origin,
                 };
-                if winners.apply(record, &name, kind)? && kind == EntryType::Link && origin.is_some()
+                if winners.apply(record, &name, kind)?
+                    && kind == EntryType::Link
+                    && origin.is_some()
                 {
                     winners.count_name_bytes(name.len())?;
                     winners.links.push((name, record));
@@ -333,8 +335,12 @@ impl Survivors {
         let mut links = HashMap::<_, Vec<_>>::new();
         for (name, link) in &self.links {
             ensure_running(cancel)?;
-            if self.entry(name).is_some_and(|entry| entry.ordinal == link.ordinal) {
-                links.entry(link.origin.expect("recorded link has an origin"))
+            if self
+                .entry(name)
+                .is_some_and(|entry| entry.ordinal == link.ordinal)
+            {
+                links
+                    .entry(link.origin.expect("recorded link has an origin"))
                     .or_default()
                     .push(name.as_str());
             }
@@ -1186,16 +1192,8 @@ mod tests {
         assert_eq!(winner("etc/version"), Some(1), "last writer wins");
         assert_eq!(winner("gone"), None, "whiteout deletes");
         assert_eq!(winner("opq/lower"), None, "opaque drops lower");
-        assert_eq!(
-            winner("opq/upper"),
-            Some(1),
-            "opaque keeps same layer"
-        );
-        assert_eq!(
-            winner("tree/child"),
-            None,
-            "file shadows lower dir tree"
-        );
+        assert_eq!(winner("opq/upper"), Some(1), "opaque keeps same layer");
+        assert_eq!(winner("tree/child"), None, "file shadows lower dir tree");
         assert_eq!(winner("tree"), Some(1));
     }
 }
