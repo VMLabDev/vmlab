@@ -406,14 +406,22 @@ fn family_matches(filter: Option<&str>, arch: &str, name: &str) -> bool {
 /// Best-effort: unreadable labs and images end a chain early rather than
 /// failing, so a scan hiccup never blocks a prune.
 pub(super) async fn clones_by_backing() -> Vec<(PathBuf, String)> {
-    let reg = super::registry::Registry::load();
-    let registered: Vec<(String, PathBuf)> = reg
+    clones_of(&registered_labs()).await
+}
+
+/// Every registered lab, as (name, root).
+fn registered_labs() -> Vec<(String, PathBuf)> {
+    super::registry::Registry::load()
         .labs()
         .iter()
         .map(|l| (l.name.clone(), l.root.clone()))
-        .collect();
+        .collect()
+}
+
+/// [`clones_by_backing`] over the labs `registered` names.
+async fn clones_of(registered: &[(String, PathBuf)]) -> Vec<(PathBuf, String)> {
     let roots = backing::scan_roots(
-        &registered,
+        registered,
         crate::freeze::main_lab_root,
         crate::freeze::worktree_lab_roots,
     );
@@ -461,34 +469,73 @@ pub async fn export(reference: String, out: PathBuf) -> Result<Value, CommandErr
     Ok(Value::Null)
 }
 
+/// `store` as an install with `overwrite` must see it: refusing to replace
+/// a version while a clone in one of the `labs`, or in the rest of a lab's
+/// worktree family, is backed by one of its disks. Replacing a version
+/// deletes its disks exactly as removing it does, and every clone is a delta
+/// against them. Without `overwrite` no version is replaced and no lab is
+/// scanned.
+async fn guarding_replace(
+    store: TemplateStore,
+    overwrite: bool,
+    labs: &[(String, PathBuf)],
+) -> TemplateStore {
+    if !overwrite {
+        return store;
+    }
+    let in_use = clones_of(labs).await;
+    store.refusing_replace(move |doomed| backed_clones_reason(&in_use, doomed))
+}
+
 /// `store.import`: read a template back out of an archive, with its
-/// variants (§6.6).
+/// variants (§6.6). With `overwrite` it is refused while a clone is backed
+/// by the version it would replace.
 pub async fn import(
     archive: PathBuf,
     overwrite: bool,
     trust_scripts: bool,
 ) -> Result<Value, CommandError> {
-    let meta = tokio::task::spawn_blocking(move || {
-        store().import_trusting_scripts(&archive, overwrite, trust_scripts)
-    })
+    let meta = import_into(
+        store(),
+        &registered_labs(),
+        archive,
+        overwrite,
+        trust_scripts,
+    )
     .await
-    .map_err(|e| e.to_string())?
     .map_err(|e| format!("{e:#}"))?;
     let mut result = answer(InstalledVersion::of(&meta))?;
     result["script_paths"] = serde_json::json!(crate::template::trust::script_paths(&meta));
     Ok(result)
 }
 
+/// [`import`] into `store`, with `labs` the registered labs.
+async fn import_into(
+    store: TemplateStore,
+    labs: &[(String, PathBuf)],
+    archive: PathBuf,
+    overwrite: bool,
+    trust_scripts: bool,
+) -> Result<TemplateMeta> {
+    let store = guarding_replace(store, overwrite, labs).await;
+    tokio::task::spawn_blocking(move || {
+        store.import_trusting_scripts(&archive, overwrite, trust_scripts)
+    })
+    .await
+    .context("template import task")?
+}
+
 /// `store.pull`: download a published template into the store — the base,
 /// its default variant, and the variant a `#<variant>` names or, with
-/// `all_variants`, every one (§6.6).
+/// `all_variants`, every one (§6.6). With `overwrite` it is refused while a
+/// clone is backed by the version it would replace.
 pub async fn pull(
     target: String,
     arch: Option<String>,
     overwrite: bool,
     all_variants: bool,
 ) -> Result<Value, CommandError> {
-    let store = store();
+    let store = guarding_replace(store(), overwrite, &registered_labs()).await;
     let meta = crate::template::oci_bridge::pull(
         &target,
         arch.as_deref(),
@@ -836,6 +883,71 @@ mod tests {
         );
         let why = backed_clones_reason(&clones, &[standard, extra]).expect("in use");
         assert!(why.contains("lab/x, lab/y"), "{why}");
+    }
+
+    /// A store version `x86_64/t@1` whose base is a blank qcow2 of `size`
+    /// bytes, exported to `archive`.
+    fn archive_of_a_version(dir: &std::path::Path, size: u64, archive: &std::path::Path) {
+        use crate::template::store::{DISK_FILE, sha256_file};
+        let source = TemplateStore::new(dir.join("templates"));
+        std::fs::create_dir_all(source.root()).unwrap();
+        let staging = tempfile::tempdir_in(source.root()).unwrap().keep();
+        let disk = staging.join(DISK_FILE);
+        crate::template::qimg::tool()
+            .create_blank(&disk, size)
+            .unwrap();
+        let mut m = meta("x86_64", "t", "1");
+        m.sha256 = Some(sha256_file(&disk).unwrap());
+        source.install(&staging, &m, false).unwrap();
+        source.export("x86_64", "t", Some("1"), archive).unwrap();
+    }
+
+    /// An import with `overwrite` deletes the version's disks as a removal
+    /// does, so it is refused the same way while a clone in a registered lab
+    /// is backed by one, and the version stays as it was (review
+    /// templates-registry F2).
+    #[tokio::test]
+    async fn an_overwriting_import_is_refused_while_a_clone_is_backed_by_the_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.tar.zst");
+        let second = tmp.path().join("second.tar.zst");
+        archive_of_a_version(&tmp.path().join("a"), 1 << 20, &first);
+        archive_of_a_version(&tmp.path().join("b"), 2 << 20, &second);
+
+        let store = TemplateStore::new(tmp.path().join("store"));
+        std::fs::create_dir_all(store.root()).unwrap();
+        import_into(store.clone(), &[], first, false, false)
+            .await
+            .unwrap();
+        let installed = store.resolve_version("x86_64", "t", Some("1")).unwrap();
+        let before = std::fs::read(&installed.disk_path).unwrap();
+
+        // A registered lab whose machine `dc01` runs on a linked clone of
+        // the installed disk.
+        let lab_root = tmp.path().join("lab");
+        let machine = crate::paths::lab_local_dir(&lab_root).join("vms/dc01");
+        std::fs::create_dir_all(&machine).unwrap();
+        crate::template::qimg::tool()
+            .create_linked_clone(
+                &installed.disk_path.canonicalize().unwrap(),
+                &machine.join("disk0.qcow2"),
+            )
+            .unwrap();
+        let labs = vec![("corp".to_string(), lab_root)];
+
+        let err = import_into(store.clone(), &labs, second.clone(), true, false)
+            .await
+            .expect_err("the clone of corp/dc01 is backed by the version");
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to replace"), "{text}");
+        assert!(text.contains("corp/dc01"), "{text}");
+        assert_eq!(std::fs::read(&installed.disk_path).unwrap(), before);
+
+        // With no clone backed by it, the same import replaces the version.
+        import_into(store.clone(), &[], second, true, false)
+            .await
+            .unwrap();
+        assert_ne!(std::fs::read(&installed.disk_path).unwrap(), before);
     }
 
     #[test]

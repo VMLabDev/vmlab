@@ -104,6 +104,14 @@ Not read:
   Assert the error, and assert that the file still reads `keep me`. Repeat
   with the mock agent of
   `a_transfer_against_an_agent_without_the_feature_is_refused`.
+- Fixed in card #463. `pull_file_as` opens the file session first, pulls
+  into a new file beside the destination and renames it over the destination
+  only after the digest matched. A failed pull removes that file. An existing
+  destination keeps its mode and is written through a symlink. A destination
+  that exists and is not a regular file (a device, a FIFO) is written
+  directly, as before. The test failed before the fix (the file read empty)
+  and passes after it. Not fixed here: `FileOps::pull_to`, the syncer's pull,
+  still creates its destination first. The syncer gives it a temp path.
 
 ### F2. An inline push writes its bytes to one predictable file in the shared temp directory
 
