@@ -42,13 +42,15 @@ pub(crate) fn fresh_work_dir(base: &Path) -> Result<tempfile::TempDir> {
 
 /// Pull `target` — a registry reference, maybe ending `#<variant>` — into
 /// `store`: the base, its default variant, and the variant named or, with
-/// `all_variants`, every one (§6.6).
+/// `all_variants`, every one (§6.6). `in_use` is asked before a variant
+/// overlay the store holds is replaced by a rebuilt one.
 pub async fn pull(
     target: &str,
     arch: Option<&str>,
     store: &TemplateStore,
     overwrite: bool,
     all_variants: bool,
+    in_use: super::build::InUse,
 ) -> Result<TemplateMeta> {
     let (reference, variant) =
         crate::config::model::split_variant(target).map_err(anyhow::Error::msg)?;
@@ -63,6 +65,7 @@ pub async fn pull(
     // directory so a concurrent one cannot delete it.
     let work = fresh_work_dir(&crate::paths::template_store_dir().join(".oci-pull"))?;
     registry
+        .guarding(in_use)
         .pull_with_progress(arch, store, work.path(), overwrite, &want, &mut |_| {})
         .await
 }

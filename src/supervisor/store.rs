@@ -436,6 +436,19 @@ pub(super) async fn clones_by_backing() -> Vec<(PathBuf, String)> {
     out
 }
 
+/// The in-use check a variant rebuild and a pull ask before they replace a
+/// variant overlay (§6.6): the clones of every registered lab backed by the
+/// given disks, read when it is asked. It reads the lab registry and the
+/// labs' disks only, so a lab daemon can ask it as well as the supervisor.
+pub(crate) fn in_use_check() -> crate::template::build::InUse {
+    Arc::new(|disks| {
+        Box::pin(async move {
+            let clones = clones_by_backing().await;
+            backed_clones_reason(&clones, &disks)
+        })
+    })
+}
+
 /// `store.export`: write one template to a portable archive.
 pub async fn export(reference: String, out: PathBuf) -> Result<Value, CommandError> {
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -482,6 +495,7 @@ pub async fn pull(
         &store,
         overwrite,
         all_variants,
+        in_use_check(),
     )
     .await
     .context("pulling from registry")
