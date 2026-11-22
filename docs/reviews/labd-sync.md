@@ -48,7 +48,7 @@ depends on what a real guest or agent does, the finding says so.
 | F3 (fixed, card #390) | A restore does not flush and does not refuse on unsynced guest work | Data loss (guest work) |
 | F4 | A re-seed never completes while the tree holds a socket, an unreadable path or an oversize file | Wrong result (sync stops for good) |
 | F5 (fixed, card #404) | A halted workspace keeps every path the guest reports, without a bound and without checking it is a path | Security against a hostile guest (host memory and CPU) |
-| F6 | A guest or host file that changed without a settled event is carried anyway, so the quiet period and the git lock deferral are bypassed | Wrong result (torn copy on the host) |
+| F6 (fixed, card #418) | A guest or host file that changed without a settled event is carried anyway, so the quiet period and the git lock deferral are bypassed | Wrong result (torn copy on the host) |
 | F7 | A guest delete made while the watch reopens for a new prune list is undone | Wrong result |
 | F8 | An ignore rule written in the guest applies one pass late, so the output it ignores is copied to the host and stays | Wrong result |
 | F9 | A directory named `.gitignore` or `.vmlabignore` fails every pass | Wrong result (sync stops) |
@@ -262,6 +262,16 @@ and `a_halt_does_not_keep_paths_that_exist_on_neither_side`.
 process.
 
 ### F6. A change with no settled event is carried, so the debounce is bypassed
+
+**Fixed in #418.** A steady-state pass defers a path that moved on either side
+with no settled event, and starts its quiet period. The path is decided once
+that period is over, or once a pass sees it in the same state a quiet period
+later. A pass that sees `.git`'s mutable set moved asks the guest for the lock
+names git uses (`<file>.lock` for each mutable file, and `<path>.lock` beside
+each moved path) before the watch has named one. Two limits remain. A stat-walk
+pass is not changed: it runs where events were lost, and only a walk under a
+flush holds changed guest paths back. A git lock with another name is still
+known only from the watch.
 
 **Where.** `src/labd/workspace/syncer.rs:1666-1678` (the probe set is the whole
 host tree and the whole ledger), `syncer.rs:1211-1217` (the `select!`),

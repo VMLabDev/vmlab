@@ -94,7 +94,7 @@ use super::halt::{self, Halt};
 use super::ignore::{TEMP_PREFIX, is_syncer_own, validate_entry_name};
 use super::ledger::{Kind, Ledger};
 use super::locks;
-use super::plan::{Inputs, Oversize, Volume, Winner, reconcile};
+use super::plan::{Inputs, Oversize, State, Volume, Winner, has_moved, reconcile};
 use super::scan::{Skip, guest_locks, guest_walk, host_scan, join_guest, probe_guest};
 use super::watcher::{Debounce, HostEvent, HostWatch, QUIET};
 use super::windows::{GuestRun, Learned, Preconditions, prepare_root, set_line_endings};
@@ -843,6 +843,9 @@ async fn run(
     // a path once, at the moment it appears, so a lock held across several
     // passes has to be re-asked about rather than re-reported.
     let mut lock_candidates: BTreeSet<String> = BTreeSet::new();
+    // What the passes have seen at each moved path, so a change no event has
+    // named yet waits out a quiet period exactly once.
+    let mut sighted = Sighted::default();
     // What the marker file at the guest's workspace root currently says, so it
     // is written when the halt changes and not once a pass.
     let mut marker: Option<String> = None;
@@ -1095,6 +1098,7 @@ async fn run(
                     unwitnessed: rescan && unwitnessed,
                     flush,
                     lock_candidates: &lock_candidates,
+                    sighted: &sighted,
                     resolved: &resolutions,
                     previous_halt: syncer.report().halt,
                     marker: marker.clone(),
@@ -1125,6 +1129,18 @@ async fn run(
                     owed.extend(done.deferred);
                     host_dirty = done.host_deferred;
                     lock_candidates = done.locks;
+                    sighted = done.sighted;
+                    // Found moved with no event behind them: their quiet
+                    // period starts here, and an event that does arrive
+                    // starts it again. The guest's are in flight from now on,
+                    // so they are listed as unsynced below.
+                    let now = Instant::now();
+                    for path in done.found_host {
+                        host_debounce.touch(path, now);
+                    }
+                    for path in done.found_guest {
+                        guest_debounce.touch(path, now);
+                    }
                     look_again = if !done.report.deferred.is_empty() {
                         Some(Instant::now() + LOCK_RETRY)
                     } else {
@@ -1587,6 +1603,8 @@ struct Pending<'a> {
     flush: bool,
     /// Guest-side git locks seen on an earlier pass and not yet observed gone.
     lock_candidates: &'a BTreeSet<String>,
+    /// What earlier passes saw at each path that had moved, and since when.
+    sighted: &'a Sighted,
     /// Who wins where, as the developer has already said.
     resolved: &'a BTreeMap<String, Winner>,
     /// Conflicts a deferred comparison cannot clear.
@@ -1594,6 +1612,110 @@ struct Pending<'a> {
     /// What the guest's halt marker currently says, so an unchanged halt does
     /// not rewrite it once a pass.
     marker: Option<String>,
+}
+
+/// What a pass saw at one path that had moved against the ledger, and when it
+/// first saw exactly that.
+#[derive(Debug, Clone)]
+struct Sighting {
+    /// `None` where the side no longer holds the path.
+    state: Option<State>,
+    since: Instant,
+}
+
+/// Each side's moved paths as the passes have seen them.
+///
+/// **The debounce's rule, for a change no event has named yet.** A steady
+/// pass stats every agreed path, so it finds a file that moved whether or not
+/// the watch has reported it — and the report may simply not have arrived:
+/// the loop reads one event a turn, and a pass another path asked for can run
+/// while the event for this one waits in the channel. Deciding such a path at
+/// once would read a file in the middle of being written. So a moved path
+/// with no settled event behind it is decided only once a pass has seen it in
+/// the same state a quiet period earlier, and until then it is deferred and
+/// handed to the debounce like a reported one.
+///
+/// The record is what keeps that from repeating. A path that differs from
+/// the ledger for good and that no action clears — a file the size guard
+/// refuses, say — would otherwise be found afresh by every pass and never
+/// read as still.
+#[derive(Debug, Clone, Default)]
+struct Sighted {
+    host: BTreeMap<String, Sighting>,
+    guest: BTreeMap<String, Sighting>,
+}
+
+/// One side's moved paths this pass, and which of them moved with nothing to
+/// say they have stopped.
+struct Unsettled {
+    /// Every moved path, for the next pass to compare against.
+    sighted: BTreeMap<String, Sighting>,
+    /// The ones to defer: no settled event, not already in flight, and not
+    /// seen in this state a quiet period ago.
+    found: BTreeSet<String>,
+    /// Deferred without a quiet period of their own: gone from under a
+    /// directory that is itself still in one, and decided with it.
+    riding: BTreeSet<String>,
+}
+
+/// Work out one side's [`Unsettled`].
+///
+/// `reported` is what the watch named and the debounce let settle, `waiting`
+/// what is in a quiet period already, and `decided` the paths whose state an
+/// earlier pass has put in front of the developer — a halted path, or one a
+/// resolution names — which a second quiet period would only keep halted for
+/// one pass more.
+///
+/// **A directory's report speaks for what went with it.** A delete expands
+/// through the ledger rather than through the event stream, because the
+/// platforms disagree about whether a removed tree is reported entry by entry.
+/// So a path this side no longer holds, under a directory the watch named, is
+/// reported when that directory is, and waits exactly as long as it does.
+fn unsettled(
+    tree: &BTreeMap<String, State>,
+    ledger: &Ledger,
+    before: &BTreeMap<String, Sighting>,
+    reported: &BTreeSet<String>,
+    waiting: &BTreeSet<String>,
+    decided: &dyn Fn(&str) -> bool,
+    now: Instant,
+) -> Unsettled {
+    let mut out = Unsettled {
+        sighted: BTreeMap::new(),
+        found: BTreeSet::new(),
+        riding: BTreeSet::new(),
+    };
+    let under = |path: &str, dirs: &BTreeSet<String>| {
+        path.match_indices('/')
+            .any(|(end, _)| dirs.contains(&path[..end]))
+    };
+    let paths: BTreeSet<&String> = tree.keys().chain(ledger.entries.keys()).collect();
+    for path in paths {
+        let state = tree.get(path);
+        if !has_moved(state, ledger.entries.get(path)) {
+            continue;
+        }
+        let since = before
+            .get(path)
+            .filter(|seen| seen.state.as_ref() == state)
+            .map(|seen| seen.since);
+        let still = since.is_some_and(|since| now.duration_since(since) >= QUIET);
+        if !still && !reported.contains(path) && !waiting.contains(path) && !decided(path) {
+            if state.is_none() && under(path, waiting) {
+                out.riding.insert(path.clone());
+            } else if !(state.is_none() && under(path, reported)) {
+                out.found.insert(path.clone());
+            }
+        }
+        out.sighted.insert(
+            path.clone(),
+            Sighting {
+                state: state.cloned(),
+                since: since.unwrap_or(now),
+            },
+        );
+    }
+    out
 }
 
 /// What a completed pass tells the loop.
@@ -1609,6 +1731,13 @@ struct Passed {
     host_deferred: BTreeSet<String>,
     /// Guest-side locks still held, to re-ask about next pass.
     locks: BTreeSet<String>,
+    /// Each side's moved paths as this pass saw them.
+    sighted: Sighted,
+    /// Host paths that moved with no settled event: their quiet period starts
+    /// now.
+    found_host: BTreeSet<String>,
+    /// The same on the guest's side.
+    found_guest: BTreeSet<String>,
     /// Resolutions to hand back: their apply failed, so the developer's answer
     /// has not been carried out yet.
     unresolved: BTreeMap<String, Winner>,
@@ -1746,9 +1875,90 @@ async fn pass(
         rehash.extend(skips.iter().map(|skip| skip.path.clone()));
     }
 
+    // The ignore rules live in the tree and change under the syncer. A ledger
+    // path the developer has just ignored is not a delete on either side: it
+    // leaves the ledger and both copies stay where they are.
+    let guest_owned: BTreeSet<String> = ledger
+        .entries
+        .iter()
+        .filter(|(path, agreed)| {
+            ignores
+                .verdict(path, agreed.kind == Kind::Dir)
+                .is_guest_owned()
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+
     // Everything neither side can be read for, plus everything still being
     // written: deferred, never guessed at.
     let mut undecided = pending.in_flight.clone();
+
+    // A path that moved with no settled event behind it is still being
+    // written for all this pass can tell ([`Sighted`]). The walk is left out:
+    // it runs where the events were lost, so there is no report to wait for,
+    // and a flush over one already holds every changed guest path back.
+    let mut sighted = pending.sighted.clone();
+    let (mut found_host, mut found_guest) = (BTreeSet::new(), BTreeSet::new());
+    if !pending.rescan {
+        let now = Instant::now();
+        let unread: BTreeSet<&str> = scan
+            .skipped
+            .iter()
+            .chain(probe.skipped.iter())
+            .map(|skip| skip.path.as_str())
+            .collect();
+        let decided = |path: &str| {
+            pending.resolved.contains_key(path)
+                || ledger.halted.iter().any(|halted| halted == path)
+                || guest_owned.contains(path)
+                || unread.contains(path)
+        };
+        let host = unsettled(
+            &scan.tree,
+            ledger,
+            &pending.sighted.host,
+            pending.host_dirty,
+            &pending.in_flight,
+            &decided,
+            now,
+        );
+        let guest = unsettled(
+            &probe.tree,
+            ledger,
+            &pending.sighted.guest,
+            pending.guest_dirty,
+            &pending.in_flight,
+            &decided,
+            now,
+        );
+        undecided.extend(host.riding);
+        undecided.extend(guest.riding);
+        (found_host, found_guest) = (host.found, guest.found);
+        sighted = Sighted {
+            host: host.sighted,
+            guest: guest.sighted,
+        };
+        let found = found_host.len() + found_guest.len();
+        if found > 0 {
+            events.emit(
+                "workspace.deferred",
+                json!({
+                    "machine": workspace.machine,
+                    "reason": format!(
+                        "{found} path(s) changed with no report from the watch yet, so they wait \
+                         out a quiet period rather than being read while they may still be \
+                         written"
+                    ),
+                    "paths": found_host
+                        .iter()
+                        .chain(found_guest.iter())
+                        .take(REPORTED)
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            undecided.extend(found_host.iter().chain(found_guest.iter()).cloned());
+        }
+    }
     if pending.rescan && pending.flush {
         // An overflow loses the named events that would have kept these
         // paths in the debounce set. A walk finds their current contents,
@@ -1820,6 +2030,11 @@ async fn pass(
         // inside its debounce window counts too: the debounce exists to stop
         // the syncer *reading* a file mid-write, and a lock is never read, only
         // noticed.
+        //
+        // And a lock whose own event has not been drained yet is asked for by
+        // name wherever the mutable set moved, on either side: the pass would
+        // otherwise carry `index` and `HEAD` out from under a commit because
+        // the report of `index.lock` was one turn of the loop behind them.
         let candidates: BTreeSet<String> = pending
             .lock_candidates
             .iter()
@@ -1831,6 +2046,9 @@ async fn pass(
                     .filter(|path| locks::is_lock(path)),
             )
             .cloned()
+            .chain(locks::candidates(
+                sighted.host.keys().chain(sighted.guest.keys()),
+            ))
             .collect();
         held.extend(guest_locks(guest.as_ref(), &workspace.guest_root, &candidates).await);
     }
@@ -1852,20 +2070,6 @@ async fn pass(
         );
         undecided.extend(deferred.iter().cloned());
     }
-
-    // The ignore rules live in the tree and change under the syncer. A ledger
-    // path the developer has just ignored is not a delete on either side: it
-    // leaves the ledger and both copies stay where they are.
-    let guest_owned: BTreeSet<String> = ledger
-        .entries
-        .iter()
-        .filter(|(path, agreed)| {
-            ignores
-                .verdict(path, agreed.kind == Kind::Dir)
-                .is_guest_owned()
-        })
-        .map(|(path, _)| path.clone())
-        .collect();
 
     // The walk after a break is the one look at the guest that can bear an
     // agreement out: a path still there once the watch, or the machine, has
@@ -2054,7 +2258,11 @@ async fn pass(
     // next pass, which is the sentence a developer who just edited
     // `.vmlabignore` needs most.
     let prune = ignores.prune_list(&scan.pruned);
-    let record_rules = if halt.is_some() {
+    //
+    // A pass that held a moved path back for its quiet period leaves it alone
+    // too: that path may be the conflict the new rules bring, and it has not
+    // been compared yet.
+    let record_rules = if halt.is_some() || !found_host.is_empty() || !found_guest.is_empty() {
         ledger.ignore_digest.clone()
     } else {
         rules
@@ -2187,6 +2395,9 @@ async fn pass(
         },
         deferred: owed,
         locks: held,
+        sighted,
+        found_host,
+        found_guest,
         unresolved,
         marker: wanted,
         report: Report {
@@ -2556,6 +2767,7 @@ mod tests {
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 previous_halt: None,
                 marker: None,
@@ -2881,6 +3093,7 @@ mod tests {
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 previous_halt: None,
                 marker: None,
@@ -3268,6 +3481,7 @@ mod tests {
             unwitnessed: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
+            sighted: &Sighted::default(),
             resolved: &BTreeMap::new(),
             previous_halt: None,
             marker: None,

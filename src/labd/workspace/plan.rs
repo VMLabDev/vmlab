@@ -619,6 +619,14 @@ fn moved(now: Option<&State>, was: Option<&Agreed>) -> Moved {
     }
 }
 
+/// Whether one side holds something other than what was last agreed there.
+///
+/// The same answer the matrix works from, for the caller that has to decide
+/// *before* the plan whether a side that moved has also stopped moving.
+pub fn has_moved(now: Option<&State>, was: Option<&Agreed>) -> bool {
+    moved(now, was).changed()
+}
+
 /// The digest that stands for this side: the one computed, or — where the
 /// pre-filter vouched for the side and none was computed — the agreed one.
 fn digest_of(now: &State, was: &Agreed) -> String {
