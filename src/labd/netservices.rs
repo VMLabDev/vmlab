@@ -16,9 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use crate::config::model::MacAddr;
+use crate::config::model::{L4Proto, MacAddr};
 use crate::net::frame::{ETHERTYPE_IPV4, EthView, IPPROTO_TCP, Ipv4View, TcpView, eth_build};
 use crate::net::gateway::GatewayHandle;
+use crate::net::nat::guard::FlowKind;
 use crate::net::nat::{HostGuard, NatConfig, NatEngine};
 use crate::net::router::Router;
 use crate::net::rules::{RuleSet, Verdict};
@@ -32,9 +33,9 @@ pub struct SegmentServices {
     /// though a segment without egress still runs one for its host services.
     pub nat: Option<Arc<NatEngine>>,
     /// Host loopback TCP ports a guest may reach through a `redirect`
-    /// rewriting a gateway address onto one, on a segment without egress or
-    /// under worktree isolation (§21.4). Unused on a segment with egress
-    /// outside isolation, which reaches every port anyway.
+    /// rewriting a gateway address onto one: what a segment without egress
+    /// admits, and what the engine's guard lets through to `127.0.0.1`,
+    /// under worktree isolation (§21.4) and outside it (§9.7).
     host_services: Arc<Mutex<Vec<u16>>>,
     /// Active runtime port forwards: rule id → task handle.
     pub forwards: Mutex<Vec<(u64, tokio::task::JoinHandle<()>)>>,
@@ -47,6 +48,8 @@ impl SegmentServices {
     /// what it can of the gateway's off-segment frames, as `segment`'s.
     /// `isolated` puts the engine under worktree isolation (§21.4): it
     /// refuses every host address but the services this segment exposes.
+    /// Otherwise it refuses the host's loopback alone (§9.7), but for those
+    /// services and the targets of the segment's `redirect` rules.
     pub fn install(
         switch: &Arc<Switch>,
         gateway: &GatewayHandle,
@@ -102,9 +105,28 @@ impl SegmentServices {
         let host_services = Arc::new(Mutex::new(Vec::new()));
         let admit = (!nat_enabled).then(|| host_services.clone());
         let engine = spawn_nat(switch, gateway, gw_mac, mtu, rules.clone(), admit, router);
-        if isolated {
-            engine.set_guard(Arc::new(HostGuard::new(host_services.clone())));
-        }
+        // Every engine has a guard. Outside isolation it keeps the host's
+        // loopback from the guests (§9.7), less the host services above and
+        // the target of a `redirect` the lab declares onto loopback: that
+        // rule is the operator's own grant, where a bare SYN for
+        // 127.0.0.1 is a guest helping itself.
+        let guard = if isolated {
+            HostGuard::new(host_services.clone())
+        } else {
+            let rules = rules.clone();
+            HostGuard::loopback(
+                host_services.clone(),
+                Box::new(move |dst, kind| {
+                    let (proto, port) = match kind {
+                        FlowKind::Tcp { port } => (L4Proto::Tcp, Some(port)),
+                        FlowKind::Udp { port } => (L4Proto::Udp, Some(port)),
+                        FlowKind::Icmp => (L4Proto::Icmp, None),
+                    };
+                    rules.lock_recover().redirects_onto(dst, proto, port)
+                }),
+            )
+        };
+        engine.set_guard(Arc::new(guard));
         let nat = nat_enabled.then_some(engine);
 
         Arc::new(SegmentServices {
@@ -229,10 +251,10 @@ pub fn preinstall_rules(
 }
 
 impl SegmentServices {
-    /// Let guests reach host loopback TCP `port` even when the segment has
-    /// no egress, or runs under worktree isolation. The caller installs the
+    /// Let guests reach host loopback TCP `port`, also when the segment has
+    /// no egress or runs under worktree isolation. The caller installs the
     /// `redirect` that rewrites a gateway address onto it; this only stops
-    /// the missing egress, or isolation's host guard, dropping it.
+    /// the missing egress, or the engine's host guard, dropping it.
     pub fn expose_host_service(&self, port: u16) {
         let mut ports = self.host_services.lock_recover();
         if !ports.contains(&port) {
@@ -477,8 +499,8 @@ mod tests {
         assert!(accepted(&smbd).await, "gateway:445 never reached smbd");
     }
 
-    /// ...and nothing else on the host: a listener on loopback, which the
-    /// same segment reaches without isolation, is answered with RST.
+    /// ...and nothing else on the host: a listener on loopback is answered
+    /// with RST.
     #[tokio::test]
     async fn an_isolated_segment_reaches_no_host_port() {
         let other = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -486,17 +508,16 @@ mod tests {
             .unwrap();
         let port = other.local_addr().unwrap().port();
 
-        let (_services, _gw, guest) = segment_isolated(true, false);
-        guest.tx.send(syn(Ipv4Addr::LOCALHOST, port)).await.unwrap();
-        assert!(
-            accepted(&other).await,
-            "egress reaches the host without isolation"
-        );
-
         let (_services, _gw, mut guest) = segment_isolated(true, true);
         guest.tx.send(syn(Ipv4Addr::LOCALHOST, port)).await.unwrap();
         assert!(!accepted(&other).await, "isolation let a host port through");
-        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+        let reply = first_tcp_flags(&mut guest).await;
+        assert_ne!(reply & crate::net::frame::TCP_RST, 0, "flags {reply:#x}");
+    }
+
+    /// The flags of the first TCP segment the guest receives.
+    async fn first_tcp_flags(guest: &mut crate::net::switch::ChannelPort) -> u8 {
+        tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let frame = guest.rx.recv().await.expect("guest port open");
                 let tcp = EthView::parse(&frame)
@@ -508,8 +529,56 @@ mod tests {
             }
         })
         .await
-        .expect("the refused SYN got no reply");
-        assert_ne!(reply & crate::net::frame::TCP_RST, 0, "flags {reply:#x}");
+        .expect("the SYN got no reply")
+    }
+
+    /// Networking review F5 (card #460): a segment with egress and no
+    /// isolation does not hand its guests the host's loopback. A SYN for a
+    /// listening `127.0.0.1` port is reset, and so is one for `0.0.0.0`,
+    /// which a connect delivers to the same listener.
+    #[tokio::test]
+    async fn a_nat_segment_does_not_reach_the_hosts_loopback() {
+        let other = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = other.local_addr().unwrap().port();
+
+        for dst in [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED] {
+            let (_services, _gw, mut guest) = segment(true);
+            guest.tx.send(syn(dst, port)).await.unwrap();
+            let flags = first_tcp_flags(&mut guest).await;
+            assert_ne!(flags & crate::net::frame::TCP_RST, 0, "{dst}: {flags:#x}");
+        }
+        assert!(!accepted(&other).await, "a guest reached the host's loopback");
+    }
+
+    /// A `redirect` the lab declares onto loopback is the operator's grant,
+    /// and keeps working outside isolation: the lab's `smbd` behind
+    /// gateway:445, or a declared rule onto a host-side service. Only the
+    /// port the rule names is opened.
+    #[tokio::test]
+    async fn a_declared_redirect_onto_loopback_still_reaches_it() {
+        let service = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = service.local_addr().unwrap().port();
+        let other = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let other_port = other.local_addr().unwrap().port();
+
+        let (services, _gw, guest) = segment(true);
+        redirect_445(&services, port);
+        guest.tx.send(syn(GW_IP, 445)).await.unwrap();
+        assert!(accepted(&service).await, "the redirect target was refused");
+
+        let (services, _gw, mut guest) = segment(true);
+        redirect_445(&services, port);
+        let unnamed = syn(Ipv4Addr::LOCALHOST, other_port);
+        guest.tx.send(unnamed).await.unwrap();
+        let flags = first_tcp_flags(&mut guest).await;
+        assert_ne!(flags & crate::net::frame::TCP_RST, 0, "{flags:#x}");
+        assert!(!accepted(&other).await, "another loopback port was reached");
     }
 
     /// A free loopback port, released for the test to claim.
