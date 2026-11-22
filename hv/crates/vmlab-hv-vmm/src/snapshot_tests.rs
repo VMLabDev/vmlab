@@ -475,6 +475,83 @@ fn delete_removes_and_missing_snapshots_error() {
 
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn a_failed_save_leaves_no_snapshot_and_no_vmstate() {
+    use vmlab_hv_proto::{
+        client::Client,
+        control::{Command, Outcome},
+    };
+
+    // Exercise preflight, rollback after snapshot creation, and discard
+    // before the vmstate disk has received its snapshot.
+    for (duplicate, vmstate_first) in [(true, true), (false, true), (false, false)] {
+        let Some(m) = machine_with_setup(&[0xeb, 0xfe], 8, true, |_, _| {}) else {
+            assert!(
+                std::env::var_os("VMLAB_REQUIRE_KVM").is_none(),
+                "KVM fixture unavailable"
+            );
+            return;
+        };
+        let shared = m.handle.shared();
+        let original = shared.snapshot_registry().unwrap();
+        let image = original.disks[0].image.clone();
+        let second = m._dir.path().join("second.qcow2");
+        vmlab_disk::ops::create_qcow2(&second, 8 << 20, None, None).unwrap();
+        if duplicate {
+            vmlab_disk::ops::snapshot_create(&second, "s").unwrap();
+        }
+        let second_image = Arc::new(PlMutex::new(
+            vmlab_disk::open(&second, vmlab_disk::Format::Qcow2, !duplicate).unwrap(),
+        ));
+        let second_before = second_image.lock().snapshots().unwrap();
+        let mut disks = vec![
+            DiskNode {
+                id: "scratch".into(),
+                writable: true,
+                vmstate: true,
+                image: image.clone(),
+            },
+            DiskNode {
+                id: "second".into(),
+                writable: true,
+                vmstate: false,
+                image: second_image.clone(),
+            },
+        ];
+        if !vmstate_first {
+            disks.swap(0, 1);
+        }
+        shared.set_snapshot_registry(Arc::new(SnapshotRegistry {
+            digest: original.digest,
+            disks,
+            nodes: vec![DeviceNode::Plain(shared.serials.lock()[0].clone())],
+        }));
+        let before = std::fs::metadata(&m.disk_path).unwrap().len();
+        let socket = m._dir.path().join("control.sock");
+        crate::control::serve(&socket, &m.handle).unwrap();
+        let mut client = Client::connect(socket).unwrap();
+        let outcome = client
+            .call(Command::SnapshotSave { name: "s".into() })
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Error { ref message, .. } if message.contains("second")),
+            "{outcome:?}"
+        );
+        assert!(image.lock().snapshots().unwrap().is_empty());
+        let mut vmstate = [0xff; 512];
+        image.lock().read_vmstate(0, &mut vmstate).unwrap();
+        assert_eq!(vmstate, [0; 512]);
+        let second_after = second_image.lock().snapshots().unwrap();
+        assert_eq!(second_after.len(), second_before.len());
+        if duplicate {
+            assert_eq!(second_after[0].name, "s");
+            assert_eq!(second_after[0].id, second_before[0].id);
+            assert_eq!(std::fs::metadata(&m.disk_path).unwrap().len(), before);
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn failed_smi_restore_rolls_back_disks_ram_cpu_devices_and_run_state() {
     use snapshot::format;
     use vmlab_hv_devices::{BusDevice, Snapshot};

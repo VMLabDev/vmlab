@@ -24,6 +24,10 @@
 #                     Without cosign the default is to refuse installation.
 #                     Skipping permits an attacker to replace both assets and
 #                     checksums. Use only with an independently trusted source.
+#   --release-key <file>  verify a key-signed release with this cosign public
+#                     key, not the one in this script; or VMLAB_RELEASE_KEY.
+#                     For testing a local build: whoever picks the key picks
+#                     whom the installer trusts.
 #   --help            show this help
 #
 #   VMLAB_RELEASE_BASE_URL  where releases are downloaded from, as
@@ -58,6 +62,19 @@ set -eu
 REPO="VMLabDev/vmlab"
 SOURCE_BUILD="cargo install --git https://github.com/VMLabDev/vmlab --locked"
 
+# ── Release signatures ──────────────────────────────────────────────────────
+# A release is authenticated in one of two ways, by the signature file it has:
+#   SHA256SUMS.bundle      keyless cosign, the GitHub OIDC identity of ci.yml on
+#                          main: every release that GitHub built.
+#   SHA256SUMS.key.bundle  a cosign key pair: a release built outside GitHub
+#                          (scripts/release-sign.sh). Verified with
+#                          `cosign verify-blob --key` against RELEASE_KEY.
+# RELEASE_KEY is the switch for the second way. While it is empty this
+# installer trusts no key, and refuses a key-signed release. To turn it on,
+# put the PEM public key between the quotes: the same text as
+# build/release-signing.pub (docs/agents/release-gate.md).
+RELEASE_KEY=''
+
 VERSION="${VMLAB_VERSION:-}"
 BIN_DIR="${VMLAB_INSTALL_DIR:-$HOME/.local/bin}"
 GUEST_DIR="${VMLAB_GUEST_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/vmlab/guest}"
@@ -65,6 +82,7 @@ BASE_URL="${VMLAB_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
 PRE=0
 SKIP_CHECKS=0
 INSECURE_SKIP_SIGNATURE="${VMLAB_INSECURE_SKIP_SIGNATURE:-0}"
+RELEASE_KEY_FILE="${VMLAB_RELEASE_KEY:-}"
 NO_GUEST=0
 FASTPATH="${VMLAB_FASTPATH_CAPS:-ask}"
 
@@ -81,6 +99,7 @@ usage() {
     '  --no-fastpath       do not request capabilities' \
     '  --skip-checks       skip runtime tool checks' \
     '  --insecure-skip-signature  unsafe: skip cosign, still check SHA256SUMS' \
+    '  --release-key FILE  cosign public key for a key-signed release (testing)' \
     '  --help              show this help'
   exit "${1:-0}"
 }
@@ -100,6 +119,8 @@ while [ $# -gt 0 ]; do
     --no-fastpath) FASTPATH=no; shift ;;
     --skip-checks) SKIP_CHECKS=1; shift ;;
     --insecure-skip-signature) INSECURE_SKIP_SIGNATURE=1; shift ;;
+    --release-key) [ $# -ge 2 ] || err "--release-key needs an argument"; RELEASE_KEY_FILE="$2"; shift 2 ;;
+    --release-key=*) RELEASE_KEY_FILE="${1#--release-key=}"; shift ;;
     -h|--help) usage 0 ;;
     -*) err "unknown option: $1 (try --help)" ;;
     *) [ -z "$VERSION" ] || err "unexpected argument: $1"; VERSION="$1"; shift ;;
@@ -201,13 +222,41 @@ trap cleanup_release EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 download_file "$BASE_URL/$tag/SHA256SUMS" "$verify_dir/SHA256SUMS" || err "release has no checksum manifest"
-if [ "$INSECURE_SKIP_SIGNATURE" -eq 0 ]; then
-  download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" || err "release has no signature bundle"
+
+# The public half of the release key as a file, or nothing when the switch is off.
+release_key() {
+  if [ -n "$RELEASE_KEY_FILE" ]; then
+    [ -s "$RELEASE_KEY_FILE" ] || err "no release key at $RELEASE_KEY_FILE"
+    warn "verifying with the release key $RELEASE_KEY_FILE, not the one of this installer."
+    printf '%s\n' "$RELEASE_KEY_FILE"
+  elif [ -n "$RELEASE_KEY" ]; then
+    printf '%s\n' "$RELEASE_KEY" > "$verify_dir/release-key.pub"
+    printf '%s\n' "$verify_dir/release-key.pub"
+  fi
+}
+
+# verify_signature: authenticate SHA256SUMS, or end the install. A key-signed
+# release is taken only when a release key is known. The signature of a key
+# pair is in no transparency log, so that check is turned off for it alone.
+verify_signature() {
+  key="$(release_key)" || exit 1
+  if download_file "$BASE_URL/$tag/SHA256SUMS.key.bundle" "$verify_dir/SHA256SUMS.key.bundle" 2>/dev/null; then
+    [ -n "$key" ] || err "this release is signed with a release key, and this installer has none to verify it with. Get the current installer from https://vmlab.io/install.sh"
+    cosign verify-blob --key "$key" --bundle "$verify_dir/SHA256SUMS.key.bundle" \
+      --insecure-ignore-tlog=true "$verify_dir/SHA256SUMS" \
+      || err "release signature verification failed"
+    return 0
+  fi
+  [ -z "$RELEASE_KEY_FILE" ] || err "release has no key signature (SHA256SUMS.key.bundle) for --release-key"
+  download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" \
+    || err "release has no signature bundle. An unsigned release installs only with --insecure-skip-signature"
   cosign verify-blob --bundle "$verify_dir/SHA256SUMS.bundle" \
     --certificate-identity 'https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     "$verify_dir/SHA256SUMS" || err "release signature verification failed"
-fi
+}
+
+[ "$INSECURE_SKIP_SIGNATURE" -eq 1 ] || verify_signature
 
 verify_asset() {
   # Match one exact basename, never interpret paths supplied by a manifest.

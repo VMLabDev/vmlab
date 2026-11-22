@@ -61,12 +61,12 @@ shell-paths:
 	python3 -m unittest discover -s scripts -p 'test_check_shell_paths.py'
 	python3 scripts/check_shell_paths.py
 
-# Test the release version calculation of ci.yml's "Calculate version" job: promotion of a pre-release, bumps, and 0.x breaking changes (VML-104)
+# Test the release version calculation of `just release::local`: the command line and the trailers, promotion of a pre-release, bumps, and 0.x breaking changes (VML-104)
 [group('ci')]
 release-version:
 	python3 -m unittest discover -s scripts -p 'test_release_version.py'
 
-# Offline release/installer dry-run, with an explicit signature-verifier stub
+# Offline dry-run of the local release: manifest, provenance, both signing ways and the installer through a cosign stub, the upload command, and ci.yml without a release job
 [group('ci')]
 release-dry-run: require-uv
 	uv run --no-project --with pytest==8.4.2 --with PyYAML==6.0.3 python -m pytest -p no:cacheprovider scripts/test_release_assets.py scripts/test_release_workflow.py --junitxml={{quote(release_report)}}
