@@ -2663,6 +2663,68 @@ mod tests {
         assert_eq!(std::fs::read(held).unwrap(), vars);
     }
 
+    /// A template's config blob is a small JSON document, and it is read
+    /// whole on every resolve of a registry reference. One of 16 MiB is
+    /// refused by its size rather than held and parsed (review F4).
+    #[tokio::test]
+    async fn an_oversized_config_blob_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same template under the tag `big`, its config blob padded with
+        // JSON whitespace to 16 MiB: still a document that parses.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let mut config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        config.resize(16 * 1024 * 1024, b' ');
+        TemplateConfig::from_json(&config).expect("the padded blob still parses");
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "big",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let err = registry_with_fake("ghcr.io/owner/alpine:big", fake.clone())
+            .pull(Some("x86_64"), &store, &store_root.join(".oci-pull"), false)
+            .await
+            .expect_err("a 16 MiB config blob is refused");
+        assert!(format!("{err:#}").contains("config blob"), "{err:#}");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+    }
+
     /// Pulling a version the store already holds uses the stored copy when it
     /// is the same image, without downloading, and refuses only when the two
     /// disks differ.

@@ -397,6 +397,29 @@ mod tests {
         assert_eq!(TemplateConfig::from_meta(&m).vars().unwrap(), None);
     }
 
+    /// A config blob is the registry's word. A zstd frame of zeros expands
+    /// by more than four orders of magnitude, so a few KiB of
+    /// `secure_boot_vars` must not be allowed to ask for memory without end
+    /// (review F4): the payload is refused past the largest VARS file there
+    /// is, and one of exactly that size still comes back.
+    #[test]
+    fn an_oversized_vars_payload_is_refused() {
+        use base64::Engine as _;
+        let pack = |len: usize| {
+            let packed = zstd::encode_all(vec![0u8; len].as_slice(), 3).unwrap();
+            base64::engine::general_purpose::STANDARD.encode(packed)
+        };
+        let mut cfg = TemplateConfig::from_meta(&meta());
+        let bomb = pack(256 * 1024 * 1024);
+        assert!(bomb.len() < 64 * 1024, "{} bytes of text", bomb.len());
+        cfg.secure_boot_vars = Some(bomb);
+        let err = cfg.vars().expect_err("256 MiB of VARS is refused");
+        assert!(err.to_string().contains("secure_boot_vars"), "{err}");
+
+        cfg.secure_boot_vars = Some(pack(64 * 1024 * 1024));
+        assert_eq!(cfg.vars().unwrap().unwrap().len(), 64 * 1024 * 1024);
+    }
+
     #[test]
     fn origin_override_records_reference() {
         let m = meta();
