@@ -115,6 +115,21 @@ pub trait Transport: Send + Sync {
     async fn blob_exists(&self, repository: &str, digest: &str) -> Result<bool>;
     /// GET a blob's bytes.
     async fn get_blob(&self, repository: &str, digest: &str) -> Result<Vec<u8>>;
+    /// GET a blob that is refused past `limit` bytes. The default
+    /// implementation checks what [`get_blob`](Self::get_blob) returned;
+    /// [`HttpTransport`] overrides it to stop reading at the limit.
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self.get_blob(repository, digest).await?;
+        if bytes.len() > limit {
+            bail!("registry response exceeds {limit} bytes");
+        }
+        Ok(bytes)
+    }
     /// GET a blob into a file on disk, verifying its digest and reporting
     /// cumulative bytes to `progress`. Returns the byte count. The default
     /// implementation buffers through [`get_blob`](Self::get_blob);
@@ -236,11 +251,7 @@ impl Registry {
                 .collect()),
             ManifestOrIndex::Manifest(m) => {
                 // Plain single-arch manifest: read its config blob for the arch.
-                let config_bytes = self
-                    .transport
-                    .get_blob(repo, &m.config.digest)
-                    .await
-                    .context("downloading config blob")?;
+                let config_bytes = self.config_blob(repo, &m.config).await?;
                 Ok(vec![TemplateConfig::from_json(&config_bytes)?.arch])
             }
         }
@@ -287,11 +298,7 @@ impl Registry {
         if !manifest.is_vmlab_template() {
             bail!("{repo}:{tag} is not a vmlab template");
         }
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let arches = if arches.is_empty() {
             vec![config.arch]
@@ -518,9 +525,31 @@ impl Registry {
         Ok(count)
     }
 
+    /// A template's config blob, refused past [`MAX_CONFIG_BLOB`]: by the size
+    /// its descriptor declares before any request, and by the bytes that
+    /// arrive whatever it declares.
+    async fn config_blob(&self, repo: &str, config: &Descriptor) -> Result<Vec<u8>> {
+        ensure!(
+            config.size <= MAX_CONFIG_BLOB as u64,
+            "config blob {} of {} bytes exceeds the {MAX_CONFIG_BLOB} a template's may have",
+            config.digest,
+            config.size
+        );
+        self.transport
+            .get_blob_bounded(repo, &config.digest, MAX_CONFIG_BLOB)
+            .await
+            .context("downloading config blob")
+    }
+
     /// Upload a config blob unless present, returning its descriptor.
     async fn put_config(&self, repo: &str, config: &TemplateConfig) -> Result<Descriptor> {
         let bytes = config.to_json()?;
+        // What no pull would read back is not published.
+        ensure!(
+            bytes.len() <= MAX_CONFIG_BLOB,
+            "the template's config blob is {} bytes, over the {MAX_CONFIG_BLOB} a pull accepts",
+            bytes.len()
+        );
         let digest = digest_of(&bytes);
         if !self.transport.blob_exists(repo, &digest).await? {
             self.transport
@@ -640,11 +669,7 @@ impl Registry {
         }
 
         // 3. Download config → TemplateMeta.
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let vars = config.vars()?;
         let mut meta = config.into_meta(Some(self.reference.canonical()))?;
@@ -854,8 +879,7 @@ impl Registry {
                 }
             }
             let config_bytes = self
-                .transport
-                .get_blob(repo, &vm.config.digest)
+                .config_blob(repo, &vm.config)
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
             let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
@@ -1414,6 +1438,10 @@ pub struct HttpTransport {
 const MAX_RETRIES: u32 = 3;
 pub(super) const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_BLOB_BODY: usize = 1024 * 1024 * 1024;
+/// A template's config blob: a JSON document, read whole on every resolve of
+/// a registry reference. Its one large field is the packed VARS file, which
+/// is tens of KiB for a real one.
+const MAX_CONFIG_BLOB: usize = MAX_JSON_BODY;
 const MAX_STREAMED_BLOB: u64 = 8 * 1024 * 1024 * 1024;
 pub(super) const MAX_LIST_PAGES: usize = 100;
 pub(super) const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
@@ -1746,6 +1774,23 @@ impl Transport for HttpTransport {
             bail!("GET blob {digest} returned {}", resp.status());
         }
         bounded_body(resp, MAX_BLOB_BODY).await
+    }
+
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let url = self.url(&format!("/v2/{repository}/blobs/{digest}"));
+        let scope = self.scope(repository, false);
+        let resp = self
+            .send_with_auth(&scope, || self.client.get(&url))
+            .await?;
+        if !resp.status().is_success() {
+            bail!("GET blob {digest} returned {}", resp.status());
+        }
+        bounded_body(resp, limit).await
     }
 
     async fn get_blob_to_file(
@@ -2782,6 +2827,68 @@ mod tests {
             .unwrap();
         let held = crate::template::store::template_vars(&r.dir, &r.meta).unwrap();
         assert_eq!(std::fs::read(held).unwrap(), vars);
+    }
+
+    /// A template's config blob is a small JSON document, and it is read
+    /// whole on every resolve of a registry reference. One of 16 MiB is
+    /// refused by its size rather than held and parsed (review F4).
+    #[tokio::test]
+    async fn an_oversized_config_blob_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same template under the tag `big`, its config blob padded with
+        // JSON whitespace to 16 MiB: still a document that parses.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let mut config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        config.resize(16 * 1024 * 1024, b' ');
+        TemplateConfig::from_json(&config).expect("the padded blob still parses");
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "big",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let err = registry_with_fake("ghcr.io/owner/alpine:big", fake.clone())
+            .pull(Some("x86_64"), &store, &store_root.join(".oci-pull"), false)
+            .await
+            .expect_err("a 16 MiB config blob is refused");
+        assert!(format!("{err:#}").contains("config blob"), "{err:#}");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
     }
 
     /// Pulling a version the store already holds uses the stored copy when it
