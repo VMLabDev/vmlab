@@ -1452,10 +1452,40 @@ enum SeedDisk {
 }
 
 /// Copy a source image into the working disk, flattening its chain. A
-/// `standalone` source is the image a template definition names itself.
+/// `standalone` source is the image a template definition names itself, and
+/// it is refused when it has a backing file.
 async fn seed_working_disk(src: &Path, standalone: bool, dest: &Path) -> Result<()> {
-    let _ = standalone;
+    if standalone {
+        refuse_backed_source(src)?;
+    }
     super::qimg::convert_to_qcow2(src, dest).await?;
+    Ok(())
+}
+
+/// Refuse a `qcow2` build source that names a backing file. Both image tools
+/// open the backing file when they convert the image, and they open a host
+/// file that is not qcow2 as raw. The convert would copy that file into the
+/// working disk, where the guest of the same image reads it. The store has the
+/// same rule for a pulled or imported base (`verify_base`). A source that is
+/// not qcow2 passes.
+fn refuse_backed_source(src: &Path) -> Result<()> {
+    use std::io::Read;
+    // The header reader refuses a symlink, and a local source may be one.
+    let image = std::fs::canonicalize(src)
+        .with_context(|| format!("cannot open the build source {}", src.display()))?;
+    let mut magic = [0; 4];
+    let n = std::fs::File::open(&image)
+        .and_then(|mut f| f.read(&mut magic))
+        .with_context(|| format!("cannot read the build source {}", src.display()))?;
+    if n < 4 || magic != *b"QFI\xfb" {
+        return Ok(());
+    }
+    if let Some(backing) = super::store::qcow2_backing_file(&image)? {
+        bail!(
+            "the build source {} names the backing file {backing:?}, and a qcow2 source must not have a backing file: flatten it first (qemu-img convert -O qcow2)",
+            src.display()
+        );
+    }
     Ok(())
 }
 
