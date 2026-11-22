@@ -72,8 +72,8 @@
 //!
 //! While halted the loop keeps its watch open and keeps draining the guest's
 //! dirty set into its own pending set, so the guest's set stays small and a
-//! long halt costs no rescan; every drained path stays owed, because nothing
-//! was agreed about any of it. The only work a halted pass still does is work
+//! long halt costs no rescan. A path with work to reconcile stays owed across
+//! the halt. The only work a halted pass still does is work
 //! that moves nothing the developer did not ask for: adopting two sides that
 //! already match, and carrying out a resolution.
 
@@ -91,7 +91,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use super::apply::{Target, apply};
 use super::guest::{GuestFs, GuestWatch};
 use super::halt::{self, Halt};
-use super::ignore::{TEMP_PREFIX, is_syncer_own};
+use super::ignore::{TEMP_PREFIX, is_syncer_own, validate_entry_name};
 use super::ledger::{Kind, Ledger};
 use super::locks;
 use super::plan::{Inputs, Oversize, Volume, Winner, reconcile};
@@ -1046,6 +1046,7 @@ async fn run(
                             &mut guest_debounce,
                             &mut rescan,
                             syncer.settle,
+                            workspace.preconditions.windows,
                         )
                         .await
                         {
@@ -1269,12 +1270,11 @@ async fn run(
                     // skip comes from.
                     WatchReport::Batch(entries) => {
                         draining = draining.saturating_sub(1);
-                        let now = Instant::now();
-                        // vmlab's own writes — the marker above all, written
-                        // *because* of a halt — are never the guest's work.
-                        for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
-                            guest_debounce.touch(entry.path, now);
-                        }
+                        record_guest_paths(
+                            &mut guest_debounce,
+                            entries.into_iter().map(|entry| entry.path),
+                            workspace.preconditions.windows,
+                        );
                     }
                     // Overflow. It **warns and never halts** — a build burst
                     // is wanted work that happens to be large, and halting
@@ -1368,6 +1368,24 @@ fn drop_watch(
     });
 }
 
+/// Only workspace-relative paths can enter the guest debounce set.
+fn record_guest_paths(
+    debounce: &mut Debounce,
+    paths: impl Iterator<Item = String>,
+    windows: bool,
+) {
+    let now = Instant::now();
+    for path in paths {
+        if path
+            .split('/')
+            .all(|component| validate_entry_name(component, windows).is_ok())
+            && !is_syncer_own(&path)
+        {
+            debounce.touch(path, now);
+        }
+    }
+}
+
 /// Ask the guest for its dirty set and wait for that answer, so a verb's pass
 /// sees every guest-side write the agent had noticed when the verb arrived.
 ///
@@ -1384,6 +1402,7 @@ async fn settle_guest(
     debounce: &mut Debounce,
     rescan: &mut bool,
     bound: Duration,
+    windows: bool,
 ) -> Result<bool> {
     watch.drain().await?;
     *draining += 1;
@@ -1396,10 +1415,7 @@ async fn settle_guest(
                 }
                 Some(WatchReport::Batch(entries)) => {
                     *draining -= 1;
-                    let now = Instant::now();
-                    for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
-                        debounce.touch(entry.path, now);
-                    }
+                    record_guest_paths(debounce, entries.into_iter().map(|entry| entry.path), windows);
                 }
                 Some(WatchReport::Rescan) => {
                     *draining -= 1;
@@ -1772,11 +1788,13 @@ async fn pass(
     }
     if !probe.unlisted_dirs.is_empty() {
         // The listing says nothing about paths below a skipped directory.
-        // Defer existing agreements and host-only paths under it.
+        // Defer existing agreements, host-only paths and reported guest
+        // paths under it until their presence can be checked.
         undecided.extend(
             scan.tree
                 .keys()
                 .chain(ledger.entries.keys())
+                .chain(rehash_guest.iter())
                 .filter(|path| {
                     path.match_indices('/')
                         .any(|(end, _)| probe.unlisted_dirs.contains(&path[..end]))
@@ -2153,7 +2171,17 @@ async fn pass(
         )
     });
     let mut owed = match halt {
-        Some(_) => rehash_guest.clone(),
+        // Keep guest work and known deletions across the halt. An untracked
+        // path absent on both sides has nothing left to reconcile.
+        Some(_) => rehash_guest
+            .into_iter()
+            .filter(|path| {
+                scan.tree.contains_key(path)
+                    || probe.tree.contains_key(path)
+                    || ledger.entries.contains_key(path)
+                    || undecided.contains(path)
+            })
+            .collect::<BTreeSet<_>>(),
         None => rehash_guest.intersection(&undecided).cloned().collect(),
     };
     // A full walk can discover a new guest file without a dirty notification.
@@ -2166,11 +2194,6 @@ async fn pass(
             Some(_) => rehash_host.clone(),
             None => rehash_host.intersection(&undecided).cloned().collect(),
         },
-        // **While halted, everything drained stays owed.** Nothing was agreed
-        // about any of it, so a path dropped here would be a guest-side edit
-        // waiting for a discontinuity to be noticed at all — and the host
-        // keeping the pending set is exactly what stops a long halt costing a
-        // rescan.
         deferred: owed,
         locks: held,
         unresolved,
@@ -4100,7 +4123,7 @@ mod tests {
         let mut watch = sessions.watcher.session();
         let mut debounce = Debounce::default();
         assert!(
-            settle_guest(watch.as_mut(), &mut 0, &mut debounce, &mut false, SETTLE)
+            settle_guest(watch.as_mut(), &mut 0, &mut debounce, &mut false, SETTLE, false)
                 .await
                 .unwrap()
         );
