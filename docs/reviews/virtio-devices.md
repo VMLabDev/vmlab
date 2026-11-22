@@ -533,6 +533,11 @@ Not read:
   `host_open`, read the worker thread's CPU clock (`pthread_getcpuclockid`)
   across a 300 ms sleep, and assert less than 50 ms.
 - Confidence: high.
+- Fixed in card #432. The worker polls a port's listener only while the port
+  has no client, so a connection in the backlog wakes it only when the port
+  is free again. The proof test fails before the fix (the worker used 299 ms
+  of CPU in 300 ms) and passes after it. It also checks that the waiting
+  client is accepted once the first one leaves.
 
 ### F17. virtio-sound: restored stream parameters are not validated, and `advance` then divides by zero
 

@@ -319,9 +319,16 @@ fn run(
             events: libc::POLLIN,
             revents: 0,
         });
-        for listener in &listeners {
+        for (i, listener) in listeners.iter().enumerate() {
+            // A port takes one client. While it has one, a connection in the
+            // backlog is not accepted, so asking for it would make every
+            // `poll` return at once: `poll` ignores a negative fd.
             polls.push(libc::pollfd {
-                fd: listener.as_raw_fd(),
+                fd: if clients[i].is_none() {
+                    listener.as_raw_fd()
+                } else {
+                    -1
+                },
                 events: libc::POLLIN,
                 revents: 0,
             });
