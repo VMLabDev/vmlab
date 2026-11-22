@@ -4220,6 +4220,53 @@ mod tests {
         /// A display whose VNC socket is a fake RFB server, for the console
         /// recording tests (§11.1); `None` is a machine with no display.
         display: Option<Arc<FakeDisplayHost>>,
+        /// Stop inside `start`, before the machine leaves `Stopped`, until
+        /// the test lets it go: the window in which a real adapter has no
+        /// emulator yet and a stop finds nothing to stop.
+        hold_start: Option<Hold>,
+        /// Stop inside `wait_state`, once the machine has settled, until the
+        /// test lets it go: the gap between a destroy's stop and its removal.
+        hold_settle: Option<Hold>,
+        /// `start` makes `disk0.qcow2`, as a real machine makes its clone.
+        makes_disk: bool,
+    }
+
+    /// A point a double stops at until the test lets it go, so a test orders
+    /// two operations by events and never by a clock.
+    #[derive(Clone)]
+    struct Hold {
+        reached: Arc<tokio::sync::Semaphore>,
+        go: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Hold {
+        fn new() -> Self {
+            Self {
+                reached: Arc::new(tokio::sync::Semaphore::new(0)),
+                go: Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+        /// The double's side: say it got here, then wait to be let go.
+        async fn pass(&self) {
+            self.reached.add_permits(1);
+            self.go.acquire().await.expect("hold").forget();
+        }
+        /// The test's side: wait until the double got here.
+        async fn reached(&self) {
+            self.reached.acquire().await.expect("hold").forget();
+        }
+        fn release(&self) {
+            self.go.add_permits(1);
+        }
+    }
+
+    /// Let every task that can run do so, as far as it gets without the
+    /// test's help. No clock: a task that is still blocked afterwards is
+    /// blocked on something only the test releases.
+    async fn run_until_stalled() {
+        for _ in 0..2000 {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// What a displayed double tells its [`Display`]: a VNC socket (a fake
@@ -4302,7 +4349,20 @@ mod tests {
                 boot_ids: std::sync::Mutex::new(Vec::new()),
                 usb: None,
                 display: None,
+                hold_start: None,
+                hold_settle: None,
+                makes_disk: false,
             })
+        }
+
+        /// A container double with a disk, held at one of its two points.
+        fn held(name: &str, shared: &Shared, start: Option<&Hold>, settle: Option<&Hold>) -> Arc<Self> {
+            let mut m = Arc::into_inner(Self::new(name, MachineKind::Container, shared))
+                .expect("sole owner");
+            m.hold_start = start.cloned();
+            m.hold_settle = settle.cloned();
+            m.makes_disk = true;
+            Arc::new(m)
         }
 
         /// A running VM double with a USB controller.
@@ -4526,6 +4586,20 @@ mod tests {
             Ok(())
         }
 
+        async fn wait_state(&self, want: PowerState, timeout: Duration) -> Result<()> {
+            if let Some(hold) = &self.hold_settle {
+                hold.pass().await;
+            }
+            let deadline = tokio::time::Instant::now() + timeout;
+            while self.state().await != want {
+                if tokio::time::Instant::now() > deadline {
+                    bail!("{}: not {want:?} after {timeout:?}", self.name);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(())
+        }
+
         /// Readiness the way both adapters give it: the agent answers, the
         /// lab's `before_ready` settles what it owes the boot, then ready.
         async fn start(
@@ -4535,6 +4609,13 @@ mod tests {
         ) -> Result<()> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.note("start").await;
+            if let Some(hold) = &self.hold_start {
+                hold.pass().await;
+            }
+            if self.makes_disk {
+                std::fs::create_dir_all(&self.dir)?;
+                std::fs::write(self.dir.join("disk0.qcow2"), b"disk")?;
+            }
             *self.state.write().await = PowerState::Starting;
             tokio::time::sleep(self.boot).await;
             // The paused window a real VM offers before its CPUs run (D20).
@@ -5915,6 +5996,154 @@ lab "t" {
             idx("web:stop") < idx("db:stop"),
             "the dependency was stopped first: {log:?}"
         );
+    }
+
+    const TWO_DEPENDENT: &str = r#"import <vmlab.wcl>
+lab "t" {
+  container "a" { image = "a:1" }
+  container "b" { image = "b:1" depends_on = ["a"] }
+}"#;
+
+    /// Review lab-lifecycle F2 (card #547). A full `down` that arrives while
+    /// an `up` is starting a machine must leave nothing running: the start
+    /// under way is stopped once it has something to stop, and the `up` boots
+    /// no later wave. Before the fix `down` found "a" with nothing to stop
+    /// and returned, "a" then booted, and "b" booted after it.
+    #[tokio::test]
+    async fn a_down_leaves_no_machine_running_behind_an_up_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::held("a", &sh, Some(&hold), None);
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b.clone()]);
+
+        let up = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.up(&[], quiet()).await }
+        });
+        hold.reached().await;
+        let down = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.down(&[], false).await }
+        });
+        run_until_stalled().await;
+        hold.release();
+        down.await.unwrap().expect("down");
+        let up = up.await.unwrap();
+
+        assert_eq!(a.state().await, PowerState::Stopped, "\"a\" outlived the down");
+        assert_eq!(b.state().await, PowerState::Stopped, "\"b\" outlived the down");
+        assert_eq!(
+            b.starts.load(Ordering::SeqCst),
+            0,
+            "the up booted a later wave after the down"
+        );
+        assert!(up.is_err(), "the up reported a lab it did not bring up");
+    }
+
+    /// Review lab-lifecycle F4 (card #547). A start of the machine that
+    /// arrives between a destroy's stop and its removal waits for the
+    /// removal (or is refused), so the machine never runs on unlinked disks.
+    /// Before the fix it booted at once and its directory was removed under
+    /// it.
+    #[tokio::test]
+    async fn a_machine_destroy_excludes_a_concurrent_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::held("a", &sh, None, Some(&hold));
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b]);
+        let disk = a.dir.join("disk0.qcow2");
+        std::fs::create_dir_all(&a.dir).unwrap();
+        std::fs::write(&disk, b"disk").unwrap();
+
+        let destroy = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.destroy_machine("a").await }
+        });
+        hold.reached().await;
+        let start = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.start_machine("a").await }
+        });
+        run_until_stalled().await;
+        hold.release();
+        destroy.await.unwrap().expect("destroy");
+        let started = start.await.unwrap();
+
+        let running = a.state().await != PowerState::Stopped;
+        match started {
+            Ok(()) => assert!(
+                running && disk.exists(),
+                "the start succeeded, so \"a\" runs with its disk: running {running}, disk {}",
+                disk.exists()
+            ),
+            Err(_) => assert!(
+                !running && !a.dir.exists(),
+                "the start was refused, so \"a\" is stopped and gone"
+            ),
+        }
+    }
+
+    /// The other order of F4: the start is under way when the destroy
+    /// arrives. The destroy waits until the start has something to stop,
+    /// stops it, and only then removes the disks.
+    #[tokio::test]
+    async fn a_machine_destroy_stops_a_start_under_way_before_it_removes_the_disks() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::held("a", &sh, Some(&hold), None);
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b]);
+
+        let start = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.start_machine("a").await }
+        });
+        hold.reached().await;
+        let destroy = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.destroy_machine("a").await }
+        });
+        run_until_stalled().await;
+        hold.release();
+        destroy.await.unwrap().expect("destroy");
+        let _ = start.await.unwrap();
+
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "\"a\" runs after its destroy returned"
+        );
+        assert!(!a.dir.exists(), "the destroy left the directory");
+    }
+
+    /// F4 for the whole lab: once `destroy` has begun, a start is refused,
+    /// so nothing boots between its stop and the removal of `.vmlab/`.
+    #[tokio::test]
+    async fn a_lab_destroy_refuses_a_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::held("a", &sh, None, Some(&hold));
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b]);
+
+        let destroy = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.destroy().await }
+        });
+        hold.reached().await;
+        let started = lab.start_machine("a").await;
+        hold.release();
+        destroy.await.unwrap().expect("destroy");
+
+        assert!(started.is_err(), "a start was accepted during the destroy");
+        assert_eq!(a.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(a.state().await, PowerState::Stopped);
     }
 
     /// Teardown iterates machines once: both kinds are stopped, and neither
