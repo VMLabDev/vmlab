@@ -903,8 +903,8 @@ mod tests {
         let hostile = "loader,file=/etc/hostname,addr=0x1000000,force-raw=on";
         let mut m = meta();
         m.display = Some(hostile.into());
-        let err = resolve_vm(&v, Some(&m), &profiles)
-            .expect_err("a template names its own QEMU device");
+        let err =
+            resolve_vm(&v, Some(&m), &profiles).expect_err("a template names its own QEMU device");
         let text = format!("{err:#}");
         assert!(text.contains("display"), "{text}");
         assert!(text.contains("x86_64/win@1"), "{text}");
@@ -926,7 +926,8 @@ mod tests {
         }
         // The VM's own `display` wins and is taken as written.
         m.display = Some(hostile.into());
-        let own = vm("vm \"a\" { template = \"x86_64/win\" display = \"bochs-display,vgamem=8M\" }");
+        let own =
+            vm("vm \"a\" { template = \"x86_64/win\" display = \"bochs-display,vgamem=8M\" }");
         // The template's string is still refused: it would be the display of
         // the next VM that does not restate one.
         assert!(resolve_vm(&own, Some(&m), &profiles).is_err());
