@@ -958,6 +958,8 @@ impl AgentHandle {
     }
 
     /// Run to completion, collecting output. `128 + signal` codes on Unix.
+    /// After the channel opens, one timeout covers sending stdin and
+    /// collecting output.
     /// Stdout and stderr together stop at [`EXEC_OUTPUT_LIMIT`]: past it the
     /// command is ended and the exec is an error.
     pub async fn exec(
@@ -971,45 +973,69 @@ impl AgentHandle {
     ) -> Result<ExecOutput> {
         let display = argv.join(" ");
         let mut session = self.open_exec(argv, env, cwd, logon).await?;
-        if let Some(stdin) = stdin {
-            session.send(&stdin).await?;
-        }
-        session.eof().await?;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let ev = tokio::time::timeout_at(deadline, session.recv())
-                .await
-                .map_err(|_| anyhow!("exec `{display}` timed out after {timeout:?}"))?;
-            if let Some(SessionEvent::Data(b) | SessionEvent::Stderr(b)) = &ev
-                && out.len() + err.len() + b.len() > EXEC_OUTPUT_LIMIT
-            {
-                // Returning drops the session, which closes the channel and
-                // so ends the command in the guest.
-                bail!(
-                    "exec `{display}` wrote more than {} MiB of output, the most a collected \
-                     exec holds; send the output to a file in the guest and copy that",
-                    EXEC_OUTPUT_LIMIT / (1024 * 1024)
-                );
-            }
-            match ev {
-                Some(SessionEvent::Data(b)) => out.extend(b),
-                Some(SessionEvent::Stderr(b)) => err.extend(b),
-                Some(SessionEvent::Exited(code)) => {
-                    return Ok(ExecOutput {
-                        exit_code: code,
-                        stdout: out,
-                        stderr: err,
-                    });
+        let sender = session.sender();
+        // Let an in-flight frame finish if the exec ends during a write.
+        // Dropping the session closes its credit and wakes a blocked sender.
+        let send_input = tokio::spawn(async move {
+            let result = async {
+                if let Some(stdin) = stdin {
+                    sender.send(&stdin).await?;
                 }
-                Some(SessionEvent::Error(msg)) => bail!("exec `{display}`: {msg}"),
-                // `exited` is what completes a collected exec; the output
-                // EOF just before it tells this caller nothing new.
-                Some(SessionEvent::Eof) => {}
-                None => bail!("agent channel closed during exec `{display}`"),
+                sender.eof().await
             }
-        }
+            .await;
+            // The child can exit before reading stdin. The receive half
+            // owns the terminal event and reports the command's result.
+            if sender.credit.closed.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                result
+            }
+        });
+        let mut collect_output = std::pin::pin!(async {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            loop {
+                let ev = session.recv().await;
+                if let Some(SessionEvent::Data(b) | SessionEvent::Stderr(b)) = &ev
+                    && out.len() + err.len() + b.len() > EXEC_OUTPUT_LIMIT
+                {
+                    // Dropping the session closes the channel and ends the
+                    // command in the guest.
+                    bail!(
+                        "exec `{display}` wrote more than {} MiB of output, the most a collected \
+                         exec holds; send the output to a file in the guest and copy that",
+                        EXEC_OUTPUT_LIMIT / (1024 * 1024)
+                    );
+                }
+                match ev {
+                    Some(SessionEvent::Data(b)) => out.extend(b),
+                    Some(SessionEvent::Stderr(b)) => err.extend(b),
+                    Some(SessionEvent::Exited(code)) => {
+                        return Ok(ExecOutput {
+                            exit_code: code,
+                            stdout: out,
+                            stderr: err,
+                        });
+                    }
+                    Some(SessionEvent::Error(msg)) => bail!("exec `{display}`: {msg}"),
+                    // The output EOF precedes the exit code.
+                    Some(SessionEvent::Eof) => {}
+                    None => bail!("agent channel closed during exec `{display}`"),
+                }
+            }
+        });
+        tokio::time::timeout(timeout, async {
+            tokio::select! {
+                result = &mut collect_output => result,
+                sent = send_input => {
+                    sent??;
+                    collect_output.await
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("exec `{display}` timed out after {timeout:?}"))?
     }
 
     /// Open a file **RPC session** on the guest (PRD §19.5): handle-based,
@@ -1489,6 +1515,7 @@ impl AgentSession {
 
 impl Drop for AgentSession {
     fn drop(&mut self) {
+        self.credit.close();
         if self.closed {
             return;
         }

@@ -355,6 +355,8 @@ Not read:
 
 ### F10. An exec with stdin can deadlock, and the timeout does not cover it
 
+- Status: fixed in card #509. Collected exec drains output while sending
+  stdin under the same deadline, and the agent credits discarded input.
 - Where: `src/labd/vm_agent.rs:811-815` and
   `guest/agent/src/exec.rs:66-78`.
 - Fault: two faults on one path.
@@ -371,11 +373,12 @@ Not read:
   caller in the tree passes stdin today except the conformance check with
   six bytes, so the fault is not reached yet.
 - Confidence: high for both readings.
-- Test: `a_large_stdin_through_cat_comes_back_whole`: `exec` of `cat` with
-  1 MiB of stdin and a 30 s timeout against a real agent (the conformance
-  suite), assert 1 MiB of stdout. `stdin_after_the_child_closed_it_is_still_credited`
-  in `sessions_test.rs`: exec `true`, send 600 KiB on the channel, assert
-  that `window_adjust` grants cover all of it.
+- Test: `a_large_stdin_through_cat_comes_back_whole` runs against a real
+  agent with 1 MiB of stdin and a 30 s timeout. The command fills its output
+  window on stderr before running `cat`. The test checks both streams.
+  `stdin_after_the_child_closed_it_is_still_credited` keeps the child alive
+  after it closes stdin, sends 600 KiB, and checks that `window_adjust`
+  grants cover all of it.
 
 ### F11. The ctl reader ends for good on one line that is too long or not UTF-8
 
