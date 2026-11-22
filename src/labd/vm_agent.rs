@@ -4274,6 +4274,80 @@ mod tests {
         assert!(err.starts_with("push /guest/x.bin"), "{err}");
     }
 
+    /// A pull that fails costs the host nothing: the destination a user named
+    /// still holds what it held, and nothing is left beside it. Before, the
+    /// destination was emptied first and the guest asked second, so a typo in
+    /// the guest path destroyed the host file it was aimed at.
+    #[tokio::test]
+    async fn a_failed_pull_leaves_the_host_file_as_it_was() {
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("notes.txt");
+        std::fs::write(&dest, b"keep me").unwrap();
+
+        // A guest path the agent does not hold.
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent.pull_file("/guest/typo", &dest).await.unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.starts_with("pull /guest/typo"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        // A transfer that fails part-way, after bytes have arrived.
+        let source = work.path().join("source");
+        std::fs::write(&source, vec![7; TRANSFER_CHUNK * 4]).unwrap();
+        agent
+            .push_file(&source, "/growing-hostile", None)
+            .await
+            .unwrap();
+        let err = agent
+            .pull_file("/growing-hostile", &dest)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"), "{err:#}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        // An agent that cannot serve the transfer at all.
+        let (_dir, path) = mock_agent_with(true, vec!["terminal".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent.pull_file("/guest/some-file", &dest).await.unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("repair-agent"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        // No failure left a part-written file beside the destination.
+        let left: Vec<_> = std::fs::read_dir(work.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.txt" && n != "source")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A pull that succeeds replaces the destination's content in one step,
+    /// keeps the mode the file had, and writes through a symlink to the file
+    /// it names rather than replacing the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_onto_an_existing_file_keeps_its_mode_and_its_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let real = work.path().join("real.bin");
+        std::fs::write(&real, b"old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = work.path().join("link.bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &link).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap().len(), 10_000);
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
+    }
+
     const MOCK_NO_DESKTOP: &str = "no one is logged on to the desktop";
     /// How far ahead of the host the mock guest's clock runs.
     const MOCK_CLOCK_AHEAD_MS: i64 = 3_600_000;
