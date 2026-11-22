@@ -30,7 +30,7 @@ Who the attacker is, per finding:
 | F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466) |
 | F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467) |
 | F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476) |
-| F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment |
+| F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment (fixed in card #477) |
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache |
 | F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet |
@@ -216,6 +216,27 @@ Who the attacker is, per finding:
   after the host socket buffer plus 64 segments. A second form at the
   gateway: with the flow stalled, send an ARP request for the gateway and
   assert a reply within a second.
+- Fixed in card #477. `handle_tcp` hands a segment to its flow with
+  `try_send` and never waits: a segment that finds the flow's channel full
+  is dropped, and the guest sends it again. The flow task no longer waits
+  for the host's socket outside its `select!`. Guest data waits in a buffer
+  of one window per flow (`Flow::to_host` in `src/net/nat/vtcp.rs`), and the
+  window the guest is told is the room left in it, where it was a constant
+  64 KiB before. A host that does not read therefore closes the guest's
+  window, the flow sends a window update when the host reads again, and the
+  guest's FIN reaches the host after the buffered data. The channel grew
+  from 64 to 256 segments (`SEGMENT_QUEUE`), which is more than a guest
+  inside its window has in flight, so only a guest that ignores the window
+  loses segments there. The wait during the host `connect` is covered by
+  the same `try_send`. The proof test failed before the fix
+  (`handle_frame` blocked at segment 64) and passes after it. The second
+  form is `a_stalled_flow_does_not_block_the_gateway`, which got no ARP
+  reply before the fix. Two more tests cover the new path: the window
+  closes and reopens with every acknowledged byte delivered in order, and a
+  FIN behind buffered data. Not changed: `handle_udp` still awaits the
+  64-slot channel of an engine-originated UDP flow (`guest_udp`), and the
+  gateway still awaits the engine's output channel when it resets an
+  unknown flow.
 
 ### F5. A NAT guest reaches the host's loopback (security, guest)
 

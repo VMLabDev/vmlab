@@ -1784,7 +1784,9 @@ impl Upload {
     /// The first `len` bytes of the stream the guest uploads: each byte
     /// follows from its place, so a lost, repeated or moved byte shows.
     fn stream(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect()
+        (0..len)
+            .map(|i| (i.wrapping_mul(31) & 0xff) as u8)
+            .collect()
     }
 
     /// The full data segment that starts `ahead` segments past `seq`.
@@ -1841,8 +1843,17 @@ async fn open_upload(
         seq: isn.wrapping_add(1),
         ack: synack.seq.wrapping_add(1),
     };
-    wire.send(tcp_frame(sport, dst, up.seq, up.ack, TCP_ACK, 65535, b"", &[]))
-        .await;
+    wire.send(tcp_frame(
+        sport,
+        dst,
+        up.seq,
+        up.ack,
+        TCP_ACK,
+        65535,
+        b"",
+        &[],
+    ))
+    .await;
     up
 }
 
@@ -2080,14 +2091,26 @@ async fn a_stalled_flow_closes_the_window_and_resumes_when_the_host_reads() {
         }
     }
 
-    let fin = tcp_frame(up.sport, dst, up.seq, up.ack, TCP_ACK | TCP_FIN, 65535, b"", &[]);
+    let fin = tcp_frame(
+        up.sport,
+        dst,
+        up.seq,
+        up.ack,
+        TCP_ACK | TCP_FIN,
+        65535,
+        b"",
+        &[],
+    );
     wire.send(fin).await;
     let received = timeout(WAIT, sink)
         .await
         .expect("the host never saw the end of the upload")
         .unwrap();
     assert_eq!(received.len(), up.acked());
-    assert!(received == Upload::stream(up.acked()), "the upload arrived changed");
+    assert!(
+        received == Upload::stream(up.acked()),
+        "the upload arrived changed"
+    );
 }
 
 /// The guest's FIN behind buffered data: the host gets the data first and
@@ -2100,7 +2123,16 @@ async fn a_fin_behind_a_stalled_flow_reaches_the_host_after_the_data() {
     let mut up = open_upload(&wire, &mut rx, 40_130, dst).await;
     upload_until_stalled(&wire, &mut rx, &mut up).await;
 
-    let fin = tcp_frame(up.sport, dst, up.seq, up.ack, TCP_ACK | TCP_FIN, 65535, b"", &[]);
+    let fin = tcp_frame(
+        up.sport,
+        dst,
+        up.seq,
+        up.ack,
+        TCP_ACK | TCP_FIN,
+        65535,
+        b"",
+        &[],
+    );
     wire.send(fin).await;
     loop {
         let t = recv_flow(&mut rx, dst).await;
@@ -2115,5 +2147,8 @@ async fn a_fin_behind_a_stalled_flow_reaches_the_host_after_the_data() {
         .expect("the host never saw the end of the upload")
         .unwrap();
     assert_eq!(received.len(), up.acked());
-    assert!(received == Upload::stream(up.acked()), "the upload arrived changed");
+    assert!(
+        received == Upload::stream(up.acked()),
+        "the upload arrived changed"
+    );
 }
