@@ -1391,3 +1391,34 @@ async fn isolation_drops_icmp_to_the_host() {
     recv_frame(&mut rx).await;
     assert_eq!(pinger.calls.load(Ordering::SeqCst), 1);
 }
+
+// ---------------------------------------------------------------------------
+// The host's loopback outside isolation (networking review F5, card #460)
+// ---------------------------------------------------------------------------
+
+/// An engine nobody gave a guard still refuses the host's loopback: a SYN to
+/// a listening `127.0.0.1` port is answered with RST and the listener
+/// accepts nothing. A service bound to loopback is bound there to be
+/// reachable from the host only.
+#[tokio::test]
+async fn nat_refuses_loopback_without_isolation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dst = (Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port());
+    let (tx, mut rx) = mpsc::channel(256);
+    let engine = NatEngine::new(NatConfig::new(GW_IP, GW_MAC), tx);
+
+    guest_tcp(&engine, 40200, dst, 777, 0, TCP_SYN, b"", &[]).await;
+    let t = recv_tcp(&mut rx).await;
+    assert_ne!(t.flags & TCP_RST, 0, "the SYN is reset, got {t:?}");
+    assert_eq!(t.ack, 778, "the reset acks the SYN");
+    assert!(
+        timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "the host's loopback listener was reached"
+    );
+    assert!(
+        engine.tcp_flows.lock().unwrap().is_empty(),
+        "no flow opened"
+    );
+}
