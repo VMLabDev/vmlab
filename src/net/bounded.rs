@@ -48,14 +48,6 @@ impl<K: Copy + Eq + Hash, V> BoundedMap<K, V> {
         self.map.get(key)
     }
 
-    pub(crate) fn contains_key(&self, key: &K) -> bool {
-        self.map.contains_key(key)
-    }
-
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &K> {
-        self.map.keys()
-    }
-
     /// Read by the tests that hold a table to its limit.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -80,7 +72,5 @@ mod tests {
         assert_eq!(m.get(&1), None);
         assert_eq!(m.get(&2), Some(&"b"));
         assert_eq!(m.get(&3), Some(&"c"));
-        assert!(m.contains_key(&2));
-        assert_eq!(m.keys().count(), 2);
     }
 }
