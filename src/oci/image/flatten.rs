@@ -13,12 +13,20 @@
 //! 2. **Emit** — re-stream the layers lowest→highest, appending only the
 //!    surviving entries to a merged tar piped straight into `sqfstar`,
 //!    which builds the squashfs without the tree ever touching disk.
+//!
+//! A layer comes from a registry, so its content is hostile input: the survey
+//! costs time and memory in proportion to the layer's bytes and no more, the
+//! whole image is held to [`Limits`], and both passes stop at the caller's
+//! cancel flag (the work runs on a blocking thread, which an aborted task
+//! does not stop).
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
@@ -38,14 +46,65 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 /// lower layers.
 const OPAQUE_MARKER: &str = ".wh..wh..opq";
 
+/// What one image may ask of the flatten. A registry chooses every number a
+/// layer holds, so each of these is a refusal, not a truncation.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    /// Tar entries over all layers, and distinct paths the survey remembers.
+    entries: u64,
+    /// Bytes of path the survey remembers.
+    name_bytes: u64,
+    /// Decompressed bytes over all layers.
+    unpacked_bytes: u64,
+}
+
+impl Limits {
+    /// The limits of a pulled container image: several times the largest
+    /// images in ordinary use, and a survey of at most a few GiB of memory.
+    const IMAGE: Limits = Limits {
+        entries: 4_000_000,
+        name_bytes: 256 << 20,
+        unpacked_bytes: 64 << 30,
+    };
+}
+
+/// The message of a flatten that stopped at its cancel flag.
+const CANCELLED: &str = "the flatten was cancelled";
+
+/// Sets a flatten's cancel flag when dropped. The async caller holds it
+/// across the `spawn_blocking` await: aborting that task drops it, and the
+/// blocking thread — which an abort does not reach — stops at its next read.
+pub struct CancelOnDrop(Arc<AtomicBool>);
+
+impl CancelOnDrop {
+    /// The guard and the flag to hand to [`flatten_to_squashfs`].
+    pub fn pair() -> (Self, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        (Self(flag.clone()), flag)
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn ensure_running(cancel: &AtomicBool) -> Result<()> {
+    ensure!(!cancel.load(Ordering::SeqCst), "{CANCELLED}");
+    Ok(())
+}
+
 /// Flatten `layers` (compressed layer blob path + its manifest media type,
 /// lowest first) into a squashfs at `dest`, verifying each layer's
 /// decompressed stream against its `diff_id`. Synchronous — callers on the
-/// async side wrap it in `spawn_blocking`.
+/// async side wrap it in `spawn_blocking` and hold a [`CancelOnDrop`] for
+/// `cancel`, which stops the work once set.
 pub fn flatten_to_squashfs(
     layers: &[(PathBuf, String)],
     diff_ids: &[String],
     dest: &Path,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     ensure!(
         layers.len() == diff_ids.len(),
@@ -57,8 +116,8 @@ pub fn flatten_to_squashfs(
     if !binary_on_path(SQFSTAR) {
         bail!("`{SQFSTAR}` not found on PATH — install squashfs-tools to run container images");
     }
-    let winners = survey_layers(layers, diff_ids)?;
-    write_squashfs(layers, &winners, dest)
+    let winners = survey_layers(layers, diff_ids, &Limits::IMAGE, cancel)?;
+    write_squashfs(layers, &winners, dest, cancel)
 }
 
 /// Pass 1: stream every layer recording, per surviving path, the layer that
@@ -67,22 +126,34 @@ pub fn flatten_to_squashfs(
 fn survey_layers(
     layers: &[(PathBuf, String)],
     diff_ids: &[String],
-) -> Result<HashMap<String, usize>> {
-    let mut winners: HashMap<String, usize> = HashMap::new();
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Result<Survivors> {
+    let mut winners = Survivors::new(limits);
+    let mut entries: u64 = 0;
+    let mut unpacked_left = limits.unpacked_bytes;
     for (i, (path, media_type)) in layers.iter().enumerate() {
-        let mut reader = HashingReader::new(layer_reader(path, media_type)?);
+        let mut reader =
+            LayerStream::hashed(layer_reader(path, media_type)?, cancel, unpacked_left);
         {
             let mut archive = tar::Archive::new(&mut reader);
             for entry in archive
                 .entries()
                 .with_context(|| format!("cannot read layer {i} ({})", path.display()))?
             {
+                ensure_running(cancel)?;
                 let entry =
                     entry.with_context(|| format!("cannot read layer {i} ({})", path.display()))?;
+                entries += 1;
+                ensure!(
+                    entries <= limits.entries,
+                    "the image has more than {} entries in its layers — refused",
+                    limits.entries
+                );
                 let Some(name) = normalise(&entry.path()?) else {
                     continue;
                 };
-                apply_entry(&mut winners, i, &name, entry.header().entry_type());
+                winners.apply(i, &name, entry.header().entry_type())?;
             }
         }
         // The tar reader stops at the end-of-archive marker; drain to EOF so
@@ -90,6 +161,7 @@ fn survey_layers(
         // digests of).
         io::copy(&mut reader, &mut io::sink())
             .with_context(|| format!("cannot decompress layer {i} ({})", path.display()))?;
+        unpacked_left = reader.left;
         let got = format!("sha256:{}", reader.finish());
         if !got.eq_ignore_ascii_case(&diff_ids[i]) {
             bail!(
@@ -103,48 +175,129 @@ fn survey_layers(
     Ok(winners)
 }
 
-/// Fold one tar entry from `layer` into the survivor map. Whiteouts and
-/// opaque markers only erase *lower* layers — entries this layer already
-/// recorded are kept (a layer can legitimately whiteout a path and recreate
-/// it, in either order).
-fn apply_entry(winners: &mut HashMap<String, usize>, layer: usize, name: &str, kind: EntryType) {
-    let (dir, base) = match name.rsplit_once('/') {
-        Some((dir, base)) => (dir, base),
-        None => ("", name),
-    };
-    if base == OPAQUE_MARKER {
-        let prefix = if dir.is_empty() {
-            String::new()
-        } else {
-            format!("{dir}/")
+/// The paths that survive the layer stack, as a tree of path components.
+///
+/// A whiteout, an opaque marker and a file over a directory each erase a
+/// whole lower subtree. The tree records that as one number on the subtree's
+/// root (`cut`) instead of visiting the subtree, so folding an entry in
+/// costs its own path length whatever the image holds, and so does asking
+/// who won a path.
+struct Survivors {
+    nodes: Vec<Node>,
+    name_bytes: u64,
+    max_nodes: u64,
+    max_name_bytes: u64,
+}
+
+#[derive(Default)]
+struct Node {
+    /// The layer whose entry at this path is the newest not erased here.
+    entry: Option<usize>,
+    /// Entries strictly beneath this path from a layer below `cut` are
+    /// erased. Layers are folded in lowest first, so a later entry is never
+    /// from a layer below a cut that is already recorded.
+    cut: usize,
+    children: HashMap<Box<str>, usize>,
+}
+
+impl Survivors {
+    fn new(limits: &Limits) -> Self {
+        Self {
+            nodes: vec![Node::default()],
+            name_bytes: 0,
+            max_nodes: limits.entries,
+            max_name_bytes: limits.name_bytes,
+        }
+    }
+
+    /// The node of `path` (`""` is the root), made if absent.
+    fn node(&mut self, path: &str) -> Result<usize> {
+        let mut at = 0;
+        for comp in path.split('/').filter(|c| !c.is_empty()) {
+            at = self.node_under(at, comp)?;
+        }
+        Ok(at)
+    }
+
+    /// Fold one tar entry from `layer` into the tree. Whiteouts and opaque
+    /// markers only erase *lower* layers — entries this layer already
+    /// recorded are kept (a layer can legitimately whiteout a path and
+    /// recreate it, in either order).
+    fn apply(&mut self, layer: usize, name: &str, kind: EntryType) -> Result<()> {
+        let (dir, base) = match name.rsplit_once('/') {
+            Some((dir, base)) => (dir, base),
+            None => ("", name),
         };
-        winners.retain(|p, l| *l == layer || !(p.len() > prefix.len() && p.starts_with(&prefix)));
-        return;
+        if base == OPAQUE_MARKER {
+            let at = self.node(dir)?;
+            let node = &mut self.nodes[at];
+            node.cut = node.cut.max(layer);
+            return Ok(());
+        }
+        if let Some(target_base) = base.strip_prefix(WHITEOUT_PREFIX) {
+            if target_base.is_empty() {
+                return Ok(()); // `.wh.` names no target
+            }
+            let at = self.node(dir)?;
+            let at = self.node_under(at, target_base)?;
+            let node = &mut self.nodes[at];
+            if node.entry.is_some_and(|l| l < layer) {
+                node.entry = None;
+            }
+            node.cut = node.cut.max(layer);
+            return Ok(());
+        }
+        let at = self.node(name)?;
+        let node = &mut self.nodes[at];
+        if kind != EntryType::Directory {
+            // A non-directory shadows any lower directory tree at the same path.
+            node.cut = node.cut.max(layer);
+        }
+        node.entry = Some(layer);
+        Ok(())
     }
-    if let Some(target_base) = base.strip_prefix(WHITEOUT_PREFIX) {
-        let target = if dir.is_empty() {
-            target_base.to_string()
-        } else {
-            format!("{dir}/{target_base}")
-        };
-        let prefix = format!("{target}/");
-        winners.retain(|p, l| *l == layer || !(*p == target || p.starts_with(&prefix)));
-        return;
+
+    /// The node of the one component `comp` beneath node `at`, made if absent.
+    fn node_under(&mut self, at: usize, comp: &str) -> Result<usize> {
+        if let Some(&child) = self.nodes[at].children.get(comp) {
+            return Ok(child);
+        }
+        self.name_bytes += comp.len() as u64;
+        ensure!(
+            self.nodes.len() as u64 <= self.max_nodes,
+            "the image has more than {} paths in its layers — refused",
+            self.max_nodes
+        );
+        ensure!(
+            self.name_bytes <= self.max_name_bytes,
+            "the paths in the image's layers take more than {} bytes — refused",
+            self.max_name_bytes
+        );
+        let child = self.nodes.len();
+        self.nodes.push(Node::default());
+        self.nodes[at].children.insert(comp.into(), child);
+        Ok(child)
     }
-    if kind != EntryType::Directory {
-        // A non-directory shadows any lower directory tree at the same path.
-        let prefix = format!("{name}/");
-        winners.retain(|p, l| *l == layer || !p.starts_with(&prefix));
+
+    /// The layer that wins `name`, or `None` when no layer's entry survives.
+    fn winner(&self, name: &str) -> Option<usize> {
+        let mut at = 0;
+        let mut cut = 0;
+        for comp in name.split('/').filter(|c| !c.is_empty()) {
+            cut = cut.max(self.nodes[at].cut);
+            at = *self.nodes[at].children.get(comp)?;
+        }
+        self.nodes[at].entry.filter(|layer| *layer >= cut)
     }
-    winners.insert(name.to_string(), layer);
 }
 
 /// Pass 2: spawn `sqfstar` and stream the surviving entries into its stdin
 /// as one merged tar, then wait and surface its stderr on failure.
 fn write_squashfs(
     layers: &[(PathBuf, String)],
-    winners: &HashMap<String, usize>,
+    winners: &Survivors,
     dest: &Path,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -173,7 +326,12 @@ fn write_squashfs(
 
     // Stream survivors; stdin closes when this returns (even on error), so
     // the child always sees EOF and exits before we wait on it.
-    let streamed = stream_survivors(layers, winners, stdin);
+    let streamed = stream_survivors(layers, winners, stdin, cancel);
+    if streamed.is_err() {
+        // Nothing will read what sqfstar has built so far: do not wait for it
+        // to finish an image of a part of the stream.
+        let _ = child.kill();
+    }
     let status = child.wait().context("waiting for sqfstar")?;
     let stderr_text = drain.join().unwrap_or_default();
     if !status.success() {
@@ -190,17 +348,19 @@ fn write_squashfs(
 /// layer won (headers preserved: mode, uid/gid, mtime, link targets).
 fn stream_survivors(
     layers: &[(PathBuf, String)],
-    winners: &HashMap<String, usize>,
+    winners: &Survivors,
     stdin: std::process::ChildStdin,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut builder = tar::Builder::new(stdin);
     for (i, (path, media_type)) in layers.iter().enumerate() {
-        let reader = layer_reader(path, media_type)?;
+        let reader = LayerStream::verified(layer_reader(path, media_type)?, cancel);
         let mut archive = tar::Archive::new(reader);
         for entry in archive
             .entries()
             .with_context(|| format!("cannot re-read layer {i} ({})", path.display()))?
         {
+            ensure_running(cancel)?;
             let mut entry =
                 entry.with_context(|| format!("cannot re-read layer {i} ({})", path.display()))?;
             let Some(name) = normalise(&entry.path()?) else {
@@ -210,7 +370,7 @@ fn stream_survivors(
             if base.starts_with(WHITEOUT_PREFIX) {
                 continue; // whiteouts/opaque markers never reach the output
             }
-            if winners.get(&name) != Some(&i) {
+            if winners.winner(&name) != Some(i) {
                 continue; // shadowed by a higher layer (or whiteout-erased)
             }
             // Preserve the original header; append via `append_data`/
@@ -281,31 +441,61 @@ fn normalise(path: &Path) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// A `Read` adapter feeding every byte through SHA-256 on its way out, so a
-/// layer's decompressed stream is hashed exactly once while tar walks it.
-struct HashingReader<R> {
+/// A layer's decompressed stream as both passes read it: a read past `left`
+/// bytes is refused, and so is any read once `cancel` is set. The survey's
+/// stream also feeds every byte through SHA-256 on its way out, so the stream is
+/// hashed exactly once while tar walks it.
+struct LayerStream<'a, R> {
     inner: R,
-    hasher: Sha256,
+    hasher: Option<Sha256>,
+    cancel: &'a AtomicBool,
+    /// Decompressed bytes the image may still yield.
+    left: u64,
 }
 
-impl<R: Read> HashingReader<R> {
-    fn new(inner: R) -> Self {
+impl<'a, R: Read> LayerStream<'a, R> {
+    /// The survey's stream: hashed, and held to `left` bytes.
+    fn hashed(inner: R, cancel: &'a AtomicBool, left: u64) -> Self {
         Self {
             inner,
-            hasher: Sha256::new(),
+            hasher: Some(Sha256::new()),
+            cancel,
+            left,
         }
     }
 
-    /// The hex digest of everything read.
+    /// The emit pass's stream, over bytes the survey has hashed and held to
+    /// the limit already.
+    fn verified(inner: R, cancel: &'a AtomicBool) -> Self {
+        Self {
+            inner,
+            hasher: None,
+            cancel,
+            left: u64::MAX,
+        }
+    }
+
+    /// The hex digest of everything read from a hashed stream.
     fn finish(self) -> String {
-        hex::encode(self.hasher.finalize())
+        hex::encode(self.hasher.unwrap_or_default().finalize())
     }
 }
 
-impl<R: Read> Read for HashingReader<R> {
+impl<R: Read> Read for LayerStream<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(io::Error::other(CANCELLED));
+        }
         let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
+        if n as u64 > self.left {
+            return Err(io::Error::other(
+                "the image's layers unpack to more bytes than a pull accepts — refused",
+            ));
+        }
+        self.left -= n as u64;
+        if let Some(hasher) = &mut self.hasher {
+            hasher.update(&buf[..n]);
+        }
         Ok(n)
     }
 }
@@ -451,7 +641,13 @@ mod tests {
             .build(tmp.path(), "layer1.tar", false);
 
         let dest = tmp.path().join("rootfs.sqfs");
-        flatten_to_squashfs(&[(l0, m0), (l1, m1)], &[d0, d1], &dest).unwrap();
+        flatten_to_squashfs(
+            &[(l0, m0), (l1, m1)],
+            &[d0, d1],
+            &dest,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(dest.is_file());
         assert!(std::fs::metadata(&dest).unwrap().len() > 0);
 
@@ -503,7 +699,13 @@ mod tests {
             .build(tmp.path(), "l1.tar.gz", true);
 
         let dest = tmp.path().join("out.sqfs");
-        flatten_to_squashfs(&[(l0, m0), (l1, m1)], &[d0, d1], &dest).unwrap();
+        flatten_to_squashfs(
+            &[(l0, m0), (l1, m1)],
+            &[d0, d1],
+            &dest,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         if !have("unsquashfs") {
             return;
@@ -524,8 +726,13 @@ mod tests {
                 .file("x", 0o644, 0, b"x")
                 .build(tmp.path(), "l0.tar.gz", true);
         let bogus = format!("sha256:{}", "0".repeat(64));
-        let err =
-            flatten_to_squashfs(&[(l0, m0)], &[bogus], &tmp.path().join("out.sqfs")).unwrap_err();
+        let err = flatten_to_squashfs(
+            &[(l0, m0)],
+            &[bogus],
+            &tmp.path().join("out.sqfs"),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("diff_id mismatch"), "{err}");
     }
 
@@ -536,6 +743,7 @@ mod tests {
             &[(PathBuf::from("/nonexistent"), "tar".into())],
             &[],
             Path::new("/nonexistent-out"),
+            &AtomicBool::new(false),
         )
         .unwrap_err();
         assert!(err.to_string().contains("diff_ids"), "{err}");
@@ -554,37 +762,289 @@ mod tests {
         assert_eq!(normalise(Path::new("./")), None);
     }
 
+    /// Review F6: every non-directory entry scanned the whole survivor map,
+    /// so a layer of `n` files cost `n²/2` visits.
+    #[test]
+    fn the_survey_of_a_large_layer_is_linear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut layer = Layer::new().dir("d", 0o755);
+        for i in 0..200_000 {
+            layer = layer.file(&format!("d/f{i}"), 0o644, 0, b"");
+        }
+        let (path, media, diff_id) = layer.build(tmp.path(), "big.tar", false);
+        let started = std::time::Instant::now();
+        let cancel = AtomicBool::new(false);
+        let winners = survey_layers(&[(path, media)], &[diff_id], &Limits::IMAGE, &cancel).unwrap();
+        assert_eq!(winners.winner("d/f199999"), Some(0));
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "the survey of 200,000 files took {took:?}"
+        );
+    }
+
+    const ROOMY: Limits = Limits {
+        entries: 1 << 20,
+        name_bytes: 1 << 30,
+        unpacked_bytes: 1 << 40,
+    };
+
+    /// Review F6: the survivor map had no entry limit.
+    #[test]
+    fn a_layer_with_too_many_entries_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            entries: 100,
+            ..ROOMY
+        };
+        let cancel = AtomicBool::new(false);
+        let layer_of = |files: usize, name: &str| {
+            let mut layer = Layer::new();
+            for i in 0..files {
+                layer = layer.file(&format!("f{i}"), 0o644, 0, b"");
+            }
+            let (path, media, diff_id) = layer.build(tmp.path(), name, false);
+            (vec![(path, media)], vec![diff_id])
+        };
+
+        let (layers, diff_ids) = layer_of(100, "at-the-limit.tar");
+        survey_layers(&layers, &diff_ids, &limits, &cancel).unwrap();
+
+        let (layers, diff_ids) = layer_of(101, "over.tar");
+        let err = survey_layers(&layers, &diff_ids, &limits, &cancel)
+            .err()
+            .expect("101 entries pass a limit of 100");
+        assert!(
+            format!("{err:#}").contains("more than 100 entries"),
+            "{err:#}"
+        );
+
+        // One entry that names many directories: the paths are counted too.
+        let deep = (0..200).map(|i| format!("d{i}")).collect::<Vec<_>>();
+        let (path, media, diff_id) =
+            Layer::new()
+                .file(&deep.join("/"), 0o644, 0, b"")
+                .build(tmp.path(), "deep.tar", false);
+        let err = survey_layers(&[(path, media)], &[diff_id], &limits, &cancel)
+            .err()
+            .expect("200 paths pass a limit of 100");
+        assert!(
+            format!("{err:#}").contains("more than 100 paths"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_layer_whose_names_take_too_much_memory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            name_bytes: 64,
+            ..ROOMY
+        };
+        let (path, media, diff_id) = Layer::new()
+            .file(&"a".repeat(40), 0o644, 0, b"")
+            .file(&"b".repeat(40), 0o644, 0, b"")
+            .build(tmp.path(), "names.tar", false);
+        let err = survey_layers(
+            &[(path, media)],
+            &[diff_id],
+            &limits,
+            &AtomicBool::new(false),
+        )
+        .err()
+        .expect("80 bytes of names pass a limit of 64");
+        assert!(format!("{err:#}").contains("more than 64 bytes"), "{err:#}");
+    }
+
+    /// A gzip layer of zeroes is a thousandth of what it unpacks to.
+    #[test]
+    fn layers_that_unpack_to_too_much_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            unpacked_bytes: 64 * 1024,
+            ..ROOMY
+        };
+        let cancel = AtomicBool::new(false);
+        let layer = |name: &str| {
+            Layer::new()
+                .file("zeroes", 0o644, 0, &[0u8; 40 * 1024])
+                .build(tmp.path(), name, true)
+        };
+        let (p0, m0, d0) = layer("l0.tar.gz");
+        let (p1, m1, d1) = layer("l1.tar.gz");
+
+        survey_layers(
+            &[(p0.clone(), m0.clone())],
+            std::slice::from_ref(&d0),
+            &limits,
+            &cancel,
+        )
+        .unwrap();
+        // The limit is over the image, not over each layer.
+        let err = survey_layers(&[(p0, m0), (p1, m1)], &[d0, d1], &limits, &cancel)
+            .err()
+            .expect("80 KiB pass a limit of 64 KiB");
+        assert!(
+            format!("{err:#}").contains("unpack to more bytes"),
+            "{err:#}"
+        );
+    }
+
+    /// Review F6: the flatten runs on a blocking thread, which an aborted
+    /// pull task leaves running.
+    #[test]
+    fn a_cancelled_flatten_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, media, diff_id) =
+            Layer::new()
+                .file("x", 0o644, 0, b"x")
+                .build(tmp.path(), "l0.tar.gz", true);
+        let layers = [(path, media)];
+        let diff_ids = [diff_id];
+
+        let (guard, cancel) = CancelOnDrop::pair();
+        let winners = survey_layers(&layers, &diff_ids, &ROOMY, &cancel).unwrap();
+        drop(guard);
+        let err = survey_layers(&layers, &diff_ids, &ROOMY, &cancel)
+            .err()
+            .expect("the survey ran on after the cancel");
+        assert!(format!("{err:#}").contains(CANCELLED), "{err:#}");
+
+        if !have(SQFSTAR) {
+            return;
+        }
+        let dest = tmp.path().join("out.sqfs");
+        let err = write_squashfs(&layers, &winners, &dest, &cancel).unwrap_err();
+        assert!(format!("{err:#}").contains(CANCELLED), "{err:#}");
+        let err = flatten_to_squashfs(&layers, &diff_ids, &dest, &cancel).unwrap_err();
+        assert!(format!("{err:#}").contains(CANCELLED), "{err:#}");
+    }
+
+    /// The tree must answer as the map it replaced did. That map is the
+    /// definition of the layer semantics: every erasure visits every path.
+    #[test]
+    fn the_survivor_tree_agrees_with_a_scan_of_every_path() {
+        fn scan(winners: &mut HashMap<String, usize>, layer: usize, name: &str, kind: EntryType) {
+            let (dir, base) = match name.rsplit_once('/') {
+                Some((dir, base)) => (dir, base),
+                None => ("", name),
+            };
+            if base == OPAQUE_MARKER {
+                let prefix = if dir.is_empty() {
+                    String::new()
+                } else {
+                    format!("{dir}/")
+                };
+                winners.retain(|p, l| {
+                    *l == layer || !(p.len() > prefix.len() && p.starts_with(&prefix))
+                });
+                return;
+            }
+            if let Some(target_base) = base.strip_prefix(WHITEOUT_PREFIX) {
+                let target = if dir.is_empty() {
+                    target_base.to_string()
+                } else {
+                    format!("{dir}/{target_base}")
+                };
+                let prefix = format!("{target}/");
+                winners.retain(|p, l| *l == layer || !(*p == target || p.starts_with(&prefix)));
+                return;
+            }
+            if kind != EntryType::Directory {
+                let prefix = format!("{name}/");
+                winners.retain(|p, l| *l == layer || !p.starts_with(&prefix));
+            }
+            winners.insert(name.to_string(), layer);
+        }
+
+        // Every path of up to three components over two names, so that the
+        // entries collide, nest and erase each other often.
+        let names = ["a", "b"];
+        let mut paths: Vec<String> = Vec::new();
+        for x in names {
+            paths.push(x.to_string());
+            for y in names {
+                paths.push(format!("{x}/{y}"));
+                for z in names {
+                    paths.push(format!("{x}/{y}/{z}"));
+                }
+            }
+        }
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |below: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % below
+        };
+        for round in 0..2000 {
+            let mut map = HashMap::new();
+            let mut tree = Survivors::new(&ROOMY);
+            let mut script = Vec::new();
+            for layer in 0..4 {
+                for _ in 0..next(6) {
+                    let path = &paths[next(paths.len())];
+                    let (dir, base) = match path.rsplit_once('/') {
+                        Some((dir, base)) => (format!("{dir}/"), base),
+                        None => (String::new(), path.as_str()),
+                    };
+                    let (name, kind) = match next(8) {
+                        0 => (format!("{dir}{WHITEOUT_PREFIX}{base}"), EntryType::Regular),
+                        1 => (format!("{path}/{OPAQUE_MARKER}"), EntryType::Regular),
+                        2 => (OPAQUE_MARKER.to_string(), EntryType::Regular),
+                        3 => (format!("{dir}{WHITEOUT_PREFIX}"), EntryType::Regular),
+                        4 | 5 => (path.clone(), EntryType::Directory),
+                        _ => (path.clone(), EntryType::Regular),
+                    };
+                    scan(&mut map, layer, &name, kind);
+                    tree.apply(layer, &name, kind).unwrap();
+                    script.push((layer, name, kind));
+                }
+            }
+            for path in &paths {
+                assert_eq!(
+                    tree.winner(path),
+                    map.get(path).copied(),
+                    "round {round}, path `{path}`, after {script:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn survey_records_winners_and_whiteouts() {
         // Pure pass-1 logic, no sqfstar required.
-        let mut winners = HashMap::new();
+        let mut winners = Survivors::new(&ROOMY);
+        let mut apply_entry = |layer: usize, name: &str, kind: EntryType| {
+            winners.apply(layer, name, kind).unwrap();
+        };
         // layer 0
-        apply_entry(&mut winners, 0, "etc", EntryType::Directory);
-        apply_entry(&mut winners, 0, "etc/version", EntryType::Regular);
-        apply_entry(&mut winners, 0, "gone", EntryType::Regular);
-        apply_entry(&mut winners, 0, "opq/lower", EntryType::Regular);
-        apply_entry(&mut winners, 0, "tree/child", EntryType::Regular);
+        apply_entry(0, "etc", EntryType::Directory);
+        apply_entry(0, "etc/version", EntryType::Regular);
+        apply_entry(0, "gone", EntryType::Regular);
+        apply_entry(0, "opq/lower", EntryType::Regular);
+        apply_entry(0, "tree/child", EntryType::Regular);
         // layer 1: override, whiteout, opaque, file-over-directory
-        apply_entry(&mut winners, 1, "etc/version", EntryType::Regular);
-        apply_entry(&mut winners, 1, ".wh.gone", EntryType::Regular);
-        apply_entry(&mut winners, 1, "opq/.wh..wh..opq", EntryType::Regular);
-        apply_entry(&mut winners, 1, "opq/upper", EntryType::Regular);
-        apply_entry(&mut winners, 1, "tree", EntryType::Regular);
+        apply_entry(1, "etc/version", EntryType::Regular);
+        apply_entry(1, ".wh.gone", EntryType::Regular);
+        apply_entry(1, "opq/.wh..wh..opq", EntryType::Regular);
+        apply_entry(1, "opq/upper", EntryType::Regular);
+        apply_entry(1, "tree", EntryType::Regular);
 
-        assert_eq!(winners.get("etc"), Some(&0), "merged dir stays");
-        assert_eq!(winners.get("etc/version"), Some(&1), "last writer wins");
-        assert_eq!(winners.get("gone"), None, "whiteout deletes");
-        assert_eq!(winners.get("opq/lower"), None, "opaque drops lower");
+        assert_eq!(winners.winner("etc"), Some(0), "merged dir stays");
+        assert_eq!(winners.winner("etc/version"), Some(1), "last writer wins");
+        assert_eq!(winners.winner("gone"), None, "whiteout deletes");
+        assert_eq!(winners.winner("opq/lower"), None, "opaque drops lower");
         assert_eq!(
-            winners.get("opq/upper"),
-            Some(&1),
+            winners.winner("opq/upper"),
+            Some(1),
             "opaque keeps same layer"
         );
         assert_eq!(
-            winners.get("tree/child"),
+            winners.winner("tree/child"),
             None,
             "file shadows lower dir tree"
         );
-        assert_eq!(winners.get("tree"), Some(&1));
+        assert_eq!(winners.winner("tree"), Some(1));
     }
 }
