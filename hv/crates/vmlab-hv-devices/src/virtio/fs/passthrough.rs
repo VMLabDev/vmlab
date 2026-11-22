@@ -1286,7 +1286,8 @@ impl Session {
         let mut used = 0usize;
         let mut position = offset;
         while used <= size as usize {
-            let Some((entries, next)) = self.dir_batch(inode, handle, position, size as usize / 4)?
+            let Some((entries, next)) =
+                self.dir_batch(inode, handle, position, size as usize / 4)?
             else {
                 break;
             };
