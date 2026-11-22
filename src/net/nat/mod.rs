@@ -180,6 +180,10 @@ impl Drop for PassiveSlot {
 }
 
 /// The ephemeral range 49152..=65535.
+/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
+#[allow(dead_code)]
+pub(super) const MAX_GUEST_MACS: usize = 1024;
+
 const EPHEMERAL_BASE: u16 = 49152;
 const EPHEMERAL_PORTS: u32 = 16384;
 

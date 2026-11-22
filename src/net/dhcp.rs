@@ -42,6 +42,9 @@ const BOOTREPLY: u8 = 2;
 const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 /// BOOTP fixed header (236 bytes) plus the magic cookie (4 bytes).
 const BOOTP_MIN_LEN: usize = 240;
+/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
+#[allow(dead_code)]
+const MAX_DECLINED: usize = 1024;
 /// The broadcast bit in the BOOTP `flags` field.
 const FLAG_BROADCAST: u16 = 0x8000;
 
@@ -1009,5 +1012,39 @@ mod tests {
                 assert!(EthView::parse(&reply).is_some());
             }
         }
+    }
+
+    /// Review F6: declines of 100 000 addresses quarantine no more than
+    /// [`MAX_DECLINED`], and none outside the pool.
+    #[test]
+    fn the_declined_set_is_bounded() {
+        let decline = |ip: Ipv4Addr| {
+            client_frame(
+                mac(1),
+                DHCP_DECLINE,
+                &[(OPT_REQUESTED_IP, &ip.octets())],
+                Ipv4Addr::UNSPECIFIED,
+                false,
+            )
+        };
+        // A /8, so that the pool is larger than the limit.
+        let cfg = DhcpConfig::new(net("10.0.0.0/8"), Ipv4Addr::new(10, 0, 0, 1), GW_MAC);
+        let mut s = DhcpServer::new(cfg);
+        for i in 0..100_000u32 {
+            s.handle(&decline(Ipv4Addr::from(0x0A00_0002 + i)));
+        }
+        assert!(
+            s.declined.len() <= MAX_DECLINED,
+            "{} addresses are quarantined, over the limit of {MAX_DECLINED}",
+            s.declined.len()
+        );
+        assert_eq!(s.declined.len(), MAX_DECLINED, "a decline still quarantines");
+
+        // An address the server cannot hand out takes no slot.
+        let mut s = DhcpServer::new(config());
+        for i in 0..1_000u32 {
+            s.handle(&decline(Ipv4Addr::from(0xC612_0000 + i)));
+        }
+        assert_eq!(s.declined.len(), 0);
     }
 }

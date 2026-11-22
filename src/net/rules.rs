@@ -53,6 +53,12 @@ use crate::net::frame::{
 
 /// Idle expiry for redirect translation (return-path) entries.
 const CONN_IDLE: Duration = Duration::from_secs(300);
+/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
+#[allow(dead_code)]
+const MAX_CONNS: usize = 4096;
+/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
+#[allow(dead_code)]
+const MAX_CONNS_PER_GUEST: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -1282,5 +1288,87 @@ mod tests {
         assert_eq!(rs.conn_count(), 1);
         let reply = tcp_pkt(TARGET, GUEST, 80, 6000, frame::TCP_ACK);
         assert!(matches!(rs.eval_return(&reply), Verdict::Rewrite(_)));
+    }
+
+    fn guest_n(n: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 213, 7, n)
+    }
+
+    /// Review F7: 200 000 redirected packets that differ in source port
+    /// leave no more entries than one guest's share, and a packet that
+    /// matches no rule does not pay for the size of the table.
+    #[test]
+    fn eval_cost_does_not_grow_with_the_connection_table() {
+        let mut rs = RuleSet::new();
+        rs.add_redirect(redirect(DST_A, None, TARGET, None, None));
+
+        for i in 0..200_000u32 {
+            let p = tcp_pkt(GUEST, DST_A, i as u16, 1 + (i >> 16) as u16, frame::TCP_SYN);
+            assert!(matches!(rs.eval(&p), Verdict::Rewrite(_)));
+            // Checked on the way, not at the end: without a limit every one
+            // of these calls walks the whole table.
+            assert!(
+                rs.conn_count() <= MAX_CONNS_PER_GUEST,
+                "one guest holds {} entries, over its limit of {MAX_CONNS_PER_GUEST}",
+                rs.conn_count()
+            );
+        }
+        assert_eq!(rs.conn_count(), MAX_CONNS_PER_GUEST);
+
+        // The newest connection is tracked: its reply is rewritten.
+        let last = 199_999u32;
+        let reply = tcp_pkt(
+            TARGET,
+            GUEST,
+            1 + (last >> 16) as u16,
+            last as u16,
+            frame::TCP_ACK,
+        );
+        assert!(matches!(rs.eval_return(&reply), Verdict::Rewrite(_)));
+
+        // A packet no rule matches: 1 000 of them with the table at its
+        // limit. One walk of the table per second is all they may pay.
+        let other = tcp_pkt(GUEST, Ipv4Addr::new(192, 0, 2, 99), 1, 80, frame::TCP_SYN);
+        let start = Instant::now();
+        for _ in 0..1_000 {
+            assert!(matches!(rs.eval(&other), Verdict::Pass));
+        }
+        let took = start.elapsed();
+        assert!(
+            took < Duration::from_secs(1),
+            "1 000 calls took {took:?} with {} entries",
+            rs.conn_count()
+        );
+    }
+
+    /// A guest at its limit replaces its own entry idle the longest and
+    /// leaves the entries of another guest alone, and no number of guests
+    /// takes the table past its size.
+    #[test]
+    fn a_guest_at_its_limit_does_not_push_out_another_guest() {
+        let mut rs = RuleSet::new();
+        rs.add_redirect(redirect(DST_A, None, TARGET, None, None));
+
+        let quiet = tcp_pkt(guest_n(1), DST_A, 4000, 80, frame::TCP_SYN);
+        assert!(matches!(rs.eval(&quiet), Verdict::Rewrite(_)));
+        for sport in 0..(2 * MAX_CONNS_PER_GUEST as u16) {
+            rs.eval(&tcp_pkt(guest_n(2), DST_A, sport, 80, frame::TCP_SYN));
+        }
+        assert_eq!(rs.conn_count(), MAX_CONNS_PER_GUEST + 1);
+        let reply = tcp_pkt(TARGET, guest_n(1), 80, 4000, frame::TCP_ACK);
+        assert!(
+            matches!(rs.eval_return(&reply), Verdict::Rewrite(_)),
+            "the quiet guest's connection is still tracked"
+        );
+        // The busy guest's first connection made room for its later ones.
+        let reply = tcp_pkt(TARGET, guest_n(2), 80, 0, frame::TCP_ACK);
+        assert!(matches!(rs.eval_return(&reply), Verdict::Pass));
+
+        for n in 3..10 {
+            for sport in 0..MAX_CONNS_PER_GUEST as u16 {
+                rs.eval(&tcp_pkt(guest_n(n), DST_A, sport, 80, frame::TCP_SYN));
+            }
+        }
+        assert_eq!(rs.conn_count(), MAX_CONNS);
     }
 }

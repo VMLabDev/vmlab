@@ -38,6 +38,10 @@ use super::NatEngine;
 /// Reachability results are reused for this long.
 const CACHE_TTL: Duration = Duration::from_secs(10);
 
+/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
+#[allow(dead_code)]
+pub(super) const MAX_CACHED: usize = 1024;
+
 /// How many probes run at once (review F3): each is one `ping` process. An
 /// echo request that would need one more is dropped (the guest retransmits).
 pub(super) const MAX_PROBES: usize = 32;
@@ -111,6 +115,12 @@ impl IcmpState {
             Some((ok, at)) if at.elapsed() < CACHE_TTL => Some(*ok),
             _ => None,
         }
+    }
+
+    /// How many results the cache holds.
+    #[cfg(test)]
+    pub(super) fn cached_len(&self) -> usize {
+        self.cache.lock_recover().len()
     }
 
     /// Try to claim the probe for `dst` on behalf of `guest`; `false` means

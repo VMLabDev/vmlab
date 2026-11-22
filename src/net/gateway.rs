@@ -51,6 +51,9 @@ const ARP_RETRY: Duration = Duration::from_secs(1);
 /// Bounds on what waits for ARP: packets per next hop, and next hops.
 const ARP_PENDING_PACKETS: usize = 16;
 const ARP_PENDING_HOSTS: usize = 256;
+/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
+#[allow(dead_code)]
+const MAX_NEIGHBOURS: usize = 1024;
 
 /// Uplink handler: receives every frame the gateway routes off-segment.
 ///
@@ -959,5 +962,25 @@ mod tests {
         let arp = ArpView::parse(EthView::parse(&reply).unwrap().payload()).unwrap();
         assert_eq!(arp.op(), ArpOp::Reply);
         assert_eq!(arp.sha(), gw.gw_mac());
+    }
+
+    /// Review F6: ARP from 100 000 sender addresses leaves no more than
+    /// [`MAX_NEIGHBOURS`] entries, and the newest sender is one of them.
+    #[test]
+    fn the_neighbour_table_is_bounded() {
+        let mut n = Neighbours::default();
+        const SENDERS: u32 = 100_000;
+        for i in 0..SENDERS {
+            n.learn(Ipv4Addr::from(0x0A00_0000 + i), GUEST_MAC);
+        }
+        assert!(
+            n.table.len() <= MAX_NEIGHBOURS,
+            "the gateway holds {} neighbours, over its limit of {MAX_NEIGHBOURS}",
+            n.table.len()
+        );
+        assert_eq!(
+            n.table.get(&Ipv4Addr::from(0x0A00_0000 + SENDERS - 1)),
+            Some(&GUEST_MAC)
+        );
     }
 }

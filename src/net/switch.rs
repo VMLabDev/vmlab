@@ -131,6 +131,10 @@ impl Default for PortConfig {
     }
 }
 
+/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
+#[allow(dead_code)]
+const MAX_MACS_PER_GUEST_PORT: usize = 256;
+
 #[derive(Default)]
 struct Inner {
     ports: HashMap<PortId, PortEntry>,
@@ -1197,5 +1201,62 @@ mod tests {
         )
         .await;
         assert_no_frame(&mut raw.rx).await;
+    }
+
+    /// Review F6: a guest that sends from 100 000 source MACs leaves no more
+    /// than its port's limit in the table, the newest of them is the one
+    /// kept, and what another port taught the switch stays.
+    #[tokio::test]
+    async fn the_mac_table_is_bounded() {
+        fn forged(i: u32) -> MacAddr {
+            let b = i.to_be_bytes();
+            MacAddr([0x02, 0x10, b[0], b[1], b[2], b[3]])
+        }
+
+        let sw = Switch::new("seg0".into());
+        let a = sw.add_channel_port(GUEST);
+        let b = sw.add_channel_port(GUEST);
+        sw.ingress(b.id, frame(MAC_BROADCAST, mac(1), b"b is here"));
+
+        const FRAMES: u32 = 100_000;
+        for i in 0..FRAMES {
+            sw.ingress(a.id, frame(MAC_BROADCAST, forged(i), b"x"));
+        }
+        {
+            let inner = sw.inner.lock_recover();
+            assert!(
+                inner.macs.len() <= MAX_MACS_PER_GUEST_PORT + 1,
+                "the table holds {} MACs, over the limit of one guest port ({MAX_MACS_PER_GUEST_PORT}) and the one of port b",
+                inner.macs.len()
+            );
+            assert_eq!(inner.macs.get(&mac(1)), Some(&b.id), "port b's MAC stays");
+            assert_eq!(
+                inner.macs.get(&forged(FRAMES - 1)),
+                Some(&a.id),
+                "the newest MAC is known"
+            );
+            assert_eq!(inner.macs.get(&forged(0)), None, "the oldest was dropped");
+        }
+
+        // Removing the port still purges everything learned on it.
+        sw.remove_port(a.id);
+        assert_eq!(sw.inner.lock_recover().macs.len(), 1);
+    }
+
+    /// A MAC that moved to another port is not dropped when the port it
+    /// left reaches its limit.
+    #[tokio::test]
+    async fn a_moved_mac_outlives_the_limit_of_the_port_it_left() {
+        let sw = Switch::new("seg0".into());
+        let a = sw.add_channel_port(GUEST);
+        let b = sw.add_channel_port(GUEST);
+        sw.ingress(a.id, frame(MAC_BROADCAST, mac(7), b"on a"));
+        sw.ingress(b.id, frame(MAC_BROADCAST, mac(7), b"moved to b"));
+        for i in 0..=MAX_MACS_PER_GUEST_PORT as u32 {
+            let n = i.to_be_bytes();
+            let src = MacAddr([0x02, 0x10, n[0], n[1], n[2], n[3]]);
+            sw.ingress(a.id, frame(MAC_BROADCAST, src, b"x"));
+        }
+        assert_eq!(sw.inner.lock_recover().macs.get(&mac(7)), Some(&b.id));
     }
 }
