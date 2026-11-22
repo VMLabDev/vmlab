@@ -208,18 +208,17 @@ fn same_build(what: &str, answer: Option<serde_json::Value>) -> Result<()> {
 /// would adopt it.
 pub async fn check_registration(name: &str, root: &Path) -> Result<()> {
     use crate::supervisor::registry::{LabEntry, Registry};
-    let labs: Vec<LabEntry> =
-        match SupClient::connect(&crate::paths::supervisor_socket()).await {
-            Ok(supervisor) => {
-                let labs = supervisor
-                    .send(SupRequest::Status {})
-                    .await
-                    .map_err(remote)?;
-                serde_json::from_value(labs)
-                    .context("the supervisor reported a registry vmlab cannot read")?
-            }
-            Err(_) => Registry::load().labs().to_vec(),
-        };
+    let labs: Vec<LabEntry> = match SupClient::connect(&crate::paths::supervisor_socket()).await {
+        Ok(supervisor) => {
+            let labs = supervisor
+                .send(SupRequest::Status {})
+                .await
+                .map_err(remote)?;
+            serde_json::from_value(labs)
+                .context("the supervisor reported a registry vmlab cannot read")?
+        }
+        Err(_) => Registry::load().labs().to_vec(),
+    };
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     match labs.iter().find(|entry| entry.name == name) {
         Some(entry) => entry.claims(name, &root).map_err(anyhow::Error::new),
