@@ -85,9 +85,12 @@ class Rfb:
             buf += chunk
         return bytes(buf)
 
-    def frame(self, x, y, w, h, fb):
-        """Ask for the rectangle and copy the answer's pixels into fb (w*h*4 bytes)."""
-        self.s.sendall(struct.pack('>BBHHHH', 3, 0, x, y, w, h))
+    def frame(self, x, y, w, h, fb, incremental=False):
+        """Ask for the rectangle and copy the answer's pixels into fb (w*h*4 bytes).
+
+        An incremental request is answered when the console has a new frame.
+        """
+        self.s.sendall(struct.pack('>BBHHHH', 3, 1 if incremental else 0, x, y, w, h))
         while True:
             t = self.rx(1)[0]
             if t == 0:
