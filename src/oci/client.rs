@@ -3687,7 +3687,7 @@ mod tests {
         )
         .await
         .expect("the transport must give up by itself");
-        let err = answer.err().expect("a silent registry is an error");
+        let err = answer.expect_err("a silent registry is an error");
         assert!(
             err.downcast_ref::<NoAnswer>().is_some(),
             "the error names the silence: {err:#}"
@@ -3748,7 +3748,7 @@ mod tests {
         )
         .await
         .expect("a stalled manifest body must not hold the call");
-        let err = manifest.err().expect("half a manifest is an error");
+        let err = manifest.expect_err("half a manifest is an error");
         assert!(err.downcast_ref::<NoAnswer>().is_some(), "{err:#}");
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3763,7 +3763,7 @@ mod tests {
         )
         .await
         .expect("a stalled blob stream must not hold the call");
-        let err = blob.err().expect("half a blob is an error");
+        let err = blob.expect_err("half a blob is an error");
         assert!(err.downcast_ref::<NoAnswer>().is_some(), "{err:#}");
     }
 
