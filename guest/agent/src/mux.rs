@@ -9,7 +9,7 @@
 //! per-session input channels whose pump threads grant credit back after the
 //! bytes are actually consumed (written into the PTY / child stdin / file).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -49,6 +49,125 @@ pub enum Input {
     Bytes(Vec<u8>),
     /// `HostMsg::Eof` — no more bytes (exec stdin closed; file push done).
     Eof,
+}
+
+/// One session's input queue. It is bounded by the bytes it holds, the unit
+/// the host's send window counts in, so a host that respects its window can
+/// never fill it, whatever size its frames are; and a push never waits, so
+/// the agent's one reader thread is never held by a session that has stopped
+/// reading (review F6). Small frames are joined, so what the queue holds
+/// costs what its bytes cost.
+struct InputQueue {
+    state: Mutex<InputState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct InputState {
+    items: VecDeque<Input>,
+    /// Payload bytes in `items`.
+    bytes: usize,
+    /// The session was removed: what is queued is still delivered, then the
+    /// pump sees the end.
+    tx_gone: bool,
+    /// The pump is gone: input is discarded.
+    rx_gone: bool,
+}
+
+/// The host sent more than its window allows.
+struct InputOverrun;
+
+impl InputQueue {
+    fn push(&self, input: Input) -> Result<(), InputOverrun> {
+        let mut g = self.state.lock().unwrap();
+        if g.rx_gone {
+            return Ok(());
+        }
+        match input {
+            // Nothing for a pump to act on, and no window to bound it by.
+            Input::Bytes(b) if b.is_empty() => return Ok(()),
+            Input::Bytes(b) => {
+                if g.bytes + b.len() > INPUT_QUEUE_BYTES {
+                    return Err(InputOverrun);
+                }
+                g.bytes += b.len();
+                match g.items.back_mut() {
+                    Some(Input::Bytes(last)) if last.len() + b.len() <= MAX_PAYLOAD => {
+                        last.extend_from_slice(&b)
+                    }
+                    _ => g.items.push_back(Input::Bytes(b)),
+                }
+            }
+            // A second EOF behind an unread one says nothing new.
+            Input::Eof if matches!(g.items.back(), Some(Input::Eof)) => return Ok(()),
+            Input::Eof => g.items.push_back(Input::Eof),
+        }
+        self.cv.notify_one();
+        Ok(())
+    }
+}
+
+/// The session table's end of an [`InputQueue`]; dropping it ends the pump's
+/// stream once the queue is drained.
+struct InputTx(Arc<InputQueue>);
+
+impl Drop for InputTx {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().tx_gone = true;
+        self.0.cv.notify_all();
+    }
+}
+
+/// A session's input, for its pump: iterate it, or [`InputRx::recv`]. Both
+/// end when the session is removed and the queue is empty.
+pub struct InputRx(Arc<InputQueue>);
+
+/// The session is gone and its input queue is empty.
+#[derive(Debug)]
+pub struct InputClosed;
+
+impl InputRx {
+    /// Block until the host sends something, or the session is removed.
+    pub fn recv(&self) -> Result<Input, InputClosed> {
+        let mut g = self.0.state.lock().unwrap();
+        loop {
+            if let Some(input) = g.items.pop_front() {
+                if let Input::Bytes(b) = &input {
+                    g.bytes -= b.len();
+                }
+                return Ok(input);
+            }
+            if g.tx_gone {
+                return Err(InputClosed);
+            }
+            g = self.0.cv.wait(g).unwrap();
+        }
+    }
+}
+
+impl Iterator for InputRx {
+    type Item = Input;
+
+    fn next(&mut self) -> Option<Input> {
+        self.recv().ok()
+    }
+}
+
+impl Drop for InputRx {
+    fn drop(&mut self) {
+        let mut g = self.0.state.lock().unwrap();
+        g.rx_gone = true;
+        g.items.clear();
+        g.bytes = 0;
+    }
+}
+
+fn input_queue() -> (InputTx, InputRx) {
+    let queue = Arc::new(InputQueue {
+        state: Mutex::new(InputState::default()),
+        cv: Condvar::new(),
+    });
+    (InputTx(queue.clone()), InputRx(queue))
 }
 
 /// Guest→host send credit for one channel. Output pumps block in
@@ -98,7 +217,7 @@ impl Credit {
 /// One live channel.
 struct Session {
     channel: Channel,
-    input: Option<SyncSender<Input>>,
+    input: Option<InputTx>,
     credit: Arc<Credit>,
     /// Applies a terminal resize (PTY sessions only).
     resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
@@ -191,10 +310,12 @@ fn unix_ms_now() -> i64 {
 /// block. Sized to absorb bursts, not to buffer a detached host forever.
 const OUT_QUEUE: usize = 256;
 
-/// Per-session input queue depth. The host may have at most
-/// `INITIAL_WINDOW` un-granted bytes in flight, so the queue never fills
-/// while both sides respect the window; the bound is a safety net.
-const INPUT_QUEUE: usize = 2 * (INITIAL_WINDOW as usize / 1024);
+/// How many payload bytes a session's input queue holds. The host may have
+/// at most `INITIAL_WINDOW` un-granted bytes in flight, and a pump grants
+/// only what it has taken off the queue, so the queue never passes this
+/// while the host respects the window. A host that does not loses the
+/// channel ([`Mux::route_input`]).
+const INPUT_QUEUE_BYTES: usize = INITIAL_WINDOW as usize;
 
 /// How long the port writer waits before offering a refused frame again.
 const WRITE_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -348,14 +469,14 @@ impl Mux {
         id: u32,
         resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
         kill: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Option<(Receiver<Input>, Arc<Credit>)> {
+    ) -> Option<(InputRx, Arc<Credit>)> {
         let mut sessions = self.inner.sessions.lock().unwrap();
         if sessions.contains_key(&id) || id == 0 {
             drop(sessions);
             self.send_error(Some(id), "channel id already in use");
             return None;
         }
-        let (tx, rx) = sync_channel(INPUT_QUEUE);
+        let (tx, rx) = input_queue();
         let credit = Arc::new(Credit::new());
         let channel = self.channel.clone().expect("channel-bound session mux");
         assert_eq!(channel.id, id);
@@ -491,15 +612,30 @@ impl Mux {
     /// Route host→guest payload bytes / EOF into a session's input queue.
     /// Unknown ids are dropped silently: a `close` crossing in-flight data
     /// is normal, not an error.
+    ///
+    /// This runs on the agent's one reader thread and never waits for the
+    /// session: a pump that has stopped reading leaves its bytes queued, and
+    /// every other channel, the pings and this channel's own `close` are
+    /// still served. A host that sends past its window is not waited for
+    /// either. Its channel is closed and it is told why, the same answer the
+    /// host gives a guest that overruns the other direction.
     pub fn route_input(&self, id: u32, input: Input) {
-        let tx = {
+        let overrun = {
             let sessions = self.inner.sessions.lock().unwrap();
-            sessions.get(&id).and_then(|s| s.input.clone())
+            sessions
+                .get(&id)
+                .and_then(|s| s.input.as_ref())
+                .is_some_and(|tx| tx.0.push(input).is_err())
         };
-        if let Some(tx) = tx {
-            // Blocking send: the input queue bounds a host that ignores its
-            // send window.
-            let _ = tx.send(input);
+        if overrun {
+            self.remove(id);
+            self.send_error(
+                Some(id),
+                format!(
+                    "the host sent more than the receive window of {INITIAL_WINDOW} bytes \
+                     without credit; channel closed"
+                ),
+            );
         }
     }
 
@@ -1220,6 +1356,97 @@ mod tests {
             Input::Eof => panic!("bytes first"),
         }
         assert!(matches!(input.recv().unwrap(), Input::Eof));
+    }
+
+    /// Review F6 (card #507). The host's window counts bytes, so a session
+    /// whose pump has stopped reading can still be sent a window's worth of
+    /// one-byte frames. Routing them must not hold up the reader thread: the
+    /// ping behind them is answered.
+    #[test]
+    fn a_session_that_stops_reading_does_not_block_other_channels() {
+        let (mux, mut cap) = capture_mux();
+        // Held and never read: a terminal whose program ignores its input.
+        let (_input, _credit) = mux.for_channel(9).register(9, None, None).unwrap();
+        let (done, routed) = std::sync::mpsc::channel();
+        let reader = mux.clone();
+        thread::spawn(move || {
+            for _ in 0..600 {
+                reader.route_input(9, Input::Bytes(vec![b'x']));
+            }
+            reader.handle_msg(HostMsg::Ping, &TestPlatform::new());
+            let _ = done.send(());
+        });
+        routed
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the reader got past a session that does not read its input");
+        assert!(matches!(cap.ctrl(), AgentMsg::Pong { .. }));
+    }
+
+    /// A host that ignores its window is not waited for either: the channel
+    /// is closed and the host is told, and the reader goes on.
+    #[test]
+    fn a_host_that_overruns_its_window_loses_the_channel() {
+        let (mux, mut cap) = capture_mux();
+        let killed = Arc::new(AtomicBool::new(false));
+        let k = killed.clone();
+        let (input, _credit) = mux
+            .for_channel(9)
+            .register(
+                9,
+                None,
+                Some(Box::new(move || k.store(true, Ordering::SeqCst))),
+            )
+            .unwrap();
+        // Exactly the window, in small frames: all of it is held.
+        let frame = vec![b'x'; 1024];
+        for _ in 0..INITIAL_WINDOW as usize / frame.len() {
+            mux.route_input(9, Input::Bytes(frame.clone()));
+        }
+        assert!(!killed.load(Ordering::SeqCst), "a full window is in bounds");
+        mux.route_input(9, Input::Bytes(vec![b'x']));
+        assert!(killed.load(Ordering::SeqCst));
+        match cap.ctrl() {
+            AgentMsg::Error { id: Some(9), msg } => assert!(msg.contains("window"), "{msg}"),
+            other => panic!("expected an error for channel 9, got {other:?}"),
+        }
+        // What was in bounds is still delivered, then the stream ends.
+        let mut got = 0;
+        for chunk in input {
+            match chunk {
+                Input::Bytes(b) => {
+                    assert!(b.len() <= MAX_PAYLOAD);
+                    got += b.len();
+                }
+                Input::Eof => panic!("no EOF was sent"),
+            }
+        }
+        assert_eq!(got, INITIAL_WINDOW as usize);
+    }
+
+    /// Joining small frames changes neither the bytes nor where an EOF
+    /// falls among them, and taking bytes off the queue makes room again.
+    #[test]
+    fn the_input_queue_keeps_order_and_frees_what_is_read() {
+        let (mux, _cap) = capture_mux();
+        let (input, _credit) = mux.for_channel(9).register(9, None, None).unwrap();
+        for b in b"abc" {
+            mux.route_input(9, Input::Bytes(vec![*b]));
+        }
+        mux.route_input(9, Input::Bytes(Vec::new()));
+        mux.route_input(9, Input::Eof);
+        mux.route_input(9, Input::Eof);
+        mux.route_input(9, Input::Bytes(b"d".to_vec()));
+        assert!(matches!(input.recv().unwrap(), Input::Bytes(b) if b == b"abc"));
+        assert!(matches!(input.recv().unwrap(), Input::Eof));
+        assert!(matches!(input.recv().unwrap(), Input::Bytes(b) if b == b"d"));
+        // Two windows through a pump that reads: never an overrun.
+        let frame = vec![0u8; MAX_PAYLOAD];
+        for _ in 0..2 * INITIAL_WINDOW as usize / MAX_PAYLOAD {
+            mux.route_input(9, Input::Bytes(frame.clone()));
+            assert!(matches!(input.recv().unwrap(), Input::Bytes(b) if b.len() == MAX_PAYLOAD));
+        }
+        mux.remove(9);
+        assert!(input.recv().is_err());
     }
 
     #[test]

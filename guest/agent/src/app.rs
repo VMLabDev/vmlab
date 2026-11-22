@@ -344,7 +344,7 @@ impl Records {
 
 /// The host writes nothing an app channel acts on; consume it anyway, so a
 /// host that does cannot stall on its window.
-fn drain(mux: &Mux, id: u32, input: std::sync::mpsc::Receiver<Input>) {
+fn drain(mux: &Mux, id: u32, input: crate::mux::InputRx) {
     let mux = mux.clone();
     thread::spawn(move || {
         let mut window = RecvWindow::default();
@@ -412,7 +412,7 @@ fn register_conn(
     mux: &Mux,
     id: u32,
     shared: &Arc<Mutex<Shared>>,
-) -> Option<(std::sync::mpsc::Receiver<Input>, Arc<Credit>)> {
+) -> Option<(crate::mux::InputRx, Arc<Credit>)> {
     let kill_shared = shared.clone();
     mux.register(
         id,
@@ -492,7 +492,7 @@ fn pump_conn(
     mux: &Mux,
     id: u32,
     conn: Conn,
-    input: std::sync::mpsc::Receiver<Input>,
+    input: crate::mux::InputRx,
     credit: Arc<Credit>,
     shared: Arc<Mutex<Shared>>,
 ) {
