@@ -242,17 +242,97 @@ trait PullSink {
     async fn finish(&mut self) -> Result<()> {
         Ok(())
     }
+    /// How many bytes the host lets this pull write, where the host has a
+    /// bound of its own. A size the guest reports past it is refused before
+    /// the first read.
+    fn room(&self) -> Option<u64> {
+        None
+    }
 }
 
-/// Straight to a host file: bounded by the disk, never held in memory.
-struct FileSink(tokio::fs::File);
+/// The share of a filesystem a pull leaves free: a twentieth of it, and no
+/// more than [`PULL_RESERVE_MAX`].
+const PULL_RESERVE_MAX: u64 = 1 << 30;
+
+/// How many bytes a pull writes before it measures the free space again.
+/// Other writers share the disk, so one measurement does not hold for long.
+const PULL_REMEASURE: u64 = 64 * 1024 * 1024;
+
+/// The bytes a pull may write into `file`: the free space of its filesystem
+/// less the reserve. `None` where the filesystem reports no size.
+fn pull_room(file: &tokio::fs::File) -> Option<u64> {
+    let stat = nix::sys::statvfs::fstatvfs(file).ok()?;
+    let unit = stat.fragment_size() as u64;
+    let total = (stat.blocks() as u64).saturating_mul(unit);
+    if total == 0 {
+        return None;
+    }
+    let free = (stat.blocks_available() as u64).saturating_mul(unit);
+    Some(free.saturating_sub((total / 20).min(PULL_RESERVE_MAX)))
+}
+
+fn no_room(wanted: u64, room: u64) -> anyhow::Error {
+    anyhow!(
+        "the guest sends {wanted} bytes and the host has room for {room} \
+         (free space less the reserve a pull leaves)"
+    )
+}
+
+/// Straight to a host file, never held in memory. The guest decides what it
+/// sends, so the bound is the host's: the free space of the destination's
+/// filesystem, measured here and never taken from the guest.
+struct FileSink {
+    file: tokio::fs::File,
+    /// Bytes this pull may still write. `None` for a destination that fills
+    /// no disk: a device, a FIFO, a filesystem without a size.
+    left: Option<u64>,
+    /// Bytes until `left` is measured again.
+    remeasure_in: u64,
+}
+
+impl FileSink {
+    /// A sink for a regular file, bounded by the room on its filesystem.
+    fn new(file: tokio::fs::File) -> FileSink {
+        FileSink {
+            left: pull_room(&file),
+            file,
+            remeasure_in: PULL_REMEASURE,
+        }
+    }
+
+    /// A sink for a destination that is not a regular file.
+    fn unbounded(file: tokio::fs::File) -> FileSink {
+        FileSink {
+            file,
+            left: None,
+            remeasure_in: PULL_REMEASURE,
+        }
+    }
+}
 
 impl PullSink for FileSink {
     async fn write(&mut self, chunk: &[u8]) -> Result<()> {
-        Ok(self.0.write_all(chunk).await?)
+        let len = chunk.len() as u64;
+        if self.left.is_some() {
+            if self.remeasure_in < len {
+                self.left = pull_room(&self.file);
+                self.remeasure_in = PULL_REMEASURE;
+            }
+            self.remeasure_in = self.remeasure_in.saturating_sub(len);
+        }
+        if let Some(left) = self.left {
+            if len > left {
+                return Err(no_room(len, left));
+            }
+            self.left = Some(left - len);
+        }
+        Ok(self.file.write_all(chunk).await?)
     }
     async fn finish(&mut self) -> Result<()> {
-        Ok(self.0.flush().await?)
+        Ok(self.file.flush().await?)
+    }
+    fn room(&self) -> Option<u64> {
+        self.left
     }
 }
 
@@ -997,7 +1077,7 @@ impl AgentHandle {
             let file = tokio::fs::File::create(&target)
                 .await
                 .with_context(|| format!("creating {}", local.display()))?;
-            return ops.pull(remote, &mut FileSink(file)).await;
+            return ops.pull(remote, &mut FileSink::unbounded(file)).await;
         }
         // The bytes land beside the destination and replace it only once the
         // digest has matched, so every failure — a guest path that is not
@@ -1006,7 +1086,7 @@ impl AgentHandle {
         let (file, temp) = create_pull_temp(&target)
             .await
             .with_context(|| format!("creating {}", local.display()))?;
-        let pulled = ops.pull(remote, &mut FileSink(file)).await?;
+        let pulled = ops.pull(remote, &mut FileSink::new(file)).await?;
         if let Some(meta) = existing {
             tokio::fs::set_permissions(&temp.0, meta.permissions())
                 .await
@@ -1672,6 +1752,13 @@ impl FileOps {
         if attrs.kind == EntryKind::Dir {
             bail!("pull {remote}: is a directory");
         }
+        // The size is the guest's word. It bounds the pull only once the
+        // host has checked it against a bound of its own.
+        if let Some(room) = sink.room()
+            && attrs.size > room
+        {
+            return Err(no_room(attrs.size, room)).with_context(|| format!("pull {remote}"));
+        }
         let handle = self
             .inner
             .open_handle(Op::Open {
@@ -1685,7 +1772,8 @@ impl FileOps {
         let mut hasher = Sha256::new();
         let mut got = 0u64;
         // A changing or dishonest guest must not turn a finite pull into an
-        // endless disk write. Allow one chunk of growth after the stat.
+        // endless disk write. Allow one chunk of growth after the stat. The
+        // sink holds the host's own bound, which no stat can raise.
         let limit = attrs.size.saturating_add(TRANSFER_CHUNK as u64);
         let mut queued = 0u64;
         let mut window: std::collections::VecDeque<tokio::task::JoinHandle<Result<Vec<u8>>>> =
@@ -1762,7 +1850,7 @@ impl FileOps {
         let file = tokio::fs::File::create(local)
             .await
             .with_context(|| format!("creating {}", local.display()))?;
-        self.pull(remote, &mut FileSink(file)).await
+        self.pull(remote, &mut FileSink::new(file)).await
     }
 
     /// Every entry in `dir`, each described by its own attributes and never
@@ -3236,7 +3324,13 @@ mod tests {
         /// moving, which the watchdog must never mistake for one that
         /// stopped.
         slow: bool,
+        /// Bytes served so far from a file named `claims-everything`.
+        endless_served: u64,
     }
+
+    /// Where the mock ends a file named `claims-everything` by an error.
+    const ENDLESS_STOP: u64 = 16 * 1024 * 1024;
+    const ENDLESS_STOPPED: &str = "the mock stopped an endless file";
 
     /// The marker reply [`MockFiles::op`] hands back for a request the
     /// stalled peer never answers; `serve` drops it on the floor.
@@ -3267,6 +3361,7 @@ mod tests {
                     .map(|l| format!("as:{}:{}", l.user, l.elevated))
                     .unwrap_or_else(|| "as:agent".into()),
                 slow: false,
+                endless_served: 0,
             }
         }
 
@@ -3367,6 +3462,27 @@ mod tests {
                     offset,
                     len,
                 } => {
+                    // A file named `claims-everything` never ends: every
+                    // read is a full one, at any offset. The mock stops it
+                    // by an error of its own after `ENDLESS_STOP` bytes, so
+                    // a host that believes it cannot fill the test host.
+                    if self
+                        .handles
+                        .get(&handle)
+                        .is_some_and(|p| p.contains("claims-everything"))
+                    {
+                        self.endless_served += len as u64;
+                        if self.endless_served > ENDLESS_STOP {
+                            return (
+                                Reply::Error {
+                                    code: ErrorCode::Failure,
+                                    msg: ENDLESS_STOPPED.into(),
+                                },
+                                Vec::new(),
+                            );
+                        }
+                        return (Reply::Data, vec![9; len as usize]);
+                    }
                     let store = self.fs.store.lock().unwrap();
                     let Some(file) = self.handles.get(&handle).and_then(|p| store.get(p)) else {
                         return (
@@ -3491,7 +3607,9 @@ mod tests {
                                     // the file does not have — what a file
                                     // truncated between the stat and the
                                     // reads looks like to a puller.
-                                    size: if path.contains("growing-hostile") {
+                                    size: if path.contains("claims-everything") {
+                                        u64::MAX
+                                    } else if path.contains("growing-hostile") {
                                         0
                                     } else if path.contains("shrinking") {
                                         file.len() as u64 + (1 << 20)
@@ -4099,6 +4217,61 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("stat size"));
         assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
+    }
+
+    /// The guest answers `stat` with the largest size there is and every
+    /// read with a full chunk. The size is the guest's word, so it bounds
+    /// nothing: the bound is the room the host measured on its own disk, and
+    /// a size past it is refused before a byte is written (guest-agents F7).
+    #[tokio::test]
+    async fn a_guest_cannot_choose_how_much_a_pull_writes() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, b"seed").unwrap();
+        ops.push(&source, "/claims-everything", None).await.unwrap();
+
+        let dest = work.path().join("dest");
+        let err = ops.pull_to("/claims-everything", &dest).await.unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("the host has room for"), "{said}");
+        assert!(!said.contains(ENDLESS_STOPPED), "{said}");
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 0);
+
+        let dest = work.path().join("dest-file");
+        let err = agent
+            .pull_file("/claims-everything", &dest)
+            .await
+            .unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("the host has room for"), "{said}");
+        assert!(!dest.exists());
+    }
+
+    /// The room is spent as the bytes land, so a guest whose `stat` was
+    /// modest and whose reads are not is stopped by the sink as well.
+    #[tokio::test]
+    async fn a_file_sink_stops_at_the_room_it_was_given() {
+        let work = tempfile::tempdir().unwrap();
+        let file = tokio::fs::File::create(work.path().join("dest"))
+            .await
+            .unwrap();
+        let mut sink = FileSink {
+            file,
+            left: Some(TRANSFER_CHUNK as u64 + 1),
+            remeasure_in: u64::MAX,
+        };
+        let chunk = vec![1u8; TRANSFER_CHUNK];
+        sink.write(&chunk).await.unwrap();
+        let err = sink.write(&chunk).await.unwrap_err();
+        assert!(format!("{err:#}").contains("the host has room for"));
+        sink.finish().await.unwrap();
+        assert_eq!(
+            std::fs::metadata(work.path().join("dest")).unwrap().len(),
+            TRANSFER_CHUNK as u64
+        );
     }
 
     /// A directory arrives whole, however many slices the guest streams it

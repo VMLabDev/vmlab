@@ -267,6 +267,15 @@ Not read:
   answers `stat` with `size: u64::MAX` and each `read` with 64 KiB. Assert
   that `pull_to` fails after a bounded number of bytes. The fix card must
   decide where the bound comes from (a caller's ceiling, or free space).
+- Fixed in card #468. The bound is free space: a pull into a host file may
+  write the free space of the destination's filesystem less a reserve (a
+  twentieth of the filesystem, at most 1 GiB). The host measures it when the
+  file is opened and again after every 64 MiB written. A `stat` size past
+  that room is refused before the first read, and the sink refuses each
+  chunk past it, so `pull_to` and `pull_file_as` both stop there. A
+  destination that is not a regular file (a device, a FIFO) has no bound, as
+  it fills no disk. The test failed before the fix (the pull wrote 16 MiB
+  and ended only where the mock ends its file) and passes after it.
 
 ### F8. A file request on a FIFO or a device takes a guest worker thread for good
 

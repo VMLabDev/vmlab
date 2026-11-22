@@ -464,3 +464,225 @@ async fn fastpath_bench_ab() {
         stats.frames_offloaded,
     );
 }
+
+// ---------------------------------------------------------------------------
+// A tap's filter must last as long as the tap (networking review F2)
+// ---------------------------------------------------------------------------
+
+/// Set for the child below, so a plain `--ignored` run does not serve.
+const HELPER_CHILD_ENV: &str = "VMLAB_FASTPATH_TEST_HELPER";
+
+/// `vmlab-fastpath` as a real process for the two tests below: this test
+/// binary started again with the request socket as its standard input, the
+/// way a daemon starts the helper. Run directly it does nothing.
+#[test]
+#[ignore = "the helper process of the tap filter tests — they start it themselves"]
+fn fastpath_afxdp_helper_child() {
+    use std::os::fd::AsFd as _;
+    if std::env::var_os(HELPER_CHILD_ENV).is_none() {
+        return;
+    }
+    let sock = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+    super::helper::server::serve(sock, super::helper::server::Aya).unwrap();
+}
+
+/// How the tap's caller loses the helper's engine.
+enum FilterEnd {
+    /// The caller sends `unload` and keeps the queue descriptor.
+    Unload,
+    /// The helper dies (a daemon crash closes its socket; here SIGKILL).
+    Killed,
+}
+
+fn helper_ask(
+    sock: &std::os::fd::OwnedFd,
+    request: &super::helper::proto::Request,
+) -> (super::helper::proto::Reply, Vec<std::os::fd::OwnedFd>) {
+    use std::os::fd::AsFd as _;
+    super::helper::proto::send(sock.as_fd(), request, &[]).unwrap();
+    let (bytes, fds) = super::helper::proto::recv(sock.as_fd())
+        .expect("reading the helper's reply")
+        .expect("the helper exited");
+    (serde_json::from_slice(&bytes).unwrap(), fds)
+}
+
+/// The interface's IPv6 link-local address, once duplicate address
+/// detection has finished and the host answers for it.
+async fn link_local(ifname: &str) -> std::net::Ipv6Addr {
+    const TENTATIVE: u8 = 0x40;
+    const LINK_SCOPE: u8 = 0x20;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // `<address> <ifindex> <prefix> <scope> <flags> <name>`, all hex.
+        let table = std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default();
+        for line in table.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let [address, _, _, scope, flags, name] = fields[..] else {
+                continue;
+            };
+            let scope = u8::from_str_radix(scope, 16).unwrap_or(0);
+            let flags = u8::from_str_radix(flags, 16).unwrap_or(TENTATIVE);
+            if name != ifname || scope != LINK_SCOPE || flags & TENTATIVE != 0 {
+                continue;
+            }
+            if let Ok(bits) = u128::from_str_radix(address, 16) {
+                return std::net::Ipv6Addr::from(bits);
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{ifname} got no IPv6 link-local address: this test needs IPv6 enabled \
+             (net.ipv6.conf.default.disable_ipv6 = 0) to see the host stack answer"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// An ICMPv6 neighbour solicitation for `target`, as a guest would send it.
+fn neighbour_solicitation(target: std::net::Ipv6Addr) -> Vec<u8> {
+    use crate::net::frame::internet_checksum;
+    let t = target.octets();
+    let src = std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x0a).octets();
+    let mut dst = std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0).octets();
+    dst[13..].copy_from_slice(&t[13..]);
+    // Type 135, code 0, checksum, reserved, target, source link-layer option.
+    let mut icmp = vec![135, 0, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&t);
+    icmp.extend_from_slice(&[1, 1]);
+    icmp.extend_from_slice(&MAC_A.0);
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&src);
+    pseudo.extend_from_slice(&dst);
+    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(&icmp);
+    icmp[2..4].copy_from_slice(&internet_checksum(&pseudo).to_be_bytes());
+    let mut ip = vec![0x60, 0, 0, 0];
+    ip.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    ip.extend_from_slice(&[58, 255]);
+    ip.extend_from_slice(&src);
+    ip.extend_from_slice(&dst);
+    ip.extend_from_slice(&icmp);
+    let multicast = MacAddr([0x33, 0x33, 0xff, t[13], t[14], t[15]]);
+    eth_build(multicast, MAC_A, 0x86dd, &ip)
+}
+
+/// Write a solicitation for `target` into the tap, the way a guest's frame
+/// arrives, and say whether the host's network stack advertises back
+/// within a second.
+async fn host_stack_answers(io: &super::afxdp::TapIo, target: std::net::Ipv6Addr) -> bool {
+    io.send(&neighbour_solicitation(target)).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match tokio::time::timeout_at(deadline, io.recv(&mut buf)).await {
+            // Ethernet, IPv6 with ICMPv6 next, type 136, then the target.
+            Ok(Ok(n))
+                if n >= 78
+                    && buf[12..14] == [0x86, 0xdd]
+                    && buf[20] == 58
+                    && buf[54] == 136
+                    && buf[62..78] == target.octets() =>
+            {
+                return true;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("tap read failed: {e}"),
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Take a tap from a helper process, end the helper's engine, and say
+/// whether a frame the tap's holder writes then reaches the host stack.
+async fn tap_reaches_host_stack_after(end: FilterEnd) -> bool {
+    use super::helper::proto::{self, Reply, Request};
+    use std::process::{Command, Stdio};
+
+    let (sock, theirs) = proto::pair().unwrap();
+    rustix::net::sockopt::set_socket_timeout(
+        &sock,
+        rustix::net::sockopt::Timeout::Recv,
+        Some(Duration::from_secs(10)),
+    )
+    .unwrap();
+    // libtest names a test without the crate.
+    let (_, module) = module_path!().split_once("::").unwrap();
+    let mut helper = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("{module}::fastpath_afxdp_helper_child")])
+        .args(["--ignored", "--nocapture"])
+        .env(HELPER_CHILD_ENV, "1")
+        .stdin(Stdio::from(theirs))
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let engine = match helper_ask(&sock, &Request::XdpLoad {}).0 {
+        Reply::Engine { engine } => engine,
+        other => panic!("xdp_load: {other:?}"),
+    };
+    let request = Request::XdpTap {
+        engine,
+        queue_pairs: None,
+    };
+    let (name, ifindex, queue) = match helper_ask(&sock, &request) {
+        (Reply::Tap { name, ifindex }, mut queues) if queues.len() == 1 => {
+            (name, ifindex, queues.remove(0))
+        }
+        (other, _) => panic!("xdp_tap: {other:?}"),
+    };
+    let request = Request::XdpPort {
+        engine,
+        ifindex,
+        tag: 1,
+        flags: 0,
+    };
+    assert_eq!(helper_ask(&sock, &request).0, Reply::Done);
+    let io = super::afxdp::TapIo::new(queue).unwrap();
+    let address = link_local(&name).await;
+    assert!(
+        !host_stack_answers(&io, address).await,
+        "{name} reaches the host stack with its filter attached"
+    );
+
+    match end {
+        FilterEnd::Unload => {
+            assert_eq!(
+                helper_ask(&sock, &Request::Unload { engine }).0,
+                Reply::Done
+            );
+        }
+        FilterEnd::Killed => {
+            helper.kill().unwrap();
+            helper.wait().unwrap();
+        }
+    }
+    let answered = host_stack_answers(&io, address).await;
+    drop(sock);
+    let _ = helper.wait();
+    answered
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN — run via `just fastpath-test`"]
+async fn fastpath_afxdp_tap_is_closed_to_the_host_stack_after_unload() {
+    if !tier_is(FastpathTier::AfXdp) {
+        return;
+    }
+    assert!(
+        !tap_reaches_host_stack_after(FilterEnd::Unload).await,
+        "after `unload` the host answered a frame written into the tap"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs CAP_BPF + CAP_NET_ADMIN — run via `just fastpath-test`"]
+async fn fastpath_afxdp_tap_is_closed_to_the_host_stack_after_the_helper_is_killed() {
+    if !tier_is(FastpathTier::AfXdp) {
+        return;
+    }
+    assert!(
+        !tap_reaches_host_stack_after(FilterEnd::Killed).await,
+        "with its helper killed the host answered a frame written into the tap"
+    );
+}
