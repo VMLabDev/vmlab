@@ -328,6 +328,54 @@ mod tests {
         drop(server);
     }
 
+    /// A daemon that binds beside a live one must not take its socket: the
+    /// first would run on unreachable, and both would own the same lab.
+    #[tokio::test]
+    async fn a_second_bind_does_not_take_a_live_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("run/control.sock");
+        let first = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
+
+        let second = Server::<LabRequest>::bind(&sock, Arc::new(Echo)).await;
+        let err = second.err().expect("the second bind must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "the refusal names the holder: {err}"
+        );
+
+        let client = crate::proto::client::LabClient::connect(&sock)
+            .await
+            .expect("the first server still holds the path");
+        client.send(LabRequest::Ping {}).await.unwrap();
+
+        // Once the holder is gone the path is free again.
+        drop(client);
+        drop(first);
+        let third = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
+        let client = crate::proto::client::LabClient::connect(&sock)
+            .await
+            .unwrap();
+        client.send(LabRequest::Ping {}).await.unwrap();
+        drop(third);
+    }
+
+    /// A socket file nobody listens on, left by a daemon that was killed, is
+    /// replaced as before.
+    #[tokio::test]
+    async fn a_dead_socket_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("control.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists(), "the dead listener left its file");
+
+        let _server = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
+        let client = crate::proto::client::LabClient::connect(&sock)
+            .await
+            .unwrap();
+        client.send(LabRequest::Ping {}).await.unwrap();
+    }
+
     /// A directory owned by somebody else must never be used for sockets.
     #[test]
     #[cfg(unix)]

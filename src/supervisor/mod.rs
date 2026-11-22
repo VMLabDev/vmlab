@@ -1070,6 +1070,126 @@ mod tests {
         );
     }
 
+    const LIVE_DAEMON_HELPER: &str = "VMLAB_TEST_LIVE_DAEMON_ROOT";
+
+    /// A `failed` entry does not prove its daemon dead. A successor spawned
+    /// beside a live one is a second owner of the lab's disks.
+    #[test]
+    fn a_failed_entry_with_a_live_daemon_is_not_shadowed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let test_exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(test_exe)
+            .args([
+                "--exact",
+                "supervisor::tests::live_daemon_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LIVE_DAEMON_HELPER, scratch.path())
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// This process stands in for the live lab daemon: it serves the lab's
+    /// control socket, and the registry names it in a `failed` entry.
+    #[test]
+    #[ignore = "subprocess helper for a_failed_entry_with_a_live_daemon_is_not_shadowed"]
+    fn live_daemon_helper() {
+        use std::sync::Arc;
+
+        use crate::proto::client::LabClient;
+        use crate::proto::server::{Handler, Server, Streamer};
+        use crate::proto::{CommandError, LabRequest};
+
+        struct Alive;
+
+        #[async_trait::async_trait]
+        impl Handler<LabRequest> for Alive {
+            async fn handle(
+                &self,
+                _req: LabRequest,
+                _s: &Streamer,
+            ) -> Result<serde_json::Value, CommandError> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        let Some(root) = std::env::var_os(LIVE_DAEMON_HELPER) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let name = "shadowed";
+            std::fs::write(
+                root.join("vmlab.wcl"),
+                format!("import <vmlab.wcl>\nlab \"{name}\" {{ }}\n"),
+            )
+            .unwrap();
+            let socket = crate::paths::lab_socket(name);
+            let _daemon = Server::<LabRequest>::bind(&socket, Arc::new(Alive))
+                .await
+                .unwrap();
+
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let host = crate::config::host::HostConfig::default();
+            let supervisor = Arc::new(super::Supervisor {
+                registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+                events: events.clone(),
+                globals: super::GlobalSegments::new(&host, events.clone()),
+                ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                template_ops: super::templates::TemplateOps::default(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                keepers: super::keepawake::Keepers::default(),
+            });
+            let me = std::process::id();
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: name.into(),
+                    root: super::registry::canonical_root(&root).unwrap(),
+                    pid: me,
+                    started: process_start_time(me),
+                    state: super::registry::LabState::Failed,
+                })
+                .unwrap();
+
+            let ensured = supervisor.ensure_lab(name, root.clone()).await;
+
+            // Before the guard the unwanted `__labd` child is this test
+            // executable, which rejects that argument. Let it finish.
+            let entry = supervisor.registry.lock().await.get(name).cloned();
+            if let Some(entry) = entry.as_ref().filter(|e| e.pid != me) {
+                while process_running(entry.pid) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+            let shadow_log = crate::paths::state_dir().join(format!("labd-{name}.log"));
+            assert!(!shadow_log.exists(), "lab.ensure spawned a second daemon");
+            let refusal = ensured.expect_err("a live daemon must not be shadowed");
+            assert_eq!(refusal.code, crate::proto::ErrorCode::Conflict, "{refusal}");
+            assert!(refusal.message.contains(&me.to_string()), "{refusal}");
+            let entry = entry.expect("the entry stays");
+            assert_eq!(entry.pid, me, "the entry still names the live daemon");
+
+            let client = LabClient::connect(&socket).await.unwrap();
+            assert!(client.send(LabRequest::Ping {}).await.is_ok());
+        });
+    }
+
     #[test]
     fn an_exited_child_is_not_running_before_it_is_reaped() {
         assert!(process_running(std::process::id()));
