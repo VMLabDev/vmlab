@@ -2959,6 +2959,110 @@ mod tests {
         assert!(err.contains("different disk"), "{err}");
     }
 
+    /// F11 of docs/reviews/templates-registry.md. The manifest's whole-image
+    /// digest is what a pull verifies, the config blob's `sha256` what the
+    /// store records. A config blob that states another digest is refused
+    /// before a chunk is fetched, so the store never holds a version whose
+    /// metadata names a digest its disk does not have.
+    #[tokio::test]
+    async fn a_config_digest_that_disagrees_with_the_manifest_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same correct manifest under the tag `forged`, its config blob
+        // stating a `sha256` of 64 zeros.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&config).unwrap();
+        config["sha256"] = serde_json::Value::String("00".repeat(32));
+        let config = serde_json::to_vec(&config).unwrap();
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "forged",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let mut downloads = 0;
+        let err = registry_with_fake("ghcr.io/owner/alpine:forged", fake.clone())
+            .pull_with_progress(
+                Some("x86_64"),
+                &store,
+                &store_root.join(".oci-pull"),
+                false,
+                &VariantWant::default(),
+                &mut |_| downloads += 1,
+            )
+            .await
+            .expect_err("a config blob naming another digest is refused");
+        assert!(format!("{err:#}").contains("config blob records"), "{err:#}");
+        assert_eq!(downloads, 0, "refused before a chunk is fetched");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// F11 of docs/reviews/templates-registry.md, the push half. A stored
+    /// disk that is no longer the one its metadata records (bit rot, a file
+    /// truncated by a crash) is not published: the damaged bytes would get a
+    /// correct manifest digest, and every consumer would verify them as good.
+    #[tokio::test]
+    async fn a_push_refuses_a_disk_that_is_not_the_recorded_one() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let mut disk = vec![7u8; 64 * 1024];
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.sha256 = Some(hex::encode(Sha256::digest(&disk)));
+        disk[1000] ^= 1;
+        make_template(&tdir, &m, &disk);
+        let err = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a disk that is not the recorded one is not pushed");
+        assert!(format!("{err:#}").contains("records the digest"), "{err:#}");
+        assert!(fake.puts.lock().unwrap().is_empty(), "nothing was uploaded");
+        assert!(fake.manifests.lock().unwrap().is_empty());
+    }
+
     /// Push a template under `reference`, with the name and version its
     /// config blob states chosen freely, as a repository can.
     async fn push_stating(
