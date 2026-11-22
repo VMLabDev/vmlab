@@ -1078,15 +1078,17 @@ fn place_vnet_rx_frames(
     hdr_len: usize,
     mergeable: bool,
     guest_csum: bool,
+    #[cfg(test)] mut after_wait: impl FnMut(u16),
 ) {
     let mut guard = lock(shared);
     let sh = &mut *guard;
-    if sh.snapshot_paused {
+    if sh.snapshot_paused || sh.rx_pending.is_empty() {
         return;
     }
     let Some(vnet) = sh.vnet.as_ref() else { return };
     let Some(mem) = sh.mem.as_ref() else { return };
     let mut pending = std::mem::take(&mut sh.rx_pending);
+    let mut blocked = vec![false; usize::from(vnet.active_pairs)];
     let mut interrupts = Vec::new();
     while let Some(packet) = pending.pop_front() {
         let Ok((mut metadata, _, frame)) = Header::from_metadata(&packet) else {
@@ -1112,6 +1114,10 @@ fn place_vnet_rx_frames(
             .copied()
             .unwrap_or((hash % u32::from(vnet.active_pairs)) as u16)
             % vnet.active_pairs;
+        if blocked[usize::from(pair)] {
+            sh.rx_pending.push_back(packet);
+            continue;
+        }
         let index = 2 * pair;
         let Some(q) = sh
             .queues
@@ -1159,7 +1165,11 @@ fn place_vnet_rx_frames(
                 if raced {
                     pending.push_front(packet);
                 } else {
+                    // A refill later in this pass must serve this packet first.
+                    blocked[usize::from(pair)] = true;
                     sh.rx_pending.push_back(packet);
+                    #[cfg(test)]
+                    after_wait(index);
                 }
             }
             Err(()) => {}
@@ -1340,7 +1350,14 @@ fn needs_receive_interrupt(q: &mut Queue, mem: &GuestMemory, old_used: u16) -> b
 /// Move pending frames into free receiveq buffers, header first.
 fn place_rx_frames(shared: &Arc<Mutex<Shared>>, hdr_len: usize, mergeable: bool, guest_csum: bool) {
     if lock(shared).vnet.is_some() {
-        place_vnet_rx_frames(shared, hdr_len, mergeable, guest_csum);
+        place_vnet_rx_frames(
+            shared,
+            hdr_len,
+            mergeable,
+            guest_csum,
+            #[cfg(test)]
+            |_| {},
+        );
         return;
     }
     let mut irq: Option<(Arc<dyn VirtioInterrupt>, u16)> = None;
@@ -3091,6 +3108,64 @@ mod tests {
             f.vqs[2].used_idx(&f.mem) == 1
         });
         assert_eq!(f.vqs[0].used_idx(&f.mem), 0);
+    }
+
+    #[test]
+    fn multiqueue_receive_preserves_order_when_guest_refills_mid_pass() {
+        let mut f = Fixture::new_mode(Some(2));
+        let _socket = f.take_switch_side();
+        f.dev.quiesce();
+        lock(&f.dev.shared).snapshot_paused = false;
+        assert_eq!(f.control_pairs(2, 4), 0);
+        let (_, first) = gso_packet(true, 64);
+        let mut second = first.clone();
+        second[54] = 2;
+        let mut third = first.clone();
+        third[54] = 3;
+        let mut other = first.clone();
+        other[35] ^= 1;
+        let shared = f.dev.shared.clone();
+        {
+            let mut state = lock(&shared);
+            let steering = &mut state.vnet.as_mut().unwrap().steering;
+            steering.insert(flow_hash(&first), 0);
+            steering.insert(flow_hash(&other), 1);
+            for frame in [&first, &second, &other] {
+                state
+                    .rx_pending
+                    .push_back(vnet_body(Header::default(), frame));
+            }
+        }
+        let first_addr = f.data(0);
+        let other_addr = f.data(3);
+        f.vqs[2].add_chain(&f.mem, &[(other_addr, 256, true)]);
+        place_vnet_rx_frames(&shared, 12, false, false, |index| {
+            assert_eq!(index, 0);
+            f.vqs[0].add_chain(&f.mem, &[(first_addr, 256, true)]);
+        });
+        assert_eq!(f.vqs[0].used_idx(&f.mem), 0);
+        assert_eq!(f.vqs[2].used_idx(&f.mem), 1);
+
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let body = vnet_body(Header::default(), &third);
+        let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&body);
+        sender.write_all(&wire).unwrap();
+        read_frames(&shared, &mut receiver).unwrap();
+        for index in 1..3 {
+            let address = f.data(index);
+            f.vqs[0].add_chain(&f.mem, &[(address, 256, true)]);
+        }
+        place_rx_frames(&shared, 12, false, false);
+        assert_eq!(f.vqs[0].used_idx(&f.mem), 3);
+        for (index, frame) in [first, second, third].into_iter().enumerate() {
+            let mut received = vec![0; frame.len()];
+            f.mem
+                .read_slice(&mut received, GuestAddress(f.data(index as u64) + 12))
+                .unwrap();
+            assert_eq!(received, frame);
+        }
+        assert!(lock(&shared).rx_pending.is_empty());
     }
 
     #[test]
