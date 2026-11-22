@@ -2730,6 +2730,64 @@ mod tests {
         );
     }
 
+    /// F19 of the virtio devices review: `ftruncate(2)` works on a writable
+    /// descriptor whatever the mode of the file, so a SETATTR that carries
+    /// the handle truncates through it.
+    #[test]
+    fn ftruncate_through_a_handle_ignores_the_file_mode() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root opens a 0400 file for writing, so the fault does not show.
+            return;
+        }
+        let (dir, fs) = scratch();
+        let (entry, handle, _, _) = fs
+            .create(
+                &ctx(),
+                ROOT_ID,
+                c"readonly",
+                CreateIn {
+                    flags: libc::O_RDWR as u32,
+                    mode: 0o400,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        {
+            use std::os::unix::fs::FileExt;
+            let file = fs.inner.lock().file_handle(entry.inode, handle).unwrap();
+            file.write_all_at(b"content", 0).unwrap();
+        }
+        let mut attr = entry.attr;
+        attr.st_size = 3;
+        let (st, _) = fs
+            .setattr(&ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+        assert_eq!(st.st_size, 3);
+        assert_eq!(std::fs::read(dir.path().join("readonly")).unwrap(), b"con");
+
+        // Without the handle the mode of the file decides, as truncate(2).
+        attr.st_size = 0;
+        assert_eq!(
+            fs.setattr(&ctx(), entry.inode, attr, None, SetattrValid::SIZE)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        // A handle that is not open for writing does not truncate either.
+        let (reader, _, _) = fs
+            .open(&ctx(), entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert_eq!(
+            fs.setattr(&ctx(), entry.inode, attr, reader, SetattrValid::SIZE)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(std::fs::read(dir.path().join("readonly")).unwrap(), b"con");
+    }
+
     #[test]
     fn statfs_reports_the_share() {
         let (_dir, fs) = scratch();
