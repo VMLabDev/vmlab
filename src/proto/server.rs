@@ -72,11 +72,25 @@ pub struct Server<R: WireRequest> {
 /// lab's state file, the registry) and keeps it until it exits; binding the
 /// socket needs one. Taking it also refuses a path somebody still accepts
 /// connections on without holding the lock — a daemon whose lock file was
-/// removed under it, or one from a build that took none.
+/// removed under it, or one from a build that took none. The lock file holds
+/// the holder's pid while it is held.
 #[derive(Debug)]
 pub struct SocketGuard {
     path: PathBuf,
-    _lock: nix::fcntl::Flock<std::fs::File>,
+    lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+/// How often, and how far apart, [`SocketGuard::acquire`] looks again at a
+/// lock that names no live holder before it refuses: one second in all.
+const LEAK_TRIES: u32 = 200;
+const LEAK_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        // No pid in the file says the lock is free or about to be: see the
+        // retry in `acquire`.
+        let _ = self.lock.set_len(0);
+    }
 }
 
 impl SocketGuard {
@@ -104,6 +118,7 @@ impl SocketGuard {
                 ),
             )
         };
+        let mut leaked = 0;
         let mut lock = loop {
             let file = std::fs::File::options()
                 .create(true)
@@ -117,10 +132,24 @@ impl SocketGuard {
                     Err((mut file, nix::errno::Errno::EWOULDBLOCK)) => {
                         let mut pid = String::new();
                         let _ = file.read_to_string(&mut pid);
-                        return Err(match pid.trim() {
-                            "" => in_use(""),
-                            pid => in_use(&format!(" (pid {pid})")),
-                        });
+                        let holder = pid
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|pid| crate::supervisor::process_running(*pid));
+                        if let Some(pid) = holder {
+                            return Err(in_use(&format!(" (pid {pid})")));
+                        }
+                        // Locked, yet no live process is named: a holder
+                        // between its lock and its pid, or one that is gone
+                        // while a child it forked has not reached its `exec`
+                        // and still has the descriptor. Both pass at once.
+                        if leaked == LEAK_TRIES {
+                            return Err(in_use(""));
+                        }
+                        leaked += 1;
+                        std::thread::sleep(LEAK_PAUSE);
+                        continue;
                     }
                     Err((_, errno)) => return Err(errno.into()),
                 };
@@ -141,7 +170,7 @@ impl SocketGuard {
         write!(lock, "{}", std::process::id())?;
         Ok(SocketGuard {
             path: path.to_path_buf(),
-            _lock: lock,
+            lock,
         })
     }
 }
@@ -466,8 +495,16 @@ mod tests {
     async fn a_dead_socket_is_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("control.sock");
-        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
-        assert!(sock.exists(), "the dead listener left its file");
+        // A socket inode with no listener behind it. Not a listener bound
+        // and dropped: a child that another test forks keeps that one open
+        // until its `exec`.
+        nix::sys::stat::mknod(
+            &sock,
+            nix::sys::stat::SFlag::S_IFSOCK,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .unwrap();
 
         let _server = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
         let client = crate::proto::client::LabClient::connect(&sock)
