@@ -936,10 +936,12 @@ mod tests {
         let cmd = cmd.as_bytes();
         assert!(lab.started(cmd));
         // A host GPU's `qemu_binary` is an absolute path to the same name.
-        assert!(lab.started(
-            format!("/opt/qemu-vmlab/bin/qemu-system-x86_64\0-name\0vmlab:mylab/web\0{qmp}")
-                .as_bytes()
-        ));
+        assert!(
+            lab.started(
+                format!("/opt/qemu-vmlab/bin/qemu-system-x86_64\0-name\0vmlab:mylab/web\0{qmp}")
+                    .as_bytes()
+            )
+        );
         // A different lab must not match.
         assert!(!LabIdentity::new("other", None).started(cmd));
         // Prefix collision: `my` must not match `mylab`'s VMs.
@@ -962,7 +964,8 @@ mod tests {
     fn a_renamed_qemu_binary_is_matched_by_its_argv_form() {
         let lab = LabIdentity::new("mylab", None);
         let qmp = qmp_arg("mylab");
-        let gpu_qemu = format!("/opt/gpu/bin/qemu-nv\0-name\0vmlab:mylab/web\0-machine\0q35\0{qmp}");
+        let gpu_qemu =
+            format!("/opt/gpu/bin/qemu-nv\0-name\0vmlab:mylab/web\0-machine\0q35\0{qmp}");
         let gpu_qemu = gpu_qemu.as_bytes();
         assert!(lab.started(gpu_qemu));
         assert!(!LabIdentity::new("other", None).started(gpu_qemu));
@@ -970,9 +973,11 @@ mod tests {
         // No `-machine`: not our QEMU.
         assert!(!lab.started(format!("qemu-nv\0-name\0vmlab:mylab/web\0{qmp}").as_bytes()));
         // `-name` not first: not our argv.
-        assert!(!lab.started(
-            format!("tool\0-v\0-name\0vmlab:mylab/web\0-machine\0q35\0{qmp}").as_bytes()
-        ));
+        assert!(
+            !lab.started(
+                format!("tool\0-v\0-name\0vmlab:mylab/web\0-machine\0q35\0{qmp}").as_bytes()
+            )
+        );
         // The marker as a free argument, not `-name`'s value.
         assert!(!lab.started(format!("tool\0vmlab:mylab/web\0-machine\0q35\0{qmp}").as_bytes()));
         // No QMP socket under the lab's runtime directory (F5).
@@ -1128,7 +1133,8 @@ mod tests {
     /// environment's runtime directory, and is not this lab's orphan.
     #[test]
     fn a_qemu_of_another_runtime_directory_is_not_an_orphan() {
-        let other = crate::paths::lab_runtime_dir_in(Path::new("/run/user/elsewhere/vmlab"), "demo");
+        let other =
+            crate::paths::lab_runtime_dir_in(Path::new("/run/user/elsewhere/vmlab"), "demo");
         let other = other.display();
         let table = vec![
             (
