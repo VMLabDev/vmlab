@@ -360,16 +360,92 @@ pub fn validate_current() -> Result<crate::config::LabFile> {
         crate::instance::apply(&mut file, &root)?;
         return Ok(file);
     }
+    Err(miette_to_anyhow(validation_error(&root, issues)))
+}
+
+/// The issues validation raised about the lab file under `root`, renderable
+/// against that file.
+fn validation_error(root: &Path, issues: config::IssueList) -> ConfigErrors {
     let path = root.join(crate::paths::LAB_FILE);
     let source = std::fs::read_to_string(&path).unwrap_or_default();
-    let err = ConfigErrors {
+    ConfigErrors {
         name: path.display().to_string(),
         src: NamedSource::new(path.display().to_string(), source),
         issues,
-    };
-    Err(miette_to_anyhow(err))
+    }
 }
 
 fn miette_to_anyhow(e: ConfigErrors) -> anyhow::Error {
     anyhow::anyhow!("{:?}", miette::Report::new(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host that knows no profile and no template.
+    struct KnowsNothing;
+
+    impl ValidationContext for KnowsNothing {
+        fn template_meta(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Option<crate::template::TemplateMeta> {
+            None
+        }
+        fn profile(&self, _: &str) -> Option<crate::profiles::Profile> {
+            None
+        }
+        fn check_container_hardware(
+            &self,
+            _: &crate::config::model::Container,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn check_script(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// An issue labelled with a whole `vm` block prints every line of it
+    /// (config review F5). The login's password and a `secret = true`
+    /// variable's value are in those lines and must not be in the report.
+    #[test]
+    fn a_diagnostic_does_not_show_a_secret_value() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(crate::paths::LAB_FILE),
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    profile = "no-such-profile"
+    login "dev" { user = "dev" password = "hunter2-login" }
+    playbook "pb" {
+      play = "base"
+      var "token" { value = "hunter2-var" secret = true }
+      var "domain" { value = "plain-var" }
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let file = config::load_lab_root(root.path()).expect("the lab file loads");
+        let issues = config::validate(&file, &KnowsNothing);
+        assert!(
+            issues.iter().any(|i| i.message.contains("unknown profile")),
+            "{issues:?}"
+        );
+        let err = validation_error(root.path(), issues);
+        let shown = format!("{:?}", miette::Report::new(err));
+        assert!(shown.contains("unknown profile"), "{shown}");
+        // The excerpt is still there, with what is not a secret in it.
+        assert!(shown.contains("plain-var"), "{shown}");
+        assert!(shown.contains("password"), "{shown}");
+        assert!(!shown.contains("hunter2-login"), "{shown}");
+        assert!(!shown.contains("hunter2-var"), "{shown}");
+    }
 }

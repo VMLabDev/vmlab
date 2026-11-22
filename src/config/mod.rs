@@ -1080,4 +1080,24 @@ lab "web" {
         assert_ne!(digest_of(DIGEST_LAB), digest_of(&template));
         assert_ne!(digest_of(DIGEST_LAB), digest_of(&args));
     }
+
+    /// A load error renders against the source too (config review F5): the
+    /// line of a mistake in a `login` block holds its password.
+    #[test]
+    fn a_load_error_does_not_show_a_secret_value() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    login "dev" { user = "dev" password = "hunter2-login" elevated = "yes" }
+  }
+}
+"#;
+        let err = load_lab_source(source, "<test>", &std::env::temp_dir())
+            .expect_err("`elevated` is not a bool");
+        assert!(err.issues.iter().any(|i| i.span.is_some()), "{err:?}");
+        let shown = format!("{:?}", miette::Report::new(err));
+        assert!(shown.contains("elevated"), "{shown}");
+        assert!(!shown.contains("hunter2-login"), "{shown}");
+    }
 }

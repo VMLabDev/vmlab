@@ -498,6 +498,18 @@ mod tests {
         }
     }
 
+    /// The trunk PSK is a secret like the OSK (config review F6).
+    #[test]
+    fn the_psk_is_hidden_from_debug() {
+        let host = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { psk = \"sekrit-psk\" }",
+            "<test>",
+        )
+        .unwrap();
+        assert!(host.psk.is_some());
+        assert!(!format!("{host:?}").contains("sekrit-psk"));
+    }
+
     #[test]
     fn defaults_when_absent() {
         let cfg = HostConfig::default();
