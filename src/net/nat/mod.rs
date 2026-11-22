@@ -53,10 +53,12 @@
 //! under worktree isolation (PRD §21.4) refuses every host address
 //! ([`guard`]).
 //!
-//! Frames toward a guest need the guest's MAC: it is learned from every
-//! frame the engine sees, and the gateway can prime the table via
-//! [`NatEngine::learn_mac`] (it sees ARP/DHCP). Unknown guests fall back to
-//! the L2 broadcast address, which the switch floods.
+//! Frames toward a guest need the guest's MAC. The lab daemon binds the
+//! address of a forward to the MAC of the NIC that holds its lease with
+//! [`NatEngine::learn_mac`], and no frame changes a bound address (review
+//! F9). An address nobody bound is learned from the frames the engine sees.
+//! Unknown guests fall back to the L2 broadcast address, which the switch
+//! floods.
 
 mod forward;
 pub mod guard;
@@ -136,8 +138,8 @@ pub struct NatEngine {
     /// Engine-bound UDP flows for [`Self::udp_bind_guest_flow`], keyed
     /// (guest_ip, guest_port, gw_port); the value receives guest payloads.
     guest_udp: StdMutex<HashMap<GuestUdpKey, mpsc::Sender<Vec<u8>>>>,
-    /// Learned guest IP → MAC mappings.
-    macs: StdMutex<HashMap<Ipv4Addr, MacAddr>>,
+    /// Guest IP → MAC mappings, bound or seen ([`GuestMac`]).
+    macs: StdMutex<HashMap<Ipv4Addr, GuestMac>>,
     icmp: icmp::IcmpState,
     pinger: Arc<dyn Pinger>,
     /// What of the host a new flow may not reach: the segment's guard, or
@@ -149,6 +151,17 @@ pub struct NatEngine {
     /// How many ports of the ephemeral range are handed out: all of it,
     /// except in tests that need to exhaust it.
     eph_span: AtomicU32,
+}
+
+/// Where the engine sends what it originates toward a guest address.
+#[derive(Clone, Copy)]
+enum GuestMac {
+    /// Told by the lab daemon ([`NatEngine::learn_mac`]), which knows the
+    /// NIC that holds the lease. Only another binding replaces it.
+    Bound(MacAddr),
+    /// The source MAC of the last frame from this address. Any frame
+    /// replaces it.
+    Seen(MacAddr),
 }
 
 /// How many guest-opened vTCP flows the engine holds at once (review F3):
@@ -232,9 +245,21 @@ impl NatEngine {
         }
     }
 
-    /// Prime the IP → MAC table (the gateway sees ARP/DHCP and knows best).
+    /// Bind `ip` to `mac`: every connection the engine originates toward
+    /// `ip` (a port forward) goes to `mac` from now on, whatever MAC a guest
+    /// frame carries that address from (review F9). The caller is the lab
+    /// daemon, which knows the NIC that holds the lease. A later call
+    /// replaces the binding.
     pub fn learn_mac(&self, ip: Ipv4Addr, mac: MacAddr) {
-        self.macs.lock_recover().insert(ip, mac);
+        self.macs.lock_recover().insert(ip, GuestMac::Bound(mac));
+    }
+
+    /// Note the MAC a frame from `ip` came from, unless `ip` is bound.
+    fn see_mac(&self, ip: Ipv4Addr, mac: MacAddr) {
+        let mut macs = self.macs.lock_recover();
+        if !matches!(macs.get(&ip), Some(GuestMac::Bound(_))) {
+            macs.insert(ip, GuestMac::Seen(mac));
+        }
     }
 
     /// Entry point: one guest→world IPv4 ethernet frame (dst MAC = gateway).
@@ -250,7 +275,7 @@ impl NatEngine {
         let Some(ip) = Ipv4View::parse(eth.payload()) else {
             return;
         };
-        self.learn_mac(ip.src(), src_mac);
+        self.see_mac(ip.src(), src_mac);
 
         match ip.proto() {
             IPPROTO_TCP => self.handle_tcp(&ip, src_mac).await,
@@ -449,11 +474,10 @@ impl NatEngine {
     // -- internals shared with submodules -------------------------------------
 
     fn guest_mac(&self, ip: Ipv4Addr) -> MacAddr {
-        self.macs
-            .lock_recover()
-            .get(&ip)
-            .copied()
-            .unwrap_or(MAC_BROADCAST)
+        match self.macs.lock_recover().get(&ip) {
+            Some(GuestMac::Bound(mac) | GuestMac::Seen(mac)) => *mac,
+            None => MAC_BROADCAST,
+        }
     }
 
     fn next_ip_id(&self) -> u16 {

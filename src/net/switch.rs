@@ -96,8 +96,9 @@ pub struct SwitchStats {
     /// Ingress frames flooded (unknown unicast, broadcast, multicast) that
     /// reached at least one port.
     pub frames_flooded: u64,
-    /// Frames that died: hook drops, isolation drops, runts, full or closed
-    /// egress queues, and floods that reached nobody.
+    /// Frames that died: hook drops, isolation drops, runts, guest frames
+    /// from a service port's MAC, full or closed egress queues, and floods
+    /// that reached nobody.
     pub frames_dropped: u64,
     /// Frames forwarded in-kernel by the fast path (already included in
     /// `frames_forwarded`); 0 on a pure-userspace switch.
@@ -340,6 +341,23 @@ impl Switch {
         }
     }
 
+    /// Put `mac` on the service port `port` before that port has sent a
+    /// frame, so that no guest can claim it first (review F9). The gateway
+    /// binds its own MAC this way. Does nothing for a port that is gone or
+    /// is a guest's.
+    pub fn bind_mac(&self, port: PortId, mac: MacAddr) {
+        let mut inner = self.inner.lock_recover();
+        if !matches!(inner.ports.get(&port), Some(p) if p.class == PortClass::Service) {
+            return;
+        }
+        let prev = inner.macs.insert(mac, port);
+        if prev != Some(port)
+            && let Some(off) = &self.offload
+        {
+            off.relearn(mac, port);
+        }
+    }
+
     /// Detach a port and purge every MAC learned on it (kernel fast-path
     /// state included). Idempotent.
     pub fn remove_port(&self, id: PortId) {
@@ -534,6 +552,22 @@ impl Switch {
         let src = MacAddr(src);
 
         let inner = &mut *self.inner.lock_recover();
+
+        // A MAC a service port holds (the gateway's, bound when it attached,
+        // or one learned behind a trunk) is not a guest's to send from: the
+        // frame is dropped and the MAC stays where it is (review F9). A
+        // guest that could move it would receive, or black-hole, every other
+        // guest's traffic to the gateway.
+        if matches!(ingress_class, PortClass::Guest { .. })
+            && !is_multicast(&src)
+            && let Some(holder) = inner.macs.get(&src)
+            && *holder != port
+            && matches!(inner.ports.get(holder), Some(p) if p.class == PortClass::Service)
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            debug!(switch = %self.name, %port, mac = %src, "guest frame from a service port's MAC dropped");
+            return;
+        }
 
         // Learn the source MAC; relearning moves it (VM migrated ports).
         // Binding changes mirror into the kernel fast path: toward the MAC's
@@ -1234,5 +1268,36 @@ mod tests {
         b.tx.send(to_gateway.clone()).await.unwrap();
         assert_no_frame(&mut a.rx).await;
         assert_eq!(recv(&mut svc.rx).await, to_gateway);
+    }
+
+    /// A MAC bound to a service port is that port's before it has sent a
+    /// frame, and stays a move between service ports away (a trunk that
+    /// reconnects).
+    #[tokio::test]
+    async fn a_bound_mac_is_held_before_its_port_speaks() {
+        let sw = Switch::new("seg0".into());
+        let mut svc = sw.add_channel_port(PortClass::Service);
+        let mut a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let gateway = mac(0x47);
+        sw.bind_mac(svc.id, gateway);
+
+        a.tx.send(frame(mac(9), gateway, b"spoof")).await.unwrap();
+        wait_for(|| sw.stats().frames_dropped == 1, "the spoofed frame dropped").await;
+        assert_no_frame(&mut b.rx).await;
+        assert_no_frame(&mut svc.rx).await;
+
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        b.tx.send(to_gateway.clone()).await.unwrap();
+        assert_eq!(recv(&mut svc.rx).await, to_gateway);
+        assert_no_frame(&mut a.rx).await;
+
+        // Another service port may take it: the MAC moved behind a trunk.
+        let mut trunk = sw.add_channel_port(PortClass::Service);
+        trunk.tx.send(frame(MAC_BROADCAST, gateway, b"moved")).await.unwrap();
+        recv(&mut b.rx).await;
+        let again = frame(gateway, mac(2), b"to the gateway again");
+        b.tx.send(again.clone()).await.unwrap();
+        assert_eq!(recv(&mut trunk.rx).await, again);
     }
 }
