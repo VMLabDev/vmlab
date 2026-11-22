@@ -41,7 +41,7 @@ Who the attacker is, per finding:
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again |
 | F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC |
 | F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused |
-| F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind |
+| F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind (fixed in card #528) |
 | F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind |
 | F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY |
 | F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
@@ -637,6 +637,9 @@ Who the attacker is, per finding:
 
 ### F15. A failed global attach leaves state behind (wrong result)
 
+- Fixed in card #528. Attach validates the PSK before changing segment
+  membership and binds the socket before committing a subnet allocation or
+  starting the gateway and DNS sync tasks.
 - Where: `src/supervisor/global.rs:550-566` (existing segment: `refcount +=
   1` and `join` run before `require_psk()?`), and `:579-609` (new segment:
   `Gateway::spawn`, `spawn_dns_sync` and `listen_unix` run before
@@ -651,7 +654,7 @@ Who the attacker is, per finding:
   socket file and the switch stay, and the subnet index is spent (F14). The
   early return after a failed `listen_unix` (`:596-599`) leaves the gateway
   and DNS sync task of that attempt the same way.
-- Proof: test `a_refused_attach_leaves_nothing` in
+- Proof: the `a_refused_attach_leaves_nothing_*` tests in
   `src/supervisor/global.rs`. Build `GlobalSegments::new_at` with `psk =
   None`. `attach("wan", None, None, None)` succeeds. `attach("wan", None,
   Some("127.0.0.1:1".into()), None)` fails. `detach("wan", None)` once.
