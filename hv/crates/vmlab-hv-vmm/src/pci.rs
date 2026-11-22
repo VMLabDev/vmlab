@@ -1168,6 +1168,50 @@ mod tests {
     }
 
     #[test]
+    fn doorbells_follow_the_memory_enable_bit() {
+        // A function registers its queue doorbells in the kernel from the
+        // address `set_bar_address` gives it. On a q35 root that address
+        // must go away with memory decoding, as the userspace dispatch does.
+        let device = FakePci::new(test_bars());
+        let mut root = PciRoot::q35(1 << 32);
+        root.add_device_at(3, 0, device.clone()).unwrap();
+        let last = |device: &Arc<Mutex<FakePci>>| {
+            let device = device.lock();
+            device
+                .placements
+                .iter()
+                .rev()
+                .find(|(bar, _)| *bar == 0)
+                .map(|(_, address)| *address)
+        };
+        root.config_write(0, 3, 0, 16, &0xc200_0000u32.to_le_bytes());
+        assert_eq!(last(&device), Some(None));
+        root.config_write(0, 3, 0, 4, &2u16.to_le_bytes());
+        assert_eq!(last(&device), Some(Some(0xc200_0000)));
+        let saved = root.save_bar_states();
+        root.config_write(0, 3, 0, 4, &0u16.to_le_bytes());
+        assert_eq!(last(&device), Some(None));
+        assert!(!root.dispatch_mmio_write(0xc200_0040, &[1]));
+        // A restore follows the bit the function holds, as a config write.
+        root.restore_bar_states(&saved).unwrap();
+        assert_eq!(last(&device), Some(None));
+        root.config_write(0, 3, 0, 4, &2u16.to_le_bytes());
+        assert_eq!(last(&device), Some(Some(0xc200_0000)));
+        // The I/O enable bit does not place a memory BAR.
+        root.config_write(0, 3, 0, 4, &1u16.to_le_bytes());
+        assert_eq!(last(&device), Some(None));
+    }
+
+    #[test]
+    fn a_root_without_firmware_places_bars_whatever_the_command_register() {
+        let (root, device) = root_with_fake();
+        root.lock().config_write(0, 0, 0, 4, &0u16.to_le_bytes());
+        let device = device.lock();
+        let (_, address) = device.placements.iter().rev().find(|p| p.0 == 0).unwrap();
+        assert!(address.is_some());
+    }
+
+    #[test]
     fn mmio_dispatch_keeps_rom_priority_over_an_overlapping_bar() {
         let device = FakePci::new(test_bars());
         let mut root = PciRoot::q35(1 << 32);
