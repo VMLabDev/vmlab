@@ -247,41 +247,69 @@ fn a_new_process_removes_a_stale_rollback_checkpoint() {
     let disk = guest.dir().join("scratch.qcow2");
     let control = guest.dir().join("control.sock");
     assert!(matches!(
-        guest.control.call(Ctrl::SnapshotSave { name: "saved".into() }).unwrap(),
+        guest
+            .control
+            .call(Ctrl::SnapshotSave {
+                name: "saved".into()
+            })
+            .unwrap(),
         Outcome::Ok { .. }
     ));
     // A name of the checkpoint format before #421: a user may hold it.
     const LEGACY: &str = "vmlab-hv-rollback-1-0";
     assert!(matches!(
-        guest.control.call(Ctrl::SnapshotSave { name: LEGACY.into() }).unwrap(),
+        guest
+            .control
+            .call(Ctrl::SnapshotSave {
+                name: LEGACY.into()
+            })
+            .unwrap(),
         Outcome::Ok { .. }
     ));
     assert!(
         !matches!(
-            guest.control.call(Ctrl::SnapshotSave { name: "vmlab-hv-rollback-:1-0".into() }).unwrap(),
+            guest
+                .control
+                .call(Ctrl::SnapshotSave {
+                    name: "vmlab-hv-rollback-:1-0".into()
+                })
+                .unwrap(),
             Outcome::Ok { .. }
         ),
         "a save under the reserved checkpoint prefix must be refused"
     );
     let is_checkpoint = |name: &str| name.starts_with("vmlab-hv-rollback-") && name != LEGACY;
     let mut loader = Client::connect(control).unwrap();
-    let load = std::thread::spawn(move || loader.call(Ctrl::SnapshotLoad { name: "saved".into() }));
+    let load = std::thread::spawn(move || {
+        loader.call(Ctrl::SnapshotLoad {
+            name: "saved".into(),
+        })
+    });
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if snapshot_list(&disk).is_ok_and(|entries| {
-            entries.iter().any(|entry| is_checkpoint(&entry.name))
-        }) {
+        if snapshot_list(&disk)
+            .is_ok_and(|entries| entries.iter().any(|entry| is_checkpoint(&entry.name)))
+        {
             guest.child.kill().unwrap();
             break;
         }
-        assert!(!load.is_finished(), "load ended before the checkpoint was observed");
-        assert!(Instant::now() < deadline, "rollback checkpoint never appeared");
+        assert!(
+            !load.is_finished(),
+            "load ended before the checkpoint was observed"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "rollback checkpoint never appeared"
+        );
         std::thread::yield_now();
     }
     assert_eq!(guest.child.wait().unwrap().signal(), Some(libc::SIGKILL));
     assert!(load.join().unwrap().is_err(), "load replied before SIGKILL");
     assert!(
-        snapshot_list(&disk).unwrap().iter().any(|entry| is_checkpoint(&entry.name)),
+        snapshot_list(&disk)
+            .unwrap()
+            .iter()
+            .any(|entry| is_checkpoint(&entry.name)),
         "the killed process left no rollback checkpoint"
     );
 
@@ -296,21 +324,31 @@ fn a_new_process_removes_a_stale_rollback_checkpoint() {
             .arg("--control")
             .arg(&control)
             .arg("--paused"),
-    ).unwrap();
+    )
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut client = loop {
         if let Ok(client) = Client::connect(&control) {
             break client;
         }
-        assert!(restarted.try_wait().unwrap().is_none(), "restart exited before serving control");
+        assert!(
+            restarted.try_wait().unwrap().is_none(),
+            "restart exited before serving control"
+        );
         assert!(Instant::now() < deadline, "restart never served control");
         std::thread::sleep(Duration::from_millis(25));
     };
-    assert!(matches!(client.call(Ctrl::Quit).unwrap(), Outcome::Ok { .. }));
+    assert!(matches!(
+        client.call(Ctrl::Quit).unwrap(),
+        Outcome::Ok { .. }
+    ));
     assert!(restarted.wait().unwrap().success());
     let entries = snapshot_list(&disk).unwrap();
     assert_eq!(
-        entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
         ["saved", LEGACY],
         "restart must remove the rollback checkpoint and keep both user snapshots"
     );
