@@ -21,6 +21,7 @@ use virtio_queue::{Queue, QueueState, QueueT};
 use vm_memory::GuestMemoryMmap;
 
 use super::fuse::Server;
+use super::fuse::filesystem::FileSystem;
 use super::fuse::transport::{Reader, Writer};
 use super::passthrough::PassthroughFs;
 use super::vhost_user::{CONFIG_LEN, FS_DEVICE_TYPE, NUM_QUEUES, QUEUE_MAX_SIZE};
@@ -293,6 +294,8 @@ impl VirtioDevice for InProcessFs {
         inner.queues.clear();
         inner.pending_queues = None;
         inner.active = false;
+        self.fs.destroy();
+        self.server = Arc::new(Server::new(self.fs.clone()));
     }
 }
 

@@ -371,6 +371,8 @@ Not read:
   Call `f.fs.reset()`, activate again as `Fixture::over` does, send `INIT`,
   then `LOOKUP` a new file and expect `error == 0`. Today it is `-ENFILE`.
 - Confidence: high.
+- Fixed in card #402. Device reset ends the FUSE session, releases its inodes
+  and handles, and keeps the pinned share root for the next guest session.
 
 ### F12. vhost-user-fs: a completion interrupt can be lost across a snapshot
 

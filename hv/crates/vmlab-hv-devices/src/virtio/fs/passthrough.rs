@@ -49,6 +49,7 @@ const MAGIC: u32 = 0x5346_5049;
 const SESSION_LIMIT: usize = 4096;
 #[cfg(test)]
 const SESSION_LIMIT: usize = 32;
+const INITIAL_REQUEST_LIMIT: usize = super::fuse::server::MAX_BUFFER_SIZE as usize + 4096;
 
 /// A passthrough filesystem serving `root` on the host. Clones share one
 /// session, so the device and its FUSE server observe the same inodes.
@@ -140,7 +141,7 @@ impl PassthroughFs {
             root: root.canonicalize().unwrap_or(root),
             read_only,
             request_limit: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
-                super::fuse::server::MAX_BUFFER_SIZE as usize + 4096,
+                INITIAL_REQUEST_LIMIT,
             )),
             inner: std::sync::Arc::new(Mutex::new(Session {
                 writeback_cache: false,
@@ -436,7 +437,19 @@ impl FileSystem for PassthroughFs {
         Ok(enabled)
     }
 
-    fn destroy(&self) {}
+    fn destroy(&self) {
+        let mut session = self.inner.lock();
+        // Keep the pinned share root so reset also works after a host rename.
+        session.inodes.retain(|&ino, _| ino == ROOT_ID);
+        session.by_path.retain(|_, ino| *ino == ROOT_ID);
+        session.handles.clear();
+        session.handles_by_inode.clear();
+        session.next_ino = ROOT_ID + 1;
+        session.next_handle = 1;
+        session.writeback_cache = false;
+        self.request_limit
+            .store(INITIAL_REQUEST_LIMIT, std::sync::atomic::Ordering::Relaxed);
+    }
 
     fn lookup(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
         let mut session = self.inner.lock();
