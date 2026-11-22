@@ -308,6 +308,20 @@ impl Fixture {
             match feature.as_str() {
                 "exec" => {
                     check!("exec", exec_case(&handle, &root));
+                    if tier == "full" {
+                        check!(
+                            "a_large_stdin_through_cat_comes_back_whole",
+                            a_large_stdin_through_cat_comes_back_whole(&handle)
+                        );
+                        check!(
+                            "exec_timeout_covers_blocked_stdin",
+                            exec_timeout_covers_blocked_stdin(&handle)
+                        );
+                        check!(
+                            "exec_preserves_exit_when_stdin_is_unread",
+                            exec_preserves_exit_when_stdin_is_unread(&handle)
+                        );
+                    }
                     check!("flow_control", self.flow_control(&handle));
                     check!("cancellation", self.cancellation(&handle, &root));
                 }
@@ -864,6 +878,62 @@ async fn collect(session: &mut AgentSession) -> Result<ExecOutput> {
             other => bail!("unexpected session event {other:?}"),
         }
     }
+}
+
+async fn a_large_stdin_through_cat_comes_back_whole(handle: &AgentHandle) -> Result<()> {
+    let input: Vec<u8> = (0..LARGE).map(|i| (i % 251) as u8).collect();
+    // Fill the output window before reading stdin, regardless of pipe capacity.
+    let out = handle
+        .exec(
+            sh("head -c 524288 /dev/zero >&2; exec cat"),
+            vec![],
+            None,
+            Some(input.clone()),
+            Duration::from_secs(30),
+            None,
+        )
+        .await?;
+    ensure(
+        out.exit_code == 0 && out.stdout == input && out.stderr == vec![0; LARGE / 2],
+        "cat did not echo the full input after writing stderr",
+    )
+}
+
+async fn exec_timeout_covers_blocked_stdin(handle: &AgentHandle) -> Result<()> {
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.exec(
+            vec!["sleep".into(), "30".into()],
+            vec![],
+            None,
+            Some(vec![0; LARGE]),
+            Duration::from_secs(1),
+            None,
+        ),
+    )
+    .await
+    .context("exec outlasted its deadline while sending stdin")?;
+    match result {
+        Err(e) => ensure(e.to_string().contains("timed out"), &e.to_string()),
+        Ok(_) => bail!("exec finished despite blocked stdin"),
+    }
+}
+
+async fn exec_preserves_exit_when_stdin_is_unread(handle: &AgentHandle) -> Result<()> {
+    let out = handle
+        .exec(
+            sh("printf done; exit 7"),
+            vec![],
+            None,
+            Some(vec![0; LARGE]),
+            BUDGET,
+            None,
+        )
+        .await?;
+    ensure(
+        out.exit_code == 7 && out.stdout == b"done",
+        "lost output or exit code when the child exited without reading stdin",
+    )
 }
 
 async fn exec_case(handle: &AgentHandle, root: &str) -> Result<()> {
