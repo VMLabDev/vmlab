@@ -548,6 +548,11 @@ Not read:
   `restore_state` must return `Err`. Today it returns `Ok` and
   `guest.advance(period_time())` panics.
 - Confidence: high.
+- Fixed in card #430. `restore_state` holds the stored buffer size, period
+  size and channel count to the bounds of `SET_PARAMS`, through one shared
+  check, and answers `Err` otherwise. The proof test also covers a period
+  below one frame, a period of part frames, a zero buffer, a buffer of part
+  periods and three channels.
 
 ### F18. virtio-console: control traffic stalls or is lost when `pending` is full
 
