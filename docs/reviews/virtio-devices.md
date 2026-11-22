@@ -409,6 +409,14 @@ Not read:
   recorded before `save_state` returns.
 - Confidence: medium. Both code facts are confirmed. Where the VMM saves the
   transport's interrupt state relative to this section was not read.
+- Fixed in card #416. `save_state` delivers the calls that are readable
+  after `GET_VRING_BASE` before it re-arms the rings, and a restore of an
+  active section notifies every armed queue (also when the section is applied
+  by the next `activate`). The two proof tests and
+  `restored_state_applied_at_activation_notifies_every_queue` fail before
+  the fix and pass after it. The save test checks the order (the interrupt
+  comes before the re-arm), because the restarted worker would otherwise
+  deliver the call a moment after `save_state` returns.
 
 ### F13. virtio-fs: `READDIRPLUS` leaks a lookup reference and hides entries when the inode table is full
 

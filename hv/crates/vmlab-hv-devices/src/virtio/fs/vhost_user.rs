@@ -225,6 +225,49 @@ impl Inner {
         }
     }
 
+    /// Turn every call the backend raised while the worker was stopped into
+    /// a queue interrupt. The backend finishes requests in flight when it
+    /// answers `GET_VRING_BASE`, so a save calls this before it re-arms.
+    fn deliver_pending_calls(&self) {
+        let Some(interrupt) = &self.interrupt else {
+            return;
+        };
+        for (index, vring) in self.vrings.iter().enumerate() {
+            let Some(vring) = vring else {
+                continue;
+            };
+            let mut fd = libc::pollfd {
+                fd: vring.call.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `fd` is one well-formed pollfd; poll(2) with a zero
+            // timeout only writes its `revents` back.
+            let n = unsafe { libc::poll(&mut fd, 1, 0) };
+            // The eventfd blocks on an empty counter: read it only when
+            // poll saw it readable.
+            if n == 1 && fd.revents & libc::POLLIN != 0 {
+                let _ = vring.call.read();
+                interrupt.notify_queue(index as u16);
+            }
+        }
+    }
+
+    /// Interrupt every armed queue. A restored guest may hold a request
+    /// whose completion interrupt was raised only in the machine that was
+    /// saved, after its interrupt state was captured. A spurious queue
+    /// interrupt is harmless: the driver finds no new used entry.
+    fn notify_every_queue(&self) {
+        let Some(interrupt) = &self.interrupt else {
+            return;
+        };
+        for (index, vring) in self.vrings.iter().enumerate() {
+            if vring.is_some() {
+                interrupt.notify_queue(index as u16);
+            }
+        }
+    }
+
     /// Send one vring's layout and eventfds to the backend.
     fn arm_vring(&mut self, index: usize, base: u32) -> Result<(), DeviceError> {
         let vhost_err =
@@ -584,6 +627,9 @@ impl VirtioDevice for Fs {
         inner.interrupt = Some(interrupt);
         inner.start_worker()?;
         inner.active = true;
+        if pending.is_some() {
+            inner.notify_every_queue();
+        }
         Ok(())
     }
 
@@ -642,6 +688,9 @@ impl Snapshot for Fs {
                 }
                 inner.save_backend_state()
             })();
+        // The worker is stopped, so nothing else serves the calls the
+        // backend raised while it stopped its queues.
+        inner.deliver_pending_calls();
         // The machine continues after the snapshot: re-arm with the saved
         // bases, exactly where the queues stopped.
         for (index, base) in bases.iter().enumerate() {
@@ -730,6 +779,7 @@ impl Snapshot for Fs {
             }
             inner.enable_vrings()?;
             inner.start_worker()?;
+            inner.notify_every_queue();
         } else {
             inner.pending = Some(Pending {
                 bases,
