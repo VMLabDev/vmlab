@@ -826,6 +826,100 @@ fn fileops_caps_handles_and_refuses_an_overflowing_offset() {
     mux.remove(30);
 }
 
+/// Review F8 (guest agents): the file session refuses what is not a file
+/// with an end. A FIFO would hold a worker in `open(2)` until a peer came,
+/// and a digest of `/dev/zero` would read for the life of the agent; a
+/// worker has no cancel, so each such request used to cost the session a
+/// thread for good.
+#[cfg(unix)]
+#[test]
+fn a_digest_of_a_fifo_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let fifo = fifo.to_str().unwrap().to_string();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenFileOps {
+            id: 12,
+            logon: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 12 });
+
+    let write = OpenFlags {
+        write: true,
+        ..OpenFlags::default()
+    };
+    let requests = [
+        Op::Digest { path: fifo.clone() },
+        Op::Open {
+            path: fifo.clone(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+        Op::Open {
+            path: fifo.clone(),
+            flags: write,
+            mode: None,
+        },
+        // The open a size or time change makes for itself.
+        Op::Setstat {
+            path: fifo.clone(),
+            attrs: vmlab_agent_proto::fileops::SetAttrs {
+                mtime_ns: Some(0),
+                ..Default::default()
+            },
+        },
+        Op::Digest {
+            path: "/dev/zero".into(),
+        },
+        Op::Open {
+            path: "/dev/zero".into(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+    ];
+    // More requests than the session has workers: before the fix the first
+    // four each took one and the rest were never served.
+    for (id, op) in requests.into_iter().enumerate() {
+        let what = format!("{op:?}");
+        let asked = std::time::Instant::now();
+        ask(&mux, 12, id as u64, op);
+        let (reply, _) = cap.fileops(12);
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(1),
+            "{what} took {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(reply.id, id as u64);
+        match reply.reply {
+            Reply::Error { msg, .. } => assert!(msg.contains("not a regular file"), "{msg}"),
+            other => panic!("{what}: expected a refusal, got {other:?}"),
+        }
+    }
+
+    // Every worker is still there to serve a real file.
+    let file = dir.path().join("f");
+    std::fs::write(&file, b"abc").unwrap();
+    ask(
+        &mux,
+        12,
+        99,
+        Op::Digest {
+            path: file.to_str().unwrap().into(),
+        },
+    );
+    match cap.fileops(12).0.reply {
+        Reply::Digest { len, .. } => assert_eq!(len, 3),
+        other => panic!("expected a digest, got {other:?}"),
+    }
+    mux.remove(12);
+}
+
 #[test]
 fn tail_sends_backlog_then_appends() {
     use std::io::Write;
