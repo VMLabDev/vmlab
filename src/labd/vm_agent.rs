@@ -273,8 +273,7 @@ async fn create_pull_temp(target: &Path) -> std::io::Result<(tokio::fs::File, Pu
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let temp =
-            target.with_file_name(format!(".{name}.vmlab-pull.{}.{n}", std::process::id()));
+        let temp = target.with_file_name(format!(".{name}.vmlab-pull.{}.{n}", std::process::id()));
         match tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -4375,7 +4374,10 @@ mod tests {
         // An agent that cannot serve the transfer at all.
         let (_dir, path) = mock_agent_with(true, vec!["terminal".into()]).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
-        let err = agent.pull_file("/guest/some-file", &dest).await.unwrap_err();
+        let err = agent
+            .pull_file("/guest/some-file", &dest)
+            .await
+            .unwrap_err();
         let err = format!("{err:#}");
         assert!(err.contains("repair-agent"), "{err}");
         assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
