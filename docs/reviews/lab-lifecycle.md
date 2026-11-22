@@ -31,7 +31,7 @@ Two facts are used by several findings:
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | Nothing makes a supervisor or a lab daemon the only one, and binding the socket unlinks a live one |
+| F1 | data loss | Nothing makes a supervisor or a lab daemon the only one, and binding the socket unlinks a live one (fixed, card #546) |
 | F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned |
 | F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name |
 | F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine |
@@ -85,6 +85,20 @@ Two facts are used by several findings:
      registry entry in state `failed` whose pid and start time name a live
      helper process, then `ensure_lab`. It must refuse or stop the old
      daemon first. Today it spawns a second `__labd`.
+- Fixed in card #546. `SocketGuard` in `src/proto/server.rs` is an exclusive
+  `flock` on `<socket>.lock`, which the kernel drops when the holder dies.
+  Taking it also refuses a path that still accepts a connection. A bind needs
+  the guard and fails with `AddrInUse`, naming the holder's pid, when a live
+  daemon has it. A socket file that nobody listens on is replaced as before.
+  The lab daemon takes the guard as its first step, before it loads the
+  config or rewrites `state.json` (path 4), and the supervisor before it
+  loads `labs.json` (path 1). `ensure_lab_locked` asks the guard before it
+  spawns and answers `conflict` while a daemon holds it, whatever the
+  registry says (paths 2 and 3). It does not stop that daemon, because an
+  entry that was lost gives no root to check it against. The two proof tests
+  failed before the fix and pass after it. Not fixed here: the registry
+  overwrite of path 1 is closed only because the second supervisor no longer
+  starts, and F7 and F14 still drop the entry of a live daemon.
 
 ### F2. A stop does not close the lab to starts (data loss)
 
