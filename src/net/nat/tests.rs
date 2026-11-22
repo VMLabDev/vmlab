@@ -2166,6 +2166,10 @@ async fn guest_macs_are_bounded() {
     use crate::sync::LockRecover;
 
     let (engine, _rx) = engine();
+    // A binding of the lab daemon is not one of the limited entries.
+    let bound_ip = Ipv4Addr::new(10, 200, 0, 9);
+    let bound_mac = MacAddr([0x02, 0xEE, 0, 0, 0, 0x09]);
+    engine.learn_mac(bound_ip, bound_mac);
     const SOURCES: u32 = 100_000;
     for i in 0..SOURCES {
         let src = Ipv4Addr::from(0x0A00_0000 + i);
@@ -2174,7 +2178,7 @@ async fn guest_macs_are_bounded() {
         let f = frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt);
         engine.handle_frame(Bytes::from(f)).await;
     }
-    let held = engine.macs.lock_recover().len();
+    let held = engine.macs.lock_recover().seen.len();
     assert!(
         held <= MAX_GUEST_MACS,
         "the engine holds {held} guest MACs, over its limit of {MAX_GUEST_MACS}"
@@ -2182,6 +2186,11 @@ async fn guest_macs_are_bounded() {
     assert_eq!(
         engine.guest_mac(Ipv4Addr::from(0x0A00_0000 + SOURCES - 1)),
         GUEST_MAC
+    );
+    assert_eq!(
+        engine.guest_mac(bound_ip),
+        bound_mac,
+        "the flood does not drop a bound address"
     );
 }
 
@@ -2225,4 +2234,53 @@ async fn the_ping_cache_is_bounded() {
     );
     drop(engine);
     replies.abort();
+}
+
+/// Review F9: a forward goes to the MAC the lab daemon bound the address to,
+/// whatever MAC a later frame carries that address from.
+#[tokio::test]
+async fn a_forward_goes_to_the_machine_it_names() {
+    const ATTACKER_MAC: MacAddr = MacAddr([0x02, 0xEE, 0, 0, 0, 0x66]);
+    let (engine, mut rx) = engine();
+    engine.learn_mac(GUEST_IP, GUEST_MAC);
+
+    // The attacker sends one frame to the gateway with the victim's address
+    // as its source.
+    let seg = frame::udp_build(GUEST_IP, Ipv4Addr::new(127, 0, 0, 1), 4000, 9, b"x").unwrap();
+    let pkt = frame::ipv4_build(
+        GUEST_IP,
+        Ipv4Addr::new(127, 0, 0, 1),
+        IPPROTO_UDP,
+        64,
+        &seg,
+        8,
+    )
+    .unwrap();
+    let spoof = frame::eth_build(GW_MAC, ATTACKER_MAC, ETHERTYPE_IPV4, &pkt);
+    engine.handle_frame(Bytes::from(spoof)).await;
+
+    let open = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.open_tcp_to_guest(GUEST_IP, 22).await.map(|_| ()) }
+    });
+    let syn_dst = loop {
+        let f = recv_frame(&mut rx).await;
+        let eth = EthView::parse(&f).expect("eth parses");
+        if eth.ethertype() != ETHERTYPE_IPV4 {
+            continue;
+        }
+        let ip = Ipv4View::parse(eth.payload()).expect("ipv4 parses");
+        if ip.proto() != IPPROTO_TCP {
+            continue;
+        }
+        let t = TcpView::parse(ip.payload()).expect("tcp parses");
+        if t.flags() & (TCP_SYN | TCP_ACK) == TCP_SYN {
+            break eth.dst_mac();
+        }
+    };
+    open.abort();
+    assert_eq!(
+        syn_dst, GUEST_MAC,
+        "the forward's SYN goes to the bound MAC, not the last MAC seen"
+    );
 }

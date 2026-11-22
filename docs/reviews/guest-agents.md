@@ -204,6 +204,18 @@ Not read:
   answers an open and sends 300 KiB on that channel while the test does not
   call `recv`. Assert that the session ends with an error that names the
   window, and that no more than `INITIAL_WINDOW` bytes sit in the queue.
+- Fixed in card #484. The host now counts the credit it granted on each
+  channel (`RecvCredit` in `src/labd/vm_agent.rs`): the reader takes from it
+  for every data frame, and the consumer adds each `window_adjust` before it
+  sends it. A frame past the credit is dropped, the reader closes that one
+  channel and tells the agent, and the consumer reads an error that names
+  the window after what was queued. The connection and the other channels
+  stay. The queue of one channel therefore holds at most `INITIAL_WINDOW`
+  bytes. The test `a_guest_that_ignores_its_credit_loses_the_channel` failed
+  before the fix (the host kept the channel) and passes after it. The mock
+  agent of the tests in that file now sends its data under the credit too.
+  Not fixed here: the 10 s wait of F5 (fixed in card #506), and a queue of
+  2048 small frames inside the window.
 
 ### F5. One channel with a slow consumer stops the host reader for 10 seconds
 
@@ -229,6 +241,27 @@ Not read:
   channels, sends more than `SESSION_QUEUE` frames on the first while the
   test does not read it, and answers pings. Assert that `ping(2 s)` returns
   true while the first channel is full.
+- Fixed in card #506. The reader task no longer waits on a session. The
+  queue of one channel is now `SessionQueue` in `src/labd/vm_agent.rs`, and
+  `deliver` puts an event into it without a wait. Up to `SESSION_QUEUE`
+  events each frame is its own event. At that depth the payload of a frame
+  joins the last queued event of the same stream (stdout or stderr), which
+  the receive window of F4 bounds in bytes, so a consumer that is behind
+  loses nothing: every consumer reads a channel as a byte stream. An event
+  that cannot join (stdout and stderr in turn past the depth, for example)
+  closes that one channel at once, and its consumer reads an error that
+  names the queue after what was queued. One `Eof` and the event that ends
+  a session are always taken, so a command that ends while its consumer is
+  behind keeps its exit code. The `close` frame the reader sends for a channel it ended is
+  written by a task of its own with a 10 s limit on the writer lock and the
+  write, so a guest that does not read cannot hold the reader there. A write
+  cut off inside the frame marks the connection as over, as a ping does. The
+  tests `a_full_session_queue_does_not_delay_a_pong` and
+  `a_channel_that_overfills_its_queue_is_closed_without_a_wait` failed
+  before the fix (the ping got no pong in 2 s) and pass after it. Not fixed
+  here: `expose_terminal_socket` still does not read terminal output while
+  it waits for guest credit, which now costs only that terminal. The bounded
+  `close` write has no test of its own.
 
 ### F6. A full input queue of one session blocks the whole guest agent
 
@@ -259,6 +292,17 @@ Not read:
   From a second thread call `route_input(9, …)` 600 times with one byte
   each, then `handle_msg(Ping)`. Assert that the pong arrives within one
   second.
+- Fixed in card #507. A session's input queue is now bounded by the bytes
+  it holds, the unit the window counts in, and `route_input` never waits on
+  it. Small frames are joined in the queue, so a full window of one-byte
+  frames costs a window of memory. A host that respects its window cannot
+  fill the queue. A host that sends past it loses that channel with an
+  error, which is what the host does to a guest in the other direction
+  (F4, card #484). The test failed before the fix (the reader blocked at
+  frame 513 and no pong came within one second) and passes after it. The
+  second stage in `fileops.rs` (`WORK_QUEUE`) still blocks, but only the
+  session's own `read_loop` thread: its unread bytes wait in the input
+  queue and the reader thread goes on.
 
 ### F7. A pull trusts the size in the guest's `stat`, so a guest can fill the host disk
 

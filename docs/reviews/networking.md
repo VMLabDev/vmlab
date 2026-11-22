@@ -34,8 +34,8 @@ Who the attacker is, per finding:
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache (fixed in card #485) |
 | F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet (fixed in card #485) |
-| F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease |
-| F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards |
+| F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease (fixed in card #501) |
+| F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards (fixed in card #502) |
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
 | F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again |
@@ -306,25 +306,29 @@ Who the attacker is, per finding:
   any unknown destination. A frame from a port that is gone teaches nothing
   now. The gateway remembers 1 024 neighbours (`MAX_NEIGHBOURS` in
   `src/net/gateway.rs`) and asks again with ARP for one it dropped. The NAT
-  engine keeps a MAC for 1 024 guest addresses (`MAX_GUEST_MACS` in
-  `src/net/nat/mod.rs`). Only a flow the engine opens toward a guest reads
-  that table, and it broadcasts when the entry is gone. The probe cache
+  engine keeps the MAC it saw for 1 024 guest addresses (`MAX_GUEST_MACS`
+  in `src/net/nat/mod.rs`). The addresses the lab daemon binds (F9) are held
+  apart from those and are not counted, so a flood of source addresses
+  cannot drop a binding. Only a flow the engine opens toward a guest reads
+  either table, and it broadcasts when the address is in neither. The probe cache
   holds 1 024 results (`MAX_CACHED` in `src/net/nat/icmp.rs`). DHCP
   quarantines 1 024 declined addresses (`MAX_DECLINED` in
-  `src/net/dhcp.rs`) and none outside the subnet's host addresses, which it
-  could not hand out anyway. The four address tables share one type,
-  `BoundedMap` in `src/net/bounded.rs`. The proof tests failed before the
+  `src/net/dhcp.rs`). Since F8 a client declines only the address it holds,
+  but it can take a new lease and decline that one too, so the limit is
+  still needed. A decline past it replaces the quarantine that ends first.
+  The gateway, NAT and probe tables share one type, `BoundedMap` in
+  `src/net/bounded.rs`. The proof tests failed before the
   fix and pass after it: `the_mac_table_is_bounded` in `src/net/switch.rs`
   (100 001 MACs before), `the_neighbour_table_is_bounded` in
   `src/net/gateway.rs` (100 000), `guest_macs_are_bounded` and
   `the_ping_cache_is_bounded` in `src/net/nat/tests.rs` (100 000 and
-  5 000), and `the_declined_set_is_bounded` in `src/net/dhcp.rs` (100 000).
-  Not changed: the four address tables have no share per guest, so a guest
+  5 000), and `the_declined_set_is_bounded` in `src/net/dhcp.rs` (100 000 before
+  F8 was fixed, and 5 000 on the code of F8 without the limit, where one
+  client takes and declines 5 000 addresses in turn).
+  Not changed: the address tables have no share per guest, so a guest
   that floods one pushes out the entries of the others, which each owner
-  puts back with its next frame. A decline still quarantines for the
-  daemon's life and is still believed from any `chaddr` (F8). A /24 has 253
-  addresses a client can hold, so only a larger subnet reaches the limit of
-  1 024.
+  puts back with its next frame. A /24 has 253 addresses a client can hold,
+  so only a larger subnet reaches the DHCP limit of 1 024.
 
 ### F7. The redirect connection table: no limit, full scan per packet (security, guest)
 
@@ -397,6 +401,21 @@ Who the attacker is, per finding:
   source MAC in the `handle` call, so it is a gateway test in
   `src/net/gateway.rs`: lease as MAC A, send a RELEASE with `chaddr` A in a
   frame whose ethernet source is B, assert `dhcp_leases()` still holds A.
+- Fixed in card #501, in `src/net/dhcp.rs`. `handle` ignores a message whose
+  `chaddr` is not the ethernet source of its frame, so a guest speaks for its
+  own NIC only (the segments have no relay agent). A DECLINE quarantines only
+  the address its client holds: one with no lease, or one that names another
+  address, changes nothing. A quarantine ends after one lease time, so the
+  set is no larger than the leases of one lease time. An OFFER holds its
+  address for 60 seconds (`OFFER_HOLD`) and the full lease starts at the ACK.
+  The client is still told the full lease time in the OFFER. Five proof tests
+  failed before the fix and pass after it: the two named above,
+  `a_decline_of_an_address_the_client_does_not_hold_quarantines_nothing`,
+  `a_message_that_speaks_for_another_mac_is_ignored` and
+  `an_offer_holds_its_address_briefly_until_the_request`.
+  - Not fixed here: a guest that also forges the ethernet source of its
+    frames still speaks for that MAC, and can still take one address per
+    forged MAC with a DISCOVER and a REQUEST. Binding a port to its MAC is F9.
 
 ### F9. No port is bound to its MAC or IP (security, guest)
 
@@ -435,6 +454,32 @@ Who the attacker is, per finding:
   `handle_frame` with a frame from `attacker_mac` with source `victim_ip`,
   then `open_tcp_to_guest(victim_ip, 22)`. Assert the SYN's destination MAC
   is `victim_mac`. Today it is `attacker_mac`.
+- Fixed in card #502, in three places, each with the knowledge vmlab already
+  had.
+  1. The switch drops a guest port's frame whose source MAC a service port
+     holds, and leaves the MAC where it is. `Gateway::spawn` binds the
+     gateway MAC to its port with `Switch::bind_mac` before any frame, so a
+     guest cannot claim it first. A MAC learned behind a trunk is held the
+     same way. A MAC still moves between two guest ports and between two
+     service ports.
+  2. The NAT engine keeps the address the lab daemon bound with `learn_mac`
+     (the MAC of the NIC that holds the lease, set when a forward is
+     installed): a frame from another MAC no longer changes where a forward's
+     SYN goes. An address nobody bound is still learned from frames.
+  3. The gateway drops an ARP or an IPv4 frame whose source address is under
+     a DHCP lease of another MAC (`DhcpServer::leased_to_another`), before
+     the neighbour table, DNS, NAT and routing see it.
+  Both proof tests failed before the change and pass after it, with
+  `a_bound_mac_is_held_before_its_port_speaks` in `src/net/switch.rs` and
+  `an_arp_cannot_claim_a_leased_address` and
+  `a_leased_source_address_needs_its_holders_mac` in `src/net/gateway.rs`.
+  Not covered: an address with no lease and no forward (a static one) has no
+  owner vmlab knows, so the last frame or ARP still wins for it. Two guests on
+  non-isolated ports can still take each other's MAC in the switch, because a
+  MAC that moves between guest ports is also what a restarted machine and a
+  failover address do. The lease check is only as strong as the lease, which
+  the fix of F8 in card #501 now ties to the ethernet source of the DHCP
+  message.
 
 ### F10. IP fragments evade port rules on routed traffic (security, guest)
 
