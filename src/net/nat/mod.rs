@@ -325,7 +325,12 @@ impl NatEngine {
             }
             return;
         }
-        let opens = seg.is_syn() && !seg.is_ack();
+        // A SYN to the gateway's own address never opens a flow (review
+        // F18). The host does not own that address, so a connect to it
+        // would leave by the host's default route. What the gateway serves
+        // over TCP is a flow the engine opened itself, found above, or a
+        // `redirect` rewritten to another address before it gets here.
+        let opens = seg.is_syn() && !seg.is_ack() && key.dst_ip != self.cfg.gw_ip;
         if opens && !self.refused(key.dst_ip, guard::FlowKind::Tcp { port: key.dst_port }) {
             let Some(slot) = self.claim_passive_tcp(key.guest_ip) else {
                 // Dropped, not reset: the guest's SYN retransmission finds
@@ -338,8 +343,9 @@ impl NatEngine {
             self.tcp_flows.lock_recover().insert(key, tx);
             vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx, slot);
         } else if !seg.is_rst() {
-            // Anything unexpected for an unknown flow, or a SYN to a host
-            // address the engine refuses: reset it.
+            // Anything unexpected for an unknown flow, or a SYN to the
+            // gateway address or a host address the engine refuses: reset
+            // it.
             if let Some(rst) = vtcp::rst_for(ip, &tcp, self.next_ip_id()) {
                 self.send_frame(src_mac, &rst).await;
             }

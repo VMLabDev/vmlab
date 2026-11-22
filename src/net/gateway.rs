@@ -494,7 +494,9 @@ impl GatewayTask {
             // ICMP echo to the gateway itself is answered here. Other
             // gateway-addressed traffic falls through to the uplink: TCP
             // replies to engine-originated flows (port forwards, §9.8) and
-            // gateway-terminated services land in the NAT engine.
+            // gateway-terminated services land in the NAT engine, which
+            // resets a SYN to this address that belongs to neither
+            // (review F18).
             if ip.proto() == IPPROTO_ICMP {
                 if let Some(reply) = icmp_echo_reply_for(eth.payload()) {
                     self.send(eth_build(
