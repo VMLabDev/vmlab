@@ -245,9 +245,16 @@ impl VmDirs {
         self.local.join("tpm-state")
     }
     /// What each offline snapshot holds beside the disks (§7.3): one
-    /// directory per snapshot, see [`super::snapshot_state`].
+    /// directory per snapshot.
     pub fn snapshot_state(&self) -> PathBuf {
         self.local.join("snapshot-state")
+    }
+    fn firmware_state(&self) -> super::snapshot_state::FirmwareState {
+        super::snapshot_state::FirmwareState::new(
+            self.snapshot_state(),
+            self.ovmf_vars(),
+            self.tpm_state(),
+        )
     }
     /// The TSC frequency a `tsc = "host"` VM was pinned at, at its first KVM
     /// start (§5.2) — kept beside its disk, because an online snapshot only
@@ -1866,9 +1873,10 @@ impl VmInstance {
             }
             PowerState::Stopped => {
                 let disks = self.all_disk_paths();
+                let state = self.dirs.firmware_state();
                 let name = name.to_owned();
                 super::machine::finish_offline_snapshot(guard, async move {
-                    snapshot_offline_disks(&disks, &name).await
+                    capture_offline(&disks, &state, &name).await
                 })
                 .await
                 .map_err(Attempted)?;
@@ -1932,7 +1940,8 @@ impl VmInstance {
             let vm = Arc::clone(self);
             let name = name.to_owned();
             super::machine::finish_offline_snapshot(guard, async move {
-                restore_offline_disks(&vm.all_disk_paths(), &name, async {
+                let state = vm.dirs.firmware_state();
+                restore_offline(&vm.all_disk_paths(), &state, &name, async {
                     if vm.power_state().await != PowerState::Stopped {
                         vm.stop_ladder(false).await?;
                         vm.settle_stopped(Duration::from_secs(60))
@@ -1958,9 +1967,13 @@ impl VmInstance {
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
                 snapshots.delete(name, &refs).await?;
+                // An offline snapshot can be deleted while the VM runs. What
+                // it held beside the disks is not in use by the emulator.
+                self.dirs.firmware_state().delete(name)?;
             }
             PowerState::Stopped => {
                 let disks = self.all_disk_paths();
+                let state = self.dirs.firmware_state();
                 let name = name.to_owned();
                 super::machine::finish_offline_snapshot(guard, async move {
                     for disk in disks {
@@ -1976,7 +1989,7 @@ impl VmInstance {
                             crate::template::qimg::snapshot_delete(&disk, &name).await?;
                         }
                     }
-                    Ok(())
+                    state.delete(&name)
                 })
                 .await?;
             }
@@ -2700,6 +2713,63 @@ pub(super) fn tail_file(path: &Path, lines: usize) -> Result<String> {
 
 fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
+}
+
+/// An offline capture (§7.3): the disks, and beside them the UEFI variable
+/// store and the TPM state as they are now. The firmware state is copied
+/// before any disk changes and named only after every disk took the snapshot,
+/// so a failure on either side leaves no half of one.
+async fn capture_offline(
+    disks: &[PathBuf],
+    state: &super::snapshot_state::FirmwareState,
+    name: &str,
+) -> Result<()> {
+    let staged = state.stage_capture()?;
+    if let Err(error) = snapshot_offline_disks(disks, name).await {
+        state.discard_capture(&staged);
+        return Err(error);
+    }
+    if let Err(error) = state.commit_capture(&staged, name) {
+        state.discard_capture(&staged);
+        let mut failures = Vec::new();
+        for disk in disks.iter().rev() {
+            if let Err(rollback) = crate::template::qimg::snapshot_delete(disk, name).await {
+                failures.push(format!("{}: {rollback}", disk.display()));
+            }
+        }
+        return Err(error.context(format!(
+            "offline snapshot failed, rollback errors: {failures:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// An offline restore (§7.3): the disks, then the firmware state the capture
+/// kept with them. The copies are made before the VM stops and before any
+/// disk is rewound, and are renamed into place only once every disk is at the
+/// snapshot. A snapshot that holds no firmware state leaves the VM's alone.
+async fn restore_offline(
+    disks: &[PathBuf],
+    state: &super::snapshot_state::FirmwareState,
+    name: &str,
+    stop: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    let staged = state.stage_restore(name)?;
+    if let Err(error) = restore_offline_disks(disks, name, stop).await {
+        if let Some(staged) = staged {
+            state.discard_restore(staged);
+        }
+        return Err(error);
+    }
+    match staged {
+        Some(staged) => state.commit_restore(staged).with_context(|| {
+            format!(
+                "the disks are at snapshot {name:?} but its UEFI variables and TPM state \
+                 were not put back; restore it again"
+            )
+        }),
+        None => Ok(()),
+    }
 }
 
 async fn restore_offline_disks(
