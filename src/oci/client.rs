@@ -2793,14 +2793,7 @@ mod tests {
         m.version = version.into();
         make_template(&tdir, &m, disk);
         registry_with_fake(reference, fake.clone())
-            .push(
-                &tdir,
-                1024,
-                "x86_64",
-                &work.path().join("push"),
-                None,
-                None,
-            )
+            .push(&tdir, 1024, "x86_64", &work.path().join("push"), None, None)
             .await
             .unwrap();
     }
@@ -2817,7 +2810,14 @@ mod tests {
         let want = VariantWant::default();
         let good = "localhost:5000/good/ubuntu:24.04";
 
-        push_stating(&fake, "localhost:5000/evil/x:1", "ubuntu", "24.04.9", b"evil").await;
+        push_stating(
+            &fake,
+            "localhost:5000/evil/x:1",
+            "ubuntu",
+            "24.04.9",
+            b"evil",
+        )
+        .await;
         let (pulled, _) = pull_want(&fake, "localhost:5000/evil/x:1", &store, &want)
             .await
             .unwrap();
@@ -2882,8 +2882,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("pulled from ghcr.io/evil/alpine"), "{err}");
-        let held = store.installed("x86_64", "alpine", "3.20").unwrap().unwrap();
-        assert_eq!(held.meta.pulled_from.as_deref(), Some("ghcr.io/evil/alpine"));
+        let held = store
+            .installed("x86_64", "alpine", "3.20")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.meta.pulled_from.as_deref(),
+            Some("ghcr.io/evil/alpine")
+        );
     }
 
     #[tokio::test]
