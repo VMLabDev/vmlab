@@ -348,6 +348,19 @@ pub fn convert(
     backing_format: Option<&str>,
 ) -> Result<()> {
     if dest.exists() {
+        // The destination is replaced, so it must not be an image this
+        // convert reads: the source, the `backing` argument, or a file of
+        // either backing chain, under any name (review vmlab-disk F11).
+        for input in std::iter::once(src).chain(backing) {
+            if let Some(used) = chain_file_same_as(input, dest) {
+                return Err(Error::Unsupported(format!(
+                    "convert destination {} is {}, an image the convert reads; \
+                     nothing was changed",
+                    dest.display(),
+                    used.display()
+                )));
+            }
+        }
         std::fs::remove_file(dest)?;
     }
     let backing_ref = backing.map(|b| (b, backing_format));
@@ -386,6 +399,47 @@ pub fn convert(
                 dest_img.flush()
             }
         },
+    }
+}
+
+/// The first file of `image`'s backing chain (the image itself first) that
+/// is the same file as `target`, by any name. The walk reads headers only
+/// and stops at the first file it cannot read: `convert` reports that error
+/// itself when it opens the chain.
+fn chain_file_same_as(image: &Path, target: &Path) -> Option<PathBuf> {
+    // A chain longer than this is a loop, which the open refuses.
+    const MAX_DEPTH: usize = 1024;
+    let mut cursor = Some(image.to_path_buf());
+    for _ in 0..MAX_DEPTH {
+        let path = cursor?;
+        if same_file(&path, target) {
+            return Some(path);
+        }
+        cursor = match probe_format(&path) {
+            Ok(Format::Qcow2) => Qcow2Image::open_header(&path)
+                .ok()
+                .and_then(|img| img.backing_file_path()),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Whether two paths name one file, through links of either kind.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 

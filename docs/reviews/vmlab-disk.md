@@ -340,6 +340,16 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 - Proof: unit test in `ops.rs`, `convert_onto_the_source_is_refused`: after
   the call the source still exists and reads the same data. Today the file is
   gone.
+- Fixed in card #543. `convert` refuses, before it removes anything, a
+  destination that is the same file (device and inode, so under any name) as
+  the source, as the `backing` argument, or as a file of either backing
+  chain. The proof test failed before the fix (`the source was deleted`) and
+  passes after it, with `convert_onto_a_second_name_of_the_source_is_refused`
+  and `convert_onto_a_backing_file_is_refused` beside it. A hard link or a
+  symlink to the source is refused too, although replacing that name alone
+  loses no data.
+  - Not fixed here: `convert` still writes the image in place, so an
+    interrupted convert leaves a part of an image at the destination path.
 
 ## Notes
 
