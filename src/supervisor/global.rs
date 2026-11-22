@@ -1024,6 +1024,50 @@ mod tests {
         panic!("segment {name} never reached peer_connected={want}");
     }
 
+    /// A segment name from a trunk peer names a socket file under `sock_dir`:
+    /// one that leaves the directory is refused before anything is unlinked
+    /// (docs/reviews/networking.md F1).
+    #[tokio::test]
+    async fn a_peer_cannot_name_a_segment_outside_the_socket_directory() {
+        use tokio::io::AsyncReadExt;
+        let i = instance("k").await;
+        let victim = i._dir.path().join("victim.sock");
+        let absolute = i._dir.path().join("absolute.sock");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::fs::write(&absolute, b"victim").unwrap();
+        let absolute_name = absolute.with_extension("");
+        for name in ["../victim", absolute_name.to_str().unwrap(), "..", "a/b"] {
+            let mut s = tokio::net::TcpStream::connect(i.addr).await.unwrap();
+            crate::supervisor::trunk_auth::client(&mut s, name, "k")
+                .await
+                .unwrap();
+            let mut answer = [0u8; 3];
+            timeout(Duration::from_secs(10), s.read_exact(&mut answer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(&answer, b"OK\n", "the peer's name {name:?} was accepted");
+            assert!(
+                i.globals
+                    .attach(name, None, None, None)
+                    .await
+                    .is_err(),
+                "attach took {name:?}"
+            );
+        }
+        // An accepted trunk is attached after the answer: give a wrong one
+        // the time to reach the file.
+        sleep(Duration::from_millis(200)).await;
+        for file in [&victim, &absolute] {
+            assert!(
+                std::fs::symlink_metadata(file).unwrap().file_type().is_file(),
+                "{} was replaced",
+                file.display()
+            );
+        }
+        assert!(i.globals.list().await.is_empty());
+    }
+
     #[tokio::test]
     async fn two_instances_bridge_and_reconnect() {
         let mut a = instance("s3kr1t").await;
