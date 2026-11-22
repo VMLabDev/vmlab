@@ -409,6 +409,13 @@ impl Registry {
 
         // 1 + 2. Chunk, compress and upload the base.
         let set = chunking::chunk_and_compress(&disk, chunk_size, &work_dir.join("chunks"))?;
+        // The disk is published under the digest it has now, and the config
+        // blob carries the one the store recorded: a consumer verifies the
+        // first and records the second, so they must be the same.
+        let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+        if let Some(recorded) = &meta.sha256 {
+            ensure_recorded(&reference, recorded, &set.whole_digest)?;
+        }
         report.base = self.upload_chunks(&repo, &set).await?;
 
         // 3. The variants, each a manifest of its own.
@@ -429,6 +436,11 @@ impl Registry {
                 &overlay,
                 chunk_size,
                 &work_dir.join("variants").join(&v.name),
+            )?;
+            ensure_recorded(
+                &format!("{reference}#{}", v.name),
+                &v.sha256,
+                &vset.whole_digest,
             )?;
             let uploaded = self.upload_chunks(&repo, &vset).await?;
             let config = self
@@ -777,6 +789,18 @@ impl Registry {
             .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
             .to_string();
         let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+        // The manifest's digest is what the disk is verified against, and the
+        // config blob's is what the store would record: one that differs
+        // would leave a version whose metadata names a digest its disk does
+        // not have.
+        if let Some(recorded) = &meta.sha256 {
+            ensure!(
+                digest_eq(recorded, &whole),
+                "{}'s config blob records the disk digest {recorded} but its manifest names \
+                 {whole} — the template was pushed inconsistently; refusing to pull",
+                self.reference.canonical()
+            );
+        }
         let (listed, default) = manifest.variants()?;
         for entry in &listed {
             crate::template::trust::component(&entry.name)?;
@@ -1010,14 +1034,14 @@ impl Registry {
                     }
                     chunking::verify_whole(&disk, &whole)?;
                     let mut meta = meta;
-                    if meta.sha256.is_none() {
-                        meta.sha256 = Some(
-                            whole
-                                .strip_prefix("sha256:")
-                                .unwrap_or(&whole)
-                                .to_ascii_lowercase(),
-                        );
-                    }
+                    // What the disk was just verified against, whatever
+                    // spelling the config blob gave it.
+                    meta.sha256 = Some(
+                        whole
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&whole)
+                            .to_ascii_lowercase(),
+                    );
                     meta.variants = variants;
                     store.install_with_variants(&staging, &meta, overwrite)?;
                     Ok(meta)
@@ -1267,6 +1291,18 @@ impl<'a> Download<'a> {
             bytes_total: self.bytes_total,
         });
     }
+}
+
+/// Refuse to push `what` when its disk hashes to `actual` and the store's
+/// metadata records `recorded`: the stored file is not the one that was
+/// built or pulled.
+fn ensure_recorded(what: &str, recorded: &str, actual: &str) -> Result<()> {
+    ensure!(
+        digest_eq(recorded, actual),
+        "{what} records the digest {recorded} but its disk hashes to {actual} — the stored \
+         disk is damaged or was changed outside vmlab; rebuild or pull it again before pushing"
+    );
+    Ok(())
 }
 
 /// Two `sha256` digests, either maybe `sha256:`-prefixed, compared without
