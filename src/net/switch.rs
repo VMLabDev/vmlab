@@ -7,7 +7,7 @@
 //! enforcement.
 
 use crate::sync::LockRecover;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,6 +108,26 @@ struct PortEntry {
     class: PortClass,
     tx: PortTx,
     config: PortConfig,
+    /// The MACs learned on this port, oldest first, at most the port's
+    /// limit ([`mac_limit`]). A MAC that moved to another port stays here
+    /// until it is the oldest.
+    learned: VecDeque<MacAddr>,
+}
+
+/// How many source MACs the switch remembers on one guest port (review F6).
+/// A guest writes the source MAC of its frames, so past this a new one
+/// replaces the oldest learned on that port. A frame for a MAC the switch
+/// no longer remembers is flooded, as for any unknown destination.
+const MAX_MACS_PER_GUEST_PORT: usize = 256;
+/// The same for a service port. A trunk is one: it carries every MAC of the
+/// segment's far side.
+const MAX_MACS_PER_SERVICE_PORT: usize = 4096;
+
+fn mac_limit(class: &PortClass) -> usize {
+    match class {
+        PortClass::Guest { .. } => MAX_MACS_PER_GUEST_PORT,
+        PortClass::Service => MAX_MACS_PER_SERVICE_PORT,
+    }
 }
 
 enum PortTx {
@@ -130,10 +150,6 @@ impl Default for PortConfig {
         }
     }
 }
-
-/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
-#[allow(dead_code)]
-const MAX_MACS_PER_GUEST_PORT: usize = 256;
 
 #[derive(Default)]
 struct Inner {
@@ -326,6 +342,7 @@ impl Switch {
                     framing: FramingMode::Raw,
                     mtu,
                 },
+                learned: VecDeque::new(),
             },
         );
 
@@ -431,6 +448,7 @@ impl Switch {
                 class,
                 tx: PortTx::Packets(tx),
                 config,
+                learned: VecDeque::new(),
             },
         );
         rx
@@ -544,11 +562,29 @@ impl Switch {
         // new port when that port is offloaded, otherwise deleting any stale
         // kernel entry (BPF map updates are ~1µs non-blocking syscalls;
         // deferring them would open learn/unlearn ordering races).
-        if !is_multicast(&src) {
-            let prev = inner.macs.insert(src, port);
-            if prev != Some(port)
-                && let Some(off) = &self.offload
-            {
+        // A port holds a limited number of MACs: past it the oldest one
+        // learned on the port is forgotten, here and in the kernel. A frame
+        // from a port that is gone teaches nothing.
+        if !is_multicast(&src)
+            && inner.macs.get(&src) != Some(&port)
+            && let Some(entry) = inner.ports.get_mut(&port)
+        {
+            let limit = mac_limit(&entry.class);
+            while entry.learned.len() >= limit {
+                let Some(oldest) = entry.learned.pop_front() else {
+                    break;
+                };
+                // Not a MAC that has moved to another port since.
+                if inner.macs.get(&oldest) == Some(&port) {
+                    inner.macs.remove(&oldest);
+                    if let Some(off) = &self.offload {
+                        off.forget(oldest);
+                    }
+                }
+            }
+            entry.learned.push_back(src);
+            inner.macs.insert(src, port);
+            if let Some(off) = &self.offload {
                 off.relearn(src, port);
             }
         }

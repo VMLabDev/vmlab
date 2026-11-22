@@ -85,6 +85,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::frame::{
     self, ETHERTYPE_IPV4, EthView, ICMP_ECHO_REQUEST, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP,
     IcmpView, Ipv4View, MAC_BROADCAST, TcpView, UdpView,
@@ -136,8 +137,9 @@ pub struct NatEngine {
     /// Engine-bound UDP flows for [`Self::udp_bind_guest_flow`], keyed
     /// (guest_ip, guest_port, gw_port); the value receives guest payloads.
     guest_udp: StdMutex<HashMap<GuestUdpKey, mpsc::Sender<Vec<u8>>>>,
-    /// Learned guest IP → MAC mappings.
-    macs: StdMutex<HashMap<Ipv4Addr, MacAddr>>,
+    /// Learned guest IP → MAC mappings: one entry per source address, which
+    /// a guest writes freely, so the table holds [`MAX_GUEST_MACS`].
+    macs: StdMutex<BoundedMap<Ipv4Addr, MacAddr>>,
     icmp: icmp::IcmpState,
     pinger: Arc<dyn Pinger>,
     /// What of the host a new flow may not reach: the segment's guard, or
@@ -180,8 +182,10 @@ impl Drop for PassiveSlot {
 }
 
 /// The ephemeral range 49152..=65535.
-/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
-#[allow(dead_code)]
+/// How many guest addresses the engine keeps a MAC for (review F6). Past
+/// this a new one replaces the oldest. A flow a guest opens carries the
+/// MAC of its own frames. Only a flow the engine opens toward a guest (a
+/// port forward) reads this table, and it broadcasts when the entry is gone.
 pub(super) const MAX_GUEST_MACS: usize = 1024;
 
 const EPHEMERAL_BASE: u16 = 49152;
@@ -206,7 +210,7 @@ impl NatEngine {
             tcp_passive: StdMutex::new(HashMap::new()),
             udp_flows: StdMutex::new(HashMap::new()),
             guest_udp: StdMutex::new(HashMap::new()),
-            macs: StdMutex::new(HashMap::new()),
+            macs: StdMutex::new(BoundedMap::new(MAX_GUEST_MACS)),
             icmp: icmp::IcmpState::new(),
             pinger,
             guard: std::sync::OnceLock::new(),

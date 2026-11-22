@@ -53,11 +53,16 @@ use crate::net::frame::{
 
 /// Idle expiry for redirect translation (return-path) entries.
 const CONN_IDLE: Duration = Duration::from_secs(300);
-/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
-#[allow(dead_code)]
+/// How often `eval` drops idle entries from the translation table. Not on
+/// every packet: the walk is over the whole table (review F7).
+const CONN_SWEEP: Duration = Duration::from_secs(1);
+/// How many translation entries the table holds (review F7). A guest picks
+/// the source address and port an entry is keyed on. Past the limit a new
+/// connection replaces the entry idle the longest.
 const MAX_CONNS: usize = 4096;
-/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
-#[allow(dead_code)]
+/// How many of [`MAX_CONNS`] one guest address may hold, so that one guest
+/// cannot push out the connections of the others. Past it a new connection
+/// of that guest replaces its own entry idle the longest.
 const MAX_CONNS_PER_GUEST: usize = 1024;
 
 // ---------------------------------------------------------------------------
@@ -230,7 +235,61 @@ pub struct RuleSet {
     next_id: u64,
     redirects: Vec<(RuleId, RedirectRule)>,
     blocks: Vec<(RuleId, BlockRule)>,
-    conns: Mutex<HashMap<ConnKey, RevVal>>,
+    conns: Mutex<Conns>,
+}
+
+/// The redirect translation table: reply-direction key to what the reply's
+/// source is rewritten back to. In a key, `dst` is the guest.
+#[derive(Default)]
+struct Conns {
+    table: HashMap<ConnKey, RevVal>,
+    /// When idle entries were last dropped.
+    swept: Option<Instant>,
+}
+
+impl Conns {
+    /// Drop idle entries, at most once per [`CONN_SWEEP`].
+    fn sweep(&mut self, now: Instant) {
+        if self
+            .swept
+            .is_some_and(|at| now.duration_since(at) < CONN_SWEEP)
+        {
+            return;
+        }
+        self.swept = Some(now);
+        self.table
+            .retain(|_, v| now.duration_since(v.last) < CONN_IDLE);
+    }
+
+    /// Track a connection. A new one at the guest's limit replaces that
+    /// guest's entry idle the longest, and in a full table the entry idle
+    /// the longest of all. The walk this takes is over at most
+    /// [`MAX_CONNS`] entries, and only a new connection pays it.
+    fn track(&mut self, key: ConnKey, val: RevVal) {
+        if let Some(held) = self.table.get_mut(&key) {
+            *held = val;
+            return;
+        }
+        let of_guest = self.table.keys().filter(|k| k.dst == key.dst).count();
+        let only = if of_guest >= MAX_CONNS_PER_GUEST {
+            Some(key.dst)
+        } else if self.table.len() >= MAX_CONNS {
+            None
+        } else {
+            self.table.insert(key, val);
+            return;
+        };
+        let oldest = self
+            .table
+            .iter()
+            .filter(|(k, _)| only.is_none_or(|g| k.dst == g))
+            .min_by_key(|(_, v)| v.last)
+            .map(|(k, _)| *k);
+        if let Some(oldest) = oldest {
+            self.table.remove(&oldest);
+        }
+        self.table.insert(key, val);
+    }
 }
 
 impl RuleSet {
@@ -313,7 +372,7 @@ impl RuleSet {
         let Some(ip) = Ipv4View::parse(ipv4_packet) else {
             return Verdict::Pass;
         };
-        self.expire_conns();
+        self.conns.lock_recover().sweep(Instant::now());
         let meta = Meta::of(&ip);
 
         // A fragment's port is unknown: one that a port rule could cover is
@@ -347,7 +406,7 @@ impl RuleSet {
                     orig_port: meta.dst_port,
                     last: Instant::now(),
                 };
-                self.conns.lock_recover().insert(key, val);
+                self.conns.lock_recover().track(key, val);
             }
             if let Some(out) = rewrite_packet(ipv4_packet, &ip, None, Some((new_ip, new_port))) {
                 return Verdict::Rewrite(out);
@@ -385,7 +444,7 @@ impl RuleSet {
         };
         let rev = {
             let mut conns = self.conns.lock_recover();
-            match conns.get_mut(&key) {
+            match conns.table.get_mut(&key) {
                 Some(v) if v.last.elapsed() < CONN_IDLE => {
                     v.last = Instant::now();
                     Some(*v)
@@ -419,20 +478,15 @@ impl RuleSet {
     /// Number of live translation entries (diagnostics; asserted by tests).
     #[allow(dead_code)]
     pub fn conn_count(&self) -> usize {
-        self.conns.lock_recover().len()
-    }
-
-    fn expire_conns(&self) {
-        self.expire_conns_older_than(CONN_IDLE);
+        self.conns.lock_recover().table.len()
     }
 
     /// Expiry with an explicit idle threshold, so tests can drain the table
     /// without waiting out the real `CONN_IDLE`.
+    #[cfg(test)]
     fn expire_conns_older_than(&self, idle: Duration) {
         let mut conns = self.conns.lock_recover();
-        if !conns.is_empty() {
-            conns.retain(|_, v| v.last.elapsed() < idle);
-        }
+        conns.table.retain(|_, v| v.last.elapsed() < idle);
     }
 
     /// Whether a rule with a port covers the destination address and

@@ -28,6 +28,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::debug;
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::dhcp::{DHCP_SERVER_PORT, DhcpConfig, DhcpServer};
 use crate::net::dns::{DNS_PORT, DnsAction, DnsServer, DnsZone, forward_upstream};
 use crate::net::frame::{
@@ -51,8 +52,9 @@ const ARP_RETRY: Duration = Duration::from_secs(1);
 /// Bounds on what waits for ARP: packets per next hop, and next hops.
 const ARP_PENDING_PACKETS: usize = 16;
 const ARP_PENDING_HOSTS: usize = 256;
-/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
-#[allow(dead_code)]
+/// How many neighbours the gateway remembers (review F6). Past this a new
+/// one replaces the oldest, which the gateway asks for again with ARP when
+/// a routed packet next needs it.
 const MAX_NEIGHBOURS: usize = 1024;
 
 /// Uplink handler: receives every frame the gateway routes off-segment.
@@ -253,10 +255,20 @@ impl L3Port {
 
 /// What the gateway knows of its segment's hosts, and the routed packets
 /// waiting for one of them to answer ARP.
-#[derive(Default)]
 struct Neighbours {
-    table: HashMap<Ipv4Addr, MacAddr>,
+    /// One entry per ARP sender address, which a guest writes freely, so
+    /// the table holds [`MAX_NEIGHBOURS`] (review F6).
+    table: BoundedMap<Ipv4Addr, MacAddr>,
     pending: HashMap<Ipv4Addr, Pending>,
+}
+
+impl Default for Neighbours {
+    fn default() -> Self {
+        Self {
+            table: BoundedMap::new(MAX_NEIGHBOURS),
+            pending: HashMap::new(),
+        }
+    }
 }
 
 struct Pending {

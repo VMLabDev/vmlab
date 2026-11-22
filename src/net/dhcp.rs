@@ -19,6 +19,7 @@ use ipnet::Ipv4Net;
 use tracing::{debug, warn};
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::frame::{
     ETHERTYPE_IPV4, EthView, IPPROTO_UDP, Ipv4View, MAC_BROADCAST, UdpView, eth_build, ipv4_build,
     udp_build,
@@ -42,8 +43,10 @@ const BOOTREPLY: u8 = 2;
 const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 /// BOOTP fixed header (236 bytes) plus the magic cookie (4 bytes).
 const BOOTP_MIN_LEN: usize = 240;
-/// A limit the proof tests of review F6 and F7 name. Nothing holds to it yet.
-#[allow(dead_code)]
+
+/// How many declined addresses stay quarantined (review F6). A client names
+/// the address it declines, so past this a new decline replaces the oldest,
+/// and that address can be offered again.
 const MAX_DECLINED: usize = 1024;
 /// The broadcast bit in the BOOTP `flags` field.
 const FLAG_BROADCAST: u16 = 0x8000;
@@ -119,8 +122,9 @@ struct Lease {
 pub struct DhcpServer {
     config: DhcpConfig,
     leases: HashMap<MacAddr, Lease>,
-    /// Addresses quarantined by client DECLINEs (duplicate detection).
-    declined: HashSet<Ipv4Addr>,
+    /// Addresses quarantined by client DECLINEs (duplicate detection). The
+    /// client names the address, so the set holds [`MAX_DECLINED`].
+    declined: BoundedMap<Ipv4Addr, ()>,
 }
 
 /// A parsed inbound BOOTP/DHCP request.
@@ -141,7 +145,7 @@ impl DhcpServer {
         Self {
             config,
             leases: HashMap::new(),
-            declined: HashSet::new(),
+            declined: BoundedMap::new(MAX_DECLINED),
         }
     }
 
@@ -289,9 +293,11 @@ impl DhcpServer {
             .remove(&req.chaddr)
             .map(|l| l.ip)
             .or(req.requested_ip);
-        if let Some(ip) = declined {
+        // Only an address this server could hand out is worth a slot: a
+        // quarantine of any other changes no allocation.
+        if let Some(ip) = declined.filter(|ip| self.in_pool(*ip)) {
             warn!(mac = %req.chaddr, %ip, "DHCP decline; address quarantined");
-            self.declined.insert(ip);
+            self.declined.insert(ip, ());
         }
     }
 
@@ -321,20 +327,25 @@ impl DhcpServer {
             .map(|l| l.ip)
             .chain(self.config.reservations.values().copied())
             .chain(std::iter::once(self.config.gateway))
-            .chain(self.declined.iter().copied())
+            .chain(self.declined.keys().copied())
             .collect();
         self.config.subnet.hosts().find(|h| !taken.contains(h))
+    }
+
+    /// Whether `ip` is an address of the subnet a client can hold.
+    fn in_pool(&self, ip: Ipv4Addr) -> bool {
+        self.config.subnet.contains(&ip)
+            && ip != self.config.subnet.network()
+            && ip != self.config.subnet.broadcast()
+            && ip != self.config.gateway
     }
 
     /// May a client with no reservation and no lease claim `ip`?
     fn requestable(&self, ip: Ipv4Addr) -> bool {
         let now = Instant::now();
-        self.config.subnet.contains(&ip)
-            && ip != self.config.subnet.network()
-            && ip != self.config.subnet.broadcast()
-            && ip != self.config.gateway
+        self.in_pool(ip)
             && !self.config.reservations.values().any(|&r| r == ip)
-            && !self.declined.contains(&ip)
+            && !self.declined.contains_key(&ip)
             && !self.leases.values().any(|l| l.ip == ip && l.expiry > now)
     }
 
