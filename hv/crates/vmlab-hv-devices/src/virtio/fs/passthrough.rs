@@ -969,49 +969,17 @@ impl FileSystem for PassthroughFs {
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let mut session = self.inner.lock();
-        let live = live_inode(&session, inode)?;
-        let dir_path = live.path.clone();
-        let dir_fd = live.fd.try_clone()?;
-        // Cookies are the host's own, as in `readdir`. A READDIRPLUS record
-        // is several times its getdents64 record, so read a smaller batch:
-        // what does not fit is read again by the next request.
-        let mut used = 0usize;
-        let mut position = offset;
-        while used <= size as usize {
-            let Some((entries, next)) =
-                session.dir_batch(inode, handle, position, size as usize / 4)?
-            else {
-                break;
-            };
-            position = next;
-            for cached in &entries {
-                if used > size as usize {
-                    return Ok(());
-                }
-                let path = dir_path.join(OsStr::from_bytes(&cached.name));
-                // Resolve (or create) the session inode so the Entry carries
-                // the server's own ino and a lookup count the kernel will
-                // FORGET.
-                let entry = match session.resolve(&path, &dir_fd, &cached.name) {
-                    Ok(entry) => entry,
-                    Err(_) => continue, // raced away; the guest re-lookups
-                };
-                match add_entry(
-                    DirEntry {
-                        ino: entry.inode,
-                        offset: cached.cookie,
-                        type_: cached.d_type as u32,
-                        name: &cached.name,
-                    },
-                    entry,
-                ) {
-                    Ok(0) => return Ok(()),
-                    Ok(len) => used += len,
-                    Err(e) => return Err(e),
-                }
+        // Every entry handed to `add_entry` carries one lookup the guest
+        // answers with FORGET. A request that fails is answered with the
+        // error alone, so the guest sees none of them: take them back.
+        let mut served = Vec::new();
+        let result = session.readdirplus(inode, handle, size, offset, &mut served, add_entry);
+        if result.is_err() {
+            for ino in served {
+                session.forget_one(ino, 1);
             }
         }
-        Ok(())
+        result
     }
 
     fn fsyncdir(&self, _ctx: &Context, inode: u64, datasync: bool, _handle: u64) -> io::Result<()> {
@@ -1295,6 +1263,82 @@ impl Session {
             HandleKind::File { file: None, .. } => Err(io::Error::from_raw_os_error(libc::ESTALE)),
             HandleKind::Dir { .. } => Err(io::Error::from_raw_os_error(libc::EISDIR)),
         }
+    }
+
+    /// READDIRPLUS under the session lock. `served` takes the inode of each
+    /// entry `add_entry` accepted, in order: the caller undoes their lookups
+    /// when the request fails.
+    fn readdirplus(
+        &mut self,
+        inode: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        served: &mut Vec<u64>,
+        add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        let live = live_inode(self, inode)?;
+        let dir_path = live.path.clone();
+        let dir_fd = live.fd.try_clone()?;
+        // Cookies are the host's own, as in `readdir`. A READDIRPLUS record
+        // is several times its getdents64 record, so read a smaller batch:
+        // what does not fit is read again by the next request.
+        let mut used = 0usize;
+        let mut position = offset;
+        while used <= size as usize {
+            let Some((entries, next)) = self.dir_batch(inode, handle, position, size as usize / 4)?
+            else {
+                break;
+            };
+            position = next;
+            for cached in &entries {
+                if used > size as usize {
+                    return Ok(());
+                }
+                let path = dir_path.join(OsStr::from_bytes(&cached.name));
+                // Resolve (or create) the session inode so the Entry carries
+                // the server's own ino and a lookup count the kernel will
+                // FORGET.
+                let entry = match self.resolve(&path, &dir_fd, &cached.name) {
+                    Ok(entry) => entry,
+                    // The inode table is full. Skipping the entry would
+                    // hide a file that exists, so say it: end a reply that
+                    // already holds entries here (the guest asks again at
+                    // the last cookie it took), and fail one that holds
+                    // none.
+                    Err(e) if e.raw_os_error() == Some(libc::ENFILE) => {
+                        return if served.is_empty() { Err(e) } else { Ok(()) };
+                    }
+                    Err(_) => continue, // raced away; the guest re-lookups
+                };
+                let ino = entry.inode;
+                match add_entry(
+                    DirEntry {
+                        ino,
+                        offset: cached.cookie,
+                        type_: cached.d_type as u32,
+                        name: &cached.name,
+                    },
+                    entry,
+                ) {
+                    // The entry did not fit and the guest never sees it, so
+                    // no FORGET comes for it: drop its lookup here.
+                    Ok(0) => {
+                        self.forget_one(ino, 1);
+                        return Ok(());
+                    }
+                    Ok(len) => {
+                        served.push(ino);
+                        used += len;
+                    }
+                    Err(e) => {
+                        self.forget_one(ino, 1);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One bounded batch of the entries of `handle` after the cookie
