@@ -51,7 +51,7 @@ depends on what a real guest or agent does, the finding says so.
 | F6 (fixed, card #418) | A guest or host file that changed without a settled event is carried anyway, so the quiet period and the git lock deferral are bypassed | Wrong result (torn copy on the host) |
 | F7 | A guest delete made while the watch reopens for a new prune list is undone | Wrong result |
 | F8 | An ignore rule written in the guest applies one pass late, so the output it ignores is copied to the host and stays | Wrong result |
-| F9 | A directory named `.gitignore` or `.vmlabignore` fails every pass | Wrong result (sync stops) |
+| F9 (fixed, card #434) | A directory named `.gitignore` or `.vmlabignore` fails every pass | Wrong result (sync stops) |
 | F10 | A host file name that is not UTF-8 is trouble on every pass, and refuses every capture | Wrong result |
 | F11 (fixed, card #435) | A directory one side deleted comes back when the other side keeps ignored content in it | Cosmetic |
 
@@ -359,6 +359,17 @@ and the ledger no longer has it.
 **How bad.** Wrong result.
 
 ### F9. A directory named like a rule file fails every pass
+
+**Fixed in #434.** `read_rule_file` reads a regular file only. A rule-file name
+that is a directory, a FIFO, a socket or a device is refused by name, like the
+symlink of F2: its rules do not apply, the pass names it in the skipped list
+and in a `workspace.skipped` event, and the scan goes on. A directory still
+syncs as a directory. The open does not block and the opened handle is checked
+again, so a FIFO that replaces the file is not waited on. A regular rule file
+that cannot be read is still an error. The tests are
+`a_rule_file_that_is_not_a_file_is_a_named_skip` (scan) and
+`a_directory_named_like_a_rule_file_is_refused_by_name` (ignore rules). The
+text below describes the code before the fix.
 
 **Where.** `src/labd/workspace/ignore.rs:169-173`,
 `src/labd/workspace/scan.rs:115`.
