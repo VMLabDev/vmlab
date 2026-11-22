@@ -37,8 +37,7 @@ at least two host callbacks, so a host whose quantum is larger than 256 frames
 gets a deeper queue and a matching prefill. After each confirmed underrun the
 limit grows by 256 frames, up to 2048 frames (42.7 ms). The limit belongs to
 the machine's `PipeWireHost` and outlives a stream, so a loaded host is learned
-once and not again for every sound. `VMLAB_HV_AUDIO_QUEUE_MAX=<frames>` replaces
-the maximum for a measurement; `512` is the fixed queue of earlier builds.
+once and not again for every sound.
 
 An underrun is a pull, after priming, that got less PCM than the host asked
 for while the guest was playing. The last pull of a sound is short too, so a
@@ -58,7 +57,13 @@ PipeWire playback underrun: underruns=2 silence_frames=356 late_callbacks=1 long
 
 A clean interval writes nothing. The counters do not see a break made in the
 guest: a period the guest refilled too late leaves the device on time, with
-stale PCM in it.
+stale PCM in it. On a host with more runnable threads than CPUs that is the
+common break (card #447: 119 breaks in 60 s with 48 busy processes on 32 CPUs
+and no underrun, none with 16).
+
+A measurement on that card moved the callback to PipeWire's data thread
+(`RT_PROCESS`) on a host where that thread has no real-time priority. It had
+more silent quanta, not fewer (22 against 1 in 60 s). The flag stays absent.
 
 PulseAudio uses a nonblocking mainloop iteration followed by a 1 ms worker
 sleep. Playback writes are limited to the server's writable space. Capture

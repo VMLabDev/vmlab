@@ -26,17 +26,6 @@ const STREAM_GAP: Duration = Duration::from_millis(250);
 /// How often the worker writes the underruns it counted to the log.
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 
-/// The deepest playback queue, in frames. `VMLAB_HV_AUDIO_QUEUE_MAX` replaces
-/// the default for a measurement: `512` is the fixed queue of before card #447.
-fn max_queue_frames() -> usize {
-    std::env::var("VMLAB_HV_AUDIO_QUEUE_MAX")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .map_or(MAX_QUEUE_FRAMES, |frames: usize| {
-            frames.clamp(QUEUE_FRAMES, 4 * MAX_QUEUE_FRAMES)
-        })
-}
-
 /// What the playback callback counts and the worker reports (card #447).
 #[derive(Default)]
 struct Health {
@@ -155,12 +144,9 @@ impl PipeWireHost {
             return Err(error("invalid PCM format"));
         }
         let shared = Arc::new(Shared {
-            ring: SpscRing::with_capacity_bytes(
-                2 * max_queue_frames().max(MAX_QUEUE_FRAMES) * format.frame_bytes(),
-            ),
+            ring: SpscRing::with_capacity_bytes(2 * MAX_QUEUE_FRAMES * format.frame_bytes()),
             stride: format.frame_bytes(),
             queue_frames: self.queue_frames.clone(),
-            max_queue_frames: max_queue_frames(),
             health: Health::default(),
             stop: AtomicBool::new(false),
             alive: AtomicBool::new(true),
@@ -214,7 +200,6 @@ struct Shared {
     ring: SpscRing,
     stride: usize,
     queue_frames: Arc<AtomicUsize>,
-    max_queue_frames: usize,
     health: Health,
     stop: AtomicBool,
     alive: AtomicBool,
@@ -439,7 +424,7 @@ fn run(
                     let offset = shared.transferred.fetch_add(n, Ordering::Relaxed);
                     // The queue holds two host callbacks at least, and one
                     // quantum more after each underrun, up to its maximum.
-                    let mut queue = (2 * frames).min(shared.max_queue_frames);
+                    let mut queue = (2 * frames).min(MAX_QUEUE_FRAMES);
                     if playback.primed
                         && playback.gaps.pull(
                             Instant::now(),
@@ -451,7 +436,7 @@ fn run(
                     {
                         queue = queue.max(
                             (shared.queue_frames.load(Ordering::Relaxed) + QUANTUM_FRAMES)
-                                .min(shared.max_queue_frames),
+                                .min(MAX_QUEUE_FRAMES),
                         );
                     }
                     shared.queue_frames.fetch_max(queue, Ordering::Relaxed);
@@ -518,12 +503,6 @@ fn run(
     let mut params =
         [spa::pod::Pod::from_bytes(&bytes).ok_or_else(|| error("invalid format pod"))?];
     // Without RT_PROCESS, callbacks stay on this owning mainloop thread.
-    // VMLAB_HV_AUDIO_RT=1 moves them to PipeWire's real-time data thread, for
-    // a measurement (card #447).
-    let mut flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
-    if std::env::var_os("VMLAB_HV_AUDIO_RT").is_some_and(|value| value == "1") {
-        flags |= pw::stream::StreamFlags::RT_PROCESS;
-    }
     stream
         .connect(
             if capture {
@@ -532,7 +511,7 @@ fn run(
                 spa::utils::Direction::Output
             },
             None,
-            flags,
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
             &mut params,
         )
         .map_err(error)?;
@@ -697,7 +676,6 @@ mod tests {
                 ring: SpscRing::with_capacity_bytes(4096),
                 stride: 4,
                 queue_frames: Arc::new(AtomicUsize::new(QUEUE_FRAMES)),
-                max_queue_frames: MAX_QUEUE_FRAMES,
                 health: Health::default(),
                 stop: AtomicBool::new(false),
                 alive: AtomicBool::new(true),
