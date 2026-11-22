@@ -2902,6 +2902,53 @@ mod tests {
         }
     }
 
+    /// What `mock:flood` sends on its channel: more than the window.
+    const FLOOD_BYTES: usize = 300 * 1024;
+
+    /// The host granted one window on the channel and the guest sent past
+    /// it: the channel ends with an error that names the window, and what
+    /// the consumer is left to read is no more than the host granted
+    /// (review of the guest agents, F4).
+    #[tokio::test]
+    async fn a_guest_that_ignores_its_credit_loses_the_channel() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = handle
+            .open_exec(vec!["mock:flood".into()], vec![], None, None)
+            .await
+            .unwrap();
+        // Nothing is read here, so the host grants no credit past the
+        // first window.
+        let id = session.id;
+        let dropped = async {
+            while handle.inner.sessions.lock().await.contains_key(&id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .expect("the host kept a channel whose guest sent past its window");
+
+        let mut queued = 0usize;
+        let error = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), session.recv())
+                .await
+                .expect("the session did not end");
+            match ev {
+                Some(SessionEvent::Data(b)) => queued += b.len(),
+                Some(SessionEvent::Error(msg)) => break msg,
+                other => panic!("the session ended without an error: {other:?}"),
+            }
+        };
+        assert!(error.contains("window"), "{error}");
+        assert!(
+            queued as u64 <= INITIAL_WINDOW,
+            "{queued} bytes sat in the queue of one channel"
+        );
+        // The connection outlives the channel.
+        assert!(handle.ping(Duration::from_secs(2)).await);
+    }
+
     /// A minimal in-process agent speaking the real frame protocol over a
     /// unix socket, mirroring what `guest/agent` does: echo terminals,
     /// canned exec output, in-memory file store.
@@ -3048,6 +3095,23 @@ mod tests {
                                         tokio::time::sleep(Duration::from_secs(20)).await;
                                     }
                                     send(AgentMsg::Opened { id }).await;
+                                    // `mock:flood`: a guest that ignores its
+                                    // credit, sending past the window with
+                                    // no grant and never ending the exec.
+                                    if argv.first().is_some_and(|s| s == "mock:flood") {
+                                        let chunk = vec![7u8; 4096];
+                                        let mut w = tx.lock().await;
+                                        for _ in 0..FLOOD_BYTES / chunk.len() {
+                                            let _ = w
+                                                .write_all(&encode_frame(
+                                                    FrameKind::Data,
+                                                    id,
+                                                    &chunk,
+                                                ))
+                                                .await;
+                                        }
+                                        continue;
+                                    }
                                     // Echo who the open said to run as, so a
                                     // test can assert the identity actually
                                     // reached the wire (PRD §19.2).
