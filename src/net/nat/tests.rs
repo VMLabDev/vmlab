@@ -72,6 +72,7 @@ struct GTcp {
     seq: u32,
     ack: u32,
     flags: u8,
+    window: u16,
     options: Vec<u8>,
     payload: Vec<u8>,
 }
@@ -114,6 +115,7 @@ async fn recv_tcp(rx: &mut mpsc::Receiver<Bytes>) -> GTcp {
             seq: t.seq(),
             ack: t.ack(),
             flags: t.flags(),
+            window: t.window(),
             options: t.options().to_vec(),
             payload: t.payload().to_vec(),
         };
@@ -169,6 +171,22 @@ async fn guest_tcp_window(
     payload: &[u8],
     options: &[u8],
 ) {
+    let f = tcp_frame(sport, dst, seq, ack, flags, window, payload, options);
+    engine.handle_frame(f).await;
+}
+
+/// One guest TCP segment as the ethernet frame the gateway MAC receives.
+#[allow(clippy::too_many_arguments)]
+fn tcp_frame(
+    sport: u16,
+    dst: (Ipv4Addr, u16),
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    options: &[u8],
+) -> Bytes {
     let seg = frame::tcp_build(
         GUEST_IP,
         dst.0,
@@ -185,8 +203,7 @@ async fn guest_tcp_window(
     )
     .unwrap();
     let pkt = frame::ipv4_build(GUEST_IP, dst.0, IPPROTO_TCP, 64, &seg, 7).unwrap();
-    let f = frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt);
-    engine.handle_frame(Bytes::from(f)).await;
+    Bytes::from(frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt))
 }
 
 async fn guest_udp(engine: &Arc<NatEngine>, sport: u16, dst: (Ipv4Addr, u16), payload: &[u8]) {
@@ -1722,5 +1739,263 @@ async fn ping_probes_are_bounded() {
     assert!(
         peak > MAX_PROBES_PER_GUEST,
         "a second guest probes while the first is at its limit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A stalled flow (review F4)
+// ---------------------------------------------------------------------------
+
+/// How long a call may take before the test says it is blocked. A call
+/// behind a stalled flow never returned at all, so the length only has to
+/// outlast a loaded test host.
+const BLOCKED: Duration = Duration::from_secs(5);
+/// A full segment at the 1460-byte MSS these tests negotiate.
+const FULL_SEGMENT: usize = 1460;
+
+/// Where a fake guest's frames go in: straight into the engine, or into a
+/// switch port with a gateway behind it.
+enum Wire {
+    Engine(Arc<NatEngine>),
+    Port(mpsc::Sender<Bytes>),
+}
+
+impl Wire {
+    async fn send(&self, frame: Bytes) {
+        match self {
+            Wire::Engine(engine) => engine.handle_frame(frame).await,
+            Wire::Port(tx) => tx.send(frame).await.expect("switch port closed"),
+        }
+    }
+}
+
+/// The guest's end of one flow it opened.
+struct Upload {
+    sport: u16,
+    dst: (Ipv4Addr, u16),
+    /// The first byte the engine has not acknowledged.
+    seq: u32,
+    ack: u32,
+}
+
+impl Upload {
+    /// The data segment `ahead` full segments past `seq`, filled with `fill`.
+    fn segment(&self, ahead: u32, fill: u8) -> Bytes {
+        tcp_frame(
+            self.sport,
+            self.dst,
+            self.seq.wrapping_add(ahead * FULL_SEGMENT as u32),
+            self.ack,
+            TCP_ACK | TCP_PSH,
+            65535,
+            &[fill; FULL_SEGMENT],
+            &[],
+        )
+    }
+}
+
+/// Next TCP frame of the flow to `dst`, skipping every other frame.
+async fn recv_flow(rx: &mut mpsc::Receiver<Bytes>, dst: (Ipv4Addr, u16)) -> GTcp {
+    loop {
+        let t = recv_tcp(rx).await;
+        if t.src == dst {
+            return t;
+        }
+    }
+}
+
+/// Complete the guest's handshake for a flow to `dst`.
+async fn open_upload(
+    wire: &Wire,
+    rx: &mut mpsc::Receiver<Bytes>,
+    sport: u16,
+    dst: (Ipv4Addr, u16),
+) -> Upload {
+    let isn = 50_000u32;
+    let syn = tcp_frame(sport, dst, isn, 0, TCP_SYN, 65535, b"", &[2, 4, 0x05, 0xB4]);
+    wire.send(syn).await;
+    let synack = recv_flow(rx, dst).await;
+    assert_eq!(synack.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
+    let up = Upload {
+        sport,
+        dst,
+        seq: isn.wrapping_add(1),
+        ack: synack.seq.wrapping_add(1),
+    };
+    wire.send(tcp_frame(sport, dst, up.seq, up.ack, TCP_ACK, 65535, b"", &[]))
+        .await;
+    up
+}
+
+/// Upload full segments in order, each after the acknowledgement of the one
+/// before, until the engine stops taking them: a second without an
+/// acknowledgement of the whole segment. Against a host that does not read,
+/// that is the moment its socket buffers are full. Leaves `up.seq` at the
+/// first byte the engine has not acknowledged, and returns the last frame
+/// of the flow it saw.
+async fn upload_until_stalled(
+    wire: &Wire,
+    rx: &mut mpsc::Receiver<Bytes>,
+    up: &mut Upload,
+) -> Option<GTcp> {
+    let start = up.seq;
+    let mut last = None;
+    loop {
+        assert!(
+            up.seq.wrapping_sub(start) < 256 << 20,
+            "a host that reads nothing took 256 MiB"
+        );
+        let end = up.seq.wrapping_add(FULL_SEGMENT as u32);
+        wire.send(up.segment(0, 0x5a)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while up.seq != end {
+            match tokio::time::timeout_at(deadline, recv_flow(rx, up.dst)).await {
+                Ok(t) => {
+                    if seq_after(t.ack, up.seq) {
+                        up.seq = t.ack;
+                    }
+                    last = Some(t);
+                }
+                Err(_) => return last,
+            }
+        }
+    }
+}
+
+/// A listener that accepts connections and never reads from them. The task
+/// holds each accepted stream open for as long as the test runs.
+async fn host_that_never_reads() -> (Ipv4Addr, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    (Ipv4Addr::LOCALHOST, port)
+}
+
+/// Review F4: a flow whose host end does not read must not hold up any
+/// other frame. The guest fills the host's socket buffers, then sends 200
+/// more segments: every `handle_frame` call returns, and a second flow
+/// still opens. Before the fix the flow task sat in `write_all`, its
+/// channel filled after 64 segments, and the next call never returned.
+#[tokio::test]
+async fn a_stalled_flow_does_not_block_other_frames() {
+    let dst = host_that_never_reads().await;
+    let (engine, mut rx) = engine();
+    let wire = Wire::Engine(engine.clone());
+    let mut up = open_upload(&wire, &mut rx, 40_100, dst).await;
+    upload_until_stalled(&wire, &mut rx, &mut up).await;
+
+    // The engine's answers are read all the while, so that only the host's
+    // socket can be what a call waits for.
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if seen_tx.send(frame).is_err() {
+                return;
+            }
+        }
+    });
+
+    for i in 0..200 {
+        timeout(BLOCKED, engine.handle_frame(up.segment(i, 0x5b)))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("handle_frame is blocked behind the stalled flow at segment {i}")
+            });
+    }
+
+    // Another flow of the same guest opens while the first one is stalled.
+    let echo = tcp_echo_server().await;
+    let other = (Ipv4Addr::LOCALHOST, echo.port());
+    let syn = tcp_frame(40_101, other, 9_000, 0, TCP_SYN, 65535, b"", &[]);
+    timeout(BLOCKED, engine.handle_frame(syn))
+        .await
+        .expect("a SYN is blocked behind the stalled flow");
+    let opened = timeout(WAIT, async {
+        loop {
+            let frame = seen_rx.recv().await.expect("engine output closed");
+            let eth = EthView::parse(&frame).unwrap();
+            let ip = Ipv4View::parse(eth.payload()).unwrap();
+            let tcp = TcpView::parse(ip.payload()).unwrap();
+            if (ip.src(), tcp.src_port()) == other && tcp.flags() & TCP_SYN != 0 {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(opened.is_ok(), "no SYN-ACK for a second flow");
+}
+
+/// Review F4 at the gateway: with one flow stalled and 200 more of its
+/// segments sent, the gateway still answers an ARP request for its own
+/// address. Before the fix the gateway task waited in the uplink for the
+/// flow's channel, and with it ARP, DHCP, DNS and every other flow.
+#[tokio::test]
+async fn a_stalled_flow_does_not_block_the_gateway() {
+    use crate::net::gateway::{Gateway, GatewayConfig};
+    use crate::net::switch::{PortClass, Switch};
+
+    let dst = host_that_never_reads().await;
+    let switch = Switch::new("seg".into());
+    let gateway = Gateway::spawn(
+        &switch,
+        GatewayConfig {
+            segment_name: "seg".into(),
+            lab_name: "lab".into(),
+            gw_ip: GW_IP,
+            gw_mac: GW_MAC,
+            dhcp: None,
+            dns: None,
+            upstream_dns: None,
+        },
+    );
+    // The engine behind the gateway, wired as `spawn_nat` wires it.
+    let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(1024);
+    let engine = NatEngine::new(NatConfig::new(GW_IP, GW_MAC), out_tx);
+    engine.set_guard(Arc::new(super::HostGuard::open()));
+    let to_segment = gateway.sender();
+    tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if to_segment.send(frame).await.is_err() {
+                return;
+            }
+        }
+    });
+    gateway.set_uplink(Arc::new(move |frame: Bytes| {
+        let engine = engine.clone();
+        Box::pin(async move { engine.handle_frame(frame).await })
+    }));
+
+    let mut guest = switch.add_channel_port(PortClass::Guest { isolated: false });
+    let wire = Wire::Port(guest.tx.clone());
+    let mut up = open_upload(&wire, &mut guest.rx, 40_110, dst).await;
+    upload_until_stalled(&wire, &mut guest.rx, &mut up).await;
+    for i in 0..200 {
+        wire.send(up.segment(i, 0x5b)).await;
+    }
+    // Let the switch hand all of them to the gateway before the request.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    wire.send(Bytes::from(frame::arp_request_build(
+        GUEST_MAC, GUEST_IP, GW_IP,
+    )))
+    .await;
+    let answered = timeout(BLOCKED, async {
+        loop {
+            let frame = guest.rx.recv().await.expect("guest port closed");
+            let eth = EthView::parse(&frame).unwrap();
+            if eth.ethertype() == frame::ETHERTYPE_ARP && eth.src_mac() == GW_MAC {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        answered.is_ok(),
+        "the gateway answers no ARP request while one flow is stalled"
     );
 }
