@@ -173,6 +173,17 @@ Not read:
   answers `open_exec` with `opened` and then sends 64 KiB `Data` frames
   without end. Assert that `exec` returns an error that names the limit
   after a bounded number of bytes, and does not run to the timeout.
+- Fixed in card #483. `AgentHandle::exec` holds at most `EXEC_OUTPUT_LIMIT`
+  (64 MiB, stdout and stderr together). The event that would pass it makes
+  the exec an error that names the limit, and the session is dropped, which
+  closes the channel and ends the command in the guest. The limit covers
+  every caller, `machine.exec` and the internal probes. The test
+  `a_collected_exec_refuses_output_past_its_ceiling` in
+  `src/labd/vm_agent.rs` runs a mock exec that sends 128 MiB within the
+  credit the host grants and never exits. It failed before the fix (the exec
+  ran to its 20 s timeout with all of it held) and passes after it. Not fixed
+  here: `machine.exec` still copies the collected output into its JSON reply,
+  so one exec can hold a small multiple of the limit for a moment.
 
 ### F4. The host does not enforce the receive window, so one channel can queue 2048 full frames
 
