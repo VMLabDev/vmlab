@@ -17,6 +17,19 @@ and the last loud sample, this counts
                    each of its ends.
   gaps             stretches of at least 1 ms that are silent.
 
+Each discontinuity gets the jump of the sine's phase across it, in samples
+(modulo one cycle), and the breaks are sorted by what they look like:
+
+  displaced  two discontinuities at most 30 ms apart whose jumps cancel: the
+             stretch between them is sound from another time. A period the
+             guest refilled too late looks like this: the sound card model
+             reads the period that was there before. It is made in the guest's
+             half of the path.
+  gaps       silence put in by the host half: vmlab-hv's queue ran empty, or
+             the sound server had no buffer from it in time.
+  shifts     the rest: the phase jumps and stays. Frames were lost or
+             repeated on the way, in the sound server or in the capture.
+
 With --hv-log it also sums the underruns vmlab-hv wrote to the VM's log after
 the byte offset: the pulls of the host's sound server that the VM could not
 fill, and the frames of silence it put in their place.
@@ -73,11 +86,58 @@ def analyse(samples, rate, hz):
             run = 0
     res['spikes'] = spikes
     res['discontinuities'] = len(places)
+    res.update(classify(signal, places, gaps, w, rate))
     res['gaps'] = len(gaps)
     res['gap_seconds'] = round(sum(n for _, n in gaps) / rate, 4)
     res['first_discontinuities_s'] = [round((first + i) / rate, 3) for i in places[:20]]
     res['first_gaps'] = [{'at_s': round((first + i) / rate, 3), 'ms': round(n * 1000 / rate, 1)} for i, n in gaps[:20]]
     return res
+
+
+def phase_jump(signal, at, w):
+    """The jump of the sine's phase across sample `at`, in samples, in half a
+    cycle either way. Two cycles are fitted on each side."""
+    cycle = 2 * math.pi / w
+    n = int(2 * cycle)
+
+    def phase(start):
+        seg = signal[start:start + n]
+        if start < 0 or len(seg) < n:
+            return None
+        s = sum(v * math.sin(w * i) for i, v in enumerate(seg, start))
+        c = sum(v * math.cos(w * i) for i, v in enumerate(seg, start))
+        return math.atan2(c, s)
+
+    before, after = phase(at - 6 - n), phase(at + 6)
+    if before is None or after is None:
+        return None
+    return ((after - before + math.pi) % (2 * math.pi) - math.pi) / w
+
+
+def classify(signal, places, gaps, w, rate):
+    """Sort the discontinuities into displaced stretches, gap edges and shifts."""
+    near_gap = set()
+    for start, n in gaps:
+        near_gap.update(i for i in places if start - rate // 500 <= i <= start + n + rate // 500)
+    rest = [i for i in places if i not in near_gap]
+    jumps = {i: phase_jump(signal, i, w) for i in rest}
+    displaced, shifts, k = [], [], 0
+    while k < len(rest):
+        a = rest[k]
+        b = rest[k + 1] if k + 1 < len(rest) else None
+        ja, jb = jumps[a], jumps.get(b)
+        if b is not None and b - a <= 0.03 * rate and ja is not None and jb is not None and abs(ja + jb) < 0.75:
+            displaced.append({'at': a, 'frames': b - a, 'jump_samples': round(ja, 2)})
+            k += 2
+        else:
+            shifts.append({'at': a, 'jump_samples': None if ja is None else round(ja, 2)})
+            k += 1
+    lengths = {}
+    for d in displaced:
+        lengths[d['frames']] = lengths.get(d['frames'], 0) + 1
+    return {'displaced': len(displaced), 'shifts': len(shifts),
+            'displaced_frames': dict(sorted(lengths.items(), key=lambda kv: -kv[1])[:6]),
+            'first_shifts': shifts[:10]}
 
 
 def hv_underruns(path, offset):
@@ -136,7 +196,8 @@ def main():
         res['hv'] = hv_underruns(a.hv_log, a.hv_log_offset)
     with open(a.out, 'w') as f:
         json.dump(res, f, indent=2)
-    print(f"audio: {res.get('signal_seconds', 0)} s of signal, {res.get('discontinuities', '?')} discontinuities, "
+    print(f"audio: {res.get('signal_seconds', 0)} s of signal, {res.get('discontinuities', '?')} discontinuities "
+          f"({res.get('displaced', '?')} displaced stretches, {res.get('shifts', '?')} shifts), "
           f"{res.get('gaps', '?')} gaps" + (f"; vmlab-hv underruns: {res['hv'].get('underruns')}" if a.hv_log else '')
           + (f"; error: {res['error']}" if res['error'] else ''))
     return 1 if res['error'] else 0

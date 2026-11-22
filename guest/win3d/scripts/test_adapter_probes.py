@@ -48,6 +48,22 @@ class Analyse(unittest.TestCase):
         self.assertEqual((r['discontinuities'], r['gaps']), (2, 1))
         self.assertAlmostEqual(r['gap_seconds'], 256 / RATE, places=3)
 
+    def test_breaks_are_sorted_by_their_phase_jump(self):
+        # A period of 480 frames replaced by the sound of 960 frames earlier, a
+        # stretch of silence, and 768 frames lost.
+        stale = sine(3)
+        stale[4800 + 48000:4800 + 48480] = stale[4800 + 47040:4800 + 47520]
+        r = audio.analyse(stale, RATE, 997)
+        self.assertEqual((r['discontinuities'], r['displaced'], r['shifts'], r['gaps']), (2, 1, 0, 0))
+        self.assertEqual(r['displaced_frames'], {480: 1})
+
+        r = audio.analyse(sine(3, zeros=((48000, 256),)), RATE, 997)
+        self.assertEqual((r['discontinuities'], r['displaced'], r['shifts'], r['gaps']), (2, 0, 0, 1))
+
+        r = audio.analyse(sine(3, skips=((48000, 768),)), RATE, 997)
+        self.assertEqual((r['discontinuities'], r['displaced'], r['shifts'], r['gaps']), (1, 0, 1, 0))
+        self.assertAlmostEqual(r['first_shifts'][0]['jump_samples'], 768 % (RATE / 997) - RATE / 997, delta=0.3)
+
     def test_a_silent_capture_is_an_error(self):
         self.assertEqual(audio.analyse([0] * RATE, RATE, 997)['error'], 'the capture is silent')
 
