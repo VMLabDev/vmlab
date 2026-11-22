@@ -432,6 +432,9 @@ much as a Makefile is.
   `.wh.b`. Flatten, read the squashfs back, and expect `a` to exist with the
   content `one` and `b` to be absent. A second test replaces `b` in layer 2
   with content `two` and expects `a` = `one`, `b` = `two`.
+- Fixed in card #524. The survey records the original archive entry behind
+  each hard link. If its original path is erased or replaced, the flatten
+  writes that entry under a surviving alias and points any other aliases to it.
 
 ### F10. The registry HTTP client has no timeout (wrong result)
 

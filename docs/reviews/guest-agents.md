@@ -367,6 +367,10 @@ Not read:
 
 ### F9. An exec does not report its exit while a background child holds its output pipe
 
+- Status: fixed in card #526. The Rust agent gives both output pumps one
+  two-second drain window after process exit and stops forwarding before
+  sending EOF and the exit code. The legacy agent drains the bytes buffered
+  at exit, regardless of whether a descendant keeps the pipes open.
 - Where: `guest/agent/src/exec.rs:100-114` (the reaper joins both output
   pumps before it sends `exited`). The legacy agent has the same rule at
   `guest/agent-legacy/src/agent.c:590`.
@@ -380,9 +384,11 @@ Not read:
 - Severity: wrong result. A provision step that starts a daemon fails on its
   timeout.
 - Confidence: high.
-- Test: `an_exec_reports_its_exit_while_a_background_child_holds_the_pipe`
-  in `guest/agent/src/sessions_test.rs`. Run
-  `sh -c 'sleep 30 & exit 3'`. Assert `exited` with code 3 within 5 s.
+- Tests: `an_exec_reports_its_exit_while_a_background_child_holds_the_pipe`
+  in `guest/agent/src/sessions_test.rs` and
+  `legacy_exec_reports_exit_with_inherited_output_pipes` in
+  `src/labd/legacy_agent_tests.rs`. Assert stdout, stderr and exit code 3
+  while a descendant still holds the pipes open.
 
 ### F10. An exec with stdin can deadlock, and the timeout does not cover it
 
@@ -474,6 +480,14 @@ Not read:
 - Test: in `guest/agent/src/unix/mod.rs`, next to the path resolver test at
   line 1453: open a file session on `container_platform`, send
   `Op::Realpath { path: "/srv/link" }`, and assert `/etc/sentinel`.
+- Fixed in card #525. `realpath` in a session whose paths are resolved inside
+  a root answers the resolved path without that root in front
+  (`seen_from` in `guest/agent/src/fileops.rs`), so the answer is good for a
+  later request. The test is
+  `realpath_in_a_container_answers_a_container_path` in
+  `guest/agent/src/unix/mod.rs`. It fails before the fix (the answer was
+  `<tempdir>/rootfs/etc/sentinel`) and passes after it. Not fixed here: the
+  failure messages of the file operations still name the micro-VM path.
 
 ### F14. A tail or event-log stream damages a UTF-8 character that crosses two frames
 
