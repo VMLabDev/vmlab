@@ -105,6 +105,10 @@ void probe_readback_image(probe_ctx *ctx, const uint8_t *base, size_t pitch,
 
 /* Records an error; any error makes the exit code PROBE_EXIT_API_FAILURE. */
 void probe_error(probe_ctx *ctx, const char *fmt, ...);
+/* Records a warning: a difference worth reporting that is not a failure of
+ * the probe, such as a self-check that another vendor's driver does not
+ * meet. It does not change the exit code. */
+void probe_warning(probe_ctx *ctx, const char *fmt, ...);
 /* Records an error for a failed HRESULT and returns 1 when hr failed. */
 int probe_hr(probe_ctx *ctx, HRESULT hr, const char *what);
 
