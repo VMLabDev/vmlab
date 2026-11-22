@@ -1,14 +1,19 @@
 //! Outbound UDP NAT: one connected, ephemeral host socket per guest flow
 //! (guest_ip, guest_port, dst_ip, dst_port), a reader task translating
 //! replies back into frames, 60 s idle expiry. DNS to arbitrary servers
-//! works through this with zero configuration.
+//! works through this with zero configuration. The table is limited per
+//! guest address and in total; a new flow past a limit replaces the flow
+//! idle the longest.
 
 use crate::sync::LockRecover;
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::task::AbortHandle;
 use tokio::time::{Instant, timeout};
 use tracing::{debug, trace};
 
@@ -33,6 +38,9 @@ pub(super) const MAX_UDP_FLOWS_PER_GUEST: usize = 128;
 pub(super) struct UdpFlow {
     sock: Arc<UdpSocket>,
     last_used: Arc<StdMutex<Instant>>,
+    /// The reader task, which holds the socket too: aborted when the flow
+    /// is replaced.
+    reader: AbortHandle,
 }
 
 /// Handle one guest→world datagram: reuse or create the flow socket and
@@ -58,12 +66,25 @@ pub(super) async fn handle_outbound(
                 debug!(?key, error = %e, "nat: udp connect failed");
                 return;
             }
+            let sock = Arc::new(sock);
+            let last_used = Arc::new(StdMutex::new(Instant::now()));
+            let reader = spawn_reader(
+                engine.clone(),
+                key,
+                guest_mac,
+                sock.clone(),
+                last_used.clone(),
+            );
             let flow = UdpFlow {
-                sock: Arc::new(sock),
-                last_used: Arc::new(StdMutex::new(Instant::now())),
+                sock,
+                last_used,
+                reader,
             };
-            engine.udp_flows.lock_recover().insert(key, flow.clone());
-            spawn_reader(engine.clone(), key, guest_mac, flow.clone());
+            {
+                let mut table = engine.udp_flows.lock_recover();
+                make_room(&mut table, key.guest_ip);
+                table.insert(key, flow.clone());
+            }
             trace!(?key, "nat: udp flow created");
             flow
         }
@@ -72,15 +93,44 @@ pub(super) async fn handle_outbound(
     let _ = flow.sock.send(payload).await;
 }
 
+/// Before a new flow of `guest` goes into `table`: when the guest is at its
+/// limit, end its flow idle the longest, else when the table is full, end
+/// the flow idle the longest of all.
+fn make_room(table: &mut HashMap<FlowKey, UdpFlow>, guest: Ipv4Addr) {
+    let of_guest = table.keys().filter(|k| k.guest_ip == guest).count();
+    let only = if of_guest >= MAX_UDP_FLOWS_PER_GUEST {
+        Some(guest)
+    } else if table.len() >= MAX_UDP_FLOWS {
+        None
+    } else {
+        return;
+    };
+    let oldest = table
+        .iter()
+        .filter(|(k, _)| only.is_none_or(|g| k.guest_ip == g))
+        .min_by_key(|(_, f)| *f.last_used.lock_recover())
+        .map(|(k, _)| *k);
+    if let Some(flow) = oldest.and_then(|k| table.remove(&k)) {
+        trace!(?oldest, "nat: udp flow limit reached, oldest flow replaced");
+        flow.reader.abort();
+    }
+}
+
 /// Reader task: world→guest datagrams become frames; exits (and removes the
 /// flow) after 60 s without traffic in either direction.
-fn spawn_reader(engine: Arc<NatEngine>, key: FlowKey, guest_mac: MacAddr, flow: UdpFlow) {
-    tokio::spawn(async move {
+fn spawn_reader(
+    engine: Arc<NatEngine>,
+    key: FlowKey,
+    guest_mac: MacAddr,
+    sock: Arc<UdpSocket>,
+    last_used: Arc<StdMutex<Instant>>,
+) -> AbortHandle {
+    let task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
-            match timeout(UDP_IDLE, flow.sock.recv(&mut buf)).await {
+            match timeout(UDP_IDLE, sock.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
-                    *flow.last_used.lock_recover() = Instant::now();
+                    *last_used.lock_recover() = Instant::now();
                     engine
                         .send_udp_to_guest(
                             guest_mac,
@@ -97,7 +147,7 @@ fn spawn_reader(engine: Arc<NatEngine>, key: FlowKey, guest_mac: MacAddr, flow: 
                     break;
                 }
                 Err(_elapsed) => {
-                    let idle = flow.last_used.lock_recover().elapsed();
+                    let idle = last_used.lock_recover().elapsed();
                     if idle >= UDP_IDLE {
                         trace!(?key, "nat: udp flow idle, expiring");
                         break;
@@ -105,6 +155,11 @@ fn spawn_reader(engine: Arc<NatEngine>, key: FlowKey, guest_mac: MacAddr, flow: 
                 }
             }
         }
-        engine.udp_flows.lock_recover().remove(&key);
+        // Remove this flow only: the key can hold a newer one by now.
+        let mut table = engine.udp_flows.lock_recover();
+        if table.get(&key).is_some_and(|f| Arc::ptr_eq(&f.sock, &sock)) {
+            table.remove(&key);
+        }
     });
+    task.abort_handle()
 }
