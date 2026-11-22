@@ -354,6 +354,16 @@ Not read:
   `guest/agent/src/sessions_test.rs`. Make a FIFO with `mkfifo`, send
   `Op::Digest` and `Op::Open` for it, and assert an error reply within one
   second for each.
+- Fixed in card #508. On Unix every open the file session makes for a path
+  (`Op::Open`, `Op::Digest`, and the open of a size or time `Op::Setstat`)
+  refuses a FIFO, a character device and a socket with "not a regular
+  file". It checks the path first, opens with `O_NONBLOCK`, and checks the
+  open handle again. A block device is finite and stays allowed, so
+  `vmlab cp file vm:/dev/null` is now refused and a push to a disk device is
+  not. The test also asks for `/dev/zero` and for more requests than the
+  session has workers. It failed before the fix (the digest of the FIFO got
+  no reply in 10 s) and passes after it. Not fixed here: Windows device
+  names, which stay unchecked.
 
 ### F9. An exec does not report its exit while a background child holds its output pipe
 
