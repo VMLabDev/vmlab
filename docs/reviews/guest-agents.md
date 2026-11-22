@@ -292,6 +292,17 @@ Not read:
   From a second thread call `route_input(9, …)` 600 times with one byte
   each, then `handle_msg(Ping)`. Assert that the pong arrives within one
   second.
+- Fixed in card #507. A session's input queue is now bounded by the bytes
+  it holds, the unit the window counts in, and `route_input` never waits on
+  it. Small frames are joined in the queue, so a full window of one-byte
+  frames costs a window of memory. A host that respects its window cannot
+  fill the queue. A host that sends past it loses that channel with an
+  error, which is what the host does to a guest in the other direction
+  (F4, card #484). The test failed before the fix (the reader blocked at
+  frame 513 and no pong came within one second) and passes after it. The
+  second stage in `fileops.rs` (`WORK_QUEUE`) still blocks, but only the
+  session's own `read_loop` thread: its unread bytes wait in the input
+  queue and the reader thread goes on.
 
 ### F7. A pull trusts the size in the guest's `stat`, so a guest can fill the host disk
 
