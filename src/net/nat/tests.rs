@@ -1773,24 +1773,42 @@ impl Wire {
 struct Upload {
     sport: u16,
     dst: (Ipv4Addr, u16),
+    /// The sequence number of the first data byte.
+    start: u32,
     /// The first byte the engine has not acknowledged.
     seq: u32,
     ack: u32,
 }
 
 impl Upload {
-    /// The data segment `ahead` full segments past `seq`, filled with `fill`.
-    fn segment(&self, ahead: u32, fill: u8) -> Bytes {
+    /// The first `len` bytes of the stream the guest uploads: each byte
+    /// follows from its place, so a lost, repeated or moved byte shows.
+    fn stream(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect()
+    }
+
+    /// The full data segment that starts `ahead` segments past `seq`.
+    fn segment(&self, ahead: u32) -> Bytes {
+        let seq = self.seq.wrapping_add(ahead * FULL_SEGMENT as u32);
+        let at = seq.wrapping_sub(self.start) as usize;
+        let payload: Vec<u8> = (at..at + FULL_SEGMENT)
+            .map(|i| (i.wrapping_mul(31) & 0xff) as u8)
+            .collect();
         tcp_frame(
             self.sport,
             self.dst,
-            self.seq.wrapping_add(ahead * FULL_SEGMENT as u32),
+            seq,
             self.ack,
             TCP_ACK | TCP_PSH,
             65535,
-            &[fill; FULL_SEGMENT],
+            &payload,
             &[],
         )
+    }
+
+    /// How many bytes the engine has acknowledged.
+    fn acked(&self) -> usize {
+        self.seq.wrapping_sub(self.start) as usize
     }
 }
 
@@ -1819,6 +1837,7 @@ async fn open_upload(
     let up = Upload {
         sport,
         dst,
+        start: isn.wrapping_add(1),
         seq: isn.wrapping_add(1),
         ack: synack.seq.wrapping_add(1),
     };
@@ -1828,11 +1847,12 @@ async fn open_upload(
 }
 
 /// Upload full segments in order, each after the acknowledgement of the one
-/// before, until the engine stops taking them: a second without an
-/// acknowledgement of the whole segment. Against a host that does not read,
-/// that is the moment its socket buffers are full. Leaves `up.seq` at the
-/// first byte the engine has not acknowledged, and returns the last frame
-/// of the flow it saw.
+/// before, until the engine stops taking them: it closes the guest's window,
+/// or three seconds pass without an acknowledgement of the whole segment
+/// (the engine before the fix, which never closed the window). Against a
+/// host that does not read, that is the moment its socket buffers are full.
+/// Leaves `up.seq` at the first byte the engine has not acknowledged, and
+/// returns the last frame of the flow it saw.
 async fn upload_until_stalled(
     wire: &Wire,
     rx: &mut mpsc::Receiver<Bytes>,
@@ -1846,15 +1866,19 @@ async fn upload_until_stalled(
             "a host that reads nothing took 256 MiB"
         );
         let end = up.seq.wrapping_add(FULL_SEGMENT as u32);
-        wire.send(up.segment(0, 0x5a)).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        wire.send(up.segment(0)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while up.seq != end {
             match tokio::time::timeout_at(deadline, recv_flow(rx, up.dst)).await {
                 Ok(t) => {
                     if seq_after(t.ack, up.seq) {
                         up.seq = t.ack;
                     }
+                    let closed = t.window == 0;
                     last = Some(t);
+                    if closed {
+                        return last;
+                    }
                 }
                 Err(_) => return last,
             }
@@ -1901,7 +1925,7 @@ async fn a_stalled_flow_does_not_block_other_frames() {
     });
 
     for i in 0..200 {
-        timeout(BLOCKED, engine.handle_frame(up.segment(i, 0x5b)))
+        timeout(BLOCKED, engine.handle_frame(up.segment(i)))
             .await
             .unwrap_or_else(|_| {
                 panic!("handle_frame is blocked behind the stalled flow at segment {i}")
@@ -1975,7 +1999,7 @@ async fn a_stalled_flow_does_not_block_the_gateway() {
     let mut up = open_upload(&wire, &mut guest.rx, 40_110, dst).await;
     upload_until_stalled(&wire, &mut guest.rx, &mut up).await;
     for i in 0..200 {
-        wire.send(up.segment(i, 0x5b)).await;
+        wire.send(up.segment(i)).await;
     }
     // Let the switch hand all of them to the gateway before the request.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1998,4 +2022,98 @@ async fn a_stalled_flow_does_not_block_the_gateway() {
         answered.is_ok(),
         "the gateway answers no ARP request while one flow is stalled"
     );
+}
+
+/// A listener that accepts one connection, reads nothing until it is told
+/// to, and then reads to the end. Returns its address, the sender that
+/// tells it, and the task that yields what it read.
+async fn host_that_reads_when_told() -> (
+    (Ipv4Addr, u16),
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Vec<u8>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tell, told) = tokio::sync::oneshot::channel();
+    let sink = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = told.await;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        received
+    });
+    ((Ipv4Addr::LOCALHOST, port), tell, sink)
+}
+
+/// A host that does not read closes the guest's window instead of blocking
+/// anything, and the flow goes on when the host reads again: the window
+/// reopens without a probe from the guest, and the host gets every byte the
+/// engine acknowledged, in order, and then the guest's FIN.
+#[tokio::test]
+async fn a_stalled_flow_closes_the_window_and_resumes_when_the_host_reads() {
+    let (dst, tell, sink) = host_that_reads_when_told().await;
+    let (engine, mut rx) = engine();
+    let wire = Wire::Engine(engine.clone());
+    let mut up = open_upload(&wire, &mut rx, 40_120, dst).await;
+    let last = upload_until_stalled(&wire, &mut rx, &mut up)
+        .await
+        .expect("the engine answered the upload");
+    assert_eq!(last.window, 0, "a full buffer is a closed window");
+    assert_eq!(last.ack, up.seq);
+
+    tell.send(()).unwrap();
+    let total = up.acked() + 200 * FULL_SEGMENT;
+    let mut window = last.window;
+    while up.acked() < total {
+        // The guest keeps to the window it is told, and sends no probe.
+        while usize::from(window) < FULL_SEGMENT {
+            window = recv_flow(&mut rx, dst).await.window;
+        }
+        let end = up.seq.wrapping_add(FULL_SEGMENT as u32);
+        wire.send(up.segment(0)).await;
+        while up.seq != end {
+            let t = recv_flow(&mut rx, dst).await;
+            if seq_after(t.ack, up.seq) {
+                up.seq = t.ack;
+            }
+            window = t.window;
+        }
+    }
+
+    let fin = tcp_frame(up.sport, dst, up.seq, up.ack, TCP_ACK | TCP_FIN, 65535, b"", &[]);
+    wire.send(fin).await;
+    let received = timeout(WAIT, sink)
+        .await
+        .expect("the host never saw the end of the upload")
+        .unwrap();
+    assert_eq!(received.len(), up.acked());
+    assert!(received == Upload::stream(up.acked()), "the upload arrived changed");
+}
+
+/// The guest's FIN behind buffered data: the host gets the data first and
+/// the end of the stream after it, not a stream cut short.
+#[tokio::test]
+async fn a_fin_behind_a_stalled_flow_reaches_the_host_after_the_data() {
+    let (dst, tell, sink) = host_that_reads_when_told().await;
+    let (engine, mut rx) = engine();
+    let wire = Wire::Engine(engine.clone());
+    let mut up = open_upload(&wire, &mut rx, 40_130, dst).await;
+    upload_until_stalled(&wire, &mut rx, &mut up).await;
+
+    let fin = tcp_frame(up.sport, dst, up.seq, up.ack, TCP_ACK | TCP_FIN, 65535, b"", &[]);
+    wire.send(fin).await;
+    loop {
+        let t = recv_flow(&mut rx, dst).await;
+        if t.ack == up.seq.wrapping_add(1) {
+            break;
+        }
+    }
+
+    tell.send(()).unwrap();
+    let received = timeout(WAIT, sink)
+        .await
+        .expect("the host never saw the end of the upload")
+        .unwrap();
+    assert_eq!(received.len(), up.acked());
+    assert!(received == Upload::stream(up.acked()), "the upload arrived changed");
 }
