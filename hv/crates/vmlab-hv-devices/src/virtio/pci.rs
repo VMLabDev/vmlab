@@ -1991,6 +1991,47 @@ mod tests {
         assert_eq!(control(&mut g) & 0x03FF, 1);
     }
 
+    /// Review F20: a feature write after FEATURES_OK, and the status
+    /// written again, must not give a live device another feature set.
+    #[test]
+    fn features_are_fixed_after_features_ok() {
+        let mut g = Guest::new();
+        g.setup_msix();
+        g.negotiate_and_activate(0);
+        // Bytes 5..13 of the block state are its acknowledged features.
+        let acked = |g: &Guest| g.pci.device().save_state().unwrap()[5..13].to_vec();
+        let first = acked(&g);
+        assert_ne!(first, [0u8; 8]);
+        let status = g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS);
+        assert_eq!(status, 0x0F);
+
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 0);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, status);
+
+        assert_eq!(acked(&g), first);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x0F);
+        // The driver reads back the set that is in force.
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
+        assert_eq!(
+            g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE).to_le_bytes(),
+            first[..4]
+        );
+
+        // Dropping FEATURES_OK without a reset does not reopen negotiation.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x03);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 0);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0F);
+        assert_eq!(acked(&g), first);
+
+        // A reset does.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 1);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1); // VERSION_1
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0B);
+        assert_eq!(acked(&g), (1u64 << 32).to_le_bytes());
+    }
+
     #[test]
     fn features_ok_rejects_unknown_bits() {
         let mut g = Guest::new();
