@@ -1452,6 +1452,54 @@ async fn nat_refuses_loopback_without_isolation() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// TCP to the gateway address itself (networking review F18, card #520)
+// ---------------------------------------------------------------------------
+
+/// A guest's SYN to its gateway address on a port nothing serves is reset
+/// by the engine itself: no flow is opened and no host socket dials that
+/// address, which the host does not own. The reset is on the output channel
+/// when `handle_frame` returns, so the test reads it without waiting.
+#[tokio::test]
+async fn a_syn_to_the_gateway_itself_is_reset() {
+    let (engine, mut rx) = engine();
+    let dst = (GW_IP, 22);
+    let seg = frame::tcp_build(
+        GUEST_IP,
+        dst.0,
+        TcpFields {
+            src_port: 40300,
+            dst_port: dst.1,
+            seq: 777,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            options: &[],
+        },
+        &[],
+    )
+    .unwrap();
+    let pkt = frame::ipv4_build(GUEST_IP, dst.0, IPPROTO_TCP, 64, &seg, 9).unwrap();
+    let f = frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt);
+    engine.handle_frame(Bytes::from(f)).await;
+
+    assert!(
+        engine.tcp_flows.lock().unwrap().is_empty(),
+        "a flow was opened for the gateway address: the host dials it"
+    );
+    let f = rx
+        .try_recv()
+        .expect("no reset for a SYN to the gateway address");
+    let eth = EthView::parse(&f).unwrap();
+    assert_eq!(eth.dst_mac(), GUEST_MAC);
+    let ip = Ipv4View::parse(eth.payload()).unwrap();
+    assert_eq!((ip.src(), ip.dst()), (GW_IP, GUEST_IP));
+    let t = TcpView::parse(ip.payload()).unwrap();
+    assert_ne!(t.flags() & TCP_RST, 0, "the SYN is reset");
+    assert_eq!(t.ack(), 778, "the reset acks the SYN");
+    assert_eq!((t.src_port(), t.dst_port()), (22, 40300));
+}
+
 /// The same for the rest of `127.0.0.0/8`, for `0.0.0.0`, and for UDP and
 /// ICMP, which are dropped: no flow, no probe, no reply.
 #[tokio::test]
