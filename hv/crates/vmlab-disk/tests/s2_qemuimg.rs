@@ -1109,6 +1109,72 @@ fn a_write_to_a_cluster_qemu_zeroed_in_place_reads_back() {
     qemu_check(&path);
 }
 
+/// Text like `base64 /dev/urandom`: it compresses to about three quarters,
+/// so the compressed clusters start at many sector offsets.
+fn base64_like(len: usize, seed: u64) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ALPHABET[(x >> 32) as usize & 63]
+        })
+        .collect()
+}
+
+/// F3 of docs/reviews/vmlab-disk.md: the refcount range of a compressed
+/// cluster ends at the end of its last sector, so overwriting every cluster
+/// of a `qemu-img convert -c` image takes no reference from a neighbour.
+#[test]
+fn overwriting_a_qemu_compressed_image_keeps_refcounts() {
+    require_qemu_img!();
+    let temp = tmpdir("compressed-refcounts");
+    let dir = temp.path();
+    let size = 64 << 20;
+    let cluster = 64 << 10;
+    let src = dir.join("src.raw");
+    std::fs::write(&src, base64_like(size, 0x5eed)).unwrap();
+    let written = base64_like(size, 0xf00d);
+    let expected = dir.join("expected.raw");
+    std::fs::write(&expected, &written).unwrap();
+    for compat in ["1.1", "0.10"] {
+        let path = dir.join(format!("c-{compat}.qcow2"));
+        qemu_img(&[
+            "convert",
+            "-c",
+            "-f",
+            "raw",
+            "-O",
+            "qcow2",
+            "-o",
+            &format!("compat={compat}"),
+            src.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ]);
+        {
+            let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+            for offset in (0..size).step_by(cluster) {
+                image
+                    .write_at(offset as u64, &written[offset..offset + cluster])
+                    .unwrap_or_else(|e| panic!("compat {compat}: write at {offset}: {e}"));
+            }
+            image.flush().unwrap();
+        }
+        qemu_check(&path);
+        qemu_img(&[
+            "compare",
+            "-f",
+            "qcow2",
+            "-F",
+            "raw",
+            path.to_str().unwrap(),
+            expected.to_str().unwrap(),
+        ]);
+    }
+}
+
 #[test]
 fn s2_discard_and_zero_semantics() {
     require_qemu_img!();
