@@ -229,7 +229,7 @@ impl State {
 
 /// Write `bytes` across the writable descriptors of a held chain. The
 /// device checked at hold time that they are long enough.
-fn write_response(mem: &GuestMemory, segments: &[(GuestAddress, u32)], bytes: &[u8]) {
+pub(super) fn write_response(mem: &GuestMemory, segments: &[(GuestAddress, u32)], bytes: &[u8]) {
     let mut rest = bytes;
     for &(addr, len) in segments {
         if rest.is_empty() {
