@@ -604,6 +604,12 @@ Not read:
   `save_state()` bytes 5..13, the acknowledged features, are unchanged).
   Today they change.
 - Confidence: high.
+- Fixed in card #428. The set accepted at `FEATURES_OK` (or at `DRIVER_OK`
+  from a legacy driver) is fixed until the next reset: a later
+  `GUEST_FEATURE` write, modern or legacy, is ignored, and a status write
+  does not call `ack_features` again. The driver reads back the set in
+  force. The proof test fails before the fix (the block device's
+  acknowledged features become 0) and passes after it.
 
 ### F21. PCI root: a queue doorbell stays registered while memory decoding is off
 

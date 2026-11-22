@@ -428,11 +428,10 @@ fn run(
             wake_pending.swap(false, Ordering::AcqRel);
             let features = negotiated.load(Ordering::Acquire);
             let hdr = hdr_len(features);
+            let mut barriers = Vec::new();
             while let Ok(cmd) = cmds.try_recv() {
                 match cmd {
-                    Cmd::Barrier(done) => {
-                        let _ = done.send(());
-                    }
+                    Cmd::Barrier(done) => barriers.push(done),
                     Cmd::Shutdown => shutdown = true,
                 }
             }
@@ -446,6 +445,12 @@ fn run(
                 features & F_CSUM != 0,
                 features & F_GUEST_CSUM != 0,
             );
+            // A barrier is acknowledged after the pass it woke: the sender
+            // may change shared state as soon as it returns, and this pass
+            // must not run against that state.
+            for done in barriers {
+                let _ = done.send(());
+            }
         }
 
         if stream.is_some() {
