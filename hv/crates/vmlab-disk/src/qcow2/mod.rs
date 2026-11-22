@@ -1431,6 +1431,12 @@ impl DiskImage for Qcow2Image {
             .ok_or_else(|| Error::Unsupported("vmstate offset overflows u64".into()))?;
         self.read_bytes(offset, buf)
     }
+
+    fn discard_vmstate(&mut self, len: u64) -> Result<()> {
+        self.check_writable()?;
+        self.punch_vmstate(len)?;
+        self.flush()
+    }
 }
 
 /// Closing an image writes its cached metadata. Data clusters are written at

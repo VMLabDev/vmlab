@@ -268,13 +268,18 @@ impl Qcow2Image {
 
     /// Replace the vmstate entries of the active L1 with zero-flag
     /// descriptors, COWing L2 tables that became shared.
-    fn punch_vmstate(&mut self, vm_state_size: u64) -> Result<()> {
+    pub(crate) fn punch_vmstate(&mut self, vm_state_size: u64) -> Result<()> {
+        if vm_state_size == 0 {
+            return Ok(());
+        }
         let base = self.vmstate_base();
-        let end = base + vm_state_size;
+        let end = base
+            .checked_add(vm_state_size)
+            .ok_or_else(|| Error::Unsupported("vmstate range overflows u64".into()))?;
         let shift = self.cluster_bits + (self.cluster_bits - 3);
         let first_l1 = (base >> shift) as usize;
         let last_l1 = ((end - 1) >> shift) as usize;
-        for l1_index in first_l1..=last_l1.min(self.l1.len().saturating_sub(1)) {
+        for l1_index in first_l1..(last_l1 + 1).min(self.l1.len()) {
             let l2_host = self.l1[l1_index] & OFFSET_MASK;
             if l2_host == 0 {
                 continue;
@@ -300,7 +305,7 @@ impl Qcow2Image {
             } else {
                 0
             };
-            let idx_end = ((end - entry_start) / self.cluster_size).min(l2e);
+            let idx_end = (end - entry_start).div_ceil(self.cluster_size).min(l2e);
             for l2_index in idx_start..idx_end {
                 let entry = self.l2_entry(active_l2, l2_index)?;
                 if entry == 0 {
