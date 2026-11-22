@@ -1255,6 +1255,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_trunk_forms_again_after_the_dialer_detaches() {
+        let mut a = instance("secret").await;
+        let mut b = instance("secret").await;
+        let target = b.addr.to_string();
+        b.globals.attach("wan", None, None, None).await.unwrap();
+        a.globals
+            .attach("wan", None, Some(target.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+
+        let (old_switch, dialer, gateway_sender) = {
+            let segs = a.globals.segs.lock().await;
+            let seg = &segs["wan"];
+            (
+                seg.switch.clone(),
+                seg.dialer.as_ref().unwrap().abort_handle(),
+                seg.gateway.sender(),
+            )
+        };
+        assert_eq!(old_switch.stats().ports, 2);
+        a.globals.detach("wan", None).await;
+        while !dialer.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        // Keep the gateway port registered so the count isolates the TCP port.
+        assert_eq!(
+            old_switch.stats().ports,
+            1,
+            "dialed trunk port survived detach"
+        );
+        drop(gateway_sender);
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.down");
+
+        let (a_sock, _) = a
+            .globals
+            .attach("wan", None, Some(target), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+
+        // Register B's test port before sending so the frame cannot pass it by.
+        let b_switch = b.globals.segs.lock().await["wan"].switch.clone();
+        let mut b_port = b_switch.add_channel_port(PortClass::Service);
+        let mut a_client = trunk_client(&a_sock).await;
+        let frame = bcast(b"after reattach");
+        write_frame(&mut a_client, &frame).await.unwrap();
+        assert_eq!(b_port.rx.recv().await.unwrap(), frame);
+    }
+
+    #[tokio::test]
     async fn mutual_dial_converges_to_one_trunk() {
         let mut a = instance("s3kr1t").await;
         let mut b = instance("s3kr1t").await;
