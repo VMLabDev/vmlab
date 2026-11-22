@@ -177,6 +177,11 @@ impl VmDirs {
     pub fn qmp_sock(&self) -> PathBuf {
         self.run.join("qmp.sock")
     }
+    /// The file QEMU reads the Apple SMC key from (§5.2). It exists only
+    /// while QEMU starts.
+    pub fn apple_smc_config(&self) -> PathBuf {
+        self.run.join("applesmc.cfg")
+    }
     /// The socket the VM's hypervisor is controlled on: QMP for QEMU,
     /// vmlab-hv's own protocol beside it (§22). vmlab-hv binds
     /// `display.sock` and `vnc.sock` in the same directory.
@@ -936,6 +941,7 @@ impl VmInstance {
             } else {
                 None
             },
+            apple_smc_config: self.dirs.apple_smc_config(),
             qmp_sock: self.dirs.qmp_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),

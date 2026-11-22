@@ -56,10 +56,23 @@ impl Hypervisor for Qemu {
         let (binary, args) = compose(&spec.machine)?;
         crate::qemu::process::write_launch_header(&spec.log, &binary, &args, &spec.env)?;
         let log_from = crate::qemu::process::log_offset(&spec.log);
-        let proc =
-            Proc::spawn_with_fds(&spec.label, &binary, &args, &spec.env, &spec.log, spec.fds)
-                .await?;
+        // QEMU reads the file while it parses its options, which is before
+        // it binds the QMP socket. So the file goes when QMP answers, or
+        // when the start fails.
+        let key_file = AppleSmcKeyFile::write(&spec.machine)?;
+        let secrets = key_file.iter().map(|f| f.key.clone()).collect();
+        let proc = Proc::spawn_with_fds(
+            &spec.label,
+            &binary,
+            &args,
+            &spec.env,
+            &spec.log,
+            spec.fds,
+            secrets,
+        )
+        .await?;
         let qmp = connect_qmp_retry(&spec.control_sock, &proc, &spec.log, log_from).await?;
+        drop(key_file);
         // QEMU binds the guest channels itself, from the argv — this adapter
         // has nothing to stand up, only to say where they landed. It is the
         // first thing anyone wants when a terminal will not attach.
@@ -81,6 +94,63 @@ impl Hypervisor for Qemu {
 
     fn guest_asset(&self, arch: &str) -> Result<GuestAsset> {
         crate::guest_asset::ensure_guest_asset(arch)
+    }
+}
+
+/// The `-readconfig` file that carries the Apple SMC key to QEMU (§5.2),
+/// readable by this user only and removed on drop. The key is in no argv
+/// element, because every local user reads `/proc/<pid>/cmdline`.
+struct AppleSmcKeyFile {
+    path: std::path::PathBuf,
+    key: String,
+}
+
+impl AppleSmcKeyFile {
+    /// Write the file of a VM with an Apple SMC; `None` for every other launch.
+    fn write(launch: &Launch) -> Result<Option<Self>> {
+        let Launch::Vm {
+            resolved, paths, ..
+        } = launch
+        else {
+            return Ok(None);
+        };
+        let Some(key) = paths.apple_smc_osk.as_ref().filter(|_| resolved.apple_smc) else {
+            return Ok(None);
+        };
+        Self::write_at(&paths.apple_smc_config, key).map(Some)
+    }
+
+    fn write_at(path: &Path, key: &crate::config::host::AppleSmcOsk) -> Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let text = crate::qemu::apple_smc_config(key)?;
+        // A file left by a killed daemon may have another mode or be a
+        // link: `create_new` after the removal makes this one ours at 0600.
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("removing {}", path.display()));
+            }
+            _ => {}
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        let guard = Self {
+            path: path.to_path_buf(),
+            key: key.expose().to_string(),
+        };
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(guard)
+    }
+}
+
+impl Drop for AppleSmcKeyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -380,6 +450,30 @@ async fn connect_qmp_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Apple SMC key file is this user's alone, replaces whatever stood
+    /// at its path, and is gone when the start is over (config review F3).
+    #[test]
+    fn the_apple_smc_key_file_is_private_and_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("applesmc.cfg");
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let key = crate::config::host::AppleSmcOsk::parse("TEST".repeat(16)).unwrap();
+        let file = AppleSmcKeyFile::write_at(&path, &key).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            crate::qemu::apple_smc_config(&key).unwrap()
+        );
+        assert_eq!(file.key, "TEST".repeat(16));
+        drop(file);
+        assert!(!path.exists());
+    }
 
     /// An emulator that dies before QMP comes up is reported as such rather
     /// than hanging for the full connect window — the failure a missing
