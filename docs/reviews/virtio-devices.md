@@ -629,6 +629,17 @@ Not read:
   Program BAR 0, set command bit 1, then clear it. Assert that the last
   entry of `placements` for the BAR is `None`. Today it is `Some(addr)`.
 - Confidence: high.
+- Fixed in card #429. On a q35 root the address given to `set_bar_address`
+  is `None` while the BAR's decode bit of the command register is clear
+  (bit 1 for a memory BAR, bit 0 for an I/O BAR), on a config write and on a
+  restore of the BAR state, as `decode_mmio` and `find_bar` already decide.
+  The root of a container machine, which does not check the command
+  register on dispatch, is unchanged. `doorbells_follow_the_memory_enable_bit`
+  fails before the fix (`Some(0xc2000000)` after BAR 0 is programmed with
+  memory decoding off) and passes after it.
+  - Not fixed here: the kernel path matches only `base + 4 * queue` (the
+    harmless difference above), and a command register that the device
+    changes by itself, without a config write, moves no placement.
 
 ### F22. virtio-gpu: a fenced release after the loss of the host GPU is answered with an error
 
