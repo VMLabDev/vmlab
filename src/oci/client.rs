@@ -3552,6 +3552,36 @@ mod tests {
         );
     }
 
+    /// A registry that takes connections and holds them without a byte:
+    /// the stand-in for a silent registry, token realm or mirror.
+    async fn silent_registry() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                held.push(sock);
+            }
+        });
+        addr
+    }
+
+    /// Review F10: a registry that accepts the connection and then sends
+    /// nothing must fail the request, not hold it for ever.
+    #[tokio::test]
+    async fn a_registry_that_never_answers_times_out() {
+        let addr = silent_registry().await;
+        let transport = HttpTransport::new(addr.to_string(), Credential::Anonymous).unwrap();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.get_manifest("acme/ubuntu", "1.0.0"),
+        )
+        .await
+        .expect("the transport must give up by itself");
+        assert!(answer.is_err(), "a silent registry is an error");
+    }
+
     /// A refusal the registry means is reported, not retried into silence.
     #[tokio::test]
     async fn a_refused_blob_is_not_retried() {
