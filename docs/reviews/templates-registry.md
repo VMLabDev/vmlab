@@ -35,7 +35,7 @@ much as a Makefile is.
 | F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` (fixed, #465) |
 | F9 | wrong result | A hard link in a container layer loses its target when a higher layer deletes or replaces that target |
 | F10 | wrong result | The registry HTTP client has no timeout |
-| F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest |
+| F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest (fixed, #504) |
 | F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" |
 | F13 | wrong result | A cancelled pull removes the work directory under the install that is still running |
 | F14 | wrong result | Staging directories of the store, of pulls, of pushes and of the image cache are never swept |
@@ -453,6 +453,11 @@ much as a Makefile is.
   Today it installs, and a second `pull` of the same reference fails with
   "different disk". Push test `a_push_refuses_a_disk_that_is_not_the_recorded_one`:
   flip one byte of a stored `disk.qcow2`, push, expect an error.
+- Fixed in card #504: a pull refuses a config blob whose `sha256` is not
+  the manifest's whole-image digest, before it fetches a chunk, and records
+  the verified digest. A push refuses a base disk or a variant overlay
+  that does not hash to the digest its metadata records, before it uploads
+  that disk.
 
 ### F12. Two pulls of one template at the same time (wrong result)
 
