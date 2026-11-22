@@ -308,6 +308,13 @@ Not read:
   buffer. Assert that the 60-byte frame arrives. Today each buffer comes
   back with used length 0 and nothing arrives.
 - Confidence: high.
+- Fixed in card #401. Both paths place a frame through `receive_single`.
+  A chain that holds the header but not the frame is returned with length 0
+  and the frame is dropped, as the mergeable path does. The tests
+  `oversized_frame_without_mergeable_buffers_is_dropped` and
+  `oversized_vnet_frame_without_mergeable_buffers_is_dropped` fail before
+  the fix (the second buffer came back with length 0, not 72) and pass
+  after it.
 
 ### F9. virtio-gpu: chains held for a vblank or a fence have no upper limit
 

@@ -999,6 +999,40 @@ fn receive_merged_header(
     Ok(Receive::Delivered)
 }
 
+fn receive_single(
+    mem: &GuestMemory,
+    q: &mut Queue,
+    chain: DescriptorChain<&GuestMemory>,
+    header: &[u8],
+    frame: &[u8],
+    guest_csum: bool,
+) -> Result<Receive, ()> {
+    let head = chain.head_index();
+    let need = header.len() + frame.len();
+    let (written, result) = match ReceiveWriter::new(mem, chain) {
+        Ok(mut writer) if writer.available_bytes() >= need => {
+            let mut checksum = guest_csum.then(|| CopyChecksum::receive(frame)).flatten();
+            if writer.write_all(header).is_ok()
+                && writer.write_frame(frame, checksum.as_mut()).is_ok()
+                && (!checksum.as_ref().is_some_and(CopyChecksum::valid)
+                    || writer.set_flags(HDR_F_DATA_VALID).is_ok())
+            {
+                (need as u32, Receive::Delivered)
+            } else {
+                (0, Receive::Retry)
+            }
+        }
+        Ok(writer) if writer.available_bytes() >= header.len() => {
+            // A valid receive buffer cannot hold the frame. Return the
+            // buffer empty and drop the frame so the next one can proceed.
+            (0, Receive::Delivered)
+        }
+        _ => (0, Receive::Retry),
+    };
+    q.add_used(mem, head, written).map_err(|_| ())?;
+    Ok(result)
+}
+
 fn receive_offload_supported(header: Header, frame: &[u8], features: u64) -> bool {
     if header.flags & NEEDS_CSUM != 0 && features & F_GUEST_CSUM == 0 {
         return false;
@@ -1095,33 +1129,18 @@ fn place_vnet_rx_frames(
             match q.iter(mem).ok().and_then(|mut iter| iter.next()) {
                 None => Ok(Receive::Wait(q.next_avail())),
                 Some(chain) => {
-                    let head = chain.head_index();
                     let mut header = metadata.encode();
                     if hdr_len == 12 {
                         header[10..].copy_from_slice(&1u16.to_le_bytes());
                     }
-                    let need = hdr_len + frame.len();
-                    let mut checksum = (guest_csum && metadata.flags == 0)
-                        .then(|| CopyChecksum::receive(frame))
-                        .flatten();
-                    let written = if let Ok(mut writer) = ReceiveWriter::new(mem, chain)
-                        && writer.available_bytes() >= need
-                        && writer.write_all(&header[..hdr_len]).is_ok()
-                        && writer.write_frame(frame, checksum.as_mut()).is_ok()
-                        && (!checksum.as_ref().is_some_and(CopyChecksum::valid)
-                            || writer.set_flags(HDR_F_DATA_VALID).is_ok())
-                    {
-                        need as u32
-                    } else {
-                        0
-                    };
-                    q.add_used(mem, head, written).map_err(|_| ()).map(|()| {
-                        if written == 0 {
-                            Receive::Retry
-                        } else {
-                            Receive::Delivered
-                        }
-                    })
+                    receive_single(
+                        mem,
+                        q,
+                        chain,
+                        &header[..hdr_len],
+                        frame,
+                        guest_csum && metadata.flags == 0,
+                    )
                 }
             }
         };
@@ -1374,28 +1393,20 @@ fn place_rx_frames(shared: &Arc<Mutex<Shared>>, hdr_len: usize, mergeable: bool,
                     }
                 };
                 let Some(chain) = chain else { break };
-                let head = chain.head_index();
-                let need = hdr.len() + frame.len();
-                let mut written = 0;
-                let mut checksum = guest_csum.then(|| CopyChecksum::receive(frame)).flatten();
-                if let Ok(mut writer) = ReceiveWriter::new(mem, chain)
-                    && writer.available_bytes() >= need
-                    && writer.write_all(&hdr).is_ok()
-                    && writer.write_frame(frame, checksum.as_mut()).is_ok()
-                    && (!checksum.as_ref().is_some_and(CopyChecksum::valid)
-                        || writer.set_flags(HDR_F_DATA_VALID).is_ok())
-                {
-                    written = need as u32;
+                match receive_single(mem, q, chain, &hdr, frame, guest_csum) {
+                    Ok(Receive::Delivered) => {
+                        used_any = true;
+                        sh.rx_pending.pop_front();
+                    }
+                    Ok(Receive::Retry | Receive::Wait(_)) => {
+                        used_any = true;
+                        break;
+                    }
+                    Err(()) => {
+                        invalid = true;
+                        break;
+                    }
                 }
-                if q.add_used(mem, head, written).is_err() {
-                    invalid = true;
-                    break;
-                }
-                used_any = true;
-                if written == 0 {
-                    break;
-                }
-                sh.rx_pending.pop_front();
             }
             // Socket input drives RX while buffers are available. If a frame
             // is waiting, arm the refill kick and check for a raced refill.
