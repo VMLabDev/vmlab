@@ -1589,6 +1589,9 @@ pub fn build(
             } else {
                 kvm.seabios_pci64_base(layout.ram_top() > 1 << 32)
             }),
+            pci64_size: crate::vfio::pci64_window(
+                vfio.iter().flat_map(|device| device.lock().bars()),
+            ),
             tpm: tpm.is_some(),
             smm: secure_smm,
         };

@@ -560,6 +560,19 @@ impl Drop for Host {
     }
 }
 
+/// Length of the 64-bit PCI window PCI0._CRS must declare for these assigned
+/// BARs. Firmware packs 64-bit BARs largest first from the window base, so
+/// the assigned ones can push every other device's past the default 32 GiB:
+/// a 32 GiB BAR alone fills it. A guest OS that finds a BAR outside the
+/// window treats the firmware's placement as a conflict.
+pub(crate) fn pci64_window(bars: impl Iterator<Item = BarInfo>) -> u64 {
+    let assigned: u64 = bars
+        .filter(|bar| matches!(bar.kind, BarKind::Mmio64 { .. }))
+        .map(|bar| bar.size)
+        .sum();
+    vmlab_hv_firmware::acpi::PCI64_SIZE + assigned.div_ceil(1 << 30) * (1 << 30)
+}
+
 pub(crate) fn build(
     desc: &MachineDescription,
     kvm: &crate::kvm::KvmVm,
@@ -787,6 +800,23 @@ mod tests {
         assert!(error.contains("only 8 MiB"), "{error}");
         assert!(error.contains("RLIMIT_MEMLOCK"), "{error}");
         assert!(error.contains("ulimit -l unlimited"), "{error}");
+    }
+
+    #[test]
+    fn the_64_bit_pci_window_grows_by_the_assigned_64_bit_bars() {
+        let bar = |index, size, kind| BarInfo { index, size, kind };
+        let wide = BarKind::Mmio64 { prefetchable: true };
+        assert_eq!(pci64_window(std::iter::empty()), 32 << 30);
+        // An RTX 5090: 64 MiB of registers, 32 GiB and 32 MiB prefetchable,
+        // an I/O BAR and the ROM.
+        let gpu = [
+            bar(0, 64 << 20, BarKind::Mmio32),
+            bar(1, 32 << 30, wide),
+            bar(3, 32 << 20, wide),
+            bar(5, 0x80, BarKind::Io),
+            bar(6, 512 << 10, BarKind::Mmio32),
+        ];
+        assert_eq!(pci64_window(gpu.into_iter()), 65 << 30);
     }
 
     #[test]
