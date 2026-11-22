@@ -165,7 +165,12 @@ pub async fn serve(runtime: &Arc<LabRuntime>) -> Result<Option<BuildLabServer>> 
         lab: Arc::downgrade(runtime),
         tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
     });
-    let server = Server::bind(&sock, handler).await?;
+    let server = match Server::bind(&sock, handler).await {
+        Ok(server) => server,
+        // A daemon that holds the socket's guard and has not bound yet.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     Ok(Some(BuildLabServer {
         _server: server,
         sock,
