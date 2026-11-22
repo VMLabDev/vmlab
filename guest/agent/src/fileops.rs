@@ -361,7 +361,8 @@ impl Session {
                     set_mode(&path, mode).context(&path)?;
                 }
                 if attrs.size.is_some() || attrs.mtime_ns.is_some() || attrs.atime_ns.is_some() {
-                    let file = OpenOptions::new().write(true).open(&path).context(&path)?;
+                    let file =
+                        open_bounded(OpenOptions::new().write(true), &path).context(&path)?;
                     if let Some(size) = attrs.size {
                         file.set_len(size).context(&path)?;
                     }
@@ -521,6 +522,41 @@ impl<T> Context<T> for std::io::Result<T> {
     }
 }
 
+/// Open `path`, refusing what would take a worker for good (guest-agent
+/// review F8): a FIFO blocks in `open(2)` until a peer comes, a character
+/// device such as `/dev/zero` has no end for a digest to reach, and a worker
+/// has no cancel. The path is checked first, so the refusal reads the same
+/// for every access; `O_NONBLOCK` then makes the open itself return if a
+/// FIFO was put there in between, and the handle is checked again. A block
+/// device is finite and stays allowed. Windows has no such check.
+fn open_bounded(opts: &mut OpenOptions, path: &str) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            refuse_endless(&meta)?;
+        }
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    refuse_endless(&file.metadata()?)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn refuse_endless(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = meta.file_type();
+    if kind.is_fifo() || kind.is_char_device() || kind.is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(())
+}
+
 fn open_file(path: &str, flags: OpenFlags, mode: Option<u32>) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     // An open that names no access at all is a read, which is what a client
@@ -536,7 +572,7 @@ fn open_file(path: &str, flags: OpenFlags, mode: Option<u32>) -> std::io::Result
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
     }
-    let file = opts.open(path)?;
+    let file = open_bounded(&mut opts, path)?;
     // `OpenOptionsExt::mode` only takes when the open actually created the
     // file, and a push over one that already exists still means the mode it
     // asked for. Windows has no Unix bits and ignores this entirely — the
@@ -781,7 +817,7 @@ fn realpath(path: &str) -> String {
 }
 
 fn digest_file(path: &str) -> std::io::Result<(String, u64)> {
-    let mut file = File::open(path)?;
+    let mut file = open_bounded(OpenOptions::new().read(true), path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut len = 0u64;
