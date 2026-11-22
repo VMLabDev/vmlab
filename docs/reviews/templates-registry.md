@@ -236,6 +236,11 @@ much as a Makefile is.
   feature bit 2 set and a data-file extension (type `0x44415441`) naming
   `/etc/hostname`, and call `verify_base`. Expect an error. Today it returns
   `Ok`. The same for `verify_variants` with a correct backing name.
+- Fixed in card #462. `refuse_qcow2_data_file` in `src/template/store.rs`
+  refuses a qcow2 whose header has incompatible-feature bit 2 or a data-file
+  header extension, with either image tool. `verify_base`, `verify_variants`
+  and the variant pull in `src/oci/client.rs` call it. The variant case has
+  its own test, `a_variant_with_an_external_data_file_is_refused`.
 
 ### F8. `template login` destroys a docker config it cannot parse (data loss)
 

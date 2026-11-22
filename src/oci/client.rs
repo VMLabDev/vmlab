@@ -868,6 +868,8 @@ impl Registry {
                         == Some(crate::template::store::VARIANT_BACKING),
                     "untrusted variant backing file"
                 );
+                crate::template::store::refuse_qcow2_data_file(&disk)
+                    .with_context(|| format!("variant `{}`", variant.name))?;
                 variants.push(variant);
             }
             match local {

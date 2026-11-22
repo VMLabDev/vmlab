@@ -882,6 +882,75 @@ pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&name).into_owned()))
 }
 
+/// The incompatible-feature bit that says a qcow2 image keeps the guest's
+/// clusters in a second host file.
+const QCOW2_INCOMPAT_DATA_FILE: u64 = 1 << 2;
+/// The header extension that names that second file.
+const QCOW2_EXT_DATA_FILE: u32 = 0x4441_5441;
+/// The largest qcow2 cluster, which bounds where header extensions can lie.
+const QCOW2_MAX_CLUSTER: u64 = 2 << 20;
+
+/// Refuse a qcow2 image that keeps its data in an external file. QEMU and
+/// `qemu-img` open the host file such an image names when they open the
+/// image, so a pulled or imported disk could hand the guest any file its
+/// user can read. Refused on the feature bit and on the extension alone,
+/// whichever image tool is selected. A file that is not qcow2 passes.
+pub fn refuse_qcow2_data_file(path: &Path) -> Result<()> {
+    use std::io::Read;
+    regular_file(path)?;
+    let f = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut head = Vec::new();
+    f.take(QCOW2_MAX_CLUSTER)
+        .read_to_end(&mut head)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let be32 = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(head.get(at..at + 4)?.try_into().ok()?))
+    };
+    let be64 = |at: usize| -> Option<u64> {
+        Some(u64::from_be_bytes(head.get(at..at + 8)?.try_into().ok()?))
+    };
+    if head.get(..4) != Some(b"QFI\xfb".as_slice()) {
+        return Ok(());
+    }
+    let refused = || {
+        anyhow!(
+            "{} is a qcow2 image with an external data file, which a template disk must not have",
+            path.display()
+        )
+    };
+    // Version 2 has neither feature bits nor a header length. Its
+    // extensions start right after its 72-byte header.
+    let mut at = 72;
+    if be32(4).is_some_and(|version| version >= 3) {
+        if be64(72).is_some_and(|bits| bits & QCOW2_INCOMPAT_DATA_FILE != 0) {
+            return Err(refused());
+        }
+        at = be32(100).map_or(104, |len| (len as usize).max(104));
+    }
+    // Extensions end at the backing file name when there is one.
+    let end = match be64(8) {
+        Some(backing) if backing != 0 => head.len().min(backing as usize),
+        _ => head.len(),
+    };
+    while let (Some(kind), Some(len)) = (be32(at), be32(at + 4)) {
+        if kind == 0 || at + 8 > end {
+            break;
+        }
+        if kind == QCOW2_EXT_DATA_FILE {
+            return Err(refused());
+        }
+        // Each extension's data is padded to eight bytes.
+        let Some(next) = (len as usize)
+            .checked_next_multiple_of(8)
+            .and_then(|padded| at.checked_add(8)?.checked_add(padded))
+        else {
+            break;
+        };
+        at = next;
+    }
+    Ok(())
+}
+
 fn regular_file(path: &Path) -> Result<()> {
     ensure!(
         fs::symlink_metadata(path)?.file_type().is_file(),
@@ -902,6 +971,7 @@ pub(crate) fn verify_base(path: &Path) -> Result<()> {
             qcow2_backing_file(path)?.is_none(),
             "template base disk must not have a backing file"
         );
+        refuse_qcow2_data_file(path)?;
     }
     Ok(())
 }
@@ -1024,6 +1094,8 @@ fn verify_variants(dir: &Path, meta: &TemplateMeta, base_digest: Option<&str>) -
             v.name,
             backing.as_deref().unwrap_or("nothing")
         );
+        refuse_qcow2_data_file(&overlay)
+            .with_context(|| format!("variant `{}` of {reference}", v.name))?;
     }
     Ok(())
 }
