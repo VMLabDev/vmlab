@@ -108,7 +108,7 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, reso
 /// Frame records off the channel and hand them to the workers. The one thing
 /// this thread must not do is serve a request: a read that blocks here would
 /// stop the channel being read at all, and with it every reply's credit.
-fn read_loop(session: Arc<Session>, input: Receiver<Input>, tx: SyncSender<Work>) {
+fn read_loop(session: Arc<Session>, input: crate::mux::InputRx, tx: SyncSender<Work>) {
     let mut decoder = RecordDecoder::new();
     let mut window = RecvWindow::default();
     for msg in input {

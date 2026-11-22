@@ -118,7 +118,7 @@ pub fn open(mux: &Mux, id: u32, root: String, prune: Vec<String>) {
 ///
 /// A drain is handed to the sender thread rather than answered here, so this
 /// thread keeps reading the channel while a batch is on the wire.
-fn drain_loop(watch: Arc<Watch>, input: std::sync::mpsc::Receiver<Input>) {
+fn drain_loop(watch: Arc<Watch>, input: crate::mux::InputRx) {
     let mut decoder = RecordDecoder::new();
     let mut window = RecvWindow::default();
     for msg in input {
