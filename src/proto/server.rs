@@ -2,7 +2,7 @@
 //! handler, fan out events to subscribed connections.
 
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -57,12 +57,128 @@ pub trait Handler<R: WireRequest>: Send + Sync + 'static {
 pub struct Server<R: WireRequest> {
     pub events: broadcast::Sender<Event>,
     handle: tokio::task::JoinHandle<()>,
+    /// Held for as long as the server lives; dropped after `Drop` has
+    /// removed the socket file.
+    guard: SocketGuard,
     _vocabulary: PhantomData<fn() -> R>,
 }
 
+/// The right to serve one control socket: what makes a daemon the only one
+/// at its path.
+///
+/// It is an exclusive `flock` on `<socket>.lock`, which the kernel drops when
+/// the holder dies however it dies, so a killed daemon leaves nothing stale.
+/// A daemon takes it before it touches anything a peer would also own (the
+/// lab's state file, the registry) and keeps it until it exits; binding the
+/// socket needs one. Taking it also refuses a path somebody still accepts
+/// connections on without holding the lock — a daemon whose lock file was
+/// removed under it, or one from a build that took none. The lock file holds
+/// the holder's pid while it is held.
+#[derive(Debug)]
+pub struct SocketGuard {
+    path: PathBuf,
+    lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+/// How often, and how far apart, [`SocketGuard::acquire`] looks again at a
+/// lock that names no live holder before it refuses: one second in all.
+const LEAK_TRIES: u32 = 200;
+const LEAK_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        // No pid in the file says the lock is free or about to be: see the
+        // retry in `acquire`.
+        let _ = self.lock.set_len(0);
+    }
+}
+
+impl SocketGuard {
+    /// Take the guard of the socket at `path` (parent directories created),
+    /// or fail with [`std::io::ErrorKind::AddrInUse`], naming the holder,
+    /// when a live daemon has it. Never waits.
+    pub fn acquire(path: &Path) -> std::io::Result<SocketGuard> {
+        use std::io::{Read as _, Seek as _, Write as _};
+        use std::os::unix::fs::MetadataExt as _;
+
+        // The socket is a full-privilege interface (scripts, guest files,
+        // daemon-side writes), so the directory holding it is owner-only.
+        if let Some(parent) = path.parent() {
+            crate::paths::ensure_private_dir(parent).map_err(std::io::Error::other)?;
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let in_use = |holder: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} belongs to a running daemon{holder}; a second one is refused",
+                    path.display()
+                ),
+            )
+        };
+        let mut leaked = 0;
+        let mut lock = loop {
+            let file = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)?;
+            let lock =
+                match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                    Ok(lock) => lock,
+                    Err((mut file, nix::errno::Errno::EWOULDBLOCK)) => {
+                        let mut pid = String::new();
+                        let _ = file.read_to_string(&mut pid);
+                        let holder = pid
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|pid| crate::supervisor::process_running(*pid));
+                        if let Some(pid) = holder {
+                            return Err(in_use(&format!(" (pid {pid})")));
+                        }
+                        // Locked, yet no live process is named: a holder
+                        // between its lock and its pid, or one that is gone
+                        // while a child it forked has not reached its `exec`
+                        // and still has the descriptor. Both pass at once.
+                        if leaked == LEAK_TRIES {
+                            return Err(in_use(""));
+                        }
+                        leaked += 1;
+                        std::thread::sleep(LEAK_PAUSE);
+                        continue;
+                    }
+                    Err((_, errno)) => return Err(errno.into()),
+                };
+            // The lock is on whatever the path named when it was opened. A
+            // file removed or replaced since is not the one a peer would
+            // lock, so open the path again.
+            let held = lock.metadata()?;
+            match std::fs::metadata(&lock_path) {
+                Ok(now) if now.ino() == held.ino() && now.dev() == held.dev() => break lock,
+                _ => continue,
+            }
+        };
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return Err(in_use(" that still accepts connections"));
+        }
+        lock.set_len(0)?;
+        lock.rewind()?;
+        write!(lock, "{}", std::process::id())?;
+        Ok(SocketGuard {
+            path: path.to_path_buf(),
+            lock,
+        })
+    }
+}
+
 impl<R: WireRequest + Send + 'static> Server<R> {
-    /// Bind `path` (parent dirs created, stale socket file replaced) and
-    /// serve until dropped/aborted.
+    /// Bind `path` (parent dirs created, a dead daemon's socket file
+    /// replaced) and serve until dropped/aborted. A path a live daemon
+    /// serves is refused: see [`SocketGuard`].
     pub async fn bind(path: &Path, handler: Arc<dyn Handler<R>>) -> std::io::Result<Server<R>> {
         let (events, _) = broadcast::channel::<Event>(1024);
         Self::bind_with_events(path, handler, events).await
@@ -75,13 +191,21 @@ impl<R: WireRequest + Send + 'static> Server<R> {
         handler: Arc<dyn Handler<R>>,
         events: broadcast::Sender<Event>,
     ) -> std::io::Result<Server<R>> {
-        // The socket is a full-privilege interface (scripts, guest files,
-        // daemon-side writes), so both the directory holding it and the socket
-        // itself are owner-only — `bind` would otherwise honour the umask and
-        // leave it connectable by any local user.
-        if let Some(parent) = path.parent() {
-            crate::paths::ensure_private_dir(parent).map_err(std::io::Error::other)?;
-        }
+        Self::bind_guarded(SocketGuard::acquire(path)?, handler, events)
+    }
+
+    /// [`bind_with_events`](Self::bind_with_events) for a daemon that took
+    /// its [`SocketGuard`] earlier, before it built what it serves.
+    pub fn bind_guarded(
+        guard: SocketGuard,
+        handler: Arc<dyn Handler<R>>,
+        events: broadcast::Sender<Event>,
+    ) -> std::io::Result<Server<R>> {
+        let path = guard.path.as_path();
+        // The guard says nobody serves this path, so a file there is a dead
+        // daemon's. The socket itself is owner-only too — `bind` would
+        // otherwise honour the umask and leave it connectable by any local
+        // user.
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         #[cfg(unix)]
@@ -112,6 +236,7 @@ impl<R: WireRequest + Send + 'static> Server<R> {
         Ok(Server {
             events,
             handle,
+            guard,
             _vocabulary: PhantomData,
         })
     }
@@ -125,6 +250,10 @@ impl<R: WireRequest + Send + 'static> Server<R> {
 impl<R: WireRequest> Drop for Server<R> {
     fn drop(&mut self) {
         self.handle.abort();
+        // The abort closes the listener only when the task is next polled.
+        // Without the file nobody connects in between, so a successor's
+        // guard does not take this server for a live one.
+        let _ = std::fs::remove_file(&self.guard.path);
     }
 }
 
@@ -326,6 +455,62 @@ mod tests {
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "directory mode {dir_mode:o}");
         drop(server);
+    }
+
+    /// A daemon that binds beside a live one must not take its socket: the
+    /// first would run on unreachable, and both would own the same lab.
+    #[tokio::test]
+    async fn a_second_bind_does_not_take_a_live_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("run/control.sock");
+        let first = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
+
+        let second = Server::<LabRequest>::bind(&sock, Arc::new(Echo)).await;
+        let err = second.err().expect("the second bind must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "the refusal names the holder: {err}"
+        );
+
+        let client = crate::proto::client::LabClient::connect(&sock)
+            .await
+            .expect("the first server still holds the path");
+        client.send(LabRequest::Ping {}).await.unwrap();
+
+        // Once the holder is gone the path is free again.
+        drop(client);
+        drop(first);
+        let third = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
+        let client = crate::proto::client::LabClient::connect(&sock)
+            .await
+            .unwrap();
+        client.send(LabRequest::Ping {}).await.unwrap();
+        drop(third);
+    }
+
+    /// A socket file nobody listens on, left by a daemon that was killed, is
+    /// replaced as before.
+    #[tokio::test]
+    async fn a_dead_socket_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("control.sock");
+        // A socket inode with no listener behind it. Not a listener bound
+        // and dropped: a child that another test forks keeps that one open
+        // until its `exec`.
+        nix::sys::stat::mknod(
+            &sock,
+            nix::sys::stat::SFlag::S_IFSOCK,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .unwrap();
+
+        let _server = Server::bind(&sock, Arc::new(Echo)).await.unwrap();
+        let client = crate::proto::client::LabClient::connect(&sock)
+            .await
+            .unwrap();
+        client.send(LabRequest::Ping {}).await.unwrap();
     }
 
     /// A directory owned by somebody else must never be used for sockets.
