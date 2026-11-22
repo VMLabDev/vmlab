@@ -250,12 +250,26 @@ fn a_new_process_removes_a_stale_rollback_checkpoint() {
         guest.control.call(Ctrl::SnapshotSave { name: "saved".into() }).unwrap(),
         Outcome::Ok { .. }
     ));
+    // A name of the checkpoint format before #421: a user may hold it.
+    const LEGACY: &str = "vmlab-hv-rollback-1-0";
+    assert!(matches!(
+        guest.control.call(Ctrl::SnapshotSave { name: LEGACY.into() }).unwrap(),
+        Outcome::Ok { .. }
+    ));
+    assert!(
+        !matches!(
+            guest.control.call(Ctrl::SnapshotSave { name: "vmlab-hv-rollback-:1-0".into() }).unwrap(),
+            Outcome::Ok { .. }
+        ),
+        "a save under the reserved checkpoint prefix must be refused"
+    );
+    let is_checkpoint = |name: &str| name.starts_with("vmlab-hv-rollback-") && name != LEGACY;
     let mut loader = Client::connect(control).unwrap();
     let load = std::thread::spawn(move || loader.call(Ctrl::SnapshotLoad { name: "saved".into() }));
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if snapshot_list(&disk).is_ok_and(|entries| {
-            entries.iter().any(|entry| entry.name.starts_with("vmlab-hv-rollback-"))
+            entries.iter().any(|entry| is_checkpoint(&entry.name))
         }) {
             guest.child.kill().unwrap();
             break;
@@ -266,9 +280,10 @@ fn a_new_process_removes_a_stale_rollback_checkpoint() {
     }
     assert_eq!(guest.child.wait().unwrap().signal(), Some(libc::SIGKILL));
     assert!(load.join().unwrap().is_err(), "load replied before SIGKILL");
-    assert!(snapshot_list(&disk).unwrap().iter().any(|entry| {
-        entry.name.starts_with("vmlab-hv-rollback-")
-    }), "the killed process left no rollback checkpoint");
+    assert!(
+        snapshot_list(&disk).unwrap().iter().any(|entry| is_checkpoint(&entry.name)),
+        "the killed process left no rollback checkpoint"
+    );
 
     std::fs::remove_file(&guest.ctl_sock).unwrap();
     std::fs::remove_file(&guest.agent_sock).unwrap();
@@ -296,8 +311,8 @@ fn a_new_process_removes_a_stale_rollback_checkpoint() {
     let entries = snapshot_list(&disk).unwrap();
     assert_eq!(
         entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
-        ["saved"],
-        "restart must remove the rollback checkpoint and preserve the saved snapshot"
+        ["saved", LEGACY],
+        "restart must remove the rollback checkpoint and keep both user snapshots"
     );
 }
 

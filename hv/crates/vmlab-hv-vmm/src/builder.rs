@@ -1715,6 +1715,8 @@ pub fn build(
     *shared.msr_policy.lock() = desc.msr_policy;
     crate::macos::configure_msrs(&shared.kvm, desc.msr_policy)?;
     shared.set_reset_description(desc.clone());
+    crate::snapshot::remove_stale_checkpoints(&snap_disks)
+        .map_err(|error| VmmError::Other(format!("cleaning stale rollback checkpoints: {error}")))?;
     shared.set_snapshot_registry(Arc::new(SnapshotRegistry {
         digest: machine_digest(desc),
         disks: snap_disks,
