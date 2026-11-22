@@ -1158,6 +1158,42 @@ fn snapshot_restores_both_frame_credits_and_fraction() {
     }
 }
 
+/// Review finding F17: a snapshot is input, not the device's own word.
+/// `advance` divides by the period in frames, so a stored period of zero, or
+/// of less than one frame, would panic the host on a started stream.
+/// `SET_PARAMS` refuses the same values on the live path.
+#[test]
+fn restore_rejects_a_zero_period() {
+    let mut g = Guest::new(Arc::new(RecordingHost::new()), true);
+    g.negotiate();
+    g.setup_queues();
+    g.start_streams();
+    let state = g.device.lock().save_state().unwrap();
+    let stream0 = state.len() - g.device.lock().streams.len() * super::STREAM_STATE_BYTES;
+    // Offsets within one stream's state: buffer_bytes 1, period_bytes 5,
+    // channels 13.
+    let damaged = |at: usize, bytes: &[u8]| {
+        let mut state = state.clone();
+        state[stream0 + at..stream0 + at + bytes.len()].copy_from_slice(bytes);
+        state
+    };
+    let cases = [
+        ("a zero period", damaged(5, &0u32.to_le_bytes())),
+        ("a period below one frame", damaged(5, &3u32.to_le_bytes())),
+        ("a period of part frames", damaged(5, &1026u32.to_le_bytes())),
+        ("a zero buffer", damaged(1, &0u32.to_le_bytes())),
+        ("a buffer of part periods", damaged(1, &4097u32.to_le_bytes())),
+        ("three channels", damaged(13, &[3])),
+    ];
+    for (what, state) in cases {
+        let restored = g.device.lock().restore_state(&state);
+        assert!(restored.is_err(), "restore accepted {what}");
+    }
+    // The undamaged state still restores, and the clock runs on it.
+    g.device.lock().restore_state(&state).unwrap();
+    g.advance(period_time());
+}
+
 #[test]
 fn driver_reset_returns_the_device_to_power_on() {
     let host = PacedHost::default();
