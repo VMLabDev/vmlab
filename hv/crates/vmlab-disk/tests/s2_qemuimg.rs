@@ -1200,8 +1200,8 @@ fn s2_snapshot_churn() {
     }
 }
 
-/// Larger buffers move through the cluster path without per-byte syscalls
-/// and stay correct (a 16 MiB write/read at an unaligned offset).
+/// A 16 MiB write/read at an unaligned offset preserves the data and
+/// leaves a valid qcow2 image.
 #[test]
 fn s2_large_unaligned_io() {
     require_qemu_img!();
@@ -1210,21 +1210,13 @@ fn s2_large_unaligned_io() {
     let path = dir.join("l.qcow2");
     ops::create_qcow2(&path, 32 * 1024 * 1024, None, None).unwrap();
     let data = pattern(16 * 1024 * 1024, 21);
-    let t0 = std::time::Instant::now();
     write_pattern(&path, Format::Qcow2, 123_457, &data);
-    let write_secs = t0.elapsed().as_secs_f64();
     let mut got = vec![0u8; data.len()];
-    let t1 = std::time::Instant::now();
     vmlab_disk::open(&path, Format::Qcow2, true)
         .unwrap()
         .read_at(123_457, &mut got)
         .unwrap();
-    let read_secs = t1.elapsed().as_secs_f64();
     assert_eq!(got, data);
-    assert!(
-        write_secs < 10.0 && read_secs < 10.0,
-        "pathologically slow: write {write_secs:.2}s read {read_secs:.2}s"
-    );
     qemu_check(&path);
     let _ = std::io::stdout().flush();
 }

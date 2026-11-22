@@ -214,8 +214,8 @@ Not read:
   bytes. The test `a_guest_that_ignores_its_credit_loses_the_channel` failed
   before the fix (the host kept the channel) and passes after it. The mock
   agent of the tests in that file now sends its data under the credit too.
-  Not fixed here: the 10 s wait of F5, and a queue of 2048 small frames
-  inside the window.
+  Not fixed here: the 10 s wait of F5 (fixed in card #506), and a queue of
+  2048 small frames inside the window.
 
 ### F5. One channel with a slow consumer stops the host reader for 10 seconds
 
@@ -241,6 +241,27 @@ Not read:
   channels, sends more than `SESSION_QUEUE` frames on the first while the
   test does not read it, and answers pings. Assert that `ping(2 s)` returns
   true while the first channel is full.
+- Fixed in card #506. The reader task no longer waits on a session. The
+  queue of one channel is now `SessionQueue` in `src/labd/vm_agent.rs`, and
+  `deliver` puts an event into it without a wait. Up to `SESSION_QUEUE`
+  events each frame is its own event. At that depth the payload of a frame
+  joins the last queued event of the same stream (stdout or stderr), which
+  the receive window of F4 bounds in bytes, so a consumer that is behind
+  loses nothing: every consumer reads a channel as a byte stream. An event
+  that cannot join (stdout and stderr in turn past the depth, for example)
+  closes that one channel at once, and its consumer reads an error that
+  names the queue after what was queued. One `Eof` and the event that ends
+  a session are always taken, so a command that ends while its consumer is
+  behind keeps its exit code. The `close` frame the reader sends for a channel it ended is
+  written by a task of its own with a 10 s limit on the writer lock and the
+  write, so a guest that does not read cannot hold the reader there. A write
+  cut off inside the frame marks the connection as over, as a ping does. The
+  tests `a_full_session_queue_does_not_delay_a_pong` and
+  `a_channel_that_overfills_its_queue_is_closed_without_a_wait` failed
+  before the fix (the ping got no pong in 2 s) and pass after it. Not fixed
+  here: `expose_terminal_socket` still does not read terminal output while
+  it waits for guest credit, which now costs only that terminal. The bounded
+  `close` write has no test of its own.
 
 ### F6. A full input queue of one session blocks the whole guest agent
 
@@ -333,6 +354,16 @@ Not read:
   `guest/agent/src/sessions_test.rs`. Make a FIFO with `mkfifo`, send
   `Op::Digest` and `Op::Open` for it, and assert an error reply within one
   second for each.
+- Fixed in card #508. On Unix every open the file session makes for a path
+  (`Op::Open`, `Op::Digest`, and the open of a size or time `Op::Setstat`)
+  refuses a FIFO, a character device and a socket with "not a regular
+  file". It checks the path first, opens with `O_NONBLOCK`, and checks the
+  open handle again. A block device is finite and stays allowed, so
+  `vmlab cp file vm:/dev/null` is now refused and a push to a disk device is
+  not. The test also asks for `/dev/zero` and for more requests than the
+  session has workers. It failed before the fix (the digest of the FIFO got
+  no reply in 10 s) and passes after it. Not fixed here: Windows device
+  names, which stay unchecked.
 
 ### F9. An exec does not report its exit while a background child holds its output pipe
 

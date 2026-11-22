@@ -39,7 +39,7 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
                         return Ok(cached);
                     }
                     log(format!("downloading {url}"));
-                    download(url, &cached).await?;
+                    download(url, &cached, DOWNLOAD_LIMITS).await?;
                     verify_file(&cached, sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
@@ -57,7 +57,7 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
                     }
                     let dl = dir.join(format!("{sha256}.download"));
                     log(format!("downloading {url}"));
-                    download(url, &dl).await?;
+                    download(url, &dl, DOWNLOAD_LIMITS).await?;
                     verify_file(&dl, sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
@@ -127,7 +127,21 @@ impl Compression {
     }
 }
 
-async fn download(url: &str, dest: &Path) -> Result<()> {
+/// How long an artefact download waits on a server that has stopped
+/// talking: to connect, and then for the response head and between two
+/// reads of the body. Neither bounds the whole download.
+#[derive(Clone, Copy)]
+struct DownloadLimits {
+    connect: std::time::Duration,
+    read: std::time::Duration,
+}
+
+const DOWNLOAD_LIMITS: DownloadLimits = DownloadLimits {
+    connect: std::time::Duration::from_secs(30),
+    read: std::time::Duration::from_secs(60),
+};
+
+async fn download(url: &str, dest: &Path, limits: DownloadLimits) -> Result<()> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
 
@@ -136,6 +150,8 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
     // cloud.centos.org) answer 403 to requests with an empty UA.
     let client = reqwest::Client::builder()
         .user_agent(concat!("vmlab/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(limits.connect)
+        .read_timeout(limits.read)
         .build()
         .context("building HTTP client")?;
     let resp = client
@@ -177,6 +193,37 @@ async fn verify_file(path: &Path, expected_hex: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review F10: a mirror that accepts the connection and sends nothing
+    /// must fail the download, not hold it for ever.
+    #[tokio::test]
+    async fn a_mirror_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                held.push(sock);
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = DownloadLimits {
+            connect: std::time::Duration::from_secs(5),
+            read: std::time::Duration::from_millis(300),
+        };
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download(
+                &format!("http://{addr}/x.iso"),
+                &tmp.path().join("x.iso"),
+                limits,
+            ),
+        )
+        .await
+        .expect("the download must give up by itself");
+        assert!(done.is_err(), "a silent mirror is an error");
+    }
 
     #[tokio::test]
     async fn local_path_passthrough() {
