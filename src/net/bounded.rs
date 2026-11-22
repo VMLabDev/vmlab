@@ -10,6 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 
+#[derive(Debug)]
 pub(crate) struct BoundedMap<K, V> {
     limit: usize,
     map: HashMap<K, V>,

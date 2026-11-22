@@ -1049,7 +1049,11 @@ mod tests {
             "{} addresses are quarantined, over the limit of {MAX_DECLINED}",
             s.declined.len()
         );
-        assert_eq!(s.declined.len(), MAX_DECLINED, "a decline still quarantines");
+        assert_eq!(
+            s.declined.len(),
+            MAX_DECLINED,
+            "a decline still quarantines"
+        );
 
         // An address the server cannot hand out takes no slot.
         let mut s = DhcpServer::new(config());

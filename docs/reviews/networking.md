@@ -322,9 +322,9 @@ Who the attacker is, per finding:
   Not changed: the four address tables have no share per guest, so a guest
   that floods one pushes out the entries of the others, which each owner
   puts back with its next frame. A decline still quarantines for the
-  daemon's life and is still believed from any `chaddr` (F8). The 257th
-  declined address frees the oldest quarantine of a small pool only in
-  theory: a /24 has 253 addresses.
+  daemon's life and is still believed from any `chaddr` (F8). A /24 has 253
+  addresses a client can hold, so only a larger subnet reaches the limit of
+  1 024.
 
 ### F7. The redirect connection table: no limit, full scan per packet (security, guest)
 
