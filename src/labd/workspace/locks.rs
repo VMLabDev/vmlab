@@ -77,6 +77,33 @@ pub fn is_mutable(rel: &str) -> bool {
             .any(|dir| rest == *dir || rest.starts_with(&format!("{dir}/")))
 }
 
+/// The guest-side locks worth asking about when the watch has named none.
+///
+/// The steady state never walks, and a lock's own event can still be waiting
+/// behind the pass that is about to carry what the lock protects. So a pass
+/// that sees any of the mutable set moved, on either side, asks for the locks
+/// git takes to rewrite it: `<file>.lock` for each of the mutable files —
+/// `index.lock` first among them, which a commit, a checkout and a merge all
+/// hold for their whole length — and `<path>.lock` beside each moved path,
+/// which is how a single ref is locked.
+///
+/// Nothing moved in the mutable set means nothing to ask: a pass that is not
+/// about to touch `.git`'s conflict surface pays no round trip for it.
+pub fn candidates<'a>(moved: impl Iterator<Item = &'a String>) -> BTreeSet<String> {
+    let mut asked: BTreeSet<String> = moved
+        .filter(|path| is_mutable(path))
+        .map(|path| format!("{path}.lock"))
+        .collect();
+    if !asked.is_empty() {
+        asked.extend(
+            MUTABLE_FILES
+                .iter()
+                .map(|file| format!("{GIT}/{file}.lock")),
+        );
+    }
+    asked
+}
+
 /// Which of `paths` this pass leaves strictly alone, given the locks either
 /// side is holding.
 ///
@@ -179,6 +206,20 @@ mod tests {
     #[test]
     fn nothing_defers_while_no_lock_is_held() {
         assert!(deferred(&BTreeSet::new(), set(&[".git/index"]).iter()).is_empty());
+    }
+
+    /// A lock the watch has not named yet is asked for by name, and only when
+    /// the mutable set moved: the mutable files' own locks, and the lock
+    /// beside each moved path.
+    #[test]
+    fn a_moved_mutable_path_names_the_locks_to_ask_about() {
+        let asked = candidates(set(&[".git/refs/heads/main", "src/main.rs"]).iter());
+        assert!(asked.contains(".git/index.lock"), "{asked:?}");
+        assert!(asked.contains(".git/HEAD.lock"), "{asked:?}");
+        assert!(asked.contains(".git/refs/heads/main.lock"), "{asked:?}");
+        assert!(asked.iter().all(|path| is_lock(path)), "{asked:?}");
+        let quiet = set(&[".git/objects/ab/cdef", "src/main.rs"]);
+        assert!(candidates(quiet.iter()).is_empty());
     }
 
     /// It is named out loud, like everything else the syncer declines to do.

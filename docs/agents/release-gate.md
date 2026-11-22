@@ -61,15 +61,163 @@ merged. If they differ, test the new candidate tree before publishing. Record
 the final merge SHA and both tree hashes on the release card. Never stamp or
 edit source files between this comparison and the merge.
 
-## Release-branch CI
+## Build and publish a version (not on GitHub)
 
-Pushes to `release/**` run version-stamped CLI, guest and hypervisor builds
-and prepare checksums/provenance from their real artifacts. The version is
-`0.0.0-dry-run`; it is not a publishable release. Windows display compilation
-runs, but catalog signing is main-only. The dry guest bundle explicitly uses
-the unsigned display output and omits its generated catalog/certificate.
-It is an artifact for checking packaging only, not for installation or release.
-No signing identity or write permission is granted to asset preparation.
-The offline `just ci::release-dry-run` tests remain part of local validation.
-Signing (Windows and cosign), tags and GitHub releases run only on main pushes
-with a publish trailer. Action SHA pins must remain intact.
+GitHub builds, signs and publishes no version (operator, 2026-11-22, card 423).
+`.github/workflows/ci.yml` holds the cheap checks only. A trailer on a commit
+starts nothing. A version is built on helios in the `vmlab-build` container,
+and uploaded by a second command.
+
+B1. Build. In a clean full checkout of the release commit, with the tags
+fetched, as the account that owns the checkout:
+
+```sh
+just release::local --pre-release --bump patch    # or --release, or --bump minor|major
+```
+
+It runs `scripts/release-local.sh`. The version comes from
+`scripts/release-version.sh` with the kind and the bump of the command line
+(`just release::version --pre-release --bump patch` prints it and builds
+nothing). Without `--bump` the commit subjects since the last `v*` tag decide.
+`--release` after an alpha promotes that alpha. The build is
+`build/run.sh build/dist.sh <version>` in the container. The result is the
+release directory `target/release-local/v<version>/` (or `--out DIR`):
+
+| File | What |
+| --- | --- |
+| `vmlab-<version>-linux-x86_64` | the CLI |
+| `vmlab-fastpath-<version>-linux-x86_64` | the fast-path helper |
+| `vmlab-guest-<version>.tar.gz`, `.sha256` | the strict guest bundle |
+| `vmlab-hv-<version>-linux-x86_64.tar.gz`, `.sha256` | the hypervisor bundle |
+| `provenance.json` | SLSA v1 statement. The builder id names the host and the commit: `.../scripts/release-local.sh@<commit>#host=helios` |
+| `SHA256SUMS` | the four assets and `provenance.json` |
+| `SHA256SUMS.key.bundle` | only with `--signing key` |
+
+The command ends with a check: every asset is there and not empty,
+`SHA256SUMS` and `provenance.json` describe the files, and the CLI reports the
+version. `just release::verify <dir>` runs the check again. The command refuses
+a checkout with uncommitted changes to tracked files, and a version whose tag
+exists. It uploads nothing. Start it like every heavy run on helios.
+
+The command rebuilds the `vmlab-build` image first, so the image has the
+toolchains that the commit pins. `--image-as-is` skips that for a test build.
+A change of `scripts/guest-toolchains.sh` rebuilds every layer of the image
+(about 10 GiB). A cold build of all assets took 14 minutes on helios and
+about 3 GiB of docker volumes, beside the caches in the checkout. Do not
+start it with less than 15 GiB free: the disk is shared with the e2e runs.
+
+B2. Publish. After R1 to R3 and A1 to A3, with the release commit on GitHub
+`main`, the factory runs this with its GitHub login:
+
+```sh
+just release::publish target/release-local/v<version>
+```
+
+It checks the directory again and then runs exactly this, and nothing else
+(`--print` shows it and uploads nothing):
+
+```sh
+gh release create v<version> --repo VMLabDev/vmlab --target <commit> \
+  --title v<version> --generate-notes [--prerelease] \
+  vmlab-<version>-linux-x86_64 vmlab-fastpath-<version>-linux-x86_64 \
+  vmlab-guest-<version>.tar.gz vmlab-guest-<version>.tar.gz.sha256 \
+  vmlab-hv-<version>-linux-x86_64.tar.gz vmlab-hv-<version>-linux-x86_64.tar.gz.sha256 \
+  SHA256SUMS provenance.json [SHA256SUMS.key.bundle]
+```
+
+`<commit>` is the commit in `provenance.json`. A version with a suffix gets
+`--prerelease`. GitHub makes the tag at that commit. The command refuses the
+version `0.0.0-dry-run`.
+
+## Windows display driver
+
+The guest bundle needs the signed display package: `vmlab-display.inf`,
+`.dll`, `.cat` and `.cer`, `install.exe`, `install.ps1`, the three `ivshmem`
+files and `PACKAGE.json`. Two steps make it. The container compiles the DLL
+and the installer with Clang and lld (the former `vdisplay-build` job).
+Windows makes the catalog and test-signs it with the pinned Inf2Cat and
+SignTool (the former `vdisplay-sign` job on a GitHub Windows runner).
+
+`just release::local` takes the package in one of three ways:
+
+- `--display staged` (default): the package staged in
+  `guest/vdisplay-windows/target/signed-package`, or in
+  `VMLAB_VDISPLAY_PACKAGE_DIR` inside the checkout. `guest/package.sh` refuses
+  it when a source file changed after signing.
+- `--display rebuild`: runs `guest/vdisplay-windows/rebuild.py --route container`
+  first. That compiles in the container and signs in the Windows 11 build lab
+  on the host. It needs a built vmlab CLI (`VMLAB_RELEASE_VMLAB`, default
+  `target/debug/vmlab`), the Windows 11 `standard` template, the config-weave
+  Windows binary, and disk space for the build VM and its toolchain.
+- `--display unsigned`: compile only. For the version `0.0.0-dry-run` alone.
+  The bundle has no catalog and no certificate. It proves the build, and it is
+  never a release.
+
+Left open by card 423: `--display rebuild` was not run on helios. The proof
+of the card built `0.0.0-dry-run` with `--display unsigned`. Helios has the
+Windows 11 template, and no config-weave Windows binary was found in the
+account vmlab. A real version needs one green `--display rebuild`, or a
+signed package staged by hand, before B1.
+
+## Signing: two ways, and the decision of the operator
+
+The keyless cosign signature of the old release job used the GitHub OIDC
+identity of `ci.yml`. It cannot be made on helios. `scripts/release-sign.sh`
+is the one signing step, with two ways (`--signing`, or
+`VMLAB_RELEASE_SIGNING`):
+
+- `none` (default): `SHA256SUMS` only. `install.sh` refuses the release
+  unless the user gives `--insecure-skip-signature`.
+- `key`: a cosign key pair. The private half comes from the environment
+  variable `VMLAB_RELEASE_COSIGN_KEY` (the contents of the encrypted
+  `cosign.key`) and its password from `COSIGN_PASSWORD`. The public half is
+  the committed file `build/release-signing.pub`. The step writes
+  `SHA256SUMS.key.bundle`, then verifies it with the public half. Nothing goes
+  to a transparency log.
+
+`install.sh` picks the check by the signature file of the release.
+`SHA256SUMS.key.bundle` is verified with `cosign verify-blob --key` against
+`RELEASE_KEY`, a variable at the top of `install.sh`. That variable is the
+switch, and it is empty today: the installer trusts no key and refuses a
+key-signed release. `SHA256SUMS.bundle` is verified keyless against the
+identity of `ci.yml` as before, so every release that GitHub built still
+installs. `--release-key FILE` verifies with another public key. It is for
+testing a local build.
+
+No trust root was picked in card 423. Until the operator turns `key` on,
+every version built on helios is unsigned, and `curl ... | sh -s -- --pre`
+refuses it without `--insecure-skip-signature`.
+
+The operator decides:
+
+- D1. Whether a key pair that the factory holds becomes the trust root of new
+  releases. The alternative is unsigned releases (`none`), or another root in
+  a later card.
+- D2. Where the private half and its password live, and who can read them.
+  Whoever reads them can sign a release that every installer accepts.
+- D3. Whether a signature without a transparency log is enough. `key` uploads
+  nothing to Rekor, so cosign prints its tlog warning at each install.
+- D4. What happens when the key is lost or leaks. `install.sh` holds one key.
+  A new key needs a new `install.sh`, and old copies refuse the new releases.
+
+To turn `key` on:
+
+- K1. Make the pair on a trusted machine with cosign v2.6.1 and a password:
+  `cosign generate-key-pair`. It writes `cosign.key` and `cosign.pub`.
+- K2. Store the contents of `cosign.key` as the factory secret that fills
+  `VMLAB_RELEASE_COSIGN_KEY`, and the password as the secret that fills
+  `COSIGN_PASSWORD`. Remove `cosign.key`. Never commit it.
+- K3. Commit `cosign.pub` as `build/release-signing.pub`, and put the same
+  text between the quotes of `RELEASE_KEY=''` in `install.sh`.
+  `just ci::release-dry-run` fails when the two differ.
+- K4. Deploy that `install.sh` to vmlab.io before the first key-signed
+  release.
+- K5. Install cosign v2.6.1 on helios. It has none today. Signing with
+  cosign v3 fails on `--tlog-upload=false`. Verifying works with v2.6.1 and v3.
+- K6. Build with `just release::local ... --signing key`. To sign a directory
+  that exists: `just release::sign <dir> key`.
+
+The offline `just ci::release-dry-run` tests cover the manifest, the
+provenance, both signing ways through a cosign contract stub, the installer's
+refusals and the upload command. They prove no cryptography. Action SHA pins
+in the remaining workflows must stay intact.

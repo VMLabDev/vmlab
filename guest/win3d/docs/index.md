@@ -65,6 +65,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [release.md](release.md) | Cut a release with `scripts/release.sh`, or install the release assets: the driver zip in a guest and the patched QEMU on an NVIDIA host |
 | [known-limits.md](known-limits.md) | Find out what does not work, has not been tested, or needs a workaround, including which host GPUs work |
 | [`installer/README.txt`](../installer/README.txt) | The short guide that ships inside the bundle |
+| [operator-test.md](operator-test.md) | Test the build of card #409 by hand on helios and zeus: start a lab, what to try, what good looks like, the known limits, and what to send back |
 
 ## How it works
 

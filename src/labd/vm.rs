@@ -1808,24 +1808,34 @@ impl VmInstance {
     // ---- snapshots (PRD §7.3) ---------------------------------------------
 
     /// Take a snapshot; returns whether it was online (running) or offline.
-    async fn take_snapshot(&self, name: &str) -> Result<bool> {
+    async fn take_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<bool, super::machine::SnapshotCaptureError> {
+        use super::machine::SnapshotCaptureError::Attempted;
+
         validate_snapshot_name(name)?;
         let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
                 drop(guard);
                 if let Some(why) = self.online_snapshot_refusal().await {
-                    bail!("{why}");
+                    return Err(anyhow!("{why}").into());
                 }
                 // See `usb::snapshot_refusal` for why, and PRD §5.2.1.
                 let attached = self.usb.lock().await.clone();
                 if !attached.is_empty() {
-                    bail!(crate::usb::snapshot_refusal(&self.cfg.name, &attached));
+                    return Err(
+                        anyhow!(crate::usb::snapshot_refusal(&self.cfg.name, &attached)).into(),
+                    );
                 }
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-                snapshots.save(name, "disk0", &refs).await?;
+                snapshots
+                    .save(name, "disk0", &refs)
+                    .await
+                    .map_err(Attempted)?;
                 Ok(true)
             }
             PowerState::Stopped => {
@@ -1834,12 +1844,15 @@ impl VmInstance {
                 super::machine::finish_offline_snapshot(guard, async move {
                     snapshot_offline_disks(&disks, &name).await
                 })
-                .await?;
+                .await
+                .map_err(Attempted)?;
                 Ok(false)
             }
             // Capturing must not change the guest, and waking it would.
-            PowerState::Suspended => Err(super::machine::suspended_error(&self.cfg.name)),
-            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
+            PowerState::Suspended => Err(super::machine::suspended_error(&self.cfg.name).into()),
+            other => {
+                Err(anyhow!("{} is {:?} — wait for it to settle", self.cfg.name, other).into())
+            }
         }
     }
 
@@ -1927,11 +1940,12 @@ impl VmInstance {
                     for disk in disks {
                         // Capture rollback may already have removed this disk's
                         // entry. Pending-intent cleanup is idempotent.
-                        if crate::template::qimg::image_info(&disk)
-                            .await?
-                            .snapshots
-                            .iter()
-                            .any(|snapshot| snapshot.name == name)
+                        if disk.try_exists()?
+                            && crate::template::qimg::image_info(&disk)
+                                .await?
+                                .snapshots
+                                .iter()
+                                .any(|snapshot| snapshot.name == name)
                         {
                             crate::template::qimg::snapshot_delete(&disk, &name).await?;
                         }
@@ -2443,7 +2457,7 @@ impl super::machine::Machine for VmInstance {
         self.agent.clear_failure().await;
     }
 
-    async fn snapshot(&self, name: &str) -> Result<bool> {
+    async fn snapshot(&self, name: &str) -> Result<bool, super::machine::SnapshotCaptureError> {
         self.take_snapshot(name).await
     }
 

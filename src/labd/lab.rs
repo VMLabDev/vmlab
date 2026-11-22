@@ -14,7 +14,7 @@ use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
 use super::forward_plan::{self, ForwardPlan, ForwardRule, InstalledForward};
 use super::freeze_clone;
-use super::machine::{AgentOrigin, Machine};
+use super::machine::{AgentOrigin, Machine, SnapshotCaptureError};
 use super::machine_build::{self, BuildContext, Built, MachineSet};
 use super::mount_report::{MOUNT_REPORT_HOLD, MountReport, SettleOnDrop};
 use super::network::LabNetwork;
@@ -114,6 +114,7 @@ pub struct LabRuntime {
     /// starter, or a first-boot script restarting its own guest, finds it
     /// claimed and leaves it to the run that holds it.
     first_boots: std::sync::Mutex<std::collections::HashSet<String>>,
+    active_captures: std::sync::Mutex<BTreeSet<(String, String)>>,
     /// Each machine's share-mount task (§7.5), so a stop can end it. `up`
     /// keeps its handle only for its report hold; after that the task would
     /// otherwise retry against a guest that has gone until its window ends.
@@ -575,6 +576,7 @@ impl LabRuntime {
             agent_updates: std::sync::atomic::AtomicBool::new(true),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             first_boots: std::sync::Mutex::default(),
+            active_captures: std::sync::Mutex::default(),
             mount_tasks: std::sync::Mutex::default(),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg,
@@ -651,6 +653,7 @@ impl LabRuntime {
             agent_updates: std::sync::atomic::AtomicBool::new(false),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             first_boots: std::sync::Mutex::default(),
+            active_captures: std::sync::Mutex::default(),
             mount_tasks: std::sync::Mutex::default(),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
             host_cfg: crate::config::host::HostConfig::default(),
@@ -3355,27 +3358,46 @@ impl LabRuntime {
     /// other machine passes straight through.
     pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
         let m = self.machine(vm_name)?;
+        super::vm::validate_snapshot_name(snap)?;
         if let Some(why) = super::worktree::take_refusal(&*self.state.lock().await, vm_name, snap) {
             return Err(crate::proto::CommandError::conflict(why).into());
         }
         self.workspaces
             .before_capture(vm_name, self.workspace_of(vm_name).as_ref())
             .await?;
-        {
+        let _active = {
             let mut state = self.state.lock().await;
             let machine = state.machine_mut(vm_name);
             if machine.snapshots.contains_key(snap) || machine.pending_snapshots.contains(snap) {
                 bail!("{vm_name}: snapshot {snap:?} already exists or is pending cleanup");
             }
+            let key = (vm_name.to_owned(), snap.to_owned());
+            if !self.active_captures.lock_recover().insert(key.clone()) {
+                bail!("{vm_name}: snapshot {snap:?} is still being captured");
+            }
+            let active = ActiveCapture { lab: self, key };
             machine.pending_snapshots.insert(snap.to_string());
             if let Err(error) = state.save(&self.lab_local) {
                 state.machine_mut(vm_name).pending_snapshots.remove(snap);
                 return Err(error);
             }
-        }
+            active
+        };
         let online = match m.snapshot(snap).await {
             Ok(online) => online,
-            Err(error) => {
+            Err(SnapshotCaptureError::Refused(error)) => {
+                let mut state = self.state.lock().await;
+                state.machine_mut(vm_name).pending_snapshots.remove(snap);
+                if let Err(save) = state.save(&self.lab_local) {
+                    state
+                        .machine_mut(vm_name)
+                        .pending_snapshots
+                        .insert(snap.to_owned());
+                    return Err(error.context(format!("could not clear pending capture: {save:#}")));
+                }
+                return Err(error);
+            }
+            Err(SnapshotCaptureError::Attempted(error)) => {
                 // The backend rolls back artifacts it created. Keep the
                 // intent visible because it may report a rollback failure.
                 // Do not blindly delete here: a backend may have refused
@@ -3709,6 +3731,16 @@ impl LabRuntime {
         if record.is_none() && !machine.pending_snapshots.contains(snap) {
             return Err(missing_snapshot(vm_name, snap).into());
         }
+        if self
+            .active_captures
+            .lock_recover()
+            .contains(&(vm_name.to_owned(), snap.to_owned()))
+        {
+            return Err(crate::proto::CommandError::conflict(format!(
+                "{vm_name}: snapshot {snap:?} is still being captured"
+            ))
+            .into());
+        }
         if let Some(g) = record.and_then(|r| r.frozen_in) {
             return Err(
                 crate::proto::CommandError::conflict(super::worktree::locked_refusal(
@@ -3730,10 +3762,26 @@ impl LabRuntime {
             state.save(&self.lab_local)?;
             return Ok(());
         }
-        m.delete_snapshot(snap).await?;
-        state.machine_mut(vm_name).snapshots.remove(snap);
-        state.machine_mut(vm_name).pending_snapshots.remove(snap);
-        state.save(&self.lab_local)?;
+        if let Err(error) = m.delete_snapshot(snap).await {
+            let missing = error
+                .downcast_ref::<crate::proto::CommandError>()
+                .is_some_and(|error| error.code == crate::proto::ErrorCode::NotFound);
+            if record.is_some() || !missing {
+                return Err(error);
+            }
+        }
+        let machine = state.machine_mut(vm_name);
+        machine.snapshots.remove(snap);
+        let pending = machine.pending_snapshots.remove(snap);
+        if let Err(error) = state.save(&self.lab_local) {
+            if pending {
+                state
+                    .machine_mut(vm_name)
+                    .pending_snapshots
+                    .insert(snap.to_owned());
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -3779,6 +3827,18 @@ impl LabRuntime {
 /// How long teardown waits for a machine's exit monitor to settle before
 /// removing what the machine was using.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Prevent a delete from clearing the durable intent while capture is active.
+struct ActiveCapture<'a> {
+    lab: &'a LabRuntime,
+    key: (String, String),
+}
+
+impl Drop for ActiveCapture<'_> {
+    fn drop(&mut self) {
+        self.lab.active_captures.lock_recover().remove(&self.key);
+    }
+}
 
 /// A machine's place in [`LabRuntime::first_boots`], held for as long as its
 /// first boot runs and given back on drop, however that run ends.
@@ -4130,7 +4190,9 @@ mod tests {
         /// Snapshots it takes are online ones (RAM included).
         online_snapshots: bool,
         snapshot_failure: bool,
+        snapshot_refused: bool,
         snapshot_cleanup_failure: bool,
+        snapshot_missing: bool,
         clock: crate::config::model::Clock,
         /// What `boot_id` answers, in turn; the last answer repeats. Empty is
         /// a machine with no boot identity to read.
@@ -4216,7 +4278,9 @@ mod tests {
                 failing_mount: None,
                 online_snapshots: false,
                 snapshot_failure: false,
+                snapshot_refused: false,
                 snapshot_cleanup_failure: false,
+                snapshot_missing: false,
                 clock: crate::config::model::Clock::Host,
                 boot_ids: std::sync::Mutex::new(Vec::new()),
                 usb: None,
@@ -4525,10 +4589,16 @@ mod tests {
             };
             next.map(String::from).map_err(|e| anyhow!(e))
         }
-        async fn snapshot(&self, name: &str) -> Result<bool> {
+        async fn snapshot(&self, name: &str) -> Result<bool, SnapshotCaptureError> {
+            super::super::vm::validate_snapshot_name(name)?;
             self.note(&format!("snapshot:{name}")).await;
+            if self.snapshot_refused {
+                return Err(anyhow!("injected capture refusal").into());
+            }
             if self.snapshot_failure {
-                bail!("injected snapshot failure");
+                return Err(SnapshotCaptureError::Attempted(anyhow!(
+                    "injected snapshot failure"
+                )));
             }
             Ok(self.online_snapshots)
         }
@@ -4578,6 +4648,9 @@ mod tests {
         }
         async fn delete_snapshot(&self, name: &str) -> Result<()> {
             self.note(&format!("delete_snapshot:{name}")).await;
+            if self.snapshot_missing {
+                return Err(missing_snapshot(&self.name, name).into());
+            }
             if self.snapshot_cleanup_failure {
                 bail!("injected snapshot cleanup failure");
             }
@@ -4742,6 +4815,65 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
                 .pending_snapshots
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_capture_leaves_no_pending_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        machine.snapshot_refused = true;
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        let error = lab.snapshot("a", "capture").await.unwrap_err();
+        assert_eq!(error.to_string(), "injected capture refusal");
+        lab.snapshot("a", "invalid/name").await.unwrap_err();
+        assert!(
+            lab.snapshots("a")
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let disk = std::fs::read_to_string(lab.lab_local.join("state.json")).unwrap();
+        assert!(!disk.contains("\"capture\""));
+    }
+
+    #[tokio::test]
+    async fn a_pending_entry_is_cleared_when_no_disk_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        machine.snapshot_missing = true;
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        {
+            let mut state = lab.state.lock().await;
+            state
+                .machine_mut("a")
+                .pending_snapshots
+                .insert("interrupted".into());
+            state.save(&lab.lab_local).unwrap();
+        }
+        lab.delete_snapshot("a", "interrupted").await.unwrap();
+        assert!(
+            lab.snapshots("a")
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(lab.snapshot("a", "interrupted").await.is_ok());
     }
 
     fn quiet() -> crate::scripting::OutputSink {
