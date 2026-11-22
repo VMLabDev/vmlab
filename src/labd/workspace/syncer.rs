@@ -3702,6 +3702,67 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    /// A directory the guest deleted, that the host cannot drop because it
+    /// still holds ignored content there, stays deleted in the guest (review
+    /// #380 F11). No later pass and no walk makes it again, until a synced
+    /// file has to land under it.
+    #[tokio::test]
+    async fn a_directory_left_standing_is_not_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("crate/target")).unwrap();
+        std::fs::write(dir.path().join("crate/target/host.o"), "host build").unwrap();
+        std::fs::write(dir.path().join("crate/a.rs"), "a").unwrap();
+        let (syncers, guest, sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/crate/a.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        guest.unlink("/src/crate/a.rs");
+        guest.unlink("/src/crate");
+        sessions.watcher.mark("crate/a.rs");
+        sessions.watcher.mark("crate");
+        let removed = {
+            let dir = dir.path().to_path_buf();
+            eventually(move || !dir.join("crate/a.rs").exists()).await
+        };
+        assert!(removed, "the guest delete never reached the host");
+
+        // Past the quiet period a path with no agreement waits out, more
+        // than once, and then through a walk of both trees.
+        for _ in 0..3 {
+            tokio::time::sleep(QUIET * 2).await;
+            syncer.pass_now().await.unwrap();
+        }
+        assert!(
+            guest.get("/src/crate").is_none(),
+            "the directory the guest deleted is back: {:?}",
+            guest.paths()
+        );
+        sessions.watcher.overflow();
+        tokio::time::sleep(QUIET * 2).await;
+        let report = syncer.pass_now().await.unwrap();
+        assert!(
+            guest.get("/src/crate").is_none(),
+            "a walk made the directory the guest deleted again: {:?}",
+            guest.paths()
+        );
+        assert!(dir.path().join("crate/target/host.o").exists());
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        assert!(report.unsynced.is_empty(), "{:?}", report.unsynced);
+
+        // A synced file under it is work for the guest, and brings the
+        // directory with it.
+        std::fs::write(dir.path().join("crate/b.rs"), "b").unwrap();
+        let landed = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/crate/b.rs").as_deref() == Some("b")).await
+        };
+        assert!(landed, "a new file under it never landed: {:?}", guest.paths());
+        syncers.stop("dev01").await;
+    }
+
     /// An overflow **warns and never halts** — a build burst is wanted work
     /// that happens to be large — but it *is* a barrier: nothing propagates
     /// in either direction until the walk that re-establishes agreement has
