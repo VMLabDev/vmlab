@@ -115,6 +115,21 @@ pub trait Transport: Send + Sync {
     async fn blob_exists(&self, repository: &str, digest: &str) -> Result<bool>;
     /// GET a blob's bytes.
     async fn get_blob(&self, repository: &str, digest: &str) -> Result<Vec<u8>>;
+    /// GET a blob that is refused past `limit` bytes. The default
+    /// implementation checks what [`get_blob`](Self::get_blob) returned;
+    /// [`HttpTransport`] overrides it to stop reading at the limit.
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self.get_blob(repository, digest).await?;
+        if bytes.len() > limit {
+            bail!("registry response exceeds {limit} bytes");
+        }
+        Ok(bytes)
+    }
     /// GET a blob into a file on disk, verifying its digest and reporting
     /// cumulative bytes to `progress`. Returns the byte count. The default
     /// implementation buffers through [`get_blob`](Self::get_blob);
@@ -236,11 +251,7 @@ impl Registry {
                 .collect()),
             ManifestOrIndex::Manifest(m) => {
                 // Plain single-arch manifest: read its config blob for the arch.
-                let config_bytes = self
-                    .transport
-                    .get_blob(repo, &m.config.digest)
-                    .await
-                    .context("downloading config blob")?;
+                let config_bytes = self.config_blob(repo, &m.config).await?;
                 Ok(vec![TemplateConfig::from_json(&config_bytes)?.arch])
             }
         }
@@ -287,11 +298,7 @@ impl Registry {
         if !manifest.is_vmlab_template() {
             bail!("{repo}:{tag} is not a vmlab template");
         }
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let arches = if arches.is_empty() {
             vec![config.arch]
@@ -518,9 +525,31 @@ impl Registry {
         Ok(count)
     }
 
+    /// A template's config blob, refused past [`MAX_CONFIG_BLOB`]: by the size
+    /// its descriptor declares before any request, and by the bytes that
+    /// arrive whatever it declares.
+    async fn config_blob(&self, repo: &str, config: &Descriptor) -> Result<Vec<u8>> {
+        ensure!(
+            config.size <= MAX_CONFIG_BLOB as u64,
+            "config blob {} of {} bytes exceeds the {MAX_CONFIG_BLOB} a template's may have",
+            config.digest,
+            config.size
+        );
+        self.transport
+            .get_blob_bounded(repo, &config.digest, MAX_CONFIG_BLOB)
+            .await
+            .context("downloading config blob")
+    }
+
     /// Upload a config blob unless present, returning its descriptor.
     async fn put_config(&self, repo: &str, config: &TemplateConfig) -> Result<Descriptor> {
         let bytes = config.to_json()?;
+        // What no pull would read back is not published.
+        ensure!(
+            bytes.len() <= MAX_CONFIG_BLOB,
+            "the template's config blob is {} bytes, over the {MAX_CONFIG_BLOB} a pull accepts",
+            bytes.len()
+        );
         let digest = digest_of(&bytes);
         if !self.transport.blob_exists(repo, &digest).await? {
             self.transport
@@ -640,11 +669,7 @@ impl Registry {
         }
 
         // 3. Download config → TemplateMeta.
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let vars = config.vars()?;
         let mut meta = config.into_meta(Some(self.reference.canonical()))?;
@@ -801,8 +826,7 @@ impl Registry {
 
         // The variants to fetch: each one's manifest and config blob, which
         // say what its overlay assembles to and the block it stands for.
-        let mut parts: Vec<(crate::template::meta::VariantMeta, Vec<Descriptor>, String)> =
-            Vec::new();
+        let mut parts: Vec<(crate::template::meta::VariantMeta, Chunks, String)> = Vec::new();
         for entry in chosen {
             let vm = self.fetch_manifest(repo, &entry.manifest).await?;
             if !vm.is_vmlab_template() {
@@ -855,8 +879,7 @@ impl Registry {
                 }
             }
             let config_bytes = self
-                .transport
-                .get_blob(repo, &vm.config.digest)
+                .config_blob(repo, &vm.config)
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
             let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
@@ -874,7 +897,14 @@ impl Registry {
                 "variant `{}`'s config blob disagrees with its manifest",
                 entry.name
             );
-            parts.push((variant, layout.overlay, layout.overlay_digest));
+            parts.push((
+                variant,
+                Chunks {
+                    layers: layout.overlay,
+                    sizes: layout.overlay_sizes,
+                },
+                layout.overlay_digest,
+            ));
         }
         if let Some(local) = &local
             && parts.is_empty()
@@ -885,27 +915,45 @@ impl Registry {
         // 4. Download chunks in order — the base's only when the store does
         // not already hold it — verifying each chunk's digest as it lands.
         let chunks_dir = work_dir.join("chunks");
-        let base_layers: Vec<Descriptor> = if local.is_none() {
-            manifest.layers_in_order().into_iter().cloned().collect()
+        //
+        // A manifest is hostile input, and its layer list may name one small
+        // chunk of zeros thousands of times. So what each part assembles to
+        // is taken from what the manifest declares, checked against its own
+        // totals before anything is fetched, and held to at every chunk; and
+        // the sum is refused where the filesystem has no room for it.
+        let base = if local.is_none() {
+            Chunks {
+                sizes: manifest.declared_base_chunks()?,
+                layers: manifest.layers_in_order().into_iter().cloned().collect(),
+            }
         } else {
-            Vec::new()
+            Chunks::default()
         };
-        let mut download = Download::new(
-            std::iter::once(&base_layers)
-                .chain(parts.iter().map(|(_, layers, _)| layers))
-                .flatten(),
-            progress,
-        );
+        let all = || std::iter::once(&base).chain(parts.iter().map(|(_, chunks, _)| chunks));
+        let assembled = sum_sizes(all().flat_map(|c| c.sizes.iter().copied()))?;
+        let compressed = sum_sizes(all().flat_map(|c| c.layers.iter().map(|d| d.size)))?;
+        // The chunks and the assembled disks both land under the work
+        // directory; the install renames them into the store, or copies them
+        // when the store is another filesystem.
+        ensure_room(
+            work_dir,
+            assembled
+                .checked_add(compressed)
+                .ok_or_else(|| anyhow!("the manifest's sizes overflow"))?,
+            &reference,
+        )?;
+        ensure_room(dest_store.root(), assembled, &reference)?;
+        let mut download = Download::new(all().flat_map(|c| c.layers.iter()), progress);
         let base_paths = self
-            .download_layers(repo, &base_layers, &chunks_dir.join("base"), &mut download)
+            .download_layers(repo, &base, &chunks_dir.join("base"), &mut download)
             .await?;
         let mut overlays = Vec::new();
-        for (variant, layers, digest) in parts {
+        for (variant, chunks, digest) in &parts {
             let dir = chunks_dir.join("variants").join(&variant.name);
             let paths = self
-                .download_layers(repo, layers.as_slice(), &dir, &mut download)
+                .download_layers(repo, chunks, &dir, &mut download)
                 .await?;
-            overlays.push((variant, paths, digest));
+            overlays.push((variant.clone(), paths, digest.clone()));
         }
 
         // 5 + 6. Decompress the chunks into the disk images, verify each
@@ -1006,18 +1054,19 @@ impl Registry {
         }
     }
 
-    /// Download `layers` in order into `dir`, verifying each compressed
-    /// chunk's digest, and return the chunk files in that order.
+    /// Download `chunks` in order into `dir`, verifying each compressed
+    /// chunk's size and digest, and return the chunk files in that order,
+    /// each with the decompressed size its manifest states.
     async fn download_layers(
         &self,
         repo: &str,
-        layers: &[Descriptor],
+        chunks: &Chunks,
         dir: &Path,
         download: &mut Download<'_>,
-    ) -> Result<Vec<std::path::PathBuf>> {
+    ) -> Result<Vec<(std::path::PathBuf, u64)>> {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        let mut paths = Vec::with_capacity(layers.len());
-        for (i, layer) in layers.iter().enumerate() {
+        let mut paths = Vec::with_capacity(chunks.layers.len());
+        for (i, (layer, size)) in chunks.layers.iter().zip(&chunks.sizes).enumerate() {
             let chunk = download.chunk;
             let bytes = self
                 .transport
@@ -1031,14 +1080,61 @@ impl Registry {
                     layer.digest
                 );
             }
+            // The room check counted the size the manifest states.
+            ensure!(
+                bytes.len() as u64 == layer.size,
+                "chunk {chunk} is {} bytes, its manifest states {}",
+                bytes.len(),
+                layer.size
+            );
             let path = dir.join(format!("chunk-{i:04}.zst"));
             std::fs::write(&path, &bytes)
                 .with_context(|| format!("cannot write {}", path.display()))?;
-            paths.push(path);
+            paths.push((path, *size));
             download.done(layer.size);
         }
         Ok(paths)
     }
+}
+
+/// One part of a pull, the base or a variant's overlay: its chunk layers in
+/// order, and what each decompresses to as the manifest declares it
+/// ([`crate::oci::manifest::declared_chunk_sizes`]).
+#[derive(Debug, Clone, Default)]
+struct Chunks {
+    layers: Vec<Descriptor>,
+    sizes: Vec<u64>,
+}
+
+fn sum_sizes(mut sizes: impl Iterator<Item = u64>) -> Result<u64> {
+    sizes
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| anyhow!("the manifest's sizes overflow"))
+}
+
+/// Refuse a pull whose manifest declares more than the filesystem holding
+/// `dir` has free. The declared size is the registry's word, so without this
+/// a registry fills the store's filesystem by declaring a large disk, and a
+/// full store filesystem stops every VM whose overlay is on it. `dir` need
+/// not exist yet: its nearest existing ancestor is asked.
+fn ensure_room(dir: &Path, need: u64, reference: &str) -> Result<()> {
+    let Some(at) = dir.ancestors().find(|p| p.exists()) else {
+        return Ok(());
+    };
+    let stat = nix::sys::statvfs::statvfs(at)
+        .with_context(|| format!("cannot read the free space of {}", at.display()))?;
+    let free = (stat.blocks_available() as u64).saturating_mul(stat.fragment_size() as u64);
+    refuse_without_room(need, free, at, reference)
+}
+
+fn refuse_without_room(need: u64, free: u64, at: &Path, reference: &str) -> Result<()> {
+    ensure!(
+        need <= free,
+        "template {reference} declares {need} bytes to download and assemble, and the \
+         filesystem of {} has {free} free — free space there, then pull again",
+        at.display()
+    );
+    Ok(())
 }
 
 /// Which variants a pull fetches beyond the default, which it always does
@@ -1342,6 +1438,10 @@ pub struct HttpTransport {
 const MAX_RETRIES: u32 = 3;
 pub(super) const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_BLOB_BODY: usize = 1024 * 1024 * 1024;
+/// A template's config blob: a JSON document, read whole on every resolve of
+/// a registry reference. Its one large field is the packed VARS file, which
+/// is tens of KiB for a real one.
+const MAX_CONFIG_BLOB: usize = MAX_JSON_BODY;
 const MAX_STREAMED_BLOB: u64 = 8 * 1024 * 1024 * 1024;
 pub(super) const MAX_LIST_PAGES: usize = 100;
 pub(super) const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
@@ -1674,6 +1774,23 @@ impl Transport for HttpTransport {
             bail!("GET blob {digest} returned {}", resp.status());
         }
         bounded_body(resp, MAX_BLOB_BODY).await
+    }
+
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let url = self.url(&format!("/v2/{repository}/blobs/{digest}"));
+        let scope = self.scope(repository, false);
+        let resp = self
+            .send_with_auth(&scope, || self.client.get(&url))
+            .await?;
+        if !resp.status().is_success() {
+            bail!("GET blob {digest} returned {}", resp.status());
+        }
+        bounded_body(resp, limit).await
     }
 
     async fn get_blob_to_file(
@@ -2280,6 +2397,8 @@ mod tests {
         manifests: Mutex<HashMap<String, (String, Vec<u8>)>>,
         /// Every blob digest PUT, in order — what a push uploaded.
         puts: Mutex<Vec<String>>,
+        /// Every blob digest asked for with GET, in order.
+        gets: Mutex<Vec<String>>,
     }
 
     fn key(repo: &str, id: &str) -> String {
@@ -2292,6 +2411,7 @@ mod tests {
             Ok(self.blobs.lock().unwrap().contains_key(&key(repo, digest)))
         }
         async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
+            self.gets.lock().unwrap().push(digest.to_string());
             self.blobs
                 .lock()
                 .unwrap()
@@ -2709,6 +2829,68 @@ mod tests {
         assert_eq!(std::fs::read(held).unwrap(), vars);
     }
 
+    /// A template's config blob is a small JSON document, and it is read
+    /// whole on every resolve of a registry reference. One of 16 MiB is
+    /// refused by its size rather than held and parsed (review F4).
+    #[tokio::test]
+    async fn an_oversized_config_blob_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same template under the tag `big`, its config blob padded with
+        // JSON whitespace to 16 MiB: still a document that parses.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let mut config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        config.resize(16 * 1024 * 1024, b' ');
+        TemplateConfig::from_json(&config).expect("the padded blob still parses");
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "big",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let err = registry_with_fake("ghcr.io/owner/alpine:big", fake.clone())
+            .pull(Some("x86_64"), &store, &store_root.join(".oci-pull"), false)
+            .await
+            .expect_err("a 16 MiB config blob is refused");
+        assert!(format!("{err:#}").contains("config blob"), "{err:#}");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+    }
+
     /// Pulling a version the store already holds uses the stored copy when it
     /// is the same image, without downloading, and refuses only when the two
     /// disks differ.
@@ -3122,6 +3304,113 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("mismatch"), "{err}");
+    }
+
+    /// F5 of `docs/reviews/templates-registry.md`: a registry cannot make a
+    /// pull write more than its manifest declares. The manifest says the disk
+    /// is 1 MiB and lists one chunk of 1 MiB of zeros 64 times. In the first
+    /// case each layer states its true size, so the layers sum to 64 MiB and
+    /// the pull stops before it fetches a chunk. In the second each layer
+    /// states 16 KiB, so the sum fits and the pull stops at the first chunk
+    /// that decompresses past what it states.
+    #[tokio::test]
+    async fn a_pull_refuses_more_data_than_its_manifest_declares() {
+        const DECLARED: u64 = 1024 * 1024;
+        const COPIES: usize = 64;
+        for honest_layers in [true, false] {
+            let fake = std::sync::Arc::new(FakeRegistry::default());
+            let work = tempfile::tempdir().unwrap();
+            let tdir = work.path().join("t");
+            make_template(&tdir, &meta("x86_64"), &vec![0u8; DECLARED as usize]);
+            registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+                .push(
+                    &tdir,
+                    DECLARED,
+                    "x86_64",
+                    &work.path().join("p"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mut hostile = arch_manifest(&fake, "3.20").await;
+            assert_eq!(hostile.layers.len(), 1);
+            let chunk = hostile.layers[0].clone();
+            hostile.layers = (0..COPIES)
+                .map(|i| {
+                    let mut layer = chunk.clone();
+                    let ann = layer.annotations.as_mut().unwrap();
+                    ann.insert(annotations::CHUNK_INDEX.to_string(), i.to_string());
+                    if !honest_layers {
+                        ann.insert(
+                            annotations::CHUNK_UNCOMPRESSED_SIZE.to_string(),
+                            (DECLARED / COPIES as u64).to_string(),
+                        );
+                    }
+                    layer
+                })
+                .collect();
+            let ann = hostile.annotations.as_mut().unwrap();
+            assert_eq!(ann[annotations::TOTAL_SIZE], DECLARED.to_string());
+            ann.insert(annotations::CHUNK_COUNT.to_string(), COPIES.to_string());
+            fake.put_manifest(
+                "owner/alpine",
+                "3.20",
+                media_types::OCI_MANIFEST,
+                serde_json::to_vec(&hostile).unwrap(),
+            )
+            .await
+            .unwrap();
+            fake.gets.lock().unwrap().clear();
+
+            let store = TemplateStore::new(work.path().join("store"));
+            let pull_dir = work.path().join("pull");
+            let err = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+                .pull(Some("x86_64"), &store, &pull_dir, false)
+                .await
+                .unwrap_err();
+            assert!(store.list().unwrap().is_empty(), "{err:#}");
+
+            let fetched = fake
+                .gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|d| **d == chunk.digest)
+                .count();
+            if honest_layers {
+                assert_eq!(fetched, 0, "chunks fetched before the refusal: {err:#}");
+            }
+            assert!(
+                fetched as u64 * chunk.size <= DECLARED,
+                "{fetched} chunks fetched: {err:#}"
+            );
+            let written = std::fs::metadata(pull_dir.join("staging").join(DISK_FILE))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert!(
+                written <= DECLARED,
+                "{written} bytes assembled for a disk declared as {DECLARED}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pull_is_refused_where_the_filesystem_has_no_room() {
+        let at = Path::new("/store");
+        refuse_without_room(10, 10, at, "x86_64/alpine@3.20").unwrap();
+        let err = refuse_without_room(11, 10, at, "x86_64/alpine@3.20")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("declares 11 bytes") && err.contains("/store has 10 free"),
+            "{err}"
+        );
+        // A directory that does not exist yet is measured at its ancestor.
+        let dir = tempfile::tempdir().unwrap();
+        ensure_room(&dir.path().join("a/b"), 1, "t").unwrap();
+        assert!(ensure_room(&dir.path().join("a/b"), u64::MAX, "t").is_err());
     }
 
     #[test]
@@ -4199,7 +4488,10 @@ mod tests {
         for (i, d) in base.layers_in_order().iter().enumerate() {
             let p = dir.join(format!("{i}.zst"));
             std::fs::write(&p, fake.get_blob("owner/alpine", &d.digest).await.unwrap()).unwrap();
-            paths.push(p);
+            let size = d.annotations.as_ref().unwrap()[annotations::CHUNK_UNCOMPRESSED_SIZE]
+                .parse()
+                .unwrap();
+            paths.push((p, size));
         }
         chunking::assemble(&paths, &dir.join(DISK_FILE)).unwrap();
         chunking::verify_whole(&dir.join(DISK_FILE), base.whole_digest().unwrap()).unwrap();

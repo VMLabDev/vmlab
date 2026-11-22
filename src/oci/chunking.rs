@@ -160,11 +160,15 @@ pub fn chunk_and_compress(qcow2: &Path, chunk_size: u64, out_dir: &Path) -> Resu
     })
 }
 
-/// Reassemble an image from compressed chunk blobs given in order: each is
-/// zstd-decompressed and concatenated into `out`. The caller MUST then call
+/// Reassemble an image from compressed chunk blobs given in order, each
+/// with the decompressed size its manifest states: each is zstd-decompressed
+/// and concatenated into `out`. A chunk that decompresses to more or fewer
+/// bytes than it states is refused, so `out` never grows past the sum of the
+/// stated sizes, which the caller has checked against the manifest's total
+/// ([`super::manifest::declared_chunk_sizes`]). The caller MUST then call
 /// [`verify_whole`] against the manifest's whole-image digest before
 /// installing — assembly itself does not validate content.
-pub fn assemble(chunk_paths: &[PathBuf], out: &Path) -> Result<()> {
+pub fn assemble(chunks: &[(PathBuf, u64)], out: &Path) -> Result<()> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -172,13 +176,18 @@ pub fn assemble(chunk_paths: &[PathBuf], out: &Path) -> Result<()> {
     let out_file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
     let mut writer = BufWriter::with_capacity(COPY_BUF, out_file);
 
-    for path in chunk_paths {
+    for (path, size) in chunks {
+        ensure!(
+            *size <= MAX_CHUNK_SIZE,
+            "chunk {} states {size} bytes, above the {MAX_CHUNK_SIZE} limit",
+            path.display()
+        );
         let compressed =
             File::open(path).with_context(|| format!("cannot open chunk {}", path.display()))?;
         let mut decoder = zstd::Decoder::new(BufReader::with_capacity(COPY_BUF, compressed))
             .with_context(|| format!("cannot read zstd chunk {}", path.display()))?;
         decoder.window_log_max(27).context("limiting zstd window")?;
-        copy_chunk(decoder, &mut writer, MAX_CHUNK_SIZE)
+        copy_chunk(decoder, &mut writer, *size)
             .with_context(|| format!("cannot decompress chunk {}", path.display()))?;
     }
     writer
@@ -187,13 +196,19 @@ pub fn assemble(chunk_paths: &[PathBuf], out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_chunk(reader: impl Read, writer: &mut impl Write, limit: u64) -> Result<()> {
-    let mut bounded = reader.take(limit);
-    std::io::copy(&mut bounded, writer)?;
+/// Copy exactly `size` bytes from `reader`, refusing a stream that holds
+/// more or fewer. Nothing past `size` is written.
+fn copy_chunk(reader: impl Read, writer: &mut impl Write, size: u64) -> Result<()> {
+    let mut bounded = reader.take(size);
+    let copied = std::io::copy(&mut bounded, writer)?;
+    ensure!(
+        copied == size,
+        "decompressed chunk is {copied} bytes, its manifest states {size}"
+    );
     let mut extra = [0];
     ensure!(
         bounded.into_inner().read(&mut extra)? == 0,
-        "decompressed chunk exceeds {limit} bytes"
+        "decompressed chunk exceeds the {size} bytes its manifest states"
     );
     Ok(())
 }
@@ -273,6 +288,8 @@ mod tests {
         );
         assert_eq!(output, b"123");
         assert!(copy_chunk(&b"123"[..], &mut Vec::new(), 3).is_ok());
+        // A chunk shorter than its manifest states is refused too.
+        assert!(copy_chunk(&b"12"[..], &mut Vec::new(), 3).is_err());
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -314,7 +331,7 @@ mod tests {
         let paths: Vec<_> = set
             .chunks
             .iter()
-            .map(|c| c.compressed_path.clone())
+            .map(|c| (c.compressed_path.clone(), c.uncompressed_size))
             .collect();
         let reassembled = dir.path().join("out.qcow2");
         assemble(&paths, &reassembled).unwrap();
@@ -339,7 +356,7 @@ mod tests {
         let paths: Vec<_> = set
             .chunks
             .iter()
-            .map(|c| c.compressed_path.clone())
+            .map(|c| (c.compressed_path.clone(), c.uncompressed_size))
             .collect();
         let reassembled = dir.path().join("out.qcow2");
         assemble(&paths, &reassembled).unwrap();
@@ -360,7 +377,7 @@ mod tests {
         let paths: Vec<_> = set
             .chunks
             .iter()
-            .map(|c| c.compressed_path.clone())
+            .map(|c| (c.compressed_path.clone(), c.uncompressed_size))
             .collect();
         let reassembled = dir.path().join("out.qcow2");
         assemble(&paths, &reassembled).unwrap();

@@ -28,8 +28,8 @@ much as a Makefile is.
 | F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it (fixed, #461) |
 | F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check (fixed in card #464) |
 | F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot (fixed, #480) |
-| F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference |
-| F5 | security | A template pull bounds each chunk but not the number of chunks or the total size |
+| F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference (fixed in card #481) |
+| F5 | security | A template pull bounds each chunk but not the number of chunks or the total size (fixed, #482) |
 | F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop |
 | F7 | security | The store accepts a qcow2 with an external data file (reachable only with `VMLAB_IMAGE_TOOL=qemu-img`) |
 | F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` (fixed, #465) |
@@ -214,6 +214,23 @@ much as a Makefile is.
 - The same code path reads the config blob with `get_blob`, so a 1 GiB JSON
   document is held in memory, then parsed. A test with the fake transport
   that serves a config blob of 16 MiB should see a refusal.
+- Fixed in card #481. `TemplateConfig::vars` reads the zstd frame through a
+  reader that stops one byte past `MAX_VARS_BYTES` (64 MiB, the largest real
+  VARS file) and refuses a payload that reaches it. `with_vars` refuses a
+  larger file on push. Every read of a template's config blob (`index_arches`,
+  `tag_version`, `resolve_manifest_meta`, the variant configs of a pull) goes
+  through `Registry::config_blob`, which refuses a descriptor that declares
+  more than `MAX_CONFIG_BLOB` (8 MiB, the JSON limit) before any request, and
+  fetches with `Transport::get_blob_bounded`, so the HTTP transport stops
+  reading at that limit whatever the descriptor says. `put_config` refuses
+  to publish a config blob over the same limit. Tests:
+  `an_oversized_vars_payload_is_refused` (`src/oci/config_blob.rs`) and
+  `an_oversized_config_blob_is_refused` (`src/oci/client.rs`). Both fail
+  before the fix (`vars()` returns 256 MiB, the pull of a 16 MiB config blob
+  succeeds) and pass with it.
+  - Not fixed here: the container image config (`src/oci/image/pull.rs:180`,
+    `index_platform_arches`) is still read with `get_blob` under the 1 GiB
+    limit.
 
 ### F5. A template pull does not bound the chunk count or the total size (security)
 
@@ -243,6 +260,36 @@ much as a Makefile is.
   more than the declared size (the fake transport counts `get_blob` calls).
   Today all 64 chunks are fetched and 64 MiB is assembled before
   `verify_whole` fails.
+- Fixed in card #482. A pull now takes what each part assembles to from the
+  manifest and holds the registry to it. Before a chunk is fetched
+  (`declared_chunk_sizes` in `src/oci/manifest.rs`): the chunk count
+  annotation must equal the layer count, every layer must state its
+  uncompressed size, no chunk may state more than 1 GiB, none may be empty
+  unless it is the only one, and the sizes must sum to the declared total
+  (`TOTAL_SIZE` for the base, `VARIANT_SIZE` and `VARIANT_CHUNK_COUNT` for an
+  overlay). The declared bytes, compressed plus assembled, are then compared
+  with the free space of the filesystem of the work directory, and the
+  assembled bytes with that of the store (`ensure_room` in
+  `src/oci/client.rs`). A fetched chunk must have the compressed size its
+  descriptor states. `chunking::assemble` takes each chunk's stated size and
+  refuses a chunk that decompresses to more or fewer bytes, so the staged
+  disk never grows past the declared total.
+  Tests: `a_pull_refuses_more_data_than_its_manifest_declares` and
+  `a_pull_is_refused_where_the_filesystem_has_no_room` (`src/oci/client.rs`),
+  `the_declared_chunk_sizes_are_held_to_the_manifests_totals`
+  (`src/oci/manifest.rs`), `decompressed_chunk_limit_is_enforced`
+  (`src/oci/chunking.rs`). The first failed before the fix (64 chunks
+  fetched, the pull ended at the whole-image digest) and passes after it.
+  - Not fixed here: the container image pull. Its layer count and the
+    decompressed stream that goes to `sqfstar` are still unbounded (F6 covers
+    the flatten).
+  - Not fixed here: the declared total is the registry's word. A pull may
+    still take all the free space that it finds at its start, as an honest
+    large template does. No reserve is kept, and the virtual disk size in the
+    config blob is not compared.
+  - Changed behaviour: a manifest without the chunk count, the total size or
+    a layer's uncompressed size is refused. Every vmlab push has written all
+    three.
 
 ### F6. The layer flatten is quadratic, unbounded, and cannot be cancelled (security)
 
