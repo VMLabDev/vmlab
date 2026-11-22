@@ -26,7 +26,7 @@ much as a Makefile is.
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it |
-| F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check |
+| F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check (fixed in card #464) |
 | F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot |
 | F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference |
 | F5 | security | A template pull bounds each chunk but not the number of chunks or the total size |
@@ -97,6 +97,22 @@ much as a Makefile is.
   same version with another disk and `overwrite = true`. Expect a refusal
   that names the machine, as `backed_clones_reason` gives for `remove`. Today
   the import succeeds. The same test with `pull`.
+- Fixed in card #464. `store.import` and `store.pull` with `overwrite` scan
+  the registered labs with `clones_by_backing` and hand the store a replace
+  guard (`TemplateStore::refusing_replace`). An install that would replace a
+  version asks the guard about the base and every variant overlay in the
+  version directory before `swap_in`, and a pull asks before it downloads
+  anything. The refusal names the machines and leaves the version as it
+  was. There is no force flag: the way past is to remove the clones or to
+  install under another version. Tests:
+  `an_overwriting_import_is_refused_while_a_clone_is_backed_by_the_version`
+  (`src/supervisor/store.rs`),
+  `an_overwriting_pull_is_refused_while_a_clone_is_backed_by_the_version`
+  (`src/oci/client.rs`) and
+  `an_overwrite_asks_the_replace_guard_and_a_refusal_keeps_the_version`
+  (`src/template/store.rs`). All three fail with the guard not consulted
+  (the install succeeds) and pass with it.
+  - Not fixed here: F1 (`add_variants`) is a separate path.
 
 ### F3. One repository can fill the store slot another reference resolves to (security)
 
