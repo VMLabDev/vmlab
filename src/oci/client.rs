@@ -409,6 +409,13 @@ impl Registry {
 
         // 1 + 2. Chunk, compress and upload the base.
         let set = chunking::chunk_and_compress(&disk, chunk_size, &work_dir.join("chunks"))?;
+        // The disk is published under the digest it has now, and the config
+        // blob carries the one the store recorded: a consumer verifies the
+        // first and records the second, so they must be the same.
+        let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+        if let Some(recorded) = &meta.sha256 {
+            ensure_recorded(&reference, recorded, &set.whole_digest)?;
+        }
         report.base = self.upload_chunks(&repo, &set).await?;
 
         // 3. The variants, each a manifest of its own.
@@ -429,6 +436,11 @@ impl Registry {
                 &overlay,
                 chunk_size,
                 &work_dir.join("variants").join(&v.name),
+            )?;
+            ensure_recorded(
+                &format!("{reference}#{}", v.name),
+                &v.sha256,
+                &vset.whole_digest,
             )?;
             let uploaded = self.upload_chunks(&repo, &vset).await?;
             let config = self
@@ -777,6 +789,18 @@ impl Registry {
             .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
             .to_string();
         let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+        // The manifest's digest is what the disk is verified against, and the
+        // config blob's is what the store would record: one that differs
+        // would leave a version whose metadata names a digest its disk does
+        // not have.
+        if let Some(recorded) = &meta.sha256 {
+            ensure!(
+                digest_eq(recorded, &whole),
+                "{}'s config blob records the disk digest {recorded} but its manifest names \
+                 {whole} — the template was pushed inconsistently; refusing to pull",
+                self.reference.canonical()
+            );
+        }
         let (listed, default) = manifest.variants()?;
         for entry in &listed {
             crate::template::trust::component(&entry.name)?;
@@ -1010,14 +1034,14 @@ impl Registry {
                     }
                     chunking::verify_whole(&disk, &whole)?;
                     let mut meta = meta;
-                    if meta.sha256.is_none() {
-                        meta.sha256 = Some(
-                            whole
-                                .strip_prefix("sha256:")
-                                .unwrap_or(&whole)
-                                .to_ascii_lowercase(),
-                        );
-                    }
+                    // What the disk was just verified against, whatever
+                    // spelling the config blob gave it.
+                    meta.sha256 = Some(
+                        whole
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&whole)
+                            .to_ascii_lowercase(),
+                    );
                     meta.variants = variants;
                     store.install_with_variants(&staging, &meta, overwrite)?;
                     Ok(meta)
@@ -1267,6 +1291,18 @@ impl<'a> Download<'a> {
             bytes_total: self.bytes_total,
         });
     }
+}
+
+/// Refuse to push `what` when its disk hashes to `actual` and the store's
+/// metadata records `recorded`: the stored file is not the one that was
+/// built or pulled.
+fn ensure_recorded(what: &str, recorded: &str, actual: &str) -> Result<()> {
+    ensure!(
+        digest_eq(recorded, actual),
+        "{what} records the digest {recorded} but its disk hashes to {actual} — the stored \
+         disk is damaged or was changed outside vmlab; rebuild or pull it again before pushing"
+    );
+    Ok(())
 }
 
 /// Two `sha256` digests, either maybe `sha256:`-prefixed, compared without
@@ -2957,6 +2993,113 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("different disk"), "{err}");
+    }
+
+    /// F11 of docs/reviews/templates-registry.md. The manifest's whole-image
+    /// digest is what a pull verifies, the config blob's `sha256` what the
+    /// store records. A config blob that states another digest is refused
+    /// before a chunk is fetched, so the store never holds a version whose
+    /// metadata names a digest its disk does not have.
+    #[tokio::test]
+    async fn a_config_digest_that_disagrees_with_the_manifest_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same correct manifest under the tag `forged`, its config blob
+        // stating a `sha256` of 64 zeros.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&config).unwrap();
+        config["sha256"] = serde_json::Value::String("00".repeat(32));
+        let config = serde_json::to_vec(&config).unwrap();
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "forged",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let mut downloads = 0;
+        let err = registry_with_fake("ghcr.io/owner/alpine:forged", fake.clone())
+            .pull_with_progress(
+                Some("x86_64"),
+                &store,
+                &store_root.join(".oci-pull"),
+                false,
+                &VariantWant::default(),
+                &mut |_| downloads += 1,
+            )
+            .await
+            .expect_err("a config blob naming another digest is refused");
+        assert!(
+            format!("{err:#}").contains("config blob records"),
+            "{err:#}"
+        );
+        assert_eq!(downloads, 0, "refused before a chunk is fetched");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// F11 of docs/reviews/templates-registry.md, the push half. A stored
+    /// disk that is no longer the one its metadata records (bit rot, a file
+    /// truncated by a crash) is not published: the damaged bytes would get a
+    /// correct manifest digest, and every consumer would verify them as good.
+    #[tokio::test]
+    async fn a_push_refuses_a_disk_that_is_not_the_recorded_one() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let mut disk = vec![7u8; 64 * 1024];
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.sha256 = Some(hex::encode(Sha256::digest(&disk)));
+        disk[1000] ^= 1;
+        make_template(&tdir, &m, &disk);
+        let err = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a disk that is not the recorded one is not pushed");
+        assert!(format!("{err:#}").contains("records the digest"), "{err:#}");
+        assert!(fake.puts.lock().unwrap().is_empty(), "nothing was uploaded");
+        assert!(fake.manifests.lock().unwrap().is_empty());
     }
 
     /// Push a template under `reference`, with the name and version its
