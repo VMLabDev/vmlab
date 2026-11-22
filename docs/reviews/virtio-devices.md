@@ -281,6 +281,19 @@ Not read:
   Today the sum is 32 x 2000.
 - Confidence: high for the mechanism. The effect depends on the memory limit
   of the process.
+- Fixed in card #400. A directory handle holds no entries: it holds one
+  directory descriptor, opened by the first `READDIR`, and the cookie the
+  stream stands at. Each request reads bounded batches with `getdents64`
+  (at most 64 KiB per call) and serves the host's `d_off` as the cookie, so
+  a request costs what it serves and a listing is linear. A request at
+  another cookie seeks. Offset 0 still rewinds. A handle counts against the
+  session limit as before, so the descriptors are bounded by it. The test
+  `directory_caches_are_bounded_across_handles` fails before the fix
+  (`32 handles hold 64096 directory entries`) and passes after it.
+  - Changed for the guest: a cookie is now the host's `d_off` and not an
+    index. After a snapshot restore a handle resumes by seeking to the
+    cookie the guest sends.
+  - Not fixed here: F13.
 
 ### F8. virtio-net: one frame larger than the guest's buffers stalls receive forever without mergeable buffers
 
