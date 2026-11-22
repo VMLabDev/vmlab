@@ -499,6 +499,46 @@ impl State {
         self.raise_lost();
     }
 
+    /// Whether queue `queue` can hold one more chain for a vblank or a
+    /// fence. A driver has at most the queue size of chains outstanding, so
+    /// more than that held is one head published again and again, which
+    /// would otherwise grow the two lists without limit.
+    fn can_hold(&self, queue: u16) -> bool {
+        let held = self
+            .vblank_waits
+            .iter()
+            .filter(|wait| wait.queue == queue)
+            .count()
+            + self
+                .fences
+                .iter()
+                .filter(|fence| fence.queue == queue)
+                .count();
+        self.queues
+            .get(usize::from(queue))
+            .is_some_and(|q| held < usize::from(q.size()))
+    }
+
+    /// Hold a vblank wait until the next tick, or give it back when its
+    /// queue holds a queue size of chains already.
+    fn hold_vblank(&mut self, wait: vblank::Wait) -> Result<(), vblank::Wait> {
+        if !self.can_hold(wait.queue) {
+            return Err(wait);
+        }
+        self.vblank_waits.push(wait);
+        Ok(())
+    }
+
+    /// Hold a fenced chain until its fence signals. False when its queue
+    /// holds a queue size of chains already: the caller answers it at once.
+    fn hold_fence(&mut self, fence: PendingFence) -> bool {
+        if !self.can_hold(fence.queue) {
+            return false;
+        }
+        self.fences.push(fence);
+        true
+    }
+
     /// Answer every fence the device holds. Their responses are written.
     fn release_fences(&mut self) {
         let fences = std::mem::take(&mut self.fences);
@@ -1280,17 +1320,29 @@ impl VirtioDevice for Gpu {
             while let Some(chain) = s.queues[index].pop_descriptor_chain(&mem) {
                 let head = chain.head_index();
                 let len = s.chain(&mem, index, chain);
+                let mut len = len;
                 if let Some(response) = s.held_vblank.take() {
-                    s.vblank_waits.push(vblank::Wait {
+                    let wait = vblank::Wait {
                         queue: index as u16,
                         head,
                         response,
-                    });
-                    self.arm_vblank(&mut s);
-                    continue;
+                    };
+                    match s.hold_vblank(wait) {
+                        Ok(()) => {
+                            self.arm_vblank(&mut s);
+                            continue;
+                        }
+                        // No room to hold it: refuse it at once.
+                        Err(wait) => {
+                            let mut refusal = [0; 24];
+                            refusal[..4].copy_from_slice(&OUT_OF_MEMORY.to_le_bytes());
+                            vblank::write_response(&mem, &wait.response, &refusal);
+                            len = refusal.len() as u32;
+                        }
+                    }
                 }
-                if let Some((flags, id, ctx, ring)) = s.current_fence.take() {
-                    s.fences.push(PendingFence {
+                if let Some((flags, id, ctx, ring)) = s.current_fence.take()
+                    && s.hold_fence(PendingFence {
                         queue: index as u16,
                         head,
                         len,
@@ -1298,9 +1350,11 @@ impl VirtioDevice for Gpu {
                         id,
                         ctx,
                         ring,
-                    });
+                    })
+                {
                     continue;
                 }
+                // A fence with no room to be held is answered here, early.
                 if s.queues[index].add_used(&mem, head, len).is_err() {
                     return;
                 }

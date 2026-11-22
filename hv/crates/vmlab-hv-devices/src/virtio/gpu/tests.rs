@@ -671,6 +671,57 @@ fn a_reset_drops_the_held_vblank_waits() {
     }));
 }
 
+/// A guest that publishes one head again and again: the queue holds no more
+/// waits than its size, and each surplus chain is refused at once.
+#[test]
+fn held_vblank_waits_are_bounded_by_the_queue_size() {
+    let mut f = QueueFixture::new(FEATURES);
+    f.gpu.state.lock().vblank = Some(Arc::new(vblank::Clock::idle()));
+    for _ in 0..40 {
+        f.put(0, &vblank_wait(0), 48);
+        f.notify();
+    }
+    assert_eq!(f.gpu.state.lock().vblank_waits.len(), 16);
+    assert_eq!(f.used(), 24, "the surplus chains are answered at once");
+    assert_eq!(f.used_entry(0), (0, 24));
+    assert_eq!(u32_at(&f.response(0, 24), 0), OUT_OF_MEMORY);
+
+    // A tick answers the held waits and makes room again.
+    assert!(f.gpu.state.lock().answer_vblanks(vblank::Tick {
+        sequence: 1,
+        timestamp_ns: 1,
+    }));
+    assert_eq!(f.used(), 40);
+    f.put(0, &vblank_wait(0), 48);
+    f.notify();
+    assert_eq!(f.gpu.state.lock().vblank_waits.len(), 1);
+}
+
+/// The fence twin: the fences and the waits of one queue share its size.
+#[test]
+fn held_fences_are_bounded_by_the_queue_size() {
+    let mut f = QueueFixture::new(FEATURES);
+    f.gpu.state.lock().vblank = Some(Arc::new(vblank::Clock::idle()));
+    f.put(0, &vblank_wait(0), 48);
+    f.notify();
+    let fence = |queue| PendingFence {
+        queue,
+        head: 2,
+        len: 24,
+        flags: 3,
+        id: 1,
+        ctx: 1,
+        ring: 0,
+    };
+    let mut s = f.gpu.state.lock();
+    let held = (0..40).filter(|_| s.hold_fence(fence(0))).count();
+    assert_eq!(held, 15, "one of the 16 places holds the vblank wait");
+    assert_eq!(s.fences.len(), 15);
+    // The cursor queue has its own places, and no queue has none.
+    assert!(s.hold_fence(fence(1)));
+    assert!(!s.hold_fence(fence(2)));
+}
+
 #[test]
 fn the_frame_clock_ticks_at_60_hz_from_its_start_and_never_twice() {
     use std::time::Duration;
