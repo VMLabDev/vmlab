@@ -3381,8 +3381,7 @@ mod tests {
         }
         async fn get_blob(&self, r: &str, d: &str) -> Result<Vec<u8>> {
             use std::sync::atomic::Ordering;
-            let meets =
-                self.chunks.contains(d) && self.arrived.fetch_add(1, Ordering::SeqCst) < 2;
+            let meets = self.chunks.contains(d) && self.arrived.fetch_add(1, Ordering::SeqCst) < 2;
             if meets {
                 self.meeting.wait().await;
             }
