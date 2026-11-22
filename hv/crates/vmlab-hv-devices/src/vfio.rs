@@ -54,6 +54,68 @@ fn dword(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
+/// Extended capabilities a guest must not see on an assigned function. Their
+/// registers stay with the host: the kernel presents SR-IOV's VF BARs
+/// read-only, and firmware that adds them to its resource plan (EDK2 does)
+/// asks its host bridge for a range no window can satisfy, after which no
+/// device on the bus is given a BAR. ARI names a next function that is not in
+/// the guest, and Resizable BAR would change a BAR size the VMM has fixed.
+/// ID 0 is what the kernel leaves where it masked a capability itself.
+const HIDDEN_EXTENDED_CAPABILITIES: [u16; 4] = [0x0000, 0x000e, 0x0010, 0x0015];
+
+/// Unlink [`HIDDEN_EXTENDED_CAPABILITIES`] from the chain at 0x100. A hidden
+/// capability reads as zeros up to the next capability and ignores writes;
+/// the header before it points past it. A hidden head keeps the chain alive
+/// under the ID 0xffff, which no guest has a driver for.
+fn hide_extended_capabilities(config: &mut [u8], host_config: &mut [bool]) {
+    if config.len() != 4096 {
+        return;
+    }
+    let mut chain = Vec::new();
+    let mut offset: usize = 0x100;
+    while (0x100..=0xffc).contains(&offset)
+        && offset.is_multiple_of(4)
+        && !chain.iter().any(|&(seen, _)| seen == offset)
+    {
+        let header = dword(config, offset);
+        if header == 0 || header == u32::MAX {
+            break;
+        }
+        chain.push((offset, header as u16));
+        offset = (header >> 20) as usize & !3;
+    }
+    let hidden = |id: u16| HIDDEN_EXTENDED_CAPABILITIES.contains(&id);
+    if !chain.iter().any(|&(_, id)| hidden(id)) {
+        return;
+    }
+    let mut starts: Vec<usize> = chain.iter().map(|&(offset, _)| offset).collect();
+    starts.sort_unstable();
+    for (index, &(offset, id)) in chain.iter().enumerate() {
+        let next = chain[index + 1..]
+            .iter()
+            .find(|&&(_, id)| !hidden(id))
+            .map_or(0, |&(offset, _)| offset as u32);
+        let header = if !hidden(id) {
+            dword(config, offset) & 0x000f_ffff | next << 20
+        } else if index == 0 && next != 0 {
+            0xffff | next << 20
+        } else {
+            0
+        };
+        if hidden(id) {
+            let end = starts
+                .iter()
+                .copied()
+                .find(|&start| start > offset)
+                .unwrap_or(config.len());
+            config[offset..end].fill(0);
+            host_config[offset..end].fill(false);
+        }
+        config[offset..offset + 4].copy_from_slice(&header.to_le_bytes());
+        host_config[offset..offset + 4].fill(false);
+    }
+}
+
 impl<B: Backend> VfioPci<B> {
     pub fn new(mut backend: B, bars: Vec<BarInfo>, mut config: Vec<u8>) -> Result<Self, String> {
         if !matches!(config.len(), 256 | 4096) || config[14] & 0x7f != 0 {
@@ -140,6 +202,7 @@ impl<B: Backend> VfioPci<B> {
             }
             cap = (config[cap + 1] & !3) as usize;
         }
+        hide_extended_capabilities(&mut config, &mut host_config);
         let mut table = vec![0; msix.map_or(0, |x| x.count * 16)];
         for entry in table.as_chunks_mut::<16>().0 {
             entry[12] = 1;
@@ -606,6 +669,87 @@ mod tests {
 
     fn write(device: &mut VfioPci<Mock>, offset: usize, bytes: &[u8]) {
         device.config_write(offset / 4, (offset % 4) as u64, bytes);
+    }
+
+    fn extended(id: u16, next: u32) -> [u8; 4] {
+        (u32::from(id) | 1 << 16 | next << 20).to_le_bytes()
+    }
+
+    fn with_extended(capabilities: &[(usize, u16, u32)]) -> (VfioPci<Mock>, Mock) {
+        let mut config = configuration();
+        for &(offset, id, next) in capabilities {
+            config[offset..offset + 4].copy_from_slice(&extended(id, next));
+            config[offset + 4..offset + 8].fill(0x77);
+        }
+        let mock = Mock::default();
+        let device = VfioPci::new(
+            mock.clone(),
+            vec![BarInfo {
+                index: 0,
+                size: 0x8000,
+                kind: BarKind::Mmio64 {
+                    prefetchable: false,
+                },
+            }],
+            config,
+        )
+        .unwrap();
+        mock.0.lock().unwrap().writes.clear();
+        (device, mock)
+    }
+
+    #[test]
+    fn sriov_ari_and_resizable_bar_are_unlinked_from_the_extended_chain() {
+        // AER, SR-IOV, a kernel-masked slot, LTR, Resizable BAR, ARI.
+        let (mut device, mock) = with_extended(&[
+            (0x100, 0x01, 0x200),
+            (0x200, 0x10, 0x240),
+            (0x240, 0x00, 0x300),
+            (0x300, 0x18, 0x400),
+            (0x400, 0x15, 0x500),
+            (0x500, 0x0e, 0),
+        ]);
+        assert_eq!(device.config_read(0x100 / 4), 0x3001_0001);
+        // The body of a visible capability still comes from the host.
+        assert_eq!(device.config_read(0x104 / 4), 0xa5a5_a5a5);
+        assert_eq!(device.config_read(0x300 / 4), 0x0001_0018);
+        // SR-IOV reads as nothing through to the next capability: no VF BAR
+        // is left for firmware to size.
+        for offset in (0x200..0x300)
+            .step_by(4)
+            .chain([0x400, 0x404, 0x500, 0x504])
+        {
+            assert_eq!(device.config_read(offset / 4), 0, "{offset:#x}");
+        }
+        // Writes to a hidden capability never reach the device.
+        write(&mut device, 0x224, &[0xff; 4]);
+        write(&mut device, 0x408, &[0xff; 4]);
+        write(&mut device, 0x100, &[0xff; 4]);
+        assert!(mock.0.lock().unwrap().writes.is_empty());
+        write(&mut device, 0x104, &[1, 2, 3, 4]);
+        assert_eq!(
+            mock.0.lock().unwrap().writes.last().unwrap(),
+            &(7, 0x104, vec![1, 2, 3, 4])
+        );
+        // A device reset restores the same view.
+        device.reset().unwrap();
+        assert_eq!(device.config_read(0x100 / 4), 0x3001_0001);
+        assert_eq!(device.config_read(0x200 / 4), 0);
+    }
+
+    #[test]
+    fn a_hidden_first_extended_capability_keeps_the_rest_reachable() {
+        let (mut device, _) = with_extended(&[(0x100, 0x10, 0x180), (0x180, 0x01, 0)]);
+        assert_eq!(device.config_read(0x100 / 4), 0x1800_ffff);
+        assert_eq!(device.config_read(0x104 / 4), 0);
+        assert_eq!(device.config_read(0x180 / 4), 0x0001_0001);
+        // Hidden capabilities alone leave an empty list.
+        let (mut device, _) = with_extended(&[(0x100, 0x10, 0x180), (0x180, 0x15, 0)]);
+        assert_eq!(device.config_read(0x100 / 4), 0);
+        assert_eq!(device.config_read(0x180 / 4), 0);
+        // A chain with nothing to hide is the host's own, loops included.
+        let (mut device, _) = with_extended(&[(0x100, 0x01, 0x180), (0x180, 0x18, 0x100)]);
+        assert_eq!(device.config_read(0x100 / 4), 0xa5a5_a5a5);
     }
 
     #[test]
