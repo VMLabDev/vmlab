@@ -656,6 +656,9 @@ fn install_built_variant(
         &base.meta.version,
         staging,
         std::slice::from_ref(meta),
+        // The caller asked at the swap, with the build's own check
+        // (`refuse_in_use`).
+        &|_| None,
     )
 }
 

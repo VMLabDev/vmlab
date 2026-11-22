@@ -35,12 +35,24 @@ const GUEST_MAC: MacAddr = MacAddr([0x02, 0xBB, 0, 0, 0, 0x10]);
 /// a shorter value under heavy parallel build load.
 const WAIT: Duration = Duration::from_secs(15);
 
+/// An engine whose "internet" is the test host's loopback: its guard is
+/// open, because every listener these tests dial is bound there.
 fn engine() -> (Arc<NatEngine>, mpsc::Receiver<Bytes>) {
     let (tx, rx) = mpsc::channel(256);
-    (NatEngine::new(NatConfig::new(GW_IP, GW_MAC), tx), rx)
+    let engine = NatEngine::new(NatConfig::new(GW_IP, GW_MAC), tx);
+    engine.set_guard(Arc::new(super::HostGuard::open()));
+    (engine, rx)
 }
 
+/// [`engine`] with a custom pinger.
 fn engine_with_pinger(p: Arc<dyn Pinger>) -> (Arc<NatEngine>, mpsc::Receiver<Bytes>) {
+    let (engine, rx) = unguarded(p);
+    engine.set_guard(Arc::new(super::HostGuard::open()));
+    (engine, rx)
+}
+
+/// An engine as [`NatEngine::with_pinger`] makes it, with no guard set.
+fn unguarded(p: Arc<dyn Pinger>) -> (Arc<NatEngine>, mpsc::Receiver<Bytes>) {
     let (tx, rx) = mpsc::channel(256);
     (
         NatEngine::with_pinger(NatConfig::new(GW_IP, GW_MAC), tx, p),
@@ -1286,7 +1298,7 @@ fn guarded(
     host: Vec<Ipv4Addr>,
     exposed: Vec<u16>,
 ) -> (Arc<NatEngine>, mpsc::Receiver<Bytes>) {
-    let (engine, rx) = engine_with_pinger(pinger);
+    let (engine, rx) = unguarded(pinger);
     let host: std::collections::HashSet<Ipv4Addr> = host.into_iter().collect();
     engine.set_guard(Arc::new(super::HostGuard::with_source(
         Arc::new(std::sync::Mutex::new(exposed)),
@@ -1390,4 +1402,93 @@ async fn isolation_drops_icmp_to_the_host() {
     guest_icmp_echo(&engine, Ipv4Addr::new(192, 0, 2, 46), 3, b"x").await;
     recv_frame(&mut rx).await;
     assert_eq!(pinger.calls.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The host's loopback outside isolation (networking review F5, card #460)
+// ---------------------------------------------------------------------------
+
+/// An engine nobody gave a guard still refuses the host's loopback: a SYN to
+/// a listening `127.0.0.1` port is answered with RST and the listener
+/// accepts nothing. A service bound to loopback is bound there to be
+/// reachable from the host only.
+#[tokio::test]
+async fn nat_refuses_loopback_without_isolation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dst = (Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port());
+    let (tx, mut rx) = mpsc::channel(256);
+    let engine = NatEngine::new(NatConfig::new(GW_IP, GW_MAC), tx);
+
+    guest_tcp(&engine, 40200, dst, 777, 0, TCP_SYN, b"", &[]).await;
+    let t = recv_tcp(&mut rx).await;
+    assert_ne!(t.flags & TCP_RST, 0, "the SYN is reset, got {t:?}");
+    assert_eq!(t.ack, 778, "the reset acks the SYN");
+    assert!(
+        timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "the host's loopback listener was reached"
+    );
+    assert!(
+        engine.tcp_flows.lock().unwrap().is_empty(),
+        "no flow opened"
+    );
+}
+
+/// The same for the rest of `127.0.0.0/8`, for `0.0.0.0`, and for UDP and
+/// ICMP, which are dropped: no flow, no probe, no reply.
+#[tokio::test]
+async fn nat_refuses_every_loopback_address_and_protocol_without_isolation() {
+    let pinger = stub_pinger();
+    let (engine, mut rx) = unguarded(pinger.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // A connect to 0.0.0.0 reaches a listener on loopback.
+    for (i, dst) in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(127, 0, 0, 2)]
+        .into_iter()
+        .enumerate()
+    {
+        guest_tcp(
+            &engine,
+            40210 + i as u16,
+            (dst, port),
+            1,
+            0,
+            TCP_SYN,
+            b"",
+            &[],
+        )
+        .await;
+        let t = recv_tcp(&mut rx).await;
+        assert_ne!(t.flags & TCP_RST, 0, "{dst}: {t:?}");
+    }
+    assert!(
+        timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "the host's loopback listener was reached"
+    );
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = sock.local_addr().unwrap().port();
+    guest_udp(&engine, 50200, (Ipv4Addr::LOCALHOST, udp_port), b"hello").await;
+    guest_udp(&engine, 50201, (Ipv4Addr::UNSPECIFIED, udp_port), b"hello").await;
+    let mut buf = [0u8; 16];
+    assert!(
+        timeout(Duration::from_millis(300), sock.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "the datagram reached the host"
+    );
+    assert!(engine.udp_flows.lock().unwrap().is_empty());
+
+    guest_icmp_echo(&engine, Ipv4Addr::LOCALHOST, 1, b"x").await;
+    assert!(
+        timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "no frame emitted"
+    );
+    assert_eq!(pinger.calls.load(Ordering::SeqCst), 0, "no probe ran");
 }
